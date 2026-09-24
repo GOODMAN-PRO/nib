@@ -53,6 +53,8 @@ targets:
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true
         UIRequiresFullScreen: false
+        # The droplet display link asks for 80-120 Hz (NibDesign DisplayLinkDriver); ProMotion iPhones need this.
+        CADisableMinimumFrameDurationOnPhone: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

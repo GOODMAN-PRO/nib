@@ -1,0 +1,2396 @@
+<!doctype html>
+<html lang="en" data-theme="light" data-motion="full" data-transparency="full" data-liquid="full" data-sound="off">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nib Design</title>
+<meta name="description" content="Nib's locked design, Clear Water: an interactive mockup of floating chrome made of water droplets you can drag, merge and pull apart.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..700&display=swap" rel="stylesheet">
+<style>
+/* ============================================================================
+   Nib · Direction A · Clear Water
+   Tokens mirror docs direction-a.md §3–§9. Hex values are the spec.
+   ========================================================================== */
+:root{
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Inter",system-ui,sans-serif;
+  --font-display:-apple-system,BlinkMacSystemFont,"SF Pro Display","Inter",system-ui,sans-serif;
+  --font-rounded:ui-rounded,"SF Pro Rounded","Inter",system-ui,sans-serif;
+  --font-serif:"New York",ui-serif,"Iowan Old Style",Georgia,serif;
+  --ease-out:cubic-bezier(.23,1,.32,1);
+  /* ink palette (never themed: ink is ink) */
+  --ink-carbon:#121212;--ink-graphite:#5B6068;--ink-midnight:#1B2A6B;--ink-cobalt:#2156D9;
+  --ink-lagoon:#0B8793;--ink-moss:#2F7A3C;--ink-ochre:#B7791F;--ink-sienna:#9A4E2A;
+  --ink-vermilion:#D9432B;--ink-crimson:#B0173A;--ink-plum:#7B3FA0;--ink-chalk:#F4F4F1;
+}
+html[data-theme="light"]{
+  color-scheme:light;
+  --present-bg:#E4E4E9;--present-ink:#1D1D1F;--present-ink-2:#6E6E73;--present-ctl:rgba(255,255,255,.72);
+  --label:#000000;--label-2:rgba(60,60,67,.60);--label-3:rgba(60,60,67,.30);--label-4:rgba(60,60,67,.18);
+  --sep:rgba(60,60,67,.29);--sep-soft:rgba(60,60,67,.12);
+  --fill-1:rgba(120,120,128,.20);--fill-2:rgba(120,120,128,.16);--fill-3:rgba(118,118,128,.12);--fill-4:rgba(116,116,128,.08);
+  --bg-1:#FFFFFF;--bg-2:#F2F2F7;--bg-3:#FFFFFF;--bg-sidebar:#F2F2F7;--desk:#E7E7EC;
+  --accent:#0066E0;--on-accent:#FFFFFF;--accent-wash:rgba(0,102,224,.10);
+  --red:#FF3B30;--green:#34C759;
+  /* water (the SVG filter reads these through flood-color) */
+  --w-body:rgba(255,255,255,.08);--w-edge:rgba(20,28,40,.07);--w-caustic:rgba(255,255,255,.12);
+  --w-rim:rgba(255,255,255,.85);--w-line:rgba(0,0,0,.075);--w-tint-rim:rgba(255,255,255,.30);
+  --b-body:rgba(255,255,255,.70);--b-rim:rgba(255,255,255,1);
+  --lens-clear:rgba(255,255,255,.46);--lens-deep:rgba(249,249,251,.72);--rt-fill:#F4F4F6;
+  --w-line-bud:rgba(0,0,0,.12);--scrim:rgba(0,0,0,.18);--sheet-shadow:0 24px 60px -12px rgba(0,0,0,.28);
+  --shadow-rest:0 .5px 1px rgba(0,0,0,.07),0 6px 16px -3px rgba(0,0,0,.11);
+  --shadow-lift:0 1px 2px rgba(0,0,0,.06),0 18px 36px -8px rgba(0,0,0,.22);
+  --cover-shadow:0 .5px 1px rgba(0,0,0,.10),0 3px 8px -2px rgba(0,0,0,.10);
+  --paper-shadow:0 0 0 .5px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.05),0 14px 34px -10px rgba(0,0,0,.14);
+}
+html[data-theme="dark"]{
+  color-scheme:dark;
+  --present-bg:#0C0C0E;--present-ink:#F5F5F7;--present-ink-2:#8E8E93;--present-ctl:rgba(44,44,46,.8);
+  --label:#FFFFFF;--label-2:rgba(235,235,245,.60);--label-3:rgba(235,235,245,.30);--label-4:rgba(235,235,245,.16);
+  --sep:rgba(84,84,88,.65);--sep-soft:rgba(84,84,88,.34);
+  --fill-1:rgba(120,120,128,.36);--fill-2:rgba(120,120,128,.32);--fill-3:rgba(118,118,128,.24);--fill-4:rgba(118,118,128,.18);
+  --bg-1:#000000;--bg-2:#1C1C1E;--bg-3:#2C2C2E;--bg-sidebar:#1C1C1E;--desk:#121214;
+  --accent:#3D8BFF;--on-accent:#FFFFFF;--accent-wash:rgba(61,139,255,.16);
+  --red:#FF453A;--green:#30D158;
+  --w-body:rgba(255,255,255,.03);--w-edge:rgba(255,255,255,.08);--w-caustic:rgba(255,255,255,.10);
+  --w-rim:rgba(255,255,255,.42);--w-line:rgba(255,255,255,.12);--w-tint-rim:rgba(255,255,255,.30);
+  --b-body:rgba(255,255,255,.22);--b-rim:rgba(255,255,255,.7);
+  --lens-clear:rgba(22,22,24,.62);--lens-deep:rgba(28,28,30,.86);--rt-fill:#2C2C2E;
+  --w-line-bud:rgba(255,255,255,.16);--scrim:rgba(0,0,0,.45);--sheet-shadow:0 24px 60px -12px rgba(0,0,0,.7);
+  --shadow-rest:0 .5px 1px rgba(0,0,0,.5),0 8px 20px -3px rgba(0,0,0,.55);
+  --shadow-lift:0 1px 2px rgba(0,0,0,.5),0 20px 40px -8px rgba(0,0,0,.7);
+  --cover-shadow:0 .5px 1px rgba(0,0,0,.6),0 3px 10px -2px rgba(0,0,0,.6);
+  --paper-shadow:0 0 0 .5px rgba(255,255,255,.06),0 18px 40px -12px rgba(0,0,0,.8);
+}
+
+*{box-sizing:border-box}
+html{background:var(--present-bg);transition:background-color .3s var(--ease-out)}
+body{margin:0;font-family:var(--font);color:var(--present-ink);-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;font-optical-sizing:auto}
+button{font:inherit;color:inherit}
+svg.i{width:22px;height:22px;flex:none;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;overflow:visible}
+
+/* ---------- presentation shell (not part of the product) ---------- */
+.doc{display:flex;flex-direction:column;align-items:safe center;gap:80px;padding:56px 32px 120px}
+.doc-head{width:1218px;max-width:100%;display:flex;flex-direction:column;gap:24px;padding-left:4px}
+.eyebrow{font:500 13px/18px var(--font);color:var(--present-ink-2);margin-bottom:6px}
+.doc-head h1{margin:0;font:600 34px/40px var(--font-display);letter-spacing:-.024em}
+.doc-head p{margin:10px 0 0;max-width:720px;font:400 15px/22px var(--font);color:var(--present-ink-2)}
+.ctl{display:flex;flex-wrap:wrap;gap:10px;justify-content:flex-start}
+.ctl-group{display:flex;align-items:center;gap:2px;padding:3px;border-radius:12px;background:var(--present-ctl);box-shadow:0 0 0 .5px rgba(0,0,0,.08)}
+.ctl-group b{font:500 12px/16px var(--font);color:var(--present-ink-2);padding:0 8px 0 7px}
+.ctl-group button{border:0;background:none;padding:6px 10px;border-radius:9px;font:500 13px/16px var(--font);color:var(--present-ink-2);cursor:pointer}
+.ctl-group button[aria-pressed="true"]{background:var(--bg-3);color:var(--present-ink);box-shadow:0 1px 2px rgba(0,0,0,.12),0 0 0 .5px rgba(0,0,0,.04)}
+html[data-theme="dark"] .ctl-group button[aria-pressed="true"]{background:#48484A}
+.frame{display:flex;flex-direction:column;align-items:flex-start;gap:16px}
+.frame-head{display:flex;flex-direction:column;gap:4px;padding-left:4px}
+.frame-title{font:600 17px/22px var(--font-display);letter-spacing:-.012em;display:flex;gap:10px;align-items:baseline}
+.frame-title .n{color:var(--present-ink-2);font-variant-numeric:tabular-nums;font-weight:500}
+.frame-title .meta{font:400 13px/18px var(--font);color:var(--present-ink-2)}
+.hint{margin:0;font:400 13px/19px var(--font);color:var(--present-ink-2);max-width:760px}
+.device{padding:12px;border-radius:30px;background:#0B0B0C;box-shadow:0 0 0 1px rgba(0,0,0,.4),inset 0 0 0 1px rgba(255,255,255,.07),0 40px 90px -30px rgba(0,0,0,.45)}
+.device.phone{padding:11px;border-radius:66px}
+.row-phones{display:flex;gap:56px;align-items:flex-start}
+
+/* ---------- a screen and its layers ---------- */
+.screen{position:relative;overflow:hidden;border-radius:18px;isolation:isolate;background:var(--desk);color:var(--label);font-family:var(--font);user-select:none;-webkit-user-select:none}
+.phone .screen{border-radius:55px}
+.scene{position:absolute;inset:0}
+.chrome{position:absolute;inset:0;pointer-events:none;transition:opacity .22s var(--ease-out)}
+.lens-layer,.content-layer{position:absolute;inset:0;pointer-events:none}
+svg.water{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
+.content-layer>*{pointer-events:auto}
+/* recede (§10.8): only droplets over the page or within 24 pt of the stroke fade to 22 %; backdrop sampling freezes for all */
+.writing .lens{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+.writing .recede{filter:opacity(.22)!important;transition:filter .1s var(--ease-out)!important}
+svg.water,.dclip{transition:filter .22s var(--ease-out)}
+.dclip{position:absolute;left:0;top:0;transform-origin:0 0;overflow:hidden;pointer-events:none;will-change:transform}
+
+.lens{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform;box-shadow:var(--shadow-rest);transition:opacity .18s var(--ease-out),box-shadow .25s var(--ease-out),filter .22s var(--ease-out),background-color .18s var(--ease-out)}
+.lens.clear{background:var(--lens-clear);-webkit-backdrop-filter:saturate(1.7) brightness(1.04) blur(5px);backdrop-filter:saturate(1.7) brightness(1.04) blur(5px)}
+html[data-theme="dark"]:not([data-transparency="reduce"]):not([data-liquid="off"]) .lens.clear.paper{background:rgba(22,22,24,.80)}
+.lens.deep{background:var(--lens-deep);-webkit-backdrop-filter:blur(26px) saturate(1.8);backdrop-filter:blur(26px) saturate(1.8)}
+.lens.tinted{background:var(--accent);-webkit-backdrop-filter:none;backdrop-filter:none}
+.lens.lifted{box-shadow:var(--shadow-lift)}
+html[data-transparency="reduce"] .lens.clear,html[data-transparency="reduce"] .lens.deep,html[data-liquid="off"] .lens.clear,html[data-liquid="off"] .lens.deep{background:var(--rt-fill);-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
+.dc{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform;transition:filter .22s var(--ease-out)}
+
+/* ---------- controls that live on water ---------- */
+.pill-row{display:flex;align-items:center;height:100%;padding:0 4px}
+.icon-btn{width:40px;height:44px;border:0;margin:0;padding:0;background:none;color:var(--label);display:grid;place-items:center;border-radius:22px;cursor:pointer;transition:transform .16s var(--ease-out),opacity .16s}
+.icon-btn:active{transform:scale(.96)}
+.icon-btn:focus-visible,.tool:focus-visible,.swatch:focus-visible,.btn:focus-visible,.seg button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.icon-btn .i{width:21px;height:21px}
+.vsep{width:.5px;height:22px;background:var(--sep);margin:0 6px}
+.doc-title{display:flex;flex-direction:column;justify-content:center;padding:0 16px 0 2px;min-width:0}
+.doc-title .t1{font:600 15px/19px var(--font);letter-spacing:-.012em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.doc-title .t2{font:600 12px/15px var(--font);color:var(--label);white-space:nowrap}   /* §2.4: small text on Clear is `label` semibold */
+.hud{gap:2px;padding:0 12px 0 4px}
+.hud .pg{font:600 13px/16px var(--font-rounded);font-variant-numeric:tabular-nums;color:var(--label)}
+.hud .pg span{color:var(--label);font-weight:500}
+
+/* status bars */
+.status{position:absolute;left:0;right:0;top:0;height:24px;display:flex;align-items:center;justify-content:space-between;padding:0 20px 0 22px;font:600 13px/16px var(--font);letter-spacing:-.01em;color:var(--label);z-index:5;pointer-events:none}
+.status .r{display:flex;gap:6px;align-items:center;font-weight:600}
+.status svg{height:12px;width:auto}
+.phone .status{height:54px;padding:0 32px 0 50px;font:600 17px/22px var(--font);align-items:center}
+.island{position:absolute;left:50%;top:11px;width:126px;height:37px;margin-left:-63px;background:#000;border-radius:20px;z-index:6}
+.homebar{position:absolute;left:50%;bottom:8px;width:134px;height:5px;margin-left:-67px;border-radius:3px;background:var(--label);opacity:.9;z-index:6;pointer-events:none}
+
+/* ---------- editor scene ---------- */
+.desk{position:absolute;inset:0;background:var(--desk)}
+.page{position:absolute;left:0;top:0;background:#fff;box-shadow:var(--paper-shadow);touch-action:none;cursor:crosshair;overflow:hidden}
+.page svg{display:block;width:100%;height:100%}
+.page .hand{font-family:"Segoe Print","Bradley Hand","Noteworthy","Ink Free",cursive}
+.page .serif{font-family:var(--font-serif)}
+.prop-strike{stroke:var(--red);transition:opacity .25s}
+.wrong{transition:opacity .3s}
+.page.discarded .prop-strike{opacity:0}
+
+/* palette */
+.palette{touch-action:none;cursor:grab;overflow:hidden}
+.palette.grabbing{cursor:grabbing}
+.tool{position:absolute;left:0;top:0;width:44px;height:44px;border:0;margin:0;padding:0;background:none;color:var(--label);display:grid;place-items:center;border-radius:22px;cursor:pointer;opacity:.74;transition:opacity .12s}
+.tool[aria-pressed="true"]{opacity:1}
+.tool .i{width:23px;height:23px}
+.pdiv{position:absolute;left:0;top:0;background:var(--sep)}
+.swatch{position:absolute;left:0;top:0;width:44px;height:44px;border:0;margin:0;padding:0;background:none;display:grid;place-items:center;cursor:pointer;border-radius:22px}
+.swatch i{display:block;width:22px;height:22px;border-radius:50%;background:var(--c);box-shadow:inset 0 0 0 .5px rgba(0,0,0,.22);outline:0 solid transparent;outline-offset:2.5px;transition:outline-color .15s}
+.swatch[aria-pressed="true"] i{outline:2px solid var(--label)}
+
+/* popovers on deep water */
+.pop{padding:16px 16px 0;opacity:0;filter:blur(3px);transition:opacity .12s var(--ease-out),filter .12s var(--ease-out);pointer-events:none}
+.pop.shown{opacity:1;filter:blur(0);transition-duration:.22s;pointer-events:auto}
+.pop-head{display:flex;align-items:baseline;justify-content:space-between;height:24px}
+.pop-title{font:600 17px/22px var(--font);letter-spacing:-.02em}
+.pop-sub{font:400 13px/18px var(--font);color:var(--label-2)}
+.pen-types{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:12px}
+.pen-types button{height:52px;border:0;border-radius:10px;background:none;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:var(--label-2);cursor:pointer;transition:background-color .15s,color .15s}
+.pen-types button .i{width:22px;height:22px}
+.pen-types button span{font:500 11px/13px var(--font)}
+.pen-types button[aria-checked="true"]{background:var(--fill-3);color:var(--label)}
+.pop-sec{display:flex;justify-content:space-between;align-items:baseline;margin-top:16px;height:18px;font:600 13px/18px var(--font);color:var(--label-2)}
+.pop-sec .val{font:500 13px/18px var(--font-rounded);font-variant-numeric:tabular-nums}
+.pop-sec .link{border:0;background:none;padding:0;color:var(--accent);font:500 13px/18px var(--font);cursor:pointer}
+.sizes{display:flex;gap:8px;margin-top:8px}
+.sizes button{width:44px;height:40px;border:0;border-radius:12px;background:none;display:grid;place-items:center;cursor:pointer;transition:background-color .15s}
+.sizes button i{display:block;border-radius:50%;background:var(--label)}
+.sizes button[aria-checked="true"]{background:var(--fill-3)}
+.colors{display:grid;grid-template-columns:repeat(6,44px);justify-content:space-between;row-gap:0;margin-top:4px}
+.colors .swatch{position:static;width:44px;height:44px}
+.colors .swatch i{width:26px;height:26px}
+.slider{position:relative;height:28px;margin-top:10px;touch-action:none;cursor:pointer}
+.slider .track{position:absolute;left:0;right:0;top:12px;height:4px;border-radius:2px;background:var(--fill-1)}
+.slider .fill{position:absolute;left:0;top:12px;height:4px;border-radius:2px;background:var(--label);width:calc(var(--v)*100%)}
+.slider .thumb{position:absolute;top:0;left:0;width:28px;height:28px;border-radius:14px;background:#fff;box-shadow:0 0 0 .5px rgba(0,0,0,.06),0 3px 8px rgba(0,0,0,.16),0 1px 1px rgba(0,0,0,.08),inset 0 1px 0 rgba(255,255,255,.9);will-change:transform}
+html[data-theme="dark"] .slider .thumb{background:#F2F2F7}
+
+/* assistant panel */
+.ai{display:flex;flex-direction:column;height:100%;padding:0}
+.ai-head{display:flex;align-items:center;gap:10px;height:60px;padding:0 12px 0 18px}
+.ai-mark{width:30px;height:30px;border-radius:15px;display:grid;place-items:center;background:var(--fill-3);color:var(--label)}
+.ai-mark .i{width:17px;height:17px}
+.ai-titles{flex:1;min-width:0}
+.ai-title{font:600 17px/20px var(--font);letter-spacing:-.02em}
+.ai-model{font:400 12px/15px var(--font);color:var(--label-2)}
+.round-btn{width:30px;height:30px;border:0;border-radius:15px;background:var(--fill-3);display:grid;place-items:center;color:var(--label-2);cursor:pointer}
+.round-btn .i{width:15px;height:15px;stroke-width:2.2}
+.ai-scope{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:2px 18px 14px}
+.seg{display:flex;padding:2px;border-radius:9px;background:var(--fill-3)}
+.seg button{border:0;background:none;height:28px;padding:0 14px;border-radius:7px;font:500 13px/16px var(--font);color:var(--label);cursor:pointer}
+.seg button[aria-selected="true"]{background:var(--bg-3);box-shadow:0 1px 2px rgba(0,0,0,.12),0 0 0 .5px rgba(0,0,0,.04);font-weight:600}
+html[data-theme="dark"] .seg button[aria-selected="true"]{background:#636366}
+.scope-chip{display:flex;align-items:center;gap:6px;height:28px;padding:0 10px 0 8px;border:0;border-radius:14px;background:none;color:var(--label-2);font:500 13px/16px var(--font);cursor:pointer}
+.scope-chip .i{width:15px;height:15px}
+.ai-thread{flex:1;overflow:hidden;padding:4px 16px 0;border-top:.5px solid var(--sep-soft)}
+.turn{margin-top:18px}
+.who{display:flex;align-items:center;gap:6px;font:600 12px/16px var(--font);color:var(--label-2);letter-spacing:.01em}
+.who .i{width:13px;height:13px}
+.turn p{margin:5px 0 0;font:400 15px/21px var(--font);letter-spacing:-.012em;color:var(--label)}
+.turn.you p{color:var(--label)}
+.math{font-family:var(--font-serif);font-style:italic;font-size:16px;letter-spacing:0}
+.cite{display:inline-flex;align-items:center;gap:3px;padding:0 6px;height:20px;border-radius:6px;background:var(--accent-wash);color:var(--accent);font:600 12px/20px var(--font);vertical-align:1px;cursor:pointer}
+.trace{list-style:none;margin:12px 0 0;padding:0;display:flex;flex-direction:column;gap:4px}
+.trace li{display:flex;align-items:center;gap:7px;font:400 12px/16px var(--font);color:var(--label-2)}
+.trace .i{width:13px;height:13px;color:var(--green);stroke-width:2.4}
+.proposal{margin-top:18px;padding:14px 14px 12px;border-radius:12px;background:var(--fill-4);transition:opacity .2s}
+.prop-headrow{display:flex;justify-content:space-between;align-items:baseline}
+.prop-headrow b{font:600 15px/20px var(--font);letter-spacing:-.012em}
+.prop-headrow span{font:400 13px/18px var(--font);color:var(--label-2)}
+.changes{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:10px}
+.changes li{display:grid;grid-template-columns:22px 1fr;gap:8px;align-items:start}
+.chg{width:22px;height:22px;border-radius:11px;display:grid;place-items:center;font:700 14px/1 var(--font-rounded);color:#fff}
+.chg.del{background:var(--red)}
+.chg.add{background:var(--accent)}
+.chg-t{font:500 14px/19px var(--font);letter-spacing:-.01em}
+.chg-s{font:400 12px/16px var(--font);color:var(--label-2);margin-top:1px}
+.prop-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
+.btn{height:38px;border:0;border-radius:19px;font:600 15px/20px var(--font);letter-spacing:-.012em;background:var(--fill-3);color:var(--label);cursor:pointer;transition:transform .16s var(--ease-out),background-color .2s}
+.btn:active{transform:scale(.96)}
+.btn.primary{background:var(--accent);color:var(--on-accent)}
+.prop-foot{display:flex;align-items:center;gap:6px;margin-top:10px;font:400 12px/16px var(--font);color:var(--label-2)}
+.prop-foot .i{width:14px;height:14px}
+.applied{display:none;align-items:center;justify-content:space-between;margin-top:18px;padding:0 4px 0 2px;height:38px;font:500 14px/19px var(--font)}
+.applied span{display:flex;gap:7px;align-items:center}
+.applied .i{width:16px;height:16px;color:var(--green);stroke-width:2.4}
+.applied button{border:0;background:none;color:var(--accent);font:600 15px/20px var(--font);cursor:pointer}
+.ai.done .proposal{display:none}
+.ai.done .applied{display:flex}
+.ai-compose{padding:12px 12px 12px}
+.field{display:flex;align-items:center;gap:4px;height:44px;padding:0 5px 0 14px;border-radius:22px;background:var(--fill-4);box-shadow:inset 0 0 0 .5px var(--sep-soft)}
+.field input{flex:1;min-width:0;border:0;margin:0;padding:0;background:none;outline:0;font:400 15px/20px var(--font);color:var(--label);letter-spacing:-.012em;user-select:text;-webkit-user-select:text}
+.field input::placeholder{color:var(--label-3)}
+.field .icon-btn{width:34px;height:34px;color:var(--label-2)}
+.field .icon-btn .i{width:19px;height:19px}
+/* Send is a `label` arrow on fill3, shown only once there is something to send (120 ms fade) */
+.send{width:32px;height:32px;border:0;border-radius:16px;background:var(--fill-3);color:var(--label);display:grid;place-items:center;cursor:pointer;opacity:0;pointer-events:none;transition:opacity .12s var(--ease-out)}
+.field.has-text .send{opacity:1;pointer-events:auto}
+.send .i{width:16px;height:16px;stroke-width:2.3}
+.usage{margin:8px 0 0;text-align:center;font:400 11px/13px var(--font);color:var(--label-2)}
+
+/* proposal chip on the page */
+.chip{display:flex;align-items:center;height:100%;padding:0 4px 0 12px;gap:2px;touch-action:none;cursor:grab}
+.chip .lbl{display:flex;align-items:center;gap:6px;flex:1;font:600 15px/20px var(--font);letter-spacing:-.012em;white-space:nowrap}
+.chip .lbl .i{width:15px;height:15px;color:var(--accent)}
+.chip .icon-btn{width:32px;height:32px;border-radius:16px}
+.chip .icon-btn .i{width:17px;height:17px;stroke-width:2.1}
+.chip .ok{background:var(--accent);color:#fff;margin-left:4px}
+
+/* toast */
+.toast{display:flex;align-items:center;justify-content:space-between;height:100%;padding:0 8px 0 18px;font:500 14px/19px var(--font);letter-spacing:-.01em;opacity:0;transition:opacity .2s var(--ease-out)}
+.toast.shown{opacity:1}
+.toast button{border:0;background:none;color:var(--accent);font:600 15px/20px var(--font);padding:0 12px;height:36px;border-radius:18px;cursor:pointer}
+
+/* ---------- library ---------- */
+.lib{position:absolute;inset:0;background:var(--bg-1)}
+.side{position:absolute;left:0;top:0;bottom:0;width:320px;background:var(--bg-sidebar);box-shadow:inset -.5px 0 0 var(--sep-soft)}
+.big{position:absolute;margin:0;font:700 34px/41px var(--font-display);letter-spacing:-.024em}
+.srow{position:absolute;left:12px;width:296px;height:44px;border-radius:10px;display:flex;align-items:center;gap:13px;padding:0 12px;font:400 17px/22px var(--font);letter-spacing:-.018em}
+.srow .i{width:22px;height:22px;color:var(--label-2)}
+.srow .t{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}   /* one line, tail truncation */
+.srow .n{margin-left:auto;font:400 15px/20px var(--font);color:var(--label-2);font-variant-numeric:tabular-nums}
+.srow.sel{background:var(--fill-3);font-weight:600}
+.srow.sel .i{color:var(--accent)}
+.srow .fold{fill:var(--fc);stroke:none}
+.shead{position:absolute;left:24px;right:24px;display:flex;justify-content:space-between;align-items:center;font:600 15px/20px var(--font);letter-spacing:-.012em;color:var(--label-2)}
+.shead .i{width:15px;height:15px;stroke-width:2}
+.sync{position:absolute;left:24px;right:14px;bottom:18px;display:flex;align-items:center;gap:8px;font:400 13px/18px var(--font);color:var(--label-2)}
+.sync .i{width:18px;height:18px}
+.sync .icon-btn{margin-left:auto;color:var(--label-2)}
+.lsub{position:absolute;margin:0;font:400 13px/18px var(--font);color:var(--label-2)}
+.sec{position:absolute;margin:0;font:600 20px/25px var(--font-display);letter-spacing:-.02em}
+.ftile{position:absolute;height:78px;border-radius:14px;background:var(--bg-2);display:flex;align-items:center;gap:12px;padding:0 14px}
+.ftile .i{width:34px;height:34px;flex:none;fill:var(--fc);stroke:none}
+.ftile>div{min-width:0}
+.ftile b{display:block;font:600 15px/19px var(--font);letter-spacing:-.012em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ftile span{display:block;font:400 13px/17px var(--font);color:var(--label-2)}
+.card{touch-action:none;cursor:grab}
+.card .cover{position:absolute;inset:0;border-radius:5px 8px 8px 5px;overflow:hidden;box-shadow:var(--cover-shadow);background:#fff;transition:box-shadow .25s var(--ease-out)}
+.card.lifted .cover{box-shadow:0 2px 4px rgba(0,0,0,.12),0 22px 40px -12px rgba(0,0,0,.35)}
+.card .meta{position:absolute;left:0;right:0;top:100%;padding-top:10px;transition:opacity .15s var(--ease-out)}
+.card.lifted .meta{opacity:0}
+.card .meta b{display:block;font:600 13px/16px var(--font);letter-spacing:-.008em;color:var(--label);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card .meta span{display:flex;align-items:center;gap:4px;margin-top:2px;font:400 12px/16px var(--font);color:var(--label-2)}
+.card .meta .i{width:11px;height:11px;fill:var(--label-2);stroke:none}
+.behind{position:absolute;inset:0;pointer-events:none}
+.behind .cover{transform:translate(7px,-6px) rotate(3.5deg)}
+.cloth{background:var(--cc)!important}
+.cloth::before{content:"";position:absolute;inset:0;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='140' height='182'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 .07 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");mix-blend-mode:overlay}
+.cloth .spine{position:absolute;left:0;top:0;bottom:0;width:13px;background:rgba(0,0,0,.16);box-shadow:inset -1px 0 0 rgba(255,255,255,.07)}
+.cloth .band{position:absolute;right:17px;top:0;bottom:0;width:5px;background:rgba(0,0,0,.30);box-shadow:inset 1px 0 0 rgba(255,255,255,.10),1px 0 1px rgba(0,0,0,.12)}
+.cloth.light .band{background:rgba(40,30,20,.55)}
+.cloth .plate{position:absolute;left:30px;right:34px;top:34px;height:30px;border-radius:3px;box-shadow:inset 0 0 0 .75px rgba(255,255,255,.28)}
+.cloth.light .plate{box-shadow:inset 0 0 0 .75px rgba(60,40,20,.28)}
+.mini{position:absolute;left:0;top:0;width:140px;height:198px}
+.pdfp{position:absolute;inset:14px 14px auto 14px}
+.pdfp i{display:block;height:3px;border-radius:1.5px;background:#D5D7DC;margin-top:5px}
+.pdfp i.h{height:6px;width:60%;background:#8B8F97;margin:2px 0 9px}
+.pdfp i.s{width:72%}
+.pdfp .eq{font:italic 10px/12px var(--font-serif);color:#6B7079;margin:7px 0 2px 8px}
+.board{position:absolute;inset:0;background-color:#FBFBFC;background-image:radial-gradient(circle,#CDD1D8 .9px,transparent 1.2px);background-size:12px 12px}
+.board .st{position:absolute;width:34px;height:30px;border-radius:2px;box-shadow:0 1px 2px rgba(0,0,0,.14)}
+.board svg{position:absolute;inset:0}
+.study{position:absolute;inset:0;background:#fff;display:flex;flex-direction:column;justify-content:center;padding:0 16px}
+.study q{quotes:none;font:italic 15px/19px var(--font-serif);color:#1d1d1f}
+.study small{margin-top:10px;font:500 11px/13px var(--font);color:#8E8E93}
+.study-edge{position:absolute;left:6px;right:6px;bottom:-5px;height:5px;border-radius:0 0 6px 6px;background:#E5E5EA}
+.textdoc{position:absolute;inset:16px 16px auto}
+.textdoc b{display:block;font:700 12px/15px var(--font);color:#1d1d1f;margin-bottom:6px}
+.textdoc i{display:block;height:3px;border-radius:1.5px;background:#DADCE0;margin-top:5px}
+.badge{position:absolute;right:6px;bottom:6px;width:20px;height:20px;border-radius:6px;background:rgba(255,255,255,.9);box-shadow:0 0 0 .5px rgba(0,0,0,.08);display:grid;place-items:center;color:#636366}
+.badge .i{width:13px;height:13px;stroke-width:1.9}
+
+
+/* ---------- locked-design additions ---------- */
+code{font:500 13px/1 ui-monospace,"SF Mono",Menlo,monospace;background:var(--present-ctl);padding:2px 5px;border-radius:5px}
+.bud-line{stroke:var(--w-line-bud)}
+.bead-ink{opacity:.15}
+.kh{display:inline-grid;place-items:center;min-width:22px;height:20px;padding:0 5px;border-radius:6px;background:var(--fill-3);color:var(--label-2);font:500 11px/13px var(--font);font-style:normal}
+
+/* assistant: context chips, numbered rows, include boxes, receipt */
+.ctx{display:flex;flex-wrap:nowrap;gap:6px;padding:0 16px 12px;overflow-x:auto;scrollbar-width:none}
+.ctx::-webkit-scrollbar{display:none}
+.ctx>*{flex:none}
+.chip2{display:inline-flex;align-items:center;gap:2px;height:28px;padding:0 3px 0 10px;border:0;border-radius:14px;background:var(--fill-3);color:var(--label-2);font:400 12px/16px var(--font);white-space:nowrap}
+.chip2>.i{width:14px;height:14px}
+.chip2 button{width:20px;height:20px;border:0;border-radius:11px;background:none;color:var(--label-3);display:grid;place-items:center;cursor:pointer;padding:0}
+.chip2 button .i{width:11px;height:11px;stroke-width:2.4}
+.chip2.add{padding:0;width:28px;justify-content:center;cursor:pointer}   /* the one place context is added */
+.chip2.off{opacity:.4;text-decoration:line-through}
+.nb{width:22px;height:22px;border-radius:11px;background:var(--accent);color:#fff;font:700 13px/22px var(--font-rounded);text-align:center;font-variant-numeric:tabular-nums}
+.nb.red{background:var(--red)}
+.changes li{grid-template-columns:22px 1fr 36px;gap:10px}
+.changes li.dz{grid-template-columns:22px 1fr auto;align-items:center}
+.changes li.off .chg-t,.changes li.off .chg-s{opacity:.45}
+/* include toggles: a 22 pt ring with a `label` check; accent only for the focus ring */
+.chk{width:36px;height:36px;margin:-7px -7px -7px 0;border:0;background:none;display:grid;place-items:center;cursor:pointer;color:var(--label-3);border-radius:18px}
+.chk .i{width:22px;height:22px}
+.chk[aria-checked="true"]{color:var(--label)}
+.chk:focus-visible{outline:2px solid var(--accent);outline-offset:-5px}
+.eye{margin-left:auto;border:0;background:none;display:flex;gap:4px;align-items:center;color:var(--accent);font:400 13px/18px var(--font);cursor:pointer;padding:0}
+.eye .i{width:15px;height:15px}
+.eye[aria-pressed="false"]{color:var(--label-2)}
+.prop-headrow{gap:8px;justify-content:flex-start}
+.btn.danger{display:inline-flex;align-items:center;height:32px;padding:0 12px;background:var(--fill-3);color:var(--red);font:600 13px/16px var(--font);white-space:nowrap}   /* secondary: one filled primary per card */
+.btn[disabled]{opacity:.4;pointer-events:none}
+.deleted{display:flex;gap:5px;align-items:center;font:400 12px/16px var(--font);color:var(--label-2);white-space:nowrap}
+.deleted .i{width:13px;height:13px;color:var(--green);stroke-width:2.4}
+.page .wash{fill:var(--accent-wash);opacity:0;transition:opacity .12s var(--ease-out)}
+.page.flash .wash{opacity:1}
+.cite{border:0}
+.deleted button{border:0;background:none;padding:0;color:var(--accent);font:600 12px/16px var(--font);cursor:pointer}
+.applied .acts{display:flex;gap:16px;align-items:center}
+.applied .acts button{display:flex;gap:6px;align-items:center}
+
+/* on-page proofreader marks: ghost ink in your pen, numbered badges */
+.page .prop-new{fill:var(--ink-carbon);opacity:.42;transition:opacity .35s var(--ease-out),transform .5s cubic-bezier(.32,.72,0,1)}
+.page .mbadge circle{fill:var(--accent)}
+.page .mbadge.red circle{fill:var(--red)}
+.page .mbadge text{fill:#fff;font:700 13px/1 var(--font-rounded);text-anchor:middle}
+.page .mbadge,.page .stray,.page .tie{transition:opacity .22s var(--ease-out)}
+.page .tie{stroke:var(--accent);stroke-width:1.06}
+.page.tethering .tie,.page.acc2 .tie,.page.x2 .tie,.page.discarded .tie,.page.hide-marks .tie{opacity:0}
+.page.acc1 .prop-strike,.page.acc1 .wrong,.page.acc1 .mbadge[data-n="1"]{opacity:0}
+.page.acc2 .prop-new{opacity:1}
+.page.acc2 .mbadge[data-n="2"]{opacity:0}
+.page.x1:not(.acc1) .prop-strike,.page.x1 .mbadge[data-n="1"]{opacity:.12}
+.page.x2 .prop-new,.page.x2 .mbadge[data-n="2"]{opacity:.1}
+.page.discarded .prop-new,.page.discarded .mbadge{opacity:0}
+.page.hide-marks .prop-new,.page.hide-marks .mbadge,.page.hide-marks .prop-strike{opacity:0}
+.page.stray-gone .stray,.page.stray-gone .mbadge.red{opacity:0}
+
+/* library: folder films, sidebar "+1" pill, absorb gulp */
+.lib .ftile{transition:transform .44s cubic-bezier(.3,1.25,.5,1)}
+.lib .ftile .film{position:absolute;inset:-4px;border-radius:18px;pointer-events:none;opacity:0;background:var(--w-body);box-shadow:inset 0 0 0 .8px var(--w-line),inset 1.2px 1.6px 0 -.3px var(--w-rim),inset -3px -4px 8px -4px var(--w-caustic),var(--shadow-rest);transition:opacity .26s var(--ease-out) var(--d,0ms),background-color .2s var(--ease-out)}
+.lib.films .ftile .film{opacity:1}
+.lib .ftile.fused{transform:scale(1.03)}
+.lib .ftile.fused .film{background:var(--accent-wash)}
+.lib .ftile.gulp,.lib .srow.gulp{transform:scale(1.03);transition:none}
+.lib .srow{transition:transform .44s cubic-bezier(.3,1.25,.5,1),background-color .2s var(--ease-out)}
+.srow .pill1{position:absolute;right:48px;height:26px;min-width:34px;padding:0 9px;border-radius:13px;display:grid;place-items:center;font:600 13px/1 var(--font-rounded);color:var(--label);background:var(--lens-clear);box-shadow:inset 0 0 0 .8px var(--w-line),inset 1px 1.3px 0 -.2px var(--w-rim),var(--shadow-rest);transform:scale(.25);opacity:0;transform-origin:0 50%;transition:transform .42s cubic-bezier(.3,1.25,.5,1),opacity .18s var(--ease-out)}
+.srow.target{background:var(--accent-wash)}
+.srow.target .pill1{transform:scale(1);opacity:1}
+.card.static,.static .card{position:absolute}
+
+/* sheets (opaque grouped surfaces) */
+.scrim{position:absolute;inset:0;background:var(--scrim)}
+.sheet{position:absolute;background:var(--bg-2);border-radius:28px;box-shadow:var(--sheet-shadow);overflow:hidden;color:var(--label)}
+.sheet-head{position:relative;display:flex;align-items:center;justify-content:space-between;height:60px;padding:0 20px}
+.sheet-head h3{position:absolute;left:0;right:0;margin:0;text-align:center;font:600 20px/25px var(--font-display);letter-spacing:-.02em;pointer-events:none}
+.txtbtn{border:0;background:none;padding:0;height:44px;color:var(--accent);font:400 17px/22px var(--font);letter-spacing:-.02em;cursor:pointer}
+.tinted{height:38px;border:0;border-radius:19px;padding:0 18px;background:var(--accent);color:#fff;font:600 15px/20px var(--font);letter-spacing:-.012em;cursor:pointer;transition:transform .16s var(--ease-out)}
+.tinted:active{transform:scale(.96)}   /* press feedback is scale 0.96 on `tap`; no ripple (§10.14) */
+.sec-label{margin:0 0 8px;font:600 13px/18px var(--font);color:var(--label-2)}
+.nseg{position:relative;display:flex;padding:2px;border-radius:9px;background:var(--fill-3);height:32px}
+.nseg button{position:relative;z-index:1;flex:1;border:0;background:none;height:28px;border-radius:7px;font:500 13px/16px var(--font);color:var(--label);cursor:pointer;white-space:nowrap;padding:0 12px}
+.nseg button[aria-checked="true"]{font-weight:600}
+.nseg .knob{position:absolute;top:2px;left:0;height:28px;border-radius:7px;background:var(--bg-3);box-shadow:0 1px 2px rgba(0,0,0,.12),0 0 0 .5px rgba(0,0,0,.04);transition:transform .3s cubic-bezier(.3,1.1,.5,1),width .3s cubic-bezier(.3,1.1,.5,1)}
+html[data-theme="dark"] .nseg .knob{background:#636366}
+.gfield{display:flex;align-items:center;gap:8px;height:44px;padding:0 6px 0 14px;border-radius:10px;background:var(--bg-3);font:400 17px/22px var(--font);letter-spacing:-.02em}
+.gfield .ph{flex:1;color:var(--label-3)}
+.gfield .use{height:30px;border:0;border-radius:15px;padding:0 12px;background:var(--fill-3);color:var(--accent);font:600 13px/16px var(--font);cursor:pointer;display:flex;gap:5px;align-items:center}
+.gfield .use .i{width:14px;height:14px}
+.strip{display:flex;gap:12px;overflow-x:auto;padding:6px 6px 10px;margin:0 -6px;scrollbar-width:none}
+.strip::-webkit-scrollbar{display:none}
+.pick{position:relative;flex:none;border:0;padding:0;background:none;cursor:pointer;border-radius:8px}
+/* one selection ring for covers and papers: 2 pt accent, 3 pt outside, concentric */
+.pick::after{content:"";position:absolute;inset:-3px;border-radius:11px;box-shadow:0 0 0 2px transparent;transition:box-shadow .15s var(--ease-out);pointer-events:none}
+.pick.paper::after{bottom:auto;height:141px;border-radius:7px}
+.pick[aria-checked="true"]::after{box-shadow:0 0 0 2px var(--accent)}
+.pick .cv{display:block;position:relative;width:88px;height:116px;border-radius:5px 8px 8px 5px;overflow:hidden;box-shadow:var(--cover-shadow)}
+.pick .none{width:88px;height:116px;border-radius:5px 8px 8px 5px;background:#fff;box-shadow:inset 0 0 0 .5px rgba(0,0,0,.14);display:grid;place-items:center;color:#8E8E93;font:500 12px/16px var(--font)}
+.pick small{display:block;margin-top:6px;font:400 12px/16px var(--font);color:var(--label-2);text-align:center}
+.papers{display:grid;grid-template-columns:repeat(4,104px);gap:16px 18px;padding-bottom:16px}
+/* the paper grid scrolls; its bottom 16 pt fades so a cut-off row reads as "more below", not as a clipping bug */
+.papers-scroll{flex:1;height:218px;padding:26px 6px 0;overflow-y:auto;scrollbar-width:none;-webkit-mask-image:linear-gradient(#000 calc(100% - 16px),transparent);mask-image:linear-gradient(#000 calc(100% - 16px),transparent)}
+.papers-scroll::-webkit-scrollbar{display:none}
+.paper .pv{display:block;width:104px;height:135px;border-radius:4px;overflow:hidden;background:#fff;box-shadow:var(--cover-shadow)}
+.paper .pv svg{display:block;width:100%;height:100%}
+.groups{list-style:none;margin:0;padding:0;width:150px;flex:none}
+.groups li{height:32px;display:flex;align-items:center;padding:0 12px;border-radius:10px;font:400 15px/20px var(--font);color:var(--label);cursor:pointer}
+.groups li[aria-selected="true"]{background:var(--fill-3);font-weight:600}
+.opts{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.menu-btn{display:flex;align-items:center;gap:6px;height:36px;padding:0 12px;border:0;border-radius:10px;background:var(--bg-3);color:var(--label);font:400 15px/20px var(--font);cursor:pointer}
+.menu-btn .i{width:12px;height:12px;color:var(--label-2)}
+.pswatch{width:26px;height:26px;border-radius:13px;border:0;padding:0;cursor:pointer;box-shadow:inset 0 0 0 .5px rgba(0,0,0,.22);outline:2px solid transparent;outline-offset:2.5px}
+.pswatch[aria-checked="true"]{outline-color:var(--label)}
+
+/* grouped lists (Settings, plugins) */
+.split{position:absolute;inset:60px 0 0 0;display:flex}
+.split-side{width:220px;flex:none;padding:4px 10px;border-right:.5px solid var(--sep-soft)}
+.split-main{flex:1;overflow:hidden;padding:4px 24px 24px;background:var(--bg-2)}
+.nrow{display:flex;align-items:center;gap:12px;min-height:44px;padding:0 12px;border-radius:10px;font:400 17px/22px var(--font);letter-spacing:-.02em;color:var(--label);cursor:pointer}
+.nrow .i{width:21px;height:21px;color:var(--label-2)}
+.nrow[aria-selected="true"]{background:var(--fill-3);font-weight:600}
+.nrow[aria-selected="true"] .i{color:var(--accent)}
+.gtitle{margin:10px 0 14px;font:700 28px/34px var(--font-display);letter-spacing:-.02em}
+.group{background:var(--bg-3);border-radius:10px;overflow:hidden;margin-bottom:6px}
+.gcap{margin:22px 16px 6px;font:400 13px/18px var(--font);color:var(--label-2);text-transform:none}
+.gfoot{margin:6px 16px 0;font:400 13px/18px var(--font);color:var(--label-2)}
+.grow{display:flex;align-items:center;gap:12px;min-height:44px;padding:0 16px;position:relative;font:400 17px/22px var(--font);letter-spacing:-.02em}
+.grow+.grow::before{content:"";position:absolute;left:16px;right:0;top:0;height:.5px;background:var(--sep)}
+.grow.ic+.grow.ic::before{left:57px}
+.grow .val{margin-left:auto;color:var(--label-2);display:flex;gap:6px;align-items:center}
+.grow .val .i{width:13px;height:13px;color:var(--label-3)}
+.grow .sw{margin-left:auto}
+.grow .nseg{margin-left:auto;width:216px}
+.sq29{width:29px;height:29px;border-radius:7px;display:grid;place-items:center;background:var(--fill-3);color:var(--label);flex:none}
+.sq29 .i{width:17px;height:17px}
+.sw{position:relative;width:51px;height:31px;border:0;border-radius:16px;background:var(--fill-1);padding:0;cursor:pointer;transition:background-color .2s var(--ease-out);flex:none}
+.sw[aria-checked="true"]{background:var(--green)}
+.sw i{position:absolute;top:2px;left:2px;width:27px;height:27px;border-radius:14px;background:#fff;box-shadow:0 3px 8px rgba(0,0,0,.15),0 1px 1px rgba(0,0,0,.16),0 0 0 .5px rgba(0,0,0,.04);transition:transform .32s cubic-bezier(.3,1.2,.5,1),width .2s cubic-bezier(.3,1.2,.5,1),height .2s cubic-bezier(.3,1.2,.5,1),top .2s cubic-bezier(.3,1.2,.5,1)}
+.sw[aria-checked="true"] i{transform:translateX(20px)}
+.sw.sq i{width:35px;height:23px;top:4px;transition-duration:.32s,.12s,.12s,.12s}
+.sw.sq[aria-checked="true"] i{transform:translateX(12px)}
+
+/* plugin manager */
+.plist{width:320px;flex:none;border-right:.5px solid var(--sep-soft);padding:8px 10px;overflow:hidden}
+.prow{display:flex;gap:12px;align-items:center;padding:10px 10px;border-radius:12px;cursor:pointer}
+.prow[aria-selected="true"]{background:var(--fill-3)}
+.prow b{display:block;font:600 15px/20px var(--font);letter-spacing:-.012em}
+.prow span{display:block;font:400 12px/16px var(--font);color:var(--label-2)}
+.prow .meta{flex:1;min-width:0}
+.prow .upd{display:inline-block;vertical-align:1px;margin-left:4px;font:600 11px/13px var(--font);color:var(--accent);background:var(--accent-wash);padding:2px 7px;border-radius:9px}
+.pdetail{flex:1;padding:18px 24px;overflow:hidden}
+.phead{display:flex;gap:14px;align-items:center}
+.phead .sq29{width:58px;height:58px;border-radius:13px}
+.phead .sq29 .i{width:30px;height:30px}
+.phead h4{margin:0;font:600 20px/25px var(--font-display);letter-spacing:-.02em}
+.phead p{margin:2px 0 0;font:400 13px/18px var(--font);color:var(--label-2)}
+.pdesc{margin:14px 0 0;font:400 15px/21px var(--font);color:var(--label);max-width:62ch}
+.diff{margin-top:16px;padding:12px 14px;border-radius:12px;background:var(--fill-4)}
+.diff b{display:block;font:600 15px/20px var(--font)}
+.diff ul{list-style:none;margin:8px 0 10px;padding:0;display:flex;flex-direction:column;gap:6px}
+.diff li{display:flex;gap:8px;align-items:center;font:400 14px/19px var(--font)}
+.diff li .i{width:16px;height:16px}
+.diff li.add{color:var(--accent)}
+.diff li.rem{color:var(--label-2);text-decoration:line-through}
+.diff .row{display:flex;gap:8px}
+.perm .i{width:17px;height:17px}
+.pbtns{display:flex;gap:10px;margin-top:16px}
+.btn2{height:38px;border:0;border-radius:19px;padding:0 16px;background:var(--fill-3);color:var(--label);font:600 15px/20px var(--font);cursor:pointer}
+.btn2.red{color:var(--red)}
+.hash{font:500 13px/18px ui-monospace,"SF Mono",Menlo,monospace;color:var(--label-2);letter-spacing:.02em}
+.consent{transform:translateY(40px);opacity:0;transition:transform .48s cubic-bezier(.32,.72,0,1),opacity .2s var(--ease-out);pointer-events:none}
+.consent.shown{transform:none;opacity:1;pointer-events:auto}
+.consent-scrim{opacity:0;transition:opacity .2s var(--ease-out);pointer-events:none}
+.consent-scrim.shown{opacity:1;pointer-events:auto}
+.ptool{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:22px;background:var(--lens-clear);box-shadow:inset 0 0 0 .8px var(--w-line),var(--shadow-rest);position:relative}
+.ptool .i{width:23px;height:23px}
+.ptool::after{content:"";position:absolute;right:9px;top:9px;width:5px;height:5px;border-radius:50%;background:var(--label-2)}
+
+.chip .icon-btn{width:44px;height:44px;border-radius:22px}
+.chip .ok{position:relative;background:none;color:#fff;margin-left:2px}
+.chip .ok::before{content:"";position:absolute;left:6px;top:6px;width:32px;height:32px;border-radius:16px;background:var(--accent)}
+.chip .ok svg{position:relative}
+html[data-theme="dark"] .pswatch{box-shadow:inset 0 0 0 .5px rgba(255,255,255,.28)}
+html[data-theme="dark"] .swatch i{box-shadow:inset 0 0 0 .5px rgba(255,255,255,.28)}
+html[data-theme="dark"] .swatch.dk i{box-shadow:inset 0 0 0 1px rgba(255,255,255,.35)}   /* Carbon, Midnight: a permanent ring in dark mode, as Chalk has in light */
+.swatch.lt i{box-shadow:inset 0 0 0 1px rgba(0,0,0,.22)}
+
+@media (prefers-reduced-motion:reduce){
+  .pop,.toast,.lens,.chrome,.prop-new{transition-duration:.12s!important}
+}
+</style>
+</head>
+<body>
+<!-- ======================= SF-Symbols-style icon set (stand-ins) ======================= -->
+<svg width="0" height="0" style="position:fixed;left:0;top:0" aria-hidden="true">
+<defs>
+  <symbol id="i-pen" viewBox="0 0 24 24"><path d="M15.2 4.3a2 2 0 0 1 2.8 0l1.7 1.7a2 2 0 0 1 0 2.8L9.4 19.1l-5.1.6.6-5.1Z"/><path d="M13.3 6.2l4.5 4.5"/><path d="M4.9 14.6l4.5 4.5-5.1.6Z" style="fill:var(--ink,currentColor);stroke:var(--ink,currentColor)"/></symbol>
+  <symbol id="i-highlighter" viewBox="0 0 24 24"><path d="M9.3 15.9 16 5.2a1.8 1.8 0 0 1 2.5-.5l1.1.7a1.8 1.8 0 0 1 .5 2.5L13.4 18.6Z"/><path d="M9.3 15.9l4.1 2.7-1.4 2.1-4.1-2.7Z"/><path d="M3.2 21.2h5" style="stroke:var(--ink,currentColor);stroke-width:2.6"/></symbol>
+  <symbol id="i-eraser" viewBox="0 0 24 24"><path d="M4.7 14.2 13.5 5.4a2 2 0 0 1 2.8 0l3.3 3.3a2 2 0 0 1 0 2.8l-7.6 7.6H8.5a2 2 0 0 1-1.4-.6l-2.4-2.4a2 2 0 0 1 0-2.8Z"/><path d="M8.9 10l6.1 6.1"/><path d="M12 19.1h8"/></symbol>
+  <symbol id="i-lasso" viewBox="0 0 24 24"><ellipse cx="12.6" cy="9.4" rx="7.6" ry="5.1" stroke-dasharray="2.3 2.2"/><path d="M8.1 13.7c-1.5 1.1-1.7 2.7-.6 3.6 1.3 1.1 3.5.3 3.9 1.9.3 1.2-.7 2.1-2 2.3"/></symbol>
+  <symbol id="i-shapes" viewBox="0 0 24 24"><circle cx="9.3" cy="9.3" r="5.6"/><rect x="10.8" y="10.8" width="9" height="9" rx="2.2"/></symbol>
+  <symbol id="i-tape" viewBox="0 0 24 24"><path d="M3.4 10.3 17.9 5l2.7 7.4-14.5 5.3Z"/><path d="M7.6 8.8l2.6 7.3M11.9 7.2l2.6 7.3M16.1 5.7l2.6 7.3" stroke-opacity=".45"/></symbol>
+  <symbol id="i-text" viewBox="0 0 24 24"><path d="M5.5 7.2V5.2h13v2M12 5.2v13.6M9.2 18.8h5.6"/></symbol>
+  <symbol id="i-photo" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="3"/><circle cx="9" cy="10" r="1.7"/><path d="M4 17.2l4.6-4.3a1 1 0 0 1 1.4 0l3.1 2.9 2.3-2.1a1 1 0 0 1 1.4 0l3.2 3.1"/></symbol>
+  <symbol id="i-sticker" viewBox="0 0 24 24"><path d="M5 7.6A3.6 3.6 0 0 1 8.6 4h6.8A3.6 3.6 0 0 1 19 7.6v5.1L12.7 19H8.6A3.6 3.6 0 0 1 5 15.4Z"/><path d="M19 12.7h-3.2a3.1 3.1 0 0 0-3.1 3.1V19"/></symbol>
+  <symbol id="i-laser" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2.3" style="fill:currentColor"/><path d="M12 3.6v2.8M12 17.6v2.8M3.6 12h2.8M17.6 12h2.8M6.1 6.1l2 2M15.9 15.9l2 2M6.1 17.9l2-2M15.9 8.1l2-2"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14.6 4.6 10.2 9 5.8"/><path d="M4.6 10.2H14.8a4.6 4.6 0 0 1 0 9.2H12"/></symbol>
+  <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15 14.6l4.4-4.4L15 5.8"/><path d="M19.4 10.2H9.2a4.6 4.6 0 0 0 0 9.2H12"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.6" cy="10.6" r="6.3"/><path d="M15.4 15.4 20 20"/></symbol>
+  <symbol id="i-bookmark" viewBox="0 0 24 24"><path d="M7.2 4h9.6A1.2 1.2 0 0 1 18 5.2v14.6l-6-3.9-6 3.9V5.2A1.2 1.2 0 0 1 7.2 4Z"/></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 14.2V3.8M8.3 7.4 12 3.7l3.7 3.7"/><path d="M9 10.4H7.3a1.8 1.8 0 0 0-1.8 1.8v6.1a1.8 1.8 0 0 0 1.8 1.8h9.4a1.8 1.8 0 0 0 1.8-1.8v-6.1a1.8 1.8 0 0 0-1.8-1.8H15"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5.8" cy="12" r="1.55" style="fill:currentColor;stroke:none"/><circle cx="12" cy="12" r="1.55" style="fill:currentColor;stroke:none"/><circle cx="18.2" cy="12" r="1.55" style="fill:currentColor;stroke:none"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.6 4.8 7.4 12l7.2 7.2" style="stroke-width:2.2"/></symbol>
+  <symbol id="i-drop" viewBox="0 0 24 24"><path d="M12 3.4c3.5 4.2 6.1 7.6 6.1 10.7a6.1 6.1 0 0 1-12.2 0c0-3.1 2.6-6.5 6.1-10.7Z"/><path d="M9.2 14.4a2.9 2.9 0 0 0 2.5 2.8"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M7 7l10 10M17 7 7 17"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5.6 12.6l4.1 4.1 8.7-9"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5.5v13M5.5 12h13"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3.6" width="6" height="10.8" rx="3"/><path d="M5.9 11.4a6.1 6.1 0 0 0 12.2 0M12 17.5v2.9"/></symbol>
+  <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 18.5v-13M6.8 10.2 12 5l5.2 5.2"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 24 24"><rect x="4" y="4" width="6.8" height="6.8" rx="1.8"/><rect x="13.2" y="4" width="6.8" height="6.8" rx="1.8"/><rect x="4" y="13.2" width="6.8" height="6.8" rx="1.8"/><rect x="13.2" y="13.2" width="6.8" height="6.8" rx="1.8"/></symbol>
+  <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="3"/><path d="M9.6 5v14"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.9A2.6 2.6 0 0 1 5.6 5.3h3.6a2 2 0 0 1 1.4.6L12 7.3h6.4A2.6 2.6 0 0 1 21 9.9v6.8a2.6 2.6 0 0 1-2.6 2.6H5.6A2.6 2.6 0 0 1 3 16.7Z"/></symbol>
+  <symbol id="i-doc" viewBox="0 0 24 24"><path d="M7.2 3.6h6.2l4.4 4.4v11.2a1.2 1.2 0 0 1-1.2 1.2H7.2A1.2 1.2 0 0 1 6 19.2V4.8a1.2 1.2 0 0 1 1.2-1.2Z"/><path d="M13.4 3.6V8h4.4M9 12.5h6M9 15.8h4"/></symbol>
+  <symbol id="i-books" viewBox="0 0 24 24"><rect x="3.8" y="4.5" width="4.2" height="15" rx="1.1"/><rect x="9.6" y="4.5" width="4.2" height="15" rx="1.1"/><path d="M15.4 6.1l3.6-1 3.1 13.8-3.6 1Z"/></symbol>
+  <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 4.3l2.3 4.8 5.2.7-3.8 3.6.9 5.2L12 16.1l-4.6 2.5.9-5.2-3.8-3.6 5.2-.7Z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.3"/><path d="M12 7.4V12l3.1 2"/></symbol>
+  <symbol id="i-people" viewBox="0 0 24 24"><circle cx="9" cy="8.6" r="3.1"/><path d="M3.6 18.6c.6-2.9 2.8-4.6 5.4-4.6s4.8 1.7 5.4 4.6"/><path d="M15.3 5.9a2.9 2.9 0 0 1 0 5.6M17.2 14.3c1.7.5 2.9 2 3.3 4"/></symbol>
+  <symbol id="i-stack" viewBox="0 0 24 24"><rect x="4" y="8.4" width="16" height="11.6" rx="2.6"/><path d="M6.6 5.6h10.8M8.8 3h6.4"/></symbol>
+  <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M9.2 4.6a2 2 0 0 1 4 0V6h3.3A1.5 1.5 0 0 1 18 7.5v3.3h1.4a2 2 0 0 1 0 4H18v3.7a1.5 1.5 0 0 1-1.5 1.5h-3.3v-1.3a2 2 0 0 0-4 0V20H5.5A1.5 1.5 0 0 1 4 18.5v-3.7h1.3a2 2 0 0 0 0-4H4V7.5A1.5 1.5 0 0 1 5.5 6h3.7Z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.8 6.6h14.4M9.4 6.6V4.9a1 1 0 0 1 1-1h3.2a1 1 0 0 1 1 1v1.7M6.7 6.6l.8 12.1a1.5 1.5 0 0 0 1.5 1.4h6a1.5 1.5 0 0 0 1.5-1.4l.8-12.1"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7.4" stroke-width="2.7" stroke-dasharray="2.35 3.46" stroke-linecap="butt"/><circle cx="12" cy="12" r="5.4"/><circle cx="12" cy="12" r="2.1"/></symbol>
+  <symbol id="i-sort" viewBox="0 0 24 24"><path d="M8 19.5v-15M4.6 7.9 8 4.5l3.4 3.4M16 4.5v15M12.6 16.1 16 19.5l3.4-3.4"/></symbol>
+  <symbol id="i-select" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.4"/><path d="M8.4 12.3l2.5 2.5 4.8-5"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M6.5 9.4 12 14.9l5.5-5.5"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.8 12S6.1 6.2 12 6.2 21.2 12 21.2 12 17.9 17.8 12 17.8 2.8 12 2.8 12Z"/><circle cx="12" cy="12" r="2.7"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7.4 18.4a4.1 4.1 0 0 1-.5-8.2 5.6 5.6 0 0 1 10.8-1.4 4.3 4.3 0 0 1-.6 9.6Z"/><path d="M9.4 13.4l1.9 1.9 3.6-3.7"/></symbol>
+  <symbol id="i-page" viewBox="0 0 24 24"><rect x="5.5" y="3.5" width="13" height="17" rx="2.2"/><path d="M8.6 8h6.8M8.6 11.3h6.8M8.6 14.6h4.2"/></symbol>
+  <symbol id="i-nib" viewBox="0 0 24 24"><path d="M12 21 7.4 12.7c-.4-.8-.4-1.7.1-2.4L12 3l4.5 7.3c.5.7.5 1.6.1 2.4Z"/><path d="M12 3.3v7.4"/><circle cx="12" cy="11.9" r="1.1"/></symbol>
+  <symbol id="i-ball" viewBox="0 0 24 24"><path d="M9.2 20.6h5.6V10.4L12 3.2l-2.8 7.2Z"/><path d="M9.2 10.4h5.6"/></symbol>
+  <symbol id="i-brush" viewBox="0 0 24 24"><path d="M10.1 20.8h3.8v-6.6h-3.8Z"/><path d="M9.3 14.2h5.4c.4-3.9-1-7.8-2.7-11-1.7 3.2-3.1 7.1-2.7 11Z"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M9.2 20.7h5.6V10.3L12 3.3l-2.8 7Z"/><path d="M9.2 10.3h5.6M10.8 6.4h2.4"/></symbol>
+  <symbol id="i-wifi" viewBox="0 0 24 18"><path d="M12 15.6a1.6 1.6 0 1 0 0 .01Z" style="fill:currentColor;stroke:none"/><path d="M7.9 11.6a5.9 5.9 0 0 1 8.2 0M4.8 8.6a10.4 10.4 0 0 1 14.4 0M1.9 5.6a14.6 14.6 0 0 1 20.2 0" style="stroke-width:2.1"/></symbol>
+  <symbol id="i-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.2"/></symbol>
+  <symbol id="i-checkring" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.2"/><path d="M8 12.4l2.7 2.7 5.4-5.6" style="stroke-width:2"/></symbol>
+  <symbol id="i-ruler" viewBox="0 0 24 24"><g transform="rotate(-30 12 12)"><rect x="2.8" y="8.2" width="18.4" height="7.6" rx="1.6"/><path d="M6.6 8.2v2.6M9.8 8.2v3.8M13 8.2v2.6M16.2 8.2v3.8"/></g></symbol>
+  <symbol id="i-eyeoff" viewBox="0 0 24 24"><path d="M2.8 12S6.1 6.2 12 6.2 21.2 12 21.2 12 17.9 17.8 12 17.8 2.8 12 2.8 12Z"/><circle cx="12" cy="12" r="2.7"/><path d="M4.6 4.6l14.8 14.8"/></symbol>
+  <symbol id="i-hand" viewBox="0 0 24 24"><path d="M8.2 12.2V6.4a1.4 1.4 0 0 1 2.8 0v5M11 11.4V4.9a1.4 1.4 0 0 1 2.8 0v6.5M13.8 11.4V6.1a1.4 1.4 0 0 1 2.8 0v7.3M16.6 12.2V9.6a1.4 1.4 0 0 1 2.8 0v4.6a6.6 6.6 0 0 1-6.6 6.6h-.6a6 6 0 0 1-4.9-2.6L4.8 15a1.5 1.5 0 0 1 2.4-1.8l1 1.3"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M3.6 12h16.8M12 3.4c2.4 2.4 3.4 5.5 3.4 8.6s-1 6.2-3.4 8.6c-2.4-2.4-3.4-5.5-3.4-8.6s1-6.2 3.4-8.6Z"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9.5 5.5 16 12l-6.5 6.5" style="stroke-width:2.1"/></symbol>
+  <symbol id="i-hex" viewBox="0 0 24 24"><path d="M12 3.4l7.4 4.3v8.6L12 20.6l-7.4-4.3V7.7Z"/><path d="M12 8.3l3.3 1.9v3.7L12 15.8l-3.3-1.9v-3.7Z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5.4" y="10.6" width="13.2" height="9.6" rx="2.4"/><path d="M8.4 10.6V8a3.6 3.6 0 0 1 7.2 0v2.6"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10.2 13.8a3.6 3.6 0 0 0 5.1 0l3-3a3.6 3.6 0 0 0-5.1-5.1l-1 1"/><path d="M13.8 10.2a3.6 3.6 0 0 0-5.1 0l-3 3a3.6 3.6 0 0 0 5.1 5.1l1-1"/></symbol>
+  <symbol id="i-import" viewBox="0 0 24 24"><path d="M12 3.8v10.4M8.3 10.6 12 14.3l3.7-3.7"/><path d="M5.5 16.2v1.9a1.8 1.8 0 0 0 1.8 1.8h9.4a1.8 1.8 0 0 0 1.8-1.8v-1.9"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.6"/><path d="M12 11v5.4"/><circle cx="12" cy="7.8" r="1" style="fill:currentColor;stroke:none"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4.5 7h9M17.5 7h2M4.5 17h2M10.5 17h9"/><circle cx="15.5" cy="7" r="2"/><circle cx="8.5" cy="17" r="2"/></symbol>
+  <symbol id="i-bridge" viewBox="0 0 24 24"><circle cx="5.5" cy="12" r="2.2"/><circle cx="18.5" cy="6.5" r="2.2"/><circle cx="18.5" cy="17.5" r="2.2"/><path d="M7.5 11l8.9-3.6M7.5 13l8.9 3.6"/></symbol>
+  <symbol id="i-writing" viewBox="0 0 24 24"><path d="M4 18.5c2-1.6 3.4-4.8 5-4.8 1.8 0 .6 3.6 2.4 3.6 1.5 0 2.4-2.6 3.8-2.6 1.1 0 1.2 1.8 2.3 1.8.9 0 1.6-.7 2.5-1.6"/><path d="M14.8 4.6l3.1 3.1-6.3 6.3-3.6.5.5-3.6Z"/></symbol>
+  <symbol id="i-pencil2" viewBox="0 0 24 24"><path d="M15.4 4.3a2 2 0 0 1 2.8 0l1.5 1.5a2 2 0 0 1 0 2.8L9.4 18.9l-5.1.8.8-5.1Z"/></symbol>
+</defs>
+</svg>
+
+<div class="doc">
+  <header class="doc-head">
+    <div>
+      <div class="eyebrow">Nib · Locked design</div>
+      <h1>Clear Water</h1>
+      <p>Everything that floats in Nib is made of clear water. It lenses the page, stretches with the speed you drag it, settles with surface tension, reaches across to its neighbours, pinches apart when pulled and buds off its parent. The page and your ink carry all the colour. This page runs on the numbers in <code>docs/DESIGN.md</code>.</p>
+    </div>
+    <div class="ctl" role="group" aria-label="Preview settings">
+      <div class="ctl-group" data-set="theme"><b>Appearance</b><button data-v="light">Light</button><button data-v="dark">Dark</button></div>
+      <div class="ctl-group" data-set="liquid"><b>Liquid</b><button data-v="full">Full</button><button data-v="calm">Calm</button><button data-v="off">Off</button></div>
+      <div class="ctl-group" data-set="motion"><b>Motion</b><button data-v="full">Full</button><button data-v="reduce">Reduced</button></div>
+      <div class="ctl-group" data-set="transparency"><b>Transparency</b><button data-v="full">Full</button><button data-v="reduce">Reduced</button></div>
+      <div class="ctl-group" data-set="sound"><b>Hear haptics</b><button data-v="off">Off</button><button data-v="on">On</button></div>
+    </div>
+  </header>
+
+  <section class="frame" aria-label="Library, iPad landscape">
+    <div class="frame-head">
+      <div class="frame-title"><span class="n">01</span> Library <span class="meta">iPad Pro 11″ · landscape · 1194 × 834 pt</span></div>
+      <p class="hint">Drag a notebook. It lifts into a bead of water that stretches with speed and reaches toward its neighbours. Drop it on a folder tile (every tile grows a water film while you drag) or on a folder in the sidebar (the notebook condenses to half size and the folder grows a “+1”). Hold it over the middle of another notebook for a moment to make a folder. Every move has Undo.</p>
+    </div>
+    <div class="device"><div class="screen" id="s-lib" style="width:1194px;height:834px"></div></div>
+  </section>
+
+  <section class="frame" aria-label="Editor with tool palette and pen settings, iPad landscape">
+    <div class="frame-head">
+      <div class="frame-title"><span class="n">02</span> Editor · tool palette and pen settings <span class="meta">iPad Pro 11″ · landscape</span></div>
+      <p class="hint">Drag the palette by its body and fling it to any edge: it gathers into a bead and spreads into its new shape, and nothing ever draws outside it. Fling it to the bottom right and it fuses with the page counter. Tap tools and the bead glides as one drop; More buds the rest of the tools; press the selected tool and slide to scrub. Tap the selected pen to fold its settings in, and again to bud them out. Write on the page and the chrome steps back.</p>
+    </div>
+    <div class="device"><div class="screen" id="s-edit" style="width:1194px;height:834px"></div></div>
+  </section>
+
+  <section class="frame" aria-label="Editor with the assistant proposing an edit, iPad landscape">
+    <div class="frame-head">
+      <div class="frame-title"><span class="n">03</span> Editor · Assistant proposing an edit <span class="meta">iPad Pro 11″ · landscape</span></div>
+      <p class="hint">The proposal is on the page before anything changes: numbered marks that match the rows, ghost ink in your own pen, a strike through the wrong formula. Untick a change and it leaves the page. The chip rests in the margin, clear of your ink. Pull it: an anchor appears on the change, the stem thins, pinches and leaves a small drop that flows home. The stray scribble has its own Delete button, because Accept never covers a deletion.</p>
+    </div>
+    <div class="device"><div class="screen" id="s-ai" style="width:1194px;height:834px"></div></div>
+  </section>
+
+  <section class="frame" aria-label="Editor, iPhone">
+    <div class="frame-head">
+      <div class="frame-title"><span class="n">04</span> Editor · iPhone <span class="meta">iPhone 16 · 393 × 852 pt</span></div>
+      <p class="hint">Tap the pen to bud its settings up out of the palette. Press the pen and slide along the palette to scrub the bead, or flick the palette to the top or bottom.</p>
+    </div>
+    <div class="device phone"><div class="screen" id="s-phone" style="width:393px;height:852px"></div></div>
+  </section>
+
+  <section class="frame" aria-label="New notebook sheet, iPad landscape">
+    <div class="frame-head">
+      <div class="frame-title"><span class="n">05</span> New notebook and templates <span class="meta">iPad Pro 11″ · form sheet 720 × 640</span></div>
+      <p class="hint">A sheet is an opaque grouped surface. Its only water is the Create button. Pick a type, a cover and a paper.</p>
+    </div>
+    <div class="device"><div class="screen" id="s-tpl" style="width:1194px;height:834px"></div></div>
+  </section>
+
+  <section class="frame" aria-label="Plugin manager, iPad landscape">
+    <div class="frame-head">
+      <div class="frame-title"><span class="n">06</span> Plugin manager <span class="meta">iPad Pro 11″ · Settings › Plugins</span></div>
+      <p class="hint">Every permission is a plain sentence with its own switch. An update that asks for more shows exactly what changed before you accept it. Install from Gallery shows the consent sheet with the source and hash.</p>
+    </div>
+    <div class="device"><div class="screen" id="s-plug" style="width:1194px;height:834px"></div></div>
+  </section>
+
+  <section class="frame" aria-label="Settings, iPad landscape">
+    <div class="frame-head">
+      <div class="frame-title"><span class="n">07</span> Settings <span class="meta">iPad Pro 11″ · form sheet</span></div>
+      <p class="hint">Grouped lists stay native. The switch thumb is the only liquid here: it squashes as it moves. Liquid: Full, Calm or Off changes every frame on this page.</p>
+    </div>
+    <div class="device"><div class="screen" id="s-set" style="width:1194px;height:834px"></div></div>
+  </section>
+</div>
+
+<script>
+(() => {
+'use strict';
+/* =============================================================================
+   0. Environment
+   ========================================================================== */
+const root = document.documentElement;
+const TAU = Math.PI * 2, NS = 'http://www.w3.org/2000/svg';
+const CHROMIUM = !!(navigator.userAgentData && navigator.userAgentData.brands.some(b => /Chromium|Chrome|Edge/.test(b.brand)));
+const mq = q => matchMedia(q).matches;
+root.dataset.theme = mq('(prefers-color-scheme: dark)') ? 'dark' : 'light';
+root.dataset.motion = mq('(prefers-reduced-motion: reduce)') ? 'reduce' : 'full';
+root.dataset.transparency = mq('(prefers-reduced-transparency: reduce)') ? 'reduce' : 'full';
+root.dataset.liquid = 'full';
+const RM = () => root.dataset.motion === 'reduce' || root.dataset.liquid === 'off';
+const RT = () => root.dataset.transparency === 'reduce' || root.dataset.liquid === 'off';
+const CALM = () => root.dataset.liquid === 'calm';   // Settings › Liquid › Calm: stretch caps halved, no necks
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const HAND = "'Segoe Print','Bradley Hand','Noteworthy','Ink Free',cursive";
+const INK = { carbon:'#121212', graphite:'#5B6068', midnight:'#1B2A6B', cobalt:'#2156D9', lagoon:'#0B8793', moss:'#2F7A3C',
+              ochre:'#B7791F', sienna:'#9A4E2A', vermilion:'#D9432B', crimson:'#B0173A', plum:'#7B3FA0', chalk:'#F4F4F1' };
+const INK_ORDER = ['carbon','graphite','midnight','cobalt','lagoon','moss','ochre','sienna','vermilion','crimson','plum','chalk'];
+const HIGHLIGHT = { lemon:'#FFE45C', apricot:'#FFBE6B', mint:'#86E3AE', sky:'#82CCFF', lilac:'#C8A8FF', blush:'#FFA3C7' };
+
+function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
+function sv(tag, attrs) { const e = document.createElementNS(NS, tag); for (const k in attrs || {}) e.setAttribute(k, attrs[k]); return e; }
+const icon = (id, cls = 'i') => `<svg class="${cls}" aria-hidden="true"><use href="#i-${id}"/></svg>`;
+
+/* =============================================================================
+   1. Haptics — on device: UIImpactFeedbackGenerator / CoreHaptics "plip".
+      Here: optional tiny synthesized water plips (off by default).
+   ========================================================================== */
+let actx = null;
+const PLIP = { merge:[520,1150,.065,.045], split:[880,1760,.045,.04], snap:[360,640,.06,.045], select:[1500,1850,.022,.022], bud:[700,1300,.05,.035], success:[640,1280,.09,.045] };
+function haptic(kind) {
+  if (navigator.userActivation && !navigator.userActivation.hasBeenActive) return;   // nothing plays before a touch
+  try { navigator.vibrate && navigator.vibrate(kind === 'success' ? [8, 40, 8] : 6); } catch (e) {}
+  if (root.dataset.sound !== 'on') return;
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const [f0, f1, dur, gain] = PLIP[kind] || PLIP.select, t = actx.currentTime;
+    const o = actx.createOscillator(), g = actx.createGain(), lp = actx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 2600;
+    o.type = 'sine'; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    g.gain.setValueAtTime(.0001, t); g.gain.exponentialRampToValueAtTime(gain, t + .004); g.gain.exponentialRampToValueAtTime(.0001, t + dur + .035);
+    o.connect(lp).connect(g).connect(actx.destination); o.start(t); o.stop(t + dur + .05);
+  } catch (e) {}
+}
+
+/* =============================================================================
+   2. Springs — same parameterisation as SwiftUI .spring(response:dampingFraction:)
+      k = (2π/response)², c = 4π·ζ/response, mass 1.
+   ========================================================================== */
+const SPR = {
+  follow:[.085, 1],   // finger → droplet (critically damped, ~1 frame of viscosity)
+  tap:[.22, .9], lift:[.3, .72],
+  glide:[.20, 1],     // selection bead head: a selection indicator never overshoots
+  trail:[.26, 1],     // selection bead tail (a short lag → teardrop only on long jumps)
+  snap:[.50, .80],    // palette dock after a fling (keeps release velocity)
+  slot:[.40, 1],      // grid and slot snaps: velocity projected toward the slot, never overshoots
+  reflow:[.44, .86],  // neighbours making room
+  tether:[.40, .62],  // proposal chip returning to its dock
+  bud:[.42, .76], budSize:[.46, .80],
+  reform:[.28, .90],  // palette gather and spread on an orientation change (≤ 380 ms)
+  thumb:[.16, .72],   // slider-thumb stretch
+  neck:[.14, 1], absorb:[.22, 1],
+  rm:[.26, 1]         // Reduce Motion: every spring becomes this (no overshoot)
+};
+class Spring {
+  constructor(x = 0, p = 'snap') { this.x = x; this.v = 0; this.to = x; this.eps = .02; this.use(p); }
+  use(p) { const [r, z] = typeof p === 'string' ? SPR[p] : p; this.k = (TAU / r) ** 2; this.c = 4 * Math.PI * z / r; return this; }
+  step(dt) {
+    let k = this.k, c = this.c;
+    if (RM()) { k = (TAU / SPR.rm[0]) ** 2; c = 4 * Math.PI / SPR.rm[0]; }
+    const n = Math.max(1, Math.ceil(dt * 240)), h = dt / n;
+    for (let i = 0; i < n; i++) { this.v += (-k * (this.x - this.to) - c * this.v) * h; this.x += this.v * h; }
+    return !this.rest;
+  }
+  get rest() { return Math.abs(this.x - this.to) < this.eps && Math.abs(this.v) < this.eps * 4; }
+  snap(x) { this.x = this.to = x; this.v = 0; return this; }
+}
+
+/* Deformation matrix: stretch s along axis θ, volume-preserving in 3D (sx·sy·sz = 1 with sy = sz → sy = 1/√sx),
+   uniform lift L, about the grab point (gx, gy) relative to the centre (x, y), so the part under the finger stays put. */
+function mat(x, y, w, h, s, th, L, gx = 0, gy = 0) {
+  const sx = (1 + s) * L, sy = L / Math.sqrt(1 + s), c = Math.cos(th), n = Math.sin(th);
+  const a = c * c * sx + n * n * sy, b = c * n * (sx - sy), d = n * n * sx + c * c * sy;
+  const hx = w / 2 + gx, hy = h / 2 + gy;
+  return [a, b, b, d, x + gx - (a * hx + b * hy), y + gy - (b * hx + d * hy)];
+}
+const css = m => `matrix(${m[0].toFixed(5)},${m[1].toFixed(5)},${m[2].toFixed(5)},${m[3].toFixed(5)},${m[4].toFixed(2)},${m[5].toFixed(2)})`;
+const apply = (m, x, y) => ({ x: m[0] * x + m[2] * y + m[4], y: m[1] * x + m[3] * y + m[5] });
+const inv = m => { const det = m[0] * m[3] - m[1] * m[2] || 1e-9; return [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det]; };
+const mul = (A, B) => [A[0] * B[0] + A[2] * B[1], A[1] * B[0] + A[3] * B[1], A[0] * B[2] + A[2] * B[3], A[1] * B[2] + A[3] * B[3],
+                       A[0] * B[4] + A[2] * B[5] + A[4], A[1] * B[4] + A[3] * B[5] + A[5]];   // A∘B: B first
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const wrapHalfTurn = d => d - Math.PI * Math.round(d / Math.PI);   // (−π/2, π/2]: a stretch looks the same both ways
+const overlap = (A, B) => Math.max(0, Math.min(A.r, B.r) - Math.max(A.l, B.l)) * Math.max(0, Math.min(A.b, B.b) - Math.max(A.t, B.t));
+
+/* =============================================================================
+   3. Water: one SVG filter per screen renders every droplet from the UNION
+      of their silhouettes (metaball threshold), so merges, necks and splits
+      get one continuous rim, specular and caustic.
+   ========================================================================== */
+function waterFilter(id, W, H, sg, k) {
+  // sg = goo sigma (merge distance ≈ 1.35·sg), k = optical scale
+  const reg = `filterUnits="userSpaceOnUse" x="-60" y="-60" width="${W + 120}" height="${H + 120}" color-interpolation-filters="sRGB"`;
+  const goo = `<feGaussianBlur in="SourceAlpha" stdDeviation="${sg}" result="bl"/>
+    <feComponentTransfer in="bl" result="m"><feFuncA type="linear" slope="24" intercept="-11.5"/></feComponentTransfer>`;
+  const line = `<feMorphology in="m" operator="erode" radius=".8" result="me"/>
+    <feComposite in="m" in2="me" operator="out" result="olA"/>
+    <feFlood class="fw-line" result="c5"/><feComposite in="c5" in2="olA" operator="in" result="line"/>`;
+  return `
+  <filter id="${id}" ${reg}>${goo}
+    <feFlood class="fw-body" result="c1"/><feComposite in="c1" in2="m" operator="in" result="body"/>
+    <feGaussianBlur in="m" stdDeviation="${4.2 * k}" result="bump"/>
+    <feSpecularLighting in="bump" surfaceScale="${6.5 * k}" specularConstant=".55" specularExponent="40" lighting-color="#fff" result="sp">
+      <feDistantLight azimuth="225" elevation="40"/>
+    </feSpecularLighting>
+    <feComposite in="sp" in2="m" operator="in" result="spec"/>
+    <feOffset in="m" dx="${1.1 * k}" dy="${1.5 * k}" result="mr"/>
+    <feComposite in="m" in2="mr" operator="out" result="rimA"/>
+    <feFlood class="fw-rim" result="c4"/><feComposite in="c4" in2="rimA" operator="in" result="rim"/>
+    ${line}
+    <feMerge><feMergeNode in="body"/><feMergeNode in="spec"/><feMergeNode in="rim"/><feMergeNode in="line"/></feMerge>
+  </filter>
+  <!-- edge and caustic only where there is something to lens: drawn from the same union, clipped to the pages (§3.3) -->
+  <filter id="${id}-optics" ${reg}>${goo}
+    <feGaussianBlur in="m" stdDeviation="${2.6 * k}" result="mb"/>
+    <feComposite in="m" in2="mb" operator="out" result="ring"/>
+    <feFlood class="fw-edge" result="c2"/><feComposite in="c2" in2="ring" operator="in" result="edge"/>
+    <feOffset in="m" dx="${-4 * k}" dy="${-6 * k}" result="mo"/>
+    <feComposite in="m" in2="mo" operator="out" result="cr"/>
+    <feGaussianBlur in="cr" stdDeviation="${2.4 * k}" result="crb"/>
+    <feComposite in="crb" in2="m" operator="in" result="cr2"/>
+    <feFlood class="fw-caustic" result="c3"/><feComposite in="c3" in2="cr2" operator="in" result="caustic"/>
+    <feMerge><feMergeNode in="edge"/><feMergeNode in="caustic"/></feMerge>
+  </filter>
+  <!-- Tinted: rim (white 30 %) and outline only; no edge, caustic or specular over the accent -->
+  <filter id="${id}-tint" ${reg}>${goo}
+    <feOffset in="m" dx="${1.1 * k}" dy="${1.5 * k}" result="mr"/>
+    <feComposite in="m" in2="mr" operator="out" result="rimA"/>
+    <feFlood class="fw-tint-rim" result="c4"/><feComposite in="c4" in2="rimA" operator="in" result="rim"/>
+    ${line}
+    <feMerge><feMergeNode in="rim"/><feMergeNode in="line"/></feMerge>
+  </filter>
+  <filter id="${id}-rt" ${reg}>${goo}
+    <feFlood class="fw-rt" result="c1"/><feComposite in="c1" in2="m" operator="in" result="body"/>
+    ${line}
+    <feMerge><feMergeNode in="body"/><feMergeNode in="line"/></feMerge>
+  </filter>
+  <!-- the selection bead is body plus rim: no shadow, edge ring or specular (it must not read as a button on the palette) -->
+  <filter id="${id}-bead" x="-60%" y="-60%" width="220%" height="220%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="3.2" result="bl"/>
+    <feComponentTransfer in="bl" result="m"><feFuncA type="linear" slope="22" intercept="-10.4"/></feComponentTransfer>
+    <feFlood class="fb-body" result="c1"/><feComposite in="c1" in2="m" operator="in" result="body"/>
+    <feOffset in="m" dx=".9" dy="1.2" result="mr"/>
+    <feComposite in="m" in2="mr" operator="out" result="rimA"/>
+    <feFlood class="fb-rim" result="c4"/><feComposite in="c4" in2="rimA" operator="in" result="rim"/>
+    <feMerge><feMergeNode in="body"/><feMergeNode in="rim"/></feMerge>
+  </filter>`;
+}
+const floodCSS = `
+  .fw-body{flood-color:var(--w-body)} .fw-edge{flood-color:var(--w-edge)} .fw-caustic{flood-color:var(--w-caustic)}
+  .fw-rim{flood-color:var(--w-rim)} .fw-line{flood-color:var(--w-line)} .fw-rt{flood-color:var(--rt-fill)} .fw-tint-rim{flood-color:var(--w-tint-rim)}
+  .fb-body{flood-color:var(--b-body)} .fb-rim{flood-color:var(--b-rim)}`;
+document.head.appendChild(el('style', null, floodCSS));
+
+/* Baked lens (P5): rim-only magnification. R/G encode an inward offset that
+   peaks at the rim and is zero once deeper than the corner radius. */
+const lensCache = new Map();
+function bakeLens(w, h, r) {
+  const key = `${w}x${h}x${r}`; if (lensCache.has(key)) return lensCache.get(key);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(w, h), D = img.data;
+  const ramp = Math.min(r, Math.min(w, h) / 2) * .95 + 2;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const px = x + .5 - w / 2, py = y + .5 - h / 2;
+    const qx = Math.abs(px) - (w / 2 - r), qy = Math.abs(py) - (h / 2 - r);
+    const ox = Math.max(qx, 0), oy = Math.max(qy, 0);
+    const sd = Math.hypot(ox, oy) + Math.min(Math.max(qx, qy), 0) - r;
+    let gx, gy;
+    if (qx > 0 && qy > 0) { const L = Math.hypot(ox, oy) || 1; gx = ox / L * Math.sign(px); gy = oy / L * Math.sign(py); }
+    else if (qx > qy) { gx = Math.sign(px); gy = 0; } else { gx = 0; gy = Math.sign(py); }
+    const depth = -sd; let R = 128, G = 128;
+    if (depth >= 0 && depth < ramp) { const kk = Math.pow(1 - depth / ramp, 1.8); R = 128 - gx * kk * 127; G = 128 - gy * kk * 127; }
+    const i = (y * w + x) * 4; D[i] = R; D[i + 1] = G; D[i + 2] = 128; D[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  const url = c.toDataURL('image/png'); lensCache.set(key, url); return url;
+}
+
+/* =============================================================================
+   4. Scene · Drop · Bond
+   ========================================================================== */
+const scenes = [];
+let raf = 0, last = 0;
+function kick() { if (!raf) { last = performance.now(); raf = requestAnimationFrame(tick); } }
+function tick(now) {
+  const dt = Math.min((now - last) / 1000, 1 / 30); last = now;
+  let busy = false;
+  for (const s of scenes) if (s.awake) { s.awake = s.step(dt); busy = busy || s.awake; }
+  raf = busy ? requestAnimationFrame(tick) : 0;
+}
+
+class Scene {
+  constructor(screen, { W, H, sigma = 8, k = 1, id }) {
+    this.screen = screen; this.W = W; this.H = H; this.sigma = sigma; this.id = id || screen.id;
+    this.drops = []; this.bonds = []; this.tasks = []; this.renders = []; this.pid = null; this.dragging = 0; this.awake = true;
+    this.scene = el('div', 'scene'); screen.appendChild(this.scene);
+    this.chrome = el('div', 'chrome'); screen.appendChild(this.chrome);
+    this.lensLayer = el('div', 'lens-layer'); this.chrome.appendChild(this.lensLayer);
+    this.water = sv('svg', { class: 'water', width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true' });
+    this.defs = sv('defs'); this.water.appendChild(this.defs);
+    this.defs.innerHTML = waterFilter(`w-${this.id}`, W, H, sigma, k);
+    this.masses = sv('g', { filter: `url(#w-${this.id})` }); this.water.appendChild(this.masses);
+    this.inner = sv('g', { id: `m-${this.id}` }); this.masses.appendChild(this.inner);
+    this.necks = sv('g'); this.inner.appendChild(this.necks);
+    this.tints = sv('g', { filter: `url(#w-${this.id}-tint)` }); this.water.appendChild(this.tints);   // Tinted: rim + line only
+    this.outlines = sv('g'); this.water.appendChild(this.outlines);   // unfiltered: bud outlines
+    this.chrome.appendChild(this.water);
+    // edge + caustic: the same union, drawn only over light paper (on a flat desk the rim and line are enough)
+    this.optics = sv('svg', { class: 'water', width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true' });
+    const og = sv('g', { filter: `url(#w-${this.id}-optics)` }); og.appendChild(sv('use', { href: `#m-${this.id}` }));
+    this.optics.appendChild(og); this.optics.style.display = 'none'; this.chrome.appendChild(this.optics);
+    this.papers = [];
+    this.beadSvg = sv('svg', { class: 'water', width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true' });
+    this.beads = sv('g', { filter: `url(#w-${this.id}-bead)` }); this.beadSvg.appendChild(this.beads);
+    this.beadInk = sv('g', { class: 'bead-ink' }); this.beadSvg.appendChild(this.beadInk);
+    this.chrome.appendChild(this.beadSvg);
+    this.content = el('div', 'content-layer'); this.chrome.appendChild(this.content);
+    this.tMin = 1.27 * sigma + .6;      // thinnest neck that survives the threshold
+    this.merge = sigma < 7 ? 9 : 11;    // merge distance k: 11 pt iPad, 9 pt iPhone
+    scenes.push(this);
+    this.setRT();
+  }
+  setRT() { this.masses.setAttribute('filter', `url(#w-${this.id}${RT() ? '-rt' : ''})`); this.optics.style.visibility = RT() ? 'hidden' : ''; }
+  /* Light paper under the chrome (scene coordinates). Optics are clipped to it; dark-mode Clear thickens over it. */
+  addPaper(r) {
+    const p = { l: Math.max(0, r.x), t: Math.max(0, r.y), r: Math.min(this.W, r.x + r.w), b: Math.min(this.H, r.y + r.h) };
+    this.papers.push(p);
+    this.optics.style.display = '';
+    this.optics.style.clipPath = `path('${this.papers.map(q => `M${q.l} ${q.t}H${q.r}V${q.b}H${q.l}Z`).join('')}')`;
+  }
+  paperShare(B) { const a = Math.max(1, (B.r - B.l) * (B.b - B.t)); return this.papers.reduce((s, p) => s + overlap(B, p), 0) / a; }
+  /* §10.8: while ink is going down, droplets over the page or within 24 pt of the stroke recede; the rest stay at 100 %. */
+  recede(bb) {
+    let any = false;
+    for (const d of this.drops) {
+      const B = d.box(), gap = bb ? Math.hypot(Math.max(0, bb.l - B.r, B.l - bb.r), Math.max(0, bb.t - B.b, B.t - bb.b)) : 1e9;
+      const on = !!bb && d.visible && (this.paperShare(B) > 0 || gap < 24);
+      d.setRecede(on); any = any || on;
+    }
+    // ponytail: the union is one filter, so its rim and line fade together; per-droplet water needs one filter per cluster
+    this.water.classList.toggle('recede', any); this.optics.classList.toggle('recede', any);
+  }
+  toLocal(e) { const r = this.screen.getBoundingClientRect(); return { x: (e.clientX - r.left) * this.W / r.width, y: (e.clientY - r.top) * this.H / r.height }; }
+  wake() { this.awake = true; kick(); }
+  bond(a, b, o = {}) {
+    const line = sv('line', { 'stroke-linecap': 'round', stroke: '#000' }); line.style.display = 'none'; this.necks.appendChild(line);
+    const bd = { a, b, on: o.on ?? 12, off: o.off ?? 40, t0: o.t0 ?? 24, inset: o.inset ?? 6, state: 0, t: new Spring(0, 'neck'),
+                 line, onJoin: o.onJoin, onBreak: o.onBreak, silent: !!o.silent, enabled: true };
+    bd.t.eps = .05; this.bonds.push(bd); return bd;
+  }
+  stepBonds(dt) {
+    let busy = false;
+    for (const bd of this.bonds) {
+      const ok = bd.enabled && bd.a.visible && bd.b.visible && !RM() && !CALM();
+      const A = bd.a.box(), B = bd.b.box(), n = nearest(A, B);
+      const tt = bd.t0 * Math.pow(Math.max(0, 1 - n.gap / bd.off), .7);
+      if (!ok) { bd.state = 0; }
+      else if (!bd.state && n.gap < bd.on) { bd.state = 1; if (!bd.silent) haptic('merge'); bd.onJoin && bd.onJoin(); }
+      else if (bd.state && tt < this.tMin) { bd.state = 0; if (!bd.silent) haptic('split'); bd.onBreak && bd.onBreak(n); }
+      bd.t.to = bd.state ? tt : 0;
+      busy = bd.t.step(dt) || busy;
+      if (bd.t.x < .8) { if (bd.shown) { bd.line.style.display = 'none'; bd.shown = false; } continue; }
+      if (!bd.shown) { bd.line.style.display = ''; bd.shown = true; }
+      const ia = Math.min(bd.inset, Math.min(A.w, A.h) / 3), ib = Math.min(bd.inset, Math.min(B.w, B.h) / 3);
+      const pa = toward(n.ax, n.ay, A.cx, A.cy, ia), pb = toward(n.bx, n.by, B.cx, B.cy, ib);
+      bd.line.setAttribute('x1', pa.x.toFixed(1)); bd.line.setAttribute('y1', pa.y.toFixed(1));
+      bd.line.setAttribute('x2', pb.x.toFixed(1)); bd.line.setAttribute('y2', pb.y.toFixed(1));
+      bd.line.setAttribute('stroke-width', bd.t.x.toFixed(2));
+    }
+    return busy;
+  }
+  step(dt) {
+    let busy = this.dragging > 0;
+    for (const t of this.tasks) busy = t(dt) || busy;
+    for (const d of this.drops) busy = d.step(dt) || busy;
+    busy = this.stepBonds(dt) || busy;
+    for (const d of this.drops) d.render();
+    for (const r of this.renders) r();
+    return busy;
+  }
+}
+function toward(x, y, cx, cy, d) { const dx = cx - x, dy = cy - y, L = Math.hypot(dx, dy) || 1, m = Math.min(d, L); return { x: x + dx / L * m, y: y + dy / L * m }; }
+function nearest(A, B) {
+  let ax, bx, ay, by;
+  if (A.r < B.l) { ax = A.r; bx = B.l; } else if (B.r < A.l) { ax = A.l; bx = B.r; } else ax = bx = (Math.max(A.l, B.l) + Math.min(A.r, B.r)) / 2;
+  if (A.b < B.t) { ay = A.b; by = B.t; } else if (B.b < A.t) { ay = A.t; by = B.b; } else ay = by = (Math.max(A.t, B.t) + Math.min(A.b, B.b)) / 2;
+  let gap = Math.hypot(bx - ax, by - ay);
+  if (ax !== bx && ay !== by) gap += (Math.min(A.r0, B.r0)) * .59;   // corner-to-corner: rounded corners are further apart
+  return { ax, ay, bx, by, gap };
+}
+
+class Drop {
+  constructor(scene, o) {
+    this.scene = scene; this.o = o;
+    this.px = new Spring(o.x, o.move || 'snap'); this.py = new Spring(o.y, o.move || 'snap');
+    this.pw = new Spring(o.w, 'budSize'); this.ph = new Spring(o.h, 'budSize'); this.pr = new Spring(o.r, 'budSize');
+    this.lift = new Spring(1, 'lift'); this.lift.eps = .0004;
+    // fix 6: the stretch origin is the grab point (centred local coordinates); it springs home after release
+    this.gx = new Spring(0, 'snap'); this.gy = new Spring(0, 'snap'); this.gx.eps = this.gy.eps = .05;
+    const minor = Math.min(o.lw || o.w, o.lh || o.h);
+    // `wobble`: water at UI scale is tight and quick, one small undershoot (ζ 0.68 ≈ 5 %); bigger droplets are a little slower
+    this.def = new Spring(0, [clamp(.14 * Math.sqrt(minor / 44), .14, .26), .68]); this.def.eps = .0004;
+    this.theta = o.theta || 0; this.cap = o.cap ?? .1; this.vref = o.vref || 2600; this.rigid = o.rigid ?? .5;
+    this.cw = o.cw || o.w; this.ch = o.ch || o.h; this.followSize = !!o.followSize;
+    this.visible = o.visible !== false;
+    this.mass = sv('rect', { fill: '#000' });
+    if (o.lens === 'tinted') scene.tints.appendChild(this.mass); else scene.inner.insertBefore(this.mass, scene.necks);
+    if (!this.visible) this.mass.style.display = 'none';
+    this.outline = null; this.outlineOn = false;
+    if (o.lens) {
+      this.lens = el('div', 'lens ' + o.lens); scene.lensLayer.appendChild(this.lens);
+      this.setLensBox(o.lw || o.w, o.lh || o.h, o.lr ?? o.r);
+      if (!this.visible) this.lens.style.opacity = 0;
+    }
+    if (o.el) {
+      this.el = o.el; this.el.classList.add('dc');
+      if (o.clip) {   // content revealed through the droplet: a clip that takes the BODY's matrix, not the content's
+        this.clip = el('div', 'dclip'); this.clip.appendChild(this.el); scene.content.appendChild(this.clip);
+      } else scene.content.appendChild(this.el);
+      this.sizeContent();
+    }
+    this.lastM = ''; scene.drops.push(this);
+    this.render();   // first paint already in place (no lens drawn away from its content before the first tick)
+  }
+  setRecede(on) { for (const n of [this.lens, this.clip || this.el, ...(this.extra || [])]) if (n) n.classList.toggle('recede', on); }
+  setLensBox(w, h, r) {
+    this.lw = w; this.lh = h;
+    const L = this.lens; L.style.width = w + 'px'; L.style.height = h + 'px'; L.style.borderRadius = r + 'px';
+    if (CHROMIUM && this.o.lens === 'clear' && !this.o.noRefract) {
+      const id = `lens-${this.scene.id}-${w}x${h}`;
+      if (!document.getElementById(id)) {
+        const url = bakeLens(Math.round(w), Math.round(h), r);
+        const f = sv('filter', { id, x: 0, y: 0, width: w, height: h, filterUnits: 'userSpaceOnUse', primitiveUnits: 'userSpaceOnUse', 'color-interpolation-filters': 'sRGB' });
+        const im = sv('feImage', { x: 0, y: 0, width: w, height: h, preserveAspectRatio: 'none', result: 'map' });
+        im.setAttribute('href', url); im.setAttributeNS('http://www.w3.org/1999/xlink', 'href', url);
+        f.appendChild(im);
+        // rim amplitude A = 0.15·minor + 2, halved on thin droplets (< 60 pt) so ink under a palette never doubles
+        const minor = Math.min(w, h), A = minor < 60 ? .08 * minor + 1 : .15 * minor + 2;
+        f.appendChild(sv('feDisplacementMap', { in: 'SourceGraphic', in2: 'map', scale: Math.round(2 * A), xChannelSelector: 'R', yChannelSelector: 'G' }));
+        this.scene.defs.appendChild(f);
+      }
+      L.dataset.filter = `url(#${id}) saturate(1.7) brightness(1.04) blur(5px)`;
+      applyLensFilter(L);
+    }
+  }
+  live(on) {
+    this.lensLive = on; this.lastM = '';
+    if (!this.lens) return;
+    if (on) { this.lens.dataset.filter = this.o.lens === 'clear' ? 'saturate(1.7) brightness(1.04) blur(5px)' : ''; applyLensFilter(this.lens); }
+  }
+  sizeContent() { this.el.style.width = this.cw + 'px'; this.el.style.height = this.ch + 'px'; }
+  box() {
+    const L = this.lift.x, w = this.pw.x * L, h = this.ph.x * L;
+    return { l: this.px.x - w / 2, r: this.px.x + w / 2, t: this.py.x - h / 2, b: this.py.x + h / 2, cx: this.px.x, cy: this.py.x, w, h, r0: this.pr.x };
+  }
+  grab(p) { const b = this.box(); this.gx.snap(clamp(p.x - b.cx, -b.w / 2, b.w / 2)); this.gy.snap(clamp(p.y - b.cy, -b.h / 2, b.h / 2)); }
+  release() { this.gx.to = 0; this.gy.to = 0; }
+  setOutline(on) {   // fix 4: a budding droplet carries the 12 % water line from its first frame
+    if (on && !this.outline) { this.outline = sv('rect', { fill: 'none', class: 'bud-line', 'stroke-width': .8 }); this.scene.outlines.appendChild(this.outline); }
+    this.outlineOn = on; if (this.outline) this.outline.style.display = on ? '' : 'none'; this.lastM = '';
+  }
+  // a 2.5 % squash on a 44 pt bar (the impulse is scaled to the droplet's wobble spring; 2.4 ≈ 2.5 % at 0.14 s, ζ 0.68)
+  poke(amount = 2.4) { if (!RM()) { this.def.v -= amount; this.scene.wake(); } }
+  step(dt) {
+    let busy = false;
+    for (const s of [this.px, this.py, this.pw, this.ph, this.pr, this.lift, this.gx, this.gy]) busy = s.step(dt) || busy;
+    const vx = this.dvx ?? this.px.v, vy = this.dvy ?? this.py.v, sp = Math.hypot(vx, vy);
+    let tgt = Math.min(CALM() ? this.cap / 2 : this.cap, sp / this.vref);
+    const w = Math.max(this.pw.x, 1), h = Math.max(this.ph.x, 1);
+    // fix 5, blended: long droplets deform on their own axes only (no shear). The regime fades in over aspect 2.5–3.5
+    // and θ always follows exponentially, so a droplet crossing aspect 3 mid re-form never twists in one frame.
+    const axis = w >= h ? 0 : Math.PI / 2, wl = smooth(2.5, 3.5, Math.max(w, h) / Math.min(w, h));
+    const phi = Math.atan2(vy, vx), free = sp > 40 ? phi : this.theta;
+    if (sp > 40) tgt *= 1 + (Math.cos(2 * (phi - axis)) - 1) * wl;
+    const target = free + wrapHalfTurn(axis - free) * wl;
+    this.theta += wrapHalfTurn(target - this.theta) * (1 - Math.exp(-18 * dt));
+    this.def.to = RM() ? 0 : tgt;
+    busy = this.def.step(dt) || busy;
+    if (RM()) this.def.snap(0);
+    return busy;
+  }
+  render() {
+    const w = this.pw.x, h = this.ph.x, r = Math.max(0, Math.min(this.pr.x, w / 2, h / 2));
+    const cap = CALM() ? this.cap / 2 : this.cap;   // caps are caps: the rendered stretch never passes them
+    const s = clamp(this.def.x, -.4 * cap, cap), L = this.lift.x, gx = this.gx.x, gy = this.gy.x;
+    const M = mat(this.px.x, this.py.x, w, h, s, this.theta, L, gx, gy);
+    const key = M.map(v => v.toFixed(3)).join() + w.toFixed(2) + h.toFixed(2) + (this.outlineOn ? 'o' : '');
+    if (key === this.lastM) return; this.lastM = key;
+    this.M = M;
+    const tr = `matrix(${M.map(v => v.toFixed(4)).join(' ')})`;
+    for (const shape of [this.visible ? this.mass : null, this.outlineOn ? this.outline : null]) {
+      if (!shape) continue;
+      shape.setAttribute('width', Math.max(0, w).toFixed(2)); shape.setAttribute('height', Math.max(0, h).toFixed(2));
+      shape.setAttribute('rx', r.toFixed(2)); shape.setAttribute('transform', tr);
+    }
+    if (this.lens) {
+      if (this.o.lens === 'clear') this.lens.classList.toggle('paper', this.scene.paperShare(this.box()) > .5);
+      if (this.lensLive) {
+        const st = this.lens.style; st.width = w.toFixed(1) + 'px'; st.height = h.toFixed(1) + 'px'; st.borderRadius = r.toFixed(1) + 'px';
+        st.transform = css(M);
+      } else {
+        const sx = w / this.lw, sy = h / this.lh;
+        this.lens.style.transform = css([M[0] * sx, M[1] * sx, M[2] * sy, M[3] * sy, M[4], M[5]]);
+      }
+    }
+    if (this.el) {
+      const cw = this.followSize ? w : this.cw, ch = this.followSize ? h : this.ch;
+      if (this.followSize) { this.el.style.width = w + 'px'; this.el.style.height = h + 'px'; }
+      this.Mc = mat(this.px.x, this.py.x, cw, ch, s * this.rigid, this.theta, L, gx, gy);
+      if (this.clip) {
+        // C's rule, exactly: the clip is the body itself (its matrix M, size w × h, radius r); the content inside it
+        // gets inverse(M)·Mc, so on screen it still lands at Mc. Nothing can draw outside the body.
+        const cs = this.clip.style; cs.width = w.toFixed(2) + 'px'; cs.height = h.toFixed(2) + 'px'; cs.borderRadius = r.toFixed(2) + 'px';
+        cs.transform = css(M);
+        this.el.style.transform = css(mul(inv(M), this.Mc));
+      } else this.el.style.transform = css(this.Mc);
+    }
+  }
+  show(v) {
+    this.visible = v; this.mass.style.display = v ? '' : 'none';
+    if (this.lens && !v) this.lens.style.opacity = 0;
+    if (!v) this.setOutline(false);
+    this.lastM = '';
+  }
+}
+function applyLensFilter(L) {
+  const f = RT() ? '' : (L.dataset.filter || '');
+  L.style.backdropFilter = f; L.style.webkitBackdropFilter = f;   // '' falls back to the class rule
+}
+
+/* Pointer → drag with velocity samples. Multi-touch protected; tap vs drag at 6 pt. */
+function onDrag(target, scene, h) {
+  target.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || scene.pid !== null) return;
+    const p0 = scene.toLocal(e), t0 = performance.now();
+    const ctx = h.down ? h.down(p0, e) : {};
+    if (ctx === false) return;
+    scene.pid = e.pointerId; try { target.setPointerCapture(e.pointerId); } catch (_) {}
+    let dragging = false; const samples = [{ t: t0, x: p0.x, y: p0.y }];
+    const move = ev => {
+      if (ev.pointerId !== scene.pid) return;
+      const p = scene.toLocal(ev), now = performance.now();
+      samples.push({ t: now, x: p.x, y: p.y }); while (samples.length > 2 && now - samples[0].t > 80) samples.shift();
+      if (!dragging && Math.hypot(p.x - p0.x, p.y - p0.y) > 6) { dragging = true; h.start && h.start(p0, p, ctx); }
+      if (dragging) { h.move && h.move(p, ctx); scene.wake(); }
+    };
+    const up = ev => {
+      if (ev.pointerId !== scene.pid) return;
+      target.removeEventListener('pointermove', move); target.removeEventListener('pointerup', up); target.removeEventListener('pointercancel', up);
+      scene.pid = null;
+      const p = scene.toLocal(ev), now = performance.now(), s0 = samples[0], sl = samples[samples.length - 1];
+      const dts = Math.max((now - s0.t) / 1000, .016);
+      let v = { x: (p.x - s0.x) / dts, y: (p.y - s0.y) / dts };
+      if (now - sl.t > 70) v = { x: 0, y: 0 };               // held still before lifting: no fling
+      const vm = Math.hypot(v.x, v.y); if (vm > 5000) { v.x *= 5000 / vm; v.y *= 5000 / vm; }
+      if (dragging) h.end && h.end(p, v, ctx, ev); else h.tap && h.tap(p, ctx, ev);
+      scene.wake();
+    };
+    target.addEventListener('pointermove', move); target.addEventListener('pointerup', up); target.addEventListener('pointercancel', up);
+    e.preventDefault();
+  });
+}
+const rubber = (v, lo, hi, dim = 120) => v < lo ? lo - (1 - 1 / ((lo - v) * .55 / dim + 1)) * dim : v > hi ? hi + (1 - 1 / ((v - hi) * .55 / dim + 1)) * dim : v;
+
+/* =============================================================================
+   5. Components shared by the editor screens
+   ========================================================================== */
+function pageMarkup(uid, proposal) {
+  const rules = []; for (let y = 172; y <= 1066; y += 34) rules.push(`<line x1="0" x2="760" y1="${y}" y2="${y}"/>`);
+  let sine = ''; for (let x = 142; x <= 542; x += 2.5) { const y = 660 - 80 * Math.sin(TAU * (x - 142) / 200) + Math.sin(x * .09) * .9; sine += (x === 142 ? 'M' : 'L') + x.toFixed(1) + ' ' + y.toFixed(1); }
+  const H = `class="hand"`;
+  return `<svg viewBox="0 0 760 1075" preserveAspectRatio="xMinYMin meet" role="img" aria-label="Handwritten page: Simple Harmonic Motion">
+  <rect width="760" height="1075" fill="#fff"/>
+  <g stroke="#CFDBE8" stroke-width="1.1">${rules.join('')}</g>
+  <line x1="84" x2="84" y1="0" y2="1075" stroke="#EDB9B3" stroke-width="1.3"/>
+  <path d="M296 190 C 340 183, 420 192, 486 186" stroke="${HIGHLIGHT.lemon}" stroke-width="30" stroke-linecap="round" fill="none" opacity=".62" style="mix-blend-mode:multiply"/>
+  <g ${H} fill="${INK.carbon}">
+    <text x="612" y="72" font-size="19" fill="${INK.graphite}">Tue 24.09</text>
+    <text x="102" y="124" font-size="40" transform="rotate(-.6 102 124)">Simple Harmonic Motion</text>
+    <text x="102" y="200" font-size="25">Definition:</text>
+    <text x="306" y="201" font-size="29">a = −ω²x</text>
+    <text x="102" y="234" font-size="19" fill="${INK.graphite}" transform="rotate(-.3 102 234)">acceleration is proportional to displacement, towards equilibrium</text>
+    <text x="102" y="302" font-size="26">x = x₀ sin ωt</text>
+    <text x="372" y="302" font-size="26">v = ±ω√(x₀² − x²)</text>
+    <text x="396" y="340" font-size="19" fill="${INK.vermilion}" transform="rotate(-2 396 340)">max at x = 0</text>
+    <text x="102" y="404" font-size="25">Mass–spring:</text>
+    <text class="wrong" x="300" y="405" font-size="27">T = 2π√(k/m)</text>
+    <text x="102" y="438" font-size="25">Pendulum:</text>
+    <text x="300" y="439" font-size="27">T = 2π√(l/g)</text>
+    <text x="102" y="506" font-size="25">Energy:  E = ½ m ω² x₀²</text>
+    <text x="448" y="506" font-size="19" fill="${INK.graphite}">(constant)</text>
+    <text x="116" y="572" font-size="22">x</text>
+    <text x="590" y="684" font-size="22">t</text>
+    <text x="92" y="590" font-size="18" fill="${INK.graphite}">x₀</text>
+    <text x="232" y="752" font-size="22" fill="${INK.cobalt}">T</text>
+    <text x="102" y="812" font-size="22" fill="${INK.vermilion}">Exam tip:</text>
+    <text x="222" y="812" font-size="22">always state a = −ω²x first</text>
+    <text x="102" y="880" font-size="20" fill="${INK.graphite}">Next: damping and resonance, p. 4</text>
+  </g>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M102 140 C 230 134, 400 146, 560 137 S 640 135, 672 139" stroke="${INK.cobalt}" stroke-width="2.6"/>
+    <path d="M293 176 C 330 168, 440 169, 494 175 C 503 183, 502 206, 494 212 C 440 218, 330 219, 296 212 C 287 204, 286 184, 293 176 Z" stroke="${INK.vermilion}" stroke-width="2"/>
+    <path d="M140 760 L 140 556 M 133 566 L 140 554 L 147 566" stroke="${INK.carbon}" stroke-width="2"/>
+    <path d="M128 660 L 584 660 M 574 653 L 586 660 L 574 667" stroke="${INK.carbon}" stroke-width="2"/>
+    <path d="${sine}" stroke="${INK.carbon}" stroke-width="2.5"/>
+    <path d="M140 580 L 552 580" stroke="${INK.graphite}" stroke-width="1.4" stroke-dasharray="5 6"/>
+    <path d="M142 724 L 342 724 M 142 716 L 142 732 M 342 716 L 342 732" stroke="${INK.cobalt}" stroke-width="1.8"/>
+    <path d="M386 334 C 380 326, 379 320, 382 312 M 382 312 l -4 8 M 382 312 l 6 6" stroke="${INK.vermilion}" stroke-width="1.8"/>
+    ${proposal ? `<path class="prop-strike" d="M298 396 L 470 394" stroke-width="2.6"/>
+    <path class="stray" d="M472 752 l11 -9 l9 12 l10 -11 l8 12 l11 -10 l7 9 l9 -8" stroke="${INK.graphite}" stroke-width="2"/>` : ''}
+  </g>
+  ${proposal ? `<rect class="wash" x="286" y="372" width="440" height="44" rx="6"/>
+  <text class="hand prop-new" x="520" y="405" font-size="27">T = 2π√(m/k)</text>
+  <g class="marks" aria-hidden="true">
+    <line class="tie" style="display:none"/>
+    <g class="mbadge" data-n="1" transform="translate(52 383)"><circle r="11"/><text y="4.6">1</text></g>
+    <g class="mbadge" data-n="2" transform="translate(52 409)"><circle r="11"/><text y="4.6">2</text></g>
+    <g class="mbadge red" data-n="3" transform="translate(52 752)"><circle r="11"/><text y="4.6">3</text></g>
+  </g>` : ''}
+  <g class="user-ink" fill="none" stroke-linecap="round" stroke-linejoin="round"></g>
+</svg>`;
+}
+
+/* A page with writing that makes the chrome recede. */
+function mountPage(scene, rect, opts = {}) {
+  const page = el('div', 'page', pageMarkup(scene.id, opts.proposal));
+  const ph = Math.round(rect.w * 1075 / 760);
+  Object.assign(page.style, { left: rect.x + 'px', top: rect.y + 'px', width: rect.w + 'px', height: ph + 'px' });
+  scene.scene.appendChild(page);
+  scene.addPaper({ x: rect.x, y: rect.y, w: rect.w, h: ph });
+  const svg = page.querySelector('svg'), ink = svg.querySelector('.user-ink'), s = rect.w / 760;
+  let path = null, pts = [], releaseT = 0, bb = null;
+  const grow = p => { bb = bb ? { l: Math.min(bb.l, p.x), r: Math.max(bb.r, p.x), t: Math.min(bb.t, p.y), b: Math.max(bb.b, p.y) } : { l: p.x, r: p.x, t: p.y, b: p.y }; scene.recede(bb); };
+  onDrag(page, scene, {
+    down(p) {
+      if (scene.popIsOpen && scene.popIsOpen()) { scene.popClose(); return false; }   // a tap outside dismisses; it never inks
+      clearTimeout(releaseT); scene.screen.classList.add('writing'); bb = null; grow(p);
+      const tool = scene.tool ? scene.tool() : { color: INK.carbon, width: 2.4 };
+      pts = [{ x: (p.x - rect.x) / s, y: (p.y - rect.y) / s }];
+      path = sv('path', { stroke: tool.color, 'stroke-width': tool.width, opacity: tool.opacity || 1 });
+      if (tool.multiply) path.style.mixBlendMode = 'multiply';
+      ink.appendChild(path); draw(); return {};
+    },
+    start() {}, move(p) { pts.push({ x: (p.x - rect.x) / s, y: (p.y - rect.y) / s }); grow(p); draw(); },
+    end() { finish(); }, tap() { finish(); }
+  });
+  function draw() {
+    if (pts.length < 2) { path.setAttribute('d', `M${pts[0].x} ${pts[0].y} l.1 0`); return; }
+    let d = `M${pts[0].x.toFixed(1)} ${pts[0].y.toFixed(1)}`;
+    for (let i = 1; i < pts.length - 1; i++) { const m = { x: (pts[i].x + pts[i + 1].x) / 2, y: (pts[i].y + pts[i + 1].y) / 2 }; d += ` Q${pts[i].x.toFixed(1)} ${pts[i].y.toFixed(1)} ${m.x.toFixed(1)} ${m.y.toFixed(1)}`; }
+    const l = pts[pts.length - 1]; d += ` L${l.x.toFixed(1)} ${l.y.toFixed(1)}`; path.setAttribute('d', d);
+  }
+  function finish() { releaseT = setTimeout(() => { scene.screen.classList.remove('writing'); scene.recede(null); }, 450); }
+  return { page, svg, s, rect };
+}
+
+function statusBarPad(scene, dark) {
+  const sb = el('div', 'status', `<span>9:41&nbsp;&nbsp;Tue 24 Sep</span><span class="r">${wifi()}<span>100%</span>${battery()}</span>`);
+  scene.screen.appendChild(sb);
+}
+const wifi = () => `<svg viewBox="0 0 24 18" width="16" height="12" fill="none" stroke="currentColor" stroke-linecap="round"><use href="#i-wifi"/></svg>`;
+const battery = () => `<svg viewBox="0 0 27 13" width="27" height="13"><rect x=".5" y=".5" width="22" height="12" rx="3.6" fill="none" stroke="currentColor" opacity=".4"/><rect x="2.2" y="2.2" width="18.6" height="8.6" rx="2.2" fill="currentColor"/><path d="M24.2 4.5v4a2 2 0 0 0 0-4Z" fill="currentColor" opacity=".45"/></svg>`;
+
+/* Static droplet with content (pills, HUDs). Pressing a control pokes the water. */
+function pill(scene, x, y, w, h, html, o = {}) {
+  const c = el('div', o.cls || '', html);
+  const d = new Drop(scene, { x: x + w / 2, y: y + h / 2, w, h, r: o.r ?? h / 2, lens: o.lens || 'clear', el: c, cap: .1, rigid: .5 });
+  c.addEventListener('pointerdown', e => { if (e.target.closest('button')) d.poke(o.poke ?? 2.4); });
+  return d;
+}
+
+/* ---------- Tool palette with selection bead ---------- */
+// Six everyday tools and More (Customise Toolbar can show all of them): 6 + 7 × 44 + 17 + 3 × 44 + 6 = 469 pt
+const TOOLS = [
+  ['pen', 'Pen'], ['highlighter', 'Highlighter'], ['eraser', 'Eraser'], ['lasso', 'Lasso'], ['shapes', 'Shapes'],
+  ['text', 'Text'], ['more', 'More tools']];
+const MORE_TOOLS = [['photo', 'Image'], ['tape', 'Tape'], ['sticker', 'Elements'], ['laser', 'Laser pointer'], ['ruler', 'Ruler']];
+
+/* Resting next to a neighbour (fix 7): fused with a 1 pt overlap (centres aligned within 24 pt), or pushed out to
+   16 pt when the gap would fall in the banned 12–15 pt band. */
+function restRect(m, f, k, axis) {   // axis 'x' | 'y': a docked droplet only slides along its dock
+  const w = m.r - m.l, h = m.b - m.t, out = { l: m.l, r: m.r, t: m.t, b: m.b };
+  if (axis === 'x' && !(m.t < f.b && f.t < m.b)) return out;
+  if (axis === 'y' && !(m.l < f.r && f.l < m.r)) return out;
+  const g = nearest(Object.assign({ r0: 0 }, m), f).gap;
+  const gapX = Math.max(f.l - m.r, m.l - f.r), gapY = Math.max(f.t - m.b, m.t - f.b);
+  const mcx = (m.l + m.r) / 2, mcy = (m.t + m.b) / 2, fcx = (f.l + f.r) / 2, fcy = (f.t + f.b) / 2;
+  const alongX = axis ? axis === 'x' : gapX >= gapY;
+  if (g < k) {
+    if (alongX) { out.l = mcx < fcx ? f.l + 1 - w : f.r - 1; if (!axis && Math.abs(mcy - fcy) <= 24) out.t = fcy - h / 2; }
+    else { out.t = mcy < fcy ? f.t + 1 - h : f.b - 1; if (!axis && Math.abs(mcx - fcx) <= 24) out.l = fcx - w / 2; }
+  } else if (g < 16) {
+    const push = 16 - g;
+    if (alongX) out.l += mcx < fcx ? -push : push; else out.t += mcy < fcy ? -push : push;
+  } else return out;
+  out.r = out.l + w; out.b = out.t + h; return out;
+}
+
+function Palette(scene, o) {
+  const P = { orient: o.orient, sel: 0, color: o.colors[0], dragging: false };
+  const pad = o.pad ?? 6, pitch = o.pitch ?? 44, thick = o.thick ?? 56, cp = o.colorPitch ?? 44;
+  const tools = o.tools, nC = o.colors.length;
+  const lastTool = tools[tools.length - 1][0] === 'more' ? tools.length - 2 : tools.length - 1;   // More is never selected
+  const length = pad * 2 + tools.length * pitch + (nC ? 17 + nC * cp : 0);
+  const dims = or => or === 'v' ? { w: thick, h: length } : { w: length, h: thick };
+  const along = i => pad + pitch * i + pitch / 2;
+  const cAlong = j => pad + tools.length * pitch + 17 + cp * j + cp / 2;
+  const loc = (or, a, c = thick / 2) => or === 'v' ? { x: c, y: a } : { x: a, y: c };
+  const box = el('div', 'palette'); box.style.borderRadius = thick / 2 + 'px';
+  box.setAttribute('role', 'toolbar'); box.setAttribute('aria-label', 'Tools'); box.setAttribute('aria-orientation', P.orient === 'v' ? 'vertical' : 'horizontal');
+  const items = [];
+  tools.forEach(([id, label], i) => {
+    const b = el('button', 'tool', icon(id)); b.dataset.i = i; b.dataset.t = id; b.setAttribute('aria-label', label);
+    if (id === 'more') b.setAttribute('aria-haspopup', 'dialog'); else b.setAttribute('aria-pressed', i === 0);
+    // a glyph's colour stripe shows what that tool lays down: the pen its ink, the highlighter its highlight
+    if (id === 'highlighter') b.style.setProperty('--ink', HIGHLIGHT.lemon); else if (id === 'pen') b.style.setProperty('--ink', P.color);
+    box.appendChild(b);
+    items.push({ node: b, a: along(i), w: 44, h: 44, kind: 'tool' });
+  });
+  if (nC) {
+    const divider = el('i', 'pdiv'); box.appendChild(divider); items.push({ node: divider, a: pad + tools.length * pitch + 8.5, kind: 'div' });
+    o.colors.forEach((c, j) => {
+      const b = el('button', 'swatch', '<i></i>'); b.style.setProperty('--c', c); b.dataset.c = j;
+      if (c === INK.carbon || c === INK.midnight) b.classList.add('dk'); else if (c === INK.chalk) b.classList.add('lt');
+      b.setAttribute('aria-label', 'Ink ' + Object.keys(INK).find(k => INK[k] === c)); b.setAttribute('aria-pressed', j === 0);
+      box.appendChild(b); items.push({ node: b, a: cAlong(j), w: 44, h: 44, kind: 'swatch' });
+    });
+  }
+  const d0 = dims(P.orient);
+  const drop = new Drop(scene, { x: o.x, y: o.y, w: d0.w, h: d0.h, r: thick / 2, lens: 'clear', el: box, cap: .09, rigid: .55, followSize: true, theta: P.orient === 'v' ? Math.PI / 2 : 0 });
+  drop.extra = [scene.beadSvg];   // the bead recedes with its palette
+  const other = dims(P.orient === 'v' ? 'h' : 'v'); if (CHROMIUM) { const keep = [drop.lw, drop.lh]; drop.setLensBox(other.w, other.h, thick / 2); drop.setLensBox(keep[0], keep[1], thick / 2); }
+  items.forEach(it => { const p = loc(P.orient, it.a); it.lx = new Spring(p.x, 'bud'); it.ly = new Spring(p.y, 'bud'); });
+
+  // The bead: head + lagging tail joined by a neck. Fix 1: the tail stays within 1.0·r and the neck's half-width
+  // never drops below 0.72 of the tail radius, so it glides as one drop and never splits. Tool switching happens tens
+  // of times a minute, so the bead is quick and never overshoots (`glide` ζ 1); the teardrop only shows on long jumps.
+  const head = new Spring(along(0), 'glide'), tail = new Spring(along(0), 'trail'); head.eps = tail.eps = .05;
+  const bR = o.beadR ?? 20, tR = bR * .78, maxSep = 1.0 * bR, minNeck = 2 * .72 * tR;
+  const cH = sv('circle', { r: bR, fill: '#000' }), cT = sv('circle', { r: tR, fill: '#000' }), neck = sv('line', { stroke: '#000', 'stroke-linecap': 'round' });
+  scene.beads.append(cT, neck, cH);
+  const iH = sv('circle', { r: bR }), iT = sv('circle', { r: tR }), iN = sv('line', { 'stroke-linecap': 'round' });
+  scene.beadInk.append(iT, iN, iH);   // the bead takes the current ink at 15 % (B's graft)
+  const setInk = c => { iH.setAttribute('fill', c); iT.setAttribute('fill', c); iN.setAttribute('stroke', c); };
+  setInk(P.color);
+  let arrived = true, scrub = false;
+
+  // Re-forming (fix 2): gather into a bead, switch the axis at the midpoint while the content is invisible, spread.
+  const R = { phase: null, from: 0, to: null };
+  const xfade = p => (p <= .42 || p >= .58) ? 1 : Math.abs(p - .5) / .08;   // content is dark for 0.42–0.58 only
+  let alpha = 1;
+  function setOrient(or) {
+    if (or === P.orient || R.phase) return;
+    if (RM()) {
+      P.orient = or; const d = dims(or); drop.pw.snap(d.w); drop.ph.snap(d.h);
+      items.forEach(it => { const q = loc(or, it.a); it.lx.snap(q.x); it.ly.snap(q.y); });
+      box.setAttribute('aria-orientation', or === 'v' ? 'vertical' : 'horizontal');
+      if (drop.lens) { drop.live(false); drop.setLensBox(d.w, d.h, thick / 2); }
+      drop.lastM = ''; return;
+    }
+    R.phase = 'gather'; R.to = or; R.from = Math.max(drop.pw.x, drop.ph.x);
+    drop.live(true);
+    drop.pw.use('reform').to = thick; drop.ph.use('reform').to = thick;   // a correction gesture: ≤ 380 ms, not a show
+  }
+  function select(i, fromKeyboard) {
+    const same = i === P.sel;
+    P.sel = i; items.forEach(it => it.kind === 'tool' && it.node.dataset.t !== 'more' && it.node.setAttribute('aria-pressed', +it.node.dataset.i === i));
+    head.to = along(i); arrived = false;
+    if (fromKeyboard || RM()) { head.snap(along(i)); tail.snap(along(i)); arrived = true; }   // keyboard and Pencil switches teleport
+    if (o.onSelect) o.onSelect(i, same);
+    scene.wake();
+  }
+  function setColor(j) {
+    P.color = o.colors[j];
+    items.forEach(it => it.kind === 'swatch' && it.node.setAttribute('aria-pressed', +it.node.dataset.c === j));
+    box.querySelectorAll('.tool[data-t="pen"]').forEach(b => b.style.setProperty('--ink', P.color));
+    setInk(P.color);
+  }
+  P.setColorHex = hex => {
+    let j = o.colors.indexOf(hex);
+    if (j < 0) { o.colors[0] = hex; const sw = box.querySelector('.swatch'); if (sw) sw.style.setProperty('--c', hex); j = 0; }
+    setColor(j);
+  };
+  const localAlong = p => { const b = drop.box(); return P.orient === 'v' ? p.y - b.t : p.x - b.l; };
+
+  scene.tasks.push(dt => {
+    let busy = false;
+    items.forEach(it => { busy = it.lx.step(dt) || busy; busy = it.ly.step(dt) || busy; });
+    busy = head.step(dt) || busy;
+    tail.to = head.x; busy = tail.step(dt) || busy;
+    tail.x = clamp(tail.x, head.x - maxSep, head.x + maxSep);
+    if (!arrived && Math.abs(head.x - head.to) < 1.2) { arrived = true; if (!scrub) haptic('select'); }
+    // the palette is never thinner than its thickness: its short side is snapped, never sprung below `thick`
+    for (const s of [drop.pw, drop.ph]) if (s.x < thick) { s.x = thick; s.v = Math.max(0, s.v); }
+    const long = Math.max(drop.pw.x, drop.ph.x);
+    if (R.phase === 'gather') {
+      const switchAt = thick * 1.5;
+      alpha = xfade(clamp(.5 * (R.from - long) / Math.max(1, R.from - switchAt), 0, .5));
+      if (long <= switchAt) {
+        R.phase = 'spread'; R.from = long; P.orient = R.to; alpha = 0;
+        box.setAttribute('aria-orientation', P.orient === 'v' ? 'vertical' : 'horizontal');
+        items.forEach(it => { const q = loc(P.orient, it.a); it.lx.snap(q.x); it.ly.snap(q.y); });
+        const d = dims(P.orient); drop.pw.to = d.w; drop.ph.to = d.h;
+      }
+      busy = true;
+    } else if (R.phase === 'spread') {
+      alpha = xfade(clamp(.5 + .5 * (long - R.from) / Math.max(1, length - R.from), .5, 1));
+      if (drop.pw.rest && drop.ph.rest) {
+        R.phase = null; alpha = 1;
+        const d = dims(P.orient);
+        if (drop.lens) { drop.live(false); drop.setLensBox(d.w, d.h, thick / 2); drop.lastM = ''; }
+      }
+      busy = true;
+    }
+    // fix 7: while the palette is dragged into a neighbour, the neighbour's glyphs yield (to 25 % over 12 pt)
+    for (const nb of (o.neighbours || [])) {
+      if (!nb.el) continue;
+      let a = 1;
+      if (P.dragging && nb.visible) {
+        const A = drop.box(), B = nb.box();
+        const ox = Math.min(A.r, B.r) - Math.max(A.l, B.l), oy = Math.min(A.b, B.b) - Math.max(A.t, B.t);
+        if (ox > 0 && oy > 0) a = Math.max(.25, 1 - Math.max(0, Math.min(ox, oy) - 1) / 12);
+      }
+      nb.el.style.opacity = a;
+    }
+    return busy;
+  });
+  scene.renders.push(() => {
+    box.style.opacity = alpha.toFixed(3);
+    items.forEach(it => {
+      if (it.kind === 'div') {
+        const v = P.orient === 'v';
+        Object.assign(it.node.style, { width: v ? '28px' : '.5px', height: v ? '.5px' : '28px', transform: `translate(${(it.lx.x - (v ? 14 : 0)).toFixed(2)}px,${(it.ly.x - (v ? 0 : 14)).toFixed(2)}px)` });
+        return;
+      }
+      let mag = 1;
+      if (it.kind === 'tool') { const dd = Math.abs(head.x - it.a); mag = 1 + .13 * Math.max(0, 1 - dd / 30); }
+      it.node.style.transform = `translate(${(it.lx.x - it.w / 2).toFixed(2)}px,${(it.ly.x - it.h / 2).toFixed(2)}px) scale(${mag.toFixed(3)})`;
+    });
+    const M = drop.Mc; if (!M) return;
+    const det = Math.sqrt(Math.abs(M[0] * M[3] - M[1] * M[2]));
+    const hl = itemAt(head.x), tl2 = itemAt(tail.x);
+    const hp = apply(M, hl.x, hl.y), tp = apply(M, tl2.x, tl2.y);
+    const gap = Math.abs(head.x - tail.x);
+    const nw = (Math.max(minNeck, bR * 1.2 * (1 - gap / 150)) * det).toFixed(2);
+    for (const [H, T, N] of [[cH, cT, neck], [iH, iT, iN]]) {
+      H.setAttribute('cx', hp.x.toFixed(2)); H.setAttribute('cy', hp.y.toFixed(2)); H.setAttribute('r', (bR * det).toFixed(2));
+      T.setAttribute('cx', tp.x.toFixed(2)); T.setAttribute('cy', tp.y.toFixed(2)); T.setAttribute('r', (tR * det).toFixed(2));
+      N.setAttribute('x1', hp.x.toFixed(2)); N.setAttribute('y1', hp.y.toFixed(2)); N.setAttribute('x2', tp.x.toFixed(2)); N.setAttribute('y2', tp.y.toFixed(2));
+      N.setAttribute('stroke-width', nw);
+    }
+    scene.beadSvg.style.opacity = (drop.pw.x < 8 ? 0 : alpha).toFixed(3);
+  });
+  function itemAt(a) {
+    const f = clamp((a - along(0)) / pitch, 0, tools.length - 1), i0 = Math.floor(f), i1 = Math.min(tools.length - 1, i0 + 1), t = f - i0;
+    const A = items[i0], B = items[i1];
+    return { x: A.lx.x + (B.lx.x - A.lx.x) * t, y: A.ly.x + (B.ly.x - A.ly.x) * t };
+  }
+
+  onDrag(box, scene, {
+    down(p, e) {
+      const t = e.target.closest('.tool,.swatch');
+      return { tool: t && t.classList.contains('tool') ? +t.dataset.i : -1, sw: t && t.classList.contains('swatch') ? +t.dataset.c : -1, p0: p };
+    },
+    start(p0, p, ctx) {
+      const b = drop.box(), dAlong = P.orient === 'v' ? p.y - p0.y : p.x - p0.x, dAcross = P.orient === 'v' ? p.x - p0.x : p.y - p0.y;
+      if (ctx.tool === P.sel && Math.abs(dAlong) > Math.abs(dAcross) && !R.phase) { ctx.mode = 'scrub'; scrub = true; return; }
+      ctx.mode = 'drag'; ctx.off = { x: p0.x - b.cx, y: p0.y - b.cy };
+      if (o.onDragStart) o.onDragStart();
+      drop.grab(p0);
+      drop.px.use('follow'); drop.py.use('follow'); drop.lift.to = 1.035; box.classList.add('grabbing');
+      if (drop.lens) drop.lens.classList.add('lifted');
+      P.dragging = true; scene.dragging++;
+    },
+    move(p, ctx) {
+      if (ctx.mode === 'scrub') { head.to = clamp(localAlong(p), along(0), along(lastTool)); arrived = true; return; }
+      const b = drop.box(), hw = b.w / 2, hh = b.h / 2;
+      drop.px.to = rubber(p.x - ctx.off.x, hw + 8, scene.W - hw - 8);
+      drop.py.to = rubber(p.y - ctx.off.y, hh + (o.minTop ?? 8), scene.H - hh - 8);
+    },
+    end(p, v, ctx) {
+      if (ctx.mode === 'scrub') {
+        scrub = false; const a = head.to; let best = 0;
+        for (let i = 1; i <= lastTool; i++) if (Math.abs(along(i) - a) < Math.abs(along(best) - a)) best = i;
+        arrived = false; select(best); return;
+      }
+      P.dragging = false; scene.dragging--; box.classList.remove('grabbing'); if (drop.lens) drop.lens.classList.remove('lifted');
+      drop.release();
+      const proj = { x: p.x + v.x * .12, y: p.y + v.y * .12 };      // UIScrollView .fast projection
+      const z = o.zone(proj, P.orient);
+      const d = dims(z.orient);
+      const c = z.at(d);
+      let rect = { l: c.x - d.w / 2, r: c.x + d.w / 2, t: c.y - d.h / 2, b: c.y + d.h / 2 };
+      for (const nb of (o.neighbours || [])) if (nb.visible) rect = restRect(rect, nb.box(), scene.merge, z.orient === 'h' ? 'x' : 'y');
+      setOrient(z.orient);
+      drop.px.use('snap'); drop.py.use('snap'); drop.px.to = (rect.l + rect.r) / 2; drop.py.to = (rect.t + rect.b) / 2;
+      drop.px.v = v.x; drop.py.v = v.y; drop.lift.to = 1;
+      setTimeout(() => haptic('snap'), 260);
+    },
+    tap(p, ctx) {
+      if (ctx.sw >= 0) { setColor(ctx.sw); drop.poke(1.3); if (o.onColor) o.onColor(P.color); return; }
+      if (ctx.tool >= 0 && tools[ctx.tool][0] === 'more') { drop.poke(2.2); if (o.onMore) o.onMore(ctx.tool); return; }   // More buds a grid; the bead stays
+      if (ctx.tool >= 0) { drop.poke(2.2); select(ctx.tool); }
+    }
+  });
+  box.addEventListener('click', e => {        // keyboard activation (Enter/Space): no pointer, no animation
+    if (e.detail !== 0) return;
+    const t = e.target.closest('.tool');
+    if (t && t.dataset.t === 'more') { if (o.onMore) o.onMore(+t.dataset.i, true); return; }
+    if (t) select(+t.dataset.i, true);
+    const s = e.target.closest('.swatch'); if (s) setColor(+s.dataset.c);
+  });
+
+  Object.assign(P, {
+    drop, select, setColor,
+    toolWorld(i) { const M = drop.Mc || mat(drop.px.x, drop.py.x, drop.pw.x, drop.ph.x, 0, 0, 1); const l = itemAt(along(i)); return apply(M, l.x, l.y); },
+    get orientNow() { return P.orient; }
+  });
+  return P;
+}
+
+/* ---------- Popover that buds off the palette ---------- */
+function Popover(scene, pal, o) {
+  const content = el('div', 'pop', o.html); content.setAttribute('role', 'dialog'); content.setAttribute('aria-label', o.label);
+  const drop = new Drop(scene, { x: -200, y: -200, w: 34, h: 34, r: 17, lw: o.w, lh: o.h, lr: o.r, cw: o.w, ch: o.h, lens: 'deep', el: content, cap: .06, rigid: .15, visible: false, move: 'bud', clip: true });
+  drop.pw.use('budSize'); drop.ph.use('budSize'); drop.live(true);
+  const S = { open: false, closing: false };
+  let fadeT = 0;
+  const bond = scene.bond(pal.drop, drop, { on: 11, off: o.neckOff ?? 21, t0: 30, inset: 10, silent: true, onBreak: () => { if (S.open && !content.classList.contains('shown')) { reveal(); haptic('bud'); } }, onJoin: () => { if (S.closing) haptic('merge'); } });
+  function reveal() { clearTimeout(fadeT); content.classList.add('shown'); drop.setOutline(false); scene.wake(); }
+  function target() { return o.place(pal, S.tool); }
+  const RETRACT = [.3, .9];
+  S.openAt = tool => {
+    S.tool = tool; S.open = true; S.closing = false;
+    const src = pal.toolWorld(tool), t = target();
+    drop.px.snap(src.x); drop.py.snap(src.y); drop.pw.snap(30); drop.ph.snap(30); drop.pr.snap(15);
+    drop.show(true); drop.lens.style.opacity = 0; drop.setOutline(true);
+    content.classList.remove('shown');
+    if (RM()) { drop.px.snap(t.x); drop.py.snap(t.y); drop.pw.snap(o.w); drop.ph.snap(o.h); drop.pr.snap(o.r); reveal(); }
+    else {
+      drop.px.use('bud').to = t.x; drop.py.use('bud').to = t.y; drop.pw.use('budSize').to = o.w; drop.ph.use('budSize').to = o.h; drop.pr.to = o.r;
+      fadeT = setTimeout(reveal, 300);
+    }
+    scene.wake();
+  };
+  S.close = () => {
+    if (!S.open) return; S.open = false; S.closing = true; clearTimeout(fadeT);
+    content.classList.remove('shown'); drop.setOutline(!RM());
+    const back = () => {
+      const src = pal.toolWorld(S.tool);
+      if (RM()) { drop.show(false); S.closing = false; return; }
+      drop.px.use(RETRACT).to = src.x; drop.py.use(RETRACT).to = src.y; drop.pw.use(RETRACT).to = 28; drop.ph.use(RETRACT).to = 28; drop.pr.to = 14; scene.wake();
+    };
+    setTimeout(back, RM() ? 120 : 70);
+  };
+  S.toggle = tool => (S.open && tool === S.tool) ? S.close() : S.openAt(tool);
+  scene.tasks.push(() => {
+    if (!drop.visible) return false;
+    const prog = clamp((drop.pw.x - 30) / (o.w - 30), 0, 1);
+    if (drop.lens) drop.lens.style.opacity = RT() ? (prog > .9 ? 1 : 0) : (S.open ? clamp((prog - .25) / .5, 0, 1) : clamp((prog - .3) / .5, 0, 1)).toFixed(3);
+    if (S.closing) {
+      const src = pal.toolWorld(S.tool);
+      drop.px.to = src.x; drop.py.to = src.y;
+      if (drop.pw.x < 34 && Math.hypot(drop.px.x - src.x, drop.py.x - src.y) < 5) { drop.show(false); S.closing = false; }
+    }
+    return false;
+  });
+  S.drop = drop; S.content = content; S.bond = bond;
+  return S;
+}
+
+/* More buds a grid of the tools that are not on the palette; choosing one closes it. The bead never moves to More. */
+function morePopover(scene, pal, place, w = 312, h = 124) {
+  const S = Popover(scene, pal, { w, h, r: 26, label: 'More tools', html: moreHTML(), place });
+  S.content.querySelectorAll('[data-tool]').forEach(b => b.addEventListener('click', () => {
+    S.content.querySelectorAll('[data-tool]').forEach(x => x.setAttribute('aria-checked', x === b));
+    S.drop.poke(.5); setTimeout(S.close, 120);
+  }));
+  return S;
+}
+const swatchRing = k => (k === 'carbon' || k === 'midnight') ? ' dk' : k === 'chalk' ? ' lt' : '';
+function moreHTML() {
+  return `
+  <div class="pop-head"><span class="pop-title">More tools</span></div>
+  <div class="pen-types" style="grid-template-columns:repeat(5,1fr)" role="radiogroup" aria-label="More tools">
+    ${MORE_TOOLS.map(([id, label]) => `<button role="radio" aria-checked="false" data-tool="${id}">${icon(id)}<span>${label.replace(' pointer', '')}</span></button>`).join('')}
+  </div>`;
+}
+function penPopoverHTML(colors, sel) {
+  return `
+  <div class="pop-head"><span class="pop-title">Fountain Pen</span></div>
+  <div class="pen-types" role="radiogroup" aria-label="Pen type">
+    <button role="radio" aria-checked="true">${icon('nib')}<span>Fountain</span></button>
+    <button role="radio" aria-checked="false">${icon('ball')}<span>Ball</span></button>
+    <button role="radio" aria-checked="false">${icon('brush')}<span>Brush</span></button>
+    <button role="radio" aria-checked="false">${icon('pencil')}<span>Pencil</span></button>
+  </div>
+  <div class="pop-sec"><span>Thickness</span><span class="val" data-val>0.50 mm</span></div>
+  <div class="sizes" role="radiogroup" aria-label="Thickness">
+    <button role="radio" aria-checked="false" data-w="1.6" data-mm="0.30 mm" aria-label="Fine"><i style="width:5px;height:5px"></i></button>
+    <button role="radio" aria-checked="true" data-w="2.4" data-mm="0.50 mm" aria-label="Medium"><i style="width:8px;height:8px"></i></button>
+    <button role="radio" aria-checked="false" data-w="3.6" data-mm="0.80 mm" aria-label="Bold"><i style="width:12px;height:12px"></i></button>
+  </div>
+  <div class="pop-sec"><span>Colour</span><button class="link">Custom…</button></div>
+  <div class="colors" role="radiogroup" aria-label="Ink colour">
+    ${INK_ORDER.map(k => `<button class="swatch${swatchRing(k)}" role="radio" data-hex="${INK[k]}" aria-checked="${INK[k] === sel}" aria-pressed="${INK[k] === sel}" aria-label="${k[0].toUpperCase() + k.slice(1)}" style="--c:${INK[k]}"><i></i></button>`).join('')}
+  </div>
+  <div class="pop-sec"><span>Pressure sensitivity</span><span class="val" data-pv>60%</span></div>
+  <div class="slider" style="--v:.6" aria-label="Pressure sensitivity" role="slider" aria-valuemin="0" aria-valuemax="100" aria-valuenow="60" tabindex="0"><i class="track"></i><i class="fill"></i><span class="thumb"></span></div>`;
+}
+
+/* Liquid slider: the thumb is a bead that stretches a little with speed (cap 0.10) and settles in one small undershoot.
+   It stretches about the grab side (the lag between finger and thumb), so the part under the finger stays put. */
+function liquidSlider(sl, scene, onChange) {
+  const thumb = sl.querySelector('.thumb'); let v = parseFloat(getComputedStyle(sl).getPropertyValue('--v')) || .5;
+  const pos = new Spring(0, 'follow'), def = new Spring(0, 'thumb'); def.eps = .0005;
+  const W = () => sl.clientWidth - 28;
+  let ready = false;
+  const set = x => { v = clamp(x / W(), 0, 1); sl.style.setProperty('--v', v); sl.setAttribute('aria-valuenow', Math.round(v * 100)); onChange && onChange(v); pos.to = v * W(); scene.wake(); };
+  onDrag(sl, scene, {
+    down(p) { const r = sl.getBoundingClientRect(), sr = scene.screen.getBoundingClientRect(), k = scene.W / sr.width; return { x0: (r.left - sr.left) * k }; },
+    start() { scene.dragging++; }, move(p, c) { set(p.x - c.x0 - 14); },
+    end(p, vv, c) { scene.dragging--; }, tap(p, c) { set(p.x - c.x0 - 14); }
+  });
+  sl.addEventListener('keydown', e => { if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { set((v + (e.key === 'ArrowRight' ? .05 : -.05)) * W()); pos.snap(pos.to); } });
+  scene.tasks.push(dt => {
+    if (!ready) { if (W() <= 0) return false; pos.snap(v * W()); ready = true; }
+    const b1 = pos.step(dt); def.to = RM() ? 0 : Math.min(.10, Math.abs(pos.v) / 2600); const b2 = def.step(dt);
+    const s = clamp(def.x, -.04, .10), sx = 1 + s, sy = 1 / Math.sqrt(1 + s);
+    thumb.style.transformOrigin = `${(14 + clamp(pos.to - pos.x, -14, 14)).toFixed(1)}px 14px`;   // the grab side
+    thumb.style.transform = `translateX(${pos.x.toFixed(2)}px) scale(${sx.toFixed(3)},${sy.toFixed(3)})`;
+    return b1 || b2;
+  });
+}
+
+/* =============================================================================
+   6. Screens
+   ========================================================================== */
+function editorChrome(scene, cfg) {
+  const { W, H } = scene;
+  // top-left: back + document title
+  const tl = pill(scene, 16, 32, cfg.titleW || 252, 44,
+    `<div class="pill-row"><button class="icon-btn" aria-label="Library">${icon('back')}</button><div class="doc-title"><div class="t1">Simple Harmonic Motion</div><div class="t2">Physics 9702 · Page 3 of 12</div></div></div>`);
+  const right = cfg.rightEdge ?? (W - 16 - 44 - 16);
+  const trW = 6 * 40 + 13 + 8;
+  const tr = pill(scene, right - trW, 32, trW, 44,
+    `<div class="pill-row"><button class="icon-btn" aria-label="Undo">${icon('undo')}</button><button class="icon-btn" aria-label="Redo">${icon('redo')}</button><span class="vsep"></span><button class="icon-btn" aria-label="Search">${icon('search')}</button><button class="icon-btn" aria-label="Bookmark">${icon('bookmark')}</button><button class="icon-btn" aria-label="Share">${icon('share')}</button><button class="icon-btn" aria-label="More">${icon('more')}</button></div>`);
+  let asst = null;
+  if (!cfg.noAssistant) asst = pill(scene, W - 16 - 44, 32, 44, 44, `<div class="pill-row" style="padding:0 2px"><button class="icon-btn" aria-label="Assistant">${icon('drop')}</button></div>`);
+  const hudW = 104, hudRight = cfg.hudRight ?? (W - 16);
+  const hud = pill(scene, hudRight - hudW, H - 16 - 40, hudW, 40, `<div class="pill-row hud"><button class="icon-btn" style="width:36px;height:40px" aria-label="Page thumbnails">${icon('grid')}</button><span class="pg">3 <span>/ 12</span></span></div>`);
+  return { tl, tr, asst, hud };
+}
+
+function mountEditor(screen, cfg) {
+  const W = 1194, H = 834;
+  const scene = new Scene(screen, { W, H, sigma: 8, k: 1 });
+  scene.scene.appendChild(el('div', 'desk'));
+  statusBarPad(scene);
+  const pg = mountPage(scene, cfg.page, { proposal: cfg.ai });
+  const chrome = editorChrome(scene, cfg);
+  const colors = [INK.carbon, INK.cobalt, INK.vermilion];
+  let pop = null, more = null;
+  const TOP = 92;                     // the palette is 469 pt long: 7 slots (6 tools + More) × 44 + 17 + 3 inks × 44 + 2 × 6
+  const neighbours = [chrome.tl, chrome.tr, chrome.asst, chrome.hud].filter(Boolean);
+  const pal = Palette(scene, {
+    x: 44, y: 455, orient: 'v', tools: TOOLS, colors, minTop: 84, neighbours,
+    zone(p) {
+      const maxRight = cfg.ai ? 818 : W - 16;
+      const Z = [
+        { orient: 'v', dist: Math.abs(p.x - 16), at: s => ({ x: 16 + s.w / 2, y: clamp(p.y, TOP + s.h / 2, H - 16 - s.h / 2) }) },
+        { orient: 'h', dist: Math.abs(p.y - H), at: s => ({ x: clamp(p.x, 16 + s.w / 2, maxRight - s.w / 2), y: H - 16 - s.h / 2 }) },
+        { orient: 'h', dist: Math.abs(p.y - TOP) + 40, at: s => ({ x: clamp(p.x, 16 + s.w / 2, maxRight - s.w / 2), y: TOP + s.h / 2 }) }];
+      if (!cfg.ai) Z.push({ orient: 'v', dist: Math.abs(p.x - W), at: s => ({ x: W - 16 - s.w / 2, y: clamp(p.y, TOP + s.h / 2, H - 16 - s.h / 2) }) });
+      else Z.push({ orient: 'v', dist: Math.abs(p.x - 818), at: s => ({ x: 818 - s.w / 2, y: clamp(p.y, TOP + s.h / 2, H - 16 - s.h / 2) }) });
+      return Z.sort((a, b) => a.dist - b.dist)[0];
+    },
+    onSelect(i, same) { if (more) more.close(); if (!pop) return; if (i === 0 && same) pop.toggle(0); else pop.close(); },
+    onMore(i) { if (!more) return; if (pop) pop.close(); more.toggle(i); },
+    onDragStart() { pop && pop.close(); more && more.close(); },
+    onColor(c) { if (pop) syncPopColor(c); }
+  });
+  // hysteresis bonds: palette ↔ neighbouring droplets (merge on approach, the neck thins and pinches at ≈ 31 pt)
+  neighbours.forEach(d => scene.bond(pal.drop, d, { on: 11, off: 44, t0: 26 }));
+  const pen = { width: 2.4 };
+  scene.tool = () => {
+    const t = TOOLS[pal.sel][0];
+    if (t === 'highlighter') return { color: HIGHLIGHT.lemon, width: 18, opacity: .6, multiply: true };
+    return { color: pal.color, width: pen.width };
+  };
+  function syncPopColor(c) { if (pop) pop.content.querySelectorAll('.colors .swatch').forEach(s => { const on = s.dataset.hex === c; s.setAttribute('aria-checked', on); s.setAttribute('aria-pressed', on); }); }
+  // one placement rule for every bud (NibBudPlacement): beside the palette, the popover's top 16 pt above the tool slot
+  const beside = (PW, PH) => (pal, tool) => {
+    const b = pal.drop.box(), c = pal.toolWorld(tool), gap = 20;
+    if (pal.orient === 'v') {
+      const left = b.cx < W / 2, x = left ? b.r + gap + PW / 2 : b.l - gap - PW / 2;
+      return { x, y: clamp(c.y - 22 - 16 + PH / 2, TOP + PH / 2, H - 16 - PH / 2) };
+    }
+    const below = b.cy > H / 2, y = below ? b.t - gap - PH / 2 : b.b + gap + PH / 2;
+    return { x: clamp(c.x, 16 + PW / 2, W - 16 - PW / 2), y };
+  };
+  more = morePopover(scene, pal, beside(312, 124));
+  scene.popClose = () => more.close(); scene.popIsOpen = () => more.open;
+  if (!cfg.ai) {
+    const PW = 312, PH = 404;
+    pop = Popover(scene, pal, { w: PW, h: PH, r: 26, label: 'Pen settings', html: penPopoverHTML(colors, INK.carbon), place: beside(PW, PH) });
+    scene.popClose = () => { pop.close(); more.close(); }; scene.popIsOpen = () => pop.open || more.open;
+    wirePopover(pop, pal, pen, scene);
+    if (cfg.popOpen) setTimeout(() => pop.openAt(0), 350);
+  }
+  if (cfg.ai) mountAssistant(scene, pal, pg, chrome, neighbours);
+  scene.wake();
+  return scene;
+}
+function wirePopover(pop, pal, pen, scene) {
+  const c = pop.content;
+  c.querySelectorAll('.pen-types button').forEach(b => b.addEventListener('click', () => { c.querySelectorAll('.pen-types button').forEach(x => x.setAttribute('aria-checked', x === b)); c.querySelector('.pop-title').textContent = b.textContent.trim() + (b.textContent.trim() === 'Pencil' ? '' : ' Pen'); pop.drop.poke(.5); }));
+  c.querySelectorAll('.sizes button').forEach(b => b.addEventListener('click', () => { c.querySelectorAll('.sizes button').forEach(x => x.setAttribute('aria-checked', x === b)); pen.width = +b.dataset.w; c.querySelector('[data-val]').textContent = b.dataset.mm; pop.drop.poke(.5); }));
+  c.querySelectorAll('.colors .swatch').forEach(b => b.addEventListener('click', () => {
+    c.querySelectorAll('.colors .swatch').forEach(x => { x.setAttribute('aria-checked', x === b); x.setAttribute('aria-pressed', x === b); });
+    pal.setColorHex(b.dataset.hex); pop.drop.poke(.5);
+  }));
+  const sl = c.querySelector('.slider');
+  if (sl) liquidSlider(sl, scene, v => { const pv = c.querySelector('[data-pv]'); if (pv) pv.textContent = Math.round(v * 100) + '%'; });
+}
+
+/* ---------- Assistant ---------- */
+function mountAssistant(scene, pal, pg, chrome, neighbours) {
+  const panel = el('div', 'ai', `
+    <header class="ai-head">
+      <span class="ai-mark">${icon('drop')}</span>
+      <div class="ai-titles"><div class="ai-title">Assistant</div><div class="ai-model">Claude Sonnet 4.5 · your API key</div></div>
+      <button class="round-btn" aria-label="Close assistant">${icon('x')}</button>
+    </header>
+    <div class="ai-scope">
+      <div class="seg" role="tablist" aria-label="Mode"><button role="tab" aria-selected="false">Ask</button><button role="tab" aria-selected="true">Edit</button></div>
+    </div>
+    <div class="ctx" aria-label="What the assistant reads">
+      <span class="chip2">Page 3<button aria-label="Stop reading Page 3">${icon('x')}</button></span>
+      <span class="chip2">Handwriting<button aria-label="Stop reading handwriting">${icon('x')}</button></span>
+      <span class="chip2">Page image<button aria-label="Stop reading the page image">${icon('x')}</button></span>
+      <button class="chip2 add" aria-label="Add context">${icon('plus')}</button>
+    </div>
+    <div class="ai-thread">
+      <section class="turn you"><div class="who">You · 9:41</div>
+        <p>Check the formulas and fix anything wrong, in my handwriting.</p></section>
+      <ul class="trace" aria-label="What the assistant did">
+        <li>${icon('check')} Read page 3 · 14 handwritten lines recognised</li>
+        <li>${icon('check')} Prepared 3 changes · nothing applied yet</li>
+      </ul>
+      <section class="turn"><div class="who">${icon('drop')} Assistant · 9:41 · 4 s</div>
+        <p>The mass–spring period is upside down: it's <span class="math">T = 2π√(m/k)</span> <span class="cite" data-cite>${icon('page')}Line 5</span>. The rest are right, apart from a stray scribble.</p></section>
+      <section class="proposal" aria-label="Proposed edit">
+        <div class="prop-headrow"><b>Proposed edit</b><span>3 changes</span><button class="eye" aria-pressed="true" data-eye>${icon('eye')}<span>On page</span></button></div>
+        <ol class="changes">
+          <li data-n="1"><span class="nb" aria-hidden="true">1</span><div><div class="chg-t">Strike <span class="math">T = 2π√(k/m)</span></div><div class="chg-s">Page 3 · line 5</div></div><button class="chk" role="checkbox" aria-checked="true" aria-label="Include change 1" data-chk="1">${icon('checkring')}</button></li>
+          <li data-n="2"><span class="nb" aria-hidden="true">2</span><div><div class="chg-t">Write <span class="math">T = 2π√(m/k)</span></div><div class="chg-s">Your fountain pen · Carbon</div></div><button class="chk" role="checkbox" aria-checked="true" aria-label="Include change 2" data-chk="2">${icon('checkring')}</button></li>
+          <li data-n="3" class="dz"><span class="nb red" aria-hidden="true">3</span><div><div class="chg-t">Stray scribble</div><div class="chg-s">Under the graph</div></div><div data-dz><button class="btn danger" data-del>Delete scribble</button></div></li>
+        </ol>
+        <div class="prop-actions"><button class="btn primary" data-accept>Accept 2</button><button class="btn" data-discard>Discard</button></div>
+        <div class="prop-foot">${icon('eye')} Previewing on the page. Nothing changes until you accept.</div>
+      </section>
+      <div class="applied" role="status"><span>${icon('check')} <b data-applied-text>Applied 2 changes</b></span><span class="acts"><button data-undo>Undo <i class="kh">⌘Z</i></button><button data-show>Show</button></span></div>
+    </div>
+    <footer class="ai-compose">
+      <div class="field"><input type="text" placeholder="Tell Nib what to change…" aria-label="Message"><button class="icon-btn" aria-label="Dictate">${icon('mic')}</button><button class="send" aria-label="Send">${icon('up')}</button></div>
+      <p class="usage">1,284 tokens this chat · sent only to your provider</p>
+    </footer>`);
+  const PX = 834, PY = 32, PW = 344, PH = 834 - 32 - 16;
+  const pd = new Drop(scene, { x: PX + PW / 2, y: PY + PH / 2, w: PW, h: PH, r: 28, lens: 'deep', el: panel, cap: .03, rigid: .1 });
+  scene.bond(pal.drop, pd, { on: 11, off: 44, t0: 28 });
+  neighbours.push(pd);
+
+  // The chip docks in the page's trailing margin, level with its line's badges, and never over ink (stroke bounds + 8 pt).
+  // The anchor bead and the stem exist only while the chip is being dragged; at rest the chip is just the chip.
+  const chipEl = el('div', 'chip', `<span class="lbl">${icon('drop')} Fix period</span><button class="icon-btn ok" aria-label="Accept proposed edit">${icon('check')}</button><button class="icon-btn" aria-label="Discard proposed edit">${icon('x')}</button>`);
+  const svg = pg.svg, s = pg.s, R = pg.rect, page = pg.page;
+  const newT = svg.querySelector('.prop-new'), wrong = svg.querySelector('.wrong'), strike = svg.querySelector('.prop-strike');
+  const CW = 204, CH = 44, tie = svg.querySelector('.tie');
+  let anchor = null, chip = null, rest = null, tether = null, anchorAt = null;
+  // NibTether.restingCentre: the trailing edge is fixed; the chip takes the free band (ink bounds + 8 pt) nearest its
+  // line. Candidates are the line itself and every band edge, so a band exactly as tall as the chip is still found.
+  function dock(line, ink) {
+    const right = Math.min(R.x + R.w - 8, PX - 16), x = right - CW / 2, bottom = Math.min(scene.H - 16, R.y + R.w * 1075 / 760);
+    const blocked = ink.map(b => ({ l: R.x + b.x * s - 8, r: R.x + (b.x + b.width) * s + 8, t: R.y + b.y * s - 8, b: R.y + (b.y + b.height) * s + 8 }))
+      .filter(q => q.l < right && q.r > right - CW);
+    const free = y => y - CH / 2 >= R.y - .01 && y + CH / 2 <= bottom + .01 && !blocked.some(q => q.t < y + CH / 2 - .01 && q.b > y - CH / 2 + .01);
+    const ys = [line, ...blocked.flatMap(q => [q.b + CH / 2, q.t - CH / 2])].filter(free).sort((a, b) => Math.abs(a - line) - Math.abs(b - line));
+    return { x, y: ys.length ? ys[0] : line };
+  }
+  const place = () => {
+    const wb = wrong.getBBox();
+    strike.setAttribute('d', `M${(wb.x - 4).toFixed(1)} ${(wb.y + wb.height * .56).toFixed(1)} C ${(wb.x + wb.width * .3).toFixed(1)} ${(wb.y + wb.height * .5).toFixed(1)}, ${(wb.x + wb.width * .7).toFixed(1)} ${(wb.y + wb.height * .6).toFixed(1)}, ${(wb.x + wb.width + 5).toFixed(1)} ${(wb.y + wb.height * .53).toFixed(1)}`);
+    newT.setAttribute('x', (wb.x + wb.width + 44).toFixed(1));
+    newT.style.transformBox = 'fill-box';
+    const nb = newT.getBBox();
+    newT.dataset.dx = (wb.x - nb.x).toFixed(1);
+    const ink = [...svg.querySelectorAll('g.hand text, g.user-ink path, g[fill="none"] path, .prop-new, .stray')].map(n => n.getBBox());
+    rest = dock(R.y + (wb.y + wb.height / 2) * s, ink);
+    // the anchor sits on the change, at its point nearest the docked chip
+    const g = { l: R.x + nb.x * s, r: R.x + (nb.x + nb.width) * s, t: R.y + nb.y * s, b: R.y + (nb.y + nb.height) * s };
+    anchorAt = { x: clamp(rest.x, g.l, g.r), y: rest.y < g.t ? g.t : rest.y > g.b ? g.b : (g.t + g.b) / 2 };
+    // not level with its line: a 1 pt accent hairline ties the resting chip to its change (nothing else hangs off it)
+    const edgeY = rest.y > anchorAt.y ? rest.y - CH / 2 : rest.y + CH / 2, level = Math.abs(rest.y - (R.y + (wb.y + wb.height / 2) * s)) < CH / 2;
+    tie.setAttribute('x1', ((anchorAt.x - R.x) / s).toFixed(1)); tie.setAttribute('y1', ((anchorAt.y - R.y) / s).toFixed(1));
+    tie.setAttribute('x2', ((clamp(anchorAt.x, rest.x - CW / 2 + 22, rest.x + CW / 2 - 22) - R.x) / s).toFixed(1)); tie.setAttribute('y2', ((edgeY - R.y) / s).toFixed(1));
+    tie.style.display = level ? 'none' : '';
+    if (!anchor) {
+      anchor = new Drop(scene, { x: anchorAt.x, y: anchorAt.y, w: 26, h: 26, r: 13, cap: .2, visible: false });
+      chip = new Drop(scene, { x: rest.x, y: rest.y, w: CW, h: CH, r: 22, lens: 'clear', noRefract: true, el: chipEl, cap: .16, rigid: .35, move: 'tether' });
+      tether = scene.bond(anchor, chip, { on: 14, off: 96, t0: 24, inset: 8, onBreak: n => satellite((n.ax + n.bx) / 2, (n.ay + n.by) / 2) });
+      tether.enabled = false;
+      scene.bond(pal.drop, chip, { on: 11, off: 40, t0: 22 });
+      scene.bond(pd, chip, { on: 11, off: 40, t0: 22 });
+      // once the chip is home again, the anchor and stem dry away
+      scene.tasks.push(() => {
+        if (!anchor.visible || chip.px.to !== rest.x || !chip.px.rest || !chip.py.rest || scene.pid !== null) return false;
+        tether.enabled = false; anchor.show(false); page.classList.remove('tethering'); return false;
+      });
+    }
+    scene.wake();
+  };
+  (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(() => setTimeout(() => { place(); wireChip(); }, 0));
+
+  // C's satellite: a pinched stem leaves a 5 pt drop that flows back into the anchor
+  function satellite(x, y) {
+    if (RM()) return;
+    const d = new Drop(scene, { x, y, w: 10, h: 10, r: 5, cap: 0, move: 'absorb' });
+    let shrinking = false;
+    const task = () => {
+      d.px.to = anchor.px.x; d.py.to = anchor.py.x;
+      if (!shrinking && Math.hypot(d.px.x - anchor.px.x, d.py.x - anchor.py.x) < 3) { shrinking = true; d.pw.use('absorb').to = 0; d.ph.use('absorb').to = 0; d.pr.to = 0; }
+      if (shrinking && d.pw.x < .4) {
+        d.show(false); d.mass.remove();
+        scene.drops.splice(scene.drops.indexOf(d), 1); scene.tasks.splice(scene.tasks.indexOf(task), 1);
+        return false;
+      }
+      return true;
+    };
+    scene.tasks.push(task); scene.wake();
+  }
+
+  function wireChip() {
+    onDrag(chipEl, scene, {
+      down(p, e) { if (e.target.closest('button')) return false; const b = chip.box(); return { off: { x: p.x - b.cx, y: p.y - b.cy } }; },
+      start(p0) {
+        // pulling the chip away shows where it belongs: the anchor bead grows on the change and a stem joins them
+        anchor.px.snap(anchorAt.x); anchor.py.snap(anchorAt.y); anchor.pw.snap(8); anchor.ph.snap(8); anchor.pr.snap(4);
+        anchor.pw.to = 26; anchor.ph.to = 26; anchor.pr.to = 13; anchor.show(true); tether.enabled = true; page.classList.add('tethering');
+        chip.grab(p0); chip.px.use('follow'); chip.py.use('follow'); chip.lift.to = 1.05; chip.lens.classList.add('lifted'); scene.dragging++;
+      },
+      move(p, c) { chip.px.to = rubber(p.x - c.off.x, 110, 1180); chip.py.to = rubber(p.y - c.off.y, 30, 810); },
+      end(p, v) { scene.dragging--; chip.release(); chip.lens.classList.remove('lifted'); chip.lift.to = 1; chip.px.use('tether'); chip.py.use('tether'); chip.px.to = rest.x; chip.py.to = rest.y; chip.px.v = v.x * .6; chip.py.v = v.y * .6; }
+    });
+    chipEl.querySelector('.ok').addEventListener('click', accept);
+    chipEl.querySelectorAll('.icon-btn')[1].addEventListener('click', discard);
+  }
+  function chipVisible(on) {
+    if (!anchor) return;
+    if (on) {   // the chip grows out of the change and flows to its dock
+      chip.show(true);
+      chip.px.snap(anchorAt.x); chip.py.snap(anchorAt.y); chip.pw.snap(20); chip.ph.snap(20); chip.pr.snap(10);
+      chip.px.use('bud').to = rest.x; chip.py.use('bud').to = rest.y; chip.pw.to = CW; chip.ph.to = CH; chip.pr.to = 22;
+      chipEl.style.visibility = ''; setTimeout(() => { chipEl.style.opacity = 1; chip.lens.style.opacity = 1; }, 220);
+    } else {   // the chip flows back into the change and dries into the page
+      chipEl.style.transition = 'opacity .14s'; chipEl.style.opacity = 0; chip.lens.style.opacity = 0;
+      tether.enabled = false; anchor.show(false);
+      chip.px.use('bud').to = anchorAt.x; chip.py.use('bud').to = anchorAt.y; chip.pw.to = 20; chip.ph.to = 20; chip.pr.to = 10;
+      setTimeout(() => { chip.pw.to = 0; chip.ph.to = 0; chip.pr.to = 0; scene.wake(); }, 240);
+      setTimeout(() => { if (chipEl.style.opacity === '0') { chip.show(false); chipEl.style.visibility = 'hidden'; } }, 700);
+    }
+    scene.wake();
+  }
+
+  // the composer: Send appears only once there is something to send
+  const field = panel.querySelector('.field'), input = field.querySelector('input');
+  input.addEventListener('input', () => field.classList.toggle('has-text', input.value.trim() !== ''));
+
+  // include boxes, "On page", the destructive row, Accept / Discard / Undo
+  const acceptBtn = panel.querySelector('[data-accept]');
+  const included = new Set([1, 2]);
+  const syncAccept = () => { acceptBtn.textContent = `Accept ${included.size}`; acceptBtn.disabled = included.size === 0; };
+  panel.querySelectorAll('[data-chk]').forEach(b => b.addEventListener('click', () => {
+    const n = +b.dataset.chk, on = !included.has(n);
+    on ? included.add(n) : included.delete(n);
+    b.setAttribute('aria-checked', on); b.innerHTML = icon(on ? 'checkring' : 'circle');
+    b.closest('li').classList.toggle('off', !on); page.classList.toggle('x' + n, !on);
+    syncAccept(); pd.poke(.5);
+  }));
+  const eye = panel.querySelector('[data-eye]');
+  eye.addEventListener('click', () => {
+    const on = eye.getAttribute('aria-pressed') !== 'true';
+    eye.setAttribute('aria-pressed', on); eye.innerHTML = icon(on ? 'eye' : 'eyeoff') + '<span>On page</span>';
+    page.classList.toggle('hide-marks', !on); chipVisible(on);
+  });
+  const dz = panel.querySelector('[data-dz]');
+  const delHTML = dz.innerHTML;
+  const wireDel = () => dz.querySelector('[data-del]').addEventListener('click', () => {
+    page.classList.add('stray-gone'); haptic('success');
+    dz.innerHTML = `<div class="deleted">${icon('check')} Deleted <button>Undo</button></div>`;
+    dz.querySelector('button').addEventListener('click', () => { page.classList.remove('stray-gone'); dz.innerHTML = delHTML; wireDel(); });
+  });
+  wireDel();
+  panel.querySelectorAll('.chip2 button').forEach(b => b.addEventListener('click', () => b.closest('.chip2').classList.toggle('off')));
+
+  function accept() {
+    if (panel.classList.contains('done') || included.size === 0) return;
+    if (included.has(1)) page.classList.add('acc1');
+    if (included.has(2)) { page.classList.add('acc2'); newT.style.transform = included.has(1) ? `translateX(${newT.dataset.dx}px)` : ''; }
+    else page.classList.add('discarded');
+    panel.classList.add('done'); panel.querySelector('[data-applied-text]').textContent = `Applied ${included.size} change${included.size > 1 ? 's' : ''}`;
+    haptic('success'); chipVisible(false); pd.poke(.5);
+  }
+  function discard() {
+    if (panel.classList.contains('done')) return;
+    page.classList.add('discarded');
+    panel.classList.add('done'); panel.querySelector('[data-applied-text]').textContent = 'Discarded the proposal';
+    chipVisible(false); pd.poke(.5);
+  }
+  function undo() {
+    page.classList.remove('acc1', 'acc2', 'discarded'); newT.style.transform = '';
+    panel.classList.remove('done'); chipVisible(eye.getAttribute('aria-pressed') === 'true'); pd.poke(.5);
+  }
+  acceptBtn.addEventListener('click', accept);
+  panel.querySelector('[data-discard]').addEventListener('click', discard);
+  panel.querySelector('[data-undo]').addEventListener('click', undo);
+  const flash = () => { page.classList.add('flash'); setTimeout(() => page.classList.remove('flash'), 600); };
+  panel.querySelector('[data-show]').addEventListener('click', flash);
+  panel.querySelector('[data-cite]').addEventListener('click', flash);
+  panel.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => panel.querySelectorAll('.seg button').forEach(x => x.setAttribute('aria-selected', x === b))));
+}
+
+/* ---------- iPhone editor ---------- */
+function mountPhone(screen) {
+  const W = 393, H = 852;
+  const scene = new Scene(screen, { W, H, sigma: 6.5, k: .8 });
+  scene.scene.appendChild(el('div', 'desk'));
+  screen.appendChild(el('div', 'island'));
+  const sb = el('div', 'status', `<span>9:41</span><span class="r"><svg viewBox="0 0 18 12" width="18" height="12"><rect x="0" y="8" width="3" height="4" rx=".8" fill="currentColor"/><rect x="5" y="5.5" width="3" height="6.5" rx=".8" fill="currentColor"/><rect x="10" y="3" width="3" height="9" rx=".8" fill="currentColor"/><rect x="15" y="0" width="3" height="12" rx=".8" fill="currentColor"/></svg>${wifi()}${battery()}</span>`);
+  screen.appendChild(sb); screen.appendChild(el('div', 'homebar'));
+  const pg = mountPage(scene, { x: 12, y: 116, w: 369 });
+  // the next page, continuing below (vertical scrolling)
+  const rules = []; for (let y = 172; y <= 1066; y += 34) rules.push(`<line x1="0" x2="760" y1="${y}" y2="${y}"/>`);
+  const p2 = el('div', 'page', `<svg viewBox="0 0 760 1075" aria-hidden="true"><rect width="760" height="1075" fill="#fff"/><g stroke="#CFDBE8" stroke-width="1.1">${rules.join('')}</g><line x1="84" x2="84" y1="0" y2="1075" stroke="#EDB9B3" stroke-width="1.3"/><g class="hand" fill="${INK.carbon}"><text x="102" y="124" font-size="40">Damping</text><text x="102" y="200" font-size="25">amplitude decreases with time,</text><text x="102" y="234" font-size="25">energy is lost to the surroundings</text></g><path d="M102 140 C 180 136, 240 145, 300 139" stroke="${INK.cobalt}" stroke-width="2.6" fill="none" stroke-linecap="round"/></svg>`);
+  Object.assign(p2.style, { left: '12px', top: (116 + 522 + 14) + 'px', width: '369px', height: '522px' });
+  scene.scene.appendChild(p2); scene.addPaper({ x: 12, y: 116 + 522 + 14, w: 369, h: 522 });
+  // the canvas has a bottom content inset of 56 + 8 + 16 pt, so the last line can always scroll above the palette
+  const tl = pill(scene, 16, 60, 212, 44, `<div class="pill-row"><button class="icon-btn" aria-label="Library">${icon('back')}</button><div class="doc-title" style="padding-right:14px"><div class="t1">Simple Harmonic Motion</div><div class="t2">Page 3 of 12</div></div></div>`);
+  const tr = pill(scene, W - 16 - 128, 60, 128, 44, `<div class="pill-row"><button class="icon-btn" aria-label="Undo">${icon('undo')}</button><button class="icon-btn" aria-label="Assistant">${icon('drop')}</button><button class="icon-btn" aria-label="More">${icon('more')}</button></div>`);
+  const tools = [TOOLS[0], TOOLS[1], TOOLS[2], TOOLS[3], TOOLS[5], TOOLS[6]];   // pen, highlighter, eraser, lasso, text, More
+  const pen = { width: 2.4 };
+  let pop, more;
+  const pal = Palette(scene, {
+    x: W / 2, y: H - 34 - 8 - 28, orient: 'h', tools, colors: [INK.carbon], pitch: 46, thick: 56, colorPitch: 44, beadR: 20, minTop: 60, neighbours: [tl, tr],
+    zone(p) {
+      const top = { orient: 'h', dist: Math.abs(p.y - 112), at: s => ({ x: W / 2, y: 112 + 8 + s.h / 2 }) };
+      const bot = { orient: 'h', dist: Math.abs(p.y - H), at: s => ({ x: W / 2, y: H - 34 - 8 - s.h / 2 }) };
+      return top.dist < bot.dist ? top : bot;
+    },
+    onSelect(i, same) { more.close(); if (i === 0 && same) pop.toggle(0); else pop.close(); },
+    onMore(i) { pop.close(); more.toggle(i); },
+    onDragStart() { pop.close(); more.close(); },
+    onColor() {}
+  });
+  scene.bond(pal.drop, tl, { on: 9, off: 34, t0: 20 }); scene.bond(pal.drop, tr, { on: 9, off: 34, t0: 20 });
+  scene.tool = () => TOOLS[pal.sel][0] === 'highlighter' ? { color: HIGHLIGHT.lemon, width: 18, opacity: .6, multiply: true } : { color: pal.color, width: pen.width };
+  const PW = 345, PH = 204;
+  pop = Popover(scene, pal, {
+    w: PW, h: PH, r: 26, label: 'Pen settings',
+    html: `<div class="pop-head"><span class="pop-title">Fountain Pen</span><span class="pop-sub" data-val>0.50 mm</span></div>
+      <div class="colors" style="margin-top:10px;grid-template-columns:repeat(6,44px)">${INK_ORDER.map(k => `<button class="swatch${swatchRing(k)}" role="radio" data-hex="${INK[k]}" aria-pressed="${k === 'carbon'}" aria-checked="${k === 'carbon'}" aria-label="${k}" style="--c:${INK[k]}"><i style="width:28px;height:28px"></i></button>`).join('')}</div>
+      <div class="sizes" style="margin-top:14px;justify-content:space-between">
+        <button role="radio" aria-checked="false" data-w="1.6" data-mm="0.30 mm" aria-label="Fine" style="flex:1"><i style="width:5px;height:5px"></i></button>
+        <button role="radio" aria-checked="true" data-w="2.4" data-mm="0.50 mm" aria-label="Medium" style="flex:1"><i style="width:8px;height:8px"></i></button>
+        <button role="radio" aria-checked="false" data-w="3.6" data-mm="0.80 mm" aria-label="Bold" style="flex:1"><i style="width:12px;height:12px"></i></button>
+      </div>`,
+    place(pal, tool) {
+      const b = pal.drop.box(), below = b.cy > H / 2;
+      return { x: W / 2, y: below ? b.t - 16 - PH / 2 : b.b + 16 + PH / 2 };
+    }
+  });
+  pop.bond.off = 17;   // pinch at ≈13 pt, before the 16 pt rest gap
+  more = morePopover(scene, pal, pal => { const b = pal.drop.box(), below = b.cy > H / 2; return { x: W / 2, y: below ? b.t - 16 - 62 : b.b + 16 + 62 }; }, PW, 124);
+  more.bond.off = 17;
+  scene.popClose = () => { pop.close(); more.close(); }; scene.popIsOpen = () => pop.open || more.open;
+  wirePopover(pop, pal, pen, scene);
+  scene.wake();
+  return scene;
+}
+
+/* ---------- Library ---------- */
+function coverHTML(c) {
+  const star = c.fav ? `<svg class="i" aria-hidden="true"><use href="#i-star"/></svg>` : '';
+  let face = '';
+  if (c.kind === 'cloth') face = `<div class="cover cloth ${c.light ? 'light' : ''}" style="--cc:${c.c}"><i class="spine"></i><i class="band"></i></div>`;
+  if (c.kind === 'page') face = `<div class="cover"><div class="mini">${pageMarkup('mini', false)}</div></div>`;
+  if (c.kind === 'pdf') face = `<div class="cover"><div class="pdfp"><i class="h"></i><i></i><i></i><i class="s"></i><div class="eq">∫₀¹ x² dx = 1/3</div><i></i><i></i><i></i><i class="s"></i><i></i><i></i><i class="s"></i><i></i><i></i></div><span class="badge">${icon('doc')}</span></div>`;
+  if (c.kind === 'board') face = `<div class="cover"><div class="board"><svg viewBox="0 0 140 182"><path d="M44 58 C 64 70, 72 84, 88 98 M 44 58 C 40 90, 46 110, 52 128" stroke="#9AA0A8" stroke-width="1.2" fill="none"/></svg><i class="st" style="left:24px;top:40px;background:#FFE680;transform:rotate(-3deg)"></i><i class="st" style="left:78px;top:88px;background:#BFE3FF;transform:rotate(2deg)"></i><i class="st" style="left:36px;top:122px;background:#FFC7DA;transform:rotate(-1deg)"></i></div><span class="badge">${icon('sidebar')}</span></div>`;
+  if (c.kind === 'study') face = `<div class="cover"><div class="study"><q>What is simple harmonic motion?</q><small>1 of 42 · Study set</small></div><span class="badge">${icon('stack')}</span></div>`;
+  if (c.kind === 'text') face = `<div class="cover"><div class="textdoc"><b>Titration: finding the concentration of NaOH</b><i></i><i></i><i style="width:80%"></i><i></i><i></i><i style="width:62%"></i><i></i><i></i><i style="width:74%"></i></div><span class="badge">${icon('doc')}</span></div>`;
+  return `<div class="behind"></div>${face}<div class="meta"><b>${c.title}</b><span>${star}${c.sub}</span></div>`;
+}
+const CARDS = [
+  { id: 'shm', title: 'Simple Harmonic Motion', sub: 'Today, 9:12', kind: 'page', fav: true },
+  { id: 'org', title: 'Organic Chemistry', sub: 'Yesterday', kind: 'cloth', c: '#2F4A3E' },
+  { id: 'algo', title: 'Algorithms & Pseudocode', sub: 'Monday', kind: 'cloth', c: '#2A2D33' },
+  { id: 'p1', title: 'Pure Maths 1 · May/June 2024', sub: 'PDF · 18 pages', kind: 'pdf' },
+  { id: 'board', title: 'Revision board', sub: 'Whiteboard', kind: 'board' },
+  { id: 'defs', title: 'Physics definitions', sub: 'Study set · 42 cards', kind: 'study', fav: true },
+  { id: 'journal', title: 'Journal', sub: '12 Sep', kind: 'cloth', c: '#A4553A' },
+  { id: 'lab', title: 'Titration lab report', sub: 'Text document', kind: 'text' },
+  { id: 'plan', title: 'Planner 2026–27', sub: '10 Sep', kind: 'cloth', c: '#D5C6A8', light: true },
+  { id: 'mech', title: 'Mechanics', sub: '2 Sep', kind: 'cloth', c: '#23324F' }];
+
+function mountLibrary(screen) {
+  const W = 1194, H = 834;
+  // two water stacks: notebooks (under the covers) and floating chrome (over everything)
+  const scene = new Scene(screen, { W, H, sigma: 8, k: 1, id: 's-lib-grid' });
+  const top = new Scene(screen, { W, H, sigma: 8, k: 1, id: 's-lib-top' });
+  const lib = el('div', 'lib'); scene.scene.appendChild(lib);
+  top.scene.style.pointerEvents = 'none';
+  const rows = [['books', 'Documents', '23', 1], ['star', 'Favourites', '5'], ['people', 'Shared', '2'], ['clock', 'Recents', ''], ['stack', 'Study Sets', '3'], ['puzzle', 'Gallery', ''], ['trash', 'Trash', '4']];
+  const folders = [['Physics 9702', INK.cobalt, 18], ['Chemistry 9701', INK.moss, 11], ['Computer Science 9618', INK.graphite, 9], ['Mathematics 9709', INK.ochre, 14], ['Personal', INK.plum, 6]];
+  const ROW0 = 140 + 7 * 44 + 52;
+  // every library measure sits on the 24 pt gutter: content 344…1170, four folder tiles of (826 − 3 × 24) / 4
+  const GUT = 24, TW = (1170 - 344 - 3 * GUT) / 4;
+  lib.innerHTML = `
+    <aside class="side" aria-label="Sidebar">
+      <div style="position:absolute;left:12px;top:32px"><button class="icon-btn" aria-label="Hide sidebar" style="color:var(--accent)">${icon('sidebar')}</button></div>
+      <h2 class="big" style="left:24px;top:80px">Library</h2>
+      ${rows.map((r, i) => `<div class="srow ${r[3] ? 'sel' : ''}" style="top:${140 + i * 44}px">${icon(r[0])}<span class="t">${r[1]}</span><span class="n">${r[2]}</span></div>`).join('')}
+      <div class="shead" style="top:${140 + 7 * 44 + 22}px"><span>Folders</span>${icon('down')}</div>
+      ${folders.map((f, i) => `<div class="srow frow" data-f="${i}" style="top:${ROW0 + i * 44}px"><svg class="i" style="fill:${f[1]};stroke:none" aria-hidden="true"><use href="#i-folder"/></svg><span class="t">${f[0]}</span><span class="n">${f[2]}</span><span class="pill1" aria-hidden="true">+1</span></div>`).join('')}
+      <div class="sync">${icon('cloud')}<span>OneDrive · Up to date</span><button class="icon-btn" aria-label="Settings">${icon('gear')}</button></div>
+    </aside>
+    <h1 class="big" style="left:344px;top:80px">Documents</h1>
+    <p class="lsub" style="left:345px;top:124px">23 items · Date modified</p>
+    <h2 class="sec" style="left:344px;top:164px">Folders</h2>
+    ${folders.slice(0, 4).map((f, i) => `<div class="ftile" data-f="${i}" style="left:${344 + i * (TW + GUT)}px;top:198px;width:${TW}px"><i class="film"></i><svg class="i" style="fill:${f[1]}" aria-hidden="true"><use href="#i-folder"/></svg><div><b>${f[0]}</b><span><em class="n" style="font-style:normal">${f[2]}</em> notebooks</span></div></div>`).join('')}
+    <h2 class="sec" style="left:344px;top:304px">Notebooks</h2>`;
+  const tiles = [...lib.querySelectorAll('.ftile')], frows = [...lib.querySelectorAll('.frow')];
+  const tileRect = i => { const l = 344 + i * (TW + GUT); return { l, r: l + TW, t: 198, b: 276, r0: 14 }; };
+  const rowRect = i => ({ l: 12, r: 308, t: ROW0 + i * 44, b: ROW0 + 44 + i * 44 });
+  const sb = el('div', 'status', `<span>9:41&nbsp;&nbsp;Tue 24 Sep</span><span class="r">${wifi()}<span>100%</span>${battery()}</span>`); screen.appendChild(sb);
+
+  pill(top, 1170 - 96 - 16 - 128, 32, 128, 44, `<div class="pill-row"><button class="icon-btn" aria-label="Search">${icon('search')}</button><button class="icon-btn" aria-label="Sort">${icon('sort')}</button><button class="icon-btn" aria-label="Select">${icon('select')}</button></div>`);
+  pill(top, 1170 - 96, 32, 96, 44, `<button class="icon-btn" style="width:96px;color:#fff;font:600 15px/20px var(--font);letter-spacing:-.012em;display:flex;gap:4px;justify-content:center" aria-label="New">${icon('plus')}<span>New</span></button>`, { lens: 'tinted' });
+
+  // grid
+  const X0 = 344, CW = 140, CH = 182, PITCH = CW + GUT, Y0 = 342, ROW = 250;   // 164 pt pitch; the 30 pt left over goes to the trailing margin
+  const slot = i => ({ x: X0 + CW / 2 + (i % 5) * PITCH, y: Y0 + CH / 2 + Math.floor(i / 5) * ROW });
+  const order = [];
+  const cards = CARDS.map((c, i) => {
+    const node = el('div', 'card', coverHTML(c)); node.setAttribute('role', 'button'); node.setAttribute('aria-label', c.title); node.tabIndex = 0;
+    const s = slot(i);
+    const d = new Drop(scene, { x: s.x, y: s.y, w: CW - 8, h: CH - 8, r: 4, cw: CW, ch: CH, el: node, cap: .1, rigid: .7, move: 'reflow', vref: 2800 });
+    d.card = c; d.node = node; order.push(d); return d;
+  });
+  // every pair can bond, but a neck only forms once a combine has armed (proximity alone draws nothing)
+  const pairBond = new Map();
+  for (let i = 0; i < cards.length; i++) for (let j = i + 1; j < cards.length; j++) {
+    const b = scene.bond(cards[i], cards[j], { on: 13, off: 46, t0: 30, inset: 10 });
+    b.enabled = false; pairBond.set(cards[i].card.id + '|' + cards[j].card.id, b); pairBond.set(cards[j].card.id + '|' + cards[i].card.id, b);
+    cards[i].bonds = (cards[i].bonds || []).concat(b); cards[j].bonds = (cards[j].bonds || []).concat(b);
+  }
+  const layout = (except) => order.forEach((d, i) => { if (d === except || d.gone) return; const s = slot(i); d.px.use('reflow').to = s.x; d.py.use('reflow').to = s.y; });
+  // a 3 pt envelope, concentric with the cover (spine 5 + 3 = 8); the lift and its shadow carry the pickup
+  const envelope = (d, on) => { d.pw.to = on ? CW + 6 : CW - 8; d.ph.to = on ? CH + 6 : CH - 8; d.pr.to = on ? 8 : 4; };
+  let undoStack = null;
+  const gulp = n => { n.classList.add('gulp'); requestAnimationFrame(() => requestAnimationFrame(() => n.classList.remove('gulp'))); };
+
+  cards.forEach(d => {
+    onDrag(d.node, scene, {
+      down() { return {}; },
+      start(p0, p, ctx) {
+        ctx.off = { x: p0.x - d.px.x, y: p0.y - d.py.x };
+        d.grab(p0);
+        d.px.use('follow'); d.py.use('follow'); d.lift.to = 1.045; envelope(d, true);
+        d.node.classList.add('lifted'); d.node.style.zIndex = 5;
+        scene.dragging++; ctx.hover = null; ctx.hoverT = 0; ctx.tile = -1; ctx.row = -1;
+        tiles.forEach((t, i) => t.style.setProperty('--d', i * 35 + 'ms'));
+        lib.classList.add('films');
+      },
+      move(p, ctx) {
+        d.px.to = rubber(p.x - ctx.off.x, 40, W - 40); d.py.to = rubber(p.y - ctx.off.y, 120, H - 40);
+        // over the sidebar the notebook condenses to half size around the finger; a folder row grows a "+1" pill
+        const overSide = p.x < 320;
+        d.lift.to = overSide ? .5 : 1.045;
+        const row = overSide ? frows.findIndex((_, i) => { const r = rowRect(i); return p.y >= r.t && p.y < r.b; }) : -1;
+        if (row !== ctx.row) { frows.forEach((r, i) => r.classList.toggle('target', i === row)); if (row >= 0) haptic('merge'); ctx.row = row; }
+        // folder tiles: within 13 pt the card fuses with the tile's water film
+        const B = d.box(); let tile = -1;
+        if (!overSide) tiles.forEach((t, i) => { if (tile < 0 && nearest(B, tileRect(i)).gap < 13) tile = i; });
+        if (tile !== ctx.tile) { tiles.forEach((t, i) => t.classList.toggle('fused', i === tile)); if (tile >= 0) haptic('merge'); ctx.tile = tile; }
+        // notebook → notebook: armed only inside the inner 70 % of the target cover, after 380 ms
+        const over = (overSide || tile >= 0) ? null : order.find(o => o !== d && !o.gone && Math.abs(o.px.x - p.x) < CW * .35 && Math.abs(o.py.x - p.y) < CH * .35) || null;
+        if (over !== ctx.hover) {
+          if (ctx.hover) { envelope(ctx.hover, false); ctx.hover.lift.to = 1; pairBond.get(d.card.id + '|' + ctx.hover.card.id).enabled = false; }
+          ctx.hover = over; ctx.armed = false; clearTimeout(ctx.hoverT);
+          // armed: the target swells and the water reaches across (the neck is the promise that they will combine)
+          if (over) ctx.hoverT = setTimeout(() => { ctx.armed = true; envelope(over, true); over.lift.to = 1.03; pairBond.get(d.card.id + '|' + over.card.id).enabled = true; haptic('merge'); scene.wake(); }, 380);
+        }
+      },
+      end(p, v, ctx) {
+        scene.dragging--; clearTimeout(ctx.hoverT); d.node.classList.remove('lifted'); d.release();
+        d.px.use('slot'); d.py.use('slot'); d.lift.to = 1;
+        setTimeout(() => lib.classList.remove('films'), 260);
+        if (ctx.row >= 0) { const r = rowRect(ctx.row), row = frows[ctx.row]; row.classList.remove('target'); absorb(d, { x: 40, y: (r.t + r.b) / 2 }, row, folders[ctx.row][0]); return; }
+        if (ctx.tile >= 0) { const r = tileRect(ctx.tile), t = tiles[ctx.tile]; t.classList.remove('fused'); absorb(d, { x: r.l + 31, y: (r.t + r.b) / 2 }, t, folders[ctx.tile][0]); return; }
+        if (ctx.armed && ctx.hover) { combine(d, ctx.hover); return; }
+        if (ctx.hover) { envelope(ctx.hover, false); ctx.hover.lift.to = 1; }
+        const proj = { x: p.x + v.x * .1, y: p.y + v.y * .1 };
+        let best = 0, bd = 1e9; order.forEach((_, i) => { const s = slot(i), dd = Math.hypot(s.x - proj.x, s.y - proj.y); if (dd < bd) { bd = dd; best = i; } });
+        const live = order.filter(o => !o.gone).length; best = Math.min(best, live - 1);
+        order.splice(order.indexOf(d), 1); order.splice(best, 0, d);
+        // `slot` (ζ 1) from only the part of the fling that points at the slot, capped at 1200 pt/s and at ω·distance,
+        // so a grid reorder lands and never overshoots (it stays inside the grid by construction)
+        const s = slot(best), dx = s.x - d.px.x, dy = s.y - d.py.x, L = Math.hypot(dx, dy) || 1;
+        const sp = Math.min(Math.max(0, (v.x * dx + v.y * dy) / L), 1200, TAU / SPR.slot[0] * L);
+        d.px.to = s.x; d.py.to = s.y; d.px.v = dx / L * sp; d.py.v = dy / L * sp;
+        layout(d);
+        setTimeout(() => { envelope(d, false); d.node.style.zIndex = ''; d.bonds.forEach(b => b.enabled = false); scene.wake(); }, 260);
+        setTimeout(() => haptic('snap'), 240);
+      }
+    });
+  });
+
+  // B's absorb: the card flows into the folder, shrinking to 12 % and fading; the folder takes a small gulp
+  function absorb(d, at, target, name) {
+    const idx = order.indexOf(d), cnt = target.querySelector('.n'), before = cnt.textContent;
+    d.px.use('absorb').to = at.x; d.py.use('absorb').to = at.y; d.lift.to = .12; envelope(d, false);
+    d.node.style.transition = 'opacity .22s'; d.node.style.opacity = 0;
+    setTimeout(() => {
+      cnt.textContent = +before + 1; gulp(target); haptic('success');
+      d.gone = true; d.show(false); d.node.style.visibility = 'hidden'; d.bonds.forEach(x => x.enabled = false);
+      order.splice(order.indexOf(d), 1); order.push(d); layout(); scene.wake();
+    }, 280);
+    undoStack = { kind: 'move', d, idx, cnt, before };
+    showToast(`Moved to ${name}`);
+  }
+  function combine(a, b) {
+    const bm = b.node.querySelector('.meta b'), bs = b.node.querySelector('.meta span');
+    undoStack = { kind: 'combine', a, b, idx: order.indexOf(a), title: bm.innerHTML, sub: bs.innerHTML };
+    a.px.use('bud').to = b.px.x; a.py.use('bud').to = b.py.x; a.lift.to = .82;
+    a.node.style.transition = 'opacity .22s .12s'; a.node.style.opacity = 0;
+    setTimeout(() => {
+      a.gone = true; a.show(false); a.node.style.visibility = 'hidden'; a.bonds.forEach(x => x.enabled = false);
+      const behind = b.node.querySelector('.behind'); const clone = a.node.querySelector('.cover').cloneNode(true); behind.innerHTML = ''; behind.appendChild(clone);
+      bm.textContent = 'New Folder'; bs.textContent = '2 notebooks';
+      envelope(b, false); b.lift.to = 1; b.poke(1.4); haptic('merge');
+      order.splice(order.indexOf(a), 1); order.push(a); layout();
+      scene.wake();
+    }, 300);
+    showToast('Made “New Folder” from 2 notebooks');
+  }
+  function undo() {
+    if (!undoStack) return; const u = undoStack; undoStack = null;
+    if (u.kind === 'combine') {
+      const { a, b, idx, title, sub } = u;
+      b.node.querySelector('.behind').innerHTML = ''; b.node.querySelector('.meta b').innerHTML = title; b.node.querySelector('.meta span').innerHTML = sub;
+      restore(a, idx, b.px.x, b.py.x); b.poke(1);
+    } else {
+      u.cnt.textContent = u.before; restore(u.d, u.idx, u.d.px.x, u.d.py.x);
+    }
+    hideToast(); scene.wake();
+  }
+  function restore(a, idx, x, y) {
+    order.splice(order.indexOf(a), 1); order.splice(idx, 0, a);
+    a.gone = false; a.show(true); a.node.style.visibility = ''; a.node.style.transition = 'opacity .2s'; a.node.style.opacity = 1; a.lift.snap(1); a.node.style.zIndex = '';
+    envelope(a, false); a.pw.snap(CW - 8); a.ph.snap(CH - 8); a.pr.snap(4); a.bonds.forEach(x => x.enabled = false);
+    a.px.snap(x); a.py.snap(y); layout();
+  }
+  const tEl = el('div', 'toast', `<span data-msg></span><button>Undo</button>`);
+  const toast = new Drop(top, { x: 757, y: H + 40, w: 380, h: 48, r: 24, lens: 'deep', el: tEl, cap: .08, rigid: .2, visible: false, move: 'bud' });
+  tEl.querySelector('button').addEventListener('click', undo);
+  let tT = 0;
+  function showToast(msg) { tEl.querySelector('[data-msg]').textContent = msg; toast.show(true); toast.lens.style.opacity = 1; toast.px.snap(757); toast.py.snap(H + 30); toast.py.use('bud').to = H - 24 - 24; tEl.classList.add('shown'); clearTimeout(tT); tT = setTimeout(hideToast, 6000); top.wake(); }
+  function hideToast() { tEl.classList.remove('shown'); toast.py.to = H + 40; setTimeout(() => { if (!tEl.classList.contains('shown')) toast.show(false); }, 400); top.wake(); }
+  scene.wake(); top.wake();
+  return scene;
+}
+
+/* =============================================================================
+   6b. Opaque surfaces: sheets, grouped lists, the switch (the only liquid in Settings)
+   ========================================================================== */
+function wireSeg(seg, onPick) {
+  const knob = el('i', 'knob'); seg.prepend(knob);
+  const btns = [...seg.querySelectorAll('button')];
+  const place = () => { const b = btns.find(x => x.getAttribute('aria-checked') === 'true') || btns[0]; knob.style.width = b.offsetWidth + 'px'; knob.style.transform = `translateX(${b.offsetLeft}px)`; };
+  btns.forEach(b => b.addEventListener('click', () => { btns.forEach(x => x.setAttribute('aria-checked', x === b)); place(); onPick && onPick(b.dataset.v, b); }));
+  requestAnimationFrame(place); seg.place = place;
+  return seg;
+}
+const segHTML = (opts, sel, attrs = '') => `<div class="nseg" role="radiogroup" ${attrs}>${opts.map(([v, t]) => `<button role="radio" data-v="${v}" aria-checked="${v === sel}">${t}</button>`).join('')}</div>`;
+function wireSwitches(root) {
+  root.querySelectorAll('.sw').forEach(sw => sw.addEventListener('click', () => {
+    const on = sw.getAttribute('aria-checked') !== 'true';
+    if (!RM()) { sw.classList.add('sq'); setTimeout(() => sw.classList.remove('sq'), 120); }   // 27 → 35 → 27 pt over 0.32 s
+    sw.setAttribute('aria-checked', on);
+  }));
+}
+const swHTML = (on, label) => `<button class="sw" role="switch" aria-checked="${on}" aria-label="${label}"><i></i></button>`;
+
+/* A still editor behind a sheet (page + resting chrome), dimmed by the scrim. */
+function editorBackdrop(screen) {
+  const scene = new Scene(screen, { W: 1194, H: 834, sigma: 8, k: 1 });
+  scene.scene.appendChild(el('div', 'desk'));
+  statusBarPad(scene);
+  const page = el('div', 'page', pageMarkup(scene.id, false));
+  Object.assign(page.style, { left: '217px', top: '92px', width: '760px', height: Math.round(760 * 1075 / 760) + 'px', pointerEvents: 'none' });
+  scene.scene.appendChild(page);
+  editorChrome(scene, {});
+  scene.chrome.style.pointerEvents = 'none'; scene.content.style.pointerEvents = 'none';
+  scene.wake();
+  return scene;
+}
+function libraryBackdrop(screen) {
+  const lib = el('div', 'lib static');
+  const rows = [['books', 'Documents', '23', 1], ['star', 'Favourites', '5'], ['people', 'Shared', '2'], ['clock', 'Recents', ''], ['stack', 'Study Sets', '3'], ['puzzle', 'Gallery', ''], ['trash', 'Trash', '4']];
+  lib.innerHTML = `<aside class="side"><h2 class="big" style="left:24px;top:80px">Library</h2>${rows.map((r, i) => `<div class="srow ${r[3] ? 'sel' : ''}" style="top:${140 + i * 44}px">${icon(r[0])}<span>${r[1]}</span><span class="n">${r[2]}</span></div>`).join('')}</aside>
+    <h1 class="big" style="left:344px;top:80px">Documents</h1>
+    ${CARDS.slice(0, 10).map((c, i) => `<div class="card static" style="left:${344 + (i % 5) * 164}px;top:${150 + Math.floor(i / 5) * 250}px;width:140px;height:182px">${coverHTML(c)}</div>`).join('')}`;
+  screen.appendChild(lib);
+  screen.appendChild(el('div', 'status', `<span>9:41&nbsp;&nbsp;Tue 24 Sep</span><span class="r">${wifi()}<span>100%</span>${battery()}</span>`));
+}
+
+/* ---------- 05 · New notebook and templates ---------- */
+function paperSVG(kind) {
+  const W = 104, H = 135, rule = '#CFDBE8', margin = '#EDB9B3';
+  let g = '';
+  const lines = (step, y0 = 18) => { let s = ''; for (let y = y0; y < H - 6; y += step) s += `<line x1="0" x2="${W}" y1="${y}" y2="${y}" stroke="${rule}" stroke-width=".7"/>`; return s; };
+  if (kind === 'narrow') g = lines(4.2) + `<line x1="14" x2="14" y1="0" y2="${H}" stroke="${margin}" stroke-width=".8"/>`;
+  if (kind === 'college') g = lines(5.2) + `<line x1="14" x2="14" y1="0" y2="${H}" stroke="${margin}" stroke-width=".8"/>`;
+  if (kind === 'dots') { for (let y = 8; y < H; y += 5.2) for (let x = 6; x < W; x += 5.2) g += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r=".45" fill="#B7C4D2"/>`; }
+  if (kind === 'grid') { for (let x = 0; x < W; x += 5.2) g += `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="0" y2="${H}" stroke="${rule}" stroke-width=".5"/>`; g += lines(5.2, 0).replaceAll('.7', '.5'); }
+  if (kind === 'cornell') g = lines(5.2, 22) + `<line x1="30" x2="30" y1="14" y2="${H - 26}" stroke="${margin}" stroke-width=".8"/><line x1="0" x2="${W}" y1="${H - 26}" y2="${H - 26}" stroke="#9FB1C4" stroke-width=".8"/><line x1="0" x2="${W}" y1="14" y2="14" stroke="#9FB1C4" stroke-width=".8"/>`;
+  if (kind === 'music') { for (let s = 0; s < 7; s++) for (let l = 0; l < 5; l++) { const y = 16 + s * 16.5 + l * 2.2; g += `<line x1="8" x2="${W - 8}" y1="${y}" y2="${y}" stroke="#A9B4C0" stroke-width=".45"/>`; } }
+  if (kind === 'planner') { g = `<rect x="7" y="10" width="${W - 14}" height="12" rx="2" fill="none" stroke="#B7C4D2" stroke-width=".6"/>`; for (let r = 0; r < 4; r++) for (let c = 0; c < 2; c++) g += `<rect x="${7 + c * 46}" y="${28 + r * 26}" width="44" height="23" rx="2" fill="none" stroke="#C9D3DE" stroke-width=".6"/>`; }
+  return `<svg viewBox="0 0 ${W} ${H}" aria-hidden="true"><rect width="${W}" height="${H}" fill="#fff"/>${g}</svg>`;
+}
+function mountTemplates(screen) {
+  libraryBackdrop(screen);
+  screen.appendChild(el('div', 'scrim'));
+  const S = { x: (1194 - 720) / 2, y: 97, w: 720, h: 640 };
+  const sheet = el('div', 'sheet'); Object.assign(sheet.style, { left: S.x + 'px', top: S.y + 'px', width: S.w + 'px', height: S.h + 'px' });
+  const covers = [['none', 'No cover'], ['#2F4A3E', 'Moss'], ['#23324F', 'Navy'], ['#A4553A', 'Terracotta'], ['#2A2D33', 'Carbon'], ['#5E1F24', 'Oxblood'], ['#D5C6A8', 'Sand', 1], ['#8C8A84', 'Stone'], ['#F3F1EC', 'Paper', 1]];
+  const papers = [['blank', 'Blank'], ['narrow', 'Ruled 7 mm'], ['college', 'Ruled 8.7 mm'], ['dots', 'Dotted 5 mm'], ['grid', 'Grid 5 mm'], ['cornell', 'Cornell'], ['music', 'Music'], ['planner', 'Week planner']];
+  const paperColors = [['#FFFFFF', 'White'], ['#FBF8F1', 'Ivory'], ['#FCF3C8', 'Legal'], ['#F1F1EF', 'Grey'], ['#1E1F22', 'Slate'], ['#1F2A24', 'Board']];
+  sheet.innerHTML = `
+    <div class="sheet-head"><button class="txtbtn">Cancel</button><h3>New Notebook</h3><button class="tinted" data-create>Create</button></div>
+    <div style="padding:0 20px;display:flex;flex-direction:column;gap:14px">
+      ${segHTML([['nb', 'Notebook'], ['wb', 'Whiteboard'], ['td', 'Text document'], ['ss', 'Study set']], 'nb', 'aria-label="Type" data-type')}
+      <div>
+        <p class="sec-label">Title</p>
+        <div class="gfield"><span class="ph">Simple Harmonic Motion</span><button class="use">${icon('drop')}Use suggestion</button></div>
+      </div>
+      <div>
+        <p class="sec-label">Cover</p>
+        <div class="strip" role="radiogroup" aria-label="Cover">${covers.map(([c, n, light], i) => `<button class="pick" role="radio" aria-checked="${i === 1}" aria-label="${n}">${c === 'none' ? `<span class="none">No cover</span>` : `<span class="cv cover cloth ${light ? 'light' : ''}" style="--cc:${c}"><i class="spine"></i><i class="band"></i></span>`}</button>`).join('')}</div>
+      </div>
+      <div style="display:flex;gap:20px">
+        <div><p class="sec-label">Paper</p><ul class="groups" role="listbox" aria-label="Template group">${['Basic', 'Lined', 'Grid', 'Planners', 'Music', 'From plugins'].map((g, i) => `<li role="option" aria-selected="${i === 0}">${g}</li>`).join('')}</ul></div>
+        <div class="papers-scroll"><div class="papers" role="radiogroup" aria-label="Paper">${papers.map(([k, n], i) => `<button class="pick paper" role="radio" aria-checked="${i === 2}" aria-label="${n}"><span class="pv">${paperSVG(k)}</span><small>${n}</small></button>`).join('')}</div></div>
+      </div>
+      <div class="opts">
+        <button class="menu-btn">A4 ${icon('down')}</button>
+        ${segHTML([['p', 'Portrait'], ['l', 'Landscape']], 'p', 'aria-label="Orientation" style="width:200px"')}
+        <span style="flex:1"></span>
+        ${paperColors.map(([c, n], i) => `<button class="pswatch" role="radio" aria-checked="${i === 0}" aria-label="${n} paper" style="background:${c}"></button>`).join('')}
+      </div>
+    </div>`;
+  screen.appendChild(sheet);
+  sheet.querySelectorAll('.nseg').forEach(s => wireSeg(s, v => { if (s.hasAttribute('data-type')) sheet.querySelector('h3').textContent = { nb: 'New Notebook', wb: 'New Whiteboard', td: 'New Text Document', ss: 'New Study Set' }[v]; }));
+  const pickGroup = sel => sheet.querySelectorAll(sel).forEach(b => b.addEventListener('click', () => { b.parentElement.querySelectorAll(':scope > button').forEach(x => x.setAttribute('aria-checked', x === b)); }));
+  pickGroup('.strip .pick'); pickGroup('.papers .pick'); pickGroup('.opts .pswatch');
+  sheet.querySelectorAll('.groups li').forEach(li => li.addEventListener('click', () => sheet.querySelectorAll('.groups li').forEach(x => x.setAttribute('aria-selected', x === li))));
+  sheet.querySelector('.use').addEventListener('click', e => { const ph = sheet.querySelector('.gfield .ph'); ph.style.color = 'var(--label)'; e.currentTarget.remove(); });
+}
+
+/* ---------- 06 · Plugin manager ---------- */
+function mountPlugins(screen) {
+  editorBackdrop(screen);
+  screen.appendChild(el('div', 'scrim'));
+  const S = { x: (1194 - 780) / 2, y: 76, w: 780, h: 690 };
+  const sheet = el('div', 'sheet'); Object.assign(sheet.style, { left: S.x + 'px', top: S.y + 'px', width: S.w + 'px', height: S.h + 'px' });
+  const plugins = [
+    ['stack', 'Anki Export', 'Mira Tan · 1.2.0', 'Reads documents · Uses your AI', true, true],
+    ['hex', 'Chem Structures', 'Oxbridge Lab · 0.9.4', 'Adds a tool · Reads the selection', true, false],
+    ['clock', 'Pomodoro', 'Nib Community · 2.0.1', 'Adds a panel', false, false],
+    ['doc', 'LaTeX Export', 'Ivo Brandt · 1.0.3', 'Reads documents · Saves files', true, false]];
+  sheet.innerHTML = `
+    <div class="sheet-head"><button class="txtbtn" data-install>Install from…</button><h3>Plugins</h3><button class="txtbtn" style="font-weight:600">Done</button></div>
+    <div class="split">
+      <div class="plist" role="listbox" aria-label="Installed plugins">
+        ${plugins.map(([ic, n, by, perms, on, upd], i) => `<div class="prow" role="option" aria-selected="${i === 0}"><span class="sq29">${icon(ic)}</span><div class="meta"><b>${n}${upd ? ' <span class="upd">Update</span>' : ''}</b><span>${by}</span><span>${perms}</span></div>${swHTML(on, 'Enable ' + n)}</div>`).join('')}
+      </div>
+      <div class="pdetail">
+        <div class="phead"><span class="sq29">${icon('stack')}</span><div><h4>Anki Export</h4><p>Mira Tan · version 1.2.0 · from the Nib Community gallery</p></div></div>
+        <p class="pdesc">Turns lassoed handwriting and study sets into Anki cards, with the page image on the back.</p>
+        <div class="diff" role="group" aria-label="Update 1.3.0">
+          <b>Update to 1.3.0</b>
+          <ul><li class="add">${icon('globe')} Reach the network: ankiweb.net</li><li class="rem">${icon('drop')} Use your AI provider</li></ul>
+          <div class="row"><button class="btn primary" style="height:34px;padding:0 16px;white-space:nowrap">Review and Update</button></div>
+          <p class="gfoot" style="margin:8px 0 0">Nothing changes until you approve the new permissions.</p>
+        </div>
+        <p class="gcap" style="margin-left:0">This plugin can</p>
+        <div class="group perm">
+          <div class="grow ic"><span class="sq29">${icon('doc')}</span>Read your documents${swHTML(true, 'Read your documents')}</div>
+          <div class="grow ic"><span class="sq29">${icon('drop')}</span>Use your AI provider${swHTML(true, 'Use your AI provider')}</div>
+          <div class="grow ic"><span class="sq29">${icon('pencil2')}</span>Change pages${swHTML(false, 'Change pages')}</div>
+        </div>
+        <p class="gcap" style="margin-left:0">It adds</p>
+        <div class="group"><div class="grow">1 panel · 2 menu items · 1 assistant action<span class="val">${icon('chev')}</span></div></div>
+        <div class="pbtns"><button class="btn2">Disable</button><button class="btn2 red">Remove</button></div>
+      </div>
+    </div>`;
+  screen.appendChild(sheet);
+  wireSwitches(sheet);
+  sheet.querySelectorAll('.prow').forEach(r => r.addEventListener('click', e => { if (e.target.closest('.sw')) return; sheet.querySelectorAll('.prow').forEach(x => x.setAttribute('aria-selected', x === r)); }));
+
+  // the install consent sheet (B): source, hash, the permission list; Install is the only primary
+  const cs = el('div', 'scrim consent-scrim'); screen.appendChild(cs);
+  const C = { w: 480, h: 560 };
+  const consent = el('div', 'sheet consent'); Object.assign(consent.style, { left: (1194 - C.w) / 2 + 'px', top: (834 - C.h) / 2 + 'px', width: C.w + 'px', height: C.h + 'px' });
+  consent.innerHTML = `
+    <div class="sheet-head"><button class="txtbtn" data-cancel>Cancel</button><h3>Install Plugin</h3><button class="tinted" data-go>Install</button></div>
+    <div style="padding:4px 24px 0">
+      <div class="phead"><span class="sq29">${icon('hex')}</span><div><h4>Chem Structures</h4><p>Oxbridge Lab · version 0.9.4</p></div></div>
+      <p class="gcap" style="margin-left:0">Source</p>
+      <div class="group"><div class="grow">gallery.nib.app/chem-structures</div><div class="grow"><span class="hash">SHA-256 3f7a 91c2 0be4 d58e</span><span class="val">Full hash ${icon('chev')}</span></div></div>
+      <p class="gcap" style="margin-left:0">It will be able to</p>
+      <div class="group perm">
+        <div class="grow ic"><span class="sq29">${icon('lasso')}</span>Read what you select</div>
+        <div class="grow ic"><span class="sq29">${icon('pencil2')}</span>Add structures to pages</div>
+        <div class="grow ic"><span class="sq29">${icon('hex')}</span>Add a tool to your palette</div>
+      </div>
+      <p class="gfoot" style="margin-left:0">Its tool joins your palette after the inks, marked with a dot: <span class="ptool" style="vertical-align:middle;margin-left:6px;transform:scale(.8)">${icon('hex')}</span></p>
+      <p class="gfoot" style="margin-left:0">Plugins run in a sandbox. You can change each permission later in Settings › Plugins.</p>
+    </div>`;
+  screen.appendChild(consent);
+  const open = on => { consent.classList.toggle('shown', on); cs.classList.toggle('shown', on); };
+  sheet.querySelector('[data-install]').addEventListener('click', () => open(true));
+  consent.querySelector('[data-cancel]').addEventListener('click', () => open(false));
+  cs.addEventListener('click', () => open(false));
+  consent.querySelector('[data-go]').addEventListener('click', () => setTimeout(() => open(false), 260));
+}
+
+/* ---------- 07 · Settings ---------- */
+function mountSettings(screen) {
+  editorBackdrop(screen);
+  screen.appendChild(el('div', 'scrim'));
+  const S = { x: (1194 - 760) / 2, y: 64, w: 760, h: 706 };
+  const sheet = el('div', 'sheet'); Object.assign(sheet.style, { left: S.x + 'px', top: S.y + 'px', width: S.w + 'px', height: S.h + 'px' });
+  const sections = [['gear', 'General', 1], ['doc', 'Editing'], ['pencil', 'Stylus'], ['writing', 'Writing'], ['drop', 'AI'], ['cloud', 'Sync'], ['puzzle', 'Plugins'], ['bridge', 'Bridge'], ['sliders', 'Advanced'], ['info', 'About']];
+  sheet.innerHTML = `
+    <div class="sheet-head"><span></span><h3>Settings</h3><button class="txtbtn" style="font-weight:600">Done</button></div>
+    <div class="split">
+      <div class="split-side" role="listbox" aria-label="Sections">${sections.map(([ic, n, sel]) => `<div class="nrow" role="option" aria-selected="${!!sel}">${icon(ic)}${n}</div>`).join('')}</div>
+      <div class="split-main">
+        <h4 class="gtitle">General</h4>
+        <p class="gcap">Appearance</p>
+        <div class="group">
+          <div class="grow">Theme<span class="val">Match System ${icon('chev')}</span></div>
+          <div class="grow">Liquid ${segHTML([['full', 'Full'], ['calm', 'Calm'], ['off', 'Off']], root.dataset.liquid, 'aria-label="Liquid" data-liquid-seg')}</div>
+          <div class="grow">App icon<span class="val">Default ${icon('chev')}</span></div>
+        </div>
+        <p class="gfoot">Calm keeps the water but halves the stretch. Off uses solid chrome and no motion.</p>
+        <p class="gcap">Writing</p>
+        <div class="group">
+          <div class="grow">Scroll direction<span class="val">Vertical ${icon('chev')}</span></div>
+          <div class="grow">Draw and Hold to make shapes${swHTML(true, 'Draw and Hold')}</div>
+          <div class="grow">Scribble to erase${swHTML(true, 'Scribble to erase')}</div>
+          <div class="grow">Show document tabs${swHTML(false, 'Show document tabs')}</div>
+        </div>
+        <p class="gcap">Language</p>
+        <div class="group"><div class="grow">Handwriting recognition<span class="val">English (UK) ${icon('chev')}</span></div></div>
+      </div>
+    </div>`;
+  screen.appendChild(sheet);
+  wireSwitches(sheet);
+  wireSeg(sheet.querySelector('[data-liquid-seg]'), v => { root.dataset.liquid = v; applyPrefs(); });
+  sheet.querySelectorAll('.nrow').forEach(r => r.addEventListener('click', () => sheet.querySelectorAll('.nrow').forEach(x => x.setAttribute('aria-selected', x === r))));
+}
+
+/* =============================================================================
+   7. Boot + preview controls
+   ========================================================================== */
+const all = [];
+all.push(mountLibrary(document.getElementById('s-lib')));
+all.push(mountEditor(document.getElementById('s-edit'), { page: { x: 217, y: 92, w: 760 }, popOpen: true }));
+all.push(mountEditor(document.getElementById('s-ai'), { page: { x: 92, y: 92, w: 720 }, ai: true, rightEdge: 818, noAssistant: true, hudRight: 818 }));
+all.push(mountPhone(document.getElementById('s-phone')));
+mountTemplates(document.getElementById('s-tpl'));
+mountPlugins(document.getElementById('s-plug'));
+mountSettings(document.getElementById('s-set'));
+
+function syncControls() {
+  document.querySelectorAll('.ctl-group').forEach(g => g.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', root.dataset[g.dataset.set] === b.dataset.v)));
+  document.querySelectorAll('[data-liquid-seg]').forEach(seg => { seg.querySelectorAll('button').forEach(b => b.setAttribute('aria-checked', b.dataset.v === root.dataset.liquid)); seg.place && seg.place(); });
+}
+function applyPrefs() {
+  syncControls();
+  scenes.forEach(s => s.setRT()); document.querySelectorAll('.lens').forEach(applyLensFilter);
+  scenes.forEach(s => { s.drops.forEach(d => d.lastM = ''); s.wake(); });
+}
+document.querySelectorAll('.ctl-group').forEach(g => g.addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  root.dataset[g.dataset.set] = b.dataset.v;
+  if (g.dataset.set === 'sound' && b.dataset.v === 'on') haptic('merge');
+  applyPrefs();
+}));
+syncControls();
+
+/* fit frames to narrow windows (the mock is authored at true point size) */
+function fit() {
+  const avail = document.documentElement.clientWidth - 64;
+  document.querySelectorAll('.device').forEach(d => { d.style.zoom = ''; const w = d.offsetWidth; d.style.zoom = w > avail ? (avail / w).toFixed(4) : ''; });
+}
+addEventListener('resize', fit); fit();
+/* test hook: advance the simulation deterministically (used when rAF is throttled) */
+window.__nib = { scenes, advance(ms) { for (let t = 0; t < ms; t += 1000 / 60) scenes.forEach(s => s.step(1 / 60)); } };
+})();
+</script>
+</body>
+</html>

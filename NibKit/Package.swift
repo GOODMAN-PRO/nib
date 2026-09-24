@@ -118,9 +118,13 @@ let modules: [Module] = [
 
 var targets: [Target] = [
     .target(name: "NibContracts"),
-    .target(name: "NibDesign"),
+    // The design system (docs/DESIGN_SYSTEM.md): Shaders/NibLiquid.metal compiles into default.metallib in its bundle
+    // (ShaderLibrary.bundle(.module)); Localizable.xcstrings holds its strings (String(localized:bundle: .module)).
+    .target(name: "NibDesign", dependencies: ["NibContracts"],
+            resources: [.process("Shaders"), .process("Localizable.xcstrings")]),
     .target(name: "NibTesting", dependencies: ["NibContracts"]),
     .testTarget(name: "NibContractsTests", dependencies: ["NibContracts", "NibTesting"]),
+    .testTarget(name: "NibDesignTests", dependencies: ["NibDesign"]),
     .testTarget(name: "ConformanceTests",
                 dependencies: ["NibContracts", "NibTesting"] + modules.map { Target.Dependency.target(name: $0.name) }),
     // Example plugins call doc.create, card.add, ink.writeText, panels and nib.ai, so they run against every module
@@ -141,6 +145,7 @@ for m in modules {
 
 let package = Package(
     name: "NibKit",
+    defaultLocalization: "en",
     platforms: [.iOS(.v17)],
     // Two products, so Xcode always generates the aggregate "NibKit-Package" scheme CI tests with.
     products: [.library(name: "NibKit", targets: ["NibContracts", "NibDesign"] + modules.map { $0.name }),

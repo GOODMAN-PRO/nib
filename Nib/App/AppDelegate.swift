@@ -1,6 +1,7 @@
 import UIKit
 import BackgroundTasks
 import NibContracts
+import NibDesign
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -15,6 +16,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         let disabled = SafeMode.disabledFeatures
         let features = FeatureList.all.filter { !disabled.contains($0.id) }
         app.register(features)
+        DesignGallery.registerSettingsPage(in: app)   // Settings › Advanced › Developer (NibDesign is not a feature)
         registerBackgroundTasks(app)   // must run before this method returns
         Task { @MainActor in
             await app.start(features)
