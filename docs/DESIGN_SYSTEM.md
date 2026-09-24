@@ -24,7 +24,8 @@ These are small changes outside `NibDesign`. The architect applies them together
 1. **`NibKit/Package.swift`** is generated from `docs/forge-spec.json` ("Edit the spec, not this file"), so the change goes into the generator, which then emits it. It already has `.target(name: "NibDesign")`: **replace** that line (adding a second `NibDesign` target is a manifest error, and a hand edit is lost on the next regeneration) and add the test target and the default localisation:
 
    ```swift
-   .target(name: "NibDesign", resources: [.process("Shaders"), .process("Localizable.xcstrings")]),  // default.metallib + strings
+   .target(name: "NibDesign", dependencies: ["NibContracts"],                                          // NibPalette (item 6)
+           resources: [.process("Shaders"), .process("Localizable.xcstrings")]),                       // default.metallib + strings
    .testTarget(name: "NibDesignTests", dependencies: ["NibDesign"]),                                   // §3.28
    // and in Package(…):
    defaultLocalization: "en",
@@ -256,6 +257,8 @@ struct EditorChrome: View {
 ## 3. Source
 
 Files in the order below. Paths are relative to the repository root.
+
+Two files live beside these and are not reproduced here: `Gallery/DesignGallery.swift` (the Settings › Advanced › Developer screen that shows every token, component and droplet interaction in light and dark; the app shell registers it with `DesignGallery.registerSettingsPage(in:)`) and `NibKit/Tests/NibDesignTests/TokenContrastTests.swift` (WCAG contrast of the text tokens over the worst case beneath, §2.4 of DESIGN.md).
 
 ### 3.1 `NibKit/Sources/NibDesign/Modifiers/NibInteraction.swift`
 
@@ -4442,6 +4445,7 @@ extension View {
 
 ```swift
 import SwiftUI
+import NibContracts
 
 public struct NibTool: Identifiable, Hashable, Sendable {
     public let id: String
@@ -5403,11 +5407,12 @@ public struct NibSheetHeader: View {
     let onCancel: () -> Void
     let onPrimary: () -> Void
 
-    public init(_ title: String, cancelTitle: String = String(localized: "Cancel", bundle: .module),
+    /// `cancelTitle` nil = "Cancel" (a default argument cannot read the internal `Bundle.module`).
+    public init(_ title: String, cancelTitle: String? = nil,
                 primaryTitle: String? = nil, isPrimaryEnabled: Bool = true, onCancel: @escaping () -> Void,
                 onPrimary: @escaping () -> Void = {}) {
         self.title = title
-        self.cancelTitle = cancelTitle
+        self.cancelTitle = cancelTitle ?? String(localized: "Cancel", bundle: .module)
         self.primaryTitle = primaryTitle
         self.isPrimaryEnabled = isPrimaryEnabled
         self.onCancel = onCancel
@@ -5856,6 +5861,7 @@ public struct NibProgressBar: View {
 
 ```swift
 import SwiftUI
+import NibContracts
 
 /// A document in the library: cover (5 pt at the spine, 8 pt at the fore-edge), title, subtitle, type badge, and a
 /// check bead in select mode. Covers are cloth and paper, not water; inside a container give it
@@ -6576,6 +6582,7 @@ public struct NibEmptyState: View {
 
 ```swift
 import SwiftUI
+import NibContracts
 
 /// Every component in its states on one static screen. NibTesting snapshots it in Light, Dark, Reduce Transparency,
 /// Increase Contrast and AX3; reviewers diff the snapshots. No ScrollView: droplets never live in scrolling content.
@@ -6679,6 +6686,7 @@ public struct NibDesignGallery: View {
 ```swift
 import XCTest
 import CoreGraphics
+import SwiftUI
 @testable import NibDesign
 
 final class DropletPhysicsTests: XCTestCase {
@@ -6894,10 +6902,11 @@ final class DropletPhysicsTests: XCTestCase {
         // Stretch springs ζ ≥ 0.65, position springs ζ ≥ 0.6, selection indicators and slots ζ 1 (DESIGN.md §9.1).
         XCTAssertGreaterThanOrEqual(NibMotion.wobble(minor: 44).dampingRatio, 0.65)
         XCTAssertGreaterThanOrEqual(NibMotion.thumb.dampingRatio, 0.65)
-        for s in [NibMotion.tap, .lift, .snap, .reflow, .tether, .bud, .budSize, .reform, .retract, .sheet] {
+        for s in [NibMotion.tap, NibMotion.lift, NibMotion.snap, NibMotion.reflow, NibMotion.tether, NibMotion.bud,
+                  NibMotion.budSize, NibMotion.reform, NibMotion.retract, NibMotion.sheet] {
             XCTAssertGreaterThanOrEqual(s.dampingRatio, 0.6)
         }
-        for s in [NibMotion.glide, .trail, .slot] {
+        for s in [NibMotion.glide, NibMotion.trail, NibMotion.slot] {
             XCTAssertEqual(s.dampingRatio, 1, accuracy: 1e-12)
         }
     }
@@ -6910,6 +6919,7 @@ final class DropletPhysicsTests: XCTestCase {
         XCTAssertEqual(v.value, 100, accuracy: 0.02)
     }
 
+    @MainActor
     func testTheChipDocksClearOfInkNearestItsLine() {
         let page = CGRect(x: 92, y: 92, width: 720, height: 742)
         let line: CGFloat = 466

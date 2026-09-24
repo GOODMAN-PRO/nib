@@ -1,5 +1,6 @@
 import XCTest
 import CoreGraphics
+import SwiftUI
 @testable import NibDesign
 
 final class DropletPhysicsTests: XCTestCase {
@@ -215,10 +216,11 @@ final class DropletPhysicsTests: XCTestCase {
         // Stretch springs ζ ≥ 0.65, position springs ζ ≥ 0.6, selection indicators and slots ζ 1 (DESIGN.md §9.1).
         XCTAssertGreaterThanOrEqual(NibMotion.wobble(minor: 44).dampingRatio, 0.65)
         XCTAssertGreaterThanOrEqual(NibMotion.thumb.dampingRatio, 0.65)
-        for s in [NibMotion.tap, .lift, .snap, .reflow, .tether, .bud, .budSize, .reform, .retract, .sheet] {
+        for s in [NibMotion.tap, NibMotion.lift, NibMotion.snap, NibMotion.reflow, NibMotion.tether, NibMotion.bud,
+                  NibMotion.budSize, NibMotion.reform, NibMotion.retract, NibMotion.sheet] {
             XCTAssertGreaterThanOrEqual(s.dampingRatio, 0.6)
         }
-        for s in [NibMotion.glide, .trail, .slot] {
+        for s in [NibMotion.glide, NibMotion.trail, NibMotion.slot] {
             XCTAssertEqual(s.dampingRatio, 1, accuracy: 1e-12)
         }
     }
@@ -231,6 +233,7 @@ final class DropletPhysicsTests: XCTestCase {
         XCTAssertEqual(v.value, 100, accuracy: 0.02)
     }
 
+    @MainActor
     func testTheChipDocksClearOfInkNearestItsLine() {
         let page = CGRect(x: 92, y: 92, width: 720, height: 742)
         let line: CGFloat = 466
