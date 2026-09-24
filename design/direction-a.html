@@ -34,10 +34,10 @@ html[data-theme="light"]{
   --accent:#0066E0;--on-accent:#FFFFFF;--accent-wash:rgba(0,102,224,.10);
   --red:#FF3B30;--green:#34C759;
   /* water (the SVG filter reads these through flood-color) */
-  --w-body:rgba(255,255,255,.10);--w-edge:rgba(20,28,40,.17);--w-caustic:rgba(255,255,255,.62);
-  --w-rim:rgba(255,255,255,.96);--w-line:rgba(0,0,0,.075);
+  --w-body:rgba(255,255,255,.08);--w-edge:rgba(20,28,40,.15);--w-caustic:rgba(255,255,255,.36);
+  --w-rim:rgba(255,255,255,.85);--w-line:rgba(0,0,0,.075);
   --b-body:rgba(255,255,255,.86);--b-edge:rgba(20,28,40,.15);--b-rim:rgba(255,255,255,1);--b-shadow:rgba(0,0,0,.16);
-  --lens-clear:rgba(255,255,255,.24);--lens-deep:rgba(249,249,251,.72);--rt-fill:#F4F4F6;
+  --lens-clear:rgba(255,255,255,.38);--lens-deep:rgba(249,249,251,.72);--rt-fill:#F4F4F6;
   --shadow-rest:0 .5px 1px rgba(0,0,0,.07),0 6px 16px -3px rgba(0,0,0,.11);
   --shadow-lift:0 1px 2px rgba(0,0,0,.06),0 18px 36px -8px rgba(0,0,0,.22);
   --cover-shadow:0 .5px 1px rgba(0,0,0,.10),0 3px 8px -2px rgba(0,0,0,.10);
@@ -55,7 +55,7 @@ html[data-theme="dark"]{
   --w-body:rgba(255,255,255,.035);--w-edge:rgba(255,255,255,.11);--w-caustic:rgba(255,255,255,.24);
   --w-rim:rgba(255,255,255,.58);--w-line:rgba(255,255,255,.14);
   --b-body:rgba(255,255,255,.22);--b-edge:rgba(255,255,255,.12);--b-rim:rgba(255,255,255,.7);--b-shadow:rgba(0,0,0,.45);
-  --lens-clear:rgba(22,22,24,.56);--lens-deep:rgba(30,30,32,.74);--rt-fill:#2C2C2E;
+  --lens-clear:rgba(22,22,24,.6);--lens-deep:rgba(30,30,32,.74);--rt-fill:#2C2C2E;
   --shadow-rest:0 .5px 1px rgba(0,0,0,.5),0 8px 20px -3px rgba(0,0,0,.55);
   --shadow-lift:0 1px 2px rgba(0,0,0,.5),0 20px 40px -8px rgba(0,0,0,.7);
   --cover-shadow:0 .5px 1px rgba(0,0,0,.6),0 3px 10px -2px rgba(0,0,0,.6);
@@ -102,7 +102,7 @@ svg.water{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
 .writing .lens{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
 
 .lens{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform;box-shadow:var(--shadow-rest);transition:opacity .18s var(--ease-out),box-shadow .25s var(--ease-out)}
-.lens.clear{background:var(--lens-clear);-webkit-backdrop-filter:saturate(1.7) brightness(1.04) blur(.6px);backdrop-filter:saturate(1.7) brightness(1.04) blur(.6px)}
+.lens.clear{background:var(--lens-clear);-webkit-backdrop-filter:saturate(1.7) brightness(1.04) blur(1.4px);backdrop-filter:saturate(1.7) brightness(1.04) blur(1.4px)}
 .lens.deep{background:var(--lens-deep);-webkit-backdrop-filter:blur(26px) saturate(1.8);backdrop-filter:blur(26px) saturate(1.8)}
 .lens.tinted{background:var(--accent);-webkit-backdrop-filter:none;backdrop-filter:none}
 .lens.lifted{box-shadow:var(--shadow-lift)}
@@ -525,7 +525,7 @@ function waterFilter(id, W, H, sg, k) {
     <feComposite in="crb" in2="m" operator="in" result="cr2"/>
     <feFlood class="fw-caustic" result="c3"/><feComposite in="c3" in2="cr2" operator="in" result="caustic"/>
     <feGaussianBlur in="m" stdDeviation="${4.2 * k}" result="bump"/>
-    <feSpecularLighting in="bump" surfaceScale="${6.5 * k}" specularConstant=".95" specularExponent="30" lighting-color="#fff" result="sp">
+    <feSpecularLighting in="bump" surfaceScale="${6.5 * k}" specularConstant=".55" specularExponent="40" lighting-color="#fff" result="sp">
       <feDistantLight azimuth="225" elevation="40"/>
     </feSpecularLighting>
     <feComposite in="sp" in2="m" operator="in" result="spec"/>
@@ -712,10 +712,10 @@ class Drop {
         const im = sv('feImage', { x: 0, y: 0, width: w, height: h, preserveAspectRatio: 'none', result: 'map' });
         im.setAttribute('href', url); im.setAttributeNS('http://www.w3.org/1999/xlink', 'href', url);
         f.appendChild(im);
-        f.appendChild(sv('feDisplacementMap', { in: 'SourceGraphic', in2: 'map', scale: Math.round(Math.min(w, h) * .5 + 6), xChannelSelector: 'R', yChannelSelector: 'G' }));
+        f.appendChild(sv('feDisplacementMap', { in: 'SourceGraphic', in2: 'map', scale: Math.round(Math.min(w, h) * .3 + 4), xChannelSelector: 'R', yChannelSelector: 'G' }));
         this.scene.defs.appendChild(f);
       }
-      L.dataset.filter = `url(#${id}) saturate(1.7) brightness(1.04) blur(.4px)`;
+      L.dataset.filter = `url(#${id}) saturate(1.7) brightness(1.04) blur(1.4px)`;
       applyLensFilter(L);
     }
   }
@@ -996,8 +996,8 @@ function Palette(scene, o) {
     // bead in world space through the palette's content matrix
     const M = drop.Mc; if (!M) return;
     const det = Math.sqrt(Math.abs(M[0] * M[3] - M[1] * M[2]));
-    const across = thick / 2;
-    const hp = apply(M, ...Object.values(localXY(head.x, across))), tp = apply(M, ...Object.values(localXY(tail.x, across)));
+    const hl = itemAt(head.x), tl2 = itemAt(tail.x);
+    const hp = apply(M, hl.x, hl.y), tp = apply(M, tl2.x, tl2.y);
     cH.setAttribute('cx', hp.x.toFixed(2)); cH.setAttribute('cy', hp.y.toFixed(2)); cH.setAttribute('r', (bR * det).toFixed(2));
     cT.setAttribute('cx', tp.x.toFixed(2)); cT.setAttribute('cy', tp.y.toFixed(2)); cT.setAttribute('r', (bR * .78 * det).toFixed(2));
     const gap = Math.abs(head.x - tail.x);
@@ -1006,11 +1006,11 @@ function Palette(scene, o) {
     const hide = drop.pw.x < 8;  cH.style.display = cT.style.display = neck.style.display = hide ? 'none' : '';
     void vertical;
   });
-  function localXY(a, c) {
-    // position along the axis in the CURRENT (possibly morphing) content box
-    const w = drop.pw.x, h = drop.ph.x, v = P.orient === 'v';
-    const d = dims(P.orient), ra = v ? h / d.h : w / d.w;
-    return v ? { x: c * (w / thick), y: a * ra } : { x: a * ra, y: c * (h / thick) };
+  function itemAt(a) {
+    // bead rides on the tool icons' own springs, so it stays glued to them while the palette re-forms
+    const f = clamp((a - along(0)) / pitch, 0, tools.length - 1), i0 = Math.floor(f), i1 = Math.min(tools.length - 1, i0 + 1), t = f - i0;
+    const A = items[i0], B = items[i1];
+    return { x: A.lx.x + (B.lx.x - A.lx.x) * t, y: A.ly.x + (B.ly.x - A.ly.x) * t };
   }
 
   // interactions
@@ -1063,7 +1063,7 @@ function Palette(scene, o) {
 
   Object.assign(P, {
     drop, select, setColor,
-    toolWorld(i) { const M = drop.Mc || mat(drop.px.x, drop.py.x, drop.pw.x, drop.ph.x, 0, 0, 1); const l = localXY(along(i), thick / 2); return apply(M, l.x, l.y); },
+    toolWorld(i) { const M = drop.Mc || mat(drop.px.x, drop.py.x, drop.pw.x, drop.ph.x, 0, 0, 1); const l = itemAt(along(i)); return apply(M, l.x, l.y); },
     get orientNow() { return P.orient; }
   });
   return P;
@@ -1147,7 +1147,7 @@ function liquidSlider(sl, scene, onChange) {
   const thumb = sl.querySelector('.thumb'); let v = parseFloat(getComputedStyle(sl).getPropertyValue('--v')) || .5;
   const pos = new Spring(0, 'follow'), def = new Spring(0, [.2, .45]); def.eps = .0005;
   const W = () => sl.clientWidth - 28;
-  pos.snap(v * (W() || 240));
+  let ready = false;
   const set = x => { v = clamp(x / W(), 0, 1); sl.style.setProperty('--v', v); sl.setAttribute('aria-valuenow', Math.round(v * 100)); onChange && onChange(v); pos.to = v * W(); scene.wake(); };
   onDrag(sl, scene, {
     down(p) { const r = sl.getBoundingClientRect(), sr = scene.screen.getBoundingClientRect(), k = scene.W / sr.width; return { x0: (r.left - sr.left) * k }; },
@@ -1156,6 +1156,7 @@ function liquidSlider(sl, scene, onChange) {
   });
   sl.addEventListener('keydown', e => { if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { set((v + (e.key === 'ArrowRight' ? .05 : -.05)) * W()); pos.snap(pos.to); } });
   scene.tasks.push(dt => {
+    if (!ready) { if (W() <= 0) return false; pos.snap(v * W()); ready = true; }
     const b1 = pos.step(dt); def.to = RM() ? 0 : Math.min(.45, Math.abs(pos.v) / 1400); const b2 = def.step(dt);
     const sx = 1 + def.x, sy = 1 / Math.sqrt(1 + def.x);
     thumb.style.transform = `translateX(${pos.x.toFixed(2)}px) scale(${sx.toFixed(3)},${sy.toFixed(3)})`;
@@ -1249,7 +1250,7 @@ function wirePopover(pop, pal, pen, scene) {
     pal.setColorHex(b.dataset.hex); pop.drop.poke(.25);
   }));
   const sl = c.querySelector('.slider');
-  if (sl) requestAnimationFrame(() => liquidSlider(sl, scene, v => { const pv = c.querySelector('[data-pv]'); if (pv) pv.textContent = Math.round(v * 100) + '%'; }));
+  if (sl) liquidSlider(sl, scene, v => { const pv = c.querySelector('[data-pv]'); if (pv) pv.textContent = Math.round(v * 100) + '%'; });
 }
 
 /* ---------- Assistant ---------- */
@@ -1316,7 +1317,7 @@ function mountAssistant(scene, pal, pg, chrome) {
     }
     scene.wake();
   };
-  (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(() => requestAnimationFrame(() => { place(); wireChip(); }));
+  (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(() => setTimeout(() => { place(); wireChip(); }, 0));
 
   function wireChip() {
     onDrag(chipEl, scene, {
@@ -1422,7 +1423,7 @@ function mountPhone(screen) {
 function coverHTML(c) {
   const star = c.fav ? `<svg class="i" aria-hidden="true"><use href="#i-star"/></svg>` : '';
   let face = '';
-  if (c.kind === 'cloth') face = `<div class="cover cloth ${c.light ? 'light' : ''}" style="--cc:${c.c}"><i class="spine"></i><i class="plate"></i><i class="band"></i></div>`;
+  if (c.kind === 'cloth') face = `<div class="cover cloth ${c.light ? 'light' : ''}" style="--cc:${c.c}"><i class="spine"></i><i class="band"></i></div>`;
   if (c.kind === 'page') face = `<div class="cover"><div class="mini">${pageMarkup('mini', false)}</div></div>`;
   if (c.kind === 'pdf') face = `<div class="cover"><div class="pdfp"><i class="h"></i><i></i><i></i><i class="s"></i><div class="eq">∫₀¹ x² dx = 1/3</div><i></i><i></i><i></i><i class="s"></i><i></i><i></i><i class="s"></i><i></i><i></i></div><span class="badge">${icon('doc')}</span></div>`;
   if (c.kind === 'board') face = `<div class="cover"><div class="board"><svg viewBox="0 0 140 182"><path d="M44 58 C 64 70, 72 84, 88 98 M 44 58 C 40 90, 46 110, 52 128" stroke="#9AA0A8" stroke-width="1.2" fill="none"/></svg><i class="st" style="left:24px;top:40px;background:#FFE680;transform:rotate(-3deg)"></i><i class="st" style="left:78px;top:88px;background:#BFE3FF;transform:rotate(2deg)"></i><i class="st" style="left:36px;top:122px;background:#FFC7DA;transform:rotate(-1deg)"></i></div><span class="badge">${icon('sidebar')}</span></div>`;
@@ -1583,6 +1584,8 @@ function fit() {
   document.querySelectorAll('.device').forEach(d => { d.style.zoom = ''; const w = d.offsetWidth; d.style.zoom = w > avail ? (avail / w).toFixed(4) : ''; });
 }
 addEventListener('resize', fit); fit();
+/* test hook: advance the simulation deterministically (used when rAF is throttled) */
+window.__nib = { scenes, advance(ms) { for (let t = 0; t < ms; t += 1000 / 60) scenes.forEach(s => s.step(1 / 60)); } };
 })();
 </script>
 </body>

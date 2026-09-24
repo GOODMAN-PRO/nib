@@ -41,12 +41,13 @@ public final class NibApp {
     public let ui: UIRegistries
     public private(set) var featureIDs: [String] = []
 
-    public init(persistence: DocumentPersistence = InMemoryPersistence(), defaults: UserDefaults = .standard,
+    public init(persistence: DocumentPersistence? = nil, defaults: UserDefaults = .standard,
                 deviceID: UInt32 = DeviceIdentity.current, makeShared: Bool = true) {
         let events = EventBus()
         let clock = HLCClock(device: deviceID)
         let settings = SettingsStore(defaults: defaults)
-        let workspace = Workspace(clock: clock, persistence: persistence, events: events)
+        // nil = InMemoryPersistence (created here: a main-actor init cannot be a default argument).
+        let workspace = Workspace(clock: clock, persistence: persistence ?? InMemoryPersistence(), events: events)
         let commands = CommandRegistry()
         let gateway = Gateway()
         let services = NibServices(settings: settings)
