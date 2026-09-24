@@ -932,13 +932,13 @@ html.rm .tool .ic,html.rm .qs,html.rm .toast,html.rm .tgl i{transition-duration:
       <h3>Droplet physics · the numbers this page runs on</h3>
       <table class="phys">
         <tr><th>Behaviour</th><th>Value (SwiftUI spring response / damping)</th></tr>
-        <tr><td>Drag stretch</td><td><code>log-strain = Smax·tanh(|v| / 1400 pt/s)</code>, area preserved. Smax palette .09, card .08, chip .12, bead .30</td></tr>
-        <tr><td>Wobble on release</td><td><code>0.26 / 0.42</code> ≈ 3.8 Hz, one visible overshoot</td></tr>
+        <tr><td>Drag stretch</td><td><code>log-strain = Smax·tanh(|v| / 1400 pt/s)</code>, area preserved. Smax palette .09, card skin .12, chip .07, slider thumb .25</td></tr>
+        <tr><td>Wobble on release</td><td><code>0.26 / 0.42</code> ≈ 3.5 Hz, one visible overshoot, halves every 70 ms</td></tr>
         <tr><td>Settle, dock, snap</td><td><code>0.34 / 0.80</code>, throw projection 0.10 s</td></tr>
         <tr><td>Bead glide</td><td>lead <code>0.22 / 0.80</code>, trail <code>0.30 / 0.95</code>, neck 72% of radius</td></tr>
-        <tr><td>Bud-off</td><td><code>0.32 / 0.78</code>; pinch at 50% progress; content fades 55→92%</td></tr>
+        <tr><td>Bud-off</td><td><code>0.38 / 0.80</code>; neck pinches at 60% (≈ 110 ms); content revealed through the droplet 55→90%</td></tr>
         <tr><td>Absorb, merge-in</td><td><code>0.22 / 1.00</code></td></tr>
-        <tr><td>Merge / split</td><td>goo σ 7 pt, iso .42 (passive bridge 11.5 pt); reach 72 pt, arm 24 pt, split 120 pt</td></tr>
+        <tr><td>Merge / split</td><td>goo σ 7 pt, iso .42 (passive bridge 11.5 pt); reach 64 pt sidebar / 40 pt grid; tether splits at 120 pt, re-merges inside 56 pt</td></tr>
         <tr><td>Refraction</td><td>rim lens 12 pt wide, 9 pt peak displacement, frost 3 pt, saturate 1.5</td></tr>
       </table>
     </div>
@@ -970,7 +970,7 @@ const DEFS = $('.defs defs');
 const spring = (response, damping) => ({ k: (TAU / response) ** 2, c: 4 * Math.PI * damping / response });
 const M = {
   settle:    spring(.34, .80),   // drop, dock, slot snap
-  wobble:    spring(.26, .42),   // shape (surface tension): ~3.8 Hz, one overshoot
+  wobble:    spring(.26, .42),   // shape (surface tension): ~3.5 Hz, one overshoot
   beadLead:  spring(.22, .80),
   beadTrail: spring(.30, .95),
   bud:       spring(.38, .80),   // popover buds off its button
@@ -1499,13 +1499,13 @@ class Library {
       d.ph.remove(); d.card.remove();
       $('#libCount').textContent = ($$('.card', this.grid).length) + ' items';
     } else {
-      const f = document.createElement('div'); f.className = 'card';
+      const other = $('.meta-t', t.el).textContent, f = document.createElement('div'); f.className = 'card';
       const c1 = $('.cover', t.el).cloneNode(true), c2 = $('.cover', d.card).cloneNode(true);
       f.innerHTML = `<div class="cover flat" style="background:var(--s3);border-radius:8px;box-shadow:none"></div><p class="meta-t">New folder</p><div class="meta-s">Folder · 2 items</div>`;
       const host = $('.cover', f);
       [c1, c2].forEach((c, i) => { Object.assign(c.style, { position: 'absolute', width: '48%', left: i ? '44%' : '9%', top: i ? '24%' : '14%', transform: `rotate(${i ? 4 : -5}deg)`, aspectRatio: '3/4' }); host.appendChild(c); });
       t.el.replaceWith(f); d.ph.remove(); d.card.remove();
-      this.toast(`New folder from “${title}” and “${$('.meta-t', f).textContent === 'New folder' ? $('.meta-t', t.el).textContent : ''}”`);
+      this.toast(`New folder from “${title}” and “${other}”`);
       $('#libCount').textContent = ($$('.card', this.grid).length) + ' items';
     }
     this.d = null; this.hide();
@@ -1544,7 +1544,7 @@ class Tether {
     Object.assign(this.dot.style, { left: this.A[0] + 'px', top: this.A[1] + 'px' });
     this.D = [this.A[0] + 26, this.A[1] - this.H / 2 + 9];
     this.x = new Sp(M.tether, this.D[0]); this.y = new Sp(M.tether, this.D[1]); this.sc = new Sp(M.absorb, 1); this.ar = new Sp(M.absorb, 8);
-    this.def = new Deform(.12); this.vel = new Vel(); this.attached = true; this.g0 = [this.W / 2, this.H / 2];
+    this.def = new Deform(.07); this.vel = new Vel(); this.attached = true; this.g0 = [this.W / 2, this.H / 2];
     this.satP = null;
     this.chip.addEventListener('pointerdown', e => { if (e.button !== 0 || e.target.closest('button') || !this.alive) return; this.startDrag(e); });
     $$('button[data-act]', this.chip).forEach(b => b.addEventListener('click', () => onAct(b.dataset.act)));
@@ -1571,7 +1571,7 @@ class Tether {
   finish() { this.alive = false; this.attached = true; this.x.p = this.y.p = M.absorb; this.x.to = this.A[0] - this.g0[0]; this.y.to = this.A[1] - this.g0[1]; this.chip.style.transformOrigin = `${this.g0[0]}px ${this.g0[1]}px`; this.sc.to = .08; this.ar.to = 0; kick(this); }
   reset() { this.alive = true; this.attached = true; this.x.p = this.y.p = M.tether; this.x.snap(this.D[0]); this.y.snap(this.D[1]); this.sc.snap(1); this.ar.snap(8); this.chip.style.display = ''; this.dot.style.opacity = ''; this.render(); }
   frame(dt) {
-    if (this.dragging) { this.vel.decay(dt); this.def.target(this.vel.vx, this.vel.vy, .04); }
+    if (this.dragging) { this.vel.decay(dt); this.def.target(this.vel.vx, this.vel.vy, .045); }
     else { this.x.step(dt); this.y.step(dt); this.def.target(this.x.v, this.y.v); }
     this.def.step(dt); this.sc.step(dt); this.ar.step(dt);
     const L = this.len();
@@ -1595,8 +1595,9 @@ class Tether {
     setA(this.anc, { cx: this.A[0], cy: this.A[1], r: Math.max(0, this.ar.x) });
     const L = this.len(), p = this.near();
     let w = 0;
-    if (this.alive && this.attached) w = 12 * Math.pow(clamp(1 - L / 120, 0, 1), .6);
-    else if (this.alive && L < 56) w = 12 * (1 - L / 56);
+    // a thread under ~8 pt vanishes in the σ7 goo, so the neck runs 16 → 8 pt and then pinches
+    if (this.alive && this.attached) w = 8 + 8 * Math.pow(clamp(1 - L / 120, 0, 1), .6);
+    else if (this.alive && L < 56) w = 16 * (1 - L / 56);
     setA(this.lig, { x1: this.A[0], y1: this.A[1], x2: p[0], y2: p[1], 'stroke-width': w });
     if (this.satP) setA(this.sat, { cx: this.satP.x.x, cy: this.satP.y.x, r: this.satP.r.x }); else setA(this.sat, { r: 0 });
     this.goo.box(Math.min(x, this.A[0]) - 40, Math.min(y, this.A[1]) - 40, Math.max(x + this.W, this.A[0]) + 40, Math.max(y + this.H, this.A[1]) + 40);

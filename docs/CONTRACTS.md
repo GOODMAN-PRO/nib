@@ -9736,7 +9736,8 @@ final class NibContractsTests: XCTestCase {
     func testRemoteMergeIsLastWriterWins() throws {
         let h = Harness()
         var item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
-        item.rev = Rev(wallMs: UInt64.max / 2, counter: 0, device: 99)
+        // Newer than the fixture rev but not far-future (that would be distrusted, see Rev.effective).
+        item.rev = Rev(wallMs: UInt64(Date().timeIntervalSince1970 * 1000), counter: 0, device: 99)
         item.locked = true
         let patch = DocumentPatch(doc: Fixtures.docID, items: [Fixtures.page1.raw: [item]])
         XCTAssertEqual(h.app.bus.applyRemote(patch, origin: "test").updated.count, 1)

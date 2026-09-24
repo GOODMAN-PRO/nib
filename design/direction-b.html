@@ -49,7 +49,7 @@
   --f-spec:#FFFFFF; --f-spec-a:.70;
   --f-caus:#FFFFFF; --f-caus-a:.18;
   --f-shadow:#000000; --f-shadow-a:.55;
-  --dense-veil:rgba(25,28,32,.66);
+  --dense-veil:rgba(24,27,31,.80);
   --clear-veil:rgba(22,24,28,.56);
   color-scheme:dark;
 }
@@ -113,10 +113,9 @@ svg.ic{width:24px;height:24px;flex:none;fill:none;stroke:currentColor;stroke-wid
 .lens.dense{background:var(--dense-veil);-webkit-backdrop-filter:blur(24px) saturate(1.6);backdrop-filter:blur(24px) saturate(1.6)}
 .lens.refract.clear{backdrop-filter:var(--lens-url) blur(4px) saturate(1.7) brightness(1.04)}
 .drop-content{position:absolute;left:0;top:0;pointer-events:auto;will-change:transform;touch-action:none}
-/* chrome recedes while the pen is down; ink stays crisp */
-.lens-layer,.goo-layer,.drop-layer .recedes{transition:opacity .5s var(--ease-out) .35s}
-.writing .lens-layer .lens:not(.dense),.writing .drop-layer .recedes{opacity:.32;transition:opacity .16s var(--ease-out)}
-.writing:not([data-screen="ai"]) .goo-layer{opacity:.4;transition:opacity .16s var(--ease-out)}
+/* chrome within 120 pt of the pen recedes while it is down; ink stays crisp */
+.lens,.drop-content{transition:opacity .5s var(--ease-out) .35s}
+.lens.receded,.drop-content.receded{opacity:.32;transition:opacity .16s var(--ease-out)}
 /* Reduce Transparency: same silhouettes, opaque material, no refraction */
 .rt .goo-layer{filter:url(#water-solid)}
 .rt .lens{backdrop-filter:none!important;-webkit-backdrop-filter:none!important;background:transparent!important}
@@ -995,6 +994,7 @@ function frame(now) {
 let pending = null, justDragged = false;
 function startPending(e, S, kind, obj, extra) {
   if (e.button !== undefined && e.button !== 0) return;
+  if (pending && pending.started) return;              // one finger drags; extra touches are ignored
   const p = S.local(e); pending = { S, kind, obj, x0: p.x, y0: p.y, id: e.pointerId, started: false, target: e.currentTarget, extra };
 }
 addEventListener('pointermove', e => {
@@ -1021,7 +1021,7 @@ function begin(P, p) {
   if (P.kind === 'drop') {
     d.gx = P.x0 - d.x; d.gy = P.y0 - d.y; d.mode = 'drag'; d.px = d.x; d.py = d.y; d.press(true); haptic(P.S, 'lift');
     d.onBegin && d.onBegin(); wake();
-  } else if (P.kind === 'bead') { d.dragging = true; d.dragX = p.x; wake(); }
+  } else if (P.kind === 'bead') { d.dragging = true; d.dragX = p.x; haptic(P.S, 'lift'); wake(); }
   else if (P.kind === 'card') beginCard(P, p);
 }
 function move(P, p) {
@@ -1037,7 +1037,9 @@ function end(P) {
 }
 function bindDrag(S, d) {
   d.el.addEventListener('pointerdown', e => {
-    if (e.target.closest('.bead')) return;
+    // grabbing the bead (or the selected tool it sits under) slides the bead; anywhere else moves the droplet
+    const t = e.target.closest('.tool');
+    if (d.bead && (e.target.closest('.bead') || (t && t.getAttribute('aria-pressed') === 'true'))) { startPending(e, S, 'bead', d.bead); return; }
     startPending(e, S, 'drop', d);
   });
 }
@@ -1084,7 +1086,6 @@ class Bead {
     this.cx = this.tools.map(t => t.offsetLeft + t.offsetWidth / 2);
     this.idx = Math.max(0, this.tools.findIndex(t => t.dataset.tool === S.tool));
     this.x = this.cx[this.idx]; this.v = 0; this.s = 0; this.sv = 0; this.dragging = false; this.last = this.idx;
-    this.el.addEventListener('pointerdown', e => { e.stopPropagation(); startPending(e, S, 'bead', this); });
     tickers.add(dt => this.tick(dt)); this.render();
   }
   localX(px) { return px - (this.pal.x - this.pal.w / 2) - 8; }
@@ -1223,9 +1224,13 @@ function bindCanvas(S) {
       const r = page.getBoundingClientRect(), vb = page.viewBox.baseVal;
       const P = ev => [(ev.clientX - r.left) * vb.width / r.width, (ev.clientY - r.top) * vb.height / r.height];
       S.el.classList.add('writing');
+      const recede = ev => { const q = S.local(ev); for (const d of S.drops) { if (d.material === 'dense') continue; const R = d.rect();
+        const on = Math.hypot(Math.max(R.l - q.x, 0, q.x - R.r), Math.max(R.t - q.y, 0, q.y - R.b)) < 120;
+        for (const n of [d.el, d.lens]) if (n) n.classList.toggle('receded', on); } };
+      recede(e);
       if (S.tool === 'eraser') {
         const er = ev => { const [x, y] = P(ev); ink.querySelectorAll('path').forEach(pa => { if (pa._pts && pa._pts.some(q => Math.hypot(q[0] - x, q[1] - y) < 12)) pa.remove(); }); };
-        er(e); page.onpointermove = er;
+        er(e); page.onpointermove = ev => { er(ev); recede(ev); };
       } else {
         const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         const t = S.tool, col = t === 'highlighter' ? '#F9ED52' : t === 'laser' ? '#E5484D' : S.ink;
@@ -1238,10 +1243,11 @@ function bindCanvas(S) {
           for (let i = 1; i < pts.length - 1; i++) { const mx = (pts[i][0] + pts[i + 1][0]) / 2, my = (pts[i][1] + pts[i + 1][1]) / 2; d += `Q${pts[i][0].toFixed(1)} ${pts[i][1].toFixed(1)} ${mx.toFixed(1)} ${my.toFixed(1)}`; }
           const l = pts[pts.length - 1]; d += `L${l[0].toFixed(1)} ${l[1].toFixed(1)}`; path.setAttribute('d', d); };
         draw(); t === 'highlighter' ? ink.prepend(path) : ink.appendChild(path);
-        page.onpointermove = ev => { for (const ce of (ev.getCoalescedEvents ? ev.getCoalescedEvents() : [ev])) pts.push(P(ce)); draw(); };
+        page.onpointermove = ev => { for (const ce of (ev.getCoalescedEvents ? ev.getCoalescedEvents() : [ev])) pts.push(P(ce)); draw(); recede(ev); };
         if (t === 'laser') path.addEventListener('animationend', () => path.remove());
       }
-      const up = () => { page.onpointermove = null; page.removeEventListener('pointerup', up); page.removeEventListener('pointercancel', up); S.el.classList.remove('writing'); };
+      const up = () => { page.onpointermove = null; page.removeEventListener('pointerup', up); page.removeEventListener('pointercancel', up); S.el.classList.remove('writing');
+        S.el.querySelectorAll('.receded').forEach(n => n.classList.remove('receded')); };
       page.addEventListener('pointerup', up); page.addEventListener('pointercancel', up);
     });
   });
@@ -1395,6 +1401,8 @@ const rmS = document.getElementById('rmSwitch'), rtS = document.getElementById('
 function setRM(v) { cfg.rm = v; root.classList.toggle('rm', v); rmS.setAttribute('aria-checked', String(v)); wake(); }
 setRM(OSRM.matches); OSRM.addEventListener('change', e => setRM(e.matches));
 bindSwitch(rmS, v => setRM(v)); bindSwitch(rtS, v => { cfg.rt = v; root.classList.toggle('rt', v); });
+if (new URLSearchParams(location.search).has('rt')) { cfg.rt = true; root.classList.add('rt'); rtS.setAttribute('aria-checked', 'true'); }
+if (new URLSearchParams(location.search).has('rm')) setRM(true);
 
 /* ---------------------------------------------------------------- refraction (Chromium: backdrop-filter:url()) */
 (() => {
