@@ -18,7 +18,7 @@ final class TokenContrastTests: XCTestCase {
     private func resolve(_ color: UIColor, dark: Bool) -> (RGB, CGFloat) {
         let resolved = color.resolvedColor(with: UITraitCollection(userInterfaceStyle: dark ? .dark : .light))
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        XCTAssertTrue(resolved.getRed(&r, &g, &b, &a), "\(color) has no RGB components")
+        XCTAssertTrue(resolved.getRed(&r, green: &g, blue: &b, alpha: &a), "\(color) has no RGB components")
         return (RGB(r: r, g: g, b: b), a)
     }
 
