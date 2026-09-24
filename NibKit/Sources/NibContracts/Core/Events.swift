@@ -12,6 +12,11 @@ public enum NibEventType {
     public static let aiTurnFinished = "ai.turn.finished"
     public static let pluginMessage = "plugin.message"
     public static let syncStatus = "sync.status"
+    /// Laser pointer moved (F040 → presentation F063, collaboration F108). Payload {page, point: [x, y], mode:
+    /// "dot" | "trail"}; a payload without `point` means the laser was lifted.
+    public static let laserMoved = "laser.moved"
+    /// Backup queue or last-run state changed (F068 → Cloud & Backup panel F070); query `backup.status` for details.
+    public static let backupStatus = "backup.status"
 }
 
 /// Events carry refs, not payloads: subscribers query for details.

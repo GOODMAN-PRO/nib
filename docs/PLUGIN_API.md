@@ -371,6 +371,7 @@ A content pack is a plugin that contributes only content (manifest `kind: "conte
 | `plugin.message` | A panel posted a message | `payload` |
 | `sync.status` | The sync engine's state changed | `payload` |
 | `laser.moved` | Laser pointer moved | `payload {page, point, mode}` |
+| `backup.status` | The backup queue or last run changed | — (query `backup.status`) |
 
 Events carry refs, not content. Query what you need.
 

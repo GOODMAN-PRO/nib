@@ -271,6 +271,30 @@ final class NibContractsTests: XCTestCase {
         XCTAssertEqual(LWW.merge([], [skewed]).first?.title, "device clock 30 days ahead")
     }
 
+    func testSharedCanvasAndCollabFakes() async throws {
+        let h = Harness()
+        let canvas = FakeCanvasHost(h)
+        canvas.zoomScale = 2
+        let back = try XCTUnwrap(canvas.pagePoint(canvas.viewPoint(Point(10, 20), page: Fixtures.page2)))
+        XCTAssertEqual(back.page, Fixtures.page2)
+        XCTAssertEqual(back.point.x, 10, accuracy: 1e-9)
+        XCTAssertEqual(back.point.y, 20, accuracy: 1e-9)
+        XCTAssertNil(canvas.pagePoint(CGPoint(x: -1, y: -1)))
+
+        let hub = InMemoryCollabTransport.Hub()
+        let a = InMemoryCollabTransport(hub: hub)
+        let b = InMemoryCollabTransport(hub: hub)
+        var received: [Data] = []
+        b.onMessage = { _, data in received.append(data) }
+        try await a.host(code: "ROOM01", displayName: "A")
+        try await b.join(code: "ROOM01", displayName: "B")
+        try a.send(Data([1]), to: nil)
+        XCTAssertEqual(received, [Data([1])])
+        XCTAssertEqual(a.peers.map(\.name), ["B"])
+        b.leave()
+        XCTAssertTrue(a.peers.isEmpty)
+    }
+
     /// A context as a command would receive it (via a throwaway registered command).
     private func probeContext(_ h: Harness) async throws -> CommandContext {
         var captured: CommandContext?

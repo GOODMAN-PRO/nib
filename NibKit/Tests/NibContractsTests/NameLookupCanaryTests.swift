@@ -82,7 +82,8 @@ enum NameLookupCanary {
         SettingsSection.self, SettingsPageDescriptor.self, InspectorContext.self, InspectorDescriptor.self, ToolMenuDescriptor.self,
         BlockViewContext.self, BlockViewDescriptor.self, PluginPanelFactory.self, CanvasToolDescriptor.self, DocumentEditorDescriptor.self,
         OpenMode.self, SceneNavigator.self, SceneHooks.self, ScreenRegistry.self, UIRegistries.self,
-        NibFeature.self, NibApp.self, SafeMode.self, InkOutline.self
+        NibFeature.self, NibApp.self, SafeMode.self, InkOutline.self, FakeCanvasHost.self,
+        InMemoryCollabTransport.self
     ]
 
     /// Protocols with associated types / Self requirements are checked as generic constraints.

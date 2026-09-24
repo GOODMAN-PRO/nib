@@ -193,3 +193,124 @@ public extension PluginManifest {
         return try json.decode(PluginManifest.self)
     }
 }
+
+/// A view-less canvas for tool, attachment and gesture tests: `pages` stacked top to bottom (`pageSize`, `gap`, page
+/// points) and scaled by `zoomScale` into view coordinates. Records what the code under test asked of the canvas.
+/// `commitStroke` only records (register a stand-in `ink.addStrokes` if a test needs the real commit path).
+@MainActor
+public final class FakeCanvasHost: CanvasHost {
+    public let app: NibApp
+    public let session: EditorSession
+    public let documentID: DocumentID
+    public var zoomScale: Double = 1
+    public var pages: [PageID]
+    public var pageSize = PageSize.a4
+    public var gap: Double = 20
+    public let canvasView: UIView
+    public let overlayLayer = CALayer()
+    public private(set) var hidden: [PageID: Set<ElementID>] = [:]
+    public private(set) var invalidations: [(page: PageID, rect: Rect?)] = []
+    public private(set) var committed: [(stroke: Stroke, page: PageID)] = []
+    public private(set) var wetStrokeCancels = 0
+    public private(set) var liveViews: [ElementID: UIView] = [:]
+
+    public init(app: NibApp, session: EditorSession, doc: DocumentID = Fixtures.docID,
+                pages: [PageID] = [Fixtures.page1, Fixtures.page2]) {
+        self.app = app
+        self.session = session
+        self.documentID = doc
+        self.pages = pages
+        canvasView = UIView(frame: CGRect(x: 0, y: 0, width: 1024, height: 1366))
+        canvasView.layer.addSublayer(overlayLayer)
+    }
+
+    /// The Harness's app and session on the fixture document.
+    public convenience init(_ harness: Harness) { self.init(app: harness.app, session: harness.session) }
+
+    public func pageFrame(_ page: PageID) -> CGRect? {
+        guard let i = pages.firstIndex(of: page) else { return nil }
+        return CGRect(x: 0, y: Double(i) * (pageSize.height + gap) * zoomScale,
+                      width: pageSize.width * zoomScale, height: pageSize.height * zoomScale)
+    }
+
+    public func viewPoint(_ p: Point, page: PageID) -> CGPoint {
+        let o = pageFrame(page)?.origin ?? .zero
+        return CGPoint(x: Double(o.x) + p.x * zoomScale, y: Double(o.y) + p.y * zoomScale)
+    }
+
+    public func pagePoint(_ v: CGPoint) -> (page: PageID, point: Point)? {
+        for page in pages {
+            if let f = pageFrame(page), f.contains(v) {
+                return (page, Point(Double(v.x - f.minX) / zoomScale, Double(v.y - f.minY) / zoomScale))
+            }
+        }
+        return nil
+    }
+
+    public func setHidden(_ ids: Set<ElementID>, page: PageID) { hidden[page] = ids.isEmpty ? nil : ids }
+    public func invalidate(page: PageID, rect: Rect?) { invalidations.append((page, rect)) }
+    public func commitStroke(_ stroke: Stroke, page: PageID) { committed.append((stroke, page)) }
+    public func cancelWetStroke() { wetStrokeCancels += 1 }
+    public func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { liveViews[item] = view }
+}
+
+/// Collaboration transport inside one process: transports sharing a `Hub` that host/join the same code exchange
+/// messages synchronously (two-Harness collaboration tests). `leave()` then `join` simulates suspend and rejoin.
+@MainActor
+public final class InMemoryCollabTransport: CollabTransport {
+    /// Switchboard shared by the transports of one test: code → transports in that session.
+    @MainActor
+    public final class Hub {
+        fileprivate var rooms: [String: [InMemoryCollabTransport]] = [:]
+        public init() {}
+    }
+
+    public let id = "memory"
+    public let hub: Hub
+    /// This participant as the other transports see it.
+    public private(set) var me: CollabPeer
+    public var displayName: String { me.name }
+    public var maxPeers = 8
+    public var onMessage: ((CollabPeer, Data) -> Void)?
+    public var onPeersChanged: (([CollabPeer]) -> Void)?
+    /// Every payload this transport sent, in order.
+    public private(set) var sent: [Data] = []
+    private var code: String?
+
+    public init(hub: Hub, peerID: String = NibID.make().raw) {
+        self.hub = hub
+        self.me = CollabPeer(id: peerID, name: "")
+    }
+
+    private var room: [InMemoryCollabTransport] { code.flatMap { hub.rooms[$0] } ?? [] }
+    public var peers: [CollabPeer] { room.filter { $0 !== self }.map(\.me) }
+
+    public func host(code: String, displayName: String) async throws { try enter(code, displayName) }
+
+    public func join(code: String, displayName: String) async throws {
+        guard hub.rooms[code]?.isEmpty == false else { throw NibError.notFound("collaboration session \(code)") }
+        try enter(code, displayName)
+    }
+
+    public func send(_ data: Data, to peers: [CollabPeer]?) throws {
+        guard code != nil else { throw NibError.unavailable("collaboration session") }
+        sent.append(data)
+        for t in room where t !== self && (peers?.contains(t.me) ?? true) { t.onMessage?(me, data) }
+    }
+
+    public func leave() {
+        guard let c = code else { return }
+        hub.rooms[c]?.removeAll { $0 === self }
+        code = nil
+        for t in hub.rooms[c] ?? [] { t.onPeersChanged?(t.peers) }
+    }
+
+    private func enter(_ code: String, _ name: String) throws {
+        leave()
+        guard (hub.rooms[code]?.count ?? 0) < maxPeers else { throw NibError.unavailable("collaboration session is full") }
+        me.name = name
+        self.code = code
+        hub.rooms[code, default: []].append(self)
+        for t in room { t.onPeersChanged?(t.peers) }
+    }
+}
