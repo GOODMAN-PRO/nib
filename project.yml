@@ -1,0 +1,212 @@
+name: Nib
+options:
+  bundleIdPrefix: app.nib
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    DEVELOPMENT_TEAM: ""
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+packages:
+  NibKit:
+    path: NibKit
+targets:
+  Nib:
+    type: application
+    platform: iOS
+    sources:
+      - path: Nib
+    dependencies:
+      - package: NibKit
+        product: NibKit
+      - target: NibWidgets
+      - target: NibShare
+    entitlements:
+      path: Nib/Nib.entitlements
+      properties:
+        com.apple.security.application-groups: [group.app.nib.Nib]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.nib.Nib
+        PRODUCT_NAME: Nib
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+    info:
+      path: Nib/Info.plist
+      properties:
+        CFBundleDisplayName: Nib
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
+        UIRequiresFullScreen: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UIBackgroundModes: [audio, fetch, processing]
+        # Registered by AppDelegate before launch returns; each id maps to a BackgroundTaskDescriptor
+        # (backup F068 processing, index F055 processing, webdav F069 refresh, sync F025 refresh).
+        BGTaskSchedulerPermittedIdentifiers: [app.nib.backup, app.nib.index, app.nib.webdav, app.nib.sync]
+        # App Group ids the build asks for (progressive enhancement; AltStore/SideStore add ALTAppGroups).
+        NibAppGroups: [group.app.nib.Nib]
+        NSCameraUsageDescription: Nib uses the camera to insert photos and scan documents.
+        NSMicrophoneUsageDescription: Nib records audio alongside your notes.
+        NSPhotoLibraryUsageDescription: Nib inserts images from your photo library.
+        NSPhotoLibraryAddUsageDescription: Nib saves images and exports to your photo library.
+        NSSpeechRecognitionUsageDescription: Nib transcribes your recordings on this device.
+        NSFaceIDUsageDescription: Nib uses Face ID to unlock password-protected notebooks.
+        NSLocalNetworkUsageDescription: Nib uses the local network for live collaboration and the AI bridge.
+        NSCalendarsFullAccessUsageDescription: Nib shows your calendar events and creates notes for meetings.
+        NSCalendarsUsageDescription: Nib shows your calendar events and creates notes for meetings.
+        NSBonjourServices: [_nib._tcp, _nib-collab._tcp, _nib-collab._udp]
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSUserActivityTypes: [app.nib.openDocument]
+        CFBundleURLTypes:
+          - CFBundleURLName: app.nib
+            CFBundleURLSchemes: [nib]
+        UIApplicationShortcutItems:
+          - UIApplicationShortcutItemType: app.nib.quicknote
+            UIApplicationShortcutItemTitle: QuickNote
+            UIApplicationShortcutItemIconSymbolName: square.and.pencil
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Nib Document
+            CFBundleTypeRole: Editor
+            LSHandlerRank: Owner
+            LSTypeIsPackage: true
+            LSItemContentTypes: [app.nib.document]
+          - CFBundleTypeName: Nib Plugin
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes: [app.nib.plugin]
+          - CFBundleTypeName: Nib Element Collection
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes: [app.nib.collection]
+          - CFBundleTypeName: PDF
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [com.adobe.pdf]
+          - CFBundleTypeName: Image
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.image]
+          - CFBundleTypeName: Importable files
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - org.openxmlformats.wordprocessingml.document
+              - com.microsoft.word.doc
+              - org.openxmlformats.presentationml.presentation
+              - com.microsoft.powerpoint.ppt
+              - public.comma-separated-values-text
+              - public.tab-separated-values-text
+              - public.plain-text
+              - public.zip-archive
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: app.nib.document
+            UTTypeDescription: Nib Document
+            UTTypeConformsTo: [com.apple.package, public.composite-content]
+            UTTypeTagSpecification:
+              public.filename-extension: [nibnote]
+          - UTTypeIdentifier: app.nib.plugin
+            UTTypeDescription: Nib Plugin
+            UTTypeConformsTo: [public.zip-archive]
+            UTTypeTagSpecification:
+              public.filename-extension: [nibplugin]
+          - UTTypeIdentifier: app.nib.collection
+            UTTypeDescription: Nib Element Collection
+            UTTypeConformsTo: [public.zip-archive]
+            UTTypeTagSpecification:
+              public.filename-extension: [nibcollection]
+          - UTTypeIdentifier: app.nib.fragment
+            UTTypeDescription: Nib Fragment
+            UTTypeConformsTo: [public.json]
+          - UTTypeIdentifier: app.nib.pages
+            UTTypeDescription: Nib Pages
+            UTTypeConformsTo: [public.json]
+  NibWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NibWidgets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.nib.Nib.widgets
+        PRODUCT_NAME: NibWidgets
+        SKIP_INSTALL: "YES"
+    info:
+      path: NibWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Nib
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        NibAppGroups: [group.app.nib.Nib]
+    entitlements:
+      path: NibWidgets/NibWidgets.entitlements
+      properties:
+        com.apple.security.application-groups: [group.app.nib.Nib]
+  NibShare:
+    # Optional share extension (F064): writes into the App Group inbox when one exists, else hands small payloads
+    # to the app through the pasteboard (nib://import?from=pasteboard). Removed in Nib-unsigned-noextensions.ipa.
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NibShare
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.nib.Nib.share
+        PRODUCT_NAME: NibShare
+        SKIP_INSTALL: "YES"
+    info:
+      path: NibShare/Info.plist
+      properties:
+        CFBundleDisplayName: Nib
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NibAppGroups: [group.app.nib.Nib]
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsImageWithMaxCount: 20
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsFileWithMaxCount: 20
+    entitlements:
+      path: NibShare/NibShare.entitlements
+      properties:
+        com.apple.security.application-groups: [group.app.nib.Nib]
+schemes:
+  Nib:
+    build:
+      targets:
+        Nib: all
+    run:
+      config: Debug
+    archive:
+      config: Release

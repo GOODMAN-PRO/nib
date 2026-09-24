@@ -1,0 +1,301 @@
+name: iOS
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Xcode 26.6 = iOS 26 SDK, because the locked UI uses Liquid Glass. The deployment target stays iOS 17.0 and Swift 5
+  # language mode; every iOS 26+ API sits behind #available. Bump the dd-x26.6-* cache keys together with this path.
+  XCODE: /Applications/Xcode_26.6.app
+  HOMEBREW_NO_AUTO_UPDATE: 1
+
+jobs:
+  # feat/<FeatureID> branches (one per feature agent): lint that feature, build and run ONLY its test target(s), and
+  # build the app only when the feature owns files in Nib/, NibWidgets/ or NibShare/. No full suite, no IPA.
+  feature:
+    if: startsWith(github.ref, 'refs/heads/feat/')
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Scripts/restore_mtimes.py reads the history
+
+      - name: Resolve feature from branch
+        id: feat
+        run: |
+          python3 - "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, os, re, sys
+          m = re.match(r"feat/(F\d{3})\b", sys.argv[1])
+          if not m:
+              sys.exit("branch %s is not feat/<FeatureID> (e.g. feat/F012)" % sys.argv[1])
+          spec = json.load(open("docs/forge-spec.json", encoding="utf-8"))
+          f = next((x for x in spec["features"] if x["id"] == m.group(1)), None)
+          if f is None:
+              sys.exit("%s is not a feature in docs/forge-spec.json" % m.group(1))
+          tests = sorted({p.split("/")[2] for p in f.get("tests", []) if p.startswith("NibKit/Tests/")})
+          app = any(p.split("/")[0] in ("Nib", "NibWidgets", "NibShare") for p in f["files"] + f.get("tests", []))
+          # A package scheme that builds only these test targets and their dependencies (not all ~200 targets).
+          ref = ('<BuildableReference BuildableIdentifier = "primary" BlueprintIdentifier = "{0}" BuildableName = "{0}" '
+                 'BlueprintName = "{0}" ReferencedContainer = "container:"></BuildableReference>')
+          entries = "".join('<BuildActionEntry buildForTesting = "YES" buildForRunning = "NO" buildForProfiling = "NO" '
+                            'buildForArchiving = "NO" buildForAnalyzing = "NO">' + ref.format(t) + "</BuildActionEntry>"
+                            for t in tests)
+          testables = "".join('<TestableReference skipped = "NO">' + ref.format(t) + "</TestableReference>" for t in tests)
+          scheme_dir = "NibKit/.swiftpm/xcode/xcshareddata/xcschemes"
+          os.makedirs(scheme_dir, exist_ok=True)
+          with open(scheme_dir + "/NibFeature.xcscheme", "w") as out:
+              out.write('<?xml version="1.0" encoding="UTF-8"?>\n<Scheme LastUpgradeVersion = "2600" version = "1.7">'
+                        '<BuildAction parallelizeBuildables = "YES" buildImplicitDependencies = "YES"><BuildActionEntries>'
+                        + entries + '</BuildActionEntries></BuildAction><TestAction buildConfiguration = "Debug" '
+                        'selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB" '
+                        'selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB" '
+                        'shouldUseLaunchSchemeArgsEnv = "YES"><Testables>' + testables + "</Testables></TestAction></Scheme>\n")
+          print("id=" + f["id"])
+          print("tests=" + " ".join(tests))
+          print("app=" + ("true" if app else "false"))
+          print("%s (%s): test targets [%s], app build %s" % (f["id"], f["module"], " ".join(tests), app), file=sys.stderr)
+          EOF
+
+      - name: Lint (this feature's module + spec + docs)
+        run: python3 Scripts/lint.py --feature ${{ steps.feat.outputs.id }}
+
+      - name: Select Xcode 26.6
+        run: |
+          if [ ! -d "$XCODE" ]; then
+            echo "::error::$XCODE is not on this runner image any more; pick another Xcode 26.x in ios.yml (env.XCODE)"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Restore file times (keeps the restored DerivedData incremental)
+        run: |
+          python3 Scripts/restore_mtimes.py
+          defaults write com.apple.dt.XCBuild IgnoreFileSystemDeviceInodeChanges -bool YES
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: build/SourcePackages
+          key: spm-${{ hashFiles('NibKit/Package.swift') }}
+
+      - name: Restore DerivedData from main
+        # Read-only: feature branches never save (111 branches x GBs would evict main's cache). Main's cache already
+        # holds NibContracts, NibTesting and the SDK modules, so only this feature's module and tests compile.
+        uses: actions/cache/restore@v4
+        with:
+          path: build/DerivedData
+          key: dd-x26.6-main-${{ hashFiles('NibKit/Package.swift', 'NibKit/Sources/**', 'NibKit/Tests/**') }}
+          restore-keys: dd-x26.6-main-
+
+      - name: Pick simulator
+        id: sim
+        if: steps.feat.outputs.tests != ''
+        run: echo "udid=$(python3 Scripts/pick_sim.py)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test ${{ steps.feat.outputs.tests }}
+        if: steps.feat.outputs.tests != ''
+        working-directory: NibKit
+        run: |
+          set -o pipefail
+          mkdir -p ../build
+          SCHEME=NibFeature
+          if ! xcodebuild -list -json 2>/dev/null | grep -q '"NibFeature"'; then
+            echo "::warning::generated NibFeature scheme not picked up; falling back to NibKit-Package (builds every target)"
+            SCHEME=NibKit-Package
+          fi
+          ONLY=""
+          for t in ${{ steps.feat.outputs.tests }}; do ONLY="$ONLY -only-testing:$t"; done
+          COMMON="-scheme $SCHEME -destination id=${{ steps.sim.outputs.udid }} -derivedDataPath ../build/DerivedData"
+          COMMON="$COMMON -clonedSourcePackagesDirPath ../build/SourcePackages -skipPackagePluginValidation $ONLY"
+          xcodebuild build-for-testing $COMMON 2>&1 | tee ../build/feature-build.log
+          xcodebuild test-without-building $COMMON -parallel-testing-enabled NO \
+            -resultBundlePath ../build/Feature.xcresult 2>&1 | tee ../build/feature-tests.log
+
+      - name: Build the app (feature owns app-target files)
+        if: steps.feat.outputs.app == 'true'
+        run: |
+          set -o pipefail
+          mkdir -p build
+          brew install xcodegen
+          swift Scripts/make_icons.swift
+          xcodegen generate
+          xcodebuild build -project Nib.xcodeproj -scheme Nib -configuration Debug -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData -clonedSourcePackagesDirPath build/SourcePackages \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build/app-build.log
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-logs
+          path: |
+            build/*.log
+            build/*.xcresult
+
+  test:
+    if: ${{ !startsWith(github.ref, 'refs/heads/feat/') }}
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Scripts/restore_mtimes.py reads the history
+
+      - name: Select Xcode 26.6
+        run: |
+          if [ ! -d "$XCODE" ]; then
+            echo "::error::$XCODE is not on this runner image any more; pick another Xcode 26.x in ios.yml (env.XCODE)"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Restore file times (keeps the restored DerivedData incremental)
+        run: |
+          python3 Scripts/restore_mtimes.py
+          defaults write com.apple.dt.XCBuild IgnoreFileSystemDeviceInodeChanges -bool YES
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: build/SourcePackages
+          key: spm-${{ hashFiles('NibKit/Package.swift') }}
+
+      - name: Restore DerivedData
+        id: dd
+        uses: actions/cache/restore@v4
+        with:
+          path: build/DerivedData
+          key: dd-x26.6-main-${{ hashFiles('NibKit/Package.swift', 'NibKit/Sources/**', 'NibKit/Tests/**') }}
+          restore-keys: dd-x26.6-main-
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate icons
+        run: swift Scripts/make_icons.swift
+
+      - name: Lint (code + docs)
+        run: python3 Scripts/lint.py
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Relay self-test
+        run: |
+          if [ -f tools/relay/relay.mjs ]; then node tools/relay/relay.mjs --selftest; else echo "relay not built yet"; fi
+
+      - name: Pick simulator
+        id: sim
+        run: echo "udid=$(python3 Scripts/pick_sim.py)" >> "$GITHUB_OUTPUT"
+
+      - name: Package tests (contracts, canary, conformance, integration, every module)
+        working-directory: NibKit
+        run: |
+          set -o pipefail
+          mkdir -p ../build
+          xcodebuild test -scheme NibKit-Package \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -parallel-testing-enabled NO \
+            -derivedDataPath ../build/DerivedData \
+            -clonedSourcePackagesDirPath ../build/SourcePackages \
+            -skipPackagePluginValidation \
+            -resultBundlePath ../build/NibKitTests.xcresult 2>&1 | tee ../build/package-tests.log
+
+      - name: Save DerivedData (main only; feature branches restore it)
+        if: (success() || failure()) && github.ref == 'refs/heads/main' && steps.dd.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/DerivedData
+          key: ${{ steps.dd.outputs.cache-primary-key }}
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            build/*.log
+            build/*.xcresult
+
+  ipa:
+    # Independent of `test`, so an IPA is produced even when tests fail. The archive compiles the app.
+    if: ${{ !startsWith(github.ref, 'refs/heads/feat/') }}
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26.6
+        run: |
+          if [ ! -d "$XCODE" ]; then echo "::error::$XCODE missing; update env.XCODE"; exit 1; fi
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: build/SourcePackages
+          key: spm-${{ hashFiles('NibKit/Package.swift') }}
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate icons and project
+        run: |
+          swift Scripts/make_icons.swift
+          xcodegen generate
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild archive -project Nib.xcodeproj -scheme Nib -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath build/Nib.xcarchive \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build/archive.log
+
+      - name: Package IPAs
+        run: |
+          set -e
+          rm -rf build/Payload && mkdir -p build/Payload
+          cp -R build/Nib.xcarchive/Products/Applications/Nib.app build/Payload/
+          APP=build/Payload/Nib.app
+          test -d "$APP/PlugIns/NibWidgets.appex" || { echo "::error::NibWidgets.appex missing from the IPA"; exit 1; }
+          # Ad-hoc sign with the entitlements (App Group) so sideloading tools that honour them can register the group.
+          for ext in "$APP"/PlugIns/*.appex; do
+            name=$(basename "$ext" .appex)
+            codesign --force --sign - --entitlements "$name/$name.entitlements" "$ext" || true
+          done
+          codesign --force --sign - --entitlements Nib/Nib.entitlements "$APP" || true
+          (cd build && zip -qry Nib-unsigned.ipa Payload)
+          rm -rf "$APP/PlugIns"
+          codesign --force --sign - --entitlements Nib/Nib.entitlements "$APP" || true
+          (cd build && zip -qry Nib-unsigned-noextensions.ipa Payload)
+
+      - name: Upload IPAs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nib-unsigned-ipa
+          path: |
+            build/Nib-unsigned.ipa
+            build/Nib-unsigned-noextensions.ipa
+
+      - name: Upload archive log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-log
+          path: build/archive.log

@@ -1,0 +1,1 @@
+// Scaffold placeholder, owned by F082 (Example plugins & plugin test fixtures). Replace this file.
