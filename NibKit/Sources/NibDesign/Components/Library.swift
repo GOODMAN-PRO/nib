@@ -1,4 +1,5 @@
 import SwiftUI
+import NibContracts
 
 /// A document in the library: cover (5 pt at the spine, 8 pt at the fore-edge), title, subtitle, type badge, and a
 /// check bead in select mode. Covers are cloth and paper, not water; inside a container give it

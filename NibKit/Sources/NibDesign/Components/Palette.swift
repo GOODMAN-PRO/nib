@@ -1,4 +1,5 @@
 import SwiftUI
+import NibContracts
 
 public struct NibTool: Identifiable, Hashable, Sendable {
     public let id: String

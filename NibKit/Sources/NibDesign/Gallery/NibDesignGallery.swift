@@ -1,4 +1,5 @@
 import SwiftUI
+import NibContracts
 
 /// Every component in its states on one static screen. NibTesting snapshots it in Light, Dark, Reduce Transparency,
 /// Increase Contrast and AX3; reviewers diff the snapshots. No ScrollView: droplets never live in scrolling content.
