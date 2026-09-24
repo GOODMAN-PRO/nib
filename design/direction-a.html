@@ -34,10 +34,10 @@ html[data-theme="light"]{
   --accent:#0066E0;--on-accent:#FFFFFF;--accent-wash:rgba(0,102,224,.10);
   --red:#FF3B30;--green:#34C759;
   /* water (the SVG filter reads these through flood-color) */
-  --w-body:rgba(255,255,255,.08);--w-edge:rgba(20,28,40,.15);--w-caustic:rgba(255,255,255,.36);
+  --w-body:rgba(255,255,255,.08);--w-edge:rgba(20,28,40,.15);--w-caustic:rgba(255,255,255,.3);
   --w-rim:rgba(255,255,255,.85);--w-line:rgba(0,0,0,.075);
   --b-body:rgba(255,255,255,.86);--b-edge:rgba(20,28,40,.15);--b-rim:rgba(255,255,255,1);--b-shadow:rgba(0,0,0,.16);
-  --lens-clear:rgba(255,255,255,.38);--lens-deep:rgba(249,249,251,.72);--rt-fill:#F4F4F6;
+  --lens-clear:rgba(255,255,255,.46);--lens-deep:rgba(249,249,251,.72);--rt-fill:#F4F4F6;
   --shadow-rest:0 .5px 1px rgba(0,0,0,.07),0 6px 16px -3px rgba(0,0,0,.11);
   --shadow-lift:0 1px 2px rgba(0,0,0,.06),0 18px 36px -8px rgba(0,0,0,.22);
   --cover-shadow:0 .5px 1px rgba(0,0,0,.10),0 3px 8px -2px rgba(0,0,0,.10);
@@ -55,7 +55,7 @@ html[data-theme="dark"]{
   --w-body:rgba(255,255,255,.035);--w-edge:rgba(255,255,255,.11);--w-caustic:rgba(255,255,255,.24);
   --w-rim:rgba(255,255,255,.58);--w-line:rgba(255,255,255,.14);
   --b-body:rgba(255,255,255,.22);--b-edge:rgba(255,255,255,.12);--b-rim:rgba(255,255,255,.7);--b-shadow:rgba(0,0,0,.45);
-  --lens-clear:rgba(22,22,24,.6);--lens-deep:rgba(30,30,32,.74);--rt-fill:#2C2C2E;
+  --lens-clear:rgba(22,22,24,.62);--lens-deep:rgba(30,30,32,.74);--rt-fill:#2C2C2E;
   --shadow-rest:0 .5px 1px rgba(0,0,0,.5),0 8px 20px -3px rgba(0,0,0,.55);
   --shadow-lift:0 1px 2px rgba(0,0,0,.5),0 20px 40px -8px rgba(0,0,0,.7);
   --cover-shadow:0 .5px 1px rgba(0,0,0,.6),0 3px 10px -2px rgba(0,0,0,.6);
@@ -235,7 +235,7 @@ html[data-theme="dark"] .seg button[aria-selected="true"]{background:#636366}
 .ai.done .applied{display:flex}
 .ai-compose{padding:12px 12px 12px}
 .field{display:flex;align-items:center;gap:4px;height:44px;padding:0 5px 0 4px;border-radius:22px;background:var(--fill-4);box-shadow:inset 0 0 0 .5px var(--sep-soft)}
-.field .ph{flex:1;font:400 15px/20px var(--font);color:var(--label-3);letter-spacing:-.012em;padding-left:2px}
+.field .ph{flex:1;min-width:0;font:400 15px/20px var(--font);color:var(--label-3);letter-spacing:-.012em;padding-left:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .field .icon-btn{width:34px;height:34px;color:var(--label-2)}
 .field .icon-btn .i{width:19px;height:19px}
 .send{width:32px;height:32px;border:0;border-radius:16px;background:var(--accent);color:#fff;display:grid;place-items:center;cursor:pointer}
@@ -633,7 +633,7 @@ class Scene {
   toLocal(e) { const r = this.screen.getBoundingClientRect(); return { x: (e.clientX - r.left) * this.W / r.width, y: (e.clientY - r.top) * this.H / r.height }; }
   wake() { this.awake = true; kick(); }
   bond(a, b, o = {}) {
-    const line = sv('line', { 'stroke-linecap': 'round', stroke: '#000' }); this.necks.appendChild(line);
+    const line = sv('line', { 'stroke-linecap': 'round', stroke: '#000' }); line.style.display = 'none'; this.necks.appendChild(line);
     const bd = { a, b, on: o.on ?? 12, off: o.off ?? 40, t0: o.t0 ?? 24, inset: o.inset ?? 6, state: 0, t: new Spring(0, 'neck'),
                  line, onJoin: o.onJoin, onBreak: o.onBreak, silent: !!o.silent, enabled: true };
     bd.t.eps = .05; this.bonds.push(bd); return bd;
@@ -719,6 +719,11 @@ class Drop {
       applyLensFilter(L);
     }
   }
+  live(on) {
+    this.lensLive = on; this.lastM = '';
+    if (!this.lens) return;
+    if (on) { this.lens.dataset.filter = this.o.lens === 'clear' ? 'saturate(1.7) brightness(1.04) blur(1.4px)' : ''; applyLensFilter(this.lens); }
+  }
   sizeContent() { this.el.style.width = this.cw + 'px'; this.el.style.height = this.ch + 'px'; }
   box() {
     const L = this.lift.x, w = this.pw.x * L, h = this.ph.x * L;
@@ -748,8 +753,14 @@ class Drop {
       this.mass.setAttribute('transform', `matrix(${M.map(v => v.toFixed(4)).join(' ')})`);
     }
     if (this.lens) {
-      const sx = w / this.lw, sy = h / this.lh;
-      this.lens.style.transform = css([M[0] * sx, M[1] * sx, M[2] * sy, M[3] * sy, M[4], M[5]]);
+      if (this.lensLive) {
+        // lens box follows the live geometry (morphs, buds): no url() map, just blur + tint
+        const st = this.lens.style; st.width = w.toFixed(1) + 'px'; st.height = h.toFixed(1) + 'px'; st.borderRadius = r.toFixed(1) + 'px';
+        st.transform = css(M);
+      } else {
+        const sx = w / this.lw, sy = h / this.lh;
+        this.lens.style.transform = css([M[0] * sx, M[1] * sx, M[2] * sy, M[3] * sy, M[4], M[5]]);
+      }
     }
     if (this.el) {
       const cw = this.followSize ? w : this.cw, ch = this.followSize ? h : this.ch;
@@ -766,7 +777,7 @@ class Drop {
 }
 function applyLensFilter(L) {
   const f = RT() ? '' : (L.dataset.filter || '');
-  L.style.backdropFilter = f; L.style.webkitBackdropFilter = f;
+  L.style.backdropFilter = f; L.style.webkitBackdropFilter = f;   // '' falls back to the class rule
 }
 
 /* Pointer → drag with velocity samples. Multi-touch protected; tap vs drag at 6 pt. */
@@ -823,7 +834,7 @@ function pageMarkup(uid, proposal) {
     <text x="102" y="234" font-size="19" fill="${INK.graphite}" transform="rotate(-.3 102 234)">acceleration is proportional to displacement, towards equilibrium</text>
     <text x="102" y="302" font-size="26">x = x₀ sin ωt</text>
     <text x="372" y="302" font-size="26">v = ±ω√(x₀² − x²)</text>
-    <text x="470" y="338" font-size="19" fill="${INK.vermilion}" transform="rotate(-2 470 338)">max at x = 0 !</text>
+    <text x="404" y="340" font-size="19" fill="${INK.vermilion}" transform="rotate(-2 404 340)">max at x = 0 !</text>
     <text x="102" y="404" font-size="25">Mass–spring:</text>
     <text class="wrong" x="300" y="405" font-size="27">T = 2π√(k/m)</text>
     <text x="102" y="438" font-size="25">Pendulum:</text>
@@ -846,7 +857,7 @@ function pageMarkup(uid, proposal) {
     <path d="${sine}" stroke="${INK.carbon}" stroke-width="2.5"/>
     <path d="M140 580 L 552 580" stroke="${INK.graphite}" stroke-width="1.4" stroke-dasharray="5 6"/>
     <path d="M142 724 L 342 724 M 142 716 L 142 732 M 342 716 L 342 732" stroke="${INK.cobalt}" stroke-width="1.8"/>
-    <path d="M466 330 C 452 322, 440 316, 432 310 M 432 310 l 3 9 M 432 310 l 9 -1" stroke="${INK.vermilion}" stroke-width="1.8"/>
+    <path d="M398 334 C 392 326, 391 320, 394 312 M 394 312 l -4 8 M 394 312 l 6 6" stroke="${INK.vermilion}" stroke-width="1.8"/>
     ${proposal ? `<path class="prop-strike" d="M298 396 L 470 394" stroke-width="2.6"/>` : ''}
   </g>
   ${proposal ? `<text class="hand prop-new" x="520" y="405" font-size="27">T = 2π√(m/k)</text>` : ''}
@@ -946,7 +957,7 @@ function Palette(scene, o) {
     if (or === P.orient) return;
     P.orient = or; morphing = true; box.setAttribute('aria-orientation', or === 'v' ? 'vertical' : 'horizontal');
     const d = dims(or); drop.pw.to = d.w; drop.ph.to = d.h;
-    if (drop.lens) drop.lens.style.opacity = 0;
+    drop.live(true);
     items.forEach((it, i) => { const p = loc(or, it.a); it.lx.to = p.x; it.ly.to = p.y; it.delay = RM() ? 0 : i * .012; });
   }
   function select(i, fromKeyboard) {
@@ -977,7 +988,7 @@ function Palette(scene, o) {
     if (!arrived && Math.abs(head.x - head.to) < 1.2) { arrived = true; if (!scrub) haptic('select'); }
     if (morphing && drop.pw.rest && drop.ph.rest && items.every(it => it.lx.rest && it.ly.rest)) {
       morphing = false; const d = dims(P.orient);
-      if (drop.lens) { drop.setLensBox(d.w, d.h, thick / 2); drop.lens.style.opacity = 1; drop.lastM = ''; }
+      if (drop.lens) { drop.live(false); drop.setLensBox(d.w, d.h, thick / 2); drop.lastM = ''; }
     }
     return busy || morphing;
   });
@@ -1073,12 +1084,13 @@ function Palette(scene, o) {
 function Popover(scene, pal, o) {
   const content = el('div', 'pop', o.html); content.setAttribute('role', 'dialog'); content.setAttribute('aria-label', o.label);
   const drop = new Drop(scene, { x: -200, y: -200, w: 34, h: 34, r: 17, lw: o.w, lh: o.h, lr: o.r, cw: o.w, ch: o.h, lens: 'deep', el: content, cap: .06, rigid: .15, visible: false, move: 'bud' });
-  drop.pw.use('budSize'); drop.ph.use('budSize');
+  drop.pw.use('budSize'); drop.ph.use('budSize'); drop.live(true);
   const S = { open: false, closing: false, t: 0 };
   let fadeT = 0;
   const bond = scene.bond(pal.drop, drop, { on: 11, off: 30, t0: 30, inset: 10, silent: true, onBreak: () => { if (S.open) { reveal(); haptic('bud'); } }, onJoin: () => { if (S.closing) haptic('merge'); } });
   function reveal() { clearTimeout(fadeT); content.classList.add('shown'); }
   function target() { return o.place(pal, S.tool); }
+  const RETRACT = [.3, .9];
   S.openAt = tool => {
     S.tool = tool; S.open = true; S.closing = false;
     const src = pal.toolWorld(tool), t = target();
@@ -1087,7 +1099,7 @@ function Popover(scene, pal, o) {
     content.classList.remove('shown');
     if (RM()) { drop.px.snap(t.x); drop.py.snap(t.y); drop.pw.snap(o.w); drop.ph.snap(o.h); drop.pr.snap(o.r); reveal(); }
     else {
-      drop.px.use('bud').to = t.x; drop.py.use('bud').to = t.y; drop.pw.to = o.w; drop.ph.to = o.h; drop.pr.to = o.r;
+      drop.px.use('bud').to = t.x; drop.py.use('bud').to = t.y; drop.pw.use('budSize').to = o.w; drop.ph.use('budSize').to = o.h; drop.pr.to = o.r;
       fadeT = setTimeout(reveal, 300);
     }
     content.style.pointerEvents = '';
@@ -1099,7 +1111,7 @@ function Popover(scene, pal, o) {
     const back = () => {
       const src = pal.toolWorld(S.tool);
       if (RM()) { drop.show(false); S.closing = false; return; }
-      drop.px.use('bud').to = src.x; drop.py.use('bud').to = src.y; drop.pw.to = 28; drop.ph.to = 28; drop.pr.to = 14; scene.wake();
+      drop.px.use(RETRACT).to = src.x; drop.py.use(RETRACT).to = src.y; drop.pw.use(RETRACT).to = 28; drop.ph.use(RETRACT).to = 28; drop.pr.to = 14; scene.wake();
     };
     setTimeout(back, RM() ? 120 : 70);
   };
@@ -1287,7 +1299,7 @@ function mountAssistant(scene, pal, pg, chrome) {
       <div class="applied" role="status"><span>${icon('check')} <b data-applied-text>Applied 2 changes</b></span><button data-undo>Undo</button></div>
     </div>
     <footer class="ai-compose">
-      <div class="field"><button class="icon-btn" aria-label="Add context">${icon('plus')}</button><span class="ph">Ask or tell Nib what to change…</span><button class="icon-btn" aria-label="Dictate">${icon('mic')}</button><button class="send" aria-label="Send">${icon('up')}</button></div>
+      <div class="field"><button class="icon-btn" aria-label="Add context">${icon('plus')}</button><span class="ph">Tell Nib what to change…</span><button class="icon-btn" aria-label="Dictate">${icon('mic')}</button><button class="send" aria-label="Send">${icon('up')}</button></div>
       <p class="usage">1,284 tokens this chat · sent only to your provider</p>
     </footer>`);
   const PX = 834, PY = 32, PW = 344, PH = 834 - 32 - 16;
@@ -1306,8 +1318,8 @@ function mountAssistant(scene, pal, pg, chrome) {
     newT.style.transformBox = 'fill-box';
     const nb = newT.getBBox();
     newT.dataset.dx = (wb.x - nb.x).toFixed(1);
-    const ax = R.x + (nb.x + nb.width + 14) * s, ay = R.y + (nb.y + nb.height * .62) * s;
-    rest = { x: ax - 70, y: ay - 13 - 6 - 20 };
+    const ax = R.x + (nb.x + nb.width / 2) * s, ay = R.y + (nb.y + 4) * s;
+    rest = { x: ax, y: ay - 13 - 7 - 20 };
     if (!anchor) {
       anchor = new Drop(scene, { x: ax, y: ay, w: 26, h: 26, r: 13, cap: .2 });
       chip = new Drop(scene, { x: rest.x, y: rest.y, w: 190, h: 40, r: 20, lens: 'clear', el: chipEl, cap: .16, rigid: .35, move: 'tether' });
@@ -1377,6 +1389,11 @@ function mountPhone(screen) {
   const sb = el('div', 'status', `<span>9:41</span><span class="r"><svg viewBox="0 0 18 12" width="18" height="12"><rect x="0" y="8" width="3" height="4" rx=".8" fill="currentColor"/><rect x="5" y="5.5" width="3" height="6.5" rx=".8" fill="currentColor"/><rect x="10" y="3" width="3" height="9" rx=".8" fill="currentColor"/><rect x="15" y="0" width="3" height="12" rx=".8" fill="currentColor"/></svg>${wifi()}${battery()}</span>`);
   screen.appendChild(sb); screen.appendChild(el('div', 'homebar'));
   const pg = mountPage(scene, { x: 12, y: 116, w: 369 });
+  // the next page, continuing below (vertical scrolling)
+  const rules = []; for (let y = 172; y <= 1066; y += 34) rules.push(`<line x1="0" x2="760" y1="${y}" y2="${y}"/>`);
+  const p2 = el('div', 'page', `<svg viewBox="0 0 760 1075" aria-hidden="true"><rect width="760" height="1075" fill="#fff"/><g stroke="#CFDBE8" stroke-width="1.1">${rules.join('')}</g><line x1="84" x2="84" y1="0" y2="1075" stroke="#EDB9B3" stroke-width="1.3"/><g class="hand" fill="${INK.carbon}"><text x="102" y="124" font-size="40">Damping</text><text x="102" y="200" font-size="25">amplitude decreases with time,</text><text x="102" y="234" font-size="25">energy is lost to the surroundings</text></g><path d="M102 140 C 180 136, 240 145, 300 139" stroke="${INK.cobalt}" stroke-width="2.6" fill="none" stroke-linecap="round"/></svg>`);
+  Object.assign(p2.style, { left: '12px', top: (116 + 522 + 14) + 'px', width: '369px', height: '522px' });
+  scene.scene.appendChild(p2);
   const tl = pill(scene, 16, 60, 212, 44, `<div class="pill-row"><button class="icon-btn" aria-label="Library">${icon('back')}</button><div class="doc-title" style="padding-right:14px"><div class="t1">Simple Harmonic Motion</div><div class="t2">Page 3 of 12</div></div></div>`);
   const tr = pill(scene, W - 16 - 128, 60, 128, 44, `<div class="pill-row"><button class="icon-btn" aria-label="Undo">${icon('undo')}</button><button class="icon-btn" aria-label="Assistant">${icon('drop')}</button><button class="icon-btn" aria-label="More">${icon('more')}</button></div>`);
   const tools = [TOOLS[0], TOOLS[1], TOOLS[2], TOOLS[3], TOOLS[6], ['more', 'More tools']];

@@ -137,7 +137,7 @@ kbd{font:500 11px/1 var(--mono);color:var(--t3);background:var(--kbd-bg);border:
 .vr{width:1px;height:20px;background:var(--line2);margin:0 6px;flex:none}
 
 /* quicksilver button: the primary action is a bead of mercury */
-.qs{display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 14px;border-radius:16px;
+.qs{white-space:nowrap;display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 14px;border-radius:16px;
   background:var(--qs-grad);color:var(--on-qs);font:600 14px/1 var(--sf);letter-spacing:-.01em;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.75),inset 0 -1px 1px rgba(0,0,0,.28),0 1px 2px rgba(0,0,0,.35),0 4px 10px -4px rgba(0,0,0,.5);
   transition:transform .18s var(--ease-out)}
@@ -145,7 +145,7 @@ kbd{font:500 11px/1 var(--mono);color:var(--t3);background:var(--kbd-bg);border:
 .qs:active{transform:scaleX(1.04) scaleY(.93)}
 .qs kbd{background:rgba(0,0,0,.08);border-color:rgba(0,0,0,.14);color:inherit;opacity:.7}
 [data-theme="light"] .qs kbd{background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.2)}
-.ghost-btn{display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 12px;border-radius:16px;color:var(--t1);
+.ghost-btn{white-space:nowrap;display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 12px;border-radius:16px;color:var(--t1);
   font:500 14px/1 var(--sf);background:var(--s3)}
 .ghost-btn:active{transform:scaleX(1.03) scaleY(.94)}
 
@@ -175,6 +175,7 @@ html.rt [data-theme] .glass{background:var(--s2)}
 .side-h{font:600 12px/1 var(--sf);color:var(--t3);padding:14px 10px 8px;letter-spacing:.01em}
 .row{position:relative;height:40px;display:flex;align-items:center;gap:12px;padding:0 10px;border-radius:10px;color:var(--t1);font-size:15px;cursor:default}
 .row .ic{color:var(--t2);width:20px;height:20px}
+.row .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .row .n{margin-left:auto;font:500 12px/1 var(--mono);color:var(--t3)}
 .row.sel{background:var(--s3)}
 .row.sel .ic{color:var(--t1)}
@@ -256,7 +257,7 @@ html.rt [data-theme] .glass{background:var(--s2)}
 .tab{height:30px;display:flex;align-items:center;gap:8px;padding:0 10px 0 12px;border-radius:9px;font-size:13px;color:var(--t2);max-width:210px;white-space:nowrap}
 .tab.on{background:var(--s3);color:var(--t1);font-weight:500}
 .tab .x{width:14px;height:14px;opacity:.55}
-.cmd{margin:0 auto;height:30px;width:260px;border-radius:9px;background:var(--s2);box-shadow:inset 0 0 0 1px var(--line);display:flex;align-items:center;gap:8px;padding:0 6px 0 10px;color:var(--t3);font-size:13px}
+.cmd{white-space:nowrap;overflow:hidden;margin:0 auto;height:30px;width:260px;border-radius:9px;background:var(--s2);box-shadow:inset 0 0 0 1px var(--line);display:flex;align-items:center;gap:8px;padding:0 6px 0 10px;color:var(--t3);font-size:13px}
 .cmd kbd{margin-left:auto}
 .ed-bar .grp{display:flex;align-items:center;gap:2px}
 .rec{width:7px;height:7px;border-radius:50%;background:var(--accent);position:absolute;right:6px;top:7px;box-shadow:0 0 0 2px var(--s1)}
@@ -344,15 +345,16 @@ html.rt [data-theme] .glass{background:var(--s2)}
 .mode{margin-left:auto;display:inline-flex;padding:2px;border-radius:9px;background:var(--s3)}
 .mode button{height:26px;padding:0 11px;border-radius:7px;font:500 13px/1 var(--sf);color:var(--t2)}
 .mode button[aria-pressed="true"]{background:var(--s1);color:var(--t1);box-shadow:0 1px 2px rgba(0,0,0,.3)}
-.ai-scroll{flex:1;overflow:hidden;padding:0 18px}
-.model{display:flex;align-items:center;gap:8px;font:500 11.5px/1 var(--mono);color:var(--t3);padding:2px 0 14px;border-bottom:1px solid var(--line)}
+.ai-ctx{flex:none;padding:0 18px 12px;border-bottom:1px solid var(--line)}
+.ai-scroll{flex:1;overflow:hidden;padding:0 18px 16px;display:flex;flex-direction:column;justify-content:flex-end}
+.model{display:flex;align-items:center;gap:8px;font:500 11.5px/1 var(--mono);color:var(--t3);padding:0 0 12px}
 .model i{width:6px;height:6px;border-radius:50%;background:var(--ok)}
 .model .sp{margin-left:auto;color:var(--t2)}
-.reads{display:flex;flex-wrap:wrap;gap:6px;padding:14px 0 4px}
-.reads .lbl{width:100%;font:600 12px/1 var(--sf);color:var(--t3);margin-bottom:4px}
+.reads{display:flex;align-items:center;gap:6px}
+.reads .lbl{font:600 12px/1 var(--sf);color:var(--t3);margin-right:4px}
 .tok{height:26px;display:inline-flex;align-items:center;gap:6px;padding:0 9px;border-radius:13px;background:var(--s3);font-size:12.5px;color:var(--t2)}
 .tok .ic{width:14px;height:14px;stroke-width:1.8}
-.turn{padding:18px 0 0}
+.turn{padding:16px 0 0}
 .who{font:500 11.5px/1 var(--mono);color:var(--t3);display:flex;gap:8px;margin-bottom:8px}
 .said{margin:0;font-size:15px;line-height:1.45;color:var(--t1)}
 .said.ai{color:var(--t2)}
@@ -372,7 +374,7 @@ html.rt [data-theme] .glass{background:var(--s2)}
 .chg .s{font-size:12px;color:var(--t3);margin-top:3px}
 .chg.off .t{color:var(--t3);text-decoration:line-through;text-decoration-color:var(--t4)}
 .cs-f{display:flex;align-items:center;gap:8px;padding:12px 14px 14px;border-top:1px solid var(--line)}
-.cs-f .note{font-size:12px;color:var(--t3);margin-right:auto;line-height:1.3}
+.cs-f .note{font-size:12px;color:var(--t3);margin-right:auto;line-height:1.3;white-space:nowrap}
 .cs.applied .chk,.cs.applied .cs-f .qs,.cs.applied .cs-f .ghost-btn{display:none}
 .cs .applied-line{display:none;align-items:center;gap:8px;font-size:13px;color:var(--t2)}
 .cs.applied .applied-line{display:flex}
@@ -420,7 +422,7 @@ html.rt [data-theme] .glass{background:var(--s2)}
 .swrow{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}
 .tokc{font:500 11px/1.35 var(--mono);color:var(--page-t2)}
 .tokc i{display:block;height:44px;border-radius:10px;margin-bottom:8px;box-shadow:inset 0 0 0 1px var(--page-line)}
-.tokc b{display:block;color:var(--page-t1);font-weight:500}
+.tokc b{display:block;color:var(--page-t1);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .inkrow{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:8px}
 .inkrow .tokc i{height:34px;border-radius:50%;width:34px}
 .type-sp{display:grid;gap:10px}
@@ -564,7 +566,7 @@ html.rm .tool .ic,html.rm .qs,html.rm .toast,html.rm .tgl i{transition-duration:
         <div class="row" data-drop><svg class="ic"><use href="#i-folder"/></svg><span class="nm">Past papers</span><span class="n">34</span><span class="plus">+1</span></div>
         <div class="row" data-drop><svg class="ic"><use href="#i-folder"/></svg><span class="nm">Chemistry 9701</span><span class="n">12</span><span class="plus">+1</span></div>
         <div class="row" data-drop><svg class="ic"><use href="#i-folder"/></svg><span class="nm">Maths 9709</span><span class="n">21</span><span class="plus">+1</span></div>
-        <div class="row" data-drop><svg class="ic"><use href="#i-folder"/></svg><span class="nm">Computer Science 9618</span><span class="n">9</span><span class="plus">+1</span></div>
+        <div class="row" data-drop><svg class="ic"><use href="#i-folder"/></svg><span class="nm">Computing 9618</span><span class="n">9</span><span class="plus">+1</span></div>
         <div class="row" data-drop><svg class="ic"><use href="#i-folder"/></svg><span class="nm">Personal</span><span class="n">6</span><span class="plus">+1</span></div>
       </nav>
       <div class="side-foot">
@@ -700,7 +702,7 @@ html.rm .tool .ic,html.rm .qs,html.rm .toast,html.rm .tgl i{transition-duration:
       <button class="back"><svg class="ic"><use href="#i-chev-l"/></svg>Physics</button>
       <button class="ib" aria-label="Page sidebar"><svg class="ic"><use href="#i-sidebar"/></svg></button>
       <div class="tabs"><span class="tab on">Kinematics &amp; Dynamics<svg class="ic x"><use href="#i-x"/></svg></span><span class="tab">Formula sheet</span></div>
-      <div class="cmd" style="width:220px"><svg class="ic xs"><use href="#i-search"/></svg>Search or run a command<kbd>⌘K</kbd></div>
+      <div class="cmd" style="width:200px"><svg class="ic xs"><use href="#i-search"/></svg>Run a command<kbd>⌘K</kbd></div>
       <div class="grp">
         <button class="ib" aria-label="Undo"><svg class="ic"><use href="#i-undo"/></svg></button>
         <button class="ib" aria-label="Redo" style="color:var(--t4)"><svg class="ic"><use href="#i-redo"/></svg></button>
@@ -753,32 +755,34 @@ html.rm .tool .ic,html.rm .qs,html.rm .toast,html.rm .tgl i{transition-duration:
         <span class="mode" role="group" aria-label="Mode"><button aria-pressed="false">Ask</button><button aria-pressed="true">Edit</button></span>
         <button class="ib" aria-label="Close assistant"><svg class="ic sm"><use href="#i-x"/></svg></button>
       </div>
-      <div class="ai-scroll">
+      <div class="ai-ctx">
         <div class="model"><i></i>Claude Sonnet 4.5 · your Anthropic key<span class="sp">⌘J</span></div>
         <div class="reads"><span class="lbl">Reading</span>
           <span class="tok"><svg class="ic"><use href="#i-page"/></svg>Page 3</span>
-          <span class="tok"><svg class="ic"><use href="#i-text"/></svg>Recognised handwriting</span>
+          <span class="tok"><svg class="ic"><use href="#i-text"/></svg>Handwriting</span>
           <span class="tok"><svg class="ic"><use href="#i-image"/></svg>Page image</span>
         </div>
+      </div>
+      <div class="ai-scroll">
         <div class="turn">
           <div class="who"><span>You</span><span>09:41</span></div>
           <p class="said">Add the missing SUVAT equation and label the graph axes with units. Match my handwriting.</p>
         </div>
         <div class="turn">
           <div class="who"><span>Assistant</span><span>09:41 · 4 s</span></div>
-          <p class="said ai">You have three of the four constant-acceleration equations. I drafted <b>v² = u² + 2as</b> under them, labelled both axes, and marked the definition you will want for Paper 2.</p>
+          <p class="said ai">Drafted <b>v² = u² + 2as</b> under your other three, labelled both axes with units, and marked the definition for Paper 2.</p>
           <div class="cs" id="ed2Cs">
             <div class="cs-h"><span id="ed2CsT">3 proposed changes</span><label>Preview on page<button class="tgl" role="switch" aria-checked="true" id="ed2Prev" aria-label="Preview on page"><i></i></button></label></div>
-            <div class="chg" data-i="1"><button class="chk" role="checkbox" aria-checked="true" aria-label="Include change 1"><svg class="ic"><use href="#i-check"/></svg></button><span class="nb">1</span><div><div class="t">Add equation (4): v² = u² + 2as</div><div class="s">Ink, 1 line · written in your hand</div></div></div>
-            <div class="chg" data-i="2"><button class="chk" role="checkbox" aria-checked="true" aria-label="Include change 2"><svg class="ic"><use href="#i-check"/></svg></button><span class="nb">2</span><div><div class="t">Label axes: v / m s⁻¹ and t / s</div><div class="s">Ink, 2 labels on the v–t graph</div></div></div>
-            <div class="chg" data-i="3"><button class="chk" role="checkbox" aria-checked="true" aria-label="Include change 3"><svg class="ic"><use href="#i-check"/></svg></button><span class="nb">3</span><div><div class="t">Highlight the definition of acceleration</div><div class="s">Highlighter, line 12</div></div></div>
-            <div class="cs-f"><span class="note">Applies as one undo step</span><span class="applied-line"><span class="ok"><svg class="ic xs" style="stroke-width:2.6"><use href="#i-check"/></svg></span><span id="ed2Done">Applied. Undo with ⌘Z.</span><button class="ghost-btn" id="ed2Reset" style="height:28px;margin-left:6px">Reset demo</button></span><button class="ghost-btn" data-act="discard">Discard<kbd>esc</kbd></button><button class="qs" data-act="accept">Accept 3<kbd>⏎</kbd></button></div>
+            <div class="chg" data-i="1"><button class="chk" role="checkbox" aria-checked="true" aria-label="Include change 1"><svg class="ic"><use href="#i-check"/></svg></button><span class="nb">1</span><div><div class="t">Add equation (4): v² = u² + 2as</div><div class="s">Ink, 1 line · in your handwriting</div></div></div>
+            <div class="chg" data-i="2"><button class="chk" role="checkbox" aria-checked="true" aria-label="Include change 2"><svg class="ic"><use href="#i-check"/></svg></button><span class="nb">2</span><div><div class="t">Label axes v / m s⁻¹ and t / s</div><div class="s">Ink, 2 labels on the v–t graph</div></div></div>
+            <div class="chg" data-i="3"><button class="chk" role="checkbox" aria-checked="true" aria-label="Include change 3"><svg class="ic"><use href="#i-check"/></svg></button><span class="nb">3</span><div><div class="t">Highlight the definition</div><div class="s">Highlighter, line 12</div></div></div>
+            <div class="cs-f"><span class="note">One undo step</span><span class="applied-line"><span class="ok"><svg class="ic xs" style="stroke-width:2.6"><use href="#i-check"/></svg></span><span id="ed2Done">Applied. Undo with ⌘Z.</span><button class="ghost-btn" id="ed2Reset" style="height:28px;margin-left:6px">Reset demo</button></span><button class="ghost-btn" data-act="discard">Discard</button><button class="qs" data-act="accept">Accept 3<kbd>⏎</kbd></button></div>
           </div>
         </div>
       </div>
       <div class="composer">
-        <div class="qa"><button>Summarise page</button><button>Quiz me</button><button>Convert to text</button><button>Check working</button></div>
-        <label class="field"><input placeholder="Ask about this page, or say what to change" aria-label="Message the assistant"><button class="ib" style="width:32px;height:32px" aria-label="Attach selection"><svg class="ic sm"><use href="#i-select"/></svg></button><button class="send" aria-label="Send"><svg class="ic"><use href="#i-up"/></svg></button></label>
+        <div class="qa"><button>Summarise</button><button>Quiz me</button><button>Convert to text</button><button>Explain</button></div>
+        <label class="field"><input placeholder="Ask, or say what to change" aria-label="Message the assistant"><button class="ib" style="width:32px;height:32px" aria-label="Attach selection"><svg class="ic sm"><use href="#i-select"/></svg></button><button class="send" aria-label="Send"><svg class="ic"><use href="#i-up"/></svg></button></label>
       </div>
     </aside>
   </div></div></div>
@@ -969,7 +973,7 @@ const M = {
   wobble:    spring(.26, .42),   // shape (surface tension): ~3.8 Hz, one overshoot
   beadLead:  spring(.22, .80),
   beadTrail: spring(.30, .95),
-  bud:       spring(.32, .78),   // popover buds off its button
+  bud:       spring(.38, .80),   // popover buds off its button
   absorb:    spring(.22, 1.0),   // merge back in, close
   tether:    spring(.28, .70),
   cardHome:  spring(.38, .82),
@@ -1005,15 +1009,15 @@ class Deform {
   }
   step(dt) { this.a.step(dt); this.b.step(dt); }
   rest() { return this.a.rest(.0015) && this.b.rest(.0015); }
-  m(scale = 1) {
-    const a = this.a.x, b = this.b.x, s = Math.hypot(a, b);
+  m(scale = 1, gain = 1) {
+    const a = this.a.x * gain, b = this.b.x * gain, s = Math.hypot(a, b);
     if (s < 1e-5) return [scale, 0, 0, scale];
     const ph = Math.atan2(b, a) / 2, c = Math.cos(ph), si = Math.sin(ph), e = Math.exp(s), ei = 1 / e;
     const m11 = c * c * e + si * si * ei, m12 = c * si * (e - ei), m22 = si * si * e + c * c * ei;
     return [m11 * scale, m12 * scale, m12 * scale, m22 * scale];
   }
-  css(scale = 1) { const m = this.m(scale); return `matrix(${m[0]},${m[1]},${m[2]},${m[3]},0,0)`; }
-  svg(scale = 1) { const m = this.m(scale); return `matrix(${m[0]} ${m[1]} ${m[2]} ${m[3]} 0 0)`; }
+  css(scale = 1, gain = 1) { const m = this.m(scale, gain); return `matrix(${m[0]},${m[1]},${m[2]},${m[3]},0,0)`; }
+  svg(scale = 1, gain = 1) { const m = this.m(scale, gain); return `matrix(${m[0]} ${m[1]} ${m[2]} ${m[3]} 0 0)`; }
 }
 class Vel {
   constructor() { this.vx = this.vy = 0; this.x = this.y = 0; this.t = 0; }
@@ -1268,14 +1272,14 @@ class PenPopover {
     const x = dir > 0 ? W + 14 : -14 - w;
     const gy = clamp(pal.py.to + ay - 46, pal.o.top + 8, pal.o.bottom - 12 - h), y = gy - pal.py.to;
     const bx = dir > 0 ? x + 22 : x + w - 22, by = clamp(ay, y + 22, y + h - 22);
-    const q1 = sstep(0, .36, p), e = clamp((p - .2) / .8, 0, 1.04);
-    const budX = lerp(ax, bx, q1), budY = lerp(ay, by, q1), budR = Math.max(0, (8 + 14 * q1) * (1 - sstep(.3, .52, p)));
+    const q1 = sstep(0, .5, p), e = clamp((p - .3) / .7, 0, 1.04);
+    const budX = lerp(ax, bx, q1), budY = lerp(ay, by, q1), budR = Math.max(0, (9 + 13 * q1) * (1 - sstep(.42, .62, p)));
     return { ax, ay, x, y, w, h, dir, budX, budY, budR, e,
-      rx: lerp(bx - 22, x, e), ry: lerp(by - 22, y, e), rw: lerp(44, w, e), rh: lerp(44, h, e), lw: Math.max(0, 16 * (1 - p / .5)) };
+      rx: lerp(bx - 22, x, e), ry: lerp(by - 22, y, e), rw: lerp(44, w, e), rh: lerp(44, h, e), lw: Math.max(0, 18 * (1 - p / .6)) };
   }
   frame(dt) {
     const before = this.p.x; this.p.step(dt); const p = this.p.x;
-    if (before < .5 && p >= .5) haptic('split');              // the neck pinches off
+    if (before < .6 && p >= .6) haptic('split');              // the neck pinches off
     if (!this.open && before > .03 && p <= .03) haptic('plip'); // re-absorbed into the palette
     this.render(p);
     return !this.p.rest(.002);
@@ -1289,8 +1293,10 @@ class PenPopover {
     for (const n of [this.glass, this.edge]) Object.assign(n.style, { left: g.rx + 'px', top: g.ry + 'px', width: g.rw + 'px', height: g.rh + 'px', opacity: ga, display: g.e > 0 ? '' : 'none' });
     const settled = this.open && Math.abs(p - 1) < .01;
     if (settled !== this.lensOn) { this.lensOn = settled; this.glass._lens = settled ? this.lensId : null; paintGlass(this.glass); }
-    const o = sstep(.55, .92, p);
-    Object.assign(this.el.style, { left: g.x + 'px', top: g.y + 'px', opacity: o, visibility: o > .01 ? 'visible' : 'hidden', transform: `scale(${.97 + .03 * o})` });
+    const o = sstep(.55, .9, p);
+    const ci = [g.ry - g.y, g.x + g.w - g.rx - g.rw, g.y + g.h - g.ry - g.rh, g.rx - g.x].map(v => Math.max(0, v).toFixed(1));
+    Object.assign(this.el.style, { left: g.x + 'px', top: g.y + 'px', opacity: o, visibility: o > .01 ? 'visible' : 'hidden', transform: `scale(${.97 + .03 * o})`,
+      clipPath: g.e >= 1 ? '' : `inset(${ci[0]}px ${ci[1]}px ${ci[2]}px ${ci[3]}px round 22px)` });   // the droplet fills with content
     this.el.classList.toggle('flip', g.dir < 0);
     pal.goo.box(0, 0, pal.W, pal.H);
     if (vis) pal.goo.box(Math.min(g.rx, g.budX - g.budR, g.ax), Math.min(g.ry, g.budY - g.budR), Math.max(g.rx + g.rw, g.budX + g.budR, g.ax), Math.max(g.ry + g.rh, g.budY + g.budR));
@@ -1357,7 +1363,8 @@ class Slider {
 /* =====================================================================
    LIBRARY: cards lift into droplets, reach for targets, merge or spring home
    ===================================================================== */
-const REACH = 72, ARM = 24;
+const SIDE = 272;
+const ptRect = (P, r) => Math.hypot(Math.max(r.x - P[0], 0, P[0] - (r.x + r.w)), Math.max(r.y - P[1], 0, P[1] - (r.y + r.h)));
 function edgeDist(A, B) {
   const dx = Math.max(0, B.x - (A.x + A.w), A.x - (B.x + B.w)), dy = Math.max(0, B.y - (A.y + A.h), A.y - (B.y + B.h));
   return Math.hypot(dx, dy);
@@ -1404,8 +1411,8 @@ class Library {
     Object.assign(card.style, { width: r.w + 'px', left: '0px', top: '0px' });
     this.layer.appendChild(card);
     const d = this.d = { card, ph, cw: rc.w, ch: rc.h, gx: lx - r.x, gy: ly - r.y, home: r, phase: 'drag',
-      x: new Sp(M.cardHome, r.x), y: new Sp(M.cardHome, r.y), lift: new Sp(M.settle, 1), def: new Deform(.08), vel: new Vel(),
-      target: null, reach: 0, rs: 0, armed: false };
+      x: new Sp(M.cardHome, r.x), y: new Sp(M.cardHome, r.y), lift: new Sp(M.settle, 1), def: new Deform(.12), vel: new Vel(),
+      target: null, reach: 0, rs: 0, armed: false, tilt: new Sp(M.wobble, 0) };
     d.lift.to = 1.045; d.vel.reset(lx, ly);
     card.style.transformOrigin = `${d.gx}px ${d.gy}px`;
     this.targets = [
@@ -1436,23 +1443,29 @@ class Library {
     const d = this.d; if (!d) return busy;
     if (d.phase === 'drag') { d.vel.decay(dt); d.def.target(d.vel.vx, d.vel.vy); }
     else { d.x.step(dt); d.y.step(dt); d.def.target(d.x.v, d.y.v); }
+    const P = [d.x.x + d.gx, d.y.x + d.gy], inSide = P[0] < SIDE;
+    if (d.phase === 'drag') d.lift.to = inSide ? .5 : 1.045;    // over the sidebar the card condenses into a droplet
     d.lift.step(dt); d.def.step(dt);
-    const A = { x: d.x.x, y: d.y.x, w: d.cw, h: d.ch };
+    d.tilt.to = ST.rm ? 0 : clamp((d.phase === 'drag' ? d.vel.vx : d.x.v) / 1400, -1, 1) * 3; d.tilt.step(dt);
+    const sc = d.lift.x, A = { x: P[0] - d.gx * sc, y: P[1] - d.gy * sc, w: d.cw * sc, h: d.ch * sc };
     if (d.phase === 'drag') {
-      let best = null, bd = 1e9; for (const t of this.targets) { const dd = edgeDist(A, t.r); if (dd < bd) { bd = dd; best = t; } }
-      if (best && bd < REACH) {
+      let best = null, bd = 1e9;
+      for (const t of this.targets) { if ((t.kind === 'folder') !== inSide) continue; const dd = ptRect(P, t.r); if (dd < bd) { bd = dd; best = t; } }
+      const R = inSide ? 64 : 40;
+      if (best && bd < R) {
         if (d.target !== best) this.setTarget(best);
-        d.reach = 1 - bd / REACH;
-        const armed = bd < ARM; if (armed !== d.armed) { d.armed = armed; best.el.classList.toggle('armed', armed); if (armed) haptic('tick'); }
+        d.reach = 1 - bd / R;
+        const r = best.r, inner = P[0] > r.x + r.w * .15 && P[0] < r.x + r.w * .85 && P[1] > r.y + r.h * .15 && P[1] < r.y + r.h * .85;
+        const armed = inSide ? bd < 2 : inner;
+        if (armed !== d.armed) { d.armed = armed; best.el.classList.toggle('armed', armed); if (armed) haptic('tick'); }
       } else if (d.target) this.setTarget(null);
     }
     const want = d.target ? (d.phase === 'drag' ? d.reach : (d.onRest && d.lift.to < 1 ? 1 : 0)) : 0;
     d.rs += (want - d.rs) * (1 - Math.exp(-dt * 20));
-    // card + its liquid skin share one transform
-    const sc = d.lift.x;
-    d.card.style.transform = `translate(${d.x.x}px,${d.y.x}px) ${d.def.css(sc)}`;
+    // the card rides in a liquid skin: skin takes the full strain, the card a third of it plus a small tilt
+    d.card.style.transform = `translate(${d.x.x}px,${d.y.x}px) rotate(${d.tilt.x}deg) ${d.def.css(sc, .3)}`;
     d.card.style.opacity = d.lift.to < 1 ? sstep(.1, .45, sc) : '';
-    setA(this.skinG, { transform: `translate(${d.x.x} ${d.y.x}) translate(${d.gx} ${d.gy}) ${d.def.svg(sc)} translate(${-d.gx} ${-d.gy})` });
+    setA(this.skinG, { transform: `translate(${d.x.x} ${d.y.x}) translate(${d.gx} ${d.gy}) rotate(${d.tilt.x}) ${d.def.svg(sc)} translate(${-d.gx} ${-d.gy})` });
     setA(this.skin, { x: -6, y: -6, width: d.cw + 12, height: d.ch + 12, rx: 13 });
     const pad = 40 + 60 * Math.abs(sc - 1);
     this.goo.box(A.x - pad, A.y - pad, A.x + A.w + pad, A.y + A.h + pad);
@@ -1466,7 +1479,7 @@ class Library {
       this.goo.box(r.x - 12, r.y - 12, r.x + r.w + 12, r.y + r.h + 12);
     } else { setA(this.tskin, { width: 0, height: 0 }); setA(this.lig, { 'stroke-width': 0 }); }
     this.goo.commit();
-    const moving = d.phase === 'drag' || !d.x.rest(.3) || !d.y.rest(.3) || !d.lift.rest(.002) || !d.def.rest();
+    const moving = d.phase === 'drag' || !d.x.rest(.3) || !d.y.rest(.3) || !d.lift.rest(.002) || !d.def.rest() || !d.tilt.rest(.05);
     if (!moving && d.onRest) { const f = d.onRest; d.onRest = null; f(); }
     return true;
   }
@@ -1529,7 +1542,7 @@ class Tether {
     const o = rectIn($('.prop[data-i="1"]', s), s);
     this.A = [o.x + o.w, o.y + o.h / 2];
     Object.assign(this.dot.style, { left: this.A[0] + 'px', top: this.A[1] + 'px' });
-    this.D = [this.A[0] + 28, this.A[1] - this.H / 2];
+    this.D = [this.A[0] + 26, this.A[1] - this.H / 2 + 9];
     this.x = new Sp(M.tether, this.D[0]); this.y = new Sp(M.tether, this.D[1]); this.sc = new Sp(M.absorb, 1); this.ar = new Sp(M.absorb, 8);
     this.def = new Deform(.12); this.vel = new Vel(); this.attached = true; this.g0 = [this.W / 2, this.H / 2];
     this.satP = null;

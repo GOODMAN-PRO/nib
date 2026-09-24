@@ -887,10 +887,20 @@ class Drop {
       Math.abs(this.sw.x - this.sw.t) + Math.abs(this.sh.x - this.sh.t) > 1e-4 || Math.abs(this.sw.v) + Math.abs(this.sh.v) > 1e-3;
   }
   render() {
-    const s = Math.min(Math.hypot(this.Sx, this.Sy), .6), th = Math.atan2(this.Sy, this.Sx) / 2;
+    // long chrome (palette, chips) deforms only along its own axes: no shear, never reads as jelly
+    const axis = Math.max(this.w / this.h, this.h / this.w) > 3;
+    const s = axis ? clamp(this.Sx, -.6, .6) : Math.min(Math.hypot(this.Sx, this.Sy), .6), th = axis ? 0 : Math.atan2(this.Sy, this.Sx) / 2;
     const sw = this.sw.x, sh = this.sh.x;
     const T = (k, w, h) => { const a = 1 + s * k, b = 1 / a;
       return `translate3d(${(this.x - w / 2).toFixed(2)}px,${(this.y - h / 2).toFixed(2)}px,0) rotate(${th.toFixed(4)}rad) scale(${a.toFixed(4)},${b.toFixed(4)}) rotate(${(-th).toFixed(4)}rad) scale(${sw.toFixed(4)},${sh.toFixed(4)})`; };
+    // while a droplet is scaled (bud, reabsorb, press) its corners stay round: small droplets are circles
+    if (Math.abs(sw - 1) > .002 || Math.abs(sh - 1) > .002 || this._rr) {
+      const vmin = Math.min(this.w * sw, this.h * sh), f = 1 - clamp((Math.min(sw, sh) - .2) / .8, 0, 1);
+      const rv = Math.min(vmin / 2, this.r + (vmin / 2 - this.r) * f);
+      if (this.lens) this.lens.style.borderRadius = `${(rv / sw).toFixed(2)}px / ${(rv / sh).toFixed(2)}px`;
+      if (this.blob) { const rb = Math.max(rv - DELTA, 0); this.blob.style.borderRadius = `${(rb / sw).toFixed(2)}px / ${(rb / sh).toFixed(2)}px`; }
+      this._rr = Math.abs(sw - 1) > .002 || Math.abs(sh - 1) > .002;
+    }
     if (this.lens) this.lens.style.transform = T(1, this.w, this.h);
     if (this.blob) this.blob.style.transform = T(1, this.w - 2 * DELTA, this.h - 2 * DELTA);
     if (this.el) this.el.style.transform = T(this.follow, this.w, this.h);
@@ -920,9 +930,10 @@ function geometry(a, b, p) {
   return { ax, ay, bx, by, gap, ang };
 }
 function stepPairs(S, dt) {
-  const D = S.drops.filter(d => d.mergeable && d.visible);
+  const D = S.drops.filter(d => d.visible);
   for (let i = 0; i < D.length; i++) for (let j = i + 1; j < D.length; j++) {
     const a = D[i], b = D[j];
+    if (!(a.mergeable && b.mergeable)) { const q = S.pairs.get(Math.min(a.id, b.id) + ':' + Math.max(a.id, b.id)); if (!q || (!q.script && q.t.x < .3)) { if (q && q.el) { q.el.remove(); q.el = null; } continue; } }
     const A = a.rect(), B = b.rect();
     if (A.r + 80 < B.l || B.r + 80 < A.l || A.b + 80 < B.t || B.b + 80 < A.t) { const p = S.pairs.get(Math.min(a.id, b.id) + ':' + Math.max(a.id, b.id)); if (!p || (!p.merged && p.t.x < .3)) continue; }
     const p = pairOf(S, a, b), g = geometry(a, b, p);
@@ -1008,7 +1019,7 @@ addEventListener('click', e => { if (justDragged) { e.stopPropagation(); e.preve
 function begin(P, p) {
   const d = P.obj;
   if (P.kind === 'drop') {
-    d.gx = p.x - d.x; d.gy = p.y - d.y; d.mode = 'drag'; d.px = d.x; d.py = d.y; d.press(true); haptic(P.S, 'lift');
+    d.gx = P.x0 - d.x; d.gy = P.y0 - d.y; d.mode = 'drag'; d.px = d.x; d.py = d.y; d.press(true); haptic(P.S, 'lift');
     d.onBegin && d.onBegin(); wake();
   } else if (P.kind === 'bead') { d.dragging = true; d.dragX = p.x; wake(); }
   else if (P.kind === 'card') beginCard(P, p);
@@ -1142,7 +1153,7 @@ function selectTool(S, pal, tool, fromBead) {
 
 /* ---------------------------------------------------------------- bud-off popover */
 function penX(pal) { const t = pal.bead.tools.find(t => t.dataset.tool === pal.screen.tool) || pal.bead.tools[1]; return pal.x - pal.w / 2 + 8 + t.offsetLeft + t.offsetWidth / 2; }
-function popHome(pal, pop) { const px = penX(pal); const x = clamp(px + pop.w / 2 - 70, pop.w / 2 + 12, pal.screen.el.offsetWidth - pop.w / 2 - 12);
+function popHome(pal, pop) { const px = penX(pal); const x = clamp(px + pop.w / 2 - 56, pop.w / 2 + 12, pal.screen.el.offsetWidth - pop.w / 2 - 12);
   const below = pal.y < pal.screen.el.offsetHeight / 2; return { x, y: below ? pal.y + pal.h / 2 + 18 + pop.h / 2 : pal.y - pal.h / 2 - 18 - pop.h / 2, below }; }
 function togglePop(S, pal, pop) { pop.open ? closePop(S, pal, pop) : openPop(S, pal, pop); }
 function openPop(S, pal, pop) {
@@ -1263,7 +1274,7 @@ document.querySelectorAll('.screen').forEach(el => {
   }
   const pop = S.byName('penpop');
   if (pop) {
-    pop.open = true;
+    pop.open = true; pop.mergeable = false;
     pop.el.querySelectorAll('.inks button').forEach(b => b.addEventListener('click', () => { setInk(S, pal, b.dataset.ink, b); haptic(S, 'detent'); }));
     pop.el.querySelectorAll('.switch').forEach(b => bindSwitch(b));
     const h = popHome(pal, pop); pop.x = pop.tx = h.x; pop.y = pop.ty = h.y; pop.render();
@@ -1315,7 +1326,7 @@ document.querySelectorAll('.screen').forEach(el => {
     const clone = thumb.cloneNode(true); Object.assign(clone.style, { position: 'absolute', left: M + 'px', top: M + 'px', width: r.w + 'px', height: r.h + 'px' });
     wrap.appendChild(clone);
     const d = new Drop(S, { el: wrap, name: 'card', x: r.x + r.w / 2, y: r.y + r.h / 2, w: r.w + 2 * M, h: r.h + 2 * M, r: 18, cap: .09, follow: .7, vRef: 1100 });
-    d.gx = p.x - d.x; d.gy = p.y - d.y; d.mode = 'drag'; d.px = d.x; d.py = d.y; d.press(true);
+    d.gx = P.x0 - d.x; d.gy = P.y0 - d.y; d.mode = 'drag'; d.px = d.x; d.py = d.y; d.press(true);
     d.home = { x: d.x, y: d.y }; d.item = item; d.target = null; P.drop = d;
     item.classList.add('dragging-src'); haptic(S, 'lift');
     d.onMerge = (o, on) => { const f = folders.find(f => f.drop === o); if (!f) return; f.t.classList.toggle('target', on); d.target = on ? f : (d.target === f ? null : d.target); };
@@ -1429,6 +1440,7 @@ function fit() {
 }
 addEventListener('resize', fit); fit();
 
+window.__nib = { screens, cfg };   // review hook
 /* ---------------------------------------------------------------- scripted states for review screenshots (?demo=…) */
 const demo = new URLSearchParams(location.search).get('demo');
 if (demo === 'merge') { const S = screens.find(s => s.name === 'editor'), pal = S.byName('palette'), pop = S.byName('penpop');

@@ -92,7 +92,10 @@ public enum Fixtures {
         let content = DocumentContent(meta: meta, pages: [p1, p2, p3], outline: [outline], audio: [clip])
 
         let z = FractionalIndex.sequence(after: nil, count: 10)
-        let pts = (0..<20).map { i in StrokePoint(x: Float(72 + i * 4), y: Float(120 + (i % 5)), t: Float(i) * 0.01) }
+        let pts: [StrokePoint] = (0..<20).map { (i: Int) -> StrokePoint in
+            let x = Float(72 + i * 4), y = Float(120 + i % 5), t = Float(i) * 0.01
+            return StrokePoint(x: x, y: y, t: t)
+        }
         let tapePts = [StrokePoint(x: 80, y: 600, width: 18, height: 18), StrokePoint(x: 260, y: 600, width: 18, height: 18)]
         let box = DisplayList(ops: [DisplayOp(op: .rect, rect: Rect(x: 0, y: 0, width: 100, height: 50), stroke: .black)])
         let items: [Item] = [
