@@ -182,16 +182,25 @@ final class NibTemplatesTests: XCTestCase {
         XCTAssertTrue(outside.contains("item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01"))   // x 400–540 on a 419 pt page
         XCTAssertFalse(outside.contains("item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"))
         XCTAssertNotNil(r["warning"]?.stringValue)
+        XCTAssertEqual(r["outsideCount"]?.intValue, outside.count)
+        XCTAssertEqual(r["count"]?.intValue, 1)
+        XCTAssertNil(r["truncated"])
         XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).count, 10)
 
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(try h.snapshot(), before)
         XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
         XCTAssertEqual(try page(h, Fixtures.page1).size, PageSize.a5)
+        // Growing a page cannot push anything outside, so nothing is checked.
+        let grown = try await h.run("page.setTemplate", json(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": "builtin.grid", "size": "A3"}"#))
+        XCTAssertEqual(grown["outside"]?.arrayValue ?? [], [])
+        XCTAssertEqual(grown["outsideCount"]?.intValue, 0)
+        XCTAssertNil(grown["warning"]?.stringValue)
     }
 
     func testSizesAndOrientation() async throws {
         let h = harness()
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
         _ = try await h.run("page.setTemplate", json(
             #"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "builtin.dots", "size": "Standard", "landscape": true}"#))
         XCTAssertEqual(try page(h, Fixtures.page2).size, PageSize.standardLandscape)
@@ -199,6 +208,8 @@ final class NibTemplatesTests: XCTestCase {
         XCTAssertEqual(try page(h, Fixtures.page2).size, PageSize.standard)
         _ = try await h.run("page.setTemplate", json(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "builtin.dots", "size": [500, 300]}"#))
         XCTAssertEqual(try page(h, Fixtures.page2).size, PageSize(500, 300))
+        // Page 2 is not on screen: the shrink check drops it from the item cache again; it reloads unchanged.
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2), items)
 
         XCTAssertEqual(TemplateCommands.oriented(.a4, landscape: true), PageSize.a4.rotated)
         XCTAssertEqual(TemplateCommands.oriented(.square, landscape: true), PageSize.square)
@@ -221,6 +232,7 @@ final class NibTemplatesTests: XCTestCase {
 
         let r = try await h.run("page.setTemplate", json(#"{"pages": ["doc:FIXTUREDOC01"], "template": "builtin.grid"}"#))
         XCTAssertEqual(r["pages"]?.arrayValue?.count, 2)
+        XCTAssertEqual(r["count"]?.intValue, 2)
         XCTAssertEqual(try page(h, Fixtures.page1).background.template?.id, "cover.kraft")
         XCTAssertEqual(try page(h, Fixtures.page2).background.template?.id, "builtin.grid")
         XCTAssertEqual(try page(h, Fixtures.pdfPage).background.template?.id, "builtin.grid")
@@ -233,6 +245,14 @@ final class NibTemplatesTests: XCTestCase {
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertTrue(try h.app.workspace.content(Fixtures.docID).meta.coverEnabled)
         XCTAssertEqual(try page(h, Fixtures.page1).background.template?.id, "cover.kraft")
+
+        // page.setBackground with a paper template clears the flag too; a flat colour may be a custom cover and keeps it.
+        _ = try await h.run("page.setBackground", json(
+            #"{"pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "background": {"kind": "template", "template": {"id": "builtin.ruled"}}}"#))
+        XCTAssertFalse(try h.app.workspace.content(Fixtures.docID).meta.coverEnabled)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        _ = try await h.run("page.setBackground", json(##"{"pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "background": {"kind": "color", "color": "#FDF6DC"}}"##))
+        XCTAssertTrue(try h.app.workspace.content(Fixtures.docID).meta.coverEnabled)
     }
 
     func testParamsCarryOverAndDatedTemplatesAreStamped() async throws {
@@ -248,9 +268,17 @@ final class NibTemplatesTests: XCTestCase {
         XCTAssertEqual(params["paper"], .string(RGBA.paperDark.hex))   // the paper colour follows the page
         XCTAssertNil(params["spacing"])
         XCTAssertNil(p.zoomReturnHeight)
-        let now = Calendar.current.dateComponents([.year, .month], from: Date())
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = .current
+        let now = gregorian.dateComponents([.year, .month], from: Date())
         XCTAssertEqual(params["month"]?.intValue, now.month)
         XCTAssertEqual(params["year"]?.intValue, now.year)
+        // A Buddhist device calendar (th_TH default, year 2569) still stamps the Gregorian month the planner draws.
+        var stamped: [String: JSONValue] = [:]
+        TemplateCommands.stampDates(&stamped, def: PlannerTemplates.monthly, now: Date(timeIntervalSince1970: 1_789_473_600),
+                                    device: Calendar(identifier: .buddhist))   // 2026-09-15 12:00 UTC
+        XCTAssertEqual(stamped["year"]?.intValue, 2026)
+        XCTAssertEqual(stamped["month"]?.intValue, 9)
 
         // null resets a param to its default.
         _ = try await h.run("page.setTemplate", json(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "builtin.plannerMonthly", "params": {"paper": null}}"#))
@@ -282,6 +310,11 @@ final class NibTemplatesTests: XCTestCase {
 
         await assertFails(h, "page.setBackground",
                           #"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "background": {"kind": "image", "asset": "missing.png"}}"#, .notFound)
+        // Asset names are plain file names: no path into another document.
+        await assertFails(h, "page.setBackground",
+                          #"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "background": {"kind": "image", "asset": "../FIXTUREDOC02/assets/fixture-image.png"}}"#, .invalidParams)
+        await assertFails(h, "page.setBackground",
+                          #"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "background": {"kind": "pdf", "asset": ".hidden.pdf"}}"#, .invalidParams)
         await assertFails(h, "page.setBackground",
                           #"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "background": {"kind": "pdf"}}"#, .invalidParams)
         await assertFails(h, "page.setBackground",

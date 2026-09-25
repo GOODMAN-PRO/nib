@@ -110,9 +110,13 @@ enum TemplateCommands {
     }
 
     /// Dated templates (month/year params) get the current month when the caller gave none, so the stored page is
-    /// fixed in time and the render stays pure.
-    static func stampDates(_ params: inout [String: JSONValue], def: TemplateDefinition, now: Date) {
-        let parts = Calendar.current.dateComponents([.year, .month], from: now)
+    /// fixed in time and the render stays pure. Always Gregorian, as `PlannerCalendar` renders: only the device
+    /// calendar's time zone is used (a Buddhist, Japanese or Hebrew device calendar would stamp a wrong year/month).
+    static func stampDates(_ params: inout [String: JSONValue], def: TemplateDefinition, now: Date,
+                           device: Calendar = .current) {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = device.timeZone
+        let parts = cal.dateComponents([.year, .month], from: now)
         if def.params.contains(where: { $0.name == "month" }), params["month"] == nil, let m = parts.month {
             params["month"] = .number(Double(m))
         }
@@ -154,8 +158,9 @@ enum TemplateCommands {
 
     /// Resolves `pages` (page refs, or doc:D for every live page) to page records. A document ref skips a cover page 1
     /// for papers and means page 1 alone for covers; covers are only allowed on page 1 of a notebook.
+    /// Resolved before `ctx.mutate` (same main-actor turn, no await in between), so the records are current.
     @MainActor
-    static func targets(_ refs: [String], tx: DocTransaction, cover: Bool,
+    static func targets(_ refs: [String], workspace: Workspace, cover: Bool,
                         registry: Registry<TemplateDefinition>) throws -> [Target] {
         guard !refs.isEmpty else { throw NibError.invalid("pages is empty", path: "$.pages") }
         var out: [Target] = []
@@ -168,7 +173,7 @@ enum TemplateCommands {
             let path = "$.pages[\(i)]"
             switch NodeRef(ref) {
             case let .page(doc, pid)?:
-                let content = try tx.content(doc)
+                let content = try workspace.content(doc)
                 guard let page = content.page(pid), !page.deleted else {
                     throw NibError(.notFound, "page \(pid) not found in document \(doc)", path: path,
                                    hint: "call query.get {\"ref\": \"doc:\(doc)\"} for its page refs")
@@ -176,7 +181,7 @@ enum TemplateCommands {
                 if firstPages[doc] == nil { firstPages[doc] = content.livePages.first?.id }
                 add(doc, page, first: firstPages[doc] == pid)
             case let .document(doc)?:
-                let live = try tx.content(doc).livePages
+                let live = try workspace.content(doc).livePages
                 for (n, page) in live.enumerated() {
                     if cover {
                         if n == 0 { add(doc, page, first: true) }
@@ -233,16 +238,44 @@ enum TemplateCommands {
         }
     }
 
-    /// Items that no longer fit inside a page of `size` (they are kept where they are).
+    /// Result ref lists stop here (`count` / `outsideCount` give the totals): an edit's result must stay far below
+    /// `NibLimits.aiToolResultBytes`, and paging an edit's result with a cursor makes no sense (ARCHITECTURE §6).
+    static let refLimit = 100
+
+    /// Items that no longer fit on pages that SHRINK (they are kept where they are): the first `refLimit` refs and
+    /// the total. Runs before `ctx.mutate` because it may load every page of a notebook (mutate must stay short),
+    /// and drops each checked page from the item cache again unless a window shows it.
     @MainActor
-    static func itemsOutside(doc: DocumentID, page: PageID, size: PageSize, tx: DocTransaction) throws -> [String] {
-        let bounds = Rect(x: 0, y: 0, width: size.width, height: size.height).insetBy(-0.5)
-        return try tx.items(doc, page: page).filter { !bounds.contains($0.bounds) }.map { NodeRef.item(doc, page, $0.id).description }
+    static func itemsOutside(_ targets: [Target], newSizes: [PageSize?], ctx: CommandContext) throws -> (refs: [String], count: Int) {
+        var refs: [String] = []
+        var count = 0
+        var pageIDs: [DocumentID: Set<PageID>] = [:]
+        for (t, new) in zip(targets, newSizes) {
+            guard let old = t.page.size, let new = new, new.width < old.width || new.height < old.height else { continue }
+            let bounds = Rect(x: 0, y: 0, width: new.width, height: new.height).insetBy(-0.5)
+            for item in try ctx.workspace.items(t.doc, page: t.page.id) where !bounds.contains(item.bounds) {
+                count += 1
+                if refs.count < refLimit { refs.append(NodeRef.item(t.doc, t.page.id, item.id).description) }
+            }
+            // ponytail: Workspace does not expose which pages were cached before the check, so every checked page
+            // no window shows is dropped (it reloads on demand); keep pre-cached pages once Workspace says which.
+            if !ctx.services.sessions.sessions.contains(where: { $0.document == t.doc && $0.page == t.page.id }) {
+                if pageIDs[t.doc] == nil { pageIDs[t.doc] = try Set(ctx.workspace.content(t.doc).pages.map { $0.id }) }
+                ctx.workspace.evictPages(t.doc, keeping: (pageIDs[t.doc] ?? []).subtracting([t.page.id]))
+            }
+        }
+        return (refs, count)
     }
 
     /// PDF / image backgrounds must name an asset stored in the document (and a PDF page that exists).
+    /// The name comes from AI or plugins: a plain file name only, so it cannot point into another document.
     @MainActor
     static func checkAsset(_ asset: AssetRef, pdfPage: Int?, doc: DocumentID, services: NibServices) throws {
+        let name = asset.name
+        if name.isEmpty || name.hasPrefix(".") || name.contains("/") || name.contains("\\") || name.contains("..") {
+            throw NibError(.invalidParams, "'\(name)' is not an asset name", path: "$.background.asset",
+                           hint: "pass the asset name returned by asset.put")
+        }
         guard let store = services.assets else { return }
         guard let url = store.url(asset, doc: doc), FileManager.default.fileExists(atPath: url.path) else {
             throw NibError(.notFound, "asset \(asset.name) not found in document \(doc)", path: "$.background.asset",
@@ -337,9 +370,15 @@ struct PageSetTemplate: NibCommand {
     }
 
     struct Output: Codable {
+        /// The first `TemplateCommands.refLimit` changed pages; `count` is the total.
         var pages: [String]
-        /// Items that fall (partly) outside a resized page; they are kept where they are.
+        var count: Int
+        /// Items that fall (partly) outside a shrunk page, kept where they are: the first
+        /// `TemplateCommands.refLimit` refs; `outsideCount` is the total.
         var outside: [String]
+        var outsideCount: Int
+        /// true when `pages` or `outside` was capped.
+        var truncated: Bool?
         var warning: String?
     }
 
@@ -369,21 +408,25 @@ struct PageSetTemplate: NibCommand {
         let requested = try TemplateCommands.pageSize(p.size)
         let wholeDocuments = TemplateCommands.wholeDocuments(p.pages)
         let now = Date()
-        return try ctx.mutate { tx in
-            let targets = try TemplateCommands.targets(p.pages, tx: tx, cover: def.isCover, registry: registry)
-            var refs: [String] = []
-            var outside: [String] = []
-            var metaChanges: [DocumentID: TemplateCommands.MetaChange] = [:]
-            for t in targets {
-                var page = t.page
-                if let current = page.size {
-                    var size = requested ?? current
-                    if let landscape = p.landscape { size = TemplateCommands.oriented(size, landscape: landscape) }
-                    page.size = size
-                } else if requested != nil || p.landscape != nil {
+        let targets = try TemplateCommands.targets(p.pages, workspace: ctx.workspace, cover: def.isCover, registry: registry)
+        let sizes = try targets.map { t -> PageSize? in
+            guard let current = t.page.size else {
+                if requested != nil || p.landscape != nil {
                     throw NibError(.invalidParams, "whiteboard boards are infinite; size and landscape do not apply",
                                    path: requested != nil ? "$.size" : "$.landscape", hint: "leave out size and landscape for boards")
                 }
+                return nil
+            }
+            var size = requested ?? current
+            if let landscape = p.landscape { size = TemplateCommands.oriented(size, landscape: landscape) }
+            return size
+        }
+        let outside = try TemplateCommands.itemsOutside(targets, newSizes: sizes, ctx: ctx)
+        return try ctx.mutate { tx in
+            var metaChanges: [DocumentID: TemplateCommands.MetaChange] = [:]
+            for (t, size) in zip(targets, sizes) {
+                var page = t.page
+                page.size = size
                 let old = page.background
                 var params = TemplateCommands.carriedParams(from: old, to: def, registry)
                 for (k, v) in given { params[k] = v == .null ? nil : v }
@@ -400,15 +443,14 @@ struct PageSetTemplate: NibCommand {
                 if !def.isCover, wholeDocuments.contains(t.doc) {
                     metaChanges[t.doc, default: TemplateCommands.MetaChange()].defaultTemplate = TemplateRef(def.id, params: params)
                 }
-                refs.append(NodeRef.page(t.doc, page.id).description)
-                if let size = page.size, size != t.page.size {
-                    outside += try TemplateCommands.itemsOutside(doc: t.doc, page: page.id, size: size, tx: tx)
-                }
             }
             try TemplateCommands.apply(metaChanges, tx: tx)
-            let warning = outside.isEmpty ? nil
+            let limit = TemplateCommands.refLimit
+            let refs = targets.prefix(limit).map { NodeRef.page($0.doc, $0.page.id).description }
+            let warning = outside.count == 0 ? nil
                 : "\(outside.count) item(s) now fall outside the page; they were kept in place (move them or choose a larger size)"
-            return Output(pages: refs, outside: outside, warning: warning)
+            return Output(pages: refs, count: targets.count, outside: outside.refs, outsideCount: outside.count,
+                          truncated: targets.count > limit || outside.count > limit ? true : nil, warning: warning)
         }
     }
 }
@@ -422,7 +464,10 @@ struct PageSetBackground: NibCommand {
     }
 
     struct Output: Codable {
+        /// The first `TemplateCommands.refLimit` changed pages; `count` is the total (`truncated` when capped).
         var pages: [String]
+        var count: Int
+        var truncated: Bool?
     }
 
     static let descriptor = CommandDescriptor(
@@ -489,26 +534,27 @@ struct PageSetBackground: NibCommand {
             }
         }
         let wholeDocuments = TemplateCommands.wholeDocuments(p.pages)
+        let targets = try TemplateCommands.targets(p.pages, workspace: ctx.workspace, cover: cover, registry: registry)
         return try ctx.mutate { tx in
-            let targets = try TemplateCommands.targets(p.pages, tx: tx, cover: cover, registry: registry)
-            var refs: [String] = []
             var metaChanges: [DocumentID: TemplateCommands.MetaChange] = [:]
             for t in targets {
                 var page = t.page
                 let old = page.background
                 page.background = background
                 try tx.put(page, doc: t.doc)
-                if t.isFirst, let flag = TemplateCommands.coverFlag(wasCover: TemplateCommands.isCover(old, registry),
-                                                                    nowCover: cover, allowDisable: false) {
+                // A non-cover template is known paper; a PDF/image/colour may be a custom cover, so it keeps the flag.
+                if t.isFirst, let flag = TemplateCommands.coverFlag(wasCover: TemplateCommands.isCover(old, registry), nowCover: cover,
+                                                                    allowDisable: p.background.kind == .template) {
                     metaChanges[t.doc, default: TemplateCommands.MetaChange()].coverEnabled = flag
                 }
                 if !cover, wholeDocuments.contains(t.doc), let template = background.template {
                     metaChanges[t.doc, default: TemplateCommands.MetaChange()].defaultTemplate = template
                 }
-                refs.append(NodeRef.page(t.doc, page.id).description)
             }
             try TemplateCommands.apply(metaChanges, tx: tx)
-            return Output(pages: refs)
+            let limit = TemplateCommands.refLimit
+            return Output(pages: targets.prefix(limit).map { NodeRef.page($0.doc, $0.page.id).description },
+                          count: targets.count, truncated: targets.count > limit ? true : nil)
         }
     }
 }
