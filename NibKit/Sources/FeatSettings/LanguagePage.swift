@@ -155,6 +155,9 @@ protocol NotificationStatusReading {
 }
 
 struct SystemNotificationStatus: NotificationStatusReading {
+    /// Nonisolated, so it can be a default argument.
+    nonisolated init() {}
+
     func status() async -> UNAuthorizationStatus? {
         guard !NibApp.isHostlessTest else { return nil }
         return await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
