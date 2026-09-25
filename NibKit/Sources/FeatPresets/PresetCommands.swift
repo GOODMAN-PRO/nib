@@ -253,6 +253,10 @@ struct PresetSelect: NibCommand {
 }
 
 struct PresetSetSwatch: NibCommand {
+    /// Each app's tape patterns by its command bus, set in `FeatPresetsFeature.register`: the check uses the invoking
+    /// app's registry (a process can hold several apps, and `NibApp.shared` may be nil).
+    static let tapePatterns = NSMapTable<CommandBus, Registry<TapePatternDescriptor>>.weakToWeakObjects()
+
     struct Params: Codable {
         var tool: String
         var index: Int
@@ -274,10 +278,12 @@ struct PresetSetSwatch: NibCommand {
         try PresetRules.checkTool(p.tool)
         let colour = try PresetRules.colour(p.color, tool: p.tool)
         let change = PatternChange(p.pattern)
-        if case .set(let ref) = change, p.tool == "tape",
-           let patterns = NibApp.shared?.content.tapePatterns, patterns.get(ref.name) == nil {
-            throw NibError(.notFound, "tape pattern '\(ref.name)' not found", path: "$.pattern",
-                           hint: "call tape.patterns for the available pattern ids")
+        if case .set(let ref) = change, p.tool == "tape" {
+            guard let patterns = tapePatterns.object(forKey: ctx.bus) else { throw NibError.unavailable("tape patterns") }
+            guard patterns.get(ref.name) != nil else {
+                throw NibError(.notFound, "tape pattern '\(ref.name)' not found", path: "$.pattern",
+                               hint: "call tape.patterns for the available pattern ids")
+            }
         }
         let next = try PresetRules.update(p.tool, in: ctx.services.settings) {
             try PresetRules.setSwatch($0, tool: p.tool, index: p.index, color: colour, pattern: change)
@@ -412,8 +418,9 @@ enum PresetActions {
         return (command, .object(o))
     }
 
+    /// The task's value is true when every call succeeded.
     @discardableResult
-    static func run(_ app: NibApp, session: EditorSession?, _ calls: [Call]) -> Task<Void, Never> {
+    static func run(_ app: NibApp, session: EditorSession?, _ calls: [Call]) -> Task<Bool, Never> {
         Task { @MainActor in
             let group = NibID.make().raw
             for c in calls {
@@ -422,9 +429,10 @@ enum PresetActions {
                 } catch {
                     NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                                     userInfo: ["command": c.command, "error": NibError.wrap(error)])
-                    return
+                    return false
                 }
             }
+            return true
         }
     }
 }

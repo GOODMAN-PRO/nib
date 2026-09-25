@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import ImageIO
 import NibContracts
 import NibDesign
 
@@ -100,6 +101,8 @@ enum PresetColour {
 }
 
 /// Glyphs NibSymbol has no token for yet (contract gap): validated through `NibSymbol(systemName:)` with a token fallback.
+// ponytail: stand-ins until contract request F008-pattern-swatch-and-symbols adds NibSymbol.customColour and
+// NibSymbol.eyedropper (filed in the F008 feature summary); switch to the tokens and delete this enum then.
 enum PresetSymbols {
     static let customColour = NibSymbol(systemName: "paintpalette") ?? .plus
     static let eyedropper = NibSymbol(systemName: "eyedropper") ?? .search
@@ -199,22 +202,25 @@ struct ColourEditorRow: View {
         onDone()
     }
 
-    /// nil = plain colour. Adding a pattern adds a slot in the current colour, then gives it the pattern.
     private func setPattern(_ id: String?) {
-        let hex = current.color.hex
-        if let slot {
-            PresetActions.run(app, session: session, [PresetActions.call("preset.setSwatch", tool,
-                                                                          ["index": .number(Double(slot)), "color": .string(hex),
-                                                                           "pattern": .string(id ?? "")])])
-        } else {
-            var calls = [PresetActions.call("preset.addSwatch", tool, ["color": .string(hex)])]
-            if let id {
-                calls.append(PresetActions.call("preset.setSwatch", tool, ["index": .number(Double(presets.swatches.count)),
-                                                                           "color": .string(hex), "pattern": .string(id)]))
-            }
-            PresetActions.run(app, session: session, calls)
-        }
+        PresetActions.run(app, session: session, Self.patternCalls(tool: tool, slot: slot, count: presets.swatches.count,
+                                                                   hex: current.color.hex, pattern: id))
         onDone()
+    }
+
+    /// The commands a pattern choice runs. nil = plain colour. Adding a pattern adds a slot in the current colour, then
+    /// gives it the pattern: the new slot's index is the old slot count.
+    static func patternCalls(tool: String, slot: Int?, count: Int, hex: String, pattern id: String?) -> [PresetActions.Call] {
+        if let slot {
+            return [PresetActions.call("preset.setSwatch", tool, ["index": .number(Double(slot)), "color": .string(hex),
+                                                                  "pattern": .string(id ?? "")])]
+        }
+        var calls = [PresetActions.call("preset.addSwatch", tool, ["color": .string(hex)])]
+        if let id {
+            calls.append(PresetActions.call("preset.setSwatch", tool, ["index": .number(Double(count)), "color": .string(hex),
+                                                                       "pattern": .string(id)]))
+        }
+        return calls
     }
 
     private func openPicker() {
@@ -249,6 +255,9 @@ struct ColourEditorRow: View {
 
 /// A tape slot that carries a pattern: the tile over the slot's colour, drawn like `NibPenSwatch` (flat, a 0.5 pt
 /// hairline, the 2 pt label ring 2.5 pt outside when selected, a 44 pt hit target).
+// ponytail: mirrors NibPenSwatch(size: .palette) metrics line for line because NibDesign has no pattern overlay yet;
+// contract request F008-pattern-swatch-and-symbols (filed in the F008 feature summary) asks NibPenSwatch for one.
+// Replace this view with NibPenSwatch(pattern:) once it lands.
 struct PatternSwatch: View {
     let colour: RGBA
     let patternID: String
@@ -320,7 +329,12 @@ enum TapePatternCache {
         let load = descriptor.load
         let size = tilePoints
         let tile = await Task.detached(priority: .userInitiated) { () -> UIImage? in
-            guard let data = try? load(), let cg = UIImage(data: data)?.cgImage else { return nil }
+            // Custom and plugin patterns are untrusted, possibly huge images: decode a tile-sized thumbnail only.
+            guard let data = try? load(), let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+            let options = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                           kCGImageSourceCreateThumbnailWithTransform: true,
+                           kCGImageSourceThumbnailMaxPixelSize: Int((size * 3).rounded(.up))] as CFDictionary
+            guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options) else { return nil }
             return UIImage(cgImage: cg, scale: max(1, CGFloat(cg.width) / size), orientation: .up)
         }.value
         if let tile { images[id] = tile }
@@ -340,7 +354,7 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate {
     private var latest: RGBA?
     private var committed: RGBA?
 
-    private init(initial: RGBA, commitsOnFinishOnly: Bool, onPick: @escaping @MainActor (RGBA) -> Void) {
+    init(initial: RGBA, commitsOnFinishOnly: Bool, onPick: @escaping @MainActor (RGBA) -> Void) {
         self.committed = initial
         self.commitsOnFinishOnly = commitsOnFinishOnly
         self.onPick = onPick
@@ -381,11 +395,12 @@ final class SystemColourPicker: NSObject, UIColorPickerViewControllerDelegate {
     }
 }
 
-/// Presents system view controllers from the window the tool menu lives in.
+/// Presents system view controllers from the window the tool menu lives in (never another window's navigator: two
+/// iPad windows side by side are both foreground-active).
 @MainActor
 enum PresetPresenter {
     static func present(_ viewController: UIViewController, app: NibApp, session: EditorSession) {
-        if let navigator = app.ui.activeNavigator {
+        if let navigator = app.ui.activeNavigator, navigator.session === session {
             navigator.presentModal(viewController)
             return
         }

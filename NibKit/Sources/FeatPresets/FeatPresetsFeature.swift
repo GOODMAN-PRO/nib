@@ -10,6 +10,7 @@ public enum FeatPresetsFeature: NibFeature {
 
     public static func register(_ app: NibApp) {
         app.commands.register(PresetSelect.self)
+        PresetSetSwatch.tapePatterns.setObject(app.content.tapePatterns, forKey: app.bus)
         app.commands.register(PresetSetSwatch.self)
         app.commands.register(PresetAddSwatch.self)
         app.commands.register(PresetRemoveSwatch.self)

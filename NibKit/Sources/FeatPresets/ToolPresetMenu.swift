@@ -103,11 +103,12 @@ struct ToolPresetMenu: View {
     @State private var dragged: Int?
     @Environment(\.horizontalSizeClass) private var sizeClass
 
-    init(app: NibApp, session: EditorSession, tool: String) {
+    init(app: NibApp, session: EditorSession, tool: String, mode: PresetBarMode = .slots) {
         self.app = app
         self.session = session
         self.tool = tool
         _presets = State(initialValue: PresetRules.normalized(app.settings.get(PresetRules.key(tool)), tool: tool))
+        _mode = State(initialValue: mode)
     }
 
     var body: some View {
@@ -124,7 +125,8 @@ struct ToolPresetMenu: View {
                 arrangeRow
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange)) { note in
+        // The store posts on the writing thread (a synced-prefs merge can be off main).
+        .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange).receive(on: DispatchQueue.main)) { note in
             if (note.userInfo?["name"] as? String) == PresetRules.key(tool).name { reload() }
         }
         .onAppear(perform: reload)
@@ -188,6 +190,8 @@ struct ToolPresetMenu: View {
             }
             .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
             .onAppear { proxy.scrollTo(presets.selectedSwatch, anchor: .center) }
+            // Keys 1-9/0, the AI or another window can select a slot scrolled out of view (iPhone shows 3.5).
+            .onChange(of: presets.selectedSwatch) { _, s in proxy.scrollTo(s, anchor: .center) }
         }
         .frame(width: stripWidth(presets.swatches.count), height: NibMetrics.hitTarget)
     }
@@ -206,7 +210,7 @@ struct ToolPresetMenu: View {
             }
             .onDrag {
                 dragged = i
-                return NSItemProvider(object: String(i) as NSString)
+                return NSItemProvider(object: SwatchDropDelegate.payload(i) as NSString)
             }
             .onDrop(of: [UTType.plainText], delegate: SwatchDropDelegate(index: i, dragged: $dragged) { from, to in
                 move(from, to)
@@ -239,6 +243,7 @@ struct ToolPresetMenu: View {
 
     private func setMode(_ next: PresetBarMode) {
         mode = next
+        dragged = nil
         UIAccessibility.post(notification: .layoutChanged, argument: nil)
     }
 
@@ -377,8 +382,8 @@ struct LineSampleButton: View {
         Button(action: action) {
             LineSample()
                 .stroke(NibColor.label, style: PresetStroke.style(lineWidth: lineWidth, pattern: pattern))
-                .frame(width: 20, height: 20)
-                .frame(width: 40, height: 40)
+                .frame(width: NibSpacing.xl, height: NibSpacing.xl)
+                .frame(width: NibMetrics.hudHeight, height: NibMetrics.hudHeight)
                 .background(isSelected ? NibColor.fill3 : Color.clear, in: Circle())
                 .animation(NibMotion.colorChange, value: isSelected)
                 .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
@@ -428,7 +433,7 @@ struct RemoveBadge: View {
         Image(nib: .minus)
             .font(NibFont.caption1Emphasis)
             .foregroundStyle(NibColor.onAccent)
-            .frame(width: 16, height: 16)
+            .frame(width: NibSpacing.l, height: NibSpacing.l)
             .background(NibColor.destructive, in: Circle())
             .padding(NibSpacing.xs)
             .allowsHitTesting(false)
@@ -436,18 +441,27 @@ struct RemoveBadge: View {
     }
 }
 
-/// Drop a dragged slot on another to move it there (one `preset.moveSwatch`).
+/// Drop a dragged slot on another to move it there (one `preset.moveSwatch`). The drag carries `payload(from)`, so a
+/// cancelled drag's stale index never moves anything when outside text is dropped later.
 struct SwatchDropDelegate: DropDelegate {
     let index: Int
     @Binding var dragged: Int?
     let onMove: (Int, Int) -> Void
 
+    static func payload(_ index: Int) -> String { "app.nib.presets.swatch:\(index)" }
+
+    func validateDrop(info: DropInfo) -> Bool { dragged != nil }
+
     func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
 
     func performDrop(info: DropInfo) -> Bool {
-        guard let from = dragged else { return false }
+        guard let from = dragged, let provider = info.itemProviders(for: [UTType.plainText]).first else { return false }
         dragged = nil
-        if from != index { onMove(from, index) }
+        let to = index, onMove = onMove, expected = Self.payload(from)
+        _ = provider.loadObject(ofClass: NSString.self) { object, _ in
+            guard let text = object as? NSString, text as String == expected, from != to else { return }
+            DispatchQueue.main.async { onMove(from, to) }
+        }
         return true
     }
 }

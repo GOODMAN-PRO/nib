@@ -107,6 +107,19 @@ final class FeatPresetsTests: XCTestCase {
         }
     }
 
+    func testMenuRendersInEveryMode() {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let modes: [PresetBarMode] = [.width(1), .colour(.slot(0)), .colour(.add), .arrange]
+        for tool in NibSettings.presetTools {
+            for mode in modes {
+                let host = UIHostingController(rootView: ToolPresetMenu(app: h.app, session: h.session, tool: tool, mode: mode))
+                let size = host.sizeThatFits(in: CGSize(width: 1194, height: 834))
+                XCTAssertGreaterThanOrEqual(size.height, 44, "\(tool) \(mode)")
+                XCTAssertGreaterThan(size.width, 3 * 44, "\(tool) \(mode)")
+            }
+        }
+    }
+
     // MARK: Commands
 
     func testSelectChecksBounds() async throws {
@@ -296,6 +309,65 @@ final class FeatPresetsTests: XCTestCase {
         XCTAssertEqual(PresetColour.palette(for: "pen").count, 12)
         XCTAssertEqual(try PresetRules.colour("#FFE45C", tool: "highlighter").a, PresetRules.highlighterAlpha)
         XCTAssertEqual(try PresetRules.colour("#FFE45C", tool: "tape").a, 255)
+    }
+
+    /// The add-pattern path: preset.addSwatch, then preset.setSwatch at the old slot count.
+    func testAddingATapePatternAddsASlotThatCarriesIt() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        h.app.content.tapePatterns.register(TapePatternDescriptor(id: "builtin.dots", title: "Dots", owner: "test") {
+            Fixtures.pngData
+        })
+        let before = presets(h, "tape")
+        let calls = ColourEditorRow.patternCalls(tool: "tape", slot: nil, count: before.swatches.count, hex: before.color.hex,
+                                                 pattern: "builtin.dots")
+        let ok = await PresetActions.run(h.app, session: h.session, calls).value
+        XCTAssertTrue(ok)
+        let after = presets(h, "tape")
+        XCTAssertEqual(after.swatches.count, before.swatches.count + 1)
+        XCTAssertEqual(after.selectedSwatch, before.swatches.count, "the new slot is selected")
+        XCTAssertEqual(after.swatches.last?.pattern, AssetRef("builtin.dots"))
+        XCTAssertEqual(after.swatches.last?.color, before.color)
+        XCTAssertEqual(Array(after.swatches.prefix(before.swatches.count)), before.swatches, "the other slots are untouched")
+
+        let unknown = ColourEditorRow.patternCalls(tool: "tape", slot: 0, count: after.swatches.count, hex: "#FFFFFF",
+                                                   pattern: "nope")
+        let failed = await PresetActions.run(h.app, session: h.session, unknown).value
+        XCTAssertFalse(failed, "a failed command reports false")
+        XCTAssertEqual(presets(h, "tape"), after)
+    }
+
+    /// A slot commits every settled choice; a new slot commits once, when the picker closes; an unchanged colour never.
+    func testSystemColourPickerCommitRules() {
+        let vc = UIColorPickerViewController()
+        let blue = UIColor(red: 0, green: 0, blue: 1, alpha: 1)
+        let red = UIColor(red: 1, green: 0, blue: 0, alpha: 1)
+
+        var slotPicks: [RGBA] = []
+        let slot = SystemColourPicker(initial: vermilion, commitsOnFinishOnly: false) { slotPicks.append($0) }
+        slot.colorPickerViewController(vc, didSelect: PresetColour.uiColor(vermilion), continuously: false)
+        XCTAssertEqual(slotPicks, [], "the colour it opened with is not a change")
+        slot.colorPickerViewController(vc, didSelect: blue, continuously: true)
+        XCTAssertEqual(slotPicks, [], "a drag in progress commits nothing")
+        slot.colorPickerViewController(vc, didSelect: blue, continuously: false)
+        XCTAssertEqual(slotPicks, [RGBA(0, 0, 255)])
+        slot.colorPickerViewController(vc, didSelect: red, continuously: false)
+        XCTAssertEqual(slotPicks, [RGBA(0, 0, 255), RGBA(255, 0, 0)])
+        slot.colorPickerViewControllerDidFinish(vc)
+        XCTAssertEqual(slotPicks.count, 2, "closing on the committed colour adds nothing")
+
+        var addPicks: [RGBA] = []
+        let add = SystemColourPicker(initial: vermilion, commitsOnFinishOnly: true) { addPicks.append($0) }
+        add.colorPickerViewController(vc, didSelect: blue, continuously: false)
+        add.colorPickerViewController(vc, didSelect: red, continuously: false)
+        XCTAssertEqual(addPicks, [], "adding waits for the picker to close")
+        add.colorPickerViewControllerDidFinish(vc)
+        XCTAssertEqual(addPicks, [RGBA(255, 0, 0)])
+
+        var untouchedPicks: [RGBA] = []
+        let untouched = SystemColourPicker(initial: vermilion, commitsOnFinishOnly: true) { untouchedPicks.append($0) }
+        untouched.colorPickerViewController(vc, didSelect: PresetColour.uiColor(vermilion), continuously: false)
+        untouched.colorPickerViewControllerDidFinish(vc)
+        XCTAssertEqual(untouchedPicks, [], "closing without a change adds nothing")
     }
 
     // MARK: Eyedropper

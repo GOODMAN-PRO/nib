@@ -264,8 +264,8 @@ final class EyedropperAttachment: CanvasAttachment {
         case .add:
             call = PresetActions.call("preset.addSwatch", request.tool, ["color": .string(hex)])
         }
-        await PresetActions.run(app, session: session, [call]).value
-        NibHaptics.play(.select)
+        // A failed command shows its toast; the select feedback is for a colour that actually landed.
+        if await PresetActions.run(app, session: session, [call]).value { NibHaptics.play(.select) }
     }
 }
 
