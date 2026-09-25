@@ -19,8 +19,12 @@ final class FeatDiagramsTests: XCTestCase {
     }
 
     /// Lets tasks started by the canvas attachments finish.
-    func settle(until condition: () -> Bool) async {
-        for _ in 0..<500 where !condition() { await Task.yield() }
+    func settle(until condition: @escaping () -> Bool) async {
+        var spins = 0
+        while spins < 500, !condition() {
+            await Task.yield()
+            spins += 1
+        }
     }
 
     // MARK: Registration and conformance
