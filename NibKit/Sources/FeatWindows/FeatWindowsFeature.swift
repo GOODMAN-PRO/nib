@@ -35,7 +35,7 @@ public enum FeatWindowsFeature: NibFeature {
 
 // MARK: - Menu entries
 
-/// Entries for the tab menu, the document title menu, library items and page thumbnails. Each runs a command.
+/// Entries for the tab menu, library items and page thumbnails. Each runs a command.
 @MainActor
 enum WindowMenus {
     /// There is no "new window" glyph among `NibSymbol`s; menu icons are symbol names by contract.
@@ -54,12 +54,8 @@ enum WindowMenus {
         menus.register(MenuItemDescriptor(
             id: "windows.tab.closeOthers", title: String(localized: "Close Other Tabs"), icon: "xmark.square",
             location: .tab, order: 300, owner: owner, command: CommandIDs.batch,
-            params: { ctx in closeOthersParams(keeping: ctx.index ?? 0) },
+            params: { ctx in closeOthersParams(ctx) },
             isVisible: { ctx in ctx.index != nil && tabCount(ctx) > 1 }))
-        menus.register(MenuItemDescriptor(
-            id: "windows.title.closeOthers", title: String(localized: "Close Other Tabs"), icon: "xmark.square",
-            location: .documentTitle, order: 900, owner: owner, command: "tab.closeOthers",
-            isVisible: { ctx in tabCount(ctx) > 1 }))
         menus.register(MenuItemDescriptor(
             id: "windows.library.newWindow", title: String(localized: "Open in New Window"), icon: newWindowIcon,
             location: .libraryItem, order: 150, owner: owner, command: "window.open",
@@ -105,11 +101,19 @@ enum WindowMenus {
         return .object(params)
     }
 
-    /// `tab.closeOthers` keeps the current tab, so the menu of another tab makes that one current first.
-    static func closeOthersParams(keeping index: Int) -> JSONValue {
-        let select: JSONValue = ["command": "tab.select", "params": ["index": .number(Double(index))]]
-        let closeOthers: JSONValue = ["command": "tab.closeOthers"]
-        return ["calls": [select, closeOthers]]
+    /// `tab.close` for every other tab, background tabs first and the current tab last, so the kept tab is the current
+    /// tab's neighbour and takes over. Nothing waits for an open to land (behind the lock gate opens are deferred).
+    static func closeOthersParams(_ ctx: MenuContext) -> JSONValue {
+        guard let navigator = WindowScenes.of(ctx.app)?.navigator(for: ctx.session), let keep = menuDocument(ctx) else {
+            return ["calls": []]
+        }
+        let current = navigator.activeDocument
+        let others = navigator.openDocuments.filter { $0 != keep && $0 != current }
+            + [current].compactMap { $0 }.filter { $0 != keep }
+        let calls = others.map { doc -> JSONValue in
+            ["command": "tab.close", "params": ["doc": .string(NodeRef.document(doc).description)]]
+        }
+        return ["calls": .array(calls)]
     }
 }
 

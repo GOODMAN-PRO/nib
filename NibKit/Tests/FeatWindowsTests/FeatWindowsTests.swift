@@ -4,7 +4,8 @@ import NibContracts
 import NibTesting
 @testable import FeatWindows
 
-/// A window without UIKit: the shell's tab rules (ShellViewController.performOpen / closeDocument) over a real session.
+/// A window without UIKit: the shell's tab rules (ShellViewController.openDocument / performOpen / closeDocument) over a
+/// real session. Like the shell, an open behind `ui.openGate` runs later, in a Task, and only if the gate lets it.
 @MainActor
 final class FakeNavigator: SceneNavigator {
     let app: NibApp
@@ -20,6 +21,16 @@ final class FakeNavigator: SceneNavigator {
     }
 
     func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {
+        if let gate = app.ui.openGate, mode != .newWindow {
+            Task { @MainActor in
+                if await gate(doc) { self.performOpen(doc, page: page, mode: mode) }
+            }
+        } else {
+            performOpen(doc, page: page, mode: mode)
+        }
+    }
+
+    private func performOpen(_ doc: DocumentID, page: PageID?, mode: OpenMode) {
         guard mode != .newWindow, let content = try? app.workspace.content(doc) else { return }
         let asTab = mode == .newTab || app.settings.get(NibSettings.openAsTabs)
         if !openDocuments.contains(doc) {
@@ -90,6 +101,12 @@ final class FeatWindowsTests: XCTestCase {
 
     private func run(_ h: Harness, _ command: String, _ params: JSONValue = [:], in navigator: FakeNavigator) async throws {
         _ = try await h.app.bus.execute(Invocation(command: command, params: params, session: navigator.session))
+    }
+
+    /// Waits (up to 2 s) for deferred opens and restoration retries to land.
+    private func waitUntil(_ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(2)
+        while !condition(), Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
     }
 
     private func errorCode(_ body: () async throws -> Void) async -> NibError.Code? {
@@ -183,6 +200,37 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertTrue(relaunched.openDocuments.isEmpty)
     }
 
+    func testRestorationRetriesUntilTheDocumentCanOpen() async throws {
+        let (h, scenes, hooks) = try windows()
+        var late = try h.app.workspace.content(board)
+        late.meta.id = NibID.make()
+        let doc = late.meta.id
+        h.app.settings.set(WindowSettings.lastSession, WindowState(tabs: [doc], active: doc, page: nil))
+
+        let navigator = window(h, scenes)
+        hooks.connect(navigator, requested: nil, restored: nil, external: false)
+        XCTAssertTrue(navigator.openDocuments.isEmpty)          // the library has not loaded it yet
+        _ = try h.library.createDocument(late, title: "Late", in: nil)
+        try await waitUntil { navigator.session.document == doc }
+        XCTAssertEqual(navigator.openDocuments, [doc])
+    }
+
+    func testRestorationBacksOffOnceThePersonOpensSomething() async throws {
+        let (h, scenes, hooks) = try windows()
+        var late = try h.app.workspace.content(board)
+        late.meta.id = NibID.make()
+        let doc = late.meta.id
+        h.app.settings.set(WindowSettings.lastSession, WindowState(tabs: [doc], active: doc, page: nil))
+
+        let navigator = window(h, scenes)
+        hooks.connect(navigator, requested: nil, restored: nil, external: false)
+        try await run(h, "doc.open", ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        _ = try h.library.createDocument(late, title: "Late", in: nil)
+        try await Task.sleep(nanoseconds: 400_000_000)          // past the first retry
+        XCTAssertEqual(navigator.openDocuments, [notebook])
+        XCTAssertEqual(navigator.session.document, notebook)
+    }
+
     // MARK: Windows
 
     func testNewWindowRequestsCarryTheDocumentAndPage() async throws {
@@ -222,6 +270,35 @@ final class FeatWindowsTests: XCTestCase {
         hooks.connect(target, requested: WindowState(userInfo: dragged.userInfo ?? [:]), restored: nil, external: false)
         XCTAssertEqual(target.openDocuments, [board])
         XCTAssertEqual(target.session.document, board)
+        XCTAssertEqual(origin.openDocuments, [notebook])
+        XCTAssertEqual(origin.session.document, notebook)
+    }
+
+    func testADraggedOutTabLeavesItsWindowOnlyOnceItOpensInTheNewOne() async throws {
+        let (h, scenes, hooks) = try windows()
+        let origin = window(h, scenes)
+        try await run(h, "doc.open", ["doc": "doc:FIXTUREDOC01"], in: origin)
+        try await run(h, "doc.open", ["doc": "doc:FIXTUREDOC04"], in: origin)
+        var unlocks = false
+        h.app.ui.openGate = { _ in
+            try? await Task.sleep(nanoseconds: 20_000_000)      // the password prompt
+            return unlocks
+        }
+        let dragged = WindowState(tabs: [board], active: board, page: nil, source: origin.session.id)
+
+        // The new window's prompt is dismissed: the tab stays where it was.
+        let cancelled = window(h, scenes)
+        hooks.connect(cancelled, requested: dragged, restored: nil, external: false)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(cancelled.openDocuments.isEmpty)
+        XCTAssertEqual(origin.openDocuments, [notebook, board])
+        XCTAssertEqual(origin.session.document, board)
+
+        unlocks = true
+        let target = window(h, scenes)
+        hooks.connect(target, requested: dragged, restored: nil, external: false)
+        try await waitUntil { origin.openDocuments == [notebook] }
+        XCTAssertEqual(target.openDocuments, [board])
         XCTAssertEqual(origin.openDocuments, [notebook])
         XCTAssertEqual(origin.session.document, notebook)
     }
@@ -279,6 +356,63 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertNil(navigator.session.document)
     }
 
+    func testCloseOtherTabsBehindTheLockGateKeepsOnlyTheChosenTab() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        for doc in ["doc:FIXTUREDOC01", "doc:FIXTUREDOC03", "doc:FIXTUREDOC04"] {
+            try await run(h, "doc.open", ["doc": .string(doc)], in: navigator)
+        }
+        try await run(h, "tab.select", ["index": 0], in: navigator)
+        h.app.ui.openGate = { _ in true }                        // the lock feature always installs one
+
+        // Close Other Tabs from the second tab's menu, while the first tab is on screen.
+        let context = MenuContext(app: h.app, session: navigator.session, doc: study, ref: "doc:FIXTUREDOC03", index: 1)
+        let item = try XCTUnwrap(h.app.ui.menuItems(.tab, context).first { $0.id == "windows.tab.closeOthers" })
+        try await run(h, item.command, item.params(context), in: navigator)
+        try await waitUntil { navigator.session.document == study }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(navigator.openDocuments, [study])
+        XCTAssertEqual(navigator.session.document, study)
+    }
+
+    func testClosingTheCurrentTabWaitsForItsNeighbourToPassTheLockGate() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        try await run(h, "doc.open", ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, "doc.open", ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        try await run(h, "tab.select", ["index": 0], in: navigator)
+        var prompts: [DocumentID] = []
+        var unlocks = false
+        h.app.ui.openGate = { doc in
+            prompts.append(doc)
+            try? await Task.sleep(nanoseconds: 20_000_000)      // the password prompt
+            return unlocks
+        }
+
+        // The neighbour's prompt is dismissed: the tab stays on screen and nothing asks again.
+        try await run(h, "tab.close", in: navigator)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(navigator.openDocuments, [notebook, board])
+        XCTAssertEqual(navigator.session.document, notebook)
+        XCTAssertEqual(prompts, [board])
+
+        // Switching tabs afterwards does not close it late.
+        unlocks = true
+        try await run(h, "tab.select", ["index": 1], in: navigator)
+        try await waitUntil { navigator.session.document == board }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(navigator.openDocuments, [notebook, board])
+
+        // Unlocked: the neighbour shows first, then the tab closes.
+        try await run(h, "tab.select", ["index": 0], in: navigator)
+        try await waitUntil { navigator.session.document == notebook }
+        try await run(h, "tab.close", in: navigator)
+        try await waitUntil { navigator.openDocuments == [board] }
+        XCTAssertEqual(navigator.openDocuments, [board])
+        XCTAssertEqual(navigator.session.document, board)
+        XCTAssertEqual(prompts, [board, board, notebook, board])
+    }
+
     func testDocOpenValidatesItsParameters() async throws {
         let (h, scenes, _) = try windows()
         let navigator = window(h, scenes)
@@ -322,8 +456,6 @@ final class FeatWindowsTests: XCTestCase {
                                                    session: navigator.session))
         XCTAssertEqual(navigator.openDocuments, [study])
         XCTAssertEqual(navigator.session.document, study)
-        // With one tab left the title menu has nothing to close.
-        XCTAssertTrue(h.app.ui.menuItems(.documentTitle, MenuContext(app: h.app, session: navigator.session)).isEmpty)
 
         // A page thumbnail opens at that page.
         let page = MenuContext(app: h.app, session: navigator.session, doc: notebook, page: Fixtures.page2)
@@ -367,11 +499,10 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(phone.tabWidth, 96)
         XCTAssertLessThanOrEqual(phone.dropletWidth, 393 - 32)
 
-        XCTAssertTrue(TabStripLayout.showsStrip(tabCount: 1, openAsTabs: true, width: 1194))
-        XCTAssertFalse(TabStripLayout.showsStrip(tabCount: 1, openAsTabs: false, width: 1194))
-        XCTAssertFalse(TabStripLayout.showsStrip(tabCount: 1, openAsTabs: true, width: 393))
-        XCTAssertTrue(TabStripLayout.showsStrip(tabCount: 2, openAsTabs: false, width: 393))
-        XCTAssertFalse(TabStripLayout.showsStrip(tabCount: 0, openAsTabs: true, width: 1194))
+        XCTAssertTrue(TabStripLayout.showsStrip(tabCount: 1, openAsTabs: true))
+        XCTAssertFalse(TabStripLayout.showsStrip(tabCount: 1, openAsTabs: false))
+        XCTAssertTrue(TabStripLayout.showsStrip(tabCount: 2, openAsTabs: false))
+        XCTAssertFalse(TabStripLayout.showsStrip(tabCount: 0, openAsTabs: true))
 
         XCTAssertEqual(TabMath.neighbour(of: notebook, in: [notebook, text, board]), text)
         XCTAssertEqual(TabMath.neighbour(of: board, in: [notebook, text, board]), text)

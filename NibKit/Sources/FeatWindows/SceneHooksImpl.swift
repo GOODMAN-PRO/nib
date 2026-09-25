@@ -1,4 +1,5 @@
 import UIKit
+import os
 import NibContracts
 
 /// `app.ui.sceneHooks`: what a window opens with (a requested document, its restored tabs, or on a cold launch the
@@ -18,7 +19,8 @@ final class SceneHooksImpl: SceneHooks {
     /// delays (ms), then opens what it can.
     static let retryDelays: [UInt64] = [250, 500, 1_000, 2_000, 4_000]
     /// ponytail: the shell has no "add a tab without showing it", so every restored tab builds its editor once; the
-    /// cap bounds that at launch. A navigator method that only appends to `openDocuments` would remove the cap.
+    /// cap bounds that at launch and the tabs past it are logged. A `SceneNavigator.addTab(_:)` that only appends to
+    /// `openDocuments` (requested from the contract owner) would remove the cap.
     static let maxRestoredTabs = 8
 
     private weak var app: NibApp?
@@ -56,10 +58,8 @@ final class SceneHooksImpl: SceneHooks {
     func makeTabBar(_ navigator: SceneNavigator) -> UIView? {
         scenes.add(navigator)
         scenes.updateSceneTitle(navigator)
-        guard let app else { return nil }
-        let width = navigator.rootViewController?.viewIfLoaded?.bounds.width ?? 0
-        guard TabStripLayout.showsStrip(tabCount: navigator.openDocuments.count,
-                                        openAsTabs: app.settings.get(NibSettings.openAsTabs), width: width) else { return nil }
+        guard let app, TabStripLayout.showsStrip(tabCount: navigator.openDocuments.count,
+                                                 openAsTabs: app.settings.get(NibSettings.openAsTabs)) else { return nil }
         return TabStripHostView(model: TabStripModel(app: app, navigator: navigator, scenes: scenes))
     }
 
@@ -85,6 +85,10 @@ final class SceneHooksImpl: SceneHooks {
         guard let app else { return }
         var wanted = Array(state.tabs.prefix(SceneHooksImpl.maxRestoredTabs))
         if let active = state.active, !wanted.contains(active) { wanted.append(active) }
+        let total = state.tabs.count, dropped = total - wanted.count
+        if attempt == 0, dropped > 0 {
+            logger.notice("Restoring a window: \(dropped, privacy: .public) of \(total, privacy: .public) tabs left out")
+        }
         if reason != .request {
             // Restoring never asks for a password; a locked document is opened by the person, not by a relaunch.
             let lock = app.services.lock
@@ -107,7 +111,9 @@ final class SceneHooksImpl: SceneHooks {
         apply(WindowState(tabs: ready, active: active, page: state.page), to: navigator)
         if reason == .request, let source = state.source, let doc = active,
            let origin = scenes.navigator(sessionID: source), origin !== navigator {
-            scenes.close(doc, in: origin)          // a dragged-out tab moves
+            // A dragged-out tab moves: it leaves its old window once it is on screen here (behind the lock gate that
+            // waits for the password; a cancelled prompt leaves the tab where it was).
+            scenes.close(doc, in: origin, once: navigator, shows: doc)
         }
         scenes.updateSceneTitle(navigator)
     }

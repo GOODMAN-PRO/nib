@@ -34,11 +34,11 @@ enum TabStripLayout {
 
     static func tabWidths(compact: Bool) -> ClosedRange<CGFloat> { compact ? 96...180 : 120...220 }
 
-    /// Tabs on (Settings › Editing) show the strip from the first document on regular widths; iPhone and narrow
-    /// windows show it only once there is a second tab to switch to.
-    static func showsStrip(tabCount: Int, openAsTabs: Bool, width: CGFloat) -> Bool {
-        if tabCount > 1 { return true }
-        return tabCount == 1 && openAsTabs && width >= NibMetrics.compactBreakpoint
+    /// Tabs on (Settings › Editing) show the strip from the first document; tabs off, once there is a second tab to
+    /// switch to. Not by width: the strip is built before the window has one, and a Split View or Stage Manager resize
+    /// does not rebuild it; `plan` fits it to whatever width it gets.
+    static func showsStrip(tabCount: Int, openAsTabs: Bool) -> Bool {
+        tabCount > 1 || (tabCount == 1 && openAsTabs)
     }
 
     static func plan(count: Int, active: Int?, width: CGFloat) -> Plan {
@@ -128,8 +128,9 @@ final class TabStripModel: ObservableObject {
         app.perform("tab.close", ["doc": .string(NodeRef.document(tab.id).description)], session: navigator?.session)
     }
 
-    /// ponytail: no catalogue command shows the library in a window (reported as a contract gap), so the Library
-    /// button asks the navigator directly, as the shell's own fallbacks do.
+    /// ponytail: no catalogue command shows the library in a window, so the Library button asks the navigator
+    /// directly, as the shell's own fallbacks do. `window.showLibrary {folder?}` is requested as a contract change;
+    /// the button runs it through `app.perform` once it exists.
     func showLibrary() {
         guard let navigator, navigator.session.document != nil else { return }
         navigator.showLibrary(folder: nil)
@@ -204,6 +205,8 @@ struct TabStripView: View {
                 .contentShape(Rectangle().inset(by: -TabStripLayout.hitOutset))
         }
         .menuIndicator(.hidden)
+        .menuStyle(.button)
+        .buttonStyle(NibPressStyle(shape: Capsule()))
         .frame(width: TabStripLayout.overflowWidth, height: TabStripLayout.tabHeight)
         .accessibilityLabel(String(localized: "\(hidden.count) more tabs"))
     }
@@ -258,7 +261,7 @@ struct TabCapsule: View {
         .contextMenu {
             TabMenu(items: items) { model.run($0, on: tab) }
         }
-        .modifier(TabDrag(activity: model.dragActivity(tab)))
+        .modifier(TabDrag(enabled: model.scenes.supportsMultipleWindows()) { model.dragActivity(tab) })
     }
 }
 
@@ -299,14 +302,17 @@ struct TabMenu: View {
     }
 }
 
-/// Dragging a tab to the edge of the screen opens it in a new window (iPad); the item carries the window activity.
+/// Dragging a tab to the edge of the screen opens it in a new window (iPad); the item carries the window activity,
+/// built only when a drag starts (it may read the tab's document for its page).
 struct TabDrag: ViewModifier {
-    let activity: NSUserActivity?
+    let enabled: Bool
+    let makeActivity: () -> NSUserActivity?
 
     @ViewBuilder func body(content: Content) -> some View {
-        if let activity {
+        if enabled {
             content.onDrag {
                 let provider = NSItemProvider()
+                guard let activity = makeActivity() else { return provider }
                 provider.registerObject(activity, visibility: .all)
                 provider.suggestedName = activity.title
                 return provider

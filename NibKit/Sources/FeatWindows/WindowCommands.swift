@@ -2,7 +2,7 @@ import UIKit
 import os
 import NibContracts
 
-private let logger = Logger(subsystem: "app.nib", category: "windows")
+let logger = Logger(subsystem: "app.nib", category: "windows")
 
 // MARK: - Window state (activity userInfo + last session)
 
@@ -108,10 +108,18 @@ final class WindowScenes {
         weak var navigator: SceneNavigator?
     }
 
+    /// Close `doc` in the window of `origin` once the window this is keyed by shows `shows`.
+    private struct PendingClose {
+        let shows: DocumentID
+        let doc: DocumentID
+        let origin: NibID
+    }
+
     private weak var app: NibApp?
     private var entries: [Entry] = []
     private var pagesBySession: [NibID: [DocumentID: PageID]] = [:]
     private var lastPages: [DocumentID: PageID] = [:]
+    private var pendingCloses: [NibID: PendingClose] = [:]
     private var subscription: EventSubscription?
 
     /// iPhone shows one window at a time. Swapped in tests (hostless tests have no UIApplication).
@@ -152,7 +160,8 @@ final class WindowScenes {
 
     // MARK: Pages per tab
 
-    /// Records page changes (so a tab reopens where it was left) and keeps window titles current.
+    /// Records page changes (so a tab reopens where it was left), runs tab closes that wait for a document to show,
+    /// and keeps window titles current.
     func observe(_ events: EventBus) {
         guard subscription == nil else { return }
         subscription = events.subscribe { @Sendable [weak self] event in
@@ -172,7 +181,13 @@ final class WindowScenes {
         if type == NibEventType.pageChanged, let doc = session.document, let page = session.page {
             remember(page, doc: doc, session: session)
         }
-        if type == NibEventType.sessionDocument, let navigator = all.first(where: { $0.session === session }) {
+        guard type == NibEventType.sessionDocument else { return }
+        // The window moved on: a close waiting for it runs if it now shows the awaited document, else it is dropped.
+        if let pending = pendingCloses.removeValue(forKey: id), session.document == pending.shows,
+           let origin = navigator(sessionID: pending.origin) {
+            close(pending.doc, in: origin)
+        }
+        if let navigator = all.first(where: { $0.session === session }) {
             updateSceneTitle(navigator)
         }
     }
@@ -239,12 +254,7 @@ final class WindowScenes {
             // Show the neighbour first, so the close only removes a background tab (closing the current tab makes the
             // shell open its own pick, the last tab, and build an editor for nothing).
             navigator.openDocument(next, page: page(of: next, in: navigator.session), mode: .replace)
-            if app?.ui.openGate == nil {
-                navigator.closeDocument(doc)
-            } else {
-                // Behind the lock gate that open runs in a Task; close after it.
-                Task { @MainActor [weak navigator] in navigator?.closeDocument(doc) }
-            }
+            close(doc, in: navigator, once: navigator, shows: next)
             return
         }
         let wasCurrent = navigator.activeDocument == doc
@@ -253,6 +263,24 @@ final class WindowScenes {
             // The shell opens another tab when the current one closes; the library stays on screen instead.
             Task { @MainActor [weak navigator] in navigator?.showLibrary(folder: nil) }
         }
+    }
+
+    /// Closes `doc` in `origin` once `window` shows `shown`: now, or when an open the lock gate deferred lands. If that
+    /// open is cancelled (a locked document whose password prompt was dismissed) or the window shows something else
+    /// first, the tab stays.
+    func close(_ doc: DocumentID, in origin: SceneNavigator, once window: SceneNavigator, shows shown: DocumentID) {
+        if window.activeDocument == shown, window.session.document == shown {
+            pendingCloses[window.session.id] = nil
+            close(doc, in: origin)
+        } else {
+            pendingCloses[window.session.id] = PendingClose(shows: shown, doc: doc, origin: origin.session.id)
+            if let app { observe(app.events) }       // the window's next document change settles it
+        }
+    }
+
+    /// The person sent the window elsewhere (`tab.select`, `doc.open`): a close still waiting on it is dropped.
+    func dropPendingClose(in window: SceneNavigator) {
+        pendingCloses[window.session.id] = nil
     }
 
     static func activateScene(_ activity: NSUserActivity, requestingScene: UIWindowScene?) throws {
@@ -368,6 +396,7 @@ struct DocOpen: NibCommand {
             }
             return NoResult()
         }
+        scenes.dropPendingClose(in: navigator)
         navigator.openDocument(doc, page: page ?? scenes.page(of: doc, in: navigator.session), mode: mode)
         return NoResult()
     }
@@ -469,6 +498,7 @@ struct TabSelect: NibCommand {
         }
         let doc = tabs[i]
         guard navigator.session.document != doc else { return NoResult() }
+        scenes.dropPendingClose(in: navigator)
         navigator.openDocument(doc, page: scenes.page(of: doc, in: navigator.session), mode: .replace)
         return NoResult()
     }
