@@ -1,6 +1,233 @@
+import SwiftUI
 import NibContracts
+import NibDesign
 
+/// Document chrome (F017): `ui.screens.documentContainer` wraps every editor with the nav bar, the toolbar, the
+/// sidebar host, floating panels and sheets. Panels, nav-bar items and menu entries come from the registries, so
+/// features and plugins add theirs without touching this module.
 public enum FeatDocChromeFeature: NibFeature {
     public static let id = "chrome"
-    public static func register(_ app: NibApp) {}
+
+    public static func register(_ app: NibApp) {
+        app.services.set(ChromeStateStore(app: app), for: ChromeStateStore.serviceKey)
+        app.commands.register(PanelOpen.self)
+        app.commands.register(PanelClose.self)
+        app.commands.register(SidebarToggle.self)
+        app.commands.register(DocSetScrollDirection.self)
+        app.settings.declarePrefix(ChromeSettings.placementPrefix, synced: false,
+                                   summary: "Where one panel shows in documents on this device: left, right or floating (null = its default).",
+                                   owner: id, schema: .str(choices: ChromePlacement.overrides.map { $0.rawValue }))
+        app.ui.screens.documentContainer = { editor, doc, hostApp, navigator in
+            DocumentContainerViewController(editor: editor, document: doc, app: hostApp, navigator: navigator)
+        }
+        app.content.keyCommands.register(KeyCommandDescriptor(
+            id: ChromeShortcuts.sidebarKeyCommand, title: String(localized: "Show or Hide Sidebar"),
+            shortcut: ChromeShortcuts.sidebar, command: "sidebar.toggle", scope: .document, owner: id))
+        registerMenus(app)
+        registerPanels(app)
+    }
+
+    /// More-menu base items (D-080) and the title menu entries that belong to no other feature.
+    private static func registerMenus(_ app: NibApp) {
+        for direction in ScrollDirection.allCases {
+            let horizontal = direction == .horizontal
+            app.ui.menus.register(MenuItemDescriptor(
+                id: horizontal ? "chrome.more.scrollHorizontal" : "chrome.more.scrollVertical",
+                title: horizontal ? String(localized: "Scroll Horizontally") : String(localized: "Scroll Vertically"),
+                icon: horizontal ? "arrow.left.and.right" : "arrow.up.and.down",
+                location: .documentMore, order: 100, owner: id, command: "doc.setScrollDirection",
+                params: { ctx in
+                    ["doc": .string(ChromeMenuSupport.docRef(ctx)), "direction": .string(direction.rawValue)]
+                },
+                isVisible: { ctx in
+                    guard let current = ChromeMenuSupport.scrollDirection(ctx) else { return false }
+                    return current != direction
+                }))
+        }
+        app.ui.menus.register(MenuItemDescriptor(
+            id: "chrome.more.editingSettings", title: String(localized: "Document Editing Settings"), icon: "gearshape",
+            location: .documentMore, order: 900, owner: id, command: "panel.open",
+            params: { _ in ["id": .string(ChromePanels.editingSettings)] }))
+        app.ui.menus.register(MenuItemDescriptor(
+            id: "chrome.title.rename", title: String(localized: "Rename"), icon: "pencil",
+            location: .documentTitle, order: 100, owner: id, command: "panel.open",
+            params: { _ in ["id": .string(ChromePanels.rename)] },
+            isVisible: { ChromeMenuSupport.canChangeLibrary($0, with: "library.rename") }))
+        app.ui.menus.register(MenuItemDescriptor(
+            id: "chrome.title.move", title: String(localized: "Move to Folder"), icon: "folder",
+            location: .documentTitle, order: 300, owner: id, command: "panel.open",
+            params: { _ in ["id": .string(ChromePanels.move)] },
+            isVisible: { ChromeMenuSupport.canChangeLibrary($0, with: "library.move") }))
+        app.ui.menus.register(MenuItemDescriptor(
+            id: "chrome.title.closeOthers", title: String(localized: "Close Other Tabs"), icon: "xmark.square",
+            location: .documentTitle, order: 400, owner: id, command: "tab.closeOthers",
+            isVisible: { ctx in
+                ctx.app.commands.entry("tab.closeOthers") != nil
+                    && (ctx.app.ui.activeNavigator?.openDocuments.count ?? 0) > 1
+            }))
+    }
+
+    private static func registerPanels(_ app: NibApp) {
+        app.ui.panels.register(PanelDescriptor(
+            id: ChromePanels.editingSettings, title: String(localized: "Document Editing"), icon: "gearshape",
+            placement: .sheet, order: 900, owner: id) { context in AnyView(EditingSettingsSheet(context: context)) })
+        app.ui.panels.register(PanelDescriptor(
+            id: ChromePanels.rename, title: String(localized: "Rename Document"), icon: "pencil",
+            placement: .sheet, order: 910, owner: id) { context in AnyView(RenameDocumentSheet(context: context)) })
+        app.ui.panels.register(PanelDescriptor(
+            id: ChromePanels.move, title: String(localized: "Move to Folder"), icon: "folder",
+            placement: .sheet, order: 920, owner: id) { context in AnyView(MoveDocumentSheet(context: context)) })
+    }
+}
+
+@MainActor
+enum ChromeMenuSupport {
+    static func docRef(_ ctx: MenuContext) -> String {
+        ctx.doc.map { NodeRef.document($0).description } ?? ""
+    }
+
+    /// The current direction of a notebook (nil for other kinds: only notebooks scroll by page).
+    static func scrollDirection(_ ctx: MenuContext) -> ScrollDirection? {
+        guard let doc = ctx.doc, let content = try? ctx.app.workspace.content(doc),
+              content.meta.kind == .notebook else { return nil }
+        return content.meta.scrollDirection
+    }
+
+    static func canChangeLibrary(_ ctx: MenuContext, with command: String) -> Bool {
+        ctx.doc != nil && ctx.app.services.library != nil && ctx.app.commands.entry(command) != nil
+    }
+}
+
+// MARK: - Sheets
+
+/// More › Document Editing Settings: the Settings pages of the Editing section (F027 and any plugin), in a sheet.
+struct EditingSettingsSheet: View {
+    let context: PanelContext
+
+    var body: some View {
+        let pages = context.app.ui.settingsPages.all.filter { $0.section == .editing }
+        NavigationStack {
+            Group {
+                if pages.isEmpty {
+                    NibEmptyState(symbol: .settings, title: String(localized: "No editing settings"),
+                                  message: String(localized: "Document editing settings appear here once the Settings feature is installed."))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if pages.count == 1, let page = pages.first {
+                    page.makeView(context.app)
+                        .navigationTitle(page.title)
+                } else {
+                    List {
+                        ForEach(pages, id: \.id) { page in
+                            NavigationLink {
+                                page.makeView(context.app)
+                                    .navigationTitle(page.title)
+                            } label: {
+                                NibRow(page.title, icon: NibSymbol(systemName: page.icon))
+                            }
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                    .navigationTitle(String(localized: "Document Editing"))
+                }
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(String(localized: "Done")) { context.dismiss() }
+                }
+            }
+        }
+    }
+}
+
+/// Title menu › Rename: a title field that runs `library.rename`.
+struct RenameDocumentSheet: View {
+    let context: PanelContext
+    @State private var title: String
+
+    init(context: PanelContext) {
+        self.context = context
+        let doc = context.session?.document
+        _title = State(initialValue: doc.flatMap { context.app.services.library?.node($0)?.title } ?? "")
+    }
+
+    private var trimmed: String { title.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            NibSheetHeader(String(localized: "Rename Document"), primaryTitle: String(localized: "Rename"),
+                           isPrimaryEnabled: !trimmed.isEmpty, onCancel: { context.dismiss() }, onPrimary: rename)
+            NibField(text: $title, prompt: String(localized: "Title"))
+                .onSubmit(rename)
+                .padding(.horizontal, NibSpacing.xl)
+                .padding(.vertical, NibSpacing.l)
+            Spacer(minLength: 0)
+        }
+        .presentationDetents([.medium])
+    }
+
+    private func rename() {
+        guard !trimmed.isEmpty, let doc = context.session?.document else { return }
+        context.app.perform("library.rename", ["ref": .string(NodeRef.document(doc).description), "title": .string(trimmed)],
+                            session: context.session)
+        context.dismiss()
+    }
+}
+
+/// Title menu › Move to Folder: every folder of the library, running `library.move`.
+struct MoveDocumentSheet: View {
+    let context: PanelContext
+
+    var body: some View {
+        let library = context.app.services.library
+        let doc = context.session?.document
+        let current = doc.flatMap { library?.node($0)?.parent }
+        let folders = (library?.allNodes() ?? []).filter { $0.kind == .folder }
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        NavigationStack {
+            List {
+                row(String(localized: "Library"), subtitle: nil, symbol: .library, folder: nil, current: current)
+                ForEach(folders) { folder in
+                    row(folder.title, subtitle: parentPath(folder.path), symbol: .folderFill, folder: folder.id, current: current)
+                }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle(String(localized: "Move to Folder"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(String(localized: "Cancel")) { context.dismiss() }
+                }
+            }
+        }
+    }
+
+    private func row(_ title: String, subtitle: String?, symbol: NibSymbol, folder: FolderID?,
+                     current: FolderID?) -> some View {
+        Button {
+            move(to: folder)
+        } label: {
+            NibRow(title, subtitle: subtitle, icon: symbol) {
+                if folder == current {
+                    Image(nib: .checkmark)
+                        .foregroundStyle(NibColor.accent)
+                        .accessibilityLabel(String(localized: "Current folder"))
+                }
+            }
+        }
+        .disabled(folder == current)
+    }
+
+    private func parentPath(_ path: String) -> String? {
+        let parts = path.split(separator: "/")
+        return parts.count > 1 ? parts.dropLast().joined(separator: " / ") : nil
+    }
+
+    private func move(to folder: FolderID?) {
+        guard let doc = context.session?.document else { return }
+        var params: [String: JSONValue] = ["refs": .array([.string(NodeRef.document(doc).description)])]
+        if let folder { params["folder"] = .string(NodeRef.folder(folder).description) }
+        context.app.perform("library.move", .object(params), session: context.session)
+        context.dismiss()
+    }
 }
