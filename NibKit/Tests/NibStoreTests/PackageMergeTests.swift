@@ -214,6 +214,7 @@ final class PackageMergeTests: XCTestCase {
         let chunks = json.withUnsafeBytes { PackageCodec.decodeChunks($0, count: 3) }
         XCTAssertEqual(chunks.count, 3)
         XCTAssertEqual(chunks.map(\.points.count).reduce(0, +), 300 - 5 + 2, "300 strokes, 5 empty, 2 fixture strokes")
+        XCTAssertEqual(try chunks.flatMap { try PackageCodec.decode($0) }, items, "no chunk needs the fallback decode")
         XCTAssertEqual(try PackageCodec.decodeItems(data), items)
     }
 
