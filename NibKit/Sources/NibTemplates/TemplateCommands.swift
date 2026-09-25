@@ -356,7 +356,7 @@ struct PageSetTemplate: NibCommand {
         examples: [
             try! JSONValue.parse(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "builtin.grid", "params": {"paper": "yellow", "spacing": 20}}"#),
             try! JSONValue.parse(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": "builtin.ruledWide", "size": "Letter", "landscape": true}"#),
-            try! JSONValue.parse(#"{"pages": ["doc:FIXTUREDOC01"], "template": "builtin.dots", "params": {"paper": "#242426"}}"#),
+            try! JSONValue.parse(##"{"pages": ["doc:FIXTUREDOC01"], "template": "builtin.dots", "params": {"paper": "#242426"}}"##),
             try! JSONValue.parse(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": "cover.band", "params": {"color": "navy"}}"#),
             try! JSONValue.parse(#"{"pages": ["page:FIXTUREDOC04/FIXTUREBRD01"], "template": "builtin.whiteboardGrid"}"#)
         ],
@@ -441,7 +441,7 @@ struct PageSetBackground: NibCommand {
             ], required: ["kind"])
         ], required: ["pages", "background"]),
         examples: [
-            try! JSONValue.parse(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "background": {"kind": "color", "color": "#FDF6DC"}}"#),
+            try! JSONValue.parse(##"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "background": {"kind": "color", "color": "#FDF6DC"}}"##),
             try! JSONValue.parse(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "background": {"kind": "pdf", "asset": "fixture-page.pdf", "pdfPage": 0}}"#),
             try! JSONValue.parse(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "background": {"kind": "image", "asset": "fixture-image.png"}}"#),
             try! JSONValue.parse(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG003"], "background": {"kind": "template", "template": {"id": "builtin.cornell", "params": {"spacing": 20}}}}"#)

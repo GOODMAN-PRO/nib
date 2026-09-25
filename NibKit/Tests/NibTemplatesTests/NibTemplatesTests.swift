@@ -272,7 +272,7 @@ final class NibTemplatesTests: XCTestCase {
 
     func testSetBackgroundAppliesAndValidates() async throws {
         let h = harness()
-        _ = try await h.run("page.setBackground", json(#"{"pages": ["doc:FIXTUREDOC01"], "background": {"kind": "color", "color": "#FDF6DC"}}"#))
+        _ = try await h.run("page.setBackground", json(##"{"pages": ["doc:FIXTUREDOC01"], "background": {"kind": "color", "color": "#FDF6DC"}}"##))
         for id in [Fixtures.page1, Fixtures.page2, Fixtures.pdfPage] {
             XCTAssertEqual(try page(h, id).background, Background.ofColor(RGBA.paperYellow))
         }
