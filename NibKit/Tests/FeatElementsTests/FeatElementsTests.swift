@@ -254,14 +254,14 @@ final class FeatElementsTests: XCTestCase {
         }
 
         let inserted = try await a.run("element.insert", ["page": "page:FIXTUREDOC01/FIXTUREPG002",
-                                                          "collection": StarterElements.stickers, "element": "star"])
+                                                          "collection": .string(StarterElements.stickers), "element": "star"])
         let star = try items(inserted, in: a)
-        XCTAssertEqual(star.map { $0.kind }, [.image])
+        XCTAssertEqual(star.map { $0.kind }, [ItemKind.image])
         let asset = try XCTUnwrap(star.first?.image?.asset)
         XCTAssertFalse(try a.assets.data(asset, doc: Fixtures.docID).isEmpty)
         XCTAssertEqual(union(star).midX, PageSize.a4.width / 2, accuracy: 0.01, "no point and another page: the page centre")
 
-        try await a.run("element.collection.delete", ["collection": StarterElements.labels])
+        try await a.run("element.collection.delete", ["collection": .string(StarterElements.labels)])
         let b = harness(device: 8)
         b.app.services.library = a.library
         let again = try await b.run("element.collection.list")
