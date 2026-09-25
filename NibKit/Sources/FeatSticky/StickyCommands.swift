@@ -83,7 +83,7 @@ struct StickyCreate: NibCommand {
                       "id": .str("your own id, [A-Za-z0-9_-]{1,64}")],
                      required: ["page", "at"]),
         examples: [
-            try! JSONValue.parse(#"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "at": [72, 560], "color": "#FFE87C", "text": "Revise SUVAT"}"#),
+            try! JSONValue.parse(##"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "at": [72, 560], "color": "#FFE87C", "text": "Revise SUVAT"}"##),
             try! JSONValue.parse(#"{"page": "page:FIXTUREDOC04/FIXTUREBRD01", "at": [240, 40]}"#)
         ],
         effect: .edit)
@@ -205,7 +205,7 @@ struct StickySetColor: NibCommand {
         id: "sticky.setColor", title: String(localized: "Change Note Colour"),
         summary: "Change the paper colour of sticky notes (#RRGGBB or #RRGGBBAA). Locked notes are refused.",
         params: .obj(["refs": .arr(.ref), "color": .color], required: ["refs", "color"]),
-        examples: [try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01"], "color": "#AEDAFF"}"#)],
+        examples: [try! JSONValue.parse(##"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01"], "color": "#AEDAFF"}"##)],
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
