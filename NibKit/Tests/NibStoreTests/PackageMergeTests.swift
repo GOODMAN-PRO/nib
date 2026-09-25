@@ -165,7 +165,65 @@ final class PackageMergeTests: XCTestCase {
 
         XCTAssertEqual(merged.count, 1000)
         XCTAssertEqual(merged.filter(\.deleted).count, 100)
+        diagnoseDecode(data, base: base)
         XCTAssertLessThan(best, 0.05 * 4)
+    }
+
+    // TEMP diagnostics (removed once the budget holds): where the decode time goes on the CI simulator.
+    private func diagnoseDecode(_ data: Data, base: [Item]) {
+        func best(_ f: () throws -> Void) -> Double {
+            var b = Double.infinity
+            for _ in 0..<3 {
+                let s = Date()
+                try? f()
+                b = min(b, Date().timeIntervalSince(s))
+            }
+            return (b * 1000).rounded()
+        }
+        let json = try! (data as NSData).decompressed(using: .lzfse) as Data
+        var out: [String] = ["cores=\(ProcessInfo.processInfo.activeProcessorCount)", "json=\(json.count)B"]
+        out.append("inflate=\(best { _ = try (data as NSData).decompressed(using: .lzfse) })")
+        out.append("jsonser=\(best { _ = try JSONSerialization.jsonObject(with: json) })")
+        out.append("full=\(best { _ = try JSONDecoder().decode([Item].self, from: json) })")
+        var array = try! JSONSerialization.jsonObject(with: json) as! [[String: Any]]
+        var b64: [String] = []
+        for i in array.indices {
+            if var s = array[i]["stroke"] as? [String: Any] {
+                b64.append(s["ptsB64"] as? String ?? "")
+                s["ptsB64"] = nil
+                array[i]["stroke"] = s
+            }
+        }
+        let stripped = try! JSONSerialization.data(withJSONObject: array)
+        out.append("reser=\(best { _ = try JSONSerialization.data(withJSONObject: array) })")
+        out.append("nopts=\(best { _ = try JSONDecoder().decode([Item].self, from: stripped) })")
+        out.append("pts=\(best { for s in b64 { _ = Self.fastPoints(s) } })")
+        let decoded = try! JSONDecoder().decode([Item].self, from: json)
+        out.append("merge=\(best { _ = LWW.merge(base, decoded) })")
+        let n = ProcessInfo.processInfo.activeProcessorCount
+        let whole = try! JSONSerialization.jsonObject(with: json) as! [Any]
+        let size = (whole.count + n - 1) / n
+        let chunks = stride(from: 0, to: whole.count, by: size).map {
+            try! JSONSerialization.data(withJSONObject: Array(whole[$0..<min($0 + size, whole.count)]))
+        }
+        out.append("par\(chunks.count)=\(best { DispatchQueue.concurrentPerform(iterations: chunks.count) { _ = try? JSONDecoder().decode([Item].self, from: chunks[$0]) } })")
+        out.append("encode=\(best { _ = try PackageCodec.encodeItems(base) })")
+        print("NIBSTORE-DIAG " + out.joined(separator: " "))
+    }
+
+    private static func fastPoints(_ b64: String) -> [StrokePoint] {
+        guard let d = Data(base64Encoded: b64) else { return [] }
+        var f = [Float](repeating: 0, count: d.count / 4)
+        _ = f.withUnsafeMutableBufferPointer { d.copyBytes(to: $0) }
+        var pts: [StrokePoint] = []
+        pts.reserveCapacity(f.count / 10)
+        var i = 0
+        while i + 10 <= f.count {
+            pts.append(StrokePoint(x: f[i], y: f[i + 1], t: f[i + 2], force: f[i + 3], azimuth: f[i + 4], altitude: f[i + 5],
+                                   roll: f[i + 6], width: f[i + 7], height: f[i + 8], opacity: f[i + 9]))
+            i += 10
+        }
+        return pts
     }
 
     func testFarFutureRevisionLosesAndIsReported() throws {
