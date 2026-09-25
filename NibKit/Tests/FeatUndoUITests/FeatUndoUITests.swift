@@ -116,7 +116,7 @@ final class FeatUndoUITests: XCTestCase {
         await model.show(doc: Fixtures.docID)
         XCTAssertEqual(model.rows.count, 3)
         XCTAssertEqual(model.rows.first?.principal.kind, .you)          // newest first
-        let aiRow = try XCTUnwrap(model.rows.first { $0.id == turn })
+        let aiRow = try XCTUnwrap(model.rows.first { $0.group == turn })
         XCTAssertEqual(aiRow.principal.kind, .ai)
         XCTAssertEqual(aiRow.changes, 2)
         XCTAssertEqual(aiRow.label, "Set Page Title")
@@ -127,13 +127,43 @@ final class FeatUndoUITests: XCTestCase {
         XCTAssertEqual(try title(h, Fixtures.page1), originalTitle)     // the AI's edit nobody touched since
         XCTAssertEqual(try title(h, Fixtures.page2), "Mine")            // the later user edit is kept
         XCTAssertEqual(try title(h, Fixtures.pdfPage), "Also mine")
-        XCTAssertFalse(model.rows.contains { $0.id == turn })
+        XCTAssertFalse(model.rows.contains { $0.group == turn })
         XCTAssertEqual(model.rows.first?.label, "Revert Set Page Title") // the revert is itself one undoable step
         XCTAssertEqual(model.rows.first?.principal.kind, .you)
 
         // The step is gone now: reverting it again says so instead of failing silently.
         await model.revert(aiRow)
         XCTAssertEqual(model.receipt, .gone)
+    }
+
+    /// The open panel follows live commits (coalesced into one reload), and stops once it is off screen.
+    func testHistoryFollowsCommitsWhileObservingAndStopsAfter() async throws {
+        let h = harness()
+        let model = HistoryViewModel(app: h.app, session: h.session)
+        await model.show(doc: Fixtures.docID)
+        let before = model.rows.count
+        model.observe()
+
+        try await setTitle(h, Fixtures.page1, "Live")
+        await Task.yield()
+        await Task.yield()
+        for _ in 0..<100 where model.rows.count == before { await Task.yield() }   // the reload awaits the bus
+        XCTAssertEqual(model.rows.count, before + 1)
+        XCTAssertEqual(model.rows.first?.label, "Set Page Title")
+
+        // A group that commits again after an interleaved edit is two rows, each with its own id.
+        try await setTitle(h, Fixtures.page2, "AI", as: .ai("t"), group: "AITURN000002")
+        try await setTitle(h, Fixtures.page1, "Mine")
+        try await setTitle(h, Fixtures.page2, "AI again", as: .ai("t"), group: "AITURN000002")
+        for _ in 0..<100 where model.rows.count < before + 4 { await Task.yield() }
+        XCTAssertEqual(Set(model.rows.map(\.id)).count, model.rows.count)
+
+        model.stopObserving()
+        for _ in 0..<20 { await Task.yield() }       // a reload already under way finishes first
+        let rows = model.rows
+        try await setTitle(h, Fixtures.page1, "Unseen")
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(model.rows, rows)
     }
 
     func testPrincipalBadgesDetailsAndReceipts() {
@@ -147,8 +177,8 @@ final class FeatUndoUITests: XCTestCase {
         XCTAssertEqual(HistoryPrincipal("sync:1a2b3c4d").kind, .collaborator)
         for kind in HistoryPrincipal.Kind.allCases { XCTAssertFalse(kind.title.isEmpty) }
 
-        let row = HistoryRow(id: "G", label: "Add Strokes", principal: HistoryPrincipal("plugin:anki-export"), changes: 3,
-                             date: Date())
+        let row = HistoryRow(id: "G#1", group: "G", label: "Add Strokes", principal: HistoryPrincipal("plugin:anki-export"),
+                             changes: 3, date: Date())
         XCTAssertTrue(row.detail().hasPrefix("anki-export · 3 changes · "))
         XCTAssertTrue(row.accessibilityLabel.hasPrefix("Add Strokes, Plugin, anki-export"))
 

@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Combine
 import os
 import NibContracts
 import NibDesign
@@ -59,8 +60,10 @@ extension HistoryPrincipal.Kind {
 
 /// One undo step of the document, newest first.
 struct HistoryRow: Identifiable, Equatable {
-    /// The undo group: what `history.revertGroup` takes (an AI turn or a plugin call is one group).
+    /// Unique in the list: a group can appear twice (an AI turn that commits again after an interleaved user edit).
     let id: String
+    /// The undo group: what `history.revertGroup` takes (an AI turn or a plugin call is one group).
+    let group: String
     let label: String
     let principal: HistoryPrincipal
     let changes: Int
@@ -118,11 +121,14 @@ enum HistoryReceipt: Equatable {
 @MainActor
 final class HistoryViewModel: ObservableObject {
     @Published private(set) var rows: [HistoryRow] = []
-    @Published private(set) var canRedo = false
     @Published private(set) var loaded = false
+    /// `history.list` failed: the panel says so instead of looking empty.
+    @Published private(set) var loadFailed = false
     /// The group being reverted (its button and the others are disabled meanwhile).
     @Published private(set) var reverting: String?
     @Published var receipt: HistoryReceipt?
+    /// Bumped on every new receipt, so two identical receipts in a row each get their full time on screen.
+    @Published private(set) var receiptSerial = 0
     private(set) var doc: DocumentID?
     private let app: NibApp
     private weak var session: EditorSession?
@@ -145,7 +151,8 @@ final class HistoryViewModel: ObservableObject {
     func observe() {
         guard commits == nil else { return }
         commits = app.bus.observeCommits { [weak self] changes in
-            guard let self, let doc = self.doc, changes.documents.contains(doc) else { return }
+            // The bus drops a cancelled observer on a later turn: ignore commits that land in between.
+            guard let self, self.commits != nil, let doc = self.doc, changes.documents.contains(doc) else { return }
             self.scheduleReload()
         }
     }
@@ -157,37 +164,43 @@ final class HistoryViewModel: ObservableObject {
 
     func reload() async {
         guard let doc else {
-            rows = []
-            canRedo = false
-            loaded = true
+            finish(rows: [], failed: false)
             return
         }
         do {
             let value = try await app.bus.execute(CommandIDs.historyList,
                                                   ["doc": Self.ref(doc), "limit": .number(Double(NibLimits.undoDepth))],
                                                   session: session)
-            let list = try value.decode(HistoryListOutput.self)
+            let entries = try value.decode(HistoryListOutput.self).entries
             guard doc == self.doc else { return }          // the document changed while listing
-            rows = list.entries.map {
-                HistoryRow(id: $0.group, label: $0.label, principal: HistoryPrincipal($0.principal), changes: $0.changes,
-                           date: Date(timeIntervalSince1970: $0.at))
-            }
-            canRedo = list.canRedo
+            // ponytail: ids count from the oldest step, so they stay put as steps are added or undone; they shift
+            // only when the history is full and the oldest step drops out.
+            finish(rows: entries.enumerated().map { offset, entry in
+                HistoryRow(id: "\(entry.group)#\(entries.count - offset)", group: entry.group, label: entry.label,
+                           principal: HistoryPrincipal(entry.principal), changes: entry.changes,
+                           date: Date(timeIntervalSince1970: entry.at))
+            }, failed: false)
         } catch {
             Self.log.error("history.list failed: \(String(describing: error), privacy: .public)")
-            rows = []
-            canRedo = false
+            guard doc == self.doc else { return }
+            finish(rows: [], failed: true)
         }
-        loaded = true
+    }
+
+    /// Publishes only what changed: a commit that leaves the list as it was re-renders nothing.
+    private func finish(rows newRows: [HistoryRow], failed: Bool) {
+        if rows != newRows { rows = newRows }
+        if loadFailed != failed { loadFailed = failed }
+        if !loaded { loaded = true }
     }
 
     /// Selective revert (N-016): undoes one step even after later edits; records changed since are kept.
     func revert(_ row: HistoryRow) async {
         guard let doc, reverting == nil else { return }
-        reverting = row.id
+        reverting = row.group
         let outcome: HistoryReceipt
         do {
-            let value = try await app.bus.execute(CommandIDs.revertGroup, ["doc": Self.ref(doc), "group": .string(row.id)],
+            let value = try await app.bus.execute(CommandIDs.revertGroup, ["doc": Self.ref(doc), "group": .string(row.group)],
                                                   session: session)
             outcome = .reverted(count: value["reverted"]?.intValue ?? 0, kept: value["skipped"]?.intValue ?? 0)
         } catch let error as NibError where error.code == .notFound {
@@ -198,6 +211,7 @@ final class HistoryViewModel: ObservableObject {
         }
         reverting = nil
         receipt = outcome
+        receiptSerial += 1
         UIAccessibility.post(notification: .announcement, argument: outcome.text)
         await reload()
     }
@@ -226,7 +240,6 @@ private struct HistoryListOutput: Decodable {
     }
 
     var entries: [Entry]
-    var canRedo: Bool
 }
 
 // MARK: - Views
@@ -248,12 +261,17 @@ struct HistoryPanel: View {
 }
 
 struct HistoryList: View {
-    @ObservedObject private var session: EditorSession
+    /// Not observed: the session also publishes zoom, scroll and selection, which would rebuild the list every frame.
+    private let session: EditorSession
     @StateObject private var model: HistoryViewModel
+    @State private var document: DocumentID?
+    @State private var readOnly: Bool
 
     init(app: NibApp, session: EditorSession) {
-        _session = ObservedObject(wrappedValue: session)
+        self.session = session
         _model = StateObject(wrappedValue: HistoryViewModel(app: app, session: session))
+        _document = State(initialValue: session.document)
+        _readOnly = State(initialValue: session.readOnly)
     }
 
     var body: some View {
@@ -262,7 +280,11 @@ struct HistoryList: View {
                 HistoryReceiptRow(receipt: receipt)
                     .transition(.opacity)
             }
-            if !model.rows.isEmpty {
+            if model.loadFailed {
+                NibEmptyState(symbol: .warningTriangle, title: String(localized: "Couldn't load the history."),
+                              primary: NibAction(String(localized: "Try Again")) { Task { await model.reload() } })
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if !model.rows.isEmpty {
                 steps
             } else if model.loaded {
                 NibEmptyState(symbol: .recents, title: String(localized: "No changes yet"),
@@ -272,8 +294,10 @@ struct HistoryList: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .animation(NibMotion.fade, value: model.receipt)
-        .task(id: session.document) { await model.show(doc: session.document) }
-        .task(id: model.receipt) {
+        .onReceive(session.$document.removeDuplicates()) { document = $0 }
+        .onReceive(session.$readOnly.removeDuplicates()) { readOnly = $0 }
+        .task(id: document) { await model.show(doc: document) }
+        .task(id: model.receiptSerial) {
             guard model.receipt != nil else { return }
             try? await Task.sleep(nanoseconds: UInt64(NibMotion.toastDuration * 1_000_000_000))
             if !Task.isCancelled { model.receipt = nil }
@@ -288,7 +312,7 @@ struct HistoryList: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(model.rows) { row in
-                    HistoryRowView(row: row, canRevert: !session.readOnly && model.reverting == nil) {
+                    HistoryRowView(row: row, canRevert: !readOnly && model.reverting == nil) {
                         Task { await model.revert(row) }
                     }
                     Rectangle()
@@ -313,22 +337,27 @@ struct HistoryRowView: View {
     @Environment(\.dynamicTypeSize) var typeSize
 
     var body: some View {
-        // At accessibility sizes the button moves under the text instead of squeezing it.
-        let layout = typeSize.isAccessibilitySize
+        // At accessibility sizes the button moves under the text, and the detail under the badge, instead of
+        // squeezing or cutting them off in a sidebar-width panel.
+        let ax = typeSize.isAccessibilitySize
+        let layout = ax
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: NibSpacing.s))
             : AnyLayout(HStackLayout(alignment: .center, spacing: NibSpacing.m))
+        let line = ax
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: NibSpacing.xs))
+            : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: NibSpacing.s))
         layout {
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 Text(row.label)
                     .font(NibFont.body)
                     .foregroundStyle(NibColor.label)
-                    .lineLimit(3)
-                HStack(alignment: .firstTextBaseline, spacing: NibSpacing.s) {
+                    .lineLimit(ax ? nil : 3)
+                line {
                     PrincipalBadge(principal: row.principal)
                     Text(row.detail())
                         .font(NibFont.caption1)
                         .foregroundStyle(NibColor.labelSecondary)
-                        .lineLimit(2)
+                        .lineLimit(ax ? nil : 2)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -360,7 +389,7 @@ struct PrincipalBadge: View {
         }
         .font(NibFont.caption2)
         .padding(.horizontal, NibSpacing.s)
-        .frame(minHeight: 20)
+        .padding(.vertical, NibSpacing.xxs)
         .background(NibColor.fill3, in: Capsule())
         .fixedSize()
     }

@@ -120,8 +120,17 @@ final class UndoGestureAttachment: NSObject, CanvasAttachment, UIGestureRecogniz
     // MARK: UIGestureRecognizerDelegate
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        guard let host, UndoGestureGate.accepts(touchIn: touch.view, canvas: host.canvasView) else { return false }
-        claimFocus()
+        guard let host else { return false }
+        return UndoGestureGate.accepts(touchIn: touch.view, canvas: host.canvasView)
+    }
+
+    /// Only the three-finger system gesture fights ours, so only three fingers down take focus: a scroll, a tap or a
+    /// pinch leaves a text field elsewhere (the assistant composer, a search or rename field) focused.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive event: UIEvent) -> Bool {
+        let fingers = event.allTouches?.filter {
+            $0.type == .direct && $0.phase != .ended && $0.phase != .cancelled
+        }.count ?? 0
+        if fingers >= 3 { claimFocus() }
         return true
     }
 
@@ -136,12 +145,15 @@ final class UndoGestureAttachment: NSObject, CanvasAttachment, UIGestureRecogniz
         true
     }
 
-    /// A finger on the canvas moves focus back to it (tapping the page ends typing elsewhere, as everywhere in
-    /// iPadOS), unless a text box or block is being edited.
+    /// Takes focus so the system's three-finger gestures stay off, unless our taps are off (setting, read-only) or a
+    /// text box or block is being edited.
     private func claimFocus() {
-        // ponytail: focus is reclaimed on finger touches and on appearing only; a contract hook on the editor view
+        // ponytail: focus is claimed on appearing and on three-finger touches only; a contract hook on the editor view
         // controller (`editingInteractionConfiguration`) would make this responder unnecessary.
-        guard let host, !host.session.isEditingText, !focus.isFirstResponder, focus.window != nil else { return }
+        guard let host, !focus.isFirstResponder, focus.window != nil,
+              UndoGestureGate.isEnabled(setting: host.app.settings.get(UndoSettings.gestures),
+                                        readOnly: host.session.readOnly, editingText: host.session.isEditingText)
+        else { return }
         focus.becomeFirstResponder()
     }
 }
