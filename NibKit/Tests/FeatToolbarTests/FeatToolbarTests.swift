@@ -32,6 +32,23 @@ struct TestTouch: NibCommand {
     }
 }
 
+/// Stand-in for the presets feature's command: the palette shows quick inks only when it exists.
+struct TestPresetSelect: NibCommand {
+    static let descriptor = CommandDescriptor(
+        id: "preset.select", title: "Select Preset", summary: "Stand-in: select a colour slot of a writing tool.",
+        examples: [[:]], effect: .session, target: .app)
+
+    static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> NoResult { NoResult() }
+}
+
+/// The library's synced prefs shared by two devices (one key per entry, like the Library Store).
+final class SharedPrefs: SyncedSettingsBackend {
+    private var values: [String: JSONValue] = [:]
+    func value(_ name: String) -> JSONValue? { values[name] }
+    func setValue(_ name: String, _ value: JSONValue?) { values[name] = value }
+    func names() -> [String] { Array(values.keys) }
+}
+
 /// Stand-in for the features that own the tools: lasso, pen (settings; options from `ui.toolMenus`), eraser (its own
 /// options bar), a non-sticky text tool and a ruler accessory that also asks for P.
 enum TestToolsFeature: NibFeature {
@@ -60,6 +77,7 @@ enum TestToolsFeature: NibFeature {
             })
         }
         app.commands.register(TestTouch.self)
+        app.commands.register(TestPresetSelect.self)
     }
 }
 
@@ -90,7 +108,7 @@ final class FeatToolbarTests: XCTestCase {
     }
 
     /// Defaults, unknown items and precedence rules of the layout, without an app.
-    func testArrangeAppliesDefaultsAndTheLayout() {
+    func testArrangeAppliesDefaultsAndTheLayout() throws {
         let entries = [entry("lasso", .lasso, hideable: false), entry("pen", .tools), entry("eraser", .tools),
                        entry("ruler", .accessories), entry("stamp", .tools, plugin: true)]
         let defaults = ToolbarLayoutEngine.arrange(entries, layout: nil)
@@ -101,7 +119,7 @@ final class FeatToolbarTests: XCTestCase {
         let layout = ToolbarLayout(order: ["ruler", "eraser", "pen"], hidden: ["pen", "lasso"])
         XCTAssertEqual(ToolbarLayoutEngine.arrange(entries, layout: layout),
                        ToolbarArrangement(shown: ["lasso", "ruler", "eraser", "stamp"], more: ["pen"]))
-        XCTAssertEqual(ToolbarLayoutEngine.sanitized(layout, entries: entries).hidden, ["pen"])
+        XCTAssertEqual(try ToolbarLayoutEngine.sanitized(layout, entries: entries).hidden, ["pen"])
 
         // Materialising keeps what the old layout said about items that are not registered right now.
         let old = ToolbarLayout(order: ["gone", "pen"], hidden: ["gone"])
@@ -210,6 +228,93 @@ final class FeatToolbarTests: XCTestCase {
         }
     }
 
+    /// Plugins and the AI write the synced layout: over-long lists and ids are refused, never stored or truncated.
+    func testLayoutListsAndIdsAreCapped() async throws {
+        let h = harness()
+        let tooMany = JSONValue.array(Array(repeating: .string("pen.item"), count: ToolbarLayoutEngine.maxIDs + 1))
+        let tooLong = JSONValue.string(String(repeating: "x", count: ToolbarLayoutEngine.maxIDLength + 1))
+        let cases: [(JSONValue, String)] = [(["order": tooMany, "hidden": []], "$.order"),
+                                            (["order": ["pen.item"], "hidden": [tooLong]], "$.hidden[0]")]
+        for (params, path) in cases {
+            do {
+                try await h.run("toolbar.setLayout", params)
+                XCTFail("an over-long layout is refused")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams)
+                XCTAssertEqual(e.path, path)
+            }
+        }
+        XCTAssertNil(ToolbarStore.current(h.app.settings), "nothing is stored")
+    }
+
+    /// ARCHITECTURE.md §4.3: saved layouts are one synced key per name, so two devices saving never overwrite each other.
+    func testSavedLayoutsFromTwoDevicesBothSurvive() async throws {
+        let prefs = SharedPrefs()
+        let ipad = Harness(features: [FeatToolbarFeature.self, TestToolsFeature.self], deviceID: 7)
+        let iphone = Harness(features: [FeatToolbarFeature.self, TestToolsFeature.self], deviceID: 8)
+        ipad.app.settings.syncedBackend = prefs
+        iphone.app.settings.syncedBackend = prefs
+
+        try await ipad.run("toolbar.setLayout", ["order": ["eraser.item", "pen.item"], "hidden": []])
+        try await ipad.run("toolbar.saveLayout", ["name": "Exam"])
+        try await iphone.run("toolbar.setLayout", ["order": ["pen.item"], "hidden": ["eraser.item"]])
+        try await iphone.run("toolbar.saveLayout", ["name": "Lecture"])
+
+        for h in [ipad, iphone] {
+            let listed = try await h.run("toolbar.layouts")
+            XCTAssertEqual(listed["layouts"]?.arrayValue?.compactMap { $0["name"]?.stringValue }, ["Exam", "Lecture"])
+        }
+        XCTAssertEqual(ToolbarStore.saved("Exam", iphone.app.settings)?.hidden.contains("eraser.item"), false)
+        XCTAssertEqual(ToolbarStore.saved("Lecture", ipad.app.settings)?.hidden.contains("eraser.item"), true)
+    }
+
+    /// The dock is stored per device and read back; iPhone docks horizontally only.
+    func testDockPersistsAndCompactIgnoresVerticalEdges() async throws {
+        let h = harness()
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let landscape = CGSize(width: 1180, height: 820)
+        let phone = CGSize(width: 390, height: 844)
+        var dock = model.dock(for: landscape, compact: false)
+        XCTAssertEqual(dock.edge.rawValue, "leading")
+        XCTAssertEqual(model.dock(for: CGSize(width: 820, height: 1180), compact: false).edge.rawValue, "top")
+        XCTAssertEqual(model.dock(for: phone, compact: true).edge.rawValue, "bottom")
+
+        dock.edge = .trailing
+        dock.along = 0.25
+        model.setDock(dock)
+        try await waitUntil("the dock is stored") {
+            h.app.settings.json(ToolbarSettings.dock.name)?["edge"]?.stringValue == "trailing"
+        }
+        let fresh = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertEqual(fresh.dock(for: landscape, compact: false), dock)
+        XCTAssertEqual(fresh.dock(for: phone, compact: true).edge.rawValue, "bottom", "a side dock does not apply on iPhone")
+    }
+
+    /// DESIGN.md §14.2: iPad shows three quick inks, iPhone one, the current ink.
+    func testIPhoneShowsOneQuickInkTheCurrentOne() {
+        let h = harness()
+        var presets = ToolPresets.defaults(for: "pen")
+        presets.selectedSwatch = 2
+        h.app.settings.set(NibSettings.presets("pen"), presets)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertEqual(model.quickInks(compact: false).map { $0.index }, [0, 1, 2])
+        XCTAssertEqual(model.quickInks(compact: true).map { $0.index }, [2])
+    }
+
+    /// Stickiness is asked afresh: a tool may read it from a setting (F026's pinned text tool).
+    func testStickinessIsReadEveryTime() throws {
+        let h = harness()
+        let settings = h.app.settings
+        h.app.ui.canvasTools.register(CanvasToolDescriptor(id: "note", title: "note", owner: TestToolsFeature.id) {
+            TestTool(id: "note", isSticky: settings.json("testtools.notePinned")?.boolValue ?? false)
+        })
+        let runtime = try XCTUnwrap(h.app.services.get(ToolbarRuntime.serviceKey, as: ToolbarRuntime.self))
+        XCTAssertFalse(runtime.isSticky("note"))
+        settings.setJSON("testtools.notePinned", true)
+        XCTAssertTrue(runtime.isSticky("note"))
+        XCTAssertTrue(runtime.isSticky("unknown"), "an unknown tool counts as sticky")
+    }
+
     func testVisibilityIsPerWindowAndTogglesWithoutAValue() async throws {
         let h = harness()
         let model = ToolbarModel(app: h.app, session: h.session)
@@ -222,6 +327,8 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertFalse(model.isVisible)
         let runtime = try XCTUnwrap(h.app.services.get(ToolbarRuntime.serviceKey, as: ToolbarRuntime.self))
         XCTAssertTrue(runtime.isVisible(other), "another window keeps its palette")
+        let listed = try await h.run("toolbar.layouts")
+        XCTAssertEqual(listed["visible"]?.boolValue, false, "readable without toggling it")
 
         try await h.run("toolbar.setVisible", ["visible": true])
         XCTAssertTrue(model.isVisible)
@@ -306,6 +413,12 @@ final class FeatToolbarTests: XCTestCase {
         // A zoom changes the visible size: not a scroll.
         h.session.visibleRect = Rect(x: 0, y: 40, width: 200, height: 300)
         h.session.visibleRect = Rect(x: 50, y: 90, width: 100, height: 150)
+        XCTAssertFalse(model.optionsCollapsed)
+
+        // Acting on the writing tool (a quick ink) brings the folded bar back too.
+        h.session.visibleRect = Rect(x: 50, y: 150, width: 100, height: 150)
+        XCTAssertTrue(model.optionsCollapsed)
+        model.selectSwatch(0)
         XCTAssertFalse(model.optionsCollapsed)
     }
 }

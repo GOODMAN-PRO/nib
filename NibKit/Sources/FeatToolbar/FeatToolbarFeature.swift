@@ -66,16 +66,11 @@ final class ToolbarRuntime: ObservableObject {
     private(set) weak var app: NibApp?
     /// Windows whose palette is hidden (`toolbar.setVisible`). Window state: never persisted.
     @Published private(set) var hiddenSessions: Set<NibID> = []
-    private var stickiness: [String: Bool] = [:]
     private var cancellables = Set<AnyCancellable>()
     private var started = false
 
     init(app: NibApp) {
         self.app = app
-        NotificationCenter.default.publisher(for: .nibRegistryDidChange, object: app.ui.canvasTools)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.stickiness.removeAll() }
-            .store(in: &cancellables)
     }
 
     func isVisible(_ session: EditorSession) -> Bool { !hiddenSessions.contains(session.id) }
@@ -88,14 +83,11 @@ final class ToolbarRuntime: ObservableObject {
         }
     }
 
-    /// `CanvasTool.isSticky` of a registered tool (unknown tools count as sticky). Cached per tool id until the tool
-    /// registry changes.
+    /// `CanvasTool.isSticky` of a registered tool (unknown tools count as sticky). Asked afresh each time: a tool may
+    /// read it from a setting (a pinned text tool). Runs only on a tool change or a user commit.
     func isSticky(_ tool: String) -> Bool {
-        if let known = stickiness[tool] { return known }
         guard let make = app?.ui.canvasTools.get(tool)?.make else { return true }
-        let sticky = make().isSticky
-        stickiness[tool] = sticky
-        return sticky
+        return make().isSticky
     }
 
     func entries(for kind: DocumentKind?) -> [ToolbarEntry] {

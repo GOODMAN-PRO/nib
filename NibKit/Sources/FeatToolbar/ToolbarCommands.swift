@@ -194,7 +194,7 @@ struct ToolbarSetLayout: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> ToolbarLayout {
         let entries = try ctx.toolbarRuntime().entries(for: nil)
-        let layout = ToolbarLayoutEngine.sanitized(ToolbarLayout(order: p.order, hidden: p.hidden), entries: entries)
+        let layout = try ToolbarLayoutEngine.sanitized(ToolbarLayout(order: p.order, hidden: p.hidden), entries: entries)
         ToolbarStore.setCurrent(layout, ctx.services.settings)
         return layout
     }
@@ -271,17 +271,20 @@ struct ToolbarLayouts: NibCommand {
         var layouts: [NamedToolbarLayout]
         /// Every palette item of the current document kind: the palette in order, then the items in More.
         var items: [ItemState]
+        /// Whether the palette shows in the current window (`toolbar.setVisible`); absent without a window.
+        var visible: Bool?
     }
 
     static let descriptor = CommandDescriptor(
         id: "toolbar.layouts", title: "Toolbar Layouts",
-        summary: "List saved toolbar layouts, the current layout, and every palette item with whether it is on the palette.",
+        summary: "List saved toolbar layouts, the current layout, every palette item with whether it is on the palette, and whether the palette shows in this window.",
         params: .empty, examples: [[:]], effect: .read, target: .app)
 
     static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> Output {
         let s = ctx.services.settings
         let current = ToolbarStore.current(s)
-        let entries = try ctx.toolbarRuntime().entries(for: ctx.toolbarDocumentKind)
+        let runtime = try ctx.toolbarRuntime()
+        let entries = runtime.entries(for: ctx.toolbarDocumentKind)
         let arrangement = ToolbarLayoutEngine.arrange(entries, layout: current)
         let onPalette = Set(arrangement.shown)
         let byID = Dictionary(entries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -293,7 +296,8 @@ struct ToolbarLayouts: NibCommand {
         let layouts = ToolbarStore.savedNames(s).compactMap { name in
             ToolbarStore.saved(name, s).map { NamedToolbarLayout(name: name, layout: $0) }
         }
-        return Output(current: current, layouts: layouts, items: items)
+        return Output(current: current, layouts: layouts, items: items,
+                      visible: ctx.activeSession.map { runtime.isVisible($0) })
     }
 }
 
@@ -338,7 +342,7 @@ struct ToolbarApplyLayout: NibCommand {
             throw NibError(.notFound, "no saved toolbar layout named '\(name)'",
                            hint: "call toolbar.layouts for the saved names")
         }
-        let layout = ToolbarLayoutEngine.sanitized(saved, entries: try ctx.toolbarRuntime().entries(for: nil))
+        let layout = try ToolbarLayoutEngine.sanitized(saved, entries: ctx.toolbarRuntime().entries(for: nil))
         ToolbarStore.setCurrent(layout, s)
         return NamedToolbarLayout(name: name, layout: layout)
     }

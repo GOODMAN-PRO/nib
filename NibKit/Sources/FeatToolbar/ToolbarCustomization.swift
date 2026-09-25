@@ -90,8 +90,23 @@ enum ToolbarLayoutEngine {
                              hidden: unique(arrangement.more + old.hidden.filter { !ids.contains($0) }))
     }
 
-    /// Drops duplicates, empty ids and items that cannot be hidden from `hidden`.
-    static func sanitized(_ layout: ToolbarLayout, entries: [ToolbarEntry]) -> ToolbarLayout {
+    /// A layout is a synced setting that plugins and the AI write: each list and each id is capped.
+    static let maxIDs = 512
+    static let maxIDLength = 128
+
+    /// Drops duplicates, empty ids and items that cannot be hidden from `hidden`. Throws when a list or an id is over
+    /// its cap rather than truncating it.
+    static func sanitized(_ layout: ToolbarLayout, entries: [ToolbarEntry]) throws -> ToolbarLayout {
+        for (key, ids) in [("order", layout.order), ("hidden", layout.hidden)] {
+            guard ids.count <= maxIDs else {
+                throw NibError(.invalidParams, "\(key) lists at most \(maxIDs) toolbar item ids", path: "$.\(key)",
+                               hint: "call toolbar.layouts for the item ids; items a layout leaves out keep their defaults")
+            }
+            if let i = ids.firstIndex(where: { $0.count > maxIDLength }) {
+                throw NibError(.invalidParams, "a toolbar item id is at most \(maxIDLength) characters",
+                               path: "$.\(key)[\(i)]", hint: "call toolbar.layouts for the item ids")
+            }
+        }
         let fixed = Set(entries.filter { !$0.hideable }.map { $0.id })
         return ToolbarLayout(order: unique(layout.order.filter { !$0.isEmpty }),
                              hidden: unique(layout.hidden.filter { !$0.isEmpty && !fixed.contains($0) }))
@@ -310,11 +325,8 @@ struct ToolbarCustomizationView: View {
             Section {
                 ForEach(model.savedNames, id: \.self) { name in
                     NibRow(name, icon: .listView) {
-                        Button(String(localized: "Apply")) { model.apply(name) }
-                            .font(NibFont.button)
-                            .foregroundStyle(NibColor.accent)
+                        NibButton(String(localized: "Apply"), kind: .plain, size: .compact) { model.apply(name) }
                             .buttonStyle(.borderless)
-                            .frame(minHeight: NibMetrics.hitTarget)
                             .accessibilityLabel(String(localized: "Apply \(name)"))
                     }
                 }
@@ -335,13 +347,8 @@ struct ToolbarCustomizationView: View {
             }
 
             Section {
-                Button {
+                NibButton(String(localized: "Reset Toolbar"), kind: .destructive, size: .compact) {
                     confirmingReset = true
-                } label: {
-                    Text(String(localized: "Reset Toolbar"))
-                        .font(NibFont.body)
-                        .foregroundStyle(NibColor.destructive)
-                        .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
                 }
                 .buttonStyle(.borderless)
             }
@@ -382,7 +389,7 @@ struct ToolbarCustomizationView: View {
             Image(nib: control == .hide ? .minus : .plus)
                 .font(NibFont.glyph(.round))
                 .foregroundStyle(NibColor.onAccent)
-                .frame(width: 22, height: 22)
+                .frame(width: NibSpacing.xxl, height: NibSpacing.xxl)
                 .background(control == .hide ? NibColor.destructive : NibColor.success, in: Circle())
                 .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
                 .contentShape(Rectangle())

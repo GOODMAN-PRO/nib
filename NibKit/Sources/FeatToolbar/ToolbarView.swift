@@ -16,7 +16,8 @@ final class ToolbarHostView: UIView {
     init(app: NibApp, session: EditorSession) {
         let model = ToolbarModel(app: app, session: session)
         self.model = model
-        host = UIHostingController(rootView: ToolbarRootView(model: model))
+        let inking = app.services.get(ToolbarModel.inkingKey(session), as: NibInkingState.self)
+        host = UIHostingController(rootView: ToolbarRootView(model: model, inking: inking))
         super.init(frame: .zero)
         backgroundColor = .clear
         host.view.backgroundColor = .clear
@@ -52,10 +53,13 @@ final class ToolbarHostView: UIView {
     }
 
     /// Only what SwiftUI draws takes a touch. Before iOS 18 SwiftUI content hit-tests as views other than the hosting
-    /// view; from iOS 18 it hit-tests as the hosting view itself, so its subviews are asked instead. While a settings
-    /// bud is open every touch is ours: a touch outside it only closes it and never inks (DESIGN.md §10.6).
-    // ponytail: UIKit-side heuristic because the contract hands the chrome a UIView; a SwiftUI toolbar screen placed in
-    // the chrome's own droplet container would make it (and the second container) unnecessary.
+    /// view; from iOS 18 it hit-tests as the hosting view itself, so its subviews are asked instead. While the chevron's
+    /// settings bud is open every touch is ours: a touch outside it only closes it and never inks (DESIGN.md §10.6).
+    // ponytail: UIKit-side heuristic because the contract hands the chrome a UIView. Its ceiling: NibToolPalette keeps
+    // its own settings popover and More grid in private state, so this guard cannot cover them: the container's
+    // dismiss catcher should take that touch before iOS 18 (a view of its own) but looks like empty space here from
+    // iOS 18 (unverified on device). Upgrade path (contract request): NibToolPalette reports settingsPresented/morePresented bindings to OR in
+    // below, or a SwiftUI toolbar screen rendered inside the chrome's single droplet container makes all of this go.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard let hit = super.hitTest(point, with: event), let root = host.view else { return nil }
         if model.settingsBudOpen { return hit }
@@ -114,6 +118,11 @@ final class ToolbarModel: ObservableObject {
     /// Page points of scrolling that fold the options bar away (T-109).
     static let collapseTravel: Double = 24
     static let presetSelect = "preset.select"
+
+    /// The window's Pencil state (`NibInkingState`), registered by the document chrome (F017) before it builds this
+    /// screen; the palette's droplet container reads it so the palette recedes and stops sampling under a stroke.
+    // ponytail: F017's key, not a contract key yet (contract request: the chrome's single container or a contract key).
+    static func inkingKey(_ session: EditorSession) -> String { "chrome.inking." + session.id.raw }
 
     let app: NibApp
     let session: EditorSession
@@ -341,6 +350,7 @@ final class ToolbarModel: ObservableObject {
     func options(for id: String) -> AnyView? {
         guard !optionsCollapsed, let d = descriptors[id] else { return nil }
         return ActiveToolMenuHost.optionsBar(for: d, app: app, session: session) { [weak self] in
+            self?.expandOptions()
             self?.settingsBudOpen = true
         }
     }
@@ -361,8 +371,16 @@ final class ToolbarModel: ObservableObject {
         }
     }
 
-    /// A quick colour: the current writing tool's colour slot, switching back to that tool if another is active.
+    /// The palette's quick inks: three on iPad; on iPhone one, the current ink (DESIGN.md §14.2).
+    func quickInks(compact: Bool) -> [QuickSwatch] {
+        guard compact, let first = swatches.first else { return swatches }
+        return [swatches.first { $0.index == swatchIndex } ?? first]
+    }
+
+    /// A quick colour: the current writing tool's colour slot, switching back to that tool if another is active. Acting
+    /// on the writing tool brings its folded options bar back.
     func selectSwatch(_ index: Int) {
+        expandOptions()
         app.perform(Self.presetSelect, ["tool": .string(inkTool), "swatch": .number(Double(index))], session: session)
         if session.tool != inkTool, app.ui.canvasTools.get(inkTool) != nil {
             app.perform(CommandIDs.toolSelect, ["tool": .string(inkTool)], session: session)
@@ -397,10 +415,12 @@ final class ToolbarModel: ObservableObject {
 
 struct ToolbarRootView: View {
     @ObservedObject var model: ToolbarModel
+    /// The window's Pencil state: the palette recedes near a live stroke and stops sampling the page (DESIGN.md §10.8).
+    let inking: NibInkingState?
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
-        NibDropletContainer {
+        NibDropletContainer(inking: inking) {
             GeometryReader { proxy in
                 layer(size: proxy.size, safe: proxy.safeAreaInsets)
             }
@@ -411,12 +431,13 @@ struct ToolbarRootView: View {
     private func layer(size: CGSize, safe: EdgeInsets) -> some View {
         let compact = sizeClass == .compact
         let dock = model.dock(for: size, compact: compact)
+        let inks = model.quickInks(compact: compact)
         ZStack(alignment: .topLeading) {
             if model.showsPalette {
                 if model.isVisible {
                     NibToolPalette(id: ToolbarModel.paletteID, tools: model.shown.map { tool($0) },
                                    moreTools: model.more.map { tool($0) }, selection: selection,
-                                   swatches: model.swatches.map { swatch($0) }, swatch: swatchIndex,
+                                   swatches: inks.map { swatch($0) }, swatch: swatchIndex(inks),
                                    dock: Binding(get: { dock }, set: { model.setDock($0) }),
                                    options: { model.options(for: $0) }) { id in
                         ToolSettingsContent(model: model, toolID: id)
@@ -435,8 +456,10 @@ struct ToolbarRootView: View {
         Binding(get: { model.tool }, set: { model.select($0) })
     }
 
-    private var swatchIndex: Binding<Int> {
-        Binding(get: { model.swatchIndex }, set: { model.selectSwatch($0) })
+    /// Positions in `inks`, which on iPhone holds only the current ink.
+    private func swatchIndex(_ inks: [QuickSwatch]) -> Binding<Int> {
+        Binding(get: { inks.firstIndex { $0.index == model.swatchIndex } ?? -1 },
+                set: { i in if inks.indices.contains(i) { model.selectSwatch(inks[i].index) } })
     }
 
     /// Shortcuts are the shell's single-key commands (canvas scope, off while typing, never animated); a palette
