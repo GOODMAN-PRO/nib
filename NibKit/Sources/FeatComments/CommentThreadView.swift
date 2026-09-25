@@ -236,44 +236,69 @@ final class CommentThreadModel: ObservableObject {
         }
     }
 
+    /// Ink commits are frequent: only writes to the shown thread (the changeset's own values) or to the page table
+    /// touch the panel, and nothing here ever scans the document.
     private func committed(_ cs: Changeset) {
-        guard let target = state?.target(for: session) else { return }
+        guard let state = state, let target = state.target(for: session) else { return }
         let doc: DocumentID
         switch target {
         case let .thread(d, _, _): doc = d
         case let .draft(draft): doc = draft.doc
         }
-        if cs.documents.contains(doc) { reload(target) }
+        guard cs.documents.contains(doc) else { return }
+        var pagesChanged = false
+        var writes: [PageID: Item] = [:]   // the thread's last write per page
+        for m in cs.mutations where m.document == doc {
+            switch m {
+            case .page:
+                pagesChanged = true
+            case let .item(_, p, _, after):
+                if case let .thread(_, _, id) = target, after.id == id { writes[p] = after }
+            default:
+                break
+            }
+        }
+        guard case let .thread(_, page, id) = target else {
+            if pagesChanged { reload(target) }   // the draft's page title
+            return
+        }
+        if let moved = writes.first(where: { $0.key != page && !$0.value.deleted })?.key {
+            // item.moveToPage keeps ids: follow the thread (the targets sink reloads).
+            state.focus(.thread(doc: doc, page: moved, id: id), in: session)
+        } else if pagesChanged {
+            reload(target)
+        } else if let item = writes[page] {
+            show(item.deleted || item.comment == nil ? .missing : .thread(doc: doc, page: page, item: item))
+        }
     }
 
     private func reload(_ target: CommentsState.Target?) {
         switch target {
         case nil:
-            content = .empty
+            show(.empty, title: "")
         case .draft(let draft)?:
-            content = .draft(draft)
-            pageTitle = title(doc: draft.doc, page: draft.page)
+            show(.draft(draft), title: title(doc: draft.doc, page: draft.page) ?? "")
         case let .thread(doc, page, id)?:
-            if let item = try? app.workspace.item(doc, page: page, id: id), item.comment != nil {
-                content = .thread(doc: doc, page: page, item: item)
-                pageTitle = title(doc: doc, page: page)
-            } else if let moved = try? app.workspace.page(ofItem: id, in: doc),
-                      let item = try? app.workspace.item(doc, page: moved, id: id), item.comment != nil {
-                // item.moveToPage keeps ids: follow the thread. Refocus later: this may run inside the focus change.
-                content = .thread(doc: doc, page: moved, item: item)
-                pageTitle = title(doc: doc, page: moved)
-                let state = self.state
-                let session = self.session
-                Task { @MainActor in state?.focus(.thread(doc: doc, page: moved, id: id), in: session) }
+            // Only its own page: a thread that moves is followed in `committed`.
+            if let title = title(doc: doc, page: page), let item = try? app.workspace.item(doc, page: page, id: id),
+               item.comment != nil {
+                show(.thread(doc: doc, page: page, item: item), title: title)
             } else {
-                content = .missing
+                show(.missing)
             }
         }
     }
 
-    private func title(doc: DocumentID, page: PageID) -> String {
+    /// Publishes only real changes, so the message list does not re-render (and re-detect links) for nothing.
+    private func show(_ new: Content, title: String? = nil) {
+        if content != new { content = new }
+        if let title = title, pageTitle != title { pageTitle = title }
+    }
+
+    /// nil when the page is gone.
+    private func title(doc: DocumentID, page: PageID) -> String? {
         guard let content = try? app.workspace.content(doc), let index = content.pageIndex(page),
-              let record = content.page(page) else { return "" }
+              let record = content.page(page) else { return nil }
         return CommentFormat.pageTitle(record, index: index, kind: content.meta.kind)
     }
 
@@ -325,11 +350,12 @@ final class CommentThreadModel: ObservableObject {
 
 // MARK: - View
 
-/// The thread panel (a floating Deep panel; a sheet in compact windows; the chrome draws its header): messages with
-/// author and time, clickable links, edit / copy / delete per message, Resolve, the thread menu, and a composer
-/// where ⌘⏎ sends.
+/// The thread panel (a floating Deep panel; a sheet in compact windows): `NibPanelHeader` with Resolve, the thread
+/// menu and Close, then messages with author and time, clickable links, edit / copy / delete per message, and a
+/// composer where ⌘⏎ sends.
 struct CommentThreadView: View {
     @StateObject private var model: CommentThreadModel
+    private let dismiss: @MainActor () -> Void
     @State private var reply = ""
     @State private var sending = false
     @State private var editing: NibID?
@@ -340,10 +366,13 @@ struct CommentThreadView: View {
     init(context: PanelContext) {
         _model = StateObject(wrappedValue: CommentThreadModel(app: context.app,
                                                               session: context.session ?? context.app.services.sessions.active))
+        dismiss = context.dismiss
     }
 
     var body: some View {
         VStack(spacing: 0) {
+            header
+            hairline
             switch model.content {
             case .empty:
                 placeholder(String(localized: "No comment open"),
@@ -352,7 +381,6 @@ struct CommentThreadView: View {
                 placeholder(String(localized: "Comment not found"),
                             String(localized: "It was deleted. Undo brings it back."))
             case .draft:
-                header(String(localized: "New comment · \(model.pageTitle)"), comment: nil)
                 Spacer(minLength: 0)
                 if !model.readOnly {
                     hairline
@@ -360,8 +388,6 @@ struct CommentThreadView: View {
                 }
             case let .thread(_, _, item):
                 if let comment = item.comment {
-                    header(threadTitle(comment), comment: comment)
-                    hairline
                     messages(comment)
                     if !model.readOnly {
                         hairline
@@ -406,18 +432,25 @@ struct CommentThreadView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func threadTitle(_ comment: CommentItem) -> String {
-        comment.resolved ? String(localized: "\(model.pageTitle) · Resolved") : model.pageTitle
+    private var thread: CommentItem? {
+        if case let .thread(_, _, item) = model.content { return item.comment }
+        return nil
     }
 
-    private func header(_ title: String, comment: CommentItem?) -> some View {
-        HStack(spacing: NibSpacing.xs) {
-            Text(title)
-                .font(NibFont.caption1Emphasis)
-                .foregroundStyle(NibColor.labelSecondary)
-                .lineLimit(2)
-                .accessibilityAddTraits(.isHeader)
-            Spacer(minLength: NibSpacing.s)
+    private var subtitle: String? {
+        switch model.content {
+        case .empty, .missing: return nil
+        case .draft: return String(localized: "\(model.pageTitle) · New comment")
+        case .thread:
+            return thread?.resolved == true ? String(localized: "\(model.pageTitle) · Resolved") : model.pageTitle
+        }
+    }
+
+    private var header: some View {
+        let comment = thread
+        return NibPanelHeader(title: String(localized: "Comment"), subtitle: subtitle, symbol: .comment,
+                              badge: comment.flatMap { $0.resolved ? nil : .number($0.messages.count) },
+                              onClose: { dismiss() }) {
             if let comment = comment, let ref = model.ref {
                 if !model.readOnly {
                     NibIconButton(comment.resolved ? .checkCircleFill : .checkCircle,
@@ -441,9 +474,6 @@ struct CommentThreadView: View {
                 .accessibilityLabel(String(localized: "More"))
             }
         }
-        .padding(.leading, NibSpacing.l)
-        .padding(.trailing, NibSpacing.xs)
-        .frame(minHeight: NibMetrics.hitTarget)
     }
 
     private func messages(_ comment: CommentItem) -> some View {
@@ -517,7 +547,7 @@ struct CommentThreadView: View {
                 editText = message.text
                 editing = message.id
             } label: {
-                Label { Text(String(localized: "Edit")) } icon: { Image(nib: .pencil) }
+                Label { Text(String(localized: "Edit Message")) } icon: { Image(nib: .pencil) }
             }
         }
         Button(String(localized: "Copy Text")) { UIPasteboard.general.string = message.text }
@@ -525,7 +555,7 @@ struct CommentThreadView: View {
             Button(role: .destructive) {
                 if isOnly { lastMessagePendingDelete = message.id } else { model.delete(message.id) }
             } label: {
-                Label { Text(String(localized: "Delete")) } icon: { Image(nib: .trash) }
+                Label { Text(String(localized: "Delete Message")) } icon: { Image(nib: .trash) }
             }
         }
     }

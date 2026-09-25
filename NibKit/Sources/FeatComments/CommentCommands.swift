@@ -38,9 +38,11 @@ enum CommentRules {
     static func hitRadius(zoom: Double) -> Double { max(pinDiameter / 2, 22 / max(zoom, 0.05)) }
 
     /// The visible pin nearest to `point` within `radius`; on a tie the topmost (items are in z order, bottom first).
-    static func hit(_ items: [Item], at point: Point, radius: Double, showResolved: Bool) -> Item? {
+    /// Pins on layers hidden on this device are not drawn, so they cannot be hit.
+    static func hit(_ items: [Item], at point: Point, radius: Double, showResolved: Bool,
+                    hiddenLayers: Set<Int> = []) -> Item? {
         var best: (item: Item, distance: Double)?
-        for it in items where !it.deleted {
+        for it in items where !it.deleted && !hiddenLayers.contains(it.layer) {
             guard let c = it.comment, isVisible(c, showResolved: showResolved) else { continue }
             let d = c.anchor.distance(to: point)
             if d <= radius, d <= (best?.distance ?? .infinity) { best = (it, d) }
@@ -216,9 +218,16 @@ struct CommentAdd: NibCommand {
             return Output(draft: true)
         }
         let text = try CommentRules.text(p.text, path: "$.text")
-        if let id = p.id, try ctx.workspace.page(ofItem: NibID(id), in: place.doc) != nil {
-            throw NibError(.conflict, "an item with id \(id) already exists", path: "$.id",
-                           hint: "choose another id or leave it out")
+        if let id = p.id {
+            // Tombstones count too: reusing a deleted item's id on another page would leave two live items with one
+            // id once that deletion is undone. ponytail: loads every page, but only for caller-chosen ids.
+            let wanted = NibID(id)
+            for page in try ctx.workspace.content(place.doc).pages {
+                guard let found = try ctx.workspace.allItems(place.doc, page: page.id).first(where: { $0.id == wanted }),
+                      !found.deleted || page.id != place.page else { continue }
+                throw NibError(.conflict, "an item with id \(id) already exists", path: "$.id",
+                               hint: "choose another id or leave it out")
+            }
         }
         let message = CommentMessage(author: CommentRules.author(for: ctx.principal, settings: ctx.services.settings),
                                      text: text)
@@ -379,18 +388,19 @@ struct CommentTapAt: NibCommand {
         }
         let point = try CommentRules.point(p.point, path: "$.point")
         let showResolved = ctx.services.settings.get(CommentSettings.showResolved)
+        let hiddenLayers = ctx.activeSession?.hiddenLayers ?? []
         var thread: Item?
         // The canvas passes the topmost item under every tap, so from there only a pin that is drawn may open.
         // Refs from the Comments list and from comment links open what they name.
         if let ref = p.ref, case let .item(refDoc, refPage, id)? = NodeRef(ref), refDoc == doc, refPage == page,
            let it = try? ctx.workspace.item(doc, page: page, id: id), let c = it.comment,
-           p.gesture == nil || CommentRules.isVisible(c, showResolved: showResolved) {
+           p.gesture == nil || (CommentRules.isVisible(c, showResolved: showResolved) && !hiddenLayers.contains(it.layer)) {
             thread = it
         }
         if thread == nil {
             let items = (try? ctx.workspace.items(doc, page: page)) ?? []
             thread = CommentRules.hit(items, at: point, radius: CommentRules.hitRadius(zoom: ctx.activeSession?.zoom ?? 1),
-                                      showResolved: showResolved)
+                                      showResolved: showResolved, hiddenLayers: hiddenLayers)
         }
         guard let found = thread else { return Output(handled: false, ref: nil) }
         let ref = NodeRef.item(doc, page, found.id).description

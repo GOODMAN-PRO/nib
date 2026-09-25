@@ -124,12 +124,12 @@ enum CommentMenus {
             params: { objectParams($0) }, isVisible: { canAddOnSelection($0) }))
 
         menus.register(MenuItemDescriptor(
-            id: resolveID, title: String(localized: "Resolve"), icon: NibSymbol.checkCircle.name,
+            id: resolveID, title: String(localized: "Resolve Thread"), icon: NibSymbol.checkCircle.name,
             location: .comment, order: 100, owner: owner, command: CommentResolve.descriptor.id,
             params: { ["ref": .string($0.ref ?? ""), "resolved": true] },
             isVisible: { ctx in canEdit(ctx) && thread(ctx).map { !$0.resolved } == true }))
         menus.register(MenuItemDescriptor(
-            id: reopenID, title: String(localized: "Reopen"), icon: NibSymbol.undo.name,
+            id: reopenID, title: String(localized: "Reopen Thread"), icon: NibSymbol.undo.name,
             location: .comment, order: 100, owner: owner, command: CommentResolve.descriptor.id,
             params: { ["ref": .string($0.ref ?? ""), "resolved": false] },
             isVisible: { ctx in canEdit(ctx) && thread(ctx).map { $0.resolved } == true }))
