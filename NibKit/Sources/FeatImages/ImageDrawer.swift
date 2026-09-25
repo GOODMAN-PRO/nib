@@ -396,7 +396,7 @@ final class AnimatedImageView: UIView {
     let imageView = UIImageView()
     private let maskLayer = CAShapeLayer()
     private var crop: Rect?
-    private var mask: [Point]?
+    private var outline: [Point]?
     private var flip = ImageFlip()
 
     override init(frame: CGRect) {
@@ -411,7 +411,7 @@ final class AnimatedImageView: UIView {
 
     func configure(crop: Rect?, mask: [Point]?, flip: ImageFlip) {
         self.crop = crop
-        self.mask = mask
+        self.outline = mask
         self.flip = flip
         setNeedsLayout()
     }
@@ -422,7 +422,7 @@ final class AnimatedImageView: UIView {
         imageView.bounds = CGRect(origin: .zero, size: bounds.size)
         imageView.center = CGPoint(x: bounds.midX, y: bounds.midY)
         imageView.transform = CGAffineTransform(scaleX: flip.x ? -1 : 1, y: flip.y ? -1 : 1)
-        guard let mask = mask, mask.count >= 3 else {
+        guard let mask = outline, mask.count >= 3 else {
             imageView.layer.mask = nil
             return
         }
