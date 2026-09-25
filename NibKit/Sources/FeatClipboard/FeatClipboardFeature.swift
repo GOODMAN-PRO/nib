@@ -30,7 +30,8 @@ public enum FeatClipboardFeature: NibFeature {
         key("duplicate", String(localized: "Duplicate"), KeyShortcut("d", [.command]), ItemDuplicate.descriptor.id, order: 304)
 
         app.ui.menus.register(MenuItemDescriptor(
-            id: "clipboard.pasteAndMatchStyle", title: String(localized: "Paste and Match Style"), icon: "doc.on.clipboard",
+            // ponytail: no icon until NibSymbol has a paste glyph (contract gap: raw SF Symbol strings are not allowed).
+            id: "clipboard.pasteAndMatchStyle", title: String(localized: "Paste and Match Style"), icon: nil,
             location: .pageLongPress, order: 110, owner: id, command: ClipboardPaste.descriptor.id,
             params: { ctx in matchStyleParams(ctx) },
             isVisible: { ctx in

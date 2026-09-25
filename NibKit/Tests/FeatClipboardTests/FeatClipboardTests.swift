@@ -5,32 +5,23 @@ import NibContracts
 import NibTesting
 @testable import FeatClipboard
 
-/// An in-memory pasteboard, so tests never touch (or wait on) the simulator's.
-final class MemoryBoard: ClipboardBoard {
-    var items: [[String: Any]] = []
-
-    func contains(_ types: [String]) -> Bool { items.contains { item in types.contains { item[$0] != nil } } }
-    var hasStrings: Bool { !strings.isEmpty }
-
-    func data(_ type: String) -> [Data] {
-        items.compactMap { item in (item[type] as? Data) ?? (item[type] as? String).map { Data($0.utf8) } }
-    }
-
-    var strings: [String] { items.compactMap { $0[UTType.utf8PlainText.identifier] as? String } }
-    func write(_ representations: [String: Any]) { items = [representations] }
-}
-
 @MainActor
 final class FeatClipboardTests: XCTestCase {
     private var page1: String { "item:FIXTUREDOC01/FIXTUREPG001/" }
 
-    private func useMemoryBoard() -> MemoryBoard {
-        let board = MemoryBoard()
+    /// A fresh in-memory pasteboard for one test (hostless runs never use the simulator's).
+    private func useMemoryBoard() -> InMemoryClipboardBoard {
+        let board = InMemoryClipboardBoard()
         Clipboard.board = board
         return board
     }
 
-    private func restoreBoard() { Clipboard.board = SystemClipboardBoard() }
+    private func restoreBoard() { Clipboard.board = InMemoryClipboardBoard() }
+
+    func testHostlessRunsUseAnInMemoryBoard() {
+        _ = Harness(features: [FeatClipboardFeature.self])
+        XCTAssertTrue(Clipboard.board is InMemoryClipboardBoard)
+    }
 
     private func refs(_ value: JSONValue) -> [String] { value["refs"]?.arrayValue?.compactMap { $0.stringValue } ?? [] }
 
@@ -294,6 +285,117 @@ final class FeatClipboardTests: XCTestCase {
         board.items = [[UTType.utf8PlainText.identifier: "Some text"]]
         let entry = try? XCTUnwrap(h.app.ui.menuItems(.pageLongPress, context).first { $0.id == "clipboard.pasteAndMatchStyle" })
         XCTAssertEqual(entry?.params(context), ["matchStyle": true, "page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [50, 60]])
+    }
+
+    /// Read-only mode (F042): ⌘X, ⌘V, ⌥⇧⌘V and ⌘D change nothing.
+    func testReadOnlyModeBlocksCutPasteAndDuplicate() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        board.items = [[UTType.utf8PlainText.identifier: "Pasted"]]
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        h.session.readOnly = true
+        let before = try h.snapshot()
+
+        let cut = try await h.run("clipboard.cut", [:])
+        XCTAssertEqual(cut["count"], 0)
+        XCTAssertEqual(cut["removed"], [])
+        let paste = try await h.run("clipboard.paste", [:])
+        XCTAssertEqual(paste["source"], "empty")
+        let matchStyle = try await h.run("clipboard.paste", ["matchStyle": true])
+        XCTAssertEqual(matchStyle["source"], "empty")
+        let duplicate = try await h.run("item.duplicate", [:])
+        XCTAssertEqual(refs(duplicate), [])
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        XCTAssertEqual(board.strings, ["Pasted"], "the clipboard is left alone too")
+
+        // Read-only mode is the user's window mode: it never blocks an AI call.
+        let out = try await h.run("item.duplicate", ["refs": [.string(page1 + "FIXTURESHP01")]], as: .ai("t"))
+        XCTAssertEqual(refs(out).count, 1)
+    }
+
+    /// ⌘V in a window without a canvas page (text documents, study sets) is a quiet no-op for the user.
+    func testUserPasteWithoutAPageIsQuiet() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        board.items = [[UTType.utf8PlainText.identifier: "Pasted"]]
+        h.session.page = nil
+        let out = try await h.run("clipboard.paste", [:])
+        XCTAssertEqual(out["source"], "empty")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    /// AI, plugins and the bridge pass `page` (schema) and may pass `fragment`; without one they only ever read a Nib
+    /// fragment from the pasteboard, never another app's content.
+    func testPasteAsANonUserPrincipal() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+
+        let result = try await h.app.bus.execute(Invocation(command: "clipboard.paste", params: ClipboardPaste.fragmentExample,
+                                                            principal: .ai("t"), session: h.session))
+        XCTAssertEqual(result.value["source"], "fragment")
+        let pasted = try items(refs(result.value), in: h)
+        XCTAssertEqual(pasted.map { $0.kind }, [.shape, .text, .connector])
+        XCTAssertEqual(pasted[1].attachedTo, pasted[0].id)
+        XCTAssertEqual(pasted[2].connector?.from.item, pasted[0].id)
+        XCTAssertTrue(pasted.allSatisfy { $0.createdBy == "ai:t" })
+
+        do {
+            _ = try await h.run("clipboard.paste", ["fragment": ClipboardPaste.fragmentExample["fragment"] ?? .null], as: .ai("t"))
+            XCTFail("callers other than the user must name the page")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+        }
+
+        let target: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [100, 100]]
+        board.items = [[UTType.utf8PlainText.identifier: "Another app's text"]]
+        let foreign = try await h.run("clipboard.paste", target, as: .ai("t"))
+        XCTAssertEqual(foreign["source"], "empty")
+        guard case var .object(matchStyle) = target else { return XCTFail("target is an object") }
+        matchStyle["matchStyle"] = true
+        let foreignText = try await h.run("clipboard.paste", .object(matchStyle), as: .ai("t"))
+        XCTAssertEqual(foreignText["source"], "empty")
+
+        // The AI's own copy puts a fragment on the board, so its copy then paste still works.
+        _ = try await h.run("clipboard.copy", ["refs": [.string(page1 + "FIXTURESHP01")]], as: .ai("t"))
+        let own = try await h.run("clipboard.paste", target, as: .ai("t"))
+        XCTAssertEqual(own["source"], "fragment")
+        XCTAssertEqual(refs(own).count, 1)
+    }
+
+    /// Any app can put a broken `app.nib.fragment` on the pasteboard: paste falls through to the other flavours.
+    func testMalformedPasteboardFragmentFallsThrough() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        board.items = [[Fragment.typeIdentifier: Data("{not a fragment".utf8), UTType.utf8PlainText.identifier: "Fallback"]]
+        let out = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertEqual(out["source"], "text")
+        XCTAssertEqual(try items(refs(out), in: h).first?.text?.text.plainText, "Fallback")
+
+        board.items = [[Fragment.typeIdentifier: Data("{not a fragment".utf8)]]
+        let broken = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertEqual(broken["source"], "empty")
+    }
+
+    /// A drag dropped back on its own canvas moves the selection: same page = item.transform, other page = item.moveToPage.
+    func testOwnDragDropRouting() {
+        let source = CanvasDragContext(host: ObjectIdentifier(self), doc: Fixtures.docID, page: Fixtures.page1,
+                                       start: Point(150, 240), bounds: Rect(x: 100, y: 200, width: 120, height: 90),
+                                       refs: [page1 + "FIXTURESHP01"])
+        XCTAssertNil(CanvasDragDrop.moveCommand(source, to: Fixtures.page1, point: Point(150, 240)), "dropped where it was lifted")
+
+        let same = CanvasDragDrop.moveCommand(source, to: Fixtures.page1, point: Point(160, 235))
+        XCTAssertEqual(same?.command, "item.transform")
+        XCTAssertEqual(same?.params, ["refs": [.string(page1 + "FIXTURESHP01")], "translate": [10, -5]])
+
+        let other = CanvasDragDrop.moveCommand(source, to: Fixtures.page2, point: Point(150, 250))
+        XCTAssertEqual(other?.command, "item.moveToPage")
+        XCTAssertEqual(other?.params, ["refs": [.string(page1 + "FIXTURESHP01")], "page": "page:FIXTUREDOC01/FIXTUREPG002",
+                                       "offset": [0, 10]])
     }
 
     func testDropReaderTurnsProvidersIntoFragments() async throws {

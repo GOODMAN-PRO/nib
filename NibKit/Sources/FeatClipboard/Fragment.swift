@@ -132,6 +132,22 @@ struct Fragment: Equatable {
             n.layer = min(max(layer ?? n.layer, 0), NibLimits.layerCount - 1)
             out.append(n)
         }
+        // Fragments from AI, plugins and the pasteboard are untrusted: the item that closes an attachment loop
+        // (A→A, A→B→A…) lets go, so nothing that follows `attachedTo` chains can spin.
+        var parent: [ElementID: ElementID] = [:]
+        for n in out { if let p = n.attachedTo { parent[n.id] = p } }
+        for i in out.indices {
+            var seen = Set<ElementID>()
+            var next = out[i].attachedTo
+            while let p = next, seen.insert(p).inserted {
+                if p == out[i].id {
+                    out[i].attachedTo = nil
+                    parent[out[i].id] = nil
+                    break
+                }
+                next = parent[p]
+            }
+        }
         return out
     }
 

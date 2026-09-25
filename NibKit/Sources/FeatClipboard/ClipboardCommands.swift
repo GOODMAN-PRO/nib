@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import os
 import UniformTypeIdentifiers
 import NibContracts
 
@@ -34,10 +35,28 @@ final class SystemClipboardBoard: ClipboardBoard {
     func write(_ representations: [String: Any]) { board.setItems([representations], options: [:]) }
 }
 
+/// A pasteboard in memory: hostless tests never touch (or wait on, or prompt for) the simulator's.
+final class InMemoryClipboardBoard: ClipboardBoard {
+    /// One dictionary per pasteboard item (type identifier → `Data` or `String`).
+    var items: [[String: Any]] = []
+
+    func contains(_ types: [String]) -> Bool { items.contains { item in types.contains { item[$0] != nil } } }
+    var hasStrings: Bool { !strings.isEmpty }
+
+    func data(_ type: String) -> [Data] {
+        items.compactMap { item in (item[type] as? Data) ?? (item[type] as? String).map { Data($0.utf8) } }
+    }
+
+    var strings: [String] { items.compactMap { $0[UTType.utf8PlainText.identifier] as? String } }
+    func write(_ representations: [String: Any]) { items = [representations] }
+}
+
 @MainActor
 enum Clipboard {
-    /// The pasteboard every clipboard command reads and writes (tests swap in an in-memory board).
-    static var board: ClipboardBoard = SystemClipboardBoard()
+    /// The pasteboard every clipboard command reads and writes: in memory in hostless tests (ARCHITECTURE 15.13).
+    static var board: ClipboardBoard = NibApp.isHostlessTest ? InMemoryClipboardBoard() : SystemClipboardBoard()
+
+    static let log = Logger(subsystem: "app.nib", category: "clipboard")
 }
 
 // MARK: - Reading the pasteboard
@@ -51,20 +70,28 @@ enum PasteboardReader {
 
     /// What a paste inserts, and where it came from ("fragment", "image" or "text"); nil when there is nothing.
     /// Paste and Match Style takes the plain text in `style`. Otherwise a Nib fragment wins, then rich text (Word,
-    /// Pages and web selections also carry a picture of the text), then images, then plain text.
-    static func read(_ board: ClipboardBoard, matchStyle: Bool, style: TextBoxStyle,
-                     limits: PasteLimits) throws -> (fragment: Fragment, source: String)? {
+    /// Pages and web selections also carry a picture of the text), then images, then plain text. `fragmentOnly`
+    /// (callers other than the user) reads a Nib fragment and nothing else: no system paste prompt with nobody at the
+    /// device, and no other app's content handed to the caller.
+    static func read(_ board: ClipboardBoard, matchStyle: Bool, style: TextBoxStyle, limits: PasteLimits,
+                     fragmentOnly: Bool = false) -> (fragment: Fragment, source: String)? {
         // Only what is needed is read: each read of another app's content can show the system paste prompt.
         func plainText() -> (fragment: Fragment, source: String)? {
             let plain = board.hasStrings ? board.strings.joined(separator: "\n") : ""
             guard !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return (ContentFragments.text(RichText(plain: plain), style: style, width: limits.textWidth), "text")
         }
-        if matchStyle, let text = plainText() { return text }
+        if matchStyle, !fragmentOnly, let text = plainText() { return text }
         if board.contains([Fragment.typeIdentifier]), let data = board.data(Fragment.typeIdentifier).first {
-            let fragment = try Fragment.decode(data)
-            return (Fragment(items: fragment.items.filter { $0.isValid }, assets: fragment.assets), "fragment")
+            // Any app can put a fragment on the pasteboard: a broken one falls through to the item's other flavours.
+            do {
+                let fragment = try Fragment.decode(data)
+                return (Fragment(items: fragment.items.filter { $0.isValid }, assets: fragment.assets), "fragment")
+            } catch {
+                Clipboard.log.error("unreadable Nib fragment on the pasteboard: \(error.localizedDescription, privacy: .public)")
+            }
         }
+        if fragmentOnly { return nil }
         for type in richTypes where board.contains([type]) {
             if let data = board.data(type).first, let rich = ContentFragments.richText(data, type: type),
                !rich.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -94,7 +121,7 @@ enum ClipboardRender {
         let hidden = Set(pageItems.map { $0.id }).subtracting(chosen)
         let region = Fragment.union(items).insetBy(-2)
         guard region.width > 0, region.height > 0 else { return nil }
-        let scale = max(0.1, min(2, maxPixels / max(region.width, region.height)))
+        let scale = min(2, maxPixels / max(region.width, region.height))     // long edge ≤ maxPixels, however big
         let request = RenderRequest(doc: doc, page: page, region: region, scale: scale, background: false, hidden: hidden)
         guard let result = try? await renderer.render(request) else { return nil }
         return UIImage(cgImage: result.image).pngData()
@@ -135,6 +162,12 @@ struct ClipSelection {
 enum ClipboardCore {
     /// Settings the text feature may keep its default style in (TextBoxStyle or TextAttributes JSON).
     static let defaultStyleSettings = ["text.defaultStyle", "text.styles.default"]
+
+    /// True when the user's own window is in read-only mode (F042): the editing commands then do nothing. Only the
+    /// invoking window counts, so an AI or bridge call is never blocked by some other window's mode.
+    static func isReadOnly(_ ctx: CommandContext) -> Bool {
+        ctx.principal.isUser && ctx.session?.readOnly == true
+    }
 
     /// Items from refs (all on one page), or from the invoking window's selection when `refs` is omitted (keyboard
     /// shortcuts). nil = nothing selected.
@@ -311,7 +344,7 @@ struct ClipboardCopy: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "clipboard.copy", title: "Copy",
-        summary: "Copy items to the clipboard as a Nib fragment plus a PNG and their recognised text (attached content comes along).",
+        summary: "Copy items to the clipboard (replacing what is on it) as a Nib fragment plus a PNG and their recognised text (attached content comes along).",
         params: .obj(["refs": .arr(.ref, "items to copy, all on one page")], required: ["refs"]),
         examples: [example],
         effect: .read)
@@ -319,6 +352,8 @@ struct ClipboardCopy: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         guard let sel = try ClipboardCore.selection(p.refs, ctx) else { return Output(count: 0, types: [], text: nil) }
         let export = await ClipboardCore.export(sel, ctx)
+        // ponytail: every caller writes the system clipboard (the summary says so), which is what lets an AI's copy
+        // then paste work; return the fragment in Output instead if callers other than the user must leave it alone.
         if !ctx.dryRun { Clipboard.board.write(export.representations) }
         return Output(count: sel.items.count, types: export.types, text: export.text.isEmpty ? nil : export.text)
     }
@@ -347,7 +382,7 @@ struct ClipboardCut: NibCommand {
         effect: .edit, destructive: true)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        guard let sel = try ClipboardCore.selection(p.refs, ctx) else {
+        guard !ClipboardCore.isReadOnly(ctx), let sel = try ClipboardCore.selection(p.refs, ctx) else {
             return Output(count: 0, types: [], text: nil, removed: [])
         }
         if let locked = sel.items.first(where: { $0.locked }) {
@@ -355,7 +390,13 @@ struct ClipboardCut: NibCommand {
                            hint: "unlock it with item.setLocked, or copy it with clipboard.copy")
         }
         let export = await ClipboardCore.export(sel, ctx)
-        if !ctx.dryRun { Clipboard.board.write(export.representations) }
+        let representations = export.representations
+        // Without the fragment the items could not be pasted back as items: nothing is deleted then.
+        guard representations[Fragment.typeIdentifier] != nil else {
+            throw NibError(.internalError, "the items could not be copied, so nothing was cut",
+                           hint: "copy them with clipboard.copy to see why, or delete them with item.delete")
+        }
+        if !ctx.dryRun { Clipboard.board.write(representations) }
         let cut = Set(sel.items.map { $0.id })
         var removed: [String] = []
         try ctx.mutate { tx in
@@ -416,6 +457,11 @@ struct ClipboardPaste: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        let user = ctx.principal.isUser
+        // ⌘V is live in every window: read-only mode, and documents without canvas pages, quietly paste nothing.
+        if ClipboardCore.isReadOnly(ctx) || (user && p.page == nil && ctx.activeSession?.page == nil) {
+            return Output(refs: [], source: "empty")
+        }
         let (doc, page) = try ClipboardCore.target(p.page, ctx)
         try ClipboardCore.ensureUnlocked(doc, ctx)
         let record = try ClipboardCore.livePage(doc, page, ctx)
@@ -432,8 +478,8 @@ struct ClipboardPaste: NibCommand {
             source = "fragment"
         } else {
             let style = ClipboardCore.defaultTextStyle(ctx.services.settings)
-            guard let read = try PasteboardReader.read(Clipboard.board, matchStyle: p.matchStyle ?? false, style: style,
-                                                      limits: PasteLimits(page: record.size)) else {
+            guard let read = PasteboardReader.read(Clipboard.board, matchStyle: p.matchStyle ?? false, style: style,
+                                                   limits: PasteLimits(page: record.size), fragmentOnly: !user) else {
                 return Output(refs: [], source: "empty")
             }
             fragment = read.fragment
@@ -443,8 +489,9 @@ struct ClipboardPaste: NibCommand {
         let session = ctx.activeSession
         let visible = session?.document == doc && session?.page == page ? session?.visibleRect : nil
         let bounds = Fragment.union(fragment.items)
-        let refs = try ClipboardCore.insert(fragment, doc: doc, page: page, ids: ids, layer: session?.activeLayer ?? 0,
-                                            ctx: ctx) { existing in
+        // The window's active layer only when that window shows the target document.
+        let layer = (session?.document == doc ? session?.activeLayer : nil) ?? 0
+        let refs = try ClipboardCore.insert(fragment, doc: doc, page: page, ids: ids, layer: layer, ctx: ctx) { existing in
             let steps = at == nil
                 ? Placement.cascadeSteps(probe: fragment.items.first, existing: existing, step: Placement.step, from: 0) : 0
             let cascade = Point(Placement.step.x * Double(steps), Placement.step.y * Double(steps))
@@ -484,7 +531,7 @@ struct ItemDuplicate: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        guard let sel = try ClipboardCore.selection(p.refs, ctx) else { return Output(refs: []) }
+        guard !ClipboardCore.isReadOnly(ctx), let sel = try ClipboardCore.selection(p.refs, ctx) else { return Output(refs: []) }
         let record = try ClipboardCore.livePage(sel.doc, sel.page, ctx)
         let offset = try ClipboardCore.point(p.offset, path: "$.offset")
         let ids = try ClipboardCore.ids(p.ids)

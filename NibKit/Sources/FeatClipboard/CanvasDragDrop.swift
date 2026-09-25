@@ -37,6 +37,9 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
     /// text before the picture (handwriting dragged into another app lands as text).
     private var recognized: (ids: [ElementID], text: String)?
     private var lastSelection: Selection?
+    /// ponytail: only selections up to this many strokes are recognised ahead of a drag (big lassos that are only
+    /// moved would pay full recognition each time); larger ones offer the PNG first and recognise when asked.
+    static let prerecognizeLimit = 300
 
     // MARK: CanvasAttachment
 
@@ -144,7 +147,8 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         guard !selection.isEmpty, selection.doc == doc, let page = selection.page,
               let pageItems = try? host.app.workspace.items(doc, page: page) else { return }
         let items = Fragment.expand(selection.items, in: pageItems)
-        guard !items.isEmpty, items.allSatisfy({ ClipboardText.isHandwriting($0) }) else { return }
+        guard !items.isEmpty, items.count <= CanvasDragDrop.prerecognizeLimit,
+              items.allSatisfy({ ClipboardText.isHandwriting($0) }) else { return }
         let app = host.app
         let ids = selection.items
         Task { @MainActor [weak self] in
@@ -162,21 +166,18 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         (session.localDragSession?.localContext as? CanvasDragContext)?.host == ObjectIdentifier(host)
     }
 
-    /// A drag lifted on this canvas and dropped back on it moves the selection (to another page too).
-    private func move(_ source: CanvasDragContext, to page: PageID, point: Point, host: CanvasHost) {
+    /// A drag lifted on this canvas and dropped back on it moves the selection: `item.transform` on the same page,
+    /// `item.moveToPage` onto another one; nil when it was dropped where it was lifted.
+    static func moveCommand(_ source: CanvasDragContext, to page: PageID, point: Point) -> (command: String, params: JSONValue)? {
         let dx = point.x - source.start.x
         let dy = point.y - source.start.y
         let refs: JSONValue = .array(source.refs.map { .string($0) })
         if page == source.page {
-            guard dx != 0 || dy != 0 else { return }
-            host.app.perform(CommandIDs.itemTransform, ["refs": refs, "translate": [.number(dx), .number(dy)]],
-                             session: host.session)
-        } else {
-            host.app.perform(CommandIDs.itemMoveToPage,
-                             ["refs": refs, "page": .string(NodeRef.page(source.doc, page).description),
-                              "offset": [.number(dx), .number(dy)]],
-                             session: host.session)
+            guard dx != 0 || dy != 0 else { return nil }
+            return (CommandIDs.itemTransform, ["refs": refs, "translate": [.number(dx), .number(dy)]])
         }
+        return (CommandIDs.itemMoveToPage, ["refs": refs, "page": .string(NodeRef.page(source.doc, page).description),
+                                            "offset": [.number(dx), .number(dy)]])
     }
 
     /// Pastes the dropped content as one undo step, centred where it was dropped; files go to `import.files`.
@@ -238,7 +239,7 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         view.isAccessibilityElement = false
         view.accessibilityElementsHidden = true
         view.backgroundColor = NibUIColor.accentWash
-        view.layer.borderWidth = 2
+        view.layer.borderWidth = NibSpacing.xxs
         view.alpha = 0
         return view
     }
@@ -317,7 +318,9 @@ extension CanvasDragDrop: UIDropInteractionDelegate {
         hideHighlight()
         guard let host = host, let hit = host.pagePoint(session.location(in: host.canvasView)) else { return }
         if isOwnDrag(session, host: host), let source = session.localDragSession?.localContext as? CanvasDragContext {
-            move(source, to: hit.page, point: hit.point, host: host)
+            if let move = CanvasDragDrop.moveCommand(source, to: hit.page, point: hit.point) {
+                host.app.perform(move.command, move.params, session: host.session)
+            }
             return
         }
         let providers = session.items.map { $0.itemProvider }

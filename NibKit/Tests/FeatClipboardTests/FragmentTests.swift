@@ -120,6 +120,23 @@ final class FragmentTests: XCTestCase {
         XCTAssertNil(out[1].attachedTo)
     }
 
+    /// Untrusted fragments may attach in a loop: the item that closes it lets go, the rest stay attached.
+    func testAttachmentLoopsAreBroken() {
+        func box(_ id: ElementID, attachedTo parent: ElementID) -> Item {
+            var n = Item.makeText(TextBoxItem(frame: Frame(x: 0, y: 0, w: 10, h: 10), text: RichText(plain: "x")))
+            n.id = id
+            n.attachedTo = parent
+            return n
+        }
+        let fragment = Fragment(items: [box("SELFLOOP0001", attachedTo: "SELFLOOP0001"),
+                                        box("PAIRLOOPA001", attachedTo: "PAIRLOOPB001"),
+                                        box("PAIRLOOPB001", attachedTo: "PAIRLOOPA001")])
+        let out = fragment.instantiated(translate: .zero, zAfter: nil, layer: nil)
+        XCTAssertNil(out[0].attachedTo)
+        XCTAssertNil(out[1].attachedTo)
+        XCTAssertEqual(out[2].attachedTo, out[1].id)
+    }
+
     func testExpandCarriesAttachedContentButNotComments() {
         var inner = Item.makeText(TextBoxItem(frame: Frame(x: 110, y: 210, w: 80, h: 30), text: RichText(plain: "Inside")))
         inner.id = "INNERTEXT001"
