@@ -91,7 +91,7 @@ final class HighlighterTool: CanvasTool {
         host.cancelWetStroke()
         refreshPreview(host)                                   // the ink stays visible while it is recognised
         Task { @MainActor [weak self] in
-            let shape = await Self.recognise(stroke, host: host)
+            let shape = await HighlighterTool.recognise(stroke, host: host)
             self?.recognitionFinished(shape, generation: g, host: host)
         }
         return true
@@ -154,7 +154,7 @@ final class HighlighterTool: CanvasTool {
             do {
                 try await host.app.bus.execute(CommandIDs.shapeCreate, params, session: host.session)
             } catch {
-                Self.log.error("shape.create failed, keeping the stroke: \(String(describing: error), privacy: .public)")
+                HighlighterTool.log.error("shape.create failed, keeping the stroke: \(String(describing: error), privacy: .public)")
                 host.commitStroke(h.stroke, page: h.page)      // never lose what was drawn
             }
             h.layer.removeFromSuperlayer()

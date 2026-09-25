@@ -63,7 +63,9 @@ final class FeatHighlighterTests: XCTestCase {
         let out = HighlighterGeometry.stabilized(zigzag, amount: 0.8)
         XCTAssertEqual(out.first, zigzag.first)
         XCTAssertEqual(out.last, zigzag.last)
-        XCTAssertEqual(out.map(\.x), zigzag.map(\.x))
+        // Only positions move: time and nib sizes are the captured ones.
+        XCTAssertEqual(out.map(\.t), zigzag.map(\.t))
+        XCTAssertEqual(out.map(\.width), zigzag.map(\.width))
         func roughness(_ p: [StrokePoint]) -> Float { zip(p, p.dropFirst()).map { abs($1.y - $0.y) }.reduce(0, +) }
         XCTAssertLessThan(roughness(out), roughness(zigzag) * 0.5)
         XCTAssertEqual(HighlighterGeometry.stabilized(zigzag, amount: 0), zigzag)
