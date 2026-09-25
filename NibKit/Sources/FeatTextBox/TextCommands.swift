@@ -305,7 +305,7 @@ enum TextItems {
     }
 
     /// A live, unlocked item that carries text.
-    static func editable(_ tx: DocTransaction, _ ref: String, path: String) throws -> Target {
+    @MainActor static func editable(_ tx: DocTransaction, _ ref: String, path: String) throws -> Target {
         let (doc, page, id) = try TextRefs.item(ref, path: path)
         let item = try tx.item(doc, page: page, id: id)
         guard richText(item) != nil else {
