@@ -78,16 +78,18 @@ enum PageTextLayout {
     }
 
     /// Backing scale of the zoomed text view: sharp at the current zoom, capped so a page-sized view stays within
-    /// about 16 M pixels. ponytail: one bitmap for the whole box; tile it if huge pages at 800 % ever look soft.
+    /// about 4 M pixels (16 MB of layer memory). ponytail: one bitmap for the whole box; tile it if deep zoom on large
+    /// pages ever looks too soft.
     static func contentScale(zoom: CGFloat, screenScale: CGFloat, boxSize: CGSize) -> CGFloat {
         let wanted = max(screenScale, 1) * max(zoom, 0.01)
-        let cap = (16_000_000 / max(boxSize.width * boxSize.height, 1)).squareRoot()
+        let cap = (4_000_000 / max(boxSize.width * boxSize.height, 1)).squareRoot()
         return max(1, min(wanted, cap))
     }
 }
 
-/// Text-format glyphs. NibSymbol has no bold, italic, list or indent symbols yet (contract gap), so they come through
-/// `NibSymbol(systemName:)`, which rejects banned names and symbols this OS lacks; a text label is the fallback.
+/// Text-format glyphs. NibSymbol has no bold, italic, underline, strikethrough or indent cases yet (contract request,
+/// ARCHITECTURE §15.11), so they come through `NibSymbol(systemName:)`, which rejects banned names and symbols this OS
+/// lacks; a text label is the fallback. Replace with the NibSymbol cases once they land.
 enum PageTextGlyph {
     static let bold = NibSymbol(systemName: "bold")
     static let italic = NibSymbol(systemName: "italic")
@@ -101,8 +103,9 @@ enum PageTextGlyph {
 
 /// Full-page typing on the canvas: a TextKit text view laid exactly over the page's full-page box while it is being
 /// edited, with an opaque formatting bar above the keyboard (DESIGN §14.17: no liquid on text-editing surfaces).
-/// Every change is committed through `text.setText` (one undo step per typing session); undo, sync and AI edits of
-/// the box reload the view.
+/// Every change is committed through `item.update` (one undo step per typing session): the box is locked so transform,
+/// the eraser and the text tool leave it alone, and item.update checks only the document lock. Undo, sync and AI
+/// edits of the box reload the view.
 @MainActor
 final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGestureRecognizerDelegate,
                             UIColorPickerViewControllerDelegate {
@@ -146,10 +149,12 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     private var pendingBegin: (item: Item, doc: DocumentID, page: PageID)?
     private var usedHeight: CGFloat = 0
     private var rejectedInsert = false
-    private var pageFull = false
+    private(set) var pageFull = false
     private var presentingPicker = false
     private var pickerRange = NSRange(location: 0, length: 0)
     private var keyboardOverlap: CGFloat = 0
+    private var commitFailing = false
+    private var scaleTask: Task<Void, Never>?
 
     /// Starts typing in `item` on the canvas that shows `session`'s document (called by `text.startPageText`).
     static func begin(_ item: Item, doc: DocumentID, page: PageID, session: EditorSession) {
@@ -213,7 +218,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     // MARK: Begin and finish
 
     func beginEditing(_ item: Item, doc: DocumentID, page: PageID) {
-        guard let host = host, let box = item.text else { return }
+        guard let host = host, !host.session.readOnly, let box = item.text else { return }
         if let e = editing, e.item == item.id, e.doc == doc, let tv = textView {
             if !tv.isFirstResponder { focus(tv) }
             return
@@ -226,6 +231,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         editing = Target(doc: doc, page: page, item: item.id, frame: box.frame, defaults: box.style.defaults)
         group = NibID.make().raw
         dirty = false
+        commitFailing = false
         rejectedInsert = false
         pageFull = false
         afterReturn = nil
@@ -241,7 +247,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         host.session.isEditingText = true
         layoutTextView()
         tv.selectedRange = NSRange(location: text.length, length: 0)
-        normalizeIfNeeded()
+        normalizeIfNeeded(currentRichText())
         fixTypingAttributes()
         updateOverflow()
         updateBar()
@@ -259,6 +265,8 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         dirty = false
         commitTask?.cancel()
         commitTask = nil
+        scaleTask?.cancel()
+        scaleTask = nil
         rejectedInsert = false
         pageFull = false
         afterReturn = nil
@@ -278,13 +286,38 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
             let session = host.session
             let group = self.group
             let ref = NodeRef.item(e.doc, e.page, e.item).description
-            Task { @MainActor [weak host] in
-                await PageTextEditor.send(text, ref: ref, group: group, session: session, app: app)
-                host?.setHidden([], page: page)                  // show the drawn box once it has the final text
+            Task { @MainActor [weak self, weak host] in
+                if await PageTextEditor.send(text, ref: ref, group: group, session: session, app: app) {
+                    host?.setHidden([], page: page)              // show the drawn box once it has the final text
+                } else {
+                    self?.reopen(e, with: text, group: group)    // never drop the only copy of what was typed
+                }
             }
         } else {
             host.setHidden([], page: page)
         }
+    }
+
+    /// A commit failed after typing ended: open the box again with the unsaved text, so it can be retried or copied.
+    private func reopen(_ e: Target, with text: RichText, group: String) {
+        guard editing == nil, let host = host else { return }
+        guard let item = try? host.app.workspace.item(e.doc, page: e.page, id: e.item), !item.deleted,
+              let box = item.text else {
+            host.setHidden([], page: e.page)
+            return
+        }
+        beginEditing(item, doc: e.doc, page: e.page)
+        guard let now = editing, now.item == e.item, now.doc == e.doc, textView != nil else {
+            host.setHidden([], page: e.page)
+            return
+        }
+        self.group = group
+        commitFailing = true                                   // the failure was reported; retries stay quiet
+        trailing = Self.shell(text.paragraphs.last ?? Paragraph())
+        let s = RichTextBridge.attributed(text, base: box.style.defaults)
+        let end = PageTextLayout.spot(at: s.length, in: s)
+        install(s, selection: (end, end))
+        textChanged()
     }
 
     private func makeTextView(size: CGSize) -> PageTextView {
@@ -343,7 +376,25 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         tv.transform = CGAffineTransform(scaleX: scale, y: scale)
         tv.center = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
         let contentScale = PageTextLayout.contentScale(zoom: scale, screenScale: tv.traitCollection.displayScale, boxSize: size)
-        if abs(tv.contentScaleFactor - contentScale) > 0.01 { Self.setContentScale(contentScale, on: tv) }
+        applyContentScale(contentScale, to: tv)
+    }
+
+    /// Re-rasterising a page-sized view is expensive: during a pinch only a 25 % change re-renders at once; the exact
+    /// scale follows once the zoom has rested for 0.2 s.
+    private func applyContentScale(_ scale: CGFloat, to tv: UIView) {
+        scaleTask?.cancel()
+        scaleTask = nil
+        let current = max(tv.contentScaleFactor, 0.01)
+        guard abs(current - scale) > 0.01 else { return }
+        if abs(scale / current - 1) >= 0.25 {
+            Self.setContentScale(scale, on: tv)
+            return
+        }
+        scaleTask = Task { @MainActor [weak tv] in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled, let tv = tv else { return }
+            Self.setContentScale(scale, on: tv)
+        }
     }
 
     private static func setContentScale(_ scale: CGFloat, on view: UIView) {
@@ -381,10 +432,10 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     }
 
     /// Regenerates list markers (new list items, renumbering, a damaged marker) when they no longer match the model.
-    private func normalizeIfNeeded() {
+    private func normalizeIfNeeded(_ rich: RichText) {
         guard let tv = textView, let e = editing, tv.markedTextRange == nil else { return }
         let s: NSAttributedString = tv.attributedText ?? NSAttributedString()
-        let regenerated = RichTextBridge.attributed(currentRichText(), base: e.defaults)
+        let regenerated = RichTextBridge.attributed(rich, base: e.defaults)
         guard regenerated.string != s.string else { return }
         let sel = tv.selectedRange
         install(regenerated, selection: (PageTextLayout.spot(at: sel.location, in: s),
@@ -433,13 +484,15 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         return typing
     }
 
+    /// After every edit. The model is converted once here (on a full page each conversion counts).
     private func textChanged() {
-        normalizeIfNeeded()
-        if let last = currentRichText().paragraphs.last { trailing = Self.shell(last) }
+        let rich = currentRichText()
+        normalizeIfNeeded(rich)
+        if let last = rich.paragraphs.last { trailing = Self.shell(last) }
         dirty = true
         scheduleCommit()
         updateOverflow()
-        updateBar()
+        updateBar(rich)
         revealCaretIfNeeded()
     }
 
@@ -597,7 +650,12 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
 
     private func updateOverflow() {
         guard let tv = textView, let e = editing else { return }
-        usedHeight = PageTextLayout.usedHeight(tv.attributedText ?? NSAttributedString(), width: CGFloat(e.frame.w))
+        // The view's own layout is incremental; `PageTextLayout.usedHeight` would lay the whole text out again.
+        let layout = tv.layoutManager
+        layout.ensureLayout(for: tv.textContainer)
+        let extra = layout.extraLineFragmentRect                // the empty line after a trailing newline
+        usedHeight = tv.textStorage.length == 0 ? 0
+            : ceil(max(layout.usedRect(for: tv.textContainer).maxY, extra.isEmpty ? 0 : extra.maxY))
         let full = rejectedInsert || usedHeight > CGFloat(e.frame.h) + 0.5
         if full && !pageFull {
             UIAccessibility.post(notification: .announcement,
@@ -650,21 +708,34 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
 
     private func commitNow() async {
         guard dirty, let e = editing, let host = host else { return }
-        dirty = false
-        await Self.send(currentRichText(), ref: NodeRef.item(e.doc, e.page, e.item).description, group: group,
-                        session: host.session, app: host.app)
+        dirty = false                                          // typing during the send marks it dirty again
+        let text = currentRichText()
+        let group = self.group
+        let ok = await Self.send(text, ref: NodeRef.item(e.doc, e.page, e.item).description, group: group,
+                                 session: host.session, app: host.app, quiet: commitFailing)
+        commitFailing = !ok
+        guard !ok else { return }
+        if let now = editing, now.item == e.item, now.doc == e.doc {
+            dirty = true                                       // keep the text and try again
+            scheduleCommit()
+        } else if editing == nil {
+            reopen(e, with: text, group: group)
+        }
     }
 
-    /// F026's command (CommandIDs has no constant for it); the typed text reaches the document only through it.
-    static let setTextCommand = "text.setText"
-
-    private static func send(_ text: RichText, ref: String, group: String, session: EditorSession?, app: NibApp) async {
+    /// Writes the typed text. Returns false (after reporting it unless `quiet`) when the commit failed.
+    @discardableResult
+    private static func send(_ text: RichText, ref: String, group: String, session: EditorSession?, app: NibApp,
+                             quiet: Bool = false) async -> Bool {
         do {
             let json = try JSONValue.from(text)
-            _ = try await app.bus.execute(Invocation(command: setTextCommand, params: ["ref": .string(ref), "text": json],
+            _ = try await app.bus.execute(Invocation(command: CommandIDs.itemUpdate,
+                                                     params: ["ref": .string(ref), "patch": ["text": ["text": json]]],
                                                      session: session, group: group))
+            return true
         } catch {
-            report(error, command: setTextCommand, app: app)
+            if !quiet { report(error, command: CommandIDs.itemUpdate, app: app) }
+            return false
         }
     }
 
@@ -870,9 +941,9 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
 
     // MARK: Bar and accessibility
 
-    private func updateBar() {
+    private func updateBar(_ model: RichText? = nil) {
         guard let bar = bar, let tv = textView else { return }
-        let rich = currentRichText()
+        let rich = model ?? currentRichText()
         let p = paragraphModel(caretSpot().paragraph, in: rich)
         let chars = RichTextBridge.textAttributes(characterAttributes())
         let state = PageTextBarState(style: PageTextStyle.of(p), bold: chars.bold == true, italic: chars.italic == true,
@@ -888,10 +959,22 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
                 return true
             }
         }
-        actions.append(UIAccessibilityCustomAction(name: String(localized: "Bulleted List")) { [weak self] _ in
-            self?.setList(.bullet, toggles: true)
+        actions.append(UIAccessibilityCustomAction(name: String(localized: "Toggle Checkbox")) { [weak self] _ in
+            guard let self = self, self.textView != nil else { return false }
+            let paragraph = self.caretSpot().paragraph
+            guard self.paragraphModel(paragraph, in: self.currentRichText()).list == .todo else { return false }
+            self.changeParagraphs { text, _ in PageTextModel.togglingChecked(paragraph, in: text) }
             return true
         })
+        let lists: [(String, ListKind)] = [(String(localized: "Bulleted List"), .bullet),
+                                           (String(localized: "Numbered List"), .number),
+                                           (String(localized: "Checklist"), .todo)]
+        for (name, kind) in lists {
+            actions.append(UIAccessibilityCustomAction(name: name) { [weak self] _ in
+                self?.setList(kind, toggles: true)
+                return true
+            })
+        }
         actions.append(UIAccessibilityCustomAction(name: String(localized: "Increase Indent")) { [weak self] _ in
             self?.indent(1)
             return true
@@ -968,6 +1051,17 @@ final class PageTextView: UITextView {
 }
 
 // MARK: - Formatting bar
+
+/// DESIGN values the bar copies until NibDesign has them (contract request, ARCHITECTURE §15.11: a UIKit
+/// `NibPenSwatch` image and a hairline divider token). Replace with the tokens once they land.
+private enum BarLiteral {
+    /// `NibPenSwatch` at palette size, 22 pt (DESIGN §13.3).
+    static let swatchSide: CGFloat = 22
+    /// The permanent 1 pt `swatchRing` on inks that vanish against the chrome (DESIGN §3.3, §3.4).
+    static let swatchRing: CGFloat = 1
+    /// Swatch outline and divider hairline, 0.5 pt (DESIGN §3.4 swatches, §5 palette divider).
+    static let hairline: CGFloat = 0.5
+}
 
 struct PageTextBarState: Equatable {
     var style: PageTextStyle = .body
@@ -1167,13 +1261,14 @@ final class PageTextBar: UIInputView {
     }
 
     static func swatch(_ color: UIColor, ring: Bool) -> UIImage {
-        let side: CGFloat = 22
+        let side = BarLiteral.swatchSide
         let image = UIGraphicsImageRenderer(size: CGSize(width: side, height: side)).image { _ in
-            let rect = CGRect(x: 1, y: 1, width: side - 2, height: side - 2)
+            let inset = BarLiteral.swatchRing
+            let rect = CGRect(x: inset, y: inset, width: side - 2 * inset, height: side - 2 * inset)
             color.setFill()
             UIBezierPath(ovalIn: rect).fill()
             let outline = UIBezierPath(ovalIn: rect)
-            outline.lineWidth = ring ? 1 : 0.5
+            outline.lineWidth = ring ? BarLiteral.swatchRing : BarLiteral.hairline
             (ring ? NibUIColor.swatchRing : NibUIColor.swatchHairline).setStroke()
             outline.stroke()
         }
@@ -1251,7 +1346,7 @@ final class PageTextBar: UIInputView {
         line.backgroundColor = NibUIColor.separator
         line.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            line.widthAnchor.constraint(equalToConstant: 0.5),
+            line.widthAnchor.constraint(equalToConstant: BarLiteral.hairline),
             line.heightAnchor.constraint(equalToConstant: NibSpacing.xxl)
         ])
         return line

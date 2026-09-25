@@ -41,6 +41,7 @@ public enum FeatPageTextFeature: NibFeature {
 
     private static func hasPageText(_ ctx: MenuContext) -> Bool {
         guard let doc = ctx.doc, let page = ctx.page else { return false }
-        return (try? ctx.app.workspace.items(doc, page: page))?.contains(where: PageTextModel.isFullPageBox) ?? false
+        let items = (try? ctx.app.workspace.items(doc, page: page)) ?? []
+        return items.contains { PageTextModel.isFullPageBox($0) && !($0.text?.text.isEmpty ?? true) }
     }
 }

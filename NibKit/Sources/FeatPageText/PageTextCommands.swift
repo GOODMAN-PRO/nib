@@ -145,8 +145,8 @@ struct StartPageText: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "text.startPageText", title: "Start Typing",
-        summary: "Create or open the page's one full-page text box (page minus margins, bottom of the z-order) and start typing in it; returns its ref.",
-        params: .obj(["page": .str("page ref page:D/P; defaults to the current page of the active window"),
+        summary: "Create or open the page's one full-page text box (page minus margins, bottom of the z-order) and start typing in it; returns its ref. page defaults to the current page of the active window.",
+        params: .obj(["page": .ref,
                       "id": .str("your own id for a newly created box, [A-Za-z0-9_-]{1,64}")]),
         examples: [["page": "page:FIXTUREDOC01/FIXTUREPG002"],
                    ["page": "page:FIXTUREDOC01/FIXTUREPG001", "id": "PAGETEXT0001"]],
@@ -154,6 +154,9 @@ struct StartPageText: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let (doc, page) = try target(p.page, ctx)
+        if let session = ctx.activeSession, session.readOnly, session.document == doc {
+            throw NibError(.permissionDenied, "this window is read-only", hint: "view.setReadOnly {on: false}")
+        }
         var chosen: ElementID?
         if let id = p.id {
             guard NibID.isValid(id) else { throw NibError.invalid("id must be 1-64 of [A-Za-z0-9_-]", path: "$.id") }
@@ -221,7 +224,9 @@ struct StartPageText: NibCommand {
         let text = RichText(paragraphs: [Paragraph(style: PageTextStyle.body.rawValue)])
         var item = Item.makeText(TextBoxItem(frame: frame, text: text, style: PageTextModel.boxStyle()), layer: layer)
         if let id = id { item.id = id }
-        item.locked = true                                   // part of the page: never moved or resized by accident
+        // Part of the page: transform, the eraser and the text tool leave it alone. The editor commits through
+        // item.update, which checks only the document lock.
+        item.locked = true
         item.z = try tx.bottomZ(doc, page: page)
         return (try tx.put(item, doc: doc, page: page), true)
     }
