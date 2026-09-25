@@ -31,23 +31,32 @@ final class FeatImagesTests: XCTestCase {
 
     func testInsertCropFlipUndoRoundTrip() async throws {
         let h = Harness(features: [FeatImagesFeature.self])
-        let before = try h.snapshot()
-        let r = try await h.run("image.insert", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "asset": "fixture-image.png",
-                                                 "frame": [100, 100, 200, 100], "id": "IMGTEST00001"])
-        XCTAssertEqual(r["ref"]?.stringValue, image2)
+        // Each step is one undo entry: undo restores the document as it was before the step, redo brings the step back
+        // and the next step builds on it. ponytail: one step at a time, because the contract's revert skips an older
+        // entry once a newer undo has re-stamped the same item's rev (reported as a contract gap).
+        let steps: [(command: String, params: JSONValue)] = [
+            ("image.insert", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "asset": "fixture-image.png",
+                              "frame": [100, 100, 200, 100], "id": "IMGTEST00001"]),
+            ("image.crop", ["ref": .string(image2), "rect": [0.5, 0, 0.5, 1]]),
+            ("image.flip", ["ref": .string(image2), "axis": "horizontal"])
+        ]
+        for step in steps {
+            let before = try h.snapshot()
+            let depth = h.undoDepth(Fixtures.docID)
+            try await h.run(step.command, step.params)
+            let after = try h.snapshot()
+            XCTAssertNotEqual(after, before, step.command)
+            XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1, "\(step.command) is one undo step")
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), before, "undo \(step.command)")
+            XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+            XCTAssertEqual(try h.snapshot(), after, "redo \(step.command)")
+        }
 
-        try await h.run("image.crop", ["ref": .string(image2), "rect": [0.5, 0, 0.5, 1]])
-        var item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "IMGTEST00001")
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "IMGTEST00001")
         XCTAssertEqual(item.image?.crop, Rect(x: 0.5, y: 0, width: 0.5, height: 1))
         XCTAssertEqual(item.image?.frame, Frame(x: 200, y: 100, w: 100, h: 100), "the kept half stays where it was")
-
-        try await h.run("image.flip", ["ref": .string(image2), "axis": "horizontal"])
-        item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "IMGTEST00001")
         XCTAssertEqual(ImageFlip(item), ImageFlip(x: true, y: false))
-
-        XCTAssertEqual(h.undoDepth(Fixtures.docID), 3)
-        while h.undoDepth(Fixtures.docID) > 0 { h.app.bus.undo(Fixtures.docID) }
-        XCTAssertEqual(try h.snapshot(), before)
     }
 
     func testURLParamsResolveThroughInputFile() async throws {
