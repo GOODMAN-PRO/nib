@@ -1114,9 +1114,9 @@ final class TextBoxTextView: UITextView {
         TextBoxTextView.command(String(localized: "Underline"), "u", .command, #selector(TextBoxTextView.formatUnderline(_:))),
         TextBoxTextView.command(String(localized: "Strikethrough"), "x", [.command, .shift],
                                 #selector(TextBoxTextView.formatStrikethrough(_:))),
-        TextBoxTextView.command(String(localized: "Align Left"), "{", .command, #selector(TextBoxTextView.alignLeft(_:))),
-        TextBoxTextView.command(String(localized: "Align Centre"), "|", .command, #selector(TextBoxTextView.alignCentre(_:))),
-        TextBoxTextView.command(String(localized: "Align Right"), "}", .command, #selector(TextBoxTextView.alignRight(_:))),
+        TextBoxTextView.command(String(localized: "Align Left"), "{", .command, #selector(TextBoxTextView.alignTextLeft(_:))),
+        TextBoxTextView.command(String(localized: "Align Centre"), "|", .command, #selector(TextBoxTextView.alignTextCentre(_:))),
+        TextBoxTextView.command(String(localized: "Align Right"), "}", .command, #selector(TextBoxTextView.alignTextRight(_:))),
         TextBoxTextView.command(String(localized: "Outdent"), TextBoxTextView.tab, .shift,
                                 #selector(TextBoxTextView.outdentList(_:))),
         TextBoxTextView.command(String(localized: "Finish Editing"), UIKeyCommand.inputEscape, [],
@@ -1138,9 +1138,9 @@ final class TextBoxTextView: UITextView {
     @objc func formatItalic(_ sender: UIKeyCommand) { editor?.toggle(.italic) }
     @objc func formatUnderline(_ sender: UIKeyCommand) { editor?.toggle(.underline) }
     @objc func formatStrikethrough(_ sender: UIKeyCommand) { editor?.toggle(.strikethrough) }
-    @objc func alignLeft(_ sender: UIKeyCommand) { editor?.applyParagraph(align: .left) }
-    @objc func alignCentre(_ sender: UIKeyCommand) { editor?.applyParagraph(align: .center) }
-    @objc func alignRight(_ sender: UIKeyCommand) { editor?.applyParagraph(align: .right) }
+    @objc func alignTextLeft(_ sender: UIKeyCommand) { editor?.applyParagraph(align: .left) }
+    @objc func alignTextCentre(_ sender: UIKeyCommand) { editor?.applyParagraph(align: .center) }
+    @objc func alignTextRight(_ sender: UIKeyCommand) { editor?.applyParagraph(align: .right) }
     @objc func outdentList(_ sender: UIKeyCommand) { editor?.indent(outdent: true) }
     @objc func finishEditing(_ sender: UIKeyCommand) { editor?.endEditing() }
 }
