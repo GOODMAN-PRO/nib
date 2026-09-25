@@ -108,7 +108,7 @@ struct InkWriteText: NibCommand {
     static let example: JSONValue = try! JSONValue.parse(
         #"{"page": "page:FIXTUREDOC01/FIXTUREPG002", "text": "Hello Nib", "at": [72, 96]}"#)
     static let styledExample: JSONValue = try! JSONValue.parse(
-        #"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "text": "v = u + at\nx = 12", "at": [72, 560], "size": 24, "font": "Bradley Hand", "color": "#1F5FD1", "width": 1.6, "maxWidth": 220, "slant": 8, "ids": ["SUVATLINE001"]}"#)
+        ##"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "text": "v = u + at\nx = 12", "at": [72, 560], "size": 24, "font": "Bradley Hand", "color": "#1F5FD1", "width": 1.6, "maxWidth": 220, "slant": 8, "ids": ["SUVATLINE001"]}"##)
 
     static let descriptor = CommandDescriptor(
         id: "ink.writeText", title: "Write Handwriting",
