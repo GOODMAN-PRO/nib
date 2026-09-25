@@ -170,21 +170,51 @@ final class PackageMergeTests: XCTestCase {
         XCTAssertLessThan(best, 0.05 * 4)
     }
 
-    func testElementChunksCutOnlyBetweenTopLevelElements() throws {
+    func testDecodeChunksCutOnlyBetweenTopLevelElements() throws {
         // Strings hold escaped quotes and backslashes, brackets and commas; objects nest arrays of objects.
         let element = #"{"a":"x\\\"],[{,","b":[1,{"c":"}]"},{"d":"\\"}],"e":"\""}"#
         let json = Data(("[" + Array(repeating: element, count: 2000).joined(separator: ",") + "]").utf8)
-        let chunks = json.withUnsafeBytes { PackageCodec.elementChunks($0, count: 4) }
+        let chunks = json.withUnsafeBytes { PackageCodec.decodeChunks($0, count: 4) }
         XCTAssertEqual(chunks.count, 4)
         var total = 0
         for chunk in chunks {
-            let array = try XCTUnwrap(JSONSerialization.jsonObject(with: chunk) as? [[String: Any]])
+            let array = try XCTUnwrap(JSONSerialization.jsonObject(with: chunk.json) as? [[String: Any]])
             XCTAssertEqual(array.first?["a"] as? String, #"x\"],[{,"#)
+            XCTAssertTrue(chunk.points.isEmpty)
             total += array.count
         }
         XCTAssertEqual(total, 2000)
-        XCTAssertTrue(json.prefix(1000).withUnsafeBytes { PackageCodec.elementChunks($0, count: 4) }.isEmpty,
+        XCTAssertTrue(json.prefix(1000).withUnsafeBytes { PackageCodec.decodeChunks($0, count: 4) }.isEmpty,
                       "small pages decode in one piece")
+    }
+
+    func testChunkedDecodeKeepsEveryKindOfItemIntact() throws {
+        // Big enough for the chunked path; strokes nested in math items and "ptsB64" keys outside strokes are left to
+        // the regular decoder, top-level stroke points take the fast path.
+        let clock = HLCClock(device: 7)
+        var items = try XCTUnwrap(Fixtures.sampleContent().1[Fixtures.page1])
+        for s in 0..<300 {
+            let points = (0..<20).map { StrokePoint(x: Float(s) + Float($0) * 0.5, y: Float($0), t: Float($0) * 0.01,
+                                                    force: 0.3, azimuth: 0.2, altitude: 1.1, roll: 0.1, width: 1.5,
+                                                    height: 1.5, opacity: 0.9) }
+            var item = Item.makeStroke(Stroke(style: .defaultPen, points: points, t0: 1_700_000_000))
+            if s % 50 == 0 { item.ext = ["plugin.x": ["ptsB64": "not points"]] }
+            if s % 70 == 0 { item.stroke?.points = [] }
+            item.rev = clock.tick()
+            items.append(item)
+        }
+        let ink = [Stroke(style: .defaultPencil, points: [StrokePoint(x: 1, y: 2), StrokePoint(x: 3, y: 4)], t0: 1)]
+        var math = Item.makeMath(MathItem(frame: Frame(x: 0, y: 0, w: 10, h: 10), latex: ["x"], sourceInk: ink))
+        math.rev = clock.tick()
+        items.insert(math, at: 150)
+
+        let data = try PackageCodec.encodeItems(items)
+        let json = try (data as NSData).decompressed(using: .lzfse) as Data
+        XCTAssertGreaterThan(json.count, PackageCodec.chunkedDecodeMinimum)
+        let chunks = json.withUnsafeBytes { PackageCodec.decodeChunks($0, count: 3) }
+        XCTAssertEqual(chunks.count, 3)
+        XCTAssertEqual(chunks.map(\.points.count).reduce(0, +), 300 - 5 + 2, "300 strokes, 5 empty, 2 fixture strokes")
+        XCTAssertEqual(try PackageCodec.decodeItems(data), items)
     }
 
     func testConflictCopyAppearingAfterLoadIsMergedReportedOnceAndRemoved() throws {

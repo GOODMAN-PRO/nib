@@ -65,21 +65,22 @@ enum PackageCodec {
         return try (json as NSData).compressed(using: .lzfse) as Data
     }
 
-    /// Pages above this many JSON bytes are decoded in parallel chunks.
-    static let parallelDecodeMinimum = 64 * 1024
+    /// Pages above this many JSON bytes take the chunked decode below.
+    static let chunkedDecodeMinimum = 64 * 1024
 
-    // ponytail: parallel because `Stroke.init(from:)` unpacks every point float through a string-keyed setter, which
-    // dominates decoding a big page. A fullFormat fast path in `Stroke.unpack` (NibContracts) would make one decode
-    // fast enough on its own; drop the chunking then.
+    // ponytail: `Stroke.init(from:)` unpacks every point float through a string-keyed setter, which dominates decoding
+    // a big page (and more so in Debug builds). So big pages are cut into chunks decoded in parallel, and the points of
+    // top-level strokes skip that path: the scan empties their `ptsB64` strings and `fullPoints` fills them back in.
+    // A fullFormat fast path in `Stroke.unpack` (NibContracts) would make most of this unnecessary.
     static func decodeItems(_ data: Data) throws -> [Item] {
         let json = try (data as NSData).decompressed(using: .lzfse) as Data
-        let chunks = json.withUnsafeBytes { elementChunks($0, count: ProcessInfo.processInfo.activeProcessorCount) }
-        guard chunks.count > 1 else { return try JSONDecoder().decode([Item].self, from: json) }
+        let chunks = json.withUnsafeBytes { decodeChunks($0, count: max(1, ProcessInfo.processInfo.activeProcessorCount)) }
+        guard !chunks.isEmpty else { return try JSONDecoder().decode([Item].self, from: json) }
         var parts = [[Item]?](repeating: nil, count: chunks.count)
         parts.withUnsafeMutableBufferPointer { buffer in
             let out = buffer // each iteration writes only its own slot
             DispatchQueue.concurrentPerform(iterations: chunks.count) { i in
-                out[i] = try? JSONDecoder().decode([Item].self, from: chunks[i])
+                out[i] = try? decode(chunks[i])
             }
         }
         let decoded = parts.compactMap { $0 }
@@ -88,57 +89,154 @@ enum PackageCodec {
         return Array(decoded.joined())
     }
 
-    /// Cuts the top-level JSON array in `bytes` into up to `count` arrays of whole elements of about equal size, by
-    /// one scan that tracks nesting depth and skips strings (escapes included). Returns no chunks for one core, small
-    /// input, or input that does not start with `[`.
-    static func elementChunks(_ bytes: UnsafeRawBufferPointer, count: Int) -> [Data] {
+    /// A JSON array of whole top-level elements of a page, in which the point strings of top-level strokes
+    /// (`[i].stroke.ptsB64`) are emptied; `points` holds them (unescaped base64) by element index within the chunk.
+    struct DecodeChunk {
+        var json = Data()
+        var points: [(index: Int, base64: Data)] = []
+    }
+
+    static func decode(_ chunk: DecodeChunk) throws -> [Item] {
+        var items = try JSONDecoder().decode([Item].self, from: chunk.json)
+        for (index, base64) in chunk.points {
+            guard items.indices.contains(index), items[index].stroke != nil, let data = Data(base64Encoded: base64) else {
+                throw NibError(.internalError, "stroke points do not match the page")
+            }
+            items[index].stroke?.points = fullPoints(data)
+        }
+        return items
+    }
+
+    /// Exactly what `Stroke.init(from:)` makes of `ptsB64` bytes: little-endian Float32s in `StrokePoint.fullFormat`
+    /// order, a trailing partial point dropped.
+    static func fullPoints(_ data: Data) -> [StrokePoint] {
+        let stride = StrokePoint.fullStride
+        var floats = [Float](repeating: 0, count: data.count / MemoryLayout<Float>.size)
+        _ = floats.withUnsafeMutableBufferPointer { data.copyBytes(to: $0) }
+        return floats.withUnsafeBufferPointer { buffer -> [StrokePoint] in
+            guard let f = buffer.baseAddress else { return [] }
+            var out: [StrokePoint] = []
+            out.reserveCapacity(buffer.count / stride)
+            var i = 0
+            while i + stride <= buffer.count {
+                out.append(StrokePoint(x: f[i], y: f[i + 1], t: f[i + 2], force: f[i + 3], azimuth: f[i + 4],
+                                       altitude: f[i + 5], roll: f[i + 6], width: f[i + 7], height: f[i + 8],
+                                       opacity: f[i + 9]))
+                i += stride
+            }
+            return out
+        }
+    }
+
+    /// `fullPoints` hard-codes this field order.
+    static let fullPointsMatchContract = StrokePoint.fullFormat
+        == ["x", "y", "t", "force", "azimuth", "altitude", "roll", "width", "height", "opacity"]
+
+    private static let quote = UInt8(ascii: "\""), backslash = UInt8(ascii: "\\"), slash = UInt8(ascii: "/")
+    private static let strokeKey = Array("stroke".utf8), pointsKey = Array("ptsB64".utf8)
+
+    /// Cuts the top-level JSON array in `bytes` into up to `count` chunks of whole elements of about equal size, in
+    /// one scan that tracks nesting depth, skips strings (escapes included) and notes the keys at depth 2 (item) and
+    /// 3 (stroke). Returns no chunks for small input or input that does not start with `[`.
+    static func decodeChunks(_ bytes: UnsafeRawBufferPointer, count: Int) -> [DecodeChunk] {
         let n = bytes.count
-        guard count > 1, n >= parallelDecodeMinimum, let raw = bytes.baseAddress else { return [] }
+        guard count > 0, n >= chunkedDecodeMinimum, let raw = bytes.baseAddress else { return [] }
         let base = raw.assumingMemoryBound(to: UInt8.self)
-        let quote = UInt8(ascii: "\""), backslash = UInt8(ascii: "\\"), comma = UInt8(ascii: ",")
+        let comma = UInt8(ascii: ","), colon = UInt8(ascii: ":")
         let openArray = UInt8(ascii: "["), openObject = UInt8(ascii: "{")
         let closeArray = UInt8(ascii: "]"), closeObject = UInt8(ascii: "}")
         guard base[0] == openArray else { return [] }
 
-        var cuts: [Int] = [] // offsets of commas between top-level elements
+        var cuts: [(offset: Int, element: Int)] = [] // commas that end a chunk, and the element after each
+        var strips: [(element: Int, open: Int, close: Int)] = [] // quotes around point strings to empty
         var depth = 0
+        var element = 0
+        var inStroke = false // depth 2: the last key was "stroke"
+        var atPoints = false // depth 3: the last key was "ptsB64"
         var i = 0
-        while i < n, cuts.count < count - 1 {
+        while i < n {
             let b = base[i]
             if b == quote {
-                // The closing quote is the next one preceded by an even number of backslashes.
-                var j = i + 1
-                while true {
-                    guard let q = memchr(raw + j, Int32(quote), n - j) else { return [] }
-                    let k = raw.distance(to: UnsafeRawPointer(q))
-                    var slashes = 0
-                    while base[k - 1 - slashes] == backslash { slashes += 1 }
-                    j = k + 1
-                    if slashes % 2 == 0 { break }
+                guard let close = closingQuote(base, from: i + 1, end: n) else { return [] }
+                if depth == 2 || depth == 3 {
+                    var m = close + 1
+                    while m < n, base[m] == 0x20 || base[m] == 0x0A || base[m] == 0x0D || base[m] == 0x09 { m += 1 }
+                    let length = close - i - 1
+                    if m < n, base[m] == colon {
+                        let key: [UInt8] = length == 6 ? (depth == 2 ? strokeKey : pointsKey) : []
+                        let matches = !key.isEmpty && memcmp(base + i + 1, key, 6) == 0
+                        if depth == 2 { inStroke = matches } else { atPoints = matches }
+                    } else if depth == 3, inStroke, atPoints, length > 0, fullPointsMatchContract {
+                        strips.append((element, i, close))
+                    }
                 }
-                i = j
+                i = close + 1
                 continue
             }
             if b == openArray || b == openObject {
                 depth += 1
             } else if b == closeArray || b == closeObject {
                 depth -= 1
-            } else if b == comma, depth == 1, i >= n / count * (cuts.count + 1) {
-                cuts.append(i)
+            } else if b == comma, depth == 1 {
+                element += 1
+                if cuts.count < count - 1, i >= n / count * (cuts.count + 1) { cuts.append((i, element)) }
             }
             i += 1
         }
 
-        var chunks: [Data] = []
+        var chunks: [DecodeChunk] = []
         var start = 1
-        for end in cuts + [n] {
-            var chunk = Data([openArray])
-            chunk.append(base + start, count: end - start)
-            if end < n { chunk.append(closeArray) }
+        var first = 0
+        var s = 0
+        for cut in cuts + [(offset: n, element: element + 1)] {
+            var chunk = DecodeChunk()
+            chunk.json.append(openArray)
+            var from = start
+            while s < strips.count, strips[s].close < cut.offset {
+                let strip = strips[s]
+                s += 1
+                // Only `\/` escapes (what JSONEncoder writes into base64) are unescaped here; anything else is left
+                // for the regular decoder.
+                guard let base64 = unescapedSlashes(base, from: strip.open + 1, to: strip.close) else { continue }
+                chunk.json.append(base + from, count: strip.open + 1 - from)
+                chunk.points.append((strip.element - first, base64))
+                from = strip.close
+            }
+            chunk.json.append(base + from, count: cut.offset - from)
+            if cut.offset < n { chunk.json.append(closeArray) }
             chunks.append(chunk)
-            start = end + 1
+            start = cut.offset + 1
+            first = cut.element
         }
-        return chunks.count > 1 ? chunks : []
+        return chunks
+    }
+
+    /// The offset of the quote that closes a JSON string whose body starts at `from`: the next quote preceded by an
+    /// even number of backslashes.
+    private static func closingQuote(_ base: UnsafePointer<UInt8>, from: Int, end: Int) -> Int? {
+        var j = from
+        while let q = memchr(base + j, Int32(quote), end - j) {
+            let k = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(q))
+            var slashes = 0
+            while base[k - 1 - slashes] == backslash { slashes += 1 }
+            if slashes % 2 == 0 { return k }
+            j = k + 1
+        }
+        return nil
+    }
+
+    /// The string body `base[from..<to]` with `\/` unescaped; nil when it holds any other escape.
+    private static func unescapedSlashes(_ base: UnsafePointer<UInt8>, from: Int, to: Int) -> Data? {
+        var out = Data(capacity: to - from)
+        var s = from
+        while let p = memchr(base + s, Int32(backslash), to - s) {
+            let at = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(p))
+            guard at + 1 < to, base[at + 1] == slash else { return nil }
+            out.append(base + s, count: at - s)
+            s = at + 1 // keeps the slash
+        }
+        out.append(base + s, count: to - s)
+        return out
     }
 
     // MARK: Merge
