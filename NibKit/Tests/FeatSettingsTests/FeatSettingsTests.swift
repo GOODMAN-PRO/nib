@@ -1,6 +1,8 @@
 import XCTest
+import Combine
 import SwiftUI
 import UIKit
+import UserNotifications
 import NibContracts
 import NibTesting
 @testable import FeatSettings
@@ -67,7 +69,12 @@ final class FeatSettingsTests: XCTestCase {
     func testPagesSeeChangesMadeByTheAssistant() async throws {
         let h = Harness(features: [FeatSettingsFeature.self])
         let model = SettingsModel(app: h.app)
+        let republished = expectation(description: "open pages redraw")
+        republished.assertForOverFulfill = false
+        let subscription = model.objectWillChange.sink { republished.fulfill() }
         try await h.run(CommandIDs.settingsSet, ["name": "editing.hideStatusBar", "value": true], as: .ai("chat"))
+        await fulfillment(of: [republished], timeout: 2)
+        subscription.cancel()
         XCTAssertTrue(model.value(NibSettings.hideStatusBar))
         await assertError(.invalidParams) {
             try await h.run(CommandIDs.settingsSet, ["name": "stylus.posture", "value": 8], as: .ai("chat"))
@@ -145,6 +152,49 @@ final class FeatSettingsTests: XCTestCase {
         let about = try await h.run(SettingsOpen.id, ["place": "about"])
         XCTAssertEqual(about["page"]?.stringValue, "about.main")
         XCTAssertEqual(navigator.requestedPages.last ?? nil, "about.main")
+    }
+
+    func testSettingsOpenMovesSettingsAlreadyOnScreen() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let navigator = RecordingNavigator(app: h.app)
+        h.app.ui.activeNavigator = navigator
+        try await h.run(SettingsOpen.id)
+        let root = try XCTUnwrap(navigator.presented as? SettingsRootViewController)
+        let window = UIWindow(frame: CGRect(origin: .zero, size: SettingsRootViewController.formSheetSize))
+        window.addSubview(root.view)
+
+        let out = try await h.run(SettingsOpen.id, ["page": "settings.language"])
+        XCTAssertEqual(out["page"]?.stringValue, "settings.language")
+        XCTAssertEqual(navigator.requestedPages, [nil], "the Settings on screen moves; no second one opens")
+        XCTAssertEqual(root.state.section, .general)
+        XCTAssertEqual(root.state.detailPath.count, 1)
+    }
+
+    func testAppMenuPanelsOpenAsSheetsFromTheLibrary() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let navigator = RecordingNavigator(app: h.app)
+        h.app.ui.activeNavigator = navigator
+        var built: [String] = []
+        let panels: [(String, String, PanelPlacement)] = [("organize.trash", "organize", .libraryTab),
+                                                          ("templates.manage", "templateui", .sheet)]
+        for (id, owner, placement) in panels {
+            h.app.ui.panels.register(PanelDescriptor(id: id, title: id, icon: "square", placement: placement, order: 10,
+                                                     owner: owner, docKinds: nil) { ctx in
+                built.append(id)
+                XCTAssertNotNil(ctx.navigator)
+                return AnyView(EmptyView())
+            })
+        }
+        XCTAssertNil(navigator.session.document, "the app menu lives in the library, with no document open")
+
+        for (place, id) in [("trash", "organize.trash"), ("templates", "templates.manage")] {
+            let out = try await h.run(SettingsOpen.id, ["place": .string(place)])
+            XCTAssertEqual(out["opened"]?.stringValue, "panel", place)
+            XCTAssertEqual(out["panel"]?.stringValue, id, place)
+            XCTAssertTrue(navigator.presented is UIHostingController<AnyView>, place)
+        }
+        XCTAssertEqual(built, ["organize.trash", "templates.manage"])
+        XCTAssertTrue(navigator.requestedPages.isEmpty)
     }
 
     func testSettingsOpenRejectsUnknownPagesAndPlaces() async {
@@ -225,6 +275,22 @@ final class FeatSettingsTests: XCTestCase {
         }
         XCTAssertEqual(Set(PalmSensitivity.levels.map(PalmSensitivity.title)).count, 3)
         XCTAssertEqual(Set(StylusMode.allCases.map(\.title)).count, StylusMode.allCases.count)
+    }
+
+    func testProfileSavesTheTrimmedNameOnlyWhenItChanged() {
+        XCTAssertEqual(ProfilePage.nameToSave("  Ada Lovelace \n", stored: ""), "Ada Lovelace")
+        XCTAssertNil(ProfilePage.nameToSave(" Ada ", stored: "Ada"))
+        XCTAssertEqual(ProfilePage.nameToSave("   ", stored: "Ada"), "", "clearing the field clears the name")
+    }
+
+    func testNotificationStatusText() async {
+        XCTAssertEqual(NotificationsPage.statusText(.authorized), "Allowed")
+        XCTAssertEqual(NotificationsPage.statusText(.provisional), "Allowed")
+        XCTAssertEqual(NotificationsPage.statusText(.denied), "Off")
+        XCTAssertNotNil(NotificationsPage.statusText(.notDetermined))
+        XCTAssertNil(NotificationsPage.statusText(nil))
+        let status = await SystemNotificationStatus().status()
+        XCTAssertNil(status, "hostless tests have no notification centre")
     }
 
     func testLanguageOptionsKeepTheCurrentValueAndSortByName() {

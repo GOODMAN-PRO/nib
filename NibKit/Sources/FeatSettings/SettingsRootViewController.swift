@@ -11,7 +11,7 @@ import NibDesign
 /// beside an inset grouped list when there is room (≥ 600 pt, not at accessibility sizes), a stack otherwise.
 @MainActor
 final class SettingsRootViewController: UIViewController {
-    /// DESIGN.md §14.8.
+    /// DESIGN.md §14.8. ponytail: local until NibMetrics has a settings-sheet size (contract request).
     static let formSheetSize = CGSize(width: 760, height: 706)
 
     let app: NibApp
@@ -95,6 +95,9 @@ struct SettingsCatalog {
 
     func group(_ section: SettingsSection) -> SectionGroup? { groups.first { $0.section == section } }
 
+    /// The section to show for a selection: the selected one while it still has pages, else the first.
+    func selected(_ section: SettingsSection?) -> SectionGroup? { section.flatMap { group($0) } ?? groups.first }
+
     /// Pages whose title, section or keywords contain every word of `query` (case and diacritics ignored).
     func search(_ query: String) -> [SettingsPageDescriptor] {
         let words = query.split(whereSeparator: { $0.isWhitespace }).map(String.init)
@@ -158,11 +161,12 @@ extension SettingsSection {
         case .general: return .settings
         case .editing: return .textDocument
         case .stylus: return .pen
-        case .writing: return NibSymbol(systemName: "scribble") ?? .pencil
+        case .writing: return .whiteboard
         case .ai: return .assistant
         case .sync: return .syncing
         case .plugins: return .puzzle
         case .bridge: return .bridge
+        // ponytail: wrench and info glyphs are not in NibSymbol yet (contract request).
         case .advanced: return NibSymbol(systemName: "wrench.and.screwdriver") ?? .settings
         case .about: return NibSymbol(systemName: "info.circle") ?? .settings
         }
@@ -179,6 +183,7 @@ extension SettingsPageDescriptor {
 /// Reads `NibSettings` keys from the store and writes them only through the `settings.set` command, so a toggle
 /// in Settings, a plugin and the AI change a setting the same way. Republishes when anyone changes a setting.
 /// ponytail: one model per page; the store is the single source of truth, so nothing is cached but in-flight writes.
+@MainActor
 final class SettingsModel: ObservableObject {
     private struct Pending {
         let value: JSONValue
@@ -192,7 +197,6 @@ final class SettingsModel: ObservableObject {
     private var nextToken = 0
     private var subscription: AnyCancellable?
 
-    @MainActor
     init(app: NibApp) {
         self.app = app
         self.store = app.settings
@@ -220,13 +224,12 @@ final class SettingsModel: ObservableObject {
         guard let json = try? JSONValue.from(value) else { return }
         let name = key.name
         let token = stage(name, json)
-        Task { @MainActor in
+        Task {
             await self.commit(name, json, token: token)
         }
     }
 
     /// Writes a value through `settings.set` and returns the error, if any.
-    @MainActor
     @discardableResult
     func set<V: Codable>(_ key: SettingKey<V>, _ value: V) async -> NibError? {
         let json: JSONValue
@@ -245,7 +248,6 @@ final class SettingsModel: ObservableObject {
         return nextToken
     }
 
-    @MainActor
     @discardableResult
     private func commit(_ name: String, _ json: JSONValue, token: Int) async -> NibError? {
         var failure: NibError?
@@ -272,7 +274,7 @@ final class SettingsModel: ObservableObject {
 
 @MainActor
 struct SettingsRootView: View {
-    /// DESIGN.md §14.8: the iPad section list.
+    /// DESIGN.md §14.8: the iPad section list. ponytail: local until NibMetrics has it (contract request).
     static let sidebarWidth: CGFloat = 220
 
     let app: NibApp
@@ -298,10 +300,10 @@ struct SettingsRootView: View {
         }
         .background(NibColor.groupedBackground)
         .tint(NibColor.accent)
-        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange).receive(on: DispatchQueue.main)) { _ in
-            // Plugins install and remove settings pages while Settings may be open.
-            let fresh = SettingsCatalog(pages: app.ui.settingsPages.all)
-            if fresh.pages.map({ $0.id }) != catalog.pages.map({ $0.id }) { catalog = fresh }
+        .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange, object: app.ui.settingsPages)
+            .receive(on: DispatchQueue.main)) { _ in
+            // Plugins add, replace and remove settings pages while Settings may be open; rebuilding is cheap.
+            catalog = SettingsCatalog(pages: app.ui.settingsPages.all)
         }
     }
 
@@ -312,7 +314,7 @@ struct SettingsRootView: View {
                 .background(NibColor.backgroundSecondary)
             Divider()
             NavigationStack(path: $state.detailPath) {
-                SettingsSectionDetail(app: app, catalog: catalog, section: state.section ?? catalog.groups.first?.section)
+                SettingsSectionDetail(app: app, group: catalog.selected(state.section))
                     .navigationDestination(for: SettingsPageLink.self) { link in
                         SettingsPageHost(app: app, page: catalog.page(link.id))
                             .settingsDoneButton(onDone)
@@ -342,7 +344,7 @@ struct SettingsSidebar: View {
     let catalog: SettingsCatalog
     @ObservedObject var state: SettingsNavigationState
 
-    private var selected: SettingsSection? { state.section ?? catalog.groups.first?.section }
+    private var selected: SettingsSection? { catalog.selected(state.section)?.section }
     private var rowShape: RoundedRectangle { RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous) }
 
     var body: some View {
@@ -450,11 +452,10 @@ struct SettingsIndexList: View {
 @MainActor
 struct SettingsSectionDetail: View {
     let app: NibApp
-    let catalog: SettingsCatalog
-    let section: SettingsSection?
+    let group: SettingsCatalog.SectionGroup?
 
     var body: some View {
-        if let section, let group = catalog.group(section) {
+        if let group {
             if group.pages.count == 1 {
                 SettingsPageHost(app: app, page: group.pages[0])
             } else {

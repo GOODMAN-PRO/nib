@@ -133,29 +133,52 @@ struct ProfilePage: View {
     }
 
     private func save() {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed != model.value(NibSettings.authorName) else { return }
-        model.change(NibSettings.authorName, to: trimmed)
+        if let value = Self.nameToSave(name, stored: model.value(NibSettings.authorName)) {
+            model.change(NibSettings.authorName, to: value)
+        }
+    }
+
+    /// The typed name, trimmed, when it differs from the stored one (nil = nothing to save).
+    static func nameToSave(_ typed: String, stored: String) -> String? {
+        let trimmed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == stored ? nil : trimmed
     }
 }
 
 // MARK: - Notifications
+
+/// Notification access behind a protocol (ARCHITECTURE.md §15.13), so tests use a fake.
+@MainActor
+protocol NotificationStatusReading {
+    /// nil when unknown (no notification centre, as in hostless tests).
+    func status() async -> UNAuthorizationStatus?
+}
+
+struct SystemNotificationStatus: NotificationStatusReading {
+    func status() async -> UNAuthorizationStatus? {
+        guard !NibApp.isHostlessTest else { return nil }
+        return await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+}
 
 /// Settings › General › Notifications: whether Nib may notify, and the way to the system's notification settings
 /// for Nib (through `settings.open {place: "systemNotifications"}`).
 @MainActor
 struct NotificationsPage: View {
     let app: NibApp
+    let reader: NotificationStatusReading
     @State private var status: UNAuthorizationStatus? = nil
 
-    init(app: NibApp) {
+    init(app: NibApp, reader: NotificationStatusReading = SystemNotificationStatus()) {
         self.app = app
+        self.reader = reader
     }
 
     var body: some View {
         List {
             Section {
-                NibRow(String(localized: "Notifications"), subtitle: statusText,
+                // ponytail: bell and external-link glyphs are not in NibSymbol yet (contract request).
+                NibRow(String(localized: "Notifications"), subtitle: Self.statusText(status),
                        icon: NibSymbol(systemName: "bell.badge") ?? .settings)
                 Button {
                     app.perform(SettingsOpen.id, ["place": .string(AppMenuPlace.systemNotifications.rawValue)])
@@ -181,7 +204,7 @@ struct NotificationsPage: View {
         }
     }
 
-    private var statusText: String? {
+    static func statusText(_ status: UNAuthorizationStatus?) -> String? {
         switch status {
         case .authorized?, .provisional?, .ephemeral?: return String(localized: "Allowed")
         case .denied?: return String(localized: "Off")
@@ -191,8 +214,6 @@ struct NotificationsPage: View {
     }
 
     private func refresh() async {
-        // Hostless tests have no notification centre.
-        guard !NibApp.isHostlessTest else { return }
-        status = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+        status = await reader.status()
     }
 }

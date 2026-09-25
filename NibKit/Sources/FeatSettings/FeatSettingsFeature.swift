@@ -40,6 +40,7 @@ enum CoreSettingsPages {
     static let stylus = "settings.stylus"
 
     static func descriptors(owner: String) -> [SettingsPageDescriptor] {
+        // ponytail: "person.crop.circle", "globe" and "bell.badge" are not in NibSymbol yet (contract request).
         [
             SettingsPageDescriptor(id: profile, title: String(localized: "Profile"), icon: "person.crop.circle",
                                    section: .general, order: 10, owner: owner) { app in
@@ -53,11 +54,11 @@ enum CoreSettingsPages {
                                    section: .general, order: 800, owner: owner) { app in
                 AnyView(NotificationsPage(app: app))
             },
-            SettingsPageDescriptor(id: editing, title: String(localized: "Document Editing"), icon: "doc.text",
+            SettingsPageDescriptor(id: editing, title: String(localized: "Document Editing"), icon: NibSymbol.textDocument.name,
                                    section: .editing, order: 10, owner: owner) { app in
                 AnyView(DocumentEditingPage(app: app))
             },
-            SettingsPageDescriptor(id: stylus, title: String(localized: "Stylus & Palm Rejection"), icon: "pencil.tip",
+            SettingsPageDescriptor(id: stylus, title: String(localized: "Stylus & Palm Rejection"), icon: NibSymbol.pen.name,
                                    section: .stylus, order: 10, owner: owner) { app in
                 AnyView(StylusPage(app: app))
             },
@@ -145,7 +146,7 @@ final class SettingsRouter {
             }
             switch place.resolve(panels: app.ui.panels.all, pages: app.ui.settingsPages.all) {
             case .panel(let id)?:
-                _ = try await ctx.execute(CommandIDs.panelOpen, ["id": .string(id)])
+                try await openPanel(id, app: app, ctx)
                 return SettingsOpen.Output(opened: "panel", page: nil, panel: id)
             case .systemNotifications?:
                 try openSystemNotificationSettings()
@@ -170,6 +171,21 @@ final class SettingsRouter {
         navigator.showSettings(page: page)
         pendingPage = nil
         return SettingsOpen.Output(opened: "settings", page: page, panel: nil)
+    }
+
+    /// `panel.open` works only inside an open document and never for library tabs, but the app menu lives in the
+    /// library: there the panel is presented here, as a sheet over the window.
+    private func openPanel(_ id: String, app: NibApp, _ ctx: CommandContext) async throws {
+        guard let panel = app.ui.panels.get(id) else { throw NibError(.notFound, "panel '\(id)' not found") }
+        guard let navigator = app.ui.activeNavigator else { throw NibError.unavailable("an open Nib window") }
+        if panel.placement != .libraryTab, navigator.session.document != nil {
+            _ = try await ctx.execute(CommandIDs.panelOpen, ["id": .string(id)])
+            return
+        }
+        let host = UIHostingController(rootView: AnyView(EmptyView()))
+        host.rootView = panel.makeView(PanelContext(app: app, session: navigator.session, navigator: navigator,
+                                                    dismiss: { [weak host] in host?.dismiss(animated: true) }))
+        navigator.presentModal(host)
     }
 
     private func openSystemNotificationSettings() throws {
@@ -234,10 +250,11 @@ enum AppMenuPlace: String, CaseIterable {
 enum AppMenu {
     static func items(owner: String) -> [MenuItemDescriptor] {
         [
-            item(.settings, String(localized: "Settings"), icon: "gearshape", order: 100, owner: owner),
+            item(.settings, String(localized: "Settings"), icon: NibSymbol.settings.name, order: 100, owner: owner),
+            // ponytail: "doc.on.doc" and "info.circle" are not in NibSymbol yet (contract request).
             item(.templates, String(localized: "Manage Templates"), icon: "doc.on.doc", order: 200, owner: owner),
-            item(.cloudBackup, String(localized: "Cloud & Backup"), icon: "checkmark.icloud", order: 300, owner: owner),
-            item(.trash, String(localized: "Trash"), icon: "trash", order: 400, owner: owner),
+            item(.cloudBackup, String(localized: "Cloud & Backup"), icon: NibSymbol.syncDone.name, order: 300, owner: owner),
+            item(.trash, String(localized: "Trash"), icon: NibSymbol.trash.name, order: 400, owner: owner),
             item(.about, String(localized: "About Nib"), icon: "info.circle", order: 900, owner: owner),
         ]
     }
