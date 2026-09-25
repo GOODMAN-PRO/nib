@@ -275,7 +275,7 @@ enum ShapeRecognizer {
             best = RecognizedShape(shape: shape, error: error, confidence: confidence(error, threshold))
         }
         if let arc = fitArc(r, size: s), arc.error <= Threshold.arc {
-            consider(pointShape(.arc, arc.points), error: arc.error, score: arc.error, threshold: Threshold.arc)
+            consider(pointShape(arc.kind, arc.points), error: arc.error, score: arc.error, threshold: Threshold.arc)
         }
         if let curve = fitParabola(r, size: s), curve.error <= Threshold.curve {
             consider(pointShape(.curve, curve.points), error: curve.error, score: curve.error, threshold: Threshold.curve)
@@ -382,9 +382,11 @@ enum ShapeRecognizer {
         return best
     }
 
-    /// Algebraic (Kåsa) circle through an open stroke that sweeps 40°–330° without turning back: start, middle and end
-    /// points on the arc.
-    private static func fitArc(_ r: [Point], size s: Double) -> (points: [Point], error: Double)? {
+    /// Algebraic (Kåsa) circle through an open stroke that sweeps 40°–330° without turning back. Under 170° it is an
+    /// arc (start, control, end) whose control is where the end tangents meet, so the conic drawn with weight
+    /// cos(span / 2) is the exact circular arc. Wider sweeps, whose tangents meet far away or never, become a clamped
+    /// cubic B-spline curve with control points every ≤ 20° just outside the circle (within 1 % of it).
+    private static func fitArc(_ r: [Point], size s: Double) -> (kind: ShapeKind, points: [Point], error: Double)? {
         let o = ShapeFit.centroid(r)
         let k = s / 2
         var m = [[Double]](repeating: [0, 0, 0], count: 3)
@@ -416,12 +418,21 @@ enum ShapeRecognizer {
         let span = abs(total)
         guard span >= 40 * degree, span <= 330 * degree, back <= 0.15 * span else { return nil }
         let a0 = atan2(r[0].y - c.y, r[0].x - c.x)
-        func on(_ a: Double) -> Point { Point(c.x + radius * cos(a), c.y + radius * sin(a)) }
-        return ([on(a0), on(a0 + total / 2), on(a0 + total)], err / Double(r.count) / s)
+        func on(_ a: Double, _ distance: Double) -> Point { Point(c.x + distance * cos(a), c.y + distance * sin(a)) }
+        let error = err / Double(r.count) / s
+        if span < 170 * degree {
+            return (.arc, [on(a0, radius), on(a0 + total / 2, radius / cos(span / 2)), on(a0 + total, radius)], error)
+        }
+        // A uniform cubic B-spline passes (P[k-1] + 4 P[k] + P[k+1]) / 6 at each knot: control points on a circle of
+        // radius 6R / (4 + 2 cos step) put every knot on the circle of radius R. The ends are the stroke's ends.
+        let n = Int((span / (20 * degree)).rounded(.up))
+        let step = total / Double(n)
+        let rho = 6 * radius / (4 + 2 * cos(step))
+        return (.curve, (0...n).map { k in on(a0 + step * Double(k), k == 0 || k == n ? radius : rho) }, error)
     }
 
-    /// Parabola y = a·t² + b·t + c across the chord (t = 0…1 from the first to the last point): start, middle and end
-    /// points on the curve.
+    /// Parabola y = a·t² + b·t + c across the chord (t = 0…1 from the first to the last point) as a quadratic Bézier:
+    /// start, control, end (the control is 2 × middle − (start + end) / 2, so the curve passes through the middle).
     private static func fitParabola(_ r: [Point], size s: Double) -> (points: [Point], error: Double)? {
         let a = r[0], z = r[r.count - 1]
         let length = a.distance(to: z)
@@ -453,7 +464,8 @@ enum ShapeRecognizer {
             let y = q[0] * t * t + q[1] * t + q[2]
             return Point(a.x + t * length * ux - y * uy, a.y + t * length * uy + y * ux)
         }
-        return ([at(0), at(0.5), at(1)], err / Double(xs.count) / s)
+        let start = at(0), end = at(1)
+        return ([start, at(0.5) * 2 - (start + end) * 0.5, end], err / Double(xs.count) / s)
     }
 
     // MARK: Corners (Douglas–Peucker, cleaned)
@@ -786,8 +798,9 @@ enum ShapeFit {
 // MARK: - Shape geometry
 
 /// Page-space geometry of a `ShapeItem`, shared by the recogniser (frames of curves), the snapper (vertices) and the
-/// live preview (outline). Box kinds are defined by their frame, point kinds by their points; three-point arcs and
-/// curves pass through all three points (start, middle, end).
+/// live preview (outline). Box kinds are defined by their frame, point kinds by their points. Arcs and curves hold
+/// control points (CONTRACTS: ShapeItem.points), outlined exactly as the shape drawer (F031) draws them: an arc is the
+/// conic (start, control, end), a curve a Bézier or a clamped B-spline.
 enum ShapeGeometry {
     static let boxKinds: Set<ShapeKind> = [.rectangle, .roundedRectangle, .ellipse, .triangle, .diamond]
     static let openKinds: Set<ShapeKind> = [.line, .polyline, .arrow, .arc, .curve]
@@ -829,26 +842,16 @@ enum ShapeGeometry {
             return [closed(points(s))]
         case .arc:
             let p = points(s)
-            guard p.count == 3, let circle = circleThrough(p[0], p[1], p[2]) else { return [p] }
-            let c = circle.center
-            let a0 = atan2(p[0].y - c.y, p[0].x - c.x)
-            let toMiddle = positiveAngle(atan2(p[1].y - c.y, p[1].x - c.x) - a0)
-            let toEnd = positiveAngle(atan2(p[2].y - c.y, p[2].x - c.x) - a0)
-            let sweep = toMiddle <= toEnd ? toEnd : toEnd - 2 * Double.pi
+            guard p.count == 3 else { return [p] }
+            let w = conicWeight(p[0], p[1], p[2])
             return [(0...48).map { i -> Point in
-                let a = a0 + sweep * Double(i) / 48
-                return Point(c.x + circle.radius * cos(a), c.y + circle.radius * sin(a))
+                let t = Double(i) / 48, u = 1 - t
+                let d = u * u + 2 * u * t * w + t * t
+                let k0 = u * u / d, k1 = 2 * u * t * w / d, k2 = t * t / d
+                return Point(p[0].x * k0 + p[1].x * k1 + p[2].x * k2, p[0].y * k0 + p[1].y * k1 + p[2].y * k2)
             }]
         case .curve:
-            let p = points(s)
-            guard p.count == 3 else { return [p] }
-            // The quadratic through the middle point: control = 2 × middle − (start + end) / 2.
-            let q = Point(2 * p[1].x - (p[0].x + p[2].x) / 2, 2 * p[1].y - (p[0].y + p[2].y) / 2)
-            return [(0...32).map { i -> Point in
-                let t = Double(i) / 32, u = 1 - t
-                return Point(u * u * p[0].x + 2 * u * t * q.x + t * t * p[2].x,
-                             u * u * p[0].y + 2 * u * t * q.y + t * t * p[2].y)
-            }]
+            return [curvePoints(points(s))]
         case .arrow:
             let p = points(s)
             let tip = p[p.count - 1], from = p[p.count - 2]
@@ -882,17 +885,46 @@ enum ShapeGeometry {
         Rect.bounding(outline(s).first ?? []) ?? s.frame.bounds
     }
 
-    static func circleThrough(_ a: Point, _ b: Point, _ c: Point) -> (center: Point, radius: Double)? {
-        let d = 2 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y))
-        guard abs(d) > 1e-9 else { return nil }
-        let a2 = a.x * a.x + a.y * a.y, b2 = b.x * b.x + b.y * b.y, c2 = c.x * c.x + c.y * c.y
-        let center = Point((a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d,
-                           (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d)
-        return (center, center.distance(to: a))
+    /// The arc's conic weight as the shape drawer computes it: cos of the angle between the chord and the tangents, so
+    /// an isosceles (start, control, end) triangle gives a circular arc.
+    static func conicWeight(_ a: Point, _ c: Point, _ b: Point) -> Double {
+        func angle(_ o: Point, _ p: Point, _ q: Point) -> Double {
+            let u = p - o, v = q - o
+            let lu = hypot(u.x, u.y), lv = hypot(v.x, v.y)
+            guard lu > 1e-9, lv > 1e-9 else { return 0 }
+            return acos(max(-1, min(1, (u.x * v.x + u.y * v.y) / (lu * lv))))
+        }
+        let theta = (angle(a, c, b) + angle(b, c, a)) / 2
+        return min(max(cos(theta), 0.05), 1)
     }
 
-    private static func positiveAngle(_ a: Double) -> Double {
-        let r = ShapeFit.normalized(a)
-        return r < 0 ? r + 2 * Double.pi : r
+    /// A curve as the shape drawer draws it: 2 points a line, 3 a quadratic Bézier (start, control, end), 4 a cubic,
+    /// more a uniform cubic B-spline clamped by tripling its ends.
+    static func curvePoints(_ p: [Point]) -> [Point] {
+        func cubic(_ a: Point, _ b: Point, _ c: Point, _ d: Point) -> [Point] {
+            (0...16).map { i -> Point in
+                let t = Double(i) / 16, u = 1 - t
+                let k0 = u * u * u, k1 = 3 * u * u * t, k2 = 3 * u * t * t, k3 = t * t * t
+                return Point(a.x * k0 + b.x * k1 + c.x * k2 + d.x * k3, a.y * k0 + b.y * k1 + c.y * k2 + d.y * k3)
+            }
+        }
+        switch p.count {
+        case 0...2:
+            return p
+        case 3:
+            return cubic(p[0], p[0] + (p[1] - p[0]) * (2.0 / 3), p[2] + (p[1] - p[2]) * (2.0 / 3), p[2])
+        case 4:
+            return cubic(p[0], p[1], p[2], p[3])
+        default:
+            let q = [p[0], p[0]] + p + [p[p.count - 1], p[p.count - 1]]
+            var out = [p[0]]
+            for i in 0..<(q.count - 3) {
+                let c1 = (q[i + 1] * 4 + q[i + 2] * 2) * (1.0 / 6)
+                let c2 = (q[i + 1] * 2 + q[i + 2] * 4) * (1.0 / 6)
+                let end = (q[i + 1] + q[i + 2] * 4 + q[i + 3]) * (1.0 / 6)
+                out += cubic(out[out.count - 1], c1, c2, end).dropFirst()
+            }
+            return out
+        }
     }
 }
