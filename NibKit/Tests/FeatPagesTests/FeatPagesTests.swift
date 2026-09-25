@@ -53,20 +53,24 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertEqual(h.app.ui.menuItems(.addPage, ctx).count, 12)
     }
 
-    func testThumbnailMenuActsOnTheSidebarSelection() {
+    func testThisPageActionsActOnTheOpenPageAndTheSidebarMenusAreF023s() throws {
         let h = Harness(features: [FeatPagesFeature.self])
-        let ctx = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, nodes: [Fixtures.page2, Fixtures.pdfPage])
-        let trash = h.app.ui.menuItems(.sidebarSelection, ctx).first { $0.command == "page.trash" }
-        XCTAssertEqual(trash?.destructive, true)
-        let pages: JSONValue = ["page:FIXTUREDOC01/FIXTUREPG002", "page:FIXTUREDOC01/FIXTUREPG003"]
-        XCTAssertEqual(trash?.params(ctx)["pages"], pages)
-        let rotate = h.app.ui.menuItems(.sidebarSelection, ctx).first { $0.id == "pages.sidebarSelection.rotateAnticlockwise" }
-        XCTAssertEqual(rotate?.params(ctx)["degrees"]?.intValue, 270)
+        let sidebar = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, nodes: [Fixtures.page2, Fixtures.pdfPage])
+        XCTAssertTrue(h.app.ui.menuItems(.sidebarSelection, sidebar).isEmpty, "the page sidebar (F023) owns its menus")
+        XCTAssertTrue(h.app.ui.menuItems(.sidebarPage, sidebar).isEmpty)
 
-        let move = h.app.ui.menuItems(.sidebarSelection, ctx).first { $0.id == "pages.sidebarSelection.move" }
+        let ctx = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page2)
+        let items = h.app.ui.menuItems(.documentMore, ctx)
+        let trash = try XCTUnwrap(items.first { $0.id == "pages.documentMore.trash" })
+        XCTAssertTrue(trash.destructive)
+        let pages: JSONValue = ["page:FIXTUREDOC01/FIXTUREPG002"]
+        XCTAssertEqual(trash.params(ctx)["pages"], pages)
+        let rotate = items.first { $0.id == "pages.documentMore.rotateAnticlockwise" }
+        XCTAssertEqual(rotate?.params(ctx)["degrees"]?.intValue, 270)
+        let move = items.first { $0.id == "pages.documentMore.move" }
         XCTAssertEqual(move?.params(ctx)["id"]?.stringValue, PageDialogs.movePagesID)
-        XCTAssertEqual(MovePagesStash.pages, ["page:FIXTUREDOC01/FIXTUREPG002", "page:FIXTUREDOC01/FIXTUREPG003"])
-        MovePagesStash.pages = []
+        let board = MenuContext(app: h.app, session: h.session, doc: Fixtures.whiteboardID, page: Fixtures.boardID)
+        XCTAssertFalse(h.app.ui.menuItems(.documentMore, board).contains { $0.id == "pages.documentMore.trash" })
     }
 
     // MARK: Pure logic
@@ -111,8 +115,26 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertEqual(keys, keys.sorted())
         XCTAssertEqual(Set(keys).count, 5)
         XCTAssertTrue(keys.allSatisfy { $0 > "V" && $0 < "k" })
+        XCTAssertEqual(OrderKeys.between("V", "k", count: 1), [FractionalIndex.between("V", "k")])
         XCTAssertEqual(OrderKeys.bounds(.start, anchor: nil, in: pages).hi, "V")
         XCTAssertEqual(OrderKeys.bounds(.before, anchor: "missing", in: pages).lo, "k", "an unknown anchor means the end")
+    }
+
+    func testBulkOrderKeysStayShortAndIncreasing() {
+        // A 2000-page PDF imported at the end, between neighbours, and between keys sharing a prefix.
+        let gaps: [(lo: String?, hi: String?)] = [("t", nil), ("V", "k"), ("Vzzz", "W"), ("abc1", "abc2"), (nil, "0001")]
+        for gap in gaps {
+            let label = (gap.lo ?? "nil") + "…" + (gap.hi ?? "nil")
+            let keys = OrderKeys.between(gap.lo, gap.hi, count: PageCommands.maxNewPages)
+            XCTAssertEqual(keys.count, PageCommands.maxNewPages, label)
+            XCTAssertEqual(Set(keys).count, keys.count, label)
+            XCTAssertEqual(keys, keys.sorted(), label)
+            XCTAssertTrue(keys.allSatisfy { key in key > (gap.lo ?? "") && gap.hi.map { key < $0 } ?? true }, label)
+            XCTAssertFalse(keys.contains { $0.hasSuffix("0") }, label)
+            // Two digits past the longer neighbour always fit 2000 keys (62 × 62 > 2001).
+            XCTAssertLessThanOrEqual(keys.map { $0.count }.max() ?? 0, max(gap.lo?.count ?? 0, gap.hi?.count ?? 0) + 2, label)
+        }
+        XCTAssertLessThanOrEqual(OrderKeys.between("t", nil, count: PageCommands.maxNewPages).map { $0.count }.max() ?? 0, 4)
     }
 
     func testCurrentTemplateSkipsCoversPDFsAndPhotos() {
@@ -126,8 +148,9 @@ final class FeatPagesTests: XCTestCase {
         let colour = PageRecord(background: .ofColor(.paperYellow))
         XCTAssertEqual(CurrentTemplate.background(reference: colour, defaultPaper: paper, referenceIsCover: false), .ofColor(.paperYellow))
         XCTAssertEqual(CurrentTemplate.background(reference: nil, defaultPaper: paper, referenceIsCover: false), .ofTemplate("builtin.ruled"))
-        XCTAssertTrue(PageTemplates.isCover(TemplateRef("cover.solid")))
-        XCTAssertFalse(PageTemplates.isCover(TemplateRef("builtin.ruled")))
+        XCTAssertTrue(PageTemplates.isCover(TemplateRef("cover.solid"), nil))
+        XCTAssertFalse(PageTemplates.isCover(TemplateRef("builtin.ruled"), nil))
+        XCTAssertFalse(PageTemplates.isCover(TemplateRef("x.coverless"), nil), "only the cover. prefix names a cover")
     }
 
     func testRotationWrapsAndImagePagesKeepProportions() {
@@ -142,15 +165,35 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertEqual(tall.width, PageSize.a4.height / 2, accuracy: 0.001)
     }
 
-    func testAssetReferencesAreFoundAndRenamedEverywhere() throws {
-        let image = Item.makeImage(ImageItem(frame: Frame(x: 0, y: 0, w: 10, h: 10), asset: AssetRef("old.png")))
-        let page = PageRecord(background: .ofPDF(AssetRef("doc.pdf"), page: 0))
-        XCTAssertEqual(AssetRefs.names(in: [image]), ["old.png"])
-        XCTAssertEqual(AssetRefs.names(in: [page]), ["doc.pdf"])
-        let renamed = try AssetRefs.rewriting([image], ["old.png": "new.png"])
-        XCTAssertEqual(renamed[0].image?.asset, AssetRef("new.png"))
+    func testAssetReferencesAreFoundAndRenamedByItemKind() {
+        let frame = Frame(x: 0, y: 0, w: 10, h: 10)
+        let image = Item.makeImage(ImageItem(frame: frame, asset: AssetRef("old.png")))
+        var tapeStyle = InkStyle.defaultTape
+        tapeStyle.tapePattern = AssetRef("tape.png")
+        let tape = Item.makeStroke(Stroke(style: tapeStyle, points: [StrokePoint(x: 0, y: 0), StrokePoint(x: 9, y: 9)]))
+        let glyph = TextAttributes(attachment: AssetRef("glyph.png"))
+        let text = Item.makeText(TextBoxItem(frame: frame, text: RichText(paragraphs: [Paragraph(runs: [TextRun("\u{FFFC}", glyph)])])))
+        let chart = DisplayOp(op: .image, rect: Rect(x: 0, y: 0, width: 5, height: 5), asset: AssetRef("chart.png"))
+        let custom = Item.makeCustom(CustomItem(owner: "dev.example", type: "chart", frame: frame, display: DisplayList(ops: [chart])))
+        let pen = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 1)]))
+        let items = [image, tape, text, custom, pen]
+        XCTAssertEqual(AssetRefs.names(in: items), ["old.png", "tape.png", "glyph.png", "chart.png"])
+
+        let renamed = AssetRefs.rewriting(items, ["old.png": "a.png", "tape.png": "b.png", "glyph.png": "c.png", "chart.png": "d.png"])
+        XCTAssertEqual(AssetRefs.names(in: renamed), ["a.png", "b.png", "c.png", "d.png"])
         XCTAssertEqual(renamed[0].image?.frame, image.image?.frame)
-        XCTAssertEqual(try AssetRefs.rewriting(page, ["doc.pdf": "copy.pdf"]).background.asset, AssetRef("copy.pdf"))
+        XCTAssertEqual(renamed[4], pen, "ink without assets is left as it is")
+
+        let page = PageRecord(background: .ofPDF(AssetRef("doc.pdf"), page: 7))
+        XCTAssertEqual(AssetRefs.names(of: page), ["doc.pdf"])
+        let map = AssetMap(names: ["doc.pdf": "cut.pdf"], pdfPages: ["doc.pdf": [3: 0, 7: 1]])
+        XCTAssertEqual(AssetRefs.rewriting(page, map).background, .ofPDF(AssetRef("cut.pdf"), page: 1))
+
+        // Only PDFs used as nothing but page backgrounds are cut down to their pages.
+        let photo = PageRecord(background: .ofImage(AssetRef("photo.png")))
+        let other = PageRecord(background: .ofPDF(AssetRef("doc.pdf"), page: 3))
+        let shared = PageRecord(background: .ofPDF(AssetRef("old.png"), page: 0))
+        XCTAssertEqual(AssetRefs.pdfPagesInUse([page, other, photo, shared], items: [image]), ["doc.pdf": [3, 7]])
     }
 
     func testClonedItemsDropReferencesToItemsLeftBehind() {

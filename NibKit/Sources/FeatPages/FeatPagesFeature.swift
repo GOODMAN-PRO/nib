@@ -6,6 +6,7 @@ public enum FeatPagesFeature: NibFeature {
     public static let id = "pages"
 
     public static func register(_ app: NibApp) {
+        app.services.set(app.content, for: PageTemplates.registryKey)
         PageCommands.register(app.commands)
         PageMenus.register(app)
         PageDialogs.register(app)

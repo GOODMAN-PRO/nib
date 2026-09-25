@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 import NibContracts
 import NibTesting
 @testable import FeatPages
@@ -17,6 +18,11 @@ final class PageCommandTests: XCTestCase {
 
     private func refs(_ value: JSONValue) -> [String] {
         value["refs"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+    }
+
+    private func pdfPageCount(_ data: Data) -> Int {
+        guard let provider = CGDataProvider(data: data as CFData) else { return 0 }
+        return CGPDFDocument(provider)?.numberOfPages ?? 0
     }
 
     private func assertFails(_ command: String, _ params: JSONValue, code: NibError.Code, as principal: Principal = .user,
@@ -149,6 +155,44 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(try livePageIDs(h, Fixtures.whiteboardID), ["FIXTUREBRD01"])
     }
 
+    func testCopyingAPageOfALongPDFKeepsMainFreeAndCarriesOnlyThatPage() async throws {
+        let h = harness()
+        let lecture = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 595.28, height: 841.89)).pdfData { ctx in
+            for page in 1...300 {
+                ctx.beginPage()
+                for line in 0..<30 {
+                    ("Lecture page \(page), line \(line): velocity is displacement over time." as NSString)
+                        .draw(at: CGPoint(x: 48, y: 48 + line * 24), withAttributes: [.font: UIFont.systemFont(ofSize: 14)])
+                }
+            }
+        }
+        h.assets.install(lecture, as: AssetRef("lecture.pdf"), doc: Fixtures.docID)
+        try await h.run("page.add", ["doc": "doc:FIXTUREDOC01", "position": "end", "asset": "lecture.pdf", "pdfPage": 250,
+                                     "id": "LECTURE00251"])
+
+        // page.copy only keeps references on the main actor (ARCHITECTURE §14 and §20: budget × 4).
+        let budget = 0.016
+        let start = Date()
+        try await h.run("page.copy", ["pages": ["page:FIXTUREDOC01/LECTURE00251"]])
+        XCTAssertLessThan(Date().timeIntervalSince(start), budget * 4)
+        let clip = try XCTUnwrap(PageClipboard.read())
+        XCTAssertNil(clip.assets.first?.data, "the in-process clipboard holds no bytes")
+
+        // The system pasteboard gets that one PDF page, renumbered.
+        let json = try clip.encodedWithBytes(store: h.assets, pdfUse: clip.pdfUse)
+        XCTAssertLessThan(json.count, lecture.count / 4)
+        let cut = try XCTUnwrap(PagesPayload.decode(json)?.assets.first { $0.name == "lecture.pdf" })
+        XCTAssertEqual(cut.pdfPages, [250])
+        XCTAssertEqual(pdfPageCount(try XCTUnwrap(cut.data)), 1)
+
+        // Pasting into another document stores just that page there.
+        let r = try await h.run("page.paste", ["doc": "doc:FIXTUREDOC04", "position": "end"])
+        guard case let .page(_, id)? = NodeRef(refs(r).first ?? "") else { return XCTFail("no page ref") }
+        let page = try XCTUnwrap(h.app.workspace.content(Fixtures.whiteboardID).page(id))
+        XCTAssertEqual(page.background.pdfPage, 0)
+        XCTAssertEqual(pdfPageCount(try h.assets.data(XCTUnwrap(page.background.asset), doc: Fixtures.whiteboardID)), 1)
+    }
+
     func testPasteAcceptsAPayloadAndAddPageCanPasteToo() async throws {
         let h = harness()
         try await h.run("page.copy", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]])
@@ -184,6 +228,12 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(after.compactMap { $0.frame }, before.compactMap { $0.frame })
         let image = try XCTUnwrap(after.first { $0.kind == .image }?.image)
         XCTAssertEqual(try h.assets.data(image.asset, doc: Fixtures.whiteboardID), Fixtures.pngData)
+        // Its outline entry went along; the recording that started on it stays in the notebook, unlinked.
+        let boardOutline = try h.app.workspace.content(Fixtures.whiteboardID).liveOutline
+        XCTAssertEqual(boardOutline.map { $0.title }, ["Fixture section"])
+        XCTAssertEqual(boardOutline.first?.page, Fixtures.page1)
+        XCTAssertTrue(try h.app.workspace.content(Fixtures.docID).liveOutline.isEmpty)
+        XCTAssertNil(try h.app.workspace.content(Fixtures.docID).liveAudio.first?.page)
 
         // One undo group, recorded in both documents.
         let group = h.app.bus.history.entries(Fixtures.docID).last?.group
@@ -194,6 +244,37 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(try livePageIDs(h), ["FIXTUREPG001", "FIXTUREPG002", "FIXTUREPG003"])
         XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).map { $0.bounds }, before.map { $0.bounds })
         XCTAssertEqual(try livePageIDs(h, Fixtures.whiteboardID), ["FIXTUREBRD01"])
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).liveOutline.first?.page, Fixtures.page1)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).liveAudio.first?.page, Fixtures.page1)
+        XCTAssertTrue(try h.app.workspace.content(Fixtures.whiteboardID).liveOutline.isEmpty)
+    }
+
+    func testMoveStopsBeforeAnythingChangesWhenAnAssetCannotBeRead() async throws {
+        let h = harness()
+        h.app.services.assets = UnreadableAssetStore(h.assets, unreadable: Fixtures.pngAsset.name)
+        let before = try h.snapshotAll()
+        let depths = h.undoDepths()
+        await assertFails("page.moveTo", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "doc": "doc:FIXTUREDOC04"],
+                          code: .unavailable, in: h)
+        XCTAssertEqual(try h.snapshotAll(), before, "nothing was moved")
+        XCTAssertEqual(h.undoDepths(), depths)
+
+        // A copy deletes nothing, so it goes ahead without the unreadable image.
+        try await h.run("page.copy", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"]])
+        let r = try await h.run("page.paste", ["doc": "doc:FIXTUREDOC04", "position": "end"])
+        XCTAssertEqual(refs(r).count, 1)
+    }
+
+    func testDryRunMovePreviewsWithoutCopyingBytes() async throws {
+        let h = harness()
+        let before = try h.snapshotAll()
+        let params: JSONValue = ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "doc": "doc:FIXTUREDOC04"]
+        let r = try await h.app.bus.execute(Invocation(command: "page.moveTo", params: params, session: h.session, dryRun: true))
+        XCTAssertFalse(r.changes.created.isEmpty, "the preview lists the new page")
+        XCTAssertEqual(try h.snapshotAll(), before)
+        // The image would be stored in the whiteboard under its content name; the preview stored nothing there.
+        let copyName = try h.assets.put(Fixtures.pngData, ext: "png", doc: "SCRATCHDOC01").name
+        XCTAssertThrowsError(try h.assets.data(AssetRef(copyName), doc: Fixtures.whiteboardID))
     }
 
     func testMovingBackGetsAFreshIDBecauseTheOldOneIsTaken() async throws {
@@ -242,8 +323,10 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).trashedPages.map { $0.id }, [Fixtures.page1])
         try await h.run("page.restore", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"]])
         XCTAssertEqual(try livePageIDs(h), ["FIXTUREPG001", "FIXTUREPG002", "FIXTUREPG003"], "back in its place")
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).trashedPages.map { $0.id }, [Fixtures.page1],
+                       "undoing the restore puts it back in the Trash")
 
-        try await h.run("page.trash", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"]])
         let depth = h.undoDepth(Fixtures.docID)
         try await h.run("page.purge", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"]])
         let content = try h.app.workspace.content(Fixtures.docID)
@@ -251,6 +334,9 @@ final class PageCommandTests: XCTestCase {
         XCTAssertEqual(content.page(Fixtures.page1)?.deleted, true)
         XCTAssertTrue(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).isEmpty)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth, "purge is irreversible")
+        XCTAssertEqual(content.liveOutline.map { $0.title }, ["Fixture section"], "its outline entry stays")
+        XCTAssertNil(content.liveOutline.first?.page)
+        XCTAssertNil(content.liveAudio.first?.page, "the recording stays, without the page")
     }
 
     func testADocumentKeepsItsLastPageAndOnlyTrashedPagesArePurged() async throws {
@@ -258,5 +344,26 @@ final class PageCommandTests: XCTestCase {
         await assertFails("page.trash", ["pages": ["page:FIXTUREDOC04/FIXTUREBRD01"]], code: .invalidParams, in: h)
         await assertFails("page.purge", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]], code: .invalidParams, in: h)
         await assertFails("page.trash", ["pages": ["page:FIXTUREDOC01/NOSUCHPAGE01"]], code: .notFound, in: h)
+    }
+}
+
+/// Reads of one asset fail although its file is there (an iCloud file that has not downloaded, a coordination error).
+private final class UnreadableAssetStore: AssetStore {
+    let inner: InMemoryAssetStore
+    let unreadable: String
+
+    init(_ inner: InMemoryAssetStore, unreadable: String) {
+        self.inner = inner
+        self.unreadable = unreadable
+    }
+
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef { try inner.put(data, ext: ext, doc: doc) }
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { inner.url(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try inner.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { inner.temporaryURL(ref) }
+
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data {
+        if ref.name == unreadable { throw CocoaError(.fileReadUnknown) }
+        return try inner.data(ref, doc: doc)
     }
 }

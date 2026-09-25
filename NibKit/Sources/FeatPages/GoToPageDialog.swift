@@ -97,8 +97,7 @@ struct GoToPageDialog: View {
             } else {
                 VStack(spacing: NibSpacing.l) {
                     HStack(alignment: .firstTextBaseline, spacing: NibSpacing.s) {
-                        TextField(String(localized: "Page"), text: $input)
-                            .font(NibFont.title2)
+                        NibField(text: $input, prompt: String(localized: "Page"))
                             .multilineTextAlignment(.center)
                             .keyboardType(.numbersAndPunctuation)
                             .submitLabel(.go)
@@ -106,9 +105,12 @@ struct GoToPageDialog: View {
                             .textInputAutocapitalization(.never)
                             .focused($fieldFocused)
                             .onSubmit { go() }
-                            .padding(.horizontal, NibSpacing.m)
-                            .frame(minWidth: 96, maxWidth: 160, minHeight: NibMetrics.hitTarget)
-                            .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
+                            .onChange(of: input) { _, text in
+                                // NibField grows vertically, so Return can arrive as a line break instead of a submit.
+                                guard text.contains("\n") else { return }
+                                input = text.replacingOccurrences(of: "\n", with: "")
+                                go()
+                            }
                             .accessibilityLabel(String(localized: "Page number or title"))
                             .accessibilityHint(String(localized: "\(pages.count) pages"))
                         Text(String(localized: "of \(pages.count)"))
@@ -184,7 +186,9 @@ enum MovePagesTargets {
     }
 }
 
-/// Move Pages (D-056): pick the notebook; the pages land at its end in one undoable step (page.moveTo).
+/// Move Pages (D-056): pick the notebook; the open page lands at its end in one undoable step (page.moveTo).
+/// ponytail: the open page only, because panel.open carries just the panel id; moving a sidebar selection through this
+/// sheet needs panel.open params in PanelContext (a contract request).
 @MainActor
 struct MovePagesSheet: View {
     let context: PanelContext
@@ -195,10 +199,7 @@ struct MovePagesSheet: View {
     init(context: PanelContext) {
         self.context = context
         let doc = context.session?.document
-        let staged = MovePagesStash.pages.filter { NodeRef($0)?.documentID == doc }
-        if !staged.isEmpty {
-            pages = staged
-        } else if let doc, let page = context.session?.page {
+        if let doc, let page = context.session?.page {
             pages = [NodeRef.page(doc, page).description]
         } else {
             pages = []
@@ -209,10 +210,10 @@ struct MovePagesSheet: View {
     var body: some View {
         let shown = MovePagesTargets.filter(candidates, query: query)
         VStack(spacing: 0) {
-            NibSheetHeader(title, onCancel: { close() })
+            NibSheetHeader(title, onCancel: { context.dismiss() })
             if pages.isEmpty {
-                NibEmptyState(symbol: .pages, title: String(localized: "No pages chosen"),
-                              message: String(localized: "Select pages in the sidebar, then choose Move to Another Notebook."))
+                NibEmptyState(symbol: .pages, title: String(localized: "No page open"),
+                              message: String(localized: "Open a page, then choose Move to Another Notebook."))
                 Spacer(minLength: 0)
             } else if candidates.isEmpty {
                 NibEmptyState(symbol: .notebook, title: String(localized: "No other notebooks"),
@@ -251,7 +252,6 @@ struct MovePagesSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
-        .onDisappear { MovePagesStash.pages = [] }
     }
 
     private var title: String {
@@ -276,14 +276,8 @@ struct MovePagesSheet: View {
             }
             app.perform("page.moveTo", ["pages": .array(refs.map { JSONValue.string($0) }),
                                         "doc": .string(NodeRef.document(node.id).description)], session: session)
-            MovePagesStash.pages = []
             dismiss()
         }
-    }
-
-    private func close() {
-        MovePagesStash.pages = []
-        context.dismiss()
     }
 }
 

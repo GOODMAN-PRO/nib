@@ -1,12 +1,13 @@
 import Foundation
 import UIKit
+import PDFKit
 import NibContracts
 
 // MARK: - Payload
 
-/// The page clipboard: pages, their live items and the bytes of every asset they reference, as JSON on the
-/// pasteboard under UTI `app.nib.pages` (the page-level sibling of the "nib-fragment/1" item fragment). The sidebar's
-/// drag between windows carries the same JSON, and `page.paste {payload}` accepts it directly.
+/// The page clipboard: pages, their live items and the assets they reference, as JSON on the pasteboard under UTI
+/// `app.nib.pages` (the page-level sibling of the "nib-fragment/1" item fragment). The sidebar's drag between windows
+/// carries the same JSON, and `page.paste {payload}` accepts it directly.
 struct PagesPayload: Codable, Equatable {
     static let currentFormat = "nib-pages/1"
 
@@ -28,10 +29,17 @@ struct PagesPayload: Codable, Equatable {
         }
     }
 
-    /// One asset's bytes (base64 in JSON), under the name the page records use.
+    /// One asset under the name the page records use. On the pasteboard it carries its bytes (base64 in JSON); the
+    /// in-process clipboard keeps only the document that holds it, and the bytes are read when pasting.
     struct Asset: Codable, Equatable {
         var name: String
-        var data: Data
+        var data: Data?
+        /// The source PDF pages `data` holds, in this order, when only the pages in use were copied.
+        var pdfPages: [Int]?
+        /// In-process only. Never encoded, so a payload from the pasteboard or a caller cannot reach into a document.
+        var doc: DocumentID? = nil
+
+        enum CodingKeys: String, CodingKey { case name, data, pdfPages }
     }
 
     var format: String
@@ -80,40 +88,51 @@ struct PagesPayload: Codable, Equatable {
         return p
     }
 
-    /// Snapshot of pages with their live items and the bytes of the assets they use. Unreadable assets are left out:
-    /// pasting back into the same document still finds them there.
+    /// The in-process clipboard for `pages`: their records, live items and asset references. No bytes are read here
+    /// (the main actor stays free); `encodedWithBytes` and `AssetTransfer` read them off it.
     @MainActor
-    static func make(_ pages: [(doc: DocumentID, page: PageRecord)], workspace: Workspace,
-                     assets: AssetStore?) throws -> PagesPayload {
+    static func make(_ pages: [(doc: DocumentID, page: PageRecord)], workspace: Workspace) throws -> PagesPayload {
         var entries: [Entry] = []
         var owners: [String: DocumentID] = [:]
         for (doc, page) in pages {
             let entry = Entry(page: page, items: try workspace.items(doc, page: page.id))
-            for name in AssetRefs.names(in: [entry]) where owners[name] == nil { owners[name] = doc }
+            for name in AssetRefs.names(of: page).union(AssetRefs.names(in: entry.items)) where owners[name] == nil {
+                owners[name] = doc
+            }
             entries.append(entry)
-        }
-        var blobs: [Asset] = []
-        for name in owners.keys.sorted() {
-            guard let doc = owners[name], let data = try? assets?.data(AssetRef(name), doc: doc) else { continue }
-            blobs.append(Asset(name: name, data: data))
         }
         let docs = Set(pages.map { $0.doc })
         let source = docs.count == 1 ? docs.first.map { NodeRef.document($0).description } : nil
-        return PagesPayload(source: source, pages: entries, assets: blobs)
+        return PagesPayload(source: source, pages: entries,
+                            assets: owners.keys.sorted().map { Asset(name: $0, data: nil, pdfPages: nil, doc: owners[$0]) })
+    }
+
+    /// PDF assets used only as page backgrounds here, with the PDF pages in use.
+    var pdfUse: [String: [Int]] { AssetRefs.pdfPagesInUse(pages.map { $0.page }, items: pages.flatMap { $0.items }) }
+
+    /// Pasteboard JSON: every asset with its bytes (PDFs cut down to the pages in use; unreadable ones left out).
+    /// Blocking file and PDF work: run it off the main actor.
+    func encodedWithBytes(store: AssetStore?, pdfUse: [String: [Int]]) throws -> Data {
+        var copy = self
+        if let store { copy.assets = try AssetTransfer.fill(assets, pdfUse: pdfUse, store: store, strict: false) }
+        return try JSONEncoder().encode(copy)
     }
 }
 
 // MARK: - Pasteboard
 
-/// The page clipboard. The last copy is kept in memory and, outside hostless tests, on the system pasteboard (so it
-/// reaches other windows, and another device through Universal Clipboard). Reading prefers the memory copy while the
-/// pasteboard has not changed since, so pasting our own copy never triggers the paste-permission prompt.
+/// The page clipboard. The last copy is kept in memory (references only) and, outside hostless tests, with its bytes
+/// on the system pasteboard (so it reaches other windows, and another device through Universal Clipboard). Reading
+/// prefers the memory copy while the pasteboard has not changed since, so pasting our own copy never triggers the
+/// paste-permission prompt.
 @MainActor
 enum PageClipboard {
     static let typeIdentifier = "app.nib.pages"
 
     private static var memory: PagesPayload?
+    /// The pasteboard's change count while `memory` is the current clipboard.
     private static var writtenChangeCount: Int?
+    private static var generation = 0
 
     /// Hostless package tests keep the clipboard in memory only, so tests never depend on the simulator's pasteboard.
     private static var usesSystemPasteboard: Bool { !NibApp.isHostlessTest }
@@ -122,13 +141,23 @@ enum PageClipboard {
         NibError(.unavailable, "the page clipboard is empty", hint: "copy pages with page.copy first, or pass payload")
     }
 
-    static func write(_ payload: PagesPayload) throws {
+    /// Keeps `payload` for pastes in this process, then puts it with its asset bytes on the system pasteboard. Reading
+    /// the assets, cutting PDFs and encoding run off the main actor (ARCHITECTURE §14).
+    static func write(_ payload: PagesPayload, store: AssetStore?) async throws {
         memory = payload
-        writtenChangeCount = nil
         guard usesSystemPasteboard else { return }
-        let data = try JSONEncoder().encode(payload)
-        UIPasteboard.general.setData(data, forPasteboardType: typeIdentifier)
-        writtenChangeCount = UIPasteboard.general.changeCount
+        let board = UIPasteboard.general
+        writtenChangeCount = board.changeCount
+        generation += 1
+        let mine = generation
+        let pdfUse = payload.pdfUse
+        let data = try await Task.detached(priority: .userInitiated) {
+            try payload.encodedWithBytes(store: store, pdfUse: pdfUse)
+        }.value
+        // A newer copy, ours or another app's, replaced this one while it was being encoded.
+        guard mine == generation, board.changeCount == writtenChangeCount else { return }
+        board.setData(data, forPasteboardType: typeIdentifier)
+        writtenChangeCount = board.changeCount
     }
 
     /// Cheap check for menus: it never reads the pasteboard's contents, so it never prompts.
@@ -157,90 +186,174 @@ enum PageClipboard {
 
 // MARK: - Asset references
 
-/// Finds and renames asset references anywhere in a record's JSON: page backgrounds, image items, tape patterns,
-/// custom display lists and rich-text attachments spell them `asset`, `tapePattern` or `attachment`.
-/// ponytail: a JSON walk instead of a per-payload switch, so a payload that gains an `asset` field is covered for free;
-/// a plugin's `ext` data that reuses one of these keys is only renamed when it names a copied asset.
+/// How asset references change on the way into another document: new names (the store names blobs by their content)
+/// and, for PDFs cut down to the pages in use, new PDF page numbers (old → new).
+struct AssetMap: Equatable {
+    var names: [String: String] = [:]
+    var pdfPages: [String: [Int: Int]] = [:]
+}
+
+/// The asset references pages and items hold: page backgrounds, images, tape patterns, rich-text attachments and
+/// custom display lists. Typed, so ink points and other item data are never walked.
 enum AssetRefs {
-    static let keys: Set<String> = ["asset", "tapePattern", "attachment"]
-
-    static func collect(_ value: JSONValue, into names: inout Set<String>) {
-        switch value {
-        case .object(let o):
-            for (k, v) in o {
-                if keys.contains(k), case .string(let s) = v {
-                    if !s.isEmpty { names.insert(s) }
-                } else {
-                    collect(v, into: &names)
-                }
-            }
-        case .array(let a):
-            for v in a { collect(v, into: &names) }
-        default:
-            break
-        }
+    static func names(of page: PageRecord) -> Set<String> {
+        guard let name = page.background.asset?.name, !name.isEmpty else { return [] }
+        return [name]
     }
 
-    static func rewrite(_ value: JSONValue, _ map: [String: String]) -> JSONValue {
-        switch value {
-        case .object(let o):
-            var out: [String: JSONValue] = [:]
-            for (k, v) in o {
-                if keys.contains(k), case .string(let s) = v, let renamed = map[s] {
-                    out[k] = .string(renamed)
-                } else {
-                    out[k] = rewrite(v, map)
-                }
-            }
-            return .object(out)
-        case .array(let a):
-            return .array(a.map { rewrite($0, map) })
-        default:
-            return value
-        }
-    }
-
-    static func names<T: Encodable>(in values: [T]) -> Set<String> {
+    static func names(in items: [Item]) -> Set<String> {
         var out = Set<String>()
-        for v in values {
-            if let json = try? JSONValue.from(v) { collect(json, into: &out) }
+        for item in items {
+            var copy = item
+            visit(&copy) { ref in
+                if !ref.name.isEmpty { out.insert(ref.name) }
+                return ref
+            }
         }
         return out
     }
 
-    /// `value` with every renamed asset reference replaced (returned as is when `map` is empty).
-    static func rewriting<T: Codable>(_ value: T, _ map: [String: String]) throws -> T {
-        guard !map.isEmpty else { return value }
-        return try rewrite(JSONValue.from(value), map).decode(T.self)
+    /// Calls `f` on every asset reference `item` holds and stores what it returns.
+    static func visit(_ item: inout Item, _ f: (AssetRef) -> AssetRef) {
+        if let a = item.image?.asset { item.image?.asset = f(a) }
+        if let a = item.stroke?.style.tapePattern { item.stroke?.style.tapePattern = f(a) }
+        if let t = item.text?.text { item.text?.text = visit(t, f) }
+        if let t = item.shape?.text { item.shape?.text = visit(t, f) }
+        if let t = item.sticky?.text { item.sticky?.text = visit(t, f) }
+        if let t = item.connector?.label { item.connector?.label = visit(t, f) }
+        if let ops = item.custom?.display.ops, ops.contains(where: { $0.asset != nil }) {
+            item.custom?.display.ops = ops.map { op in
+                var op = op
+                if let a = op.asset { op.asset = f(a) }
+                return op
+            }
+        }
+    }
+
+    private static func visit(_ text: RichText, _ f: (AssetRef) -> AssetRef) -> RichText {
+        var t = text
+        for p in t.paragraphs.indices {
+            for r in t.paragraphs[p].runs.indices {
+                if let a = t.paragraphs[p].runs[r].attrs.attachment { t.paragraphs[p].runs[r].attrs.attachment = f(a) }
+            }
+        }
+        return t
+    }
+
+    /// `items` with renamed assets (old → new).
+    static func rewriting(_ items: [Item], _ names: [String: String]) -> [Item] {
+        guard !names.isEmpty else { return items }
+        return items.map { item in
+            var item = item
+            visit(&item) { ref in names[ref.name].map { AssetRef($0) } ?? ref }
+            return item
+        }
+    }
+
+    /// `page` with its background's asset renamed and, for a cut-down PDF, its PDF page renumbered.
+    static func rewriting(_ page: PageRecord, _ map: AssetMap) -> PageRecord {
+        guard let name = page.background.asset?.name else { return page }
+        var page = page
+        if page.background.kind == .pdf, let index = map.pdfPages[name]?[page.background.pdfPage ?? 0] {
+            page.background.pdfPage = index
+        }
+        if let renamed = map.names[name] { page.background.asset = AssetRef(renamed) }
+        return page
+    }
+
+    /// PDF assets used only as page backgrounds (not by items or photo pages), with the PDF pages in use: copies into
+    /// another document carry just those pages.
+    static func pdfPagesInUse(_ pages: [PageRecord], items: [Item]) -> [String: [Int]] {
+        var used: [String: Set<Int>] = [:]
+        var whole = names(in: items)
+        for page in pages {
+            guard let name = page.background.asset?.name else { continue }
+            if page.background.kind == .pdf {
+                used[name, default: []].insert(page.background.pdfPage ?? 0)
+            } else {
+                whole.insert(name)
+            }
+        }
+        for name in whole { used[name] = nil }
+        return used.mapValues { $0.sorted() }
     }
 }
 
-/// Copies asset bytes into a document package. A content-addressed store may name a blob differently from its source;
-/// the returned map (old → new, renamed ones only) feeds `AssetRefs.rewriting`.
-/// ponytail: the copy runs on the main actor before the transaction; move it to a detached task if big PDFs stall.
+// MARK: - Copying assets
+
+/// Copies asset bytes into a document package. Blocking file and PDF work: callers run it in a detached task
+/// (`AssetStore` is thread-safe by contract).
 enum AssetTransfer {
-    static func copy(_ names: Set<String>, from source: DocumentID, to target: DocumentID,
-                     store: AssetStore?) throws -> [String: String] {
-        guard source != target, !names.isEmpty else { return [:] }
-        guard let store else { throw NibError.unavailable("the asset store") }
-        var blobs: [PagesPayload.Asset] = []
-        for name in names.sorted() {
-            // A missing asset keeps its reference: there is nothing to copy, and the page still shows the rest.
-            guard let data = try? store.data(AssetRef(name), doc: source) else { continue }
-            blobs.append(PagesPayload.Asset(name: name, data: data))
+    /// `assets` with their bytes: as given, else read from the document that holds them (skipped when that is
+    /// `target`, where the references already work). PDFs in `pdfUse` are cut down to those pages. An asset that
+    /// cannot be read is left out and keeps its reference, unless `strict` (moves) and its file is there: then this
+    /// throws, before anything was stored.
+    static func fill(_ assets: [PagesPayload.Asset], pdfUse: [String: [Int]], skipping target: DocumentID? = nil,
+                     store: AssetStore, strict: Bool) throws -> [PagesPayload.Asset] {
+        var out: [PagesPayload.Asset] = []
+        for var asset in assets {
+            if asset.data == nil {
+                guard let doc = asset.doc, doc != target else { continue }
+                let ref = AssetRef(asset.name)
+                if let pages = pdfUse[asset.name], let url = store.url(ref, doc: doc), let cut = PDFCut.pages(pages, of: url) {
+                    asset.data = cut
+                    asset.pdfPages = pages
+                } else if let data = try read(ref, doc: doc, store: store, strict: strict) {
+                    asset.data = data
+                } else {
+                    continue
+                }
+            }
+            out.append(asset)
         }
-        return try install(blobs, into: target, store: store)
+        return out
     }
 
-    static func install(_ assets: [PagesPayload.Asset], into doc: DocumentID, store: AssetStore?) throws -> [String: String] {
-        guard !assets.isEmpty else { return [:] }
-        guard let store else { throw NibError.unavailable("the asset store") }
-        var map: [String: String] = [:]
+    /// Stores the bytes of `assets` in `doc` and returns how references to them change.
+    static func install(_ assets: [PagesPayload.Asset], into doc: DocumentID, store: AssetStore) throws -> AssetMap {
+        var map = AssetMap()
         for asset in assets {
+            guard let data = asset.data else { continue }
             let ext = AssetRef(asset.name).ext
-            let stored = try store.put(asset.data, ext: ext.isEmpty ? "bin" : ext, doc: doc)
-            if stored.name != asset.name { map[asset.name] = stored.name }
+            let stored = try store.put(data, ext: ext.isEmpty ? "bin" : ext, doc: doc)
+            if stored.name != asset.name { map.names[asset.name] = stored.name }
+            if let pages = asset.pdfPages {
+                map.pdfPages[asset.name] = Dictionary(pages.enumerated().map { ($0.element, $0.offset) },
+                                                      uniquingKeysWith: { first, _ in first })
+            }
         }
         return map
+    }
+
+    private static func read(_ ref: AssetRef, doc: DocumentID, store: AssetStore, strict: Bool) throws -> Data? {
+        do {
+            return try store.data(ref, doc: doc)
+        } catch {
+            // A reference that already dangles (no file) moves as it is; a file that is there but unreadable does not.
+            guard strict, let url = store.url(ref, doc: doc), isPresent(url) else { return nil }
+            throw NibError(.unavailable, "asset \(ref.name) could not be read; nothing was moved",
+                           hint: "try again when the file has downloaded")
+        }
+    }
+
+    /// On disk, or an iCloud placeholder of a file that has not downloaded yet.
+    private static func isPresent(_ url: URL) -> Bool {
+        let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+        return FileManager.default.fileExists(atPath: url.path) || FileManager.default.fileExists(atPath: placeholder.path)
+    }
+}
+
+/// A new PDF of just some pages of another, so copying a page of a long lecture PDF stays small.
+enum PDFCut {
+    /// `pages` (0-based, in this order) of the PDF at `url`; nil when it cannot be read, a page is missing, or every
+    /// page is in use (then the file is copied as it is).
+    static func pages(_ pages: [Int], of url: URL) -> Data? {
+        guard let source = PDFDocument(url: url), !source.isLocked, pages.count < source.pageCount else { return nil }
+        let out = PDFDocument()
+        for index in pages {
+            guard index >= 0, index < source.pageCount, let page = source.page(at: index)?.copy() as? PDFPage else { return nil }
+            out.insert(page, at: out.pageCount)
+        }
+        return out.dataRepresentation()
     }
 }

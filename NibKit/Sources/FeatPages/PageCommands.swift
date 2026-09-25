@@ -91,8 +91,8 @@ struct PageAdd: NibCommand {
 
         if source == "clipboard" {
             guard let payload = PageClipboard.read() else { throw PageClipboard.emptyError }
-            let refs = try PagePasting.paste(payload, into: doc, content: content, position: position, anchor: anchor,
-                                             id: p.id, ids: p.ids, ctx: ctx)
+            let refs = try await PagePasting.paste(payload, into: doc, position: position, anchor: anchor,
+                                                   id: p.id, ids: p.ids, ctx: ctx)
             await PageNavigation.reveal(refs.first, doc: doc, ctx)
             return Output(ref: refs[0], refs: refs)
         }
@@ -121,20 +121,22 @@ struct PageAdd: NibCommand {
             let chosen = try await PageAdd.chooseTemplate(size: size, ctx)
             specs = Array(repeating: chosen, count: count)
         case "pdf":
-            specs = try PageAdd.pdfPages(p, doc: doc, count: count, explicitSize: explicitSize, fallback: size, ctx: ctx)
+            specs = try await PageAdd.pdfPages(p, doc: doc, count: count, explicitSize: explicitSize, fallback: size, ctx: ctx)
         case "image":
-            specs = try PageAdd.imagePages(p, doc: doc, count: count, explicitSize: explicitSize, ctx: ctx)
+            specs = try await PageAdd.imagePages(p, doc: doc, count: count, explicitSize: explicitSize, ctx: ctx)
         default:
             let paper = content.meta.defaultTemplate ?? settings.get(NibSettings.defaultPaper)
             var isCover = false
-            if let template = reference?.background.template { isCover = PageTemplates.isCover(template) }
+            if let template = reference?.background.template { isCover = PageTemplates.isCover(template, ctx.services) }
             let background = CurrentTemplate.background(reference: reference, defaultPaper: paper, referenceIsCover: isCover)
             specs = Array(repeating: PageSpec(background: background, size: size), count: count)
         }
 
         let ids = try NewPageIDs.parse(id: p.id, ids: p.ids, count: specs.count)
-        try NewPageIDs.checkUnused(ids, in: content)
-        let keys = OrderKeys.keys(position, anchor: anchor, count: specs.count, in: content)
+        // Reading a PDF or image, or the template picker, awaited: place the pages in the document as it is now.
+        let current = try ctx.workspace.content(doc)
+        try NewPageIDs.checkUnused(ids, in: current)
+        let keys = OrderKeys.keys(position, anchor: anchor, count: specs.count, in: current)
         var records: [PageRecord] = []
         for (i, spec) in specs.enumerated() {
             records.append(PageRecord(id: ids[i] ?? NibID.make(), order: keys[i], size: spec.size, background: spec.background))
@@ -176,35 +178,44 @@ struct PageAdd: NibCommand {
     }
 
     /// One page per PDF page from `pdfPage`, each sized like its PDF page (D-091: pages from a file into this document).
+    /// Opening and measuring up to `maxNewPages` PDF pages is file work, so it runs off the main actor (ARCHITECTURE §14).
     static func pdfPages(_ p: Params, doc: DocumentID, count: Int, explicitSize: PageSize?, fallback: PageSize?,
-                         ctx: CommandContext) throws -> [PageSpec] {
+                         ctx: CommandContext) async throws -> [PageSpec] {
         let name = try PageArgs.assetName(p.asset, needed: "pdf")
         let store = try ctx.services.require(ctx.services.assets, "the asset store")
-        guard let url = store.url(AssetRef(name), doc: doc) else {
+        let service = ctx.services.pdf
+        let first = p.pdfPage ?? 0
+        let found = await Task.detached(priority: .userInitiated) { () -> (total: Int, sizes: [PageSize?])? in
+            guard let url = store.url(AssetRef(name), doc: doc) else { return nil }
+            let total = PDFPages.count(url, service: service)
+            guard first < total else { return (total: total, sizes: []) }
+            return (total: total, sizes: PDFPages.sizes(url, pages: first..<min(total, first + count), service: service))
+        }.value
+        guard let found else {
             throw NibError(.notFound, "asset \(name) is not in this document", path: "$.asset", hint: "store the file first with asset.put")
         }
-        let total = PDFPages.count(url, service: ctx.services.pdf)
-        guard total > 0 else { throw NibError.invalid("asset \(name) is not a readable PDF", path: "$.asset") }
-        let first = p.pdfPage ?? 0
-        guard first < total else {
-            throw NibError.invalid("pdfPage \(first) is past the last PDF page (\(total - 1))", path: "$.pdfPage")
+        guard found.total > 0 else { throw NibError.invalid("asset \(name) is not a readable PDF", path: "$.asset") }
+        guard first < found.total else {
+            throw NibError.invalid("pdfPage \(first) is past the last PDF page (\(found.total - 1))", path: "$.pdfPage")
         }
-        let range = first..<min(total, first + count)
-        let sizes = PDFPages.sizes(url, pages: range, service: ctx.services.pdf)
-        return zip(range, sizes).map { index, pdfSize in
-            PageSpec(background: .ofPDF(AssetRef(name), page: index), size: explicitSize ?? pdfSize ?? fallback)
+        return found.sizes.enumerated().map { i, pdfSize in
+            PageSpec(background: .ofPDF(AssetRef(name), page: first + i), size: explicitSize ?? pdfSize ?? fallback)
         }
     }
 
-    /// A photo or image as the page (D-097): the page takes the image's proportions.
+    /// A photo or image as the page (D-097): the page takes the image's proportions. The image is read off the main actor.
     static func imagePages(_ p: Params, doc: DocumentID, count: Int, explicitSize: PageSize?,
-                           ctx: CommandContext) throws -> [PageSpec] {
+                           ctx: CommandContext) async throws -> [PageSpec] {
         let name = try PageArgs.assetName(p.asset, needed: "image")
         let store = try ctx.services.require(ctx.services.assets, "the asset store")
-        guard let data = try? store.data(AssetRef(name), doc: doc) else {
+        let found = await Task.detached(priority: .userInitiated) { () -> (read: Bool, pixels: (width: Double, height: Double)?) in
+            guard let data = try? store.data(AssetRef(name), doc: doc) else { return (read: false, pixels: nil) }
+            return (read: true, pixels: ImagePageSize.pixelSize(of: data))
+        }.value
+        guard found.read else {
             throw NibError(.notFound, "asset \(name) is not in this document", path: "$.asset", hint: "store the image first with asset.put")
         }
-        guard let pixels = ImagePageSize.pixelSize(of: data) else {
+        guard let pixels = found.pixels else {
             throw NibError.invalid("asset \(name) is not a readable image", path: "$.asset")
         }
         let size = explicitSize ?? ImagePageSize.fit(width: pixels.width, height: pixels.height)
@@ -286,7 +297,7 @@ struct PageCopy: NibCommand {
             let page = try PageArgs.livePage(t.page, in: content, path: "$.pages[\(i)]")
             pages.append((t.doc, page))
         }
-        try PageClipboard.write(PagesPayload.make(pages, workspace: ctx.workspace, assets: ctx.services.assets))
+        try await PageClipboard.write(PagesPayload.make(pages, workspace: ctx.workspace), store: ctx.services.assets)
         return Output(count: pages.count, pages: targets.map { NodeRef.page($0.doc, $0.page).description })
     }
 }
@@ -306,8 +317,13 @@ struct PagePaste: NibCommand {
         var refs: [String]
     }
 
-    static let example: JSONValue = try! JSONValue.parse(
-        #"{"doc": "doc:FIXTUREDOC01", "position": "after", "anchor": "page:FIXTUREDOC01/FIXTUREPG001"}"#)
+    static let examples: [JSONValue] = [
+        try! JSONValue.parse(#"{"doc": "doc:FIXTUREDOC01", "position": "after", "anchor": "page:FIXTUREDOC01/FIXTUREPG001"}"#),
+        // A payload given inline (the clipboard is empty while conformance runs), so paste and its undo are exercised.
+        try! JSONValue.parse(#"""
+            {"doc": "doc:FIXTUREDOC04", "position": "end", "payload": {"format": "nib-pages/1", "pages": [{"page": {"id": "FIXTUREPG002", "order": "k", "size": {"width": 595.28, "height": 841.89}, "background": {"kind": "template", "template": {"id": "builtin.ruled"}}}, "items": []}], "assets": []}}
+            """#)
+    ]
 
     static let descriptor = CommandDescriptor(
         id: "page.paste", title: "Paste Pages",
@@ -319,7 +335,7 @@ struct PagePaste: NibCommand {
             "ids": PageCommands.idsSchema,
             "payload": .anything("app.nib.pages JSON {format, pages: [{page, items}], assets}; default: the page clipboard")
         ]),
-        examples: [PagePaste.example], effect: .edit)
+        examples: PagePaste.examples, effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let doc = try PageArgs.document(p.doc, ctx)
@@ -334,8 +350,8 @@ struct PagePaste: NibCommand {
         } else {
             throw PageClipboard.emptyError
         }
-        let refs = try PagePasting.paste(payload, into: doc, content: content, position: position, anchor: anchor,
-                                         id: nil, ids: p.ids, ctx: ctx)
+        let refs = try await PagePasting.paste(payload, into: doc, position: position, anchor: anchor,
+                                               id: nil, ids: p.ids, ctx: ctx)
         await PageNavigation.reveal(refs.first, doc: doc, ctx)
         return Output(refs: refs)
     }
@@ -358,39 +374,99 @@ struct PageMoveTo: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "page.moveTo", title: "Move Pages",
-        summary: "Move pages with their items and images to the end of another notebook or whiteboard in one undo step; returns the pages' new refs.",
+        summary: "Move pages with their items, images and outline entries to the end of another notebook or whiteboard as one undo group (undo it in both documents). Returns the new page refs.",
         params: .obj(["pages": PageCommands.pagesSchema, "doc": .ref, "ids": PageCommands.idsSchema], required: ["pages", "doc"]),
         examples: [PageMoveTo.example], effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let target = NodeRef.documentID(from: p.doc)
-        let targetContent = try PageArgs.pagedContent(target, ctx)
         let sources = try PageArgs.pages(p.pages, ctx)
         let chosen = try NewPageIDs.parse(id: nil, ids: p.ids, count: sources.count)
+        // Every refusal comes before any bytes are copied.
+        var plan = try MovePlan(sources, to: target, ids: chosen, ctx)
+        var maps: [DocumentID: AssetMap] = [:]
+        // Assets travel with the pages, copied off the main actor. A dry run (AI preview) copies nothing; its pages keep
+        // their references.
+        if !ctx.dryRun, plan.assets.contains(where: { !$0.assets.isEmpty }) {
+            let store = try ctx.services.require(ctx.services.assets, "the asset store")
+            let jobs = plan.assets
+            maps = try await Task.detached(priority: .userInitiated) { () -> [DocumentID: AssetMap] in
+                // Everything is read first: a file that is there but unreadable stops the move before anything is stored.
+                let filled = try jobs.map { job in
+                    try (doc: job.doc, assets: AssetTransfer.fill(job.assets, pdfUse: job.pdfUse, skipping: target,
+                                                                  store: store, strict: true))
+                }
+                var out: [DocumentID: AssetMap] = [:]
+                for job in filled { out[job.doc] = try AssetTransfer.install(job.assets, into: target, store: store) }
+                return out
+            }.value
+            // The documents may have changed while the bytes were copied: plan again from their current state.
+            plan = try MovePlan(sources, to: target, ids: chosen, ctx)
+        }
+        let defaultSize = ctx.services.settings.get(NibSettings.defaultPageSize)
+        try ctx.mutate { tx in
+            for (i, m) in plan.moving.enumerated() {
+                if m.doc == target {
+                    var page = m.page
+                    page.order = plan.keys[i]
+                    try tx.put(page, doc: target)
+                    continue
+                }
+                let map = maps[m.doc] ?? AssetMap()
+                let original = try tx.items(m.doc, page: m.page.id)
+                let items = ItemCloner.clone(AssetRefs.rewriting(original, map.names), freshIDs: m.freshItems)
+                let page = PageFactory.fitted(PageFactory.copy(of: AssetRefs.rewriting(m.page, map), id: m.newID, order: plan.keys[i]),
+                                              to: plan.targetKind, defaultSize: defaultSize)
+                try PageWriter.insert([(page, items)], doc: target, tx: tx)
+                try PageWriter.remove(m.page, items: original, doc: m.doc, trashedAt: nil, tx: tx)
+            }
+            for (doc, moved) in plan.movedIDs {
+                try PageLinks.moveOutline(from: doc, pages: moved, to: target, tx: tx)
+                try PageLinks.unlinkAudio(in: doc, pages: Set(moved.keys), tx: tx)
+            }
+        }
+        return Output(refs: plan.moving.map { NodeRef.page(target, $0.newID).description })
+    }
+}
 
-        var moving: [(doc: DocumentID, page: PageRecord)] = []
+/// What page.moveTo will do, worked out (and every refusal made) from the documents as they are now.
+@MainActor
+struct MovePlan {
+    let targetKind: DocumentKind
+    /// In the order given; pages already in the target only move to its end.
+    let moving: [(doc: DocumentID, page: PageRecord, newID: PageID, freshItems: Bool)]
+    let keys: [String]
+    /// Per source document: the assets its leaving pages use, and the PDF pages in use.
+    let assets: [(doc: DocumentID, assets: [PagesPayload.Asset], pdfUse: [String: [Int]])]
+    /// Per source document: old page id → id in the target.
+    let movedIDs: [DocumentID: [PageID: PageID]]
+
+    init(_ sources: [(doc: DocumentID, page: PageID)], to target: DocumentID, ids chosen: [PageID?],
+         _ ctx: CommandContext) throws {
+        let targetContent = try PageArgs.pagedContent(target, ctx)
+        var records: [(doc: DocumentID, page: PageRecord)] = []
         var leaving: [DocumentID: Set<PageID>] = [:]
         for (i, s) in sources.enumerated() {
             let content = try PageArgs.pagedContent(s.doc, ctx, path: "$.pages[\(i)]")
             let page = try PageArgs.livePage(s.page, in: content, path: "$.pages[\(i)]")
-            moving.append((s.doc, page))
+            records.append((s.doc, page))
             if s.doc != target { leaving[s.doc, default: []].insert(s.page) }
         }
         for (doc, pages) in leaving {
-            let content = try ctx.workspace.content(doc)
-            try PageArgs.keepsAPage(content, removing: pages, path: "$.pages")
+            try PageArgs.keepsAPage(ctx.workspace.content(doc), removing: pages, path: "$.pages")
         }
 
         // New ids: the caller's, else the original unless the target already uses it ("fresh ids when colliding").
         // A page whose id collided also gets fresh item ids, so no item id is live twice in the target.
         var used = Set(targetContent.pages.map { $0.id })
-        var plan: [(newID: PageID, freshItems: Bool)] = []
-        for (i, m) in moving.enumerated() {
-            guard m.doc != target else {
-                plan.append((m.page.id, false))
+        var moving: [(doc: DocumentID, page: PageRecord, newID: PageID, freshItems: Bool)] = []
+        var movedIDs: [DocumentID: [PageID: PageID]] = [:]
+        for (i, r) in records.enumerated() {
+            guard r.doc != target else {
+                moving.append((r.doc, r.page, r.page.id, false))
                 continue
             }
-            let collides = used.contains(m.page.id)
+            let collides = used.contains(r.page.id)
             let newID: PageID
             if let wanted = chosen[i] {
                 guard !used.contains(wanted) else {
@@ -399,46 +475,29 @@ struct PageMoveTo: NibCommand {
                 }
                 newID = wanted
             } else {
-                newID = collides ? NibID.make() : m.page.id
+                newID = collides ? NibID.make() : r.page.id
             }
             used.insert(newID)
-            plan.append((newID, collides))
+            moving.append((r.doc, r.page, newID, collides))
+            movedIDs[r.doc, default: [:]][r.page.id] = newID
         }
 
-        // Assets travel with the pages; copying bytes is slow work, so it happens before the transaction.
-        var renamed: [DocumentID: [String: String]] = [:]
-        for (doc, pageIDs) in leaving {
-            var names = AssetRefs.names(in: moving.filter { $0.doc == doc }.map { $0.page })
-            for id in pageIDs {
-                let items = try ctx.workspace.items(doc, page: id)
-                names.formUnion(AssetRefs.names(in: items))
-            }
-            renamed[doc] = try AssetTransfer.copy(names, from: doc, to: target, store: ctx.services.assets)
+        var assets: [(doc: DocumentID, assets: [PagesPayload.Asset], pdfUse: [String: [Int]])] = []
+        for doc in leaving.keys.sorted() {
+            let pages = records.filter { $0.doc == doc }.map { $0.page }
+            var items: [Item] = []
+            for page in pages { items += try ctx.workspace.items(doc, page: page.id) }
+            let names = pages.reduce(AssetRefs.names(in: items)) { $0.union(AssetRefs.names(of: $1)) }
+            assets.append((doc, names.sorted().map { PagesPayload.Asset(name: $0, data: nil, pdfPages: nil, doc: doc) },
+                           AssetRefs.pdfPagesInUse(pages, items: items)))
         }
 
-        let staying = targetContent.livePages.filter { page in !moving.contains { $0.doc == target && $0.page.id == page.id } }
-        let keys = OrderKeys.between(staying.last?.order, nil, count: moving.count)
-        let defaultSize = ctx.services.settings.get(NibSettings.defaultPageSize)
-        try ctx.mutate { tx in
-            for (i, m) in moving.enumerated() {
-                if m.doc == target {
-                    var page = m.page
-                    page.order = keys[i]
-                    try tx.put(page, doc: target)
-                    continue
-                }
-                let map = renamed[m.doc] ?? [:]
-                let original = try tx.items(m.doc, page: m.page.id)
-                let rewrittenItems = try AssetRefs.rewriting(original, map)
-                let items = ItemCloner.clone(rewrittenItems, freshIDs: plan[i].freshItems)
-                let rewrittenPage = try AssetRefs.rewriting(m.page, map)
-                let page = PageFactory.fitted(PageFactory.copy(of: rewrittenPage, id: plan[i].newID, order: keys[i]),
-                                              to: targetContent.meta.kind, defaultSize: defaultSize)
-                try PageWriter.insert([(page, items)], doc: target, tx: tx)
-                try PageWriter.remove(m.page, items: original, doc: m.doc, trashedAt: nil, tx: tx)
-            }
-        }
-        return Output(refs: plan.map { NodeRef.page(target, $0.newID).description })
+        let staying = targetContent.livePages.filter { page in !records.contains { $0.doc == target && $0.page.id == page.id } }
+        self.targetKind = targetContent.meta.kind
+        self.moving = moving
+        self.keys = OrderKeys.between(staying.last?.order, nil, count: records.count)
+        self.assets = assets
+        self.movedIDs = movedIDs
     }
 }
 
@@ -617,7 +676,7 @@ struct PageRestore: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "page.restore", title: "Restore Pages",
-        summary: "Restore trashed pages to their places in their documents (pages that are not in the Trash are left alone).",
+        summary: "Restore pages from the Trash (put there by page.trash first) to their places in their documents; pages not in the Trash are left alone.",
         params: .obj(["pages": PageCommands.pagesSchema], required: ["pages"]),
         examples: [PageTrash.example], effect: .edit)
 
@@ -670,6 +729,10 @@ struct PagePurge: NibCommand {
             for r in records {
                 let items = try tx.items(r.doc, page: r.page.id)
                 try PageWriter.remove(r.page, items: items, doc: r.doc, trashedAt: nil, tx: tx)
+            }
+            for (doc, pages) in PageArgs.grouped(records.map { (doc: $0.doc, page: $0.page.id) }) {
+                try PageLinks.unlinkOutline(in: doc, pages: Set(pages), tx: tx)
+                try PageLinks.unlinkAudio(in: doc, pages: Set(pages), tx: tx)
             }
         }
         return Output(purged: records.count)
@@ -796,11 +859,71 @@ enum PageArgs {
 
 @MainActor
 enum PageTemplates {
+    /// This app's template registry, left in its services by `FeatPagesFeature.register` (not the process-wide
+    /// `NibApp.shared`, which another app in the same process may own).
+    static let registryKey = "pages.templates"
+
     /// Covers never repeat as "current template". ponytail: without a registered definition the "cover." id prefix
     /// (NibTemplates' naming) decides.
-    static func isCover(_ ref: TemplateRef) -> Bool {
-        if let definition = NibApp.shared?.content.template(ref) { return definition.isCover }
-        return ref.id.hasPrefix("cover.") || ref.id.contains(".cover")
+    static func isCover(_ ref: TemplateRef, _ services: NibServices?) -> Bool {
+        if let definition = services?.get(registryKey, as: ContentRegistries.self)?.template(ref) { return definition.isCover }
+        return ref.id.hasPrefix("cover.")
+    }
+}
+
+/// Outline entries and recordings that point at pages leaving a document (moved away or purged).
+@MainActor
+enum PageLinks {
+    /// Outline entries of pages that moved out of `doc` follow them to the end of `target`'s outline (top level unless
+    /// their parent moved too); entries left behind under a moved entry move up to its parent.
+    static func moveOutline(from doc: DocumentID, pages: [PageID: PageID], to target: DocumentID, tx: DocTransaction) throws {
+        let outline = try tx.content(doc).liveOutline
+        let moving = outline.filter { entry in entry.page.map { pages[$0] != nil } ?? false }
+        guard !moving.isEmpty else { return }
+        var copies: [NibID: NibID] = [:]
+        var parents: [NibID: NibID?] = [:]
+        for entry in moving {
+            copies[entry.id] = NibID.make()
+            parents[entry.id] = entry.parent
+        }
+        for entry in moving {
+            try tx.put(OutlineEntry(id: copies[entry.id] ?? NibID.make(), title: entry.title,
+                                    page: entry.page.flatMap { pages[$0] }, parent: entry.parent.flatMap { copies[$0] }),
+                       doc: target)
+            var gone = entry
+            gone.deleted = true
+            try tx.put(gone, doc: doc)
+        }
+        for entry in outline where copies[entry.id] == nil {
+            var parent = entry.parent
+            var hops = 0
+            while let p = parent, copies[p] != nil, hops <= moving.count {
+                parent = parents[p] ?? nil
+                hops += 1
+            }
+            guard parent != entry.parent else { continue }
+            var kept = entry
+            kept.parent = parent
+            try tx.put(kept, doc: doc)
+        }
+    }
+
+    /// Outline entries of purged pages stay, as headings without a page.
+    static func unlinkOutline(in doc: DocumentID, pages: Set<PageID>, tx: DocTransaction) throws {
+        for entry in try tx.content(doc).outline where !entry.deleted && entry.page.map({ pages.contains($0) }) == true {
+            var e = entry
+            e.page = nil
+            try tx.put(e, doc: doc)
+        }
+    }
+
+    /// Recordings that started on a page that is gone stay in the document; they stop pointing at the page.
+    static func unlinkAudio(in doc: DocumentID, pages: Set<PageID>, tx: DocTransaction) throws {
+        for clip in try tx.content(doc).audio where !clip.deleted && clip.page.map({ pages.contains($0) }) == true {
+            var c = clip
+            c.page = nil
+            try tx.put(c, doc: doc)
+        }
     }
 }
 
@@ -818,24 +941,32 @@ enum PageNavigation {
 
 @MainActor
 enum PagePasting {
-    /// Inserts a payload's pages (fresh page and item ids unless `ids`) and installs its assets when it came from
-    /// another document.
-    static func paste(_ payload: PagesPayload, into doc: DocumentID, content: DocumentContent, position: PagePosition,
-                      anchor: PageID?, id: String?, ids: [String]?, ctx: CommandContext) throws -> [String] {
+    /// Inserts a payload's pages (fresh page and item ids unless `ids`), with its assets copied in off the main actor
+    /// when it came from another document. A dry run (AI preview) copies nothing; its pages keep their references.
+    static func paste(_ payload: PagesPayload, into doc: DocumentID, position: PagePosition, anchor: PageID?,
+                      id: String?, ids: [String]?, ctx: CommandContext) async throws -> [String] {
         guard !payload.pages.isEmpty else { throw PageClipboard.emptyError }
         let chosen = try NewPageIDs.parse(id: id, ids: ids, count: payload.pages.count)
-        try NewPageIDs.checkUnused(chosen, in: content)
-        var renamed: [String: String] = [:]
-        if payload.source != NodeRef.document(doc).description {
-            renamed = try AssetTransfer.install(payload.assets, into: doc, store: ctx.services.assets)
+        try NewPageIDs.checkUnused(chosen, in: ctx.workspace.content(doc))
+        var map = AssetMap()
+        if !ctx.dryRun, !payload.assets.isEmpty, payload.source != NodeRef.document(doc).description {
+            let store = try ctx.services.require(ctx.services.assets, "the asset store")
+            let assets = payload.assets
+            let pdfUse = payload.pdfUse
+            map = try await Task.detached(priority: .userInitiated) {
+                try AssetTransfer.install(AssetTransfer.fill(assets, pdfUse: pdfUse, skipping: doc, store: store, strict: false),
+                                          into: doc, store: store)
+            }.value
         }
+        // The document may have changed while the assets were copied: place the pages in it as it is now.
+        let content = try ctx.workspace.content(doc)
+        try NewPageIDs.checkUnused(chosen, in: content)
         let keys = OrderKeys.keys(position, anchor: anchor, count: payload.pages.count, in: content)
         let defaultSize = ctx.services.settings.get(NibSettings.defaultPageSize)
         var plan: [(PageRecord, [Item])] = []
         for (i, entry) in payload.pages.enumerated() {
-            let record = try AssetRefs.rewriting(entry.page, renamed)
-            let page = PageFactory.copy(of: record, id: chosen[i] ?? NibID.make(), order: keys[i])
-            let items = try AssetRefs.rewriting(entry.items.filter { !$0.deleted }, renamed)
+            let page = PageFactory.copy(of: AssetRefs.rewriting(entry.page, map), id: chosen[i] ?? NibID.make(), order: keys[i])
+            let items = AssetRefs.rewriting(entry.items.filter { !$0.deleted }, map.names)
             plan.append((PageFactory.fitted(page, to: content.meta.kind, defaultSize: defaultSize), ItemCloner.clone(items, freshIDs: true)))
         }
         try ctx.mutate { tx in try PageWriter.insert(plan, doc: doc, tx: tx) }
@@ -906,17 +1037,55 @@ enum NewPageIDs {
 }
 
 enum OrderKeys {
-    /// `count` increasing keys strictly between `lo` and `hi` (nil = unbounded).
+    private static let digits = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+    /// `count` increasing keys strictly between `lo` and `hi` (nil = unbounded). Several keys are spread evenly over
+    /// the gap at the smallest width that fits them (the same base-62 digits as `FractionalIndex`), so a 2000-page
+    /// import gets keys a few characters long instead of a chain that grows by one character every few pages.
     static func between(_ lo: String?, _ hi: String?, count: Int) -> [String] {
+        guard count > 1 else { return count == 1 ? [FractionalIndex.between(lo, hi)] : [] }
+        let a = Array(lo ?? "")
+        let b = hi.map { Array($0) }
+        var shared = 0
+        if let b { while shared < a.count, shared < b.count, a[shared] == b[shared] { shared += 1 } }
+        let prefix = String(a[0..<shared])
+        let low = Array(a[shared...])
+        let high = b.map { Array($0[shared...]) }
+        // Width w: the keys are w-digit numbers strictly between lo and hi read as w-digit numbers.
+        // ponytail: up to 8 digits past the common prefix (Int arithmetic); longer gaps chain as FractionalIndex does.
+        for width in 1...8 {
+            let lower = value(low, width)
+            let upper = high.map { value($0, width) + ($0.count > width ? 1 : 0) } ?? power(width)
+            let gap = upper - lower
+            guard gap > count else { continue }
+            return (1...count).map { i in
+                var v = lower + i * gap / (count + 1)
+                var key: [Character] = []
+                for _ in 0..<width {
+                    key.insert(digits[v % 62], at: 0)
+                    v /= 62
+                }
+                // A trailing "0" would leave no key between it and its prefix.
+                while key.last == "0" { key.removeLast() }
+                return prefix + String(key)
+            }
+        }
         var out: [String] = []
         var last = lo
-        for _ in 0..<max(0, count) {
+        for _ in 0..<count {
             let key = FractionalIndex.between(last, hi)
             out.append(key)
             last = key
         }
         return out
     }
+
+    /// The first `width` digits of `key` as a number (missing digits are 0).
+    private static func value(_ key: [Character], _ width: Int) -> Int {
+        (0..<width).reduce(0) { v, i in v * 62 + (i < key.count ? digits.firstIndex(of: key[i]) ?? 0 : 0) }
+    }
+
+    private static func power(_ width: Int) -> Int { (0..<width).reduce(1) { v, _ in v * 62 } }
 
     /// The neighbours a page inserted at `position` sits between (`pages` live, in order), as `orderKey` places it.
     static func bounds(_ position: PagePosition, anchor: PageID?, in pages: [PageRecord]) -> (lo: String?, hi: String?) {
@@ -932,12 +1101,11 @@ enum OrderKeys {
         }
     }
 
-    /// Keys for `count` consecutive new pages: the first from `DocumentContent.orderKey`, the rest after it.
+    /// Keys for `count` consecutive new pages: one from `DocumentContent.orderKey`, several spread over the same gap.
     static func keys(_ position: PagePosition, anchor: PageID?, count: Int, in content: DocumentContent) -> [String] {
-        guard count > 0 else { return [] }
-        let first = content.orderKey(position, relativeTo: anchor)
-        let hi = bounds(position, anchor: anchor, in: content.livePages).hi
-        return [first] + between(first, hi, count: count - 1)
+        guard count > 1 else { return count == 1 ? [content.orderKey(position, relativeTo: anchor)] : [] }
+        let gap = bounds(position, anchor: anchor, in: content.livePages)
+        return between(gap.lo, gap.hi, count: count)
     }
 }
 

@@ -37,14 +37,12 @@ struct AddPagePlan: Equatable {
     }
 }
 
-/// The pages a page menu acts on: the sidebar selection, else the thumbnail the menu was opened on, else the open page.
+/// The page More › This Page acts on: the page the menu was opened on, else the open page.
 @MainActor
 enum PageMenuTarget {
     static func refs(_ ctx: MenuContext) -> [String] {
-        let doc = ctx.doc ?? ctx.session?.document
-        if let doc, !ctx.nodes.isEmpty { return ctx.nodes.map { NodeRef.page(doc, $0).description } }
-        if let ref = ctx.ref, case .page? = NodeRef(ref) { return [ref] }
-        guard let doc, let page = ctx.page ?? (ctx.session?.document == doc ? ctx.session?.page : nil) else { return [] }
+        guard let doc = ctx.doc ?? ctx.session?.document,
+              let page = ctx.page ?? (ctx.session?.document == doc ? ctx.session?.page : nil) else { return [] }
         return [NodeRef.page(doc, page).description]
     }
 
@@ -53,13 +51,6 @@ enum PageMenuTarget {
         if let degrees { o["degrees"] = .number(Double(degrees)) }
         return .object(o)
     }
-}
-
-/// Pages a "Move to Another Notebook…" entry was chosen for. `panel.open` carries only the panel id, so the entry's
-/// params builder leaves the pages here for the Move Pages sheet.
-@MainActor
-enum MovePagesStash {
-    static var pages: [String] = []
 }
 
 @MainActor
@@ -75,7 +66,6 @@ enum PageMenus {
 
     static func register(_ app: NibApp) {
         registerAddPage(app.ui.menus)
-        registerPageActions(app.ui.menus)
         registerDocumentMore(app.ui.menus)
         app.content.keyCommands.register(KeyCommandDescriptor(
             id: goToPageKey, title: String(localized: "Go to Page"), shortcut: KeyShortcut("g", [.command, .option]),
@@ -119,66 +109,36 @@ enum PageMenus {
         }
     }
 
-    // MARK: Page actions (thumbnail menu, sidebar selection, More › This Page)
-
-    static func registerPageActions(_ menus: Registry<MenuItemDescriptor>) {
-        let places: [(location: MenuLocation, submenu: String?, order: Int)] = [
-            (.sidebarPage, nil, 100),
-            (.sidebarSelection, nil, 100),
-            (.documentMore, String(localized: "This Page"), 400)
-        ]
-        for place in places {
-            let key = "pages." + place.location.rawValue
-            let needsNotebook = place.location == .documentMore
-            let visible: @MainActor (MenuContext) -> Bool = { ctx in
-                !PageMenuTarget.refs(ctx).isEmpty && (!needsNotebook || PageMenus.isNotebook(ctx))
-            }
-            menus.register(MenuItemDescriptor(
-                id: key + ".copy", title: String(localized: "Copy"), location: place.location, order: place.order,
-                owner: owner, command: "page.copy", params: { PageMenuTarget.params($0) }, isVisible: visible,
-                submenu: place.submenu))
-            menus.register(MenuItemDescriptor(
-                id: key + ".duplicate", title: String(localized: "Duplicate"), location: place.location,
-                order: place.order + 1, owner: owner, command: "page.duplicate", params: { PageMenuTarget.params($0) },
-                isVisible: visible, submenu: place.submenu))
-            menus.register(MenuItemDescriptor(
-                id: key + ".rotateClockwise", title: String(localized: "Rotate Clockwise"), location: place.location,
-                order: place.order + 2, owner: owner, command: "page.rotate",
-                params: { PageMenuTarget.params($0, degrees: 90) }, isVisible: visible, submenu: place.submenu))
-            menus.register(MenuItemDescriptor(
-                id: key + ".rotateAnticlockwise", title: String(localized: "Rotate Anticlockwise"), location: place.location,
-                order: place.order + 3, owner: owner, command: "page.rotate",
-                params: { PageMenuTarget.params($0, degrees: 270) }, isVisible: visible, submenu: place.submenu))
-            menus.register(MenuItemDescriptor(
-                id: key + ".move", title: String(localized: "Move to Another Notebook…"), icon: NibSymbol.notebook.name,
-                location: place.location, order: place.order + 4, owner: owner, command: CommandIDs.panelOpen,
-                params: { ctx in
-                    MovePagesStash.pages = PageMenuTarget.refs(ctx)
-                    return ["id": .string(PageDialogs.movePagesID)]
-                },
-                isVisible: visible, submenu: place.submenu))
-            menus.register(MenuItemDescriptor(
-                id: key + ".trash", title: String(localized: "Move to Trash"), icon: NibSymbol.trash.name,
-                location: place.location, order: place.order + 9, owner: owner, command: "page.trash",
-                params: { PageMenuTarget.params($0) }, isVisible: visible, destructive: true, submenu: place.submenu))
-        }
-
-        // The thumbnail menu also adds and pastes right after that page.
-        menus.register(MenuItemDescriptor(
-            id: "pages.sidebarPage.addAfter", title: String(localized: "Add Page After"), icon: NibSymbol.addPage.name,
-            location: .sidebarPage, order: 90, owner: owner, command: "page.add",
-            params: { PageMenus.thumbnailPlan($0)?.add(source: "current") ?? [:] },
-            isVisible: { PageMenus.thumbnailPlan($0) != nil }))
-        menus.register(MenuItemDescriptor(
-            id: "pages.sidebarPage.pasteAfter", title: String(localized: "Paste Pages After"),
-            location: .sidebarPage, order: 91, owner: owner, command: "page.paste",
-            params: { PageMenus.thumbnailPlan($0)?.paste ?? [:] },
-            isVisible: { PageMenus.thumbnailPlan($0) != nil && PageClipboard.hasPages }))
-    }
-
-    // MARK: More menu
+    // MARK: More menu (This Page › Copy, Duplicate, Rotate, Move, Trash; Go to Page; Rotate All Pages)
+    // The page sidebar (F023) owns MenuLocation.sidebarPage and .sidebarSelection and runs the same page.* commands there.
 
     static func registerDocumentMore(_ menus: Registry<MenuItemDescriptor>) {
+        let thisPage = String(localized: "This Page")
+        let visible: @MainActor (MenuContext) -> Bool = { ctx in
+            PageMenus.isNotebook(ctx) && !PageMenuTarget.refs(ctx).isEmpty
+        }
+        let actions: [(key: String, title: String, command: String, degrees: Int?)] = [
+            ("copy", String(localized: "Copy"), "page.copy", nil),
+            ("duplicate", String(localized: "Duplicate"), "page.duplicate", nil),
+            ("rotateClockwise", String(localized: "Rotate Clockwise"), "page.rotate", 90),
+            ("rotateAnticlockwise", String(localized: "Rotate Anticlockwise"), "page.rotate", 270)
+        ]
+        for (i, action) in actions.enumerated() {
+            let degrees = action.degrees
+            menus.register(MenuItemDescriptor(
+                id: "pages.documentMore." + action.key, title: action.title, location: .documentMore, order: 400 + i,
+                owner: owner, command: action.command, params: { PageMenuTarget.params($0, degrees: degrees) },
+                isVisible: visible, submenu: thisPage))
+        }
+        // The Move Pages sheet moves the open page (panel.open carries only the panel id).
+        menus.register(MenuItemDescriptor(
+            id: "pages.documentMore.move", title: String(localized: "Move to Another Notebook…"), icon: NibSymbol.notebook.name,
+            location: .documentMore, order: 404, owner: owner, command: CommandIDs.panelOpen,
+            params: { _ in ["id": .string(PageDialogs.movePagesID)] }, isVisible: visible, submenu: thisPage))
+        menus.register(MenuItemDescriptor(
+            id: "pages.documentMore.trash", title: String(localized: "Move to Trash"), icon: NibSymbol.trash.name,
+            location: .documentMore, order: 409, owner: owner, command: "page.trash",
+            params: { PageMenuTarget.params($0) }, isVisible: visible, destructive: true, submenu: thisPage))
         menus.register(MenuItemDescriptor(
             id: "pages.documentMore.goToPage", title: String(localized: "Go to Page…"), icon: NibSymbol.pages.name,
             location: .documentMore, order: 380, owner: owner, command: CommandIDs.panelOpen,
@@ -199,13 +159,6 @@ enum PageMenus {
         guard let doc = ctx.doc ?? ctx.session?.document else { return nil }
         let page = ctx.page ?? (ctx.session?.document == doc ? ctx.session?.page : nil)
         return AddPagePlan(position: position, doc: doc, page: page)
-    }
-
-    /// "After this thumbnail" for the thumbnail menu (one page only).
-    static func thumbnailPlan(_ ctx: MenuContext) -> AddPagePlan? {
-        let refs = PageMenuTarget.refs(ctx)
-        guard refs.count == 1, case let .page(doc, page)? = NodeRef(refs[0]) else { return nil }
-        return AddPagePlan(position: .after, doc: doc, page: page)
     }
 
     static func isNotebook(_ ctx: MenuContext) -> Bool {
