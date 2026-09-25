@@ -66,7 +66,7 @@ enum ShapeRecognizer {
         if gap < 0.2 * size {
             return closedShape(Geo.resample(Array(r[0...end]), count: sampleCount), size: size)
         }
-        return openShape(r, size: size)
+        return openShape(r, raw: pts, size: size)
     }
 
     private static func confidence(_ error: Double, _ threshold: Double) -> Double {
@@ -255,8 +255,8 @@ enum ShapeRecognizer {
 
     // MARK: Open strokes
 
-    private static func openShape(_ r: [Point], size s: Double) -> RecognizedShape? {
-        if let a = fitArrow(r), a.error <= Threshold.arrow {
+    private static func openShape(_ r: [Point], raw: [Point], size s: Double) -> RecognizedShape? {
+        if let a = fitArrow(r, raw: raw), a.error <= Threshold.arrow {
             var style = neutralStyle
             style.arrowEnd = true
             let p = snapAngle(a.tail, a.tip)
@@ -327,7 +327,8 @@ enum ShapeRecognizer {
 
     /// A straight shaft up to the tip (the first point that reaches the farthest distance from the start), then a short
     /// head that stays behind the tip and reaches both sides of the shaft (a V). Either end may carry the head.
-    private static func fitArrow(_ r: [Point]) -> (tail: Point, tip: Point, error: Double)? {
+    /// `r` is the resampled stroke, `raw` the drawn points (the ends are measured on those).
+    private static func fitArrow(_ r: [Point], raw: [Point]) -> (tail: Point, tip: Point, error: Double)? {
         var best: (tail: Point, tip: Point, error: Double)?
         for reversed in [false, true] {
             let p = reversed ? Array(r.reversed()) : r
@@ -370,7 +371,13 @@ enum ShapeRecognizer {
                   left >= 0.06 * length, -right >= 0.06 * length else { continue }
             let error = shaftMean / length
             if let b = best, b.error <= error { continue }
-            best = (tail, tip, error)
+            // Resampling and smoothing both cut the corner at the tip, so the arrow runs between the drawn ends: the
+            // first point, and the drawn point around the tip that reaches farthest along the shaft, both on the shaft.
+            func along(_ q: Point) -> Double { (q.x - tail.x) * ux + (q.y - tail.y) * uy }
+            let corner = p[k]
+            let reach = raw.filter { $0.distance(to: corner) <= 0.08 * length }.map(along).max() ?? length
+            let start = along(p[0])
+            best = (Point(tail.x + start * ux, tail.y + start * uy), Point(tail.x + reach * ux, tail.y + reach * uy), error)
         }
         return best
     }
