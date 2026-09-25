@@ -153,10 +153,54 @@ final class FeatQueryTests: XCTestCase {
         XCTAssertEqual(area, ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01"])
         let layer = try await refs(json(#"{"in": "doc:FIXTUREDOC01", "layer": 3}"#))
         XCTAssertEqual(layer, [])
+        let tan = try await refs(json(##"{"in": "page:FIXTUREDOC01/FIXTUREPG001", "where": {"color": "#f4c430"}}"##))
+        XCTAssertEqual(tan, ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETAP01"], "colours match as colours (#RRGGBB = opaque)")
 
         try await h.run("node.set", json(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECUS01", "fields": {"ext": {"dev.example.tags": {"tag": "draft"}}}}"#))
         let tagged = try await refs(json(#"{"in": "doc:FIXTUREDOC01", "where": {"ext": {"dev.example.tags": {"tag": "draft"}}}}"#))
         XCTAssertEqual(tagged, ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURECUS01"])
+    }
+
+    func testDocumentAndRecordResultsStayUnderTheCap() async throws {
+        let h = harness()
+        let orders = FractionalIndex.sequence(after: "V", count: 300)
+        h.persistence.heads[Fixtures.docID]?.outline += (0..<300).map { i in
+            OutlineEntry(id: NibID("BULKOUT\(1_000 + i)"), title: "Section \(i) " + String(repeating: "t", count: 60),
+                         page: Fixtures.page1, order: orders[i])
+        }
+        let big = String(repeating: "Lorem ipsum ", count: 2_600)
+        h.persistence.heads[Fixtures.textDocID]?.blocks.append(
+            TextBlock(id: "BIGBLOCK01", kind: .paragraph, text: RichText(plain: big), order: "z"))
+        h.app.workspace.close(Fixtures.docID)
+        h.app.workspace.close(Fixtures.textDocID)
+
+        func pages(_ ref: String, depth: Int, key: String) async throws -> (refs: [String], calls: Int) {
+            var refs: [String] = []
+            var cursor: String?
+            var calls = 0
+            repeat {
+                var params: [String: JSONValue] = ["ref": .string(ref), "depth": .number(Double(depth))]
+                if let c = cursor { params["cursor"] = .string(c) }
+                let r = try await h.run("query.get", .object(params), as: .ai("cap"))
+                XCTAssertLessThanOrEqual(r.jsonString().utf8.count, NibLimits.aiToolResultBytes)
+                refs += (r[key]?.arrayValue ?? []).compactMap { $0["ref"]?.stringValue }
+                cursor = r["cursor"]?.stringValue
+                calls += 1
+            } while cursor != nil && calls < 50
+            return (refs, calls)
+        }
+        let outline = try await pages("doc:FIXTUREDOC01", depth: 1, key: "outline")
+        XCTAssertGreaterThan(outline.calls, 1, "outline entries page with the document's pages")
+        XCTAssertEqual(Set(outline.refs).count, 301)
+        let blocks = try await pages("doc:FIXTUREDOC02", depth: 2, key: "blocks")
+        XCTAssertEqual(blocks.refs.count, 4)
+        XCTAssertEqual(blocks.refs.last, "block:FIXTUREDOC02/BIGBLOCK01")
+
+        let block = try await h.run("query.get", ["ref": "block:FIXTUREDOC02/BIGBLOCK01"], as: .ai("cap"))
+        XCTAssertLessThanOrEqual(block.jsonString().utf8.count, NibLimits.aiToolResultBytes)
+        XCTAssertEqual(block["truncated"], JSONValue.bool(true))
+        XCTAssertEqual(block["ref"]?.stringValue, "block:FIXTUREDOC02/BIGBLOCK01")
+        XCTAssertTrue(block.jsonString().contains("Lorem ipsum"), "a cut record keeps the start of its text")
     }
 
     // MARK: Locked documents
@@ -218,6 +262,66 @@ final class FeatQueryTests: XCTestCase {
         XCTAssertEqual(e?.path, "$.fields.stroke.fmt")
     }
 
+    func testHostileStrokePointsAreRejectedInsteadOfCrashing() async throws {
+        let h = harness()
+        // Infinite after Float conversion, a 1e9 pt segment (≈ 6.7e8 densified points), and in-range points whose
+        // densified length is still far too long.
+        for pts in ["[0, 0, 1e30, 0]", "[0, 0, 1e9, 0]", "[0, 0, 100000, 100000, -100000, -100000, 100000, 100000]"] {
+            let e = await nibError {
+                try await h.run("item.create", self.json(#"{"page": "page:FIXTUREDOC01/FIXTUREPG002", "item": {"kind": "stroke", "stroke": {"fmt": "xy", "pts": \#(pts)}}}"#),
+                                as: .ai("c9"))
+            }
+            XCTAssertEqual(e?.code, .invalidParams, pts)
+            XCTAssertEqual(e?.path, "$.item.stroke.pts", pts)
+        }
+        let update = await nibError {
+            try await h.run("item.update", self.json(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01", "patch": {"stroke": {"fmt": "xy", "pts": [0, 0, 1e9, 0]}}}"#),
+                            as: .ai("c9"))
+        }
+        XCTAssertEqual(update?.path, "$.patch.stroke.pts")
+        // NaN smuggled in as base64 Float32 points (2 points × 10 fields).
+        var floats = [Float](repeating: 1, count: 20)
+        floats[10] = .nan
+        let b64 = floats.withUnsafeBufferPointer { Data(buffer: $0) }.base64EncodedString()
+        let nan = await nibError {
+            try await h.run("node.set", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01",
+                                         "fields": ["stroke": ["ptsB64": .string(b64)]]], as: .ai("c9"))
+        }
+        XCTAssertEqual(nan?.code, .invalidParams)
+        XCTAssertEqual(nan?.path, "$.fields.stroke.pts")
+        // Null points would silently empty the stroke.
+        for key in ["pts", "ptsB64"] {
+            let e = await nibError {
+                try await h.run("item.update", .object(["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01",
+                                                        "patch": .object(["stroke": .object([key: .null])])]))
+            }
+            XCTAssertEqual(e?.path, "$.patch.stroke." + key)
+        }
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID).stroke?.points.count, 20)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    func testStyleWidthPatchRescalesCapturedNibSizes() async throws {
+        let h = harness()
+        try await h.run("item.update", json(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETAP01", "patch": {"stroke": {"style": {"width": 36}}}}"#))
+        let tape = try XCTUnwrap(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.tapeID).stroke)
+        XCTAssertEqual(tape.style.width, 36)
+        XCTAssertEqual(tape.style.tool, .tape, "a style patch keeps the other style fields")
+        XCTAssertEqual(tape.points.map { $0.width }, [36, 36])
+        XCTAssertEqual(tape.points.map { $0.height }, [36, 36])
+    }
+
+    func testItemUpdateRoutesPayloadFieldsAndMergesThem() async throws {
+        let h = harness()
+        let r = try await h.run("item.update", json(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "patch": {"text": "Updated text", "frame": {"w": 320}}}"#))
+        XCTAssertEqual(r["changed"], JSONValue.bool(true))
+        let box = try XCTUnwrap(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).text)
+        XCTAssertEqual(box.text.plainText, "Updated text")
+        XCTAssertEqual(box.frame.w, 320)
+        XCTAssertEqual(box.frame.x, 72, "objects merge key by key")
+        XCTAssertEqual(box.frame.h, 40)
+    }
+
     func testAICannotForgeProvenanceOrProtectedFields() async throws {
         let h = harness()
         let r = try await h.run("item.create", json(#"{"page": "page:FIXTUREDOC01/FIXTUREPG002", "id": "AIBOX1", "item": {"kind": "text", "createdBy": "user", "text": {"frame": {"x": 10, "y": 10, "w": 100, "h": 30}, "text": "hi"}}}"#),
@@ -245,6 +349,58 @@ final class FeatQueryTests: XCTestCase {
         let user = try await h.run("node.set", json(#"{"ref": "doc:FIXTUREDOC01", "fields": {"meta": {"favorite": true}}}"#))
         XCTAssertEqual(user["changed"], JSONValue.bool(true))
         XCTAssertTrue(try h.app.workspace.content(Fixtures.docID).meta.favorite)
+
+        for field in ["format", "trashedFrom", "kind", "sourceBookmark"] {
+            let e = await nibError {
+                try await h.run("node.set", .object(["ref": "doc:FIXTUREDOC01", "fields": .object(["meta": .object([field: "x"])])]),
+                                as: .ai("chat7"))
+            }
+            XCTAssertEqual(e?.code, .invalidParams, field)
+            XCTAssertEqual(e?.path, "$.fields.meta." + field)
+        }
+        let id = await nibError {
+            try await h.run("item.update", self.json(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "patch": {"id": "OTHER1"}}"#),
+                            as: .ai("chat7"))
+        }
+        XCTAssertEqual(id?.path, "$.patch.id")
+        // Nobody converts a document by editing its kind.
+        let kind = await nibError {
+            try await h.run("node.set", self.json(#"{"ref": "doc:FIXTUREDOC01", "fields": {"meta": {"kind": "textDocument"}}}"#))
+        }
+        XCTAssertEqual(kind?.path, "$.fields.meta.kind")
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).meta.kind, .notebook)
+    }
+
+    func testRemovedIDsStayTaken() async throws {
+        let h = harness()
+        try await h.run("node.remove", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"], as: .ai("c4"))
+        let reuse = await nibError {
+            try await h.run("item.create", self.json(#"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "id": "FIXTURETXT01", "item": {"kind": "text", "text": {"frame": {"x": 0, "y": 0, "w": 80, "h": 20}, "text": "forged"}}}"#),
+                            as: .ai("c4"))
+        }
+        XCTAssertEqual(reuse?.code, .conflict)
+        XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID))
+
+        // An AI item cannot take over the removed id by moving onto its page either.
+        try await h.run("item.create", json(#"{"page": "page:FIXTUREDOC01/FIXTUREPG003", "id": "FIXTURETXT01", "item": {"kind": "text", "text": {"frame": {"x": 0, "y": 0, "w": 80, "h": 20}, "text": "elsewhere"}}}"#),
+                        as: .ai("c4"))
+        let move = await nibError {
+            try await h.run("node.move", ["ref": "item:FIXTUREDOC01/FIXTUREPG003/FIXTURETXT01", "to": "page:FIXTUREDOC01/FIXTUREPG001"],
+                            as: .ai("c4"))
+        }
+        XCTAssertEqual(move?.code, .conflict)
+
+        // The user can still move an item away and back.
+        try await h.run("node.move", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01", "to": "page:FIXTUREDOC01/FIXTUREPG002"])
+        try await h.run("node.move", ["ref": "item:FIXTUREDOC01/FIXTUREPG002/FIXTURESHP01", "to": "page:FIXTUREDOC01/FIXTUREPG001"])
+        XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID))
+
+        // A trashed page's id is not reused (its items would reappear on the "new" page).
+        try await h.run("node.remove", ["ref": "page:FIXTUREDOC01/FIXTUREPG002"])
+        let page = await nibError {
+            try await h.run("node.insert", self.json(#"{"parent": "doc:FIXTUREDOC01", "id": "FIXTUREPG002", "node": {"type": "page"}}"#))
+        }
+        XCTAssertEqual(page?.code, .conflict)
     }
 
     func testItemCreateDefaultsToTheActiveLayer() async throws {
@@ -317,5 +473,42 @@ final class FeatQueryTests: XCTestCase {
             try await h.run("asset.put", ["doc": "doc:FIXTUREDOC02", "url": "file:///etc/hosts", "ext": "txt"], as: .ai("c2"))
         }
         XCTAssertEqual(file?.code, .permissionDenied)
+    }
+
+    func testAssetNamesAndDocsCannotCarryPaths() async throws {
+        let h = harness()
+        let fixture = try await h.run("asset.get", ["doc": "doc:FIXTUREDOC01", "asset": "fixture-image.png"], as: .ai("c3"))
+        XCTAssertEqual(fixture["bytes"]?.intValue, Fixtures.pngData.count)
+        let cases: [(doc: String, asset: String, path: String)] = [
+            ("doc:FIXTUREDOC01", "../x.png", "$.asset"),
+            ("doc:FIXTUREDOC01", "assets/../../LOCKED.nibnote/doc.head.json", "$.asset"),
+            ("doc:FIXTUREDOC01", "fixture-image.png/..", "$.asset"),
+            ("doc:..", "fixture-image.png", "$.doc")
+        ]
+        for c in cases {
+            let e = await nibError {
+                try await h.run("asset.get", ["doc": .string(c.doc), "asset": .string(c.asset)], as: .ai("c3"))
+            }
+            XCTAssertEqual(e?.code, .invalidParams, c.asset)
+            XCTAssertEqual(e?.path, c.path, c.asset)
+        }
+        let missing = await nibError {
+            try await h.run("asset.get", ["doc": "doc:NOSUCHDOC001", "asset": "fixture-image.png"], as: .ai("c3"))
+        }
+        XCTAssertEqual(missing?.code, .notFound)
+        let tmp = await nibError {
+            try await h.run("asset.put", ["doc": "doc:FIXTUREDOC01", "url": "tmp:../../x.png", "ext": "png"], as: .ai("c3"))
+        }
+        XCTAssertEqual(tmp?.code, .invalidParams)
+        XCTAssertEqual(tmp?.path, "$.url")
+
+        // A plugin without the network permission cannot make the app fetch URLs.
+        h.app.gateway.grants = { _ in [.documentRead, .documentWrite] }
+        let net = await nibError {
+            try await h.run("asset.put", ["doc": "doc:FIXTUREDOC01", "url": "https://example.com/x.png", "ext": "png"],
+                            as: .plugin("dev.example"))
+        }
+        XCTAssertEqual(net?.code, .permissionDenied)
+        XCTAssertEqual(net?.path, "$.url")
     }
 }

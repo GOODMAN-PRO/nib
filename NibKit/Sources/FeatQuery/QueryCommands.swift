@@ -63,7 +63,7 @@ struct QueryContext: NibCommand {
             if let b = bbox { so["bbox"] = Shapes.rect(b) }
             o["selection"] = .object(so)
         }
-        return .object(o)
+        return .object(Shapes.fit(o))
     }
 }
 
@@ -89,7 +89,7 @@ struct QueryTree: NibCommand {
         let rows = Shapes.treeRows(library, root: root, depth: p.depth ?? NibLimits.maxNesting, ctx)
         let rootRef = root.map { NodeRef.folder($0).description } ?? "lib"
         let offset = try Shapes.offset(p.cursor)
-        return Shapes.fill(["root": .string(rootRef)], key: "nodes", count: rows.count, offset: offset, limit: 500) { rows[$0] }
+        return try Shapes.fill(["root": .string(rootRef)], key: "nodes", count: rows.count, offset: offset, limit: 500) { rows[$0] }
     }
 }
 
@@ -106,7 +106,7 @@ struct QueryGet: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "query.get", title: "Get Node",
-        summary: "Any node (lib, folder, doc, page, item, block, card, audio, outline) as JSON; stroke points only with points=true; pages list items (≤200 + cursor).",
+        summary: "Any node (lib, folder, doc, page, item, block, card, audio, outline) as JSON; stroke points only with points=true; lists page by cursor (≤20 KB per call).",
         params: .obj(["ref": .ref,
                       "depth": .int("0 = node only, 1 = child summaries (default), 2 = full child JSON", min: 0, max: 4),
                       "fields": .arr(.str(), "only these fields per row (e.g. ['ext','createdBy'])"),
@@ -116,7 +116,15 @@ struct QueryGet: NibCommand {
                    ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01", "points": true]],
         effect: .read)
 
+    /// Every result fits `NibLimits.aiToolResultBytes`: lists page by cursor, and a single record that is still too
+    /// large has its biggest fields cut and carries `"truncated": true`.
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> JSONValue {
+        let value = try get(p, ctx)
+        guard case .object(let o) = value else { return value }
+        return .object(Shapes.fit(o))
+    }
+
+    static func get(_ p: Params, _ ctx: CommandContext) throws -> JSONValue {
         let ref = try Shapes.ref(p.ref, path: "$.ref")
         let depth = max(0, p.depth ?? 1)
         let points = p.points ?? false
@@ -168,8 +176,11 @@ struct QueryGet: NibCommand {
         guard points, let stroke = it.stroke, case .object(var o) = row, var so = o["stroke"]?.objectValue else { return row }
         so["pointCount"] = nil
         o["stroke"] = .object(so)
-        let paged = Shapes.fill([:], key: "pts", count: stroke.points.count, offset: offset, limit: Int.max,
-                                overhead: JSONValue.object(o).jsonString().utf8.count + 80) { Shapes.pointRow(stroke.points[$0]) }
+        // Half the cap at most for the record itself (e.g. big `ext`), so point rows always have room.
+        o = Shapes.fit(o, budget: NibLimits.aiToolResultBytes / 2)
+        so = o["stroke"]?.objectValue ?? so
+        let paged = try Shapes.fill([:], key: "pts", count: stroke.points.count, offset: offset, limit: Int.max,
+                                    overhead: Shapes.bytes(.object(o)) + 80) { Shapes.pointRow(stroke.points[$0]) }
         let rows = paged["pts"]?.arrayValue ?? []
         so["fmt"] = .string("full")
         so["pts"] = .array(rows.flatMap { $0.arrayValue ?? [] })
@@ -177,7 +188,7 @@ struct QueryGet: NibCommand {
         so["pointCount"] = .number(Double(stroke.points.count))
         o["stroke"] = .object(so)
         o["cursor"] = paged["cursor"]
-        o["truncated"] = paged["truncated"]
+        o["truncated"] = paged["truncated"] ?? o["truncated"]
         return .object(o)
     }
 }
@@ -241,7 +252,9 @@ struct QueryFind: NibCommand {
         let kinds = p.kinds.map { Set($0) }
         let wanted = p.whereFields?.objectValue
 
-        var hits: [JSONValue] = []
+        // Only matches are kept; their rows are built for the requested window alone.
+        // ponytail: a doc-wide find still loads every page's items; add an index when documents get huge.
+        var hits: [(page: PageID, item: Item)] = []
         for page in pages {
             for it in try ctx.workspace.items(doc, page: page) {
                 if let k = kinds, !k.contains(it.kind.rawValue), !(it.stroke.map { k.contains($0.style.tool.rawValue) } ?? false) {
@@ -250,15 +263,17 @@ struct QueryFind: NibCommand {
                 if let l = p.layer, it.layer != l { continue }
                 if let r = area, !it.bounds.intersects(r) { continue }
                 if let t = p.text, !(Shapes.text(of: it, ctx)?.localizedCaseInsensitiveContains(t) ?? false) { continue }
-                let row = Shapes.summary(it, doc: doc, page: page, ctx)
-                if let w = wanted, !Shapes.matches(row, w, full: { (try? Shapes.itemJSON(it, points: false)) ?? [:] }) {
+                if let w = wanted, !Shapes.matches(Shapes.summary(it, doc: doc, page: page, ctx), w,
+                                                   full: { (try? Shapes.itemJSON(it, points: false)) ?? [:] }) {
                     continue
                 }
-                hits.append(.object(row))
+                hits.append((page: page, item: it))
             }
         }
-        return Shapes.fill(["in": .string(ref.description), "count": .number(Double(hits.count))], key: "items",
-                           count: hits.count, offset: offset, limit: p.limit ?? 100) { hits[$0] }
+        return try Shapes.fill(["in": .string(ref.description), "count": .number(Double(hits.count))], key: "items",
+                               count: hits.count, offset: offset, limit: p.limit ?? 100) { i in
+            .object(Shapes.summary(hits[i].item, doc: doc, page: hits[i].page, ctx))
+        }
     }
 }
 
@@ -330,7 +345,7 @@ extension Shapes {
             base["parent"] = .string(n.parent.map { NodeRef.folder($0).description } ?? "lib")
         }
         let rows = depth > 0 ? treeRows(library, root: root, depth: depth, ctx) : []
-        return fill(base, key: "children", count: rows.count, offset: offset, limit: 500) { rows[$0] }
+        return try fill(base, key: "children", count: rows.count, offset: offset, limit: 500) { rows[$0] }
     }
 
     static func documentJSON(_ doc: DocumentID, depth: Int, fields: [String]?, points: Bool, offset: Int,
@@ -347,29 +362,34 @@ extension Shapes {
         ]
         if let t = title(doc, ctx) { o["title"] = .string(t) }
         guard depth >= 1 else { return .object(o) }
-        o["outline"] = .array(try c.liveOutline.map { e in
-            try pick(outlineRow(e, doc), depth: depth, fields: fields) { try recordJSON(e, points: false) }
-        })
-        o["audio"] = .array(try c.liveAudio.map { a in
-            try pick(audioRow(a, doc), depth: depth, fields: fields) { try recordJSON(a, points: false) }
-        })
+        // The document's main list, then its outline and audio clips, share one cursor.
+        let main: Rows
         switch c.meta.kind {
         case .notebook, .whiteboard:
             let pages = c.livePages
-            return try fill(o, key: "pages", count: pages.count, offset: offset, limit: 500) { i in
-                try pick(pageRow(pages[i], doc, index: i), depth: depth, fields: fields) { try recordJSON(pages[i], points: points) }
-            }
+            main = (key: "pages", count: pages.count, row: { (i: Int) throws -> JSONValue in
+                try Shapes.pick(Shapes.pageRow(pages[i], doc, index: i), depth: depth, fields: fields) { try Shapes.recordJSON(pages[i], points: points) }
+            })
         case .textDocument:
             let blocks = c.liveBlocks
-            return try fill(o, key: "blocks", count: blocks.count, offset: offset, limit: 500) { i in
-                try pick(blockRow(blocks[i], doc), depth: depth, fields: fields) { try recordJSON(blocks[i], points: points) }
-            }
+            main = (key: "blocks", count: blocks.count, row: { (i: Int) throws -> JSONValue in
+                try Shapes.pick(Shapes.blockRow(blocks[i], doc), depth: depth, fields: fields) { try Shapes.recordJSON(blocks[i], points: points) }
+            })
         case .studySet:
             let cards = c.liveCards
-            return try fill(o, key: "cards", count: cards.count, offset: offset, limit: 500) { i in
-                try pick(cardRow(cards[i], doc), depth: depth, fields: fields) { try recordJSON(cards[i], points: points) }
-            }
+            main = (key: "cards", count: cards.count, row: { (i: Int) throws -> JSONValue in
+                try Shapes.pick(Shapes.cardRow(cards[i], doc), depth: depth, fields: fields) { try Shapes.recordJSON(cards[i], points: points) }
+            })
         }
+        let outline = c.liveOutline
+        let audio = c.liveAudio
+        let outlineRows: Rows = (key: "outline", count: outline.count, row: { (i: Int) throws -> JSONValue in
+            try Shapes.pick(Shapes.outlineRow(outline[i], doc), depth: depth, fields: fields) { try Shapes.recordJSON(outline[i], points: false) }
+        })
+        let audioRows: Rows = (key: "audio", count: audio.count, row: { (i: Int) throws -> JSONValue in
+            try Shapes.pick(Shapes.audioRow(audio[i], doc), depth: depth, fields: fields) { try Shapes.recordJSON(audio[i], points: false) }
+        })
+        return try fill(o, sections: [main, outlineRows, audioRows], offset: offset, limit: 500)
     }
 
     /// The §7.2 page shape; items are summaries (depth 1), full JSON (depth ≥ 2) or `fields`, ≤ 200 per call.
@@ -392,7 +412,7 @@ extension Shapes {
         o["itemCount"] = .number(Double(items.count))
         guard depth >= 1 else { return .object(o) }
         return try fill(o, key: "items", count: items.count, offset: offset, limit: 200) { i in
-            try itemRow(items[i], doc, page, depth: depth, fields: fields, points: points, ctx)
+            try Shapes.itemRow(items[i], doc, page, depth: depth, fields: fields, points: points, ctx)
         }
     }
 

@@ -13,6 +13,17 @@ enum AssetBytes {
         return e
     }
 
+    /// Largest file a url input may name (it is read into memory).
+    static let maxInputBytes = 200 * 1024 * 1024
+
+    /// Asset and tmp: names are one path component: `name.ext` of [A-Za-z0-9_-] (so never "..", "/").
+    static func checkName(_ name: String, path: String) throws {
+        guard name.range(of: #"\A[A-Za-z0-9_-]{1,128}(\.[A-Za-z0-9]{1,10})?\z"#, options: .regularExpression) != nil else {
+            throw NibError(.invalidParams, "'\(name)' is not an asset name", path: path,
+                           hint: "use a name returned by asset.put / asset.upload or an image item's 'asset'")
+        }
+    }
+
     static func decode(_ base64: String, path: String) throws -> Data {
         var s = base64
         if s.hasPrefix("data:"), let comma = s.firstIndex(of: ",") { s = String(s[s.index(after: comma)...]) }
@@ -23,12 +34,24 @@ enum AssetBytes {
     }
 
     /// tmp: refs, https and (user only) file:// all go through `ctx.inputFile`; the read happens off the main actor.
+    /// Plugins need the `network` permission for http(s) urls, and files over `maxInputBytes` are refused.
     static func load(base64: String?, url: String?, _ ctx: CommandContext) async throws -> Data {
         switch (base64, url) {
         case (.some(let b), .none):
             return try decode(b, path: "$.base64")
         case (.none, .some(let u)):
+            if u.hasPrefix("tmp:") { try checkName(String(u.dropFirst(4)), path: "$.url") }
+            // ponytail: CommandContext.inputFile should own this check for every url-taking command (contract gap).
+            if case .plugin = ctx.principal, let scheme = URL(string: u)?.scheme?.lowercased(),
+               scheme == "https" || scheme == "http", !ctx.bus.gateway.grants(ctx.principal).contains(.network) {
+                throw NibError(.permissionDenied, "downloading a url needs the network permission", path: "$.url",
+                               hint: "upload the bytes with asset.upload and pass the returned tmp: ref")
+            }
             let file = try await ctx.inputFile(u)
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            guard size <= maxInputBytes else {
+                throw NibError(.invalidParams, "\(u) is larger than \(maxInputBytes / 1024 / 1024) MB", path: "$.url")
+            }
             do {
                 return try await Task.detached { try Data(contentsOf: file) }.value
             } catch {
@@ -65,12 +88,12 @@ struct AssetPut: NibCommand {
                       "ext": .str("file extension: png, jpg, gif, pdf…")], required: ["doc", "ext"]),
         examples: [["doc": "doc:FIXTUREDOC01", "ext": "png",
                     "base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="]],
-        effect: .edit)
+        effect: .edit, undoable: false)
 
+    /// Not undoable: assets are content-addressed files beside the records (no `ctx.mutate`); an asset no record
+    /// references is garbage-collected by the document store.
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let doc = NodeRef.documentID(from: p.doc)
-        try Shapes.requireUnlocked(doc, ctx)
-        _ = try ctx.workspace.content(doc)
+        let doc = try Shapes.document(p.doc, path: "$.doc", ctx)
         let ext = try AssetBytes.ext(p.ext)
         let data = try await AssetBytes.load(base64: p.base64, url: p.url, ctx)
         let store = try ctx.services.require(ctx.services.assets, "the asset store")
@@ -104,11 +127,11 @@ struct AssetGet: NibCommand {
         effect: .read)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let doc = NodeRef.documentID(from: p.doc)
-        try Shapes.requireUnlocked(doc, ctx)
+        let doc = try Shapes.document(p.doc, path: "$.doc", ctx)
         let store = try ctx.services.require(ctx.services.assets, "the asset store")
         var name = p.asset
         if name.hasPrefix("assets/") { name.removeFirst("assets/".count) }
+        try AssetBytes.checkName(name, path: "$.asset")
         let ref = AssetRef(name)
         let ext = ref.ext.isEmpty ? "bin" : ref.ext
         let result: (Data, AssetRef)

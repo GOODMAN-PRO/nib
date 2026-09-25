@@ -19,8 +19,10 @@ enum Edits {
         }
     }
 
+    /// Tombstoned ids stay taken: reusing one would overwrite the trashed record (a trashed page's items would
+    /// reappear on the "new" page).
     static func ensureNew<T: LWWRecord>(_ id: NibID, in records: [T], what: String) throws {
-        if records.contains(where: { $0.id == id && !$0.deleted }) {
+        if records.contains(where: { $0.id == id }) {
             throw NibError(.conflict, "\(what) \(id) already exists", hint: "use node.set to change it, or choose another id")
         }
     }
@@ -55,12 +57,15 @@ enum Edits {
             throw NibError.notFound("page \(page) in document \(doc)")
         }
         var item = try Shapes.decode(Item.self, .object(obj), at: path)
-        let live = try ctx.workspace.items(doc, page: page)
-        if live.contains(where: { $0.id == item.id }) {
-            throw NibError(.conflict, "item \(item.id) already exists on page \(page)",
+        try Shapes.validateInk(of: item, path: path)
+        // Tombstones count: `DocTransaction.put` keeps a tombstone's createdBy, so reusing a removed item's id
+        // would store new content under the old (e.g. the user's) provenance.
+        let all = try ctx.workspace.allItems(doc, page: page)
+        if all.contains(where: { $0.id == item.id }) {
+            throw NibError(.conflict, "item \(item.id) already exists (or existed) on page \(page)",
                            hint: "use item.update or node.set to change it, or choose another id")
         }
-        if let at = at { item.z = Shapes.orderKey(at: at, among: live.map { $0.z }) }
+        if let at = at { item.z = Shapes.orderKey(at: at, among: all.filter { !$0.deleted }.map { $0.z }) }
         if var s = item.stroke {
             InkModel.prepare(&s)
             item.stroke = s
@@ -100,14 +105,16 @@ enum Edits {
         }
         var new = try Shapes.decode(Item.self, .object(merged), at: path)
         try sameID(new.id, old.id, path: path)
-        if var s = new.stroke {
-            if !newPoints, let o = old.stroke, o.style.width > 0, s.style.width != o.style.width {
-                let k = Float(s.style.width / o.style.width)
-                for i in s.points.indices {
-                    s.points[i].width *= k
-                    s.points[i].height *= k
-                }
+        if var s = new.stroke, !newPoints, let o = old.stroke, o.style.width > 0, s.style.width != o.style.width {
+            let k = Float(s.style.width / o.style.width)
+            for i in s.points.indices {
+                s.points[i].width *= k
+                s.points[i].height *= k
             }
+            new.stroke = s
+        }
+        try Shapes.validateInk(of: new, path: path)
+        if var s = new.stroke {
             InkModel.prepare(&s)
             new.stroke = s
         }
@@ -136,9 +143,13 @@ enum Edits {
                 patch.merge(meta) { _, new in new }
             }
             let old = try ctx.workspace.content(doc).meta
-            let new = try Shapes.decode(DocumentMeta.self, Shapes.compactJSON(old).merging(.object(patch)),
-                                        at: fields["meta"] == nil ? path : path + ".meta")
+            let metaPath = fields["meta"] == nil ? path : path + ".meta"
+            let new = try Shapes.decode(DocumentMeta.self, Shapes.compactJSON(old).merging(.object(patch)), at: metaPath)
             try sameID(new.id, old.id, path: path)
+            guard new.kind == old.kind else {
+                throw NibError(.invalidParams, "a document's kind cannot change", path: metaPath + ".kind",
+                               hint: "node.set does not convert documents; create a new document of the other kind")
+            }
             guard new != old else { return false }
             try ctx.mutate { tx in try tx.putMeta(new) }
             return true
@@ -492,7 +503,7 @@ struct NodeMove: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "node.move", title: "Move Node",
-        summary: "Reorder or reparent: an item to a z index or another page of its document (id kept), a page/block/card to an index, an outline entry under another.",
+        summary: "Reorder or reparent: an item to a z index or another page (id kept; AI/plugin cross-page moves re-stamp createdBy), a page/block/card to an index, an outline under another.",
         params: .obj(["ref": .ref,
                       "to": .str("items: page:D/P; pages, blocks, cards: doc:D; outline entries: doc:D or outline:D/O"),
                       "at": .int("index among the new siblings (items: z order, 0 = bottom); default last/top", min: 0)],
@@ -525,12 +536,18 @@ struct NodeMove: NibCommand {
                 let stored = moved
                 try ctx.mutate { tx in try tx.put(stored, doc: doc, page: page) }
             } else {
-                let targetItems = try ctx.workspace.items(doc, page: target)
-                if targetItems.contains(where: { $0.id == id }) {
-                    throw NibError(.conflict, "page \(target) already has an item \(id)")
+                // A tombstone of this id on the target is taken too, unless it is this item moving back (same
+                // createdBy): `DocTransaction.put` would keep the tombstone's provenance for non-user principals.
+                // ponytail: a non-user cross-page move stamps the mover as createdBy (put treats it as a create);
+                // keeping the original needs a DocTransaction move/put(keepingProvenanceOf:) contract change.
+                let targetAll = try ctx.workspace.allItems(doc, page: target)
+                if let taken = targetAll.first(where: { $0.id == id }),
+                   !taken.deleted || (!ctx.principal.isUser && taken.createdBy != item.createdBy) {
+                    throw NibError(.conflict, "page \(target) already has (or had) an item \(id)",
+                                   hint: "move a copy made with item.create and your own id instead")
                 }
                 var moved = Edits.unanchored(item)
-                moved.z = Shapes.orderKey(at: p.at, among: targetItems.map { $0.z })
+                moved.z = Shapes.orderKey(at: p.at, among: targetAll.filter { !$0.deleted }.map { $0.z })
                 let stored = moved
                 try ctx.mutate { tx in
                     try Edits.detach(id, doc: doc, page: page, tx)

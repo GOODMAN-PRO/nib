@@ -6,8 +6,9 @@ import NibContracts
 enum Shapes {
     /// Fields non-user principals may never write through raw edits (ARCHITECTURE §6.4).
     static let protectedFields = ["createdBy", "rev", "deleted", "id"]
-    /// Document meta fields non-user principals may never write.
-    static let protectedMetaFields = ["id", "rev", "format", "locked", "trashedFrom"]
+    /// Document meta fields non-user principals may never write (`kind` never changes here for anyone, and
+    /// `sourceBookmark` is resolved as a security-scoped file bookmark by other features).
+    static let protectedMetaFields = ["id", "rev", "format", "kind", "locked", "trashedFrom", "sourceBookmark"]
     /// Summary text is cut here so one row never dominates a result page.
     static let summaryTextLimit = 500
     /// Assets up to this size come back inline (base64) from asset.get, still under the 20 KB result cap.
@@ -42,6 +43,17 @@ enum Shapes {
         if hidden(doc, ctx) {
             throw NibError(.locked, "document \(doc) is locked", hint: "ask the user to unlock it first")
         }
+    }
+
+    /// A document param ("doc:D" or any ref inside D) naming an existing, unlocked document. Ids are checked
+    /// against `NibID.isValid`, so a doc param can never carry a path ("..", "/").
+    static func document(_ s: String, path: String, _ ctx: CommandContext) throws -> DocumentID {
+        guard let doc = try ref(s, path: path).documentID, NibID.isValid(doc.raw) else {
+            throw NibError(.invalidParams, "expected a document ref such as doc:D", path: path)
+        }
+        try requireUnlocked(doc, ctx)
+        _ = try ctx.workspace.content(doc)
+        return doc
     }
 
     static func title(_ doc: DocumentID, _ ctx: CommandContext) -> String? {
@@ -311,7 +323,11 @@ enum Shapes {
 
     /// A stroke patch that replaces points must name their format and give the whole flat array.
     static func checkStrokePoints(_ stroke: [String: JSONValue], path: String) throws {
-        guard let pts = stroke["pts"], pts != JSONValue.null else { return }
+        for k in ["pts", "ptsB64"] where stroke[k] == JSONValue.null {
+            throw NibError(.invalidParams, "'\(k)' cannot be null", path: path + "." + k,
+                           hint: "send the new points, or remove the item with node.remove")
+        }
+        guard let pts = stroke["pts"] else { return }
         let formats = StrokePoint.formats.keys.sorted().joined(separator: ", ")
         guard let fmt = stroke["fmt"]?.stringValue else {
             throw NibError(.invalidParams, "'fmt' is required with 'pts'", path: path + ".fmt",
@@ -324,6 +340,51 @@ enum Shapes {
               values.allSatisfy({ $0.doubleValue != nil }) else {
             throw NibError(.invalidParams, "'pts' must be a flat array of numbers, \(fields.count) per point for '\(fmt)'",
                            path: path + ".pts")
+        }
+    }
+
+    /// Most points one stroke may carry, before and (for sparse AI/plugin points) after `InkModel.densify`.
+    static let maxInkPoints = 50_000
+    static let maxDenseInkPoints = 200_000
+    /// Page coordinates are bounded like page sizes (`DocTransaction.put` accepts pages up to 100 000 pt).
+    static let maxInkCoordinate: Float = 100_000
+
+    /// Ink from the AI, plugins or the bridge must be finite, on a page-sized plane and of bounded size before
+    /// `InkModel.prepare` densifies it (an infinite or huge segment would trap or exhaust memory there).
+    static func validateInk(_ stroke: Stroke, path: String) throws {
+        func fail(_ message: String) -> NibError {
+            NibError(.invalidParams, message, path: path + ".pts",
+                     hint: "points are page coordinates within ±100000; split very long strokes")
+        }
+        guard !stroke.points.isEmpty else { throw fail("a stroke needs at least one point") }
+        guard stroke.points.count <= maxInkPoints else { throw fail("a stroke has at most \(maxInkPoints) points") }
+        guard stroke.style.width.isFinite, abs(stroke.style.width) <= Double(maxInkCoordinate) else {
+            throw NibError(.invalidParams, "style.width out of range", path: path + ".style.width")
+        }
+        var dense = 0.0
+        for (i, p) in stroke.points.enumerated() {
+            let values = [p.x, p.y, p.t, p.force, p.azimuth, p.altitude, p.roll, p.width, p.height, p.opacity]
+            guard values.allSatisfy({ $0.isFinite }), abs(p.x) <= maxInkCoordinate, abs(p.y) <= maxInkCoordinate,
+                  abs(p.width) <= maxInkCoordinate, abs(p.height) <= maxInkCoordinate else {
+                throw fail("point \(i) is not finite or lies outside ±100000")
+            }
+            if i > 0 {
+                let a = stroke.points[i - 1]
+                let d = Double(((p.x - a.x) * (p.x - a.x) + (p.y - a.y) * (p.y - a.y)).squareRoot())
+                dense += max(1, (d / 1.5).rounded(.up))
+            }
+        }
+        // `prepare` densifies only strokes without nib sizes, to 1.5 pt spacing (InkModel.densify's default).
+        if stroke.points.allSatisfy({ $0.width <= 0 }), dense > Double(maxDenseInkPoints) {
+            throw fail("the stroke is too long (at most \(maxDenseInkPoints) points after densifying at 1.5 pt)")
+        }
+    }
+
+    /// `validateInk` for every stroke an item carries (stroke items and a math item's source ink).
+    static func validateInk(of item: Item, path: String) throws {
+        if let s = item.stroke { try validateInk(s, path: path + ".stroke") }
+        for (i, s) in (item.math?.sourceInk ?? []).enumerated() {
+            try validateInk(s, path: path + ".math.sourceInk[\(i)]")
         }
     }
 
@@ -344,29 +405,116 @@ enum Shapes {
         return n
     }
 
-    /// Adds rows `offset…` of `count` under `key` of `base`: as many as fit `NibLimits.aiToolResultBytes` (at least
-    /// one, so paging always advances; at most `limit`), plus `cursor` + `truncated` when rows remain.
-    /// `overhead` = bytes the caller adds around the result afterwards.
+    /// One list of a paged result: rows `0..<count` under `key`, built lazily by `row`.
+    typealias Rows = (key: String, count: Int, row: (Int) throws -> JSONValue)
+
+    /// Adds rows `offset…` of `count` under `key` of `base` (see `fill(_:sections:offset:limit:overhead:)`).
     static func fill(_ base: [String: JSONValue], key: String, count: Int, offset: Int, limit: Int, overhead: Int = 0,
-                     row: (Int) throws -> JSONValue) rethrows -> JSONValue {
-        var out = base
-        let budget = NibLimits.aiToolResultBytes - JSONValue.object(base).jsonString().utf8.count - overhead - 64
-        var rows: [JSONValue] = []
+                     row: @escaping (Int) throws -> JSONValue) throws -> JSONValue {
+        try fill(base, sections: [(key: key, count: count, row: row)], offset: offset, limit: limit, overhead: overhead)
+    }
+
+    /// Adds the rows of `sections` (one cursor over all of them, in order) to `base`: as many as fit
+    /// `NibLimits.aiToolResultBytes` (at least one, so paging always advances; at most `limit`), plus `cursor` +
+    /// `truncated` when rows remain. The base is cut to half the cap and a row that alone exceeds the rest is cut
+    /// to fit, so the result never exceeds the cap. `overhead` = bytes the caller adds around the result afterwards.
+    static func fill(_ base: [String: JSONValue], sections: [Rows], offset: Int, limit: Int,
+                     overhead: Int = 0) throws -> JSONValue {
+        var out = fit(base, budget: NibLimits.aiToolResultBytes / 2)
+        let keys = sections.reduce(0) { $0 + $1.key.utf8.count + 8 }
+        let budget = max(64, NibLimits.aiToolResultBytes - bytes(.object(out)) - keys - overhead - 64)
+        let total = sections.reduce(0) { $0 + $1.count }
+        var lists = sections.map { _ in [JSONValue]() }
         var used = 0
+        var emitted = 0
         var i = max(0, offset)
-        while i < count && rows.count < max(1, limit) {
-            let r = try row(i)
-            let bytes = r.jsonString().utf8.count + 1
-            if !rows.isEmpty && used + bytes > budget { break }
-            rows.append(r)
-            used += bytes
+        while i < total && emitted < max(1, limit) {
+            var s = 0
+            var j = i
+            while j >= sections[s].count {
+                j -= sections[s].count
+                s += 1
+            }
+            var r = try sections[s].row(j)
+            var size = bytes(r) + 1
+            if size > budget {
+                r = fitted(r, budget: budget - 1)
+                size = bytes(r) + 1
+            }
+            if emitted > 0 && used + size > budget { break }
+            lists[s].append(r)
+            used += size
+            emitted += 1
             i += 1
         }
-        out[key] = .array(rows)
-        if i < count {
+        for (s, section) in sections.enumerated() { out[section.key] = .array(lists[s]) }
+        if i < total {
             out["cursor"] = .string(String(i))
             out["truncated"] = .bool(true)
         }
         return .object(out)
+    }
+
+    // MARK: Result cap (NibLimits.aiToolResultBytes)
+
+    static func bytes(_ v: JSONValue) -> Int { v.jsonString().utf8.count }
+
+    /// `o` cut to at most `budget` bytes of JSON and marked `"truncated": true` when anything was cut.
+    static func fit(_ o: [String: JSONValue], budget: Int = NibLimits.aiToolResultBytes) -> [String: JSONValue] {
+        guard bytes(.object(o)) > budget else { return o }
+        var marked = o
+        marked["truncated"] = .bool(true)
+        return shrink(.object(marked), to: budget).objectValue ?? [:]
+    }
+
+    /// `fit` for objects, `shrink` for anything else.
+    static func fitted(_ v: JSONValue, budget: Int) -> JSONValue {
+        if case .object(let o) = v { return .object(fit(o, budget: budget)) }
+        return shrink(v, to: budget)
+    }
+
+    /// `v` cut to at most `budget` bytes: long strings are clipped, arrays keep a prefix, objects cut their largest
+    /// fields first and drop what still does not fit. `ref`, `kind`, `id`, `cursor` and `truncated` are kept.
+    static func shrink(_ v: JSONValue, to budget: Int) -> JSONValue {
+        guard bytes(v) > budget else { return v }
+        switch v {
+        case .string(let s):
+            var n = min(s.count, max(0, budget - 8))
+            while n > 0 && bytes(.string(String(s.prefix(n)) + "…")) > budget { n = n * 3 / 4 }
+            return .string(n > 0 ? String(s.prefix(n)) + "…" : "")
+        case .array(let a):
+            var out: [JSONValue] = []
+            var used = 2
+            for e in a {
+                let size = bytes(e) + 1
+                if used + size <= budget {
+                    out.append(e)
+                    used += size
+                    continue
+                }
+                if budget - used > 16 {
+                    let cut = fitted(e, budget: budget - used - 1)
+                    if used + bytes(cut) + 1 <= budget { out.append(cut) }
+                }
+                break
+            }
+            return .array(out)
+        case .object(var o):
+            let kept: Set<String> = ["ref", "kind", "id", "cursor", "truncated"]
+            let sizes = o.mapValues { bytes($0) }
+            let largest = o.keys.filter { !kept.contains($0) }.sorted { a, b in
+                (sizes[a] ?? 0) != (sizes[b] ?? 0) ? (sizes[a] ?? 0) > (sizes[b] ?? 0) : a < b
+            }
+            for k in largest {
+                let over = bytes(.object(o)) - budget
+                guard over > 0, let value = o[k], let size = sizes[k] else { break }
+                let cut = shrink(value, to: max(0, size - over))
+                o[k] = bytes(cut) < size ? cut : nil
+            }
+            for k in largest where bytes(.object(o)) > budget { o[k] = nil }
+            return .object(o)
+        default:
+            return v
+        }
     }
 }
