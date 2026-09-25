@@ -516,7 +516,7 @@ struct TextFormat: NibCommand {
         params: .obj(["ref": .ref, "attrs": attrsSchema,
                       "range": .arr(.int(min: 0), "[start, length] in UTF-16 units of the plain text (paragraphs joined by \\n); omit for the whole text")],
                      required: ["ref", "attrs"]),
-        examples: [try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "attrs": {"bold": true, "color": "#2156D9FF"}, "range": [0, 5]}"#),
+        examples: [try! JSONValue.parse(##"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "attrs": {"bold": true, "color": "#2156D9FF"}, "range": [0, 5]}"##),
                    try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "attrs": {"font": "Georgia", "size": 20}}"#)],
         effect: .edit)
 
@@ -609,7 +609,7 @@ struct TextSetBoxStyle: NibCommand {
                                      "lineSpacing": .num("extra points between lines; 0 = automatic", min: 0, max: 100)],
                                     "fields left out are unchanged; null clears a colour")],
                      required: ["refs", "style"]),
-        examples: [try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"], "style": {"background": "#FFF3B0FF", "borderColor": "#1A1A1AFF", "borderWidth": 1, "cornerRadius": 8, "padding": 8}}"#)],
+        examples: [try! JSONValue.parse(##"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"], "style": {"background": "#FFF3B0FF", "borderColor": "#1A1A1AFF", "borderWidth": 1, "cornerRadius": 8, "padding": 8}}"##)],
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
@@ -673,7 +673,7 @@ struct TextSaveDefaultStyle: NibCommand {
                       "style": textSchema("TextBoxStyle fields (background, borderColor, borderWidth, cornerRadius, padding, shadow, autoGrow, defaults) plus align and lineSpacing")],
                      required: ["style"]),
         examples: [try! JSONValue.parse(#"{"style": {"defaults": {"font": "Helvetica", "size": 17}, "padding": 4}}"#),
-                   try! JSONValue.parse(#"{"name": "Definition", "style": {"defaults": {"bold": true}, "background": "#FFF3B0FF"}}"#)],
+                   try! JSONValue.parse(##"{"name": "Definition", "style": {"defaults": {"bold": true}, "background": "#FFF3B0FF"}}"##)],
         effect: .session, target: .app)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
