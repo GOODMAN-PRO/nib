@@ -147,12 +147,15 @@ final class NibIndexTests: XCTestCase {
     func testLockedAndTrashedDocumentsAreExcluded() async throws {
         let (h, indexer) = harness()
         await indexer.indexDocument(Fixtures.docID)
-        XCTAssertFalse(results(try await h.run("search.text", ["query": "Remember"])).isEmpty)
+        let unlocked = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertFalse(unlocked.isEmpty)
         h.app.services.lock = FakeLockService(locked: [Fixtures.docID])
-        XCTAssertTrue(results(try await h.run("search.text", ["query": "Remember"])).isEmpty)
+        let locked = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertTrue(locked.isEmpty)
         h.app.services.lock = nil
         try h.library.trash(Fixtures.docID)
-        XCTAssertTrue(results(try await h.run("search.text", ["query": "Remember"])).isEmpty)
+        let trashed = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertTrue(trashed.isEmpty)
     }
 
     func testIndexHandwritingSettingIsRespected() async throws {
@@ -160,11 +163,14 @@ final class NibIndexTests: XCTestCase {
         let (h, indexer) = harness([line])
         h.app.settings.set(NibSettings.indexHandwriting, false)
         await indexer.indexDocument(Fixtures.docID)
-        XCTAssertTrue(results(try await h.run("search.text", ["query": "zebra"])).isEmpty)
-        XCTAssertFalse(results(try await h.run("search.text", ["query": "Remember"])).isEmpty)
+        let inkOff = results(try await h.run("search.text", ["query": "zebra"]))
+        XCTAssertTrue(inkOff.isEmpty)
+        let typedOff = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertFalse(typedOff.isEmpty)
         h.app.settings.set(NibSettings.indexHandwriting, true)
         await indexer.indexDocument(Fixtures.docID)
-        XCTAssertEqual(results(try await h.run("search.text", ["query": "zebra"])).first?["kind"]?.stringValue, "ink")
+        let inkOn = results(try await h.run("search.text", ["query": "zebra"]))
+        XCTAssertEqual(inkOn.first?["kind"]?.stringValue, "ink")
     }
 
     func testRecognizeItemsMapsWordsToStrokes() async throws {
@@ -220,7 +226,8 @@ final class NibIndexTests: XCTestCase {
         let r = try await h.run("index.rebuild", ["doc": "doc:FIXTUREDOC01"])
         XCTAssertEqual(r["scheduled"]?.boolValue, false)
         XCTAssertGreaterThan(r["units"]?.intValue ?? 0, 0)
-        XCTAssertEqual(results(try await h.run("search.text", ["query": "Remember"])).first?["kind"]?.stringValue, "typed")
+        let typed = results(try await h.run("search.text", ["query": "Remember"]))
+        XCTAssertEqual(typed.first?["kind"]?.stringValue, "typed")
         let blocks = results(try await h.run("search.text", ["query": "blocks", "scope": "doc:FIXTUREDOC02"]))
         XCTAssertTrue(blocks.isEmpty, "only the rebuilt document is indexed")
     }
