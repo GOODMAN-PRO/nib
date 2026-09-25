@@ -48,6 +48,8 @@ final class BridgeAssets {
 final class ContinuationBox<T> {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<T, Error>?
+    /// `Deadline.run`'s work, cancelled when the timer wins.
+    var work: Task<Void, Never>?
 
     init(_ continuation: CheckedContinuation<T, Error>) { self.continuation = continuation }
 
@@ -60,8 +62,8 @@ final class ContinuationBox<T> {
     }
 }
 
-/// Runs main-actor work with a time limit. On timeout the caller gets `timeout()` at once; the work itself keeps
-/// running (a pending confirmation sheet, a slow export) and its late result is dropped.
+/// Runs main-actor work with a time limit. On timeout the caller gets `timeout()` at once and the work task is
+/// cancelled (a bridge confirmation still waiting then answers Deny); whatever it still returns is dropped.
 @MainActor
 enum Deadline {
     static func run<T>(seconds: Double, timeout: @escaping () -> Error,
@@ -74,9 +76,10 @@ enum Deadline {
                 } catch {
                     return
                 }
+                box.work?.cancel()
                 box.finish(.failure(timeout()))
             }
-            Task { @MainActor in
+            box.work = Task { @MainActor in
                 let result: Result<T, Error>
                 do {
                     result = .success(try await work())
@@ -111,6 +114,11 @@ final class MCPHandler {
     /// Results larger than this are cut and paged with a `cursor` (AI.md §4).
     static let pageBytes = NibLimits.aiToolResultBytes
     static let cursorPrefix = "nibr:"
+    /// Paged results kept for their cursors: at most 32 results and this many bytes, 10 minutes each.
+    static let pageCacheBytes = 64 << 20
+    /// Most clients vanish without `DELETE /mcp`: a session idle this long ends (and leaves the status pill).
+    static let sessionIdle: TimeInterval = 30 * 60
+    static let maxSessions = 64
 
     /// The static system prompt (AI.md §5), served as MCP `instructions`.
     static let staticPrompt = """
@@ -144,8 +152,9 @@ final class MCPHandler {
     var toolTimeout: TimeInterval = 120
     var serverVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0"
     var onActivity: ((BridgeActivity) -> Void)?
+    var now: () -> Date = { Date() }
     private(set) var sessions: [String: Session] = [:]
-    private var pages: [String: (text: String, expires: Date)] = [:]
+    private var pages: [String: (bytes: [UInt8], expires: Date)] = [:]
 
     init(app: NibApp, assets: BridgeAssets) {
         self.app = app
@@ -171,6 +180,8 @@ final class MCPHandler {
     }
 
     private func post(_ req: HTTPRequest, baseURL: String) async -> HTTPResponse {
+        let cutoff = now().addingTimeInterval(-MCPHandler.sessionIdle)
+        for s in sessions.values where s.lastSeen < cutoff { closeSession(s.id) }
         let message: JSONValue
         do {
             message = try JSONDecoder().decode(JSONValue.self, from: req.body)
@@ -192,7 +203,7 @@ final class MCPHandler {
                 guard var session = sessions[sid] else {
                     return rpcError(404, id: id ?? .null, RPCError(code: -32001, message: "Session not found; send initialize again"))
                 }
-                session.lastSeen = Date()
+                session.lastSeen = now()
                 sessions[sid] = session
                 client = session.client
             }
@@ -217,9 +228,16 @@ final class MCPHandler {
         guard let sid = req.header("mcp-session-id") else {
             return HTTPResponse.failure(400, "DELETE /mcp needs the Mcp-Session-Id header")
         }
-        guard let session = sessions.removeValue(forKey: sid) else { return HTTPResponse.failure(404, "unknown session") }
-        onActivity?(.session(client: session.client, version: session.clientVersion, started: false))
+        guard closeSession(sid) else { return HTTPResponse.failure(404, "unknown session") }
         return HTTPResponse.json(200, [:])
+    }
+
+    /// Ends a session (DELETE, idle expiry, eviction) and tells the status pill; false when it was unknown.
+    @discardableResult
+    private func closeSession(_ sid: String) -> Bool {
+        guard let session = sessions.removeValue(forKey: sid) else { return false }
+        onActivity?(.session(client: session.client, version: session.clientVersion, started: false))
+        return true
     }
 
     // MARK: JSON-RPC
@@ -242,11 +260,11 @@ final class MCPHandler {
         let version = requested.flatMap { MCPHandler.protocolVersions.contains($0) ? $0 : nil } ?? MCPHandler.protocolVersions[0]
         let client = MCPHandler.clientName(params["clientInfo"]?["name"]?.stringValue)
         let clientVersion = params["clientInfo"]?["version"]?.stringValue
-        let sid = UUID().uuidString
-        sessions[sid] = Session(id: sid, client: client, clientVersion: clientVersion, protocolVersion: version, lastSeen: Date())
-        if sessions.count > 64, let oldest = sessions.values.min(by: { $0.lastSeen < $1.lastSeen }) {
-            sessions[oldest.id] = nil
+        if sessions.count >= MCPHandler.maxSessions, let oldest = sessions.values.min(by: { $0.lastSeen < $1.lastSeen }) {
+            closeSession(oldest.id)
         }
+        let sid = UUID().uuidString
+        sessions[sid] = Session(id: sid, client: client, clientVersion: clientVersion, protocolVersion: version, lastSeen: now())
         onActivity?(.session(client: client, version: clientVersion, started: true))
         let capabilities: JSONValue = ["tools": ["listChanged": false]]
         let serverInfo: JSONValue = ["name": "nib", "version": .string(serverVersion)]
@@ -308,7 +326,11 @@ final class MCPHandler {
     // MARK: Execution and results
 
     /// Runs an Invocation through the gateway with the per-call time limit. Confirmations appear on the device.
+    /// Asset links this bridge handed out become `tmp:` refs again first, so an agent can pass an `asset.upload`
+    /// result or a render straight to image.insert / import.files (a non-user principal cannot fetch http URLs).
     func execute(_ inv: Invocation) async throws -> InvocationResult {
+        var inv = inv
+        inv.params = unrewrite(inv.params)
         let bus = app.bus
         let seconds = toolTimeout
         return try await Deadline.run(seconds: seconds, timeout: {
@@ -365,6 +387,22 @@ final class MCPHandler {
         }
     }
 
+    /// The inverse of `rewrite`: "<anything>/api/v1/assets/<token>" with a live token becomes "tmp:<name>".
+    func unrewrite(_ value: JSONValue) -> JSONValue {
+        switch value {
+        case .string(let s):
+            guard let r = s.range(of: "/api/v1/assets/", options: .backwards),
+                  let name = assets.resolve(String(s[r.upperBound...])) else { return value }
+            return .string("tmp:" + name)
+        case .array(let a):
+            return .array(a.map { unrewrite($0) })
+        case .object(let o):
+            return .object(o.mapValues { unrewrite($0) })
+        default:
+            return value
+        }
+    }
+
     /// Bytes of a temporary asset, read off the main actor (renders, exports and audio can be large).
     func temporaryData(_ name: String) async -> Data? {
         guard let url = app.services.assets?.temporaryURL(AssetRef(name)) else { return nil }
@@ -390,9 +428,14 @@ final class MCPHandler {
         guard bytes.count > MCPHandler.pageBytes else { return [MCPHandler.textPart(text)] }
         let now = Date()
         pages = pages.filter { $0.value.expires > now }
-        if pages.count >= 32, let oldest = pages.min(by: { $0.value.expires < $1.value.expires })?.key { pages[oldest] = nil }
+        // Oldest out until the new result fits; a single result over the cap is kept alone.
+        while !pages.isEmpty,
+              pages.count >= 32 || pages.values.reduce(bytes.count, { $0 + $1.bytes.count }) > MCPHandler.pageCacheBytes,
+              let oldest = pages.min(by: { $0.value.expires < $1.value.expires })?.key {
+            pages[oldest] = nil
+        }
         let id = NibID.make().raw
-        pages[id] = (text, now.addingTimeInterval(600))
+        pages[id] = (bytes, now.addingTimeInterval(600))
         return chunk(bytes, id: id, offset: 0)
     }
 
@@ -417,7 +460,7 @@ final class MCPHandler {
             return MCPHandler.errorResult(NibError(.notFound, "result cursor '\(cursor)' is unknown or expired",
                                                    hint: "call the tool again without the cursor"))
         }
-        let bytes = Array(entry.text.utf8)
+        let bytes = entry.bytes
         guard offset > 0, offset < bytes.count else {
             return MCPHandler.errorResult(NibError(.invalidParams, "result cursor '\(cursor)' is out of range", path: "$.cursor"))
         }

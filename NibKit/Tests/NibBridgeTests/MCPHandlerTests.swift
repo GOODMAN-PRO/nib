@@ -279,15 +279,68 @@ final class MCPHandlerTests: XCTestCase {
         XCTAssertEqual(silent.asked, 1)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0, "denied: nothing ran")
     }
+
+    func testAnAllowAfterTheToolTimeoutChangesNothing() async throws {
+        let (h, c) = try make()
+        let late = SilentPresenter()
+        late.delay = 0.4
+        c.confirmer.inner = late
+        c.mcp.toolTimeout = 0.2
+        let r = await post(c.mcp, #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nib_run","arguments":{"command":"test.wipe","params":{"page":"page:FIXTUREDOC01/FIXTUREPG001","title":"Late"}}}}"#)
+        XCTAssertEqual(try toolText(r)["error"]?["code"], "timeout")
+        try await Task.sleep(nanoseconds: 800_000_000)
+        XCTAssertEqual(late.asked, 1)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0, "the agent was told timeout, so the late Allow is a Deny")
+        XCTAssertNil(try h.app.workspace.content(Fixtures.docID).page(Fixtures.page1)?.title)
+    }
+
+    func testAssetLinksInResultsRoundTripIntoURLParameters() async throws {
+        let (_, c) = try make()
+        let upload = await post(c.mcp, #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nib_run","arguments":{"command":"test.upload","params":{}}}}"#)
+        let uploaded = try toolText(upload)
+        let link = try XCTUnwrap(uploaded["ref"]?.stringValue)
+        XCTAssertTrue(link.hasPrefix(base + "/api/v1/assets/"), "results carry download links: \(link)")
+        let name = try XCTUnwrap(uploaded["name"]?.stringValue)
+
+        let use = await post(c.mcp, #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nib_run","arguments":{"command":"test.useFile","params":{"url":"\#(link)"}}}}"#)
+        XCTAssertEqual(try json(use)["result"]?["isError"], false, String(decoding: use.body, as: UTF8.self))
+        let used = try toolText(use)
+        XCTAssertEqual(used["scheme"], "tmp", "the link is the tmp: ref again, which a bridge principal may read")
+        XCTAssertEqual(used["name"]?.stringValue, name)
+        XCTAssertEqual(used["bytes"]?.intValue, Fixtures.pngData.count)
+
+        let stranger: JSONValue = ["url": "http://x/api/v1/assets/unknown", "n": 1]
+        XCTAssertEqual(c.mcp.unrewrite(stranger), stranger, "unknown or expired links stay as they are")
+    }
+
+    func testIdleSessionsExpireAndEvictedSessionsLeaveTheStatus() async throws {
+        let (_, c) = try make()
+        var now = Date()
+        c.mcp.now = { now }
+        let idle = try await initialize(c.mcp, client: "idle")
+        now = now.addingTimeInterval(MCPHandler.sessionIdle + 1)
+        let fresh = try await initialize(c.mcp)
+        XCTAssertNil(c.mcp.sessions[idle], "a session idle for 30 minutes ends")
+        XCTAssertEqual(c.status().clients.first { $0.name == "idle" }?.sessions, 0)
+
+        for _ in 0..<MCPHandler.maxSessions {
+            now = now.addingTimeInterval(1)
+            _ = try await initialize(c.mcp)
+        }
+        XCTAssertEqual(c.mcp.sessions.count, MCPHandler.maxSessions)
+        XCTAssertNil(c.mcp.sessions[fresh], "the least recently seen session is evicted")
+        XCTAssertEqual(c.status().clients.first { $0.name == "claude-code" }?.sessions, MCPHandler.maxSessions)
+    }
 }
 
-/// A presenter that never answers (nobody at the device).
+/// A presenter that answers Allow only after `delay` seconds (60 s: nobody at the device).
 @MainActor
 final class SilentPresenter: ConfirmationPresenter {
     private(set) var asked = 0
+    var delay: TimeInterval = 60
     func confirm(_ request: ConfirmationRequest) async -> ConfirmationDecision {
         asked += 1
-        try? await Task.sleep(nanoseconds: 60_000_000_000)
+        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         return .allow
     }
 }
@@ -327,6 +380,21 @@ enum BridgeTestCommands {
             examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001"]], effect: .edit, destructive: true)) { p, ctx in
             try setTitle(p, ctx)
             return [:]
+        }
+        app.commands.register(CommandDescriptor(
+            id: "test.upload", title: "Upload", summary: "Test stand-in for asset.upload: stores bytes, returns a tmp: ref.",
+            examples: [[:]], effect: .read, target: .app)) { _, ctx in
+            let asset = try ctx.services.require(ctx.services.assets, "assets").putTemporary(Fixtures.pngData, ext: "png")
+            return ["ref": .string("tmp:" + asset.name), "name": .string(asset.name)]
+        }
+        app.commands.register(CommandDescriptor(
+            id: "test.useFile", title: "Use File", summary: "Test stand-in for image.insert: reads its url with inputFile.",
+            params: .obj(["url": .str()], required: ["url"]), examples: [["url": "tmp:x.png"]],
+            effect: .read, target: .app)) { p, ctx in
+            let url = p["url"]?.stringValue ?? ""
+            let data = try Data(contentsOf: try await ctx.inputFile(url))
+            return ["scheme": .string(url.hasPrefix("tmp:") ? "tmp" : "other"), "name": .string(String(url.dropFirst(4))),
+                    "bytes": .number(Double(data.count))]
         }
         app.commands.register(CommandDescriptor(
             id: "render.page", title: "Render Page", summary: "Test stand-in for F004's render.page.",

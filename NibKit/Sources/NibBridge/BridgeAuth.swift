@@ -72,6 +72,25 @@ enum BridgeAuth {
         }
         return allowlist.contains { normal($0) == normal(origin) }
     }
+
+    /// The checks every request passes before routing (docs/AI.md §9.1), in order: remote address in the allowed
+    /// networks (403), bearer token (401; `/health` needs none), `Origin` absent or allowlisted (403). nil = allowed.
+    /// With `head` nil only the address is checked. Thread-safe (settings and Keychain are): the server runs it on
+    /// its queue at accept and again on the head alone, before any body byte is buffered.
+    static func refusal(_ head: HTTPRequest?, remote: [UInt8]?, settings: SettingsStore) -> HTTPResponse? {
+        guard BridgeNetworks.allows(remote, in: BridgeNetworks.parse(settings.get(BridgeSettings.networks))) else {
+            return HTTPResponse.failure(403, "this address is not in the bridge's allowed networks")
+        }
+        guard let head = head, head.normalizedPath != "/health" else { return nil }
+        guard authorized(head.header("authorization"), token: BridgeSecrets.token()) else {
+            return HTTPResponse.failure(401, "missing or wrong bearer token (Authorization: Bearer nib_…)",
+                                        headers: [("WWW-Authenticate", "Bearer")])
+        }
+        guard originAllowed(head.header("origin"), allowlist: settings.get(BridgeSettings.origins)) else {
+            return HTTPResponse.failure(403, "this Origin is not allowed")
+        }
+        return nil
+    }
 }
 
 /// IPv4 / IPv6 addresses as raw bytes (4 or 16). IPv4-mapped IPv6 (::ffff:a.b.c.d) is folded to IPv4.

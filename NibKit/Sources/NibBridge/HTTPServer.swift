@@ -6,8 +6,8 @@ import NibContracts
 
 // MARK: - Router (transport-free: HTTPRequest + remote address in, HTTPResponse out)
 
-/// Checks every request before routing (docs/AI.md §9.1): remote address in the allowed networks (403), then the
-/// bearer token (401; `GET /health` is the only route without it), then `Origin` absent or allowlisted (403).
+/// Checks every request before routing (`BridgeAuth.refusal`: network 403, token 401 except `/health`, Origin 403).
+/// The server already ran the same checks on the head alone; this keeps the router safe on its own.
 @MainActor
 final class BridgeRouter {
     unowned let app: NibApp
@@ -21,22 +21,11 @@ final class BridgeRouter {
     }
 
     func route(_ req: HTTPRequest, remote: [UInt8]?) async -> HTTPResponse {
-        let settings = app.settings
-        guard BridgeNetworks.allows(remote, in: BridgeNetworks.parse(settings.get(BridgeSettings.networks))) else {
-            return HTTPResponse.failure(403, "this address is not in the bridge's allowed networks")
-        }
-        var path = req.path
-        while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        if let refusal = BridgeAuth.refusal(req, remote: remote, settings: app.settings) { return refusal }
+        let path = req.normalizedPath
         if path == "/health" {
             guard req.method == "GET" else { return HTTPResponse.failure(405, "use GET", headers: [("Allow", "GET")]) }
             return HTTPResponse.json(200, ["ok": true, "app": "nib", "api": 1])
-        }
-        guard BridgeAuth.authorized(req.header("authorization"), token: BridgeSecrets.token()) else {
-            return HTTPResponse.failure(401, "missing or wrong bearer token (Authorization: Bearer nib_…)",
-                                        headers: [("WWW-Authenticate", "Bearer")])
-        }
-        guard BridgeAuth.originAllowed(req.header("origin"), allowlist: settings.get(BridgeSettings.origins)) else {
-            return HTTPResponse.failure(403, "this Origin is not allowed")
         }
         let base = baseURL(req)
         if path == "/mcp" { return await mcp.handle(req, baseURL: base) }
@@ -126,27 +115,34 @@ protocol HTTPServing: AnyObject {
 }
 
 /// A minimal HTTP/1.1 server on `NWListener`, advertised over Bonjour as `_nib._tcp`. One request per connection
-/// (`Connection: close`); requests must complete within 120 s. Connection bookkeeping happens on `queue`; the
-/// handler runs on the main actor.
+/// (`Connection: close`). The head must arrive within 10 s and the body within 120 s more. `gate` refuses a peer at
+/// accept (address) and again on the head alone, so nothing of a refused body is buffered and no `100 Continue` is
+/// sent. Connection bookkeeping and `gate` run on `queue`; the handler runs on the main actor.
 final class HTTPServer: HTTPServing {
     typealias Handler = @MainActor (HTTPRequest, [UInt8]?) async -> HTTPResponse
+    /// (head, or nil at accept; remote address) -> a refusal, or nil to go on. Runs on `queue`: must be thread-safe.
+    typealias Gate = @Sendable (HTTPRequest?, [UInt8]?) -> HTTPResponse?
     static let serviceType = "_nib._tcp"
     static let maxConnections = 32
+    static let headerDeadline: TimeInterval = 10
     static let requestDeadline: TimeInterval = 120
 
     let port: UInt16
     let advertise: Bool
     let handler: Handler
+    let gate: Gate
     private let onEvent: @MainActor (HTTPServerEvent) -> Void
     let queue = DispatchQueue(label: "app.nib.bridge.http")
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: HTTPConnection] = [:]
     private let log = Logger(subsystem: "app.nib", category: "bridge")
 
-    init(port: UInt16, advertise: Bool, handler: @escaping Handler, onEvent: @escaping @MainActor (HTTPServerEvent) -> Void) {
+    init(port: UInt16, advertise: Bool, handler: @escaping Handler, gate: @escaping Gate,
+         onEvent: @escaping @MainActor (HTTPServerEvent) -> Void) {
         self.port = port
         self.advertise = advertise
         self.handler = handler
+        self.gate = gate
         self.onEvent = onEvent
     }
 
@@ -191,17 +187,21 @@ final class HTTPServer: HTTPServing {
         Task { @MainActor in onEvent(event) }
     }
 
-    /// Runs on `queue`.
+    /// Runs on `queue`. Addresses outside the allowed networks are refused before a byte is read.
     private func accept(_ connection: NWConnection) {
+        let remote = HTTPConnection.address(of: connection.endpoint)
+        if let refusal = gate(nil, remote) { return reject(connection, refusal) }
         guard connections.count < HTTPServer.maxConnections else {
-            connection.start(queue: queue)
-            connection.send(content: HTTPResponse.failure(503, "too many connections").serialized(),
-                            completion: .contentProcessed { _ in connection.cancel() })
-            return
+            return reject(connection, HTTPResponse.failure(503, "too many connections"))
         }
-        let c = HTTPConnection(connection: connection, server: self)
+        let c = HTTPConnection(connection: connection, remote: remote, server: self)
         connections[ObjectIdentifier(c)] = c
         c.start()
+    }
+
+    private func reject(_ connection: NWConnection, _ response: HTTPResponse) {
+        connection.start(queue: queue)
+        connection.send(content: response.serialized(), completion: .contentProcessed { _ in connection.cancel() })
     }
 
     /// Runs on `queue`.
@@ -210,17 +210,20 @@ final class HTTPServer: HTTPServing {
     }
 }
 
-/// One client connection: read until the request is complete, answer, close.
+/// One client connection: read the head, check it, read the body, answer, close.
 private final class HTTPConnection {
     let connection: NWConnection
     private weak var server: HTTPServer?
     private let queue: DispatchQueue
+    private let remote: [UInt8]?
     private var parser = HTTPParser()
+    private var headChecked = false
     private var continueSent = false
     private var answered = false
 
-    init(connection: NWConnection, server: HTTPServer) {
+    init(connection: NWConnection, remote: [UInt8]?, server: HTTPServer) {
         self.connection = connection
+        self.remote = remote
         self.server = server
         self.queue = server.queue
     }
@@ -238,9 +241,10 @@ private final class HTTPConnection {
             }
         }
         connection.start(queue: queue)
-        queue.asyncAfter(deadline: .now() + HTTPServer.requestDeadline) { [weak self] in
-            guard let self = self, !self.answered else { return }
-            self.send(HTTPResponse.failure(408, "the request did not arrive within 120 s"))
+        // A peer that never finishes its headers gives its slot back after 10 s (slowloris).
+        queue.asyncAfter(deadline: .now() + HTTPServer.headerDeadline) { [weak self] in
+            guard let self = self, !self.answered, !self.headChecked else { return }
+            self.send(HTTPResponse.failure(408, "the request headers did not arrive within 10 s"))
         }
         receive()
     }
@@ -248,21 +252,7 @@ private final class HTTPConnection {
     private func receive() {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, isComplete, error in
             guard let self = self, !self.answered else { return }
-            if let data = data, !data.isEmpty {
-                switch self.parser.feed(data) {
-                case .complete(let request):
-                    self.dispatch(request)
-                    return
-                case .failure(let status, let message):
-                    self.send(HTTPResponse.failure(status, message))
-                    return
-                case .incomplete:
-                    if self.parser.expectsContinue && !self.continueSent {
-                        self.continueSent = true
-                        self.connection.send(content: Data("HTTP/1.1 100 Continue\r\n\r\n".utf8), completion: .idempotent)
-                    }
-                }
-            }
+            if let data = data, !data.isEmpty, self.consume(data) { return }
             if isComplete || error != nil {
                 self.connection.cancel()
             } else {
@@ -271,24 +261,58 @@ private final class HTTPConnection {
         }
     }
 
+    /// Feeds the parser; true once the connection is answered or handed to the handler.
+    private func consume(_ data: Data) -> Bool {
+        let result = parser.feed(data)
+        if case .failure(let status, let message) = result {
+            send(HTTPResponse.failure(status, message))
+            return true
+        }
+        if !headChecked, let head = parser.head {
+            headChecked = true
+            if let refusal = server?.gate(head, remote) {
+                send(refusal)
+                return true
+            }
+            queue.asyncAfter(deadline: .now() + HTTPServer.requestDeadline) { [weak self] in
+                guard let self = self, !self.answered else { return }
+                self.send(HTTPResponse.failure(408, "the request body did not arrive within 120 s"))
+            }
+        }
+        if case .complete(let request) = result {
+            dispatch(request)
+            return true
+        }
+        if parser.expectsContinue && !continueSent {
+            continueSent = true
+            connection.send(content: Data("HTTP/1.1 100 Continue\r\n\r\n".utf8), completion: .idempotent)
+        }
+        return false
+    }
+
     private func dispatch(_ request: HTTPRequest) {
         answered = true
         guard let handler = server?.handler else {
             connection.cancel()
             return
         }
-        let remote = HTTPConnection.address(of: connection.endpoint)
+        let remote = self.remote
         Task {
             let response = await handler(request, remote)
             self.queue.async { self.send(response) }
         }
     }
 
+    /// Head and body go out as two sends, so a large (memory-mapped) asset is never copied into one buffer.
     private func send(_ response: HTTPResponse) {
         answered = true
-        connection.send(content: response.serialized(), completion: .contentProcessed { [weak self] _ in
-            self?.connection.cancel()
-        })
+        let close = NWConnection.SendCompletion.contentProcessed { [weak self] _ in self?.connection.cancel() }
+        if response.body.isEmpty {
+            connection.send(content: response.head, completion: close)
+        } else {
+            connection.send(content: response.head, completion: .idempotent)
+            connection.send(content: response.body, completion: close)
+        }
     }
 
     static func address(of endpoint: NWEndpoint) -> [UInt8]? {

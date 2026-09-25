@@ -1,4 +1,5 @@
 import XCTest
+import Network
 import NibContracts
 import NibTesting
 @testable import NibBridge
@@ -9,6 +10,56 @@ final class RecordingServer: HTTPServing {
     private(set) var stopped = 0
     func start() throws { started += 1 }
     func stop() { stopped += 1 }
+}
+
+/// A raw TCP client for the real listener: sends `text` as is and returns everything the server writes before it
+/// closes (the bridge answers once, then closes).
+final class RawHTTPClient {
+    private let connection: NWConnection
+    private let queue = DispatchQueue(label: "app.nib.bridge.tests.client")
+    private var received = Data()
+    private var box: ContinuationBox<String>?
+
+    init(port: Int) {
+        connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: UInt16(port)) ?? .any, using: .tcp)
+    }
+
+    func exchange(_ text: String) async throws -> String {
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<String, Error>) in
+            box = ContinuationBox(c)
+            connection.stateUpdateHandler = { [self] state in
+                switch state {
+                case .ready:
+                    if !text.isEmpty { connection.send(content: Data(text.utf8), completion: .idempotent) }
+                    read()
+                case .failed(let error), .waiting(let error):
+                    finish(.failure(error))
+                default:
+                    break
+                }
+            }
+            connection.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + 10) { [self] in
+                finish(.failure(NibError(.timeout, "the server did not answer and close within 10 s")))
+            }
+        }
+    }
+
+    private func read() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) { [self] data, _, isComplete, error in
+            if let data = data { received.append(data) }
+            if isComplete || error != nil {
+                finish(.success(String(decoding: received, as: UTF8.self)))
+            } else {
+                read()
+            }
+        }
+    }
+
+    private func finish(_ result: Result<String, Error>) {
+        connection.cancel()
+        box?.finish(result)
+    }
 }
 
 /// CIDR allowlist, token and Origin checks, the router's check order, the REST gateway and the bridge commands.
@@ -232,6 +283,45 @@ final class NibBridgeTests: XCTestCase {
         let notJSON = await call("[1,2]")
         XCTAssertEqual(notJSON.status, 400)
         XCTAssertEqual(c.status().lastCall?.error, "invalid_params")
+    }
+
+    func testTheListenerRefusesBeforeReadingABody() async throws {
+        let (h, _, _) = try make()
+        setToken(token)
+        let settings = h.app.settings
+        let ready = expectation(description: "listening")
+        var port = 0
+        let server = HTTPServer(port: 0, advertise: false,
+                                handler: { _, _ in HTTPResponse.json(200, ["reached": true]) },
+                                gate: { head, remote in BridgeAuth.refusal(head, remote: remote, settings: settings) },
+                                onEvent: { event in
+                                    guard case .ready(let p) = event, port == 0 else { return }
+                                    port = p
+                                    ready.fulfill()
+                                })
+        try server.start()
+        defer { server.stop() }
+        await fulfillment(of: [ready], timeout: 10)
+
+        // No token, 32 MB announced: refused on the head alone, without 100 Continue or reading the body.
+        let big = try await RawHTTPClient(port: port).exchange(
+            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: 100-continue\r\nContent-Length: 33554432\r\n\r\n")
+        XCTAssertTrue(big.hasPrefix("HTTP/1.1 401 "), big)
+        XCTAssertFalse(big.contains("100 Continue"), big)
+        XCTAssertFalse(big.contains("reached"), big)
+
+        let authorized = try await RawHTTPClient(port: port).exchange(
+            "POST /mcp HTTP/1.1\r\nAuthorization: Bearer \(token)\r\nContent-Length: 2\r\n\r\n{}")
+        XCTAssertTrue(authorized.hasPrefix("HTTP/1.1 200 "), authorized)
+        XCTAssertTrue(authorized.hasSuffix(#"{"reached":true}"#), authorized)
+
+        let health = try await RawHTTPClient(port: port).exchange("GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+        XCTAssertTrue(health.hasPrefix("HTTP/1.1 200 "), "/health needs no token: \(health)")
+
+        // Outside the allowed networks: refused at accept, before the client sends anything.
+        settings.set(BridgeSettings.networks, ["10.0.0.0/8"])
+        let outside = try await RawHTTPClient(port: port).exchange("")
+        XCTAssertTrue(outside.hasPrefix("HTTP/1.1 403 "), outside)
     }
 
     func testAssetLinksLastFiveMinutes() {

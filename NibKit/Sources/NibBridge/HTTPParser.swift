@@ -19,6 +19,13 @@ struct HTTPRequest: Equatable {
     }
 
     func header(_ name: String) -> String? { headers[name.lowercased()] }
+
+    /// The path without trailing slashes ("/mcp/" routes like "/mcp").
+    var normalizedPath: String {
+        var p = path
+        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
+        return p
+    }
 }
 
 enum HTTPParseResult: Equatable {
@@ -35,7 +42,9 @@ struct HTTPParser {
     static let maxBodyBytes = 32 * 1024 * 1024
 
     private var buffer = Data()
-    private var head: HTTPRequest?
+    /// The request line and headers (empty body) as soon as they have arrived, so the server can check the network,
+    /// token and Origin before it reads (or sends `100 Continue` for) the body.
+    private(set) var head: HTTPRequest?
     private var bodyLength = 0
     /// True once the headers asked for `Expect: 100-continue` and the body has not fully arrived (curl sends it for
     /// bodies over 1 KB and waits for the interim response).
@@ -165,15 +174,19 @@ struct HTTPResponse {
         headers.first { $0.0.lowercased() == name.lowercased() }?.1
     }
 
-    func serialized() -> Data {
-        var head = "HTTP/1.1 \(status) \(HTTPResponse.reason(status))\r\n"
+    /// Status line and headers. The server sends it and `body` separately, so a large (memory-mapped) asset body is
+    /// never copied.
+    var head: Data {
+        var text = "HTTP/1.1 \(status) \(HTTPResponse.reason(status))\r\n"
         for (name, value) in headers where !["content-length", "connection"].contains(name.lowercased()) {
             let clean = value.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
-            head += "\(name): \(clean)\r\n"
+            text += "\(name): \(clean)\r\n"
         }
-        head += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
-        return Data(head.utf8) + body
+        text += "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        return Data(text.utf8)
     }
+
+    func serialized() -> Data { head + body }
 
     static func reason(_ status: Int) -> String {
         switch status {

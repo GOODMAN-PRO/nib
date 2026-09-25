@@ -90,6 +90,7 @@ final class HTTPParserTests: XCTestCase {
         var parser = HTTPParser()
         XCTAssertEqual(parser.feed(Data("POST /mcp HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n".utf8)), .incomplete)
         XCTAssertTrue(parser.expectsContinue)
+        XCTAssertEqual(parser.head?.path, "/mcp", "the head is available for the auth checks before the body arrives")
         guard case .complete(let r) = parser.feed(Data("{}".utf8)) else { return XCTFail("body completes the request") }
         XCTAssertEqual(r.body, Data("{}".utf8))
         XCTAssertFalse(parser.expectsContinue)

@@ -173,12 +173,14 @@ final class BridgeController {
     // MARK: Private
 
     private func defaultServer(_ port: UInt16, generation: Int) -> HTTPServing {
-        HTTPServer(port: port, advertise: !NibApp.isHostlessTest,
-                   handler: { [weak self] request, remote in
-                       guard let self = self else { return HTTPResponse.failure(503, "the bridge is shutting down") }
-                       return await self.router.route(request, remote: remote)
-                   },
-                   onEvent: { [weak self] event in self?.serverEvent(event, generation: generation) })
+        let settings = app.settings
+        return HTTPServer(port: port, advertise: !NibApp.isHostlessTest,
+                          handler: { [weak self] request, remote in
+                              guard let self = self else { return HTTPResponse.failure(503, "the bridge is shutting down") }
+                              return await self.router.route(request, remote: remote)
+                          },
+                          gate: { head, remote in BridgeAuth.refusal(head, remote: remote, settings: settings) },
+                          onEvent: { [weak self] event in self?.serverEvent(event, generation: generation) })
     }
 
     func serverEvent(_ event: HTTPServerEvent, generation: Int) {
@@ -242,8 +244,9 @@ final class BridgeController {
 }
 
 /// Wraps the app's confirmation presenter: requests from bridge principals are answered with Deny when nobody
-/// responds on the device within `timeout` (the sheet may stay up; a late answer is ignored). Everyone else passes
-/// straight through.
+/// responds on the device within `timeout` (the sheet may stay up; a late answer is ignored), or once the tool call
+/// itself timed out (its work task is cancelled, and this runs inside it), so a late Allow never applies a change the
+/// agent was told timed out. Everyone else passes straight through.
 @MainActor
 final class BridgeConfirmer: ConfirmationPresenter {
     var inner: ConfirmationPresenter?
@@ -252,9 +255,10 @@ final class BridgeConfirmer: ConfirmationPresenter {
     func confirm(_ request: ConfirmationRequest) async -> ConfirmationDecision {
         guard let inner = inner else { return .deny }
         guard case .bridge = request.principal else { return await inner.confirm(request) }
+        guard !Task.isCancelled else { return .deny }
         let decision = try? await Deadline.run(seconds: timeout, timeout: { NibError(.userDenied, "no answer on the device") }) {
             await inner.confirm(request)
         }
-        return decision ?? .deny
+        return Task.isCancelled ? .deny : decision ?? .deny
     }
 }

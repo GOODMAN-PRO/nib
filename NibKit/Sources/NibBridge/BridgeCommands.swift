@@ -2,6 +2,12 @@ import Foundation
 import NibContracts
 
 /// Bridge settings. All are `security.*`: only the user reads or changes them (FEATURES.md › Exceptions).
+/// F091 (Bridge settings page) uses these names through `settings.get` / `settings.set` as the user:
+/// `security.bridge.enabled` (Bool), `security.bridge.port` (Int), `security.bridge.networks` ([CIDR string]),
+/// `security.bridge.origins` ([origin string]); the token is the Keychain item `BridgeSecrets` names.
+/// ponytail: `networks` and `origins` are one array key each, not one key per entry (ARCHITECTURE.md §15.5): they are
+/// device-local (never synced, so no two-device merge), user-only, and the settings page replaces the whole list.
+/// Move to `declarePrefix` per-entry keys if they ever sync.
 enum BridgeSettings {
     static let enabled = SettingKey("security.bridge.enabled", default: false)
     static let port = SettingKey("security.bridge.port", default: 7331)
