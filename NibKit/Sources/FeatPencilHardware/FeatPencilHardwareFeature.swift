@@ -79,6 +79,7 @@ enum PencilSettings {
 // MARK: - Commands
 
 /// A page ref and point from command params, checked against the window's open document.
+@MainActor
 struct PencilTarget {
     var page: PageID?
     var point: Point?

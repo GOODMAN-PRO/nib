@@ -191,6 +191,7 @@ struct PencilChoice: Identifiable, Equatable {
     var gestures: [String]
 }
 
+@MainActor
 enum PencilChoices {
     /// Built-ins first (the iPad setting leads, with `systemTitle` under it), then Pencil actions from features and
     /// plugins that offer `gesture` (all of them when nil), then Off.
