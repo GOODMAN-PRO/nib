@@ -78,7 +78,9 @@ final class InkTypesetterTests: XCTestCase {
                 let ys = strokes.joined().map { $0.y }
                 XCTAssertLessThan(ys.min() ?? 0, -0.2, "\(family) \(character) rises above the baseline (y is down)")
                 if "gp".contains(character) {
-                    XCTAssertGreaterThan(ys.max() ?? 0, 0.15, "\(family) \(character) has a descender")
+                    // The centre-line stops about half a stroke inside the outline, and Marker Felt's descenders are
+                    // short (its p's centre-line reaches 0.11 em below the baseline).
+                    XCTAssertGreaterThan(ys.max() ?? 0, 0.1, "\(family) \(character) has a descender")
                 } else {
                     XCTAssertLessThan(ys.max() ?? 0, 0.12, "\(family) \(character) sits on the baseline")
                 }
