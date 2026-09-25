@@ -18,6 +18,11 @@ enum EraserMode: String, Codable, CaseIterable, Hashable {
 enum EraserGeometry {
     /// Pieces shorter than this (page points) are dropped: they would render as specks.
     static let minPieceLength = 0.3
+    /// The largest eraser radius `ink.erase` takes (page points); the tool clamps to it when zoomed far out.
+    static let maxRadius = 500.0
+    /// The most points one `ink.erase` path or `ink.scribbleErase` scribble may have, so no caller can hold the main
+    /// actor for long. The tool sends longer gestures in several calls that share one undo group.
+    static let maxPathPoints = 20_000
 
     // MARK: Primitives
 
@@ -342,6 +347,8 @@ struct EraseSession {
     let filter: Set<InkTool>
     let layer: Int
     private(set) var candidates: [Candidate] = []
+    /// The candidate strokes by id (the preview looks them up on every move).
+    private var strokes: [ElementID: Stroke] = [:]
     private(set) var path: [Point] = []
     /// Strokes cut so far (precision and standard): what is left of each ([] = nothing).
     private(set) var pieces: [ElementID: [[StrokePoint]]] = [:]
@@ -357,18 +364,24 @@ struct EraseSession {
         self.layer = layer
         let live = items.filter { !$0.deleted }
         let parents = Set(live.compactMap { $0.attachedTo })
-        for item in live where !item.locked && item.layer == layer && (region?.intersects(item.bounds) ?? true) {
+        for item in live where !item.locked && item.layer == layer {
+            let target: Target
             switch item.kind {
             case .stroke:
                 guard let s = item.stroke, filter.contains(s.style.tool) else { continue }
-                candidates.append(Candidate(item: item, bounds: item.bounds, target: .stroke(s)))
+                target = .stroke(s)
             case .shape, .connector:
                 let tool = item.shape?.style.drawnWith ?? .pen
                 guard filter.contains(tool), !parents.contains(item.id), let o = EraserGeometry.outline(item) else { continue }
-                candidates.append(Candidate(item: item, bounds: item.bounds, target: .outline(o)))
+                target = .outline(o)
             default:
                 continue
             }
+            // Bounds walk every point of a stroke: computed once, and only for items that can take part.
+            let bounds = item.bounds
+            if let region = region, !region.intersects(bounds) { continue }
+            if case .stroke(let s) = target { strokes[item.id] = s }
+            candidates.append(Candidate(item: item, bounds: bounds, target: target))
         }
     }
 
@@ -376,12 +389,7 @@ struct EraseSession {
     var affected: Set<ElementID> { erased.union(pieces.keys) }
 
     /// A candidate stroke as it was before the gesture (previews draw its remaining pieces in its style).
-    func stroke(_ id: ElementID) -> Stroke? {
-        for c in candidates where c.item.id == id {
-            if case .stroke(let s) = c.target { return s }
-        }
-        return nil
-    }
+    func stroke(_ id: ElementID) -> Stroke? { strokes[id] }
 
     /// Moves the eraser to `p` (the first call places it); returns the ids whose result changed.
     @discardableResult

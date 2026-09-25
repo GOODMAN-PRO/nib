@@ -28,15 +28,28 @@ enum EraseSupport {
         return try workspace.items(doc, page: page)
     }
 
+    /// Rejects paths too long to run in one call (each point scans the page's candidates on the main actor).
+    static func checkLength(_ points: [Point], _ path: String) throws {
+        guard points.count <= EraserGeometry.maxPathPoints else {
+            throw NibError(.invalidParams, "\(path.dropFirst(2)) has more than \(EraserGeometry.maxPathPoints) points", path: path,
+                           hint: "split it into several calls of at most \(EraserGeometry.maxPathPoints) points")
+        }
+    }
+
     /// The layer the eraser works on: the invoking window's active layer.
     static func layer(_ ctx: CommandContext) -> Int { ctx.activeSession?.activeLayer ?? 0 }
 
     /// Tombstones `ids`. Live children lose their `attachedTo` and connector ends anchored to a removed item are
     /// released (the end point stays), so nothing is left pointing at a removed item.
+    /// Tombstones the already-fetched items (`tx.delete` would look each one up again with a scan of the page).
+    /// ponytail: `put` still scans the page per item, so clearing a 100k-item board is quadratic; needs a bulk
+    /// tombstone on DocTransaction.
     static func remove(_ ids: Set<ElementID>, among items: [Item], tx: DocTransaction, doc: DocumentID, page: PageID) throws {
         guard !ids.isEmpty else { return }
         for item in items where ids.contains(item.id) {
-            try tx.delete(item: item.id, doc: doc, page: page)
+            var gone = item
+            gone.deleted = true
+            try tx.put(gone, doc: doc, page: page)
         }
         for item in items where !ids.contains(item.id) {
             var next = item
@@ -51,21 +64,28 @@ enum EraseSupport {
     }
 
     /// Applies an eraser gesture: removes what it erased and inserts the cut pieces with fresh ids in the original's
-    /// place (same z, layer, attachment, style and provenance).
+    /// place (layer, attachment, style and provenance). Each piece gets its own z key between the original's and the
+    /// next item's, so pieces keep the stroke's place in the z-order and no two items share a key.
     static func commit(_ session: EraseSession, items: [Item], tx: DocTransaction, doc: DocumentID, page: PageID) throws -> EraseCounts {
         let plan = session.plan
         try remove(plan.remove, among: items, tx: tx, doc: doc, page: page)
         var created = 0
+        var top = ""                                   // the highest key handed out so far (splits come in z-order)
         for split in plan.splits {
+            let next = items.first { $0.z > split.original.z }?.z
+            var last = max(split.original.z, top)
             for stroke in split.strokes {
                 var piece = split.original
                 piece.id = NibID.make()
                 piece.rev = .zero
                 piece.deleted = false
                 piece.stroke = stroke
+                piece.z = FractionalIndex.between(last, next)
+                last = piece.z
                 try tx.put(piece, doc: doc, page: page)
                 created += 1
             }
+            top = last
         }
         return EraseCounts(removed: plan.remove.count, created: created)
     }
@@ -87,8 +107,8 @@ struct InkErase: NibCommand {
         id: "ink.erase", title: "Erase",
         summary: "Erase along a path on a page: precision cuts at the eraser's edge, standard removes touched segments, stroke removes whole strokes. Returns counts.",
         params: .obj(["page": .ref,
-                      "path": .arr(.point, "eraser centre line [[x,y],…] in page points"),
-                      "radius": .num("eraser radius in page points", min: 0.1, max: 500),
+                      "path": .arr(.point, "eraser centre line [[x,y],…] in page points (at most \(EraserGeometry.maxPathPoints) points)"),
+                      "radius": .num("eraser radius in page points", min: 0.1, max: EraserGeometry.maxRadius),
                       "mode": .str("precision | standard | stroke", choices: EraserMode.allCases.map { $0.rawValue }),
                       "filter": .arr(.str(choices: InkTool.allCases.map { $0.rawValue }),
                                      "ink tools to erase (default all; shapes and connectors count as pen)")],
@@ -103,10 +123,13 @@ struct InkErase: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> EraseCounts {
         let (doc, page) = try EraseSupport.pageRef(p.page)
+        try EraseSupport.checkLength(p.path, "$.path")
         guard !p.path.isEmpty, p.path.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else {
             throw NibError.invalid("path needs at least one finite [x, y] point", path: "$.path")
         }
-        guard p.radius.isFinite, p.radius > 0 else { throw NibError.invalid("radius must be a positive number", path: "$.radius") }
+        guard p.radius.isFinite, p.radius > 0, p.radius <= EraserGeometry.maxRadius else {
+            throw NibError.invalid("radius must be a positive number up to \(Int(EraserGeometry.maxRadius))", path: "$.radius")
+        }
         // The geometry runs before `mutate` (ARCHITECTURE §6.1: slow work stays out of transactions).
         let items = try EraseSupport.liveItems(ctx.workspace, doc, page)
         let region = Rect.bounding(p.path)?.insetBy(-p.radius)
@@ -130,13 +153,15 @@ struct InkScribbleErase: NibCommand {
     static let descriptor = CommandDescriptor(
         id: "ink.scribbleErase", title: "Scribble to Erase",
         summary: "Erase the pen and pencil strokes a scribble covers (points = the scribble's path in page points; the scribble is not kept). Returns counts.",
-        params: .obj(["page": .ref, "points": .arr(.point, "the scribble's path [[x,y],…] in page points")],
+        params: .obj(["page": .ref,
+                      "points": .arr(.point, "the scribble's path [[x,y],…] in page points (at most \(EraserGeometry.maxPathPoints) points)")],
                      required: ["page", "points"]),
         examples: [try! JSONValue.parse(#"{"page":"page:FIXTUREDOC01/FIXTUREPG001","points":[[70,116],[150,118],[70,121],[150,124],[70,127]]}"#)],
         effect: .edit, destructive: true)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> EraseCounts {
         let (doc, page) = try EraseSupport.pageRef(p.page)
+        try EraseSupport.checkLength(p.points, "$.points")
         guard p.points.count >= 2, p.points.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else {
             throw NibError.invalid("points needs at least two finite [x, y] points", path: "$.points")
         }
@@ -176,7 +201,7 @@ struct PageClear: NibCommand {
         let items = try EraseSupport.liveItems(ctx.workspace, doc, page)
         guard !items.isEmpty else { return .zero }
         return try ctx.mutate { tx in
-            for item in items { try tx.delete(item: item.id, doc: doc, page: page) }
+            try EraseSupport.remove(Set(items.map { $0.id }), among: items, tx: tx, doc: doc, page: page)
             return EraseCounts(removed: items.count, created: 0)
         }
     }
@@ -221,7 +246,12 @@ struct PageDeleteItems: NibCommand {
         return kinds.contains(item.kind.rawValue)
     }
 
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> EraseCounts {
+    /// One page's share of a call: its live items and the ids that go.
+    typealias Work = (doc: DocumentID, page: PageID, items: [Item], ids: Set<ElementID>)
+
+    /// What a call would delete, from reads only: `run` deletes it and the Delete Specific Items sheet counts it
+    /// (no transaction, so counting a large document never tombstones and rolls back every match).
+    static func resolve(_ p: Params, workspace: Workspace, session: EditorSession?) throws -> [Work] {
         let kinds = Set(p.kinds)
         guard !kinds.isEmpty else { throw NibError.invalid("choose at least one kind", path: "$.kinds") }
         if let unknown = kinds.subtracting(DeletableKinds.all).sorted().first {
@@ -233,7 +263,7 @@ struct PageDeleteItems: NibCommand {
         case "page":
             if let ref = p.page {
                 targets = try [EraseSupport.pageRef(ref)]
-            } else if let docRef = p.doc, let session = ctx.activeSession, let current = session.page,
+            } else if let docRef = p.doc, let session = session, let current = session.page,
                       session.document == NodeRef.documentID(from: docRef) {
                 targets = [(NodeRef.documentID(from: docRef), current)]
             } else {
@@ -249,16 +279,21 @@ struct PageDeleteItems: NibCommand {
             } else {
                 throw NibError.invalid("scope 'document' needs doc", path: "$.doc")
             }
-            targets = try ctx.workspace.content(doc).livePages.map { (doc, $0.id) }
+            targets = try workspace.content(doc).livePages.map { (doc, $0.id) }
         default:
             throw NibError.invalid("scope must be page or document", path: "$.scope")
         }
-        var work: [(doc: DocumentID, page: PageID, items: [Item], ids: Set<ElementID>)] = []
+        var work: [Work] = []
         for (doc, page) in targets {
-            let items = try EraseSupport.liveItems(ctx.workspace, doc, page)
+            let items = try EraseSupport.liveItems(workspace, doc, page)
             let ids = Set(items.filter { matches($0, kinds) }.map { $0.id })
             if !ids.isEmpty { work.append((doc: doc, page: page, items: items, ids: ids)) }
         }
+        return work
+    }
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> EraseCounts {
+        let work = try resolve(p, workspace: ctx.workspace, session: ctx.activeSession)
         guard !work.isEmpty else { return .zero }
         return try ctx.mutate { tx in
             var removed = 0

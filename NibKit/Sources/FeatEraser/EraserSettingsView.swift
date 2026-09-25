@@ -166,7 +166,7 @@ struct EraserSettingsView: View {
                           label: String(localized: "Eraser size"), detents: EraserSettings.presets)
             }
             NibInspectorSection(String(localized: "Erase filter"),
-                                action: NibAction(String(localized: "Highlighter only")) { model.only(.highlighter) }) {
+                                action: NibAction(String(localized: "Erase Highlighter Only")) { model.only(.highlighter) }) {
                 EraserFilterChips(model: model)
             }
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
@@ -246,7 +246,9 @@ struct EraserFilterChips: View {
     private func chips(_ tools: [InkTool]) -> some View {
         ForEach(tools, id: \.self) { tool in
             let on = model.filter.contains(tool)
-            NibChip(tool.eraserFilterTitle, style: .filter(isSelected: on), action: { model.toggle(tool) })
+            // A checkmark carries the on state too: never shade alone.
+            NibChip(tool.eraserFilterTitle, symbol: on ? NibSymbol.checkmark : nil, style: .filter(isSelected: on),
+                    action: { model.toggle(tool) })
                 .accessibilityAddTraits(on ? .isSelected : [])
                 .accessibilityHint(String(localized: "Chooses whether the eraser erases this ink."))
         }
@@ -354,7 +356,7 @@ enum DeleteItemsGroup: String, CaseIterable, Hashable, Identifiable {
 }
 
 /// Delete Specific Items (opened from More through `panel.open`): an opaque sheet with the scope, one switch per kind
-/// of item and a primary button that says how many items go (a dry run of `page.deleteItems`).
+/// of item and a primary button that says how many items go (counted from reads with `PageDeleteItems.resolve`).
 struct DeleteItemsSheet: View {
     let context: PanelContext
     @State private var scope = DeleteItemsScope.page
@@ -401,22 +403,33 @@ struct DeleteItemsSheet: View {
     }
 
     private func recount() async {
-        guard let params = params else {
-            count = 0
-            return
-        }
-        let preview = Invocation(command: "page.deleteItems", params: params, session: context.session, dryRun: true)
-        let result = try? await context.app.bus.execute(preview)
-        count = result?.value["removed"]?.intValue ?? 0
+        count = DeleteItemsSheet.count(params, app: context.app, session: context.session)
+    }
+
+    /// How many items `page.deleteItems` would remove, from reads only (no dry-run transaction).
+    @MainActor static func count(_ params: JSONValue?, app: NibApp, session: EditorSession?) -> Int {
+        guard let params = params, let p = try? params.decode(PageDeleteItems.Params.self),
+              let work = try? PageDeleteItems.resolve(p, workspace: app.workspace, session: session) else { return 0 }
+        return work.reduce(0) { $0 + $1.ids.count }
     }
 
     private func delete() {
         guard let params = params, count > 0 else { return }
-        let n = count
-        context.app.perform("page.deleteItems", params, session: context.session)
-        UIAccessibility.post(notification: .announcement,
-                             argument: n == 1 ? String(localized: "Deleted 1 item. Undo is available.")
-                                              : String(localized: "Deleted \(n) items. Undo is available."))
+        let app = context.app
+        let session = context.session
+        Task { @MainActor in
+            // Announce what was actually removed, once it has been.
+            do {
+                let r = try await app.bus.execute(Invocation(command: "page.deleteItems", params: params, session: session))
+                let n = r.value["removed"]?.intValue ?? 0
+                UIAccessibility.post(notification: .announcement,
+                                     argument: n == 1 ? String(localized: "Deleted 1 item. Undo is available.")
+                                                      : String(localized: "Deleted \(n) items. Undo is available."))
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                                userInfo: ["command": "page.deleteItems", "error": NibError.wrap(error)])
+            }
+        }
         context.dismiss()
     }
 }

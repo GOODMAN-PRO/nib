@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import NibContracts
 import NibTesting
 @testable import FeatEraser
@@ -28,6 +29,14 @@ final class FeatEraserTests: XCTestCase {
     private func items(_ h: Harness, _ page: PageID = Fixtures.page1) throws -> [Item] {
         try h.app.workspace.items(Fixtures.docID, page: page)
     }
+
+    /// Waits (up to 3 s) for queued work such as `app.perform` or the size debounce.
+    private func eventually(_ condition: () -> Bool) async {
+        let deadline = Date().addingTimeInterval(3)
+        while !condition() && Date() < deadline { try? await Task.sleep(nanoseconds: 10_000_000) }
+    }
+
+    private func settle() async { try? await Task.sleep(nanoseconds: 200_000_000) }
 
     private func assertInvalid(_ h: Harness, _ command: String, _ params: JSONValue,
                                file: StaticString = #filePath, line: UInt = #line) async {
@@ -82,6 +91,7 @@ final class FeatEraserTests: XCTestCase {
         let h = Harness(features: [FeatEraserFeature.self])
         let before = try h.snapshot()
         let original = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID)
+        let next = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID).z
         let r = try await h.run("ink.erase", ["page": .string(page1), "path": path([(100, 100), (100, 140)]),
                                               "radius": 3, "mode": "standard"])
         XCTAssertEqual(r, ["removed": 1, "created": 2])
@@ -91,8 +101,9 @@ final class FeatEraserTests: XCTestCase {
         XCTAssertEqual(pieces.count, 2)
         XCTAssertFalse(pieces.contains { $0.id == Fixtures.strokeID })
         XCTAssertEqual(Set(pieces.map { $0.id }).count, 2, "fresh, distinct ids")
+        XCTAssertEqual(Set(pieces.map { $0.z }).count, 2, "every piece has its own z key")
         for piece in pieces {
-            XCTAssertEqual(piece.z, original.z, "pieces stay where the stroke was in the z-order")
+            XCTAssertTrue(piece.z > original.z && piece.z < next, "pieces stay where the stroke was in the z-order")
             XCTAssertEqual(piece.layer, original.layer)
             XCTAssertEqual(piece.stroke?.style, original.stroke?.style)
             XCTAssertEqual(piece.stroke?.t0, original.stroke?.t0)
@@ -173,6 +184,12 @@ final class FeatEraserTests: XCTestCase {
         await assertInvalid(h, "ink.erase", ["page": .string(page1), "path": [], "radius": 3, "mode": "standard"])
         await assertInvalid(h, "ink.erase", ["page": .string(page1), "path": path([(1, 1)]), "radius": 0, "mode": "standard"])
         await assertInvalid(h, "ink.erase", ["page": .string(page1), "path": path([(1, 1)]), "radius": 3, "mode": "pixel"])
+        await assertInvalid(h, "ink.erase", ["page": .string(page1), "path": path([(1, 1)]), "radius": 501, "mode": "standard"])
+        // Over-long paths are refused before any geometry runs.
+        let long = path((0...EraserGeometry.maxPathPoints).map { (Double($0 % 500), 10.0) })
+        await assertInvalid(h, "ink.erase", ["page": .string(page1), "path": long, "radius": 3, "mode": "standard"])
+        await assertInvalid(h, "ink.scribbleErase", ["page": .string(page1), "points": long])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
         do {
             _ = try await h.run("ink.erase", ["page": "page:FIXTUREDOC01/NOSUCHPAGE01", "path": path([(1, 1)]),
                                               "radius": 3, "mode": "standard"])
@@ -251,7 +268,7 @@ final class FeatEraserTests: XCTestCase {
         await assertInvalid(h, "page.deleteItems", ["page": .string(page1), "kinds": ["pen"], "scope": "shelf"])
     }
 
-    func testDeleteItemsSheetBuildsParamsAndCountsWithADryRun() async throws {
+    func testDeleteItemsSheetBuildsParamsAndCountsFromReads() async throws {
         XCTAssertEqual(DeleteItemsGroup.params(doc: Fixtures.docID, page: Fixtures.page1, groups: [.handwriting, .tape], scope: .page),
                        ["page": .string(page1), "kinds": ["pen", "pencil", "tape"], "scope": "page"])
         XCTAssertEqual(DeleteItemsGroup.params(doc: Fixtures.docID, page: nil, groups: [.shapes], scope: .document),
@@ -263,9 +280,13 @@ final class FeatEraserTests: XCTestCase {
         let before = try h.snapshot()
         let params = try XCTUnwrap(DeleteItemsGroup.params(doc: Fixtures.docID, page: Fixtures.page1,
                                                            groups: [.handwriting, .tape], scope: .page))
+        XCTAssertEqual(DeleteItemsSheet.count(params, app: h.app, session: h.session), 2)
         let preview = try await h.app.bus.execute(Invocation(command: "page.deleteItems", params: params, session: h.session, dryRun: true))
-        XCTAssertEqual(preview.value["removed"]?.intValue, 2)
-        XCTAssertEqual(try h.snapshot(), before, "the count comes from a dry run that changes nothing")
+        XCTAssertEqual(preview.value["removed"]?.intValue, 2, "the sheet counts what the command deletes")
+        let whole = DeleteItemsGroup.params(doc: Fixtures.docID, page: nil, groups: [.shapes, .sticky], scope: .document)
+        XCTAssertEqual(DeleteItemsSheet.count(whole, app: h.app, session: h.session), 3)
+        XCTAssertEqual(DeleteItemsSheet.count(nil, app: h.app, session: h.session), 0)
+        XCTAssertEqual(try h.snapshot(), before, "counting changes nothing")
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
     }
 
@@ -298,6 +319,83 @@ final class FeatEraserTests: XCTestCase {
         XCTAssertEqual(h.session.tool, "pen", "Auto-deselect returns to the previous tool")
     }
 
+    func testInkHiddenOnOnePageIsShownAgainWhenTheNextGestureIsOnAnotherPage() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        h.app.settings.set(EraserSettings.size, 6)
+        let host = FakeCanvasHost(h)
+        let tool = EraserTool()
+        tool.activate(host)
+        tool.touchesBegan(CanvasSample(page: Fixtures.page1, location: Point(100, 100)), host: host)
+        tool.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(100, 140))], host: host)
+        tool.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(100, 140)), host: host)
+        let first = try XCTUnwrap(tool.pendingCommit)
+        XCTAssertEqual(host.hidden[Fixtures.page1] ?? [], [Fixtures.strokeID])
+        // The next touch lands on page 2 before the first commit's clean-up ran.
+        tool.touchesBegan(CanvasSample(page: Fixtures.page2, location: Point(50, 50)), host: host)
+        tool.touchesEnded(CanvasSample(page: Fixtures.page2, location: Point(50, 50)), host: host)
+        await first.value
+        await tool.pendingCommit?.value
+        XCTAssertNil(host.hidden[Fixtures.page1], "the first gesture's clean-up shows its page again")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.strokeID))
+        XCTAssertNil(host.hidden[Fixtures.page1], "ink restored by undo is visible")
+    }
+
+    func testTapErasesWhereTheEraserLands() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        h.app.settings.set(EraserSettings.mode, .standard)
+        h.app.settings.set(EraserSettings.size, 6)
+        let host = FakeCanvasHost(h)
+        let tool = EraserTool()
+        tool.activate(host)
+        tool.tap(CanvasSample(page: Fixtures.page1, location: Point(100, 122)), host: host)
+        await tool.pendingCommit?.value
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "one tap, one ink.erase")
+        XCTAssertEqual(try items(h).filter { $0.stroke?.style.tool == .pen }.count, 2, "the tapped stroke is cut there")
+        XCTAssertNil(host.hidden[Fixtures.page1])
+    }
+
+    func testZoomedFarOutALargeEraserStaysWithinWhatInkEraseTakes() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        h.app.settings.set(EraserSettings.size, 60)
+        let host = FakeCanvasHost(h)
+        host.zoomScale = 0.05                                  // 60 pt on screen = a 600 pt radius on the page
+        let tool = EraserTool()
+        tool.activate(host)
+        tool.touchesBegan(CanvasSample(page: Fixtures.page1, location: Point(100, 122)), host: host)
+        tool.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(100, 122)), host: host)
+        await tool.pendingCommit?.value
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "the radius is clamped, so ink.erase accepts it")
+        XCTAssertNil(try items(h).first { $0.id == Fixtures.strokeID })
+    }
+
+    func testAScrubLongerThanOneInkEraseCallIsStillOneUndoStep() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        h.app.settings.set(EraserSettings.mode, .standard)
+        h.app.settings.set(EraserSettings.size, 6)
+        let before = try h.snapshot()
+        let host = FakeCanvasHost(h)
+        let tool = EraserTool()
+        tool.activate(host)
+        func sample(_ x: Double, _ y: Double) -> CanvasSample { CanvasSample(page: Fixtures.page1, location: Point(x, y)) }
+        // Cuts the fixture stroke first, scrubs an empty spot for a whole call's worth of points, then crosses the tape:
+        // the path goes out in two ink.erase calls and each of them erases something.
+        tool.touchesBegan(sample(100, 100), host: host)
+        var moves = [sample(100, 140)]
+        moves += (0..<EraserGeometry.maxPathPoints).map { sample(300, $0 % 2 == 0 ? 300 : 301) }
+        moves += [sample(170, 580), sample(170, 620)]
+        tool.touchesMoved(moves, host: host)
+        tool.touchesEnded(sample(170, 620), host: host)
+        await tool.pendingCommit?.value
+        let left = try items(h)
+        XCTAssertEqual(left.filter { $0.stroke?.style.tool == .pen }.count, 2)
+        XCTAssertFalse(left.contains { $0.id == Fixtures.tapeID }, "the second call erased the tape")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "both calls share one undo group")
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
     func testEraserToolCancelShowsEverythingAndErasesNothing() throws {
         let h = Harness(features: [FeatEraserFeature.self])
         h.app.settings.set(EraserSettings.size, 6)
@@ -311,5 +409,44 @@ final class FeatEraserTests: XCTestCase {
         XCTAssertNil(host.hidden[Fixtures.page1])
         XCTAssertNil(tool.pendingCommit)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    // MARK: Settings model (popover and options bar)
+
+    func testEraserOptionsWriteThroughSettingsKeepOneFilterOnAndNeverWriteBack() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        let model = EraserOptions(app: h.app)
+        var writes: [String] = []
+        let observer = NotificationCenter.default.publisher(for: SettingsStore.didChange, object: h.app.settings)
+            .sink { note in writes.append(note.userInfo?["name"] as? String ?? "") }
+        defer { observer.cancel() }
+
+        model.toggle(.pen)
+        await eventually { !h.app.settings.get(EraserSettings.filterKey(.pen)) }
+        XCTAssertFalse(h.app.settings.get(EraserSettings.filterKey(.pen)), "a chip writes eraser.filter.pen")
+
+        model.only(.highlighter)
+        await eventually { EraserSettings.filter(h.app.settings) == [.highlighter] }
+        XCTAssertEqual(EraserSettings.filter(h.app.settings), [.highlighter], "Erase Highlighter Only")
+        model.toggle(.highlighter)
+        await settle()
+        XCTAssertEqual(model.filter, [.highlighter], "the last filter chip stays on")
+        XCTAssertEqual(EraserSettings.filter(h.app.settings), [.highlighter])
+
+        writes = []
+        model.size = 20
+        model.size = 21
+        model.size = 22
+        await eventually { h.app.settings.get(EraserSettings.size) == 22 }
+        await settle()
+        XCTAssertEqual(h.app.settings.get(EraserSettings.size), 22)
+        XCTAssertEqual(writes.filter { $0 == "eraser.size" }.count, 1, "a slider drag writes once, after it rests")
+
+        writes = []
+        h.app.settings.set(EraserSettings.mode, .precision)
+        await eventually { model.mode == .precision }
+        await settle()
+        XCTAssertEqual(model.mode, .precision, "the model follows the store")
+        XCTAssertEqual(writes, ["eraser.mode"], "reading values back never writes them")
     }
 }
