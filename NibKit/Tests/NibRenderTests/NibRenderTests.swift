@@ -107,6 +107,36 @@ final class NibRenderTests: XCTestCase {
         XCTAssertLessThan(rgb(bmp, 92, 100).r, 100, "next dash drawn")
     }
 
+    func testDottedStrokeDrawsDotsWithOpenGaps() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let style = InkStyle(tool: .pen, pen: .ball, color: RGBA(0, 0, 0), width: 6, pattern: .dotted)
+        let dotted = Item.makeStroke(Stroke(style: style, points: [StrokePoint(x: 20, y: 50), StrokePoint(x: 220, y: 50)]))
+        let (doc, page) = try makePage(h, items: [dotted])
+        let renderer = try XCTUnwrap(h.app.services.renderer)
+        let r = try await renderer.render(RenderRequest(doc: doc, page: page, region: Rect(x: 0, y: 0, width: 240, height: 100),
+                                                        scale: 2))
+        let bmp = bitmap(r.image)
+        // Width 6 → round dots 6 pt wide every 15.01 pt from x = 20: dots centred at x ≈ 80.04 and 95.05.
+        XCTAssertLessThan(rgb(bmp, 160, 100).r, 100, "dot drawn")
+        XCTAssertGreaterThan(rgb(bmp, 175, 100).r, 200, "gap between dots left open")
+        XCTAssertLessThan(rgb(bmp, 190, 100).r, 100, "next dot drawn")
+    }
+
+    func testSpotlightFadesInkWrittenAfterThePlayhead() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let style = InkStyle(tool: .pen, pen: .ball, color: RGBA(0, 0, 0), width: 6)
+        let early = Item.makeStroke(Stroke(style: style, points: [StrokePoint(x: 20, y: 40), StrokePoint(x: 220, y: 40)], t0: 10))
+        let late = Item.makeStroke(Stroke(style: style, points: [StrokePoint(x: 20, y: 120), StrokePoint(x: 220, y: 120)], t0: 30))
+        let (doc, page) = try makePage(h, items: [early, late])
+        let renderer = try XCTUnwrap(h.app.services.renderer)
+        let bmp = bitmap(try await renderer.render(RenderRequest(doc: doc, page: page, scale: 1,
+                                                                 replay: ReplayState(time: 20, mode: .spotlight))).image)
+        XCTAssertLessThan(rgb(bmp, 120, 40).r, 80, "ink written before the playhead is drawn normally")
+        let faded = rgb(bmp, 120, 120).r
+        XCTAssertGreaterThan(faded, 150, "ink written after the playhead is drawn at about 25 %")
+        XCTAssertLessThan(faded, 235, "faded ink is still visible")
+    }
+
     func testBandsPutHighlightersBeneathInkAndApplyReplay() {
         let pts = (0..<10).map { StrokePoint(x: Float(10 + $0 * 5), y: 40, t: Float($0) * 0.02) }
         let pen = Item.makeStroke(Stroke(style: .defaultPen, points: pts, t0: 10))
@@ -236,29 +266,111 @@ final class NibRenderTests: XCTestCase {
         XCTAssertEqual(renderer.tiles.count(page: key), 0)
     }
 
-    func testThumbnailIsCachedOnDiskByRevision() async throws {
+    func testTileCacheRefusesTilesRenderedBeforeAnInvalidation() throws {
+        let cache = TileCache(costLimit: 64 << 20)
+        let image = try XCTUnwrap(PageCompositor.makeContext(width: 4, height: 4)?.makeImage())
+        let rect = Rect(x: 0, y: 0, width: 512, height: 512)
+
+        let stale = cache.generation("D/P")
+        cache.invalidate(page: "D/P", rect: nil)
+        XCTAssertFalse(cache.insert(image, key: "a", page: "D/P", rect: rect, generation: stale))
+        XCTAssertEqual(cache.count(page: "D/P"), 0)
+        XCTAssertTrue(cache.insert(image, key: "a", page: "D/P", rect: rect, generation: cache.generation("D/P")))
+        XCTAssertEqual(cache.count(page: "D/P"), 1)
+
+        let beforePurge = cache.generation("D/P")
+        cache.removeAll()
+        XCTAssertEqual(cache.count(page: "D/P"), 0)
+        XCTAssertFalse(cache.insert(image, key: "b", page: "D/P", rect: rect, generation: beforePurge))
+        XCTAssertEqual(cache.count(page: "D/P"), 0)
+
+        let current = cache.generation("D/P")
+        cache.invalidate(page: "D/Q", rect: nil)
+        XCTAssertTrue(cache.insert(image, key: "c", page: "D/P", rect: rect, generation: current),
+                      "another page's invalidation does not outdate this page")
+    }
+
+    func testCancelledRenderSkipsItsQueuedTiles() async throws {
         let h = Harness(features: [NibRenderFeature.self])
         let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
-        let rendered = await renderer.thumbnail(doc: Fixtures.docID, page: Fixtures.page1, maxPixelSize: 160)
+        let key = TileCache.pageKey(Fixtures.docID, Fixtures.page2)
+        let gate = DispatchSemaphore(value: 0)
+        for _ in 0..<NibPageRenderer.maxWorkers { renderer.queue.addOperation { gate.wait() } }
+        defer { for _ in 0..<NibPageRenderer.maxWorkers { gate.signal() } }
+
+        let task = Task { try await renderer.render(RenderRequest(doc: Fixtures.docID, page: Fixtures.page2, scale: 1)) }
+        for _ in 0..<200 where renderer.queue.operationCount <= NibPageRenderer.maxWorkers {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertGreaterThan(renderer.queue.operationCount, NibPageRenderer.maxWorkers, "tiles wait behind busy workers")
+        task.cancel()
+        for _ in 0..<NibPageRenderer.maxWorkers { gate.signal() }
+        do {
+            _ = try await task.value
+            XCTFail("expected CancellationError")
+        } catch is CancellationError {}
+        XCTAssertEqual(renderer.tiles.count(page: key), 0, "no queued tile was rendered after the cancel")
+    }
+
+    func testThumbnailIsCachedOnDiskByContent() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        let ink = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 20, y: 20), StrokePoint(x: 200, y: 180)]))
+        let (doc, page) = try makePage(h, items: [ink])
+        let rendered = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 160)
         let first = try XCTUnwrap(rendered)
-        XCTAssertEqual(first.height, 160)
-        XCTAssertEqual(first.width, 113)
-        let again = await renderer.thumbnail(doc: Fixtures.docID, page: Fixtures.page1, maxPixelSize: 160)
+        XCTAssertEqual(first.width, 160)
+        XCTAssertEqual(first.height, 133)
+        let again = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 160)
         XCTAssertTrue(again === first, "served from memory")
 
-        let key = ThumbnailCache.Key(doc: Fixtures.docID, page: Fixtures.page1, rev: Rev(wallMs: 1, counter: 0, device: 0),
-                                     size: 160)
-        let file = try XCTUnwrap(renderer.thumbnails.fileURL(key))
-        XCTAssertTrue(file.path.hasSuffix("Nib/previews/FIXTUREDOC01/FIXTUREPG001/000000000001.00000000.00000000-160.png"))
-        for _ in 0..<60 where !FileManager.default.fileExists(atPath: file.path) {
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
+        let file = try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 160))
+        XCTAssertTrue(file.path.contains("Nib/previews/\(doc.raw)/\(page.raw)/"))
+        try await waitForFile(file)
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
 
         renderer.purgeCaches()
-        let reloaded = await renderer.thumbnail(doc: Fixtures.docID, page: Fixtures.page1, maxPixelSize: 160)
-        XCTAssertEqual(reloaded?.height, 160)
-        XCTAssertNil(renderer.thumbnails.fileURL(ThumbnailCache.Key(doc: "../x", page: Fixtures.page1, rev: .zero, size: 1)))
+        let reloaded = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 160)
+        XCTAssertEqual(reloaded?.height, 133)
+        XCTAssertNil(renderer.thumbnails.fileURL(ThumbnailCache.Key(doc: "../x", page: page, rev: .zero, digest: 0, size: 1)))
+
+        // Fixture page 1 lacks its template and most item drawers in this harness: shown, but never persisted.
+        let partialFile = try XCTUnwrap(thumbnailFile(renderer, Fixtures.docID, Fixtures.page1, size: 160))
+        try? FileManager.default.removeItem(at: partialFile)
+        let partial = await renderer.thumbnail(doc: Fixtures.docID, page: Fixtures.page1, maxPixelSize: 160)
+        XCTAssertEqual(partial?.height, 160)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partialFile.path))
+    }
+
+    func testThumbnailFollowsCommitsAndMergesOfOlderRevisions() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        h.app.commands.register(PutStroke.self)
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        let (doc, page) = try makePage(h, items: [])
+        let blankThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 120)
+        let blank = try XCTUnwrap(blankThumb)
+
+        try await h.run("test.putStroke", ["page": .string(NodeRef.page(doc, page).description)])
+        let editedThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 120)
+        let edited = try XCTUnwrap(editedThumb)
+        XCTAssertNotEqual(bitmap(edited).bytes, bitmap(blank).bytes, "a commit re-renders the thumbnail")
+        let editedFile = try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 120))
+        try await waitForFile(editedFile)
+        let newest = try renderer.snapshot(RenderRequest(doc: doc, page: page, scale: 1), needsRev: true).maxRev
+
+        // Ink another device wrote offline before the local edit: merged, yet the page's newest rev does not move.
+        var remote = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 20, y: 150), StrokePoint(x: 220, y: 150)]))
+        remote.rev = Rev(wallMs: 5, counter: 0, device: 8)
+        let merged = h.app.bus.applyRemote(DocumentPatch(doc: doc, items: [page.raw: [remote]]), origin: "device-8")
+        XCTAssertFalse(merged.isEmpty)
+        XCTAssertEqual(try renderer.snapshot(RenderRequest(doc: doc, page: page, scale: 1), needsRev: true).maxRev, newest)
+
+        renderer.purgeCaches()
+        let syncedThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 120)
+        let synced = try XCTUnwrap(syncedThumb)
+        XCTAssertNotEqual(bitmap(synced).bytes, bitmap(edited).bytes, "the merged ink shows, not the stale disk file")
+        XCTAssertNotEqual(try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 120)), editedFile)
     }
 
     // MARK: Performance
@@ -308,6 +420,21 @@ final class NibRenderTests: XCTestCase {
         }
         h.persistence.pageItems[doc] = [page: ordered]
         return (doc, page)
+    }
+
+    /// Where the page's current thumbnail of `size` px lives on disk.
+    private func thumbnailFile(_ renderer: NibPageRenderer, _ doc: DocumentID, _ page: PageID, size: Int) throws -> URL? {
+        let job = try renderer.snapshot(RenderRequest(doc: doc, page: page, scale: 1), needsRev: true)
+        let key = ThumbnailCache.Key(doc: doc, page: page, rev: job.maxRev, digest: job.contentDigest, size: size)
+        XCTAssertTrue(key.fileName.hasPrefix(job.maxRev.description + "-"))
+        return renderer.thumbnails.fileURL(key)
+    }
+
+    /// Thumbnail files are written by a render worker after `thumbnail` returns.
+    private func waitForFile(_ url: URL) async throws {
+        for _ in 0..<60 where !FileManager.default.fileExists(atPath: url.path) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
     }
 
     private func png(_ h: Harness, _ out: JSONValue) -> CGImage? {

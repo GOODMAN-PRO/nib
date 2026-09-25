@@ -73,9 +73,14 @@ struct RenderPage: NibCommand {
                 throw NibError.invalid("region must be [x, y, width, height] with a positive width and height", path: "$.region")
             }
             region = r
+        } else if let s = page.size {
+            region = Rect(x: 0, y: 0, width: s.width, height: s.height)
         } else {
-            let items = try ctx.workspace.items(doc, page: pageID).filter { layers.contains($0.layer) }
-            region = RenderGeometry.defaultRegion(size: page.size, items: items)
+            // A board's content bounds scan every stroke point: off the main actor (ARCHITECTURE §14).
+            let items = try ctx.workspace.items(doc, page: pageID)
+            region = await Task.detached(priority: .userInitiated) {
+                RenderGeometry.defaultRegion(size: nil, bounds: items.compactMap { layers.contains($0.layer) ? $0.bounds : nil })
+            }.value
         }
         let result = try await renderer.render(RenderRequest(
             doc: doc, page: pageID, region: region, scale: cappedScale(requested, region: region), layers: layers,

@@ -35,6 +35,10 @@ struct RenderJob {
     let generation: TileCache.Generation
     /// Highest revision of the page record and its items (thumbnail cache key); page rev unless requested.
     let maxRev: Rev
+    /// FNV-1a digest of every (id, rev) of the page record and its items (thumbnail cache key); 0 unless requested.
+    let contentDigest: UInt64
+    /// Visible items with their bounds, computed once per job by the first worker that needs them.
+    let culled = CulledItems()
 
     var pageKey: String { TileCache.pageKey(doc, page) }
     var pageRect: Rect? { size.map { Rect(x: 0, y: 0, width: $0.width, height: $0.height) } }
@@ -43,6 +47,33 @@ struct RenderJob {
     var visibleItems: [Item] {
         guard annotations else { return [] }
         return allItems.filter { !$0.deleted && layers.contains($0.layer) && !hidden.contains($0.id) }
+    }
+
+    /// `visibleItems` with their bounds (`Stroke.bounds` scans every point), shared by all tiles of the job.
+    var visibleBounds: [(item: Item, bounds: Rect)] {
+        culled.get { visibleItems.map { (item: $0, bounds: $0.bounds) } }
+    }
+
+    /// False when the render lacks a template or an item drawer that may be registered later (plugins, content
+    /// packs): such a render is shown but never persisted as a thumbnail.
+    var isComplete: Bool {
+        if background.kind == .template && template == nil { return false }
+        return visibleItems.allSatisfy { InkBands.kind(of: $0) != .item || registries.drawer(for: $0) != nil }
+    }
+}
+
+/// Lazily computed, lock-protected visible-item bounds of one `RenderJob` (workers render its tiles concurrently).
+final class CulledItems {
+    private let lock = NSLock()
+    private var value: [(item: Item, bounds: Rect)]?
+
+    func get(_ make: () -> [(item: Item, bounds: Rect)]) -> [(item: Item, bounds: Rect)] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let v = value { return v }
+        let v = make()
+        value = v
+        return v
     }
 }
 
@@ -199,15 +230,11 @@ enum SetOfMarks {
     /// Label text height in output pixels.
     static let labelPixels = 13.0
 
-    static func number(_ items: [Item], doc: DocumentID, page: PageID, region: Rect) -> [Mark] {
-        var boxed: [(Item, Rect)] = []
-        for item in items {
-            let b = item.bounds
-            if b.intersects(region) { boxed.append((item, b)) }
-        }
-        let sorted = boxed.sorted { ($0.1.minY, $0.1.minX) < ($1.1.minY, $1.1.minX) }
+    static func number(_ items: [(item: Item, bounds: Rect)], doc: DocumentID, page: PageID, region: Rect) -> [Mark] {
+        let boxed = items.filter { $0.bounds.intersects(region) }
+        let sorted = boxed.sorted { ($0.bounds.minY, $0.bounds.minX) < ($1.bounds.minY, $1.bounds.minX) }
         return sorted.enumerated().map { i, e in
-            Mark(number: i + 1, ref: NodeRef.item(doc, page, e.0.id).description, box: e.1)
+            Mark(number: i + 1, ref: NodeRef.item(doc, page, e.item.id).description, box: e.bounds)
         }
     }
 
@@ -276,7 +303,7 @@ enum PageCompositor {
         if let page = job.pageRect { cg.clip(to: page.cg) }
         let dark = RenderGeometry.isDark(drawBackground(job, region: region, scale: scale, cg: cg))
         let cull = region.insetBy(-RenderGeometry.drawerMargin)
-        let items = job.visibleItems.filter { $0.bounds.intersects(cull) }
+        let items = job.visibleBounds.compactMap { $0.bounds.intersects(cull) ? $0.item : nil }
         for band in InkBands.make(items, replay: job.replay) {
             drawBand(band, job: job, region: region, scale: scale, width: width, height: height, dark: dark, cg: cg)
         }

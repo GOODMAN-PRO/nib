@@ -4,19 +4,23 @@ import ImageIO
 import NibContracts
 
 /// Page thumbnails and previews (library grid, page sidebar): an in-memory `NSCache` in front of PNG files in
-/// `Caches/Nib/previews/<doc>/<page>/<maxRev>-<px>.png`. Keys are made of the ids and the page's highest revision
-/// (page record and items, tombstones included), never Swift `Hasher` values, so a file stays valid across launches
-/// and any edit, undo or synced change produces a new key. Writing a revision removes the page's older files.
+/// `Caches/Nib/previews/<doc>/<page>/<maxRev>-<digest>-<px>.png`. Keys are made of the ids, the page's highest
+/// revision and an FNV-1a digest of every (id, rev) of the page record and its items (tombstones included), never
+/// Swift `Hasher` values, so a file stays valid across launches and any change produces a new key — including a
+/// merged remote record whose rev is older than the page's newest one. Writing a key removes the page's other files.
 final class ThumbnailCache {
     struct Key {
         let doc: DocumentID
         let page: PageID
         let rev: Rev
+        let digest: UInt64
         let size: Int
 
         var pageKey: String { TileCache.pageKey(doc, page) }
-        var memoryKey: String { pageKey + "|" + rev.description + "|" + String(size) }
-        var fileName: String { rev.description + "-" + String(size) + ".png" }
+        /// "<maxRev>-<digest>-": every file of this page content, whatever its size.
+        var contentPrefix: String { rev.description + "-" + String(format: "%016llx", digest) + "-" }
+        var memoryKey: String { pageKey + "|" + contentPrefix + String(size) }
+        var fileName: String { contentPrefix + String(size) + ".png" }
     }
 
     static var defaultDirectory: URL? {
@@ -69,7 +73,7 @@ final class ThumbnailCache {
         } catch {
             return
         }
-        let current = key.rev.description + "-"
+        let current = key.contentPrefix
         for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] where !name.hasPrefix(current) {
             try? fm.removeItem(at: folder.appendingPathComponent(name))
         }
@@ -87,6 +91,27 @@ final class ThumbnailCache {
         index.removeAll()
         lock.unlock()
         memory.removeAllObjects()
+    }
+}
+
+/// FNV-1a 64: a content digest that is stable across launches and devices (Swift `Hasher` is seeded per process).
+struct FNV1a {
+    private(set) var value: UInt64 = 0xcbf2_9ce4_8422_2325
+
+    mutating func add(_ byte: UInt8) { value = (value ^ UInt64(byte)) &* 0x0000_0100_0000_01b3 }
+
+    mutating func add(_ s: String) {
+        for b in s.utf8 { add(b) }
+        add(UInt8(0))
+    }
+
+    mutating func add(_ n: UInt64) {
+        for shift in stride(from: 0, to: 64, by: 8) { add(UInt8(truncatingIfNeeded: n >> UInt64(shift))) }
+    }
+
+    mutating func add(_ r: Rev) {
+        add(r.wallMs)
+        add(UInt64(r.counter) << 32 | UInt64(r.device))
     }
 }
 

@@ -150,13 +150,11 @@ enum RenderGeometry {
     /// Padding around a board's content bounds.
     static let boardPadding = 24.0
 
-    /// Whole page, or for an infinite board the padded bounds of its content.
-    static func defaultRegion(size: PageSize?, items: [Item]) -> Rect {
+    /// Whole page, or for an infinite board the padded union of its items' `bounds` (off-main: strokes are O(points)).
+    static func defaultRegion(size: PageSize?, bounds: [Rect]) -> Rect {
         if let s = size { return Rect(x: 0, y: 0, width: s.width, height: s.height) }
         var union: Rect?
-        for item in items {
-            let b = item.bounds
-            guard !b.isEmpty else { continue }
+        for b in bounds where !b.isEmpty {
             union = union.map { $0.union(b) } ?? b
         }
         return union?.insetBy(-boardPadding) ?? emptyBoard
@@ -255,7 +253,7 @@ final class NibPageRenderer: PageRenderer {
         guard maxPixelSize > 0 else { return nil }
         let request = RenderRequest(doc: doc, page: page, scale: 1, layers: Set(0..<NibLimits.layerCount))
         guard let job = try? await snapshot(request, needsRev: true) else { return nil }
-        let key = ThumbnailCache.Key(doc: doc, page: page, rev: job.maxRev, size: maxPixelSize)
+        let key = ThumbnailCache.Key(doc: doc, page: page, rev: job.maxRev, digest: job.contentDigest, size: maxPixelSize)
         if let image = thumbnails.memoryImage(key) { return image }
         if let image = try? await run({ self.thumbnails.diskImage(key) }) {
             thumbnails.remember(image, key)
@@ -266,7 +264,12 @@ final class NibPageRenderer: PageRenderer {
                                               marks: false) else { return nil }
         let image = result.image
         thumbnails.remember(image, key)
-        queue.addOperation { self.thumbnails.write(image, key) }
+        queue.addOperation {
+            // Not persisted: a render the page changed under (or that a registry change outdated), or one missing
+            // a template or drawer that may be registered later.
+            guard self.tiles.generation(job.pageKey) == job.generation, job.isComplete else { return }
+            self.thumbnails.write(image, key)
+        }
         return image
     }
 
@@ -321,8 +324,15 @@ final class NibPageRenderer: PageRenderer {
         var pdfURL: URL?
         if page.background.kind == .pdf, let ref = page.background.asset { pdfURL = assets?.url(ref, doc: request.doc) }
         var maxRev = page.rev
+        var digest = FNV1a()
         if needsRev {
-            for item in items where item.rev > maxRev { maxRev = item.rev }
+            digest.add(page.id.raw)
+            digest.add(page.rev)
+            for item in items {
+                if item.rev > maxRev { maxRev = item.rev }
+                digest.add(item.id.raw)
+                digest.add(item.rev)
+            }
         }
         let animating = request.replay.map { $0.mode != .showAll } ?? false
         var variant: String?
@@ -338,28 +348,35 @@ final class NibPageRenderer: PageRenderer {
                          pdfURL: pdfURL, allItems: items, layers: layers, hidden: request.hidden,
                          annotations: request.annotations, replay: request.replay, requestedRegion: request.region,
                          assets: assets, registries: registries, pdf: pdf, rasters: rasters, variant: variant,
-                         generation: tiles.generation(pageKey), maxRev: maxRev)
+                         generation: tiles.generation(pageKey), maxRev: maxRev, contentDigest: needsRev ? digest.value : 0)
     }
 
     // MARK: Workers
 
-    /// Runs `work` on the render queue (at most `maxWorkers` at once).
+    /// Runs `work` on the render queue (at most `maxWorkers` at once). If the calling Task is cancelled before a
+    /// worker picks the work up, it is skipped and `CancellationError` is thrown.
     func run<T>(_ work: @escaping () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
-            queue.addOperation {
-                do {
-                    let value = try autoreleasepool { try work() }
-                    continuation.resume(returning: value)
-                } catch {
-                    continuation.resume(throwing: error)
+        let cancelled = CancelFlag()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+                queue.addOperation {
+                    guard !cancelled.isSet else { return continuation.resume(throwing: CancellationError()) }
+                    do {
+                        let value = try autoreleasepool { try work() }
+                        continuation.resume(returning: value)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
+        } onCancel: {
+            cancelled.set()
         }
     }
 
     private func region(for job: RenderJob) async throws -> Rect {
         if let r = job.requestedRegion ?? job.pageRect { return r }
-        return try await run { RenderGeometry.defaultRegion(size: nil, items: job.visibleItems) }
+        return try await run { RenderGeometry.defaultRegion(size: nil, bounds: job.visibleBounds.map { $0.bounds }) }
     }
 
     private struct Composite {
@@ -379,7 +396,7 @@ final class NibPageRenderer: PageRenderer {
                                                    wantMarks: wantMarks)
         if composite == nil {
             composite = try await run {
-                let marks = wantMarks ? SetOfMarks.number(job.visibleItems, doc: job.doc, page: job.page, region: region) : []
+                let marks = wantMarks ? SetOfMarks.number(job.visibleBounds, doc: job.doc, page: job.page, region: region) : []
                 return Composite(image: PageCompositor.image(job, region: region, scale: scale, width: px.width,
                                                              height: px.height, marks: marks),
                                  marks: marks)
@@ -411,6 +428,7 @@ final class NibPageRenderer: PageRenderer {
         }
         if !missing.isEmpty {
             let fresh = await renderTiles(missing, job: job, level: level, variant: variant)
+            try Task.checkCancellation()
             images.merge(fresh) { $1 }
         }
         if !wantMarks, coords.count == 1, let only = images[coords[0]], TileGrid.scale(level: level) == scale,
@@ -419,35 +437,60 @@ final class NibPageRenderer: PageRenderer {
         }
         let placed = coords.compactMap { c in images[c].map { (rect: TileGrid.rect(c, level: level), image: $0) } }
         return try await run {
-            let marks = wantMarks ? SetOfMarks.number(job.visibleItems, doc: job.doc, page: job.page, region: region) : []
+            let marks = wantMarks ? SetOfMarks.number(job.visibleBounds, doc: job.doc, page: job.page, region: region) : []
             return Composite(image: PageCompositor.assemble(placed, region: region, scale: scale, width: width,
                                                             height: height, marks: marks),
                              marks: marks)
         }
     }
 
-    /// Renders tiles concurrently on the render queue and caches them (unless the page changed meanwhile).
+    /// Renders tiles concurrently on the render queue and caches them (unless the page changed meanwhile). Tiles
+    /// not yet started when the calling Task is cancelled are skipped, so a fling does not leave dead work queued.
     private func renderTiles(_ coords: [TileCoord], job: RenderJob, level: Int, variant: String) async -> [TileCoord: CGImage] {
-        await withCheckedContinuation { (continuation: CheckedContinuation<[TileCoord: CGImage], Never>) in
-            let done = RenderedTiles()
-            let group = DispatchGroup()
-            for c in coords {
-                group.enter()
-                queue.addOperation {
-                    autoreleasepool {
-                        let rect = TileGrid.rect(c, level: level)
-                        if let image = PageCompositor.image(job, region: rect, scale: TileGrid.scale(level: level),
-                                                            width: TileGrid.pixels, height: TileGrid.pixels, marks: []) {
-                            self.tiles.insert(image, key: TileCache.key(job.pageKey, variant, level, c), page: job.pageKey,
-                                              rect: rect, generation: job.generation)
-                            done.add(image, at: c)
+        let cancelled = CancelFlag()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<[TileCoord: CGImage], Never>) in
+                let done = RenderedTiles()
+                let group = DispatchGroup()
+                for c in coords {
+                    group.enter()
+                    queue.addOperation {
+                        defer { group.leave() }
+                        guard !cancelled.isSet else { return }
+                        autoreleasepool {
+                            let rect = TileGrid.rect(c, level: level)
+                            if let image = PageCompositor.image(job, region: rect, scale: TileGrid.scale(level: level),
+                                                                width: TileGrid.pixels, height: TileGrid.pixels, marks: []) {
+                                self.tiles.insert(image, key: TileCache.key(job.pageKey, variant, level, c),
+                                                  page: job.pageKey, rect: rect, generation: job.generation)
+                                done.add(image, at: c)
+                            }
                         }
                     }
-                    group.leave()
                 }
+                group.notify(queue: .global(qos: .userInitiated)) { continuation.resume(returning: done.all) }
             }
-            group.notify(queue: .global(qos: .userInitiated)) { continuation.resume(returning: done.all) }
+        } onCancel: {
+            cancelled.set()
         }
+    }
+}
+
+/// Set by a Task's cancellation handler; read by render operations before they start work.
+final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
     }
 }
 
