@@ -103,16 +103,26 @@ final class FeatStudyEditorTests: XCTestCase {
 
     func testReorderAndDeleteUndoStepByStep() async throws {
         let h = harness()
+        // Undo reverts a record only while it still carries the revision its entry wrote (ARCHITECTURE.md §6.3), so
+        // the stacked steps here each write a different card.
         let before = try h.snapshot(Fixtures.studySetID)
         try await h.run("card.move", ["ref": "card:FIXTUREDOC03/FIXTURECRD02"])
         XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card2, Fixtures.card1])
-        try await h.run("card.move", ["ref": "card:FIXTUREDOC03/FIXTURECRD02", "after": "card:FIXTUREDOC03/FIXTURECRD01"])
-        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card1, Fixtures.card2])
+        let moved = try h.snapshot(Fixtures.studySetID)
         try await h.run("card.delete", ["refs": ["card:FIXTUREDOC03/FIXTURECRD01", "card:FIXTUREDOC03/FIXTURECRD01"]])
         XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card2])
-        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 3)
-        for _ in 0..<3 { h.app.bus.undo(Fixtures.studySetID) }
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 2)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertEqual(try h.snapshot(Fixtures.studySetID), moved)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
         XCTAssertEqual(try h.snapshot(Fixtures.studySetID), before)
+
+        try await h.run("card.move", ["ref": "card:FIXTUREDOC03/FIXTURECRD01", "after": "card:FIXTUREDOC03/FIXTURECRD02"])
+        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card2, Fixtures.card1])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertEqual(try h.snapshot(Fixtures.studySetID), before)
+        try await h.run("card.move", ["ref": "card:FIXTUREDOC03/FIXTURECRD02", "after": "card:FIXTUREDOC03/FIXTURECRD01"])
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 0, "a card moved to where it already is writes nothing")
         await expectError(.invalidParams) {
             try await h.run("card.move", ["ref": "card:FIXTUREDOC03/FIXTURECRD01", "after": "FIXTURECRD01"])
         }
