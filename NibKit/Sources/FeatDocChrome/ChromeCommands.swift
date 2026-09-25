@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import NibContracts
+import NibDesign
 
 // MARK: - Placement model
 
@@ -106,12 +107,14 @@ final class ChromeState: ObservableObject {
         tabs[side] = nil
     }
 
-    /// `sidebar.toggle`. The sidebar is the preferred side (NibSettings.sidebarOnRight), or the other side when every
-    /// sidebar panel was moved there. Visible in the requested mode (or no mode given): hide it. Visible in the other
-    /// mode: switch modes. Hidden: show the tab it last showed, else its first tab. Returns the side now shown.
+    /// `sidebar.toggle`. The sidebar is the side that is showing (the preferred side first); with none showing, the
+    /// preferred side (NibSettings.sidebarOnRight), or the other side when every sidebar panel was moved there.
+    /// Visible in the requested mode (or no mode given): hide it. Visible in the other mode: switch modes. Hidden: show
+    /// the tab it last showed, else its first tab. Returns the side now shown.
     func toggleSidebar(mode requested: SidebarMode?, preferred: SidebarSide,
                        available: (SidebarSide) -> [String]) throws -> SidebarSide? {
-        let side = available(preferred).isEmpty && !available(preferred.other).isEmpty ? preferred.other : preferred
+        let side = [preferred, preferred.other].first { tabs[$0] != nil }
+            ?? (available(preferred).isEmpty && !available(preferred.other).isEmpty ? preferred.other : preferred)
         if tabs[side] != nil {
             if let requested, requested != mode {
                 mode = requested
@@ -131,8 +134,8 @@ final class ChromeState: ObservableObject {
         return side
     }
 
-    /// After a placement setting or the registry changed: moves open panels to where they now belong and drops
-    /// panels that are no longer registered (`resolve` returns nil for them).
+    /// After a placement setting, the registry or the document changed: moves open panels to where they now belong
+    /// and drops the ones `resolve` returns nil for (no longer registered, or not for this document's kind).
     func reconcile(_ resolve: (String) -> ChromePlacement?) {
         for id in openPanels {
             guard let target = resolve(id) else {
@@ -141,6 +144,13 @@ final class ChromeState: ObservableObject {
             }
             if placement(of: id) != target { open(id, at: target) }
         }
+    }
+
+    /// `panel.open` with an edge: the floating panel rests on that side edge at the height it was left (the top when it
+    /// never moved). The far-off point is snapped into the floating region wherever it is used.
+    func dock(_ id: String, to edge: SidebarSide) {
+        let far = CGFloat.greatestFiniteMagnitude
+        floatingCentres[id] = CGPoint(x: edge == .left ? -far : far, y: floatingCentres[id]?.y ?? -far)
     }
 
     /// A tap in the chrome is about to run a command: its layout change animates. Changes from the keyboard, the AI,
@@ -157,25 +167,40 @@ final class ChromeState: ObservableObject {
     }
 }
 
-/// One `ChromeState` per window session. Lives in `app.services` under `serviceKey` so the commands reach it.
+/// One `ChromeState` and one `NibInkingState` per window session. Lives in `app.services` under `serviceKey` so the
+/// commands reach it. The Pencil state is also published under `inkingKey` for the canvas to write (DESIGN.md §10.8);
+/// both are dropped once their window has closed.
 @MainActor
 final class ChromeStateStore {
     static let serviceKey = "chrome.state"
     weak var app: NibApp?
-    private var states: [NibID: ChromeState] = [:]
+    private var windows: [NibID: (state: ChromeState, inking: NibInkingState)] = [:]
 
     init(app: NibApp) {
         self.app = app
     }
 
-    func state(for session: EditorSession) -> ChromeState {
-        if let existing = states[session.id] { return existing }
-        if let live = app?.services.sessions.sessions.map({ $0.id }) {
-            states = states.filter { live.contains($0.key) }   // windows that closed
+    /// Where a window's Pencil state lives for the canvas. Filed as a contract request (a ServiceKeys constant or an
+    /// EditorSession property); until it lands the canvas reads this key.
+    static func inkingKey(_ session: NibID) -> String { "chrome.inking." + session.raw }
+
+    func state(for session: EditorSession) -> ChromeState { window(session).state }
+
+    func inking(for session: EditorSession) -> NibInkingState { window(session).inking }
+
+    private func window(_ session: EditorSession) -> (state: ChromeState, inking: NibInkingState) {
+        if let existing = windows[session.id] { return existing }
+        if let app {
+            let live = Set(app.services.sessions.sessions.map { $0.id })
+            for id in Array(windows.keys) where !live.contains(id) {   // windows that closed
+                windows[id] = nil
+                app.services.set(nil, for: ChromeStateStore.inkingKey(id))
+            }
         }
-        let state = ChromeState()
-        states[session.id] = state
-        return state
+        let created = (state: ChromeState(), inking: NibInkingState())
+        windows[session.id] = created
+        app?.services.set(created.inking, for: ChromeStateStore.inkingKey(session.id))
+        return created
     }
 }
 
@@ -210,6 +235,13 @@ enum PanelResolver {
     static func accepts(_ panel: PanelDescriptor, kind: DocumentKind?) -> Bool {
         guard let kinds = panel.docKinds, let kind else { return true }
         return kinds.contains(kind)
+    }
+
+    /// Where an open panel belongs in a document of `kind`; nil closes it (unregistered, or not for this kind).
+    static func target(_ id: String, panels: Registry<PanelDescriptor>, kind: DocumentKind?,
+                       settings: SettingsStore) -> ChromePlacement? {
+        guard let panel = panels.get(id), accepts(panel, kind: kind) else { return nil }
+        return placement(of: panel, settings: settings)
     }
 
     static func preferredSide(_ settings: SettingsStore) -> SidebarSide {
@@ -248,6 +280,7 @@ enum ChromeCommandSupport {
 struct PanelOpen: NibCommand {
     struct Params: Codable {
         var id: String
+        var edge: String?
     }
     struct Output: Codable {
         var id: String
@@ -255,11 +288,22 @@ struct PanelOpen: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "panel.open", title: "Open Panel",
-        summary: "Open a registered panel by id (sidebar tab, floating panel or sheet); it goes where the user's placement settings say.",
-        params: .obj(["id": .str("panel id, e.g. 'chrome.editingSettings' or a plugin panel id")], required: ["id"]),
-        examples: [["id": "chrome.editingSettings"]], effect: .session, target: .app)
+        summary: "Open a registered panel by id where the user's placement settings say; edge docks a floating panel to the left or right edge.",
+        params: .obj(["id": .str("panel id, e.g. 'chrome.editingSettings' or a plugin panel id"),
+                      "edge": .str("floating panels only: the side edge it rests on",
+                                   choices: SidebarSide.allCases.map { $0.rawValue })],
+                     required: ["id"]),
+        examples: [["id": "chrome.editingSettings"], ["id": "dev.example.stats.panel", "edge": "left"]],
+        effect: .session, target: .app)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        var edge: SidebarSide?
+        if let raw = p.edge {
+            guard let parsed = SidebarSide(rawValue: raw) else {
+                throw NibError.invalid("edge must be 'left' or 'right'", path: "$.edge")
+            }
+            edge = parsed
+        }
         let (store, app) = try ChromeCommandSupport.store(ctx)
         let (state, kind) = try ChromeCommandSupport.window(ctx, store)
         guard let panel = app.ui.panels.get(p.id) else {
@@ -275,7 +319,12 @@ struct PanelOpen: NibCommand {
         guard let placement = PanelResolver.placement(of: panel, settings: ctx.services.settings) else {
             throw NibError.invalid("'\(p.id)' is a library panel; it opens in the library, not in a document", path: "$.id")
         }
+        if edge != nil && placement != .floating {
+            throw NibError(.invalidParams, "edge docks floating panels; '\(p.id)' opens as \(placement.rawValue)",
+                           path: "$.edge", hint: "float it with settings.set chrome.panelPlacement.\(p.id) = floating")
+        }
         state.open(panel.id, at: placement)
+        if let edge { state.dock(panel.id, to: edge) }
         return Output(id: panel.id, placement: placement.rawValue)
     }
 }

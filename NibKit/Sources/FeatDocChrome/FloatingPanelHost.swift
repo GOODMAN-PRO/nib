@@ -89,8 +89,8 @@ struct FloatingPanelView: View {
         .simultaneousGesture(TapGesture().onEnded { bringToFront() })
         .accessibilityElement(children: .contain)
         .accessibilityLabel(panel.title)
-        .accessibilityAction(named: Text(String(localized: "Move to Left Edge"))) { dock(atX: region.minX) }
-        .accessibilityAction(named: Text(String(localized: "Move to Right Edge"))) { dock(atX: region.maxX) }
+        .accessibilityAction(named: Text(String(localized: "Move to Left Edge"))) { dock(.left) }
+        .accessibilityAction(named: Text(String(localized: "Move to Right Edge"))) { dock(.right) }
         .position(centre)
     }
 
@@ -102,15 +102,16 @@ struct FloatingPanelView: View {
             break
         case .ended(let location, let velocity):
             let dropped = CGPoint(x: location.x - grab.width, y: location.y - grab.height)
-            chrome.state.floatingCentres[panel.id] = FloatingSnap.rest(centre: dropped, velocity: velocity, size: size,
-                                                                      in: region)
-            bringToFront()
+            let rest = FloatingSnap.rest(centre: dropped, velocity: velocity, size: size, in: region)
+            // The height it was let go at stays with the view; the edge (and bringing it to the front) is panel.open.
+            chrome.state.floatingCentres[panel.id] = rest
+            dock(rest.x < region.midX ? .left : .right)
         }
     }
 
-    private func dock(atX x: CGFloat) {
-        chrome.state.floatingCentres[panel.id] = FloatingSnap.rest(centre: CGPoint(x: x, y: centre.y), size: size,
-                                                                  in: region)
+    /// Through `panel.open`, so the AI, plugins and the bridge can dock a floating panel the same way.
+    private func dock(_ edge: SidebarSide) {
+        chrome.run("panel.open", ["id": .string(panel.id), "edge": .string(edge.rawValue)])
     }
 
     private func bringToFront() {

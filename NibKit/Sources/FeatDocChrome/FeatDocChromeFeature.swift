@@ -29,6 +29,14 @@ public enum FeatDocChromeFeature: NibFeature {
 
     /// More-menu base items (D-080) and the title menu entries that belong to no other feature.
     private static func registerMenus(_ app: NibApp) {
+        // Read-only mode: tapping the title offers Edit (DESIGN.md §14.2).
+        app.ui.menus.register(MenuItemDescriptor(
+            id: "chrome.title.edit", title: String(localized: "Edit"), icon: "lock.open",
+            location: .documentTitle, order: 0, owner: id, command: "view.setReadOnly",
+            params: { _ in ["on": false] },
+            isVisible: { ctx in
+                ctx.session?.readOnly == true && ctx.app.commands.entry("view.setReadOnly") != nil
+            }))
         for direction in ScrollDirection.allCases {
             let horizontal = direction == .horizontal
             app.ui.menus.register(MenuItemDescriptor(
@@ -62,8 +70,10 @@ public enum FeatDocChromeFeature: NibFeature {
             id: "chrome.title.closeOthers", title: String(localized: "Close Other Tabs"), icon: "xmark.square",
             location: .documentTitle, order: 400, owner: id, command: "tab.closeOthers",
             isVisible: { ctx in
-                ctx.app.commands.entry("tab.closeOthers") != nil
-                    && (ctx.app.ui.activeNavigator?.openDocuments.count ?? 0) > 1
+                // The active navigator can belong to another window: count tabs only when it is this one's.
+                guard ctx.app.commands.entry("tab.closeOthers") != nil, let navigator = ctx.app.ui.activeNavigator,
+                      navigator.session === ctx.session else { return false }
+                return navigator.openDocuments.count > 1
             }))
     }
 
@@ -106,36 +116,37 @@ struct EditingSettingsSheet: View {
 
     var body: some View {
         let pages = context.app.ui.settingsPages.all.filter { $0.section == .editing }
-        NavigationStack {
-            Group {
-                if pages.isEmpty {
-                    NibEmptyState(symbol: .settings, title: String(localized: "No editing settings"),
-                                  message: String(localized: "Document editing settings appear here once the Settings feature is installed."))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if pages.count == 1, let page = pages.first {
-                    page.makeView(context.app)
-                        .navigationTitle(page.title)
-                } else {
-                    List {
-                        ForEach(pages, id: \.id) { page in
-                            NavigationLink {
-                                page.makeView(context.app)
-                                    .navigationTitle(page.title)
-                            } label: {
-                                NibRow(page.title, icon: NibSymbol(systemName: page.icon))
-                            }
-                        }
+        VStack(spacing: 0) {
+            NibSheetHeader(String(localized: "Document Editing"), cancelTitle: String(localized: "Done"),
+                           onCancel: { context.dismiss() })
+            NavigationStack {
+                content(pages)
+                    .toolbar(.hidden, for: .navigationBar)
+            }
+        }
+    }
+
+    /// Settings pages push with their own navigation bar; the root sits under the sheet header.
+    @ViewBuilder
+    private func content(_ pages: [SettingsPageDescriptor]) -> some View {
+        if pages.isEmpty {
+            NibEmptyState(symbol: .settings, title: String(localized: "No editing settings"),
+                          message: String(localized: "Document editing settings appear here once the Settings feature is installed."))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if pages.count == 1, let page = pages.first {
+            page.makeView(context.app)
+        } else {
+            List {
+                ForEach(pages, id: \.id) { page in
+                    NavigationLink {
+                        page.makeView(context.app)
+                            .navigationTitle(page.title)
+                    } label: {
+                        NibRow(page.title, icon: NibSymbol(systemName: page.icon))
                     }
-                    .listStyle(.insetGrouped)
-                    .navigationTitle(String(localized: "Document Editing"))
                 }
             }
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(String(localized: "Done")) { context.dismiss() }
-                }
-            }
+            .listStyle(.insetGrouped)
         }
     }
 }
@@ -184,7 +195,8 @@ struct MoveDocumentSheet: View {
         let current = doc.flatMap { library?.node($0)?.parent }
         let folders = (library?.allNodes() ?? []).filter { $0.kind == .folder }
             .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-        NavigationStack {
+        VStack(spacing: 0) {
+            NibSheetHeader(String(localized: "Move to Folder"), onCancel: { context.dismiss() })
             List {
                 row(String(localized: "Library"), subtitle: nil, symbol: .library, folder: nil, current: current)
                 ForEach(folders) { folder in
@@ -192,13 +204,6 @@ struct MoveDocumentSheet: View {
                 }
             }
             .listStyle(.insetGrouped)
-            .navigationTitle(String(localized: "Move to Folder"))
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(String(localized: "Cancel")) { context.dismiss() }
-                }
-            }
         }
     }
 

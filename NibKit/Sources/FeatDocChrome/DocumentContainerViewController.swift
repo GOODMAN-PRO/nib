@@ -114,9 +114,6 @@ final class ChromeContext {
         self.navigator = navigator
     }
 
-    /// Where the window's Pencil state lives for the canvas to write (`NibInkingState`, read by the droplet container).
-    static func inkingKey(_ session: EditorSession) -> String { "chrome.inking." + session.id.raw }
-
     var docRef: String { NodeRef.document(doc).description }
 
     func has(_ command: String) -> Bool { app.commands.entry(command) != nil }
@@ -149,11 +146,24 @@ final class ChromeContext {
         PanelContext(app: app, session: session, navigator: navigator, dismiss: { [weak self] in self?.closePanel(id) })
     }
 
-    /// A panel's own Close (and swiping a sheet away): the layout updates at once, then `panel.close` runs so hooks,
-    /// plugins and the bridge see the same call.
+    /// A panel's own Close runs `panel.close`, so hooks, plugins and the bridge see what closed.
     func closePanel(_ id: String) {
+        tap("panel.close", ["id": .string(id)])
+    }
+
+    /// Swiping a sheet or cover away: SwiftUI needs its binding to settle at once, so the state closes first and
+    /// `panel.close` follows.
+    func dismissPanel(_ id: String) {
         state.close(id)
         run("panel.close", ["id": .string(id)])
+    }
+
+    /// Open panels move to where the settings now put them; unregistered panels and panels a document of `kind` does
+    /// not take (left open by the document this window showed before) close.
+    func reconcile(kind: DocumentKind) {
+        let panels = app.ui.panels
+        let settings = app.settings
+        state.reconcile { PanelResolver.target($0, panels: panels, kind: kind, settings: settings) }
     }
 
     /// Native panels get the chrome's header; plugin panels draw theirs (NibPluginPanelChrome, F081).
@@ -170,7 +180,8 @@ final class ChromeContext {
         }
     }
 
-    /// Back to the library, in the document's folder. `library.setView` (F019) runs when it is installed.
+    /// Back to the library, in the document's folder. `library.setView` (F019) runs when it is installed; returning the
+    /// window to the library has no command yet (contract request), so the navigator does it.
     func goToLibrary() {
         let folder = app.services.library?.node(doc)?.parent
         if has("library.setView") {
@@ -213,6 +224,8 @@ final class ChromeDocumentModel: ObservableObject {
     @Published private(set) var snapshot: Snapshot
     /// Bumped when a registry or a setting changes, so nav items, menus and panels are rebuilt.
     @Published private(set) var revision = 0
+    /// The document's live pages in order, re-read on commits (not published: the backdrop reads them while scrolling).
+    private(set) var pages: [PageRecord] = []
     private let chrome: ChromeContext
     private var page: PageID?
     private var readOnly: Bool
@@ -225,13 +238,22 @@ final class ChromeDocumentModel: ObservableObject {
         page = session.page
         readOnly = session.readOnly
         tool = session.tool
-        snapshot = ChromeDocumentModel.read(chrome, page: session.page, readOnly: session.readOnly, tool: session.tool)
+        let (first, live) = ChromeDocumentModel.read(chrome, page: session.page, readOnly: session.readOnly,
+                                                     tool: session.tool)
+        snapshot = first
+        pages = live
+        // The window's chrome state outlives its documents: drop what this document's kind does not take.
+        chrome.reconcile(kind: first.kind)
         observe()
     }
 
     func refresh() {
-        let next = ChromeDocumentModel.read(chrome, page: page, readOnly: readOnly, tool: tool)
-        if next != snapshot { snapshot = next }
+        let (next, live) = ChromeDocumentModel.read(chrome, page: page, readOnly: readOnly, tool: tool)
+        pages = live
+        guard next != snapshot else { return }
+        let kindChanged = next.kind != snapshot.kind
+        snapshot = next
+        if kindChanged { chrome.reconcile(kind: next.kind) }
     }
 
     private func observe() {
@@ -278,31 +300,29 @@ final class ChromeDocumentModel: ObservableObject {
 
     /// A panel placement, the sidebar side or the registries changed: open panels move to where they now belong.
     private func configurationChanged() {
-        let app = chrome.app
-        let settings = app.settings
-        chrome.state.reconcile { id in
-            app.ui.panels.get(id).flatMap { PanelResolver.placement(of: $0, settings: settings) }
-        }
+        chrome.reconcile(kind: snapshot.kind)
         revision &+= 1
         refresh()
     }
 
-    private static func read(_ chrome: ChromeContext, page: PageID?, readOnly: Bool, tool: String) -> Snapshot {
+    private static func read(_ chrome: ChromeContext, page: PageID?, readOnly: Bool,
+                             tool: String) -> (Snapshot, [PageRecord]) {
         let app = chrome.app
         let content = try? app.workspace.content(chrome.doc)
         let library = app.services.library
         let node = library?.node(chrome.doc)
         let pages = content?.livePages ?? []
         let index = page.flatMap { id in pages.firstIndex { $0.id == id } }
-        return Snapshot(title: node?.title ?? String(localized: "Untitled"),
-                        folder: node?.parent.flatMap { library?.node($0)?.title },
-                        kind: content?.meta.kind ?? .notebook,
-                        page: page,
-                        pageIndex: index,
-                        pageCount: pages.count,
-                        bookmarked: index.map { pages[$0].bookmarked } ?? false,
-                        readOnly: readOnly,
-                        tool: tool)
+        let snapshot = Snapshot(title: node?.title ?? String(localized: "Untitled"),
+                                folder: node?.parent.flatMap { library?.node($0)?.title },
+                                kind: content?.meta.kind ?? .notebook,
+                                page: page,
+                                pageIndex: index,
+                                pageCount: pages.count,
+                                bookmarked: index.map { pages[$0].bookmarked } ?? false,
+                                readOnly: readOnly,
+                                tool: tool)
+        return (snapshot, pages)
     }
 }
 
@@ -314,18 +334,28 @@ final class ChromeBackdrop: ObservableObject {
     /// Paper lightness per template and parameters (rendering a template once is enough).
     private var tones: [String: Bool] = [:]
 
-    func update(chrome: ChromeContext, in view: UIView) {
-        guard let host = chrome.session.editor?.canvasHost, let content = try? chrome.app.workspace.content(chrome.doc) else {
+    /// `live`: the document's pages in order; `current`: the index of the session's page. Pages lie in order, so the
+    /// visible ones are a run around the current page: the walk stops at the first page off screen on each side, and a
+    /// scroll tick costs the visible pages, not the document.
+    func update(chrome: ChromeContext, live: [PageRecord], current: Int?, in view: UIView) {
+        guard let host = chrome.session.editor?.canvasHost, !live.isEmpty else {
             if !pages.isEmpty { pages = [] }
             return
         }
         let source: UIView = (host as? UIViewController)?.view ?? host.canvasView
-        var frames: [CGRect] = []
-        for page in content.livePages {
-            guard let frame = host.pageFrame(page.id) else { continue }
+        func visibleFrame(_ index: Int) -> CGRect? {
+            guard let frame = host.pageFrame(live[index].id) else { return nil }
             let rect = source.convert(frame, to: view)
-            guard rect.intersects(view.bounds), isLight(page, app: chrome.app) else { continue }
-            frames.append(rect)
+            return rect.intersects(view.bounds) ? rect : nil
+        }
+        let start = min(max(current ?? 0, 0), live.count - 1)
+        var low = start
+        while low > 0, visibleFrame(low - 1) != nil { low -= 1 }
+        var high = start
+        while high < live.count - 1, visibleFrame(high + 1) != nil { high += 1 }
+        let frames = (low...high).compactMap { index -> CGRect? in
+            guard let rect = visibleFrame(index), isLight(live[index], app: chrome.app) else { return nil }
+            return rect
         }
         if frames != pages { pages = frames }
     }
@@ -398,9 +428,8 @@ final class DocumentContainerViewController: UIViewController {
         self.model = ChromeDocumentModel(chrome: chrome)
         self.geometry = ChromeGeometry()
         self.backdrop = ChromeBackdrop()
-        self.inking = NibInkingState()
+        self.inking = store.inking(for: session)
         super.init(nibName: nil, bundle: nil)
-        app.services.set(inking, for: ChromeContext.inkingKey(session))
     }
 
     required init?(coder: NSCoder) { return nil }
@@ -434,7 +463,8 @@ final class DocumentContainerViewController: UIViewController {
         geometry.update(size: view.bounds.size, safeArea: view.safeAreaInsets)
     }
 
-    /// P-106. Takes effect wherever the window's root forwards `childForStatusBarHidden` to its content.
+    /// P-106. Takes effect once the window's root forwards `childForStatusBarHidden` to its content (the shell does not
+    /// yet: filed as a contract request).
     override var prefersStatusBarHidden: Bool { chrome.app.settings.get(NibSettings.hideStatusBar) }
 
     override var preferredStatusBarUpdateAnimation: UIStatusBarAnimation { .fade }
@@ -466,7 +496,7 @@ final class DocumentContainerViewController: UIViewController {
 
     private func updateBackdrop() {
         guard isViewLoaded else { return }
-        backdrop.update(chrome: chrome, in: view)
+        backdrop.update(chrome: chrome, live: model.pages, current: model.snapshot.pageIndex, in: view)
     }
 }
 
@@ -535,7 +565,8 @@ struct ChromeRootView: View {
 
     /// Sidebar tabs are the 240 pt navigator; a docked floating panel (the assistant, plugins) keeps its 344 / 420.
     private func sidebarWidth(_ side: SidebarSide) -> CGFloat? {
-        guard let id = state.tabs[side], let panel = chrome.app.ui.panels.get(id) else { return nil }
+        guard let id = state.tabs[side], let panel = chrome.app.ui.panels.get(id),
+              PanelResolver.accepts(panel, kind: model.snapshot.kind) else { return nil }
         return panel.placement == .sidebarTab ? NibMetrics.navigatorWidth : NibMetrics.panelWidth(typeSize)
     }
 
@@ -556,8 +587,8 @@ struct ChromeRootView: View {
                                    size: floatingSize(layout))
             }
             NavBarView(chrome: chrome, items: items, title: snapshot.title, subtitle: NavBarModel.subtitle(snapshot),
-                       titleHasMenu: !chrome.menuItems(.documentTitle).isEmpty, compact: layout.isCompact,
-                       sidebarMode: state.mode, openMenu: $openMenu)
+                       readOnly: snapshot.readOnly, titleHasMenu: !chrome.menuItems(.documentTitle).isEmpty,
+                       compact: layout.isCompact, sidebarMode: state.mode, openMenu: $openMenu)
                 .frame(width: layout.bar.width, height: layout.bar.height)
                 .position(x: layout.bar.midX, y: layout.bar.midY)
             ChromePopovers(openMenu: $openMenu, documentTitle: snapshot.title,
@@ -593,9 +624,12 @@ struct ChromeRootView: View {
         return [preferred, preferred.other].first { state.tabs[$0] != nil }
     }
 
+    /// A panel another document's kind left open is never shown (reconciling closes it).
     private func sidebarContent(_ side: SidebarSide) -> (tabs: [PanelDescriptor], selected: PanelDescriptor)? {
-        guard let id = state.tabs[side], let selected = chrome.app.ui.panels.get(id) else { return nil }
-        let tabs = chrome.sidebarTabs(side, kind: model.snapshot.kind)
+        let kind = model.snapshot.kind
+        guard let id = state.tabs[side], let selected = chrome.app.ui.panels.get(id),
+              PanelResolver.accepts(selected, kind: kind) else { return nil }
+        let tabs = chrome.sidebarTabs(side, kind: kind)
         return (tabs.contains(where: { $0.id == id }) ? tabs : [selected] + tabs, selected)
     }
 
@@ -626,7 +660,7 @@ struct ChromeRootView: View {
             for item in overflow {
                 switch item.action {
                 case .command(let command, let params):
-                    rows.append(ChromeMenuRow(id: item.id, title: item.title, symbol: item.symbol) {
+                    rows.append(ChromeMenuRow(id: item.id, title: item.title, symbol: item.symbol, isOn: item.isOn) {
                         openMenu = nil
                         chrome.tap(command, params)
                     })
@@ -684,16 +718,16 @@ struct ChromeRootView: View {
     private func dismiss(_ sheet: PresentedSheet) {
         switch sheet {
         case .modal(let id), .floating(let id):
-            chrome.closePanel(id)
+            chrome.dismissPanel(id)
         case .sidebar(let side):
-            if let id = state.tabs[side] { chrome.closePanel(id) }
+            if let id = state.tabs[side] { chrome.dismissPanel(id) }
         }
     }
 
     private var coverBinding: Binding<Bool> {
         let id = state.cover
         return Binding(get: { id != nil }, set: { shown in
-            if !shown, let id { chrome.closePanel(id) }
+            if !shown, let id { chrome.dismissPanel(id) }
         })
     }
 

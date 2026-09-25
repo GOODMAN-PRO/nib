@@ -35,7 +35,6 @@ struct NavItem: Identifiable, Equatable {
     var isOn = false
     var order: Int
     var action: Action
-    var shortcut: KeyShortcut? = nil
 }
 
 struct NavBarItems: Equatable {
@@ -99,9 +98,9 @@ enum NavBarModel {
         leading.append(NavItem(id: library, title: String(localized: "Library"), symbol: .back, order: 0,
                                action: .library))
         if input.hasSidebar && !taken("sidebar.toggle") {
+            // ⌃⌘S and its ⌘-hold entry come from the registered key command, not a second SwiftUI shortcut here.
             leading.append(NavItem(id: sidebar, title: String(localized: "Sidebar"), symbol: .sidebar,
-                                   isOn: input.sidebarVisible, order: 100, action: .command("sidebar.toggle", [:]),
-                                   shortcut: ChromeShortcuts.sidebar))
+                                   isOn: input.sidebarVisible, order: 100, action: .command("sidebar.toggle", [:])))
         }
         if input.commandExists("search.open") && !taken("search.open") {
             leading.append(NavItem(id: search, title: String(localized: "Search"), symbol: .search, order: 200,
@@ -215,19 +214,6 @@ enum NavBarModel {
     }
 }
 
-extension KeyShortcut {
-    /// The SwiftUI form, so the button shows its `KeyHint` on hover and while ⌘ is held.
-    var keyboardShortcut: KeyboardShortcut? {
-        guard key.count == 1, let character = key.first else { return nil }
-        var flags: EventModifiers = []
-        if modifiers.contains(.command) { flags.insert(.command) }
-        if modifiers.contains(.shift) { flags.insert(.shift) }
-        if modifiers.contains(.option) { flags.insert(.option) }
-        if modifiers.contains(.control) { flags.insert(.control) }
-        return KeyboardShortcut(KeyEquivalent(character), modifiers: flags)
-    }
-}
-
 // MARK: - Nav bar view
 
 /// Three Clear bar droplets: leading actions, the title (tap for the document menu) and trailing menus. In compact
@@ -237,6 +223,7 @@ struct NavBarView: View {
     let items: NavBarItems
     let title: String
     let subtitle: String?
+    let readOnly: Bool
     let titleHasMenu: Bool
     let compact: Bool
     let sidebarMode: SidebarMode
@@ -269,12 +256,26 @@ struct NavBarView: View {
             Button {
                 toggle(.title)
             } label: {
-                NibBarTitle(title: title, subtitle: subtitle)
+                titleLabel
             }
             .buttonStyle(NibPressStyle(shape: Capsule()))
             .nibBudAnchor(ChromeMenu.title.anchor)
             .accessibilityHint(String(localized: "Opens the document menu"))
         } else {
+            titleLabel
+        }
+    }
+
+    /// Read only: `lock` on the subtitle's line (DESIGN.md §14.2); the subtitle says it, so VoiceOver skips the glyph.
+    private var titleLabel: some View {
+        HStack(alignment: .lastTextBaseline, spacing: NibSpacing.xs) {
+            if readOnly {
+                Image(nib: .lock)
+                    .font(NibFont.caption1Emphasis)
+                    .foregroundStyle(NibColor.label)
+                    .padding(.leading, NibSpacing.s)
+                    .accessibilityHidden(true)
+            }
             NibBarTitle(title: title, subtitle: subtitle)
         }
     }
@@ -289,8 +290,7 @@ struct NavBarView: View {
                 .nibBudAnchor(menu.anchor)
         case .command(let command, let params):
             if item.id == NavBarModel.sidebar {
-                NibToolbarItem(item.symbol, label: item.title, isOn: item.isOn,
-                               shortcut: item.shortcut?.keyboardShortcut) { chrome.tap(command, params) }
+                NibToolbarItem(item.symbol, label: item.title, isOn: item.isOn) { chrome.tap(command, params) }
                     .contextMenu { sidebarModes(command, visible: item.isOn) }
             } else {
                 NibToolbarItem(item.symbol, label: item.title, isOn: item.isOn) { chrome.tap(command, params) }
@@ -338,6 +338,8 @@ struct ChromeMenuRow: Identifiable {
     var destructive = false
     /// Rows with the same section are grouped under it (a menu item's `submenu`).
     var section: String? = nil
+    /// A toggle that moved into More (Sidebar, Read Only, Bookmark): a checkmark while it is on.
+    var isOn = false
     let action: () -> Void
 }
 
@@ -372,7 +374,8 @@ struct ChromePopovers: View {
             ForEach(ChromeMenu.allCases) { menu in
                 NibBudPopover(id: "chrome.popover." + menu.rawValue, source: menu.anchor,
                               isPresented: presented(menu), title: title(menu), width: width, placement: .below) {
-                    ChromeMenuList(rows: rows(menu))
+                    // Only the open menu builds its rows: every entry's isVisible and params run per build.
+                    if openMenu == menu { ChromeMenuList(rows: rows(menu)) }
                 }
             }
         }
@@ -436,11 +439,18 @@ struct ChromeMenuList: View {
                             .foregroundStyle(row.destructive ? NibColor.destructive : NibColor.label)
                             .multilineTextAlignment(.leading)
                         Spacer(minLength: NibSpacing.s)
+                        if row.isOn {
+                            Image(nib: .checkmark)
+                                .font(NibFont.glyph(.panel))
+                                .foregroundStyle(NibColor.accent)
+                                .accessibilityHidden(true)
+                        }
                     }
                     .frame(minHeight: NibMetrics.hitTarget)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)))
+                .accessibilityAddTraits(row.isOn ? .isSelected : [])
             }
         }
     }

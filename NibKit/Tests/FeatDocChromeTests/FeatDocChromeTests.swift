@@ -119,6 +119,53 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(state.floating, ["chat", "pages"], "opening a floating panel again brings it to the front")
     }
 
+    func testSidebarToggleActsOnTheSideThatIsShowing() throws {
+        // D-136 + D-117: the sidebar belongs on the left, but Outline was moved to the right and is open.
+        let state = ChromeState()
+        state.open("outline", at: .right)
+        let available: (SidebarSide) -> [String] = { $0 == .left ? ["pages"] : ["outline"] }
+
+        XCTAssertEqual(try state.toggleSidebar(mode: .window, preferred: .left, available: available), .right)
+        XCTAssertEqual(state.mode, .window)
+        XCTAssertEqual(state.tabs[.right], "outline")
+        XCTAssertNil(state.tabs[.left], "switching modes never opens the other side")
+
+        XCTAssertNil(try state.toggleSidebar(mode: nil, preferred: .left, available: available))
+        XCTAssertTrue(state.tabs.isEmpty, "the side that shows hides")
+    }
+
+    func testAContainerClosesPanelsItsDocumentKindDoesNotTake() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        h.app.ui.panels.register(panel("test.pages", .sidebarTab, kinds: [.notebook]))
+        h.app.ui.panels.register(panel("test.timer", .floating, kinds: [.notebook]))
+        h.app.ui.panels.register(panel("test.chat", .floating))
+        let state = try chromeState(h)
+        try await h.run("panel.open", ["id": "test.pages"])
+        try await h.run("panel.open", ["id": "test.timer"])
+        try await h.run("panel.open", ["id": "test.chat"])
+        XCTAssertEqual(state.openPanels, ["test.pages", "test.timer", "test.chat"])
+
+        // Back to the library, then a whiteboard in the same window: its chrome state carries over.
+        h.session.document = Fixtures.whiteboardID
+        _ = DocumentContainerViewController(editor: UIViewController(), document: Fixtures.whiteboardID, app: h.app,
+                                            navigator: TestNavigator(session: h.session))
+        XCTAssertEqual(state.openPanels, ["test.chat"])
+    }
+
+    func testInkingStateIsPublishedPerWindowAndDroppedWhenTheWindowCloses() throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let store = try XCTUnwrap(h.app.services.get(ChromeStateStore.serviceKey, as: ChromeStateStore.self))
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+        let inking = store.inking(for: other)
+        XCTAssertTrue(h.app.services.get(ChromeStateStore.inkingKey(other.id), as: AnyObject.self) === inking)
+
+        h.app.services.sessions.remove(other)
+        _ = store.state(for: h.session)
+        XCTAssertNil(h.app.services.get(ChromeStateStore.inkingKey(other.id), as: AnyObject.self))
+        XCTAssertNotNil(h.app.services.get(ChromeStateStore.inkingKey(h.session.id), as: AnyObject.self))
+    }
+
     // MARK: Commands
 
     func testPanelCommandsPlacePanelsWhereTheSettingsSay() async throws {
@@ -151,6 +198,17 @@ final class FeatDocChromeTests: XCTestCase {
         r = try await h.run("panel.open", ["id": "test.chat"], as: .ai("chat1"))
         XCTAssertEqual(r["placement"], "floating")
         XCTAssertEqual(state.floating, ["test.pages", "test.chat"])
+
+        // Docking to an edge is a command too (dragging and the VoiceOver actions run it).
+        try await h.run("panel.open", ["id": "test.chat", "edge": "left"], as: .ai("chat1"))
+        let docked = try XCTUnwrap(state.floatingCentres["test.chat"])
+        XCTAssertEqual(FloatingSnap.rest(centre: docked, size: CGSize(width: 344, height: 560),
+                                         in: CGRect(x: 16, y: 88, width: 1162, height: 726)),
+                       CGPoint(x: 188, y: 368))
+        XCTAssertEqual(state.floating, ["test.pages", "test.chat"])
+        await assertCode(.invalidParams) {
+            try await h.run("panel.open", ["id": "chrome.editingSettings", "edge": "left"])
+        }
 
         r = try await h.run("panel.close", ["id": "test.chat"])
         XCTAssertEqual(r["closed"], true)
@@ -249,6 +307,32 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertTrue(compact.overflow.map(\.id).contains(NavBarModel.addPage))
     }
 
+    func testTitleMenuOffersEditWhileReadOnlyAndCountsThisWindowsTabs() {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        for id in ["view.setReadOnly", "tab.closeOthers"] {
+            h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "test double", effect: .session,
+                                                      target: .app)) { _, _ in .object([:]) }
+        }
+        let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID)
+        XCTAssertEqual(h.app.ui.menuItems(.documentTitle, context).map(\.id), [])
+
+        h.session.readOnly = true
+        let edit = h.app.ui.menuItems(.documentTitle, context).first
+        XCTAssertEqual(edit?.id, "chrome.title.edit")
+        XCTAssertEqual(edit?.command, "view.setReadOnly")
+        XCTAssertEqual(edit?.params(context), ["on": false])
+
+        // Close Other Tabs counts this window's tabs, not those of whichever window was active last.
+        let elsewhere = TestNavigator(session: EditorSession())
+        elsewhere.openDocuments = [Fixtures.docID, Fixtures.textDocID]
+        h.app.ui.activeNavigator = elsewhere
+        XCTAssertFalse(h.app.ui.menuItems(.documentTitle, context).map(\.id).contains("chrome.title.closeOthers"))
+        let here = TestNavigator(session: h.session)
+        here.openDocuments = [Fixtures.docID, Fixtures.textDocID]
+        h.app.ui.activeNavigator = here
+        XCTAssertTrue(h.app.ui.menuItems(.documentTitle, context).map(\.id).contains("chrome.title.closeOthers"))
+    }
+
     func testSubtitleShowsFolderPageAndReadOnly() {
         var snapshot = ChromeDocumentModel.Snapshot(title: "Kinematics", folder: "Physics 9702", kind: .notebook,
                                                     page: Fixtures.page1, pageIndex: 2, pageCount: 12,
@@ -272,6 +356,25 @@ final class FeatDocChromeTests: XCTestCase {
         let context = ChromeContext(app: h.app, doc: Fixtures.docID, session: h.session, state: state ?? ChromeState(),
                                     navigator: navigator)
         context.goToLibrary()
+        XCTAssertEqual(navigator.shownLibrary, [Fixtures.folderID])
+    }
+
+    func testBackRunsLibrarySetViewWhenItIsInstalled() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        let log = CallLog()
+        let ran = expectation(description: "library.setView ran")
+        h.app.commands.register(CommandDescriptor(id: "library.setView", title: "Library", summary: "test double",
+                                                  effect: .session, target: .app)) { params, _ in
+            log.params.append(params)
+            ran.fulfill()
+            return .object([:])
+        }
+        let navigator = TestNavigator(session: h.session)
+        let context = ChromeContext(app: h.app, doc: Fixtures.docID, session: h.session, state: try chromeState(h),
+                                    navigator: navigator)
+        context.goToLibrary()
+        await fulfillment(of: [ran], timeout: 5)
+        XCTAssertEqual(log.params, [["folder": "folder:FIXTUREFLD01"]])
         XCTAssertEqual(navigator.shownLibrary, [Fixtures.folderID])
     }
 
@@ -299,6 +402,11 @@ final class FeatDocChromeTests: XCTestCase {
             XCTFail("unexpected \(error)", file: file, line: line)
         }
     }
+}
+
+@MainActor
+private final class CallLog {
+    var params: [JSONValue] = []
 }
 
 @MainActor

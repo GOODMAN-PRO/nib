@@ -29,13 +29,8 @@ struct SidebarPanelView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 0) {
-            Text(selected.title)
-                .font(NibFont.headline)
-                .foregroundStyle(NibColor.label)
-                .lineLimit(1)
-                .accessibilityAddTraits(.isHeader)
-            Spacer(minLength: NibSpacing.s)
+        NibPanelHeader(title: selected.title, symbol: NibSymbol(systemName: selected.icon) ?? .puzzle,
+                       onClose: { chrome.closePanel(selected.id) }) {
             if showsModeToggle {
                 let next: SidebarMode = mode == .window ? .sidebar : .window
                 NibIconButton(next == .sidebar ? NibSymbol.sidebar : NibSymbol.pages,
@@ -45,13 +40,7 @@ struct SidebarPanelView: View {
                 }
             }
             PanelPlacementMenu(chrome: chrome, panel: selected, current: side.placement)
-            NibIconButton(.xmark, label: String(localized: "Close Sidebar"), size: .round) {
-                chrome.tap("panel.close", ["id": .string(selected.id)])
-            }
         }
-        .padding(.leading, NibSpacing.l)
-        .padding(.trailing, NibSpacing.xs)
-        .frame(minHeight: NibMetrics.hitTarget + NibSpacing.m)
     }
 
     /// Up to three tabs as a segmented control (Pages · Outline · Search); more as a strip of glyphs.
