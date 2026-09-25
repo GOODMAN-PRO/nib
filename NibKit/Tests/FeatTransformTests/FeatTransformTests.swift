@@ -182,7 +182,7 @@ final class FeatTransformTests: XCTestCase {
         let h = Harness(features: [FeatTransformFeature.self])
         let strokes = (0..<5_000).map { i -> Item in
             let x = Float(i % 100) * 5, y = Float(i / 100) * 5
-            return Item(kind: .stroke, z: String(format: "V%05d1", i),
+            return Item(kind: .stroke, z: "V" + String(100_000 + i) + "1",
                         stroke: Stroke(style: .defaultPen, points: [StrokePoint(x: x, y: y), StrokePoint(x: x + 3, y: y + 3)],
                                        t0: 0))
         }
