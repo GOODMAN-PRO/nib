@@ -112,6 +112,7 @@ final class FeatRulerTests: XCTestCase {
             } catch let e as NibError {
                 XCTAssertEqual(e.code, .invalidParams)
                 XCTAssertEqual(e.path, path)
+                XCTAssertEqual(e.hint, "call commands.describe {\"id\": \"ruler.set\"}", "says what to call next")
             }
         }
         do {
@@ -121,6 +122,24 @@ final class FeatRulerTests: XCTestCase {
             XCTAssertEqual(e.code, .invalidParams)
         }
         XCTAssertEqual(RulerState.load(h.session), RulerState(), "nothing changed")
+    }
+
+    func testADryRunPreviewsWithoutPersistingAnything() async throws {
+        let h = Harness(features: [FeatRulerFeature.self])
+        let units = h.app.settings.get(RulerSettings.units), digits = h.app.settings.get(RulerSettings.digits)
+        let other = units == "in" ? "cm" : "in"
+        let params: JSONValue = ["visible": true, "angle": 45, "position": [120, 250], "units": .string(other),
+                                 "digits": .bool(!digits)]
+        let r = try await h.app.bus.execute(Invocation(command: "ruler.set", params: params, principal: .ai("chat"),
+                                                       session: h.session, dryRun: true))
+        XCTAssertEqual(r.value["visible"], true, "the preview shows the would-be state")
+        XCTAssertEqual(r.value["angle"], 45)
+        XCTAssertEqual(r.value["position"], [120, 250])
+        XCTAssertEqual(r.value["units"]?.stringValue, other)
+        XCTAssertEqual(r.value["digits"], JSONValue.bool(!digits))
+        XCTAssertEqual(h.app.settings.get(RulerSettings.units), units, "synced settings untouched")
+        XCTAssertEqual(h.app.settings.get(RulerSettings.digits), digits)
+        XCTAssertEqual(RulerState.load(h.session), RulerState(), "the session ruler untouched")
     }
 
     func testTheAIAndPluginsCanPlaceTheRulerWithoutTouchingUndo() async throws {
@@ -306,6 +325,43 @@ final class FeatRulerTests: XCTestCase {
         XCTAssertTrue(ruler.rulerView.isHidden)
         ruler.detach(from: host)
         XCTAssertFalse(host.canvasView.subviews.contains { $0 === ruler.rulerView })
+    }
+
+    /// Zoomed out, the ruler keeps a minimum on-screen thickness, so its touch band stays inside the body and the Pencil
+    /// can still start a ruled line on or just outside either edge.
+    func testZoomedOutTheRulerOnlyClaimsTouchesInsideItsBody() async throws {
+        for zoom in [0.5, 0.3] {
+            let h = Harness(features: [FeatRulerFeature.self])
+            let host = FakeCanvasHost(h)
+            host.zoomScale = zoom
+            let editor = FakeEditor(host)
+            h.session.editor = editor
+            let ruler = RulerAttachment()
+            ruler.attach(to: host)
+            _ = try await h.run("ruler.set", ["visible": true, "angle": 0, "position": [300, 400]])
+            let c = CGPoint(x: 300 * zoom, y: 400 * zoom)                  // page 1 starts at the view origin
+            let half = RulerMetrics.viewThickness(zoom: zoom) / 2
+            XCTAssertGreaterThanOrEqual(half - 6, 22, "zoom \(zoom): a 44 pt touch band")
+            XCTAssertTrue(ruler.hitTest(c, host: host), "zoom \(zoom): the middle is the ruler's")
+            XCTAssertTrue(ruler.hitTest(CGPoint(x: c.x, y: c.y - 22), host: host), "zoom \(zoom): 44 pt across")
+            for side in [-1.0, 1.0] {
+                XCTAssertFalse(ruler.hitTest(CGPoint(x: c.x, y: c.y + side * (half + 2)), host: host),
+                               "zoom \(zoom): 2 pt outside the edge is the page's")
+                XCTAssertFalse(ruler.hitTest(CGPoint(x: c.x, y: c.y + side * (half - 3)), host: host),
+                               "zoom \(zoom): a Pencil on the edge still writes")
+            }
+
+            // A stroke that starts 5 page pt outside the upper edge is laid along it.
+            let edge = 400 - RulerMetrics.pageThickness(zoom: zoom) / 2
+            let original = (0...5).map { StrokePoint(x: Float(200 + $0 * 30), y: Float(edge - 5 - Double($0 % 2) * 3)) }
+            var stroke = Stroke(style: .defaultPen, points: original, t0: 0)
+            XCTAssertTrue(RulerProcessor().process(&stroke, page: Fixtures.page1, session: h.session))
+            let line = edge - InkStyle.defaultPen.width / 2
+            XCTAssertTrue(stroke.points.allSatisfy { abs(Double($0.y) - line) < 0.01 }, "zoom \(zoom): projected")
+            for (p, o) in zip(stroke.points, original) { XCTAssertEqual(p.x, o.x, accuracy: 0.01) }
+            ruler.detach(from: host)
+            withExtendedLifetime(editor) {}
+        }
     }
 
     func testTheAttachmentRotatesWithTwoFingers() async throws {

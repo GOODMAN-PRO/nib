@@ -144,30 +144,30 @@ struct RulerSet: NibCommand {
         ]),
         examples: RulerSet.examples, effect: .session, target: .app)
 
+    private static let describeHint = "call commands.describe {\"id\": \"ruler.set\"}"
+
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         var units: RulerUnits?
         if let raw = p.units {
             guard let u = RulerUnits(rawValue: raw) else {
-                throw NibError(.invalidParams, "units must be 'cm' or 'in'", path: "$.units",
-                               hint: "call commands.describe {\"id\": \"ruler.set\"}")
+                throw NibError(.invalidParams, "units must be 'cm' or 'in'", path: "$.units", hint: describeHint)
             }
             units = u
         }
-        if let a = p.angle, !a.isFinite { throw NibError.invalid("angle must be a number of degrees", path: "$.angle") }
+        if let a = p.angle, !a.isFinite {
+            throw NibError(.invalidParams, "angle must be a number of degrees", path: "$.angle", hint: describeHint)
+        }
         var position: Point?
         if let xy = p.position {
             guard xy.count == 2, xy.allSatisfy({ $0.isFinite }) else {
-                throw NibError.invalid("position must be [x, y] in page points", path: "$.position")
+                throw NibError(.invalidParams, "position must be [x, y] in page points", path: "$.position",
+                               hint: describeHint)
             }
             position = Point(xy[0], xy[1])
         }
         let places = p.visible != nil || p.toggle == true || p.angle != nil || position != nil
         let session = ctx.activeSession
         if places && session == nil { throw NibError.unavailable("an open editor window") }
-
-        let settings = ctx.services.settings
-        if let units { settings.set(RulerSettings.units, units.rawValue) }
-        if let digits = p.digits { settings.set(RulerSettings.digits, digits) }
 
         var state = session.map { RulerState.load($0) } ?? RulerState()
         if let session, places {
@@ -182,9 +182,17 @@ struct RulerSet: NibCommand {
             } else if state.visible && (!wasVisible || state.position == nil) {
                 place(&state, session: session, ctx: ctx)
             }
-            state.save(to: session)
         }
-        return output(state, session: session, settings: settings)
+
+        // A dry run (AI previews, plugin.run) returns the would-be state and persists nothing (ARCHITECTURE §6.2).
+        let settings = ctx.services.settings
+        if !ctx.dryRun {
+            if let units { settings.set(RulerSettings.units, units.rawValue) }
+            if let digits = p.digits { settings.set(RulerSettings.digits, digits) }
+            if let session, places { state.save(to: session) }
+        }
+        return output(state, session: session, units: units ?? RulerSettings.currentUnits(settings),
+                      digits: p.digits ?? settings.get(RulerSettings.digits))
     }
 
     /// Showing the ruler puts it where the user is looking: the middle of the visible part of the current page (the
@@ -210,13 +218,12 @@ struct RulerSet: NibCommand {
     }
 
     @MainActor
-    private static func output(_ state: RulerState, session: EditorSession?, settings: SettingsStore) -> Output {
+    private static func output(_ state: RulerState, session: EditorSession?, units: RulerUnits, digits: Bool) -> Output {
         var ref: String?
         if let session, let doc = session.document, let page = state.anchorPage(in: session) {
             ref = NodeRef.page(doc, page).description
         }
         return Output(visible: state.visible, angle: state.angle, position: state.position.map { [$0.x, $0.y] },
-                      page: ref, units: RulerSettings.currentUnits(settings).rawValue,
-                      digits: settings.get(RulerSettings.digits))
+                      page: ref, units: units.rawValue, digits: digits)
     }
 }

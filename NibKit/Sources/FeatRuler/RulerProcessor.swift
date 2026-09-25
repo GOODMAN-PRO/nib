@@ -3,18 +3,21 @@ import NibContracts
 
 /// Fixed sizes of the ruler (DESIGN.md §14.3: an opaque on-page object). Its length is page units (a 12-inch rule, so
 /// 30 cm fit too), so its scale always matches the page at any zoom. Its thickness is 64 view points at 100 % zoom and
-/// above, so it stays easy to hold when zoomed in, and shrinks with the page below 100 %.
+/// above, so it stays easy to hold when zoomed in; below 100 % it shrinks with the page but never under
+/// `minimumThickness`, so the 44 pt touch band (`RulerLayout.claims`) always stays inside the drawn body.
 enum RulerMetrics {
     /// Page points: 12 in (864 pt) of scale plus a blank end of `endMargin` on each side.
     static let length: Double = 888
     static let endMargin: Double = 12
     /// View points at zoom ≥ 1.
     static let thickness: Double = 64
+    /// View points: the 44 pt hit target plus the 6 pt band inside each edge where the Pencil writes.
+    static let minimumThickness: Double = 56
     /// Page points: a stroke that starts this close to an edge is projected onto it.
     static let reach: Double = 20
 
-    static func viewThickness(zoom: Double) -> Double { thickness * min(max(zoom, 0.01), 1) }
-    static func pageThickness(zoom: Double) -> Double { thickness / max(zoom, 1) }
+    static func viewThickness(zoom: Double) -> Double { max(minimumThickness, thickness * min(zoom, 1)) }
+    static func pageThickness(zoom: Double) -> Double { viewThickness(zoom: zoom) / max(zoom, 0.01) }
 }
 
 /// The ruler as a band in one coordinate space (page points or view points, y down): a centre line through `center`

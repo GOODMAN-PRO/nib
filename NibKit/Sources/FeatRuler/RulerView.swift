@@ -202,14 +202,14 @@ enum RulerLayout {
     }
 
     /// Whether a touch at `p` (view points) is the ruler's: its whole length, and across it everything but a 6 pt band
-    /// inside each edge, so a Pencil set down on the edge still writes. At least 44 pt across (DESIGN.md §5).
+    /// inside each edge, so a Pencil set down on (or next to) the edge still writes. The ruler is never thinner than
+    /// `RulerMetrics.minimumThickness`, so this is at least 44 pt across (DESIGN.md §5) and never leaves the body.
     static func claims(_ p: Point, pose: RulerGesture.Pose, zoom: Double) -> Bool {
         let thickness = RulerMetrics.viewThickness(zoom: zoom)
         let g = RulerGeometry(center: pose.center, angle: pose.angle, length: RulerMetrics.length * zoom,
                               thickness: thickness)
         let (u, v) = g.local(p)
-        let half = max(thickness / 2 - 6, Double(NibMetrics.hitTarget) / 2)
-        return abs(u) <= g.length / 2 && abs(v) <= half
+        return abs(u) <= g.length / 2 && abs(v) <= thickness / 2 - 6
     }
 }
 
@@ -403,14 +403,15 @@ struct RulerAngleHUD: View {
 @MainActor
 final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDelegate {
     /// How long the angle HUD stays after the fingers lift (DESIGN.md §14.17: evaporates 0.6 s after).
-    /// ponytail: a local constant; NibMotion has no HUD-linger token yet.
+    /// Known deviation: NibMotion has no HUD-evaporate token yet (contract gap reported with F039, asking for one shared
+    /// with the pinch-zoom HUD); switch to it once it lands.
     static let hudLinger: UInt64 = 600_000_000
 
     private weak var host: CanvasHost?
     let rulerView = RulerView()
     private let hudModel = RulerHUDModel()
     private var hud: UIHostingController<RulerAngleHUD>?
-    private var hudSize: (text: String, size: CGSize)?
+    private var hudSize: (text: String, category: UIContentSizeCategory, size: CGSize)?
     private var menu: UIEditMenuInteraction?
     private var subscriptions: Set<AnyCancellable> = []
     private var state = RulerState()
@@ -531,8 +532,9 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
         guard let hud else { return }
         let text = RulerAngle.label(pose.angle)
         hudModel.text = text
-        if hudSize?.text != text {
-            hudSize = (text, hud.sizeThatFits(in: CGSize(width: 240, height: NibMetrics.hudHeight)))
+        let category = host.canvasView.traitCollection.preferredContentSizeCategory
+        if hudSize?.text != text || hudSize?.category != category {
+            hudSize = (text, category, hud.sizeThatFits(in: CGSize(width: 240, height: NibMetrics.hudHeight)))
         }
         let size = hudSize?.size ?? .zero
         let r = pose.angle * .pi / 180
@@ -711,10 +713,12 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
             field.accessibilityLabel = String(localized: "Angle in degrees")
         }
         alert.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel))
-        alert.addAction(UIAlertAction(title: String(localized: "Set Angle"), style: .default) { [weak self, weak alert] _ in
+        let set = UIAlertAction(title: String(localized: "Set Angle"), style: .default) { [weak self, weak alert] _ in
             guard let value = RulerAttachment.number(alert?.textFields?.first?.text) else { return }
             self?.setRuler(["angle": .number(value)])
-        })
+        }
+        alert.addAction(set)
+        Self.enable(set, whileNumbersIn: alert)
         present(alert)
     }
 
@@ -739,12 +743,26 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
             }
         }
         alert.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel))
-        alert.addAction(UIAlertAction(title: String(localized: "Move Ruler"), style: .default) { [weak self, weak alert] _ in
+        let move = UIAlertAction(title: String(localized: "Move Ruler"), style: .default) { [weak self, weak alert] _ in
             guard let fields = alert?.textFields, fields.count == 2,
                   let nx = RulerAttachment.number(fields[0].text), let ny = RulerAttachment.number(fields[1].text) else { return }
             self?.setRuler(["position": .array([.number(nx * units.points), .number(ny * units.points)])])
-        })
+        }
+        alert.addAction(move)
+        Self.enable(move, whileNumbersIn: alert)
         present(alert)
+    }
+
+    /// Keeps `action` enabled only while every field of `alert` holds a number, so a typo can never be submitted and
+    /// silently dropped (DESIGN.md §14.18).
+    static func enable(_ action: UIAlertAction, whileNumbersIn alert: UIAlertController) {
+        let update: () -> Void = { [weak alert, weak action] in
+            action?.isEnabled = alert?.textFields?.allSatisfy { RulerAttachment.number($0.text) != nil } ?? false
+        }
+        update()
+        for field in alert.textFields ?? [] {
+            field.addAction(UIAction { _ in update() }, for: .editingChanged)
+        }
     }
 
     /// A number typed with either decimal separator.
