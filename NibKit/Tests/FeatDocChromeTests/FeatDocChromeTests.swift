@@ -161,9 +161,10 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertTrue(h.app.services.get(ChromeStateStore.inkingKey(other.id), as: AnyObject.self) === inking)
 
         h.app.services.sessions.remove(other)
-        _ = store.state(for: h.session)
-        XCTAssertNil(h.app.services.get(ChromeStateStore.inkingKey(other.id), as: AnyObject.self))
-        XCTAssertNotNil(h.app.services.get(ChromeStateStore.inkingKey(h.session.id), as: AnyObject.self))
+        let current = store.inking(for: h.session)
+        // A concrete type: a missing entry read `as: AnyObject.self` bridges to NSNull instead of nil.
+        XCTAssertNil(h.app.services.get(ChromeStateStore.inkingKey(other.id), as: type(of: inking)))
+        XCTAssertTrue(h.app.services.get(ChromeStateStore.inkingKey(h.session.id), as: AnyObject.self) === current)
     }
 
     // MARK: Commands
@@ -350,7 +351,9 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertFalse(container.prefersStatusBarHidden)
         h.app.settings.set(NibSettings.hideStatusBar, true)
         XCTAssertTrue(container.prefersStatusBarHidden)
-        XCTAssertNotNil(h.app.services.get("chrome.inking." + h.session.id.raw, as: AnyObject.self))
+        let store = h.app.services.get(ChromeStateStore.serviceKey, as: ChromeStateStore.self)
+        XCTAssertTrue(h.app.services.get("chrome.inking." + h.session.id.raw, as: AnyObject.self)
+                      === store?.inking(for: h.session))
 
         let state = try? chromeState(h)
         let context = ChromeContext(app: h.app, doc: Fixtures.docID, session: h.session, state: state ?? ChromeState(),
