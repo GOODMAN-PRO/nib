@@ -243,9 +243,9 @@ struct ShapeCreate: NibCommand {
                       "text": .anything("text inside the shape: a string or RichText"),
                       "id": .str("your own id, [A-Za-z0-9_-]{1,64}")], required: ["page", "shape"]),
         examples: [
-            try! JSONValue.parse(#"{"page":"page:FIXTUREDOC01/FIXTUREPG002","shape":"ellipse","frame":[100,120,180,110],"style":{"fillColor":"#2156D94D"},"text":"Idea"}"#),
+            try! JSONValue.parse(##"{"page":"page:FIXTUREDOC01/FIXTUREPG002","shape":"ellipse","frame":[100,120,180,110],"style":{"fillColor":"#2156D94D"},"text":"Idea"}"##),
             try! JSONValue.parse(#"{"page":"page:FIXTUREDOC01/FIXTUREPG001","shape":"arrow","points":[[80,320],[260,360]],"style":{"strokeWidth":2}}"#),
-            try! JSONValue.parse(#"{"page":"page:FIXTUREDOC04/FIXTUREBRD01","shape":"diamond","frame":[260,40,120,90],"style":{"strokeColor":null,"fillColor":"#FFE45C"},"text":"Decide"}"#)
+            try! JSONValue.parse(##"{"page":"page:FIXTUREDOC04/FIXTUREBRD01","shape":"diamond","frame":[260,40,120,90],"style":{"strokeColor":null,"fillColor":"#FFE45C"},"text":"Decide"}"##)
         ],
         effect: .edit)
 
@@ -289,7 +289,7 @@ struct ShapeSetStyle: NibCommand {
             + "translucency), cornerRadius, pattern, arrowheads, ink look (drawnWith).",
         params: .obj(["refs": .arr(.ref, "shape item refs"), "style": ShapeStylePatch.schema], required: ["refs", "style"]),
         examples: [
-            try! JSONValue.parse(#"{"refs":["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"],"style":{"strokeColor":null,"fillColor":"#FFE45C99","cornerRadius":14}}"#),
+            try! JSONValue.parse(##"{"refs":["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"],"style":{"strokeColor":null,"fillColor":"#FFE45C99","cornerRadius":14}}"##),
             try! JSONValue.parse(#"{"refs":["item:FIXTUREDOC04/FIXTUREBRD01/FIXTUREBSH01"],"style":{"pattern":"dashed","drawnWith":"pencil","strokeWidth":2.5}}"#)
         ],
         effect: .edit)
