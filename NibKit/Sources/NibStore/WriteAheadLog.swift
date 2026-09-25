@@ -8,7 +8,8 @@ import NibContracts
 final class WriteAheadLog {
     struct Entry: Codable {
         var head: DocumentContent?
-        /// PageID raw value → the page's full item array at that commit (tombstones included).
+        /// PageID raw value → the items of that page that changed at that commit (tombstones included). Replay merges
+        /// them over the package files last-writer-wins.
         var pages: [String: [Item]]
     }
 
@@ -42,9 +43,15 @@ final class WriteAheadLog {
                 throw NibError(.internalError, "cannot create the write-ahead log \(url.lastPathComponent)")
             }
         }
-        let handle = try FileHandle(forWritingTo: url)
+        let handle = try FileHandle(forUpdating: url)
         defer { try? handle.close() }
-        _ = try handle.seekToEnd()
+        let end = try handle.seekToEnd()
+        if end > 0 {
+            // A torn last line (the app died mid-append) must not swallow this entry: start it on a line of its own.
+            try handle.seek(toOffset: end - 1)
+            if try handle.read(upToCount: 1) != Data([0x0A]) { line.insert(0x0A, at: line.startIndex) }
+            _ = try handle.seekToEnd()
+        }
         try handle.write(contentsOf: line)
     }
 

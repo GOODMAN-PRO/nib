@@ -32,7 +32,7 @@ final class PackageAssetStore: AssetStore {
 
     func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
         if gate.contains(doc) { throw ReadOnlyGate.refusal(doc) }
-        guard let pkg = locator.url(doc) else { throw NibError.notFound("document \(doc.raw)") }
+        let pkg = try PackageFiles.existingPackage(doc, locator)
         let ref = try PackageAssetStore.ref(for: data, ext: ext)
         let url = pkg.appendingPathComponent("assets", isDirectory: true).appendingPathComponent(ref.name)
         // Content-addressed: an existing file with this name already holds these bytes.

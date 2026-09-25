@@ -22,10 +22,24 @@ public enum NibStoreFeature: NibFeature {
 
     public static func start(_ app: NibApp) async {
         guard let store = app.workspace.persistence as? PackagePersistence else { return }
-        // Save pending changes when the app leaves the foreground; the write-ahead log covers a kill before that.
+        // Save pending changes when the app leaves the foreground, inside a background-task assertion so suspension
+        // does not cut the writes off; the write-ahead log covers a kill before that.
         _ = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil,
                                                    queue: .main) { _ in
-            Task { @MainActor in store.flushAll() }
+            MainActor.assumeIsolated {
+                if NibApp.isHostlessTest {
+                    store.flushAll()
+                    return
+                }
+                let task = UIApplication.shared.beginBackgroundTask(withName: "nib.store.flush", expirationHandler: nil)
+                store.flushAll()
+                UIApplication.shared.endBackgroundTask(task)
+            }
+        }
+        // A closed document was flushed by the workspace; drop what the store remembers of it.
+        app.events.subscribe { e in
+            guard e.type == NibEventType.docClosed, let doc = e.doc else { return }
+            MainActor.assumeIsolated { store.forget(doc) }
         }
     }
 }

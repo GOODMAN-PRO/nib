@@ -11,19 +11,21 @@ final class TestLibrary {
                                                                               isDirectory: true)
     let locator = PackageLocator()
 
+    /// Creates the package folder (the library's job in the app) and registers it.
     @discardableResult
     func package(_ doc: DocumentID) -> URL {
         let url = root.appendingPathComponent(doc.raw + "." + NibFormat.packageExtension, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         locator.set(url, for: doc)
         return url
     }
 
     /// A store for one device; every device has its own write-ahead log folder, as on real devices.
     func store(_ device: String, events: EventBus? = nil, gate: ReadOnlyGate = ReadOnlyGate(),
-               debounce: TimeInterval = 3600) -> PackagePersistence {
+               debounce: TimeInterval = 3600, maxDelay: TimeInterval = 10) -> PackagePersistence {
         PackagePersistence(device: device, locator: locator, events: events, gate: gate,
                            walDirectory: root.appendingPathComponent("wal-" + device, isDirectory: true),
-                           debounce: debounce)
+                           debounce: debounce, maxDelay: maxDelay)
     }
 
     func assets(gate: ReadOnlyGate = ReadOnlyGate()) -> PackageAssetStore {
@@ -102,24 +104,109 @@ final class NibStoreTests: XCTestCase {
         var head = try crashed.loadHead(doc)
         head.meta.favorite = true
         head.meta.rev = clock.tick()
+        var page = try crashed.loadItems(doc, page: Fixtures.page1)
         var stroke = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 2), StrokePoint(x: 3, y: 4)]))
         stroke.id = "WALSTROKE001"
         stroke.rev = clock.tick()
-        crashed.didChange(doc, head: head, pages: [Fixtures.page2: [stroke]])
+        page.append(stroke)
+        crashed.didChange(doc, head: head, pages: [Fixtures.page1: page])
         crashed.waitForIO()
-        XCTAssertEqual(crashed.wal.read(doc).count, 1)
+        let logged = crashed.wal.read(doc)
+        XCTAssertEqual(logged.count, 1)
+        XCTAssertEqual(logged.first?.pages[Fixtures.page1.raw]?.map(\.id), ["WALSTROKE001"],
+                       "only the item that changed is logged, not the whole page")
         let onDisk = try PackageCodec.decodeHead(Data(contentsOf: pkg.appendingPathComponent("doc.0000000a.json")))
         XCTAssertFalse(onDisk.meta.favorite)
 
         // Relaunch: the same device replays its log on load, then writes and truncates it.
         let relaunched = lib.store("0000000a")
         XCTAssertTrue(try relaunched.loadHead(doc).meta.favorite)
-        XCTAssertEqual(try relaunched.loadItems(doc, page: Fixtures.page2).map(\.id), ["WALSTROKE001"])
+        XCTAssertEqual(Set(try relaunched.loadItems(doc, page: Fixtures.page1).map(\.id)), Set(page.map(\.id)))
         relaunched.flush(doc)
         XCTAssertTrue(relaunched.wal.read(doc).isEmpty)
         let fresh = lib.store("0000000a")
         XCTAssertTrue(try fresh.loadHead(doc).meta.favorite)
-        XCTAssertEqual(try fresh.loadItems(doc, page: Fixtures.page2).map(\.id), ["WALSTROKE001"])
+        XCTAssertEqual(Set(try fresh.loadItems(doc, page: Fixtures.page1).map(\.id)), Set(page.map(\.id)))
+    }
+
+    func testWriteAheadLogSurvivesTornLastLine() throws {
+        let lib = TestLibrary()
+        let (content, _) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let wal = WriteAheadLog(directory: lib.root.appendingPathComponent("wal", isDirectory: true))
+        try wal.append(WriteAheadLog.Entry(head: content, pages: [:]), doc: doc)
+        // The app died mid-append: half a line, no newline.
+        let handle = try FileHandle(forWritingTo: wal.url(doc))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(#"{"head":{"me"#.utf8))
+        try handle.close()
+        try wal.append(WriteAheadLog.Entry(head: nil, pages: [Fixtures.page2.raw: []]), doc: doc)
+        let entries = wal.read(doc)
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(entries.last?.pages.keys.first, Fixtures.page2.raw)
+    }
+
+    func testLoadItemsWaitsForWriteInFlight() async throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let crashed = lib.store("0000000a")
+        crashed.didChange(doc, head: content, pages: items)
+        crashed.flush(doc)
+        var stroke = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 2), StrokePoint(x: 3, y: 4)]))
+        stroke.id = "WALSTROKE002"
+        stroke.rev = HLCClock(device: 10).tick()
+        crashed.didChange(doc, head: nil, pages: [Fixtures.page2: [stroke]])
+        crashed.waitForIO()
+
+        // Relaunch: the replayed stroke is pending and its write is due in 50 ms. The page file is held by another
+        // writer, so that write is still in flight (taken off `pending`, not on disk) when the page is loaded.
+        let relaunched = lib.store("0000000a", debounce: 0.05)
+        _ = try relaunched.loadHead(doc)
+        holdCoordinatedWrite(pkg.appendingPathComponent("pages/\(Fixtures.page2.raw)/0000000a.nibpage"), seconds: 0.5)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(try relaunched.loadItems(doc, page: Fixtures.page2).map(\.id), ["WALSTROKE002"])
+    }
+
+    /// Another writer holds `url` for `seconds` (coordinated writes to it wait); returns once it holds it.
+    private func holdCoordinatedWrite(_ url: URL, seconds: TimeInterval) {
+        let held = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            var error: NSError?
+            NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: url, options: [], error: &error) { _ in
+                held.signal()
+                Thread.sleep(forTimeInterval: seconds)
+            }
+            held.signal() // coordination failed: do not leave the test waiting
+        }
+        held.wait()
+    }
+
+    func testWriteToRemovedPackageKeepsChangesAndLog() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+
+        try FileManager.default.removeItem(at: pkg)
+        var head = content
+        head.meta.favorite = true
+        head.meta.rev = HLCClock(device: 10).tick()
+        store.didChange(doc, head: head, pages: [:])
+        store.flush(doc)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: pkg.path), "no ghost package at the old path")
+        XCTAssertEqual(store.wal.read(doc).count, 1, "the log keeps what was not written")
+
+        // The package comes back: the kept changes reach it on the next flush.
+        try FileManager.default.createDirectory(at: pkg, withIntermediateDirectories: true)
+        store.flush(doc)
+        XCTAssertTrue(store.wal.read(doc).isEmpty)
+        let own = try PackageCodec.decodeHead(Data(contentsOf: pkg.appendingPathComponent("doc.0000000a.json")))
+        XCTAssertTrue(own.meta.favorite)
     }
 
     func testNewerFormatOpensReadOnlyAndRefusesWrites() throws {

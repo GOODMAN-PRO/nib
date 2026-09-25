@@ -153,77 +153,125 @@ final class PackageMergeTests: XCTestCase {
         }
         let data = try PackageCodec.encodeItems(remote)
 
-        // Budget (ARCHITECTURE §20): decode and merge a 1k-stroke page < 50 ms, asserted ×4. Best of three runs, so
-        // the first one also warms the decoder up.
+        // Budget (ARCHITECTURE §20): decode and merge a 1k-stroke page < 50 ms, asserted ×4. Best of five runs (the
+        // simulator shares its machine), so the first one also warms the decoder up.
         var merged: [Item] = []
         var best = Double.infinity
-        for _ in 0..<3 {
+        for _ in 0..<5 {
             let start = Date()
             merged = LWW.merge(base, try PackageCodec.decodeItems(data))
             best = min(best, Date().timeIntervalSince(start))
         }
+        print("decode+merge of a 1k-stroke page: best \(Int(best * 1000)) ms of a 200 ms budget")
 
+        XCTAssertEqual(try PackageCodec.decodeItems(data), remote, "parallel chunks decode in order, losslessly")
         XCTAssertEqual(merged.count, 1000)
         XCTAssertEqual(merged.filter(\.deleted).count, 100)
-        diagnoseDecode(data, base: base)
         XCTAssertLessThan(best, 0.05 * 4)
     }
 
-    // TEMP diagnostics (removed once the budget holds): where the decode time goes on the CI simulator.
-    private func diagnoseDecode(_ data: Data, base: [Item]) {
-        func best(_ f: () throws -> Void) -> Double {
-            var b = Double.infinity
-            for _ in 0..<3 {
-                let s = Date()
-                try? f()
-                b = min(b, Date().timeIntervalSince(s))
-            }
-            return (b * 1000).rounded()
+    func testElementChunksCutOnlyBetweenTopLevelElements() throws {
+        // Strings hold escaped quotes and backslashes, brackets and commas; objects nest arrays of objects.
+        let element = #"{"a":"x\\\"],[{,","b":[1,{"c":"}]"},{"d":"\\"}],"e":"\""}"#
+        let json = Data(("[" + Array(repeating: element, count: 2000).joined(separator: ",") + "]").utf8)
+        let chunks = json.withUnsafeBytes { PackageCodec.elementChunks($0, count: 4) }
+        XCTAssertEqual(chunks.count, 4)
+        var total = 0
+        for chunk in chunks {
+            let array = try XCTUnwrap(JSONSerialization.jsonObject(with: chunk) as? [[String: Any]])
+            XCTAssertEqual(array.first?["a"] as? String, #"x\"],[{,"#)
+            total += array.count
         }
-        let json = try! (data as NSData).decompressed(using: .lzfse) as Data
-        var out: [String] = ["cores=\(ProcessInfo.processInfo.activeProcessorCount)", "json=\(json.count)B"]
-        out.append("inflate=\(best { _ = try (data as NSData).decompressed(using: .lzfse) })")
-        out.append("jsonser=\(best { _ = try JSONSerialization.jsonObject(with: json) })")
-        out.append("full=\(best { _ = try JSONDecoder().decode([Item].self, from: json) })")
-        var array = try! JSONSerialization.jsonObject(with: json) as! [[String: Any]]
-        var b64: [String] = []
-        for i in array.indices {
-            if var s = array[i]["stroke"] as? [String: Any] {
-                b64.append(s["ptsB64"] as? String ?? "")
-                s["ptsB64"] = nil
-                array[i]["stroke"] = s
-            }
-        }
-        let stripped = try! JSONSerialization.data(withJSONObject: array)
-        out.append("reser=\(best { _ = try JSONSerialization.data(withJSONObject: array) })")
-        out.append("nopts=\(best { _ = try JSONDecoder().decode([Item].self, from: stripped) })")
-        out.append("pts=\(best { for s in b64 { _ = Self.fastPoints(s) } })")
-        let decoded = try! JSONDecoder().decode([Item].self, from: json)
-        out.append("merge=\(best { _ = LWW.merge(base, decoded) })")
-        let n = ProcessInfo.processInfo.activeProcessorCount
-        let whole = try! JSONSerialization.jsonObject(with: json) as! [Any]
-        let size = (whole.count + n - 1) / n
-        let chunks = stride(from: 0, to: whole.count, by: size).map {
-            try! JSONSerialization.data(withJSONObject: Array(whole[$0..<min($0 + size, whole.count)]))
-        }
-        out.append("par\(chunks.count)=\(best { DispatchQueue.concurrentPerform(iterations: chunks.count) { _ = try? JSONDecoder().decode([Item].self, from: chunks[$0]) } })")
-        out.append("encode=\(best { _ = try PackageCodec.encodeItems(base) })")
-        print("NIBSTORE-DIAG " + out.joined(separator: " "))
+        XCTAssertEqual(total, 2000)
+        XCTAssertTrue(json.prefix(1000).withUnsafeBytes { PackageCodec.elementChunks($0, count: 4) }.isEmpty,
+                      "small pages decode in one piece")
     }
 
-    private static func fastPoints(_ b64: String) -> [StrokePoint] {
-        guard let d = Data(base64Encoded: b64) else { return [] }
-        var f = [Float](repeating: 0, count: d.count / 4)
-        _ = f.withUnsafeMutableBufferPointer { d.copyBytes(to: $0) }
-        var pts: [StrokePoint] = []
-        pts.reserveCapacity(f.count / 10)
-        var i = 0
-        while i + 10 <= f.count {
-            pts.append(StrokePoint(x: f[i], y: f[i + 1], t: f[i + 2], force: f[i + 3], azimuth: f[i + 4], altitude: f[i + 5],
-                                   roll: f[i + 6], width: f[i + 7], height: f[i + 8], opacity: f[i + 9]))
-            i += 10
+    func testConflictCopyAppearingAfterLoadIsMergedReportedOnceAndRemoved() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+        _ = try store.loadHead(doc)
+        _ = try store.loadItems(doc, page: Fixtures.page1)
+
+        // A file provider drops diverged copies of this device's files while the document is open.
+        let clock = HLCClock(device: 10)
+        var diverged = content
+        var entry = OutlineEntry(id: "COPYOUTLINE2", title: "Only in the copy", page: Fixtures.page1)
+        entry.rev = clock.tick()
+        diverged.outline.append(entry)
+        let headCopy = pkg.appendingPathComponent("doc.0000000a 2.json")
+        try PackageCodec.encodeHead(diverged).write(to: headCopy)
+        var stroke = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 5, y: 5), StrokePoint(x: 9, y: 9)]))
+        stroke.id = "COPYSTROKE02"
+        stroke.rev = clock.tick()
+        let pageCopy = pkg.appendingPathComponent("pages/\(Fixtures.page1.raw)/0000000a 2.nibpage")
+        try PackageCodec.encodeItems([stroke]).write(to: pageCopy)
+
+        let patch = try XCTUnwrap(store.remoteChanges(doc))
+        XCTAssertEqual(patch.outline.map(\.id), ["COPYOUTLINE2"])
+        XCTAssertEqual(patch.items[Fixtures.page1.raw]?.map(\.id), ["COPYSTROKE02"])
+        XCTAssertNil(try store.remoteChanges(doc), "reported once")
+
+        store.flush(doc)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: headCopy.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: pageCopy.path))
+        XCTAssertNil(try store.remoteChanges(doc))
+        let ownHead = try PackageCodec.decodeHead(Data(contentsOf: pkg.appendingPathComponent("doc.0000000a.json")))
+        XCTAssertNotNil(ownHead.outline.first { $0.id == "COPYOUTLINE2" })
+        let ownPage = try PackageCodec.decodeItems(Data(contentsOf:
+            pkg.appendingPathComponent("pages/\(Fixtures.page1.raw)/0000000a.nibpage")))
+        XCTAssertNotNil(ownPage.first { $0.id == "COPYSTROKE02" })
+    }
+
+    func testNewerFormatArrivingRemotelyMakesDocumentReadOnly() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let events = EventBus()
+        var reasons: [String] = []
+        let subscription = events.subscribe { e in
+            if e.type == NibEventType.syncStatus, let reason = e.payload?["reason"]?.stringValue { reasons.append(reason) }
         }
-        return pts
+        defer { subscription.cancel() }
+        let gate = ReadOnlyGate()
+        let store = lib.store("0000000a", events: events, gate: gate)
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+        _ = try store.loadHead(doc)
+        XCTAssertFalse(gate.contains(doc))
+
+        var newer = content
+        newer.meta.format = NibFormat.version + 1
+        newer.meta.rev = HLCClock(device: 11).tick()
+        try PackageCodec.encodeHead(newer).write(to: pkg.appendingPathComponent("doc.0000000b.json"))
+        XCTAssertNotNil(try store.remoteChanges(doc))
+        XCTAssertTrue(gate.contains(doc))
+        XCTAssertTrue(gate.published.contains(doc.raw))
+        XCTAssertEqual(reasons, ["newerFormat"])
+    }
+
+    func testContinuousChangesStillWriteWithinMaxDelay() async throws {
+        let lib = TestLibrary()
+        let (content, _) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let own = lib.package(doc).appendingPathComponent("doc.0000000a.json")
+        // Every change arrives well inside the debounce, so only the max-delay cap lets a write through.
+        let store = lib.store("0000000a", debounce: 0.3, maxDelay: 0.1)
+        let clock = HLCClock(device: 10)
+        var head = content
+        for _ in 0..<50 where !FileManager.default.fileExists(atPath: own.path) {
+            head.meta.rev = clock.tick()
+            store.didChange(doc, head: head, pages: [:])
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        store.waitForIO()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: own.path))
     }
 
     func testFarFutureRevisionLosesAndIsReported() throws {

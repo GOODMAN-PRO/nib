@@ -65,9 +65,80 @@ enum PackageCodec {
         return try (json as NSData).compressed(using: .lzfse) as Data
     }
 
+    /// Pages above this many JSON bytes are decoded in parallel chunks.
+    static let parallelDecodeMinimum = 64 * 1024
+
+    // ponytail: parallel because `Stroke.init(from:)` unpacks every point float through a string-keyed setter, which
+    // dominates decoding a big page. A fullFormat fast path in `Stroke.unpack` (NibContracts) would make one decode
+    // fast enough on its own; drop the chunking then.
     static func decodeItems(_ data: Data) throws -> [Item] {
         let json = try (data as NSData).decompressed(using: .lzfse) as Data
-        return try JSONDecoder().decode([Item].self, from: json)
+        let chunks = json.withUnsafeBytes { elementChunks($0, count: ProcessInfo.processInfo.activeProcessorCount) }
+        guard chunks.count > 1 else { return try JSONDecoder().decode([Item].self, from: json) }
+        var parts = [[Item]?](repeating: nil, count: chunks.count)
+        parts.withUnsafeMutableBufferPointer { buffer in
+            let out = buffer // each iteration writes only its own slot
+            DispatchQueue.concurrentPerform(iterations: chunks.count) { i in
+                out[i] = try? JSONDecoder().decode([Item].self, from: chunks[i])
+            }
+        }
+        let decoded = parts.compactMap { $0 }
+        // A chunk that does not decode on its own: decode the whole page, which reports the real error.
+        guard decoded.count == chunks.count else { return try JSONDecoder().decode([Item].self, from: json) }
+        return Array(decoded.joined())
+    }
+
+    /// Cuts the top-level JSON array in `bytes` into up to `count` arrays of whole elements of about equal size, by
+    /// one scan that tracks nesting depth and skips strings (escapes included). Returns no chunks for one core, small
+    /// input, or input that does not start with `[`.
+    static func elementChunks(_ bytes: UnsafeRawBufferPointer, count: Int) -> [Data] {
+        let n = bytes.count
+        guard count > 1, n >= parallelDecodeMinimum, let raw = bytes.baseAddress else { return [] }
+        let base = raw.assumingMemoryBound(to: UInt8.self)
+        let quote = UInt8(ascii: "\""), backslash = UInt8(ascii: "\\"), comma = UInt8(ascii: ",")
+        let openArray = UInt8(ascii: "["), openObject = UInt8(ascii: "{")
+        let closeArray = UInt8(ascii: "]"), closeObject = UInt8(ascii: "}")
+        guard base[0] == openArray else { return [] }
+
+        var cuts: [Int] = [] // offsets of commas between top-level elements
+        var depth = 0
+        var i = 0
+        while i < n, cuts.count < count - 1 {
+            let b = base[i]
+            if b == quote {
+                // The closing quote is the next one preceded by an even number of backslashes.
+                var j = i + 1
+                while true {
+                    guard let q = memchr(raw + j, Int32(quote), n - j) else { return [] }
+                    let k = raw.distance(to: UnsafeRawPointer(q))
+                    var slashes = 0
+                    while base[k - 1 - slashes] == backslash { slashes += 1 }
+                    j = k + 1
+                    if slashes % 2 == 0 { break }
+                }
+                i = j
+                continue
+            }
+            if b == openArray || b == openObject {
+                depth += 1
+            } else if b == closeArray || b == closeObject {
+                depth -= 1
+            } else if b == comma, depth == 1, i >= n / count * (cuts.count + 1) {
+                cuts.append(i)
+            }
+            i += 1
+        }
+
+        var chunks: [Data] = []
+        var start = 1
+        for end in cuts + [n] {
+            var chunk = Data([openArray])
+            chunk.append(base + start, count: end - start)
+            if end < n { chunk.append(closeArray) }
+            chunks.append(chunk)
+            start = end + 1
+        }
+        return chunks.count > 1 ? chunks : []
     }
 
     // MARK: Merge
@@ -266,13 +337,22 @@ struct PackageFiles {
         return r
     }
 
+    /// The package folder of `doc`, which must exist: creating packages is the library's job (F002), and a write that
+    /// races a move or delete must not leave a ghost package at the old path.
+    static func existingPackage(_ doc: DocumentID, _ locator: PackageLocator) throws -> URL {
+        guard let url = locator.url(doc) else { throw NibError.notFound("document \(doc.raw)") }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw NibError.notFound("document package \(url.lastPathComponent)")
+        }
+        return url
+    }
+
     /// Writes this device's files with the full merged state it knows (expired tombstones dropped), then deletes the
     /// conflict copies whose content that state now holds. Never touches another device's file.
     func write(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]], deleting copies: [URL],
                now: Date) throws {
-        let pkg = try package(doc)
+        let pkg = try PackageFiles.existingPackage(doc, locator)
         let fm = FileManager.default
-        try fm.createDirectory(at: pkg, withIntermediateDirectories: true)
         if let head = head {
             let data = try PackageCodec.encodeHead(PackageCodec.pruned(head, now: now))
             try PackageFiles.coordinatedWrite(data, to: pkg.appendingPathComponent(PackageCodec.headFileName(device)))
