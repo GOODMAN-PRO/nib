@@ -39,6 +39,7 @@ struct UndoChromeState: Equatable {
 
 /// The undo/redo toolbar items (T-081) and ⌘Z / ⇧⌘Z key commands. Both are plain descriptors pointing at
 /// `edit.undo` / `edit.redo`, so the toolbar, the shell and the command bar need nothing special.
+@MainActor
 enum UndoButtons {
     static func itemID(_ action: UndoAction) -> String { action == .undo ? "undo.undo" : "undo.redo" }
     static func keyID(_ action: UndoAction) -> String { action == .undo ? "undo.key.undo" : "undo.key.redo" }
@@ -65,7 +66,6 @@ enum UndoButtons {
         }
     }
 
-    @MainActor
     static func install(_ state: UndoChromeState, in app: NibApp) {
         for item in toolbarItems(state) { app.ui.toolbar.register(item) }
         for key in keyCommands(state) { app.content.keyCommands.register(key) }

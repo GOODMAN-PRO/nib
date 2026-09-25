@@ -5,6 +5,7 @@ import NibContracts
 import NibDesign
 
 /// Which touches may count toward an undo/redo tap. Pure, so "never on toolbars" is unit-tested.
+@MainActor
 enum UndoGestureGate {
     /// Only touches on the canvas or its content: never on a control, text field or bar (even one hosted inside the
     /// canvas), and never outside it (the floating chrome is a sibling layer above the canvas).
