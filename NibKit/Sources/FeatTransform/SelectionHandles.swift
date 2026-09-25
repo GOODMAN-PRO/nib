@@ -159,7 +159,8 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
     private var touchStreamActive = false
     private var ignoringTouchStream = false
     private var memo: BoxMemo?
-    private var actionsFor: Set<ElementID> = []
+    /// The page and items the VoiceOver actions were built for (their next/previous page depends on the page).
+    private var actionsFor: (page: PageID, ids: Set<ElementID>)?
 
     override init() {
         accessView = HandleAccessView(frame: .zero)
@@ -403,8 +404,9 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         accessView.accessibilityValue = box.items.count == 1
             ? String(localized: "1 object") : String(localized: "\(box.items.count) objects")
         accessView.accessibilityHint = String(localized: "Use the actions to move, resize or rotate it, or send it to another page.")
-        guard box.ids != actionsFor || accessView.accessibilityCustomActions == nil else { return }
-        actionsFor = box.ids
+        if let built = actionsFor, built.page == box.page, built.ids == box.ids,
+           accessView.accessibilityCustomActions != nil { return }
+        actionsFor = (page: box.page, ids: box.ids)
         accessView.accessibilityCustomActions = accessibilityActions(box)
     }
 

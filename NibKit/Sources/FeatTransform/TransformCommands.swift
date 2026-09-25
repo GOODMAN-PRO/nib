@@ -273,7 +273,7 @@ enum TransformWriter {
             var n = shift.map { TransformMath.apply($0, to: it) } ?? it
             if let parent = n.attachedTo, !moved.contains(parent) { n.attachedTo = nil }
             if n.kind == .connector { n = TransformGraph.detaching(n) { !moved.contains($0) } }
-            n.z = ""                                                    // top of the destination page
+            n.z = try tx.topZ(doc, page: dest)                          // top of the destination page (even over a tombstone)
             placed.append(try tx.put(n, doc: doc, page: dest))
         }
         for it in items where moved.contains(it.id) { try tx.delete(item: it.id, doc: doc, page: src) }

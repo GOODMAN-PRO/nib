@@ -623,17 +623,19 @@ final class DragController {
             let inv = Invocation(command: command, params: params, session: host.session, group: group)
             return try await host.app.bus.execute(inv).value
         }
-        func copies(offset: Point?) async throws -> [String] {
+        /// Copies in place (explicit zero offset), which the transform or move below then places.
+        func copies() async throws -> [String] {
             let ids = box.items.map { _ in NibID.make().raw }
-            var params: [String: JSONValue] = ["refs": refs, "ids": Self.strings(ids)]
-            if let o = offset { params["offset"] = Self.numbers([o.x, o.y]) }
-            let result = try await run("item.duplicate", .object(params))
+            let result = try await run("item.duplicate", ["refs": refs, "ids": Self.strings(ids), "offset": Self.numbers([0, 0])])
             return Self.refs(in: result) ?? ids.map { NodeRef.item(box.doc, box.page, NibID($0)).description }
         }
         switch plan {
         case .translate(let d):
             if duplicate {
-                let copied = try await copies(offset: d)
+                let copied = try await copies()
+                if d != .zero {
+                    _ = try await run(CommandIDs.itemTransform, ["refs": Self.strings(copied), "translate": Self.numbers([d.x, d.y])])
+                }
                 await select(copied)
                 return Outcome(affine: nil)
             }
@@ -642,7 +644,7 @@ final class DragController {
         case .moveToPage(let page, let d):
             var moving = refs
             if duplicate {
-                let copied = try await copies(offset: nil)
+                let copied = try await copies()
                 moving = Self.strings(copied)
             }
             let result = try await run(CommandIDs.itemMoveToPage, [
