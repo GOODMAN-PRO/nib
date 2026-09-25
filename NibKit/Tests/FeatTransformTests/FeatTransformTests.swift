@@ -96,6 +96,111 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(try item(h, Fixtures.textID).text?.frame.y, 430)
     }
 
+    func testALockedAttachedItemBlocksItsContainer() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        edit(h, Fixtures.textID) {
+            $0.attachedTo = Fixtures.shapeID
+            $0.locked = true
+        }
+        let before = try h.snapshot()
+        for (command, extra) in [("item.transform", ["translate": [0, 30]] as JSONValue),
+                                 ("item.moveToPage", ["page": "page:FIXTUREDOC01/FIXTUREPG002"] as JSONValue)] {
+            var params = try XCTUnwrap(extra.objectValue)
+            params["refs"] = .array([ref(Fixtures.shapeID)])
+            do {
+                try await h.run(command, .object(params))
+                XCTFail("\(command) moved a locked attached item")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams)
+                XCTAssertEqual(e.path, "$.refs[0]")
+                XCTAssertTrue(e.message.contains(Fixtures.textID.raw), e.message)
+            }
+        }
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testAConnectorWithAFreeEndKeepsThatEndWhenItsShapeMoves() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        edit(h, Fixtures.connectorID) { $0.connector?.to = ConnectorEnd(point: Point(400, 190)) }
+        let params: JSONValue = ["refs": .array([ref(Fixtures.shapeID)]), "translate": [10, 0]]
+        try await h.run("item.transform", params)
+        let connector = try XCTUnwrap(try item(h, Fixtures.connectorID).connector)
+        XCTAssertEqual(connector.from.point, Point(270, 245), "the anchored end follows the shape")
+        XCTAssertEqual(connector.to.point, Point(400, 190), "the free end stays put")
+        XCTAssertNil(connector.to.item)
+    }
+
+    // MARK: Input bounds (AI and plugins are a trust boundary)
+
+    func testOutOfRangeTransformsAreRefusedAndChangeNothing() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let before = try h.snapshot()
+        let stroke = JSONValue.array([ref(Fixtures.strokeID)])
+        let calls: [(JSONValue, Principal)] = [
+            (["refs": stroke, "scale": [1e308]], .user),
+            (["refs": stroke, "translate": [1e39, 0]], .user),
+            (["refs": stroke, "scale": [1e308]], .ai("t")),
+            (["refs": stroke, "matrix": [1e6, 0, 0, 1, 0, 0]], .user)       // bounded input, result off the page
+        ]
+        for (params, principal) in calls {
+            do {
+                try await h.run("item.transform", params, as: principal)
+                XCTFail("accepted \(params.jsonString())")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams, params.jsonString())
+            }
+            XCTAssertEqual(try h.snapshot(), before, params.jsonString())
+        }
+    }
+
+    func testMirroringIsRefusedForBoxesButAppliesToInk() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let mirror: JSONValue = [-1, 0, 0, 1, 400, 0]
+        do {
+            try await h.run("item.transform", ["refs": .array([ref(Fixtures.shapeID)]), "matrix": mirror])
+            XCTFail("a shape was mirrored")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+            XCTAssertEqual(e.path, "$.matrix")
+        }
+        try await h.run("item.transform", ["refs": .array([ref(Fixtures.strokeID)]), "matrix": mirror])
+        XCTAssertEqual(try item(h, Fixtures.strokeID).stroke?.points.first?.x, 328)
+    }
+
+    func testTheAIIsToldWhenNothingIsSelected() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        do {
+            try await h.run("item.transform", ["translate": [1, 0]], as: .ai("t"))
+            XCTFail("an empty selection passed silently")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+            XCTAssertEqual(e.path, "$.refs")
+        }
+    }
+
+    func testNudgingFiveThousandSelectedStrokesScansThePageOnce() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let strokes = (0..<5_000).map { i -> Item in
+            let x = Float(i % 100) * 5, y = Float(i / 100) * 5
+            return Item(kind: .stroke, z: String(format: "V%05d1", i),
+                        stroke: Stroke(style: .defaultPen, points: [StrokePoint(x: x, y: y), StrokePoint(x: x + 3, y: y + 3)],
+                                       t0: 0))
+        }
+        h.persistence.pageItems[doc]?[page2] = strokes
+        h.session.selection = Selection(doc: doc, page: page2, items: strokes.map(\.id))
+        // Budget: the same nudge with an explicit origin, which never looked anything up.
+        var t0 = Date()
+        try await h.run("item.transform", ["translate": [1, 0], "origin": [0, 0]])
+        let budget = Date().timeIntervalSince(t0)
+        t0 = Date()
+        try await h.run("item.transform", ["translate": [0, 1]])
+        let elapsed = Date().timeIntervalSince(t0)
+        XCTAssertLessThan(elapsed, budget * 4)
+        let first = try XCTUnwrap(try item(h, strokes[0].id, on: page2).stroke?.points.first)
+        XCTAssertEqual(first.x, 1)
+        XCTAssertEqual(first.y, 1)
+    }
+
     func testRotatedFrameResizesAlongItsOwnAxes() {
         let f = Frame(x: 100, y: 100, w: 80, h: 40, rotation: .pi / 6)
         let c = f.center
@@ -261,5 +366,177 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertNil(handles.drag)
         XCTAssertEqual(h.undoDepth(doc), depth)
         XCTAssertNil(host.hidden[page1])
+    }
+
+    func testATapOnTheSelectionGoesToTheTapHandlers() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let taps = TapRecorder()
+        h.app.commands.register(CommandDescriptor(id: "test.tapAt", title: "Tap", summary: "Records taps.", effect: .session)) {
+            params, _ in
+            taps.calls.append(params)
+            return ["handled": true]
+        }
+        h.app.content.tapHandlers.register(TapHandlerDescriptor(id: "test.tap", owner: "test", gesture: .tap,
+                                                                command: "test.tapAt", itemKinds: [.shape]))
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 245), host: host))
+        handles.touchesBegan(sample(page1, 180, 245), host: host)
+        handles.touchesEnded(sample(page1, 181, 246), host: host)
+        await handles.pendingTap?.value
+        let call = try XCTUnwrap(taps.calls.first)
+        XCTAssertEqual(taps.calls.count, 1)
+        XCTAssertEqual(call["gesture"], "tap")
+        XCTAssertEqual(call["ref"], ref(Fixtures.shapeID))
+        XCTAssertEqual(call["page"], "page:FIXTUREDOC01/FIXTUREPG001")
+        XCTAssertEqual(call["point"], [181, 246])
+    }
+
+    // MARK: Drags
+
+    func testOptionDragDuplicatesInOneUndoStepAndSelectsTheCopy() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        h.app.commands.register(StubDuplicate.self)
+        h.app.settings.set(NibSettings.alignObjects, false)
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        let depth = h.undoDepth(doc)
+        XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 245), host: host))
+        handles.touchesBegan(sample(page1, 180, 245, [.option]), host: host)
+        handles.touchesMoved([sample(page1, 200, 255, [.option])], host: host)
+        XCTAssertNil(host.hidden[page1], "the originals stay visible under a copy")
+        handles.touchesEnded(sample(page1, 220, 275, [.option]), host: host)
+        await handles.pendingCommit?.value
+        let original = try XCTUnwrap(try item(h, Fixtures.shapeID).shape?.frame)
+        XCTAssertEqual(original.x, 100)
+        XCTAssertEqual(original.y, 200)
+        XCTAssertEqual(h.session.selection.items.count, 1)
+        let copyID = try XCTUnwrap(h.session.selection.items.first)
+        XCTAssertNotEqual(copyID, Fixtures.shapeID)
+        let copy = try XCTUnwrap(try item(h, copyID).shape?.frame)
+        XCTAssertEqual(copy.x, 140, accuracy: 1e-9)
+        XCTAssertEqual(copy.y, 230, accuracy: 1e-9)
+        XCTAssertEqual(h.undoDepth(doc), depth + 1, "the copy and its move are one undo step")
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertThrowsError(try item(h, copyID))
+    }
+
+    func testShiftRotationTurnsInFifteenDegreeSteps() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 176), host: host))
+        XCTAssertEqual(handles.layout?.target(at: CGPoint(x: 180, y: 176)), .rotate)
+        // The bead sits straight above the centre (180, 245); turning it 20° clockwise with Shift lands on 15°.
+        let a = -70 * Double.pi / 180
+        let end = sample(page1, 180 + 69 * cos(a), 245 + 69 * sin(a), [.shift])
+        handles.touchesBegan(sample(page1, 180, 176), host: host)
+        handles.touchesMoved([end], host: host)
+        handles.touchesEnded(end, host: host)
+        await handles.pendingCommit?.value
+        let f = try XCTUnwrap(try item(h, Fixtures.shapeID).shape?.frame)
+        XCTAssertEqual(f.rotation, Double.pi / 12, accuracy: 1e-9)
+        XCTAssertEqual(f.w, 160, accuracy: 1e-9)
+        XCTAssertEqual(f.h, 90, accuracy: 1e-9)
+        XCTAssertEqual(f.center.x, 180, accuracy: 1e-9)
+        XCTAssertEqual(f.center.y, 245, accuracy: 1e-9)
+    }
+
+    func testEdgeDragOnARotatedBoxResizesAlongItsOwnWidth() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        edit(h, Fixtures.shapeID) { $0.shape?.frame.rotation = .pi / 6 }
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        // The right edge's bead sits 80 pt from the centre (180, 245) along the box's own 30° x axis.
+        let c = cos(Double.pi / 6), s = sin(Double.pi / 6)
+        let start = sample(page1, 180 + 80 * c, 245 + 80 * s)
+        let end = sample(page1, 180 + 120 * c, 245 + 120 * s)
+        let v = host.viewPoint(start.location, page: page1)
+        XCTAssertTrue(handles.hitTest(v, host: host))
+        XCTAssertEqual(handles.layout?.target(at: v), .edge(1))
+        handles.touchesBegan(start, host: host)
+        handles.touchesMoved([end], host: host)
+        handles.touchesEnded(end, host: host)
+        await handles.pendingCommit?.value
+        let f = try XCTUnwrap(try item(h, Fixtures.shapeID).shape?.frame)
+        XCTAssertEqual(f.w, 200, accuracy: 1e-6)
+        XCTAssertEqual(f.h, 90, accuracy: 1e-6)
+        XCTAssertEqual(f.rotation, .pi / 6, accuracy: 1e-9)
+    }
+
+    func testShiftDragMovesAlongOneAxis() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        h.app.settings.set(NibSettings.alignObjects, false)
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 245), host: host))
+        handles.touchesBegan(sample(page1, 180, 245), host: host)
+        handles.touchesMoved([sample(page1, 200, 250, [.shift])], host: host)
+        handles.touchesEnded(sample(page1, 220, 255, [.shift]), host: host)
+        await handles.pendingCommit?.value
+        let frame = try XCTUnwrap(try item(h, Fixtures.shapeID).shape?.frame)
+        XCTAssertEqual(frame.x, 140, accuracy: 1e-9)
+        XCTAssertEqual(frame.y, 200, accuracy: 1e-9)
+    }
+
+    func testDraggingSnapsToANeighboursEdge() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        h.app.settings.set(NibSettings.alignObjects, true)
+        h.app.settings.set(NibSettings.snapToGrid, false)
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 245), host: host))
+        // Dropped with its left edge at x 398: 2 pt from the sticky note's left edge (x 400), within the 6 pt snap.
+        handles.touchesBegan(sample(page1, 180, 245), host: host)
+        handles.touchesMoved([sample(page1, 300, 245)], host: host)
+        handles.touchesEnded(sample(page1, 478, 245), host: host)
+        await handles.pendingCommit?.value
+        let frame = try XCTUnwrap(try item(h, Fixtures.shapeID).shape?.frame)
+        XCTAssertEqual(frame.x, 400, accuracy: 1e-9)
+        XCTAssertEqual(frame.y, 200, accuracy: 1e-9)
+    }
+}
+
+/// Tap handler calls seen by a test.
+@MainActor
+private final class TapRecorder {
+    var calls: [JSONValue] = []
+}
+
+/// Stands in for item.duplicate (another feature): copies items in place under the caller's ids, then shifts them.
+private struct StubDuplicate: NibCommand {
+    struct Params: Codable {
+        var refs: [String]
+        var ids: [String]?
+        var offset: [Double]?
+    }
+
+    struct Output: Codable {
+        var refs: [String]
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "item.duplicate", title: "Duplicate", summary: "Test stub: copies items.",
+        params: .obj(["refs": .arr(.ref), "ids": .arr(.str()), "offset": .point], required: ["refs"]), effect: .edit)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        let refs = try ctx.mutate { tx in
+            try p.refs.enumerated().map { i, s -> String in
+                guard case let .item(doc, page, id)? = NodeRef(s) else { throw NibError.invalid("not an item ref") }
+                var copy = try tx.item(doc, page: page, id: id)
+                copy.id = p.ids.flatMap { i < $0.count ? NibID($0[i]) : nil } ?? NibID.make()
+                copy.z = ""
+                if let o = p.offset, o.count == 2 { copy = copy.transformed(by: .translation(o[0], o[1])) }
+                try tx.put(copy, doc: doc, page: page)
+                return NodeRef.item(doc, page, copy.id).description
+            }
+        }
+        return Output(refs: refs)
     }
 }

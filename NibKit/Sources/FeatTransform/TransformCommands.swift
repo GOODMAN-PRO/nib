@@ -5,6 +5,12 @@ import NibContracts
 
 /// Transform maths shared by the commands, the live drag preview and the handles.
 enum TransformMath {
+    /// Largest coordinate, translation or matrix entry accepted, in page points: AI and plugin input is bounded, and
+    /// no write may leave an item beyond it (non-finite geometry would break encoding and sync).
+    static let limit = 1e6
+    /// Accepted scale factors.
+    static let scaleRange = 1e-3...1e3
+
     /// The box an item occupies for handles and guides: its frame's bounds, else its ink bounds.
     static func box(_ item: Item) -> Rect { item.frame?.bounds ?? item.bounds }
 
@@ -48,8 +54,8 @@ enum TransformMath {
         if let s = scale {
             guard s.count == 1 || s.count == 2 else { throw NibError.invalid("scale is [s] or [sx, sy]", path: "$.scale") }
             let sx = s[0], sy = s.count == 2 ? s[1] : s[0]
-            guard sx.isFinite, sy.isFinite, sx > 0, sy > 0 else {
-                throw NibError.invalid("scale factors must be positive numbers", path: "$.scale")
+            guard scaleRange.contains(sx), scaleRange.contains(sy) else {
+                throw NibError.invalid("scale factors must be between 0.001 and 1000", path: "$.scale")
             }
             t = t.concatenating(.scale(sx, sy, about: origin))
             given = true
@@ -65,8 +71,8 @@ enum TransformMath {
             given = true
         }
         if let m = matrix {
-            guard m.count == 6, m.allSatisfy({ $0.isFinite }) else {
-                throw NibError.invalid("matrix is [a, b, c, d, tx, ty]", path: "$.matrix")
+            guard m.count == 6, m.allSatisfy({ abs($0) <= limit }) else {
+                throw NibError.invalid("matrix is [a, b, c, d, tx, ty], each within 1000000 of 0", path: "$.matrix")
             }
             let a = Affine(a: m[0], b: m[1], c: m[2], d: m[3], tx: m[4], ty: m[5])
             guard abs(a.determinant) > 1e-9 else { throw NibError.invalid("matrix is singular", path: "$.matrix") }
@@ -81,8 +87,20 @@ enum TransformMath {
     }
 
     static func point(_ v: [Double], path: String) throws -> Point {
-        guard v.count == 2, v[0].isFinite, v[1].isFinite else { throw NibError.invalid("expected [x, y] in page points", path: path) }
+        guard v.count == 2, abs(v[0]) <= limit, abs(v[1]) <= limit else {
+            throw NibError.invalid("expected [x, y] in page points, each within 1000000 of 0", path: path)
+        }
         return Point(v[0], v[1])
+    }
+
+    /// True when every coordinate of the item is finite and within `limit` of 0 (NaN fails every comparison).
+    static func inRange(_ item: Item) -> Bool {
+        func ok(_ v: Double) -> Bool { abs(v) <= limit }
+        let b = box(item)
+        let ink = [item.stroke].compactMap { $0 } + (item.math?.sourceInk ?? [])
+        return ok(b.minX) && ok(b.minY) && ok(b.maxX) && ok(b.maxY)
+            && ink.allSatisfy { $0.points.allSatisfy { ok(Double($0.x)) && ok(Double($0.y)) } }
+            && (item.shape?.points ?? []).allSatisfy { ok($0.x) && ok($0.y) }
     }
 
     static func rectJSON(_ r: Rect?) -> [Double]? { r.map { [$0.x, $0.y, $0.width, $0.height] } }
@@ -95,22 +113,28 @@ enum TransformGraph {
         return [c.from.item, c.to.item].compactMap { $0 }
     }
 
-    /// `ids` plus every live item that travels with them: items attached (transitively) through `attachedTo`, and
-    /// connectors whose anchored ends all sit on travelling items (a whole diagram moves as one).
-    static func closure(_ ids: Set<ElementID>, in items: [Item]) -> Set<ElementID> {
-        var moved = ids
+    /// `ids` plus every live item that travels with them, each mapped to the travelling item that pulled it in
+    /// (`ids` map to themselves): items attached (transitively) through `attachedTo`, and connectors with BOTH ends
+    /// anchored to travelling items (a whole diagram moves as one). A connector with a free end stays put; `refit`
+    /// re-pins its anchored end.
+    static func carriers(_ ids: Set<ElementID>, in items: [Item]) -> [ElementID: ElementID] {
+        var via: [ElementID: ElementID] = [:]
+        for id in ids { via[id] = id }
         while true {
-            let before = moved.count
-            for it in items where !it.deleted && !moved.contains(it.id) {
-                if let parent = it.attachedTo, moved.contains(parent) {
-                    moved.insert(it.id)
-                } else if it.kind == .connector {
-                    let a = anchors(it)
-                    if !a.isEmpty && a.allSatisfy({ moved.contains($0) }) { moved.insert(it.id) }
+            let before = via.count
+            for it in items where !it.deleted && via[it.id] == nil {
+                if let parent = it.attachedTo, via[parent] != nil {
+                    via[it.id] = parent
+                } else if let c = it.connector, let a = c.from.item, let b = c.to.item, via[a] != nil, via[b] != nil {
+                    via[it.id] = a
                 }
             }
-            if moved.count == before { return moved }
+            if via.count == before { return via }
         }
+    }
+
+    static func closure(_ ids: Set<ElementID>, in items: [Item]) -> Set<ElementID> {
+        Set(carriers(ids, in: items).keys)
     }
 
     /// Re-pins a connector's anchored ends onto their targets with `Item.anchorPoint(side:t:)`. An end anchored to a
@@ -164,6 +188,7 @@ struct TargetRef {
 enum TransformTargets {
     /// Parses `refs`; nil refs means the active session's selection. Returns nil when refs were omitted and nothing is
     /// selected (arrow-key nudges then do nothing instead of failing).
+    /// Only the user's own key commands get that silent no-op: the AI and plugins are told nothing is selected.
     static func resolve(_ refs: [String]?, _ ctx: CommandContext) throws -> [TargetRef]? {
         let list: [String]
         if let refs = refs {
@@ -173,7 +198,13 @@ enum TransformTargets {
             list = refs
         } else {
             list = ctx.activeSession?.selection.refs ?? []
-            if list.isEmpty { return nil }
+            if list.isEmpty {
+                guard ctx.principal.isUser else {
+                    throw NibError(.invalidParams, "nothing is selected", path: "$.refs",
+                                   hint: "pass item refs (query.find lists them)")
+                }
+                return nil
+            }
         }
         return try list.enumerated().map { i, s in
             guard case let .item(doc, page, id)? = NodeRef(s) else {
@@ -232,14 +263,44 @@ enum TransformWriter {
         return byID
     }
 
+    /// Everything travelling with the targets (see `TransformGraph.carriers`), after rejecting a locked traveller
+    /// (an attached child or a carried connector) with the path of the target that pulled it in.
+    private static func travellers(_ refs: [TargetRef], _ items: [Item], _ byID: [ElementID: Item]) throws -> Set<ElementID> {
+        let via = TransformGraph.carriers(Set(refs.map(\.id)), in: items)
+        if let locked = via.keys.filter({ byID[$0]?.locked == true }).min() {
+            var root = locked
+            while let up = via[root], up != root { root = up }
+            throw NibError(.invalidParams, "item \(locked) is locked and travels with item \(root)",
+                           path: refs.first(where: { $0.id == root })?.path ?? "$.refs",
+                           hint: "unlock it first with item.setLocked {refs, locked: false}")
+        }
+        return Set(via.keys)
+    }
+
+    /// `tx.put` for a transformed item, refusing geometry beyond `TransformMath.limit` (the transaction rolls back).
+    @discardableResult
+    private static func put(_ item: Item, doc: DocumentID, page: PageID, tx: DocTransaction) throws -> Item {
+        guard TransformMath.inRange(item) else {
+            throw NibError(.invalidParams, "the result is out of range", path: "$",
+                           hint: "keep items within 1000000 pt of the page origin")
+        }
+        return try tx.put(item, doc: doc, page: page)
+    }
+
     /// Transforms targets on one page plus everything travelling with them, re-pins anchored connector ends, and
     /// returns the transformed targets.
     static func transform(_ refs: [TargetRef], doc: DocumentID, page: PageID, by t: Affine,
                           tx: DocTransaction) throws -> [Item] {
         let items = try tx.items(doc, page: page)
         let byID = try checked(refs, items, page: page)
-        let moved = TransformGraph.closure(Set(refs.map(\.id)), in: items)
+        let moved = try travellers(refs, items, byID)
+        // ponytail: frames have no mirror flag, so a mirroring matrix would turn boxed text upside down instead.
+        if t.determinant < 0, moved.contains(where: { byID[$0]?.frame != nil }) {
+            throw NibError(.invalidParams, "boxes cannot be mirrored", path: "$.matrix",
+                           hint: "a matrix with a negative determinant mirrors; text, images, stickies and shapes cannot")
+        }
         var lookup = byID
+        var changed = moved
         for id in moved {
             if let it = byID[id] { lookup[id] = TransformMath.apply(t, to: it) }
         }
@@ -248,9 +309,10 @@ enum TransformWriter {
             guard inMoved || TransformGraph.anchors(c).contains(where: { moved.contains($0) }),
                   let current = lookup[c.id] else { continue }
             lookup[c.id] = TransformGraph.refit(current, lookup: lookup, moved: moved, t: t, alreadyTransformed: inMoved)
+            changed.insert(c.id)
         }
-        for it in items {
-            if let next = lookup[it.id], next != it { try tx.put(next, doc: doc, page: page) }
+        for it in items where changed.contains(it.id) {
+            if let next = lookup[it.id], next != it { try put(next, doc: doc, page: page, tx: tx) }
         }
         return refs.compactMap { lookup[$0.id] }
     }
@@ -266,7 +328,7 @@ enum TransformWriter {
             return try transform(refs, doc: doc, page: src, by: .translation(o.x, o.y), tx: tx)
         }
         let targets = Set(refs.map(\.id))
-        let moved = TransformGraph.closure(targets, in: items)
+        let moved = try travellers(refs, items, byID)
         let shift = offset.map { Affine.translation($0.x, $0.y) }
         var placed: [Item] = []
         for it in items where moved.contains(it.id) {                  // bottom first: z order survives the move
@@ -274,7 +336,7 @@ enum TransformWriter {
             if let parent = n.attachedTo, !moved.contains(parent) { n.attachedTo = nil }
             if n.kind == .connector { n = TransformGraph.detaching(n) { !moved.contains($0) } }
             n.z = try tx.topZ(doc, page: dest)                          // top of the destination page (even over a tombstone)
-            placed.append(try tx.put(n, doc: doc, page: dest))
+            placed.append(try put(n, doc: doc, page: dest, tx: tx))
         }
         for it in items where moved.contains(it.id) { try tx.delete(item: it.id, doc: doc, page: src) }
         for c in items where c.kind == .connector && !moved.contains(c.id) {
@@ -309,11 +371,14 @@ struct ItemTransform: NibCommand {
             + "rotate degrees clockwise, matrix [a,b,c,d,tx,ty]; about origin.",
         params: .obj([
             "refs": .arr(.ref, "item refs; omit to use the current selection"),
-            "translate": .arr(.num(), "[dx, dy] in page points"),
-            "scale": .arr(.num(), "[s] or [sx, sy], each > 0"),
+            "translate": .arr(.num(min: -TransformMath.limit, max: TransformMath.limit), "[dx, dy] in page points"),
+            "scale": .arr(.num(min: 0.001, max: 1000), "[s] or [sx, sy], each 0.001...1000"),
             "rotate": .num("degrees, clockwise on screen"),
-            "matrix": .arr(.num(), "[a, b, c, d, tx, ty] applied after scale, rotate and translate"),
-            "origin": .point
+            "matrix": .arr(.num(min: -TransformMath.limit, max: TransformMath.limit),
+                           "[a, b, c, d, tx, ty] applied after scale, rotate and translate; a mirroring matrix "
+                               + "(negative determinant) is refused when text, images, stickies or shapes would move"),
+            "origin": .arr(.num(min: -TransformMath.limit, max: TransformMath.limit),
+                           "[x, y] in page points; default: the centre of the targets' box")
         ], required: []),
         examples: [
             try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"], "translate": [24, 12]}"#),
@@ -325,16 +390,21 @@ struct ItemTransform: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         guard let targets = try TransformTargets.resolve(p.refs, ctx) else { return Output(refs: [], bbox: nil) }
-        let origin: Point
+        let groups = TransformTargets.byPage(targets)
+        var origin = Point.zero
         if let o = p.origin {
             origin = try TransformMath.point(o, path: "$.origin")
-        } else {
-            let boxes = targets.compactMap { try? ctx.workspace.item($0.doc, page: $0.page, id: $0.id) }.map(TransformMath.box)
+        } else if p.scale != nil || p.rotate != nil {                 // translate and matrix never use the origin
+            var boxes: [Rect] = []
+            for g in groups {                                         // one page scan per page, not one per target
+                let wanted = Set(g.refs.map(\.id))
+                let items = (try? ctx.workspace.items(g.doc, page: g.page)) ?? []
+                boxes += items.filter { wanted.contains($0.id) }.map(TransformMath.box)
+            }
             origin = TransformMath.union(boxes)?.center ?? .zero
         }
         let t = try TransformMath.affine(translate: p.translate, scale: p.scale, rotate: p.rotate, matrix: p.matrix,
                                          origin: origin)
-        let groups = TransformTargets.byPage(targets)
         let results = try ctx.mutate { tx -> [[Item]] in
             try groups.map { try TransformWriter.transform($0.refs, doc: $0.doc, page: $0.page, by: t, tx: tx) }
         }
@@ -366,7 +436,8 @@ struct ItemMoveToPage: NibCommand {
         params: .obj([
             "refs": .arr(.ref, "item refs; omit to use the current selection"),
             "page": .str("destination page ref page:DOC/PAGE"),
-            "offset": .arr(.num(), "[dx, dy] added on the way, in page points")
+            "offset": .arr(.num(min: -TransformMath.limit, max: TransformMath.limit),
+                           "[dx, dy] added on the way, in page points")
         ], required: ["page"]),
         examples: [
             try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"], "page": "page:FIXTUREDOC01/FIXTUREPG002", "offset": [0, 40]}"#),

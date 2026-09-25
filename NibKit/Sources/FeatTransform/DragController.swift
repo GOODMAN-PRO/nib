@@ -98,6 +98,11 @@ final class DragController {
     var isDragging: Bool { phase == .dragging }
     var isCommitting: Bool { phase == .committing }
 
+    /// True when a touch ending at `v` never passed the slop: a tap, not a drag.
+    func isTap(at v: CGPoint) -> Bool {
+        phase == .armed && hypot(v.x - start.x, v.y - start.y) < Self.slop
+    }
+
     init(host: CanvasHost, box: SelectionBox, target: HandleTarget, start: CGPoint, duplicate: Bool,
          layer: CALayer, changed: @escaping () -> Void) {
         self.host = host

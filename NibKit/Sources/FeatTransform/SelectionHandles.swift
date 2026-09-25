@@ -1,4 +1,5 @@
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 import NibContracts
 import NibDesign
 
@@ -155,12 +156,19 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
     private(set) var drag: DragController?
     /// The last drag's commit, so tests can await it.
     private(set) var pendingCommit: Task<Void, Never>?
+    /// The last tap forwarded to `content.tapHandlers`, so tests can await it.
+    private(set) var pendingTap: Task<Void, Never>?
     private var pendingTarget: HandleTarget?
     private var touchStreamActive = false
     private var ignoringTouchStream = false
-    private var memo: BoxMemo?
-    /// The page and items the VoiceOver actions were built for (their next/previous page depends on the page).
-    private var actionsFor: (page: PageID, ids: Set<ElementID>)?
+    private var memo: BoxMemo? {
+        didSet { cached = nil }
+    }
+    /// The box built for a selection; commits (and undo, redo, sync) clear it, scrolling only re-projects it.
+    private var cached: (selection: Selection, box: SelectionBox?)?
+    private var commits: EventSubscription?
+    /// What the VoiceOver actions were built for (next/previous page depends on the page and the live page order).
+    private var actionsFor: (page: PageID, ids: Set<ElementID>, pages: [PageID])?
 
     override init() {
         accessView = HandleAccessView(frame: .zero)
@@ -186,17 +194,21 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         }
         host.canvasView.addSubview(accessView)
 
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(twoFingerPan(_:)))
+        let pan = DuplicatePan(target: self, action: #selector(twoFingerPan(_:)))
         pan.minimumNumberOfTouches = 2
         pan.maximumNumberOfTouches = 2
         pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
         pan.delegate = self
         host.canvasView.addGestureRecognizer(pan)
         twoFinger = pan
+        commits = host.app.bus.observeCommits { [weak self] _ in self?.cached = nil }
         refresh()
     }
 
     func detach(from host: CanvasHost) {
+        commits?.cancel()
+        commits = nil
+        cached = nil
         drag?.cancel()
         drag = nil
         container.removeFromSuperlayer()
@@ -233,7 +245,41 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
         defer { endTouchStream() }
         guard !ignoringTouchStream, let d = drag else { return }
-        finish(d, at: host.viewPoint(sample.location, page: sample.page), modifiers: sample.modifiers)
+        let v = host.viewPoint(sample.location, page: sample.page)
+        let tapped = d.isTap(at: v)
+        finish(d, at: v, modifiers: sample.modifiers)
+        if tapped { pendingTap = forwardTap(sample, host: host) }
+    }
+
+    /// A touch on the selection that never became a drag is a tap: it goes to `content.tapHandlers` in order (link
+    /// taps, selection.tapAt, editing the selected text or note…) until one returns {"handled": true}.
+    /// ponytail: single taps only; double-taps, long-presses and the active tool's own tap need a contract way for
+    /// an attachment to decline a touch it already claimed (CanvasAttachment has none yet).
+    private func forwardTap(_ sample: CanvasSample, host: CanvasHost) -> Task<Void, Never>? {
+        let doc = host.documentID
+        let items = (try? host.app.workspace.items(doc, page: sample.page)) ?? []
+        let top = items.last { TransformMath.box($0).contains(sample.location) }
+        let readOnly = host.session.readOnly
+        let handlers = host.app.content.tapHandlers.all.filter { h in
+            guard h.gesture == .tap, !readOnly || h.worksInReadOnly else { return false }
+            if let kinds = h.itemKinds, !(top.map { kinds.contains($0.kind) } ?? false) { return false }
+            if let keys = h.drawKeys, !(top.map { keys.contains($0.drawKey) } ?? false) { return false }
+            return true
+        }
+        guard !handlers.isEmpty else { return nil }
+        var params: [String: JSONValue] = [
+            "page": .string(NodeRef.page(doc, sample.page).description),
+            "point": .array([.number(sample.location.x), .number(sample.location.y)]),
+            "gesture": .string(CanvasGesture.tap.rawValue)
+        ]
+        if let top { params["ref"] = .string(NodeRef.item(doc, sample.page, top.id).description) }
+        let bus = host.app.bus, session = host.session
+        return Task { @MainActor in
+            for h in handlers {
+                let r = try? await bus.execute(h.command, .object(params), session: session)
+                if r?["handled"]?.boolValue == true { return }
+            }
+        }
     }
 
     func touchesCancelled(host: CanvasHost) {
@@ -323,10 +369,18 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         let session = host.session
         let sel = session.selection
         guard !session.readOnly, !session.isEditingText, !sel.isEmpty, let doc = sel.doc, doc == host.documentID,
-              let page = sel.page, host.pageFrame(page) != nil,
-              let pageItems = try? host.app.workspace.items(doc, page: page) else { return nil }
+              let page = sel.page, host.pageFrame(page) != nil else { return nil }
+        if let c = cached, c.selection == sel { return c.box }
+        let built = buildBox(sel, doc: doc, page: page, host: host)
+        cached = (sel, built)
+        return built
+    }
+
+    /// Runs when the selection changes or something commits, never per scroll frame.
+    private func buildBox(_ sel: Selection, doc: DocumentID, page: PageID, host: CanvasHost) -> SelectionBox? {
+        guard let pageItems = try? host.app.workspace.allItems(doc, page: page) else { return nil }
         let wanted = Set(sel.items)
-        let items = pageItems.filter { wanted.contains($0.id) }
+        let items = pageItems.filter { !$0.deleted && wanted.contains($0.id) }
         // Locked items are selectable but immovable: no handles, and touches go to the tools.
         guard !items.isEmpty, !items.contains(where: { $0.locked }) else { return nil }
         let union = TransformMath.union(items.map(TransformMath.box)) ?? .zero
@@ -394,28 +448,40 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         accessView.frame = l.bounds
         // Topmost for pointer hover (it passes every touch through, so the ink view below still gets the Pencil).
         if host.canvasView.subviews.last !== accessView { host.canvasView.bringSubviewToFront(accessView) }
-        updateAccessibility(box)
+        updateAccessibility(box, host: host)
     }
 
     // MARK: VoiceOver (every drag has an action equivalent)
 
-    private func updateAccessibility(_ box: SelectionBox) {
+    private func updateAccessibility(_ box: SelectionBox, host: CanvasHost) {
         accessView.accessibilityLabel = String(localized: "Selection")
         accessView.accessibilityValue = box.items.count == 1
             ? String(localized: "1 object") : String(localized: "\(box.items.count) objects")
         accessView.accessibilityHint = String(localized: "Use the actions to move, resize or rotate it, or send it to another page.")
-        if let built = actionsFor, built.page == box.page, built.ids == box.ids,
+        let pages = ((try? host.app.workspace.content(box.doc).livePages) ?? []).map(\.id)
+        if let built = actionsFor, built.page == box.page, built.ids == box.ids, built.pages == pages,
            accessView.accessibilityCustomActions != nil { return }
-        actionsFor = (page: box.page, ids: box.ids)
-        accessView.accessibilityCustomActions = accessibilityActions(box)
+        actionsFor = (page: box.page, ids: box.ids, pages: pages)
+        accessView.accessibilityCustomActions = accessibilityActions(box, pages: pages)
     }
 
-    private func accessibilityActions(_ box: SelectionBox) -> [UIAccessibilityCustomAction] {
+    private func accessibilityActions(_ box: SelectionBox, pages: [PageID]) -> [UIAccessibilityCustomAction] {
+        /// Announces only once the command succeeded; a failure is announced and reported like any failed command.
         func action(_ name: String, _ command: String, _ params: JSONValue, announce: String? = nil) -> UIAccessibilityCustomAction {
             UIAccessibilityCustomAction(name: name) { [weak self] _ in
                 guard let host = self?.host else { return false }
-                host.app.perform(command, params, session: host.session)
-                if let announce { UIAccessibility.post(notification: .announcement, argument: announce) }
+                let app = host.app, session = host.session
+                Task { @MainActor in
+                    do {
+                        try await app.bus.execute(command, params, session: session)
+                        if let announce { UIAccessibility.post(notification: .announcement, argument: announce) }
+                    } catch {
+                        let e = NibError.wrap(error)
+                        NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                                        userInfo: ["command": command, "error": e])
+                        UIAccessibility.post(notification: .announcement, argument: e.message)
+                    }
+                }
                 return true
             }
         }
@@ -429,18 +495,22 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
             action(String(localized: "Rotate clockwise"), CommandIDs.itemTransform, ["rotate": 90]),
             action(String(localized: "Rotate anticlockwise"), CommandIDs.itemTransform, ["rotate": -90]),
             action(String(localized: "Enlarge"), CommandIDs.itemTransform, ["scale": .array([.number(1.25)])]),
-            action(String(localized: "Shrink"), CommandIDs.itemTransform, ["scale": .array([.number(0.8)])])
+            action(String(localized: "Shrink"), CommandIDs.itemTransform, ["scale": .array([.number(0.8)])]),
+            // The blue edge handles: one axis at a time.
+            action(String(localized: "Make wider"), CommandIDs.itemTransform, ["scale": pair(1.25, 1)]),
+            action(String(localized: "Make narrower"), CommandIDs.itemTransform, ["scale": pair(0.8, 1)]),
+            action(String(localized: "Make taller"), CommandIDs.itemTransform, ["scale": pair(1, 1.25)]),
+            action(String(localized: "Make shorter"), CommandIDs.itemTransform, ["scale": pair(1, 0.8)])
         ]
-        if let pages = try? host?.app.workspace.content(box.doc).livePages,
-           let i = pages.firstIndex(where: { $0.id == box.page }) {
+        if let i = pages.firstIndex(of: box.page) {
             if i + 1 < pages.count {
                 list.append(action(String(localized: "Move to next page"), CommandIDs.itemMoveToPage,
-                                   ["page": .string(NodeRef.page(box.doc, pages[i + 1].id).description)],
+                                   ["page": .string(NodeRef.page(box.doc, pages[i + 1]).description)],
                                    announce: String(localized: "Moved to page \(i + 2)")))
             }
             if i > 0 {
                 list.append(action(String(localized: "Move to previous page"), CommandIDs.itemMoveToPage,
-                                   ["page": .string(NodeRef.page(box.doc, pages[i - 1].id).description)],
+                                   ["page": .string(NodeRef.page(box.doc, pages[i - 1]).description)],
                                    announce: String(localized: "Moved to page \(i)")))
             }
         }
@@ -485,12 +555,47 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         return (0..<2).allSatisfy { layout.contains(gestureRecognizer.location(ofTouch: $0, in: host.canvasView)) }
     }
 
-    /// Two fingers resting on the selection duplicate it rather than scroll or zoom the canvas.
+    /// Two fingers resting on the selection duplicate it rather than scroll the canvas; a pinch fails the duplicate
+    /// (`DuplicatePan`), so the canvas still zooms.
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === twoFinger, let host, layout != nil,
               otherGestureRecognizer.view === host.canvasView else { return false }
         return otherGestureRecognizer is UIPanGestureRecognizer || otherGestureRecognizer is UIPinchGestureRecognizer
+    }
+}
+
+/// The two-finger duplicate drag. It fails as soon as the fingers pinch (their spread changes), even while their
+/// centroid stays put, so the canvas pan and pinch that wait for it still zoom a large selection.
+final class DuplicatePan: UIPanGestureRecognizer {
+    /// Spread change, in view points, that makes two fingers a pinch.
+    static let pinchSlop: CGFloat = 12
+    private var startSpread: CGFloat?
+
+    private var spread: CGFloat? {
+        guard numberOfTouches == 2 else { return nil }
+        let a = location(ofTouch: 0, in: view), b = location(ofTouch: 1, in: view)
+        return hypot(a.x - b.x, a.y - b.y)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesBegan(touches, with: event)
+        startSpread = spread
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesMoved(touches, with: event)
+        guard state == .possible, let s = spread else { return }
+        guard let s0 = startSpread else {
+            startSpread = s
+            return
+        }
+        if abs(s - s0) > Self.pinchSlop { state = .failed }
+    }
+
+    override func reset() {
+        super.reset()
+        startSpread = nil
     }
 }
 
