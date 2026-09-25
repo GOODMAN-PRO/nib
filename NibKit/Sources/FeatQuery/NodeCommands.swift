@@ -613,7 +613,7 @@ struct ItemCreate: NibCommand {
                      required: ["page", "item"]),
         examples: [
             try! JSONValue.parse(#"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "item": {"kind": "sticky", "sticky": {"frame": {"x": 400, "y": 300, "w": 140, "h": 140}, "text": "New note"}}}"#),
-            try! JSONValue.parse(#"{"page": "page:FIXTUREDOC01/FIXTUREPG002", "item": {"kind": "stroke", "stroke": {"style": {"color": "#D0021BFF"}, "fmt": "xy", "pts": [72, 72, 200, 120]}}}"#)
+            try! JSONValue.parse(##"{"page": "page:FIXTUREDOC01/FIXTUREPG002", "item": {"kind": "stroke", "stroke": {"style": {"color": "#D0021BFF"}, "fmt": "xy", "pts": [72, 72, 200, 120]}}}"##)
         ],
         effect: .edit)
 
@@ -653,7 +653,7 @@ struct ItemUpdate: NibCommand {
         examples: [
             try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01", "patch": {"stroke": {"fmt": "xy", "pts": [72, 140, 150, 170, 230, 140]}}}"#),
             try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "patch": {"text": "Updated text", "frame": {"w": 320}}}"#),
-            try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01", "patch": {"color": "#A0E7E5FF", "layer": 1}}"#)
+            try! JSONValue.parse(##"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01", "patch": {"color": "#A0E7E5FF", "layer": 1}}"##)
         ],
         effect: .edit)
 
