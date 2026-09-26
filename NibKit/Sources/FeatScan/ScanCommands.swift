@@ -538,9 +538,8 @@ enum ScanFeedback {
 
     static func added(_ count: Int, doc: DocumentID, ctx: CommandContext) {
         guard count > 0, let host = ctx.activeSession?.floatingHost ?? ctx.navigator?.floatingHost else { return }
-        weak var app = ctx.app
         let params: JSONValue = ["doc": .string(NodeRef.document(doc).description), "group": .string(ctx.group)]
-        host.postToast(message(count), actionTitle: String(localized: "Undo")) {
+        host.postToast(message(count), actionTitle: String(localized: "Undo")) { [weak app = ctx.app] in
             app?.perform(CommandIDs.revertGroup, params)
         }
     }
