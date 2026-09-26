@@ -48,3 +48,6 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
   - F041: if moved to a G26 closure hook, remove layer.exportOptions row in the same change.
   - F036: restore drop-to-attach (running).
   - NibContracts (v2/contracts2): PanelIDs.studyLearn -> studysession.smartLearn + practice; CommandIDs constants for new ids.
+- F074 (unbuilt) must parse nib://bridge/pair?host=&port=&token= (port param added by F091). Add to F074 spec before its build.
+- F019 (unbuilt) must present sheet panels from the library (panel.open without an open document: F021 New Notebook sheet, F044, F020 rely on it), fill MenuContext.folder, and double-tap + New -> doc.quickNote. Add to F019 spec before build.
+- Unpinned result shapes to pin (spec owner): template.choose kind values + result size; doc.suggestTitle result; panel.open params delivery to PanelContext.params (flat vs nested).
