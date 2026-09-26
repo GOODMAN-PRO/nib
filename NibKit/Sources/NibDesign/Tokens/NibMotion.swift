@@ -41,16 +41,21 @@ public enum NibMotion {
     /// Liquid Off: set by `NibDropletContainer` from the Appearance setting, next to `NibHaptics.isEnabled`.
     public static var forcesReduced = false
 
+    /// A held droplet following the finger. Critically damped, so it never overshoots the finger; it trails it by
+    /// v·ζ·response/π (27 ms of travel: 27 pt at 1000 pt/s) and catches up within about 0.1 s of the finger stopping.
+    /// That slight lag is the water's weight (DESIGN.md §10.1).
     public static let follow = NibSpring(response: 0.085, dampingRatio: 1.0)
     public static let tap = NibSpring(response: 0.22, dampingRatio: 0.90)
     public static let lift = NibSpring(response: 0.30, dampingRatio: 0.72)
     /// Selection bead head: a selection indicator never overshoots.
     public static let glide = NibSpring(response: 0.20, dampingRatio: 1.0)
     public static let trail = NibSpring(response: 0.26, dampingRatio: 1.0)
-    /// The palette's dock only, from the full release velocity.
+    /// The palette's dock only (`.dropletDockable`, `NibToolPalette`), from the full release velocity: one small
+    /// overshoot, then the plip on arrival (DESIGN.md §10.11).
     public static let snap = NibSpring(response: 0.50, dampingRatio: 0.80)
     /// Grid and slot snaps, from `DropletPhysics.slotVelocity`: lands without passing the slot.
     public static let slot = NibSpring(response: 0.40, dampingRatio: 1.0)
+    /// Neighbours making room (the library's live reorder, `NibReflow`; page thumbnails) and folder films.
     public static let reflow = NibSpring(response: 0.44, dampingRatio: 0.86)
     public static let tether = NibSpring(response: 0.40, dampingRatio: 0.62)
     public static let bud = NibSpring(response: 0.42, dampingRatio: 0.76)
@@ -82,6 +87,9 @@ public enum NibMotion {
     public static let laserFade = Animation.linear(duration: 0.6)
 
     public static let recedeDelay: Double = 0.45
+    /// A HUD that answers a gesture (the ruler's angle, the pinch-zoom percentage) lingers this long after the fingers
+    /// lift, then fades out with `exit` (DESIGN.md §9.2).
+    public static let hudLinger: Double = 0.6
     public static let budRevealDelay: Double = 0.30
     public static let toastDuration: Double = 6
     public static let combineHold: Double = 0.38
