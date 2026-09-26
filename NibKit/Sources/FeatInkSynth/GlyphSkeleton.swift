@@ -81,10 +81,11 @@ struct InkBitmap: Equatable {
     }
 }
 
-/// Glyph outlines → centre-line strokes: each glyph is rasterised at `emPixels`, thinned (Zhang–Suen), cleaned to a
-/// one-pixel 8-connected skeleton, traced into polylines (short spurs pruned, branches that continue straight through
-/// a junction joined into one pen stroke), smoothed and simplified. Pure and thread-safe; results are cached per font
-/// and glyph, so a glyph is skeletonised once per process.
+/// Glyph outlines → centre-line strokes: each outline shape of a glyph (contours that overlap or abut; a hole goes with
+/// its outline) is rasterised at `emPixels`, thinned (Zhang–Suen, every blob kept), cleaned to a one-pixel 8-connected
+/// skeleton, traced into polylines (short spurs pruned, branches that continue straight through a junction joined into
+/// one pen stroke), smoothed and simplified. Pure and thread-safe; results are cached per font and glyph, so a glyph
+/// is skeletonised once per process.
 enum GlyphSkeleton {
     /// Raster resolution in pixels per em.
     static let emPixels = 96.0
@@ -128,15 +129,120 @@ enum GlyphSkeleton {
         let height = Int((Double(box.height) + 2 * pad).rounded(.up))
         guard width > 2, height > 2, width * height <= 4_000_000 else { return [] }
         let toBitmap = CGAffineTransform(translationX: CGFloat(pad) - box.minX, y: CGFloat(pad) - box.minY)
-        guard let bitmap = InkBitmap.render(path, width: width, height: height, transform: toBitmap) else { return [] }
         // Bitmap space (x right, y down from the top row) → font units (y up) → em (y down).
         let ox = Double(box.minX) - pad, oy = Double(box.minY) - pad, h = Double(height)
-        let lines = centreLines(of: bitmap).map { line in
+        let lines = centreLines(of: path, width: width, height: height, transform: toBitmap).map { line in
             line.map { p in Point((p.x + ox) / emPixels, -((h - p.y) + oy) / emPixels) }
         }
         return lines.map { oriented($0) }.sorted { a, b in
             (a.map { $0.x }.min() ?? 0) < (b.map { $0.x }.min() ?? 0)
         }
+    }
+
+    // MARK: Outline shapes
+
+    /// Centre-lines of the filled outline `path`, rasterised at `width` × `height` through `transform`, in bitmap
+    /// coordinates. Each outline shape (`shapes`) is thinned on its own: parts of a glyph that only touch at raster
+    /// resolution (Marker Felt's ÷, whose lower dot meets the bar's tail at a pixel corner) stay separate strokes
+    /// instead of merging into one blob whose skeleton loses both.
+    static func centreLines(of path: CGPath, width: Int, height: Int, transform: CGAffineTransform) -> [[Point]] {
+        var lines: [[Point]] = []
+        for shape in shapes(of: path, width: width, height: height, transform: transform) {
+            guard let bitmap = InkBitmap.render(shape, width: width, height: height, transform: transform) else { continue }
+            lines += centreLines(of: bitmap)
+        }
+        return lines
+    }
+
+    /// The contours of `path` grouped into shapes (`contourGroups` of their individual fills), each shape one path
+    /// filled with non-zero winding, so a hole stays with the outline around it.
+    static func shapes(of path: CGPath, width: Int, height: Int, transform: CGAffineTransform) -> [CGPath] {
+        let parts = contours(of: path)
+        guard parts.count > 1 else { return [path] }
+        let masks = parts.map { InkBitmap.render($0, width: width, height: height, transform: transform)?.pixels ?? [] }
+        return contourGroups(masks, width: width, height: height).map { group -> CGPath in
+            let shape = CGMutablePath()
+            for k in group { shape.addPath(parts[k]) }
+            return shape
+        }
+    }
+
+    /// The closed contours (subpaths) of `path`, in order.
+    static func contours(of path: CGPath) -> [CGPath] {
+        var result: [CGMutablePath] = []
+        path.applyWithBlock { element in
+            let e = element.pointee
+            switch e.type {
+            case .moveToPoint:
+                let contour = CGMutablePath()
+                contour.move(to: e.points[0])
+                result.append(contour)
+            case .addLineToPoint:
+                result.last?.addLine(to: e.points[0])
+            case .addQuadCurveToPoint:
+                result.last?.addQuadCurve(to: e.points[1], control: e.points[0])
+            case .addCurveToPoint:
+                result.last?.addCurve(to: e.points[2], control1: e.points[0], control2: e.points[1])
+            case .closeSubpath:
+                result.last?.closeSubpath()
+            @unknown default:
+                break
+            }
+        }
+        return result.map { $0 as CGPath }
+    }
+
+    /// Groups contours by their fills (`masks`, 0/1 rows of `width` × `height`, one per contour): contours whose
+    /// fills share a pixel (an outline and its holes, the overlapping pieces of a stroke) or meet along a seam of at
+    /// least `seam` pixel edges (abutting pieces) belong together; contours that only touch at a pixel corner, or
+    /// not at all, are apart. Returns contour indices per group, in contour order.
+    static func contourGroups(_ masks: [[UInt8]], width w: Int, height h: Int, seam: Int = 3) -> [[Int]] {
+        let n = masks.count
+        guard n > 0 else { return [] }
+        var parent = Array(0..<n)
+        func find(_ x: Int) -> Int {
+            var x = x
+            while parent[x] != x {
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            }
+            return x
+        }
+        func union(_ a: Int, _ b: Int) {
+            let ra = find(a), rb = find(b)
+            if ra != rb { parent[max(ra, rb)] = min(ra, rb) }
+        }
+        let area = max(0, w) * max(0, h)
+        // The first contour covering each pixel; a pixel covered twice joins the two.
+        var owner = [Int](repeating: -1, count: area)
+        for (k, mask) in masks.enumerated() where mask.count == area {
+            for i in 0..<area where mask[i] != 0 {
+                if owner[i] < 0 { owner[i] = k } else { union(owner[i], k) }
+            }
+        }
+        // Pixel edges between different groups (right and down neighbours).
+        var contacts: [Int: Int] = [:]
+        for i in 0..<area where owner[i] >= 0 {
+            let right = (i % w) + 1 < w ? i + 1 : -1
+            let down = i + w < area ? i + w : -1
+            for j in [right, down] where j >= 0 && owner[j] >= 0 {
+                let a = find(owner[i]), b = find(owner[j])
+                if a != b { contacts[min(a, b) * n + max(a, b), default: 0] += 1 }
+            }
+        }
+        for (key, count) in contacts where count >= seam { union(key / n, key % n) }
+        var groups: [[Int]] = []
+        var slot: [Int: Int] = [:]
+        for k in 0..<n {
+            let root = find(k)
+            if let g = slot[root] {
+                groups[g].append(k)
+            } else {
+                slot[root] = groups.count
+                groups.append([k])
+            }
+        }
+        return groups
     }
 
     /// Writing direction: left to right, or top to bottom for mostly vertical strokes. Closed loops are kept.

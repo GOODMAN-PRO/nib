@@ -105,6 +105,55 @@ final class InkTypesetterTests: XCTestCase {
         XCTAssertEqual(divide.filter { extent($0).x <= 3 && extent($0).y <= 3 }.count, 2, "two dots: \(divide)")
     }
 
+    func testContourGroupsJoinOverlapsAndSeamsButNotCorners() {
+        func mask(_ inside: (Double, Double) -> Bool) -> [UInt8] { bitmap(40, 40, inside).pixels }
+        let a = mask { x, y in x >= 2 && x < 12 && y >= 2 && y < 12 }
+        let corner = mask { x, y in x >= 12 && x < 22 && y >= 12 && y < 22 }
+        let overlap = mask { x, y in x >= 8 && x < 20 && y >= 8 && y < 20 }
+        let shortContact = mask { x, y in x >= 12 && x < 20 && y >= 10 && y < 18 }
+        let seam = mask { x, y in x >= 12 && x < 30 && y >= 2 && y < 8 }
+        let far = mask { x, y in x >= 30 && x < 36 && y >= 30 && y < 36 }
+        XCTAssertEqual(GlyphSkeleton.contourGroups([a, corner], width: 40, height: 40), [[0], [1]], "a pixel corner")
+        XCTAssertEqual(GlyphSkeleton.contourGroups([a, shortContact], width: 40, height: 40), [[0], [1]], "2 pixel edges")
+        XCTAssertEqual(GlyphSkeleton.contourGroups([a, seam], width: 40, height: 40), [[0, 1]], "a 6-edge seam")
+        XCTAssertEqual(GlyphSkeleton.contourGroups([far, a, overlap, [], corner], width: 40, height: 40),
+                       [[0], [1, 2, 4], [3]], "overlaps chain; an empty fill is its own group")
+        XCTAssertEqual(GlyphSkeleton.contourGroups([], width: 40, height: 40), [])
+    }
+
+    func testOutlinePartsThatOnlyTouchAtACornerAreThinnedApart() throws {
+        // Two squares meeting at a pixel corner (like Marker Felt's ÷, whose lower dot meets the bar's tail): one blob
+        // as a raster, two shapes and two strokes.
+        let corner = CGMutablePath()
+        corner.addRect(CGRect(x: 2, y: 2, width: 10, height: 10))
+        corner.addRect(CGRect(x: 12, y: 12, width: 10, height: 10))
+        XCTAssertEqual(GlyphSkeleton.contours(of: corner).count, 2)
+        XCTAssertEqual(GlyphSkeleton.shapes(of: corner, width: 24, height: 24, transform: .identity).count, 2)
+        XCTAssertEqual(GlyphSkeleton.centreLines(of: corner, width: 24, height: 24, transform: .identity).count, 2)
+
+        // Pieces that abut along a seam stay one stroke.
+        let seam = CGMutablePath()
+        seam.addRect(CGRect(x: 2, y: 2, width: 10, height: 6))
+        seam.addRect(CGRect(x: 12, y: 2, width: 18, height: 6))
+        XCTAssertEqual(GlyphSkeleton.shapes(of: seam, width: 34, height: 10, transform: .identity).count, 1)
+        let bar = GlyphSkeleton.centreLines(of: seam, width: 34, height: 10, transform: .identity)
+        XCTAssertEqual(bar.count, 1)
+        XCTAssertGreaterThan(extent(try XCTUnwrap(bar.first)).x, 18)
+
+        // A hole stays with the outline around it (non-zero winding: the inner contour runs the other way round).
+        let ring = CGMutablePath()
+        ring.addLines(between: [CGPoint(x: 2, y: 2), CGPoint(x: 30, y: 2), CGPoint(x: 30, y: 30), CGPoint(x: 2, y: 30)])
+        ring.closeSubpath()
+        ring.addLines(between: [CGPoint(x: 10, y: 10), CGPoint(x: 10, y: 22), CGPoint(x: 22, y: 22), CGPoint(x: 22, y: 10)])
+        ring.closeSubpath()
+        XCTAssertEqual(GlyphSkeleton.contours(of: ring).count, 2)
+        let shapes = GlyphSkeleton.shapes(of: ring, width: 32, height: 32, transform: .identity)
+        XCTAssertEqual(shapes.count, 1)
+        let filled = try XCTUnwrap(InkBitmap.render(try XCTUnwrap(shapes.first), width: 32, height: 32, transform: .identity))
+        XCTAssertEqual(filled.pixels[16 * 32 + 16], 0, "the hole is kept")
+        XCTAssertEqual(filled.pixels[4 * 32 + 16], 1, "the outline is filled")
+    }
+
     /// Dotted letters and marks keep every part in every font (a dotless i, a ÷ read as − or a ? without its dot
     /// would change what was written, e.g. a Math Assist answer).
     func testDottedLettersAndMarksKeepEveryPartInEveryFont() {
@@ -259,40 +308,6 @@ final class InkTypesetterTests: XCTestCase {
             XCTAssertTrue(b.points.allSatisfy { $0.width > 0 && $0.height > 0 }, "nib sizes derived")
             XCTAssertEqual(b.style, a.style)
         }
-    }
-
-    func testZZDiagnoseDivideSign() {
-        var msg = "\n"
-        for family in InkSynthFont.allCases {
-            let font = family.font(size: 18)
-            let attributes: [NSAttributedString.Key: Any] = [NSAttributedString.Key(kCTFontAttributeName as String): font]
-            let line = CTLineCreateWithAttributedString(NSAttributedString(string: "÷", attributes: attributes) as CFAttributedString)
-            for run in CTLineGetGlyphRuns(line) as! [CTRun] {
-                let runFont = (CTRunGetAttributes(run) as NSDictionary)[kCTFontAttributeName as String] as! CTFont
-                var g = CGGlyph(0)
-                CTRunGetGlyphs(run, CFRange(location: 0, length: 1), &g)
-                let big = CTFontCreateCopyWithAttributes(runFont, 96, nil, nil)
-                guard let path = CTFontCreatePathForGlyph(big, g, nil) else { continue }
-                var contours = 0
-                path.applyWithBlock { e in if e.pointee.type == .moveToPoint { contours += 1 } }
-                let box = path.boundingBoxOfPath
-                msg += "\(family) run font \(CTFontCopyPostScriptName(runFont)) glyph \(g) contours \(contours) box \(box)\n"
-                let w = Int(box.width.rounded(.up)) + 4, h = Int(box.height.rounded(.up)) + 4
-                guard let bm = InkBitmap.render(path, width: w, height: h,
-                                                transform: CGAffineTransform(translationX: 2 - box.minX, y: 2 - box.minY))
-                else { continue }
-                var g2 = [UInt8](repeating: 0, count: (w + 2) * (h + 2))
-                for y in 0..<h { for x in 0..<w where bm.pixels[y * w + x] == 1 { g2[(y + 1) * (w + 2) + x + 1] = 1 } }
-                msg += "components \(GlyphSkeleton.components(g2, width: w + 2, height: h + 2).map { $0.count })\n"
-                let lines = GlyphSkeleton.centreLines(of: bm)
-                msg += "centre-lines \(lines.count): \(lines.map { l in l.map { "(\(Int($0.x)),\(Int($0.y)))" }.joined() })\n"
-                for y in 0..<h {
-                    let row: [Character] = bm.pixels[(y * w)..<((y + 1) * w)].map { $0 == 1 ? "#" : "." }
-                    msg += String(row) + "\n"
-                }
-            }
-        }
-        XCTFail(msg)
     }
 
     func testFontNamesAreLenient() {
