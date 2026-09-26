@@ -12,10 +12,19 @@ enum InkSynthSettings {
     }
 }
 
+/// Input limits of `ink.writeText` (not actor-isolated, so command descriptors can use them in their schemas).
+enum InkSynthLimits {
+    /// About 4k strokes: storing them is one synchronous main-actor transaction, so longer text is written in
+    /// several calls.
+    static let maxCharacters = 2000
+    /// Largest |x| or |y| accepted for `at`: the page-size limit (`DocTransaction` refuses larger pages), and well
+    /// inside Float range, so stored stroke points stay finite.
+    static let maxCoordinate = 100_000.0
+}
+
 /// Parameter checks and the shared write step of both commands.
 @MainActor
 enum InkSynthParams {
-    static let maxCharacters = 5000
     /// Right margin kept free when `ink.writeText` wraps at the page edge by default.
     static let pageMargin = 36.0
 
@@ -54,16 +63,23 @@ enum InkSynthParams {
         return ids.map { NibID($0) }
     }
 
-    /// Stores synthesised strokes in writing order, normalised by `InkModel.prepare` (densified, nib sizes derived),
-    /// with the caller's ids first.
+    /// The page, if it is still there: a command re-checks inside `mutate`, because the page may have been deleted
+    /// while it typeset off the main actor.
+    static func livePage(_ doc: DocumentID, _ page: PageID, content: DocumentContent) throws -> PageRecord {
+        guard let record = content.page(page), !record.deleted else {
+            throw NibError.notFound("page \(page) in document \(doc)")
+        }
+        return record
+    }
+
+    /// Stores synthesised strokes in writing order, with the caller's ids first. The strokes come already normalised
+    /// (`InkTypesetter.Layout.prepared()`, run off the main actor), so this only builds and puts the items.
     static func write(_ strokes: [Stroke], ids: [ElementID], layer: Int, doc: DocumentID, page: PageID,
                       tx: DocTransaction) throws -> [Item] {
         var written: [Item] = []
         written.reserveCapacity(strokes.count)
         for (k, stroke) in strokes.enumerated() {
-            var s = stroke
-            InkModel.prepare(&s)
-            var item = Item.makeStroke(s, layer: layer)
+            var item = Item.makeStroke(stroke, layer: layer)
             if k < ids.count { item.id = ids[k] }
             written.append(try tx.put(item, doc: doc, page: page))
         }
@@ -115,8 +131,9 @@ struct InkWriteText: NibCommand {
         summary: "Write text as handwriting-style ink strokes from a top-left point (size = font size in points), wrapping at maxWidth; returns the stroke refs.",
         params: .obj([
             "page": .ref,
-            "text": .str("the text; a newline starts a new line"),
-            "at": .arr(.num(), "[x, y] top-left of the first line, in page points"),
+            "text": .str("the text, at most \(InkSynthLimits.maxCharacters) characters (write longer text in several calls); a newline starts a new line"),
+            "at": .arr(.num(min: -InkSynthLimits.maxCoordinate, max: InkSynthLimits.maxCoordinate),
+                       "[x, y] top-left of the first line, in page points"),
             "size": .num("font size in points (default 18)", min: 4, max: 400),
             "font": .str("handwriting font (default: the device setting inksynth.font)",
                          choices: InkSynthFont.allCases.map { $0.rawValue }),
@@ -134,12 +151,13 @@ struct InkWriteText: NibCommand {
         guard !p.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NibError.invalid("text is empty", path: "$.text")
         }
-        guard p.text.count <= InkSynthParams.maxCharacters else {
-            throw NibError(.invalidParams, "text is longer than \(InkSynthParams.maxCharacters) characters", path: "$.text",
+        guard p.text.count <= InkSynthLimits.maxCharacters else {
+            throw NibError(.invalidParams, "text is longer than \(InkSynthLimits.maxCharacters) characters", path: "$.text",
                            hint: "write long text in several calls")
         }
-        guard p.at.count == 2, p.at[0].isFinite, p.at[1].isFinite else {
-            throw NibError.invalid("at must be [x, y] in page points", path: "$.at")
+        guard p.at.count == 2, p.at.allSatisfy({ $0.isFinite && abs($0) <= InkSynthLimits.maxCoordinate }) else {
+            throw NibError.invalid("at must be [x, y] in page points, each within ±\(Int(InkSynthLimits.maxCoordinate))",
+                                   path: "$.at")
         }
         let size = p.size ?? 18
         guard (4...400).contains(size) else { throw NibError.invalid("size must be 4–400 points", path: "$.size") }
@@ -159,29 +177,32 @@ struct InkWriteText: NibCommand {
             guard let c = RGBA(hex: hex) else { throw NibError.invalid("colour must be #RRGGBB or #RRGGBBAA", path: "$.color") }
             color = c
         }
-        guard let record = try ctx.workspace.content(doc).page(page), !record.deleted else {
-            throw NibError.notFound("page \(page) in document \(doc)")
-        }
-        let ids = try InkSynthParams.callerIDs(p.ids, doc: doc, page: page, workspace: ctx.workspace)
+        // Checked here so bad params fail fast, and again inside mutate (the page or an id may change meanwhile).
+        let record = try InkSynthParams.livePage(doc, page, content: try ctx.workspace.content(doc))
+        _ = try InkSynthParams.callerIDs(p.ids, doc: doc, page: page, workspace: ctx.workspace)
 
         let origin = Point(p.at[0], p.at[1])
-        let maxWidth = p.maxWidth ?? record.size.flatMap { s -> Double? in
-            let room = s.width - origin.x - InkSynthParams.pageMargin
-            return room >= size * 4 ? room : nil
+        // By default text wraps at the page's right margin, and still wraps (at 4 em) when `at` is close to or past
+        // it; boards (no page size) do not wrap.
+        let maxWidth = p.maxWidth ?? record.size.map { s in
+            max(s.width - origin.x - InkSynthParams.pageMargin, size * 4)
         }
         let width = p.width ?? min(max(pen.width * size / 18, 0.3), 20)
         let style = InkStyle(tool: .pen, pen: .fountain, color: color, width: width)
         let options = InkTypesetter.Options(font: font, size: size, shear: tan((p.slant ?? 0) * .pi / 180),
                                             maxWidth: maxWidth, style: style)
         let text = p.text
-        let layout = await InkTypesetter.offMain { InkTypesetter.layout(text, at: origin, options: options) }
+        let layout = await InkTypesetter.offMain { InkTypesetter.layout(text, at: origin, options: options).prepared() }
         guard !layout.strokes.isEmpty else {
             throw NibError(.invalidParams, "the text has no characters that can be written as ink", path: "$.text",
                            hint: "use text.createBox for emoji and symbols")
         }
         let layer = ctx.activeSession?.activeLayer ?? 0
-        let written = try ctx.mutate { tx in
-            try InkSynthParams.write(layout.strokes, ids: ids, layer: layer, doc: doc, page: page, tx: tx)
+        let workspace = ctx.workspace
+        let written = try ctx.mutate { tx -> [Item] in
+            _ = try InkSynthParams.livePage(doc, page, content: try tx.content(doc))
+            let ids = try InkSynthParams.callerIDs(p.ids, doc: doc, page: page, workspace: workspace)
+            return try InkSynthParams.write(layout.strokes, ids: ids, layer: layer, doc: doc, page: page, tx: tx)
         }
         return Output(refs: InkSynthParams.refs(written, doc: doc, page: page), bounds: InkSynthParams.bounds(written),
                       lines: layout.lineCount)
@@ -246,8 +267,10 @@ struct HandwritingReplaceWord: NibCommand {
         let text = p.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw NibError.invalid("text is empty", path: "$.text") }
         guard text.count <= 500 else { throw NibError.invalid("text is longer than 500 characters", path: "$.text") }
-        let ids = try InkSynthParams.callerIDs(p.ids, doc: doc, page: page, workspace: ctx.workspace,
-                                               replacing: Set(items.map { $0.id }))
+        // Checked here so bad params fail fast, and again inside mutate (the page, the word or an id may change while
+        // recognition and typesetting run).
+        let replacing = Set(items.map { $0.id })
+        _ = try InkSynthParams.callerIDs(p.ids, doc: doc, page: page, workspace: ctx.workspace, replacing: replacing)
 
         // Match what was written: the first stroke's pen and layer, the word's box and lean, its recognised text.
         let ordered = items.sorted { ($0.z, $0.id.raw) < ($1.z, $1.id.raw) }
@@ -260,14 +283,27 @@ struct HandwritingReplaceWord: NibCommand {
                                             style: strokes[0].style,
                                             t0: strokes.map { $0.t0 }.min() ?? Date().timeIntervalSince1970)
         let match = InkTypesetter.WordMatch(box: box, lean: lean, text: oldText)
-        let layout = await InkTypesetter.offMain { InkTypesetter.layout(text, matching: match, options: options) }
+        let layout = await InkTypesetter.offMain {
+            InkTypesetter.layout(text, matching: match, options: options).prepared()
+        }
         guard !layout.strokes.isEmpty else {
             throw NibError(.invalidParams, "the text has no characters that can be written as ink", path: "$.text",
                            hint: "use text.createBox for emoji and symbols")
         }
         let layer = ordered[0].layer
+        let workspace = ctx.workspace
         let written = try ctx.mutate { tx -> [Item] in
-            for item in items { try tx.delete(item: item.id, doc: doc, page: page) }
+            _ = try InkSynthParams.livePage(doc, page, content: try tx.content(doc))
+            let ids = try InkSynthParams.callerIDs(p.ids, doc: doc, page: page, workspace: workspace,
+                                                   replacing: replacing)
+            for item in items {
+                // Still there (erased meanwhile → not_found) and still unlocked.
+                let current = try tx.item(doc, page: page, id: item.id)
+                guard !current.locked else {
+                    throw NibError.invalid("\(NodeRef.item(doc, page, item.id).description) is locked", path: "$.refs")
+                }
+                try tx.delete(item: item.id, doc: doc, page: page)
+            }
             return try InkSynthParams.write(layout.strokes, ids: ids, layer: layer, doc: doc, page: page, tx: tx)
         }
         return Output(refs: InkSynthParams.refs(written, doc: doc, page: page), bounds: InkSynthParams.bounds(written))

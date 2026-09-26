@@ -125,6 +125,18 @@ final class FeatInkSynthTests: XCTestCase {
         XCTAssertLessThanOrEqual(box.maxX, PageSize.a4.width - InkSynthParams.pageMargin + 0.01)
     }
 
+    func testWriteTextStillWrapsNearOrPastTheRightMargin() async throws {
+        for x in [PageSize.a4.width - InkSynthParams.pageMargin - 20, PageSize.a4.width + 40] {
+            let h = Harness(features: [FeatInkSynthFeature.self])
+            let r = try await h.run(CommandIDs.inkWriteText, ["page": .string(page2), "text": "one two three four five six",
+                                                              "at": [.number(x), 96]])
+            XCTAssertGreaterThan(r["lines"]?.intValue ?? 0, 1, "wraps when writing at x = \(x)")
+            let box = try XCTUnwrap(inkBox(try items(h)))
+            XCTAssertGreaterThanOrEqual(box.minX, x - 0.01)
+            XCTAssertLessThanOrEqual(box.maxX, x + 4 * 18 + 0.01, "at most 4 em wide")
+        }
+    }
+
     func testWriteTextRejectsBadParamsWithoutTouchingTheDocument() async throws {
         let h = Harness(features: [FeatInkSynthFeature.self])
         let base: [String: JSONValue] = ["page": .string(page2), "text": "Hi", "at": [72, 96]]
@@ -136,6 +148,11 @@ final class FeatInkSynthTests: XCTestCase {
         let command = CommandIDs.inkWriteText
         await assertError(h, command, with("text", "   "), .invalidParams)
         await assertError(h, command, with("at", [72]), .invalidParams)
+        // Beyond Float range the stored points would be infinite; beyond the page-size limit is refused too.
+        await assertError(h, command, with("at", [1e39, 0]), .invalidParams)
+        await assertError(h, command, with("at", [72, -100_001]), .invalidParams)
+        await assertError(h, command, with("text", .string(String(repeating: "a", count: InkSynthLimits.maxCharacters + 1))),
+                          .invalidParams)
         await assertError(h, command, with("font", "Comic Sans"), .invalidParams)
         await assertError(h, command, with("color", "blue"), .invalidParams)
         await assertError(h, command, with("size", 1), .invalidParams)
@@ -148,11 +165,13 @@ final class FeatInkSynthTests: XCTestCase {
         await assertError(h, command, ["page": .string(page1), "text": "Hi", "at": [72, 96], "ids": ["FIXTURESTK01"]],
                           .invalidParams)
         // The AI gets the schema check first.
-        do {
-            _ = try await h.run(command, with("font", "Comic Sans"), as: .ai("chat"))
-            XCTFail("schema check skipped")
-        } catch let e as NibError {
-            XCTAssertEqual(e.code, .invalidParams)
+        for bad in [with("font", "Comic Sans"), with("at", [1e39, 0])] {
+            do {
+                _ = try await h.run(command, bad, as: .ai("chat"))
+                XCTFail("schema check skipped for \(bad.jsonString())")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams)
+            }
         }
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
         XCTAssertTrue(try items(h).isEmpty)
@@ -203,6 +222,48 @@ final class FeatInkSynthTests: XCTestCase {
         let box = try XCTUnwrap(inkBox(try items(h)))
         XCTAssertEqual(box.minY, oldBox.minY, accuracy: oldBox.height * 0.12, "same ascender height")
         XCTAssertGreaterThan(box.maxY, oldBox.maxY + oldBox.height * 0.1, "the descender hangs below the old baseline")
+    }
+
+    /// A stand-in for recognize.items (F055) that lets another edit land while replaceWord waits for it.
+    private func recogniser(_ h: Harness, meanwhile edit: @escaping @MainActor (DocTransaction) throws -> Void) {
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
+                                                  summary: "Test recogniser; another edit lands meanwhile.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in try edit(tx) }
+            return ["text": "hello"]
+        }
+    }
+
+    func testReplaceWordRechecksCallerIDsWhenItWrites() async throws {
+        let h = Harness(features: [FeatInkSynthFeature.self])
+        let old = seedWord(h, "hello", style: InkStyle())
+        let oldRefs = old.map { JSONValue.string(ref(Fixtures.page2, $0.id)) }
+        // Someone takes the caller's id while the word is recognised and typeset.
+        var squatter = Item.makeStroke(InkTypesetter.layout("x", at: Point(300, 400), options: .init()).prepared().strokes[0])
+        squatter.id = NibID("NEWWORD1")
+        let taken = squatter
+        recogniser(h) { tx in _ = try tx.put(taken, doc: Fixtures.docID, page: Fixtures.page2) }
+
+        await assertError(h, "handwriting.replaceWord", ["refs": .array(oldRefs), "text": "halls", "ids": ["NEWWORD1"]],
+                          .invalidParams)
+        let now = try items(h)
+        XCTAssertEqual(now.first(where: { $0.id == squatter.id })?.stroke, squatter.stroke, "the other item is not overwritten")
+        XCTAssertEqual(Set(now.map { $0.id }), Set(old.map { $0.id } + [squatter.id]), "the word is untouched")
+    }
+
+    func testReplaceWordRechecksThePageWhenItWrites() async throws {
+        let h = Harness(features: [FeatInkSynthFeature.self])
+        let old = seedWord(h, "hello", style: InkStyle())
+        let oldRefs = old.map { JSONValue.string(ref(Fixtures.page2, $0.id)) }
+        // The page is deleted while the word is recognised and typeset.
+        recogniser(h) { tx in
+            guard var record = try tx.content(Fixtures.docID).page(Fixtures.page2) else { return }
+            record.deleted = true
+            _ = try tx.put(record, doc: Fixtures.docID)
+        }
+
+        await assertError(h, "handwriting.replaceWord", ["refs": .array(oldRefs), "text": "halls"], .notFound)
+        XCTAssertEqual(Set(try items(h).map { $0.id }), Set(old.map { $0.id }), "no ink written to the deleted page")
     }
 
     func testReplaceWordRejectsWhatIsNotHandwriting() async {

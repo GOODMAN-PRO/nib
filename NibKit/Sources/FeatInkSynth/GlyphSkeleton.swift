@@ -150,7 +150,8 @@ enum GlyphSkeleton {
     // MARK: Skeleton
 
     /// Centre-lines of the ink in `bitmap`, in bitmap coordinates (pixel centres at x + 0.5, y + 0.5, y down).
-    /// Every polyline has at least two points (a dot is a tiny dash).
+    /// Every polyline has at least two points (a dot is a tiny dash), and every 8-connected blob of ink yields at
+    /// least one polyline (the dot of an i, both dots of a colon, all three parts of a ÷).
     static func centreLines(of bitmap: InkBitmap) -> [[Point]] {
         // A one-pixel empty border keeps every neighbour lookup inside the grid.
         let w = bitmap.width + 2, h = bitmap.height + 2
@@ -163,13 +164,68 @@ enum GlyphSkeleton {
             }
         }
         guard ink > 0 else { return [] }
+        // Zhang–Suen can erase a small solid blob completely (every pixel of a 2×2 block is deletable in the same
+        // sub-iteration, and larger dots can erode down to one), so each blob that vanished gets back its pixel
+        // nearest its centroid; `trace` turns that lone pixel into a dot.
+        let blobs = components(g, width: w, height: h)
         thin(&g, width: w, height: h)
         removeRedundantPixels(&g, width: w, height: h)
+        restoreVanished(blobs, in: &g, width: w)
         return trace(g, width: w, height: h, ink: ink).map { chain -> [Point] in
             let raw = chain.pixels.map { Point(Double($0 % w) - 0.5, Double($0 / w) - 0.5) }
             var line = simplify(smooth(raw, closed: chain.closed), tolerance: tolerance)
             if line.count == 1 { line.append(Point(line[0].x + 0.3, line[0].y)) }
             return line
+        }
+    }
+
+    /// The 8-connected groups of ink pixels (grid indices) of a 0/1 grid whose border is empty.
+    static func components(_ g: [UInt8], width w: Int, height h: Int) -> [[Int]] {
+        guard w >= 3, h >= 3, g.count >= w * h else { return [] }
+        let ring = [-w, -w + 1, 1, w + 1, w, w - 1, -1, -w - 1]
+        var seen = [Bool](repeating: false, count: w * h)
+        var groups: [[Int]] = []
+        for start in (w + 1)..<(w * (h - 1) - 1) where g[start] == 1 && !seen[start] {
+            seen[start] = true
+            var group: [Int] = []
+            var stack = [start]
+            while let p = stack.popLast() {
+                group.append(p)
+                for o in ring {
+                    let q = p + o
+                    if g[q] == 1 && !seen[q] {
+                        seen[q] = true
+                        stack.append(q)
+                    }
+                }
+            }
+            groups.append(group)
+        }
+        return groups
+    }
+
+    /// Puts back one pixel of every group that thinning erased entirely: the group's pixel nearest its centroid (so
+    /// it lies inside the blob even when the blob is not convex). Groups are 8-connected components, so the pixel
+    /// touches no surviving ink and traces as a dot.
+    static func restoreVanished(_ groups: [[Int]], in g: inout [UInt8], width w: Int) {
+        for group in groups where !group.isEmpty && !group.contains(where: { g[$0] == 1 }) {
+            var cx = 0.0, cy = 0.0
+            for p in group {
+                cx += Double(p % w)
+                cy += Double(p / w)
+            }
+            cx /= Double(group.count)
+            cy /= Double(group.count)
+            var best = group[0], bestDistance = Double.infinity
+            for p in group {
+                let dx = Double(p % w) - cx, dy = Double(p / w) - cy
+                let d = dx * dx + dy * dy
+                if d < bestDistance {
+                    bestDistance = d
+                    best = p
+                }
+            }
+            g[best] = 1
         }
     }
 

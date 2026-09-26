@@ -53,6 +53,18 @@ enum InkTypesetter {
             out.baselines = baselines.map { $0 + dy }
             return out
         }
+
+        /// The strokes normalised for storage by `InkModel.prepare` (densified, nib sizes derived). Pure, so commands
+        /// run it off the main actor together with the layout and only build and put items inside `mutate`.
+        func prepared() -> Layout {
+            var out = self
+            out.strokes = strokes.map { stroke -> Stroke in
+                var s = stroke
+                InkModel.prepare(&s)
+                return s
+            }
+            return out
+        }
     }
 
     // MARK: Layout
@@ -249,9 +261,11 @@ enum InkTypesetter {
 
     /// Lays `text` out on one line so its ink matches the word's left edge, height, baseline and lean.
     static func layout(_ text: String, matching word: WordMatch, options: Options) -> Layout {
-        let single = text.split(whereSeparator: { $0.isNewline }).joined(separator: " ")
+        let single = oneLine(text)
         var profile: (above: Double, below: Double)?
-        if let old = word.text?.trimmingCharacters(in: .whitespacesAndNewlines), !old.isEmpty {
+        // The recognised old text may span lines; measured as one line like the new text, or its extent (and so the
+        // new ink's size) would be that of a multi-line block.
+        if let old = word.text.map({ oneLine($0) }), !old.isEmpty {
             profile = verticalExtent(of: old, font: options.font)
         }
         let extent = profile ?? verticalExtent(of: single, font: options.font) ?? (above: 0.7, below: 0.2)
@@ -273,6 +287,14 @@ enum InkTypesetter {
         guard let ink = placed.inkBounds, let first = placed.baselines.first else { return placed }
         let baseline = word.box.maxY - extent.below * size
         return placed.translated(dx: word.box.minX - ink.minX, dy: baseline - first)
+    }
+
+    /// `text` on one line: line breaks become single spaces, and blank lines and surrounding whitespace go.
+    static func oneLine(_ text: String) -> String {
+        text.split(whereSeparator: { $0.isNewline })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
     }
 
     // MARK: Background

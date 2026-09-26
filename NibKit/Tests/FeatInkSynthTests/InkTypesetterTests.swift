@@ -68,6 +68,60 @@ final class InkTypesetterTests: XCTestCase {
         XCTAssertTrue(tee.contains { extent($0).y >= 22 && extent($0).x <= 2 }, "the stem: \(tee)")
     }
 
+    func testSmallSolidBlobsSurviveThinningAsOneDot() throws {
+        // Zhang–Suen deletes every pixel of a 2×2 block in the same sub-iteration; the blob comes back as a dot.
+        let block = GlyphSkeleton.centreLines(of: bitmap(6, 6) { x, y in x >= 2 && x < 4 && y >= 2 && y < 4 })
+        XCTAssertEqual(block.count, 1)
+        let dot = try XCTUnwrap(block.first)
+        XCTAssertGreaterThanOrEqual(dot.count, 2, "a dot is a tiny dash")
+        XCTAssertTrue(dot.allSatisfy { abs($0.x - 3) <= 1 && abs($0.y - 3) <= 1 }, "inside the block: \(dot)")
+
+        XCTAssertEqual(GlyphSkeleton.centreLines(of: bitmap(16, 16) { x, y in hypot(x - 8, y - 8) <= 5 }).count, 1,
+                       "a 10 px disc")
+        // Dots of every size and sub-pixel position (the dot of an i at 96 px per em is about 6–20 px across); about
+        // a fifth of these used to vanish.
+        for d in stride(from: 1.5, through: 22, by: 0.5) {
+            for (ox, oy) in [(0.0, 0.0), (0.25, 0.5), (0.5, 0.3), (0.75, 0.0)] {
+                let size = Int(d) + 6
+                let cx = Double(size) / 2 + ox, cy = Double(size) / 2 + oy
+                let image = bitmap(size, size) { x, y in hypot(x - cx, y - cy) <= d / 2 }
+                guard image.pixels.contains(1) else { continue }
+                XCTAssertEqual(GlyphSkeleton.centreLines(of: image).count, 1, "disc \(d) px at +\(ox), +\(oy)")
+            }
+        }
+    }
+
+    func testEverySeparateBlobKeepsItsInk() {
+        // A colon (two dots) and a division sign (two dots and a bar), drawn as discs and a bar.
+        let colon = GlyphSkeleton.centreLines(of: bitmap(16, 40) { x, y in
+            hypot(x - 8, y - 8) <= 4 || hypot(x - 8, y - 30) <= 4
+        })
+        XCTAssertEqual(colon.count, 2)
+        let divide = GlyphSkeleton.centreLines(of: bitmap(40, 40) { x, y in
+            hypot(x - 20, y - 7) <= 3 || hypot(x - 20, y - 33) <= 3 || (x >= 4 && x < 36 && y >= 18 && y < 22)
+        })
+        XCTAssertEqual(divide.count, 3)
+        XCTAssertEqual(divide.filter { extent($0).x >= 20 }.count, 1, "one bar: \(divide)")
+        XCTAssertEqual(divide.filter { extent($0).x <= 3 && extent($0).y <= 3 }.count, 2, "two dots: \(divide)")
+    }
+
+    /// Dotted letters and marks keep every part in every font (a dotless i, a ÷ read as − or a ? without its dot
+    /// would change what was written, e.g. a Math Assist answer).
+    func testDottedLettersAndMarksKeepEveryPartInEveryFont() {
+        let minimum: [(Character, Int)] = [("i", 2), ("j", 2), (":", 2), ("?", 2), ("!", 2), ("÷", 3), (".", 1)]
+        for family in InkSynthFont.allCases {
+            for (character, count) in minimum {
+                let layout = InkTypesetter.layout(String(character), at: .zero, options: .init(font: family, size: 18))
+                XCTAssertGreaterThanOrEqual(layout.strokes.count, count, "\(family) '\(character)'")
+                guard count > 1 else { continue }
+                // The parts are stacked: some stroke lies wholly above another (the dot over the stem, under the bar).
+                let boxes = layout.strokes.compactMap { Rect.bounding($0.polyline) }
+                XCTAssertTrue(boxes.contains { a in boxes.contains { b in a.maxY < b.minY } },
+                              "\(family) '\(character)' has separate parts above one another")
+            }
+        }
+    }
+
     func testEveryFontSkeletonisesLettersUprightAndCachesThem() {
         for family in InkSynthFont.allCases {
             let font = family.font(size: 18)
@@ -180,6 +234,31 @@ final class InkTypesetterTests: XCTestCase {
         XCTAssertEqual(ink.height, box.height, accuracy: box.height * 0.15)
         XCTAssertEqual(try XCTUnwrap(InkTypesetter.lean(of: polylines(new), step: step)), lean, accuracy: 0.05)
         XCTAssertTrue(new.strokes.allSatisfy { $0.style == style }, "same pen and colour")
+    }
+
+    func testMatchingMeasuresAMultiLineRecognisedWordAsOneLine() throws {
+        let old = InkTypesetter.layout("hello", at: Point(100, 100), options: .init(size: 24))
+        let box = try XCTUnwrap(old.inkBounds)
+        let single = InkTypesetter.layout("hullo", matching: .init(box: box, lean: nil, text: "hello"), options: .init())
+        // The recogniser split the word over two lines: same letters, so the same size and baseline.
+        let split = InkTypesetter.layout("hullo", matching: .init(box: box, lean: nil, text: "hel\nlo\n"), options: .init())
+        XCTAssertEqual(split.size, single.size, accuracy: 1e-9)
+        XCTAssertEqual(split.baselines, single.baselines)
+        XCTAssertEqual(split.size, 24, accuracy: 0.05)
+        XCTAssertEqual(InkTypesetter.oneLine("  two\r\n\n words \n"), "two words")
+    }
+
+    func testPreparedStrokesAreDensifiedWithNibSizes() {
+        let raw = InkTypesetter.layout("ab", at: .zero, options: .init(size: 20))
+        let prepared = raw.prepared()
+        XCTAssertEqual(prepared.strokes.count, raw.strokes.count)
+        XCTAssertEqual(prepared.glyphs.count, raw.glyphs.count)
+        XCTAssertEqual(prepared.baselines, raw.baselines)
+        for (a, b) in zip(raw.strokes, prepared.strokes) {
+            XCTAssertGreaterThan(b.points.count, a.points.count, "densified")
+            XCTAssertTrue(b.points.allSatisfy { $0.width > 0 && $0.height > 0 }, "nib sizes derived")
+            XCTAssertEqual(b.style, a.style)
+        }
     }
 
     func testFontNamesAreLenient() {
