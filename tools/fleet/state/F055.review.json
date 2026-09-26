@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibIndex/Indexer.swift: sweep(foreground:) L879-893, indexDocument(_:force:) L603-624, indexPage L546-560, indexDocUnit L573-589",
+      "problem": "When a unit's version is unchanged, indexPage and indexDocUnit return before any real suspension point. So a library sweep never yields: it runs at every launch (+10 s), after each index-setting toggle, after rebuildAll and in the BG task. For every document it runs reader.head, and for every page reader.allItems (persistence.loadItems, which reads, decodes and merges device files) plus transcript directory listings. All of this runs as ONE synchronous @MainActor block over the whole library, so the UI freezes for a time proportional to library size on every launch. The Task.isCancelled / shouldPause checks cannot take effect until that block ends.",
+      "fix": "Add `await Task.yield()` after each page in indexDocument and after each document in sweep, and check Task.isCancelled / (foreground && Indexer.shouldPause) per page, not only per document. Also skip unchanged unloaded documents cheaply: store a per-document stamp (e.g. in the #doc unit: head rev max + live page count + page revs + flags) and only load page items when it differs or the doc had commits since the last sweep."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibIndex/VisionRecognizer.swift: InkRender.make L141-179, InkLayout.renderScale L191-199, perform(minimumTextPixels:) L102-121",
+      "problem": "All handwriting on a page goes into one bitmap capped at 4096 px per side and 16 MP, and Vision's minimumTextHeight is set to 16 px. On infinite whiteboard boards (PageRecord.size == nil) or on large pages where strokes span more than ~1400 pt, the scale drops well below the spec's ~32 px x-height. Example: notes spread over a 3000x2000 pt board give 1.37 px/pt, so 10 pt strokes render at ~14 px, below the 16 px minimum. That handwriting is silently never recognised or indexed, and search.text / recognize.pageText return nothing for it.",
+      "fix": "Group strokes into spatial clusters before rendering: union-find on stroke bounds inflated by ~1 median stroke height, then split any cluster whose bounds x target scale exceed maxSide into tiles of maxSide/scale points. Render and recognise each cluster at the target scale, concatenating InkLines (pageRect is already per-render). Add a test: strokes spread across a 5000x3000 pt board must yield renders whose renderScale stays within 10% of the target."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibIndex/Indexer.swift: flags(includeInk:) L493-498 used in every page version",
+      "problem": "Every page version includes global flags: the OCR setting, pdf availability and a hash of ALL registered custom item types. Toggling search.ocrImages, or installing/enabling/removing any plugin that declares a custom item type, makes every page in the library stale. Vision handwriting recognition then re-runs on every page (hours of CPU/battery on a big library; P-095).",
+      "fix": "Make the flags page-specific: add the OCR flag only when the page has image items or a PDF background, add the pdf flag only for PDF pages, and hash only the textPaths of the custom drawKeys present on that page."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibIndex/Indexer.swift: indexPage L546-560, pageText L634-651, processDirty/flush/sweep",
+      "problem": "The same unit can be indexed concurrently by processDirty, flush (called from search.text), sweep and pageText. Each takes its snapshot on main, then stores after a detached extraction. An older extraction that finishes last overwrites a newer one, or re-inserts a page that removeUnit just deleted. The index keeps stale or resurrected text with a stale version until the next launch sweep. For unloaded documents, search.text does not filter out deleted pages.",
+      "fix": "Keep a per-unit generation counter on Indexer ([String: Int] keyed by doc|page). Bump it when starting an index or remove, and skip Indexer.store when the generation captured before the detached task is no longer current. Alternatively, serialize per unit by awaiting an existing inFlight[key] task before starting a new one."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibIndex/SearchCommands.swift L199-204; Indexer.store L562-564",
+      "problem": "units.page_index is written only when a page is re-indexed. Inserting, moving or deleting a page shifts other pages' indices without changing their versions, so search.text returns a wrong pageIndex for documents that are not loaded (it is recomputed only for loaded docs).",
+      "fix": "In SearchText.run, resolve pageIndex from Indexer.reader.head(doc) for every result doc (one head load per doc per call, cached in a local dictionary). Or, in indexDocument and on .page mutations, run `UPDATE units SET page_index=? WHERE doc=? AND page=?` for all live pages without re-extracting."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibIndex/Indexer.swift: recognizeItems L660-686",
+      "problem": "Lines from all groups (different pages or documents) are sorted together by (minY, minX), so recognize.items over refs spanning several pages interleaves lines from different pages instead of keeping reading order per page.",
+      "fix": "Sort each group's lines by (minY, minX) before appending, and keep the groups in ref order (remove the final global sort)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibIndex/Indexer.swift: sweep L883-890, processDirty L789-814, emitProgress L916-920",
+      "problem": "index.progress is emitted once per document on every sweep, even when nothing changed, and once per page in processDirty. On a large library a launch sweep can push thousands of events into the 5,000-entry EventBus ring. MCP bridge long-pollers then miss tx.committed and other events, and each IndexSettingsModel subscriber spawns a Task per event.",
+      "fix": "Throttle emitProgress: always emit the start and final events, otherwise emit at most once per second (track the last emit Date on Indexer), and skip the event entirely when a sweep made no changes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibIndex/SearchCommands.swift L197-198",
+      "problem": "Hits are dropped whenever a library exists and the document has no library node. The indexer deliberately indexes workspace-loaded documents outside the library (libraryDocuments, and prune keeps loaded docs), so in-document search (D-108) returns nothing for such documents.",
+      "fix": "Change the filter to `if library != nil && (node?.trashedAt != nil || (node == nil && !ctx.workspace.isLoaded(h.doc))) { continue }`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/NibIndexTests/NibIndexTests.swift",
+      "problem": "The riskiest handwriting geometry is untested: VisionRecognizer.recognizeInk, InkRender.make and InkRender.pageRect (y-flip, margin, scale), and InkLayout.assemble with real, non-proportional word boxes. Every ink test goes through FakeRecognizer and the proportional splitWords path.",
+      "fix": "Add pure tests: (1) build an InkRender from a few strokes, map each stroke's bounds to normalised Vision coords (bottom-left origin) and back through pageRect, and assert equality within 0.5 pt; (2) call assemble with hand-made word boxes and assert each stroke lands in the right word and strokes outside the line are excluded."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibIndex/SearchDatabase.swift: removeDocument L336-340, ocr table",
+      "problem": "OCR cache rows (keys 'img|<doc>|…' and 'pdf|<doc>|…') are never removed when a document is pruned or deleted, so the table grows without bound over the life of the library.",
+      "fix": "In removeDocument, also run `DELETE FROM ocr WHERE key LIKE 'img|' || ? || '|%' OR key LIKE 'pdf|' || ? || '|%'` inside the same transaction."
+    }
+  ]
+}

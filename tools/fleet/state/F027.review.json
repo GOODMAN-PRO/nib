@@ -1,0 +1,47 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSettings/FeatSettingsFeature.swift: SettingsRouter.open (case .panel), AppMenuPlace.resolve",
+      "problem": "Three of the five app-menu entries (P-024) cannot open. Trash, Manage Templates and Cloud & Backup resolve to `.panel(id)` and forward to `panel.open`. The catalogue scopes that command to 'sidebar tab, floating, sheet', and its owner F017 (feat/F017, ChromeCommands.swift PanelOpen.run) throws `unavailable` \"no document is open in this window\" when no document is open, and `invalid` \"is a library panel\" for `.libraryTab` panels. The app menu lives in the library (F019), where no document is open. F020 registers Trash as `organize.trash` with placement `.libraryTab`, so the Trash entry is visible but fails every time. Manage Templates and Cloud & Backup also fail from the library, because they resolve to templateui/syncui panels. The tests check only `resolve`. Nothing runs the `.panel` open path.",
+      "fix": "In SettingsRouter.open, case .panel(let id): look up `app.ui.panels.get(id)` and `app.ui.activeNavigator`. If `panel.placement == .libraryTab` or `navigator.session.document == nil`, present the panel directly: `let host = UIHostingController(rootView: AnyView(EmptyView()))`, then `host.rootView = panel.makeView(PanelContext(app: app, session: navigator.session, navigator: navigator, dismiss: { [weak host] in host?.dismiss(animated: true) }))`, then `navigator.presentModal(host)`, and return opened \"panel\". Forward to `panel.open` only for a non-library panel while a document is open. Add a test: register a `.libraryTab` panel `organize.trash` (owner \"organize\") and a `.sheet` panel owned by \"templateui\", run `settings.open {place: \"trash\"}` and `{place: \"templates\"}` with RecordingNavigator, and assert that `presented` is set and `opened == \"panel\"`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSettings/FeatSettingsFeature.swift: SettingsOpen / register",
+      "problem": "F027 registers `settings.open`, but ARCHITECTURE.md §6.5 lists no commands for F027, and §15.3 says to register exactly the listed ids. `python Scripts/lint.py --feature F027` warns about it. The command itself is needed: menu items need a command, and ⌘, plus the AI need a way to open Settings. But it also takes an id in the `settings.*` namespace that NibContracts owns, without a contract entry.",
+      "fix": "Keep the command. Report it in the F027 final summary as a contract request: add `settings.open {page?, place?} (session)` to F027's 'Commands owned' in forge-spec.json and §6.5, so the lint warning clears and no later contract adds a clashing `settings.open`. Do not add the docs file on this branch, because it is outside F027's file list."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSettings/SettingsRootViewController.swift: SettingsModel",
+      "problem": "SettingsModel is not actor-isolated. Only init, set and commit are @MainActor. The nonisolated `change`, `stage`, `value` and `binding` read and write `pending` and `nextToken`, which the @MainActor `commit` also mutates. Today this is safe only because SwiftUI happens to call Binding setters on the main thread. The compiler does not enforce it, and it will not pass strict concurrency checking.",
+      "fix": "Declare `@MainActor final class SettingsModel: ObservableObject` and remove the per-method @MainActor annotations. The `Task { @MainActor in ... }` in change() can become a plain `Task { ... }`."
+    },
+    {
+      "severity": "minor",
+      "where": "StylusPage.swift (PosturePicker cell, PostureIllustration), SettingsRootViewController.swift (formSheetSize, sidebarWidth, SettingsSection.symbol, SettingsPageDescriptor.symbol), LanguagePage.swift (NotificationsPage), FeatSettingsFeature.swift (page and menu icons)",
+      "problem": "The code uses literal metrics: the 56 pt posture cells, stroke widths 1 and 3, the 760x706 sheet and the 220 pt section list. It also gets round the symbol catalogue with `NibSymbol(systemName:)` for feature glyphs (\"scribble\", \"wrench.and.screwdriver\", \"info.circle\", \"bell.badge\", \"arrow.up.forward.app\"). DESIGN.md §15.6 and §16 (tokens only, don't hand-roll) and the F008 review treat both as findings. Page and menu descriptor icons are literal strings even where the catalogue has the glyph (gearshape, doc.text, pencil.tip, trash, checkmark.icloud).",
+      "fix": "Use catalogue names for descriptor icons: `NibSymbol.settings.name`, `.textDocument.name`, `.pen.name`, `.trash.name`, `.syncDone.name`. Use a catalogue symbol for the Writing section (`.whiteboard` or `.pencil`). For the glyphs and metrics that are missing (settings sheet size, section-list width, posture cell height, info, bell, wrench, external-link), mark each local with a `ponytail:` comment and list them as a contract request in the feature summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSettings/SettingsRootViewController.swift: SettingsRootView.onReceive, SettingsSectionDetail, SettingsSidebar.selected",
+      "problem": "Settings can get stuck on an empty or outdated view. If a plugin is removed while Settings is open, `state.section` can point to a section that no longer has any pages. The detail then shows \"No settings yet\" instead of the first remaining section. Separately, the catalogue refreshes only when the list of page ids changes. A page re-registered with the same id but a new title, section or order stays outdated until Settings is reopened.",
+      "fix": "Resolve the selected section as `state.section.flatMap { catalog.group($0) } ?? catalog.groups.first` in both the sidebar and the detail. On `.nibRegistryDidChange`, rebuild the catalogue whenever the page list's (id, section, order, title) tuples differ, or rebuild every time, since it is cheap."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSettings/LanguagePage.swift: NotificationsPage.refresh",
+      "problem": "The view calls `UNUserNotificationCenter.current()` directly, guarded only by `isHostlessTest`. ARCHITECTURE.md §15.13 asks for notification access behind a small internal protocol, so that tests can use a fake. As a result the Allowed / Off / not-determined text mapping is never tested.",
+      "fix": "Add `protocol NotificationStatusReading { func status() async -> UNAuthorizationStatus? }`, with a system implementation that returns nil when hostless. Inject it into NotificationsPage and move statusText into a static function `(UNAuthorizationStatus?) -> String?`. Add a test for that mapping."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatSettingsTests/FeatSettingsTests.swift",
+      "problem": "Some tests prove less than their names claim. `testPagesSeeChangesMadeByTheAssistant` reads `model.value`, which falls through to the store, so it would pass even if SettingsModel never republished on `SettingsStore.didChange` (the thing that makes open pages update). Nothing tests `settings.open {page}` while Settings is already on screen (the `root.show` branch). Nothing tests Profile's trim-and-save.",
+      "fix": "In the assistant test, subscribe to `model.objectWillChange` with an XCTestExpectation before running `settings.set` as `.ai`, and await it. Also add the `.panel` open test from the first issue."
+    }
+  ]
+}

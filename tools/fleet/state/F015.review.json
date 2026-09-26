@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatUndoUI/UndoGestures.swift:122 (gestureRecognizer(_:shouldReceive:) -> claimFocus at :141)",
+      "problem": "claimFocus() runs for every direct finger touch on the canvas, including a one-finger scroll, a tap or a two-finger pinch, and it runs even when undo.gestures is off. Each call makes the invisible UndoFocusResponder first responder, which takes focus away from any text field outside the canvas (the assistant composer, the sidebar search field, rename fields). The software keyboard closes. With a hardware keyboard the letters typed next go to the shell's .canvas single-key tool shortcuts (P, H, E...) because session.isEditingText is false. Result: someone typing to the assistant who scrolls the page to look at their notes loses the composer and switches tools as they keep typing.",
+      "fix": "Stop claiming focus from shouldReceive(touch). Only the three-finger system editing gesture conflicts, so claim focus only when three or more direct touches are down: implement gestureRecognizer(_:shouldReceive event: UIEvent) -> Bool (it gets called for both taps), count event.allTouches where type == .direct and phase is not .ended or .cancelled, call claimFocus() when the count is >= 3, and return true. Keep the claim in didMoveToWindow."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatUndoUI/HistoryPanel.swift:251 (@ObservedObject session) and :171 (rows assignment)",
+      "problem": "HistoryList observes the whole EditorSession. EditorSession publishes zoom, visibleRect, selection, tool and page, so while the History tab is open every scroll or zoom frame rebuilds the list body and the visible rows. Each rebuilt row formats its date twice. reload() also assigns rows on every commit, even when nothing changed, which triggers another re-render per stroke.",
+      "fix": "Hold the session as a plain `let`. Copy document and readOnly into @State through .onReceive(session.$document.removeDuplicates()) and .onReceive(session.$readOnly.removeDuplicates()), and use those in .task(id:) and canRevert. In reload(), assign rows and canRedo only when the new value differs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatUndoUI/HistoryPanel.swift:63 (HistoryRow.id = group) / :290 ForEach",
+      "problem": "Row identity is the undo group id, but that id is not unique in the history. An AI turn or plugin call that commits again after an interleaved user edit leaves two separate entries with the same group. ForEach then sees duplicate IDs and renders or updates rows unpredictably.",
+      "fix": "Give HistoryRow a unique `id` built from the group and its position in the list (for example \"<group>#<offset>\" from enumerated entries). Add a separate `group` field and pass that to history.revertGroup."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatUndoUI/HistoryPanel.swift:322-331 (HistoryRowView)",
+      "problem": "At accessibility sizes the outer layout switches to a VStack, but the badge-plus-detail line stays a horizontal HStack with a fixedSize badge, and the detail keeps lineLimit(2) and the label lineLimit(3). At AX3 in a sidebar-width panel the detail (\"anki-export · 3 changes · 25 Sep 2026 at 09:41\") gets cut off. That fails the Slop line \"Nothing wraps or truncates badly at AX3\".",
+      "fix": "Use the same typeSize.isAccessibilitySize AnyLayout switch (VStackLayout) for the badge/detail line, and use lineLimit(typeSize.isAccessibilitySize ? nil : 2) for the detail and nil for the label at accessibility sizes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatUndoUI/HistoryPanel.swift:350-366 (PrincipalBadge, .frame(minHeight: 20))",
+      "problem": "PrincipalBadge is a capsule badge built locally with a literal 20 pt height. DESIGN.md §15.6 and §16 say to use only tokens and not to hand-build components for now.",
+      "fix": "Replace the literal frame with .padding(.vertical, NibSpacing.xxs) so only tokens remain. Then ask the orchestrator to add a principal case to NibBadgeKind in NibDesign (contract request) and use NibBadge in place of this view."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatUndoUI/HistoryPanel.swift:176-181 (reload catch)",
+      "problem": "When history.list fails, the panel clears the rows and shows \"No changes yet\". An error looks the same as an empty history, which goes against DESIGN.md §14.18 (say what happened and what to do next).",
+      "fix": "Add @Published loadFailed. Set it in the catch and clear it on success. When it is set, show NibEmptyState(symbol: .warningTriangle, title: \"Couldn't load the history.\") with a Try Again NibAction that calls reload()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatUndoUI/HistoryPanel.swift:276-280 (.task(id: model.receipt)) and :200",
+      "problem": "Two reverts in a row with the same outcome (for example .reverted(count: 1, kept: 0)) leave the task id unchanged. The first timer keeps running and clears the second receipt early.",
+      "fix": "In revert(), set receipt = nil before setting outcome, or key the dismiss task on a receipt counter that increments each time."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatUndoUI/HistoryPanel.swift:121",
+      "problem": "`canRedo` is published and updated on every reload but nothing reads it (dead state that causes extra objectWillChange).",
+      "fix": "Delete the property and its three assignments. The decoder can ignore the canRedo field."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatUndoUI/HistoryPanel.swift:145-156 / NibKit/Tests/FeatUndoUITests/FeatUndoUITests.swift",
+      "problem": "No test covers the panel following live commits while it is open (observe -> scheduleReload), or stopping after stopObserving(). That is the coalescing logic most likely to break.",
+      "fix": "Add a test: model.show(doc:), model.observe(), setTitle(...) as the user, await Task.yield() twice, then assert that rows.count went up by one. Then call stopObserving(), commit again, and assert that rows did not change."
+    }
+  ]
+}
