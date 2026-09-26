@@ -1,0 +1,47 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibBridge/HTTPServer.swift HTTPServer.accept / HTTPConnection.receive (lines ~195-272); BridgeRouter.route (lines 23-40)",
+      "problem": "All security checks (remote CIDR, bearer token, Origin) run only in BridgeRouter.route, i.e. after HTTPParser has buffered the whole body (up to 32 MB, ~64 MB peak with the prefix copy) and after '100 Continue' has already been sent. Any peer that can reach the port without a token (e.g. anyone on school/cafe Wi-Fi, which is RFC1918 and allowed by default; or any address at all, since the CIDR check is also deferred) can open the 32 allowed connections, declare Content-Length 33554432 and stream data: ~1-2 GB of buffers gets the app jetsam-killed. Idle connections that never finish their headers also hold all 32 slots for the full 120 s request deadline, locking the real client out indefinitely (slowloris).",
+      "fix": "Check the remote address in HTTPServer.accept using connection.endpoint (HTTPConnection.address) before starting to read, and refuse with 403. Expose the parsed head from HTTPParser (e.g. `private(set) var head`) and, as soon as it is known and before reading the body or sending 100 Continue, run a nonisolated precheck: path /health passes; otherwise BridgeAuth.authorized(head.header(\"authorization\"), token: BridgeSecrets.token()) and BridgeAuth.originAllowed(...), with settings read through the thread-safe SettingsStore. Answer 401/403 and close. Use a short header deadline (for example 10 s until the head arrives) and keep 120 s only for the body. Add a parser/connection test showing an unauthenticated request with a large Content-Length is refused after the head alone."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibBridge/MCPHandler.swift rewrite(_:baseURL:) (lines 353-366), used by resultText / content and BridgeRouter.call",
+      "problem": "Every live `tmp:` string in every result is replaced with `http://<host>/api/v1/assets/<token>`, including the ref returned by `asset.upload` (and renders or exports an agent wants to reuse). CommandContext.inputFile accepts only `tmp:` or https for non-user principals, because `http` is limited to `.user`. So the documented flow for an external agent, asset.upload -> image.insert / import.files {url: <ref>}, always fails with 'unsupported URL', and the error hint tells the agent to use a tmp: ref that the bridge never shows it. Bridge agents therefore cannot insert images or import files. That breaks the create part of D-037, S-020 and P-081 and the AI.md §6 Files rule.",
+      "fix": "Keep the download links, but make them round-trip. Before executing (in callTool, after ToolCatalog.invocation, and in BridgeRouter.call), walk inv.params and replace any string of the form `<anything>/api/v1/assets/<token>` whose token still resolves in BridgeAssets with `tmp:<name>`. (Alternatives: skip rewriting for asset.upload, or add the tmp: ref next to the URL.) Add a test: an asset.upload stand-in returns tmp:x, the rewritten URL is passed to a url-taking stand-in command as .bridge, and the command receives tmp:x."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibBridge/MCPHandler.swift sessions (initialize lines 245-250, post lines 190-198)",
+      "problem": "Sessions never expire. Most MCP clients disappear without DELETE /mcp, so bridge.status (and the F091 status pill) keeps showing them as connected forever, because their `sessions` count stays above 0. The 64-session eviction also drops a session without sending .session(started: false), so the counts drift upward.",
+      "fix": "In post(), purge sessions idle for more than about 30 minutes (lastSeen), and call onActivity?(.session(client:, version:, started: false)) for each purged or evicted session."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibBridge/MCPHandler.swift paged / nextPage (lines 388-425)",
+      "problem": "The paging cache keeps up to 32 full result Strings of any size for 10 minutes, for example nib_get points=true on a large page or an inline export, which can reach hundreds of MB. Every page request rebuilds Array(entry.text.utf8) of the whole text on the main actor, so paging an N-byte result costs O(N^2/20 KB) copying.",
+      "fix": "Store the UTF-8 bytes once (Data or [UInt8]) in `pages`, slice them per page, and cap the total cached bytes (for example 64 MB), evicting the oldest entries first."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibBridge/MCPHandler.swift execute / Deadline.run; NibBridgeFeature.swift BridgeConfirmer.confirm",
+      "problem": "In a nib_run batch that needs several confirmations, the 120 s tool timeout can fire while a later confirmation sheet is still up. That sheet has its own fresh 115 s window, and the work keeps running after the timeout. A late Allow then applies the change after the agent was told `timeout`, so the promise that a request waits at most 120 s does not hold for the command's effect.",
+      "fix": "In Deadline.run, keep the work Task handle and cancel it on timeout. In BridgeConfirmer.confirm, return .deny when Task.isCancelled, both before presenting and after the inner confirm returns (the confirm call runs inside the work task, so it sees the cancellation)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibBridge/HTTPServer.swift HTTPConnection.send / HTTPResponse.serialized",
+      "problem": "serialized() builds Data(head) + body, which copies the whole body. For /api/v1/assets downloads of large exports or audio, memory peaks at twice the file size on top of the mapped file.",
+      "fix": "Send the head and the body as two connection.send calls (the body can stay memory-mapped), and cancel the connection in the second call's completion."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibBridge/BridgeCommands.swift BridgeSettings.networks / origins",
+      "problem": "ARCHITECTURE.md §15.5 says a collection setting is one key per entry and never one array. `security.bridge.networks` and `security.bridge.origins` are single array keys. The Keychain location (app.nib.bridge/token) and the security.bridge.* keys that F091 has to use exist only as internal constants of NibBridge, which F091 cannot import.",
+      "fix": "Either switch to declarePrefix per-entry keys (security.bridge.networks.<n>) or record the deviation in the feature summary. Document the Keychain service/account and the security.bridge.* key names for F091 (contract request / final summary)."
+    }
+  ]
+}
