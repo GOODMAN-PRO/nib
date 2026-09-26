@@ -50,6 +50,53 @@ enum StoreStatus {
                                      "Saved by a newer version of Nib, so it opens read-only until Nib is updated.")
 }
 
+/// Changes not on disk yet: the latest head and page snapshots, plus merged conflict copies to delete.
+struct PendingWrite {
+    var head: DocumentContent?
+    var pages: [PageID: [Item]] = [:]
+    var copies: Set<URL> = []
+    let since = Date()
+
+    var isEmpty: Bool { head == nil && pages.isEmpty && copies.isEmpty }
+
+    /// This (older) state with `newer` merged over it last-writer-wins: `newer`'s snapshots, plus any record only this
+    /// one holds or holds at a higher rev.
+    func merged(with newer: PendingWrite, now: UInt64) -> PendingWrite {
+        var out = self
+        if let h = newer.head { out.head = head.flatMap { PackageCodec.mergeHeads([h, $0], now: now) } ?? h }
+        for (page, items) in newer.pages { out.pages[page] = pages[page].map { LWW.merge(items, $0) } ?? items }
+        out.copies.formUnion(newer.copies)
+        return out
+    }
+}
+
+/// What failed package writes left unsaved, per document. Owned by the persistence's serial queue and touched only
+/// there. Every later write of the document merges it in before writing, and the write-ahead log is truncated only
+/// after such a write succeeds. So a flush that runs between a failed background write and its retry cannot truncate
+/// the log while the failed changes exist only in memory.
+final class UnsavedWrites {
+    private var jobs: [DocumentID: PendingWrite] = [:]
+
+    /// What to write now: the unsaved changes of `doc` with `job` merged over them, or nil when there is nothing.
+    func take(_ doc: DocumentID, adding job: PendingWrite, now: UInt64) -> PendingWrite? {
+        let all = jobs.removeValue(forKey: doc).map { $0.merged(with: job, now: now) } ?? job
+        return all.isEmpty ? nil : all
+    }
+
+    /// `job` did not reach the disk: the next write of `doc` takes it along.
+    func keep(_ job: PendingWrite, for doc: DocumentID) {
+        jobs[doc] = job
+    }
+
+    func job(_ doc: DocumentID) -> PendingWrite? {
+        jobs[doc]
+    }
+
+    var documents: [DocumentID] {
+        Array(jobs.keys)
+    }
+}
+
 /// `DocumentPersistence` over `.nibnote` packages in the library folder (ARCHITECTURE §4.2–4.3).
 ///
 /// - Reads merge EVERY device file of the head / a page (conflict copies included) last-writer-wins; merged
@@ -57,6 +104,9 @@ enum StoreStatus {
 /// - `didChange` snapshots on the main actor, appends the payload to the write-ahead log and schedules a debounced
 ///   write (1.5 s) on one serial background queue; `flush` writes synchronously. This device writes only its own
 ///   files, and they hold the full merged state it knows.
+/// - A failed write keeps its changes on that queue (`UnsavedWrites`), and every later write of the document merges
+///   them in. The log is truncated only after a write that holds everything the log recorded, so every logged change
+///   is always either in the package files or still in the log.
 /// - `remoteChanges` re-reads other devices' files whose stamp changed and returns the records newer than the copy
 ///   this device has in memory.
 @MainActor
@@ -67,16 +117,6 @@ final class PackagePersistence: DocumentPersistence {
         var itemRevs: [PageID: [NibID: Rev]] = [:]
     }
 
-    /// Changes not on disk yet: the latest head and page snapshots, plus merged conflict copies to delete.
-    private struct Pending {
-        var head: DocumentContent?
-        var pages: [PageID: [Item]] = [:]
-        var copies: Set<URL> = []
-        let since = Date()
-
-        var isEmpty: Bool { head == nil && pages.isEmpty && copies.isEmpty }
-    }
-
     let files: PackageFiles
     let wal: WriteAheadLog
     let gate: ReadOnlyGate
@@ -84,9 +124,12 @@ final class PackagePersistence: DocumentPersistence {
     private let debounce: TimeInterval
     private let maxDelay: TimeInterval
     private let io = DispatchQueue(label: "app.nib.store.io", qos: .utility)
+    /// Only touched on `io`.
+    private let unsaved = UnsavedWrites()
     private let log = Logger(subsystem: "app.nib", category: "store")
     private var known: [DocumentID: Known] = [:]
-    private var pending: [DocumentID: Pending] = [:]
+    /// Changes not handed to `io` yet.
+    private var pending: [DocumentID: PendingWrite] = [:]
     private var timers: [DocumentID: Task<Void, Never>] = [:]
     /// Stamps of other devices' files as last read, keyed by package-relative path.
     private var seen: [DocumentID: [String: PackageFiles.Stamp]] = [:]
@@ -108,13 +151,15 @@ final class PackagePersistence: DocumentPersistence {
         let pkg = try files.package(doc)
         let now = PackageCodec.ms(Date())
         // Drain queued log appends and writes before reading the files, so a write in flight is in them (it truncates
-        // the log it covered).
-        let wal = self.wal
-        let logged = io.sync { wal.read(doc) }
+        // the log it covered). A failed write's head is still in the log, or at least in the unsaved writes (when
+        // logging failed too).
+        let wal = self.wal, unsaved = self.unsaved
+        let (logged, failedHead) = io.sync { (wal.read(doc), unsaved.job(doc)?.head) }
         let sources = try files.headSources(pkg)
         let read = files.read(sources, in: "", decode: PackageCodec.decodeHead) { PackageCodec.hasFutureRev($0, now: now) }
         report(doc, read)
         var candidates = read.values + logged.compactMap { $0.head }
+        if let kept = failedHead { candidates.append(kept) }
         if let unwritten = pending[doc]?.head { candidates.append(unwritten) }
         guard var head = PackageCodec.mergeHeads(candidates, now: now) else {
             if read.failures.isEmpty { throw NibError.notFound("document \(doc.raw)") }
@@ -149,7 +194,7 @@ final class PackagePersistence: DocumentPersistence {
             copies += disk.read.copies
         }
         if !readOnly, !logged.isEmpty || !copies.isEmpty {
-            var p = pending[doc] ?? Pending()
+            var p = pending[doc] ?? PendingWrite()
             p.head = head
             for (page, items) in recovered { p.pages[page] = LWW.merge(items, p.pages[page] ?? []) }
             p.copies.formUnion(copies)
@@ -167,7 +212,7 @@ final class PackagePersistence: DocumentPersistence {
         seen[doc, default: [:]].merge(disk.read.stamps) { _, new in new }
         known[doc]?.itemRevs[page] = PackageCodec.revs(items)
         if !disk.read.copies.isEmpty, !gate.contains(doc) {
-            var p = pending[doc] ?? Pending()
+            var p = pending[doc] ?? PendingWrite()
             p.pages[page] = items
             p.copies.formUnion(disk.read.copies)
             pending[doc] = p
@@ -177,18 +222,19 @@ final class PackagePersistence: DocumentPersistence {
     }
 
     /// A page as this device knows it: every device file (and conflict copy) merged, then what is not written yet.
-    /// Queued log appends and writes are drained first, so the files hold a write that was in flight; the log still
-    /// holds what a failed write left behind, and pending snapshots hold what is not queued yet. Unreadable and
-    /// clock-skewed files are reported.
+    /// Queued log appends and writes are drained first, so the files hold a write that was in flight. The log and the
+    /// unsaved writes hold what a failed write left behind, and pending snapshots hold what is not queued yet.
+    /// Unreadable and clock-skewed files are reported.
     private func mergedPage(_ doc: DocumentID, _ pkg: URL, _ page: PageID,
                             now: UInt64) -> (items: [Item], read: PackageFiles.ReadResult<[Item]>) {
-        let wal = self.wal
-        let logged = io.sync { wal.read(doc) }
+        let wal = self.wal, unsaved = self.unsaved
+        let (logged, failedItems) = io.sync { (wal.read(doc), unsaved.job(doc)?.pages[page]) }
         let read = files.read(files.pageSources(pkg, page: page), in: PackageCodec.pageDirectory(page),
                               decode: PackageCodec.decodeItems) { PackageCodec.hasFutureRev($0, now: now) }
         report(doc, read)
         var items = PackageCodec.mergeItems(read.values)
         for entry in logged { if let changed = entry.pages[page.raw] { items = LWW.merge(items, changed) } }
+        if let kept = failedItems { items = LWW.merge(items, kept) }
         if let unwritten = pending[doc]?.pages[page] { items = LWW.merge(items, unwritten) }
         return (items, read)
     }
@@ -213,7 +259,7 @@ final class PackagePersistence: DocumentPersistence {
             log.error("not saving \(doc.raw, privacy: .public): \(ReadOnlyGate.refusal(doc).message, privacy: .public)")
             return
         }
-        var p = pending[doc] ?? Pending()
+        var p = pending[doc] ?? PendingWrite()
         if let h = head { p.head = h }
         for (page, items) in pages { p.pages[page] = items }
         pending[doc] = p
@@ -237,9 +283,11 @@ final class PackagePersistence: DocumentPersistence {
         write(doc, synchronously: true)
     }
 
-    /// Writes every document with pending changes (the app is leaving the foreground).
+    /// Writes every document with pending or unsaved changes (the app is leaving the foreground).
     func flushAll() {
-        for doc in Array(pending.keys) { write(doc, synchronously: true) }
+        let unsaved = self.unsaved
+        let unsavedDocs = io.sync { unsaved.documents }
+        for doc in Set(pending.keys).union(unsavedDocs) { write(doc, synchronously: true) }
     }
 
     /// Waits until queued log appends and writes have finished.
@@ -260,48 +308,51 @@ final class PackagePersistence: DocumentPersistence {
         }
     }
 
-    private func write(_ doc: DocumentID, synchronously: Bool) {
+    /// Hands the pending changes of `doc` to `io` and writes them there, together with whatever earlier writes left
+    /// unsaved; `synchronously` waits for the write. The log is truncated only when that combined write succeeds.
+    /// Internal so tests can start a background write the way the debounce timer does.
+    func write(_ doc: DocumentID, synchronously: Bool) {
         timers.removeValue(forKey: doc)?.cancel()
-        guard let job = pending.removeValue(forKey: doc), !job.isEmpty else {
+        let job = pending.removeValue(forKey: doc) ?? PendingWrite()
+        guard !gate.contains(doc) else {
+            if !job.isEmpty {
+                log.error("not saving \(doc.raw, privacy: .public): \(ReadOnlyGate.refusal(doc).message, privacy: .public)")
+            }
             if synchronously { io.sync {} }
             return
         }
-        guard !gate.contains(doc) else {
-            log.error("not saving \(doc.raw, privacy: .public): \(ReadOnlyGate.refusal(doc).message, privacy: .public)")
-            return
-        }
-        let files = self.files, wal = self.wal
+        let files = self.files, wal = self.wal, unsaved = self.unsaved
         let run = { () -> Error? in
+            // A failed write's retry may not be queued yet, so its changes may exist only here and in the log.
+            // They go into this write, so truncating the log below never drops a change that is not on disk.
+            guard let all = unsaved.take(doc, adding: job, now: PackageCodec.ms(Date())) else { return nil }
             do {
-                try files.write(doc, head: job.head, pages: job.pages, deleting: Array(job.copies), now: Date())
+                try files.write(doc, head: all.head, pages: all.pages, deleting: Array(all.copies), now: Date())
                 wal.truncate(doc)
                 return nil
             } catch {
+                unsaved.keep(all, for: doc)
                 return error
             }
         }
         if synchronously {
-            if let error = io.sync(execute: run) { failed(doc, job, error) }
+            if let error = io.sync(execute: run) { failed(doc, error) }
         } else {
             io.async {
                 guard let error = run() else { return }
-                Task { @MainActor in self.failed(doc, job, error) }
+                Task { @MainActor in self.failed(doc, error) }
             }
         }
     }
 
-    /// Keeps what did not reach the disk for the next write (newer pending snapshots win); the log still holds it.
-    /// Retried after the debounce, unless the package is gone: then the next change or flush retries (it may have
-    /// moved, and the library points the locator at the new place).
-    private func failed(_ doc: DocumentID, _ job: Pending, _ error: Error) {
+    /// Reports a failed write. The unsaved writes hold its changes, and so does the log; the next write of `doc`
+    /// takes them along. That write is the retry scheduled after the debounce, unless the package is gone. Then the
+    /// next change or flush retries, because the package may have moved and the library points the locator at the new
+    /// place.
+    private func failed(_ doc: DocumentID, _ error: Error) {
         let e = NibError.wrap(error)
         log.error("saving \(doc.raw, privacy: .public) failed: \(e.message, privacy: .public)")
         emit(doc, StoreStatus.payload("error", "writeFailed", "Changes could not be saved: \(e.message)"))
-        var p = pending[doc] ?? Pending()
-        if p.head == nil { p.head = job.head }
-        for (page, items) in job.pages where p.pages[page] == nil { p.pages[page] = items }
-        p.copies.formUnion(job.copies)
-        pending[doc] = p
         if e.code != .notFound { scheduleWrite(doc) }
     }
 
@@ -376,7 +427,7 @@ final class PackagePersistence: DocumentPersistence {
 
         // Merged conflict copies go into this device's files, then they are deleted.
         if !gate.contains(doc), !headCopies.isEmpty || !pageCopies.isEmpty {
-            var p = pending[doc] ?? Pending()
+            var p = pending[doc] ?? PendingWrite()
             if !headCopies.isEmpty {
                 p.head = PackageCodec.mergeHeads([k.head] + (p.head.map { [$0] } ?? []), now: now)
             }

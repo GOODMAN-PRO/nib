@@ -2,9 +2,11 @@ import Foundation
 import NibContracts
 
 /// Crash safety between a commit and the debounced package write. Every `didChange` payload is appended as one JSON
-/// line to `<directory>/<doc>.jsonl` (Application Support/Nib/wal), the file is truncated after a successful package
-/// write, and `loadHead` replays whatever is left. Appends and truncation run on the persistence's serial queue;
-/// replay reads through the same queue, so the three never interleave.
+/// line to `<directory>/<doc>.jsonl` (Application Support/Nib/wal), and `loadHead` replays whatever is left. The file
+/// is truncated only after a package write that holds everything logged before it: the persistence merges what
+/// earlier failed writes left unsaved into every write, so a change is always either on disk or still in the log.
+/// Appends and truncation run on the persistence's serial queue, and replay reads through the same queue, so the three
+/// never interleave.
 final class WriteAheadLog {
     struct Entry: Codable {
         var head: DocumentContent?

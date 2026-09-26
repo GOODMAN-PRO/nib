@@ -209,6 +209,98 @@ final class NibStoreTests: XCTestCase {
         XCTAssertTrue(own.meta.favorite)
     }
 
+    /// A background write fails, and a flush of other changes succeeds before the failed write's retry is queued.
+    /// Truncating the log after that flush must not leave the failed changes only in memory. A crash right after it
+    /// (a fresh store on the same folders) still finds them.
+    func testFailedBackgroundWriteSurvivesLaterFlushAndCrash() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+
+        let blocked = try blockPageFolder(pkg, Fixtures.page2)
+        let stroke = walStroke("FAILEDWRITE1")
+        store.didChange(doc, head: nil, pages: [Fixtures.page2: [stroke]])
+        // The debounced write starts in the background and fails. Its failure is still on its way to the main actor:
+        // this test never yields, so the retry is not queued.
+        store.write(doc, synchronously: false)
+        store.waitForIO()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: pageFile(pkg, Fixtures.page2).path))
+        XCTAssertEqual(store.wal.read(doc).count, 1)
+
+        // The page can be written again, and the next edit (on the head only) is flushed at once.
+        try FileManager.default.removeItem(at: blocked)
+        var head = content
+        head.meta.favorite = true
+        head.meta.rev = HLCClock(device: 10).tick()
+        store.didChange(doc, head: head, pages: [:])
+        store.flush(doc)
+        XCTAssertTrue(store.wal.read(doc).isEmpty, "the flush wrote the failed changes too, then truncated the log")
+        XCTAssertEqual(try PackageCodec.decodeItems(Data(contentsOf: pageFile(pkg, Fixtures.page2))).map(\.id),
+                       ["FAILEDWRITE1"])
+
+        // Crash before the retry: nothing of the failed write is lost.
+        let relaunched = lib.store("0000000a")
+        XCTAssertTrue(try relaunched.loadHead(doc).meta.favorite)
+        XCTAssertEqual(try relaunched.loadItems(doc, page: Fixtures.page2).map(\.id), ["FAILEDWRITE1"])
+    }
+
+    /// Same interleaving, but the failed page still cannot be written. The flush then fails as a whole and truncates
+    /// nothing, so every logged change is recovered from the log after a crash.
+    func testLogIsNotTruncatedWhileFailedChangesAreNotOnDisk() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        store.didChange(doc, head: content, pages: items)
+        store.flush(doc)
+
+        let blocked = try blockPageFolder(pkg, Fixtures.page2)
+        store.didChange(doc, head: nil, pages: [Fixtures.page2: [walStroke("FAILEDWRITE2")]])
+        store.write(doc, synchronously: false)
+        store.waitForIO()
+        var head = content
+        head.meta.favorite = true
+        head.meta.rev = HLCClock(device: 10).tick()
+        store.didChange(doc, head: head, pages: [:])
+        store.flush(doc)
+        XCTAssertEqual(store.wal.read(doc).count, 2, "nothing is truncated while the failed page is not on disk")
+
+        let relaunched = lib.store("0000000a")
+        XCTAssertTrue(try relaunched.loadHead(doc).meta.favorite)
+        XCTAssertEqual(try relaunched.loadItems(doc, page: Fixtures.page2).map(\.id), ["FAILEDWRITE2"])
+
+        // Once the page can be written, the replayed changes reach the disk and the log is truncated.
+        try FileManager.default.removeItem(at: blocked)
+        relaunched.flush(doc)
+        XCTAssertTrue(relaunched.wal.read(doc).isEmpty)
+        XCTAssertEqual(try PackageCodec.decodeItems(Data(contentsOf: pageFile(pkg, Fixtures.page2))).map(\.id),
+                       ["FAILEDWRITE2"])
+    }
+
+    /// Replaces the folder of `page` with a plain file, so writing the page fails until the file is removed.
+    private func blockPageFolder(_ pkg: URL, _ page: PageID) throws -> URL {
+        let folder = pkg.appendingPathComponent("pages/\(page.raw)", isDirectory: false)
+        if FileManager.default.fileExists(atPath: folder.path) { try FileManager.default.removeItem(at: folder) }
+        XCTAssertTrue(FileManager.default.createFile(atPath: folder.path, contents: Data("blocked".utf8)))
+        return folder
+    }
+
+    private func pageFile(_ pkg: URL, _ page: PageID) -> URL {
+        pkg.appendingPathComponent("pages/\(page.raw)/0000000a.nibpage")
+    }
+
+    private func walStroke(_ id: ElementID) -> Item {
+        var stroke = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 2), StrokePoint(x: 3, y: 4)]))
+        stroke.id = id
+        stroke.rev = HLCClock(device: 10).tick()
+        return stroke
+    }
+
     func testNewerFormatOpensReadOnlyAndRefusesWrites() throws {
         let lib = TestLibrary()
         var (content, _) = Fixtures.sampleContent()
