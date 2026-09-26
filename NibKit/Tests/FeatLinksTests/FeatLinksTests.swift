@@ -24,6 +24,29 @@ final class FeatLinksTests: XCTestCase {
         h.persistence.pageItems[Fixtures.docID, default: [:]][page] = items
     }
 
+    /// A stand-in for F052's `audio.play` that records the params it was called with.
+    private final class Calls {
+        var params: [JSONValue] = []
+    }
+
+    private func stubAudioPlay(_ h: Harness) -> Calls {
+        let calls = Calls()
+        h.app.commands.register(CommandDescriptor(
+            id: "audio.play", title: "Play Recording", summary: "Test stand-in that records its params.",
+            params: .obj(["clip": .ref, "t": .num(min: 0)], required: ["clip"]), effect: .session, owner: "tests")) { params, _ in
+            calls.params.append(params)
+            return [:]
+        }
+        return calls
+    }
+
+    /// Runs a command as a dry run (an AI preview): nothing may be persisted, recorded or emitted.
+    @discardableResult
+    private func dryRun(_ h: Harness, _ command: String, _ params: JSONValue = [:]) async throws -> JSONValue {
+        try await h.app.bus.execute(Invocation(command: command, params: params, principal: .user, session: h.session,
+                                               dryRun: true)).value
+    }
+
     private func assertThrows(_ code: NibError.Code, file: StaticString = #filePath, line: UInt = #line,
                               _ body: () async throws -> Void) async {
         do {
@@ -91,11 +114,8 @@ final class FeatLinksTests: XCTestCase {
 
     func testPageAndAudioLinksResolveRefsAndBadInputIsRefused() async throws {
         let h = harness()
-        try await h.run("link.set", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01", "range": [0, 8],
-                                     "link": ["page": "FIXTUREPG002"]])
-        let sticky = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
-        XCTAssertEqual(sticky.sticky?.text.paragraphs.first?.runs.first?.attrs.link,
-                       TextLink(document: Fixtures.docID, page: Fixtures.page2))
+        try await h.run("link.set", ["ref": .string(textRef), "range": [0, 5], "link": ["page": "FIXTUREPG002"]])
+        XCTAssertEqual(LinkText.links(in: try fixtureText(h)).first?.link, TextLink(document: Fixtures.docID, page: Fixtures.page2))
 
         try await h.run("link.set", ["ref": "block:FIXTUREDOC02/FIXTUREBLK02", "range": [0, 5],
                                      "link": ["clip": "audio:FIXTUREDOC01/FIXTUREAUD01", "t": 12]])
@@ -120,6 +140,76 @@ final class FeatLinksTests: XCTestCase {
         await assertThrows(.invalidParams) {
             _ = try await h.run("link.set", ["ref": .string(ref), "range": [0, 5]], as: .ai("chat"))
         }
+        await assertThrows(.invalidParams) {
+            _ = try await h.run("link.set", ["ref": .string(ref), "range": [5_000_000_000, 5_000_000_000],
+                                             "link": ["url": "https://nib.example"]], as: .ai("chat"))
+        }
+    }
+
+    func testOnlyTheUserMayLinkToNibActionsOtherThanOpenAndAudio() async throws {
+        let h = harness()
+        // Agents and plugins that may edit documents: the refusal below is the link policy, not a missing grant.
+        h.app.gateway.grants = { _ in [.documentRead, .documentWrite] }
+        let ref: JSONValue = .string(textRef)
+        let install: JSONValue = ["url": "nib://plugin/install?url=https://plugins.example/p.zip"]
+        await assertThrows(.permissionDenied) {
+            _ = try await h.run("link.set", ["ref": ref, "range": [0, 5], "link": install], as: .ai("chat"))
+        }
+        await assertThrows(.permissionDenied) {
+            _ = try await h.run("link.set", ["ref": ref, "range": [0, 5], "link": install], as: .plugin("dev.test.plugin"))
+        }
+        XCTAssertTrue(LinkText.links(in: try fixtureText(h)).isEmpty)
+        // An agent may still use nib://open links: they are stored as page links.
+        try await h.run("link.set", ["ref": ref, "range": [0, 5], "link": ["url": "nib://open/FIXTUREDOC01/FIXTUREPG002"]],
+                        as: .ai("chat"))
+        XCTAssertEqual(LinkText.links(in: try fixtureText(h)).first?.link, TextLink(document: Fixtures.docID, page: Fixtures.page2))
+        // The user may link any nib:// action.
+        try await h.run("link.set", ["ref": ref, "range": [6, 3], "link": install])
+        XCTAssertEqual(LinkText.links(in: try fixtureText(h)).last?.link.url, "nib://plugin/install?url=https://plugins.example/p.zip")
+    }
+
+    func testEveryItemKindLinkSetAcceptsIsFollowedByLinkTapAt() async throws {
+        let h = harness()
+        let nav = try navigator(h)
+        var opened: [URL] = []
+        nav.openExternal = { opened.append($0) }
+        // A shape with text, so the shape is refused for its kind and not for lacking text.
+        place([Item(id: "LINKSHAPE001", kind: .shape, z: "V",
+                    shape: ShapeItem(shape: .rectangle, frame: Frame(x: 100, y: 500, w: 200, h: 80), text: RichText(plain: "Shape text")))], h)
+        let onPage1 = "item:FIXTUREDOC01/FIXTUREPG001/"
+        let candidates: [(ItemKind, String)] = [
+            (.text, onPage1 + "FIXTURETXT01"), (.sticky, onPage1 + "FIXTURESTY01"),
+            (.shape, "item:FIXTUREDOC01/FIXTUREPG002/LINKSHAPE001"), (.stroke, onPage1 + "FIXTURESTK01"),
+            (.connector, onPage1 + "FIXTURECON01"), (.comment, onPage1 + "FIXTURECMT01"), (.math, onPage1 + "FIXTUREMTH01"),
+            (.image, onPage1 + "FIXTUREIMG01"), (.custom, onPage1 + "FIXTURECUS01"),
+        ]
+        XCTAssertEqual(Set(candidates.map { $0.0 }), Set(ItemKind.allCases))
+        var accepted: [ItemKind] = []
+        for (kind, ref) in candidates {
+            do {
+                try await h.run("link.set", ["ref": .string(ref), "range": [0, 5], "link": .object(["url": .string("https://nib.example/" + kind.rawValue)])])
+                accepted.append(kind)
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .invalidParams, kind.rawValue)
+            }
+        }
+        XCTAssertEqual(accepted, [.text])
+        XCTAssertFalse(LinkSelection.isLinkable(onPage1 + "FIXTURESTY01", workspace: h.app.workspace))
+
+        for (kind, ref) in candidates where accepted.contains(kind) {
+            guard case let .item(d, p, i)? = NodeRef(ref) else { return XCTFail(ref) }
+            let box = try XCTUnwrap(h.app.workspace.item(d, page: p, id: i).text, kind.rawValue)
+            let rect = try XCTUnwrap(LinkHitTester.regions(text: box.text, style: box.style,
+                                                           size: CGSize(width: box.frame.w, height: box.frame.h)).first?.rects.first)
+            h.session.page = p
+            let result = try await h.run("link.tapAt", [
+                "page": .string(NodeRef.page(d, p).description),
+                "point": [.number(box.frame.x + Double(rect.midX)), .number(box.frame.y + Double(rect.midY))],
+                "ref": .string(ref), "gesture": "longPress"])
+            XCTAssertEqual(result["handled"]?.boolValue, true, kind.rawValue)
+            XCTAssertEqual(result["target"]?.stringValue, "https://nib.example/" + kind.rawValue)
+        }
+        XCTAssertEqual(opened.map { $0.absoluteString }, accepted.map { "https://nib.example/" + $0.rawValue })
     }
 
     func testAutodetectLinksTypedAddressesOnce() async throws {
@@ -142,9 +232,10 @@ final class FeatLinksTests: XCTestCase {
         XCTAssertEqual(caret.range, NSRange(location: 6, length: 3))
         XCTAssertEqual(caret.existing, TextLink(url: "https://nib.example"))
         XCTAssertEqual(caret.excerpt, "Nib")
-        let whole = try LinkEditorPresenter.makeTarget(ref: "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01", range: nil,
+        let whole = try LinkEditorPresenter.makeTarget(ref: "block:FIXTUREDOC02/FIXTUREBLK02", range: nil,
                                                        editing: nil, workspace: h.app.workspace)
-        XCTAssertEqual(whole.range, NSRange(location: 0, length: 8))
+        XCTAssertEqual(whole.range, NSRange(location: 0, length: 12))
+        XCTAssertEqual(whole.excerpt, "Hello blocks")
         XCTAssertNil(whole.existing)
 
         let model = LinkEditorModel(app: h.app, session: h.session, target: caret)
@@ -157,6 +248,26 @@ final class FeatLinksTests: XCTestCase {
         model.kind = .document
         model.page = Fixtures.page2
         XCTAssertEqual(model.linkTarget, LinkTarget(page: "page:FIXTUREDOC01/FIXTUREPG002"))
+    }
+
+    func testCommandKWhileTypingUsesTheTextTheLinkMenuWasShownFor() {
+        let h = harness()
+        h.session.selection = Selection()
+        h.session.isEditingText = true
+        XCTAssertNil(LinkSelection.editingRef(h.session, workspace: h.app.workspace))
+        XCTAssertTrue(LinkSelection.textSelectionIsVisible(MenuContext(app: h.app, session: h.session, ref: textRef)))
+        XCTAssertEqual(LinkSelection.editingRef(h.session, workspace: h.app.workspace), textRef)
+        // Another window, or the same one once typing has ended, does not inherit it.
+        let other = EditorSession()
+        other.isEditingText = true
+        XCTAssertNil(LinkSelection.editingRef(other, workspace: h.app.workspace))
+        h.session.isEditingText = false
+        XCTAssertNil(LinkSelection.editingRef(h.session, workspace: h.app.workspace))
+        // Text that cannot carry links never becomes the target.
+        h.session.isEditingText = true
+        let sticky = MenuContext(app: h.app, session: h.session, ref: "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01")
+        XCTAssertFalse(LinkSelection.textSelectionIsVisible(sticky))
+        XCTAssertNil(LinkSelection.editingRef(h.session, workspace: h.app.workspace))
     }
 
     // MARK: Following links
@@ -179,6 +290,103 @@ final class FeatLinksTests: XCTestCase {
         XCTAssertNil(nav.pendingReturn(h.session))
         let none = try await h.run("link.back")
         XCTAssertEqual(none["returned"]?.boolValue, false)
+    }
+
+    func testHistoryOfClosedWindowsIsDropped() async throws {
+        let h = harness()
+        let nav = try navigator(h)
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        other.page = Fixtures.page1
+        h.app.services.sessions.add(other)
+        _ = try await h.app.bus.execute(Invocation(command: "link.follow", params: ["page": "page:FIXTUREDOC01/FIXTUREPG002"],
+                                                   session: other))
+        XCTAssertEqual(nav.history(other), [LinkStop(doc: Fixtures.docID, page: Fixtures.page1)])
+        h.app.services.sessions.remove(other)
+        try await h.run("link.follow", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertTrue(nav.history(other).isEmpty)
+        XCTAssertEqual(nav.history(h.session), [LinkStop(doc: Fixtures.docID, page: Fixtures.page1)])
+    }
+
+    func testAudioLinksPlayTheClipAtTheirTime() async throws {
+        let h = harness()
+        let calls = stubAudioPlay(h)
+        let clip: JSONValue = "audio:FIXTUREDOC01/FIXTUREAUD01"
+        let follow = try await h.run("link.follow", ["clip": clip, "t": 30])
+        XCTAssertEqual(follow["kind"]?.stringValue, "audio")
+        XCTAssertEqual(follow["target"], clip)
+        let atThirty: JSONValue = ["clip": clip, "t": 30]
+        XCTAssertEqual(calls.params, [atThirty])
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        XCTAssertTrue(try navigator(h).history(h.session).isEmpty)
+
+        // A linked text box: a read-only tap plays from the stored time.
+        try await h.run("link.set", ["ref": .string(textRef), "range": [0, 5], "link": ["clip": clip, "t": 12]])
+        let box = try XCTUnwrap(h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).text)
+        let rect = try XCTUnwrap(LinkHitTester.regions(text: box.text, style: box.style,
+                                                       size: CGSize(width: box.frame.w, height: box.frame.h)).first?.rects.first)
+        h.session.readOnly = true
+        let tap = try await h.run("link.tapAt", ["page": "page:FIXTUREDOC01/FIXTUREPG001",
+                                                 "point": [.number(box.frame.x + Double(rect.midX)), .number(box.frame.y + Double(rect.midY))],
+                                                 "gesture": "tap"])
+        XCTAssertEqual(tap["handled"]?.boolValue, true)
+        let fromText: JSONValue = ["clip": clip, "t": 12]
+        XCTAssertEqual(calls.params.last, fromText)
+
+        // From another document the window first opens the clip's page, and remembers where it was.
+        h.session.document = Fixtures.textDocID
+        h.session.page = nil
+        try await h.run("link.follow", ["clip": clip])
+        let fromStart: JSONValue = ["clip": clip, "t": 0]
+        XCTAssertEqual(calls.params.last, fromStart)
+        XCTAssertEqual(calls.params.count, 3)
+        XCTAssertEqual(h.session.document, Fixtures.docID)
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        XCTAssertEqual(try navigator(h).pendingReturn(h.session), LinkStop(doc: Fixtures.textDocID, page: nil))
+    }
+
+    func testDryRunsResolveLinksButMoveOpenAndPlayNothing() async throws {
+        let h = harness()
+        let nav = try navigator(h)
+        var opened: [URL] = []
+        nav.openExternal = { opened.append($0) }
+        let calls = stubAudioPlay(h)
+
+        let page = try await dryRun(h, "link.follow", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        XCTAssertEqual(page["kind"]?.stringValue, "page")
+        XCTAssertEqual(page["target"]?.stringValue, "page:FIXTUREDOC01/FIXTUREPG002")
+        let web = try await dryRun(h, "link.follow", ["url": "https://example.com/a"])
+        XCTAssertEqual(web["kind"]?.stringValue, "url")
+        let audio = try await dryRun(h, "link.follow", ["clip": "audio:FIXTUREDOC01/FIXTUREAUD01", "t": 30])
+        XCTAssertEqual(audio["kind"]?.stringValue, "audio")
+        await assertThrows(.notFound) {
+            _ = try await self.dryRun(h, "link.follow", ["page": "page:FIXTUREDOC01/NOSUCHPAGE01"])
+        }
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        XCTAssertTrue(nav.history(h.session).isEmpty)
+        XCTAssertTrue(opened.isEmpty)
+        XCTAssertTrue(calls.params.isEmpty)
+
+        // A dry link.tapAt reports the link under the finger and stays put.
+        try await h.run("link.set", ["ref": .string(textRef), "range": [6, 3], "link": ["page": "page:FIXTUREDOC01/FIXTUREPG002"]])
+        let box = try XCTUnwrap(h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID).text)
+        let rect = try XCTUnwrap(LinkHitTester.regions(text: box.text, style: box.style,
+                                                       size: CGSize(width: box.frame.w, height: box.frame.h)).first?.rects.first)
+        let tap = try await dryRun(h, "link.tapAt", ["page": "page:FIXTUREDOC01/FIXTUREPG001",
+                                                     "point": [.number(box.frame.x + Double(rect.midX)), .number(box.frame.y + Double(rect.midY))],
+                                                     "gesture": "longPress"])
+        XCTAssertEqual(tap["handled"]?.boolValue, true)
+        XCTAssertEqual(tap["target"]?.stringValue, "page:FIXTUREDOC01/FIXTUREPG002")
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        XCTAssertTrue(nav.history(h.session).isEmpty)
+
+        // A dry link.back names the stop without leaving or popping it.
+        try await h.run("link.follow", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        let back = try await dryRun(h, "link.back")
+        XCTAssertEqual(back["returned"]?.boolValue, true)
+        XCTAssertEqual(back["page"]?.stringValue, "page:FIXTUREDOC01/FIXTUREPG001")
+        XCTAssertEqual(h.session.page, Fixtures.page2)
+        XCTAssertEqual(nav.history(h.session), [LinkStop(doc: Fixtures.docID, page: Fixtures.page1)])
     }
 
     func testWebLinksOpenOutsideAndAgentsCannotOpenOtherSchemes() async throws {
@@ -281,5 +489,36 @@ final class FeatLinksTests: XCTestCase {
                                                     "gesture": "tap"])
         XCTAssertEqual(onItem["handled"]?.boolValue, false)
         XCTAssertEqual(h.session.page, pageA.id)
+    }
+    func testPDFLinksLandWhereTheCentredPDFPageShowsThem() async throws {
+        let h = harness()
+        let pdf = FakePDFService()          // every PDF page is A4
+        h.app.services.pdf = pdf
+        let asset = AssetRef("wide.pdf")
+        let doc: DocumentID = "LINKWIDEPDF1"
+        // A page twice as wide as the A4 PDF page: the PDF page is drawn at scale 1, centred left to right.
+        let wide = PageSize(2 * PageSize.a4.width, PageSize.a4.height)
+        let pageA = PageRecord(id: "WIDEPDFPG001", order: "V", size: wide, background: .ofPDF(asset, page: 0))
+        let pageB = PageRecord(id: "WIDEPDFPG002", order: "k", size: wide, background: .ofPDF(asset, page: 1))
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook), pages: [pageA, pageB]),
+                                         title: "Wide", in: nil)
+        h.assets.install(Fixtures.pdfData(), as: asset, doc: doc)
+        pdf.pages[asset.name] = 2
+        let tab = Rect(x: 72, y: 72, width: 160, height: 32)
+        pdf.linkMap[asset.name] = [PDFLinkInfo(rect: tab, pageIndex: 1)]
+        h.session.document = doc
+        h.session.page = pageA.id
+        let onPageA: JSONValue = "page:LINKWIDEPDF1/WIDEPDFPG001"
+
+        let placed = LinkHitTester.PDFPlacement(pdfSize: .a4, pageSize: wide).rect(tab)
+        XCTAssertEqual(placed.x, PageSize.a4.width / 2 + 72, accuracy: 1e-6)
+        XCTAssertEqual(placed.width, 160, accuracy: 1e-6)
+        // Where a stretched (non-uniform) mapping would have put the tab, there is only paper.
+        let stretched = try await h.run("link.tapAt", ["page": onPageA, "point": [150, 88], "gesture": "tap"])
+        XCTAssertEqual(stretched["handled"]?.boolValue, false)
+        let hit = try await h.run("link.tapAt", ["page": onPageA, "point": [.number(placed.x + placed.width / 2),
+                                                                           .number(placed.y + placed.height / 2)], "gesture": "tap"])
+        XCTAssertEqual(hit["handled"]?.boolValue, true)
+        XCTAssertEqual(h.session.page, pageB.id)
     }
 }

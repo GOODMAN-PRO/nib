@@ -31,7 +31,7 @@ public enum FeatLinksFeature: NibFeature {
             id: "link.textSelection", title: String(localized: "Link"), icon: "link", location: .textSelection,
             order: 300, owner: id, command: LinkSet.descriptor.id,
             params: { ctx in LinkSelection.textSelectionParams(ctx) },
-            isVisible: { ctx in LinkSelection.isLinkable(ctx.ref, workspace: ctx.app.workspace) }))
+            isVisible: { ctx in LinkSelection.textSelectionIsVisible(ctx) }))
         app.ui.menus.register(MenuItemDescriptor(
             id: "link.objectMenu", title: String(localized: "Add Link"), icon: "link", location: .objectMenu,
             order: 650, owner: id, command: LinkSet.descriptor.id,

@@ -48,6 +48,33 @@ final class LinkHitTests: XCTestCase {
         XCTAssertNil(LinkHitTester.link(at: Point(20, 20), in: item))
     }
 
+    func testAnAutoGrowingBoxIsHitBelowAStaleFrameHeight() throws {
+        // Three lines in a frame one line tall: F026 paints an auto-growing box as tall as its text needs.
+        let text = RichText(paragraphs: [Paragraph(runs: [TextRun("One")]), Paragraph(runs: [TextRun("Two")]),
+                                         Paragraph(runs: [TextRun("Three "), TextRun("link", TextAttributes(link: site))])])
+        let frame = Frame(x: 100, y: 200, w: 300, h: 20)
+        let grows = box(text, frame)
+        let laid = LinkHitTester.layout(text: text, style: TextBoxStyle(padding: 4), width: 300)
+        XCTAssertGreaterThan(laid.needed, 3 * 15)
+        let rect = try XCTUnwrap(laid.regions.first?.rects.first)
+        XCTAssertGreaterThan(Double(rect.minY), frame.h + Double(LinkHitTester.slop))
+        let point = Point(frame.x + Double(rect.midX), frame.y + Double(rect.midY))
+        XCTAssertTrue(LinkHitTester.mayHit(point, grows))
+        XCTAssertEqual(LinkHitTester.link(at: point, in: grows), site)
+
+        // A fixed-height box clips its text at the frame, so the hidden link is not there to tap.
+        let fixed = Item(kind: .text, text: TextBoxItem(frame: frame, text: text, style: TextBoxStyle(padding: 4, autoGrow: false)))
+        XCTAssertFalse(LinkHitTester.mayHit(point, fixed))
+        XCTAssertNil(LinkHitTester.link(at: point, in: fixed))
+    }
+
+    func testOnlyTextBoxesAreHitTested() {
+        let text = linked("Visit Nib now", NSRange(location: 0, length: 13), site)
+        let sticky = Item(kind: .sticky, sticky: StickyItem(frame: Frame(x: 0, y: 0, w: 200, h: 200), text: text))
+        XCTAssertFalse(LinkHitTester.mayHit(Point(20, 20), sticky))
+        XCTAssertNil(LinkHitTester.link(at: Point(20, 20), in: sticky))
+    }
+
     func testRotatedBoxIsHitInItsOwnFrame() throws {
         let item = box(linked("Visit Nib now", NSRange(location: 6, length: 3), site),
                        Frame(x: 100, y: 100, w: 300, h: 60, rotation: .pi / 2))
@@ -96,11 +123,21 @@ final class LinkHitTests: XCTestCase {
         XCTAssertNil(runs[0].attrs.link)
         XCTAssertEqual(runs[1].attrs.bold, true)
         XCTAssertEqual(runs[1].attrs.link, site)
-        XCTAssertEqual(runs[2].attrs.link, site)
-        XCTAssertEqual(runs[2].attrs.underline, true)
-        XCTAssertEqual(runs[2].attrs.color, LinkText.linkColor)
+        XCTAssertEqual(runs[2].attrs, TextAttributes(link: site))
         XCTAssertNil(runs[3].attrs.link)
         XCTAssertEqual(LinkText.links(in: out).map { $0.range }, [NSRange(location: 4, length: 5)])
+    }
+
+    func testLinkingAndUnlinkingKeepTheWritersOwnUnderlineAndColour() {
+        let red = RGBA(0xD0, 0x30, 0x30)
+        let text = RichText(paragraphs: [Paragraph(runs: [TextRun("Styled", TextAttributes(color: red, underline: true)),
+                                                          TextRun(" plain")])])
+        let linked = LinkText.setLink(site, in: text, range: NSRange(location: 0, length: 12))
+        XCTAssertEqual(linked.paragraphs[0].runs.map { $0.attrs },
+                       [TextAttributes(color: red, underline: true, link: site), TextAttributes(link: site)])
+        let unlinked = LinkText.removeLinks(in: linked, range: NSRange(location: 0, length: 12))
+        XCTAssertEqual(unlinked.removed, 1)
+        XCTAssertEqual(unlinked.text, text)
     }
 
     func testRemovingLinksAcrossParagraphsRestoresTheText() {
@@ -121,6 +158,18 @@ final class LinkHitTests: XCTestCase {
         XCTAssertThrowsError(try LinkText.range([0, 0], in: text, allowEmpty: false))
         XCTAssertThrowsError(try LinkText.range([2], in: text, allowEmpty: true))
         XCTAssertEqual(try LinkText.range([4, 0], in: text, allowEmpty: true), NSRange(location: 4, length: 0))
+        XCTAssertEqual(try LinkText.range([10, 0], in: text, allowEmpty: true), NSRange(location: 10, length: 0))
+    }
+
+    func testHugeRangesAreRefusedWithoutOverflowing() {
+        // Agents and plugins pass any Int the schema's `min: 0` allows; start + length must never be computed.
+        let text = RichText(plain: "Hello Nib")
+        XCTAssertThrowsError(try LinkText.range([Int.max / 2 + 1, Int.max / 2 + 1], in: text, allowEmpty: false))
+        XCTAssertThrowsError(try LinkText.range([Int.max, Int.max], in: text, allowEmpty: false))
+        XCTAssertThrowsError(try LinkText.range([1, Int.max], in: text, allowEmpty: false))
+        XCTAssertThrowsError(try LinkText.range([Int.max, 0], in: text, allowEmpty: true))
+        XCTAssertThrowsError(try LinkText.range([Int.min, 1], in: text, allowEmpty: false))
+        XCTAssertEqual(try LinkText.range([6, 3], in: text, allowEmpty: false), NSRange(location: 6, length: 3))
     }
 
     func testCaretFindsTheLinkAroundIt() {
@@ -140,6 +189,32 @@ final class LinkHitTests: XCTestCase {
         XCTAssertEqual(LinkText.links(in: first.text).first?.range, NSRange(location: 5, length: 24))
         XCTAssertEqual(first.text.plainText, text.plainText)
         XCTAssertEqual(LinkText.autodetect(first.text).urls, [])
+    }
+
+    func testAutodetectLinksOnlyWebAndMailAddresses() {
+        let text = RichText(plain: "Vault obsidian://open?vault=notes and the site https://example.com/x today")
+        let result = LinkText.autodetect(text)
+        XCTAssertEqual(result.urls, ["https://example.com/x"])
+        XCTAssertEqual(LinkText.links(in: result.text).map { $0.link }, [TextLink(url: "https://example.com/x")])
+    }
+
+    // MARK: PDF placement
+
+    func testPDFLinksAreAspectFittedAndCentredOnTheNibPage() {
+        // A4 on US Letter: scaled by Letter's height, centred left to right (F024's PDFPagePlacement).
+        let letter = LinkHitTester.PDFPlacement(pdfSize: .a4, pageSize: .letter)
+        let k = min(612 / 595.28, 792 / 841.89)
+        XCTAssertEqual(letter.scale, k, accuracy: 1e-9)
+        XCTAssertEqual(letter.dx, (612 - 595.28 * k) / 2, accuracy: 1e-9)
+        XCTAssertEqual(letter.dy, 0, accuracy: 1e-9)
+        let r = letter.rect(Rect(x: 100, y: 200, width: 50, height: 10))
+        XCTAssertEqual(r.x, letter.dx + 100 * k, accuracy: 1e-9)
+        XCTAssertEqual(r.y, 200 * k, accuracy: 1e-9)
+        XCTAssertEqual(r.width / r.height, 5, accuracy: 1e-9)
+        // Same size: identity. Degenerate sizes never divide by zero.
+        XCTAssertEqual(LinkHitTester.PDFPlacement(pdfSize: .a4, pageSize: .a4).rect(Rect(x: 1, y: 2, width: 3, height: 4)),
+                       Rect(x: 1, y: 2, width: 3, height: 4))
+        XCTAssertEqual(LinkHitTester.PDFPlacement(pdfSize: PageSize(0, 0), pageSize: .a4), .identity)
     }
 
     func testTypedAddressesAreNormalised() {

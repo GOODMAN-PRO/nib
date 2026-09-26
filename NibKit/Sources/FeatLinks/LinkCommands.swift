@@ -61,6 +61,12 @@ struct LinkTarget: Codable, Equatable {
                     return try LinkTarget(internalLink).resolve(defaultDoc: defaultDoc, workspace: workspace,
                                                                principal: principal, path: path)
                 }
+                // Other nib:// links (plugin install, bridge pairing, import) run as the user when tapped, so only
+                // the user may put them behind text.
+                guard principal.isUser else {
+                    throw NibError(.permissionDenied, "only nib://open and nib://audio links may be added here",
+                                   path: path + "url", hint: "link a page with {\"page\": \"page:D/P\"} or a clip with {\"clip\": \"audio:D/A\"}")
+                }
                 return TextLink(url: u.absoluteString)
             }
             try LinkPolicy.check(u, principal: principal, path: path + "url")
@@ -135,11 +141,14 @@ enum LinkPolicy {
 
 // MARK: - Linked text (text items and blocks)
 
-/// Where linkable typed text lives: a text box, sticky note or shape with text (`item:D/P/I`) or a text-document
-/// block (`block:D/B`).
+/// Where linkable typed text lives: a text box (`item:D/P/I`) or a text-document block (`block:D/B`).
+/// Sticky notes and shapes lay their text out in geometry their own features keep private, so `link.tapAt` could
+/// not follow a link there; they are refused rather than given links that do nothing.
 enum LinkedTextRef: Equatable {
     case item(DocumentID, PageID, ElementID)
     case block(DocumentID, NibID)
+
+    static let hint = "links go on text boxes (item:D/P/I) and text-document blocks (block:D/B)"
 
     init(_ string: String) throws {
         switch NodeRef(string) {
@@ -148,8 +157,8 @@ enum LinkedTextRef: Equatable {
         case let .block(d, b)?:
             self = .block(d, b)
         default:
-            throw NibError(.invalidParams, "'\(string)' is not a text item or block ref", path: "$.ref",
-                           hint: "pass item:D/P/I of a text box, sticky note or shape with text, or block:D/B")
+            throw NibError(.invalidParams, "'\(string)' is not a text box or block ref", path: "$.ref",
+                           hint: LinkedTextRef.hint)
         }
     }
 
@@ -180,12 +189,8 @@ enum LinkedTextRef: Equatable {
         switch self {
         case let .item(d, p, i):
             var item = try tx.item(d, page: p, id: i)
-            switch item.kind {
-            case .text: item.text?.text = text
-            case .sticky: item.sticky?.text = text
-            case .shape: item.shape?.text = text
-            default: return
-            }
+            guard item.kind == .text, item.text != nil else { return }
+            item.text?.text = text
             try tx.put(item, doc: d, page: p)
         case let .block(d, b):
             var block = try LinkedTextRef.block(b, in: tx.content(d))
@@ -195,18 +200,9 @@ enum LinkedTextRef: Equatable {
     }
 
     static func text(of item: Item) throws -> RichText {
-        switch item.kind {
-        case .text:
-            if let t = item.text?.text { return t }
-        case .sticky:
-            if let t = item.sticky?.text { return t }
-        case .shape:
-            if let t = item.shape?.text { return t }
-        default:
-            break
-        }
-        throw NibError(.invalidParams, "item \(item.id) has no typed text", path: "$.ref",
-                       hint: "links go on text boxes, sticky notes, shapes with text and text-document blocks")
+        if item.kind == .text, let t = item.text?.text { return t }
+        throw NibError(.invalidParams, "item \(item.id) is a \(item.kind.rawValue), not a text box", path: "$.ref",
+                       hint: LinkedTextRef.hint)
     }
 
     static func block(_ id: NibID, in content: DocumentContent) throws -> TextBlock {
@@ -220,12 +216,6 @@ enum LinkedTextRef: Equatable {
 /// Link ranges on `RichText`, in UTF-16 units of `plainText` (paragraphs joined by "\n"): the units of
 /// `BlockComment` ranges and of the text the AI reads from `query.get`.
 enum LinkText {
-    /// Linked text is underlined; text without a colour of its own takes Cobalt, the blue ink.
-    static let linkColor: RGBA = {
-        let hex = NibInk.cobalt.hex
-        return RGBA(UInt8((hex >> 16) & 0xFF), UInt8((hex >> 8) & 0xFF), UInt8(hex & 0xFF))
-    }()
-
     static let rangeSchema: JSONSchema = .arr(.int(min: 0), "[start, length] in UTF-16 units of the plain text (paragraphs joined by \\n)")
 
     static func length(_ text: RichText) -> Int { (text.plainText as NSString).length }
@@ -243,7 +233,8 @@ enum LinkText {
         let total = length(text)
         let start = value[0]
         let count = value[1]
-        guard start >= 0, count >= 0, start + count <= total else {
+        // Compared without adding: agents and plugins may pass any Int, and start + count could overflow.
+        guard start >= 0, count >= 0, start <= total, count <= total - start else {
             throw NibError(.invalidParams, "range [\(start), \(count)] is outside the text (length \(total))",
                            path: "$.range", hint: hint)
         }
@@ -280,29 +271,27 @@ enum LinkText {
         links(in: text).first { NSLocationInRange(location, $0.range) || NSMaxRange($0.range) == location }
     }
 
+    /// Sets only `attrs.link`: the link look (Cobalt, underlined) is drawn by the text renderers, so the user's own
+    /// underline and colour survive linking and unlinking.
     static func setLink(_ link: TextLink, in text: RichText, range: NSRange) -> RichText {
         updating(text, range: range) { attrs in
             attrs.link = link
-            attrs.underline = true
-            if attrs.color == nil { attrs.color = linkColor }
         }
     }
 
-    /// Unlinks every linked character in `range` (and the link look it was given); returns how many link ranges it
-    /// touched.
+    /// Unlinks every linked character in `range`; returns how many link ranges it touched.
     static func removeLinks(in text: RichText, range: NSRange) -> (text: RichText, removed: Int) {
         let hit = links(in: text).filter { NSIntersectionRange($0.range, range).length > 0 }
         guard !hit.isEmpty else { return (text, 0) }
         let out = updating(text, range: range) { attrs in
-            guard attrs.link != nil else { return }
             attrs.link = nil
-            if attrs.underline == true { attrs.underline = nil }
-            if attrs.color == linkColor { attrs.color = nil }
         }
         return (out, hit.count)
     }
 
-    /// Turns web addresses typed or pasted as plain text into links (`NSDataDetector`); linked text is left alone.
+    /// Turns web and mail addresses typed or pasted as plain text into links (`NSDataDetector`); linked text is left
+    /// alone. Only http, https and mailto addresses are linked, whoever wrote the text: a custom-scheme address an
+    /// agent or plugin typed must not become a live link that set-time policy would have refused.
     static func autodetect(_ text: RichText) -> (text: RichText, urls: [String]) {
         let plain = text.plainText
         let length = (plain as NSString).length
@@ -313,6 +302,7 @@ enum LinkText {
         var urls: [String] = []
         for match in detector.matches(in: plain, options: [], range: NSRange(location: 0, length: length)) {
             guard let url = match.url, match.range.length > 0,
+                  LinkPolicy.agentSchemes.contains(url.scheme?.lowercased() ?? ""),
                   !existing.contains(where: { NSIntersectionRange($0, match.range).length > 0 }) else { continue }
             out = setLink(TextLink(url: url.absoluteString), in: out, range: match.range)
             urls.append(url.absoluteString)
@@ -379,13 +369,13 @@ struct LinkSet: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "link.set", title: "Add Link",
-        summary: "Link a range of typed text (text box, sticky, shape or text-document block) to a URL, a page of any document or an audio clip time.",
+        summary: "Link a range of typed text (a text box or a text-document block) to a URL, a page of any document or an audio clip time.",
         params: .obj(["ref": .ref, "range": LinkText.rangeSchema,
                       "link": .obj(LinkTarget.properties, required: [], "exactly one of url, page, clip (+ t) or doc")],
                      required: ["ref", "range", "link"]),
         examples: [
             try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "range": [6, 3], "link": {"url": "https://example.com"}}"#),
-            try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01", "range": [0, 8], "link": {"page": "page:FIXTUREDOC01/FIXTUREPG002"}}"#),
+            try! JSONValue.parse(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01", "range": [0, 5], "link": {"page": "page:FIXTUREDOC01/FIXTUREPG002"}}"#),
             try! JSONValue.parse(#"{"ref": "block:FIXTUREDOC02/FIXTUREBLK02", "range": [0, 5], "link": {"clip": "audio:FIXTUREDOC01/FIXTUREAUD01", "t": 12}}"#),
         ],
         effect: .edit)
@@ -455,7 +445,7 @@ struct LinkAutodetect: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "link.autodetect", title: "Link Web Addresses",
-        summary: "Turn web addresses typed or pasted as plain text in a text item or block into links (linked text is kept).",
+        summary: "Turn http(s) and mailto addresses typed or pasted as plain text in a text box or block into links (linked text is kept).",
         params: .obj(["ref": .ref], required: ["ref"]),
         examples: [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"]],
         effect: .edit)
@@ -481,7 +471,7 @@ struct LinkFollow: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "link.follow", title: "Follow Link",
-        summary: "Open a link: a URL, a document or page (remembered for link.back), or an audio clip at t seconds.",
+        summary: "Open a link: a URL, a document or page (remembered for link.back), or an audio clip at t seconds. A dry run only resolves it.",
         params: .obj(LinkTarget.properties, required: [], "exactly one of url, page, clip (+ t) or doc"),
         examples: [["page": "page:FIXTUREDOC01/FIXTUREPG002"], ["clip": "audio:FIXTUREDOC01/FIXTUREAUD01", "t": 30]],
         effect: .session)
@@ -508,7 +498,8 @@ struct LinkBack: NibCommand {
 
     static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> Output {
         let navigator = try LinkNavigator.require(ctx.services)
-        guard let session = ctx.activeSession, let stop = navigator.back(session: session) else {
+        // A dry run (AI preview) reports where the window would go without moving it or popping the history.
+        guard let session = ctx.activeSession, let stop = navigator.back(session: session, dryRun: ctx.dryRun) else {
             return Output(returned: false, page: nil)
         }
         return Output(returned: true, page: stop.ref)

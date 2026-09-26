@@ -52,7 +52,35 @@ enum LinkSelection {
         return ref
     }
 
+    /// The text the Link menu was last offered for, and the text view being typed in then. F026 clears
+    /// `session.selection` while a box is edited (and text-document blocks never set it), so ⌘K pressed while typing
+    /// falls back to this ref, but only while that same text view is still the one being edited.
+    private struct EditingText {
+        var ref: String
+        var session: NibID
+        weak var responder: UIResponder?
+    }
+    private static var lastEditing: EditingText?
+
+    static func rememberEditing(_ ctx: MenuContext) {
+        guard let ref = ctx.ref, let session = ctx.session ?? ctx.app.services.sessions.active else { return }
+        lastEditing = EditingText(ref: ref, session: session.id, responder: firstResponder())
+    }
+
+    /// The ref of the text being typed in `session`, when the Link menu was shown for it.
+    static func editingRef(_ session: EditorSession, workspace: Workspace) -> String? {
+        guard session.isEditingText, let last = lastEditing, last.session == session.id,
+              last.responder === firstResponder(), isLinkable(last.ref, workspace: workspace) else { return nil }
+        return last.ref
+    }
+
+    static func textSelectionIsVisible(_ ctx: MenuContext) -> Bool {
+        rememberEditing(ctx)
+        return isLinkable(ctx.ref, workspace: ctx.app.workspace)
+    }
+
     static func textSelectionParams(_ ctx: MenuContext) -> JSONValue {
+        rememberEditing(ctx)
         var params: [String: JSONValue] = [:]
         if let ref = ctx.ref { params["ref"] = .string(ref) }
         if let range = editingRange() {
@@ -96,7 +124,10 @@ enum LinkEditorPresenter {
             throw NibError.unavailable("a window to show the link editor in")
         }
         let session = ctx.activeSession ?? navigator.session
-        guard let refString = ref ?? LinkSelection.selectedRef(session, workspace: ctx.workspace) else {
+        let selected = session.isEditingText
+            ? LinkSelection.editingRef(session, workspace: ctx.workspace) ?? LinkSelection.selectedRef(session, workspace: ctx.workspace)
+            : LinkSelection.selectedRef(session, workspace: ctx.workspace)
+        guard let refString = ref ?? selected else {
             throw NibError(.invalidParams, "select typed text to link first", path: "$.ref",
                            hint: "or pass {ref, range, link}; call commands.describe {\"id\": \"link.set\"}")
         }
