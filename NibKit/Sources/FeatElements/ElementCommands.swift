@@ -99,6 +99,8 @@ struct ElementCreate: NibCommand {
         var collection: String
         var id: String?
         var title: String?
+        /// Save into 'my-elements' when `collection` is not one of yours (deleted meanwhile, or a content pack).
+        var fallback: Bool?
     }
 
     struct Output: Codable {
@@ -112,7 +114,8 @@ struct ElementCreate: NibCommand {
         id: "element.create", title: "Create Element",
         summary: "Save items (one page) as a reusable element in a collection ('my-elements' is created on demand); optional id and title.",
         params: .obj(["refs": .arr(.ref, "item refs on one page"), "collection": .str("collection id"),
-                      "id": .str("your own element id, [A-Za-z0-9_-]{1,64}"), "title": .str("element name")],
+                      "id": .str("your own element id, [A-Za-z0-9_-]{1,64}"), "title": .str("element name"),
+                      "fallback": .bool("true: save into 'my-elements' when collection is not one of yours (default false: not_found)")],
                      required: ["refs", "collection"]),
         examples: [["refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"], "collection": "my-elements"]],
         effect: .library, target: .library)
@@ -140,7 +143,8 @@ struct ElementCreate: NibCommand {
             throw NibError(.locked, "the document is locked", hint: "unlock it before saving its items as an element")
         }
         let pageItems = try ctx.workspace.items(d, page: pg)
-        for (i, id) in ids.enumerated() where !pageItems.contains(where: { $0.id == id }) {
+        let present = Set(pageItems.lazy.filter { !$0.deleted }.map { $0.id })
+        for (i, id) in ids.enumerated() where !present.contains(id) {
             throw NibError(.notFound, "item \(id) not found on page \(pg)", path: "$.refs[\(i)]")
         }
         let items = ElementFragment.expand(ids, in: pageItems)
@@ -149,7 +153,8 @@ struct ElementCreate: NibCommand {
         }
         let catalog = ElementCatalog(ctx)
         let store = try catalog.requireStore()
-        try ElementParams.writable(p.collection, catalog)
+        let fallback = p.fallback ?? false
+        if !fallback { try ElementParams.writable(p.collection, catalog) }
         let assets = ctx.services.assets
         let fragment = try await ElementIO.run {
             try ElementFragment.make(items: items) { ref in
@@ -158,19 +163,28 @@ struct ElementCreate: NibCommand {
             }
         }
         let suggested = title ?? ElementCreate.suggestedTitle(items)
-        if ctx.dryRun {
-            return Output(collection: p.collection, element: elementID, title: suggested ?? "", itemCount: fragment.items.count)
+        let requested = p.collection
+        // The collection the element goes to (file I/O: call it on `ElementIO.queue`).
+        let target: () -> String = {
+            guard fallback, requested != ElementStore.defaultCollectionID, !store.isLive(requested) else { return requested }
+            return ElementStore.defaultCollectionID
         }
-        let collection = p.collection
+        if ctx.dryRun {
+            let collection = try await ElementIO.run { target() }
+            return Output(collection: collection, element: elementID, title: suggested ?? "", itemCount: fragment.items.count)
+        }
         let defaultName = String(localized: "My Elements")
-        let record = try await ElementIO.run { () -> ElementRecord in
+        let saved = try await ElementIO.run { () -> (collection: String, record: ElementRecord) in
             catalog.prepare()
+            let collection = target()
             if collection == ElementStore.defaultCollectionID { try store.ensureDefaultCollection(title: defaultName) }
-            return try store.addElement(collection, id: elementID, title: suggested,
-                                        defaultTitle: { n in String(localized: "Element \(n)") }, fragment: fragment)
+            let record = try store.addElement(collection, id: elementID, title: suggested,
+                                              defaultTitle: { n in String(localized: "Element \(n)") }, fragment: fragment)
+            return (collection, record)
         }
         ElementParams.changed(ctx)
-        return Output(collection: collection, element: record.id.raw, title: record.title, itemCount: record.count)
+        return Output(collection: saved.collection, element: saved.record.id.raw, title: saved.record.title,
+                      itemCount: saved.record.count)
     }
 
     /// The first line of typed text in the items, if any, as the element's name.
@@ -229,19 +243,34 @@ struct ElementInsert: NibCommand {
         let catalog = ElementCatalog(ctx)
         let collection = p.collection
         let element = p.element
-        let fragment = try await ElementIO.run { try catalog.fragment(collection, element).fragment }
+        let dryRun = ctx.dryRun
+        let fragment = try await ElementIO.run { () -> ElementFragment in
+            // `start` prepares the launch library; one opened later gets its starters on first real use.
+            if !dryRun { catalog.prepare() }
+            return try catalog.fragment(collection, element).fragment
+        }
         guard !fragment.items.isEmpty else { throw NibError.invalid("the element holds no items", path: "$.element") }
+
+        // Fragments are untrusted (imported files, content packs, AI JSON): every asset an item names must travel with
+        // it, or the new items would point at nothing, or at an unrelated asset of the same name in this document.
+        var payload: [(name: String, data: Data)] = []
+        var seen = Set<String>()
+        for ref in fragment.items.flatMap(ElementFragment.assetRefs) where seen.insert(ref.name).inserted {
+            guard let data = fragment.assets[ref.name] else {
+                throw NibError.invalid("the element references asset '\(ref.name)' it does not carry", path: "$.element")
+            }
+            payload.append((name: ref.name, data: data))
+        }
 
         // Asset bytes go into the target document first (off the main actor), then the items are written atomically.
         var assetMap: [String: AssetRef] = [:]
-        if !fragment.assets.isEmpty && !ctx.dryRun {
+        if !payload.isEmpty && !ctx.dryRun {
             let store = try ctx.services.require(ctx.services.assets, "the asset store")
-            let assets = fragment.assets
+            let copies = payload
             assetMap = try await ElementIO.run { () -> [String: AssetRef] in
                 var map: [String: AssetRef] = [:]
-                for (name, data) in assets {
-                    let ext = (name as NSString).pathExtension
-                    map[name] = try store.put(data, ext: ext.isEmpty ? "png" : ext, doc: doc)
+                for (name, data) in copies {
+                    map[name] = try store.put(data, ext: ElementInsert.assetExtension(name), doc: doc)
                 }
                 return map
             }
@@ -263,6 +292,12 @@ struct ElementInsert: NibCommand {
                                     bounds: ElementFragment.union(written))
         }
         return Output(refs: written.map { NodeRef.item(doc, page, $0.id).description })
+    }
+
+    /// The file extension an untrusted asset name may give the stored copy: 1–8 letters or digits, else "png".
+    static func assetExtension(_ name: String) -> String {
+        let ext = (name as NSString).pathExtension
+        return ext.range(of: "^[A-Za-z0-9]{1,8}$", options: .regularExpression) != nil ? ext.lowercased() : "png"
     }
 }
 

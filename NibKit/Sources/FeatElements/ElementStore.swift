@@ -410,13 +410,22 @@ final class ElementStore {
     /// This device's file suffix (8 hex digits of the app clock's device id, like `DeviceIdentity.hex`).
     let device: String
     private let tick: () -> Rev
+    /// Advances the app clock past revisions read from other devices' files (`HLCClock.observe`), so an edit made
+    /// here after reading them always outranks them, even when this device's wall clock runs behind.
+    private let observe: (Rev) -> Void
     private var fm: FileManager { FileManager.default }
     private static let log = Logger(subsystem: "app.nib", category: "elements")
 
-    init(metadataURL: URL, device: UInt32, tick: @escaping () -> Rev) {
+    init(metadataURL: URL, device: UInt32, tick: @escaping () -> Rev, observe: @escaping (Rev) -> Void = { _ in }) {
         root = metadataURL.appendingPathComponent(ElementStore.folderName, isDirectory: true)
         self.device = String(format: "%08x", device)
         self.tick = tick
+        self.observe = observe
+    }
+
+    /// The store of a library on this app's clock.
+    convenience init(metadataURL: URL, clock: HLCClock) {
+        self.init(metadataURL: metadataURL, device: clock.device, tick: { clock.tick() }, observe: { clock.observe($0) })
     }
 
     func folder(_ c: String) -> URL { root.appendingPathComponent(c, isDirectory: true) }
@@ -451,10 +460,15 @@ final class ElementStore {
     }
 
     /// The merged index of a collection folder (empty when nothing has arrived yet).
-    func index(_ c: String) -> CollectionIndex {
+    func index(_ c: String) -> CollectionIndex { load(c).index }
+
+    /// The merged index plus the provider conflict copies that were read into it: the only copies a later `write`
+    /// may remove (a copy that failed to decode, or arrived after this read, is kept for the next merge).
+    func load(_ c: String) -> (index: CollectionIndex, copies: Set<String>) {
         let dir = folder(c)
         let names = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { ElementStore.isIndexFile($0) }.sorted()
         var parts: [CollectionIndex] = []
+        var copies = Set<String>()
         for name in names {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
                   var part = try? JSONDecoder().decode(CollectionIndex.self, from: data) else { continue }
@@ -463,8 +477,12 @@ final class ElementStore {
                 part.collection = record
             }
             parts.append(part)
+            if ElementStore.isConflictCopy(name) { copies.insert(name) }
         }
-        return CollectionIndex.merge(parts)
+        let merged = CollectionIndex.merge(parts)
+        if let r = merged.collection?.rev { observe(r) }
+        if let r = merged.elements.lazy.map({ $0.rev }).max() { observe(r) }
+        return (merged, copies)
     }
 
     func isLive(_ c: String) -> Bool { NibID.isValid(c) && index(c).isLive }
@@ -479,10 +497,12 @@ final class ElementStore {
         .sorted { ($0.record.order, $0.record.id.raw) < ($1.record.order, $1.record.id.raw) }
     }
 
-    func requireLive(_ c: String) throws -> CollectionIndex {
-        let idx = NibID.isValid(c) ? index(c) : CollectionIndex(collection: nil)
-        guard idx.isLive else { throw ElementStore.collectionNotFound(c) }
-        return idx
+    /// `load` of a live collection (`not_found` otherwise).
+    private func requireLiveLoad(_ c: String) throws -> (index: CollectionIndex, copies: Set<String>) {
+        guard NibID.isValid(c) else { throw ElementStore.collectionNotFound(c) }
+        let loaded = load(c)
+        guard loaded.index.isLive else { throw ElementStore.collectionNotFound(c) }
+        return loaded
     }
 
     /// The fragment bytes of an element: the file its record names, else any device's copy of it.
@@ -504,14 +524,15 @@ final class ElementStore {
 
     // MARK: Writing
 
-    private func write(_ index: CollectionIndex, to c: String) throws {
+    /// Writes this device's index file, then removes the provider conflict copies `merged` names: those were read into
+    /// `index` (see `load`). Any other copy stays until a later read merges it.
+    private func write(_ index: CollectionIndex, to c: String, merged: Set<String>) throws {
         let dir = folder(c)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         try encoder.encode(index).write(to: dir.appendingPathComponent("index.\(device).json"), options: .atomic)
-        // Provider conflict copies were merged into what was just written.
-        for name in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] where ElementStore.isConflictCopy(name) {
+        for name in merged.sorted() where ElementStore.isConflictCopy(name) {
             try? fm.removeItem(at: dir.appendingPathComponent(name))
         }
     }
@@ -528,31 +549,43 @@ final class ElementStore {
         FractionalIndex.between(liveCollections().last?.record.order, nil)
     }
 
+    /// Creates a collection. An id whose collection was deleted is brought back (empty: its elements keep their
+    /// tombstones), so a caller can recreate a collection by its own id; only a live collection is a conflict.
     func createCollection(id: String, title: String) throws -> CollectionRecord {
         guard NibID.isValid(id) else { throw NibError.invalid("id must be 1–64 of [A-Za-z0-9_-]", path: "$.id") }
         let lower = id.lowercased()
         // Folder names must also be unique on case-insensitive file systems.
-        if collectionIDs().contains(where: { $0.lowercased() == lower }) {
-            throw NibError(.conflict, "an element collection with the id '\(id)' already exists",
-                           hint: "leave out id to get a new one, or call element.collection.list")
+        if let existing = collectionIDs().first(where: { $0.lowercased() == lower }) {
+            let loaded = load(existing)
+            guard existing == id, !loaded.index.isLive else {
+                throw NibError(.conflict, "an element collection with the id '\(id)' already exists",
+                               hint: "leave out id to get a new one, or call element.collection.list")
+            }
+            var idx = loaded.index
+            let record = CollectionRecord(id: NibID(id), rev: tick(), title: title, order: nextOrder())
+            idx.collection = record
+            try write(idx, to: id, merged: loaded.copies)
+            return record
         }
         let record = CollectionRecord(id: NibID(id), rev: tick(), title: title, order: nextOrder())
-        try write(CollectionIndex(collection: record), to: id)
+        try write(CollectionIndex(collection: record), to: id, merged: [])
         return record
     }
 
     /// The default collection, created (or brought back) when something is saved to it.
     func ensureDefaultCollection(title: String) throws {
-        var idx = index(ElementStore.defaultCollectionID)
-        guard !idx.isLive else { return }
+        let loaded = load(ElementStore.defaultCollectionID)
+        guard !loaded.index.isLive else { return }
+        var idx = loaded.index
         idx.collection = CollectionRecord(id: NibID(ElementStore.defaultCollectionID), rev: tick(), title: title,
                                           order: nextOrder())
-        try write(idx, to: ElementStore.defaultCollectionID)
+        try write(idx, to: ElementStore.defaultCollectionID, merged: loaded.copies)
     }
 
     /// Renames and/or moves a collection to `position` (0-based among the live collections).
     func updateCollection(_ c: String, title: String?, position: Int?) throws -> CollectionRecord {
-        var idx = try requireLive(c)
+        let loaded = try requireLiveLoad(c)
+        var idx = loaded.index
         guard var record = idx.collection else { throw ElementStore.collectionNotFound(c) }
         if let t = title { record.title = t }
         if let p = position {
@@ -568,14 +601,15 @@ final class ElementStore {
         }
         record.rev = tick()
         idx.collection = record
-        try write(idx, to: c)
+        try write(idx, to: c, merged: loaded.copies)
         return record
     }
 
     /// Tombstones the collection and every element in it. Fragment files stay (another device's later edit may still
     /// point at them). ponytail: nothing sweeps them; add a sweep of tombstoned folders if libraries grow large.
     func deleteCollection(_ c: String) throws {
-        var idx = try requireLive(c)
+        let loaded = try requireLiveLoad(c)
+        var idx = loaded.index
         guard var record = idx.collection else { return }
         record.deleted = true
         record.rev = tick()
@@ -584,12 +618,13 @@ final class ElementStore {
             idx.elements[i].deleted = true
             idx.elements[i].rev = tick()
         }
-        try write(idx, to: c)
+        try write(idx, to: c, merged: loaded.copies)
     }
 
     func addElement(_ c: String, id: String, title: String?, defaultTitle: (Int) -> String,
                     fragment: ElementFragment) throws -> ElementRecord {
-        var idx = try requireLive(c)
+        let loaded = try requireLiveLoad(c)
+        var idx = loaded.index
         let lower = id.lowercased()
         guard NibID.isValid(id), lower != "index" else {
             throw NibError.invalid("element id must be 1–64 of [A-Za-z0-9_-] and not 'index'", path: "$.id")
@@ -605,30 +640,32 @@ final class ElementStore {
                                    kinds: fragment.kinds, count: fragment.items.count,
                                    size: [fragment.bounds.width, fragment.bounds.height])
         idx.elements = LWW.merge(idx.elements, [record])
-        try write(idx, to: c)
+        try write(idx, to: c, merged: loaded.copies)
         return record
     }
 
     func renameElement(_ c: String, _ e: String, title: String) throws -> ElementRecord {
-        var idx = try requireLive(c)
+        let loaded = try requireLiveLoad(c)
+        var idx = loaded.index
         guard let i = idx.elements.firstIndex(where: { $0.id.raw == e && !$0.deleted }) else {
             throw ElementStore.elementNotFound(e, in: c)
         }
         idx.elements[i].title = title
         idx.elements[i].rev = tick()
-        try write(idx, to: c)
+        try write(idx, to: c, merged: loaded.copies)
         return idx.elements[i]
     }
 
     /// Tombstones an element (its fragment file stays, see `deleteCollection`).
     func deleteElement(_ c: String, _ e: String) throws {
-        var idx = try requireLive(c)
+        let loaded = try requireLiveLoad(c)
+        var idx = loaded.index
         guard let i = idx.elements.firstIndex(where: { $0.id.raw == e && !$0.deleted }) else {
             throw ElementStore.elementNotFound(e, in: c)
         }
         idx.elements[i].deleted = true
         idx.elements[i].rev = tick()
-        try write(idx, to: c)
+        try write(idx, to: c, merged: loaded.copies)
     }
 
     /// Adds an imported `.nibcollection` as a new collection (its own id when free, else a fresh one).
@@ -639,7 +676,8 @@ final class ElementStore {
         let rawTitle = (imported.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let title = String((rawTitle.isEmpty ? fallbackTitle : rawTitle).prefix(ElementStore.maxTitleLength))
         let record = try createCollection(id: id, title: title)
-        var idx = index(id)
+        let loaded = load(id)
+        var idx = loaded.index
         var used = Set<String>()
         let keys = FractionalIndex.sequence(after: nil, count: imported.elements.count)
         for (i, element) in imported.elements.enumerated() {
@@ -657,7 +695,7 @@ final class ElementStore {
                                               count: element.fragment.items.count,
                                               size: [element.fragment.bounds.width, element.fragment.bounds.height]))
         }
-        try write(idx, to: id)
+        try write(idx, to: id, merged: loaded.copies)
         return (record, imported.elements.count)
     }
 
@@ -665,6 +703,12 @@ final class ElementStore {
 
     private static var prepared = Set<String>()
     private static let preparedLock = NSLock()
+
+    /// Starter records carry a floor revision instead of the clock's: every real edit or tombstone, from any device,
+    /// outranks them in `LWW.merge`. So a device whose sync has not yet delivered another device's starter files
+    /// (it sees no record and writes its own) never brings back a deleted starter or undoes a rename or reorder.
+    /// Two fresh devices write equal revisions, which merge deterministically (the first file in name order wins).
+    static func starterRev(_ n: Int) -> Rev { Rev(wallMs: 1, counter: UInt32(clamping: n), device: 0) }
 
     /// First use of a library on this device: writes every starter collection that has no record at all. A deleted
     /// starter keeps its tombstone, so it never comes back; `make` (which renders) runs only when something is missing.
@@ -686,17 +730,21 @@ final class ElementStore {
     }
 
     private func writeStarter(_ starter: StarterCollection) throws {
-        var idx = index(starter.id)
+        let loaded = load(starter.id)
+        var idx = loaded.index
         let keys = FractionalIndex.sequence(after: nil, count: starter.elements.count)
         for (i, element) in starter.elements.enumerated() {
             let file = try writeFragment(element.fragment, id: element.id, in: starter.id)
-            let record = ElementRecord(id: NibID(element.id), rev: tick(), title: element.title, order: keys[i], file: file,
-                                       kinds: element.fragment.kinds, count: element.fragment.items.count,
+            let record = ElementRecord(id: NibID(element.id), rev: ElementStore.starterRev(i + 1), title: element.title,
+                                       order: keys[i], file: file, kinds: element.fragment.kinds,
+                                       count: element.fragment.items.count,
                                        size: [element.fragment.bounds.width, element.fragment.bounds.height])
             idx.elements = LWW.merge(idx.elements, [record])
         }
-        idx.collection = CollectionRecord(id: NibID(starter.id), rev: tick(), title: starter.title, order: starter.order)
-        try write(idx, to: starter.id)
+        let record = CollectionRecord(id: NibID(starter.id), rev: ElementStore.starterRev(0), title: starter.title,
+                                      order: starter.order)
+        idx.collection = LWW.merge(idx.collection.map { [$0] } ?? [], [record]).first
+        try write(idx, to: starter.id, merged: loaded.copies)
     }
 
     // MARK: Errors
@@ -759,15 +807,54 @@ struct ElementInfo: Codable, Equatable, Identifiable {
     var key: String { collection + "/" + id }
 }
 
+/// Content-pack entries loaded once per catalog snapshot: a pack's `load` decodes every element (base64 assets
+/// included), so thumbnails, list pages and exports reuse one load instead of repeating it per element.
+final class ElementPackCache {
+    private struct Loaded {
+        var entries: [ElementEntry]
+        var byID: [String: Int]
+    }
+
+    private var loaded: [String: Loaded] = [:]
+    private let lock = NSLock()
+
+    private func cached(_ id: String) -> Loaded? {
+        lock.lock()
+        defer { lock.unlock() }
+        return loaded[id]
+    }
+
+    private func load(_ d: ElementCollectionDescriptor) throws -> Loaded {
+        if let hit = cached(d.id) { return hit }
+        let entries = try d.load()
+        var byID: [String: Int] = [:]
+        for (i, e) in entries.enumerated() where byID[e.id] == nil { byID[e.id] = i }
+        let fresh = Loaded(entries: entries, byID: byID)
+        lock.lock()
+        loaded[d.id] = fresh
+        lock.unlock()
+        return fresh
+    }
+
+    func entries(_ d: ElementCollectionDescriptor) throws -> [ElementEntry] { try load(d).entries }
+
+    func entry(_ d: ElementCollectionDescriptor, _ id: String) throws -> ElementEntry? {
+        let l = try load(d)
+        return l.byID[id].map { l.entries[$0] }
+    }
+}
+
 /// Snapshot of where elements come from, made on the main actor and used on `ElementIO.queue`.
 struct ElementCatalog {
     let store: ElementStore?
     let plugins: [ElementCollectionDescriptor]
+    /// Lives as long as this snapshot: the popover makes a new catalog on every reload and registry change.
+    let packs = ElementPackCache()
 
     @MainActor
     init(services: NibServices, clock: HLCClock) {
         if let library = services.library {
-            store = ElementStore(metadataURL: library.metadataURL, device: clock.device, tick: { clock.tick() })
+            store = ElementStore(metadataURL: library.metadataURL, clock: clock)
         } else {
             store = nil
         }
@@ -784,7 +871,8 @@ struct ElementCatalog {
         return s
     }
 
-    /// Writes the starter collections the first time this library is used on this device.
+    /// Writes the starter collections the first time this library is used on this device. A library write: called by
+    /// `FeatElementsFeature.start`, the popover and the library commands, never by a read command.
     func prepare() {
         store?.ensureStarters(ids: StarterElements.ids, make: StarterElements.make)
     }
@@ -795,14 +883,13 @@ struct ElementCatalog {
     func isWritable(_ c: String) -> Bool { store?.isLive(c) ?? false }
 
     func collections() throws -> [ElementCollectionInfo] {
-        prepare()
         var out = (store?.liveCollections() ?? []).map { entry in
             ElementCollectionInfo(id: entry.record.id.raw, title: entry.record.title, count: entry.index.liveElements.count,
                                   readOnly: false, source: .user, owner: nil)
         }
         let taken = Set(out.map { $0.id })
         for d in plugins where !taken.contains(d.id) {
-            let count = (try? d.load().count) ?? 0
+            let count = (try? packs.entries(d).count) ?? 0
             out.append(ElementCollectionInfo(id: d.id, title: d.title, count: count, readOnly: true, source: .plugin,
                                              owner: d.owner))
         }
@@ -810,7 +897,6 @@ struct ElementCatalog {
     }
 
     func list(_ c: String) throws -> (info: ElementCollectionInfo, elements: [ElementInfo]) {
-        prepare()
         if let store = store, NibID.isValid(c) {
             let idx = store.index(c)
             if let record = idx.collection, !record.deleted {
@@ -835,7 +921,6 @@ struct ElementCatalog {
     }
 
     func fragment(_ c: String, _ e: String) throws -> (title: String, fragment: ElementFragment) {
-        prepare()
         if let store = store, NibID.isValid(c) {
             let idx = store.index(c)
             if idx.isLive {
@@ -846,7 +931,7 @@ struct ElementCatalog {
             }
         }
         if let d = plugin(c) {
-            guard let entry = try loadPlugin(d).first(where: { $0.id == e }) else { throw ElementStore.elementNotFound(e, in: c) }
+            guard let entry = try loadPluginEntry(d, e) else { throw ElementStore.elementNotFound(e, in: c) }
             do {
                 return (entry.title, try entry.fragment.decode(ElementFragment.self))
             } catch {
@@ -870,11 +955,23 @@ struct ElementCatalog {
 
     private func loadPlugin(_ d: ElementCollectionDescriptor) throws -> [ElementEntry] {
         do {
-            return try d.load()
+            return try packs.entries(d)
         } catch {
-            throw NibError(.unavailable, "the content pack collection '\(d.title)' could not be read (\(error.localizedDescription))",
-                           hint: "reload or reinstall the plugin '\(d.owner)'")
+            throw ElementCatalog.packUnreadable(d, error)
         }
+    }
+
+    private func loadPluginEntry(_ d: ElementCollectionDescriptor, _ e: String) throws -> ElementEntry? {
+        do {
+            return try packs.entry(d, e)
+        } catch {
+            throw ElementCatalog.packUnreadable(d, error)
+        }
+    }
+
+    private static func packUnreadable(_ d: ElementCollectionDescriptor, _ error: Error) -> NibError {
+        NibError(.unavailable, "the content pack collection '\(d.title)' could not be read (\(error.localizedDescription))",
+                 hint: "reload or reinstall the plugin '\(d.owner)'")
     }
 }
 
@@ -948,7 +1045,12 @@ enum ElementArchive {
         }
     }
 
-    static func read(_ url: URL) throws -> ImportedCollection {
+    /// Reads a `.nibcollection` (untrusted): at most `maxElements` JSON files (plus the manifest), none over
+    /// `maxEntryBytes` unpacked, all together at most `maxTotalBytes`. The limits are parameters so tests can use
+    /// small ones.
+    static func read(_ url: URL, maxEntryBytes: Int = ElementArchive.maxEntryBytes,
+                     maxTotalBytes: Int = ElementArchive.maxTotalBytes,
+                     maxElements: Int = ElementArchive.maxElements) throws -> ImportedCollection {
         let archive: Archive
         do {
             archive = try Archive(url: url, accessMode: .read, pathEncoding: nil)
@@ -956,21 +1058,32 @@ enum ElementArchive {
             throw NibError(.invalidParams, "not a .nibcollection file (\(error.localizedDescription))",
                            hint: "export a collection from Nib (element.export) and import that file")
         }
+        let tooLarge = NibError(.invalidParams, "the collection is too large to import",
+                                hint: "split it into smaller collections")
         var files: [String: Data] = [:]
         var total = 0
         for entry in archive where entry.type == .file {
             let path = entry.path
             guard isWanted(path) else { continue }
             guard files.count <= maxElements else {
-                throw NibError(.invalidParams, "the collection holds more than \(maxElements) elements")
+                throw NibError(.invalidParams, "the collection holds more than \(maxElements) elements",
+                               hint: "split it into smaller collections")
             }
             var data = Data()
-            _ = try archive.extract(entry) { chunk in
-                data.append(chunk)
-                total += chunk.count
-                if data.count > maxEntryBytes || total > maxTotalBytes {
-                    throw NibError(.invalidParams, "the collection is too large to import")
+            var overLimit = false
+            do {
+                _ = try archive.extract(entry) { chunk in
+                    data.append(chunk)
+                    total += chunk.count
+                    if data.count > maxEntryBytes || total > maxTotalBytes {
+                        overLimit = true
+                        throw tooLarge
+                    }
                 }
+            } catch {
+                if overLimit { throw tooLarge }
+                throw NibError(.invalidParams, "the collection file is damaged (\(error.localizedDescription))",
+                               hint: "export the collection again and import the new file")
             }
             files[path] = data
         }

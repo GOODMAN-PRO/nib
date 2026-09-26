@@ -67,7 +67,8 @@ final class ElementsTool: CanvasTool {
 // MARK: - Object menu
 
 /// "Create Element" in the object menu: saves the selection into the collection the popover showed last when it is
-/// one of yours, otherwise into My Elements.
+/// one of yours, otherwise into My Elements. No file I/O here (this runs on the main actor): `element.create`
+/// checks the collection on its I/O queue and falls back (`fallback: true`).
 @MainActor
 enum ElementMenu {
     static func canCreate(_ ctx: MenuContext) -> Bool {
@@ -76,14 +77,10 @@ enum ElementMenu {
     }
 
     static func createParams(_ ctx: MenuContext) -> JSONValue {
-        var collection = ElementStore.defaultCollectionID
         let last = ctx.app.settings.get(ElementSettings.lastCollection)
-        if last != collection, let library = ctx.app.services.library {
-            let clock = ctx.app.clock
-            let store = ElementStore(metadataURL: library.metadataURL, device: clock.device, tick: { clock.tick() })
-            if store.isLive(last) { collection = last }
-        }
-        return ["refs": .array(ctx.selection.refs.map { .string($0) }), "collection": .string(collection)]
+        let collection = NibID.isValid(last) ? last : ElementStore.defaultCollectionID
+        return ["refs": .array(ctx.selection.refs.map { .string($0) }), "collection": .string(collection),
+                "fallback": .bool(true)]
     }
 }
 

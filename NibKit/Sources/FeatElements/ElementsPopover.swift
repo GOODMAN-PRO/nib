@@ -82,8 +82,8 @@ final class ElementsModel: ObservableObject {
 
         var message: String {
             switch self {
-            case .collection(let c):
-                return String(localized: "The \(c.count) elements in this collection are removed on every device. Pages keep the copies already inserted.")
+            case .collection:
+                return String(localized: "Every element in this collection is removed on every device. Pages keep the copies already inserted.")
             case .element:
                 return String(localized: "The element is removed from its collection. Pages keep the copies already inserted.")
             }
@@ -103,7 +103,6 @@ final class ElementsModel: ObservableObject {
 
     enum Sheet: Equatable {
         case share(URL)
-        case gallery
     }
 
     let app: NibApp
@@ -138,6 +137,10 @@ final class ElementsModel: ObservableObject {
     private var lists: [String: [ElementInfo]] = [:]
     private var subscription: EventSubscription?
     private var cancellables = Set<AnyCancellable>()
+    /// The GIF search whose results may still be shown: an older one that finishes later is dropped.
+    private var gifSearchToken = UUID()
+    /// GIPHY offset of the next page (results without a usable GIF are dropped, so it runs ahead of `gifs.count`).
+    private var gifNextOffset = 0
 
     init(app: NibApp, session: EditorSession) {
         self.app = app
@@ -171,6 +174,10 @@ final class ElementsModel: ObservableObject {
                 Task { @MainActor in await self?.reload() }
             }
         }
+        // A library opened after launch gets its starter collections here, as `FeatElementsFeature.start` does for
+        // the launch library (read commands never write them). Once per library and device, so usually a no-op.
+        let catalog = ElementCatalog(services: app.services, clock: app.clock)
+        _ = try? await ElementIO.run { catalog.prepare() }
         await reload()
     }
 
@@ -259,10 +266,27 @@ final class ElementsModel: ObservableObject {
     }
 
     func insert(_ element: ElementInfo) {
-        guard canInsert, let doc = session.document, let page = session.page else { return }
+        Task { await insertElement(element) }
+    }
+
+    /// Inserts an element; on success the non-sticky Elements tool hands the palette back to the previous tool, so
+    /// the next touch writes or lassoes straight away. A failed insert leaves the tool active to try again.
+    @discardableResult
+    func insertElement(_ element: ElementInfo) async -> Bool {
+        guard canInsert, let doc = session.document, let page = session.page else { return false }
         let params = ElementInsert.Params(page: NodeRef.page(doc, page).description, collection: element.collection,
                                           element: element.id, at: insertionPoint(page), ids: nil)
-        Task { _ = await call(ElementInsert.self, params) }
+        guard await call(ElementInsert.self, params) != nil else { return false }
+        await handBack()
+        return true
+    }
+
+    /// Back to the tool that was active before Elements (`tool.select`), when Elements is still the active tool.
+    func handBack() async {
+        guard session.tool == ElementsTool.toolID, let previous = session.previousTool, previous != ElementsTool.toolID else {
+            return
+        }
+        await execute(CommandIDs.toolSelect, ["tool": .string(previous)])
     }
 
     func createFromSelection() async {
@@ -276,13 +300,18 @@ final class ElementsModel: ObservableObject {
         select(out.collection)
     }
 
-    /// A GIF (GIPHY, a picked file or a link) goes in through `image.insert` as an animated image.
+    /// A GIF (GIPHY, a picked file or a link) goes in through `image.insert` as an animated image, then the tool hands
+    /// back like an element insert.
     func insertGIF(url: String) {
         guard canInsert, let doc = session.document, let page = session.page else { return }
         var params: [String: JSONValue] = ["page": .string(NodeRef.page(doc, page).description), "url": .string(url),
                                            "animated": true]
         if let at = insertionPoint(page) { params["at"] = .array(at.map { .number($0) }) }
-        app.perform("image.insert", .object(params), session: session)
+        let json = JSONValue.object(params)
+        Task {
+            guard await execute("image.insert", json) else { return }
+            await handBack()
+        }
     }
 
     // MARK: Collections and elements
@@ -393,7 +422,7 @@ final class ElementsModel: ObservableObject {
 
     // MARK: GIPHY
 
-    var hasMoreGIFs: Bool { gifState == .loaded && gifs.count < gifTotal && gifs.count < 240 }
+    var hasMoreGIFs: Bool { gifState == .loaded && gifNextOffset < gifTotal && gifs.count < 240 }
 
     func refreshGIFKey() {
         if GiphyKey.load() == nil {
@@ -411,6 +440,8 @@ final class ElementsModel: ObservableObject {
     }
 
     func searchGIFs(more: Bool = false) async {
+        let token = UUID()
+        gifSearchToken = token                      // a newer search (or a kind switch) supersedes any in flight
         let q = gifQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else {
             gifs = []
@@ -422,34 +453,39 @@ final class ElementsModel: ObservableObject {
             return
         }
         if !more { gifState = .loading }
+        let limit = 24
+        let offset = more ? gifNextOffset : 0
         do {
-            let params = GifSearch.Params(query: q, kind: gifKind, limit: 24, offset: more ? gifs.count : 0)
+            let params = GifSearch.Params(query: q, kind: gifKind, limit: limit, offset: offset)
             let out = try await app.bus.run(GifSearch.self, params, session: session)
-            gifs = more ? gifs + out.gifs : out.gifs
+            guard token == gifSearchToken else { return }
+            gifs = ElementsModel.appending(out.gifs, to: more ? gifs : [])
+            gifNextOffset = offset + limit
             gifTotal = out.total
             gifState = .loaded
         } catch {
+            guard token == gifSearchToken else { return }
             gifState = GiphyKey.load() == nil ? .needsKey : .failed(NibError.wrap(error).message)
         }
     }
 
+    /// `page` after `existing`, without GIFs already shown (GIPHY pages can overlap; the grid needs unique ids).
+    static func appending(_ page: [GiphyGIF], to existing: [GiphyGIF]) -> [GiphyGIF] {
+        var seen = Set(existing.map { $0.id })
+        return existing + page.filter { seen.insert($0.id).inserted }
+    }
+
     // MARK: Elsewhere
 
-    /// The plugin gallery's library tab (F080), where content packs of elements are installed.
+    /// The plugin gallery's library tab (F080), where content packs of elements are installed. Only decides whether
+    /// the Marketplace button shows; opening goes through `panel.open`, like every other caller.
     var galleryPanel: PanelDescriptor? {
         app.ui.panels.all.first { $0.owner == "pluginmanager" && $0.placement == .libraryTab }
     }
 
     func openGallery() {
-        guard galleryPanel != nil else { return }
-        sheet = .gallery
-        showsSheet = true
-    }
-
-    func galleryView() -> AnyView {
-        guard let panel = galleryPanel else { return AnyView(EmptyView()) }
-        return panel.makeView(PanelContext(app: app, session: session, navigator: app.ui.activeNavigator,
-                                           dismiss: { [weak self] in self?.showsSheet = false }))
+        guard let panel = galleryPanel else { return }
+        app.perform(CommandIDs.panelOpen, ["id": .string(panel.id)], session: session)
     }
 
     func openSettings() {
@@ -496,10 +532,29 @@ final class ElementsModel: ObservableObject {
         }
     }
 
+    /// Another feature's command by id (JSON path), awaited so the next step can follow it; false when it failed.
+    @discardableResult
+    private func execute(_ command: String, _ params: JSONValue) async -> Bool {
+        do {
+            try await app.bus.execute(command, params, session: session)
+            return true
+        } catch {
+            report(command, error)
+            return false
+        }
+    }
+
     /// Failures show as the shell's toast, like `app.perform`.
     private func report(_ command: String, _ error: Error) {
         NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                         userInfo: ["command": command, "error": NibError.wrap(error)])
+    }
+}
+
+/// Counted copy with automatic grammar agreement: "1 element", "3 elements" (and the right forms in other languages).
+enum ElementCopy {
+    static func count(_ n: Int) -> String {
+        String(AttributedString(localized: "^[\(n) element](inflect: true)").characters)
     }
 }
 
@@ -568,8 +623,6 @@ struct ElementsSheet: View {
         switch model.sheet {
         case .share(let url)?:
             ActivityView(items: [url])
-        case .gallery?:
-            model.galleryView()
         case nil:
             EmptyView()
         }
@@ -723,7 +776,7 @@ struct ElementsCollectionBar: View {
                     ForEach(model.collections) { c in
                         NibChip(c.title, style: .filter(isSelected: c.id == model.current)) { model.select(c.id) }
                             .accessibilityAddTraits(c.id == model.current ? .isSelected : [])
-                            .accessibilityValue(String(localized: "\(c.count) elements"))
+                            .accessibilityValue(ElementCopy.count(c.count))
                     }
                 }
                 .padding(.vertical, NibSpacing.s)                 // the chips' 44 pt hit areas stay inside the scroller
@@ -1323,7 +1376,7 @@ struct ElementsSettingsView: View {
         do {
             let local = try ElementFiles.copyToTemporary(url)
             let out = try await app.bus.run(ElementImport.self, ElementImport.Params(url: local.absoluteString))
-            status = String(localized: "Imported \(out.count) elements into \u{201C}\(out.title)\u{201D}.")
+            status = String(localized: "Imported \(ElementCopy.count(out.count)) into \u{201C}\(out.title)\u{201D}.")
         } catch {
             status = NibError.wrap(error).message
         }
