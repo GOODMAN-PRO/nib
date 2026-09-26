@@ -480,6 +480,7 @@ final class CommandCatalogueTests: XCTestCase {
         ("studysession.practice", PanelIDs.studyPractice),
         ("studysession.smartLearn", PanelIDs.studySmartLearn),
         ("studysession.smartLearn", PanelIDs.studyLearn),
+        ("pages.movePages", PanelIDs.movePages),
     ]
 
     func testEveryCommandConstantHoldsItsID() {

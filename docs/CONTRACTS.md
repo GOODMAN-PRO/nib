@@ -9,7 +9,7 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 | **C** | App shell (`AppDelegate.swift`, `ShellViewController.swift`) | Architect only |
 | **D** | `project.yml`, CI workflow, `pick_sim.py`, `lint.py` | Architect only |
 
-16,506 lines across 55 files. Every file starts with its repository path as a heading.
+16,510 lines across 55 files. Every file starts with its repository path as a heading.
 
 ## How to use this file
 
@@ -20,7 +20,7 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 
 ## contracts-v2 changelog
 
-**contracts-v2.1** (branch `v2/contracts2`, additive). `CommandIDs` gains a constant for each of the 313 ARCHITECTURE.md §6.5 catalogue ids that had none (among them `settingsOpen`, `shapeTapAt`, `imagePick`, `pdfTapAt`, `pencilGesture`, `pencilPalette`, `pencilActions`, `layerExportOptions`, `outlineList`, `clipboardCopyText`, `toolbarDock` and `libraryReorder`). Each name is the id in camel case: `ai.chat.delete` → `aiChatDelete`. `PanelIDs` now matches the §13 panel id list: it gains `studySmartLearn = "studysession.smartLearn"`, which is the id F049 opens. `studyLearn` is superseded by it. It shipped as "studysession.learn", which no feature registers, and now holds the Smart Learn id. The new `NibContractsTests/CommandCatalogueTests.swift` reads docs/ARCHITECTURE.md and fails when a §6.5 row has no `CommandIDs` constant, when a constant names an id that is not in the catalogue, or when `PanelIDs` differs from the §13 list. A spec change that adds a catalogue row or a panel id must add the constant in the same change.
+**contracts-v2.1** (branch `v2/contracts2`, additive). `CommandIDs` gains a constant for each of the 313 ARCHITECTURE.md §6.5 catalogue ids that had none (among them `settingsOpen`, `shapeTapAt`, `imagePick`, `pdfTapAt`, `pencilGesture`, `pencilPalette`, `pencilActions`, `layerExportOptions`, `outlineList`, `clipboardCopyText`, `toolbarDock` and `libraryReorder`). Each name is the id in camel case: `ai.chat.delete` → `aiChatDelete`. `PanelIDs` now matches the §13 panel id list: it gains `studySmartLearn = "studysession.smartLearn"`, which is the id F049 opens. `studyLearn` is superseded by it. It shipped as "studysession.learn", which no feature registers, and now holds the Smart Learn id. `PanelIDs` also gains `movePages = "pages.movePages"`, F022's Move Pages sheet. F023 opens it with `panel.open {id, pages}`. Adopt: F022's `MovePagesSheet` moves the refs in `PanelContext.params["pages"]` and falls back to the open page when there are none. The new `NibContractsTests/CommandCatalogueTests.swift` reads docs/ARCHITECTURE.md and fails when a §6.5 row has no `CommandIDs` constant, when a constant names an id that is not in the catalogue, or when `PanelIDs` differs from the §13 list. A spec change that adds a catalogue row or a panel id must add the constant in the same change.
 
 contracts-v2 (branch `v2/contracts`) resolves the contract gaps the first 48 features reported (`tools/fleet/contract-gaps.md`, where every gap line now ends with `[v2: G<n> …]`, `[v2: rejected - …]` or `[v2: deferred - …]`). It is **additive over contracts-v1**: no public API was renamed, removed or re-signed; every new protocol requirement has a default implementation; new stored fields are optional or defaulted and decode leniently; superseded APIs keep working and carry a "Superseded in contracts-v2 by X" doc comment. Two behaviour changes are bug fixes: `DocTransaction.revert` (G4) and `CommandContext.inputFile` (G6); plus `Frame.applying` for rotated frames under non-uniform scale (G24). The sources in Part A below are the v2 sources; `NibContractsTests/ContractsV2Tests.swift` covers every fix and every new API.
 
@@ -467,6 +467,7 @@ public static let assistant = "aichat.panel", trash = "organize.trash", favourit
 public static let templates = "templateui.manage", cloudBackup = "syncui.panel", about = "about.panel"
 public static let gallery = "pluginmanager.gallery", studyPractice = "studysession.practice"
 public static let studySmartLearn = "studysession.smartLearn"   // v2.1; v2's studyLearn now holds this id too
+public static let movePages = "pages.movePages"                 // v2.1; F022 sheet, panel.open {id, pages?}
 ```
 Replaces: F014 `FeatClipboard/ClipboardCommands.swift` `"selection.clear"`, F028 `PageTextEditor.setTextCommand`, F047 `TextDocViewController.swift` `"library.rename"`, F058 `FeatSmartInk/EditHandwritingMode.swift` `"item.recolor"` / `"clipboard.cut"` literals → the constants; F017 `DocumentContainerViewController.swift` Back button and F018 `FeatWindows/TabStripView.swift` `showLibrary()` / `WindowCommands.swift` direct `navigator.showLibrary` → `app.perform(CommandIDs.windowShowLibrary, …)`; F017 assistant found by owner "aichat", F027 app-menu places guessed by owner, F035 gallery by owner "pluginmanager", F049 `FeatStudyEditor/CardEditorView.swift` practice/learn by owner → `PanelIDs`. Adopt: F085, F045, F070, F098, F080, F050 register their panels under these ids.
 
@@ -5020,6 +5021,9 @@ public enum PanelIDs {
     /// Superseded in contracts-v2.1 by `studySmartLearn`. contracts-v2 shipped "studysession.learn", which no feature
     /// registers; this now holds the Smart Learn id so existing callers open the right panel.
     public static let studyLearn = "studysession.smartLearn"
+    /// Move Pages sheet (F022). contracts-v2.1. Open it with `panel.open {id, pages?}`: the sheet moves the page refs
+    /// in `PanelContext.params["pages"]`, or the open page when there are none (F023 passes the selected thumbnails).
+    public static let movePages = "pages.movePages"
 }
 ```
 
@@ -15362,6 +15366,7 @@ final class CommandCatalogueTests: XCTestCase {
         ("studysession.practice", PanelIDs.studyPractice),
         ("studysession.smartLearn", PanelIDs.studySmartLearn),
         ("studysession.smartLearn", PanelIDs.studyLearn),
+        ("pages.movePages", PanelIDs.movePages),
     ]
 
     func testEveryCommandConstantHoldsItsID() {

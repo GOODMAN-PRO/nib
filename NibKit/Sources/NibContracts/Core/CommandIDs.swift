@@ -509,4 +509,7 @@ public enum PanelIDs {
     /// Superseded in contracts-v2.1 by `studySmartLearn`. contracts-v2 shipped "studysession.learn", which no feature
     /// registers; this now holds the Smart Learn id so existing callers open the right panel.
     public static let studyLearn = "studysession.smartLearn"
+    /// Move Pages sheet (F022). contracts-v2.1. Open it with `panel.open {id, pages?}`: the sheet moves the page refs
+    /// in `PanelContext.params["pages"]`, or the open page when there are none (F023 passes the selected thumbnails).
+    public static let movePages = "pages.movePages"
 }
