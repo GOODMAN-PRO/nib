@@ -4,14 +4,16 @@ Workflow cap = 2 concurrent (4 CPUs) -> using background Agent calls; me as sche
 
 ## v2 pass (main-side), branches v2/*
 - v2/contracts  contracts-v2 (C1)            running
-- v2/glass      Liquid Glass redo (D1a)       running
+- v2/glass      Liquid Glass redo (D1a)       GREEN (run 36221916103, 8b0ef70)
+- v2/mockup     mockup.html update            running
 - v2/physics    toolbar dock/bead + reflow    running
 - v2/dstokens   NibDesign gap tokens/comps    running
 Next: integrator merges 4 branches -> main, CI green, tag contracts-v2 + design-v2, merge main into all feat/*; then F016 dock adoption; mockup update + republish.
 
 ## Fleet jobs launched
 - FIX: F001 F012 F028 (red), F022 F030 F037 (WIP), F017 F026
-Pending FIX queue: F029 F032 F034 F035 F036 F038 F039 F041 F043 F044 F046 F051 F055 F059 F063 F090
+FIX done green: F012 F017 F022 F026 F028 F029 F030 F032 F034 F035 F036 F037 F038 F039 F041
+FIX running: F001 F043 F044 F046 F051 F055 F059 F063 F090. Queue empty.
 Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F064/F065 WIP)
 
 ## Follow-ups (not in any agent yet)

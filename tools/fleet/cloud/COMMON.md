@@ -15,3 +15,6 @@ CI loop (for "get branch X green"):
 4. On failure: `gh run view <id> --repo GOODMAN-PRO/nib --log-failed > /home/user/Nib-ci-logs/<branch-with-slashes-as-_>-<round>.log` and grep for `error:`, `** BUILD FAILED`, `** TEST FAILED`, `failed (`, `fatal`, `::error`. Fix root causes, go to 1. Branches other than feat/* run the full `test` job (all package tests + lint + conformance) and the `ipa` job. Feature branches (feat/Fxxx) run only that feature's lint, tests and app build.
 
 Tip: you can install a Linux Swift toolchain in your scratchpad (e.g. from swift.org, swiftly or the tarball) and run pure-logic code/tests with `swift` locally before pushing. UIKit/SwiftUI won't compile on Linux, but model/algorithm code and its tests often can; this saves CI rounds.
+
+Note: pushes to branches other than main and feat/** do NOT start CI. For v2/* or other branches start it with `gh workflow run ios.yml --repo GOODMAN-PRO/nib --ref <branch>` and then find the run (event workflow_dispatch).
+Note: the main clone's fetch refspec now covers all branches; `git fetch origin` updates every origin/feat/* ref.
