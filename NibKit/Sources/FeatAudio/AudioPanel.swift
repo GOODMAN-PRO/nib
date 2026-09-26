@@ -541,6 +541,8 @@ struct RecorderHUD: View {
                 run(r, "stop")
             }
         }
+        .frame(minHeight: NibMetrics.hudHeight)
+        .nibChromeTypeCap()
         .accessibilityElement(children: .contain)
     }
 

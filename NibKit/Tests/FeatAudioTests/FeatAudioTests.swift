@@ -251,10 +251,11 @@ final class FeatAudioTests: XCTestCase {
         let after = try await h.run("audio.setPlayback")
         XCTAssertTrue(after["recording"] == nil || after["recording"] == .null, "not recording any more")
 
-        // AAC in CAF, readable back at (about) the same length; the live file is gone.
+        // AAC in CAF, readable back at the same length (the encoder's priming is in the packet table); the live
+        // file is gone.
         let url = try file(h, record.file)
         let caf = try AVAudioFile(forReading: url)
-        XCTAssertEqual(Double(caf.length) / caf.processingFormat.sampleRate, 2.5, accuracy: 0.1)
+        XCTAssertEqual(Double(caf.length) / caf.processingFormat.sampleRate, 2.5, accuracy: 0.03)
         XCTAssertFalse(exists(live))
         XCTAssertFalse(LiveRecordings.contains(doc: Fixtures.docID, clip: record.id))
         XCTAssertFalse(audio.isFinalising(Fixtures.docID, record.id))
@@ -385,6 +386,12 @@ final class FeatAudioTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: copy) }
         let unclosed = try AVAudioFile(forReading: copy)
         XCTAssertEqual(Double(unclosed.length) / unclosed.processingFormat.sampleRate, 2, accuracy: 0.25)
+        // Recovery copies its packets into AAC in CAF without re-encoding (no transcode fallback needed).
+        let caf = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".caf")
+        defer { try? FileManager.default.removeItem(at: caf) }
+        try AudioFiles.remux(copy, to: caf, type: kAudioFileCAFType)
+        try AudioFiles.verify(caf)
+        XCTAssertEqual(AudioFiles.duration(of: caf) ?? 0, 2, accuracy: 0.25)
         _ = try await h.run("audio.record", ["doc": .string(fixtureDoc), "action": "stop"])
     }
 

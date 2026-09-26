@@ -34,7 +34,7 @@ final class MicrophoneSource: AudioSampleSource {
         do {
             // A Bluetooth headset or AirPods can be the microphone (HFP); A2DP keeps playback on them afterwards.
             try session.setCategory(.playAndRecord, mode: .default,
-                                    options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+                                    options: [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP])
             try session.setActive(true)
         } catch {
             throw Self.busy(error)
