@@ -5,13 +5,9 @@ import PencilKit
 import NibContracts
 import NibDesign
 
-/// Time Keeper glyphs NibSymbol does not name yet (contract gap): the public `NibSymbol(systemName:)` validates them.
+/// The glyph of a session kind (NibDesign v2 `.timer` / `.stopwatch`).
 enum TimeKeeperGlyph {
-    static let timer = NibSymbol(systemName: "timer") ?? .recents
-    static let stopwatch = NibSymbol(systemName: "stopwatch") ?? .recents
-    static let lap = NibSymbol(systemName: "flag") ?? .bookmark
-
-    static func of(_ kind: TimerKind) -> NibSymbol { kind == .timer ? timer : stopwatch }
+    static func of(_ kind: TimerKind) -> NibSymbol { kind == .timer ? NibSymbol.timer : NibSymbol.stopwatch }
 }
 
 /// Keyboard equivalents of the shell's key commands (FeatTimeKeeperFeature), shown as `KeyHint`s on the controls.
@@ -20,24 +16,15 @@ enum TimeKeeperKeys {
     static let lap = KeyboardShortcut("k", modifiers: [.command, .option])
 }
 
-/// A countdown's progress: a 3 pt `fill1` track with a `label` fill that turns `destructive` for the last five
-/// seconds. (NibProgressBar has no critical state; this is the same bar composed from its tokens.)
+/// A countdown's progress: NibProgressBar, `critical` (destructive) for the last five seconds.
 struct TimeKeeperProgress: View {
     let value: Double
     let critical: Bool
 
     var body: some View {
-        GeometryReader { proxy in
-            ZStack(alignment: .leading) {
-                Capsule().fill(NibColor.fill1)
-                Capsule()
-                    .fill(critical ? NibColor.destructive : NibColor.label)
-                    .frame(width: proxy.size.width * CGFloat(min(max(value, 0), 1)))
-            }
-        }
-        .frame(height: 3)
-        .animation(NibMotion.colorChange, value: critical)
-        .accessibilityHidden(true)                  // the clock beside it carries the value
+        NibProgressBar(value: value, style: critical ? .critical : .standard)
+            .animation(NibMotion.colorChange, value: critical)
+            .accessibilityHidden(true)              // the clock beside it carries the value
     }
 }
 
@@ -64,15 +51,13 @@ struct TimeKeeperPanel: View {
     @State private var reading: Reading = .idle
     /// Bumped by every read, so an older recognition that finishes late never overwrites a newer one.
     @State private var readGeneration = 0
-    @State private var showsAllHistory = false
-    @State private var expanded: Set<String> = []
     @State private var pendingDelete: TimerPreset?
 
     private var seconds: Int? { DurationParser.seconds(from: durationText) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            NibPanelHeader(title: String(localized: "Time Keeper"), symbol: TimeKeeperGlyph.timer) { context.dismiss() }
+            NibPanelHeader(title: String(localized: "Time Keeper"), symbol: NibSymbol.timer) { context.dismiss() }
             ScrollView {
                 VStack(alignment: .leading, spacing: NibSpacing.xl) {
                     if keeper.engine.isActive {
@@ -81,7 +66,9 @@ struct TimeKeeperPanel: View {
                     } else {
                         setup
                     }
-                    historySection
+                    // A value, compared before its body is built: the clock above ticks every second, the history
+                    // changes only when a session ends.
+                    TimeKeeperHistorySection(records: keeper.history).equatable()
                 }
                 .padding(NibSpacing.l)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -280,7 +267,7 @@ struct TimeKeeperPanel: View {
                         writing = false
                         reading = .idle
                     } label: {
-                        NibInspectorRow(mode.name, subtitle: TimerFormat.short(mode.seconds), symbol: TimeKeeperGlyph.timer)
+                        NibInspectorRow(mode.name, subtitle: TimerFormat.short(mode.seconds), symbol: NibSymbol.timer)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)))
@@ -322,30 +309,40 @@ struct TimeKeeperPanel: View {
         run("timer.saveMode", ["name": .string(mode), "seconds": .number(Double(s))])
         modeName = ""
     }
+}
 
-    // MARK: History
+/// The session history: the five newest, or all of them after "Show All" (built lazily, as the list is never pruned).
+/// It takes the records as a value and does not observe the Time Keeper, and is used `.equatable()`: the panel's
+/// once-a-second clock never rebuilds it.
+struct TimeKeeperHistorySection: View, Equatable {
+    static let collapsedCount = 5
 
-    private var historySection: some View {
-        let all = keeper.history
-        let shown = showsAllHistory ? all : Array(all.prefix(5))
-        var action: NibAction?
-        if all.count > 5 {
-            action = NibAction(showsAllHistory ? String(localized: "Show Less") : String(localized: "Show All")) {
-                showsAllHistory.toggle()
-            }
-        }
-        return NibInspectorSection(String(localized: "History"), action: action) {
-            if all.isEmpty {
+    let records: [TimerRecord]
+    @State private var showsAll = false
+    @State private var expanded: Set<String> = []
+
+    static func == (a: TimeKeeperHistorySection, b: TimeKeeperHistorySection) -> Bool { a.records == b.records }
+
+    var body: some View {
+        NibInspectorSection(String(localized: "History"), action: toggleAction) {
+            if records.isEmpty {
                 Text(String(localized: "Finished timers and stopwatches appear here."))
                     .font(NibFont.footnote)
                     .foregroundStyle(NibColor.labelSecondary)
             }
-            ForEach(shown) { record in
-                TimeKeeperHistoryRow(record: record, expanded: expanded.contains(record.id)) {
-                    if expanded.contains(record.id) { expanded.remove(record.id) } else { expanded.insert(record.id) }
+            LazyVStack(alignment: .leading, spacing: NibSpacing.s) {
+                ForEach(showsAll ? records : Array(records.prefix(Self.collapsedCount))) { record in
+                    TimeKeeperHistoryRow(record: record, expanded: expanded.contains(record.id)) {
+                        if expanded.contains(record.id) { expanded.remove(record.id) } else { expanded.insert(record.id) }
+                    }
                 }
             }
         }
+    }
+
+    private var toggleAction: NibAction? {
+        guard records.count > Self.collapsedCount else { return nil }
+        return NibAction(showsAll ? String(localized: "Show Less") : String(localized: "Show All")) { showsAll.toggle() }
     }
 }
 
@@ -355,6 +352,8 @@ struct TimeKeeperRunningSection: View {
     /// The window shows a canvas, so the session has a bar to hide or show.
     let barAvailable: Bool
     let run: (String, JSONValue) -> Void
+    /// Discarding throws away the run and its laps, so it asks first.
+    @State private var confirmsDiscard = false
 
     var body: some View {
         let e = keeper.engine
@@ -390,6 +389,14 @@ struct TimeKeeperRunningSection: View {
                 }
             }
         }
+        .confirmationDialog(String(localized: "Discard this session?"), isPresented: $confirmsDiscard,
+                            titleVisibility: .visible) {
+            Button(String(localized: "Discard Session"), role: .destructive) {
+                run("timer.control", ["action": "discard"])
+            }
+        } message: {
+            Text(String(localized: "It won't be saved to your history."))
+        }
     }
 
     @ViewBuilder private func controls(_ e: TimerEngine) -> some View {
@@ -412,8 +419,8 @@ struct TimeKeeperRunningSection: View {
                     }
                 }
                 Spacer(minLength: 0)
-                NibButton(String(localized: "Discard"), kind: .destructive, size: .compact) {
-                    run("timer.control", ["action": "discard"])
+                NibButton(String(localized: "Discard Session"), kind: .destructive, size: .compact) {
+                    confirmsDiscard = true
                 }
             }
         }
@@ -421,7 +428,7 @@ struct TimeKeeperRunningSection: View {
 
     @ViewBuilder private func finishedButtons(_ e: TimerEngine) -> some View {
         NibButton(String(localized: "Start Again"), symbol: .retry, expands: true) {
-            var params: [String: JSONValue] = ["seconds": .number(e.duration.rounded())]
+            var params: [String: JSONValue] = ["seconds": .number(Double(e.seconds))]
             if let label = e.label { params["label"] = .string(label) }
             run("timer.start", .object(params))
         }
@@ -437,7 +444,7 @@ struct TimeKeeperRunningSection: View {
             run("timer.control", ["action": "togglePause"])
         }
         if e.kind == .stopwatch && e.state == .running {
-            NibButton(String(localized: "Lap"), symbol: TimeKeeperGlyph.lap, expands: true, shortcut: TimeKeeperKeys.lap) {
+            NibButton(String(localized: "Lap"), symbol: NibSymbol.lap, expands: true, shortcut: TimeKeeperKeys.lap) {
                 run("stopwatch.lap", [:])
             }
         }
@@ -594,7 +601,7 @@ struct TimeKeeperBar: View {
         HStack(spacing: NibSpacing.xxs) {
             if e.state == .finished {
                 NibIconButton(.retry, label: String(localized: "Start Again")) {
-                    var params: [String: JSONValue] = ["seconds": .number(e.duration.rounded())]
+                    var params: [String: JSONValue] = ["seconds": .number(Double(e.seconds))]
                     if let label = e.label { params["label"] = .string(label) }
                     keeper.perform("timer.start", .object(params))
                 }
@@ -607,7 +614,7 @@ struct TimeKeeperBar: View {
             }
             summary(e, at: t)
             if e.kind == .stopwatch && e.state == .running {
-                NibIconButton(TimeKeeperGlyph.lap, label: String(localized: "Record Lap"), shortcut: TimeKeeperKeys.lap) {
+                NibIconButton(NibSymbol.lap, label: String(localized: "Record Lap"), shortcut: TimeKeeperKeys.lap) {
                     keeper.perform("stopwatch.lap")
                 }
             }
@@ -651,8 +658,9 @@ struct TimeKeeperBar: View {
                         .lineLimit(1)
                         .layoutPriority(1)
                     if let label = e.label {
+                        // HUD type on Clear (DESIGN.md §2.4), as NibHUD sets its secondary part.
                         Text(label)
-                            .font(NibFont.caption1Emphasis)
+                            .font(NibFont.hud)
                             .foregroundStyle(NibColor.label)
                             .lineLimit(1)
                     }

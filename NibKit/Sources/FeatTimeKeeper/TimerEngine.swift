@@ -37,6 +37,22 @@ struct TimerLap: Codable, Equatable, Hashable {
     var split: Double
 }
 
+/// Limits for numbers that come from outside the engine: synced prefs written by another device, the library's prefs
+/// files, and settings.set from the AI or a plugin. Values are clamped before they are converted to Int or drawn, so
+/// no stored value can trap (ARCHITECTURE.md §15.6).
+enum TimerBounds {
+    /// The longest run a record keeps: 100 days (a stopwatch can be left running).
+    static let maxRecorded: Double = 100 * 86_400
+    /// The latest Unix time a record keeps.
+    static let latestDate: Double = Date.distantFuture.timeIntervalSince1970
+
+    /// `x` within 0…`cap`: NaN and -∞ give 0, +∞ gives `cap`.
+    static func clamp(_ x: Double, to cap: Double) -> Double {
+        guard x.isFinite else { return x == .infinity ? cap : 0 }
+        return min(max(x, 0), cap)
+    }
+}
+
 /// One Time Keeper session. Time is measured on the wall clock (`accumulated` plus the running segment since
 /// `resumedAt`), so a session keeps counting while the app is hidden, suspended or relaunched: nothing has to tick.
 /// ponytail: wall clock, so changing the device clock moves the timer; a monotonic clock does not survive a relaunch.
@@ -76,6 +92,18 @@ struct TimerEngine: Codable, Equatable {
     }
 
     var isActive: Bool { state != .idle }
+
+    /// The countdown length in whole seconds (0 for a stopwatch).
+    var seconds: Int { Int(TimerBounds.clamp(duration, to: Double(Self.maxSeconds)).rounded()) }
+
+    /// Every number is finite and in range: a snapshot read back from storage is used only if this holds.
+    var isSane: Bool {
+        let numbers = [duration, accumulated] + laps.flatMap { [$0.total, $0.split] }
+        let dates = [startedAt, resumedAt, endedAt].compactMap { $0?.timeIntervalSince1970 }
+        return numbers.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= TimerBounds.maxRecorded }
+            && dates.allSatisfy { $0.isFinite && abs($0) <= TimerBounds.latestDate }
+            && duration <= Double(Self.maxSeconds)
+    }
 
     func elapsed(at t: Date) -> Double {
         var e = accumulated
@@ -125,7 +153,8 @@ struct TimerEngine: Codable, Equatable {
     mutating func lap(at t: Date) -> TimerLap? {
         guard kind == .stopwatch, state == .running else { return nil }
         let total = elapsed(at: t)
-        let lap = TimerLap(index: laps.count + 1, total: total, split: total - (laps.last?.total ?? 0))
+        // Never a negative split, even after the device clock was set back.
+        let lap = TimerLap(index: laps.count + 1, total: total, split: max(0, total - (laps.last?.total ?? 0)))
         laps.append(lap)
         return lap
     }
@@ -191,11 +220,15 @@ struct TimerRecord: Codable, Equatable, Identifiable {
         self.laps = laps
     }
 
-    /// Lenient: settings.set from the AI or a plugin may leave fields out (ARCHITECTURE.md §4.2).
+    /// Lenient: settings.set from the AI or a plugin may leave fields out (ARCHITECTURE.md §4.2). And sanitised: records
+    /// arrive from other devices, the library's prefs files and plugins, so every number is clamped to a sane range and
+    /// laps that are not a finite, non-negative total and split are dropped (the rest are numbered again).
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        let started = (try? c.decodeIfPresent(Double.self, forKey: .startedAt)) ?? 0
-        let ended = (try? c.decodeIfPresent(Double.self, forKey: .endedAt)) ?? started
+        let started = TimerBounds.clamp((try? c.decodeIfPresent(Double.self, forKey: .startedAt)) ?? 0,
+                                        to: TimerBounds.latestDate)
+        let ended = TimerBounds.clamp((try? c.decodeIfPresent(Double.self, forKey: .endedAt)) ?? started,
+                                      to: TimerBounds.latestDate)
         id = (try? c.decodeIfPresent(String.self, forKey: .id)) ?? ""
         kind = (try? c.decodeIfPresent(TimerKind.self, forKey: .kind)) ?? .timer
         label = try? c.decodeIfPresent(String.self, forKey: .label)
@@ -203,10 +236,36 @@ struct TimerRecord: Codable, Equatable, Identifiable {
         docTitle = try? c.decodeIfPresent(String.self, forKey: .docTitle)
         startedAt = started
         endedAt = ended
-        duration = try? c.decodeIfPresent(Double.self, forKey: .duration)
-        elapsed = (try? c.decodeIfPresent(Double.self, forKey: .elapsed)) ?? max(0, ended - started)
+        let planned = try? c.decodeIfPresent(Double.self, forKey: .duration)
+        duration = planned.flatMap { $0.isFinite && $0 >= 0 ? min($0, Double(TimerEngine.maxSeconds)) : nil }
+        elapsed = TimerBounds.clamp((try? c.decodeIfPresent(Double.self, forKey: .elapsed)) ?? (ended - started),
+                                    to: TimerBounds.maxRecorded)
         completed = (try? c.decodeIfPresent(Bool.self, forKey: .completed)) ?? false
-        laps = (try? c.decodeIfPresent([TimerLap].self, forKey: .laps)) ?? []
+        let stored = (try? c.decodeIfPresent([StoredLap].self, forKey: .laps)) ?? []
+        laps = stored.compactMap { lap -> (total: Double, split: Double)? in
+            guard let total = lap.total, let split = lap.split, total.isFinite, split.isFinite, total >= 0, split >= 0 else {
+                return nil
+            }
+            return (min(total, TimerBounds.maxRecorded), min(split, TimerBounds.maxRecorded))
+        }
+        .enumerated()
+        .map { TimerLap(index: $0.offset + 1, total: $0.element.total, split: $0.element.split) }
+    }
+}
+
+/// One stored lap, read without failing: a malformed lap is dropped on its own instead of losing every lap.
+private struct StoredLap: Decodable {
+    enum CodingKeys: String, CodingKey {
+        case total, split
+    }
+
+    let total: Double?
+    let split: Double?
+
+    init(from decoder: Decoder) throws {
+        let c = try? decoder.container(keyedBy: CodingKeys.self)
+        total = try? c?.decodeIfPresent(Double.self, forKey: .total)
+        split = try? c?.decodeIfPresent(Double.self, forKey: .split)
     }
 }
 
@@ -251,13 +310,19 @@ struct TimerPreset: Codable, Equatable, Hashable, Identifiable {
 
 /// Reads a duration a person typed or wrote: "25" (minutes), "25 min", "90s", "1h 15m", "1h15", "2.5 min",
 /// "1:30" (minutes:seconds), "1:05:00" (hours:minutes:seconds). Handwriting look-alikes next to digits are fixed
-/// ("I5" is 15, "O5:00" is 05:00). Returns whole seconds in 1 s…24 h, or nil.
+/// ("I5" is 15, "O5:00" is 05:00). Returns whole seconds in 1 s…24 h, or nil. Total: any string, however long its
+/// digit run (a scribble misread as a dozen nines), gives nil rather than overflowing.
 /// ponytail: unit words match by their English first letter (h, m, s); digits and clock forms work in any language.
 enum DurationParser {
+    /// Longest part of a clock form ("99999:00" is already far beyond 24 h).
+    static let maxClockDigits = 5
+
     static func seconds(from raw: String) -> Int? {
         let text = normalise(raw)
         guard !text.isEmpty else { return nil }
         guard let value = text.contains(":") ? clock(text) : units(text) else { return nil }
+        // Range-check the Double first: Int(_:) traps beyond Int.max.
+        guard value.isFinite, value >= 0.5, value <= Double(TimerEngine.maxSeconds) + 0.5 else { return nil }
         let s = Int(value.rounded())
         return (1...TimerEngine.maxSeconds).contains(s) ? s : nil
     }
@@ -288,7 +353,9 @@ enum DurationParser {
     static func clock(_ text: String) -> Double? {
         let parts = text.split(separator: ":", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces) }
-        guard (2...3).contains(parts.count), parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy(isDigit) }) else {
+        // At most five digits a part, so the Int arithmetic below cannot overflow.
+        guard (2...3).contains(parts.count),
+              parts.allSatisfy({ !$0.isEmpty && $0.count <= maxClockDigits && $0.allSatisfy(isDigit) }) else {
             return nil
         }
         let n = parts.compactMap { Int($0) }
@@ -339,6 +406,8 @@ enum DurationParser {
             }
             if let l = last, unit >= l { return nil }
             total += value * unit
+            // Already past 24 h (or infinite, from a very long digit run): nothing later can bring it back.
+            guard total.isFinite, total <= Double(TimerEngine.maxSeconds) + 0.5 else { return nil }
             last = unit
         }
         return last == nil ? nil : total
@@ -403,16 +472,21 @@ enum TimerFormat {
 
     private static func two(_ n: Int) -> String { n < 10 ? "0\(n)" : "\(n)" }
 
+    /// Total for any Double (history comes from other devices and plugins): not finite or beyond
+    /// `TimerBounds.maxRecorded` draws as that cap, below zero as zero.
+    private static func bounded(_ seconds: Double) -> Double { TimerBounds.clamp(seconds, to: TimerBounds.maxRecorded) }
+
     /// "04:12", "1:05:00". Countdowns round up, so a timer shows 25:00 when it starts and 00:01 in its last second.
     static func clock(_ seconds: Double, roundingUp: Bool = false) -> String {
-        let total = max(0, Int(roundingUp ? seconds.rounded(.up) : seconds.rounded(.down)))
+        let value = bounded(seconds)
+        let total = Int(roundingUp ? value.rounded(.up) : value.rounded(.down))
         let h = total / 3600, m = (total % 3600) / 60, s = total % 60
         return h > 0 ? "\(h):\(two(m)):\(two(s))" : "\(two(m)):\(two(s))"
     }
 
     /// Lap times with tenths: "01:02.3".
     static func lap(_ seconds: Double) -> String {
-        let tenths = max(0, Int((seconds * 10).rounded(.down)))
+        let tenths = Int((bounded(seconds) * 10).rounded(.down))
         return clock(Double(tenths / 10)) + "." + String(tenths % 10)
     }
 
@@ -423,7 +497,7 @@ enum TimerFormat {
 
     /// "25 minutes", for VoiceOver.
     static func spoken(_ seconds: Double) -> String {
-        fullFormatter.string(from: max(0, seconds)) ?? clock(seconds)
+        fullFormatter.string(from: bounded(seconds)) ?? clock(seconds)
     }
 
     /// "1 lap", "3 laps".

@@ -135,6 +135,87 @@ final class TimerEngineTests: XCTestCase {
         }
     }
 
+    func testDurationParserNeverOverflows() {
+        // Typed nines, or a long digit run misread from a scribble: nil, never a trap.
+        let hostile = ["999999999999999999", "99999999999999999999 min", "999999999999999999:00",
+                       "9999999999999999:00:00", String(repeating: "9", count: 400),
+                       String(repeating: "9", count: 400) + "h", "1h " + String(repeating: "9", count: 30) + "m",
+                       "99999:00", "123456:00", "1:123456:00", "86401s", "1441"]
+        for text in hostile {
+            XCTAssertNil(DurationParser.seconds(from: text), "'\(text)'")
+        }
+        XCTAssertEqual(DurationParser.seconds(from: "1440:00"), 86_400, "24 h as minutes:seconds")
+        XCTAssertEqual(DurationParser.seconds(from: "24:00:00"), 86_400)
+        XCTAssertEqual(DurationParser.seconds(from: "1440"), 86_400)
+        XCTAssertEqual(DurationParser.seconds(from: "0.5s"), 1, "half a second rounds to the shortest timer")
+        XCTAssertNil(TimerRecognition.bestDuration([TextRecognition(text: String(repeating: "9", count: 40),
+                                                                    bbox: Rect(x: 0, y: 0, width: 80, height: 40),
+                                                                    source: "ink")]))
+    }
+
+    func testFormattingIsTotal() {
+        let cap = TimerBounds.maxRecorded                  // 100 days: 2400 hours
+        XCTAssertEqual(TimerFormat.clock(1e19), "2400:00:00", "a value beyond Int.max draws as the cap")
+        XCTAssertEqual(TimerFormat.clock(.infinity), "2400:00:00")
+        XCTAssertEqual(TimerFormat.clock(.nan), "00:00")
+        XCTAssertEqual(TimerFormat.clock(-.infinity, roundingUp: true), "00:00")
+        XCTAssertEqual(TimerFormat.clock(cap + 1), "2400:00:00")
+        XCTAssertEqual(TimerFormat.lap(1e19), "2400:00:00.0")
+        XCTAssertEqual(TimerFormat.lap(.nan), "00:00.0")
+        XCTAssertEqual(TimerFormat.lap(-4), "00:00.0")
+        XCTAssertFalse(TimerFormat.spoken(1e19).isEmpty)
+        _ = TimerFormat.spoken(.nan)
+        _ = TimerFormat.spoken(-.infinity)
+    }
+
+    func testStoredRecordsAreSanitised() throws {
+        let huge: JSONValue = ["index": 1, "total": 1e19, "split": 1e19]
+        let negative: JSONValue = ["index": 2, "total": -1, "split": 1]
+        let unnumbered: JSONValue = ["total": 30, "split": 12.5]
+        let badIndex: JSONValue = ["index": 1e19, "total": 40, "split": 10]
+        let noTotal: JSONValue = ["index": 5, "split": 3]
+        let laps: [JSONValue] = [huge, negative, unnumbered, badIndex, "junk", noTotal]
+        var fields: [String: JSONValue] = ["kind": "stopwatch", "startedAt": -5, "endedAt": 1e300, "elapsed": 1e19]
+        fields["duration"] = 1e19
+        fields["completed"] = true
+        fields["laps"] = .array(laps)
+        let record = try JSONValue.object(fields).decode(TimerRecord.self)
+        XCTAssertEqual(record.startedAt, 0)
+        XCTAssertEqual(record.endedAt, TimerBounds.latestDate)
+        XCTAssertEqual(record.elapsed, TimerBounds.maxRecorded)
+        XCTAssertEqual(record.duration, Double(TimerEngine.maxSeconds))
+        XCTAssertEqual(record.laps, [TimerLap(index: 1, total: TimerBounds.maxRecorded, split: TimerBounds.maxRecorded),
+                                     TimerLap(index: 2, total: 30, split: 12.5),
+                                     TimerLap(index: 3, total: 40, split: 10)],
+                       "bad laps are dropped one by one, the rest numbered again")
+        XCTAssertNil(try (["duration": -3] as JSONValue).decode(TimerRecord.self).duration)
+        XCTAssertEqual(try (["startedAt": 100, "endedAt": 40] as JSONValue).decode(TimerRecord.self).elapsed, 0,
+                       "an end before the start is no run, not a negative one")
+    }
+
+    func testSnapshotsOutOfRangeAreNotRestored() {
+        XCTAssertTrue(timer(1500).isSane)
+        var huge = timer(60)
+        huge.duration = 1e19
+        XCTAssertFalse(huge.isSane)
+        var negative = stopwatch()
+        negative.accumulated = -1
+        XCTAssertFalse(negative.isSane)
+        var far = timer(60)
+        far.resumedAt = Date(timeIntervalSince1970: 1e300)
+        XCTAssertFalse(far.isSane)
+        XCTAssertEqual(huge.seconds, TimerEngine.maxSeconds, "whole seconds never trap either")
+    }
+
+    func testLapSplitsNeverGoNegative() {
+        var e = stopwatch()
+        _ = e.lap(at: at(20))
+        e.pause(at: at(20))
+        e.accumulated = 15                               // as after the device clock was set back
+        e.resume(at: at(20))
+        XCTAssertEqual(e.lap(at: at(21))?.split, 0)
+    }
+
     func testRecognitionPicksTheFirstReadableCandidate() {
         let box = Rect(x: 0, y: 0, width: 80, height: 40)
         let split = [TextRecognition(text: "5", bbox: Rect(x: 40, y: 2, width: 20, height: 40), source: "ink"),

@@ -8,6 +8,7 @@ import NibTesting
 final class FakeTimerNotifier: TimerNotifier {
     var scheduled: [String: Date] = [:]
     var cancelled: [String] = []
+    var chimes = 0
 
     func schedule(id: String, at date: Date, title: String, body: String) { scheduled[id] = date }
 
@@ -17,6 +18,8 @@ final class FakeTimerNotifier: TimerNotifier {
     }
 
     func requestAuthorizationIfNeeded(granted: @escaping @MainActor () -> Void) {}
+
+    func chime() { chimes += 1 }
 }
 
 /// A wall clock the test moves by hand ("the app was suspended for ten minutes").
@@ -253,9 +256,163 @@ final class FeatTimeKeeperTests: XCTestCase {
         XCTAssertNil(h.app.settings.json("timer.modes.Pomodoro"))
 
         try await h.run("stopwatch.start")
-        _ = try await h.app.bus.execute(Invocation(command: "timer.control", params: ["action": "stop"],
-                                                   session: h.session, dryRun: true))
+        func control(_ action: String) async throws -> JSONValue {
+            try await h.app.bus.execute(Invocation(command: "timer.control", params: ["action": .string(action)],
+                                                   session: h.session, dryRun: true)).value
+        }
+        var predicted = try await control("stop")
+        XCTAssertEqual(predicted["active"], false, "the preview of stop says the session would end")
         XCTAssertEqual(keeper.engine.state, .running, "a dry-run stop leaves the stopwatch running")
+        predicted = try await control("discard")
+        XCTAssertEqual(predicted["active"], false)
+        predicted = try await control("pause")
+        XCTAssertEqual(predicted["state"], "paused")
+        predicted = try await control("togglePause")
+        XCTAssertEqual(predicted["state"], "paused")
+        predicted = try await control("hide")
+        XCTAssertEqual(predicted["visible"], false)
+        predicted = try await control("toggleVisibility")
+        XCTAssertEqual(predicted["visible"], false, "on the notebook canvas K would hide the bar")
+        XCTAssertEqual(keeper.engine.state, .running)
+        XCTAssertTrue(keeper.barVisible, "no preview changed the session")
+        try await h.run("timer.control", ["action": "pause"])
+        predicted = try await control("resume")
+        XCTAssertEqual(predicted["state"], "running")
+        XCTAssertEqual(keeper.engine.state, .paused)
+    }
+
+    func testFinishedInTheBackgroundLeavesTheNotificationToFire() async throws {
+        let (h, keeper, notifier, clock) = try make()
+        try await h.run("timer.start", ["seconds": 30])
+        let id = keeper.engine.id
+        keeper.isForeground = false                      // Nib kept alive in the background (an audio recording)
+        clock.advance(30)
+        keeper.tick()
+        XCTAssertEqual(keeper.engine.state, .finished)
+        XCTAssertFalse(notifier.cancelled.contains(id), "the scheduled alert is how the user hears of the end")
+        XCTAssertNotNil(notifier.scheduled[id])
+        XCTAssertEqual(notifier.chimes, 0)
+        XCTAssertEqual(keeper.loadHistory().count, 1, "it is saved all the same")
+
+        keeper.isForeground = true
+        try await h.run("timer.control", ["action": "stop"])
+        XCTAssertTrue(notifier.cancelled.contains(id), "clearing the finished timer removes its alert")
+    }
+
+    func testFinishedInTheForegroundChimesWhereNothingShowsIt() async throws {
+        let (h, keeper, notifier, clock) = try make()
+        XCTAssertFalse(keeper.finishNeedsAlert(), "a notebook canvas shows the bar")
+        try await h.run("timer.start", ["seconds": 30])
+        clock.advance(31)
+        keeper.tick()
+        XCTAssertEqual(notifier.chimes, 0, "the bar shows it on the canvas")
+        XCTAssertTrue(notifier.cancelled.contains(keeper.engine.id), "in the foreground the system alert is not needed")
+
+        h.session.document = Fixtures.textDocID          // no bar in a text document
+        XCTAssertTrue(keeper.finishNeedsAlert())
+        try await h.run("timer.start", ["seconds": 30])
+        clock.advance(31)
+        keeper.tick()
+        XCTAssertEqual(notifier.chimes, 1)
+
+        h.session.document = nil                         // the library
+        XCTAssertTrue(keeper.finishNeedsAlert())
+        keeper.panelOpen = true
+        XCTAssertFalse(keeper.finishNeedsAlert(), "the open panel shows it")
+        keeper.panelOpen = false
+        keeper.isForeground = false
+        XCTAssertFalse(keeper.finishNeedsAlert(), "in the background the notification does it")
+
+        keeper.isForeground = true
+        try await h.run("timer.start", ["seconds": 30])
+        clock.advance(600)                               // noticed long after the end (a relaunch): no alert
+        keeper.tick()
+        XCTAssertEqual(notifier.chimes, 1)
+    }
+
+    func testLeavingTheTimersDocumentAsksOnce() async throws {
+        let (h, keeper, _, clock) = try make()
+        var asked: [NibID] = []
+        keeper.onLeaveDocument = { asked.append($0) }
+        func move(_ s: EditorSession, to doc: DocumentID?) {
+            s.document = doc
+            keeper.sessionMoved(s.id, to: doc.map { NodeRef.document($0).description } ?? "")
+        }
+
+        try await h.run("timer.start", ["seconds": 600])
+        move(h.session, to: Fixtures.textDocID)
+        XCTAssertEqual(asked, [h.session.id], "leaving the timer's document asks")
+        move(h.session, to: nil)
+        XCTAssertEqual(asked.count, 1, "moving on between other documents does not ask again")
+
+        // Another window still shows the document.
+        move(h.session, to: Fixtures.docID)
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+        move(other, to: Fixtures.docID)
+        h.app.services.sessions.activate(h.session)
+        move(h.session, to: Fixtures.textDocID)
+        XCTAssertEqual(asked.count, 1, "the document is still on screen in another window")
+
+        // The window that leaves is not the active one (h.session is): it is asked once it is.
+        move(other, to: nil)
+        XCTAssertEqual(asked.count, 1, "waits for the window that left")
+        keeper.presentLeavePromptIfReady()               // another scene became active
+        XCTAssertEqual(asked.count, 1, "still not the window that left")
+        h.app.services.sessions.activate(other)
+        keeper.presentLeavePromptIfReady()               // its scene became active
+        XCTAssertEqual(asked, [h.session.id, other.id])
+        keeper.presentLeavePromptIfReady()
+        XCTAssertEqual(asked.count, 2, "asked once")
+
+        // A finished countdown has nothing left to stop.
+        move(h.session, to: Fixtures.docID)
+        try await h.run("timer.start", ["seconds": 30])
+        clock.advance(31)
+        keeper.tick()
+        move(h.session, to: Fixtures.textDocID)
+        XCTAssertEqual(asked.count, 2)
+
+        // A stopwatch started outside any document belongs to none.
+        try await h.run("timer.control", ["action": "stop"])
+        move(h.session, to: nil)
+        try await h.run("stopwatch.start")
+        XCTAssertNil(keeper.engine.doc)
+        move(h.session, to: Fixtures.docID)
+        move(h.session, to: Fixtures.textDocID)
+        XCTAssertEqual(asked.count, 2)
+    }
+
+    func testHostileHistoryRecordsNeverTrap() async throws {
+        let (h, keeper, _, _) = try make()
+        let lap: JSONValue = ["index": 1, "total": 1e19, "split": 1e19]
+        let hostile: JSONValue = ["kind": "timer", "startedAt": 1e300, "elapsed": 1e19, "duration": 1e19,
+                                  "laps": .array([lap])]
+        // Synced prefs written by another device or a prefs file skip the schema check.
+        h.app.settings.setJSON("timer.history.HOSTILE", hostile)
+        let history = keeper.loadHistory()
+        let record = try XCTUnwrap(history.first)
+        XCTAssertEqual(record.elapsed, TimerBounds.maxRecorded)
+        XCTAssertEqual(record.duration, Double(TimerEngine.maxSeconds))
+        // What the history row draws.
+        XCTAssertEqual(TimerFormat.clock(record.elapsed), "2400:00:00")
+        let firstLap = try XCTUnwrap(record.laps.first)
+        XCTAssertEqual(TimerFormat.lap(firstLap.total), "2400:00:00.0")
+        let out = try await h.run("timer.history")
+        XCTAssertEqual(out["sessions"]?.arrayValue?.count, 1)
+
+        // settings.set (the AI's and plugins' path) is checked against the tightened schema.
+        await expectError(.invalidParams, "elapsed beyond the cap") {
+            try await h.run("settings.set", ["name": "timer.history.AI", "value": ["elapsed": 1e19]])
+        }
+        await expectError(.invalidParams, "duration beyond 24 hours") {
+            try await h.run("settings.set", ["name": "timer.history.AI", "value": ["duration": 1e19]])
+        }
+        let bad: JSONValue = ["total": -1, "split": 1]
+        await expectError(.invalidParams, "negative lap") {
+            try await h.run("settings.set", ["name": "timer.history.AI", "value": ["laps": .array([bad])]])
+        }
+        XCTAssertNil(h.app.settings.json("timer.history.AI"))
     }
 
     func testTwoDevicesKeepEverySessionAndModeOneKeyEach() async throws {
@@ -321,5 +478,6 @@ final class FeatTimeKeeperTests: XCTestCase {
         notifier.schedule(id: "X", at: Date().addingTimeInterval(60), title: "t", body: "b")
         notifier.cancel(id: "X")
         notifier.requestAuthorizationIfNeeded {}
+        notifier.chime()
     }
 }

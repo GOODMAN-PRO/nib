@@ -31,7 +31,7 @@ struct TimerStatus: Codable, Equatable {
         kind = e.isActive ? e.kind : nil
         state = e.state
         label = e.label
-        seconds = e.isActive && e.kind == .timer ? Int(e.duration.rounded()) : nil
+        seconds = e.isActive && e.kind == .timer ? e.seconds : nil
         elapsed = (e.elapsed(at: t) * 10).rounded() / 10
         remaining = e.isActive && e.kind == .timer ? (e.remaining(at: t) * 10).rounded() / 10 : nil
         endsAt = e.endDate?.timeIntervalSince1970
@@ -79,10 +79,21 @@ final class TimeKeeper: ObservableObject {
     private(set) var instantVisibility = false
     /// The Time Keeper panel is on screen (its view reports this).
     var panelOpen = false
+    /// Nib is in the foreground (set from the app's active and background notifications in `begin`; tests set it).
+    /// In the background the scheduled notification is how a countdown's end is heard, so a finish noticed then
+    /// leaves it to fire.
+    var isForeground = true
+    /// Runs instead of the leave-document alert, with the window that left (tests).
+    var onLeaveDocument: (@MainActor (NibID) -> Void)?
 
     private var ticker: Task<Void, Never>?
     /// Last "doc:<id>" (or "") each window showed, to notice leaving the session's document.
     private var lastDocs: [NibID: String] = [:]
+    /// The window that left the session's document while another window was the active one: it is asked once it
+    /// becomes active.
+    private var pendingLeave: NibID?
+    /// The "Time's up" alert on screen, dismissed when the session ends another way.
+    private weak var finishAlert: UIAlertController?
     private var subscriptions: Set<AnyCancellable> = []
     private var events: EventSubscription?
 
@@ -186,6 +197,8 @@ final class TimeKeeper: ObservableObject {
         if save, engine.state != .finished, let record = engine.record(endingAt: t) { store(record) }
         engine = .idle
         now = t
+        pendingLeave = nil
+        dismissFinishAlert()
         stopTicking()
         persist()
     }
@@ -219,16 +232,64 @@ final class TimeKeeper: ObservableObject {
         }
         now = t
         if let record = engine.record(endingAt: t) { store(record) }
-        notifier.cancel(id: engine.id)
+        // In the foreground the scheduled notification is not needed (the system would not show it). In the
+        // background (Nib kept alive, say by an audio recording) it is how the user hears of the end: this tick
+        // lands at about the moment it fires, and cancelling would remove it before or right after delivery.
+        if isForeground { notifier.cancel(id: engine.id) }
         instantVisibility = false
         barVisible = true
         stopTicking()
         persist()
         // A countdown that ended long ago (noticed after a relaunch) shows "Time's up" without an alert.
         let late = t.timeIntervalSince(engine.endedAt ?? t) > 60
-        guard !NibApp.isHostlessTest, !late else { return }
-        NibHaptics.play(.success)
-        UIAccessibility.post(notification: .announcement, argument: String(localized: "Time's up"))
+        guard isForeground, !late else { return }
+        if !NibApp.isHostlessTest {
+            NibHaptics.play(.success)
+            UIAccessibility.post(notification: .announcement, argument: String(localized: "Time's up"))
+        }
+        if finishNeedsAlert() {
+            notifier.chime()
+            presentFinishAlert()
+        }
+    }
+
+    /// A countdown that ends in the foreground where neither the bar nor the panel shows it (the library, Settings,
+    /// a text document, a study set) needs an alert: iPad has no haptics and VoiceOver's announcement reaches only
+    /// VoiceOver users.
+    func finishNeedsAlert() -> Bool {
+        isForeground && !panelOpen && !showsBar(in: app?.services.sessions.active)
+    }
+
+    /// "Time's up" with Start Again and Done, on the active window.
+    private func presentFinishAlert() {
+        guard !NibApp.isHostlessTest, engine.state == .finished, let navigator = app?.ui.activeNavigator else { return }
+        dismissFinishAlert()
+        let seconds = engine.seconds
+        let label = engine.label
+        let alert = UIAlertController(title: String(localized: "Time's up"), message: finishMessage(),
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: String(localized: "Start Again"), style: .default) { [weak self, weak navigator] _ in
+            var params: [String: JSONValue] = ["seconds": .number(Double(seconds))]
+            if let label { params["label"] = .string(label) }
+            self?.perform("timer.start", .object(params), session: navigator?.session)
+        })
+        alert.addAction(UIAlertAction(title: String(localized: "Done"), style: .cancel) { [weak self] _ in
+            self?.perform("timer.control", ["action": "stop"])
+        })
+        finishAlert = alert
+        navigator.presentModal(alert)
+    }
+
+    private func dismissFinishAlert() {
+        guard let alert = finishAlert else { return }
+        finishAlert = nil
+        if alert.presentingViewController != nil, !alert.isBeingDismissed { alert.dismiss(animated: true) }
+    }
+
+    /// "Essay plan has finished." or "Your 25 min timer has finished." (the notification and the alert).
+    private func finishMessage() -> String {
+        if let label = engine.label { return String(localized: "\(label) has finished.") }
+        return String(localized: "Your \(TimerFormat.short(engine.seconds)) timer has finished.")
     }
 
     private func startTicking() {
@@ -250,13 +311,7 @@ final class TimeKeeper: ObservableObject {
 
     private func scheduleNotification() {
         guard let end = engine.endDate else { return }
-        let body: String
-        if let label = engine.label {
-            body = String(localized: "\(label) has finished.")
-        } else {
-            body = String(localized: "Your \(TimerFormat.short(Int(engine.duration.rounded()))) timer has finished.")
-        }
-        notifier.schedule(id: engine.id, at: end, title: String(localized: "Time's up"), body: body)
+        notifier.schedule(id: engine.id, at: end, title: String(localized: "Time's up"), body: finishMessage())
     }
 
     // MARK: Storage (settings are written here, inside the command layer)
@@ -272,7 +327,8 @@ final class TimeKeeper: ObservableObject {
     /// Picks up the session saved before a relaunch; a countdown that ended meanwhile is finished and recorded.
     func restore() {
         guard let json = settings.json(Keys.active.name), json != .null,
-              let snapshot = try? json.decode(TimeKeeperSnapshot.self), snapshot.engine.isActive else { return }
+              let snapshot = try? json.decode(TimeKeeperSnapshot.self), snapshot.engine.isActive,
+              snapshot.engine.isSane else { return }
         engine = snapshot.engine
         barVisible = snapshot.barVisible
         tick()
@@ -340,6 +396,7 @@ final class TimeKeeper: ObservableObject {
     // MARK: Lifecycle (called from the feature's start)
 
     func begin() {
+        if !NibApp.isHostlessTest { isForeground = UIApplication.shared.applicationState != .background }
         restore()
         refreshStored()
         guard let app else { return }
@@ -352,7 +409,20 @@ final class TimeKeeper: ObservableObject {
         }
         NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.tick() }
+            .sink { [weak self] _ in
+                self?.isForeground = true
+                self?.tick()
+            }
+            .store(in: &subscriptions)
+        NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.isForeground = false }
+            .store(in: &subscriptions)
+        // A window that left the session's document while another was active is asked when it becomes active
+        // (delivered on the next main-queue turn, after the shell has made it the active navigator).
+        NotificationCenter.default.publisher(for: UIScene.didActivateNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.presentLeavePromptIfReady() }
             .store(in: &subscriptions)
         // Modes and history saved on another device arrive through the synced settings.
         NotificationCenter.default.publisher(for: SettingsStore.didChange, object: settings)
@@ -365,13 +435,51 @@ final class TimeKeeper: ObservableObject {
             .store(in: &subscriptions)
     }
 
-    /// A window moved away from the document the running session belongs to: offer to stop and save it.
+    /// A window moved away from the document the running session belongs to: offer to stop and save it, unless
+    /// another window still shows that document. The offer appears on that window once it is the active one.
     func sessionMoved(_ session: NibID, to doc: String) {
         let previous = lastDocs[session]
         lastDocs[session] = doc
-        guard let timerDoc = engine.doc, previous == timerDoc, doc != timerDoc,
-              engine.state == .running || engine.state == .paused else { return }
-        promptToStop()
+        if let timerDoc = engine.doc, previous == timerDoc, doc != timerDoc, isOngoing,
+           !isShown(timerDoc, besides: session) {
+            pendingLeave = session
+        }
+        presentLeavePromptIfReady()
+    }
+
+    /// Running or paused: a finished countdown is already saved and has nothing left to stop.
+    private var isOngoing: Bool { engine.state == .running || engine.state == .paused }
+
+    /// A window other than `session` shows the document.
+    private func isShown(_ doc: String, besides session: NibID) -> Bool {
+        app?.services.sessions.sessions.contains { other in
+            other.id != session && other.document.map { NodeRef.document($0).description } == doc
+        } ?? false
+    }
+
+    /// The window the user is in: the active navigator's, else the active session's (hostless tests have no
+    /// navigator; the shell sets both together).
+    private var activeWindow: NibID? {
+        app?.ui.activeNavigator?.session.id ?? app?.services.sessions.active?.id
+    }
+
+    /// Asks the window that left the session's document once it is the active one, while that still matters: the
+    /// session is running or paused, the window has not gone back to the document, no other window shows it and the
+    /// window is still open. Called on every window move and whenever a scene becomes active.
+    func presentLeavePromptIfReady() {
+        guard let session = pendingLeave else { return }
+        guard let timerDoc = engine.doc, isOngoing, lastDocs[session] != timerDoc, !isShown(timerDoc, besides: session),
+              app?.services.sessions.session(session) != nil else {
+            pendingLeave = nil
+            return
+        }
+        guard activeWindow == session else { return }
+        pendingLeave = nil
+        if let hook = onLeaveDocument {
+            hook(session)
+        } else {
+            promptToStop()
+        }
     }
 
     private func promptToStop() {
@@ -471,7 +579,7 @@ struct TimerControl: NibCommand {
         }
         let keeper = try TimeKeeper.require(ctx)
         if action == .pause || action == .resume || action == .togglePause { try requireRunning(keeper.engine) }
-        guard !ctx.dryRun else { return keeper.status() }
+        guard !ctx.dryRun else { return predicted(action, keeper, ctx) }
         let instant = p.instant ?? false
         switch action {
         case .pause:
@@ -502,6 +610,32 @@ struct TimerControl: NibCommand {
             await openPanel(ctx)
         }
         return keeper.status()
+    }
+
+    /// The status `action` would leave (dry runs), worked out on a copy of the session.
+    static func predicted(_ action: Action, _ keeper: TimeKeeper, _ ctx: CommandContext) -> TimerStatus {
+        let t = keeper.clock()
+        var e = keeper.engine
+        var visible = keeper.barVisible
+        switch action {
+        case .pause:
+            e.pause(at: t)
+        case .resume:
+            e.resume(at: t)
+        case .togglePause:
+            if e.state == .running { e.pause(at: t) } else { e.resume(at: t) }
+        case .stop, .discard:
+            e = .idle
+        case .show:
+            visible = true
+        case .hide:
+            visible = false
+        case .toggleVisibility:
+            if e.isActive && keeper.showsBar(in: ctx.activeSession) { visible.toggle() }
+        case .open:
+            break
+        }
+        return TimerStatus(e, at: t, visible: visible)
     }
 
     static func requireRunning(_ e: TimerEngine) throws {
