@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatShapeRecognition/ShapeRecognizer.swift:385-457 (fitArc, fitParabola) and :830-851 (ShapeGeometry.outline .arc/.curve); NibKit/Tests/FeatShapeRecognitionTests/ShapeRecognizerTests.swift:301 (testArcPassesThroughItsThreePoints)",
+      "problem": "Recognised arcs and curves put the middle of their 3 points on the curve. The contract (CONTRACTS.md: ShapeItem.points are 'Vertices / control points') and the shape renderer that owns these kinds (F031 ShapeDrawer: 'Curves and arcs treat their points as control points'; 3 curve points = quadratic Bezier (start, control, end), 3 arc points = conic with control c) read the middle point as a control point. So every recognised curve is drawn with half its bulge once shape.create commits it. An arc is drawn with about 46% of its bulge at a 120 deg sweep, and arcs over 180 deg (fitArc accepts up to 330 deg) come out as a shallow bump. The shape jumps on lift, and the AI's shape.recognize -> shape.create path produces the wrong geometry too.",
+      "fix": "Emit control-point form. For curves, return [at(0), 2*at(0.5) - (at(0)+at(1))/2, at(1)]. For arcs, cap the span at about 170 deg and return [start, the intersection of the tangents at start and end (c + R/cos(span/2) along the mid-angle), end]. With F031's conicWeight = cos(span/2) that is an exact circular arc. When the span is 170 deg or more, emit a .curve with sampled B-spline control points, or let the stroke fall through to ellipse/polyline. Change ShapeGeometry.outline to draw .curve as a quadratic with control p[1] and .arc as the rational conic, so the live preview matches the committed shape. Rewrite the arc test to check that the outline lies on the circle and that points[1] is the tangent intersection."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatShapeRecognition/DrawShapeTool.swift:124-135 (snapToNeighbours)",
+      "problem": "In the Draw Shape tool, Snap to Other Shapes only gets the shapes whose bounds meet the new shape's bounds plus 12 pt. ShapeSnapper keeps extending the chain through merged neighbours but can never reach a shape outside that first query. The most common loop-closing case therefore fails. With a box drawn as 4 separate lines, drawing the 4th side joins the top and bottom lines into a 3-sided polyline, while the opposite side is outside the query area, so it stays a separate line and no polygon is made. The unit test (testClosingTheLoopMakesOnePolygon) passes a hand-built complete neighbour list, so it never exercises the tool path.",
+      "fix": "Build the neighbour set from the connected component, not from a single rect. Either pass every shape on the page's active, visible layer (pages hold few shapes; this is still O(n)), or loop: query items around each newly exposed chain end (radius 12) until a pass adds nothing, then call ShapeSnapper.snap once with the union. Add a FakeCanvasHost test that seeds 3 sides of a square as line items, draws the 4th side, and asserts that item.delete gets all 3 refs and shape.create gets shape 'polygon' with 4 points."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapeRecognition/DrawShapeTool.swift:51-54 (deactivate)",
+      "problem": "Switching tools during Draw and Hold (for example a Pencil Pro squeeze or double-tap, or a keyboard shortcut, while the Pencil is still resting) sets hold = nil and clears the preview. The canvas has already cancelled the wet stroke, so the drawing is lost without an ink fallback. touchesCancelled correctly keeps it.",
+      "fix": "In deactivate, if let h = hold { host.commitStroke(h.stroke, page: h.page) } before clearing hold and the preview. Add a test next to testCancelledHoldKeepsTheInk."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapeRecognition/DrawShapeTool.swift:137-142 (didSnap), :79-88 (strokeHeld)",
+      "problem": "The haptic on snap is not heard for Draw and Hold. didSnap runs from strokeHeld while the Pencil is down, and NibHaptics.play is silent while inking (DESIGN.md §11; DropletField sets NibHaptics.isInking). The Pencil Pro path (T-117) depends on an undeclared 'shape.snapped' event that F043 does not know about, and its payload has no location, which UICanvasFeedbackGenerator.pathCompleted(at:) and alignmentOccurred(at:) need.",
+      "fix": "Add the snap location (a 'point' [x, y] in page points, e.g. the grab point or the stroke's last point) to the shape.snapped payload. Also play NibHaptics.play(.snap) in touchesEnded for the hold path, when the Pencil lifts. Ask the orchestrator to raise a contract request (a NibEventType constant for shape.snapped, consumed by F043); do not add the file on this branch."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapeRecognition/DrawShapeTool.swift:241-274 (ShapeCommit.create failure path)",
+      "problem": "When item.delete succeeds and shape.create then fails, app.bus.revert(group:doc:) is used. It records a new 'Revert …' undo step, so the user's undo stack gains an entry that deletes the neighbours again when undone. The fallback also depends on the host being alive: [weak host] at line 150 drops the ink when the canvas has gone away.",
+      "fix": "Run shape.create first and item.delete second, in the same group. If the delete fails, keep both (no data loss) and log; no revert is needed. If host is nil, keep the stroke through the bus (CommandIDs ink.addStrokes with the stroke) instead of dropping it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapeRecognition/RecognitionCommands.swift:88-93 (neighbours, page ref)",
+      "problem": "shape.recognize with a page ref marks every unlocked shape mergeable, including shapes on hidden layers and on other layers. The tool only merges shapes on the active layer, so an AI or plugin following mergeWith would delete shapes that the user's own drawing would never merge.",
+      "fix": "For page refs, set mergeable: !item.locked && item.layer == (ctx.activeSession?.activeLayer ?? item.layer) and skip items on ctx.activeSession?.hiddenLayers. Document this in the neighbors schema string."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapeRecognition/DrawShapeTool.swift:202-203",
+      "problem": "The ids of other features' commands are written as string literals ('item.delete', 'item.transform') although CommandIDs.itemDelete and CommandIDs.itemTransform exist (ARCHITECTURE §15.4).",
+      "fix": "Use CommandIDs.itemDelete and CommandIDs.itemTransform."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatShapeRecognitionTests/*",
+      "problem": "Risky paths have no coverage: the tilted box path (the item.transform call with rotate in degrees about the centre), the create-fails-after-delete rollback, 5+ vertex polygons (they compete with the 0.55-weighted ellipse), parabola curves, and tilted ellipses.",
+      "fix": "Add tests. (1) A 20 deg tilted rectangle stroke through the tool, with stand-ins returning a ref: assert that item.transform gets rotate of about 20 and origin at the centre, in the same group. (2) A shape.create stand-in that throws: assert that the neighbours are not deleted and that the stroke is committed as ink. (3) A clean hexagon becomes a polygon with 6 points. (4) A shallow parabola becomes a curve. (5) A tilted ellipse keeps its rotation."
+    }
+  ]
+}
