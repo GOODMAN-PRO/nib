@@ -261,6 +261,40 @@ final class InkTypesetterTests: XCTestCase {
         }
     }
 
+    func testZZDiagnoseDivideSign() {
+        var msg = "\n"
+        for family in InkSynthFont.allCases {
+            let font = family.font(size: 18)
+            let attributes: [NSAttributedString.Key: Any] = [NSAttributedString.Key(kCTFontAttributeName as String): font]
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: "÷", attributes: attributes) as CFAttributedString)
+            for run in CTLineGetGlyphRuns(line) as! [CTRun] {
+                let runFont = (CTRunGetAttributes(run) as NSDictionary)[kCTFontAttributeName as String] as! CTFont
+                var g = CGGlyph(0)
+                CTRunGetGlyphs(run, CFRange(location: 0, length: 1), &g)
+                let big = CTFontCreateCopyWithAttributes(runFont, 96, nil, nil)
+                guard let path = CTFontCreatePathForGlyph(big, g, nil) else { continue }
+                var contours = 0
+                path.applyWithBlock { e in if e.pointee.type == .moveToPoint { contours += 1 } }
+                let box = path.boundingBoxOfPath
+                msg += "\(family) run font \(CTFontCopyPostScriptName(runFont)) glyph \(g) contours \(contours) box \(box)\n"
+                let w = Int(box.width.rounded(.up)) + 4, h = Int(box.height.rounded(.up)) + 4
+                guard let bm = InkBitmap.render(path, width: w, height: h,
+                                                transform: CGAffineTransform(translationX: 2 - box.minX, y: 2 - box.minY))
+                else { continue }
+                var g2 = [UInt8](repeating: 0, count: (w + 2) * (h + 2))
+                for y in 0..<h { for x in 0..<w where bm.pixels[y * w + x] == 1 { g2[(y + 1) * (w + 2) + x + 1] = 1 } }
+                msg += "components \(GlyphSkeleton.components(g2, width: w + 2, height: h + 2).map { $0.count })\n"
+                let lines = GlyphSkeleton.centreLines(of: bm)
+                msg += "centre-lines \(lines.count): \(lines.map { l in l.map { "(\(Int($0.x)),\(Int($0.y)))" }.joined() })\n"
+                for y in 0..<h {
+                    let row: [Character] = bm.pixels[(y * w)..<((y + 1) * w)].map { $0 == 1 ? "#" : "." }
+                    msg += String(row) + "\n"
+                }
+            }
+        }
+        XCTFail(msg)
+    }
+
     func testFontNamesAreLenient() {
         XCTAssertEqual(InkSynthFont(name: "Bradley Hand"), .bradleyHand)
         XCTAssertEqual(InkSynthFont(name: "marker-felt"), .markerFelt)
