@@ -255,6 +255,58 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(Set(h.session.selection.items), [Fixtures.shapeID, Fixtures.stickyID])
     }
 
+    func testCopyingToAPageLeavesTheOriginalsAndLinksTheCopies() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let before = try h.snapshot()
+        let depth = h.undoDepth(doc)
+        let shapeCopy: ElementID = "SHAPECOPY001", noteCopy: ElementID = "NOTECOPY0001"
+        let params: JSONValue = ["refs": .array([ref(Fixtures.shapeID), ref(Fixtures.stickyID)]),
+                                 "page": "page:FIXTUREDOC01/FIXTUREPG002", "offset": [0, 40], "copy": true,
+                                 "ids": ["SHAPECOPY001", "NOTECOPY0001"]]
+        let out = try await h.run("item.moveToPage", params)
+        XCTAssertEqual(out["moved"], .array([ref(shapeCopy, on: page2), ref(noteCopy, on: page2)]))
+        XCTAssertEqual(try item(h, Fixtures.shapeID).shape?.frame.y, 200, "the originals stay")
+        XCTAssertEqual(try item(h, Fixtures.connectorID).connector?.from.item, Fixtures.shapeID)
+        XCTAssertEqual(try item(h, shapeCopy, on: page2).shape?.frame.y, 240)
+        let copies = try h.app.workspace.items(doc, page: page2)
+        XCTAssertEqual(copies.count, 3, "the connector between them is copied too")
+        let line = try XCTUnwrap(copies.first { $0.kind == .connector }?.connector)
+        XCTAssertEqual(line.from.item, shapeCopy)
+        XCTAssertEqual(line.to.item, noteCopy)
+        XCTAssertEqual(line.from.point, Point(260, 285))
+        XCTAssertEqual(h.undoDepth(doc), depth + 1)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testCopyIDsAreCheckedAndACopyCanStayOnItsPage() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let refs = JSONValue.array([ref(Fixtures.shapeID)])
+        let before = try h.snapshot()
+        let refused: [(JSONValue, String)] = [
+            (["refs": refs, "page": "page:FIXTUREDOC01/FIXTUREPG002", "ids": ["SHAPECOPY001"]], "$.ids"),
+            (["refs": refs, "page": "page:FIXTUREDOC01/FIXTUREPG001", "copy": true, "ids": ["FIXTURESTY01"]], "$.ids[0]"),
+            (["refs": refs, "page": "page:FIXTUREDOC01/FIXTUREPG002", "copy": true, "ids": ["A", "A"]], "$.ids[1]")
+        ]
+        for (params, path) in refused {
+            do {
+                try await h.run("item.moveToPage", params)
+                XCTFail("accepted \(params.jsonString())")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams, params.jsonString())
+                XCTAssertEqual(e.path, path, params.jsonString())
+            }
+        }
+        XCTAssertEqual(try h.snapshot(), before)
+        let out = try await h.run("item.moveToPage", ["refs": refs, "page": "page:FIXTUREDOC01/FIXTUREPG001",
+                                                      "copy": true, "offset": [20, 20]])
+        let moved = try XCTUnwrap(out["moved"]?.arrayValue?.first?.stringValue)
+        guard case let .item(_, _, copyID)? = NodeRef(moved) else { return XCTFail("not an item ref: \(moved)") }
+        XCTAssertNotEqual(copyID, Fixtures.shapeID)
+        XCTAssertEqual(try item(h, copyID).shape?.frame.x, 120)
+        XCTAssertEqual(try item(h, Fixtures.shapeID).shape?.frame.x, 100)
+    }
+
     // MARK: Handles attachment
 
     func testHandleLayoutPicksTheNearestHandle() {
@@ -421,6 +473,32 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(doc), depth + 1, "the copy and its move are one undo step")
         XCTAssertTrue(h.app.bus.undo(doc))
         XCTAssertThrowsError(try item(h, copyID))
+        XCTAssertEqual(try item(h, Fixtures.shapeID).shape?.frame.x, 100)
+    }
+
+    func testOptionDropOnAnotherPageCopiesThereInOneUndoStep() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        h.app.settings.set(NibSettings.alignObjects, false)
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        let before = try h.snapshot()
+        let depth = h.undoDepth(doc)
+        XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 245), host: host))
+        handles.touchesBegan(sample(page1, 180, 245, [.option]), host: host)
+        handles.touchesMoved([sample(page2, 180, 100, [.option])], host: host)
+        handles.touchesEnded(sample(page2, 180, 100, [.option]), host: host)
+        await handles.pendingCommit?.value
+        XCTAssertEqual(try item(h, Fixtures.shapeID).shape?.frame.y, 200, "the original stays")
+        XCTAssertEqual(try item(h, Fixtures.connectorID).connector?.from.item, Fixtures.shapeID, "and keeps its connector")
+        XCTAssertEqual(h.session.selection.page, page2)
+        let copyID = try XCTUnwrap(h.session.selection.items.first)
+        let copy = try XCTUnwrap(try item(h, copyID, on: page2).shape?.frame)
+        XCTAssertEqual(copy.x, 100, accuracy: 1e-6)
+        XCTAssertEqual(copy.y, 55, accuracy: 1e-6)
+        XCTAssertEqual(h.undoDepth(doc), depth + 1)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(), before)
     }
 
     func testShiftRotationTurnsInFifteenDegreeSteps() async throws {

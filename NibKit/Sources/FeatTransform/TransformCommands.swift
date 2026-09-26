@@ -159,6 +159,24 @@ enum TransformGraph {
         return out
     }
 
+    /// A copied connector's anchors pointed at the copies (`fresh`: original id → copy id); an end anchored to
+    /// anything that was not copied becomes a free end at its point.
+    static func remapping(_ connector: Item, _ fresh: [ElementID: ElementID]) -> Item {
+        guard var c = connector.connector else { return connector }
+        func remap(_ end: ConnectorEnd) -> ConnectorEnd {
+            guard let id = end.item else { return end }
+            guard let twin = fresh[id] else { return ConnectorEnd(point: end.point) }
+            var e = end
+            e.item = twin
+            return e
+        }
+        c.from = remap(c.from)
+        c.to = remap(c.to)
+        var out = connector
+        out.connector = c
+        return out
+    }
+
     /// Drops the anchors of ends whose target matches (the end keeps its point).
     static func detaching(_ connector: Item, where shouldDetach: (ElementID) -> Bool) -> Item {
         guard var c = connector.connector else { return connector }
@@ -246,8 +264,9 @@ enum TransformTargets {
 
 @MainActor
 enum TransformWriter {
-    /// Live items of a page by id, after checking every target exists and is not locked.
-    private static func checked(_ refs: [TargetRef], _ items: [Item], page: PageID) throws -> [ElementID: Item] {
+    /// Live items of a page by id, after checking every target exists and (unless `allowLocked`) is not locked.
+    private static func checked(_ refs: [TargetRef], _ items: [Item], page: PageID,
+                                allowLocked: Bool = false) throws -> [ElementID: Item] {
         var byID: [ElementID: Item] = [:]
         for it in items { byID[it.id] = it }
         for r in refs {
@@ -255,7 +274,7 @@ enum TransformWriter {
                 throw NibError(.notFound, "item \(r.id) not found on page \(page)", path: r.path,
                                hint: "call query.find to list the page's items")
             }
-            guard !it.locked else {
+            guard allowLocked || !it.locked else {
                 throw NibError(.invalidParams, "item \(r.id) is locked", path: r.path,
                                hint: "unlock it first with item.setLocked {refs, locked: false}")
             }
@@ -345,6 +364,50 @@ enum TransformWriter {
         }
         return placed.filter { targets.contains($0.id) }
     }
+
+    /// Puts copies of the targets and everything travelling with them on `dest` (which may be `src`), `offset` away,
+    /// and leaves the originals untouched; returns the targets' copies. Copies take the caller's `ids` from `next`
+    /// on, in creation order (the targets in `refs` order, then what travels with them bottom first), then minted
+    /// ones. Links inside the copied set point at the copies; links to anything left behind are dropped.
+    /// Every record is written once, so the copy undoes in one step: DocTransaction.revert cannot undo a record that
+    /// one undo group writes twice, which rules out item.duplicate followed by item.moveToPage for a copy.
+    static func copy(_ refs: [TargetRef], doc: DocumentID, from src: PageID, to dest: PageID, offset: Point?,
+                     ids: [ElementID], next: inout Int, tx: DocTransaction) throws -> [Item] {
+        let items = try tx.items(doc, page: src)
+        _ = try checked(refs, items, page: src, allowLocked: true)   // a copy leaves a locked original as it is
+        let copied = TransformGraph.closure(Set(refs.map(\.id)), in: items)
+        var order: [ElementID] = []
+        var seen = Set<ElementID>()
+        for r in refs where seen.insert(r.id).inserted { order.append(r.id) }
+        for it in items where copied.contains(it.id) && seen.insert(it.id).inserted { order.append(it.id) }
+        let taken = try Set(tx.items(doc, page: dest).map(\.id))
+        var fresh: [ElementID: ElementID] = [:]
+        for id in order {
+            guard next < ids.count else {
+                fresh[id] = NibID.make()
+                continue
+            }
+            guard !taken.contains(ids[next]) else {
+                throw NibError(.invalidParams, "an item with id \(ids[next]) already exists on the page",
+                               path: "$.ids[\(next)]", hint: "choose unused ids, or omit ids to get fresh ones")
+            }
+            fresh[id] = ids[next]
+            next += 1
+        }
+        let shift = offset.map { Affine.translation($0.x, $0.y) }
+        var placed: [ElementID: Item] = [:]
+        for it in items where copied.contains(it.id) {                 // bottom first: z order survives the copy
+            guard let id = fresh[it.id] else { continue }
+            var n = shift.map { TransformMath.apply($0, to: it) } ?? it
+            n.id = id
+            n.createdBy = nil                                           // stamped with whoever made the copy
+            n.attachedTo = it.attachedTo.flatMap { fresh[$0] }
+            if n.kind == .connector { n = TransformGraph.remapping(n, fresh) }
+            n.z = try tx.topZ(doc, page: dest)
+            placed[it.id] = try put(n, doc: doc, page: dest, tx: tx)
+        }
+        return refs.compactMap { placed[$0.id] }
+    }
 }
 
 // MARK: - Commands
@@ -416,15 +479,18 @@ struct ItemTransform: NibCommand {
     }
 }
 
-/// item.moveToPage: move items to another page of the same document, keeping their ids.
+/// item.moveToPage: move items to another page of the same document, keeping their ids, or (copy) put copies there.
 struct ItemMoveToPage: NibCommand {
     struct Params: Codable {
         var refs: [String]?
         var page: String
         var offset: [Double]?
+        var copy: Bool?
+        var ids: [String]?
     }
 
     struct Output: Codable {
+        /// Refs of the items now on `page`: the moved items, or with `copy` their copies.
         var moved: [String]
         var page: String
     }
@@ -432,20 +498,28 @@ struct ItemMoveToPage: NibCommand {
     static let descriptor = CommandDescriptor(
         id: "item.moveToPage", title: String(localized: "Move to Page"),
         summary: "Move items to another page of the same document, keeping their ids (refs default to the selection); "
-            + "attached items and connectors travel along; offset shifts them.",
+            + "attached items and connectors travel along; offset shifts them; copy leaves the originals.",
         params: .obj([
             "refs": .arr(.ref, "item refs; omit to use the current selection"),
             "page": .str("destination page ref page:DOC/PAGE"),
             "offset": .arr(.num(min: -TransformMath.limit, max: TransformMath.limit),
-                           "[dx, dy] added on the way, in page points")
+                           "[dx, dy] added on the way, in page points"),
+            "copy": .bool("leave the items where they are and put copies with new ids on the page (the page may be "
+                              + "their own); links inside the copied set point at the copies"),
+            "ids": .arr(.str("your own id, [A-Za-z0-9_-]{1,64}"),
+                        "copy only: caller-chosen ids for the copies, in creation order (the refs' copies first, "
+                            + "then what travels with them)")
         ], required: ["page"]),
         examples: [
             try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"], "page": "page:FIXTUREDOC01/FIXTUREPG002", "offset": [0, 40]}"#),
-            try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01", "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01"], "page": "page:FIXTUREDOC01/FIXTUREPG003"}"#)
+            try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01", "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01"], "page": "page:FIXTUREDOC01/FIXTUREPG003"}"#),
+            try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01", "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01"], "page": "page:FIXTUREDOC01/FIXTUREPG002", "offset": [0, 40], "copy": true, "ids": ["SHAPECOPY001", "NOTECOPY0001"]}"#)
         ],
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        let copying = p.copy ?? false
+        let ids = try chosenIDs(p.ids, copying: copying)
         guard let targets = try TransformTargets.resolve(p.refs, ctx) else { return Output(moved: [], page: p.page) }
         let doc: DocumentID
         let dest: PageID
@@ -461,7 +535,7 @@ struct ItemMoveToPage: NibCommand {
         }
         guard targets.allSatisfy({ $0.doc == doc }) else {
             throw NibError(.unsupported, "items can only move between pages of their own document", path: "$.page",
-                           hint: "use clipboard.cut then clipboard.paste to move items to another document")
+                           hint: "use clipboard.cut (or clipboard.copy) then clipboard.paste to take items to another document")
         }
         guard let record = try ctx.workspace.content(doc).page(dest), !record.deleted else {
             throw NibError(.notFound, "page \(dest) not found in document \(doc)", path: "$.page",
@@ -470,12 +544,39 @@ struct ItemMoveToPage: NibCommand {
         let offset = try p.offset.map { try TransformMath.point($0, path: "$.offset") }
         let groups = TransformTargets.byPage(targets)
         let results = try ctx.mutate { tx -> [[Item]] in
-            try groups.map { try TransformWriter.move($0.refs, doc: doc, from: $0.page, to: record.id, offset: offset, tx: tx) }
+            var next = 0                                              // caller ids are used in order across pages
+            return try groups.map { g -> [Item] in
+                if copying {
+                    return try TransformWriter.copy(g.refs, doc: doc, from: g.page, to: record.id, offset: offset,
+                                                    ids: ids, next: &next, tx: tx)
+                }
+                return try TransformWriter.move(g.refs, doc: doc, from: g.page, to: record.id, offset: offset, tx: tx)
+            }
         }
-        for (g, items) in zip(groups, results) {
-            TransformTargets.follow(ctx, doc: doc, from: g.page, to: record.id, items: items)
+        if !copying {                                                 // a copy leaves the selection on the originals
+            for (g, items) in zip(groups, results) {
+                TransformTargets.follow(ctx, doc: doc, from: g.page, to: record.id, items: items)
+            }
         }
         return Output(moved: results.flatMap { $0 }.map { NodeRef.item(doc, record.id, $0.id).description },
                       page: NodeRef.page(doc, record.id).description)
+    }
+
+    /// Caller-chosen ids for copies: valid and distinct, and only meaningful with `copy`.
+    static func chosenIDs(_ raw: [String]?, copying: Bool) throws -> [ElementID] {
+        guard let raw else { return [] }
+        guard copying else {
+            throw NibError(.invalidParams, "ids name copies", path: "$.ids", hint: "pass copy: true, or leave ids out")
+        }
+        var seen = Set<String>()
+        for (i, s) in raw.enumerated() {
+            guard NibID.isValid(s) else {
+                throw NibError(.invalidParams, "id must be 1-64 of [A-Za-z0-9_-]", path: "$.ids[\(i)]")
+            }
+            guard seen.insert(s).inserted else {
+                throw NibError(.invalidParams, "id '\(s)' is given twice", path: "$.ids[\(i)]")
+            }
+        }
+        return raw.map { NibID($0) }
     }
 }

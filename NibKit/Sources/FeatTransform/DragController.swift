@@ -620,6 +620,9 @@ final class DragController {
         return list?.isEmpty == false ? list : nil
     }
 
+    /// A drag-duplicate writes each copy exactly once: DocTransaction.revert cannot undo a record that one undo group
+    /// writes twice, so "item.duplicate in place, then move the copy" would leave the copy behind on undo. On its own
+    /// page the copy is item.duplicate with the drag as its offset; on another page it is item.moveToPage {copy: true}.
     private func commit(_ plan: Plan) async throws -> Outcome {
         let group = NibID.make().raw                                    // the whole drop is one undo step
         let refs = Self.strings(box.refs)
@@ -628,35 +631,25 @@ final class DragController {
             let inv = Invocation(command: command, params: params, session: host.session, group: group)
             return try await host.app.bus.execute(inv).value
         }
-        /// Copies in place (explicit zero offset), which the transform or move below then places.
-        func copies() async throws -> [String] {
-            let ids = box.items.map { _ in NibID.make().raw }
-            let result = try await run("item.duplicate", ["refs": refs, "ids": Self.strings(ids), "offset": Self.numbers([0, 0])])
-            return Self.refs(in: result) ?? ids.map { NodeRef.item(box.doc, box.page, NibID($0)).description }
-        }
         switch plan {
         case .translate(let d):
             if duplicate {
-                let copied = try await copies()
-                if d != .zero {
-                    _ = try await run(CommandIDs.itemTransform, ["refs": Self.strings(copied), "translate": Self.numbers([d.x, d.y])])
-                }
-                await select(copied)
+                let ids = box.items.map { _ in NibID.make().raw }
+                let result = try await run("item.duplicate", ["refs": refs, "ids": Self.strings(ids),
+                                                              "offset": Self.numbers([d.x, d.y])])
+                await select(Self.refs(in: result) ?? ids.map { NodeRef.item(box.doc, box.page, NibID($0)).description })
                 return Outcome(affine: nil)
             }
             _ = try await run(CommandIDs.itemTransform, ["refs": refs, "translate": Self.numbers([d.x, d.y])])
             return Outcome(affine: .translation(d.x, d.y))
         case .moveToPage(let page, let d):
-            var moving = refs
-            if duplicate {
-                let copied = try await copies()
-                moving = Self.strings(copied)
-            }
-            let result = try await run(CommandIDs.itemMoveToPage, [
-                "refs": moving,
+            var params: [String: JSONValue] = [
+                "refs": refs,
                 "page": .string(NodeRef.page(box.doc, page).description),
                 "offset": Self.numbers([d.x, d.y])
-            ])
+            ]
+            if duplicate { params["copy"] = .bool(true) }
+            let result = try await run(CommandIDs.itemMoveToPage, .object(params))
             await select(result["moved"]?.arrayValue?.compactMap { $0.stringValue } ?? [])
             return Outcome(affine: nil)
         case .matrix(let a):
