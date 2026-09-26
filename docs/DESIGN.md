@@ -374,14 +374,14 @@ Every animated value is a spring from `NibMotion`: k = (2π / response)², c = 4
 
 | Token | Response (s) | ζ | Used for |
 |---|---|---|---|
-| `follow` | 0.085 | 1.00 | A droplet following the finger (one frame of viscosity) |
+| `follow` | 0.085 | 1.00 | A held droplet following the finger. Critically damped: it trails the finger by v × 27 ms (27 pt at 1000 pt/s) and never passes it. That slight lag is the water's weight (§10.1) |
 | `tap` | 0.22 | 0.90 | Button press scale 0.96 |
-| `lift` | 0.30 | 0.72 | Pick-up scale 1 → 1.035–1.05 |
+| `lift` | 0.30 | 0.72 | Pick-up scale 1 → 1.035–1.05; the armed cover's 1.03 swell (§10.12) |
 | `glide` | 0.20 | 1.00 | Selection bead head. A selection indicator never overshoots; tool switching happens tens of times a minute |
 | `trail` | 0.26 | 1.00 | Selection bead tail (the short lag makes the teardrop on long jumps) |
-| `snap` | 0.50 | 0.80 | **The palette's dock only**, starting from the full release velocity (measured overshoot 4 pt) |
+| `snap` | 0.50 | 0.80 | **The palette's dock only** (`.dropletDockable`, `NibToolPalette`), starting from the full release velocity: overshoot 3.5–4.5 pt from a 300 pt throw (11 pt for a 5000 pt/s fling), arrival in 0.25–0.37 s, then one plip (§10.11) |
 | `slot` | 0.40 | 1.00 | Grid and slot snaps (library cards, page thumbnails, floating panels): only the part of the release velocity that points at the slot, capped at 1200 pt/s and at ω·distance, so it never overshoots |
-| `reflow` | 0.44 | 0.86 | Neighbours making room (grid, thumbnails), folder films |
+| `reflow` | 0.44 | 0.86 | Neighbours making room: the library's live reorder (`NibReflow`, §10.12), page thumbnails; folder films |
 | `tether` | 0.40 | 0.62 | Proposal chip flowing back to its dock (one visible overshoot) |
 | `bud` | 0.42 | 0.76 | Popover position while budding |
 | `budSize` | 0.46 | 0.80 | Popover size while budding |
@@ -389,7 +389,7 @@ Every animated value is a spring from `NibMotion`: k = (2π / response)², c = 4
 | `retract` | 0.30 | 0.90 | Popover folding back into its button |
 | `neck` | 0.14 | 1.00 | Neck thickness |
 | `absorb` | 0.22 | 1.00 | Satellite drop and cards flowing into a folder |
-| `wobble` | clamp(0.14·√(minor / 44), 0.14, 0.26) | 0.68 | Surface tension (§10.3): about 5 % overshoot, under one visible cycle |
+| `wobble` | clamp(0.14·√(minor / 44), 0.14, 0.26) | 0.68 | Surface tension (§10.3): with the 33 ms settle lead, one dip of about 6 % of the peak (never over 10 %), under one visible cycle |
 | `thumb` | 0.16 | 0.72 | Slider-thumb stretch |
 | `sheet` | 0.48 | 0.90 | Sheets and panels docking |
 | `reduced` | 0.26 | 1.00 | Replaces every spring under Reduce Motion and Liquid Off (`NibSpring.animation` does this itself) |
@@ -402,6 +402,7 @@ Floors, enforced by review and by the springs' unit tests: stretch springs (`wob
 - A budded droplet's content fades in over 220 ms with blur 3 → 0 pt; it is revealed *through* the droplet, clipped to its shape, and never scales up from 0.
 - Colour changes lead motion: a newly selected tool's glyph reaches full strength within 120 ms, before the bead arrives. Accepting an AI change turns ghost ink into ink over 350 ms.
 - The laser trail fades linearly over 600 ms: the only linear motion in Nib, because it is time made visible.
+- A HUD that answers a gesture (the ruler's angle, the pinch-zoom percentage) lingers **0.6 s** after the fingers lift (`NibMotion.hudLinger`), then fades out with the exit timing (120 ms). While the fingers are down it never fades.
 
 ### 9.3 What never animates
 
@@ -423,7 +424,8 @@ This is the complete behaviour, implemented by `DropletPhysics`, `DropletField` 
 ### 10.1 Drag
 
 - **Pickup** after 6 pt of movement (less is a tap). The droplet lifts to 1.035 (palette, bars), 1.045 (cards, thumbnails) or 1.05 (chip) with `lift`, goes to E2, and a card or thumbnail grows a 3 pt water envelope, concentric with it. The lift and its shadow carry the pickup, as iOS drag previews do; a wide envelope over a flat backdrop only reads as a die-cut sticker outline.
-- **Follow.** Target = finger − grab offset; position springs to it with `follow`. Weight is expressed in shape, never in positional lag.
+- **Follow.** Target = finger − grab offset; position springs to it with `follow` (0.085 s, ζ 1). Being critically damped it never passes the finger; it trails it by v·ζ·response/π, that is **v × 27 ms** (27 pt at 1000 pt/s, 108 pt at a 4000 pt/s flick), and catches up within 0.1 s of the finger stopping. That slight lag is the water's weight, together with the stretch (§10.2) and the settle (§10.3): a held droplet is a bead being pulled along, not a sticker glued to the finger. It is never more than this: no extra smoothing, no inertia after release other than the release velocity (§10.3).
+- **Held: a bead of water.** While the finger is down the droplet is lifted (1.035 for the palette, with `lift`), its rim is 1.5× (§10.9; the dock draws it with `DropletLiftedRim` until the glass pass's `liftedRim` is on the branch), it follows with `follow`, stretches with its own speed about the grab point, volume-preserving, within its cap (§10.2), dips once as it slows (§10.3), keeps lensing the page under it (a held Clear droplet keeps its Regular glass on iOS 26 and its edge lens on iOS 17–25; only the Pencil freezes it, §10.8), and, for the palette, grows a meniscus towards the dock it would land in (§10.11).
 - **Bounds.** Past the container edges (8 pt inset) the droplet rubber-bands: `edge + D·(1 − 1/(0.55·e/D + 1))`, D = 120 pt.
 - **One finger.** The first pointer owns the drag; extra touches are ignored until it lifts.
 - **Fingers move chrome; the Pencil writes.** A stroke that starts on the page never reaches a droplet.
@@ -447,8 +449,9 @@ This is the complete behaviour, implemented by `DropletPhysics`, `DropletField` 
 
 - The stretch is itself a spring toward s\*. When you stop, s\* → 0 and s dips just below zero once: the droplet flattens slightly across its old direction of travel, like a drop landing, and is round again.
 - `wobble` response `clamp(0.14·√(minor / 44 pt), 0.14, 0.26)` s at ζ 0.68: a 44 pt bar 0.14 s, the 56 pt palette 0.16 s, a 140 pt card 0.25 s, panels 0.26 s. **About half a visible cycle, the undershoot ≤ 10 % of the peak.** Water at UI scale is quick and tight; 1.5 cycles at ζ 0.5 is jelly.
+- **Settle lead (33 ms).** A held droplet slows through its `follow` spring, so s\* falls over 40–80 ms, and a spring chasing a falling target barely dips (1–3 %, nobody sees it: a dead stop). So whenever s\* falls back towards zero the stretch velocity is kicked by ω²·0.033 s·Δs\* (ω = 2π / wobble response), as if the fall had come 33 ms earlier. Every droplet size then dips once by about **6 % of its peak** (unit-tested between 3 % and 10 % for the bar, the palette and a card at 300, 1500 and 4000 pt/s) and never comes back above 1 %: one visible drop-landing, no bounce. A rising s\* (speeding up) gets no lead.
 - **Release** projects a landing point `p + v·0.12 s`. If the finger was still for ≥ 70 ms before lifting, v = 0: a careful placement never flings. Release speed is capped at 5000 pt/s.
-- The palette then springs to its dock with `snap`, **starting at the full release velocity**. Everything that lands in a slot (library cards, thumbnails, floating panels) uses `slot` with only the part of the velocity that points at the slot, capped at 1200 pt/s and at ω·distance (ω = 2π / 0.40 s), so it can never overshoot and never leaves its container. A snap haptic plays about 260 ms in. **Nothing rests where it lands**: every droplet has a home (a dock, a slot, its anchor, its layout position) and flows to it.
+- The palette then springs to its dock with `snap`, **starting at the full release velocity**, and plays **one plip** (`NibHaptics.plip`) the first time its centre is within 1.5 pt of the dock, or when it comes to rest (typically 0.25–0.37 s in). The snap's 4 pt overshoot takes it out of that band and back, but the landing is disarmed by then: one plip per landing, none if it has not arrived within 1.5 s (another drag took over). Everything that lands in a slot (library cards, thumbnails, floating panels) uses `slot` with only the part of the velocity that points at the slot, capped at 1200 pt/s and at ω·distance (ω = 2π / 0.40 s), so it can never overshoot and never leaves its container; a slot's snap haptic plays about 260 ms in. **Nothing rests where it lands**: every droplet has a home (a dock, a slot, its anchor, its layout position) and flows to it.
 - Any change of a droplet's layout position (a dock change, a reflow, a popover re-placed) animates from where it is on screen to the new place with the droplet's current velocity (FLIP).
 
 ### 10.4 Merge (union)
@@ -536,7 +539,9 @@ When a fling docks the palette on an edge of the other orientation (vertical ↔
 4. At the midpoint (long side ≤ 1.5 × thickness) the layout switches axis while the content is invisible.
 5. The body spreads to the new length with `reform`; the icons appear in their new slots; the bead rides along.
 
-Under Reduce Motion the palette cross-fades to its new dock with `reduced`.
+Any change of the dock's axis re-forms: a release, an accessibility action, `toolbar.dock`, or a size-class change that takes the side docks away (Split View narrowing to compact moves a side dock to the bottom). `NibToolPalette` and `.dropletDockable` keep laying the content out for the old dock until the gather reaches its midpoint; `@Environment(\.nibDockEdge)` switches there, while the content is invisible. A move along the same axis is not a re-form: the body flows to its new place from where it is (FLIP) with `snap` and the release velocity.
+
+Under Reduce Motion and Liquid Off the palette cross-fades to its new dock: it fades out in 120 ms, moves with `reduced` while invisible (0.26 s, no overshoot), and fades in over 220 ms. No stretch, no meniscus.
 
 ### 10.11 Docks
 
@@ -545,15 +550,41 @@ Under Reduce Motion the palette cross-fades to its new dock with `reduced`.
 | iPad | Left or right edge (vertical, anywhere along the edge below the bars), bottom (horizontal), top below the bars (horizontal, +40 pt bias so the top is picked only on purpose). With the assistant docked, the right edge moves to the panel's leading edge |
 | iPhone | Bottom (default) or top below the bars, horizontal only |
 
-VoiceOver and Full Keyboard Access get "Move palette to the left edge / right edge / top / bottom" actions.
+The dock is one engine, `DropletDockModel` plus its driver, used by `NibToolPalette` and by `.dropletDockable` (any other droplet that docks like the palette), so they feel the same. Every number below is in `DropletDockModel` and unit-tested.
+
+| Quantity | Value |
+|---|---|
+| Region | Below the bars: safe area + 8 + 44 + 16 pt; 16 pt in from the sides; 16 pt above the bottom safe area (8 pt on iPhone, just above the home indicator); minus the docked assistant panel at the trailing edge. `along` 0…1 slides the palette from one end of its edge to the other |
+| Distance to a dock | From the point to the line the palette's centre sits on at that dock (perpendicular to the edge: anywhere along it counts). The top counts **+40 pt** |
+| Release point | The projected finger, `p + v·0.12 s`, with v zeroed if the finger was still ≥ 70 ms and capped at 5000 pt/s (§10.3) |
+| Capture radius | **200 pt** (iPad), **160 pt** (iPhone). The nearest dock within it wins, centred on the projected point along its edge, then fused (1 pt) to or pushed 16 pt clear of its neighbours along the dock (§10.4). Outside every capture radius the palette flows **home** to the dock it left: a drop in the middle of the page never moves it by accident (a mid-page drop on an 11-inch iPad is 320–550 pt from every dock) |
+| Settle | `snap` (0.50 s, ζ 0.80) from the full release velocity; about 4 pt overshoot; **one plip** when it is within 1.5 pt of the dock (§10.3). Other axis: re-form (§10.10) |
+| Held | A bead of water (§10.1): lift 1.035, rim 1.5×, `follow` lag, stretch cap 0.09 about the grab point, one settle dip |
+
+**Meniscus** (a neck, §10.5). While the palette is held, the dock the finger is within capture of (current finger, not projected) is where the water reaches: its frame slid along the edge to face the body.
+
+| Gap between the body and that dock frame | Water |
+|---|---|
+| ≥ 72 pt (`off`) | Nothing |
+| 72 → 20 pt | A tongue grows out of the body towards the dock (from 8 pt inside the body): its far edge reaches `smoothstep((72 − gap) / 52)` of the gap, its thickness is t = 26·(1 − gap/72)^0.7 (t₀ 26, the palette ↔ bars value) |
+| < 20 pt (`join`) | It touches and fuses: a bridge 8 pt into the dock frame, t from the same law (26 pt at contact) |
+| Pulled back out | It holds on, thinning by the law, and pinches when t < t_min: at **51.6 pt** on iPad (σ 8), **56.5 pt** on iPhone (σ 6.5). It re-arms beyond 72 pt |
+| Released | It reaches for the landing dock and the body swallows it as it arrives; released towards another dock it thins and pinches |
+
+The meniscus springs with `neck`, is drawn in the droplet's own union (a neck of the field on iOS 17–25, a glass capsule inside the `GlassEffectContainer` on iOS 26), plays no haptic of its own (the one haptic is the arrival plip), and is not drawn under Reduce Motion, Calm or Liquid Off. Pulling the palette off its own dock shows the same thing in reverse: the water holds on and pinches at 51.6 pt.
+
+VoiceOver and Full Keyboard Access get "Move palette to the left edge / right edge / top / bottom" actions (no plip: haptics answer touch). Plugins, the assistant and ⌘K move it with `toolbar.dock {dock: "top" | "bottom" | "left" | "right", along?}` (FeatToolbar), which persists the dock per device and returns the previous one for Undo. Left and right are the leading and trailing edges, mirrored in right-to-left languages.
 
 ### 10.12 Library drag
 
-- **Lift.** The cover lifts to 1.045 with `coverLifted` and becomes a Clear droplet: a **3 pt** water envelope (radius 8, concentric with the cover's 5 pt spine) grows around it, the cover stays opaque and crisp, stretch cap 0.10 with rigidity 0.70, the title fades out. Neighbours reflow with `reflow`.
-- **Combine** (notebook → notebook). Arms only when the finger is inside the **inner 70 %** of the target cover (from C) **and** has been held there **380 ms**. Then, and only then, the target swells to 1.03, grows its own envelope, a neck forms between the two (the visual promise that they will combine) and an armed haptic plays. Proximity alone draws nothing. On drop the dragged drop flows in and the stack becomes "New Folder"; a toast buds up: "Made "New Folder" from 2 notebooks · Undo", 6 s.
-- **Folder film** (from B). When a drag starts, every folder tile grows a water film over 260 ms (`reflow`, 35 ms stagger). Brought within 13 pt of a folder, the card fuses with its film (accent wash tint, merge haptic). On drop the card flows into the folder with `absorb`, shrinking to 12 % and fading in 220 ms; the folder takes a small gulp (scale 1.03 → 1); the grid closes the gap; a toast: "Moved to Physics 9702 · Undo". Films evaporate 260 ms after the drop.
+- **Lift.** A 0.3 s press, then 6 pt of movement (the grid scrolls, so a plain drag is a scroll). The cover lifts to 1.045 with `coverLifted` and becomes a Clear droplet: a **3 pt** water envelope (radius 8, concentric with the cover's 5 pt spine) grows around it, the cover stays opaque and crisp, stretch cap 0.10 with rigidity 0.70, the title fades out. The lifted cover is a `NibReflowCarrier` in the window's droplet container (the grid sits below the container, in a scroll view); its grid cell hides while it is carried.
+- **Live reflow** (`NibReflow`, like home-screen icons with water easing). The gap follows the finger: it sits at the slot whose centre is nearest the finger, and moves only when the finger is **24 pt** closer to another slot's centre than to the gap's (12 pt past the midpoint), so it never flickers at a boundary. The covers between the card's home and the gap move one slot towards home with `reflow` (0.44 s, ζ 0.86), wrapping rows; the rest stay still. More than **24 pt** outside every slot (over the sidebar, the folder tiles, the bars) the gap closes back at home. While the finger is in another cover's inner 70 % (its combine zone) that cover holds still, so a combine can arm; at its edge the reflow goes on.
+- **Combine** (notebook → notebook). Arms only when the finger is inside the **inner 70 %** of the target cover (from C) **and** has been held there **380 ms**. Then, and only then, the target swells to 1.03, grows its own envelope, a neck forms between the two (the visual promise that they will combine) and an armed haptic plays. Proximity alone draws nothing. **While armed the reflow pauses** (nothing moves under the finger); leaving the target cover disarms it and the reflow resumes. On drop the dragged drop flows in and the stack becomes "New Folder"; a toast buds up: "Made "New Folder" from 2 notebooks · Undo", 6 s.
+- **Folder film** (from B). When a drag starts, every folder tile grows a water film over 260 ms (`reflow`, 35 ms stagger). Brought within 13 pt of a folder, the card fuses with its film (accent wash tint, merge haptic) and the notebooks' reflow pauses (`NibReflow.isPaused`). On drop the card flows into the folder with `absorb`, shrinking to 12 % and fading in 220 ms; the folder takes a small gulp (scale 1.03 → 1); the grid closes the gap; a toast: "Moved to Physics 9702 · Undo". Films evaporate 260 ms after the drop.
 - **Sidebar drop** (from C). Over the sidebar the lifted card condenses to 50 % around the finger. The hovered folder row grows a droplet pill from its glyph with "+1"; dropping absorbs the card into the row.
+- **Drop in the grid** reorders: the drop reports the move, `(from, to)` plus the notebooks it now sits after and before. FeatLibraryUI applies it to the grid in the same update (the neighbours are already in their new slots, so nothing moves twice) and records one undoable `library.reorder`, which sets that folder's sort to Manual. The carrier flows into its new slot and the cell shows again when it rests (within 1.2 s).
 - **Release elsewhere** returns the card to its (possibly new) slot with `slot`: only the part of the release velocity that points at the slot, capped at 1200 pt/s and at ω·distance. A 2500 pt/s fling lands on its slot without passing it. Multi-select drags a stacked carrier (up to 3 covers fanned 4°).
+- **Accessibility.** Every cover has "Move earlier" and "Move later" actions (the same `library.reorder`), besides "Move to folder…".
 
 ### 10.13 Settings switch (from B)
 
@@ -596,7 +627,8 @@ Every press is scale 0.96 on `tap` (the Tinted primary, covers, buttons, icon bu
 | **Merge "plip"**: two droplets join, a popover folds back, a card fuses with a folder | (0.45, 0.70) at 0 ms, then (0.20, 0.35) at +18 ms | `.soft` 0.5 |
 | **Split**: a neck pinches, a tether snaps | (0.35, 0.90) | `.rigid` 0.35 |
 | **Bud**: a popover pinches free | (0.30, 0.60) | `.soft` 0.4 |
-| **Snap**: dock or slot arrival | (0.55, 0.40) | `.soft` 0.7 |
+| **Snap**: slot arrival (cards, thumbnails, floating panels) | (0.55, 0.40) | `.soft` 0.7 |
+| **Plip**: the palette lands in its dock, once per landing (§10.11) | (0.40, 0.85) | `.rigid` 0.45 |
 | **Select**: the bead arrives | – | selection |
 | **Armed**: card held over card 380 ms | plip | `.soft` 0.6 |
 | **Detent**: slider presets, 0 %, 100 % | – | selection |
@@ -723,7 +755,8 @@ Frames in points. iPad Pro 11″ landscape 1194 × 834, portrait 834 × 1194 (13
 - **Sidebar** 320 pt, opaque `backgroundSecondary` (no glass in navigation). "Library" (display) at y 80. `NibSidebarRow`s, 44 pt with 12 pt insets: Documents, Favourites, Shared, Recents, Study Sets, Gallery, Trash, with counts right-aligned in secondary. The selected row is on `fill3` with a semibold label and an accent glyph. "Folders" disclosure lists folders with their coloured glyphs and full names. The bottom row shows sync ("OneDrive · Up to date") and Settings.
 - **Content**: "Documents" (display) at x 344, y 80, with "23 items · Date modified" (caption1). "Folders" (title3), then four folder tiles 78 tall on the 24 pt gutter (188.5 pt wide in 11″ landscape). "Notebooks" (title3), then the cover grid (164 pt pitch). Every library measure sits on the 24 pt gutter.
 - **Floating chrome** (droplet container), top-right at y 32: a Clear bar (Search, Sort, Select; 3 × 44 + 8) and, 16 pt away, the Tinted "+ New" droplet (96 × 44), which buds the New menu (Notebook, QuickNote, Whiteboard, Text document, Study set, Import files, Scan document).
-- **Liquid moments**: §10.12 (lift, reach, combine, folder film, sidebar drop, absorb, toast with Undo).
+- **Liquid moments**: §10.12 (lift, live reflow, combine, folder film, sidebar drop, absorb, toast with Undo).
+- **Reorder**: press and hold a cover (0.3 s), then drag it: the other covers spring aside with `reflow` and the gap follows the finger (24 pt hysteresis, so it never flickers); drop to put it there. That records one undoable `library.reorder` and sets the folder's sort to **Manual** ("23 items · Manual"); choosing another sort keeps the manual order for when Manual is chosen again. Holding over another cover's centre for 380 ms combines instead; over a folder tile it files the notebook. VoiceOver: "Move earlier" / "Move later" on every cover.
 - **Select mode**: covers show check beads; a Clear action bar buds up at the bottom centre (Move, Share, Duplicate, Favourite, Delete). Delete asks with a system confirmation dialog.
 - **Context menu** on a cover: the system context menu with a cover preview.
 
@@ -756,6 +789,8 @@ Frames in points. iPad Pro 11″ landscape 1194 × 834, portrait 834 × 1194 (13
 **Locked document**: the page is replaced by a paper-coloured field with `lock` at 44 pt, "Locked" (emptyTitle) and a Face ID button.
 
 ### 14.3 Tool palette and tool settings (mockup 02)
+
+**Docking.** Drag the palette's body (dragging along the axis from the selected tool scrubs the bead instead) and it is a bead of water: it lifts to 1.035, its rim brightens, it trails the finger by v × 27 ms, stretches with its speed and dips once as it slows (§10.1–10.3). Near a dock (the finger within 200 pt of it, 160 on iPhone; the top counts 40 pt more) a meniscus reaches out and fuses at 20 pt. Released or flung, it snaps to the dock the projected finger is within capture of, with `snap`, and plips once as it lands; a mid-page drop flows home. Left and right re-form between vertical and horizontal (§10.10). iPhone: top and bottom only. `toolbar.dock` moves it from ⌘K, plugins and the assistant (§10.11).
 
 The palette is `NibToolPalette`: six everyday tools by default (pen, highlighter, eraser, lasso, shapes, text) and **More** (`ellipsis`), which buds a grid of the occasional ones (image, tape, elements, laser, ruler); a divider, three quick inks, then plugin tools after a second divider. That is 469 pt, less than Goodnotes exposes by default. The toolbar customisation sheet (from More › Customise Toolbar) is an opaque list with reorder handles, hide (−) and show (+), and saved layouts; people who want all ten tools on the palette put them there. Every tool popover is a Deep `NibPopoverPanel` budded from its tool; sections below are `NibInspectorSection`s, top to bottom. A tool's contextual options (`activeToolMenu`) appear in a `NibToolOptionsBar` fused to the palette's far side.
 
