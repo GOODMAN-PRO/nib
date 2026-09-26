@@ -7096,6 +7096,10 @@ extension NibPenSwatch {
     init(_ swatch: NibSwatch, pattern: NibSwatchPattern?, isSelected: Bool, size: Size = .popover, action:)
 }
 extension NibPenSwatch.Size { var diameter: CGFloat }
+struct NibWidthPresetButton: View { init(diameter: CGFloat, isSelected: Bool, label: String, action: @escaping () -> Void) }
+extension NibMetrics { static let widthPresetDots: [CGFloat]; static func widthPresetDot(_ index: Int) -> CGFloat }
+extension View { func nibTooltip(_ text: String) -> some View }   // Components/Buttons.swift
+// NibIconButton, NibToolButton, NibDropletButton, NibOptionTile, NibWidthPresetButton read `isEnabled` and dim to 40 %
 extension NibToolPalette {
     init(id:tools:moreTools:selection:swatches:swatch:dock:allowedEdges:reservedTrailing:
          toolOptions: @escaping (String) -> NibToolOptions?, settingsPresented: Binding<Bool>? = nil,
@@ -7128,6 +7132,7 @@ extension UIImage { static func nibSwatch(_ swatch: NibSwatch, size: NibPenSwatc
 | F008 NibPenSwatch has no tape-pattern overlay | `NibSwatch(pattern:)`, `NibPenSwatch(_:pattern:…)`, `NibSwatchPattern` (the palette's quick swatches show patterns too) | F008 `PatternSwatch` (FeatPresets/ColorSlotEditor.swift). `PatternTile`'s loader stays in the feature: it produces the `UIImage` |
 | F008 a tool options bar cannot bud a popover | `NibToolPalette(toolOptions:)` returning `NibToolOptions(popover:)`; the palette places the popover as a full-size child, beside the bar, and closes it on tool change | F008's inline Thickness and colour-editor modes of the bar (FeatPresets). Needs the contract change below so a `ToolMenuDescriptor` can carry the popover |
 | F016 the palette reports no re-tap and hides its popover state; no public open-bud signal | `onReselect:`, `settingsPresented:`, `morePresented:`, `.onNibBudChange(_:)` | F016 `settingsBudOpen` / the `hasSettings` toggle trick and `ToolSettingsBud` (FeatToolbar/ActiveToolMenuHost.swift); the iOS 18 `hitTest` guess in FeatToolbar/ToolbarView.swift becomes "while a bud is open, keep every touch" |
+| F043 no tooltips on icon and tool buttons; `NibIconButton` does not dim when disabled; no public preset-dot sizes | `nibTooltip` built into `NibIconButton`, `NibToolButton` and `NibWidthPresetButton`; those and `NibDropletButton`, `NibOptionTile` dim themselves; `NibWidthPresetButton`, `NibMetrics.widthPresetDots`; `NibStroke.hairline` for the hover-dot outline | F043's `.help(…)` and `.opacity(… disabledOpacity)` on palette buttons and `PalettePlan.dotSizes` / `widthRow` (FeatPencilHardware/SqueezePalette.swift). Drop the hand dimming when merging: it would now dim twice |
 | F016 tool keys register twice | `NibTool(shortcut:registersShortcut: false)` + `nibShortcutHint` | F016's `shortcut: nil` on palette tools, which hid the KeyHints |
 | F009, F008, F026, F036, F044 local colour-name tables | `NibHighlighter.name`, `NibPaper.name`, `NibCoverCloth.name`, `NibFolderColor.name` | F009 `NibHighlighter.title` (FeatHighlighter/HighlighterTool.swift), F008 `highlighterName`, F026 `highlighterName` / `paperName`, F044 `BoardPaper.title`. F036's sticky colours are its own palette and keep their names |
 | F028, F026 no UIKit swatch image | `UIImage.nibSwatch(_:size:isSelected:)` (light and dark in one asset, pattern included) | F028 `PageTextBar.swatch(_:ring:)`, F026 `swatchImage(_:)` |
@@ -7197,6 +7202,10 @@ struct NibFloatingLayer: View { init(host: NibFloatingHost) }
 // Components/NibCanvasHandles.swift (UIKit)
 final class NibHandleView: UIView { enum Style { case clear, tinted }; var style: Style; init(style: Style = .clear) }
 final class NibFrameView: UIView { init(frame: CGRect) }
+// Components/NibPageThumbnailView.swift (UIKit) and Components/Library.swift
+final class NibPageThumbnailView: UIView { var image: UIImage?; var isCurrent: Bool; var aspectRatio: CGFloat; var width: CGFloat
+                                           init(width: CGFloat = NibMetrics.rowThumbnailWidth, aspectRatio: CGFloat = 595.0 / 842.0) }
+extension NibPageThumbnail { init(number:isCurrent:isSelected:aspectRatio:width:showsNumber: Bool, content:) }
 // Components/NibWebTokens.swift
 enum NibWebTokens { static func stylesheet(for traits: UITraitCollection) -> String
                     static func variables(for traits: UITraitCollection) -> [(name: String, value: String)] }
@@ -7206,7 +7215,7 @@ enum NibWebTokens { static func stylesheet(for traits: UITraitCollection) -> Str
 |---|---|---|
 | NibBudPopover and droplets are unreachable from UIKit code and canvas attachments (F026 keyboard-bar popovers, F029 return pill, F037 thread popover, F038 zoom frame, F039 angle HUD, F044 minimap, F052 recording HUD and audio bar, F062 Time Keeper bar, F063 presenter HUD) and `nibToast` needs a container (F020) | `NibFloatingHost` + `NibFloatingLayer`: present by id, bud from a UIKit rect (`setAnchor(_:rect:in:)`), `post(toast)` | The system UIKit popover (F026), the static `nibGlass` HUDs hosted in the canvas (F029, F039, F062, F063), F037's floating Deep panel for one thread, F038's rigid UIKit box, F020's VoiceOver-only announcements. Needs the chrome to install the layer (below) |
 | F038, F012 a canvas attachment cannot put a `frame` or `handle` droplet on the canvas | `NibHandleView` (rigid 12 pt bead, `clear` or `tinted`), `NibFrameView` (rim and water line, radius 18); `NibMetrics.handleBead`, `.rotationHandleOffset`, `.zoomPaneHeight`, `.popoverContentWidth`; `NibStroke.emphasis` / `.thin` for the 1.5 / 1 pt outlines | F038's UIKit box (FeatZoomWindow, accent outline over `accentWash`) and its local pane metrics; F012's CALayer beads (FeatTransform/SelectionHandles.swift) |
-| F046 no hierarchical row or mini thumbnail | `NibOutlineRow`, `NibMiniPageThumbnail` | F046 `BookmarkRowView` and `PageThumbnailImage` (SwiftUI) in FeatOutline/OutlinePanel.swift; its UIKit `OutlineCell` keeps the drag table but takes `NibMetrics.outlineIndent` / `.rowThumbnailWidth` / `NibUIFont` |
+| F046 no hierarchical row, no 40 pt thumbnail without a number, no UIKit thumbnail | `NibOutlineRow`, `NibMiniPageThumbnail`, `NibPageThumbnail(…, showsNumber: false)`, `NibPageThumbnailView` (UIKit cells) | F046 `BookmarkRowView` and `PageThumbnailImage` (FeatOutline/OutlinePanel.swift) and the thumbnail layers of its UIKit `OutlineCell`, which keeps the drag table and takes `NibMetrics.outlineIndent` / `.rowThumbnailWidth` / `NibUIFont` |
 | F052, F056, F063, F091, F108 HUDs with several parts | `NibHUDGroup`, `NibHUDText`, `NibStatusDot`, `NibWaveform` | F052's recorder row in the Audio tab, F063's `presentation.hud` content |
 | Unbuilt F019, F021, F045, F050, F070, F071, F072, F076, F079, F080, F081, F085, F086, F091, F094, F103, F108 | `NibDropletButton`, `NibBanner`, `NibTraceRow`, `NibSecureField`, `NibCodeBlock`, `NibQRCode`, `NibPermissionRow`, `NibPresenceStack`, `NibPaperTile`, `nibSelectionRing`, `nibFadeBottomEdge`, `NibFlashcard`, `NibOutlineRow`, `NibWebTokens` (plugin HTML panels' `--nib-*` variables, DESIGN.md §14.10) | – |
 

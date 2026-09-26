@@ -99,6 +99,13 @@ public enum NibMetrics {
     public static let optionTileHeight: CGFloat = 52
     /// What a popover's content has to lay out in: its width less 16 pt padding each side (sliders, grids).
     public static let popoverContentWidth: CGFloat = 280
+    /// The thickness preset dots, thinnest first (`NibWidthPresetButton`).
+    public static let widthPresetDots: [CGFloat] = [5, 8, 12]
+    /// The dot of preset `index`: 5, 8, 12 pt, then 3 pt larger per further preset.
+    public static func widthPresetDot(_ index: Int) -> CGFloat {
+        let i = max(index, 0)
+        return i < widthPresetDots.count ? widthPresetDots[i] : widthPresetDots[widthPresetDots.count - 1] + CGFloat(3 * (i - 2))
+    }
     /// Selection and frame handles (DESIGN.md §14.3): 12 pt beads in 44 pt hit areas (`NibHandleView`); the rotation
     /// bead sits 24 pt above the top edge on a hairline.
     public static let handleBead: CGFloat = 12

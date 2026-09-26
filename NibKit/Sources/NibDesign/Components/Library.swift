@@ -268,15 +268,25 @@ public struct NibPageThumbnail<Content: View>: View {
     let isSelected: Bool?
     let aspectRatio: CGFloat
     let width: CGFloat
+    let showsNumber: Bool
     let content: Content
 
     public init(number: Int, isCurrent: Bool, isSelected: Bool? = nil, aspectRatio: CGFloat = 595.0 / 842.0,
                 width: CGFloat = NibMetrics.thumbnailWidth, @ViewBuilder content: () -> Content) {
+        self.init(number: number, isCurrent: isCurrent, isSelected: isSelected, aspectRatio: aspectRatio, width: width,
+                  showsNumber: true, content: content)
+    }
+
+    /// v2: `showsNumber: false` for rows that say the page themselves (outline and bookmark rows use
+    /// `width: NibMetrics.rowThumbnailWidth`); VoiceOver still reads "Page N".
+    public init(number: Int, isCurrent: Bool, isSelected: Bool? = nil, aspectRatio: CGFloat = 595.0 / 842.0,
+                width: CGFloat = NibMetrics.thumbnailWidth, showsNumber: Bool, @ViewBuilder content: () -> Content) {
         self.number = number
         self.isCurrent = isCurrent
         self.isSelected = isSelected
         self.aspectRatio = aspectRatio
         self.width = width
+        self.showsNumber = showsNumber
         self.content = content()
     }
 
@@ -298,10 +308,12 @@ public struct NibPageThumbnail<Content: View>: View {
                         NibCheckBead(isOn: isSelected).padding(6)
                     }
                 }
-            Text("\(number)")
-                .font(NibFont.caption1)
-                .monospacedDigit()
-                .foregroundStyle(isCurrent ? NibColor.accent : NibColor.labelSecondary)
+            if showsNumber {
+                Text("\(number)")
+                    .font(NibFont.caption1)
+                    .monospacedDigit()
+                    .foregroundStyle(isCurrent ? NibColor.accent : NibColor.labelSecondary)
+            }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(String(localized: "Page \(number)", bundle: .module))

@@ -110,6 +110,7 @@ public struct NibIconButton: View {
     let isOn: Bool
     let shortcut: KeyboardShortcut?
     let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
     @ScaledMetric(relativeTo: .body) private var barGlyph: CGFloat = 21
     @ScaledMetric(relativeTo: .body) private var paletteGlyph: CGFloat = 23
     @ScaledMetric(relativeTo: .body) private var panelGlyph: CGFloat = 17
@@ -161,16 +162,26 @@ public struct NibIconButton: View {
                         Circle().fill(NibColor.fill3)
                     }
                 }
+                .opacity(isEnabled ? 1 : NibOpacity.disabled)
                 .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
                 .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: Circle()))
         .nibShortcut(shortcut)
+        .nibTooltip(label)
         .accessibilityLabel(label)
         .accessibilityAddTraits(isOn ? .isSelected : [])
         .accessibilityShowsLargeContentViewer {
             Label { Text(label) } icon: { Image(nib: symbol) }
         }
+    }
+}
+
+public extension View {
+    /// v2: `text` as the pointer tooltip of an icon-only control (iPadOS shows it on hover), without also making it
+    /// the VoiceOver hint: the control's label already says it.
+    func nibTooltip(_ text: String) -> some View {
+        help(Text(text)).accessibilityHint(Text(verbatim: ""))
     }
 }
 

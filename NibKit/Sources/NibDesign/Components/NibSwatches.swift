@@ -221,6 +221,7 @@ public struct NibOptionTile<Preview: View>: View {
     let isSelected: Bool
     let action: () -> Void
     let preview: Preview
+    @Environment(\.isEnabled) private var isEnabled
 
     public init(_ title: String, isSelected: Bool, action: @escaping () -> Void, @ViewBuilder preview: () -> Preview) {
         self.title = title
@@ -239,6 +240,7 @@ public struct NibOptionTile<Preview: View>: View {
                     .lineLimit(1)
             }
             .foregroundStyle(isSelected ? NibColor.label : NibColor.labelSecondary)
+            .opacity(isEnabled ? 1 : NibOpacity.disabled)
             .padding(.horizontal, NibSpacing.xs)
             .frame(maxWidth: .infinity, minHeight: NibMetrics.optionTileHeight)
             .background(isSelected ? NibColor.fill3 : Color.clear, in: shape)
@@ -277,12 +279,20 @@ public extension UIImage {
     /// selected. Light and dark are drawn into one image asset, so an image view follows the appearance. The image is
     /// the well plus room for the ring (`size.diameter + 10` points square), so selecting never changes its size.
     static func nibSwatch(_ swatch: NibSwatch, size: NibPenSwatch.Size = .palette, isSelected: Bool = false) -> UIImage {
-        let asset = UIImageAsset()
         let light = NibSwatchImage.draw(swatch, diameter: size.diameter, isSelected: isSelected, dark: false)
         let dark = NibSwatchImage.draw(swatch, diameter: size.diameter, isSelected: isSelected, dark: true)
-        asset.register(light.withRenderingMode(.alwaysOriginal), with: UITraitCollection(userInterfaceStyle: .light))
-        asset.register(dark.withRenderingMode(.alwaysOriginal), with: UITraitCollection(userInterfaceStyle: .dark))
-        return asset.image(with: UITraitCollection.current)
+        // Each variant is registered at the scale it was drawn at, so the asset hands it back at its point size.
+        let scale = light.scale
+        func traits(_ style: UIUserInterfaceStyle) -> UITraitCollection {
+            UITraitCollection { mutable in
+                mutable.userInterfaceStyle = style
+                mutable.displayScale = scale
+            }
+        }
+        let asset = UIImageAsset()
+        asset.register(light.withRenderingMode(.alwaysOriginal), with: traits(.light))
+        asset.register(dark.withRenderingMode(.alwaysOriginal), with: traits(.dark))
+        return asset.image(with: traits(UITraitCollection.current.userInterfaceStyle == .dark ? .dark : .light))
     }
 }
 

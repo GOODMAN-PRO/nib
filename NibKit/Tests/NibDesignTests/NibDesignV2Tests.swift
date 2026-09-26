@@ -220,6 +220,20 @@ final class NibDesignV2Tests: XCTestCase {
         XCTAssertNotNil(layers[0].mask)
     }
 
+    @MainActor
+    func testPageThumbnailViewSizesToItsPageAndRingsTheCurrentPage() {
+        let view = NibPageThumbnailView()
+        XCTAssertEqual(view.intrinsicContentSize.width, NibMetrics.rowThumbnailWidth)
+        XCTAssertEqual(view.intrinsicContentSize.height, 40 * 842 / 595, accuracy: 0.01)
+        view.aspectRatio = 842.0 / 595.0
+        XCTAssertLessThan(view.intrinsicContentSize.height, view.intrinsicContentSize.width)
+        let ring = view.layer.sublayers?.compactMap { $0 as? CAShapeLayer }.first
+        XCTAssertEqual(ring?.isHidden, true)
+        view.isCurrent = true
+        XCTAssertEqual(ring?.isHidden, false)
+        XCTAssertFalse(view.isAccessibilityElement)
+    }
+
     // MARK: API shape
 
     @MainActor
@@ -232,6 +246,8 @@ final class NibDesignV2Tests: XCTestCase {
         XCTAssertEqual(NibOpacity.recede, NibLiquid.recedeOpacity)
         XCTAssertEqual(NibMetrics.settingsSheetSize, CGSize(width: 760, height: 706))
         XCTAssertEqual(NibMetrics.popoverContentWidth, NibMetrics.popoverWidth - 2 * NibSpacing.l)
+        XCTAssertEqual((0..<5).map { NibMetrics.widthPresetDot($0) }, [5, 8, 12, 15, 18])
+        XCTAssertEqual(NibMetrics.widthPresetDot(-1), 5)
         let registered = NibTool(id: "pen", label: "Pen", symbol: .pen, shortcut: KeyboardShortcut("p"))
         XCTAssertTrue(registered.registersShortcut)
         XCTAssertEqual(registered.registeredShortcut, KeyboardShortcut("p"))
@@ -253,6 +269,8 @@ final class NibDesignV2Tests: XCTestCase {
         _ = NibPenSwatch(NibSwatch(paper: .white), isSelected: false) {}
         _ = NibPenSwatch(NibSwatch(paper: .white), pattern: nil, isSelected: true, size: .palette) {}
         _ = NibStrokeWidthSlider(width: .constant(0.5))
+        _ = NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(1), isSelected: true, label: "0.5 millimetres") {}
+        _ = NibIconButton(.undo, label: "Undo") {}.disabled(true).nibTooltip("Undo")
         _ = NibStrokeWidthSlider(width: .constant(12), range: 4...40, presets: [8, 16, 24], title: "Size", unit: .points)
         _ = NibProgressBar(value: 0.3)
         _ = NibProgressBar(value: 0.9, style: .critical)
@@ -291,6 +309,10 @@ final class NibDesignV2Tests: XCTestCase {
             NibToggle("Network", isOn: .constant(true))
         }
         _ = NibOutlineRow("Chapter 1", depth: 2, pageLabel: "4")
+        _ = NibPageThumbnail(number: 3, isCurrent: true) { Color.clear }
+        _ = NibPageThumbnail(number: 3, isCurrent: false, width: NibMetrics.rowThumbnailWidth, showsNumber: false) {
+            Color.clear
+        }
         _ = NibOutlineRow("Chapter 2", isExpanded: .constant(true)) { NibMiniPageThumbnail { Color.clear } }
         _ = NibPaperTile(name: "Dots", isSelected: true, action: {}) { Color.clear }
         _ = NibFlashcard(isFlipped: false) { Text(verbatim: "Front") } back: { Text(verbatim: "Back") }

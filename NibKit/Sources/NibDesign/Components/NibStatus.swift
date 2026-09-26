@@ -284,6 +284,7 @@ public struct NibDropletButton: View {
     let kind: Kind
     let shortcut: KeyboardShortcut?
     let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
 
     public init(id: String, title: String, symbol: NibSymbol? = nil, detail: String? = nil, kind: Kind = .clear,
                 shortcut: KeyboardShortcut? = nil, action: @escaping () -> Void) {
@@ -330,6 +331,7 @@ public struct NibDropletButton: View {
                 }
             }
             .foregroundStyle(kind == .tinted ? NibColor.onAccent : NibColor.label)
+            .opacity(isEnabled ? 1 : NibOpacity.disabled)
             .padding(.horizontal, title == nil ? 0 : NibSpacing.l)
             .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
             .contentShape(Capsule())

@@ -201,28 +201,52 @@ public struct NibStrokeWidthSlider: View {
             VStack(alignment: .leading, spacing: NibSpacing.s) {
                 HStack(spacing: NibSpacing.s) {
                     ForEach(Array(presets.enumerated()), id: \.offset) { index, preset in
-                        let selected = Self.matches(width, preset, unit: unit)
-                        Button {
+                        NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index),
+                                             isSelected: Self.matches(width, preset, unit: unit),
+                                             label: Self.presetLabel(preset, unit: unit)) {
                             withAnimation(NibMotion.tap.animation) { width = preset }
-                        } label: {
-                            Circle()
-                                .fill(NibColor.label)
-                                .frame(width: CGFloat(5 + index * 3 + (index > 1 ? 1 : 0)),
-                                       height: CGFloat(5 + index * 3 + (index > 1 ? 1 : 0)))
-                                .frame(width: 44, height: 40)
-                                .background(selected ? NibColor.fill3 : Color.clear,
-                                            in: RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous))
-                                .frame(minHeight: NibMetrics.hitTarget)
-                                .contentShape(Rectangle())
                         }
-                        .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)))
-                        .accessibilityLabel(Self.presetLabel(preset, unit: unit))
-                        .accessibilityAddTraits(selected ? .isSelected : [])
                     }
                 }
                 NibSlider(value: $width, in: range, label: heading, detents: presets)
             }
         }
+    }
+}
+
+/// v2: one thickness preset (DESIGN.md §13.3): a `label` dot in a 44 × 40 cell (44 pt hit target), the selected one
+/// on `fill3` (radius 12). The dots of a row are `NibMetrics.widthPresetDot(index)`: 5, 8, 12 pt. Every place that
+/// offers a thickness (a tool's popover, the Pencil palette, the options bar) uses it, so a width looks the same.
+public struct NibWidthPresetButton: View {
+    let diameter: CGFloat
+    let isSelected: Bool
+    let label: String
+    let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
+
+    public init(diameter: CGFloat, isSelected: Bool, label: String, action: @escaping () -> Void) {
+        self.diameter = diameter
+        self.isSelected = isSelected
+        self.label = label
+        self.action = action
+    }
+
+    public var body: some View {
+        let shape = RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)
+        Button(action: action) {
+            Circle()
+                .fill(NibColor.label)
+                .frame(width: diameter, height: diameter)
+                .frame(width: NibMetrics.hitTarget, height: 40)
+                .background(isSelected ? NibColor.fill3 : Color.clear, in: shape)
+                .opacity(isEnabled ? 1 : NibOpacity.disabled)
+                .frame(minHeight: NibMetrics.hitTarget)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(NibPressStyle(shape: shape))
+        .nibTooltip(label)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 

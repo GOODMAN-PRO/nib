@@ -159,6 +159,7 @@ public struct NibToolButton: View {
     let pitch: CGFloat
     let action: () -> Void
     @Environment(DropletField.self) private var field: DropletField?
+    @Environment(\.isEnabled) private var isEnabled
     @ScaledMetric(relativeTo: .body) private var glyph: CGFloat = 23
 
     public init(tool: NibTool, isSelected: Bool, action: @escaping () -> Void) {
@@ -183,7 +184,7 @@ public struct NibToolButton: View {
                 .font(NibFont.glyph(.palette, size: min(glyph, 28)))
                 .symbolRenderingMode(tool.tint == nil ? .hierarchical : .palette)
                 .foregroundStyle(NibColor.label, tool.tint ?? NibColor.label)
-                .opacity(isSelected ? 1 : 0.74)
+                .opacity(isEnabled ? (isSelected ? 1 : NibOpacity.unselectedTool) : NibOpacity.disabled)
                 .animation(NibMotion.colorChange, value: isSelected)
                 .overlay(alignment: .topTrailing) {
                     if tool.isPlugin {
@@ -201,6 +202,7 @@ public struct NibToolButton: View {
         .buttonStyle(NibPressStyle(shape: Circle()))
         .nibShortcut(tool.registeredShortcut)
         .nibShortcutHint(tool.hintOnlyShortcut)
+        .nibTooltip(tool.label)
         .accessibilityLabel(tool.isPlugin ? String(localized: "\(tool.label), plugin", bundle: .module) : tool.label)
         .accessibilityValue(tool.value ?? "")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
