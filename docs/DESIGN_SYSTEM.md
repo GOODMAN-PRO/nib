@@ -6983,3 +6983,250 @@ The code compiles and the physics is unit-tested in CI, but these six things can
 4. **The Pencil is not rejected by chrome gestures on iOS 17.** SwiftUI gestures can't filter touch type, so a Pencil press that starts on a droplet can drag it. The editor sets PencilKit's `drawingPolicy` so strokes that start on the page never reach chrome. Revisit with `UIGestureRecognizerRepresentable` (`allowedTouchTypes = [.direct]`, iOS 18) after the device check.
 5. **Blur radius calibration.** `GraphicsContext.Filter.blur(radius:)` is treated as σ. If bridges start noticeably later or earlier than 11 pt on device, adjust `DropletMetrics.regular.fieldBlur`; `minimumNeck` follows it automatically.
 6. **Contrast over ink.** With the palette and bars over a page of black handwriting, the bar subtitle and HUD digits (`label`, semibold) read at ≥ 4.5:1 in light mode, and dark-mode Clear over white paper (80 %) is a dark surface, not a grey blob (DESIGN.md §2.4).
+
+---
+
+## NibDesign v2 additions
+
+The gaps the first wave of feature agents reported (tools/fleet/contract-gaps.md, their `ponytail:` stand-ins) and the components the 61 features without a branch will need (docs/forge-spec.json), closed inside `NibDesign`. Everything is additive: no public declaration was renamed or removed, and every v1 initialiser still resolves (`NibDesignV2Tests.testEveryInitialiserResolves` calls each v1 initialiser beside its v2 overload). §3 above lists the v1 sources; the files on disk are authoritative for the v2 members below. New components live in new files under `Components/`; DESIGN.md §4–8 and §13 carry the spec rows.
+
+Tests: `NibKit/Tests/NibDesignTests/NibDesignV2Tests.swift` (every symbol token resolves and is allowed on the CI OS, the swatch ring rule reproduces `NibInk.needsRing`, width text in both units, waveform bars, presence folding, outline indent, principal mapping, QR rendering, UIKit type roles, CSS tokens, the floating host, every initialiser).
+
+### 1. Tokens
+
+**`NibSymbol`** (`Tokens/NibSymbol.swift`, DESIGN.md §8.3): 72 new tokens plus `imagePlayground`, an OS-gated `NibSymbol?`. `static let all: [NibSymbol]` (internal) lists every token for the gallery and the resolve test.
+
+```swift
+// Tools and colour
+static let eyedropper, customColour, drawShape, layers, editHandwriting, recognisedText, convertToText, straighten,
+           insertSpace, math, graph, table, dragHandle: NibSymbol
+// Editing
+static let cut, copy, paste, duplicate, link, arrange, screenshot, crop, flipHorizontal, flipVertical, replace, unlock,
+           touchID, print, saveToFiles, newWindow, externalLink, qrCode: NibSymbol
+static var imagePlayground: NibSymbol? { get }       // nil below iOS 18.1
+// Text formatting
+static let bold, italic, underline, strikethrough, textSuperscript, textSubscript, inlineCode, fontSize, alignLeft,
+           alignCentre, alignRight, justify, listBulleted, listNumbered, checklist, indent, outdent, lineSpacing: NibSymbol
+// Audio, time, places
+static let recordDot, skipBack10, skipForward10, transcript, speak, timer, stopwatch, lap, history, profile, language,
+           notifications, reminder, info, advanced, templates, minimap, fitToContent, calendar, cloud, backup,
+           diagnostics, dictionary: NibSymbol
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| F008 no eyedropper / colour-picker glyph | `.eyedropper`, `.customColour` | F008 `PresetSymbols` (FeatPresets/ColorSlotEditor.swift) |
+| F014 no paste glyph | `.paste` (menu icon string: `NibSymbol.paste.name`) | F014 `icon: nil` on Paste and Match Style (FeatClipboard/FeatClipboardFeature.swift) |
+| F018 no new-window glyph | `.newWindow` | F018 `WindowMenus.newWindowIcon` literal (FeatWindows/FeatWindowsFeature.swift) |
+| F026, F028 no text-format glyphs (bold, italic, underline, strikethrough, alignment, lists, indent, outdent, line spacing) | `.bold` … `.lineSpacing` | F026 `TextFormatOptions.symbol(_:fallback:)` (FeatTextBox/TextFormatInspector.swift); F028 `PageTextGlyph` (FeatPageText/PageTextEditor.swift) |
+| F027 no profile, language, notifications, templates, about, advanced, external-link glyphs | `.profile`, `.language`, `.notifications`, `.templates`, `.info`, `.advanced`, `.externalLink` | F027 literals in FeatSettings/FeatSettingsFeature.swift, LanguagePage.swift, SettingsRootViewController.swift |
+| F030 no Draw Shape glyph | `.drawShape` | F030's use of `.documentWrite` (FeatShapeRecognition/FeatShapeRecognitionFeature.swift) |
+| F034 no crop, flip, replace, paste, Image Playground glyphs | `.crop`, `.flipHorizontal`, `.flipVertical`, `.replace`, `.paste`, `.imagePlayground` | F034 `ImageIcons` (FeatImages/ImageTool.swift) |
+| F037 no link glyph | `.link`, `.copy` | F037 icon-less Copy Link entry (FeatComments) |
+| F041 no layers glyph | `.layers` | F041 `LayerGlyph` (FeatLayers/LayersPanel.swift) |
+| F044 no minimap, fit, templates glyphs | `.minimap`, `.fitToContent`, `.templates` | F044 `MinimapView` statics and the BoardsPanel literal (FeatWhiteboard) |
+| F052 no record-dot or ±10 s glyphs | `.recordDot`, `.skipBack10`, `.skipForward10` | F052 AudioPanel.swift statics and `recordDot` (FeatAudio) |
+| F058 no straighten, align, insert space, cut, paste, colour, edit-all glyphs | `.straighten`, `.alignLeft`/`.alignCentre`/`.alignRight`, `.insertSpace`, `.cut`, `.paste`, `.customColour`, `.recognisedText`, `.editHandwriting` | F058 `SmartInkSymbol` (FeatSmartInk/EditHandwritingMode.swift) |
+| F062 no timer, stopwatch, flag glyphs | `.timer`, `.stopwatch`, `.lap` | F062 `TimeKeeperView` statics (FeatTimeKeeper) |
+
+**`NibFont` / `NibUIFont`** (`Tokens/NibFont.swift`, DESIGN.md §4.1):
+
+```swift
+extension NibFont {
+    static let badgeNumber: Font                       // SF Rounded bold footnote (NibBadge .number now uses it)
+    static let documentBody: Font                      // New York 17
+    static func documentHeading(_ level: Int) -> Font  // New York bold title / title2 / title3
+}
+extension NibUIFont {   // every §4.1 role for UIKit except math; all scale with UIFontMetrics
+    static var display, displayEditorial, title1, title2, title3, emptyTitle, cardFace, bodyEmphasis, callout,
+               chatEmphasis, button, footnoteEmphasis, caption1Emphasis, caption2, hudLarge, badgeNumber, code,
+               documentBody: UIFont { get }
+    static func documentHeading(_ level: Int) -> UIFont
+}
+```
+
+Resolves F037, F039, F046, F047 (UIKit roles built with `NibUIFont.font(…)` by hand) and F102/F103 (text-document body and headings). Replaces `NibUIFont.font(.body, design: .serif)` and the serif `title1/2/3` headings in FeatTextDoc (F047), `font(.footnote, weight: .bold, design: .rounded)` for comment pins (F037), `font(.caption2, weight: .medium)` in FeatRuler (F039), `font(.body/.footnote, weight: .semibold)` in FeatOutline (F046).
+
+**`NibSpacing.swift`** (DESIGN.md §5, §5.1, §5.2, §6):
+
+```swift
+extension NibRadius { static let ruler: CGFloat /* 6 */; static let pageWash: CGFloat /* 4 */ }
+extension NibMetrics {
+    static let optionTileHeight, statusDot, presenceBead, liveCursorBead, tabCapsuleHeight, rowThumbnailWidth,
+               outlineIndent, settingsSectionListWidth, searchWidth, searchResultsMaxHeight, commandBarWidth,
+               onboardingCardWidth, zoomPaneHeight, audioBarWidth, textColumnWidth, laserDot, laserGlow, laserTrail,
+               proposalBadgeX, popoverContentWidth, handleBead, rotationHandleOffset: CGFloat
+    static let presenceMaxShown, maxVisibleTabs, outlineMaxDepth: Int
+    static let settingsSheetSize, newDocumentSheetSize, coverPreviewSize, coverStripSize, paperTileSize,
+               pluginManagerSheetSize, developerConsoleSize, floatingPanelSize, searchSnippetSize, studyCardSize: CGSize
+}
+public enum NibStroke {   // hairline 0.5, outline 0.8, thin 1, emphasis 1.5, ring 2, thick 3, ringOutset 3
+    static let dash: [CGFloat]            // [4, 4]
+    static let dashed: StrokeStyle        // thin + dash, for SwiftUI
+    static var layerDash: [NSNumber]      // for CAShapeLayer.lineDashPattern
+}
+public enum NibOpacity { static let disabled, unselectedTool, recede, ghostInk, replayPending, laserGlow: Double }
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| F014 no stroke or border-width token | `NibStroke.ring` (drop highlight) | `NibSpacing.xxs` as a line width (FeatClipboard/CanvasDragDrop.swift) |
+| F026 no focus-outline width or dash token | `NibStroke.thin` + `NibStroke.layerDash` | `lineWidth = 1`, `lineDashPattern = [4, 4]` (FeatTextBox/TextBoxEditor.swift) |
+| F027 no settings sheet, section list or stroke tokens | `NibMetrics.settingsSheetSize`, `.settingsSectionListWidth`; `NibStroke.thin`, `.thick` | F027 local constants (FeatSettings/SettingsRootViewController.swift, StylusPage.swift). The 56 pt posture cell stays local: it is one screen's layout, not a system measure |
+| F028 no hairline divider token | `NibStroke.hairline`, `NibStroke.thin`; `NibPenSwatch.Size.palette.diameter` | F028 `BarLiteral` (FeatPageText/PageTextEditor.swift) |
+| F039 no ruler radius | `NibRadius.ruler` | `NibRadius.badge` on the ruler body (FeatRuler) |
+| F040 no laser metrics | `NibMetrics.laserDot`, `.laserGlow`, `.laserTrail`, `NibOpacity.laserGlow` | F040 `LaserStyle` sizes (FeatLaser/FeatLaserFeature.swift); the 0.6 s fade is a motion token (below) |
+| F046 no row-thumbnail or indent metrics | `NibMetrics.rowThumbnailWidth`, `.outlineIndent`, `.outlineMaxDepth` | F046 `OutlineMetrics` (FeatOutline/OutlinePanel.swift) |
+| Unbuilt F019, F021, F045, F050, F052, F056, F072, F073, F080, F085, F093, F108 | the §14 screen metrics, `NibOpacity.ghostInk`, `.replayPending` | – |
+
+### 2. Palette, tools and swatches
+
+```swift
+// Components/Palette.swift
+extension NibTool {
+    let registersShortcut: Bool
+    init(id:label:symbol:isPlugin:hasSettings:value:shortcut: KeyboardShortcut?, registersShortcut: Bool, tint:)
+}
+extension NibSwatch {
+    let pattern: NibSwatchPattern?
+    init(id: String, color: Color, name: String, ringsLight: Bool = false, ringsDark: Bool = false,
+         pattern: NibSwatchPattern?)
+}
+extension NibPenSwatch {
+    init(_ swatch: NibSwatch, pattern: NibSwatchPattern?, isSelected: Bool, size: Size = .popover, action:)
+}
+extension NibPenSwatch.Size { var diameter: CGFloat }
+extension NibToolPalette {
+    init(id:tools:moreTools:selection:swatches:swatch:dock:allowedEdges:reservedTrailing:
+         toolOptions: @escaping (String) -> NibToolOptions?, settingsPresented: Binding<Bool>? = nil,
+         morePresented: Binding<Bool>? = nil, onReselect: ((String) -> Void)? = nil,
+         @ViewBuilder settings: @escaping (String) -> Settings)
+}
+// Components/NibToolOptions.swift
+struct NibToolOptions { init(bar: AnyView, popover: NibToolOptionsPopover? = nil)
+                        init<Bar: View>(popover: NibToolOptionsPopover? = nil, @ViewBuilder bar: () -> Bar) }
+struct NibToolOptionsPopover { init<C: View>(source: String, isPresented: Binding<Bool>, title: String,
+                                             subtitle: String? = nil, @ViewBuilder content: () -> C) }
+extension View { func onNibBudChange(_ action: @escaping (Bool) -> Void) -> some View
+                 func nibShortcutHint(_ shortcut: KeyboardShortcut?) -> some View }
+// Components/NibSwatches.swift
+struct NibSwatchPattern: Hashable { init(id: String, image: UIImage, tilePoints: CGFloat = 11, name: String? = nil) }
+extension NibSwatch { init(id: String, hex: UInt32, name: String, pattern: NibSwatchPattern? = nil)
+                      init(ink: NibInk, pattern: NibSwatchPattern?)
+                      init(highlighter:), init(paper:), init(cloth:), init(folder:) }
+extension NibHighlighter, NibPaper, NibCoverCloth, NibFolderColor { var name: String }
+struct NibSwatchGrid: View { init(swatches:selection: Binding<String?>, columns: Int = 6, noneLabel: String? = nil,
+                                  size: NibPenSwatch.Size = .popover) }
+struct NibOptionTile<Preview: View>: View { init(_ title:isSelected:action:preview:), init(_ title:symbol:isSelected:action:) }
+struct NibOptionGlyph: View
+extension UIImage { static func nibSwatch(_ swatch: NibSwatch, size: NibPenSwatch.Size = .palette,
+                                          isSelected: Bool = false) -> UIImage }
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| F008 NibPenSwatch has no tape-pattern overlay | `NibSwatch(pattern:)`, `NibPenSwatch(_:pattern:…)`, `NibSwatchPattern` (the palette's quick swatches show patterns too) | F008 `PatternSwatch` (FeatPresets/ColorSlotEditor.swift). `PatternTile`'s loader stays in the feature: it produces the `UIImage` |
+| F008 a tool options bar cannot bud a popover | `NibToolPalette(toolOptions:)` returning `NibToolOptions(popover:)`; the palette places the popover as a full-size child, beside the bar, and closes it on tool change | F008's inline Thickness and colour-editor modes of the bar (FeatPresets). Needs the contract change below so a `ToolMenuDescriptor` can carry the popover |
+| F016 the palette reports no re-tap and hides its popover state; no public open-bud signal | `onReselect:`, `settingsPresented:`, `morePresented:`, `.onNibBudChange(_:)` | F016 `settingsBudOpen` / the `hasSettings` toggle trick and `ToolSettingsBud` (FeatToolbar/ActiveToolMenuHost.swift); the iOS 18 `hitTest` guess in FeatToolbar/ToolbarView.swift becomes "while a bud is open, keep every touch" |
+| F016 tool keys register twice | `NibTool(shortcut:registersShortcut: false)` + `nibShortcutHint` | F016's `shortcut: nil` on palette tools, which hid the KeyHints |
+| F009, F008, F026, F036, F044 local colour-name tables | `NibHighlighter.name`, `NibPaper.name`, `NibCoverCloth.name`, `NibFolderColor.name` | F009 `NibHighlighter.title` (FeatHighlighter/HighlighterTool.swift), F008 `highlighterName`, F026 `highlighterName` / `paperName`, F044 `BoardPaper.title`. F036's sticky colours are its own palette and keep their names |
+| F028, F026 no UIKit swatch image | `UIImage.nibSwatch(_:size:isSelected:)` (light and dark in one asset, pattern included) | F028 `PageTextBar.swatch(_:ring:)`, F026 `swatchImage(_:)` |
+| Unbuilt F007, F013, F031, F033, F036, F040 colour and choice grids | `NibSwatchGrid`, `NibOptionTile` | – |
+
+### 3. Controls, badges and library
+
+```swift
+extension NibButton.Kind { case destructivePlain }
+extension NibBadgeKind { case principal(NibPrincipalKind); case capsule(String) }
+enum NibPrincipalKind: String, CaseIterable, Sendable { case you, assistant, plugin, bridge, collaborator
+                                                        init(_ principal: Principal); var title: String; var symbol: NibSymbol }
+extension NibStrokeWidthSlider { enum Unit { case millimetres, points }
+                                 init(width:range:presets:title: String, unit: Unit) }
+extension NibProgressBar { enum Style { case standard, critical }; init(value: Double, style: Style) }
+extension NibFolderTile { init(name:count:color:glyph: NibFolderGlyph, isTargeted:isFused:) }
+enum NibFolderGlyph: Hashable, Sendable { case symbol(NibSymbol), emoji(String) }
+struct NibFolderGlyphView: View { init(glyph:color:size:) }
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| F010 NibStrokeWidthSlider is millimetres-only and titled "Thickness" | `NibStrokeWidthSlider(width:range:presets:title:unit: .points)` | F010's hand-built size presets (FeatEraser/EraserSettingsView.swift) |
+| F010 no destructive plain button | `NibButton(kind: .destructivePlain)` | `NibButton(.destructive)` for Clear Page (FeatEraser) |
+| F015 NibBadge has no principal kind | `NibBadge(.principal(NibPrincipalKind(principal)))` | F015 `PrincipalBadge` and `HistoryPrincipal.Kind.title/.symbol` (FeatUndoUI/HistoryPanel.swift) |
+| F020 NibFolderTile has no icon or emoji | `NibFolderTile(glyph:)`, `NibFolderGlyphView` | F020's own Favourites tile and `FolderGlyph` (FeatLibraryOrganize/FeatLibraryOrganizeFeature.swift, FavoritesPanel.swift) |
+| F062 NibProgressBar has no critical tint | `NibProgressBar(value:style: .critical)` | F062 `TimeKeeperProgress` (FeatTimeKeeper) |
+| Unbuilt F080 "Update" capsule; F013 "Made by Assistant" | `NibBadge(.capsule("Update"))`, `NibPrincipalKind.title` | – |
+
+### 4. New components
+
+```swift
+// Components/NibStatus.swift
+struct NibHUDGroup<Content: View>: View { init(id: String, @ViewBuilder content: () -> Content) }
+struct NibHUDText: View { init(_ primary: String, secondary: String? = nil) }
+struct NibStatusDot: View { enum Kind { case unseen, connected, recording, warning }; init(_ kind: Kind) }
+struct NibPresenceStack: View { struct Person { init(id:name:initials:colorIndex:) }; init(_ people: [Person], compact: Bool = false) }
+struct NibWaveform: View { init(levels: [Double], bars: Int = 24, height: CGFloat = 20) }
+struct NibBanner: View { enum Style { case info, warning }
+                         init(_ message: String, style: Style = .warning, symbol: NibSymbol? = nil, action: NibAction? = nil) }
+struct NibTraceRow: View { enum Phase { case running, done, warning }; init(_ text: String, phase: Phase) }
+struct NibDropletButton: View { enum Kind { case clear, tinted }
+                                init(id:title:symbol:detail:kind:shortcut:action:), init(id:symbol:label:kind:shortcut:action:) }
+// Components/NibForms.swift
+struct NibSecureField: View { init(text: Binding<String>, prompt: String, onSubmit: @escaping () -> Void = {}) }
+struct NibCodeBlock: View { init(_ text: String, onCopy: (() -> Void)? = nil) }
+struct NibQRCode: View { init(_ payload: String, label: String) }
+struct NibPermissionRow<Accessory: View>: View { enum Change { case unchanged, added, removed }
+                                                 init(_ text:symbol:change:accessory:), init(_ text:symbol:change:) }
+// Components/NibLists.swift
+struct NibOutlineRow<Leading: View>: View { init(_ title:depth:pageLabel:isSelected:isExpanded:reservesDisclosure:leading:) }
+struct NibMiniPageThumbnail<Content: View>: View { init(aspectRatio:width:content:) }
+struct NibPaperTile<Content: View>: View { init(name:isSelected:size:action:content:) }
+struct NibFlashcard<Front: View, Back: View>: View { init(isFlipped:fill:front:back:) }
+extension View { func nibSelectionRing(_ isSelected: Bool, cornerRadius: CGFloat) -> some View
+                 func nibFadeBottomEdge(_ height: CGFloat = NibSpacing.l) -> some View }
+// Components/NibFloatingHost.swift
+@MainActor @Observable final class NibFloatingHost {
+    init(); var toast: NibToastItem?; var toastBinding: Binding<NibToastItem?> { get }
+    func present<C: View>(_ id: String, @ViewBuilder content: () -> C); func dismiss(_ id: String)
+    func isPresenting(_ id: String) -> Bool; var presentedIDs: [String] { get }
+    func setAnchor(_ id: String, rect: CGRect); @discardableResult func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool
+    func removeAnchor(_ id: String); func containerRect(_ rect: CGRect, from view: UIView) -> CGRect?
+    func post(_ toast: NibToastItem)
+}
+struct NibFloatingLayer: View { init(host: NibFloatingHost) }
+// Components/NibCanvasHandles.swift (UIKit)
+final class NibHandleView: UIView { enum Style { case clear, tinted }; var style: Style; init(style: Style = .clear) }
+final class NibFrameView: UIView { init(frame: CGRect) }
+// Components/NibWebTokens.swift
+enum NibWebTokens { static func stylesheet(for traits: UITraitCollection) -> String
+                    static func variables(for traits: UITraitCollection) -> [(name: String, value: String)] }
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| NibBudPopover and droplets are unreachable from UIKit code and canvas attachments (F026 keyboard-bar popovers, F029 return pill, F037 thread popover, F038 zoom frame, F039 angle HUD, F044 minimap, F052 recording HUD and audio bar, F062 Time Keeper bar, F063 presenter HUD) and `nibToast` needs a container (F020) | `NibFloatingHost` + `NibFloatingLayer`: present by id, bud from a UIKit rect (`setAnchor(_:rect:in:)`), `post(toast)` | The system UIKit popover (F026), the static `nibGlass` HUDs hosted in the canvas (F029, F039, F062, F063), F037's floating Deep panel for one thread, F038's rigid UIKit box, F020's VoiceOver-only announcements. Needs the chrome to install the layer (below) |
+| F038, F012 a canvas attachment cannot put a `frame` or `handle` droplet on the canvas | `NibHandleView` (rigid 12 pt bead, `clear` or `tinted`), `NibFrameView` (rim and water line, radius 18); `NibMetrics.handleBead`, `.rotationHandleOffset`, `.zoomPaneHeight`, `.popoverContentWidth`; `NibStroke.emphasis` / `.thin` for the 1.5 / 1 pt outlines | F038's UIKit box (FeatZoomWindow, accent outline over `accentWash`) and its local pane metrics; F012's CALayer beads (FeatTransform/SelectionHandles.swift) |
+| F046 no hierarchical row or mini thumbnail | `NibOutlineRow`, `NibMiniPageThumbnail` | F046 `BookmarkRowView` and `PageThumbnailImage` (SwiftUI) in FeatOutline/OutlinePanel.swift; its UIKit `OutlineCell` keeps the drag table but takes `NibMetrics.outlineIndent` / `.rowThumbnailWidth` / `NibUIFont` |
+| F052, F056, F063, F091, F108 HUDs with several parts | `NibHUDGroup`, `NibHUDText`, `NibStatusDot`, `NibWaveform` | F052's recorder row in the Audio tab, F063's `presentation.hud` content |
+| Unbuilt F019, F021, F045, F050, F070, F071, F072, F076, F079, F080, F081, F085, F086, F091, F094, F103, F108 | `NibDropletButton`, `NibBanner`, `NibTraceRow`, `NibSecureField`, `NibCodeBlock`, `NibQRCode`, `NibPermissionRow`, `NibPresenceStack`, `NibPaperTile`, `nibSelectionRing`, `nibFadeBottomEdge`, `NibFlashcard`, `NibOutlineRow`, `NibWebTokens` (plugin HTML panels' `--nib-*` variables, DESIGN.md §14.10) | – |
+
+### 5. Localisation
+
+`Localizable.xcstrings` now lists every `String(localized:bundle: .module)` key of the module (157, with format specifiers as Swift emits them: `%@`, `%lld`), with translator comments on the colour, paper, cloth and principal names and the unit strings, so F095 can translate the design system's own strings.
+
+### 6. What still needs another owner
+
+| Needed change | Owner | For |
+|---|---|---|
+| `ToolMenuDescriptor` (or `ToolbarItemDescriptor.activeToolMenu`) carries an optional popover: `source` anchor id, `title`, `isPresented`, content; F016 passes it as `NibToolOptions(popover:)` | NibContracts, then F016 | F008 |
+| A per-window accessor for the chrome's `NibFloatingHost` and `NibInkingState` (a `ServiceKeys` constant or `DocumentEditing` properties) | NibContracts | F012, F016, F026, F029, F037, F038, F039, F044, F052, F062, F063 |
+| Install `NibFloatingLayer(host:)` in the document chrome's container and present `host.toastBinding`; the library root does the same for its container | F017, F019 | as above, F020 |
+| A SwiftUI `ui.screens.toolbar` rendered inside the chrome's one container (the palette's second container cannot merge or share buds) | NibContracts, F016, F017 | F016 |
+| A public inking input for a lone `nibGlass` surface outside a container (`nibIsInking` is internal) | Glass optics (Modifiers/NibSurfaces.swift, Liquid/NibLiquid.swift) | F062, F044 |
+| A pure-black letterbox colour token (`#000000`) for external displays | Glass optics (Tokens/NibColor.swift) | F063 |
+| Droplets that follow a canvas transform per frame (a refracting, stretching zoom frame on the canvas); `NibHandleView` / `NibFrameView` draw the rigid look with the water tokens meanwhile | Glass optics | F012, F038 |
+| Gallery entries for every v2 component and token | Glass optics (Gallery/**) | DESIGN.md §13 "every state is in the gallery" |
+| `NibMotion.hudLinger` (0.6 s, the ruler and pinch HUDs) and `NibMotion.laserFadeDuration` (0.6 s as a `TimeInterval` for CALayer fades) | Drag physics (Tokens/NibMotion.swift) | F039, F040 |
+| A Pencil Pro alignment haptic features may request (`UICanvasFeedbackGenerator.alignmentOccurred(at:)` behind `NibHaptics`) | Drag physics (Tokens/NibHaptics.swift) | F030, F039, F043 |
+| Move `nibShortcutHint` beside `nibShortcut` in Modifiers/NibInteraction.swift (it lives in Components/NibToolOptions.swift until then) | Drag physics | – |
+| DESIGN.md §14.11 puts caption2 on the Clear grading droplets, which §2.4 bans; `NibDropletButton` uses caption1 semibold `label`. §14.12 (laser `destructive`) and §14.3 (Vermilion default) disagree | DESIGN.md §14 owner | F050, F040 |

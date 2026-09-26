@@ -16,6 +16,9 @@ public struct NibAction {
 public struct NibButton: View {
     public enum Kind: Sendable {
         case primary, secondary, destructive, plain
+        /// v2: `destructive` text with no fill, for a destructive action that is not the surface's button row (the
+        /// eraser's "Clear Page", always followed by a system confirmation).
+        case destructivePlain
     }
 
     public enum Size: Sendable {
@@ -72,7 +75,7 @@ public struct NibButton: View {
         switch kind {
         case .primary: return NibColor.onAccent
         case .secondary: return NibColor.label
-        case .destructive: return NibColor.destructive
+        case .destructive, .destructivePlain: return NibColor.destructive
         case .plain: return NibColor.accent
         }
     }
@@ -81,7 +84,7 @@ public struct NibButton: View {
         switch kind {
         case .primary: return NibColor.accent
         case .secondary, .destructive: return NibColor.fill3
-        case .plain: return Color.clear
+        case .plain, .destructivePlain: return Color.clear
         }
     }
 }
@@ -199,6 +202,10 @@ public enum NibBadgeKind: Sendable {
     /// "Plugin" provenance capsule.
     case plugin
     case presence(initials: String, colorIndex: Int)
+    /// v2: who made it ("You", "Assistant", "Plugin", "Bridge", "Collaborator") with its glyph, on a `fill3` capsule.
+    case principal(NibPrincipalKind)
+    /// v2: a short word on a `fill3` capsule, like "Plugin": "Update" on a plugin row, "Beta".
+    case capsule(String)
 }
 
 public struct NibBadge: View {
@@ -232,12 +239,23 @@ public struct NibBadge: View {
                 .frame(minWidth: 20, minHeight: 20)
                 .background(NibColor.fill3, in: Capsule())
         case .plugin:
-            Text(String(localized: "Plugin", bundle: .module))
-                .font(NibFont.caption2)
-                .foregroundStyle(NibColor.labelSecondary)
-                .padding(.horizontal, 7)
-                .frame(minHeight: 18)
-                .background(NibColor.fill3, in: Capsule())
+            textCapsule(String(localized: "Plugin", bundle: .module))
+        case .capsule(let text):
+            textCapsule(text)
+        case .principal(let kind):
+            HStack(spacing: NibSpacing.xxs) {
+                Image(nib: kind.symbol)
+                    .foregroundStyle(kind.glyphColor)
+                    .accessibilityHidden(true)
+                Text(kind.title)
+                    .foregroundStyle(NibColor.labelSecondary)
+            }
+            .font(NibFont.caption2)
+            .padding(.horizontal, 7)
+            .frame(minHeight: 18)
+            .background(NibColor.fill3, in: Capsule())
+            .fixedSize()
+            .accessibilityElement(children: .combine)
         case .presence(let initials, let colorIndex):
             Text(initials)
                 .font(NibFont.caption2)
@@ -247,9 +265,18 @@ public struct NibBadge: View {
         }
     }
 
+    private func textCapsule(_ text: String) -> some View {
+        Text(text)
+            .font(NibFont.caption2)
+            .foregroundStyle(NibColor.labelSecondary)
+            .padding(.horizontal, 7)
+            .frame(minHeight: 18)
+            .background(NibColor.fill3, in: Capsule())
+    }
+
     private func numberDisc(_ n: Int, fill: Color) -> some View {
         Text("\(n)")
-            .font(Font.system(.footnote, design: .rounded).weight(.bold))
+            .font(NibFont.badgeNumber)
             .monospacedDigit()
             .foregroundStyle(NibColor.onAccent)
             .frame(width: 22, height: 22)

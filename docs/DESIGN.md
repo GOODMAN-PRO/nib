@@ -226,6 +226,11 @@ SF Mono appears only in the plugin developer console and the "Show tool calls" d
 | `caption2` | `.caption2` | 11 / 13 | Medium | Pen-type labels, usage line, badges |
 | `hud` | `.footnote` rounded, monospaced digits | 13 / 16 | Semibold | "3 / 12", "0.50 mm", "125 %", "04:12" |
 | `math` | `.callout` serif italic | 16 / 21 | Regular | Formulas in the assistant |
+| `badgeNumber` | `.footnote` rounded | 13 / 18 | Bold | Proofreader and comment-pin numbers on their 22 pt discs |
+| `documentBody` | `.body` serif | 17 / 22 | Regular | The default body of a text document (§14.17) |
+| `documentHeading(1…3)` | `.title` / `.title2` / `.title3` serif | 28 / 22 / 20 | Bold | Text-document headings H1–H3; deeper levels read as H3 |
+
+UIKit surfaces (outline and bookmark rows, the keyboard formatting bar, text documents, comment pins) use the same roles through `NibUIFont`, which has every row of this table except `math`, each scaled with `UIFontMetrics`.
 
 ### 4.2 Dynamic Type
 
@@ -264,6 +269,53 @@ Base unit 4 pt; 2 pt only inside controls.
 - Folder tiles 78 pt tall on the same 24 pt gutter; their width is computed, `(content width − 3 × 24) / 4` on iPad (188.5 pt in 11″ landscape), never hard-coded. Names are one line with tail truncation. Sidebar 320.
 - Size classes: below 600 pt wide (iPhone, Slide Over, half Split View on 11″) Nib uses the compact layout; otherwise the regular one. Library columns re-flow at 600, 900 and 1180 pt.
 
+**Screen metrics** (`NibMetrics`, from the screens in §14; a screen never re-derives these numbers):
+
+| Token | Value | Where |
+|---|---|---|
+| `optionTileHeight` | 52 | Popover choice grids: pen types, shape kinds, tape patterns, More (`NibOptionTile`) |
+| `popoverContentWidth` | 280 | What a 312 pt popover's content lays out in (sliders, grids) |
+| `handleBead` / `rotationHandleOffset` | 12 / 24 | Selection and frame handles (44 pt hit areas); the rotation bead above the top edge |
+| `statusDot` | 6 | Unseen changes, the bridge's connected dot, recording (`NibStatusDot`) |
+| `presenceBead` / `presenceMaxShown` | 22 / 3 | Collaborator initials after the title, then "+N" |
+| `liveCursorBead` | 10 | A collaborator's cursor on the page |
+| `tabCapsuleHeight` / `maxVisibleTabs` | 32 / 5 | Document tabs between the bars |
+| `rowThumbnailWidth` | 40 | Bookmark and outline rows |
+| `outlineIndent` / `outlineMaxDepth` | 16 / 4 | Outline rows indent per level, then stop |
+| `settingsSheetSize` / `settingsSectionListWidth` | 760 × 706 / 220 | Settings on iPad |
+| `newDocumentSheetSize` | 720 × 640 | New Notebook sheet |
+| `coverPreviewSize` / `coverStripSize` / `paperTileSize` | 104 × 136 / 88 × 116 / 104 × 135 | New Notebook: live cover, cover strip, paper grid |
+| `pluginManagerSheetSize` / `developerConsoleSize` | 780 × 690 / 480 × 320 | Plugin manager (list 320), developer console |
+| `floatingPanelSize` | 344 × 560 | Floating Deep panels, the Elements panel's maximum |
+| `searchWidth` / `searchResultsMaxHeight` / `searchSnippetSize` | 560 / 600 / 120 × 60 | Global search field, results panel, handwriting snippets |
+| `commandBarWidth` | 560 | ⌘K |
+| `onboardingCardWidth` | 480 | Onboarding card (iPhone: width − 32) |
+| `studyCardSize` | 560 × 360 | Practice card and the editor's preview |
+| `zoomPaneHeight` | 240 | Zoom Window pane |
+| `audioBarWidth` | 320 | Audio playback bar |
+| `textColumnWidth` | 680 | Text documents |
+| `laserDot` / `laserGlow` / `laserTrail` | 12 / 12 / 4 | Laser |
+| `proposalBadgeX` | 52 | x of the assistant's margin badges, in page points |
+
+### 5.1 Stroke widths
+
+Nothing strokes at a width off this list (`NibStroke`).
+
+| Token | pt | Use |
+|---|---|---|
+| `hairline` | 0.5 | Separators and dividers, the swatch hairline |
+| `outline` | 0.8 | A droplet's `waterLine`, the Reduce Transparency outline |
+| `thin` | 1 | The permanent swatch ring, guides, the lasso marquee, template rules, ruler ticks |
+| `emphasis` | 1.5 | The Zoom Window box, the dashed addition rule (Differentiate Without Colour) |
+| `ring` | 2 | Focus rings, selection rings (current page, chosen paper, selected swatch), drop-target borders |
+| `thick` | 3 | Progress bars, illustration pen strokes |
+| `ringOutset` | 3 | How far outside its shape a selection ring sits |
+| `dash` (`dashed`, `layerDash`) | 4 / 4 at `thin` | The one dash: the lasso marquee, a text box's editing outline, spacing guides |
+
+### 5.2 Opacities with a meaning
+
+Colour tokens carry their own alpha. These are for content and state (`NibOpacity`): disabled 40 %, unselected palette tool 74 %, receding droplet 22 % (§10.8), assistant ghost ink 42 % (§14.9), replay's not-yet-reached strokes 30 % (§14.13), laser glow 45 % (§14.12).
+
 ---
 
 ## 6. Radii
@@ -286,8 +338,10 @@ Continuous corners everywhere (`.continuous`, `CALayerCornerCurve.continuous`).
 | Segmented track / knob | 9 / 7 |
 | Plugin and settings icon squircle | 7 |
 | Badge | 6 |
+| Ruler body (`NibRadius.ruler`, an opaque on-page object) | 6 |
 | Notebook cover | 5 at the spine, 8 at the fore-edge |
-| Page thumbnail | 4 (the current-page ring 7) |
+| Page thumbnail, paper and cover tiles | 4 (the current-page and selection ring 7) |
+| Search hits and citations washed on the page (`NibRadius.pageWash`) | 4 |
 | Page | 0 |
 
 **Concentric rule.** A shape inside a shape shares its centre of curvature: `inner = outer − inset`, minimum 8 (`NibRadius.concentric`). Capsules stay capsules. Radii off this table are a lint error.
@@ -363,6 +417,20 @@ SF Symbols only. Palette tools are Medium at 23 pt; bars Regular at 21 pt; sideb
 | Collaboration | Invite `person.crop.circle.badge.plus`, live `dot.radiowaves.left.and.right` |
 | Plugin permissions | `hand.raised`, network `network`, AI `drop`, document write `pencil.and.outline` |
 | Keyboard | `command`, `keyboard` |
+
+### 8.3 More tools, actions and places (v2)
+
+Each is a `NibSymbol` token (named first); features never spell an SF Symbol. Every name exists on iOS 17, except Image Playground, which is `NibSymbol.imagePlayground` (nil below iOS 18.1, so the entry hides).
+
+| Group | Tokens and symbols |
+|---|---|
+| Colour | `eyedropper` `eyedropper`, `customColour` `paintpalette` ("Custom…", the object menu's Colour) |
+| Tools | `drawShape` `pencil.and.outline`, `layers` `square.3.layers.3d`, `editHandwriting` `scribble`, `recognisedText` `text.viewfinder`, `convertToText` `character.textbox`, `straighten` `level`, `insertSpace` `arrow.up.and.down`, `math` `x.squareroot`, `graph` `chart.xyaxis.line`, `table` `tablecells`, `dragHandle` `line.3.horizontal` |
+| Editing | `cut` `scissors`, `copy` `doc.on.doc`, `paste` `doc.on.clipboard`, `duplicate` `plus.square.on.square`, `link` `link`, `arrange` `square.stack.3d.up`, `screenshot` `camera.viewfinder`, `crop` `crop`, `flipHorizontal` / `flipVertical` `arrow.left.and.right.righttriangle.left.righttriangle.right` / `arrow.up.and.down.righttriangle.up.righttriangle.down`, `replace` `arrow.2.squarepath` |
+| Text formatting | `bold`, `italic`, `underline`, `strikethrough`, `textSuperscript` `textformat.superscript`, `textSubscript` `textformat.subscript`, `inlineCode` `chevron.left.forwardslash.chevron.right`, `fontSize` `textformat.size`, `alignLeft` / `alignCentre` / `alignRight` / `justify` `text.alignleft` / `text.aligncenter` / `text.alignright` / `text.justify`, `listBulleted` `list.bullet`, `listNumbered` `list.number`, `checklist`, `indent` `increase.indent`, `outdent` `decrease.indent`, `lineSpacing` `arrow.up.and.down.text.horizontal` |
+| Audio and time | `recordDot` `record.circle`, `skipBack10` / `skipForward10` `gobackward.10` / `goforward.10`, `transcript` `captions.bubble`, `speak` `speaker.wave.2`, `timer`, `stopwatch`, `lap` `flag`, `history` `clock.arrow.circlepath` |
+| Documents and sharing | `unlock` `lock.open`, `touchID` `touchid`, `print` `printer`, `saveToFiles` `square.and.arrow.down.on.square`, `newWindow` `macwindow.badge.plus`, `externalLink` `arrow.up.forward.app`, `qrCode` `qrcode`, `templates` `rectangle.3.group`, `minimap` `map`, `fitToContent` `arrow.up.left.and.arrow.down.right` |
+| Settings and places | `profile` `person.crop.circle`, `language` `globe`, `notifications` `bell.badge`, `reminder` `bell`, `info` `info.circle` (About, info notices), `advanced` `wrench.and.screwdriver`, `calendar`, `cloud` `icloud`, `backup` `externaldrive`, `diagnostics` `stethoscope`, `dictionary` `character.book.closed` |
 
 ---
 
@@ -637,6 +705,8 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`.budsFrom(_:isPresented:)`** | Popover presentation that grows out of a droplet or `nibBudAnchor` | Keep the popover in the view tree and toggle `isPresented` | Use `.popover` or `.sheet` for tool settings; pass `instant: false` for keyboard invocations |
 | **`nibGlass`** | The material on one surface with no physics | Use it only outside a container (rare) | Stack it on another glass |
 | **`nibCard`** | Opaque surface (folder tiles, study cards, cells) with a radius and optional elevation | Use it for anything that is content, not chrome | Put a border and a wide soft shadow on the same card |
+| **`NibFloatingHost` + `NibFloatingLayer`** | The window's owner places `NibFloatingLayer(host:)` as a full-size child of its container and presents `host.toast` with `.nibToast(host.toastBinding)`; code outside the container (canvas attachments, UIKit editors, library tabs) calls `host.present(id) { … }`, `dismiss(id)`, `setAnchor(id, rect:in:)` and `post(toast)` | Bud popovers from a point on the page (`NibBudPopover(source:)` after `setAnchor`), float HUDs and the Zoom Window `frame`; everything recedes and merges like the chrome | Make a second container or a static `nibGlass` HUD because the chrome is out of reach |
+| **`.onNibBudChange(_:)`** | Reports whether any bud is open in the container | Stop forwarding touches to the canvas while one is open (§10.6.7) | Read the container's internals |
 
 ### 13.2 Chrome
 
@@ -646,6 +716,11 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`NibToolbarItem`** | `NibIconButton(.bar)`: 21 pt Regular glyph in a 40 pt visual, 44 pt hit | – | *On* (e.g. bookmarked): glyph in accent. Requires a label |
 | **`NibBarTitle`** | Title (barTitle) over subtitle (caption1 **semibold, `label`**: §2.4) | Truncates the title first | The subtitle turns `warning` for "Offline · changes saved on this iPad" |
 | **`NibHUD`** | Optional icon button + primary number + secondary part, both in `hud` type and `label` | 40 pt tall, always | Digits change with no animation. Capped at xxxLarge |
+| **`NibHUDGroup` + `NibHUDText`** | A `hud` droplet holding any mix of `NibHUDText` (primary + lighter secondary, both `label`), `NibIconButton(.bar)`s, `NibStatusDot` and `NibWaveform` | 40 pt tall, 4 pt inner padding | "3 of 11" with previous and next, the presenter HUD, the recording HUD, "Following Sam · Stop", the bridge status pill. Capped at xxxLarge |
+| **`NibDropletButton`** | One droplet that is one button: glyph and/or title (`button` type) with an optional detail line (caption1 semibold `label`, the one small type allowed on Clear); `tinted` (accent, `onAccent`) or `clear` | ≥ 44 × 44; icon-only is 44 × 44 | The library's "+ New" (Tinted, at most one per screen), the iPhone search and New droplets, the study grading droplets (Again · Hard · Good · Easy + next interval: §14.11's caption2 becomes caption1 semibold to meet §2.4). Large Content Viewer; capped at xxxLarge |
+| **`NibStatusDot`** | 6 pt dot: `unseen` (accent), `connected` (success), `recording` (destructive), `warning` | 6 | Never the only signal: beside a label, or the element carries a value |
+| **`NibPresenceStack`** | Up to three 22 pt `presence` beads after the title, then a "+N" bead; compact: one bead and the count | 22 pt beads, 4 pt apart | VoiceOver reads the names as a list |
+| **`NibWaveform`** | 2 pt bars 4 pt apart in `labelSecondary`, newest on the right, at least 2 pt tall | 24 bars × 20 pt by default | Redraws when its levels change; nothing moves on its own |
 | **`NibToast`** | Deep capsule: one line of callout + one action (accent) | ≥ 48 pt tall, ≤ 480 wide, bottom-centre 24 pt above the safe area | Presented only through `.nibToast($item)`, which places it, buds it up from below, dismisses it after 6 s (paused while VoiceOver runs), replaces any toast already showing and posts it as a VoiceOver announcement |
 
 ### 13.3 Tools
@@ -654,29 +729,37 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 |---|---|---|---|
 | **`NibToolPalette`** | Tools, More, a 17 pt divider slot, quick swatches, then plugin tools after a second divider, the bead, the selected tool's popover | 56 pt thick; 44 pt pitch (46 iPhone); 6 pt ends; 469 pt for 6 tools + More + 3 inks. At the type cap thickness grows to 64 and pitch to 52 (54 iPhone) | Tap selects; tapping the selected tool buds its settings; tapping More buds a grid of the other tools (the bead stays put); drag the body to dock; scrub the bead (never onto More). Plugin tools carry a 5 pt dot. Too many tools for the dock's length: the least recently used collapse into More, never the selected tool. A tool chosen from More takes the last native slot. Capped at xxxLarge |
 | **`NibToolButton`** | 23 pt Medium glyph (28 at cap), passing-lens scale | 44 × 44 | Unselected 74 %, selected 100 % within 120 ms; Large Content Viewer. A pen or pencil glyph's colour stripe shows the current ink; the highlighter's shows the current highlight colour; no other glyph is tinted. VoiceOver value: "Carbon, 0.5 millimetres" |
-| **`NibToolOptionsBar`** | The active tool's contextual options (a tool's `activeToolMenu`): a Clear `bar` droplet | 44 pt tall | Fused (1 pt overlap) to the palette's far side, level with the selected tool; rendered by the palette, so tools never place it themselves |
-| **`NibPenSwatch`** | Flat circle + 0.5 pt hairline; selected: 2 pt label ring 2.5 pt outside | 22 (palette), 26 (popover), 28 (iPhone) in a 44 pt cell | Chalk (light mode) and Carbon and Midnight (dark mode) keep a 1 pt `swatchRing` always. Never glossy |
+| **`NibToolOptionsBar`** | The active tool's contextual options (a tool's `activeToolMenu`): a Clear `bar` droplet | 44 pt tall | Fused (1 pt overlap) to the palette's far side, level with the selected tool; rendered by the palette, so tools never place it themselves. `NibToolPalette(toolOptions:)` returns a `NibToolOptions`: the bar and, optionally, one `NibToolOptionsPopover` budded from a `nibBudAnchor` inside the bar (the thickness slider, the colour editor), which the palette places with its own rule and closes when the tool changes |
+| **`NibToolPalette` hooks** | `settingsPresented:` and `morePresented:` mirror the settings popover and the More grid both ways; `onReselect:` reports a tap on the selected tool | – | The chrome opens the settings popover from a chevron in the options bar, keeps one popover open at a time, and guards canvas touches while one is open. `NibTool(shortcut:registersShortcut: false)` shows the tool key as a `KeyHint` without registering it twice (`nibShortcutHint`) |
+| **`NibPenSwatch`** | Flat circle + 0.5 pt hairline; selected: 2 pt label ring 2.5 pt outside | 22 (palette), 26 (popover), 28 (iPhone) in a 44 pt cell (`NibPenSwatch.Size.diameter`) | Chalk (light mode) and Carbon and Midnight (dark mode) keep a 1 pt `swatchRing` always. Never glossy. A tape swatch tiles its `NibSwatchPattern` over the colour inside the same circle (`NibSwatch(pattern:)` or `NibPenSwatch(_:pattern:)`); VoiceOver reads "Cobalt, Dots". UIKit bars use `UIImage.nibSwatch(_:size:isSelected:)`, drawn for light and dark in one image |
+| **`NibSwatchGrid`** | `NibPenSwatch`es in a grid, optionally led by a None well (empty circle, diagonal hairline) | 44 pt cells, 6 columns in a popover (12 inks = 6 × 2) | Selection by swatch id (None = nil). "Custom…" is the enclosing `NibInspectorSection`'s link. `NibSwatch(highlighter:)`, `(paper:)`, `(cloth:)`, `(folder:)`, `(id:hex:name:)` ring a colour the way inks are ringed (luminance > 0.8 in light mode, < 0.035 in dark mode) |
+| **`NibHandleView` / `NibFrameView`** (UIKit) | A rigid 12 pt handle bead in a 44 pt view: `clear` (Clear body over paper, rim, 0.8 pt water line, E1; `chromeOpaque` under Reduce Transparency) or `tinted` (accent, Tinted rim). The Zoom Window box: rim and water line only, radius 18 | 44 × 44; any box size | For canvas attachments, which cannot reach the container: handles never deform anyway (§10.15). Inside the container the box is `.droplet(style: .frame)` through `NibFloatingHost` |
+| **`NibOptionTile`** | Glyph (`NibOptionGlyph`, 22 pt) or small preview over a caption2 label | ≥ 52 pt tall, full cell width | Selected on `fill3` (radius 10), label `label`; others `labelSecondary`. Pen types, shape kinds, tape patterns, the More grid |
 | **Selection bead** | Head r 20, tail r 15.6, neck ≥ 22.5 pt, `beadBody` + ink 15 % + rim. No shadow, no specular | – | Not an accessibility element |
 | **`NibPopoverPanel` / `NibBudPopover`** | Title (headline) + optional subtitle; content in `NibInspectorSection`s | 312 wide (iPhone 345: screen − 48), padding 16, scrolls past 520 | Deep; buds; one popover open at a time. `NibBudPopover(placement:)` positions itself from its source (§10.6) |
 | **`NibInspectorSection`** | Label (footnote semibold secondary) + value (hud) or link (accent, 44 pt hit) + content | 8 pt label-to-content | – |
 | **`NibInspectorRow`** | Optional 24 pt glyph, title, subtitle, accessory | ≥ 44 pt | – |
 | **`NibSlider`** | 4 pt `fill1` track, `label` fill, 28 pt white bead thumb | 44 pt tall | Thumb stretches up to **0.10** with speed (`thumb` spring, about its grab side) and settles in one small undershoot; detent haptics |
-| **`NibStrokeWidthSlider`** | Three preset dots (5, 8, 12 pt) + value in mm + bead slider | Presets 44 × 40 | Selected preset on `fill3` |
+| **`NibStrokeWidthSlider`** | Three preset dots (5, 8, 12 pt) + value in mm + bead slider | Presets 44 × 40 | Selected preset on `fill3`. `init(width:range:presets:title:unit:)` titles it and measures in `.millimetres` ("0.50 mm") or `.points` ("12 pt", the eraser's Size) |
 | **`NibSegmentedControl`** | `fill3` track (radius 9, 2 pt inset), `backgroundTertiary` knob (radius 7, E1) | 32 pt visual; each segment's hit area is 44 pt tall | Knob glides on `tap`; selected label semibold |
 
 ### 13.4 Controls and text
 
 | Component | Anatomy | Sizes | States and notes |
 |---|---|---|---|
-| **`NibButton`** | Capsule; optional glyph; `button` type. Kinds: primary (accent fill), secondary (`fill3`), destructive (`destructive` text on `fill3`: never a red fill), plain (accent text) | ≥ 44 pt regular, 38 pt compact visual (44 hit); two lines at AX sizes | Label is verb + object ("Create Notebook", "Delete 4 items"). One filled primary per surface |
+| **`NibButton`** | Capsule; optional glyph; `button` type. Kinds: primary (accent fill), secondary (`fill3`), destructive (`destructive` text on `fill3`: never a red fill), plain (accent text), destructivePlain (`destructive` text, no fill) | ≥ 44 pt regular, 38 pt compact visual (44 hit); two lines at AX sizes | Label is verb + object ("Create Notebook", "Delete 4 items"). One filled primary per surface. destructivePlain is for a destructive action outside the surface's button row (the eraser's "Clear Page"), always confirmed by the system |
 | **`NibIconButton`** | Glyph in a 40 pt visual; `round` = 30 pt `fill3` disc; `send` = 32 pt `fill3` disc with a `label` arrow | 44 hit | Always has an accessibility label |
 | **`NibToggle`** | System switch on iOS 26; squash thumb (§10.13) below | 51 × 31 | Green when on |
 | **`NibSearchField`** | Magnifier, field, clear button | ≥ 44 pt capsule | `filled` on opaque surfaces (`fill4`), `onDroplet` inside a Clear droplet (no fill) |
 | **`NibField`** | Field on `fill4`, radius 22 (`NibRadius.composer`), grows to 5 lines | ≥ 44 pt | Placeholder in `labelTertiary`, focus ring accent |
 | **`NibChip`** | Context (removable, `fill3`, ≥ 28 pt, remove button with a 28 × 44 hit area), citation (accent wash, radius 6, 20 pt visual inline, 44 pt hit), filter (selected on `fill2`) | Never wraps | Context chips say exactly what the model reads |
-| **`NibBadge`** | Type (20 pt white square on covers), number (22 pt accent disc, SF Rounded bold), destructive number, count, "Plugin" capsule, presence (22 pt initials) | – | – |
+| **`NibBadge`** | Type (20 pt white square on covers), number (22 pt accent disc, `badgeNumber`), destructive number, count, "Plugin" capsule, presence (22 pt initials), principal (glyph + "You" / "Assistant" / "Plugin" / "Bridge" / "Collaborator" on a `fill3` capsule; the assistant's drop in accent), capsule (any short word: "Update") | – | `NibPrincipalKind(principal)` maps a command's principal |
 | **`KeyHint`** | Keys in caption2 on `fill3`, radius 6 | ≥ 22 × 20 | Shown while ⌘ is held, after 500 ms of hover, in menus and in ⌘K |
-| **`NibProgressBar`** | A 3 pt `fill1` track with a `label` fill, capsule ends | 3 pt tall | The only determinate progress (export, import, study sessions); never a liquid loader |
+| **`NibProgressBar`** | A 3 pt `fill1` track with a `label` fill, capsule ends | 3 pt tall | The only determinate progress (export, import, study sessions); never a liquid loader. `style: .critical` fills in `destructive` (a timer's last seconds) |
+| **`NibSecureField`** | Secure field on `fill4`, radius 10, with a show/hide eye (44 pt) | ≥ 44 pt | Passwords, API keys, tokens: only in Settings and the lock prompt. Privacy-sensitive (redacted in snapshots) |
+| **`NibCodeBlock`** | `code` type on `fill4`, radius 12, selectable, optional Copy icon button | – | Only for the developer console, raw tool calls and pasteable configuration (the bridge's `claude mcp add …`). The caller writes the pasteboard |
+| **`NibQRCode`** | Black modules on a white card (radius 10, 12 pt quiet zone), no interpolation | Square, any size | Pairing and joining. White in dark mode too; VoiceOver reads its label |
+| **`NibBanner`** | Glyph (`warning` triangle or `info`), one or two lines of callout, at most one plain accent action, on `fill4` radius 12 | ≥ 44 pt | Sync conflicts, a newer-format document, safe mode, offline, the assistant's inline error with Retry (§14.18). Never glass, never a toast |
 | **`NibPageBeads`** | Onboarding progress: 8 pt beads 8 pt apart, the selection bead gliding between them | – | Not a page control people swipe; VoiceOver reads "Step 2 of 4" |
 | **`NibEmptyState`** | 44 pt glyph in tertiary, New York title, one sentence, ≤ 1 primary + 1 secondary | ≤ 420 wide | No illustration, no mascot, no confetti |
 
@@ -686,9 +769,13 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 |---|---|---|---|
 | **`NibDocumentCard`** | Cover (5/8 radii, `cover` elevation), title (footnote semibold, 2 lines), subtitle (caption1, star for favourites), type badge | 140 × 182 (iPhone 110 × 143) | Lifted: 3 pt envelope, `coverLifted`, title hidden. Absorbed: 12 % and faded toward the folder. Select mode: a check bead on the cover (`isSelected`). Tap: press scale then open |
 | **`NibClothCover`** | Flat cloth, spine, band | – | No printed title, no gradient |
-| **`NibFolderTile`** | Folder glyph in folder colour, full name (one line, tail truncation), count, on `backgroundSecondary` | 78 tall, width from the grid (§5), radius 14 | Targeted: water film; fused: accent wash + 1.03 |
+| **`NibFolderTile`** | Folder glyph in folder colour, full name (one line, tail truncation), count, on `backgroundSecondary` | 78 tall, width from the grid (§5), radius 14 | Targeted: water film; fused: accent wash + 1.03. `glyph: NibFolderGlyph` shows another symbol in the folder colour or the emoji the person chose (their content, not Nib's iconography); `NibFolderGlyphView` draws the same glyph in rows and menus |
 | **`NibSidebarRow`** | 22 pt Regular glyph, title (body, one line, tail truncation), count (secondary, right) | 44 pt, radius 10 selection on `fill3` | Selected: semibold title, accent glyph. The same full folder name as the tiles ("Computer Science 9618") |
 | **`NibPageThumbnail`** | Page render (radius 4, paper elevation), number (caption1) | 176 wide in the navigator | Current: 2 pt accent ring 3 pt outside (radius 7), accent number. Select mode: check bead. Reorder: `.droplet(style: .thumbnail)` |
+| **`NibMiniPageThumbnail`** | Page render, radius 4, paper elevation, no number | 40 wide (`rowThumbnailWidth`) | Bookmark and outline rows; decorative for VoiceOver |
+| **`NibOutlineRow`** | Optional disclosure chevron (28 pt, 44 pt hit), optional leading preview, title (body; semibold when selected), page in `hud` secondary | ≥ 44 pt; 16 pt indent per level, stopping at level 4 | Selected on `fill3` (radius 10). Outline and bookmark tabs, the text-document outline. Opaque or Deep surfaces only |
+| **`NibPaperTile` + `.nibSelectionRing`** | A paper, template or cover render (radius 4, paper elevation) with its name (caption1) | 104 × 135 in the paper grid, 88 × 116 in the cover strip | Selected: the 2 pt accent ring 3 pt outside and the name in accent, the one selection language per sheet. `.nibFadeBottomEdge()` fades the grid's last 16 pt |
+| **`NibFlashcard`** | A paper card (radius 20, E1) with a front and a back | `studyCardSize` 560 × 360 (iPhone: width − 32) | Flips around Y with `sheet`, each face only on its own half-turn; Reduce Motion cross-fades; VoiceOver reads the face that shows |
 
 ### 13.6 Assistant and plugins
 
@@ -699,6 +786,9 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`NibProposalChip` + `NibTether`** | Chip (drop mark, change name in 15 pt semibold, Accept disc, Discard) docked in the page's trailing margin, clear of ink; while it is dragged it hangs from a 26 pt anchor bead on the change by a water stem | 204 × 44. Pull: the anchor grows on the change, the stem thins and pinches at 65 pt, leaving a 5 pt satellite; release: flows back to its dock with `tether`, then the anchor dries away. Never refracts |
 | **`NibPanelHeader`** | Glyph in a 30 pt `fill3` disc, title (headline), subtitle (caption1 secondary), optional badge, optional More menu, round Close | 60 pt minimum, grows with Dynamic Type. The header of the assistant, plugin panels, the transcript and comments |
 | **`NibPluginPanelChrome`** | `NibPanelHeader` with the "Plugin" badge and the More menu (Reload, Permissions, Report a Problem); content below a soft hairline | 344 wide (420 at AX sizes). The plugin draws only inside; it cannot draw glass |
+| **`NibTraceRow`** | caption1 `labelSecondary` text after a small activity indicator (running), a `success` check (done) or a `warning` triangle | The assistant's tool trace and every AI loading state (§14.18); never a pulsing bead. VoiceOver adds "In progress" while running |
+| **`NibPermissionRow`** | 24 pt glyph + the permission as a plain sentence (body) + accessory (its `NibToggle`) | In an update's diff: added in accent with "+", removed struck through in `labelSecondary`; VoiceOver says "Added" / "Removed" first |
+| **`NibWebTokens`** | `stylesheet(for:)`: every colour, spacing, radius and type token as `--nib-…` CSS variables for the traits, `color-scheme`, body text in `label` at `-apple-system-body`, a transparent page | Plugin HTML panels inject it at document start and again when the traits change |
 
 ### 13.7 Sheets and lists
 
