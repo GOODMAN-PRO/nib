@@ -5,7 +5,8 @@ import NibDesign
 /// The active tool's contextual options and its settings. The options bar is a `NibToolOptionsBar` that
 /// `NibToolPalette(toolOptions:)` fuses to the palette's far side, level with the selected tool (DESIGN.md §13.3), so
 /// it floats with the palette and docks with it on any screen edge. Its content comes from `ui.toolMenus` (registered
-/// under the tool id) and otherwise from the toolbar item's own `activeToolMenu`.
+/// under the tool id) and otherwise from the toolbar item's own `activeToolMenu`; a `ui.toolMenus` entry may add a
+/// popover of its own, which the palette buds beside the bar.
 @MainActor
 enum ActiveToolMenuHost {
     enum Source: Equatable {
@@ -32,9 +33,24 @@ enum ActiveToolMenuHost {
     static func optionsBar(for descriptor: ToolbarItemDescriptor, app: NibApp, session: EditorSession,
                            openSettings: @escaping () -> Void) -> AnyView? {
         let options = Self.menu(for: descriptor, app: app, session: session)
-        let settingsTitle = descriptor.settings == nil ? nil : descriptor.title
+        let settingsTitle = descriptor.settings == nil ? nil : descriptor.resolvedTitle(for: session)
         guard options != nil || settingsTitle != nil else { return nil }
         return AnyView(ActiveToolOptions(menu: options, settingsTitle: settingsTitle, openSettings: openSettings))
+    }
+
+    /// The options bar's own popover (a thickness slider, a colour editor) that buds from a control inside the bar
+    /// (contracts-v2 `ToolMenuDescriptor.makePopover`). Only a `ui.toolMenus` entry carries one, and only while it is
+    /// the tool's options source.
+    static func popover(for descriptor: ToolbarItemDescriptor, app: NibApp, session: EditorSession) -> ToolMenuPopover? {
+        guard source(for: descriptor, app: app) == .toolMenus else { return nil }
+        return app.ui.toolMenus.get(descriptor.toolID ?? descriptor.id)?.makePopover?(session)
+    }
+
+    /// `ToolMenuPopover` mirrors NibDesign's `NibToolOptionsPopover` field for field.
+    static func palettePopover(_ p: ToolMenuPopover) -> NibToolOptionsPopover {
+        NibToolOptionsPopover(source: p.source, isPresented: p.isPresented, title: p.title, subtitle: p.subtitle) {
+            p.content
+        }
     }
 }
 

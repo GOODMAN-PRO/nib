@@ -6,73 +6,30 @@ import NibDesign
 
 // MARK: - The screen
 
-/// `ui.screens.toolbar`: the tool palette's own full-window layer, embedded by the document chrome over the editor.
-/// Give it the window's bounds: the palette docks to any edge. Touches pass through wherever nothing is drawn, so
-/// the canvas below keeps them (a Pencil stroke that starts on the page never reaches a droplet).
-final class ToolbarHostView: UIView {
-    let model: ToolbarModel
-    private let host: UIHostingController<ToolbarRootView>
+/// `ui.screens.toolbarView` (contracts-v2): the tool palette as a full-size layer that the document chrome places
+/// INSIDE its one droplet container, over the whole window. The palette docks below the bars on any edge by itself
+/// (NibDesign's dock region), merges and necks with the bars, shares their buds (a touch outside an open bud only
+/// closes it), picks up the page backdrop, and recedes with them while the Pencil is down (the chrome mirrors
+/// `session.inking` into its container). Empty space takes no touch, so the canvas below keeps it.
+struct ToolbarScreen: View {
+    @StateObject private var model: ToolbarModel
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    /// The window's UndoManager: it takes the "Move Palette" steps of `toolbar.dock`.
+    @Environment(\.undoManager) private var undoManager
 
     init(app: NibApp, session: EditorSession) {
-        let model = ToolbarModel(app: app, session: session)
-        self.model = model
-        let inking = app.services.get(ToolbarModel.inkingKey(session), as: NibInkingState.self)
-        host = UIHostingController(rootView: ToolbarRootView(model: model, inking: inking))
-        super.init(frame: .zero)
-        backgroundColor = .clear
-        host.view.backgroundColor = .clear
-        host.view.frame = bounds
-        host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        addSubview(host.view)
+        _model = StateObject(wrappedValue: ToolbarModel(app: app, session: session))
     }
 
-    required init?(coder: NSCoder) { nil }
-
-    /// Keeps the hosting controller in the view-controller hierarchy (traits, presentations, focus), and hands the
-    /// window's UndoManager to `toolbar.dock` ("Move Palette").
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        guard let window else { return }
-        model.attachUndoManager(window.undoManager)
-        guard host.parent == nil, let parent = owningViewController else { return }
-        parent.addChild(host)
-        host.didMove(toParent: parent)
-    }
-
-    override func willMove(toWindow newWindow: UIWindow?) {
-        super.willMove(toWindow: newWindow)
-        guard newWindow == nil else { return }
-        model.attachUndoManager(nil)
-        guard host.parent != nil else { return }
-        host.willMove(toParent: nil)
-        host.removeFromParent()
-    }
-
-    private var owningViewController: UIViewController? {
-        var responder: UIResponder? = superview
-        while let r = responder {
-            if let vc = r as? UIViewController { return vc }
-            responder = r.next
+    var body: some View {
+        GeometryReader { proxy in
+            ToolbarRootView(model: model, size: proxy.size, compact: sizeClass == .compact)
         }
-        return nil
-    }
-
-    /// Only what SwiftUI draws takes a touch. Before iOS 18 SwiftUI content hit-tests as views other than the hosting
-    /// view; from iOS 18 it hit-tests as the hosting view itself, so its subviews are asked instead. While any bud of
-    /// the container is open (a tool's settings, More, an options popover: `onNibBudChange`) every touch is ours: a
-    /// touch outside it only closes it and never inks (DESIGN.md §10.6).
-    // ponytail: UIKit-side pass-through because the contract hands the chrome a UIView; a SwiftUI toolbar screen
-    // inside the chrome's single droplet container (contracts-v2) makes the per-subview test go.
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        guard let hit = super.hitTest(point, with: event), let root = host.view else { return nil }
-        if model.budOpen { return hit }
-        if #available(iOS 18.0, *) {
-            for sub in root.subviews.reversed() where sub.hitTest(sub.convert(point, from: self), with: event) != nil {
-                return hit
-            }
-            return nil
-        }
-        return hit === self || hit === root ? nil : hit
+        // Settings › Appearance › Liquid for the palette's own motion (the Reduce Motion / Off cross-fade).
+        .nibLiquidMode(model.liquidMode)
+        .onAppear { model.attachUndoManager(undoManager) }
+        .onChange(of: undoManager.map { ObjectIdentifier($0) }) { _, _ in model.attachUndoManager(undoManager) }
+        .onDisappear { model.attachUndoManager(nil) }
     }
 }
 
@@ -83,17 +40,23 @@ struct PaletteItem: Identifiable, Equatable {
     /// The palette slot id: the tool id for tools (so the selection is `session.tool`), else the item id.
     let id: String
     let descriptorID: String
+    /// `resolvedTitle(for:)` of the window.
     let title: String
+    /// `resolvedIcon(for:)` of the window.
     let icon: String
     let isPlugin: Bool
     let isTool: Bool
     let hasSettings: Bool
     /// The current ink (pen, pencil) or highlight colour (highlighter) on the glyph's colour layer.
     let tint: RGBA?
-    /// VoiceOver value, e.g. "Carbon".
+    /// VoiceOver value, e.g. "Carbon", "On" or "Unavailable".
     let value: String?
     /// The key the shell runs this item with (`ToolbarShortcuts`), shown as a hint on hover and while ⌘ is held.
     let keyHint: KeyShortcut?
+    /// The descriptor's live `isEnabled` (contracts-v2): a disabled item's tap runs nothing.
+    let isEnabled: Bool
+    /// `ToolbarItemDescriptor.showsInCompactWidth`: false = regular widths only.
+    let showsInCompactWidth: Bool
 }
 
 /// The tool keys as SwiftUI shortcuts, for the palette's key hints only (the shell registers the keys themselves).
@@ -130,16 +93,10 @@ struct QuickSwatch: Identifiable, Equatable {
     var id: String { "swatch.\(index)" }
 }
 
-/// Whether a tool hands back to the previous one after a use (T-035). A pinned text tool stays.
-enum ToolReturnPolicy {
-    static func returnsAfterUse(tool: String, isSticky: Bool, textPinned: Bool) -> Bool {
-        !isSticky && !(tool == "text" && textPinned)
-    }
-}
-
-/// The palette of one window: which items show and where, the selected tool, quick colours, the options bar, the
-/// dock, and tool switching (last tool per document kind, non-sticky tools handing back). Every change it makes runs
-/// a command, so plugins, the AI and the bridge can do the same.
+/// The palette of one window: which items show and where (with each descriptor's live state), the selected tool,
+/// quick colours, the options bar and its popover, the dock, and the last tool per document kind. Every change it
+/// makes runs a command, so plugins, the AI and the bridge can do the same. A non-sticky tool hands back by itself
+/// (`CanvasHost.finishToolUse`, contracts-v2).
 @MainActor
 final class ToolbarModel: ObservableObject {
     static let paletteID = "toolbar.palette"
@@ -150,11 +107,6 @@ final class ToolbarModel: ObservableObject {
     /// Page points of scrolling that fold the options bar away (T-109).
     static let collapseTravel: Double = 24
     static let presetSelect = "preset.select"
-
-    /// The window's Pencil state (`NibInkingState`), registered by the document chrome (F017) before it builds this
-    /// screen; the palette's droplet container reads it so the palette recedes and stops sampling under a stroke.
-    // ponytail: F017's key, not a contract key yet (contract request: the chrome's single container or a contract key).
-    static func inkingKey(_ session: EditorSession) -> String { "chrome.inking." + session.id.raw }
 
     let app: NibApp
     let session: EditorSession
@@ -173,16 +125,25 @@ final class ToolbarModel: ObservableObject {
     /// the palette lands there at once instead of flowing home for a frame.
     @Published private(set) var pendingDock: NibPaletteDock?
     @Published private(set) var optionsCollapsed = false
+    /// Settings › Appearance › Liquid (`NibSettings.liquidMode`).
+    @Published private(set) var liquidMode: NibLiquidMode = .full
     /// The selected tool's settings popover (`NibToolPalette(settingsPresented:)`): the options bar's chevron opens it.
-    @Published var settingsOpen = false
-    /// The palette's More grid (`NibToolPalette(morePresented:)`).
-    @Published var moreOpen = false
-    /// A bud of the container is open (`onNibBudChange`): the host keeps every touch (DESIGN.md §10.6).
-    var budOpen = false
+    /// One popover at a time: opening it closes the options bar's own popover.
+    @Published var settingsOpen = false {
+        didSet { if settingsOpen && !oldValue { closeOptionsPopovers() } }
+    }
+    /// The palette's More grid (`NibToolPalette(morePresented:)`); it too closes the options bar's popover.
+    @Published var moreOpen = false {
+        didSet { if moreOpen && !oldValue { closeOptionsPopovers() } }
+    }
 
     private var descriptors: [String: ToolbarItemDescriptor] = [:]
+    /// Some palette item has live state (`isEnabled`, `isOn`, `sessionTitle`, `sessionIcon`): commits, page and
+    /// selection changes re-read it.
+    private(set) var hasLiveState = false
+    /// The presentation bindings of the options popovers handed to the palette, by tool (`ToolMenuDescriptor.makePopover`).
+    private var optionsPopovers: [String: Binding<Bool>] = [:]
     private(set) var inkTool = "pen"
-    private var pendingReturn = false
     private var lastRect: Rect?
     private var lastRectPage: PageID?
     private var scrollTravel: Double = 0
@@ -198,6 +159,7 @@ final class ToolbarModel: ObservableObject {
         isReadOnly = session.readOnly
         if Self.inkTools.contains(session.tool) { inkTool = session.tool }
         if let runtime { isVisible = runtime.isVisible(session) }
+        readLiquidMode()
         refresh()
         observe()
         restoreLastTool()
@@ -209,22 +171,31 @@ final class ToolbarModel: ObservableObject {
 
     var showsPalette: Bool { !isReadOnly && kind != nil && !(shown.isEmpty && more.isEmpty) }
 
+    /// The palette's items for this width: an item that is not for compact widths stays off the iPhone palette.
+    func items(compact: Bool) -> (shown: [PaletteItem], more: [PaletteItem]) {
+        guard compact else { return (shown, more) }
+        return (shown.filter { $0.showsInCompactWidth }, more.filter { $0.showsInCompactWidth })
+    }
+
     // MARK: Reading state
 
     func refresh() {
         refresh(for: session.document)
     }
 
+    /// Re-reads the items and their live state. Publishes only what changed, so a commit that changes no item never
+    /// re-renders the palette.
     private func refresh(for document: DocumentID?) {
         refreshScheduled = false
         let kind = document.flatMap { try? app.workspace.content($0).meta.kind }
-        self.kind = kind
+        if kind != self.kind { self.kind = kind }
         let all = kind.map { app.ui.toolbarItems(for: $0) } ?? []
         let entries = ToolbarLayoutEngine.entries(all, featureIDs: Set(app.featureIDs))
         let arrangement = ToolbarLayoutEngine.arrange(entries, layout: ToolbarStore.current(app.settings))
         let byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let plugins = Set(entries.filter { $0.isPlugin }.map { $0.id })
         let keys = app.content.keyCommands
+        let session = self.session
         var slots: [String: ToolbarItemDescriptor] = [:]
         func item(_ id: String) -> PaletteItem? {
             guard let d = byID[id] else { return nil }
@@ -235,14 +206,23 @@ final class ToolbarModel: ObservableObject {
             if let t = d.toolID, Self.tintedTools.contains(t) { presets = app.settings.get(NibSettings.presets(t)) }
             // The hint shows the key the shell really runs this item with (a key another owner took is not ours).
             let key = keys.get(ToolbarShortcuts.prefix + d.id).flatMap { $0.owner == FeatToolbarFeature.id ? $0 : nil }
-            return PaletteItem(id: slot, descriptorID: d.id, title: d.title, icon: d.icon,
-                               isPlugin: plugins.contains(d.id), isTool: d.toolID != nil, hasSettings: d.settings != nil,
-                               tint: presets?.color, value: presets.map { Self.colourName($0.color, index: $0.selectedSwatch) },
-                               keyHint: key?.shortcut)
+            let enabled = d.isEnabled?(session) ?? true
+            let colour = presets.map { Self.colourName($0.color, index: $0.selectedSwatch) }
+            return PaletteItem(id: slot, descriptorID: d.id, title: d.resolvedTitle(for: session),
+                               icon: d.resolvedIcon(for: session), isPlugin: plugins.contains(d.id),
+                               isTool: d.toolID != nil, hasSettings: d.settings != nil, tint: presets?.color,
+                               value: Self.accessibilityValue(colour: colour, isOn: d.isOn?(session) ?? false,
+                                                              isEnabled: enabled),
+                               keyHint: key?.shortcut, isEnabled: enabled, showsInCompactWidth: d.showsInCompactWidth)
         }
-        shown = arrangement.shown.compactMap { item($0) }
-        more = arrangement.more.compactMap { item($0) }
+        let nextShown = arrangement.shown.compactMap { item($0) }
+        let nextMore = arrangement.more.compactMap { item($0) }
+        if nextShown != shown { shown = nextShown }
+        if nextMore != more { more = nextMore }
         descriptors = slots
+        hasLiveState = slots.values.contains {
+            $0.isEnabled != nil || $0.isOn != nil || $0.sessionTitle != nil || $0.sessionIcon != nil
+        }
         readDock()
         refreshSwatches()
     }
@@ -252,15 +232,21 @@ final class ToolbarModel: ObservableObject {
         if saved != savedDock { savedDock = saved }
     }
 
+    private func readLiquidMode() {
+        let mode = NibLiquidMode(rawValue: app.settings.get(NibSettings.liquidMode)) ?? .full
+        if mode != liquidMode { liquidMode = mode }
+    }
+
     private func refreshSwatches() {
-        guard app.commands.entry(Self.presetSelect) != nil else {
-            swatches = []
-            swatchIndex = -1
-            return
+        var next: [QuickSwatch] = []
+        var index = -1
+        if app.commands.entry(Self.presetSelect) != nil {
+            let presets = app.settings.get(NibSettings.presets(inkTool))
+            next = presets.swatches.prefix(3).enumerated().map { QuickSwatch(index: $0.offset, color: $0.element.color) }
+            index = presets.selectedSwatch < next.count ? presets.selectedSwatch : -1
         }
-        let presets = app.settings.get(NibSettings.presets(inkTool))
-        swatches = presets.swatches.prefix(3).enumerated().map { QuickSwatch(index: $0.offset, color: $0.element.color) }
-        swatchIndex = presets.selectedSwatch < swatches.count ? presets.selectedSwatch : -1
+        if next != swatches { swatches = next }
+        if index != swatchIndex { swatchIndex = index }
     }
 
     /// An ink's own name ("Carbon") when the colour is one of the twelve inks, else its slot ("Colour 4").
@@ -268,6 +254,16 @@ final class ToolbarModel: ObservableObject {
         let hex = UInt32(c.r) << 16 | UInt32(c.g) << 8 | UInt32(c.b)
         if let ink = NibInk.allCases.first(where: { $0.hex == hex }) { return ink.name }
         return String(localized: "Colour \(index + 1)")
+    }
+
+    /// What VoiceOver reads after an item's name: its colour, "On" for an accessory that is on (Zoom Window open,
+    /// timer running) and "Unavailable" while it is disabled.
+    static func accessibilityValue(colour: String?, isOn: Bool, isEnabled: Bool) -> String? {
+        var parts: [String] = []
+        if let colour { parts.append(colour) }
+        if isOn { parts.append(String(localized: "On")) }
+        if !isEnabled { parts.append(String(localized: "Unavailable")) }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }
 
     private static func affects(_ setting: String) -> Bool {
@@ -279,7 +275,10 @@ final class ToolbarModel: ObservableObject {
         session.$document.dropFirst().sink { [weak self] d in self?.documentDidChange(d) }.store(in: &cancellables)
         session.$readOnly.dropFirst().sink { [weak self] v in self?.isReadOnly = v }.store(in: &cancellables)
         session.$visibleRect.sink { [weak self] r in self?.canvasDidScroll(r) }.store(in: &cancellables)
-        session.$selection.dropFirst().sink { [weak self] _ in self?.scheduleReturnCheck() }.store(in: &cancellables)
+        // Live descriptor state follows the window (contracts-v2): its page, selection and every commit, undo and redo.
+        session.$page.dropFirst().sink { [weak self] _ in self?.liveStateMayHaveChanged() }.store(in: &cancellables)
+        session.$selection.dropFirst().sink { [weak self] _ in self?.liveStateMayHaveChanged() }.store(in: &cancellables)
+        commits = app.bus.observeCommits { [weak self] _ in self?.liveStateMayHaveChanged() }
         runtime?.$hiddenSessions.sink { [weak self] hidden in
             guard let self else { return }
             self.isVisible = !hidden.contains(self.session.id)
@@ -292,17 +291,30 @@ final class ToolbarModel: ObservableObject {
                 .sink { [weak self] _ in self?.scheduleRefresh() }
                 .store(in: &cancellables)
         }
+        // `UIRegistries.setNeedsChromeUpdate(_:)`: a feature's live state changed outside a commit.
+        NotificationCenter.default.publisher(for: .nibChromeNeedsUpdate, object: app.ui)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self else { return }
+                if let target = note.userInfo?["session"] as? String, target != self.session.id.raw { return }
+                self.scheduleRefresh()
+            }
+            .store(in: &cancellables)
         NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] note in
-                guard let name = note.userInfo?["name"] as? String, Self.affects(name) else { return }
-                self?.scheduleRefresh()
+                guard let self, let name = note.userInfo?["name"] as? String else { return }
+                if name == NibSettings.liquidMode.name { self.readLiquidMode() }
+                if Self.affects(name) { self.scheduleRefresh() }
             }
             .store(in: &cancellables)
-        commits = app.bus.observeCommits { [weak self] cs in self?.didCommit(cs) }
     }
 
-    /// Registries fill in bursts (a plugin loading); one refresh per burst.
+    private func liveStateMayHaveChanged() {
+        if hasLiveState { scheduleRefresh() }
+    }
+
+    /// Registries fill in bursts (a plugin loading) and commits come in bursts; one refresh per burst.
     private func scheduleRefresh() {
         guard !refreshScheduled else { return }
         refreshScheduled = true
@@ -314,7 +326,6 @@ final class ToolbarModel: ObservableObject {
     /// `$tool` publishes before the session stores the value: everything here uses `t`.
     private func toolDidChange(_ t: String) {
         tool = t
-        pendingReturn = false
         settingsOpen = false
         expandOptions()
         if Self.inkTools.contains(t), t != inkTool {
@@ -322,6 +333,7 @@ final class ToolbarModel: ObservableObject {
             refreshSwatches()
         }
         rememberTool(t)
+        liveStateMayHaveChanged()
     }
 
     private func documentDidChange(_ document: DocumentID?) {
@@ -329,9 +341,16 @@ final class ToolbarModel: ObservableObject {
         restoreLastTool()
     }
 
-    /// The last sticky tool used in this kind of document is stored per kind (a non-sticky one would hand back anyway).
+    /// `CanvasTool.isSticky` of a registered tool (unknown tools count as sticky). Asked afresh each time: a tool may
+    /// read it from a setting (a pinned text tool). Runs only on a tool change.
+    func isSticky(_ tool: String) -> Bool {
+        guard let make = app.ui.canvasTools.get(tool)?.make else { return true }
+        return make().isSticky
+    }
+
+    /// The last sticky tool used in this kind of document is stored per kind (a non-sticky one hands back anyway).
     private func rememberTool(_ t: String) {
-        guard let kind, runtime?.isSticky(t) ?? true else { return }
+        guard let kind, isSticky(t) else { return }
         let name = ToolbarSettings.lastToolPrefix + kind.rawValue
         guard app.settings.json(name)?.stringValue != t else { return }
         app.perform(CommandIDs.settingsSet, ["name": .string(name), "value": .string(t)], session: session)
@@ -343,38 +362,10 @@ final class ToolbarModel: ObservableObject {
         app.perform(CommandIDs.toolSelect, ["tool": .string(t)], session: session)
     }
 
-    /// A user change to this window's document while a non-sticky tool is active is that tool's one use: hand back to
-    /// the previous tool once any text editing it started has ended.
-    // ponytail: "one use" = one user commit; a CanvasTool "finished" callback would be exact if a tool ever needs it.
-    private func didCommit(_ cs: Changeset) {
-        guard cs.principal.isUser, let doc = session.document, cs.documents.contains(doc),
-              cs.command != CommandIDs.undo, cs.command != CommandIDs.redo else { return }
-        let t = session.tool
-        let pinned = app.settings.json(ToolbarSettings.textPinned)?.boolValue ?? false
-        guard ToolReturnPolicy.returnsAfterUse(tool: t, isSticky: runtime?.isSticky(t) ?? true, textPinned: pinned) else {
-            return
-        }
-        pendingReturn = true
-        scheduleReturnCheck()
-    }
-
-    /// Checked a turn later: the tool that just committed may start editing text right after.
-    private func scheduleReturnCheck() {
-        guard pendingReturn else { return }
-        Task { @MainActor [weak self] in self?.returnIfDone() }
-    }
-
-    private func returnIfDone() {
-        guard pendingReturn, !session.isEditingText else { return }
-        pendingReturn = false
-        guard let previous = session.previousTool, previous != session.tool else { return }
-        app.perform(CommandIDs.toolSelect, ["tool": .string(previous)], session: session)
-    }
-
     // MARK: Options bar (T-109)
 
-    /// Scrolling or pulling the page folds the secondary bar away; choosing a tool brings it back. A zoom changes the
-    /// visible size and does not count.
+    /// Scrolling or pulling the page folds the secondary bar away (and its popover with it); choosing a tool brings it
+    /// back. A zoom changes the visible size and does not count.
     private func canvasDidScroll(_ rect: Rect?) {
         defer {
             lastRect = rect
@@ -383,7 +374,10 @@ final class ToolbarModel: ObservableObject {
         guard let rect, let last = lastRect, lastRectPage == session.page, !optionsCollapsed,
               abs(rect.width - last.width) < 0.5, abs(rect.height - last.height) < 0.5 else { return }
         scrollTravel += abs(rect.y - last.y) + abs(rect.x - last.x)
-        if scrollTravel >= Self.collapseTravel { optionsCollapsed = true }
+        if scrollTravel >= Self.collapseTravel {
+            closeOptionsPopovers()
+            optionsCollapsed = true
+        }
     }
 
     private func expandOptions() {
@@ -391,15 +385,26 @@ final class ToolbarModel: ObservableObject {
         scrollTravel = 0
     }
 
-    /// The options bar fused to the palette (`NibToolPalette(toolOptions:)`); nil while scrolling has folded it.
-    // ponytail: bar only. A tool menu that buds a popover of its own (`NibToolOptions(popover:)`) needs
-    // `ToolMenuDescriptor` to carry one (contracts-v2); pass it through here then.
+    /// The options bar fused to the palette (`NibToolPalette(toolOptions:)`) and, when the tool's menu has one, the
+    /// popover that buds from a control inside it (`ToolMenuDescriptor.makePopover`, contracts-v2): the palette places
+    /// it beside the bar and closes it with the bar. nil while scrolling has folded the bar.
     func toolOptions(for id: String) -> NibToolOptions? {
         guard !optionsCollapsed, let d = descriptors[id],
               let bar = ActiveToolMenuHost.optionsBar(for: d, app: app, session: session, openSettings: { [weak self] in
                   self?.openSettings()
               }) else { return nil }
-        return NibToolOptions(bar: bar)
+        let popover = ActiveToolMenuHost.popover(for: d, app: app, session: session).map { p -> NibToolOptionsPopover in
+            optionsPopovers[id] = p.isPresented
+            return ActiveToolMenuHost.palettePopover(p)
+        }
+        return NibToolOptions(bar: bar, popover: popover)
+    }
+
+    /// One popover at a time: the tool's settings, More, or the options bar's own popover.
+    private func closeOptionsPopovers() {
+        for presented in optionsPopovers.values where presented.wrappedValue {
+            presented.wrappedValue = false
+        }
     }
 
     /// The options bar's chevron: the palette buds the selected tool's settings (one popover at a time).
@@ -421,13 +426,14 @@ final class ToolbarModel: ObservableObject {
 
     // MARK: Actions (each one a command)
 
-    /// A palette tap: `tool.select` for a tool, the item's own command otherwise.
+    /// A palette tap: `tool.select` for a tool, the item's own command (with the window's `sessionParams`) otherwise.
+    /// A disabled item runs nothing.
     func select(_ id: String) {
-        guard let d = descriptors[id] else { return }
+        guard let d = descriptors[id], d.isEnabled?(session) ?? true else { return }
         if let toolID = d.toolID {
             app.perform(CommandIDs.toolSelect, ["tool": .string(toolID)], session: session)
         } else if let command = d.command {
-            app.perform(command, d.params, session: session)
+            app.perform(command, d.resolvedParams(for: session), session: session)
         }
     }
 
@@ -495,19 +501,12 @@ final class ToolbarModel: ObservableObject {
 
 // MARK: - View
 
+/// The palette (or, while it is hidden, the droplet that brings it back) over the whole window, inside the chrome's
+/// droplet container.
 struct ToolbarRootView: View {
     @ObservedObject var model: ToolbarModel
-    /// The window's Pencil state: the palette recedes near a live stroke and stops sampling the page (DESIGN.md §10.8).
-    let inking: NibInkingState?
-    @Environment(\.horizontalSizeClass) private var sizeClass
-
-    var body: some View {
-        NibDropletContainer(inking: inking) {
-            GeometryReader { proxy in
-                layer(size: proxy.size)
-            }
-        }
-    }
+    let size: CGSize
+    let compact: Bool
 
     /// What `toolbar.dock` needs from this window.
     private struct WindowMetrics: Equatable {
@@ -519,16 +518,15 @@ struct ToolbarRootView: View {
     /// (lift, brighter rim, `follow`, stretch, one settle dip, the meniscus towards the dock in reach), released it
     /// snaps to the dock the projected finger chose and plips once; its re-form and the Reduce Motion cross-fade are
     /// the engine's too. The dock binding hands every move to `toolbar.dock`.
-    @ViewBuilder
-    private func layer(size: CGSize) -> some View {
-        let compact = sizeClass == .compact
+    var body: some View {
         let dock = model.dock(for: size, compact: compact)
         let inks = model.quickInks(compact: compact)
+        let items = model.items(compact: compact)
         ZStack(alignment: .topLeading) {
             if model.showsPalette {
                 if model.isVisible {
-                    NibToolPalette(id: ToolbarModel.paletteID, tools: model.shown.map { tool($0) },
-                                   moreTools: model.more.map { tool($0) }, selection: selection,
+                    NibToolPalette(id: ToolbarModel.paletteID, tools: items.shown.map { tool($0) },
+                                   moreTools: items.more.map { tool($0) }, selection: selection,
                                    swatches: inks.map { swatch($0) }, swatch: swatchIndex(inks),
                                    dock: dockBinding(dock),
                                    toolOptions: { model.toolOptions(for: $0) },
@@ -545,7 +543,6 @@ struct ToolbarRootView: View {
         .onChange(of: WindowMetrics(size: size, compact: compact), initial: true) { _, window in
             model.windowDidChange(size: window.size, compact: window.compact)
         }
-        .onNibBudChange { open in model.budOpen = open }
     }
 
     /// Reads the dock the palette shows; a release or a "Move palette to…" action that changes it runs `toolbar.dock`.

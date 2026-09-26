@@ -4,9 +4,10 @@ import Combine
 import NibContracts
 import NibDesign
 
-/// F016 Toolbar & tool switching: the document's tool palette (`ui.screens.toolbar`), tool switching (sticky and
-/// non-sticky tools, last tool per document kind), single-key tool shortcuts, the active tool's options bar, toolbar
-/// hiding, and the customisation sheet with saved layouts.
+/// F016 Toolbar & tool switching: the document's tool palette (`ui.screens.toolbarView`, placed by the document chrome
+/// inside its one droplet container), the last tool per document kind, single-key tool shortcuts, the active tool's
+/// options bar and its popover, toolbar hiding, and the customisation sheet with saved layouts. Non-sticky tools hand
+/// back themselves (`CanvasHost.finishToolUse`, contracts-v2).
 public enum FeatToolbarFeature: NibFeature {
     public static let id = "toolbar"
 
@@ -16,7 +17,10 @@ public enum FeatToolbarFeature: NibFeature {
         ToolbarCommands.register(app.commands)
         ToolbarSettings.declare(app.settings, owner: id)
 
-        app.ui.screens.toolbar = { session, app in ToolbarHostView(app: app, session: session) }
+        // contracts-v2: a SwiftUI screen the chrome places inside its own droplet container, full window (the palette
+        // docks below the bars itself), so the palette merges and recedes with the bars and needs no UIKit
+        // pass-through. The superseded UIView slot (`screens.toolbar`) stays empty.
+        app.ui.screens.toolbarView = { session, app in AnyView(ToolbarScreen(app: app, session: session)) }
 
         let customize = String(localized: "Customise Toolbar")
         app.ui.panels.register(PanelDescriptor(
@@ -68,12 +72,15 @@ struct ToolbarWindowState {
     weak var undoManager: UndoManager? = nil
 }
 
-/// App-wide toolbar state, shared by the commands and every window's palette (a service, `serviceKey`).
+/// Per-window toolbar state, shared by the commands and every window's palette (a service, `serviceKey`): which
+/// palettes are hidden, each window's size class and UndoManager, and the Undo/Redo replays of `toolbar.dock`.
+/// Commands read the registries through `CommandContext.app` (contracts-v2); the app kept here serves the runtime's
+/// own jobs only (tool keys, dock replays).
 @MainActor
 final class ToolbarRuntime: ObservableObject {
     static let serviceKey = "toolbar.runtime"
 
-    private(set) weak var app: NibApp?
+    private weak var app: NibApp?
     /// Windows whose palette is hidden (`toolbar.setVisible`). Window state: never persisted.
     @Published private(set) var hiddenSessions: Set<NibID> = []
     private var windows: [NibID: ToolbarWindowState] = [:]
@@ -111,13 +118,12 @@ final class ToolbarRuntime: ObservableObject {
     }
 
     /// Where the palette of `session`'s window docks now, from the stored setting (never a drag in flight).
-    func currentDock(_ session: EditorSession?) -> NibPaletteDock {
+    func currentDock(_ session: EditorSession?, settings: SettingsStore) -> NibPaletteDock {
         let compact = isCompact(session)
         let size = session.flatMap { windows[$0.id]?.size } ?? .zero
         let fallback = size == .zero ? NibPaletteDock(edge: compact ? .bottom : .leading)
                                      : ToolbarDockRules.defaultDock(size: size, compact: compact)
-        return ToolbarDockRules.effective(saved: app.flatMap { ToolbarStore.dock($0.settings) }, defaultDock: fallback,
-                                          compact: compact)
+        return ToolbarDockRules.effective(saved: ToolbarStore.dock(settings), defaultDock: fallback, compact: compact)
     }
 
     /// Registers the step back from `next` to `previous` on the window's UndoManager, named "Move Palette".
@@ -168,18 +174,6 @@ final class ToolbarRuntime: ObservableObject {
         }
     }
 
-    /// `CanvasTool.isSticky` of a registered tool (unknown tools count as sticky). Asked afresh each time: a tool may
-    /// read it from a setting (a pinned text tool). Runs only on a tool change or a user commit.
-    func isSticky(_ tool: String) -> Bool {
-        guard let make = app?.ui.canvasTools.get(tool)?.make else { return true }
-        return make().isSticky
-    }
-
-    func entries(for kind: DocumentKind?) -> [ToolbarEntry] {
-        guard let app else { return [] }
-        return ToolbarLayoutEngine.entries(in: app, kind: kind)
-    }
-
     func start() {
         guard !started, let app else { return }
         started = true
@@ -214,11 +208,13 @@ final class ToolbarRuntime: ObservableObject {
 enum ToolbarShortcuts {
     static let prefix = "toolbar.key."
 
-    /// W shows or hides the writing tools.
+    /// W shows or hides the writing tools, in the documents that have a palette.
     static var writingTools: KeyCommandDescriptor {
-        KeyCommandDescriptor(id: prefix + "writingTools", title: String(localized: "Show or Hide Tools"),
-                             shortcut: KeyShortcut("w"), command: "toolbar.setVisible", params: [:], scope: .canvas,
-                             order: 0, owner: FeatToolbarFeature.id)
+        var key = KeyCommandDescriptor(id: prefix + "writingTools", title: String(localized: "Show or Hide Tools"),
+                                       shortcut: KeyShortcut("w"), command: "toolbar.setVisible", params: [:],
+                                       scope: .canvas, order: 0, owner: FeatToolbarFeature.id)
+        key.docKinds = ToolbarLayoutEngine.paletteKinds
+        return key
     }
 
     static func normalized(_ s: KeyShortcut) -> KeyShortcut {
@@ -226,7 +222,9 @@ enum ToolbarShortcuts {
     }
 
     /// W, then one command per item shortcut in registry order: `tool.select` for tools, the item's command
-    /// otherwise. The first item to claim a key keeps it; keys in `taken` are skipped.
+    /// otherwise. The first item to claim a key keeps it; keys in `taken` are skipped. Each key works only in the
+    /// document kinds its item shows in, and a command item's `sessionParams` go with its key (contracts-v2: the shell
+    /// passes `resolvedParams(for:)`).
     static func commands(for items: [ToolbarItemDescriptor], taken: Set<KeyShortcut>, owner: String) -> [KeyCommandDescriptor] {
         var used = taken
         var out: [KeyCommandDescriptor] = []
@@ -245,8 +243,11 @@ enum ToolbarShortcuts {
                 continue
             }
             guard used.insert(normalized(shortcut)).inserted else { continue }
-            out.append(KeyCommandDescriptor(id: prefix + d.id, title: d.title, shortcut: shortcut, command: command,
-                                            params: params, scope: .canvas, order: out.count, owner: owner))
+            var key = KeyCommandDescriptor(id: prefix + d.id, title: d.title, shortcut: shortcut, command: command,
+                                           params: params, scope: .canvas, order: out.count, owner: owner)
+            key.docKinds = d.docKinds
+            if d.toolID == nil { key.sessionParams = d.sessionParams }
+            out.append(key)
         }
         return out
     }

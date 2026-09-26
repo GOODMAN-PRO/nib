@@ -520,18 +520,23 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertEqual(model.quickInks(compact: true).map { $0.index }, [2])
     }
 
-    /// Stickiness is asked afresh: a tool may read it from a setting (F026's pinned text tool).
-    func testStickinessIsReadEveryTime() throws {
-        let h = harness()
+    /// A tool whose stickiness comes from a setting, like F026's pinned text tool.
+    private func registerPinnableNote(_ h: Harness) {
         let settings = h.app.settings
         h.app.ui.canvasTools.register(CanvasToolDescriptor(id: "note", title: "note", owner: TestToolsFeature.id) {
             TestTool(id: "note", isSticky: settings.json("testtools.notePinned")?.boolValue ?? false)
         })
-        let runtime = try XCTUnwrap(h.app.services.get(ToolbarRuntime.serviceKey, as: ToolbarRuntime.self))
-        XCTAssertFalse(runtime.isSticky("note"))
-        settings.setJSON("testtools.notePinned", true)
-        XCTAssertTrue(runtime.isSticky("note"))
-        XCTAssertTrue(runtime.isSticky("unknown"), "an unknown tool counts as sticky")
+    }
+
+    /// Stickiness is asked afresh: a tool may read it from a setting (F026's pinned text tool).
+    func testStickinessIsReadEveryTime() throws {
+        let h = harness()
+        registerPinnableNote(h)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertFalse(model.isSticky("note"))
+        h.app.settings.setJSON("testtools.notePinned", true)
+        XCTAssertTrue(model.isSticky("note"))
+        XCTAssertTrue(model.isSticky("unknown"), "an unknown tool counts as sticky")
     }
 
     func testVisibilityIsPerWindowAndTogglesWithoutAValue() async throws {
@@ -585,34 +590,67 @@ final class FeatToolbarTests: XCTestCase {
         h.app.ui.toolbar.unregister(owner: "com.example.stamps")
         runtime.syncKeyCommands()
         XCTAssertNil(h.app.content.keyCommands.get("toolbar.key.stamps.stamp"))
+
+        // contracts-v2: a key works only in the kinds its item shows in, and a command item's `sessionParams` go with
+        // its key (the shell passes `resolvedParams(for:)`).
+        XCTAssertEqual(pen.docKinds, Set<DocumentKind>([.notebook, .whiteboard]))
+        XCTAssertEqual(h.app.content.keyCommands.get("toolbar.key.writingTools")?.docKinds, ToolbarLayoutEngine.paletteKinds)
+        var zoom = ToolbarItemDescriptor(
+            id: "zoom.item", title: "Zoom Window", icon: "plus.magnifyingglass", group: .accessories, order: 60,
+            owner: TestToolsFeature.id, command: "zoom.toggle", params: ["mode": "window"], shortcut: KeyShortcut("z"),
+            docKinds: [.notebook])
+        zoom.sessionParams = { s in ["session": .string(s.id.raw)] }
+        h.app.ui.toolbar.register(zoom)
+        runtime.syncKeyCommands()
+        let key = try XCTUnwrap(h.app.content.keyCommands.get("toolbar.key.zoom.item"))
+        XCTAssertEqual(key.docKinds, Set<DocumentKind>([.notebook]))
+        XCTAssertEqual(key.resolvedParams(for: h.session),
+                       JSONValue.object(["mode": "window", "session": .string(h.session.id.raw)]))
+        XCTAssertNil(pen.sessionParams, "tool keys select the tool")
     }
 
-    func testNonStickyToolHandsBackAndLastToolIsRemembered() async throws {
+    /// T-035 with contracts-v2: a non-sticky tool hands back by itself when it finishes one use
+    /// (`CanvasHost.finishToolUse`); the palette never switches tools on a commit of its own, and remembers only
+    /// sticky tools as the last tool of a document kind.
+    func testNonStickyToolHandsBackThroughFinishToolUseAndLastToolIsRemembered() async throws {
         let h = harness()
+        registerPinnableNote(h)
         let model = ToolbarModel(app: h.app, session: h.session)
+        let host = FakeCanvasHost(h)
         h.session.tool = "eraser"
         try await waitUntil("the eraser is remembered") {
             h.app.settings.json("toolbar.lastTool.notebook")?.stringValue == "eraser"
         }
 
+        // A commit is not the end of a use (the text tool goes on editing the box it placed).
         h.session.tool = "text"
         try await h.run("testtools.touch")
-        try await waitUntil("the text tool hands back") { h.session.tool == "eraser" }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(h.session.tool, "text", "the palette leaves the hand-back to the tool")
+
+        // The tool finishes its use: back to the previous tool, which stays the remembered one.
+        host.finishToolUse(TestTool(id: "text", isSticky: model.isSticky("text")))
+        XCTAssertEqual(h.session.tool, "eraser")
+        try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertEqual(h.app.settings.json("toolbar.lastTool.notebook")?.stringValue, "eraser",
                        "a non-sticky tool is never the remembered one")
 
-        h.app.settings.setJSON(ToolbarSettings.textPinned, true)
-        h.session.tool = "text"
-        try await h.run("testtools.touch")
-        try await Task.sleep(nanoseconds: 200_000_000)
-        XCTAssertEqual(h.session.tool, "text", "a pinned text tool stays")
+        // A pinned tool is sticky: it stays after a use and is remembered.
+        h.app.settings.setJSON("testtools.notePinned", true)
+        h.session.tool = "note"
+        let note = try XCTUnwrap(h.app.ui.canvasTools.get("note")).make()
+        host.finishToolUse(note)
+        XCTAssertEqual(h.session.tool, "note", "a pinned tool stays")
+        try await waitUntil("the pinned tool is remembered") {
+            h.app.settings.json("toolbar.lastTool.notebook")?.stringValue == "note"
+        }
 
         // Another window opening a notebook starts with the remembered tool.
         let other = EditorSession()
         other.document = Fixtures.docID
         h.app.services.sessions.add(other)
         let otherModel = ToolbarModel(app: h.app, session: other)
-        try await waitUntil("the new window restores the eraser") { other.tool == "eraser" }
+        try await waitUntil("the new window restores the remembered tool") { other.tool == "note" }
         withExtendedLifetime([model, otherModel]) {}
     }
 
@@ -650,4 +688,126 @@ final class FeatToolbarTests: XCTestCase {
         model.selectSwatch(0)
         XCTAssertFalse(model.optionsCollapsed)
     }
+
+    /// contracts-v2: the palette is a SwiftUI screen the chrome places inside its own droplet container; there is no
+    /// UIKit layer with a second container and a touch pass-through any more.
+    func testThePaletteIsASwiftUIScreenForTheChromesContainer() {
+        let h = harness()
+        XCTAssertNotNil(h.app.ui.screens.toolbarView)
+        XCTAssertNil(h.app.ui.screens.toolbar, "the superseded UIView slot stays empty")
+        XCTAssertNotNil(h.app.ui.screens.toolbarView?(h.session, h.app))
+    }
+
+    /// contracts-v2: a tool menu's own popover (`ToolMenuDescriptor.makePopover`) reaches the palette with the options
+    /// bar; the palette's own popovers (the tool's settings, More) and folding the bar close it: one at a time.
+    func testTheOptionsBarsPopoverReachesThePalette() throws {
+        let h = harness()
+        let thickness = PopoverFlag()
+        var menu = ToolMenuDescriptor(tool: "pen", owner: TestToolsFeature.id) { _ in AnyView(EmptyView()) }
+        menu.makePopover = { _ in
+            ToolMenuPopover(source: "pen.thickness", isPresented: thickness.binding, title: "Thickness",
+                            subtitle: "0.50 mm") { EmptyView() }
+        }
+        h.app.ui.toolMenus.register(menu)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let options = try XCTUnwrap(model.toolOptions(for: "pen"))
+        let popover = try XCTUnwrap(options.popover)
+        XCTAssertEqual(popover.source, "pen.thickness")
+        XCTAssertEqual(popover.title, "Thickness")
+        XCTAssertEqual(popover.subtitle, "0.50 mm")
+        popover.isPresented.wrappedValue = true
+        XCTAssertTrue(thickness.isOpen, "the palette drives the menu's own state")
+        XCTAssertNotNil(model.toolOptions(for: "eraser"))
+        XCTAssertNil(model.toolOptions(for: "eraser")?.popover, "an item's own activeToolMenu has no popover")
+
+        model.openSettings()
+        XCTAssertTrue(model.settingsOpen)
+        XCTAssertFalse(thickness.isOpen, "the settings popover closes it")
+        model.settingsOpen = false
+        thickness.isOpen = true
+        model.moreOpen = true
+        XCTAssertFalse(thickness.isOpen, "More closes it")
+        model.moreOpen = false
+
+        thickness.isOpen = true
+        h.session.visibleRect = Rect(x: 0, y: 0, width: 400, height: 600)
+        h.session.visibleRect = Rect(x: 0, y: 40, width: 400, height: 600)
+        XCTAssertTrue(model.optionsCollapsed)
+        XCTAssertFalse(thickness.isOpen, "folding the bar closes it")
+        XCTAssertNil(model.toolOptions(for: "pen"))
+    }
+
+    /// contracts-v2 live state: the palette shows each item's title, icon, on and enabled state for this window,
+    /// re-reads them on commits and `setNeedsChromeUpdate`, taps run the item's command with the window's
+    /// `sessionParams`, a disabled item runs nothing, and a regular-width-only item stays off the iPhone palette.
+    func testItemsFollowTheirLiveState() async throws {
+        let h = harness()
+        let log = DockLog()
+        h.app.services.set(log, for: DockLog.key)
+        h.app.commands.register(TestDockSpy.self)
+        let flags = LiveFlags()
+        var zoom = ToolbarItemDescriptor(
+            id: "zoom.item", title: "Zoom Window", icon: "plus.magnifyingglass", group: .accessories, order: 60,
+            owner: TestToolsFeature.id, command: TestDockSpy.descriptor.id, params: ["command": "zoom.toggle"])
+        zoom.isOn = { _ in flags.on }
+        zoom.isEnabled = { _ in flags.enabled }
+        zoom.sessionTitle = { _ in flags.on ? "Close Zoom Window" : "Zoom Window" }
+        zoom.sessionIcon = { _ in flags.on ? "plus.magnifyingglass.circle.fill" : "plus.magnifyingglass" }
+        zoom.sessionParams = { s in ["params": ["session": .string(s.id.raw)]] }
+        zoom.showsInCompactWidth = false
+        h.app.ui.toolbar.register(zoom)
+
+        let model = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertTrue(model.hasLiveState)
+        func item() -> PaletteItem? { model.more.first { $0.id == "zoom.item" } }
+        XCTAssertEqual(item()?.title, "Zoom Window")
+        XCTAssertNil(item()?.value)
+        XCTAssertTrue(model.items(compact: false).more.contains { $0.id == "zoom.item" })
+        XCTAssertFalse(model.items(compact: true).more.contains { $0.id == "zoom.item" }, "regular widths only")
+
+        model.select("zoom.item")
+        try await waitUntil("the tap runs the command with the window's params") { log.calls.count == 1 }
+        XCTAssertEqual(log.calls.first, JSONValue.object(["session": .string(h.session.id.raw)]))
+
+        flags.on = true
+        h.app.ui.setNeedsChromeUpdate(h.session)
+        try await waitUntil("setNeedsChromeUpdate re-reads the state") { item()?.title == "Close Zoom Window" }
+        XCTAssertEqual(item()?.icon, "plus.magnifyingglass.circle.fill")
+        XCTAssertEqual(item()?.value, "On")
+
+        flags.on = false
+        flags.enabled = false
+        try await h.run("testtools.touch")
+        try await waitUntil("a commit re-reads the state") { item()?.isEnabled == false }
+        XCTAssertEqual(item()?.value, "Unavailable")
+        XCTAssertEqual(item()?.title, "Zoom Window")
+        model.select("zoom.item")
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(log.calls.count, 1, "a disabled item runs nothing")
+    }
+
+    /// contracts-v2: the palette follows Settings › Appearance › Liquid (`NibSettings.liquidMode`).
+    func testThePaletteFollowsTheLiquidSetting() async throws {
+        let h = harness()
+        let model = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertEqual(model.liquidMode, .full)
+        h.app.settings.set(NibSettings.liquidMode, "calm")
+        try await waitUntil("the palette goes calm") { model.liquidMode == .calm }
+        h.app.settings.set(NibSettings.liquidMode, "off")
+        try await waitUntil("and off") { model.liquidMode == .off }
+        h.app.settings.set(NibSettings.liquidMode, "wobbly")
+        try await waitUntil("an unknown value is full") { model.liquidMode == .full }
+    }
+}
+
+/// An options-bar popover's presentation, owned by the tool menu (as F008 owns its thickness popover).
+final class PopoverFlag {
+    var isOpen = false
+    var binding: Binding<Bool> { Binding(get: { self.isOpen }, set: { self.isOpen = $0 }) }
+}
+
+/// A toolbar item's live state, owned by the feature that registers it.
+final class LiveFlags {
+    var on = false
+    var enabled = true
 }

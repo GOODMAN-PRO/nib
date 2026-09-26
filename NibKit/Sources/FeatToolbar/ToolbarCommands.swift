@@ -5,28 +5,15 @@ import NibDesign
 
 // MARK: - Layout model
 
-/// The palette layout: one layout for every notebook and whiteboard. `order` is the palette order of toolbar item ids
-/// (`ToolbarItemDescriptor.id`); `hidden` are the items taken off the palette into More (the customisation sheet's
-/// red − and green +, DESIGN.md §14.3). Items the layout never mentions follow the defaults, so a newly installed
-/// plugin's tool appears on the palette and a new built-in accessory waits in More.
-struct ToolbarLayout: Codable, Equatable {
-    var order: [String]
-    var hidden: [String]
+/// The palette layout: one layout for every notebook and whiteboard, stored in the shared setting
+/// `NibSettings.toolbarLayout` (contracts-v2), which F043's palette and plugins read. `order` is the palette order of
+/// toolbar item ids (`ToolbarItemDescriptor.id`); `hidden` are the items taken off the palette into More (the
+/// customisation sheet's red − and green +, DESIGN.md §14.3). Items the layout never mentions follow the defaults, so
+/// a newly installed plugin's tool appears on the palette and a new built-in accessory waits in More. It decodes
+/// leniently: a layout written by a plugin, the AI or an older build may leave either list out.
+typealias ToolbarLayout = ToolbarLayoutSetting
 
-    init(order: [String] = [], hidden: [String] = []) {
-        self.order = order
-        self.hidden = hidden
-    }
-
-    enum CodingKeys: String, CodingKey { case order, hidden }
-
-    /// Lenient: a layout written by a plugin, the AI or an older build may leave either list out.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        order = try c.decodeIfPresent([String].self, forKey: .order) ?? []
-        hidden = try c.decodeIfPresent([String].self, forKey: .hidden) ?? []
-    }
-
+extension ToolbarLayoutSetting {
     var isEmpty: Bool { order.isEmpty && hidden.isEmpty }
 
     static let schema: JSONSchema = .obj(["order": .arr(.str("toolbar item id, in palette order")),
@@ -121,16 +108,15 @@ enum ToolbarDockRules {
 // MARK: - Settings
 
 enum ToolbarSettings {
-    /// The current layout. Synced: it follows the library to the user's other devices.
-    static let layout = SettingKey<ToolbarLayout?>("toolbar.layout", default: nil, synced: true)
+    /// The current layout (`NibSettings.toolbarLayout`, re-declared here by its owner). Synced: it follows the library
+    /// to the user's other devices.
+    static let layout = NibSettings.toolbarLayout
     /// Saved layouts, one synced key per name ("toolbar.layouts.<name>"), so two devices saving at once never clash.
     static let layoutsPrefix = "toolbar.layouts."
     /// Last-used tool per document kind ("toolbar.lastTool.notebook"), this device only.
     static let lastToolPrefix = "toolbar.lastTool."
     /// Where the palette docks, this device only. Written by `toolbar.dock` only.
     static let dock = SettingKey<ToolbarDockSetting?>("toolbar.dock", default: nil)
-    /// Declared by the text feature (F026): a pinned text tool stays selected after it places a box.
-    static let textPinned = "text.pinned"
 
     static func declare(_ s: SettingsStore, owner: String) {
         s.declare(layout, summary: "Toolbar layout: palette order of toolbar item ids and the ids moved into More.",
@@ -216,12 +202,19 @@ enum ToolbarCommands {
 }
 
 extension CommandContext {
-    /// The feature's runtime service (registered in `FeatToolbarFeature.register`): registries and window state.
+    /// The feature's per-window state (registered in `FeatToolbarFeature.register`): hidden palettes, window size
+    /// classes and UndoManagers. Registries are read through `app` (contracts-v2), never through this.
     func toolbarRuntime() throws -> ToolbarRuntime {
         guard let runtime = services.get(ToolbarRuntime.serviceKey, as: ToolbarRuntime.self) else {
             throw NibError.unavailable("the toolbar")
         }
         return runtime
+    }
+
+    /// Palette items of one document kind (every kind that has a palette when nil), from the app's registries.
+    func toolbarEntries(for kind: DocumentKind?) throws -> [ToolbarEntry] {
+        guard let app else { throw NibError.unavailable("the toolbar") }
+        return ToolbarLayoutEngine.entries(in: app, kind: kind)
     }
 
     /// Kind of the invoking window's document, nil without one.
@@ -245,7 +238,7 @@ struct ToolbarSetLayout: NibCommand {
         examples: [ToolbarCommands.exampleLayout], effect: .session, target: .app)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> ToolbarLayout {
-        let entries = try ctx.toolbarRuntime().entries(for: nil)
+        let entries = try ctx.toolbarEntries(for: nil)
         let layout = try ToolbarLayoutEngine.sanitized(ToolbarLayout(order: p.order, hidden: p.hidden), entries: entries)
         ToolbarStore.setCurrent(layout, ctx.services.settings)
         return layout
@@ -273,7 +266,7 @@ struct ToolbarReset: NibCommand {
         guard let part = ToolbarPart(rawValue: p.part) else {
             throw NibError(.invalidParams, "part is toolbar, tools or accessories", path: "$.part")
         }
-        let entries = try ctx.toolbarRuntime().entries(for: nil)
+        let entries = try ctx.toolbarEntries(for: nil)
         let s = ctx.services.settings
         let layout = ToolbarLayoutEngine.reset(ToolbarStore.current(s), part: part, entries: entries)
         ToolbarStore.setCurrent(layout, s)
@@ -338,7 +331,7 @@ struct ToolbarLayouts: NibCommand {
         let s = ctx.services.settings
         let current = ToolbarStore.current(s)
         let runtime = try ctx.toolbarRuntime()
-        let entries = runtime.entries(for: ctx.toolbarDocumentKind)
+        let entries = try ctx.toolbarEntries(for: ctx.toolbarDocumentKind)
         let arrangement = ToolbarLayoutEngine.arrange(entries, layout: current)
         let onPalette = Set(arrangement.shown)
         let byID = Dictionary(entries.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -352,7 +345,7 @@ struct ToolbarLayouts: NibCommand {
         }
         return Output(current: current, layouts: layouts, items: items,
                       visible: ctx.activeSession.map { runtime.isVisible($0) },
-                      dock: ToolbarDock.Position(runtime.currentDock(ctx.activeSession)))
+                      dock: ToolbarDock.Position(runtime.currentDock(ctx.activeSession, settings: s)))
     }
 }
 
@@ -370,7 +363,7 @@ struct ToolbarSaveLayout: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NamedToolbarLayout {
         let name = try ToolbarStore.validName(p.name)
         let s = ctx.services.settings
-        let entries = try ctx.toolbarRuntime().entries(for: nil)
+        let entries = try ctx.toolbarEntries(for: nil)
         let current = ToolbarStore.current(s)
         let layout = ToolbarLayoutEngine.materialize(ToolbarLayoutEngine.arrange(entries, layout: current),
                                                      keeping: current)
@@ -397,7 +390,7 @@ struct ToolbarApplyLayout: NibCommand {
             throw NibError(.notFound, "no saved toolbar layout named '\(name)'",
                            hint: "call toolbar.layouts for the saved names")
         }
-        let layout = try ToolbarLayoutEngine.sanitized(saved, entries: ctx.toolbarRuntime().entries(for: nil))
+        let layout = try ToolbarLayoutEngine.sanitized(saved, entries: ctx.toolbarEntries(for: nil))
         ToolbarStore.setCurrent(layout, s)
         return NamedToolbarLayout(name: name, layout: layout)
     }
@@ -491,7 +484,7 @@ struct ToolbarDock: NibCommand {
         if edge.isVertical && runtime.isCompact(session) {
             throw NibError(.invalidParams, compactRefusal, path: "$.dock", hint: "use top or bottom")
         }
-        let previous = runtime.currentDock(session)
+        let previous = runtime.currentDock(session, settings: ctx.services.settings)
         let next = NibPaletteDock(edge: edge, along: ToolbarDockRules.along(p.along, edge: edge, current: previous))
         ToolbarStore.setDock(next, ctx.services.settings)
         if !isReplay { runtime.registerUndo(from: previous, to: next, session: session) }
