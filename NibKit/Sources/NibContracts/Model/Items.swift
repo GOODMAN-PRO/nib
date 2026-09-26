@@ -57,6 +57,12 @@ public struct ShapeItem: Codable, Equatable {
     public var frame: Frame
     /// Vertices / control points in page coordinates (line, polyline, polygon, arc, curve, arrow).
     /// Empty for box shapes, which are defined by `frame` alone.
+    /// contracts-v2 (pinned): points are CONTROL points, never points the curve passes through, so the shape stays inside
+    /// the points' bounds and `Item.bounds` is right.
+    /// - `.curve`: Bézier control points: 2 = straight, 3 = quadratic, 4 = cubic, 5+ = clamped uniform B-spline.
+    /// - `.arc`: [start, control, end]. For sweeps under 170° `control` is where the tangents at start and end meet
+    ///   (a conic arc, circular when |control − start| = |control − end|); wider sweeps and parabolas are sent as a
+    ///   quadratic start / control / end. Convert three through-points with `ShapeItem.quadraticControl(through:_:_:)`.
     public var points: [Point]
     public var style: ShapeItemStyle
     public var text: RichText?
@@ -67,6 +73,12 @@ public struct ShapeItem: Codable, Equatable {
         self.points = points
         self.style = style
         self.text = text
+    }
+
+    /// contracts-v2: the quadratic Bézier control points [start, control, end] of the curve through `start`, `mid` (at
+    /// t = 0.5) and `end`: control = 2·mid − (start + end) / 2.
+    public static func quadraticControl(through start: Point, _ mid: Point, _ end: Point) -> [Point] {
+        [start, Point(2 * mid.x - (start.x + end.x) / 2, 2 * mid.y - (start.y + end.y) / 2), end]
     }
 
     enum CodingKeys: String, CodingKey { case shape, frame, points, style, text }
@@ -162,10 +174,13 @@ public struct TextBoxStyle: Codable, Hashable {
     public var fullPage: Bool
     /// Default character attributes for runs that leave fields nil.
     public var defaults: TextAttributes
+    /// contracts-v2: paragraph defaults of a saved or default style (applied to new paragraphs); nil = natural / none.
+    public var align: ParagraphAlignment?
+    public var lineSpacing: Double?
 
     public init(background: RGBA? = nil, borderColor: RGBA? = nil, borderWidth: Double = 0, cornerRadius: Double = 0,
                 padding: Double = 4, shadow: Bool = false, autoGrow: Bool = true, fullPage: Bool = false,
-                defaults: TextAttributes = TextAttributes()) {
+                defaults: TextAttributes = TextAttributes(), align: ParagraphAlignment? = nil, lineSpacing: Double? = nil) {
         self.background = background
         self.borderColor = borderColor
         self.borderWidth = borderWidth
@@ -175,10 +190,13 @@ public struct TextBoxStyle: Codable, Hashable {
         self.autoGrow = autoGrow
         self.fullPage = fullPage
         self.defaults = defaults
+        self.align = align
+        self.lineSpacing = lineSpacing
     }
 
     enum CodingKeys: String, CodingKey {
         case background, borderColor, borderWidth, cornerRadius, padding, shadow, autoGrow, fullPage, defaults
+        case align, lineSpacing
     }
 
     public init(from decoder: Decoder) throws {
@@ -192,6 +210,8 @@ public struct TextBoxStyle: Codable, Hashable {
         autoGrow = try c.decodeIfPresent(Bool.self, forKey: .autoGrow) ?? true
         fullPage = try c.decodeIfPresent(Bool.self, forKey: .fullPage) ?? false
         defaults = try c.decodeIfPresent(TextAttributes.self, forKey: .defaults) ?? TextAttributes()
+        align = (try? c.decodeIfPresent(ParagraphAlignment.self, forKey: .align)) ?? nil
+        lineSpacing = (try? c.decodeIfPresent(Double.self, forKey: .lineSpacing)) ?? nil
     }
 }
 
@@ -227,6 +247,10 @@ public struct ImageItem: Codable, Equatable {
     /// Animated GIF: tiles show the first frame, a live view animates it while visible.
     public var animated: Bool
     public var altText: String?
+    /// contracts-v2: mirrored horizontally / vertically inside the frame (after `crop`); nil = not flipped. Every
+    /// drawer, live view and export honours them.
+    public var flipX: Bool?
+    public var flipY: Bool?
 
     public init(frame: Frame, asset: AssetRef, crop: Rect? = nil, mask: [Point]? = nil, animated: Bool = false, altText: String? = nil) {
         self.frame = frame
@@ -237,7 +261,7 @@ public struct ImageItem: Codable, Equatable {
         self.altText = altText
     }
 
-    enum CodingKeys: String, CodingKey { case frame, asset, crop, mask, animated, altText }
+    enum CodingKeys: String, CodingKey { case frame, asset, crop, mask, animated, altText, flipX, flipY }
 
     /// Lenient: `frame` and `asset` are required.
     public init(from decoder: Decoder) throws {
@@ -248,6 +272,8 @@ public struct ImageItem: Codable, Equatable {
         mask = try c.decodeIfPresent([Point].self, forKey: .mask)
         animated = try c.decodeIfPresent(Bool.self, forKey: .animated) ?? false
         altText = try c.decodeIfPresent(String.self, forKey: .altText)
+        flipX = try c.decodeIfPresent(Bool.self, forKey: .flipX)
+        flipY = try c.decodeIfPresent(Bool.self, forKey: .flipY)
     }
 }
 
@@ -386,10 +412,15 @@ public struct DisplayOp: Codable, Equatable {
     public var spacing: Double?
     /// Corner radius (rect) or dot radius (dots).
     public var radius: Double?
+    /// contracts-v2: `text` alignment inside `rect` (nil = natural / left).
+    public var align: ParagraphAlignment?
+    /// contracts-v2: `text` weight of the system font (ignored with `fontName`); nil = regular.
+    public var weight: DisplayFontWeight?
 
     public init(op: DisplayOpKind, rect: Rect? = nil, points: [Point]? = nil, stroke: RGBA? = nil, fill: RGBA? = nil,
                 width: Double? = nil, dash: [Double]? = nil, text: String? = nil, fontSize: Double? = nil,
-                fontName: String? = nil, asset: AssetRef? = nil, spacing: Double? = nil, radius: Double? = nil) {
+                fontName: String? = nil, asset: AssetRef? = nil, spacing: Double? = nil, radius: Double? = nil,
+                align: ParagraphAlignment? = nil, weight: DisplayFontWeight? = nil) {
         self.op = op
         self.rect = rect
         self.points = points
@@ -403,7 +434,14 @@ public struct DisplayOp: Codable, Equatable {
         self.asset = asset
         self.spacing = spacing
         self.radius = radius
+        self.align = align
+        self.weight = weight
     }
+}
+
+/// contracts-v2: font weights a `DisplayOp` text can use (template headings, planner labels).
+public enum DisplayFontWeight: String, Codable, CaseIterable {
+    case light, regular, medium, semibold, bold, heavy
 }
 
 /// A tiny vector format drawn by the host renderer (templates, plugin items, math graphs, AI diagrams).

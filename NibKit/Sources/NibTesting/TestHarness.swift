@@ -374,7 +374,10 @@ public final class Harness {
     public let confirmer: AutoConfirm
 
     /// `deviceID` lets two-device tests (sync, collaboration) give each app its own HLC device id (e.g. 7 and 8).
-    public init(features: [NibFeature.Type] = [], fixtures: Bool = true, deviceID: UInt32 = 7) {
+    /// contracts-v2: `keepFeatureServices: true` keeps the persistence, library and asset store the features installed
+    /// in `register` (the real store in F001/F025 acceptance tests) instead of putting the in-memory ones back.
+    public init(features: [NibFeature.Type] = [], fixtures: Bool = true, deviceID: UInt32 = 7,
+                keepFeatureServices: Bool = false) {
         NibApp.isHostlessTest = true
         if !(Keychain.store is InMemorySecretStore) { Keychain.store = InMemorySecretStore() }
         let persistence = InMemoryPersistence()
@@ -400,11 +403,29 @@ public final class Harness {
             session.page = Fixtures.page1
         }
         app.register(features)
-        // Features may install real services in `register`; tests keep the in-memory ones.
-        app.workspace.persistence = persistence
-        app.services.library = library
-        app.services.assets = assets
-        app.settings.syncedBackend = nil
+        // Features may install real services in `register`; tests keep the in-memory ones unless asked not to.
+        if !keepFeatureServices {
+            app.workspace.persistence = persistence
+            app.services.library = library
+            app.services.assets = assets
+            app.settings.syncedBackend = nil
+        }
+    }
+
+    /// contracts-v2: writes items onto a page as the user in ONE undo step (one batch `DocTransaction.put`), without
+    /// needing the features that own ink or item commands. Returns the written items (z, rev and provenance stamped).
+    @discardableResult
+    public func insert(_ items: [Item], page: PageID = Fixtures.page1, doc: DocumentID = Fixtures.docID) async throws -> [Item] {
+        let id = "nibtesting.insert"
+        var written: [Item] = []
+        app.commands.register(CommandDescriptor(id: id, title: "Insert Items", summary: "NibTesting helper.",
+                                                effect: .edit, exposure: .ui)) { _, ctx in
+            written = try ctx.mutate { tx in try tx.put(items, doc: doc, page: page) }
+            return .null
+        }
+        defer { app.commands.unregister(id: id) }
+        try await app.bus.execute(Invocation(command: id, session: session))
+        return written
     }
 
     /// Runs a command through the JSON path (validation, permissions, confirmation) and returns its value.

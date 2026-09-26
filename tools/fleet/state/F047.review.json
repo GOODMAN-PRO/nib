@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTextDoc/BlockCell.swift:825-848 (BlockCell.setMediaContent), :875-882 (prepareForReuse); views come from TextDocViewController.swift:976-995 (embeddedView(for:))",
+      "problem": "Embedded ui.blockViews views (F048 tables, plugin custom block views) are cached once per block in the editor and shared by every cell that shows that block. setMediaContent re-attaches a view only when `mediaContent !== view`, and prepareForReuse never clears mediaContent. Here is how the view goes missing. Cell A shows table T. T scrolls off and later comes back in cell B, so B.media.addSubview(E) moves the view out of A, but A.mediaContent still points at E. T scrolls off again and returns in A. A sees mediaContent === E and adds nothing, while E is still inside B (in the reuse pool) or was already removed when B was reused. The table then shows as an empty box of its reserved height. Scrolling any document with a table or a custom-view block past the reuse pool (prefetching makes this more likely) blanks it.",
+      "fix": "In setMediaContent, attach whenever the view is not already in this cell: `if mediaContent !== view || (view != nil && view?.superview !== media) { if let old = mediaContent, old !== view, old.superview === media { old.removeFromSuperview() }; if let v = view, v.superview !== media { v.removeFromSuperview(); media.addSubview(v); activate the four edge constraints } ; mediaContent = view }`. In prepareForReuse, when mediaIsEmbedded, remove mediaContent from media if its superview is media, then set mediaContent = nil and mediaIsEmbedded = false. Add a test: build two BlockCells with a stub BlockCellHost whose embeddedView returns one shared UIView for a table block. Configure A, then B, then A again, and assert `view.isDescendant(of: cellA.contentView)`."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTextDoc/TextDocViewController.swift:1177-1181 (textView(_:editMenuForTextIn:suggestedActions:))",
+      "problem": "The edit menu over selected block text shows only TextDocHooks.editMenuProviders. The ui.menus entries at MenuLocation.textSelection never appear, although NibContracts documents that location as 'Selected typed text (text boxes, blocks)' and PLUGIN_API §5.2 offers it to plugins with ctx.ref = \"block:D/B\". F047 owns the only text views for blocks, so no other feature can render them. As a result, F029's Link item (its textSelectionParams is written for text-document blocks, which it notes never set session.selection) and every plugin textSelection item are unreachable in text documents. That breaks a registry extension point and the modify-anything guarantee for text-document text.",
+      "fix": "In editMenuForTextIn, build `let ctx = MenuContext(app: app, session: session, doc: documentID, ref: blockRef(id))`. When range.length > 0, append `menuElements(app.ui.menuItems(.textSelection, ctx), ctx)` (the same helper the block menu uses, so submenus and destructive flags carry over), then the hook providers. Return `UIMenu(children: suggestedActions + items + extra)` whenever items or extra is non-empty. Do this for captions too, with the same block ref. Add a test: register a MenuItemDescriptor at .textSelection in a Harness, load the editor, focus FIXTUREBLK02 with a non-empty selection, call the delegate method, and assert the returned menu contains that title."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/TextDocViewController.swift:863-898 (evaluateTitleOnOpen / scheduleTitleUpdate / applyTitle)",
+      "problem": "D-132 automatic naming exists only while the editor is open, and its state is inferred again on every open. Suppose the first line is changed while the document is closed (AI chat from the library, bridge, plugin, or a sync from another device), or the library adjusts the requested name (for example de-duplication). On the next open, current != derived is read as a manual rename. Automatic naming then switches off for good and the title stays stale. Separately, the 0.8 s debounce renames the library entry (and its package on disk) at every short pause while a title is being typed, which causes rename and sync churn.",
+      "fix": "Keep the last automatically applied title per document. For example, declare `textdoc.autoTitle.` with app.settings.declarePrefix (device-local) and write it through settings.set after a successful library.rename. In evaluateTitleOnOpen, set autoTitle = current == storedAutoTitle || current == derived || derived == nil. When autoTitle is true and derived != current, schedule an update right away so the title catches up after edits made while the document was closed. Raise the debounce to about 2 s, and also rename immediately when the first text block ends editing."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/TextDocViewController.swift:426-454 (enqueue/run), :464-482 (insertBlock), :828-836 (undoDocument/redoDocument)",
+      "problem": "Only the editor's own edits go through the serial commandTail queue. ⌘Z / shake / the undo bar call app.perform(edit.undo) immediately, and run(...) and insertBlock(...), which are the entry points F102/F103 hooks use, also skip the queue. When keystroke block.update calls are waiting behind a slow queued operation (a picked or pasted image being imported), several things go wrong. An undo reverts the model, BlockOverlay keeps the local text for the pending block, and the queued update then writes it back, so the undo is silently lost. A hook's Turn Into or slash-menu edit can also overtake keystrokes that are still queued, and those stale keystrokes then reapply old text.",
+      "fix": "Route undoDocument/redoDocument through the queue: `enqueue { _ = await self.run(CommandIDs.undo, [\"doc\": .string(self.docRef)]) }` (same for redo). Make run(...) and insertBlock(...) wait for the queue first, for example `let previous = commandTail; await previous?.value` at the top, or add an internal `serialized { }` helper used by all of them. Hooks then keep keystroke order."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/BlockCommands.swift:545-552 (BlockMedia.existingAsset), :555-568 (BlockMedia.importImage)",
+      "problem": "These are trust-boundary gaps. existingAsset reads the whole asset into memory on the main actor only to check that it exists. importImage loads whatever ctx.inputFile returns with Data(contentsOf:) and has no size limit, so an AI or bridge https URL that points at a huge file can exhaust memory and crash the app. It also never deletes the temporary file that inputFile downloaded for https URLs.",
+      "fix": "In existingAsset, check `store.url(ref, doc: doc) != nil` instead of reading the data. In importImage, read `try file.resourceValues(forKeys: [.fileSizeKey]).fileSize` first and throw NibError(.invalidParams, \"image is larger than 100 MB\", path: \"$.url\", hint: \"downscale it or upload a smaller file\") above the cap. Read with `Data(contentsOf: file, options: .mappedIfSafe)`. When the url started with http, remove the downloaded file with `defer { try? FileManager.default.removeItem(at: file) }`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/TextDocViewController.swift:976-995 (embeddedView(for:))",
+      "problem": "An embedded view is created once from a BlockViewContext that holds a snapshot of the block, and it is reused for as long as the kind key matches. A plugin's custom block view therefore keeps showing its creation-time data after the block's custom.data, display or height changes (undo, sync, a plugin re-insert). Entries for blocks whose kind changed stay alive until the block is deleted.",
+      "fix": "Store the CustomBlock with the cache entry for .custom blocks, and recreate the view when `block.custom != cached.custom`. Tables can stay cached, because F048 observes commits itself. When the computed key differs from the cached key, drop the cached entry (removeFromSuperview plus clear embeddedHeights[id]) before returning."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/TextDocViewController.swift:777-819 (runAIAction / presentAnswer)",
+      "problem": "S-012 per-block assistant: edit-mode quick actions rewrite the block right away, with no preview. Ask-mode answers appear in a UIAlertController, which is a poor surface for long AI text. The Slop checklist's Trust line requires that the assistant 'previews on the page before changing anything'.",
+      "fix": "Run block quick actions in ask mode (or as a dryRun Invocation) to get the proposed text. Show it in an opaque inline row under the block with Replace · Insert Below · Discard. Apply the choice with block.update or block.insert in one group. Use the same inline row for ask answers instead of an alert, and keep the plain activity indicator on the drop button while it runs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/BlockCell.swift:125-143 (BlockStyle.richText strips .attachment and U+FFFC), :234-251 (BlockTextView init)",
+      "problem": "BlockTextView has allowsEditingTextAttributes = true, so on iOS 18 users can insert Genmoji or adaptive image glyphs and paste rich text that contains inline images. richText(from:) removes every attachment and normalize deletes U+FFFC. That content disappears silently at the next commit, which is data loss of user input.",
+      "fix": "Either set `if #available(iOS 18.0, *) { supportsAdaptiveImageGlyph = false }` and, in the paste override, turn NSTextAttachment images in the pasted attributed string into image blocks inserted after the current block (the same path as blockTextViewPasteImages), or store glyphs as TextAttributes.attachment assets as F026 does."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/TextDocViewController.swift:681-685 (blockMenu 'Open Video'); BlockCell.swift:748-753 (showVideo)",
+      "problem": "block.url values that arrive through sync, remote patches or F003's generic node.set are never re-validated. 'Open Video' passes any scheme to windowScene.open, and the cell builds an LPLinkView for it.",
+      "fix": "Offer Open Video and render the link view only when `URL(string:)?.scheme` is http or https (reuse BlockMedia.videoURL's check). Otherwise show the Add Video Link placeholder."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/BlockCell.swift:11-19 (TextDocMetrics), :1046 (TableFallbackView.traitCollectionDidChange); TextDocViewController.swift:936-945 (loadImage Task.detached)",
+      "problem": "The layout sizes 680 (reading column), 640 (maximum image height) and 0.5625 are hard-coded with no NibDesign token or contract request (DESIGN.md §15.6). CI also reports two warnings: traitCollectionDidChange is deprecated in iOS 17, and a captured 'self' in the detached image load becomes an error in Swift 6.",
+      "fix": "File docs/contract-requests/F047-reading-column.md for NibMetrics.readingColumn and a max media height, and cite it in a comment on TextDocMetrics. Replace traitCollectionDidChange with `registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (v: TableFallbackView, _) in v.rebuild() }` in init. In loadImage, run only the decode detached (`let image = await Task.detached { BlockImageLoader.load(...) }.value` inside a `Task { @MainActor [weak self] in ... }`) so self is never captured by concurrent code."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTextDocTests/FeatTextDocTests.swift",
+      "problem": "The riskiest editor logic has no tests: embedded-view reuse across cells (where the major bug above lives), rendering of textSelection and block menus in the editor, the automatic-title state machine (evaluateTitleOnOpen/applyTitle with a rename made by hand or elsewhere), the block.update caption/url/asset paths (video url change, asset param, text on a divider or table refused), and TextDocMenus.moveParams.",
+      "fix": "Add tests: the BlockCell reuse test described above; a textSelection menu test through the delegate; a title test that loads the editor on a document with a fake library, edits the first block with block.update, waits past the debounce, and asserts library.rename ran, then renames by hand and asserts it stops; block.update {url} on a video block and {asset: \"fixture-image.png\"} on an image block; text on a divider and on FIXTUREBLK03 each throw invalid_params; moveParams(up/down) for the first, middle and last block."
+    }
+  ]
+}
