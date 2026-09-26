@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/FeatSidebar/PageDragDrop.swift:109-128 (PagesPayload.merge), with PagesSnapshot.payload 213-229 and ThumbnailGrid.swift dragItem 647-656; tests FeatSidebarTests.swift:279-293 and 343-405",
+      "problem": "Merging a multi-page drag of a PDF-backed notebook drops PDF data. Each dragged thumbnail gets its own item provider built from a one-page PagesSnapshot. So a stack of pages 1, 4 and 7 of one lecture PDF carries three different cut-down PDFs (PDFSubset, one page each, pdfPages [0], [3], [6]) under the same asset name. merge() keeps only the first copy of each name ('names are content hashes, so equal names are equal bytes' does not hold for cut-down PDFs). page.paste (F022 AssetTransfer.install / AssetRefs.rewriting, and the test stand-in too) maps only the kept pdfPages, so pasted pages 2..n keep source pdfPage 3 and 6, which point past the end of a one-page PDF. Their backgrounds come out blank or wrong in the target document. The acceptance round trip (app.nib.pages through page.paste) therefore fails for the common multi-page PDF case. The round-trip test uses the one-page fixture PDF, so the cut-down path never runs. testMergeKeepsDocumentOrderAndEachAssetOnce asserts the buggy keep-first behaviour.",
+      "fix": "In PagesPayload.merge, group assets by name. If any copy has pdfPages == nil (the whole file), keep that copy and drop pdfPages. Otherwise combine the cut-downs: open each copy with PDFDocument(data:) and pair pdfPages[i] with page(at: i). Dedupe by source page number, sort ascending, write a new PDFDocument with those pages, and set pdfPages to the sorted source numbers. Merge already runs inside the Task.detached in pastePages, so PDFKit stays off the main actor. Tests: generate a 3-page PDF, store it in the fixture document, and give two pages PDF backgrounds with pdfPage 0 and 2 (through a test .edit command). Build two PageDragProvider items, call model.pastePages into Fixtures.whiteboardID, and assert that the pasted asset is a 2-page PDF and that the two target pages have pdfPage 0 and 1. Update testMergeKeepsDocumentOrderAndEachAssetOnce to expect the combined pdfPages."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSidebar/ThumbnailGrid.swift:384-387 (update: any Shown change reconfigures every visible entry), 467-511 (configure builds accessibilityActions eagerly via app.ui.menuItems); FeatSidebarFeature.swift:85-92 (SidebarMenuTarget.make: content.livePages + ReorderPlan.stack per call), 238-244 (PageClipboardProbe UIPasteboard query); PagesPanel.swift:614-619 (PagesSelectionBar re-evaluates the selection menu on every model publish)",
+      "problem": "Main-thread cost grows with notebook size on every stroke and every thumbnail. Each thumbnail arrival bumps thumbnailRevision, and so does each commit on a page (every stroke while writing with the sidebar docked), each selection change and each swipe-select step. Every bump reconfigures ALL visible cells. Each configure rebuilds the UIHostingConfiguration and, even with VoiceOver off, evaluates every sidebarPage/sidebarSelection menu item's isVisible. Each of those calls workspace.content + content.livePages (filters and sorts every page record), ReorderPlan.stack over all pages and, for Paste, a UIPasteboard query. On a 1,000-page notebook that is about 10 visible cells x 10 items x an O(n log n) sort, roughly 50-100 ms on the main actor after each stroke and after each thumbnail load (a burst when the tab opens or scrolls), and it makes swipe-select lag. This breaks the chrome budget (DESIGN.md §10.16: at most 3 ms of main-thread work per frame) and is exactly the large-notebook case the review targets.",
+      "fix": "(1) Have the model publish the set of pages whose thumbnail or row changed: page ids from ThumbnailStore.onLoad and handle()'s invalidated set. Reconfigure only those entries, plus the entries whose isSelected or isCurrent actually flipped (diff the old and new selection and current page), never all visible cells. (2) Build the VoiceOver actions lazily: only while UIAccessibility.isVoiceOverRunning || isSwitchControlRunning (reconfigure visible cells on voiceOverStatusDidChangeNotification), or compute the menu items once per update and share them across cells. (3) Make SidebarMenuTarget.make O(k): check liveness with content.page(id) and sort only the k chosen records by (order, id). Compute livePageCount with a non-sorting count. Evaluate PageClipboardProbe once per menu build, or cache it per UIPasteboard.changeCount. Add a budget test: a 1,000-page generated notebook, menuItems(.sidebarPage) for one thumbnail and the selection menu for 500 selected pages, each XCTAssertLessThan(elapsed, budget * 4)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSidebar/ThumbnailGrid.swift:624-656 (itemsForBeginning / itemsForAddingTo / dragItem); PageDragDrop.swift:201-211 (PagesSnapshot.make) and 251-274 (PageDragProvider.make)",
+      "problem": "Lifting a thumbnail builds a PagesSnapshot synchronously on the main actor for every dragged page. That calls workspace.items, which runs persistence.loadItems and a decode for any page not yet in memory, and Workspace then keeps those items in pageItems for the app's lifetime. The work happens for every drag, including plain reorders inside one document, which never read the app.nib.pages payload. Select All plus a drag in a 300-page handwritten notebook stalls the lift for seconds (ARCHITECTURE §20: up to 50 ms per 1k-stroke page) and pins every page's items in memory (§20: under 400 MB with a 1,000-page PDF open). The doc comment says only the bytes are deferred, but the items are the expensive part.",
+      "fix": "At lift, capture only the doc, the page id and the page number. Let PageDragProvider.make take a `@MainActor () throws -> PagesSnapshot` builder. Register app.nib.pages with a handler that runs `Task { @MainActor in let snap = try build(); Task.detached { done(try snap.payload(store: store).encoded(), nil) } }` (catch errors into done(nil, error)) and returns nil. The drop side already awaits loadDataRepresentation, so the main actor is free and nothing deadlocks. Leave the PNG flavour as it is. Test: a builder closure that counts its calls. Assert it is not called by make/dragItem, is called once when the app.nib.pages representation is loaded, and that the round trip still passes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSidebar/PagesPanel.swift:109-130 (ThumbnailStore.request); ThumbnailGrid.swift:550-555 (prefetch) and configure 473",
+      "problem": "Thumbnail requests are never cancelled or coalesced. A fling through a long notebook queues a render for every page it passes (configure plus prefetch), and all of them run to completion. F004's thumbnail() snapshots and loads each page's items on the main actor before rendering, so the fling adds main-thread work and memory, and the pages the user stops on render last.",
+      "fix": "Keep the Task per page in ThumbnailStore. Start each render after a short coalescing delay (for example `try? await Task.sleep(nanoseconds: 40_000_000)`, then `guard !Task.isCancelled`). Cancel it in collectionView(_:cancelPrefetchingForItemsAt:) and collectionView(_:didEndDisplaying:forItemAt:) when no image has arrived. Clear `loading` on cancellation."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSidebar/FeatSidebarFeature.swift:268-276 (UnseenPages.install hook)",
+      "problem": "The unseen badges are cleared in a before-hook, so an AI dry run (preview) or a collab.markSeen call that later fails or is vetoed still clears them. A call that relies on the session default (no `pages`) clears nothing.",
+      "fix": "Register the hook with CommandHookDescriptor.guarding(...) and return nil without touching the tracker when ctx.dryRun is true. When `pages` is missing, resolve the page with ctx.pageOrSession(nil) and mark that page seen."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSidebar/ThumbnailGrid.swift:842, 847-852 (⌫ in select mode) and 581-603 (selection context menu); PagesPanel.swift:699-705",
+      "problem": "Trashing a multi-page selection asks for confirmation only from the bottom row. The ⌫ key and the selection's context menu trash every selected page without asking.",
+      "fix": "Move the confirmation onto the model: a @Published pendingTrash (item + context) that PagesSelectionBar presents. Send the key command and the context-menu Trash entry through model.requestTrash(item, context) whenever more than one page is selected."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSidebar/PageDragDrop.swift:313-333 (DroppedFiles.copy); PagesPanel.swift:437-444 (importFiles)",
+      "problem": "Files dropped on the sidebar are copied to tmp/nib-sidebar-drops/<uuid>/ and never deleted. Dropped PDFs, often tens of MB, pile up until iOS purges tmp.",
+      "fix": "After `await run(CommandIDs.importFiles, …)` returns, whether it succeeded or failed, remove each URL's parent per-drop folder with FileManager.removeItem in a detached task."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSidebar/PagesPanel.swift:405-411 (pastePages guard !loaded.isEmpty) and 439-440 (importFiles guard !urls.isEmpty)",
+      "problem": "Two drop failures are silent. When no dropped provider yields app.nib.pages bytes, or no file could be copied, the drop animates in and nothing happens, with no toast.",
+      "fix": "In both guards, post .nibCommandFailed with NibError(.unavailable, \"the dropped pages could not be read\", hint: \"drag them again\") for page.paste and the equivalent for import.files, as the decode-failure path already does."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatSidebarTests/FeatSidebarTests.swift (no ThumbnailStore coverage); PagesPanel.swift:66-131",
+      "problem": "ThumbnailStore's race logic has no test: dropping a render that finished after its page changed and re-requesting it, discarding in-flight results after removeAll (epoch), and the needsRender size threshold.",
+      "fix": "Add a test with a controllable fake PageRenderer (continuation-based, counting calls). Start a request, invalidate the page, resume it: assert a second render starts and only its image is kept. Start a request, call removeAll, resume it: assert no image and no onLoad. Assert needsRender is true for an image under 80% of the requested pixel size."
+    }
+  ]
+}
