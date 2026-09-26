@@ -226,8 +226,8 @@ final class PagesPanelModel: ObservableObject {
         let live = content.livePages
         order = live.map { $0.id }
         let unseen = UnseenPages.of(app)?.pages(in: doc) ?? []
-        let next = PageRows.make(live, filter: filter, unseen: unseen)
-        if next != rows { rows = next }
+        let nextRows = PageRows.make(live, filter: filter, unseen: unseen)
+        if nextRows != rows { rows = nextRows }
         let page = session?.page
         if page != current { current = page }
         let editable = SidebarMenuTarget.canEdit(app: app, session: session, doc: doc)
