@@ -4,7 +4,8 @@ import CoreHaptics
 import QuartzCore
 
 public enum NibHapticEvent: CaseIterable, Sendable {
-    case merge, split, bud, snap, select, armed, success, detent, warning
+    /// `plip`: a dockable droplet (the palette) arrives in its dock: one light, crisp drop, played once per landing.
+    case merge, split, bud, snap, plip, select, armed, success, detent, warning
 }
 
 /// Droplet haptics (DESIGN.md §11). Coalesced to one per 60 ms, silent while the Pencil is down or Liquid is Off.
@@ -83,6 +84,10 @@ final class PlipPlayer {
             transients([(0.30, 0.60, 0)]) { self.soft.impactOccurred(intensity: 0.4) }
         case .snap:
             transients([(0.55, 0.40, 0)]) { self.soft.impactOccurred(intensity: 0.7) }
+        case .plip:
+            // One light, crisp drop landing: lighter and sharper than a slot snap, a single transient (not the merge's
+            // two-tap plip).
+            transients([(0.40, 0.85, 0)]) { self.rigid.impactOccurred(intensity: 0.45) }
         }
     }
 
