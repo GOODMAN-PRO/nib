@@ -357,7 +357,7 @@ struct PageRotate: NibCommand {                         // conformers are @MainA
   - Flat schemas only: no `oneOf`, no `$ref`. For alternatives, use optional sibling fields.
   - Url-typed params (`url`, `urls`, `file`) resolve through `ctx.inputFile`: `tmp:<name>` refs from `asset.upload`/renders/exports, `https` URLs (downloaded), and `file://` only for the user principal or the app's tmp/Inbox. Results never hand out `file://` URLs; they return `tmp:` assets (plus base64 when asked).
   - `examples` literals: annotate nested literals (`let ex: JSONValue = […]`) or use `try! JSONValue.parse(#"…"#)` for anything longer than one line — large untyped JSONValue literals can hit "unable to type-check this expression in reasonable time" in CI.
-  - **Additive params** (contracts-v2). A command may take optional params beyond its §6.5 row (`range`, `indentBy`, `payload`, `fragment`, `cursor`, `limit`). The id and the listed params keep their meaning, and omitting the extras gives the listed behaviour. The rows are generated from forge-spec.json; the spec owner adds extras there.
+  - **Additive params** (contracts-v2). A command may take optional params beyond its §6.5 row (`range`, `indentBy`, `payload`, `fragment`, `cursor`, `limit`). The id and the listed params keep their meaning, and omitting the extras gives the listed behaviour. The rows mirror forge-spec.json, and the spec owner adds the extras in use to both.
   - **Session defaults** (contracts-v2). Key commands, toolbar buttons and menus run with static params. So `doc`, `page` and `refs` may be omitted by the user principal where the command documents a session default. Resolve them with `ctx.documentOrSession(p.doc)`, `ctx.pageOrSession(p.page)` and `ctx.refsOrSelection(p.refs)`: the invoking window's document, current page or selection. Schemas still list the params, and AI, plugin and bridge callers pass them (`edit.undo {}` from a key command undoes the window's document).
   - **Places in a document** (contracts-v2). `doc` is a document ref `doc:D` (a bare id is accepted). `position` is `before | after | start | end` (`PagePosition`). `anchor` is a page ref `page:D/P`, required for `before`/`after`. `page.add`, `page.paste` and `import.files` all use this shape.
   - **Geometry** (contracts-v2). Every point, size, delta and radius is in **page points** (top-left origin), never view points. That includes `view.scrollBy {dx, dy}`, `item.transform` and `ink.erase {path: [[x,y],…], radius}`. Sizes are `[width, height]` (`template.choose {size}`, `page.add {size}`). A frame is `[x, y, w, h]` or `[x, y, w, h, rotation]`, with rotation in radians about the centre (`Frame(array:)` / `Frame.array`). Angles in params are degrees unless the name says radians. `ShapeItem.points` are control points (see `ShapeItem` in CONTRACTS.md).
@@ -420,7 +420,7 @@ Every JSON and typed call also runs the registered **command hooks** (`app.bus.h
 
 ### 6.5 Command catalogue
 
-All commands below exist at the end of the build. Each row gives the owning feature, so any feature can call any command by id. Effects: read / session / edit / library / irreversible (user presence = shows system UI; sensitive = always confirmed for non-user callers; not undoable = `undoable: false`). Params ending in `?` are optional; `id?`/`ids?` are caller-chosen ids for created records. The feature tables are generated from the "Commands owned" lists in forge-spec.json; `Scripts/lint.py` checks that every row has as many cells as its header.
+All commands below exist at the end of the build. Each row gives the owning feature, so any feature can call any command by id. Effects: read / session / edit / library / irreversible (user presence = shows system UI; sensitive = always confirmed for non-user callers; not undoable = `undoable: false`). Params ending in `?` are optional; `id?`/`ids?` are caller-chosen ids for created records. The feature tables mirror the "Commands owned" lists in forge-spec.json: the same ids, params, effects and owners. Nothing generates them, so the spec owner edits both in the same change. `Scripts/lint.py` warns when a feature registers ids other than its list, and checks that every row has as many cells as its header. Result shapes that callers depend on are given in the summary (`→ {…}`).
 
 ### Contracts (always present, owner: NibContracts)
 
@@ -483,7 +483,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `asset.put` | edit | doc, base64? \| url?, ext | F003 | Store a binary asset in a document; returns an AssetRef. |
+| `asset.put` | edit, not undoable | doc, base64? \| url?, ext | F003 | Store a binary asset in a document; returns an AssetRef. |
 | `asset.get` | read | doc, asset | F003 | Temporary URL / base64 of an asset. |
 | `asset.upload` | session | base64, ext | F003 | Store bytes as a temporary asset and return its tmp: ref for url-taking commands. |
 
@@ -491,15 +491,15 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `audio.record` | edit (user presence), sensitive | doc, page?, action | F052 | Start or stop recording in a document (mic). |
-| `audio.play` | session | clip, t? | F052 | Play a clip from a time. |
+| `audio.record` | edit (user presence), sensitive, not undoable | doc, page?, action, id? | F052 | Start or stop recording in a document (mic). |
+| `audio.play` | session | clip, t? | F052 | Play a clip from `t` seconds after its start (default: where it was paused); the document's later clips follow. Every playback command returns the status → {clip, t, duration, playing, speed, skipSilence, noiseReduction}. |
 | `audio.pause` | session |  | F052 | Pause playback. |
 | `audio.seek` | session | t | F052 | Seek within the playing clip. |
 | `audio.setPlayback` | session | speed?, skipSilence?, noiseReduction? | F052 | Playback speed (0.5–2×), skip silence, noise reduction. |
 | `audio.rename` | edit | clip, name | F052 | Rename a clip. |
 | `audio.delete` | irreversible | clip | F052 | Delete a clip and its audio file permanently. |
 | `audio.export` | read | clip, format? | F052 | Export a clip as an audio file (temporary asset). |
-| `audio.quickRecord` | library |  | F052 | New text document and start recording immediately. |
+| `audio.quickRecord` | library | id? | F052 | New text document and start recording immediately. |
 
 ### `backup.*`
 
@@ -537,7 +537,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `bridge.setEnabled` | session | enabled | F090 | Start/stop the bridge (user only; security). |
+| `bridge.setEnabled` | session | enabled, rotateToken? | F090 | Start/stop the bridge; `rotateToken` issues a new bearer token (user only; security). |
 | `bridge.status` | read |  | F090 | Listening address, clients, last call. |
 
 ### `calendar.*`
@@ -563,7 +563,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `card.update` | edit | ref, front?, back? | F049 | Edit a card. |
 | `card.delete` | edit | refs | F049 | Delete cards. |
 | `card.move` | edit | ref, after? | F049 | Reorder a card. |
-| `card.moveTo` | edit | refs, doc | F049 | Move cards to another study set. |
+| `card.moveTo` | edit | refs, doc, ids? | F049 | Move cards to another study set. |
 
 ### `clipboard.*`
 
@@ -571,7 +571,8 @@ All commands below exist at the end of the build. Each row gives the owning feat
 |---|---|---|---|---|
 | `clipboard.copy` | read | refs | F014 | Copy items (Nib fragment + PNG + recognised text). |
 | `clipboard.cut` | edit | refs | F014 | Cut items. |
-| `clipboard.paste` | edit | page, at?, matchStyle?, ids? | F014 | Paste Nib items, images or rich text at a point. |
+| `clipboard.paste` | edit | page, at?, matchStyle?, ids?, fragment? | F014 | Paste Nib items, images or rich text at a point; `fragment` (nib-fragment/1 JSON) pastes it instead of the clipboard (canvas drops, elements, AI). |
+| `clipboard.copyText` | read | text?, url? | F014 | Put plain text and/or a link on the clipboard, replacing it (at least one; Copy Text and Copy Link menu entries). |
 
 ### `collab.*`
 
@@ -597,14 +598,14 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `comment.edit` | edit | ref, message, text | F037 | Edit a message. |
 | `comment.deleteMessage` | edit | ref, message | F037 | Delete a message (last message deletes the thread). |
 | `comment.resolve` | edit | ref, resolved | F037 | Resolve / unresolve a thread. |
-| `comment.tapAt` | session | page, point | F037 | Tap chain: open the thread under a tap. |
+| `comment.tapAt` | session | page, point, ref?, gesture? | F037 | Tap chain: open the thread under a tap. |
 
 ### `connector.*`
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
 | `connector.create` | edit | page, from, to, route?, arrowStart?, arrowEnd?, label?, id? | F032 | Connect two items (side/t anchors) or points. |
-| `connector.setPath` | edit | ref, route?, bends? | F032 | Reroute: straight/elbow/curved, add/move/remove bends, change anchors. |
+| `connector.setPath` | edit | ref, route?, bends?, from?, to? | F032 | Reroute: straight/elbow/curved, add/move/remove bends, change anchors. |
 
 ### `diagnostics.*`
 
@@ -618,7 +619,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
 | `diagram.addConnected` | edit | ref, side, shape?, id? | F032 | Quick Diagramming: create a connected shape next to a shape. |
-| `diagram.create` | edit | page, nodes, edges, layout, style?, origin?, ids? | F032 | Create a native, editable diagram (tree, flow, timeline, mind map; classic/gray/line styles). |
+| `diagram.create` | edit | page, nodes, edges, layout, style?, origin?, ids? | F032 | Create a native, editable diagram (tree, flow, timeline, mind map; classic/gray/line styles); `origin` is the top-left of its bounds (default: centred in the visible area, kept on a fixed-size page) → {refs (nodes), connectors (edges)}. |
 
 ### `dictionary.*`
 
@@ -649,13 +650,13 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `element.create` | library | refs, collection, id? | F035 | Save selected items as a reusable element. |
+| `element.create` | library | refs, collection, id?, title?, fallback? | F035 | Save selected items as a reusable element; `fallback: true` saves into 'my-elements' when the collection is not the user's (else not_found). |
 | `element.insert` | edit | page, collection, element, at?, ids? | F035 | Insert an element (its items, grouped and selected). |
 | `element.collection.create` | library | title, id? | F035 | Create a collection. |
 | `element.collection.update` | library | collection, title? \| order? | F035 | Rename / reorder a collection. |
 | `element.collection.delete` | library | collection | F035 | Delete a collection. |
 | `element.collection.list` | read |  | F035 | List element collections (yours and content packs). |
-| `element.list` | read | collection | F035 | List the elements of a collection. |
+| `element.list` | read | collection, cursor?, limit? | F035 | List the elements of a collection. |
 | `element.rename` | library | collection, element, title | F035 | Rename an element. |
 | `element.delete` | library | collection, element | F035 | Delete an element from a collection. |
 | `element.import` | library | url | F035 | Import a .nibcollection file. |
@@ -665,7 +666,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `export.run` | read | docs, pages?, format, options?, inline? | F066 | Export to PDF (editable/flattened), PNG/JPEG images, a .nibnote package or a zipped folder; returns temporary assets (tmp: refs; base64 with inline). |
+| `export.run` | read | docs, pages?, format, options?, inline? | F066 | Export to PDF (editable/flattened), PNG/JPEG images, a .nibnote package or a zipped folder; returns temporary assets (tmp: refs; base64 with inline). `options` keys include `ExportOptionKeys`: visibleLayersOnly, visibleLayers {"<documentID>": [layer]} (items on other layers are left out), annotations, background. |
 | `export.present` | read (user presence) | docs, pages? | F067 | Show the export dialog and share sheet. |
 | `export.saveToSource` | irreversible | doc | F067 | Overwrite the original imported PDF with the annotated version. |
 
@@ -686,7 +687,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `gif.search` | read | query | F035 | Search GIPHY (needs the user's GIPHY key). |
+| `gif.search` | read, sensitive | query, kind?, limit?, offset? | F035 | Search GIPHY for GIFs or stickers (`kind`; needs the user's GIPHY key). |
 
 ### `handwriting.*`
 
@@ -695,11 +696,11 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `handwriting.toText` | edit | refs, replace?, text?, id? | F057 | Convert selected handwriting to a text box (optionally with corrected text). |
 | `handwriting.toTextPages` | edit | pages | F057 | Convert all handwriting on pages to text boxes. |
 | `handwriting.words` | read | refs | F058 | Group strokes into lines and words (with recognised text when available). |
-| `handwriting.reflow` | edit | refs, width | F058 | Reflow handwriting to a new width (moves strokes only). |
-| `handwriting.straighten` | edit | refs | F058 | Straighten slanted handwritten lines. |
+| `handwriting.reflow` | edit | refs, width, left? | F058 | Reflow handwriting to a new width (moves strokes only). |
+| `handwriting.straighten` | edit | refs, minAngle? | F058 | Straighten slanted handwritten lines. |
 | `handwriting.align` | edit | refs, align | F058 | Align handwritten lines left/centre/right. |
 | `handwriting.insertSpace` | edit | page, y, height | F058 | Insert vertical space, pushing ink below down. |
-| `handwriting.replaceWord` | edit | refs, text | F059 | Replace handwritten word strokes with synthesised ink matching size, slant and colour. |
+| `handwriting.replaceWord` | edit | refs, text, ids? | F059 | Replace handwritten word strokes with synthesised ink matching size, slant and colour. |
 | `handwriting.restyle` | edit | refs, style, font? | F105 | Neaten handwriting: regularise baseline/size/slant, or re-write it in a handwriting font. |
 
 ### `image.*`
@@ -711,6 +712,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `image.flip` | edit | ref, axis | F034 | Mirror an image. |
 | `image.replace` | edit | ref, asset | F034 | Replace the image keeping its frame. |
 | `image.saveToPhotos` | read (user presence), sensitive | ref | F034 | Save to Photos. |
+| `image.pick` | edit (user presence), sensitive | source, page?, point?, doc?, position?, anchor?, ref?, refs?, ids? | F034 | Show a picker (source: photos, camera, scan, files, paste or playground) and insert the result on `page` at `point`, add it as pages of `doc` at `position`/`anchor`, replace the image `ref`, or seed Image Playground with `refs`; runs image.insert, page.add or image.replace in the same undo group → {refs}. |
 
 ### `import.*`
 
@@ -743,7 +745,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `item.create` | edit | page, item, id? | F003 | Create an item from Item JSON (kind + payload); layer defaults to the active layer. |
 | `item.update` | edit | ref, patch | F003 | Patch an item's fields (style, frame, text, ext…). |
 | `item.transform` | edit | refs, translate? \| scale? \| rotate? \| matrix?, origin? | F012 | Move/scale/rotate items (attached children and anchored connectors follow). |
-| `item.moveToPage` | edit | refs, page, offset? | F012 | Move items to another page (ids kept). |
+| `item.moveToPage` | edit | refs, page, offset?, copy?, ids? | F012 | Move items to another page (ids kept); `copy: true` leaves the originals and puts copies with new ids (`ids` chooses them). |
 | `item.delete` | edit | refs | F013 | Delete items. |
 | `item.arrange` | edit | refs, to | F013 | Bring to front / send to back / forward / backward. |
 | `item.recolor` | edit | refs, color | F013 | Recolour ink, shapes (outline+fill), text and sticky notes. |
@@ -754,7 +756,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `laser.setMode` | session | mode, color? | F040 | Dot or Trail, colour. |
+| `laser.setMode` | session | mode, color?, trailLength? | F040 | Dot or Trail, colour, trail length (short, medium, long). |
 | `laser.point` | session | page, point? | F040 | Move the laser pointer to a point on a page (null hides it). |
 
 ### `layer.*`
@@ -765,6 +767,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `layer.setVisible` | session | layer, visible | F041 | Show/hide a layer on this device. |
 | `layer.rename` | edit | doc, layer, name | F041 | Rename a layer. |
 | `layer.moveItems` | edit | refs, layer | F041 | Move items to another layer. |
+| `layer.exportOptions` | read | command, params? | F041 | Command hook on export.run and render.page: adds this device's visible layers (options.visibleLayersOnly + visibleLayers {"<documentID>": [layer]}, or render.page `layers`) unless the caller chose → {params}. |
 
 ### `lesson.*`
 
@@ -803,7 +806,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `link.follow` | session | url? \| doc?, page? \| clip?, t? | F029 | Follow a link (records return-to-page history). |
 | `link.back` | session |  | F029 | Return to the page before the last link jump. |
 | `link.autodetect` | edit | ref | F029 | Turn typed/pasted URLs in a text item into links. |
-| `link.tapAt` | session | page, point | F029 | Tap chain: follow a text or PDF link under a tap (one tap in read-only, long-press in edit). |
+| `link.tapAt` | session | page, point, ref?, gesture? | F029 | Tap chain: follow a text or PDF link under a tap (one tap in read-only, long-press in edit). |
 
 ### `lock.*`
 
@@ -829,7 +832,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `mathassist.tapAt` | session | page, point, ref? | F106 | Tap handler: open Math Assist options for the glowing equation under a tap. |
+| `mathassist.tapAt` | session | page, point, ref?, gesture? | F106 | Tap handler: open Math Assist options for the glowing equation under a tap. |
 
 ### `meeting.*`
 
@@ -862,6 +865,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `outline.move` | edit | entry, parent?, after? | F046 | Nest (max 3 levels) or reorder an entry. |
 | `outline.delete` | edit | entry | F046 | Remove an outline entry (not the page). |
 | `outline.sortByPage` | edit | doc | F046 | Sort entries by page number. |
+| `outline.list` | read | doc, source? | F046 | The document outline as the Outline tab shows it: custom entries merged with the outline of its PDF (`source`: all (default), custom or pdf), in display order → {entries: [{title, page?, level, source, ref?}]}. |
 | `outline.generate` | edit | doc, pages?, ids? | F087 | AI-generated outline entries for pages (preview then insert). |
 
 ### `page.*`
@@ -875,7 +879,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `page.add` | edit | doc, position, anchor?, count?, source?, template?, size?, asset?, pdfPage?, id?, ids? | F022 | Add pages before/after/at end from the current template, a template, a PDF, an image or the page clipboard. |
 | `page.duplicate` | edit | pages, ids? | F022 | Duplicate pages with their items. |
 | `page.copy` | read | pages | F022 | Copy pages to the page clipboard. |
-| `page.paste` | edit | doc, position, anchor?, ids? | F022 | Paste copied pages. |
+| `page.paste` | edit | doc, position, anchor?, ids?, payload? | F022 | Paste copied pages; `payload` (app.nib.pages JSON) pastes it instead of the page clipboard (sidebar drops, AI). |
 | `page.moveTo` | edit | pages, doc, ids? | F022 | Move pages to the end of another document. |
 | `page.reorder` | edit | pages, before? \| after? | F022 | Reorder pages. |
 | `page.rotate` | edit | pages \| all, degrees? | F022 | Rotate pages 90° clockwise (or given degrees). |
@@ -888,7 +892,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `panel.open` | session | id | F017 | Open a registered panel (sidebar tab, floating, sheet). |
+| `panel.open` | session | id, params?, edge? | F017 | Open a registered panel (sidebar tab, floating, sheet). |
 | `panel.close` | session | id | F017 | Close a panel. |
 
 ### `pdf.*`
@@ -899,6 +903,15 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `pdf.links` | read | page | F024 | Hyperlinks on a PDF page (rects in page coordinates). |
 | `pdf.markSelection` | edit | page, from, to, style, ids? | F042 | Highlight or strike out PDF text between two points (creates ink). |
 | `pdf.copyText` | read | page, from, to | F042 | Copy PDF text between two points. |
+| `pdf.tapAt` | session | page, point, ref?, gesture? | F042 | Tap chain: a long-press on PDF text selects the line under the point and shows Highlight, Strikethrough, Define, Speak and Copy → {handled, text?}. |
+
+### `pencil.*`
+
+| Command | Effect | Params | Owner | Summary |
+|---|---|---|---|---|
+| `pencil.gesture` | session | gesture, page?, at? | F043 | Do what Apple Pencil double-tap or squeeze (`gesture`) is set to do in the current window: switch tool, show a palette or run a bound Pencil action → {binding, command?}. |
+| `pencil.palette` | session | kind?, page?, at?, close? | F043 | Show the floating Pencil palette (kind: tools (default), colours or attributes) at `at`, or close it → {shown, kind?, tools}. |
+| `pencil.actions` | read |  | F043 | What double-tap and squeeze can be set to (settings pencilhw.doubleTap, pencilhw.squeeze), the current choices and the iPad's own Pencil preference → {doubleTap, squeeze, system, choices}. |
 
 ### `plugin.*`
 
@@ -918,13 +931,13 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `present.setMode` | session | mode | F063 | External display: mirror screen, presenter page (with zoom/animations) or full page (no animation). |
+| `present.setMode` | session | mode, blank? | F063 | External display: mirror screen, presenter page (with zoom/animations) or full page (no animation). |
 
 ### `preset.*`
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `preset.select` | session | tool, swatch?, width? | F008 | Choose the active colour / thickness slot of a tool. |
+| `preset.select` | session | tool, swatch?, width?, widthStep? | F008 | Choose the active colour / thickness slot of a tool. |
 | `preset.setSwatch` | session | tool, index, color, pattern? | F008 | Edit a colour slot. |
 | `preset.addSwatch` | session | tool, color | F008 | Add a colour slot (max 12). |
 | `preset.removeSwatch` | session | tool, index | F008 | Remove a colour slot (min 1). |
@@ -972,19 +985,19 @@ All commands below exist at the end of the build. Each row gives the owning feat
 |---|---|---|---|---|
 | `replay.setMode` | session | mode | F053 | Spotlight, reveal or static replay while audio plays. |
 | `replay.seekToItem` | session | ref | F053 | Play audio from the moment an ink item was written. |
-| `replay.tapAt` | session | page, point, ref? | F053 | Tap handler: while replaying, seek audio to the handwriting under a tap. |
+| `replay.tapAt` | session | page, point, ref?, gesture? | F053 | Tap handler: while replaying, seek audio to the handwriting under a tap. |
 
 ### `ruler.*`
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `ruler.set` | session | visible?, angle?, position?, units?, digits? | F039 | Show/hide and position the ruler. |
+| `ruler.set` | session | visible?, toggle?, angle?, position?, units?, digits? | F039 | Show/hide and position the ruler. |
 
 ### `scan.*`
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `scan.documents` | library (user presence) | doc?, position?, folder? | F065 | Scan paper (document camera + OCR) into a new or the current document. |
+| `scan.documents` | library (user presence) | doc?, position?, folder?, ids? | F065 | Scan paper (document camera + OCR) into a new or the current document. |
 | `scan.qr` | session (user presence) |  | F065 | Scan a QR code and open its link. |
 
 ### `search.*`
@@ -1003,20 +1016,29 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `selection.clear` | session |  | F011 | Clear the selection. |
 | `selection.fromPolygon` | session | page, polygon, include? | F011 | Select items touching a lasso polygon (filtered by kinds). |
 | `selection.fromRect` | session | page, rect, include? | F011 | Rectangular lasso. |
-| `selection.fromLoop` | edit | page, stroke | F011 | Circle-to-Lasso: remove the loop stroke and select what it encloses. |
+| `selection.fromLoop` | edit | page, stroke | F011 | Circle-to-Lasso: remove the loop stroke (`stroke`: the item ref of the already-committed loop) and select what it encloses. |
 | `selection.selectAll` | session | page | F011 | Select everything on the page (active layer). |
-| `selection.tapAt` | session | page, point | F011 | Tap chain: select the top non-ink item under a finger tap (quick selection). |
+| `selection.tapAt` | session | page, point, ref?, gesture? | F011 | Tap chain: select the top non-ink item under a finger tap (quick selection). |
 | `selection.screenshot` | read | page, rect | F013 | Render a region (PDF included) to a PNG asset for sharing/pasting. |
+
+### `settings.*`
+
+`settings.get`, `settings.set`, `settings.list` and `settings.describe` are contracts commands (the Contracts table at the top of §6.5).
+
+| Command | Effect | Params | Owner | Summary |
+|---|---|---|---|---|
+| `settings.open` | session | page?, place? | F027 | Open Settings, optionally at a settings page id (`page`, e.g. settings.editing) or an app-menu place (settings, templates, cloudBackup, trash, about, systemNotifications) → {opened, page?, panel?}. |
 
 ### `shape.*`
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `shape.recognize` | read | points, neighbors? | F030 | Recognise a rough stroke as a line, curve, ellipse, rectangle, triangle, polygon or arrow; returns ShapeItem JSON or null. |
+| `shape.recognize` | read | points, neighbors? | F030 | Recognise a rough stroke as a line, arrow, arc, curve, polyline, ellipse, rectangle, triangle or polygon → {shape: ShapeItem?, mergeWith?: [ref], confidence?} (shape null when nothing matched; delete mergeWith when creating the shape). |
 | `shape.create` | edit | page, shape, frame? \| points?, style?, text?, id? | F031 | Create a shape (rectangle, rounded rectangle, ellipse, diamond, triangle, polygon, line, curve, arrow). |
 | `shape.setStyle` | edit | refs, style | F031 | Outline colour/width/none, fill, corner radius, pattern, arrowheads. |
 | `shape.setKind` | edit | ref, shape | F031 | Change shape type keeping frame. |
 | `shape.setPoints` | edit | ref, points | F031 | Edit vertices / control points. |
+| `shape.tapAt` | session | page?, point?, ref?, gesture? | F031 | Tap handler: type inside the selected shape under a tap (double-tap selects and edits any closed shape; also the inspector's Edit Text) → {handled}. |
 
 ### `sidebar.*`
 
@@ -1028,7 +1050,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `spellcheck.tapAt` | session | page, point, ref? | F104 | Tap handler: show spelling suggestions for the underlined word under a tap. |
+| `spellcheck.tapAt` | session | page, point, ref?, gesture? | F104 | Tap handler: show spelling suggestions for the underlined word under a tap. |
 
 ### `sticky.*`
 
@@ -1038,7 +1060,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `sticky.setCollapsed` | edit | refs, collapsed | F036 | Collapse/expand. |
 | `sticky.resolve` | edit | ref, resolved | F036 | Resolve a note. |
 | `sticky.setColor` | edit | refs, color | F036 | Change colour. |
-| `sticky.tapAt` | session | page, point, ref? | F036 | Tap handler: expand a collapsed note or edit the selected note under a tap. |
+| `sticky.tapAt` | session | page, point, ref?, gesture? | F036 | Tap handler: expand a collapsed note or edit the selected note under a tap. |
 
 ### `stopwatch.*`
 
@@ -1083,10 +1105,10 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `tape.tapAt` | edit | page, point | F033 | Tap chain: toggle the tape under a finger tap (reveal/hide; not undoable). |
-| `tape.setRevealed` | edit | refs, revealed | F033 | Reveal or hide tape strips (not undoable). |
+| `tape.tapAt` | edit, not undoable | page, point, ref?, gesture? | F033 | Tap chain: toggle the tape under a finger tap (reveal/hide; not undoable). |
+| `tape.setRevealed` | edit, not undoable | refs, revealed | F033 | Reveal or hide tape strips (not undoable). |
 | `tape.removeAll` | edit | page | F033 | Remove all tape on a page. |
-| `tape.importPattern` | session | asset \| url | F033 | Add a custom tape pattern image. |
+| `tape.importPattern` | session | asset \| url, doc?, id? | F033 | Add a custom tape pattern image. |
 | `tape.patterns` | read |  | F033 | List tape patterns (built-in, custom, content packs). |
 | `tape.deletePattern` | session | id | F033 | Delete a custom tape pattern. |
 | `tape.clearHistory` | session |  | F033 | Clear the recently used tape patterns. |
@@ -1113,10 +1135,10 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `text.createBox` | edit | page, at \| frame, text?, style?, id? | F026 | Create a text box (RichText or plain string). |
 | `text.setText` | edit | ref, text | F026 | Replace the rich text of a text box, sticky note, shape or connector label. |
 | `text.format` | edit | ref, attrs, range? | F026 | Apply character attributes (font, size, colour, bold, italic, underline, strike, highlight). |
-| `text.setParagraph` | edit | ref, align?, list?, indent?, lineSpacing? | F026 | Paragraph formatting. |
+| `text.setParagraph` | edit | ref, align?, list?, indent?, indentBy?, lineSpacing?, range? | F026 | Paragraph formatting of all paragraphs, or those touching `range` [start, length]; `indentBy` is a relative indent (Tab = 1). |
 | `text.setBoxStyle` | edit | refs, style | F026 | Background, border, corner, padding, shadow, auto-grow. |
 | `text.saveDefaultStyle` | session | name?, style | F026 | Save the current style as the default (or a named style). |
-| `text.tapAt` | session | page, point, ref? | F026 | Tap handler: start editing the selected text box under a tap. |
+| `text.tapAt` | session | page, point, ref?, gesture? | F026 | Tap handler: start editing the selected text box under a tap. |
 | `text.startPageText` | edit | page, id? | F028 | Start (or continue) full-page typing on a page. |
 
 ### `timer.*`
@@ -1124,8 +1146,8 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
 | `timer.start` | session | seconds, label? | F062 | Start a countdown. |
-| `timer.control` | session | action | F062 | Pause, resume or end the timer/stopwatch. |
-| `timer.history` | read |  | F062 | Past sessions (name, document, duration, laps). |
+| `timer.control` | session | action, instant? | F062 | Pause, resume or end the timer/stopwatch. |
+| `timer.history` | read | limit?, cursor? | F062 | Past sessions (name, document, duration, laps). |
 | `timer.saveMode` | session | name, seconds | F062 | Save a custom timer mode. |
 | `timer.deleteMode` | session | name | F062 | Delete a custom timer mode. |
 
@@ -1168,7 +1190,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `view.zoom` | session | scale? \| fit? \| actual? | F006 | Zoom (⌘+ ⌘− ⌘0 ⌘9). |
 | `view.scrollBy` | session | dx, dy | F006 | Pan (arrow keys). |
 | `view.reveal` | session | ref | F006 | Scroll an item into view and flash it. |
-| `view.setReadOnly` | session | on | F042 | Enter/leave read-only mode. |
+| `view.setReadOnly` | session | on? | F042 | Enter/leave read-only mode (omit `on` to toggle). |
 
 ### `webdav.*`
 
@@ -1189,8 +1211,8 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `zoom.toggle` | session | on? | F038 | Show/hide the Zoom Window. |
-| `zoom.setBox` | session | page, rect | F038 | Move/resize the zoom box. |
+| `zoom.toggle` | session | on?, page?, at? | F038 | Show/hide the Zoom Window; `page` + `at` place the box. |
+| `zoom.setBox` | session | page, rect, margins? | F038 | Move/resize the zoom box; `margins` [left, right] set where it wraps. |
 | `zoom.newLine` | session |  | F038 | Jump to the next line (return height). |
 | `zoom.setReturnHeight` | edit | page, height | F038 | Per-page return height override. |
 
@@ -1280,7 +1302,7 @@ A tool declares one of three `CanvasInputMode`s:
 Everything on the canvas that is not the active tool plugs in through two registries (F101's `GestureRouter` applies them; there is no fixed tap chain):
 
 1. **`ui.canvasAttachments`** (`CanvasAttachment`): persistent overlays with their own layer/view, `canvasDidChange` on scroll/zoom/commit, and `hitTest` to claim a touch before anything else. Examples: selection handles and drag-to-move (F012), selection outline (F011), shape control points (F031), connector bends and quick-diagram dots (F032), spellcheck underlines (F104), Math Assist glow (F106), presence cursors (F108), minimap (F044), ruler (F039), zoom box (F038), answer-zone widgets (F099), and `canvas.decorate` DisplayList overlays (F006; plugins via `nib.canvas.decorate`).
-2. **`content.tapHandlers`** (`TapHandlerDescriptor`): finger tap, double-tap and long-press are offered to commands in `order`, filtered by the topmost item's kind / drawKey and by read-only mode. Each command gets `{page, point, ref?, gesture}` and returns `{"handled": Bool}`; the first `true` wins. Built-ins: `tape.tapAt` 100, `comment.tapAt` 200, `link.tapAt` 300, `selection.tapAt` 400; features add `text.tapAt`, `sticky.tapAt`, `spellcheck.tapAt`, `mathassist.tapAt`, `replay.tapAt` and custom-item edit (double-tap); plugins add `contributes.tapHandlers`.
+2. **`content.tapHandlers`** (`TapHandlerDescriptor`): finger tap, double-tap and long-press are offered to commands in `order`, filtered by the topmost item's kind / drawKey and by read-only mode. Each command gets `{page, point, ref?, gesture}` and returns `{"handled": Bool}`; the first `true` wins. Built-ins: `tape.tapAt` 100, `comment.tapAt` 200, `link.tapAt` 300, `selection.tapAt` 400; features add `text.tapAt`, `sticky.tapAt`, `shape.tapAt`, `pdf.tapAt` (long-press on PDF text), `spellcheck.tapAt`, `mathassist.tapAt`, `replay.tapAt` and custom-item edit (double-tap); plugins add `contributes.tapHandlers`.
 3. Otherwise the touch goes to the **active tool**.
 
 ### 8.6 Apple Pencil hardware
@@ -1416,7 +1438,7 @@ nib://import?from=pasteboard       (share-extension hand-off when no App Group e
 - Panels get `PanelContext.params` (the `panel.open` params minus `id`) and `presentation`, and declare `providesHeader`.
 - Settings pages declare `keywords`.
 
-Hosts call `resolvedParams`, `resolvedTitle` and `resolvedIcon`. Well-known panel ids are in `PanelIDs`.
+Hosts call `resolvedParams`, `resolvedTitle` and `resolvedIcon`. Well-known panel ids are in `PanelIDs`: the owner registers its panel under exactly that id and other features open it with `panel.open {id}`. They are `aichat.panel` (assistant, F085), `organize.trash` and `organize.favourites` (F020), `templateui.manage` (F045), `syncui.panel` (cloudBackup, F070), `about.panel` (F098), `pluginmanager.gallery` (F080), `studysession.practice` (studyPractice, F050) and `studysession.smartLearn` (Smart Learn, F050). F049 opens the study panels by these two ids; `PanelIDs.studyLearn` still reads "studysession.learn" until NibContracts aligns it with them.
 
 **Signals** (contracts-v2):
 - A `Registry` counts changes in `generation` and posts `.nibRegistryDidChange` with `RegistryChange` userInfo (ids, owner, kind).
