@@ -180,7 +180,7 @@ struct ImageCropSheet: View {
                 Circle()
                     .fill(NibColor.background)
                     .overlay(Circle().stroke(NibColor.accent, lineWidth: 1.5))
-                    .frame(width: 12, height: 12)
+                    .frame(width: NibSpacing.m, height: NibSpacing.m)
                     .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
                     .contentShape(Rectangle())
                     .hoverEffect(.highlight)
@@ -299,16 +299,16 @@ struct ImageCropSheet: View {
 enum ImageCropPresenter {
     static func ask(doc: DocumentID, page: PageID, id: ElementID, ctx: CommandContext) async throws -> CropRequest? {
         let item = try ctx.workspace.item(doc, page: page, id: id)
-        guard let image = item.image else {
-            throw NibError(.invalidParams, "item \(id.raw) is a \(item.kind.rawValue), not an image", path: "$.ref")
-        }
+        // Refused before the sheet opens, so nobody draws a crop that cannot be applied.
+        let image = try ImageRefs.editable(item)
         guard !NibApp.isHostlessTest else { throw NibError.unavailable("the crop sheet (hostless test)") }
         let data = try ImageAssets.store(ctx).data(image.asset, doc: doc)
         let flip = ImageFlip(item)
-        guard let whole = ImageRendition.cgImage(ImageItem(frame: image.frame, asset: image.asset), flip: flip, data: data,
-                                                 maxPixel: 1600) else {
-            throw NibError(.internalError, "could not decode the image")
-        }
+        let uncropped = ImageItem(frame: image.frame, asset: image.asset)
+        let rendered = await Task.detached(priority: .userInitiated) {
+            ImageRendition.cgImage(uncropped, flip: flip, data: data, maxPixel: 1600)
+        }.value
+        guard let whole = rendered else { throw NibError(.internalError, "could not decode the image") }
         let presenter = try ImagePresenter.top(ctx.activeSession)
         let result = await present(UIImage(cgImage: whole), rect: flip.mirror(image.crop ?? ImageGeometry.unit),
                                    mask: image.mask.map { flip.mirror($0) }, from: presenter)

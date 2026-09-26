@@ -40,9 +40,12 @@ enum ImagePlaygroundBridge {
             case .shape: append(item.shape?.text?.plainText, to: &seed)
             case .stroke: ink.append(.string(ref))
             case .image:
-                if seed.image == nil, let image = item.image, let data = try? ctx.services.assets?.data(image.asset, doc: doc),
-                   let rendition = ImageRendition.cgImage(image, flip: ImageFlip(item), data: data, maxPixel: 1024) {
-                    seed.image = UIImage(cgImage: rendition)
+                if seed.image == nil, let image = item.image, let data = try? ctx.services.assets?.data(image.asset, doc: doc) {
+                    let flip = ImageFlip(item)
+                    let rendition = await Task.detached(priority: .userInitiated) {
+                        ImageRendition.cgImage(image, flip: flip, data: data, maxPixel: 1024)
+                    }.value
+                    if let rendition = rendition { seed.image = UIImage(cgImage: rendition) }
                 }
             default:
                 break

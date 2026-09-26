@@ -25,13 +25,20 @@ enum ImageRefs {
     @MainActor
     static func image(_ tx: DocTransaction, _ doc: DocumentID, _ page: PageID, _ id: ElementID) throws -> (Item, ImageItem) {
         let item = try tx.item(doc, page: page, id: id)
+        return (item, try editable(item))
+    }
+
+    /// The image payload of an item the caller may change. Also run before a sheet or picker opens, so nobody crops
+    /// or picks a photo only to be told the image is locked.
+    static func editable(_ item: Item) throws -> ImageItem {
         guard let image = item.image else {
-            throw NibError(.invalidParams, "item \(id.raw) is a \(item.kind.rawValue), not an image", path: "$.ref")
+            throw NibError(.invalidParams, "item \(item.id.raw) is a \(item.kind.rawValue), not an image", path: "$.ref")
         }
         guard !item.locked else {
-            throw NibError(.invalidParams, "image \(id.raw) is locked", path: "$.ref", hint: "unlock it with item.setLocked first")
+            throw NibError(.invalidParams, "image \(item.id.raw) is locked", path: "$.ref",
+                           hint: "unlock it with item.setLocked first")
         }
-        return (item, image)
+        return image
     }
 }
 
@@ -41,12 +48,25 @@ enum ImageAssets {
         try ctx.services.require(ctx.services.assets, "the asset store")
     }
 
+    /// Largest image accepted from anyone (AI, plugins, https, files): about 256 megapixels.
+    static let maxPixels = 256_000_000.0
+
     /// Validates bytes as an image and stores them unchanged (PNG keeps its transparency, GIF its frames).
     static func put(_ data: Data, doc: DocumentID, in store: AssetStore, path: String) throws -> (AssetRef, ImageDecoder.Info) {
         guard let info = ImageDecoder.info(data) else {
             throw NibError(.invalidParams, "not an image Nib can read (PNG, JPEG, GIF, HEIC, TIFF or WebP)", path: path)
         }
+        try check(info, path: path)
         return (try store.put(data, ext: info.fileExtension, doc: doc), info)
+    }
+
+    /// Refuses images too large to decode safely (the header is read, never the pixels).
+    static func check(_ info: ImageDecoder.Info, path: String) throws {
+        guard info.pixelCount <= maxPixels else {
+            throw NibError(.invalidParams,
+                           "image is \(Int(info.pixelSize.width)) × \(Int(info.pixelSize.height)) pixels, more than 256 megapixels",
+                           path: path, hint: "downscale before inserting")
+        }
     }
 
     /// Exactly one of `asset` (already in the document), `base64` or `url` (resolved through `ctx.inputFile`: tmp: refs,
@@ -63,6 +83,7 @@ enum ImageAssets {
             guard let info = ImageDecoder.info(data) else {
                 throw NibError(.invalidParams, "asset '\(name)' is not an image", path: "$.asset")
             }
+            try check(info, path: "$.asset")
             return (AssetRef(name), info)
         case (nil, let text?, nil):
             return try put(try decodeBase64(text), doc: doc, in: store, path: "$.base64")
@@ -156,7 +177,7 @@ struct ImageInsert: NibCommand {
             "url": .str("tmp: ref from asset.upload, or an https URL"),
             "frame": .rect,
             "at": .arr(.num(), "[x, y] top-left corner in page points; the size fits half the page"),
-            "animated": .bool("animate a GIF on the canvas (default: true when it has several frames)"),
+            "animated": .bool("false keeps a GIF, APNG or WebP animation still on the canvas (default true; stills never animate)"),
             "id": .str("your own id, [A-Za-z0-9_-]{1,64}")
         ], required: ["page"]),
         examples: [
@@ -195,7 +216,9 @@ struct ImageInsert: NibCommand {
         }
         let layer = ctx.activeSession?.activeLayer ?? 0
         let item = try ctx.mutate { tx -> Item in
-            var it = Item.makeImage(ImageItem(frame: frame, asset: asset, animated: p.animated ?? info.isAnimated), layer: layer)
+            // `animated` can only turn animation off: a still never gets a live view.
+            let animated = (p.animated ?? true) && info.isAnimated
+            var it = Item.makeImage(ImageItem(frame: frame, asset: asset, animated: animated), layer: layer)
             if let id = p.id { it.id = NibID(id) }
             return try tx.put(it, doc: doc, page: pageID)
         }
@@ -379,10 +402,11 @@ struct ImageSaveToPhotos: NibCommand {
         if image.crop == nil && image.mask == nil && flip.isIdentity {
             payload = data                                   // the original bytes: GIFs stay animated, HEIC stays HEIC
         } else {
-            guard let rendition = ImageRendition.cgImage(image, flip: flip, data: data, maxPixel: 8192),
-                  let png = UIImage(cgImage: rendition).pngData() else {
-                throw NibError(.internalError, "could not render the image")
-            }
+            // Up to 8K decoded and encoded: never on the main thread.
+            let rendered = await Task.detached(priority: .userInitiated) { () -> Data? in
+                ImageRendition.cgImage(image, flip: flip, data: data, maxPixel: 8192).flatMap { ImageDecoder.png($0) }
+            }.value
+            guard let png = rendered else { throw NibError(.internalError, "could not render the image") }
             payload = png
         }
         try await PhotoLibrarySaver.save(payload)
@@ -483,6 +507,8 @@ struct ImagePick: NibCommand {
     static func target(_ p: Params, ctx: CommandContext) throws -> PickTarget {
         if let ref = p.ref {
             let (doc, page, id) = try ImageRefs.item(ref)
+            // Before the picker opens: a locked image or a non-image would only fail after a photo was chosen.
+            _ = try ImageRefs.editable(try ctx.workspace.item(doc, page: page, id: id))
             return .replace(doc, page, id)
         }
         if let page = p.page {

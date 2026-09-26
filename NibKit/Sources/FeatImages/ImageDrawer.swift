@@ -2,8 +2,21 @@ import UIKit
 import ImageIO
 import UniformTypeIdentifiers
 import NibContracts
+import NibDesign
 
 // MARK: - Decoding (ImageIO, thread-safe)
+
+/// Frames of an animated image as a live view plays them, each with its own delay. Sendable: CGImages are immutable.
+struct ImageAnimation: @unchecked Sendable {
+    var frames: [CGImage] = []
+    /// Seconds each frame stays up. Frames skipped to fit the byte budget add their time to the kept frame before
+    /// them, so the loop keeps its real length.
+    var delays: [Double] = []
+
+    var duration: Double { delays.reduce(0, +) }
+    /// Decoded bytes the frames hold.
+    var byteCount: Int { frames.reduce(0) { $0 + $1.bytesPerRow * $1.height } }
+}
 
 /// ImageIO facts and downsampled decodes. Pure and thread-safe: the drawer calls it from render threads.
 enum ImageDecoder {
@@ -14,14 +27,29 @@ enum ImageDecoder {
         /// Uniform type identifier of the encoded bytes ("public.png", "com.compuserve.gif"…).
         var type: String
 
-        var isAnimated: Bool { frameCount > 1 }
+        /// Only GIF, APNG and animated WebP play: the extra frames of a multi-page TIFF or a HEIF sequence are pages
+        /// or bursts, not an animation.
+        var isAnimated: Bool {
+            guard frameCount > 1, let t = UTType(type) else { return false }
+            return t.conforms(to: .gif) || t.conforms(to: .png) || t.conforms(to: .webP)
+        }
         /// Stored bytes are never re-encoded, so PNG keeps its transparency and GIF its frames.
         var fileExtension: String { UTType(type)?.preferredFilenameExtension ?? "img" }
+        var pixelCount: Double { Double(pixelSize.width) * Double(pixelSize.height) }
     }
 
+    /// Decoded bytes one animated view may hold (all of its frames together).
+    static let animationBudget = 32 * 1024 * 1024
+    /// Animations are shrunk to fit their budget down to this long edge; past that, frames are skipped evenly.
+    static let minimumAnimationPixel = 256
+
     static func info(_ data: Data) -> Info? {
-        guard let src = CGImageSourceCreateWithData(data as CFData, nil), let type = CGImageSourceGetType(src),
-              CGImageSourceGetCount(src) > 0,
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        return info(src)
+    }
+
+    static func info(_ src: CGImageSource) -> Info? {
+        guard let type = CGImageSourceGetType(src), CGImageSourceGetCount(src) > 0,
               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
               let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
               let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue, w > 0, h > 0 else { return nil }
@@ -49,20 +77,98 @@ enum ImageDecoder {
         return CGImageSourceCreateThumbnailAtIndex(src, index, options as CFDictionary)
     }
 
-    /// Every frame of an animated image, downsampled and cropped, with the total duration.
-    /// ponytail: UIImage animations use one frame time (total / count); per-frame delays need a CADisplayLink player.
-    static func frames(_ data: Data, maxPixelSize: Int, crop: Rect?, limit: Int = 300) -> (images: [CGImage], duration: Double) {
-        guard let src = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
-        else { return ([], 0) }
-        var images: [CGImage] = []
-        var duration = 0.0
-        for i in 0..<min(CGImageSourceGetCount(src), limit) {
-            guard let frame = downsample(src, maxPixelSize: maxPixelSize, index: i) else { continue }
-            let part = crop.flatMap { frame.cropping(to: pixelRect($0, in: frame)) } ?? frame
-            images.append(part)
-            duration += delay(src, index: i)
+    /// How an animation fits its byte budget: the long edge to decode at, and which frames to keep.
+    struct AnimationPlan: Equatable {
+        var maxPixelSize: Int
+        /// Kept frames, evenly spread and ascending; each one also stands in for the skipped frames after it.
+        var indices: [Int]
+    }
+
+    /// Shrinks the decode (never below `minimumAnimationPixel`, or the requested size when that is smaller) until
+    /// every frame fits `budget`, then keeps only as many evenly spread frames as still fit.
+    static func animationPlan(pixelSize: CGSize, crop c: Rect, frameCount: Int, maxPixelSize: Int,
+                              budget: Int) -> AnimationPlan {
+        let count = max(frameCount, 1)
+        let width = max(Double(pixelSize.width), 1), height = max(Double(pixelSize.height), 1)
+        let long = max(width, height)
+        let requested = max(1, min(maxPixelSize, Int(long.rounded(.up))))       // ImageIO never upscales
+        // One kept frame at `edge` pixels on the long edge, with slack for rounding and 64-byte row alignment.
+        func frameBytes(_ edge: Int) -> Int {
+            let s = Double(edge) / long
+            let w = Int((width * s * c.width).rounded(.up)) + 2, h = Int((height * s * c.height).rounded(.up)) + 2
+            return (w + 15) / 16 * 16 * h * 4
         }
-        return (images, duration)
+        var edge = requested
+        if count * frameBytes(edge) > budget {
+            let smallest = min(requested, minimumAnimationPixel)
+            // count × w × h × 4 grows with edge², so solve for edge; the loop absorbs the rounding slack.
+            let perEdgeSquared = Double(count) * width * height * c.width * c.height * 4 / (long * long)
+            let fit = Int((Double(budget) / max(perEdgeSquared, 1e-9)).squareRoot())
+            edge = max(smallest, min(requested, fit))
+            while edge > smallest && count * frameBytes(edge) > budget { edge = max(smallest, edge - max(1, edge / 16)) }
+        }
+        let keep = max(1, min(count, budget / max(frameBytes(edge), 1)))
+        return AnimationPlan(maxPixelSize: edge, indices: (0..<keep).map { $0 * count / keep })
+    }
+
+    /// The frames of an animated image, downsampled, cropped and within `budget` decoded bytes (a 10 s 1080p screen
+    /// recording would otherwise cost ~700 MB), each with its own delay. Stills and multi-page files give one frame.
+    /// `isCancelled` is checked between frames.
+    static func frames(_ data: Data, maxPixelSize: Int, crop: Rect?, budget: Int = animationBudget,
+                       isCancelled: () -> Bool = { false }) -> ImageAnimation {
+        guard maxPixelSize > 0, budget > 0,
+              let src = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let info = info(src) else { return ImageAnimation() }
+        let count = info.isAnimated ? info.frameCount : 1
+        let c = crop ?? ImageGeometry.unit
+        let plan = animationPlan(pixelSize: info.pixelSize, crop: c, frameCount: count, maxPixelSize: maxPixelSize,
+                                 budget: budget)
+        let delays = (0..<count).map { delay(src, index: $0) }
+        var out = ImageAnimation()
+        var used = 0
+        var leading = 0.0
+        var full = false
+        for (k, i) in plan.indices.enumerated() {
+            if isCancelled() { return ImageAnimation() }
+            let end = k + 1 < plan.indices.count ? plan.indices[k + 1] : count
+            let time = delays[i..<end].reduce(0, +)
+            var kept = false
+            if !full, let decoded = downsample(src, maxPixelSize: plan.maxPixelSize, index: i),
+               let part = crop == nil ? Optional(decoded) : copy(decoded, rect: pixelRect(c, in: decoded)) {
+                let bytes = part.bytesPerRow * part.height
+                if used + bytes <= budget {
+                    used += bytes
+                    out.frames.append(part)
+                    out.delays.append(time)
+                    kept = true
+                } else {
+                    full = true                                  // every later frame is the same size
+                }
+            }
+            if !kept {
+                if out.delays.isEmpty { leading += time } else { out.delays[out.delays.count - 1] += time }
+            }
+        }
+        if !out.delays.isEmpty { out.delays[0] += leading }
+        return out
+    }
+
+    /// `rect` of `image` in a bitmap of its own, so a crop does not keep the whole decoded frame alive.
+    static func copy(_ image: CGImage, rect: CGRect) -> CGImage? {
+        guard let part = image.cropping(to: rect), part.width > 0, part.height > 0,
+              let cg = CGContext(data: nil, width: part.width, height: part.height, bitsPerComponent: 8,
+                                 bytesPerRow: part.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        cg.draw(part, in: CGRect(x: 0, y: 0, width: part.width, height: part.height))
+        return cg.makeImage()
+    }
+
+    /// PNG bytes (Save to Photos of an edited image); ImageIO only, so it is safe off the main thread.
+    static func png(_ image: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, image, nil)
+        return CGImageDestinationFinalize(dest) ? data as Data : nil
     }
 
     /// GIF / APNG frame delay; browsers treat delays under 11 ms as 100 ms, and so does Nib.
@@ -231,16 +337,17 @@ enum ImagePainter {
         cg.draw(part, in: CGRect(origin: .zero, size: local.size))
     }
 
-    /// A quiet stand-in while an asset is missing (not synced yet, or deleted by another device).
-    static func placeholder(_ f: Frame, in cg: CGContext) {
+    /// A quiet stand-in while an asset is missing (not synced yet, or deleted by another device). The colours are
+    /// NibDesign tokens resolved for paper (light), since page content never follows dark mode.
+    static func placeholder(_ f: Frame, fill: CGColor, edge: CGColor, in cg: CGContext) {
         cg.saveGState()
         defer { cg.restoreGState() }
         cg.translateBy(x: CGFloat(f.center.x), y: CGFloat(f.center.y))
         cg.rotate(by: CGFloat(f.rotation))
         let local = CGRect(x: -f.w / 2, y: -f.h / 2, width: f.w, height: f.h)
-        cg.setFillColor(RGBA(0xEE, 0xEE, 0xF0).cgColor)
+        cg.setFillColor(fill)
         cg.fill(local)
-        cg.setStrokeColor(RGBA(0xC7, 0xC7, 0xCC).cgColor)
+        cg.setStrokeColor(edge)
         cg.setLineWidth(1)
         cg.stroke(local.insetBy(dx: 0.5, dy: 0.5))
     }
@@ -249,13 +356,17 @@ enum ImagePainter {
 /// The item as the page shows it (crop, mask and flip; unrotated), as a bitmap: Save to Photos, Image Playground's
 /// source image and the crop sheet's preview.
 enum ImageRendition {
+    /// Longest edge ever decoded for a rendition: a small crop of a huge image must not decode all of it.
+    static let maxDecode = 16384
+
+    /// Pure and thread-safe; callers on the main actor run it in a detached task.
     static func cgImage(_ image: ImageItem, flip: ImageFlip, data: Data, maxPixel: Int) -> CGImage? {
         guard let info = ImageDecoder.info(data) else { return nil }
         let c = image.crop ?? ImageGeometry.unit
         let cropW = Double(info.pixelSize.width) * c.width, cropH = Double(info.pixelSize.height) * c.height
         let s = min(1, Double(maxPixel) / max(cropW, cropH, 1))
         let w = max(1, Int((cropW * s).rounded())), h = max(1, Int((cropH * s).rounded()))
-        let need = Int((Double(max(info.pixelSize.width, info.pixelSize.height)) * s).rounded(.up))
+        let need = min(maxDecode, Int((Double(max(info.pixelSize.width, info.pixelSize.height)) * s).rounded(.up)))
         guard let full = ImageDecoder.downsample(data, maxPixelSize: max(need, 1)),
               let cg = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                  space: CGColorSpaceCreateDeviceRGB(),
@@ -275,9 +386,15 @@ enum ImageRendition {
 /// Thread-safe (NSCache, immutable CGImages); reaches assets only through `DrawContext.assets`.
 final class ImageDrawer: ItemDrawer {
     private let cache = NSCache<NSString, CGImage>()
+    private let placeholderFill: CGColor
+    private let placeholderEdge: CGColor
     static let maxDecode = 4096
 
+    @MainActor
     init() {
+        let paper = UITraitCollection(userInterfaceStyle: .light)
+        placeholderFill = NibUIColor.fill3.resolvedColor(with: paper).cgColor
+        placeholderEdge = NibUIColor.separator.resolvedColor(with: paper).cgColor
         cache.totalCostLimit = 96 * 1024 * 1024
     }
 
@@ -288,7 +405,7 @@ final class ImageDrawer: ItemDrawer {
         // ponytail: long edge only; a frame stretched far from the image's aspect decodes a little soft.
         let need = max(img.frame.w / c.width, img.frame.h / c.height) * context.scale
         guard let image = decoded(img.asset, doc: context.doc, assets: context.assets, pixels: need) else {
-            ImagePainter.placeholder(img.frame, in: context.cg)
+            ImagePainter.placeholder(img.frame, fill: placeholderFill, edge: placeholderEdge, in: context.cg)
             return
         }
         ImagePainter.paint(image, crop: img.crop, mask: img.mask, flip: ImageFlip(item), frame: img.frame, in: context.cg)
@@ -311,8 +428,20 @@ final class ImageDrawer: ItemDrawer {
 /// Animates GIF items while they are on screen: one `AnimatedImageView` per visible animated item, handed to
 /// `CanvasHost.attachLiveView` (the canvas positions it over the item's frame); removed when scrolled away, when the
 /// item stops being animated, and under Reduce Motion (tiles keep showing frame 0).
+///
+/// Cheap on large notebooks: the page order is cached until the page table changes, and each page's animated items
+/// are found once (the first time the page is on screen), then kept current from commits that touch image items. A
+/// document without GIFs costs one flag check per scroll once every page has been seen.
+///
+/// Bounded memory: all live views of a canvas share `totalBudget` decoded bytes (at most `maxLiveViews` animate at
+/// once; the rest show frame 0 in the tiles).
 @MainActor
 final class AnimatedImageAttachment: CanvasAttachment {
+    static let totalBudget = 96 * 1024 * 1024
+    static let maxLiveViews = 24
+    /// A view's share never drops below this; `maxLiveViews` × it stays within `totalBudget`.
+    static let minimumViewBudget = 4 * 1024 * 1024
+
     private struct Live {
         var page: PageID
         var signature: String
@@ -321,83 +450,179 @@ final class AnimatedImageAttachment: CanvasAttachment {
     }
 
     private var live: [ElementID: Live] = [:]
+    /// Live pages in reading order; nil until needed and after the page table changes.
+    private var pageOrder: [PageID]?
+    /// Animated image items of every page looked at so far (pages without GIFs map to an empty dictionary).
+    private var animated: [PageID: [ElementID: Item]] = [:]
+    /// Every live page has been looked at and none holds an animated image.
+    private var noneAnywhere = false
+    private var commits: EventSubscription?
+    private var reduceMotion: NSObjectProtocol?
 
-    func attach(to host: CanvasHost) { canvasDidChange(host) }
+    /// Each view's share of `totalBudget`, halving from 32 MB to 4 MB as more GIFs are visible. Power-of-two steps,
+    /// so a GIF scrolling in or out re-decodes the others only when the share changes.
+    static func budget(forViews count: Int) -> Int {
+        var share = ImageDecoder.animationBudget
+        while share > minimumViewBudget && share * max(count, 1) > totalBudget { share /= 2 }
+        return share
+    }
+
+    func attach(to host: CanvasHost) {
+        let doc = host.documentID
+        commits = host.app.bus.observeCommits { [weak self] cs in
+            guard let self = self, cs.documents.contains(doc) else { return }
+            self.apply(cs, doc: doc)
+        }
+        reduceMotion = NotificationCenter.default.addObserver(
+            forName: UIAccessibility.reduceMotionStatusDidChangeNotification, object: nil, queue: .main) { [weak self, weak host] _ in
+            MainActor.assumeIsolated {
+                guard let self = self, let host = host else { return }
+                self.canvasDidChange(host)
+            }
+        }
+        canvasDidChange(host)
+    }
 
     func detach(from host: CanvasHost) {
-        for (id, entry) in live {
-            entry.task?.cancel()
-            host.attachLiveView(nil, item: id, page: entry.page)
-        }
+        for (id, entry) in live { remove(id, entry, host) }
         live = [:]
+        commits?.cancel()
+        commits = nil
+        if let observer = reduceMotion { NotificationCenter.default.removeObserver(observer) }
+        reduceMotion = nil
+        pageOrder = nil
+        animated = [:]
+        noneAnywhere = false
     }
 
     func canvasDidChange(_ host: CanvasHost) {
         let wanted = visibleAnimatedItems(host)
         for (id, entry) in live where wanted[id]?.page != entry.page {
-            entry.task?.cancel()
-            host.attachLiveView(nil, item: id, page: entry.page)
+            remove(id, entry, host)
             live[id] = nil
         }
-        let scale = Double(host.canvasView.traitCollection.displayScale > 0 ? host.canvasView.traitCollection.displayScale : 2)
+        guard !wanted.isEmpty else { return }
+        let budget = AnimatedImageAttachment.budget(forViews: wanted.count)
+        let traits = host.canvasView.traitCollection.displayScale
+        let scale = Double(traits > 0 ? traits : 2)
         for (id, target) in wanted {
             guard let img = target.item.image else { continue }
-            let flip = ImageFlip(target.item)
+            let view = live[id]?.view ?? AnimatedImageView()
+            view.configure(crop: img.crop, mask: img.mask, flip: ImageFlip(target.item))
             let c = img.crop ?? ImageGeometry.unit
             let need = max(img.frame.w / c.width, img.frame.h / c.height) * host.zoomScale * scale
             var bucket = 64
             while Double(bucket) < need && bucket < 1024 { bucket *= 2 }
-            let signature = "\(img.asset.name)|\(String(describing: img.crop))|\(img.mask?.count ?? 0)|\(flip.x)\(flip.y)|\(bucket)"
+            let signature = "\(img.asset.name)|\(String(describing: img.crop))|\(bucket)|\(budget)"
+            if live[id] == nil { host.attachLiveView(view, item: id, page: target.page) }
             if live[id]?.signature == signature { continue }
             live[id]?.task?.cancel()
-            let view = live[id]?.view ?? AnimatedImageView()
-            view.configure(crop: img.crop, mask: img.mask, flip: flip)
-            let assets = host.app.services.assets
-            let doc = host.documentID
-            let maxPixel = bucket, asset = img.asset, crop = img.crop
-            let task = Task { [weak view] in
-                let decoded = await Task.detached(priority: .utility) { () -> (images: [CGImage], duration: Double) in
-                    guard let data = try? assets?.data(asset, doc: doc) else { return ([], 0) }
-                    return ImageDecoder.frames(data, maxPixelSize: maxPixel, crop: crop)
-                }.value
-                guard !Task.isCancelled, let view = view, !decoded.images.isEmpty else { return }
-                view.imageView.image = UIImage.animatedImage(with: decoded.images.map { UIImage(cgImage: $0) },
-                                                             duration: decoded.duration)
-            }
-            if live[id] == nil { host.attachLiveView(view, item: id, page: target.page) }
+            let task = decode(img.asset, crop: img.crop, maxPixel: bucket, budget: budget, into: view, host: host)
             live[id] = Live(page: target.page, signature: signature, view: view, task: task)
+        }
+    }
+
+    /// Decodes off the main thread; a newer decode for the same view, or the view going away, cancels it.
+    private func decode(_ asset: AssetRef, crop: Rect?, maxPixel: Int, budget: Int, into view: AnimatedImageView,
+                        host: CanvasHost) -> Task<Void, Never> {
+        let assets = host.app.services.assets
+        let doc = host.documentID
+        let work = Task.detached(priority: .utility) { () -> ImageAnimation in
+            guard let data = try? assets?.data(asset, doc: doc) else { return ImageAnimation() }
+            return ImageDecoder.frames(data, maxPixelSize: maxPixel, crop: crop, budget: budget,
+                                       isCancelled: { Task.isCancelled })
+        }
+        return Task { @MainActor [weak view] in
+            let animation = await withTaskCancellationHandler {
+                await work.value
+            } onCancel: {
+                work.cancel()
+            }
+            guard !Task.isCancelled, let view = view else { return }
+            view.play(animation)
+        }
+    }
+
+    private func remove(_ id: ElementID, _ entry: Live, _ host: CanvasHost) {
+        entry.task?.cancel()
+        entry.view.stop()
+        host.attachLiveView(nil, item: id, page: entry.page)
+    }
+
+    /// Keeps the pages already looked at current. Only image items matter, so ink and text commits cost nothing.
+    private func apply(_ cs: Changeset, doc: DocumentID) {
+        if cs.headChanged(doc) {
+            pageOrder = nil
+            noneAnywhere = false
+        }
+        for m in cs.mutations {
+            guard case let .item(d, page, before, after) = m, d == doc, animated[page] != nil,
+                  before?.kind == .image || after.kind == .image else { continue }
+            if !after.deleted && after.image?.animated == true {
+                animated[page]?[after.id] = after
+                noneAnywhere = false
+            } else {
+                animated[page]?[after.id] = nil
+            }
         }
     }
 
     /// Animated image items whose bounds are inside the canvas's visible bounds, on visible layers.
     private func visibleAnimatedItems(_ host: CanvasHost) -> [ElementID: (page: PageID, item: Item)] {
-        var wanted: [ElementID: (page: PageID, item: Item)] = [:]
-        guard !UIAccessibility.isReduceMotionEnabled,
-              let content = try? host.app.workspace.content(host.documentID) else { return wanted }
+        guard !UIAccessibility.isReduceMotionEnabled, !noneAnywhere else { return [:] }
+        if pageOrder == nil {
+            pageOrder = (try? host.app.workspace.content(host.documentID))?.livePages.map { $0.id }
+        }
+        let pages = pageOrder ?? []
         let visible = host.canvasView.bounds
-        for page in content.livePages {
-            guard let pageFrame = host.pageFrame(page.id), pageFrame.intersects(visible),
-                  let items = try? host.app.workspace.items(host.documentID, page: page.id) else { continue }
-            for item in items where item.image?.animated == true && !host.session.hiddenLayers.contains(item.layer) {
+        var wanted: [ElementID: (page: PageID, item: Item)] = [:]
+        for page in pages {
+            guard let pageFrame = host.pageFrame(page), pageFrame.intersects(visible) else { continue }
+            for item in (animated[page] ?? scan(page, host)).values where !host.session.hiddenLayers.contains(item.layer) {
                 let b = item.bounds
-                let a = host.viewPoint(Point(b.minX, b.minY), page: page.id)
-                let z = host.viewPoint(Point(b.maxX, b.maxY), page: page.id)
+                let a = host.viewPoint(Point(b.minX, b.minY), page: page)
+                let z = host.viewPoint(Point(b.maxX, b.maxY), page: page)
                 let rect = CGRect(x: min(a.x, z.x), y: min(a.y, z.y), width: abs(z.x - a.x), height: abs(z.y - a.y))
-                if rect.intersects(visible) { wanted[item.id] = (page.id, item) }
+                if rect.intersects(visible) { wanted[item.id] = (page, item) }
             }
         }
-        return wanted
+        if wanted.isEmpty {
+            noneAnywhere = !pages.isEmpty && pages.allSatisfy { animated[$0]?.isEmpty == true }
+        }
+        guard wanted.count > AnimatedImageAttachment.maxLiveViews else { return wanted }
+        // Too many at once: the ones already playing keep playing, the rest show frame 0.
+        let keep = Set(wanted.keys.sorted { a, b in
+            (live[a] == nil ? 1 : 0, a.raw) < (live[b] == nil ? 1 : 0, b.raw)
+        }.prefix(AnimatedImageAttachment.maxLiveViews))
+        return wanted.filter { keep.contains($0.key) }
+    }
+
+    /// Looks at a page's items once; commits keep the answer current afterwards.
+    private func scan(_ page: PageID, _ host: CanvasHost) -> [ElementID: Item] {
+        guard let items = try? host.app.workspace.items(host.documentID, page: page) else { return [:] }
+        var found: [ElementID: Item] = [:]
+        for item in items where item.image?.animated == true { found[item.id] = item }
+        animated[page] = found
+        return found
     }
 }
 
-/// The live GIF: an image view filling the item's frame, mirrored and clipped to the freehand mask like the tile.
-/// Frames arrive already cropped. Not an accessibility element (the page describes its items).
+/// The live GIF: an image view filling the item's frame, mirrored and clipped to the freehand mask like the tile,
+/// playing each frame for its own delay. Frames arrive already cropped. The display link runs only while the view is
+/// in a window and runs at the rate the fastest frame needs. Not an accessibility element (the page describes its
+/// items).
 final class AnimatedImageView: UIView {
     let imageView = UIImageView()
     private let maskLayer = CAShapeLayer()
     private var crop: Rect?
     private var outline: [Point]?
     private var flip = ImageFlip()
+    private var frames: [UIImage] = []
+    private var delays: [Double] = []
+    private(set) var frameIndex = 0
+    private var elapsed = 0.0
+    private var lastTick: CFTimeInterval?
+    private var link: CADisplayLink?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -409,11 +634,80 @@ final class AnimatedImageView: UIView {
 
     required init?(coder: NSCoder) { return nil }
 
+    var frameCount: Int { frames.count }
+
     func configure(crop: Rect?, mask: [Point]?, flip: ImageFlip) {
+        guard crop != self.crop || mask != outline || flip != self.flip else { return }
         self.crop = crop
         self.outline = mask
         self.flip = flip
         setNeedsLayout()
+    }
+
+    /// Shows frame 0 now and plays the rest while in a window.
+    func play(_ animation: ImageAnimation) {
+        frames = animation.frames.map { UIImage(cgImage: $0) }
+        delays = animation.delays
+        frameIndex = 0
+        elapsed = 0
+        imageView.image = frames.first
+        startLink()
+    }
+
+    /// Stops playing and lets go of the frames (the view is leaving the canvas).
+    func stop() {
+        stopLink()
+        frames = []
+        delays = []
+        imageView.image = nil
+    }
+
+    /// The frame showing `elapsed` seconds after frame `index` came up, and the time already spent in it. A stall
+    /// longer than the whole loop skips whole loops.
+    static func step(index: Int, elapsed: Double, delays: [Double]) -> (index: Int, elapsed: Double) {
+        guard delays.count > 1, delays.allSatisfy({ $0 > 0 }) else { return (0, 0) }
+        let total = delays.reduce(0, +)
+        var i = min(max(index, 0), delays.count - 1)
+        var t = max(elapsed, 0)
+        if t >= total { t = t.truncatingRemainder(dividingBy: total) }
+        while t >= delays[i] {
+            t -= delays[i]
+            i = (i + 1) % delays.count
+        }
+        return (i, t)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { stopLink() } else { startLink() }
+    }
+
+    private func startLink() {
+        stopLink()
+        guard window != nil, frames.count > 1, delays.count == frames.count else { return }
+        let link = CADisplayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick(_:)))
+        let fastest = max(delays.min() ?? 0.1, 1.0 / 60)
+        let fps = Float(min(60, (1 / fastest).rounded(.up)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: max(1, fps / 2), maximum: fps, preferred: fps)
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    private func stopLink() {
+        link?.invalidate()
+        link = nil
+        lastTick = nil
+    }
+
+    fileprivate func advance(_ link: CADisplayLink) {
+        let now = link.targetTimestamp
+        defer { lastTick = now }
+        guard let last = lastTick, frames.count > 1 else { return }
+        let next = AnimatedImageView.step(index: frameIndex, elapsed: elapsed + max(0, now - last), delays: delays)
+        elapsed = next.elapsed
+        guard next.index != frameIndex, next.index < frames.count else { return }
+        frameIndex = next.index
+        imageView.image = frames[frameIndex]
     }
 
     override func layoutSubviews() {
@@ -437,5 +731,21 @@ final class AnimatedImageView: UIView {
         maskLayer.frame = CGRect(origin: .zero, size: size)
         maskLayer.path = path.cgPath
         imageView.layer.mask = maskLayer
+    }
+}
+
+/// CADisplayLink retains its target; this weak hop lets the view go away (and invalidates the link if it has).
+@MainActor
+private final class DisplayLinkTarget: NSObject {
+    weak var view: AnimatedImageView?
+
+    init(_ view: AnimatedImageView) {
+        self.view = view
+        super.init()
+    }
+
+    @objc func tick(_ link: CADisplayLink) {
+        guard let view = view else { return link.invalidate() }
+        view.advance(link)
     }
 }
