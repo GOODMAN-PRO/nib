@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWindows/FeatWindowsFeature.swift:54-58,109-113 (WindowMenus.closeOthersParams); WindowCommands.swift:233-256 (WindowScenes.close); SceneHooksImpl.swift:261-264",
+      "problem": "Tab-menu 'Close Other Tabs' is a batch [tab.select {index}, tab.closeOthers] that assumes tab.select switches tabs synchronously. When ui.openGate is set (F071 always sets it), ShellViewController.openDocument defers every open into a Task, and the user-principal bus path (gateway.authorize returns at once, all @MainActor) never suspends, so tab.closeOthers runs while the old tab is still activeDocument. It closes the tab the person chose to keep, then the deferred open adds it back beside the old tab. Example: tabs [A*,B,C], Close Other Tabs on B, default openAsTabs=true -> [A,B] instead of [B]. WindowScenes.close has the same ordering assumption: Task{closeDocument} runs before a gate that suspends (locked neighbour), so the shell opens openDocuments.last and shows a second unlock prompt. Drag-out also removes the origin tab even if the new window's unlock is cancelled. No test sets openGate, and FakeNavigator opens synchronously.",
+      "fix": "Make the tab-menu params not depend on an open finishing. Return a batch of `tab.close {doc}` for every other tab: background tabs first, then the on-screen tab last, so its right/left neighbour is the kept tab. In WindowScenes.close, when openGate != nil, close in a Task that first checks `navigator.activeDocument == next` and otherwise leaves the tab. In SceneHooksImpl.restore, close the dragged tab in the origin only once the target navigator's activeDocument == doc. Add tests that set `h.app.ui.openGate = { _ in true }`, use a FakeNavigator that defers gated opens in a Task like the shell, and assert that Close Other Tabs on tab 1 leaves exactly [tab1]."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWindows/FeatWindowsFeature.swift:59-62 (windows.title.closeOthers)",
+      "problem": "F017 (feat/F017, FeatDocChromeFeature.swift:62) already registers chrome.title.closeOthers at MenuLocation.documentTitle running tab.closeOthers, and DESIGN §14.2 puts the document title menu with F017. Once both land, the title menu shows 'Close Other Tabs' twice. The F018 spec only asks for tab-menu entries.",
+      "fix": "Delete the windows.title.closeOthers registration and drop the title-menu assertion in testTabMenuComesFromTheRegistryAndClosesTheOtherTabs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWindows/SceneHooksImpl.swift:209-217 (makeTabBar / showsStrip width)",
+      "problem": "Whether the strip shows is decided once, from `rootViewController?.viewIfLoaded?.bounds.width ?? 0`, when the shell builds it. At scene connect the width can be 0 before layout, and a Split View or Stage Manager resize across 600 pt is not re-evaluated. So a single-tab window can be missing its strip on a regular width, or keep it on a compact one, until the next navigation (P-060).",
+      "fix": "Drop the width condition from TabStripLayout.showsStrip, so the strip shows whenever tabCount > 1 or (tabCount == 1 && openAsTabs), and let plan() handle compact widths. Or read the window scene's size/trait instead of the view bounds. Update the showsStrip test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWindows/TabStripView.swift:150-155,261 (dragActivity in TabCapsule.body)",
+      "problem": "`model.dragActivity(tab)` is evaluated on every body pass of every tab. It allocates an NSUserActivity and, for background tabs, calls scenes.page(of:) -> workspace.content(doc). That can load a document head and emit doc.opened during a SwiftUI view update.",
+      "fix": "Pass the model and tab to TabDrag, gate only on `scenes.supportsMultipleWindows()`, and build the activity inside the `onDrag { }` closure."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWindows/SceneHooksImpl.swift:173-175,237-281 (restore/apply)",
+      "problem": "Restoring a window rebuilds an editor, plus a new strip and hosting controller, for every restored tab synchronously inside scene(_:willConnectTo:): up to 9 builds for large notebooks at launch. Tabs beyond 8 are silently dropped from the restored window. The cause is a contract limitation (no 'append tab without showing'), but no contract request was filed.",
+      "fix": "Have the orchestrator file a contract request for `SceneNavigator.addTab(_:)` (append to openDocuments without display). Until then keep the cap, but log the dropped tab count with the windows Logger so the loss is visible."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWindows/TabStripView.swift:131-136 (TabStripModel.showLibrary)",
+      "problem": "The strip's Library button calls navigator.showLibrary directly instead of a command, so AI and plugins cannot do what this button does (ARCHITECTURE §15.3). The code comment says the gap was reported, but no contract request exists.",
+      "fix": "File the contract request for a session command such as `window.showLibrary {folder?}` (owner F018) through the orchestrator, and route the button through app.perform once it exists. Leave the direct call until then."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWindows/TabStripView.swift:193-209 (overflowMenu)",
+      "problem": "The 'N more' Menu label is a bare Text. It has no NibPressStyle, so no system hover highlight, no 2 pt concentric focus ring for Full Keyboard Access and no 0.96 press, unlike every other control in the strip (DESIGN §12/§13 common states).",
+      "fix": "Apply `.buttonStyle(NibPressStyle(shape: Capsule()))` to the Menu, or wrap the label the same way the tab buttons are, keeping the -hitOutset contentShape."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatWindowsTests/FeatWindowsTests.swift",
+      "problem": "The restoration retry path (document not openable yet at launch, retry, stop once the person opens something) and the lock-gate paths are untested. The two-windows edit test only reads the single shared Workspace, so it would pass without this feature.",
+      "fix": "Add a test that connects with a lastSession doc that becomes openable after the first attempt (create it in the workspace, then wait more than 250 ms) and asserts it opens. Add one where the navigator opens another doc first and asserts restoration backs off. Add the openGate tests from the major issue."
+    }
+  ]
+}

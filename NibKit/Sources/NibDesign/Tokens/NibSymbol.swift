@@ -130,6 +130,123 @@ public struct NibSymbol: Hashable, Sendable {
     public static let permission = NibSymbol("hand.raised")
     public static let network = NibSymbol("network")
     public static let documentWrite = NibSymbol("pencil.and.outline")
+
+    // v2 additions (DESIGN.md §8.3). Every name exists on iOS 17; `imagePlayground` is the one OS-gated glyph.
+
+    // Tools and colour
+    /// The system colour picker's eyedropper, and the tool options' "pick a colour from the page".
+    public static let eyedropper = NibSymbol("eyedropper")
+    /// "Custom…" colour: opens the system colour picker (also the object menu's Colour).
+    public static let customColour = NibSymbol("paintpalette")
+    /// Draw Shape (hold at the end of a stroke to snap it); distinct from the Shapes tool's `square.on.circle`.
+    public static let drawShape = NibSymbol("pencil.and.outline")
+    public static let layers = NibSymbol("square.3.layers.3d")
+    public static let editHandwriting = NibSymbol("scribble")
+    /// Recognised text: Live Text, "edit every word", Convert › Text previews.
+    public static let recognisedText = NibSymbol("text.viewfinder")
+    public static let convertToText = NibSymbol("character.textbox")
+    public static let straighten = NibSymbol("level")
+    public static let insertSpace = NibSymbol("arrow.up.and.down")
+    public static let math = NibSymbol("x.squareroot")
+    public static let graph = NibSymbol("chart.xyaxis.line")
+    public static let table = NibSymbol("tablecells")
+    /// Reorder handles on rows and text-document blocks (plain `labelTertiary`).
+    public static let dragHandle = NibSymbol("line.3.horizontal")
+
+    // Editing actions (object menu, keyboard bar, image options)
+    public static let cut = NibSymbol("scissors")
+    public static let copy = NibSymbol("doc.on.doc")
+    public static let paste = NibSymbol("doc.on.clipboard")
+    public static let duplicate = NibSymbol("plus.square.on.square")
+    public static let link = NibSymbol("link")
+    public static let arrange = NibSymbol("square.stack.3d.up")
+    public static let screenshot = NibSymbol("camera.viewfinder")
+    public static let crop = NibSymbol("crop")
+    public static let flipHorizontal = NibSymbol("arrow.left.and.right.righttriangle.left.righttriangle.right")
+    public static let flipVertical = NibSymbol("arrow.up.and.down.righttriangle.up.righttriangle.down")
+    public static let replace = NibSymbol("arrow.2.squarepath")
+    public static let unlock = NibSymbol("lock.open")
+    public static let touchID = NibSymbol("touchid")
+    public static let print = NibSymbol("printer")
+    public static let saveToFiles = NibSymbol("square.and.arrow.down.on.square")
+    public static let newWindow = NibSymbol("macwindow.badge.plus")
+    /// A link that leaves Nib (system settings, a web page).
+    public static let externalLink = NibSymbol("arrow.up.forward.app")
+    public static let qrCode = NibSymbol("qrcode")
+    /// Image Playground (iOS 18.1+): nil where the OS has no glyph, so the entry is hidden there.
+    public static var imagePlayground: NibSymbol? { NibSymbol(systemName: "apple.image.playground") }
+
+    // Text formatting (text boxes, full-page typing, text documents)
+    public static let bold = NibSymbol("bold")
+    public static let italic = NibSymbol("italic")
+    public static let underline = NibSymbol("underline")
+    public static let strikethrough = NibSymbol("strikethrough")
+    public static let textSuperscript = NibSymbol("textformat.superscript")
+    public static let textSubscript = NibSymbol("textformat.subscript")
+    public static let inlineCode = NibSymbol("chevron.left.forwardslash.chevron.right")
+    public static let fontSize = NibSymbol("textformat.size")
+    public static let alignLeft = NibSymbol("text.alignleft")
+    public static let alignCentre = NibSymbol("text.aligncenter")
+    public static let alignRight = NibSymbol("text.alignright")
+    public static let justify = NibSymbol("text.justify")
+    public static let listBulleted = NibSymbol("list.bullet")
+    public static let listNumbered = NibSymbol("list.number")
+    public static let checklist = NibSymbol("checklist")
+    public static let indent = NibSymbol("increase.indent")
+    public static let outdent = NibSymbol("decrease.indent")
+    public static let lineSpacing = NibSymbol("arrow.up.and.down.text.horizontal")
+
+    // Audio, time and replay
+    /// The recording indicator (the dot in the recording HUD is a `NibStatusDot`).
+    public static let recordDot = NibSymbol("record.circle")
+    public static let skipBack10 = NibSymbol("gobackward.10")
+    public static let skipForward10 = NibSymbol("goforward.10")
+    public static let transcript = NibSymbol("captions.bubble")
+    public static let speak = NibSymbol("speaker.wave.2")
+    public static let timer = NibSymbol("timer")
+    public static let stopwatch = NibSymbol("stopwatch")
+    public static let lap = NibSymbol("flag")
+    /// Undo history, replay and backups.
+    public static let history = NibSymbol("clock.arrow.circlepath")
+
+    // Settings and places
+    public static let profile = NibSymbol("person.crop.circle")
+    public static let language = NibSymbol("globe")
+    public static let notifications = NibSymbol("bell.badge")
+    public static let reminder = NibSymbol("bell")
+    /// About, and info notices (`NibBanner`).
+    public static let info = NibSymbol("info.circle")
+    public static let advanced = NibSymbol("wrench.and.screwdriver")
+    public static let templates = NibSymbol("rectangle.3.group")
+    public static let minimap = NibSymbol("map")
+    public static let fitToContent = NibSymbol("arrow.up.left.and.arrow.down.right")
+    public static let calendar = NibSymbol("calendar")
+    public static let cloud = NibSymbol("icloud")
+    public static let backup = NibSymbol("externaldrive")
+    public static let diagnostics = NibSymbol("stethoscope")
+    public static let dictionary = NibSymbol("character.book.closed")
+
+    /// Every token, for the gallery and the test that each name resolves on this OS.
+    static let all: [NibSymbol] = [
+        pen, pencil, highlighter, eraser, eraserFilter, lasso, lassoRectangle, shapes, connectors, tape, text, pageTyping,
+        image, camera, scan, elements, sticky, comment, laser, zoomWindow, ruler, fingerDrawing, more, moreCircle,
+        back, forward, chevronDown, undo, redo, search, clearText, bookmark, bookmarkFill, share, importFile, pages,
+        outline, addPage, assistant, assistantOpen, record, microphone, stop, play, pause, present, externalDisplay,
+        checkmark, checkCircle, checkCircleFill, circle, xmark, plus, minus, citation, send, stopGenerating, key, bridge,
+        eye, eyeSlash, warningTriangle, retry, lock, faceID, command, keyboard, dictate, attach,
+        library, favorites, starFill, shared, recents, studySets, gallery, puzzle, trash, folder, folderFill, notebook,
+        quickNote, whiteboard, textDocument, pdf, sort, select, listView, sidebar, settings, syncDone, syncing, syncError,
+        invite, live, permission, network, documentWrite,
+        eyedropper, customColour, drawShape, layers, editHandwriting, recognisedText, convertToText, straighten,
+        insertSpace, math, graph, table, dragHandle,
+        cut, copy, paste, duplicate, link, arrange, screenshot, crop, flipHorizontal, flipVertical, replace, unlock,
+        touchID, print, saveToFiles, newWindow, externalLink, qrCode,
+        bold, italic, underline, strikethrough, textSuperscript, textSubscript, inlineCode, fontSize, alignLeft,
+        alignCentre, alignRight, justify, listBulleted, listNumbered, checklist, indent, outdent, lineSpacing,
+        recordDot, skipBack10, skipForward10, transcript, speak, timer, stopwatch, lap, history,
+        profile, language, notifications, reminder, info, advanced, templates, minimap, fitToContent, calendar, cloud,
+        backup, diagnostics, dictionary,
+    ]
 }
 
 public extension Image {
