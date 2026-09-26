@@ -10,12 +10,15 @@ import NibDesign
 
 enum TextDocMetrics {
     /// The reading column (DESIGN §14.17).
-    static let columnWidth: CGFloat = 680
+    static let columnWidth = NibMetrics.textColumnWidth
     static let markerWidth = NibSpacing.x3
+    /// The tallest an image block grows (taller images letterbox inside it), and the 16:9 box an image block keeps
+    /// while its image loads. NibDesign has no token for media in the reading column yet: reported as a contract gap
+    /// (a `NibMetrics` maximum media height for text documents).
     static let maxImageHeight: CGFloat = 640
+    static let defaultImageAspect: CGFloat = 9.0 / 16.0
     /// Empty image / video block: room for its 44 pt button.
     static let placeholderHeight: CGFloat = NibMetrics.hitTarget * 2
-    static let defaultImageAspect: CGFloat = 0.5625
 }
 
 // MARK: - Style
@@ -46,13 +49,13 @@ struct BlockStyle: Equatable {
         switch kind {
         case .heading1:
             return BlockStyle(kind: kind, isCaption: false, dimmed: false,
-                              baseFont: NibUIFont.font(.title1, weight: .bold, design: .serif), serif: true, bold: true, code: false)
+                              baseFont: NibUIFont.documentHeading(1), serif: true, bold: true, code: false)
         case .heading2:
             return BlockStyle(kind: kind, isCaption: false, dimmed: false,
-                              baseFont: NibUIFont.font(.title2, weight: .bold, design: .serif), serif: true, bold: true, code: false)
+                              baseFont: NibUIFont.documentHeading(2), serif: true, bold: true, code: false)
         case .heading3:
             return BlockStyle(kind: kind, isCaption: false, dimmed: false,
-                              baseFont: NibUIFont.font(.title3, weight: .bold, design: .serif), serif: true, bold: true, code: false)
+                              baseFont: NibUIFont.documentHeading(3), serif: true, bold: true, code: false)
         case .code:
             let size = NibUIFont.font(.subheadline).pointSize
             return BlockStyle(kind: kind, isCaption: false, dimmed: false,
@@ -60,7 +63,7 @@ struct BlockStyle: Equatable {
                               serif: false, bold: false, code: true)
         default:
             return BlockStyle(kind: kind, isCaption: false, dimmed: kind == .todo && checked,
-                              baseFont: NibUIFont.font(.body, design: .serif), serif: true, bold: false, code: false)
+                              baseFont: NibUIFont.documentBody, serif: true, bold: false, code: false)
         }
     }
 
@@ -73,7 +76,7 @@ struct BlockStyle: Equatable {
         TextAttributes(size: size, bold: bold ? true : nil, code: code ? true : nil)
     }
 
-    private static let serifDescriptor = NibUIFont.font(.body, design: .serif).fontDescriptor
+    private static let serifDescriptor = NibUIFont.documentBody.fontDescriptor
     private static var bridgeFamily: String { RichTextBridge.font(TextAttributes(size: 17)).familyName }
 
     // MARK: RichText -> text view
@@ -247,6 +250,9 @@ final class BlockTextView: UITextView {
         addSubview(placeholderLabel)
         if #available(iOS 18.0, *) {
             writingToolsBehavior = .complete
+            // Block text stores no inline images: Genmoji are not offered, and images that arrive inside pasted or
+            // dropped rich text become image blocks (`BlockAttachments`), so nothing typed is lost.
+            supportsAdaptiveImageGlyph = false
         }
     }
 
@@ -375,6 +381,8 @@ protocol BlockCellHost: AnyObject {
     func cellDidTapCustom(_ cell: BlockCell)
     func aiMenuElements(for cell: BlockCell) -> [UIMenuElement]
     func accessibilityActions(for cell: BlockCell) -> [UIAccessibilityCustomAction]
+    /// Replace, Insert Below or Discard on the assistant's proposal shown under the cell's block.
+    func cell(_ cell: BlockCell, resolveProposal choice: BlockProposal.Choice)
 }
 
 // MARK: - Cell
@@ -409,6 +417,8 @@ final class BlockCell: UICollectionViewCell {
     private let quoteBar = UIView()
     private let stack = UIStackView()
     private let media = UIView()
+    /// The assistant's proposal for this block (S-012), under its text; hidden when there is none.
+    let proposalView = BlockProposalView()
     private var mediaContent: UIView?
     /// The media view came from `ui.blockViews` (another feature's view keeps its own accessibility).
     private var mediaIsEmbedded = false
@@ -516,7 +526,12 @@ final class BlockCell: UICollectionViewCell {
         stack.spacing = NibSpacing.s
         textView.role = .body
         captionView.role = .caption
-        for v in [textView, media, captionView] as [UIView] { stack.addArrangedSubview(v) }
+        for v in [textView, media, captionView, proposalView] as [UIView] { stack.addArrangedSubview(v) }
+        proposalView.isHidden = true
+        proposalView.onChoice = { [weak self] choice in
+            guard let self = self else { return }
+            self.host?.cell(self, resolveProposal: choice)
+        }
 
         markerLabel.textAlignment = .right
         markerLabel.adjustsFontSizeToFitWidth = true
@@ -746,7 +761,8 @@ final class BlockCell: UICollectionViewCell {
                 showAddButton(title: String(localized: "Add Image"), symbol: .image, readOnly: env.readOnly, isImage: true)
             }
         case .video:
-            if let s = block.url, let url = URL(string: s) {
+            // Only web links get a link view: a stored url of any other scheme shows the Add Video Link button.
+            if let s = block.url, let url = BlockMedia.webURL(s) {
                 showVideo(url)
             } else {
                 showAddButton(title: String(localized: "Add Video Link"), symbol: .play, readOnly: env.readOnly, isImage: false)
@@ -822,22 +838,24 @@ final class BlockCell: UICollectionViewCell {
         setNeedsLayout()
     }
 
+    /// Shows `view` in the media slot. Embedded views (`ui.blockViews`) are kept per block by the editor, so the same
+    /// view can have moved into another cell since this one last showed it: it is attached whenever it is not
+    /// inside this cell's slot, not only when it differs from the last one shown here.
     private func setMediaContent(_ view: UIView?, height: CGFloat?, embedded: Bool = false) {
         mediaIsEmbedded = embedded
-        if mediaContent !== view {
-            if let old = mediaContent, old.superview === media { old.removeFromSuperview() }
-            if let v = view {
-                v.translatesAutoresizingMaskIntoConstraints = false
-                media.addSubview(v)
-                NSLayoutConstraint.activate([
-                    v.leadingAnchor.constraint(equalTo: media.leadingAnchor),
-                    v.trailingAnchor.constraint(equalTo: media.trailingAnchor),
-                    v.topAnchor.constraint(equalTo: media.topAnchor),
-                    v.bottomAnchor.constraint(equalTo: media.bottomAnchor)
-                ])
-            }
-            mediaContent = view
+        if let old = mediaContent, old !== view, old.superview === media { old.removeFromSuperview() }
+        if let v = view, v.superview !== media {
+            v.removeFromSuperview()
+            v.translatesAutoresizingMaskIntoConstraints = false
+            media.addSubview(v)
+            NSLayoutConstraint.activate([
+                v.leadingAnchor.constraint(equalTo: media.leadingAnchor),
+                v.trailingAnchor.constraint(equalTo: media.trailingAnchor),
+                v.topAnchor.constraint(equalTo: media.topAnchor),
+                v.bottomAnchor.constraint(equalTo: media.bottomAnchor)
+            ])
         }
+        mediaContent = view
         if let h = height {
             mediaHeight.constant = h
             mediaHeight.isActive = true
@@ -879,6 +897,14 @@ final class BlockCell: UICollectionViewCell {
         var c = aiButton.configuration
         c?.showsActivityIndicator = false
         aiButton.configuration = c
+        // An embedded view belongs to its block, not to this cell: give it back, so the cell that shows the block
+        // next attaches it and this one never keeps a stale reference.
+        if mediaIsEmbedded {
+            if let content = mediaContent, content.superview === media { content.removeFromSuperview() }
+            mediaContent = nil
+            mediaIsEmbedded = false
+        }
+        proposalView.isHidden = true
     }
 
     // MARK: Accessories
@@ -894,6 +920,16 @@ final class BlockCell: UICollectionViewCell {
         c?.showsActivityIndicator = running
         aiButton.configuration = c
         aiButton.isEnabled = !running
+    }
+
+    /// Shows (or hides) the assistant's proposal under the block. `editable` false leaves only Discard.
+    func setProposal(_ proposal: BlockProposal?, editable: Bool) {
+        guard let p = proposal else {
+            proposalView.isHidden = true
+            return
+        }
+        proposalView.show(p, editable: editable)
+        proposalView.isHidden = false
     }
 
     @objc private func hovered(_ g: UIHoverGestureRecognizer) {
@@ -963,6 +999,126 @@ final class BlockCell: UICollectionViewCell {
     }
 }
 
+// MARK: - Assistant proposal (S-012)
+
+/// What the block's assistant action proposes. Nothing in the document changes until the user picks Replace or
+/// Insert Below (DESIGN "Trust is visible": the assistant previews on the page before changing anything).
+struct BlockProposal: Equatable {
+    enum Choice { case replace, insertBelow, discard }
+
+    /// The action's title ("Make Concise"), or the question's.
+    var title: String
+    var text: String
+    /// Edit actions on a text block offer Replace; answers to a question only Insert Below.
+    var replaces: Bool
+}
+
+/// The proposal row under a block: an opaque `fill4` proposal block in the reading column (no droplets on text,
+/// DESIGN §14.17), the proposed text in the `chat` role, then Replace (the row's one filled button) · Insert Below ·
+/// Discard, each with a 44 pt target.
+final class BlockProposalView: UIView {
+    var onChoice: ((BlockProposal.Choice) -> Void)?
+
+    private let titleLabel = UILabel()
+    private let bodyLabel = UILabel()
+    private let buttons = UIStackView()
+    /// Keeps the buttons at their leading edge in a row.
+    private let buttonSpacer = UIView()
+    private lazy var replaceButton = makeButton(String(localized: "Replace"), primary: true, choice: .replace)
+    private lazy var insertButton = makeButton(String(localized: "Insert Below"), primary: false, choice: .insertBelow)
+    private lazy var discardButton = makeButton(String(localized: "Discard"), primary: false, choice: .discard)
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = NibUIColor.fill4
+        layer.cornerRadius = NibRadius.proposal
+        layer.cornerCurve = .continuous
+
+        let mark = UIImageView(image: UIImage(nib: .assistant))
+        mark.preferredSymbolConfiguration = NibUIFont.glyph(.panel)
+        mark.tintColor = NibUIColor.labelSecondary
+        mark.setContentHuggingPriority(.required, for: .horizontal)
+        mark.isAccessibilityElement = false
+        titleLabel.font = NibUIFont.chatEmphasis
+        titleLabel.textColor = NibUIColor.labelSecondary
+        titleLabel.adjustsFontForContentSizeCategory = true
+        titleLabel.numberOfLines = 0
+        let header = UIStackView(arrangedSubviews: [mark, titleLabel])
+        header.axis = .horizontal
+        header.spacing = NibSpacing.s
+        header.alignment = .firstBaseline
+
+        bodyLabel.font = NibUIFont.chat
+        bodyLabel.textColor = NibUIColor.label
+        bodyLabel.adjustsFontForContentSizeCategory = true
+        bodyLabel.numberOfLines = 0
+
+        buttons.axis = .horizontal
+        buttons.spacing = NibSpacing.s
+        buttons.alignment = .center
+        for b in [replaceButton, insertButton, discardButton] {
+            b.setContentHuggingPriority(.required, for: .horizontal)
+            buttons.addArrangedSubview(b)
+        }
+        buttonSpacer.setContentHuggingPriority(UILayoutPriority(1), for: .horizontal)
+        buttonSpacer.setContentCompressionResistancePriority(UILayoutPriority(1), for: .horizontal)
+        buttons.addArrangedSubview(buttonSpacer)
+
+        let column = UIStackView(arrangedSubviews: [header, bodyLabel, buttons])
+        column.axis = .vertical
+        column.spacing = NibSpacing.m
+        column.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(column)
+        NSLayoutConstraint.activate([
+            column.leadingAnchor.constraint(equalTo: leadingAnchor, constant: NibSpacing.m),
+            column.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -NibSpacing.m),
+            column.topAnchor.constraint(equalTo: topAnchor, constant: NibSpacing.m),
+            column.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -NibSpacing.m)
+        ])
+        shouldGroupAccessibilityChildren = true
+        _ = registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (view: BlockProposalView, _: UITraitCollection) in
+            view.updateAxis()
+        }
+        updateAxis()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func show(_ proposal: BlockProposal, editable: Bool) {
+        titleLabel.text = proposal.title
+        bodyLabel.text = proposal.text
+        replaceButton.isHidden = !(editable && proposal.replaces)
+        insertButton.isHidden = !editable
+        titleLabel.accessibilityLabel = String(localized: "Proposed edit: \(proposal.title)")
+    }
+
+    /// Accessibility sizes stack the buttons, so their titles never truncate.
+    private func updateAxis() {
+        let stacked = traitCollection.preferredContentSizeCategory.isAccessibilityCategory
+        buttons.axis = stacked ? .vertical : .horizontal
+        buttons.alignment = stacked ? .leading : .center
+        buttonSpacer.isHidden = stacked
+    }
+
+    private func makeButton(_ title: String, primary: Bool, choice: BlockProposal.Choice) -> UIButton {
+        var c: UIButton.Configuration = primary ? .filled() : .gray()
+        c.title = title
+        c.cornerStyle = .capsule
+        c.baseBackgroundColor = primary ? NibUIColor.accent : NibUIColor.fill3
+        c.baseForegroundColor = primary ? NibUIColor.onAccent : NibUIColor.label
+        c.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+            var outgoing = incoming
+            outgoing.font = NibUIFont.button
+            return outgoing
+        }
+        let b = UIButton(configuration: c)
+        b.addAction(UIAction { [weak self] _ in self?.onChoice?(choice) }, for: .primaryActionTriggered)
+        b.isPointerInteractionEnabled = true
+        b.heightAnchor.constraint(greaterThanOrEqualToConstant: NibMetrics.hitTarget).isActive = true
+        return b
+    }
+}
+
 // MARK: - Custom block drawing
 
 /// Draws a `CustomBlock.display` DisplayList, so a plugin's block survives the plugin's removal.
@@ -1007,6 +1163,11 @@ final class TableFallbackView: UIView {
             rows.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
         isAccessibilityElement = false
+        // Borders are resolved CGColors and hairlines depend on the scale: rebuild when either changes.
+        _ = registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitDisplayScale.self]) {
+            (view: TableFallbackView, _: UITraitCollection) in
+            view.rebuild()
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -1041,10 +1202,5 @@ final class TableFallbackView: UIView {
             }
             rows.addArrangedSubview(line)
         }
-    }
-
-    override func traitCollectionDidChange(_ previous: UITraitCollection?) {
-        super.traitCollectionDidChange(previous)
-        if previous?.userInterfaceStyle != traitCollection.userInterfaceStyle { rebuild() }
     }
 }
