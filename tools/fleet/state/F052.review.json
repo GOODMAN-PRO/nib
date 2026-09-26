@@ -1,0 +1,95 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAudio/Recorder.swift:114-193 (Recorder: AVAudioFile AAC-in-CAF writer, closeFile) / NibKit/Tests/FeatAudioTests/FeatAudioTests.swift:255-270 (testCrashRecoveryReadsTheLengthFromTheFile)",
+      "problem": "S-057 (parity+) and the spec both promise that a crash keeps what was recorded. Nothing shows that it does. The crash test fakes the crash with `audio.recorder?.closeFile()`, which cleanly closes the AVAudioFile, and a real crash never does that. AAC is VBR, so a CAF of AAC packets is only decodable with its 'pakt' packet table, and Core Audio writes that table when the file is closed. An unclosed AAC-in-CAF is therefore very likely unreadable. That covers a crash, jetsam killing a backgrounded recorder, and a battery pull. `recover` would then find no length and the whole recording would be lost. willTerminateNotification does not arrive in any of these cases.",
+      "fix": "First, prove it with a test. Add an internal `Recorder.drainForTesting()` (`queue.sync {}`). In a new test, start with SyntheticSource, feed 2 s, drain but do NOT call finish/closeFile, copy `audio/<clip>.caf` to a temp URL, open the copy with AVAudioFile and assert a length of 2 s ±0.25. Rewrite testCrashRecovery to recover from such an unclosed file. If the copy cannot be read, record into a self-framing, crash-safe file: AAC in ADTS (`audio/<clip>.aac`, same size as AAC-in-CAF) or 16-bit LPCM CAF. Then, off the main actor, convert it to AAC-in-CAF at `audio/<clip>.caf` on stop and in `AudioRecord.recover`. For ADTS use a packet copy with no re-encode; for LPCM use a transcode. Write to `<clip>.caf.tmp` and replace atomically. The clip record keeps `file = audio/<clip>.caf`, and the delete sweep already removes `<clip>.*` side files."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAudio/Recorder.swift:173-193 (resume/finish/closeFile), 257-273 (writeSilence); callers AudioCommands.swift:178 (AudioRecord.stop), :403 (AudioDelete), Recorder.swift:331-349 (finishRecording/abortRecording)",
+      "problem": "`Recorder.finish()` and `closeFile()` call `queue.sync` from the main actor. On resume, `writeSilence(gap)` queues AAC encoding of the ENTIRE pause as silence on that same serial queue (the 'ponytail' note in the code). Example: pause for a 30 min break, resume, then tap Stop, or delete the clip. The main thread then blocks until minutes of silence are encoded, which takes seconds (longer on overnight pauses) and freezes the UI. This breaks ARCHITECTURE §14 (a command must not block the main actor for more than 16 ms). The same wait also covers `SilenceMap.Builder.finish()`, which sorts about 216k levels for a 3 h recording. At termination the sync can overrun the system's grace period, and the file is then never closed.",
+      "fix": "(a) Required: make `Recorder.finish()` async. Use `await withCheckedContinuation { c in queue.async { let r = …; self.file = nil; c.resume(returning: r) } }`, make `AudioController.finishRecording()`/`abortRecording()` async, and `await` them in AudioRecord.stop, AudioDelete and the start-failure path. Keep `queue.sync` only in `closeFile()`, and skip it there when a silence filler is still pending (track the pending filler frames). (b) Bound the filler: encode at most N minutes (e.g. 10). For a longer pause, finish the current clip at pause time and open a new clip on resume with `start` = resume time. Note Replay alignment still holds and no silence is encoded. Add a test: pause with the fake clock advanced 20 min, resume, then stop; assert that stop returns and the clip lengths match the wall clock."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAudio/AudioCommands.swift:39-47 (AudioRefs.fileURL), :420-429 (AudioDelete.removeFiles)",
+      "problem": "This is a trust-boundary data-loss risk. `fileURL` refuses only '..' and absolute paths, so it trusts any path inside the package. AudioClip.file is attacker-controlled data: F003's `node.set`/`node.insert` let plugins, the AI and the bridge set it, and folder sync carries it from other devices. Point a clip at `doc.<dev>.json`, a page file, or another clip's `audio/<other>.caf`, then call `audio.delete`. The user sees a normal 'Delete Recording' confirmation, but the command deletes that document file or the other recording's audio. `audio.export {format: caf}` would also hand out any package file as a tmp: asset.",
+      "fix": "Accept only the canonical audio location. Require `parts.count == 2`, `parts[0] == \"audio\"` and `parts[1].hasPrefix(clip.id.raw + \".\")`; otherwise throw `invariant_violation`. In AudioDelete, catch that error, tombstone the record and touch no file. Extend testAClipFileOutsideItsPackageIsRefused with two cases. Case one: a file inside the package (e.g. write `FIXTUREDOC01/doc.7.json` and set `file` to it). Case two: another clip's `audio/OTHERCLIP01.caf`. Assert that audio.delete leaves both files in place and that play/export refuse."
+    },
+    {
+      "severity": "minor",
+      "where": "[contracts-v2 G12, not on main yet] NibKit/Sources/FeatAudio/AudioPanel.swift:132-147, 388-429 (recorder / RecorderView inside the sidebar tab); FeatAudioFeature.swift:102-138 (AudioIndicators)",
+      "problem": "This problem comes from the missing chrome extension point for floating HUDs (the F052 blocker, logged in tools/fleet/contract-gaps.md). DESIGN §14.13 wants a Clear 40 pt recording HUD: budded from the trailing bar to top centre, with a destructive dot, the timer in hud type, a live waveform, Pause and Stop. It exists only inside the Audio sidebar tab. As a result: ⌘⇧R, More › Record Audio and the toolbar accessory start a recording with no clock, waveform or Pause on screen unless the user opens the tab; a pause caused by an interruption (a call) is invisible; and nothing recedes to 22 % while the Pencil is down. The forge spec itself places the recorder in the tab, so this is not a spec violation today.",
+      "fix": "Once v2/contracts is on main (REVIEW rule 3 then makes this a major), register `ChromeOverlayDescriptor(id: \"audio.recorder\", owner: FeatAudioFeature.id, placement: .top, surface: .hud, order: …, recedesWhileWriting: true, docKinds: AudioIndicators.docKinds, isVisible: { AudioController.of($0.app.services)?.recording != nil }, makeView: { AnyView(RecorderHUD(audio:…)) })` in `app.ui.chromeOverlays`. RecorderHUD holds the dot, the NibFont.hud clock, LiveWaveform, and Pause/Stop NibIconButtons that run audio.record. Call `app.ui.setNeedsChromeUpdate()` from `recordingChanged` and after pause/resume. Keep only the clip list and the compact 'Recording in …' row in the tab. No change is required before v2 lands."
+    },
+    {
+      "severity": "minor",
+      "where": "[contracts-v2 G12 (+G16), not on main yet] NibKit/Sources/FeatAudio/AudioPanel.swift:45-51, 508-693 (AudioPlaybackBar hosted in the sidebar tab, ⌘⌥P / ⌘⌥←→ as SwiftUI shortcuts on its buttons)",
+      "problem": "This also comes from the missing floating-bar extension point. DESIGN §14.13 wants a Clear 320 × 44 audio bar at bottom centre, above the palette on iPhone. It lives in the Audio tab instead. As a result: close the tab or switch document, and audio keeps playing with no visible Pause or scrubber anywhere. On iPhone the tab covers the canvas, so the user cannot watch the page (or F053 Replay) while controlling playback. The play/pause and ±10 s shortcuts work only while the tab is on screen, because they are `.nibShortcut`s on the tab's buttons rather than KeyCommandDescriptors.",
+      "fix": "Once v2 is on main: register a `.bottom`, `.bar` ChromeOverlayDescriptor 'audio.player' (recedesWhileWriting: true, docKinds as above). Make it visible while `audio.playback != nil` (or while the document has playable clips) and host AudioPlaybackBar in it. Call `app.ui.setNeedsChromeUpdate()` from playback changes (play, pause, planFinished, stopPlayback). Move ⌘⌥P and ⌘⌥←/→ to KeyCommandDescriptors whose G16 `sessionParams` fill in the loaded clip (audio.play / audio.pause / audio.seek), so they work app-wide."
+    },
+    {
+      "severity": "minor",
+      "where": "[contracts-v2 G16, not on main yet] NibKit/Sources/FeatAudio/FeatAudioFeature.swift:38, 45-48, 112-127 (AudioIndicators.register re-registers the toolbar item and the panel on every recording change)",
+      "problem": "The recording indicator works by replacing the toolbar descriptor and the whole PanelDescriptor. Replacing the panel makes the hosts rebuild an open Audio tab, which drops its @State: an open Rename alert or Delete confirmation disappears when recording starts or auto-stops (for example on a full disk).",
+      "fix": "When v2 is on main: register the toolbar item once, with `sessionIcon`/`sessionTitle`/`isOn` reading `AudioController.recording`. Register the panel once as well; the tab icon or title can stay static, since the G12 `.top` recorder overlay becomes the indicator. Drop `recordingChanged`'s re-registration."
+    },
+    {
+      "severity": "minor",
+      "where": "[contracts-v2 G3, not on main yet] NibKit/Sources/FeatAudio/Player.swift:668-675 (emitPlayback), Recorder.swift:339-340, 354-358 (audio.recording)",
+      "problem": "The events are emitted as string types with hand-built JSON. v2 adds `NibEventType.audioPlayback`/`audioRecording` and `AudioPlaybackPayload`/`AudioRecordingPayload`, which F053 will decode.",
+      "fix": "When v2 is on main: emit with `app.events.emit(AudioPlaybackPayload(clip:t:playing:rate:at:), principal: .user, doc:)` and `AudioRecordingPayload(clip:state:duration:)`, and have the tests decode them with `event.decode(_:)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAudio/AudioCommands.swift:259 (AudioPlay.run)",
+      "problem": "`if ctx.dryRun { return audio.status }` runs before the clip ref, its file path and the file's existence are checked. A dry run (AI preview, plugin.run) of `audio.play` with a bogus or missing clip therefore reports success.",
+      "fix": "Resolve `AudioRefs.clip`, `AudioRefs.fileURL`, the fileExists check and the 'still recording' conflict first, then return early on dryRun."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAudio/AudioCommands.swift:209, 268, 466; Recorder.swift:288; Player.swift:508",
+      "problem": "Several error hints tell the caller to run `audio.record {\"action\": \"stop\"}` or to 'leave doc out'. The schema requires `doc` and is enforced for non-user principals, so the AI, plugins or the bridge get invalid_params when they follow the hint.",
+      "fix": "Put the recording document in each hint (`audio.record {\"doc\": \"doc:<id>\", \"action\": \"stop\"}`) and drop 'or leave doc out' from requireSame."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAudio/Player.swift:465-474 (PlaybackStatus) / AudioCommands.swift:312-343",
+      "problem": "No read tells the AI or plugins whether Nib is recording, or into which clip. `audio.record` returns state only as a side effect of start/stop/pause, so the AI cannot ask 'am I recording?' without acting.",
+      "fix": "Add `recording: {clip, doc, state, duration}?` (from AudioRecord.status) to PlaybackStatus, so `audio.setPlayback {}` reports it. Document it in the summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAudio/Recorder.swift:31-67 (MicrophoneSource.prepare/start), 401-420 (interrupted)",
+      "problem": "Several audio session gaps. After an interruption iOS deactivates the session, but `start()` never re-activates it before `engine.start()`, and `try? resumeRecording()` swallows any failure, so the recording can stay paused with no notice. `.ended` without `.shouldResume` also leaves it paused silently. The `.playAndRecord` options also leave out `.allowBluetooth`, so a Bluetooth headset or AirPods mic cannot be used.",
+      "fix": "In `MicrophoneSource.start` call `AVAudioSession.sharedInstance().setActive(true)` before `engine.start()`. In `interrupted(.ended)`, surface a failed or skipped resume through `lastError` ('Recording paused by a call. Resume to continue.'). Add `.allowBluetooth` (and `.allowBluetoothA2DP`) to the category options."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAudio/AudioCommands.swift:506-522 (AudioQuickRecord.run)",
+      "problem": "Quick Record creates and opens the text document before the microphone is checked. If permission is denied or the mic is busy, an empty 'Recording … at …' document is left in the library.",
+      "fix": "Before doc.create, throw `unavailable` when `AVAudioApplication.shared.recordPermission == .denied` (skip this check when a test source is injected). If `audio.record` start still fails, trash the new document through the library's trash command (ignore `unavailable`), then rethrow."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAudio/Player.swift:391-422 (AudioFiles.exportData/transcode); AudioPanel.swift:306-316 (presentShare)",
+      "problem": "Exporting to m4a decodes and re-encodes AAC. That loses quality and costs tens of seconds of CPU for a multi-hour lecture. Both formats also load the whole file into memory (about 150 MB for 3 h). Share copies in tmp/NibAudioShare are never removed.",
+      "fix": "For m4a, remux without re-encoding: use AVAssetExportSession with AVAssetExportPresetPassthrough and outputFileType .m4a, or copy packets with AudioFile. Read with `Data(contentsOf:options: .alwaysMapped)`. Delete the share copy in `.sheet(item:onDismiss:)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAudio/AudioPanel.swift:157, 478 (VStack spacing: 1), 153-155/397-399/467-469 (10 pt dots), 476, 416, 437-438, 586-599 (marks aligned to NibSlider's private 14 pt inset)",
+      "problem": "This fails the Slop checklist in places. Spacing 1 is off the 4 pt scale; NibSpacing.xxs = 2, which is what NibRow uses. The code also uses literal glyph and dot sizes, and the clip-start dots are positioned by duplicating NibSlider's internal 14 pt thumb inset, so they drift if NibSlider changes.",
+      "fix": "Use NibSpacing.xxs. Take sizes from NibMetrics/NibSpacing, or file NibDesign requests (a record-dot glyph and a slider marks API) in the contract gaps. Until then, keep the marks but derive the inset from a single named constant with a comment pointing at NibSlider."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatAudioTests/FeatAudioTests.swift (coverage) / Player.swift:289-348 (AVPlaybackEngine.scheduleNext/played), 624-637 (planFinished)",
+      "problem": "The riskiest playback logic has no tests: splitting skip-silence segments into chunks, the 8 ms ramps, and the pending/exhausted accounting that fires onFinish. Auto-advance to the document's next clip after a clip plays out is also untested.",
+      "fix": "Extract the segment-to-frame-range chunking into a pure function (e.g. `PlaybackPlan.chunks(sampleRate:fileLength:maxFrames:)`) and unit-test it on boundaries, empty segments and the file-length clamp. Add a FakePlaybackEngine test that records a second clip, calls `engine.finish?()` on the first, and asserts that `engine.opened.last` is the second clip's file with a plan starting at 0."
+    }
+  ]
+}

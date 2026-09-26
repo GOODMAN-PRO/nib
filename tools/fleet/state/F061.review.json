@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/EquationSolver.swift:413-436 (polynomialRoots) and :501-544 (numericRoots)",
+      "problem": "Cubics and quartics with a root of multiplicity 3 or 4 come back as complex noise, so the answer is wrong. Durand-Kerner converges only to about eps^(1/m) on an m-fold root, and the 1e-7 imaginary-part threshold then calls those roots complex. I compiled the engine locally (Swift 6.1.2, -swift-version 5, NibContracts shimmed) and got these results: '(x-1)^3 = 0' and 'x^3 - 3x^2 + 3x - 1 = 0' give 'x ≈ 0.9999952087 + 0.00001039880661i, …' with message 'No real solutions'. The same happens for 'x^3 + 3x^2 + 3x + 1 = 0', '(x-2)^4 = 0' and 'x^4 - 4x^3 + 6x^2 - 4x + 1 = 0'. '(x - 1/3)^3 = 0' gives 'x ≈ 0.3333351208' and '(x^2+1)^2 = 0' gives 'x ≈ 5.325430235 × 10^-10 − i'. These are textbook inputs (perfect cubes) inside the spec's 'cubic/quartic (numeric)' scope.",
+      "fix": "In polynomialRoots, when every coefficient is exact (Scalar.rational != nil), run three exact steps before any numerics. (1) Take the square-free part p / gcd(p, p') using Rational polynomial division; if a step overflows, fall back to the Double path. (2) Pull out rational roots with the rational-root theorem: try candidates ±(divisors of the numerator of c0)/(divisors of the leading coefficient), bounded to a few hundred, and deflate each root exactly. (3) If the remaining factor has degree ≤ 2, solve it with quadraticRoots/exactQuadratic, so x^3 - x^2 - 2x + 2 = 0 also gives 1 and ±√2 exactly. Only a leftover of degree 3 or 4 goes to Durand-Kerner. For Double coefficients, after Durand-Kerner, group roots within ~1e-4·(1+|z|) of each other and replace each group by its mean, which is accurate for clustered multiple roots. Then classify a root as real when |im| ≤ 1e-7·(1+|re|), and snap |re| < 1e-9·scale to 0. Add MathEngineTests rows for (x-1)^3 = 0 → 'x = 1', x^4 - 4x^3 + 6x^2 - 4x + 1 = 0 → 'x = 1', (x-1/3)^3 = 0 → 'x = 1/3' and (x^2+1)^2 = 0 → 'x = ±i'."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathParser.swift (parseExpression/parseTerm build left-deep chains; parseGroup/parseFactor/parseExponentChain recursion); MathEvaluator.swift value()/binary(); MathDefinitions.collectFree; MathNode.mentions; SymbolicReader.read; MathEngineCommands.swift:600-609 (MathEvaluate.run: define(variables:) on the main actor, evaluate on Task.detached)",
+      "problem": "Moderately long input overflows the stack and crashes the app. Tree depth and input length are not limited, and every pass over the tree is recursive: parser, evaluator, freeNames, mentions and SymbolicReader. The work runs on a 512 KB cooperative-pool thread, and define(variables:) parses on the main thread. I measured on a thread with a 512 KB stack. Release (-O) builds segfault on '1+1+…+1 =' with 1,000 terms (about 2,000 characters), 'x+x+…+x = 1' with 600 terms, 800 nested parentheses, or 3,000 leading '-'. Debug (-Onone, which CI tests use) crashes at 200 terms, and 'f(x) = f(x - 1) + 1\\nf(3) =' crashes before maxDepth = 100 is reached. Any plugin, AI or bridge caller of math.evaluate can crash the app, and so can the F106 overlay feeding page lines.",
+      "fix": "(a) In MathEvaluate.run, reject an expression over 4,000 characters, and any variables value over 2,000, with NibError(.invalidParams, …, path: \"$.expression\" / \"$.variables.<name>\"). (b) Make MathParser track the depth of the tree it builds. Count +1 per operand in the parseExpression/parseTerm loops, and +1 per nested parseGroup/parseFactor/parseExponentChain/parseScript/parseBracket/parseEnvironment call. Throw MathFailure.unsupported(\"expressions this long\") above about 150. (c) Run the evaluation, and define(variables:), on a dedicated Thread with stackSize = 8 << 20, bridged with withCheckedThrowingContinuation, instead of Task.detached; the recursion-depth limits (maxDepth 100, the SymbolicReader limit of 64) then hold in Debug too. Add tests: a 5,000-term sum and 1,000 nested brackets must throw a NibError, not crash; the recursive f(x) above must return 'calls itself too deeply'."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/EquationSolver.swift:52-68 (Polynomial.multiplied/power), :181-202 (SymbolicReader .multiply/.power); MathEvaluator.swift Matrix.multiplied/power/rowReduce; MathEngineCommands.swift:607 (Task.detached)",
+      "problem": "Expanding an equation symbolically has no work or size limit. MathEvaluator.stepBudget covers only tree nodes. It does not cover Polynomial expansion or matrix arithmetic, and the detached task ignores cancellation. '(a+b+c+d+f+g+h+k+m+n)^24 = 1' ran for more than 30 s and was still growing past 600 MB at 20 s. It would only have been rejected as 'non-linear' once expansion to about 38M terms finished; on iPad that means a jetsam kill or a hung command. power() multiplies n times with no squaring. Separately, a sum over large matrix powers, such as sum(P^10000, i, 1, 99999) with a 30×30 permutation matrix, costs about 1e11 scalar operations while using only ~3e5 budget steps.",
+      "fix": "Make Polynomial.multiplied/power (and the RationalExpression wrappers) throwing. Before multiplying, throw MathFailure.unsupported(\"equations this large\") if terms(a)·terms(b) > 20,000 or the resulting totalDegree > 64. Implement power by repeated squaring. In SymbolicReader .power, also reject when deg(base)·n > 64 before expanding. In MathEvaluator, charge matrix work to the step budget: rows·cols·k per Matrix.multiplied, n^3 per rowReduce. Check Task.isCancelled (or a cancellation flag set from withTaskCancellationHandler) in the step counter, so a cancelled caller stops the work. Add a test that '(a+b+c+d+f+g+h+k+m+n)^24 = 1' throws unsupported within XCTAssertLessThan(elapsed, 1.0 × 4)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathEngineCommands.swift:198-236 (MathEngine.evaluate, non-question path: `latest` bookkeeping and the demotion loop)",
+      "problem": "A linear system written in 'y = …' form is not solved: the engine silently drops equations. 'y = 2x + 1; y = 3 - x' returns kind 'definition' with 'Defines y in terms of x', and the first equation is lost; the same input inside \\\\begin{cases}…\\\\end{cases} does the same. This is the most common way students write the intersection of two lines. 'y = 2x + 1\\nx = 1 - y' fails with 'x is defined in terms of itself', because freeNames stops at the cycle and reports no unknowns, so neither line is demoted. 'Latest definition wins' is meant for page variables; within one multi-line math.evaluate source it discards user equations.",
+      "fix": "In the non-question path, gather all the `.variable(name, rhs)` statements before defining anything. Apply 'latest wins' only to names whose every right-hand side is constant, i.e. has no free names given the other lines. If a name is assigned more than once and any of its right-hand sides has free unknowns, turn every assignment of that name into a MathEquation. Treat names reached through a definition cycle as unknowns: when collectFree meets a variable it is already resolving, add it to `found`. Demote every definition on the cycle to an equation. Expected results: 'y = 2x + 1; y = 3 - x' → 'x = 2/3, y = 7/3', the cases form gives the same, and 'y = 2x + 1\\nx = 1 - y' → 'x = 0, y = 1'. Add these rows to testLinearSystems."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/MathEvaluator.swift:935-959 (differentiate/centralDifference/roundedToSignificant)",
+      "problem": "The numeric derivative returns wrong digits, and sometimes spurious errors, for ordinary inputs. The step h = eps^(1/(n+4))·max(1,|x|) does not shrink when |x| < 1, and results are rounded to 9 significant digits whatever the actual error. Measured: 'd/dx(1/x)|_{x=0.001}' → −994375.849 (true −1,000,000); 'diff(ln(x), x, 0.001)' → 998.933338 (true 1000); 'd/dx(sqrt(x))|_{x=0.0001}' throws 'The square root of a negative number isn't a real number' because the stencil steps below 0; '\\\\frac{d^3}{dx^3}(x^4)|_{x=1}' → 24.0000001; '\\\\frac{d^4}{dx^4}(x^4)|_{x=1}' → 24.0000007; 'f(x) = 1/x, f'(0.01)' → −9999.9953. These values would be written onto the page as the answer.",
+      "fix": "Replace the fixed-step scheme with Ridders' extrapolation (Numerical Recipes dfridr, for order n): start at h0 = 0.1·max(|x|, 1e-6), shrink by 1.4 per step, and keep the lowest-error estimate. If an evaluation throws invalidParams (domain), retry with h/10 up to about 6 times before reporting 'The derivative doesn't exist there'. Round the result to the significant digits its error estimate supports, and snap it to Rational.approximating(d, maxDenominator: 1000, tolerance: err) when that lies within the error, so the fourth derivative of x^4 shows 24. Add tests: d/dx(1/x) at 0.001 = −1000000, diff(ln(x), x, 0.001) = 1000, d/dx sqrt(x) at 0.0001 = 50, d^3/dx^3 x^4 at 1 = 24."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/EquationSolver.swift:439-457 (quadraticRoots, Double path) and :501-526 (numericRoots)",
+      "problem": "The numeric paths never scale the coefficients, so extreme magnitudes give wrong answers. 'x^2 + 10^200 x + 1 = 0' → one root −5 × 10^199: y*y overflows to inf, and 'abs(d) <= 1e-12*max(y*y, …)' treats inf as a double root. '10^308 x^2 + 10^308 x = 10^308' → 'x ≈ 0'. 'x^3 + 10^200 x - 1 = 0' → 'No real solutions', although there is a real root near 1e-200. '10^300 x^3 + x - 1 = 0' → x ≈ −4.4e-17. Durand-Kerner also returns its last iterate even when it hasn't converged.",
+      "fix": "Divide every coefficient by the largest magnitude (or a power-of-two scale) before the Double paths. In the quadratic, use the scaled b and c, or compute the discriminant as b·(b − 4ac/b), to avoid overflow. After the Durand-Kerner loop, if the largest relative step is still above 1e-8, throw MathFailure.unsupported(\"this equation (the numeric solver didn't converge)\") instead of returning roots."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathParser.swift:150-158 (number lexing)",
+      "problem": "Scientific notation is misread without any error: '1e5 =' → 13.59140914 (1·e·5), '[[1e0]]' → [[0]], 'diff(x^2, x, 1e3)' → 16.309691. F088 checks AI answers with math.evaluate, and AI output often uses 1.5e-3.",
+      "fix": "In the lexer, after reading the digits of a number, check whether 'e'/'E' comes next followed by a digit, or by '+'/'-' and a digit. If so, read it as an exponent and produce the number exactly (mantissa × 10^exp through Rational when it fits, otherwise Double). '2e' and '2e^2' still mean 2·e. Add rows '1e5 =' → '100000' and '1.5e-3 =' → '0.0015'."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathEngineCommands.swift:61-77 (MathStatementRole)",
+      "problem": "'f(x) = 7' with f already defined (on the page, in variables, or on an earlier line) redefines f as the constant 7 instead of solving 2x + 1 = 7. 'f(x) = 2x + 1\\nf(x) = 7' returns 'Defines f(x)'. MathEngineTests acknowledges this in a comment rather than handling it. Solving f(x) = value is a common Math Assist use.",
+      "fix": "When the page (or an earlier line in the same source) already defines function `name`, and the new right-hand side mentions none of the parameters, treat the statement as an equation. Keep treating it as a definition when the right-hand side uses the parameters. Add a test with context ['f(x) = 2x + 1'] where 'f(x) = 7' → 'x = 3'."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathParser.swift:1055-1107 (parseIntegral/findDifferential)",
+      "problem": "Nested integrals fail with a syntax error: '∫_0^1 ∫_0^1 x y dy dx' and '\\\\int_0^1\\\\int_0^1 xy\\\\,dx\\\\,dy' give invalid_params 'Add the variable of integration, e.g. dx'. The outer integral takes the inner integral's differential. The user gets a syntax error instead of the AI Solve hint the spec requires for unsupported input.",
+      "fix": "In findDifferential, skip one differential for every ∫/int token met at depth 0 between pos and the candidate, so each integral pairs with its own dx, as with nested brackets. That makes double integrals work under the existing step budget. Otherwise, throw MathFailure.unsupported(\"multiple integrals\") when another ∫ appears before the differential."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathEngineCommands.swift:610-613 (hint rewrite)",
+      "problem": "The AI Solve hint puts the raw expression between single quotes without escaping. Any input containing ' (f'(x), primes) or a backslash-quote produces a malformed suggested call for the model to copy.",
+      "fix": "Build the hint with a JSON-encoded string, e.g. `\"call math.solve \" + JSONValue.object([\"latex\": .string(String(expression.prefix(300))), \"mode\": \"solve\"]).jsonString()`, or at least escape ' and \\."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/MathEngineCommands.swift:240-264 (MathEngine.function)",
+      "problem": "The graph sampler returned for F107 captures one MathEvaluator, a class with mutable locals/cache/steps that is documented as not thread-safe. If graphs sample curves concurrently, for example several expressions off the main thread, this is a data race.",
+      "fix": "Create the MathEvaluator inside the returned closure (it is cheap), or protect it with an NSLock, and document the closure's threading contract."
+    }
+  ]
+}

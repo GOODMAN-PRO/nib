@@ -214,9 +214,11 @@ public struct PageRecord: LWWRecord {
     public var trashedAt: Double?
     /// Fractional order key (see `DocumentContent.orderKey`).
     public var order: String
-    /// nil = infinite whiteboard board.
+    /// nil = infinite whiteboard board. The page as displayed (after `rotation`).
     public var size: PageSize?
-    /// 0, 90, 180 or 270.
+    /// 0, 90, 180 or 270, clockwise (contracts-v2, pinned): turns only a PDF or image BACKGROUND, which is then
+    /// aspect-fitted and centred into `size` (`backgroundTransform(sourceSize:)`). Items are stored in page points and
+    /// never rotated by it; rotating a page's content is a command that rewrites `size` and item geometry.
     public var rotation: Int
     public var background: Background
     public var bookmarked: Bool
@@ -262,6 +264,36 @@ public struct PageRecord: LWWRecord {
         title = try c.decodeIfPresent(String.self, forKey: .title)
         zoomReturnHeight = try c.decodeIfPresent(Double.self, forKey: .zoomReturnHeight)
         ext = try c.decodeIfPresent([String: JSONValue].self, forKey: .ext)
+    }
+}
+
+public extension PageRecord {
+    /// contracts-v2: `ext` key of the text recognised on a scanned page (F065 writes `[TextRecognition]`, NibIndex F055
+    /// and search read it).
+    static let scanTextExtKey = "nib.scanText"
+
+    /// contracts-v2: maps a background source page (PDF page or image, `sourceSize` in its own points, top-left origin)
+    /// into page points: turned clockwise by `rotation`, then aspect-fitted and centred into `size`. Identity when the
+    /// sizes match and rotation is 0. Boards (`size == nil`) draw the source unscaled at the origin. Renderers,
+    /// PDF link and text hit-testing, and exporters all use it.
+    func backgroundTransform(sourceSize: PageSize) -> Affine {
+        PageRecord.backgroundTransform(sourceSize: sourceSize, rotation: rotation, pageSize: size)
+    }
+
+    static func backgroundTransform(sourceSize: PageSize, rotation: Int, pageSize: PageSize?) -> Affine {
+        let w = sourceSize.width, h = sourceSize.height
+        let turn: Affine
+        switch ((rotation % 360) + 360) % 360 {
+        case 90: turn = Affine(a: 0, b: 1, c: -1, d: 0, tx: h, ty: 0)
+        case 180: turn = Affine(a: -1, b: 0, c: 0, d: -1, tx: w, ty: h)
+        case 270: turn = Affine(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: w)
+        default: turn = .identity
+        }
+        guard let page = pageSize, w > 0, h > 0 else { return turn }
+        let turned = (rotation / 90) % 2 == 0 ? PageSize(w, h) : PageSize(h, w)
+        let k = min(page.width / turned.width, page.height / turned.height)
+        let ox = (page.width - turned.width * k) / 2, oy = (page.height - turned.height * k) / 2
+        return turn.concatenating(Affine(a: k, b: 0, c: 0, d: k, tx: ox, ty: oy))
     }
 }
 

@@ -11,12 +11,38 @@ public enum NibEventType {
     public static let libraryChanged = "library.changed"
     public static let aiTurnFinished = "ai.turn.finished"
     public static let pluginMessage = "plugin.message"
+    /// Storage, folder sync or backup trouble or progress. Payload `SyncStatusPayload` (contracts-v2).
     public static let syncStatus = "sync.status"
     /// Laser pointer moved (F040 → presentation F063, collaboration F108). Payload {page, point: [x, y], mode:
     /// "dot" | "trail"}; a payload without `point` means the laser was lifted.
     public static let laserMoved = "laser.moved"
     /// Backup queue or last-run state changed (F068 → Cloud & Backup panel F070); query `backup.status` for details.
     public static let backupStatus = "backup.status"
+
+    // contracts-v2 (payload types in EventPayloads.swift)
+
+    /// `SessionRegistry.active` changed (a window became key). Payload {"session": id}.
+    public static let sessionActivated = "session.activated"
+    /// A session's `activeLayer` or `hiddenLayers` changed. Payload {"session": id}.
+    public static let layersChanged = "session.layers"
+    /// A tool finished one use (`EditorSession.finishToolUse`). Payload {"session": id, "tool": id}.
+    public static let toolFinished = "tool.finished"
+    /// Search indexing progress (NibIndex F055 → search UI F056). Payload `IndexProgressPayload`.
+    public static let indexProgress = "index.progress"
+    /// Audio playback position or state (F052 → Note Replay F053). Payload `AudioPlaybackPayload`.
+    public static let audioPlayback = "audio.playback"
+    /// Recording started, paused, resumed or stopped (F052). Payload `AudioRecordingPayload`.
+    public static let audioRecording = "audio.recording"
+    /// A Draw-and-Hold or Draw Shape stroke snapped to a shape (F009, F030 → Pencil Pro haptic F043). Payload
+    /// `ShapeSnappedPayload`.
+    public static let shapeSnapped = "shape.snapped"
+    /// Any feature asks for an Apple Pencil Pro haptic (ruler snaps F039, alignment guides F012); F043 plays it with
+    /// `UICanvasFeedbackGenerator`, the only module allowed to. Payload `PencilHapticPayload`.
+    public static let pencilHaptic = "pencil.haptic"
+    /// The element library changed (F035: collections, favourites, recents). Payload {"collection"?: id}.
+    public static let elementsChanged = "elements.changed"
+    /// MCP/HTTP bridge state changed (F090 → Bridge settings F091). Payload {"state": "off" | "starting" | "on" | …}.
+    public static let bridgeStatus = "bridge.status"
 }
 
 /// Events carry refs, not payloads: subscribers query for details.

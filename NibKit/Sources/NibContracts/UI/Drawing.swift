@@ -50,10 +50,17 @@ public extension DisplayList {
         case .text:
             guard let text = op.text else { return }
             let size = CGFloat(op.fontSize ?? 14)
-            let font = op.fontName.flatMap { UIFont(name: $0, size: size) } ?? UIFont.systemFont(ofSize: size)
+            let font = op.fontName.flatMap { UIFont(name: $0, size: size) }
+                ?? UIFont.systemFont(ofSize: size, weight: DisplayList.uiWeight(op.weight ?? .regular))
+            var attributes: [NSAttributedString.Key: Any] = [.font: font,
+                                                             .foregroundColor: (op.stroke ?? op.fill ?? .black).uiColor]
+            if let align = op.align {
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = RichTextBridge.alignment(align)
+                attributes[.paragraphStyle] = paragraph
+            }
             UIGraphicsPushContext(cg)
-            (text as NSString).draw(in: r, withAttributes: [.font: font,
-                                                             .foregroundColor: (op.stroke ?? op.fill ?? .black).uiColor])
+            (text as NSString).draw(in: r, withAttributes: attributes)
             UIGraphicsPopContext()
         case .image:
             guard let asset = op.asset, let doc = doc, let data = try? assets?.data(asset, doc: doc),
@@ -96,6 +103,19 @@ public extension DisplayList {
                 }
                 y += step
             }
+        }
+    }
+}
+
+extension DisplayList {
+    static func uiWeight(_ w: DisplayFontWeight) -> UIFont.Weight {
+        switch w {
+        case .light: return .light
+        case .regular: return .regular
+        case .medium: return .medium
+        case .semibold: return .semibold
+        case .bold: return .bold
+        case .heavy: return .heavy
         }
     }
 }
