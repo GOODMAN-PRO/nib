@@ -55,3 +55,5 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - F022 V2ADOPT: Move Pages sheet must read PanelContext.params["pages"] (F023 multi-page move). F022/F023 duplicate the nib-pages/1 payload encoder: a shared contract type would remove it.
 - NibSymbol: rotate glyph; 3 pt drag-preview border token (F023).
 - contract gap: bridge per-call event (F090 emits bridge.status only on state/session change); ARCHITECTURE §12 pairing link should document optional port (F074 spec already says so).
+- F017 V2ADOPT green (d0849c6): overlays hosted, floatingHost published, toolbarView full-window, openPanels, PanelContext params/presentation.
+- Remaining chrome gaps: DropletStyle per-droplet recede opt-out (NibDesign); overlay 'instant' show; contract for palette dock location so bottom overlays avoid a bottom-docked palette on iPad; toast bud swallows first outside touch; shell must track key-window changes (window.showLibrary) and forward childForStatusBarHidden (P-106).
