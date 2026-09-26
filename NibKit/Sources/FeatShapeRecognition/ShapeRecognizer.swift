@@ -415,18 +415,22 @@ enum ShapeRecognizer {
         let sign: Double = total >= 0 ? 1 : -1
         var back = 0.0
         for i in 1..<angles.count { back += max(0, -sign * ShapeFit.normalized(angles[i] - angles[i - 1])) }
-        let span = abs(total)
-        guard span >= 40 * degree, span <= 330 * degree, back <= 0.15 * span else { return nil }
+        guard back <= 0.15 * abs(total) else { return nil }
+        // Smoothing pulls the ends in, so the sweep is measured to the drawn ends: the arc runs from end to end.
         let a0 = atan2(r[0].y - c.y, r[0].x - c.x)
+        let z = r[r.count - 1]
+        let sweep = total + ShapeFit.normalized(atan2(z.y - c.y, z.x - c.x) - (a0 + total))
+        let span = abs(sweep)
+        guard span >= 40 * degree, span <= 330 * degree else { return nil }
         func on(_ a: Double, _ distance: Double) -> Point { Point(c.x + distance * cos(a), c.y + distance * sin(a)) }
         let error = err / Double(r.count) / s
         if span < 170 * degree {
-            return (.arc, [on(a0, radius), on(a0 + total / 2, radius / cos(span / 2)), on(a0 + total, radius)], error)
+            return (.arc, [on(a0, radius), on(a0 + sweep / 2, radius / cos(span / 2)), on(a0 + sweep, radius)], error)
         }
         // A uniform cubic B-spline passes (P[k-1] + 4 P[k] + P[k+1]) / 6 at each knot: control points on a circle of
         // radius 6R / (4 + 2 cos step) put every knot on the circle of radius R. The ends are the stroke's ends.
         let n = Int((span / (20 * degree)).rounded(.up))
-        let step = total / Double(n)
+        let step = sweep / Double(n)
         let rho = 6 * radius / (4 + 2 * cos(step))
         return (.curve, (0...n).map { k in on(a0 + step * Double(k), k == 0 || k == n ? radius : rho) }, error)
     }

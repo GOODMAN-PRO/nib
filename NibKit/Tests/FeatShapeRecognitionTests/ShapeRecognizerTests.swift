@@ -298,17 +298,96 @@ final class ShapeRecognizerTests: XCTestCase {
         XCTAssertEqual(r.points[1].x - r.points[0].x, 200, accuracy: 1)
     }
 
-    func testArcPassesThroughItsThreePoints() throws {
-        let arc = stride(from: 0.0, through: 120.0, by: 4).map { d -> Point in
-            Point(200 + 80 * cos(d * Double.pi / 180), 200 + 80 * sin(d * Double.pi / 180))
+    private func circle(_ c: Point, _ radius: Double, from a: Double, to b: Double, by step: Double = 4) -> [Point] {
+        stride(from: a, through: b, by: step).map { d -> Point in
+            Point(c.x + radius * cos(d * Double.pi / 180), c.y + radius * sin(d * Double.pi / 180))
         }
+    }
+
+    /// Arcs hold control points (F031's drawer): start, the point where the end tangents meet, end. Drawn as the conic
+    /// with weight cos(span / 2) that is the exact circular arc.
+    func testArcIsTheCircularConicWhoseControlIsWhereTheEndTangentsMeet() throws {
+        let c = Point(200, 200)
+        let arc = circle(c, 80, from: 0, to: 120)
         let r = try XCTUnwrap(ShapeRecognizer.recognize(arc)).shape
         XCTAssertEqual(r.shape, .arc)
         XCTAssertEqual(r.points.count, 3)
-        for p in r.points { XCTAssertEqual(p.distance(to: Point(200, 200)), 80, accuracy: 1) }
+        let p = r.points
+        XCTAssertLessThan(p[0].distance(to: arc[0]), 1)
+        XCTAssertLessThan(p[2].distance(to: arc[arc.count - 1]), 1)
+        // R / cos(60°) from the centre, on the bisector at 60°.
+        XCTAssertEqual(p[1].x, c.x + 160 * cos(Double.pi / 3), accuracy: 2)
+        XCTAssertEqual(p[1].y, c.y + 160 * sin(Double.pi / 3), accuracy: 2)
+        for end in [p[0], p[2]] {
+            let rx = end.x - c.x, ry = end.y - c.y, tx = p[1].x - end.x, ty = p[1].y - end.y
+            XCTAssertLessThan(abs(rx * tx + ry * ty) / (hypot(rx, ry) * hypot(tx, ty)), 0.02, "tangent at \(end)")
+        }
+        XCTAssertEqual(ShapeGeometry.conicWeight(p[0], p[1], p[2]), 0.5, accuracy: 0.02)
         let outline = try XCTUnwrap(ShapeGeometry.outline(r).first)
-        let nearest = outline.map { $0.distance(to: r.points[1]) }.min() ?? 99
-        XCTAssertLessThan(nearest, 3)
+        for q in outline { XCTAssertEqual(q.distance(to: c), 80, accuracy: 1, "\(q)") }
+        XCTAssertEqual(outline.map { $0.distance(to: Point(c.x + 80 * cos(Double.pi / 3), c.y + 80 * sin(Double.pi / 3))) }.min() ?? 99,
+                       0, accuracy: 1.5, "the outline reaches the middle of the arc, not half way to it")
+    }
+
+    /// Past 170° the tangents meet far away or not at all: the arc becomes a B-spline curve that stays on the circle.
+    func testWideArcBecomesACurveThatStaysOnTheCircle() throws {
+        let c = Point(300, 300)
+        let arc = circle(c, 100, from: 30, to: 270)
+        let r = try XCTUnwrap(ShapeRecognizer.recognize(arc)).shape
+        XCTAssertEqual(r.shape, .curve)
+        XCTAssertGreaterThanOrEqual(r.points.count, 10)
+        XCTAssertLessThan(r.points[0].distance(to: arc[0]), 1)
+        XCTAssertLessThan(r.points[r.points.count - 1].distance(to: arc[arc.count - 1]), 1)
+        let outline = try XCTUnwrap(ShapeGeometry.outline(r).first)
+        for q in outline { XCTAssertEqual(q.distance(to: c), 100, accuracy: 1.5, "\(q)") }
+        // The far side of the circle (180°) is drawn, not cut off by a shallow bump.
+        XCTAssertEqual(ShapeGeometry.bounds(r).minX, 200, accuracy: 1.5)
+    }
+
+    /// Curves hold control points: a quadratic Bézier (start, control, end) drawn by F031 through the parabola's middle.
+    func testShallowParabolaBecomesAQuadraticCurve() throws {
+        let stroke = (0...60).map { i -> Point in
+            let t = Double(i) / 60
+            return Point(100 + 240 * t, 300 - 240 * t * (1 - t))
+        }
+        let r = try XCTUnwrap(ShapeRecognizer.recognize(stroke)).shape
+        XCTAssertEqual(r.shape, .curve)
+        XCTAssertEqual(r.points.count, 3)
+        for (got, expected) in zip(r.points, [Point(100, 300), Point(220, 180), Point(340, 300)]) {
+            XCTAssertLessThan(got.distance(to: expected), 1, "\(r.points)")
+        }
+        let outline = try XCTUnwrap(ShapeGeometry.outline(r).first)
+        XCTAssertEqual(outline.map(\.y).min() ?? 0, 240, accuracy: 1)
+        XCTAssertEqual(ShapeGeometry.bounds(r).minY, 240, accuracy: 1)
+    }
+
+    func testCleanHexagonIsAPolygonWithSixCorners() throws {
+        let c = Point(300, 300)
+        let corners = (0..<6).map { k -> Point in
+            Point(c.x + 100 * cos(Double(k) * Double.pi / 3), c.y + 100 * sin(Double(k) * Double.pi / 3))
+        }
+        let r = try XCTUnwrap(ShapeRecognizer.recognize(closed(corners, count: 150))).shape
+        XCTAssertEqual(r.shape, .polygon)
+        XCTAssertEqual(r.points.count, 6)
+        for corner in corners {
+            XCTAssertLessThan(r.points.map { $0.distance(to: corner) }.min() ?? 99, 2, "\(corner)")
+        }
+    }
+
+    func testTiltedEllipseKeepsItsRotation() throws {
+        let c = Point(300, 400), tilt = 30 * Double.pi / 180
+        let loop = (0...72).map { k -> Point in
+            let a = 2 * Double.pi * Double(k) / 72
+            return SeededStrokes.rotate(Point(c.x + 120 * cos(a), c.y + 60 * sin(a)), tilt, about: c)
+        }
+        let e = try XCTUnwrap(ShapeRecognizer.recognize(loop)).shape
+        XCTAssertEqual(e.shape, .ellipse)
+        XCTAssertTrue(e.points.isEmpty)
+        XCTAssertEqual(e.frame.rotation, tilt, accuracy: 0.02)
+        XCTAssertEqual(e.frame.w, 240, accuracy: 2)
+        XCTAssertEqual(e.frame.h, 120, accuracy: 2)
+        XCTAssertEqual(e.frame.center.x, c.x, accuracy: 1)
+        XCTAssertEqual(e.frame.center.y, c.y, accuracy: 1)
     }
 
     func testDotsZigzagsAndSinglePointsAreNotShapes() {
@@ -341,6 +420,43 @@ final class ShapeRecognizerTests: XCTestCase {
         XCTAssertEqual(r.shape.points.count, 3)
         XCTAssertTrue(r.shape.points.contains(Point(100, 100)))
         XCTAssertTrue(r.shape.points.contains(Point(200, 100)))
+        XCTAssertTrue(r.shape.points.contains(Point(150, 190)), "the existing corner wins over the new stroke's end")
+    }
+
+    /// The neighbours of a new shape on a page reach the whole chain of lines it can join, not only the shapes around it:
+    /// the fourth side of a box drawn as four lines closes the loop through the far side.
+    func testFourthSideOfABoxOfLinesReachesTheFarSideAndClosesTheLoop() {
+        let doc: DocumentID = "SNAPDOC00001", page: PageID = "SNAPPAGE0001"
+        let top = Item.makeShape(line(Point(400, 600), Point(560, 600)))
+        let right = Item.makeShape(line(Point(560, 600), Point(560, 760)))
+        let bottom = Item.makeShape(line(Point(560, 760), Point(400, 760)))
+        let farBox = Item.makeShape(ShapeItem(shape: .rectangle, frame: Frame(x: 50, y: 50, w: 40, h: 40)))
+        let hidden = Item.makeShape(line(Point(400, 760), Point(300, 700)), layer: 2)
+        let otherLayer = Item.makeShape(line(Point(700, 100), Point(750, 100)), layer: 1)
+        let side = line(Point(400, 758), Point(400, 602))
+        let neighbours = ShapeSnapper.neighbours(for: side, among: [top, right, bottom, farBox, hidden, otherLayer],
+                                                 doc: doc, page: page, activeLayer: 0, hiddenLayers: [2])
+        let refs = [top, right, bottom].map { NodeRef.item(doc, page, $0.id).description }
+        XCTAssertEqual(Set(neighbours.map(\.ref)), Set(refs))
+        let r = ShapeSnapper.snap(side, to: neighbours)
+        XCTAssertEqual(r.shape.shape, .polygon)
+        XCTAssertEqual(Set(r.mergeWith), Set(refs))
+        XCTAssertEqual(r.shape.points.count, 4)
+        XCTAssertEqual(Set(r.shape.points), [Point(400, 600), Point(560, 600), Point(560, 760), Point(400, 760)])
+    }
+
+    func testNeighboursKeepNearbyShapesOfOtherLayersAsSnapTargetsOnly() {
+        let doc: DocumentID = "SNAPDOC00001", page: PageID = "SNAPPAGE0001"
+        let locked = Item(kind: .shape, locked: true, shape: line(Point(200, 100), Point(300, 100)))
+        let below = Item.makeShape(line(Point(100, 50), Point(100, 98)), layer: 1)
+        let neighbours = ShapeSnapper.neighbours(for: line(Point(100, 100), Point(198, 102)), among: [locked, below],
+                                                 doc: doc, page: page, activeLayer: 0, hiddenLayers: [])
+        XCTAssertEqual(neighbours.count, 2)
+        XCTAssertTrue(neighbours.allSatisfy { !$0.mergeable })
+        let r = ShapeSnapper.snap(line(Point(100, 100), Point(198, 102)), to: neighbours)
+        XCTAssertEqual(r.mergeWith, [])
+        XCTAssertEqual(r.shape.shape, .line)
+        XCTAssertEqual(r.shape.points, [Point(100, 98), Point(200, 100)])
     }
 
     func testEndSnapsOntoACornerWithoutMerging() {

@@ -5,8 +5,9 @@ import NibDesign
 
 /// Events this feature emits on `app.events`.
 enum ShapeRecognitionEvents {
-    /// A stroke snapped to a shape (on lift or with Draw and Hold). Payload `{page, shape}`. The Apple Pencil hardware
-    /// feature can answer it with the Pencil Pro snap haptic (T-117); `UICanvasFeedbackGenerator` belongs there.
+    /// A stroke snapped to a shape (on lift or with Draw and Hold). Payload `{page, shape, point}`, `point` being
+    /// `[x, y]` in page points where the Pencil was. The Apple Pencil hardware feature can answer it with the Pencil
+    /// Pro snap haptic at that point (T-117); `UICanvasFeedbackGenerator` belongs there.
     static let snapped = "shape.snapped"
 }
 
@@ -34,6 +35,8 @@ final class DrawShapeTool: CanvasTool {
         var stroke: Stroke
         var adjust: DrawAndHold
         var current: Point
+        /// The snap haptic could not play while the Pencil was down (NibHaptics is silent while inking): play it on lift.
+        var hapticPending: Bool
     }
 
     private var hold: Hold?
@@ -48,7 +51,12 @@ final class DrawShapeTool: CanvasTool {
         return InkStyle(tool: .pen, pen: .ball, color: presets.color, width: presets.width, pattern: presets.pattern)
     }
 
+    /// Switching tools mid-hold (a Pencil squeeze or double-tap, a shortcut) is not a decision to drop the drawing: the
+    /// canvas has already let go of the wet stroke, so the held stroke is kept as ink.
     func deactivate(_ host: CanvasHost) {
+        if let h = hold {
+            host.commitStroke(h.stroke, page: h.page)
+        }
         hold = nil
         clearPreview()
     }
@@ -70,7 +78,7 @@ final class DrawShapeTool: CanvasTool {
         host.cancelWetStroke()
         let result = snapToNeighbours(shape, page: page, host: host)
         draw(result.shape, page: page, host: host)
-        didSnap(result.shape, page: page, host: host)
+        didSnap(result.shape, at: stroke.points.last?.location ?? shape.frame.center, page: page, host: host)
         commit(result, plain: shape, page: page, stroke: stroke, host: host)
     }
 
@@ -81,9 +89,10 @@ final class DrawShapeTool: CanvasTool {
             return false
         }
         let grab = stroke.points.last?.location ?? shape.frame.center
-        hold = Hold(page: page, stroke: stroke, adjust: DrawAndHold(shape: shape, grab: grab), current: grab)
+        hold = Hold(page: page, stroke: stroke, adjust: DrawAndHold(shape: shape, grab: grab), current: grab,
+                    hapticPending: NibHaptics.isInking)
         draw(shape, page: page, host: host)
-        didSnap(shape, page: page, host: host)
+        didSnap(shape, at: grab, page: page, host: host)
         return true
     }
 
@@ -99,6 +108,7 @@ final class DrawShapeTool: CanvasTool {
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
         guard let h = hold else { return }
         hold = nil
+        if h.hapticPending { NibHaptics.play(.snap) }
         let shape = h.adjust.shape(at: sample.page == h.page ? sample.location : h.current)
         let result = snapToNeighbours(shape, page: h.page, host: host)
         draw(result.shape, page: h.page, host: host)
@@ -120,29 +130,30 @@ final class DrawShapeTool: CanvasTool {
         return ShapeCommit.styled(found.shape, ink: stroke.style)
     }
 
-    /// Snap to Other Shapes against the visible shapes near the new one; only unlocked shapes on the active layer merge.
+    /// Snap to Other Shapes against the shapes on visible layers (the whole chain of lines the new one can join, so a
+    /// loop closes however far round it runs); only unlocked shapes on the active layer merge.
     private func snapToNeighbours(_ shape: ShapeItem, page: PageID, host: CanvasHost) -> SnapResult {
         guard host.app.settings.get(ShapeSettings.snapToOtherShapes) else { return SnapResult(shape: shape, mergeWith: []) }
         let doc = host.documentID, session = host.session
-        let area = ShapeGeometry.bounds(shape).insetBy(-ShapeSnapper.radius)
-        let items = (try? host.app.workspace.items(doc, page: page, in: area)) ?? []
-        let neighbours = items.compactMap { item -> SnapNeighbor? in
-            guard let s = item.shape, !session.hiddenLayers.contains(item.layer) else { return nil }
-            return SnapNeighbor(ref: NodeRef.item(doc, page, item.id).description, shape: s,
-                                mergeable: !item.locked && item.layer == session.activeLayer)
-        }
+        let items = (try? host.app.workspace.items(doc, page: page)) ?? []
+        let neighbours = ShapeSnapper.neighbours(for: shape, among: items, doc: doc, page: page,
+                                                 activeLayer: session.activeLayer, hiddenLayers: session.hiddenLayers)
         return ShapeSnapper.snap(shape, to: neighbours)
     }
 
-    private func didSnap(_ shape: ShapeItem, page: PageID, host: CanvasHost) {
+    /// The snap haptic (heard once the Pencil is up; see `Hold.hapticPending`), the `shape.snapped` event with the page
+    /// point where the Pencil was, for the Pencil Pro haptic.
+    private func didSnap(_ shape: ShapeItem, at point: Point, page: PageID, host: CanvasHost) {
         NibHaptics.play(.snap)
         host.app.events.emit(ShapeRecognitionEvents.snapped, doc: host.documentID,
                              payload: ["page": .string(NodeRef.page(host.documentID, page).description),
-                                       "shape": .string(shape.shape.rawValue)])
+                                       "shape": .string(shape.shape.rawValue),
+                                       "point": [.number(point.x), .number(point.y)]])
     }
 
     /// Creates the shape as one undo step, then retires the preview. When nothing could be created the stroke is
-    /// committed as ink, so a drawing is never lost.
+    /// committed as ink (through the canvas, or straight through `ink.addStrokes` when the canvas has closed meanwhile),
+    /// so a drawing is never lost.
     private func commit(_ result: SnapResult, plain: ShapeItem, page: PageID, stroke: Stroke, host: CanvasHost) {
         let layer = preview
         preview = nil
@@ -150,8 +161,10 @@ final class DrawShapeTool: CanvasTool {
         Task { @MainActor [weak host] in
             if let made = await ShapeCommit.create(result, plain: plain, doc: doc, page: page, app: app, session: session) {
                 UIAccessibility.post(notification: .announcement, argument: ShapeCommit.announcement(made))
+            } else if let host {
+                host.commitStroke(stroke, page: page)
             } else {
-                host?.commitStroke(stroke, page: page)
+                await ShapeCommit.keepInk(stroke, doc: doc, page: page, app: app, session: session)
             }
             try? await Task.sleep(nanoseconds: DrawShapeTool.previewHandOff)
             layer?.removeFromSuperlayer()
@@ -197,11 +210,8 @@ final class DrawShapeTool: CanvasTool {
 }
 
 /// How a recognised shape becomes document content: the tool's look, the `shape.create` call, and the undo step that
-/// also removes merged neighbours and turns a tilted box.
+/// also turns a tilted box and removes merged neighbours.
 enum ShapeCommit {
-    static let deleteCommand = "item.delete"
-    static let transformCommand = "item.transform"
-
     /// The shape in the look of the ink that drew it: its colour, width and pattern, no fill, sharp corners.
     static func styled(_ s: ShapeItem, ink: InkStyle) -> ShapeItem {
         var out = s
@@ -224,8 +234,9 @@ enum ShapeCommit {
         return .object(o)
     }
 
-    /// Deletes the merged neighbours, creates the shape and turns a tilted box, all in one undo group. Returns the
-    /// shape made, or nil when nothing was created (merged neighbours are then restored).
+    /// Creates the shape, turns a tilted box, then deletes the merged neighbours, all in one undo group. Creating comes
+    /// first so that nothing has been removed when it fails: the caller then keeps the stroke as ink. A failed delete
+    /// leaves the neighbours beside the new shape (nothing is lost). Returns the shape made, or nil when none was.
     @MainActor
     static func create(_ result: SnapResult, plain: ShapeItem, doc: DocumentID, page: PageID, app: NibApp,
                        session: EditorSession) async -> ShapeItem? {
@@ -238,39 +249,48 @@ enum ShapeCommit {
             try await app.bus.execute(Invocation(command: command, params: params, principal: .user, session: session,
                                                  group: group)).value
         }
-        var shape = result.shape
-        var deleted = false
-        if !result.mergeWith.isEmpty {
-            if app.commands.entry(deleteCommand) == nil {
-                shape = plain
-            } else {
-                do {
-                    _ = try await call(deleteCommand, ["refs": .array(result.mergeWith.map { JSONValue.string($0) })])
-                    deleted = true
-                } catch {
-                    DrawShapeTool.log.error("merging shapes failed: \(String(describing: error), privacy: .public)")
-                    shape = plain
-                }
-            }
-        }
+        // Without item.delete the neighbours cannot be merged away, so the shape is made as drawn.
+        let merging = !result.mergeWith.isEmpty && app.commands.entry(CommandIDs.itemDelete) != nil
+        let shape = result.mergeWith.isEmpty || merging ? result.shape : plain
+        let value: JSONValue
         do {
-            let value = try await call(CommandIDs.shapeCreate, createParams(shape, page: NodeRef.page(doc, page).description))
-            if ShapeGeometry.isBox(shape), shape.frame.rotation != 0, let ref = value["ref"]?.stringValue,
-               app.commands.entry(transformCommand) != nil {
-                let c = shape.frame.center
-                do {
-                    _ = try await call(transformCommand, ["refs": [.string(ref)],
-                                                          "rotate": .number(shape.frame.rotation * 180 / Double.pi),
-                                                          "origin": [.number(c.x), .number(c.y)]])
-                } catch {
-                    DrawShapeTool.log.error("turning the shape failed: \(String(describing: error), privacy: .public)")
-                }
-            }
-            return shape
+            value = try await call(CommandIDs.shapeCreate, createParams(shape, page: NodeRef.page(doc, page).description))
         } catch {
             DrawShapeTool.log.error("shape.create failed, keeping the stroke: \(String(describing: error), privacy: .public)")
-            if deleted { _ = app.bus.revert(group: group, doc: doc) }
             return nil
+        }
+        if ShapeGeometry.isBox(shape), shape.frame.rotation != 0, let ref = value["ref"]?.stringValue,
+           app.commands.entry(CommandIDs.itemTransform) != nil {
+            let c = shape.frame.center
+            do {
+                _ = try await call(CommandIDs.itemTransform, ["refs": [.string(ref)],
+                                                               "rotate": .number(shape.frame.rotation * 180 / Double.pi),
+                                                               "origin": [.number(c.x), .number(c.y)]])
+            } catch {
+                DrawShapeTool.log.error("turning the shape failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+        if merging {
+            do {
+                _ = try await call(CommandIDs.itemDelete, ["refs": .array(result.mergeWith.map { JSONValue.string($0) })])
+            } catch {
+                DrawShapeTool.log.error("removing merged shapes failed, keeping them: \(String(describing: error), privacy: .public)")
+            }
+        }
+        return shape
+    }
+
+    /// Keeps a stroke as ink without a canvas (it closed before the shape could be made): `ink.addStrokes` directly.
+    @MainActor
+    static func keepInk(_ stroke: Stroke, doc: DocumentID, page: PageID, app: NibApp, session: EditorSession) async {
+        do {
+            let json = try JSONValue.from(stroke)
+            _ = try await app.bus.execute(Invocation(command: CommandIDs.inkAddStrokes,
+                                                     params: ["page": .string(NodeRef.page(doc, page).description),
+                                                              "strokes": .array([json])],
+                                                     principal: .user, session: session)).value
+        } catch {
+            DrawShapeTool.log.error("keeping the stroke as ink failed: \(String(describing: error), privacy: .public)")
         }
     }
 

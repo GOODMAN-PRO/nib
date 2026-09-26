@@ -29,15 +29,34 @@ final class FeatShapeRecognitionTests: XCTestCase {
     }
 
     private func standIn(_ id: String, _ h: Harness, _ calls: Calls, _ done: XCTestExpectation? = nil,
-                         result: JSONValue = [:]) {
+                         result: JSONValue = [:], fails: Bool = false) {
         h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "Test stand-in.", params: .anything(),
                                                   effect: .edit)) { json, ctx in
             calls.params[id] = json
             calls.groups[id] = ctx.group
             done?.fulfill()
+            if fails { throw NibError.unavailable("the test's \(id)") }
             return result
         }
     }
+
+    /// Existing unlocked line shapes on the fixture page, added through a test command.
+    private func seedLines(_ h: Harness, _ lines: [(id: String, from: Point, to: Point, layer: Int)]) async throws {
+        h.app.commands.register(CommandDescriptor(id: "test.seedLines", title: "Seed lines", summary: "Test helper.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                for l in lines {
+                    var item = Item.makeShape(ShapeRecognizer.pointShape(.line, [l.from, l.to]), layer: l.layer)
+                    item.id = NibID(l.id)
+                    _ = try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
+                }
+            }
+            return [:]
+        }
+        _ = try await h.run("test.seedLines")
+    }
+
+    private func itemRef(_ id: String) -> String { "item:FIXTUREDOC01/FIXTUREPG001/\(id)" }
 
     private func assertPoints(_ value: JSONValue?, _ expected: [Point], file: StaticString = #filePath, line: UInt = #line) {
         let got = (value?.arrayValue ?? []).map { Point($0[0]?.doubleValue ?? .nan, $0[1]?.doubleValue ?? .nan) }
@@ -140,6 +159,30 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertEqual(value["mergeWith"], [])
     }
 
+    /// With a page ref the command sees what the Draw Shape tool sees: shapes on another layer are snap targets but
+    /// are never merged away, and shapes on hidden layers are ignored.
+    func testRecognizeWithAPageRefMergesOnlyTheActiveLayer() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        try await seedLines(h, [(id: "LAYERLINE001", from: Point(300, 600), to: Point(400, 600), layer: 1)])
+        let params: JSONValue = ["points": [[402, 605], [402, 700]], "neighbors": .string(pageRef)]
+        h.session.activeLayer = 0
+        let other = try await h.run("shape.recognize", params)
+        XCTAssertEqual(other["shape"], "line")
+        XCTAssertEqual(other["mergeWith"], [])
+        XCTAssertEqual(other["points"]?[0], [400, 600])
+
+        h.session.activeLayer = 1
+        let active = try await h.run("shape.recognize", params)
+        XCTAssertEqual(active["shape"], "polyline")
+        XCTAssertEqual(active["mergeWith"], [.string(itemRef("LAYERLINE001"))])
+
+        h.session.activeLayer = 0
+        h.session.hiddenLayers = [1]
+        let hidden = try await h.run("shape.recognize", params)
+        XCTAssertEqual(hidden["mergeWith"], [])
+        assertPoints(hidden["points"], [Point(402, 605), Point(402, 700)])
+    }
+
     // MARK: Draw Shape tool
 
     func testDrawShapeKeepsInkThatIsNotAShape() {
@@ -215,6 +258,21 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertEqual(host.committed.count, 1)
     }
 
+    /// A Pencil squeeze, double-tap or shortcut that switches tools mid-hold keeps the held stroke as ink.
+    func testSwitchingToolsDuringAHoldKeepsTheInk() {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        let host = FakeCanvasHost(h)
+        let tool = DrawShapeTool()
+        let held = rectangleStroke(h)
+        XCTAssertTrue(tool.strokeHeld(held, page: page, host: host))
+        tool.deactivate(host)
+        XCTAssertEqual(host.committed.count, 1)
+        XCTAssertEqual(host.committed.first?.stroke.points.count, held.points.count)
+        XCTAssertEqual(host.committed.first?.page, page)
+        tool.deactivate(host)
+        XCTAssertEqual(host.committed.count, 1, "no hold, nothing more to keep")
+    }
+
     func testWithoutShapeCreateTheStrokeStaysInk() async {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         let host = FakeCanvasHost(h)
@@ -225,33 +283,124 @@ final class FeatShapeRecognitionTests: XCTestCase {
 
     func testJoiningAnExistingLineDeletesItAndCreatesOnePolylineInOneUndoStep() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
-        // An existing unlocked line shape on the active layer, added through a test command.
-        h.app.commands.register(CommandDescriptor(id: "test.addLine", title: "Add line", summary: "Test helper.",
-                                                  effect: .edit)) { _, ctx in
-            try ctx.mutate { tx in
-                var item = Item.makeShape(ShapeRecognizer.pointShape(.line, [Point(300, 300), Point(400, 300)]))
-                item.id = NibID("OLDLINE00001")
-                _ = try tx.put(item, doc: Fixtures.docID, page: Fixtures.page1)
-            }
-            return [:]
-        }
-        _ = try await h.run("test.addLine")
+        try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
         let calls = Calls()
         let created = expectation(description: "shape.create")
+        let deleted = expectation(description: "item.delete")
         standIn(CommandIDs.shapeCreate, h, calls, created)
-        standIn(ShapeCommit.deleteCommand, h, calls)
+        standIn(CommandIDs.itemDelete, h, calls, deleted)
         let host = FakeCanvasHost(h)
         DrawShapeTool().strokeFinished(stroke(Geo.resample([Point(402, 305), Point(402, 400)], count: 30), h), page: page, host: host)
-        await fulfillment(of: [created], timeout: 5)
-        XCTAssertEqual(calls.params[ShapeCommit.deleteCommand]?["refs"], ["item:FIXTUREDOC01/FIXTUREPG001/OLDLINE00001"])
+        await fulfillment(of: [created, deleted], timeout: 5, enforceOrder: true)
+        XCTAssertEqual(calls.params[CommandIDs.itemDelete]?["refs"], [.string(itemRef("OLDLINE00001"))])
         let p = try XCTUnwrap(calls.params[CommandIDs.shapeCreate])
         XCTAssertEqual(p["shape"], "polyline")
         assertPoints(p["points"], [Point(300, 300), Point(400, 300), Point(402, 400)])
         XCTAssertNotNil(calls.groups[CommandIDs.shapeCreate])
-        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[ShapeCommit.deleteCommand])
+        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[CommandIDs.itemDelete])
     }
 
-    func testSnappingEmitsAnEvent() {
+    /// A box drawn as four separate lines: the fourth side joins the far side too (through the top and bottom), so the
+    /// three old lines go and one four-cornered polygon is made.
+    func testFourthSideOfABoxOfLinesMakesOnePolygon() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        try await seedLines(h, [(id: "BOXTOP000001", from: Point(400, 600), to: Point(560, 600), layer: 0),
+                                (id: "BOXRIGHT0001", from: Point(560, 600), to: Point(560, 760), layer: 0),
+                                (id: "BOXBOTTOM001", from: Point(560, 760), to: Point(400, 760), layer: 0)])
+        let calls = Calls()
+        let created = expectation(description: "shape.create")
+        let deleted = expectation(description: "item.delete")
+        standIn(CommandIDs.shapeCreate, h, calls, created)
+        standIn(CommandIDs.itemDelete, h, calls, deleted)
+        let host = FakeCanvasHost(h)
+        DrawShapeTool().strokeFinished(stroke(Geo.resample([Point(400, 758), Point(400, 602)], count: 40), h), page: page, host: host)
+        await fulfillment(of: [created, deleted], timeout: 5, enforceOrder: true)
+        let refs = (calls.params[CommandIDs.itemDelete]?["refs"]?.arrayValue ?? []).compactMap(\.stringValue)
+        XCTAssertEqual(Set(refs), Set(["BOXTOP000001", "BOXRIGHT0001", "BOXBOTTOM001"].map { itemRef($0) }))
+        let p = try XCTUnwrap(calls.params[CommandIDs.shapeCreate])
+        XCTAssertEqual(p["shape"], "polygon")
+        let corners = (p["points"]?.arrayValue ?? []).map { Point($0[0]?.doubleValue ?? .nan, $0[1]?.doubleValue ?? .nan) }
+        XCTAssertEqual(corners.count, 4, "\(corners)")
+        for expected in [Point(400, 600), Point(560, 600), Point(560, 760), Point(400, 760)] {
+            XCTAssertLessThan(corners.map { $0.distance(to: expected) }.min() ?? 99, 0.01, "\(corners)")
+        }
+        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[CommandIDs.itemDelete])
+        XCTAssertTrue(host.committed.isEmpty)
+    }
+
+    /// shape.create takes an upright frame, so a tilted box is turned with item.transform (degrees, about its centre)
+    /// in the same undo step.
+    func testTiltedBoxIsTurnedAboutItsCentreInTheSameUndoStep() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        let calls = Calls()
+        let turned = expectation(description: "item.transform")
+        let newRef = itemRef("NEWSHAPE0001")
+        standIn(CommandIDs.shapeCreate, h, calls, result: ["ref": .string(newRef)])
+        standIn(CommandIDs.itemTransform, h, calls, turned)
+        let host = FakeCanvasHost(h)
+        let c = Point(300, 600), tilt = 20 * Double.pi / 180
+        let corners = [Point(200, 550), Point(400, 550), Point(400, 650), Point(200, 650)]
+            .map { SeededStrokes.rotate($0, tilt, about: c) }
+        DrawShapeTool().strokeFinished(stroke(Geo.resample(corners + [corners[0]], count: 120), h), page: page, host: host)
+        await fulfillment(of: [turned], timeout: 5)
+        let create = try XCTUnwrap(calls.params[CommandIDs.shapeCreate])
+        XCTAssertEqual(create["shape"], "rectangle")
+        let frame = (create["frame"]?.arrayValue ?? []).compactMap(\.doubleValue)
+        XCTAssertEqual(frame.count, 4)
+        XCTAssertEqual(frame.count == 4 ? frame[2] : 0, 200, accuracy: 2)
+        XCTAssertEqual(frame.count == 4 ? frame[3] : 0, 100, accuracy: 2)
+        XCTAssertEqual(frame.count == 4 ? frame[0] + frame[2] / 2 : 0, c.x, accuracy: 1)
+        XCTAssertEqual(frame.count == 4 ? frame[1] + frame[3] / 2 : 0, c.y, accuracy: 1)
+        let transform = try XCTUnwrap(calls.params[CommandIDs.itemTransform])
+        XCTAssertEqual(transform["refs"], [.string(newRef)])
+        XCTAssertEqual(transform["rotate"]?.doubleValue ?? 0, 20, accuracy: 1)
+        XCTAssertEqual(transform["origin"]?[0]?.doubleValue ?? 0, c.x, accuracy: 1)
+        XCTAssertEqual(transform["origin"]?[1]?.doubleValue ?? 0, c.y, accuracy: 1)
+        XCTAssertNotNil(calls.groups[CommandIDs.itemTransform])
+        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[CommandIDs.itemTransform])
+    }
+
+    /// shape.create runs before anything is deleted: when it fails, the neighbours stay and the stroke stays as ink.
+    func testFailedCreateKeepsTheNeighboursAndTheInk() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        try await seedLines(h, [(id: "OLDLINE00001", from: Point(300, 300), to: Point(400, 300), layer: 0)])
+        let calls = Calls()
+        standIn(CommandIDs.shapeCreate, h, calls, fails: true)
+        standIn(CommandIDs.itemDelete, h, calls)
+        let depth = h.undoDepth(Fixtures.docID)
+        let host = FakeCanvasHost(h)
+        DrawShapeTool().strokeFinished(stroke(Geo.resample([Point(402, 305), Point(402, 400)], count: 30), h), page: page, host: host)
+        await settle { !host.committed.isEmpty }
+        XCTAssertNotNil(calls.params[CommandIDs.shapeCreate], "the merged polyline was tried")
+        XCTAssertNil(calls.params[CommandIDs.itemDelete], "nothing was deleted")
+        XCTAssertEqual(host.committed.count, 1)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth, "no revert step on the undo stack")
+        XCTAssertNoThrow(try h.app.workspace.item(Fixtures.docID, page: page, id: NibID("OLDLINE00001")))
+    }
+
+    /// When the canvas closes before the shape could be made, the stroke is still kept, through ink.addStrokes.
+    func testClosedCanvasStillKeepsTheStrokeAsInk() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        let calls = Calls()
+        let kept = expectation(description: "ink.addStrokes")
+        standIn(CommandIDs.inkAddStrokes, h, calls, kept)
+        let drawn = rectangleStroke(h)
+        weak var gone: FakeCanvasHost?
+        do {
+            let host = FakeCanvasHost(h)
+            gone = host
+            DrawShapeTool().strokeFinished(drawn, page: page, host: host)
+        }
+        XCTAssertNil(gone, "the canvas closed before the shape was made")
+        await fulfillment(of: [kept], timeout: 5)
+        let p = try XCTUnwrap(calls.params[CommandIDs.inkAddStrokes])
+        XCTAssertEqual(p["page"], .string(pageRef))
+        let strokes = try XCTUnwrap(p["strokes"]?.arrayValue)
+        XCTAssertEqual(strokes.count, 1)
+        XCTAssertEqual(try strokes[0].decode(Stroke.self).points.count, drawn.points.count)
+    }
+
+    func testSnappingEmitsAnEventWhereThePencilIs() {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         let before = h.app.events.lastSeq
         let host = FakeCanvasHost(h)
@@ -260,6 +409,9 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertEqual(snapped.count, 1)
         XCTAssertEqual(snapped.first?.payload?["shape"], "rectangle")
         XCTAssertEqual(snapped.first?.payload?["page"], .string(pageRef))
+        // The rectangle stroke ends back at its first corner, where the Pencil is held.
+        XCTAssertEqual(snapped.first?.payload?["point"]?[0]?.doubleValue ?? 0, 100, accuracy: 0.01)
+        XCTAssertEqual(snapped.first?.payload?["point"]?[1]?.doubleValue ?? 0, 100, accuracy: 0.01)
     }
 
     func testCreateParamsSendUprightFramesAndPoints() {

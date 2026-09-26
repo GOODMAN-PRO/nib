@@ -48,7 +48,7 @@ struct ShapeRecognizeCommand: NibCommand {
         summary: "Recognise a rough stroke (page points) as a line, arrow, arc, curve, polyline, ellipse, rectangle, triangle or polygon: ShapeItem JSON + mergeWith, or null.",
         params: .obj([
             "points": .arr(.point, "the stroke as [[x, y], …] in page points, at least 2"),
-            "neighbors": .anything("shapes to snap to: a page ref (all its shapes), or an array of item refs / ShapeItem objects with an id")
+            "neighbors": .anything("shapes to snap to: a page ref (its shapes on visible layers; when a window shows the document only unlocked shapes on its active layer are merged, as when drawing), or an array of item refs / ShapeItem objects with an id")
         ], required: ["points"]),
         examples: [
             try! JSONValue.parse(#"{"points": [[100, 100], [260, 102], [259, 190], [101, 188], [100, 101]]}"#),
@@ -75,7 +75,8 @@ struct ShapeRecognizeCommand: NibCommand {
                           confidence: (found.confidence * 100).rounded() / 100, mergeWith: result.mergeWith)
     }
 
-    /// Resolves `neighbors`: a page ref gives every shape on the page; item refs give those shapes; inline ShapeItem
+    /// Resolves `neighbors`: a page ref gives the page's shapes the Draw Shape tool would see (none on hidden layers;
+    /// only the active layer's merge, when a window shows the document); item refs give those shapes; inline ShapeItem
     /// objects are used as they are (their `id` or `ref` is what `mergeWith` reports). Locked items never merge.
     static func neighbours(_ value: JSONValue?, _ ctx: CommandContext) throws -> [SnapNeighbor] {
         guard let value = value, value != .null else { return [] }
@@ -86,10 +87,13 @@ struct ShapeRecognizeCommand: NibCommand {
             if let string = entry.stringValue {
                 switch NodeRef(string) {
                 case let .page(doc, page)?:
+                    let session = ctx.activeSession.flatMap { $0.document == doc ? $0 : nil }
+                    let hidden = session?.hiddenLayers ?? []
                     for item in try ctx.workspace.items(doc, page: page) {
-                        guard let shape = item.shape else { continue }
+                        guard let shape = item.shape, !hidden.contains(item.layer) else { continue }
+                        let mergeable = !item.locked && item.layer == (session?.activeLayer ?? item.layer)
                         out.append(SnapNeighbor(ref: NodeRef.item(doc, page, item.id).description, shape: shape,
-                                                mergeable: !item.locked))
+                                                mergeable: mergeable))
                     }
                 case let .item(doc, page, id)?:
                     let item = try ctx.workspace.item(doc, page: page, id: id)

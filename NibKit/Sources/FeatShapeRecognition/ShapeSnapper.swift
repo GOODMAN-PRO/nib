@@ -23,6 +23,26 @@ struct SnapResult {
 enum ShapeSnapper {
     static let radius = 12.0
 
+    /// Whether a shape can be joined end to end into a polyline (a line or polyline with both ends).
+    static func joins(_ s: ShapeItem) -> Bool {
+        (s.shape == .line || s.shape == .polyline) && s.points.count >= 2
+    }
+
+    /// The neighbours a new shape on a page can snap to (the Draw Shape tool and `shape.recognize` with a page ref):
+    /// every shape on a visible layer near `shape`, plus every mergeable line or polyline anywhere on the page, since a
+    /// chain of joined lines can end far from the new one (the fourth side of a box closes the loop through the third).
+    /// Only unlocked shapes on the active layer are mergeable; without an active layer every unlocked shape is.
+    static func neighbours(for shape: ShapeItem, among items: [Item], doc: DocumentID, page: PageID,
+                           activeLayer: Int?, hiddenLayers: Set<Int>) -> [SnapNeighbor] {
+        let near = ShapeGeometry.bounds(shape).insetBy(-radius)
+        return items.compactMap { item -> SnapNeighbor? in
+            guard let s = item.shape, !hiddenLayers.contains(item.layer) else { return nil }
+            let mergeable = !item.locked && item.layer == (activeLayer ?? item.layer)
+            guard (mergeable && joins(s)) || item.bounds.intersects(near) else { return nil }
+            return SnapNeighbor(ref: NodeRef.item(doc, page, item.id).description, shape: s, mergeable: mergeable)
+        }
+    }
+
     static func snap(_ shape: ShapeItem, to neighbors: [SnapNeighbor], radius r: Double = ShapeSnapper.radius) -> SnapResult {
         guard ShapeGeometry.openKinds.contains(shape.shape), shape.points.count >= 2, !neighbors.isEmpty else {
             return SnapResult(shape: shape, mergeWith: [])
@@ -31,14 +51,13 @@ enum ShapeSnapper {
         var merged: [String] = []
         var used = Set<Int>()
         var startIsNew = true, endIsNew = true
-        if shape.shape == .line || shape.shape == .polyline {
+        if joins(shape) {
             var chain = shape.points
             var joined = true
             while joined {
                 joined = false
                 for (i, n) in neighbors.enumerated() where !used.contains(i) && n.mergeable {
-                    guard n.shape.shape == .line || n.shape.shape == .polyline, n.shape.points.count >= 2,
-                          let first = chain.first, let last = chain.last else { continue }
+                    guard joins(n.shape), let first = chain.first, let last = chain.last else { continue }
                     let np = n.shape.points
                     if last.distance(to: np[0]) <= r {
                         chain.removeLast()
@@ -66,7 +85,9 @@ enum ShapeSnapper {
                 }
             }
             if chain.count >= 4, chain[0].distance(to: chain[chain.count - 1]) <= r {
-                // The chain came back to where it started: one closed polygon. Its first vertex stays.
+                // The chain came back to where it started: one closed polygon. The existing shape's vertex wins over
+                // the new stroke's own end.
+                if startIsNew && !endIsNew { chain[0] = chain[chain.count - 1] }
                 chain.removeLast()
                 return SnapResult(shape: ShapeRecognizer.pointShape(.polygon, chain, style: shape.style), mergeWith: merged)
             }
