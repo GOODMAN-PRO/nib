@@ -1,4 +1,5 @@
 import SwiftUI
+import QuartzCore
 import NibContracts
 
 public struct NibTool: Identifiable, Hashable, Sendable {
@@ -220,6 +221,12 @@ public struct NibToolButton: View {
 /// `tools` is the customised palette (native and plugin tools, in order); `moreTools` is what More holds by default.
 /// When the dock is too short, the least recently used tools collapse into More (never the selected one); a tool
 /// chosen from More takes the last native slot.
+///
+/// `dock` is the one source of where it rests. Its own releases and "Move palette to…" actions write the binding (so
+/// the owner's command sees them), and every change of it, from those or from outside (`toolbar.dock`, a size class
+/// that takes the side docks away), moves the palette from where it is on screen: along the same axis it flows there,
+/// to the other axis it re-forms, under Reduce Motion and Liquid Off it cross-fades (DESIGN.md §10.10). A side dock
+/// on a compact width shows at the bottom.
 public struct NibToolPalette<Settings: View>: View {
     static var moreID: String { "more" }
 
@@ -245,7 +252,16 @@ public struct NibToolPalette<Settings: View>: View {
     @Environment(\.nibLiquidMode) private var liquidMode
     @ScaledMetric(relativeTo: .body) private var scaledThick: CGFloat = 56
     @ScaledMetric(relativeTo: .body) private var scaledPitch: CGFloat = 44
-    @State private var shownDock: NibPaletteDock?
+    /// The dock the content is laid out for. It follows `dock` only through `follow(_:model:)`, so across axes it keeps
+    /// the old layout until the re-form's midpoint. nil until the palette appears.
+    @State private var laidOut: NibPaletteDock?
+    /// The dock a gathering re-form spreads into.
+    @State private var reforming: NibPaletteDock?
+    /// The field's re-form phase for this palette, as `ReshapeWatcher` last reported it: back at idle, a move that
+    /// waited for the re-form runs.
+    @State private var reshape: DropletField.ReshapePhase = .idle
+    /// The palette's own release until the binding takes the dock it chose.
+    @State private var released: OwnRelease?
     @State private var tapped: String?
     @State private var mode: DragMode?
     @State private var settingsOpen = false
@@ -339,7 +355,12 @@ public struct NibToolPalette<Settings: View>: View {
         compact ? min(max(scaledPitch + 2, NibMetrics.palettePitchCompact), NibMetrics.palettePitchCompactMax)
                 : min(max(scaledPitch, NibMetrics.palettePitch), NibMetrics.palettePitchMax)
     }
-    private var current: NibPaletteDock { shownDock ?? dock }
+    /// Where the palette should rest: the binding's dock, or the bottom for a dock this width does not offer.
+    private var wanted: NibPaletteDock {
+        DropletDockModel(region: .zero, length: 0, thickness: 0, docks: allowedEdges, compact: compact).validated(dock)
+    }
+    /// Where it is laid out now (lags `wanted` through a re-form or a cross-fade).
+    private var current: NibPaletteDock { laidOut ?? wanted }
     private var edges: [NibDock] { compact ? allowedEdges.filter { !$0.isVertical } : allowedEdges }
 
     private func length(natives: Int, more: Bool, plugins: Int) -> CGFloat {
@@ -485,6 +506,13 @@ public struct NibToolPalette<Settings: View>: View {
                 if let along = map[selection] { field?.setBead(id, head: along, glide: false) }
             }
             .background(DockArrivalWatcher(id: id, node: field?.node(id), field: field, landing: $landing))
+            .onAppear { if laidOut == nil { laidOut = wanted } }
+            // Every dock change, whatever made it, moves the palette from where it is on screen.
+            .onChange(of: wanted) { _, next in follow(next, model: dockModel(r, origin: origin)) }
+            .onChange(of: reshape) { _, phase in
+                // A move that waited for a re-form to end runs now, from where the palette rests.
+                if phase == .idle { follow(wanted, model: dockModel(r, origin: origin)) }
+            }
             .onChange(of: selection) { oldValue, newValue in
                 let glide = tapped == newValue
                 tapped = nil
@@ -503,7 +531,61 @@ public struct NibToolPalette<Settings: View>: View {
             .modifier(PresentationMirror(isOpen: $settingsOpen, external: settingsPresented))
             .modifier(PresentationMirror(isOpen: $moreOpen, external: morePresented))
         }
-        .background(ReshapeWatcher(node: field?.node(id)) { shownDock = nil })
+        .background(ReshapeWatcher(node: field?.node(id)) { phase in reshaped(phase) })
+    }
+
+    // MARK: Moving between docks
+
+    /// The dock to rest in changed: the palette's own release, a "Move palette to…" action, `toolbar.dock` (⌘K, a
+    /// plugin, the assistant, an undo) or a size class that takes the side docks away. It moves there from where it is
+    /// on screen (DESIGN.md §10.10). A release reaches here through the binding like any other change, so it animates
+    /// once, carrying its own velocity.
+    private func follow(_ next: NibPaletteDock, model: DropletDockModel) {
+        guard let shown = laidOut else { return }       // not on screen yet: it appears at `next`
+        let own = released.flatMap { $0.claims(next, now: CACurrentMediaTime()) ? $0 : nil }
+        // The phase as the field has it now (a change `reshaped` has not seen yet included).
+        let phase = field?.node(id).presentation.reshape ?? .idle
+        switch DockTransition.plan(from: shown, to: next, reforming: reforming, phase: phase,
+                                   reduced: reduceMotion || liquidMode == .off) {
+        case .stay, .wait:
+            return
+        case .slide:
+            // The body flows to the new layout from where it is (FLIP), keeping a release's velocity.
+            laidOut = next
+        case .reform, .retarget:
+            if let field, field.visualFrame(id) != nil {
+                // Gather towards the new dock; the layout switches as the spread starts (`reshaped`).
+                let target = model.frame(for: next)
+                reforming = next
+                field.beginReshape(id, towards: CGPoint(x: target.midX, y: target.midY),
+                                   velocity: own?.velocity ?? .zero)
+            } else {
+                // No body to re-form (outside a container, or not laid out yet): lay out there at once.
+                reforming = nil
+                laidOut = next
+            }
+        case .crossFade:
+            // Fade out, move while invisible (the body glides with `reduced`), fade in.
+            withAnimation(NibMotion.exit) { fade = 0 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                laidOut = next
+                if let own { landing = DockLanding(centre: own.landing.centre) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.reduced.response) {
+                    withAnimation(NibMotion.enter) { fade = 1 }
+                }
+            }
+        }
+        released = nil
+    }
+
+    /// The field's re-form phase for this palette: the layout switches to the new dock as the spread starts, while the
+    /// content is invisible (the spread cannot end before it does). Back at idle, a move that waited runs.
+    private func reshaped(_ phase: DropletField.ReshapePhase) {
+        if phase == .spreading, let reforming {
+            laidOut = reforming
+            self.reforming = nil
+        }
+        reshape = phase
     }
 
     struct AnchorKey: Equatable {
@@ -667,6 +749,7 @@ public struct NibToolPalette<Settings: View>: View {
                         settingsOpen = false
                         moreOpen = false
                         landing = nil
+                        released = nil
                         field.dismissBuds()
                         DropletDockDriver(id: id, field: field).begin(at: value.startLocation)
                     }
@@ -703,30 +786,17 @@ public struct NibToolPalette<Settings: View>: View {
                 }
                 guard mode == .move else { return }
                 // The projected finger picks the dock within the capture radius (else home); the palette springs there
-                // with `snap` from the full release velocity, re-forms if the axis changes, and plips on arrival.
+                // with `snap` from the full release velocity and plips on arrival. The move itself (slide, re-form or
+                // cross-fade) runs once the binding takes the dock, in `follow`, like any other dock change.
                 let release = DropletDockDriver(id: id, field: field).release(
                     at: value.location, velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height),
                     from: current, model: dockModel(r, origin: origin))
                 let next = release.dock
                 let arrival = DockLanding(centre: CGPoint(x: release.frame.midX, y: release.frame.midY))
-                if (reduceMotion || liquidMode == .off) && next != current {
-                    // Fade out, move while invisible (the body glides with `reduced`), fade in.
-                    withAnimation(NibMotion.exit) { fade = 0 }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                        dock = next
-                        landing = DockLanding(centre: arrival.centre)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.reduced.response) {
-                            withAnimation(NibMotion.enter) { fade = 1 }
-                        }
-                    }
-                    return
-                }
-                if next.isVertical != current.isVertical {
-                    shownDock = current
-                    field.beginReshape(id, towards: CGPoint(x: release.frame.midX, y: release.frame.midY),
-                                       velocity: release.velocity)
-                }
-                landing = arrival
+                let moves = next != current
+                // The cross-fade arms the plip once it has moved (resting where it was, the body would plip at once).
+                if !(moves && (reduceMotion || liquidMode == .off)) { landing = arrival }
+                released = moves ? OwnRelease(dock: next, velocity: release.velocity, landing: arrival) : nil
                 dock = next
             }
     }
@@ -751,13 +821,11 @@ struct PresentationMirror: ViewModifier {
 /// Watches one droplet's re-form phase without making its parent's body depend on the droplet's per-frame state.
 struct ReshapeWatcher: View {
     let node: DropletNode?
-    let onSpread: () -> Void
+    let onPhase: (DropletField.ReshapePhase) -> Void
 
     var body: some View {
         Color.clear
-            .onChange(of: node?.presentation.reshape ?? .idle) { _, phase in
-                if phase == .spreading { onSpread() }
-            }
+            .onChange(of: node?.presentation.reshape ?? .idle) { _, phase in onPhase(phase) }
     }
 }
 
