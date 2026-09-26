@@ -54,6 +54,9 @@ struct TimeKeeperSnapshot: Codable {
 final class TimeKeeper: ObservableObject {
     static let serviceKey = "timekeeper.controller"
     static let panelID = "timekeeper"
+    /// The bar's chrome overlay, shown on page canvases.
+    static let barID = "timekeeper.bar"
+    static let barKinds: Set<DocumentKind> = [.notebook, .whiteboard]
 
     enum Keys {
         static let modes = "timer.modes."
@@ -75,8 +78,6 @@ final class TimeKeeper: ObservableObject {
     @Published private(set) var barVisible = true
     @Published private(set) var modes: [TimerPreset] = []
     @Published private(set) var history: [TimerRecord] = []
-    /// True when the last visibility change came from the keyboard: it shows or hides without motion.
-    private(set) var instantVisibility = false
     /// The Time Keeper panel is on screen (its view reports this).
     var panelOpen = false
     /// Nib is in the foreground (set from the app's active and background notifications in `begin`; tests set it).
@@ -117,13 +118,16 @@ final class TimeKeeper: ObservableObject {
         app?.perform(command, params, session: session)
     }
 
-    /// The window shows a page canvas, where the bar lives (notebooks and whiteboards; the canvas attachment's
-    /// document kinds). Elsewhere the panel is the Time Keeper's only view.
+    /// The window shows a page canvas, where the bar lives (the bar overlay's document kinds). Elsewhere the panel is
+    /// the Time Keeper's only view.
     func showsBar(in session: EditorSession?) -> Bool {
         guard let doc = session?.document else { return false }
         guard let kind = app?.services.library?.node(doc)?.documentKind else { return true }
-        return kind == .notebook || kind == .whiteboard
+        return Self.barKinds.contains(kind)
     }
+
+    /// The bar overlay is up in canvas windows: a session is active and its bar is not hidden.
+    var showsBarOverlay: Bool { engine.isActive && barVisible }
 
     // MARK: Sessions
 
@@ -152,7 +156,6 @@ final class TimeKeeper: ObservableObject {
         engine = makeEngine(kind, seconds: seconds, label: label, session: session, at: t)
         if let s = session { lastDocs[s.id] = engine.doc ?? "" }
         now = t
-        instantVisibility = false
         barVisible = true
         scheduleNotification()
         persist()
@@ -203,8 +206,8 @@ final class TimeKeeper: ObservableObject {
         persist()
     }
 
-    func setBarVisible(_ on: Bool, instant: Bool) {
-        instantVisibility = instant
+    /// Shows or hides the bar; hiding never stops the session.
+    func setBarVisible(_ on: Bool) {
         barVisible = on
         persist()
     }
@@ -236,7 +239,6 @@ final class TimeKeeper: ObservableObject {
         // background (Nib kept alive, say by an audio recording) it is how the user hears of the end: this tick
         // lands at about the moment it fires, and cancelling would remove it before or right after delivery.
         if isForeground { notifier.cancel(id: engine.id) }
-        instantVisibility = false
         barVisible = true
         stopTicking()
         persist()
@@ -316,12 +318,15 @@ final class TimeKeeper: ObservableObject {
 
     // MARK: Storage (settings are written here, inside the command layer)
 
+    /// Saves the session after every change, and asks the chrome to re-evaluate the bar overlay and the accessory's
+    /// on state (both read the session; the chrome does not observe it).
     private func persist() {
         var value: JSONValue?
         if engine.isActive {
             value = try? JSONValue.from(TimeKeeperSnapshot(engine: engine, barVisible: barVisible))
         }
         settings.setJSON(Keys.active.name, value)
+        app?.ui.setNeedsChromeUpdate()
     }
 
     /// Picks up the session saved before a relaunch; a countdown that ended meanwhile is finished and recorded.
@@ -336,6 +341,7 @@ final class TimeKeeper: ObservableObject {
             scheduleNotification()
             startTicking()
         }
+        app?.ui.setNeedsChromeUpdate()
     }
 
     private func store(_ record: TimerRecord) {
@@ -402,10 +408,13 @@ final class TimeKeeper: ObservableObject {
         guard let app else { return }
         for s in app.services.sessions.sessions { lastDocs[s.id] = s.document.map { NodeRef.document($0).description } ?? "" }
         events = app.events.subscribe { [weak self] event in
-            guard event.type == NibEventType.sessionDocument,
-                  let session = event.payload?["session"]?.stringValue else { return }
-            let doc = event.doc.map { NodeRef.document($0).description } ?? ""
-            Task { @MainActor in self?.sessionMoved(NibID(session), to: doc) }
+            if event.type == NibEventType.sessionDocument, let session = event.payload?["session"]?.stringValue {
+                let doc = event.doc.map { NodeRef.document($0).description } ?? ""
+                Task { @MainActor in self?.sessionMoved(NibID(session), to: doc) }
+            } else if event.type == NibEventType.sessionActivated {
+                // A window that left the session's document while another was active is asked once it is active.
+                Task { @MainActor in self?.presentLeavePromptIfReady() }
+            }
         }
         NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
             .receive(on: DispatchQueue.main)
@@ -417,12 +426,6 @@ final class TimeKeeper: ObservableObject {
         NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.isForeground = false }
-            .store(in: &subscriptions)
-        // A window that left the session's document while another was active is asked when it becomes active
-        // (delivered on the next main-queue turn, after the shell has made it the active navigator).
-        NotificationCenter.default.publisher(for: UIScene.didActivateNotification)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.presentLeavePromptIfReady() }
             .store(in: &subscriptions)
         // Modes and history saved on another device arrive through the synced settings.
         NotificationCenter.default.publisher(for: SettingsStore.didChange, object: settings)
@@ -567,7 +570,7 @@ struct TimerControl: NibCommand {
         id: "timer.control", title: "Control Time Keeper",
         summary: "Pause, resume or end the Time Keeper timer/stopwatch (stop saves it to history, discard does not), show/hide its bar without stopping it, or open its panel.",
         params: .obj(["action": .str("what to do", choices: Action.allCases.map { $0.rawValue }),
-                      "instant": .bool("show or hide without motion (keyboard)")],
+                      "instant": .bool("keyboard: open the panel without the bud animation")],
                      required: ["action"]),
         examples: [["action": "togglePause"], ["action": "stop"], ["action": "hide"]],
         effect: .session, target: .app)
@@ -595,19 +598,19 @@ struct TimerControl: NibCommand {
         case .show:
             await show(keeper, ctx, instant: instant)
         case .hide:
-            await hide(keeper, ctx, instant: instant)
+            await hide(keeper, ctx)
         case .toggleVisibility:
             // On a canvas the key and the accessory toggle the bar of a running session; everywhere else, and with
             // nothing running, they open and close the panel.
             if keeper.engine.isActive && keeper.showsBar(in: ctx.activeSession) {
-                keeper.setBarVisible(!keeper.barVisible, instant: instant)
+                keeper.setBarVisible(!keeper.barVisible)
             } else if keeper.panelOpen {
                 await closePanel(ctx)
             } else {
-                await openPanel(ctx)
+                await openPanel(ctx, instant: instant)
             }
         case .open:
-            await openPanel(ctx)
+            await openPanel(ctx, instant: instant)
         }
         return keeper.status()
     }
@@ -652,21 +655,24 @@ struct TimerControl: NibCommand {
     /// A session shows its bar; with none, the Time Keeper panel opens.
     private static func show(_ keeper: TimeKeeper, _ ctx: CommandContext, instant: Bool) async {
         if keeper.engine.isActive {
-            keeper.setBarVisible(true, instant: instant)
+            keeper.setBarVisible(true)
         } else {
-            await openPanel(ctx)
+            await openPanel(ctx, instant: instant)
         }
     }
 
     /// Hides the bar (the session keeps running) and closes the panel.
-    private static func hide(_ keeper: TimeKeeper, _ ctx: CommandContext, instant: Bool) async {
-        if keeper.engine.isActive { keeper.setBarVisible(false, instant: instant) }
+    private static func hide(_ keeper: TimeKeeper, _ ctx: CommandContext) async {
+        if keeper.engine.isActive { keeper.setBarVisible(false) }
         if keeper.panelOpen { await closePanel(ctx) }
     }
 
     /// The panel host is the document chrome (F017), an optional dependency: without it the call is a no-op.
-    private static func openPanel(_ ctx: CommandContext) async {
-        _ = try? await ctx.execute("panel.open", ["id": .string(TimeKeeper.panelID)])
+    /// `instant` (the K key) reaches the host as `PanelContext.params`, so it opens without the bud (DESIGN.md §9.3).
+    private static func openPanel(_ ctx: CommandContext, instant: Bool) async {
+        var params: [String: JSONValue] = ["id": .string(TimeKeeper.panelID)]
+        if instant { params["params"] = ["instant": true] }
+        _ = try? await ctx.execute("panel.open", .object(params))
     }
 
     private static func closePanel(_ ctx: CommandContext) async {

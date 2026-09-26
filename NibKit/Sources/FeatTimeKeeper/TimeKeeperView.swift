@@ -1,6 +1,5 @@
 import SwiftUI
 import UIKit
-import Combine
 import PencilKit
 import NibContracts
 import NibDesign
@@ -580,76 +579,68 @@ struct DurationPad: UIViewRepresentable {
 
 // MARK: - Bar
 
-final class TimeKeeperBarPresentation: ObservableObject {
-    /// The Pencil is down on the canvas (DESIGN.md §10.8).
-    @Published var receded = false
-}
-
-/// The running session as a Clear 40 pt HUD capsule: pause or resume, the clock and name over the progress bar,
-/// Lap (stopwatch), Stop and Save, Hide. Tapping the clock opens the panel with the laps and history.
+/// The running session on the canvas: pause or resume, the clock and name over the progress bar, Lap (stopwatch),
+/// Stop and Save, Hide. Tapping the clock opens the panel with the laps and history. It is a chrome overlay
+/// (`timekeeper.bar`, `.bottom`, `.bar`): the document chrome gives it the Clear bar droplet inside the window's droplet
+/// container, places it above the bottom edge (and the iPhone palette), slides it in and out, and recedes it while the
+/// Pencil is down. So the view draws no glass of its own.
 struct TimeKeeperBar: View {
-    static let width: CGFloat = NibMetrics.panelWidth
-    /// The 40 pt HUD plus room for the 44 pt hit targets.
-    static let height: CGFloat = NibMetrics.hitTarget + NibSpacing.xs
+    static let maxWidth: CGFloat = NibMetrics.panelWidth
 
     @ObservedObject var keeper: TimeKeeper
-    @ObservedObject var presentation: TimeKeeperBarPresentation
+    /// The window the bar is in: its buttons act for it.
+    let session: EditorSession?
 
     var body: some View {
         let e = keeper.engine
         let t = keeper.now
-        HStack(spacing: NibSpacing.xxs) {
-            if e.state == .finished {
-                NibIconButton(.retry, label: String(localized: "Start Again")) {
-                    var params: [String: JSONValue] = ["seconds": .number(Double(e.seconds))]
-                    if let label = e.label { params["label"] = .string(label) }
-                    keeper.perform("timer.start", .object(params))
+        if e.isActive {
+            HStack(spacing: NibSpacing.xxs) {
+                if e.state == .finished {
+                    NibIconButton(.retry, label: String(localized: "Start Again")) {
+                        var params: [String: JSONValue] = ["seconds": .number(Double(e.seconds))]
+                        if let label = e.label { params["label"] = .string(label) }
+                        run("timer.start", .object(params))
+                    }
+                } else {
+                    NibIconButton(e.state == .running ? NibSymbol.pause : NibSymbol.play,
+                                  label: e.state == .running ? String(localized: "Pause") : String(localized: "Resume"),
+                                  shortcut: TimeKeeperKeys.pause) {
+                        run("timer.control", ["action": "togglePause"])
+                    }
                 }
-            } else {
-                NibIconButton(e.state == .running ? NibSymbol.pause : NibSymbol.play,
-                              label: e.state == .running ? String(localized: "Pause") : String(localized: "Resume"),
-                              shortcut: TimeKeeperKeys.pause) {
-                    keeper.perform("timer.control", ["action": "togglePause"])
+                summary(e, at: t)
+                if e.kind == .stopwatch && e.state == .running {
+                    NibIconButton(NibSymbol.lap, label: String(localized: "Record Lap"), shortcut: TimeKeeperKeys.lap) {
+                        run("stopwatch.lap")
+                    }
+                }
+                NibIconButton(e.state == .finished ? NibSymbol.checkmark : NibSymbol.stop,
+                              label: e.state == .finished ? String(localized: "Done") : String(localized: "Stop and Save")) {
+                    run("timer.control", ["action": "stop"])
+                }
+                NibIconButton(.chevronDown, label: String(localized: "Hide Time Keeper")) {
+                    run("timer.control", ["action": "hide"])
                 }
             }
-            summary(e, at: t)
-            if e.kind == .stopwatch && e.state == .running {
-                NibIconButton(NibSymbol.lap, label: String(localized: "Record Lap"), shortcut: TimeKeeperKeys.lap) {
-                    keeper.perform("stopwatch.lap")
-                }
-            }
-            NibIconButton(e.state == .finished ? NibSymbol.checkmark : NibSymbol.stop,
-                          label: e.state == .finished ? String(localized: "Done") : String(localized: "Stop and Save")) {
-                keeper.perform("timer.control", ["action": "stop"])
-            }
-            NibIconButton(.chevronDown, label: String(localized: "Hide Time Keeper")) {
-                keeper.perform("timer.control", ["action": "hide"])
-            }
+            .padding(.horizontal, NibSpacing.xs)
+            .frame(maxWidth: TimeKeeperBar.maxWidth)
+            .frame(height: NibMetrics.hudHeight)
+            .nibChromeTypeCap()
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(String(localized: "Time Keeper"))
         }
-        .padding(.horizontal, NibSpacing.xs)
-        .frame(height: NibMetrics.hudHeight)
-        .background { material }
-        .nibChromeTypeCap()
-        .opacity(presentation.receded ? NibLiquid.recedeOpacity : 1)
-        .animation(presentation.receded ? NibMotion.recede : NibMotion.enter, value: presentation.receded)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(String(localized: "Time Keeper"))
     }
 
-    /// Clear water at rest. While the Pencil is down nothing samples the backdrop (DESIGN.md §10.8): the bar is the
-    /// plain Clear body, as the droplet container draws frozen droplets (at 22 % the swap does not show).
-    @ViewBuilder private var material: some View {
-        if presentation.receded {
-            NibDropletShape().fill(NibColor.clearBody)
-        } else {
-            Color.clear.nibGlass(.clear)
-        }
+    private func run(_ command: String, _ params: JSONValue = [:]) {
+        keeper.perform(command, params, session: session)
     }
 
     private func summary(_ e: TimerEngine, at t: Date) -> some View {
         let spoken = TimerFormat.spokenDisplay(e, at: t)
-        return Button(action: openPanel) {
+        return Button {
+            run("timer.control", ["action": "open"])
+        } label: {
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 HStack(spacing: NibSpacing.s) {
                     Text(e.state == .finished ? String(localized: "Time's up") : TimerFormat.display(e, at: t))
@@ -677,189 +668,5 @@ struct TimeKeeperBar: View {
         .accessibilityLabel(e.label.map { "\($0), \(spoken)" } ?? spoken)
         .accessibilityAddTraits(.updatesFrequently)
         .accessibilityHint(String(localized: "Opens Time Keeper"))
-    }
-
-    private func openPanel() {
-        keeper.perform("timer.control", ["action": "open"])
-    }
-}
-
-/// Puts the bar over every canvas (a canvas attachment cannot reach the chrome's droplet container, so the bar is a
-/// lone `nibGlass` HUD in the canvas's superview). It slides in from the bottom edge when a session starts or is
-/// shown and slides back when hidden (a cross-fade under Reduce Motion, nothing when the keyboard asked or when a
-/// document opens with a session already running), sits above the iPhone palette, and recedes to 22 % while the
-/// Pencil is down.
-@MainActor
-final class TimeKeeperBarAttachment: CanvasAttachment {
-    private let keeper: TimeKeeper
-    private let presentation = TimeKeeperBarPresentation()
-    private weak var host: CanvasHost?
-    private var hosting: UIHostingController<TimeKeeperBar>?
-    private var cancellables: Set<AnyCancellable> = []
-    private var wantsBar = false
-    /// False until the first state arrives: a bar that is already up when the canvas opens appears in place.
-    private var hasState = false
-    private var restore: Task<Void, Never>?
-
-    init(keeper: TimeKeeper) {
-        self.keeper = keeper
-    }
-
-    func attach(to host: CanvasHost) {
-        self.host = host
-        keeper.$engine.map { $0.isActive }.removeDuplicates()
-            .combineLatest(keeper.$barVisible.removeDuplicates())
-            .map { $0 && $1 }
-            .removeDuplicates()
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] on in self?.setWanted(on) }
-            .store(in: &cancellables)
-    }
-
-    func detach(from host: CanvasHost) {
-        cancellables.removeAll()
-        restore?.cancel()
-        if let h = hosting {
-            h.willMove(toParent: nil)
-            h.view.removeFromSuperview()
-            h.removeFromParent()
-        }
-        hosting = nil
-        self.host = nil
-    }
-
-    func canvasDidChange(_ host: CanvasHost) {
-        // The canvas may not have been in a view hierarchy when the state first arrived.
-        if wantsBar, hosting?.view.superview == nil {
-            slideIn(animated: false)
-        } else {
-            layout()
-        }
-    }
-
-    /// Asked for every touch that starts on the canvas; the bar never takes it, but steps back while it writes.
-    func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
-        if wantsBar { recede() }
-        return false
-    }
-
-    private func setWanted(_ on: Bool) {
-        let animated = hasState && !keeper.instantVisibility
-        hasState = true
-        wantsBar = on
-        if on { slideIn(animated: animated) } else { slideOut(animated: animated) }
-    }
-
-    private var reduceMotion: Bool { UIAccessibility.isReduceMotionEnabled || NibMotion.forcesReduced }
-
-    private func slideIn(animated: Bool) {
-        guard let view = ensureHosting() else { return }
-        layout()
-        presentation.receded = false
-        let wasHidden = view.isHidden
-        view.isHidden = false
-        guard animated else {
-            view.alpha = 1
-            view.transform = .identity
-            return
-        }
-        if wasHidden {
-            if reduceMotion { view.alpha = 0 } else { view.transform = offscreen(view) }
-        }
-        NibMotion.animateUIKit(NibMotion.sheet) {
-            view.alpha = 1
-            view.transform = .identity
-        }
-    }
-
-    private func slideOut(animated: Bool) {
-        guard let view = hosting?.view, !view.isHidden else { return }
-        guard animated else {
-            view.isHidden = true
-            view.alpha = 1
-            view.transform = .identity
-            return
-        }
-        let fade = reduceMotion
-        let target = offscreen(view)
-        NibMotion.animateUIKit(NibMotion.retract, animations: {
-            if fade { view.alpha = 0 } else { view.transform = target }
-        }, completion: { [weak self] _ in
-            guard let self, !self.wantsBar else { return }
-            view.isHidden = true
-            view.alpha = 1
-            view.transform = .identity
-        })
-    }
-
-    /// Below the bottom edge of the container.
-    private func offscreen(_ view: UIView) -> CGAffineTransform {
-        let bottom = view.superview?.bounds.maxY ?? view.center.y
-        return CGAffineTransform(translationX: 0, y: max(bottom - view.center.y + view.bounds.height, view.bounds.height))
-    }
-
-    private func recede() {
-        presentation.receded = true
-        restore?.cancel()
-        restore = Task { @MainActor [weak self] in
-            // Until the Pencil lifts (NibHaptics.isInking is the droplet container's flag), then 450 ms (DESIGN.md §10.8).
-            repeat {
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            } while NibHaptics.isInking && !Task.isCancelled
-            try? await Task.sleep(nanoseconds: UInt64(NibMotion.recedeDelay * 1_000_000_000))
-            guard !Task.isCancelled else { return }
-            self?.presentation.receded = false
-        }
-    }
-
-    private func ensureHosting() -> UIView? {
-        guard let host, let container = host.canvasView.superview else { return nil }
-        let h: UIHostingController<TimeKeeperBar>
-        if let existing = hosting {
-            h = existing
-        } else {
-            h = UIHostingController(rootView: TimeKeeperBar(keeper: keeper, presentation: presentation))
-            h.view.backgroundColor = .clear
-            h.safeAreaRegions = []
-            h.view.isHidden = true
-            hosting = h
-        }
-        if h.view.superview !== container {
-            h.willMove(toParent: nil)
-            h.view.removeFromSuperview()
-            h.removeFromParent()
-            if let parent = Self.viewController(of: container) {
-                parent.addChild(h)
-                container.addSubview(h.view)
-                h.didMove(toParent: parent)
-            } else {
-                container.addSubview(h.view)
-            }
-        }
-        return h.view
-    }
-
-    /// Bottom centre of the canvas, 16 pt above the safe area (above the palette on iPhone). Set through bounds and
-    /// centre so a slide in progress keeps its transform.
-    private func layout() {
-        guard let host, let view = hosting?.view, let container = view.superview else { return }
-        let canvas = host.canvasView
-        let area = container.convert(canvas.bounds, from: canvas)
-        let compact = area.width < NibMetrics.compactBreakpoint
-        let width = max(0, min(TimeKeeperBar.width, area.width - 2 * NibMetrics.chromeInset))
-        let bottom = canvas.safeAreaInsets.bottom + (compact ? NibMetrics.canvasBottomInsetCompact : NibMetrics.chromeInset)
-        let size = CGSize(width: width, height: TimeKeeperBar.height)
-        let centre = CGPoint(x: area.midX, y: area.maxY - bottom - size.height / 2)
-        if view.bounds.size != size { view.bounds = CGRect(origin: .zero, size: size) }
-        if view.center != centre { view.center = centre }
-    }
-
-    private static func viewController(of view: UIView) -> UIViewController? {
-        var responder: UIResponder? = view
-        while let r = responder {
-            if let vc = r as? UIViewController { return vc }
-            responder = r.next
-        }
-        return nil
     }
 }

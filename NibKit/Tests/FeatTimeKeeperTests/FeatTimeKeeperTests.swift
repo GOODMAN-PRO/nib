@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import NibContracts
 import NibTesting
 @testable import FeatTimeKeeper
@@ -81,7 +82,12 @@ final class FeatTimeKeeperTests: XCTestCase {
         XCTAssertEqual(accessory?.params, ["action": "toggleVisibility"])
         XCTAssertEqual(h.app.ui.menus.get("timekeeper.more")?.command, "timer.control")
         XCTAssertEqual(h.app.ui.panels.get("timekeeper")?.placement, .floating)
-        XCTAssertNotNil(h.app.ui.canvasAttachments.get("timekeeper.bar"))
+        let bar = try XCTUnwrap(h.app.ui.chromeOverlays.get("timekeeper.bar"), "the bar is a chrome overlay")
+        XCTAssertEqual(bar.placement, .bottom)
+        XCTAssertEqual(bar.surface, .bar)
+        XCTAssertTrue(bar.recedesWhileWriting)
+        XCTAssertEqual(bar.docKinds, Set([DocumentKind.notebook, .whiteboard]))
+        XCTAssertNil(h.app.ui.canvasAttachments.get("timekeeper.bar"))
         XCTAssertEqual(h.app.content.keyCommands.get("timekeeper.toggle")?.shortcut, KeyShortcut("k"))
         XCTAssertEqual(h.app.content.keyCommands.get("timekeeper.toggle")?.scope, .canvas)
         XCTAssertEqual(h.app.content.keyCommands.get("timekeeper.pause")?.command, "timer.control")
@@ -190,27 +196,61 @@ final class FeatTimeKeeperTests: XCTestCase {
 
     func testHidingKeepsTheSessionRunning() async throws {
         let (h, keeper, _, _) = try make()
+        // A stand-in for the document chrome's panel host (F017), recording what panel.open is asked.
+        var opened: [JSONValue] = []
+        h.app.commands.register(CommandDescriptor(
+            id: "panel.open", title: "Open Panel", summary: "Test stand-in for the document chrome's panel host.",
+            params: .obj(["id": .str(), "params": .anything()], required: ["id"]), effect: .session, target: .app,
+            owner: "test")) { json, _ in
+            opened.append(json)
+            return .null
+        }
+        var chromeUpdates = 0
+        let watch = NotificationCenter.default.publisher(for: .nibChromeNeedsUpdate, object: h.app.ui)
+            .sink { _ in chromeUpdates += 1 }
+        defer { watch.cancel() }
+        let bar = try XCTUnwrap(h.app.ui.chromeOverlays.get("timekeeper.bar"))
+        let canvas = ChromeContext(app: h.app, session: h.session, kind: .notebook)
+        let textWindow = ChromeContext(app: h.app, session: h.session, kind: .textDocument)
+        let accessory = try XCTUnwrap(h.app.ui.toolbar.get("timekeeper"))
+        XCTAssertFalse(bar.isVisible(canvas))
+        XCTAssertEqual(accessory.isOn?(h.session), false)
+
         try await h.run("timer.start", ["seconds": 120])
+        XCTAssertTrue(bar.isVisible(canvas), "a running session shows its bar")
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(canvas).map { $0.id }, ["timekeeper.bar"])
+        XCTAssertTrue(h.app.ui.visibleChromeOverlays(textWindow).isEmpty, "no bar in a text document")
+        XCTAssertEqual(accessory.isOn?(h.session), true, "the accessory shows that a session is running")
+        XCTAssertGreaterThan(chromeUpdates, 0, "the chrome is asked to re-evaluate the bar and the accessory")
+
         var status = try await h.run("timer.control", ["action": "hide"])
         XCTAssertEqual(status["visible"], false)
         XCTAssertEqual(status["state"], "running")
-        XCTAssertFalse(keeper.instantVisibility)
+        XCTAssertFalse(bar.isVisible(canvas), "hidden, not stopped")
+        XCTAssertEqual(accessory.isOn?(h.session), true)
         status = try await h.run("timer.control", ["action": "toggleVisibility", "instant": true])
         XCTAssertEqual(status["visible"], true)
-        XCTAssertTrue(keeper.instantVisibility, "keyboard toggles show the bar without motion")
+        XCTAssertTrue(bar.isVisible(canvas))
+        XCTAssertTrue(opened.isEmpty, "on a canvas K toggles the bar, not the panel")
 
         // Off the canvas (a text document) there is no bar: K opens the panel and leaves the bar alone.
         h.session.document = Fixtures.textDocID
-        status = try await h.run("timer.control", ["action": "toggleVisibility"])
+        status = try await h.run("timer.control", ["action": "toggleVisibility", "instant": true])
         XCTAssertEqual(status["visible"], true)
         XCTAssertEqual(status["state"], "running")
+        XCTAssertEqual(opened, [["id": "timekeeper", "params": ["instant": true]]],
+                       "the key asks the panel host to skip the bud (PanelContext.params)")
 
-        // With nothing running K and the More menu open the panel; without the chrome's panel host that is a no-op.
+        // With nothing running K and the More menu open the panel.
         try await h.run("timer.control", ["action": "discard"])
+        XCTAssertEqual(accessory.isOn?(h.session), false)
+        XCTAssertFalse(bar.isVisible(canvas))
         status = try await h.run("timer.control", ["action": "toggleVisibility"])
         XCTAssertEqual(status["active"], false)
         status = try await h.run("timer.control", ["action": "open"])
         XCTAssertEqual(status["active"], false)
+        XCTAssertEqual(opened.count, 3)
+        XCTAssertEqual(opened.last, ["id": "timekeeper"], "the menu opens it with the usual bud")
         XCTAssertTrue(keeper.loadHistory().isEmpty, "a discarded session is not saved")
     }
 

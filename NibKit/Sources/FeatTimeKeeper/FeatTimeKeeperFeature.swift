@@ -48,20 +48,29 @@ public enum FeatTimeKeeperFeature: NibFeature {
                              owner: id, readOnly: true)
 
         let title = String(localized: "Time Keeper")
-        let icon = "timer"
-        app.ui.toolbar.register(ToolbarItemDescriptor(
+        let icon = NibSymbol.timer.name
+        var accessory = ToolbarItemDescriptor(
             id: "timekeeper", title: title, icon: icon, group: .accessories, order: 700, owner: id,
-            command: "timer.control", params: ["action": "toggleVisibility"], shortcut: KeyShortcut("k")))
+            command: "timer.control", params: ["action": "toggleVisibility"], shortcut: KeyShortcut("k"))
+        // On while a timer or stopwatch is running, paused or finished and not yet cleared.
+        accessory.isOn = { _ in keeper.engine.isActive }
+        app.ui.toolbar.register(accessory)
         app.ui.menus.register(MenuItemDescriptor(
             id: "timekeeper.more", title: title, icon: icon, location: .documentMore, order: 700, owner: id,
             command: "timer.control", params: { _ in ["action": "open"] }))
         app.ui.panels.register(PanelDescriptor(
             id: TimeKeeper.panelID, title: title, icon: icon, placement: .floating, order: 700, owner: id,
             makeView: { context in AnyView(TimeKeeperPanel(keeper: keeper, context: context)) }))
-        app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(
-            id: "timekeeper.bar", owner: id, order: 900, make: { _ in TimeKeeperBarAttachment(keeper: keeper) }))
+        // The bar over the canvas: a chrome overlay, so it lives in the window's droplet container and recedes while
+        // the Pencil is down. `TimeKeeper` asks the chrome to re-evaluate it whenever the session or the bar changes.
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: TimeKeeper.barID, owner: id, placement: .bottom, surface: .bar, order: 700,
+            docKinds: TimeKeeper.barKinds,
+            isVisible: { _ in keeper.showsBarOverlay },
+            makeView: { context in AnyView(TimeKeeperBar(keeper: keeper, session: context.session)) }))
 
-        // Keyboard paths never animate (DESIGN.md §9.3), so K passes `instant`.
+        // Keyboard paths never animate (DESIGN.md §9.3), so K passes `instant` (the panel host reads it from
+        // PanelContext.params and skips the bud).
         func key(_ name: String, _ title: String, _ shortcut: KeyShortcut, _ command: String, _ params: JSONValue,
                  _ scope: KeyScope) {
             app.content.keyCommands.register(KeyCommandDescriptor(
