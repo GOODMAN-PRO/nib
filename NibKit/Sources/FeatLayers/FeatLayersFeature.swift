@@ -14,8 +14,8 @@ public enum FeatLayersFeature: NibFeature {
         app.commands.register(LayerMoveItems.self)
         app.commands.register(LayerExportOptions.self)
         LayerSettings.declare(app.settings, owner: id)
-        app.bus.hooks.register(CommandHookDescriptor(id: "layers.exportVisibleLayers", owner: id,
-                                                     commands: [CommandIDs.exportRun],
+        app.bus.hooks.register(CommandHookDescriptor(id: "layers.visibleLayersOnly", owner: id,
+                                                     commands: LayerExportOptions.hooked,
                                                      command: LayerCommandIDs.exportOptions))
         LayersChrome.registerMenus(app, owner: id)
     }
@@ -27,8 +27,9 @@ public enum FeatLayersFeature: NibFeature {
     }
 }
 
-/// What runs after launch: the panel follows `layers.show`, each window loads its document's stored layer view, the
-/// Move to Layer menu shows the active document's layer names, and editing a hidden layer shows it again.
+/// What runs after launch: the panel and every window's layer view follow `layers.show`, each window loads its
+/// document's stored layer view, the Move to Layer menu shows the active document's layer names, and editing a hidden
+/// layer shows it again.
 @MainActor
 final class LayersRuntime {
     static let serviceKey = "layers.runtime"
@@ -61,9 +62,12 @@ final class LayersRuntime {
             }
     }
 
+    /// `layers.show` changed: add or remove the panel and shortcuts, and apply it to every window (off shows every
+    /// layer and draws on Layer 1; on restores each document's stored view).
     private func syncChrome() {
         guard let app else { return }
         LayersChrome.sync(app, owner: FeatLayersFeature.id)
+        for session in app.services.sessions.sessions { LayerView.apply(app.settings, to: session) }
     }
 
     /// A window switched documents: load that document's hidden and active layers on this device.
@@ -85,14 +89,24 @@ final class LayersRuntime {
         if case .sync = cs.principal { return }
         guard !LayerModel.passiveCommands.contains(cs.command) else { return }
         // Editing a hidden layer (drawing while it is active, an AI or plugin edit) shows it again, with an alert.
-        for session in app.services.sessions.sessions {
-            guard let doc = session.document, !session.hiddenLayers.isEmpty else { continue }
-            let revealed = LayerModel.editedLayers(cs, doc: doc).intersection(session.hiddenLayers)
-            guard !revealed.isEmpty else { continue }
-            for layer in revealed.sorted() {
-                LayerView.setVisible(true, layer: layer, session: session, settings: app.settings)
+        var shown = Set<DocumentID>()
+        if app.settings.get(LayerSettings.show) {
+            for session in app.services.sessions.sessions {
+                guard let doc = session.document else { continue }
+                shown.insert(doc)
+                guard !session.hiddenLayers.isEmpty else { continue }
+                let revealed = LayerModel.editedLayers(cs, doc: doc).intersection(session.hiddenLayers)
+                guard !revealed.isEmpty else { continue }
+                for layer in revealed.sorted() {
+                    LayerView.setVisible(true, layer: layer, session: session, settings: app.settings)
+                }
+                tellUser(revealed: revealed, doc: doc, session: session)
             }
-            tellUser(revealed: revealed, doc: doc, session: session)
+        }
+        // Documents no window shows (every document while Layers is off): update the stored view, so the new content
+        // is not hidden when the document is next shown with Layers on. No alert: nothing visible changes now.
+        for doc in cs.documents where !shown.contains(doc) {
+            LayerView.reveal(LayerModel.editedLayers(cs, doc: doc), doc: doc, settings: app.settings)
         }
     }
 
@@ -103,7 +117,7 @@ final class LayersRuntime {
         let names = revealed.sorted().map { layers[$0].name }
         let title = names.count == 1 ? String(localized: "\(names[0]) is visible again")
                                      : String(localized: "Hidden layers are visible again")
-        let message = String(localized: "You changed something on a layer that was hidden on this device, so it is shown again.")
+        let message = String(localized: "Something changed on a layer that was hidden on this device, so it is shown again.")
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: String(localized: "OK"), style: .default))
         self.alert = alert

@@ -4,7 +4,8 @@ import NibContracts
 import NibDesign
 
 enum LayerGlyph {
-    /// DESIGN.md §8 names no layers glyph; descriptor icon strings resolve through `NibSymbol(systemName:)`.
+    /// DESIGN.md §8 names no layers glyph and NibSymbol has no `.layers` case (contract request: add
+    /// `NibSymbol.layers` = "square.3.layers.3d"); descriptor icon strings resolve through `NibSymbol(systemName:)`.
     static let name = "square.3.layers.3d"
     static var symbol: NibSymbol { NibSymbol(systemName: name) ?? .pages }
 }
@@ -209,6 +210,8 @@ struct LayersPanel: View {
                     .lineLimit(2)
                     .padding(.horizontal, NibSpacing.l)
                     .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget)
+                    // ponytail: NibButton's secondary look (fill3 capsule, button font) drawn by hand, because a Menu
+                    // label cannot be a NibButton (a Button inside a Menu label swallows the tap).
                     .background(NibColor.fill3, in: Capsule())
                     .contentShape(.hoverEffect, Capsule())
                     .hoverEffect(.highlight)
@@ -263,9 +266,9 @@ struct LayerRowView: View {
                         .font(NibFont.glyph(.panel))
                         .foregroundStyle(NibColor.accent)
                         .opacity(row.isActive ? 1 : 0)
-                        .frame(width: 24)
+                        .frame(width: NibSpacing.xxl)
                         .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 1) {
+                    VStack(alignment: .leading, spacing: NibSpacing.xxs) {
                         Text(row.name)
                             .font(row.isActive ? NibFont.bodyEmphasis : NibFont.body)
                             .foregroundStyle(row.isHidden ? NibColor.labelSecondary : NibColor.label)

@@ -81,9 +81,16 @@ enum LayerModel {
         }
     }
 
-    /// Trimmed name; an empty name resets the layer to its default name.
+    /// One line: newlines and control characters become spaces, runs of whitespace collapse to one space and the ends
+    /// are trimmed (names from the AI, plugins and the bridge end up in menu titles and alerts). An empty name resets
+    /// the layer to its default name. Format characters (Cf) are kept, so emoji ZWJ sequences survive.
     static func cleanName(_ raw: String, layer: Int) throws -> String {
-        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var scalars = String.UnicodeScalarView()
+        for scalar in raw.unicodeScalars {
+            let isBreak = CharacterSet.newlines.contains(scalar) || scalar.properties.generalCategory == .control
+            scalars.append(isBreak ? " " : scalar)
+        }
+        let name = String(scalars).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         guard name.count <= maxNameLength else {
             throw NibError.invalid("name is longer than \(maxNameLength) characters", path: "$.name")
         }
@@ -108,11 +115,21 @@ enum LayerModel {
         return out
     }
 
-    /// Layers a changeset wrote live items to in `doc`: what "editing a layer" means for auto-unhide.
+    /// Layers a changeset wrote live items to in `doc`: what "editing a layer" means for auto-unhide. Items on pages
+    /// the changeset creates (or restores) do not count: duplicating, pasting, moving or merging pages copies items
+    /// with their layer, which is not an edit of that layer.
     static func editedLayers(_ cs: Changeset, doc: DocumentID) -> Set<Int> {
+        var newPages = Set<PageID>()
+        for m in cs.mutations {
+            if case let .page(d, before, after) = m, d == doc, !after.deleted, before?.deleted ?? true {
+                newPages.insert(after.id)
+            }
+        }
         var out = Set<Int>()
         for m in cs.mutations {
-            if case let .item(d, _, _, after) = m, d == doc, !after.deleted { out.insert(after.layer) }
+            if case let .item(d, page, _, after) = m, d == doc, !after.deleted, !newPages.contains(page) {
+                out.insert(after.layer)
+            }
         }
         return out
     }
@@ -150,6 +167,18 @@ enum LayerModel {
         p["options"] = .object(options)
         return .object(p)
     }
+
+    /// `render.page` params with `layers` set to this device's visible layers of the page's document, so renders for
+    /// the AI and the bridge of a document no window shows leave hidden layers out too. nil = leave the call unchanged:
+    /// nothing is hidden, the caller chose `layers`, or `page` is not a page ref.
+    static func renderParams(_ params: JSONValue, visible: (DocumentID) -> Set<Int>) -> JSONValue? {
+        guard case .object(var p) = params, p["layers"] == nil || p["layers"] == .null,
+              let ref = p["page"]?.stringValue, case let .page(doc, _)? = NodeRef(ref) else { return nil }
+        let shown = visible(doc)
+        guard shown.count < NibLimits.layerCount else { return nil }
+        p["layers"] = .array(shown.sorted().map { JSONValue.number(Double($0)) })
+        return .object(p)
+    }
 }
 
 struct LayerRow: Identifiable, Equatable {
@@ -181,13 +210,26 @@ enum LayerView {
 
     static func store(_ session: EditorSession, settings: SettingsStore) {
         guard let doc = session.document else { return }
-        settings.set(LayerSettings.view(doc),
-                     LayerViewState(hidden: session.hiddenLayers.sorted(), active: session.activeLayer))
+        store(LayerViewState(hidden: session.hiddenLayers.sorted(), active: session.activeLayer), doc: doc,
+              settings: settings)
     }
 
-    /// Loads the stored view of the session's document (after the window switched documents).
+    /// The default view (nothing hidden, Layer 1 active) removes the document's key instead of writing it, so device
+    /// settings do not keep one key for every document ever touched. `get` returns the default for a missing key.
+    static func store(_ state: LayerViewState, doc: DocumentID, settings: SettingsStore) {
+        if state == LayerViewState() {
+            settings.setJSON(LayerSettings.viewPrefix + doc.raw, nil)
+        } else {
+            settings.set(LayerSettings.view(doc), state)
+        }
+    }
+
+    /// Loads the stored view of the session's document (start, document switches, `layers.show` changes). While
+    /// Layers is off every layer is shown and new content goes to Layer 1, so nothing can stay hidden or out of reach
+    /// without the panel; the stored view is kept and comes back when Layers is turned on again.
     static func apply(_ settings: SettingsStore, to session: EditorSession) {
-        let state = session.document.map { settings.get(LayerSettings.view($0)) } ?? LayerViewState()
+        var state = LayerViewState()
+        if settings.get(LayerSettings.show), let doc = session.document { state = settings.get(LayerSettings.view(doc)) }
         let hidden = Set(state.hidden.filter { LayerModel.all.contains($0) })
         let active = LayerModel.all.contains(state.active) ? state.active : 0
         if session.hiddenLayers != hidden { session.hiddenLayers = hidden }
@@ -203,6 +245,27 @@ enum LayerView {
         session.hiddenLayers = hidden
         store(session, settings: settings)
         return true
+    }
+
+    /// Auto-unhide for a document without a window that applies its view (none shows it, or Layers is off): shows
+    /// `layers` again in its stored view, so new content on them is not hidden when the document is next shown.
+    static func reveal(_ layers: Set<Int>, doc: DocumentID, settings: SettingsStore) {
+        guard !layers.isEmpty else { return }
+        var state = settings.get(LayerSettings.view(doc))
+        let hidden = state.hidden.filter { !layers.contains($0) }
+        guard hidden.count != state.hidden.count else { return }
+        state.hidden = hidden
+        store(state, doc: doc, settings: settings)
+    }
+
+    /// Changing the layer view while Layers is off (the AI, a plugin or the bridge; the UI offers it only while on)
+    /// turns `layers.show` on first, through `settings.set` so the caller needs the same permission, and loads the
+    /// document's stored view: a hidden layer or another active layer is never in effect without the panel to see it.
+    static func ensureShown(_ ctx: CommandContext, session: EditorSession) async throws {
+        let settings = ctx.services.settings
+        guard !settings.get(LayerSettings.show) else { return }
+        _ = try await ctx.execute(CommandIDs.settingsSet, ["name": .string(LayerSettings.show.name), "value": .bool(true)])
+        apply(settings, to: session)   // the runtime does this for every window too; this covers hosts without it
     }
 
     /// Layers of `doc` shown on this device: an open window's view wins (the caller's first), else the stored view.
@@ -235,13 +298,20 @@ struct LayerSetActive: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "layer.setActive", title: "Set Active Layer",
-        summary: "Choose the layer (0-4) that new ink, shapes and text go to in the current notebook or whiteboard window.",
+        summary: "Choose the layer (0-4) that new ink, shapes and text go to in the current notebook or whiteboard window. Turns the layers.show setting on if it is off.",
         params: .obj(["layer": layerSchema], required: ["layer"]),
         examples: [["layer": 1]], effect: .session)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> LayerViewOutput {
         try LayerModel.check(p.layer, path: "$.layer")
         let (session, doc) = try LayerView.target(ctx)
+        // A preview (dry run) changes nothing: not the window, not the Layers setting.
+        guard !ctx.dryRun else {
+            var out = LayerView.output(session, doc: doc)
+            out.activeLayer = p.layer
+            return out
+        }
+        try await LayerView.ensureShown(ctx, session: session)
         if session.activeLayer != p.layer {
             session.activeLayer = p.layer
             LayerView.store(session, settings: ctx.services.settings)
@@ -257,13 +327,21 @@ struct LayerSetVisible: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "layer.setVisible", title: "Show or Hide Layer",
-        summary: "Show or hide a layer (0-4) on this device only; hidden layers are not drawn or exported. The document is unchanged.",
+        summary: "Show or hide a layer (0-4) on this device only; hidden layers are not drawn or exported. Turns the layers.show setting on if it is off.",
         params: .obj(["layer": layerSchema, "visible": .bool()], required: ["layer", "visible"]),
         examples: [["layer": 1, "visible": false]], effect: .session)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> LayerViewOutput {
         try LayerModel.check(p.layer, path: "$.layer")
         let (session, doc) = try LayerView.target(ctx)
+        guard !ctx.dryRun else {
+            var out = LayerView.output(session, doc: doc)
+            var hidden = Set(out.hiddenLayers)
+            if p.visible { hidden.remove(p.layer) } else { hidden.insert(p.layer) }
+            out.hiddenLayers = hidden.sorted()
+            return out
+        }
+        try await LayerView.ensureShown(ctx, session: session)
         let changed = LayerView.setVisible(p.visible, layer: p.layer, session: session, settings: ctx.services.settings)
         // Selected items on a layer that just disappeared would keep invisible handles.
         if changed, !p.visible, !session.selection.isEmpty, let page = session.selection.page ?? session.page,
@@ -378,29 +456,38 @@ struct LayerMoveItems: NibCommand {
     }
 }
 
-/// Command hook on `export.run` (registered in `app.bus.hooks`): exports include only the layers visible on this
-/// device. ponytail: an id beyond §6.5's four because hooks must be `read` commands; reported as a contract gap.
+/// Command hook on `export.run` and `render.page` (registered in `app.bus.hooks`): exports and renders include only
+/// the layers visible on this device, also for documents no window shows. Off while `layers.show` is off (every layer
+/// is shown then). ponytail: an id beyond §6.5's four because hooks must be `read` commands; reported as a contract gap.
 struct LayerExportOptions: NibCommand {
     struct Params: Codable {
         var command: String?
         var params: JSONValue?
     }
+    static let hooked = [CommandIDs.exportRun, CommandIDs.renderPage]
     static let example: JSONValue = ["command": "export.run",
                                      "params": ["docs": ["doc:FIXTUREDOC01"], "format": "pdf"]]
     static let descriptor = CommandDescriptor(
         id: "layer.exportOptions", title: "Export Visible Layers",
-        summary: "Hook for export.run: adds options.visibleLayers {docID: [layers]} so layers hidden on this device are not exported.",
-        params: .obj(["command": .str(), "params": .anything("the export.run params")], required: ["command"]),
+        summary: "Hook for export.run and render.page: adds options.visibleLayers {docID: [layers]} or layers, so layers hidden on this device are left out.",
+        params: .obj(["command": .str(), "params": .anything("the export.run or render.page params")], required: ["command"]),
         examples: [example], effect: .read, target: .app)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> JSONValue {
         let sessions = ctx.services.sessions
         let settings = ctx.services.settings
         let caller = ctx.session
-        guard p.command == CommandIDs.exportRun, let params = p.params,
-              let changed = LayerModel.exportParams(params, visible: { doc in
-                  LayerView.visibleLayers(doc, sessions: sessions, settings: settings, preferring: caller)
-              }) else { return [:] }
+        guard settings.get(LayerSettings.show), let params = p.params else { return [:] }
+        let visible = { (doc: DocumentID) -> Set<Int> in
+            LayerView.visibleLayers(doc, sessions: sessions, settings: settings, preferring: caller)
+        }
+        let changed: JSONValue?
+        switch p.command ?? "" {
+        case CommandIDs.exportRun: changed = LayerModel.exportParams(params, visible: visible)
+        case CommandIDs.renderPage: changed = LayerModel.renderParams(params, visible: visible)
+        default: changed = nil
+        }
+        guard let changed else { return [:] }
         return ["params": changed]
     }
 }
