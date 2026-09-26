@@ -1,0 +1,47 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatZoomWindow/ZoomWindowController.swift:122-133 (stateChanged)",
+      "problem": "Every box move (auto-advance, New Line, drag, zoom slider) calls writing?.dropWet(Int.max), which clears all wet strokes from the pane straight away. The replacement render only arrives after the 40 ms debounce plus render time. Until then the pane shows the previous paper image shifted to the new box, and that image was rendered before the latest commits. On each auto-advance the stroke that triggered it sits at 75-100 % of the old box, which is 25-50 % of the new box. It was committed moments earlier and is in neither layer, so the word the user just wrote blinks out on every advance. On New Line the same happens wherever the return height is smaller than the box height. This breaks ARCHITECTURE.md §8.1: a wet stroke is removed only after its dry ink is on screen, and nothing flickers. The ponytail comment says only a move mid-commit shows this, but it happens on every move.",
+      "fix": "Drop all wet strokes only when the page changes (shownPage != state.page). On a rect-only change, keep them. The pane's PKCanvasView content coordinates are page points, so after the new contentOffset/zoomScale the wet strokes stay aligned. Also keep `landed` as it is so the next render's dropWet(drop) removes them once their dry ink is in the image. Make the writing view reachable from tests (for example an internal `wetCount` on the controller) and add a test that a zoom.setBox rect change leaves the wet stroke count unchanged."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatZoomWindow/ZoomWindowController.swift:255-257 (strokeFinished) and ZoomBoxOverlay.swift:169-172 (isVisible)",
+      "problem": "If the box's page is deleted while the pane is open (page navigator, undo, AI, sync or a collaborator), the pane stays visible and writable. The strokeFinished guard (pageRecord == nil) then drops every new stroke without telling the user, and the wet ink stays on screen as if it were saved until the box next moves. This loses ink without a warning.",
+      "fix": "Make isVisible require controller.pageRecord != nil so the pane and box hide. In committed(_:), when the state's page is now deleted, run zoom.toggle {on:false} (or re-home the box on session.page). When the strokeFinished guard fails, drop that wet stroke and post .nibCommandFailed so the user sees the stroke was not saved."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatZoomWindow/ZoomWindowController.swift:157-168 (ensurePane) and 108-117 (layout)",
+      "problem": "container.addSubview puts the pane (nibGlass Deep) above everything in the canvas's superview, including the window's droplet chrome. On an 11-inch iPad in landscape, the left-docked, vertically centred palette (about 469 pt) runs below the pane's top edge (about 558 pt). The pane then covers the lower tools and their buds, puts glass on glass, and hides the bottom-right page HUD. Compactness is also decided by width < 600, so iPhone landscape (width 852) uses the 16 pt inset instead of canvasBottomInsetCompact and sits on the bottom palette.",
+      "fix": "Use container.insertSubview(h.view, aboveSubview: canvas) so chrome and popovers stay above the pane. Decide the iPhone inset from traitCollection.userInterfaceIdiom == .phone (or the vertical size class), not from width."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatZoomWindow/ZoomWindowController.swift:237 (configureWriting) and 566-568 (ZoomWritingView.configure)",
+      "problem": "When stylusMode is .pencilOnly (the default), the pane's PKCanvasView and eraser accept only Pencil touches. An iPhone has no Pencil, so the Zoom Window cannot be written in on iPhone with default settings. The spec requires iPhone support, and the pane is the main writing aid on a small screen. Scrolling is disabled in the pane, so allowing fingers there does not conflict with panning.",
+      "fix": "Map .pencilOnly to PKCanvasViewDrawingPolicy.default. It stays Pencil-only when a Pencil is paired and prefersPencilOnlyDrawing is set, and allows fingers otherwise. Derive the eraser's allowedTouchTypes the same way, for example add .direct when !UIPencilInteraction.prefersPencilOnlyDrawing. Change the writing-area hint so it no longer says 'Write with Apple Pencil' when fingers draw."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatZoomWindow/ZoomBoxOverlay.swift:264-270, 326-337; ZoomWindowController.swift:443",
+      "problem": "The on-page box does not follow DESIGN.md §14.3 and §15.6. The spec asks for a `frame` droplet: rim and outline only, no body, draggable with stretch. The box is instead filled with NibUIColor.accentWash, so a tinted body sits over the ink being written, and it is fully rigid. The handles and lines are hand-rolled with literal sizes (diameter 12, lineWidth 1.5, 1 pt lines, slider maxWidth 280, pane height 240), and no contract request was filed for the missing tokens or the missing UIKit frame droplet.",
+      "fix": "Set box.backgroundColor = .clear so only the rim and outline are drawn. Take the handle diameter, outline width and pane height from NibMetrics, or file docs/contract-requests/F038-zoom-frame.md for them and for a UIKit `frame`/`handle` droplet, and reference that request in a ponytail comment on the literals."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatZoomWindow/ZoomWindowController.swift:267-279 (erase), 626-640 (ZoomWritingView.erasing)",
+      "problem": "The pane eraser does not match the eraser tool. It reads the mode from session.toolOptions[\"eraser\"][\"mode\"], but F010 keeps the mode in the `eraser.mode` setting, so the pane always uses standard mode. It ignores the eraser size (fixed 8 pt) and the filter chips. It shows no preview and erases only on lift. The UIPanGestureRecognizer only starts after its movement threshold, so the start of the path is lost and a tap erases nothing.",
+      "fix": "Read `eraser.mode`, `eraser.size` (screen-point diameter, so radius = size / 2 / magnification) and the `eraser.filter.*` keys untyped through app.settings.json, as the pen style already is. Capture the path with an immediate-began recogniser (a UILongPressGestureRecognizer with minimumPressDuration 0) and draw a preview circle. Move the pane-to-page point mapping into ZoomGeometry and unit-test it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatZoomWindow/ZoomWindowController.swift:281-320 (committed / scheduleRender)",
+      "problem": "Once the pane has been opened and then closed, `writing` still exists and state.page stays set. Every commit on that page inside the old box region then triggers an off-screen render of the hidden pane at 3x the screen scale, which is wasted work on every stroke. Separately, `landed` adds cs.summary(for: doc).created.count, which counts every user-created item in the document. That includes strokes written on the main canvas on the same page, so pane wet strokes can be dropped before their dry render and blink.",
+      "fix": "In scheduleRender and committed, return early unless state.isOn and the pane is showing (hosting?.view.isHidden == false). Count only created items on page pid, or better, count this pane's own commitStroke calls, and cap `landed` by the number of those commits that have landed."
+    }
+  ]
+}
