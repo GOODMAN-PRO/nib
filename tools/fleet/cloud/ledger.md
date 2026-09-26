@@ -31,9 +31,21 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - F052 FIX: HOLD until contracts-v2 on main (HUD overlay, playback bar, live toolbar state, typed events), then FIX with the review (3 majors incl. audio.delete path traversal).
 
 ## Contracts-v2 landed (session 2026-09-26)
-- v2/contracts green (run 36224576545); merged to main as 1741651; main CI 36225011717 pending -> marker/contracts-v2.
+- v2/contracts green (run 36224576545); merged to main as 1741651; main CI 36225011717 GREEN -> marker/contracts-v2 = 1741651. Main is merged into feat/* by each V2ADOPT job (saves ~35 CI runs vs a blanket merge).
 - 368 gaps: 220 resolved, 67 rejected, 81 deferred; see docs/CONTRACTS.md changelog.
 - v2/spec agent: catalogue rows + unbuilt-feature spec edits (F066 layers export, F007 roll key, etc.)
 - IMPLEMENT launched: F002 F006 F013 F021 F023 F091 F102 F103; CI: F031; F052 FIX held -> launch now that v2 is on main (after spec).
 - TODO after main CI green: merge main into all feat/* branches (only those not being worked on by an agent; agents merge it themselves).
 - contract gap (minor): ChromeOverlayDescriptor has no 'instant/no-motion' show option (F062 K key, DESIGN §9.3). Custom sound token missing (F062 uses system sound 1005).
+- No PRs for feat/* or v2/* branches: ios.yml also triggers on pull_request, so a PR per branch would double the macOS CI load. Integration merges branches directly. Marker branches point at main commits (no diff).
+- contract gap: docked assistant side/width for reservedTrailing (F016); per-tool disabled/on appearance in NibToolPalette.
+- Mockup v2 merged to main (9e7dfb4) and REPUBLISHED to https://claude.ai/artifact/XQKSP4QSMTHuwFZRPxTLMm (version 1790407236-34b6). Publish copy = design/mockup.html with skeleton adaptations (title 'Nib Clear Water', :root light tokens, body bg, theme detection keeps data-theme, no doctype/head/body tags).
+- Spec v2 merged to main (f7da15b). Follow-ups for fix/V2ADOPT passes:
+  - F030: shape.recognize must return wrapped {shape: ShapeItem?, confidence?, mergeWith?: [ref]} (F007 accepts both; F009 already does).
+  - F009: preview curves use control points (F030/F031 convention).
+  - F046: register outline.list {doc, source?} (read).
+  - F014: register clipboard.copyText {text?, url?} (read) (F037 needs it).
+  - F041: if moved to a G26 closure hook, remove layer.exportOptions row in the same change.
+  - F036: restore drop-to-attach (running).
+  - NibContracts (v2/contracts2): PanelIDs.studyLearn -> studysession.smartLearn + practice; CommandIDs constants for new ids.
+- F074 (unbuilt) must parse nib://bridge/pair?host=&port=&token= (port param added by F091). Add to F074 spec before its build.
