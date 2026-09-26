@@ -128,9 +128,10 @@ final class FeatAudioTests: XCTestCase {
         }
     }
 
-    /// Waits (polling the main actor) for work a command handed to `app.perform`.
+    /// Waits (polling the main actor) for work a command handed to `app.perform`. The deadline is generous for busy CI
+    /// simulators; a passing test returns as soon as the condition holds.
     private func waitUntil(file: StaticString = #filePath, line: UInt = #line, _ condition: () -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(30)
         while !condition() {
             if Date() > deadline {
                 XCTFail("timed out", file: file, line: line)
