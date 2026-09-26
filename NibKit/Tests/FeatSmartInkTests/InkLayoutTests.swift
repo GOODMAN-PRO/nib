@@ -469,51 +469,69 @@ final class InkLayoutTests: XCTestCase {
 
     // MARK: Word edits
 
-    func testClosingTheHoleOfARemovedWord() throws {
+    /// Delete or cut a word: the column reflows as if it were gone, read with its paragraphs as written, so the hole
+    /// never turns into an indent; the removed word itself does not move.
+    func testReflowWithoutAWordFlowsAsIfItWereGone() {
         let s = Synth.paragraph()
         let layout = InkLayout.analyze(s.glyphs)
-        // A word inside a line: the rest of the line moves left into its place.
-        let inside = try XCTUnwrap(layout.closingHole(line: 1, word: 0))
-        XCTAssertEqual(Set(inside.ids), Set(s.words[5] + s.words[6] + s.words[7]))
-        XCTAssertPoint(inside.by, Point(-32, 0))
-        // The last word of a line leaves nothing to close.
-        XCTAssertNil(layout.closingHole(line: 0, word: 3))
+        let gone = Set(s.words[4])   // the first word of line 2
+        let result = layout.reflow(width: 154, left: 72, without: gone)
+        XCTAssertTrue(gone.allSatisfy { result.moves[$0] == nil })
+        let rest = s.moved(result.moves).filter { !gone.contains($0.id) }
+        let again = InkLayout.analyze(rest)
+        var expected = s.words
+        expected.remove(at: 4)
+        XCTAssertEqual(again.words.map { $0.ids }, expected)
+        XCTAssertEqual(again.lines.map { $0.startsParagraph }, [true, false, false])
+        for line in again.lines { XCTAssertEqual(line.box.minX, 72, accuracy: 0.01) }
 
-        // A word alone on its line: the lines below move up one line.
+        // A word alone on its line: the lines below close up, and a blank line after it stays.
         var t = Synth()
         t.line([3, 3], y: 100)
         t.line([4], y: 130)
         t.line([3, 3], y: 160)
+        t.line([3], y: 220)
         let lone = InkLayout.analyze(t.glyphs)
-        let up = try XCTUnwrap(lone.closingHole(line: 1, word: 0))
-        XCTAssertEqual(Set(up.ids), Set(t.words[3] + t.words[4]))
-        XCTAssertPoint(up.by, Point(0, -30))
-        XCTAssertNil(lone.closingHole(line: 2, word: 1), "the last word of a line leaves nothing to close")
-
-        // Before a blank line, the lines below move up by no more than the lone line's own line: the blank stays.
-        var u = Synth()
-        u.line([3, 3], y: 100)
-        u.line([3, 3], y: 130)
-        u.line([4], y: 160)
-        u.line([3], y: 220)
-        let beforeBlank = InkLayout.analyze(u.glyphs)
-        XCTAssertEqual(beforeBlank.lines.map { $0.startsParagraph }, [true, false, false, true])
-        let kept = try XCTUnwrap(beforeBlank.closingHole(line: 2, word: 0))
-        XCTAssertEqual(Set(kept.ids), Set(u.words[5]))
-        XCTAssertPoint(kept.by, Point(0, -30))
+        XCTAssertEqual(lone.lines.map { $0.startsParagraph }, [true, false, false, true])
+        let closed = lone.reflow(width: lone.box.width, without: Set(t.words[2]))
+        XCTAssertPoint(closed.moves[t.words[3][0]], Point(0, -30))
+        XCTAssertPoint(closed.moves[t.words[4][0]], Point(0, -30))
+        XCTAssertPoint(closed.moves[t.words[5][0]], Point(0, -30))   // the blank line above it is kept
+        XCTAssertEqual(closed.lineCount, 3)
     }
 
-    func testRoomForPastedWords() {
+    /// Paste After Word: the pasted handwriting (two lines of its own) flows in as one run right after the word, and
+    /// the column reflows around it with nothing overlapping.
+    func testReflowInsertsWordsAfterAWord() {
         let s = Synth.paragraph()
         let layout = InkLayout.analyze(s.glyphs)
-        // After the first word of line 1 (72…100): pasted ink starts one gap later, the rest of the line moves right.
-        let room = layout.room(after: 0, word: 0, width: 40)
-        XCTAssertPoint(room.at, Point(100 + 14, layout.lines[0].centerY(at: 114)))
-        XCTAssertEqual(Set(room.ids), Set(s.words[1] + s.words[2] + s.words[3]))
-        XCTAssertPoint(room.by, Point(114 + 40 + 14 - 114, 0))
-        // At the end of a line nothing moves.
-        let end = layout.room(after: 0, word: 3, width: 40)
-        XCTAssertTrue(end.ids.isEmpty)
-        XCTAssertEqual(end.by, .zero)
+        var clip = Synth()
+        clip.line([2], x: 400, y: 500)
+        clip.line([3], x: 400, y: 530)
+        let pasted = clip.strokes.map { (id: NibID("PASTED" + $0.id.raw), points: $0.points) }
+        let own = InkLayout.analyze(pasted.map { InkGlyph(id: $0.id, points: $0.points) })
+        XCTAssertEqual(own.lines.count, 2)
+        let insertion = layout.insertion(of: own, after: s.words[1][0])
+        XCTAssertEqual(insertion.words.map { $0.ids.count }, [2, 3])
+
+        let result = layout.reflow(width: 154, left: 72, insertion: insertion)
+        let moved = s.moved(result.moves) + pasted.map { g in
+            InkGlyph(id: g.id, points: g.points.map { $0 + (result.moves[g.id] ?? .zero) })
+        }
+        let again = InkLayout.analyze(moved)
+        var expected = s.words
+        expected.insert(contentsOf: [pasted[0...1].map { $0.id }, pasted[2...4].map { $0.id }], at: 2)
+        XCTAssertEqual(again.words.map { $0.ids }, expected)
+        XCTAssertEqual(again.lines.count, 3)
+        for line in again.lines {
+            XCTAssertEqual(line.box.minX, 72, accuracy: 0.01)
+            XCTAssertLessThanOrEqual(line.box.maxX, 226.5)
+            for (a, b) in zip(line.words, line.words.dropFirst()) { XCTAssertGreaterThan(b.box.minX, a.box.maxX) }
+        }
+        // Where the paste lands first: one gap after the word, on its centre line.
+        XCTAssertPoint(layout.insertionPoint(after: 0, word: 1), Point(142 + 14, layout.lines[0].centerY(at: 156)))
+        // Without a word to follow, the pasted words go to the end of the column.
+        let atEnd = layout.reflow(width: 154, insertion: layout.insertion(of: own, after: nil))
+        XCTAssertEqual(atEnd.moves[pasted[0].id]?.y ?? 0, 160 - 500, accuracy: 1.5)
     }
 }

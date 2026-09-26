@@ -480,24 +480,58 @@ struct InkLayout: Equatable {
         var lineCount: Int
     }
 
+    /// Handwriting flowed in after a word (Paste After Word): its words in this layout's frame, in reading order, with
+    /// the height of each word's own centre line.
+    struct Insertion: Equatable {
+        var words: [InkWord]
+        var centres: [Double]
+        /// A stroke of the word they follow; nil (or not found) = the end of the last column.
+        var after: ElementID?
+    }
+
+    /// Another layout's words (pasted handwriting, analysed on its own) in this layout's frame, in reading order: one
+    /// run of words, whatever lines they were on.
+    func insertion(of other: InkLayout, after: ElementID?) -> Insertion {
+        var words: [InkWord] = []
+        var centres: [Double] = []
+        for line in other.lines {
+            for word in line.words {
+                var placed = word
+                placed.box = Rect.bounding(other.pageCorners(word.box).map { toLayout($0) }) ?? word.box
+                words.append(placed)
+                centres.append(toLayout(other.toPage(Point(word.box.midX, line.centerY(at: word.box.midX)))).y)
+            }
+        }
+        return Insertion(words: words, centres: centres, after: after)
+    }
+
     /// Lays every column out again `width` wide, keeping paragraphs, list items, indents and paragraph spacing. Each
     /// column keeps its top and its own left edge; `left` (layout frame, the whole layout's left edge; default: where
-    /// it is) shifts every column by the same amount. `joinParagraphs` flows each column as one paragraph. Words are
-    /// only translated.
-    func reflow(width: Double, left: Double? = nil, joinParagraphs: Bool = false) -> Reflow {
+    /// it is) shifts every column by the same amount. `joinParagraphs` flows each column as one paragraph. Words with
+    /// a stroke in `without` are left out (the rest flows as if they were gone; they do not move), and `insertion`
+    /// flows in after its word. Words are only translated.
+    func reflow(width: Double, left: Double? = nil, joinParagraphs: Bool = false, without: Set<ElementID> = [],
+                insertion: Insertion? = nil) -> Reflow {
         let dx = (left ?? box.minX) - box.minX
+        var into: Int?
+        if insertion != nil {
+            let line = insertion?.after.flatMap { a in lines.firstIndex { $0.ids.contains(a) } }
+            into = line.flatMap { column(ofLine: $0) } ?? (columns.isEmpty ? nil : columns.count - 1)
+        }
         var moves: [ElementID: Point] = [:]
         var count = 0
         for c in columns.indices {
-            let r = reflow(column: c, width: width, left: columns[c].box.minX + dx, joinParagraphs: joinParagraphs)
+            let r = reflow(column: c, width: width, left: columns[c].box.minX + dx, joinParagraphs: joinParagraphs,
+                           without: without, insertion: c == into ? insertion : nil)
             moves.merge(r.moves) { a, _ in a }
             count += r.lineCount
         }
         return Reflow(moves: moves, lineCount: count)
     }
 
-    /// Lays one column out again `width` wide with its left edge at layout x `left`.
-    func reflow(column c: Int, width: Double, left: Double, joinParagraphs: Bool = false) -> Reflow {
+    /// Lays one column out again `width` wide with its left edge at layout x `left` (see `reflow(width:…)`).
+    func reflow(column c: Int, width: Double, left: Double, joinParagraphs: Bool = false, without: Set<ElementID> = [],
+                insertion: Insertion? = nil) -> Reflow {
         guard columns.indices.contains(c) else { return Reflow(moves: [:], lineCount: 0) }
         let range = columns[c].lines
         let origin = columns[c].box.minX
@@ -512,12 +546,32 @@ struct InkLayout: Equatable {
                 paragraphs[paragraphs.count - 1].append(i)
             }
         }
+        let isGone: (InkWord) -> Bool = { word in word.ids.contains { without.contains($0) } }
+        var inserted = insertion == nil
         var moves: [ElementID: Point] = [:]
         var y = lines[range.lowerBound].center
         var count = 0
+        var placedAny = false
         for (pi, paragraph) in paragraphs.enumerated() {
             let first = lines[paragraph[0]]
-            let isList = first.isListItem && first.words.count > 1
+            // What this paragraph holds now: its words less the removed ones, with the insertion after its word. The
+            // paragraph's shape (indents, list marker, spacing) is read from the lines as written.
+            var flow: [(word: InkWord, centre: Double)] = []
+            for li in paragraph {
+                for word in lines[li].words {
+                    if !isGone(word) { flow.append((word: word, centre: lines[li].centerY(at: word.box.midX))) }
+                    if !inserted, let ins = insertion, let a = ins.after, word.ids.contains(a) {
+                        flow += zip(ins.words, ins.centres).map { (word: $0, centre: $1) }
+                        inserted = true
+                    }
+                }
+            }
+            if !inserted, pi == paragraphs.count - 1, let ins = insertion {
+                flow += zip(ins.words, ins.centres).map { (word: $0, centre: $1) }
+                inserted = true
+            }
+            guard !flow.isEmpty else { continue }
+            let isList = first.isListItem && first.words.count > 1 && !isGone(first.words[0])
             var firstIndent = max(0, first.box.minX - origin)
             var hangIndent = 0.0
             if isList {
@@ -537,33 +591,32 @@ struct InkLayout: Equatable {
             // Never closer than 0.9 x-height, so the moved words are still separate words when analysed again.
             let gap = max(gaps.isEmpty ? wordGap : InkLayout.median(gaps),
                           0.9 * InkLayout.median(paragraph.map { lines[$0].xHeight }))
-            if pi > 0 {
+            if placedAny {
                 let extra = max(0, first.center - lines[paragraph[0] - 1].center - pitch)
                 y += pitch + extra
             }
             var x = l + firstIndent
             var lineHasWord = false
             count += 1
-            for (k, li) in paragraph.enumerated() {
-                for (j, word) in lines[li].words.enumerated() {
-                    if lineHasWord {
-                        if x + gap + word.box.width > r + 0.5 {
-                            y += pitch
-                            x = l + hangIndent
-                            lineHasWord = false
-                            count += 1
-                        } else {
-                            x += gap
-                        }
+            for (k, item) in flow.enumerated() {
+                let word = item.word
+                if lineHasWord {
+                    if x + gap + word.box.width > r + 0.5 {
+                        y += pitch
+                        x = l + hangIndent
+                        lineHasWord = false
+                        count += 1
+                    } else {
+                        x += gap
                     }
-                    let shift = Point(x - word.box.minX, y - lines[li].centerY(at: word.box.midX))
-                    let v = pageVector(shift)
-                    for id in word.ids { moves[id] = v }
-                    x += word.box.width
-                    lineHasWord = true
-                    if isList && k == 0 && j == 0 { x = max(x, l + hangIndent - gap) }
                 }
+                let v = pageVector(Point(x - word.box.minX, y - item.centre))
+                for id in word.ids { moves[id] = v }
+                x += word.box.width
+                lineHasWord = true
+                if isList && k == 0 { x = max(x, l + hangIndent - gap) }
             }
+            placedAny = true
         }
         return Reflow(moves: moves.filter { abs($0.value.x) > 0.005 || abs($0.value.y) > 0.005 }, lineCount: count)
     }
@@ -667,38 +720,10 @@ struct InkLayout: Equatable {
         return lines[li].words.isEmpty ? nil : (li, lines[li].words.count - 1)
     }
 
-    /// Stroke ids of the words after a word on its line.
-    func idsAfter(line li: Int, word wi: Int) -> [ElementID] {
-        lines[li].words.dropFirst(wi + 1).flatMap { $0.ids }
-    }
-
-    /// Closes the hole a removed word leaves, before its column reflows (so the analysis never mistakes the hole for
-    /// an indent or a blank line): the words after it on its line move left into its place, or, when it was alone on
-    /// its line, the column's lines below move up by one line (no more than the space it held, so paragraph spacing
-    /// stays). One page displacement for all the ids; nil when nothing needs to move.
-    func closingHole(line li: Int, word wi: Int) -> (ids: [ElementID], by: Point)? {
-        let line = lines[li]
-        if wi + 1 < line.words.count {
-            let dx = line.words[wi].box.minX - line.words[wi + 1].box.minX
-            return (idsAfter(line: li, word: wi), pageVector(Point(dx, 0)))
-        }
-        guard line.words.count == 1, let c = column(ofLine: li), li + 1 < columns[c].lines.upperBound else { return nil }
-        var dy = lines[li + 1].center - line.center
-        if li > columns[c].lines.lowerBound { dy = min(dy, line.center - lines[li - 1].center) }
-        return (((li + 1)..<columns[c].lines.upperBound).flatMap { lines[$0].ids }, pageVector(Point(0, -dy)))
-    }
-
-    /// Room for `width` points of handwriting pasted after a word: the page point where the pasted ink's left edge
-    /// and centre go, and how far (page displacement) the words after it on its line move right to make room, so
-    /// nothing overlaps and reading order puts the pasted words right after the word.
-    func room(after li: Int, word wi: Int, width: Double) -> (at: Point, ids: [ElementID], by: Point) {
-        let line = lines[li]
-        let gap = max(wordGap, xHeight)
-        let x = line.words[wi].box.maxX + gap
-        let at = toPage(Point(x, line.centerY(at: x)))
-        guard wi + 1 < line.words.count else { return (at, [], .zero) }
-        let push = max(0, x + max(width, 0) + gap - line.words[wi + 1].box.minX)
-        return (at, idsAfter(line: li, word: wi), push > 0 ? pageVector(Point(push, 0)) : .zero)
+    /// Where handwriting pasted after a word lands first (page): one word gap after it, on its centre line.
+    func insertionPoint(after li: Int, word wi: Int) -> Point {
+        let x = lines[li].words[wi].box.maxX + max(wordGap, xHeight)
+        return toPage(Point(x, lines[li].centerY(at: x)))
     }
 
     // MARK: Recognition hints

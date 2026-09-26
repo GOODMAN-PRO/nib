@@ -22,14 +22,14 @@ enum Handwriting {
     static func isHandwriting(_ item: Item) -> Bool { !item.locked && InkGlyph(item: item) != nil }
 
     /// Groups item refs by page and keeps their handwriting. Throws for malformed or missing refs, and when no
-    /// handwriting is left at all.
-    static func targets(_ refs: [String], workspace: Workspace) throws -> [Target] {
-        guard !refs.isEmpty else { throw NibError.invalid("refs is empty", path: "$.refs") }
+    /// handwriting is left at all (`path`: the parameter the refs came from).
+    static func targets(_ refs: [String], workspace: Workspace, path: String = "$.refs") throws -> [Target] {
+        guard !refs.isEmpty else { throw NibError.invalid("\(path.dropFirst(2)) is empty", path: path) }
         var order: [NodeRef] = []
         var wanted: [NodeRef: [ElementID]] = [:]
         for (i, ref) in refs.enumerated() {
             guard case let .item(doc, page, id)? = NodeRef(ref) else {
-                throw NibError(.invalidParams, "'\(ref)' is not an item ref", path: "$.refs[\(i)]",
+                throw NibError(.invalidParams, "'\(ref)' is not an item ref", path: "\(path)[\(i)]",
                                hint: "pass stroke refs such as item:D/P/I (query.find {in: page, kinds: [\"stroke\"]})")
             }
             let key = NodeRef.page(doc, page)
@@ -51,7 +51,7 @@ enum Handwriting {
             if !items.isEmpty { out.append(Target(doc: doc, page: page, items: items)) }
         }
         guard !out.isEmpty else {
-            throw NibError(.invalidParams, "refs contain no handwriting (pen or pencil strokes)", path: "$.refs",
+            throw NibError(.invalidParams, "\(path.dropFirst(2)) contain no handwriting (pen or pencil strokes)", path: path,
                            hint: "select strokes with query.find {in: page, kinds: [\"stroke\"]}")
         }
         return out
@@ -112,6 +112,18 @@ enum Handwriting {
             }
             return n
         }
+    }
+
+    /// Element ids of item refs (any page), for parameters that only name strokes.
+    static func ids(_ refs: [String], path: String) throws -> Set<ElementID> {
+        var out = Set<ElementID>()
+        for (i, ref) in refs.enumerated() {
+            guard case let .item(_, _, id)? = NodeRef(ref) else {
+                throw NibError(.invalidParams, "'\(ref)' is not an item ref", path: "\(path)[\(i)]")
+            }
+            out.insert(id)
+        }
+        return out
     }
 
     static func translations(_ moves: [ElementID: Point]) -> [ElementID: Affine] {
@@ -239,6 +251,9 @@ struct HandwritingReflow: NibCommand {
         var width: Double
         var left: Double?
         var joinParagraphs: Bool?
+        var without: [String]?
+        var insert: [String]?
+        var after: String?
     }
 
     struct Output: Codable {
@@ -250,12 +265,15 @@ struct HandwritingReflow: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "handwriting.reflow", title: "Reflow Handwriting",
-        summary: "Reflow handwriting into columns of a new width by moving whole words (strokes are only translated; paragraphs, lists and indents are kept). Side-by-side columns reflow separately, each keeping its own left edge and top.",
+        summary: "Reflow handwriting to a new column width by moving whole words (paragraphs, lists and indents kept). Side-by-side columns reflow separately; words can be left out or flowed in.",
         params: .obj(["refs": SmartInkSchema.refs,
                       "width": .num("column width in page points", min: 1, max: SmartInkSchema.coordinateLimit),
                       "left": .num("page x of the left edge (default: where it is now); every column moves by the same amount",
                                    min: -SmartInkSchema.coordinateLimit, max: SmartInkSchema.coordinateLimit),
-                      "joinParagraphs": .bool("true = flow each column as one paragraph, ignoring paragraph breaks")],
+                      "joinParagraphs": .bool("true = flow each column as one paragraph, ignoring paragraph breaks"),
+                      "without": .arr(.ref, "strokes of refs to leave out: the rest flows as if their words were gone and they stay put (reflow, then delete them)"),
+                      "insert": .arr(.ref, "other strokes on the same page to flow in as words after `after` (one run of words, whatever their layout)"),
+                      "after": .str("a stroke ref (item:D/P/I) from refs: the inserted words follow its word (default: the end of the column)")],
                      required: ["refs", "width"]),
         examples: [["refs": [SmartInkSchema.strokeRef], "width": 240]],
         effect: .edit)
@@ -267,15 +285,47 @@ struct HandwritingReflow: NibCommand {
         if let left = p.left, !(left.isFinite && abs(left) <= SmartInkSchema.coordinateLimit) {
             throw NibError.invalid("left must be a page x within ±\(Int(SmartInkSchema.coordinateLimit))", path: "$.left")
         }
+        let without = try Handwriting.ids(p.without ?? [], path: "$.without")
+        var insert: Handwriting.Target?
+        if let refs = p.insert, !refs.isEmpty {
+            let found = try Handwriting.targets(refs, workspace: ctx.workspace, path: "$.insert")
+            guard found.count == 1 else { throw NibError.invalid("insert strokes must all be on one page", path: "$.insert") }
+            insert = found[0]
+        }
+        var after: ElementID?
+        if let ref = p.after, insert != nil {
+            guard case let .item(_, _, id)? = NodeRef(ref) else {
+                throw NibError(.invalidParams, "'\(ref)' is not an item ref", path: "$.after")
+            }
+            after = id
+        }
+        let inserted = Set(insert?.items.map { $0.id } ?? [])
         var plans: [(target: Handwriting.Target, transforms: [ElementID: Affine])] = []
         var lines = 0
-        for target in try Handwriting.targets(p.refs, workspace: ctx.workspace) {
+        var placed = false
+        for var target in try Handwriting.targets(p.refs, workspace: ctx.workspace) {
+            target.items.removeAll { inserted.contains($0.id) }
+            guard !target.items.isEmpty else { continue }
             let layout = await Handwriting.layout(target, ctx: ctx)
-            let width = max(p.width, layout.widestWord)
-            let result = layout.reflow(width: width, left: p.left.map { layout.layoutLeft(fromPage: $0) },
-                                       joinParagraphs: p.joinParagraphs ?? false)
-            plans.append((target: target, transforms: Handwriting.translations(result.moves)))
+            var written = target
+            var insertion: InkLayout.Insertion?
+            if let ins = insert, ins.doc == target.doc, ins.page == target.page {
+                if let a = after, !target.items.contains(where: { $0.id == a }) {
+                    throw NibError.invalid("after must be one of refs, on the page of the inserted strokes", path: "$.after")
+                }
+                let own = await Handwriting.layout(ins, ctx: ctx)
+                insertion = layout.insertion(of: own, after: after)
+                written.items += ins.items
+                placed = true
+            }
+            let widest = max(layout.widestWord, insertion?.words.map { $0.box.width }.max() ?? 0)
+            let result = layout.reflow(width: max(p.width, widest), left: p.left.map { layout.layoutLeft(fromPage: $0) },
+                                       joinParagraphs: p.joinParagraphs ?? false, without: without, insertion: insertion)
+            plans.append((target: written, transforms: Handwriting.translations(result.moves)))
             lines += result.lineCount
+        }
+        if insert != nil && !placed {
+            throw NibError.invalid("insert strokes must be on a page of refs", path: "$.insert")
         }
         let moved = try Handwriting.write(plans, ctx: ctx)
         return Output(moved: moved, lines: lines)

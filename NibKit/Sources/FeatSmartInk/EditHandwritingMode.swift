@@ -10,8 +10,8 @@ import NibDesign
 // - `EditHandwritingOverlay` (a canvas attachment): the column frame, the side handles that reflow, the selected
 //   word's outline and the live reflow preview. Precision affordances: rigid, never animated, never liquid;
 // - `EditHandwritingOptions` (the tool's options bar, fused to the palette by the toolbar): every action.
-// Every change runs a command (handwriting.*, item.recolor, item.delete, item.transform, clipboard.*), so it is
-// undoable and the AI, plugins and the bridge can do the same. Layouts run off the main actor. Side-by-side columns
+// Every change runs a command (handwriting.*, item.recolor, item.delete, clipboard.*), so it is undoable and the AI,
+// plugins and the bridge can do the same. Layouts run off the main actor. Side-by-side columns
 // (margin notes, two-column pages) are laid out separately; the frame and side handles act on one column at a time.
 
 // MARK: - Model
@@ -502,45 +502,46 @@ final class EditHandwritingModel: ObservableObject {
     func deleteWord() async { await removeWord(using: CommandIDs.itemDelete) }
     func cutWord() async { await removeWord(using: "clipboard.cut") }
 
-    /// Removes the selected word, closes its hole (the rest of its line moves left, or the lines below move up), then
-    /// reflows its column at the same width and left edge so the text flows on: one undo step.
+    /// Removes the selected word and flows its column on at the same width and left edge, as one undo step: the
+    /// column first reflows as if the word were gone (its paragraphs read with it, so the hole never looks like an
+    /// indent or a break), then the word is deleted or cut. Every stroke changes once, so Undo restores all of it.
     private func removeWord(using command: String) async {
-        guard canEdit, let at = selectedWordLocation, let c = layout.column(ofLine: at.line) else { return }
+        guard canEdit, let app, let t = target, let at = selectedWordLocation, let c = layout.column(ofLine: at.line) else {
+            return
+        }
         let word = layout.lines[at.line].words[at.word]
-        let removed = Set(word.ids)
-        let rest = layout.ids(ofColumn: c).filter { !removed.contains($0) }
-        let hole = layout.closingHole(line: at.line, word: at.word)
+        let columnIDs = layout.ids(ofColumn: c)
         let width = layout.columns[c].box.width
         let left = layout.pageLeft(ofColumn: c)
         let group = NibID.make().raw
-        guard await run(command, ["refs": refs(word.ids)], group: group) != nil else { return }
+        guard await run("handwriting.reflow", ["refs": refs(columnIDs), "width": .number(width), "left": .number(left),
+                                               "without": refs(word.ids)], group: group) != nil else { return }
         selectedWord = []
-        if let hole, !hole.ids.isEmpty {
-            await run(CommandIDs.itemTransform, ["refs": refs(hole.ids), "translate": [.number(hole.by.x), .number(hole.by.y)]],
-                      group: group, quiet: true)
+        if await run(command, ["refs": refs(word.ids)], group: group) == nil,
+           app.bus.history.entries(t.doc).last?.group == group {
+            // The word could not be removed: put the column back as it was.
+            app.bus.undo(t.doc)
         }
-        guard !rest.isEmpty else { return }
-        await run("handwriting.reflow", ["refs": refs(rest), "width": .number(width), "left": .number(left)], group: group)
     }
 
-    /// Pastes after the selected word (or at the end of the active column) and flows the text around it, as one undo
-    /// step: the pasted handwriting is laid out on one line, placed just after the word, the rest of the word's line
-    /// moves right to make room (nothing overlaps, so reading order is word, pasted words, next word), and the column
-    /// reflows at its width and left edge.
+    /// Pastes after the selected word (or at the end of the active column) and flows the column around it: the
+    /// pasted handwriting becomes one run of words right after the word (reading order word, pasted words, next word,
+    /// nothing overlapping) and the column reflows at its width and left edge. Two undo steps, Paste then Reflow: the
+    /// history reverts only an item's last change within one step, so pasted strokes must not be created and moved in
+    /// the same step.
     func paste() async {
         guard canEdit, let app, let t = target,
               let anchor = selectedWordLocation ?? layout.lastWord(ofColumn: activeColumn),
-              let c = layout.column(ofLine: anchor.line) else { return }
-        let before = layout
-        let columnIDs = before.ids(ofColumn: c)
-        let width = before.columns[c].box.width
-        let left = before.pageLeft(ofColumn: c)
-        let probe = before.room(after: anchor.line, word: anchor.word, width: 0).at
+              let c = layout.column(ofLine: anchor.line),
+              let after = layout.lines[anchor.line].words[anchor.word].ids.first else { return }
+        let columnIDs = layout.ids(ofColumn: c)
+        let width = layout.columns[c].box.width
+        let left = layout.pageLeft(ofColumn: c)
+        let at = layout.insertionPoint(after: anchor.line, word: anchor.word)
         let pageRef = NodeRef.page(t.doc, t.page).description
-        let group = NibID.make().raw
         guard let result = await run(CommandIDs.clipboardPaste,
-                                     ["page": .string(pageRef), "at": [.number(probe.x), .number(probe.y)]],
-                                     group: group) else { return }
+                                     ["page": .string(pageRef), "at": [.number(at.x), .number(at.y)]],
+                                     group: NibID.make().raw) else { return }
         // Paste selects what it pasted; the mode shows its own selection instead.
         session?.selection = Selection()
         let pastedRefs: [ElementID] = (result["refs"]?.arrayValue ?? []).compactMap { value in
@@ -553,34 +554,13 @@ final class EditHandwritingModel: ObservableObject {
             .filter { Handwriting.isHandwriting($0) }.map { $0.id })
         let pasted = pastedRefs.filter { handwriting.contains($0) }
         guard !pasted.isEmpty else { return }
-        // 1. One line, whatever the clipboard's layout.
-        if pasted.count > 1 {
-            await run("handwriting.reflow", ["refs": refs(pasted), "width": .number(SmartInkSchema.coordinateLimit),
-                                             "joinParagraphs": true], group: group)
-        }
-        // 2. Right after the word, on its line; 3. the rest of the line moves right by the pasted width.
-        let glyphs = ((try? app.workspace.items(t.doc, page: t.page)) ?? [])
-            .filter { pasted.contains($0.id) }.compactMap { InkGlyph(item: $0) }
-        let bounds = InkLayout.union(glyphs.map { $0.bounds })
-        // Centre lines meet (letters sit at the same height as the word's), not bounding boxes.
-        let own = await Handwriting.layout(glyphs, hints: [])
-        let centre = own.lines.first.map { own.toPage(Point($0.box.midX, $0.center)).y } ?? bounds.midY
-        let room = before.room(after: anchor.line, word: anchor.word, width: bounds.width)
-        let dx = room.at.x - bounds.minX
-        let dy = room.at.y - centre
-        if abs(dx) > 0.01 || abs(dy) > 0.01 {
-            await run(CommandIDs.itemTransform, ["refs": refs(pasted), "translate": [.number(dx), .number(dy)]],
-                      group: group, quiet: true)
-        }
-        if !room.ids.isEmpty, room.by != .zero {
-            await run(CommandIDs.itemTransform, ["refs": refs(room.ids), "translate": [.number(room.by.x), .number(room.by.y)]],
-                      group: group, quiet: true)
-        }
-        // 4. The column flows again, pasted words included.
-        let known = Set(target?.ids ?? t.ids)
-        target = Target(doc: t.doc, page: t.page, ids: (target?.ids ?? t.ids) + pasted.filter { !known.contains($0) })
-        await run("handwriting.reflow", ["refs": refs(columnIDs + pasted), "width": .number(width), "left": .number(left)],
-                  group: group)
+        let current = target?.ids ?? t.ids
+        let known = Set(current)
+        target = Target(doc: t.doc, page: t.page, ids: current + pasted.filter { !known.contains($0) })
+        await run("handwriting.reflow", ["refs": refs(columnIDs), "width": .number(width), "left": .number(left),
+                                         "insert": refs(pasted),
+                                         "after": .string(NodeRef.item(t.doc, t.page, after).description)],
+                  group: NibID.make().raw)
         scheduleReload()
     }
 

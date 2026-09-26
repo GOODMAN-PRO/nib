@@ -46,21 +46,8 @@ final class FeatSmartInkTests: XCTestCase {
         return InkLayout.analyze(items.compactMap { InkGlyph(item: $0) })
     }
 
-    /// Stand-ins for F012's item.transform and F013's item.delete, which the mode's word edits run.
-    private func installItemCommands(_ h: Harness) {
-        h.app.commands.register(CommandDescriptor(id: CommandIDs.itemTransform, title: "Transform",
-                                                  summary: "Test stand-in.", effect: .edit)) { params, ctx in
-            let t = params["translate"]?.arrayValue?.compactMap { $0.doubleValue } ?? []
-            guard t.count == 2 else { throw NibError.invalid("translate is [dx, dy]", path: "$.translate") }
-            try ctx.mutate { tx in
-                for value in params["refs"]?.arrayValue ?? [] {
-                    guard let s = value.stringValue, case let .item(d, p, id)? = NodeRef(s) else { continue }
-                    let item = try tx.item(d, page: p, id: id)
-                    try tx.put(item.transformed(by: .translation(t[0], t[1])), doc: d, page: p)
-                }
-            }
-            return [:]
-        }
+    /// Stand-in for item.delete (another feature's command), which Delete Word runs.
+    private func installItemDelete(_ h: Harness) {
         h.app.commands.register(CommandDescriptor(id: CommandIDs.itemDelete, title: "Delete",
                                                   summary: "Test stand-in.", effect: .edit)) { params, ctx in
             try ctx.mutate { tx in
@@ -301,6 +288,18 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertEqual(code, .invalidParams)
         code = await errorCode { _ = try await h.run("handwriting.straighten", ["refs": [.string(stroke)], "pivot": "middle"]) }
         XCTAssertEqual(code, .invalidParams)
+        code = await errorCode { _ = try await h.run("handwriting.reflow", ["refs": [.string(stroke)], "width": 100, "without": ["page:FIXTUREDOC01/FIXTUREPG001"]]) }
+        XCTAssertEqual(code, .invalidParams)
+        // Inserted strokes must share a page with refs, and `after` must be one of refs.
+        let s = Synth.paragraph()
+        let refs = install(s, in: h)
+        code = await errorCode { _ = try await h.run("handwriting.reflow", ["refs": json(refs), "width": 100, "insert": [.string(stroke)]]) }
+        XCTAssertEqual(code, .invalidParams)
+        code = await errorCode {
+            _ = try await h.run("handwriting.reflow", ["refs": json(Array(refs.dropLast(2))), "width": 100,
+                                                       "insert": json(Array(refs.suffix(2))), "after": .string(refs[refs.count - 1])])
+        }
+        XCTAssertEqual(code, .invalidParams)
         XCTAssertEqual(h.undoDepth(doc), 0)
     }
 
@@ -377,11 +376,11 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertNil(model.target)
     }
 
-    /// Delete Word on the first word of a line: the rest of the line closes up and the column reflows at its width,
-    /// so the next reflow never mistakes the hole for an indent. One undo step.
+    /// Delete Word on the first word of a line: the column flows on at its width as if the word were gone (no false
+    /// indent), then the word is deleted. One undo step that restores everything.
     func testEditModeDeleteClosesTheHoleAndReflows() async throws {
         let h = Harness(features: [FeatSmartInkFeature.self])
-        installItemCommands(h)
+        installItemDelete(h)
         let s = Synth.paragraph()
         let (model, tool, host) = await editMode(h, s)
         let before = try h.snapshot()
@@ -399,18 +398,17 @@ final class FeatSmartInkTests: XCTestCase {
         for line in after.lines { XCTAssertEqual(line.box.minX, 72, accuracy: 0.01) }
         XCTAssertLessThanOrEqual(after.box.width, 154.5)
         assertNoOverlaps(after)
-        XCTAssertEqual(h.undoDepth(doc), 1, "delete, close and reflow are one undo step")
+        XCTAssertEqual(h.undoDepth(doc), 1, "reflow and delete are one undo step")
         h.app.bus.undo(doc)
         XCTAssertEqual(try h.snapshot(), before)
         tool.deactivate(host)
     }
 
-    /// Paste After Word on a mid-line word: the clipboard's handwriting (two lines) lands on one line right after the
-    /// word, the rest of the line makes room, and the column reflows: reading order word, pasted, next word, and no
-    /// word boxes overlap. One undo step.
+    /// Paste After Word on a mid-line word: the clipboard's handwriting (two lines) flows in as one run right after
+    /// the word and the column reflows: reading order word, pasted, next word, and no word boxes overlap. Two undo
+    /// steps (Paste, Reflow) that together restore the page.
     func testEditModePastesAfterAMidLineWord() async throws {
         let h = Harness(features: [FeatSmartInkFeature.self])
-        installItemCommands(h)
         // The clipboard: "ab" over "cde", as a stand-in for F014's clipboard.paste (centred at `at`).
         var clip = Synth()
         clip.line([2], x: 0, y: 0)
@@ -448,7 +446,8 @@ final class FeatSmartInkTests: XCTestCase {
         for line in after.lines { XCTAssertEqual(line.box.minX, 72, accuracy: 0.01) }
         XCTAssertLessThanOrEqual(after.box.width, 154.5)
         XCTAssertEqual(Set(model.target?.ids ?? []), Set(s.ids + pasted), "the pasted words are edited too")
-        XCTAssertEqual(h.undoDepth(doc), 1, "paste, placement and reflow are one undo step")
+        XCTAssertEqual(h.undoDepth(doc), 2, "Paste, then Reflow")
+        h.app.bus.undo(doc)
         h.app.bus.undo(doc)
         XCTAssertEqual(try h.snapshot(), before)
         tool.deactivate(host)
