@@ -241,6 +241,8 @@ public struct NibToolPalette<Settings: View>: View {
 
     @Environment(DropletField.self) private var field: DropletField?
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.nibLiquidMode) private var liquidMode
     @ScaledMetric(relativeTo: .body) private var scaledThick: CGFloat = 56
     @ScaledMetric(relativeTo: .body) private var scaledPitch: CGFloat = 44
     @State private var shownDock: NibPaletteDock?
@@ -252,6 +254,10 @@ public struct NibToolPalette<Settings: View>: View {
     @State private var popoverSize = CGSize(width: NibMetrics.popoverWidth, height: 412)
     @State private var moreSize = CGSize(width: NibMetrics.popoverWidth, height: 124)
     @State private var optionsSize = CGSize(width: 200, height: NibMetrics.barHeight)
+    /// A released drag on its way to its dock: the one plip plays when it arrives (DESIGN.md §10.11).
+    @State private var landing: DockLanding?
+    /// Reduce Motion and Liquid Off cross-fade the palette to its new dock (DESIGN.md §10.10).
+    @State private var fade: Double = 1
 
     enum DragMode {
         case move, scrub
@@ -400,43 +406,22 @@ public struct NibToolPalette<Settings: View>: View {
     }
 
     private func region(_ proxy: GeometryProxy) -> CGRect {
-        let s = proxy.safeAreaInsets
-        let top = s.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.l
-        let bottom = s.bottom + (compact ? NibSpacing.s : NibSpacing.l)
-        return CGRect(x: s.leading + NibSpacing.l, y: top,
-                      width: max(0, proxy.size.width - s.leading - s.trailing - 2 * NibSpacing.l - reservedTrailing),
-                      height: max(0, proxy.size.height - top - bottom))
+        DropletDockModel.region(size: proxy.size, safeArea: proxy.safeAreaInsets, compact: compact,
+                                reservedTrailing: reservedTrailing)
     }
 
-    private func centre(_ d: NibPaletteDock, size s: CGSize, in r: CGRect) -> CGPoint {
-        let t = min(max(d.along, 0), 1)
-        func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * t }
-        switch d.edge {
-        case .leading: return CGPoint(x: r.minX + s.width / 2, y: lerp(r.minY + s.height / 2, r.maxY - s.height / 2))
-        case .trailing: return CGPoint(x: r.maxX - s.width / 2, y: lerp(r.minY + s.height / 2, r.maxY - s.height / 2))
-        case .top: return CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.minY + s.height / 2)
-        case .bottom: return CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.maxY - s.height / 2)
-        }
+    /// The dock engine (DESIGN.md §10.11) for region `r`, shifted by `origin` into the container's space: the palette's
+    /// size in each orientation, the docks this device offers, the capture radius and the meniscus.
+    private func dockModel(_ r: CGRect, origin: CGPoint = .zero) -> DropletDockModel {
+        DropletDockModel(region: r.offsetBy(dx: origin.x, dy: origin.y),
+                         horizontal: CGSize(width: length(arrange(maxLength: r.width)), height: thick),
+                         vertical: CGSize(width: thick, height: length(arrange(maxLength: r.height))),
+                         docks: allowedEdges, compact: compact)
     }
 
-    private func dockFor(_ p: CGPoint, in r: CGRect, _ a: Arrangement) -> NibPaletteDock {
-        func distance(_ e: NibDock) -> CGFloat {
-            switch e {
-            case .leading: return abs(p.x - r.minX)
-            case .trailing: return abs(p.x - r.maxX)
-            case .top: return abs(p.y - r.minY) + 40
-            case .bottom: return abs(p.y - r.maxY)
-            }
-        }
-        let edge = edges.min { distance($0) < distance($1) } ?? .bottom
-        let s = size(NibPaletteDock(edge: edge), a)
-        let along: CGFloat
-        if edge.isVertical {
-            along = (p.y - (r.minY + s.height / 2)) / max(1, r.height - s.height)
-        } else {
-            along = (p.x - (r.minX + s.width / 2)) / max(1, r.width - s.width)
-        }
-        return NibPaletteDock(edge: edge, along: min(max(along, 0), 1))
+    private func centre(_ d: NibPaletteDock, in r: CGRect) -> CGPoint {
+        let f = dockModel(r).frame(for: d)
+        return CGPoint(x: f.midX, y: f.midY)
     }
 
     /// A slot's rect across the palette's full thickness, in the palette's centred coordinates.
@@ -465,13 +450,13 @@ public struct NibToolPalette<Settings: View>: View {
             let map = slots(a)
             let origin = proxy.frame(in: NibLiquid.space).origin
             let d = current
-            let s = size(d, a)
-            let c = centre(d, size: s, in: r)
+            let c = centre(d, in: r)
             let bounds = CGRect(origin: .zero, size: proxy.size)
             let slotAt = { (along: CGFloat) -> CGRect in slotRect(along, d, a).offsetBy(dx: c.x, dy: c.y) }
             ZStack(alignment: .topLeading) {
                 palette(d, a, map)
                     .gesture(dragGesture(region: r, origin: origin, arrangement: a, slots: map))
+                    .opacity(fade)
                     .position(c)
                 if let tool = a.natives.first(where: { $0.id == selection }) ?? a.plugins.first(where: { $0.id == selection }),
                    tool.hasSettings, let along = map[tool.id] {
@@ -499,6 +484,7 @@ public struct NibToolPalette<Settings: View>: View {
                 registerAnchors(key.slots, d, a)
                 if let along = map[selection] { field?.setBead(id, head: along, glide: false) }
             }
+            .background(DockArrivalWatcher(id: id, node: field?.node(id), field: field, landing: $landing))
             .onChange(of: selection) { oldValue, newValue in
                 let glide = tapped == newValue
                 tapped = nil
@@ -680,8 +666,9 @@ public struct NibToolPalette<Settings: View>: View {
                         mode = .move
                         settingsOpen = false
                         moreOpen = false
+                        landing = nil
                         field.dismissBuds()
-                        field.beginDrag(id, at: value.startLocation)
+                        DropletDockDriver(id: id, field: field).begin(at: value.startLocation)
                     }
                 }
                 switch mode {
@@ -691,7 +678,9 @@ public struct NibToolPalette<Settings: View>: View {
                     let lo = scrubbable.map(\.1).min() ?? a, hi = scrubbable.map(\.1).max() ?? a
                     field.scrubBead(id, to: min(max(a, lo), hi))        // never onto More or the swatches
                 case .move:
-                    field.drag(id, to: value.location)
+                    // Held, the palette is a bead of water: it follows with `follow`, and its meniscus reaches for the
+                    // dock the finger is within capture of.
+                    DropletDockDriver(id: id, field: field).move(to: value.location, model: dockModel(r, origin: origin))
                 case .none:
                     break
                 }
@@ -713,26 +702,32 @@ public struct NibToolPalette<Settings: View>: View {
                     return
                 }
                 guard mode == .move else { return }
-                let v = field.endDrag(id, velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height))
-                let projected = DropletPhysics.projectedLanding(value.location, velocity: v)
-                let local = CGPoint(x: projected.x - origin.x, y: projected.y - origin.y)
-                var next = dockFor(local, in: r, a)
-                let nextSize = size(next, a)
-                let nextCentre = centre(next, size: nextSize, in: r)
-                let rect = CGRect(x: nextCentre.x - nextSize.width / 2 + origin.x, y: nextCentre.y - nextSize.height / 2 + origin.y,
-                                  width: nextSize.width, height: nextSize.height)
-                let rested = field.restingRect(rect, excluding: id, along: next.isVertical ? .vertical : .horizontal)
-                if next.isVertical {
-                    next.along = min(max((rested.minY - origin.y - r.minY) / max(1, r.height - nextSize.height), 0), 1)
-                } else {
-                    next.along = min(max((rested.minX - origin.x - r.minX) / max(1, r.width - nextSize.width), 0), 1)
+                // The projected finger picks the dock within the capture radius (else home); the palette springs there
+                // with `snap` from the full release velocity, re-forms if the axis changes, and plips on arrival.
+                let release = DropletDockDriver(id: id, field: field).release(
+                    at: value.location, velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height),
+                    from: current, model: dockModel(r, origin: origin))
+                let next = release.dock
+                let arrival = DockLanding(centre: CGPoint(x: release.frame.midX, y: release.frame.midY))
+                if (reduceMotion || liquidMode == .off) && next != current {
+                    // Fade out, move while invisible (the body glides with `reduced`), fade in.
+                    withAnimation(NibMotion.exit) { fade = 0 }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                        dock = next
+                        landing = DockLanding(centre: arrival.centre)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.reduced.response) {
+                            withAnimation(NibMotion.enter) { fade = 1 }
+                        }
+                    }
+                    return
                 }
                 if next.isVertical != current.isVertical {
                     shownDock = current
-                    field.beginReshape(id, towards: CGPoint(x: rested.midX, y: rested.midY), velocity: v)
+                    field.beginReshape(id, towards: CGPoint(x: release.frame.midX, y: release.frame.midY),
+                                       velocity: release.velocity)
                 }
+                landing = arrival
                 dock = next
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) { NibHaptics.play(.snap) }
             }
     }
 }
@@ -782,6 +777,7 @@ struct NibSelectionBead: View {
         let head = node?.head ?? fallbackHead, tail = node?.tail ?? fallbackHead
         let g = BeadPhysics.geometry(head: head, tail: tail, radius: NibMetrics.beadRadius)
         let across = thickness / 2
+        let systemGlass = field?.usesSystemGlass ?? false
         Canvas { context, _ in
             func point(_ a: CGFloat) -> CGPoint { vertical ? CGPoint(x: across, y: a) : CGPoint(x: a, y: across) }
             let h = point(g.head), t = point(g.tail)
@@ -799,12 +795,8 @@ struct NibSelectionBead: View {
                 layer.opacity = 0.15
                 layer.fill(bead, with: .color(ink))
             }
-            // The rim: the bead minus itself shifted down-right, a hairline highlight on the top-left.
-            context.drawLayer { layer in
-                layer.fill(bead, with: .color(NibColor.waterRim))
-                layer.blendMode = .destinationOut
-                layer.fill(bead.offsetBy(dx: 0.9, dy: 1.2), with: .color(.black))
-            }
+            // The key rim on the top-left (iOS 17–25); inside iOS 26 glass the bead is a plain fill (DESIGN.md §10.7).
+            context.drawNibBeadRim(bead, systemGlass: systemGlass)
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
