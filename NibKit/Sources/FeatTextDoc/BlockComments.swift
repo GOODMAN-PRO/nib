@@ -636,8 +636,8 @@ enum CommentHighlighter {
     static func apply(_ ranges: [NSRange], to tv: UITextView) {
         let wash = NibUIColor.accentWash
         let line = NibUIColor.accent
-        let underline = NSUnderlineStyle.single.union(.patternDot).rawValue
         if let layout = tv.textLayoutManager {
+            let underline = NSUnderlineStyle.single.union(.patternDot).rawValue
             let whole = layout.documentRange
             layout.removeRenderingAttribute(.backgroundColor, for: whole)
             layout.removeRenderingAttribute(.underlineStyle, for: whole)
@@ -654,17 +654,50 @@ enum CommentHighlighter {
             }
             return
         }
-        // Already on TextKit 1 (another part of the app asked the view for its layoutManager).
+        // Already on TextKit 1 (another part of the app asked the view for its layoutManager). iOS has no temporary
+        // attributes, so the wash is a shape layer behind the glyphs, with an accent rule under each line of it.
+        let marks: CAShapeLayer
+        if let existing = tv.layer.sublayers?.first(where: { $0.name == markLayerName }) as? CAShapeLayer {
+            marks = existing
+        } else {
+            marks = CAShapeLayer()
+            marks.name = markLayerName
+            tv.layer.insertSublayer(marks, at: 0)
+        }
+        let rules: CAShapeLayer
+        if let existing = marks.sublayers?.first as? CAShapeLayer {
+            rules = existing
+        } else {
+            rules = CAShapeLayer()
+            rules.lineDashPattern = [NSNumber(value: Double(NibStroke.hairline * 2)), NSNumber(value: Double(NibStroke.hairline * 2))]
+            marks.addSublayer(rules)
+        }
         let manager = tv.layoutManager
-        let whole = NSRange(location: 0, length: tv.textStorage.length)
-        for key in [NSAttributedString.Key.backgroundColor, .underlineStyle, .underlineColor] {
-            manager.removeTemporaryAttribute(key, forCharacterRange: whole)
+        let inset = tv.textContainerInset
+        let length = tv.textStorage.length
+        let fill = CGMutablePath()
+        let stroke = CGMutablePath()
+        for r in ranges where NSMaxRange(r) <= length {
+            let glyphs = manager.glyphRange(forCharacterRange: r, actualCharacterRange: nil)
+            manager.enumerateEnclosingRects(forGlyphRange: glyphs, withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
+                                            in: tv.textContainer) { rect, _ in
+                let box = rect.offsetBy(dx: inset.left, dy: inset.top)
+                fill.addRect(box)
+                stroke.move(to: CGPoint(x: box.minX, y: box.maxY - NibStroke.hairline))
+                stroke.addLine(to: CGPoint(x: box.maxX, y: box.maxY - NibStroke.hairline))
+            }
         }
-        for r in ranges where NSMaxRange(r) <= whole.length {
-            manager.addTemporaryAttributes([.backgroundColor: wash, .underlineStyle: underline, .underlineColor: line],
-                                           forCharacterRange: r)
-        }
+        marks.frame = tv.layer.bounds
+        marks.path = fill
+        marks.fillColor = wash.resolvedColor(with: tv.traitCollection).cgColor
+        rules.frame = marks.bounds
+        rules.path = stroke
+        rules.fillColor = nil
+        rules.lineWidth = NibStroke.hairline
+        rules.strokeColor = line.resolvedColor(with: tv.traitCollection).cgColor
     }
+
+    private static let markLayerName = TextDocExtrasHookIDs.prefix + "comment.marks"
 }
 
 // MARK: - Presenting the comment card
