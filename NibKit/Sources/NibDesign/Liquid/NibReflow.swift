@@ -495,8 +495,8 @@ struct NibReflowDragModifier<ID: Hashable>: ViewModifier {
 // MARK: - The carrier
 
 extension DropletStyle {
-    /// The cover a combine is armed on, as water under its own content: a 3 pt envelope (radius 8) that necks with the
-    /// lifted card (§10.12). Rigid: it does not move.
+    /// The cover a combine is armed on, as water under its own content: a 3 pt envelope (radius 8) with the held rim
+    /// (it rises to meet the card) that necks with the lifted card (§10.12). Rigid: it does not move.
     static var armedCover: DropletStyle {
         var s = DropletStyle.card
         s.cornerRadius = NibRadius.cardEnvelope
@@ -507,7 +507,7 @@ extension DropletStyle {
         s.restsDry = false
         s.drag = .fixed
         s.isInteractive = false
-        return s
+        return s.lifted
     }
 }
 

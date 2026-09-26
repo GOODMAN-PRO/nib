@@ -19,6 +19,9 @@ struct DropletPresentation: Equatable {
     /// to it before its own transform, so the clip lands on the body and nothing ever draws outside it.
     var bodyMask: Path?
     var isLifted = false
+    /// Rim strength (DESIGN.md §10.9): 1 at rest, rising to the style's `liftedRim` with the lift spring while held.
+    /// iOS 26 draws the difference over the system glass (`NibLiftRim`); iOS 17–25 passes it to the water shader.
+    var rim: CGFloat = 1
     /// Released and still flowing home (the proposal chip shows its anchor until then).
     var isSettling = false
     var isDrawn = false
@@ -165,8 +168,13 @@ final class DropletField {
         let frostPath: Path
         let frostOpacity: Double
         let budLine: Bool
-        /// Share of the droplet over light paper (edge, caustic, dark-mode Clear body).
+        /// Share of the droplet over light paper (edge lens, deeper shadow, dark-mode Clear body).
         let paper: Double
+        /// Lift progress (0 at rest, 1 fully lifted) and the rim strength it gives (DESIGN.md §10.9).
+        let lift: Double
+        let rim: Double
+        /// False for covers and thumbnails: their content carries its own lifted shadow.
+        let castsShadow: Bool
     }
 
     // Per-frame state: not observed (views observe their own node, and the water layers the clusters).
@@ -494,6 +502,7 @@ final class DropletField {
                 .applying(p.contentTransform.inverted())
         }
         p.isLifted = e.isDragging
+        p.rim = e.style.rimStrength(lift: liftProgress(e))
         p.isSettling = !e.isDragging && !e.dyn.offset.isResting
         p.isDrawn = isDrawn(e)
         p.recedes = recedes(e)
@@ -509,10 +518,12 @@ final class DropletField {
                 let progress = Double(bodySize(e).width / max(e.rest.width, 1))
                 frost = min(max((progress - 0.25) / 0.5, 0), 1)
             }
+            let lift = liftProgress(e)
             return Render(id: id, material: e.style.material, path: bodyPath(e, inset: 0), innerPath: bodyPath(e, inset: 0.8),
                           frostPath: bodyPath(e, inset: 1.5), frostOpacity: frost,
                           budLine: e.bud.map { !$0.revealed || $0.closingAt != nil } ?? false,
-                          paper: e.style.refracts ? paperShare(visualBox(e)) : 0)
+                          paper: e.style.refracts ? paperShare(visualBox(e)) : 0,
+                          lift: Double(lift), rim: Double(e.style.rimStrength(lift: lift)), castsShadow: !e.style.restsDry)
         }
     }
 
@@ -532,9 +543,11 @@ final class DropletField {
             for n in own { frame = frame.union(n.path.boundingRect.insetBy(dx: -n.thickness, dy: -n.thickness)) }
             for s in sats { frame = frame.union(s.path.boundingRect) }
             let recede = ids.contains { id in entries[id].map(recedes) ?? false }
+            let optics = WaterCluster.optics(members)
             return WaterCluster(id: ids[0], renders: members, necks: own, satellites: sats,
                                 frame: frame.insetBy(dx: -pad, dy: -pad).integral,
-                                opacity: recede ? NibLiquid.recedeOpacity : 1)
+                                opacity: recede ? NibLiquid.recedeOpacity : 1,
+                                rim: optics.rim, shadow: optics.shadow, shadowY: optics.shadowY)
         }
     }
 

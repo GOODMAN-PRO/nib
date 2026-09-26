@@ -11,8 +11,9 @@ import NibContracts
 ///   selection bead), tap the selected tool again (its settings bud off it), More, Search (a bud from a bar button),
 ///   drag the two floating droplets together and apart (merge and pinch-off), drag the proposal chip (tether, stem,
 ///   satellite), show a toast, hold the Pencil (recede), switch Liquid Full / Calm / Off. Over the page the water
-///   lenses the ink: system glass on iOS 26, edge and caustic on iOS 17–25. There is no tap ripple (DESIGN.md §10.14):
-///   a press squashes the droplet (poke) and scales the control to 0.96.
+///   lenses the ink: system glass on iOS 26, the edge lens on iOS 17–25. Drag a droplet and its rim brightens (held,
+///   DESIGN.md §10.9). There is no tap ripple (DESIGN.md §10.14): a press squashes the droplet (poke) and scales the
+///   control to 0.96.
 public struct DesignGallery: View {
     enum Page: String, CaseIterable, Hashable {
         case liquid, components, tokens, dock
@@ -125,9 +126,9 @@ struct GalleryTokens: View {
         ("accent", NibColor.accent), ("accentWash", NibColor.accentWash), ("onAccent", NibColor.onAccent),
         ("destructive", NibColor.destructive), ("success", NibColor.success), ("warning", NibColor.warning),
         ("clearBody", NibColor.clearBody), ("clearBodyOnPaper", NibColor.clearBodyOnPaper),
-        ("deepBody", NibColor.deepBody), ("deepGlassTint", NibColor.deepGlassTint), ("waterBody", NibColor.waterBody),
-        ("waterEdge", NibColor.waterEdge), ("waterCaustic", NibColor.waterCaustic), ("waterRim", NibColor.waterRim),
+        ("deepBody", NibColor.deepBody), ("waterBody", NibColor.waterBody), ("waterRim", NibColor.waterRim),
         ("tintRim", NibColor.tintRim), ("waterLine", NibColor.waterLine), ("waterLineBud", NibColor.waterLineBud),
+        ("waterShadow", NibColor.waterShadow), ("waterShadowOnPaper", NibColor.waterShadowOnPaper),
         ("beadBody", NibColor.beadBody), ("beadShadow", NibColor.beadShadow),
         ("swatchHairline", NibColor.swatchHairline), ("swatchRing", NibColor.swatchRing),
     ]
@@ -377,6 +378,16 @@ struct GalleryTokens: View {
                             .nibGlass(kind)
                         label(name)
                     }
+                }
+                // The held rim (DESIGN.md §10.9): the same Clear glass with its rim at `liftedRim`.
+                VStack(alignment: .leading, spacing: NibSpacing.xs) {
+                    Text("Aa")
+                        .font(NibFont.button)
+                        .foregroundStyle(NibColor.label)
+                        .frame(width: 64, height: 40)
+                        .nibGlass(.clear)
+                        .overlay { NibLiftRim(cornerRadius: nil, boost: DropletStyle.bar.liftedRim - 1) }
+                    label("clear held")
                 }
             }
         }

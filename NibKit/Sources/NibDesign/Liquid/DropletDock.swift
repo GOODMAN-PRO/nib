@@ -24,9 +24,6 @@ public struct DropletDockModel: Equatable, Sendable {
     public static let meniscusJoin: CGFloat = 20
     public static let meniscusThickness: CGFloat = 26
     public static let meniscusOff: CGFloat = 72
-    /// While held the bead catches more light: a second rim layer at this opacity over the body, so the rim is 1.5× at
-    /// full lift (the glass pass's `DropletStyle.liftedRim` 1.5, DESIGN.md §10.9, draws the same in the optics).
-    public static let liftedRimBoost: Double = 0.5
 
     /// The rect every docked frame stays inside (below the bars, 16 pt in from the edges).
     public var region: CGRect
@@ -401,28 +398,6 @@ struct DockArrivalWatcher: View {
     }
 }
 
-/// The stronger rim of a held droplet: a second rim layer at 50 % over its body while it is lifted, faded in and out
-/// with the reveal timing (1.5× in all). Stand-in until the glass pass's held rim (`presentation.rim` from
-/// `DropletStyle.liftedRim`, DESIGN.md §10.9) is on this branch: then delete this view and its two uses (here and
-/// `NibToolPalette`), or the rim doubles.
-struct DropletLiftedRim: View {
-    let node: DropletNode?
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.nibLiquidMode) private var mode
-
-    var body: some View {
-        let p = node?.presentation ?? DropletPresentation()
-        let on = p.isLifted && !reduceTransparency && mode != .off
-        NibWaterRimLayer(cornerRadius: p.cornerRadius, rimOnly: true)
-            .frame(width: max(0, p.bodySize.width), height: max(0, p.bodySize.height))
-            .offset(x: p.bodyOffset.x, y: p.bodyOffset.y)
-            .opacity(on ? DropletDockModel.liftedRimBoost : 0)
-            .animation(on ? NibMotion.enter : NibMotion.exit, value: on)
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-    }
-}
-
 // MARK: - `.dropletDockable`
 
 private struct NibDockEdgeKey: EnvironmentKey {
@@ -509,7 +484,6 @@ struct DropletDockableModifier: ViewModifier {
                     .environment(\.nibDockEdge, dock.edge)
                     .frame(width: frame.width, height: frame.height)
                     .droplet(id, style: style, managesDrag: false)
-                    .overlay { DropletLiftedRim(node: field?.node(id)) }
                     .opacity(opacity)
                     .gesture(dragGesture(driver: driver, model: model))
                     .accessibilityActions {

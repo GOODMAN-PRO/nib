@@ -449,7 +449,6 @@ public struct NibToolPalette<Settings: View>: View {
         .contentShape(NibDropletShape())
         .nibChromeTypeCap()
         .droplet(id, style: .palette, managesDrag: false)
-        .overlay { DropletLiftedRim(node: field?.node(id)) }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Tools", bundle: .module))
         .accessibilityActions {
@@ -632,6 +631,7 @@ struct NibSelectionBead: View {
         let head = node?.head ?? fallbackHead, tail = node?.tail ?? fallbackHead
         let g = BeadPhysics.geometry(head: head, tail: tail, radius: NibMetrics.beadRadius)
         let across = thickness / 2
+        let systemGlass = field?.usesSystemGlass ?? false
         Canvas { context, _ in
             func point(_ a: CGFloat) -> CGPoint { vertical ? CGPoint(x: across, y: a) : CGPoint(x: a, y: across) }
             let h = point(g.head), t = point(g.tail)
@@ -649,12 +649,8 @@ struct NibSelectionBead: View {
                 layer.opacity = 0.15
                 layer.fill(bead, with: .color(ink))
             }
-            // The rim: the bead minus itself shifted down-right, a hairline highlight on the top-left.
-            context.drawLayer { layer in
-                layer.fill(bead, with: .color(NibColor.waterRim))
-                layer.blendMode = .destinationOut
-                layer.fill(bead.offsetBy(dx: 0.9, dy: 1.2), with: .color(.black))
-            }
+            // The key rim on the top-left (iOS 17–25); inside iOS 26 glass the bead is a plain fill (DESIGN.md §10.7).
+            context.drawNibBeadRim(bead, systemGlass: systemGlass)
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
