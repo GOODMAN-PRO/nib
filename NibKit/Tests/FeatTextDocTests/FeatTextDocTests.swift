@@ -1,8 +1,456 @@
 import XCTest
+import UIKit
 import NibContracts
-import FeatTextDoc
+import NibTesting
+@testable import FeatTextDoc
 
 @MainActor
 final class FeatTextDocTests: XCTestCase {
-    func testFeatureID() { XCTAssertFalse(FeatTextDocFeature.id.isEmpty) }
+    private let doc = Fixtures.textDocID
+    private let heading = "block:FIXTUREDOC02/FIXTUREBLK01"
+    private let paragraph = "block:FIXTUREDOC02/FIXTUREBLK02"
+    private let table = "block:FIXTUREDOC02/FIXTUREBLK03"
+
+    private func harness() -> Harness { Harness(features: [FeatTextDocFeature.self]) }
+
+    private func live(_ h: Harness) throws -> [TextBlock] { try h.app.workspace.content(doc).liveBlocks }
+
+    private func ids(_ h: Harness) throws -> [String] { try live(h).map { $0.id.raw } }
+
+    private func block(_ h: Harness, _ id: String) throws -> TextBlock {
+        try XCTUnwrap(live(h).first { $0.id.raw == id }, "block \(id)")
+    }
+
+    private func assertError(_ code: NibError.Code, file: StaticString = #filePath, line: UInt = #line,
+                             _ body: () async throws -> Void) async {
+        do {
+            try await body()
+            XCTFail("expected \(code.rawValue)", file: file, line: line)
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, code, e.description, file: file, line: line)
+        } catch {
+            XCTFail("unexpected \(error)", file: file, line: line)
+        }
+    }
+
+    // MARK: Registration and conformance
+
+    func testConformance() async {
+        let problems = await CommandConformance.check(features: [FeatTextDocFeature.self])
+        XCTAssertEqual(problems, [])
+    }
+
+    func testRegistersCommandsEditorBlockKindsAndMenus() {
+        let h = harness()
+        XCTAssertEqual(FeatTextDocFeature.id, "textdoc")
+        for id in ["block.insert", "block.update", "block.delete", "block.move"] {
+            XCTAssertEqual(h.app.commands.descriptor(id)?.owner, "textdoc", id)
+        }
+        XCTAssertTrue(h.app.commands.descriptor("block.delete")?.destructive ?? false)
+        XCTAssertNotNil(h.app.ui.editors.get(DocumentKind.textDocument.rawValue))
+        let kinds = h.app.content.blockKinds.all
+        let expected: Set<BlockKind> = [.paragraph, .heading1, .heading2, .heading3, .bullet, .numbered, .todo, .quote,
+                                        .code, .divider, .image, .video]
+        XCTAssertEqual(Set(kinds.map { $0.kind }), expected)
+        for k in kinds {
+            XCTAssertNil(k.command, k.id)
+            XCTAssertEqual(k.params["kind"]?.stringValue, k.kind.rawValue, k.id)
+            XCTAssertFalse(k.aliases.isEmpty, k.id)
+        }
+        let new = h.app.ui.menuItems(.libraryNew, MenuContext(app: h.app))
+        XCTAssertTrue(new.contains { $0.id == "textdoc.new" && $0.command == CommandIDs.batch })
+    }
+
+    func testShiftCommandTMakesATextDocumentOnlyOnce() async throws {
+        let h = harness()
+        await FeatTextDocFeature.start(h.app)
+        let d = try XCTUnwrap(h.app.content.keyCommands.get("textdoc.new"))
+        XCTAssertEqual(d.shortcut, KeyShortcut("t", [.command, .shift]))
+        XCTAssertEqual(d.command, CommandIDs.appOpenURL)
+        XCTAssertEqual(d.params["url"]?.stringValue, "nib://new?kind=textDocument")
+        XCTAssertEqual(d.scope, .library)
+        await FeatTextDocFeature.start(h.app)
+        XCTAssertEqual(h.app.content.keyCommands.all.filter { $0.shortcut == d.shortcut }.count, 1)
+
+        // The keyboard feature got there first: no second ⇧⌘T.
+        let other = harness()
+        other.app.content.keyCommands.register(KeyCommandDescriptor(
+            id: "keyboard.newTextDocument", title: "New Text Document", shortcut: KeyShortcut("T", [.shift, .command]),
+            command: CommandIDs.appOpenURL, params: ["url": "nib://new?kind=textDocument"], scope: .global, owner: "keyboard"))
+        await FeatTextDocFeature.start(other.app)
+        XCTAssertNil(other.app.content.keyCommands.get("textdoc.new"))
+    }
+
+    func testTheEditorIsMadeForTextDocuments() throws {
+        let h = harness()
+        let make = try XCTUnwrap(h.app.ui.editors.get(DocumentKind.textDocument.rawValue)?.make)
+        let vc = make(doc, h.session, h.app)
+        let editor = try XCTUnwrap(vc as? TextDocViewController)
+        XCTAssertTrue(h.session.editor === editor)
+        XCTAssertNil(editor.canvasHost)
+        editor.loadViewIfNeeded()
+        XCTAssertEqual(editor.blocks.map { $0.id.raw }, ["FIXTUREBLK01", "FIXTUREBLK02", "FIXTUREBLK03"])
+    }
+
+    // MARK: Acceptance: undo round trip against FIXTUREDOC02
+
+    func testBlockCommandsPassTheUndoRoundTripOnTheFixtureTextDocument() async throws {
+        let insert: JSONValue = ["doc": "doc:FIXTUREDOC02", "after": "block:FIXTUREDOC02/FIXTUREBLK02", "kind": "todo",
+                                 "text": "Revise", "id": "ROUNDTRIP01"]
+        let update: JSONValue = ["ref": "block:FIXTUREDOC02/FIXTUREBLK02", "kind": "quote", "text": "Quoted", "indent": 2]
+        let delete: JSONValue = ["refs": ["block:FIXTUREDOC02/FIXTUREBLK01", "block:FIXTUREDOC02/FIXTUREBLK03"]]
+        let move: JSONValue = ["ref": "block:FIXTUREDOC02/FIXTUREBLK03", "after": "doc:FIXTUREDOC02"]
+        let calls: [(String, JSONValue)] = [("block.insert", insert), ("block.update", update),
+                                            ("block.delete", delete), ("block.move", move)]
+        for (command, params) in calls {
+            let h = harness()
+            let before = try h.snapshot(doc)
+            let depth = h.undoDepth(doc)
+            try await h.run(command, params)
+            XCTAssertNotEqual(try h.snapshot(doc), before, command)
+            XCTAssertEqual(h.undoDepth(doc), depth + 1, "\(command) is one undo step")
+            XCTAssertTrue(h.app.bus.undo(doc), command)
+            XCTAssertEqual(try h.snapshot(doc), before, "\(command) undo")
+            XCTAssertTrue(h.app.bus.redo(doc), command)
+            XCTAssertNotEqual(try h.snapshot(doc), before, "\(command) redo")
+        }
+    }
+
+    // MARK: Order
+
+    func testInsertGoesAfterTheAnchorAtTheTopOrAtTheEnd() async throws {
+        let h = harness()
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "paragraph", "text": "end", "id": "ENDBLOCK"])
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "after": "doc:FIXTUREDOC02", "kind": "heading1",
+                                         "text": "top", "id": "TOPBLOCK"])
+        let r = try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "after": .string(heading), "kind": "bullet",
+                                                 "text": "middle", "id": "MIDBLOCK"])
+        XCTAssertEqual(r["ref"]?.stringValue, "block:FIXTUREDOC02/MIDBLOCK")
+        XCTAssertEqual(try ids(h), ["TOPBLOCK", "FIXTUREBLK01", "MIDBLOCK", "FIXTUREBLK02", "FIXTUREBLK03", "ENDBLOCK"])
+        XCTAssertEqual(try block(h, "MIDBLOCK").text.plainText, "middle")
+    }
+
+    func testMovePlacesTheBlockAfterTheAnchorOrOnTopAndSkipsNoOps() async throws {
+        let h = harness()
+        try await h.run("block.move", ["ref": .string(heading), "after": .string(table)])
+        XCTAssertEqual(try ids(h), ["FIXTUREBLK02", "FIXTUREBLK03", "FIXTUREBLK01"])
+        try await h.run("block.move", ["ref": .string(table)])
+        XCTAssertEqual(try ids(h), ["FIXTUREBLK03", "FIXTUREBLK02", "FIXTUREBLK01"])
+        let depth = h.undoDepth(doc)
+        try await h.run("block.move", ["ref": .string(table), "after": "doc:FIXTUREDOC02"])
+        XCTAssertEqual(h.undoDepth(doc), depth, "moving a block to where it is records nothing")
+    }
+
+    func testOrderKeysStayBetweenNeighboursEvenWithDuplicateKeys() throws {
+        var a = TextBlock(id: "AAAA", kind: .paragraph, order: "k")
+        var b = TextBlock(id: "BBBB", kind: .paragraph, order: "k")
+        let c = TextBlock(id: "CCCC", kind: .paragraph, order: "t")
+        a.rev = .zero
+        b.rev = .zero
+        let key = try BlockRules.orderKey(after: "block:D/AAAA", doc: "D", live: [a, b, c], moving: nil, whenOmitted: .end)
+        XCTAssertGreaterThan(key, "k")
+        XCTAssertLessThan(key, "t")
+        let top = try BlockRules.orderKey(after: nil, doc: "D", live: [a, b, c], moving: nil, whenOmitted: .start)
+        XCTAssertLessThan(top, "k")
+    }
+
+    // MARK: Kinds and payloads
+
+    func testTurnIntoMovesContentBetweenKinds() async throws {
+        let h = harness()
+        try await h.run("block.update", ["ref": .string(paragraph), "kind": "todo"])
+        XCTAssertEqual(try block(h, "FIXTUREBLK02").checked, false)
+        try await h.run("block.update", ["ref": .string(paragraph), "checked": true])
+        XCTAssertEqual(try block(h, "FIXTUREBLK02").checked, true)
+        try await h.run("block.update", ["ref": .string(paragraph), "kind": "image"])
+        var b = try block(h, "FIXTUREBLK02")
+        XCTAssertNil(b.checked)
+        XCTAssertTrue(b.text.isEmpty)
+        XCTAssertEqual(b.caption?.plainText, "Hello blocks", "text becomes the caption")
+        try await h.run("block.update", ["ref": .string(paragraph), "kind": "paragraph"])
+        b = try block(h, "FIXTUREBLK02")
+        XCTAssertEqual(b.text.plainText, "Hello blocks")
+        XCTAssertNil(b.caption)
+        XCTAssertEqual(b.comments?.count, 1, "comments survive Turn Into")
+
+        try await h.run("block.update", ["ref": .string(table), "kind": "paragraph"])
+        b = try block(h, "FIXTUREBLK03")
+        XCTAssertNil(b.table)
+        XCTAssertEqual(b.text.plainText, "A1\tB1\nA2\tB2")
+        try await h.run("block.update", ["ref": .string(table), "kind": "table"])
+        b = try block(h, "FIXTUREBLK03")
+        XCTAssertEqual(b.table?.rows.count, 3)
+        XCTAssertTrue(b.text.isEmpty)
+    }
+
+    func testInsertAppliesKindDefaults() async throws {
+        let h = harness()
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "table", "text": "Header", "id": "TABLE2"])
+        let t = try block(h, "TABLE2")
+        XCTAssertEqual(t.table?.rows.count, 3)
+        XCTAssertEqual(t.table?.rows.first?.count, 3)
+        XCTAssertEqual(t.table?.rows[0][0].text.plainText, "Header")
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "divider", "text": "ignored", "id": "RULE1"])
+        XCTAssertTrue(try block(h, "RULE1").text.isEmpty)
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "video", "url": " https://example.com/v.mp4 ",
+                                         "text": "Lecture", "id": "VIDEO1"])
+        let v = try block(h, "VIDEO1")
+        XCTAssertEqual(v.url, "https://example.com/v.mp4")
+        XCTAssertEqual(v.caption?.plainText, "Lecture")
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "image", "id": "EMPTYIMG"])
+        XCTAssertNil(try block(h, "EMPTYIMG").asset, "an image block may wait for its image")
+    }
+
+    func testImageURLIsStoredAsADocumentAsset() async throws {
+        let h = harness()
+        let upload = try h.assets.putTemporary(Fixtures.pngData, ext: "png")
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "image", "url": .string("tmp:" + upload.name),
+                                         "caption": "Cell diagram", "id": "IMGBLOCK1"])
+        let b = try block(h, "IMGBLOCK1")
+        let asset = try XCTUnwrap(b.asset)
+        XCTAssertEqual(asset.ext, "png")
+        XCTAssertEqual(try h.assets.data(asset, doc: doc), Fixtures.pngData)
+        XCTAssertEqual(b.caption?.plainText, "Cell diagram")
+
+        let text = try h.assets.putTemporary(Data("not an image".utf8), ext: "txt")
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.update", ["ref": "block:FIXTUREDOC02/IMGBLOCK1", "url": .string("tmp:" + text.name)])
+        }
+    }
+
+    func testInvalidCallsAreRefusedWithCodesAndPaths() async throws {
+        let h = harness()
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.insert", ["doc": "doc:FIXTUREDOC01", "kind": "paragraph"])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "custom"])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.update", ["ref": .string(paragraph), "checked": true])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.update", ["ref": .string(paragraph)])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.update", ["ref": .string(heading), "kind": "custom"])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "video", "url": "ftp://example.com/a"])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.move", ["ref": .string(heading), "after": .string(heading)])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "paragraph", "id": "FIXTUREBLK01"])
+        }
+        await assertError(.notFound) {
+            _ = try await h.run("block.delete", ["refs": ["block:FIXTUREDOC02/NOSUCHBLOCK"]])
+        }
+        await assertError(.notFound) {
+            _ = try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "image", "asset": "missing.png"])
+        }
+        XCTAssertEqual(try ids(h), ["FIXTUREBLK01", "FIXTUREBLK02", "FIXTUREBLK03"], "failed calls change nothing")
+    }
+
+    func testPluginsCreateOnlyTheirOwnCustomBlocks() async throws {
+        let h = harness()
+        h.app.gateway.grants = { _ in Set(Scope.allCases) }
+        let display: JSONValue = ["ops": [["op": "rect", "rect": [0, 0, 100, 40], "stroke": "#000000"]]]
+        let mine: JSONValue = ["doc": "doc:FIXTUREDOC02", "kind": "custom", "id": "CUSTOM1",
+                               "custom": ["owner": "dev.nib.charts", "type": "bar", "height": 80, "display": display]]
+        try await h.run("block.insert", mine, as: .plugin("dev.nib.charts"))
+        let c = try XCTUnwrap(try block(h, "CUSTOM1").custom)
+        XCTAssertEqual(c.height, 80)
+        XCTAssertEqual(c.display.ops.count, 1)
+        XCTAssertEqual(try block(h, "CUSTOM1").custom?.owner, "dev.nib.charts")
+
+        let theirs: JSONValue = ["doc": "doc:FIXTUREDOC02", "kind": "custom",
+                                 "custom": ["owner": "someone.else", "type": "bar"]]
+        await assertError(.permissionDenied) {
+            _ = try await h.run("block.insert", theirs, as: .plugin("dev.nib.charts"))
+        }
+    }
+
+    func testDuplicateMenuEntryCopiesTheBlockBelowInOneUndoStep() async throws {
+        let h = harness()
+        try await h.run("block.update", ["ref": .string(paragraph), "kind": "todo", "checked": true, "indent": 2])
+        let ctx = MenuContext(app: h.app, session: h.session, doc: doc, ref: paragraph)
+        let item = try XCTUnwrap(h.app.ui.menuItems(.block, ctx).first { $0.id == "textdoc.block.duplicate" })
+        let depth = h.undoDepth(doc)
+        try await h.run(item.command, item.params(ctx))
+        let blocks = try live(h)
+        XCTAssertEqual(blocks.count, 4)
+        let copy = blocks[2]
+        XCTAssertNotEqual(copy.id, Fixtures.paragraphBlockID)
+        XCTAssertEqual(copy.kind, .todo)
+        XCTAssertEqual(copy.checked, true)
+        XCTAssertEqual(copy.indent, 2)
+        XCTAssertEqual(copy.text.plainText, "Hello blocks")
+        XCTAssertEqual(h.undoDepth(doc), depth + 1)
+
+        let headingCtx = MenuContext(app: h.app, session: h.session, doc: doc, ref: heading)
+        let visible = Set(h.app.ui.menuItems(.block, headingCtx).map { $0.id })
+        XCTAssertFalse(visible.contains("textdoc.block.moveUp"), "the first block cannot move up")
+        XCTAssertTrue(visible.contains("textdoc.block.moveDown"))
+        XCTAssertFalse(visible.contains("textdoc.block.check"))
+        h.session.readOnly = true
+        XCTAssertTrue(h.app.ui.menuItems(.block, headingCtx).isEmpty, "read-only documents offer no edits")
+    }
+
+    // MARK: Text model
+
+    func testSplitAndJoinWorkInUTF16Offsets() {
+        let text = RichText(paragraphs: [
+            Paragraph(runs: [TextRun("Hel"), TextRun("lo", TextAttributes(bold: true))]),
+            Paragraph(runs: [TextRun("a\u{1D11E}b")])
+        ])
+        let (head, tail) = BlockText.split(text, at: 4)
+        XCTAssertEqual(head.plainText, "Hell")
+        XCTAssertEqual(tail.plainText, "o\na\u{1D11E}b")
+        XCTAssertEqual(tail.paragraphs[0].runs.first?.attrs.bold, true)
+        XCTAssertEqual(BlockText.join(head, tail), text)
+
+        let atEnd = BlockText.split(text, at: 5)
+        XCTAssertEqual(atEnd.head.plainText, "Hello")
+        XCTAssertEqual(BlockText.join(atEnd.head, atEnd.tail), text)
+
+        let surrogate = BlockText.split(text, at: 9)
+        XCTAssertEqual(surrogate.head.plainText, "Hello\na\u{1D11E}")
+        XCTAssertEqual(surrogate.tail.plainText, "b")
+        XCTAssertEqual(BlockText.length(text), 10)
+
+        let beyond = BlockText.split(text, at: 99)
+        XCTAssertEqual(beyond.head, text)
+        XCTAssertTrue(beyond.tail.isEmpty)
+    }
+
+    func testStyleRoundTripStoresOnlyWhatTheUserChose() {
+        let rich = RichText(paragraphs: [
+            Paragraph(runs: [TextRun("Plain "), TextRun("bold", TextAttributes(bold: true)), TextRun(" end")]),
+            Paragraph(runs: [TextRun("second", TextAttributes(italic: true)), TextRun(" line", TextAttributes(underline: true))])
+        ])
+        for kind in [BlockKind.paragraph, .heading1, .heading3, .quote, .todo, .bullet] {
+            let style = BlockStyle.make(kind: kind)
+            XCTAssertEqual(style.richText(from: style.attributed(rich)), style.normalize(rich), kind.rawValue)
+        }
+        let code = BlockStyle.make(kind: .code)
+        let snippet = RichText(paragraphs: [Paragraph(runs: [TextRun("let x = "), TextRun("1", TextAttributes(bold: true))])])
+        XCTAssertEqual(code.richText(from: code.attributed(snippet)), code.normalize(snippet))
+
+        // The heading's size and weight are the kind's, not the text's: nothing of them is stored.
+        let h1 = BlockStyle.make(kind: .heading1)
+        let stored = h1.richText(from: h1.attributed(RichText(plain: "Cells")))
+        XCTAssertEqual(stored, RichText(plain: "Cells"))
+        // A checked to-do is dimmed on screen only.
+        let done = BlockStyle.make(kind: .todo, checked: true)
+        XCTAssertEqual(done.richText(from: done.attributed(RichText(plain: "Done"))), RichText(plain: "Done"))
+        // Paragraph list markers never enter a block's text.
+        var listed = RichText(plain: "item")
+        listed.paragraphs[0].list = .bullet
+        XCTAssertEqual(BlockStyle.make(kind: .paragraph).attributed(listed).string, "item")
+    }
+
+    func testListMarkersNestAndRestart() {
+        func b(_ id: String, _ kind: BlockKind, _ indent: Int = 0) -> TextBlock {
+            var t = TextBlock(id: NibID(id), kind: kind)
+            t.indent = indent == 0 ? nil : indent
+            return t
+        }
+        let blocks = [b("N1", .numbered), b("N2", .numbered), b("N3", .numbered, 1), b("N4", .numbered, 1),
+                      b("N5", .numbered), b("P1", .paragraph), b("N6", .numbered), b("B1", .bullet), b("B2", .bullet, 1),
+                      b("B3", .bullet, 2), b("B4", .bullet, 3)]
+        let m = BlockSnapshotPlan.markers(blocks)
+        XCTAssertEqual(["N1", "N2", "N3", "N4", "N5", "N6"].map { m[NibID($0)] }, ["1.", "2.", "1.", "2.", "3.", "1."])
+        XCTAssertNil(m[NibID("P1")])
+        XCTAssertEqual(["B1", "B2", "B3", "B4"].map { m[NibID($0)] }, ["\u{2022}", "\u{25E6}", "\u{25AA}", "\u{2022}"])
+    }
+
+    func testSnapshotPlanReconfiguresOnlyWhatChanged() {
+        func b(_ id: String, _ kind: BlockKind, _ text: String) -> TextBlock {
+            TextBlock(id: NibID(id), kind: kind, text: RichText(plain: text))
+        }
+        let old = [b("A", .paragraph, "a"), b("B", .numbered, "b"), b("C", .numbered, "c"), b("A", .paragraph, "dup")]
+        let first = BlockSnapshotPlan(blocks: old, previous: [:], previousMarkers: [:], previousFirst: nil)
+        XCTAssertEqual(first.ids.map { $0.raw }, ["A", "B", "C"], "duplicate ids are dropped")
+        XCTAssertTrue(first.reconfigure.isEmpty)
+
+        // Editing A and inserting a numbered block before B renumbers B and C.
+        let new = [b("A", .paragraph, "a2"), b("X", .numbered, "x"), b("B", .numbered, "b"), b("C", .numbered, "c")]
+        let second = BlockSnapshotPlan(blocks: new, previous: first.byID, previousMarkers: first.markers, previousFirst: first.ids.first)
+        XCTAssertEqual(Set(second.reconfigure.map { $0.raw }), ["A", "B", "C"])
+        XCTAssertEqual(second.markers[NibID("C")], "3.")
+        XCTAssertEqual(second.indexByID[NibID("B")], 2)
+    }
+
+    func testTextInFlightSurvivesAnOlderCommit() {
+        let model = [TextBlock(id: "A", kind: .paragraph, text: RichText(plain: "Ce")),
+                     TextBlock(id: "B", kind: .paragraph, text: RichText(plain: "b"))]
+        var typed = TextBlock(id: "A", kind: .paragraph, text: RichText(plain: "Cells"))
+        XCTAssertEqual(BlockOverlay.keepLocalText(model, local: [typed.id: typed], pending: []), model)
+        let shown = BlockOverlay.keepLocalText(model, local: [typed.id: typed], pending: [typed.id])
+        XCTAssertEqual(shown.map { $0.text.plainText }, ["Cells", "b"], "the newer keystrokes stay on screen")
+        typed.kind = .heading1
+        XCTAssertEqual(BlockOverlay.keepLocalText(model, local: [typed.id: typed], pending: [typed.id]), model,
+                       "when the kinds differ the model wins")
+    }
+
+    func testTitleComesFromTheFirstLineOfText() {
+        var image = TextBlock(id: "IMG", kind: .image)
+        image.caption = RichText(plain: "A caption is not a title")
+        let blocks = [image, TextBlock(id: "H", kind: .heading1),
+                      TextBlock(id: "P", kind: .paragraph, text: RichText(plain: "  Cells: the basics / intro\nSecond line"))]
+        XCTAssertEqual(TextDocTitle.derive(from: blocks), "Cells- the basics - intro")
+        XCTAssertNil(TextDocTitle.derive(from: [TextBlock(id: "D", kind: .divider), TextBlock(id: "E", kind: .paragraph)]))
+        XCTAssertEqual(TextDocTitle.sanitize("..hidden \t  name"), "hidden name")
+        XCTAssertEqual(TextDocTitle.sanitize(String(repeating: "a", count: 200)).count, TextDocTitle.maxLength)
+    }
+
+    // MARK: Hooks
+
+    func testHooksAreKeyedOrderedAndRemovable() {
+        TextDocHooks.removeAll(prefix: "test.")
+        TextDocHooks.addKeyCommandSet("test.b", order: 2) { _ in [] }
+        TextDocHooks.addKeyCommandSet("test.a", order: 1) { _ in [] }
+        TextDocHooks.addKeyCommandSet("test.a", order: 3) { _ in [] }
+        let mine = TextDocHooks.keyCommandSets.filter { $0.id.hasPrefix("test.") }
+        XCTAssertEqual(mine.map { $0.id }, ["test.b", "test.a"], "re-registering an id replaces it")
+        TextDocHooks.removeAll(prefix: "test.")
+        XCTAssertTrue(TextDocHooks.keyCommandSets.filter { $0.id.hasPrefix("test.") }.isEmpty)
+    }
+
+    // MARK: Acceptance: 1,000-block snapshot
+
+    func testApplyingAThousandBlockSnapshotIsFast() throws {
+        let h = harness()
+        let id: DocumentID = "PERFTEXTDOC1"
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: id, kind: .textDocument)),
+                                         title: "Long document", in: nil)
+        let blocks: [TextBlock] = (0..<1000).map { i in
+            let kind: BlockKind = i % 10 == 0 ? .heading2 : (i % 3 == 0 ? .numbered : .paragraph)
+            return TextBlock(id: NibID("PERFBLK\(i)"), kind: kind, text: RichText(plain: "Line \(i) of a long document"),
+                             order: String(format: "K%05dV", i))
+        }
+        let editor = TextDocViewController(doc: id, session: h.session, app: h.app)
+        editor.loadViewIfNeeded()
+
+        var start = CFAbsoluteTimeGetCurrent()
+        editor.applyBlocks(blocks)
+        let insertAll = CFAbsoluteTimeGetCurrent() - start
+        XCTAssertEqual(editor.blocks.count, 1000)
+
+        // A remote patch that touches every block (reconfigure path).
+        let edited = blocks.map { b -> TextBlock in
+            var b = b
+            b.text = RichText(plain: b.text.plainText + " (edited)")
+            return b
+        }
+        start = CFAbsoluteTimeGetCurrent()
+        editor.applyBlocks(edited)
+        let reconfigureAll = CFAbsoluteTimeGetCurrent() - start
+
+        // Budget 200 ms, asserted at 4x for CI simulators (ARCHITECTURE §15.10).
+        XCTAssertLessThan(insertAll, 0.2 * 4)
+        XCTAssertLessThan(reconfigureAll, 0.2 * 4)
+    }
 }
