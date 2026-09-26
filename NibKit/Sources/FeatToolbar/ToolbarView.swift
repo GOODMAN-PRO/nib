@@ -28,17 +28,22 @@ final class ToolbarHostView: UIView {
 
     required init?(coder: NSCoder) { nil }
 
-    /// Keeps the hosting controller in the view-controller hierarchy (traits, presentations, focus).
+    /// Keeps the hosting controller in the view-controller hierarchy (traits, presentations, focus), and hands the
+    /// window's UndoManager to `toolbar.dock` ("Move Palette").
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        guard window != nil, host.parent == nil, let parent = owningViewController else { return }
+        guard let window else { return }
+        model.attachUndoManager(window.undoManager)
+        guard host.parent == nil, let parent = owningViewController else { return }
         parent.addChild(host)
         host.didMove(toParent: parent)
     }
 
     override func willMove(toWindow newWindow: UIWindow?) {
         super.willMove(toWindow: newWindow)
-        guard newWindow == nil, host.parent != nil else { return }
+        guard newWindow == nil else { return }
+        model.attachUndoManager(nil)
+        guard host.parent != nil else { return }
         host.willMove(toParent: nil)
         host.removeFromParent()
     }
@@ -53,16 +58,14 @@ final class ToolbarHostView: UIView {
     }
 
     /// Only what SwiftUI draws takes a touch. Before iOS 18 SwiftUI content hit-tests as views other than the hosting
-    /// view; from iOS 18 it hit-tests as the hosting view itself, so its subviews are asked instead. While the chevron's
-    /// settings bud is open every touch is ours: a touch outside it only closes it and never inks (DESIGN.md §10.6).
-    // ponytail: UIKit-side heuristic because the contract hands the chrome a UIView. Its ceiling: NibToolPalette keeps
-    // its own settings popover and More grid in private state, so this guard cannot cover them: the container's
-    // dismiss catcher should take that touch before iOS 18 (a view of its own) but looks like empty space here from
-    // iOS 18 (unverified on device). Upgrade path (contract request): NibToolPalette reports settingsPresented/morePresented bindings to OR in
-    // below, or a SwiftUI toolbar screen rendered inside the chrome's single droplet container makes all of this go.
+    /// view; from iOS 18 it hit-tests as the hosting view itself, so its subviews are asked instead. While any bud of
+    /// the container is open (a tool's settings, More, an options popover: `onNibBudChange`) every touch is ours: a
+    /// touch outside it only closes it and never inks (DESIGN.md §10.6).
+    // ponytail: UIKit-side pass-through because the contract hands the chrome a UIView; a SwiftUI toolbar screen
+    // inside the chrome's single droplet container (contracts-v2) makes the per-subview test go.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard let hit = super.hitTest(point, with: event), let root = host.view else { return nil }
-        if model.settingsBudOpen { return hit }
+        if model.budOpen { return hit }
         if #available(iOS 18.0, *) {
             for sub in root.subviews.reversed() where sub.hitTest(sub.convert(point, from: self), with: event) != nil {
                 return hit
@@ -89,6 +92,35 @@ struct PaletteItem: Identifiable, Equatable {
     let tint: RGBA?
     /// VoiceOver value, e.g. "Carbon".
     let value: String?
+    /// The key the shell runs this item with (`ToolbarShortcuts`), shown as a hint on hover and while ⌘ is held.
+    let keyHint: KeyShortcut?
+}
+
+/// The tool keys as SwiftUI shortcuts, for the palette's key hints only (the shell registers the keys themselves).
+enum ToolKeyHint {
+    static func keyboardShortcut(_ s: KeyShortcut) -> KeyboardShortcut? {
+        let key: KeyEquivalent
+        switch s.key.lowercased() {
+        case "up": key = .upArrow
+        case "down": key = .downArrow
+        case "left": key = .leftArrow
+        case "right": key = .rightArrow
+        case "escape": key = .escape
+        case "delete": key = .delete
+        case "tab": key = .tab
+        case "return": key = .return
+        case "space": key = .space
+        default:
+            guard s.key.count == 1, let c = s.key.lowercased().first else { return nil }
+            key = KeyEquivalent(c)
+        }
+        var modifiers: EventModifiers = []
+        if s.modifiers.contains(.command) { modifiers.insert(.command) }
+        if s.modifiers.contains(.shift) { modifiers.insert(.shift) }
+        if s.modifiers.contains(.option) { modifiers.insert(.option) }
+        if s.modifiers.contains(.control) { modifiers.insert(.control) }
+        return KeyboardShortcut(key, modifiers: modifiers)
+    }
 }
 
 /// One of the palette's three quick colours: the first slots of the current writing tool's presets.
@@ -137,9 +169,16 @@ final class ToolbarModel: ObservableObject {
     @Published private(set) var isVisible = true
     @Published private(set) var isReadOnly = false
     @Published private(set) var savedDock: ToolbarDockSetting?
+    /// A dock the palette was just dragged (or moved by an accessibility action) to while `toolbar.dock` stores it:
+    /// the palette lands there at once instead of flowing home for a frame.
+    @Published private(set) var pendingDock: NibPaletteDock?
     @Published private(set) var optionsCollapsed = false
-    /// The chevron's settings popover (`ToolSettingsBud`).
-    @Published var settingsBudOpen = false
+    /// The selected tool's settings popover (`NibToolPalette(settingsPresented:)`): the options bar's chevron opens it.
+    @Published var settingsOpen = false
+    /// The palette's More grid (`NibToolPalette(morePresented:)`).
+    @Published var moreOpen = false
+    /// A bud of the container is open (`onNibBudChange`): the host keeps every touch (DESIGN.md §10.6).
+    var budOpen = false
 
     private var descriptors: [String: ToolbarItemDescriptor] = [:]
     private(set) var inkTool = "pen"
@@ -170,11 +209,6 @@ final class ToolbarModel: ObservableObject {
 
     var showsPalette: Bool { !isReadOnly && kind != nil && !(shown.isEmpty && more.isEmpty) }
 
-    /// The selected tool when it has settings (the chevron's popover shows them).
-    var settingsItem: PaletteItem? {
-        (shown + more).first { $0.id == tool && $0.hasSettings }
-    }
-
     // MARK: Reading state
 
     func refresh() {
@@ -190,6 +224,7 @@ final class ToolbarModel: ObservableObject {
         let arrangement = ToolbarLayoutEngine.arrange(entries, layout: ToolbarStore.current(app.settings))
         let byID = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let plugins = Set(entries.filter { $0.isPlugin }.map { $0.id })
+        let keys = app.content.keyCommands
         var slots: [String: ToolbarItemDescriptor] = [:]
         func item(_ id: String) -> PaletteItem? {
             guard let d = byID[id] else { return nil }
@@ -198,15 +233,23 @@ final class ToolbarModel: ObservableObject {
             slots[slot] = d
             var presets: ToolPresets?
             if let t = d.toolID, Self.tintedTools.contains(t) { presets = app.settings.get(NibSettings.presets(t)) }
+            // The hint shows the key the shell really runs this item with (a key another owner took is not ours).
+            let key = keys.get(ToolbarShortcuts.prefix + d.id).flatMap { $0.owner == FeatToolbarFeature.id ? $0 : nil }
             return PaletteItem(id: slot, descriptorID: d.id, title: d.title, icon: d.icon,
                                isPlugin: plugins.contains(d.id), isTool: d.toolID != nil, hasSettings: d.settings != nil,
-                               tint: presets?.color, value: presets.map { Self.colourName($0.color, index: $0.selectedSwatch) })
+                               tint: presets?.color, value: presets.map { Self.colourName($0.color, index: $0.selectedSwatch) },
+                               keyHint: key?.shortcut)
         }
         shown = arrangement.shown.compactMap { item($0) }
         more = arrangement.more.compactMap { item($0) }
         descriptors = slots
-        savedDock = app.settings.get(ToolbarSettings.dock)
+        readDock()
         refreshSwatches()
+    }
+
+    private func readDock() {
+        let saved = ToolbarStore.dock(app.settings)
+        if saved != savedDock { savedDock = saved }
     }
 
     private func refreshSwatches() {
@@ -241,7 +284,8 @@ final class ToolbarModel: ObservableObject {
             guard let self else { return }
             self.isVisible = !hidden.contains(self.session.id)
         }.store(in: &cancellables)
-        let registries: [AnyObject] = [app.ui.toolbar, app.ui.toolMenus, app.ui.canvasTools, app.commands]
+        let registries: [AnyObject] = [app.ui.toolbar, app.ui.toolMenus, app.ui.canvasTools, app.commands,
+                                       app.content.keyCommands]
         for registry in registries {
             NotificationCenter.default.publisher(for: .nibRegistryDidChange, object: registry)
                 .receive(on: DispatchQueue.main)
@@ -271,7 +315,7 @@ final class ToolbarModel: ObservableObject {
     private func toolDidChange(_ t: String) {
         tool = t
         pendingReturn = false
-        settingsBudOpen = false
+        settingsOpen = false
         expandOptions()
         if Self.inkTools.contains(t), t != inkTool {
             inkTool = t
@@ -347,12 +391,28 @@ final class ToolbarModel: ObservableObject {
         scrollTravel = 0
     }
 
-    func options(for id: String) -> AnyView? {
-        guard !optionsCollapsed, let d = descriptors[id] else { return nil }
-        return ActiveToolMenuHost.optionsBar(for: d, app: app, session: session) { [weak self] in
-            self?.expandOptions()
-            self?.settingsBudOpen = true
-        }
+    /// The options bar fused to the palette (`NibToolPalette(toolOptions:)`); nil while scrolling has folded it.
+    // ponytail: bar only. A tool menu that buds a popover of its own (`NibToolOptions(popover:)`) needs
+    // `ToolMenuDescriptor` to carry one (contracts-v2); pass it through here then.
+    func toolOptions(for id: String) -> NibToolOptions? {
+        guard !optionsCollapsed, let d = descriptors[id],
+              let bar = ActiveToolMenuHost.optionsBar(for: d, app: app, session: session, openSettings: { [weak self] in
+                  self?.openSettings()
+              }) else { return nil }
+        return NibToolOptions(bar: bar)
+    }
+
+    /// The options bar's chevron: the palette buds the selected tool's settings (one popover at a time).
+    func openSettings() {
+        expandOptions()
+        moreOpen = false
+        settingsOpen = true
+    }
+
+    /// The selected tool tapped again (the palette buds or closes its settings itself): acting on the tool brings its
+    /// folded options bar back.
+    func toolReselected(_ id: String) {
+        expandOptions()
     }
 
     func settingsView(for id: String) -> AnyView? {
@@ -391,23 +451,45 @@ final class ToolbarModel: ObservableObject {
         app.perform("toolbar.setVisible", ["visible": .bool(visible)], session: session)
     }
 
-    /// The saved dock, else the design's default: left in iPad landscape, top in iPad portrait, bottom on iPhone.
-    /// Compact widths dock horizontally only.
+    // MARK: Dock (DESIGN.md §10.11)
+
+    /// Where the palette shows in a window of `size`: a move in flight, else the saved dock, else the design's default
+    /// (left in iPad landscape, top in iPad portrait, bottom on iPhone). A side dock on a compact width shows at the
+    /// bottom (`DropletDockModel.validated`).
     func dock(for size: CGSize, compact: Bool) -> NibPaletteDock {
-        if let saved = savedDock, let edge = NibDock(rawValue: saved.edge), !(compact && edge.isVertical) {
-            return NibPaletteDock(edge: edge, along: CGFloat(min(max(saved.along, 0), 1)))
-        }
-        if compact { return NibPaletteDock(edge: .bottom) }
-        return NibPaletteDock(edge: size.width > size.height ? .leading : .top)
+        if let pendingDock { return ToolbarDockRules.validated(pendingDock, compact: compact) }
+        return ToolbarDockRules.effective(saved: savedDock, defaultDock: ToolbarDockRules.defaultDock(size: size, compact: compact),
+                                          compact: compact)
     }
 
-    func setDock(_ dock: NibPaletteDock) {
-        let value = ToolbarDockSetting(edge: dock.edge.rawValue, along: Double(dock.along))
-        guard value != savedDock else { return }
-        savedDock = value
-        app.perform(CommandIDs.settingsSet, ["name": .string(ToolbarSettings.dock.name),
-                                             "value": ["edge": .string(value.edge), "along": .number(value.along)]],
-                    session: session)
+    /// The palette's `dock` binding: a drag's release (the dock the projected finger chose) and the "Move palette to…"
+    /// actions land here. The move runs `toolbar.dock`, so it is persisted, undoable, visible to command hooks and
+    /// replayable; the palette shows the new dock at once while the command runs, and falls back if it is refused.
+    func requestDock(_ dock: NibPaletteDock) {
+        pendingDock = dock
+        let command = ToolbarDock.descriptor.id
+        let params = ToolbarDock.Position(dock).params
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.app.bus.execute(command, params, session: self.session)
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: self.app,
+                                                userInfo: ["command": command, "error": NibError.wrap(error)])
+            }
+            if self.pendingDock == dock { self.pendingDock = nil }
+            self.readDock()
+        }
+    }
+
+    /// The window's size and size class, for `toolbar.dock` (the default dock and the compact refusal).
+    func windowDidChange(size: CGSize, compact: Bool) {
+        runtime?.windowDidChange(session, size: size, compact: compact)
+    }
+
+    /// The window's UndoManager, which takes the "Move Palette" steps; nil when the palette leaves its window.
+    func attachUndoManager(_ manager: UndoManager?) {
+        runtime?.setUndoManager(manager, for: session)
     }
 }
 
@@ -422,13 +504,23 @@ struct ToolbarRootView: View {
     var body: some View {
         NibDropletContainer(inking: inking) {
             GeometryReader { proxy in
-                layer(size: proxy.size, safe: proxy.safeAreaInsets)
+                layer(size: proxy.size)
             }
         }
     }
 
+    /// What `toolbar.dock` needs from this window.
+    private struct WindowMetrics: Equatable {
+        let size: CGSize
+        let compact: Bool
+    }
+
+    /// The palette docks itself through NibDesign's water dock (`NibToolPalette(dock:)`): held it is a bead of water
+    /// (lift, brighter rim, `follow`, stretch, one settle dip, the meniscus towards the dock in reach), released it
+    /// snaps to the dock the projected finger chose and plips once; its re-form and the Reduce Motion cross-fade are
+    /// the engine's too. The dock binding hands every move to `toolbar.dock`.
     @ViewBuilder
-    private func layer(size: CGSize, safe: EdgeInsets) -> some View {
+    private func layer(size: CGSize) -> some View {
         let compact = sizeClass == .compact
         let dock = model.dock(for: size, compact: compact)
         let inks = model.quickInks(compact: compact)
@@ -438,18 +530,27 @@ struct ToolbarRootView: View {
                     NibToolPalette(id: ToolbarModel.paletteID, tools: model.shown.map { tool($0) },
                                    moreTools: model.more.map { tool($0) }, selection: selection,
                                    swatches: inks.map { swatch($0) }, swatch: swatchIndex(inks),
-                                   dock: Binding(get: { dock }, set: { model.setDock($0) }),
-                                   options: { model.options(for: $0) }) { id in
+                                   dock: dockBinding(dock),
+                                   toolOptions: { model.toolOptions(for: $0) },
+                                   settingsPresented: $model.settingsOpen, morePresented: $model.moreOpen,
+                                   onReselect: { model.toolReselected($0) }) { id in
                         ToolSettingsContent(model: model, toolID: id)
                     }
-                    ToolSettingsBud(model: model, placement: ActiveToolMenuHost.placement(for: dock),
-                                    width: compact ? max(0, size.width - 3 * NibSpacing.l) : NibMetrics.popoverWidth)
                 } else {
-                    RevealToolsButton(dock: dock, size: size, safe: safe, compact: compact) { model.setVisible(true) }
+                    RevealToolsButton(dock: dock, onDock: { model.requestDock($0) }) { model.setVisible(true) }
                 }
             }
         }
         .frame(width: size.width, height: size.height, alignment: .topLeading)
+        .onChange(of: WindowMetrics(size: size, compact: compact), initial: true) { _, window in
+            model.windowDidChange(size: window.size, compact: window.compact)
+        }
+        .onNibBudChange { open in model.budOpen = open }
+    }
+
+    /// Reads the dock the palette shows; a release or a "Move palette to…" action that changes it runs `toolbar.dock`.
+    private func dockBinding(_ dock: NibPaletteDock) -> Binding<NibPaletteDock> {
+        Binding(get: { dock }, set: { next in if next != dock { model.requestDock(next) } })
     }
 
     private var selection: Binding<String> {
@@ -462,13 +563,14 @@ struct ToolbarRootView: View {
                 set: { i in if inks.indices.contains(i) { model.selectSwatch(inks[i].index) } })
     }
 
-    /// Shortcuts are the shell's single-key commands (canvas scope, off while typing, never animated); a palette
-    /// button must not register the same key a second time, so `NibTool.shortcut` stays nil.
+    /// The tool keys are the shell's single-key commands (canvas scope, off while typing, never animated): the palette
+    /// shows each as a hint (hover, ⌘ held) and does not register it a second time.
     private func tool(_ item: PaletteItem) -> NibTool {
         NibTool(id: item.id, label: item.title,
                 symbol: item.isPlugin ? NibSymbol.plugin(item.icon) : (NibSymbol(systemName: item.icon) ?? .puzzle),
-                isPlugin: item.isPlugin, hasSettings: item.hasSettings && !model.settingsBudOpen,
-                value: item.value, tint: item.tint.map { Self.color($0) })
+                isPlugin: item.isPlugin, hasSettings: item.hasSettings, value: item.value,
+                shortcut: item.keyHint.flatMap { ToolKeyHint.keyboardShortcut($0) }, registersShortcut: false,
+                tint: item.tint.map { Self.color($0) })
     }
 
     private func swatch(_ s: QuickSwatch) -> NibSwatch {
@@ -485,37 +587,19 @@ struct ToolbarRootView: View {
     }
 }
 
-/// While the palette is hidden (`toolbar.setVisible`, W), one small bar droplet at its dock brings it back.
+/// While the palette is hidden (`toolbar.setVisible`, W), one small bar droplet at its dock brings it back. It docks
+/// like the palette (`.dropletDockable`, the same engine): dragged, it is a bead of water and moves the palette's
+/// dock through `toolbar.dock`.
 struct RevealToolsButton: View {
     let dock: NibPaletteDock
-    let size: CGSize
-    let safe: EdgeInsets
-    let compact: Bool
+    let onDock: (NibPaletteDock) -> Void
     let action: () -> Void
 
     var body: some View {
-        NibBarGroup(id: ToolbarModel.paletteID + ".reveal") {
-            NibToolbarItem(.pen, label: String(localized: "Show Tools"), action: action)
-        }
-        .position(centre)
-    }
-
-    /// The palette's own dock region: below the bars, 16 pt in from the edges (8 pt above the home indicator on iPhone).
-    private var centre: CGPoint {
-        let top = safe.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.l
-        let bottom = size.height - safe.bottom - (compact ? NibSpacing.s : NibSpacing.l)
-        let left = safe.leading + NibSpacing.l
-        let right = size.width - safe.trailing - NibSpacing.l
-        let halfWidth = NibMetrics.hitTarget / 2 + NibSpacing.xs
-        let halfHeight = NibMetrics.barHeight / 2
-        let t = min(max(dock.along, 0), 1)
-        let alongY = top + halfHeight + max(0, bottom - top - 2 * halfHeight) * t
-        let alongX = left + halfWidth + max(0, right - left - 2 * halfWidth) * t
-        switch dock.edge {
-        case .leading: return CGPoint(x: left + halfWidth, y: alongY)
-        case .trailing: return CGPoint(x: right - halfWidth, y: alongY)
-        case .top: return CGPoint(x: alongX, y: top + halfHeight)
-        case .bottom: return CGPoint(x: alongX, y: bottom - halfHeight)
-        }
+        // One bar button and the bar group's padding, 44 pt thick.
+        NibToolbarItem(.pen, label: String(localized: "Show Tools"), action: action)
+            .nibChromeTypeCap()
+            .dropletDockable(ToolbarModel.paletteID + ".reveal", length: NibMetrics.hitTarget + 2 * NibSpacing.xs,
+                             thickness: NibMetrics.barHeight, current: dock, style: .bar, onDock: onDock)
     }
 }

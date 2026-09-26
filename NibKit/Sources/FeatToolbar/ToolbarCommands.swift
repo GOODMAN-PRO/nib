@@ -1,5 +1,7 @@
 import Foundation
+import CoreGraphics
 import NibContracts
+import NibDesign
 
 // MARK: - Layout model
 
@@ -53,7 +55,8 @@ enum ToolbarPart: String, CaseIterable, Codable {
     case accessories
 }
 
-/// Where the palette docks on this device (`NibPaletteDock` as data).
+/// Where the palette docks on this device (`NibPaletteDock` as data): the edge as `toolbar.dock` names it (left and
+/// right are the leading and trailing edges) and a 0–1 position along it.
 struct ToolbarDockSetting: Codable, Equatable {
     var edge: String
     var along: Double
@@ -63,15 +66,56 @@ struct ToolbarDockSetting: Codable, Equatable {
         self.along = along
     }
 
+    init(_ dock: NibPaletteDock) {
+        edge = dock.edge.commandValue
+        along = min(max(Double(dock.along), 0), 1)
+    }
+
     enum CodingKeys: String, CodingKey { case edge, along }
 
+    /// Lenient: `along` may be missing; an older build stored the edge as "leading" / "trailing".
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         edge = try c.decode(String.self, forKey: .edge)
         along = try c.decodeIfPresent(Double.self, forKey: .along) ?? 0.5
     }
 
-    static let edges = ["leading", "trailing", "top", "bottom"]
+    /// nil for an edge no build ever wrote.
+    var dock: NibPaletteDock? {
+        guard let side = NibDock(commandValue: edge) else { return nil }
+        return NibPaletteDock(edge: side, along: CGFloat(along.isFinite ? min(max(along, 0), 1) : 0.5))
+    }
+
+    /// The `toolbar.dock` names, in the order the schema lists them.
+    static let edges = ["top", "bottom", "left", "right"]
+}
+
+/// The dock rules the command and the palette share (DESIGN.md §10.11), pure so they are unit-tested.
+enum ToolbarDockRules {
+    /// The design's default when nothing is saved: bottom on iPhone and compact widths, left in iPad landscape, top in
+    /// iPad portrait.
+    static func defaultDock(size: CGSize, compact: Bool) -> NibPaletteDock {
+        if compact { return NibPaletteDock(edge: .bottom) }
+        return NibPaletteDock(edge: size.width > size.height ? .leading : .top)
+    }
+
+    /// A dock this width does not offer (a side dock on a compact width) shows at the bottom. The saved dock is kept,
+    /// so the palette goes back to its side when the window widens again.
+    static func validated(_ dock: NibPaletteDock, compact: Bool) -> NibPaletteDock {
+        DropletDockModel(region: .zero, length: 0, thickness: 0, compact: compact).validated(dock)
+    }
+
+    /// Where the palette is: the saved dock (validated for this width), else the default.
+    static func effective(saved: ToolbarDockSetting?, defaultDock: NibPaletteDock, compact: Bool) -> NibPaletteDock {
+        guard let dock = saved?.dock else { return validated(defaultDock, compact: compact) }
+        return validated(dock, compact: compact)
+    }
+
+    /// `toolbar.dock`'s `along`: as asked, else where the palette is now when the axis stays, else the middle.
+    static func along(_ requested: Double?, edge: NibDock, current: NibPaletteDock) -> CGFloat {
+        if let requested { return CGFloat(min(max(requested, 0), 1)) }
+        return edge.isVertical == current.isVertical ? min(max(current.along, 0), 1) : 0.5
+    }
 }
 
 // MARK: - Settings
@@ -83,7 +127,7 @@ enum ToolbarSettings {
     static let layoutsPrefix = "toolbar.layouts."
     /// Last-used tool per document kind ("toolbar.lastTool.notebook"), this device only.
     static let lastToolPrefix = "toolbar.lastTool."
-    /// Where the palette docks, this device only.
+    /// Where the palette docks, this device only. Written by `toolbar.dock` only.
     static let dock = SettingKey<ToolbarDockSetting?>("toolbar.dock", default: nil)
     /// Declared by the text feature (F026): a pinned text tool stays selected after it places a box.
     static let textPinned = "text.pinned"
@@ -96,7 +140,8 @@ enum ToolbarSettings {
         s.declarePrefix(lastToolPrefix, synced: false,
                         summary: "Last-used canvas tool per document kind (toolbar.lastTool.notebook, .whiteboard).",
                         owner: owner, schema: .str("tool id"))
-        s.declare(dock, summary: "Where the tool palette docks: an edge and a 0–1 position along it.", owner: owner,
+        s.declare(dock, summary: "Where the tool palette docks on this device: an edge and a 0–1 position along it "
+                  + "(move it with toolbar.dock).", owner: owner,
                   schema: .obj(["edge": .str(choices: ToolbarDockSetting.edges), "along": .num(min: 0, max: 1)],
                                required: ["edge"]))
     }
@@ -134,6 +179,12 @@ enum ToolbarStore {
         s.setJSON(ToolbarSettings.layoutsPrefix + name, nil)
     }
 
+    static func dock(_ s: SettingsStore) -> ToolbarDockSetting? { s.get(ToolbarSettings.dock) }
+
+    static func setDock(_ dock: NibPaletteDock, _ s: SettingsStore) {
+        s.set(ToolbarSettings.dock, ToolbarDockSetting(dock))
+    }
+
     /// Trimmed; 1–64 characters on one line.
     static func validName(_ raw: String) throws -> String {
         let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -157,6 +208,7 @@ enum ToolbarCommands {
         r.register(ToolbarSaveLayout.self)
         r.register(ToolbarApplyLayout.self)
         r.register(ToolbarDeleteLayout.self)
+        r.register(ToolbarDock.self)
     }
 
     static let exampleLayout = try! JSONValue.parse(
@@ -273,11 +325,13 @@ struct ToolbarLayouts: NibCommand {
         var items: [ItemState]
         /// Whether the palette shows in the current window (`toolbar.setVisible`); absent without a window.
         var visible: Bool?
+        /// Where the palette docks in the current window (`toolbar.dock`).
+        var dock: ToolbarDock.Position
     }
 
     static let descriptor = CommandDescriptor(
         id: "toolbar.layouts", title: "Toolbar Layouts",
-        summary: "List saved toolbar layouts, the current layout, every palette item with whether it is on the palette, and whether the palette shows in this window.",
+        summary: "List saved toolbar layouts, the current layout, every palette item with whether it is on the palette, whether the palette shows and where it docks.",
         params: .empty, examples: [[:]], effect: .read, target: .app)
 
     static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> Output {
@@ -297,7 +351,8 @@ struct ToolbarLayouts: NibCommand {
             ToolbarStore.saved(name, s).map { NamedToolbarLayout(name: name, layout: $0) }
         }
         return Output(current: current, layouts: layouts, items: items,
-                      visible: ctx.activeSession.map { runtime.isVisible($0) })
+                      visible: ctx.activeSession.map { runtime.isVisible($0) },
+                      dock: ToolbarDock.Position(runtime.currentDock(ctx.activeSession)))
     }
 }
 
@@ -372,5 +427,75 @@ struct ToolbarDeleteLayout: NibCommand {
         }
         ToolbarStore.delete(name, s)
         return Output(deleted: name)
+    }
+}
+
+/// Moves the tool palette to a dock (DESIGN.md §10.11). Every dock change runs it: the palette's own drags (its
+/// `dock` binding), the "Move palette to…" accessibility actions, ⌘K, plugins and the assistant. It persists the dock
+/// per device, registers its inverse on the window's UndoManager ("Move Palette"), and returns `previous`: a caller
+/// that is not the user undoes it by calling `toolbar.dock` again with that.
+struct ToolbarDock: NibCommand {
+    struct Params: Codable {
+        var dock: String
+        var along: Double?
+    }
+
+    /// A dock as `toolbar.dock` takes it.
+    struct Position: Codable, Equatable {
+        var dock: String
+        var along: Double
+
+        init(dock: String, along: Double) {
+            self.dock = dock
+            self.along = along
+        }
+
+        init(_ d: NibPaletteDock) {
+            let setting = ToolbarDockSetting(d)
+            self.init(dock: setting.edge, along: setting.along)
+        }
+
+        var params: JSONValue { ["dock": .string(dock), "along": .number(along)] }
+    }
+
+    struct Output: Codable {
+        var dock: String
+        var along: Double
+        /// Where the palette was: `toolbar.dock` with it undoes this call.
+        var previous: Position
+    }
+
+    static let compactRefusal = "iPhone docks the palette at the top or bottom"
+
+    static let descriptor = CommandDescriptor(
+        id: "toolbar.dock", title: "Move Palette",
+        summary: "Dock the tool palette at the top, bottom, left or right edge (iPhone: top or bottom), along 0–1 of it. Returns previous; call again with it to undo.",
+        params: .obj(["dock": .str("the edge; left and right are the leading and trailing edges",
+                                   choices: ToolbarDockSetting.edges),
+                      "along": .num("position along the edge: 0 leading or top end, 1 trailing or bottom end; default: where it is now, or the middle on a new axis",
+                                    min: 0, max: 1)],
+                     required: ["dock"]),
+        examples: [["dock": "right"]], effect: .session, target: .app)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        guard let edge = NibDock(commandValue: p.dock) else {
+            throw NibError(.invalidParams, "dock is top, bottom, left or right", path: "$.dock")
+        }
+        let runtime = try ctx.toolbarRuntime()
+        let session = ctx.activeSession
+        // An Undo or Redo of the window's UndoManager replays through here; it has registered the opposite step itself.
+        let isReplay = runtime.takeReplay(session, edge: edge, along: p.along)
+        if let along = p.along, !(along >= 0 && along <= 1) {
+            throw NibError(.invalidParams, "along is between 0 and 1", path: "$.along")
+        }
+        if edge.isVertical && runtime.isCompact(session) {
+            throw NibError(.invalidParams, compactRefusal, path: "$.dock", hint: "use top or bottom")
+        }
+        let previous = runtime.currentDock(session)
+        let next = NibPaletteDock(edge: edge, along: ToolbarDockRules.along(p.along, edge: edge, current: previous))
+        ToolbarStore.setDock(next, ctx.services.settings)
+        if !isReplay { runtime.registerUndo(from: previous, to: next, session: session) }
+        let stored = Position(next)
+        return Output(dock: stored.dock, along: stored.along, previous: Position(previous))
     }
 }

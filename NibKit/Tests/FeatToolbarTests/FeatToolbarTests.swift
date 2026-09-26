@@ -41,6 +41,30 @@ struct TestPresetSelect: NibCommand {
     static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> NoResult { NoResult() }
 }
 
+/// What the dock spy saw: the params of every `toolbar.dock` call, in order.
+final class DockLog {
+    static let key = "testtools.dockLog"
+    var calls: [JSONValue] = []
+}
+
+/// Stand-in for a plugin's command hook on `toolbar.dock`: records each call and leaves its params alone.
+struct TestDockSpy: NibCommand {
+    struct Params: Codable {
+        var command: String
+        var params: JSONValue
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "testtools.dockSpy", title: "Dock Spy", summary: "Stand-in hook: records toolbar.dock calls.",
+        params: .obj(["command": .str(), "params": .anything()], required: ["command", "params"]),
+        examples: [["command": "toolbar.dock", "params": ["dock": "top"]]], effect: .read, target: .app)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
+        ctx.services.get(DockLog.key, as: DockLog.self)?.calls.append(p.params)
+        return NoResult()
+    }
+}
+
 /// The library's synced prefs shared by two devices (one key per entry, like the Library Store).
 final class SharedPrefs: SyncedSettingsBackend {
     private var values: [String: JSONValue] = [:]
@@ -268,26 +292,221 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertEqual(ToolbarStore.saved("Lecture", ipad.app.settings)?.hidden.contains("eraser.item"), true)
     }
 
-    /// The dock is stored per device and read back; iPhone docks horizontally only.
-    func testDockPersistsAndCompactIgnoresVerticalEdges() async throws {
-        let h = harness()
-        let model = ToolbarModel(app: h.app, session: h.session)
-        let landscape = CGSize(width: 1180, height: 820)
-        let phone = CGSize(width: 390, height: 844)
-        var dock = model.dock(for: landscape, compact: false)
-        XCTAssertEqual(dock.edge.rawValue, "leading")
-        XCTAssertEqual(model.dock(for: CGSize(width: 820, height: 1180), compact: false).edge.rawValue, "top")
-        XCTAssertEqual(model.dock(for: phone, compact: true).edge.rawValue, "bottom")
+    private static let landscape = CGSize(width: 1180, height: 820)
+    private static let portrait = CGSize(width: 820, height: 1180)
+    private static let phone = CGSize(width: 390, height: 844)
 
-        dock.edge = .trailing
-        dock.along = 0.25
-        model.setDock(dock)
-        try await waitUntil("the dock is stored") {
-            h.app.settings.json(ToolbarSettings.dock.name)?["edge"]?.stringValue == "trailing"
+    private func toolbarRuntime(_ h: Harness) throws -> ToolbarRuntime {
+        try XCTUnwrap(h.app.services.get(ToolbarRuntime.serviceKey, as: ToolbarRuntime.self))
+    }
+
+    /// An iPad window in landscape (compact: an iPhone-width one), as the palette reports it.
+    private func window(_ h: Harness, compact: Bool = false) throws -> ToolbarRuntime {
+        let runtime = try toolbarRuntime(h)
+        runtime.windowDidChange(h.session, size: compact ? Self.phone : Self.landscape, compact: compact)
+        return runtime
+    }
+
+    private func dock(_ edge: String, _ along: Double = 0.5) throws -> ToolbarDockSetting {
+        let setting = ToolbarDockSetting(edge: edge, along: along)
+        XCTAssertNotNil(setting.dock, "\(edge) is a dock")
+        return setting
+    }
+
+    private func expectInvalid(_ h: Harness, _ params: JSONValue, as principal: Principal = .user,
+                               path: String? = nil, _ what: String) async {
+        do {
+            try await h.run("toolbar.dock", params, as: principal)
+            XCTFail(what)
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams, what)
+            if let path { XCTAssertEqual(e.path, path, what) }
+        } catch {
+            XCTFail("\(what): \(error)")
         }
+    }
+
+    /// The dock rules shared by the command and the palette: defaults, compact validation, `along`, stored names.
+    func testDockRules() throws {
+        XCTAssertEqual(ToolbarDockRules.defaultDock(size: Self.landscape, compact: false).edge.commandValue, "left")
+        XCTAssertEqual(ToolbarDockRules.defaultDock(size: Self.portrait, compact: false).edge.commandValue, "top")
+        XCTAssertEqual(ToolbarDockRules.defaultDock(size: Self.phone, compact: true).edge.commandValue, "bottom")
+
+        let right = try XCTUnwrap(try dock("right", 0.2).dock)
+        XCTAssertEqual(ToolbarDockSetting(ToolbarDockRules.validated(right, compact: false)), try dock("right", 0.2))
+        XCTAssertEqual(ToolbarDockSetting(ToolbarDockRules.validated(right, compact: true)), try dock("bottom"),
+                       "a side dock shows at the bottom on a compact width")
+
+        // along: as asked, else kept on the same axis, else the middle.
+        XCTAssertEqual(ToolbarDockRules.along(0.9, edge: .leading, current: right), 0.9)
+        XCTAssertEqual(ToolbarDockRules.along(nil, edge: .leading, current: right), 0.2, accuracy: 1e-9)
+        XCTAssertEqual(ToolbarDockRules.along(nil, edge: .top, current: right), 0.5)
+
+        // Left and right are the leading and trailing edges; an older build's "trailing" still reads.
+        XCTAssertEqual(right.edge, .trailing)
+        XCTAssertEqual(try dock("left").dock?.edge, .leading)
+        XCTAssertEqual(ToolbarDockSetting(edge: "trailing", along: 0.3).dock.map { ToolbarDockSetting($0) },
+                       try dock("right", 0.3))
+        XCTAssertNil(ToolbarDockSetting(edge: "middle", along: 0.3).dock)
+    }
+
+    /// Acceptance: `toolbar.dock`'s schema and example validate, and bad params are refused for every caller.
+    func testDockCommandSchema() async throws {
+        let h = harness()
+        _ = try window(h)
+        let d = try XCTUnwrap(h.app.commands.entry("toolbar.dock")).descriptor
+        XCTAssertEqual(d.effect, .session)
+        XCTAssertEqual(d.examples, [["dock": "right"]])
+        for example in d.examples { XCTAssertEqual(d.params.validate(example), [], "the example validates") }
+        let good: [JSONValue] = [["dock": "top"], ["dock": "bottom", "along": 0], ["dock": "left", "along": 1]]
+        for params in good { XCTAssertEqual(d.params.validate(params), [], "\(params)") }
+        let bad: [JSONValue] = [[:], ["dock": "middle"], ["dock": "leading"], ["dock": "top", "along": 1.5],
+                                ["dock": "top", "along": "half"], ["along": 0.5]]
+        for params in bad { XCTAssertFalse(d.params.validate(params).isEmpty, "\(params) fails the schema") }
+
+        let ai = Principal.ai("chat")
+        await expectInvalid(h, ["dock": "middle"], as: ai, path: "$.dock", "an unknown dock is refused")
+        await expectInvalid(h, ["dock": "top", "along": 2], as: ai, path: "$.along", "along past 1 is refused")
+        await expectInvalid(h, ["dock": "middle"], path: "$.dock", "the user's call checks the dock too")
+        await expectInvalid(h, ["dock": "top", "along": -0.1], path: "$.along", "and along")
+        XCTAssertNil(ToolbarStore.dock(h.app.settings), "nothing is stored")
+    }
+
+    /// Acceptance: it persists `toolbar.dock` per device, maps left and right to the leading and trailing edges, and a
+    /// fresh palette reads it back.
+    func testDockPersistsPerDeviceAndMapsLeftAndRight() async throws {
+        let h = harness()
+        _ = try window(h)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertEqual(ToolbarDockSetting(model.dock(for: Self.landscape, compact: false)), try dock("left"))
+        XCTAssertEqual(ToolbarDockSetting(model.dock(for: Self.portrait, compact: false)), try dock("top"))
+        XCTAssertEqual(ToolbarDockSetting(model.dock(for: Self.phone, compact: true)), try dock("bottom"))
+
+        let moved = try await h.run("toolbar.dock", ["dock": "right", "along": 0.25])
+        XCTAssertEqual(moved["dock"]?.stringValue, "right")
+        XCTAssertEqual(moved["along"]?.doubleValue, 0.25)
+        XCTAssertEqual(ToolbarStore.dock(h.app.settings), try dock("right", 0.25))
+        XCTAssertEqual(h.app.settings.json("toolbar.dock")?["edge"]?.stringValue, "right")
+        XCTAssertFalse(h.app.settings.descriptor("toolbar.dock")?.synced ?? true, "the dock is per device")
+
         let fresh = ToolbarModel(app: h.app, session: h.session)
-        XCTAssertEqual(fresh.dock(for: landscape, compact: false), dock)
-        XCTAssertEqual(fresh.dock(for: phone, compact: true).edge.rawValue, "bottom", "a side dock does not apply on iPhone")
+        let shown = fresh.dock(for: Self.landscape, compact: false)
+        XCTAssertEqual(shown.edge, .trailing, "right is the trailing edge")
+        XCTAssertEqual(ToolbarDockSetting(shown), try dock("right", 0.25))
+        XCTAssertEqual(ToolbarDockSetting(fresh.dock(for: Self.phone, compact: true)), try dock("bottom"),
+                       "a side dock shows at the bottom on iPhone")
+
+        try await h.run("toolbar.dock", ["dock": "left"])
+        XCTAssertEqual(ToolbarStore.dock(h.app.settings), try dock("left", 0.25), "same axis: along stays")
+        try await h.run("toolbar.dock", ["dock": "bottom"])
+        XCTAssertEqual(ToolbarStore.dock(h.app.settings), try dock("bottom", 0.5), "new axis: the middle")
+
+        let listed = try await h.run("toolbar.layouts")
+        XCTAssertEqual(listed["dock"]?["dock"]?.stringValue, "bottom", "readable through the query API")
+        withExtendedLifetime(model) {}
+    }
+
+    /// Acceptance: compact widths refuse the side docks.
+    func testCompactWidthsRefuseTheSideDocks() async throws {
+        let h = harness()
+        _ = try window(h, compact: true)
+        for edge in ["left", "right"] {
+            do {
+                try await h.run("toolbar.dock", ["dock": .string(edge)], as: .ai("chat"))
+                XCTFail("\(edge) is refused on a compact width")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams)
+                XCTAssertEqual(e.message, ToolbarDock.compactRefusal)
+            }
+        }
+        XCTAssertNil(ToolbarStore.dock(h.app.settings))
+        let moved = try await h.run("toolbar.dock", ["dock": "top"], as: .ai("chat"))
+        XCTAssertEqual(moved["previous"]?["dock"]?.stringValue, "bottom", "iPhone starts at the bottom")
+        XCTAssertEqual(ToolbarStore.dock(h.app.settings), try dock("top"))
+    }
+
+    /// Acceptance: the result's `previous`, replayed by a caller that is not the user, restores the dock.
+    func testDockReturnsPreviousWhoseReplayRestoresIt() async throws {
+        let h = harness()
+        _ = try window(h)
+        let ai = Principal.ai("chat")
+        let landscapeDefault: JSONValue = ["dock": "left", "along": 0.5]
+        let bottom: JSONValue = ["dock": "bottom", "along": 0.8]
+        let right: JSONValue = ["dock": "right", "along": 0.5]
+        let first = try await h.run("toolbar.dock", bottom, as: ai)
+        XCTAssertEqual(first["previous"], landscapeDefault, "nothing saved: the landscape default")
+
+        let moved = try await h.run("toolbar.dock", ["dock": "right"], as: ai)
+        XCTAssertEqual(moved["along"]?.doubleValue, 0.5)
+        let previous = try XCTUnwrap(moved["previous"])
+        XCTAssertEqual(previous, bottom)
+
+        let undone = try await h.run("toolbar.dock", previous, as: ai)
+        XCTAssertEqual(ToolbarStore.dock(h.app.settings), try dock("bottom", 0.8))
+        XCTAssertEqual(undone["previous"], right, "and that undo can be undone in turn")
+    }
+
+    /// Acceptance: a drag's release goes through `toolbar.dock` (command hooks see it), the palette shows the new
+    /// dock at once, and a refused move falls back.
+    func testADragReleaseDocksThroughTheCommand() async throws {
+        let h = harness()
+        let runtime = try window(h)
+        let log = DockLog()
+        h.app.services.set(log, for: DockLog.key)
+        h.app.commands.register(TestDockSpy.self)
+        h.app.bus.hooks.register(CommandHookDescriptor(id: "testtools.dockSpy", owner: TestToolsFeature.id,
+                                                       commands: ["toolbar.dock"], command: TestDockSpy.descriptor.id))
+        let model = ToolbarModel(app: h.app, session: h.session)
+        let top = try dock("top", 0.25)
+        let released = try XCTUnwrap(top.dock)
+        let call: JSONValue = ["dock": "top", "along": 0.25]
+
+        model.requestDock(released)
+        XCTAssertEqual(ToolbarDockSetting(model.dock(for: Self.landscape, compact: false)), top, "the palette lands at once")
+        try await waitUntil("toolbar.dock stores the release") { ToolbarStore.dock(h.app.settings) == top }
+        XCTAssertEqual(log.calls, [call])
+        try await waitUntil("the move settles") { model.pendingDock == nil }
+        XCTAssertEqual(ToolbarDockSetting(model.dock(for: Self.landscape, compact: false)), top)
+
+        // A side dock on a compact width is refused: the palette stays where it was.
+        runtime.windowDidChange(h.session, size: Self.phone, compact: true)
+        model.requestDock(try XCTUnwrap(try dock("left").dock))
+        try await waitUntil("the refused move settles") { model.pendingDock == nil }
+        XCTAssertEqual(ToolbarDockSetting(model.dock(for: Self.phone, compact: true)), top)
+        XCTAssertEqual(log.calls.count, 2)
+    }
+
+    /// Undo and Redo of the window's UndoManager ("Move Palette") replay the dock through the command.
+    func testDockUndoAndRedoOnTheWindowsUndoManager() async throws {
+        let h = harness()
+        let runtime = try window(h)
+        let undo = UndoManager()
+        undo.groupsByEvent = false
+        runtime.setUndoManager(undo, for: h.session)
+
+        try await h.run("toolbar.dock", ["dock": "right", "along": 0.25])
+        XCTAssertTrue(undo.canUndo)
+        XCTAssertEqual(undo.undoActionName, "Move Palette")
+
+        undo.undo()
+        try await waitUntil("Undo moves the palette back") { ToolbarStore.dock(h.app.settings)?.edge == "left" }
+        XCTAssertEqual(ToolbarStore.dock(h.app.settings), try dock("left"))
+        XCTAssertTrue(undo.canRedo)
+        XCTAssertFalse(undo.canUndo, "the replay registers no second step")
+
+        undo.redo()
+        try await waitUntil("Redo moves it again") { ToolbarStore.dock(h.app.settings)?.edge == "right" }
+        XCTAssertEqual(ToolbarStore.dock(h.app.settings), try dock("right", 0.25))
+        XCTAssertTrue(undo.canUndo)
+        XCTAssertFalse(undo.canRedo)
+
+        // A move to where the palette already is adds no step of its own; a window that goes away takes its steps.
+        try await h.run("toolbar.dock", ["dock": "right", "along": 0.25])
+        XCTAssertEqual(ToolbarStore.dock(h.app.settings), try dock("right", 0.25))
+        undo.undo()
+        try await waitUntil("Undo again") { ToolbarStore.dock(h.app.settings)?.edge == "left" }
+        runtime.setUndoManager(nil, for: h.session)
+        XCTAssertFalse(undo.canRedo)
     }
 
     /// DESIGN.md §14.2: iPad shows three quick inks, iPhone one, the current ink.
@@ -347,6 +566,16 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertNil(keys.first { $0.id == "toolbar.key.ruler.item" }, "P already belongs to the pen")
         XCTAssertEqual(Set(keys.map { ToolbarShortcuts.normalized($0.shortcut) }).count, keys.count, "no key twice")
 
+        // The palette shows each key the shell runs as a hint, and registers none of them itself.
+        let model = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertEqual(model.shown.first { $0.id == "pen" }?.keyHint, KeyShortcut("p"))
+        let ruler = try XCTUnwrap(model.more.first { $0.id == "ruler.item" })
+        XCTAssertNil(ruler.keyHint, "the ruler's P is the pen's")
+        XCTAssertEqual(ToolKeyHint.keyboardShortcut(KeyShortcut("p")), KeyboardShortcut("p", modifiers: []))
+        XCTAssertEqual(ToolKeyHint.keyboardShortcut(KeyShortcut("up", [.command, .shift])),
+                       KeyboardShortcut(.upArrow, modifiers: [.command, .shift]))
+        XCTAssertNil(ToolKeyHint.keyboardShortcut(KeyShortcut("pp")))
+
         h.app.ui.toolbar.register(ToolbarItemDescriptor(
             id: "stamps.stamp", title: "Stamp", icon: "seal", group: .tools, order: 50, owner: "com.example.stamps",
             toolID: "com.example.stamps.tool", shortcut: KeyShortcut("k")))
@@ -397,18 +626,18 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertEqual(ActiveToolMenuHost.source(for: pen, app: h.app), .toolMenus)
         XCTAssertEqual(ActiveToolMenuHost.source(for: eraser, app: h.app), .descriptor)
         XCTAssertEqual(ActiveToolMenuHost.source(for: text, app: h.app), .absent)
-        XCTAssertNotNil(model.options(for: "pen"))
+        XCTAssertNotNil(model.toolOptions(for: "pen"))
 
         h.session.visibleRect = Rect(x: 0, y: 0, width: 400, height: 600)
         h.session.visibleRect = Rect(x: 0, y: 10, width: 400, height: 600)
         XCTAssertFalse(model.optionsCollapsed)
         h.session.visibleRect = Rect(x: 0, y: 40, width: 400, height: 600)
         XCTAssertTrue(model.optionsCollapsed)
-        XCTAssertNil(model.options(for: "pen"))
+        XCTAssertNil(model.toolOptions(for: "pen"))
 
         h.session.tool = "eraser"
         XCTAssertFalse(model.optionsCollapsed)
-        XCTAssertNotNil(model.options(for: "eraser"))
+        XCTAssertNotNil(model.toolOptions(for: "eraser"))
 
         // A zoom changes the visible size: not a scroll.
         h.session.visibleRect = Rect(x: 0, y: 40, width: 200, height: 300)

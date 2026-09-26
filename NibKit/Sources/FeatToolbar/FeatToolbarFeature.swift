@@ -1,6 +1,8 @@
 import SwiftUI
+import UIKit
 import Combine
 import NibContracts
+import NibDesign
 
 /// F016 Toolbar & tool switching: the document's tool palette (`ui.screens.toolbar`), tool switching (sticky and
 /// non-sticky tools, last tool per document kind), single-key tool shortcuts, the active tool's options bar, toolbar
@@ -58,6 +60,14 @@ public enum FeatToolbarFeature: NibFeature {
     }
 }
 
+/// What `toolbar.dock` needs to know about one window, reported by its palette: the size class (compact widths dock
+/// at the top or bottom only), the size (the default dock follows the orientation) and the window's UndoManager.
+struct ToolbarWindowState {
+    var compact: Bool
+    var size: CGSize
+    weak var undoManager: UndoManager? = nil
+}
+
 /// App-wide toolbar state, shared by the commands and every window's palette (a service, `serviceKey`).
 @MainActor
 final class ToolbarRuntime: ObservableObject {
@@ -66,11 +76,86 @@ final class ToolbarRuntime: ObservableObject {
     private(set) weak var app: NibApp?
     /// Windows whose palette is hidden (`toolbar.setVisible`). Window state: never persisted.
     @Published private(set) var hiddenSessions: Set<NibID> = []
+    private var windows: [NibID: ToolbarWindowState] = [:]
+    /// Docks an Undo or Redo is replaying through `toolbar.dock`, per window: that run registers no undo of its own.
+    private var replays: [NibID: ToolbarDockSetting] = [:]
     private var cancellables = Set<AnyCancellable>()
     private var started = false
 
     init(app: NibApp) {
         self.app = app
+    }
+
+    // MARK: Windows and docks
+
+    func windowDidChange(_ session: EditorSession, size: CGSize, compact: Bool) {
+        var state = windows[session.id] ?? ToolbarWindowState(compact: compact, size: size)
+        state.compact = compact
+        state.size = size
+        windows[session.id] = state
+    }
+
+    /// The palette's window: its UndoManager takes the "Move Palette" steps. nil detaches it and drops those steps.
+    func setUndoManager(_ manager: UndoManager?, for session: EditorSession) {
+        var state = windows[session.id] ?? ToolbarWindowState(compact: Self.deviceIsCompact, size: .zero)
+        if let old = state.undoManager, old !== manager { old.removeAllActions(withTarget: self) }
+        state.undoManager = manager
+        windows[session.id] = state
+    }
+
+    /// Before a window reports its size class, the device decides: iPhone is compact.
+    private static var deviceIsCompact: Bool { UIDevice.current.userInterfaceIdiom == .phone }
+
+    func isCompact(_ session: EditorSession?) -> Bool {
+        session.flatMap { windows[$0.id]?.compact } ?? Self.deviceIsCompact
+    }
+
+    /// Where the palette of `session`'s window docks now, from the stored setting (never a drag in flight).
+    func currentDock(_ session: EditorSession?) -> NibPaletteDock {
+        let compact = isCompact(session)
+        let size = session.flatMap { windows[$0.id]?.size } ?? .zero
+        let fallback = size == .zero ? NibPaletteDock(edge: compact ? .bottom : .leading)
+                                     : ToolbarDockRules.defaultDock(size: size, compact: compact)
+        return ToolbarDockRules.effective(saved: app.flatMap { ToolbarStore.dock($0.settings) }, defaultDock: fallback,
+                                          compact: compact)
+    }
+
+    /// Registers the step back from `next` to `previous` on the window's UndoManager, named "Move Palette".
+    func registerUndo(from previous: NibPaletteDock, to next: NibPaletteDock, session: EditorSession?) {
+        guard previous != next, let session, let manager = windows[session.id]?.undoManager else { return }
+        register(on: manager, restoring: previous, from: next, session: session)
+    }
+
+    /// Undoing the step registers the opposite step at once (on the redo stack while undoing, on the undo stack while
+    /// redoing), then moves the palette through `toolbar.dock`, so an undo is observable and persisted like any move.
+    /// Without a run loop grouping by event (a test's manager) the step gets a group of its own.
+    private func register(on manager: UndoManager, restoring target: NibPaletteDock, from current: NibPaletteDock,
+                          session: EditorSession) {
+        let ownGroup = !manager.groupsByEvent && manager.groupingLevel == 0
+        if ownGroup { manager.beginUndoGrouping() }
+        manager.registerUndo(withTarget: self) { [weak session, weak manager] runtime in
+            MainActor.assumeIsolated {
+                guard let session else { return }
+                runtime.replay(target, from: current, session: session, manager: manager)
+            }
+        }
+        manager.setActionName(String(localized: "Move Palette"))
+        if ownGroup { manager.endUndoGrouping() }
+    }
+
+    private func replay(_ target: NibPaletteDock, from current: NibPaletteDock, session: EditorSession,
+                        manager: UndoManager?) {
+        if let manager { register(on: manager, restoring: current, from: target, session: session) }
+        replays[session.id] = ToolbarDockSetting(target)
+        app?.perform(ToolbarDock.descriptor.id, ToolbarDock.Position(target).params, session: session)
+    }
+
+    /// True (once) when this `toolbar.dock` call is the replay an Undo or Redo started.
+    func takeReplay(_ session: EditorSession?, edge: NibDock, along: Double?) -> Bool {
+        guard let session, let pending = replays[session.id], pending.edge == edge.commandValue, let along,
+              abs(along - pending.along) < 1e-9 else { return false }
+        replays[session.id] = nil
+        return true
     }
 
     func isVisible(_ session: EditorSession) -> Bool { !hiddenSessions.contains(session.id) }
