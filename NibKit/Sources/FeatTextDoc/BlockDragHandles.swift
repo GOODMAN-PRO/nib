@@ -35,6 +35,7 @@ enum BlockReorder {
     }
 
     /// The command as a call.
+    @MainActor
     static func call(_ params: BlockMove.Params) -> CommandCall {
         var p: [String: JSONValue] = ["ref": .string(params.ref)]
         if let after = params.after { p["after"] = .string(after) }
@@ -82,7 +83,7 @@ final class BlockHandleView: UIView {
 
 /// Places the one handle of an editor, shows the block menu from it and runs the drag.
 @MainActor
-final class BlockHandleOverlay: NSObject, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
+final class BlockHandleOverlay: NSObject, UIGestureRecognizerDelegate {
     private weak var controller: TextDocEditingController?
     let handle = BlockHandleView()
     private var hovered: NibID?
@@ -196,8 +197,8 @@ final class BlockHandleOverlay: NSObject, UIGestureRecognizerDelegate, UIEditMen
         editMenu.presentEditMenu(with: config)
     }
 
-    func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
-                             suggestedActions: [UIMenuElement]) -> UIMenu? {
+    /// The block menu for the handle's block (the edit menu's delegate asks for it).
+    func handleMenu() -> UIMenu? {
         guard let editor = editor, let id = handle.block, let block = editor.block(id) else { return nil }
         return editor.blockMenu(for: block)
     }
@@ -393,5 +394,13 @@ final class BlockHandleOverlay: NSObject, UIGestureRecognizerDelegate, UIEditMen
               let params = BlockReorder.move(editor.blocks.map { $0.id }, moving: id, toGap: gap, doc: editor.documentID)
         else { return }
         await controller.execute([BlockReorder.call(params)])
+    }
+}
+
+// UIKit calls the edit-menu delegate on the main thread; the protocol just is not annotated for it.
+extension BlockHandleOverlay: @preconcurrency UIEditMenuInteractionDelegate {
+    func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
+                             suggestedActions: [UIMenuElement]) -> UIMenu? {
+        handleMenu()
     }
 }

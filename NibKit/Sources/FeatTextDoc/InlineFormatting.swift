@@ -124,8 +124,17 @@ enum InlineFormat {
 
     /// Whether every character of `range` carries the style (false when the range holds no characters).
     static func isActive(_ style: InlineStyle, in text: RichText, range: NSRange, kind: BlockKind) -> Bool {
-        let pieces = attributes(in: text, range: range)
-        return !pieces.isEmpty && pieces.allSatisfy { has(style, $0, kind: kind) }
+        isActive(style, pieces: attributes(in: text, range: range), kind: kind)
+    }
+
+    static func isActive(_ style: InlineStyle, pieces: [TextAttributes], kind: BlockKind) -> Bool {
+        !pieces.isEmpty && pieces.allSatisfy { has(style, $0, kind: kind) }
+    }
+
+    /// The first piece when every piece has its colour and highlight (menus check the shared one), else nil.
+    static func shared(_ pieces: [TextAttributes]) -> TextAttributes? {
+        guard let first = pieces.first else { return nil }
+        return pieces.allSatisfy({ $0.color == first.color && $0.highlight == first.highlight }) ? first : nil
     }
 
     /// The attributes typing continues at `offset`: those of the character before it, else the one after.
@@ -277,22 +286,24 @@ extension TextDocEditingController {
         refreshFormattingState()
     }
 
-    /// Whether the style is on for the focused selection (or for what is typed next).
-    func isInlineActive(_ style: InlineStyle) -> Bool {
-        guard let tv = editor?.focusedTextView, let kind = formattingKind(tv), let blockStyle = tv.style else { return false }
+    /// What the focused selection carries, read once: the attributes of every character in it, or of what is typed
+    /// next when nothing is selected. nil without a focused text view.
+    func selectionAttributes() -> (kind: BlockKind, pieces: [TextAttributes])? {
+        guard let tv = editor?.focusedTextView, let kind = formattingKind(tv), let blockStyle = tv.style else { return nil }
         let range = tv.selectedRange
-        if range.length == 0 { return InlineFormat.has(style, typingAttributes(tv), kind: kind) }
-        return InlineFormat.isActive(style, in: blockStyle.richText(from: tv.attributedText), range: range, kind: kind)
+        if range.length == 0 { return (kind, [typingAttributes(tv)]) }
+        return (kind, InlineFormat.attributes(in: blockStyle.richText(from: tv.attributedText), range: range))
     }
 
-    /// The colour of the focused selection when it has one (for the checkmarks in the colour menus).
+    /// Whether the style is on for the focused selection (or for what is typed next).
+    func isInlineActive(_ style: InlineStyle) -> Bool {
+        guard let s = selectionAttributes() else { return false }
+        return InlineFormat.isActive(style, pieces: s.pieces, kind: s.kind)
+    }
+
+    /// The colour and highlight the whole selection shares (for the checkmarks in the colour menus).
     func currentAttributes() -> TextAttributes? {
-        guard let tv = editor?.focusedTextView, let blockStyle = tv.style else { return nil }
-        let range = tv.selectedRange
-        if range.length == 0 { return typingAttributes(tv) }
-        let pieces = InlineFormat.attributes(in: blockStyle.richText(from: tv.attributedText), range: range)
-        guard let first = pieces.first else { return nil }
-        return pieces.allSatisfy({ $0.color == first.color && $0.highlight == first.highlight }) ? first : nil
+        selectionAttributes().flatMap { InlineFormat.shared($0.pieces) }
     }
 
     // MARK: Menus
@@ -382,6 +393,12 @@ final class FormattingBar: UIView {
 
     override var intrinsicContentSize: CGSize {
         CGSize(width: UIView.noIntrinsicMetric, height: NibMetrics.hitTarget + 2 * NibSpacing.xs)
+    }
+
+    /// Shown above a keyboard: mirror the block that has it.
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { controller?.refreshFormattingState() }
     }
 
     private func build() {
@@ -533,9 +550,11 @@ extension TextDocEditingController {
               let block = editor.block(id), let kind = formattingKind(tv) else { return s }
         s.enabled = true
         s.isCaption = tv.role == .caption
-        s.available = Set(InlineStyle.toggles.filter { InlineFormat.isAvailable($0, kind: kind) })
-        s.active = Set(InlineStyle.toggles.filter { s.available.contains($0) && isInlineActive($0) })
-        let attrs = currentAttributes()
+        let available = Set(InlineStyle.toggles.filter { InlineFormat.isAvailable($0, kind: kind) })
+        let pieces = selectionAttributes()?.pieces ?? []
+        s.available = available
+        s.active = Set(InlineStyle.toggles.filter { available.contains($0) && InlineFormat.isActive($0, pieces: pieces, kind: kind) })
+        let attrs = InlineFormat.shared(pieces)
         s.highlighted = attrs?.highlight != nil
         s.coloured = attrs?.color != nil
         let indent = block.indent ?? 0
@@ -545,8 +564,9 @@ extension TextDocEditingController {
         return s
     }
 
+    /// Updates the bar while it is on screen (it reads the focused selection, so not on every keystroke elsewhere).
     func refreshFormattingState() {
-        guard let bar = formattingBarIfLoaded else { return }
+        guard let bar = formattingBarIfLoaded, bar.window != nil else { return }
         bar.update(formattingState())
     }
 

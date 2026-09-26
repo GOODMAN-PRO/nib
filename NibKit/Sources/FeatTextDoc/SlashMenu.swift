@@ -119,6 +119,7 @@ enum SlashPlan: Equatable {
     case insertBelow
 }
 
+@MainActor
 enum SlashPlanner {
     struct Result: Equatable {
         var calls: [CommandCall]
@@ -180,6 +181,58 @@ enum SlashPlanner {
                 ? Result(calls: calls, focus: newID, focusResultOf: nil)
                 : Result(calls: calls, focus: nil, focusResultOf: insertIndex)
         }
+    }
+}
+
+// MARK: - Typed block shortcuts (pure, tested)
+
+/// Markdown-style shortcuts at the start of a text line: "# " makes a heading, "- " a bulleted list, "1. " a numbered
+/// one, "[] " a to-do, "> " a quote, "``` " code and "--- " a divider. The prefix leaves the text and the block turns
+/// into the kind with one block.update, like Turn Into.
+@MainActor
+enum MarkdownShortcut {
+    struct Rule: Equatable {
+        let kind: BlockKind
+        var checked: Bool?
+    }
+
+    /// The rule for the text typed before the space, nil when it is not a shortcut.
+    static func rule(for prefix: String) -> Rule? {
+        switch prefix {
+        case "#": return Rule(kind: .heading1)
+        case "##": return Rule(kind: .heading2)
+        case "###": return Rule(kind: .heading3)
+        case "-", "*", "+": return Rule(kind: .bullet)
+        case "[]", "[ ]": return Rule(kind: .todo, checked: false)
+        case "[x]", "[X]": return Rule(kind: .todo, checked: true)
+        case ">": return Rule(kind: .quote)
+        case "```": return Rule(kind: .code)
+        case "---": return Rule(kind: .divider)
+        default:
+            // "1." to "999.": a numbered list.
+            let digits = prefix.dropLast()
+            guard prefix.hasSuffix("."), (1...3).contains(digits.count),
+                  digits.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
+            return Rule(kind: .numbered)
+        }
+    }
+
+    /// The calls for a shortcut typed in `block` (a paragraph), with `rest` the text after the prefix; nil when it
+    /// does not apply (a divider needs an otherwise empty line). The caret goes to the start of `focus`.
+    static func calls(_ rule: Rule, block: TextBlock, rest: RichText, doc: DocumentID,
+                      newID: NibID) -> (calls: [CommandCall], focus: NibID)? {
+        let ref = NodeRef.block(doc, block.id).description
+        if rule.kind == .divider {
+            guard rest.isEmpty else { return nil }
+            let paragraph = BlockKindDescriptor(id: "", title: "", icon: "", kind: .paragraph, owner: "",
+                                                params: ["kind": .string(BlockKind.paragraph.rawValue)])
+            return ([TurnInto.call(ref: ref, to: .divider),
+                     SlashPlanner.insertCall(paragraph, after: block.id, doc: doc, newID: newID)], newID)
+        }
+        guard let text = try? JSONValue.from(rest) else { return nil }
+        var params: [String: JSONValue] = ["ref": .string(ref), "kind": .string(rule.kind.rawValue), "text": text]
+        if let checked = rule.checked { params["checked"] = .bool(checked) }
+        return ([CommandCall(command: BlockUpdate.descriptor.id, params: .object(params))], block.id)
     }
 }
 
@@ -378,7 +431,7 @@ struct BlockKindMenuOverlay: View {
     @ObservedObject var state: BlockKindMenuState
     let dropletID: String
     /// In the editor's own hosting view (no floating host): its coordinates start at the view's corner.
-    let ignoresSafeArea: Bool
+    let fillsHostingView: Bool
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -389,7 +442,7 @@ struct BlockKindMenuOverlay: View {
             positioned
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .ignoresSafeArea(edges: ignoresSafeArea ? .all : [])
+        .ignoresSafeArea(edges: fillsHostingView ? .all : [])
     }
 
     @ViewBuilder
@@ -439,11 +492,11 @@ final class BlockKindMenuPresenter {
            let anchorRect = host.containerRect(rect, from: view),
            let bounds = host.containerRect(BlockKindMenuPresenter.visibleRect(cv), from: cv) {
             state.placement = MenuPlacement.make(anchor: anchorRect, bounds: bounds)
-            host.present(id, content: AnyView(BlockKindMenuOverlay(state: state, dropletID: id, ignoresSafeArea: false)))
+            host.present(id, content: AnyView(BlockKindMenuOverlay(state: state, dropletID: id, fillsHostingView: false)))
             self.host = host
             return
         }
-        let hosting = UIHostingController(rootView: BlockKindMenuOverlay(state: state, dropletID: id, ignoresSafeArea: true))
+        let hosting = UIHostingController(rootView: BlockKindMenuOverlay(state: state, dropletID: id, fillsHostingView: true))
         hosting.view.backgroundColor = .clear
         hosting.view.translatesAutoresizingMaskIntoConstraints = false
         editor.addChild(hosting)
@@ -521,6 +574,7 @@ extension TextDocEditingController {
             pickSlash(state.highlighted)
             return true
         }
+        if interceptMarkdown(change) { return true }
         guard change.replacement == "/", change.range.length == 0, !change.isCaption,
               BlockRules.isText(change.block.kind), change.block.kind != .code,
               change.textView.markedTextRange == nil,
@@ -528,6 +582,26 @@ extension TextDocEditingController {
         else { return false }
         pendingSlash = SlashSession(blockID: change.block.id, location: change.range.location)
         return false
+    }
+
+    /// A space after a Markdown prefix at the start of a paragraph turns it into the kind (the space is consumed).
+    func interceptMarkdown(_ change: TextDocTextChange) -> Bool {
+        guard let editor = editor, change.replacement == " ", change.range.length == 0, !change.isCaption,
+              change.block.kind == .paragraph, change.textView.markedTextRange == nil,
+              let tv = change.textView as? BlockTextView, let style = tv.style else { return false }
+        let text = tv.textStorage.string as NSString
+        let location = change.range.location
+        guard location > 0, location <= min(4, text.length),
+              let rule = MarkdownShortcut.rule(for: text.substring(to: location)) else { return false }
+        let rest = style.normalize(BlockText.split(style.richText(from: tv.attributedText), at: location).tail)
+        guard let plan = MarkdownShortcut.calls(rule, block: change.block, rest: rest, doc: editor.documentID,
+                                                newID: NibID.make()) else { return false }
+        Task { @MainActor [weak self] in
+            guard let self = self, await self.execute(plan.calls) != nil, let editor = self.editor else { return }
+            editor.focus(plan.focus, at: 0)
+            self.refreshFormattingState()
+        }
+        return true
     }
 
     /// Selection observer: opens the menu once the "/" is in the text, then follows the query or closes.

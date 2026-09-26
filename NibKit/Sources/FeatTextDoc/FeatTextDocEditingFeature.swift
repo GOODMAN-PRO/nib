@@ -374,9 +374,19 @@ final class TextDocEditingController {
             guard let self = self else { return }
             await self.flush()
             guard let editor = self.editor, let d = editor.app.content.keyCommands.get(descriptorID) else { return }
-            let done = await self.run(command: d.command, params: d.resolvedParams(for: editor.session))
-            if done != nil, shortcut == .deleteBlock {
+            guard let results = await self.run(command: d.command, params: d.resolvedParams(for: editor.session)) else {
+                return
+            }
+            switch shortcut {
+            case .deleteBlock where !results.isEmpty:
                 if let next = nextFocus { editor.focus(next, at: nil) } else { editor.view.endEditing(true) }
+            case .duplicate:
+                // The copy takes the caret, as a new line would.
+                if let ref = results.first?["ref"]?.stringValue, case let .block(_, copy)? = NodeRef(ref) {
+                    editor.focus(copy, at: nil)
+                }
+            default:
+                break
             }
             self.refreshFormattingState()
         }

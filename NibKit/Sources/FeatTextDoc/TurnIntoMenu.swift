@@ -20,6 +20,7 @@ enum TurnInto {
     }
 
     /// The one command that turns `ref` into `kind`.
+    @MainActor
     static func call(ref: String, to kind: BlockKind) -> CommandCall {
         CommandCall(command: BlockUpdate.descriptor.id, params: ["ref": .string(ref), "kind": .string(kind.rawValue)])
     }

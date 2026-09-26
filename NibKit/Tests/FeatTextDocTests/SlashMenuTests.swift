@@ -279,6 +279,53 @@ final class SlashMenuTests: XCTestCase {
         XCTAssertEqual(try live(h).suffix(2).map { $0.id.raw }, ["RULELINE01", "AFTERRULE01"])
     }
 
+    // MARK: Markdown-style shortcuts
+
+    func testMarkdownPrefixesTurnALineIntoTheirKind() async throws {
+        XCTAssertEqual(MarkdownShortcut.rule(for: "#")?.kind, .heading1)
+        XCTAssertEqual(MarkdownShortcut.rule(for: "##")?.kind, .heading2)
+        XCTAssertEqual(MarkdownShortcut.rule(for: "###")?.kind, .heading3)
+        XCTAssertNil(MarkdownShortcut.rule(for: "####"))
+        for bullet in ["-", "*", "+"] { XCTAssertEqual(MarkdownShortcut.rule(for: bullet)?.kind, .bullet, bullet) }
+        XCTAssertEqual(MarkdownShortcut.rule(for: "1.")?.kind, .numbered)
+        XCTAssertEqual(MarkdownShortcut.rule(for: "42.")?.kind, .numbered)
+        XCTAssertNil(MarkdownShortcut.rule(for: "1234."))
+        XCTAssertNil(MarkdownShortcut.rule(for: "a."))
+        XCTAssertEqual(MarkdownShortcut.rule(for: "[]"), MarkdownShortcut.Rule(kind: .todo, checked: false))
+        XCTAssertEqual(MarkdownShortcut.rule(for: "[x]"), MarkdownShortcut.Rule(kind: .todo, checked: true))
+        XCTAssertEqual(MarkdownShortcut.rule(for: ">")?.kind, .quote)
+        XCTAssertEqual(MarkdownShortcut.rule(for: "```")?.kind, .code)
+        XCTAssertEqual(MarkdownShortcut.rule(for: "---")?.kind, .divider)
+        XCTAssertNil(MarkdownShortcut.rule(for: "Hello"))
+
+        let h = harness()
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "paragraph", "text": "[x]Buy milk", "id": "MDLINE0001"])
+        let line = try block(h, "MDLINE0001")
+        let rule = try XCTUnwrap(MarkdownShortcut.rule(for: "[x]"))
+        let plan = try XCTUnwrap(MarkdownShortcut.calls(rule, block: line, rest: RichText(plain: "Buy milk"), doc: doc,
+                                                        newID: "UNUSED00003"))
+        XCTAssertEqual(plan.calls.map { $0.command }, ["block.update"], "one block.update, like Turn Into")
+        XCTAssertEqual(plan.focus, NibID("MDLINE0001"))
+        let depth = h.undoDepth(doc)
+        try await h.run(CommandIDs.batch, ["calls": .array(plan.calls.map { $0.json })])
+        let todo = try block(h, "MDLINE0001")
+        XCTAssertEqual(todo.kind, .todo)
+        XCTAssertEqual(todo.checked, true)
+        XCTAssertEqual(todo.text.plainText, "Buy milk")
+        XCTAssertEqual(h.undoDepth(doc), depth + 1)
+
+        let rule2 = try XCTUnwrap(MarkdownShortcut.rule(for: "---"))
+        XCTAssertNil(MarkdownShortcut.calls(rule2, block: line, rest: RichText(plain: "text"), doc: doc, newID: "N0"),
+                     "a rule needs an otherwise empty line")
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "paragraph", "text": "---", "id": "MDRULE0001"])
+        let rulePlan = try XCTUnwrap(MarkdownShortcut.calls(rule2, block: try block(h, "MDRULE0001"), rest: .empty,
+                                                            doc: doc, newID: "MDAFTER001"))
+        try await h.run(CommandIDs.batch, ["calls": .array(rulePlan.calls.map { $0.json })])
+        XCTAssertEqual(try block(h, "MDRULE0001").kind, .divider)
+        XCTAssertEqual(try live(h).last?.id.raw, "MDAFTER001", "a line after the rule takes the caret")
+        XCTAssertEqual(rulePlan.focus, NibID("MDAFTER001"))
+    }
+
     // MARK: Acceptance: Turn Into maps every kind pair to a block.update
 
     func testTurnIntoMapsEveryKindPairToOneBlockUpdate() async throws {
@@ -543,6 +590,26 @@ final class SlashMenuTests: XCTestCase {
         XCTAssertEqual(style.richText(from: style.attributed(formatted)), formatted, "the editor shows what is stored")
         XCTAssertTrue(h.app.bus.undo(doc))
         XCTAssertEqual(try h.snapshot(doc), before)
+    }
+
+    // MARK: The popover
+
+    func testThePopoverRendersInLightDarkAndLargeText() {
+        let h = harness()
+        let state = BlockKindMenuState(title: "Blocks", emptyText: "No matching blocks")
+        state.subtitle = "/he"
+        state.choices = SlashMenuFilter.matches("he", in: h.app.content.blockKinds.all).map { BlockKindChoice.make($0) }
+        XCTAssertFalse(state.choices.isEmpty)
+        let panel = BlockKindMenuPanel(state: state)
+        let images = NibSnapshot.images(panel, size: CGSize(width: 312, height: 480))
+        XCTAssertEqual(Set(images.keys), Set(NibSnapshot.Variant.allCases))
+        let regular = NibSnapshot.fittingSize(panel, width: 312)
+        let large = NibSnapshot.fittingSize(panel, width: 312, variant: .largeText)
+        XCTAssertEqual(regular.width, 312, accuracy: 1)
+        XCTAssertGreaterThanOrEqual(regular.height, CGFloat(state.choices.count) * 44, "44 pt rows")
+        XCTAssertGreaterThan(large.height, regular.height, "rows grow with Dynamic Type")
+        state.choices = []
+        XCTAssertGreaterThanOrEqual(NibSnapshot.fittingSize(panel, width: 312).height, 44, "the empty state keeps a row")
     }
 
     // MARK: Popover placement
