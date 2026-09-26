@@ -1,0 +1,41 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatRuler/RulerView.swift:206-213 (RulerLayout.claims) with RulerProcessor.swift:16 (RulerMetrics.viewThickness)",
+      "problem": "Below about 69 % zoom the ruler claims touches outside its drawn body, and it drops Pencil strokes that land there. The claim half-width is max(thickness/2 - 6, 22) and viewThickness is 64*zoom. At 50 % zoom (the notebook minimum, and close to iPhone fit-width) the body is 32 pt thick but the claim reaches 22 pt from the centre, so it extends 6 view pt (12 page pt) past each edge. Per F101, GestureRouter offers every touch, Pencil included, to attachment hitTest first. touchesBegan then returns early for Pencil samples. So a Pencil stroke that starts on or just outside the edge, exactly where ruler.project is meant to work, produces no ink at all. This also breaks the code's own comment that 'a Pencil set down on the edge still writes'. Below 42 % zoom (whiteboards go down to 5 %) the claim covers the whole 20 pt projection reach, so ruling a line with the Pencil is impossible. The 6 pt edge band is also gone from 87.5 % zoom down.",
+      "fix": "Keep the 44 pt claim inside the drawn body at every zoom. Give the ruler a minimum on-screen thickness: RulerMetrics.viewThickness(zoom:) = max(56, 64 * min(zoom, 1)) and pageThickness(zoom:) = viewThickness(zoom:) / max(zoom, 0.01). Then claims() can use half = thickness/2 - 6 (always at least 22). Projection, drawing and the HUD already read these helpers, so they follow. Add FeatRulerTests cases at zoom 0.5 and 0.3: a point 2 view pt outside the edge is not claimed by hitTest, a point in the middle is, and RulerProcessor still projects a stroke that starts 5 page pt outside the edge. Also update testTheRulerKeepsItsScreenThicknessWhenZoomedIn's expectations for zoom 0.5."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatRuler/RulerCommands.swift:147-176 (RulerSet.run)",
+      "problem": "ruler.set ignores ctx.dryRun. ARCHITECTURE §6.2 says a dry run persists nothing, and AI previews (nib_run dry_run) and plugin.run use dry runs. Here a dry run still writes the synced settings ruler.units and ruler.digits, changes the session ruler and posts nibRulerDidChange. An assistant preview that includes ruler.set therefore changes the user's synced preference before they accept.",
+      "fix": "After validating, if ctx.dryRun, build the would-be state on a copy (without state.save or settings.set) and return output() computed from it, using the requested units and digits values instead of reading settings. Add a test that runs Invocation(dryRun: true) and asserts that the settings and RulerState.load(session) are unchanged."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatRuler/RulerView.swift:405-407 (RulerAttachment.hudLinger)",
+      "problem": "The HUD's 0.6 s linger is a hand-rolled duration literal. The code marks it with a 'ponytail' comment because NibMotion has no token for it. DESIGN.md §15.6 and the Slop checklist ('no literal ... duration') say to file a contract request, not to add a local token for now.",
+      "fix": "Ask for a NibMotion HUD-evaporate token (DESIGN.md §14.17 uses the same 0.6 s for the pinch-zoom HUD). Until it exists, list the literal in the feature summary as a known deviation and reference the request."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatRuler/RulerCommands.swift:156,161",
+      "problem": "The angle and position parameter errors use NibError.invalid, which sets a path but no hint. ARCHITECTURE §15.6 requires a hint on parameter errors saying what to call next. The units error has one.",
+      "fix": "Throw NibError(.invalidParams, ..., path: \"$.angle\" / \"$.position\", hint: \"call commands.describe {\\\"id\\\": \\\"ruler.set\\\"}\"), the same as the units branch."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatRuler/RulerView.swift:534-536 (layoutHUD hudSize cache)",
+      "problem": "The HUD size is cached only by its text. When Dynamic Type or the content size category changes, hud.view.bounds keeps the old size until the angle text changes, so the Clear HUD can clip or look wrong at larger text sizes.",
+      "fix": "Include the trait's preferredContentSizeCategory in the cache key, e.g. (text, category, size), or clear hudSize in the RulerView trait-change handler, which already re-lays out the ruler."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatRuler/RulerView.swift:714-716, 742-746 (Set Angle / Set Position alerts)",
+      "problem": "If the user types something unparseable (e.g. '1,234.5' or letters), the alert closes and nothing happens, with no feedback. DESIGN.md §14.18 says every message states what happened and what to do next.",
+      "fix": "Disable the Set Angle and Move Ruler actions while the fields do not parse: observe UITextField.textDidChangeNotification and set action.isEnabled = RulerAttachment.number(text) != nil. That way invalid input can never be submitted silently."
+    }
+  ]
+}
