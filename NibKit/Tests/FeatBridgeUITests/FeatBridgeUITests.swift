@@ -14,7 +14,8 @@ final class FakeBridge {
                                   "169.254.0.0/16", "::1/128", "fd7a:115c:a1e0::/48", "fe80::/10"]
     static let enabledKey = SettingKey(BridgeNames.enabledSetting, default: false)
 
-    let app: NibApp
+    /// The app keeps the fake alive (services), so tests may drop their reference to it.
+    unowned let app: NibApp
     var clients: [JSONValue] = []
     var lastCall: JSONValue = .null
     var listening = true
@@ -29,6 +30,7 @@ final class FakeBridge {
 
     init(_ app: NibApp) {
         self.app = app
+        app.services.set(self, for: "tests.fakeBridge")
         let s = app.settings
         s.declare(FakeBridge.enabledKey, summary: "Bridge on.", owner: "bridge", schema: .bool())
         s.declare(SettingKey(BridgeNames.portSetting, default: 7331), summary: "Bridge port.", owner: "bridge",

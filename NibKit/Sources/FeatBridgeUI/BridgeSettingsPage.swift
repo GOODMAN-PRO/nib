@@ -531,7 +531,9 @@ final class BridgeSettingsModel: ObservableObject {
         await monitor.refresh()
     }
 
-    /// A new token for the bridge; every client that still presents the old one is refused (401) from now on.
+    /// A new token for the bridge; every client that still presents the old one is refused (401) from now on. A running
+    /// bridge rotates with `bridge.setEnabled {enabled: true, rotateToken: true}` (spec, G27); one the person turned off
+    /// rotates with `enabled: false`, so rotating never starts a bridge behind their back.
     @discardableResult
     func rotateToken() async -> Bool {
         guard let app = app else { return false }
