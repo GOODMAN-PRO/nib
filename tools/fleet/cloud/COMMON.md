@@ -3,7 +3,9 @@
 Repo: GOODMAN-PRO/nib (public). Main clone: /home/user/nib. You run in a Linux cloud container: there is NO Swift/Xcode here, so GitHub Actions (macos-26, Xcode 26.6) is the only compiler. Be meticulous about Swift/Apple API correctness: Swift 5 language mode, iOS 26 SDK, deployment target iOS 17, every iOS 26+ API (Liquid Glass: glassEffect, GlassEffectContainer, Glass, glassEffectID/Union, etc.) behind `#available(iOS 26, *)`, `public` access across modules.
 
 Standing rules:
-- Commit messages end with a blank line then exactly: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+- Commit messages end with a blank line then exactly these two lines, adjacent, as one trailer paragraph (e.g. `-m "$(printf 'Co-Authored-By: ...\nClaude-Session: ...')"`):
+  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+  `Claude-Session: https://claude.ai/code/session_01GpZ3Q12FGHi43JsYU8aD5F`
 - Never disable/skip tests, comment code out, use `#if false`, or stub features away to get green.
 - `gh` works for repo operations (`gh run list/watch/view --repo GOODMAN-PRO/nib`). `gh auth status` reports the token invalid; ignore that, the repo calls work. Bash `sleep` in the foreground may be blocked: poll with `gh run watch <id> --repo GOODMAN-PRO/nib --exit-status --interval 45` (Bash timeout 600000; call again if it times out) or `timeout 60 tail -f /dev/null` as a wait.
 - Before pushing a branch: `git fetch origin <branch> main` then push with `git push -u origin <branch>`. Retry network failures up to 4 times with backoff.
