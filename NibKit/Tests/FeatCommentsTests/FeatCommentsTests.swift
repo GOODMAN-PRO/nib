@@ -13,6 +13,39 @@ private final class PanelHost {
     var opened: [String] = []
 }
 
+/// Records the refs a stand-in command was called with.
+private final class Calls {
+    var refs: [String] = []
+}
+
+/// Wraps the harness store and records every page read, to prove that commits never rescan the document.
+@MainActor
+private final class CountingPersistence: DocumentPersistence {
+    let base: DocumentPersistence
+    var loads: [PageID] = []
+
+    init(_ base: DocumentPersistence) { self.base = base }
+
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
+        loads.append(page)
+        return try base.loadItems(doc, page: page)
+    }
+
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
+        try base.fileURL(doc, relativePath: relativePath)
+    }
+
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+}
+
 private final class FakeEditor: DocumentEditing {
     let documentID: DocumentID = Fixtures.docID
     let session: EditorSession
@@ -44,6 +77,36 @@ final class FeatCommentsTests: XCTestCase {
             return ["id": params["id"] ?? .null]
         }
         return host
+    }
+
+    /// `test.ink`: a pen stroke on page 1, the most frequent commit there is.
+    private func registerInk(_ h: Harness) {
+        h.app.commands.register(CommandDescriptor(id: "test.ink", title: "Ink", summary: "Test.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { (tx: DocTransaction) -> Void in
+                let points = [StrokePoint(x: 10, y: 10), StrokePoint(x: 40, y: 12)]
+                try tx.put(Item.makeStroke(Stroke(style: .defaultPen, points: points)), doc: Fixtures.docID,
+                           page: Fixtures.page1)
+            }
+            return [:]
+        }
+    }
+
+    /// `test.addPage {id, text?}`: appends a page to the notebook, with a thread on it when `text` is given.
+    private func registerAddPage(_ h: Harness) {
+        h.app.commands.register(CommandDescriptor(id: "test.addPage", title: "Add Page", summary: "Test.",
+                                                  effect: .edit)) { params, ctx in
+            let page = PageID(params["id"]?.stringValue ?? "")
+            try ctx.mutate { (tx: DocTransaction) -> Void in
+                try tx.put(PageRecord(id: page, order: "", size: .a4, background: .ofTemplate("builtin.ruled")),
+                           doc: Fixtures.docID)
+                if let text = params["text"]?.stringValue {
+                    let thread = CommentItem(anchor: Point(5, 5), messages: [CommentMessage(author: "Ana", text: text)])
+                    try tx.put(Item.makeComment(thread), doc: Fixtures.docID, page: page)
+                }
+            }
+            return [:]
+        }
     }
 
     private func assertError(_ code: NibError.Code, file: StaticString = #filePath, line: UInt = #line,
@@ -87,6 +150,15 @@ final class FeatCommentsTests: XCTestCase {
         }
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertThrowsError(try item(h, ref))
+
+        // The undone thread stays a tombstone on page 1: its id is still taken on every other page (redoing or
+        // syncing it back would give two live items one id), and reusing it on its own page replaces the tombstone.
+        await assertError(.conflict) {
+            _ = try await h.run("comment.add", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [10, 10],
+                                                "text": "Elsewhere", "id": "MYTHREAD01"])
+        }
+        try await h.run("comment.add", ["page": .string(pageRef), "at": [10, 10], "text": "Back", "id": "MYTHREAD01"])
+        XCTAssertEqual(try item(h, ref).comment?.messages.map(\.text), ["Back"])
     }
 
     func testAddOnAnObjectPinsTheThreadToItAndSurvivesTheObjectsDeletion() async throws {
@@ -169,6 +241,19 @@ final class FeatCommentsTests: XCTestCase {
 
         r = try await h.run("comment.tapAt", ["page": .string(pageRef), "point": [300, 300], "gesture": "tap"])
         XCTAssertEqual(r["handled"]?.boolValue, false)
+
+        // A pin on a layer hidden on this device is not drawn, so a finger tap (or the canvas's topmost-item ref)
+        // cannot open it; the Comments list still can.
+        let pinLayer = try item(h, threadRef).layer
+        h.session.hiddenLayers = [pinLayer]
+        r = try await h.run("comment.tapAt", tap)
+        XCTAssertEqual(r["handled"]?.boolValue, false, "a pin on a hidden layer cannot be tapped")
+        r = try await h.run("comment.tapAt", ["page": .string(pageRef), "point": [566, 404], "gesture": "tap",
+                                              "ref": .string(threadRef)])
+        XCTAssertEqual(r["handled"]?.boolValue, false, "nor opened through the canvas's topmost-item ref")
+        r = try await h.run("comment.tapAt", ["page": .string(pageRef), "point": [0, 0], "ref": .string(threadRef)])
+        XCTAssertEqual(r["handled"]?.boolValue, true)
+        h.session.hiddenLayers = []
 
         try await h.run("comment.resolve", ["ref": .string(threadRef), "resolved": true])
         r = try await h.run("comment.tapAt", tap)
@@ -327,6 +412,11 @@ final class FeatCommentsTests: XCTestCase {
         let items = [a, b, resolved]
         XCTAssertEqual(CommentRules.hit(items, at: Point(109, 100), radius: 22, showResolved: false)?.id, b.id)
         XCTAssertEqual(CommentRules.hit(items, at: Point(109, 100), radius: 22, showResolved: true)?.id, resolved.id)
+        let onLayer2 = Item.makeComment(CommentItem(anchor: Point(109, 100), messages: []), layer: 2)
+        XCTAssertEqual(CommentRules.hit(items + [onLayer2], at: Point(109, 100), radius: 22, showResolved: false)?.id,
+                       onLayer2.id)
+        XCTAssertEqual(CommentRules.hit(items + [onLayer2], at: Point(109, 100), radius: 22, showResolved: false,
+                                        hiddenLayers: [2])?.id, b.id, "pins on hidden layers are not drawn")
         XCTAssertNil(CommentRules.hit([a], at: Point(140, 100), radius: CommentRules.hitRadius(zoom: 2), showResolved: false))
         XCTAssertNotNil(CommentRules.hit([a], at: Point(140, 100), radius: CommentRules.hitRadius(zoom: 0.5),
                                          showResolved: false))
@@ -334,5 +424,159 @@ final class FeatCommentsTests: XCTestCase {
         XCTAssertEqual(CommentRules.defaultAnchor(size: .a4, visible: nil), Point(595.28 - 36, 36))
         XCTAssertEqual(CommentRules.defaultAnchor(size: .a4, visible: Rect(x: 0, y: 100, width: 200, height: 300)),
                        Point(100, 250))
+    }
+
+    func testThreadPanelHandsTheDraftToItsThreadAndFollowsItWithoutRescanning() async throws {
+        let h = harness()
+        registerInk(h)
+        let counting = CountingPersistence(h.persistence)
+        h.app.workspace.persistence = counting
+        let state = try XCTUnwrap(CommentsState.of(h.app.services))
+        state.focus(.draft(CommentsState.Draft(doc: Fixtures.docID, page: Fixtures.page1, at: Point(372, 400),
+                                               parent: Fixtures.textID)), in: h.session)
+        let model = CommentThreadModel(app: h.app, session: h.session)
+        guard case .draft = model.content else { return XCTFail("the panel does not show the draft") }
+
+        // The first message creates the thread, pinned to the text box, and the panel moves on to it.
+        let sent = await model.send("Hi")
+        XCTAssertTrue(sent)
+        guard case let .thread(_, page, id)? = state.target(for: h.session) else {
+            return XCTFail("the panel did not move on to the new thread")
+        }
+        XCTAssertEqual(page, Fixtures.page1)
+        let created = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id)
+        XCTAssertEqual(created.attachedTo, Fixtures.textID)
+        XCTAssertEqual(created.comment?.messages.map(\.text), ["Hi"])
+        XCTAssertEqual(model.content, .thread(doc: Fixtures.docID, page: Fixtures.page1, item: created))
+        XCTAssertEqual(model.pageTitle, "Page 1")
+
+        // A reply shows straight from the changeset.
+        let replied = await model.send("Second")
+        XCTAssertTrue(replied)
+        guard case let .thread(_, _, shown) = model.content else { return XCTFail("the thread is gone") }
+        XCTAssertEqual(shown.comment?.messages.map(\.text), ["Hi", "Second"])
+
+        // Moving the thread to another page keeps its id, and the panel follows it.
+        h.app.commands.register(CommandDescriptor(id: "test.moveThread", title: "Move", summary: "Test.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { (tx: DocTransaction) -> Void in
+                var moved = try tx.item(Fixtures.docID, page: Fixtures.page1, id: id)
+                try tx.delete(item: id, doc: Fixtures.docID, page: Fixtures.page1)
+                moved.attachedTo = nil
+                moved.z = ""
+                try tx.put(moved, doc: Fixtures.docID, page: Fixtures.page2)
+            }
+            return [:]
+        }
+        try await h.run("test.moveThread")
+        XCTAssertEqual(state.target(for: h.session), .thread(doc: Fixtures.docID, page: Fixtures.page2, id: id))
+        guard case let .thread(_, shownPage, _) = model.content else { return XCTFail("the moved thread is not shown") }
+        XCTAssertEqual(shownPage, Fixtures.page2)
+        XCTAssertEqual(model.pageTitle, "Page 2")
+
+        // Deleting it leaves "Comment not found" open; ink after that reads no page at all (the page holding the
+        // PDF was never loaded, and nothing may load it looking for the thread).
+        counting.loads.removeAll()
+        let movedRef = NodeRef.item(Fixtures.docID, Fixtures.page2, id).description
+        for message in shown.comment?.messages ?? [] {
+            try await h.run("comment.deleteMessage", ["ref": .string(movedRef), "message": .string(message.id.raw)])
+        }
+        XCTAssertEqual(model.content, .missing)
+        try await h.run("test.ink")
+        try await h.run("test.ink")
+        XCTAssertEqual(model.content, .missing)
+        XCTAssertEqual(counting.loads, [], "commits must not scan the document for a deleted thread")
+
+        // Undoing the deletion brings the thread back into the open panel.
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(model.content, .missing)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        guard case let .thread(_, _, restored) = model.content else { return XCTFail("undo did not bring it back") }
+        XCTAssertEqual(restored.comment?.messages.map(\.text), ["Second"])
+    }
+
+    func testACommentLinkInTheSameDocumentRevealsAndOpensItsThread() async throws {
+        let h = harness()
+        let panels = installPanelHost(h)
+        let reveals = Calls()
+        h.app.commands.register(CommandDescriptor(id: "view.reveal", title: "Reveal", summary: "Test.",
+                                                  effect: .session)) { params, _ in
+            reveals.refs.append(params["ref"]?.stringValue ?? "")
+            return [:]
+        }
+        let url = try XCTUnwrap(CommentLink.url(doc: Fixtures.docID, page: Fixtures.page1, comment: Fixtures.commentID))
+        CommentUI.follow(url, app: h.app, session: h.session)
+        for _ in 0..<200 where panels.opened.isEmpty { await Task.yield() }
+        XCTAssertEqual(reveals.refs, [threadRef])
+        XCTAssertEqual(panels.opened, [CommentPanels.thread])
+        XCTAssertEqual(CommentsState.of(h.app.services)?.target(for: h.session),
+                       .thread(doc: Fixtures.docID, page: Fixtures.page1, id: Fixtures.commentID))
+    }
+
+    func testCommentsListKeepsAnIndexThatCommitsUpdateWithoutRereadingPages() async throws {
+        let h = harness()
+        registerInk(h)
+        registerAddPage(h)
+        let counting = CountingPersistence(h.persistence)
+        h.app.workspace.persistence = counting
+        let model = CommentsListModel(app: h.app, session: h.session)
+        await model.scan?.value
+        XCTAssertFalse(model.scanning)
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1"])
+        XCTAssertEqual(counting.loads.count, Set(counting.loads).count, "the scan reads each page once")
+
+        // Memory pressure drops the cached pages but not the index.
+        h.app.workspace.evictPages(Fixtures.docID, keeping: [Fixtures.page1])
+        counting.loads.removeAll()
+        try await h.run("test.ink")
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1"])
+
+        let added = try await h.run("comment.add", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [10, 10],
+                                                    "text": "Second page"])
+        let addedRef = try XCTUnwrap(added["ref"]?.stringValue)
+        let addedMessage = try XCTUnwrap(added["message"]?.stringValue)
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2"])
+        XCTAssertEqual(model.sections.last?.rows.map(\.text), ["Second page"])
+
+        try await h.run("comment.resolve", ["ref": .string(threadRef), "resolved": true])
+        XCTAssertEqual(model.sections.map(\.title), ["Page 2"])
+        XCTAssertEqual(model.hiddenResolved, 1)
+
+        h.app.settings.set(CommentSettings.showResolved, true)
+        for _ in 0..<200 where !model.showResolved { await Task.yield() }
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2"])
+        XCTAssertEqual(model.sections.first?.rows.first?.resolved, true)
+        XCTAssertEqual(model.hiddenResolved, 0)
+
+        // A new page is read as it arrives (the PDF page before it has no threads, so it shows as page 4).
+        try await h.run("test.addPage", ["id": "NEWPAGE00001", "text": "New page"])
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2", "Page 4"])
+
+        try await h.run("comment.deleteMessage", ["ref": .string(addedRef), "message": .string(addedMessage)])
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 4"])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(model.sections.map(\.title), ["Page 1", "Page 2", "Page 4"])
+
+        XCTAssertFalse(counting.loads.contains(Fixtures.page1), "page 1 stayed cached and was never re-read")
+        XCTAssertFalse(counting.loads.contains(Fixtures.pdfPage), "no commit touched the PDF page, so it was not read")
+
+        let content = try h.app.workspace.content(Fixtures.docID)
+        let oracle = CommentsListModel.build(content: content, items: {
+            (try? h.app.workspace.items(Fixtures.docID, page: $0)) ?? []
+        }, showResolved: true)
+        XCTAssertEqual(model.sections, oracle.sections)
+
+        // A long document is read a few pages per main-actor turn and ends with the same list.
+        for n in 0..<CommentsListModel.scanChunk {
+            try await h.run("test.addPage", ["id": .string("MOREPAGE\(1000 + n)")])
+        }
+        try await h.run("test.addPage", ["id": "LASTPAGE0001", "text": "At the end"])
+        let fresh = CommentsListModel(app: h.app, session: h.session)
+        XCTAssertTrue(fresh.scanning)
+        await fresh.scan?.value
+        XCTAssertFalse(fresh.scanning)
+        XCTAssertEqual(fresh.sections, model.sections)
+        XCTAssertEqual(fresh.sections.last?.rows.map(\.text), ["At the end"])
     }
 }

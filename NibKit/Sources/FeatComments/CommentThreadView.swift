@@ -446,10 +446,15 @@ struct CommentThreadView: View {
         }
     }
 
+    /// The pin's number disc while the thread is open (DESIGN.md §14.3); a resolved thread says so in the subtitle.
+    private var badge: NibBadgeKind? {
+        guard let comment = thread, !comment.resolved else { return nil }
+        return .number(comment.messages.count)
+    }
+
     private var header: some View {
         let comment = thread
-        return NibPanelHeader(title: String(localized: "Comment"), subtitle: subtitle, symbol: .comment,
-                              badge: comment.flatMap { $0.resolved ? nil : .number($0.messages.count) },
+        return NibPanelHeader(title: String(localized: "Comment"), subtitle: subtitle, symbol: .comment, badge: badge,
                               onClose: { dismiss() }) {
             if let comment = comment, let ref = model.ref {
                 if !model.readOnly {
@@ -466,7 +471,7 @@ struct CommentThreadView: View {
                 } label: {
                     Image(nib: .more)
                         .font(NibFont.glyph(.panel))
-                        .foregroundStyle(NibColor.label)
+                        .foregroundStyle(NibColor.labelSecondary)
                         .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
                         .contentShape(Rectangle())
                 }
