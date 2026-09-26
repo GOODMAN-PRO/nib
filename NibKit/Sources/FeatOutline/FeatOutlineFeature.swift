@@ -12,16 +12,17 @@ public enum FeatOutlineFeature: NibFeature {
         OutlineSettings.declare(app.settings, owner: id)
         app.ui.panels.register(PanelDescriptor(
             id: OutlinePanels.outline, title: String(localized: "Outline"), icon: NibSymbol.outline.name,
-            placement: .sidebarTab, order: 10, owner: id, docKinds: [.notebook]) { context in
+            placement: .sidebarTab, order: OutlinePanels.outlineOrder, owner: id, docKinds: [.notebook]) { context in
                 AnyView(OutlinePanel(context: context))
             })
         app.ui.panels.register(PanelDescriptor(
             id: OutlinePanels.bookmarks, title: String(localized: "Bookmarks"), icon: NibSymbol.bookmark.name,
-            placement: .sidebarTab, order: 20, owner: id, docKinds: [.notebook]) { context in
+            placement: .sidebarTab, order: OutlinePanels.bookmarksOrder, owner: id, docKinds: [.notebook]) { context in
                 AnyView(BookmarksPanel(context: context))
             })
         OutlineMenus.register(app.ui.menus, owner: id)
-        // The native bookmark shortcut: `{}` toggles the window's current page (see PageSetBookmarked.Params).
+        // The native bookmark shortcut: `{}` toggles the window's current notebook page and does nothing in other
+        // document kinds (see PageSetBookmarked.run).
         app.content.keyCommands.register(KeyCommandDescriptor(
             id: OutlinePanels.bookmarkShortcut, title: String(localized: "Bookmark Page"),
             shortcut: KeyShortcut("b", [.command, .option]), command: "page.setBookmarked", scope: .document, owner: id))
@@ -31,6 +32,10 @@ public enum FeatOutlineFeature: NibFeature {
 enum OutlinePanels {
     static let outline = "outline.tab"
     static let bookmarks = "outline.bookmarks"
+    /// DESIGN.md §14.4 orders the navigator tabs Pages · Outline · Bookmarks: after the Pages tab, before Audio (300),
+    /// Comments (450), Layers (500) and History (900).
+    static let outlineOrder = 200
+    static let bookmarksOrder = 210
     /// Key command id (not a command): ⌥⌘B runs page.setBookmarked for the current page.
     static let bookmarkShortcut = "outline.bookmarkPage"
 }

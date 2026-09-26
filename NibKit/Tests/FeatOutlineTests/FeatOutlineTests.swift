@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 import NibContracts
 import NibTesting
 @testable import FeatOutline
@@ -55,6 +56,9 @@ final class FeatOutlineTests: XCTestCase {
             XCTAssertNotNil(h.app.settings.descriptor(key.name), key.name)
         }
         XCTAssertEqual(h.app.content.keyCommands.get("outline.bookmarkPage")?.command, "page.setBookmarked")
+        // DESIGN.md §14.4: Pages · Outline · Bookmarks, ahead of Audio (300) and the other sidebar tabs.
+        XCTAssertEqual(h.app.ui.panels.get(OutlinePanels.outline)?.order, 200)
+        XCTAssertEqual(h.app.ui.panels.get(OutlinePanels.bookmarks)?.order, 210)
     }
 
     // MARK: Nesting (max 3 levels)
@@ -184,6 +188,31 @@ final class FeatOutlineTests: XCTestCase {
         await assertFails("page.setBookmarked", ["pages": [pageRef(Fixtures.page1)]], code: .invalidParams, as: .ai("chat"), in: h)
         await assertFails("page.setBookmarked", ["pages": ["page:FIXTUREDOC01/NOSUCHPAGE"], "on": true], code: .notFound, in: h)
         await assertFails("page.setBookmarked", ["pages": ["doc:FIXTUREDOC01"], "on": true], code: .invalidParams, in: h)
+        await assertFails("page.setBookmarked", ["pages": [], "on": true], code: .invalidParams, in: h)
+    }
+
+    func testBookmarkShortcutDoesNothingOutsideNotebooks() async throws {
+        let h = harness()
+        let shortcut = try XCTUnwrap(h.app.content.keyCommands.get("outline.bookmarkPage"))
+        let depth = h.undoDepths()
+
+        // A whiteboard board is a page record, but no bookmark UI shows it: the shortcut leaves it alone.
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        var r = try await h.run(shortcut.command, shortcut.params)
+        XCTAssertEqual(r["pages"]?.arrayValue?.count, 0)
+        XCTAssertFalse(try h.app.workspace.content(Fixtures.whiteboardID).page(Fixtures.boardID)?.bookmarked ?? false)
+
+        // A text document has no pages: no error toast, no change.
+        h.session.document = Fixtures.textDocID
+        h.session.page = nil
+        r = try await h.run(shortcut.command, shortcut.params)
+        XCTAssertEqual(r["pages"]?.arrayValue?.count, 0)
+
+        h.session.document = nil
+        r = try await h.run(shortcut.command, shortcut.params)
+        XCTAssertEqual(r["pages"]?.arrayValue?.count, 0)
+        XCTAssertEqual(h.undoDepths(), depth, "nothing was recorded")
     }
 
     // MARK: Tree logic (drag and drop, VoiceOver moves)
@@ -215,6 +244,20 @@ final class FeatOutlineTests: XCTestCase {
         XCTAssertNil(tree.drop("C", at: 4, in: rows), "its own slot")
         XCTAssertEqual(tree.drop("B", at: 0, in: rows), OutlinePlacement(parent: nil, after: nil))
         XCTAssertEqual(tree.drop("A1", at: 4, in: rows), OutlinePlacement(parent: nil, after: "C"))
+        XCTAssertEqual(tree.drop("C", at: 2, in: rows), OutlinePlacement(parent: "A", after: "A1"), "the row above's level")
+        // Between rows the drag's level picks among the levels open there.
+        XCTAssertEqual(tree.drop("C", at: 2, in: rows, depth: 1), OutlinePlacement(parent: nil, after: "A"),
+                       "dragged left below an expanded entry's last child: back to the top level")
+        XCTAssertEqual(tree.drop("C", at: 2, in: rows, depth: 3), OutlinePlacement(parent: "A1", after: nil),
+                       "dragged right: nested under the leaf above")
+        XCTAssertEqual(tree.drop("A1", at: 2, in: rows, depth: 1), OutlinePlacement(parent: nil, after: "A"),
+                       "out a level from its own slot")
+        XCTAssertNil(tree.drop("A1", at: 2, in: rows, depth: 2), "its own slot and level")
+        XCTAssertNil(tree.drop("A1", at: 1, in: rows, depth: 2), "its own slot and level")
+        XCTAssertEqual(tree.drop("C", at: 4, in: rows, depth: 2), OutlinePlacement(parent: "B", after: nil),
+                       "its own slot, dragged right: nested under the row above")
+        XCTAssertEqual(tree.drop("B", at: 1, in: rows, depth: 1), OutlinePlacement(parent: "A", after: nil),
+                       "above an expanded entry's first child only the first-child slot is open")
         XCTAssertEqual(tree.drop("C", into: "A"), OutlinePlacement(parent: "A", after: "A1"))
         XCTAssertNil(tree.drop("A", into: "A1"), "never inside itself")
         XCTAssertEqual(tree.indent("B"), OutlinePlacement(parent: "A", after: "A1"))
@@ -231,6 +274,34 @@ final class FeatOutlineTests: XCTestCase {
         ])
         XCTAssertNil(deep.drop("Z", into: "Y"), "three levels under a level-2 entry is too deep")
         XCTAssertNil(deep.indent("Z"), "Z's subtree is already three levels tall")
+        let deepRows = deep.flatten { _ in false }
+        XCTAssertEqual(deepRows.map { $0.id }, ["X", "Y", "Z", "Z1", "Z2"])
+        XCTAssertNil(deep.drop("Z1", at: 2, in: deepRows, depth: 3), "Z1 carries Z2: under Y it would reach level 4")
+    }
+
+    func testRawParentChainsOfAnyDepthStayShallow() {
+        // node.insert / node.set or a merge can chain parents far past 3 levels; building and walking the tree
+        // must not recurse once per level.
+        var chain = [OutlineEntry(id: "E0", title: "0", page: nil, order: "V")]
+        for i in 1..<5000 {
+            chain.append(OutlineEntry(id: NibID("E\(i)"), title: "\(i)", page: nil, parent: NibID("E\(i - 1)"), order: "V"))
+        }
+        let tree = OutlineTree(chain)
+        XCTAssertEqual(tree.depth(of: "E15"), OutlineTree.depthLimit)
+        XCTAssertEqual(tree.depth(of: "E16"), 1, "past the limit an entry starts over at the top level")
+        XCTAssertNil(tree.parent(of: "E16"))
+        XCTAssertEqual(tree.depth(of: "E17"), 2)
+        XCTAssertEqual(tree.height(of: "E0"), OutlineTree.depthLimit)
+        let rows = tree.flatten { _ in false }
+        XCTAssertEqual(rows.count, 5000, "every entry stays reachable")
+        XCTAssertEqual(rows.map { $0.depth }.max(), OutlineTree.depthLimit)
+        XCTAssertEqual(tree.descendants(of: "E0").count, OutlineTree.depthLimit - 1)
+
+        // A cycle closed by a long chain is broken once, in linear time.
+        var loop = chain
+        loop[0].parent = "E4999"
+        let looped = OutlineTree(loop)
+        XCTAssertEqual(looped.flatten { _ in false }.count, 5000)
     }
 
     func testOrderKeysRekeyWhenNeighboursCannotBracket() throws {
@@ -327,4 +398,111 @@ final class FeatOutlineTests: XCTestCase {
         try await h.run("settings.set", ["name": .string(OutlineSettings.showPDFOutline.name), "value": false])
         try await waitUntil { model.sections.map { $0.kind } == [.custom] }
     }
+
+    func testBookmarksPanelFollowsBookmarksTrashAndTheCurrentPage() async throws {
+        let h = harness()
+        let model = BookmarksPanelModel(app: h.app, session: h.session)
+        XCTAssertEqual(model.rows, [])
+        try await h.run("page.setBookmarked", ["pages": [pageRef(Fixtures.pdfPage)], "on": true])
+        try await h.run("page.setBookmarked", ["pages": [pageRef(Fixtures.page1)], "on": true])
+        try await waitUntil { model.rows.map { $0.page } == [Fixtures.page1, Fixtures.pdfPage] }
+        XCTAssertEqual(model.rows.map { $0.number }, [1, 3], "page order, with page numbers")
+        XCTAssertEqual(model.rows.map { $0.isCurrent }, [true, false])
+
+        h.session.page = Fixtures.pdfPage
+        try await waitUntil { model.rows.map { $0.isCurrent } == [false, true] }
+
+        // The page Trash (deleted + trashedAt), arriving as a merge from another device.
+        var trashed = try XCTUnwrap(h.app.workspace.content(doc).page(Fixtures.pdfPage))
+        trashed.deleted = true
+        trashed.trashedAt = Date().timeIntervalSince1970
+        trashed.rev = Rev(wallMs: UInt64(Date().timeIntervalSince1970 * 1000) + 60_000, counter: 0, device: 99)
+        let merged = h.app.bus.applyRemote(DocumentPatch(doc: doc, pages: [trashed]), origin: "test")
+        XCTAssertFalse(merged.updated.isEmpty && merged.removed.isEmpty, "the trashed page merged")
+        try await waitUntil { model.rows.map { $0.page } == [Fixtures.page1] }
+
+        try await h.run("page.setBookmarked", ["pages": [pageRef(Fixtures.page1)], "on": false])
+        try await waitUntil { model.rows.isEmpty }
+    }
+
+    func testThumbnailChangedWhileRenderingRendersAgainWithoutFlashing() async throws {
+        let renderer = HeldRenderer()
+        let store = ThumbnailStore()
+        var loads = 0
+        store.onLoad = { loads += 1 }
+
+        store.request(doc: doc, page: Fixtures.page1, renderer: renderer)
+        try await waitUntil { renderer.waiting == 1 }
+        store.request(doc: doc, page: Fixtures.page1, renderer: renderer)
+        XCTAssertEqual(renderer.calls, 1, "one render per page at a time")
+
+        // The page changes (a stroke) while its first render runs: that render is dropped and the page renders again.
+        store.invalidate([Fixtures.page1])
+        renderer.release()
+        try await waitUntil { renderer.calls == 2 && renderer.waiting == 1 }
+        XCTAssertNil(store.image(Fixtures.page1), "the out-of-date render never lands")
+        XCTAssertEqual(loads, 0)
+        renderer.release()
+        try await waitUntil { store.image(Fixtures.page1) != nil }
+        XCTAssertEqual(loads, 1)
+        XCTAssertFalse(store.needsRender(Fixtures.page1))
+
+        // A later change keeps the old image on screen until the new one replaces it.
+        let first = try XCTUnwrap(store.image(Fixtures.page1))
+        store.invalidate([Fixtures.page1])
+        XCTAssertTrue(store.image(Fixtures.page1) === first, "no flash to the placeholder")
+        XCTAssertTrue(store.needsRender(Fixtures.page1))
+        store.request(doc: doc, page: Fixtures.page1, renderer: renderer)
+        try await waitUntil { renderer.waiting == 1 }
+        XCTAssertTrue(store.image(Fixtures.page1) === first)
+        renderer.release()
+        try await waitUntil { loads == 2 }
+        XCTAssertFalse(store.image(Fixtures.page1) === first)
+        store.request(doc: doc, page: Fixtures.page1, renderer: renderer)
+        XCTAssertEqual(renderer.calls, 3, "a current image is not rendered again")
+    }
+}
+
+/// Holds every thumbnail render until the test releases it (a slow renderer, deterministically).
+private final class HeldRenderer: PageRenderer, @unchecked Sendable {
+    private let lock = NSLock()
+    private var held: [CheckedContinuation<CGImage?, Never>] = []
+    private var count = 0
+
+    var calls: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    var waiting: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return held.count
+    }
+
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<CGImage?, Never>) in
+            lock.lock()
+            count += 1
+            held.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    func release() {
+        lock.lock()
+        let all = held
+        held = []
+        lock.unlock()
+        for continuation in all { continuation.resume(returning: FakeRenderer.blank(CGSize(width: 8, height: 8))) }
+    }
+
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        throw NibError(.unsupported, "thumbnails only")
+    }
+
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
+
+    func purgeCaches() {}
 }

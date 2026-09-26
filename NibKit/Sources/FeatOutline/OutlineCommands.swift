@@ -33,6 +33,10 @@ struct OutlinePlacement: Equatable {
 struct OutlineTree {
     /// Levels a custom outline may have: an entry, a sub-entry and a sub-sub-entry.
     static let maxDepth = 3
+    /// The commands keep outlines 3 levels deep, but raw writes (node.insert / node.set, merges from other devices)
+    /// can chain parents to any depth. An entry that would sit deeper than this starts over at the top level, so
+    /// the recursive walks below stay shallow however the records were written.
+    static let depthLimit = 16
 
     struct Row: Equatable {
         var id: NibID
@@ -46,6 +50,7 @@ struct OutlineTree {
     private var parentOf: [NibID: NibID] = [:]
     private var childrenOf: [NibID: [NibID]] = [:]
     private var roots: [NibID] = []
+    private var depthOf: [NibID: Int] = [:]
 
     init(_ outline: [OutlineEntry]) {
         let live = outline.filter { !$0.deleted }.sorted { ($0.order, $0.id.raw) < ($1.order, $1.id.raw) }
@@ -53,17 +58,36 @@ struct OutlineTree {
         for e in live {
             if let p = e.parent, p != e.id, entries[p] != nil { parentOf[e.id] = p }
         }
-        // Break parent cycles at the link that closes them.
-        for e in live {
-            var seen: Set<NibID> = [e.id]
-            var current = e.id
-            while let p = parentOf[current] {
-                if seen.contains(p) {
-                    parentOf[current] = nil
+        // Resolve every depth once (iterative, O(n) overall): walk up to an entry whose depth is known, a root or a
+        // repeat, then assign depths top-down. A parent cycle is broken at the link that closes it, and a chain past
+        // `depthLimit` is cut there.
+        for e in live where depthOf[e.id] == nil {
+            var path: [NibID] = []
+            var onPath: Set<NibID> = []
+            var base = 0
+            var current: NibID? = e.id
+            while let id = current {
+                if let known = depthOf[id] {
+                    base = known
                     break
                 }
-                seen.insert(p)
-                current = p
+                if onPath.contains(id) {
+                    if let top = path.last { parentOf[top] = nil }
+                    break
+                }
+                path.append(id)
+                onPath.insert(id)
+                current = parentOf[id]
+            }
+            var depth = base
+            for id in path.reversed() {
+                if depth >= OutlineTree.depthLimit {
+                    parentOf[id] = nil
+                    depth = 1
+                } else {
+                    depth += 1
+                }
+                depthOf[id] = depth
             }
         }
         for e in live {
@@ -87,14 +111,14 @@ struct OutlineTree {
     func parent(of id: NibID) -> NibID? { parentOf[id] }
 
     /// 1 for a top-level entry.
-    func depth(of id: NibID) -> Int {
-        var depth = 1
-        var current = id
-        while let p = parentOf[current] {
-            depth += 1
-            current = p
-        }
-        return depth
+    func depth(of id: NibID) -> Int { depthOf[id] ?? 1 }
+
+    /// Where an entry sits now: its parent and the sibling right before it.
+    func placement(of id: NibID) -> OutlinePlacement {
+        let parent = parentOf[id]
+        let siblings = children(of: parent)
+        let index = siblings.firstIndex(of: id) ?? 0
+        return OutlinePlacement(parent: parent, after: index > 0 ? siblings[index - 1] : nil)
     }
 
     /// Levels in the subtree rooted at `id` (1 for a leaf).
@@ -185,25 +209,43 @@ struct OutlineTree {
         return OutlinePlacement(parent: target, after: children(of: target).last { $0 != id })
     }
 
-    /// Dropped between visible rows, before `rows[index]` (`index == rows.count` = after the last row). The entry
-    /// joins the row above as a sibling, or becomes the first child of the row above when that row is expanded.
-    /// nil = no move (its own slot, or nesting too deep).
-    func drop(_ id: NibID, at index: Int, in rows: [Row]) -> OutlinePlacement? {
+    /// Dropped between visible rows, before `rows[index]` (`index == rows.count` = after the last row).
+    ///
+    /// When the row above is expanded and its children follow, the entry becomes its first child. Otherwise the
+    /// gap offers several levels: inside the row above (when it shows nothing of its own below it), next to it, or
+    /// next to one of its ancestors, down to the level of the row below. `depth` (from the drag's horizontal
+    /// position) picks the closest of those levels; nil keeps the row above's level.
+    /// nil = no move (the entry's current place, or nesting too deep).
+    func drop(_ id: NibID, at index: Int, in rows: [Row], depth: Int? = nil) -> OutlinePlacement? {
         let moving = Set([id] + descendants(of: id))
         let index = max(0, min(index, rows.count))
-        if let start = rows.firstIndex(where: { $0.id == id }) {
-            let end = start + rows[start...].prefix { moving.contains($0.id) }.count
-            if (start...end).contains(index) { return nil }
-        }
         let above = rows[..<index].last { !moving.contains($0.id) }
         let below = rows[index...].first { !moving.contains($0.id) }
-        guard let anchor = above else { return OutlinePlacement(parent: nil, after: nil) }
         let placement: OutlinePlacement
-        if let below = below, below.depth > anchor.depth {
-            placement = OutlinePlacement(parent: anchor.id, after: nil)
+        if let anchor = above {
+            if let below = below, below.depth > anchor.depth {
+                placement = OutlinePlacement(parent: anchor.id, after: nil)
+            } else {
+                // A collapsed row hides its children, so nothing may land inside it unseen.
+                let nestable = !(anchor.hasChildren && !anchor.isExpanded)
+                let lowest = min(below?.depth ?? 1, anchor.depth)
+                let highest = anchor.depth + (nestable ? 1 : 0)
+                let wanted = min(max(depth ?? anchor.depth, lowest), highest)
+                if wanted > anchor.depth {
+                    placement = OutlinePlacement(parent: anchor.id, after: nil)
+                } else {
+                    var level = anchor.id
+                    for _ in 0..<(anchor.depth - wanted) {
+                        guard let p = parentOf[level] else { break }
+                        level = p
+                    }
+                    placement = OutlinePlacement(parent: parentOf[level], after: level)
+                }
+            }
         } else {
-            placement = OutlinePlacement(parent: parentOf[anchor.id], after: anchor.id)
+            placement = OutlinePlacement(parent: nil, after: nil)
         }
+        guard entries[id] != nil, placement != self.placement(of: id) else { return nil }
         return placementError(id, height: height(of: id), under: placement.parent) == nil ? placement : nil
     }
 }
@@ -587,12 +629,20 @@ struct PageSetBookmarked: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        var refs = p.pages ?? []
-        if p.pages == nil, let session = ctx.activeSession, let doc = session.document, let page = session.page {
+        let refs: [String]
+        if let pages = p.pages {
+            guard !pages.isEmpty else {
+                throw NibError(.invalidParams, "pages must list at least one page ref", path: "$.pages")
+            }
+            refs = pages
+        } else {
+            // The shortcut (⌥⌘B) is document-wide: only a notebook's current page is bookmarkable. Anywhere else
+            // (a text document, a whiteboard board, no page) it does nothing rather than raising an error.
+            guard let session = ctx.activeSession, let doc = session.document, let page = session.page,
+                  (try? ctx.workspace.content(doc))?.meta.kind == .notebook else {
+                return Output(pages: [], on: false)
+            }
             refs = [NodeRef.page(doc, page).description]
-        }
-        guard !refs.isEmpty else {
-            throw NibError(.invalidParams, "pages must list at least one page ref", path: "$.pages")
         }
         var targets: [(index: Int, doc: DocumentID, page: PageID)] = []
         var seen = Set<String>()

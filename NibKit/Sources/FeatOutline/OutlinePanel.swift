@@ -26,11 +26,25 @@ enum OutlineSettings {
 
 enum OutlineMetrics {
     /// DESIGN.md §14.4: bookmark rows carry a 40 pt thumbnail; outline rows use the same one when thumbnails are on.
-    static let thumbnailWidth: CGFloat = NibSpacing.x4
+    /// ponytail: NibMetrics has only the 176 pt navigator thumbnail; move this to a NibMetrics row-thumbnail token
+    /// once one lands (contract gap reported by F046).
+    static let rowThumbnailWidth: CGFloat = 40
     /// Deeper PDF outlines stop indenting here so titles keep their width in the 240 pt panel.
     static let maxIndentLevels = 4
     /// Thumbnails are drawn at 40 pt; 160 px covers 3× screens with room to spare.
     static let thumbnailPixels = 160
+    /// Rendered thumbnails a panel keeps (about 100 KB each); older ones are evicted and rendered again on demand.
+    static let thumbnailCacheLimit = 100
+
+    /// The leading inset of an outline row at `depth` (1 = top level).
+    static func indent(_ depth: Int) -> CGFloat {
+        NibSpacing.xs + CGFloat(min(max(depth, 1), maxIndentLevels) - 1) * NibSpacing.l
+    }
+
+    /// The outline level whose indent is closest to `x`.
+    static func depth(atIndent x: CGFloat) -> Int {
+        max(1, Int(((x - NibSpacing.xs) / NibSpacing.l).rounded()) + 1)
+    }
 }
 
 enum PageGeometry {
@@ -159,34 +173,48 @@ enum OutlineRowBuilder {
 
 // MARK: - Document tracking and thumbnails
 
-/// Page thumbnails for one panel, rendered by `services.renderer` off the main actor and dropped when their page
-/// changes.
+/// Page thumbnails for one panel, rendered by `services.renderer` off the main actor. A page that changes keeps its
+/// old image on screen (no flash to the placeholder) until the next render replaces it; a render that finishes after
+/// its page changed again is dropped and the page is rendered once more. At most `thumbnailCacheLimit` images are
+/// kept, so a 1,000-page notebook never holds every thumbnail.
 @MainActor
 final class ThumbnailStore {
-    private var images: [PageID: UIImage] = [:]
+    private let images = NSCache<NSString, UIImage>()
     private var loading: Set<PageID> = []
+    /// Pages whose image predates their last change.
+    private var stale: Set<PageID> = []
     private var generations: [PageID: Int] = [:]
     private var epoch = 0
     var onLoad: (@MainActor () -> Void)?
 
-    func image(_ page: PageID) -> UIImage? { images[page] }
+    init() {
+        images.countLimit = OutlineMetrics.thumbnailCacheLimit
+    }
+
+    func image(_ page: PageID) -> UIImage? { images.object(forKey: page.raw as NSString) }
+
+    /// True when `page` has no image yet or its image is out of date.
+    func needsRender(_ page: PageID) -> Bool { stale.contains(page) || image(page) == nil }
 
     func invalidate(_ pages: Set<PageID>) {
         for page in pages {
-            images[page] = nil
             generations[page, default: 0] += 1
+            stale.insert(page)
         }
     }
 
     func removeAll() {
-        images.removeAll()
+        images.removeAllObjects()
         loading.removeAll()
+        stale.removeAll()
         generations.removeAll()
         epoch += 1
     }
 
+    /// Renders `page` unless its image is current or a render is already running (that one re-renders by itself if
+    /// the page changes meanwhile).
     func request(doc: DocumentID, page: PageID, renderer: PageRenderer?) {
-        guard images[page] == nil, !loading.contains(page), let renderer = renderer else { return }
+        guard needsRender(page), !loading.contains(page), let renderer = renderer else { return }
         loading.insert(page)
         let epochAtStart = epoch
         let generation = generations[page] ?? 0
@@ -194,8 +222,14 @@ final class ThumbnailStore {
             let cgImage = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: OutlineMetrics.thumbnailPixels)
             guard let self = self, self.epoch == epochAtStart else { return }
             self.loading.remove(page)
-            guard (self.generations[page] ?? 0) == generation, let cgImage = cgImage else { return }
-            self.images[page] = UIImage(cgImage: cgImage)
+            guard (self.generations[page] ?? 0) == generation else {
+                // The page changed while it rendered: this image is already out of date.
+                self.request(doc: doc, page: page, renderer: renderer)
+                return
+            }
+            self.stale.remove(page)
+            guard let cgImage = cgImage else { return }
+            self.images.setObject(UIImage(cgImage: cgImage), forKey: page.raw as NSString)
             self.onLoad?()
         }
     }
@@ -211,6 +245,9 @@ final class PanelDocumentTracker {
     private(set) var doc: DocumentID?
     /// The open document's head (nil when none is open) and whether the window switched documents.
     var onRefresh: (@MainActor (DocumentContent?, Bool) -> Void)?
+    /// Pages of the open document whose thumbnails went out of date (their items or their record changed); the
+    /// panel asks its visible rows to render them again.
+    var onThumbnailsChanged: (@MainActor (Set<PageID>) -> Void)?
     private var cancellables = Set<AnyCancellable>()
     private var commits: EventSubscription?
     private var scheduled = false
@@ -261,14 +298,19 @@ final class PanelDocumentTracker {
         thumbnails.request(doc: doc, page: page, renderer: app.services.renderer)
     }
 
+    /// Every stroke is a commit, so only head changes (pages, outline, meta) rebuild the rows; item-only commits just
+    /// mark their pages' thumbnails out of date.
     private func handle(_ changeset: Changeset) {
         guard let doc = doc, changeset.documents.contains(doc) else { return }
         var pages = changeset.itemPages[doc] ?? []
         for m in changeset.mutations {
             if case let .page(d, _, after) = m, d == doc { pages.insert(after.id) }
         }
-        thumbnails.invalidate(pages)
-        schedule()
+        if !pages.isEmpty {
+            thumbnails.invalidate(pages)
+            onThumbnailsChanged?(pages)
+        }
+        if changeset.headChanged(doc) { schedule() }
     }
 }
 
@@ -304,6 +346,11 @@ final class OutlinePanelModel: ObservableObject {
         tracker = PanelDocumentTracker(app: app, session: session)
         tracker.onRefresh = { [weak self] content, switched in self?.rebuild(content, switched: switched) }
         tracker.thumbnails.onLoad = { [weak self] in self?.thumbnailRevision += 1 }
+        // Visible rows re-request their out-of-date thumbnails on the next list update.
+        tracker.onThumbnailsChanged = { [weak self] _ in
+            guard let self = self, self.showsThumbnails else { return }
+            self.thumbnailRevision += 1
+        }
         tracker.refreshNow()
     }
 
@@ -623,13 +670,12 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
             showsThumbnails = thumbnails
             tableView.reloadData()
         } else if showsThumbnails {
+            // Out-of-date thumbnails keep their old image until the new render lands (request is a no-op when the
+            // image is current).
             for case let cell as OutlineCell in tableView.visibleCells {
                 guard let page = cell.page else { continue }
-                if let image = model.thumbnail(page) {
-                    cell.setThumbnail(image)
-                } else {
-                    model.requestThumbnail(page)
-                }
+                if let image = model.thumbnail(page) { cell.setThumbnail(image) }
+                model.requestThumbnail(page)
             }
         }
     }
@@ -661,7 +707,7 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
         var image: UIImage?
         if showsThumbnails, let page = row.page {
             image = model.thumbnail(page)
-            if image == nil { model.requestThumbnail(page) }
+            model.requestThumbnail(page)
         }
         cell.configure(row, showsThumbnail: showsThumbnails, image: image, aspect: model.aspect(row.page))
         cell.onToggle = { [weak self] in self?.model.toggle(row) }
@@ -804,9 +850,10 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
 
     func tableView(_ tableView: UITableView, itemsForBeginning session: UIDragSession,
                    at indexPath: IndexPath) -> [UIDragItem] {
-        guard let entry = rowAt(indexPath)?.entry else { return [] }
+        guard let row = rowAt(indexPath), let entry = row.entry, let doc = model.doc else { return [] }
         let item = UIDragItem(itemProvider: NSItemProvider(object: entry.raw as NSString))
-        item.localObject = entry.raw
+        let grabOffset = session.location(in: tableView).x - OutlineMetrics.indent(row.depth)
+        item.localObject = OutlineDragItem(doc: doc, entry: entry, grabOffset: grabOffset)
         return [item]
     }
 
@@ -827,12 +874,12 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
     }
 
     func tableView(_ tableView: UITableView, canHandle session: UIDropSession) -> Bool {
-        session.localDragSession != nil
+        draggedEntry(session) != nil
     }
 
     func tableView(_ tableView: UITableView, dropSessionDidUpdate session: UIDropSession,
                    withDestinationIndexPath destinationIndexPath: IndexPath?) -> UITableViewDropProposal {
-        guard let entry = draggedEntry(session), let target = dropTarget(at: session.location(in: tableView), moving: entry) else {
+        guard let drag = draggedEntry(session), let target = dropTarget(at: session.location(in: tableView), moving: drag) else {
             pendingDrop = nil
             return UITableViewDropProposal(operation: .forbidden, intent: .unspecified)
         }
@@ -842,9 +889,9 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
     }
 
     func tableView(_ tableView: UITableView, performDropWith coordinator: UITableViewDropCoordinator) {
-        guard let entry = draggedEntry(coordinator.session), let placement = pendingDrop else { return }
+        guard let drag = draggedEntry(coordinator.session), let placement = pendingDrop else { return }
         pendingDrop = nil
-        model.move(entry, placement)
+        model.move(drag.entry, placement)
         NibHaptics.play(.snap)
     }
 
@@ -853,12 +900,19 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
         flushDeferredUpdate()
     }
 
-    private func draggedEntry(_ session: UIDropSession) -> NibID? {
-        (session.localDragSession?.items.first?.localObject as? String).map { NibID($0) }
+    /// The entry being dragged, only when it is a live entry of this outline: never another window's document, a
+    /// page thumbnail or any other in-app drag.
+    private func draggedEntry(_ session: UIDropSession) -> OutlineDragItem? {
+        guard let drag = session.localDragSession?.items.first?.localObject as? OutlineDragItem,
+              drag.doc == model.doc, model.tree.entries[drag.entry] != nil else { return nil }
+        return drag
     }
 
-    /// The middle half of a row nests into it; its top and bottom quarters insert before or after it.
-    private func dropTarget(at location: CGPoint, moving entry: NibID) -> (placement: OutlinePlacement, into: Bool)? {
+    /// The middle half of a row nests into it; its top and bottom quarters insert before or after it, at the level
+    /// the dragged row's leading edge points at (drag left to move out a level, right to nest).
+    private func dropTarget(at location: CGPoint, moving drag: OutlineDragItem) -> (placement: OutlinePlacement, into: Bool)? {
+        let entry = drag.entry
+        let depth = OutlineMetrics.depth(atIndent: location.x - drag.grabOffset)
         guard let section = sections.firstIndex(where: { $0.kind == .custom }) else { return nil }
         let rows = sections[section].rows
         let flat = rows.compactMap { r in
@@ -875,23 +929,51 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
                 return tree.drop(entry, into: flat[indexPath.row].id).map { (placement: $0, into: true) }
             }
             let index = fraction <= 0.25 ? indexPath.row : indexPath.row + 1
-            return tree.drop(entry, at: index, in: flat).map { (placement: $0, into: false) }
+            return tree.drop(entry, at: index, in: flat, depth: depth).map { (placement: $0, into: false) }
         }
         let last = tableView.rectForRow(at: IndexPath(row: rows.count - 1, section: section))
         guard location.y >= last.maxY else { return nil }
-        return tree.drop(entry, at: flat.count, in: flat).map { (placement: $0, into: false) }
+        return tree.drop(entry, at: flat.count, in: flat, depth: depth).map { (placement: $0, into: false) }
     }
 }
 
-/// One outline row: disclosure, optional thumbnail, title (your entries bold), page number in `hud`.
+/// What an outline row drag carries: the entry, its document, and how far right of the row's indent the finger
+/// grabbed it (so the drop level follows the row's leading edge, not the finger).
+struct OutlineDragItem {
+    let doc: DocumentID
+    let entry: NibID
+    let grabOffset: CGFloat
+}
+
+/// One outline row: disclosure, optional thumbnail, title (your entries bold), page number in `hud`. The current
+/// page's rows sit on the row highlight as well as carrying the accent number, so the state is never colour alone.
 final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
     static let reuseID = "outline.row"
+
+    /// The inset rounded `fill3` behind a pressed or current row (the sidebar row highlight).
+    static func rowFill() -> UIView {
+        let container = UIView()
+        let fill = UIView()
+        fill.backgroundColor = NibUIColor.fill3
+        fill.layer.cornerRadius = NibRadius.sidebarRow
+        fill.layer.cornerCurve = .continuous
+        fill.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(fill)
+        NSLayoutConstraint.activate([
+            fill.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: NibSpacing.xs),
+            fill.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -NibSpacing.xs),
+            fill.topAnchor.constraint(equalTo: container.topAnchor),
+            fill.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        ])
+        return container
+    }
 
     private let disclosure = UIButton(type: .system)
     private let thumbnail = UIImageView()
     private let titleLabel = UILabel()
     private let pageLabel = UILabel()
     private let stack = UIStackView()
+    private let currentFill = OutlineCell.rowFill()
     private var leading: NSLayoutConstraint?
     private var thumbnailHeight: NSLayoutConstraint?
     var onToggle: (() -> Void)?
@@ -910,21 +992,7 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
     private func setUp() {
         backgroundColor = .clear
         tintColor = NibUIColor.accent
-
-        let highlight = UIView()
-        let fill = UIView()
-        fill.backgroundColor = NibUIColor.fill3
-        fill.layer.cornerRadius = NibRadius.sidebarRow
-        fill.layer.cornerCurve = .continuous
-        fill.translatesAutoresizingMaskIntoConstraints = false
-        highlight.addSubview(fill)
-        NSLayoutConstraint.activate([
-            fill.leadingAnchor.constraint(equalTo: highlight.leadingAnchor, constant: NibSpacing.xs),
-            fill.trailingAnchor.constraint(equalTo: highlight.trailingAnchor, constant: -NibSpacing.xs),
-            fill.topAnchor.constraint(equalTo: highlight.topAnchor),
-            fill.bottomAnchor.constraint(equalTo: highlight.bottomAnchor)
-        ])
-        selectedBackgroundView = highlight
+        selectedBackgroundView = OutlineCell.rowFill()
 
         disclosure.tintColor = NibUIColor.labelSecondary
         disclosure.setPreferredSymbolConfiguration(NibUIFont.glyph(.panel), forImageIn: .normal)
@@ -956,8 +1024,8 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
         contentView.addSubview(stack)
 
         let leading = stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: NibSpacing.xs)
-        let thumbnailWidth = thumbnail.widthAnchor.constraint(equalToConstant: OutlineMetrics.thumbnailWidth)
-        let thumbnailHeight = thumbnail.heightAnchor.constraint(equalToConstant: OutlineMetrics.thumbnailWidth)
+        let thumbnailWidth = thumbnail.widthAnchor.constraint(equalToConstant: OutlineMetrics.rowThumbnailWidth)
+        let thumbnailHeight = thumbnail.heightAnchor.constraint(equalToConstant: OutlineMetrics.rowThumbnailWidth)
         // Below required, so the stack view's own constraints win while the thumbnail is hidden.
         thumbnailWidth.priority = .defaultHigh
         thumbnailHeight.priority = .defaultHigh
@@ -980,7 +1048,8 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
 
     func configure(_ row: OutlineRow, showsThumbnail: Bool, image: UIImage?, aspect: CGFloat) {
         page = row.page
-        leading?.constant = NibSpacing.xs + CGFloat(min(row.depth, OutlineMetrics.maxIndentLevels) - 1) * NibSpacing.l
+        leading?.constant = OutlineMetrics.indent(row.depth)
+        backgroundView = row.isCurrent ? currentFill : nil
         disclosure.setImage(row.hasChildren ? UIImage(nib: row.isExpanded ? .chevronDown : .forward) : nil, for: .normal)
         disclosure.isUserInteractionEnabled = row.hasChildren
 
@@ -991,7 +1060,7 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
         pageLabel.textColor = row.isCurrent ? NibUIColor.accent : NibUIColor.labelSecondary
 
         thumbnail.isHidden = !showsThumbnail
-        thumbnailHeight?.constant = OutlineMetrics.thumbnailWidth / max(aspect, 0.1)
+        thumbnailHeight?.constant = OutlineMetrics.rowThumbnailWidth / max(aspect, 0.1)
         thumbnail.image = image
 
         accessibilityLabel = row.title
@@ -1055,6 +1124,11 @@ final class BookmarksPanelModel: ObservableObject {
         tracker = PanelDocumentTracker(app: app, session: session)
         tracker.onRefresh = { [weak self] content, _ in self?.rebuild(content) }
         tracker.thumbnails.onLoad = { [weak self] in self?.thumbnailRevision += 1 }
+        // Rows on screen re-request their out-of-date thumbnails (see BookmarksPanel); others render on appear.
+        tracker.onThumbnailsChanged = { [weak self] pages in
+            guard let self = self, self.rows.contains(where: { pages.contains($0.page) }) else { return }
+            self.thumbnailRevision += 1
+        }
         tracker.refreshNow()
     }
 
@@ -1062,10 +1136,12 @@ final class BookmarksPanelModel: ObservableObject {
         self.content = content
         let next = content.map { BookmarkRow.rows($0, current: tracker.session?.page) } ?? []
         if next != rows { rows = next }
-        for row in next where tracker.thumbnails.image(row.page) == nil { tracker.requestThumbnail(row.page) }
     }
 
     func image(_ page: PageID) -> UIImage? { tracker.thumbnails.image(page) }
+
+    /// Called by each row as it appears and after thumbnails change; a no-op while the image is current.
+    func requestThumbnail(_ page: PageID) { tracker.requestThumbnail(page) }
 
     func open(_ row: BookmarkRow) {
         guard let doc = tracker.doc else { return }
@@ -1112,10 +1188,12 @@ struct BookmarksPanel: View {
                     .buttonStyle(.plain)
                     .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
                     .hoverEffect(.highlight)
+                    .onAppear { model.requestThumbnail(row.page) }
+                    .onChange(of: model.thumbnailRevision) { model.requestThumbnail(row.page) }
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
-                    .listRowInsets(EdgeInsets(top: NibSpacing.xs, leading: NibSpacing.l, bottom: NibSpacing.xs,
-                                              trailing: NibSpacing.l))
+                    .listRowInsets(EdgeInsets(top: NibSpacing.xxs, leading: NibSpacing.xs, bottom: NibSpacing.xxs,
+                                              trailing: NibSpacing.xs))
                     .swipeActions(edge: .trailing) {
                         Button(role: .destructive) {
                             model.remove(row)
@@ -1149,52 +1227,46 @@ struct BookmarksPanel: View {
     }
 }
 
+/// A bookmark: the page thumbnail with its number under it (NibPageThumbnail), then the page's title. The current
+/// page carries the accent ring, the row highlight and an emphasised title, so the state is never colour alone.
 struct BookmarkRowView: View {
     let row: BookmarkRow
     let image: UIImage?
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         HStack(spacing: NibSpacing.m) {
-            PageThumbnailImage(image: image, aspect: row.aspect)
-            VStack(alignment: .leading, spacing: NibSpacing.xxs) {
-                Text(String(localized: "Page \(row.number)"))
-                    .font(NibFont.body)
-                    .monospacedDigit()
-                    .foregroundStyle(row.isCurrent ? NibColor.accent : NibColor.label)
-                if let title = row.title {
-                    Text(title)
-                        .font(NibFont.caption1)
-                        .foregroundStyle(NibColor.labelSecondary)
-                        .lineLimit(2)
+            NibPageThumbnail(number: row.number, isCurrent: row.isCurrent, aspectRatio: max(row.aspect, 0.1),
+                             width: OutlineMetrics.rowThumbnailWidth) {
+                ZStack {
+                    NibColor.backgroundTertiary
+                    if let image = image {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                    }
                 }
             }
+            Text(row.title ?? String(localized: "Page \(row.number)"))
+                .font(row.isCurrent ? NibFont.bodyEmphasis : NibFont.body)
+                .foregroundStyle(NibColor.label)
+                .lineLimit(typeSize.isAccessibilitySize ? nil : 2)
             Spacer(minLength: 0)
         }
+        .padding(.horizontal, NibSpacing.m)
+        .padding(.vertical, NibSpacing.s)
         .frame(minHeight: NibMetrics.hitTarget)
+        .background(row.isCurrent ? NibColor.fill3 : Color.clear,
+                    in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
         .contentShape(Rectangle())
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityTitle)
         .accessibilityValue(row.isCurrent ? String(localized: "Current page") : "")
         .accessibilityAddTraits(row.isCurrent ? .isSelected : [])
     }
-}
 
-/// A small page render on a paper-coloured placeholder (no shimmer while it loads).
-struct PageThumbnailImage: View {
-    let image: UIImage?
-    let aspect: CGFloat
-
-    var body: some View {
-        ZStack {
-            NibColor.backgroundTertiary
-            if let image = image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-            }
-        }
-        .frame(width: OutlineMetrics.thumbnailWidth, height: OutlineMetrics.thumbnailWidth / max(aspect, 0.1))
-        .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
-        .nibElevation(.paper)
-        .accessibilityHidden(true)
+    private var accessibilityTitle: String {
+        guard let title = row.title else { return String(localized: "Page \(row.number)") }
+        return String(localized: "Page \(row.number), \(title)")
     }
 }
