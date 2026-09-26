@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPencilHardware/SqueezePalette.swift:79-98 (PalettePlan.mirror); NibKit/Tests/FeatPencilHardwareTests/FeatPencilHardwareTests.swift:143-148",
+      "problem": "Acceptance 'palette mirrors the current toolbar layout' (T-076 'Palette contents follow the customised toolbar') fails in the default state. F016's ToolbarLayoutEngine.arrange (feat/F016, ToolbarCustomization.swift) puts every hideable, non-plugin tool that the saved layout does not mention into More, unless it is one of the everyday set {lasso, pen, highlighter, eraser, shape, drawShape, text} (DESIGN.md 14.3). `toolbar.layout` is nil on a fresh install. mirror() instead shows every .tools item, so the squeeze palette shows pencil, tape, image, elements, sticky and laser while the toolbar shows six tools. A built-in tool added after the person customised the toolbar shows up the same way. mirror() also differs from F016 in three other ways. A lasso descriptor left at the default hideable=true can be hidden, but F016 never hides the lasso. There is no one-slot-per-tool dedupe (F016 keys slots on toolID ?? id). Rank and hidden are matched on the toolID as well as the descriptor id, but F016 uses the descriptor id only. The test builds this divergence in: mirror(items, layout: nil) expects 'tape' on the palette, and the customised case expects 'tape', which F016 puts in More.",
+      "fix": "Port F016's rule into mirror, passing isPlugin in. Keep an `everyday` set equal to F016's and use hideable = d.hideable && d.group != .lasso. Set known = Set(order) + hidden, keyed on descriptor ids only. Show an item when !hideable || (known.contains(d.id) ? !hidden.contains(d.id) : (isPlugin(d.owner) || everyday.contains(d.toolID ?? d.id))). Rank by the d.id position in order and put unranked items after in registry order. Keep the first descriptor per d.toolID ?? d.id. Update the tests so that layout nil gives [lasso, pen, highlighter, eraser, dev.stamp.tool] and the customised layout leaves tape out. Add a case with a hideable lasso listed in `hidden`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPencilHardware/PencilHandler.swift:405-415 (note/recentPoint), 484-491 (showPalette haptic)",
+      "problem": "note(host, nil), called for a squeeze or double-tap without a hover pose, refreshes lastActivity but keeps the old lastPoint. recentPoint's 2-second freshness check is therefore measured from the gesture, not from when the point was recorded. Example: the Pencil hovered at the top left at 10:00 and is squeezed away from the screen at 10:05. The palette opens at the 10:00 spot and the alignment haptic plays. A squeeze with no earlier hover on that canvas gets no haptic. Option-Command-P or an AI pencil.palette call within 2 s of Pencil activity plays the Pencil haptic, which DESIGN.md 11 forbids for keyboard actions.",
+      "fix": "Store lastPoint[host] = (point, CACurrentMediaTime()) and have recentPoint check the point's own timestamp (< 2 s). Pass an explicit fromPencil flag into showPalette: true from receive() for squeeze and double-tap, false for commands and keyboard. It can travel through pencil.gesture -> pencil.palette as a private param, or through a handler field set just before perform. Play the alignment haptic exactly when fromPencil is true, at the palette anchor."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPencilHardware/PencilHandler.swift:528-536 (didCommit)",
+      "problem": "The 'snapping' haptic (T-117) fires on every user shape.create commit: Shapes-tool drags, Command-K and menu inserts, and commits in any document while lastHost exists. There is no check that the commit's document matches host.documentID and no freshness check. A real Draw-and-Hold snap happens while the Pencil is down, but its haptic only arrives when the shape commits after lift. F030 (feat/F030, DrawShapeTool.swift:6-10, 136-141) already emits `shape.snapped` {page, shape} on app.events at the moment of the snap and says the Pencil hardware feature should answer it with UICanvasFeedbackGenerator.",
+      "fix": "Replace the commit observer with an app.events subscription to \"shape.snapped\" (started in start()). Play pathCompleted only when the event's doc equals the recent host's documentID, at recentPoint(host) or else the page point from the payload. Name the event's owner in a ponytail comment."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPencilHardware/PencilHandler.swift:431-435; HoverPreview.swift:63-65",
+      "problem": "When the eraser is active, the hover preview draws a second ring over F010's own hover cursor. F010's EraserTool.hover (feat/F010, EraserTool.swift:127-136) already draws a circle whose diameter is `eraser.size` in screen points (default 14, independent of zoom). F043 reads session.toolOptions[\"eraser\"][\"radius\"|\"size\"], which F010 never writes, and falls back to a 6 pt page radius x zoom. Result: two concentric rings of different sizes under the Pencil at any zoom other than about 1.17.",
+      "fix": "Drop the eraser case from HoverPreviewGeometry.shape (return .none, since tools that implement CanvasTool.hover own their cursor). Remove the toolOptions radius lookup and its test lines, or change them to assert .none for the eraser."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPencilHardware/FeatPencilHardwareFeature.swift:121,161,202; PencilHandler.swift:83-89",
+      "problem": "F043 registers pencil.gesture, pencil.palette and pencil.actions. ARCHITECTURE 6.5 lists none of them, and F043's spec has no 'Commands owned'. 15.3 says to register exactly the listed ids. `lint.py --feature F043` reports 0 warnings only because the ids are passed as PencilCommandIDs.* constants, which its CommandDescriptor(id: \"...\") regex cannot see. The commands themselves are justified: they are how AI and plugins reach the palette and gestures.",
+      "fix": "Write the three ids as string literals in CommandDescriptor(id:), for example id: \"pencil.gesture\" (keep the constants for callers), so the lint check sees them. Report the three ids in the feature summary so the architect adds pencil.* rows to 6.5."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPencilHardware/FeatPencilHardwareFeature.swift:58-59, 290-301; PencilHandler.swift:447-450",
+      "problem": "`pen.reactToRoll` is a guessed name for another feature's setting. No contract defines it, F007 is not built, and the contract models roll per style (InkStyle.reactsToRoll). If F007 picks another key, the barrel-roll hover nib and the 'React to pen rotation' toggle never appear (T-006/P-046) and nothing reports it. The Apple Pencil Pro footer always says 'With pen rotation on, turning the barrel turns the fountain pen's nib.', even when the toggle is missing.",
+      "fix": "Show the second footer sentence only when app.settings.descriptor(PencilSettings.reactToRoll) != nil. List the assumed key name in the feature summary so F007 uses `pen.reactToRoll`, or so a shared NibSettings key gets added."
+    },
+    {
+      "severity": "minor",
+      "where": "spec 'tooltips on toolbar icons (UIToolTipInteraction / .help)'; SqueezePalette.swift:321",
+      "problem": "Only the Pencil palette's own buttons get .help. The toolbar icons the spec names (rendered by F016 through NibDesign's NibToolButton) have no tooltip anywhere, so hovering the Pencil over the toolbar shows nothing. The Settings footer promises tooltips only in the palette.",
+      "fix": "Ask for `.help(tool.label)` inside NibDesign's NibToolButton and NibIconButton, which covers the toolbar and this palette in one place, then drop the per-call .help here. Until that exists, list the gap in the feature summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPencilHardware/SqueezePalette.swift:294-301, 435-456 (SqueezePalettePresenter.present)",
+      "problem": "Escape probably never closes the palette. The hidden `.keyboardShortcut(.cancelAction)` Close button only fires when the UIHostingController is in the responder chain. The controller is added as a child of rootViewController, but its view goes straight onto the window and nothing makes it first responder, so the canvas stays first responder and hardware Escape goes past the palette. The palette is modal, so a keyboard user has to reach for the screen to leave it.",
+      "fix": "Use a small UIHostingController subclass with `override var canBecomeFirstResponder: Bool { true }`. Call controller.becomeFirstResponder() at the end of present() and resignFirstResponder() in dismiss(). Check with a hardware keyboard in the simulator."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPencilHardware/SqueezePalette.swift:112-116, 304-311, 336-343, 370-390; HoverPreview.swift:113,118",
+      "problem": "Places that break DESIGN 16 'only tokens' and 15.6 'don't hand-roll':\n- `.opacity(plan.canUndo ? 1 : 0.4)` is a literal and dims twice, since .disabled is applied as well.\n- The hairline is `.frame(height: 0.5)`.\n- The thickness dots use literal sizes [5, 8, 12].\n- The layer lineWidth values 1 and 0.5 are literals.\n- The width presets are a hand-rolled Circle with a fill3 Circle selection. NibStrokeWidthSlider's presets use a NibRadius.proposal rounded-rect selection, so the same presets look different in two places.",
+      "fix": "Drop the manual opacity and let .disabled carry the disabled state. Take the hairline, dot sizes and disabled alpha from NibMetrics/NibDesign tokens, or request a compact preset-dots component from NibDesign that NibStrokeWidthSlider's presets reuse, and use it here."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatPencilHardwareTests/FeatPencilHardwareTests.swift",
+      "problem": "The riskiest non-pure logic has no tests: recentPoint freshness (the stale-point bug above), receive() closing an open palette instead of running the binding, the gate applied through receive(), and what triggers the snap haptic. The mirror test asserts the behaviour that diverges from F016.",
+      "fix": "Add a Harness test: hover at point A, advance time over 2 s (inject a clock into PencilHandler, or pass `now` through note/recentPoint the way receive(now:) already does), squeeze with no location, and assert that pencil.gesture got no page/at. Add a test that receive() while palette.isPresented runs no command. Fix the mirror expectations as described in the first issue."
+    }
+  ]
+}

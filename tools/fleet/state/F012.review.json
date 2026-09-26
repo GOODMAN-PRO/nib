@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTransform/TransformCommands.swift:44-81 (TransformMath.affine) and 237-285 (TransformWriter.transform/move)",
+      "problem": "Trust boundary (AI/plugins): inputs are only checked for finiteness, never range, and results are never validated. item.transform {scale:[1e308]} on a 200 pt shape yields infinite frame coordinates in a single call; translate [1e39, 0] is a finite Double but overflows the Float32 StrokePoint x/y to inf; a finite matrix with huge entries does the same. Non-finite geometry is then committed (DocTransaction.put only checks payload kind/layer), breaks JSON encoding of the page and of the command's own bbox output (JSONEncoder throws on non-conforming floats, after the mutation already committed), and syncs to other devices.",
+      "fix": "Bound inputs (translate components |d| <= 1e6, scale factors in [1e-3, 1e3], matrix entries |m| <= 1e6; also put minimum/maximum on the schema numbers) AND validate outputs: in TransformWriter.transform and move, before tx.put, check TransformMath.box(next) (and every stroke point) is finite and within +/-1e6 pt, else throw NibError.invalid(\"the result is out of range\", path: \"$\") so the transaction rolls back. Add tests: scale [1e308] and translate [1e39, 0] on FIXTURESTK01 throw invalid_params and leave h.snapshot() unchanged."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTransform/TransformCommands.swift:331-333 (ItemTransform.run default origin)",
+      "problem": "The default origin does ctx.workspace.item(...) per target, and Workspace.item is a linear first(where:) over the page, so every item.transform without origin is O(k*n) on the main actor. That path runs on every drag commit and every arrow-key nudge, even though translate and matrix never use the origin. Select-all on a large whiteboard (boardItemLimit is 100k; 10k strokes gives ~50M ID compares) hangs the UI for hundreds of ms per nudge, and holding an arrow key freezes it.",
+      "fix": "Compute the origin only when p.scale or p.rotate is present, and resolve boxes with one workspace.items(doc, page:) per TransformTargets.byPage group turned into a [ElementID: Item] dictionary (the same way TransformWriter.checked does). Add a test that nudges 5k selected strokes and asserts XCTAssertLessThan(elapsed, budget * 4)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTransform/TransformCommands.swift:107-110 (TransformGraph.closure)",
+      "problem": "A connector with ONE anchored end (the other end free) counts as 'all anchored ends travel' and so moves as a whole: moving or rotating the shape also drags or swings the free end. The spec asks to recompute anchored connector ends with Item.anchorPoint, not to move the whole connector. The current tests only use a connector anchored at both ends.",
+      "fix": "Include a connector in the closure only when both from.item and to.item are non-nil and travelling (or when it is itself in refs). Otherwise leave it to TransformGraph.refit, which already re-pins just the anchored end. Add a test with a one-ended connector whose free end must stay put."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTransform/TransformCommands.swift:219-233, 241, 269 (checked vs closure)",
+      "problem": "Only refs are checked for locked. Locked items that travel through the closure (attachedTo children, whole connectors) are still moved, scaled or rotated, and moved to another page, which contradicts 'locked items are rejected'.",
+      "fix": "After computing the closure, run the same locked check over every travelling item (throw invalid_params naming the locked child and the ref that pulled it in), or exclude locked children and clear their attachedTo. Cover it with a test next to testAttachedItemsFollowTheirContainer."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTransformTests/FeatTransformTests.swift",
+      "problem": "The riskiest drag paths are untested. Option-drag and two-finger duplicate (item.duplicate with ids + offset [0,0], then item.transform or item.moveToPage in one undo group, then selection.set or the fallback) has no test. Neither do rotation drags, edge resize (unrotated and rotated frame, Shift proportional, Option from centre), the Shift axis lock on a body drag, snapping during a real drag (every drag test turns alignObjects off), or the haptic de-duplication in signal().",
+      "fix": "Register a stub item.duplicate NibCommand in the test Harness. Add drag tests for: an Option-drag duplicate (originals untouched, copies moved, one undo step, selection on the copies); a rotate drag with Shift giving 15 degree steps; an edge(1) resize on a rotated frame (w changes, h and rotation kept); a Shift body drag locking one axis; a body drag with alignObjects on that snaps to a neighbour's edge."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTransform/SelectionHandles.swift:213-237, 489-494",
+      "problem": "Because hitTest claims every touch inside the selection and a no-move touchesEnded does nothing, taps on a selected item never reach content.tapHandlers: no double-tap to edit selected text, no link tap, no selection.tapAt. Also, whenever handles exist, every canvas pan/pinch must wait for the two-finger recogniser to fail, so a pinch-zoom or two-finger scroll that starts on a large selection (for example select-all) duplicates it instead of zooming or scrolling.",
+      "fix": "On a touch that ends without passing the slop, forward it: execute the matching content.tapHandlers commands in order ({page, point, ref, gesture: \"tap\"}) until one returns handled, and file docs/contract-requests/F012-attachment-tap-passthrough.md for a first-class decline path. In gestureRecognizerShouldBegin, fail the two-finger pan when the spread between the touches changes past a threshold (a pinch), so zoom still works on a selection."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTransform/SelectionHandles.swift:402-447",
+      "problem": "The VoiceOver custom actions are cached per (page, ids), so 'Move to next/previous page' goes stale after pages are added, removed or reordered (wrong target, or a missing or extra action). Announcements post before the command runs and whatever its result. One-axis resize (the blue edge drag) has no action equivalent (DESIGN.md 15.5: every drag has an action).",
+      "fix": "Include the live page ids (or the page index and count) in the actionsFor cache key. Announce from the command completion using bus.execute and a success check instead of app.perform. Add 'Make wider', 'Make narrower', 'Make taller' and 'Make shorter' actions (item.transform with scale [1.25,1], [0.8,1], [1,1.25], [1,0.8])."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTransform/TransformCommands.swift:167-177, 326-327, 378",
+      "problem": "When refs is omitted and nothing is selected, item.transform and item.moveToPage return {refs: []} or {moved: []} as a silent success. That is right for arrow-key nudges, but an AI or plugin caller gets no signal or hint that nothing happened.",
+      "fix": "When refs is omitted, the selection is empty and ctx.principal is not the user, throw NibError(.invalidParams, \"nothing is selected\", path: \"$.refs\", hint: \"pass item refs (query.find lists them)\"). Keep the no-op for the user-principal key commands."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTransform/TransformCommands.swift:17-27, 67-75",
+      "problem": "A matrix with a negative determinant (a mirror) mirrors strokes, points and connectors, but TransformMath.frame turns the frames of text, images, stickies and shapes into a 180 degree rotation. A mixed selection therefore comes out inconsistent: text reads upside down instead of mirrored.",
+      "fix": "Reject det < 0 with invalid_params when any target or travelling item has a frame (the hint should say frames cannot be mirrored), or state the limitation in the schema description of matrix."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTransform/SelectionHandles.swift:209-218, 322-331",
+      "problem": "canvasDidChange (fired on every scroll and zoom frame) and hitTest rebuild the box with workspace.items(doc, page:), which filters the whole page, so a live selection costs O(page items) per scroll frame on dense pages.",
+      "fix": "Look up only the selected ids. Cache the SelectionBox keyed by (selection, page item revision) and rebuild it only when the selection or a commit changes it; on scroll or zoom, only re-project the cached frame through pageToView."
+    }
+  ]
+}
