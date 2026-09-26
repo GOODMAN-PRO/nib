@@ -775,6 +775,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `library.duplicate` | library | refs, ids? | F002 | Duplicate documents or folders. |
 | `library.trash` | library | refs | F002 | Move to Trash (recoverable). |
 | `library.setView` | session | folder?, layout?, sort?, filter? | F019 | Set the library window's current folder, grid/list layout, sort and filter. |
+| `library.reorder` | library | refs, folder?, after? \| before? | F019 | Put documents or folders in a folder's manual order after or before a sibling (sets its sort to Manual); returns the previous order for Undo. |
 | `library.chooseFolder` | library (user presence) |  | F025 | Pick a folder (iCloud Drive, OneDrive, Dropbox, On My iPad…) as the library. |
 | `library.relocate` | library (user presence) | copy | F025 | Copy the library to another folder and switch to it (e.g. On My iPad → iCloud Drive). |
 | `library.locations` | read |  | F025 | Known library folders on this device. |
@@ -1127,6 +1128,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `toolbar.saveLayout` | session | name | F016 | Save the current toolbar layout under a name. |
 | `toolbar.applyLayout` | session | name | F016 | Apply a saved toolbar layout. |
 | `toolbar.deleteLayout` | session | name | F016 | Delete a saved toolbar layout. |
+| `toolbar.dock` | session | dock, along? | F016 | Dock the tool palette at the top, bottom, left or right edge (iPhone: top or bottom); persisted per device; returns the previous dock for Undo. |
 
 ### `transcript.*`
 
