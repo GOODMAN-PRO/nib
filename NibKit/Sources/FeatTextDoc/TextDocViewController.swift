@@ -109,6 +109,8 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         super.viewWillDisappear(animated)
         view.endEditing(true)
         session.isEditingText = false
+        session.editingTextRef = nil
+        session.editingTextRange = nil
         // A name still waiting for the typing pause is given now, so closing right after typing keeps it.
         scheduleTitleUpdate(after: 0)
     }
@@ -378,7 +380,8 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         collectionView.scrollToItem(at: indexPath, at: .top, animated: animated)
     }
 
-    /// Text documents have no pages: a block id passed as `page` scrolls to that block.
+    /// Text documents have no pages. Callers use `reveal(block:animated:)`; a block id that still arrives as a page
+    /// (older callers, deep links) scrolls to that block too.
     func reveal(page: PageID, rect: Rect?, animated: Bool) {
         if byID[page] != nil { reveal(block: page, animated: animated) }
     }
@@ -744,8 +747,11 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         var groupOrder: [String] = []
         for d in items {
             let image = d.icon.flatMap { NibSymbol(systemName: $0) }.flatMap { UIImage(nib: $0) }
-            let action = UIAction(title: d.title, image: image, attributes: d.destructive ? [.destructive] : []) { [weak self] _ in
+            let checked = d.isChecked?(context) == true
+            let action = UIAction(title: d.resolvedTitle(for: context), image: image,
+                                  attributes: d.destructive ? [.destructive] : [], state: checked ? .on : .off) { [weak self] _ in
                 guard let self = self else { return }
+                // Params are read now (they may look at the selection); the command runs in line with typing.
                 let params = d.params(context)
                 self.newTypingGroup()
                 self.enqueue { await self.execute(d.command, params, group: NibID.make().raw) }
@@ -1037,7 +1043,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         guard current != title else { return }
         requestedTitle = title
         do {
-            let inv = Invocation(command: "library.rename", params: ["ref": .string(docRef), "title": .string(title)],
+            let inv = Invocation(command: CommandIDs.libraryRename, params: ["ref": .string(docRef), "title": .string(title)],
                                  principal: .user, session: session)
             _ = try await app.bus.execute(inv)
             // The library may adjust the name (a duplicate gets a number): remember what it really is.
@@ -1283,9 +1289,23 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
         if focusedBlockID != id { newTypingGroup() }
         focusedBlockID = id
         focusedTextView = tv
+        publishEditingText(tv)
         cellContaining(tv)?.updateAccessories()
         notifySelection()
         scrollCaretVisible()
+    }
+
+    /// What is being typed in, for links (F029), spellcheck and the assistant's context: the block and the
+    /// selection in UTF-16 units of its text (captions report their media block).
+    private func publishEditingText(_ tv: BlockTextView?) {
+        guard let tv = tv, let id = tv.blockID else {
+            session.editingTextRef = nil
+            session.editingTextRange = nil
+            return
+        }
+        let range = tv.selectedRange
+        session.editingTextRef = blockRef(id)
+        session.editingTextRange = [range.location, range.length]
     }
 
     func textViewDidEndEditing(_ textView: UITextView) {
@@ -1294,6 +1314,7 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
             focusedTextView = nil
             focusedBlockID = nil
             session.isEditingText = false
+            publishEditingText(nil)
         }
         cellContaining(tv)?.updateAccessories()
         notifySelection()
@@ -1305,6 +1326,7 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
 
     func textViewDidChangeSelection(_ textView: UITextView) {
         guard textView === focusedTextView else { return }
+        publishEditingText(focusedTextView)
         notifySelection()
         scrollCaretVisible()
     }
@@ -1360,7 +1382,8 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
         guard let tv = textView as? BlockTextView, let id = tv.blockID, let block = byID[id] else { return nil }
         var items: [UIMenuElement] = []
         if range.length > 0 {
-            let context = MenuContext(app: app, session: session, doc: documentID, ref: blockRef(id))
+            let context = MenuContext(app: app, session: session, doc: documentID, ref: blockRef(id),
+                                      textRange: [range.location, range.length])
             items = menuElements(app.ui.menuItems(.textSelection, context), context)
         }
         let extra = TextDocHooks.editMenuProviders.flatMap { $0.value(block, range, tv.role == .caption, self) }

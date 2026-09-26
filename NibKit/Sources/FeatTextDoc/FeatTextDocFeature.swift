@@ -104,10 +104,13 @@ enum TextDocMenus {
 
     static func items(owner: String) -> [MenuItemDescriptor] {
         var out: [MenuItemDescriptor] = []
-        out.append(MenuItemDescriptor(
+        var newItem = MenuItemDescriptor(
             id: "textdoc.new", title: String(localized: "Text Document"), icon: NibSymbol.textDocument.name,
             location: .libraryNew, order: 400, owner: owner, command: CommandIDs.batch,
-            params: { ctx in TextDocMenus.newDocumentParams(ctx) }))
+            params: { ctx in TextDocMenus.newDocumentParams(ctx) })
+        // The ⇧⌘T label; the key itself is the `textdoc.new` key command registered in `start`.
+        newItem.shortcut = newDocumentShortcut
+        out.append(newItem)
         out.append(MenuItemDescriptor(
             id: "textdoc.block.duplicate", title: String(localized: "Duplicate"), icon: "plus.square.on.square",
             location: .block, order: 100, owner: owner, command: CommandIDs.batch,
@@ -179,7 +182,12 @@ enum TextDocMenus {
     static func newDocumentParams(_ ctx: MenuContext) -> JSONValue {
         let id = NibID.make()
         var create: [String: JSONValue] = ["kind": .string(DocumentKind.textDocument.rawValue), "id": .string(id.raw)]
-        if let ref = ctx.ref, case .folder? = NodeRef(ref) { create["folder"] = .string(ref) }
+        // The folder the New menu was opened in (contracts-v2 `MenuContext.folder`; hosts before it passed the ref).
+        if let folder = ctx.folder {
+            create["folder"] = .string(NodeRef.folder(folder).description)
+        } else if let ref = ctx.ref, case .folder? = NodeRef(ref) {
+            create["folder"] = .string(ref)
+        }
         let open: JSONValue = ["doc": .string(NodeRef.document(id).description)]
         let calls: [JSONValue] = [["command": .string(CommandIDs.docCreate), "params": .object(create)],
                                   ["command": .string(CommandIDs.docOpen), "params": open]]

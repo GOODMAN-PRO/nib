@@ -599,9 +599,11 @@ final class FeatTextDocTests: XCTestCase {
 
     func testTextSelectionMenuEntriesAppearOverSelectedBlockText() throws {
         let h = harness()
-        h.app.ui.menus.register(MenuItemDescriptor(
+        var define = MenuItemDescriptor(
             id: "test.define", title: "Define Word", location: .textSelection, order: 1, owner: "test",
-            command: "block.update", isVisible: { ctx in ctx.ref == "block:FIXTUREDOC02/FIXTUREBLK02" }))
+            command: "block.update", isVisible: { ctx in ctx.ref == "block:FIXTUREDOC02/FIXTUREBLK02" })
+        define.contextTitle = { ctx in ctx.textRange == [0, 5] ? "Define Word" : "Wrong Range" }
+        h.app.ui.menus.register(define)
         let editor = openEditor(h)
         let tv = BlockTextView()
         tv.blockID = Fixtures.paragraphBlockID
@@ -610,7 +612,7 @@ final class FeatTextDocTests: XCTestCase {
         tv.attributedText = style.attributed(RichText(plain: "Hello blocks"))
 
         let menu = try XCTUnwrap(editor.textView(tv, editMenuForTextIn: NSRange(location: 0, length: 5), suggestedActions: []))
-        XCTAssertTrue(titles(menu).contains("Define Word"))
+        XCTAssertTrue(titles(menu).contains("Define Word"), "entries get the block and the selected range")
         XCTAssertNil(editor.textView(tv, editMenuForTextIn: NSRange(location: 2, length: 0), suggestedActions: []),
                      "a caret without a selection keeps the system menu")
         tv.role = .caption

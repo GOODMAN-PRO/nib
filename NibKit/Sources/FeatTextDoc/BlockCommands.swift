@@ -566,7 +566,7 @@ enum BlockMedia {
         // `inputFile` downloads web links to a temporary file of their own: it goes once the image is stored.
         let scheme = URL(string: url)?.scheme?.lowercased()
         let downloaded = scheme == "https" || scheme == "http"
-        defer { if downloaded { try? FileManager.default.removeItem(at: file) } }
+        defer { if downloaded { removeDownload(file) } }
         let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         guard size <= maxImageBytes else {
             throw NibError(.invalidParams, "the image is larger than 100 MB", path: "$.url",
@@ -582,6 +582,13 @@ enum BlockMedia {
             throw NibError(.invalidParams, "\(url) is not an image", path: "$.url", hint: "pass a PNG, JPEG, HEIC or GIF")
         }
         return asset
+    }
+
+    /// Deletes a file `inputFile` downloaded, with the folder of its own it lands in (`<tmp>/nib-downloads/<UUID>/`).
+    nonisolated static func removeDownload(_ file: URL) {
+        let folder = file.deletingLastPathComponent()
+        let target = folder.deletingLastPathComponent().lastPathComponent == "nib-downloads" ? folder : file
+        try? FileManager.default.removeItem(at: target)
     }
 
     /// The file extension of an image ImageIO can read, nil for anything else.
