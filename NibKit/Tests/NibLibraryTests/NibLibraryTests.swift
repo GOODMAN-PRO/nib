@@ -178,6 +178,21 @@ final class NibLibraryTests: XCTestCase {
         XCTAssertEqual(ghead.livePages.first?.background.template?.params["spacing"], 20)
         XCTAssertEqual(Set(ghead.livePages.map { $0.order }).count, 3, "every page has its own order key")
 
+        // The New Notebook sheet (F021) passes a cover template id, or false for no cover.
+        let kraftRef = try await lib.run("doc.create", ["kind": "notebook", "cover": "cover.kraft"])
+        let kraft = try XCTUnwrap(lib.head(docID(kraftRef)))
+        XCTAssertTrue(kraft.meta.coverEnabled)
+        XCTAssertEqual(kraft.livePages.map { $0.background.template?.id }, ["cover.kraft", NibSettings.defaultPaper.defaultValue.id])
+        let bareRef = try await lib.run("doc.create", ["kind": "notebook", "cover": false])
+        let bare = try XCTUnwrap(lib.head(docID(bareRef)))
+        XCTAssertFalse(bare.meta.coverEnabled)
+        XCTAssertEqual(bare.livePages.count, 1)
+        lib.h.app.settings.set(NibSettings.coverByDefault, false)
+        let plainRef = try await lib.run("doc.create", ["kind": "notebook"])
+        let plain = try XCTUnwrap(lib.head(docID(plainRef)))
+        XCTAssertEqual(plain.livePages.count, 1, "an omitted cover follows templates.coverByDefault")
+        for ref in [kraftRef, bareRef, plainRef] { try lib.library.deletePermanently(docID(ref)) }
+
         let boardRef = try await lib.run("doc.create", ["kind": "whiteboard"])
         let board = try XCTUnwrap(lib.head(docID(boardRef)))
         XCTAssertEqual(board.meta.kind, .whiteboard)

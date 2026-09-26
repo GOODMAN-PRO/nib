@@ -417,7 +417,7 @@ struct DocCreate: NibCommand {
             "folder": LibraryCommands.folderSchema,
             "template": .anything("paper template (notebook) or board background (whiteboard): an id or {id, params}"),
             "size": .arr(.num(), "[width, height] of notebook pages in points; default templates.defaultSize"),
-            "cover": .anything("notebook cover: true/false, or a cover template id or {id, params}; default templates.coverByDefault"),
+            "cover": .anything("notebook cover: a cover template id or {id, params}, true (templates.defaultCover) or false (none); omitted = templates.coverByDefault"),
             "pages": .int("number of paper pages of a notebook (default 1)", min: 1, max: 500),
             "id": .str("your own document id, [A-Za-z0-9_-]{1,64}")
         ], required: ["kind"]),
