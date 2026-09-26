@@ -9,16 +9,18 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 | **C** | App shell (`AppDelegate.swift`, `ShellViewController.swift`) | Architect only |
 | **D** | `project.yml`, CI workflow, `pick_sim.py`, `lint.py` | Architect only |
 
-15,549 lines across 54 files. Every file starts with its repository path as a heading.
+16,506 lines across 55 files. Every file starts with its repository path as a heading.
 
 ## How to use this file
 
 - **Scaffold agent.** Create every file below at the given path, exactly as written. Then create the module stubs listed in `forge-spec.json` → `scaffold[2]` (one per feature entry type, including the second entry types of split features). Push, and do not start features until CI is green — including `NameLookupCanaryTests`, which proves no contract name clashes with an SDK type.
 - **Feature agents.** Import `NibContracts` (and `NibTesting` in tests: Harness, Fixtures, fakes) and use only the API below. If something is missing, file `docs/contract-requests/<Fxxx>-<slug>.md`; do not edit these files.
 - **Concurrency.** Everything marked `@MainActor` must be used from the main actor. Test classes that use `Harness` or `NibApp` are `@MainActor`.
-- **contracts-v2.** The sources below are contracts-v2, an additive revision over contracts-v1. The "contracts-v2 changelog" section lists every new API by gap group, with the workaround in each feature that it replaces.
+- **contracts-v2.** The sources below are contracts-v2 (plus the additive contracts-v2.1 follow-up), an additive revision over contracts-v1. The "contracts-v2 changelog" section lists every new API by gap group, with the workaround in each feature that it replaces.
 
 ## contracts-v2 changelog
+
+**contracts-v2.1** (branch `v2/contracts2`, additive). `CommandIDs` gains a constant for each of the 313 ARCHITECTURE.md §6.5 catalogue ids that had none (among them `settingsOpen`, `shapeTapAt`, `imagePick`, `pdfTapAt`, `pencilGesture`, `pencilPalette`, `pencilActions`, `layerExportOptions`, `outlineList`, `clipboardCopyText`, `toolbarDock` and `libraryReorder`). Each name is the id in camel case: `ai.chat.delete` → `aiChatDelete`. `PanelIDs` now matches the §13 panel id list: it gains `studySmartLearn = "studysession.smartLearn"`, which is the id F049 opens. `studyLearn` is superseded by it. It shipped as "studysession.learn", which no feature registers, and now holds the Smart Learn id. The new `NibContractsTests/CommandCatalogueTests.swift` reads docs/ARCHITECTURE.md and fails when a §6.5 row has no `CommandIDs` constant, when a constant names an id that is not in the catalogue, or when `PanelIDs` differs from the §13 list. A spec change that adds a catalogue row or a panel id must add the constant in the same change.
 
 contracts-v2 (branch `v2/contracts`) resolves the contract gaps the first 48 features reported (`tools/fleet/contract-gaps.md`, where every gap line now ends with `[v2: G<n> …]`, `[v2: rejected - …]` or `[v2: deferred - …]`). It is **additive over contracts-v1**: no public API was renamed, removed or re-signed; every new protocol requirement has a default implementation; new stored fields are optional or defaulted and decode leniently; superseded APIs keep working and carry a "Superseded in contracts-v2 by X" doc comment. Two behaviour changes are bug fixes: `DocTransaction.revert` (G4) and `CommandContext.inputFile` (G6); plus `Frame.applying` for rotated frames under non-uniform scale (G24). The sources in Part A below are the v2 sources; `NibContractsTests/ContractsV2Tests.swift` covers every fix and every new API.
 
@@ -463,7 +465,8 @@ public static let windowShowLibrary = "window.showLibrary"      // NEW contracts
 // PanelIDs
 public static let assistant = "aichat.panel", trash = "organize.trash", favourites = "organize.favourites"
 public static let templates = "templateui.manage", cloudBackup = "syncui.panel", about = "about.panel"
-public static let gallery = "pluginmanager.gallery", studyPractice = "studysession.practice", studyLearn = "studysession.learn"
+public static let gallery = "pluginmanager.gallery", studyPractice = "studysession.practice"
+public static let studySmartLearn = "studysession.smartLearn"   // v2.1; v2's studyLearn now holds this id too
 ```
 Replaces: F014 `FeatClipboard/ClipboardCommands.swift` `"selection.clear"`, F028 `PageTextEditor.setTextCommand`, F047 `TextDocViewController.swift` `"library.rename"`, F058 `FeatSmartInk/EditHandwritingMode.swift` `"item.recolor"` / `"clipboard.cut"` literals → the constants; F017 `DocumentContainerViewController.swift` Back button and F018 `FeatWindows/TabStripView.swift` `showLibrary()` / `WindowCommands.swift` direct `navigator.showLibrary` → `app.perform(CommandIDs.windowShowLibrary, …)`; F017 assistant found by owner "aichat", F027 app-menu places guessed by owner, F035 gallery by owner "pluginmanager", F049 `FeatStudyEditor/CardEditorView.swift` practice/learn by owner → `PanelIDs`. Adopt: F085, F045, F070, F098, F080, F050 register their panels under these ids.
 
@@ -4510,6 +4513,7 @@ import Foundation
 
 /// Well-known command ids that features call across module boundaries (owners: ARCHITECTURE.md §6).
 /// Calling a command by id is the ONLY way one feature uses another feature's behaviour.
+/// Since contracts-v2.1 every id in the §6.5 catalogue has a constant here.
 public enum CommandIDs {
     // Contracts (always present)
     public static let undo = "edit.undo"
@@ -4596,6 +4600,400 @@ public enum CommandIDs {
     public static let audioPlay = "audio.play"
     /// Contracts (always present): shows the library in the invoking window {folder?} (session).
     public static let windowShowLibrary = "window.showLibrary"
+
+    // contracts-v2.1: a constant for every other id in the ARCHITECTURE.md §6.5 catalogue, by namespace in catalogue
+    // order, with the owning feature. NibContractsTests/CommandCatalogueTests checks that every catalogue row has one.
+
+    public static let a11yDescribePage = "a11y.describePage"  // F095
+
+    public static let aiChatList = "ai.chat.list"  // F084
+    public static let aiChatRename = "ai.chat.rename"  // F084
+    public static let aiChatDelete = "ai.chat.delete"  // F084
+    public static let aiChatFeedback = "ai.chat.feedback"  // F084
+    public static let aiProviderList = "ai.provider.list"  // F086
+    public static let aiProviderSave = "ai.provider.save"  // F086
+    public static let aiProviderActivate = "ai.provider.activate"  // F086
+    public static let aiProviderDelete = "ai.provider.delete"  // F086
+    public static let aiProviderTest = "ai.provider.test"  // F086
+    public static let aiQuiz = "ai.quiz"  // F087
+
+    public static let answerZoneCreate = "answerZone.create"  // F099
+    public static let answerZoneScore = "answerZone.score"  // F099
+    public static let answerZoneSetHints = "answerZone.setHints"  // F099
+    public static let answerZoneRevealHint = "answerZone.revealHint"  // F099
+
+    public static let appDeleteAllData = "app.deleteAllData"  // F098
+
+    public static let assetGet = "asset.get"  // F003
+
+    public static let audioRecord = "audio.record"  // F052
+    public static let audioPause = "audio.pause"  // F052
+    public static let audioSeek = "audio.seek"  // F052
+    public static let audioSetPlayback = "audio.setPlayback"  // F052
+    public static let audioRename = "audio.rename"  // F052
+    public static let audioDelete = "audio.delete"  // F052
+    public static let audioExport = "audio.export"  // F052
+    public static let audioQuickRecord = "audio.quickRecord"  // F052
+
+    public static let backupNow = "backup.now"  // F068
+    public static let backupManual = "backup.manual"  // F068
+    public static let backupConfigure = "backup.configure"  // F068
+    public static let backupChooseFolder = "backup.chooseFolder"  // F068
+    public static let backupStatus = "backup.status"  // F068
+    public static let backupClearQueue = "backup.clearQueue"  // F068
+
+    public static let blockInsert = "block.insert"  // F047
+    public static let blockUpdate = "block.update"  // F047
+    public static let blockDelete = "block.delete"  // F047
+    public static let blockMove = "block.move"  // F047
+    public static let blockComment = "block.comment"  // F103
+    public static let blockEditComment = "block.editComment"  // F103
+    public static let blockDeleteComment = "block.deleteComment"  // F103
+    public static let blockResolveComment = "block.resolveComment"  // F103
+
+    public static let boardAdd = "board.add"  // F044
+    public static let boardRename = "board.rename"  // F044
+    public static let boardInsertTemplate = "board.insertTemplate"  // F044
+
+    public static let bridgeSetEnabled = "bridge.setEnabled"  // F090
+    public static let bridgeStatus = "bridge.status"  // F090
+
+    public static let calendarEvents = "calendar.events"  // F075
+    public static let calendarCreateNote = "calendar.createNote"  // F075
+    public static let calendarOpenNote = "calendar.openNote"  // F075
+
+    public static let canvasClearDecorations = "canvas.clearDecorations"  // F006
+
+    public static let cardAdd = "card.add"  // F049
+    public static let cardUpdate = "card.update"  // F049
+    public static let cardDelete = "card.delete"  // F049
+    public static let cardMove = "card.move"  // F049
+    public static let cardMoveTo = "card.moveTo"  // F049
+
+    public static let clipboardCopyText = "clipboard.copyText"  // F014
+
+    public static let collabHost = "collab.host"  // F072
+    public static let collabJoin = "collab.join"  // F072
+    public static let collabLeave = "collab.leave"  // F072
+    public static let collabParticipants = "collab.participants"  // F072
+    public static let collabApprove = "collab.approve"  // F072
+    public static let collabSetRole = "collab.setRole"  // F072
+    public static let collabRevoke = "collab.revoke"  // F072
+    public static let collabFollow = "collab.follow"  // F108
+    public static let collabFollowMe = "collab.followMe"  // F108
+    public static let collabMarkSeen = "collab.markSeen"  // F108
+
+    public static let commentAdd = "comment.add"  // F037
+    public static let commentReply = "comment.reply"  // F037
+    public static let commentEdit = "comment.edit"  // F037
+    public static let commentDeleteMessage = "comment.deleteMessage"  // F037
+    public static let commentResolve = "comment.resolve"  // F037
+    public static let commentTapAt = "comment.tapAt"  // F037
+
+    public static let connectorCreate = "connector.create"  // F032
+    public static let connectorSetPath = "connector.setPath"  // F032
+
+    public static let diagnosticsExport = "diagnostics.export"  // F076
+    public static let diagnosticsSetFeatureEnabled = "diagnostics.setFeatureEnabled"  // F076
+
+    public static let diagramAddConnected = "diagram.addConnected"  // F032
+
+    public static let dictionaryAdd = "dictionary.add"  // F104
+    public static let dictionaryRemove = "dictionary.remove"  // F104
+    public static let dictionaryList = "dictionary.list"  // F104
+
+    public static let docSetFavorite = "doc.setFavorite"  // F002
+    public static let docMerge = "doc.merge"  // F002
+    public static let docSetScrollDirection = "doc.setScrollDirection"  // F017
+    public static let docQuickNote = "doc.quickNote"  // F021
+    public static let docConvertToWhiteboard = "doc.convertToWhiteboard"  // F044
+    public static let docSetLanguage = "doc.setLanguage"  // F057
+    public static let docSetWritingAids = "doc.setWritingAids"  // F104
+    public static let docSetLocked = "doc.setLocked"  // F071
+    public static let docUnlock = "doc.unlock"  // F071
+    public static let docSuggestTitle = "doc.suggestTitle"  // F087
+
+    public static let elementCreate = "element.create"  // F035
+    public static let elementInsert = "element.insert"  // F035
+    public static let elementCollectionCreate = "element.collection.create"  // F035
+    public static let elementCollectionUpdate = "element.collection.update"  // F035
+    public static let elementCollectionDelete = "element.collection.delete"  // F035
+    public static let elementCollectionList = "element.collection.list"  // F035
+    public static let elementList = "element.list"  // F035
+    public static let elementRename = "element.rename"  // F035
+    public static let elementDelete = "element.delete"  // F035
+    public static let elementImport = "element.import"  // F035
+    public static let elementExport = "element.export"  // F035
+
+    public static let exportPresent = "export.present"  // F067
+    public static let exportSaveToSource = "export.saveToSource"  // F067
+
+    public static let folderCreate = "folder.create"  // F002
+    public static let folderSetStyle = "folder.setStyle"  // F002
+
+    public static let galleryList = "gallery.list"  // F080
+
+    public static let gifSearch = "gif.search"  // F035
+
+    public static let handwritingToText = "handwriting.toText"  // F057
+    public static let handwritingToTextPages = "handwriting.toTextPages"  // F057
+    public static let handwritingWords = "handwriting.words"  // F058
+    public static let handwritingReflow = "handwriting.reflow"  // F058
+    public static let handwritingStraighten = "handwriting.straighten"  // F058
+    public static let handwritingAlign = "handwriting.align"  // F058
+    public static let handwritingInsertSpace = "handwriting.insertSpace"  // F058
+    public static let handwritingReplaceWord = "handwriting.replaceWord"  // F059
+    public static let handwritingRestyle = "handwriting.restyle"  // F105
+
+    public static let imageInsert = "image.insert"  // F034
+    public static let imageCrop = "image.crop"  // F034
+    public static let imageFlip = "image.flip"  // F034
+    public static let imageReplace = "image.replace"  // F034
+    public static let imageSaveToPhotos = "image.saveToPhotos"  // F034
+    public static let imagePick = "image.pick"  // F034
+
+    public static let importPick = "import.pick"  // F064
+
+    public static let indexRebuild = "index.rebuild"  // F055
+
+    public static let inkSetStyle = "ink.setStyle"  // F007
+
+    public static let itemArrange = "item.arrange"  // F013
+    public static let itemSetLocked = "item.setLocked"  // F013
+
+    public static let laserSetMode = "laser.setMode"  // F040
+    public static let laserPoint = "laser.point"  // F040
+
+    public static let layerSetActive = "layer.setActive"  // F041
+    public static let layerSetVisible = "layer.setVisible"  // F041
+    public static let layerRename = "layer.rename"  // F041
+    public static let layerMoveItems = "layer.moveItems"  // F041
+    public static let layerExportOptions = "layer.exportOptions"  // F041
+
+    public static let lessonCreate = "lesson.create"  // F109
+    public static let lessonSetState = "lesson.setState"  // F109
+    public static let lessonImportRoster = "lesson.importRoster"  // F109
+    public static let lessonCollect = "lesson.collect"  // F110
+    public static let lessonCluster = "lesson.cluster"  // F110
+    public static let lessonSetClusters = "lesson.setClusters"  // F110
+
+    public static let libraryList = "library.list"  // F002
+    public static let libraryMove = "library.move"  // F002
+    public static let libraryDuplicate = "library.duplicate"  // F002
+    public static let libraryTrash = "library.trash"  // F002
+    public static let librarySetView = "library.setView"  // F019
+    public static let libraryReorder = "library.reorder"  // F019
+    public static let libraryChooseFolder = "library.chooseFolder"  // F025
+    public static let libraryRelocate = "library.relocate"  // F025
+    public static let libraryLocations = "library.locations"  // F025
+    public static let librarySwitch = "library.switch"  // F025
+    public static let libraryRepair = "library.repair"  // F070
+
+    public static let linkSet = "link.set"  // F029
+    public static let linkRemove = "link.remove"  // F029
+    public static let linkFollow = "link.follow"  // F029
+    public static let linkBack = "link.back"  // F029
+    public static let linkAutodetect = "link.autodetect"  // F029
+    public static let linkTapAt = "link.tapAt"  // F029
+
+    public static let lockSetup = "lock.setup"  // F071
+
+    public static let mathRecognize = "math.recognize"  // F060
+    public static let mathConvert = "math.convert"  // F060
+    public static let mathSetLatex = "math.setLatex"  // F060
+    public static let mathCopy = "math.copy"  // F060
+    public static let mathEvaluate = "math.evaluate"  // F061
+    public static let mathAssist = "math.assist"  // F106
+    public static let mathGraphCreate = "math.graph.create"  // F107
+    public static let mathGraphSetViewport = "math.graph.setViewport"  // F107
+    public static let mathSolve = "math.solve"  // F088
+
+    public static let mathassistTapAt = "mathassist.tapAt"  // F106
+
+    public static let meetingSummarize = "meeting.summarize"  // F089
+    public static let meetingGenerateNotes = "meeting.generateNotes"  // F089
+
+    public static let menuShowAt = "menu.showAt"  // F013
+
+    public static let nodeInsert = "node.insert"  // F003
+    public static let nodeSet = "node.set"  // F003
+    public static let nodeRemove = "node.remove"  // F003
+    public static let nodeMove = "node.move"  // F003
+
+    public static let outlineAdd = "outline.add"  // F046
+    public static let outlineRename = "outline.rename"  // F046
+    public static let outlineMove = "outline.move"  // F046
+    public static let outlineDelete = "outline.delete"  // F046
+    public static let outlineSortByPage = "outline.sortByPage"  // F046
+    public static let outlineList = "outline.list"  // F046
+    public static let outlineGenerate = "outline.generate"  // F087
+
+    public static let pageSetBackground = "page.setBackground"  // F005
+    public static let pageClear = "page.clear"  // F010
+    public static let pageDeleteItems = "page.deleteItems"  // F010
+    public static let pageDuplicate = "page.duplicate"  // F022
+    public static let pageCopy = "page.copy"  // F022
+    public static let pagePaste = "page.paste"  // F022
+    public static let pageMoveTo = "page.moveTo"  // F022
+    public static let pageReorder = "page.reorder"  // F022
+    public static let pageRotate = "page.rotate"  // F022
+    public static let pageTrash = "page.trash"  // F022
+    public static let pageRestore = "page.restore"  // F022
+    public static let pagePurge = "page.purge"  // F022
+    public static let pageSetBookmarked = "page.setBookmarked"  // F046
+
+    public static let pdfText = "pdf.text"  // F024
+    public static let pdfLinks = "pdf.links"  // F024
+    public static let pdfMarkSelection = "pdf.markSelection"  // F042
+    public static let pdfCopyText = "pdf.copyText"  // F042
+    public static let pdfTapAt = "pdf.tapAt"  // F042
+
+    public static let pencilGesture = "pencil.gesture"  // F043
+    public static let pencilPalette = "pencil.palette"  // F043
+    public static let pencilActions = "pencil.actions"  // F043
+
+    public static let pluginList = "plugin.list"  // F078
+    public static let pluginEnable = "plugin.enable"  // F078
+    public static let pluginReload = "plugin.reload"  // F078
+    public static let pluginLogs = "plugin.logs"  // F078
+    public static let pluginSdkTypes = "plugin.sdkTypes"  // F078
+    public static let pluginDocs = "plugin.docs"  // F078
+    public static let pluginUninstall = "plugin.uninstall"  // F079
+    public static let pluginReview = "plugin.review"  // F079
+
+    public static let presentSetMode = "present.setMode"  // F063
+
+    public static let presetSelect = "preset.select"  // F008
+    public static let presetSetSwatch = "preset.setSwatch"  // F008
+    public static let presetAddSwatch = "preset.addSwatch"  // F008
+    public static let presetRemoveSwatch = "preset.removeSwatch"  // F008
+    public static let presetMoveSwatch = "preset.moveSwatch"  // F008
+    public static let presetSetWidth = "preset.setWidth"  // F008
+    public static let presetReset = "preset.reset"  // F008
+
+    public static let printPresent = "print.present"  // F067
+
+    public static let relayConfigure = "relay.configure"  // F092
+
+    public static let replaySetMode = "replay.setMode"  // F053
+    public static let replaySeekToItem = "replay.seekToItem"  // F053
+    public static let replayTapAt = "replay.tapAt"  // F053
+
+    public static let rulerSet = "ruler.set"  // F039
+
+    public static let scanDocuments = "scan.documents"  // F065
+    public static let scanQr = "scan.qr"  // F065
+
+    public static let searchOpen = "search.open"  // F056
+    public static let searchStep = "search.step"  // F056
+
+    public static let selectionFromRect = "selection.fromRect"  // F011
+    public static let selectionFromLoop = "selection.fromLoop"  // F011
+    public static let selectionSelectAll = "selection.selectAll"  // F011
+    public static let selectionTapAt = "selection.tapAt"  // F011
+    public static let selectionScreenshot = "selection.screenshot"  // F013
+
+    public static let settingsOpen = "settings.open"  // F027
+
+    public static let shapeSetStyle = "shape.setStyle"  // F031
+    public static let shapeSetKind = "shape.setKind"  // F031
+    public static let shapeSetPoints = "shape.setPoints"  // F031
+    public static let shapeTapAt = "shape.tapAt"  // F031
+
+    public static let sidebarToggle = "sidebar.toggle"  // F017
+
+    public static let spellcheckTapAt = "spellcheck.tapAt"  // F104
+
+    public static let stickyCreate = "sticky.create"  // F036
+    public static let stickySetCollapsed = "sticky.setCollapsed"  // F036
+    public static let stickyResolve = "sticky.resolve"  // F036
+    public static let stickySetColor = "sticky.setColor"  // F036
+    public static let stickyTapAt = "sticky.tapAt"  // F036
+
+    public static let stopwatchStart = "stopwatch.start"  // F062
+    public static let stopwatchLap = "stopwatch.lap"  // F062
+
+    public static let studyGrade = "study.grade"  // F050
+    public static let studyResetProgress = "study.resetProgress"  // F050
+    public static let studySetReminders = "study.setReminders"  // F050
+    public static let studySetTheme = "study.setTheme"  // F050
+    public static let studyImportText = "study.importText"  // F051
+    public static let studyExportCSV = "study.exportCSV"  // F051
+
+    public static let syncNow = "sync.now"  // F025
+
+    public static let tabClose = "tab.close"  // F018
+    public static let tabCloseOthers = "tab.closeOthers"  // F018
+    public static let tabSelect = "tab.select"  // F018
+
+    public static let tableEdit = "table.edit"  // F048
+    public static let tableExportCSV = "table.exportCSV"  // F048
+
+    public static let tapeTapAt = "tape.tapAt"  // F033
+    public static let tapeSetRevealed = "tape.setRevealed"  // F033
+    public static let tapeRemoveAll = "tape.removeAll"  // F033
+    public static let tapeImportPattern = "tape.importPattern"  // F033
+    public static let tapePatterns = "tape.patterns"  // F033
+    public static let tapeDeletePattern = "tape.deletePattern"  // F033
+    public static let tapeClearHistory = "tape.clearHistory"  // F033
+
+    public static let templateList = "template.list"  // F005
+    public static let templateChoose = "template.choose"  // F045
+    public static let templateImport = "template.import"  // F045
+    public static let templateListCustom = "template.listCustom"  // F045
+    public static let templateGroupCreate = "template.group.create"  // F045
+    public static let templateGroupRename = "template.group.rename"  // F045
+    public static let templateGroupDelete = "template.group.delete"  // F045
+    public static let templateDelete = "template.delete"  // F045
+    public static let templateSetHidden = "template.setHidden"  // F045
+    public static let templateFromPage = "template.fromPage"  // F045
+
+    public static let textFormat = "text.format"  // F026
+    public static let textSetParagraph = "text.setParagraph"  // F026
+    public static let textSetBoxStyle = "text.setBoxStyle"  // F026
+    public static let textSaveDefaultStyle = "text.saveDefaultStyle"  // F026
+    public static let textTapAt = "text.tapAt"  // F026
+    public static let textStartPageText = "text.startPageText"  // F028
+
+    public static let timerStart = "timer.start"  // F062
+    public static let timerControl = "timer.control"  // F062
+    public static let timerHistory = "timer.history"  // F062
+    public static let timerSaveMode = "timer.saveMode"  // F062
+    public static let timerDeleteMode = "timer.deleteMode"  // F062
+
+    public static let toolbarSetLayout = "toolbar.setLayout"  // F016
+    public static let toolbarReset = "toolbar.reset"  // F016
+    public static let toolbarSetVisible = "toolbar.setVisible"  // F016
+    public static let toolbarLayouts = "toolbar.layouts"  // F016
+    public static let toolbarSaveLayout = "toolbar.saveLayout"  // F016
+    public static let toolbarApplyLayout = "toolbar.applyLayout"  // F016
+    public static let toolbarDeleteLayout = "toolbar.deleteLayout"  // F016
+    public static let toolbarDock = "toolbar.dock"  // F016
+
+    public static let transcriptGet = "transcript.get"  // F054
+    public static let transcriptRegenerate = "transcript.regenerate"  // F054
+    public static let transcriptEditSegment = "transcript.editSegment"  // F054
+    public static let transcriptInsert = "transcript.insert"  // F054
+
+    public static let trashList = "trash.list"  // F002
+    public static let trashRecover = "trash.recover"  // F002
+    public static let trashDeletePermanently = "trash.deletePermanently"  // F002
+    public static let trashEmpty = "trash.empty"  // F002
+
+    public static let viewZoom = "view.zoom"  // F006
+    public static let viewScrollBy = "view.scrollBy"  // F006
+
+    public static let webdavSyncNow = "webdav.syncNow"  // F069
+    public static let webdavConfigure = "webdav.configure"  // F069
+    public static let webdavPut = "webdav.put"  // F069
+    public static let webdavStatus = "webdav.status"  // F069
+
+    public static let windowOpen = "window.open"  // F018
+
+    public static let zoomToggle = "zoom.toggle"  // F038
+    public static let zoomSetBox = "zoom.setBox"  // F038
+    public static let zoomNewLine = "zoom.newLine"  // F038
+    public static let zoomSetReturnHeight = "zoom.setReturnHeight"  // F038
 }
 
 /// contracts-v2: well-known panel ids, so a feature can open another feature's panel with `panel.open {id}` without
@@ -4615,9 +5013,13 @@ public enum PanelIDs {
     public static let about = "about.panel"
     /// Plugin and content Gallery library tab (F080).
     public static let gallery = "pluginmanager.gallery"
-    /// Study set Practice and Smart Learn panels (F050).
+    /// Study set Practice panel (F050).
     public static let studyPractice = "studysession.practice"
-    public static let studyLearn = "studysession.learn"
+    /// Study set Smart Learn panel (F050). contracts-v2.1: the id F049 opens and ARCHITECTURE.md §13 lists.
+    public static let studySmartLearn = "studysession.smartLearn"
+    /// Superseded in contracts-v2.1 by `studySmartLearn`. contracts-v2 shipped "studysession.learn", which no feature
+    /// registers; this now holds the Smart Learn id so existing callers open the right panel.
+    public static let studyLearn = "studysession.smartLearn"
 }
 ```
 
@@ -14472,6 +14874,569 @@ private final class RecordingNavigator: SceneNavigator {
     func showLibrary(folder: FolderID?) { shownFolders.append(folder) }
     func showSettings(page: String?) {}
     func presentModal(_ viewController: UIViewController) {}
+}
+```
+
+### `NibKit/Tests/NibContractsTests/CommandCatalogueTests.swift`
+
+```swift
+import XCTest
+import NibContracts
+
+/// contracts-v2.1: every command id in the ARCHITECTURE.md §6.5 catalogue has a `CommandIDs` constant, and `PanelIDs`
+/// matches the well-known panel ids that ARCHITECTURE.md §13 lists. The tables below name every constant, so a missing
+/// one fails to compile; the doc checks read docs/ARCHITECTURE.md from the repository checkout this file lives in.
+final class CommandCatalogueTests: XCTestCase {
+    /// Every `CommandIDs` constant with the id it holds, in §6.5 catalogue order.
+    static let commandIDs: [(String, String)] = [
+        ("edit.undo", CommandIDs.undo),
+        ("edit.redo", CommandIDs.redo),
+        ("history.list", CommandIDs.historyList),
+        ("history.revertGroup", CommandIDs.revertGroup),
+        ("commands.list", CommandIDs.commandsList),
+        ("commands.describe", CommandIDs.commandsDescribe),
+        ("commands.batch", CommandIDs.batch),
+        ("tool.select", CommandIDs.toolSelect),
+        ("settings.get", CommandIDs.settingsGet),
+        ("settings.set", CommandIDs.settingsSet),
+        ("settings.list", CommandIDs.settingsList),
+        ("settings.describe", CommandIDs.settingsDescribe),
+        ("window.showLibrary", CommandIDs.windowShowLibrary),
+
+        ("a11y.describePage", CommandIDs.a11yDescribePage),
+
+        ("ai.ask", CommandIDs.aiAsk),
+        ("ai.chat.list", CommandIDs.aiChatList),
+        ("ai.chat.rename", CommandIDs.aiChatRename),
+        ("ai.chat.delete", CommandIDs.aiChatDelete),
+        ("ai.chat.feedback", CommandIDs.aiChatFeedback),
+        ("ai.provider.list", CommandIDs.aiProviderList),
+        ("ai.provider.save", CommandIDs.aiProviderSave),
+        ("ai.provider.activate", CommandIDs.aiProviderActivate),
+        ("ai.provider.delete", CommandIDs.aiProviderDelete),
+        ("ai.provider.test", CommandIDs.aiProviderTest),
+        ("ai.quiz", CommandIDs.aiQuiz),
+
+        ("answerZone.create", CommandIDs.answerZoneCreate),
+        ("answerZone.score", CommandIDs.answerZoneScore),
+        ("answerZone.setHints", CommandIDs.answerZoneSetHints),
+        ("answerZone.revealHint", CommandIDs.answerZoneRevealHint),
+
+        ("app.openURL", CommandIDs.appOpenURL),
+        ("app.quickAction", CommandIDs.appQuickAction),
+        ("app.deleteAllData", CommandIDs.appDeleteAllData),
+
+        ("asset.put", CommandIDs.assetPut),
+        ("asset.get", CommandIDs.assetGet),
+        ("asset.upload", CommandIDs.assetUpload),
+
+        ("audio.record", CommandIDs.audioRecord),
+        ("audio.play", CommandIDs.audioPlay),
+        ("audio.pause", CommandIDs.audioPause),
+        ("audio.seek", CommandIDs.audioSeek),
+        ("audio.setPlayback", CommandIDs.audioSetPlayback),
+        ("audio.rename", CommandIDs.audioRename),
+        ("audio.delete", CommandIDs.audioDelete),
+        ("audio.export", CommandIDs.audioExport),
+        ("audio.quickRecord", CommandIDs.audioQuickRecord),
+
+        ("backup.now", CommandIDs.backupNow),
+        ("backup.manual", CommandIDs.backupManual),
+        ("backup.configure", CommandIDs.backupConfigure),
+        ("backup.chooseFolder", CommandIDs.backupChooseFolder),
+        ("backup.status", CommandIDs.backupStatus),
+        ("backup.clearQueue", CommandIDs.backupClearQueue),
+
+        ("block.insert", CommandIDs.blockInsert),
+        ("block.update", CommandIDs.blockUpdate),
+        ("block.delete", CommandIDs.blockDelete),
+        ("block.move", CommandIDs.blockMove),
+        ("block.comment", CommandIDs.blockComment),
+        ("block.editComment", CommandIDs.blockEditComment),
+        ("block.deleteComment", CommandIDs.blockDeleteComment),
+        ("block.resolveComment", CommandIDs.blockResolveComment),
+
+        ("board.add", CommandIDs.boardAdd),
+        ("board.rename", CommandIDs.boardRename),
+        ("board.insertTemplate", CommandIDs.boardInsertTemplate),
+
+        ("bridge.setEnabled", CommandIDs.bridgeSetEnabled),
+        ("bridge.status", CommandIDs.bridgeStatus),
+
+        ("calendar.events", CommandIDs.calendarEvents),
+        ("calendar.createNote", CommandIDs.calendarCreateNote),
+        ("calendar.openNote", CommandIDs.calendarOpenNote),
+
+        ("canvas.decorate", CommandIDs.canvasDecorate),
+        ("canvas.clearDecorations", CommandIDs.canvasClearDecorations),
+
+        ("card.add", CommandIDs.cardAdd),
+        ("card.update", CommandIDs.cardUpdate),
+        ("card.delete", CommandIDs.cardDelete),
+        ("card.move", CommandIDs.cardMove),
+        ("card.moveTo", CommandIDs.cardMoveTo),
+
+        ("clipboard.copy", CommandIDs.clipboardCopy),
+        ("clipboard.cut", CommandIDs.clipboardCut),
+        ("clipboard.paste", CommandIDs.clipboardPaste),
+        ("clipboard.copyText", CommandIDs.clipboardCopyText),
+
+        ("collab.host", CommandIDs.collabHost),
+        ("collab.join", CommandIDs.collabJoin),
+        ("collab.leave", CommandIDs.collabLeave),
+        ("collab.participants", CommandIDs.collabParticipants),
+        ("collab.approve", CommandIDs.collabApprove),
+        ("collab.setRole", CommandIDs.collabSetRole),
+        ("collab.revoke", CommandIDs.collabRevoke),
+        ("collab.follow", CommandIDs.collabFollow),
+        ("collab.followMe", CommandIDs.collabFollowMe),
+        ("collab.markSeen", CommandIDs.collabMarkSeen),
+
+        ("comment.add", CommandIDs.commentAdd),
+        ("comment.reply", CommandIDs.commentReply),
+        ("comment.edit", CommandIDs.commentEdit),
+        ("comment.deleteMessage", CommandIDs.commentDeleteMessage),
+        ("comment.resolve", CommandIDs.commentResolve),
+        ("comment.tapAt", CommandIDs.commentTapAt),
+
+        ("connector.create", CommandIDs.connectorCreate),
+        ("connector.setPath", CommandIDs.connectorSetPath),
+
+        ("diagnostics.export", CommandIDs.diagnosticsExport),
+        ("diagnostics.setFeatureEnabled", CommandIDs.diagnosticsSetFeatureEnabled),
+
+        ("diagram.addConnected", CommandIDs.diagramAddConnected),
+        ("diagram.create", CommandIDs.diagramCreate),
+
+        ("dictionary.add", CommandIDs.dictionaryAdd),
+        ("dictionary.remove", CommandIDs.dictionaryRemove),
+        ("dictionary.list", CommandIDs.dictionaryList),
+
+        ("doc.create", CommandIDs.docCreate),
+        ("doc.setFavorite", CommandIDs.docSetFavorite),
+        ("doc.merge", CommandIDs.docMerge),
+        ("doc.setScrollDirection", CommandIDs.docSetScrollDirection),
+        ("doc.open", CommandIDs.docOpen),
+        ("doc.quickNote", CommandIDs.docQuickNote),
+        ("doc.convertToWhiteboard", CommandIDs.docConvertToWhiteboard),
+        ("doc.setLanguage", CommandIDs.docSetLanguage),
+        ("doc.setWritingAids", CommandIDs.docSetWritingAids),
+        ("doc.setLocked", CommandIDs.docSetLocked),
+        ("doc.unlock", CommandIDs.docUnlock),
+        ("doc.suggestTitle", CommandIDs.docSuggestTitle),
+
+        ("element.create", CommandIDs.elementCreate),
+        ("element.insert", CommandIDs.elementInsert),
+        ("element.collection.create", CommandIDs.elementCollectionCreate),
+        ("element.collection.update", CommandIDs.elementCollectionUpdate),
+        ("element.collection.delete", CommandIDs.elementCollectionDelete),
+        ("element.collection.list", CommandIDs.elementCollectionList),
+        ("element.list", CommandIDs.elementList),
+        ("element.rename", CommandIDs.elementRename),
+        ("element.delete", CommandIDs.elementDelete),
+        ("element.import", CommandIDs.elementImport),
+        ("element.export", CommandIDs.elementExport),
+
+        ("export.run", CommandIDs.exportRun),
+        ("export.present", CommandIDs.exportPresent),
+        ("export.saveToSource", CommandIDs.exportSaveToSource),
+
+        ("folder.create", CommandIDs.folderCreate),
+        ("folder.setStyle", CommandIDs.folderSetStyle),
+
+        ("gallery.list", CommandIDs.galleryList),
+
+        ("gif.search", CommandIDs.gifSearch),
+
+        ("handwriting.toText", CommandIDs.handwritingToText),
+        ("handwriting.toTextPages", CommandIDs.handwritingToTextPages),
+        ("handwriting.words", CommandIDs.handwritingWords),
+        ("handwriting.reflow", CommandIDs.handwritingReflow),
+        ("handwriting.straighten", CommandIDs.handwritingStraighten),
+        ("handwriting.align", CommandIDs.handwritingAlign),
+        ("handwriting.insertSpace", CommandIDs.handwritingInsertSpace),
+        ("handwriting.replaceWord", CommandIDs.handwritingReplaceWord),
+        ("handwriting.restyle", CommandIDs.handwritingRestyle),
+
+        ("image.insert", CommandIDs.imageInsert),
+        ("image.crop", CommandIDs.imageCrop),
+        ("image.flip", CommandIDs.imageFlip),
+        ("image.replace", CommandIDs.imageReplace),
+        ("image.saveToPhotos", CommandIDs.imageSaveToPhotos),
+        ("image.pick", CommandIDs.imagePick),
+
+        ("import.files", CommandIDs.importFiles),
+        ("import.pick", CommandIDs.importPick),
+
+        ("index.rebuild", CommandIDs.indexRebuild),
+
+        ("ink.addStrokes", CommandIDs.inkAddStrokes),
+        ("ink.setStyle", CommandIDs.inkSetStyle),
+        ("ink.setPoints", CommandIDs.inkSetPoints),
+        ("ink.erase", CommandIDs.inkErase),
+        ("ink.scribbleErase", CommandIDs.inkScribbleErase),
+        ("ink.writeText", CommandIDs.inkWriteText),
+
+        ("item.create", CommandIDs.itemCreate),
+        ("item.update", CommandIDs.itemUpdate),
+        ("item.transform", CommandIDs.itemTransform),
+        ("item.moveToPage", CommandIDs.itemMoveToPage),
+        ("item.delete", CommandIDs.itemDelete),
+        ("item.arrange", CommandIDs.itemArrange),
+        ("item.recolor", CommandIDs.itemRecolor),
+        ("item.setLocked", CommandIDs.itemSetLocked),
+        ("item.duplicate", CommandIDs.itemDuplicate),
+
+        ("laser.setMode", CommandIDs.laserSetMode),
+        ("laser.point", CommandIDs.laserPoint),
+
+        ("layer.setActive", CommandIDs.layerSetActive),
+        ("layer.setVisible", CommandIDs.layerSetVisible),
+        ("layer.rename", CommandIDs.layerRename),
+        ("layer.moveItems", CommandIDs.layerMoveItems),
+        ("layer.exportOptions", CommandIDs.layerExportOptions),
+
+        ("lesson.create", CommandIDs.lessonCreate),
+        ("lesson.setState", CommandIDs.lessonSetState),
+        ("lesson.importRoster", CommandIDs.lessonImportRoster),
+        ("lesson.collect", CommandIDs.lessonCollect),
+        ("lesson.cluster", CommandIDs.lessonCluster),
+        ("lesson.setClusters", CommandIDs.lessonSetClusters),
+
+        ("library.list", CommandIDs.libraryList),
+        ("library.rename", CommandIDs.libraryRename),
+        ("library.move", CommandIDs.libraryMove),
+        ("library.duplicate", CommandIDs.libraryDuplicate),
+        ("library.trash", CommandIDs.libraryTrash),
+        ("library.setView", CommandIDs.librarySetView),
+        ("library.reorder", CommandIDs.libraryReorder),
+        ("library.chooseFolder", CommandIDs.libraryChooseFolder),
+        ("library.relocate", CommandIDs.libraryRelocate),
+        ("library.locations", CommandIDs.libraryLocations),
+        ("library.switch", CommandIDs.librarySwitch),
+        ("library.repair", CommandIDs.libraryRepair),
+
+        ("link.set", CommandIDs.linkSet),
+        ("link.remove", CommandIDs.linkRemove),
+        ("link.follow", CommandIDs.linkFollow),
+        ("link.back", CommandIDs.linkBack),
+        ("link.autodetect", CommandIDs.linkAutodetect),
+        ("link.tapAt", CommandIDs.linkTapAt),
+
+        ("lock.setup", CommandIDs.lockSetup),
+
+        ("math.recognize", CommandIDs.mathRecognize),
+        ("math.convert", CommandIDs.mathConvert),
+        ("math.setLatex", CommandIDs.mathSetLatex),
+        ("math.copy", CommandIDs.mathCopy),
+        ("math.evaluate", CommandIDs.mathEvaluate),
+        ("math.assist", CommandIDs.mathAssist),
+        ("math.graph.create", CommandIDs.mathGraphCreate),
+        ("math.graph.setViewport", CommandIDs.mathGraphSetViewport),
+        ("math.solve", CommandIDs.mathSolve),
+
+        ("mathassist.tapAt", CommandIDs.mathassistTapAt),
+
+        ("meeting.summarize", CommandIDs.meetingSummarize),
+        ("meeting.generateNotes", CommandIDs.meetingGenerateNotes),
+
+        ("menu.showAt", CommandIDs.menuShowAt),
+
+        ("node.insert", CommandIDs.nodeInsert),
+        ("node.set", CommandIDs.nodeSet),
+        ("node.remove", CommandIDs.nodeRemove),
+        ("node.move", CommandIDs.nodeMove),
+
+        ("outline.add", CommandIDs.outlineAdd),
+        ("outline.rename", CommandIDs.outlineRename),
+        ("outline.move", CommandIDs.outlineMove),
+        ("outline.delete", CommandIDs.outlineDelete),
+        ("outline.sortByPage", CommandIDs.outlineSortByPage),
+        ("outline.list", CommandIDs.outlineList),
+        ("outline.generate", CommandIDs.outlineGenerate),
+
+        ("page.setTemplate", CommandIDs.pageSetTemplate),
+        ("page.setBackground", CommandIDs.pageSetBackground),
+        ("page.clear", CommandIDs.pageClear),
+        ("page.deleteItems", CommandIDs.pageDeleteItems),
+        ("page.add", CommandIDs.pageAdd),
+        ("page.duplicate", CommandIDs.pageDuplicate),
+        ("page.copy", CommandIDs.pageCopy),
+        ("page.paste", CommandIDs.pagePaste),
+        ("page.moveTo", CommandIDs.pageMoveTo),
+        ("page.reorder", CommandIDs.pageReorder),
+        ("page.rotate", CommandIDs.pageRotate),
+        ("page.trash", CommandIDs.pageTrash),
+        ("page.restore", CommandIDs.pageRestore),
+        ("page.purge", CommandIDs.pagePurge),
+        ("page.setBookmarked", CommandIDs.pageSetBookmarked),
+
+        ("panel.open", CommandIDs.panelOpen),
+        ("panel.close", CommandIDs.panelClose),
+
+        ("pdf.text", CommandIDs.pdfText),
+        ("pdf.links", CommandIDs.pdfLinks),
+        ("pdf.markSelection", CommandIDs.pdfMarkSelection),
+        ("pdf.copyText", CommandIDs.pdfCopyText),
+        ("pdf.tapAt", CommandIDs.pdfTapAt),
+
+        ("pencil.gesture", CommandIDs.pencilGesture),
+        ("pencil.palette", CommandIDs.pencilPalette),
+        ("pencil.actions", CommandIDs.pencilActions),
+
+        ("plugin.list", CommandIDs.pluginList),
+        ("plugin.enable", CommandIDs.pluginEnable),
+        ("plugin.reload", CommandIDs.pluginReload),
+        ("plugin.logs", CommandIDs.pluginLogs),
+        ("plugin.sdkTypes", CommandIDs.pluginSdkTypes),
+        ("plugin.docs", CommandIDs.pluginDocs),
+        ("plugin.install", CommandIDs.pluginInstall),
+        ("plugin.uninstall", CommandIDs.pluginUninstall),
+        ("plugin.review", CommandIDs.pluginReview),
+
+        ("present.setMode", CommandIDs.presentSetMode),
+
+        ("preset.select", CommandIDs.presetSelect),
+        ("preset.setSwatch", CommandIDs.presetSetSwatch),
+        ("preset.addSwatch", CommandIDs.presetAddSwatch),
+        ("preset.removeSwatch", CommandIDs.presetRemoveSwatch),
+        ("preset.moveSwatch", CommandIDs.presetMoveSwatch),
+        ("preset.setWidth", CommandIDs.presetSetWidth),
+        ("preset.reset", CommandIDs.presetReset),
+
+        ("print.present", CommandIDs.printPresent),
+
+        ("query.context", CommandIDs.queryContext),
+        ("query.tree", CommandIDs.queryTree),
+        ("query.get", CommandIDs.queryGet),
+        ("query.find", CommandIDs.queryFind),
+
+        ("recognize.pageText", CommandIDs.recognizePageText),
+        ("recognize.items", CommandIDs.recognizeItems),
+
+        ("relay.configure", CommandIDs.relayConfigure),
+
+        ("render.page", CommandIDs.renderPage),
+
+        ("replay.setMode", CommandIDs.replaySetMode),
+        ("replay.seekToItem", CommandIDs.replaySeekToItem),
+        ("replay.tapAt", CommandIDs.replayTapAt),
+
+        ("ruler.set", CommandIDs.rulerSet),
+
+        ("scan.documents", CommandIDs.scanDocuments),
+        ("scan.qr", CommandIDs.scanQr),
+
+        ("search.text", CommandIDs.searchText),
+        ("search.open", CommandIDs.searchOpen),
+        ("search.step", CommandIDs.searchStep),
+
+        ("selection.set", CommandIDs.selectionSet),
+        ("selection.clear", CommandIDs.selectionClear),
+        ("selection.fromPolygon", CommandIDs.selectionFromPolygon),
+        ("selection.fromRect", CommandIDs.selectionFromRect),
+        ("selection.fromLoop", CommandIDs.selectionFromLoop),
+        ("selection.selectAll", CommandIDs.selectionSelectAll),
+        ("selection.tapAt", CommandIDs.selectionTapAt),
+        ("selection.screenshot", CommandIDs.selectionScreenshot),
+
+        ("settings.open", CommandIDs.settingsOpen),
+
+        ("shape.recognize", CommandIDs.shapeRecognize),
+        ("shape.create", CommandIDs.shapeCreate),
+        ("shape.setStyle", CommandIDs.shapeSetStyle),
+        ("shape.setKind", CommandIDs.shapeSetKind),
+        ("shape.setPoints", CommandIDs.shapeSetPoints),
+        ("shape.tapAt", CommandIDs.shapeTapAt),
+
+        ("sidebar.toggle", CommandIDs.sidebarToggle),
+
+        ("spellcheck.tapAt", CommandIDs.spellcheckTapAt),
+
+        ("sticky.create", CommandIDs.stickyCreate),
+        ("sticky.setCollapsed", CommandIDs.stickySetCollapsed),
+        ("sticky.resolve", CommandIDs.stickyResolve),
+        ("sticky.setColor", CommandIDs.stickySetColor),
+        ("sticky.tapAt", CommandIDs.stickyTapAt),
+
+        ("stopwatch.start", CommandIDs.stopwatchStart),
+        ("stopwatch.lap", CommandIDs.stopwatchLap),
+
+        ("study.grade", CommandIDs.studyGrade),
+        ("study.resetProgress", CommandIDs.studyResetProgress),
+        ("study.setReminders", CommandIDs.studySetReminders),
+        ("study.setTheme", CommandIDs.studySetTheme),
+        ("study.importText", CommandIDs.studyImportText),
+        ("study.exportCSV", CommandIDs.studyExportCSV),
+
+        ("sync.now", CommandIDs.syncNow),
+
+        ("tab.close", CommandIDs.tabClose),
+        ("tab.closeOthers", CommandIDs.tabCloseOthers),
+        ("tab.select", CommandIDs.tabSelect),
+
+        ("table.edit", CommandIDs.tableEdit),
+        ("table.exportCSV", CommandIDs.tableExportCSV),
+
+        ("tape.tapAt", CommandIDs.tapeTapAt),
+        ("tape.setRevealed", CommandIDs.tapeSetRevealed),
+        ("tape.removeAll", CommandIDs.tapeRemoveAll),
+        ("tape.importPattern", CommandIDs.tapeImportPattern),
+        ("tape.patterns", CommandIDs.tapePatterns),
+        ("tape.deletePattern", CommandIDs.tapeDeletePattern),
+        ("tape.clearHistory", CommandIDs.tapeClearHistory),
+
+        ("template.list", CommandIDs.templateList),
+        ("template.choose", CommandIDs.templateChoose),
+        ("template.import", CommandIDs.templateImport),
+        ("template.listCustom", CommandIDs.templateListCustom),
+        ("template.group.create", CommandIDs.templateGroupCreate),
+        ("template.group.rename", CommandIDs.templateGroupRename),
+        ("template.group.delete", CommandIDs.templateGroupDelete),
+        ("template.delete", CommandIDs.templateDelete),
+        ("template.setHidden", CommandIDs.templateSetHidden),
+        ("template.fromPage", CommandIDs.templateFromPage),
+
+        ("text.createBox", CommandIDs.textCreateBox),
+        ("text.setText", CommandIDs.textSetText),
+        ("text.format", CommandIDs.textFormat),
+        ("text.setParagraph", CommandIDs.textSetParagraph),
+        ("text.setBoxStyle", CommandIDs.textSetBoxStyle),
+        ("text.saveDefaultStyle", CommandIDs.textSaveDefaultStyle),
+        ("text.tapAt", CommandIDs.textTapAt),
+        ("text.startPageText", CommandIDs.textStartPageText),
+
+        ("timer.start", CommandIDs.timerStart),
+        ("timer.control", CommandIDs.timerControl),
+        ("timer.history", CommandIDs.timerHistory),
+        ("timer.saveMode", CommandIDs.timerSaveMode),
+        ("timer.deleteMode", CommandIDs.timerDeleteMode),
+
+        ("toolbar.setLayout", CommandIDs.toolbarSetLayout),
+        ("toolbar.reset", CommandIDs.toolbarReset),
+        ("toolbar.setVisible", CommandIDs.toolbarSetVisible),
+        ("toolbar.layouts", CommandIDs.toolbarLayouts),
+        ("toolbar.saveLayout", CommandIDs.toolbarSaveLayout),
+        ("toolbar.applyLayout", CommandIDs.toolbarApplyLayout),
+        ("toolbar.deleteLayout", CommandIDs.toolbarDeleteLayout),
+        ("toolbar.dock", CommandIDs.toolbarDock),
+
+        ("transcript.get", CommandIDs.transcriptGet),
+        ("transcript.regenerate", CommandIDs.transcriptRegenerate),
+        ("transcript.editSegment", CommandIDs.transcriptEditSegment),
+        ("transcript.insert", CommandIDs.transcriptInsert),
+
+        ("trash.list", CommandIDs.trashList),
+        ("trash.recover", CommandIDs.trashRecover),
+        ("trash.deletePermanently", CommandIDs.trashDeletePermanently),
+        ("trash.empty", CommandIDs.trashEmpty),
+
+        ("view.goToPage", CommandIDs.viewGoToPage),
+        ("view.zoom", CommandIDs.viewZoom),
+        ("view.scrollBy", CommandIDs.viewScrollBy),
+        ("view.reveal", CommandIDs.viewReveal),
+        ("view.setReadOnly", CommandIDs.viewSetReadOnly),
+
+        ("webdav.syncNow", CommandIDs.webdavSyncNow),
+        ("webdav.configure", CommandIDs.webdavConfigure),
+        ("webdav.put", CommandIDs.webdavPut),
+        ("webdav.status", CommandIDs.webdavStatus),
+
+        ("window.open", CommandIDs.windowOpen),
+
+        ("zoom.toggle", CommandIDs.zoomToggle),
+        ("zoom.setBox", CommandIDs.zoomSetBox),
+        ("zoom.newLine", CommandIDs.zoomNewLine),
+        ("zoom.setReturnHeight", CommandIDs.zoomSetReturnHeight),
+    ]
+
+    /// Every `PanelIDs` constant with the id it holds (`studyLearn` is the superseded alias of `studySmartLearn`).
+    static let panelIDs: [(String, String)] = [
+        ("aichat.panel", PanelIDs.assistant),
+        ("organize.trash", PanelIDs.trash),
+        ("organize.favourites", PanelIDs.favourites),
+        ("templateui.manage", PanelIDs.templates),
+        ("syncui.panel", PanelIDs.cloudBackup),
+        ("about.panel", PanelIDs.about),
+        ("pluginmanager.gallery", PanelIDs.gallery),
+        ("studysession.practice", PanelIDs.studyPractice),
+        ("studysession.smartLearn", PanelIDs.studySmartLearn),
+        ("studysession.smartLearn", PanelIDs.studyLearn),
+    ]
+
+    func testEveryCommandConstantHoldsItsID() {
+        for (id, constant) in Self.commandIDs {
+            XCTAssertEqual(constant, id)
+        }
+        XCTAssertEqual(Set(Self.commandIDs.map { $0.0 }).count, Self.commandIDs.count, "an id is listed twice")
+    }
+
+    func testEveryCatalogueIDHasACommandConstant() throws {
+        let catalogue = try Self.catalogueIDs()
+        XCTAssertGreaterThan(catalogue.count, 300, "the §6.5 parser found too few rows")
+        let constants = Set(Self.commandIDs.map { $0.0 })
+        let missing = catalogue.filter { !constants.contains($0) }
+        XCTAssertEqual(missing, [], "§6.5 ids without a CommandIDs constant (add each to CommandIDs.swift and here)")
+        let listed = Set(catalogue)
+        let stale = Self.commandIDs.map { $0.0 }.filter { !listed.contains($0) }
+        XCTAssertEqual(stale, [], "CommandIDs constants whose id is not in the §6.5 catalogue")
+    }
+
+    func testPanelIDsMatchTheArchitecturePanelList() throws {
+        for (id, constant) in Self.panelIDs {
+            XCTAssertEqual(constant, id)
+        }
+        let listed = try Self.architecturePanelIDs()
+        XCTAssertEqual(listed, Set(Self.panelIDs.map { $0.0 }), "PanelIDs differs from the ARCHITECTURE.md §13 list")
+    }
+
+    // MARK: docs/ARCHITECTURE.md
+
+    private static func architecture() throws -> [Substring] {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // NibContractsTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // NibKit
+            .deletingLastPathComponent() // repository root
+        let text = try String(contentsOf: root.appendingPathComponent("docs/ARCHITECTURE.md"), encoding: .utf8)
+        return text.split(separator: "\n", omittingEmptySubsequences: false)
+    }
+
+    /// The first-column id of every table row in §6.5, in document order.
+    private static func catalogueIDs() throws -> [String] {
+        let lines = try architecture()
+        guard let start = lines.firstIndex(where: { $0.hasPrefix("### 6.5 ") }) else {
+            XCTFail("ARCHITECTURE.md has no §6.5 heading")
+            return []
+        }
+        let end = lines[(start + 1)...].firstIndex(where: { $0.hasPrefix("## ") }) ?? lines.endIndex
+        return lines[start..<end].compactMap { line -> String? in
+            guard line.hasPrefix("| `") else { return nil }
+            let cell = line.dropFirst(3)
+            guard let close = cell.firstIndex(of: "`") else { return nil }
+            return String(cell[..<close])
+        }
+    }
+
+    /// The backticked dotted ids after "Well-known panel ids are in `PanelIDs`" in §13.
+    private static func architecturePanelIDs() throws -> Set<String> {
+        let marker = "Well-known panel ids are in `PanelIDs`"
+        guard let line = try architecture().first(where: { $0.contains(marker) }),
+              let range = line.range(of: marker) else {
+            XCTFail("ARCHITECTURE.md no longer says: \(marker)")
+            return []
+        }
+        let spans = line[range.upperBound...].split(separator: "`", omittingEmptySubsequences: false)
+        var ids = Set<String>()
+        for (index, span) in spans.enumerated() where index % 2 == 1 {
+            let parts = span.split(separator: ".", omittingEmptySubsequences: false)
+            let isID = parts.count == 2 && parts.allSatisfy { part in
+                !part.isEmpty && part.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) }
+            }
+            if isID, let first = span.first, first.isLowercase { ids.insert(String(span)) }
+        }
+        return ids
+    }
 }
 ```
 
