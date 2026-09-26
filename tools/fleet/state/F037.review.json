@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatComments/CommentThreadView.swift:239-247 (CommentThreadModel.committed) and 256-270 (reload)",
+      "problem": "While the thread panel is open, every commit to the document reloads the thread, including every ink stroke. When the thread no longer exists, reload falls back to `workspace.page(ofItem:in:)`. That call walks `content.pages` and runs `allItems` on each one, loading any page not yet in memory from disk, all on the main actor. The thread is gone right after 'Delete Thread' or after deleting its last message, and the floating panel stays open showing 'Comment not found'. From then on, each pen stroke loads and scans the whole document. On a 300+ page inked notebook the first stroke freezes the app for seconds, every later stroke costs O(all items in the doc), which breaks the 2 ms stroke-finalize budget, and every page stays in memory. When the thread does exist, each stroke still re-assigns `content`. That fires objectWillChange, re-renders the message list and runs NSDataDetector (CommentText.attributed) on every visible message.",
+      "fix": "In `committed`, compute the target id and reload only when `cs.mutations` holds an `.item(d, p, before, after)` with `after.id == id`, or a `.page` mutation for the target's page. If such a mutation lands on a different page with `!after.deleted`, the thread moved: refocus to that page `p` directly. If the only mutation is a tombstone, set `.missing`. Remove the `page(ofItem:)` fallback from reload. Also assign `content`/`pageTitle` only when the new value differs (`if new != content { content = new }`)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatComments/CommentThreadView.swift:340-343 and 413-447 (CommentThreadView.header)",
+      "problem": "The thread panel builds its own header: a caption1Emphasis title, a resolve button and a raw Menu. DESIGN.md §13.7 names `NibPanelHeader` as the header of the comments panel ('The header of the assistant, plugin panels, the transcript and comments': glyph disc, headline title, caption1 subtitle, badge, More, round Close). The view also drops `PanelContext.dismiss`, so the floating thread panel on iPad has no Close control. The code comment assumes the chrome draws the header, but neither the F017 spec nor the PanelDescriptor contract says so. The assistant (DESIGN §14.9) and NibPluginPanelChrome both draw NibPanelHeader inside the panel content. This hand-rolls a component the design system already provides (DESIGN §15.6).",
+      "fix": "Keep `context.dismiss` on the view. For the thread and draft states, render `NibPanelHeader(title: String(localized: \"Comment\"), subtitle: model.pageTitle (plus \" · Resolved\" when resolved, or \"New comment\" for a draft), symbol: .comment, badge: comment.resolved ? nil : .number(comment.messages.count), onClose: dismiss) { resolve/reopen NibIconButton (not in read-only); the existing More Menu }`, followed by the soft hairline. Delete the custom `header(_:comment:)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatComments/CommentsPanel.swift:149-174 (CommentsListModel.reload/committed)",
+      "problem": "The Comments tab loads every page's items synchronously on the main actor when it opens. It does the same full rebuild after every comment or page-table commit, and after a memory-warning `evictPages` that rebuild reads every page from disk again. The ponytail comment names this ceiling. Still, on a 300-page inked notebook it is a multi-second freeze, and it keeps every page in memory against the 400 MB budget.",
+      "fix": "Keep a `[PageID: [Row]]` index in the model. Build it once, page by page, with `await Task.yield()` every few pages so the UI stays responsive. After that, update only the pages named by `.item` mutations in each Changeset (comment kinds) and by `.page` mutations, instead of rescanning. File docs/contract-requests/F037-comment-index.md to ask for an indexed comment query (NibIndex/query.find)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatComments/CommentCommands.swift:41-49 (CommentRules.hit) and 383-394 (CommentTapAt.run)",
+      "problem": "Hit-testing ignores per-device hidden layers (`EditorSession.hiddenLayers`). New comments deliberately take their parent's layer 'so hiding that layer hides its comments too'. Yet a finger tap where such an invisible pin sits still opens its thread and takes the tap away from link.tapAt and selection.tapAt. A canvas-supplied `ref` to a hidden-layer comment opens it too.",
+      "fix": "Add a `hiddenLayers: Set<Int>` parameter to `CommentRules.hit` and skip items whose `layer` is in it. Pass `ctx.activeSession?.hiddenLayers ?? []`, and apply the same check in the `ref` branch whenever `p.gesture != nil`. Add one case to testHitPrefersTheNearestVisiblePin…."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatComments/CommentCommands.swift:219-222 (CommentAdd id conflict check)",
+      "problem": "The conflict check uses `workspace.page(ofItem:)`, which only sees live items. A caller-chosen id that matches a tombstone on another page is accepted, so the same id now exists on two pages. Undoing the earlier deletion then brings the tombstone back to life, leaving two live items with one id and ambiguous refs.",
+      "fix": "Check tombstones as well: scan `content.pages` with `allItems(doc, page:)` for any record with that id. Throw `conflict` when it sits on a different page. If it sits on the same page, reuse it (put replaces it)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatComments/CommentThreadView.swift:9-39, 122-139 (comment links)",
+      "problem": "`nib://open/<doc>/<page>?comment=<id>` only opens its thread when tapped inside a comment message. Pasted anywhere else (a text box link via link.tapAt, a text document, another app), it goes through F074's router, whose spec covers only `nib://open/<doc>[/<page>]`. There the `comment=` query is dropped, so D-123 'comment links' is only partly met.",
+      "fix": "File docs/contract-requests/F037-comment-links.md asking F074 to forward `comment=<id>` to `comment.tapAt {page: \"page:D/P\", point: [0,0], ref: \"item:D/P/<id>\"}` after opening the page. Report D-123 as partial in the feature summary until that lands."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatComments/FeatCommentsFeature.swift:127,133; CommentThreadView.swift:520,528",
+      "problem": "The Slop checklist requires verb + object button titles. The thread menu has 'Resolve' and 'Reopen', and the message menu has 'Edit' and 'Delete'. The icon button's labels already say 'Resolve Thread' / 'Reopen Thread'.",
+      "fix": "Rename them to 'Resolve Thread', 'Reopen Thread', 'Edit Message' and 'Delete Message'."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatComments/CommentsPanel.swift:283,289",
+      "problem": "The row layout uses literal metrics: `.frame(width: 22, height: 22)` and `VStack(spacing: 2)`. The rule is tokens only.",
+      "fix": "Use `NibSpacing.xxs` for the stack spacing. Show the resolved state without a hand-sized frame, for example `Image(nib: .checkCircleFill).font(NibFont.glyph(.panel))` inside the same 22 pt slot NibBadge uses, or request a `NibBadgeKind.resolved` in a contract request."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatCommentsTests/FeatCommentsTests.swift",
+      "problem": "Tests never exercise the UI model paths: CommentThreadModel.send in draft mode (comment.add with `at`/`ref`, then refocusing the panel on the new thread) and in reply mode, the missing and moved thread reload, and CommentUI.follow for a comment link in the same document. These are where the draft-to-thread hand-off and the per-commit reload bug live.",
+      "fix": "Add a @MainActor test that installs the PanelHost and focuses `.draft(parent: Fixtures.textID)`. Build `CommentThreadModel(app:session:)`, `await model.send(\"Hi\")`, and assert that a thread exists with `attachedTo == textID` and that `state.target` is now `.thread`. Then delete the thread with comment.deleteMessage, commit an unrelated stroke, and assert `model.content == .missing` without any page(ofItem:) rescan. For example, check that a page not previously loaded is still absent from the cache, or add a counting persistence."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatComments/CommentCommands.swift:253-264 (comment.reply) — contract model",
+      "problem": "All of a thread's messages live in one last-writer-wins Item. If two devices or collaborators reply to, edit or resolve the same thread at the same time, one of the two writes is silently dropped when they merge. This is data loss, and it comes from the contract model rather than F037 code.",
+      "fix": "File docs/contract-requests/F037-comment-merge.md asking for a message-level merge of CommentItem (union of messages by id, newest `at`/`edited` wins per message), and note the limitation in the feature summary."
+    }
+  ]
+}
