@@ -83,11 +83,39 @@ final class FeatMathAssistTests: XCTestCase {
         XCTAssertEqual(inverse["matrix"], expected)
     }
 
-    func testUnsupportedSuggestsAISolveWithTheExpression() async {
+    /// The hint carries the call as JSON, so quotes and primes in the maths survive being copied into a tool call.
+    func testUnsupportedSuggestsAISolveWithTheExpression() async throws {
         let h = harness()
-        let error = await nibError { _ = try await h.run("math.evaluate", ["expression": "sin(x) = 1/2"]) }
-        XCTAssertEqual(error?.code, .unsupported)
-        XCTAssertTrue(error?.hint?.contains("math.solve {latex: 'sin(x) = 1/2'") ?? false, error?.hint ?? "no hint")
+        for expression in ["sin(x) = 1/2", "f'(x) = 1", "\\lim_{x \\to 0} \"x\""] {
+            let error = await nibError { _ = try await h.run("math.evaluate", ["expression": .string(expression)]) }
+            XCTAssertEqual(error?.code, .unsupported, expression)
+            let hint = try XCTUnwrap(error?.hint, expression)
+            let prefix = "try AI Solve: call math.solve "
+            XCTAssertTrue(hint.hasPrefix(prefix), hint)
+            let call = try JSONValue.parse(String(hint.dropFirst(prefix.count)))
+            XCTAssertEqual(call["latex"]?.stringValue, expression)
+            XCTAssertEqual(call["mode"]?.stringValue, "solve")
+        }
+    }
+
+    /// Input is bounded before it is parsed: long expressions and variables are invalid_params at their path.
+    func testOverlongInputIsRefusedAtItsPath() async {
+        let h = harness()
+        let long = Array(repeating: "1", count: 2_001).joined(separator: "+") + " ="
+        let tooLong = await nibError { _ = try await h.run("math.evaluate", ["expression": .string(long)]) }
+        XCTAssertEqual(tooLong?.code, .invalidParams)
+        XCTAssertEqual(tooLong?.path, "$.expression")
+        let variables: JSONValue = ["a": .string(String(repeating: "1+", count: 1_000) + "1")]
+        let longVariable = await nibError {
+            _ = try await h.run("math.evaluate", ["expression": "a =", "variables": variables])
+        }
+        XCTAssertEqual(longVariable?.code, .invalidParams)
+        XCTAssertEqual(longVariable?.path, "$.variables.a")
+        let deep = await nibError {
+            _ = try await h.run("math.evaluate", ["expression": .string(String(repeating: "(", count: 1_000) + "1" +
+                                                                       String(repeating: ")", count: 1_000) + " =")])
+        }
+        XCTAssertEqual(deep?.code, .unsupported, "too deeply nested: refused, never a stack overflow")
     }
 
     func testBadParametersNameTheirPath() async {

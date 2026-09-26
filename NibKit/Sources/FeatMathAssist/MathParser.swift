@@ -10,7 +10,14 @@ import NibContracts
 /// Every engine error is a `NibError`. Bad input and maths errors (division by zero, √ of a negative) are
 /// `invalid_params`; input the evaluator cannot work out is `unsupported`, with a hint that points to AI Solve (F088).
 enum MathFailure {
-    static let aiSolveHint = "try AI Solve: call math.solve {latex: '…', mode: 'solve'}"
+    static let aiSolveHint = aiSolveHint(for: "…")
+
+    /// "try AI Solve: call math.solve {"latex":"…","mode":"solve"}": the call as JSON, so quotes, primes and
+    /// backslashes in the maths survive being copied into a tool call.
+    static func aiSolveHint(for latex: String) -> String {
+        let call: JSONValue = ["latex": .string(latex), "mode": "solve"]
+        return "try AI Solve: call math.solve " + call.jsonString()
+    }
 
     static func syntax(_ message: String) -> NibError {
         NibError(.invalidParams, message,
@@ -155,6 +162,12 @@ enum MathLexer {
                     text.unicodeScalars.append(s[i])
                     i += 1
                 }
+                if let end = exponentEnd(s, from: i) {
+                    // Scientific notation (1e5, 1.5e-3, 2E+4); "2e", "2e^2" and "2ex" stay 2·e….
+                    text += "e"
+                    for k in (i + 1)..<end { text.unicodeScalars.append(s[k]) }
+                    i = end
+                }
                 tokens.append(.number(text))
             } else if c == "\\" {
                 i = try readCommand(s, from: i + 1, into: &tokens, droppedClosers: &droppedClosers)
@@ -187,6 +200,17 @@ enum MathLexer {
     }
 
     static func isDigit(_ c: Unicode.Scalar) -> Bool { c.value >= 48 && c.value <= 57 }
+
+    /// The index just past an exponent "e5", "E-3" or "e+12" starting at `start`, when there is one. Only ASCII
+    /// signs, as software writes them: a typeset "2e−1" is 2e − 1.
+    private static func exponentEnd(_ s: [Unicode.Scalar], from start: Int) -> Int? {
+        guard start < s.count, s[start] == "e" || s[start] == "E" else { return nil }
+        var j = start + 1
+        if j < s.count, s[j] == "+" || s[j] == "-" { j += 1 }
+        guard j < s.count, isDigit(s[j]) else { return nil }
+        while j < s.count, isDigit(s[j]) { j += 1 }
+        return j
+    }
 
     static func isASCIILetter(_ c: Unicode.Scalar) -> Bool {
         (c.value >= 65 && c.value <= 90) || (c.value >= 97 && c.value <= 122)
@@ -412,6 +436,9 @@ struct MathStatement {
 // MARK: - Parser
 
 struct MathParser {
+    /// How deeply the tree being built may nest. Operands of a chain count too (1 + 1 + … + 1 is a left-deep tree),
+    /// and every later pass over the tree recurses, so deeper input is refused here rather than risking the stack.
+    static let maxDepth = 150
     static let userFunctionNames: Set<String> = ["f", "g", "h", "F", "G", "H"]
     static let functionWordSet: Set<String> = ["sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "exp",
                                                "sqrt", "abs", "det", "inv", "sum", "prod", "int", "diff"]
@@ -425,6 +452,8 @@ struct MathParser {
     private var limit: Int
     /// Open |…| bars: inside them a '|' closes rather than multiplies.
     private var absDepth = 0
+    /// Nesting of the tree being built at the current position (see `maxDepth`).
+    private var depth = 0
     private(set) var plusMinusCount: Int
 
     init(tokens: [MathToken], plusMinusCount: Int = 0) {
@@ -531,17 +560,29 @@ struct MathParser {
         return false
     }
 
-    /// Numerals are exact: "0.1" is 1/10. Numbers too long for 64-bit fractions become decimals.
+    /// Numerals are exact: "0.1" is 1/10, "1.5e-3" is 3/2000. Numbers too long for 64-bit fractions become decimals.
     static func number(_ text: String) throws -> Scalar {
-        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count <= 2, !text.isEmpty else { throw MathFailure.syntax("'\(text)' isn't a number") }
+        var mantissa = Substring(text)
+        var exponent = 0
+        if let e = text.firstIndex(where: { $0 == "e" || $0 == "E" }) {
+            guard let power = Int(text[text.index(after: e)...]) else {
+                throw MathFailure.syntax("'\(text)' isn't a number")
+            }
+            mantissa = text[..<e]
+            exponent = power
+        }
+        let parts = mantissa.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count <= 2, !mantissa.isEmpty else { throw MathFailure.syntax("'\(text)' isn't a number") }
         let whole = String(parts[0])
         let fraction = parts.count > 1 ? String(parts[1]) : ""
         if fraction.count <= 18, let n = Int((whole.isEmpty ? "0" : whole) + fraction),
-           let scale = Rational.integerPower(10, fraction.count), let r = Rational(n, scale) {
-            return .exact(r)
+           let scale = Rational.integerPower(10, fraction.count), let r = Rational(n, scale),
+           let power = Rational(integer: 10).power(exponent), let value = r.multiplying(power) {
+            return .exact(value)
         }
-        guard let d = Double(text) else { throw MathFailure.syntax("'\(text)' isn't a number") }
+        guard let d = Double(String(mantissa) + "e" + String(exponent)), d.isFinite else {
+            throw MathFailure.syntax("'\(text)' is too large a number")
+        }
         return .real(d)
     }
 
@@ -589,16 +630,27 @@ struct MathParser {
         return k
     }
 
+    /// One level deeper in the tree being built; each caller restores `depth` when it returns.
+    private mutating func descend() throws {
+        depth += 1
+        if depth > MathParser.maxDepth { throw MathFailure.unsupported("expressions this long or this deeply nested") }
+    }
+
     private mutating func parseExpression() throws -> MathNode {
+        let saved = depth
+        defer { depth = saved }
         var node = try parseTerm()
         while true {
             if take("+") {
+                try descend()
                 let rhs = try parseTerm()
                 node = .binary(.add, node, rhs)
             } else if take("-") {
+                try descend()
                 let rhs = try parseTerm()
                 node = .binary(.subtract, node, rhs)
             } else if take("±") {
+                try descend()
                 let k = nextPlusMinus()
                 let rhs = try parseTerm()
                 node = .binary(.plusMinus(k), node, rhs)
@@ -609,18 +661,23 @@ struct MathParser {
     }
 
     private mutating func parseTerm() throws -> MathNode {
+        let saved = depth
+        defer { depth = saved }
         var node = try parseFactor()
         while true {
             if take("*") {
+                try descend()
                 let rhs = try parseFactor()
                 node = .binary(.multiply, node, rhs)
             } else if take("/") {
+                try descend()
                 let rhs = try parseFactor()
                 node = .binary(.divide, node, rhs)
             } else if startsImplicitFactor() {
                 if case .number? = peek(), pos > 0, case .number = tokens[pos - 1] {
                     throw MathFailure.syntax("Two numbers in a row: put an operator between them")
                 }
+                try descend()
                 let rhs = try parseFactor()
                 node = .binary(.multiply, node, rhs)
             } else {
@@ -630,12 +687,19 @@ struct MathParser {
     }
 
     private mutating func parseFactor() throws -> MathNode {
+        let saved = depth
+        defer { depth = saved }
         if take("-") {
+            try descend()
             let inner = try parseFactor()
             return .negate(inner)
         }
-        if take("+") { return try parseFactor() }
+        if take("+") {
+            try descend()
+            return try parseFactor()
+        }
         if take("±") {
+            try descend()
             let k = nextPlusMinus()
             let inner = try parseFactor()
             return .binary(.plusMinus(k), .number(.zero), inner)
@@ -644,14 +708,20 @@ struct MathParser {
     }
 
     private mutating func parsePower() throws -> MathNode {
+        let saved = depth
+        defer { depth = saved }
         let base = try parsePostfix()
         guard take("^") else { return base }
+        try descend()
         let exponent = try parseExponentChain()
         return .binary(.power, base, exponent)
     }
 
     /// The exponent after '^': signed and right-associative ("e^-x^2" is e^(-(x^2))).
     private mutating func parseExponentChain() throws -> MathNode {
+        let saved = depth
+        defer { depth = saved }
+        try descend()
         if take("-") {
             let inner = try parseExponentChain()
             return .negate(inner)
@@ -666,6 +736,9 @@ struct MathParser {
     /// One script argument of '_' or '^' in bounds and on function names: a {group}, a number, a letter or a
     /// (group), optionally signed. It never swallows the next '^', so "\int_0^1" reads as lower 0, upper 1.
     private mutating func parseScript() throws -> MathNode {
+        let saved = depth
+        defer { depth = saved }
+        try descend()
         if take("-") {
             let inner = try parseScript()
             return .negate(inner)
@@ -675,8 +748,12 @@ struct MathParser {
     }
 
     private mutating func parsePostfix() throws -> MathNode {
+        let saved = depth
+        defer { depth = saved }
         var node = try parsePrimary()
         while let t = peek() {
+            if case .symbol(let s) = t, s == "!" || s == "%" || s == "°" { try descend() }
+            if case .superscript = t { try descend() }
             switch t {
             case .symbol("!"):
                 advance()
@@ -740,6 +817,10 @@ struct MathParser {
 
     private mutating func parsePrimary() throws -> MathNode {
         guard let t = peek() else { throw MathFailure.syntax("The expression is incomplete") }
+        // Every bracket, root, function, ∑, ∫ and matrix nests through here.
+        let saved = depth
+        defer { depth = saved }
+        try descend()
         switch t {
         case .number(let text):
             advance()
@@ -876,7 +957,7 @@ struct MathParser {
     /// A LaTeX argument: "{…}" or a single token ("\frac12" is 1/2).
     private mutating func parseLatexArgument() throws -> MathNode {
         if take("{") { return try parseGroup(closing: "}") }
-        if case .number(let text)? = peek(), text.count > 1 {
+        if case .number(let text)? = peek(), text.count > 1, text.unicodeScalars.allSatisfy(MathLexer.isDigit) {
             let first = String(text.prefix(1))
             tokens[pos] = .number(String(text.dropFirst()))
             return .number(try MathParser.number(first))
@@ -1000,8 +1081,11 @@ struct MathParser {
         if peek() == .symbol("(") { return try parseParenthesisedList() }
         if take("{") { return [try parseGroup(closing: "}")] }
         guard peek() != nil else { throw MathFailure.syntax("A function is missing its argument") }
+        let saved = depth
+        defer { depth = saved }
         var node = try parseFactor()
         while startsImplicitFactor(), !startsFunction() {
+            try descend()
             let next = try parsePower()
             node = .binary(.multiply, node, next)
         }
@@ -1087,18 +1171,28 @@ struct MathParser {
         return .integral(variable: v, from: args[2], to: args[3], body: args[0])
     }
 
-    /// The index of the "d" of the integral's "dx" (at the same bracket depth as the body).
+    /// The index of the "d" of the integral's "dx" (at the same bracket depth as the body). An integral inside the
+    /// body takes the next differential first, as with nested brackets: ∫_0^1 ∫_0^2 x y dy dx.
     private func findDifferential() -> Int? {
-        var depth = 0
+        var nesting = 0
+        var inner = 0
         var i = pos
         while i + 1 < limit {
             switch tokens[i] {
-            case .symbol("("), .symbol("["), .symbol("{"): depth += 1
-            case .symbol(")"), .symbol("]"), .symbol("}"): depth -= 1
-            case .command(let c) where c.hasPrefix("begin:"): depth += 1
-            case .command(let c) where c.hasPrefix("end:"): depth -= 1
+            case .symbol("("), .symbol("["), .symbol("{"): nesting += 1
+            case .symbol(")"), .symbol("]"), .symbol("}"): nesting -= 1
+            case .command(let c) where c.hasPrefix("begin:"): nesting += 1
+            case .command(let c) where c.hasPrefix("end:"): nesting -= 1
+            case .symbol("∫"):
+                if nesting == 0 { inner += 1 }
+            case .word("int"):
+                if nesting == 0, tokens[i + 1] != .symbol("(") { inner += 1 }   // int(…) has no differential
             case .word("d"):
-                if depth == 0, case .word(let v) = tokens[i + 1], MathParser.isSingleLetter(v) { return i }
+                if nesting == 0, case .word(let v) = tokens[i + 1], MathParser.isSingleLetter(v) {
+                    if inner == 0 { return i }
+                    inner -= 1
+                    i += 1
+                }
             default: break
             }
             i += 1

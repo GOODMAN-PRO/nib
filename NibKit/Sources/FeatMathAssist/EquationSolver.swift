@@ -2,14 +2,19 @@ import Foundation
 import NibContracts
 
 // The on-device maths engine (F061), part 3: equations. Each equation becomes a fraction of polynomials in its unknowns.
-// One unknown up to degree 4 is solved (linear and quadratic exactly, cubic and quartic numerically, with rational
-// roots recognised exactly); several unknowns are solved as a linear system by Gauss–Jordan elimination. Anything else
-// (sin x = ½, x² + y² = 1 with a line, degree 5) is `unsupported`, pointing to AI Solve.
+// One unknown is solved exactly as far as fractions allow (repeated factors and fraction roots are divided out, what is
+// left of degree ≤ 2 is solved with surds), and a leftover cubic or quartic numerically; several unknowns are solved as
+// a linear system by Gauss–Jordan elimination. Anything else (sin x = ½, x² + y² = 1 with a line, x⁵ − x − 1 = 0) is
+// `unsupported`, pointing to AI Solve.
 
 // MARK: - Polynomials
 
 /// A polynomial in the unknowns: exponent of each unknown → coefficient (zero coefficients are never stored).
 struct Polynomial: Equatable {
+    /// Expanding (a + b + … + n)^24 would take minutes and gigabytes: products are refused beyond these sizes.
+    static let maxProductTerms = 20_000
+    static let maxDegree = 64
+
     private(set) var terms: [[Int]: Scalar]
     let variableCount: Int
 
@@ -49,7 +54,11 @@ struct Polynomial: Equatable {
 
     func scaled(_ c: Scalar) -> Polynomial { Polynomial(variableCount: variableCount, terms: terms.mapValues { $0 * c }) }
 
-    func multiplied(_ o: Polynomial) -> Polynomial {
+    func multiplied(_ o: Polynomial) throws -> Polynomial {
+        guard terms.count * o.terms.count <= Polynomial.maxProductTerms,
+              totalDegree + o.totalDegree <= Polynomial.maxDegree else {
+            throw MathFailure.unsupported("equations this large")
+        }
         var t: [[Int]: Scalar] = [:]
         for (e1, c1) in terms {
             for (e2, c2) in o.terms {
@@ -61,9 +70,20 @@ struct Polynomial: Equatable {
         return Polynomial(variableCount: variableCount, terms: t)
     }
 
-    func power(_ n: Int) -> Polynomial {
+    /// By repeated squaring.
+    func power(_ n: Int) throws -> Polynomial {
+        let (degree, overflow) = totalDegree.multipliedReportingOverflow(by: max(0, n))
+        guard !overflow, degree <= Polynomial.maxDegree, n <= Polynomial.maxDegree else {
+            throw MathFailure.unsupported("equations this large")
+        }
         var result = Polynomial.constant(.one, variableCount: variableCount)
-        for _ in 0..<max(0, n) { result = result.multiplied(self) }
+        var base = self
+        var e = max(0, n)
+        while e > 0 {
+            if e & 1 == 1 { result = try result.multiplied(base) }
+            e >>= 1
+            if e > 0 { base = try base.multiplied(base) }
+        }
         return result
     }
 
@@ -114,19 +134,25 @@ struct RationalExpression {
         return .polynomial(numerator.scaled(inverse))
     }
 
-    func adding(_ o: RationalExpression) -> RationalExpression {
+    /// Term products an operation with `o` costs (charged to the evaluator's budget).
+    func work(with o: RationalExpression) -> Int {
+        (numerator.terms.count + denominator.terms.count) * (o.numerator.terms.count + o.denominator.terms.count)
+    }
+
+    func adding(_ o: RationalExpression) throws -> RationalExpression {
         if denominator == o.denominator {
             return RationalExpression(numerator: numerator.adding(o.numerator), denominator: denominator)
         }
-        return RationalExpression(numerator: numerator.multiplied(o.denominator).adding(o.numerator.multiplied(denominator)),
-                                  denominator: denominator.multiplied(o.denominator)).normalized()
+        return RationalExpression(numerator: try numerator.multiplied(o.denominator)
+                                      .adding(o.numerator.multiplied(denominator)),
+                                  denominator: try denominator.multiplied(o.denominator)).normalized()
     }
 
     var negated: RationalExpression { RationalExpression(numerator: numerator.negated, denominator: denominator) }
 
-    func multiplied(_ o: RationalExpression) -> RationalExpression {
-        RationalExpression(numerator: numerator.multiplied(o.numerator),
-                           denominator: denominator.multiplied(o.denominator)).normalized()
+    func multiplied(_ o: RationalExpression) throws -> RationalExpression {
+        RationalExpression(numerator: try numerator.multiplied(o.numerator),
+                           denominator: try denominator.multiplied(o.denominator)).normalized()
     }
 
     func reciprocal() throws -> RationalExpression {
@@ -136,7 +162,7 @@ struct RationalExpression {
 
     func power(_ n: Int) throws -> RationalExpression {
         if n < 0 { return try reciprocal().power(-n) }
-        return RationalExpression(numerator: numerator.power(n), denominator: denominator.power(n)).normalized()
+        return RationalExpression(numerator: try numerator.power(n), denominator: try denominator.power(n)).normalized()
     }
 }
 
@@ -161,8 +187,15 @@ struct SymbolicReader {
     }
 
     func read(_ node: MathNode) throws -> RationalExpression {
+        try read(node, nesting: 0)
+    }
+
+    /// `nesting` counts every level of recursion (trees and expansions) so the stack stays bounded; `depth` counts
+    /// expansions of page definitions only.
+    private func read(_ node: MathNode, nesting: Int) throws -> RationalExpression {
         if isConstant(node) { return try constant(node) }
-        guard depth < 64 else { throw MathFailure.math("A definition refers to itself") }
+        guard depth < 64, nesting < 1_000 else { throw MathFailure.math("A definition refers to itself") }
+        let next = nesting + 1
         switch node {
         case .variable(let name):
             if let bound = bindings[name] { return bound }
@@ -173,44 +206,52 @@ struct SymbolicReader {
                 var inner = self
                 inner.bindings = [:]
                 inner.depth += 1
-                return try inner.read(definition)
+                return try inner.read(definition, nesting: next)
             }
             throw MathFailure.undefined(name)
         case .negate(let inner):
-            return try read(inner).negated
+            return try read(inner, nesting: next).negated
         case .binary(let op, let lhs, let rhs):
-            let a = try read(lhs)
+            let a = try read(lhs, nesting: next)
             switch op {
-            case .add:
-                return try a.adding(read(rhs))
-            case .subtract:
-                return try a.adding(read(rhs).negated)
-            case .plusMinus(let k):
-                let b = try read(rhs)
-                return a.adding(signs[k] == true ? b.negated : b)
+            case .add, .subtract, .plusMinus:
+                var b = try read(rhs, nesting: next)
+                if op == .subtract { b = b.negated }
+                if case .plusMinus(let k) = op, signs[k] == true { b = b.negated }
+                try evaluator.charge(a.work(with: b))
+                return try a.adding(b)
             case .multiply:
-                return try a.multiplied(read(rhs))
+                let b = try read(rhs, nesting: next)
+                try evaluator.charge(a.work(with: b))
+                return try a.multiplied(b)
             case .divide:
-                return try a.multiplied(read(rhs).reciprocal())
+                let b = try read(rhs, nesting: next).reciprocal()
+                try evaluator.charge(a.work(with: b))
+                return try a.multiplied(b)
             case .power:
                 guard isConstant(rhs) else { throw MathFailure.unsupported("equations with the unknown in an exponent") }
-                guard case .scalar(let e) = try evaluator.evaluate(rhs, signs: signs), let n = e.integerValue,
-                      abs(n) <= 24 else {
+                guard case .scalar(let e) = try evaluator.evaluate(rhs, signs: signs), let n = e.integerValue else {
                     throw MathFailure.unsupported("equations with fractional powers or roots of the unknown")
                 }
+                // Refused before expanding: (x + 1)^100 would be a polynomial of degree 100.
+                let degree = max(a.numerator.totalDegree, a.denominator.totalDegree)
+                guard abs(n) <= Polynomial.maxDegree, degree * abs(n) <= Polynomial.maxDegree else {
+                    throw MathFailure.unsupported("equations this large")
+                }
+                try evaluator.charge(a.work(with: a) * abs(n))
                 return try a.power(n)
             }
         case .postfix(.percent, let inner):
-            return try read(inner).multiplied(constantExpression(Scalar.one.divided(by: Scalar(100))))
+            return try read(inner, nesting: next).multiplied(constantExpression(Scalar.one.divided(by: Scalar(100))))
         case .postfix(.degrees, let inner):
-            return try read(inner).multiplied(constantExpression(.real(Double.pi / 180)))
+            return try read(inner, nesting: next).multiplied(constantExpression(.real(Double.pi / 180)))
         case .postfix(.factorial, _):
             throw MathFailure.unsupported("equations with factorials of the unknown")
         case .call(let name, let args, let primes):
             guard primes == 0 else { throw MathFailure.unsupported("equations with derivatives of the unknown") }
             guard let fn = definitions.functions[name] else {
                 if args.count == 1, definitions.variables[name] != nil {
-                    return try read(.binary(.multiply, .variable(name), args[0]))
+                    return try read(.binary(.multiply, .variable(name), args[0]), nesting: next)
                 }
                 throw MathFailure.undefinedFunction(name)
             }
@@ -219,9 +260,11 @@ struct SymbolicReader {
             }
             var inner = self
             inner.bindings = [:]
-            for (i, parameter) in fn.parameters.enumerated() { inner.bindings[parameter] = try read(args[i]) }
+            for (i, parameter) in fn.parameters.enumerated() {
+                inner.bindings[parameter] = try read(args[i], nesting: next)
+            }
             inner.depth += 1
-            return try inner.read(fn.body)
+            return try inner.read(fn.body, nesting: next)
         case .function(let f, _):
             throw MathFailure.unsupported(SymbolicReader.describe(f))
         case .matrix:
@@ -336,14 +379,21 @@ enum EquationOutcome {
 // MARK: - Solving
 
 enum EquationSolver {
-    static func solve(_ equations: [MathEquation], definitions: MathDefinitions) throws -> EquationOutcome {
+    static let maxUnknowns = 100
+
+    static func solve(_ equations: [MathEquation], definitions: MathDefinitions,
+                      cancellation: MathCancellation? = nil) throws -> EquationOutcome {
         var names = Set<String>()
         for e in equations {
             names.formUnion(definitions.freeNames(e.lhs))
             names.formUnion(definitions.freeNames(e.rhs))
         }
         let unknowns = names.sorted()
-        let evaluator = MathEvaluator(definitions: definitions)
+        // Every term carries an exponent for each unknown, so work grows with their square: refuse huge systems early.
+        guard unknowns.count <= maxUnknowns, equations.count <= 2 * maxUnknowns else {
+            throw MathFailure.unsupported("systems of more than \(maxUnknowns) unknowns")
+        }
+        let evaluator = MathEvaluator(definitions: definitions, cancellation: cancellation)
         if unknowns.isEmpty { return .check(try holds(equations, evaluator)) }
         if unknowns.count == 1, equations.count == 1 {
             return try solveOne(equations[0], variable: unknowns[0], definitions: definitions, evaluator: evaluator)
@@ -387,7 +437,10 @@ enum EquationSolver {
         var roots: [EquationRoot] = []
         for signs in try signCombinations(equation.plusMinusCount) {
             let reader = SymbolicReader(unknowns: [variable], definitions: definitions, evaluator: evaluator, signs: signs)
-            let difference = try reader.read(equation.lhs).adding(reader.read(equation.rhs).negated)
+            let lhs = try reader.read(equation.lhs)
+            let rhs = try reader.read(equation.rhs)
+            try evaluator.charge(lhs.work(with: rhs))
+            let difference = try lhs.adding(rhs.negated)
             switch try polynomialRoots(difference.numerator.univariateCoefficients) {
             case .identity:
                 return .identity([variable])
@@ -420,6 +473,13 @@ enum EquationSolver {
             roots.append(.value(.zero))   // x = 0, then solve what is left after dividing by x
             while c.count > 1, c[0].isNegligible(scale: scale) { c.removeFirst() }
         }
+        if c.count > 2, let fractions = ExactPolynomial.fractions(c) {
+            // Exactly first: repeated factors ((x − 1)³ is solved as x − 1) and fraction roots are divided out, so
+            // only what has neither is left for the numeric method: x³ − x² − 2x + 2 = (x − 1)(x² − 2).
+            let reduced = ExactPolynomial.reduce(fractions)
+            roots += reduced.roots.map { EquationRoot.value(.exact($0)) }
+            c = reduced.rest.map { Scalar.exact($0) }
+        }
         switch c.count - 1 {
         case 0:
             break
@@ -428,7 +488,7 @@ enum EquationSolver {
         case 2:
             roots += quadraticRoots(c[0], c[1], c[2])
         case 3, 4:
-            roots += numericRoots(c)
+            roots += try numericRoots(c)
         default:
             throw MathFailure.unsupported("equations of degree \(c.count - 1)")
         }
@@ -440,9 +500,11 @@ enum EquationSolver {
         if let ra = a.rational, let rb = b.rational, let rc = c.rational, let exact = exactQuadratic(ra, rb, rc) {
             return exact
         }
-        let x = a.doubleValue
-        let y = b.doubleValue
-        let z = c.doubleValue
+        // Divided by the largest coefficient first, so b² can't overflow (x² + 10²⁰⁰x + 1 = 0).
+        let size = max(abs(a.doubleValue), abs(b.doubleValue), abs(c.doubleValue))
+        let x = a.doubleValue / size
+        let y = b.doubleValue / size
+        let z = c.doubleValue / size
         let d = y * y - 4 * x * z
         if abs(d) <= 1e-12 * max(y * y, abs(4 * x * z)) { return [.value(.real(-y / (2 * x)))] }
         if d > 0 {
@@ -496,25 +558,44 @@ enum EquationSolver {
         return (k, m * rest)
     }
 
-    /// Cubic and quartic roots by Durand–Kerner, real ones polished with Newton's method and recognised as fractions
-    /// when a fraction satisfies the equation exactly.
-    static func numericRoots(_ coefficients: [Scalar]) -> [EquationRoot] {
-        let c = coefficients.map { $0.doubleValue }
-        let n = c.count - 1
-        let monic = c.map { $0 / c[n] }
-        var bound = 0.0
-        for k in 0..<n { bound = max(bound, abs(monic[k])) }
-        let radius = 1 + bound
+    /// Cubic and quartic roots by Durand–Kerner. The unknown is scaled first (x = 2ᵐ·y, so every coefficient of the
+    /// monic polynomial in y is at most 1 and every root |y| < 2), which keeps 10²⁰⁰x and 10⁻²⁰⁰ roots in range. A
+    /// repeated root comes back as a small cluster (a triple root's copies sit about 10⁻⁵ apart): clusters whose mean
+    /// really is a multiple root are merged into it. Real roots are polished with Newton's method and recognised as
+    /// fractions when a fraction satisfies the equation exactly.
+    static func numericRoots(_ coefficients: [Scalar]) throws -> [EquationRoot] {
+        let a = coefficients.map { $0.doubleValue }
+        let n = a.count - 1
+        guard n >= 1, a.allSatisfy({ $0.isFinite }), a[n] != 0 else {
+            throw MathFailure.unsupported("this equation (its coefficients are too large)")
+        }
+        // 2ᵐ ≥ |aₖ/aₙ|^(1/(n−k)) for every k: then |bₖ| = |aₖ/aₙ|·2^(m(k−n)) ≤ 1.
+        var m = Int.min
+        for k in 0..<n where a[k] != 0 {
+            m = max(m, Int((log2(abs(a[k])) - log2(abs(a[n]))) / Double(n - k)).advanced(by: 1))
+        }
+        if m == Int.min { m = 0 }
+        guard (-1000...1000).contains(m) else {
+            throw MathFailure.unsupported("this equation (its coefficients are too far apart)")
+        }
+        let b: [Double] = (0...n).map { k in
+            guard a[k] != 0 else { return 0 }
+            let ratio = a[k].significand / a[n].significand
+            let exponent = Int(a[k].exponent) - Int(a[n].exponent) + (k - n) * m
+            return Double(sign: (a[k] < 0) == (a[n] < 0) ? .plus : .minus, exponent: exponent, significand: ratio)
+        }
+        guard b.indices.allSatisfy({ (a[$0] == 0) == (b[$0] == 0) }) else {
+            throw MathFailure.unsupported("this equation (its coefficients are too far apart)")   // one underflowed
+        }
         var z: [ComplexNumber] = []
         for k in 0..<n {
             let angle = 2 * Double.pi * Double(k) / Double(n) + 0.4
-            z.append(ComplexNumber(radius * cos(angle), radius * sin(angle)))
+            z.append(ComplexNumber(1.5 * cos(angle), 1.5 * sin(angle)))
         }
         for _ in 0..<2000 {
             var largest = 0.0
             for i in 0..<n {
-                var value = ComplexNumber(1, 0)
-                for k in stride(from: n - 1, through: 0, by: -1) { value = value * z[i] + ComplexNumber(monic[k], 0) }
+                let value = evaluate(b, at: z[i])
                 var product = ComplexNumber(1, 0)
                 for j in 0..<n where j != i { product = product * (z[i] - z[j]) }
                 guard product.magnitude > 0 else { continue }
@@ -524,23 +605,139 @@ enum EquationSolver {
             }
             if largest < 1e-15 { break }
         }
+        // Every root must satisfy the equation to rounding (a backward error at Double precision); an iteration that
+        // never settled would otherwise be reported as roots.
+        for root in z where backwardError(b, at: root) > 1e-10 {
+            throw MathFailure.unsupported("this equation (the numeric solver didn't converge)")
+        }
+        let scale = Double(sign: .plus, exponent: m, significand: 1)
         var roots: [EquationRoot] = []
-        for root in z {
-            if abs(root.im) <= 1e-7 * (1 + abs(root.re)) {
-                let x = polish(c, root.re)
+        for cluster in clusters(z, b) {
+            var root = cluster.root
+            if abs(root.im) <= 1e-7 * root.magnitude || abs(root.im) <= 1e-14 {
+                // Newton on the (m−1)-th derivative, which has a simple root where p has an m-fold one.
+                let y = polish(derivative(b, cluster.size - 1), root.re)
+                let x = y * scale
                 if let exact = exactRoot(coefficients, near: x) {
                     roots.append(.value(.exact(exact)))
                 } else {
                     roots.append(.value(.real(x)))
                 }
             } else {
-                roots.append(.complex(root.re, root.im))
+                if abs(root.re) <= 1e-12 * root.magnitude { root.re = 0 }
+                roots.append(.complex(root.re * scale, root.im * scale))
             }
         }
-        // A repeated root comes back once per multiplicity, a little apart.
         var unique: [EquationRoot] = []
-        for r in roots where !unique.contains(where: { $0.isClose(to: r, tolerance: 1e-6) }) { unique.append(r) }
+        for r in roots where !unique.contains(where: { $0.isClose(to: r) }) { unique.append(r) }
         return unique
+    }
+
+    /// Groups the Durand–Kerner roots of `b`. Roots near each other form a group, and a group of m becomes one root
+    /// when there is an m-fold root there: Newton on p⁽ᵐ⁻¹⁾ from the group's mean (which is only good to about the
+    /// group's spread) finds the candidate, and p, p′, …, p⁽ᵐ⁻¹⁾ must all vanish at it. Otherwise the group's members
+    /// merge pairwise, closest first, only where each merge passes the same test.
+    private static func clusters(_ z: [ComplexNumber], _ b: [Double]) -> [(root: ComplexNumber, size: Int)] {
+        func near(_ p: ComplexNumber, _ q: ComplexNumber) -> Bool {
+            (p - q).magnitude <= 1e-2 * max(p.magnitude, q.magnitude) + 1e-3
+        }
+        var label = Array(z.indices)
+        for i in z.indices {
+            for j in z.indices where j > i && near(z[i], z[j]) && label[i] != label[j] {
+                let old = label[j]
+                for k in label.indices where label[k] == old { label[k] = label[i] }
+            }
+        }
+        var result: [(root: ComplexNumber, size: Int)] = []
+        for group in Set(label).sorted() {
+            let members = z.indices.filter { label[$0] == group }.map { z[$0] }
+            if members.count > 1, let root = multipleRoot(b, near: members) {
+                result.append((root, members.count))
+            } else {
+                result += mergedPairs(members, b)
+            }
+        }
+        return result
+    }
+
+    private static func mergedPairs(_ z: [ComplexNumber], _ b: [Double]) -> [(root: ComplexNumber, size: Int)] {
+        var groups = z.map { (members: [$0], root: $0) }
+        var rejected = Set<[Int]>()   // pairs of group indices; cleared whenever the groups change
+        while true {
+            var best: (i: Int, j: Int, distance: Double)? = nil
+            for i in groups.indices {
+                for j in groups.indices where j > i && !rejected.contains([i, j]) {
+                    let distance = (groups[i].root - groups[j].root).magnitude
+                    if best.map({ distance < $0.distance }) ?? true { best = (i, j, distance) }
+                }
+            }
+            guard let pair = best else { break }
+            let merged = groups[pair.i].members + groups[pair.j].members
+            if let root = multipleRoot(b, near: merged) {
+                groups[pair.i] = (merged, root)
+                groups.remove(at: pair.j)
+                rejected = []
+            } else {
+                rejected.insert([pair.i, pair.j])
+            }
+        }
+        return groups.map { ($0.root, $0.members.count) }
+    }
+
+    /// The m-fold root of p near the m roots `members`, if there is one. Two distinct roots closer than about 10⁻⁶ of
+    /// their size pass as a double root: Doubles can't tell those apart.
+    private static func multipleRoot(_ b: [Double], near members: [ComplexNumber]) -> ComplexNumber? {
+        let m = members.count
+        let sum = members.reduce(ComplexNumber(0, 0), +)
+        let root = newton(derivative(b, m - 1), from: ComplexNumber(sum.re / Double(m), sum.im / Double(m)))
+        for k in 0..<m where backwardError(derivative(b, k), at: root) > 1e-13 { return nil }
+        return root
+    }
+
+    private static func derivative(_ c: [Double], _ order: Int) -> [Double] {
+        var out = c
+        for _ in 0..<order { out = differentiated(out) }
+        return out
+    }
+
+    /// Complex Newton steps while |p| keeps falling.
+    private static func newton(_ c: [Double], from start: ComplexNumber) -> ComplexNumber {
+        let slope = differentiated(c)
+        var z = start
+        var size = evaluate(c, at: z).magnitude
+        for _ in 0..<30 where size > 0 {
+            let d = evaluate(slope, at: z)
+            guard d.magnitude > 0 else { break }
+            let next = z - evaluate(c, at: z) / d
+            let nextSize = evaluate(c, at: next).magnitude
+            guard nextSize < size else { break }
+            z = next
+            size = nextSize
+        }
+        return z
+    }
+
+    /// |p(z)| / (max|cₖ| · Σ|z|ᵏ): the relative change of the coefficients that would make z an exact root.
+    private static func backwardError(_ c: [Double], at z: ComplexNumber) -> Double {
+        let largest = c.map { abs($0) }.max() ?? 0
+        guard largest > 0 else { return 0 }
+        var powers = 0.0
+        var power = 1.0
+        for _ in c {
+            powers += power
+            power *= z.magnitude
+        }
+        return evaluate(c, at: z).magnitude / (largest * powers)
+    }
+
+    private static func differentiated(_ c: [Double]) -> [Double] {
+        c.count > 1 ? (1..<c.count).map { Double($0) * c[$0] } : [0]
+    }
+
+    private static func evaluate(_ c: [Double], at z: ComplexNumber) -> ComplexNumber {
+        var value = ComplexNumber(0, 0)
+        for k in stride(from: c.count - 1, through: 0, by: -1) { value = value * z + ComplexNumber(c[k], 0) }
+        return value
     }
 
     private static func evaluate(_ c: [Double], _ x: Double) -> Double {
@@ -585,7 +782,10 @@ enum EquationSolver {
         var rows: [[Scalar]] = []
         var denominators: [Polynomial] = []
         for e in equations {
-            let difference = try reader.read(e.lhs).adding(reader.read(e.rhs).negated)
+            let lhs = try reader.read(e.lhs)
+            let rhs = try reader.read(e.rhs)
+            try evaluator.charge(lhs.work(with: rhs))
+            let difference = try lhs.adding(rhs.negated)
             guard difference.numerator.totalDegree <= 1 else {
                 throw MathFailure.unsupported(equations.count == 1 ? "non-linear equations in several unknowns"
                                                                    : "non-linear systems of equations")
@@ -595,6 +795,7 @@ enum EquationSolver {
             denominators.append(difference.denominator)
         }
         let n = unknowns.count
+        try evaluator.charge(rows.count * rows.count * (n + 1))
         let reduced = try Matrix.rowReduce(rows, columns: n)
         var scale = 0.0
         for row in rows {
@@ -611,6 +812,158 @@ enum EquationSolver {
         let point = values.map { $0.value.doubleValue }
         for d in denominators where abs(d.value(at: point)) < 1e-12 { return .noSolution }
         return .system(values)
+    }
+}
+
+// MARK: - Exact polynomial arithmetic
+
+/// One-unknown polynomials with fraction coefficients (constant term first). Every step returns nil as soon as a
+/// number stops fitting in 64 bits; callers then carry on with what they have, and the numeric method does the rest.
+enum ExactPolynomial {
+    /// The fraction coefficients, when every coefficient is one.
+    static func fractions(_ c: [Scalar]) -> [Rational]? {
+        var out: [Rational] = []
+        for s in c {
+            guard let r = s.rational else { return nil }
+            out.append(r)
+        }
+        return out
+    }
+
+    /// `p`'s fraction roots, and what is left of `p` once they (and every repeated factor) are divided out: the
+    /// square-free part p / gcd(p, p′), then each root r = ±(divisor of c₀)/(divisor of cₙ) that the rational root
+    /// theorem allows, deflated exactly.
+    static func reduce(_ p: [Rational]) -> (roots: [Rational], rest: [Rational]) {
+        var rest = trimmed(p)
+        if let derivative = derivative(rest), let common = gcd(rest, derivative), common.count > 1,
+           let quotient = divide(rest, by: common), quotient.remainder.isEmpty {
+            rest = trimmed(quotient.quotient)
+        }
+        var roots: [Rational] = []
+        for candidate in candidates(rest) where rest.count > 1 {
+            while rest.count > 1, value(rest, at: candidate)?.numerator == 0,
+                  let deflated = divide(rest, by: [candidate.negated, .one]), deflated.remainder.isEmpty {
+                if !roots.contains(candidate) { roots.append(candidate) }
+                rest = trimmed(deflated.quotient)
+            }
+        }
+        return (roots, rest)
+    }
+
+    static func trimmed(_ p: [Rational]) -> [Rational] {
+        var q = p
+        while let last = q.last, last.numerator == 0 { q.removeLast() }
+        return q
+    }
+
+    static func derivative(_ p: [Rational]) -> [Rational]? {
+        guard p.count > 1 else { return [] }
+        var out: [Rational] = []
+        for k in 1..<p.count {
+            guard let term = p[k].multiplying(Rational(integer: k)) else { return nil }
+            out.append(term)
+        }
+        return trimmed(out)
+    }
+
+    /// a = quotient·b + remainder, deg remainder < deg b (b nonzero).
+    static func divide(_ a: [Rational], by b: [Rational]) -> (quotient: [Rational], remainder: [Rational])? {
+        var r = trimmed(a)
+        let d = trimmed(b)
+        guard let lead = d.last, let inverse = lead.reciprocal else { return nil }
+        guard r.count >= d.count else { return ([], r) }
+        var q = Array(repeating: Rational.zero, count: r.count - d.count + 1)
+        while r.count >= d.count, let top = r.last {
+            guard let factor = top.multiplying(inverse) else { return nil }
+            let shift = r.count - d.count
+            q[shift] = factor
+            for (i, c) in d.enumerated() {
+                guard let product = c.multiplying(factor), let difference = r[i + shift].adding(product.negated) else {
+                    return nil
+                }
+                r[i + shift] = difference
+            }
+            r[r.count - 1] = .zero   // cancelled exactly
+            r = trimmed(r)
+        }
+        return (q, r)
+    }
+
+    /// The monic greatest common divisor, by Euclid's algorithm.
+    static func gcd(_ a: [Rational], _ b: [Rational]) -> [Rational]? {
+        var x = trimmed(a)
+        var y = trimmed(b)
+        while !y.isEmpty {
+            guard let step = divide(x, by: y), let next = monic(step.remainder) else { return nil }
+            (x, y) = (y, next)
+        }
+        return monic(x)
+    }
+
+    private static func monic(_ p: [Rational]) -> [Rational]? {
+        guard let lead = p.last else { return [] }
+        guard let inverse = lead.reciprocal else { return nil }
+        var out: [Rational] = []
+        for c in p {
+            guard let scaled = c.multiplying(inverse) else { return nil }
+            out.append(scaled)
+        }
+        return out
+    }
+
+    /// Horner's rule; nil on overflow.
+    static func value(_ p: [Rational], at x: Rational) -> Rational? {
+        var total = Rational.zero
+        for c in p.reversed() {
+            guard let product = total.multiplying(x), let sum = product.adding(c) else { return nil }
+            total = sum
+        }
+        return total
+    }
+
+    /// ±p/q for p dividing the constant term and q the leading term of `p` cleared of fractions. Empty when the
+    /// coefficients are too large to factor quickly or there would be too many candidates to try.
+    static func candidates(_ p: [Rational]) -> [Rational] {
+        guard p.count > 1, let first = p.first, first.numerator != 0, let last = p.last else { return [] }
+        var lcm = 1
+        for c in p {
+            let (product, overflow) = (lcm / Rational.gcd(lcm, c.denominator)).multipliedReportingOverflow(by: c.denominator)
+            guard !overflow else { return [] }
+            lcm = product
+        }
+        guard let constant = first.multiplying(Rational(integer: lcm)),
+              let leading = last.multiplying(Rational(integer: lcm)) else { return [] }
+        guard let numerators = divisors(constant.numerator), let denominators = divisors(leading.numerator),
+              numerators.count * denominators.count <= 2_000 else { return [] }
+        var seen = Set<Rational>()
+        var out: [Rational] = []
+        for n in numerators {
+            for d in denominators {
+                for sign in [1, -1] {
+                    guard let r = Rational(sign * n, d), seen.insert(r).inserted else { continue }
+                    out.append(r)
+                }
+            }
+        }
+        return out
+    }
+
+    /// Positive divisors of |n| by trial division (nil above 10¹², which would take too long).
+    private static func divisors(_ n: Int) -> [Int]? {
+        let m = n.magnitude
+        guard m > 0, m <= 1_000_000_000_000 else { return nil }
+        let value = Int(m)
+        var small: [Int] = []
+        var large: [Int] = []
+        var f = 1
+        while f * f <= value {
+            if value % f == 0 {
+                small.append(f)
+                if f * f != value { large.append(value / f) }
+            }
+            f += 1
+        }
+        return small + large.reversed()
     }
 }
 

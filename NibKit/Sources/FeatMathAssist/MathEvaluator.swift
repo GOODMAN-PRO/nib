@@ -3,7 +3,7 @@ import NibContracts
 
 // The on-device maths engine (F061), part 2: exact numbers, matrices, page definitions and the evaluator. Numbers stay
 // exact fractions while they fit in 64 bits and become Doubles otherwise; calculus is numeric (adaptive Gauss–Kronrod
-// integrals, central differences with a Richardson step for derivatives).
+// integrals, Ridders' extrapolation of central differences for derivatives).
 
 // MARK: - Exact fractions
 
@@ -494,18 +494,101 @@ struct MathDefinitions {
     var variables: [String: MathNode] = [:]
     var functions: [String: MathFunctionDefinition] = [:]
 
+    /// A page definition that an expression refers to.
+    private enum Reference: Hashable {
+        case variable(String)
+        case function(String)
+    }
+
     /// Names in `node` that neither the page nor a binder (∑ index, integration variable, parameter) defines: the
     /// unknowns of an equation. Page variables and functions are followed; `symbolic` names (the parameters of a
-    /// function being expanded) count as free.
+    /// function being expanded) count as free, and so does a variable whose definition leads back to itself
+    /// (y = 2x + 1 next to x = 1 − y): neither can be worked out from the page alone.
     func freeNames(_ node: MathNode, symbolic: Set<String> = []) -> Set<String> {
         var found = Set<String>()
-        var visited = Set<String>()
-        collectFree(node, bound: [], symbolic: symbolic, found: &found, visited: &visited)
+        var roots: [Reference] = []
+        scan(node, bound: [], symbolic: symbolic, found: &found, references: &roots)
+        // Definitions are followed depth-first with an explicit stack, as a page may chain any number of them; one
+        // met again while it is still being resolved lies on a cycle.
+        var done = Set<Reference>()
+        var resolving = Set<Reference>()
+        var path: [(reference: Reference, pending: [Reference])] = []
+        for root in roots where !done.contains(root) {
+            path.append((root, references(of: root, found: &found)))
+            resolving.insert(root)
+            while !path.isEmpty {
+                if let next = path[path.count - 1].pending.popLast() {
+                    if resolving.contains(next) {
+                        if case .variable(let name) = next { found.insert(name) }
+                    } else if !done.contains(next) {
+                        path.append((next, references(of: next, found: &found)))
+                        resolving.insert(next)
+                    }
+                } else {
+                    let finished = path.removeLast().reference
+                    resolving.remove(finished)
+                    done.insert(finished)
+                }
+            }
+        }
         return found
     }
 
-    private func collectFree(_ node: MathNode, bound: Set<String>, symbolic: Set<String>, found: inout Set<String>,
-                             visited: inout Set<String>) {
+    /// The variables among `names` whose value can't be worked out from the page alone, in one pass over the
+    /// definitions: `freeNames(.variable(name))` isn't empty for exactly these.
+    func unresolvedVariables(among names: [String]) -> Set<String> {
+        var result: [Reference: Bool] = [:]
+        var resolving = Set<Reference>()
+        var path: [(reference: Reference, pending: [Reference], free: Bool)] = []
+        func enter(_ reference: Reference) {
+            var found = Set<String>()
+            let pending = references(of: reference, found: &found)
+            path.append((reference, pending, !found.isEmpty))
+            resolving.insert(reference)
+        }
+        for name in names where variables[name] != nil && result[.variable(name)] == nil {
+            enter(.variable(name))
+            while !path.isEmpty {
+                let top = path.count - 1
+                if let next = path[top].pending.popLast() {
+                    if resolving.contains(next) {
+                        path[top].free = true   // a cycle
+                    } else if let known = result[next] {
+                        if known { path[top].free = true }
+                    } else {
+                        enter(next)
+                    }
+                } else {
+                    let finished = path.removeLast()
+                    resolving.remove(finished.reference)
+                    result[finished.reference] = finished.free
+                    if finished.free, !path.isEmpty { path[path.count - 1].free = true }
+                }
+            }
+        }
+        return Set(names.filter { result[.variable($0)] == true })
+    }
+
+    /// The definitions a definition refers to; its free names go straight into `found`.
+    private func references(of reference: Reference, found: inout Set<String>) -> [Reference] {
+        var out: [Reference] = []
+        switch reference {
+        case .variable(let name):
+            if let definition = variables[name] {
+                scan(definition, bound: [], symbolic: [], found: &found, references: &out)
+            }
+        case .function(let name):
+            if let fn = functions[name] {
+                scan(fn.body, bound: Set(fn.parameters), symbolic: [], found: &found, references: &out)
+            }
+        }
+        return out
+    }
+
+    /// One tree (its depth is bounded by `MathParser.maxDepth`): free names into `found`, page definitions it uses
+    /// into `references`.
+    private func scan(_ node: MathNode, bound: Set<String>, symbolic: Set<String>, found: inout Set<String>,
+                      references: inout [Reference]) {
         switch node {
         case .number:
             return
@@ -513,46 +596,40 @@ struct MathDefinitions {
             if bound.contains(name) { return }
             if symbolic.contains(name) {
                 found.insert(name)
-                return
+            } else if variables[name] != nil {
+                references.append(.variable(name))
+            } else if !MathDefinitions.constants.contains(name) {
+                found.insert(name)
             }
-            if let definition = variables[name] {
-                if visited.insert("var " + name).inserted {
-                    collectFree(definition, bound: [], symbolic: [], found: &found, visited: &visited)
-                }
-                return
-            }
-            if !MathDefinitions.constants.contains(name) { found.insert(name) }
         case .negate(let inner), .postfix(_, let inner):
-            collectFree(inner, bound: bound, symbolic: symbolic, found: &found, visited: &visited)
+            scan(inner, bound: bound, symbolic: symbolic, found: &found, references: &references)
         case .binary(let op, let lhs, let rhs):
-            collectFree(lhs, bound: bound, symbolic: symbolic, found: &found, visited: &visited)
+            scan(lhs, bound: bound, symbolic: symbolic, found: &found, references: &references)
             if op == .power, case .variable("T") = rhs, !bound.contains("T"), !symbolic.contains("T"),
                variables["T"] == nil {
                 return   // A^T is a transpose, not a power
             }
-            collectFree(rhs, bound: bound, symbolic: symbolic, found: &found, visited: &visited)
+            scan(rhs, bound: bound, symbolic: symbolic, found: &found, references: &references)
         case .function(_, let args):
-            for a in args { collectFree(a, bound: bound, symbolic: symbolic, found: &found, visited: &visited) }
+            for a in args { scan(a, bound: bound, symbolic: symbolic, found: &found, references: &references) }
         case .call(let name, let args, _):
-            for a in args { collectFree(a, bound: bound, symbolic: symbolic, found: &found, visited: &visited) }
-            if let fn = functions[name] {
-                if visited.insert("fn " + name).inserted {
-                    collectFree(fn.body, bound: Set(fn.parameters), symbolic: [], found: &found, visited: &visited)
-                }
+            for a in args { scan(a, bound: bound, symbolic: symbolic, found: &found, references: &references) }
+            if functions[name] != nil {
+                references.append(.function(name))
             } else if variables[name] != nil || bound.contains(name) || symbolic.contains(name) {
-                collectFree(.variable(name), bound: bound, symbolic: symbolic, found: &found, visited: &visited)
+                scan(.variable(name), bound: bound, symbolic: symbolic, found: &found, references: &references)
             }
         case .matrix(let rows):
             for row in rows {
-                for x in row { collectFree(x, bound: bound, symbolic: symbolic, found: &found, visited: &visited) }
+                for x in row { scan(x, bound: bound, symbolic: symbolic, found: &found, references: &references) }
             }
         case .bigOperator(_, let v, let from, let to, let body), .integral(let v, let from, let to, let body):
-            collectFree(from, bound: bound, symbolic: symbolic, found: &found, visited: &visited)
-            collectFree(to, bound: bound, symbolic: symbolic, found: &found, visited: &visited)
-            collectFree(body, bound: bound.union([v]), symbolic: symbolic, found: &found, visited: &visited)
+            scan(from, bound: bound, symbolic: symbolic, found: &found, references: &references)
+            scan(to, bound: bound, symbolic: symbolic, found: &found, references: &references)
+            scan(body, bound: bound.union([v]), symbolic: symbolic, found: &found, references: &references)
         case .derivative(let v, _, let body, let at):
-            collectFree(at ?? .variable(v), bound: bound, symbolic: symbolic, found: &found, visited: &visited)
-            collectFree(body, bound: bound.union([v]), symbolic: symbolic, found: &found, visited: &visited)
+            scan(at ?? .variable(v), bound: bound, symbolic: symbolic, found: &found, references: &references)
+            scan(body, bound: bound.union([v]), symbolic: symbolic, found: &found, references: &references)
         }
     }
 }
@@ -583,14 +660,41 @@ extension MathNode {
 
 // MARK: - Evaluator
 
+/// Set from any thread to stop a calculation that is running (math.evaluate's caller was cancelled).
+final class MathCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
 /// Evaluates syntax trees against page definitions. One instance per request: it caches page variables' values and
-/// records whether numeric calculus (an approximation) was used. Not thread-safe; it runs on one task at a time.
+/// records whether numeric calculus (an approximation) was used. Not thread-safe; it runs on one thread at a time.
 final class MathEvaluator {
+    /// Work units (tree nodes, plus what matrix and polynomial arithmetic multiply) for one `evaluate`…
     static let stepBudget = 3_000_000
+    /// … and for everything this evaluator does in one request.
+    static let workBudget = 20_000_000
     static let maxTerms = 100_000
+    /// Nested calls of page functions (f(x) = f(x − 1) + 1 never ends).
     static let maxDepth = 100
+    /// Nested evaluation of any kind (functions, page variables and the trees themselves). The command runs on an
+    /// 8 MB stack (`MathStack`); graph samplers may run on any thread, so they pass a lower limit.
+    static let maxNesting = 600
 
     let definitions: MathDefinitions
+    let cancellation: MathCancellation?
+    let nestingLimit: Int
     /// True once an integral or derivative was worked out numerically.
     private(set) var approximate = false
     private var locals: [String: MathValue] = [:]
@@ -598,10 +702,16 @@ final class MathEvaluator {
     private var cache: [String: MathValue] = [:]
     private var resolving: Set<String> = []
     private var depth = 0
+    private var nesting = 0
     private var steps = 0
+    private var work = 0
+    private var nextCancellationCheck = 0
 
-    init(definitions: MathDefinitions) {
+    init(definitions: MathDefinitions, cancellation: MathCancellation? = nil,
+         nestingLimit: Int = MathEvaluator.maxNesting) {
         self.definitions = definitions
+        self.cancellation = cancellation
+        self.nestingLimit = nestingLimit
     }
 
     /// Evaluates one side of a statement; `signs[k] == true` takes − for its k-th ±.
@@ -620,9 +730,26 @@ final class MathEvaluator {
         return try realValue(value(node))
     }
 
+    /// Counts `units` of work against the budgets, and stops (CancellationError) once the caller has cancelled.
+    func charge(_ units: Int) throws {
+        steps += units
+        work += units
+        if steps > MathEvaluator.stepBudget || work > MathEvaluator.workBudget {
+            throw MathFailure.unsupported("calculations this long")
+        }
+        if work >= nextCancellationCheck {
+            nextCancellationCheck = work + 10_000
+            if cancellation?.isCancelled == true { throw CancellationError() }
+        }
+    }
+
     private func value(_ node: MathNode) throws -> MathValue {
-        steps += 1
-        if steps > MathEvaluator.stepBudget { throw MathFailure.unsupported("calculations this long") }
+        try charge(1)
+        nesting += 1
+        defer { nesting -= 1 }
+        guard nesting <= nestingLimit else {
+            throw MathFailure.math("This calculation nests too deeply (does a definition use itself?)")
+        }
         switch node {
         case .number(let s):
             return .scalar(s)
@@ -717,9 +844,11 @@ final class MathEvaluator {
         let a = try value(lhs)
         if op == .power, case .variable("T") = rhs, case .matrix(let m) = a, locals["T"] == nil,
            definitions.variables["T"] == nil {
+            try charge(m.rowCount * m.columnCount)
             return .matrix(m.transposed)
         }
         let b = try value(rhs)
+        try charge(MathEvaluator.matrixWork(op, a, b))
         switch op {
         case .add: return try checked(MathValue.add(a, b, subtract: false))
         case .subtract: return try checked(MathValue.add(a, b, subtract: true))
@@ -727,6 +856,25 @@ final class MathEvaluator {
         case .multiply: return try checked(MathValue.multiply(a, b))
         case .divide: return try checked(MathValue.divide(a, b))
         case .power: return try checked(MathValue.power(a, b))
+        }
+    }
+
+    /// Scalar operations per matrix operation: m·n for sums and scaling, m·n·k for a product, one product per bit
+    /// of a power (plus an inverse for negative ones).
+    static func matrixWork(_ op: MathOperator, _ a: MathValue, _ b: MathValue) -> Int {
+        switch (op, a, b) {
+        case (.multiply, .matrix(let x), .matrix(let y)):
+            return x.rowCount * x.columnCount * y.columnCount
+        case (.power, .matrix(let m), .scalar(let s)):
+            let n = m.rowCount
+            let exponent = s.integerValue ?? 0
+            let magnitude = Int(min(exponent.magnitude, 1 << 20))
+            let products = 2 * (Int.bitWidth - magnitude.leadingZeroBitCount) + (exponent < 0 ? 1 : 0) + 1
+            return n * n * n * products
+        case (_, .matrix(let m), _), (_, _, .matrix(let m)):
+            return m.rowCount * m.columnCount
+        default:
+            return 0
         }
     }
 
@@ -755,6 +903,7 @@ final class MathEvaluator {
         guard args.count == expected else { throw MathFailure.syntax("\(f.rawValue) takes \(expected) argument(s)") }
         var values: [MathValue] = []
         for a in args { values.append(try value(a)) }
+        if case .matrix(let m) = values[0] { try charge(m.rowCount * m.rowCount * m.columnCount) }   // elimination
         switch f {
         case .det:
             guard case .matrix(let m) = values[0] else { throw MathFailure.math("det needs a matrix") }
@@ -930,15 +1079,76 @@ final class MathEvaluator {
 
     // MARK: Numeric calculus
 
-    /// The order-th derivative at x: central differences with one Richardson step (error O(h⁴)), rounded to 9
-    /// significant digits, which is what Doubles carry through a difference quotient.
+    /// The order-th derivative at x by Ridders' extrapolation of central differences (Numerical Recipes' dfridr).
+    /// Two starting steps are tried, a tenth of |x| (so 1/x at 0.001 is never sampled across 0) and 0.1 (so sin x
+    /// at 1000 isn't sampled a period apart), and the estimate with the smaller error wins. A step whose stencil
+    /// leaves the function's domain (√x just above 0) is cut tenfold, up to six times. The result keeps the digits
+    /// its error estimate supports and is snapped to a fraction within that error (d⁴/dx⁴ x⁴ is 24, not 24.0000007).
     static func differentiate(order n: Int, at x: Double, _ f: (Double) throws -> Double) throws -> Double {
-        let h = pow(Double.ulpOfOne, 1 / Double(n + 4)) * max(1, abs(x))
-        let coarse = try centralDifference(order: n, at: x, step: h, f)
-        let fine = try centralDifference(order: n, at: x, step: h / 2, f)
-        let d = (4 * fine - coarse) / 3
-        guard d.isFinite else { throw MathFailure.math("The derivative doesn't exist there") }
-        return roundedToSignificant(d, 9)
+        _ = try f(x)   // a function that isn't defined at x reports why
+        var best: (value: Double, error: Double)? = nil
+        let relative = 0.1 * max(abs(x), 1e-6)
+        for start in relative == 0.1 ? [relative] : [relative, 0.1] {
+            var h = start
+            for _ in 0...6 {
+                do {
+                    let estimate = try ridders(order: n, at: x, step: h, f)
+                    if estimate.value.isFinite, best.map({ estimate.error < $0.error }) ?? true { best = estimate }
+                    break
+                } catch let error as NibError where error.code == .invalidParams {
+                    h /= 10   // the stencil left the domain: try closer in
+                }
+            }
+        }
+        guard let result = best else { throw MathFailure.math("The derivative doesn't exist there") }
+        return settled(result.value, error: result.error)
+    }
+
+    /// One Ridders tableau: central differences at steps h, h/1.4, h/1.4², … extrapolated to step 0.
+    private static func ridders(order n: Int, at x: Double, step: Double,
+                                _ f: (Double) throws -> Double) throws -> (value: Double, error: Double) {
+        let shrink = 1.4
+        let shrink2 = shrink * shrink
+        let rounds = 10
+        var table = Array(repeating: Array(repeating: 0.0, count: rounds), count: rounds)
+        var h = step
+        table[0][0] = try centralDifference(order: n, at: x, step: h, f)
+        var answer = table[0][0]
+        var error = Double.infinity
+        for i in 1..<rounds {
+            h /= shrink
+            do {
+                table[0][i] = try centralDifference(order: n, at: x, step: h, f)
+            } catch let e as NibError where e.code == .invalidParams {
+                break   // a smaller step left the domain: keep what the larger ones gave
+            }
+            var factor = shrink2
+            for j in 1...i {
+                table[j][i] = (table[j - 1][i] * factor - table[j - 1][i - 1]) / (factor - 1)
+                factor *= shrink2
+                let estimate = max(abs(table[j][i] - table[j - 1][i]), abs(table[j][i] - table[j - 1][i - 1]))
+                if estimate <= error {
+                    error = estimate
+                    answer = table[j][i]
+                }
+            }
+            // Higher orders stopped helping: rounding error has taken over.
+            if abs(table[i][i] - table[i - 1][i - 1]) >= 2 * error { break }
+        }
+        return (answer, error)
+    }
+
+    /// `d` with the digits `error` supports; a fraction (denominator ≤ 1000) within the error when there is one.
+    static func settled(_ d: Double, error: Double) -> Double {
+        guard d.isFinite, d != 0 else { return d }
+        let tolerance = max(error, 4 * d.ulp)
+        if tolerance <= 1e-8 * max(1, abs(d)),
+           let r = Rational.approximating(d, maxDenominator: 1000, tolerance: tolerance) {
+            return r.doubleValue
+        }
+        guard tolerance.isFinite else { return roundedToSignificant(d, 6) }
+        let digits = Int(floor(log10(abs(d) / tolerance)))
+        return roundedToSignificant(d, min(15, max(1, digits)))
     }
 
     private static func centralDifference(order n: Int, at x: Double, step h: Double,

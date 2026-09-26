@@ -18,9 +18,9 @@ final class MathEngineTests: XCTestCase {
         }
     }
 
-    private func assertError(_ source: String, _ code: NibError.Code, file: StaticString = #filePath,
-                             line: UInt = #line) {
-        XCTAssertThrowsError(try answer(source), "input: \(source)", file: file, line: line) { error in
+    private func assertError(_ source: String, _ code: NibError.Code, context: [String] = [],
+                             file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try answer(source, context: context), "input: \(source)", file: file, line: line) { error in
             XCTAssertEqual((error as? NibError)?.code, code, "input: \(source): \(error)", file: file, line: line)
         }
     }
@@ -153,8 +153,56 @@ final class MathEngineTests: XCTestCase {
             ("2 + 2 = 5", "False"),
         ])
         assertAnswers([("2x + a = 7", "x = 2")], context: ["a = 3"])
-        assertAnswers([("f(x) + 1 = 8", "x = 3")], context: ["f(x) = 2x + 1"])   // f(x) = 8 alone would redefine f
         assertAnswers([("x^2 = 2", "x \u{2248} \u{2212}1.414213562, x \u{2248} 1.414213562")], format: .decimal)
+    }
+
+    /// With f on the page, "f(x) = 7" asks when f is 7; a right-hand side in the parameter redefines f.
+    func testSolvingAPageFunctionForAValue() throws {
+        assertAnswers([("f(x) = 7", "x = 3"), ("f(x) + 1 = 8", "x = 3"), ("f(t) = 5", "t = 2")],
+                      context: ["f(x) = 2x + 1"])
+        assertAnswers([("f(x) = 2x + 1\nf(x) = 7", "x = 3")])
+        let redefined = try answer("f(x) = x^3", context: ["f(x) = 2x + 1"])
+        XCTAssertEqual(redefined.kind, "definition")
+        XCTAssertEqual(try answer("f(2) =", context: ["f(x) = 2x + 1", "f(x) = 7", "f(x) = x^3"]).answer, "8",
+                       "an equation line on the page doesn't redefine f; a later definition does")
+    }
+
+    /// Repeated roots, exactly (the square-free part and fraction roots come out before anything numeric) and
+    /// numerically (a Durand–Kerner cluster merged into one root).
+    func testRepeatedRoots() {
+        assertAnswers([
+            ("(x-1)^3 = 0", "x = 1"),
+            ("x^3 - 3x^2 + 3x - 1 = 0", "x = 1"),
+            ("x^3 + 3x^2 + 3x + 1 = 0", "x = \u{2212}1"),
+            ("(x-2)^4 = 0", "x = 2"),
+            ("x^4 - 4x^3 + 6x^2 - 4x + 1 = 0", "x = 1"),
+            ("(x - 1/3)^3 = 0", "x = 1/3"),
+            ("(2x - 1)^3 = 0", "x = 1/2"),
+            ("(x^2+1)^2 = 0", "x = \u{00B1}i"),
+            ("(3x + 2)^2 (x - 5) = 0", "x = \u{2212}2/3, x = 5"),
+            ("x^3 - x^2 - 2x + 2 = 0", "x = \u{2212}\u{221A}2, x = 1, x = \u{221A}2"),
+            ("(x-1)^2 (x^2 - 2) = 0", "x = \u{2212}\u{221A}2, x = 1, x = \u{221A}2"),
+            ("(x - 1)^5 = 0", "x = 1"),
+            ("(x-\u{03C0})^3 = 0", "x \u{2248} 3.141592654"),
+            ("(x-\u{03C0})^4 = 0", "x \u{2248} 3.141592654"),
+            ("(x-\u{221A}2)^3 (x+1) = 0", "x \u{2248} \u{2212}1, x \u{2248} 1.414213562"),
+            ("(x^2+\u{03C0})^2 = 0", "x \u{2248} 1.772453851i, x \u{2248} \u{2212}1.772453851i"),
+            ("(x - \u{03C0})(x - \u{03C0} - 0.00001)(x + 5) = 0",
+             "x \u{2248} \u{2212}5, x \u{2248} 3.141592654, x \u{2248} 3.141602654"),
+        ])
+        XCTAssertEqual(try answer("(x-1)^3 = 0").solutions?.count, 1)
+        XCTAssertTrue(try answer("(x-1)^3 = 0").exact)
+    }
+
+    /// Coefficients far apart in size are scaled before the numeric methods.
+    func testExtremeCoefficients() throws {
+        assertAnswers([
+            ("x^2 + 10^200 x + 1 = 0", "x \u{2248} \u{2212}1 \u{00D7} 10^200, x \u{2248} \u{2212}1 \u{00D7} 10^-200"),
+            ("10^308 x^2 + 10^308 x = 10^308", "x \u{2248} \u{2212}1.618033989, x \u{2248} 0.6180339887"),
+            ("x^3 + 10^200 x - 1 = 0", "x \u{2248} 1 \u{00D7} 10^-200"),
+            ("10^300 x^3 + x - 1 = 0", "x \u{2248} 1 \u{00D7} 10^-100"),
+        ])
+        XCTAssertEqual(try answer("x^3 + 10^200 x - 1 = 0").solutions?.count, 3, "and the complex pair near ±10^100 i")
     }
 
     func testEquationSolutionsCarryValues() throws {
@@ -184,6 +232,13 @@ final class MathEngineTests: XCTestCase {
             ("a = 3\n2x + a = 7", "x = 2"),
             ("x + y = 2\n2x + 2y = 4", "Infinitely many solutions"),
             ("x + y = 2\nx + y = 3", "No solution"),
+            // "Latest wins" is for page values: a name given two values that use unknowns is two equations.
+            ("y = 2x + 1; y = 3 - x", "x = 2/3, y = 7/3"),
+            ("\\begin{cases} y = 2x + 1 \\\\ y = 3 - x \\end{cases}", "x = 2/3, y = 7/3"),
+            ("y = 2x + 1\ny = 5", "x = 2, y = 5"),
+            // Definitions that lead back to each other are equations too.
+            ("y = 2x + 1\nx = 1 - y", "x = 0, y = 1"),
+            ("a = 2\na = 5\nx + a = 7", "x = 2"),
         ])
         assertAnswers([("x + y = 3\nx - y = 1", "x = 2, y = 1")], format: .decimal)
     }
@@ -240,6 +295,112 @@ final class MathEngineTests: XCTestCase {
         XCTAssertTrue(try answer("\\sum_{i=1}^{10} i =").exact)
     }
 
+    /// Ridders' extrapolation: steps sized to x (never across a singularity or out of the domain), digits the error
+    /// supports, and fractions within the error.
+    func testNumericDerivatives() {
+        assertAnswers([
+            ("d/dx(1/x)|_{x=0.001} =", "\u{2212}1000000"),
+            ("diff(ln(x), x, 0.001) =", "1000"),
+            ("d/dx(sqrt(x))|_{x=0.0001} =", "50"),
+            ("\\frac{d^3}{dx^3}(x^4)|_{x=1} =", "24"),
+            ("\\frac{d^4}{dx^4}(x^4)|_{x=1} =", "24"),
+            ("f(x) = 1/x\nf'(0.01) =", "\u{2212}10000"),
+            ("diff(sin(x), x, 1000) =", "0.5623790763"),
+            ("\\frac{d^2}{dx^2}(x^2 + x)|_{x=0} =", "2"),
+            ("diff(e^x, x, 0) =", "1"),
+        ])
+        assertError("d/dx(sqrt(x))|_{x=0} =", .invalidParams)   // the slope is infinite there
+        assertError("diff(ln(x), x, -1) =", .invalidParams)
+    }
+
+    /// ∫∫: each integral takes its own differential, innermost first.
+    func testNestedIntegrals() {
+        assertAnswers([
+            ("\u{222B}_0^1 \u{222B}_0^1 x y dy dx =", "0.25"),
+            ("\\int_0^1\\int_0^2 xy\\,dx\\,dy =", "1"),
+            ("\\int_0^1 \\int_0^1 \\int_0^1 x y z \\, dx \\, dy \\, dz =", "0.125"),
+        ])
+    }
+
+    func testScientificNotation() {
+        assertAnswers([
+            ("1e5 =", "100000"),
+            ("1.5e-3 =", "0.0015"),
+            ("1E3 + 1 =", "1001"),
+            ("[[1e0, 2e1]] =", "[[1, 20]]"),
+            ("diff(x^2, x, 1e3) =", "2000"),
+            ("2e =", "5.436563657"),     // 2·e: no digit after the e
+            ("2e^2 =", "14.7781122"),
+            ("2e\u{2212}1 =", "4.436563657"),   // a typeset minus is subtraction: 2e − 1
+        ])
+    }
+
+    // MARK: Limits: long input throws, never crashes
+
+    /// Every pass over a tree recurses: depth is capped when parsing, evaluation runs on an 8 MB stack, and all of
+    /// it holds when the caller is on a 512 KB thread (a dispatch or cooperative-pool thread).
+    func testDeepInputThrowsInsteadOfOverflowingTheStack() {
+        let sources = [
+            Array(repeating: "1", count: 5000).joined(separator: "+") + " =",
+            String(repeating: "(", count: 1000) + "1" + String(repeating: ")", count: 1000) + " =",
+            String(repeating: "[", count: 1000) + "1" + String(repeating: "]", count: 1000) + " =",
+            String(repeating: "-", count: 3000) + "1 =",
+            Array(repeating: "x", count: 600).joined(separator: "+") + " = 1",
+            Array(repeating: "2", count: 3000).joined(separator: "^") + " =",
+            String(repeating: "sin ", count: 2000) + "1 =",
+        ]
+        final class Outcomes: @unchecked Sendable {
+            var codes: [String] = []
+        }
+        let outcomes = Outcomes()
+        let done = expectation(description: "evaluated on a small stack")
+        let thread = Thread {
+            for source in sources {
+                do {
+                    _ = try MathEngine().evaluate(source)
+                    outcomes.codes.append("answered")
+                } catch let error as NibError {
+                    outcomes.codes.append(error.code.rawValue)
+                } catch {
+                    outcomes.codes.append("\(error)")
+                }
+            }
+            done.fulfill()
+        }
+        thread.stackSize = 512 << 10
+        thread.start()
+        wait(for: [done], timeout: 60)
+        XCTAssertEqual(outcomes.codes, Array(repeating: NibError.Code.unsupported.rawValue, count: sources.count))
+
+        XCTAssertThrowsError(try answer("f(x) = f(x - 1) + 1\nf(3) =")) { error in
+            XCTAssertEqual((error as? NibError)?.message, "f calls itself too deeply")
+        }
+        let chain = (1..<400).map { "a_\($0) = a_\($0 - 1) + 1" } + ["a_0 = 1"]
+        assertError("a_399 =", .invalidParams, context: chain)
+        XCTAssertEqual(try answer(Array(repeating: "1", count: 140).joined(separator: "+") + " =").answer, "140")
+    }
+
+    /// Expanding an equation is bounded (terms per product, degree), and so is matrix work.
+    func testLargeWorkIsRefusedQuickly() {
+        let start = Date()
+        assertError("(a+b+c+d+f+g+h+k+m+n)^24 = 1", .unsupported)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1.0 * 4)
+        assertError("(x+1)^100 = 0", .unsupported)
+        assertAnswers([("(x+1)^64 = 0", "x = \u{2212}1")])
+        // About 10¹¹ scalar operations if it ran: matrix products are charged to the step budget.
+        let cycle = (0..<30).map { i in "[" + (0..<30).map { $0 == (i + 1) % 30 ? "1" : "0" }.joined(separator: ",") + "]" }
+        assertError("P = [" + cycle.joined(separator: ",") + "]\nsum(P^10000, i, 1, 99999) =", .unsupported)
+    }
+
+    func testCancellationStopsTheWork() {
+        let cancellation = MathCancellation()
+        cancellation.cancel()
+        XCTAssertThrowsError(try MathEngine().evaluate("sum(i^2, i, 1, 99999) =", cancellation: cancellation)) { error in
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertEqual(try MathEngine().evaluate("sum(i, i, 1, 100) =", cancellation: MathCancellation()).answer, "5050")
+    }
+
     // MARK: Limits (S-024)
 
     func testUnsupportedInputPointsToAISolve() {
@@ -272,6 +433,25 @@ final class MathEngineTests: XCTestCase {
         XCTAssertNil(root(-1), "undefined points are gaps, not errors")
         XCTAssertEqual(try XCTUnwrap(root(9)), 3, accuracy: 1e-12)
         XCTAssertThrowsError(try MathEngine().function("x^2 + y^2 = 1"))
+        XCTAssertNil(try MathEngine(context: ["f(x) = f(x - 1) + 1"]).function("f(x)")(1), "endless recursion is a gap")
+
+        // Graphs may sample several curves at once: every call has its own evaluator.
+        let parabola = try MathEngine(context: ["k = 3"]).function("y = k x^2 + x")
+        final class Tally: @unchecked Sendable {
+            private let lock = NSLock()
+            private(set) var wrong = 0
+            func record(_ ok: Bool) {
+                lock.lock()
+                if !ok { wrong += 1 }
+                lock.unlock()
+            }
+        }
+        let tally = Tally()
+        DispatchQueue.concurrentPerform(iterations: 2000) { i in
+            let x = Double(i % 50) / 7
+            tally.record(abs((parabola(x) ?? .nan) - (3 * x * x + x)) < 1e-9)
+        }
+        XCTAssertEqual(tally.wrong, 0)
     }
 
     // MARK: Building blocks

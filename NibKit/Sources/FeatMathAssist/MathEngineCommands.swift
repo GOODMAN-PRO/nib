@@ -58,7 +58,9 @@ enum MathStatementRole {
     case function(String, [String], MathNode)
     case equation(MathNode, MathNode)
 
-    init(_ statement: MathStatement) {
+    /// `definitions` are the page's so far: with f already defined, "f(x) = 7" asks when f is 7 (an equation),
+    /// while "f(x) = x^3", whose right-hand side uses the parameter, redefines f.
+    init(_ statement: MathStatement, definitions: MathDefinitions = MathDefinitions()) {
         guard let rhs = statement.rhs else {
             self = .question(statement.lhs)
             return
@@ -68,7 +70,8 @@ enum MathStatementRole {
                 self = .variable(name, rhs)
                 return
             }
-            if case .call(let name, let args, 0) = statement.lhs, let parameters = MathStatementRole.parameters(args) {
+            if case .call(let name, let args, 0) = statement.lhs, let parameters = MathStatementRole.parameters(args),
+               definitions.functions[name] == nil || parameters.contains(where: rhs.mentions) {
                 self = .function(name, parameters, rhs)
                 return
             }
@@ -97,19 +100,28 @@ struct MathEngine {
     }
 
     /// A page's context: the definitions among `lines`, in page order, later ones winning. Other lines (questions,
-    /// equations) and lines that don't parse are skipped, as a page is full of those.
+    /// equations) and lines that don't parse are skipped, as a page is full of those. Parsed on `MathStack`.
     init(context lines: [String]) {
-        definitions = MathDefinitions()
-        for line in lines {
-            guard let statements = try? MathParser.statements(line) else { continue }
-            for statement in statements { define(statement) }
+        let parsed = try? MathStack.run { () -> MathDefinitions in
+            var page = MathEngine()
+            for line in lines {
+                guard let statements = try? MathParser.statements(line) else { continue }
+                for statement in statements { page.define(statement) }
+            }
+            return page.definitions
         }
+        definitions = parsed ?? MathDefinitions()
     }
 
     /// Records a definition (replacing an earlier one of the same name); false when the statement isn't one.
     @discardableResult
     mutating func define(_ statement: MathStatement) -> Bool {
-        switch MathStatementRole(statement) {
+        define(MathStatementRole(statement, definitions: definitions))
+    }
+
+    @discardableResult
+    private mutating func define(_ role: MathStatementRole) -> Bool {
+        switch role {
         case .variable(let name, let value):
             definitions.variables[name] = value
             definitions.functions[name] = nil
@@ -124,7 +136,17 @@ struct MathEngine {
 
     /// `variables` of math.evaluate: name → number, expression text or matrix rows ({"a": 2, "f(x)": "x^2",
     /// "A": [[1, 2], [3, 4]]}). Keys are taken in sorted order, so the result never depends on JSON key order.
+    /// Parsed on `MathStack`.
     mutating func define(variables: [String: JSONValue]) throws {
+        let start = self
+        definitions = try MathStack.run { () -> MathDefinitions in
+            var page = start
+            try page.defineHere(variables: variables)
+            return page.definitions
+        }
+    }
+
+    private mutating func defineHere(variables: [String: JSONValue]) throws {
         for name in variables.keys.sorted() {
             guard let value = variables[name] else { continue }
             do {
@@ -179,12 +201,23 @@ struct MathEngine {
 
     /// Works out `source`: one line or several (line breaks, ';', LaTeX '\\', cases). When the last line is an
     /// expression ("… =" or no '=' at all), the lines before it must be definitions. Otherwise the lines are
-    /// definitions and equations: the equations are solved together for their unknowns.
-    func evaluate(_ source: String, format: MathAnswerFormat = .auto) throws -> MathAnswer {
+    /// definitions and equations: the equations are solved together for their unknowns. Runs on an 8 MB stack
+    /// (`MathStack`, blocking the caller); `cancellation` stops it early with a CancellationError.
+    func evaluate(_ source: String, format: MathAnswerFormat = .auto,
+                  cancellation: MathCancellation? = nil) throws -> MathAnswer {
+        let engine = self
+        return try MathStack.run { try engine.work(source, format: format, cancellation: cancellation) }
+    }
+
+    /// Decimals (0.5, 1.5e-3) in the input: `auto` answers in decimals.
+    static func hasDecimals(_ source: String) -> Bool {
+        source.range(of: "\\.[0-9]|[0-9][eE][-+]?[0-9]", options: .regularExpression) != nil
+    }
+
+    private func work(_ source: String, format: MathAnswerFormat, cancellation: MathCancellation?) throws -> MathAnswer {
         let statements = try MathParser.statements(source)
         guard let last = statements.last else { throw MathFailure.syntax("There's nothing to work out") }
-        let style = MathStyle(format: format,
-                              preferDecimal: source.range(of: "\\.[0-9]", options: .regularExpression) != nil)
+        let style = MathStyle(format: format, preferDecimal: MathEngine.hasDecimals(source))
         var page = self
         if case .question(let node) = MathStatementRole(last) {
             for index in 0..<(statements.count - 1) {
@@ -192,53 +225,92 @@ struct MathEngine {
                     throw MathFailure.syntax("Line \(index + 1) isn't a definition: only lines like 'a = 2' or 'f(x) = x^2' can come before the one to work out")
                 }
             }
-            return try page.answer(question: node, plusMinusCount: last.plusMinusCount, style: style)
+            return try page.answer(question: node, plusMinusCount: last.plusMinusCount, style: style,
+                                   cancellation: cancellation)
         }
 
+        // Every line is a definition or an equation. Functions are defined as they come; variables are gathered
+        // first, as "the latest definition wins" is for page values, not for the equations of one system.
         var equations: [MathEquation] = []
-        var latest: [String: Int] = [:]
+        var assignments: [String: [(index: Int, value: MathNode)]] = [:]
+        var lastRole = MathStatementRole(last)
         for (index, statement) in statements.enumerated() {
-            switch MathStatementRole(statement) {
+            let role = MathStatementRole(statement, definitions: page.definitions)
+            lastRole = role
+            switch role {
             case .question:
                 throw MathFailure.syntax("Only the last line can be an expression to work out (line \(index + 1) has no '=')")
-            case .variable(let name, _):
-                page.define(statement)
-                latest[name] = index
+            case .variable(let name, let value):
+                assignments[name, default: []].append((index, value))
             case .function:
-                page.define(statement)
+                page.define(role)
             case .equation(let lhs, let rhs):
                 equations.append(MathEquation(lhs: lhs, rhs: rhs, plusMinusCount: statement.plusMinusCount))
             }
         }
-        // A definition that needs an unknown (x = 2y next to x + y = 3) is one of the equations after all.
-        var demoted: [String] = []
+        // A name given several values keeps the latest only when every value is a plain value given the other lines
+        // (a = 2, a = 5). Otherwise each is an equation: y = 2x + 1 and y = 3 − x meet at x = 2/3.
+        var repeatedAsEquations = Set<String>()
         var changed = true
         while changed {
             changed = false
-            for (name, _) in latest.sorted(by: { $0.value < $1.value }) {
-                guard let node = page.definitions.variables[name],
-                      !page.definitions.freeNames(.variable(name)).isEmpty else { continue }
-                page.definitions.variables[name] = nil
-                equations.append(MathEquation(lhs: .variable(name), rhs: node, plusMinusCount: 0))
-                demoted.append(name)
-                changed = true
+            var probe = page
+            for (name, values) in assignments where !repeatedAsEquations.contains(name) {
+                probe.definitions.variables[name] = values[values.count - 1].value
+                probe.definitions.functions[name] = nil
+            }
+            for name in assignments.keys.sorted() where !repeatedAsEquations.contains(name) {
+                guard let values = assignments[name], values.count > 1 else { continue }
+                var others = probe
+                others.definitions.variables[name] = nil
+                if values.contains(where: { !others.definitions.freeNames($0.value).isEmpty }) {
+                    repeatedAsEquations.insert(name)
+                    changed = true
+                }
             }
         }
-        if equations.isEmpty { return try page.answerDefinition(last, style: style) }
+        var latest: [String: Int] = [:]
+        for name in assignments.keys.sorted() {
+            guard let values = assignments[name], let newest = values.last else { continue }
+            if repeatedAsEquations.contains(name) {
+                for v in values { equations.append(MathEquation(lhs: .variable(name), rhs: v.value, plusMinusCount: 0)) }
+            } else {
+                page.definitions.variables[name] = newest.value
+                page.definitions.functions[name] = nil
+                latest[name] = newest.index
+            }
+        }
+        // A definition that needs an unknown (x = 2y next to x + y = 3), or that leads back to itself (y = 2x + 1
+        // next to x = 1 − y), is one of the equations after all.
+        var demoted: [String] = []
+        let defined = latest.sorted(by: { $0.value < $1.value }).map { $0.key }
+        let unresolved = page.definitions.unresolvedVariables(among: defined)
+        for name in defined where unresolved.contains(name) {
+            guard let node = page.definitions.variables[name] else { continue }
+            equations.append(MathEquation(lhs: .variable(name), rhs: node, plusMinusCount: 0))
+            demoted.append(name)
+        }
+        for name in demoted { page.definitions.variables[name] = nil }
+        if equations.isEmpty { return try page.answerDefinition(lastRole, style: style, cancellation: cancellation) }
         if equations.count == 1, let name = demoted.first {
             // "y = 2x + 1" on its own defines y; it isn't an equation to solve.
             let others = page.definitions.freeNames(equations[0].rhs).subtracting([name]).sorted()
             return MathAnswer(kind: "definition", answer: name, latex: MathFormatter.latexName(name), exact: true,
                               message: "Defines \(name) in terms of \(others.joined(separator: ", "))")
         }
-        let outcome = try EquationSolver.solve(equations, definitions: page.definitions)
+        let outcome = try EquationSolver.solve(equations, definitions: page.definitions, cancellation: cancellation)
         return MathFormatter.answer(outcome, style: style)
     }
 
+    /// Nested evaluation allowed in graph samples, which run on the caller's thread (possibly a 512 KB one): an
+    /// unoptimised build spends about 3.5 KB of stack per level, so 80 levels stay under 300 KB.
+    static let samplerNestingLimit = 80
+
     /// y = f(x) as a function of x for graphs: "x^2", "y = x^2" or "f(x) = x^2", with the page's definitions. Returns
-    /// nil where the function is undefined (√x for x < 0, 1/x at 0).
+    /// nil where the function is undefined (√x for x < 0, 1/x at 0). The closure may be called from any thread,
+    /// several at once: each call works with its own evaluator.
     func function(_ source: String, of variable: String = "x") throws -> (Double) -> Double? {
-        let statements = try MathParser.statements(source)
+        let statements = try MathStack.run { try MathParser.statements(source) }
         guard statements.count == 1, let statement = statements.first else {
             throw MathFailure.syntax("Graph one expression per line, like y = x^2")
         }
@@ -256,15 +328,17 @@ struct MathEngine {
         } else {
             body = statement.lhs
         }
-        let evaluator = MathEvaluator(definitions: definitions)
+        let definitions = self.definitions
         return { x in
+            let evaluator = MathEvaluator(definitions: definitions, nestingLimit: MathEngine.samplerNestingLimit)
             guard let y = try? evaluator.sample(body, variable: variable, at: x), y.isFinite else { return nil }
             return y
         }
     }
 
-    private func answer(question node: MathNode, plusMinusCount: Int, style: MathStyle) throws -> MathAnswer {
-        let evaluator = MathEvaluator(definitions: definitions)
+    private func answer(question node: MathNode, plusMinusCount: Int, style: MathStyle,
+                        cancellation: MathCancellation?) throws -> MathAnswer {
+        let evaluator = MathEvaluator(definitions: definitions, cancellation: cancellation)
         var values: [MathValue] = []
         for signs in try EquationSolver.signCombinations(plusMinusCount) {
             let v = try evaluator.evaluate(node, signs: signs)
@@ -273,10 +347,11 @@ struct MathEngine {
         return MathFormatter.answer(values: values, style: style, approximate: evaluator.approximate)
     }
 
-    private func answerDefinition(_ statement: MathStatement, style: MathStyle) throws -> MathAnswer {
-        switch MathStatementRole(statement) {
+    private func answerDefinition(_ role: MathStatementRole, style: MathStyle,
+                                  cancellation: MathCancellation?) throws -> MathAnswer {
+        switch role {
         case .variable(let name, _):
-            let evaluator = MathEvaluator(definitions: definitions)
+            let evaluator = MathEvaluator(definitions: definitions, cancellation: cancellation)
             let value = try evaluator.evaluate(.variable(name))
             var answer = MathFormatter.answer(values: [value], style: style, approximate: evaluator.approximate)
             answer.kind = "definition"
@@ -291,6 +366,61 @@ struct MathEngine {
         case .question, .equation:
             throw MathFailure.syntax("There's nothing to work out")
         }
+    }
+}
+
+// MARK: - Stack
+
+/// Runs the engine on a thread with an 8 MB stack. Every pass over a syntax tree recurses (parser, evaluator, the
+/// equation reader); their limits (`MathParser.maxDepth`, `MathEvaluator.maxNesting`, the reader's) are sized for
+/// this stack, not for the 512 KB of a dispatch or cooperative-pool thread.
+enum MathStack {
+    static let size = 8 << 20
+    private static let marker = "nib.mathassist.largeStack"
+
+    /// True on a thread this type started.
+    static var isCurrent: Bool { Thread.current.threadDictionary[marker] != nil }
+
+    /// Blocks the calling thread until `work` has run on a large stack; runs it in place when already on one.
+    static func run<T>(_ work: @escaping () throws -> T) throws -> T {
+        if isCurrent { return try work() }
+        let box = ResultBox<T>()
+        let done = DispatchSemaphore(value: 0)
+        start(qualityOfService: Thread.current.qualityOfService) {
+            box.result = Result { try work() }
+            done.signal()
+        }
+        done.wait()
+        guard let result = box.result else { throw NibError(.internalError, "The maths engine stopped unexpectedly") }
+        return try result.get()
+    }
+
+    /// Suspends the caller (freeing its actor, e.g. the main actor) while `work` runs on a large stack.
+    static func perform<T>(_ work: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            start(qualityOfService: .userInitiated) { continuation.resume(with: Result { try work() }) }
+        }
+    }
+
+    private static func start(qualityOfService: QualityOfService, _ body: @escaping () -> Void) {
+        let job = Job(body)   // handed to exactly one thread, which runs it once
+        let thread = Thread {
+            Thread.current.threadDictionary[marker] = true
+            job.body()
+        }
+        thread.stackSize = size
+        thread.qualityOfService = qualityOfService
+        thread.name = "Nib maths engine"
+        thread.start()
+    }
+
+    private final class ResultBox<T> {
+        var result: Result<T, Error>?
+    }
+
+    private final class Job: @unchecked Sendable {
+        let body: () -> Void
+        init(_ body: @escaping () -> Void) { self.body = body }
     }
 }
 
@@ -589,6 +719,12 @@ struct MathEvaluate: NibCommand {
         examples: examples,
         effect: .read, target: .app)
 
+    /// Input sizes (characters) and counts accepted from callers; longer input is refused before it is parsed.
+    static let maxExpressionLength = 4_000
+    static let maxVariableLength = 2_000
+    static let maxVariableNameLength = 64
+    static let maxVariables = 500
+
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> MathAnswer {
         var chosen = MathAnswerFormat.auto
         if let name = p.format {
@@ -597,19 +733,42 @@ struct MathEvaluate: NibCommand {
             }
             chosen = parsed
         }
-        var engine = MathEngine()
-        try engine.define(variables: p.variables ?? [:])
-        let prepared = engine
+        guard p.expression.count <= maxExpressionLength else {
+            throw NibError(.invalidParams, "expression is too long: at most \(maxExpressionLength) characters",
+                           path: "$.expression")
+        }
+        let variables = p.variables ?? [:]
+        guard variables.count <= maxVariables else {
+            throw NibError(.invalidParams, "variables: at most \(maxVariables) definitions", path: "$.variables")
+        }
+        for (name, value) in variables {
+            guard name.count <= maxVariableNameLength else {
+                throw NibError(.invalidParams, "variables: a name is longer than \(maxVariableNameLength) characters",
+                               path: "$.variables")
+            }
+            guard value.jsonString().count <= maxVariableLength else {
+                throw NibError(.invalidParams, "variables.\(name) is too long: at most \(maxVariableLength) characters",
+                               path: "$.variables.\(name)")
+            }
+        }
         let format = chosen
         let expression = p.expression
+        let cancellation = MathCancellation()
         do {
-            // Integrals and long sums can take a moment: keep them off the main actor.
-            return try await Task.detached(priority: .userInitiated) {
-                try prepared.evaluate(expression, format: format)
-            }.value
+            // On an 8 MB stack (every pass over the tree recurses), off the main actor; cancelling the caller's task
+            // stops the work at its next budget check.
+            return try await withTaskCancellationHandler {
+                try await MathStack.perform {
+                    var engine = MathEngine()
+                    try engine.define(variables: variables)
+                    return try engine.evaluate(expression, format: format, cancellation: cancellation)
+                }
+            } onCancel: {
+                cancellation.cancel()
+            }
         } catch let error as NibError where error.code == .unsupported {
             var e = error
-            e.hint = "try AI Solve: call math.solve {latex: '\(expression.prefix(300))', mode: 'solve'}"
+            e.hint = MathFailure.aiSolveHint(for: String(expression.prefix(300)))
             throw e
         }
     }
