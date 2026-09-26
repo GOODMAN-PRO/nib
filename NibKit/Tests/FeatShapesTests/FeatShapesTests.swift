@@ -29,9 +29,40 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertNotNil(h.app.ui.canvasAttachments.get(ShapeEditOverlay.descriptorID))
         let shape = Item.makeShape(ShapeItem(shape: .ellipse, frame: Frame(x: 0, y: 0, w: 10, h: 10)))
         XCTAssertTrue(h.app.content.drawer(for: shape) is ShapeDrawer)
+        XCTAssertEqual(h.app.content.paintBounds(for: shape), shape.bounds.insetBy(-NibLimits.drawerMargin))
         let taps = h.app.content.tapHandlers.all.filter { $0.command == "shape.tapAt" }
         XCTAssertEqual(Set(taps.map(\.gesture)), [.tap, .doubleTap])
         XCTAssertTrue(taps.allSatisfy { $0.order < 400 && $0.itemKinds == [.shape] })
+    }
+
+    func testShapeLabelsPublishTheirTextLayout() throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        var s = ShapeItem(shape: .ellipse, frame: Frame(x: 100, y: 100, w: 200, h: 120, rotation: 0.3))
+        s.text = RichText(plain: "Idea")
+        let layout = try XCTUnwrap(h.app.content.textLayout(for: Item.makeShape(s)))
+        XCTAssertEqual(layout.container, ShapeGeometry.textFrame(s))
+        XCTAssertEqual(layout.container.rotation, 0.3)
+        XCTAssertTrue(layout.centredVertically)
+        XCTAssertEqual(layout.base.size, RichTextBridge.defaultFontSize)
+        XCTAssertEqual(layout.base.color, s.style.strokeColor?.withAlpha(1))
+        // An empty closed shape still takes text; a bare line does not.
+        s.text = nil
+        XCTAssertNotNil(h.app.content.textLayout(for: Item.makeShape(s)))
+        let line = ShapeItem(shape: .line, frame: Frame(x: 0, y: 0, w: 50, h: 0), points: [Point(0, 0), Point(50, 0)])
+        XCTAssertNil(h.app.content.textLayout(for: Item.makeShape(line)))
+    }
+
+    func testFrameArraysCarryTheRotation() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        let value = try await h.run("shape.create", ["page": .string(page2Ref), "shape": "rectangle",
+                                                     "frame": [40, 60, 120, 80, 0.5]])
+        guard case let .item(_, _, id)? = NodeRef(value["ref"]?.stringValue ?? "") else { return XCTFail("no ref") }
+        let s = try XCTUnwrap(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: id).shape)
+        XCTAssertEqual(s.frame, Frame(x: 40, y: 60, w: 120, h: 80, rotation: 0.5))
+        XCTAssertEqual(ShapeJSON.frame(s.frame), [40, 60, 120, 80, 0.5])
+        XCTAssertEqual(ShapeJSON.frame(Frame(x: 1, y: 2, w: 3, h: 4)), [1, 2, 3, 4])
+        await assertInvalid(h, "shape.create", ["page": .string(page2Ref), "shape": "rectangle", "frame": [0, 0, 10]])
+        await assertInvalid(h, "shape.create", ["page": .string(page2Ref), "shape": "rectangle", "frame": [0, 0, -5, 10]])
     }
 
     func testEveryKindCreatesAsTheAIAndUndoes() async throws {
@@ -157,20 +188,49 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertEqual(ShapeGeometry.cornerRadius(Point(0, 0), Point(50, 0), Point(100, 0), 6), 0)
     }
 
-    func testArrowheadsStayWithinTheDrawerMargin() {
+    func testArrowheadsStayWithinThePaintBounds() {
+        let drawer = ShapeDrawer()
         for width in [0.5, 1.5, 4, 12, 40] {
             var style = ShapeItemStyle(strokeWidth: width)
             style.arrowStart = true
             let s = ShapeItem(shape: .arrow, frame: Frame(x: 0, y: 0, w: 200, h: 0), points: [Point(0, 0), Point(200, 0)],
                               style: style)
-            let bounds = Item.makeShape(s).bounds.insetBy(-ShapeGeometry.drawerMargin - 0.001)
+            let paint = ShapeGeometry.paintBounds(s)
+            XCTAssertEqual(drawer.paintBounds(Item.makeShape(s)), paint)
+            XCTAssertTrue(paint.contains(Item.makeShape(s).bounds.insetBy(-NibLimits.drawerMargin)))
             let parts = ShapeGeometry.strokeParts(s)
             XCTAssertEqual(parts.heads.count, 2)
             for head in parts.heads {
-                for p in head.points { XCTAssertTrue(bounds.contains(p), "width \(width): \(p) outside \(bounds)") }
+                // The head's outline stroke (half of width / 2) must fit too.
+                let reach = paint.insetBy(max(width * 0.5, 0.5) / 2)
+                for p in head.points { XCTAssertTrue(reach.contains(p), "width \(width): \(p) outside \(reach)") }
+                XCTAssertGreaterThan(head.left.distance(to: head.right), width, "width \(width): head narrower than the line")
             }
             XCTAssertLessThan(Geo.pathLength(parts.polylines[0]), 200)
         }
+    }
+
+    func testOverflowingLabelsAreInsideThePaintBounds() {
+        var s = ShapeItem(shape: .rectangle, frame: Frame(x: 100, y: 100, w: 60, h: 30))
+        s.text = RichText(plain: "A long label that cannot fit inside such a small rectangle at seventeen points")
+        let box = ShapeRenderer.textBox(s.text ?? .empty, shape: s)
+        XCTAssertGreaterThan(box.h, s.frame.h + 2 * NibLimits.drawerMargin, "the label overflows the margin")
+        let paint = ShapeGeometry.paintBounds(s)
+        XCTAssertTrue(paint.contains(box.bounds))
+        XCTAssertTrue(paint.contains(Item.makeShape(s).bounds.insetBy(-NibLimits.drawerMargin)))
+        s.text = nil
+        XCTAssertEqual(ShapeGeometry.paintBounds(s), Item.makeShape(s).bounds.insetBy(-NibLimits.drawerMargin))
+    }
+
+    func testPlainRangeLeavesListMarkersOut() {
+        var text = RichText(plain: "one\ntwo")
+        for i in text.paragraphs.indices { text.paragraphs[i].list = .bullet }
+        let a = RichTextBridge.attributed(text)
+        let two = (a.string as NSString).range(of: "two")
+        XCTAssertGreaterThan(two.location, 4, "the bridge adds bullet markers before each paragraph")
+        XCTAssertEqual(ShapeTextStyle.plainRange(two, in: a), [4, 3])
+        XCTAssertEqual(ShapeTextStyle.plainRange(NSRange(location: 0, length: a.length), in: a), [0, 7])
+        XCTAssertEqual(ShapeTextStyle.plainRange(NSRange(location: 2, length: 0), in: NSAttributedString(string: "abc")), [2, 0])
     }
 
     func testStylePatchParsesNoneAndNullAndRejectsUnknownFields() throws {
@@ -256,12 +316,16 @@ final class FeatShapesTests: XCTestCase {
         h.app.settings.set(ShapeSettings.fill, "#2156D9")
         let host = FakeCanvasHost(h)
         let tool = ShapeTool()
+        h.session.selectTool("pen")
+        h.session.selectTool(ShapeTool.toolID)
         tool.activate(host)
         tool.tap(CanvasSample(page: Fixtures.page2, location: Point(300, 400)), host: host)
         await tool.pendingCreate?.value
         var items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
         XCTAssertEqual(items.count, 1)
         XCTAssertEqual(items.first?.shape?.frame.center, Point(300, 400))
+        XCTAssertEqual(host.renderWaits, [Fixtures.page2], "the preview waits for the tiles")
+        XCTAssertEqual(h.session.tool, "pen", "non-sticky: one shape, then back to the previous tool")
 
         tool.touchesBegan(CanvasSample(page: Fixtures.page2, location: Point(100, 100)), host: host)
         tool.touchesMoved([CanvasSample(page: Fixtures.page2, location: Point(220, 180))], host: host)
@@ -334,6 +398,16 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertEqual(try shape(h, Fixtures.shapeID).style.cornerRadius, 42, accuracy: 0.5)
         XCTAssertNil(host.hidden[Fixtures.page1])
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+
+        // A tap on a knob is not a reshape: it passes on to the tap handlers (shape.tapAt types into the shape).
+        let moved = try XCTUnwrap(overlay.knobs.first)
+        XCTAssertTrue(overlay.hitTest(host.viewPoint(moved.point, page: Fixtures.page1), host: host))
+        let tapSample = CanvasSample(page: Fixtures.page1, location: moved.point)
+        overlay.touchesBegan(tapSample, host: host)
+        overlay.touchesEnded(tapSample, host: host)
+        XCTAssertFalse(overlay.gesture(.tap, at: tapSample, host: host))
+        XCTAssertNil(host.hidden[Fixtures.page1])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
         overlay.detach(from: host)
     }
 
@@ -351,12 +425,26 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertEqual(r["handled"], .bool(true))
         let editor = try XCTUnwrap(overlay.text)
         XCTAssertTrue(h.session.isEditingText)
+        XCTAssertEqual(h.session.editingTextRef, shapeRef)
         XCTAssertEqual(host.hidden[Fixtures.page1], [Fixtures.shapeID])
         editor.textView.attributedText = NSAttributedString(string: "Plan B", attributes: editor.textView.typingAttributes)
+        editor.textView.selectedRange = NSRange(location: 5, length: 1)
+        overlay.textViewDidChangeSelection(editor.textView)
+        XCTAssertEqual(h.session.editingTextRange, [5, 1])
+        // A tap inside the text while editing belongs to the editor, never to the tap handlers.
+        let inside = editor.textView.convert(CGPoint(x: editor.textView.bounds.midX, y: editor.textView.bounds.midY),
+                                             to: host.canvasView)
+        let sample = CanvasSample(page: Fixtures.page1, location: Point(180, 245))
+        XCTAssertTrue(overlay.hitTest(inside, host: host))
+        overlay.touchesEnded(sample, host: host)
+        XCTAssertTrue(overlay.gesture(.tap, at: sample, host: host))
+        XCTAssertNotNil(overlay.text)
         overlay.endTextEditing(commit: true)
         await overlay.pendingFlush?.value
         XCTAssertEqual(try shape(h, Fixtures.shapeID).text?.plainText, "Plan B")
         XCTAssertFalse(h.session.isEditingText)
+        XCTAssertNil(h.session.editingTextRef)
+        XCTAssertNil(h.session.editingTextRange)
         h.app.bus.undo(Fixtures.docID)
         XCTAssertNil(try shape(h, Fixtures.shapeID).text)
         overlay.detach(from: host)

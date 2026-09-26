@@ -131,13 +131,11 @@ enum ShapeToolStyle {
 // MARK: - Canvas maths
 
 enum CanvasMath {
-    /// Page points → canvas-view points for one page (from three `viewPoint` probes, so any canvas layout works).
+    /// Page points → canvas-view points for one page (`CanvasHost.pageTransform`; identity while the page is not laid
+    /// out, which callers rule out first).
     @MainActor
     static func pageToView(_ host: CanvasHost, page: PageID) -> CGAffineTransform {
-        let o = host.viewPoint(.zero, page: page)
-        let x = host.viewPoint(Point(1, 0), page: page)
-        let y = host.viewPoint(Point(0, 1), page: page)
-        return CGAffineTransform(a: x.x - o.x, b: x.y - o.y, c: y.x - o.x, d: y.y - o.y, tx: o.x, ty: o.y)
+        host.pageTransform(page) ?? .identity
     }
 
     static func viewScale(_ t: CGAffineTransform) -> CGFloat { max(hypot(t.a, t.b), 0.0001) }
@@ -146,8 +144,7 @@ enum CanvasMath {
     @MainActor
     static func point(_ sample: CanvasSample, on page: PageID, host: CanvasHost) -> Point {
         guard sample.page != page else { return sample.location }
-        let v = host.viewPoint(sample.location, page: sample.page)
-        return Point(v.applying(pageToView(host, page: page).inverted()))
+        return host.convert(sample.location, from: sample.page, to: page) ?? sample.location
     }
 }
 
@@ -302,15 +299,30 @@ final class ShapeTool: CanvasTool {
                            fromCentre: d.modifiers.contains(.option), style: ShapeToolStyle.current(host.app, entry: entry))
     }
 
-    /// Creates the shape through `shape.create`, then selects it; the preview stays until the tiles have it.
+    /// Creates the shape through `shape.create`, then selects it. The preview stays until the tiles have the shape
+    /// (`afterNextRender`); then the tool has finished one use and, being non-sticky, hands back to the previous tool
+    /// (`finishToolUse`).
     private func commit(_ s: ShapeItem, page: PageID, host: CanvasHost) {
         let app = host.app, session = host.session
         let params = ShapeJSON.createParams(s, page: NodeRef.page(host.documentID, page).description)
-        pendingCreate = Task { @MainActor [weak self] in
-            defer { self?.preview.clear() }
+        pendingCreate = Task { @MainActor [weak self, weak host] in
             guard let value = await ShapesUI.run(app, CommandIDs.shapeCreate, params, session: session),
-                  let ref = value["ref"]?.stringValue, ShapesUI.has(app, CommandIDs.selectionSet) else { return }
-            await ShapesUI.run(app, CommandIDs.selectionSet, ["refs": [.string(ref)]], session: session)
+                  let ref = value["ref"]?.stringValue else {
+                self?.preview.clear()
+                return
+            }
+            if ShapesUI.has(app, CommandIDs.selectionSet) {
+                await ShapesUI.run(app, CommandIDs.selectionSet, ["refs": [.string(ref)]], session: session)
+            }
+            guard let host else {
+                self?.preview.clear()
+                return
+            }
+            host.afterNextRender(page: page) { [weak self, weak host] in
+                guard let self else { return }
+                self.preview.clear()
+                if let host, host.session.tool == self.id { host.finishToolUse(self) }
+            }
         }
     }
 

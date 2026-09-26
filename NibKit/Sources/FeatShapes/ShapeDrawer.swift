@@ -11,15 +11,14 @@ import NibContracts
 ///
 /// Box kinds (rectangle, rounded rectangle, ellipse, triangle, diamond) are defined by `frame` alone, rotated about its
 /// centre. Point kinds keep their page-space `points` plus a `frame` fitted around them in the frame's own rotated axes,
-/// so free rotation survives every edit. Curves and arcs treat their points as control points (Bézier / conic), so the
-/// drawn outline never leaves the points' bounds, which is what `Item.bounds` (and so tile culling) uses.
+/// so free rotation survives every edit. Curves and arcs follow the pinned `ShapeItem.points` rule (control points:
+/// `.curve` 2 straight, 3 quadratic, 4 cubic, 5+ clamped B-spline; `.arc` [start, control, end] as a conic), so the
+/// drawn outline never leaves the points' bounds, which is what `Item.bounds` uses. Arrowheads, the ink look and
+/// overflowing text can reach further: `paintBounds` covers them (the drawer's `ItemDrawer.paintBounds`).
 enum ShapeGeometry {
     static let boxKinds: Set<ShapeKind> = [.rectangle, .roundedRectangle, .ellipse, .triangle, .diamond]
     static let openKinds: Set<ShapeKind> = [.line, .polyline, .arc, .curve, .arrow]
     static let maxPoints = 2_000
-    /// How far a drawer may paint outside `Item.bounds` (arrowheads, ink nibs, overflowing text). The renderer grants
-    /// 12 pt; this stays under it.
-    static let drawerMargin = 10.0
 
     static func isBox(_ kind: ShapeKind) -> Bool { boxKinds.contains(kind) }
     static func isOpen(_ kind: ShapeKind) -> Bool { openKinds.contains(kind) }
@@ -520,10 +519,10 @@ enum ShapeGeometry {
         return StrokeParts(body: body, polylines: [line], heads: heads)
     }
 
-    /// Head size for an outline width: at most `drawerMargin` wide on each side, and together no more than 90 % of
-    /// the line.
+    /// Head size for an outline width (about three widths across), together no more than 90 % of the line.
+    /// `paintBounds` covers the heads, so they are not limited by `NibLimits.drawerMargin`.
     static func headSize(width w: Double, length total: Double, count: Int) -> (length: Double, halfWidth: Double) {
-        var half = min(drawerMargin, max(3, 1.6 * w + 1.5))
+        var half = max(3, 1.6 * w + 1.5)
         var length = half * 2.2
         let limit = total * 0.45 / Double(max(count, 1))
         if length > limit, length > 0 {
@@ -672,9 +671,26 @@ enum ShapeGeometry {
         return Frame(x: c.x - w / 2, y: c.y - h / 2, w: w, h: h, rotation: f.rotation)
     }
 
-    /// Everything the drawer may paint: `Item.bounds` plus the drawer margin.
-    static func drawBounds(_ s: ShapeItem) -> Rect {
-        Item.makeShape(s).bounds.insetBy(-drawerMargin)
+    /// How far the outline can paint past `Item.bounds` (which already holds half the outline width): the ink look's
+    /// wider nib, and arrowheads wider than the line.
+    static func overhang(_ s: ShapeItem) -> Double {
+        let w = s.style.strokeWidth
+        var reach = s.style.drawnWith == nil ? 0 : w / 2 + 1
+        if wantsEndHead(s) || wantsStartHead(s) {
+            reach = max(reach, headSize(width: w, length: .infinity, count: 1).halfWidth + w / 2)
+        }
+        return reach
+    }
+
+    /// Everything the drawer paints (page coordinates): `Item.bounds` grown by `NibLimits.drawerMargin` or the
+    /// outline's overhang, whichever is more, plus text that overflows the shape. The drawer clips to it and publishes
+    /// it as `ItemDrawer.paintBounds`, so tile culling and invalidation cover exactly what is drawn.
+    static func paintBounds(_ s: ShapeItem) -> Rect {
+        var r = Item.makeShape(s).bounds.insetBy(-max(NibLimits.drawerMargin, overhang(s)))
+        if let text = s.text, !text.isEmpty {
+            r = r.union(ShapeRenderer.textBox(text, shape: s).bounds.insetBy(-2))
+        }
+        return r
     }
 }
 
@@ -703,6 +719,31 @@ enum ShapeTextStyle {
 
     static func base(_ s: ShapeItem, darkPaper: Bool, scale: Double) -> TextAttributes {
         TextAttributes(size: baseSize * scale, color: baseColour(s, darkPaper: darkPaper))
+    }
+
+    /// The "shape" `TextLayoutDescriptor`: labels lay out in `ShapeGeometry.textFrame`, centred vertically, 17 pt in
+    /// the outline colour (TextKit with no line fragment padding or inset, like the drawer and the editor). Closed
+    /// shapes always have one (they take text); open ones only while they carry text.
+    static func layout(_ item: Item) -> TextLayoutInfo? {
+        guard let s = item.shape, !ShapeGeometry.isOpen(s.shape) || !(s.text?.isEmpty ?? true) else { return nil }
+        return TextLayoutInfo(container: ShapeGeometry.textFrame(s), base: base(s, darkPaper: false, scale: 1),
+                              centredVertically: true)
+    }
+
+    /// A text view selection as `EditorSession.editingTextRange`: [start, length] in plain-text UTF-16 units, with the
+    /// generated list markers left out.
+    static func plainRange(_ r: NSRange, in a: NSAttributedString) -> [Int] {
+        guard r.location != NSNotFound else { return [0, 0] }
+        let end = min(r.location + r.length, a.length)
+        let start = min(r.location, end)
+        var before = 0, inside = 0
+        a.enumerateAttribute(.nibListMarker, in: NSRange(location: 0, length: end)) { value, range, _ in
+            guard value != nil else { return }
+            let head = max(0, min(range.location + range.length, start) - range.location)
+            before += head
+            inside += range.length - head
+        }
+        return [start - before, end - start - inside]
     }
 
     static func scaled(_ text: RichText, by scale: Double) -> RichText {
@@ -780,7 +821,7 @@ enum ShapeRenderer {
     static func draw(_ s: ShapeItem, in cg: CGContext, scale: Double, darkPaper: Bool, drawsText: Bool = true) {
         cg.saveGState()
         defer { cg.restoreGState() }
-        cg.clip(to: ShapeGeometry.drawBounds(s).cg)
+        cg.clip(to: ShapeGeometry.paintBounds(s).cg)
         let style = s.style
         if !ShapeGeometry.isOpen(s.shape), let fill = style.fillColor, fill.a > 0 {
             cg.addPath(ShapeGeometry.path(s))
@@ -861,20 +902,31 @@ enum ShapeRenderer {
         cg.draw(cgImage, in: CGRect(origin: .zero, size: rect.size))
     }
 
-    static func drawText(_ text: RichText, shape: ShapeItem, in cg: CGContext, darkPaper: Bool) {
+    static let textOptions: NSStringDrawingOptions = [.usesLineFragmentOrigin, .usesFontLeading]
+
+    /// Where a shape's text draws: `ShapeGeometry.textFrame`'s width, as tall as the laid-out text (so it can overflow
+    /// a small shape), centred on the text frame and rotated with it. Colours do not change the layout, so `attributed`
+    /// may be drawn on dark or light paper.
+    static func textBox(_ text: RichText, shape: ShapeItem, attributed: NSAttributedString? = nil) -> Frame {
         let tf = ShapeGeometry.textFrame(shape)
+        let a = attributed ?? ShapeTextStyle.attributed(text, shape: shape, darkPaper: false, scale: 1)
+        let measured = a.boundingRect(with: CGSize(width: CGFloat(tf.w), height: .greatestFiniteMagnitude),
+                                      options: textOptions, context: nil)
+        let h = Double(ceil(measured.height))
+        let c = tf.center
+        return Frame(x: c.x - tf.w / 2, y: c.y - h / 2, w: tf.w, h: h, rotation: tf.rotation)
+    }
+
+    static func drawText(_ text: RichText, shape: ShapeItem, in cg: CGContext, darkPaper: Bool) {
         let attributed = ShapeTextStyle.attributed(text, shape: shape, darkPaper: darkPaper, scale: 1)
-        let width = CGFloat(tf.w)
-        let options: NSStringDrawingOptions = [.usesLineFragmentOrigin, .usesFontLeading]
-        let measured = attributed.boundingRect(with: CGSize(width: width, height: .greatestFiniteMagnitude),
-                                               options: options, context: nil)
-        let height = ceil(measured.height)
+        let box = textBox(text, shape: shape, attributed: attributed)
+        let width = CGFloat(box.w), height = CGFloat(box.h)
         cg.saveGState()
         defer { cg.restoreGState() }
-        cg.translateBy(x: CGFloat(tf.center.x), y: CGFloat(tf.center.y))
-        cg.rotate(by: CGFloat(tf.rotation))
+        cg.translateBy(x: CGFloat(box.center.x), y: CGFloat(box.center.y))
+        cg.rotate(by: CGFloat(box.rotation))
         UIGraphicsPushContext(cg)
-        attributed.draw(with: CGRect(x: -width / 2, y: -height / 2, width: width, height: height), options: options,
+        attributed.draw(with: CGRect(x: -width / 2, y: -height / 2, width: width, height: height), options: textOptions,
                         context: nil)
         UIGraphicsPopContext()
     }
@@ -886,5 +938,10 @@ final class ShapeDrawer: ItemDrawer {
     func draw(_ item: Item, in context: DrawContext) {
         guard let shape = item.shape else { return }
         ShapeRenderer.draw(shape, in: context.cg, scale: context.scale, darkPaper: context.darkPaper)
+    }
+
+    /// Arrowheads, the ink look and overflowing labels, which can reach past `Item.bounds` + `NibLimits.drawerMargin`.
+    func paintBounds(_ item: Item) -> Rect? {
+        item.shape.map { ShapeGeometry.paintBounds($0) }
     }
 }

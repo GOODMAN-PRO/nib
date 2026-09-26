@@ -189,6 +189,13 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     private var drag: (index: Int, point: Point)?
     private var committing = false
     private var swallowing = false
+    /// What the last claimed touch was for. Kept until the next `hitTest`, so `gesture` answers the same whether the
+    /// canvas asks before or after `touchesEnded`.
+    private var claim: Claim = .none
+
+    private enum Claim {
+        case none, knob, text
+    }
     private(set) var text: TextSession?
     /// The last knob commit and the last text commit (tests await them).
     private(set) var pendingCommit: Task<Void, Never>?
@@ -240,12 +247,21 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
                 endTextEditing(commit: true)
             }
             swallowing = true
+            claim = .text
             return true
         }
+        claim = .none
         guard drag == nil, !committing else { return false }
         refresh()
         pendingKnob = knobIndex(at: viewPoint)
+        if pendingKnob != nil { claim = .knob }
         return pendingKnob != nil
+    }
+
+    /// A tap that ended text editing (or landed in the text) is consumed. A tap, double-tap or long-press on a knob is
+    /// not a reshape, so it passes on to the tap handlers: a tap on the selected shape types into it (`shape.tapAt`).
+    func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool {
+        claim == .text
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
@@ -470,12 +486,17 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         }
     }
 
+    /// The reshaped shape replaces the preview once the tiles have it (`afterNextRender`), so it never flickers.
     private func didCommit(page: PageID) {
-        committing = false
-        drag = nil
-        preview.clear()
-        host?.setHidden([], page: page)
-        refresh()
+        let settle: @MainActor () -> Void = { [weak self] in
+            guard let self else { return }
+            self.committing = false
+            self.drag = nil
+            self.preview.clear()
+            self.host?.setHidden([], page: page)
+            self.refresh()
+        }
+        if let host { host.afterNextRender(page: page, settle) } else { settle() }
     }
 
     // MARK: VoiceOver (every drag has an action) and pointer
@@ -575,6 +596,8 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         host.canvasView.addSubview(tv)
         host.setHidden([id], page: page)
         host.session.isEditingText = true
+        host.session.editingTextRef = Self.ref(session)
+        host.session.editingTextRange = ShapeTextStyle.plainRange(tv.selectedRange, in: attributed)
         hideKnobs()
         layoutText(session, host: host)
         tv.becomeFirstResponder()
@@ -591,14 +614,23 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         t.textView.onEscape = nil
         t.textView.isEditable = false
         t.textView.resignFirstResponder()
-        host?.session.isEditingText = false
+        if let session = host?.session {
+            session.isEditingText = false
+            if session.editingTextRef == Self.ref(t) {
+                session.editingTextRef = nil
+                session.editingTextRange = nil
+            }
+        }
         let page = t.page
         Task { @MainActor [weak self] in
             await flushed?.value
-            self?.host?.setHidden([], page: page)
-            t.textView.removeFromSuperview()
-            t.backdrop.removeFromSuperlayer()
-            self?.refresh()
+            let reveal: @MainActor () -> Void = { [weak self] in
+                self?.host?.setHidden([], page: page)
+                t.textView.removeFromSuperview()
+                t.backdrop.removeFromSuperlayer()
+                self?.refresh()
+            }
+            if let host = self?.host { host.afterNextRender(page: page, reveal) } else { reveal() }
         }
     }
 
@@ -611,7 +643,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         guard rich != t.committed else { return nil }
         t.committed = rich
         let value: JSONValue = (try? JSONValue.from(rich)) ?? .string(rich.plainText)
-        let params: JSONValue = ["ref": .string(NodeRef.item(t.doc, t.page, t.id).description), "text": value]
+        let params: JSONValue = ["ref": .string(Self.ref(t)), "text": value]
         let app = host.app, session = host.session, group = t.group
         let task = Task { @MainActor in
             _ = await ShapesUI.run(app, ShapeTapAt.textCommand, params, session: session, group: group)
@@ -620,8 +652,11 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         return task
     }
 
+    /// The item ref of the shape a text session edits (`text.setText`, `EditorSession.editingTextRef`).
+    private static func ref(_ t: TextSession) -> String { NodeRef.item(t.doc, t.page, t.id).description }
+
     private func layoutText(_ t: TextSession, host: CanvasHost) {
-        guard let item = try? host.app.workspace.item(t.doc, page: t.page, id: t.id), let shape = item.shape else { return }
+        guard let item = try? host.app.workspace.item(t.doc, page: t.page, id: t.id), var shape = item.shape else { return }
         let m = CanvasMath.pageToView(host, page: t.page)
         let tf = ShapeGeometry.textFrame(shape)
         let tv = t.textView
@@ -634,15 +669,16 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         tv.center = tf.center.cg.applying(m)
         let k = CanvasMath.viewScale(m) / CGFloat(t.scale)
         tv.transform = CGAffineTransform(rotationAngle: CGFloat(tf.rotation) + atan2(m.b, m.a)).scaledBy(x: k, y: k)
+        shape.text = nil                                    // the backdrop is the shape without its text
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        t.backdrop.frame = ShapeGeometry.drawBounds(shape).cg.applying(m)
+        t.backdrop.frame = ShapeGeometry.paintBounds(shape).cg.applying(m)
         CATransaction.commit()
     }
 
     /// The shape without its text, drawn by the shape drawer itself, shown while the item is hidden for editing.
     private func renderBackdrop(_ t: TextSession, shape: ShapeItem, host: CanvasHost) {
-        let bounds = ShapeGeometry.drawBounds(shape)
+        let bounds = ShapeGeometry.paintBounds(shape)
         guard bounds.width > 0, bounds.height > 0 else { return }
         let m = CanvasMath.pageToView(host, page: t.page)
         var pxPerPt = CanvasMath.viewScale(m) * max(host.canvasView.traitCollection.displayScale, 1)
@@ -672,6 +708,13 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
             guard !Task.isCancelled else { return }
             self?.flush(t)
         }
+    }
+
+    func textViewDidChangeSelection(_ textView: UITextView) {
+        guard let t = text, textView === t.textView, let session = host?.session,
+              session.editingTextRef == Self.ref(t) else { return }
+        let current = textView.attributedText ?? NSAttributedString()
+        session.editingTextRange = ShapeTextStyle.plainRange(textView.selectedRange, in: current)
     }
 
     func textViewDidEndEditing(_ textView: UITextView) {

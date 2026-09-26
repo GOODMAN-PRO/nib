@@ -130,8 +130,9 @@ struct ShapeStylePatch: Equatable {
 enum ShapeParse {
     static let kindSchema: JSONSchema = .str("shape type", choices: ShapeKind.allCases.map { $0.rawValue })
     static let frameSchema: JSONSchema = .arr(.num(), "[x, y, width, height] in page points; optional 5th value: rotation in radians")
-    static let pointsSchema: JSONSchema = .arr(.point, "[[x, y], …] in page points: line/arrow 2, arc 3 (start, control, end), "
-                                               + "curve 2+ Bézier control points, polyline 2+, polygon 3+")
+    static let pointsSchema: JSONSchema = .arr(.point, "[[x, y], …] control points in page points: line/arrow 2; arc 3 "
+                                               + "[start, control where the end tangents meet, end]; curve 2+ (3 quadratic, "
+                                               + "4 cubic, 5+ B-spline); polyline 2+; polygon 3+")
 
     static func kind(_ s: String, path: String) throws -> ShapeKind {
         guard let k = ShapeKind(rawValue: s) else {
@@ -142,11 +143,11 @@ enum ShapeParse {
     }
 
     static func frame(_ v: [Double], path: String) throws -> Frame {
-        guard v.count == 4 || v.count == 5, v.allSatisfy({ $0.isFinite }) else {
+        guard let f = Frame(array: v), v.allSatisfy({ $0.isFinite }) else {
             throw NibError.invalid("frame is [x, y, width, height] (optional 5th: rotation in radians)", path: path)
         }
-        guard v[2] >= 0, v[3] >= 0 else { throw NibError.invalid("width and height must be 0 or more", path: path) }
-        return Frame(x: v[0], y: v[1], w: v[2], h: v[3], rotation: v.count == 5 ? v[4] : 0)
+        guard f.w >= 0, f.h >= 0 else { throw NibError.invalid("width and height must be 0 or more", path: path) }
+        return f
     }
 
     static func page(_ ref: String, path: String) throws -> (DocumentID, PageID) {
@@ -205,11 +206,7 @@ enum ShapeParse {
 enum ShapeJSON {
     static func points(_ pts: [Point]) -> JSONValue { .array(pts.map { JSONValue.array([.number($0.x), .number($0.y)]) }) }
 
-    static func frame(_ f: Frame) -> JSONValue {
-        var v: [JSONValue] = [.number(f.x), .number(f.y), .number(f.w), .number(f.h)]
-        if f.rotation != 0 { v.append(.number(f.rotation)) }
-        return .array(v)
-    }
+    static func frame(_ f: Frame) -> JSONValue { .array(f.array.map { JSONValue.number($0) }) }
 
     static func createParams(_ s: ShapeItem, page: String) -> JSONValue {
         var o: [String: JSONValue] = ["page": .string(page), "shape": .string(s.shape.rawValue),

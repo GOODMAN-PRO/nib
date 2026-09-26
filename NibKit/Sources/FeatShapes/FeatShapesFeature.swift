@@ -22,6 +22,8 @@ public enum FeatShapesFeature: NibFeature {
         app.commands.register(ShapeTapAt.self)
 
         app.content.drawers.register(ItemDrawerEntry(key: ItemKind.shape.rawValue, owner: id, drawer: ShapeDrawer()))
+        app.content.textLayouts.register(TextLayoutDescriptor(key: ItemKind.shape.rawValue, owner: id,
+                                                              layout: ShapeTextStyle.layout))
 
         let title = String(localized: "Shapes")
         app.ui.canvasTools.register(CanvasToolDescriptor(id: ShapeTool.toolID, title: title, order: 400, owner: id,
