@@ -13,3 +13,6 @@ Next: integrator merges 4 branches -> main, CI green, tag contracts-v2 + design-
 - FIX: F001 F012 F028 (red), F022 F030 F037 (WIP), F017 F026
 Pending FIX queue: F029 F032 F034 F035 F036 F038 F039 F041 F043 F044 F046 F051 F055 F059 F063 F090
 Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F064/F065 WIP)
+
+## Follow-ups (not in any agent yet)
+- F009: highlighter live preview treats 3-point curves as passing through the middle point; F030/F031 use control points. Needs a FIX pass after contracts-v2.
