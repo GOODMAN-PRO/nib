@@ -28,3 +28,4 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - F001: WAL risk FIXED (e6ce770, run 36223033046).
 - F016 (after main integration): register toolbar.dock {dock, along?} (session, returns previous), persist dock setting, route NibToolPalette dock binding through it; remove workarounds.
 - F019 spec now has library.reorder {refs, folder?, after?|before?} + Manual sort + NibReflow.
+- F052 FIX: HOLD until contracts-v2 on main (HUD overlay, playback bar, live toolbar state, typed events), then FIX with the review (3 majors incl. audio.delete path traversal).
