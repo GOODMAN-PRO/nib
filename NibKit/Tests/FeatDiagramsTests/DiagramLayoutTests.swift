@@ -73,12 +73,111 @@ final class DiagramLayoutTests: XCTestCase {
         let boxes = (0..<n).map { i in DiagramLayout.nodeBox(label: "Step \(i)", fontSize: 15) }
         let r = DiagramLayout.layout(boxes, edges: edges, kind: .flow)
         XCTAssertTrue(overlapping(r.frames).isEmpty)
-        // Routes run between the bands: no waypoint sits inside a node.
+        // Routes run between the bands: no waypoint sits inside a node, and every route stays editable.
+        for route in r.edges {
+            XCTAssertLessThanOrEqual(route.bends.count, ConnectorRouter.maxBends)
+            for b in route.bends {
+                XCTAssertFalse(r.frames.contains { $0.insetBy(0.5).contains(b) }, "bend \(b) inside a node")
+            }
+        }
+    }
+
+    func testFlowAtTheCapsStaysFastAndEditable() {
+        // diagram.create's caps are 200 nodes and 600 edges. A random graph that size layers 100–200 deep with
+        // 15k–28k dummy slots; the sweep budget and the Fenwick crossing count keep the layout quick.
+        let budget = 0.5
+        for (seed, chained) in [(UInt64(7), false), (UInt64(8), true)] {
+            var rng = SeededGenerator(state: seed)
+            let n = 200
+            var edges: [(Int, Int)] = chained ? (1..<n).map { ($0 - 1, $0) } : []
+            while edges.count < 600 {
+                let u = Int.random(in: 0..<n, using: &rng), v = Int.random(in: 0..<n, using: &rng)
+                if u != v { edges.append((u, v)) }
+            }
+            let boxes = (0..<n).map { i in DiagramLayout.nodeBox(label: "Step \(i)", fontSize: 15) }
+            let start = Date()
+            let r = DiagramLayout.layout(boxes, edges: edges, kind: .flow)
+            let elapsed = Date().timeIntervalSince(start)
+            XCTAssertLessThan(elapsed, budget * 4, "a flow at the caps took \(elapsed) s")
+            XCTAssertEqual(r.frames.count, n)
+            XCTAssertTrue(overlapping(r.frames).isEmpty)
+            for route in r.edges {
+                XCTAssertLessThanOrEqual(route.bends.count, ConnectorRouter.maxBends)
+                for b in route.bends {
+                    XCTAssertFalse(r.frames.contains { $0.insetBy(0.5).contains(b) }, "bend \(b) inside a node")
+                }
+            }
+        }
+    }
+
+    func testRoutesWithTooManyBendsDetourDownTheSide() {
+        // A zig-zag through 40 gaps would need 80 bends; the route goes round the side instead.
+        let columns = (0...40).map { $0 % 2 == 0 ? 0.0 : 50.0 }
+        let gaps = (0..<40).map { Double($0) * 100 + 80 }
+        XCTAssertEqual(DiagramLayout.gapRoute(columns: columns, gaps: gaps).count, 80)
+        let route = DiagramLayout.boundedRoute(columns: columns, gaps: gaps, detour: -40)
+        XCTAssertEqual(route, [Point(0, 80), Point(-40, 80), Point(-40, 3980), Point(0, 3980)])
+        // A route that fits keeps its steps.
+        let short = DiagramLayout.boundedRoute(columns: [0, 50, 50], gaps: [80, 180], detour: -40)
+        XCTAssertEqual(short, [Point(0, 80), Point(50, 80)])
+    }
+
+    func testCrossingCountMatchesEveryPairChecked() {
+        var rng = SeededGenerator(state: 99)
+        for _ in 0..<60 {
+            let top = Int.random(in: 1...8, using: &rng), bottom = Int.random(in: 1...8, using: &rng)
+            // Nodes 0..<top sit in layer 0, the rest in layer 1, each layer in a shuffled order.
+            let layer = [Int](repeating: 0, count: top) + [Int](repeating: 1, count: bottom)
+            let pos = Array(0..<top).shuffled(using: &rng) + Array(0..<bottom).shuffled(using: &rng)
+            var segs: [(Int, Int)] = []
+            for _ in 0..<Int.random(in: 0...20, using: &rng) {
+                segs.append((Int.random(in: 0..<top, using: &rng), top + Int.random(in: 0..<bottom, using: &rng)))
+            }
+            var pairs = 0
+            for i in segs.indices {
+                for j in segs.indices where j > i {
+                    if (pos[segs[i].0] - pos[segs[j].0]) * (pos[segs[i].1] - pos[segs[j].1]) < 0 { pairs += 1 }
+                }
+            }
+            XCTAssertEqual(DiagramLayout.crossings(segs, layer: layer, pos: pos, layers: 2), pairs)
+        }
+    }
+
+    func testTimelineWrapsIntoRowsThatFitTheWidth() {
+        let n = 12
+        let boxes = (0..<n).map { i in DiagramLayout.nodeBox(label: "Event number \(i) of the year", fontSize: 15) }
+        let chain = (1..<n).map { ($0 - 1, $0) }
+        let r = DiagramLayout.layout(boxes, edges: chain + [(0, n - 1)], kind: .timeline, maxWidth: 523)
+        XCTAssertTrue(overlapping(r.frames).isEmpty)
+        XCTAssertLessThanOrEqual(r.frames.map { $0.maxX }.max() ?? 0, 523 + 1e-6)
+        var rows = 1
+        // Read like text: each event sits right of the one before it, or starts the next row below.
+        for i in 1..<n {
+            let a = r.frames[i - 1], b = r.frames[i]
+            if abs(a.midY - b.midY) < 1e-6 {
+                XCTAssertGreaterThan(b.minX, a.maxX)
+                XCTAssertEqual(r.edges[i - 1].fromSide, .right)
+                XCTAssertEqual(r.edges[i - 1].toSide, .left)
+            } else {
+                rows += 1
+                XCTAssertGreaterThan(b.minY, a.maxY)
+                XCTAssertEqual(r.edges[i - 1].fromSide, .bottom)
+                XCTAssertEqual(r.edges[i - 1].toSide, .top)
+                XCTAssertEqual(r.edges[i - 1].bends.count, 2)
+            }
+        }
+        XCTAssertGreaterThan(rows, 1)
+        // First to last passes whole rows: it runs down the right-hand side.
+        XCTAssertEqual(r.edges[n - 1].bends.count, 4)
+        XCTAssertGreaterThan(r.edges[n - 1].bends[1].x, r.frames.map { $0.maxX }.max() ?? 0)
         for route in r.edges {
             for b in route.bends {
                 XCTAssertFalse(r.frames.contains { $0.insetBy(0.5).contains(b) }, "bend \(b) inside a node")
             }
         }
+        // Without a width it is still one row.
+        let single = DiagramLayout.layout(boxes, edges: chain, kind: .timeline)
+        XCTAssertEqual(Set(single.frames.map { $0.midY }).count, 1)
     }
 
     func testTreeCentresParentsOverChildren() {
@@ -143,20 +242,41 @@ final class DiagramLayoutTests: XCTestCase {
         XCTAssertEqual(r.depth[7], 2)
     }
 
-    func testConnectedShapeSlidesPastWhatIsAlreadyThere() {
+    func testConnectedShapeSlidesPastWhatIsAlreadyThere() throws {
         let source = Rect(x: 0, y: 0, width: 100, height: 50)
         let size = NodeBox(w: 100, h: 50)
-        let free = DiagramLayout.placeConnected(source: source, size: size, side: .right, obstacles: [], page: nil)
+        let page = PageSize(595, 842)
+        let free = try XCTUnwrap(DiagramLayout.placeConnected(source: source, size: size, side: .right, obstacles: [], page: nil))
         XCTAssertEqual(free, Rect(x: 100 + DiagramLayout.connectedGap, y: 0, width: 100, height: 50))
-        let blocked = DiagramLayout.placeConnected(source: source, size: size, side: .right, obstacles: [free], page: nil)
+        let blocked = try XCTUnwrap(DiagramLayout.placeConnected(source: source, size: size, side: .right,
+                                                                 obstacles: [free], page: nil))
         XCTAssertEqual(blocked.x, free.x)
         XCTAssertEqual(blocked.y, 50 + DiagramLayout.connectedGap / 2)
-        let below = DiagramLayout.placeConnected(source: source, size: size, side: .bottom, obstacles: [],
-                                                 page: PageSize(595, 842))
+        let below = try XCTUnwrap(DiagramLayout.placeConnected(source: source, size: size, side: .bottom, obstacles: [],
+                                                               page: page))
         XCTAssertEqual(below.y, 50 + DiagramLayout.connectedGap)
-        let clamped = DiagramLayout.placeConnected(source: source, size: size, side: .top, obstacles: [],
-                                                   page: PageSize(595, 842))
-        XCTAssertGreaterThanOrEqual(clamped.y, 0)
+    }
+
+    func testConnectedShapeStaysOnItsSideOrReportsNoRoom() throws {
+        let size = NodeBox(w: 100, h: 50)
+        let page = PageSize(595, 842)
+        // A source on the page's top edge has no room above: never a shape beside it or over it instead.
+        let atTop = Rect(x: 0, y: 0, width: 100, height: 50)
+        XCTAssertNil(DiagramLayout.placeConnected(source: atTop, size: size, side: .top, obstacles: [], page: page))
+        XCTAssertNil(DiagramLayout.placeConnected(source: Rect(x: 495, y: 300, width: 100, height: 50), size: size,
+                                                  side: .right, obstacles: [], page: page))
+        // Less room than the usual gap: the gap shrinks, and the shape still sits wholly above, on the page.
+        let near = Rect(x: 200, y: 80, width: 100, height: 50)
+        let above = try XCTUnwrap(DiagramLayout.placeConnected(source: near, size: size, side: .top, obstacles: [], page: page))
+        XCTAssertEqual(above.minY, 0, accuracy: 1e-9)
+        XCTAssertLessThanOrEqual(above.maxY, near.minY - DiagramLayout.minConnectedGap + 1e-9)
+        XCTAssertFalse(DiagramLayout.overlaps(above, near))
+        // Every slot blocked: still above the source, never over it.
+        let crowded = (-4...4).map { k in Rect(x: 200 + Double(k) * 60, y: 0, width: 60, height: 30) }
+        let fallback = try XCTUnwrap(DiagramLayout.placeConnected(source: near, size: size, side: .top, obstacles: crowded,
+                                                                  page: page))
+        XCTAssertLessThanOrEqual(fallback.maxY, near.minY)
+        XCTAssertFalse(DiagramLayout.overlaps(fallback, near))
     }
 
     func testNodeBoxesWrapLongLabels() {

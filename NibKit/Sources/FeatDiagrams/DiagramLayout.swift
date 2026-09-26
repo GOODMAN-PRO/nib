@@ -65,8 +65,10 @@ enum DiagramLayout {
 
     // MARK: Entry point
 
-    /// Lays out `boxes` joined by `edges` (index pairs, from → to; self-loops are ignored).
-    static func layout(_ boxes: [NodeBox], edges: [(Int, Int)], kind: DiagramLayoutKind) -> DiagramLayoutResult {
+    /// Lays out `boxes` joined by `edges` (index pairs, from → to; self-loops are ignored). A timeline given
+    /// `maxWidth` wraps into rows no wider than that; the other layouts ignore it.
+    static func layout(_ boxes: [NodeBox], edges: [(Int, Int)], kind: DiagramLayoutKind,
+                       maxWidth: Double? = nil) -> DiagramLayoutResult {
         guard !boxes.isEmpty else {
             let none = edges.map { _ in DiagramLayoutResult.EdgeRoute(fromSide: nil, toSide: nil, bends: []) }
             return DiagramLayoutResult(frames: [], edges: none,
@@ -76,7 +78,7 @@ enum DiagramLayout {
         switch kind {
         case .tree: raw = tree(boxes, edges: edges)
         case .flow: raw = flow(boxes, edges: edges)
-        case .timeline: raw = timeline(boxes, edges: edges)
+        case .timeline: raw = timeline(boxes, edges: edges, maxWidth: maxWidth)
         case .mindmap: raw = mindmap(boxes, edges: edges)
         }
         return normalized(raw)
@@ -178,6 +180,17 @@ enum DiagramLayout {
             pts.append(Point(columns[k + 1], gaps[k]))
         }
         return pts
+    }
+
+    /// `gapRoute`, unless that needs more bends than a connector may have (`ConnectorRouter.maxBends`, the most
+    /// `connector.setPath` accepts, so the route stays editable). Then the route detours down the side of the whole
+    /// diagram at x `detour`: across the first gap, down past every band, back across the last gap. Four bends, and
+    /// like `gapRoute` it never crosses a node.
+    static func boundedRoute(columns: [Double], gaps: [Double], detour: Double) -> [Point] {
+        let pts = gapRoute(columns: columns, gaps: gaps)
+        guard pts.count > ConnectorRouter.maxBends, let from = columns.first, let to = columns.last,
+              let first = gaps.first, let last = gaps.last else { return pts }
+        return [Point(from, first), Point(detour, first), Point(detour, last), Point(to, last)]
     }
 
     // MARK: Tree (layered, top-down)
@@ -339,8 +352,10 @@ enum DiagramLayout {
         }
         reindex()
         var best = layers
-        var bestCrossings = crossings(segs, layer: vLayer, pos: pos, layers: layerCount)
-        let sweeps = segs.count > 600 ? 4 : 12
+        // Past the budget (long edges through many layers make many dummy slots) a flow keeps its input order, so
+        // even the biggest diagram.create stays fast.
+        let sweeps = segs.count > sweepBudget ? 0 : (segs.count > 600 ? 4 : 12)
+        var bestCrossings = sweeps > 0 ? crossings(segs, layer: vLayer, pos: pos, layers: layerCount) : 0
         for iteration in 0..<sweeps where bestCrossings > 0 {
             let downward = iteration % 2 == 0
             let range = downward ? Array(stride(from: 1, to: layerCount, by: 1))
@@ -409,12 +424,19 @@ enum DiagramLayout {
         func gapBelow(_ l: Int) -> Double { b.top[l] + b.height[l] + layerGap / 2 }
         var branch = [Int](repeating: -1, count: n)
         for v in 0..<n where layer[v] > 0 { branch[v] = 0 }
+        // Detours for routes with too many bends run just outside every node and dummy slot, on the nearer side.
+        var left = x.first ?? 0, right = x.first ?? 0
+        for v in 0..<vCount {
+            left = min(left, x[v] - vWidth[v] / 2)
+            right = max(right, x[v] + vWidth[v] / 2)
+        }
         let routes = edges.indices.map { i -> DiagramLayoutResult.EdgeRoute in
             guard valid[i] else { return .init(fromSide: nil, toSide: nil, bends: []) }
             let (u, v) = dag(i)
             let columns = [x[u]] + chains[i].map { x[$0] } + [x[v]]
             let gaps = layer[v] > layer[u] ? (layer[u]..<layer[v]).map { gapBelow($0) } : []
-            let pts = gapRoute(columns: columns, gaps: gaps)
+            let detour = (x[u] + x[v]) / 2 < (left + right) / 2 ? left - dummyGap : right + dummyGap
+            let pts = boundedRoute(columns: columns, gaps: gaps, detour: detour)
             // A reversed (back) edge runs upward: out of the lower node's top into the upper node's bottom.
             return reversed.contains(i) ? .init(fromSide: .top, toSide: .bottom, bends: Array(pts.reversed()))
                                         : .init(fromSide: .bottom, toSide: .top, bends: pts)
@@ -422,17 +444,37 @@ enum DiagramLayout {
         return DiagramLayoutResult(frames: frames, edges: routes, depth: layer, branch: branch, size: NodeBox(w: 0, h: 0))
     }
 
-    /// Edge crossings between adjacent layers for the given positions.
+    /// Segments (dummy slots included) past which a flow skips the crossing-reduction sweeps.
+    static let sweepBudget = 10_000
+
+    /// Edge crossings between adjacent layers for the given positions: two segments cross when their upper ends and
+    /// their lower ends are in opposite orders (shared ends never count). Per layer the segments are sorted by upper
+    /// end and a Fenwick tree counts the lower ends out of order, O(s log s) rather than every pair.
     static func crossings(_ segs: [(Int, Int)], layer: [Int], pos: [Int], layers: Int) -> Int {
         var byLayer = [[(Int, Int)]](repeating: [], count: max(1, layers))
         for (a, b) in segs { byLayer[layer[a]].append((pos[a], pos[b])) }
         var total = 0
-        for list in byLayer where list.count > 1 {
-            for i in 0..<(list.count - 1) {
-                for j in (i + 1)..<list.count {
-                    let s = (list[i].0 - list[j].0) * (list[i].1 - list[j].1)
-                    if s < 0 { total += 1 }
+        for var list in byLayer where list.count > 1 {
+            list.sort { $0.0 != $1.0 ? $0.0 < $1.0 : $0.1 < $1.1 }
+            let size = (list.map { $0.1 }.max() ?? 0) + 1
+            var tree = [Int](repeating: 0, count: size + 1)
+            var seen = 0
+            for (_, lower) in list {
+                // Earlier segments whose lower end is at or before this one's...
+                var i = lower + 1
+                var notAfter = 0
+                while i > 0 {
+                    notAfter += tree[i]
+                    i -= i & -i
                 }
+                // ...and the rest, strictly after it, cross it.
+                total += seen - notAfter
+                i = lower + 1
+                while i <= size {
+                    tree[i] += 1
+                    i += i & -i
+                }
+                seen += 1
             }
         }
         return total
@@ -440,32 +482,73 @@ enum DiagramLayout {
 
     // MARK: Timeline (horizontal)
 
-    /// One row, left to right in edge order (ties and cycles fall back to node order). Neighbours join side to side;
-    /// edges that skip nodes arc over (forward) or under (backward) the row.
-    static func timeline(_ boxes: [NodeBox], edges: [(Int, Int)]) -> DiagramLayoutResult {
+    /// Rows of a wrapped timeline sit this far apart: room for the arcs under one row, the track that joins it to the
+    /// next, and the arcs over the next row, each on its own line.
+    static let rowGap = 2 * timelineGap
+
+    /// Left to right in edge order (ties and cycles fall back to node order): one row, or with `maxWidth` rows read
+    /// like text, each as full as that width allows. Neighbours in a row join side to side; edges that skip nodes arc
+    /// over (forward) or under (backward) their row. An edge to the next row drops through the track between the
+    /// rows; one that passes a whole row runs down the right-hand side.
+    static func timeline(_ boxes: [NodeBox], edges: [(Int, Int)], maxWidth: Double? = nil) -> DiagramLayoutResult {
         let n = boxes.count
         let order = topologicalOrder(count: n, edges: edges)
         var rank = [Int](repeating: 0, count: n)
         for (i, v) in order.enumerated() { rank[v] = i }
-        let rowH = boxes.map { $0.h }.max() ?? 0
-        var frames = [Rect](repeating: .zero, count: n)
+        var rows: [[Int]] = [[]]
         var cursor = 0.0
         for v in order {
-            frames[v] = Rect(x: cursor, y: (rowH - boxes[v].h) / 2, width: boxes[v].w, height: boxes[v].h)
+            if let limit = maxWidth, let current = rows.last, !current.isEmpty, cursor + boxes[v].w > limit {
+                rows.append([])
+                cursor = 0
+            }
+            rows[rows.count - 1].append(v)
             cursor += boxes[v].w + timelineGap
         }
+        var row = [Int](repeating: 0, count: n)
+        var top = [Double](repeating: 0, count: rows.count)
+        var height = [Double](repeating: 0, count: rows.count)
+        var frames = [Rect](repeating: .zero, count: n)
+        var right = 0.0
+        for (r, list) in rows.enumerated() {
+            height[r] = list.map { boxes[$0].h }.max() ?? 0
+            if r > 0 { top[r] = top[r - 1] + height[r - 1] + rowGap }
+            var x = 0.0
+            for v in list {
+                row[v] = r
+                frames[v] = Rect(x: x, y: top[r] + (height[r] - boxes[v].h) / 2, width: boxes[v].w, height: boxes[v].h)
+                right = max(right, x + boxes[v].w)
+                x += boxes[v].w + timelineGap
+            }
+        }
+        /// The track between row `r` and the one below it.
+        func track(_ r: Int) -> Double { top[r] + height[r] + rowGap / 2 }
+        let detour = right + timelineGap / 2
         let routes = edges.map { e -> DiagramLayoutResult.EdgeRoute in
             let (u, v) = e
             guard u != v, u >= 0, v >= 0, u < n, v < n else { return .init(fromSide: nil, toSide: nil, bends: []) }
             let forward = rank[v] > rank[u]
-            if abs(rank[v] - rank[u]) == 1 {
-                return forward ? .init(fromSide: .right, toSide: .left, bends: [])
-                               : .init(fromSide: .left, toSide: .right, bends: [])
+            let a = frames[u], b = frames[v]
+            if row[u] == row[v] {
+                if abs(rank[v] - rank[u]) == 1 {
+                    return forward ? .init(fromSide: .right, toSide: .left, bends: [])
+                                   : .init(fromSide: .left, toSide: .right, bends: [])
+                }
+                let r = row[u]
+                let y = forward ? top[r] - timelineGap / 2 : top[r] + height[r] + timelineGap / 2
+                let side: ConnectorSide = forward ? .top : .bottom
+                return .init(fromSide: side, toSide: side, bends: [Point(a.midX, y), Point(b.midX, y)])
             }
-            let y = forward ? -timelineGap / 2 : rowH + timelineGap / 2
-            let side: ConnectorSide = forward ? .top : .bottom
-            return .init(fromSide: side, toSide: side,
-                         bends: [Point(frames[u].midX, y), Point(frames[v].midX, y)])
+            let down = row[v] > row[u]
+            let near = down ? track(row[u]) : track(row[u] - 1)
+            let far = down ? track(row[v] - 1) : track(row[v])
+            let from: ConnectorSide = down ? .bottom : .top
+            let to: ConnectorSide = down ? .top : .bottom
+            if abs(row[v] - row[u]) == 1 {
+                return .init(fromSide: from, toSide: to, bends: [Point(a.midX, near), Point(b.midX, near)])
+            }
+            return .init(fromSide: from, toSide: to,
+                         bends: [Point(a.midX, near), Point(detour, near), Point(detour, far), Point(b.midX, far)])
         }
         return DiagramLayoutResult(frames: frames, edges: routes, depth: [Int](repeating: 0, count: n),
                                    branch: [Int](repeating: -1, count: n), size: NodeBox(w: 0, h: 0))
@@ -562,12 +645,27 @@ enum DiagramLayout {
     // MARK: Quick Diagramming placement
 
     static let connectedGap = 56.0
+    /// On a fixed-size page the gap may shrink to this when the page has less room on that side.
+    static let minConnectedGap = 16.0
 
     /// Where Quick Diagramming puts a new shape of `size` on `side` of `source`: one gap away, centred on the source,
     /// sliding along that side (1, −1, 2, −2, … slots) past anything already there, and kept on a fixed-size page.
+    /// The shape always lands on the requested side, clear of the source: nil when a fixed-size page has no room
+    /// there (not even `minConnectedGap` plus the shape).
     static func placeConnected(source b: Rect, size: NodeBox, side: ConnectorSide, obstacles: [Rect],
-                               page: PageSize?) -> Rect {
-        let gap = connectedGap
+                               page: PageSize?) -> Rect? {
+        var gap = connectedGap
+        if let p = page {
+            let room: Double
+            switch side {
+            case .right: room = p.width - b.maxX - size.w
+            case .left: room = b.minX - size.w
+            case .bottom: room = p.height - b.maxY - size.h
+            case .top: room = b.minY - size.h
+            }
+            guard room >= minConnectedGap else { return nil }
+            gap = min(gap, room)
+        }
         func candidate(_ k: Int) -> Rect {
             var r: Rect
             switch side {
@@ -580,16 +678,19 @@ enum DiagramLayout {
             case .top:
                 r = Rect(x: b.midX - size.w / 2 + Double(k) * (size.w + gap / 2), y: b.minY - gap - size.h, width: size.w, height: size.h)
             }
+            // Kept on the page along the side only; across it the gap above already fits the page.
             if let p = page {
-                r.x = min(max(0, r.x), max(0, p.width - r.width))
-                r.y = min(max(0, r.y), max(0, p.height - r.height))
+                switch side {
+                case .left, .right: r.y = min(max(0, r.y), max(0, p.height - r.height))
+                case .top, .bottom: r.x = min(max(0, r.x), max(0, p.width - r.width))
+                }
             }
             return r
         }
         for k in [0, 1, -1, 2, -2, 3, -3] {
             let r = candidate(k)
             let padded = r.insetBy(-8)
-            if !overlaps(b, r) && !obstacles.contains(where: { overlaps($0, padded) }) { return r }
+            if !obstacles.contains(where: { overlaps($0, padded) }) { return r }
         }
         return candidate(0)
     }

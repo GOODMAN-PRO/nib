@@ -375,13 +375,14 @@ final class ConnectorEditor: CanvasAttachment {
         render()
     }
 
-    /// Commits the drag (or tap) that just ended as one `connector.setPath`: one undo step.
+    /// Commits the drag (or tap) that just ended as one `connector.setPath`: one undo step. The drag (its preview path
+    /// and handles, with the real connector still hidden) stays until the command has run, so the end of a drag never
+    /// flashes the old geometry; `hitTest` ignores new touches meanwhile.
     private func commit(host: CanvasHost) {
         guard let d = drag, let t = target else {
             drag = nil
             return
         }
-        drag = nil
         var params: [String: JSONValue] = ["ref": .string(NodeRef.item(t.doc, t.page, t.item.id).description)]
         switch d.handle {
         case .end(let start):
@@ -402,16 +403,21 @@ final class ConnectorEditor: CanvasAttachment {
         case .insert, .segment:
             if d.moved { params["bends"] = ConnectorEditor.json(d.preview.bends) }
         }
-        render()
         guard params.count > 1 else {
+            drag = nil
             if d.moved { host.setHidden([], page: t.page) }
+            render()
             return
         }
         let page = t.page
         let call = JSONValue.object(params)
-        Task { [kit] in
+        Task { [weak self, kit] in
             await kit.perform("connector.setPath", call)
+            // The edited connector (or, if the edit failed, the old one) shows again as the preview goes.
             kit.host?.setHidden([], page: page)
+            guard let self = self else { return }
+            self.drag = nil
+            self.refresh()
         }
     }
 

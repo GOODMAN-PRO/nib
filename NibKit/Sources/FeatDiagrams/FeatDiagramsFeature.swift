@@ -63,8 +63,11 @@ enum DiagramMenus {
             submenu: style))
     }
 
-    /// The selected items, when the document is editable.
+    /// The selected items, when the document is editable. Every entry here needs one item (a box shape, a
+    /// connector) or two (Connect), so a bigger selection (select-all on a dense page) returns at once, before any
+    /// workspace lookup: the object menu is rebuilt often and each lookup scans the page.
     static func items(_ ctx: MenuContext) -> [Item] {
+        guard ctx.selection.items.count <= 2 else { return [] }
         guard !(ctx.session?.readOnly ?? false), let doc = ctx.selection.doc, let page = ctx.selection.page else { return [] }
         return ctx.selection.items.compactMap { try? ctx.app.workspace.item(doc, page: page, id: $0) }
     }

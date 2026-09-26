@@ -125,6 +125,51 @@ final class FeatDiagramsTests: XCTestCase {
         }
     }
 
+    func testSetPathRefusesALockedConnector() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        // Lock the fixture connector in storage, then let the workspace load it afresh.
+        h.app.workspace.close(Fixtures.docID)
+        var stored = try XCTUnwrap(h.persistence.pageItems[Fixtures.docID]?[Fixtures.page1])
+        let i = try XCTUnwrap(stored.firstIndex { $0.id == Fixtures.connectorID })
+        stored[i].locked = true
+        h.persistence.pageItems[Fixtures.docID]?[Fixtures.page1] = stored
+        XCTAssertTrue(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.connectorID).locked)
+        do {
+            try await h.run("connector.setPath", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECON01", "route": "elbow"])
+            XCTFail("a locked connector cannot be rerouted")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+            XCTAssertEqual(e.path, "$.ref")
+            XCTAssertNotNil(e.hint)
+        }
+        XCTAssertEqual(try connector(h, Fixtures.connectorID).route, .straight)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    func testLabelsHaveALengthCap() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let long = JSONValue.string(String(repeating: "a", count: DiagramSchemas.maxLabel + 1))
+        let connectorCall: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG001", "from": ["point": [0, 0]],
+                                        "to": ["point": [90, 90]], "label": long]
+        let nodeCall: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "layout": "tree",
+                                   "nodes": [["id": "a", "label": long]], "edges": []]
+        let edgeCall: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "layout": "tree",
+                                   "nodes": [["id": "a"], ["id": "b"]], "edges": [["from": "a", "to": "b", "label": long]]]
+        let calls: [(String, JSONValue, String)] = [("connector.create", connectorCall, "$.label"),
+                                                    ("diagram.create", nodeCall, "$.nodes[0].label"),
+                                                    ("diagram.create", edgeCall, "$.edges[0].label")]
+        for (command, params, path) in calls {
+            do {
+                try await h.run(command, params)
+                XCTFail("\(path) is too long")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams)
+                XCTAssertEqual(e.path, path)
+            }
+        }
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
     // MARK: diagram.addConnected
 
     func testAddConnectedCopiesTheShapeBesideIt() async throws {
@@ -147,6 +192,26 @@ final class FeatDiagramsTests: XCTestCase {
         h.app.bus.undo(Fixtures.whiteboardID)
         XCTAssertThrowsError(try ws.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: "NEXT1"))
         XCTAssertThrowsError(try ws.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: connectorID))
+    }
+
+    func testAddConnectedSaysWhenASideHasNoRoom() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        // The sticky note is 140 pt tall and 120 pt from the top of the page: no room for its copy above it.
+        let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).count
+        do {
+            try await h.run("diagram.addConnected", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01", "side": "top"])
+            XCTFail("no room above")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+            XCTAssertEqual(e.path, "$.side")
+            XCTAssertNotNil(e.hint)
+        }
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).count, before)
+        // Below there is room, and the new shape lands wholly below it.
+        let r = try await h.run("diagram.addConnected", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01", "side": "bottom"])
+        guard case let .item(_, _, id)? = NodeRef(r["ref"]?.stringValue ?? "") else { return XCTFail("no shape ref") }
+        let frame = try XCTUnwrap(h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id).frame)
+        XCTAssertGreaterThanOrEqual(frame.y, 260 + DiagramLayout.minConnectedGap)
     }
 
     // MARK: diagram.create
@@ -206,6 +271,67 @@ final class FeatDiagramsTests: XCTestCase {
             XCTAssertLessThanOrEqual(f.x + f.w, size.width)
             XCTAssertLessThanOrEqual(f.y + f.h, size.height)
             XCTAssertNil(item.shape?.style.fillColor, "the line style has no fill")
+        }
+    }
+
+    func testDiagramCreateWrapsALongTimelineOntoAFixedPage() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let nodes = (1...12).map { i -> JSONValue in
+            ["id": .string("e\(i)"), "label": .string("Event \(i): a milestone of the year")]
+        }
+        let params: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "layout": "timeline", "nodes": .array(nodes),
+                                 "edges": []]
+        let r = try await h.run("diagram.create", params)
+        XCTAssertEqual(r["connectors"]?.arrayValue?.count, 11)
+        let size = PageSize.a4
+        let page = Rect(x: 0, y: 0, width: size.width, height: size.height)
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        var rows = Set<Int>()
+        for item in items {
+            XCTAssertTrue(page.contains(item.bounds), "\(item.id) at \(item.bounds) is off the page")
+            if let f = item.frame { rows.insert(Int(f.bounds.midY.rounded())) }
+        }
+        XCTAssertEqual(items.filter { $0.kind == .shape }.count, 12)
+        XCTAssertGreaterThan(rows.count, 1, "the timeline wraps into rows")
+    }
+
+    func testDiagramCreateRefusesADiagramThatCannotFitAFixedPage() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        // A root with 5 branches of 4 leaves: 20 leaves side by side, far wider than A4 even at the smallest scale.
+        var nodes: [JSONValue] = [["id": "root", "label": "Topic"]]
+        var edges: [JSONValue] = []
+        for b in 1...5 {
+            nodes.append(["id": .string("b\(b)"), "label": .string("Branch \(b)")])
+            edges.append(["from": "root", "to": .string("b\(b)")])
+            for l in 1...4 {
+                nodes.append(["id": .string("b\(b)l\(l)"), "label": .string("Leaf \(b).\(l)")])
+                edges.append(["from": .string("b\(b)"), "to": .string("b\(b)l\(l)")])
+            }
+        }
+        let onA4: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "layout": "tree", "nodes": .array(nodes),
+                               "edges": .array(edges)]
+        do {
+            try await h.run("diagram.create", onA4, as: .ai("chat"))
+            XCTFail("26 nodes this wide do not fit an A4 page")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+            XCTAssertEqual(e.path, "$.nodes")
+            XCTAssertNotNil(e.hint)
+        }
+        XCTAssertTrue(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).isEmpty)
+        // A board takes it whole.
+        let onBoard: JSONValue = ["page": "page:FIXTUREDOC04/FIXTUREBRD01", "layout": "tree", "nodes": .array(nodes),
+                                  "edges": .array(edges)]
+        let r = try await h.run("diagram.create", onBoard)
+        XCTAssertEqual(r["refs"]?.arrayValue?.count, 26)
+        // An explicit origin that would push a diagram off a fixed page is refused too.
+        let offPage: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "layout": "timeline", "origin": [500, 700],
+                                  "nodes": [["id": "a", "label": "One"], ["id": "b", "label": "Two"]], "edges": []]
+        do {
+            try await h.run("diagram.create", offPage)
+            XCTFail("the diagram would run off the page")
+        } catch let e as NibError {
+            XCTAssertEqual(e.path, "$.origin")
         }
     }
 
@@ -279,6 +405,65 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertEqual(alpha(plain, 83, 51), 0)
     }
 
+    func testConnectorsStayInsideTheirBounds() {
+        // Tile invalidation (Changeset.dirtyRect) and lasso hit tests use Item.bounds: every route, and the stroke
+        // actually drawn (trimmed for arrowheads), must stay inside it.
+        var rng = DiagramLayoutTests.SeededGenerator(state: 2024)
+        func point() -> Point { Point(Double.random(in: 0...400, using: &rng), Double.random(in: 0...400, using: &rng)) }
+        let sides: [Int?] = [nil, 0, 1, 2, 3]
+        for route in ConnectorRoute.allCases {
+            for sa in sides {
+                for sb in sides {
+                    for bendCount in [0, 1, 3] {
+                        for _ in 0..<5 {
+                            let from = ConnectorEnd(point: point(), item: sa == nil ? nil : "A", side: sa, t: 0.5)
+                            let to = ConnectorEnd(point: point(), item: sb == nil ? nil : "B", side: sb, t: 0.5)
+                            let bends = (0..<bendCount).map { _ in point() }
+                            let style = ShapeItemStyle(arrowStart: Bool.random(using: &rng), arrowEnd: true)
+                            let c = ConnectorItem(from: from, to: to, route: route, bends: bends, style: style)
+                            let bounds = Item.makeConnector(c).bounds.insetBy(-1e-6)
+                            let g = ConnectorRouter.geometry(c)
+                            let what = "\(route) from side \(String(describing: sa)) to side \(String(describing: sb))"
+                            for p in g.flattened() {
+                                XCTAssertTrue(bounds.contains(p), "\(what): \(p) outside \(bounds)")
+                            }
+                            let s = ConnectorPainter.arrowSize(style.strokeWidth) * 0.8
+                            let drawn = g.path(trimStart: s, trimEnd: s).boundingBoxOfPath
+                            XCTAssertTrue(bounds.cg.insetBy(dx: -1e-6, dy: -1e-6).contains(drawn), "\(what): stroke \(drawn)")
+                        }
+                    }
+                }
+            }
+        }
+        // The reviewer's case: top to top, 300 pt apart, used to arch about 83 pt above both anchors.
+        let arch = ConnectorItem(from: ConnectorEnd(point: Point(0, 100), item: "A", side: 0, t: 0.5),
+                                 to: ConnectorEnd(point: Point(300, 100), item: "B", side: 0, t: 0.5), route: .curved)
+        let top = ConnectorRouter.geometry(arch).flattened().map { $0.y }.min() ?? 0
+        XCTAssertGreaterThanOrEqual(top, Item.makeConnector(arch).bounds.minY)
+        XCTAssertLessThan(top, 100, "it still leaves upward, along the top sides")
+    }
+
+    func testLabelsSitOnTheMiddleOfTheLineOverAKnockout() throws {
+        let w = 200, h = 100
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                          space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let c = ConnectorItem(from: ConnectorEnd(point: Point(10, 50)), to: ConnectorEnd(point: Point(190, 50)),
+                              style: ShapeItemStyle(arrowEnd: false), label: RichText(plain: "Hi"))
+        ConnectorDrawer().draw(Item.makeConnector(c), in: DrawContext(cg: ctx, scale: 1, doc: "D", page: "P"))
+        let label = ConnectorPainter.layout(RichText(plain: "Hi"), ink: .black, geometry: ConnectorRouter.geometry(c))
+        XCTAssertEqual(label.rect.midX, 100, accuracy: 0.5)
+        XCTAssertEqual(label.rect.midY, 50, accuracy: 0.5)
+        let data = try XCTUnwrap(ctx.data)
+        let bytes = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        func alpha(_ x: Int, _ y: Int) -> UInt8 { bytes[(h - 1 - y) * w * 4 + x * 4 + 3] }
+        XCTAssertGreaterThan(alpha(30, 50), 0, "the line away from the label")
+        XCTAssertGreaterThan(alpha(170, 50), 0, "the line on the other side")
+        let gap = Int((label.rect.minX - 2.5).rounded(.down))
+        XCTAssertEqual(alpha(gap, 50), 0, "the line stops short of the label")
+        XCTAssertEqual(alpha(Int(label.rect.maxX.rounded(.up)) + 1, 50), 0, "on both sides")
+    }
+
     // MARK: Canvas attachments
 
     func testQuickDiagramDotTapAddsAndSelectsAConnectedShape() async throws {
@@ -320,6 +505,10 @@ final class FeatDiagramsTests: XCTestCase {
         editor.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(250, 390))], host: host)
         XCTAssertEqual(host.hidden[Fixtures.page1], [Fixtures.connectorID], "the real connector hides while its preview moves")
         editor.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(222, 398)), host: host)
+        // Until the edit lands the preview stays and the real connector stays hidden (no flash of the old route),
+        // and the handles take no new touches.
+        XCTAssertEqual(host.hidden[Fixtures.page1], [Fixtures.connectorID])
+        XCTAssertFalse(editor.hitTest(CGPoint(x: 260, y: 245), host: host))
         await settle { (try? self.connector(h, Fixtures.connectorID).to.item) == Fixtures.textID }
         let c = try connector(h, Fixtures.connectorID)
         XCTAssertEqual(c.to.item, Fixtures.textID)
@@ -328,6 +517,78 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
         await settle { host.hidden[Fixtures.page1] == nil }
         XCTAssertNil(host.hidden[Fixtures.page1])
+        editor.canvasDidChange(host)
+        XCTAssertTrue(editor.hitTest(CGPoint(x: 260, y: 245), host: host), "handles take touches again")
+    }
+
+    func testQuickDiagramDragOntoAnItemConnectsToIt() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let host = FakeCanvasHost(h)
+        let overlay = QuickDiagramOverlay(host: host)
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        overlay.canvasDidChange(host)
+        // From the rectangle's right dot into the sticky note (400, 120, 140 × 140).
+        let dot = Point(260 + Double(QuickDiagramOverlay.dotOffset), 245)
+        overlay.touchesBegan(CanvasSample(page: Fixtures.page1, location: dot), host: host)
+        overlay.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(420, 220))], host: host)
+        overlay.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(470, 190)), host: host)
+        func added() -> [ConnectorItem] {
+            ((try? h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)) ?? [])
+                .filter { $0.id != Fixtures.connectorID }.compactMap { $0.connector }
+        }
+        await settle { !added().isEmpty }
+        let link = try XCTUnwrap(added().first)
+        XCTAssertEqual(link.from.item, Fixtures.shapeID)
+        XCTAssertEqual(link.from.side, ConnectorSide.right.rawValue)
+        XCTAssertEqual(link.from.point, try anchor(h, Fixtures.shapeID, side: 1))
+        XCTAssertEqual(link.to.item, Fixtures.stickyID)
+        XCTAssertEqual(link.to.side, ConnectorSide.left.rawValue, "snapped to the side facing the shape")
+        XCTAssertEqual(link.to.point, try anchor(h, Fixtures.stickyID, side: 3))
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+    }
+
+    func testQuickDiagramDragOntoPaperLeavesAFreeEnd() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let host = FakeCanvasHost(h)
+        let overlay = QuickDiagramOverlay(host: host)
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        overlay.canvasDidChange(host)
+        // From the rectangle's left dot out onto empty paper.
+        let dot = Point(100 - Double(QuickDiagramOverlay.dotOffset), 245)
+        let release = Point(20, 300)
+        overlay.touchesBegan(CanvasSample(page: Fixtures.page1, location: dot), host: host)
+        overlay.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(30, 280))], host: host)
+        overlay.touchesEnded(CanvasSample(page: Fixtures.page1, location: release), host: host)
+        func added() -> [ConnectorItem] {
+            ((try? h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)) ?? [])
+                .filter { $0.id != Fixtures.connectorID }.compactMap { $0.connector }
+        }
+        await settle { !added().isEmpty }
+        let link = try XCTUnwrap(added().first)
+        XCTAssertEqual(link.from.item, Fixtures.shapeID)
+        XCTAssertEqual(link.from.side, ConnectorSide.left.rawValue)
+        XCTAssertNil(link.to.item)
+        XCTAssertEqual(link.to.point, release)
+        // A short wobble onto nothing does nothing.
+        let count = added().count
+        overlay.touchesBegan(CanvasSample(page: Fixtures.page1, location: dot), host: host)
+        overlay.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(dot.x - 10, 245))], host: host)
+        overlay.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(dot.x - 12, 245)), host: host)
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(added().count, count)
+    }
+
+    func testObjectMenuSkipsLookupsForBigSelections() {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let pair = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID, Fixtures.stickyID])
+        XCTAssertEqual(DiagramMenus.items(MenuContext(app: h.app, session: h.session, selection: pair)).count, 2)
+        XCTAssertTrue(DiagramMenus.connectable(MenuContext(app: h.app, session: h.session, selection: pair)))
+        let many = Selection(doc: Fixtures.docID, page: Fixtures.page1,
+                             items: [Fixtures.shapeID, Fixtures.stickyID, Fixtures.textID])
+        XCTAssertTrue(DiagramMenus.items(MenuContext(app: h.app, session: h.session, selection: many)).isEmpty)
+        XCTAssertFalse(DiagramMenus.connectable(MenuContext(app: h.app, session: h.session, selection: many)))
     }
 
     func testEditorOffersBendHandlesPerRoute() {

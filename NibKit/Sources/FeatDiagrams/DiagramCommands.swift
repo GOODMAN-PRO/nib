@@ -71,6 +71,15 @@ enum DiagramSchemas {
         "point": .point,
     ], required: [], "an attached end {item, side?, t?} or a free end {point}")
     static let id: JSONSchema = .str("your own id for the new item, [A-Za-z0-9_-]{1,64}")
+
+    /// Longest label (characters) on a node or a connector: longer text belongs in a text box.
+    static let maxLabel = 1000
+
+    static func checkLabel(_ text: String?, path: String) throws {
+        guard let text = text, text.count > maxLabel else { return }
+        throw NibError(.invalidParams, "label is \(text.count) characters; at most \(maxLabel) fit", path: path,
+                       hint: "shorten it, or put the long text in a text box next to the diagram")
+    }
 }
 
 /// Resolving refs, ends and ids against the workspace, with errors that tell a model what to do next.
@@ -211,7 +220,7 @@ struct ConnectorCreate: NibCommand {
             "route": .str("straight (default), elbow (right angles) or curved", choices: ConnectorRoute.allCases.map { $0.rawValue }),
             "arrowStart": .bool("arrowhead at the start (default false)"),
             "arrowEnd": .bool("arrowhead at the end (default true)"),
-            "label": .str("text shown along the connector"),
+            "label": .str("text shown on the middle of the connector (at most 1000 characters)"),
             "id": DiagramSchemas.id,
         ], required: ["page", "from", "to"]),
         examples: [
@@ -223,6 +232,7 @@ struct ConnectorCreate: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let ws = ctx.workspace
         let (doc, page, _) = try DiagramRefs.page(p.page, in: ws, path: "$.page")
+        try DiagramSchemas.checkLabel(p.label?.plainText, path: "$.label")
         let newID = try DiagramRefs.newID(p.id, doc: doc, page: page, in: ws, path: "$.id")
         let from = try DiagramRefs.end(p.from, doc: doc, page: page, in: ws, path: "$.from")
         let to = try DiagramRefs.end(p.to, doc: doc, page: page, in: ws, path: "$.to")
@@ -248,7 +258,7 @@ struct ConnectorSetPath: NibCommand {
         var to: EndParam?
     }
 
-    static let maxBends = 64
+    static let maxBends = ConnectorRouter.maxBends
 
     static let descriptor = CommandDescriptor(
         id: "connector.setPath", title: "Edit Connector",
@@ -352,8 +362,11 @@ struct DiagramAddConnected: NibCommand {
         let obstacles = try ws.items(doc, page: page)
             .filter { $0.id != source.id && !passThrough.contains($0.kind) }
             .map { $0.bounds }
-        let rect = DiagramLayout.placeConnected(source: frame.bounds, size: NodeBox(w: frame.w, h: frame.h), side: side,
-                                                obstacles: obstacles, page: pageRecord.size)
+        guard let rect = DiagramLayout.placeConnected(source: frame.bounds, size: NodeBox(w: frame.w, h: frame.h),
+                                                      side: side, obstacles: obstacles, page: pageRecord.size) else {
+            throw NibError(.invalidParams, "no room for a shape on the \(side.name) of item \(source.id) on this page",
+                           path: "$.side", hint: "try another side, or move the shape further onto the page")
+        }
         let layer = ctx.activeSession?.activeLayer ?? 0
         var style = source.shape?.style ?? ShapeItemStyle()
         style.arrowStart = false
@@ -444,6 +457,35 @@ enum DiagramBuilder {
         return max(minScale, s)
     }
 
+    /// A laid-out diagram, the scale it is drawn at, and whether it then fits inside the page's margins.
+    struct Arrangement {
+        var result: DiagramLayoutResult
+        var scale: Double
+        var fits: Bool
+    }
+
+    /// Lays a diagram out for its page. A board (no fixed size) takes any size at scale 1. On a fixed-size page the
+    /// diagram shrinks to fit (never below `minScale`), and a timeline also wraps into rows: the row widths that
+    /// scales 1, 0.75, 0.5 and `minScale` leave are tried, and the arrangement that fits at the largest scale wins.
+    /// Pure and value-typed, so `diagram.create` runs it off the main actor.
+    static func arrange(_ boxes: [NodeBox], edges: [(Int, Int)], kind: DiagramLayoutKind, page: PageSize?) -> Arrangement {
+        guard let p = page else {
+            return Arrangement(result: DiagramLayout.layout(boxes, edges: edges, kind: kind), scale: 1, fits: true)
+        }
+        let usable = NodeBox(w: p.width - 2 * margin, h: p.height - 2 * margin)
+        func fitted(_ r: DiagramLayoutResult) -> Arrangement {
+            let s = fitScale(r.size, page: p)
+            return Arrangement(result: r, scale: s, fits: r.size.w * s <= usable.w + 1e-6 && r.size.h * s <= usable.h + 1e-6)
+        }
+        var best = fitted(DiagramLayout.layout(boxes, edges: edges, kind: kind))
+        guard kind == .timeline, !(best.fits && best.scale >= 1), usable.w > 0 else { return best }
+        for target in [1.0, 0.75, 0.5, minScale] {
+            let wrapped = fitted(DiagramLayout.layout(boxes, edges: edges, kind: kind, maxWidth: usable.w / target))
+            if wrapped.fits && (!best.fits || wrapped.scale > best.scale + 1e-9) { best = wrapped }
+        }
+        return best
+    }
+
     /// Top-left for a diagram of `size`: centred in the visible area (or the page), kept inside a fixed-size page.
     static func origin(for size: NodeBox, page: PageSize?, visible: Rect?) -> Point {
         let centre = visible?.center ?? page.map { Point($0.width / 2, $0.height / 2) } ?? .zero
@@ -526,8 +568,9 @@ struct DiagramCreate: NibCommand {
         var connectors: [String]
     }
 
-    static let maxNodes = 500
-    static let maxEdges = 2000
+    /// Caps that keep the layout (off the main actor) well under a second even for a tangled flow.
+    static let maxNodes = 200
+    static let maxEdges = 600
 
     static let descriptor = CommandDescriptor(
         id: "diagram.create", title: "Create Diagram",
@@ -536,16 +579,16 @@ struct DiagramCreate: NibCommand {
             "page": .ref,
             "nodes": .arr(.obj([
                 "id": .str("node id, used by edges; becomes the item id when it is free on the page"),
-                "label": .str("text in the box"),
+                "label": .str("text in the box (at most 1000 characters)"),
                 "shape": .str("box shape (default roundedRectangle)", choices: DiagramSchemas.boxShapes.map { $0.rawValue }),
                 "color": .color,
-            ], required: ["id"]), "the boxes, in order"),
+            ], required: ["id"]), "the boxes, in order (at most 200)"),
             "edges": .arr(.obj([
                 "from": .str("node id"),
                 "to": .str("node id"),
-                "label": .str("text on the connector"),
-            ], required: ["from", "to"]), "connectors between nodes; a timeline with none is chained in node order"),
-            "layout": .str("tree: top-down hierarchy, flow: layered flowchart, timeline: one row, mindmap: radial",
+                "label": .str("text on the connector (at most 1000 characters)"),
+            ], required: ["from", "to"]), "connectors between nodes (at most 600); a timeline with none is chained in node order"),
+            "layout": .str("tree: top-down hierarchy, flow: layered flowchart, timeline: left to right (wraps into rows on a fixed-size page), mindmap: radial",
                            choices: DiagramLayoutKind.allCases.map { $0.rawValue }),
             "style": .str("classic (colour, default), gray or line (outlines only)", choices: DiagramStyle.allCases.map { $0.rawValue }),
             "origin": .point,
@@ -559,13 +602,20 @@ struct DiagramCreate: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let ws = ctx.workspace
-        let (doc, page, pageRecord) = try DiagramRefs.page(p.page, in: ws, path: "$.page")
+        let (doc, page, before) = try DiagramRefs.page(p.page, in: ws, path: "$.page")
         let nodes = p.nodes
         let n = nodes.count
         guard n > 0 else { throw NibError(.invalidParams, "nodes is empty", path: "$.nodes") }
-        guard n <= maxNodes else { throw NibError(.invalidParams, "at most \(maxNodes) nodes", path: "$.nodes") }
+        guard n <= maxNodes else {
+            throw NibError(.invalidParams, "at most \(maxNodes) nodes", path: "$.nodes", hint: "split it into several diagrams")
+        }
         let edges = p.edges ?? []
-        guard edges.count <= maxEdges else { throw NibError(.invalidParams, "at most \(maxEdges) edges", path: "$.edges") }
+        guard edges.count <= maxEdges else {
+            throw NibError(.invalidParams, "at most \(maxEdges) edges", path: "$.edges", hint: "split it into several diagrams")
+        }
+        if let o = p.origin, !o.x.isFinite || !o.y.isFinite {
+            throw NibError(.invalidParams, "origin must be finite", path: "$.origin")
+        }
 
         var index: [String: Int] = [:]
         for (i, node) in nodes.enumerated() {
@@ -577,6 +627,7 @@ struct DiagramCreate: NibCommand {
                 throw NibError(.invalidParams, "shape must be one of \(DiagramSchemas.boxShapes.map { $0.rawValue }.joined(separator: ", "))",
                                path: "$.nodes[\(i)].shape")
             }
+            try DiagramSchemas.checkLabel(node.label, path: "$.nodes[\(i)].label")
             index[node.id] = i
         }
         var pairs: [(Int, Int)] = []
@@ -591,6 +642,7 @@ struct DiagramCreate: NibCommand {
                                hint: "from and to are ids from nodes[].id")
             }
             guard u != v else { throw NibError(.invalidParams, "edge \(i) joins a node to itself", path: "$.edges[\(i)]") }
+            try DiagramSchemas.checkLabel(e.label, path: "$.edges[\(i)].label")
             pairs.append((u, v))
             edgeLabels.append(e.label)
         }
@@ -598,10 +650,10 @@ struct DiagramCreate: NibCommand {
             pairs = (1..<n).map { ($0 - 1, $0) }
             edgeLabels = [String?](repeating: nil, count: n - 1)
         }
-        let taken = try Set(ws.items(doc, page: page).map { $0.id })
-        let ids = try DiagramBuilder.itemIDs(nodeIDs: nodes.map { $0.id }, overrides: p.ids, taken: taken)
+        // Bad ids fail before the layout runs.
+        _ = try DiagramBuilder.itemIDs(nodeIDs: nodes.map { $0.id }, overrides: p.ids,
+                                       taken: Set(ws.items(doc, page: page).map { $0.id }))
 
-        // Layout (slow work happens before the transaction).
         var isRoot = [Bool](repeating: false, count: n)
         if p.layout == .tree || p.layout == .mindmap {
             let roots = DiagramLayout.spanningForest(count: n, edges: pairs).roots
@@ -610,12 +662,43 @@ struct DiagramCreate: NibCommand {
         let labels = nodes.map { $0.label ?? "" }
         let fonts = isRoot.map { $0 ? DiagramBuilder.rootFontSize : DiagramBuilder.fontSize }
         let boxes = (0..<n).map { DiagramLayout.nodeBox(label: labels[$0], fontSize: fonts[$0]) }
-        let result = DiagramLayout.layout(boxes, edges: pairs, kind: p.layout)
-        let s = DiagramBuilder.fitScale(result.size, page: pageRecord.size)
+
+        // The layout is pure value work that grows fast with the graph: off the main actor (ARCHITECTURE §14).
+        let edgePairs = pairs
+        let kind = p.layout
+        let pageSize = before.size
+        let arranged = await Task.detached(priority: .userInitiated) {
+            DiagramBuilder.arrange(boxes, edges: edgePairs, kind: kind, page: pageSize)
+        }.value
+
+        // The document may have changed during the await: resolve the page and the free ids again.
+        let (_, _, pageRecord) = try DiagramRefs.page(p.page, in: ws, path: "$.page")
+        guard pageRecord.size == pageSize else {
+            throw NibError(.conflict, "the page changed size while the diagram was laid out", path: "$.page",
+                           hint: "run diagram.create again")
+        }
+        let taken = try Set(ws.items(doc, page: page).map { $0.id })
+        let ids = try DiagramBuilder.itemIDs(nodeIDs: nodes.map { $0.id }, overrides: p.ids, taken: taken)
+
+        let result = arranged.result
+        let s = arranged.scale
+        let placed = NodeBox(w: result.size.w * s, h: result.size.h * s)
+        if let size = pageRecord.size {
+            // Nothing may land off a fixed-size page: off-page items never render and the lasso cannot reach them.
+            if let o = p.origin {
+                guard o.x >= 0, o.y >= 0, o.x + placed.w <= size.width + 1e-6, o.y + placed.h <= size.height + 1e-6 else {
+                    throw NibError(.invalidParams,
+                                   "the diagram (\(Int(placed.w.rounded())) × \(Int(placed.h.rounded())) pt) does not fit on the page at this origin",
+                                   path: "$.origin", hint: "leave origin out to centre it on the page, or use a whiteboard page")
+                }
+            } else if !arranged.fits {
+                throw NibError(.invalidParams, "diagram is too large for this page", path: "$.nodes",
+                               hint: "use a whiteboard page, split it into smaller diagrams, or try the mindmap layout")
+            }
+        }
         let session = ctx.activeSession
         let visible = session?.document == doc && session?.page == page ? session?.visibleRect : nil
-        let o = p.origin ?? DiagramBuilder.origin(for: NodeBox(w: result.size.w * s, h: result.size.h * s),
-                                                   page: pageRecord.size, visible: visible)
+        let o = p.origin ?? DiagramBuilder.origin(for: placed, page: pageRecord.size, visible: visible)
         func place(_ q: Point) -> Point { Point(o.x + q.x * s, o.y + q.y * s) }
 
         let style = p.style ?? .classic
