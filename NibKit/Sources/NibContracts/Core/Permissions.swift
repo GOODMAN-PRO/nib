@@ -32,6 +32,17 @@ public enum Principal: Hashable, Codable, CustomStringConvertible {
 
     public var isUser: Bool { self == .user }
 
+    /// contracts-v2: "user", "plugin", "ai", "bridge" or "sync" (per-kind gateway policies and presenters).
+    public var kind: String {
+        switch self {
+        case .user: return "user"
+        case .plugin: return "plugin"
+        case .ai: return "ai"
+        case .bridge: return "bridge"
+        case .sync: return "sync"
+        }
+    }
+
     /// The exposure bit a command needs for this principal to see it.
     public var exposure: Exposure {
         switch self {

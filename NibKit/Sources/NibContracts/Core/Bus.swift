@@ -48,6 +48,26 @@ public struct CommandHookDescriptor: Registrable {
     public var command: String
     /// Principal the hook runs as (`.plugin(id)` for plugins).
     public var principal: Principal
+    /// contracts-v2: a native hook (features only) runs this closure instead of a command: it gets the command id and
+    /// params and returns replacement params, nil to let the call pass, or throws to veto it. It must not change
+    /// documents. Lets a feature hook `export.run` (layers) or item-creating commands (board limit) without
+    /// registering an extra command id. `command` is ignored when set.
+    public var handler: (@MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?)?
+    /// contracts-v2: a native guard that also sees the call: a READ-ONLY `CommandContext` with the caller's principal,
+    /// session and group (`ctx.pageOrSession(_:)` resolves session defaults, `ctx.app` / `ctx.content` reach the app;
+    /// `ctx.mutate` throws). Same contract as `handler` (replacement params, nil, or throw to veto) and preferred over it.
+    /// Runs for every principal and for typed `bus.run` calls. Build with `CommandHookDescriptor.guarding(...)`.
+    public var contextHandler: (@MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)?
+
+    /// contracts-v2: a native guard hook with the call's context (see `contextHandler`), e.g. a board item limit that
+    /// vetoes item-creating commands from any principal.
+    public static func guarding(id: String, owner: String, commands: [String], order: Int = 0,
+                                _ body: @escaping @MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)
+        -> CommandHookDescriptor {
+        var d = CommandHookDescriptor(id: id, owner: owner, commands: commands, command: "", order: order)
+        d.contextHandler = body
+        return d
+    }
 
     public init(id: String, owner: String, commands: [String], command: String, principal: Principal = .user, order: Int = 0) {
         self.id = id
@@ -56,6 +76,19 @@ public struct CommandHookDescriptor: Registrable {
         self.commands = commands
         self.command = command
         self.principal = principal
+        self.handler = nil
+    }
+
+    /// contracts-v2: a native closure hook (see `handler`).
+    public init(id: String, owner: String, commands: [String], order: Int = 0,
+                handler: @escaping @MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?) {
+        self.id = id
+        self.order = order
+        self.owner = owner
+        self.commands = commands
+        self.command = ""
+        self.principal = .user
+        self.handler = handler
     }
 
     public func matches(_ commandID: String) -> Bool {
@@ -114,6 +147,64 @@ public final class CommandContext {
     /// The invoking session, else the most recently active window's session.
     public var activeSession: EditorSession? { session ?? bus.services.sessions.active }
 
+    // MARK: contracts-v2: typed access to the app
+
+    /// The app this command runs in (nil only for a `CommandBus` built outside `NibApp`). Prefer the typed accessors
+    /// below; never reach `NibApp.shared` from a command.
+    public var app: NibApp? { bus.app }
+    /// Non-UI registries: templates, drawers, importers, exporters, tape patterns, custom item types, key commands…
+    public var content: ContentRegistries { bus.content }
+    /// UI registries (toolbar, menus, panels, chrome overlays, canvas tools…); nil without an app.
+    public var ui: UIRegistries? { bus.app?.ui }
+    /// Navigator of the most recently active window (open tabs, show library, present modals); nil when headless.
+    public var navigator: SceneNavigator? { bus.app?.ui.activeNavigator }
+
+    /// True when the document must not be written: persistence refuses it (`DocumentPersistence.isReadOnly`, e.g. saved
+    /// by a newer Nib) or it is listed in the legacy `ServiceKeys.storeReadOnly` set.
+    public func isReadOnly(_ doc: DocumentID) -> Bool {
+        if workspace.isReadOnly(doc) { return true }
+        return services.get(ServiceKeys.storeReadOnly, as: NSSet.self)?.contains(doc.raw) ?? false
+    }
+
+    /// Makes this command's undo group ONE step across documents: undoing (or redoing) it in any of the documents it
+    /// changed also undoes it in the others, as long as it is still their latest step (`page.moveTo` between
+    /// documents, an AI turn that edits two notebooks).
+    public func linkUndoAcrossDocuments() {
+        bus.history.link(group)
+    }
+
+    // MARK: contracts-v2: session defaults (§6.1)
+
+    /// `ref` as a document id; when it is nil or empty, the invoking session's document (key commands, toolbar
+    /// buttons and menus run with static params). Throws `invalid_params` with a hint when neither exists.
+    public func documentOrSession(_ ref: String?, field: String = "doc") throws -> DocumentID {
+        if let r = ref, !r.isEmpty { return NodeRef.documentID(from: r) }
+        guard let doc = activeSession?.document else {
+            throw NibError.invalid("missing '\(field)' and no document is open", path: "$." + field)
+        }
+        return doc
+    }
+
+    /// `ref` as a page ("page:D/P"); when it is nil or empty, the invoking session's current page.
+    public func pageOrSession(_ ref: String?, field: String = "page") throws -> (doc: DocumentID, page: PageID) {
+        if let r = ref, !r.isEmpty {
+            guard case let .page(d, p)? = NodeRef(r) else {
+                throw NibError.invalid("'\(field)' must be a page ref like page:D/P", path: "$." + field)
+            }
+            return (d, p)
+        }
+        guard let s = activeSession, let d = s.document, let p = s.page else {
+            throw NibError.invalid("missing '\(field)' and no page is open", path: "$." + field)
+        }
+        return (d, p)
+    }
+
+    /// `refs` when given and non-empty, else the invoking session's selection refs ([] when nothing is selected).
+    public func refsOrSelection(_ refs: [String]?) -> [String] {
+        if let r = refs, !r.isEmpty { return r }
+        return activeSession?.selection.refs ?? []
+    }
+
     /// Runs synchronous writes atomically. Throwing (or an invariant failure) rolls everything back.
     /// All `mutate` calls in one command (and nested commands) share the undo group.
     /// `undoable: false` = persisted but not undoable (tape reveal, study grading, per-document view state).
@@ -164,10 +255,20 @@ public final class CommandContext {
     /// "tmp:<name>" (from `asset.upload`, renders, exports), "https://…" (downloaded to a temp file), and
     /// "file://…" only for the user principal or inside this app's tmp / Documents/Inbox folders — so the AI,
     /// plugins and the bridge can never read arbitrary sandbox paths (e.g. a locked document's package).
+    ///
+    /// contracts-v2 (security fix): downloads by non-user principals need `https`, the `network` scope, and — for plugins
+    /// whose manifest is known — a host listed in `network.hosts`; plain `http` is user-only. Every download is capped
+    /// at `NibLimits.maxDownloadBytes` and lands as `<tmp>/nib-downloads/<UUID>/<original file name>`, so importers can
+    /// title documents from `lastPathComponent`. `tmp:` names must be plain file names.
     public func inputFile(_ string: String) async throws -> URL {
         let fm = FileManager.default
         if string.hasPrefix("tmp:") {
-            guard let url = services.assets?.temporaryURL(AssetRef(String(string.dropFirst(4)))) else {
+            let name = String(string.dropFirst(4))
+            guard CommandContext.isPlainFileName(name) else {
+                throw NibError(.invalidParams, "invalid temporary asset name '\(name)'",
+                               hint: "pass the tmp: ref exactly as asset.upload returned it")
+            }
+            guard let url = services.assets?.temporaryURL(AssetRef(name)) else {
                 throw NibError.notFound("temporary asset \(string)")
             }
             return url
@@ -176,14 +277,9 @@ public final class CommandContext {
             throw NibError.invalid("not a URL: \(string)")
         }
         switch scheme {
-        case "https", "http" where principal.isUser:
-            let (tmp, response) = try await URLSession.shared.download(from: url)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                throw NibError(.unavailable, "download failed: \(url.absoluteString)")
-            }
-            let dest = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent)
-            try fm.moveItem(at: tmp, to: dest)
-            return dest
+        case "https", "http":
+            try authorizeDownload(url, scheme: scheme)
+            return try await CommandContext.download(url)
         case "file":
             if principal.isUser { return url }
             let path = url.standardizedFileURL.resolvingSymlinksInPath().path
@@ -199,6 +295,58 @@ public final class CommandContext {
             throw NibError.invalid("unsupported URL '\(string)'; use a tmp: ref from asset.upload or an https URL")
         }
     }
+
+    /// Who may download what (see `inputFile`).
+    func authorizeDownload(_ url: URL, scheme: String) throws {
+        if principal.isUser { return }
+        guard scheme == "https" else {
+            throw NibError(.permissionDenied, "only https URLs are accepted from \(principal)",
+                           hint: "use an https URL, or upload the bytes with asset.upload and pass the tmp: ref")
+        }
+        guard bus.gateway.grants(principal).contains(.network) else {
+            throw NibError(.permissionDenied, "downloading \(url.host ?? "a URL") needs the 'network' permission",
+                           hint: "upload the bytes with asset.upload and pass the tmp: ref")
+        }
+        if case let .plugin(id) = principal,
+           let manifest = services.get(ServiceKeys.pluginHost, as: PluginHosting.self)?.handle(id)?.manifest {
+            let host = (url.host ?? "").lowercased()
+            let hosts = (manifest.network?.hosts ?? []).map { $0.lowercased() }
+            guard hosts.contains(host) else {
+                throw NibError(.permissionDenied, "'\(host)' is not in the plugin's network.hosts",
+                               hint: "add the host to manifest network.hosts")
+            }
+        }
+    }
+
+    static func isPlainFileName(_ name: String) -> Bool {
+        !name.isEmpty && name.count <= 255 && !name.hasPrefix(".") && !name.contains("/") && !name.contains("\\")
+            && !name.contains("\0")
+    }
+
+    /// Downloads `url` (60 s timeout, `NibLimits.maxDownloadBytes` cap) into a fresh temporary folder, keeping its name.
+    static func download(_ url: URL) async throws -> URL {
+        let fm = FileManager.default
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
+        let (tmp, response) = try await URLSession.shared.download(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            try? fm.removeItem(at: tmp)
+            throw NibError(.unavailable, "download failed: \(url.absoluteString)")
+        }
+        let limit = Int64(NibLimits.maxDownloadBytes)
+        let size = ((try? fm.attributesOfItem(atPath: tmp.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        guard response.expectedContentLength <= limit, size <= limit else {
+            try? fm.removeItem(at: tmp)
+            throw NibError(.invalidParams, "the file at \(url.absoluteString) is larger than \(limit / 1_048_576) MB")
+        }
+        let folder = fm.temporaryDirectory.appendingPathComponent("nib-downloads", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let name = url.lastPathComponent
+        let dest = folder.appendingPathComponent(isPlainFileName(name) ? name : "download")
+        try fm.moveItem(at: tmp, to: dest)
+        return dest
+    }
 }
 
 /// Executes commands, commits transactions, drives undo/redo and merges remote changes.
@@ -212,6 +360,10 @@ public final class CommandBus {
     public let history: UndoHistory
     /// Before-command hooks (plugins' `contributes.commandHooks`, features). Run for every JSON and typed call.
     public let hooks = Registry<CommandHookDescriptor>()
+    /// contracts-v2: the owning app (set by `NibApp.init`; `CommandContext.app`).
+    public internal(set) weak var app: NibApp?
+    /// contracts-v2: the app's non-UI registries (`CommandContext.content`); an empty set for a bare bus.
+    public internal(set) var content = ContentRegistries()
     private var seq: UInt64 = 0
     private var observers: [UUID: (Changeset) -> Void] = [:]
 
@@ -271,6 +423,17 @@ public final class CommandBus {
         let group = inv.group ?? NibID.make().raw
         if !inv.skipHooks {
             for hook in hooks.all where hook.matches(d.id) {
+                if let guardBody = hook.contextHandler {
+                    let hookContext = CommandContext(bus: self, principal: inv.principal, group: group, depth: inv.depth,
+                                                     dryRun: inv.dryRun, session: inv.session, commandID: d.id,
+                                                     title: d.title, readOnly: true, inheritedPolicy: inv.inheritedPolicy)
+                    if let replaced = try await guardBody(d.id, params, hookContext), replaced != .null { params = replaced }
+                    continue
+                }
+                if let handler = hook.handler {
+                    if let replaced = try await handler(d.id, params), replaced != .null { params = replaced }
+                    continue
+                }
                 let r = try await execute(Invocation(command: hook.command, params: ["command": .string(d.id), "params": params],
                                                      principal: hook.principal, session: inv.session, group: group,
                                                      dryRun: inv.dryRun, depth: inv.depth + 1, readOnly: true, skipHooks: true))
@@ -332,12 +495,26 @@ public final class CommandBus {
 
     // MARK: Undo / redo / selective revert
 
+    /// Undoes the latest step of `doc` (and, for a group linked across documents, the same group's latest step in
+    /// every other document where it is still the latest). Returns false when there is nothing to undo.
     @discardableResult
     public func undo(_ doc: DocumentID) -> Bool {
         guard let entry = history.popUndo(doc) else { return false }
+        var entries = [(doc, entry)]
+        if entry.linked {
+            for other in history.linkedDocuments(entry.group, except: doc, redo: false) {
+                if let e = history.popUndo(other) { entries.append((other, e)) }
+            }
+        }
         let tx = DocTransaction(workspace: workspace, principal: .user, group: "undo:" + entry.group)
-        _ = tx.revert(entry.mutations)
-        history.pushRedo(UndoEntry(group: entry.group, label: entry.label, principal: entry.principal, mutations: tx.mutations), doc: doc)
+        for (_, e) in entries { _ = tx.revert(e.mutations) }
+        history.rebase(tx.rebase)
+        for (d, e) in entries {
+            var r = UndoEntry(group: e.group, label: e.label, principal: e.principal,
+                              mutations: tx.mutations.filter { $0.document == d })
+            r.linked = e.linked
+            history.pushRedo(r, doc: d)
+        }
         finishUnrecorded(tx, label: "Undo " + entry.label, command: CommandIDs.undo)
         return true
     }
@@ -345,9 +522,21 @@ public final class CommandBus {
     @discardableResult
     public func redo(_ doc: DocumentID) -> Bool {
         guard let entry = history.popRedo(doc) else { return false }
+        var entries = [(doc, entry)]
+        if entry.linked {
+            for other in history.linkedDocuments(entry.group, except: doc, redo: true) {
+                if let e = history.popRedo(other) { entries.append((other, e)) }
+            }
+        }
         let tx = DocTransaction(workspace: workspace, principal: .user, group: "redo:" + entry.group)
-        _ = tx.revert(entry.mutations)
-        history.pushUndo(UndoEntry(group: entry.group, label: entry.label, principal: entry.principal, mutations: tx.mutations), doc: doc)
+        for (_, e) in entries { _ = tx.revert(e.mutations) }
+        history.rebase(tx.rebase)
+        for (d, e) in entries {
+            var r = UndoEntry(group: e.group, label: e.label, principal: e.principal,
+                              mutations: tx.mutations.filter { $0.document == d })
+            r.linked = e.linked
+            history.pushUndo(r, doc: d)
+        }
         finishUnrecorded(tx, label: "Redo " + entry.label, command: CommandIDs.redo)
         return true
     }
@@ -358,6 +547,7 @@ public final class CommandBus {
         guard let entry = history.removeEntry(group: group, doc: doc) else { return nil }
         let tx = DocTransaction(workspace: workspace, principal: principal, group: NibID.make().raw)
         let skipped = tx.revert(entry.mutations)
+        history.rebase(tx.rebase)
         let n = tx.mutations.count
         if n > 0 { commit(tx, label: "Revert " + entry.label, command: CommandIDs.revertGroup, record: true) }
         return (n, skipped)
