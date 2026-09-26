@@ -5,9 +5,10 @@ import NibContracts
 import NibDesign
 
 /// Canvas tool "sticky" (key N): a tap places a note of the current colour, signed with the author name, centred
-/// under the finger, and opens it for typing straight away; `sticky.create` records it (with its text) when typing
-/// ends, as one undo step. Non-sticky: that commit is the tool's one use, so the toolbar then hands back the previous
-/// tool. Taps on existing notes reach `sticky.tapAt` first (tap handlers run before the tool).
+/// under the finger (`sticky.create`), and opens it for typing straight away; placing and typing are one undo step.
+/// Non-sticky: placing the note is the tool's one use, so it hands back to the previous tool at once
+/// (`CanvasHost.finishToolUse`), and the tap that ends typing does not place another note. Taps on existing notes reach
+/// `sticky.tapAt` first (tap handlers run before the tool).
 @MainActor
 final class StickyTool: CanvasTool {
     static let toolID = "sticky"
@@ -24,7 +25,11 @@ final class StickyTool: CanvasTool {
         let author = app.settings.get(NibSettings.authorName).trimmingCharacters(in: .whitespacesAndNewlines)
         let note = StickyItem(frame: StickyGeometry.frame(centredOn: sample.location, pageSize: pageSize),
                               color: StickySettings.currentColour(app.settings), author: author.isEmpty ? nil : author)
-        StickyEditor.editor(for: host).beginDraft(doc: doc, page: sample.page, note: note)
+        let editor = StickyEditor.editor(for: host)
+        editor.endEditing(save: true)
+        // Hand back before typing starts: the editor finishes editing on any later tool change.
+        if host.session.tool == id { host.finishToolUse(self) }
+        editor.placeNote(doc: doc, page: sample.page, note: note)
     }
 }
 
@@ -54,7 +59,8 @@ enum StickyPalette {
     }
 }
 
-/// Swatches in rows of 44 pt cells.
+/// The note colours as NibDesign's swatch grid (selection by swatch id, the hex of the colour; a selected colour
+/// matches its preset by hue).
 @MainActor
 struct StickySwatchGrid: View {
     let colours: [RGBA]
@@ -62,15 +68,16 @@ struct StickySwatchGrid: View {
     let choose: (RGBA) -> Void
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: NibMetrics.hitTarget, maximum: NibMetrics.hitTarget), spacing: 0)],
-                  alignment: .leading, spacing: 0) {
-            ForEach(colours, id: \.self) { c in
-                NibPenSwatch(StickyPalette.swatch(c), isSelected: selected.map { StickyPalette.same($0, c) } ?? false,
-                             size: .popover) { choose(c) }
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(String(localized: "Note colours"))
+        NibSwatchGrid(swatches: colours.map { StickyPalette.swatch($0) }, selection: selection)
+            .accessibilityLabel(String(localized: "Note colours"))
+    }
+
+    private var selection: Binding<String?> {
+        Binding(
+            get: { self.selected.flatMap { s in self.colours.first { StickyPalette.same($0, s) }?.hex } },
+            set: { id in
+                if let c = self.colours.first(where: { $0.hex == id }) { self.choose(c) }
+            })
     }
 }
 
@@ -175,8 +182,7 @@ struct StickyToolSettings: View {
 // MARK: - Inspector
 
 /// Style editor for selected sticky notes (the object menu's Style): colour, collapse, resolve, and whole-note text
-/// formatting (bold, italic, underline, strikethrough, size, alignment). Every change is a command and one undo step
-/// (a record is written once per step, so undo always restores it fully).
+/// formatting (bold, italic, underline, strikethrough, size, alignment). Every change is a command and one undo step.
 @MainActor
 struct StickyInspector: View {
     struct Target {
@@ -319,19 +325,19 @@ struct StickyInspector: View {
         let refs = targets.filter { !$0.locked && !StickyPalette.same($0.note.color, c) }.map { JSONValue.string($0.ref) }
         guard !refs.isEmpty else { return }
         for i in targets.indices where !targets[i].locked { targets[i].note.color = c }
-        run("sticky.setColor", ["refs": .array(refs), "color": .string(c.hex)])
+        run(StickySetColor.descriptor.id, ["refs": .array(refs), "color": .string(c.hex)])
     }
 
     private func setCollapsed(_ on: Bool) {
         let refs = targets.filter { $0.note.collapsed != on }.map { JSONValue.string($0.ref) }
         guard !refs.isEmpty else { return }
         for i in targets.indices { targets[i].note.collapsed = on }
-        run("sticky.setCollapsed", ["refs": .array(refs), "collapsed": .bool(on)])
+        run(StickySetCollapsed.descriptor.id, ["refs": .array(refs), "collapsed": .bool(on)])
     }
 
     private func setResolved(_ on: Bool) {
         let calls = targets.filter { $0.note.resolved != on }.map { t -> JSONValue in
-            ["command": "sticky.resolve", "params": ["ref": .string(t.ref), "resolved": .bool(on)]]
+            ["command": .string(StickyResolve.descriptor.id), "params": ["ref": .string(t.ref), "resolved": .bool(on)]]
         }
         guard !calls.isEmpty else { return }
         for i in targets.indices { targets[i].note.resolved = on }

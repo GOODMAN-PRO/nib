@@ -299,64 +299,138 @@ enum StickyHit {
     }
 }
 
-// MARK: - Children of a deleted note
+// MARK: - Items dropped onto notes
 
-/// Items attached to a note (`attachedTo`, set by plugins, the AI or `item.update`) are let go when the note is
-/// deleted, so they stay editable: `DocTransaction.validate` refuses any later write of an item attached to a missing
-/// item. Applied as `item.update {attachedTo: null}` in the deleting commit's own undo group, so one undo brings the
-/// note and its children back together.
+/// "Items dropped onto an expanded note get `attachedTo`", so they travel with it: after a commit that moved items on
+/// a page, or put items there by any means but writing ink (paste, duplicate, drag and drop, elements, images, a move
+/// from another page), each such item is attached to the topmost expanded note beneath its centre, or let go of the
+/// note it was moved off. Items attached to a note the commit deleted are let go too, so they stay editable
+/// (`DocTransaction.validate` refuses any later write of an item attached to a missing item).
 ///
-/// A follow-up only ever writes records its commit did not write. Rewriting a record in the same undo group (for
-/// example attaching an item a move or paste just dropped onto a note) breaks undo: `DocTransaction.revert` reverts
-/// the later write, then skips the earlier one because the record's rev changed, so the item would stay where it was
-/// dropped. That is why items dropped onto a note are not attached automatically until the core coalesces repeated
-/// writes of one record in an undo entry (contract gap).
-enum StickyOrphans {
-    /// Commits that never detach: undo and redo (their follow-up would clear the redo stack), sync (the deleting
-    /// device detaches and syncs that), the follow-up updates themselves, and sticky commands (they never delete).
-    static func considers(command: String, principal: Principal) -> Bool {
+/// Applied as `item.update {attachedTo}` (F003) in the commit's own undo group. The dropped item is then written twice
+/// in one group; contracts-v2 (G4) reverts such a record all the way, so one undo puts the item back where it was
+/// and as it was attached, and one redo drops and attaches it again.
+enum StickyAttach {
+    struct Change: Equatable {
+        var item: ElementID
+        var parent: ElementID?
+    }
+
+    /// Commits whose moves and drops are attached: every one but undo, redo and group reverts (they restore
+    /// `attachedTo` themselves), sync, `item.update` (the follow-ups, and attachments plugins or the AI set on purpose)
+    /// and sticky commands.
+    static func attachesDrops(command: String, principal: Principal) -> Bool {
+        releasesChildren(command: command, principal: principal) && command != CommandIDs.revertGroup
+    }
+
+    /// Commits whose deleted notes let go of their children: every one but undo and redo (their follow-up would clear
+    /// the redo stack), sync (the deleting device lets go and syncs that), `item.update` and sticky commands (they
+    /// never delete).
+    static func releasesChildren(command: String, principal: Principal) -> Bool {
         if case .sync = principal { return false }
         let skipped: Set<String> = [CommandIDs.undo, CommandIDs.redo, CommandIDs.itemUpdate, "sync.merge"]
         return !skipped.contains(command) && !command.hasPrefix("sticky.")
     }
 
-    /// The live items on a page attached to one of `deletedNotes`, leaving out every record the commit wrote itself
-    /// (`written`), in page order.
-    static func plan(deletedNotes: Set<ElementID>, written: Set<ElementID>, pageItems: [Item]) -> [ElementID] {
-        guard !deletedNotes.isEmpty else { return [] }
-        return pageItems.compactMap { it -> ElementID? in
-            guard !it.deleted, !written.contains(it.id), let parent = it.attachedTo, deletedNotes.contains(parent) else { return nil }
-            return it.id
+    /// Kinds that can sit on a note (connectors follow their anchors, comments their target, notes don't nest).
+    static func attachable(_ it: Item) -> Bool {
+        it.kind != .sticky && it.kind != .connector && it.kind != .comment
+    }
+
+    /// One page of a commit. `moved` and `created` are its after-values there (`created` also holds items moved in
+    /// from another page); `arrivedFrom` the note each item moved in from another page was attached to there;
+    /// `deletedNotes` the notes it deleted there; `pageItems` the page as it is now (z order, bottom first).
+    static func plan(moved: [Item], created: [Item], arrivedFrom: [ElementID: ElementID] = [:],
+                     deletedNotes: Set<ElementID>, pageItems: [Item]) -> [Change] {
+        let live = pageItems.filter { !$0.deleted }
+        var position: [ElementID: Int] = [:]
+        for (i, it) in live.enumerated() { position[it.id] = i }
+        let notes = live.filter { $0.kind == .sticky && $0.sticky != nil }
+        let noteIDs = Set(notes.map { $0.id })
+        // Notes that moved on this page, or came onto it, in this commit: their children travelled with them.
+        let travelling = Set((moved + created).map { $0.id }).intersection(noteIDs)
+        let orphans = live.filter { $0.attachedTo.map { deletedNotes.contains($0) } ?? false }
+        var seen = Set<ElementID>()
+        var out: [Change] = []
+        for candidate in moved + created + orphans where seen.insert(candidate.id).inserted {
+            guard let pos = position[candidate.id] else { continue }
+            let it = live[pos]
+            guard attachable(it) else { continue }
+            if let parent = it.attachedTo, travelling.contains(parent) { continue }       // travelled with its note
+            // Moved to another page together with its note (`DocTransaction.move` drops a parent that was not on the
+            // new page yet): attached to it again.
+            if let parent = arrivedFrom[it.id], travelling.contains(parent) {
+                if it.attachedTo != parent { out.append(Change(item: it.id, parent: parent)) }
+                continue
+            }
+            let parentNote = it.attachedTo.flatMap { p in notes.first { $0.id == p } }
+            let parentIsNote = parentNote != nil || (it.attachedTo.map { deletedNotes.contains($0) } ?? false)
+            if it.attachedTo != nil && !parentIsNote { continue }                         // another container's child
+            let centre = it.bounds.center
+            let target = notes.last { n in
+                guard let s = n.sticky, !s.collapsed, let np = position[n.id], np < pos else { return false }
+                return Geo.polygonContains(s.frame.corners, centre)
+            }
+            // A child of a collapsed note moved within the note's frame stays with it.
+            if target == nil, let n = parentNote, let s = n.sticky, s.collapsed,
+               Geo.polygonContains(s.frame.corners, centre) { continue }
+            if target?.id != it.attachedTo { out.append(Change(item: it.id, parent: target?.id)) }
         }
+        return out
     }
 
     /// The commit observer (installed in `start`).
     @MainActor
     static func commitDidHappen(_ cs: Changeset, app: NibApp) {
-        guard considers(command: cs.command, principal: cs.principal) else { return }
-        var work: [String] = []
+        let attaches = attachesDrops(command: cs.command, principal: cs.principal)
+        let releases = releasesChildren(command: cs.command, principal: cs.principal)
+        guard attaches || releases, app.commands.entry(CommandIDs.itemUpdate) != nil else { return }
+        let inkCommit = cs.command.hasPrefix("ink.")
+        // The note each item that left a page was attached to there (a move to another page is a tombstone on the old
+        // page and a new record on the new one, in the same commit).
+        var departed: [ElementID: ElementID] = [:]
+        for m in cs.mutations {
+            guard case let .item(_, _, before?, after) = m, after.deleted, !before.deleted,
+                  let parent = before.attachedTo else { continue }
+            departed[after.id] = parent
+        }
+        var work: [(ref: String, parent: String?)] = []
         for (doc, pages) in cs.itemPages {
             for page in pages {
-                var written = Set<ElementID>()
+                var moved: [Item] = [], created: [Item] = []
                 var deletedNotes = Set<ElementID>()
                 for m in cs.mutations {
                     guard case let .item(d, p, before, after) = m, d == doc, p == page else { continue }
-                    written.insert(after.id)
-                    if after.deleted, after.kind == .sticky, before.map({ !$0.deleted }) ?? false { deletedNotes.insert(after.id) }
+                    let wasLive = before.map { !$0.deleted } ?? false
+                    if after.deleted {
+                        if releases && wasLive && after.kind == .sticky { deletedNotes.insert(after.id) }
+                    } else if !attaches {
+                        continue
+                    } else if !wasLive {
+                        if !inkCommit { created.append(after) }
+                    } else if let b = before, b.bounds != after.bounds {
+                        moved.append(after)
+                    }
                 }
-                guard !deletedNotes.isEmpty, let items = try? app.workspace.allItems(doc, page: page) else { continue }
-                for id in plan(deletedNotes: deletedNotes, written: written, pageItems: items) {
-                    work.append(NodeRef.item(doc, page, id).description)
+                guard !(moved.isEmpty && created.isEmpty && deletedNotes.isEmpty),
+                      let items = try? app.workspace.allItems(doc, page: page) else { continue }
+                var arrived: [ElementID: ElementID] = [:]
+                for it in created { if let parent = departed[it.id] { arrived[it.id] = parent } }
+                for c in plan(moved: moved, created: created, arrivedFrom: arrived, deletedNotes: deletedNotes,
+                              pageItems: items) {
+                    work.append((NodeRef.item(doc, page, c.item).description,
+                                 c.parent.map { NodeRef.item(doc, page, $0).description }))
                 }
             }
         }
         guard !work.isEmpty else { return }
         Task { @MainActor in
-            for ref in work {
-                // ponytail: a failure (item gone, permission, item.update not installed) leaves that child attached to
-                // the deleted note; the note's own delete and its undo are unaffected.
+            for w in work {
+                let parent: JSONValue = w.parent.map { .string($0) } ?? .null
+                // ponytail: a failure (item gone meanwhile, permission) leaves that item as the commit left it; the
+                // commit itself and its undo are unaffected.
                 _ = try? await app.bus.execute(Invocation(command: CommandIDs.itemUpdate,
-                                                          params: ["ref": .string(ref), "patch": ["attachedTo": .null]],
+                                                          params: ["ref": .string(w.ref), "patch": ["attachedTo": parent]],
                                                           principal: cs.principal, group: cs.group))
             }
         }

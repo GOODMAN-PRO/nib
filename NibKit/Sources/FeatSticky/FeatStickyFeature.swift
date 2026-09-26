@@ -3,11 +3,10 @@ import NibContracts
 import NibDesign
 
 /// F036 Sticky notes (T-071, T-107): the "sticky" canvas tool (key N) with its colour options and settings, the
-/// "sticky" item drawer (a collapsed note draws as an icon, in exports too), in-place text editing, the tap handlers
-/// that expand a collapsed note or edit the selected one, author signatures (`NibSettings.authorName`), resolve, the
-/// sticky-note inspector, object-menu and page long-press entries, and letting go of a deleted note's children.
-/// Items dropped onto a note are not attached automatically: that follow-up would rewrite the dropped item in the
-/// drop's own undo group, which the core's undo cannot revert fully (see `StickyOrphans`).
+/// "sticky" item drawer (a collapsed note draws as an icon, in exports too, and is hit only there) and text layout,
+/// in-place text editing with autosave, the tap handlers that expand a collapsed note or edit the selected one, author
+/// signatures (`NibSettings.authorName`), resolve, the sticky-note inspector, object-menu and page long-press entries,
+/// and attaching items dropped onto an expanded note (`StickyAttach`; one undo takes back the drop and the attachment).
 /// Commands: sticky.create, sticky.setCollapsed, sticky.resolve, sticky.setColor (edit) and sticky.tapAt (session).
 public enum FeatStickyFeature: NibFeature {
     public static let id = "sticky"
@@ -22,6 +21,10 @@ public enum FeatStickyFeature: NibFeature {
         app.commands.register(StickyTapAt.self)
 
         app.content.drawers.register(ItemDrawerEntry(key: ItemKind.sticky.rawValue, owner: id, drawer: StickyDrawer()))
+        // Where note text lays out on the page (link hit-testing, other editors, the AI's context).
+        app.content.textLayouts.register(TextLayoutDescriptor(key: ItemKind.sticky.rawValue, owner: id) { item in
+            item.sticky.flatMap { StickyGeometry.textLayout($0) }
+        })
 
         // Before selection.tapAt (400): a tap on the selected note edits it instead of re-selecting it.
         for gesture in [CanvasGesture.tap, .doubleTap] {
@@ -57,11 +60,12 @@ public enum FeatStickyFeature: NibFeature {
         registerMenus(app)
     }
 
-    /// Installs the observer that lets go of a deleted note's children (`StickyOrphans`).
+    /// Installs the observer that attaches items dropped onto a note and lets go of a deleted note's children
+    /// (`StickyAttach`).
     public static func start(_ app: NibApp) async {
         app.bus.observeCommits { [weak app] cs in
             guard let app else { return }
-            StickyOrphans.commitDidHappen(cs, app: app)
+            StickyAttach.commitDidHappen(cs, app: app)
         }
     }
 

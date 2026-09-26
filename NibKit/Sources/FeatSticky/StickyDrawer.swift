@@ -41,8 +41,8 @@ enum StickyGeometry {
     /// A new note is a square of this side.
     static let noteSide = 160.0
     static let padding = 12.0
-    /// Side of the collapsed note icon (drawn at the frame's top-left; the frame keeps the expanded size, so an
-    /// export that expands collapsed notes only flips the flag).
+    /// Side of the collapsed note icon, drawn at the frame's top-left. The frame keeps the expanded size, so expanding
+    /// (or an export that prints collapsed notes expanded, on a copy) only flips `collapsed`.
     static let iconSide = 28.0
     /// Height of the author / resolved line at the bottom of a note.
     static let footerHeight = 11.0
@@ -65,6 +65,28 @@ enum StickyGeometry {
         let f = s.frame
         let bottom = hasFooter(s) ? padding + footerHeight + 4 : max(padding, fold(width: f.w, height: f.h))
         return Rect(x: padding, y: padding, width: max(0, f.w - 2 * padding), height: max(0, f.h - padding - bottom))
+    }
+
+    /// A rect of the note's own unrotated space (origin at the frame's top-left) as a page frame, turned with the note
+    /// about the note's centre (the inverse of `local(_:in:)`).
+    static func pageFrame(_ r: Rect, in f: Frame) -> Frame {
+        let c = f.center
+        let dx = r.midX - f.w / 2, dy = r.midY - f.h / 2
+        let cs = cos(f.rotation), sn = sin(f.rotation)
+        let cx = c.x + dx * cs - dy * sn, cy = c.y + dx * sn + dy * cs
+        return Frame(x: cx - r.width / 2, y: cy - r.height / 2, w: r.width, h: r.height, rotation: f.rotation)
+    }
+
+    /// The icon a collapsed note is drawn as, at the frame's top-left, in page space.
+    static func iconFrame(_ s: StickyItem) -> Frame {
+        let side = iconSide(s.frame)
+        return pageFrame(Rect(x: 0, y: 0, width: side, height: side), in: s.frame)
+    }
+
+    /// Where the note's text lays out on the page (`content.textLayouts`); nil while collapsed, when no text shows.
+    static func textLayout(_ s: StickyItem) -> TextLayoutInfo? {
+        guard !s.collapsed else { return nil }
+        return TextLayoutInfo(container: pageFrame(textRect(s), in: s.frame), base: textBase)
     }
 
     /// A note whose top-left corner is `at`, kept on the page when the page is big enough (boards are infinite).
@@ -90,8 +112,9 @@ enum StickyGeometry {
         return Point(dx * cs - dy * sn + f.w / 2, dx * sn + dy * cs + f.h / 2)
     }
 
-    /// True when a tap at `p` lands on the note as drawn: the whole note, or only its icon when collapsed. The icon's
-    /// target grows to `minimumSide` (44 view points at the current zoom) around it.
+    /// True when a tap at `p` lands on the note as drawn: the whole note, or only its icon when collapsed (the area
+    /// `StickyDrawer.hitBounds` gives the canvas). The icon's target grows to `minimumSide` (44 view points at the
+    /// current zoom) around it.
     static func hits(_ s: StickyItem, _ p: Point, minimumSide: Double = 0) -> Bool {
         let q = local(p, in: s.frame)
         guard s.collapsed else { return q.x >= 0 && q.y >= 0 && q.x <= s.frame.w && q.y <= s.frame.h }
@@ -102,8 +125,7 @@ enum StickyGeometry {
 }
 
 /// Paints a sticky note into any y-down CGContext whose unit is one page point: dry tiles, thumbnails, exports
-/// (through `StickyDrawer`) and the editing overlay. Pure and thread-safe. The `collapsed` flag is the drawer flag
-/// that makes exports show collapsed notes as icons.
+/// (through `StickyDrawer`) and the editing overlay. Pure and thread-safe. A collapsed note paints only its icon.
 enum StickyPainter {
     /// `pixelsPerPoint` sizes the shadow (CoreGraphics shadows are in device pixels). `drawsText: false` leaves the
     /// text out (the editing overlay puts a live text view there).
@@ -249,11 +271,26 @@ enum StickyPainter {
     }
 }
 
-/// `ItemDrawer` for `Item.drawKey` "sticky": shadowed square, folded corner, text, author and resolved mark; a
-/// collapsed note draws as its icon (tiles, thumbnails and exports alike).
+/// `ItemDrawer` for `Item.drawKey` "sticky": shadowed square, folded corner, text, author and resolved mark. A
+/// collapsed note draws as its icon for every `DrawContext.purpose`, exports included (the spec's "collapsed notes
+/// export as icons"); its frame keeps the expanded size, so it takes taps and lasso hits, and dirties tiles, only
+/// where the icon is (`hitBounds`, `paintBounds`).
 final class StickyDrawer: ItemDrawer {
     func draw(_ item: Item, in context: DrawContext) {
         guard let s = item.sticky else { return }
         StickyPainter.paint(s, in: context.cg, pixelsPerPoint: context.scale)
+    }
+
+    /// A collapsed note is hit only on its visible icon; an expanded one on its whole frame (`Item.bounds`).
+    func hitBounds(_ item: Item) -> Rect? {
+        guard let s = item.sticky, s.collapsed else { return nil }
+        return StickyGeometry.iconFrame(s).bounds
+    }
+
+    /// A collapsed note paints only its icon and the icon's shadow (within `NibLimits.drawerMargin`); an expanded one
+    /// stays within its frame and shadow (the default).
+    func paintBounds(_ item: Item) -> Rect? {
+        guard let s = item.sticky, s.collapsed else { return nil }
+        return StickyGeometry.iconFrame(s).bounds.insetBy(-NibLimits.drawerMargin)
     }
 }
