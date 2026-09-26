@@ -10,6 +10,23 @@ struct WaterCluster: Identifiable, Equatable {
     var frame: CGRect
     /// 0.22 while any member recedes (the union cannot fade one member without changing its shape).
     var opacity: Double
+    /// The union's rim strength (its most lifted member's), shadow opacity multiplier and shadow offset (DESIGN.md §10.9).
+    var rim: Float = 1
+    var shadow: Float = 1
+    var shadowY: Float = Float(NibOptics.shadowOffset)
+
+    /// One union has one rim and one shadow: the rim follows the most lifted member; the shadow deepens from 1× at 5 pt
+    /// to 1.6× at 8 pt with the lift of the members that cast one, and is 0 when none does (lifted covers and
+    /// thumbnails bring their own).
+    static func optics(_ members: [DropletField.Render]) -> (rim: Float, shadow: Float, shadowY: Float) {
+        let rim = members.map(\.rim).max() ?? 1
+        let casting = members.filter(\.castsShadow)
+        guard !casting.isEmpty else { return (Float(rim), 0, Float(NibOptics.shadowOffset)) }
+        let lift = CGFloat(min(max(casting.map(\.lift).max() ?? 0, 0), 1))
+        let shadow = 1 + (NibOptics.liftedShadow - 1) * lift
+        let y = NibOptics.shadowOffset + (NibOptics.liftedShadowOffset - NibOptics.shadowOffset) * lift
+        return (Float(rim), Float(shadow), Float(y))
+    }
 
     /// Union-find over the linked pairs; groups keep the order of `ids`.
     static func groups(_ ids: [String], linked: Set<DropletField.PairKey>) -> [[String]] {
