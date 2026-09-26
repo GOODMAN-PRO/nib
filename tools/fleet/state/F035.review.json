@@ -1,0 +1,89 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatElements/ElementStore.swift:671-700 (ensureStarters / writeStarter), called from FeatElementsFeature.start and ElementCatalog.prepare",
+      "problem": "Starter collection and element records are stamped with `tick()`, which is the current time. On a second device whose library sync has not delivered the other device's `elements/starter-*/index.<dev>.json` yet, the file provider latency case in ARCHITECTURE §21, `index(id).collection == nil` is true, so the device writes fresh starter records at time T2. These beat every earlier edit made on the first device at time T1 < T2 once the files merge: a deleted starter collection comes back on both devices, renamed or reordered starter collections revert, and starter elements that were renamed or deleted come back. The comment says 'a deleted one stays deleted', which only holds when sync has already delivered the files. testStarterCollections covers only the already-synced case.",
+      "fix": "In writeStarter, stamp every starter CollectionRecord and ElementRecord with a floor revision instead of tick(), for example `Rev(wallMs: 1, counter: UInt32(i), device: 0)` (any fixed rev near zero), so any real edit or tombstone from any device wins in LWW.merge. Two fresh devices still produce equal-rev records that merge deterministically, because LWW keeps the base and files are merged in sorted order. Add a test: device A deletes starter-labels and renames starters-stickers/star; device B, on an empty folder, calls ensureStarters; sync both ways; assert the tombstone and the rename win on both stores."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatElements/ElementsPopover.swift:261-286 (ElementsModel.insert / insertGIF); FeatElementsFeature.swift:50-65 (ElementsTool)",
+      "problem": "The spec says the tool is non-sticky, and the CanvasTool contract says 'non-sticky tools return to the previous tool after one use'. ElementsTool's doc comment says 'an insert hands the palette back to the previous tool', but no code does this. After inserting a sticker or GIF, the Elements tool stays active (input mode .taps). The next tap on the page is used up switching tools, so the user cannot write or lasso straight away. Only a page tap reverts the tool.",
+      "fix": "After a successful insert, return to the previous tool. In insert(_:), make the Task `if await call(ElementInsert.self, params) != nil { handBack() }`, with `func handBack() { if session.tool == ElementsTool.toolID, let p = session.previousTool, p != ElementsTool.toolID { app.perform(CommandIDs.toolSelect, [\"tool\": .string(p)], session: session) } }`. In insertGIF, run image.insert through `try await app.bus.run`, or call handBack after perform. Leave the tool active only when the insert fails."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementStore.swift:454-468 (index) and all tick() call sites",
+      "problem": "The hybrid logical clock never observes revisions read from other devices' index files (Workspace does call clock.observe for document records). Example: device B's clock runs 5 minutes behind. B renames an element 1 minute after A renamed it. B's rev is older than A's, so the merged index keeps A's title. element.rename reports success, but element.list immediately shows the old name.",
+      "fix": "Give ElementStore an `observe: (Rev) -> Void` closure next to `tick`, passing `{ clock.observe($0) }` from ElementCatalog and ElementMenu. In index(_:), after merging, call observe on the collection rev and on the maximum element rev before any tick() that follows."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementStore.swift:507-517 (write) and 454-468 (index)",
+      "problem": "write() deletes every provider conflict copy in the folder, including copies that failed to decode in index() (index skips them with try?) and copies that arrived between the read and the write. Their edits are lost without being merged. ARCHITECTURE §4 allows deleting conflict copies only after they have been merged.",
+      "fix": "Have index(_:) also return the names of the conflict copies it decoded successfully (for example `func indexAndMerged(_ c:) -> (CollectionIndex, Set<String>)`), pass that set to write(_:to:mergedCopies:), and delete only those names."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementCommands.swift:142-145 (ElementCreate.run)",
+      "problem": "The code checks that each ref exists with `pageItems.contains(where:)` inside a loop over ids. That is O(selected × page items) on the main actor. Lassoing about 5,000 strokes on a dense page and choosing Create Element does about 25M string comparisons, a visible freeze well over the 16 ms command budget (§14).",
+      "fix": "Build `let present = Set(pageItems.lazy.filter { !$0.deleted }.map { $0.id })` once and test `present.contains(id)` in the loop."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementStore.swift:797-878 (ElementCatalog.collections/list/fragment/exportEntries), ElementsPopover.swift:943-953 (ElementThumbnails)",
+      "problem": "Content-pack collections are loaded in full (`d.load()`, which decodes every entry's base64 assets) for each thumbnail, each 150-element list page, each collection count and each exported element. That makes a pack of n elements O(n²) work on the single serial ElementIO queue, so thumbnails of a large pack delay element.insert, which waits behind them on the same queue.",
+      "fix": "Memoise loaded plugin entries per ElementCatalog snapshot: store a small final class cache (dictionary keyed by descriptor id, guarded by NSLock) in ElementCatalog, fill it in loadPlugin, and reuse it in collections(), list(), fragment() and exportEntries(). The popover already rebuilds the catalog on reload and on nibRegistryDidChange, so the cache expires with it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementStore.swift:797-837 (ElementCatalog.collections/list/fragment call prepare())",
+      "problem": "The read commands element.collection.list, element.list and element.export (and thumbnail and drag reads) write starter collections into .nib-library, even under dryRun or in Ask-mode (read-only) contexts. ARCHITECTURE §6.1 says read commands are read-only.",
+      "fix": "Remove prepare() from collections(), list() and fragment(). Keep it in FeatElementsFeature.start and in the library-effect commands, which already call it inside their ElementIO blocks. To cover a library that is switched mid-session, also call it from the popover's first reload through a library command path, or accept that starters appear after the next start()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementCommands.swift:236-248 (ElementInsert asset copy) and ElementStore.swift:198-241 (fragment decode)",
+      "problem": "Asset names and extensions from untrusted fragments (imported .nibcollection files, content packs, AI JSON) are passed through unchecked. The extension `(name as NSString).pathExtension` goes straight to AssetStore.put. Item asset references that are not in `fragment.assets` keep their raw name, so the new items point at a missing asset or at an unrelated asset with that name in the target document.",
+      "fix": "In ElementInsert, before mutate, collect `fragment.items.flatMap(ElementFragment.assetRefs)` and throw `NibError.invalid(\"element references asset '<name>' it does not carry\", path: \"$.element\")` when a referenced name is missing from fragment.assets. Sanitise the extension with `ext.range(of: \"^[A-Za-z0-9]{1,8}$\", options: .regularExpression) != nil ? ext : \"png\"`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementsPopover.swift:86, 726, 1326",
+      "problem": "Counted copy is not pluralised, and FeatElements has no string catalog with plural variants. It reads 'The 1 elements in this collection…', '1 elements' (VoiceOver value on the collection chips) and 'Imported 1 elements into…'.",
+      "fix": "Use automatic grammar agreement, for example `String(AttributedString(localized: \"^[\\(c.count) element](inflect: true)\").characters)`, for the count fragments. Or reword to avoid the number, for example 'Every element in this collection is removed on every device.'"
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementsPopover.swift:413-434 (searchGIFs more:)",
+      "problem": "GIPHY pagination can return the same GIF on two pages. `gifs + out.gifs` then holds duplicate `id`s, which `ForEach(model.gifs)` needs to be unique, causing undefined SwiftUI diffing and cells that are wrong or missing. Overlapping searches (a kind switch while a search is in flight) can also finish out of order and show the older results.",
+      "fix": "Append only new ids: `let seen = Set(gifs.map(\\.id)); gifs += out.gifs.filter { !seen.contains($0.id) }`. Keep a `searchToken` UUID set at the start of each search, and drop results whose token is no longer current."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementsPopover.swift:438-453 (galleryPanel / galleryView)",
+      "problem": "The Marketplace button finds F080's library-tab panel by owner string and builds its view inside this feature's own sheet, instead of opening it through the command every other caller uses. That skips the panel host's presentation rules and ties this feature to the `pluginmanager` owner string.",
+      "fix": "Keep the lookup only to decide whether to show the button. On tap, call `app.perform(\"panel.open\", [\"id\": .string(panel.id)], session: session)` (F017) and drop the `.gallery` sheet case."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/ElementStore.swift:531-542 (createCollection)",
+      "problem": "After element.collection.delete, the tombstoned folder stays on disk, so `element.collection.create {id: sameId}` fails with `conflict` forever. An AI or plugin that recreates a collection by its own id after deleting it can never do so, although the hint implies the id is in use.",
+      "fix": "When the existing folder's merged index is not live (`!index(id).isLive`, same-case match), revive it the way ensureDefaultCollection does: write a new CollectionRecord with tick(), the new title and nextOrder(), keeping the element tombstones. Raise conflict only for a live collection."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatElements/FeatElementsFeature.swift:78-87 (ElementMenu.createParams)",
+      "problem": "Building the object-menu params creates an ElementStore and calls isLive(last). That lists the folder and decodes every index file synchronously on the main actor, while the menu item is being run.",
+      "fix": "Pass `collection: last` and let element.create fall back: in ElementCreate.run, if the collection is not live and not a plugin collection, fall back to ElementStore.defaultCollectionID inside the existing ElementIO block. Or do the check inside ElementIO."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatElementsTests/FeatElementsTests.swift",
+      "problem": "Several risky paths are untested: starters written before a lagging sync delivers another device's tombstone or rename (the major above), element.collection.update reordering (including the equal-key branch), the zip size and count limits in ElementArchive.read, and the non-sticky hand-back after insert.",
+      "fix": "Add a two-store test for starter resurrection with the floor-rev fix. Add a reorder test: create 3 collections, move the last to position 0, assert the order from element.collection.list. Add an archive test that builds a zip with an entry over maxEntryBytes (or temporarily lowered limits through a parameter) and asserts invalidParams."
+    }
+  ]
+}

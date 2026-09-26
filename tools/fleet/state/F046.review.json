@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatOutline/OutlinePanel.swift:991 (OutlineCell.configure) and :1160-1163 (BookmarkRowView)",
+      "problem": "The current page is shown by colour alone: the accent page number in outline rows and the accent 'Page N' text in bookmark rows. There is no second visual cue (VoiceOver gets 'Current page', but sighted users do not). This fails the DESIGN.md §16 Slop checklist line 'state is never colour alone', which the gate treats as a rejection. The design system's own rows pair the colour with a second cue: NibSidebarRow uses a fill3 background plus a semibold title, and NibPageThumbnail uses an accent ring.",
+      "fix": "Add a cue that is not colour. In OutlineCell.configure, when row.isCurrent, set backgroundView to the same inset fill3 rounded view used for selectedBackgroundView (NibUIColor.fill3, NibRadius.sidebarRow, inset NibSpacing.xs) and set it to nil otherwise. In BookmarkRowView, add `.background(row.isCurrent ? NibColor.fill3 : Color.clear, in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))` and use NibFont.bodyEmphasis for the current page number, or draw the current-page ring with NibPageThumbnail."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOutline/OutlinePanel.swift:174-200 (ThumbnailStore.invalidate/request)",
+      "problem": "If a page is invalidated while its render is still running, the page stays in `loading`, so the rebuild's re-request is skipped. When the old render finishes, the generation no longer matches and it is dropped without a new request and without onLoad. The thumbnail then stays blank until some unrelated refresh. This happens reliably when you write on a bookmarked page with the Bookmarks tab, or Show Thumbnails, open. invalidate also clears the old image at once, so the row flashes to the placeholder after every stroke.",
+      "fix": "In the completion's generation-mismatch branch, call `self.request(doc: doc, page: page, renderer: renderer)` instead of returning. In invalidate, keep the stale image and only bump the generation, then replace the image when the new render lands, so there is no flicker."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOutline/OutlinePanel.swift:264-272 (PanelDocumentTracker.handle), :1061-1066 (BookmarksPanelModel.rebuild)",
+      "problem": "Every commit to the open document runs a full rebuild on the main actor: livePages is sorted twice, the PDF outline rows are flattened, and the sections are diffed. Each stroke is a commit, so this runs on every stroke. The Bookmarks tab also starts a render for every bookmarked page at once, and ThumbnailStore never evicts images. On a 1,000-page PDF notebook this is wasted main-thread work while writing, and memory grows without bound.",
+      "fix": "In handle, always invalidate thumbnails, but call schedule() only when `changeset.headChanged(doc)`. For commits that only change items, bump thumbnailRevision so visible cells re-request their thumbnails. In BookmarksPanel, request each thumbnail from the row's `.onAppear` instead of looping over all rows in rebuild. Back ThumbnailStore with an NSCache (countLimit around 100)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOutline/OutlineCommands.swift:589-596 (PageSetBookmarked.run {} path); FeatOutlineFeature.swift:25-27",
+      "problem": "The ⌥⌘B key command has scope .document for every document kind. In a text document it throws invalid_params ('pages must list at least one page ref'), which shows an error toast. In a whiteboard it bookmarks the current board, and no UI ever shows that bookmark.",
+      "fix": "In the `p.pages == nil` path, use the session's current page only when `try ctx.workspace.content(doc).meta.kind == .notebook`. When there is no such page, return `Output(pages: [], on: false)` without throwing. Keep the invalid_params error for callers that pass an explicit empty `pages`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOutline/OutlinePanel.swift:829-831, 856-858 (canHandle/draggedEntry)",
+      "problem": "Any in-app drag whose first item has a String localObject is treated as an outline entry. That includes an entry dragged from another window's outline and a string-tagged thumbnail from the Pages sidebar. The drop then runs outline.move with a ref from the wrong document, which fails with not_found and shows an error toast.",
+      "fix": "In draggedEntry, return the id only when `model.tree.entries[id] != nil`, and use the same check in canHandle."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOutline/OutlineCommands.swift:191-208 (OutlineTree.drop(_:at:in:))",
+      "problem": "A drop between rows always joins the parent of the row above it. Dropping below the last child of an expanded entry therefore nests the moved entry there. A drag cannot put it back at the top level between an expanded entry and the next top-level row. Only the Move Out a Level menu item and the VoiceOver action can.",
+      "fix": "Choose the depth from the drop point's x position. Among the row above and its ancestors, pick the level whose indent (NibSpacing.xs + (depth-1)*NibSpacing.l) is closest to location.x, then place the entry after that ancestor. Add a test case for it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOutline/FeatOutlineFeature.swift:15,20 (PanelDescriptor order 10/20)",
+      "problem": "Orders 10 and 20 are lower than any other sidebar tab (Audio 300, Comments 450, Layers 500, History 900). If F023 gives Pages any order above 20, Outline and Bookmarks come before Pages. DESIGN.md §14.4 specifies the order Pages · Outline · Bookmarks.",
+      "fix": "Use orders 200 and 210, which fall after the Pages tab and before Audio at 300."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOutline/OutlinePanel.swift:29 (OutlineMetrics.thumbnailWidth = NibSpacing.x4), :1182-1200 (PageThumbnailImage)",
+      "problem": "A spacing token is reused as a component size, and a local page-thumbnail view duplicates NibPageThumbnail (radius, elevation, current-page ring). DESIGN.md §15.6 says to compose the existing component or file a contract request, not hand-roll one.",
+      "fix": "Compose NibPageThumbnail(number:isCurrent:aspectRatio:width:) at a 40 pt width. If the number under the thumbnail is not wanted in a row, file docs/contract-requests/F046-row-thumbnail.md for a NibMetrics row-thumbnail token or a numberless variant, and cite it in a ponytail comment until it lands."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOutline/OutlineCommands.swift:50-149 (OutlineTree init/height/descendants/flatten)",
+      "problem": "Raw writes (node.insert/node.set from F003, or merges from other devices) can build an outline parent chain of any depth, because the 3-level rule is enforced only by the outline.* commands. height, descendants and flatten recurse once per level, and the cycle check in init is O(n·depth). A chain of thousands of entries from a plugin or a merge can overflow the main-thread stack when the panel opens.",
+      "fix": "Clamp depth while building the tree: any entry whose depth would pass a small limit (for example 16) becomes a root. Alternatively, make flatten and height iterative and memoise depth in init."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatOutlineTests/FeatOutlineTests.swift",
+      "problem": "No tests cover BookmarkRow.rows or BookmarksPanelModel (order, trashed pages excluded, current page, refresh after page.setBookmarked). None cover the ThumbnailStore path where a page is invalidated during a render, which is where the bug above lives.",
+      "fix": "Add a BookmarksPanelModel test: bookmark FIXTUREPG003 and FIXTUREPG001, wait until rows == [PG001, PG003], trash PG003, and expect [PG001]. Add a ThumbnailStore test with a fake PageRenderer that suspends: request, invalidate, resume, and assert a second render is requested and the image lands."
+    }
+  ]
+}

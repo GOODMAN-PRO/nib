@@ -1,0 +1,71 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapeCommands.swift:159-174, 210-232, 78-93 (TapeStore.documentAsset / deletePattern / reload)",
+      "problem": "documentAssets cache (doc|<id>.png|colour -> AssetRef) is never invalidated. deletePattern clears only `tiles`, reload() clears only `tiles`. Delete custom pattern MYWASHI01, re-import a different image with the same id (tape.importPattern {id}), or have sync replace the file: the next strip in the same document and colour still gets the OLD tile.",
+      "fix": "Invalidate documentAssets wherever tiles is invalidated: in deletePattern and importPattern `documentAssets = documentAssets.filter { !$0.key.contains(\"|\" + id + \".png|\") }`, and `documentAssets.removeAll()` in reload()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapeDrawer.swift:202-208 (TapeDrawer.image); TapeCommands.swift:163-168 (documentAsset)",
+      "problem": "Trust boundary. Content-pack tiles and AI/plugin-supplied tapePattern assets are copied into documents at full size (documentAsset only normalises custom imports), and the drawer decodes them with CGImageSourceCreateImageAtIndex at full resolution on render threads, caching up to 64. One 8000x8000 PNG set as a tapePattern via asset.put + ink.addStrokes decodes to about 256 MB every time the page renders, which risks a jetsam crash each time that document opens.",
+      "fix": "Decode drawer tiles with CGImageSourceCreateThumbnailAtIndex (kCGImageSourceCreateThumbnailFromImageAlways, kCGImageSourceThumbnailMaxPixelSize 400), e.g. a TapeTile.decode(_:maxPixels:) overload. In documentAsset, pass non-built-in tile bytes through TapeTile.customTile before assets.put."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapeDrawer.swift:144-150 (TapeRenderer.fillPattern, follows branch)",
+      "problem": "At interior joins each run's clip rect stops 0.5 pt past the join, perpendicular to that run. On the outer side of every bend, the round-join wedge lies outside both rects, so it gets no pattern and shows the flat base colour. On curved follow-direction tape this shows as coloured notches at every simplified vertex.",
+      "fix": "Clip each run to a quad whose start and end edges lie on the angle bisectors of the neighbouring runs (keep the +/-width extension only at the true ends). Adjacent slices then meet exactly and cover the join wedge."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapeTool.swift:469-473 (history cells), :568 (TapeStripCell label); TapeCommands.swift:112 (custom descriptor title)",
+      "problem": "VoiceOver labels are ambiguous. History entries that share a pattern in different colours all read the same title (e.g. 'Polka dots', 'Polka dots'), so the colour is the only difference. Every custom pattern reads 'Custom pattern'. This fails the Slop checklist line 'state is never colour alone'.",
+      "fix": "Label history cells with title + colour (reuse the swatch naming, or a colour name or hex via accessibilityValue). Number custom patterns in the descriptor title ('Custom pattern \\(i + 1)') or pass an accessibilityValue."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapeTool.swift:335, 451, 509-510, 559",
+      "problem": "Several sizes are literals rather than tokens: `.padding(3)` is off the 4 pt scale (strip cell and add button), and the width preview uses `.frame(width: 28 ...)` and `minHeight: 40`, and `stripHeight = 24` is a raw value. The Slop checklist allows tokens only.",
+      "fix": "Use `.padding(NibSpacing.xs)` with ring `NibRadius.field` (6 + 4 = 10, still concentric), `stripHeight = NibSpacing.xxl`, and `minHeight: NibSpacing.x4`. Replace 28 with an existing token."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapeTool.swift:367-371",
+      "problem": "The Pattern direction control is a NibSegmentedControl, which sets lineLimit(1). In the 312 pt popover at AX3, 'Follow stroke' / 'Horizontal' truncate. The Slop checklist requires that nothing truncates at AX3.",
+      "fix": "Read @Environment(\\.dynamicTypeSize). When it is an accessibility size, show `NibToggle(String(localized: \"Pattern follows stroke\"), isOn: followsBinding)` instead of the segmented control."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapeTool.swift:395-401; TapeCommands.swift:452-453 and 199",
+      "problem": "Import blocks the main actor. The fileImporter completion runs Data(contentsOf:) synchronously on main, and tape.importPattern reads the file and runs TapeTile.customTile (ImageIO thumbnail of the full image) inside the main-actor command. A 48 MP HEIC blocks well over the 16 ms budget (ARCHITECTURE §14).",
+      "fix": "Read the file in the Task instead of the completion handler. In TapeImportPattern.run, do `Data(contentsOf:)` and `TapeTile.customTile` in `Task.detached`, then pass the finished tile bytes to TapeStore.importPattern, which then only checks the id and writes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapeCommands.swift:237-249 (TapeStore.recordUse), called from TapeTool.swift:119",
+      "problem": "History is written to .nib-library/tape/history.<dev>.json from the tool's touch path, outside any command handler. ARCHITECTURE §15.3 requires .nib-library writes to happen inside command handlers. Tape drawn by the AI or a plugin (ink.addStrokes) therefore never reaches the History tab.",
+      "fix": "Next contract wave: file a contract request for a `tape.recordUse {pattern?, color}` (session) command and have the tool call it through app.perform after commitStroke. Until then, add a `ponytail:` comment at recordUse naming the deviation."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapePatterns.swift:362-372, 384-387 (TapeHistory.load / save)",
+      "problem": "save() deletes every non-device `history.*.json`, including conflict copies that load() skipped because they failed to decode (e.g. still partially downloaded). Those entries are lost without being merged.",
+      "fix": "Have load return the names it decoded as well as the entries, and have save delete only conflict copies whose names are in that set."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTape/TapeCommands.swift:507-521 (TapePatternsList.run)",
+      "problem": "Every tape.patterns call re-encodes each built-in, loads every content-pack tile and writes a new putTemporary file for each pattern, all synchronously on main. With large content packs this is slow and the result can exceed the 20 KB paging threshold.",
+      "fix": "Cache the tmp: AssetRef per id|colour in TapeStore for about 50 minutes (the temp lifetime is 1 h) and reuse it, so repeated calls write nothing. If content packs grow large, add the standard `cursor` paging."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTapeTests/FeatTapeTests.swift:215-218, 235-271",
+      "problem": "Several risky paths are untested or weakly tested. The follow-direction render only asserts centre alpha == 255 (passes even if the pattern is not rotated). No test covers deletePattern tombstoning history entries, tape.clearHistory end to end, the revealed + patterned state, or reload() picking up externally added or removed custom pattern files (the sync path).",
+      "fix": "Compare the follow-direction and level renders of the diagonal strip and assert they differ. Record a use of MYWASHI01, delete it, and assert TapeHistory.live has none left. Run tape.clearHistory and assert {cleared} and an empty live list. Write a PNG into metadataURL/tape, call store.reload(), and assert content.tapePatterns.get(id) != nil (then delete the file, reload, and assert nil)."
+    }
+  ]
+}
