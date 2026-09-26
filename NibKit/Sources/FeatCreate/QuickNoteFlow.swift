@@ -560,6 +560,9 @@ final class QuickNoteExitModel: ObservableObject {
     /// A separate keep button when Save renames.
     var offersKeep: Bool { proposedTitle != nil }
 
+    /// Combine needs the Library Store's `doc.merge`; without it the choice is not offered.
+    var canCombine: Bool { app.commands.entry(CreateIDs.docMerge) != nil }
+
     func setTitle(_ text: String) {
         title = text
         edited = true
@@ -797,9 +800,11 @@ struct QuickNoteExitSheet: View {
                             Task { @MainActor in await model.keep() }
                         }
                     }
-                    NibButton(String(localized: "Combine to a Document…"), symbol: .addPage, kind: .secondary,
-                              expands: true) {
-                        model.showCombine()
+                    if model.canCombine {
+                        NibButton(String(localized: "Combine to a Document…"), symbol: .addPage, kind: .secondary,
+                                  expands: true) {
+                            model.showCombine()
+                        }
                     }
                     NibButton(String(localized: "Delete QuickNote"), symbol: .trash, kind: .destructive, expands: true) {
                         Task { @MainActor in await model.delete() }

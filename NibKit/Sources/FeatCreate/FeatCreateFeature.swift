@@ -40,7 +40,8 @@ public enum FeatCreateFeature: NibFeature {
 }
 
 enum CreateLog {
-    static let log = Logger(subsystem: "app.nib", category: FeatCreateFeature.id)
+    /// The category is the feature id ("create"), spelled out: `FeatCreateFeature.id` is main-actor isolated.
+    static let log = Logger(subsystem: "app.nib", category: "create")
 }
 
 /// Runs other features' commands for a creation flow: nested inside a command (same principal, group and read-only

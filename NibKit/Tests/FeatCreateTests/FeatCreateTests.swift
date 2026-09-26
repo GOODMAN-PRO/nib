@@ -608,6 +608,7 @@ final class FeatCreateTests: XCTestCase {
         }
         let id = try await quickNote(h)
         let model = QuickNoteExitModel(doc: id, app: h.app, session: h.session)
+        XCTAssertTrue(model.canCombine)
         model.showCombine()
         XCTAssertEqual(model.mode, .combine)
         XCTAssertEqual(model.targets.map(\.id), [Fixtures.docID], "notebooks only, never the QuickNote itself")
@@ -632,6 +633,7 @@ final class FeatCreateTests: XCTestCase {
         let model = QuickNoteExitModel(doc: id, app: h.app, session: h.session)
 
         // Without the Library Store's commands nothing happens, the prompt says why, and the mark stays.
+        XCTAssertFalse(model.canCombine, "Combine is not offered without doc.merge")
         await model.combine(into: Fixtures.docID)
         XCTAssertNil(model.outcome)
         XCTAssertNotNil(model.message)
