@@ -39,6 +39,8 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     private var styles: [String: BlockStyle] = [:]
     private var regularWidth = false
     private var aiRunning = Set<NibID>()
+    /// Assistant proposals waiting under their blocks (S-012): nothing changes until Replace or Insert Below.
+    private(set) var proposals: [NibID: BlockProposal] = [:]
     private var hookKeyCommands: [String: TextDocKeyCommand] = [:]
     private var pendingImageBlock: NibID?
     /// Blocks whose local text is newer than the model: block.update calls in flight, per block.
@@ -50,13 +52,16 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     private var linkCache: [String: LPLinkMetadata] = [:]
     private var linkWaiters: [String: [(LPLinkMetadata) -> Void]] = [:]
     private var linkProviders: [String: LPMetadataProvider] = [:]
-    private var embedded: [NibID: (key: String, view: UIView)] = [:]
+    /// `ui.blockViews` views, one per block, kept while the block keeps its kind (and, for custom blocks, its payload).
+    private var embedded: [NibID: EmbeddedView] = [:]
     private var embeddedHeights: [NibID: CGFloat] = [:]
 
     private var autoTitle = false
     private var expectedTitle: String?
     private var requestedTitle: String?
     private var titleTask: Task<Void, Never>?
+    /// How long typing pauses before the name follows the first line.
+    var titleDebounce: TimeInterval = TextDocTitle.debounce
 
     private let log = Logger(subsystem: "app.nib", category: "textdoc")
 
@@ -104,6 +109,10 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         super.viewWillDisappear(animated)
         view.endEditing(true)
         session.isEditingText = false
+        session.editingTextRef = nil
+        session.editingTextRange = nil
+        // A name still waiting for the typing pause is given now, so closing right after typing keeps it.
+        scheduleTitleUpdate(after: 0)
     }
 
     override func viewDidLayoutSubviews() {
@@ -142,7 +151,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         let background = UIView()
         background.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(backgroundTapped(_:))))
         emptyLabel.text = String(localized: "Tap to start writing")
-        emptyLabel.font = NibUIFont.font(.body, design: .serif)
+        emptyLabel.font = NibUIFont.documentBody
         emptyLabel.adjustsFontForContentSizeCategory = true
         emptyLabel.textColor = NibUIColor.labelTertiary
         emptyLabel.textAlignment = .center
@@ -165,7 +174,8 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         }
     }
 
-    /// The reading column (680 pt) centred, with the decorator strip and the assistant mark around it.
+    /// The reading column (`NibMetrics.textColumnWidth`) centred, with the decorator strip and the assistant mark
+    /// around it.
     private func section(_ environment: NSCollectionLayoutEnvironment) -> NSCollectionLayoutSection {
         let width = environment.container.effectiveContentSize.width
         let compact = width < NibMetrics.compactBreakpoint
@@ -280,12 +290,9 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     }
 
     private func pruneCaches() {
-        for id in Array(embedded.keys) where byID[id] == nil {
-            embedded[id]?.view.removeFromSuperview()
-            embedded[id] = nil
-            embeddedHeights[id] = nil
-        }
+        for id in Array(embedded.keys) where byID[id] == nil { dropEmbedded(id) }
         aiRunning = aiRunning.filter { byID[$0] != nil }
+        proposals = proposals.filter { byID[$0.key] != nil }
     }
 
     private func style(_ kind: BlockKind, checked: Bool = false, caption: Bool = false) -> BlockStyle {
@@ -316,6 +323,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         }
         cell.configure(block, environment: env)
         cell.setAIRunning(aiRunning.contains(id))
+        cell.setProposal(proposals[id], editable: !isReadOnly)
         for hook in TextDocHooks.cellDecorators { hook.value(cell, block, self) }
     }
 
@@ -372,7 +380,8 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         collectionView.scrollToItem(at: indexPath, at: .top, animated: animated)
     }
 
-    /// Text documents have no pages: a block id passed as `page` scrolls to that block.
+    /// Text documents have no pages. Callers use `reveal(block:animated:)`; a block id that still arrives as a page
+    /// (older callers, deep links) scrolls to that block too.
     func reveal(page: PageID, rect: Rect?, animated: Bool) {
         if byID[page] != nil { reveal(block: page, animated: animated) }
     }
@@ -422,18 +431,47 @@ final class TextDocViewController: UIViewController, DocumentEditing {
 
     // MARK: Commands
 
-    /// Runs UI edits one after another, so a split never overtakes the keystroke before it.
-    private func enqueue(_ operation: @escaping @MainActor () async -> Void) {
+    /// Runs UI edits one after another, so a split never overtakes the keystroke before it. Returns the queued task.
+    @discardableResult
+    private func enqueue(_ operation: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
         let previous = commandTail
-        commandTail = Task { @MainActor in
+        let task = Task { @MainActor in
             await previous?.value
             await operation()
         }
+        commandTail = task
+        return task
     }
 
-    /// Runs a command as the user from this editor; failures become the shell's toast.
+    /// Runs a command as the user from this editor, in line with the edits already queued (keystrokes, splits, undo),
+    /// and returns once it ran. This is the entry point for F102/F103 hooks, so a Turn Into or slash-menu edit never
+    /// overtakes typing. Failures become the shell's toast. Queued edits themselves use `execute`.
     @discardableResult
     func run<C: NibCommand>(_ type: C.Type, _ params: C.Params, group: String? = nil) async -> C.Output? {
+        let result = QueuedResult<C.Output>()
+        let task = enqueue { result.value = await self.execute(type, params, group: group) }
+        await task.value
+        return result.value
+    }
+
+    @discardableResult
+    func run(_ command: String, _ params: JSONValue, group: String? = nil) async -> JSONValue? {
+        let result = QueuedResult<JSONValue>()
+        let task = enqueue { result.value = await self.execute(command, params, group: group) }
+        await task.value
+        return result.value
+    }
+
+    /// Returns once every edit queued so far has run (hooks that read the model right after typing, tests).
+    func flushEdits() async {
+        let task = enqueue {}
+        await task.value
+    }
+
+    /// Runs a command now: inside a queued edit (which must never wait for the queue it is part of), or for reads
+    /// that need no ordering (the assistant's ask mode).
+    @discardableResult
+    private func execute<C: NibCommand>(_ type: C.Type, _ params: C.Params, group: String? = nil) async -> C.Output? {
         do {
             return try await app.bus.run(type, params, session: session, group: group)
         } catch {
@@ -443,7 +481,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     }
 
     @discardableResult
-    func run(_ command: String, _ params: JSONValue, group: String? = nil) async -> JSONValue? {
+    private func execute(_ command: String, _ params: JSONValue, group: String? = nil) async -> JSONValue? {
         do {
             let inv = Invocation(command: command, params: params, principal: .user, session: session, group: group)
             return try await app.bus.execute(inv).value
@@ -459,26 +497,35 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     }
 
     /// Inserts a block from a `BlockKindDescriptor` (slash menu, Turn Into of F102) after `after` (nil = at the end)
-    /// and puts the caret in it. Returns the new block's id when it is known.
+    /// and puts the caret in it, in line with the queued edits. Returns the new block's id when it is known.
     @discardableResult
     func insertBlock(using descriptor: BlockKindDescriptor, after: NibID?) async -> NibID? {
-        var params = descriptor.params.objectValue ?? [:]
-        params["doc"] = .string(docRef)
-        if let after = after { params["after"] = .string(blockRef(after)) }
-        var newID: NibID?
+        var fields = descriptor.params.objectValue ?? [:]
+        fields["doc"] = .string(docRef)
+        if let after = after { fields["after"] = .string(blockRef(after)) }
+        var chosenID: NibID?
         if descriptor.command == nil {
             let id = NibID.make()
-            newID = id
-            if params["kind"] == nil { params["kind"] = .string(descriptor.kind.rawValue) }
-            params["id"] = .string(id.raw)
+            chosenID = id
+            if fields["kind"] == nil { fields["kind"] = .string(descriptor.kind.rawValue) }
+            fields["id"] = .string(id.raw)
         }
-        let value = await run(descriptor.command ?? BlockInsert.descriptor.id, .object(params), group: NibID.make().raw)
+        let command = descriptor.command ?? BlockInsert.descriptor.id
+        let params = JSONValue.object(fields)
+        let known = chosenID
+        let group = NibID.make().raw
         newTypingGroup()
-        var inserted = newID
-        if let ref = value?["ref"]?.stringValue, case let .block(_, id)? = NodeRef(ref) { inserted = id }
-        guard value != nil, let id = inserted else { return nil }
-        focus(id, at: 0)
-        return id
+        let result = QueuedResult<NibID>()
+        let task = enqueue {
+            guard let value = await self.execute(command, params, group: group) else { return }
+            var inserted = known
+            if let ref = value["ref"]?.stringValue, case let .block(_, id)? = NodeRef(ref) { inserted = id }
+            guard let id = inserted else { return }
+            self.focus(id, at: 0)
+            result.value = id
+        }
+        await task.value
+        return result.value
     }
 
     private func insertParagraph(after: NibID?) {
@@ -486,7 +533,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         let params = BlockInsert.Params(doc: docRef, after: after.map { blockRef($0) }, kind: .paragraph, id: id.raw)
         newTypingGroup()
         enqueue {
-            guard await self.run(BlockInsert.self, params, group: NibID.make().raw) != nil else { return }
+            guard await self.execute(BlockInsert.self, params, group: NibID.make().raw) != nil else { return }
             self.focus(id, at: 0)
         }
     }
@@ -515,7 +562,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     /// Runs the block.update behind a `setLocalText`; once none is left in flight the model speaks for the block again.
     @discardableResult
     private func commitLocalText(_ id: NibID, _ params: BlockUpdate.Params, group: String) async -> Bool {
-        let ok = await run(BlockUpdate.self, params, group: group) != nil
+        let ok = await execute(BlockUpdate.self, params, group: group) != nil
         if let n = pendingText[id], n > 1 { pendingText[id] = n - 1 } else { pendingText[id] = nil }
         // A refused update (the block went meanwhile, a locked document): show the model's text again.
         if !ok, pendingText[id] == nil { reloadFromModel(usingReloadData: false) }
@@ -524,16 +571,21 @@ final class TextDocViewController: UIViewController, DocumentEditing {
 
     private func commitText(of tv: BlockTextView) {
         guard let id = tv.blockID, let block = byID[id], let style = tv.style else { return }
+        // Inline images (pasted or dropped rich text, image glyphs) have no place in block text: they leave the
+        // text view here and become image blocks right after this one instead of vanishing at the commit.
+        let images = isReadOnly ? [] : BlockAttachments.takeImages(from: tv)
         let caption = tv.role == .caption
         let text = style.richText(from: tv.attributedText)
         let current = caption ? (block.caption ?? .empty) : block.text
-        guard text != style.normalize(current) else { return }
-        touchTypingGroup(id)
-        setLocalText(text, caption: caption, for: id)
-        let params = caption ? BlockUpdate.Params(ref: blockRef(id), caption: text) : BlockUpdate.Params(ref: blockRef(id), text: text)
-        let group = typingGroup
-        enqueue { await self.commitLocalText(id, params, group: group) }
-        scheduleTitleUpdate()
+        if text != style.normalize(current) {
+            touchTypingGroup(id)
+            setLocalText(text, caption: caption, for: id)
+            let params = caption ? BlockUpdate.Params(ref: blockRef(id), caption: text) : BlockUpdate.Params(ref: blockRef(id), text: text)
+            let group = typingGroup
+            enqueue { await self.commitLocalText(id, params, group: group) }
+            scheduleTitleUpdate()
+        }
+        if !images.isEmpty { insertImageBlocks(images, after: id) }
     }
 
     // MARK: Structure edits (Return, Backspace, Tab)
@@ -552,7 +604,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
             let params = level > 0 && BlockRules.isList(block.kind)
                 ? BlockUpdate.Params(ref: ref, indent: level - 1)
                 : BlockUpdate.Params(ref: ref, kind: .paragraph, indent: 0)
-            enqueue { await self.run(BlockUpdate.self, params, group: group) }
+            enqueue { await self.execute(BlockUpdate.self, params, group: group) }
             return
         }
         let newID = NibID.make()
@@ -563,9 +615,9 @@ final class TextDocViewController: UIViewController, DocumentEditing {
             let after = indexByID[block.id].flatMap { $0 > 0 ? blockRef(blocks[$0 - 1].id) : nil } ?? docRef
             let insert = BlockInsert.Params(doc: docRef, after: after, kind: above, id: newID.raw)
             enqueue {
-                guard await self.run(BlockInsert.self, insert, group: group) != nil else { return }
+                guard await self.execute(BlockInsert.self, insert, group: group) != nil else { return }
                 if level > 0 {
-                    await self.run(BlockUpdate.self, BlockUpdate.Params(ref: self.blockRef(newID), indent: level), group: group)
+                    await self.execute(BlockUpdate.self, BlockUpdate.Params(ref: self.blockRef(newID), indent: level), group: group)
                 }
             }
             return
@@ -578,9 +630,9 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         let blockID = block.id
         enqueue {
             guard await self.commitLocalText(blockID, update, group: group) else { return }
-            guard await self.run(BlockInsert.self, insert, group: group) != nil else { return }
+            guard await self.execute(BlockInsert.self, insert, group: group) != nil else { return }
             if level > 0 {
-                await self.run(BlockUpdate.self, BlockUpdate.Params(ref: self.blockRef(newID), indent: level), group: group)
+                await self.execute(BlockUpdate.self, BlockUpdate.Params(ref: self.blockRef(newID), indent: level), group: group)
             }
             self.focus(newID, at: 0)
         }
@@ -600,7 +652,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         enqueue {
             guard await self.commitLocalText(blockID, BlockUpdate.Params(ref: ref, text: trimmed), group: group) else { return }
             let insert = BlockInsert.Params(doc: self.docRef, after: ref, kind: .paragraph, id: newID.raw)
-            guard await self.run(BlockInsert.self, insert, group: group) != nil else { return }
+            guard await self.execute(BlockInsert.self, insert, group: group) != nil else { return }
             self.focus(newID, at: 0)
         }
         return false
@@ -621,7 +673,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         guard next != current else { return }
         newTypingGroup()
         let params = BlockUpdate.Params(ref: blockRef(block.id), indent: next)
-        enqueue { await self.run(BlockUpdate.self, params, group: NibID.make().raw) }
+        enqueue { await self.execute(BlockUpdate.self, params, group: NibID.make().raw) }
     }
 
     /// Moves the caret to the previous or next text block; false when there is none (UIKit keeps the key).
@@ -649,7 +701,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
             guard await self.commitLocalText(targetID, update, group: group) else { return }
             // Focus first so the keyboard stays up while the merged block goes.
             self.focus(target.id, at: caret)
-            await self.run(BlockDelete.self, delete, group: group)
+            await self.execute(BlockDelete.self, delete, group: group)
         }
     }
 
@@ -678,7 +730,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
                 break
             }
         }
-        if block.kind == .video, let s = block.url, let url = URL(string: s) {
+        if block.kind == .video, let s = block.url, let url = BlockMedia.webURL(s) {
             elements.append(UIAction(title: String(localized: "Open Video"), image: UIImage(nib: .present)) { [weak self] _ in
                 self?.view.window?.windowScene?.open(url, options: nil, completionHandler: nil)
             })
@@ -695,9 +747,14 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         var groupOrder: [String] = []
         for d in items {
             let image = d.icon.flatMap { NibSymbol(systemName: $0) }.flatMap { UIImage(nib: $0) }
-            let action = UIAction(title: d.title, image: image, attributes: d.destructive ? [.destructive] : []) { [weak self] _ in
+            let checked = d.isChecked?(context) == true
+            let action = UIAction(title: d.resolvedTitle(for: context), image: image,
+                                  attributes: d.destructive ? [.destructive] : [], state: checked ? .on : .off) { [weak self] _ in
                 guard let self = self else { return }
-                self.app.perform(d.command, d.params(context), session: self.session)
+                // Params are read now (they may look at the selection); the command runs in line with typing.
+                let params = d.params(context)
+                self.newTypingGroup()
+                self.enqueue { await self.execute(d.command, params, group: NibID.make().raw) }
             }
             if let title = d.submenu {
                 if groups[title] == nil { groupOrder.append(title) }
@@ -734,7 +791,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     private func attachImage(_ file: URL, to id: NibID, removeAfter: Bool) {
         let params = BlockUpdate.Params(ref: blockRef(id), url: file.absoluteString)
         enqueue {
-            await self.run(BlockUpdate.self, params, group: NibID.make().raw)
+            await self.execute(BlockUpdate.self, params, group: NibID.make().raw)
             if removeAfter { try? FileManager.default.removeItem(at: file) }
         }
     }
@@ -754,7 +811,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         alert.addAction(UIAlertAction(title: String(localized: "Add Link"), style: .default) { [weak self, weak alert] _ in
             guard let self = self, let text = alert?.textFields?.first?.text, !text.isEmpty else { return }
             let params = BlockUpdate.Params(ref: self.blockRef(id), url: text)
-            self.enqueue { await self.run(BlockUpdate.self, params, group: NibID.make().raw) }
+            self.enqueue { await self.execute(BlockUpdate.self, params, group: NibID.make().raw) }
         })
         present(alert, animated: true)
     }
@@ -774,48 +831,108 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         app.services.ai != nil && !isReadOnly && !blockAIActions.isEmpty
     }
 
+    /// Runs a block quick action in ask mode, so the assistant proposes and the user decides: edit actions are asked
+    /// for the block's new text and offer Replace; questions offer Insert Below. Both show under the block.
     private func runAIAction(_ action: AIActionDescriptor, on id: NibID) {
+        guard let block = byID[id] else { return }
         let scope = AIScope(kind: .block, doc: documentID, refs: [blockRef(id)])
         guard let scopeJSON = try? JSONValue.from(scope) else { return }
+        let replaces = action.mode == .edit && BlockRules.isText(block.kind)
+        let prompt = replaces ? action.prompt + "\n\n" + BlockAssistant.previewInstruction : action.prompt
+        let params: JSONValue = ["prompt": .string(prompt), "scope": scopeJSON, "mode": .string(AIMode.ask.rawValue)]
         aiRunning.insert(id)
         cell(for: id)?.setAIRunning(true)
-        let params: JSONValue = ["prompt": .string(action.prompt), "scope": scopeJSON, "mode": .string(action.mode.rawValue)]
         Task { @MainActor [weak self] in
             guard let self = self else { return }
-            let value = await self.run(CommandIDs.aiAsk, params, group: NibID.make().raw)
+            // Ask mode is read-only, so it needs no place in the edit queue.
+            let value = await self.execute(CommandIDs.aiAsk, params, group: NibID.make().raw)
             self.aiRunning.remove(id)
             self.cell(for: id)?.setAIRunning(false)
-            if action.mode == .ask, let answer = value?["text"]?.stringValue, !answer.isEmpty {
-                self.presentAnswer(answer, title: action.title, below: id)
-            }
+            guard self.byID[id] != nil, let raw = value?["text"]?.stringValue else { return }
+            let answer = BlockAssistant.clean(raw)
+            guard !answer.isEmpty else { return }
+            self.showProposal(BlockProposal(title: action.title, text: answer, replaces: replaces), for: id)
         }
     }
 
-    /// An ask-mode answer: read it, or insert it below the block (one paragraph per line).
-    private func presentAnswer(_ answer: String, title: String, below id: NibID) {
-        let alert = UIAlertController(title: title, message: answer, preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: String(localized: "Done"), style: .cancel))
-        if !isReadOnly {
-            alert.addAction(UIAlertAction(title: String(localized: "Insert Below"), style: .default) { [weak self] _ in
-                self?.insertParagraphs(answer, after: id)
-            })
-        }
-        present(alert, animated: true)
+    /// Shows (nil: removes) the proposal under a block and brings it into view.
+    func showProposal(_ proposal: BlockProposal?, for id: NibID) {
+        proposals[id] = proposal
+        reconfigure([id])
+        guard proposal != nil, let cell = cell(for: id) else { return }
+        collectionView.layoutIfNeeded()
+        let rect = cell.proposalView.convert(cell.proposalView.bounds, to: collectionView)
+        collectionView.scrollRectToVisible(rect.insetBy(dx: 0, dy: -NibSpacing.l), animated: false)
+        UIAccessibility.post(notification: .layoutChanged, argument: cell.proposalView)
     }
 
-    private func insertParagraphs(_ text: String, after id: NibID) {
-        let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    /// Replace, Insert Below or Discard: the chosen change is one undo step through the block commands.
+    func resolveProposal(for id: NibID, _ choice: BlockProposal.Choice) {
+        guard let proposal = proposals[id] else { return }
+        showProposal(nil, for: id)
+        guard choice != .discard, !isReadOnly, let block = byID[id] else { return }
         let group = NibID.make().raw
+        newTypingGroup()
+        if choice == .replace, proposal.replaces, BlockRules.isText(block.kind) {
+            let ref = blockRef(id)
+            if block.kind == .code {
+                let update = BlockUpdate.Params(ref: ref, text: RichText(plain: proposal.text))
+                enqueue { await self.execute(BlockUpdate.self, update, group: group) }
+                return
+            }
+            // One block per paragraph: the first replaces this block's text, the rest continue below it.
+            let paragraphs = BlockAssistant.paragraphs(proposal.text)
+            guard let first = paragraphs.first else { return }
+            let update = BlockUpdate.Params(ref: ref, text: RichText(plain: first))
+            let rest = insertCalls(Array(paragraphs.dropFirst()), after: id, kind: BlockRules.continuation(of: block.kind))
+            enqueue {
+                guard await self.execute(BlockUpdate.self, update, group: group) != nil else { return }
+                for call in rest { guard await self.execute(BlockInsert.self, call, group: group) != nil else { return } }
+            }
+        } else {
+            insertParagraphs(proposal.text, after: id, group: group)
+        }
+    }
+
+    private func insertParagraphs(_ text: String, after id: NibID, group: String) {
+        let calls = insertCalls(BlockAssistant.paragraphs(text), after: id, kind: .paragraph)
+        enqueue {
+            for call in calls { guard await self.execute(BlockInsert.self, call, group: group) != nil else { return } }
+        }
+    }
+
+    /// block.insert calls that put one block per line after `id`, in order.
+    private func insertCalls(_ lines: [String], after id: NibID, kind: BlockKind) -> [BlockInsert.Params] {
         var after = blockRef(id)
         var calls: [BlockInsert.Params] = []
         for line in lines {
             let newID = NibID.make()
-            calls.append(BlockInsert.Params(doc: docRef, after: after, kind: .paragraph, text: RichText(plain: line), id: newID.raw))
+            calls.append(BlockInsert.Params(doc: docRef, after: after, kind: kind, text: RichText(plain: line), id: newID.raw))
             after = blockRef(newID)
         }
-        enqueue {
-            for call in calls { guard await self.run(BlockInsert.self, call, group: group) != nil else { return } }
+        return calls
+    }
+
+    /// Reconfigures the cells of `ids` in place (proposals, anything outside the block model).
+    private func reconfigure(_ ids: [NibID]) {
+        guard dataSource != nil else { return }
+        var snapshot = dataSource.snapshot()
+        let present = ids.filter { snapshot.indexOfItem($0) != nil }
+        guard !present.isEmpty else { return }
+        snapshot.reconfigureItems(present)
+        UIView.performWithoutAnimation {
+            dataSource.apply(snapshot, animatingDifferences: false)
         }
+    }
+
+    @objc private func acceptProposalKey() {
+        guard let id = focusedBlockID, let p = proposals[id] else { return }
+        resolveProposal(for: id, p.replaces ? .replace : .insertBelow)
+    }
+
+    @objc private func discardProposalKey() {
+        guard let id = focusedBlockID else { return }
+        resolveProposal(for: id, .discard)
     }
 
     // MARK: Undo (through the bus, like the Undo button)
@@ -825,20 +942,36 @@ final class TextDocViewController: UIViewController, DocumentEditing {
     var undoLabel: String { app.bus.history.undoLabel(documentID) ?? "" }
     var redoLabel: String { app.bus.history.redoLabel(documentID) ?? "" }
 
+    /// ⌘Z, shake and the Undo bar wait for the queued keystrokes, so an undo is never overwritten by a block.update
+    /// that was still on its way.
     func undoDocument() {
         newTypingGroup()
-        app.perform(CommandIDs.undo, ["doc": .string(docRef)], session: session)
+        let params: JSONValue = ["doc": .string(docRef)]
+        enqueue { await self.execute(CommandIDs.undo, params) }
     }
 
     func redoDocument() {
         newTypingGroup()
-        app.perform(CommandIDs.redo, ["doc": .string(docRef)], session: session)
+        let params: JSONValue = ["doc": .string(docRef)]
+        enqueue { await self.execute(CommandIDs.redo, params) }
     }
 
     // MARK: Key commands from hooks
 
     override var keyCommands: [UIKeyCommand]? {
         var out = super.keyCommands ?? []
+        // ⌘⏎ accepts and ⎋ discards the proposal under the block being typed in (DESIGN keyboard row).
+        if let id = focusedBlockID, let p = proposals[id] {
+            let accept = UIKeyCommand(title: p.replaces && !isReadOnly ? String(localized: "Replace with Proposal")
+                                                                       : String(localized: "Insert Proposal Below"),
+                                      action: #selector(acceptProposalKey), input: "\r", modifierFlags: .command)
+            let discard = UIKeyCommand(title: String(localized: "Discard Proposal"), action: #selector(discardProposalKey),
+                                       input: UIKeyCommand.inputEscape, modifierFlags: [])
+            for command in [accept, discard] {
+                command.wantsPriorityOverSystemBehavior = true
+                out.append(command)
+            }
+        }
         var map: [String: TextDocKeyCommand] = [:]
         for set in TextDocHooks.keyCommandSets {
             for k in set.value(self) {
@@ -860,42 +993,71 @@ final class TextDocViewController: UIViewController, DocumentEditing {
 
     // MARK: Title (D-132: the first line names the document)
 
+    private var autoTitleKey: SettingKey<String> { TextDocTitle.settingKey(documentID) }
+
     private func evaluateTitleOnOpen() {
-        let current = app.services.library?.node(documentID)?.title
+        guard let current = app.services.library?.node(documentID)?.title else {
+            autoTitle = false
+            return
+        }
         let derived = TextDocTitle.derive(from: blocks)
+        let stored = app.settings.get(autoTitleKey)
         expectedTitle = current
-        // Automatic naming stays on while the name still follows the first line (or the document is new).
-        autoTitle = current != nil && (derived == nil || current == derived)
+        // Automatic naming stays on while the name is still the one it gave last (the first line may have changed
+        // while the document was closed: AI chat, bridge, plugin, another device), follows the first line, or the
+        // document has no text yet. A name chosen by hand, anywhere, switches it off for this document.
+        autoTitle = derived == nil || current == derived || (!stored.isEmpty && current == stored)
+        guard autoTitle else { return }
+        if stored != current { app.settings.set(autoTitleKey, current) }
+        // Catch up with edits made while the document was closed.
+        scheduleTitleUpdate(after: 0)
     }
 
-    private func scheduleTitleUpdate() {
+    /// Renames the document after the first line once typing pauses (`titleDebounce`), or right away (`after: 0`:
+    /// on open, when the title's block loses the caret, when the editor closes).
+    private func scheduleTitleUpdate(after delay: TimeInterval? = nil) {
         guard autoTitle, let derived = TextDocTitle.derive(from: blocks), derived != expectedTitle,
               derived != requestedTitle else { return }
         titleTask?.cancel()
+        let wait = delay ?? titleDebounce
+        if wait <= 0 {
+            // Held strongly: a rename asked for while the editor closes still happens.
+            titleTask = Task { @MainActor in await self.applyTitle(derived) }
+            return
+        }
         titleTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 800_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
             guard !Task.isCancelled, let self = self else { return }
             await self.applyTitle(derived)
         }
     }
 
     private func applyTitle(_ title: String) async {
-        guard let library = app.services.library, let current = library.node(documentID)?.title else { return }
+        guard autoTitle, let library = app.services.library, let current = library.node(documentID)?.title else { return }
         if let expected = expectedTitle, current != expected {
-            autoTitle = false   // renamed by hand meanwhile: the name is the user's now
+            // Renamed meanwhile, by hand or elsewhere: the name is the user's now.
+            autoTitle = false
+            app.settings.setJSON(autoTitleKey.name, nil)
             return
         }
         guard current != title else { return }
         requestedTitle = title
         do {
-            let inv = Invocation(command: "library.rename", params: ["ref": .string(docRef), "title": .string(title)],
+            let inv = Invocation(command: CommandIDs.libraryRename, params: ["ref": .string(docRef), "title": .string(title)],
                                  principal: .user, session: session)
             _ = try await app.bus.execute(inv)
-            expectedTitle = library.node(documentID)?.title ?? title
+            // The library may adjust the name (a duplicate gets a number): remember what it really is.
+            let applied = library.node(documentID)?.title ?? title
+            expectedTitle = applied
+            app.settings.set(autoTitleKey, applied)
         } catch {
+            requestedTitle = nil
             log.info("automatic title skipped: \(NibError.wrap(error).description, privacy: .public)")
         }
     }
+
+    /// True while the document's name follows its first line (tests and hooks read it).
+    var followsFirstLine: Bool { autoTitle }
 }
 
 // MARK: - Collection view
@@ -933,15 +1095,16 @@ extension TextDocViewController: BlockCellHost {
             return
         }
         let doc = documentID
-        Task.detached(priority: .userInitiated) { [weak self] in
-            let image = BlockImageLoader.load(store, asset: asset, doc: doc, maxPixel: maxPixel)
-            await MainActor.run {
-                if let image = image, let self = self {
-                    self.imageCache.setObject(image, forKey: key)
-                    if image.size.width > 0 { self.aspects[asset.name] = image.size.height / image.size.width }
-                }
-                completion(image)
+        Task { @MainActor [weak self] in
+            // Only the decode runs detached; the editor is touched on the main actor alone.
+            let image = await Task.detached(priority: .userInitiated) {
+                BlockImageLoader.load(store, asset: asset, doc: doc, maxPixel: maxPixel)
+            }.value
+            if let image = image, let self = self {
+                self.imageCache.setObject(image, forKey: key)
+                if image.size.width > 0 { self.aspects[asset.name] = image.size.height / image.size.width }
             }
+            completion(image)
         }
     }
 
@@ -977,21 +1140,35 @@ extension TextDocViewController: BlockCellHost {
         let key: String
         switch block.kind {
         case .custom:
-            guard let c = block.custom else { return nil }
+            guard let c = block.custom else { return dropEmbedded(block.id) }
             key = "custom.\(c.owner).\(c.type)"
         case .table:
             key = BlockKind.table.rawValue
         default:
-            return nil
+            return dropEmbedded(block.id)
         }
-        if let cached = embedded[block.id], cached.key == key { return cached.view }
+        if let cached = embedded[block.id] {
+            // Tables observe commits themselves. A custom block's view shows the payload it was made from, so it is
+            // made again once `custom` changes (undo, sync, a plugin's update); another kind drops the old view.
+            if cached.key == key, block.kind == .table || cached.custom == block.custom { return cached.view }
+            dropEmbedded(block.id)
+        }
         guard let descriptor = app.ui.blockViews.get(key) else { return nil }
         let id = block.id
         let context = BlockViewContext(app: app, session: session, doc: documentID, block: block,
                                        heightChanged: { [weak self] height in self?.embeddedHeightChanged(id, height) })
         let view = descriptor.make(context)
-        embedded[id] = (key, view)
+        embedded[id] = EmbeddedView(key: key, view: view, custom: block.custom)
         return view
+    }
+
+    /// Forgets a block's embedded view (and its reported height); always returns nil.
+    @discardableResult
+    private func dropEmbedded(_ id: NibID) -> UIView? {
+        guard let entry = embedded.removeValue(forKey: id) else { return nil }
+        entry.view.removeFromSuperview()
+        embeddedHeights[id] = nil
+        return nil
     }
 
     func embeddedHeight(for block: NibID) -> CGFloat? { embeddedHeights[block] }
@@ -1011,7 +1188,7 @@ extension TextDocViewController: BlockCellHost {
         guard !isReadOnly, let block = cell.block, block.kind == .todo else { return }
         newTypingGroup()
         let params = BlockUpdate.Params(ref: blockRef(block.id), checked: !(block.checked ?? false))
-        enqueue { await self.run(BlockUpdate.self, params, group: NibID.make().raw) }
+        enqueue { await self.execute(BlockUpdate.self, params, group: NibID.make().raw) }
     }
 
     func cell(_ cell: BlockCell, addImageFrom source: BlockImageSource) {
@@ -1031,7 +1208,12 @@ extension TextDocViewController: BlockCellHost {
         guard let d = app.content.blockKinds.all.first(where: { $0.kind == .custom && $0.customType == type && $0.command != nil }),
               let command = d.command else { return }
         let ref = blockRef(block.id)
-        enqueue { await self.run(command, ["ref": .string(ref)], group: NibID.make().raw) }
+        enqueue { await self.execute(command, ["ref": .string(ref)], group: NibID.make().raw) }
+    }
+
+    func cell(_ cell: BlockCell, resolveProposal choice: BlockProposal.Choice) {
+        guard let id = cell.block?.id else { return }
+        resolveProposal(for: id, choice)
     }
 
     func aiMenuElements(for cell: BlockCell) -> [UIMenuElement] {
@@ -1066,14 +1248,14 @@ extension TextDocViewController: BlockCellHost {
             actions.append(UIAccessibilityCustomAction(name: name) { [weak self] _ in
                 guard let self = self else { return false }
                 let params = BlockUpdate.Params(ref: self.blockRef(id), checked: !done)
-                self.enqueue { await self.run(BlockUpdate.self, params, group: NibID.make().raw) }
+                self.enqueue { await self.execute(BlockUpdate.self, params, group: NibID.make().raw) }
                 return true
             })
         }
         actions.append(UIAccessibilityCustomAction(name: String(localized: "Delete Block")) { [weak self] _ in
             guard let self = self else { return false }
             let params = BlockDelete.Params(refs: [self.blockRef(id)])
-            self.enqueue { await self.run(BlockDelete.self, params, group: NibID.make().raw) }
+            self.enqueue { await self.execute(BlockDelete.self, params, group: NibID.make().raw) }
             return true
         })
         return actions
@@ -1090,7 +1272,7 @@ extension TextDocViewController: BlockCellHost {
             after = blockRef(blocks[i + 1].id)
         }
         let params = BlockMove.Params(ref: blockRef(id), after: after)
-        enqueue { await self.run(BlockMove.self, params, group: NibID.make().raw) }
+        enqueue { await self.execute(BlockMove.self, params, group: NibID.make().raw) }
     }
 }
 
@@ -1107,9 +1289,23 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
         if focusedBlockID != id { newTypingGroup() }
         focusedBlockID = id
         focusedTextView = tv
+        publishEditingText(tv)
         cellContaining(tv)?.updateAccessories()
         notifySelection()
         scrollCaretVisible()
+    }
+
+    /// What is being typed in, for links (F029), spellcheck and the assistant's context: the block and the
+    /// selection in UTF-16 units of its text (captions report their media block).
+    private func publishEditingText(_ tv: BlockTextView?) {
+        guard let tv = tv, let id = tv.blockID else {
+            session.editingTextRef = nil
+            session.editingTextRange = nil
+            return
+        }
+        let range = tv.selectedRange
+        session.editingTextRef = blockRef(id)
+        session.editingTextRange = [range.location, range.length]
     }
 
     func textViewDidEndEditing(_ textView: UITextView) {
@@ -1118,13 +1314,19 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
             focusedTextView = nil
             focusedBlockID = nil
             session.isEditingText = false
+            publishEditingText(nil)
         }
         cellContaining(tv)?.updateAccessories()
         notifySelection()
+        // Leaving the line the name comes from: rename now instead of after the pause.
+        if tv.role == .body, let id = tv.blockID, id == TextDocTitle.source(in: blocks)?.id {
+            scheduleTitleUpdate(after: 0)
+        }
     }
 
     func textViewDidChangeSelection(_ textView: UITextView) {
         guard textView === focusedTextView else { return }
+        publishEditingText(focusedTextView)
         notifySelection()
         scrollCaretVisible()
     }
@@ -1174,10 +1376,19 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
         }
     }
 
+    /// The edit menu over selected block or caption text: the system's actions, then `ui.menus` entries at
+    /// `MenuLocation.textSelection` (built-in features and plugins; `ctx.ref` is the block), then the hook providers.
     func textView(_ textView: UITextView, editMenuForTextIn range: NSRange, suggestedActions: [UIMenuElement]) -> UIMenu? {
         guard let tv = textView as? BlockTextView, let id = tv.blockID, let block = byID[id] else { return nil }
+        var items: [UIMenuElement] = []
+        if range.length > 0 {
+            let context = MenuContext(app: app, session: session, doc: documentID, ref: blockRef(id),
+                                      textRange: [range.location, range.length])
+            items = menuElements(app.ui.menuItems(.textSelection, context), context)
+        }
         let extra = TextDocHooks.editMenuProviders.flatMap { $0.value(block, range, tv.role == .caption, self) }
-        return extra.isEmpty ? nil : UIMenu(children: suggestedActions + extra)
+        guard !items.isEmpty || !extra.isEmpty else { return nil }
+        return UIMenu(children: suggestedActions + items + extra)
     }
 
     // MARK: BlockTextViewDelegate
@@ -1192,7 +1403,7 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
                 ? BlockUpdate.Params(ref: ref, indent: level - 1)
                 : BlockUpdate.Params(ref: ref, kind: .paragraph)
             newTypingGroup()
-            enqueue { await self.run(BlockUpdate.self, params, group: NibID.make().raw) }
+            enqueue { await self.execute(BlockUpdate.self, params, group: NibID.make().raw) }
             return true
         }
         if level > 0 {
@@ -1211,12 +1422,12 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
             let params = BlockDelete.Params(refs: [ref])
             enqueue {
                 if let t = target { self.focus(t, at: nil) }
-                await self.run(BlockDelete.self, params, group: NibID.make().raw)
+                await self.execute(BlockDelete.self, params, group: NibID.make().raw)
             }
         } else if previous.kind == .divider {
             newTypingGroup()
             let params = BlockDelete.Params(refs: [blockRef(previous.id)])
-            enqueue { await self.run(BlockDelete.self, params, group: NibID.make().raw) }
+            enqueue { await self.execute(BlockDelete.self, params, group: NibID.make().raw) }
         }
         return true
     }
@@ -1259,12 +1470,17 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
 
     func blockTextViewPasteImages(_ tv: BlockTextView) -> Bool {
         guard !isReadOnly, let id = tv.blockID else { return false }
-        let images = UIPasteboard.general.images ?? []
+        let images = (UIPasteboard.general.images ?? []).compactMap { $0.pngData() }
         guard !images.isEmpty else { return false }
+        return insertImageBlocks(images, after: id)
+    }
+
+    /// Stores images as image blocks right after `id`, in one undo step (block.insert {url} of temporary files).
+    @discardableResult
+    private func insertImageBlocks(_ images: [Data], after id: NibID) -> Bool {
         var files: [URL] = []
-        for image in images {
-            guard let data = image.pngData() else { continue }
-            let file = TextDocViewController.temporaryFile("png")
+        for data in images {
+            let file = TextDocViewController.temporaryFile(BlockMedia.imageExtension(data) ?? "png")
             if (try? data.write(to: file)) != nil { files.append(file) }
         }
         guard !files.isEmpty else { return false }
@@ -1278,7 +1494,7 @@ extension TextDocViewController: UITextViewDelegate, BlockTextViewDelegate {
             after = blockRef(newID)
         }
         enqueue {
-            for call in calls { await self.run(BlockInsert.self, call, group: group) }
+            for call in calls { await self.execute(BlockInsert.self, call, group: group) }
             for file in files { try? FileManager.default.removeItem(at: file) }
         }
         return true
@@ -1312,6 +1528,24 @@ extension TextDocViewController: PHPickerViewControllerDelegate, UIDocumentPicke
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
         pendingImageBlock = nil
     }
+}
+
+// MARK: - Embedded views
+
+/// One `ui.blockViews` view of a block, with what it was made for.
+struct EmbeddedView {
+    let key: String
+    let view: UIView
+    /// The custom payload the view was made from (nil for tables).
+    let custom: CustomBlock?
+}
+
+// MARK: - Queued results
+
+/// Carries a queued command's result back to the caller waiting for it (both on the main actor).
+@MainActor
+private final class QueuedResult<Value> {
+    var value: Value?
 }
 
 // MARK: - Undo manager
@@ -1493,12 +1727,23 @@ enum BlockOverlay {
 /// D-132: the document's name from its first line of text.
 enum TextDocTitle {
     static let maxLength = 80
+    /// The typing pause after which the name follows the first line (short pauses mid-word rename nothing).
+    static let debounce: TimeInterval = 2
+    /// Device-local record of the name automatic naming gave each document last ("textdoc.autoTitle.<doc>").
+    static let settingPrefix = "textdoc.autoTitle."
 
-    static func derive(from blocks: [TextBlock]) -> String? {
+    static func settingKey(_ doc: DocumentID) -> SettingKey<String> {
+        SettingKey(settingPrefix + doc.raw, default: "")
+    }
+
+    static func derive(from blocks: [TextBlock]) -> String? { source(in: blocks)?.title }
+
+    /// The block the name comes from, with its first non-empty line.
+    static func source(in blocks: [TextBlock]) -> (id: NibID, title: String)? {
         for b in blocks where BlockRules.isText(b.kind) {
             for line in b.text.plainText.components(separatedBy: .newlines) {
                 let t = sanitize(line)
-                if !t.isEmpty { return t }
+                if !t.isEmpty { return (b.id, t) }
             }
         }
         return nil
@@ -1513,6 +1758,70 @@ enum TextDocTitle {
         s = s.trimmingCharacters(in: .whitespaces)
         if s.count > maxLength { s = String(s.prefix(maxLength)).trimmingCharacters(in: .whitespaces) }
         return s
+    }
+}
+
+/// S-012: the assistant's answer as block text.
+enum BlockAssistant {
+    /// Appended to a block edit action's prompt: the assistant answers with the new text, which the editor previews.
+    static let previewInstruction = "Reply with only the new text of this block: no quotes, labels or commentary. "
+        + "Do not change the document yourself; the user reviews your text before it replaces the block."
+
+    /// Trims the answer and unwraps a fenced code block the model may put around it.
+    static func clean(_ answer: String) -> String {
+        let s = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.hasPrefix("```"), s.hasSuffix("```"), s.contains("\n") else { return s }
+        var lines = s.components(separatedBy: "\n")
+        lines.removeFirst()
+        if let last = lines.last, last.trimmingCharacters(in: .whitespaces) == "```" { lines.removeLast() }
+        return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The answer's paragraphs: its non-empty lines, trimmed.
+    static func paragraphs(_ text: String) -> [String] {
+        text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+}
+
+/// Inline images inside block text: pasted or dropped rich text with attachments, and adaptive image glyphs.
+enum BlockAttachments {
+    /// Removes every inline image from the text view (keeping the caret in place) and returns the images' bytes.
+    @MainActor
+    static func takeImages(from tv: UITextView) -> [Data] {
+        let storage = tv.textStorage
+        guard storage.length > 0 else { return [] }
+        var found: [(range: NSRange, data: Data?)] = []
+        storage.enumerateAttributes(in: NSRange(location: 0, length: storage.length), options: []) { a, range, _ in
+            if #available(iOS 18.0, *), let glyph = a[.adaptiveImageGlyph] as? NSAdaptiveImageGlyph {
+                found.append((range: range, data: glyph.imageContent))
+            } else if let attachment = a[.attachment] as? NSTextAttachment {
+                found.append((range: range, data: imageData(attachment)))
+            }
+        }
+        guard !found.isEmpty else { return [] }
+        let caret = tv.selectedRange.location
+        storage.beginEditing()
+        for item in found.reversed() { storage.deleteCharacters(in: item.range) }
+        storage.endEditing()
+        tv.selectedRange = NSRange(location: caretAfterRemoving(found.map { $0.range }, caret: caret, length: storage.length),
+                                   length: 0)
+        return found.compactMap { $0.data }
+    }
+
+    /// The caret's new offset once `ranges` (ascending, disjoint) are deleted.
+    static func caretAfterRemoving(_ ranges: [NSRange], caret: Int, length: Int) -> Int {
+        var removed = 0
+        for r in ranges where r.location < caret { removed += min(r.length, caret - r.location) }
+        return max(0, min(caret - removed, length))
+    }
+
+    /// The attachment's image bytes: its file contents when ImageIO can read them, else a PNG of its image.
+    static func imageData(_ attachment: NSTextAttachment) -> Data? {
+        if let contents = attachment.contents ?? attachment.fileWrapper?.regularFileContents,
+           BlockMedia.imageExtension(contents) != nil {
+            return contents
+        }
+        return attachment.image?.pngData()
     }
 }
 

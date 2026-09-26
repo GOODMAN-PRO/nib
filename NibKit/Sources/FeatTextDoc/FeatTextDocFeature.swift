@@ -20,6 +20,10 @@ public enum FeatTextDocFeature: NibFeature {
 
         for d in BuiltinBlockKinds.descriptors(owner: id) { app.content.blockKinds.register(d) }
         for m in TextDocMenus.items(owner: id) { app.ui.menus.register(m) }
+
+        app.settings.declarePrefix(TextDocTitle.settingPrefix, synced: false,
+                                   summary: "Per text document: the name automatic naming gave it last (D-132); a different name means the user chose one.",
+                                   owner: id, schema: .str("document name"))
     }
 
     /// ⇧⌘T in the library makes a new text document (the `nib://new` deep link creates and opens it). The keyboard
@@ -100,10 +104,13 @@ enum TextDocMenus {
 
     static func items(owner: String) -> [MenuItemDescriptor] {
         var out: [MenuItemDescriptor] = []
-        out.append(MenuItemDescriptor(
+        var newItem = MenuItemDescriptor(
             id: "textdoc.new", title: String(localized: "Text Document"), icon: NibSymbol.textDocument.name,
             location: .libraryNew, order: 400, owner: owner, command: CommandIDs.batch,
-            params: { ctx in TextDocMenus.newDocumentParams(ctx) }))
+            params: { ctx in TextDocMenus.newDocumentParams(ctx) })
+        // The ⇧⌘T label; the key itself is the `textdoc.new` key command registered in `start`.
+        newItem.shortcut = newDocumentShortcut
+        out.append(newItem)
         out.append(MenuItemDescriptor(
             id: "textdoc.block.duplicate", title: String(localized: "Duplicate"), icon: "plus.square.on.square",
             location: .block, order: 100, owner: owner, command: CommandIDs.batch,
@@ -175,22 +182,28 @@ enum TextDocMenus {
     static func newDocumentParams(_ ctx: MenuContext) -> JSONValue {
         let id = NibID.make()
         var create: [String: JSONValue] = ["kind": .string(DocumentKind.textDocument.rawValue), "id": .string(id.raw)]
-        if let ref = ctx.ref, case .folder? = NodeRef(ref) { create["folder"] = .string(ref) }
+        // The folder the New menu was opened in (contracts-v2 `MenuContext.folder`; hosts before it passed the ref).
+        if let folder = ctx.folder {
+            create["folder"] = .string(NodeRef.folder(folder).description)
+        } else if let ref = ctx.ref, case .folder? = NodeRef(ref) {
+            create["folder"] = .string(ref)
+        }
         let open: JSONValue = ["doc": .string(NodeRef.document(id).description)]
         let calls: [JSONValue] = [["command": .string(CommandIDs.docCreate), "params": .object(create)],
                                   ["command": .string(CommandIDs.docOpen), "params": open]]
         return ["calls": .array(calls)]
     }
 
+    /// block.move params one step up or down. At the edge the block stays where it is (block.move without `after`
+    /// would send it to the top).
     static func moveParams(_ ctx: MenuContext, up: Bool) -> JSONValue {
         guard let b = block(ctx) else { return [:] }
         let ref = NodeRef.block(b.doc, b.block.id).description
-        if up {
-            let after = b.index >= 2 ? NodeRef.block(b.doc, b.all[b.index - 2].id).description : NodeRef.document(b.doc).description
-            return ["ref": .string(ref), "after": .string(after)]
-        }
-        guard b.index + 1 < b.all.count else { return ["ref": .string(ref)] }
-        return ["ref": .string(ref), "after": .string(NodeRef.block(b.doc, b.all[b.index + 1].id).description)]
+        let top = NodeRef.document(b.doc).description
+        func after(_ i: Int) -> String { i >= 0 ? NodeRef.block(b.doc, b.all[i].id).description : top }
+        if up { return ["ref": .string(ref), "after": .string(after(b.index - 2))] }
+        let target = b.index + 1 < b.all.count ? b.index + 1 : b.index - 1
+        return ["ref": .string(ref), "after": .string(after(target))]
     }
 
     /// A copy right below: block.insert with every field it takes, then block.update for indent and checked.
