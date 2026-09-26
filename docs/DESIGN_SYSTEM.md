@@ -258,7 +258,9 @@ struct EditorChrome: View {
 
 Files in the order below. Paths are relative to the repository root.
 
-Two files live beside these and are not reproduced here: `Gallery/DesignGallery.swift` (the Settings › Advanced › Developer screen that shows every token, component and droplet interaction in light and dark; the app shell registers it with `DesignGallery.registerSettingsPage(in:)`) and `NibKit/Tests/NibDesignTests/TokenContrastTests.swift` (WCAG contrast of the text tokens over the worst case beneath, §2.4 of DESIGN.md).
+Three files live beside these and are not reproduced here: `Gallery/DesignGallery.swift` (the Settings › Advanced › Developer screen that shows every token, component and droplet interaction in light and dark, the held rim included; the app shell registers it with `DesignGallery.registerSettingsPage(in:)`), `NibKit/Tests/NibDesignTests/TokenContrastTests.swift` (WCAG contrast of the text tokens over the worst case beneath, §2.4 of DESIGN.md) and `NibKit/Tests/NibDesignTests/GlassOpticsTests.swift` (Liquid Glass v2, DESIGN.md §10.9: the rim follows the top-left light with a counter-rim at half and is never a uniform stroke, every optic stays in the outer 4.5 pt so contrast holds under content, the held rim and shadow, Regular system glass with the accent as the only tint, `interactive` on touchable chrome, and the fallback selection of §12).
+
+**Liquid Glass v2 in code.** The optics numbers live in one place, `NibOptics` (§3.16), and reach both Metal functions as arguments, so the Swift and Metal argument lists must match one for one. On iOS 26 `DropletStyle.systemGlass` and `nibGlass` go through `NibSystemGlass` (Regular everywhere, the accent the only tint) and `NibGlassRenderer` picks system glass, water or the opaque union. The held rim is `DropletPresentation.rim` (`DropletStyle.rimStrength(lift:)`), drawn by `NibLiftRim` over iOS 26 glass and by the water shader through `WaterCluster.rim` on iOS 17–25. Outside the liquid files, three call sites follow: `Droplet.swift` (`GlassBody` draws `NibLiftRim` and no bud stroke, `FrameRim` draws its outline once, a droplet outside a container passes `isInteractive`), `DropletContainer.swift` (`NibShaders.waterField(cluster, iso:)`) and `Palette.swift` (`drawNibBeadRim`).
 
 ### 3.1 `NibKit/Sources/NibDesign/Modifiers/NibInteraction.swift`
 
@@ -438,21 +440,26 @@ public enum NibUIColor {
     public static let success = UIColor.systemGreen
     public static let warning = UIColor.systemOrange
 
-    // Water: what the droplet material is made of (DESIGN.md §3.3). Deep dark body is #1C1C1E @ 86 % (fix 3).
+    // Water: what the droplet material is made of (DESIGN.md §3.3). Deep dark body is #1C1C1E @ 86 % (fix 3). On iOS 26
+    // the system glass is the material and only the bodies (as the frozen tint while the Pencil is down) are used; the
+    // optics tokens below draw Nib's own water on iOS 17–25 (DESIGN.md §10.9).
     public static let clearBody = UIColor.nib(0xFFFFFF, 0.46, dark: 0x161618, 0.62, contrastLight: 0.72, contrastDark: 0.72)
     /// Clear over light paper: dark mode thickens to 80 % so a droplet over white paper is not a grey blob.
     public static let clearBodyOnPaper = UIColor.nib(0xFFFFFF, 0.46, dark: 0x161618, 0.80, contrastLight: 0.72, contrastDark: 0.86)
     public static let deepBody = UIColor.nib(0xF9F9FB, 0.72, dark: 0x1C1C1E, 0.86, contrastLight: 0.90, contrastDark: 0.92)
-    public static let deepGlassTint = UIColor.nib(0xFFFFFF, 0.35, dark: 0x1C1C1E, 0.45)
     public static let waterBody = UIColor.nib(0xFFFFFF, 0.08, dark: 0xFFFFFF, 0.03)
-    /// Edge and caustic are drawn over light paper only (DESIGN.md §3.3); over a flat desk they read as a pillow.
-    public static let waterEdge = UIColor.nib(0x141C28, 0.07, dark: 0xFFFFFF, 0.08)
-    public static let waterCaustic = UIColor.nib(0xFFFFFF, 0.12, dark: 0xFFFFFF, 0.10)
-    public static let waterRim = UIColor.nib(0xFFFFFF, 0.85, dark: 0xFFFFFF, 0.42)
-    /// A Tinted droplet's only optic.
+    /// The rim at full strength: a 0.8 pt line lit by the top-left key light, half as bright on the counter side, and
+    /// 22 % of it as the sheen inside the lit edge. Never a uniform stroke.
+    public static let waterRim = UIColor.nib(0xFFFFFF, 0.85, dark: 0xFFFFFF, 0.50)
+    /// A Tinted droplet's only optic (key and counter rim, no sheen).
     public static let tintRim = UIColor.nib(0xFFFFFF, 0.30, dark: 0xFFFFFF, 0.30)
     public static let waterLine = UIColor.nib(0x000000, 0.075, dark: 0xFFFFFF, 0.12, contrastLight: 0.25, contrastDark: 0.40)
     public static let waterLineBud = UIColor.nib(0x000000, 0.12, dark: 0xFFFFFF, 0.16, contrastLight: 0.25, contrastDark: 0.40)
+    /// The water's own shadow over a flat backdrop (desk, library, sheets), and over light paper. Light mode: deeper over
+    /// paper, where there is ink to separate from (the system glass's shadow grows over text). Dark mode: lighter over
+    /// paper, where the dark water already stands off the white page and a deep halo reads as a smudge.
+    public static let waterShadow = UIColor.nib(0x000000, 0.08, dark: 0x000000, 0.28)
+    public static let waterShadowOnPaper = UIColor.nib(0x000000, 0.13, dark: 0x000000, 0.18)
     public static let beadBody = UIColor.nib(0xFFFFFF, 0.70, dark: 0xFFFFFF, 0.22)
     /// Slider thumbs only; the selection bead has no shadow.
     public static let beadShadow = UIColor.nib(0x000000, 0.16, dark: 0x000000, 0.45)
@@ -489,14 +496,13 @@ public enum NibColor {
     public static let clearBody = Color(uiColor: NibUIColor.clearBody)
     public static let clearBodyOnPaper = Color(uiColor: NibUIColor.clearBodyOnPaper)
     public static let deepBody = Color(uiColor: NibUIColor.deepBody)
-    public static let deepGlassTint = Color(uiColor: NibUIColor.deepGlassTint)
     public static let waterBody = Color(uiColor: NibUIColor.waterBody)
-    public static let waterEdge = Color(uiColor: NibUIColor.waterEdge)
-    public static let waterCaustic = Color(uiColor: NibUIColor.waterCaustic)
     public static let waterRim = Color(uiColor: NibUIColor.waterRim)
     public static let tintRim = Color(uiColor: NibUIColor.tintRim)
     public static let waterLine = Color(uiColor: NibUIColor.waterLine)
     public static let waterLineBud = Color(uiColor: NibUIColor.waterLineBud)
+    public static let waterShadow = Color(uiColor: NibUIColor.waterShadow)
+    public static let waterShadowOnPaper = Color(uiColor: NibUIColor.waterShadowOnPaper)
     public static let beadBody = Color(uiColor: NibUIColor.beadBody)
     public static let beadShadow = Color(uiColor: NibUIColor.beadShadow)
     public static let swatchHairline = Color(uiColor: NibUIColor.swatchHairline)
@@ -1225,9 +1231,47 @@ public enum NibGlass: Sendable {
     case clear, deep, tinted, bead
 }
 
+/// What Nib asks of the system glass on iOS 26+ (DESIGN.md §2.2). Every droplet is the Regular variant: Apple never
+/// mixes Regular and Clear in one interface, and Clear is for media-rich backdrops with a dimming layer beneath, which
+/// a page of handwriting is not. Regular already thickens itself for large surfaces (popovers, panels) and adapts its
+/// shadow and tint to what is beneath, so Deep is not tinted either: a tint means prominence, never thickness, and
+/// only the Tinted material (the one primary action) has one. `isInteractive` is set wherever the glass takes the touch.
+struct NibSystemGlass: Equatable {
+    var tintsAccent: Bool
+    var isInteractive: Bool
+
+    static func of(_ kind: NibGlass, interactive: Bool) -> NibSystemGlass {
+        NibSystemGlass(tintsAccent: kind == .tinted, isInteractive: interactive)
+    }
+
+    @available(iOS 26.0, *)
+    var glass: Glass {
+        (tintsAccent ? Glass.regular.tint(NibColor.accent) : Glass.regular).interactive(isInteractive)
+    }
+}
+
+/// Which recipe draws the droplet material (DESIGN.md §2.3, §12). The system glass handles Reduce Transparency (it
+/// frosts) and Increase Contrast (it borders) itself, so on iOS 26 only Liquid Off replaces it.
+enum NibGlassRenderer: Equatable {
+    /// System Liquid Glass (iOS 26+).
+    case system
+    /// Nib's water: body tint, rim, sheen, outline, shadow (iOS 17–25).
+    case water
+    /// One opaque fill with the 0.8 pt line: Liquid Off everywhere; Reduce Transparency and thermal throttling on 17–25.
+    case opaque
+
+    static func select(systemGlass: Bool, mode: NibLiquidMode, reduceTransparency: Bool,
+                       throttled: Bool = false) -> NibGlassRenderer {
+        if mode == .off { return .opaque }
+        if systemGlass { return .system }
+        return reduceTransparency || throttled ? .opaque : .water
+    }
+}
+
 public extension View {
     /// The droplet material on a single surface that has no physics, such as a floating HUD outside a container.
-    /// Inside a `NibDropletContainer` use `.droplet(_:style:)`, which merges, stretches and buds.
+    /// Inside a `NibDropletContainer` use `.droplet(_:style:)`, which merges, stretches and buds. `interactive`: the
+    /// surface holds controls, so on iOS 26 the glass answers touches the way system buttons do.
     func nibGlass(_ kind: NibGlass = .clear, cornerRadius: CGFloat? = nil, interactive: Bool = false) -> some View {
         modifier(NibGlassModifier(kind: kind, shape: NibDropletShape(cornerRadius: cornerRadius), interactive: interactive))
     }
@@ -1260,56 +1304,71 @@ struct NibGlassModifier: ViewModifier {
     @Environment(\.nibIsInking) private var frozen
 
     func body(content: Content) -> some View {
-        content.background { material }
-    }
-
-    @ViewBuilder private var material: some View {
-        if reduceTransparency || mode == .off {
-            opaque
-        } else if kind == .bead {
-            shape.fill(NibColor.beadBody)              // a bead is body plus rim: no shadow (DESIGN.md §2.2)
-                .overlay { NibWaterRimLayer(cornerRadius: shape.cornerRadius, rimOnly: true) }
-        } else {
-            glass
-        }
-    }
-
-    @ViewBuilder private var glass: some View {
         if #available(iOS 26.0, *) {
-            if frozen {
-                shape.fill(tint).glassEffect(.identity, in: shape)
-            } else {
-                Color.clear.glassEffect(systemGlass, in: shape)
-            }
+            // The glass is applied to the content itself, as Apple's custom-view guide does: its foreground effects
+            // (vibrant labels, the interactive response) reach the controls. One modifier chain in every state, so a
+            // Pencil down or a Liquid change never rebuilds the content.
+            content
+                .background { systemUnderlay }
+                .glassEffect(systemGlass, in: shape)
         } else {
-            water
+            content.background { fallback }
         }
+    }
+
+    private var renderer: NibGlassRenderer {
+        var hasSystemGlass = false
+        if #available(iOS 26.0, *) { hasSystemGlass = true }
+        return NibGlassRenderer.select(systemGlass: hasSystemGlass, mode: mode, reduceTransparency: reduceTransparency)
     }
 
     private var tint: Color {
         kind == .deep ? NibColor.deepBody : (kind == .tinted ? NibColor.accent : NibColor.clearBody)
     }
 
+    /// iOS 26: nothing under system glass, except the plain body tint while frozen (`.identity` above it), the opaque
+    /// fill under Liquid Off, and a bead, which is a plain fill because it only ever sits inside glass (never glass on
+    /// glass, no rim painted over the system's).
     @available(iOS 26.0, *)
-    private var systemGlass: Glass {
-        switch kind {
-        case .clear, .bead: return Glass.regular.interactive(interactive)
-        case .deep: return Glass.regular.tint(NibColor.deepGlassTint)
-        case .tinted: return Glass.regular.tint(NibColor.accent).interactive(interactive)
+    @ViewBuilder private var systemUnderlay: some View {
+        if renderer == .opaque {
+            opaque
+        } else if kind == .bead {
+            shape.fill(NibColor.beadBody)
+        } else if frozen {
+            shape.fill(tint)
         }
     }
 
-    /// iOS 17–25: body tint (plus frost for Deep, not while inking) and the rim shader. No backdrop refraction.
-    /// A lone surface has no page behind it to lens, so it gets the rim and outline only; Tinted gets its 30 % rim.
+    @available(iOS 26.0, *)
+    private var systemGlass: Glass {
+        if renderer == .opaque || kind == .bead || frozen { return .identity }
+        return NibSystemGlass.of(kind, interactive: interactive).glass
+    }
+
+    @ViewBuilder private var fallback: some View {
+        if renderer == .opaque {
+            opaque
+        } else if kind == .bead {
+            shape.fill(NibColor.beadBody)              // a bead is body plus its key rim: no shadow (DESIGN.md §2.2)
+                .overlay { NibWaterRimLayer(cornerRadius: shape.cornerRadius, bead: true) }
+        } else {
+            water
+        }
+    }
+
+    /// iOS 17–25: the water's shadow (outside the body only), frost under Deep (not while inking), the body tint and
+    /// the analytic optics. A lone surface has no page behind it, so it gets no edge lens; Tinted gets its rim and the
+    /// outline only.
     private var water: some View {
         ZStack {
+            NibWaterShadow(shape: shape)
             if kind == .deep && !frozen {
                 shape.fill(.ultraThinMaterial)
             }
             shape.fill(tint)
-            NibWaterRimLayer(cornerRadius: shape.cornerRadius, rimOnly: true, tinted: kind == .tinted)
+            NibWaterRimLayer(cornerRadius: shape.cornerRadius, rimOnly: kind == .tinted, tinted: kind == .tinted)
         }
-        .nibElevation(.rest)
     }
 
     private var opaque: some View {
@@ -1319,12 +1378,18 @@ struct NibGlassModifier: ViewModifier {
     }
 }
 
-/// The water optics of one shape, analytic (no field). `rimOnly` drops edge, caustic and specular (a lone surface,
-/// a bead, a Tinted droplet); `tinted` uses the Tinted rim.
+/// The water optics of one shape, analytic (no field), for iOS 17–25 surfaces with no container field: `nibGlass`,
+/// beads, folder films, the zoom-window frame. Always the directional rim (key rim, counter-rim half as bright) and the
+/// 0.8 pt outline under it; the sheen unless `rimOnly` (flat library films, frames, Tinted). `tinted` uses the Tinted
+/// rim. `bead` is the key rim alone, no counter-rim, sheen or outline, so a bead never reads as a raised button.
+/// `strength` is the rim strength (1 at rest, `DropletStyle.liftedRim` held).
 struct NibWaterRimLayer: View {
     let cornerRadius: CGFloat?
     var rimOnly = false
     var tinted = false
+    var bead = false
+    var outline = true
+    var strength: CGFloat = 1
 
     var body: some View {
         GeometryReader { proxy in
@@ -1332,10 +1397,68 @@ struct NibWaterRimLayer: View {
             Rectangle()
                 .fill(Color.white)
                 .padding(-1)                    // 1 pt outset so the anti-aliased edge is not cut
-                .colorEffect(NibShaders.waterRim(cornerRadius: r, optics: rimOnly ? 0 : 1, tinted: tinted))
+                .colorEffect(NibShaders.waterRim(cornerRadius: r, strength: strength, sheen: !(rimOnly || bead),
+                                                 counter: !bead, outline: outline && !bead, tinted: tinted))
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+    }
+}
+
+/// iOS 26: a held droplet's brighter rim (DESIGN.md §10.9, Held). Nothing is painted on the system glass at rest. The
+/// body of a droplet in a container never takes the touch, so the system cannot light it up; while it is held this
+/// adds only the difference, the key and counter rim at (strength − 1) × `waterRim`, plus-lighter onto the system's own
+/// rim. No outline, no sheen.
+struct NibLiftRim: View {
+    let cornerRadius: CGFloat?
+    let boost: CGFloat
+
+    var body: some View {
+        NibWaterRimLayer(cornerRadius: cornerRadius, rimOnly: true, outline: false, strength: boost)
+            .blendMode(.plusLighter)
+    }
+}
+
+/// The water's shadow on iOS 17–25 for a lone surface (DESIGN.md §10.9): the silhouette blurred at σ 8 pt, 5 pt down,
+/// in `waterShadow`, drawn outside the body only so it never shows through the translucent water. Droplets in a
+/// container get the same shadow from the field shader.
+struct NibWaterShadow: View {
+    let shape: NibDropletShape
+    /// How far the shadow reaches past the body: 5 pt down plus two blur radii of 8 pt, rounded up.
+    static let reach: CGFloat = 24
+
+    var body: some View {
+        let reach = Self.reach
+        Canvas { context, size in
+            let rect = CGRect(x: reach, y: reach, width: max(0, size.width - 2 * reach),
+                              height: max(0, size.height - 2 * reach))
+            let silhouette = shape.path(in: rect)
+            var outside = Path(CGRect(origin: .zero, size: size))
+            outside.addPath(silhouette)
+            context.clip(to: outside, style: FillStyle(eoFill: true))
+            context.addFilter(.shadow(color: NibColor.waterShadow, radius: 8, x: 0, y: NibOptics.shadowOffset,
+                                      options: .shadowOnly))
+            context.fill(silhouette, with: .color(.black))
+        }
+        .padding(-reach)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+extension GraphicsContext {
+    /// The selection bead's rim (DESIGN.md §10.7, §10.9). iOS 17–25: the key rim alone, `waterRim` in a crescent
+    /// 0.8 pt wide where the edge faces the top-left light and tapering to nothing where it turns away (the bead minus
+    /// itself moved 0.8 pt away from the light). No counter-rim, sheen or line: it must not read as a raised button.
+    /// Inside iOS 26 system glass the bead is a plain fill and this draws nothing (no rim over the system's glass).
+    mutating func drawNibBeadRim(_ bead: Path, systemGlass: Bool) {
+        guard !systemGlass else { return }
+        drawLayer { layer in
+            layer.fill(bead, with: .color(NibColor.waterRim))
+            layer.blendMode = .destinationOut
+            layer.fill(bead.offsetBy(dx: -NibOptics.light.dx * NibOptics.beadRim, dy: -NibOptics.light.dy * NibOptics.beadRim),
+                       with: .color(.black))
+        }
     }
 }
 
@@ -1474,8 +1597,8 @@ public extension View {
     func nibLiquidMode(_ mode: NibLiquidMode) -> some View { environment(\.nibLiquidMode, mode) }
 
     /// The frames of light paper (luminance > 0.6) under the container, in its coordinates: the editor passes its
-    /// visible pages, never dark papers. Droplets over them get edge and caustic (DESIGN.md §3.3), dark-mode Clear
-    /// thickens to 80 %, and they recede while the Pencil is down.
+    /// visible pages, never dark papers. Droplets over them get the edge lens and a deeper shadow on iOS 17–25
+    /// (DESIGN.md §3.3), dark-mode Clear thickens to 80 %, and they recede while the Pencil is down.
     func nibBackdrop(_ pages: [CGRect]) -> some View { environment(\.nibBackdrop, pages) }
 }
 ```
@@ -1959,10 +2082,20 @@ public struct DropletStyle: Equatable, Sendable {
     public var bondsOnRequest = false
     /// Rim and outline only, no body (the zoom-window target frame). Drawn by the droplet itself, outside the union.
     public var drawsBody = true
-    /// Page-resident droplets sit on ink and never refract it (the chip, the lasso object menu).
+    /// Page-resident droplets sit on ink and never refract it (the chip, the lasso object menu). iOS 17–25: no edge lens.
+    /// iOS 26: the system glass always lenses, so these are docked clear of ink instead; they stay the Regular variant
+    /// like every other droplet (Clear glass is for media and never mixes with Regular, DESIGN.md §2.2).
     public var refracts = true
-    /// iOS 26 glass responds to touch with the system's own highlight.
+    /// Touchable chrome: `Glass.interactive()` on iOS 26 wherever the glass itself takes the touch (`nibGlass`, a
+    /// droplet outside a container). Inside a container the body sits behind the content and is never hit-tested, so
+    /// the poke (§10.2) and the held rim (`liftedRim`) are the press response there.
     public var isInteractive = true
+    /// Rim strength at rest (DESIGN.md §10.9): 1. `lifted` raises it to `liftedRim`.
+    public var rim: CGFloat = 1
+    /// Rim strength while the droplet is held, reached at full lift and following the lift spring there and back: the
+    /// key rim, counter-rim and sheen all scale by it (1.5 = half as bright again). 1 = never brightens (precision
+    /// handles). iOS 26 draws the difference over the system glass; iOS 17–25 feeds it to the water shader.
+    public var liftedRim: CGFloat = NibOptics.liftedRim
 
     public static let bar = DropletStyle(material: .clear, cornerRadius: nil, stretchCap: 0.10, rigidity: 0.5,
                                          neck: NeckParams(join: 11, t0: 26, off: 44))
@@ -1998,7 +2131,7 @@ public struct DropletStyle: Equatable, Sendable {
                                              neck: NeckParams(join: 11, t0: 26, off: 44))
     /// Precision affordances never deform (DESIGN.md §10.15): lasso and resize handles, the rotation bead.
     public static let handle = DropletStyle(material: .clear, cornerRadius: nil, stretchCap: 0, rigidity: 1, lift: 1.0,
-                                            poke: 0, refracts: false, isInteractive: false)
+                                            poke: 0, refracts: false, isInteractive: false, liftedRim: 1)
     /// The zoom-window target: rim and outline only, radius 18, draggable with stretch.
     public static let frame = DropletStyle(material: .clear, cornerRadius: NibRadius.zoomFrame, stretchCap: 0.06,
                                            rigidity: 1, lift: 1.0, poke: 0, drag: .free, drawsBody: false,
@@ -2011,17 +2144,28 @@ public struct DropletStyle: Equatable, Sendable {
         case .tinted: return .tinted
         }
     }
+
+    /// The same droplet shown as held: its rim at `liftedRim` without being dragged (a feature's own press-and-hold
+    /// state, the gallery). A drag brightens the rim by itself, following the lift spring.
+    public var lifted: DropletStyle {
+        var style = self
+        style.rim = max(rim, liftedRim)
+        return style
+    }
+
+    /// Rim strength at lift progress `progress` (0 at rest, 1 fully lifted): `rim` → `max(rim, liftedRim)`.
+    public func rimStrength(lift progress: CGFloat) -> CGFloat {
+        rim + (max(rim, liftedRim) - rim) * min(max(progress, 0), 1)
+    }
+
+    /// What this droplet asks of the system glass on iOS 26 (DESIGN.md §2.2).
+    var systemGlassSpec: NibSystemGlass { NibSystemGlass.of(glassKind, interactive: isInteractive) }
 }
 
 @available(iOS 26.0, *)
 extension DropletStyle {
-    var systemGlass: Glass {
-        switch material {
-        case .clear: return refracts ? Glass.regular.interactive(isInteractive) : Glass.clear.interactive(isInteractive)
-        case .deep: return Glass.regular.tint(NibColor.deepGlassTint)
-        case .tinted: return Glass.regular.tint(NibColor.accent).interactive(isInteractive)
-        }
-    }
+    /// Regular for every material (tinted with the accent only for Tinted), interactive for touchable chrome.
+    var systemGlass: Glass { systemGlassSpec.glass }
 }
 
 /// Where the palette rests: an edge plus a 0…1 position along it.
@@ -2071,6 +2215,9 @@ struct DropletPresentation: Equatable {
     /// to it before its own transform, so the clip lands on the body and nothing ever draws outside it.
     var bodyMask: Path?
     var isLifted = false
+    /// Rim strength (DESIGN.md §10.9): 1 at rest, rising to the style's `liftedRim` with the lift spring while held.
+    /// iOS 26 draws the difference over the system glass (`NibLiftRim`); iOS 17–25 passes it to the water shader.
+    var rim: CGFloat = 1
     /// Released and still flowing home (the proposal chip shows its anchor until then).
     var isSettling = false
     var isDrawn = false
@@ -2217,8 +2364,13 @@ final class DropletField {
         let frostPath: Path
         let frostOpacity: Double
         let budLine: Bool
-        /// Share of the droplet over light paper (edge, caustic, dark-mode Clear body).
+        /// Share of the droplet over light paper (edge lens, deeper shadow, dark-mode Clear body).
         let paper: Double
+        /// Lift progress (0 at rest, 1 fully lifted) and the rim strength it gives (DESIGN.md §10.9).
+        let lift: Double
+        let rim: Double
+        /// False for covers and thumbnails: their content carries its own lifted shadow.
+        let castsShadow: Bool
     }
 
     // Per-frame state: not observed (views observe their own node, and the water layers the clusters).
@@ -2543,6 +2695,7 @@ final class DropletField {
                 .applying(p.contentTransform.inverted())
         }
         p.isLifted = e.isDragging
+        p.rim = e.style.rimStrength(lift: liftProgress(e))
         p.isSettling = !e.isDragging && !e.dyn.offset.isResting
         p.isDrawn = isDrawn(e)
         p.recedes = recedes(e)
@@ -2558,10 +2711,12 @@ final class DropletField {
                 let progress = Double(bodySize(e).width / max(e.rest.width, 1))
                 frost = min(max((progress - 0.25) / 0.5, 0), 1)
             }
+            let lift = liftProgress(e)
             return Render(id: id, material: e.style.material, path: bodyPath(e, inset: 0), innerPath: bodyPath(e, inset: 0.8),
                           frostPath: bodyPath(e, inset: 1.5), frostOpacity: frost,
                           budLine: e.bud.map { !$0.revealed || $0.closingAt != nil } ?? false,
-                          paper: e.style.refracts ? paperShare(visualBox(e)) : 0)
+                          paper: e.style.refracts ? paperShare(visualBox(e)) : 0,
+                          lift: Double(lift), rim: Double(e.style.rimStrength(lift: lift)), castsShadow: !e.style.restsDry)
         }
     }
 
@@ -2581,9 +2736,11 @@ final class DropletField {
             for n in own { frame = frame.union(n.path.boundingRect.insetBy(dx: -n.thickness, dy: -n.thickness)) }
             for s in sats { frame = frame.union(s.path.boundingRect) }
             let recede = ids.contains { id in entries[id].map(recedes) ?? false }
+            let optics = WaterCluster.optics(members)
             return WaterCluster(id: ids[0], renders: members, necks: own, satellites: sats,
                                 frame: frame.insetBy(dx: -pad, dy: -pad).integral,
-                                opacity: recede ? NibLiquid.recedeOpacity : 1)
+                                opacity: recede ? NibLiquid.recedeOpacity : 1,
+                                rim: optics.rim, shadow: optics.shadow, shadowY: optics.shadowY)
         }
     }
 
@@ -3230,8 +3387,8 @@ struct FrostLayer: View {
 
 /// iOS 17–25: each cluster's droplets and necks as one metaball field in a canvas framed to the cluster. The Canvas
 /// blurs the silhouettes (σ 8 pt iPad / 6.5 pt iPhone); the Metal layer effect thresholds it with analytic
-/// anti-aliasing and shades body, edge, caustic, specular, rim and outline. Material kinds and the paper share travel
-/// in the colour channels.
+/// anti-aliasing and shades body, edge lens, sheen, outline, directional rim and the water's shadow (DESIGN.md §10.9).
+/// Material kinds and the paper share travel in the colour channels.
 struct WaterLayer: View {
     let field: DropletField
 
@@ -3266,7 +3423,7 @@ struct WaterClusterCanvas: View, Equatable {
                 }
             }
         }
-        .layerEffect(NibShaders.waterField(iso: iso), maxSampleOffset: CGSize(width: 6, height: 8))
+        .layerEffect(NibShaders.waterField(cluster, iso: iso), maxSampleOffset: CGSize(width: 6, height: 8))
     }
 }
 
@@ -3387,7 +3544,7 @@ struct DropletModifier: ViewModifier {
                             bondsWith: bondsWith, onDrag: onDrag, field: field, node: field.node(id),
                             namespace: namespace, bud: bud)
         } else {
-            content.nibGlass(style.glassKind, cornerRadius: style.cornerRadius)
+            content.nibGlass(style.glassKind, cornerRadius: style.cornerRadius, interactive: style.isInteractive)
         }
     }
 }
@@ -3500,15 +3657,12 @@ struct FrameRim: View {
     let presentation: DropletPresentation
 
     var body: some View {
-        let shape = NibDropletShape(cornerRadius: presentation.cornerRadius)
-        ZStack {
-            shape.stroke(NibColor.waterLine, lineWidth: 0.8)
-            NibWaterRimLayer(cornerRadius: presentation.cornerRadius, rimOnly: true)
-        }
-        .frame(width: max(0, presentation.bodySize.width), height: max(0, presentation.bodySize.height))
-        .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+        // The rim layer draws the 0.8 pt outline itself: no second stroke (DESIGN.md §10.9).
+        NibWaterRimLayer(cornerRadius: presentation.cornerRadius, rimOnly: true, strength: presentation.rim)
+            .frame(width: max(0, presentation.bodySize.width), height: max(0, presentation.bodySize.height))
+            .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 
@@ -3548,8 +3702,11 @@ struct GlassBody: View {
             .glassEffect(frozen ? .identity : style.systemGlass, in: shape)
             .modifier(GlassIDModifier(id: id, namespace: namespace))
             .overlay {
-                if presentation.budLine {
-                    shape.stroke(NibColor.waterLineBud, lineWidth: 0.8)
+                // Nothing is painted on system glass at rest: its own rim, shadow and lensing are the droplet (a bud's
+                // outline is for the iOS 17–25 water only). Held, the rim brightens (DESIGN.md §10.9).
+                if presentation.rim > 1.001 {
+                    NibLiftRim(cornerRadius: style.cornerRadius == nil ? nil : presentation.cornerRadius,
+                               boost: presentation.rim - 1)
                 }
             }
             .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
@@ -3612,30 +3769,101 @@ struct BudAnchorReader: View {
 ### 3.16 `NibKit/Sources/NibDesign/Liquid/NibShaders.swift`
 
 ```swift
+import Foundation
 import SwiftUI
 
-/// The Metal functions in Shaders/NibLiquid.metal, loaded from this module's bundle.
-enum NibShaders {
-    static let library = ShaderLibrary.bundle(.module)
-    static let specular: Float = 0.55
+/// The water's optics (DESIGN.md §10.9, Liquid Glass v2), in one place: the Metal shaders receive these numbers as
+/// arguments, the Canvas bead rim uses them, and NibDesignTests checks them. Every optic lives in the outer 4.5 pt of a
+/// droplet; the core is the body tint alone. Nothing is a uniform stroke except the 0.8 pt outline under the rim.
+enum NibOptics {
+    /// Unit vector toward the key light in screen space (y down): the top-left, azimuth 225°.
+    static let light = CGVector(dx: -0.7071, dy: -0.7071)
+    /// Key lobe `max(λ, 0)^1.5` and counter lobe `counter · max(−λ, 0)^2`, λ = outward normal · light.
+    static let keyPower: CGFloat = 1.5
+    static let counterPower: CGFloat = 2
+    /// The counter-rim (bottom-right) at its peak, relative to the key rim at its peak.
+    static let counter: CGFloat = 0.5
+    /// The sheen inside the lit edge, as a share of `waterRim`, times the key lobe squared.
+    static let sheen: CGFloat = 0.22
+    /// The rim and outline band: `1 − smoothstep(0.3, 1.1, d)`, d = depth inside the silhouette in points (≈ 0.8 pt).
+    static let edgeBand: (CGFloat, CGFloat) = (0.3, 1.1)
+    /// The sheen band: `1 − smoothstep(0.8, 4.5, d)`.
+    static let sheenBand: (CGFloat, CGFloat) = (0.8, 4.5)
+    /// Edge lens (iOS 17–25, over light paper only): the body thins by up to 35 % at the silhouette, back to full by
+    /// 4 pt, as if the glass bent the page in at its rim. Content sits ≥ 4.5 pt inside, so text contrast is untouched.
+    static let lens: CGFloat = 0.35
+    static let lensDepth: CGFloat = 4
+    /// Deeper than this nothing but the body is drawn: the clear core.
+    static let opticsDepth: CGFloat = 4.5
+    /// Rim strength while a droplet is held, at full lift (`DropletStyle.liftedRim` default).
+    static let liftedRim: CGFloat = 1.5
+    /// The water's shadow (iOS 17–25): the field (the silhouette blurred at σ) moved down 5 pt at rest, 8 pt held, drawn
+    /// outside the body only; its opacity grows by 60 % at full lift.
+    static let shadowOffset: CGFloat = 5
+    static let liftedShadowOffset: CGFloat = 8
+    static let liftedShadow: CGFloat = 1.6
+    /// The selection bead's key rim: the bead minus itself moved this far away from the light.
+    static let beadRim: CGFloat = 0.8
 
-    /// Layer effect over one cluster's field Canvas (iOS 17–25).
-    static func waterField(iso: Float) -> Shader {
-        library.nibWaterField(
-            .float(iso),
-            .color(NibColor.clearBody), .color(NibColor.clearBodyOnPaper), .color(NibColor.deepBody), .color(NibColor.accent),
-            .color(NibColor.waterBody), .color(NibColor.waterEdge), .color(NibColor.waterCaustic), .color(NibColor.waterRim),
-            .color(NibColor.tintRim), .color(NibColor.waterLine), .float(specular))
+    static func smoothstep(_ a: CGFloat, _ b: CGFloat, _ x: CGFloat) -> CGFloat {
+        let t = min(max((x - a) / (b - a), 0), 1)
+        return t * t * (3 - 2 * t)
     }
 
-    /// Colour effect for one static shape (`nibGlass` fallback, folder films, frames): analytic rounded-rect distance,
-    /// no sampling. `optics` 0 draws the rim and outline only; `tinted` uses the Tinted rim.
-    static func waterRim(cornerRadius: CGFloat, optics: Float, tinted: Bool) -> Shader {
+    /// λ for an outward unit normal.
+    static func lambda(_ outward: CGVector) -> CGFloat { outward.dx * light.dx + outward.dy * light.dy }
+
+    static func key(_ outward: CGVector) -> CGFloat { pow(max(lambda(outward), 0), keyPower) }
+
+    /// How lit the rim is at an edge whose outward normal is `outward`: 1 facing the light, `counter` facing away, 0
+    /// where the edge runs parallel to the light.
+    static func rimLight(_ outward: CGVector) -> CGFloat {
+        key(outward) + counter * pow(max(-lambda(outward), 0), counterPower)
+    }
+
+    /// The rim's alpha at depth `d` for an edge facing `outward`, at strength `strength`, over a rim colour of alpha `a`.
+    static func rimAlpha(_ outward: CGVector, depth d: CGFloat, strength: CGFloat = 1, colourAlpha a: CGFloat) -> CGFloat {
+        min(a * rimLight(outward) * (1 - smoothstep(edgeBand.0, edgeBand.1, d)) * strength, 1)
+    }
+
+    /// The body's opacity factor at depth `d` over a droplet whose share over light paper is `paper` (edge lens).
+    static func lensFactor(depth d: CGFloat, paper: CGFloat) -> CGFloat {
+        1 - lens * min(max(paper, 0), 1) * (1 - smoothstep(0, lensDepth, d))
+    }
+}
+
+/// The Metal functions in Shaders/NibLiquid.metal, loaded from this module's bundle. The argument lists here and the
+/// function signatures there must match one for one.
+enum NibShaders {
+    static let library = ShaderLibrary.bundle(.module)
+
+    /// Layer effect over one cluster's field Canvas (iOS 17–25): body, edge lens, sheen, outline, directional rim and
+    /// the water's shadow. It samples ±1.5 pt around each pixel and 8 pt above it at most.
+    static func waterField(_ cluster: WaterCluster, iso: Float) -> Shader {
+        waterField(iso: iso, rim: cluster.rim, shadow: cluster.shadow, shadowY: cluster.shadowY)
+    }
+
+    static func waterField(iso: Float, rim: Float = 1, shadow: Float = 1,
+                           shadowY: Float = Float(NibOptics.shadowOffset)) -> Shader {
+        library.nibWaterField(
+            .float(iso), .float(rim), .float(shadow), .float(shadowY),
+            .float(NibOptics.light.dx), .float(NibOptics.light.dy), .float(NibOptics.counter), .float(NibOptics.sheen),
+            .float(NibOptics.lens),
+            .color(NibColor.clearBody), .color(NibColor.clearBodyOnPaper), .color(NibColor.deepBody), .color(NibColor.accent),
+            .color(NibColor.waterBody), .color(NibColor.waterRim), .color(NibColor.tintRim), .color(NibColor.waterLine),
+            .color(NibColor.waterShadow), .color(NibColor.waterShadowOnPaper))
+    }
+
+    /// Colour effect for one static shape (`nibGlass` on iOS 17–25, beads, folder films, frames, the held rim on iOS 26):
+    /// analytic rounded-rect distance, no sampling. `sheen` false drops the sheen, `counter` false the counter-rim,
+    /// `outline` false the 0.8 pt line; `tinted` uses the Tinted rim.
+    static func waterRim(cornerRadius: CGFloat, strength: CGFloat, sheen: Bool, counter: Bool, outline: Bool,
+                         tinted: Bool) -> Shader {
         library.nibWaterRim(
-            .boundingRect, .float(cornerRadius), .float(optics),
-            .color(NibColor.waterEdge), .color(NibColor.waterCaustic),
-            .color(tinted ? NibColor.tintRim : NibColor.waterRim), .color(NibColor.waterLine),
-            .float(tinted ? 0 : specular))
+            .boundingRect, .float(cornerRadius), .float(strength),
+            .float(NibOptics.light.dx), .float(NibOptics.light.dy), .float(counter ? NibOptics.counter : CGFloat(0)),
+            .float(sheen ? NibOptics.sheen : 0), .float(outline ? Float(1) : Float(0)),
+            .color(tinted ? NibColor.tintRim : NibColor.waterRim), .color(NibColor.waterLine))
     }
 }
 ```
@@ -3657,6 +3885,23 @@ struct WaterCluster: Identifiable, Equatable {
     var frame: CGRect
     /// 0.22 while any member recedes (the union cannot fade one member without changing its shape).
     var opacity: Double
+    /// The union's rim strength (its most lifted member's), shadow opacity multiplier and shadow offset (DESIGN.md §10.9).
+    var rim: Float = 1
+    var shadow: Float = 1
+    var shadowY: Float = Float(NibOptics.shadowOffset)
+
+    /// One union has one rim and one shadow: the rim follows the most lifted member; the shadow deepens from 1× at 5 pt
+    /// to 1.6× at 8 pt with the lift of the members that cast one, and is 0 when none does (lifted covers and
+    /// thumbnails bring their own).
+    static func optics(_ members: [DropletField.Render]) -> (rim: Float, shadow: Float, shadowY: Float) {
+        let rim = members.map(\.rim).max() ?? 1
+        let casting = members.filter(\.castsShadow)
+        guard !casting.isEmpty else { return (Float(rim), 0, Float(NibOptics.shadowOffset)) }
+        let lift = CGFloat(min(max(casting.map(\.lift).max() ?? 0, 0), 1))
+        let shadow = 1 + (NibOptics.liftedShadow - 1) * lift
+        let y = NibOptics.shadowOffset + (NibOptics.liftedShadowOffset - NibOptics.shadowOffset) * lift
+        return (Float(rim), Float(shadow), Float(y))
+    }
 
     /// Union-find over the linked pairs; groups keep the order of `ids`.
     static func groups(_ ids: [String], linked: Set<DropletField.PairKey>) -> [[String]] {
@@ -3691,72 +3936,94 @@ struct WaterCluster: Identifiable, Equatable {
 #include <SwiftUI/SwiftUI_Metal.h>
 using namespace metal;
 
-// Nib's water (docs/DESIGN.md §10.9). Light from the top-left: azimuth 225°, elevation 40°; screen y points down.
-constant float3 kLight = float3(-0.5417, -0.5417, 0.6428);
+// Nib's water on iOS 17–25 (docs/DESIGN.md §10.9, Liquid Glass v2). Every optic lives in the outer 4.5 pt: a 0.8 pt rim
+// lit by the top-left key light with a counter-rim half as bright opposite it, a sheen inside the lit edge and, over
+// light paper, a body that thins toward the silhouette where the glass would bend the page. The core is the body tint
+// alone. The numbers arrive from NibOptics (NibShaders.swift); the argument lists there and here match one for one.
 
 static inline half4 over(half4 src, half4 dst) {
     return src + dst * (1.0h - src.a);
 }
 
-// d: signed distance to the surface in points (+ inside). dRim / dCaustic: the same at p − (1.1, 1.5) and p + (4, 6).
-// n2: unit vector pointing into the droplet. Height = smoothstep(0, 8 pt, d): a flat puddle with a rounded rim.
-// Edge and caustic come in already scaled by how much there is to lens (light paper) and by 1 − tinted.
-static inline half4 waterOptics(half4 body, float d, float dRim, float dCaustic, float2 n2,
-                                half4 edge, half4 caustic, half4 rim, half4 line, float specular) {
-    float cover = saturate(d + 0.5);
-    float edgeK = 1.0 - smoothstep(0.0, 2.6, d);
-    float lineK = 1.0 - smoothstep(0.3, 1.1, d);
-    float rimK = saturate(0.5 - dRim) * cover;
-    float causticK = (1.0 - smoothstep(-2.0, 2.0, dCaustic)) * smoothstep(0.0, 3.0, d);
-    float t = saturate(d / 8.0);
-    float slope = 6.0 * t * (1.0 - t) / 8.0 * 6.5;
-    float3 n = normalize(float3(-n2 * slope, 1.0));
-    float3 h = normalize(kLight + float3(0.0, 0.0, 1.0));
-    float spec = pow(saturate(dot(n, h)), 40.0) * specular * cover;
-    half hs = half(spec);
+// `c` (premultiplied) at `k` times its own alpha, the result's alpha capped at 1.
+static inline half4 scaled(half4 c, float k) {
+    float a = float(c.a);
+    if (a <= 0.0 || k <= 0.0) {
+        return half4(0.0h);
+    }
+    return c * half(min(k, 1.0 / a));
+}
+
+// body: premultiplied body colour. d: distance inside the silhouette in points. outward: unit normal pointing out of
+// the water. light: unit vector toward the key light (screen space, y down). strength: rim strength (1 at rest, 1.5
+// held). counter: the counter-rim's peak relative to the key rim's. sheen: the sheen's share of the rim colour.
+static inline half4 waterOptics(half4 body, float d, float2 outward, float2 light, half4 rim, half4 line,
+                                float strength, float counter, float sheen) {
+    float lambda = dot(outward, light);
+    float k = max(lambda, 0.0);
+    float c = max(-lambda, 0.0);
+    float key = k * sqrt(k);                                  // max(λ, 0)^1.5
+    float lit = key + counter * c * c;                        // + counter · max(−λ, 0)^2
+    float band = 1.0 - smoothstep(0.3, 1.1, d);               // the 0.8 pt edge: outline and rim
+    float glow = 1.0 - smoothstep(0.8, 4.5, d);               // the sheen inside the lit edge
 
     half4 o = body;
-    o = over(edge * half(edgeK), o);
-    o = over(caustic * half(causticK), o);
-    o = over(half4(hs, hs, hs, hs), o);
-    o = over(rim * half(rimK), o);
-    o = over(line * half(lineK), o);
-    return o * half(cover);
+    o = over(scaled(rim, sheen * key * key * glow * strength), o);
+    o = over(line * half(band), o);                           // under the rim: it shows where the rim is dim
+    o = over(scaled(rim, lit * band * strength), o);
+    return o;
 }
 
 // Layer effect over a cluster's blurred field. Alpha = union coverage; r, g, b = clear, deep, tinted coverage, scaled
-// by k = 0.5 + 0.5 × the share over light paper, so (r + g + b) / a recovers that share.
-[[ stitchable ]] half4 nibWaterField(float2 position, SwiftUI::Layer layer, float iso,
+// by k = 0.5 + 0.5 × the share over light paper, so (r + g + b) / a recovers that share. strength: rim strength.
+// shadowK: shadow opacity multiplier (0 = none, 1 at rest, 1.6 held). shadowY: shadow offset downward in points.
+[[ stitchable ]] half4 nibWaterField(float2 position, SwiftUI::Layer layer, float iso, float strength, float shadowK,
+                                     float shadowY, float lightX, float lightY, float counter, float sheen, float lens,
                                      half4 clearBody, half4 clearBodyPaper, half4 deepBody, half4 tintBody,
-                                     half4 waterBody, half4 edge, half4 caustic, half4 rim, half4 tintRim,
-                                     half4 line, float specular) {
+                                     half4 waterBody, half4 rim, half4 tintRim, half4 line,
+                                     half4 shadowDesk, half4 shadowPaper) {
     half4 c = layer.sample(position);
     float f = float(c.a);
-    if (f < iso * 0.35) {
-        return half4(0.0h);
+    float cover = 0.0;
+    half4 o = half4(0.0h);
+    if (f >= iso * 0.35) {
+        const float e = 1.5;
+        float fx = (float(layer.sample(position + float2(e, 0.0)).a) - float(layer.sample(position - float2(e, 0.0)).a))
+                   / (2.0 * e);
+        float fy = (float(layer.sample(position + float2(0.0, e)).a) - float(layer.sample(position - float2(0.0, e)).a))
+                   / (2.0 * e);
+        float2 g = float2(fx, fy);
+        float gl = max(length(g), 0.0001);
+        float d = (f - iso) / gl;
+        if (d >= -0.5) {
+            cover = saturate(d + 0.5);
+            float kinds = max(float(c.r) + float(c.g) + float(c.b), 0.0001);
+            float paper = saturate((kinds / max(f, 0.0001) - 0.5) * 2.0);
+            float tinted = float(c.b) / kinds;
+            half4 clear = mix(clearBody, clearBodyPaper, half4(half(paper)));
+            half4 body = clear * half(float(c.r) / kinds) + deepBody * half(float(c.g) / kinds) + tintBody * half(tinted);
+            body = over(waterBody * half(1.0 - tinted), body);
+            // Edge lens: only where there is a page to bend, never on Tinted.
+            body = body * half(1.0 - lens * paper * (1.0 - tinted) * (1.0 - smoothstep(0.0, 4.0, d)));
+            half4 r = mix(rim, tintRim, half4(half(tinted)));
+            // The field grows inward, so −∇f points out of the water.
+            o = waterOptics(body, d, -g / gl, float2(lightX, lightY), r, line, strength, counter,
+                            sheen * (1.0 - tinted)) * half(cover);
+        }
     }
-    float fx = float(layer.sample(position + float2(1.0, 0.0)).a - layer.sample(position - float2(1.0, 0.0)).a) * 0.5;
-    float fy = float(layer.sample(position + float2(0.0, 1.0)).a - layer.sample(position - float2(0.0, 1.0)).a) * 0.5;
-    float2 g = float2(fx, fy);
-    float gl = max(length(g), 0.0001);
-    float d = (f - iso) / gl;
-    if (d < -0.5) {
-        return half4(0.0h);
+    // The shadow: the field is the silhouette blurred at σ, so the field `shadowY` points higher is the water's soft
+    // shadow. It is drawn only where the water is not, so it never shows through the translucent body.
+    if (cover < 1.0 && shadowK > 0.0) {
+        half4 s = layer.sample(position - float2(0.0, shadowY));
+        float fs = float(s.a);
+        if (fs > 0.002) {
+            float sk = max(float(s.r) + float(s.g) + float(s.b), 0.0001);
+            float sp = saturate((sk / fs - 0.5) * 2.0);
+            half4 shadow = scaled(mix(shadowDesk, shadowPaper, half4(half(sp))), shadowK * saturate(fs / iso));
+            o = o + shadow * half(1.0 - cover);
+        }
     }
-    float dRim = (float(layer.sample(position - float2(1.1, 1.5)).a) - iso) / gl;
-    float dCaustic = (float(layer.sample(position + float2(4.0, 6.0)).a) - iso) / gl;
-
-    float kinds = max(float(c.r) + float(c.g) + float(c.b), 0.0001);
-    float paper = saturate((kinds / max(f, 0.0001) - 0.5) * 2.0);
-    float tinted = float(c.b) / kinds;
-    half4 clear = mix(clearBody, clearBodyPaper, half4(half(paper)));
-    half4 body = clear * half(float(c.r) / kinds) + deepBody * half(float(c.g) / kinds) + tintBody * half(tinted);
-    body = over(waterBody * half(1.0 - tinted), body);
-    // Edge and caustic only where there is something to lens; Tinted gets its rim and the outline, nothing else.
-    half optics = half(paper * (1.0 - tinted));
-    half4 r = mix(rim, tintRim, half4(half(tinted)));
-    return waterOptics(body, d, dRim, dCaustic, g / gl, edge * optics, caustic * optics, r, line,
-                       specular * (1.0 - tinted));
+    return o;
 }
 
 static inline float roundedBoxSDF(float2 p, float2 halfSize, float radius) {
@@ -3764,26 +4031,27 @@ static inline float roundedBoxSDF(float2 p, float2 halfSize, float radius) {
     return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
 }
 
-// Colour effect for one static shape drawn with a 1 pt outset (nibGlass on iOS 17–25, folder films, frames). The
-// material underneath provides the body; this adds the optics. `optics` 0 = rim and outline only.
-[[ stitchable ]] half4 nibWaterRim(float2 position, half4 color, float4 bounds, float radius, float optics,
-                                   half4 edge, half4 caustic, half4 rim, half4 line, float specular) {
+// Colour effect for one static shape drawn with a 1 pt outset (nibGlass on iOS 17–25, beads, folder films, frames, the
+// held rim over iOS 26 glass). The body underneath is drawn by SwiftUI; this adds the optics. counter 0 drops the
+// counter-rim, sheen 0 the sheen, lineOn 0 the outline.
+[[ stitchable ]] half4 nibWaterRim(float2 position, half4 color, float4 bounds, float radius, float strength,
+                                   float lightX, float lightY, float counter, float sheen, float lineOn,
+                                   half4 rim, half4 line) {
     float2 halfSize = bounds.zw * 0.5 - 1.0;
     float2 centre = bounds.xy + bounds.zw * 0.5;
     float r = min(radius, min(halfSize.x, halfSize.y));
     float2 p = position - centre;
     float d = -roundedBoxSDF(p, halfSize, r);
-    if (d < -0.5) {
+    if (d < -0.5 || d > 5.0) {
         return half4(0.0h);
     }
-    float dRim = -roundedBoxSDF(p - float2(1.1, 1.5), halfSize, r);
-    float dCaustic = -roundedBoxSDF(p + float2(4.0, 6.0), halfSize, r);
-    float e = 0.5;
-    float2 g = float2(roundedBoxSDF(p - float2(e, 0.0), halfSize, r) - roundedBoxSDF(p + float2(e, 0.0), halfSize, r),
-                      roundedBoxSDF(p - float2(0.0, e), halfSize, r) - roundedBoxSDF(p + float2(0.0, e), halfSize, r));
-    float gl = max(length(g), 0.0001);
-    half o = half(optics);
-    return waterOptics(half4(0.0h), d, dRim, dCaustic, g / gl, edge * o, caustic * o, rim, line, specular * optics);
+    const float e = 0.5;
+    float2 g = float2(roundedBoxSDF(p + float2(e, 0.0), halfSize, r) - roundedBoxSDF(p - float2(e, 0.0), halfSize, r),
+                      roundedBoxSDF(p + float2(0.0, e), halfSize, r) - roundedBoxSDF(p - float2(0.0, e), halfSize, r));
+    float2 outward = g / max(length(g), 0.0001);
+    half4 o = waterOptics(half4(0.0h), d, outward, float2(lightX, lightY), rim, line * half(lineOn), strength, counter,
+                          sheen);
+    return o * half(saturate(d + 0.5));
 }
 ```
 
@@ -5100,6 +5368,7 @@ struct NibSelectionBead: View {
         let head = node?.head ?? fallbackHead, tail = node?.tail ?? fallbackHead
         let g = BeadPhysics.geometry(head: head, tail: tail, radius: NibMetrics.beadRadius)
         let across = thickness / 2
+        let systemGlass = field?.usesSystemGlass ?? false
         Canvas { context, _ in
             func point(_ a: CGFloat) -> CGPoint { vertical ? CGPoint(x: across, y: a) : CGPoint(x: a, y: across) }
             let h = point(g.head), t = point(g.tail)
@@ -5117,12 +5386,8 @@ struct NibSelectionBead: View {
                 layer.opacity = 0.15
                 layer.fill(bead, with: .color(ink))
             }
-            // The rim: the bead minus itself shifted down-right, a hairline highlight on the top-left.
-            context.drawLayer { layer in
-                layer.fill(bead, with: .color(NibColor.waterRim))
-                layer.blendMode = .destinationOut
-                layer.fill(bead.offsetBy(dx: 0.9, dy: 1.2), with: .color(.black))
-            }
+            // The key rim on the top-left (iOS 17–25); inside iOS 26 glass the bead is a plain fill (DESIGN.md §10.7).
+            context.drawNibBeadRim(bead, systemGlass: systemGlass)
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -6975,11 +7240,12 @@ Inside `NibDesign` itself, review checks that every `String(localized:` passes `
 
 ## 5. Device checks the simulator cannot make
 
-The code compiles and the physics is unit-tested in CI, but these six things can only be judged on hardware. They are the first `tools/smoke` scripts for F111, and nothing ships until a person has looked at each one:
+The code compiles and the physics is unit-tested in CI, but these seven things can only be judged on hardware. They are the first `tools/smoke` scripts for F111, and nothing ships until a person has looked at each one:
 
-1. **iOS 26 glass follows our geometry.** The body is sized by `.frame` and moved by `.offset` after `.glassEffect`, which the union honours. Necks are rotated capsules (`rotationEffect` after `glassEffect`): check that they merge. If they don't, set `NeckGlassLayer` necks to axis-aligned capsules. Check too that `Glass.identity` over the body tint (while the Pencil is down) is indistinguishable at 22 %.
+1. **iOS 26 glass follows our geometry.** The body is sized by `.frame` and moved by `.offset` after `.glassEffect`, which the union honours. Necks are rotated capsules (`rotationEffect` after `glassEffect`): check that they merge. If they don't, set `NeckGlassLayer` necks to axis-aligned capsules. Check too that `Glass.identity` over the body tint (while the Pencil is down) is indistinguishable at 22 %. Check that the held rim (`NibLiftRim`, plus-lighter) lands on the system's own rim as one brighter edge, not as a second line inside it, on capsules and on 26 and 28 pt corners; if it doubles, move it out by the difference.
 2. **The iOS 17 field costs ≤ 1.2 ms of GPU per frame on an A12** (iPad mini 5 / iPhone XS), **measured again with per-cluster canvases**. Measure it with the Metal HUD (`MTL_HUD_ENABLED=1`) while dragging the palette over the page, and check with Instruments that the main thread stays under 3 ms per frame (only the moving droplet's node and its cluster's canvas update). If the GPU goes over, `WaterOpaqueLayer` (one path union, no blur, no shader) is the automatic Calm path, and it must measure cheaper than the field.
 3. **Touches pass through the container to the canvas** where no droplet is drawn (ZStack sibling layout, §2), and never while a bud is open (the dismiss area covers the safe-area strips).
 4. **The Pencil is not rejected by chrome gestures on iOS 17.** SwiftUI gestures can't filter touch type, so a Pencil press that starts on a droplet can drag it. The editor sets PencilKit's `drawingPolicy` so strokes that start on the page never reach chrome. Revisit with `UIGestureRecognizerRepresentable` (`allowedTouchTypes = [.direct]`, iOS 18) after the device check.
 5. **Blur radius calibration.** `GraphicsContext.Filter.blur(radius:)` is treated as σ. If bridges start noticeably later or earlier than 11 pt on device, adjust `DropletMetrics.regular.fieldBlur`; `minimumNeck` follows it automatically.
-6. **Contrast over ink.** With the palette and bars over a page of black handwriting, the bar subtitle and HUD digits (`label`, semibold) read at ≥ 4.5:1 in light mode, and dark-mode Clear over white paper (80 %) is a dark surface, not a grey blob (DESIGN.md §2.4).
+6. **Contrast over ink.** With the palette and bars over a page of black handwriting, the bar subtitle and HUD digits (`label`, semibold) read at ≥ 4.5:1 in light mode, and dark-mode Clear over white paper (80 %) is a dark surface, not a grey blob (DESIGN.md §2.4). On iOS 26, check the same for Deep popovers and the assistant as plain Regular glass (no tint): 15 pt body text over dense handwriting. If a panel fails, the fix is the panel's placement or the system's Tinted glass preference, not a tint on the glass.
+7. **The rim reads as Apple's.** Side by side with a system toolbar on iOS 26, a Clear droplet on iOS 17 or 18 shows a thin rim brightest at the top-left corner, fainter at the bottom-right, none at the other two corners, no second line inside it and no grey band; a dragged droplet's rim visibly brightens and settles back with the lift.
