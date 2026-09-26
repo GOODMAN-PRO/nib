@@ -57,10 +57,20 @@ public struct DropletStyle: Equatable, Sendable {
     public var bondsOnRequest = false
     /// Rim and outline only, no body (the zoom-window target frame). Drawn by the droplet itself, outside the union.
     public var drawsBody = true
-    /// Page-resident droplets sit on ink and never refract it (the chip, the lasso object menu).
+    /// Page-resident droplets sit on ink and never refract it (the chip, the lasso object menu). iOS 17–25: no edge lens.
+    /// iOS 26: the system glass always lenses, so these are docked clear of ink instead; they stay the Regular variant
+    /// like every other droplet (Clear glass is for media and never mixes with Regular, DESIGN.md §2.2).
     public var refracts = true
-    /// iOS 26 glass responds to touch with the system's own highlight.
+    /// Touchable chrome: `Glass.interactive()` on iOS 26 wherever the glass itself takes the touch (`nibGlass`, a
+    /// droplet outside a container). Inside a container the body sits behind the content and is never hit-tested, so
+    /// the poke (§10.2) and the held rim (`liftedRim`) are the press response there.
     public var isInteractive = true
+    /// Rim strength at rest (DESIGN.md §10.9): 1. `lifted` raises it to `liftedRim`.
+    public var rim: CGFloat = 1
+    /// Rim strength while the droplet is held, reached at full lift and following the lift spring there and back: the
+    /// key rim, counter-rim and sheen all scale by it (1.5 = half as bright again). 1 = never brightens (precision
+    /// handles). iOS 26 draws the difference over the system glass; iOS 17–25 feeds it to the water shader.
+    public var liftedRim: CGFloat = NibOptics.liftedRim
 
     public static let bar = DropletStyle(material: .clear, cornerRadius: nil, stretchCap: 0.10, rigidity: 0.5,
                                          neck: NeckParams(join: 11, t0: 26, off: 44))
@@ -96,7 +106,7 @@ public struct DropletStyle: Equatable, Sendable {
                                              neck: NeckParams(join: 11, t0: 26, off: 44))
     /// Precision affordances never deform (DESIGN.md §10.15): lasso and resize handles, the rotation bead.
     public static let handle = DropletStyle(material: .clear, cornerRadius: nil, stretchCap: 0, rigidity: 1, lift: 1.0,
-                                            poke: 0, refracts: false, isInteractive: false)
+                                            poke: 0, refracts: false, isInteractive: false, liftedRim: 1)
     /// The zoom-window target: rim and outline only, radius 18, draggable with stretch.
     public static let frame = DropletStyle(material: .clear, cornerRadius: NibRadius.zoomFrame, stretchCap: 0.06,
                                            rigidity: 1, lift: 1.0, poke: 0, drag: .free, drawsBody: false,
@@ -109,17 +119,28 @@ public struct DropletStyle: Equatable, Sendable {
         case .tinted: return .tinted
         }
     }
+
+    /// The same droplet shown as held: its rim at `liftedRim` without being dragged (a feature's own press-and-hold
+    /// state, the gallery). A drag brightens the rim by itself, following the lift spring.
+    public var lifted: DropletStyle {
+        var style = self
+        style.rim = max(rim, liftedRim)
+        return style
+    }
+
+    /// Rim strength at lift progress `progress` (0 at rest, 1 fully lifted): `rim` → `max(rim, liftedRim)`.
+    public func rimStrength(lift progress: CGFloat) -> CGFloat {
+        rim + (max(rim, liftedRim) - rim) * min(max(progress, 0), 1)
+    }
+
+    /// What this droplet asks of the system glass on iOS 26 (DESIGN.md §2.2).
+    var systemGlassSpec: NibSystemGlass { NibSystemGlass.of(glassKind, interactive: isInteractive) }
 }
 
 @available(iOS 26.0, *)
 extension DropletStyle {
-    var systemGlass: Glass {
-        switch material {
-        case .clear: return refracts ? Glass.regular.interactive(isInteractive) : Glass.clear.interactive(isInteractive)
-        case .deep: return Glass.regular.tint(NibColor.deepGlassTint)
-        case .tinted: return Glass.regular.tint(NibColor.accent).interactive(isInteractive)
-        }
-    }
+    /// Regular for every material (tinted with the accent only for Tinted), interactive for touchable chrome.
+    var systemGlass: Glass { systemGlassSpec.glass }
 }
 
 /// Where the palette rests: an edge plus a 0…1 position along it.
