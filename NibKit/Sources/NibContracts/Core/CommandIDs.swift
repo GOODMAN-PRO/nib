@@ -74,4 +74,40 @@ public enum CommandIDs {
     // Extensibility
     public static let pluginInstall = "plugin.install"
     public static let aiAsk = "ai.ask"
+
+    // contracts-v2: more catalogue ids features call across modules (owners: ARCHITECTURE.md §6.5)
+    public static let selectionClear = "selection.clear"
+    public static let textSetText = "text.setText"
+    public static let libraryRename = "library.rename"
+    public static let clipboardCut = "clipboard.cut"
+    public static let itemRecolor = "item.recolor"
+    public static let itemDuplicate = "item.duplicate"
+    public static let viewReveal = "view.reveal"
+    public static let viewSetReadOnly = "view.setReadOnly"
+    public static let panelClose = "panel.close"
+    public static let audioPlay = "audio.play"
+    /// Contracts (always present): shows the library in the invoking window {folder?} (session).
+    public static let windowShowLibrary = "window.showLibrary"
+}
+
+/// contracts-v2: well-known panel ids, so a feature can open another feature's panel with `panel.open {id}` without
+/// guessing by owner. Owners register their panels under exactly these ids.
+public enum PanelIDs {
+    /// AI chat panel (F085).
+    public static let assistant = "aichat.panel"
+    /// Library Trash tab (F020).
+    public static let trash = "organize.trash"
+    /// Library Favourites tab (F020).
+    public static let favourites = "organize.favourites"
+    /// Manage Templates (F045).
+    public static let templates = "templateui.manage"
+    /// Cloud & Backup (F070).
+    public static let cloudBackup = "syncui.panel"
+    /// About (F098).
+    public static let about = "about.panel"
+    /// Plugin and content Gallery library tab (F080).
+    public static let gallery = "pluginmanager.gallery"
+    /// Study set Practice and Smart Learn panels (F050).
+    public static let studyPractice = "studysession.practice"
+    public static let studyLearn = "studysession.learn"
 }
