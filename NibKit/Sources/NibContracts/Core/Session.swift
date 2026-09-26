@@ -8,12 +8,17 @@ public struct Selection: Equatable {
     public var items: [ElementID]
     /// Page-coordinate bounds of the selection (lasso polygon bounds or item union).
     public var bounds: Rect?
+    /// contracts-v2: the lasso outline (page coordinates) when the selection came from a lasso; the transform feature
+    /// (F012) moves, scales and rotates it with the items, so everyone draws the same outline. nil = bounds only.
+    public var outline: [Point]?
 
-    public init(doc: DocumentID? = nil, page: PageID? = nil, items: [ElementID] = [], bounds: Rect? = nil) {
+    public init(doc: DocumentID? = nil, page: PageID? = nil, items: [ElementID] = [], bounds: Rect? = nil,
+                outline: [Point]? = nil) {
         self.doc = doc
         self.page = page
         self.items = items
         self.bounds = bounds
+        self.outline = outline
     }
 
     public var isEmpty: Bool { items.isEmpty }
@@ -92,6 +97,11 @@ public final class EditorSession: ObservableObject {
     @Published public var replay: ReplayState? = nil
     /// True while a text view (text box, block, card field) is first responder; single-key shortcuts are off.
     public var isEditingText = false
+    /// contracts-v2: what is being edited while `isEditingText` (item, block or card ref) and the selected range
+    /// [start, length] in plain-text units (UTF-16, list markers excluded). Set by the editing feature, cleared when
+    /// editing ends; read by link (F029), spellcheck and the AI's context.
+    public var editingTextRef: String?
+    public var editingTextRange: [Int]?
     /// Transient per-tool options (current preset slot, eraser size…), keyed by tool id.
     public var toolOptions: [String: JSONValue] = [:]
     /// The editor view controller showing `document` (set by the editor).

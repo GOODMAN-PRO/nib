@@ -497,6 +497,7 @@ public final class ScreenRegistry {
     /// Returns nil when onboarding is complete.
     public var onboarding: (@MainActor (NibApp, SceneNavigator) -> UIViewController?)?
     /// The document toolbar view (Toolbar feature); embedded by the document chrome.
+    /// Superseded in contracts-v2 by `toolbarView` (the chrome prefers it when set).
     public var toolbar: (@MainActor (EditorSession, NibApp) -> UIView)?
     /// contracts-v2: the toolbar as a SwiftUI view; the document chrome places it INSIDE its own droplet container (one
     /// container per window, so the palette merges, necks and recedes with the bars). Preferred over `toolbar`.

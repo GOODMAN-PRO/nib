@@ -307,6 +307,31 @@ public final class Workspace {
         return olds
     }
 
+    /// Rollback support: restores several records of one kind in one pass (`nil` value = remove the record; ids that
+    /// are not present are appended in `order`).
+    func restoreRecords<T: LWWRecord>(_ values: [NibID: T?], order: [NibID], doc: DocumentID,
+                                      at path: WritableKeyPath<DocumentContent, [T]>) {
+        guard !values.isEmpty, var h = heads.removeValue(forKey: doc) else { return }
+        let list = h[keyPath: path]
+        h[keyPath: path] = []
+        var out: [T] = []
+        out.reserveCapacity(list.count)
+        var placed = Set<NibID>()
+        for r in list {
+            guard let value = values[r.id] else {
+                out.append(r)
+                continue
+            }
+            guard let restored = value else { continue }
+            out.append(placed.insert(r.id).inserted ? restored : r)
+        }
+        for id in order where !placed.contains(id) {
+            if let value = values[id], let restored = value { out.append(restored) }
+        }
+        h[keyPath: path] = out
+        heads[doc] = h
+    }
+
     func removeRecord<T: LWWRecord>(_ id: NibID, doc: DocumentID, at path: WritableKeyPath<DocumentContent, [T]>) {
         guard var h = heads[doc] else { return }
         h[keyPath: path].removeAll { $0.id == id }

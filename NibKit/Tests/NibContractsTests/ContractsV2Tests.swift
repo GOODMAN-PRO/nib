@@ -228,6 +228,7 @@ final class ContractsV2Tests: XCTestCase {
         let onPage = try h.app.workspace.items(doc, page: Fixtures.page2)
         XCTAssertEqual(onPage.map { $0.id }, written.map { $0.id }, "appended in order, on top")
         XCTAssertEqual(Set(onPage.map { $0.z }).count, 500)
+        XCTAssertLessThan(onPage.map { $0.z.count }.max() ?? 0, 10, "batch z keys are balanced, not one character longer every few items")
         XCTAssertTrue(onPage.allSatisfy { $0.createdBy == "user" })
 
         let del = try await probeContext(h)
@@ -251,6 +252,66 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertEqual(live.suffix(50).map { $0.id }, written.map { $0.id })
         XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
         XCTAssertEqual(try h.app.workspace.content(Fixtures.studySetID).liveCards.count, 2)
+    }
+
+    func testLargeCardImportUndoesRedoesAndRollsBackInOnePass() async throws {
+        let h = Harness()
+        let set = Fixtures.studySetID
+        let before = try h.snapshot(set)
+        let cards = (0..<10_000).map { StudyCard(front: CardFace(text: RichText(plain: "Q\($0)")), back: CardFace()) }
+
+        // A failed import leaves nothing behind (batched rollback).
+        let failing = try await probeContext(h)
+        XCTAssertThrowsError(try failing.mutate { tx -> Void in
+            _ = try tx.put(cards, doc: set)
+            throw NibError.invalid("importer stopped")
+        })
+        XCTAssertEqual(try h.snapshot(set), before)
+
+        // Import, then edit one imported card again in the same group: one undo removes everything.
+        let ctx = try await probeContext(h)
+        let written = try ctx.mutate { tx -> [StudyCard] in
+            let w = try tx.put(cards, doc: set)
+            var edited = w[42]
+            edited.front = CardFace(text: RichText(plain: "edited"))
+            try tx.put(edited, doc: set)
+            return w
+        }
+        XCTAssertEqual(try h.app.workspace.content(set).liveCards.count, 10_002)
+        XCTAssertLessThan(written.map { $0.order.count }.max() ?? 0, 10, "balanced order keys")
+        XCTAssertEqual(written.map { $0.order }, written.map { $0.order }.sorted(), "appended in array order")
+        XCTAssertTrue(h.app.bus.undo(set))
+        XCTAssertEqual(try h.app.workspace.content(set).liveCards.count, 2)
+        XCTAssertTrue(h.app.bus.redo(set))
+        let live = try h.app.workspace.content(set).liveCards
+        XCTAssertEqual(live.count, 10_002)
+        XCTAssertEqual(live.first { $0.id == written[42].id }?.front.text?.plainText, "edited")
+        XCTAssertTrue(h.app.bus.undo(set))
+        XCTAssertEqual(try h.app.workspace.content(set).liveCards.count, 2)
+    }
+
+    func testBatchPagesOutlineAndAudio() async throws {
+        let h = Harness()
+        let before = try h.snapshot()
+        let ctx = try await probeContext(h)
+        let invalid: [PageRecord] = [PageRecord(), PageRecord(rotation: 45)]
+        XCTAssertThrowsError(try ctx.mutate { tx in try tx.put(invalid, doc: self.doc) },
+                             "every page is validated before anything is written")
+        XCTAssertEqual(try h.snapshot(), before)
+
+        let newPages: [PageRecord] = (0..<20).map { _ in PageRecord() }
+        let pages = try ctx.mutate { tx in try tx.put(newPages, doc: self.doc) }
+        let live = try h.app.workspace.content(doc).livePages
+        XCTAssertEqual(live.suffix(20).map { $0.id }, pages.map { $0.id }, "appended in array order")
+        let entries: [OutlineEntry] = (0..<3).map { OutlineEntry(title: "Part \($0)", page: pages[$0].id) }
+        let outline = try ctx.mutate { tx in try tx.put(entries, doc: self.doc) }
+        XCTAssertEqual(try h.app.workspace.content(doc).liveOutline.suffix(3).map { $0.title }, ["Part 0", "Part 1", "Part 2"])
+        XCTAssertEqual(outline.count, 3)
+        let newClips = [AudioClip(name: "a", file: "a.m4a", start: 0), AudioClip(name: "b", file: "b.m4a", start: 5)]
+        let clips = try ctx.mutate { tx in try tx.put(newClips, doc: self.doc) }
+        XCTAssertTrue(clips.allSatisfy { $0.rev != .zero })
+        XCTAssertTrue(h.app.bus.undo(doc), "one context = one undo group for pages, outline and audio")
+        XCTAssertEqual(try h.snapshot(), before)
     }
 
     func testHarnessInsertIsOneUndoStep() async throws {
@@ -643,6 +704,42 @@ final class ContractsV2Tests: XCTestCase {
                        [Point(0, 0), Point(50, 100), Point(100, 0)])
         XCTAssertEqual(NibLimits.drawerMargin, 12)
         XCTAssertEqual(RGBA.highlighterAlpha, RGBA.highlighterYellow.a)
+    }
+
+    func testStrokeFastPathsMatchTheGenericDecoder() throws {
+        let points = (0..<50).map { i in
+            StrokePoint(x: Float(i), y: Float(i) * 2, t: Float(i) * 0.01, force: 0.3, azimuth: 0.2, altitude: 1.1,
+                        roll: 0.4, width: 2, height: 3, opacity: 0.9)
+        }
+        let flat = points.flatMap { [$0.x, $0.y, $0.t, $0.force, $0.azimuth, $0.altitude, $0.roll, $0.width, $0.height, $0.opacity] }
+        XCTAssertEqual(Stroke.unpackFull(flat), points)
+        let data = flat.withUnsafeBufferPointer { Data(buffer: $0) }
+        XCTAssertEqual(Stroke.unpackCompact(data), points)
+        let encoder = JSONEncoder()
+        encoder.userInfo[.nibCompactPoints] = true
+        let stroke = Stroke(style: .defaultPen, points: points, t0: 5)
+        XCTAssertEqual(try JSONDecoder().decode(Stroke.self, from: try encoder.encode(stroke)).points, points)
+    }
+
+    func testPresetsTapeRefsSelectionOutlineAndToolbarLayout() async throws {
+        let partial = try JSONValue.parse(#"{"swatches":[{"color":"#112233"}],"widths":[1,2,3]}"#).decode(ToolPresets.self)
+        XCTAssertEqual(partial.patterns, [.solid, .solid, .solid])
+        XCTAssertEqual(partial.selectedWidth, 1)
+        XCTAssertThrowsError(try JSONValue.parse(#"{"widths":[1]}"#).decode(ToolPresets.self))
+        XCTAssertEqual(PresetSwatch.tapePatternRef(id: "tape.dots"), AssetRef("tape.dots.png"))
+        XCTAssertEqual(PresetSwatch.tapePatternID(AssetRef("tape.dots.png")), "tape.dots")
+        XCTAssertEqual(PresetSwatch.tapePatternID(AssetRef("builtin.dots")), "builtin.dots")
+
+        let h = Harness()
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID],
+                                        outline: [Point(0, 0), Point(10, 0), Point(5, 8)])
+        XCTAssertEqual(h.session.selection.outline?.count, 3)
+        h.session.editingTextRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
+        h.session.editingTextRange = [0, 5]
+        XCTAssertEqual(h.session.editingTextRange, [0, 5])
+        try await h.run(CommandIDs.settingsSet, ["name": "toolbar.layout", "value": ["order": ["pen"], "hidden": ["ruler"]]])
+        XCTAssertEqual(h.app.settings.get(NibSettings.toolbarLayout), ToolbarLayoutSetting(order: ["pen"], hidden: ["ruler"]))
+        XCTAssertTrue(h.app.settings.get(NibSettings.penReactsToRoll))
     }
 
     func testRichTextBridgeKeepsAModelFontThatIsNotInstalled() {

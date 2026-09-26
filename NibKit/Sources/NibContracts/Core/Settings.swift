@@ -242,6 +242,11 @@ public enum NibSettings {
         SettingKey("eraser.filter." + tool.rawValue, default: true, synced: true)
     }
 
+    /// Dynamic Ink: the pen reacts to Apple Pencil Pro barrel roll (F007 owns it; F043 offers the toggle).
+    public static let penReactsToRoll = SettingKey("pen.reactToRoll", default: true, synced: true)
+    /// The toolbar palette's layout (F016 owns it; F043's palette and plugins read it). nil = default layout.
+    public static let toolbarLayout = SettingKey<ToolbarLayoutSetting?>("toolbar.layout", default: nil, synced: true)
+
     public static let presetTools = ["pen", "pencil", "highlighter", "tape", "shape", "drawShape"]
 
     /// Color / thickness presets of a writing tool (`presetTools`).
@@ -300,9 +305,33 @@ public enum NibSettings {
         s.declare(eraserMode, summary: "Eraser mode: precision, standard or stroke.", owner: "builtin",
                   schema: .str(choices: ["precision", "standard", "stroke"]))
         s.declare(eraserSize, summary: "Eraser diameter in screen points.", owner: "builtin", schema: .num(min: 2, max: 60))
+        s.declare(penReactsToRoll, summary: "The pen nib turns with Apple Pencil Pro barrel roll.", owner: "builtin", schema: bool)
+        s.declare(toolbarLayout, summary: "Toolbar layout {order: [id], hidden: [id]} (tool or item ids); null = default.",
+                  owner: "builtin", schema: .obj(["order": .arr(.str()), "hidden": .arr(.str())]))
         for tool in InkTool.allCases {
             s.declare(eraserFilter(tool), summary: "The eraser erases \(tool.rawValue) strokes.", owner: "builtin", schema: bool)
         }
+    }
+}
+
+/// contracts-v2: the value of `NibSettings.toolbarLayout` (F016 writes it through `toolbar.*` commands). Ids are toolbar
+/// descriptor ids or tool ids; items the layout never mentions follow the defaults.
+public struct ToolbarLayoutSetting: Codable, Equatable {
+    public var order: [String]
+    public var hidden: [String]
+
+    public init(order: [String] = [], hidden: [String] = []) {
+        self.order = order
+        self.hidden = hidden
+    }
+
+    enum CodingKeys: String, CodingKey { case order, hidden }
+
+    /// Lenient: both lists default to empty.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        order = try c.decodeIfPresent([String].self, forKey: .order) ?? []
+        hidden = try c.decodeIfPresent([String].self, forKey: .hidden) ?? []
     }
 }
 

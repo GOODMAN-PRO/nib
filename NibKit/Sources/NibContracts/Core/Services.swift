@@ -197,6 +197,16 @@ public struct TextRecognitionWord: Codable, Equatable {
         self.bbox = bbox
         self.itemIDs = itemIDs
     }
+
+    /// Lenient: `itemIDs` may be omitted (image and PDF words have none).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        text = try c.decode(String.self, forKey: .text)
+        bbox = try c.decodeIfPresent(Rect.self, forKey: .bbox) ?? .zero
+        itemIDs = try c.decodeIfPresent([ElementID].self, forKey: .itemIDs) ?? []
+    }
+
+    enum CodingKeys: String, CodingKey { case text, bbox, itemIDs }
 }
 
 public protocol TextRecognizer: AnyObject {

@@ -99,14 +99,30 @@ public final class DocTransaction {
         let current = try workspace.allItems(doc, page: page)
         var byID: [ElementID: Item] = [:]
         for it in current { byID[it.id] = it }
+        let valid = try items.map { try checked($0) }
+        // Items that get a fresh z on top: empty z, first occurrence, and not already on the page with a z. Each run of
+        // them takes balanced keys (short, see FractionalIndex.balanced) after the top at the run's start.
+        var seen = Set<ElementID>()
+        let fresh = valid.map { it -> Bool in
+            let first = seen.insert(it.id).inserted
+            return it.z.isEmpty && first && (byID[it.id]?.z ?? "").isEmpty
+        }
         var top = current.last?.z
+        var runKeys: ArraySlice<String> = []
         var prepared: [Item] = []
         prepared.reserveCapacity(items.count)
-        for item in items {
-            var it = try checked(item)
+        for i in valid.indices {
+            var it = valid[i]
             let existing = byID[it.id]
             if it.z.isEmpty {
-                if let z = existing?.z, !z.isEmpty {
+                if fresh[i] {
+                    if runKeys.isEmpty {
+                        var j = i
+                        while j < fresh.count, fresh[j] { j += 1 }
+                        runKeys = FractionalIndex.balanced(count: j - i, after: top)[...]
+                    }
+                    it.z = runKeys.removeFirst()
+                } else if let z = existing?.z, !z.isEmpty {
                     it.z = z
                 } else {
                     it.z = FractionalIndex.between(top, nil)
@@ -240,6 +256,40 @@ public final class DocTransaction {
         }
     }
 
+    /// contracts-v2: inserts or replaces many pages in one pass (empty `order` = appended in array order). Every page is
+    /// validated first; nothing is written when one is invalid.
+    @discardableResult
+    public func put(_ pages: [PageRecord], doc: DocumentID) throws -> [PageRecord] {
+        for p in pages {
+            if let s = p.size, !(1.0...100_000.0).contains(s.width) || !(1.0...100_000.0).contains(s.height) {
+                throw NibError.invalid("page size out of range")
+            }
+            guard [0, 90, 180, 270].contains(p.rotation) else { throw NibError.invalid("rotation must be 0, 90, 180 or 270") }
+        }
+        return try putOrdered(pages, doc: doc, at: \.pages, last: try content(doc).livePages.last?.order) {
+            .page(doc, before: $0, after: $1)
+        }
+    }
+
+    /// contracts-v2: inserts or replaces many outline entries in one pass (empty `order` = appended in array order).
+    @discardableResult
+    public func put(_ entries: [OutlineEntry], doc: DocumentID) throws -> [OutlineEntry] {
+        try putOrdered(entries, doc: doc, at: \.outline, last: try content(doc).liveOutline.last?.order) {
+            .outline(doc, before: $0, after: $1)
+        }
+    }
+
+    /// contracts-v2: inserts or replaces many audio clips in one pass.
+    @discardableResult
+    public func put(_ clips: [AudioClip], doc: DocumentID) throws -> [AudioClip] {
+        guard !clips.isEmpty else { return [] }
+        var prepared = clips
+        for i in prepared.indices { prepared[i].rev = workspace.clock.tick() }
+        let befores = try workspace.writeRecords(prepared, doc: doc, at: \.audio)
+        for (b, a) in zip(befores, prepared) { mutations.append(.audio(doc, before: b, after: a)) }
+        return prepared
+    }
+
     @discardableResult
     public func put(_ clip: AudioClip, doc: DocumentID) throws -> AudioClip {
         try putRecord(clip, doc: doc, at: \.audio) { .audio(doc, before: $0, after: $1) }
@@ -259,11 +309,20 @@ public final class DocTransaction {
                                               last: String?, wrap: (T?, T) -> Mutation) throws -> [T] {
         guard !records.isEmpty else { return [] }
         var top = last
+        var runKeys: ArraySlice<String> = []
         var prepared: [T] = []
         prepared.reserveCapacity(records.count)
-        for record in records {
-            var r = record
-            if r.order.isEmpty { r.order = FractionalIndex.between(top, nil) }
+        for i in records.indices {
+            var r = records[i]
+            if r.order.isEmpty {
+                // Each run of records without an order takes balanced keys after the top at the run's start.
+                if runKeys.isEmpty {
+                    var j = i
+                    while j < records.count, records[j].order.isEmpty { j += 1 }
+                    runKeys = FractionalIndex.balanced(count: j - i, after: top)[...]
+                }
+                r.order = runKeys.removeFirst()
+            }
             if top.map({ r.order > $0 }) ?? true { top = r.order }
             r.rev = workspace.clock.tick()
             prepared.append(r)
@@ -302,28 +361,68 @@ public final class DocTransaction {
     }
 
     /// Restores every record to its exact previous value (revisions included).
+    /// contracts-v2: consecutive record writes of one kind are restored in one pass (a failed 10,000-card import rolls
+    /// back in linear time).
     func rollback() {
-        for m in mutations.reversed() {
+        let ordered = Array(mutations.reversed())
+        var i = 0
+        while i < ordered.count {
+            let m = ordered[i]
             switch m {
             case let .item(d, p, b, a):
                 if let b = b { _ = try? workspace.writeItem(b, doc: d, page: p) } else { workspace.removeItem(a.id, doc: d, page: p) }
-            case let .page(d, b, a): restore(b, a.id, d, \.pages)
-            case let .meta(_, b, _): _ = try? workspace.writeMeta(b)
-            case let .block(d, b, a): restore(b, a.id, d, \.blocks)
-            case let .card(d, b, a): restore(b, a.id, d, \.cards)
-            case let .audio(d, b, a): restore(b, a.id, d, \.audio)
-            case let .outline(d, b, a): restore(b, a.id, d, \.outline)
+                i += 1
+            case let .meta(_, b, _):
+                _ = try? workspace.writeMeta(b)
+                i += 1
+            case let .page(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.pages) { if case let .page(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
+            case let .block(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.blocks) { if case let .block(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
+            case let .card(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.cards) { if case let .card(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
+            case let .audio(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.audio) { if case let .audio(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
+            case let .outline(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.outline) { if case let .outline(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
             }
         }
         mutations.removeAll()
     }
 
-    private func restore<T: LWWRecord>(_ before: T?, _ id: NibID, _ doc: DocumentID, _ path: WritableKeyPath<DocumentContent, [T]>) {
-        if let b = before {
-            _ = try? workspace.writeRecord(b, doc: doc, at: path)
-        } else {
-            workspace.removeRecord(id, doc: doc, at: path)
+    /// End (exclusive) of the run of mutations starting at `start` that write the same record kind of the same document.
+    private func runEnd(_ muts: [Mutation], from start: Int) -> Int {
+        let first = muts[start].recordKey
+        var j = start + 1
+        while j < muts.count {
+            let k = muts[j].recordKey
+            guard k.kind == first.kind, k.doc == first.doc else { break }
+            j += 1
         }
+        return j
+    }
+
+    /// Rollback of one run (newest first): each record ends at the `before` of its OLDEST write in the run.
+    private func restoreRun<T: LWWRecord>(_ run: ArraySlice<Mutation>, _ doc: DocumentID,
+                                          _ path: WritableKeyPath<DocumentContent, [T]>,
+                                          _ unwrap: (Mutation) -> (T?, T)?) {
+        var finals: [NibID: T?] = [:]
+        var order: [NibID] = []
+        for m in run {
+            guard let write = unwrap(m) else { continue }
+            if finals.updateValue(write.0, forKey: write.1.id) == nil { order.append(write.1.id) }
+        }
+        workspace.restoreRecords(finals, order: order, doc: doc, at: path)
     }
 
     /// Revisions this transaction's reverts re-stamped (see `RevRebase`); the bus applies them to the undo history.
@@ -336,13 +435,19 @@ public final class DocTransaction {
     /// contracts-v2 fix: a record written several times in one undo group (drag then attach, debounced text commits)
     /// is reverted all the way back. Reverting the newest write re-stamps the record, and the older write of the same
     /// record now accepts that fresh revision (`RevRebase`), instead of looking changed-since and being skipped.
+    /// contracts-v2: consecutive record writes of one kind (a batch `put(_ cards:)`) are reverted in one pass, so
+    /// undoing a large import is linear.
     func revert(_ muts: [Mutation]) -> Int {
         var skipped = 0
-        for m in muts.reversed() {
+        let ordered = Array(muts.reversed())
+        var i = 0
+        while i < ordered.count {
+            let m = ordered[i]
             let key = m.recordKey
             let expected = rebase.current(key, m.afterRev)
             switch m {
             case let .item(d, p, b, a):
+                i += 1
                 guard let cur = workspace.currentItem(a.id, doc: d, page: p), cur.rev == expected else {
                     skipped += 1
                     continue
@@ -353,9 +458,8 @@ public final class DocTransaction {
                 _ = try? workspace.writeItem(target, doc: d, page: p)
                 mutations.append(.item(d, p, before: cur, after: target))
                 if let b = b { rebase.record(key, old: b.rev, new: target.rev) }
-            case let .page(d, b, a):
-                if !revertRecord(b, a, d, key, expected, \.pages, { .page(d, before: $0, after: $1) }) { skipped += 1 }
             case let .meta(d, b, _):
+                i += 1
                 guard let cur = try? workspace.content(d).meta, cur.rev == expected else {
                     skipped += 1
                     continue
@@ -365,30 +469,67 @@ public final class DocTransaction {
                 _ = try? workspace.writeMeta(target)
                 mutations.append(.meta(d, before: cur, after: target))
                 rebase.record(key, old: b.rev, new: target.rev)
-            case let .block(d, b, a):
-                if !revertRecord(b, a, d, key, expected, \.blocks, { .block(d, before: $0, after: $1) }) { skipped += 1 }
-            case let .card(d, b, a):
-                if !revertRecord(b, a, d, key, expected, \.cards, { .card(d, before: $0, after: $1) }) { skipped += 1 }
-            case let .audio(d, b, a):
-                if !revertRecord(b, a, d, key, expected, \.audio, { .audio(d, before: $0, after: $1) }) { skipped += 1 }
-            case let .outline(d, b, a):
-                if !revertRecord(b, a, d, key, expected, \.outline, { .outline(d, before: $0, after: $1) }) { skipped += 1 }
+            case let .page(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.pages, { if case let .page(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .page(d, before: $0, after: $1) })
+                i = j
+            case let .block(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.blocks, { if case let .block(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .block(d, before: $0, after: $1) })
+                i = j
+            case let .card(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.cards, { if case let .card(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .card(d, before: $0, after: $1) })
+                i = j
+            case let .audio(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.audio, { if case let .audio(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .audio(d, before: $0, after: $1) })
+                i = j
+            case let .outline(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.outline, { if case let .outline(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .outline(d, before: $0, after: $1) })
+                i = j
             }
         }
         return skipped
     }
 
-    private func revertRecord<T: LWWRecord>(_ before: T?, _ after: T, _ doc: DocumentID, _ key: RecordKey, _ expected: Rev,
-                                            _ path: WritableKeyPath<DocumentContent, [T]>,
-                                            _ wrap: (T?, T) -> Mutation) -> Bool {
-        guard let cur = workspace.currentRecord(after.id, doc: doc, at: path), cur.rev == expected else { return false }
-        var target = before ?? after
-        if before == nil { target.deleted = true }
-        target.rev = workspace.clock.tick()
-        _ = try? workspace.writeRecord(target, doc: doc, at: path)
-        mutations.append(wrap(cur, target))
-        if let b = before { rebase.record(key, old: b.rev, new: target.rev) }
-        return true
+    /// Reverts one run (newest first) of record writes of one kind and document: current values are looked up once,
+    /// the run is checked in order exactly like single reverts (so double writes rebase), then written in one pass.
+    private func revertRun<T: LWWRecord>(_ run: ArraySlice<Mutation>, _ doc: DocumentID,
+                                         _ path: WritableKeyPath<DocumentContent, [T]>,
+                                         _ unwrap: (Mutation) -> (T?, T)?, _ wrap: (T?, T) -> Mutation) -> Int {
+        var current: [NibID: T] = [:]
+        if let list = try? workspace.content(doc)[keyPath: path] {
+            var wanted = Set<NibID>()
+            for m in run { if let write = unwrap(m) { wanted.insert(write.1.id) } }
+            for r in list where wanted.contains(r.id) && current[r.id] == nil { current[r.id] = r }
+        }
+        var skipped = 0
+        var targets: [T] = []
+        for m in run {
+            guard let write = unwrap(m) else { continue }
+            let (before, after) = write
+            let key = m.recordKey
+            guard let cur = current[after.id], cur.rev == rebase.current(key, m.afterRev) else {
+                skipped += 1
+                continue
+            }
+            var target = before ?? after
+            if before == nil { target.deleted = true }
+            target.rev = workspace.clock.tick()
+            current[after.id] = target
+            targets.append(target)
+            mutations.append(wrap(cur, target))
+            if let b = before { rebase.record(key, old: b.rev, new: target.rev) }
+        }
+        if !targets.isEmpty { _ = try? workspace.writeRecords(targets, doc: doc, at: path) }
+        return skipped
     }
 }
 
@@ -399,3 +540,5 @@ protocol OrderedRecord: LWWRecord {
 
 extension TextBlock: OrderedRecord {}
 extension StudyCard: OrderedRecord {}
+extension PageRecord: OrderedRecord {}
+extension OutlineEntry: OrderedRecord {}
