@@ -6,7 +6,7 @@ Workflow cap = 2 concurrent (4 CPUs) -> using background Agent calls; me as sche
 - v2/contracts  contracts-v2 (C1)            running
 - v2/glass      Liquid Glass redo (D1a)       GREEN (run 36221916103, 8b0ef70)
 - v2/mockup     mockup.html update            running
-- v2/physics    toolbar dock/bead + reflow    running
+- v2/physics    toolbar dock/bead + reflow    GREEN (run 36222900495, 9ecd6b1; includes v2/glass). dstokens asked to merge it.
 - v2/dstokens   NibDesign gap tokens/comps    running
 Next: integrator merges 4 branches -> main, CI green, tag contracts-v2 + design-v2, merge main into all feat/*; then F016 dock adoption; mockup update + republish.
 
@@ -24,3 +24,5 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - Integration spec edit: ARCHITECTURE catalogue: element.create gains optional fallback:Bool (F035).
 - Integration spec edit (BEFORE F066 is built): forge-spec F041 commands add layer.exportOptions {command, params} (read; hook on export.run and render.page) + ARCHITECTURE §6.5; F066 export.run options add visibleLayersOnly: Bool and visibleLayers: {docRaw: [Int]}, and F066's description must honour them.
 - F001: WAL risk FIXED (e6ce770, run 36223033046).
+- F016 (after main integration): register toolbar.dock {dock, along?} (session, returns previous), persist dock setting, route NibToolPalette dock binding through it; remove workarounds.
+- F019 spec now has library.reorder {refs, folder?, after?|before?} + Manual sort + NibReflow.
