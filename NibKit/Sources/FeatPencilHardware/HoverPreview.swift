@@ -10,8 +10,6 @@ enum HoverPreviewKind: Equatable {
     case dot
     /// A chisel tip: highlighter and tape.
     case chisel
-    /// An outline of what the eraser will take.
-    case ring
 }
 
 struct HoverPreviewShape: Equatable {
@@ -20,7 +18,7 @@ struct HoverPreviewShape: Equatable {
     var size: CGSize
     /// Radians, about the centre.
     var angle: Double
-    /// Fill for dots and chisels; rings use the chrome's label colour.
+    /// Fill of the dot or chisel.
     var color: RGBA?
 
     static let none = HoverPreviewShape(kind: .none, size: .zero, angle: 0, color: nil)
@@ -30,17 +28,18 @@ struct HoverPreviewShape: Equatable {
 enum HoverPreviewGeometry {
     /// Anything thinner vanishes under the tip; the preview is a hint, not the stroke.
     static let minimumDot = 3.0
-    static let defaultEraserRadius = 6.0
     static let inkOpacity = 0.9
     static let highlightOpacity = 0.5
+    /// The swatch hairline (DESIGN.md §3: swatches are flat colour with a 0.5 pt hairline), so the dot reads over ink
+    /// of its own colour. ponytail: NibDesign has the width only inside `NibPenSwatch`; a token would replace it.
+    static let hairline = 0.5
 
     /// - Parameters:
     ///   - presets: the tool's colour and thickness presets (nil for tools without them).
-    ///   - eraserRadius: page points (the eraser's current size), nil for the default.
     ///   - zoom: view points per page point.
     ///   - azimuth: the Pencil's azimuth in radians (turns chisel tips).
     ///   - roll: Apple Pencil Pro barrel roll in radians, only when the pen reacts to rotation (Dynamic Ink).
-    static func shape(tool: String, presets: ToolPresets?, eraserRadius: Double?, zoom: Double, azimuth: Double,
+    static func shape(tool: String, presets: ToolPresets?, zoom: Double, azimuth: Double,
                       roll: Double?) -> HoverPreviewShape {
         let z = max(zoom, 0.01)
         switch tool {
@@ -60,11 +59,10 @@ enum HoverPreviewGeometry {
             return HoverPreviewShape(kind: .chisel, size: CGSize(width: max(2, h * 0.35), height: h),
                                      angle: azimuth + (roll ?? 0),
                                      color: p.color.withAlpha(min(p.color.alpha, highlightOpacity)))
-        case "eraser":
-            let d = max(minimumDot * 2, 2 * (eraserRadius ?? defaultEraserRadius) * z)
-            return HoverPreviewShape(kind: .ring, size: CGSize(width: d, height: d), angle: 0, color: nil)
         default:
-            return .none                                    // lasso, text, plugin tools: nothing to preview
+            // Lasso, text, plugin tools: nothing to preview. The eraser draws its own hover cursor (F010's
+            // `EraserTool.hover`); tools that implement `CanvasTool.hover` own their cursor, so no second ring here.
+            return .none
         }
     }
 
@@ -107,16 +105,10 @@ final class HoverPreview {
         layer.path = HoverPreviewGeometry.path(for: shape)
         layer.position = point
         layer.setAffineTransform(CGAffineTransform(rotationAngle: CGFloat(shape.angle)))
-        if shape.kind == .ring {
-            layer.fillColor = nil
-            layer.strokeColor = NibUIColor.labelSecondary.resolvedColor(with: traits).cgColor
-            layer.lineWidth = 1
-        } else {
-            layer.fillColor = shape.color?.cgColor
-            // A hairline keeps the dot visible over ink of the same colour.
-            layer.strokeColor = NibUIColor.swatchHairline.resolvedColor(with: traits).cgColor
-            layer.lineWidth = 0.5
-        }
+        layer.fillColor = shape.color?.cgColor
+        // A hairline keeps the dot visible over ink of the same colour.
+        layer.strokeColor = NibUIColor.swatchHairline.resolvedColor(with: traits).cgColor
+        layer.lineWidth = CGFloat(HoverPreviewGeometry.hairline)
         layer.isHidden = false
         CATransaction.commit()
     }

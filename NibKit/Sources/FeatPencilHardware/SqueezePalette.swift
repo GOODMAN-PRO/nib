@@ -23,8 +23,13 @@ struct PalettePlan: Equatable {
         var value: String?
     }
 
-    /// F016's current toolbar layout: {order: [ids], hidden: [ids]} (descriptor ids or tool ids).
+    /// F016's current toolbar layout: {order: [descriptor ids], hidden: [descriptor ids]}; nil until customised.
     static let layoutSetting = "toolbar.layout"
+    /// F016's everyday tools (DESIGN.md §14.3): on the toolbar until the person customises it; the other built-in
+    /// tools wait in More. Kept equal to `ToolbarLayoutEngine.everyday` (feat/F016, ToolbarCustomization.swift).
+    static let everyday: Set<String> = ["lasso", "pen", "highlighter", "eraser", "shape", "drawShape", "text"]
+    /// The groups F016's palette arranges; the Pencil palette keeps the lasso and the tools of them.
+    static let toolbarGroups: [ToolbarGroup] = [.lasso, .tools, .accessories]
     static let perRow = 6
     static let tinted: Set<String> = ["pen", "pencil", "highlighter"]
 
@@ -52,7 +57,7 @@ struct PalettePlan: Equatable {
                      isPlugin: (String) -> Bool) -> PalettePlan {
         var plan = PalettePlan(kind: kind, selectedTool: tool)
         if kind == .tools {
-            plan.tools = mirror(toolbar, layout: layout).map { item in
+            plan.tools = mirror(toolbar, layout: layout, isPlugin: isPlugin).map { item in
                 let ink = item.toolID.flatMap { tinted.contains($0) ? presets($0) : nil }
                 return Tool(id: item.id, title: item.title, icon: item.icon, toolID: item.toolID, command: item.command,
                             params: item.params, isPlugin: isPlugin(item.owner), tint: ink?.color,
@@ -74,27 +79,37 @@ struct PalettePlan: Equatable {
         return plan
     }
 
-    /// The toolbar's writing tools in the person's order: the lasso fixed first, then the saved order, then tools the
-    /// layout doesn't know yet (new plugin tools) in registry order. Hidden tools are left out unless not hideable.
-    static func mirror(_ items: [ToolbarItemDescriptor], layout: JSONValue?) -> [ToolbarItemDescriptor] {
+    /// The tools on the toolbar, in its order: F016's `ToolbarLayoutEngine.arrange` rule, keyed on descriptor ids.
+    /// The lasso comes first and is never hidden; then the ids the layout orders, then the ones it has never seen, in
+    /// registry order. An item the layout knows is shown exactly when it is not in `hidden`; one it doesn't know
+    /// follows F016's default (everyday tools and plugin tools on the toolbar, the rest in More). One slot per tool
+    /// (`toolID ?? id`), first descriptor wins. Accessories take part in the arrangement but not in the result.
+    static func mirror(_ items: [ToolbarItemDescriptor], layout: JSONValue?,
+                       isPlugin: (String) -> Bool) -> [ToolbarItemDescriptor] {
         let order = (layout?["order"]?.arrayValue ?? []).compactMap { $0.stringValue }
         let hidden = Set((layout?["hidden"]?.arrayValue ?? []).compactMap { $0.stringValue })
+        let known = Set(order).union(hidden)
         var rank: [String: Int] = [:]
-        for (i, key) in order.enumerated() where rank[key] == nil { rank[key] = i }
-        func keys(_ d: ToolbarItemDescriptor) -> [String] { [d.id] + (d.toolID.map { [$0] } ?? []) }
-        func rankOf(_ d: ToolbarItemDescriptor) -> Int { keys(d).compactMap { rank[$0] }.min() ?? Int.max }
-        let visible = items.filter { d in
-            (d.group == .lasso || d.group == .tools) && !(d.hideable && keys(d).contains(where: { hidden.contains($0) }))
-        }
-        return visible.enumerated().sorted { a, b in
-            let groupA = a.element.group == .lasso ? 0 : 1
-            let groupB = b.element.group == .lasso ? 0 : 1
-            if groupA != groupB { return groupA < groupB }
-            let rankA = rankOf(a.element)
-            let rankB = rankOf(b.element)
-            if rankA != rankB { return rankA < rankB }
-            return a.offset < b.offset
+        for (i, id) in order.enumerated() where rank[id] == nil { rank[id] = i }
+        var ids = Set<String>()
+        let entries = items.filter { toolbarGroups.contains($0.group) && ids.insert($0.id).inserted }
+        let lasso = entries.filter { $0.group == .lasso }
+        let rest = entries.enumerated().filter { $0.element.group != .lasso }.sorted { a, b in
+            switch (rank[a.element.id], rank[b.element.id]) {
+            case let (x?, y?): return x < y
+            case (.some, .none): return true
+            case (.none, .some): return false
+            case (.none, .none): return a.offset < b.offset
+            }
         }.map { $0.element }
+        func isShown(_ d: ToolbarItemDescriptor) -> Bool {
+            guard d.hideable && d.group != .lasso else { return true }
+            if known.contains(d.id) { return !hidden.contains(d.id) }
+            return isPlugin(d.owner) || everyday.contains(d.toolID ?? d.id)
+        }
+        var slots = Set<String>()
+        return (lasso + rest).filter { isShown($0) && slots.insert($0.toolID ?? $0.id).inserted }
+            .filter { $0.group == .lasso || $0.group == .tools }
     }
 
     /// Whose colours the palette offers: the current tool's, else (colour palettes only) the last writing tool's.
@@ -109,10 +124,14 @@ struct PalettePlan: Equatable {
         stride(from: 0, to: items.count, by: perRow).map { Array(items[$0..<min($0 + perRow, items.count)]) }
     }
 
-    /// The three thickness dots, thinnest first (DESIGN.md §13.3).
+    /// `NibStrokeWidthSlider`'s preset dots (DESIGN.md §15: "Three preset dots (5, 8, 12 pt)"), thinnest first, so a
+    /// thickness looks the same here and in the tool's popover.
+    /// ponytail: NibDesign keeps these sizes inside `NibStrokeWidthSlider`; a public preset-dot token or component
+    /// there would replace this table.
+    static let dotSizes: [CGFloat] = [5, 8, 12]
+
     static func dot(_ index: Int) -> CGFloat {
-        let sizes: [CGFloat] = [5, 8, 12]
-        return sizes[min(max(index, 0), sizes.count - 1)]
+        dotSizes[min(max(index, 0), dotSizes.count - 1)]
     }
 }
 
@@ -291,20 +310,13 @@ struct SqueezePaletteView: View {
         .accessibilityLabel(plan.kind.title)
         .accessibilityAddTraits(.isModal)
         .accessibilityAction(.escape) { dismiss() }
-        .background {
-            Button(String(localized: "Close"), action: dismiss)
-                .keyboardShortcut(.cancelAction)
-                .frame(width: 0, height: 0)
-                .opacity(0)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-        }
+        // Escape on a hardware keyboard: `PaletteHostingController` (first responder while the palette is open).
     }
 
+    /// The system hairline in the `separator` token (DESIGN.md §3: 0.5 pt hairlines inside droplets).
     private var hairline: some View {
-        Rectangle()
-            .fill(NibColor.separator)
-            .frame(height: 0.5)
+        Divider()
+            .overlay(NibColor.separator)
             .padding(.horizontal, NibSpacing.s)
             .padding(.vertical, NibSpacing.xxs)
             .accessibilityHidden(true)
@@ -335,14 +347,20 @@ struct SqueezePaletteView: View {
         HStack(spacing: 0) {
             NibIconButton(.undo, label: String(localized: "Undo"), size: .palette) { model.undo() }
                 .disabled(!plan.canUndo)
-                .opacity(plan.canUndo ? 1 : 0.4)
+                .opacity(plan.canUndo ? 1 : Self.disabledOpacity)
                 .help(String(localized: "Undo"))
             NibIconButton(.redo, label: String(localized: "Redo"), size: .palette) { model.redo() }
                 .disabled(!plan.canRedo)
-                .opacity(plan.canRedo ? 1 : 0.4)
+                .opacity(plan.canRedo ? 1 : Self.disabledOpacity)
                 .help(String(localized: "Redo"))
         }
     }
+
+    /// DESIGN.md §15 common states: "Disabled: 40 % opacity, no hit testing". `.disabled` removes hit testing but
+    /// does not dim: `NibIconButton` draws its glyph in an explicit colour and `NibPressStyle` ignores `isEnabled`
+    /// (only `NibButton` dims itself), so this is the one dim, not a second one.
+    /// ponytail: when NibIconButton reads `isEnabled` itself, drop this.
+    static let disabledOpacity = 0.4
 
     private func swatchRows(_ plan: PalettePlan) -> some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -367,6 +385,11 @@ struct SqueezePaletteView: View {
                          ringsLight: ink?.needsRing(dark: false) ?? false, ringsDark: ink?.needsRing(dark: true) ?? false)
     }
 
+    /// The selection shape of `NibStrokeWidthSlider`'s presets, so the same presets look the same in both places.
+    private var presetShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)
+    }
+
     private func widthRow(_ plan: PalettePlan) -> some View {
         HStack(spacing: 0) {
             ForEach(Array(plan.widths.enumerated()), id: \.offset) { index, width in
@@ -379,10 +402,10 @@ struct SqueezePaletteView: View {
                         .fill(NibColor.label)
                         .frame(width: PalettePlan.dot(index), height: PalettePlan.dot(index))
                         .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-                        .background(selected ? NibColor.fill3 : Color.clear, in: Circle())
-                        .contentShape(Circle())
+                        .background(selected ? NibColor.fill3 : Color.clear, in: presetShape)
+                        .contentShape(presetShape)
                 }
-                .buttonStyle(NibPressStyle(shape: Circle()))
+                .buttonStyle(NibPressStyle(shape: presetShape))
                 .accessibilityLabel(label)
                 .accessibilityAddTraits(selected ? .isSelected : [])
                 .help(label)
@@ -420,13 +443,34 @@ struct PaletteOverlay: View {
 
 // MARK: - Presenter
 
+/// Hosts the palette overlay and takes the keyboard while the palette is open, so a hardware Escape closes it (the
+/// palette is modal; a keyboard person never has to reach for the screen to leave it).
+final class PaletteHostingController: UIHostingController<PaletteOverlay> {
+    var onEscape: () -> Void = {}
+
+    override var canBecomeFirstResponder: Bool { true }
+
+    override var keyCommands: [UIKeyCommand]? {
+        let escape = UIKeyCommand(title: String(localized: "Close Palette"), action: #selector(escapePressed),
+                                  input: UIKeyCommand.inputEscape)
+        escape.wantsPriorityOverSystemBehavior = true
+        return [escape] + (super.keyCommands ?? [])
+    }
+
+    @objc private func escapePressed() {
+        onEscape()
+    }
+}
+
 /// Puts the palette above everything in the canvas's window (the palette is modal while it is open) and takes it
 /// down again. One palette at a time.
 @MainActor
 final class SqueezePalettePresenter {
-    private var controller: UIHostingController<PaletteOverlay>?
+    private var controller: PaletteHostingController?
     private var model: PaletteModel?
     private(set) weak var host: CanvasHost?
+    /// Who had the keyboard before the palette took it (the canvas, a text view); it gets it back on close.
+    private weak var previousResponder: UIResponder?
 
     var isPresented: Bool { controller != nil }
 
@@ -439,10 +483,13 @@ final class SqueezePalettePresenter {
         model.onDismiss = close
         let overlay = PaletteOverlay(model: model, anchor: host.canvasView.convert(point, to: window),
                                      insets: window.safeAreaInsets, dismiss: close)
-        let controller = UIHostingController(rootView: overlay)
+        let controller = PaletteHostingController(rootView: overlay)
+        controller.onEscape = close
         controller.view.backgroundColor = .clear
         controller.view.frame = window.bounds
         controller.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        let responder = Self.firstResponder(in: window)
+            ?? (host.canvasView.canBecomeFirstResponder ? host.canvasView : nil)
         let parent = window.rootViewController
         parent?.addChild(controller)
         window.addSubview(controller.view)
@@ -451,6 +498,8 @@ final class SqueezePalettePresenter {
         self.controller = controller
         self.model = model
         self.host = host
+        previousResponder = responder
+        controller.becomeFirstResponder()
         UIAccessibility.post(notification: .screenChanged, argument: controller.view)
         return true
     }
@@ -458,12 +507,25 @@ final class SqueezePalettePresenter {
     func dismiss() {
         guard let controller else { return }
         self.controller = nil
+        let restore = previousResponder
+        previousResponder = nil
+        controller.resignFirstResponder()
         controller.willMove(toParent: nil)
         controller.view.removeFromSuperview()
         controller.removeFromParent()
         model?.stop()
         model = nil
         host = nil
+        if let view = restore as? UIView, view.window != nil { view.becomeFirstResponder() }
         UIAccessibility.post(notification: .screenChanged, argument: nil)
+    }
+
+    /// The view that has the keyboard (only on open, never per frame).
+    private static func firstResponder(in view: UIView) -> UIView? {
+        if view.isFirstResponder { return view }
+        for subview in view.subviews {
+            if let found = firstResponder(in: subview) { return found }
+        }
+        return nil
     }
 }

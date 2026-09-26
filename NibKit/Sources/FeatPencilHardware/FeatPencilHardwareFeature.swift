@@ -56,6 +56,8 @@ enum PencilSettings {
     static let hoverPreview = SettingKey("pencilhw.hoverPreview", default: true)
     static let haptics = SettingKey("pencilhw.haptics", default: true)
     /// F007's Dynamic Ink switch (declared by F007; read and offered here only when it is declared).
+    /// ponytail: an assumed name (no contract defines it; InkStyle.reactsToRoll is per style). F007 declares exactly
+    /// this key, or a shared NibSettings key replaces it; until then the toggle and its footer sentence stay hidden.
     static let reactToRoll = "pen.reactToRoll"
 
     static func key(_ gesture: PencilGesture) -> SettingKey<String> {
@@ -118,7 +120,7 @@ struct PencilGestureCommand: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: PencilCommandIDs.gesture, title: "Apple Pencil Gesture",
+        id: "pencil.gesture", title: "Apple Pencil Gesture",
         summary: "Do what Apple Pencil double-tap or squeeze is set to do in the current window (switch tool, show a palette or run a bound action).",
         params: .obj(["gesture": .str("doubleTap | squeeze", choices: PencilGesture.allCases.map { $0.rawValue }),
                       "page": .ref, "at": .point], required: ["gesture"]),
@@ -129,6 +131,8 @@ struct PencilGestureCommand: NibCommand {
             throw NibError(.invalidParams, "unknown gesture '\(p.gesture)'", path: "$.gesture", hint: "use doubleTap or squeeze")
         }
         let handler = try PencilHandler.resolve(ctx)
+        // Taken first, so a failed run never leaves the mark for a later call.
+        let fromPencil = handler.takePendingGesture(gesture)
         guard let session = ctx.activeSession else { throw NibError.unavailable("an open editor window") }
         let target = try PencilTarget(page: p.page, at: p.at, session: session)
         let binding = handler.binding(gesture)
@@ -136,6 +140,9 @@ struct PencilGestureCommand: NibCommand {
                                                at: target.point) else {
             return Output(binding: binding, command: nil)
         }
+        // A palette opened by the Pencil itself plays the Pencil Pro haptic; one opened by AI or a plugin does not.
+        handler.markPaletteFromPencil(fromPencil && invocation.command == PencilCommandIDs.palette)
+        defer { handler.markPaletteFromPencil(false) }
         _ = try await ctx.execute(invocation.command, invocation.params)
         return Output(binding: binding, command: invocation.command)
     }
@@ -158,7 +165,7 @@ struct PencilPaletteCommand: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: PencilCommandIDs.palette, title: "Pencil Palette",
+        id: "pencil.palette", title: "Pencil Palette",
         summary: "Show the floating Pencil palette in the current window (kind tools: toolbar tools, undo, colour and thickness; colours; attributes) or close it.",
         params: .obj(["kind": .str("tools (default) | colours | attributes", choices: PaletteKind.allCases.map { $0.rawValue }),
                       "page": .ref, "at": .point, "close": .bool("true closes an open palette")]),
@@ -166,6 +173,8 @@ struct PencilPaletteCommand: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let handler = try PencilHandler.resolve(ctx)
+        // Set only by pencil.gesture for a physical double-tap or squeeze; taken once, before anything can throw.
+        let fromPencil = handler.takePaletteFromPencil()
         if p.close == true {
             handler.palette.dismiss()
             return Output(shown: false, kind: nil, tools: [])
@@ -176,7 +185,8 @@ struct PencilPaletteCommand: NibCommand {
         }
         guard let session = ctx.activeSession else { throw NibError.unavailable("an open editor window") }
         let target = try PencilTarget(page: p.page, at: p.at, session: session)
-        let result = try handler.showPalette(kind, session: session, page: target.page, at: target.point)
+        let result = try handler.showPalette(kind, session: session, page: target.page, at: target.point,
+                                             fromPencil: fromPencil)
         return Output(shown: result.shown, kind: kind.rawValue, tools: result.plan.tools.map { $0.toolID ?? $0.id })
     }
 }
@@ -199,7 +209,7 @@ struct PencilActionsCommand: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: PencilCommandIDs.actions, title: "Apple Pencil Actions",
+        id: "pencil.actions", title: "Apple Pencil Actions",
         summary: "List what Apple Pencil double-tap and squeeze can be set to (settings pencilhw.doubleTap, pencilhw.squeeze) and the current choices.",
         params: .empty, examples: [[:]], effect: .read, target: .app)
 
@@ -276,6 +286,7 @@ struct PencilSettingsView: View {
 
     var body: some View {
         let _ = revision
+        let roll = app.settings.descriptor(PencilSettings.reactToRoll)
         List {
             bindingSection(.doubleTap)
             bindingSection(.squeeze)
@@ -290,14 +301,19 @@ struct PencilSettingsView: View {
             Section {
                 SettingToggle(app: app, title: String(localized: "Pencil haptics"), name: PencilSettings.haptics.name,
                               stored: app.settings.get(PencilSettings.haptics))
-                if let roll = app.settings.descriptor(PencilSettings.reactToRoll) {
+                if let roll {
                     SettingToggle(app: app, title: String(localized: "React to pen rotation"), name: roll.name,
                                   stored: (app.settings.json(roll.name) ?? roll.defaultValue).boolValue ?? false)
                 }
             } header: {
                 Text(String(localized: "Apple Pencil Pro"))
             } footer: {
-                Text(String(localized: "Apple Pencil Pro taps in your hand when a palette opens and when a shape snaps. With pen rotation on, turning the barrel turns the fountain pen's nib."))
+                // The rotation sentence only when F007's switch exists and the toggle above is shown.
+                if roll != nil {
+                    Text(String(localized: "Apple Pencil Pro taps in your hand when a palette opens and when a shape snaps. With pen rotation on, turning the barrel turns the fountain pen's nib."))
+                } else {
+                    Text(String(localized: "Apple Pencil Pro taps in your hand when a palette opens and when a shape snaps."))
+                }
             }
             hardwareSection
         }

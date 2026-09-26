@@ -265,20 +265,40 @@ enum PencilCapability: String, CaseIterable, Identifiable {
 final class PencilHandler: PencilEventHandler {
     static let serviceKey = "pencilhw.handler"
 
+    /// How long a Pencil position stays "where the Pencil is" after it was recorded (seconds).
+    static let pointLifetime: TimeInterval = 2
+    /// How long a gesture `receive` sent waits for `pencil.gesture` to pick it up (seconds).
+    static let pendingLifetime: TimeInterval = 1
+    /// F030's snap event (T-117), emitted on `app.events` with `doc` and payload {page, shape}.
+    /// ponytail: owned by F030 (`ShapeRecognitionEvents.snapped` in FeatShapeRecognition/DrawShapeTool.swift) and not in
+    /// `NibEventType`; move to the contract constant when one is added.
+    static let shapeSnapped = "shape.snapped"
+
     private weak var app: NibApp?
     /// The iPad's Apple Pencil preference per gesture; tests replace it.
     var systemPreference: @MainActor (PencilGesture) -> PencilSystemAction
+    /// Media time; tests replace it to age Pencil positions.
+    var clock: @MainActor () -> TimeInterval = { CACurrentMediaTime() }
+    /// How a Pencil gesture reaches `pencil.gesture` (the user's command path); tests record it instead.
+    var performCommand: @MainActor (String, JSONValue, EditorSession) -> Void
     let palette = SqueezePalettePresenter()
     private(set) var seen = Set<PencilCapability>()
     private var gate = PencilEventGate()
     private var previews: [ObjectIdentifier: HoverPreview] = [:]
-    private var lastPoint: [ObjectIdentifier: CGPoint] = [:]
+    /// The Pencil's last position over each canvas and when it was recorded.
+    private var lastPoint: [ObjectIdentifier: (point: CGPoint, time: TimeInterval)] = [:]
     private weak var lastHost: CanvasHost?
-    private var lastActivity: TimeInterval = 0
+    /// The physical gesture `receive` just sent, until `pencil.gesture` takes it (then its palette may play the haptic).
+    private var pendingGesture: (gesture: PencilGesture, time: TimeInterval)?
+    /// True while `pencil.gesture` runs the `pencil.palette` a physical Pencil gesture resolved to.
+    private var paletteFromPencil = false
     private var styles: [String: HoverStyle] = [:]
     private var generators: [ObjectIdentifier: AnyObject] = [:]
-    private var commits: EventSubscription?
+    private var snaps: EventSubscription?
     private var bag = Set<AnyCancellable>()
+    /// The last haptic asked for (kind and view point), for tests (which also reset it); the generator itself can't be
+    /// observed.
+    var lastFeedback: (kind: Feedback, point: CGPoint)?
 
     /// What the hover preview needs from settings, cached per tool (hover arrives at 120 Hz).
     struct HoverStyle {
@@ -296,6 +316,7 @@ final class PencilHandler: PencilEventHandler {
     init(app: NibApp) {
         self.app = app
         systemPreference = { PencilHandler.readSystemPreference($0) }
+        performCommand = { [weak app] command, params, session in app?.perform(command, params, session: session) }
         NotificationCenter.default.publisher(for: SettingsStore.didChange)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.styles.removeAll() }
@@ -331,10 +352,13 @@ final class PencilHandler: PencilEventHandler {
         return false
     }
 
-    /// Commit observer for snapping haptics (called from `start`, never from `register`).
+    /// Listens for F030's snaps, for the Pencil Pro snap haptic (called from `start`, never from `register`).
     func start() {
-        guard let app, commits == nil else { return }
-        commits = app.bus.observeCommits { [weak self] cs in self?.didCommit(cs) }
+        guard let app, snaps == nil else { return }
+        snaps = app.events.subscribe { [weak self] event in
+            guard event.type == PencilHandler.shapeSnapped else { return }
+            self?.didSnap(event)
+        }
     }
 
     // MARK: PencilEventHandler (forwarded by the canvas)
@@ -364,8 +388,8 @@ final class PencilHandler: PencilEventHandler {
 
     // MARK: Gestures
 
-    func receive(_ gesture: PencilGesture, at location: CGPoint?, session: EditorSession, host: CanvasHost,
-                 now: TimeInterval = CACurrentMediaTime()) {
+    func receive(_ gesture: PencilGesture, at location: CGPoint?, session: EditorSession, host: CanvasHost) {
+        let now = clock()
         guard gate.accept(gesture.rawValue, at: now) else { return }
         seen.insert(gesture == .doubleTap ? .doubleTap : .squeeze)
         note(host, location)
@@ -374,7 +398,25 @@ final class PencilHandler: PencilEventHandler {
             palette.dismiss()
             return
         }
-        app?.perform(PencilCommandIDs.gesture, gestureParams(gesture, host: host), session: session)
+        pendingGesture = (gesture, now)
+        performCommand(PencilCommandIDs.gesture, gestureParams(gesture, host: host), session)
+    }
+
+    /// `pencil.gesture`: whether this run comes from the Pencil itself (`receive`), not from AI, a plugin or a script.
+    func takePendingGesture(_ gesture: PencilGesture) -> Bool {
+        defer { pendingGesture = nil }
+        guard let pending = pendingGesture, pending.gesture == gesture else { return false }
+        return clock() - pending.time < PencilHandler.pendingLifetime
+    }
+
+    /// `pencil.gesture` marks the palette it runs for a physical gesture; `pencil.palette` takes the mark once.
+    func markPaletteFromPencil(_ fromPencil: Bool) {
+        paletteFromPencil = fromPencil
+    }
+
+    func takePaletteFromPencil() -> Bool {
+        defer { paletteFromPencil = false }
+        return paletteFromPencil
     }
 
     func binding(_ gesture: PencilGesture) -> String {
@@ -402,16 +444,18 @@ final class PencilHandler: PencilEventHandler {
         return .object(params)
     }
 
+    /// Pencil activity on a canvas. A gesture without a hover pose (nil) only marks the canvas; it never makes an old
+    /// position look new.
     private func note(_ host: CanvasHost, _ point: CGPoint?) {
         lastHost = host
-        lastActivity = CACurrentMediaTime()
-        if let point { lastPoint[ObjectIdentifier(host)] = point }
+        if let point { lastPoint[ObjectIdentifier(host)] = (point, clock()) }
     }
 
-    /// Where the Pencil last was over this canvas, while it is still near the screen.
+    /// Where the Pencil is over this canvas: its last position, if that was recorded in the last two seconds.
     func recentPoint(_ host: CanvasHost) -> CGPoint? {
-        guard lastHost === host, CACurrentMediaTime() - lastActivity < 2 else { return nil }
-        return lastPoint[ObjectIdentifier(host)]
+        guard lastHost === host, let last = lastPoint[ObjectIdentifier(host)],
+              clock() - last.time < PencilHandler.pointLifetime else { return nil }
+        return last.point
     }
 
     // MARK: Hover
@@ -428,10 +472,8 @@ final class PencilHandler: PencilEventHandler {
             return
         }
         let style = hoverStyle(session.tool)
-        let eraser = session.toolOptions[PencilActionResolver.eraser]
-        let radius = eraser?["radius"]?.doubleValue ?? eraser?["size"]?.doubleValue.map { $0 / 2 }
-        let shape = HoverPreviewGeometry.shape(tool: session.tool, presets: style.presets, eraserRadius: radius,
-                                               zoom: host.zoomScale, azimuth: sample.azimuth,
+        let shape = HoverPreviewGeometry.shape(tool: session.tool, presets: style.presets, zoom: host.zoomScale,
+                                               azimuth: sample.azimuth,
                                                roll: style.reactsToRoll && sample.roll != 0 ? sample.roll : nil)
         preview.show(shape, at: point)
     }
@@ -474,21 +516,22 @@ final class PencilHandler: PencilEventHandler {
     // MARK: Palette
 
     /// Shows the palette over the session's canvas at a page point, else where the Pencil is, else mid-screen.
-    func showPalette(_ kind: PaletteKind, session: EditorSession, page: PageID?,
-                     at point: Point?) throws -> (plan: PalettePlan, shown: Bool) {
+    /// `fromPencil`: a double-tap or squeeze opened it, so Apple Pencil Pro taps in the hand (never for the keyboard,
+    /// a menu, AI or a plugin; DESIGN.md §11).
+    func showPalette(_ kind: PaletteKind, session: EditorSession, page: PageID?, at point: Point?,
+                     fromPencil: Bool) throws -> (plan: PalettePlan, shown: Bool) {
         guard let app else { throw NibError.unavailable("Apple Pencil support") }
         guard let host = canvasHost(for: session) else {
             throw NibError(.unavailable, "the Pencil palette needs an open notebook or whiteboard",
                            hint: "open a notebook or whiteboard, then call pencil.palette")
         }
-        let pencil = recentPoint(host)
-        var anchor = pencil ?? CGPoint(x: host.canvasView.bounds.midX, y: host.canvasView.bounds.midY)
+        var anchor = recentPoint(host) ?? CGPoint(x: host.canvasView.bounds.midX, y: host.canvasView.bounds.midY)
         if let point, let page = page ?? session.page { anchor = host.viewPoint(point, page: page) }
         let model = PaletteModel(app: app, session: session, kind: kind)
         let shown = palette.present(model, at: anchor, in: host)
         if shown {
             preview(for: host).hide()                   // the palette covers the canvas; hover stops reaching it
-            if pencil != nil { feedback(.alignment, host: host, at: anchor) }   // never for keyboard invocations
+            if fromPencil { feedback(.alignment, host: host, at: anchor) }
         }
         return (model.plan, shown)
     }
@@ -503,6 +546,7 @@ final class PencilHandler: PencilEventHandler {
 
     func feedback(_ kind: Feedback, host: CanvasHost, at point: CGPoint) {
         guard let app, app.settings.get(PencilSettings.haptics) else { return }
+        lastFeedback = (kind, point)
         if #available(iOS 17.5, *) {
             let generator = canvasGenerator(host)
             switch kind {
@@ -525,13 +569,28 @@ final class PencilHandler: PencilEventHandler {
         return generator
     }
 
-    /// Snapping haptic: a shape the person just drew (Draw and Hold, Shapes) snapped into place.
-    /// ponytail: keyed on `shape.create` commits by the user in a window the Pencil was used in; the ruler and
-    /// alignment guides play their own (F039, F012). Add a snap event to the contracts if more snaps need it.
-    private func didCommit(_ cs: Changeset) {
-        guard cs.principal.isUser, cs.command == CommandIDs.shapeCreate, let host = lastHost else { return }
-        let point = lastPoint[ObjectIdentifier(host)]
-            ?? CGPoint(x: host.canvasView.bounds.midX, y: host.canvasView.bounds.midY)
+    /// Snapping haptic (T-117): F030 emits `shape.snapped` the moment a drawn stroke snaps to a shape (on lift, or
+    /// while the Pencil is still down with Draw and Hold). It plays on the canvas the Pencil was last used on, and only
+    /// when the snap is in that canvas's document; at the snap's own point when the event carries one, else where the
+    /// Pencil is, else mid-page. The ruler and alignment guides play their own (F039, F012).
+    func didSnap(_ event: NibEvent) {
+        guard let host = lastHost, let doc = event.doc, doc == host.documentID else { return }
+        var page: PageID?
+        if let ref = event.payload?["page"]?.stringValue, let node = NodeRef(ref), case let .page(pageDoc, id) = node,
+           pageDoc == doc {
+            page = id
+        }
+        let point: CGPoint
+        if let page, let at = event.payload?["at"]?.arrayValue, at.count == 2,
+           let x = at[0].doubleValue, let y = at[1].doubleValue {
+            point = host.viewPoint(Point(x, y), page: page)
+        } else if let pencil = recentPoint(host) {
+            point = pencil
+        } else if let page, let frame = host.pageFrame(page) {
+            point = CGPoint(x: frame.midX, y: frame.midY)
+        } else {
+            point = CGPoint(x: host.canvasView.bounds.midX, y: host.canvasView.bounds.midY)
+        }
         feedback(.path, host: host, at: point)
     }
 }
