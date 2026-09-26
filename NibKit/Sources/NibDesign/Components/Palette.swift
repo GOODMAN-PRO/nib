@@ -14,9 +14,18 @@ public struct NibTool: Identifiable, Hashable, Sendable {
     /// What the tool lays down, shown on the glyph's colour layer: the current ink for pen and pencil, the current
     /// highlight colour for the highlighter, nil for every other tool.
     public let tint: Color?
+    /// v2: false when the shell already registers the tool key as a key command. The palette then shows `shortcut` as
+    /// a `KeyHint` (hover, ⌘ held) without registering it a second time.
+    public let registersShortcut: Bool
 
     public init(id: String, label: String, symbol: NibSymbol, isPlugin: Bool = false, hasSettings: Bool = true,
                 value: String? = nil, shortcut: KeyboardShortcut? = nil, tint: Color? = nil) {
+        self.init(id: id, label: label, symbol: symbol, isPlugin: isPlugin, hasSettings: hasSettings, value: value,
+                  shortcut: shortcut, registersShortcut: true, tint: tint)
+    }
+
+    public init(id: String, label: String, symbol: NibSymbol, isPlugin: Bool = false, hasSettings: Bool = true,
+                value: String? = nil, shortcut: KeyboardShortcut?, registersShortcut: Bool, tint: Color? = nil) {
         self.id = id
         self.label = label
         self.symbol = symbol
@@ -24,32 +33,42 @@ public struct NibTool: Identifiable, Hashable, Sendable {
         self.hasSettings = hasSettings
         self.value = value
         self.shortcut = shortcut
+        self.registersShortcut = registersShortcut
         self.tint = tint
     }
+
+    /// The shortcut to register with the system, and the one to show only as a hint.
+    var registeredShortcut: KeyboardShortcut? { registersShortcut ? shortcut : nil }
+    var hintOnlyShortcut: KeyboardShortcut? { registersShortcut ? nil : shortcut }
 }
 
-/// A quick colour slot: an ink or a custom colour.
+/// A quick colour slot: an ink or a custom colour, optionally with a tape pattern over it.
 public struct NibSwatch: Identifiable, Hashable {
     public let id: String
     public let color: Color
     public let name: String
     public let ringsLight: Bool
     public let ringsDark: Bool
+    /// v2: a tape pattern tiled over the colour (`NibSwatchPattern`); nil for a plain colour.
+    public let pattern: NibSwatchPattern?
 
     public init(ink: NibInk) {
-        id = ink.rawValue
-        color = ink.color
-        name = ink.name
-        ringsLight = ink.needsRing(dark: false)
-        ringsDark = ink.needsRing(dark: true)
+        self.init(id: ink.rawValue, color: ink.color, name: ink.name, ringsLight: ink.needsRing(dark: false),
+                  ringsDark: ink.needsRing(dark: true), pattern: nil)
     }
 
     public init(id: String, color: Color, name: String, ringsLight: Bool = false, ringsDark: Bool = false) {
+        self.init(id: id, color: color, name: name, ringsLight: ringsLight, ringsDark: ringsDark, pattern: nil)
+    }
+
+    public init(id: String, color: Color, name: String, ringsLight: Bool = false, ringsDark: Bool = false,
+                pattern: NibSwatchPattern?) {
         self.id = id
         self.color = color
         self.name = name
         self.ringsLight = ringsLight
         self.ringsDark = ringsDark
+        self.pattern = pattern
     }
 }
 
@@ -61,24 +80,31 @@ public struct NibPenSwatch: View {
     }
 
     let swatch: NibSwatch
+    let pattern: NibSwatchPattern?
     let isSelected: Bool
     let size: Size
     let action: () -> Void
     @Environment(\.colorScheme) private var scheme
 
     public init(_ swatch: NibSwatch, isSelected: Bool, size: Size = .popover, action: @escaping () -> Void) {
+        self.init(swatch, pattern: swatch.pattern, isSelected: isSelected, size: size, action: action)
+    }
+
+    /// v2: a tape swatch, `pattern` tiled over the swatch's colour inside the same circle, hairline and ring.
+    public init(_ swatch: NibSwatch, pattern: NibSwatchPattern?, isSelected: Bool, size: Size = .popover,
+                action: @escaping () -> Void) {
         self.swatch = swatch
+        self.pattern = pattern
         self.isSelected = isSelected
         self.size = size
         self.action = action
     }
 
-    private var diameter: CGFloat {
-        switch size {
-        case .palette: return 22
-        case .popover: return 26
-        case .compact: return 28
-        }
+    private var diameter: CGFloat { size.diameter }
+
+    private var accessibilityName: String {
+        guard let patternName = pattern?.name else { return swatch.name }
+        return String(localized: "\(swatch.name), \(patternName)", bundle: .module)
     }
 
     public var body: some View {
@@ -86,6 +112,11 @@ public struct NibPenSwatch: View {
         Button(action: action) {
             Circle()
                 .fill(swatch.color)
+                .overlay {
+                    if let pattern {
+                        Circle().fill(pattern.paint)
+                    }
+                }
                 .overlay {
                     Circle().strokeBorder(ringed ? NibColor.swatchRing : NibColor.swatchHairline, lineWidth: ringed ? 1 : 0.5)
                 }
@@ -102,8 +133,19 @@ public struct NibPenSwatch: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: Circle()))
-        .accessibilityLabel(swatch.name)
+        .accessibilityLabel(accessibilityName)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+public extension NibPenSwatch.Size {
+    /// v2: the well's diameter (22 palette, 26 popover, 28 iPhone), for UIKit bars that draw `UIImage.nibSwatch`.
+    var diameter: CGFloat {
+        switch self {
+        case .palette: return 22
+        case .popover: return 26
+        case .compact: return 28
+        }
     }
 }
 
@@ -117,6 +159,7 @@ public struct NibToolButton: View {
     let pitch: CGFloat
     let action: () -> Void
     @Environment(DropletField.self) private var field: DropletField?
+    @Environment(\.isEnabled) private var isEnabled
     @ScaledMetric(relativeTo: .body) private var glyph: CGFloat = 23
 
     public init(tool: NibTool, isSelected: Bool, action: @escaping () -> Void) {
@@ -141,7 +184,7 @@ public struct NibToolButton: View {
                 .font(NibFont.glyph(.palette, size: min(glyph, 28)))
                 .symbolRenderingMode(tool.tint == nil ? .hierarchical : .palette)
                 .foregroundStyle(NibColor.label, tool.tint ?? NibColor.label)
-                .opacity(isSelected ? 1 : 0.74)
+                .opacity(isEnabled ? (isSelected ? 1 : NibOpacity.unselectedTool) : NibOpacity.disabled)
                 .animation(NibMotion.colorChange, value: isSelected)
                 .overlay(alignment: .topTrailing) {
                     if tool.isPlugin {
@@ -157,7 +200,9 @@ public struct NibToolButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: Circle()))
-        .nibShortcut(tool.shortcut)
+        .nibShortcut(tool.registeredShortcut)
+        .nibShortcutHint(tool.hintOnlyShortcut)
+        .nibTooltip(tool.label)
         .accessibilityLabel(tool.isPlugin ? String(localized: "\(tool.label), plugin", bundle: .module) : tool.label)
         .accessibilityValue(tool.value ?? "")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
@@ -188,10 +233,16 @@ public struct NibToolPalette<Settings: View>: View {
     let allowedEdges: [NibDock]
     let reservedTrailing: CGFloat
     let options: ((String) -> AnyView?)?
+    let toolOptions: ((String) -> NibToolOptions?)?
+    let settingsPresented: Binding<Bool>?
+    let morePresented: Binding<Bool>?
+    let onReselect: ((String) -> Void)?
     let settings: (String) -> Settings
 
     @Environment(DropletField.self) private var field: DropletField?
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.nibLiquidMode) private var liquidMode
     @ScaledMetric(relativeTo: .body) private var scaledThick: CGFloat = 56
     @ScaledMetric(relativeTo: .body) private var scaledPitch: CGFloat = 44
     @State private var shownDock: NibPaletteDock?
@@ -203,6 +254,10 @@ public struct NibToolPalette<Settings: View>: View {
     @State private var popoverSize = CGSize(width: NibMetrics.popoverWidth, height: 412)
     @State private var moreSize = CGSize(width: NibMetrics.popoverWidth, height: 124)
     @State private var optionsSize = CGSize(width: 200, height: NibMetrics.barHeight)
+    /// A released drag on its way to its dock: the one plip plays when it arrives (DESIGN.md §10.11).
+    @State private var landing: DockLanding?
+    /// Reduce Motion and Liquid Off cross-fade the palette to its new dock (DESIGN.md §10.10).
+    @State private var fade: Double = 1
 
     enum DragMode {
         case move, scrub
@@ -229,7 +284,50 @@ public struct NibToolPalette<Settings: View>: View {
         self.allowedEdges = allowedEdges
         self.reservedTrailing = reservedTrailing
         self.options = options
+        self.toolOptions = nil
+        self.settingsPresented = nil
+        self.morePresented = nil
+        self.onReselect = nil
         self.settings = settings
+    }
+
+    /// v2: the options bar with an optional popover of its own, and the palette's state for the chrome.
+    /// - Parameters:
+    ///   - toolOptions: the active tool's options bar and, optionally, a popover that buds from a `nibBudAnchor`
+    ///     inside that bar (a thickness slider, a colour editor). The palette places the popover as a full-size
+    ///     child of the container, beside the bar, with the palette's own placement rule.
+    ///   - settingsPresented: mirrors the selected tool's settings popover both ways (a chevron in the options bar
+    ///     opens it; the chrome keeps one popover open at a time and guards touches while it is open).
+    ///   - morePresented: mirrors the More grid both ways.
+    ///   - onReselect: called with the tool's id when the selected tool is tapped again (before its settings bud).
+    public init(id: String = "palette", tools: [NibTool], moreTools: [NibTool] = [], selection: Binding<String>,
+                swatches: [NibSwatch], swatch: Binding<Int>, dock: Binding<NibPaletteDock>,
+                allowedEdges: [NibDock] = NibDock.allCases, reservedTrailing: CGFloat = 0,
+                toolOptions: @escaping (String) -> NibToolOptions?, settingsPresented: Binding<Bool>? = nil,
+                morePresented: Binding<Bool>? = nil, onReselect: ((String) -> Void)? = nil,
+                @ViewBuilder settings: @escaping (String) -> Settings) {
+        self.id = id
+        self.tools = tools
+        self.moreTools = moreTools
+        self._selection = selection
+        self.swatches = swatches
+        self._swatch = swatch
+        self._dock = dock
+        self.allowedEdges = allowedEdges
+        self.reservedTrailing = reservedTrailing
+        self.options = nil
+        self.toolOptions = toolOptions
+        self.settingsPresented = settingsPresented
+        self.morePresented = morePresented
+        self.onReselect = onReselect
+        self.settings = settings
+    }
+
+    /// The options for `toolID`: the v2 closure, else the plain bar of `options`.
+    private func resolvedOptions(_ toolID: String) -> NibToolOptions? {
+        if let toolOptions { return toolOptions(toolID) }
+        guard let options, let bar = options(toolID) else { return nil }
+        return NibToolOptions(bar: bar)
     }
 
     // MARK: Geometry
@@ -308,43 +406,22 @@ public struct NibToolPalette<Settings: View>: View {
     }
 
     private func region(_ proxy: GeometryProxy) -> CGRect {
-        let s = proxy.safeAreaInsets
-        let top = s.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.l
-        let bottom = s.bottom + (compact ? NibSpacing.s : NibSpacing.l)
-        return CGRect(x: s.leading + NibSpacing.l, y: top,
-                      width: max(0, proxy.size.width - s.leading - s.trailing - 2 * NibSpacing.l - reservedTrailing),
-                      height: max(0, proxy.size.height - top - bottom))
+        DropletDockModel.region(size: proxy.size, safeArea: proxy.safeAreaInsets, compact: compact,
+                                reservedTrailing: reservedTrailing)
     }
 
-    private func centre(_ d: NibPaletteDock, size s: CGSize, in r: CGRect) -> CGPoint {
-        let t = min(max(d.along, 0), 1)
-        func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * t }
-        switch d.edge {
-        case .leading: return CGPoint(x: r.minX + s.width / 2, y: lerp(r.minY + s.height / 2, r.maxY - s.height / 2))
-        case .trailing: return CGPoint(x: r.maxX - s.width / 2, y: lerp(r.minY + s.height / 2, r.maxY - s.height / 2))
-        case .top: return CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.minY + s.height / 2)
-        case .bottom: return CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.maxY - s.height / 2)
-        }
+    /// The dock engine (DESIGN.md §10.11) for region `r`, shifted by `origin` into the container's space: the palette's
+    /// size in each orientation, the docks this device offers, the capture radius and the meniscus.
+    private func dockModel(_ r: CGRect, origin: CGPoint = .zero) -> DropletDockModel {
+        DropletDockModel(region: r.offsetBy(dx: origin.x, dy: origin.y),
+                         horizontal: CGSize(width: length(arrange(maxLength: r.width)), height: thick),
+                         vertical: CGSize(width: thick, height: length(arrange(maxLength: r.height))),
+                         docks: allowedEdges, compact: compact)
     }
 
-    private func dockFor(_ p: CGPoint, in r: CGRect, _ a: Arrangement) -> NibPaletteDock {
-        func distance(_ e: NibDock) -> CGFloat {
-            switch e {
-            case .leading: return abs(p.x - r.minX)
-            case .trailing: return abs(p.x - r.maxX)
-            case .top: return abs(p.y - r.minY) + 40
-            case .bottom: return abs(p.y - r.maxY)
-            }
-        }
-        let edge = edges.min { distance($0) < distance($1) } ?? .bottom
-        let s = size(NibPaletteDock(edge: edge), a)
-        let along: CGFloat
-        if edge.isVertical {
-            along = (p.y - (r.minY + s.height / 2)) / max(1, r.height - s.height)
-        } else {
-            along = (p.x - (r.minX + s.width / 2)) / max(1, r.width - s.width)
-        }
-        return NibPaletteDock(edge: edge, along: min(max(along, 0), 1))
+    private func centre(_ d: NibPaletteDock, in r: CGRect) -> CGPoint {
+        let f = dockModel(r).frame(for: d)
+        return CGPoint(x: f.midX, y: f.midY)
     }
 
     /// A slot's rect across the palette's full thickness, in the palette's centred coordinates.
@@ -373,13 +450,13 @@ public struct NibToolPalette<Settings: View>: View {
             let map = slots(a)
             let origin = proxy.frame(in: NibLiquid.space).origin
             let d = current
-            let s = size(d, a)
-            let c = centre(d, size: s, in: r)
+            let c = centre(d, in: r)
             let bounds = CGRect(origin: .zero, size: proxy.size)
             let slotAt = { (along: CGFloat) -> CGRect in slotRect(along, d, a).offsetBy(dx: c.x, dy: c.y) }
             ZStack(alignment: .topLeading) {
                 palette(d, a, map)
                     .gesture(dragGesture(region: r, origin: origin, arrangement: a, slots: map))
+                    .opacity(fade)
                     .position(c)
                 if let tool = a.natives.first(where: { $0.id == selection }) ?? a.plugins.first(where: { $0.id == selection }),
                    tool.hasSettings, let along = map[tool.id] {
@@ -388,11 +465,18 @@ public struct NibToolPalette<Settings: View>: View {
                 if a.hasMore, let along = map[Self.moreID] {
                     moreGrid(a.more, anchor: slotAt(along), placement: placement(d), bounds: bounds)
                 }
-                if let options, let view = options(selection), let along = map[selection] {
-                    NibToolOptionsBar(id: id + ".options") { view }
+                if let opts = resolvedOptions(selection), let along = map[selection] {
+                    NibToolOptionsBar(id: id + ".options") { opts.bar }
                         .onGeometryChange(for: CGSize.self) { $0.size } action: { optionsSize = $0 }
                         .position(placement(d).centre(size: optionsSize, beside: slotAt(along), gap: -1, in: bounds,
                                                       alignment: .centre))
+                    if let pop = opts.popover {
+                        // NibBudPopover works in container coordinates; this layer starts at `origin` in them.
+                        NibBudPopover(id: id + ".options.popover", source: pop.source, isPresented: pop.isPresented,
+                                      title: pop.title, subtitle: pop.subtitle, width: popoverWidth(bounds),
+                                      placement: placement(d)) { pop.content }
+                            .offset(x: -origin.x, y: -origin.y)
+                    }
                 }
             }
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
@@ -400,7 +484,8 @@ public struct NibToolPalette<Settings: View>: View {
                 registerAnchors(key.slots, d, a)
                 if let along = map[selection] { field?.setBead(id, head: along, glide: false) }
             }
-            .onChange(of: selection) { _, newValue in
+            .background(DockArrivalWatcher(id: id, node: field?.node(id), field: field, landing: $landing))
+            .onChange(of: selection) { oldValue, newValue in
                 let glide = tapped == newValue
                 tapped = nil
                 recent.removeAll { $0 == newValue }
@@ -410,7 +495,13 @@ public struct NibToolPalette<Settings: View>: View {
                 }
                 if !glide { settingsOpen = false }
                 moreOpen = false
+                // The previous tool's options popover closes with its bar.
+                if let previous = resolvedOptions(oldValue)?.popover, previous.isPresented.wrappedValue {
+                    previous.isPresented.wrappedValue = false
+                }
             }
+            .modifier(PresentationMirror(isOpen: $settingsOpen, external: settingsPresented))
+            .modifier(PresentationMirror(isOpen: $moreOpen, external: morePresented))
         }
         .background(ReshapeWatcher(node: field?.node(id)) { shownDock = nil })
     }
@@ -497,6 +588,7 @@ public struct NibToolPalette<Settings: View>: View {
     private func tap(_ tool: NibTool) {
         moreOpen = false
         if tool.id == selection {
+            onReselect?(tool.id)
             if tool.hasSettings { settingsOpen.toggle() }
         } else {
             settingsOpen = false
@@ -506,9 +598,14 @@ public struct NibToolPalette<Settings: View>: View {
         field?.poke(id)
     }
 
+    /// 312 pt on iPad; on iPhone the screen minus 48 (DESIGN.md §5).
+    private func popoverWidth(_ bounds: CGRect) -> CGFloat {
+        compact ? max(0, bounds.width - 3 * NibSpacing.l) : NibMetrics.popoverWidth
+    }
+
     private func popover(for tool: NibTool, anchor: CGRect, placement: NibBudPlacement, bounds: CGRect) -> some View {
         let gap = compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
-        let width = compact ? max(0, bounds.width - 3 * NibSpacing.l) : NibMetrics.popoverWidth
+        let width = popoverWidth(bounds)
         return NibPopoverPanel(title: tool.label, width: width) { settings(tool.id) }
             .onGeometryChange(for: CGSize.self) { $0.size } action: { popoverSize = $0 }
             .droplet(id + ".settings", style: .popover)
@@ -537,7 +634,8 @@ public struct NibToolPalette<Settings: View>: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)))
-                    .nibShortcut(tool.shortcut)
+                    .nibShortcut(tool.registeredShortcut)
+                    .nibShortcutHint(tool.hintOnlyShortcut)
                     .accessibilityLabel(tool.label)
                     .accessibilityAddTraits(tool.id == selection ? .isSelected : [])
                 }
@@ -568,8 +666,9 @@ public struct NibToolPalette<Settings: View>: View {
                         mode = .move
                         settingsOpen = false
                         moreOpen = false
+                        landing = nil
                         field.dismissBuds()
-                        field.beginDrag(id, at: value.startLocation)
+                        DropletDockDriver(id: id, field: field).begin(at: value.startLocation)
                     }
                 }
                 switch mode {
@@ -579,7 +678,9 @@ public struct NibToolPalette<Settings: View>: View {
                     let lo = scrubbable.map(\.1).min() ?? a, hi = scrubbable.map(\.1).max() ?? a
                     field.scrubBead(id, to: min(max(a, lo), hi))        // never onto More or the swatches
                 case .move:
-                    field.drag(id, to: value.location)
+                    // Held, the palette is a bead of water: it follows with `follow`, and its meniscus reaches for the
+                    // dock the finger is within capture of.
+                    DropletDockDriver(id: id, field: field).move(to: value.location, model: dockModel(r, origin: origin))
                 case .none:
                     break
                 }
@@ -601,26 +702,48 @@ public struct NibToolPalette<Settings: View>: View {
                     return
                 }
                 guard mode == .move else { return }
-                let v = field.endDrag(id, velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height))
-                let projected = DropletPhysics.projectedLanding(value.location, velocity: v)
-                let local = CGPoint(x: projected.x - origin.x, y: projected.y - origin.y)
-                var next = dockFor(local, in: r, a)
-                let nextSize = size(next, a)
-                let nextCentre = centre(next, size: nextSize, in: r)
-                let rect = CGRect(x: nextCentre.x - nextSize.width / 2 + origin.x, y: nextCentre.y - nextSize.height / 2 + origin.y,
-                                  width: nextSize.width, height: nextSize.height)
-                let rested = field.restingRect(rect, excluding: id, along: next.isVertical ? .vertical : .horizontal)
-                if next.isVertical {
-                    next.along = min(max((rested.minY - origin.y - r.minY) / max(1, r.height - nextSize.height), 0), 1)
-                } else {
-                    next.along = min(max((rested.minX - origin.x - r.minX) / max(1, r.width - nextSize.width), 0), 1)
+                // The projected finger picks the dock within the capture radius (else home); the palette springs there
+                // with `snap` from the full release velocity, re-forms if the axis changes, and plips on arrival.
+                let release = DropletDockDriver(id: id, field: field).release(
+                    at: value.location, velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height),
+                    from: current, model: dockModel(r, origin: origin))
+                let next = release.dock
+                let arrival = DockLanding(centre: CGPoint(x: release.frame.midX, y: release.frame.midY))
+                if (reduceMotion || liquidMode == .off) && next != current {
+                    // Fade out, move while invisible (the body glides with `reduced`), fade in.
+                    withAnimation(NibMotion.exit) { fade = 0 }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                        dock = next
+                        landing = DockLanding(centre: arrival.centre)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.reduced.response) {
+                            withAnimation(NibMotion.enter) { fade = 1 }
+                        }
+                    }
+                    return
                 }
                 if next.isVertical != current.isVertical {
                     shownDock = current
-                    field.beginReshape(id, towards: CGPoint(x: rested.midX, y: rested.midY), velocity: v)
+                    field.beginReshape(id, towards: CGPoint(x: release.frame.midX, y: release.frame.midY),
+                                       velocity: release.velocity)
                 }
+                landing = arrival
                 dock = next
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) { NibHaptics.play(.snap) }
+            }
+    }
+}
+
+/// Mirrors one of the palette's own popover flags into an optional binding the chrome passes, both ways.
+struct PresentationMirror: ViewModifier {
+    @Binding var isOpen: Bool
+    let external: Binding<Bool>?
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: isOpen) { _, open in
+                if let external, external.wrappedValue != open { external.wrappedValue = open }
+            }
+            .onChange(of: external?.wrappedValue ?? false, initial: true) { _, open in
+                if external != nil, open != isOpen { isOpen = open }
             }
     }
 }
@@ -654,6 +777,7 @@ struct NibSelectionBead: View {
         let head = node?.head ?? fallbackHead, tail = node?.tail ?? fallbackHead
         let g = BeadPhysics.geometry(head: head, tail: tail, radius: NibMetrics.beadRadius)
         let across = thickness / 2
+        let systemGlass = field?.usesSystemGlass ?? false
         Canvas { context, _ in
             func point(_ a: CGFloat) -> CGPoint { vertical ? CGPoint(x: across, y: a) : CGPoint(x: a, y: across) }
             let h = point(g.head), t = point(g.tail)
@@ -671,12 +795,8 @@ struct NibSelectionBead: View {
                 layer.opacity = 0.15
                 layer.fill(bead, with: .color(ink))
             }
-            // The rim: the bead minus itself shifted down-right, a hairline highlight on the top-left.
-            context.drawLayer { layer in
-                layer.fill(bead, with: .color(NibColor.waterRim))
-                layer.blendMode = .destinationOut
-                layer.fill(bead.offsetBy(dx: 0.9, dy: 1.2), with: .color(.black))
-            }
+            // The key rim on the top-left (iOS 17–25); inside iOS 26 glass the bead is a plain fill (DESIGN.md §10.7).
+            context.drawNibBeadRim(bead, systemGlass: systemGlass)
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)

@@ -1,0 +1,119 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWhiteboard/WhiteboardCommands.swift:52-68, MinimapView.swift:343-346, 488-528",
+      "problem": "D-030 says block at 100 %, but nothing blocks. Only board.insertTemplate (and the convert split) calls BoardLimit.check. Pen strokes, paste, stickies, shapes and page.duplicate can all push a board past NibLimits.boardItemLimit. The full banner says 'Add a board, or move items to another one, to keep writing', which suggests writing is blocked when it is not.",
+      "fix": "When MinimapModel.limit == .full, make MinimapAttachment.hitTest return true for every canvas point outside the chrome, so the active tool never gets ink; show the banner with its remedies. Also file docs/contract-requests/F044-board-limit-hook.md for a read hook command (for example board.checkLimit) registered as a CommandHookDescriptor on ink.addStrokes / item.* / clipboard.paste / sticky.* / shape.*. It would veto with the BoardLimit.check error when the target board is full."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWhiteboard/WhiteboardCommands.swift:564-641",
+      "problem": "doc.convertToWhiteboard reads content, pages and every page's items (571-572), then awaits PDF rendering for each page (580-583) before ctx.mutate. Edits that land during those awaits (sync applyRemote, or the user writing in another window) are lost. Items added meanwhile stay on pages that are then tombstoned, so they vanish. Edited items are overwritten by the stale snapshot. Audio clips and pages added meanwhile are ignored.",
+      "fix": "Inside the mutate, re-read tx.content(doc).livePages and tx.items(doc, page:) for each page. If the page ids or any item id/rev differ from the snapshot, throw NibError(.conflict, \"the notebook changed while converting\", hint: \"run doc.convertToWhiteboard again\"). Alternatively, build the layout inside the mutate from the fresh items and precompute only the cards."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWhiteboard/WhiteboardCommands.swift:698-709",
+      "problem": "PageCards.renderedPage runs UIImage(cgImage:).pngData() on the main actor, once per PDF page and one page after another. PNG-encoding an A4 page at 2x (about 2 MP) takes tens of ms, above the ARCHITECTURE §14 16 ms main-actor budget. Converting a 300-page PDF notebook janks the UI for many seconds.",
+      "fix": "Encode off the main actor: let png = await Task.detached { UIImage(cgImage: image).pngData() }.value (AssetStore is thread-safe, so put can run there too). Keep only one render in flight, as now."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWhiteboard/WhiteboardCommands.swift:652-671",
+      "problem": "PDF content can silently disappear. If a PDF page cannot be rendered (no renderer service, a corrupt or encrypted PDF, or a render error), the page falls back to a plain-paper custom card. The error is only logged, and the original page is tombstoned, so the PDF content is gone from view. Nothing tells the user, and once the session's undo history is gone the UI cannot get it back.",
+      "fix": "Render all PDF cards before the mutate. If any returns nil, throw NibError(.unavailable, \"page N of the PDF could not be rendered\", hint: ...) and leave the notebook untouched. Do not fall back to blank paper for .pdf backgrounds."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWhiteboard/MinimapView.swift:169-193, 255, 430",
+      "problem": "Drag-to-pan feeds back into itself. The minimap world is union(content, viewport), recomputed on every canvasDidChange, so each drag event maps the finger through a geometry that the previous event already changed. On an empty or sparse board, or whenever the viewport extends past the content, the viewport stays near the map centre and every finger move pushes the canvas further: it runs away instead of tracking 1:1.",
+      "fix": "Freeze the geometry during a drag. On the first onChanged, store dragGeometry = geometry; map every location through dragGeometry.page(_:); clear it in onEnded. While it is set, updateGeometry() skips recomputing the world (update the viewport rect only)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWhiteboard/WhiteboardCreateSheet.swift:14-21, 84-88, 118-122",
+      "problem": "The create options (D-116) can silently fail to apply. 'Lined' maps to builtin.whiteboardLines, which no feature provides: F005's spec has only whiteboard dot grid and grid. builtin.whiteboardGrid and the 'paper'/'line' param keys are guesses, not contracts. The page.setTemplate fallback passes a doc ref ('doc:D') in `pages`, which is not in the contract (it expects page refs). Its failure is swallowed by try?, so the chosen pattern or colour can quietly not apply.",
+      "fix": "Pass the new document's board refs: pages: content.livePages.map { .string(NodeRef.page(id, $0.id).description) }. Resolve each pattern through app.content.templates.get(id) and fall back when it is missing (lined -> builtin.ruled with the paper params, or hide the option). Report page.setTemplate failures through .nibCommandFailed instead of try?. File a contract request pinning the whiteboard template ids and param keys."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWhiteboard/BoardsPanel.swift:376-419",
+      "problem": "VoiceOver cannot reach the rename field. The row applies .accessibilityElement(children: .ignore) to the whole VStack, including the inline TextField. After the 'Rename' accessibility action, the focused field is hidden from VoiceOver, so its text cannot be read, navigated or edited.",
+      "fix": "Apply the ignore, label, value and actions only when model.renaming != board.id, for example .accessibilityElement(children: model.renaming == board.id ? .contain : .ignore), and move the label, value and actions into that branch. Give the TextField accessibilityLabel(\"Board name\")."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/WhiteboardCommands.swift:629-639",
+      "problem": "Conversion re-homes audio clips but leaves OutlineEntry.page (and bookmarks) pointing at the tombstoned notebook pages, so the whiteboard's outline is broken.",
+      "fix": "In the same mutate, for entry in content.liveOutline where boardOf[entry.page] exists, set entry.page to that board and tx.put it. Each record is still written once, so undo still round-trips."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/WhiteboardCommands.swift:354-375",
+      "problem": "board.add with a template commits the new board and then runs board.insertTemplate. If insertion fails (bad plugin fragment, limit, diagram.create unavailable), the caller gets an error while the board already exists, and AI retries add duplicate boards.",
+      "fix": "Validate before the mutate: parse BoardFragment(json:) for fragment templates, and check that diagram.create is registered (ctx registry) for diagram specs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/BoardsPanel.swift:181-194",
+      "problem": "Move to 'New Whiteboard' runs doc.create, which already creates a first board, then page.moveTo, which appends. The new whiteboard therefore starts with an empty 'Board 1' before the moved boards.",
+      "fix": "Before the move, read content(target).livePages.first. After page.moveTo, in the same group, run page.trash on that original first board."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/MinimapView.swift:343-346",
+      "problem": "hitTest claims the overlay's whole bounding box, including the transparent gaps between the banner, the map and the wider controls row. Those areas are dead zones where the user cannot write.",
+      "fix": "Record the banner, map and controls frames (onGeometryChange/GeometryReader) in the model and hit-test viewPoint against them after converting to hosting.view coordinates."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/MinimapView.swift:233",
+      "problem": "'Double-tap to fit all content' relies on view.zoom {fit: true}, but F006 does not define fit for an infinite board. It may fit the page or do nothing, and the minimap already knows the content bounds.",
+      "fix": "Compute the fit locally. Take scale = clamp(min(canvas.width / content.width, canvas.height / content.height) * 0.9, 0.05...4), run view.zoom {scale}, then centre(on: content.center)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/MinimapView.swift:63-65, 421-422; WhiteboardCreateSheet.swift:171, 209, 278-279; WhiteboardTemplates.swift:312",
+      "problem": "Literal dimensions stand in for tokens: map 208x144 / 168x116, preview 104x78 (78 is off the 4 pt scale), grid minimums 88 and 136, a hand-rolled selection ring (2 pt, -3 inset) and the viewport stroke of 1.5. DESIGN §15.6 says to file a contract request rather than hand-roll values.",
+      "fix": "File a contract request for NibMetrics.minimapSize/minimapSizeCompact and a selection-ring modifier, and derive the preview and grid sizes from NibMetrics.thumbnailWidth."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/MinimapView.swift:450, 482",
+      "problem": "The minimap's Deep and Clear glass sits over the page but never recedes to 22 % while writing and keeps sampling the backdrop while the Pencil is down, against DESIGN §10.8 and the Slop checklist. As a CanvasAttachment it has no access to NibInkingState.",
+      "fix": "File a contract request to expose the inking state to canvas attachments. Until then, fade the overlay to 22 % while commits arrive on the current board and restore it 450 ms after the last one."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/MinimapView.swift:509; BoardsPanel.swift:447, 519",
+      "problem": "The copy fails the checklist. The 'Boards' button is not verb + object. '\\(n) boards' and '\\(n) selected' have no plural handling, so users see '1 boards'.",
+      "fix": "Rename the button to 'Show Boards'. Use plural variants (inflection or a stringsdict) for the counts."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/WhiteboardCommands.swift:101-107, 481-487",
+      "problem": "Plugin template fragments are a trust boundary, but assets are base64-decoded with no size cap, and the file extension comes from the plugin's asset name without any check before AssetStore.put.",
+      "fix": "Cap each asset (for example 20 MB) and the total. Allow-list extensions (png, jpg, jpeg, gif, heic, webp, pdf) and throw invalidParams otherwise."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/WhiteboardCommands.swift:554-560",
+      "problem": "doc.convertToWhiteboard tombstones every page and item and rasterises PDF pages, but is not marked destructive, so AI or plugin callers convert a whole notebook without confirmation.",
+      "fix": "Add destructive: true to the descriptor."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWhiteboard/MinimapView.swift:136-154",
+      "problem": "After every commit burst, reloadContent copies all live items and recomputes union(bounds), and stroke bounds scan every point. On the 80k-100k-item boards this feature warns about, that is a main-actor stall after each pause in writing.",
+      "fix": "Keep contentBounds incrementally: union in the bounds of the changed items from the Changeset, and do a full rescan only on a board switch or when a deleted item touched the current bounds edge."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatWhiteboardTests/FeatWhiteboardTests.swift:262-282",
+      "problem": "The riskiest paths are untested. The minimap attachment test asserts its frame only when the frame is non-empty, so it can pass without checking anything. No test covers id-collision remapping when two pages share an item id on one board, insertTemplate refusing at the board limit, or the drag-to-pan mapping.",
+      "fix": "Add: a conversion test where two pages hold the same item id plus a connector to it (expect a remapped id and a rewired connector); a board.insertTemplate test on a board seeded near boardItemLimit (expect .unsupported); and a pure test that a frozen drag geometry maps successive locations 1:1."
+    }
+  ]
+}
