@@ -20,3 +20,4 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - App target: add user-fonts entitlement (com.apple.developer.user-fonts=[app-usage]) or UIAppSupportsInstalledFonts for F026 T-059/P-083 (owner of Nib/ Info.plist or integration).
 - Integration spec edit: add image.pick {source, page?|doc?|ref?|refs?, point?, position?, anchor?, ids?} (edit, user presence, sensitive) to F034 commands in forge-spec.json + ARCHITECTURE §6.5.
 - Integration spec edit: ARCHITECTURE catalogue: element.create gains optional fallback:Bool (F035).
+- Integration spec edit (BEFORE F066 is built): forge-spec F041 commands add layer.exportOptions {command, params} (read; hook on export.run and render.page) + ARCHITECTURE §6.5; F066 export.run options add visibleLayersOnly: Bool and visibleLayers: {docRaw: [Int]}, and F066's description must honour them.
