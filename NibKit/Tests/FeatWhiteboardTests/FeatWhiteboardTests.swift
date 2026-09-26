@@ -478,7 +478,7 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(tally.count, 2)
         XCTAssertFalse(tally.apply(before: nil, after: box("C", 200)), "an insert only grows the bounds")
         XCTAssertEqual(tally.count, 3)
-        XCTAssertEqual(tally.bounds?.maxX, 210)
+        XCTAssertEqual(tally.bounds?.maxX, box("C", 200).bounds.maxX, "the bounds grow to the new item (stroke included)")
         XCTAssertFalse(tally.apply(before: box("B", 100), after: box("B", 100, deleted: true)), "an inner item went away")
         XCTAssertEqual(tally.count, 2)
         XCTAssertTrue(tally.apply(before: box("C", 200), after: box("C", 200, deleted: true)), "the edge item went away")
