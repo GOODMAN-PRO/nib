@@ -8,7 +8,7 @@ Workflow cap = 2 concurrent (4 CPUs) -> using background Agent calls; me as sche
 - v2/mockup     mockup.html update            running
 - v2/physics    toolbar dock/bead + reflow    GREEN (run 36222900495, 9ecd6b1; includes v2/glass). dstokens asked to merge it.
 - v2/dstokens   NibDesign gap tokens/comps    GREEN (run 36223679248, 63aba8b; = glass+physics+tokens)
-- main: merged design v2 as 0bce516; main CI run 36224117203 pending -> then tag design-v2
+- main: merged design v2 as 0bce516; main CI 36224117203 GREEN (test+ipa). Tag push is blocked by the cloud proxy (git tag push + API refs both 403) -> branch marker/design-v2 = 0bce516. User must create real tags (design-v2, contracts-v2) from a machine with normal GitHub access.
 - F016 dock adoption agent running
 Next: integrator merges 4 branches -> main, CI green, tag contracts-v2 + design-v2, merge main into all feat/*; then F016 dock adoption; mockup update + republish.
 
