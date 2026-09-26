@@ -9,7 +9,7 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 | **C** | App shell (`AppDelegate.swift`, `ShellViewController.swift`) | Architect only |
 | **D** | `project.yml`, CI workflow, `pick_sim.py`, `lint.py` | Architect only |
 
-15,249 lines across 53 files. Every file starts with its repository path as a heading.
+15,347 lines across 53 files. Every file starts with its repository path as a heading.
 
 ## How to use this file
 
@@ -22,7 +22,7 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 
 contracts-v2 (branch `v2/contracts`) resolves the contract gaps the first 48 features reported (`tools/fleet/contract-gaps.md`, where every gap line now ends with `[v2: G<n> …]`, `[v2: rejected - …]` or `[v2: deferred - …]`). It is **additive over contracts-v1**: no public API was renamed, removed or re-signed; every new protocol requirement has a default implementation; new stored fields are optional or defaulted and decode leniently; superseded APIs keep working and carry a "Superseded in contracts-v2 by X" doc comment. Two behaviour changes are bug fixes: `DocTransaction.revert` (G4) and `CommandContext.inputFile` (G6); plus `Frame.applying` for rotated frames under non-uniform scale (G24). The sources in Part A below are the v2 sources; `NibContractsTests/ContractsV2Tests.swift` covers every fix and every new API.
 
-Totals for the 368 gap lines: **218 resolved, 67 rejected, 83 deferred** (34 NibDesign, 12 catalogue rows in forge-spec, 11 app shell, 26 other owners or later design). 16 more gaps reported by fix agents during the pass: 14 resolved, 2 deferred.
+Totals for the 368 gap lines: **218 resolved, 67 rejected, 83 deferred** (34 NibDesign, 12 catalogue rows in forge-spec, 11 app shell, 26 other owners or later design). 19 more gaps reported by fix agents during the pass: 17 resolved, 2 deferred.
 
 **How fix agents use this list.** For your feature, find its id below, delete the named workaround and call the v2 API instead; then re-run your tests (and `CommandConformance.check`). "Adopt" lines name owners that must implement a new hook (the default keeps today's behaviour until they do). Rejected and deferred gaps need no action from features.
 
@@ -193,10 +193,12 @@ public var renderRegion: ((_ params: [String: JSONValue], _ size: PageSize, _ sc
 public var metricsProvider: ((_ params: [String: JSONValue], _ size: PageSize?) -> TemplateMetrics)?
 public func renderOps(_ params: [String: JSONValue], size: PageSize, scale: Double, region: Rect?) -> TemplateRender
 public func metrics(for params: [String: JSONValue], size: PageSize?) -> TemplateMetrics
+public enum TemplateIDs { blank, dots, grid, graph, isometric, ruled, ruledNarrow, ruledWide, cornell, legalPad, whiteboardDots, whiteboardGrid, whiteboardLines }   // "builtin.<name>"
+public enum TemplateParamNames { paper, line, spacing, margin, color }                     // static let String constants
 ```
 Patterns are anchored at the page origin; boards call `renderRegion` with each tile's world rect (else `render` with the tile size, tiles aligned to `repeatPeriod`, 240 pt when nil). Without a provider, `metrics` reads the "spacing" and "margin" params.
 
-Replaces: F004 `NibRender/DisplayListRenderer.swift` `boardPeriod = 240` → `metrics(...).repeatPeriod` and `renderOps(..., region:)`; F005 `NibTemplates/WhiteboardGrids.swift` `fineDotBudget` → set `renderRegion` (and `metricsProvider`) on its templates; F012 `FeatTransform` GuideEngine grid read from the DisplayList → `metrics(for:size:).spacing`; F028 `FeatPageText/PageTextCommands.swift` page-proportional margins → `metrics(...).margins`.
+Replaces: F004 `NibRender/DisplayListRenderer.swift` `boardPeriod = 240` → `metrics(...).repeatPeriod` and `renderOps(..., region:)`; F005 `NibTemplates/WhiteboardGrids.swift` `fineDotBudget` → set `renderRegion` (and `metricsProvider`) on its templates; F012 `FeatTransform` GuideEngine grid read from the DisplayList → `metrics(for:size:).spacing`; F028 `FeatPageText/PageTextCommands.swift` page-proportional margins → `metrics(...).margins`. F044 `FeatWhiteboard/WhiteboardCreateSheet.swift` `BoardPattern.candidates` and `WhiteboardCommands.swift` `Whiteboard.dotsTemplate` literals, and the "paper" / "line" param names (`MinimapView.swift` paper colour) → `TemplateIDs` / `TemplateParamNames`; F005 `NibTemplates/PaperTemplates.swift` param names → the same constants.
 
 ### G8 — DisplayOp text alignment and weight
 
@@ -524,8 +526,12 @@ public enum ExportOptionKeys { public static let visibleLayersOnly, visibleLayer
 public var docKinds: Set<DocumentKind>?          // ExporterDescriptor
 public var handler: (@MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?)?   // CommandHookDescriptor
 public init(id: String, owner: String, commands: [String], order: Int = 0, handler: @escaping @MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?)
+public var contextHandler: (@MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)?
+public static func guarding(id: String, owner: String, commands: [String], order: Int = 0,
+                            _ body: @escaping @MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?) -> CommandHookDescriptor
 ```
-Replaces: F041 `FeatLayers/LayerCommands.swift` `layer.exportOptions` hook command (extra id, lint warning) + `FeatLayersFeature.swift` hook registration → a closure hook on `export.run` writing `ExportOptionKeys.visibleLayersOnly` / `visibleLayers` (F066 reads them); F044 board item limit enforced only in its own commands → a closure hook on item-creating commands; F051 `FeatStudyIO/StudyExporter.swift` "study.csv" throwing for other kinds → `docKinds: [.studySet]`.
+Closure hooks run before validation and authorization, for every principal and for typed `bus.run` calls. They return replacement params, return nil to let the call through, or throw to veto it. A guard (`contextHandler`) also gets a read-only `CommandContext` of the call: the principal, the session (`ctx.pageOrSession(_:)` resolves session defaults), and `ctx.app` / `ctx.content`. `ctx.mutate` throws inside a guard. Test: `testGuardHookSeesTheCallAndVetoesForEveryPrincipal`.
+Replaces: F041 `FeatLayers/LayerCommands.swift` `layer.exportOptions` hook command (extra id, lint warning) + `FeatLayersFeature.swift` hook registration → a closure hook on `export.run` writing `ExportOptionKeys.visibleLayersOnly` / `visibleLayers` (F066 reads them); F044 board item limit enforced only in its own commands → a `CommandHookDescriptor.guarding` hook on item-creating commands (`ink.addStrokes`, `shape.create`, `clipboard.paste`, …) that counts the target board's items; F051 `FeatStudyIO/StudyExporter.swift` "study.csv" throwing for other kinds → `docKinds: [.studySet]`.
 
 ### G27 — Gateway and bridge
 
@@ -6310,6 +6316,21 @@ public struct CommandHookDescriptor: Registrable {
     /// documents. Lets a feature hook `export.run` (layers) or item-creating commands (board limit) without
     /// registering an extra command id. `command` is ignored when set.
     public var handler: (@MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?)?
+    /// contracts-v2: a native guard that also sees the call: a READ-ONLY `CommandContext` with the caller's principal,
+    /// session and group (`ctx.pageOrSession(_:)` resolves session defaults, `ctx.app` / `ctx.content` reach the app;
+    /// `ctx.mutate` throws). Same contract as `handler` (replacement params, nil, or throw to veto) and preferred over it.
+    /// Runs for every principal and for typed `bus.run` calls. Build with `CommandHookDescriptor.guarding(...)`.
+    public var contextHandler: (@MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)?
+
+    /// contracts-v2: a native guard hook with the call's context (see `contextHandler`), e.g. a board item limit that
+    /// vetoes item-creating commands from any principal.
+    public static func guarding(id: String, owner: String, commands: [String], order: Int = 0,
+                                _ body: @escaping @MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)
+        -> CommandHookDescriptor {
+        var d = CommandHookDescriptor(id: id, owner: owner, commands: commands, command: "", order: order)
+        d.contextHandler = body
+        return d
+    }
 
     public init(id: String, owner: String, commands: [String], command: String, principal: Principal = .user, order: Int = 0) {
         self.id = id
@@ -6665,6 +6686,13 @@ public final class CommandBus {
         let group = inv.group ?? NibID.make().raw
         if !inv.skipHooks {
             for hook in hooks.all where hook.matches(d.id) {
+                if let guardBody = hook.contextHandler {
+                    let hookContext = CommandContext(bus: self, principal: inv.principal, group: group, depth: inv.depth,
+                                                     dryRun: inv.dryRun, session: inv.session, commandID: d.id,
+                                                     title: d.title, readOnly: true, inheritedPolicy: inv.inheritedPolicy)
+                    if let replaced = try await guardBody(d.id, params, hookContext), replaced != .null { params = replaced }
+                    continue
+                }
                 if let handler = hook.handler {
                     if let replaced = try await handler(d.id, params), replaced != .null { params = replaced }
                     continue
@@ -8905,6 +8933,41 @@ public struct TemplateMetrics: Equatable {
     }
 }
 
+/// contracts-v2: ids of the built-in templates (the Templates feature, F005, registers them; `PageRecord` defaults to
+/// `blank`). Templates are optional: check `content.templates.get(id)` and fall back (whiteboard → notebook paper →
+/// blank) when one is missing.
+public enum TemplateIDs {
+    public static let blank = "builtin.blank"
+    public static let dots = "builtin.dots"
+    public static let grid = "builtin.grid"
+    public static let graph = "builtin.graph"
+    public static let isometric = "builtin.isometric"
+    public static let ruled = "builtin.ruled"
+    public static let ruledNarrow = "builtin.ruledNarrow"
+    public static let ruledWide = "builtin.ruledWide"
+    public static let cornell = "builtin.cornell"
+    public static let legalPad = "builtin.legalPad"
+    /// Zoom-adaptive infinite-board backgrounds.
+    public static let whiteboardDots = "builtin.whiteboardDots"
+    public static let whiteboardGrid = "builtin.whiteboardGrid"
+    public static let whiteboardLines = "builtin.whiteboardLines"
+}
+
+/// contracts-v2: parameter names shared by the built-in templates (`TemplateRef.params`, `TemplateParam.name`). A
+/// template declares the ones it honours in `params`; set a value only when `params` contains that name.
+public enum TemplateParamNames {
+    /// Paper colour, "#RRGGBB[AA]" (built-ins also accept a preset name such as "yellow").
+    public static let paper = "paper"
+    /// Rule, grid or dot colour, "#RRGGBB[AA]".
+    public static let line = "line"
+    /// Pattern pitch in points (read by `TemplateDefinition.metrics(for:size:)`).
+    public static let spacing = "spacing"
+    /// Writing margin in points, or `true` for 25 mm (read by `metrics(for:size:)`).
+    public static let margin = "margin"
+    /// Cover colour, "#RRGGBB[AA]".
+    public static let color = "color"
+}
+
 /// A parametric paper or cover template. Built-ins and plugin templates use the same type.
 public struct TemplateDefinition: Registrable {
     public var id: String
@@ -8961,11 +9024,11 @@ public struct TemplateDefinition: Registrable {
         let p = defaults.merging(params) { _, new in new }
         if let f = metricsProvider { return f(p, size) }
         var m = TemplateMetrics()
-        if case let .number(n)? = p["spacing"], n > 0 {
+        if case let .number(n)? = p[TemplateParamNames.spacing], n > 0 {
             m.spacing = n
             m.repeatPeriod = PageSize(n, n)
         }
-        switch p["margin"] {
+        switch p[TemplateParamNames.margin] {
         case .number(let n)?: m.margins = PageInsets(top: n, left: n, bottom: n, right: n)
         case .bool(true)?:
             let mm25 = 25 * 72 / 25.4
@@ -13111,7 +13174,8 @@ enum NameLookupCanary {
         InkingSignal.self, TextRecognitionWord.self, RegistryChange.self, PageInsets.self, TemplateMetrics.self,
         DrawPurpose.self, ExportOptionKeys.self, TextLayoutInfo.self, TextLayoutDescriptor.self, PanelPresentation.self,
         ChromePlacement.self, ChromeSurface.self, ChromeAnchor.self, ChromeContext.self, ChromeOverlayDescriptor.self,
-        DisplayFontWeight.self, NibFragment.self, BridgeNames.self, PanelIDs.self
+        DisplayFontWeight.self, NibFragment.self, BridgeNames.self, PanelIDs.self, ToolbarLayoutSetting.self,
+        TemplateIDs.self, TemplateParamNames.self
     ]
 
     /// Protocols with associated types / Self requirements are checked as generic constraints.
@@ -13579,6 +13643,46 @@ final class ContractsV2Tests: XCTestCase {
         }
     }
 
+    func testGuardHookSeesTheCallAndVetoesForEveryPrincipal() async throws {
+        let h = Harness(features: [V2ProbeFeature.self])
+        var seen: [(principal: String, page: PageID?, session: Bool)] = []
+        var mutateError: NibError?
+        let limit = 1
+        h.app.bus.hooks.register(CommandHookDescriptor.guarding(id: "v2.limit", owner: "test", commands: ["v2probe.create"]) { _, params, ctx in
+            let page = try ctx.pageOrSession(params["page"]?.stringValue)
+            seen.append((ctx.principal.kind, page.page, ctx.activeSession != nil))
+            do { try ctx.mutate { _ in } } catch let e as NibError { mutateError = e }
+            let count = try ctx.app?.workspace.items(page.doc, page: page.page).filter { $0.kind == .sticky }.count ?? 0
+            if count >= limit + 1 { throw NibError(.invalidParams, "board limit reached") }
+            return nil
+        })
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        let before = try h.app.workspace.items(doc, page: page1).filter { $0.kind == .sticky }.count
+        XCTAssertEqual(before, 1, "fixture page 1 has one sticky")
+        _ = try await h.run("v2probe.create")
+        XCTAssertEqual(mutateError?.code, .permissionDenied, "a guard runs read-only")
+        for principal in [Principal.ai("c"), .plugin("dev.test.plugin"), .user] {
+            do {
+                _ = try await h.run("v2probe.create", as: principal)
+                XCTFail("the guard vetoes \(principal.kind)")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams)
+            }
+        }
+        XCTAssertEqual(seen.map { $0.principal }, ["user", "ai", "plugin", "user"])
+        XCTAssertTrue(seen.allSatisfy { $0.page == Fixtures.page1 && $0.session }, "session defaults resolve inside the guard")
+        XCTAssertEqual(try h.app.workspace.items(doc, page: page1).filter { $0.kind == .sticky }.count, 2)
+
+        XCTAssertEqual(TemplateIDs.blank, PageRecord().background.template?.id)
+        XCTAssertEqual(TemplateIDs.whiteboardDots, "builtin.whiteboardDots")
+        let t = TemplateDefinition(id: TemplateIDs.ruled, title: "Ruled", category: "Writing", owner: "test",
+                                   defaults: [TemplateParamNames.spacing: 24, TemplateParamNames.margin: 10]) { _, _, _ in
+            TemplateRender(paper: .white)
+        }
+        XCTAssertEqual(t.metrics(for: [:], size: nil).spacing, 24)
+        XCTAssertEqual(t.metrics(for: [:], size: nil).margins?.left, 10)
+    }
+
     func testGatewayPerKindPresenterAndPolicy() async throws {
         let h = Harness(features: [V2ProbeFeature.self])
         let bridgeConfirmer = AutoConfirm()
@@ -13881,7 +13985,7 @@ final class ContractsV2Tests: XCTestCase {
     }
 
     func testPresetsTapeRefsSelectionOutlineAndToolbarLayout() async throws {
-        let partial = try JSONValue.parse(#"{"swatches":[{"color":"#112233"}],"widths":[1,2,3]}"#).decode(ToolPresets.self)
+        let partial = try JSONValue.parse(##"{"swatches":[{"color":"#112233"}],"widths":[1,2,3]}"##).decode(ToolPresets.self)
         XCTAssertEqual(partial.patterns, [.solid, .solid, .solid])
         XCTAssertEqual(partial.selectedWidth, 1)
         XCTAssertThrowsError(try JSONValue.parse(#"{"widths":[1]}"#).decode(ToolPresets.self))

@@ -167,6 +167,41 @@ public struct TemplateMetrics: Equatable {
     }
 }
 
+/// contracts-v2: ids of the built-in templates (the Templates feature, F005, registers them; `PageRecord` defaults to
+/// `blank`). Templates are optional: check `content.templates.get(id)` and fall back (whiteboard → notebook paper →
+/// blank) when one is missing.
+public enum TemplateIDs {
+    public static let blank = "builtin.blank"
+    public static let dots = "builtin.dots"
+    public static let grid = "builtin.grid"
+    public static let graph = "builtin.graph"
+    public static let isometric = "builtin.isometric"
+    public static let ruled = "builtin.ruled"
+    public static let ruledNarrow = "builtin.ruledNarrow"
+    public static let ruledWide = "builtin.ruledWide"
+    public static let cornell = "builtin.cornell"
+    public static let legalPad = "builtin.legalPad"
+    /// Zoom-adaptive infinite-board backgrounds.
+    public static let whiteboardDots = "builtin.whiteboardDots"
+    public static let whiteboardGrid = "builtin.whiteboardGrid"
+    public static let whiteboardLines = "builtin.whiteboardLines"
+}
+
+/// contracts-v2: parameter names shared by the built-in templates (`TemplateRef.params`, `TemplateParam.name`). A
+/// template declares the ones it honours in `params`; set a value only when `params` contains that name.
+public enum TemplateParamNames {
+    /// Paper colour, "#RRGGBB[AA]" (built-ins also accept a preset name such as "yellow").
+    public static let paper = "paper"
+    /// Rule, grid or dot colour, "#RRGGBB[AA]".
+    public static let line = "line"
+    /// Pattern pitch in points (read by `TemplateDefinition.metrics(for:size:)`).
+    public static let spacing = "spacing"
+    /// Writing margin in points, or `true` for 25 mm (read by `metrics(for:size:)`).
+    public static let margin = "margin"
+    /// Cover colour, "#RRGGBB[AA]".
+    public static let color = "color"
+}
+
 /// A parametric paper or cover template. Built-ins and plugin templates use the same type.
 public struct TemplateDefinition: Registrable {
     public var id: String
@@ -223,11 +258,11 @@ public struct TemplateDefinition: Registrable {
         let p = defaults.merging(params) { _, new in new }
         if let f = metricsProvider { return f(p, size) }
         var m = TemplateMetrics()
-        if case let .number(n)? = p["spacing"], n > 0 {
+        if case let .number(n)? = p[TemplateParamNames.spacing], n > 0 {
             m.spacing = n
             m.repeatPeriod = PageSize(n, n)
         }
-        switch p["margin"] {
+        switch p[TemplateParamNames.margin] {
         case .number(let n)?: m.margins = PageInsets(top: n, left: n, bottom: n, right: n)
         case .bool(true)?:
             let mm25 = 25 * 72 / 25.4

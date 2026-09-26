@@ -386,7 +386,7 @@ struct PageRotate: NibCommand {                         // conformers are @MainA
 | Nested (inside a command) | `try await ctx.execute("shape.recognize", …)` | caller's | full, same group |
 | Plugins / AI / bridge | `bus.execute(Invocation(command:params:principal:group:dryRun:readOnly:))` | `.plugin(id)` / `.ai(chat)` / `.bridge(client)` | schema validation, exposure, scopes, locked documents, confirmation |
 
-Every JSON and typed call also runs the registered **command hooks** (`app.bus.hooks`: read-only hook commands that may transform the params or veto). A nested call to a command that is not registered (a disabled feature, or a stub during fan-out) throws `unavailable`, not `not_found`, so callers can treat it as an optional dependency.
+Every JSON and typed call also runs the registered **command hooks** (`app.bus.hooks`: read-only hook commands that may transform the params or veto). Hooks run before validation and authorization, for every principal. Since contracts-v2, features can also hook with a closure instead of an extra command id. `CommandHookDescriptor(id:owner:commands:order:handler:)` sees the command id and params. `CommandHookDescriptor.guarding(id:owner:commands:order:_:)` also gets a read-only `CommandContext` of the call (principal, session defaults, `ctx.app`), for example a board item limit that vetoes `ink.addStrokes` from anyone. A nested call to a command that is not registered (a disabled feature, or a stub during fan-out) throws `unavailable`, not `not_found`, so callers can treat it as an optional dependency.
 
 **Dry run.** `dryRun: true` runs the command, collects the `ChangeSummary`, then rolls back. Nothing is persisted, recorded or emitted. AI previews and `plugin.run` use it.
 

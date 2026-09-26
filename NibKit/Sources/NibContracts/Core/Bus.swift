@@ -53,6 +53,21 @@ public struct CommandHookDescriptor: Registrable {
     /// documents. Lets a feature hook `export.run` (layers) or item-creating commands (board limit) without
     /// registering an extra command id. `command` is ignored when set.
     public var handler: (@MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?)?
+    /// contracts-v2: a native guard that also sees the call: a READ-ONLY `CommandContext` with the caller's principal,
+    /// session and group (`ctx.pageOrSession(_:)` resolves session defaults, `ctx.app` / `ctx.content` reach the app;
+    /// `ctx.mutate` throws). Same contract as `handler` (replacement params, nil, or throw to veto) and preferred over it.
+    /// Runs for every principal and for typed `bus.run` calls. Build with `CommandHookDescriptor.guarding(...)`.
+    public var contextHandler: (@MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)?
+
+    /// contracts-v2: a native guard hook with the call's context (see `contextHandler`), e.g. a board item limit that
+    /// vetoes item-creating commands from any principal.
+    public static func guarding(id: String, owner: String, commands: [String], order: Int = 0,
+                                _ body: @escaping @MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)
+        -> CommandHookDescriptor {
+        var d = CommandHookDescriptor(id: id, owner: owner, commands: commands, command: "", order: order)
+        d.contextHandler = body
+        return d
+    }
 
     public init(id: String, owner: String, commands: [String], command: String, principal: Principal = .user, order: Int = 0) {
         self.id = id
@@ -408,6 +423,13 @@ public final class CommandBus {
         let group = inv.group ?? NibID.make().raw
         if !inv.skipHooks {
             for hook in hooks.all where hook.matches(d.id) {
+                if let guardBody = hook.contextHandler {
+                    let hookContext = CommandContext(bus: self, principal: inv.principal, group: group, depth: inv.depth,
+                                                     dryRun: inv.dryRun, session: inv.session, commandID: d.id,
+                                                     title: d.title, readOnly: true, inheritedPolicy: inv.inheritedPolicy)
+                    if let replaced = try await guardBody(d.id, params, hookContext), replaced != .null { params = replaced }
+                    continue
+                }
                 if let handler = hook.handler {
                     if let replaced = try await handler(d.id, params), replaced != .null { params = replaced }
                     continue

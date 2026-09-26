@@ -90,7 +90,8 @@ enum NameLookupCanary {
         InkingSignal.self, TextRecognitionWord.self, RegistryChange.self, PageInsets.self, TemplateMetrics.self,
         DrawPurpose.self, ExportOptionKeys.self, TextLayoutInfo.self, TextLayoutDescriptor.self, PanelPresentation.self,
         ChromePlacement.self, ChromeSurface.self, ChromeAnchor.self, ChromeContext.self, ChromeOverlayDescriptor.self,
-        DisplayFontWeight.self, NibFragment.self, BridgeNames.self, PanelIDs.self
+        DisplayFontWeight.self, NibFragment.self, BridgeNames.self, PanelIDs.self, ToolbarLayoutSetting.self,
+        TemplateIDs.self, TemplateParamNames.self
     ]
 
     /// Protocols with associated types / Self requirements are checked as generic constraints.

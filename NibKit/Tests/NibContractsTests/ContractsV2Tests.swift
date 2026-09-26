@@ -420,6 +420,46 @@ final class ContractsV2Tests: XCTestCase {
         }
     }
 
+    func testGuardHookSeesTheCallAndVetoesForEveryPrincipal() async throws {
+        let h = Harness(features: [V2ProbeFeature.self])
+        var seen: [(principal: String, page: PageID?, session: Bool)] = []
+        var mutateError: NibError?
+        let limit = 1
+        h.app.bus.hooks.register(CommandHookDescriptor.guarding(id: "v2.limit", owner: "test", commands: ["v2probe.create"]) { _, params, ctx in
+            let page = try ctx.pageOrSession(params["page"]?.stringValue)
+            seen.append((ctx.principal.kind, page.page, ctx.activeSession != nil))
+            do { try ctx.mutate { _ in } } catch let e as NibError { mutateError = e }
+            let count = try ctx.app?.workspace.items(page.doc, page: page.page).filter { $0.kind == .sticky }.count ?? 0
+            if count >= limit + 1 { throw NibError(.invalidParams, "board limit reached") }
+            return nil
+        })
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        let before = try h.app.workspace.items(doc, page: page1).filter { $0.kind == .sticky }.count
+        XCTAssertEqual(before, 1, "fixture page 1 has one sticky")
+        _ = try await h.run("v2probe.create")
+        XCTAssertEqual(mutateError?.code, .permissionDenied, "a guard runs read-only")
+        for principal in [Principal.ai("c"), .plugin("dev.test.plugin"), .user] {
+            do {
+                _ = try await h.run("v2probe.create", as: principal)
+                XCTFail("the guard vetoes \(principal.kind)")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams)
+            }
+        }
+        XCTAssertEqual(seen.map { $0.principal }, ["user", "ai", "plugin", "user"])
+        XCTAssertTrue(seen.allSatisfy { $0.page == Fixtures.page1 && $0.session }, "session defaults resolve inside the guard")
+        XCTAssertEqual(try h.app.workspace.items(doc, page: page1).filter { $0.kind == .sticky }.count, 2)
+
+        XCTAssertEqual(TemplateIDs.blank, PageRecord().background.template?.id)
+        XCTAssertEqual(TemplateIDs.whiteboardDots, "builtin.whiteboardDots")
+        let t = TemplateDefinition(id: TemplateIDs.ruled, title: "Ruled", category: "Writing", owner: "test",
+                                   defaults: [TemplateParamNames.spacing: 24, TemplateParamNames.margin: 10]) { _, _, _ in
+            TemplateRender(paper: .white)
+        }
+        XCTAssertEqual(t.metrics(for: [:], size: nil).spacing, 24)
+        XCTAssertEqual(t.metrics(for: [:], size: nil).margins?.left, 10)
+    }
+
     func testGatewayPerKindPresenterAndPolicy() async throws {
         let h = Harness(features: [V2ProbeFeature.self])
         let bridgeConfirmer = AutoConfirm()
@@ -722,7 +762,7 @@ final class ContractsV2Tests: XCTestCase {
     }
 
     func testPresetsTapeRefsSelectionOutlineAndToolbarLayout() async throws {
-        let partial = try JSONValue.parse(#"{"swatches":[{"color":"#112233"}],"widths":[1,2,3]}"#).decode(ToolPresets.self)
+        let partial = try JSONValue.parse(##"{"swatches":[{"color":"#112233"}],"widths":[1,2,3]}"##).decode(ToolPresets.self)
         XCTAssertEqual(partial.patterns, [.solid, .solid, .solid])
         XCTAssertEqual(partial.selectedWidth, 1)
         XCTAssertThrowsError(try JSONValue.parse(#"{"widths":[1]}"#).decode(ToolPresets.self))
