@@ -185,6 +185,9 @@ final class DropletField {
     @ObservationIgnored private var nextSatellite = 0
     @ObservationIgnored private var stroke: CGRect = .null
     @ObservationIgnored private var backdrop: [CGRect] = []
+    /// A dockable droplet's meniscus to the dock it reaches for (DESIGN.md §10.11), by droplet id. `DockMeniscus`
+    /// (DropletDock.swift) owns its rules; the field steps it and draws it as one of that droplet's necks.
+    @ObservationIgnored private var meniscuses: [String: DockMeniscus] = [:]
 
     // Observed by the leaf layers only (water, frost, necks), and written only when they change.
     private(set) var clusters: [WaterCluster] = []
@@ -805,6 +808,16 @@ final class DropletField {
 
     // MARK: Necks and clusters
 
+    /// Where droplet `id`'s meniscus reaches (a dock frame), or nil to let it go.
+    func setMeniscus(_ id: String, towards dock: CGRect?) {
+        if meniscuses[id] == nil && dock == nil { return }
+        var m = meniscuses[id] ?? DockMeniscus()
+        guard m.target != dock else { return }
+        m.target = dock
+        meniscuses[id] = m
+        wake()
+    }
+
     private func neckParams(_ a: Entry, _ b: Entry) -> NeckParams? {
         let budNeck = NeckParams(join: metrics.mergeDistance, t0: 30, off: metrics.budNeckOff)
         if let bud = b.bud, bud.owner == a.id { return budNeck }
@@ -859,6 +872,19 @@ final class DropletField {
                                                     .of(b.style.material, paper: b.style.refracts ? paperShare(boxB) : 0))))
                 }
             }
+        }
+        for (id, var m) in meniscuses {
+            guard let e = entries[id], e.hasRest else {
+                meniscuses[id] = nil
+                continue
+            }
+            let box = visualBox(e)
+            if m.step(dt, body: box, enabled: necksOn && isDrawn(e), minimumNeck: metrics.minimumNeck) { busy = true }
+            if let s = m.segment {
+                result.append(Neck(id: id + "|" + DockMeniscus.neckID, from: s.from, to: s.to, thickness: s.thickness,
+                                   colour: .of(e.style.material, paper: e.style.refracts ? paperShare(box) : 0)))
+            }
+            meniscuses[id] = m.isIdle ? nil : m
         }
         links = linked
         if result != necks { necks = result }

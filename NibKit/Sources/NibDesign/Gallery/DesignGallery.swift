@@ -15,13 +15,14 @@ import NibContracts
 ///   a press squashes the droplet (poke) and scales the control to 0.96.
 public struct DesignGallery: View {
     enum Page: String, CaseIterable, Hashable {
-        case liquid, components, tokens
+        case liquid, components, tokens, dock
 
         var title: String {
             switch self {
             case .liquid: return String(localized: "Liquid", bundle: .module)
             case .components: return String(localized: "Components", bundle: .module)
             case .tokens: return String(localized: "Tokens", bundle: .module)
+            case .dock: return String(localized: "Dock and reflow", bundle: .module)
             }
         }
     }
@@ -38,6 +39,8 @@ public struct DesignGallery: View {
             switch page {
             case .liquid:
                 GalleryLiquid()
+            case .dock:
+                DockAndReflowDemo()
             case .components:
                 ScrollView {
                     VStack(spacing: 0) {
