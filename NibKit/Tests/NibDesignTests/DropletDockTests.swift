@@ -262,4 +262,64 @@ final class DropletDockTests: XCTestCase {
         XCTAssertEqual(l.check(body: CGPoint(x: 1, y: 1), settling: true, now: 0.2), .arrived)
         XCTAssertEqual(l.check(body: CGPoint(x: 50, y: 0), settling: false, now: 0.2), .arrived)   // came to rest
     }
+
+    // MARK: Moving between docks, whatever moved the dock
+
+    private let left = NibPaletteDock(edge: .leading, along: 0.5)
+    private let right = NibPaletteDock(edge: .trailing, along: 0.5)
+    private let top = NibPaletteDock(edge: .top, along: 0.3)
+    private let bottom = NibPaletteDock(edge: .bottom, along: 0.5)
+
+    /// A dock change the palette did not make itself (a "Move palette to…" action, `toolbar.dock`, a size class) moves
+    /// it as a release does: to the other axis it re-forms, along the same axis it only slides (DESIGN.md §10.10).
+    func testAnExternalDockChangeReformsAcrossAxesAndSlidesAlongOne() {
+        XCTAssertEqual(DockTransition.plan(from: left, to: bottom), .reform)
+        XCTAssertEqual(DockTransition.plan(from: top, to: right), .reform)
+        XCTAssertEqual(DockTransition.plan(from: left, to: right), .slide)
+        XCTAssertEqual(DockTransition.plan(from: bottom, to: top), .slide)
+        XCTAssertEqual(DockTransition.plan(from: bottom, to: NibPaletteDock(edge: .bottom, along: 0.8)), .slide)
+        XCTAssertEqual(DockTransition.plan(from: left, to: left), .stay)
+        // Split View narrowing to compact takes the side docks away: the left dock shows at the bottom, a re-form.
+        XCTAssertEqual(iPhone.validated(left), bottom)
+        XCTAssertEqual(DockTransition.plan(from: left, to: iPhone.validated(left)), .reform)
+    }
+
+    func testReduceMotionCrossFadesEveryMove() {
+        XCTAssertEqual(DockTransition.plan(from: left, to: bottom, reduced: true), .crossFade)
+        XCTAssertEqual(DockTransition.plan(from: left, to: right, reduced: true), .crossFade)
+        XCTAssertEqual(DockTransition.plan(from: left, to: left, reduced: true), .stay)
+    }
+
+    /// A change that arrives mid re-form never strands the body as a bead: a running gather re-aims along the axis it
+    /// is heading for; a change back to the axis it is leaving, or one before the gather starts or once it spreads,
+    /// waits for the re-form to end.
+    func testAChangeDuringAReformReaimsOrWaits() {
+        XCTAssertEqual(DockTransition.plan(from: left, to: bottom, reforming: bottom, phase: .gathering), .stay)
+        XCTAssertEqual(DockTransition.plan(from: left, to: top, reforming: bottom, phase: .gathering), .retarget)
+        XCTAssertEqual(DockTransition.plan(from: left, to: left, reforming: bottom, phase: .gathering), .wait)
+        XCTAssertEqual(DockTransition.plan(from: left, to: right, reforming: bottom, phase: .gathering), .wait)
+        XCTAssertEqual(DockTransition.plan(from: left, to: top, reforming: bottom, phase: .gathering, reduced: true),
+                       .retarget)
+        XCTAssertEqual(DockTransition.plan(from: left, to: top, reforming: bottom, phase: .idle), .wait)      // unbegun
+        XCTAssertEqual(DockTransition.plan(from: left, to: top, reforming: bottom, phase: .spreading), .wait) // spread
+        // Spreading at the bottom: along its axis it slides at once; across it waits for the spread to end.
+        XCTAssertEqual(DockTransition.plan(from: bottom, to: top, phase: .spreading), .slide)
+        XCTAssertEqual(DockTransition.plan(from: bottom, to: left, phase: .spreading), .wait)
+        XCTAssertEqual(DockTransition.plan(from: bottom, to: bottom, phase: .spreading), .stay)
+        XCTAssertEqual(DockTransition.plan(from: bottom, to: top, phase: .gathering), .wait)
+        // Once it rests, the move that waited runs as usual.
+        XCTAssertEqual(DockTransition.plan(from: bottom, to: left, phase: .idle), .reform)
+    }
+
+    /// Only the palette's own release, reaching the binding, carries the release velocity (and the plip); a move from
+    /// anywhere else starts from rest, so a release never animates twice.
+    func testOnlyTheReleaseItselfCarriesItsVelocity() {
+        let released = NibPaletteDock(edge: .bottom, along: 0.42)
+        let own = OwnRelease(dock: released, velocity: CGVector(dx: 0, dy: 900),
+                             landing: DockLanding(centre: CGPoint(x: 400, y: 770), since: 10))
+        XCTAssertTrue(own.claims(released, now: 10.02))
+        XCTAssertFalse(own.claims(bottom, now: 10.02))                // an action's centred dock is not the release
+        XCTAssertTrue(own.claims(released, now: 10 + DropletDockModel.arrivalTimeout))
+        XCTAssertFalse(own.claims(released, now: 12))                 // a binding that took longer moves from rest
+    }
 }

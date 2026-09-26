@@ -331,6 +331,63 @@ struct DockLanding: Equatable {
     }
 }
 
+/// How a dockable droplet goes from the dock its content is laid out for to the dock it should rest in (DESIGN.md
+/// §10.10), whatever moved the dock: its own release, a "Move palette to…" action, `toolbar.dock` (⌘K, a plugin, the
+/// assistant, an undo) or a size class that takes the side docks away. It always starts from where the body is on
+/// screen.
+enum DockTransition: Equatable {
+    /// Already there, or already on its way there.
+    case stay
+    /// Same axis: lay the content out at the new dock at once; the body flows there from where it is (FLIP, `snap`).
+    case slide
+    /// Other axis: gather into a bead towards the new dock, switch the layout at the midpoint while the content is
+    /// invisible, spread (≤ 380 ms).
+    case reform
+    /// The field is gathering towards another dock of the new dock's axis: aim the bead at the new dock instead.
+    case retarget
+    /// A re-form is under way and cannot take this dock: let it finish, then move on from where the droplet rests. (A
+    /// gather that turned back, or one re-aimed once it spreads, would leave the body a bead: the layout it spreads
+    /// into must change as the spread starts.)
+    case wait
+    /// Reduce Motion and Liquid Off: fade out, move while invisible, fade in.
+    case crossFade
+
+    /// - Parameters:
+    ///   - shown: the dock the content is laid out for.
+    ///   - next: the dock to rest in.
+    ///   - reforming: the dock a re-form this droplet started will spread into, until the spread starts.
+    ///   - phase: the re-form phase the field last published for the droplet.
+    ///   - reduced: Reduce Motion or Liquid Off.
+    static func plan(from shown: NibPaletteDock, to next: NibPaletteDock, reforming: NibPaletteDock? = nil,
+                     phase: DropletField.ReshapePhase = .idle, reduced: Bool = false) -> DockTransition {
+        if let reforming {
+            if next == reforming { return .stay }
+            // Only a gather the field is running takes a new aim: one not started yet, or already spreading, cannot.
+            return phase == .gathering && next.isVertical == reforming.isVertical ? .retarget : .wait
+        }
+        if next == shown { return .stay }
+        let turns = next.isVertical != shown.isVertical
+        switch phase {
+        case .gathering: return .wait
+        case .spreading: return turns ? .wait : .slide
+        case .idle: return reduced ? .crossFade : (turns ? .reform : .slide)
+        }
+    }
+}
+
+/// A dockable's own release until its dock binding takes the dock it chose. The move that follows is the release's: it
+/// re-forms from the release velocity (and the cross-fade arms the plip). Any other move starts from rest.
+struct OwnRelease: Equatable {
+    var dock: NibPaletteDock
+    var velocity: CGVector
+    var landing: DockLanding
+
+    /// True when the dock change `next` is this release reaching the binding, within the 1.5 s a landing waits.
+    func claims(_ next: NibPaletteDock, now: CFTimeInterval) -> Bool {
+        next == dock && now - landing.since <= DropletDockModel.arrivalTimeout
+    }
+}
+
 /// Drives one dockable droplet of a container: hold, meniscus, release to a dock. The palette and every other
 /// dockable use it, so they feel the same.
 struct DropletDockDriver {
@@ -510,8 +567,8 @@ struct DropletDockableModifier: ViewModifier {
                 }
             }
         }
-        .background(ReshapeWatcher(node: field?.node(id)) {
-            if let pending {
+        .background(ReshapeWatcher(node: field?.node(id)) { phase in
+            if phase == .spreading, let pending {
                 laidOut = pending
                 self.pending = nil
             }
