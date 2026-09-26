@@ -132,36 +132,90 @@ enum StickyFormat {
 enum StickyActions {
     static let log = Logger(subsystem: "app.nib", category: "sticky")
 
+    /// The text feature's command (F026), which may be missing or refuse a note.
+    static let textSetText = "text.setText"
+
     /// Runs a command as the user in an optional undo group; a failure is logged and toasted by the shell.
     @discardableResult
     static func run(_ app: NibApp, _ command: String, _ params: JSONValue, session: EditorSession?,
                     group: String? = nil) async -> InvocationResult? {
         do {
-            return try await app.bus.execute(Invocation(command: command, params: params, principal: .user,
-                                                        session: session ?? app.services.sessions.active, group: group))
+            return try await execute(app, command, params, session: session, group: group)
         } catch {
-            let e = NibError.wrap(error)
-            log.error("\(command, privacy: .public) failed: \(e.description, privacy: .public)")
-            NotificationCenter.default.post(name: .nibCommandFailed, object: app, userInfo: ["command": command, "error": e])
+            report(app, command, NibError.wrap(error))
             return nil
         }
     }
 
-    /// Stores a note's rich text with `text.setText` (the text feature), or `item.update` when that is not installed.
+    private static func execute(_ app: NibApp, _ command: String, _ params: JSONValue, session: EditorSession?,
+                                group: String?) async throws -> InvocationResult {
+        try await app.bus.execute(Invocation(command: command, params: params, principal: .user,
+                                             session: session ?? app.services.sessions.active, group: group))
+    }
+
+    private static func report(_ app: NibApp, _ command: String, _ e: NibError) {
+        log.error("\(command, privacy: .public) failed: \(e.description, privacy: .public)")
+        NotificationCenter.default.post(name: .nibCommandFailed, object: app, userInfo: ["command": command, "error": e])
+    }
+
+    /// Errors from `text.setText` after which the note's text is saved with `item.update` instead: the command is not
+    /// installed (the app runs with any subset of features) or does not take this note.
+    static func fallsBack(_ e: NibError) -> Bool {
+        switch e.code {
+        case .unavailable, .unsupported, .invalidParams, .notFound: return true
+        default: return false
+        }
+    }
+
+    /// Stores a note's rich text with `text.setText` (the text feature), or with `item.update` on the note's
+    /// `sticky.text` when that command is missing or refuses the note. Only a failure of both is reported (and toasted).
     @discardableResult
     static func setText(_ app: NibApp, ref: String, text: RichText, session: EditorSession?, group: String?) async -> Bool {
         guard let json = try? JSONValue.from(text) else { return false }
-        if app.commands.entry("text.setText") != nil {
-            return await run(app, "text.setText", ["ref": .string(ref), "text": json], session: session, group: group) != nil
+        if app.commands.entry(textSetText) != nil {
+            do {
+                _ = try await execute(app, textSetText, ["ref": .string(ref), "text": json], session: session, group: group)
+                return true
+            } catch {
+                let e = NibError.wrap(error)
+                guard fallsBack(e) else {
+                    report(app, textSetText, e)
+                    return false
+                }
+                log.info("text.setText declined \(ref, privacy: .public) (\(e.code.rawValue, privacy: .public)); saving with item.update")
+            }
         }
-        return await run(app, CommandIDs.itemUpdate, ["ref": .string(ref), "patch": ["text": json]],
+        return await run(app, CommandIDs.itemUpdate, ["ref": .string(ref), "patch": ["sticky": ["text": json]]],
                          session: session, group: group) != nil
+    }
+
+    /// Whole-note formatting (the inspector): applies `change` to each note's text as it is when the action runs, not
+    /// as it was when the inspector opened, so an undo, a collaborator's, a sync merge's or the AI's edit since then is
+    /// kept. Notes that are gone, locked or unchanged are skipped; the rest are saved in one undo group. Returns the
+    /// texts saved, by ref.
+    @discardableResult
+    static func format(_ app: NibApp, refs: [String], session: EditorSession?,
+                       _ change: (RichText) -> RichText) async -> [String: RichText] {
+        var writes: [(ref: String, text: RichText)] = []
+        for ref in refs {
+            guard case let .item(doc, page, id)? = NodeRef(ref),
+                  let item = try? app.workspace.item(doc, page: page, id: id), !item.deleted, !item.locked,
+                  let note = item.sticky else { continue }
+            let new = change(note.text)
+            if new != note.text { writes.append((ref, new)) }
+        }
+        let group = NibID.make().raw
+        var saved: [String: RichText] = [:]
+        for w in writes {
+            if await setText(app, ref: w.ref, text: w.text, session: session, group: group) { saved[w.ref] = w.text }
+        }
+        return saved
     }
 }
 
 // MARK: - The editing overlay
 
-/// The note's text view: Escape or ⌘Return finishes editing.
+/// The note's text view: Escape, ⌘Return or the VoiceOver scrub gesture finishes editing.
 final class StickyTextView: UITextView {
     var onDone: (() -> Void)?
 
@@ -171,6 +225,13 @@ final class StickyTextView: UITextView {
         let done = UIKeyCommand(input: "\r", modifierFlags: .command, action: #selector(finish))
         done.discoverabilityTitle = String(localized: "Done")
         return (super.keyCommands ?? []) + [escape, done]
+    }
+
+    /// VoiceOver's escape (the two-finger scrub) finishes editing without a hardware keyboard.
+    override func accessibilityPerformEscape() -> Bool {
+        guard let done = onDone else { return false }
+        done()
+        return true
     }
 
     @objc private func finish() { onDone?() }
@@ -205,7 +266,7 @@ final class StickyNoteView: UIView {
         textView.allowsEditingTextAttributes = true            // ⌘B / ⌘I / ⌘U and the edit menu's formatting
         textView.tintColor = NibUIColor.accent
         textView.accessibilityLabel = String(localized: "Sticky note")
-        textView.accessibilityHint = String(localized: "Press Escape to finish editing.")
+        textView.accessibilityHint = String(localized: "Scrub or press Escape to finish editing.")
         addSubview(textView)
     }
 
@@ -321,7 +382,7 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
               !note.collapsed, !item.locked else { return }
         open(doc: doc, page: page, id: id, note: note, isDraft: false, host: host)
         host.setHidden([id], page: page)
-        host.session.editor?.reveal(page: page, rect: item.bounds, animated: true)
+        reveal(note, page: page, host: host)
     }
 
     /// Places a new note (the tool) and opens it for typing at once; it is created when editing finishes.
@@ -329,6 +390,12 @@ final class StickyEditor: NSObject, CanvasAttachment, UITextViewDelegate {
         guard let host = self.host, host.documentID == doc else { return }
         endEditing(save: true)
         open(doc: doc, page: page, id: NibID.make(), note: note, isDraft: true, host: host)
+        reveal(note, page: page, host: host)
+    }
+
+    /// Scrolls the note into view above the keyboard (without animation under Reduce Motion).
+    private func reveal(_ note: StickyItem, page: PageID, host: CanvasHost) {
+        host.session.editor?.reveal(page: page, rect: note.frame.bounds, animated: !UIAccessibility.isReduceMotionEnabled)
     }
 
     private func open(doc: DocumentID, page: PageID, id: ElementID, note: StickyItem, isDraft: Bool, host: CanvasHost) {

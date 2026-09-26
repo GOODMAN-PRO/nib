@@ -5,7 +5,9 @@ import NibDesign
 /// F036 Sticky notes (T-071, T-107): the "sticky" canvas tool (key N) with its colour options and settings, the
 /// "sticky" item drawer (a collapsed note draws as an icon, in exports too), in-place text editing, the tap handlers
 /// that expand a collapsed note or edit the selected one, author signatures (`NibSettings.authorName`), resolve, the
-/// sticky-note inspector, object-menu and page long-press entries, and attaching items dropped onto a note.
+/// sticky-note inspector, object-menu and page long-press entries, and letting go of a deleted note's children.
+/// Items dropped onto a note are not attached automatically: that follow-up would rewrite the dropped item in the
+/// drop's own undo group, which the core's undo cannot revert fully (see `StickyOrphans`).
 /// Commands: sticky.create, sticky.setCollapsed, sticky.resolve, sticky.setColor (edit) and sticky.tapAt (session).
 public enum FeatStickyFeature: NibFeature {
     public static let id = "sticky"
@@ -55,11 +57,11 @@ public enum FeatStickyFeature: NibFeature {
         registerMenus(app)
     }
 
-    /// Installs the observer that attaches items dropped onto a note (`StickyAttach`).
+    /// Installs the observer that lets go of a deleted note's children (`StickyOrphans`).
     public static func start(_ app: NibApp) async {
         app.bus.observeCommits { [weak app] cs in
             guard let app else { return }
-            StickyAttach.commitDidHappen(cs, app: app)
+            StickyOrphans.commitDidHappen(cs, app: app)
         }
     }
 

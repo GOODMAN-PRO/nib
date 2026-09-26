@@ -25,6 +25,7 @@ private final class FakeEditor: DocumentEditing {
 final class FeatStickyTests: XCTestCase {
     private let pageRef = "page:FIXTUREDOC01/FIXTUREPG001"
     private let stickyRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTY01"
+    private let imageRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREIMG01"
 
     private func harness() -> Harness { Harness(features: [FeatStickyFeature.self]) }
 
@@ -44,6 +45,53 @@ final class FeatStickyTests: XCTestCase {
                 it.sticky?.text = text
                 return try tx.put(it, doc: doc, page: page)
             }
+            return [:]
+        }
+    }
+
+    /// F003's `item.update` stand-in: encode the item, deep-merge the patch, decode (no key routing), like the real
+    /// command; an `attachedTo` item ref becomes its id.
+    private func installItemUpdateStandIn(_ h: Harness) {
+        let d = CommandDescriptor(id: CommandIDs.itemUpdate, title: "Update Item", summary: "Test stand-in.",
+                                  params: .obj(["ref": .ref, "patch": .anything()], required: ["ref", "patch"]), effect: .edit)
+        h.app.commands.register(d) { json, ctx in
+            guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }
+            var patch = json["patch"] ?? [:]
+            if case .object(var o) = patch, case let .item(_, _, parent)? = NodeRef(o["attachedTo"]?.stringValue ?? "") {
+                o["attachedTo"] = .string(parent.raw)
+                patch = .object(o)
+            }
+            let new = try JSONValue.from(ctx.workspace.item(doc, page: page, id: id)).merging(patch).decode(Item.self)
+            try ctx.mutate { tx -> Item in try tx.put(new, doc: doc, page: page) }
+            return [:]
+        }
+    }
+
+    /// F012's `item.transform` stand-in: moves an image by (dx, dy).
+    private func installTransformStandIn(_ h: Harness) {
+        let d = CommandDescriptor(id: CommandIDs.itemTransform, title: "Transform", summary: "Test stand-in.",
+                                  params: .obj(["ref": .ref, "dx": .num(), "dy": .num()], required: ["ref", "dx", "dy"]),
+                                  effect: .edit)
+        h.app.commands.register(d) { json, ctx in
+            guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }
+            let dx = json["dx"]?.doubleValue ?? 0, dy = json["dy"]?.doubleValue ?? 0
+            try ctx.mutate { tx -> Item in
+                var it = try tx.item(doc, page: page, id: id)
+                it.image?.frame.x += dx
+                it.image?.frame.y += dy
+                return try tx.put(it, doc: doc, page: page)
+            }
+            return [:]
+        }
+    }
+
+    /// F003's `item.delete` stand-in: tombstones one item.
+    private func installDeleteStandIn(_ h: Harness) {
+        let d = CommandDescriptor(id: CommandIDs.itemDelete, title: "Delete", summary: "Test stand-in.",
+                                  params: .obj(["ref": .ref], required: ["ref"]), effect: .edit)
+        h.app.commands.register(d) { json, ctx in
+            guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }
+            try ctx.mutate { tx in try tx.delete(item: id, doc: doc, page: page) }
             return [:]
         }
     }
@@ -203,43 +251,119 @@ final class FeatStickyTests: XCTestCase {
         XCTAssertFalse(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2).contains { $0.kind == .sticky })
     }
 
-    func testItemsDroppedOnAnExpandedNoteAttachAndDetach() {
-        let note = Item(id: "NOTE", kind: .sticky, z: "V", sticky: StickyItem(frame: Frame(x: 100, y: 100, w: 160, h: 160)))
-        let under = Item(id: "UNDER", kind: .shape, z: "G",
-                         shape: ShapeItem(shape: .rectangle, frame: Frame(x: 150, y: 150, w: 40, h: 30)))
-        var box = Item(id: "BOX", kind: .shape, z: "k", shape: ShapeItem(shape: .rectangle, frame: Frame(x: 150, y: 150, w: 40, h: 30)))
-        let ink = Item(id: "INK", kind: .connector, z: "m",
-                       connector: ConnectorItem(from: ConnectorEnd(point: Point(160, 160)), to: ConnectorEnd(point: Point(170, 170))))
-        typealias Change = StickyAttach.Change
+    func testDroppingAnItemOnANoteIsUndoneInOneStep() async throws {
+        let h = harness()
+        installItemUpdateStandIn(h)
+        installTransformStandIn(h)
+        await FeatStickyFeature.start(h.app)
+        let before = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
+        // The image (above the note) is dragged so its centre lands in the middle of the note.
+        try await h.run("item.transform", ["ref": .string(imageRef), "dx": 118, "dy": -322])
+        try await settle()
+        let dropped = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
+        XCTAssertEqual(dropped.image?.frame.center, Point(470, 190))
+        XCTAssertNil(dropped.attachedTo)                                        // no second write of the dropped item
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
 
-        // Dropped onto the note: attached. Items beneath the note and connectors are not "on" it.
-        XCTAssertEqual(StickyAttach.plan(moved: [box, under, ink], created: [], deletedNotes: [], pageItems: [under, note, box, ink]),
-                       [Change(item: "BOX", parent: "NOTE")])
-        // Moved off it: detached.
-        box.attachedTo = "NOTE"
-        box.shape?.frame = Frame(x: 400, y: 400, w: 40, h: 30)
-        XCTAssertEqual(StickyAttach.plan(moved: [box], created: [], deletedNotes: [], pageItems: [note, box]),
-                       [Change(item: "BOX", parent: nil)])
-        // Travelling with its note: untouched.
-        box.shape?.frame = Frame(x: 150, y: 150, w: 40, h: 30)
-        XCTAssertEqual(StickyAttach.plan(moved: [note, box], created: [], deletedNotes: [], pageItems: [note, box]), [])
-        // A collapsed note takes nothing new, and keeps a child moved within its frame.
-        var collapsed = note
-        collapsed.sticky?.collapsed = true
-        XCTAssertEqual(StickyAttach.plan(moved: [box], created: [], deletedNotes: [], pageItems: [collapsed, box]), [])
-        var loose = box
-        loose.attachedTo = nil
-        XCTAssertEqual(StickyAttach.plan(moved: [], created: [loose], deletedNotes: [], pageItems: [collapsed, loose]), [])
-        // The note deleted: its children are let go so they stay editable.
-        var gone = note
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        let undone = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
+        XCTAssertEqual(undone.image?.frame, before.image?.frame)                // one undo puts it back…
+        XCTAssertEqual(undone.attachedTo, before.attachedTo)                    // …exactly as it was
+    }
+
+    func testDeletingANoteLetsGoOfItsChildrenAndOneUndoRestoresBoth() async throws {
+        let h = harness()
+        installItemUpdateStandIn(h)
+        installDeleteStandIn(h)
+        await FeatStickyFeature.start(h.app)
+        // A plugin or the AI attaches the image to the note.
+        try await h.run("item.update", ["ref": .string(imageRef), "patch": ["attachedTo": .string(stickyRef)]])
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID).attachedTo,
+                       Fixtures.stickyID)
+
+        try await h.run("item.delete", ["ref": .string(stickyRef)])
+        try await waitFor {
+            (try? h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)).map { $0.attachedTo == nil } ?? false
+        }
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 2)                          // the detach joined the delete's step
+
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertFalse(try note(h).collapsed)                                   // the note is back…
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID).attachedTo,
+                       Fixtures.stickyID)                                       // …and so is its child
+    }
+
+    func testOnlyChildrenOfADeletedNoteAreLetGo() {
+        let frame = Frame(x: 150, y: 150, w: 40, h: 30)
+        let child = Item(id: "CHILD", kind: .shape, z: "k", attachedTo: "NOTE", shape: ShapeItem(shape: .rectangle, frame: frame))
+        let other = Item(id: "OTHER", kind: .shape, z: "m", attachedTo: "BOX", shape: ShapeItem(shape: .rectangle, frame: frame))
+        let loose = Item(id: "LOOSE", kind: .shape, z: "n", shape: ShapeItem(shape: .rectangle, frame: frame))
+        var gone = Item(id: "GONE", kind: .shape, z: "p", attachedTo: "NOTE", shape: ShapeItem(shape: .rectangle, frame: frame))
         gone.deleted = true
-        XCTAssertEqual(StickyAttach.plan(moved: [], created: [], deletedNotes: ["NOTE"], pageItems: [gone, box]),
-                       [Change(item: "BOX", parent: nil)])
-        // Undo, redo, sync and the follow-up updates never re-attach.
-        XCTAssertTrue(StickyAttach.considers(command: "item.transform", principal: .user))
-        XCTAssertFalse(StickyAttach.considers(command: CommandIDs.undo, principal: .user))
-        XCTAssertFalse(StickyAttach.considers(command: CommandIDs.itemUpdate, principal: .user))
-        XCTAssertFalse(StickyAttach.considers(command: "item.transform", principal: .sync("peer")))
+        let written = Item(id: "WRITTEN", kind: .shape, z: "q", attachedTo: "NOTE", shape: ShapeItem(shape: .rectangle, frame: frame))
+        let page = [child, other, loose, gone, written]
+
+        // Records the deleting commit wrote itself are never written again in its undo group.
+        XCTAssertEqual(StickyOrphans.plan(deletedNotes: ["NOTE"], written: ["NOTE", "WRITTEN"], pageItems: page), ["CHILD"])
+        XCTAssertEqual(StickyOrphans.plan(deletedNotes: [], written: [], pageItems: page), [])
+        // Undo, redo, sync and the follow-up updates never add a step of their own.
+        XCTAssertTrue(StickyOrphans.considers(command: CommandIDs.itemDelete, principal: .user))
+        XCTAssertTrue(StickyOrphans.considers(command: CommandIDs.revertGroup, principal: .user))
+        XCTAssertFalse(StickyOrphans.considers(command: CommandIDs.undo, principal: .user))
+        XCTAssertFalse(StickyOrphans.considers(command: CommandIDs.redo, principal: .user))
+        XCTAssertFalse(StickyOrphans.considers(command: CommandIDs.itemUpdate, principal: .user))
+        XCTAssertFalse(StickyOrphans.considers(command: CommandIDs.itemDelete, principal: .sync("peer")))
+    }
+
+    func testNoteTextIsSavedWithItemUpdateWhenTextSetTextIsMissing() async throws {
+        let h = harness()
+        installItemUpdateStandIn(h)
+        XCTAssertNil(h.app.commands.entry(StickyActions.textSetText))
+        let ok = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Saved without the text feature"),
+                                             session: h.session, group: nil)
+        XCTAssertTrue(ok)
+        XCTAssertEqual(try note(h).text.plainText, "Saved without the text feature")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try note(h).text.plainText, "Remember")
+    }
+
+    func testNoteTextIsStillSavedWhenTextSetTextRefusesTheNote() async throws {
+        let h = harness()
+        installItemUpdateStandIn(h)
+        let d = CommandDescriptor(id: StickyActions.textSetText, title: "Set Text", summary: "Test stand-in that refuses notes.",
+                                  params: .obj(["ref": .ref, "text": .anything()], required: ["ref", "text"]), effect: .edit)
+        h.app.commands.register(d) { _, _ in throw NibError(.invalidParams, "not a text box", path: "$.ref") }
+        let ok = await StickyActions.setText(h.app, ref: stickyRef, text: RichText(plain: "Kept anyway"),
+                                             session: h.session, group: nil)
+        XCTAssertTrue(ok)
+        XCTAssertEqual(try note(h).text.plainText, "Kept anyway")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+    }
+
+    func testInspectorFormattingKeepsTextChangedSinceItOpened() async throws {
+        let h = harness()
+        installTextStandIn(h)
+        installItemUpdateStandIn(h)
+        let opened = try note(h).text                                           // what the inspector cached
+        XCTAssertEqual(opened.plainText, "Remember")
+        try await h.run("text.setText", ["ref": .string(stickyRef), "text": "Changed since"])
+
+        let saved = await StickyActions.format(h.app, refs: [stickyRef], session: h.session) {
+            StickyFormat.setting(.bold, true, in: $0)
+        }
+        XCTAssertEqual(saved.count, 1)
+        let s = try note(h)
+        XCTAssertEqual(s.text.plainText, "Changed since")                       // the newer text is kept…
+        XCTAssertTrue(StickyFormat.isOn(.bold, in: s.text))                     // …and made bold
+
+        // A note locked since the inspector opened is left alone.
+        try await h.run("item.update", ["ref": .string(stickyRef), "patch": ["locked": true]])
+        let none = await StickyActions.format(h.app, refs: [stickyRef], session: h.session) {
+            StickyFormat.setting(.italic, true, in: $0)
+        }
+        XCTAssertTrue(none.isEmpty)
+        XCTAssertFalse(try StickyFormat.isOn(.italic, in: note(h).text))
     }
 
     func testDrawerDrawsACollapsedNoteAsItsIcon() throws {
@@ -286,6 +410,11 @@ final class FeatStickyTests: XCTestCase {
     }
 
     // MARK: Helpers
+
+    /// Lets follow-up work started by a commit observer run (0.2 s).
+    private func settle() async throws {
+        for _ in 0..<20 { try await Task.sleep(nanoseconds: 10_000_000) }
+    }
 
     /// Waits (up to 2 s) for the saves an editor starts when it finishes.
     private func waitFor(_ condition: () -> Bool) async throws {

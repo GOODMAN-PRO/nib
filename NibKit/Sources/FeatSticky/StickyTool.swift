@@ -190,6 +190,8 @@ struct StickyInspector: View {
     @State private var targets: [Target]
     @State private var custom: Color
     @State private var customApply: Task<Void, Never>?
+    /// The last formatting write; the next one waits for it so each reads the text the previous one saved.
+    @State private var formatting: Task<Void, Never>?
     @State private var collapsed: Bool
     @State private var resolved: Bool
     @State private var bold: Bool
@@ -341,20 +343,15 @@ struct StickyInspector: View {
         format { StickyFormat.resized($0, by: delta) }
     }
 
-    private func format(_ change: (RichText) -> RichText) {
-        var writes: [(String, RichText)] = []
-        for i in targets.indices where !targets[i].locked {
-            let new = change(targets[i].note.text)
-            guard new != targets[i].note.text else { continue }
-            targets[i].note.text = new
-            writes.append((targets[i].ref, new))
-        }
-        guard !writes.isEmpty else { return }
-        let app = app, session = session, g = NibID.make().raw
-        Task { @MainActor in
-            for (ref, text) in writes {
-                await StickyActions.setText(app, ref: ref, text: text, session: session, group: g)
-            }
+    /// `targets` only feeds the toggles: the change is applied to each note's text as it is when the write runs, one
+    /// action after another, so nothing edited since the inspector opened (an undo, a collaborator, the AI) is lost.
+    private func format(_ change: @escaping (RichText) -> RichText) {
+        let refs = targets.filter { !$0.locked }.map { $0.ref }
+        guard !refs.isEmpty else { return }
+        let app = app, session = session, previous = formatting
+        formatting = Task { @MainActor in
+            await previous?.value
+            await StickyActions.format(app, refs: refs, session: session, change)
         }
     }
 
