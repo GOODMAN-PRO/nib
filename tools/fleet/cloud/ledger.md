@@ -38,3 +38,5 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - TODO after main CI green: merge main into all feat/* branches (only those not being worked on by an agent; agents merge it themselves).
 - contract gap (minor): ChromeOverlayDescriptor has no 'instant/no-motion' show option (F062 K key, DESIGN §9.3). Custom sound token missing (F062 uses system sound 1005).
 - No PRs for feat/* or v2/* branches: ios.yml also triggers on pull_request, so a PR per branch would double the macOS CI load. Integration merges branches directly. Marker branches point at main commits (no diff).
+- contract gap: docked assistant side/width for reservedTrailing (F016); per-tool disabled/on appearance in NibToolPalette.
+- Mockup v2 merged to main (9e7dfb4) and REPUBLISHED to https://claude.ai/artifact/XQKSP4QSMTHuwFZRPxTLMm (version 1790407236-34b6). Publish copy = design/mockup.html with skeleton adaptations (title 'Nib Clear Water', :root light tokens, body bg, theme detection keeps data-theme, no doctype/head/body tags).
