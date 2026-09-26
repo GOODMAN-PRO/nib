@@ -191,7 +191,9 @@ public enum NibSettings {
     public static let stylusMode = SettingKey("stylus.mode", default: StylusMode.pencilOnly)
     /// 0 = low (recommended), 1 = medium, 2 = high.
     public static let palmSensitivity = SettingKey("stylus.palmSensitivity", default: 0)
-    /// 0…7: handedness × wrist angle illustration index.
+    /// 0…7: handedness × wrist angle = hand × 4 + wrist (contracts-v2, pinned). Hand: 0 right, 1 left. Wrist: 0 below
+    /// the line, 1 angled, 2 level, 3 hooked. 0 (right hand, wrist below) is the default. Palm rejection (F101) and
+    /// Settings (F027) share this layout.
     public static let writingPosture = SettingKey("stylus.posture", default: 0)
     public static let reduceLatency = SettingKey("pen.reduceLatency", default: true, synced: true)
     public static let defaultLanguage = SettingKey("language.default", default: "en-US", synced: true)
@@ -213,6 +215,32 @@ public enum NibSettings {
     public static let defaultCover = SettingKey("templates.defaultCover", default: TemplateRef("cover.solid"), synced: true)
     public static let defaultPageSize = SettingKey("templates.defaultSize", default: PageSize.a4, synced: true)
     public static let coverByDefault = SettingKey("templates.coverByDefault", default: true, synced: true)
+
+    // contracts-v2
+
+    /// Settings › Appearance › Liquid: "full" | "calm" | "off" (NibDesign's `NibLiquidMode` raw values). Every droplet
+    /// container reads it (the document chrome, the toolbar palette, the library). Device-local.
+    public static let liquidMode = SettingKey("appearance.liquid", default: "full")
+    /// Style of new text boxes (F026 "Save as Default"); paste-and-match-style (F014) and page text (F028) use it.
+    public static let defaultTextStyle = SettingKey("text.defaultStyle", default: TextBoxStyle(), synced: true)
+    /// Draw and Hold: a held pen or pencil stroke snaps to a shape (F007 reads it, F030 owns the behaviour).
+    public static let drawAndHold = SettingKey("shapes.drawAndHold", default: true, synced: true)
+    /// Name of the AI direct-tools setting (owned and declared by the AI Agent, F084): [command id]. Unset =
+    /// `defaultAIDirectTools`. The bridge (F090) reads it untyped.
+    public static let aiDirectToolsName = "ai.directTools"
+    /// AI.md §4: commands offered to models as their own tools besides the meta-tools.
+    public static let defaultAIDirectTools = ["ink.writeText", "ink.setPoints", "text.createBox", "item.update",
+                                              "item.delete", "page.add", "shape.create", "diagram.create"]
+
+    /// Eraser settings owned by F010, read by the Zoom Window pane (F038) and the Pencil hover preview (F043).
+    /// Mode: "precision" | "standard" | "stroke".
+    public static let eraserMode = SettingKey("eraser.mode", default: "standard", synced: true)
+    /// Eraser diameter in SCREEN points (2…60).
+    public static let eraserSize = SettingKey("eraser.size", default: 14.0, synced: true)
+    /// Erase Filter: whether the eraser erases strokes drawn with `tool` (one key per ink tool).
+    public static func eraserFilter(_ tool: InkTool) -> SettingKey<Bool> {
+        SettingKey("eraser.filter." + tool.rawValue, default: true, synced: true)
+    }
 
     public static let presetTools = ["pen", "pencil", "highlighter", "tape", "shape", "drawShape"]
 
@@ -263,6 +291,18 @@ public enum NibSettings {
         }
         s.declarePrefix("managed.", synced: false, summary: "Managed App Configuration values (read-only).",
                         owner: "builtin", readOnly: true)
+        s.declare(liquidMode, summary: "Liquid chrome: full, calm (half stretch, no necks) or off (solid, no motion).",
+                  owner: "builtin", schema: .str(choices: ["full", "calm", "off"]))
+        s.declare(defaultTextStyle, summary: "Style of new text boxes: TextBoxStyle fields, optionally align and lineSpacing.",
+                  owner: "builtin", schema: .anything("TextBoxStyle object"))
+        s.declare(drawAndHold, summary: "Hold the pen still at the end of a stroke to snap it to a shape.", owner: "builtin",
+                  schema: bool)
+        s.declare(eraserMode, summary: "Eraser mode: precision, standard or stroke.", owner: "builtin",
+                  schema: .str(choices: ["precision", "standard", "stroke"]))
+        s.declare(eraserSize, summary: "Eraser diameter in screen points.", owner: "builtin", schema: .num(min: 2, max: 60))
+        for tool in InkTool.allCases {
+            s.declare(eraserFilter(tool), summary: "The eraser erases \(tool.rawValue) strokes.", owner: "builtin", schema: bool)
+        }
     }
 }
 

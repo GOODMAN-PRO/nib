@@ -83,7 +83,14 @@ enum NameLookupCanary {
         BlockViewContext.self, BlockViewDescriptor.self, PluginPanelFactory.self, CanvasToolDescriptor.self, DocumentEditorDescriptor.self,
         OpenMode.self, SceneNavigator.self, SceneHooks.self, ScreenRegistry.self, UIRegistries.self,
         NibFeature.self, NibApp.self, SafeMode.self, InkOutline.self, FakeCanvasHost.self,
-        InMemoryCollabTransport.self
+        InMemoryCollabTransport.self,
+        // contracts-v2
+        NibEventPayload.self, SyncStatusPayload.self, IndexProgressPayload.self, LaserMovedPayload.self,
+        AudioPlaybackPayload.self, AudioRecordingPayload.self, ShapeSnappedPayload.self, PencilHapticPayload.self,
+        InkingSignal.self, TextRecognitionWord.self, RegistryChange.self, PageInsets.self, TemplateMetrics.self,
+        DrawPurpose.self, ExportOptionKeys.self, TextLayoutInfo.self, TextLayoutDescriptor.self, PanelPresentation.self,
+        ChromePlacement.self, ChromeSurface.self, ChromeAnchor.self, ChromeContext.self, ChromeOverlayDescriptor.self,
+        DisplayFontWeight.self, NibFragment.self, BridgeNames.self, PanelIDs.self
     ]
 
     /// Protocols with associated types / Self requirements are checked as generic constraints.
