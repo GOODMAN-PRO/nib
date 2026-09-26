@@ -441,7 +441,9 @@ struct CatalogEntry: Codable, Equatable {
 final class LibraryCatalog {
     private(set) var byPath: [String: CatalogEntry] = [:]
     private var pathByID: [NibID: String] = [:]
+    /// Live nodes by parent id ("" = root), unsorted; each group is sorted by title the first time it is asked for.
     private var childIndex: [String: [LibraryNode]]?
+    private var sortedChildren: [String: [LibraryNode]] = [:]
     private var liveList: [LibraryNode]?
 
     init(_ entries: [CatalogEntry] = []) {
@@ -511,15 +513,27 @@ final class LibraryCatalog {
 
     /// Live children of a folder (nil = the library root), in title order.
     func children(of folder: FolderID?) -> [LibraryNode] {
-        if childIndex == nil {
-            var index: [String: [LibraryNode]] = [:]
-            for n in liveNodes() { index[n.parent?.raw ?? "", default: []].append(n) }
-            for k in Array(index.keys) {
-                index[k]?.sort { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
-            }
-            childIndex = index
+        let key = folder?.raw ?? ""
+        if let sorted = sortedChildren[key] { return sorted }
+        let sorted = (index()[key] ?? []).sorted { a, b in
+            let r = a.title.localizedStandardCompare(b.title)
+            return r == .orderedSame ? a.id.raw < b.id.raw : r == .orderedAscending
         }
-        return childIndex?[folder?.raw ?? ""] ?? []
+        sortedChildren[key] = sorted
+        return sorted
+    }
+
+    /// How many live items a folder holds (nil = the library root).
+    func childCount(of folder: FolderID?) -> Int {
+        index()[folder?.raw ?? ""]?.count ?? 0
+    }
+
+    private func index() -> [String: [LibraryNode]] {
+        if let i = childIndex { return i }
+        var built: [String: [LibraryNode]] = [:]
+        for e in byPath.values where !e.inTrash { built[e.node.parent?.raw ?? "", default: []].append(e.node) }
+        childIndex = built
+        return built
     }
 
     /// Every document (live and trashed) → package URL, for `PackageLocator.replaceAll`.
@@ -534,27 +548,92 @@ final class LibraryCatalog {
 
     private func invalidate() {
         childIndex = nil
+        sortedChildren = [:]
         liveList = nil
     }
 }
 
-/// The catalog as cached in Application Support (one file per library root).
-struct CatalogCache: Codable {
-    static let currentVersion = 1
+/// The catalog as cached in Application Support (one file per library root): `{"version", "root", "entries"}` where
+/// every entry is a flat JSON array of primitives (see `row` / `entry`). Parsed with `JSONSerialization`, so loading
+/// 5,000 documents takes tens of milliseconds instead of a keyed `Codable` pass over every field.
+struct CatalogCache {
+    static let currentVersion = 2
     var version: Int
     var root: String
     var entries: [CatalogEntry]
 
     static func load(_ url: URL, root: String) -> [CatalogEntry]? {
         guard let data = try? Data(contentsOf: url),
-              let cache = try? JSONDecoder().decode(CatalogCache.self, from: data),
-              cache.version == currentVersion, cache.root == root else { return nil }
-        return cache.entries
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (object["version"] as? Int) == currentVersion, (object["root"] as? String) == root,
+              let rows = object["entries"] as? [[Any]] else { return nil }
+        var out: [CatalogEntry] = []
+        out.reserveCapacity(rows.count)
+        for row in rows {
+            guard let e = entry(row) else { return nil }
+            out.append(e)
+        }
+        return out
     }
 
     func write(to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder().encode(self).write(to: url, options: .atomic)
+        let object: [String: Any] = ["version": version, "root": root, "entries": entries.map { CatalogCache.row($0) }]
+        try JSONSerialization.data(withJSONObject: object).write(to: url, options: .atomic)
+    }
+
+    private static func opt(_ v: Any?) -> Any { v ?? NSNull() }
+
+    /// One entry as a flat array (positions are the format; bump `currentVersion` when they change).
+    static func row(_ e: CatalogEntry) -> [Any] {
+        let n = e.node
+        var pages: [Any] = []
+        for p in e.trashedPages {
+            pages.append(p.page.raw)
+            pages.append(p.trashedAt)
+        }
+        return [n.id.raw, n.kind.rawValue, n.title, n.path, opt(n.parent?.raw), opt(n.documentKind?.rawValue),
+                n.modified, n.created, n.favorite, n.locked, opt(n.pageCount), opt(n.style?.color?.hex),
+                opt(n.style?.icon), n.style != nil, opt(n.style?.favorite), n.sync.rawValue, opt(n.trashedAt),
+                e.parentPath, e.inTrash, e.trashTop, opt(e.stamp), opt(e.signature), e.hasRecord, e.legacy,
+                e.derivedID, opt(e.trashedFrom), opt(e.trashedFromFolder?.raw), pages, opt(e.headID?.raw)]
+    }
+
+    static func entry(_ r: [Any]) -> CatalogEntry? {
+        guard r.count == 29, let id = r[0] as? String, let kindRaw = r[1] as? String,
+              let kind = LibraryNodeKind(rawValue: kindRaw), let title = r[2] as? String, let path = r[3] as? String,
+              let parentPath = r[17] as? String else { return nil }
+        func string(_ i: Int) -> String? { r[i] as? String }
+        func double(_ i: Int) -> Double? { (r[i] as? NSNumber)?.doubleValue }
+        func bool(_ i: Int) -> Bool { (r[i] as? NSNumber)?.boolValue ?? false }
+        var node = LibraryNode(id: NibID(id), kind: kind, title: title, path: path)
+        node.parent = string(4).map { NibID($0) }
+        node.documentKind = string(5).flatMap { DocumentKind(rawValue: $0) }
+        node.modified = double(6) ?? 0
+        node.created = double(7) ?? 0
+        node.favorite = bool(8)
+        node.locked = bool(9)
+        node.pageCount = (r[10] as? NSNumber)?.intValue
+        if bool(13) {
+            node.style = FolderStyle(color: string(11).flatMap { RGBA(hex: $0) }, icon: string(12),
+                                     favorite: (r[14] as? NSNumber)?.boolValue ?? node.favorite)
+        }
+        node.sync = string(15).flatMap { SyncBadge(rawValue: $0) } ?? .localOnly
+        node.trashedAt = double(16)
+        var e = CatalogEntry(node: node, parentPath: parentPath, inTrash: bool(18), trashTop: bool(19),
+                             stamp: double(20), signature: string(21), hasRecord: bool(22), legacy: bool(23),
+                             derivedID: bool(24), trashedFrom: string(25), trashedFromFolder: string(26).map { NibID($0) },
+                             headID: string(28).map { NibID($0) })
+        if let flat = r[27] as? [Any] {
+            var i = 0
+            while i + 1 < flat.count {
+                if let page = flat[i] as? String, let at = (flat[i + 1] as? NSNumber)?.doubleValue {
+                    e.trashedPages.append(TrashedPage(page: NibID(page), trashedAt: at))
+                }
+                i += 2
+            }
+        }
+        return e
     }
 }
 

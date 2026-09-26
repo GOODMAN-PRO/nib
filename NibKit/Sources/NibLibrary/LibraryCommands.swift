@@ -236,7 +236,7 @@ struct NodeRow: Codable, Equatable {
         if n.kind == .folder {
             row.color = n.style?.color?.hex
             row.icon = n.style?.icon
-            row.items = library.children(of: n.id).count
+            row.items = (library as? FolderLibrary)?.childCount(of: n.id) ?? library.children(of: n.id).count
         } else {
             row.pages = n.pageCount
         }

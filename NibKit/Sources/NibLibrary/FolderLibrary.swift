@@ -343,6 +343,12 @@ final class FolderLibrary: LibraryService {
         return url(of: e)
     }
 
+    /// How many live items a folder holds (nil = the library root), without sorting them.
+    func childCount(of folder: FolderID?) -> Int {
+        ensureLoaded()
+        return catalog.childCount(of: folder)
+    }
+
     func trashedNodes() -> [LibraryNode] {
         ensureLoaded()
         return catalog.trashTopNodes()
