@@ -210,6 +210,7 @@ final class ToolbarRuntime: ObservableObject {
 }
 
 /// Single-key tool shortcuts (KeyScope.canvas).
+@MainActor
 enum ToolbarShortcuts {
     static let prefix = "toolbar.key."
 
