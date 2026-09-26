@@ -9,29 +9,25 @@ import NibContracts
 /// images load; the page title names the document (Safari's own PDF, shared through NibShare, imports as a PDF).
 @MainActor
 enum OfficeConverter {
-    static let officeID = "import.office"
-    static let webID = "import.webpage"
-    static let officeExtensions = ["doc", "docx", "ppt", "pptx"]
-    static let presentationExtensions: Set<String> = ["ppt", "pptx"]
-    static let webExtensions = ["html", "htm", WebLocation.fileExtension]
-
     static func officeDescriptor(owner: String) -> ImporterDescriptor {
-        ImporterDescriptor(id: officeID, title: String(localized: "Word and PowerPoint"), fileExtensions: officeExtensions,
+        ImporterDescriptor(id: ImportFormats.officeImporterID, title: String(localized: "Word and PowerPoint"),
+                           fileExtensions: ImportFormats.officeExtensions,
                            utTypes: ["com.microsoft.word.doc", "org.openxmlformats.wordprocessingml.document",
                                      "com.microsoft.powerpoint.ppt", "org.openxmlformats.presentationml.presentation"],
                            order: 100, owner: owner) { url, target, ctx in
-            let landscape = OfficeConverter.presentationExtensions.contains(url.pathExtension.lowercased())
-            return try await OfficeConverter.convertAndImport(.file(url), title: url.deletingPathExtension().lastPathComponent,
+            let landscape = ImportFormats.presentationExtensions.contains(url.pathExtension.lowercased())
+            return try await OfficeConverter.convertAndImport(.file(url), title: target.displayName ?? ImportNaming.title(of: url),
                                                               layout: .office(landscape: landscape), target: target, ctx: ctx)
         }
     }
 
     static func webDescriptor(owner: String) -> ImporterDescriptor {
-        ImporterDescriptor(id: webID, title: String(localized: "Web pages"), fileExtensions: webExtensions,
+        ImporterDescriptor(id: ImportFormats.webImporterID, title: String(localized: "Web pages"),
+                           fileExtensions: ImportFormats.webExtensions,
                            utTypes: ["public.html", "com.apple.web-internet-location"],
                            order: 100, owner: owner) { url, target, ctx in
-            let title = url.deletingPathExtension().lastPathComponent
-            guard url.pathExtension.lowercased() == WebLocation.fileExtension else {
+            let title = target.displayName ?? ImportNaming.title(of: url)
+            guard url.pathExtension.lowercased() == ImportFormats.webLocationExtension else {
                 return try await OfficeConverter.convertAndImport(.file(url), title: title, layout: .webPage,
                                                                   target: target, ctx: ctx)
             }
@@ -47,28 +43,57 @@ enum OfficeConverter {
     /// it to the registered PDF importer with the same target.
     static func convertAndImport(_ source: WebSource, title: String, layout: PDFLayout, target: ImportTarget,
                                  ctx: CommandContext) async throws -> [DocumentID] {
-        guard let app = ImportHost.app(for: ctx) else { throw NibError.unavailable("import") }
-        guard let pdfImporter = app.content.importer(forExtension: "pdf") else {
+        guard let pdfImporter = ctx.content.importer(forExtension: "pdf") else {
             throw NibError(.unavailable, "PDF import is not available, so Word, PowerPoint and web pages can't be converted",
                            hint: "enable the PDF feature and import again")
         }
-        guard !NibApp.isHostlessTest, let window = ImportUI.hostWindow(app) else {
+        if case .remote(let page) = source { try authorizeWebPage(page, ctx: ctx) }
+        guard !NibApp.isHostlessTest, let window = await ImportUI.navigator(ctx)?.rootViewController?.view.window else {
             throw NibError(.unavailable, "converting documents needs an open Nib window",
                            hint: "open Nib on the device and import again")
         }
+        if ctx.dryRun { return target.document.map { [$0] } ?? [] }
         let dir = ImportLocations.scratch.appendingPathComponent("convert-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let paper = layout.paper(base: ctx.services.settings.get(NibSettings.defaultPageSize))
-        let renderer = WebPDFRenderer(host: window, width: paper.width)
+        // Office files and saved pages render without scripts; a live page may need them for its layout.
+        let isRemote: Bool
+        if case .remote = source { isRemote = true } else { isRemote = false }
+        let renderer = WebPDFRenderer(host: window, width: paper.width, javaScript: isRemote)
         defer { renderer.tearDown() }
         try await renderer.load(source, settle: layout.settleSeconds)
         var name = title
         if layout == .webPage, let pageTitle = renderer.pageTitle, !pageTitle.isEmpty { name = pageTitle }
-        let pdf = dir.appendingPathComponent(ImportNaming.sanitize(name) + ".pdf")
+        name = ImportNaming.sanitize(name)
+        let pdf = dir.appendingPathComponent(name + ".pdf")
         try await renderer.writePDF(paper: paper, margin: layout.margin, to: pdf)
-        return try await pdfImporter.handler(pdf, target, ctx)
+        var converted = target
+        converted.displayName = name
+        return try await pdfImporter.handler(pdf, converted, ctx)
+    }
+
+    /// Loading a live page reaches the network: the AI and the bridge need the `network` scope and https, and a plugin
+    /// also a host its manifest lists (the same rule as `CommandContext.inputFile` downloads).
+    static func authorizeWebPage(_ url: URL, ctx: CommandContext) throws {
+        if ctx.principal.isUser { return }
+        guard url.scheme?.lowercased() == "https" else {
+            throw NibError(.permissionDenied, "only https pages can be imported by \(ctx.principal)",
+                           hint: "use an https address, or upload a PDF of the page with asset.upload")
+        }
+        guard ctx.bus.gateway.grants(ctx.principal).contains(.network) else {
+            throw NibError(.permissionDenied, "loading \(url.host ?? "a web page") needs the 'network' permission",
+                           hint: "upload a PDF of the page with asset.upload and import its tmp: ref")
+        }
+        if case let .plugin(id) = ctx.principal,
+           let manifest = ctx.services.get(ServiceKeys.pluginHost, as: PluginHosting.self)?.handle(id)?.manifest {
+            let host = (url.host ?? "").lowercased()
+            guard (manifest.network?.hosts ?? []).contains(where: { $0.lowercased() == host }) else {
+                throw NibError(.permissionDenied, "'\(host)' is not in the plugin's network.hosts",
+                               hint: "add the host to manifest network.hosts")
+            }
+        }
     }
 }
 
@@ -111,23 +136,25 @@ enum PDFLayout: Equatable {
 /// `.webloc` files (a property list with the "URL" key): what NibShare and downloads of web pages write, so a page
 /// is imported from its live address. Pure and thread-safe.
 enum WebLocation {
-    static let fileExtension = "webloc"
-
     static func write(_ url: URL, title: String, in dir: URL) throws -> URL {
         let data = try PropertyListSerialization.data(fromPropertyList: ["URL": url.absoluteString],
                                                       format: .xml, options: 0)
-        let file = ImportNaming.unique(ImportNaming.sanitize(title) + "." + fileExtension, in: dir)
+        let file = ImportNaming.unique(ImportNaming.sanitize(title) + "." + ImportFormats.webLocationExtension, in: dir)
         try data.write(to: file, options: .atomic)
         return file
     }
 
     /// The http(s) address in a `.webloc` file; nil for anything else.
     static func read(_ file: URL) -> URL? {
-        guard let data = try? Data(contentsOf: file),
-              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+        guard let data = try? Data(contentsOf: file) else { return nil }
+        return address(in: data)
+    }
+
+    static func address(in data: Data) -> URL? {
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
               let dict = plist as? [String: Any], let string = dict["URL"] as? String,
               let url = URL(string: string), let scheme = url.scheme?.lowercased(),
-              scheme == "https" || scheme == "http" else { return nil }
+              scheme == "https" || scheme == "http", url.host != nil else { return nil }
         return url
     }
 }
@@ -153,10 +180,12 @@ final class PaperRenderer: UIPrintPageRenderer {
 final class WebPDFRenderer: NSObject, WKNavigationDelegate {
     private let webView: WKWebView
     private var loading: CheckedContinuation<Void, Error>?
+    private var timeout: Task<Void, Never>?
 
-    init(host: UIView, width: CGFloat) {
+    init(host: UIView, width: CGFloat, javaScript: Bool) {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = javaScript
         // Off screen, but inside a window so WebKit lays it out and paints for printing.
         webView = WKWebView(frame: CGRect(x: -20_000, y: 0, width: width, height: width * 1.4),
                             configuration: configuration)
@@ -169,7 +198,7 @@ final class WebPDFRenderer: NSObject, WKNavigationDelegate {
 
     var pageTitle: String? { webView.title?.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-    func load(_ source: WebSource, settle: Double, timeout: Double = 60) async throws {
+    func load(_ source: WebSource, settle: Double, timeout seconds: Double = 60) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             loading = continuation
             switch source {
@@ -178,13 +207,15 @@ final class WebPDFRenderer: NSObject, WKNavigationDelegate {
             case .remote(let url):
                 webView.load(URLRequest(url: url))
             }
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                self?.finishLoading(NibError(.timeout, "the page took longer than \(Int(timeout)) s to load",
+            timeout = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self?.finishLoading(NibError(.timeout, "the page took longer than \(Int(seconds)) s to load",
                                              hint: "check the connection and import again"))
             }
         }
-        try? await Task.sleep(nanoseconds: UInt64(settle * 1_000_000_000))
+        timeout?.cancel()
+        try await Task.sleep(nanoseconds: UInt64(settle * 1_000_000_000))
     }
 
     /// Paginates with the web view's print formatter; a layout the formatter cannot paginate becomes one tall page.
@@ -196,17 +227,18 @@ final class WebPDFRenderer: NSObject, WKNavigationDelegate {
             try await writeSinglePage(to: url)
             return
         }
-        guard UIGraphicsBeginPDFContextToFile(url.path, renderer.paperRect, nil) else {
-            throw NibError(.internalError, "could not create the converted PDF")
-        }
         renderer.prepare(forDrawingPages: NSRange(location: 0, length: count))
-        for index in 0..<count {
-            UIGraphicsBeginPDFPage()
-            renderer.drawPage(at: index, in: UIGraphicsGetPDFContextBounds())
-            // ponytail: printing has to run on the main thread; yielding per page keeps the window responsive.
-            await Task.yield()
+        let pdf = UIGraphicsPDFRenderer(bounds: renderer.paperRect)
+        do {
+            try pdf.writePDF(to: url) { context in
+                for index in 0..<count {
+                    context.beginPage()
+                    renderer.drawPage(at: index, in: context.pdfContextBounds)
+                }
+            }
+        } catch {
+            throw NibError(.internalError, "could not write the converted PDF: \(error.localizedDescription)")
         }
-        UIGraphicsEndPDFContext()
     }
 
     private func writeSinglePage(to url: URL) async throws {
@@ -217,6 +249,7 @@ final class WebPDFRenderer: NSObject, WKNavigationDelegate {
     }
 
     func tearDown() {
+        timeout?.cancel()
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.removeFromSuperview()

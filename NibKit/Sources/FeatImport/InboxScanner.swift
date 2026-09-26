@@ -58,6 +58,11 @@ enum ShareHandoff {
     static let dataType = "app.nib.share.data"
     static let inboxFolder = "Inbox"
 
+    /// When the waiting items were last taken: the scan on activation and the deep link can both ask for them, and
+    /// the second one then finds nothing to do rather than an error.
+    @MainActor
+    static var lastTaken: Date?
+
     static func isHandoffLink(_ string: String) -> Bool {
         guard let c = URLComponents(string: string), c.scheme?.lowercased() == NibFormat.urlScheme,
               c.host?.lowercased() == "import" else { return false }
@@ -68,11 +73,12 @@ enum ShareHandoff {
     @MainActor
     static var isWaiting: Bool { UIPasteboard.general.contains(pasteboardTypes: [dataType]) }
 
-    /// Writes the waiting items into `dir` and clears them from the pasteboard.
+    /// Writes the waiting items into `dir` and clears them from the pasteboard. [] when they were just taken.
     @MainActor
     static func take(into dir: URL) throws -> [URL] {
         let board = UIPasteboard.general
         guard board.contains(pasteboardTypes: [dataType]) else {
+            if let taken = lastTaken, Date().timeIntervalSince(taken) < 60 { return [] }
             throw NibError(.notFound, "nothing shared with Nib is waiting on the pasteboard",
                            hint: "share the item to Nib again")
         }
@@ -82,6 +88,7 @@ enum ShareHandoff {
                            hint: "share it again and allow pasting when iOS asks")
         }
         board.items = []
+        lastTaken = Date()
         return urls
     }
 
@@ -133,6 +140,17 @@ enum InboxFiles {
         let modified = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
         return "\(url.standardizedFileURL.path)|\(size)|\(Int(modified))"
     }
+
+    /// What the scan offers: inbox folders (someone shared a folder), packages and files an importer takes; never
+    /// what is being imported right now or a loose file the person already declined in this state.
+    static func offered(_ entries: [Entry], inFlight: Set<String>, declined: Set<String>,
+                        canImport: (URL, Bool) -> Bool) -> [Entry] {
+        entries.filter { entry in
+            guard !inFlight.contains(entry.url.standardizedFileURL.path), !declined.contains(entry.key) else { return false }
+            if entry.fromInbox && entry.isDirectory { return true }
+            return canImport(entry.url, entry.isDirectory)
+        }
+    }
 }
 
 /// On every window activation: offers what arrived while Nib was away ("Import N files?"): Open In copies left in
@@ -169,39 +187,35 @@ enum InboxScanner {
         busy = true
         defer { busy = false }
         if ShareHandoff.isWaiting {
-            await runImport([ShareHandoff.link], app: app, session: nav.session)
+            await runImport([ShareHandoff.link], app: app, navigator: nav)
             return
         }
         let inboxes = [ImportLocations.openInInbox] + [ImportLocations.appGroupInbox].compactMap { $0 }
         let documents = ImportLocations.documents
         let found = await Task.detached(priority: .utility) { InboxFiles.entries(inboxes: inboxes, documents: documents) }.value
-        let offered = found.filter { entry in
-            guard !ImportEngine.inFlight.contains(entry.url.standardizedFileURL.path), !declined.contains(entry.key) else {
-                return false
-            }
-            if entry.fromInbox && entry.isDirectory { return true }        // a folder someone shared: its tree is imported
-            return ImportEngine.canImport(entry.url, isDirectory: entry.isDirectory, app: app)
+        let content = app.content
+        let offered = InboxFiles.offered(found, inFlight: ImportEngine.inFlight, declined: declined) { url, isDirectory in
+            ImportEngine.canImport(url, isDirectory: isDirectory, content: content)
         }
         guard !offered.isEmpty else { return }
         let loose = offered.filter { !$0.fromInbox }
         let paths = loose.map { $0.url.standardizedFileURL.path }
         ImportEngine.consumableFiles.formUnion(paths)
-        let result = await runImport(offered.map { $0.url.absoluteString }, app: app, session: nav.session)
-        if result?["cancelled"]?.boolValue == true || result == nil {
+        let result = await runImport(offered.map { $0.url.absoluteString }, app: app, navigator: nav)
+        if result == nil || result?["cancelled"]?.boolValue == true {
             declined.formUnion(loose.map { $0.key })
         }
         ImportEngine.consumableFiles.subtract(paths)
     }
 
     @discardableResult
-    private static func runImport(_ urls: [String], app: NibApp, session: EditorSession) async -> JSONValue? {
+    private static func runImport(_ urls: [String], app: NibApp, navigator: SceneNavigator) async -> JSONValue? {
         do {
             let params: JSONValue = ["urls": .array(urls.map { .string($0) })]
             return try await app.bus.execute(Invocation(command: CommandIDs.importFiles, params: params,
-                                                        principal: .user, session: session)).value
+                                                        principal: .user, session: navigator.session)).value
         } catch {
-            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                            userInfo: ["command": CommandIDs.importFiles, "error": NibError.wrap(error)])
+            ImportUI.report(NibError.wrap(error), navigator: navigator, app: app)
             return nil
         }
     }
@@ -221,17 +235,20 @@ enum DropLoader {
     /// Nib's own drags (clipboard fragments, sidebar pages) belong to the canvas and the page sidebar.
     static let ownTypes: Set<String> = ["app.nib.fragment", "app.nib.pages"]
 
-    @MainActor
-    static func plan(for provider: NSItemProvider, app: NibApp) -> DropPlan? {
-        let ids = provider.registeredTypeIdentifiers
-        if ids.contains(where: { ownTypes.contains($0) }) { return nil }
-        for id in ids {
+    /// The plan for a provider's registered types (in its order of preference). Pure.
+    static func plan(for typeIdentifiers: [String], content: ContentRegistries) -> DropPlan? {
+        if typeIdentifiers.contains(where: { ownTypes.contains($0) }) { return nil }
+        for id in typeIdentifiers {
             guard let type = UTType(id) else { continue }
             if type.conforms(to: .directory) { return .file(id) }
-            if let ext = type.preferredFilenameExtension, app.content.importer(forExtension: ext) != nil { return .file(id) }
-            if ImportEngine.importer(conformingTo: type, app: app) != nil { return .file(id) }
+            if let ext = type.preferredFilenameExtension, content.importer(forExtension: ext) != nil { return .file(id) }
+            if content.importers.all.contains(where: { d in d.utTypes.contains { UTType($0).map { type.conforms(to: $0) } ?? false } }) {
+                return .file(id)
+            }
         }
-        if ids.contains(UTType.url.identifier), !ids.contains(UTType.fileURL.identifier) { return .webLink }
+        if typeIdentifiers.contains(UTType.url.identifier), !typeIdentifiers.contains(UTType.fileURL.identifier) {
+            return .webLink
+        }
         return nil
     }
 
@@ -262,9 +279,8 @@ enum DropLoader {
                     continuation.resume(returning: (object as? NSURL).map { $0 as URL })
                 }
             }
-            guard let page = link, let scheme = page.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
-                return nil
-            }
+            guard let page = link, let scheme = page.scheme?.lowercased(), scheme == "https" || scheme == "http",
+                  page.host != nil else { return nil }
             let title = provider.suggestedName ?? page.host ?? String(localized: "Web page")
             return try? WebLocation.write(page, title: title, in: dir)
         }
@@ -309,7 +325,7 @@ final class ImportDropTarget: NSObject, UIDropInteractionDelegate {
 
     func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
         guard session.localDragSession == nil, let app = app else { return false }
-        return session.items.contains { DropLoader.plan(for: $0.itemProvider, app: app) != nil }
+        return session.items.contains { DropLoader.plan(for: $0.itemProvider.registeredTypeIdentifiers, content: app.content) != nil }
     }
 
     func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
@@ -319,27 +335,30 @@ final class ImportDropTarget: NSObject, UIDropInteractionDelegate {
     func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
         guard let app = app else { return }
         let providers = session.items.map { $0.itemProvider }
-        let editor = (window?.rootViewController as? SceneNavigator)?.session ?? app.services.sessions.active
-        Task { @MainActor in await ImportDropTarget.importDrop(providers, app: app, session: editor) }
+        let navigator = window?.rootViewController as? SceneNavigator
+        Task { @MainActor in await ImportDropTarget.importDrop(providers, app: app, navigator: navigator) }
     }
 
-    static func importDrop(_ providers: [NSItemProvider], app: NibApp, session: EditorSession?) async {
+    static func importDrop(_ providers: [NSItemProvider], app: NibApp, navigator: SceneNavigator?) async {
         let dir = ImportLocations.scratch.appendingPathComponent("drop-" + UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         var urls: [JSONValue] = []
         for provider in providers {
-            guard let plan = DropLoader.plan(for: provider, app: app),
+            guard let plan = DropLoader.plan(for: provider.registeredTypeIdentifiers, content: app.content),
                   let url = await DropLoader.load(provider, plan: plan, into: dir) else { continue }
             urls.append(.string(url.absoluteString))
         }
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty else {
+            ImportUI.report(NibError(.unsupported, String(localized: "Nib couldn't read what was dropped.")),
+                            navigator: navigator, app: app)
+            return
+        }
         do {
             _ = try await app.bus.execute(Invocation(command: CommandIDs.importFiles, params: ["urls": .array(urls)],
-                                                     principal: .user, session: session))
+                                                     principal: .user, session: navigator?.session ?? app.services.sessions.active))
         } catch {
-            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                            userInfo: ["command": CommandIDs.importFiles, "error": NibError.wrap(error)])
+            ImportUI.report(NibError.wrap(error), navigator: navigator, app: app)
         }
     }
 }

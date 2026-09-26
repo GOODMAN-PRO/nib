@@ -7,21 +7,18 @@ import NibContracts
 /// is reused), packages go through `LibraryService.importPackage`, other files through the importer registry.
 @MainActor
 enum PackageImporter {
-    static let packageID = "import.package"
-    static let archiveID = "import.archive"
-    static let packageExtensions = [NibFormat.packageExtension, NibFormat.legacyPackageExtension]
-
     static func packageDescriptor(owner: String) -> ImporterDescriptor {
-        ImporterDescriptor(id: packageID, title: String(localized: "Nib documents"), fileExtensions: packageExtensions,
-                           utTypes: [NibFormat.packageUTType], order: 100, owner: owner) { url, target, ctx in
+        ImporterDescriptor(id: ImportFormats.packageImporterID, title: String(localized: "Nib documents"),
+                           fileExtensions: ImportFormats.packageExtensions, utTypes: [NibFormat.packageUTType],
+                           order: 100, owner: owner) { url, target, ctx in
             try await PackageImporter.importPackage(url, target: target, ctx: ctx)
         }
     }
 
     /// Only the "zip" extension: .nibplugin and .nibcollection are zips too, but they belong to their own importers.
     static func archiveDescriptor(owner: String) -> ImporterDescriptor {
-        ImporterDescriptor(id: archiveID, title: String(localized: "Zipped folders and backups"), fileExtensions: ["zip"],
-                           order: 100, owner: owner) { url, target, ctx in
+        ImporterDescriptor(id: ImportFormats.archiveImporterID, title: String(localized: "Zipped folders and backups"),
+                           fileExtensions: ["zip"], utTypes: ["public.zip-archive"], order: 100, owner: owner) { url, target, ctx in
             try await PackageImporter.importArchive(url, target: target, ctx: ctx)
         }
     }
@@ -38,7 +35,7 @@ enum PackageImporter {
 
     static func importPackage(_ url: URL, target: ImportTarget, ctx: CommandContext) async throws -> [DocumentID] {
         guard target.document == nil else {
-            throw NibError(.unsupported, "a Nib document can't be imported into another document",
+            throw NibError(.unsupported, "a Nib document can't be imported into another document", path: "$.doc",
                            hint: "import it as a new document (leave out doc), then move its pages with page.moveTo")
         }
         guard StagingIO.isDirectory(url) else {
@@ -48,15 +45,17 @@ enum PackageImporter {
             }
             return try await importArchive(url, target: target, ctx: ctx)
         }
+        if ctx.dryRun { return [] }
         let library = try ctx.services.require(ctx.services.library, "the library")
         return [try library.importPackage(at: url, into: target.folder)]
     }
 
     static func importArchive(_ url: URL, target: ImportTarget, ctx: CommandContext) async throws -> [DocumentID] {
         guard target.document == nil else {
-            throw NibError(.unsupported, "a zip archive can only be imported as new documents",
+            throw NibError(.unsupported, "a zip archive can only be imported as new documents", path: "$.doc",
                            hint: "leave out doc to recreate its folders in the library")
         }
+        if ctx.dryRun { return [] }
         let dest = ImportLocations.scratch.appendingPathComponent("unzip-" + UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: dest) }
         do {
@@ -66,6 +65,8 @@ enum PackageImporter {
         }
         let library = try ctx.services.require(ctx.services.library, "the library")
         if let backup = backupRoot(in: dest) {
+            // A whole-library backup: its library data (templates, elements, tape, plugins, plugin data, AI chats,
+            // other devices' prefs) joins this library's, then its folders and documents are recreated.
             let data = backup.appendingPathComponent(NibFormat.libraryDirectory, isDirectory: true)
             let into = library.metadataURL
             try await Task.detached(priority: .userInitiated) { try ArchiveIO.merge(data, into: into, skipping: ["trash"]) }.value
@@ -77,17 +78,20 @@ enum PackageImporter {
 
     /// A dropped or picked folder: recreated as a library folder with everything inside it.
     static func importFolder(_ url: URL, into parent: FolderID?, ctx: CommandContext) async throws -> [DocumentID] {
+        if ctx.dryRun { return [] }
         let library = try ctx.services.require(ctx.services.library, "the library")
         let folder = try folderNamed(url.lastPathComponent, in: parent, library: library)
         return try await importContents(of: url, into: folder, ctx: ctx, library: library)
     }
 
     /// Imports every visible entry of `dir` into `folder`: packages as documents, directories as folders (recursively),
-    /// files through the registry (runs of images become one notebook). Files nothing can import are skipped.
+    /// files through the registry (runs of images become one notebook). Files nothing can import are skipped; when
+    /// nothing at all could be imported, the first reason is thrown.
     static func importContents(of dir: URL, into folder: FolderID?, ctx: CommandContext, library: LibraryService,
                                depth: Int = 0) async throws -> [DocumentID] {
-        guard depth < 32, let app = ImportHost.app(for: ctx) else { return [] }
+        guard depth < NibLimits.maxNesting * 2 else { return [] }
         var docs: [DocumentID] = []
+        var foundFolder = false
         var firstError: Error?
         var files: [(url: URL, isDirectory: Bool)] = []
         for entry in ArchiveIO.visibleEntries(of: dir) {
@@ -96,6 +100,7 @@ enum PackageImporter {
                     docs.append(try library.importPackage(at: entry.url, into: folder))
                 } else if entry.isDirectory {
                     let child = try folderNamed(entry.url.lastPathComponent, in: folder, library: library)
+                    foundFolder = true
                     docs += try await importContents(of: entry.url, into: child, ctx: ctx, library: library, depth: depth + 1)
                 } else {
                     files.append(entry)
@@ -105,28 +110,34 @@ enum PackageImporter {
                 importLog.error("skipped \(entry.url.lastPathComponent, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
         }
-        var noIDs: [String] = []
-        for group in ImportEngine.groups(files, app: app) where group.kind != .unsupported {
+        for group in ImportEngine.groups(files, content: ctx.content) {
+            let urls = group.indices.map { files[$0].url }
+            guard group.kind != .unsupported else {
+                firstError = firstError ?? ImportEngine.unsupported(urls[0], content: ctx.content)
+                continue
+            }
             do {
-                docs += try await ImportEngine.run(group, urls: group.indices.map { files[$0].url },
-                                                   target: ImportTarget(folder: folder), ids: &noIDs, ctx: ctx, app: app)
+                docs += try await ImportEngine.run(group, urls: urls,
+                                                   target: ImportTarget(folder: folder, displayName: ImportNaming.title(of: urls[0])),
+                                                   ctx: ctx)
             } catch {
                 firstError = firstError ?? error
                 importLog.error("skipped a file: \(error.localizedDescription, privacy: .public)")
             }
         }
-        if docs.isEmpty, let e = firstError { throw e }
+        if docs.isEmpty, !foundFolder, let e = firstError { throw e }
         return docs
     }
 
     /// The folder called `name` in `parent` (case-insensitive), created when missing.
     static func folderNamed(_ name: String, in parent: FolderID?, library: LibraryService) throws -> FolderID {
+        let title = ImportNaming.sanitize(name)
         if let existing = library.children(of: parent).first(where: {
-            $0.kind == .folder && $0.title.compare(name, options: .caseInsensitive) == .orderedSame
+            $0.kind == .folder && $0.title.compare(title, options: .caseInsensitive) == .orderedSame
         }) {
             return existing.id
         }
-        return try library.createFolder(title: name, in: parent, style: nil)
+        return try library.createFolder(title: title, in: parent, style: nil)
     }
 
     /// The root of a whole-library backup (it holds `.nib-library`), at the top of the archive or one folder down.
@@ -149,8 +160,7 @@ enum ArchiveIO {
         try FileManager.default.unzipItem(at: archive, to: destination)
     }
 
-    /// Zips the contents of `folder` (without the folder itself). ponytail: only tests build archives today; kept
-    /// here because this module already links ZIPFoundation.
+    /// Zips the contents of `folder` (without the folder itself).
     static func archive(contentsOf folder: URL, to archive: URL) throws {
         try FileManager.default.zipItem(at: folder, to: archive, shouldKeepParent: false, compressionMethod: .deflate)
     }
@@ -176,9 +186,9 @@ enum ArchiveIO {
     static func merge(_ source: URL, into destination: URL, skipping: Set<String>) throws {
         let fm = FileManager.default
         guard let walker = fm.enumerator(at: source, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }
-        let base = source.standardizedFileURL.path
+        let base = source.standardizedFileURL.resolvingSymlinksInPath().path
         for case let url as URL in walker {
-            let path = url.standardizedFileURL.path
+            let path = url.standardizedFileURL.resolvingSymlinksInPath().path
             guard path.hasPrefix(base + "/") else { continue }
             let relative = String(path.dropFirst(base.count + 1))
             if let top = relative.split(separator: "/").first, skipping.contains(String(top)) {

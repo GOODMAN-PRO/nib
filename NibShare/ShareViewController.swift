@@ -5,17 +5,8 @@ import UniformTypeIdentifiers
 /// Nib. With an App Group it writes them into `<group>/Inbox/`, which Nib offers to import the next time it becomes
 /// active. Without one it puts small payloads on the pasteboard and opens `nib://import?from=pasteboard`; larger
 /// items are saved to Files (On My iPad › Nib), which Nib also scans. This target cannot link NibKit: the constants
-/// below must stay in step with `ShareHandoff` in NibKit/Sources/FeatImport/InboxScanner.swift.
+/// in `ShareFiles.Handoff` must stay in step with `ShareHandoff` in NibKit/Sources/FeatImport/InboxScanner.swift.
 final class ShareViewController: UIViewController, UIDocumentPickerDelegate {
-    private enum Handoff {
-        static let link = "nib://import?from=pasteboard"
-        static let nameType = "app.nib.share.name"
-        static let dataType = "app.nib.share.data"
-        static let inboxFolder = "Inbox"
-        /// Larger items go through Files: the pasteboard holds them in memory in both processes.
-        static let pasteboardLimit = 10 * 1024 * 1024
-    }
-
     private let stack = UIStackView()
     private let titleLabel = UILabel()
     private let messageLabel = UILabel()
@@ -53,9 +44,9 @@ final class ShareViewController: UIViewController, UIDocumentPickerDelegate {
                  primary: (String(localized: "Done"), { [weak self] in self?.finish() }))
             return
         }
-        if let inbox = Self.appGroupInbox() {
+        if let inbox = ShareFiles.appGroupInbox() {
             do {
-                try Self.move(files, into: inbox)
+                try ShareFiles.move(files, into: inbox)
                 show(title: String(localized: "Sent to Nib"),
                      message: String(localized: "Open Nib to choose where it goes."),
                      primary: (String(localized: "Done"), { [weak self] in self?.finish() }))
@@ -64,8 +55,7 @@ final class ShareViewController: UIViewController, UIDocumentPickerDelegate {
                 // An unusable group container: fall back to the hand-off below.
             }
         }
-        let fitsPasteboard = !files.contains(where: Self.isDirectory) && Self.totalSize(files) <= Handoff.pasteboardLimit
-        guard fitsPasteboard else {
+        guard ShareFiles.fitsPasteboard(files) else {
             show(title: String(localized: "Save it to Files first"),
                  message: String(localized: "This is too large to hand over directly. Save it to On My iPad › Nib; Nib offers to import it the next time you open it."),
                  primary: (String(localized: "Save to Files"), { [weak self] in self?.saveToFiles() }),
@@ -73,13 +63,13 @@ final class ShareViewController: UIViewController, UIDocumentPickerDelegate {
             return
         }
         do {
-            try Self.putOnPasteboard(files)
+            try ShareFiles.putOnPasteboard(files)
         } catch {
             show(title: String(localized: "Couldn't send to Nib"), message: error.localizedDescription,
                  primary: (String(localized: "Done"), { [weak self] in self?.cancel() }))
             return
         }
-        if let url = URL(string: Handoff.link), openHostApp(url) {
+        if let url = URL(string: ShareFiles.Handoff.link), openHostApp(url) {
             finish()
         } else {
             show(title: String(localized: "Ready for Nib"),
@@ -132,60 +122,6 @@ final class ShareViewController: UIViewController, UIDocumentPickerDelegate {
         return false
     }
 
-    // MARK: Delivery helpers
-
-    /// `<group>/Inbox`, when the sideloading tool registered an App Group for Nib (ALTAppGroups / NibAppGroups).
-    private static func appGroupInbox() -> URL? {
-        let info = Bundle.main.infoDictionary ?? [:]
-        let ids = ((info["ALTAppGroups"] as? [String]) ?? []) + ((info["NibAppGroups"] as? [String]) ?? [])
-        for id in ids {
-            guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: id) else { continue }
-            let inbox = container.appendingPathComponent(Handoff.inboxFolder, isDirectory: true)
-            if (try? FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)) != nil { return inbox }
-        }
-        return nil
-    }
-
-    /// Moves each file in under a hidden name first, so Nib never sees a half-written file.
-    private static func move(_ files: [URL], into inbox: URL) throws {
-        let fm = FileManager.default
-        for file in files {
-            let hidden = inbox.appendingPathComponent("." + UUID().uuidString + ".part")
-            try fm.copyItem(at: file, to: hidden)
-            try fm.moveItem(at: hidden, to: unique(file.lastPathComponent, in: inbox))
-        }
-    }
-
-    private static func putOnPasteboard(_ files: [URL]) throws {
-        var items: [[String: Any]] = []
-        for file in files {
-            let data = try Data(contentsOf: file)
-            items.append([Handoff.nameType: Data(file.lastPathComponent.utf8), Handoff.dataType: data])
-        }
-        UIPasteboard.general.setItems(items, options: [.localOnly: true,
-                                                       .expirationDate: Date().addingTimeInterval(3600)])
-    }
-
-    private static func isDirectory(_ url: URL) -> Bool {
-        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-    }
-
-    private static func totalSize(_ files: [URL]) -> Int {
-        files.reduce(0) { $0 + ((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
-    }
-
-    static func unique(_ name: String, in dir: URL) -> URL {
-        var candidate = dir.appendingPathComponent(name)
-        let base = (name as NSString).deletingPathExtension
-        let ext = (name as NSString).pathExtension
-        var n = 2
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            candidate = dir.appendingPathComponent(ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)")
-            n += 1
-        }
-        return candidate
-    }
-
     // MARK: Interface (system components only: the extension has no access to NibDesign)
 
     private func buildInterface() {
@@ -205,6 +141,7 @@ final class ShareViewController: UIViewController, UIDocumentPickerDelegate {
         secondaryButton.addAction(UIAction { [weak self] _ in self?.secondaryAction?() }, for: .primaryActionTriggered)
         for button in [primaryButton, secondaryButton] {
             button.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+            button.titleLabel?.adjustsFontForContentSizeCategory = true
         }
         stack.axis = .vertical
         stack.alignment = .fill
@@ -226,7 +163,8 @@ final class ShareViewController: UIViewController, UIDocumentPickerDelegate {
                       primary: (String, () -> Void)? = nil, secondary: (String, () -> Void)? = nil) {
         titleLabel.text = title
         messageLabel.text = message
-        busy ? spinner.startAnimating() : spinner.stopAnimating()
+        if busy { spinner.startAnimating() } else { spinner.stopAnimating() }
+        spinner.accessibilityLabel = busy ? String(localized: "Preparing") : nil
         primaryAction = primary?.1
         secondaryAction = secondary?.1
         primaryButton.configuration?.title = primary?.0
@@ -234,6 +172,111 @@ final class ShareViewController: UIViewController, UIDocumentPickerDelegate {
         primaryButton.isHidden = primary == nil
         secondaryButton.isHidden = secondary == nil
         UIAccessibility.post(notification: .screenChanged, argument: titleLabel)
+    }
+}
+
+/// Files the extension writes and hands over. Pure apart from the file system and the pasteboard; callable from any
+/// thread (NSItemProvider calls back on its own queues).
+enum ShareFiles {
+    /// Keep in step with `ShareHandoff` (NibKit/Sources/FeatImport/InboxScanner.swift).
+    enum Handoff {
+        static let link = "nib://import?from=pasteboard"
+        static let nameType = "app.nib.share.name"
+        static let dataType = "app.nib.share.data"
+        static let inboxFolder = "Inbox"
+        /// Larger items go through Files: the pasteboard holds them in memory in both processes.
+        static let pasteboardLimit = 10 * 1024 * 1024
+    }
+
+    /// `<group>/Inbox`, when the sideloading tool registered an App Group for Nib (ALTAppGroups / NibAppGroups).
+    static func appGroupInbox() -> URL? {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let ids = ((info["ALTAppGroups"] as? [String]) ?? []) + ((info["NibAppGroups"] as? [String]) ?? [])
+        for id in ids {
+            guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: id) else { continue }
+            let inbox = container.appendingPathComponent(Handoff.inboxFolder, isDirectory: true)
+            if (try? FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)) != nil { return inbox }
+        }
+        return nil
+    }
+
+    /// Moves each file in under a hidden name first, so Nib never sees a half-written file.
+    static func move(_ files: [URL], into inbox: URL) throws {
+        let fm = FileManager.default
+        for file in files {
+            let hidden = inbox.appendingPathComponent("." + UUID().uuidString + ".part")
+            try fm.copyItem(at: file, to: hidden)
+            try fm.moveItem(at: hidden, to: unique(file.lastPathComponent, in: inbox))
+        }
+    }
+
+    static func fitsPasteboard(_ files: [URL]) -> Bool {
+        !files.contains(where: isDirectory) && totalSize(files) <= Handoff.pasteboardLimit
+    }
+
+    @MainActor
+    static func putOnPasteboard(_ files: [URL]) throws {
+        var items: [[String: Any]] = []
+        for file in files {
+            let data = try Data(contentsOf: file)
+            items.append([Handoff.nameType: Data(file.lastPathComponent.utf8), Handoff.dataType: data])
+        }
+        UIPasteboard.general.setItems(items, options: [.localOnly: true,
+                                                       .expirationDate: Date().addingTimeInterval(3600)])
+    }
+
+    static func isDirectory(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+    }
+
+    static func totalSize(_ files: [URL]) -> Int {
+        files.reduce(0) { $0 + ((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+    }
+
+    /// A path-safe file name (no separators, no leading dots).
+    static func safeName(_ name: String, fallback: String) -> String {
+        var s = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while s.hasPrefix(".") { s.removeFirst() }
+        return s.isEmpty ? fallback : String(s.prefix(200))
+    }
+
+    static func unique(_ name: String, in dir: URL) -> URL {
+        var candidate = dir.appendingPathComponent(name)
+        let base = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        var n = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = dir.appendingPathComponent(ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)")
+            n += 1
+        }
+        return candidate
+    }
+
+    /// A `.webloc` (property list with "URL"): Nib imports the page from its live address.
+    static func writeWebLocation(_ url: URL, title: String, in dir: URL) throws -> URL {
+        let data = try PropertyListSerialization.data(fromPropertyList: ["URL": url.absoluteString],
+                                                      format: .xml, options: 0)
+        let file = unique(safeName(title, fallback: "Web page") + ".webloc", in: dir)
+        try data.write(to: file, options: .atomic)
+        return file
+    }
+
+    /// Shared text as a small web page, which Nib lays out as a notebook page (plain text files would be read as
+    /// study-set rows).
+    static func writeText(_ text: String, title: String, in dir: URL) throws -> URL {
+        let escaped = text.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        let html = """
+        <!doctype html><html><head><meta charset="utf-8">\
+        <meta name="viewport" content="width=device-width, initial-scale=1">\
+        <style>:root { color-scheme: light; } body { font: -apple-system-body; margin: 0; }\
+         p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }</style></head>\
+        <body><p>\(escaped)</p></body></html>
+        """
+        let file = unique(safeName(title, fallback: "Shared text") + ".html", in: dir)
+        try Data(html.utf8).write(to: file, options: .atomic)
+        return file
     }
 }
 
@@ -247,7 +290,7 @@ enum SharedItemLoader {
         if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier),
            !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier),
            let link = await loadURL(provider), isWebAddress(link) {
-            return try? writeWebLocation(link, title: provider.suggestedName ?? link.host ?? "Web page", in: dir)
+            return try? ShareFiles.writeWebLocation(link, title: provider.suggestedName ?? link.host ?? "Web page", in: dir)
         }
         if provider.canLoadObject(ofClass: UIImage.self), let url = await loadImage(provider, into: dir) {
             return url
@@ -255,16 +298,15 @@ enum SharedItemLoader {
         if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier),
            let text = await loadText(provider)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
             if let link = URL(string: text), isWebAddress(link), !text.contains(where: { $0.isWhitespace }) {
-                return try? writeWebLocation(link, title: link.host ?? "Web page", in: dir)
+                return try? ShareFiles.writeWebLocation(link, title: link.host ?? "Web page", in: dir)
             }
-            let file = ShareViewController.unique((provider.suggestedName ?? "Shared text") + ".txt", in: dir)
-            return (try? Data(text.utf8).write(to: file, options: .atomic)) == nil ? nil : file
+            return try? ShareFiles.writeText(text, title: provider.suggestedName ?? "Shared text", in: dir)
         }
         return nil
     }
 
     /// The best file type on offer: documents, images, archives and folders. Web addresses and plain or rich text
-    /// are handled on their own (a web page imports from its address, text as a text file).
+    /// are handled on their own (a web page imports from its address, text as a page).
     static func fileTypeID(_ ids: [String]) -> String? {
         ids.first { id in
             guard let type = UTType(id) else { return false }
@@ -292,8 +334,7 @@ enum SharedItemLoader {
                     let ext = url.pathExtension.isEmpty ? (UTType(typeID)?.preferredFilenameExtension ?? "") : url.pathExtension
                     if !ext.isEmpty { name += "." + ext }
                 }
-                name = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
-                let dest = ShareViewController.unique(name, in: dir)
+                let dest = ShareFiles.unique(ShareFiles.safeName(name, fallback: "Shared file"), in: dir)
                 do {
                     try FileManager.default.copyItem(at: url, to: dest)
                     continuation.resume(returning: dest)
@@ -319,7 +360,7 @@ enum SharedItemLoader {
             }
         }
         guard let png = data else { return nil }
-        let file = ShareViewController.unique((provider.suggestedName ?? "Image") + ".png", in: dir)
+        let file = ShareFiles.unique(ShareFiles.safeName(provider.suggestedName ?? "", fallback: "Image") + ".png", in: dir)
         return (try? png.write(to: file, options: .atomic)) == nil ? nil : file
     }
 
@@ -337,14 +378,5 @@ enum SharedItemLoader {
                 }
             }
         }
-    }
-
-    private static func writeWebLocation(_ url: URL, title: String, in dir: URL) throws -> URL {
-        let data = try PropertyListSerialization.data(fromPropertyList: ["URL": url.absoluteString],
-                                                      format: .xml, options: 0)
-        let safe = title.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
-        let file = ShareViewController.unique((safe.isEmpty ? "Web page" : safe) + ".webloc", in: dir)
-        try data.write(to: file, options: .atomic)
-        return file
     }
 }

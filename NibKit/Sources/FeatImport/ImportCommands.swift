@@ -6,6 +6,42 @@ import NibContracts
 
 let importLog = Logger(subsystem: "app.nib", category: "import")
 
+// MARK: - Formats
+
+/// The file formats this feature knows by name. Pure and thread-safe.
+enum ImportFormats {
+    static let imageImporterID = "import.images"
+    static let packageImporterID = "import.package"
+    static let archiveImporterID = "import.archive"
+    static let officeImporterID = "import.office"
+    static let webImporterID = "import.webpage"
+
+    static let imageExtensions = ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "bmp", "webp"]
+    static let packageExtensions = [NibFormat.packageExtension, NibFormat.legacyPackageExtension]
+    static let officeExtensions = ["doc", "docx", "ppt", "pptx"]
+    static let presentationExtensions: Set<String> = ["ppt", "pptx"]
+    static let webLocationExtension = "webloc"
+    static let webExtensions = ["html", "htm", webLocationExtension]
+    /// Element collections (F035); plugins use `NibFormat.pluginExtension` (F079).
+    static let collectionExtension = "nibcollection"
+
+    static func ext(_ name: String) -> String { (name as NSString).pathExtension.lowercased() }
+
+    /// Formats whose content can become pages of a notebook: the import dialog offers "Current Document" only when
+    /// every file is one of these.
+    static func isPageFormat(_ name: String) -> Bool {
+        let e = ext(name)
+        return e == "pdf" || imageExtensions.contains(e) || officeExtensions.contains(e) || webExtensions.contains(e)
+    }
+
+    /// Plugins and element collections are not documents: their importers show their own review, so no dialog asks
+    /// where they go.
+    static func needsDestination(_ name: String) -> Bool {
+        let e = ext(name)
+        return e != NibFormat.pluginExtension && e != collectionExtension
+    }
+}
+
 // MARK: - Results and destinations
 
 struct ImportFailure: Codable, Equatable {
@@ -20,6 +56,8 @@ struct ImportResult: Codable, Equatable {
     var refs: [String]
     /// Pages inserted into an existing document ("page:D/P"), in page order.
     var pages: [String]?
+    /// Library folders created for imported folder trees, zip archives and backups ("folder:F").
+    var folders: [String]?
     /// Files that could not be imported while others were.
     var failed: [ImportFailure]?
     /// The user closed the import dialog or the Files picker.
@@ -28,7 +66,7 @@ struct ImportResult: Codable, Equatable {
     static let cancelledResult = ImportResult(refs: [], cancelled: true)
 }
 
-/// Where imported files go: new documents in a folder (nil = library root), or pages at a position in a notebook.
+/// Where imported files go: new documents in a folder (nil = library root), or pages at a position in a document.
 struct ImportDestination: Equatable {
     var folder: FolderID?
     var doc: DocumentID?
@@ -37,7 +75,11 @@ struct ImportDestination: Equatable {
 
     static let libraryRoot = ImportDestination()
 
-    var target: ImportTarget { ImportTarget(folder: folder, document: doc, position: position, anchorPage: anchor) }
+    /// The importer target for one file (or run of images): its title and the caller's ids still unused.
+    func target(displayName: String?, ids: [NibID]) -> ImportTarget {
+        ImportTarget(folder: folder, document: doc, position: position, anchorPage: anchor, displayName: displayName,
+                     ids: ids.isEmpty ? nil : ids)
+    }
 
     /// Parses `import.files` params. nil = the caller chose no destination (the user is asked when there is a window).
     static func parse(folder: String?, doc: String?, position: String?, anchor: String?) throws -> ImportDestination? {
@@ -49,56 +91,50 @@ struct ImportDestination: Equatable {
         var chosen = false
         if let f = clean(folder) {
             chosen = true
-            if f != "lib" && f != "library" {
-                if let ref = NodeRef(f) {
-                    guard case .folder(let id) = ref else {
-                        throw NibError.invalid("'folder' must be a folder ref such as folder:F, or \"lib\"", path: "$.folder")
-                    }
-                    dest.folder = id
-                } else if NibID.isValid(f) {
-                    dest.folder = NibID(f)
-                } else {
-                    throw NibError.invalid("'folder' must be a folder ref such as folder:F, or \"lib\"", path: "$.folder")
-                }
+            switch NodeRef(f) {
+            case .library?:
+                break
+            case .folder(let id)?:
+                dest.folder = id
+            case nil where NibID.isValid(f):
+                dest.folder = NibID(f)
+            default:
+                throw NibError(.invalidParams, "'folder' must be a folder ref such as folder:F, or lib", path: "$.folder",
+                               hint: "call library.list for folder refs")
             }
         }
         if let d = clean(doc) {
             chosen = true
-            if let ref = NodeRef(d) {
-                switch ref {
-                case .document(let id):
-                    dest.doc = id
-                case .page(let id, let page):
-                    dest.doc = id
-                    dest.anchor = page
-                default:
-                    throw NibError.invalid("'doc' must be a document ref such as doc:D", path: "$.doc")
-                }
-            } else if NibID.isValid(d) {
+            switch NodeRef(d) {
+            case .document(let id)?:
+                dest.doc = id
+            case .page(let id, let page)?:
+                dest.doc = id
+                dest.anchor = page
+            case nil where NibID.isValid(d):
                 dest.doc = NibID(d)
-            } else {
-                throw NibError.invalid("'doc' must be a document ref such as doc:D", path: "$.doc")
+            default:
+                throw NibError(.invalidParams, "'doc' must be a document ref such as doc:D", path: "$.doc",
+                               hint: "call library.list for document refs")
             }
         }
         if let a = clean(anchor) {
-            if let ref = NodeRef(a) {
-                guard case .page(let d, let page) = ref else {
-                    throw NibError.invalid("'anchor' must be a page ref such as page:D/P", path: "$.anchor")
-                }
+            switch NodeRef(a) {
+            case .page(let d, let page)?:
                 if let doc = dest.doc, doc != d {
-                    throw NibError.invalid("'anchor' is a page of another document", path: "$.anchor")
+                    throw NibError.invalid("'anchor' is a page of another document than 'doc'", path: "$.anchor")
                 }
                 dest.doc = d
                 dest.anchor = page
                 chosen = true
-            } else if NibID.isValid(a) {
+            case nil where NibID.isValid(a):
                 dest.anchor = NibID(a)
-            } else {
+            default:
                 throw NibError.invalid("'anchor' must be a page ref such as page:D/P", path: "$.anchor")
             }
         }
         if let p = clean(position) {
-            guard let pos = PagePosition(rawValue: p) else {
+            guard let pos = PagePosition(rawValue: p.lowercased()) else {
                 throw NibError.invalid("'position' must be before, after, start or end", path: "$.position")
             }
             dest.position = pos
@@ -109,10 +145,11 @@ struct ImportDestination: Equatable {
             throw NibError(.invalidParams, "'position' and 'anchor' place pages in a document, so they need 'doc'",
                            path: "$.doc", hint: "pass doc:D, or leave out position and anchor to create new documents")
         }
-        if dest.doc != nil, dest.folder != nil {
-            throw NibError(.invalidParams, "pass either 'folder' (new documents) or 'doc' (pages in a notebook), not both",
+        if dest.doc != nil, clean(folder) != nil {
+            throw NibError(.invalidParams, "pass either 'folder' (new documents) or 'doc' (pages in a document), not both",
                            path: "$.folder")
         }
+        if dest.position == .start || dest.position == .end { dest.anchor = nil }
         return chosen ? dest : nil
     }
 }
@@ -142,6 +179,7 @@ struct StagedFile {
     var bookmark: Data?
 }
 
+/// Names of imported files. Pure.
 enum ImportNaming {
     /// Human file name of a url string: the last path component, percent-decoded, or the host of a bare web address.
     static func displayName(of original: String) -> String {
@@ -152,15 +190,22 @@ enum ImportNaming {
         return sanitize(last)
     }
 
+    /// The title a document gets from a file: its name without the extension.
+    static func title(of url: URL) -> String {
+        let base = (url.lastPathComponent as NSString).deletingPathExtension
+        return base.isEmpty ? String(localized: "Imported") : base
+    }
+
     /// A single safe path component: no separators, no leading dots, at most 200 characters.
     static func sanitize(_ name: String) -> String {
         var s = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: "\\", with: "-").replacingOccurrences(of: "\0", with: "")
         s = s.trimmingCharacters(in: .whitespacesAndNewlines)
         while s.hasPrefix(".") { s.removeFirst() }
         if s.count > 200 {
             let ext = (s as NSString).pathExtension
             let base = String((s as NSString).deletingPathExtension.prefix(190))
-            s = ext.isEmpty ? base : base + "." + ext
+            s = ext.isEmpty || ext.count > 9 ? String(s.prefix(200)) : base + "." + ext
         }
         return s.isEmpty ? String(localized: "Imported") : s
     }
@@ -273,8 +318,7 @@ final class ImportStaging {
     /// Resolves the source through `ctx.inputFile` (tmp: refs, https downloads, file:// for the user or the inboxes)
     /// and copies it here under its display name, naming extension-less files after their content.
     @MainActor
-    func stage(_ source: ImportSource, index: Int, ctx: CommandContext,
-               hasImporter: (URL) -> Bool) async throws -> StagedFile {
+    func stage(_ source: ImportSource, index: Int, ctx: CommandContext) async throws -> StagedFile {
         if let local = source.local {
             return StagedFile(source: source, url: local, isDirectory: StagingIO.isDirectory(local))
         }
@@ -296,39 +340,18 @@ final class ImportStaging {
         }.value
         var url = staged.url
         let isDirectory = StagingIO.isDirectory(url)
-        if !isDirectory, url.pathExtension.isEmpty || !hasImporter(url), let sniffed = ContentSniffer.sniff(url),
-           sniffed != url.pathExtension.lowercased() {
+        let content = ctx.content
+        if !isDirectory, url.pathExtension.isEmpty || ImportEngine.importer(for: url, isDirectory: false, content: content) == nil,
+           let sniffed = ContentSniffer.sniff(url), sniffed != url.pathExtension.lowercased() {
             let renamed = ImportNaming.unique(url.lastPathComponent + "." + sniffed, in: dir)
             try FileManager.default.moveItem(at: url, to: renamed)
             url = renamed
         }
         // A downloaded web page imports from its live address, so its styles and images load.
         if downloaded, ["html", "htm"].contains(url.pathExtension.lowercased()), let page = URL(string: source.original) {
-            url = try WebLocation.write(page, title: (url.lastPathComponent as NSString).deletingPathExtension, in: dir)
+            url = try WebLocation.write(page, title: ImportNaming.title(of: url), in: dir)
         }
         return StagedFile(source: source, url: url, isDirectory: isDirectory, bookmark: staged.bookmark)
-    }
-}
-
-// MARK: - Host lookup
-
-/// Maps a command's bus to its app, so importers can read `app.content` (two apps can exist in tests).
-@MainActor
-enum ImportHost {
-    private final class Box {
-        weak var app: NibApp?
-        init(_ app: NibApp) { self.app = app }
-    }
-
-    private static var apps: [ObjectIdentifier: Box] = [:]
-
-    static func attach(_ app: NibApp) {
-        apps = apps.filter { $0.value.app != nil }
-        apps[ObjectIdentifier(app.bus)] = Box(app)
-    }
-
-    static func app(for ctx: CommandContext) -> NibApp? {
-        apps[ObjectIdentifier(ctx.bus)]?.app ?? NibApp.shared
     }
 }
 
@@ -348,6 +371,29 @@ struct ImportGroup: Equatable {
     var indices: [Int]
 }
 
+/// Page order keys around an insertion point. Pure.
+enum PageSlot {
+    /// Order keys of the live pages around the insertion point (nil = open end). A missing anchor means the end, like
+    /// `DocumentContent.orderKey`.
+    static func neighbours(_ live: [PageRecord], _ position: PagePosition, anchor: PageID?) -> (String?, String?) {
+        let anchorIndex = anchor.flatMap { a in live.firstIndex { $0.id == a } }
+        let index: Int
+        switch position {
+        case .start: index = 0
+        case .end: index = live.count
+        case .before: index = anchorIndex ?? live.count
+        case .after: index = anchorIndex.map { $0 + 1 } ?? live.count
+        }
+        return (index > 0 ? live[index - 1].order : nil, index < live.count ? live[index].order : nil)
+    }
+
+    /// `count` increasing order keys for pages inserted at `position` (balanced, so big imports keep short keys).
+    static func keys(_ live: [PageRecord], _ position: PagePosition, anchor: PageID?, count: Int) -> [String] {
+        let (lower, upper) = neighbours(live, position, anchor: anchor)
+        return FractionalIndex.balanced(count: count, after: lower, before: upper)
+    }
+}
+
 @MainActor
 enum ImportEngine {
     /// Paths of file:// inputs being imported right now; the inbox scan leaves them alone.
@@ -356,36 +402,38 @@ enum ImportEngine {
     static var consumableFiles = Set<String>()
 
     /// The registered importer for a file (by extension, then by UTType conformance). Plain folders have none.
-    static func importer(for url: URL, isDirectory: Bool, app: NibApp) -> ImporterDescriptor? {
+    static func importer(for url: URL, isDirectory: Bool, content: ContentRegistries) -> ImporterDescriptor? {
         let ext = url.pathExtension.lowercased()
-        if isDirectory && !PackageImporter.packageExtensions.contains(ext) { return nil }
-        if !ext.isEmpty, let d = app.content.importer(forExtension: ext) { return d }
-        guard !ext.isEmpty, let type = UTType(filenameExtension: ext) else { return nil }
-        return importer(conformingTo: type, app: app)
+        if isDirectory && !ImportFormats.packageExtensions.contains(ext) { return nil }
+        guard !ext.isEmpty else { return nil }
+        if let d = content.importer(forExtension: ext) { return d }
+        guard let type = UTType(filenameExtension: ext), !type.isDynamic else { return nil }
+        return importer(conformingTo: type, content: content)
     }
 
     /// The first importer (registry order) whose declared types `type` conforms to.
-    static func importer(conformingTo type: UTType, app: NibApp) -> ImporterDescriptor? {
-        app.content.importers.all.first { d in
+    static func importer(conformingTo type: UTType, content: ContentRegistries) -> ImporterDescriptor? {
+        content.importers.all.first { d in
             d.utTypes.contains { id in UTType(id).map { type.conforms(to: $0) } ?? false }
         }
     }
 
     /// True when Nib can import the item by itself (inbox scan): packages and files with an importer.
-    static func canImport(_ url: URL, isDirectory: Bool, app: NibApp) -> Bool {
+    static func canImport(_ url: URL, isDirectory: Bool, content: ContentRegistries) -> Bool {
         if isDirectory { return PackageImporter.isPackage(url) }
-        return importer(for: url, isDirectory: false, app: app) != nil
+        return importer(for: url, isDirectory: false, content: content) != nil
     }
 
     /// Groups files for dispatch: consecutive images handled by Nib's own image importer share one call.
-    static func groups(_ files: [(url: URL, isDirectory: Bool)], app: NibApp) -> [ImportGroup] {
+    static func groups(_ files: [(url: URL, isDirectory: Bool)], content: ContentRegistries) -> [ImportGroup] {
         var out: [ImportGroup] = []
         for (i, f) in files.enumerated() {
             let kind: ImportGroup.Kind
             if f.isDirectory && !PackageImporter.isPackage(f.url) {
                 kind = .folderTree
-            } else if let d = importer(for: f.url, isDirectory: f.isDirectory, app: app) {
-                kind = d.id == ImageImporter.id && d.owner == FeatImportFeature.id ? .images : .single(importerID: d.id)
+            } else if let d = importer(for: f.url, isDirectory: f.isDirectory, content: content) {
+                kind = d.id == ImportFormats.imageImporterID && d.owner == FeatImportFeature.id
+                    ? .images : .single(importerID: d.id)
             } else {
                 kind = .unsupported
             }
@@ -400,11 +448,10 @@ enum ImportEngine {
     }
 
     /// Runs one group into `target`. Returns the documents created or changed.
-    static func run(_ group: ImportGroup, urls: [URL], target: ImportTarget, ids: inout [String], ctx: CommandContext,
-                    app: NibApp) async throws -> [DocumentID] {
+    static func run(_ group: ImportGroup, urls: [URL], target: ImportTarget, ctx: CommandContext) async throws -> [DocumentID] {
         switch group.kind {
         case .images:
-            return try await ImageImporter.importImages(urls, target: target, ids: &ids, ctx: ctx).documents
+            return try await ImageImporter.importImages(urls, target: target, ctx: ctx).documents
         case .folderTree:
             guard target.document == nil else {
                 throw NibError(.unsupported, "a folder can only be imported as new documents",
@@ -412,36 +459,38 @@ enum ImportEngine {
             }
             return try await PackageImporter.importFolder(urls[0], into: target.folder, ctx: ctx)
         case .single(let id):
-            guard let d = app.content.importers.get(id) else { throw NibError.unavailable("the \(id) importer") }
+            guard let d = ctx.content.importers.get(id) else { throw NibError.unavailable("the \(id) importer") }
             return try await d.handler(urls[0], target, ctx)
         case .unsupported:
-            let ext = urls[0].pathExtension.lowercased()
-            let known = Set(app.content.importers.all.flatMap { $0.fileExtensions }).sorted().joined(separator: ", ")
-            throw NibError(.unsupported, ext.isEmpty ? "Nib can't tell what kind of file \(urls[0].lastPathComponent) is"
-                                                     : "Nib can't import .\(ext) files",
-                           hint: "supported: \(known), folders and zipped folders")
+            throw unsupported(urls[0], content: ctx.content)
         }
+    }
+
+    static func unsupported(_ url: URL, content: ContentRegistries) -> NibError {
+        let ext = url.pathExtension.lowercased()
+        let known = Set(content.importers.all.flatMap { $0.fileExtensions }).sorted().joined(separator: ", ")
+        return NibError(.unsupported, ext.isEmpty ? "Nib can't tell what kind of file \(url.lastPathComponent) is"
+                                                  : "Nib can't import .\(ext) files",
+                        hint: "supported: \(known), folders and zipped folders")
     }
 
     /// The whole of `import.files`: expand the share hand-off, ask where (user, no destination), stage, dispatch,
     /// advance the insertion point file by file, keep import-in-place bookmarks and consume inbox copies.
     static func perform(_ sources: [ImportSource], destination: ImportDestination?, ids: [String]?, ctx: CommandContext,
                         dialog: ImportDialogSession? = nil, reveal: Bool = false) async throws -> ImportResult {
-        if let ids = ids {
-            for (i, s) in ids.enumerated() where !NibID.isValid(s) {
-                throw NibError.invalid("ids must be 1-64 characters of A-Z, a-z, 0-9, _ or -", path: "$.ids[\(i)]")
-            }
-        }
-        guard let app = ImportHost.app(for: ctx) else { throw NibError.unavailable("import") }
+        var idQueue = try validatedIDs(ids)
         let library = try ctx.services.require(ctx.services.library, "the library")
         let staging = try ImportStaging()
         defer { staging.cleanUp() }
 
         var sources = try expandHandoff(sources, staging: staging, ctx: ctx)
+        guard !sources.isEmpty else { return ImportResult(refs: []) }            // the hand-off was already taken
         var destination = destination
         var session = dialog
-        if destination == nil, session == nil, ctx.principal.isUser, !ctx.dryRun, let nav = await ImportUI.navigator(app) {
-            let ask = ImportDialogSession(app: app, navigator: nav, session: ctx.activeSession, sources: sources, preset: nil)
+        if destination == nil, session == nil, ctx.principal.isUser, !ctx.dryRun,
+           sources.contains(where: { ImportFormats.needsDestination($0.name) }), let nav = await ImportUI.navigator(ctx) {
+            let ask = ImportDialogSession(navigator: nav, library: ctx.services.library, workspace: ctx.workspace,
+                                          session: ctx.activeSession, sources: sources, preset: nil)
             guard let choice = await ask.choose() else {
                 for s in sources { consumeInboxCopy(s.original) }                  // a declined Open In leaves nothing behind
                 return .cancelledResult
@@ -453,7 +502,7 @@ enum ImportEngine {
         defer { session?.close() }
         var dest = destination ?? .libraryRoot
         try validate(&dest, library: library, ctx: ctx)
-        if ctx.dryRun { return ImportResult(refs: []) }                           // library writes cannot be rolled back
+        if ctx.dryRun { return ImportResult(refs: [], pages: dest.doc == nil ? nil : []) }  // library writes can't roll back
 
         let paths = sources.compactMap { URL(string: $0.original) }.filter { $0.isFileURL }.map { $0.standardizedFileURL.path }
         inFlight.formUnion(paths)
@@ -465,27 +514,27 @@ enum ImportEngine {
         for (i, s) in sources.enumerated() where session?.isCancelled != true {
             session?.progress(Double(i) / total, label: ImportUI.progressLabel(s.name, index: i, count: sources.count))
             do {
-                staged.append(try await staging.stage(s, index: i, ctx: ctx) { url in
-                    importer(for: url, isDirectory: false, app: app) != nil
-                })
+                staged.append(try await staging.stage(s, index: i, ctx: ctx))
             } catch {
                 failures.append(failure(s.original, error))
             }
         }
 
+        let foldersBefore = folderIDs(library)
         var refs: [String] = []
         var pageRefs: [String] = []
         var created: [DocumentID] = []
-        var idQueue = ids ?? []
+        var importedFiles = 0
         var done = 0
-        for group in groups(staged.map { (url: $0.url, isDirectory: $0.isDirectory) }, app: app) {
+        for group in groups(staged.map { (url: $0.url, isDirectory: $0.isDirectory) }, content: ctx.content) {
             if session?.isCancelled == true { break }
             let files = group.indices.map { staged[$0] }
             session?.progress((Double(sources.count) + Double(done)) / total,
                               label: ImportUI.progressLabel(files[0].source.name, index: done, count: staged.count))
             let before = dest.doc.flatMap { d in try? ctx.workspace.content(d).livePages.map { $0.id } } ?? []
+            let target = dest.target(displayName: ImportNaming.title(of: files[0].url), ids: idQueue)
             do {
-                let docs = try await run(group, urls: files.map { $0.url }, target: dest.target, ids: &idQueue, ctx: ctx, app: app)
+                let docs = try await run(group, urls: files.map { $0.url }, target: target, ctx: ctx)
                 for d in docs where !refs.contains(NodeRef.document(d).description) {
                     refs.append(NodeRef.document(d).description)
                 }
@@ -493,33 +542,40 @@ enum ImportEngine {
                     let known = Set(before)
                     let added = ((try? ctx.workspace.content(d).livePages.map { $0.id }) ?? []).filter { !known.contains($0) }
                     pageRefs += added.map { NodeRef.page(d, $0).description }
+                    idQueue.removeFirst(min(added.count, idQueue.count))
                     if let last = added.last {                                     // the next file follows this one
                         dest.position = .after
                         dest.anchor = last
                     }
                 } else {
                     created += docs
+                    idQueue.removeFirst(min(docs.count, idQueue.count))
                     rememberSource(files, docs: docs, ctx: ctx)
                 }
+                importedFiles += files.count
                 for f in files { consumeImported(f.source.original) }
             } catch {
                 for f in files { failures.append(failure(f.source.original, error)) }
             }
             done += files.count
         }
+        let newFolders = folderIDs(library).subtracting(foldersBefore)
+        let folderRefs = library.allNodes().filter { newFolders.contains($0.id) }
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+            .map { NodeRef.folder($0.id).description }
 
         let failed = failures.map { $0.0 }
-        if refs.isEmpty, session == nil, let first = failures.first {
+        if importedFiles == 0, session == nil, let first = failures.first {
             var e = first.1
             if failures.count > 1 { e.message = "none of the \(failures.count) files could be imported; first: " + e.message }
             throw e
         }
         let result = ImportResult(refs: refs, pages: dest.doc == nil ? nil : pageRefs,
-                                  failed: failed.isEmpty ? nil : failed)
+                                  folders: folderRefs.isEmpty ? nil : folderRefs, failed: failed.isEmpty ? nil : failed)
         if let session = session {
-            session.finish(imported: refs.isEmpty ? 0 : max(created.count, pageRefs.count, 1), failures: failed)
+            session.finish(imported: importedFiles, failures: failed)
         } else if ctx.principal.isUser, !failed.isEmpty {
-            ImportUI.reportPartialFailure(failed, app: app)
+            ImportUI.reportPartialFailure(failed, ctx: ctx)
         }
         if reveal || session != nil {
             await revealResult(result, created: created, destination: dest, ctx: ctx)
@@ -528,6 +584,19 @@ enum ImportEngine {
     }
 
     // MARK: Steps
+
+    /// Checks caller-chosen ids: each valid and none twice.
+    static func validatedIDs(_ ids: [String]?) throws -> [NibID] {
+        guard let ids = ids else { return [] }
+        var seen = Set<String>()
+        for (i, s) in ids.enumerated() {
+            guard NibID.isValid(s) else {
+                throw NibError.invalid("ids must be 1-64 characters of A-Z, a-z, 0-9, _ or -", path: "$.ids[\(i)]")
+            }
+            guard seen.insert(s).inserted else { throw NibError.invalid("id \(s) is listed twice", path: "$.ids[\(i)]") }
+        }
+        return ids.map { NibID($0) }
+    }
 
     /// Replaces the share-extension hand-off link (nib://import?from=pasteboard) by the files on the pasteboard.
     private static func expandHandoff(_ sources: [ImportSource], staging: ImportStaging,
@@ -539,7 +608,8 @@ enum ImportEngine {
                 continue
             }
             guard ctx.principal.isUser else {
-                throw NibError(.permissionDenied, "only the user can import what another app shared through the pasteboard")
+                throw NibError(.permissionDenied, "only the user can import what another app shared through the pasteboard",
+                               path: "$.urls")
             }
             let urls = try ShareHandoff.take(into: try staging.directory("handoff"))
             out += urls.map { ImportSource(original: $0.absoluteString, name: $0.lastPathComponent, local: $0) }
@@ -548,9 +618,11 @@ enum ImportEngine {
     }
 
     private static func validate(_ dest: inout ImportDestination, library: LibraryService, ctx: CommandContext) throws {
-        if let f = dest.folder, library.node(f)?.kind != .folder {
-            throw NibError(.notFound, "folder \(f.raw) not found", path: "$.folder",
-                           hint: "call library.list for folder refs, or pass \"lib\" for the library root")
+        if let f = dest.folder {
+            guard let node = library.node(f), node.kind == .folder, node.trashedAt == nil else {
+                throw NibError(.notFound, "folder \(f.raw) not found", path: "$.folder",
+                               hint: "call library.list for folder refs, or pass lib for the library root")
+            }
         }
         guard let d = dest.doc else { return }
         let content: DocumentContent
@@ -559,14 +631,25 @@ enum ImportEngine {
         } catch {
             throw NibError(.notFound, "document \(d.raw) not found", path: "$.doc", hint: "call library.list for document refs")
         }
-        if dest.anchor == nil, dest.position == .before || dest.position == .after,
-           let s = ctx.activeSession, s.document == d, let page = s.page {
+        if ctx.isReadOnly(d) {
+            throw NibError(.unsupported, "document \(d.raw) was saved by a newer version of Nib and opens read-only",
+                           path: "$.doc", hint: "update Nib, or import the files as new documents")
+        }
+        if dest.anchor == nil, dest.position == .before || dest.position == .after {
+            guard let s = ctx.activeSession, s.document == d, let page = s.page else {
+                throw NibError(.invalidParams, "'anchor' (page:D/P) is needed to place pages before or after a page",
+                               path: "$.anchor", hint: "pass anchor, or position start or end")
+            }
             dest.anchor = page
         }
         if let a = dest.anchor, content.pageIndex(a) == nil {
             throw NibError(.notFound, "page \(a.raw) not found in document \(d.raw)", path: "$.anchor",
                            hint: "call query.get {\"ref\": \"doc:\(d.raw)\"} for its pages")
         }
+    }
+
+    private static func folderIDs(_ library: LibraryService) -> Set<FolderID> {
+        Set(library.allNodes().filter { $0.kind == .folder }.map { $0.id })
     }
 
     /// Import-in-place: a PDF opened from a Files provider keeps a bookmark to its source, so "Save changes to
@@ -600,7 +683,7 @@ enum ImportEngine {
         try? FileManager.default.removeItem(at: url)
     }
 
-    /// Shows what arrived: goes to the first new page, or opens the one new document.
+    /// Shows what arrived: the first new page, the one new document, or the folder that holds several.
     private static func revealResult(_ result: ImportResult, created: [DocumentID], destination: ImportDestination,
                                      ctx: CommandContext) async {
         if let doc = destination.doc, let first = result.pages?.first {
@@ -610,8 +693,11 @@ enum ImportEngine {
                 _ = try? await ctx.execute(CommandIDs.docOpen, ["doc": .string(NodeRef.document(doc).description),
                                                                 "page": .string(first)])
             }
-        } else if created.count == 1 {
+        } else if created.count == 1, result.folders == nil {
             _ = try? await ctx.execute(CommandIDs.docOpen, ["doc": .string(NodeRef.document(created[0]).description)])
+        } else if !created.isEmpty || result.folders != nil {
+            let folder = result.folders?.first ?? destination.folder.map { NodeRef.folder($0).description } ?? "lib"
+            _ = try? await ctx.execute(CommandIDs.windowShowLibrary, ["folder": .string(folder)])
         }
     }
 
@@ -640,26 +726,31 @@ struct ImportFiles: NibCommand {
         let toFolder: JSONValue = ["urls": ["tmp:lecture.pdf"], "folder": "folder:FIXTUREFLD01"]
         let intoNotebook: JSONValue = ["urls": ["tmp:scan.png", "tmp:notes.png"], "doc": "doc:FIXTUREDOC01",
                                        "position": "after", "anchor": "page:FIXTUREDOC01/FIXTUREPG001"]
+        let withID: JSONValue = ["urls": ["tmp:holiday.jpg"], "folder": "lib", "ids": ["HOLIDAYDOC01"]]
         return CommandDescriptor(
             id: "import.files", title: "Import Files",
-            summary: "Import files (PDF, images, Word, PowerPoint, web pages, .nibnote, zipped folders, backups, CSV/TXT, plugins) as new documents in a folder, or as pages into a notebook.",
+            summary: "Import files (PDF, images, Word, PowerPoint, web pages, .nibnote, zips, backups, CSV/TXT, plugins) as new documents in a folder or as pages of a document → {refs, pages?, folders?, failed?}.",
             params: .obj([
                 "urls": .arr(.str("tmp:<name> from asset.upload, an https URL, or file:// (user only)")),
-                "folder": .str("folder:F (or \"lib\" for the library root) for new documents"),
-                "doc": .str("doc:D: insert pages into this notebook instead of creating documents"),
+                "folder": .str("folder:F (or lib for the library root) for new documents"),
+                "doc": .str("doc:D: insert pages into this document instead of creating documents"),
                 "position": .str("where the pages go in doc (default end; after when anchor is given)",
                                  choices: PagePosition.allCases.map { $0.rawValue }),
-                "anchor": .str("page:D/P that position is relative to (default: the current page)"),
-                "ids": .arr(.str(), "caller-chosen ids, in creation order, for new image notebooks or inserted image pages")
+                "anchor": .str("page:D/P that before/after is relative to (the user may omit it: the current page)"),
+                "ids": .arr(.str(), "caller-chosen ids in creation order: the new documents, or the new pages with doc")
             ], required: ["urls"]),
-            examples: [toFolder, intoNotebook],
+            examples: [toFolder, intoNotebook, withID],
             effect: .library, target: .library)
     }()
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> ImportResult {
-        guard !p.urls.isEmpty else { throw NibError.invalid("'urls' must list at least one file", path: "$.urls") }
+        let urls = p.urls.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard !urls.isEmpty else { throw NibError.invalid("'urls' must list at least one file", path: "$.urls") }
+        if let blank = urls.firstIndex(where: { $0.isEmpty }) {
+            throw NibError.invalid("empty url", path: "$.urls[\(blank)]")
+        }
         let destination = try ImportDestination.parse(folder: p.folder, doc: p.doc, position: p.position, anchor: p.anchor)
-        return try await ImportEngine.perform(p.urls.map { ImportSource(original: $0) }, destination: destination,
+        return try await ImportEngine.perform(urls.map { ImportSource(original: $0) }, destination: destination,
                                               ids: p.ids, ctx: ctx)
     }
 }
@@ -674,28 +765,30 @@ struct ImportPick: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "import.pick", title: "Import Files",
-        summary: "Show the Files picker and import the chosen files: target folder:F or lib (new documents), doc:D or page:D/P (insert pages); omitted asks where.",
+        summary: "Show the Files picker and import the chosen files: target lib or folder:F (new documents), doc:D or page:D/P (pages); omitted asks where.",
         params: .obj(["target": .str("lib, folder:F, doc:D (pages at the end) or page:D/P (pages after it); omitted = ask")]),
-        examples: [["target": "folder:FIXTUREFLD01"]],
+        examples: [["target": "folder:FIXTUREFLD01"], ["target": "page:FIXTUREDOC01/FIXTUREPG001"]],
         effect: .library, target: .library, userPresence: true)
 
     static func parseTarget(_ target: String?) throws -> ImportDestination? {
         guard let t = target?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
-        if t == "lib" || t == "library" { return .libraryRoot }
         switch NodeRef(t) {
+        case .library?: return .libraryRoot
         case .folder(let f)?: return ImportDestination(folder: f)
         case .document(let d)?: return ImportDestination(doc: d, position: .end)
         case .page(let d, let p)?: return ImportDestination(doc: d, position: .after, anchor: p)
-        default: throw NibError.invalid("'target' must be lib, folder:F, doc:D or page:D/P", path: "$.target")
+        default:
+            throw NibError(.invalidParams, "'target' must be lib, folder:F, doc:D or page:D/P", path: "$.target",
+                           hint: "leave it out to let the person choose")
         }
     }
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> ImportResult {
         let preset = try parseTarget(p.target)
-        guard !NibApp.isHostlessTest, let app = ImportHost.app(for: ctx), let nav = await ImportUI.navigator(app) else {
+        guard !NibApp.isHostlessTest, let nav = await ImportUI.navigator(ctx) else {
             throw NibError(.unavailable, "the Files picker needs a window", hint: "call import.files with urls instead")
         }
-        let picked = await DocumentPicker.pick(types: ImportUI.pickerTypes(app), navigator: nav)
+        let picked = await DocumentPicker.pick(types: ImportUI.pickerTypes(ctx.content), navigator: nav)
         guard !picked.isEmpty else { return .cancelledResult }
         // Picked files stay readable while the import runs (the engine opens them again from their paths).
         let access = picked.map { ($0, $0.startAccessingSecurityScopedResource()) }
@@ -703,8 +796,10 @@ struct ImportPick: NibCommand {
         var sources = picked.map { ImportSource(original: $0.absoluteString) }
         var destination = preset
         var dialog: ImportDialogSession?
-        if preset == nil || (preset?.doc != nil && picked.count > 1) {
-            let ask = ImportDialogSession(app: app, navigator: nav, session: ctx.activeSession, sources: sources, preset: preset)
+        let asksWhere = preset == nil && sources.contains { ImportFormats.needsDestination($0.name) }
+        if asksWhere || (preset?.doc != nil && picked.count > 1) {
+            let ask = ImportDialogSession(navigator: nav, library: ctx.services.library, workspace: ctx.workspace,
+                                          session: ctx.activeSession, sources: sources, preset: preset)
             guard let choice = await ask.choose() else { return .cancelledResult }
             destination = choice.destination
             sources = choice.order.map { sources[$0] }

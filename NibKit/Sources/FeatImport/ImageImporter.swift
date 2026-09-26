@@ -20,78 +20,79 @@ struct StoredImage {
 /// (Goodnotes' "Photos and images as pages"). Every page takes its image's aspect ratio at the default page width.
 @MainActor
 enum ImageImporter {
-    static let id = "import.images"
-    static let fileExtensions = ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "bmp", "webp"]
-
     static func descriptor(owner: String) -> ImporterDescriptor {
-        ImporterDescriptor(id: id, title: String(localized: "Images"), fileExtensions: fileExtensions,
-                           utTypes: [UTType.image.identifier], order: 100, owner: owner) { url, target, ctx in
-            var ids: [String] = []
-            return try await ImageImporter.importImages([url], target: target, ids: &ids, ctx: ctx).documents
+        ImporterDescriptor(id: ImportFormats.imageImporterID, title: String(localized: "Images"),
+                           fileExtensions: ImportFormats.imageExtensions, utTypes: [UTType.image.identifier],
+                           order: 100, owner: owner) { url, target, ctx in
+            try await ImageImporter.importImages([url], target: target, ctx: ctx).documents
         }
     }
 
-    /// `ids` (consumed from the front) name the new notebook, or the new pages when `target.document` is set.
-    static func importImages(_ urls: [URL], target: ImportTarget, ids: inout [String],
-                             ctx: CommandContext) async throws -> ImageImportOutcome {
+    /// `target.ids` (in order) name the new notebook, or the new pages when `target.document` is set;
+    /// `target.displayName` titles a new notebook.
+    static func importImages(_ urls: [URL], target: ImportTarget, ctx: CommandContext) async throws -> ImageImportOutcome {
         guard !urls.isEmpty else { return ImageImportOutcome(documents: [], pages: []) }
         let assets = try ctx.services.require(ctx.services.assets, "the asset store")
         let base = ctx.services.settings.get(NibSettings.defaultPageSize)
+        var ids = target.ids ?? []
 
         if let doc = target.document {
             let content = try ctx.workspace.content(doc)
             guard content.meta.kind == .notebook else {
-                throw NibError(.unsupported, "images become pages only in notebooks",
+                throw NibError(.unsupported, "images become pages only in notebooks", path: "$.doc",
                                hint: "import them as a new document, or place them on a page with image.insert")
             }
             var pageIDs: [PageID] = []
             for _ in urls {
-                let id = next(&ids)
+                let id = ids.isEmpty ? NibID.make() : ids.removeFirst()
                 guard content.page(id) == nil, !pageIDs.contains(id) else {
-                    throw NibError(.conflict, "page \(id.raw) already exists in document \(doc.raw)", path: "$.ids")
+                    throw NibError(.conflict, "page \(id.raw) already exists in document \(doc.raw)", path: "$.ids",
+                                   hint: "choose other ids, or leave ids out")
                 }
                 pageIDs.append(id)
             }
+            // A dry run changes nothing: assets are not rolled back, so they are not written either.
+            if ctx.dryRun { return ImageImportOutcome(documents: [doc], pages: []) }
             let stored = try await store(urls, doc: doc, assets: assets)
+            // Read the neighbours after the await: other commands may have changed the page list meanwhile.
+            let live = try ctx.workspace.content(doc).livePages
+            let keys = PageSlot.keys(live, target.position, anchor: target.anchorPage, count: stored.count)
+            var pages: [PageRecord] = []
+            for i in stored.indices {
+                pages.append(PageRecord(id: pageIDs[i], order: keys[i],
+                                        size: ImageFile.pageSize(forPixels: stored[i].pixels, base: base),
+                                        background: .ofImage(stored[i].asset)))
+            }
             try ctx.mutate(String(localized: "Import Images")) { tx in
-                var position = target.position
-                var anchor = target.anchorPage
-                for (id, image) in zip(pageIDs, stored) {
-                    var page = PageRecord(id: id, size: ImageFile.pageSize(forPixels: image.pixels, base: base),
-                                          background: .ofImage(image.asset))
-                    page.order = try tx.content(doc).orderKey(position, relativeTo: anchor)
-                    try tx.put(page, doc: doc)
-                    position = .after                                              // keep the files' order
-                    anchor = id
-                }
+                _ = try tx.put(pages, doc: doc)
             }
             return ImageImportOutcome(documents: [doc], pages: pageIDs)
         }
 
         let library = try ctx.services.require(ctx.services.library, "the library")
-        let docID = next(&ids)
+        let docID = ids.isEmpty ? NibID.make() : ids.removeFirst()
         guard library.node(docID) == nil else {
-            throw NibError(.conflict, "a document with id \(docID.raw) already exists", path: "$.ids")
+            throw NibError(.conflict, "a document with id \(docID.raw) already exists", path: "$.ids",
+                           hint: "choose another id, or leave ids out")
         }
+        if ctx.dryRun { return ImageImportOutcome(documents: [], pages: []) }   // a new document can't be rolled back
         var meta = DocumentMeta(id: docID, kind: .notebook,
                                 language: ctx.services.settings.get(NibSettings.defaultLanguage),
                                 scrollDirection: ctx.services.settings.get(NibSettings.scrollDirection))
-        meta.coverEnabled = false
-        let title = urls[0].deletingPathExtension().lastPathComponent
+        meta.coverEnabled = false                                                 // the first image is page 1
+        let title = target.displayName ?? ImportNaming.title(of: urls[0])
         // The asset store files bytes into the package, so the notebook exists before its pages.
         let doc = try library.createDocument(DocumentContent(meta: meta), title: title, in: target.folder)
         do {
             let stored = try await store(urls, doc: doc, assets: assets)
-            var pageIDs: [PageID] = []
+            let pages = stored.map { image in
+                PageRecord(size: ImageFile.pageSize(forPixels: image.pixels, base: base), background: .ofImage(image.asset))
+            }
             // The first pages of a new notebook are its content, not an edit to undo.
             try ctx.mutate(String(localized: "Import Images"), undoable: false) { tx in
-                for image in stored {
-                    let page = try tx.put(PageRecord(size: ImageFile.pageSize(forPixels: image.pixels, base: base),
-                                                     background: .ofImage(image.asset)), doc: doc)
-                    pageIDs.append(page.id)
-                }
+                _ = try tx.put(pages, doc: doc)
             }
-            return ImageImportOutcome(documents: [doc], pages: pageIDs)
+            return ImageImportOutcome(documents: [doc], pages: pages.map { $0.id })
         } catch {
             ctx.workspace.close(doc)
             try? library.deletePermanently(doc)                                   // never leave an empty notebook behind
@@ -111,10 +112,6 @@ enum ImageImporter {
         }
         return out
     }
-
-    private static func next(_ ids: inout [String]) -> NibID {
-        ids.isEmpty ? NibID.make() : NibID(ids.removeFirst())
-    }
 }
 
 /// Reading and sizing images. Pure and thread-safe.
@@ -132,16 +129,23 @@ enum ImageFile {
         } catch {
             throw NibError.notFound("image \(url.lastPathComponent)")
         }
+        return try prepare(data, name: url.lastPathComponent)
+    }
+
+    /// Measures the image and turns camera photos upright; animated GIFs are kept as they are.
+    static func prepare(_ data: Data, name: String) throws -> Prepared {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil), CGImageSourceGetCount(source) > 0,
               let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] else {
-            throw NibError(.unsupported, "\(url.lastPathComponent) is not an image Nib can read")
+            throw NibError(.unsupported, "\(name) is not an image Nib can read")
         }
         let width = (props[kCGImagePropertyPixelWidth as String] as? NSNumber)?.doubleValue ?? 0
         let height = (props[kCGImagePropertyPixelHeight as String] as? NSNumber)?.doubleValue ?? 0
+        guard width > 0, height > 0 else { throw NibError(.unsupported, "\(name) is an empty image") }
         let orientation = (props[kCGImagePropertyOrientation as String] as? NSNumber)?.intValue ?? 1
         let hasAlpha = (props[kCGImagePropertyHasAlpha as String] as? NSNumber)?.boolValue ?? false
-        var ext = url.pathExtension.lowercased()
-        if ext.isEmpty { ext = ContentSniffer.sniff(data) ?? "png" }
+        var ext = (name as NSString).pathExtension.lowercased()
+        if ext.isEmpty || !ImportFormats.imageExtensions.contains(ext) { ext = ContentSniffer.sniff(data) ?? "png" }
+        if ext == "jpeg" { ext = "jpg" }
         let animated = CGImageSourceGetCount(source) > 1
         if orientation != 1, !animated, let upright = upright(data, hasAlpha: hasAlpha) { return upright }
         let turned = (5...8).contains(orientation)
@@ -155,14 +159,16 @@ enum ImageFile {
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         format.opaque = !hasAlpha
-        let drawn = UIGraphicsImageRenderer(size: image.size, format: format).image { _ in
-            image.draw(in: CGRect(origin: .zero, size: image.size))
+        let pixels = CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
+        let drawn = UIGraphicsImageRenderer(size: pixels, format: format).image { _ in
+            image.draw(in: CGRect(origin: .zero, size: pixels))
         }
         guard let out = hasAlpha ? drawn.pngData() : drawn.jpegData(compressionQuality: 0.92) else { return nil }
-        return Prepared(data: out, ext: hasAlpha ? "png" : "jpg", pixels: image.size)
+        return Prepared(data: out, ext: hasAlpha ? "png" : "jpg", pixels: pixels)
     }
 
-    /// Page size for an image: its aspect ratio at the default page's width (the long side for landscape images).
+    /// Page size for an image: its aspect ratio at the default page's width (the long side for landscape images),
+    /// rounded to 1/100 pt and kept inside the page-size limits.
     static func pageSize(forPixels px: CGSize, base: PageSize) -> PageSize {
         let short = min(base.width, base.height)
         let long = max(base.width, base.height)

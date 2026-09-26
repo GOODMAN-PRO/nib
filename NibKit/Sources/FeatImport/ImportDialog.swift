@@ -53,7 +53,7 @@ enum ImportDialogLogic {
             }
             for node in sorted {
                 out.append(ImportFolderOption(folder: node.id, title: node.title, depth: depth))
-                if depth < 32 { visit(node.id, depth: depth + 1) }
+                if depth < NibLimits.maxNesting * 2 { visit(node.id, depth: depth + 1) }
             }
         }
         visit(nil, depth: 1)
@@ -70,8 +70,10 @@ enum ImportDialogLogic {
         if let preset = preset { return preset }
         guard mode == .currentDocument, let current = current else { return ImportDestination(folder: folder) }
         let anchored = position == .before || position == .after
-        return ImportDestination(doc: current.id, position: anchored && current.page == nil ? .end : position,
-                                 anchor: anchored ? current.page : nil)
+        if anchored, let page = current.page {
+            return ImportDestination(doc: current.id, position: position, anchor: page)
+        }
+        return ImportDestination(doc: current.id, position: anchored ? .end : position)
     }
 
     /// Moves the file at `index` (an entry of `order`) one step up (-1) or down (+1).
@@ -87,13 +89,18 @@ enum ImportDialogLogic {
     static func title(names: [String]) -> String {
         names.count == 1 ? String(localized: "Import “\(names[0])”?") : String(localized: "Import \(names.count) files?")
     }
-}
 
-extension PagePosition {
-    fileprivate var importTitle: String {
-        switch self {
-        case .before: return String(localized: "Before This Page")
-        case .after: return String(localized: "After This Page")
+    /// Pages can go into the open notebook only when every file is a page format (PDF, image, Office, web page).
+    static func allowsCurrentDocument(names: [String]) -> Bool {
+        !names.isEmpty && names.allSatisfy { ImportFormats.isPageFormat($0) }
+    }
+
+    static func positionTitle(_ position: PagePosition, pageNumber: Int?) -> String {
+        switch position {
+        case .before:
+            return pageNumber.map { String(localized: "Before Page \($0)") } ?? String(localized: "Before This Page")
+        case .after:
+            return pageNumber.map { String(localized: "After Page \($0)") } ?? String(localized: "After This Page")
         case .start: return String(localized: "At the Beginning")
         case .end: return String(localized: "At the End")
         }
@@ -137,11 +144,11 @@ final class ImportDialogModel: ObservableObject {
         self.order = Array(names.indices)
     }
 
-    static func make(app: NibApp, session: EditorSession?, names: [String], preset: ImportDestination?) -> ImportDialogModel {
-        let library = app.services.library
+    static func make(library: LibraryService?, workspace: Workspace, session: EditorSession?, names: [String],
+                     preset: ImportDestination?) -> ImportDialogModel {
         var current: ImportCurrentDocument?
-        if let s = session, let doc = s.document, let content = try? app.workspace.content(doc),
-           content.meta.kind == .notebook {
+        if ImportDialogLogic.allowsCurrentDocument(names: names), let s = session, let doc = s.document,
+           let content = try? workspace.content(doc), content.meta.kind == .notebook, !workspace.isReadOnly(doc) {
             let index = s.page.flatMap { content.pageIndex($0) }
             current = ImportCurrentDocument(id: doc, title: library?.node(doc)?.title ?? String(localized: "This notebook"),
                                             page: index == nil ? nil : s.page, pageNumber: index.map { $0 + 1 },
@@ -214,6 +221,7 @@ final class ImportDialogModel: ObservableObject {
 /// The import sheet: an opaque grouped surface (no glass in sheets), one Tinted primary in the header.
 struct ImportDialogView: View {
     @ObservedObject var model: ImportDialogModel
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
         VStack(spacing: 0) {
@@ -238,11 +246,7 @@ struct ImportDialogView: View {
                         .foregroundStyle(NibColor.labelSecondary)
                 }
             } else {
-                if model.current != nil {
-                    Section {
-                        NibSegmentedControl(selection: $model.mode, options: [.newDocument, .currentDocument]) { $0.title }
-                    }
-                }
+                if model.current != nil { modeSection }
                 if model.mode == .currentDocument, let current = model.current {
                     positionSection(current)
                 } else {
@@ -254,26 +258,34 @@ struct ImportDialogView: View {
         .listStyle(.insetGrouped)
     }
 
+    /// New Document / Current Document: a segmented control, or two rows at accessibility sizes so neither truncates.
+    @ViewBuilder
+    private var modeSection: some View {
+        if typeSize.isAccessibilitySize {
+            Section {
+                ForEach([ImportDialogMode.newDocument, .currentDocument], id: \.self) { mode in
+                    choiceRow(mode.title, icon: mode == .newDocument ? NibSymbol.notebook : NibSymbol.pdf,
+                              selected: model.mode == mode) {
+                        model.mode = mode
+                    }
+                }
+            }
+        } else {
+            Section {
+                NibSegmentedControl(selection: $model.mode, options: [.newDocument, .currentDocument]) { $0.title }
+                    .accessibilityLabel(String(localized: "Import as"))
+            }
+        }
+    }
+
     private var folderSection: some View {
         Section {
             ForEach(model.folders) { option in
-                let selected = model.folder == option.folder
-                Button {
+                choiceRow(option.title, icon: option.folder == nil ? NibSymbol.library : NibSymbol.folder,
+                          selected: model.folder == option.folder,
+                          indent: CGFloat(min(option.depth, NibMetrics.outlineMaxDepth)) * NibMetrics.outlineIndent) {
                     model.folder = option.folder
-                } label: {
-                    NibRow(option.title, icon: option.folder == nil ? NibSymbol.library : NibSymbol.folder) {
-                        if selected {
-                            Image(nib: .checkmark)
-                                .font(NibFont.bodyEmphasis)
-                                .foregroundStyle(NibColor.accent)
-                                .accessibilityHidden(true)
-                        }
-                    }
-                    .padding(.leading, CGFloat(min(option.depth, 6)) * NibSpacing.l)
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityAddTraits(selected ? .isSelected : [])
             }
         } header: {
             Text(String(localized: "Folder"))
@@ -282,7 +294,12 @@ struct ImportDialogView: View {
 
     private func positionSection(_ current: ImportCurrentDocument) -> some View {
         Section {
-            NibSegmentedControl(selection: $model.position, options: model.positions) { $0.importTitle }
+            ForEach(model.positions, id: \.self) { position in
+                choiceRow(ImportDialogLogic.positionTitle(position, pageNumber: current.pageNumber), icon: nil,
+                          selected: model.position == position) {
+                    model.position = position
+                }
+            }
         } header: {
             Text(String(localized: "Add pages to “\(current.title)”"))
         } footer: {
@@ -290,6 +307,26 @@ struct ImportDialogView: View {
                 Text(String(localized: "Page \(number) of \(current.pageCount) is open."))
             }
         }
+    }
+
+    /// A selectable row: the checkmark and the Selected trait carry the choice (never colour alone).
+    private func choiceRow(_ title: String, icon: NibSymbol?, selected: Bool, indent: CGFloat = 0,
+                           action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            NibRow(title, icon: icon) {
+                if selected {
+                    Image(nib: .checkmark)
+                        .font(NibFont.bodyEmphasis)
+                        .foregroundStyle(NibColor.accent)
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.leading, indent)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverEffect(.highlight)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private var filesSection: some View {
@@ -327,8 +364,10 @@ struct ImportDialogView: View {
             Text(model.progressLabel)
                 .font(NibFont.callout)
                 .foregroundStyle(NibColor.label)
-                .lineLimit(2)
+                .lineLimit(3)
             NibProgressBar(value: model.progress)
+                .accessibilityLabel(String(localized: "Import progress"))
+                .accessibilityValue(Text(model.progress, format: .percent.precision(.fractionLength(0))))
             if model.cancelRequested {
                 Text(String(localized: "Stopping after this file."))
                     .font(NibFont.footnote)
@@ -337,7 +376,6 @@ struct ImportDialogView: View {
         }
         .padding(NibSpacing.xl)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .accessibilityElement(children: .combine)
     }
 
     private var finished: some View {
@@ -346,6 +384,7 @@ struct ImportDialogView: View {
                 ForEach(Array(model.failures.enumerated()), id: \.offset) { entry in
                     NibRow(ImportNaming.displayName(of: entry.element.url), subtitle: entry.element.message,
                            icon: .warningTriangle)
+                        .accessibilityElement(children: .combine)
                 }
             } header: {
                 Text(String(localized: "Not imported"))
@@ -366,10 +405,11 @@ final class ImportDialogSession {
     private var controller: UIViewController?
     private var pending: CheckedContinuation<ImportChoice?, Never>?
 
-    init(app: NibApp, navigator: SceneNavigator, session: EditorSession?, sources: [ImportSource],
-         preset: ImportDestination?) {
+    init(navigator: SceneNavigator, library: LibraryService?, workspace: Workspace, session: EditorSession?,
+         sources: [ImportSource], preset: ImportDestination?) {
         self.navigator = navigator
-        self.model = ImportDialogModel.make(app: app, session: session, names: sources.map { $0.name }, preset: preset)
+        self.model = ImportDialogModel.make(library: library, workspace: workspace, session: session,
+                                            names: sources.map { $0.name }, preset: preset)
     }
 
     var isCancelled: Bool { model.cancelRequested }
@@ -393,7 +433,7 @@ final class ImportDialogSession {
     }
 
     func progress(_ value: Double, label: String) {
-        model.progress = value
+        model.progress = min(max(value, 0), 1)
         model.progressLabel = label
     }
 
@@ -480,17 +520,13 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
 @MainActor
 enum ImportUI {
     /// The window that asks the user, waiting briefly for it: an Open In at launch arrives before the window is active.
-    static func navigator(_ app: NibApp) async -> SceneNavigator? {
-        guard !NibApp.isHostlessTest else { return nil }
+    static func navigator(_ ctx: CommandContext) async -> SceneNavigator? {
+        guard !NibApp.isHostlessTest, ctx.app != nil else { return nil }
         for _ in 0..<40 {
-            if let nav = app.ui.activeNavigator, nav.rootViewController?.view.window != nil { return nav }
+            if let nav = ctx.navigator, nav.rootViewController?.view.window != nil { return nav }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
         return nil
-    }
-
-    static func hostWindow(_ app: NibApp) -> UIWindow? {
-        app.ui.activeNavigator?.rootViewController?.view.window
     }
 
     /// Waits (up to 3 s) until nothing is being presented or dismissed, so the next sheet can appear.
@@ -517,23 +553,33 @@ enum ImportUI {
                   : String(localized: "Importing “\(name)”")
     }
 
-    /// Files that failed while others were imported, reported through the shell's toast.
-    static func reportPartialFailure(_ failures: [ImportFailure], app: NibApp) {
+    /// Files that failed while others were imported, as a toast in the invoking window.
+    static func reportPartialFailure(_ failures: [ImportFailure], ctx: CommandContext) {
         guard let first = failures.first else { return }
         let name = ImportNaming.displayName(of: first.url)
         let message = failures.count == 1
             ? String(localized: "“\(name)” wasn't imported: \(first.message)")
             : String(localized: "\(failures.count) files weren't imported. First: “\(name)”: \(first.message)")
         let error = NibError(NibError.Code(rawValue: first.code) ?? .unsupported, message)
+        report(error, navigator: ctx.navigator, app: ctx.app)
+    }
+
+    /// A toast in the window's floating host; the shell's toast (`nibCommandFailed`) where the window has none.
+    static func report(_ error: NibError, navigator: SceneNavigator?, app: NibApp?) {
+        if let host = navigator?.floatingHost {
+            host.postToast(error.message)
+            return
+        }
+        guard let app = app else { return }
         NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                         userInfo: ["command": CommandIDs.importFiles, "error": error])
     }
 
     /// Everything the picker may choose: registered importers' types and extensions, folders and Nib packages.
-    static func pickerTypes(_ app: NibApp) -> [UTType] {
+    static func pickerTypes(_ content: ContentRegistries) -> [UTType] {
         var types: [UTType] = [.pdf, .image, .folder, .zip]
         if let package = UTType(NibFormat.packageUTType) { types.append(package) }
-        for d in app.content.importers.all {
+        for d in content.importers.all {
             types += d.utTypes.compactMap { UTType($0) }
             types += d.fileExtensions.compactMap { UTType(filenameExtension: $0) }
         }
@@ -542,11 +588,11 @@ enum ImportUI {
     }
 
     static func symbol(forName name: String) -> NibSymbol {
-        let ext = (name as NSString).pathExtension.lowercased()
+        let ext = ImportFormats.ext(name)
         if ext == "pdf" { return .pdf }
-        if ImageImporter.fileExtensions.contains(ext) { return .image }
-        if PackageImporter.packageExtensions.contains(ext) { return .notebook }
-        if OfficeConverter.webExtensions.contains(ext) { return .network }
+        if ImportFormats.imageExtensions.contains(ext) { return .image }
+        if ImportFormats.packageExtensions.contains(ext) { return .notebook }
+        if ImportFormats.webExtensions.contains(ext) { return .network }
         if ext.isEmpty || ext == "zip" { return .folder }
         return .textDocument
     }
