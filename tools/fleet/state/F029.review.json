@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLinks/LinkCommands.swift:246 (LinkText.range), reached from link.set/link.remove inside ctx.mutate",
+      "problem": "`guard start >= 0, count >= 0, start + count <= total` traps on Int overflow. The schema is `.int(min: 0)` with no maximum, so non-user callers (AI, MCP bridge, plugins) pass validation with e.g. {\"range\": [5000000000000000000, 5000000000000000000]}. Both values decode exactly to Int, the addition overflows and the app crashes mid-transaction. This is a crash at a trust boundary.",
+      "fix": "Compare without adding: `guard start >= 0, count >= 0, start <= total, count <= total - start else { throw ... }`. Add a LinkHitTests case: `XCTAssertThrowsError(try LinkText.range([Int.max / 2 + 1, Int.max / 2 + 1], in: text, allowEmpty: false))`."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLinks/LinkNavigator.swift:241 and :260 (LinkHitTester only hit-tests item.kind == .text) vs LinkCommands.swift LinkedTextRef / LinkEditorSheet.swift objectMenuIsVisible + isLinkable",
+      "problem": "link.set, LinkedTextRef and the 'Add Link' object menu all accept sticky notes and shapes with text, and the command summary advertises them. link.tapAt only ever lays out `.text` items, so a link on a sticky or a shape can never be followed: a tap in read-only mode and a long-press in edit mode both return handled:false. The UI lets users create links that do nothing.",
+      "fix": "Pick one of two fixes. (a) Hit-test every kind LinkedTextRef accepts: take the text from `LinkedTextRef.text(of: item)` and the frame and insets the sticky and shape drawers use. (b) Until those layouts are exposed, restrict `LinkedTextRef(.item)`, `LinkSelection.isLinkable` and `objectMenuIsVisible` to `.text` items (plus blocks), and correct the link.set summary. Either way, add a FeatLinksTests case showing that a link on every item kind link.set accepts is followed by link.tapAt."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLinks/LinkNavigator.swift:278-289 (LinkHitTester.pdfLink scaling)",
+      "problem": "PDF link rects are scaled non-uniformly (sx, sy) from the top-left. The renderer (PDFRenderPool aspect-fit) and F024's PDFPagePlacement both aspect-fit the PDF page and centre it on the Nib page. So whenever the page size differs from the PDF page size, taps land on the wrong link or on none.",
+      "fix": "Map rects with `k = min(size.width / pdf.width, size.height / pdf.height)` and offsets `((size.width - pdf.width * k) / 2, (size.height - pdf.height * k) / 2)`, the same maths as PDFPagePlacement. Add a test where the page is A4 and FakePDFService.pageSize is a different aspect ratio."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLinks/LinkCommands.swift:64 (LinkTarget.resolve, non-document nib:// URLs)",
+      "problem": "LinkPolicy says agents and plugins may store only web and mail addresses, but any nib:// URL that is not open/audio is stored without a check. An AI or plugin can therefore plant nib://plugin/install?url=..., nib://bridge/pair?... or nib://import?from=pasteboard behind innocent text. When the user taps it, app.openURL runs as `.user`.",
+      "fix": "In resolve, when `!principal.isUser`, throw permissionDenied (path $.link.url) for nib:// URLs whose host is not `open` or `audio`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLinks/LinkCommands.swift:314 (LinkText.autodetect)",
+      "problem": "Auto-detected URLs never pass through LinkPolicy. After an AI or plugin writes text containing a custom-scheme URL, link.autodetect turns it into a live link that set-time policy would have refused for that principal.",
+      "fix": "Link only matches whose scheme is http, https or mailto (LinkPolicy.agentSchemes), or pass the principal in and skip matches for which `LinkPolicy.check` throws."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLinks/LinkNavigator.swift:68 (follow), :113 (back); LinkCommands.swift LinkFollow/LinkTapAt/LinkBack",
+      "problem": "Under `dryRun` (AI previews through nib_run dry_run, plugin.run), link.follow, link.tapAt and link.back still move the window, open Safari, push or pop history and call audio.play. ARCHITECTURE §6.2 says a dry run persists, records and emits nothing.",
+      "fix": "When `ctx.dryRun` is set, resolve the link and return the LinkFollowResult (for back, the pendingReturn stop) without calling go/show/openExternal/push/audio.play."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLinks/LinkCommands.swift:282-301 (setLink / removeLinks)",
+      "problem": "setLink writes underline and Cobalt colour into the model, and removeLinks then strips any underline and any Cobalt colour in the range. A user who had underlined or Cobalt-coloured the text before linking loses that formatting when the link is removed. The model write is also redundant: F026's TextLayout.styleLinks already draws links in Cobalt with an underline, and the text-document UITextView uses its own linkTextAttributes.",
+      "fix": "Have setLink set only `attrs.link` and removeLinks clear only `attrs.link`. This deletes code and makes remove lossless. Update the testSetLinkSplitsRunsAndKeepsOtherStyling assertions to match."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLinks/LinkEditorSheet.swift:99 (LinkEditorPresenter.present) with FeatLinksFeature.swift:49 (Cmd-K)",
+      "problem": "When editing begins, F026 clears `session.selection` (feat/F026 TextBoxEditor.swift:251). Cmd-K pressed while typing in a text box therefore finds no ref and throws 'select typed text to link first'. The main Cmd-K flow in the spec (select a word, press Cmd-K) fails. The same happens in text-document blocks, where session.selection is never set.",
+      "fix": "File docs/contract-requests/F029-editing-text-ref.md asking for the ref of the text being edited (for example `EditorSession.editingTextRef`). Until it lands, while `session.isEditingText`, remember the ref last passed to the link.textSelection menu's params/isVisible closures and fall back to it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLinks/LinkNavigator.swift:245 (reach rect) and :260",
+      "problem": "Hit reach is limited to `frame.h`, but F026's drawer paints auto-grow boxes at `max(frame.h, needed)`. Links drawn below a stale frame height (text changed by the AI, sync or link.set without a height update) cannot be tapped.",
+      "fix": "When `box.style.autoGrow`, use `max(f.h, layout usedRect.maxY + 2 * padding)` as the reach height, and skip the `item.bounds` pre-filter for such boxes, or widen it the same way."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLinks/LinkNavigator.swift:34 (stacks) and :354 (ReturnToPageAttachment.refresh)",
+      "problem": "Per-session history is never dropped when a window closes, so it grows with every session ever opened. Separately, refresh() runs on every canvasDidChange, which covers every scroll and zoom frame. While a return is pending, each call reloads document content, recomputes the title, runs `hosting.sizeThatFits` and reassigns @Published values, so SwiftUI re-renders the pill on every frame.",
+      "fix": "Prune `stacks` for session ids that are no longer in `app.services.sessions.sessions` whenever push or back runs. In refresh(), assign title and isVisible only when they differ, and re-measure only when the title changes. Otherwise just reposition the frame."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatLinksTests/FeatLinksTests.swift:231-284 and missing cases",
+      "problem": "The 'generated PDF' test builds real PDF bytes but never reads them: FakePDFService returns a hand-written linkMap, so the test proves routing but not link extraction or placement. There is no test for audio links (link.follow {clip, t} calling audio.play), for a page size different from the PDF size, or for oversized ranges.",
+      "fix": "Register a stub `audio.play` command in the Harness that records its params, and assert {clip: audio:D/A, t}. Add the pdfLink aspect-fit case and the overflow range case above. Optionally, fill linkMap from the generated data with PDFKit (PDFDocument annotations, flipped to top-left) so the generated PDF is actually exercised."
+    }
+  ]
+}
