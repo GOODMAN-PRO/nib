@@ -40,3 +40,11 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - No PRs for feat/* or v2/* branches: ios.yml also triggers on pull_request, so a PR per branch would double the macOS CI load. Integration merges branches directly. Marker branches point at main commits (no diff).
 - contract gap: docked assistant side/width for reservedTrailing (F016); per-tool disabled/on appearance in NibToolPalette.
 - Mockup v2 merged to main (9e7dfb4) and REPUBLISHED to https://claude.ai/artifact/XQKSP4QSMTHuwFZRPxTLMm (version 1790407236-34b6). Publish copy = design/mockup.html with skeleton adaptations (title 'Nib Clear Water', :root light tokens, body bg, theme detection keeps data-theme, no doctype/head/body tags).
+- Spec v2 merged to main (f7da15b). Follow-ups for fix/V2ADOPT passes:
+  - F030: shape.recognize must return wrapped {shape: ShapeItem?, confidence?, mergeWith?: [ref]} (F007 accepts both; F009 already does).
+  - F009: preview curves use control points (F030/F031 convention).
+  - F046: register outline.list {doc, source?} (read).
+  - F014: register clipboard.copyText {text?, url?} (read) (F037 needs it).
+  - F041: if moved to a G26 closure hook, remove layer.exportOptions row in the same change.
+  - F036: restore drop-to-attach (running).
+  - NibContracts (v2/contracts2): PanelIDs.studyLearn -> studysession.smartLearn + practice; CommandIDs constants for new ids.
