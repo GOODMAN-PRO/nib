@@ -209,9 +209,7 @@ extension Stroke: Codable {
             guard let data = Data(base64Encoded: b64) else {
                 throw DecodingError.dataCorruptedError(forKey: .ptsB64, in: c, debugDescription: "invalid base64 points")
             }
-            var floats = [Float](repeating: 0, count: data.count / MemoryLayout<Float>.size)
-            _ = floats.withUnsafeMutableBufferPointer { data.copyBytes(to: $0) }
-            points = Stroke.unpack(floats, fields: StrokePoint.fullFormat)
+            points = Stroke.unpackCompact(data)
         } else {
             let fmt = try c.decodeIfPresent(String.self, forKey: .fmt) ?? "xy"
             guard let fields = StrokePoint.formats[fmt] else {
@@ -240,9 +238,36 @@ extension Stroke: Codable {
         }
     }
 
+    /// contracts-v2: points from the compact package form (`ptsB64`: little-endian Float32 in `StrokePoint.fullFormat`
+    /// order), without JSON: page readers decode strokes straight from the file bytes.
+    public static func unpackCompact(_ data: Data) -> [StrokePoint] {
+        var floats = [Float](repeating: 0, count: data.count / MemoryLayout<Float>.size)
+        _ = floats.withUnsafeMutableBufferPointer { data.copyBytes(to: $0) }
+        return unpackFull(floats)
+    }
+
+    /// contracts-v2: points from a flat array in exactly the encoder's `StrokePoint.fullFormat` order (the fast path
+    /// of every "full" and compact decode: no per-field name lookups).
+    public static func unpackFull(_ v: [Float]) -> [StrokePoint] {
+        let s = StrokePoint.fullStride
+        let n = v.count / s
+        var out: [StrokePoint] = []
+        out.reserveCapacity(n)
+        v.withUnsafeBufferPointer { b in
+            for k in 0..<n {
+                let i = k * s
+                out.append(StrokePoint(x: b[i], y: b[i + 1], t: b[i + 2], force: b[i + 3], azimuth: b[i + 4],
+                                       altitude: b[i + 5], roll: b[i + 6], width: b[i + 7], height: b[i + 8],
+                                       opacity: b[i + 9]))
+            }
+        }
+        return out
+    }
+
     static func unpack(_ v: [Float], fields: [String]) -> [StrokePoint] {
         let stride = fields.count
         guard stride > 0 else { return [] }
+        if fields == StrokePoint.fullFormat { return unpackFull(v) }
         var out: [StrokePoint] = []
         out.reserveCapacity(v.count / stride)
         var i = 0

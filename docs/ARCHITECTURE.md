@@ -357,6 +357,11 @@ struct PageRotate: NibCommand {                         // conformers are @MainA
   - Flat schemas only: no `oneOf`, no `$ref`. For alternatives, use optional sibling fields.
   - Url-typed params (`url`, `urls`, `file`) resolve through `ctx.inputFile`: `tmp:<name>` refs from `asset.upload`/renders/exports, `https` URLs (downloaded), and `file://` only for the user principal or the app's tmp/Inbox. Results never hand out `file://` URLs; they return `tmp:` assets (plus base64 when asked).
   - `examples` literals: annotate nested literals (`let ex: JSONValue = […]`) or use `try! JSONValue.parse(#"…"#)` for anything longer than one line — large untyped JSONValue literals can hit "unable to type-check this expression in reasonable time" in CI.
+  - **Additive params** (contracts-v2). A command may take optional params beyond its §6.5 row (`range`, `indentBy`, `payload`, `fragment`, `cursor`, `limit`). The id and the listed params keep their meaning, and omitting the extras gives the listed behaviour. The rows are generated from forge-spec.json; the spec owner adds extras there.
+  - **Session defaults** (contracts-v2). Key commands, toolbar buttons and menus run with static params. So `doc`, `page` and `refs` may be omitted by the user principal where the command documents a session default. Resolve them with `ctx.documentOrSession(p.doc)`, `ctx.pageOrSession(p.page)` and `ctx.refsOrSelection(p.refs)`: the invoking window's document, current page or selection. Schemas still list the params, and AI, plugin and bridge callers pass them (`edit.undo {}` from a key command undoes the window's document).
+  - **Places in a document** (contracts-v2). `doc` is a document ref `doc:D` (a bare id is accepted). `position` is `before | after | start | end` (`PagePosition`). `anchor` is a page ref `page:D/P`, required for `before`/`after`. `page.add`, `page.paste` and `import.files` all use this shape.
+  - **Geometry** (contracts-v2). Every point, size, delta and radius is in **page points** (top-left origin), never view points. That includes `view.scrollBy {dx, dy}`, `item.transform` and `ink.erase {path: [[x,y],…], radius}`. Sizes are `[width, height]` (`template.choose {size}`, `page.add {size}`). A frame is `[x, y, w, h]` or `[x, y, w, h, rotation]`, with rotation in radians about the centre (`Frame(array:)` / `Frame.array`). Angles in params are degrees unless the name says radians. `ShapeItem.points` are control points (see `ShapeItem` in CONTRACTS.md).
+  - **Other value types** (contracts-v2). A `template` param that has no sibling `params?` is `TemplateRef` JSON `{id, params?}` (`doc.create`, `page.add`), and a plain id string is accepted as `{id}`. `page.setTemplate` keeps its `template` id plus `params?`. Media time is in seconds as a number (`audio.play {clip: "audio:D/A", t}`). `panel.open` is `{id, params?}`: the other params reach the panel as `PanelContext.params`. `ai.ask` returns `AIResponse` JSON `{text, changes, group?, usage, chatID?}`.
 - **Creating commands** (every `edit`/`library` command that creates records):
   - Default `layer` to `ctx.activeSession?.activeLayer ?? 0`.
   - Declare an optional caller-chosen `id` (one record) or `ids` (several, in creation order) param and honour it (`NibID.isValid`, else `invalid_params`). The AI links records in one batch this way (`page.add {id: "NEWPAGE00001"}` then `diagram.create {page: "page:D/NEWPAGE00001"}`); conformance checks both.
@@ -366,7 +371,11 @@ struct PageRotate: NibCommand {                         // conformers are @MainA
 - **State that must persist but must not be undoable** (tape reveal, Smart Learn grades, per-document view flags): use `ctx.mutate(undoable: false)` and declare `undoable: false`.
 - **Read commands are read-only.** Inside a `read` command (unless it declares `forwardsCalls`, like `commands.batch` and `ai.ask`), `ctx.mutate` throws and nested calls must be `read`.
 - **Slow work** (OCR, rendering, network, AI) happens before or between `mutate` calls, never inside them.
-- **Results** are `Codable`. Big results (more than 20 KB) are paged with a `cursor` parameter plus `truncated: true`.
+- **Results** are `Codable`. Big results (more than 20 KB) are paged with a `cursor` parameter plus `truncated: true`. The result carries the next `cursor`; callers pass it back unchanged. This applies to every read command and to the AI meta tool `nib_get`.
+- **Batch writes** (contracts-v2). Importers and page-wide edits write through the batch overloads: `tx.put(items, doc:page:)`, `tx.delete(items:doc:page:)`, and `tx.put(pages|blocks|cards|entries|clips, doc:)`. Each call, and undoing, redoing or rolling it back, is linear in the records written. A per-record `tx.put` loop over a large set is quadratic.
+- **Moving items keeps provenance.** Moving an item to another page uses `tx.move(item:doc:from:to:transform:z:)`; across documents, use `tx.put(_:doc:page:keepingProvenanceFrom:in:)`. A tombstone plus a fresh `put` would stamp the mover as `createdBy`.
+- **Cross-document commands** that must undo as one step (`page.moveTo` between documents) call `ctx.linkUndoAcrossDocuments()` (§6.3).
+- **App services.** Commands reach the app through `ctx.app`, `ctx.content` (templates, drawers, tape patterns, text layouts), `ctx.ui`, `ctx.navigator` and `ctx.isReadOnly(doc)`, never through `NibApp.shared` or untyped service keys that republish a registry.
 
 ### 6.2 Calling commands
 
@@ -377,7 +386,7 @@ struct PageRotate: NibCommand {                         // conformers are @MainA
 | Nested (inside a command) | `try await ctx.execute("shape.recognize", …)` | caller's | full, same group |
 | Plugins / AI / bridge | `bus.execute(Invocation(command:params:principal:group:dryRun:readOnly:))` | `.plugin(id)` / `.ai(chat)` / `.bridge(client)` | schema validation, exposure, scopes, locked documents, confirmation |
 
-Every JSON and typed call also runs the registered **command hooks** (`app.bus.hooks`: read-only hook commands that may transform the params or veto). A nested call to a command that is not registered (a disabled feature, or a stub during fan-out) throws `unavailable`, not `not_found`, so callers can treat it as an optional dependency.
+Every JSON and typed call also runs the registered **command hooks** (`app.bus.hooks`: read-only hook commands that may transform the params or veto). Hooks run before validation and authorization, for every principal. Since contracts-v2, features can also hook with a closure instead of an extra command id. `CommandHookDescriptor(id:owner:commands:order:handler:)` sees the command id and params. `CommandHookDescriptor.guarding(id:owner:commands:order:_:)` also gets a read-only `CommandContext` of the call (principal, session defaults, `ctx.app`), for example a board item limit that vetoes `ink.addStrokes` from anyone. A nested call to a command that is not registered (a disabled feature, or a stub during fan-out) throws `unavailable`, not `not_found`, so callers can treat it as an optional dependency.
 
 **Dry run.** `dryRun: true` runs the command, collects the `ChangeSummary`, then rolls back. Nothing is persisted, recorded or emitted. AI previews and `plugin.run` use it.
 
@@ -385,6 +394,8 @@ Every JSON and typed call also runs the registered **command hooks** (`app.bus.h
 
 - `UndoHistory` is per document and keeps up to 200 entries. Consecutive changesets with the same group merge into one entry.
 - `bus.undo` and `bus.redo` use `DocTransaction.revert`: they write back the stored before-values with fresh revisions, but only where the record still carries the reverted revision.
+- **Rebasing** (contracts-v2). A revert pass records "the value that had revision r now lives at revision r′" for each record it rewrites. Older mutations of the same record, in the same entry or in later undo and redo entries, accept r′ as their expected revision. So a record written twice in one group (move then attach, debounced text commits) reverts all the way back. Consecutive undos on one record also work, and a redo chain stays valid. Records changed by anyone else since, including `mutate(undoable: false)` writes, are still skipped.
+- **Linked undo** (contracts-v2). A command that changes several documents may call `ctx.linkUndoAcrossDocuments()`. Undoing (or redoing) that group in one of them then also undoes it in every other document where it is still the latest step. `UndoHistory.isLinked(group)` tells the UI.
 - `bus.revert(group:doc:)` removes one entry from anywhere in the history and reverts it the same way ("Undo that AI turn" after later edits). The revert is itself recorded, so it can be undone.
 - Page operations are commands, so page-level undo is automatic.
 - Remote (sync) changes are never recorded.
@@ -415,18 +426,19 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Summary |
 |---|---|---|---|
-| `edit.undo` | edit | doc | Undo the last change in a document. |
+| `edit.undo` | edit | doc | Undo the last change in a document (the user may omit `doc`: the window's document; a linked group undoes in every document). |
 | `edit.redo` | edit | doc | Redo. |
 | `history.list` | read | doc, limit? | Undo entries with group ids and principals. |
 | `history.revertGroup` | edit | doc, group | Selective revert of one undo group (e.g. an AI turn). |
 | `commands.list` | read | namespace? | Commands visible to the caller. |
 | `commands.describe` | read | id | Schema, examples, effect and scopes of a command. |
 | `commands.batch` | read, forwards calls | calls[{command, params}], stopOnError? | Run several commands as one undo step (each call authorised; in ask mode every call must be read). |
-| `tool.select` | session | tool | Activate a canvas tool. |
+| `tool.select` | session | tool, temporary? | Activate a canvas tool (`temporary: true` returns to the previous tool when the use ends). |
 | `settings.get` | read | name | Read a setting ('security.*' user only). |
 | `settings.set` | edit (app), not undoable | name, value | Change a declared setting; value validated ('security.*' user only, 'managed.*' read-only). |
 | `settings.list` | read | prefix? | Declared settings with summary, synced flag and owner. |
 | `settings.describe` | read | name | Schema, default and flags of one setting. |
+| `window.showLibrary` | session | folder? | Show the library in the current window, optionally at a folder (contracts-v2). |
 
 ### `a11y.*`
 
@@ -1365,21 +1377,21 @@ nib://import?from=pasteboard       (share-extension hand-off when no App Group e
 | Member | What it is |
 |---|---|
 | `app.commands` | `CommandRegistry` |
-| `app.bus` | `CommandBus` (undo, commit observers, applyRemote, `hooks`: before-command hooks) |
+| `app.bus` | `CommandBus` (undo with rebasing and linked groups, commit observers, applyRemote, `hooks`: before-command hooks, as a hook command or (contracts-v2) a closure `handler`) |
 | `app.gateway` | permissions, confirmation presenter, lock check |
 | `app.workspace` | open documents; persistence is swappable |
 | `app.events` | `EventBus` |
 | `app.settings` | `SettingsStore` (typed `SettingKey`s, synced or device) |
 | `app.services` | `NibServices`: library, assets, renderer, recognizer, pdf, ai, lock, sessions, `packages` (thread-safe PackageLocator), plus `set/get(ServiceKeys…)` |
-| `app.content` | non-UI registries: templates, drawers, importers, exporters, aiActions, strokeProcessors, keyCommands, backgroundTasks, tapHandlers, boardTemplates, tapePatterns, elementCollections, blockKinds, customItemTypes, pencilActions |
-| `app.ui` | UI registries and hooks |
+| `app.content` | non-UI registries: templates, drawers, importers, exporters, aiActions, strokeProcessors, keyCommands, backgroundTasks, tapHandlers, boardTemplates, tapePatterns, elementCollections, blockKinds, customItemTypes, pencilActions, textLayouts (contracts-v2). Commands reach it as `ctx.content` |
+| `app.ui` | UI registries and hooks (`ctx.ui` in commands; nil in headless runs) |
 
 **UI extension points** (each is a `Registry<Descriptor>` keyed by id; re-registering an id replaces it; `unregister(owner:)` removes all of a plugin's or feature's entries):
 
 | Extension point | Where it appears | Filled by (examples) |
 |---|---|---|
 | `ui.toolbar` (ToolbarItemDescriptor) | Document toolbar: lasso / tools / accessories / nav bar groups | pen F007, eraser F010, ruler F039, audio F052, plugins |
-| `ui.toolMenus` (ToolMenuDescriptor) | Active-tool options bar | presets F008 for pen, pencil, highlighter, tape, shape |
+| `ui.toolMenus` (ToolMenuDescriptor) | Active-tool options bar, plus (contracts-v2) its own popover (`makePopover` → `ToolMenuPopover`, placed by the palette) | presets F008 for pen, pencil, highlighter, tape, shape |
 | `ui.canvasTools` (CanvasToolDescriptor) | Tools selectable via `tool.select` | pen, pencil, highlighter, eraser, lasso, shape, drawShape, text, image, sticky, tape, laser, elements, plugin tools |
 | `ui.menus` (MenuItemDescriptor, MenuLocation) | Object menu, page long-press, More, title, Add Page, Share & Export, library item/new/selection, app menu, sidebar page/selection, text selection, audio clip, block, card, board, outline entry, comment, transcript line, tab | every feature that has actions |
 | `ui.panels` (PanelDescriptor) | Sidebar tabs, floating panels, sheets, library tabs | pages F023, outline F046, audio F052, layers F041, AI chat F085, gallery F080, calendar F075 |
@@ -1388,12 +1400,30 @@ nib://import?from=pasteboard       (share-extension hand-off when no App Group e
 | `ui.editors` (DocumentEditorDescriptor) | Editor per document kind | canvas F006 (notebook, whiteboard), text doc F047, study set F049 |
 | `ui.blockViews` | Text-document block kinds rendered by other features | tables F048, plugin custom blocks |
 | `ui.canvasAttachments` (CanvasAttachmentDescriptor) | Persistent canvas overlays that can claim touches | handles F012, underlines F104, glow F106, presence F108, minimap F044, ruler F039, zoom box F038 |
+| `ui.chromeOverlays` (ChromeOverlayDescriptor, contracts-v2) | Floating HUDs, bars, pills, panels and popovers. The document chrome renders them inside the window's one droplet container at a `ChromePlacement` (or `.anchored` to a page rect), in `order`. It fades them while the Pencil is down when `recedesWhileWriting` is set | recording HUD and playback bar F052, return-to-page pill F029, zoom pane F038, ruler angle F039, time keeper F062, presenter HUD F063, text popovers F026 |
+| `content.textLayouts` (TextLayoutDescriptor, contracts-v2) | Where an item's text is laid out (container frame, base attributes), for link hit-testing and editors | text boxes F026, stickies F036, shape labels F031 |
 | `content.tapHandlers` (TapHandlerDescriptor) | Finger tap / double-tap / long-press routed to commands before the tool | tape F033, comments F037, links F029, selection F011, plugins |
 | `content.backgroundTasks` (BackgroundTaskDescriptor) | BGTaskScheduler work, registered by the shell at launch | index F055, backup F068, WebDAV F069 |
 | `content.blockKinds`, `content.boardTemplates`, `content.tapePatterns`, `content.elementCollections`, `content.customItemTypes`, `content.pencilActions` | Slash/Turn Into menu, whiteboard frameworks, tape patterns, sticker packs, custom item metadata, Pencil bindings | F047/F048, F044, F033, F035, F078 (plugins and content packs) |
-| `ui.screens` | libraryRoot, documentContainer, settingsRoot, onboarding, toolbar | F019, F017, F027, F093, F016 |
+| `ui.screens` | libraryRoot, documentContainer, settingsRoot, onboarding, toolbarView (SwiftUI, hosted in the chrome's container; `toolbar` is superseded) | F019, F017, F027, F093, F016 |
 | `ui.sceneHooks`, `ui.pencilHandler`, `ui.externalDisplay`, `ui.openGate` | Single hooks | F018, F043, F063, F071 |
 | `content.keyCommands` | UIKeyCommands built by the shell (scopes global / library / document / canvas) | F073, owners of individual shortcuts |
+
+**Live descriptor state** (contracts-v2). Descriptors are registered once and evaluated live by their host, so features never re-register to change a title or a checkmark:
+- Toolbar items have `isEnabled`, `isOn`, `sessionParams`, `sessionTitle`, `sessionIcon` and `showsInCompactWidth`.
+- Menu items have `isChecked`, `contextTitle` and a display-only `shortcut`. `MenuContext` carries `folder` and `textRange`.
+- Key commands have `docKinds` and `sessionParams`.
+- Panels get `PanelContext.params` (the `panel.open` params minus `id`) and `presentation`, and declare `providesHeader`.
+- Settings pages declare `keywords`.
+
+Hosts call `resolvedParams`, `resolvedTitle` and `resolvedIcon`. Well-known panel ids are in `PanelIDs`.
+
+**Signals** (contracts-v2):
+- A `Registry` counts changes in `generation` and posts `.nibRegistryDidChange` with `RegistryChange` userInfo (ids, owner, kind).
+- `EditorSession.inking` (`InkingSignal`) is the one Pencil-down state per window. The canvas writes it; chrome, HUDs and attachments observe it. It replaces every `"chrome.inking.<session>"` key and `NibHaptics.isInking` poll.
+- `EditorSession` also publishes `openPanels`, `temporaryReturnTool` (`selectTemporarily` / `finishToolUse(sticky:)`) and `editingTextRef` / `editingTextRange`.
+- `EditorSession.floatingHost` (`FloatingHosting`, also `navigator.floatingHost` and `ChromeContext.floatingHost`) is the window's floating host: NibDesign's `NibFloatingHost` behind a protocol, set by the container's owner (F017, F019). UIKit code and canvas attachments use it to bud a popover from a rect (`setAnchor(_:rect:in:)` then `present`), show a HUD, or post a toast inside the window's one droplet container.
+- Events without an owner-specific schema have typed payloads (`NibEventPayload`: `SyncStatusPayload`, `IndexProgressPayload`, `AudioPlaybackPayload`, …), emitted with `events.emit(payload)` and read with `event.decode(_:)`.
 
 **Shell fallbacks.** The shell falls back to minimal built-in screens whenever a provider is missing, so the app runs with any subset of features. That is what makes the CI green baseline possible.
 

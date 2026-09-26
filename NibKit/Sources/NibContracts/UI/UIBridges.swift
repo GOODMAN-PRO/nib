@@ -120,6 +120,11 @@ public extension NSAttributedString.Key {
     static let nibChecked = NSAttributedString.Key("nib.checked")
     static let nibIndent = NSAttributedString.Key("nib.indent")
     static let nibParagraphStyle = NSAttributedString.Key("nib.paragraphStyle")
+    /// contracts-v2: the model's font family (String) as stored, kept next to the rendered `.font` so a family that is
+    /// not installed on this device survives a round trip through TextKit.
+    static let nibModelFont = NSAttributedString.Key("nib.modelFont")
+    /// contracts-v2: the model's traits (Int: 1 bold, 2 italic), kept when the rendered family has no such face.
+    static let nibModelTraits = NSAttributedString.Key("nib.modelTraits")
 }
 
 /// `RichText` ⇄ `NSAttributedString` (TextKit editing and drawing). Links use `nib://` URLs for
@@ -151,6 +156,13 @@ public enum RichTextBridge {
             d[.baselineOffset] = CGFloat(Double(b) * size * 0.35)
         }
         d[.font] = font(sized, base: base)
+        if !(a.code ?? base.code ?? false) {
+            if let family = a.font ?? base.font { d[.nibModelFont] = family }
+            var traits = 0
+            if a.bold ?? base.bold ?? false { traits |= 1 }
+            if a.italic ?? base.italic ?? false { traits |= 2 }
+            if traits != 0 { d[.nibModelTraits] = traits }
+        }
         d[.foregroundColor] = (a.color ?? base.color ?? .black).uiColor
         if let h = a.highlight ?? base.highlight { d[.backgroundColor] = h.uiColor }
         if a.underline ?? base.underline ?? false { d[.underlineStyle] = NSUnderlineStyle.single.rawValue }
@@ -221,6 +233,17 @@ public enum RichTextBridge {
             } else if f.familyName != defaultFontFamily {
                 t.font = f.familyName
             }
+            if !traits.contains(.traitMonoSpace) {
+                // contracts-v2: a model family that is not installed here rendered as a fallback; keep the model's.
+                if let model = a[.nibModelFont] as? String, model != f.familyName, !UIFont.familyNames.contains(model) {
+                    t.font = model
+                }
+                // A model trait the rendered family has no face for (italic in a font without italics) is kept.
+                if let mt = a[.nibModelTraits] as? Int {
+                    if mt & 1 != 0, !traits.contains(.traitBold), !hasFace(f.familyName, .traitBold) { t.bold = true }
+                    if mt & 2 != 0, !traits.contains(.traitItalic), !hasFace(f.familyName, .traitItalic) { t.italic = true }
+                }
+            }
         }
         if let c = a[.foregroundColor] as? UIColor {
             let rgba = RGBA(c)
@@ -272,6 +295,12 @@ public enum RichTextBridge {
     }
 
     // MARK: Private
+
+    /// True when `family` has a face with `trait` (so a missing trait on rendered text was the user's choice).
+    static func hasFace(_ family: String, _ trait: UIFontDescriptor.SymbolicTraits) -> Bool {
+        guard let d = UIFontDescriptor(fontAttributes: [.family: family]).withSymbolicTraits(trait) else { return false }
+        return UIFont(descriptor: d, size: 12).fontDescriptor.symbolicTraits.contains(trait)
+    }
 
     static func alignment(_ a: ParagraphAlignment) -> NSTextAlignment {
         switch a {
