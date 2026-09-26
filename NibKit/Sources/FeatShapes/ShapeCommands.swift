@@ -253,10 +253,12 @@ struct ShapeCreate: NibCommand {
         let patch = try p.style.map { try ShapeStylePatch.parse($0, path: "$.style") } ?? ShapeStylePatch()
         let frame = try p.frame.map { try ShapeParse.frame($0, path: "$.frame") }
         var shape = try ShapeGeometry.make(kind, frame: frame, points: p.points, style: patch.applied(to: ShapeItemStyle()))
-        if kind == .roundedRectangle, patch.radius == .keep {
-            shape.style.cornerRadius = ShapeGeometry.roundedDefault(shape.frame, current: shape.style.cornerRadius)
+        if patch.radius == .keep {
+            // Unless asked, a rectangle is sharp and only a rounded rectangle is rounded.
+            shape.style.cornerRadius = kind == .roundedRectangle
+                ? ShapeGeometry.roundedDefault(shape.frame, current: shape.style.cornerRadius) : 0
         }
-        if let t = p.text, !t.isEmpty { shape.text = t }
+        if let t = p.text, !t.isEmpty { shape.text = ShapeTextStyle.centred(t) }
         try ShapeGeometry.validate(shape, path: "$")
         let layer = ctx.activeSession?.activeLayer ?? 0
         let item = try ctx.mutate { tx -> Item in
@@ -381,6 +383,82 @@ struct ShapeSetPoints: NibCommand {
     }
 }
 
+/// Shapes as containers (T-050): items attached to a closed shape move, scale and rotate with it (`attachedTo`). The
+/// container watcher sends it when the user drops items into a shape or drags them out; plugins and the AI can call it
+/// directly. All the items change in ONE transaction, so dropping 2,000 strokes into a box is one commit.
+struct ShapeAttach: NibCommand {
+    struct Params: Codable {
+        var refs: [String]
+        var container: String?
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "shape.attach", title: "Put in Shape",
+        summary: "Attach items to a closed shape so they move with it, or release them (container null); items keep "
+            + "their place.",
+        params: .obj(["refs": .arr(.ref, "item refs, all on the container's page"),
+                      "container": .str("closed shape ref item:D/P/I; null releases the items")],
+                     required: ["refs"]),
+        examples: [
+            try! JSONValue.parse(#"{"refs":["item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01","item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"],"container":"item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"}"#),
+            try! JSONValue.parse(#"{"refs":["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"],"container":null}"#)
+        ],
+        effect: .edit)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
+        let targets = try p.refs.enumerated().map { i, ref in try ShapeParse.item(ref, path: "$.refs[\(i)]") }
+        guard let first = targets.first else { throw NibError.invalid("give at least one item ref", path: "$.refs") }
+        let doc = first.0, page = first.1
+        for (i, t) in targets.enumerated() where t.0 != doc || t.1 != page {
+            throw NibError.invalid("all refs must be on one page", path: "$.refs[\(i)]")
+        }
+        let container = try p.container.map { try ShapeParse.item($0, path: "$.container") }
+        if let c = container, c.0 != doc || c.1 != page {
+            throw NibError(.invalidParams, "the container is not on the items' page", path: "$.container",
+                           hint: "move the items there first with item.moveToPage")
+        }
+        try ctx.mutate { tx in
+            var parent: ElementID?
+            if let c = container {
+                // A locked shape still holds items (a locked frame on a board): attaching does not change the shape.
+                let shape = try tx.item(doc, page: page, id: c.2)
+                guard shape.kind == .shape, let kind = shape.shape?.shape, ShapeContainers.containerKinds.contains(kind) else {
+                    throw NibError(.invalidParams, "only closed shapes hold items", path: "$.container",
+                                   hint: "use a rectangle, rounded rectangle, ellipse, triangle, diamond or polygon")
+                }
+                parent = shape.id
+            }
+            let byID = try Dictionary(tx.items(doc, page: page).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            var changed: [Item] = []
+            var seen = Set<ElementID>()
+            for (i, target) in targets.enumerated() where seen.insert(target.2).inserted {
+                let path = "$.refs[\(i)]"
+                guard var item = byID[target.2], !item.deleted else {
+                    throw NibError(.notFound, "no item \(target.2) on page \(page)", path: path,
+                                   hint: "query.find lists the items of a page")
+                }
+                guard item.kind != .comment, item.kind != .connector else {
+                    throw NibError(.invalidParams, "a \(item.kind.rawValue) cannot be put in a shape", path: path,
+                                   hint: "connectors follow shapes through their anchors; comments pin to a point")
+                }
+                guard !item.locked else {
+                    throw NibError(.invalidParams, "item \(item.id) is locked", path: path,
+                                   hint: "unlock it with item.setLocked first")
+                }
+                if let parent, parent == item.id || ShapeContainers.isDescendant(parent, of: item.id, byID) {
+                    throw NibError(.invalidParams, "shape \(parent) hangs from item \(item.id), so it cannot hold it",
+                                   path: path, hint: "release the shape from the item first")
+                }
+                guard item.attachedTo != parent else { continue }
+                item.attachedTo = parent
+                changed.append(item)
+            }
+            if !changed.isEmpty { try tx.put(changed, doc: doc, page: page) }
+        }
+        return NoResult()
+    }
+}
+
 /// The tap handler behind "type inside a shape" (ARCHITECTURE §8.5): a tap on the selected shape, a double-tap on
 /// any shape, or the inspector's Edit Text button opens the text editor over it. Commits go through `text.setText`.
 struct ShapeTapAt: NibCommand {
@@ -403,7 +481,7 @@ struct ShapeTapAt: NibCommand {
         ],
         effect: .session)
 
-    static let textCommand = "text.setText"
+    static let textCommand = CommandIDs.textSetText
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let gesture = p.gesture ?? "tap"
@@ -480,23 +558,107 @@ enum ShapeContainers {
         let parent: ElementID?
     }
 
-    /// For each moved item: the smallest closed shape that now encloses it (nil = none). Only changes are returned,
-    /// never a cycle, and items attached to something other than a shape (a comment on a sticky note) are left alone.
-    static func plan(moved: [ElementID], items: [Item]) -> [Change] {
+    /// A closed shape that can hold items: its outline as a polygon and that polygon's bounds, built once per plan.
+    struct Container {
+        let id: ElementID
+        let polygon: [Point]
+        let box: Rect
+        /// The frame's area (smaller containers win) and the z position (the upper one wins a tie).
+        let area: Double
+        let index: Int
+
+        /// True when every point lies inside the outline (the bounds first: most containers are rejected there).
+        func encloses(_ points: [Point], box pointsBox: Rect) -> Bool {
+            box.contains(pointsBox) && points.allSatisfy { Geo.polygonContains(polygon, $0) }
+        }
+    }
+
+    static func containers(_ live: [Item]) -> [Container] {
+        live.enumerated().compactMap { index, item -> Container? in
+            guard let s = item.shape, containerKinds.contains(s.shape) else { return nil }
+            let polygon = ShapeGeometry.outline(s)
+            guard polygon.count >= 3, let box = Rect.bounding(polygon) else { return nil }
+            return Container(id: item.id, polygon: polygon, box: box, area: s.frame.w * s.frame.h, index: index)
+        }
+    }
+
+    /// Stroke samples used for containment: at most this many points of a stroke.
+    static let strokeSamples = 64
+
+    /// The points that must lie inside a container for `item` to count as enclosed: a stroke's own points (sampled),
+    /// the corners of a frame item's rotated frame, else the corners of its bounds.
+    static func probePoints(_ item: Item) -> [Point] {
+        if item.kind == .stroke, let pts = item.stroke?.points, !pts.isEmpty {
+            let step = max(1, pts.count / strokeSamples)
+            var out = stride(from: 0, to: pts.count, by: step).map { pts[$0].location }
+            if (pts.count - 1) % step != 0 { out.append(pts[pts.count - 1].location) }
+            return out
+        }
+        if let f = item.frame { return f.corners }
+        let r = item.bounds
+        return [Point(r.minX, r.minY), Point(r.maxX, r.minY), Point(r.maxX, r.maxY), Point(r.minX, r.maxY)]
+    }
+
+    /// An expanded sticky note and its place in the page's z order (bottom first).
+    struct Note {
+        let corners: [Point]
+        let position: Int
+    }
+
+    static func expandedNotes(_ live: [Item]) -> [Note] {
+        live.enumerated().compactMap { index, item -> Note? in
+            guard item.kind == .sticky, let s = item.sticky, !s.collapsed else { return nil }
+            return Note(corners: s.frame.corners, position: index)
+        }
+    }
+
+    /// True when a sticky note will take `item` (F036's drop-to-attach): a free item that is not a note itself, whose
+    /// centre lies on an expanded note beneath it. The shape under the note then leaves it alone, so both features
+    /// never race for one drop: the item hangs from the note, and the note can hang from the shape.
+    static func claimedByNote(_ item: Item, position: Int, notes: [Note]) -> Bool {
+        guard item.kind != .sticky else { return false }
+        let centre = item.bounds.center
+        return notes.contains { $0.position < position && Geo.polygonContains($0.corners, centre) }
+    }
+
+    /// Sticky notes attach what is dropped on them while the Sticky Notes feature (F036) and `item.update` are there.
+    static let stickyCommand = "sticky.create"
+
+    @MainActor
+    static func notesClaimDrops(_ app: NibApp) -> Bool {
+        ShapesUI.has(app, stickyCommand) && ShapesUI.has(app, CommandIDs.itemUpdate)
+    }
+
+    /// For each item the user moved: the smallest closed shape that now encloses it (nil = none). Only changes are
+    /// returned, never a cycle. Left alone: items whose parent moved in the same change (the parent carried them, for
+    /// example a rotation that tips a label's corners past the outline), items attached to something other than a
+    /// shape (a comment on a sticky note), free items dropped on an expanded sticky note when notes claim drops (the
+    /// note takes them), locked items, comments and connectors.
+    static func plan(moved: [ElementID], items: [Item], notesClaimDrops: Bool = false) -> [Change] {
         let live = items.filter { !$0.deleted }
         let byID = Dictionary(live.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        let containers = live.enumerated().compactMap { index, item -> (Item, ShapeItem, Double, Int)? in
-            guard let s = item.shape, containerKinds.contains(s.shape) else { return nil }
-            return (item, s, s.frame.w * s.frame.h, index)
-        }
+        var position: [ElementID: Int] = [:]
+        for (i, item) in live.enumerated() where position[item.id] == nil { position[item.id] = i }
+        let notes = notesClaimDrops ? expandedNotes(live) : []
+        let movedSet = Set(moved)
+        var shapes: [Container]?
         var out: [Change] = []
         for id in moved {
-            guard let item = byID[id], item.kind != .comment, item.kind != .connector else { continue }
-            if let current = item.attachedTo, let parent = byID[current], parent.kind != .shape { continue }
-            let box = item.bounds
-            let parent = containers
-                .filter { c in c.0.id != id && !isDescendant(c.0.id, of: id, byID) && ShapeGeometry.contains(c.1, box) }
-                .min { a, b in a.2 != b.2 ? a.2 < b.2 : a.3 > b.3 }?.0.id
+            guard let item = byID[id], item.kind != .comment, item.kind != .connector, !item.locked else { continue }
+            if let current = item.attachedTo {
+                if movedSet.contains(current) { continue }
+                if let parent = byID[current], parent.kind != .shape { continue }
+            }
+            let free = item.attachedTo.map { byID[$0] == nil } ?? true
+            if free, let pos = position[id], claimedByNote(item, position: pos, notes: notes) { continue }
+            let points = probePoints(item)
+            guard let box = Rect.bounding(points) else { continue }
+            let all = shapes ?? containers(live)
+            shapes = all
+            let parent = all
+                .filter { $0.id != id && $0.encloses(points, box: box) }
+                .sorted { a, b in a.area != b.area ? a.area < b.area : a.index > b.index }
+                .first { !isDescendant($0.id, of: id, byID) }?.id
             if parent != item.attachedTo { out.append(Change(item: id, parent: parent)) }
         }
         return out

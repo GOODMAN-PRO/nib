@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import Combine
 import NibContracts
 import NibDesign
@@ -6,19 +7,30 @@ import NibDesign
 // MARK: - Shared pieces
 
 enum ShapeUILayout {
-    static let kindColumns = Array(repeating: GridItem(.flexible(), spacing: NibSpacing.xs), count: 4)
-    static let swatchColumns = Array(repeating: GridItem(.fixed(NibMetrics.hitTarget), spacing: 0), count: 6)
+    /// DESIGN.md §14.3: choice grids are 4 columns of `NibOptionTile`s, 6 pt apart.
+    static let kindColumns = Array(repeating: GridItem(.flexible(), spacing: NibSpacing.xs + NibSpacing.xxs), count: 4)
     static let pointsPerMillimetre = 72 / 25.4
     static let defaultFillOpacity = 0.35
+    /// The swatch id of a colour that is none of the 12 inks (it joins the grid, selected, after the inks).
+    static let customSwatchID = "custom"
+    /// Shape glyphs are `NibOptionGlyph`'s size: the sidebar glyph role (22 pt).
+    static let glyphSide = NibGlyph.sidebar.size
+    /// Box samples are this much taller than wide (lines run corner to corner of the same box).
+    static let glyphAspect = 0.8
+    /// Samples are built with the glyph's own line width, so arrowheads come out in proportion.
+    static let glyphStyle = ShapeItemStyle(strokeColor: .black, strokeWidth: Double(NibStroke.emphasis), cornerRadius: 0)
 
     /// A small sample of each shape type, drawn with the real geometry (no symbol stands in for a shape).
     static func glyph(_ kind: ShapeKind) -> ShapeItem {
-        let style = ShapeItemStyle(strokeColor: .black, strokeWidth: 1.6, cornerRadius: 2.5)
-        let frame = Frame(x: 4, y: 4, w: 24, h: 18)
+        let w = Double(glyphSide)
+        let frame = Frame(x: 0, y: 0, w: w, h: w * glyphAspect)
+        var style = glyphStyle
+        if kind == .roundedRectangle { style.cornerRadius = ShapeGeometry.roundedDefault(frame, current: 0) }
         return (try? ShapeGeometry.make(kind, frame: frame, points: nil, style: style))
             ?? ShapeItem(shape: kind, frame: frame, style: style)
     }
 
+    /// The full name of a shape type (VoiceOver).
     static func title(_ kind: ShapeKind) -> String {
         switch kind {
         case .line: return String(localized: "Line")
@@ -34,6 +46,11 @@ enum ShapeUILayout {
         case .curve: return String(localized: "Curve")
         default: return kind.rawValue
         }
+    }
+
+    /// The caption under a type's glyph (one line in a quarter of the popover).
+    static func caption(_ kind: ShapeKind) -> String {
+        kind == .roundedRectangle ? String(localized: "Rounded") : title(kind)
     }
 
     static func title(_ pattern: StrokePattern) -> String {
@@ -53,10 +70,35 @@ enum ShapeUILayout {
         }
     }
 
-    /// A swatch for any colour: the ink's own name when it is one of the 12 inks.
-    static func swatch(_ c: RGBA, id: String) -> NibSwatch {
-        if let ink = NibInk.allCases.first(where: { $0.rgba.sameHue(c) }) { return NibSwatch(ink: ink) }
-        return NibSwatch(id: id, color: Color(uiColor: c.withAlpha(1).uiColor), name: String(localized: "Custom colour"))
+    /// The ink a colour is (alpha ignored), if it is one of the 12.
+    static func ink(_ c: RGBA?) -> NibInk? {
+        guard let c else { return nil }
+        return NibInk.allCases.first { $0.rgba.sameHue(c) }
+    }
+
+    /// The 12 inks, plus the current colour when it is none of them.
+    static func swatches(current: RGBA?) -> [NibSwatch] {
+        var out = NibInk.allCases.map { NibSwatch(ink: $0) }
+        if let c = current, ink(c) == nil {
+            out.append(NibSwatch(id: customSwatchID, hex: c.rgbHex, name: String(localized: "Custom colour")))
+        }
+        return out
+    }
+
+    /// The swatch id a colour selects: its ink, the custom swatch, or nil (none).
+    static func swatchID(_ c: RGBA?) -> String? {
+        guard let c else { return nil }
+        return ink(c)?.rawValue ?? customSwatchID
+    }
+
+    /// A "shape" preset colour as a swatch with a unique id (two presets may hold the same ink).
+    static func presetSwatch(_ c: RGBA, index: Int) -> NibSwatch {
+        let id = "preset.\(index)"
+        if let ink = ink(c) {
+            return NibSwatch(id: id, color: ink.color, name: ink.name, ringsLight: ink.needsRing(dark: false),
+                             ringsDark: ink.needsRing(dark: true), pattern: nil)
+        }
+        return NibSwatch(id: id, hex: c.rgbHex, name: String(localized: "Custom colour"))
     }
 
     static func points(_ v: Double) -> String { String(format: String(localized: "%.1f pt"), v) }
@@ -64,123 +106,33 @@ enum ShapeUILayout {
     static func percent(_ v: Double) -> String { String(localized: "\(Int((v * 100).rounded())) %") }
 }
 
-/// A shape drawn with its real geometry in `label` (library and type grids).
+/// A shape drawn with its real geometry, fitted into the More grid's 22 pt glyph (library and type grids).
 struct ShapeGlyph: View {
     let shape: ShapeItem
 
     var body: some View {
-        Canvas { context, _ in
+        Canvas { context, size in
             let parts = ShapeGeometry.strokeParts(shape)
             let outline = ShapeGeometry.isOpen(shape.shape) ? parts.body : ShapeGeometry.path(shape)
-            let style = StrokeStyle(lineWidth: CGFloat(shape.style.strokeWidth), lineCap: .round, lineJoin: .round)
-            context.stroke(Path(outline), with: .color(NibColor.label), style: style)
-            for head in parts.heads { context.fill(Path(head.path), with: .color(NibColor.label)) }
+            var box = outline.boundingBoxOfPath
+            for head in parts.heads { box = box.union(head.path.boundingBoxOfPath) }
+            let room = CGRect(origin: .zero, size: size).insetBy(dx: NibStroke.emphasis, dy: NibStroke.emphasis)
+            guard !box.isNull, box.width > 0 || box.height > 0, room.width > 0, room.height > 0 else { return }
+            let k = min(room.width / max(box.width, 0.001), room.height / max(box.height, 0.001))
+            let fit = CGAffineTransform(translationX: room.midX, y: room.midY)
+                .scaledBy(x: k, y: k)
+                .translatedBy(x: -box.midX, y: -box.midY)
+            let line = StrokeStyle(lineWidth: NibStroke.emphasis, lineCap: .round, lineJoin: .round)
+            context.stroke(Path(outline).applying(fit), with: .color(NibColor.label), style: line)
+            for head in parts.heads { context.fill(Path(head.path).applying(fit), with: .color(NibColor.label)) }
         }
-        .frame(width: 32, height: 26)
+        .frame(width: ShapeUILayout.glyphSide, height: ShapeUILayout.glyphSide)
         .accessibilityHidden(true)
     }
 }
 
-/// One cell of a shape grid: 52 pt tall, selected on `fill3` (DESIGN.md §14.3).
-struct ShapeKindCell: View {
-    let title: String
-    let glyph: ShapeItem
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            ShapeGlyph(shape: glyph)
-                .frame(maxWidth: .infinity, minHeight: 52)
-                .background(isSelected ? NibColor.fill3 : Color.clear,
-                            in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)))
-        .help(title)
-        .accessibilityLabel(title)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-}
-
-/// "No fill" / "no outline": a hairline circle with a slash.
-struct NoneSwatch: View {
-    let isSelected: Bool
-    let label: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            ZStack {
-                Circle().strokeBorder(NibColor.swatchHairline, lineWidth: 1)
-                Path { p in
-                    p.move(to: CGPoint(x: 21, y: 5))
-                    p.addLine(to: CGPoint(x: 5, y: 21))
-                }
-                .stroke(NibColor.labelSecondary, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
-            }
-            .frame(width: 26, height: 26)
-            .overlay {
-                if isSelected {
-                    Circle().stroke(NibColor.label, lineWidth: 2).frame(width: 33, height: 33)
-                }
-            }
-            .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(NibPressStyle(shape: Circle()))
-        .accessibilityLabel(label)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-}
-
-/// The 12 inks, optionally after "None".
-struct ShapeColourRow: View {
-    let selection: RGBA?
-    let allowsNone: Bool
-    let noneLabel: String
-    let pick: (RGBA?) -> Void
-
-    var body: some View {
-        LazyVGrid(columns: ShapeUILayout.swatchColumns, alignment: .leading, spacing: 0) {
-            if allowsNone {
-                NoneSwatch(isSelected: selection == nil, label: noneLabel) { pick(nil) }
-            }
-            ForEach(NibInk.allCases, id: \.self) { ink in
-                NibPenSwatch(NibSwatch(ink: ink), isSelected: selection.map { $0.sameHue(ink.rgba) } ?? false) {
-                    pick(ink.rgba)
-                }
-            }
-        }
-    }
-}
-
-/// A thickness preset dot (44 pt target).
-struct ThicknessPreset: View {
-    let width: Double
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        let d = CGFloat(min(max(width * 2.5, 4), 14))
-        Button(action: action) {
-            Circle()
-                .fill(NibColor.label)
-                .frame(width: d, height: d)
-                .frame(width: NibMetrics.hitTarget, height: 40)
-                .background(isSelected ? NibColor.fill3 : Color.clear,
-                            in: RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous))
-                .frame(minHeight: NibMetrics.hitTarget)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)))
-        .accessibilityLabel(ShapeUILayout.points(width))
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-}
-
-/// Continuous controls (sliders, the colour picker) land as one undo step per gesture: calls with the same key within
-/// a second share an undo group.
+/// Continuous controls (sliders) land as one undo step per gesture: calls with the same key within a second share an
+/// undo group.
 @MainActor
 final class ShapeCommitGrouper {
     private var last: (key: String, group: String, at: Date)?
@@ -194,6 +146,62 @@ final class ShapeCommitGrouper {
         let g = NibID.make().raw
         last = (key, g, now)
         return g
+    }
+}
+
+/// "Custom…": the system colour picker (grid, spectrum, sliders with hex, eyedropper), presented from the window the
+/// inspector or tool menu lives in. Each settled choice is reported; the last one again when the picker closes.
+@MainActor
+final class ShapeColourPicker: NSObject, UIColorPickerViewControllerDelegate {
+    private static var active: ShapeColourPicker?
+    private let onPick: @MainActor (RGBA) -> Void
+    private var latest: RGBA?
+    private var committed: RGBA?
+
+    private init(initial: RGBA, onPick: @escaping @MainActor (RGBA) -> Void) {
+        self.committed = initial
+        self.onPick = onPick
+        super.init()
+    }
+
+    static func present(title: String, initial: RGBA, supportsAlpha: Bool, app: NibApp, session: EditorSession?,
+                        onPick: @escaping @MainActor (RGBA) -> Void) {
+        let picker = UIColorPickerViewController()
+        picker.title = title
+        picker.supportsAlpha = supportsAlpha
+        picker.selectedColor = initial.uiColor
+        let coordinator = ShapeColourPicker(initial: initial, onPick: onPick)
+        picker.delegate = coordinator
+        active = coordinator
+        picker.modalPresentationStyle = .formSheet
+        if let sheet = picker.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+        }
+        if let navigator = app.ui.activeNavigator, session == nil || navigator.session === session {
+            navigator.presentModal(picker)
+            return
+        }
+        var top = (session?.editor as? UIViewController) ?? session?.editor?.canvasHost?.canvasView.window?.rootViewController
+        while let presented = top?.presentedViewController { top = presented }
+        top?.present(picker, animated: true)
+    }
+
+    func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor,
+                                   continuously: Bool) {
+        latest = RGBA(color)
+        if !continuously { commitLatest() }
+    }
+
+    func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
+        commitLatest()
+        if Self.active === self { Self.active = nil }
+    }
+
+    private func commitLatest() {
+        guard let c = latest, c != committed else { return }
+        committed = c
+        onPick(c)
     }
 }
 
@@ -215,7 +223,8 @@ final class ShapeToolMenuModel: ObservableObject {
             .store(in: &bag)
     }
 
-    var entry: ShapeLibraryEntry { ShapeLibraryEntry.current(app.settings) }
+    var entries: [ShapeLibraryEntry] { ShapeLibraryEntry.available(app) }
+    var entry: ShapeLibraryEntry { ShapeLibraryEntry.current(app) }
     var presets: ToolPresets { app.settings.get(NibSettings.presets(ShapeTool.toolID)) }
     var fill: RGBA? { RGBA(hex: app.settings.get(ShapeSettings.fill)) }
     var fillOpacity: Double { app.settings.get(ShapeSettings.fillOpacity) }
@@ -234,6 +243,30 @@ final class ShapeToolMenuModel: ObservableObject {
     func setFill(_ c: RGBA?) { set(ShapeSettings.fill.name, .string(c.map { String($0.hex.prefix(7)) } ?? "")) }
     func setFillOpacity(_ v: Double) { set(ShapeSettings.fillOpacity.name, .number((v * 100).rounded() / 100)) }
     func setRounded(_ rounded: Bool) { set(ShapeSettings.cornerRadius.name, .number(rounded ? 6 : 0)) }
+
+    /// The fill wells: None, the 12 inks (and a custom fill), selected by swatch id.
+    var fillSelection: Binding<String?> {
+        Binding(get: { [weak self] in ShapeUILayout.swatchID(self?.fill) },
+                set: { [weak self] id in
+                    guard let self, id != ShapeUILayout.customSwatchID else { return }
+                    self.setFill(id.flatMap { NibInk(rawValue: $0)?.rgba })
+                })
+    }
+
+    func customFill() {
+        ShapeColourPicker.present(title: String(localized: "Fill"), initial: fill ?? NibInk.cobalt.rgba,
+                                  supportsAlpha: false, app: app, session: session) { [weak self] c in
+            self?.setFill(c)
+        }
+    }
+
+    var outlineSelection: Binding<String?> {
+        Binding(get: { [weak self] in self.map { "preset.\($0.presets.selectedSwatch)" } },
+                set: { [weak self] id in
+                    guard let id, let index = Int(id.dropFirst("preset.".count)) else { return }
+                    self?.selectSwatch(index)
+                })
+    }
 
     func selectSwatch(_ i: Int) {
         app.perform("preset.select", ["tool": .string(ShapeTool.toolID), "swatch": .number(Double(i))], session: session)
@@ -261,11 +294,12 @@ struct ShapeLibraryMenu: View {
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
             NibInspectorSection(String(localized: "Shapes")) {
-                LazyVGrid(columns: ShapeUILayout.kindColumns, spacing: NibSpacing.xs) {
-                    ForEach(ShapeLibraryEntry.allCases) { entry in
-                        ShapeKindCell(title: entry.title, glyph: entry.glyph, isSelected: model.entry == entry) {
-                            model.choose(entry)
+                LazyVGrid(columns: ShapeUILayout.kindColumns, spacing: NibSpacing.xs + NibSpacing.xxs) {
+                    ForEach(model.entries) { entry in
+                        NibOptionTile(entry.caption, isSelected: model.entry == entry, action: { model.choose(entry) }) {
+                            ShapeGlyph(shape: entry.glyph)
                         }
+                        .accessibilityLabel(entry.title)
                     }
                 }
             }
@@ -274,10 +308,11 @@ struct ShapeLibraryMenu: View {
                 NibToggle(String(localized: "Draw outline"),
                           isOn: Binding(get: { model.outline }, set: { model.setOutline($0) }))
             }
-            NibInspectorSection(String(localized: "Fill"), value: model.fill == nil ? nil : ShapeUILayout.percent(model.fillOpacity)) {
-                ShapeColourRow(selection: model.fill, allowsNone: true, noneLabel: String(localized: "No fill")) {
-                    model.setFill($0)
-                }
+            NibInspectorSection(String(localized: "Fill"),
+                                value: model.fill == nil ? nil : ShapeUILayout.percent(model.fillOpacity),
+                                action: NibAction(String(localized: "Custom…"), handler: { model.customFill() })) {
+                NibSwatchGrid(swatches: ShapeUILayout.swatches(current: model.fill), selection: model.fillSelection,
+                              noneLabel: String(localized: "No fill"))
                 if model.fill != nil {
                     NibSlider(value: Binding(get: { model.fillOpacity }, set: { model.setFillOpacity($0) }),
                               in: 0.05...1, label: String(localized: "Fill opacity"), detents: [0.25, 0.5, 1])
@@ -297,15 +332,15 @@ struct ShapeLibraryMenu: View {
     /// Outline colour and thickness are the "shape" presets (shared with the tool's options bar).
     private var outlinePresets: some View {
         NibInspectorSection(String(localized: "Outline colour")) {
-            LazyVGrid(columns: ShapeUILayout.swatchColumns, alignment: .leading, spacing: 0) {
-                ForEach(Array(model.presets.swatches.enumerated()), id: \.offset) { index, swatch in
-                    NibPenSwatch(ShapeUILayout.swatch(swatch.color, id: "shapes.outline.\(index)"),
-                                 isSelected: model.presets.selectedSwatch == index) { model.selectSwatch(index) }
-                }
-            }
+            NibSwatchGrid(swatches: model.presets.swatches.enumerated().map { index, swatch in
+                              ShapeUILayout.presetSwatch(swatch.color, index: index)
+                          },
+                          selection: model.outlineSelection)
             HStack(spacing: NibSpacing.s) {
                 ForEach(Array(model.presets.widths.enumerated()), id: \.offset) { index, width in
-                    ThicknessPreset(width: width, isSelected: model.presets.selectedWidth == index) { model.selectWidth(index) }
+                    NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index),
+                                         isSelected: model.presets.selectedWidth == index,
+                                         label: ShapeUILayout.points(width)) { model.selectWidth(index) }
                 }
             }
         }
@@ -329,17 +364,21 @@ struct ShapeLibraryPanel: View {
 // MARK: - Style inspector
 
 /// Reads the selected shapes and edits them through `shape.setStyle` / `shape.setKind` (and `shape.tapAt` for text).
+/// It follows the session's selection, so it never edits a shape that is no longer selected.
 @MainActor
 final class ShapeInspectorModel: ObservableObject {
     let app: NibApp
     let session: EditorSession
-    let doc: DocumentID
-    let page: PageID
-    private let ids: Set<ElementID>
+    private(set) var doc: DocumentID
+    private(set) var page: PageID
+    private var ids: Set<ElementID>
     @Published private(set) var items: [Item]
     private var subscription: EventSubscription?
+    private var selectionWatch: AnyCancellable?
     private let grouper = ShapeCommitGrouper()
     private var lastOutline: RGBA?
+    /// The latest edit (tests await it).
+    private(set) var pendingRun: Task<Void, Never>?
 
     init(context: InspectorContext) {
         app = context.app
@@ -358,12 +397,23 @@ final class ShapeInspectorModel: ObservableObject {
             guard let self, cs.documents.contains(self.doc) else { return }
             self.reload()
         }
+        selectionWatch = session.$selection.dropFirst().sink { [weak self] selection in self?.follow(selection) }
         reload()
     }
 
     func stop() {
         subscription?.cancel()
         subscription = nil
+        selectionWatch = nil
+    }
+
+    /// A new selection replaces the shapes being edited (an empty one keeps them: the host is closing the inspector).
+    func follow(_ selection: Selection) {
+        guard let d = selection.doc, let p = selection.page, !selection.items.isEmpty else { return }
+        doc = d
+        page = p
+        ids = Set(selection.items)
+        reload()
     }
 
     private func reload() {
@@ -390,10 +440,17 @@ final class ShapeInspectorModel: ObservableObject {
         }
     }
 
+    /// "No fill" is offered only where the shape stays visible (an outline or text).
+    func allowsNoFill(_ s: ShapeItem) -> Bool { s.style.strokeColor != nil || !(s.text?.isEmpty ?? true) }
+
     func apply(key: String, _ change: (inout ShapeStylePatch) -> Void) {
+        apply(group: grouper.group(for: key), change)
+    }
+
+    func apply(group: String, _ change: (inout ShapeStylePatch) -> Void) {
         var patch = ShapeStylePatch()
         change(&patch)
-        run([("shape.setStyle", ["refs": .array(refs.map { JSONValue.string($0) }), "style": patch.json])], group: grouper.group(for: key))
+        run([("shape.setStyle", ["refs": .array(refs.map { JSONValue.string($0) }), "style": patch.json])], group: group)
     }
 
     func setKind(_ kind: ShapeKind) {
@@ -406,9 +463,31 @@ final class ShapeInspectorModel: ObservableObject {
         apply(key: "outline") { $0.strokeColor = .set(on ? colour : nil) }
     }
 
+    /// An ink from the outline grid, keeping the outline's alpha.
+    func setOutlineInk(_ id: String?, current: RGBA) {
+        guard let ink = id.flatMap({ NibInk(rawValue: $0) }) else { return }
+        apply(key: "outline") { $0.strokeColor = .set(ink.rgba.withAlpha(current.alpha)) }
+    }
+
+    /// An ink (or none) from the fill grid, keeping the fill's translucency.
     func setFill(_ c: RGBA?, previous: RGBA?) {
         let alpha = previous?.alpha ?? ShapeUILayout.defaultFillOpacity
         apply(key: "fill") { $0.fillColor = .set(c.map { $0.withAlpha(alpha) }) }
+    }
+
+    /// "Custom…" beside Outline or Fill: the system picker with opacity; one picker session is one undo step.
+    func customColour(fill: Bool) {
+        guard let s = first else { return }
+        let group = NibID.make().raw
+        let initial = fill ? (s.style.fillColor ?? NibInk.cobalt.rgba.withAlpha(ShapeUILayout.defaultFillOpacity))
+                           : (s.style.strokeColor ?? .black)
+        let title = fill ? String(localized: "Fill") : String(localized: "Outline")
+        ShapeColourPicker.present(title: title, initial: initial, supportsAlpha: true, app: app, session: session) {
+            [weak self] c in
+            self?.apply(group: group) { patch in
+                if fill { patch.fillColor = .set(c) } else { patch.strokeColor = .set(c) }
+            }
+        }
     }
 
     /// An arrow's end head is its type: turning it off makes it a line.
@@ -436,18 +515,10 @@ final class ShapeInspectorModel: ObservableObject {
                 })
     }
 
-    func colourBinding(key: String, current: RGBA?, fallback: RGBA,
-                       write: @escaping (inout ShapeStylePatch, RGBA) -> Void) -> Binding<Color> {
-        Binding(get: { Color(uiColor: (current ?? fallback).uiColor) },
-                set: { [weak self] colour in
-                    let rgba = RGBA(UIColor(colour))
-                    self?.apply(key: key) { write(&$0, rgba) }
-                })
-    }
-
     private func run(_ calls: [(String, JSONValue)], group: String) {
-        let app = self.app, session = self.session
-        Task { @MainActor in
+        let app = self.app, session = self.session, previous = pendingRun
+        pendingRun = Task { @MainActor in
+            await previous?.value
             for (command, params) in calls { await ShapesUI.run(app, command, params, session: session, group: group) }
         }
     }
@@ -500,34 +571,32 @@ struct ShapeStyleInspector: View {
 
     private func typeSection(_ s: ShapeItem) -> some View {
         NibInspectorSection(String(localized: "Type")) {
-            LazyVGrid(columns: ShapeUILayout.kindColumns, spacing: NibSpacing.xs) {
+            LazyVGrid(columns: ShapeUILayout.kindColumns, spacing: NibSpacing.xs + NibSpacing.xxs) {
                 ForEach(ShapeKind.allCases, id: \.self) { kind in
-                    ShapeKindCell(title: ShapeUILayout.title(kind), glyph: ShapeUILayout.glyph(kind),
-                                  isSelected: s.shape == kind) { model.setKind(kind) }
+                    NibOptionTile(ShapeUILayout.caption(kind), isSelected: s.shape == kind, action: { model.setKind(kind) }) {
+                        ShapeGlyph(shape: ShapeUILayout.glyph(kind))
+                    }
+                    .accessibilityLabel(ShapeUILayout.title(kind))
                 }
             }
         }
     }
 
     private func outlineSection(_ s: ShapeItem) -> some View {
-        NibInspectorSection(String(localized: "Outline"),
-                            value: s.style.strokeColor == nil ? nil : ShapeUILayout.points(s.style.strokeWidth)) {
+        let custom: NibAction? = s.style.strokeColor == nil
+            ? nil : NibAction(String(localized: "Custom…"), handler: { model.customColour(fill: false) })
+        return NibInspectorSection(String(localized: "Outline"),
+                                   value: s.style.strokeColor == nil ? nil : ShapeUILayout.points(s.style.strokeWidth),
+                                   action: custom) {
             if !ShapeGeometry.isOpen(s.shape) {
                 NibToggle(String(localized: "Show outline"),
                           isOn: Binding(get: { s.style.strokeColor != nil }, set: { model.setOutline($0) }))
                     .disabled(s.style.strokeColor != nil && !model.canHideOutline)
             }
             if let colour = s.style.strokeColor {
-                ShapeColourRow(selection: colour, allowsNone: false, noneLabel: "") { picked in
-                    guard let picked else { return }
-                    model.apply(key: "outline") { $0.strokeColor = .set(picked.withAlpha(colour.alpha)) }
-                }
-                ColorPicker(String(localized: "Custom outline colour"),
-                            selection: model.colourBinding(key: "outlineCustom", current: colour, fallback: .black) { patch, c in
-                                patch.strokeColor = .set(c)
-                            }, supportsOpacity: true)
-                    .font(NibFont.body)
-                    .frame(minHeight: NibMetrics.hitTarget)
+                NibSwatchGrid(swatches: ShapeUILayout.swatches(current: colour),
+                              selection: Binding(get: { ShapeUILayout.swatchID(colour) },
+                                                 set: { model.setOutlineInk($0, current: colour) }))
                 NibStrokeWidthSlider(width: model.widthBinding(s), range: 0.1...5, presets: [0.35, 0.53, 1.06])
                 NibSegmentedControl(selection: Binding(get: { s.style.pattern }, set: { pattern in
                     model.apply(key: "pattern") { $0.pattern = .set(pattern) }
@@ -546,16 +615,14 @@ struct ShapeStyleInspector: View {
     }
 
     private func fillSection(_ s: ShapeItem) -> some View {
-        NibInspectorSection(String(localized: "Fill"), value: s.style.fillColor.map { ShapeUILayout.percent($0.alpha) }) {
-            ShapeColourRow(selection: s.style.fillColor, allowsNone: s.style.strokeColor != nil || !(s.text?.isEmpty ?? true),
-                           noneLabel: String(localized: "No fill")) { model.setFill($0, previous: s.style.fillColor) }
-            ColorPicker(String(localized: "Custom fill colour"),
-                        selection: model.colourBinding(key: "fillCustom", current: s.style.fillColor,
-                                                       fallback: NibInk.cobalt.rgba.withAlpha(ShapeUILayout.defaultFillOpacity)) { patch, c in
-                            patch.fillColor = .set(c)
-                        }, supportsOpacity: true)
-                .font(NibFont.body)
-                .frame(minHeight: NibMetrics.hitTarget)
+        NibInspectorSection(String(localized: "Fill"), value: s.style.fillColor.map { ShapeUILayout.percent($0.alpha) },
+                            action: NibAction(String(localized: "Custom…"), handler: { model.customColour(fill: true) })) {
+            NibSwatchGrid(swatches: ShapeUILayout.swatches(current: s.style.fillColor),
+                          selection: Binding(get: { ShapeUILayout.swatchID(s.style.fillColor) }, set: { id in
+                              guard id != ShapeUILayout.customSwatchID else { return }
+                              model.setFill(id.flatMap { NibInk(rawValue: $0)?.rgba }, previous: s.style.fillColor)
+                          }),
+                          noneLabel: model.allowsNoFill(s) ? String(localized: "No fill") : nil)
             if let fill = s.style.fillColor {
                 NibSlider(value: Binding(get: { fill.alpha }, set: { a in
                     model.apply(key: "fillOpacity") { $0.fillColor = .set(fill.withAlpha(a)) }

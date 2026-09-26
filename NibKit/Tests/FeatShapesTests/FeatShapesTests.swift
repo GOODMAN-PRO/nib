@@ -1,6 +1,8 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatShapes
 
@@ -305,7 +307,30 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertEqual(run.attrs.size, 24)
         XCTAssertEqual(run.attrs.bold, true)
         XCTAssertNil(run.attrs.color)
-        XCTAssertEqual(back.paragraphs.first?.align, .natural)
+        XCTAssertEqual(back.paragraphs.first?.align, .center, "labels store their centring for link hits and search")
+        // On dark paper the editor shows the outline colour as chalk; it is still left implicit.
+        let dark = ShapeTextStyle.attributed(text, shape: s, darkPaper: true, scale: 1)
+        XCTAssertNil(ShapeTextStyle.richText(dark, shape: s, scale: 1).paragraphs.first?.runs.first?.attrs.color)
+    }
+
+    func testShapeCreateCentresLabelsAndKeepsRectanglesSharp() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        for (kind, radius) in [("rectangle", 0.0), ("triangle", 0), ("diamond", 0), ("roundedRectangle", 20)] {
+            let value = try await h.run("shape.create", ["page": .string(page2Ref), "shape": .string(kind),
+                                                         "frame": [10, 10, 200, 100], "text": "Plan"])
+            guard case let .item(_, _, id)? = NodeRef(value["ref"]?.stringValue ?? "") else { return XCTFail("no ref") }
+            let s = try XCTUnwrap(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: id).shape)
+            XCTAssertEqual(s.style.cornerRadius, radius, kind)
+            XCTAssertEqual(s.text?.paragraphs.first?.align, .center, kind)
+        }
+        let polygon = try await h.run("shape.create", ["page": .string(page2Ref), "shape": "polygon",
+                                                       "points": [[0, 0], [60, 0], [30, 40]]])
+        guard case let .item(_, _, pid)? = NodeRef(polygon["ref"]?.stringValue ?? "") else { return XCTFail("no ref") }
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: pid).shape?.style.cornerRadius, 0)
+        let asked = try await h.run("shape.create", ["page": .string(page2Ref), "shape": "rectangle",
+                                                     "frame": [10, 10, 50, 50], "style": ["cornerRadius": 8]])
+        guard case let .item(_, _, aid)? = NodeRef(asked["ref"]?.stringValue ?? "") else { return XCTFail("no ref") }
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: aid).shape?.style.cornerRadius, 8)
     }
 
     // MARK: Tool
@@ -391,11 +416,13 @@ final class FeatShapesTests: XCTestCase {
         XCTAssertTrue(overlay.hitTest(host.viewPoint(knob.point, page: Fixtures.page1), host: host))
         overlay.touchesBegan(CanvasSample(page: Fixtures.page1, location: knob.point), host: host)
         XCTAssertEqual(host.hidden[Fixtures.page1], [Fixtures.shapeID])
-        let to = Point(knob.point.x + 20, knob.point.y + 20)
+        // The knob sits cornerInset (22 pt) in at radius 0 and mid short side (45 pt) at the largest radius: from
+        // radius 6 (25.07 pt in), 10 pt further in along the diagonal is 35.07 pt, radius 25.5.
+        let to = Point(knob.point.x + 10, knob.point.y + 10)
         overlay.touchesMoved([CanvasSample(page: Fixtures.page1, location: to)], host: host)
         overlay.touchesEnded(CanvasSample(page: Fixtures.page1, location: to), host: host)
         await overlay.pendingCommit?.value
-        XCTAssertEqual(try shape(h, Fixtures.shapeID).style.cornerRadius, 42, accuracy: 0.5)
+        XCTAssertEqual(try shape(h, Fixtures.shapeID).style.cornerRadius, 25.5, accuracy: 0.5)
         XCTAssertNil(host.hidden[Fixtures.page1])
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
 
@@ -477,7 +504,7 @@ final class FeatShapesTests: XCTestCase {
 
     func testDroppingAnItemIntoAShapeAttachesItInTheSameUndoStep() async throws {
         let h = Harness(features: [FeatShapesFeature.self])
-        Self.registerMoveStandIns(h.app)
+        Self.registerTransformStandIn(h.app)
         await FeatShapesFeature.start(h.app)
         let watcher = try XCTUnwrap(h.app.services.get(ShapeContainerWatcher.serviceKey, as: ShapeContainerWatcher.self))
         // The maths item (72, 480, 120 × 40) moves inside the fixture rectangle (100, 200, 160 × 90).
@@ -490,6 +517,373 @@ final class FeatShapesTests: XCTestCase {
         let restored = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.mathID)
         XCTAssertNil(restored.attachedTo)
         XCTAssertEqual(restored.frame, Frame(x: 72, y: 480, w: 120, h: 40))
+    }
+
+    func testShapeAttachPutsItemsInAShapeInOneTransaction() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        let refs: JSONValue = [ref(Fixtures.mathID, page: Fixtures.page1), ref(Fixtures.strokeID, page: Fixtures.page1)]
+        try await h.run("shape.attach", ["refs": refs, "container": .string(shapeRef)], as: .ai("chat"))
+        for id in [Fixtures.mathID, Fixtures.strokeID] {
+            XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: id).attachedTo, Fixtures.shapeID)
+        }
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        // Never itself, never a cycle, never an open shape, never a connector.
+        await assertInvalid(h, "shape.attach", ["refs": [.string(shapeRef)], "container": .string(shapeRef)])
+        try await h.run("shape.create", ["page": .string(page1Ref), "shape": "rectangle", "frame": [110, 210, 40, 30],
+                                         "id": "INNER"])
+        try await h.run("shape.attach", ["refs": [ref("INNER", page: Fixtures.page1)], "container": .string(shapeRef)])
+        await assertInvalid(h, "shape.attach", ["refs": [.string(shapeRef)], "container": ref("INNER", page: Fixtures.page1)])
+        try await h.run("shape.create", ["page": .string(page1Ref), "shape": "line", "points": [[0, 0], [50, 50]], "id": "LINE"])
+        await assertInvalid(h, "shape.attach", ["refs": [ref(Fixtures.mathID, page: Fixtures.page1)],
+                                                "container": ref("LINE", page: Fixtures.page1)])
+        await assertInvalid(h, "shape.attach", ["refs": [ref(Fixtures.connectorID, page: Fixtures.page1)],
+                                                "container": .string(shapeRef)])
+        // null releases.
+        try await h.run("shape.attach", ["refs": refs, "container": .null])
+        XCTAssertNil(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.mathID).attachedTo)
+    }
+
+    func testRotatingAContainerKeepsWhatItCarries() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        Self.registerTransformStandIn(h.app)
+        await FeatShapesFeature.start(h.app)
+        let watcher = try XCTUnwrap(h.app.services.get(ShapeContainerWatcher.serviceKey, as: ShapeContainerWatcher.self))
+        let box = Item(id: "BOX", kind: .shape, shape: ShapeItem(shape: .rectangle, frame: Frame(x: 100, y: 100, w: 200, h: 120)))
+        let label = Item(id: "LABEL", kind: .text, attachedTo: "BOX",
+                         text: TextBoxItem(frame: Frame(x: 130, y: 140, w: 140, h: 40), text: RichText(plain: "Inside")))
+        try await h.insert([box, label], page: Fixtures.page2)
+        // F012 carries attached children: both turn 45° about the box's centre. The label's bounds now poke out of the
+        // turned outline, but its parent moved with it, so it stays attached.
+        try await h.run(CommandIDs.itemTransform, ["refs": [ref("BOX"), ref("LABEL")], "rotate": 45, "origin": [200, 160]])
+        await watcher.pending?.value
+        var moved = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "LABEL")
+        XCTAssertEqual(moved.attachedTo, "BOX")
+        XCTAssertEqual(moved.frame?.rotation ?? 0, Double.pi / 4, accuracy: 1e-9)
+        // Nudged on its own it is tested by its turned frame, which is still inside.
+        try await h.run(CommandIDs.itemTransform, ["refs": [ref("LABEL")], "translate": [2, 2]])
+        await watcher.pending?.value
+        moved = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "LABEL")
+        XCTAssertEqual(moved.attachedTo, "BOX")
+        // Dragged out, it is released.
+        try await h.run(CommandIDs.itemTransform, ["refs": [ref("LABEL")], "translate": [400, 0]])
+        await watcher.pending?.value
+        XCTAssertNil(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "LABEL").attachedTo)
+    }
+
+    func testItemsDroppedOnAStickyNoteAreLeftForTheNote() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        Self.registerTransformStandIn(h.app)
+        await FeatShapesFeature.start(h.app)
+        let watcher = try XCTUnwrap(h.app.services.get(ShapeContainerWatcher.serviceKey, as: ShapeContainerWatcher.self))
+        // A closed shape around the fixture note (400, 120, 140 × 140, expanded).
+        try await h.insert([Item(id: "FRAME", kind: .shape,
+                                 shape: ShapeItem(shape: .rectangle, frame: Frame(x: 380, y: 100, w: 200, h: 200)))])
+        let math = ref(Fixtures.mathID, page: Fixtures.page1)
+        // Without the Sticky Notes feature nothing else claims the maths item (72, 480, 120 × 40) landing on the note:
+        // the shape takes it, and lets go when it leaves.
+        try await h.run(CommandIDs.itemTransform, ["refs": [math], "translate": [340, -330]])
+        await watcher.pending?.value
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.mathID).attachedTo, "FRAME")
+        try await h.run(CommandIDs.itemTransform, ["refs": [math], "translate": [-340, 330]])
+        await watcher.pending?.value
+        XCTAssertNil(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.mathID).attachedTo)
+        // With it (F036 attaches drops through item.update), the note takes the item, so the shape leaves it:
+        // whichever observer ran last would otherwise win.
+        for id in [ShapeContainers.stickyCommand, CommandIDs.itemUpdate] {
+            h.app.commands.register(CommandDescriptor(id: id, title: "Stand-in", summary: "Test stand-in.",
+                                                      params: .anything(), effect: .edit)) { _, _ in .null }
+        }
+        try await h.run(CommandIDs.itemTransform, ["refs": [math], "translate": [340, -330]])
+        await watcher.pending?.value
+        XCTAssertNil(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.mathID).attachedTo)
+        // The note itself goes into the shape when it moves (notes never nest, so no note claims it).
+        let note = ref(Fixtures.stickyID, page: Fixtures.page1)
+        try await h.run(CommandIDs.itemTransform, ["refs": [note], "translate": [4, 4]])
+        await watcher.pending?.value
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID).attachedTo, "FRAME")
+        // A collapsed note claims nothing: then the shape takes the item.
+        var sticky = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID)
+        sticky.sticky?.collapsed = true
+        try await h.insert([sticky])
+        try await h.run(CommandIDs.itemTransform, ["refs": [math], "translate": [2, 2]])
+        await watcher.pending?.value
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.mathID).attachedTo, "FRAME")
+    }
+
+    func testNudgingTwoThousandStrokesIntoABoxIsOneQuickStep() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        Self.registerTransformStandIn(h.app)
+        await FeatShapesFeature.start(h.app)
+        let watcher = try XCTUnwrap(h.app.services.get(ShapeContainerWatcher.serviceKey, as: ShapeContainerWatcher.self))
+        let box = Item(id: "BOX", kind: .shape, shape: ShapeItem(shape: .rectangle, frame: Frame(x: 40, y: 40, w: 440, h: 440)))
+        let strokes = (0..<2_000).map { i -> Item in
+            let x = Float(60 + (i % 50) * 8), y = Float(500 + (i / 50) * 7)
+            return Item(id: ElementID("S\(i)"), kind: .stroke,
+                        stroke: Stroke(style: .defaultPen, points: [StrokePoint(x: x, y: y), StrokePoint(x: x + 4, y: y + 3)]))
+        }
+        try await h.insert([box] + strokes, page: Fixtures.page2)
+        h.app.bus.history.clear(Fixtures.docID)
+        // One lasso nudge of all of them into the box, attachments included, on the main actor.
+        let budget = 0.75
+        let start = Date()
+        try await h.run(CommandIDs.itemTransform, ["refs": .array(strokes.map { ref($0.id) }), "translate": [0, -430]])
+        await watcher.pending?.value
+        let elapsed = Date().timeIntervalSince(start)
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        XCTAssertEqual(items.filter { $0.attachedTo == "BOX" }.count, 2_000)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "the move and its attachments are one undo step")
+        XCTAssertLessThan(elapsed, budget * 4, "2,000 strokes took \(elapsed) s")
+        h.app.bus.undo(Fixtures.docID)
+        let restored = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        XCTAssertTrue(restored.allSatisfy { $0.attachedTo == nil })
+        XCTAssertEqual(restored.first { $0.id == "S0" }?.stroke?.points.first?.y, 500)
+    }
+
+    // MARK: Big shapes
+
+    func testClippingKeepsTheDashPhase() throws {
+        let line = [Point(0, 0), Point(100, 0)]
+        let pieces = ShapeGeometry.clipped(line, to: Rect(x: 25, y: -5, width: 30, height: 10))
+        let piece = try XCTUnwrap(pieces.first)
+        XCTAssertEqual(pieces.count, 1)
+        XCTAssertEqual(piece.offset, 25, accuracy: 1e-9)
+        XCTAssertEqual(piece.points.first?.x ?? 0, 25, accuracy: 1e-9)
+        XCTAssertEqual(piece.points.last?.x ?? 0, 55, accuracy: 1e-9)
+        // Every dash of the cut piece lies on a dash of the whole line.
+        let whole = ShapeGeometry.dashed(line, on: 4, off: 6)
+        let cut = ShapeGeometry.dashed(piece.points, on: 4, off: 6, phase: piece.offset)
+        XCTAssertEqual(cut.count, 3)
+        for dash in cut {
+            let mid = ((dash.first?.x ?? 0) + (dash.last?.x ?? 0)) / 2
+            XCTAssertTrue(whole.contains { ($0.first?.x ?? 0) - 1e-9 <= mid && mid <= ($0.last?.x ?? 0) + 1e-9 }, "\(mid)")
+        }
+        // Leaving and re-entering makes two pieces, offsets measured along the whole line.
+        let hook = [Point(0, 0), Point(50, 0), Point(50, 50), Point(0, 50)]
+        let two = ShapeGeometry.clipped(hook, to: Rect(x: -10, y: -10, width: 30, height: 80))
+        XCTAssertEqual(two.count, 2)
+        XCTAssertEqual(two.last?.offset ?? 0, 130, accuracy: 1e-9)
+        XCTAssertTrue(ShapeGeometry.clipped(hook, to: Rect(x: 200, y: 200, width: 10, height: 10)).isEmpty)
+    }
+
+    func testHugeInkShapesDrawOnlyWhatShows() throws {
+        for pattern in [StrokePattern.dotted, .dashed] {
+            let style = ShapeItemStyle(strokeWidth: 2, pattern: pattern, drawnWith: .pencil)
+            for kind in [ShapeKind.rectangle, .ellipse] {
+                let huge = ShapeItem(shape: kind, frame: Frame(x: 20, y: 20, w: 1_000_000, h: 1_000_000), style: style)
+                let parts = ShapeGeometry.strokeParts(huge)
+                XCTAssertNil(ShapeRenderer.inkLines(parts, style: style, area: nil), "\(kind) \(pattern): uncut it is vector dashes")
+                let area = Rect(x: 0, y: 0, width: 160, height: 120)
+                let visible = try XCTUnwrap(ShapeRenderer.inkLines(parts, style: style, area: area))
+                XCTAssertLessThan(visible.count, 200, "\(kind) \(pattern): only the dashes near the drawn area become ink")
+                let start = Date()
+                let drawn = pixels(of: huge)
+                XCTAssertLessThan(Date().timeIntervalSince(start), 2, "\(kind) \(pattern)")
+                if kind == .rectangle, pattern == .dashed { XCTAssertGreaterThan(drawn, 20, "the top and left edges show") }
+            }
+        }
+        // Normal shapes keep whole outlines (the pencil grain matches across tiles).
+        let small = ShapeItem(shape: .rectangle, frame: Frame(x: 10, y: 10, w: 100, h: 60))
+        XCTAssertNil(ShapeRenderer.cut(ShapeGeometry.strokeParts(small), area: Rect(x: 0, y: 0, width: 50, height: 50)))
+    }
+
+    func testShapesBeyondTheLargestPageAreRejected() async {
+        let h = Harness(features: [FeatShapesFeature.self])
+        await assertInvalid(h, "shape.create", ["page": .string(page2Ref), "shape": "rectangle",
+                                                "frame": [0, 0, 5_000_000, 5_000_000], "style": ["drawnWith": "pencil"]])
+        await assertInvalid(h, "shape.create", ["page": .string(page2Ref), "shape": "line", "points": [[0, 0], [200_000, 0]]])
+        await assertInvalid(h, "shape.setPoints", ["ref": .string(shapeRef), "points": [[-150_000, 0], [10, 10]]])
+    }
+
+    // MARK: Inspector
+
+    func testInspectorFollowsTheSelection() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        let a = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [a.id])
+        let model = ShapeInspectorModel(context: InspectorContext(app: h.app, session: h.session, doc: Fixtures.docID,
+                                                                  page: Fixtures.page1, items: [a]))
+        model.start()
+        try await h.run("shape.create", ["page": .string(page1Ref), "shape": "ellipse", "frame": [300, 600, 120, 80],
+                                         "id": "SHAPEB"])
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: ["SHAPEB"])
+        XCTAssertEqual(model.items.map(\.id), ["SHAPEB"])
+        model.apply(key: "outline") { $0.strokeColor = .set(NibInk.crimson.rgba) }
+        await model.pendingRun?.value
+        XCTAssertEqual(try shape(h, "SHAPEB").style.strokeColor, NibInk.crimson.rgba)
+        XCTAssertEqual(try shape(h, Fixtures.shapeID).style.strokeColor, a.shape?.style.strokeColor)
+        model.stop()
+    }
+
+    func testArrowEndOffTurnsAnArrowIntoALine() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        let value = try await h.run("shape.create", ["page": .string(page2Ref), "shape": "arrow", "points": [[10, 10], [200, 80]]])
+        guard case let .item(_, _, id)? = NodeRef(value["ref"]?.stringValue ?? "") else { return XCTFail("no ref") }
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: id)
+        let model = ShapeInspectorModel(context: InspectorContext(app: h.app, session: h.session, doc: Fixtures.docID,
+                                                                  page: Fixtures.page2, items: [item]))
+        model.start()
+        model.setArrowEnd(false)
+        await model.pendingRun?.value
+        var s = try XCTUnwrap(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: id).shape)
+        XCTAssertEqual(s.shape, .line)
+        XCTAssertFalse(s.style.arrowEnd)
+        XCTAssertTrue(ShapeGeometry.strokeParts(s).heads.isEmpty)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 2, "the create, then one step for the type and the head")
+        model.setArrowEnd(true)
+        await model.pendingRun?.value
+        s = try XCTUnwrap(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: id).shape)
+        XCTAssertEqual(s.shape, .line)
+        XCTAssertEqual(ShapeGeometry.strokeParts(s).heads.count, 1)
+        model.stop()
+    }
+
+    func testLibraryAndInspectorFitThePopoverInEveryAppearance() throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "preset.select", title: "Preset", summary: "Test stand-in.",
+                                                  params: .anything(), effect: .session)) { _, _ in .null }
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
+        let context = InspectorContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1, items: [item])
+        let width = NibMetrics.popoverWidth
+        let screens: [(String, AnyView)] = [
+            ("library", AnyView(ShapeLibraryMenu(app: h.app, session: h.session).padding(NibSpacing.l))),
+            ("inspector", AnyView(ShapeStyleInspector(context: context).padding(NibSpacing.l)))
+        ]
+        for (name, view) in screens {
+            let images = NibSnapshot.images(view, size: CGSize(width: width, height: NibMetrics.popoverMaxHeight))
+            XCTAssertEqual(Set(images.keys), Set(NibSnapshot.Variant.allCases), "\(name) renders light, dark and AX3")
+            var heights: [NibSnapshot.Variant: CGFloat] = [:]
+            for variant in NibSnapshot.Variant.allCases {
+                let fitting = NibSnapshot.fittingSize(view, width: width, variant: variant)
+                XCTAssertLessThanOrEqual(fitting.width, width + 0.5, "\(name) is wider than the popover in \(variant)")
+                heights[variant] = fitting.height
+            }
+            XCTAssertGreaterThan(heights[.largeText] ?? 0, heights[.light] ?? 0, "\(name) grows with AX3 text, never clips it")
+        }
+    }
+
+    // MARK: Tool, knobs and text on dark paper
+
+    func testToolStyleNeverDrawsAnInvisibleShape() {
+        let h = Harness(features: [FeatShapesFeature.self])
+        let presets = h.app.settings.get(NibSettings.presets(ShapeTool.toolID))
+        h.app.settings.set(ShapeSettings.outline, false)
+        h.app.settings.set(ShapeSettings.fill, "")
+        var s = ShapeToolStyle.current(h.app, entry: .rectangle)
+        XCTAssertEqual(s.strokeColor, presets.color, "outline off and no fill falls back to an outline")
+        XCTAssertNil(s.fillColor)
+        h.app.settings.set(ShapeSettings.fill, "#2156D9")
+        s = ShapeToolStyle.current(h.app, entry: .rectangle)
+        XCTAssertNil(s.strokeColor)
+        XCTAssertEqual(s.fillColor?.sameHue(NibInk.cobalt.rgba), true)
+        s = ShapeToolStyle.current(h.app, entry: .arrow)
+        XCTAssertEqual(s.strokeColor, presets.color, "lines always have an outline and never a fill")
+        XCTAssertNil(s.fillColor)
+    }
+
+    func testLibraryFollowsTheDesignGridAndConnectsShapes() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        XCTAssertEqual(Array(ShapeLibraryEntry.allCases.prefix(8)),
+                       [.line, .arrow, .rectangle, .ellipse, .triangle, .star, .polygon, .connector])
+        XCTAssertFalse(ShapeLibraryEntry.available(h.app).contains(.connector), "hidden while connector.create is missing")
+        h.app.settings.set(ShapeSettings.kind, ShapeLibraryEntry.connector.rawValue)
+        XCTAssertEqual(ShapeLibraryEntry.current(h.app), .arrow)
+        var created: [JSONValue] = []
+        h.app.commands.register(CommandDescriptor(id: ShapeLibraryEntry.connectorCommand, title: "Connect",
+                                                  summary: "Test stand-in.", params: .anything(), effect: .edit)) { json, _ in
+            created.append(json)
+            return ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECON01"]
+        }
+        XCTAssertTrue(ShapeLibraryEntry.available(h.app).contains(.connector))
+        XCTAssertEqual(ShapeLibraryEntry.current(h.app), .connector)
+        // A drag from inside the fixture rectangle to bare paper connects the shape to a point.
+        let host = FakeCanvasHost(h)
+        let tool = ShapeTool()
+        h.session.selectTool(ShapeTool.toolID)
+        tool.activate(host)
+        tool.touchesBegan(CanvasSample(page: Fixtures.page1, location: Point(180, 245)), host: host)
+        tool.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(420, 330))], host: host)
+        tool.touchesEnded(CanvasSample(page: Fixtures.page1, location: Point(420, 330)), host: host)
+        await tool.pendingCreate?.value
+        XCTAssertEqual(created.count, 1)
+        XCTAssertEqual(created.first?["from"]?["item"]?.stringValue, shapeRef)
+        XCTAssertEqual(created.first?["to"]?["point"], [420, 330])
+        tool.deactivate(host)
+    }
+
+    func testKnobsAreHandleBeadsAndThePencilInksBesideThem() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        try await h.run("shape.create", ["page": .string(page1Ref), "shape": "triangle", "frame": [300, 600, 120, 90],
+                                         "id": "TRI"])
+        try await h.run("shape.create", ["page": .string(page1Ref), "shape": "curve",
+                                         "points": [[300, 760], [360, 710], [420, 760]], "id": "CURVE"])
+        let host = FakeCanvasHost(h)
+        let overlay = ShapeEditOverlay()
+        overlay.attach(to: host)
+        defer { overlay.detach(from: host) }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: ["TRI"])
+        overlay.canvasDidChange(host)
+        XCTAssertEqual(overlay.knobs.count, 3)
+        let beads = overlay.knobViews.filter { !$0.isHidden }
+        XCTAssertEqual(beads.map(\.style), [.clear, .clear, .clear])
+        XCTAssertTrue(beads.allSatisfy { !$0.isUserInteractionEnabled })
+        let apex = host.viewPoint(overlay.knobs[0].point, page: Fixtures.page1)
+        XCTAssertEqual(beads[0].center.x, apex.x, accuracy: 0.01)
+        XCTAssertEqual(beads[0].center.y, apex.y, accuracy: 0.01)
+        h.session.selectTool("pen")
+        XCTAssertFalse(overlay.hitTest(apex, isPencil: true, host: host), "a pen stroke next to a vertex inks")
+        XCTAssertTrue(overlay.hitTest(apex, isPencil: false, host: host), "a finger reshapes")
+        h.session.selectTool("lasso")
+        XCTAssertTrue(overlay.hitTest(apex, isPencil: true, host: host))
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: ["CURVE"])
+        overlay.canvasDidChange(host)
+        XCTAssertEqual(overlay.knobViews.filter { !$0.isHidden }.map(\.style), [.clear, .tinted, .clear],
+                       "control points are tinted beads")
+    }
+
+    func testTextOnDarkPaperIsChalkWhileEditing() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        Self.registerTextStandIn(h.app)
+        try await Self.setPaper(h, NibPaper.slate.rgba, page: Fixtures.page1)
+        XCTAssertTrue(ShapePaper.isDark(h.app, doc: Fixtures.docID, page: Fixtures.page1))
+        XCTAssertFalse(ShapePaper.isDark(h.app, doc: Fixtures.docID, page: Fixtures.page2))
+        XCTAssertEqual(ShapePaper.paper("night"), NibPaper.night.rgba)
+        let host = FakeCanvasHost(h)
+        let overlay = ShapeEditOverlay()
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        let r = try await h.run("shape.tapAt", ["ref": .string(shapeRef), "gesture": "button"])
+        XCTAssertEqual(r["handled"], .bool(true))
+        let editor = try XCTUnwrap(overlay.text)
+        XCTAssertTrue(editor.darkPaper)
+        let typing = try XCTUnwrap(editor.textView.typingAttributes[.foregroundColor] as? UIColor)
+        XCTAssertEqual(RGBA(typing).rgbHex, NibInk.chalk.rgba.rgbHex, "black text on slate would be invisible")
+        editor.textView.attributedText = NSAttributedString(string: "Night shift", attributes: editor.textView.typingAttributes)
+        overlay.endTextEditing(commit: true)
+        await overlay.pendingFlush?.value
+        let stored = try shape(h, Fixtures.shapeID).text
+        XCTAssertEqual(stored?.plainText, "Night shift")
+        XCTAssertNil(stored?.paragraphs.first?.runs.first?.attrs.color, "chalk is how the page shows the outline colour")
+        overlay.detach(from: host)
+    }
+
+    func testDoubleTapSelectsAndEditsAnUnselectedShape() async throws {
+        let h = Harness(features: [FeatShapesFeature.self])
+        Self.registerTextStandIn(h.app)
+        let host = FakeCanvasHost(h)
+        let overlay = ShapeEditOverlay()
+        overlay.attach(to: host)
+        defer { overlay.detach(from: host) }
+        XCTAssertTrue(h.session.selection.isEmpty)
+        let r = try await h.run("shape.tapAt", ["page": .string(page1Ref), "point": [180, 245], "gesture": "doubleTap"])
+        XCTAssertEqual(r["handled"], .bool(true))
+        XCTAssertEqual(h.session.selection.items, [Fixtures.shapeID])
+        XCTAssertNotNil(overlay.text)
+        XCTAssertEqual(h.session.editingTextRef, shapeRef)
+        overlay.endTextEditing(commit: false)
+        // Lines take no text, even on a double-tap.
+        try await h.run("shape.create", ["page": .string(page2Ref), "shape": "line", "points": [[0, 20], [100, 20]]])
+        let line = try await h.run("shape.tapAt", ["page": .string(page2Ref), "point": [50, 20], "gesture": "doubleTap"])
+        XCTAssertEqual(line["handled"], .bool(false))
     }
 
     // MARK: Helpers
@@ -564,29 +958,54 @@ final class FeatShapesTests: XCTestCase {
         }
     }
 
-    /// F012's `item.transform` (translate only) and F003's `item.update`, reduced to what containers need.
-    static func registerMoveStandIns(_ app: NibApp) {
+    /// F012's `item.transform` reduced to what containers need: {refs (one page), translate [dx, dy] | rotate
+    /// (degrees) + origin [x, y]}, every item in one transaction. Like F012, it does not move attached children by
+    /// itself: tests pass them in `refs`, as F012 does when it carries them.
+    static func registerTransformStandIn(_ app: NibApp) {
         app.commands.register(CommandDescriptor(id: CommandIDs.itemTransform, title: "Move", summary: "Test stand-in.",
                                                 params: .anything(), effect: .edit)) { json, ctx in
-            guard case let .item(doc, page, id)? = NodeRef(json["refs"]?[0]?.stringValue ?? ""),
-                  let dx = json["translate"]?[0]?.doubleValue, let dy = json["translate"]?[1]?.doubleValue else {
-                throw NibError.invalid("refs / translate")
+            let targets = (json["refs"]?.arrayValue ?? []).compactMap { ref -> (DocumentID, PageID, ElementID)? in
+                guard case let .item(doc, page, id)? = NodeRef(ref.stringValue ?? "") else { return nil }
+                return (doc, page, id)
+            }
+            guard let first = targets.first else { throw NibError.invalid("refs") }
+            var t = Affine.identity
+            if let dx = json["translate"]?[0]?.doubleValue, let dy = json["translate"]?[1]?.doubleValue {
+                t = .translation(dx, dy)
+            } else if let degrees = json["rotate"]?.doubleValue, let ox = json["origin"]?[0]?.doubleValue,
+                      let oy = json["origin"]?[1]?.doubleValue {
+                t = .rotation(degrees * Double.pi / 180, about: Point(ox, oy))
+            } else {
+                throw NibError.invalid("translate or rotate + origin")
             }
             try ctx.mutate { tx in
-                let item = try tx.item(doc, page: page, id: id)
-                try tx.put(item.transformed(by: .translation(dx, dy)), doc: doc, page: page)
+                let byID = try Dictionary(tx.items(first.0, page: first.1).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                let items = try targets.map { target -> Item in
+                    guard let item = byID[target.2] else { throw NibError.notFound("item \(target.2)") }
+                    return item.transformed(by: t)
+                }
+                try tx.put(items, doc: first.0, page: first.1)
             }
             return [:]
         }
-        app.commands.register(CommandDescriptor(id: CommandIDs.itemUpdate, title: "Update", summary: "Test stand-in.",
-                                                params: .anything(), effect: .edit)) { json, ctx in
-            guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }
+    }
+
+    /// Sets a page's background colour (F005's page.setBackground, reduced).
+    static func setPaper(_ h: Harness, _ colour: RGBA, page: PageID) async throws {
+        let id = "shapestests.paper"
+        h.app.commands.register(CommandDescriptor(id: id, title: "Paper", summary: "Test stand-in.", effect: .edit,
+                                                  exposure: .ui)) { _, ctx in
             try ctx.mutate { tx in
-                let item = try tx.item(doc, page: page, id: id)
-                let merged = try JSONValue.from(item).merging(json["patch"] ?? [:]).decode(Item.self)
-                try tx.put(merged, doc: doc, page: page)
+                guard var record = try tx.content(Fixtures.docID).page(page) else { throw NibError.invalid("page") }
+                record.background = .ofColor(colour)
+                _ = try tx.put(record, doc: Fixtures.docID)
             }
-            return [:]
+            return .null
         }
+        try await h.run(id)
+    }
+
+    private func ref(_ id: ElementID, page: PageID = Fixtures.page2) -> JSONValue {
+        .string(NodeRef.item(Fixtures.docID, page, id).description)
     }
 }

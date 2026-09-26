@@ -117,10 +117,12 @@ enum ShapeControlPoints {
 
 // MARK: - Overlay
 
-/// "shapes.controlPoints": the persistent canvas attachment for the selected shape. It draws the control-point knobs
-/// (rigid beads, never deformed; DESIGN.md §10.15) and claims touches on them before the selection handles, so a drag
-/// reshapes the shape live and commits `shape.setPoints` / `shape.setStyle` on lift. It also hosts the text editor for
-/// text inside shapes: a UITextView over the shape (RichTextBridge, crisp at any zoom) committing `text.setText`.
+/// "shapes.controlPoints": the persistent canvas attachment for the selected shape. It shows the control-point knobs
+/// as `NibHandleView` beads (rigid, never deformed; DESIGN.md §10.15, §13.3), the same beads as the selection handles
+/// beside them: clear for vertices, tinted for control points and the corner-rounding knob. It claims touches on them
+/// before the selection handles, so a drag reshapes the shape live and commits `shape.setPoints` / `shape.setStyle` on
+/// lift. It also hosts the text editor for text inside shapes: a UITextView over the shape (RichTextBridge, crisp at
+/// any zoom) committing `text.setText`.
 @MainActor
 final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UIPointerInteractionDelegate {
     static let descriptorID = "shapes.controlPoints"
@@ -128,11 +130,12 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     static let order = 400
     /// Above the selection handles' layer (10).
     static let zPosition: CGFloat = 11
+    /// A knob takes touches within half a hit target of its centre.
     static let reach = NibMetrics.hitTarget / 2
-    static let vertexDiameter = NibSpacing.m
-    static let controlDiameter = NibSpacing.s + NibSpacing.xxs
-    /// Screen distance of the corner knob from the corner at radius 0 (clear of the corner handle's bead).
-    static let cornerInset = NibSpacing.xl
+    /// Screen distance of the corner knob from the corner at radius 0: outside the corner handle's hit area.
+    static let cornerInset = NibMetrics.hitTarget / 2
+    /// Tools with which the Pencil reshapes (with any other tool a Pencil stroke near a knob inks).
+    static let pencilTools: Set<String> = ["lasso", ShapeTool.toolID]
 
     private final class WeakOverlay {
         weak var overlay: ShapeEditOverlay?
@@ -162,15 +165,19 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         let group = NibID.make().raw
         /// Page → view scale when editing began; the text view's fonts are this much larger than on the page.
         let scale: Double
+        /// The page is dark paper: the editor shows near-black text as chalk, as the tiles will.
+        let darkPaper: Bool
         var committed: RichText
         var debounce: Task<Void, Never>?
 
-        init(doc: DocumentID, page: PageID, id: ElementID, textView: ShapeTextView, scale: Double, committed: RichText) {
+        init(doc: DocumentID, page: PageID, id: ElementID, textView: ShapeTextView, scale: Double, darkPaper: Bool,
+             committed: RichText) {
             self.doc = doc
             self.page = page
             self.id = id
             self.textView = textView
             self.scale = scale
+            self.darkPaper = darkPaper
             self.committed = committed
         }
     }
@@ -180,13 +187,16 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     private let container = CALayer()
     private let guides = CAShapeLayer()
     private let preview = ShapePreviewLayer()
-    private var knobLayers: [CAShapeLayer] = []
+    /// One bead per knob, reused; they never take touches (the attachment does).
+    private(set) var knobViews: [NibHandleView] = []
     private let accessView = ControlPointAccessView(frame: .zero)
     private var transform = CGAffineTransform.identity
     private(set) var target: Target?
     private(set) var knobs: [ShapeControlPoints.Knob] = []
     private var pendingKnob: Int?
     private var drag: (index: Int, point: Point)?
+    /// The dragged shape's page is dark paper (the preview shows the colours the tiles will).
+    private var dragOnDarkPaper = false
     private var committing = false
     private var swallowing = false
     /// What the last claimed touch was for. Kept until the next `hitTest`, so `gesture` answers the same whether the
@@ -231,6 +241,8 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         cancelDrag()
         container.removeFromSuperlayer()
         accessView.removeFromSuperview()
+        for view in knobViews { view.removeFromSuperview() }
+        knobViews = []
         if let id = sessionID, Self.live[id]?.overlay === self { Self.live[id] = nil }
         self.host = nil
     }
@@ -239,7 +251,14 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         refresh()
     }
 
+    /// A finger touch (VoiceOver and pointer paths ask this way too).
     func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
+        hitTest(viewPoint, isPencil: false, host: host)
+    }
+
+    /// Knobs take finger touches with any tool, but the Pencil only with the lasso or the Shapes tool: after the
+    /// non-sticky Shapes tool hands back to the pen, a stroke that starts near the new shape's vertex still inks.
+    func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool {
         if let t = text {
             // A touch outside the text ends editing and goes nowhere else (it never inks); one inside is the text's.
             let local = t.textView.convert(viewPoint, from: host.canvasView)
@@ -250,8 +269,11 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
             claim = .text
             return true
         }
+        // A touch the canvas claimed but routed only as a gesture never reached touchesEnded: start clean.
+        swallowing = false
         claim = .none
-        guard drag == nil, !committing else { return false }
+        pendingKnob = nil
+        guard drag == nil, !committing, !isPencil || Self.pencilTools.contains(host.session.tool) else { return false }
         refresh()
         pendingKnob = knobIndex(at: viewPoint)
         if pendingKnob != nil { claim = .knob }
@@ -267,6 +289,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
         guard !swallowing, let i = pendingKnob, let t = target, knobs.indices.contains(i) else { return }
         drag = (i, knobs[i].point)
+        dragOnDarkPaper = ShapePaper.isDark(host.app, doc: t.doc, page: t.page)
         host.setHidden([t.item.id], page: t.page)
         showDragPreview()
     }
@@ -356,47 +379,33 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         let shape = shownShape ?? t.shape
         let shown = drag == nil ? knobs : ShapeControlPoints.knobs(shape, minInset: minInset)
         let traits = host.canvasView.traitCollection
-        let dark = traits.userInterfaceStyle == .dark
-        let accent = NibUIColor.accent.resolvedColor(with: traits).cgColor
-        let bodyColour = UIAccessibility.isReduceTransparencyEnabled ? NibUIColor.chromeOpaque : NibUIColor.clearBodyOnPaper
-        let body = bodyColour.resolvedColor(with: traits).cgColor
-        let rim = NibUIColor.tintRim.resolvedColor(with: traits).cgColor
 
-        while knobLayers.count < shown.count {
-            let layer = CAShapeLayer()
-            container.addSublayer(layer)
-            knobLayers.append(layer)
+        while knobViews.count < shown.count {
+            let view = NibHandleView(style: .clear)
+            view.isUserInteractionEnabled = false
+            view.layer.zPosition = Self.zPosition
+            host.canvasView.addSubview(view)
+            knobViews.append(view)
         }
         var centres: [CGPoint] = []
-        for (i, layer) in knobLayers.enumerated() {
+        for (i, view) in knobViews.enumerated() {
             guard i < shown.count else {
-                layer.isHidden = true
+                view.isHidden = true
                 continue
             }
             let knob = shown[i]
-            let d = knob.role == .vertex ? Self.vertexDiameter : Self.controlDiameter
-            let path = CGPath(ellipseIn: CGRect(x: -d / 2, y: -d / 2, width: d, height: d), transform: nil)
             let centre = knob.point.cg.applying(transform)
             centres.append(centre)
-            layer.path = path
-            layer.position = centre
-            switch knob.role {
-            case .vertex:
-                layer.fillColor = body
-                layer.strokeColor = accent
-                layer.lineWidth = 2
-            case .control, .corner:
-                layer.fillColor = accent
-                layer.strokeColor = rim
-                layer.lineWidth = 1
-            }
-            layer.nibElevation(.rest, path: path, dark: dark)
-            layer.isHidden = false
+            let style: NibHandleView.Style = knob.role == .vertex ? .clear : .tinted
+            if view.style != style { view.style = style }
+            view.bounds = CGRect(x: 0, y: 0, width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+            view.center = centre
+            view.isHidden = false
         }
         var t2 = transform
         guides.path = ShapeControlPoints.legs(shape)?.copy(using: &t2)
-        guides.strokeColor = accent
-        guides.lineWidth = 1 / max(traits.displayScale, 1)
+        guides.strokeColor = NibUIColor.accent.resolvedColor(with: traits).cgColor
+        guides.lineWidth = NibStroke.hairline
         guides.isHidden = guides.path == nil
 
         guard !centres.isEmpty else {
@@ -416,7 +425,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
     private func hideKnobs() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for layer in knobLayers { layer.isHidden = true }
+        for view in knobViews { view.isHidden = true }
         guides.isHidden = true
         accessView.isHidden = true
         CATransaction.commit()
@@ -437,7 +446,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
 
     private func showDragPreview() {
         guard let shape = shownShape else { return }
-        preview.show(shape, transform: transform)
+        preview.show(shape, transform: transform, darkPaper: dragOnDarkPaper)
         drawKnobs()
     }
 
@@ -555,8 +564,9 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         return UIPointerRegion(rect: rect, identifier: i)
     }
 
+    /// Over a knob the pointer becomes a disc twice the bead (the bead plus its ring of reach).
     func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
-        let d = Self.vertexDiameter + NibSpacing.s
+        let d = NibMetrics.handleBead * 2
         let rect = CGRect(x: region.rect.midX - d / 2, y: region.rect.midY - d / 2, width: d, height: d)
         return UIPointerStyle(shape: .roundedRect(rect, radius: NibRadius.capsule(d)))
     }
@@ -572,7 +582,8 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         endTextEditing(commit: true)
         cancelDrag()
         let scale = Double(CanvasMath.viewScale(CanvasMath.pageToView(host, page: page)))
-        let attributed = ShapeTextStyle.attributed(shape.text ?? .empty, shape: shape, darkPaper: false, scale: scale)
+        let dark = ShapePaper.isDark(host.app, doc: doc, page: page)
+        let attributed = ShapeTextStyle.attributed(shape.text ?? .empty, shape: shape, darkPaper: dark, scale: scale)
         let tv = ShapeTextView(frame: .zero, textContainer: nil)
         tv.backgroundColor = .clear
         tv.isScrollEnabled = false
@@ -580,13 +591,13 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         tv.textContainerInset = .zero
         tv.allowsEditingTextAttributes = true
         tv.attributedText = attributed
-        tv.typingAttributes = ShapeTextStyle.typingAttributes(shape, scale: scale)
+        tv.typingAttributes = ShapeTextStyle.typingAttributes(shape, darkPaper: dark, scale: scale)
         tv.layer.zPosition = Self.zPosition + 1
         tv.accessibilityLabel = String(localized: "Text in shape")
         tv.delegate = self
         tv.onEscape = { [weak self] in self?.endTextEditing(commit: true) }
 
-        let session = TextSession(doc: doc, page: page, id: id, textView: tv, scale: scale,
+        let session = TextSession(doc: doc, page: page, id: id, textView: tv, scale: scale, darkPaper: dark,
                                   committed: ShapeTextStyle.richText(attributed, shape: shape, scale: scale))
         text = session
         var bare = shape
@@ -690,7 +701,7 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         let size = CGSize(width: bounds.width, height: bounds.height)
         let image = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
             ctx.cgContext.translateBy(x: CGFloat(-bounds.x), y: CGFloat(-bounds.y))
-            ShapeRenderer.draw(shape, in: ctx.cgContext, scale: Double(pxPerPt), darkPaper: false, drawsText: false)
+            ShapeRenderer.draw(shape, in: ctx.cgContext, scale: Double(pxPerPt), darkPaper: t.darkPaper, drawsText: false)
         }
         CATransaction.begin()
         CATransaction.setDisableActions(true)

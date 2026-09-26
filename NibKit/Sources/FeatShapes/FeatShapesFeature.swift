@@ -7,7 +7,7 @@ import NibDesign
 /// tool's settings popover), the "shape" drawer, the shape style inspector, control-point editing and text inside
 /// shapes ("shapes.controlPoints" canvas attachment + `shape.tapAt`), and shapes as containers (items dropped inside a
 /// closed shape are attached to it). Every change runs through `shape.create`, `shape.setStyle`, `shape.setKind`,
-/// `shape.setPoints` (and `text.setText` / `item.update` owned elsewhere), so plugins, the AI and the bridge can do
+/// `shape.setPoints`, `shape.attach` (and `text.setText` owned elsewhere), so plugins, the AI and the bridge can do
 /// everything the UI does.
 public enum FeatShapesFeature: NibFeature {
     public static let id = "shapes"
@@ -19,6 +19,7 @@ public enum FeatShapesFeature: NibFeature {
         app.commands.register(ShapeSetStyle.self)
         app.commands.register(ShapeSetKind.self)
         app.commands.register(ShapeSetPoints.self)
+        app.commands.register(ShapeAttach.self)
         app.commands.register(ShapeTapAt.self)
 
         app.content.drawers.register(ItemDrawerEntry(key: ItemKind.shape.rawValue, owner: id, drawer: ShapeDrawer()))
@@ -39,9 +40,11 @@ public enum FeatShapesFeature: NibFeature {
             id: ShapeLibraryMenu.panelID, title: title, icon: NibSymbol.shapes.name, placement: .floating, order: 400,
             owner: id, docKinds: [.notebook, .whiteboard],
             makeView: { context in AnyView(ShapeLibraryPanel(app: context.app, session: context.session)) }))
+        // Keyed on the selection: a host that keeps the inspector up while another shape is selected gets a fresh model.
         app.ui.inspectors.register(InspectorDescriptor(
             id: "shapes.style", title: String(localized: "Shape"), icon: NibSymbol.shapes.name, itemKinds: [.shape],
-            order: 100, owner: id, makeView: { context in AnyView(ShapeStyleInspector(context: context)) }))
+            order: 100, owner: id,
+            makeView: { context in AnyView(ShapeStyleInspector(context: context).id(context.items.map(\.id))) }))
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: ShapeEditOverlay.descriptorID, owner: id,
                                                                      order: ShapeEditOverlay.order) { _ in ShapeEditOverlay() })
 
@@ -105,14 +108,16 @@ enum ShapesUI {
 }
 
 /// Applies `ShapeContainers` after every user change that moves or drops items: attaches them to the closed shape they
-/// now sit in (or releases them) with `item.update`, in the same undo group as the move, so one undo reverts both.
+/// now sit in (or releases them) in the same undo group as the move, so one undo reverts both. One changeset becomes
+/// ONE `commands.batch` invocation holding a `shape.attach` per target shape, and each `shape.attach` writes all of
+/// its items in one transaction: nudging 2,000 strokes into a box is one extra commit, not 2,000.
 @MainActor
 final class ShapeContainerWatcher {
     static let serviceKey = "shapes.containers"
     private weak var app: NibApp?
     /// Lives as long as the app (the watcher is a service); the observer holds the watcher weakly.
     private var subscription: EventSubscription?
-    /// The last batch of attachment updates (tests await it).
+    /// The latest attachment batch, chained after the ones before it so they land in order (tests await it).
     private(set) var pending: Task<Void, Never>?
 
     init(app: NibApp) {
@@ -120,24 +125,37 @@ final class ShapeContainerWatcher {
         subscription = app.bus.observeCommits { [weak self] cs in self?.handle(cs) }
     }
 
-    private func handle(_ cs: Changeset) {
-        guard let app, cs.principal.isUser, ShapesUI.has(app, CommandIDs.itemUpdate) else { return }
+    /// The `commands.batch` calls that apply the plans of one changeset: one `shape.attach` per page and target.
+    static func calls(_ cs: Changeset, app: NibApp) -> [JSONValue] {
         var calls: [JSONValue] = []
-        for (doc, pages) in ShapeContainers.movedItems(cs) {
-            for (page, ids) in pages {
+        let notesClaim = ShapeContainers.notesClaimDrops(app)
+        for (doc, pages) in ShapeContainers.movedItems(cs).sorted(by: { $0.key.raw < $1.key.raw }) {
+            for (page, ids) in pages.sorted(by: { $0.key.raw < $1.key.raw }) {
                 guard let items = try? app.workspace.items(doc, page: page) else { continue }
-                for change in ShapeContainers.plan(moved: ids, items: items) {
-                    let parent: JSONValue = change.parent.map { JSONValue.string($0.raw) } ?? JSONValue.null
-                    calls.append(["ref": .string(NodeRef.item(doc, page, change.item).description),
-                                  "patch": ["attachedTo": parent]])
+                let changes = ShapeContainers.plan(moved: ids, items: items, notesClaimDrops: notesClaim)
+                let targets = Dictionary(grouping: changes, by: \.parent)
+                for (parent, group) in targets.sorted(by: { ($0.key?.raw ?? "") < ($1.key?.raw ?? "") }) {
+                    let refs = group.map { JSONValue.string(NodeRef.item(doc, page, $0.item).description) }
+                    let container = parent.map { JSONValue.string(NodeRef.item(doc, page, $0).description) } ?? .null
+                    calls.append(["command": .string(ShapeAttach.descriptor.id),
+                                  "params": ["refs": .array(refs), "container": container]])
                 }
             }
         }
+        return calls
+    }
+
+    private func handle(_ cs: Changeset) {
+        guard let app, cs.principal.isUser else { return }
+        let calls = Self.calls(cs, app: app)
         guard !calls.isEmpty else { return }
-        let group = cs.group, batch = calls
+        let group = cs.group, previous = pending
         pending = Task { @MainActor in
-            for params in batch {
-                await ShapesUI.run(app, CommandIDs.itemUpdate, params, session: nil, group: group)
+            await previous?.value
+            let value = await ShapesUI.run(app, CommandIDs.batch, ["calls": .array(calls), "stopOnError": false],
+                                           session: nil, group: group)
+            for outcome in value?["results"]?.arrayValue ?? [] where outcome["ok"]?.boolValue == false {
+                ShapesUI.log.error("shape.attach failed: \(outcome["error"]?.jsonString() ?? "?", privacy: .public)")
             }
         }
     }

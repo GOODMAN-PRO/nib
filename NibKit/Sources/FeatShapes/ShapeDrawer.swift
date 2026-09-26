@@ -19,6 +19,8 @@ enum ShapeGeometry {
     static let boxKinds: Set<ShapeKind> = [.rectangle, .roundedRectangle, .ellipse, .triangle, .diamond]
     static let openKinds: Set<ShapeKind> = [.line, .polyline, .arc, .curve, .arrow]
     static let maxPoints = 2_000
+    /// Coordinates and sizes stay within this many points of the origin (the largest page `DocTransaction` accepts).
+    static let maxExtent = 100_000.0
 
     static func isBox(_ kind: ShapeKind) -> Bool { boxKinds.contains(kind) }
     static func isOpen(_ kind: ShapeKind) -> Bool { openKinds.contains(kind) }
@@ -268,9 +270,15 @@ enum ShapeGeometry {
     /// Rejects shapes that cannot be drawn or would be invisible.
     static func validate(_ s: ShapeItem, path: String) throws {
         let f = s.frame
-        let finite = [f.x, f.y, f.w, f.h, f.rotation].allSatisfy { $0.isFinite && abs($0) < 1e7 }
-            && s.points.allSatisfy { $0.x.isFinite && $0.y.isFinite && abs($0.x) < 1e7 && abs($0.y) < 1e7 }
+        let finite = [f.x, f.y, f.w, f.h, f.rotation].allSatisfy { $0.isFinite }
+            && s.points.allSatisfy { $0.x.isFinite && $0.y.isFinite }
         guard finite else { throw NibError.invalid("coordinates must be finite numbers", path: path) }
+        let inRange = [f.x, f.y, f.w, f.h, f.x + f.w, f.y + f.h].allSatisfy { abs($0) <= maxExtent }
+            && s.points.allSatisfy { abs($0.x) <= maxExtent && abs($0.y) <= maxExtent }
+        guard inRange else {
+            throw NibError(.invalidParams, "coordinates and sizes must stay within ±100,000 points", path: path,
+                           hint: "place the shape on the page or board: frame [x, y, width, height] in page points")
+        }
         guard f.w >= 0, f.h >= 0, max(f.w, f.h) >= 0.5 else {
             throw NibError(.invalidParams, "the shape has no size", path: path,
                            hint: "give a frame with a width and height, or points that are apart")
@@ -424,8 +432,15 @@ enum ShapeGeometry {
         }
     }
 
+    /// Segments per curve piece: at least 12, then one per 6 pt of control polygon, at most 512 (a 100,000 pt ellipse
+    /// stays within a point of its true outline).
+    static func segments(_ controlLength: Double) -> Int {
+        guard controlLength.isFinite else { return 12 }
+        return max(12, min(512, Int((controlLength / 6).rounded(.up))))
+    }
+
     /// Polylines approximating a path (one per subpath; closed subpaths repeat their first point).
-    static func flatten(_ path: CGPath, segments: Int = 12) -> [[Point]] {
+    static func flatten(_ path: CGPath) -> [[Point]] {
         var out: [[Point]] = []
         var current: [Point] = []
         var start = Point.zero
@@ -442,6 +457,7 @@ enum ShapeGeometry {
             case .addQuadCurveToPoint:
                 if current.isEmpty { current = [start] }
                 let p0 = current[current.count - 1], c = Point(e.points[0]), p1 = Point(e.points[1])
+                let segments = Self.segments(p0.distance(to: c) + c.distance(to: p1))
                 for k in 1...segments {
                     let t = Double(k) / Double(segments), u = 1 - t
                     current.append(p0 * (u * u) + c * (2 * u * t) + p1 * (t * t))
@@ -450,6 +466,7 @@ enum ShapeGeometry {
                 if current.isEmpty { current = [start] }
                 let p0 = current[current.count - 1], c1 = Point(e.points[0])
                 let c2 = Point(e.points[1]), p1 = Point(e.points[2])
+                let segments = Self.segments(p0.distance(to: c1) + c1.distance(to: c2) + c2.distance(to: p1))
                 for k in 1...segments {
                     let t = Double(k) / Double(segments), u = 1 - t
                     let a = p0 * (u * u * u) + c1 * (3 * u * u * t)
@@ -583,13 +600,17 @@ enum ShapeGeometry {
         return [last, last]
     }
 
-    /// Splits a polyline into dashes (`on` long, `off` apart) for the ink look.
-    static func dashed(_ line: [Point], on: Double, off: Double) -> [[Point]] {
+    /// Splits a polyline into dashes (`on` long, `off` apart) for the ink look. `phase` is how far into the pattern the
+    /// line starts (a piece cut from a longer outline keeps the dashes where the whole outline has them).
+    static func dashed(_ line: [Point], on: Double, off: Double, phase: Double = 0) -> [[Point]] {
         guard line.count >= 2, on > 0, off > 0 else { return [line] }
         var out: [[Point]] = []
-        var current: [Point] = [line[0]]
-        var drawing = true
-        var left = on
+        let period = on + off
+        var into = phase.isFinite ? phase.truncatingRemainder(dividingBy: period) : 0
+        if into < 0 { into += period }
+        var drawing = into < on
+        var left = drawing ? on - into : period - into
+        var current: [Point] = drawing ? [line[0]] : []
         for i in 0..<(line.count - 1) {
             var a = line[i]
             let b = line[i + 1]
@@ -618,6 +639,64 @@ enum ShapeGeometry {
         return out
     }
 
+    /// A polyline piece inside a clip rect and the distance along the whole polyline at which it starts.
+    struct Piece: Equatable {
+        let points: [Point]
+        let offset: Double
+    }
+
+    /// The parts of `line` inside `rect`, split where it leaves and re-enters (Liang–Barsky per segment). Offsets are
+    /// measured along the whole line, so dash patterns keep their phase across the cuts.
+    static func clipped(_ line: [Point], to rect: Rect) -> [Piece] {
+        var out: [Piece] = []
+        var current: [Point] = []
+        var offset = 0.0
+        var travelled = 0.0
+        func close() {
+            if current.count >= 2 { out.append(Piece(points: current, offset: offset)) }
+            current = []
+        }
+        for i in 0..<max(0, line.count - 1) {
+            let a = line[i], b = line[i + 1]
+            let length = a.distance(to: b)
+            defer { travelled += length }
+            guard let (t0, t1) = clipSegment(a, b, to: rect) else {
+                close()
+                continue
+            }
+            if t0 > 0 || current.isEmpty {
+                close()
+                current = [a + (b - a) * t0]
+                offset = travelled + length * t0
+            }
+            current.append(a + (b - a) * t1)
+            if t1 < 1 { close() }
+        }
+        close()
+        return out
+    }
+
+    /// The parameter range of segment a→b inside `r`, nil when it misses.
+    static func clipSegment(_ a: Point, _ b: Point, to r: Rect) -> (Double, Double)? {
+        var t0 = 0.0, t1 = 1.0
+        let dx = b.x - a.x, dy = b.y - a.y
+        for (p, q) in [(-dx, a.x - r.minX), (dx, r.maxX - a.x), (-dy, a.y - r.minY), (dy, r.maxY - a.y)] {
+            if p == 0 {
+                if q < 0 { return nil }
+            } else {
+                let t = q / p
+                if p < 0 {
+                    if t > t1 { return nil }
+                    t0 = max(t0, t)
+                } else {
+                    if t < t0 { return nil }
+                    t1 = min(t1, t)
+                }
+            }
+        }
+        return t0 <= t1 ? (t0, t1) : nil
+    }
+
     // MARK: Hit testing, containment, text
 
     /// True when `p` is on the outline (within `tolerance` plus half the outline width) or inside a closed shape.
@@ -629,14 +708,6 @@ enum ShapeGeometry {
         }
         if !isOpen(s.shape), let poly = polys.first { return Geo.polygonContains(poly, p) }
         return false
-    }
-
-    /// True when a closed shape's outline encloses the whole rectangle.
-    static func contains(_ s: ShapeItem, _ r: Rect) -> Bool {
-        guard !isOpen(s.shape) else { return false }
-        let poly = outline(s)
-        let corners = [Point(r.minX, r.minY), Point(r.maxX, r.minY), Point(r.maxX, r.maxY), Point(r.minX, r.maxY)]
-        return corners.allSatisfy { Geo.polygonContains(poly, $0) }
     }
 
     /// Where text sits inside the shape: a frame (rotated with the shape) inscribed in the outline.
@@ -694,7 +765,8 @@ enum ShapeGeometry {
     }
 }
 
-extension NibInk {
+extension NibHexColour {
+    /// The palette colour (inks, papers) as an opaque `RGBA`.
     var rgba: RGBA { RGBA(UInt8((hex >> 16) & 0xFF), UInt8((hex >> 8) & 0xFF), UInt8(hex & 0xFF)) }
 }
 
@@ -703,6 +775,47 @@ extension RGBA {
     func sameHue(_ o: RGBA) -> Bool { r == o.r && g == o.g && b == o.b }
 
     var luminance: Double { (0.2126 * Double(r) + 0.7152 * Double(g) + 0.0722 * Double(b)) / 255 }
+
+    /// 0xRRGGBB, alpha left out.
+    var rgbHex: UInt32 { UInt32(r) << 16 | UInt32(g) << 8 | UInt32(b) }
+}
+
+// MARK: - Paper
+
+/// Whether a page is dark paper, decided the way the page renderer decides `DrawContext.darkPaper`: a colour
+/// background's colour, else the template's paper (its "paper" param as a hex or a `NibPaper` name, else what the
+/// template itself paints); PDF and image pages are white. Dark means luminance below one half. The shape text editor,
+/// its backdrop and the live previews use it so they show the colours the tiles will.
+@MainActor
+enum ShapePaper {
+    static func isDark(_ app: NibApp, doc: DocumentID, page: PageID) -> Bool {
+        guard let record = try? app.workspace.content(doc).page(page) else { return false }
+        return isDark(colour(record.background, size: record.size, app: app))
+    }
+
+    nonisolated static func isDark(_ paper: RGBA) -> Bool { paper.luminance < 0.5 }
+
+    static func colour(_ background: Background, size: PageSize?, app: NibApp) -> RGBA {
+        switch background.kind {
+        case .color:
+            return background.color ?? .white
+        case .template:
+            guard let ref = background.template else { return .white }
+            let definition = app.content.template(ref)
+            let params = (definition?.defaults ?? [:]).merging(ref.params) { _, new in new }
+            if let value = params[TemplateParamNames.paper]?.stringValue, let paper = paper(value) { return paper }
+            guard let definition else { return .white }
+            let probe = Rect(x: 0, y: 0, width: 1, height: 1)
+            return definition.renderOps(params, size: size ?? PageSize(1, 1), scale: 1, region: probe).paper
+        case .pdf, .image:
+            return .white
+        }
+    }
+
+    /// A "paper" template param: "#RRGGBB[AA]" or a paper name ("slate", "night"…).
+    nonisolated static func paper(_ value: String) -> RGBA? {
+        RGBA(hex: value) ?? NibPaper(rawValue: value.lowercased())?.rgba
+    }
 }
 
 // MARK: - Text
@@ -769,29 +882,36 @@ enum ShapeTextStyle {
         return m
     }
 
-    /// What typing inserts in an empty shape.
-    static func typingAttributes(_ s: ShapeItem, scale: Double) -> [NSAttributedString.Key: Any] {
-        var a = RichTextBridge.attributes(TextAttributes(), base: base(s, darkPaper: false, scale: scale))
+    /// What typing inserts in an empty shape (the base colour as the page shows it: chalk for dark ink on dark paper).
+    static func typingAttributes(_ s: ShapeItem, darkPaper: Bool, scale: Double) -> [NSAttributedString.Key: Any] {
+        var a = RichTextBridge.attributes(TextAttributes(), base: base(s, darkPaper: darkPaper, scale: scale))
         let ps = NSMutableParagraphStyle()
         ps.alignment = .center
         a[.paragraphStyle] = ps
         return a
     }
 
-    /// Back to page units: sizes divided by `scale`, the default size and colour left implicit, centred paragraphs
-    /// stored as natural (a shape centres natural text itself).
+    /// Shape labels store their centring explicitly, so everything that lays a label out from `RichText` (link hits,
+    /// spellcheck, search highlights) centres it as the drawer does. Natural paragraphs become centred.
+    static func centred(_ text: RichText) -> RichText {
+        var t = text
+        for p in t.paragraphs.indices where t.paragraphs[p].align == .natural { t.paragraphs[p].align = .center }
+        return t
+    }
+
+    /// Back to page units: sizes divided by `scale`, the default size and the base colour (as shown on light or dark
+    /// paper) left implicit, paragraphs centred unless aligned otherwise.
     static func richText(_ a: NSAttributedString, shape: ShapeItem, scale: Double) -> RichText {
-        var rich = RichTextBridge.richText(a)
-        let colour = baseColour(shape, darkPaper: false)
+        var rich = centred(RichTextBridge.richText(a))
+        let implicit = [baseColour(shape, darkPaper: false), baseColour(shape, darkPaper: true)]
         for p in rich.paragraphs.indices {
-            if rich.paragraphs[p].align == .center { rich.paragraphs[p].align = .natural }
             for r in rich.paragraphs[p].runs.indices {
                 var at = rich.paragraphs[p].runs[r].attrs
                 if let size = at.size {
                     let unscaled = (size / max(scale, 0.01) * 2).rounded() / 2
                     at.size = abs(unscaled - baseSize) < 0.01 ? nil : unscaled
                 }
-                if at.color == colour { at.color = nil }
+                if let c = at.color, implicit.contains(c) { at.color = nil }
                 rich.paragraphs[p].runs[r].attrs = at
             }
         }
@@ -818,6 +938,13 @@ enum ShapeRenderer {
         }
     }
 
+    /// Outlines longer than this (page points) are cut to the area being drawn before they are dashed or turned into
+    /// ink, so a huge shape costs what its visible part costs. Shorter ones stay whole, so the pencil grain of the ink
+    /// look matches across tile seams.
+    static let clipLength = 4_096.0
+    /// More synthetic strokes than this (the dots of a long dotted outline) draw as vector dashes instead of ink.
+    static let maxInkStrokes = 4_000
+
     static func draw(_ s: ShapeItem, in cg: CGContext, scale: Double, darkPaper: Bool, drawsText: Bool = true) {
         cg.saveGState()
         defer { cg.restoreGState() }
@@ -831,16 +958,34 @@ enum ShapeRenderer {
         if let raw = style.strokeColor, raw.a > 0 {
             let colour = onPaper(raw, darkPaper: darkPaper)
             let parts = ShapeGeometry.strokeParts(s)
+            // Pieces reach this far past the drawn area, so their cut ends, round caps and heads never show.
+            let area = visibleArea(cg)?.insetBy(-(ShapeGeometry.overhang(s) + style.strokeWidth))
+            var inked = false
             if let tool = style.drawnWith, tool != .tape {
-                drawInk(parts, tool: tool, colour: colour, style: style, in: cg, scale: scale, darkPaper: darkPaper)
-            } else {
-                drawVector(parts, colour: colour, style: style, in: cg)
+                inked = drawInk(parts, tool: tool, colour: colour, style: style, area: area, in: cg, scale: scale,
+                                darkPaper: darkPaper)
             }
+            if !inked { drawVector(parts, colour: colour, style: style, area: area, in: cg) }
         }
         if drawsText, let text = s.text, !text.isEmpty { drawText(text, shape: s, in: cg, darkPaper: darkPaper) }
     }
 
-    static func drawVector(_ parts: ShapeGeometry.StrokeParts, colour: RGBA, style: ShapeItemStyle, in cg: CGContext) {
+    /// The part of the page the context can still paint (its clip), nil when unbounded.
+    static func visibleArea(_ cg: CGContext) -> Rect? {
+        let clip = cg.boundingBoxOfClipPath
+        guard !clip.isNull, !clip.isInfinite, clip.width.isFinite, clip.height.isFinite else { return nil }
+        return Rect(clip)
+    }
+
+    /// The outline cut to `area` (each piece with its offset along the outline, so dashes keep their phase) when it is
+    /// longer than `clipLength`; nil when it stays whole.
+    static func cut(_ parts: ShapeGeometry.StrokeParts, area: Rect?) -> [ShapeGeometry.Piece]? {
+        guard let area, parts.polylines.reduce(0.0, { $0 + Geo.pathLength($1) }) > clipLength else { return nil }
+        return parts.polylines.flatMap { ShapeGeometry.clipped($0, to: area) }
+    }
+
+    static func drawVector(_ parts: ShapeGeometry.StrokeParts, colour: RGBA, style: ShapeItemStyle, area: Rect?,
+                           in cg: CGContext) {
         let w = CGFloat(style.strokeWidth)
         cg.saveGState()
         defer { cg.restoreGState() }
@@ -850,10 +995,24 @@ enum ShapeRenderer {
         cg.setLineCap(.round)
         cg.setLineJoin(.round)
         if let dash = dashLengths(style.pattern, width: style.strokeWidth) {
-            cg.setLineDash(phase: 0, lengths: dash.map { CGFloat($0) })
+            // CoreGraphics dashes a whole path, so a long outline is dashed piece by piece, each at its own phase.
+            let lengths = dash.map { CGFloat($0) }
+            let period = dash[0] + dash[1]
+            if let pieces = cut(parts, area: area) {
+                for piece in pieces {
+                    cg.setLineDash(phase: CGFloat(piece.offset.truncatingRemainder(dividingBy: period)), lengths: lengths)
+                    cg.addLines(between: piece.points.map { $0.cg })
+                    cg.strokePath()
+                }
+            } else {
+                cg.setLineDash(phase: 0, lengths: lengths)
+                cg.addPath(parts.body)
+                cg.strokePath()
+            }
+        } else {
+            cg.addPath(parts.body)
+            cg.strokePath()
         }
-        cg.addPath(parts.body)
-        cg.strokePath()
         guard !parts.heads.isEmpty else { return }
         cg.setLineDash(phase: 0, lengths: [])
         cg.setLineWidth(max(w * 0.5, 0.5))
@@ -863,26 +1022,46 @@ enum ShapeRenderer {
         }
     }
 
-    /// The ink look of a Draw-and-Hold shape: synthetic strokes along the outline, rendered by PencilKit with the
-    /// tool that drew it (arrowheads as open chevrons, dashes as separate strokes).
-    static func drawInk(_ parts: ShapeGeometry.StrokeParts, tool: InkTool, colour: RGBA, style: ShapeItemStyle,
-                        in cg: CGContext, scale: Double, darkPaper: Bool) {
-        var lines = parts.polylines
+    /// The polylines the ink look strokes: the outline (cut to `area` when long, see `cut`), split into dashes, then
+    /// the arrowheads as open chevrons (those that reach `area`). nil when that would be more than `maxInkStrokes`.
+    static func inkLines(_ parts: ShapeGeometry.StrokeParts, style: ShapeItemStyle, area: Rect?) -> [[Point]]? {
+        let pieces = cut(parts, area: area) ?? parts.polylines.map { ShapeGeometry.Piece(points: $0, offset: 0) }
+        var lines: [[Point]]
         if let dash = dashLengths(style.pattern, width: style.strokeWidth) {
-            lines = lines.flatMap { ShapeGeometry.dashed($0, on: dash[0], off: dash[1]) }
+            let length = pieces.reduce(0.0) { $0 + Geo.pathLength($1.points) }
+            guard length / (dash[0] + dash[1]) + Double(pieces.count) <= Double(maxInkStrokes) else { return nil }
+            lines = pieces.flatMap { ShapeGeometry.dashed($0.points, on: dash[0], off: dash[1], phase: $0.offset) }
+        } else {
+            lines = pieces.map(\.points)
         }
-        lines += parts.heads.map { $0.points }
+        for head in parts.heads {
+            guard let area, let box = Rect.bounding(head.points) else {
+                lines.append(head.points)
+                continue
+            }
+            if area.intersects(box) { lines.append(head.points) }
+        }
+        lines = lines.filter { $0.count >= 2 }
+        return lines.count <= maxInkStrokes ? lines : nil
+    }
+
+    /// The ink look of a Draw-and-Hold shape: synthetic strokes along the outline, rendered by PencilKit with the
+    /// tool that drew it (arrowheads as open chevrons, dashes as separate strokes). Only what reaches the drawn area is
+    /// built. False when it would take too many strokes; the caller then draws vector dashes.
+    static func drawInk(_ parts: ShapeGeometry.StrokeParts, tool: InkTool, colour: RGBA, style: ShapeItemStyle,
+                        area: Rect?, in cg: CGContext, scale: Double, darkPaper: Bool) -> Bool {
+        guard let lines = inkLines(parts, style: style, area: area) else { return false }
         let ink = InkStyle(tool: tool, pen: tool == .pen ? .fountain : nil, color: colour, width: style.strokeWidth)
-        let strokes = lines.filter { $0.count >= 2 }.map { line -> Stroke in
+        let strokes = lines.map { line -> Stroke in
             let pts = line.enumerated().map { i, p in StrokePoint(x: Float(p.x), y: Float(p.y), t: Float(i) * 0.004) }
             return Stroke(style: ink, points: pts, t0: 0)
         }
-        guard !strokes.isEmpty else { return }
+        guard !strokes.isEmpty else { return true }
         let drawing = PKBridge.drawing(strokes)
         var rect = drawing.bounds
         let clip = cg.boundingBoxOfClipPath
         if !clip.isNull, !clip.isInfinite { rect = rect.intersection(clip) }
-        guard !rect.isNull, rect.width > 0, rect.height > 0 else { return }
+        guard !rect.isNull, rect.width > 0, rect.height > 0 else { return true }
         // ponytail: one bitmap per draw, capped at 16 Mpx; tile the ink if huge shapes at deep zoom ever look soft.
         var pxPerPt = CGFloat(max(scale, 0.25))
         let pixels = rect.width * rect.height * pxPerPt * pxPerPt
@@ -891,7 +1070,7 @@ enum ShapeRenderer {
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
             image = drawing.image(from: rect, scale: pxPerPt)
         }
-        guard let cgImage = image?.cgImage else { return }
+        guard let cgImage = image?.cgImage else { return true }
         cg.saveGState()
         defer { cg.restoreGState() }
         if tool == .highlighter {
@@ -900,6 +1079,7 @@ enum ShapeRenderer {
         cg.translateBy(x: rect.minX, y: rect.maxY)
         cg.scaleBy(x: 1, y: -1)
         cg.draw(cgImage, in: CGRect(origin: .zero, size: rect.size))
+        return true
     }
 
     static let textOptions: NSStringDrawingOptions = [.usesLineFragmentOrigin, .usesFontLeading]
