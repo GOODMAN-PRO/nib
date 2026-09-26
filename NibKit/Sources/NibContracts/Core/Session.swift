@@ -102,6 +102,9 @@ public final class EditorSession: ObservableObject {
     /// editing ends; read by link (F029), spellcheck and the AI's context.
     public var editingTextRef: String?
     public var editingTextRange: [Int]?
+    /// contracts-v2: this window's floating host (see `FloatingHosting`), set by the container's owner (the document
+    /// chrome F017, the library F019); nil until the window's container is on screen, and in headless runs.
+    public weak var floatingHost: FloatingHosting?
     /// Transient per-tool options (current preset slot, eraser size…), keyed by tool id.
     public var toolOptions: [String: JSONValue] = [:]
     /// The editor view controller showing `document` (set by the editor).

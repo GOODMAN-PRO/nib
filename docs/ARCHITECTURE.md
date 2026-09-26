@@ -1391,7 +1391,7 @@ nib://import?from=pasteboard       (share-extension hand-off when no App Group e
 | Extension point | Where it appears | Filled by (examples) |
 |---|---|---|
 | `ui.toolbar` (ToolbarItemDescriptor) | Document toolbar: lasso / tools / accessories / nav bar groups | pen F007, eraser F010, ruler F039, audio F052, plugins |
-| `ui.toolMenus` (ToolMenuDescriptor) | Active-tool options bar | presets F008 for pen, pencil, highlighter, tape, shape |
+| `ui.toolMenus` (ToolMenuDescriptor) | Active-tool options bar, plus (contracts-v2) its own popover (`makePopover` → `ToolMenuPopover`, placed by the palette) | presets F008 for pen, pencil, highlighter, tape, shape |
 | `ui.canvasTools` (CanvasToolDescriptor) | Tools selectable via `tool.select` | pen, pencil, highlighter, eraser, lasso, shape, drawShape, text, image, sticky, tape, laser, elements, plugin tools |
 | `ui.menus` (MenuItemDescriptor, MenuLocation) | Object menu, page long-press, More, title, Add Page, Share & Export, library item/new/selection, app menu, sidebar page/selection, text selection, audio clip, block, card, board, outline entry, comment, transcript line, tab | every feature that has actions |
 | `ui.panels` (PanelDescriptor) | Sidebar tabs, floating panels, sheets, library tabs | pages F023, outline F046, audio F052, layers F041, AI chat F085, gallery F080, calendar F075 |
@@ -1422,6 +1422,7 @@ Hosts call `resolvedParams`, `resolvedTitle` and `resolvedIcon`. Well-known pane
 - A `Registry` counts changes in `generation` and posts `.nibRegistryDidChange` with `RegistryChange` userInfo (ids, owner, kind).
 - `EditorSession.inking` (`InkingSignal`) is the one Pencil-down state per window. The canvas writes it; chrome, HUDs and attachments observe it. It replaces every `"chrome.inking.<session>"` key and `NibHaptics.isInking` poll.
 - `EditorSession` also publishes `openPanels`, `temporaryReturnTool` (`selectTemporarily` / `finishToolUse(sticky:)`) and `editingTextRef` / `editingTextRange`.
+- `EditorSession.floatingHost` (`FloatingHosting`, also `navigator.floatingHost` and `ChromeContext.floatingHost`) is the window's floating host: NibDesign's `NibFloatingHost` behind a protocol, set by the container's owner (F017, F019). UIKit code and canvas attachments use it to bud a popover from a rect (`setAnchor(_:rect:in:)` then `present`), show a HUD, or post a toast inside the window's one droplet container.
 - Events without an owner-specific schema have typed payloads (`NibEventPayload`: `SyncStatusPayload`, `IndexProgressPayload`, `AudioPlaybackPayload`, …), emitted with `events.emit(payload)` and read with `event.decode(_:)`.
 
 **Shell fallbacks.** The shell falls back to minimal built-in screens whenever a provider is missing, so the app runs with any subset of features. That is what makes the CI green baseline possible.

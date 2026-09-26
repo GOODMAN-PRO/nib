@@ -556,6 +556,51 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertEqual(registry.generation, 4)
     }
 
+    func testFloatingHostToolMenuPopoverAndSnapshots() throws {
+        let h = Harness()
+        let host = FakeFloatingHost()
+        XCTAssertNil(h.session.floatingHost)
+        h.session.floatingHost = host
+        let navigator = RecordingNavigator(session: h.session)
+        XCTAssertTrue(navigator.floatingHost === host, "the navigator forwards the window's host by default")
+        XCTAssertTrue(ChromeContext(app: h.app, session: h.session).floatingHost === host)
+        host.present("comment.thread") { Text("Thread") }
+        XCTAssertTrue(host.isPresenting("comment.thread"))
+        XCTAssertTrue(host.setAnchor("pin", rect: CGRect(x: 1, y: 2, width: 3, height: 4), in: UIView()))
+        host.postToast("Deleted")
+        XCTAssertEqual(host.toasts, ["Deleted"])
+        host.dismiss("comment.thread")
+        XCTAssertFalse(host.isPresenting("comment.thread"))
+
+        var open = true
+        var menu = ToolMenuDescriptor(tool: "pen", owner: "presets") { _ in AnyView(Text("bar")) }
+        XCTAssertNil(menu.makePopover)
+        menu.makePopover = { _ in
+            ToolMenuPopover(source: "pen.width", isPresented: Binding(get: { open }, set: { open = $0 }), title: "Thickness") {
+                Text("slider")
+            }
+        }
+        h.app.ui.toolMenus.register(menu)
+        let popover = try XCTUnwrap(h.app.ui.toolMenus.get("pen")?.makePopover?(h.session))
+        XCTAssertEqual(popover.source, "pen.width")
+        popover.isPresented.wrappedValue = false
+        XCTAssertFalse(open)
+
+        let red = try XCTUnwrap(NibSnapshot.image(Color(red: 1, green: 0, blue: 0), size: CGSize(width: 20, height: 20), scale: 1))
+        let p = try XCTUnwrap(NibSnapshot.pixel(red, at: CGPoint(x: 10, y: 10)))
+        XCTAssertGreaterThan(p.r, 200)
+        XCTAssertLessThan(p.g, 60)
+        XCTAssertNil(NibSnapshot.pixel(red, at: CGPoint(x: 30, y: 10)))
+        let variants = NibSnapshot.images(Color.primary, size: CGSize(width: 10, height: 10), scale: 1)
+        XCTAssertEqual(Set(variants.keys), Set(NibSnapshot.Variant.allCases))
+        let light = variants[.light].flatMap { NibSnapshot.pixel($0, at: CGPoint(x: 5, y: 5)) }
+        let dark = variants[.dark].flatMap { NibSnapshot.pixel($0, at: CGPoint(x: 5, y: 5)) }
+        XCTAssertNotEqual(light, dark, "Color.primary follows the variant's colour scheme")
+        let text = Text("The quick brown fox jumps over the lazy dog")
+        XCTAssertGreaterThan(NibSnapshot.fittingSize(text, width: 200, variant: .largeText).height,
+                             NibSnapshot.fittingSize(text, width: 200).height)
+    }
+
     func testChromeOverlayRegistry() {
         let h = Harness()
         var recording = false
@@ -1001,6 +1046,25 @@ private final class IconOnlyDrawer: ItemDrawer {
         guard let f = item.frame else { return nil }
         return Rect(x: f.x, y: f.y, width: 28, height: 28)
     }
+}
+
+/// Records what features put into the window's droplet container.
+@MainActor
+private final class FakeFloatingHost: FloatingHosting {
+    private(set) var presented: [String: AnyView] = [:]
+    private(set) var anchors: [String: CGRect] = [:]
+    private(set) var toasts: [String] = []
+
+    func present(_ id: String, content: AnyView) { presented[id] = content }
+    func dismiss(_ id: String) { presented[id] = nil }
+    func isPresenting(_ id: String) -> Bool { presented[id] != nil }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool {
+        anchors[id] = rect
+        return true
+    }
+    func removeAnchor(_ id: String) { anchors[id] = nil }
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { rect }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) { toasts.append(message) }
 }
 
 @MainActor

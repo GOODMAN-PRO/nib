@@ -9,7 +9,7 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 | **C** | App shell (`AppDelegate.swift`, `ShellViewController.swift`) | Architect only |
 | **D** | `project.yml`, CI workflow, `pick_sim.py`, `lint.py` | Architect only |
 
-15,347 lines across 53 files. Every file starts with its repository path as a heading.
+15,549 lines across 54 files. Every file starts with its repository path as a heading.
 
 ## How to use this file
 
@@ -22,7 +22,7 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 
 contracts-v2 (branch `v2/contracts`) resolves the contract gaps the first 48 features reported (`tools/fleet/contract-gaps.md`, where every gap line now ends with `[v2: G<n> …]`, `[v2: rejected - …]` or `[v2: deferred - …]`). It is **additive over contracts-v1**: no public API was renamed, removed or re-signed; every new protocol requirement has a default implementation; new stored fields are optional or defaulted and decode leniently; superseded APIs keep working and carry a "Superseded in contracts-v2 by X" doc comment. Two behaviour changes are bug fixes: `DocTransaction.revert` (G4) and `CommandContext.inputFile` (G6); plus `Frame.applying` for rotated frames under non-uniform scale (G24). The sources in Part A below are the v2 sources; `NibContractsTests/ContractsV2Tests.swift` covers every fix and every new API.
 
-Totals for the 368 gap lines: **218 resolved, 67 rejected, 83 deferred** (34 NibDesign, 12 catalogue rows in forge-spec, 11 app shell, 26 other owners or later design). 19 more gaps reported by fix agents during the pass: 17 resolved, 2 deferred.
+Totals for the 368 gap lines: **220 resolved, 67 rejected, 81 deferred** (33 NibDesign, 12 catalogue rows in forge-spec, 11 app shell, 25 other owners or later design). 21 more gaps reported by fix agents and the design pass during the pass: 19 resolved, 2 deferred.
 
 **How fix agents use this list.** For your feature, find its id below, delete the named workaround and call the v2 API instead; then re-run your tests (and `CommandConformance.check`). "Adopt" lines name owners that must implement a new hook (the default keeps today's behaviour until they do). Rejected and deferred gaps need no action from features.
 
@@ -268,10 +268,26 @@ public let inking: InkingSignal
 }
 // ScreenRegistry (the chrome prefers it; `toolbar` is superseded)
 public var toolbarView: (@MainActor (EditorSession, NibApp) -> AnyView)?
+// The window's floating host (NibDesign's NibFloatingHost behind a protocol): popovers, HUDs and toasts from UIKit
+// code and canvas attachments, INSIDE the window's droplet container
+@MainActor public protocol FloatingHosting: AnyObject {
+    func present(_ id: String, content: AnyView); func dismiss(_ id: String); func isPresenting(_ id: String) -> Bool
+    @discardableResult func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool; func removeAnchor(_ id: String)
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect?
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?)
+}
+public extension FloatingHosting { func present<Content: View>(_ id: String, @ViewBuilder content: () -> Content); func postToast(_ message: String) }
+public weak var floatingHost: FloatingHosting?          // EditorSession, set by the container's owner (F017, F019)
+var floatingHost: FloatingHosting? { get }               // SceneNavigator (default session.floatingHost)
+@MainActor public var floatingHost: FloatingHosting?     // ChromeContext (session.floatingHost)
+// ToolMenuDescriptor: the options bar's own popover, handed to NibDesign's NibToolOptions(bar:popover:)
+public var makePopover: (@MainActor (EditorSession) -> ToolMenuPopover?)?
+public struct ToolMenuPopover { public var source: String; public var isPresented: Binding<Bool>; public var title: String; public var subtitle: String?; public var content: AnyView }
 ```
+NibDesign's `NibFloatingHost` already has every `FloatingHosting` member except `present(_:content: AnyView)` and `postToast`. So NibDesign (or F017, in an adapter) conforms it in two lines. `ToolMenuPopover` mirrors `NibToolOptionsPopover` field for field.
 The document chrome (F017) renders every visible overlay inside the window's one `NibDropletContainer`, in `order` (z-order), at its placement (an `.anchored` overlay follows its page rect through the canvas, or a window rect), with the NibDesign surface for its `surface`, receding to the recede opacity while `session.inking.isInking` when `recedesWhileWriting`. It re-evaluates `isVisible` on registry changes, session changes and `.nibChromeNeedsUpdate`.
 
-Adopt: F017 (render `ui.chromeOverlays`, mirror `session.inking` into its `NibInkingState`, host `screens.toolbarView` in its container); F006/F101 canvas (write `session.inking` begin/update/end).
+Adopt: F017 (render `ui.chromeOverlays`, mirror `session.inking` into its `NibInkingState`, host `screens.toolbarView` in its container, place a `NibFloatingLayer` and set `session.floatingHost`); F019 (the same host for the library window); F016 (pass `makePopover` to the palette as `NibToolOptions.popover`); F006/F101 canvas (write `session.inking` begin/update/end).
 
 Replaces:
 - F052 `FeatAudio/AudioPanel.swift` `RecorderView` + playback bar living in the sidebar tab → a `.top` `.hud` overlay (recording) and a `.bottom` `.bar` overlay (playback).
@@ -282,7 +298,9 @@ Replaces:
 - F063 `FeatPresentation/FeatPresentationFeature.swift` `PresenterHUDAttachment` → overlay; mirror pausing → `session.inking`.
 - F044 `FeatWhiteboard` minimap fade, F058 `FeatSmartInk/FeatSmartInkFeature.swift` `NibHaptics.isInking` → `session.inking`.
 - F016 `FeatToolbar/FeatToolbarFeature.swift` `screens.toolbar = { ToolbarHostView(...) }` and `ToolbarView.swift` `inkingKey` ("chrome.inking.<session>") → `screens.toolbarView`; F017 `FeatDocChrome/ChromeCommands.swift` `ChromeStateStore.inkingKey` publication → `session.inking`.
-- F026 `FeatTextBox` UIKit popovers (More, font picker), F008 inline options-bar modes, F037 `FeatComments` thread panel opened through `panel.open` → `.anchored` `.popover` overlays (register while shown, unregister to dismiss).
+- F026 `FeatTextBox` UIKit popovers (More, font picker) and F037 `FeatComments` thread panel opened through `panel.open` → `session.floatingHost` (`setAnchor(_:rect:in:)` + `present`), or `.anchored` `.popover` overlays.
+- F008 `FeatPresets` inline options-bar modes (thickness slider, colour editor inside the bar) → `ToolMenuDescriptor.makePopover`.
+- F020 and other library tabs announcing results to VoiceOver instead of toasting → `navigator.floatingHost?.postToast(_:)`.
 
 ### G13 — Shared settings keys
 
@@ -462,8 +480,15 @@ Replaces: F001 `NibStore/NibStoreFeature.swift` `String(format: "%08x", app.cloc
 public init(features: [NibFeature.Type] = [], fixtures: Bool = true, deviceID: UInt32 = 7, keepFeatureServices: Bool = false)   // Harness
 @discardableResult public func insert(_ items: [Item], page: PageID = Fixtures.page1, doc: DocumentID = Fixtures.docID) async throws -> [Item]
 // FakeCanvasHost: afterNextRender runs at once and records renderWaits; FakePDFService: words for word(_:page:at:)
+@MainActor public enum NibSnapshot {                  // offscreen SwiftUI snapshots (ImageRenderer)
+    public enum Variant: String, CaseIterable { case light, dark, largeText }   // largeText = AX3
+    public static func image<V: View>(_ view: V, size: CGSize, variant: Variant = .light, scale: CGFloat = 2) -> UIImage?
+    public static func images<V: View>(_ view: V, size: CGSize, scale: CGFloat = 2) -> [Variant: UIImage]
+    public static func fittingSize<V: View>(_ view: V, width: CGFloat, variant: Variant = .light) -> CGSize
+    public static func pixel(_ image: UIImage, at point: CGPoint) -> RGBA?
+}
 ```
-Replaces: F001/F025 re-registering `NibStoreFeature` after Harness init → `Harness(features:, keepFeatureServices: true)`; F058 tests writing synthetic strokes into `InMemoryPersistence.pageItems` and stand-in `ink.addStrokes` → `h.insert(_:page:doc:)`.
+Replaces: F001/F025 re-registering `NibStoreFeature` after Harness init → `Harness(features:, keepFeatureServices: true)`; F058 tests writing synthetic strokes into `InMemoryPersistence.pageItems` and stand-in `ink.addStrokes` → `h.insert(_:page:doc:)`; F037 `FeatComments` tests that render both panels through `UIHostingController.sizeThatFits` in every state → `NibSnapshot` (Light, Dark, AX3); Reduce Transparency and Increase Contrast stay F111 smoke scripts.
 
 ### G21 — Query paging
 
@@ -547,10 +572,10 @@ Replaces: F090 `NibBridge/NibBridgeFeature.swift` wrapping `gateway.presenter` (
 
 ### Rejected and deferred (summary)
 
-- **NibDesign (34 lines, deferred):** NibSymbol glyphs, tokens (metrics, radii, motion), NibBadge principal kind, NibToolPalette bindings and popover API, NibPenSwatch pattern, progress bar tint, toast outside a container, canvas-anchored droplets. The design-system passes own them.
+- **NibDesign (33 lines, deferred):** NibSymbol glyphs, tokens (metrics, radii, motion), NibBadge principal kind, NibToolPalette bindings and popover API, NibPenSwatch pattern, progress bar tint, canvas-anchored droplets. The design-system passes own them.
 - **Catalogue rows (12, deferred):** extra ids already registered by F027 (settings.open), F031 (shape.tapAt), F034 (image.pick), F041 (layer.exportOptions, superseded by G26), F042 (pdf.tapAt), F043 (pencil.gesture, pencil.palette, pencil.actions), pdf.outline; the spec owner adds the rows to docs/forge-spec.json.
 - **App shell (11, deferred):** status-bar forwarding, tab model and band layout, openGate result, settings page forwarding, paste responder, editing-interaction configuration, key routing while editing text; plus shell adoption of `KeyCommandDescriptor.docKinds`/`sessionParams` and `SceneNavigator.addTab`.
-- **Other deferred (26):** later owners or design: F007 stabiliser rule, F045 covers, F054 transcripts, F055 recognition inputs, F073 shortcuts, F074 deep links, F019 library tabs, F101 spatial index and stroke preview, F004 hiding items attached to a collapsed note, per-message comment merge (F025/F108), item groups, system font designs, pen type in shapes, connector normals.
+- **Other deferred (25):** later owners or design: F007 stabiliser rule, F045 covers, F054 transcripts, F055 recognition inputs, F073 shortcuts, F074 deep links, F019 library tabs, F101 spatial index and stroke preview, F004 hiding items attached to a collapsed note, per-message comment merge (F025/F108), item groups, system font designs, pen type in shapes, connector normals.
 - **Rejected (67):** by design (optional dependencies, provenance, non-undoable writes, locked codes, feature-internal seams), already in the contract, additive params the catalogue allows, platform or language limits, and observations. Recorded conventions: F025's NSFilePresenters use a background `presentedItemOperationQueue`; `tab.select` is 0-based with -1 = last tab (F018, F073 follows); `shape.recognize` returns `{shape: ShapeItem?, mergeWith?: [ref]}`; deep links `nib://open/<doc>/<page>?comment=<itemID>` route to `comment.tapAt`.
 
 ## Quick reference: a complete feature module (example, do not create)
@@ -7122,6 +7147,9 @@ public final class EditorSession: ObservableObject {
     /// editing ends; read by link (F029), spellcheck and the AI's context.
     public var editingTextRef: String?
     public var editingTextRange: [Int]?
+    /// contracts-v2: this window's floating host (see `FloatingHosting`), set by the container's owner (the document
+    /// chrome F017, the library F019); nil until the window's container is on screen, and in headless runs.
+    public weak var floatingHost: FloatingHosting?
     /// Transient per-tool options (current preset slot, eraser size…), keyed by tool id.
     public var toolOptions: [String: JSONValue] = [:]
     /// The editor view controller showing `document` (set by the editor).
@@ -11041,12 +11069,36 @@ public struct ToolMenuDescriptor: Registrable {
     public var order: Int
     public var owner: String
     public var makeView: @MainActor (EditorSession) -> AnyView
+    /// contracts-v2: the options bar's own popover (thickness slider, colour editor), budding from a control inside
+    /// the bar. The bar's droplet clips its content, so the popover cannot live in `makeView`; the toolbar (F016) hands
+    /// it to the palette (NibDesign `NibToolOptions(bar:popover:)`), which places it beside the bar. nil = none.
+    public var makePopover: (@MainActor (EditorSession) -> ToolMenuPopover?)? = nil
 
     public init(tool: String, owner: String, order: Int = 0, makeView: @escaping @MainActor (EditorSession) -> AnyView) {
         self.id = tool
         self.order = order
         self.owner = owner
         self.makeView = makeView
+    }
+}
+
+/// contracts-v2: a popover that buds from the control whose bud anchor id is `source` (NibDesign `nibBudAnchor`)
+/// inside a tool's options bar. One popover at a time: open it only while the tool's settings popover is closed.
+/// Mirrors NibDesign's `NibToolOptionsPopover` field for field, so the toolbar converts it one to one.
+public struct ToolMenuPopover {
+    public var source: String
+    public var isPresented: Binding<Bool>
+    public var title: String
+    public var subtitle: String?
+    public var content: AnyView
+
+    public init<Content: View>(source: String, isPresented: Binding<Bool>, title: String, subtitle: String? = nil,
+                               @ViewBuilder content: () -> Content) {
+        self.source = source
+        self.isPresented = isPresented
+        self.title = title
+        self.subtitle = subtitle
+        self.content = AnyView(content())
     }
 }
 
@@ -11157,6 +11209,9 @@ public protocol SceneNavigator: AnyObject {
 @MainActor
 public extension SceneNavigator {
     func addTab(_ doc: DocumentID) { openDocument(doc, page: nil, mode: .newTab) }
+    /// contracts-v2: the window's floating host (see `FloatingHosting`), also while the library shows. Default nil;
+    /// the shell forwards the library's or the active editor's host.
+    var floatingHost: FloatingHosting? { session.floatingHost }
 }
 
 /// Window lifecycle hooks (Tabs & Windows feature).
@@ -11291,6 +11346,10 @@ public struct ChromeContext {
     public var kind: DocumentKind?
     /// True on compact width (iPhone, narrow Split View).
     public var isCompact: Bool
+    /// contracts-v2: the window's floating host, for an overlay that buds popovers of its own. Default:
+    /// `session.floatingHost`.
+    @MainActor
+    public var floatingHost: FloatingHosting? { session.floatingHost }
 
     public init(app: NibApp, session: EditorSession, navigator: SceneNavigator? = nil, kind: DocumentKind? = nil,
                 isCompact: Bool = false) {
@@ -11299,6 +11358,43 @@ public struct ChromeContext {
         self.navigator = navigator
         self.kind = kind
         self.isCompact = isCompact
+    }
+}
+
+/// contracts-v2: the window's floating host. It puts popovers, HUDs, droplet frames and toasts INTO the window's one
+/// droplet container from code that lives outside it: a canvas attachment's popover budded from a point on the page
+/// (comment thread, spelling suggestions, lasso object menu), a UIKit text editor's formatting popover, a HUD, the Zoom
+/// Window's frame, a toast. NibDesign's `NibFloatingHost` does the work; the container's owner (the document chrome
+/// F017, the library F019) creates one per window and sets `EditorSession.floatingHost`. Everything presented merges,
+/// buds and recedes while the Pencil is down (`EditorSession.inking`) like the chrome, because it is in the same
+/// container. Prefer a `ChromeOverlayDescriptor` for anything that shows in every window; use the host for transient
+/// content that a gesture or a UIKit control opens.
+@MainActor
+public protocol FloatingHosting: AnyObject {
+    /// Shows `content`, or replaces what `id` showed. The content is laid out over the whole container, in its
+    /// coordinates: use a component that places itself (a bud popover from an anchor) or `.position`.
+    func present(_ id: String, content: AnyView)
+    func dismiss(_ id: String)
+    func isPresenting(_ id: String) -> Bool
+    /// A bud source at `rect` in `view`'s coordinates (a canvas view, a text view), so a popover can grow out of it.
+    /// False while the host is not on screen in `view`'s window.
+    @discardableResult
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool
+    func removeAnchor(_ id: String)
+    /// `rect` from `view`'s coordinates into the container's; nil while the host is not on screen in `view`'s window.
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect?
+    /// Shows a toast (replacing the one showing). `actionTitle` + `action` add one button (usually Undo).
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?)
+}
+
+public extension FloatingHosting {
+    /// `present(_:content:)` with a view builder.
+    func present<Content: View>(_ id: String, @ViewBuilder content: () -> Content) {
+        present(id, content: AnyView(content()))
+    }
+
+    func postToast(_ message: String) {
+        postToast(message, actionTitle: nil, action: nil)
     }
 }
 
@@ -12738,6 +12834,78 @@ public final class InMemoryCollabTransport: CollabTransport {
 }
 ```
 
+### `NibKit/Sources/NibTesting/Snapshot.swift`
+
+```swift
+import SwiftUI
+import UIKit
+import NibContracts
+
+/// contracts-v2: offscreen snapshots of SwiftUI views for hostless tests: the Light, Dark and AX3 states DESIGN.md
+/// §15.7 asks for, plus pixel reads for colour assertions. Rendering uses `ImageRenderer`, so pure SwiftUI renders;
+/// UIKit-backed views (UIViewRepresentable) render as placeholders. States that need a host app (Reduce Transparency,
+/// Increase Contrast, live glass) belong to smoke scripts (F111).
+@MainActor
+public enum NibSnapshot {
+    public enum Variant: String, CaseIterable {
+        case light, dark
+        /// Light at accessibility text size 3.
+        case largeText
+
+        public var colorScheme: ColorScheme { self == .dark ? .dark : .light }
+        public var dynamicTypeSize: DynamicTypeSize { self == .largeText ? .accessibility3 : .large }
+    }
+
+    /// `view` rendered at `size` (points) in `variant`; nil when nothing renders.
+    public static func image<V: View>(_ view: V, size: CGSize, variant: Variant = .light, scale: CGFloat = 2) -> UIImage? {
+        let styled = view
+            .frame(width: size.width, height: size.height)
+            .environment(\.colorScheme, variant.colorScheme)
+            .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
+        let renderer = ImageRenderer(content: styled)
+        renderer.scale = scale
+        return renderer.uiImage
+    }
+
+    /// `view` in every variant.
+    public static func images<V: View>(_ view: V, size: CGSize, scale: CGFloat = 2) -> [Variant: UIImage] {
+        var out: [Variant: UIImage] = [:]
+        for v in Variant.allCases {
+            if let image = image(view, size: size, variant: v, scale: scale) { out[v] = image }
+        }
+        return out
+    }
+
+    /// The size `view` wants at `width` in `variant` (UIHostingController.sizeThatFits), for layout assertions such as
+    /// "the panel still fits at AX3".
+    public static func fittingSize<V: View>(_ view: V, width: CGFloat, variant: Variant = .light) -> CGSize {
+        let styled = view
+            .environment(\.colorScheme, variant.colorScheme)
+            .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
+        let host = UIHostingController(rootView: styled)
+        return host.sizeThatFits(in: CGSize(width: width, height: CGFloat.greatestFiniteMagnitude))
+    }
+
+    /// The colour of the pixel at `point` (points, top-left origin); nil outside the image.
+    public static func pixel(_ image: UIImage, at point: CGPoint) -> RGBA? {
+        guard let cg = image.cgImage else { return nil }
+        let x = Int(point.x * image.scale)
+        let y = Int(point.y * image.scale)
+        guard x >= 0, y >= 0, x < cg.width, y < cg.height else { return nil }
+        var px: [UInt8] = [0, 0, 0, 0]
+        let drawn = px.withUnsafeMutableBytes { buffer -> Bool in
+            guard let ctx = CGContext(data: buffer.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: -CGFloat(x), y: CGFloat(y + 1 - cg.height), width: CGFloat(cg.width),
+                                    height: CGFloat(cg.height)))
+            return true
+        }
+        return drawn ? RGBA(px[0], px[1], px[2], px[3]) : nil
+    }
+}
+```
+
 ### `NibKit/Tests/NibContractsTests/NibContractsTests.swift`
 
 ```swift
@@ -13175,7 +13343,7 @@ enum NameLookupCanary {
         DrawPurpose.self, ExportOptionKeys.self, TextLayoutInfo.self, TextLayoutDescriptor.self, PanelPresentation.self,
         ChromePlacement.self, ChromeSurface.self, ChromeAnchor.self, ChromeContext.self, ChromeOverlayDescriptor.self,
         DisplayFontWeight.self, NibFragment.self, BridgeNames.self, PanelIDs.self, ToolbarLayoutSetting.self,
-        TemplateIDs.self, TemplateParamNames.self
+        TemplateIDs.self, TemplateParamNames.self, FloatingHosting.self, ToolMenuPopover.self, NibSnapshot.self
     ]
 
     /// Protocols with associated types / Self requirements are checked as generic constraints.
@@ -13779,6 +13947,51 @@ final class ContractsV2Tests: XCTestCase {
         XCTAssertEqual(registry.generation, 4)
     }
 
+    func testFloatingHostToolMenuPopoverAndSnapshots() throws {
+        let h = Harness()
+        let host = FakeFloatingHost()
+        XCTAssertNil(h.session.floatingHost)
+        h.session.floatingHost = host
+        let navigator = RecordingNavigator(session: h.session)
+        XCTAssertTrue(navigator.floatingHost === host, "the navigator forwards the window's host by default")
+        XCTAssertTrue(ChromeContext(app: h.app, session: h.session).floatingHost === host)
+        host.present("comment.thread") { Text("Thread") }
+        XCTAssertTrue(host.isPresenting("comment.thread"))
+        XCTAssertTrue(host.setAnchor("pin", rect: CGRect(x: 1, y: 2, width: 3, height: 4), in: UIView()))
+        host.postToast("Deleted")
+        XCTAssertEqual(host.toasts, ["Deleted"])
+        host.dismiss("comment.thread")
+        XCTAssertFalse(host.isPresenting("comment.thread"))
+
+        var open = true
+        var menu = ToolMenuDescriptor(tool: "pen", owner: "presets") { _ in AnyView(Text("bar")) }
+        XCTAssertNil(menu.makePopover)
+        menu.makePopover = { _ in
+            ToolMenuPopover(source: "pen.width", isPresented: Binding(get: { open }, set: { open = $0 }), title: "Thickness") {
+                Text("slider")
+            }
+        }
+        h.app.ui.toolMenus.register(menu)
+        let popover = try XCTUnwrap(h.app.ui.toolMenus.get("pen")?.makePopover?(h.session))
+        XCTAssertEqual(popover.source, "pen.width")
+        popover.isPresented.wrappedValue = false
+        XCTAssertFalse(open)
+
+        let red = try XCTUnwrap(NibSnapshot.image(Color(red: 1, green: 0, blue: 0), size: CGSize(width: 20, height: 20), scale: 1))
+        let p = try XCTUnwrap(NibSnapshot.pixel(red, at: CGPoint(x: 10, y: 10)))
+        XCTAssertGreaterThan(p.r, 200)
+        XCTAssertLessThan(p.g, 60)
+        XCTAssertNil(NibSnapshot.pixel(red, at: CGPoint(x: 30, y: 10)))
+        let variants = NibSnapshot.images(Color.primary, size: CGSize(width: 10, height: 10), scale: 1)
+        XCTAssertEqual(Set(variants.keys), Set(NibSnapshot.Variant.allCases))
+        let light = variants[.light].flatMap { NibSnapshot.pixel($0, at: CGPoint(x: 5, y: 5)) }
+        let dark = variants[.dark].flatMap { NibSnapshot.pixel($0, at: CGPoint(x: 5, y: 5)) }
+        XCTAssertNotEqual(light, dark, "Color.primary follows the variant's colour scheme")
+        let text = Text("The quick brown fox jumps over the lazy dog")
+        XCTAssertGreaterThan(NibSnapshot.fittingSize(text, width: 200, variant: .largeText).height,
+                             NibSnapshot.fittingSize(text, width: 200).height)
+    }
+
     func testChromeOverlayRegistry() {
         let h = Harness()
         var recording = false
@@ -14224,6 +14437,25 @@ private final class IconOnlyDrawer: ItemDrawer {
         guard let f = item.frame else { return nil }
         return Rect(x: f.x, y: f.y, width: 28, height: 28)
     }
+}
+
+/// Records what features put into the window's droplet container.
+@MainActor
+private final class FakeFloatingHost: FloatingHosting {
+    private(set) var presented: [String: AnyView] = [:]
+    private(set) var anchors: [String: CGRect] = [:]
+    private(set) var toasts: [String] = []
+
+    func present(_ id: String, content: AnyView) { presented[id] = content }
+    func dismiss(_ id: String) { presented[id] = nil }
+    func isPresenting(_ id: String) -> Bool { presented[id] != nil }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool {
+        anchors[id] = rect
+        return true
+    }
+    func removeAnchor(_ id: String) { anchors[id] = nil }
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { rect }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) { toasts.append(message) }
 }
 
 @MainActor

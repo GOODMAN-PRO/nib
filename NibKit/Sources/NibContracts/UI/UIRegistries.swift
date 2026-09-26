@@ -360,12 +360,36 @@ public struct ToolMenuDescriptor: Registrable {
     public var order: Int
     public var owner: String
     public var makeView: @MainActor (EditorSession) -> AnyView
+    /// contracts-v2: the options bar's own popover (thickness slider, colour editor), budding from a control inside
+    /// the bar. The bar's droplet clips its content, so the popover cannot live in `makeView`; the toolbar (F016) hands
+    /// it to the palette (NibDesign `NibToolOptions(bar:popover:)`), which places it beside the bar. nil = none.
+    public var makePopover: (@MainActor (EditorSession) -> ToolMenuPopover?)? = nil
 
     public init(tool: String, owner: String, order: Int = 0, makeView: @escaping @MainActor (EditorSession) -> AnyView) {
         self.id = tool
         self.order = order
         self.owner = owner
         self.makeView = makeView
+    }
+}
+
+/// contracts-v2: a popover that buds from the control whose bud anchor id is `source` (NibDesign `nibBudAnchor`)
+/// inside a tool's options bar. One popover at a time: open it only while the tool's settings popover is closed.
+/// Mirrors NibDesign's `NibToolOptionsPopover` field for field, so the toolbar converts it one to one.
+public struct ToolMenuPopover {
+    public var source: String
+    public var isPresented: Binding<Bool>
+    public var title: String
+    public var subtitle: String?
+    public var content: AnyView
+
+    public init<Content: View>(source: String, isPresented: Binding<Bool>, title: String, subtitle: String? = nil,
+                               @ViewBuilder content: () -> Content) {
+        self.source = source
+        self.isPresented = isPresented
+        self.title = title
+        self.subtitle = subtitle
+        self.content = AnyView(content())
     }
 }
 
@@ -476,6 +500,9 @@ public protocol SceneNavigator: AnyObject {
 @MainActor
 public extension SceneNavigator {
     func addTab(_ doc: DocumentID) { openDocument(doc, page: nil, mode: .newTab) }
+    /// contracts-v2: the window's floating host (see `FloatingHosting`), also while the library shows. Default nil;
+    /// the shell forwards the library's or the active editor's host.
+    var floatingHost: FloatingHosting? { session.floatingHost }
 }
 
 /// Window lifecycle hooks (Tabs & Windows feature).
@@ -610,6 +637,10 @@ public struct ChromeContext {
     public var kind: DocumentKind?
     /// True on compact width (iPhone, narrow Split View).
     public var isCompact: Bool
+    /// contracts-v2: the window's floating host, for an overlay that buds popovers of its own. Default:
+    /// `session.floatingHost`.
+    @MainActor
+    public var floatingHost: FloatingHosting? { session.floatingHost }
 
     public init(app: NibApp, session: EditorSession, navigator: SceneNavigator? = nil, kind: DocumentKind? = nil,
                 isCompact: Bool = false) {
@@ -618,6 +649,43 @@ public struct ChromeContext {
         self.navigator = navigator
         self.kind = kind
         self.isCompact = isCompact
+    }
+}
+
+/// contracts-v2: the window's floating host. It puts popovers, HUDs, droplet frames and toasts INTO the window's one
+/// droplet container from code that lives outside it: a canvas attachment's popover budded from a point on the page
+/// (comment thread, spelling suggestions, lasso object menu), a UIKit text editor's formatting popover, a HUD, the Zoom
+/// Window's frame, a toast. NibDesign's `NibFloatingHost` does the work; the container's owner (the document chrome
+/// F017, the library F019) creates one per window and sets `EditorSession.floatingHost`. Everything presented merges,
+/// buds and recedes while the Pencil is down (`EditorSession.inking`) like the chrome, because it is in the same
+/// container. Prefer a `ChromeOverlayDescriptor` for anything that shows in every window; use the host for transient
+/// content that a gesture or a UIKit control opens.
+@MainActor
+public protocol FloatingHosting: AnyObject {
+    /// Shows `content`, or replaces what `id` showed. The content is laid out over the whole container, in its
+    /// coordinates: use a component that places itself (a bud popover from an anchor) or `.position`.
+    func present(_ id: String, content: AnyView)
+    func dismiss(_ id: String)
+    func isPresenting(_ id: String) -> Bool
+    /// A bud source at `rect` in `view`'s coordinates (a canvas view, a text view), so a popover can grow out of it.
+    /// False while the host is not on screen in `view`'s window.
+    @discardableResult
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool
+    func removeAnchor(_ id: String)
+    /// `rect` from `view`'s coordinates into the container's; nil while the host is not on screen in `view`'s window.
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect?
+    /// Shows a toast (replacing the one showing). `actionTitle` + `action` add one button (usually Undo).
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?)
+}
+
+public extension FloatingHosting {
+    /// `present(_:content:)` with a view builder.
+    func present<Content: View>(_ id: String, @ViewBuilder content: () -> Content) {
+        present(id, content: AnyView(content()))
+    }
+
+    func postToast(_ message: String) {
+        postToast(message, actionTitle: nil, action: nil)
     }
 }
 
