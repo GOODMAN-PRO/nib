@@ -54,3 +54,10 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - design v2.1 merged (palette re-form on external dock change; reflow 180 ms dwell). Known edge: .dropletDockable orientation flip-back within ~190 ms mislays; could reuse palette logic.
 - F022 V2ADOPT: Move Pages sheet must read PanelContext.params["pages"] (F023 multi-page move). F022/F023 duplicate the nib-pages/1 payload encoder: a shared contract type would remove it.
 - NibSymbol: rotate glyph; 3 pt drag-preview border token (F023).
+- contract gap: bridge per-call event (F090 emits bridge.status only on state/session change); ARCHITECTURE §12 pairing link should document optional port (F074 spec already says so).
+- F017 V2ADOPT green (d0849c6): overlays hosted, floatingHost published, toolbarView full-window, openPanels, PanelContext params/presentation.
+- Remaining chrome gaps: DropletStyle per-droplet recede opt-out (NibDesign); overlay 'instant' show; contract for palette dock location so bottom overlays avoid a bottom-docked palette on iPad; toast bud swallows first outside touch; shell must track key-window changes (window.showLibrary) and forward childForStatusBarHidden (P-106).
+- Spec pass 2 items: audio.play toggle? + clip optional for user; audio.pause close?; playback status recording field (F052). Panel tabs have no live icon (Audio tab recording dot) -> contract gap.
+- Shell v2 (branch v2/shell, Nib/App/** scaffold-owned): key commands honour docKinds/sessionParams, ⌘Z window-undo fallback, key-window tracking, childForStatusBarHidden, user-fonts entitlement. After merge: F102/F014 re-register scoped key commands.
+- NibDesign gaps (F013): non-refracting Clear capsule preset; non-modal bud from a source (object menu); contract to distinguish input types (right-click vs finger/pencil long press).
+- contract gaps (F023 review): F108 per-page seen-state contract; shared nib-pages/1 payload type (F022/F023 duplicate).

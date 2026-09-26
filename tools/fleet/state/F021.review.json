@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCreate/QuickNoteFlow.swift: QuickNoteTracker.isShown L364-368, handle/sessionChanged L340-357, start L319-333 (and tests: no activeNavigator anywhere in FeatCreateTests)",
+      "problem": "In the real shell, leaving a QuickNote usually does not trigger the exit prompt (D-119). isShown() counts the QuickNote as still shown while app.ui.activeNavigator.openDocuments lists it. Four common exits miss it. (1) Back to the library: ShellViewController.showLibrary only sets session.document = nil and leaves the document in openDocuments. So with tabs on (editing.openAsTabs defaults to true), and also with tabs off, where that 'tab' is invisible and cannot be closed, going to the library never prompts. With tabs off the prompt only appears later, over whichever document replaces it. (2) Closing the QuickNote's tab while other tabs are open (Cmd-W, the strip's X, tab.close): F018 first switches the window to the neighbour, which emits session.document while the QuickNote is still listed, so nothing prompts. It then calls navigator.closeDocument, which emits no event. (3) tab.closeOthers, and closing a background tab, emit no watched event at all. (4) In cases (2) and (3) the prompt appears later, on some unrelated window or document change, out of context, or never. None of this is tested, because the tests never set app.ui.activeNavigator, so isShown only ever sees sessions.",
+      "fix": "1) Define 'shown' as: some session's document is the QuickNote, or (NibSettings.openAsTabs is on AND the active navigator currently shows a document, i.e. session.document != nil, AND its openDocuments contains it). Switching tabs still does not prompt, but showing the library in the window that left it does. 2) At the end of handle(_:), schedule one deferred re-check (Task { @MainActor [weak self] in await Task.yield(); self?.evaluate() }). Then a tab that F018 removes right after switching to the neighbour is seen as gone. 3) In register, add a contracts-v2 closure hook, CommandHookDescriptor(id: \"create.tabWatch\", owner: id, commands: [\"tab.close\", \"tab.closeOthers\"], handler:), that returns nil and schedules the same deferred evaluate(). This covers background-tab closes. 4) On Delete and Combine, run tab.close {doc} first when it is registered, so no tab keeps a trashed document. 5) Add tests with a fake SceneNavigator assigned to app.ui.activeNavigator: library shown with the tab still listed -> prompt; tab switch -> no prompt; neighbour-first tab close (switch, then remove from openDocuments with no event) -> prompt; closeOthers via the hook -> prompt."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCreate/QuickNoteFlow.swift: QuickNoteTracker.offer L442-470 / consider L391-407",
+      "problem": "Some untitled notebooks stay watched after they are left: one left empty, or one whose suggestion could not be shown (no floating host). They are never forgotten, so every later session.document, session.activated or doc.closed event runs .offerTitle again. That means TitleSuggestion.load again: doc.suggestTitle, which calls the user's own paid AI provider, plus up to 3 recognize.pageText calls. This repeats for the rest of the session on every document switch.",
+      "fix": "In offer(), check QuickNoteTracker.hasContent before loading, and never call doc.suggestTitle for an empty notebook. After one attempt, call forget(doc) whatever the outcome; sessionChanged/note() adds it back when a window shows it again. Keep the found suggestion in a [DocumentID: String] cache, so a retry after 'could not show' does not ask the AI again."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCreate/QuickNoteFlow.swift: TitleSuggestion.load L240-241, QuickNoteTracker.hasContent L486-491",
+      "problem": "Both run after the document has been left. They call workspace.content(doc) and workspace.items(doc, page:), which load the head and page items into the Workspace, cache them and emit doc.opened for a document that no window shows. Nothing closes it again.",
+      "fix": "Use workspace.peekContent(doc) (contracts-v2, reads without opening). For items, use workspace.isPageCached(doc, page:) ? workspace.items(...) : workspace.persistence.loadItems(doc, page:).filter { !$0.deleted }."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCreate/QuickNoteFlow.swift: QuickNoteTracker.prompt L414-430, QuickNotePresenter.present L707-722, QuickNoteSheetDelegate",
+      "problem": "defaultPresent returns true before the sheet is on screen, because presentModal runs in a later Task. Two cases lose the prompt: (1) presentModal targets a sheet that is being dismissed, so UIKit refuses the presentation; (2) the prompt is dismissed along with its presenter, and presentationControllerDidDismiss is not called for programmatic dismissals. In both, the model finishes without an outcome, onFinish never runs and the document stays in busy for the rest of the launch. No prompt is shown again, and the mark stays.",
+      "fix": "Give the model an onAbandon callback. The tracker sets it to busy.remove(doc) and keeps the mark. Call it from QuickNoteExitSheet.onDisappear when outcome == nil and !isWorking, and from the presenting Task when controller.presentingViewController is nil after navigator.presentModal. That way the next watched event prompts again."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCreate/QuickNoteFlow.swift: QuickNoteExitModel.isUntitled L542 / keepTitle L556-558",
+      "problem": "isUntitled compares with the literal 'Untitled'. The Library Store makes names unique (FileNames.unique), so the second QuickNote in a folder is 'Untitled 2', and its prompt shows 'Keep “Untitled 2”' instead of the specified 'Save as Untitled'.",
+      "fix": "In init, read PendingCreations.get(doc, app.settings)?.title (DocQuickNote stores the real created title there). Treat currentTitle == that title, or == NewDocumentKind.notebook.untitled, as untitled."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCreate/NewNotebookSheet.swift: kindPicker L793-806",
+      "problem": ".accessibilityLabel(\"Document type\") is applied to a ViewThatFits whose child is NibSegmentedControl, an HStack of four separate Buttons. On a container that is not itself an accessibility element, the label propagates to every child, so VoiceOver reads each segment as 'Document type' and the four kinds cannot be told apart.",
+      "fix": "Put .accessibilityElement(children: .contain) before the label, so it names the group and each segment keeps its own title. Or apply the label only to the Picker fallback."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCreate/QuickNoteFlow.swift: isShown L364-368 / leavingSession L385-389",
+      "problem": "isShown only looks at the active navigator's tabs. A QuickNote open as a background tab in another window therefore counts as left while a different window is active. When leftBy[doc] is unset (restored tabs, addTab), leavingSession falls back to the active window, which then gets the prompt. Choosing Delete there trashes a document that is still open in the other window.",
+      "fix": "Only prompt or offer when leftBy[doc] names a window that actually left the document. Otherwise treat it as .none. Report 'no list of all SceneNavigators' as a contract gap."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCreate/CreateMenus.swift: registerKeys L51-56",
+      "problem": "In the library window, Shift-Cmd-N runs doc.quickNote without folder, and the session has no document, so the QuickNote is created at the library root instead of the folder the library shows. The spec says 'in the current folder'. The New-menu path is correct, via MenuContext.folder.",
+      "fix": "Report the missing 'library window's current folder' (on EditorSession or SceneNavigator) as a contract gap. When F019 exposes it, add sessionParams to the quickNote key command that passes that folder."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCreate/NewNotebookSheet.swift: NewNotebookModel.create L637-643",
+      "problem": "Every Create writes all four remembered defaults (synced settings) through settings.set, even when a value has not changed. This causes sync churn in .nib-library prefs. The writes also happen before doc.create, so a failed creation still changes the defaults.",
+      "fix": "Skip a write when the value equals the current setting (compare JSONValue.from(settings.get(key)) with the new value). Keep writing before doc.create only when the omitted-cover fallback needs it; otherwise write after a successful creation."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCreate/NewNotebookSheet.swift: boardSection / NotebookDraft.initial",
+      "problem": "Switching the kind to Whiteboard keeps the notebook's paper colour (for example Legal, from the default paper). That colour is not one of boardColours, so it is applied to the board while no swatch shows as selected.",
+      "fix": "When the kind changes to .whiteboard and paperColour is not in NotebookDraft.boardColours, set paperColour = nil (in a didSet on draft.kind, or in an onChange of model.draft.kind)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatCreateTests/FeatCreateTests.swift",
+      "problem": "Several risky paths have no tests: the custom-paper path (page.setBackground on non-cover pages, and the 'needs the Templates feature' warning when it is missing); chooseMore calling template.choose (params kind/size/color, and userDenied being ignored); the NewNotebookModel.create failure message when doc.create throws; the untitled-notebook re-offer and forget behaviour; and every navigator/tab case (see the major).",
+      "fix": "Add Harness tests with stubbed page.setBackground, template.choose (returning a result, and throwing .userDenied) and a throwing doc.create. Add the fake-SceneNavigator tracker tests described in the major."
+    }
+  ]
+}
