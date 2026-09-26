@@ -20,7 +20,7 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 
 ## Follow-ups (not in any agent yet)
 - F009: highlighter live preview treats 3-point curves as passing through the middle point; F030/F031 use control points. Needs a FIX pass after contracts-v2.
-- F036: drop-to-attach criterion removed pending undo coalescing fix; restore after contracts-v2 (FIX pass). Update F036 line in contract-gaps.md.
+- F036: drop-to-attach RESTORED (36aa13d, run 36227055835).
 - App target: add user-fonts entitlement (com.apple.developer.user-fonts=[app-usage]) or UIAppSupportsInstalledFonts for F026 T-059/P-083 (owner of Nib/ Info.plist or integration).
 - Integration spec edit: add image.pick {source, page?|doc?|ref?|refs?, point?, position?, anchor?, ids?} (edit, user presence, sensitive) to F034 commands in forge-spec.json + ARCHITECTURE §6.5.
 - Integration spec edit: ARCHITECTURE catalogue: element.create gains optional fallback:Bool (F035).
@@ -51,3 +51,10 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - F074 (unbuilt) must parse nib://bridge/pair?host=&port=&token= (port param added by F091). Add to F074 spec before its build.
 - F019 (unbuilt) must present sheet panels from the library (panel.open without an open document: F021 New Notebook sheet, F044, F020 rely on it), fill MenuContext.folder, and double-tap + New -> doc.quickNote. Add to F019 spec before build.
 - Unpinned result shapes to pin (spec owner): template.choose kind values + result size; doc.suggestTitle result; panel.open params delivery to PanelContext.params (flat vs nested).
+- design v2.1 merged (palette re-form on external dock change; reflow 180 ms dwell). Known edge: .dropletDockable orientation flip-back within ~190 ms mislays; could reuse palette logic.
+- F022 V2ADOPT: Move Pages sheet must read PanelContext.params["pages"] (F023 multi-page move). F022/F023 duplicate the nib-pages/1 payload encoder: a shared contract type would remove it.
+- NibSymbol: rotate glyph; 3 pt drag-preview border token (F023).
+- contract gap: bridge per-call event (F090 emits bridge.status only on state/session change); ARCHITECTURE §12 pairing link should document optional port (F074 spec already says so).
+- F017 V2ADOPT green (d0849c6): overlays hosted, floatingHost published, toolbarView full-window, openPanels, PanelContext params/presentation.
+- Remaining chrome gaps: DropletStyle per-droplet recede opt-out (NibDesign); overlay 'instant' show; contract for palette dock location so bottom overlays avoid a bottom-docked palette on iPad; toast bud swallows first outside touch; shell must track key-window changes (window.showLibrary) and forward childForStatusBarHidden (P-106).
+- Spec pass 2 items: audio.play toggle? + clip optional for user; audio.pause close?; playback status recording field (F052). Panel tabs have no live icon (Audio tab recording dot) -> contract gap.
