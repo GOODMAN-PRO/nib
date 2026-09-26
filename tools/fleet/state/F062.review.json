@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTimeKeeper/TimerEngine.swift DurationParser.seconds (lines 257-263), DurationParser.clock (288-302), DurationParser.units (305-345); called from TimeKeeperPanel.seconds (TimeKeeperView.swift:71) and TimerRecognition.bestDuration",
+      "problem": "Typed or handwritten durations can crash the app. units() multiplies an unbounded Double, then seconds(from:) calls Int(value.rounded()) before the 1...86400 range check. Int(Double) traps once the value exceeds Int.max, so 18 typed nines (\"999999999999999999\", 1e18 min = 6e19 s) or a long digit string misread from a scribble crashes. clock() has the same problem with integer overflow: n[0] * 60 or n[0] * 3600 traps for \"999999999999999999:00\" or \"9999999999999999:00:00\". The panel evaluates `seconds` in its body on every keystroke and on every recognition candidate, so the crash is reachable by plain typing or writing.",
+      "fix": "In seconds(from:), return nil unless value.isFinite && value >= 0.5 && value <= Double(TimerEngine.maxSeconds) + 0.5, and only then call Int(value.rounded()). In units(), return nil as soon as `total` passes maxSeconds, or cap the digit run at about 9 characters. In clock(), refuse any part longer than 5 digits, or compute in Double and range-check before converting. Add TimerEngineTests cases: \"999999999999999999\", \"99999999999999999999 min\", \"999999999999999999:00\" and \"9999999999999999:00:00\" must all give nil."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTimeKeeper/TimerEngine.swift TimerFormat.clock / TimerFormat.lap (lines 407-417) and TimerRecord.init(from:) (195-210); FeatTimeKeeperFeature.swift history prefix schema (lines 30-34); rendered by TimeKeeperHistoryRow.subtitle and TimeKeeperLapRow (TimeKeeperView.swift:450-514)",
+      "problem": "History comes from outside the app: synced prefs written by another device, the library folder's prefs files, and settings.set from the AI or a plugin (the `timer.history.` prefix is not readOnly). A record such as {\"elapsed\": 1e19}, {\"duration\": 1e19} or a lap {\"total\": 1e19} passes the prefix schema (elapsed is only min 0; duration, startedAt, endedAt and laps are unconstrained) and the lenient decoder. When the panel draws the history, TimerFormat.clock does Int(seconds.rounded(.down)) and TimerFormat.lap does Int((seconds * 10).rounded(.down)); both trap for values beyond Int.max, and the crash repeats every time Time Keeper opens. ARCHITECTURE.md §15.6 forbids crashing on user data.",
+      "fix": "Make TimerFormat total: in clock() and lap(), map any value that is not finite, or is above a cap such as 100 * 86_400, to that cap before converting to Int. In TimerRecord.init(from:), sanitise the values: elapsed, duration, startedAt and endedAt must be finite and non-negative; clamp elapsed and duration to a sane maximum; drop laps whose total or split is not finite or is negative. Tighten the declarePrefix schema: elapsed .num(min: 0, max: …), duration .num(min: 0, max: Double(TimerEngine.maxSeconds)), startedAt/endedAt .num(min: 0). Add a test that stores such a record with settings.setJSON and then runs loadHistory plus TimerFormat without trapping."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTimeKeeper/TimerCommands.swift TimeKeeper.tick() finish branch (lines 212-231); FeatTimeKeeperFeature.swift SystemTimerNotifier.cancel (121-127)",
+      "problem": "The main job of a study timer is to tell you it has ended, and several paths end the countdown without a perceivable signal. (1) In the foreground, the finish is shown only by the canvas bar. In the library, Settings, a text document or a study set there is no bar (the attachment's docKinds are notebook and whiteboard only), the panel is usually closed, NibHaptics is a no-op on iPad, the VoiceOver announcement only helps VoiceOver users, and the local notification is suppressed in the foreground because no UNUserNotificationCenterDelegate presents it. On iPad the countdown ends unnoticed, including right after the user chose \"Keep Session\" in the leave-document prompt and went to the library. (2) tick() calls notifier.cancel(id:) on every finish transition, and cancel removes both pending and delivered requests. While Nib stays alive in the background (for example during audio recording, which keeps the process running), the 250 ms ticker notices the end at about the moment the system would fire. It then removes the pending alert before it fires, or removes the banner right after delivery, so the backgrounded user gets no alert either.",
+      "fix": "Track foreground state in TimeKeeper: an `isForeground` flag set from didBecomeActive and didEnterBackground (the begin() Combine pattern), default true, and never read UIApplication.shared in hostless tests. In tick()'s finish branch, call notifier.cancel only when isForeground; in the background, leave the scheduled request to fire. When the finish is noticed in the foreground (not late, not hostless) and the active window cannot show the bar (`!showsBar(in: app?.services.sessions.active)`) and the panel is closed, present a system alert through `app?.ui.activeNavigator?.presentModal`, like promptToStop: title \"Time's up\", the notification body as message, and actions \"Start Again\" (perform timer.start with the same seconds and label) and \"Done\" (perform timer.control {action: \"stop\"}). Optionally also play a short system sound (AudioToolbox), since iPad has no haptics. Cover the cancel-only-in-foreground rule with a FakeTimerNotifier test that sets the flag."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTimeKeeper/TimeKeeperView.swift TimeKeeperBar.summary (lines 653-658)",
+      "problem": "The session label on the Clear HUD is set in NibFont.caption1Emphasis (12 pt). DESIGN.md §2.4 allows text under 15 pt on Clear only for the bar subtitle and HUD numbers, and NibHUD sets its secondary part in `hud`.",
+      "fix": "Use NibFont.hud with NibColor.label for the label text, matching NibHUD's secondary part, and keep lineLimit(1)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTimeKeeper/TimeKeeperView.swift TimeKeeperRunningSection.controls (lines 414-417)",
+      "problem": "\"Discard\" throws away a running session, which may hold hours of study and laps, in one tap with no confirmation and no undo. It sits in the same row as \"Hide Bar\". Its label is also a bare verb (the Slop checklist asks for verb + object).",
+      "fix": "Rename it \"Discard Session\" and ask first with a confirmationDialog (\"Discard this session? It won't be saved to your history.\" with a destructive \"Discard Session\" button), the same pattern as the mode delete, before running timer.control {action: \"discard\"}."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTimeKeeper/TimeKeeperView.swift TimeKeeperPanel.body / historySection (lines 73-112, 328-349)",
+      "problem": "The whole panel observes TimeKeeper, whose `now` is published every second while a session runs, so historySection is rebuilt every second: a non-lazy VStack with a Date.formatted subtitle per row. After \"Show All\" with a long history (one record per session, never pruned), this costs tens of milliseconds a second on the main thread and causes a visible hitch once a second.",
+      "fix": "Move the history into its own view that takes `[TimerRecord]` as an Equatable value (e.g. `TimeKeeperHistoryList(records: keeper.history)` with `.equatable()`) and does not observe the keeper's clock, or split the ticking `now` into a separate small ObservableObject that only the clock and progress views observe. Use LazyVStack for the \"Show All\" list."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTimeKeeper/TimerCommands.swift TimerControl.run dry-run branch (line 474)",
+      "problem": "A dry run of timer.control returns the current status, not the status the action would produce. An AI preview of {action: \"stop\"} reports active: true, and a preview of \"hide\" reports visible: true. The other commands return what they would do.",
+      "fix": "In the dry-run branch, build the predicted status from a copy of keeper.engine at keeper.clock(). pause/resume/togglePause: apply engine.pause or engine.resume to the copy. stop/discard: TimerStatus(.idle, …). show/hide/toggleVisibility: flip `visible`. open: current status. Return TimerStatus(copy, at: t, visible: predictedVisible)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTimeKeeper/TimerCommands.swift TimeKeeper.sessionMoved / promptToStop (lines 369-393)",
+      "problem": "The leave-document prompt fires when any window leaves the timer's document, even when another window or tab still shows it. It is presented on app.ui.activeNavigator, which can be a different window from the one that navigated.",
+      "fix": "In sessionMoved, return early when another session still shows the timer's document: `app?.services.sessions.sessions.contains { $0.id != session && $0.document.map { NodeRef.document($0).description } == timerDoc }`. Present only when `app?.ui.activeNavigator?.session.id == session`; otherwise defer until that window is active."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTimeKeeperTests/FeatTimeKeeperTests.swift, TimerEngineTests.swift",
+      "problem": "The leave-document decision in sessionMoved has no test coverage: leaving the timer's document prompts; moving between other documents, a finished timer and a session started outside a document do not. Neither do hostile inputs: the overflowing parser strings and out-of-range history records above.",
+      "fix": "Make the prompt injectable (e.g. `var onLeaveDocument: (@MainActor () -> Void)?` that defaults to promptToStop). In a Harness test, change h.session.document and count the calls across those cases. Add the parser and format edge cases listed in the two majors."
+    }
+  ]
+}
