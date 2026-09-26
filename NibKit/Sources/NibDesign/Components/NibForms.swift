@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import CoreImage
 import CoreImage.CIFilterBuiltins
+import NibContracts
 
 /// A password, API key or token field (DESIGN.md §14.8: secrets are entered only in Settings, in secure fields; the
 /// lock prompt). 44 pt on `fill4` with the form-field radius (10), and an eye button that shows the text while held
