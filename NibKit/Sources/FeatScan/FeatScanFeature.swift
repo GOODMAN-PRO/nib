@@ -11,22 +11,24 @@ public enum FeatScanFeature: NibFeature {
         app.commands.register(ScanQR.self)
 
         let menus = app.ui.menus
+        // + New: after Import Files (F064, 600).
         menus.register(MenuItemDescriptor(
-            id: "scan.new.documents", title: String(localized: "Scan Document"), icon: NibSymbol.scan.name,
-            location: .libraryNew, order: 90, owner: id, command: ScanDocuments.descriptor.id,
-            params: { ctx in ScanMenus.newNotebookParams(ctx) },
+            id: ScanMenus.newDocumentsID, title: String(localized: "Scan Document"), icon: NibSymbol.scan.name,
+            location: .libraryNew, order: 700, owner: id, command: ScanDocuments.descriptor.id,
+            params: { ScanMenus.newNotebookParams($0) },
             isVisible: { _ in ScanSupport.documentCamera }))
         menus.register(MenuItemDescriptor(
-            id: "scan.new.qr", title: String(localized: "Scan QR Code"), icon: ScanMenus.qrIcon,
-            location: .libraryNew, order: 95, owner: id, command: ScanQR.descriptor.id,
+            id: ScanMenus.newQRID, title: String(localized: "Scan QR Code"), icon: NibSymbol.qrCode.name,
+            location: .libraryNew, order: 710, owner: id, command: ScanQR.descriptor.id,
             isVisible: { _ in ScanSupport.qrReader }))
+        // Add Page: after Image and Take Photo (F034, 700 and 710).
         menus.register(MenuItemDescriptor(
-            id: "scan.addPage.documents", title: String(localized: "Scan Document"), icon: NibSymbol.scan.name,
-            location: .addPage, order: 80, owner: id, command: ScanDocuments.descriptor.id,
-            params: { ctx in ScanMenus.addPageParams(ctx) },
-            isVisible: { ctx in ScanSupport.documentCamera && ScanMenus.isNotebook(ctx) }))
+            id: ScanMenus.addPageID, title: String(localized: "Scan Document"), icon: NibSymbol.scan.name,
+            location: .addPage, order: 720, owner: id, command: ScanDocuments.descriptor.id,
+            params: { ScanMenus.addPageParams($0) },
+            isVisible: { ScanSupport.documentCamera && ScanMenus.canAddPages($0) }))
         menus.register(MenuItemDescriptor(
-            id: "scan.more.qr", title: String(localized: "Scan QR Code"), icon: ScanMenus.qrIcon,
+            id: ScanMenus.moreQRID, title: String(localized: "Scan QR Code"), icon: NibSymbol.qrCode.name,
             location: .documentMore, order: 900, owner: id, command: ScanQR.descriptor.id,
             isVisible: { _ in ScanSupport.qrReader }))
     }
@@ -34,23 +36,34 @@ public enum FeatScanFeature: NibFeature {
 
 @MainActor
 enum ScanMenus {
-    static let qrIcon = "qrcode.viewfinder"
+    static let newDocumentsID = "scan.new.documents"
+    static let newQRID = "scan.new.qr"
+    static let addPageID = "scan.addPage.documents"
+    static let moreQRID = "scan.more.qr"
 
-    /// New › Scan Document: a new notebook in the folder the library is showing (the root when none).
+    /// New › Scan Document: a new notebook in the folder the library shows (the root when none).
     static func newNotebookParams(_ ctx: MenuContext) -> JSONValue {
-        guard let folder = ctx.nodes.compactMap({ ctx.app.services.library?.node($0) }).first(where: { $0.kind == .folder })
-        else { return [:] }
-        return ["folder": .string(NodeRef.folder(folder.id).description)]
+        guard let folder = ctx.folder else { return [:] }
+        return ["folder": .string(NodeRef.folder(folder).description)]
     }
 
-    /// Add Page › Scan Document: after the open page (the command's default), in this notebook.
+    /// Add Page › Scan Document: after the page the menu was opened on (else the open page), else at the end.
     static func addPageParams(_ ctx: MenuContext) -> JSONValue {
-        guard let doc = ctx.doc else { return [:] }
-        return ["doc": .string(NodeRef.document(doc).description)]
+        guard let doc = ctx.doc ?? ctx.session?.document else { return [:] }
+        var params: [String: JSONValue] = ["doc": .string(NodeRef.document(doc).description)]
+        if let page = ctx.page ?? (ctx.session?.document == doc ? ctx.session?.page : nil) {
+            params["position"] = .string(PagePosition.after.rawValue)
+            params["anchor"] = .string(NodeRef.page(doc, page).description)
+        } else {
+            params["position"] = .string(PagePosition.end.rawValue)
+        }
+        return .object(params)
     }
 
-    static func isNotebook(_ ctx: MenuContext) -> Bool {
-        guard let doc = ctx.doc, let content = try? ctx.app.workspace.content(doc) else { return false }
+    /// A notebook the person may add pages to (not read-only in this window or on disk).
+    static func canAddPages(_ ctx: MenuContext) -> Bool {
+        guard let doc = ctx.doc ?? ctx.session?.document, ctx.session?.readOnly != true, !ctx.app.isReadOnly(doc),
+              let content = try? ctx.app.workspace.content(doc) else { return false }
         return content.meta.kind == .notebook
     }
 }

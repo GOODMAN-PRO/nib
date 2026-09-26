@@ -5,9 +5,9 @@ import VisionKit
 import NibContracts
 import NibDesign
 
-// The QR reader: DataScannerViewController full screen, with Nib's chrome floating over it in one droplet
-// container: a Clear bar (Close, title) and, once a code is read, a Deep card that shows the code in full and asks
-// before anything opens. Nothing opens by itself.
+// The QR reader: DataScannerViewController full screen (the camera is this screen's page), with Nib's chrome floating
+// over it in the screen's one droplet container: a Clear bar (Close, title) and, once a code is read, a Deep panel
+// that shows the code in full and asks before anything opens. Nothing opens by itself.
 
 enum QRCameraProblem: Equatable {
     /// Camera access is off (or restricted) for Nib.
@@ -19,12 +19,12 @@ enum QRCameraProblem: Equatable {
 /// Presents the reader and waits for it: the code the person chose to open, or nil when they closed it.
 @MainActor
 enum QRScannerSession {
-    static func run(from presenter: UIViewController, problem: QRCameraProblem?) async -> String? {
+    static func run(from presenter: UIViewController, problem: QRCameraProblem?, liquidMode: String) async -> String? {
         await withCheckedContinuation { continuation in
             let model = QRScannerModel(problem: problem)
-            // A presented controller does not inherit the app root's Liquid setting; Liquid Off is visible as
-            // NibMotion.forcesReduced, and a container left on `.full` would switch it back on for the whole app.
-            let liquid: NibLiquidMode = NibMotion.forcesReduced ? .off : .full
+            // A presented controller does not inherit the app root's environment: pass the Appearance › Liquid
+            // setting on, so the reader's container keeps (and never overrides) the app-wide Liquid mode.
+            let liquid = NibLiquidMode(rawValue: liquidMode) ?? .full
             let host = UIHostingController(rootView: QRScannerScreen(model: model).nibLiquidMode(liquid))
             host.modalPresentationStyle = .fullScreen
             model.onFinish = { [weak host] result in
@@ -52,7 +52,7 @@ final class QRScannerModel: ObservableObject {
         self.problem = problem
     }
 
-    /// A code came into view (or was tapped): it replaces the one on screen. True when the card changed.
+    /// A code came into view (or was tapped): it replaces the one on screen. True when the panel changed.
     @discardableResult
     func found(_ raw: String?) -> Bool {
         guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
@@ -60,6 +60,11 @@ final class QRScannerModel: ObservableObject {
         guard payload != code else { return false }
         code = payload
         return true
+    }
+
+    /// Puts the code away and keeps reading (the panel's Close).
+    func dismissCode() {
+        code = nil
     }
 
     /// Opens (or copies) the code on screen.
@@ -83,6 +88,7 @@ struct QRScannerScreen: View {
             if let problem = model.problem {
                 NibColor.background.ignoresSafeArea()
                 QRProblemView(problem: problem) { model.problem = nil }
+                    .padding(.horizontal, NibMetrics.chromeInset)
             } else {
                 QRCameraView(model: model).ignoresSafeArea()
             }
@@ -101,7 +107,7 @@ struct QRScannerScreen: View {
                     }
                     Spacer(minLength: 0)
                     if let code = model.code, model.problem == nil {
-                        QRResultCard(payload: code) { model.confirm() }
+                        QRResultPanel(payload: code, onClose: { model.dismissCode() }, action: { model.confirm() })
                     }
                 }
                 .padding(.horizontal, NibMetrics.chromeInset)
@@ -119,59 +125,51 @@ struct QRScannerScreen: View {
 }
 
 /// The code, in full, and the one action it gets. Deep, because it carries body text.
-struct QRResultCard: View {
+struct QRResultPanel: View {
     let payload: QRPayload
+    let onClose: () -> Void
     let action: () -> Void
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
-        VStack(alignment: .leading, spacing: NibSpacing.m) {
-            HStack(alignment: .top, spacing: NibSpacing.m) {
-                Image(nib: symbol)
-                    .font(NibFont.glyph(.round))
-                    .foregroundStyle(NibColor.label)
-                    .frame(width: 30, height: 30)
-                    .background(NibColor.fill3, in: Circle())
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: NibSpacing.xxs) {
-                    Text(kindTitle)
-                        .font(NibFont.headline)
-                        .foregroundStyle(NibColor.label)
-                        .accessibilityAddTraits(.isHeader)
-                    Text(payload.display)
-                        .font(NibFont.callout)
-                        .foregroundStyle(NibColor.labelSecondary)
-                        .lineLimit(4)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                }
-                Spacer(minLength: 0)
-            }
-            NibButton(actionTitle, kind: .primary, expands: true, shortcut: .defaultAction, action: action)
+        VStack(alignment: .leading, spacing: 0) {
+            NibPanelHeader(title: QRResultPanel.kindTitle(payload.kind), symbol: QRResultPanel.symbol(payload.kind),
+                           onClose: onClose)
+            Text(payload.display)
+                .font(NibFont.callout)
+                .foregroundStyle(NibColor.labelSecondary)
+                .lineLimit(typeSize.isAccessibilitySize ? 8 : 4)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, NibSpacing.l)
+            NibButton(QRResultPanel.actionTitle(payload.kind), kind: .primary, expands: true, shortcut: .defaultAction,
+                      action: action)
+                .padding(NibSpacing.l)
         }
-        .padding(NibSpacing.l)
-        .frame(maxWidth: 420)
+        .frame(maxWidth: NibMetrics.panelWidth(typeSize))
         .droplet("scan.qr.result", style: .panel)
         .accessibilityElement(children: .contain)
     }
 
-    private var symbol: NibSymbol {
-        switch payload.kind {
-        case .web: return .network
+    static func symbol(_ kind: QRPayloadKind) -> NibSymbol {
+        switch kind {
+        case .web: return .externalLink
         case .nib: return .notebook
-        case .text: return .textDocument
+        case .text: return .copy
         }
     }
 
-    private var kindTitle: String {
-        switch payload.kind {
+    static func kindTitle(_ kind: QRPayloadKind) -> String {
+        switch kind {
         case .web: return String(localized: "Link")
-        case .nib: return String(localized: "Nib link")
+        case .nib: return String(localized: "Nib Link")
         case .text: return String(localized: "Text")
         }
     }
 
-    private var actionTitle: String {
-        switch payload.kind {
+    static func actionTitle(_ kind: QRPayloadKind) -> String {
+        switch kind {
         case .web: return String(localized: "Open Link")
         case .nib: return String(localized: "Open in Nib")
         case .text: return String(localized: "Copy Text")
@@ -189,7 +187,7 @@ struct QRProblemView: View {
         case .denied:
             NibEmptyState(symbol: .camera, title: String(localized: "Camera access is off"),
                           message: String(localized: "Allow Nib to use the camera in Settings to scan QR codes."),
-                          primary: NibAction(String(localized: "Open Settings")) { ScanPresenter.openSettings() })
+                          primary: NibAction(String(localized: "Open Settings")) { CameraAccess.openSettings() })
         case .unavailable:
             NibEmptyState(symbol: .camera, title: String(localized: "The camera is not available"),
                           message: String(localized: "Another app may be using it. Close that app, then try again."),
