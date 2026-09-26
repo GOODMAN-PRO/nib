@@ -54,3 +54,4 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - design v2.1 merged (palette re-form on external dock change; reflow 180 ms dwell). Known edge: .dropletDockable orientation flip-back within ~190 ms mislays; could reuse palette logic.
 - F022 V2ADOPT: Move Pages sheet must read PanelContext.params["pages"] (F023 multi-page move). F022/F023 duplicate the nib-pages/1 payload encoder: a shared contract type would remove it.
 - NibSymbol: rotate glyph; 3 pt drag-preview border token (F023).
+- contract gap: bridge per-call event (F090 emits bridge.status only on state/session change); ARCHITECTURE §12 pairing link should document optional port (F074 spec already says so).
