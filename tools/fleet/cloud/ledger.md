@@ -51,3 +51,6 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - F074 (unbuilt) must parse nib://bridge/pair?host=&port=&token= (port param added by F091). Add to F074 spec before its build.
 - F019 (unbuilt) must present sheet panels from the library (panel.open without an open document: F021 New Notebook sheet, F044, F020 rely on it), fill MenuContext.folder, and double-tap + New -> doc.quickNote. Add to F019 spec before build.
 - Unpinned result shapes to pin (spec owner): template.choose kind values + result size; doc.suggestTitle result; panel.open params delivery to PanelContext.params (flat vs nested).
+- design v2.1 merged (palette re-form on external dock change; reflow 180 ms dwell). Known edge: .dropletDockable orientation flip-back within ~190 ms mislays; could reuse palette logic.
+- F022 V2ADOPT: Move Pages sheet must read PanelContext.params["pages"] (F023 multi-page move). F022/F023 duplicate the nib-pages/1 payload encoder: a shared contract type would remove it.
+- NibSymbol: rotate glyph; 3 pt drag-preview border token (F023).
