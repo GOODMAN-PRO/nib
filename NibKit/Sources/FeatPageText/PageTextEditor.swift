@@ -103,9 +103,11 @@ enum PageTextGlyph {
 
 /// Full-page typing on the canvas: a TextKit text view laid exactly over the page's full-page box while it is being
 /// edited, with an opaque formatting bar above the keyboard (DESIGN §14.17: no liquid on text-editing surfaces).
-/// Every change is committed through `item.update` (one undo step per typing session): the box is locked so transform,
-/// the eraser and the text tool leave it alone, and item.update checks only the document lock. Undo, sync and AI
-/// edits of the box reload the view.
+/// Typing is committed through `item.update` half a second after it pauses (and on Done): the box is locked so
+/// transform, the eraser and the text tool leave it alone, and item.update checks only the document lock. Each commit
+/// is its own undo step, as in F026's text boxes: `DocTransaction.revert` cannot undo a record written twice in one
+/// undo group (contract gap), so merging a session's commits would make undo restore only the last of them.
+/// Undo, sync and AI edits of the box reload the view.
 @MainActor
 final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGestureRecognizerDelegate,
                             UIColorPickerViewControllerDelegate {
@@ -138,8 +140,8 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     private var commitObserver: EventSubscription?
     private var sessionObservers: Set<AnyCancellable> = []
 
-    /// Undo group of the current typing session: every commit of one session is one undo step.
-    private var group = NibID.make().raw
+    /// Undo groups of this editor's commits in flight, so their changesets are not taken for outside changes.
+    private var ownGroups: Set<String> = []
     private var dirty = false
     private var commitTask: Task<Void, Never>?
     /// Model of the last paragraph while it has no character of its own to carry its style, list and indent.
@@ -229,7 +231,6 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
             return
         }
         editing = Target(doc: doc, page: page, item: item.id, frame: box.frame, defaults: box.style.defaults)
-        group = NibID.make().raw
         dirty = false
         commitFailing = false
         rejectedInsert = false
@@ -284,13 +285,16 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         if send {
             let app = host.app
             let session = host.session
-            let group = self.group
             let ref = NodeRef.item(e.doc, e.page, e.item).description
+            let group = NibID.make().raw
+            ownGroups.insert(group)                              // the box may be opened again before this lands
             Task { @MainActor [weak self, weak host] in
-                if await PageTextEditor.send(text, ref: ref, group: group, session: session, app: app) {
+                let ok = await PageTextEditor.send(text, ref: ref, group: group, session: session, app: app)
+                self?.ownGroups.remove(group)
+                if ok {
                     host?.setHidden([], page: page)              // show the drawn box once it has the final text
                 } else {
-                    self?.reopen(e, with: text, group: group)    // never drop the only copy of what was typed
+                    self?.reopen(e, with: text)                  // never drop the only copy of what was typed
                 }
             }
         } else {
@@ -299,7 +303,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     }
 
     /// A commit failed after typing ended: open the box again with the unsaved text, so it can be retried or copied.
-    private func reopen(_ e: Target, with text: RichText, group: String) {
+    private func reopen(_ e: Target, with text: RichText) {
         guard editing == nil, let host = host else { return }
         guard let item = try? host.app.workspace.item(e.doc, page: e.page, id: e.item), !item.deleted,
               let box = item.text else {
@@ -311,7 +315,6 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
             host.setHidden([], page: e.page)
             return
         }
-        self.group = group
         commitFailing = true                                   // the failure was reported; retries stay quiet
         trailing = Self.shell(text.paragraphs.last ?? Paragraph())
         let s = RichTextBridge.attributed(text, base: box.style.defaults)
@@ -710,16 +713,18 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         guard dirty, let e = editing, let host = host else { return }
         dirty = false                                          // typing during the send marks it dirty again
         let text = currentRichText()
-        let group = self.group
+        let group = NibID.make().raw                           // one undo step per commit (see the type comment)
+        ownGroups.insert(group)
         let ok = await Self.send(text, ref: NodeRef.item(e.doc, e.page, e.item).description, group: group,
                                  session: host.session, app: host.app, quiet: commitFailing)
+        ownGroups.remove(group)                                // its changeset has been observed by now
         commitFailing = !ok
         guard !ok else { return }
         if let now = editing, now.item == e.item, now.doc == e.doc {
             dirty = true                                       // keep the text and try again
             scheduleCommit()
         } else if editing == nil {
-            reopen(e, with: text, group: group)
+            reopen(e, with: text)
         }
     }
 
@@ -757,11 +762,10 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
                     finish(commit: false)                           // undone, deleted or no longer a page box
                     return
                 }
-                guard cs.group != group else { return }             // our own commit
+                guard !ownGroups.contains(cs.group) else { return } // our own commit
                 if cs.command == CommandIDs.undo || cs.command == CommandIDs.redo || cs.command == CommandIDs.revertGroup {
-                    commitTask?.cancel()
+                    commitTask?.cancel()                            // the undo wins over typing not yet committed
                     dirty = false
-                    group = NibID.make().raw                        // typing after an undo is a new undo step
                 }
                 if dirty {                                          // our pending text is newer and wins on commit
                     editing?.frame = box.frame

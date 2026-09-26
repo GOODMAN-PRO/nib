@@ -318,7 +318,7 @@ final class FeatPageTextTests: XCTestCase {
         XCTAssertTrue(shown, "the drawn box shows again once it has the final text")
     }
 
-    func testDebouncedCommitsMergeIntoOneUndoStep() async throws {
+    func testEachDebouncedCommitIsAnUndoStepThatUndoesCompletely() async throws {
         let h = Harness(features: [FeatPageTextFeature.self])
         h.app.commands.register(FakeItemUpdate.self)
         let host = FakeCanvasHost(h)
@@ -332,14 +332,20 @@ final class FeatPageTextTests: XCTestCase {
         XCTAssertTrue(typeText("One", editor, tv))
         let first = await eventually { self.boxText(h, page, id)?.plainText == "One" }
         XCTAssertTrue(first, "committed while typing, before Done")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
+        XCTAssertEqual(tv.text, "One", "the editor's own commit does not reload the view")
         XCTAssertTrue(typeText(" two", editor, tv))
         let second = await eventually { self.boxText(h, page, id)?.plainText == "One two" }
         XCTAssertTrue(second)
+        // Not merged into one group: DocTransaction.revert would then restore only the last write of the box.
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 2, "each commit is its own undo step")
         editor.finish()
-        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1, "every commit of one session is one undo step")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 2, "nothing was left to commit on Done")
 
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
-        XCTAssertEqual(boxText(h, page, id)?.plainText, "")
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "One", "the latest commit undoes completely")
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "One two")
     }
 
     func testEditorReloadsOnOutsideChangesAndUndoStartsANewStep() async throws {
