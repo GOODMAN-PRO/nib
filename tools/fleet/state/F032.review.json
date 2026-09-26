@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDiagrams/ConnectorDrawer.swift:349-366 (ConnectorRouter.curve)",
+      "problem": "Curved connectors are drawn outside Item.bounds. The end tangents are 1.2 x distance along the side normals, so control points sit 0.4 x distance outside the anchors. Item.bounds for a connector only covers from/to/bends plus strokeWidth/2 + 6. Measured: a Quick Diagramming drag from a shape's top dot to a neighbour, switched to Curved, goes about 15 pt outside its bounds, and a top-to-top curve between points 300 pt apart goes about 83 pt outside. Mutation.dirtyRect (the union of Item.bounds) will not invalidate those tiles, so moving, deleting or undoing leaves ghost or clipped curves, and lasso hit tests miss them. The comment on `stub` states this same invariant, and the curve breaks it.",
+      "fix": "Clamp c1/c2 of every cubic (the end tangents and the Catmull-Rom interior controls) into Rect.bounding([a] + bends + [b]).insetBy(-stub). A cubic stays inside its control hull, so the curve then stays inside Item.bounds. Add a test: for random curved connectors (every side pair, with and without bends), every point of ConnectorRouter.geometry(c).flattened() lies inside Item.makeConnector(c).bounds."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDiagrams/ConnectorDrawer.swift:532-549 (ConnectorPainter.labelRect / drawLabel)",
+      "problem": "Connector labels are drawn outside Item.bounds. The label box is centred h/2 + 4 pt beside the path and can be up to 240 pt wide, but a connector's bounds pad the path by only about 6.75 pt. So every labelled connector (connector.create label, diagram.create edge labels) is mostly outside its bounds. Tile invalidation (ARCHITECTURE section 9, Mutation.dirtyRect) then leaves stale label pixels after a move, delete or undo, and tiles that bounds-culling skips will clip the label. Item.bounds belongs to NibContracts. No contract request was filed, which section 15.11 requires in this case.",
+      "fix": "File docs/contract-requests/F032-connector-bounds.md (the process ARCHITECTURE section 15.11 sets out) asking for Item.bounds(.connector) to include the label box (label size 13, max width 240, offset rule) and the curve control hull. Until it lands, draw the label centred on the path midpoint over a paper-coloured knockout, so the label straddles the line instead of sitting beside it. Add a `ponytail:` comment that points at the request."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDiagrams/DiagramCommands.swift:441-456 (DiagramBuilder.fitScale / origin), 614-618",
+      "problem": "diagram.create puts nodes off fixed-size pages and still reports success. fitScale never goes below minScale 0.35, and origin only clamps the top-left corner. Typical 'Generate Diagram' (S-009) output overflows A4's 523 pt usable width. A 12-event timeline is about 2,300 pt wide, which is 800 pt after scaling, so about 280 pt falls off the right edge. A root with 5 children of 4 leaves each is about 4,600 pt wide, which is 1,600 pt after scaling, so about 1,080 pt falls off. Off-page items do not render and the lasso cannot reach them. testDiagramCreateFitsAFixedPage only covers 7 short nodes.",
+      "fix": "On a page with a fixed size and no `origin`, when size x minScale exceeds (page - 2 x margin), throw NibError(.invalidParams, \"diagram is too large for this page\", path: \"$.nodes\", hint: \"use a whiteboard page, fewer nodes, or the mindmap/flow layout\"), so the AI can retry. Alternatively, wrap timelines into rows. Add tests on A4: a 12-node timeline and a 26-node wide tree, each asserting that every frame lies inside the page or that the error is thrown."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDiagrams/DiagramCommands.swift:529-530, 604-613; DiagramLayout.swift:331-363, 426-439 (flow / crossings)",
+      "problem": "The diagram.create layout runs on the main actor, and at the allowed caps (500 nodes, 2,000 edges) it is very expensive. Simulating the algorithm on a random flow graph gives about 314 layers, about 178,000 dummy nodes, and about 60 million segment pairs per crossings() call. That call runs 5 times, so about 300 million iterations, which freezes the UI for seconds. The AI or plugins can trigger this, which breaks the 16 ms rule in ARCHITECTURE section 14. Doing the layout 'before the transaction' still does it on the main actor.",
+      "fix": "Run `DiagramLayout.layout(boxes, edges:, kind:)` in `Task.detached(priority: .userInitiated)` and await it (all its inputs and outputs are pure value types). After the await, check the page and the taken ids again. Lower the caps (for example 200 nodes and 600 edges). In flow, skip the barycenter and crossing sweeps once segs.count passes a budget (for example 5,000). Add a CI time-budget test at the caps, XCTAssertLessThan(elapsed, budget x 4)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDiagrams/FeatDiagramsFeature.swift:67-70 (DiagramMenus.items)",
+      "problem": "Every time the object menu is built, 9 isVisible closures each resolve the whole selection with `ctx.selection.items.compactMap { try? ws.item(...) }`, and Workspace.item is a linear scan. Select-all on a dense handwritten page (2,000 strokes) therefore visits about 9 x 2,000 x 1,000 = 18 million items per menu build. That is a visible hitch on the object menu, even though every caller only needs a selection of 1 (box shape, connector) or 2 (connect).",
+      "fix": "Add `guard ctx.selection.items.count <= 2 else { return [] }` at the top of items(ctx), before any workspace lookup."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDiagrams/DiagramLayout.swift:173-181, 412-421 vs DiagramCommands.swift:251, 285",
+      "problem": "diagram.create can make connectors with more bends than connector.setPath accepts. Flow's gapRoute adds 2 bends at every gap where the column changes. A 100-node, 200-edge flow already produces up to 88 bends, and 500/2,000 up to 626. The ConnectorEditor sends the full bends list on every bend or segment drag, so editing those connectors always fails with 'at most 64 bends'.",
+      "fix": "Keep gapRoute output at or below ConnectorSetPath.maxBends: route through dummies as one vertical run, and only step sideways at the first and last gaps, or simplify the points. Assert this in testFlowWithCyclesAndLongEdgesNeverOverlaps."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDiagrams/DiagramLayout.swift:568-595 (placeConnected)",
+      "problem": "When the source touches a fixed page's edge, the clamped candidate for the requested side overlaps the source. The search then slides the new shape along the clamped edge: 'Above' on a shape at y 0 places it to the right at y 0. If all 7 slots are blocked, it returns candidate(0) even when that rect overlaps the source. The 'clamped' test only asserts y >= 0.",
+      "fix": "Never return a rect that overlaps the source. When the requested side has no room on a fixed page, throw NibError(.invalidParams, \"no room on that side\", path: \"$.side\", hint: \"try another side\") instead of placing the shape somewhere else. Add a test for a source at the page's top edge."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDiagrams/ConnectorEditor.swift:379-416 (commit)",
+      "problem": "commit() sets drag = nil and calls render() before connector.setPath has run, while the real connector is still hidden. For at least one run-loop turn neither the preview nor the connector is drawn, and the handles jump back to the old geometry. This shows as a flicker at the end of every drag.",
+      "fix": "Keep the last preview (the path layer and the d.preview handles) until the Task finishes. Only then unhide the connector and call refresh()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDiagrams/DiagramCommands.swift:230, 610-612, 640 (labels)",
+      "problem": "Labels from the AI and plugins have no length limit. A 100,000-character node label makes nodeBox about 86,000 pt tall, and connector labels are laid out with a 10,000 pt height on every tile render.",
+      "fix": "Cap label length (for example 1,000 characters) with NibError(.invalidParams) at $.label, $.nodes[i].label and $.edges[i].label."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatDiagramsTests/FeatDiagramsTests.swift",
+      "problem": "Two risky paths have no tests: Quick Diagramming drag-to-connect (release onto an item, which snaps and calls connector.create, and release on empty paper, which creates a free end) and connector.setPath on a locked connector. No test checks that connector geometry stays inside Item.bounds.",
+      "fix": "Add a FakeCanvasHost test that drags a dot onto FIXTURESTY01 and asserts a connector from the shape's side to the sticky; add a free-end drag test; add a locked-connector setPath test that expects invalidParams; add the bounds test described in the first issue."
+    }
+  ]
+}

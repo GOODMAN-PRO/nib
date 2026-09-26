@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatToolbar/ToolbarView.swift:403 (ToolbarRootView.body)",
+      "problem": "The palette sits in its own NibDropletContainer with no `inking:` and no `.nibBackdrop`. That makes a second container in the window, next to F017's. As a result the palette never recedes to 22% while the Pencil writes, and its glass keeps sampling the canvas under a live stroke. This breaks DESIGN.md §10.8 and §15.2-15.3, and the Slop checklist line: ink path untouched, chrome near the stroke recedes, nothing samples the backdrop while the Pencil is down. It hurts most on iPhone, where the bottom palette overlaps the page. The two containers also let an F017 bud and a palette bud be open at the same time (breaks 'one popover open at a time').",
+      "fix": "Pass the window's Pencil state: `NibDropletContainer(inking: app.services.get(\"chrome.inking.\" + session.id.raw, as: NibInkingState.self))`. F017 registers it under that key in DocumentContainerViewController.init, before it calls `ui.screens.toolbar`. Thread `app` and `session` into ToolbarRootView to do this. Separately (not in this branch), raise the contract request that the ponytail comment already implies: a SwiftUI toolbar screen rendered inside the chrome's single container, plus a contract key for the inking state."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatToolbar/ToolbarView.swift:61 (ToolbarHostView.hitTest)",
+      "problem": "hitTest claims every touch only while `model.settingsBudOpen` is set, which covers only the chevron bud. NibToolPalette keeps its own settings popover (the spec's main path: tap the selected tool again) and its More grid in private @State that the model never sees. The code's own rule says a tap outside an open bud is not caught unless this flag is set. Under that rule, a tap outside either of those popovers passes through to the canvas and inks, which breaks DESIGN.md §10.6.7 and the Slop line 'A tap outside a popover dismisses it and never inks'. The other possibility is that the container's DismissCatcher already catches those touches, in which case the special case is dead code. Either way the rule is inconsistent and untested.",
+      "fix": "Make the guard cover every palette bud. Get NibToolPalette to report `settingsPresented:` / `morePresented:` bindings (NibDesign owner or contract request, outside this branch) and OR them into the hitTest guard next to `settingsBudOpen`. If on-device checks on iOS 17 and on iOS 18+ show that the DismissCatcher already takes those touches, delete the `settingsBudOpen` special case and change the comment to say so."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatToolbar/FeatToolbarFeature.swift:93 (ToolbarRuntime.isSticky)",
+      "problem": "`isSticky` is cached per tool id and cleared only when the canvasTools registry changes. Stickiness can change at runtime: F026's TextTool returns `settings.get(text.pinned)`. If text is pinned when first checked and unpinned later, the cache still says sticky. rememberTool then stores 'text' as the kind's last tool, and the generic hand-back in didCommit is skipped for it.",
+      "fix": "Drop the cache and call `make().isSticky` each time. It runs only on a tool change or a user commit, and the factories are cheap. If a cache is kept, also clear it on `SettingsStore.didChange`. Add a test with a tool whose `isSticky` reads a setting."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatToolbar/ToolbarView.swift:419",
+      "problem": "iPhone always gets 3 quick inks. DESIGN.md §14.2 specifies the iPhone palette as Pen, Highlighter, Eraser, Lasso, Text, More, then one ink (349 pt). The two extra swatches push everyday tools into More on a phone width.",
+      "fix": "Pass `model.swatches.prefix(compact ? 1 : 3)` (and map the selected index) when `sizeClass == .compact`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatToolbar/ToolbarCustomization.swift:385, 313, 341",
+      "problem": "Hand-rolled controls in the customisation sheet: the red/green circle uses a literal 22x22 frame (not a token and off the 4 pt scale). 'Apply' and 'Reset Toolbar' are hand-styled Buttons (font, colour and minHeight set by hand) instead of the NibDesign button component. This fails DESIGN.md §15.6 and the Slop 'only tokens' line.",
+      "fix": "Use `NibButton(_, kind: .plain/.destructive, size: .compact)` for Apply and Reset. For the −/+ glyph, use a NibMetrics or NibDesign size token (or a NibDesign list-control component via contract request) instead of the literal 22."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatToolbar/ToolbarCommands.swift:181 (toolbar.setLayout) / toolbar.saveLayout",
+      "problem": "Trust boundary: plugins and the AI can write unbounded `order`/`hidden` arrays of arbitrary-length strings into a synced setting (`toolbar.layout` and each `toolbar.layouts.<name>`). Nothing caps them, so one call can bloat what every device syncs.",
+      "fix": "In `sanitized`, cap each list (e.g. 512 ids) and each id's length (e.g. 128). Throw `invalid_params` with a path and hint when a cap is exceeded, rather than truncating silently."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatToolbar/ToolbarCommands.swift:273 (toolbar.layouts Output)",
+      "problem": "A caller cannot read whether the palette is shown in the current window without toggling it with `toolbar.setVisible`. The toolbar's full state is not queryable by the AI or plugins.",
+      "fix": "Add `visible: Bool?` to `ToolbarLayouts.Output` (the active session's `runtime.isVisible`, nil without a window)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatToolbar/ToolbarView.swift:336 (expandOptions)",
+      "problem": "T-109: once scrolling folds the options bar, only a change to a different tool brings it back. The current tool's options (and its chevron) cannot be reopened without switching away and back.",
+      "fix": "Also call `expandOptions()` when the user acts on the current tool, e.g. when `settingsBudOpen` becomes true or when the palette selection is set to the tool that is already selected."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatToolbarTests/FeatToolbarTests.swift",
+      "problem": "ARCHITECTURE.md §4.3 names `toolbar.layouts.<name>` as a per-entry synced collection and says each store has a two-device merge test in its feature. There is none. There is also no test for dock persistence (`setDock` → `toolbar.dock`) or quick-colour selection (`selectSwatch`).",
+      "fix": "Add a test with two Harness apps sharing a small in-test SyncedSettingsBackend: both save different layout names and both names survive. Add one test that `setDock` writes `toolbar.dock` and that a fresh model's `dock(for:compact:)` reads it back, ignoring vertical edges when compact."
+    }
+  ]
+}

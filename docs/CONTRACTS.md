@@ -9,13 +9,574 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 | **C** | App shell (`AppDelegate.swift`, `ShellViewController.swift`) | Architect only |
 | **D** | `project.yml`, CI workflow, `pick_sim.py`, `lint.py` | Architect only |
 
-11,886 lines across 50 files. Every file starts with its repository path as a heading.
+15,549 lines across 54 files. Every file starts with its repository path as a heading.
 
 ## How to use this file
 
 - **Scaffold agent.** Create every file below at the given path, exactly as written. Then create the module stubs listed in `forge-spec.json` → `scaffold[2]` (one per feature entry type, including the second entry types of split features). Push, and do not start features until CI is green — including `NameLookupCanaryTests`, which proves no contract name clashes with an SDK type.
 - **Feature agents.** Import `NibContracts` (and `NibTesting` in tests: Harness, Fixtures, fakes) and use only the API below. If something is missing, file `docs/contract-requests/<Fxxx>-<slug>.md`; do not edit these files.
 - **Concurrency.** Everything marked `@MainActor` must be used from the main actor. Test classes that use `Harness` or `NibApp` are `@MainActor`.
+- **contracts-v2.** The sources below are contracts-v2, an additive revision over contracts-v1. The "contracts-v2 changelog" section lists every new API by gap group, with the workaround in each feature that it replaces.
+
+## contracts-v2 changelog
+
+contracts-v2 (branch `v2/contracts`) resolves the contract gaps the first 48 features reported (`tools/fleet/contract-gaps.md`, where every gap line now ends with `[v2: G<n> …]`, `[v2: rejected - …]` or `[v2: deferred - …]`). It is **additive over contracts-v1**: no public API was renamed, removed or re-signed; every new protocol requirement has a default implementation; new stored fields are optional or defaulted and decode leniently; superseded APIs keep working and carry a "Superseded in contracts-v2 by X" doc comment. Two behaviour changes are bug fixes: `DocTransaction.revert` (G4) and `CommandContext.inputFile` (G6); plus `Frame.applying` for rotated frames under non-uniform scale (G24). The sources in Part A below are the v2 sources; `NibContractsTests/ContractsV2Tests.swift` covers every fix and every new API.
+
+Totals for the 368 gap lines: **220 resolved, 67 rejected, 81 deferred** (33 NibDesign, 12 catalogue rows in forge-spec, 11 app shell, 25 other owners or later design). 21 more gaps reported by fix agents and the design pass during the pass: 19 resolved, 2 deferred.
+
+**How fix agents use this list.** For your feature, find its id below, delete the named workaround and call the v2 API instead; then re-run your tests (and `CommandConformance.check`). "Adopt" lines name owners that must implement a new hook (the default keeps today's behaviour until they do). Rejected and deferred gaps need no action from features.
+
+### G1 — Commands reach the app and its registries
+
+Gap: `CommandContext` exposed no `NibApp`, so commands could not read `content` / `ui` registries or the window; features published registries under untyped service keys or read `NibApp.shared`.
+
+```swift
+// CommandContext
+public var app: NibApp? { get }
+public var content: ContentRegistries { get }
+public var ui: UIRegistries? { get }
+public var navigator: SceneNavigator? { get }            // most recently active window
+// CommandBus
+public internal(set) weak var app: NibApp?
+public internal(set) var content: ContentRegistries
+// SceneNavigator (default: opens a new tab, i.e. shows it; the shell adopts the non-showing version)
+func addTab(_ doc: DocumentID)
+```
+
+Replaces:
+- F003 `NibKit/Sources/FeatQuery/QueryShapes.swift` `NibApp.shared` guarded by `app.bus === ctx.bus` → `ctx.app`, `ctx.navigator?.openDocuments`, `ctx.content.customItemTypes`.
+- F005 `NibTemplates/TemplateCommands.swift` `TemplateCommands.registryKey` ("templates.registry") + `NibTemplatesFeature.swift` `services.set(app.content.templates, …)` → `ctx.content.templates`.
+- F008 `FeatPresets/PresetCommands.swift` `PresetSetSwatch.tapePatterns` (NSMapTable CommandBus → Registry) and the `NibApp.shared?.content.tapePatterns` check → `ctx.content.tapePatterns`.
+- F016 `FeatToolbar/FeatToolbarFeature.swift` `ToolbarRuntime.serviceKey` ("toolbar.runtime") + `ToolbarCommands.swift` `CommandContext.toolbarRuntime()` → `ctx.ui?.toolbar` / `ctx.app` (keep ToolbarRuntime only for window state).
+- F022 `FeatPages/PageCommands.swift` `NibApp.shared?.content.template(ref)?.isCover` → `ctx.content.template(ref)?.isCover`.
+- F033 `FeatTape/TapeCommands.swift` `TapeStore.serviceKey` ("tape.store") lookups of `content.tapePatterns` → `ctx.content.tapePatterns` (TapeStore stays for custom tiles and history).
+- F038 `FeatZoomWindow/FeatZoomWindowFeature.swift` + `ZoomCommands.swift` `ZoomStore(templates: app.content.templates)` → `ctx.content.templates`.
+- F018 `FeatWindows/SceneHooksImpl.swift` `maxRestoredTabs = 8` → `navigator.addTab(_:)` once the shell implements it (shell adoption: `ShellViewController.addTab` appends without building an editor).
+
+### G2 — Read-only documents
+
+Gap: the store published read-only documents as an untyped `NSMutableSet` under "store.readOnly".
+
+```swift
+// DocumentPersistence (default false)
+func isReadOnly(_ doc: DocumentID) -> Bool
+// Workspace / CommandContext / NibApp
+public func isReadOnly(_ doc: DocumentID) -> Bool     // Workspace: persistence only; ctx and app also honour the legacy set
+// ServiceKeys (legacy name of the NSSet, kept working)
+public static let storeReadOnly = "store.readOnly"
+```
+
+Replaces: F001 `NibStore/NibStoreFeature.swift` `readOnlyKey` publication → implement `PackagePersistence.isReadOnly(_:)` (adopt), keep publishing the set until consumers move; F014 `FeatClipboard/ClipboardCommands.swift` `isReadOnly(_ ctx:)`, F042 and F070 `services.get("store.readOnly", as: NSSet.self)` → `ctx.isReadOnly(doc)` / `app.isReadOnly(doc)`.
+
+### G3 — Event types and typed payloads
+
+Gap: several events had no constant or payload schema (sync.status, index.progress, audio.*, shape.snapped, elements.changed, bridge.status), window switches and layer changes emitted nothing, and the library-changed rule was implicit.
+
+```swift
+public protocol NibEventPayload: Codable { static var eventType: String { get } }
+public extension EventBus { @discardableResult func emit<P: NibEventPayload>(_ payload: P, principal: Principal? = nil, doc: DocumentID? = nil) -> NibEvent }
+public extension NibEvent { func decode<P: NibEventPayload>(_ type: P.Type) -> P? }
+
+public struct SyncStatusPayload: NibEventPayload, Equatable      // state, source, reason?, message?, files?
+public struct IndexProgressPayload: NibEventPayload, Equatable   // running, done, total, pending
+public struct LaserMovedPayload: NibEventPayload, Equatable      // page, point?, mode, color?, session?
+public struct AudioPlaybackPayload: NibEventPayload, Equatable   // clip, t, playing, rate, at
+public struct AudioRecordingPayload: NibEventPayload, Equatable  // clip, state, duration
+public struct ShapeSnappedPayload: NibEventPayload, Equatable    // page, shape, point?, session?
+public struct PencilHapticPayload: NibEventPayload, Equatable    // kind, page?, point?, session?
+
+// NibEventType
+public static let sessionActivated = "session.activated"   // SessionRegistry.add / activate / remove when `active` changes
+public static let layersChanged = "session.layers"          // EditorSession.activeLayer / hiddenLayers didSet
+public static let toolFinished = "tool.finished"            // EditorSession.finishToolUse
+public static let indexProgress = "index.progress"
+public static let audioPlayback = "audio.playback"
+public static let audioRecording = "audio.recording"
+public static let shapeSnapped = "shape.snapped"
+public static let pencilHaptic = "pencil.haptic"            // anyone asks F043 for a Pencil Pro haptic
+public static let elementsChanged = "elements.changed"
+public static let bridgeStatus = "bridge.status"
+```
+`LibraryService` doc: implementations emit `library.changed` after every catalog change.
+
+Replaces:
+- F001 `NibStore/PackagePersistence.swift` `StoreStatus.payload(...)` JSON → `events.emit(SyncStatusPayload(...), doc:)`; F025/F070 decode with `event.decode(SyncStatusPayload.self)`.
+- F055 `NibIndex/Indexer.swift` `IndexKeys.progressEvent` + `emitProgress` JSON → `IndexProgressPayload`; F056 subscribes to `NibEventType.indexProgress`.
+- F040 `FeatLaser/FeatLaserFeature.swift` hand-built `payload` → `LaserMovedPayload`.
+- F052 `FeatAudio/Player.swift` `emit("audio.playback", …)`, `Recorder.swift` `emit("audio.recording", …)` → the payload types; F053 reads them.
+- F030 `FeatShapeRecognition/DrawShapeTool.swift` `ShapeRecognitionEvents.snapped` → `NibEventType.shapeSnapped` + `ShapeSnappedPayload`; F043 `FeatPencilHardware/PencilHandler.swift` `shapeSnapped` literal → the constant; F039 (ruler) and F012 (guides) emit `PencilHapticPayload` instead of `NibHaptics.play(.detent)` stand-ins.
+- F035 `FeatElements/ElementCommands.swift` `ElementEvents.changed` → `NibEventType.elementsChanged`.
+- F090 `NibBridge/NibBridgeFeature.swift` `BridgeController.statusEvent` → `NibEventType.bridgeStatus`.
+- F015 `FeatUndoUI/UndoButtons.swift` `UIWindow.didBecomeKeyNotification` observer, F063 `FeatPresentation/FeatPresentationFeature.swift` `UIScene.didActivateNotification` re-reads → `NibEventType.sessionActivated`.
+- F041 (canvas redraw on layer visibility) → `NibEventType.layersChanged`.
+
+### G4 — Undo: revert rebasing and linked undo across documents
+
+Gap (the F031 blocker, also F005, F026, F028, F029, F034, F036, F044, F049): `DocTransaction.revert` only reverted a record whose current revision equalled the stored after-revision, but reverting writes a fresh revision. So (a) a record written twice in one undo group (move then attach, debounced text commits, two meta writes) was only reverted to the middle state, and (b) the older of two consecutive undo entries on one record was silently skipped. Also, a change across two documents (page.moveTo) was two undo steps.
+
+Fix: a revert pass remembers "the value that had revision r now lives at revision r'" per record (`RevRebase`, internal) and accepts r' for older mutations of that record; after every undo, redo and selective revert the bus rewrites the after-revisions stored in the remaining undo and redo entries the same way. Selective revert still skips records changed later by anyone else (`testSelectiveRevertStillSkipsRecordsChangedLater`). Non-undoable writes (`mutate(undoable: false)`) still count as later changes (F033's tape reveal, rejected).
+
+```swift
+// CommandContext: make this command's undo group one step across every document it changes
+public func linkUndoAcrossDocuments()
+// UndoEntry
+public var linked: Bool
+// UndoHistory
+public func isLinked(_ group: String) -> Bool
+// CommandBus.undo / redo: a linked entry also undoes (redoes) the same group in every other document where it is the latest step
+```
+
+Regression tests: `ContractsV2Tests.testAttachAfterMoveInTheSameGroupUndoesTheMoveToo` (F031's exact flow: commit observer attaches with `item.update` in the move's group), `testRecordWrittenTwiceInOneGroupIsFullyReverted` (item, page record and meta, F028/F005), `testConsecutiveUndosOnOneItem` (undo ×3, redo, interleaved), `testInsertCropFlipThenThreeUndosRemovesTheImage` (F034), `testLinkedUndoAcrossDocuments` (F022).
+
+Replaces:
+- F005 `NibTemplates/TemplateCommands.swift` `MetaChange` / `apply` (write each page and meta once per command) → write as needed.
+- F026 `FeatTextBox` de-duplicated refs and one group per editing commit → plain writes; F036 `FeatSticky` draft-until-typing-ends sticky creation and once-per-session saves → allowed to autosave; F044 `FeatWhiteboard` write-once rule (board template re-centring can come back).
+- F031 `FeatShapesTests.testDroppingAnItemIntoAShapeAttachesItInTheSameUndoStep` passes unchanged; F036 can restore its drop-to-attach criterion.
+- F029 `FeatLinksTests.swift` (note about consecutive undo), F034, F036 and F049 tests that check one undo step at a time → may stack undos again.
+- F022 `FeatPages` `page.moveTo`: call `ctx.linkUndoAcrossDocuments()` so one undo restores both documents (update its test, which today undoes each document separately).
+
+### G5 — Writes: provenance-keeping moves, batch writes, fast paths
+
+Gap: moving an item by a non-user principal re-stamped `createdBy`; per-item puts were O(page size) (scan + array copy), so page-wide edits and imports were quadratic; stroke points decoded through JSONDecoder.
+
+```swift
+// DocTransaction
+@discardableResult public func put(_ item: Item, doc: DocumentID, page: PageID, keepingProvenanceFrom sourcePage: PageID, in sourceDoc: DocumentID? = nil) throws -> Item
+@discardableResult public func move(item id: ElementID, doc: DocumentID, from source: PageID, to target: PageID, transform: Affine? = nil, z: String = "") throws -> Item
+@discardableResult public func put(_ items: [Item], doc: DocumentID, page: PageID) throws -> [Item]
+public func delete(items ids: [ElementID], doc: DocumentID, page: PageID) throws
+@discardableResult public func put(_ blocks: [TextBlock], doc: DocumentID) throws -> [TextBlock]
+@discardableResult public func put(_ cards: [StudyCard], doc: DocumentID) throws -> [StudyCard]
+@discardableResult public func put(_ pages: [PageRecord], doc: DocumentID) throws -> [PageRecord]   // validates all first
+@discardableResult public func put(_ entries: [OutlineEntry], doc: DocumentID) throws -> [OutlineEntry]
+@discardableResult public func put(_ clips: [AudioClip], doc: DocumentID) throws -> [AudioClip]
+// Stroke
+public static func unpackFull(_ v: [Float]) -> [StrokePoint]
+public static func unpackCompact(_ data: Data) -> [StrokePoint]
+```
+Workspace now keeps an id → index table per cached page (O(1) item lookups and in-place replacement) and writes records in place, so single puts no longer copy the page. Batch puts give records with an empty `order` (and items with an empty `z`) keys after the current last one, in array order, using balanced keys (`FractionalIndex.balanced`), so 10,000 appended cards get keys a few characters long. Undo, redo and rollback of a batch are linear too: consecutive record writes of one kind are reverted (or restored) in one pass (`testLargeCardImportUndoesRedoesAndRollsBackInOnePass`: 10,000 cards imported, re-edited in the same group, undone, redone, and a failed import rolled back).
+
+Replaces:
+- F003 `FeatQuery/NodeCommands.swift` node.move (ponytail "a non-user cross-page move stamps the mover as createdBy") → `tx.move(item:doc:from:to:)` (or `put(_:doc:page:keepingProvenanceFrom:in:)` across documents).
+- F012 `FeatTransform` item.moveToPage re-put → `tx.move(item:doc:from:to:transform:)`; the drag commit over many items → one `tx.put(items, …)` (the 5,000-stroke nudge).
+- F010 `FeatEraser/EraseCommands.swift` `EraseSupport.remove` → `tx.delete(items:doc:page:)` and `tx.put(items, …)` for the cut pieces.
+- F051 `FeatStudyIO/StudyImporter.swift` appending into an existing set, and its `rows × (existing + rows) ≤ 25M` append cap → `tx.put(cards, doc:)` (drop the cap).
+- F019/F020 PDF and image import (one `put(page)` per page, each re-sorting `livePages`) → `tx.put(pages, doc:)`; outline importers → `tx.put(entries, doc:)`.
+- F001 `NibStore` PageReader's own points decoder → `Stroke.unpackCompact(_:)`.
+
+### G6 — `CommandContext.inputFile` security fix and import naming
+
+Gap: `case "https", "http" where principal.isUser` bound the `where` only to "http", so any plugin, AI or bridge caller could make https downloads with no network-scope check and no size limit; `tmp:` names were not validated; downloads were renamed `<UUID>-name`, and importers had no display name or caller-chosen ids.
+
+Fix: non-user principals may download only `https`, only with the `network` scope, and plugins whose manifest the plugin host knows only from `network.hosts`; plain `http` is user-only; every download is capped at `NibLimits.maxDownloadBytes` (200 MB, 60 s timeout) and lands as `<tmp>/nib-downloads/<UUID>/<original name>`; `tmp:` names must be plain file names (no `/`, `\`, leading `.`).
+
+```swift
+public static let maxDownloadBytes = 200 * 1_048_576          // NibLimits
+// ImportTarget
+public var displayName: String?
+public var ids: [NibID]?
+public init(folder: FolderID? = nil, document: DocumentID? = nil, position: PagePosition = .end, anchorPage: PageID? = nil, displayName: String? = nil, ids: [NibID]? = nil)
+```
+Test: `ContractsV2Tests.testInputFileSecurity`.
+
+Replaces: F003 `FeatQuery/AssetCommands.swift` `AssetBytes.load` checks (plugin network, `maxInputBytes`, tmp names) → rely on `ctx.inputFile`; F024 `NibPDF/PDFImporter.swift` and F051 `FeatStudyIO/StudyImporter.swift` "<UUID>-" prefix stripping → no longer needed (keep reading `lastPathComponent`, or `target.displayName`). Adopt: F064 `import.files` fills `ImportTarget.displayName` (original name without extension) and `ids`.
+
+### G7 — Templates: region rendering, metrics, boards
+
+Gap: templates rendered whole pages only, published no grid spacing, margins or repeat period, and the board size semantics were unstated.
+
+```swift
+public struct PageInsets: Codable, Hashable { public var top, left, bottom, right: Double }
+public struct TemplateMetrics: Equatable { public var spacing: Double?; public var margins: PageInsets?; public var repeatPeriod: PageSize? }
+// TemplateDefinition
+public var renderRegion: ((_ params: [String: JSONValue], _ size: PageSize, _ scale: Double, _ region: Rect) -> TemplateRender)?
+public var metricsProvider: ((_ params: [String: JSONValue], _ size: PageSize?) -> TemplateMetrics)?
+public func renderOps(_ params: [String: JSONValue], size: PageSize, scale: Double, region: Rect?) -> TemplateRender
+public func metrics(for params: [String: JSONValue], size: PageSize?) -> TemplateMetrics
+public enum TemplateIDs { blank, dots, grid, graph, isometric, ruled, ruledNarrow, ruledWide, cornell, legalPad, whiteboardDots, whiteboardGrid, whiteboardLines }   // "builtin.<name>"
+public enum TemplateParamNames { paper, line, spacing, margin, color }                     // static let String constants
+```
+Patterns are anchored at the page origin; boards call `renderRegion` with each tile's world rect (else `render` with the tile size, tiles aligned to `repeatPeriod`, 240 pt when nil). Without a provider, `metrics` reads the "spacing" and "margin" params.
+
+Replaces: F004 `NibRender/DisplayListRenderer.swift` `boardPeriod = 240` → `metrics(...).repeatPeriod` and `renderOps(..., region:)`; F005 `NibTemplates/WhiteboardGrids.swift` `fineDotBudget` → set `renderRegion` (and `metricsProvider`) on its templates; F012 `FeatTransform` GuideEngine grid read from the DisplayList → `metrics(for:size:).spacing`; F028 `FeatPageText/PageTextCommands.swift` page-proportional margins → `metrics(...).margins`. F044 `FeatWhiteboard/WhiteboardCreateSheet.swift` `BoardPattern.candidates` and `WhiteboardCommands.swift` `Whiteboard.dotsTemplate` literals, and the "paper" / "line" param names (`MinimapView.swift` paper colour) → `TemplateIDs` / `TemplateParamNames`; F005 `NibTemplates/PaperTemplates.swift` param names → the same constants.
+
+### G8 — DisplayOp text alignment and weight
+
+```swift
+public var align: ParagraphAlignment?          // DisplayOp
+public var weight: DisplayFontWeight?          // DisplayOp (system font only)
+public enum DisplayFontWeight: String, Codable, CaseIterable { case light, regular, medium, semibold, bold, heavy }
+```
+`DisplayList.draw` honours both. Replaces: F005 planner headings, weekday names and day numbers drawn left-aligned regular → set `align` / `weight`.
+
+### G9 — Per-page content revision
+
+```swift
+func contentRevision(_ doc: DocumentID, page: PageID) -> Rev?        // DocumentPersistence, default nil
+public func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? // Workspace: cached page max rev, else persistence
+```
+Replaces: F004 thumbnail key that loads a page's items to compute the max rev → `workspace.contentRevision(doc, page:)` (falls back to loading when nil). Adopt: F001 implements `PackagePersistence.contentRevision` from its page files.
+
+### G10 — Workspace cache accessors
+
+```swift
+public func isPageCached(_ doc: DocumentID, page: PageID) -> Bool
+public func cachedPages(_ doc: DocumentID) -> Set<PageID>
+public func peekContent(_ doc: DocumentID) throws -> DocumentContent   // no caching, no doc.opened
+```
+Replaces: F005 `NibTemplates/TemplateCommands.swift` `evictPages(t.doc, keeping: all pages minus that one)` → evict only pages that were not in `cachedPages` before; F020 `FeatLibraryOrganize` heads cache (bookmarked and trashed pages of documents never opened) → `peekContent` per document.
+
+### G11 — Registry change signals
+
+```swift
+public var generation: UInt64                  // Registry
+public enum RegistryChange {                   // userInfo of .nibRegistryDidChange posted by a Registry
+    public static let idsKey, ownerKey, kindKey, generationKey: String
+    public static let registered, replaced, unregistered: String
+    public static func ids(_ note: Notification) -> [String]
+}
+public private(set) var isStarted: Bool         // NibApp, true after start(_:)
+```
+Replaces: F004 `NibRender` "drop every tile on any drawer/template registration" → drop only pages whose background template id or item draw keys are in `RegistryChange.ids(note)`, and ignore changes before `app.isStarted` for disk thumbnails.
+
+### G12 — Chrome overlays (floating HUDs), the inking signal, the SwiftUI toolbar
+
+Gap (blocked F052; worked around by F029, F038, F039, F044, F062, F063, F016, F017, F026, F008, F037): no chrome extension point for floating HUDs, bars or popovers, no hand-off of the Pencil-down state, and the toolbar was a UIView in a second droplet container.
+
+```swift
+public enum ChromePlacement: String, Codable, CaseIterable { case topLeading, top, topTrailing, leading, trailing, center, bottomLeading, bottom, bottomTrailing, anchored }
+public enum ChromeSurface: String, Codable, CaseIterable { case hud, bar, pill, panel, popover, none }
+public enum ChromeAnchor: Equatable { case page(PageID, Rect); case window(CGRect) }
+public struct ChromeContext { public var app: NibApp; public var session: EditorSession; public var navigator: SceneNavigator?; public var kind: DocumentKind?; public var isCompact: Bool }
+public struct ChromeOverlayDescriptor: Registrable {
+    public init(id: String, owner: String, placement: ChromePlacement, surface: ChromeSurface = .hud, order: Int = 0,
+                recedesWhileWriting: Bool = true, isInteractive: Bool = true, docKinds: Set<DocumentKind>? = nil,
+                isVisible: @escaping @MainActor (ChromeContext) -> Bool = { _ in true },
+                anchor: (@MainActor (ChromeContext) -> ChromeAnchor?)? = nil,
+                makeView: @escaping @MainActor (ChromeContext) -> AnyView)
+}
+// UIRegistries
+public let chromeOverlays: Registry<ChromeOverlayDescriptor>
+public func visibleChromeOverlays(_ context: ChromeContext) -> [ChromeOverlayDescriptor]   // bottom-most first
+public func setNeedsChromeUpdate(_ session: EditorSession? = nil)                        // posts .nibChromeNeedsUpdate
+// EditorSession (not @Published, so Pencil down never re-evaluates SwiftUI bodies)
+public let inking: InkingSignal
+@MainActor public final class InkingSignal {
+    public private(set) var isInking: Bool; public private(set) var strokeBounds: CGRect?   // window coordinates
+    public func begin(strokeBounds: CGRect? = nil); public func update(strokeBounds: CGRect); public func end()
+    @discardableResult public func observe(_ handler: @escaping @MainActor (InkingSignal) -> Void) -> EventSubscription
+}
+// ScreenRegistry (the chrome prefers it; `toolbar` is superseded)
+public var toolbarView: (@MainActor (EditorSession, NibApp) -> AnyView)?
+// The window's floating host (NibDesign's NibFloatingHost behind a protocol): popovers, HUDs and toasts from UIKit
+// code and canvas attachments, INSIDE the window's droplet container
+@MainActor public protocol FloatingHosting: AnyObject {
+    func present(_ id: String, content: AnyView); func dismiss(_ id: String); func isPresenting(_ id: String) -> Bool
+    @discardableResult func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool; func removeAnchor(_ id: String)
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect?
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?)
+}
+public extension FloatingHosting { func present<Content: View>(_ id: String, @ViewBuilder content: () -> Content); func postToast(_ message: String) }
+public weak var floatingHost: FloatingHosting?          // EditorSession, set by the container's owner (F017, F019)
+var floatingHost: FloatingHosting? { get }               // SceneNavigator (default session.floatingHost)
+@MainActor public var floatingHost: FloatingHosting?     // ChromeContext (session.floatingHost)
+// ToolMenuDescriptor: the options bar's own popover, handed to NibDesign's NibToolOptions(bar:popover:)
+public var makePopover: (@MainActor (EditorSession) -> ToolMenuPopover?)?
+public struct ToolMenuPopover { public var source: String; public var isPresented: Binding<Bool>; public var title: String; public var subtitle: String?; public var content: AnyView }
+```
+NibDesign's `NibFloatingHost` already has every `FloatingHosting` member except `present(_:content: AnyView)` and `postToast`. So NibDesign (or F017, in an adapter) conforms it in two lines. `ToolMenuPopover` mirrors `NibToolOptionsPopover` field for field.
+The document chrome (F017) renders every visible overlay inside the window's one `NibDropletContainer`, in `order` (z-order), at its placement (an `.anchored` overlay follows its page rect through the canvas, or a window rect), with the NibDesign surface for its `surface`, receding to the recede opacity while `session.inking.isInking` when `recedesWhileWriting`. It re-evaluates `isVisible` on registry changes, session changes and `.nibChromeNeedsUpdate`.
+
+Adopt: F017 (render `ui.chromeOverlays`, mirror `session.inking` into its `NibInkingState`, host `screens.toolbarView` in its container, place a `NibFloatingLayer` and set `session.floatingHost`); F019 (the same host for the library window); F016 (pass `makePopover` to the palette as `NibToolOptions.popover`); F006/F101 canvas (write `session.inking` begin/update/end).
+
+Replaces:
+- F052 `FeatAudio/AudioPanel.swift` `RecorderView` + playback bar living in the sidebar tab → a `.top` `.hud` overlay (recording) and a `.bottom` `.bar` overlay (playback).
+- F029 `FeatLinks/LinkNavigator.swift` `ReturnToPageAttachment` (standalone `.droplet(style: .hud)` on the canvas) → `.bottom` `.pill` overlay.
+- F038 `FeatZoomWindow` pane (static `nibGlass(.deep)` in `canvasView.superview`) → `.bottom` `.panel` overlay (the zoom box stays a CanvasAttachment).
+- F039 `FeatRuler/RulerView.swift` angle HUD in a UIHostingController on the canvas → `.top` `.hud` overlay.
+- F062 `FeatTimeKeeper/TimeKeeperView.swift` `TimeKeeperBarAttachment` → `.bottom` `.bar` overlay; its `NibHaptics.isInking` polling → `session.inking.observe`.
+- F063 `FeatPresentation/FeatPresentationFeature.swift` `PresenterHUDAttachment` → overlay; mirror pausing → `session.inking`.
+- F044 `FeatWhiteboard` minimap fade, F058 `FeatSmartInk/FeatSmartInkFeature.swift` `NibHaptics.isInking` → `session.inking`.
+- F016 `FeatToolbar/FeatToolbarFeature.swift` `screens.toolbar = { ToolbarHostView(...) }` and `ToolbarView.swift` `inkingKey` ("chrome.inking.<session>") → `screens.toolbarView`; F017 `FeatDocChrome/ChromeCommands.swift` `ChromeStateStore.inkingKey` publication → `session.inking`.
+- F026 `FeatTextBox` UIKit popovers (More, font picker) and F037 `FeatComments` thread panel opened through `panel.open` → `session.floatingHost` (`setAnchor(_:rect:in:)` + `present`), or `.anchored` `.popover` overlays.
+- F008 `FeatPresets` inline options-bar modes (thickness slider, colour editor inside the bar) → `ToolMenuDescriptor.makePopover`.
+- F020 and other library tabs announcing results to VoiceOver instead of toasting → `navigator.floatingHost?.postToast(_:)`.
+
+### G13 — Shared settings keys
+
+```swift
+// NibSettings (declared by NibApp.init; the owning feature may re-declare the same name)
+public static let liquidMode = SettingKey("appearance.liquid", default: "full")                 // full | calm | off
+public static let defaultTextStyle = SettingKey("text.defaultStyle", default: TextBoxStyle(), synced: true)
+public static let drawAndHold = SettingKey("shapes.drawAndHold", default: true, synced: true)
+public static let eraserMode = SettingKey("eraser.mode", default: "standard", synced: true)      // precision | standard | stroke
+public static let eraserSize = SettingKey("eraser.size", default: 14.0, synced: true)           // screen points
+public static func eraserFilter(_ tool: InkTool) -> SettingKey<Bool>                            // "eraser.filter.<tool>"
+public static let penReactsToRoll = SettingKey("pen.reactToRoll", default: true, synced: true)
+public static let toolbarLayout = SettingKey<ToolbarLayoutSetting?>("toolbar.layout", default: nil, synced: true)
+public struct ToolbarLayoutSetting: Codable, Equatable { public var order: [String]; public var hidden: [String] }
+// writingPosture doc pinned: value = hand × 4 + wrist (hand 0 right, 1 left; wrist 0 below, 1 angled, 2 level, 3 hooked)
+// TextBoxStyle
+public var align: ParagraphAlignment?
+public var lineSpacing: Double?
+public static let maxErasePathPoints = 20_000                                                   // NibLimits
+```
+Replaces: F014 `FeatClipboard/ClipboardCommands.swift` `defaultStyleSettings` ("text.defaultStyle", "text.styles.default") → `NibSettings.defaultTextStyle`; F026 `FeatTextBox/TextCommands.swift` `SavedTextStyle` align/lineSpacing side keys → `TextBoxStyle.align` / `lineSpacing` (same JSON keys, so stored styles still decode); F016 hard-coded Liquid `.full` → `NibSettings.liquidMode`; F009 `FeatHighlighter` and F030 `FeatShapeRecognition` → read `NibSettings.drawAndHold` without declaring it; F038 `FeatZoomWindow/AutoAdvance.swift` untyped eraser keys and point limit, F043 `toolOptions["eraser"]` guess → the eraser keys and `NibLimits.maxErasePathPoints` (F010 `EraserGeometry.maxPathPoints` → the constant); F043 `FeatPencilHardware/FeatPencilHardwareFeature.swift` `PencilSettings.reactToRoll` literal → `NibSettings.penReactsToRoll`; F043 lenient `toolbar.layout` read → `NibSettings.toolbarLayout`; F027 writing posture → the pinned layout.
+
+### G14 — Canvas and drawing contracts
+
+```swift
+// CanvasHost (defaults in an extension; the canvas F006/F101 overrides)
+func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void)     // default: after 150 ms
+func pageTransform(_ page: PageID) -> CGAffineTransform?                         // page → canvasView
+func convert(_ point: Point, from source: PageID, to target: PageID) -> Point?
+var fixedOverlayView: UIView { get }                                             // default canvasView.superview
+func finishToolUse(_ tool: CanvasTool)
+func commitStroke(_ stroke: Stroke, page: PageID, completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void)
+// CanvasAttachment (defaults)
+func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool     // canvas calls this; default → hitTest(_:host:)
+func hover(_ sample: CanvasSample?, host: CanvasHost)
+func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool   // false = pass on to tap handlers
+// CanvasSample
+public var touchID: Int                                                          // init(..., touchID: Int = 0)
+// DocumentEditing (default: reveal(page: block, …))
+func reveal(block: NibID, animated: Bool)
+// ItemDrawer (defaults nil)
+func hitBounds(_ item: Item) -> Rect?
+func paintBounds(_ item: Item) -> Rect?
+// ContentRegistries
+public let textLayouts: Registry<TextLayoutDescriptor>
+public func textLayout(for item: Item) -> TextLayoutInfo?
+public func hitBounds(for item: Item) -> Rect
+public func paintBounds(for item: Item) -> Rect        // default Item.bounds grown by NibLimits.drawerMargin
+public struct TextLayoutInfo: Equatable { public static let lineFragmentPadding: Double; public var container: Frame; public var base: TextAttributes; public var centredVertically: Bool }
+public struct TextLayoutDescriptor: Registrable { public init(key: String, owner: String, order: Int = 0, layout: @escaping (Item) -> TextLayoutInfo?) }
+// DrawContext (init gains purpose: .screen, annotations: true, paper: nil)
+public let purpose: DrawPurpose; public let annotations: Bool; public let paper: RGBA?
+public enum DrawPurpose: String, Codable, CaseIterable { case screen, thumbnail, export, query }
+public var purpose: DrawPurpose                          // RenderRequest
+public static let drawerMargin: Double = 12             // NibLimits
+```
+Doc clarifications: `canvasView` is the scroll view and `viewPoint`/`pageFrame` use its bounds coordinates; `cancelWetStroke` is idempotent and may be called from `strokeFinished`; a touch claimed by an attachment never pans, zooms or inks; the canvas owns `UIPencilInteraction` and forwards through `ui.pencilHandler` (squeeze locations in `canvasView` coordinates); a bound Pencil action gets `{gesture, doc, page?, at?}` with its own params merged over.
+
+Adopt: F006/F101 (implement the CanvasHost hooks precisely, call `hitTest(_:isPencil:host:)`, `hover`, `gesture`, fill `touchID`); F004 (culling/invalidation with `paintBounds(for:)`, pass `purpose`/`annotations`/`paper`); F026, F036, F031 register `TextLayoutDescriptor`s for text, sticky and shape labels.
+
+Replaces:
+- F010 `FeatEraser/EraserTool.swift` ~150 ms preview hold, F012 `FeatTransform/DragController.swift` `settleNanoseconds` (120 ms), F030 `FeatShapeRecognition/DrawShapeTool.swift` `previewHandOff` (300 ms), F033 `FeatTape/TapeTool.swift` `dryHandoff` (0.25 s) → `host.afterNextRender(page:) { … }`.
+- F012 `FeatTransform/DragController.swift` `extension CanvasHost { func pageToView(_:) }` → `host.pageTransform(_:)`; F010 dropping samples on other pages → `host.convert(_:from:to:)`.
+- F012 invisible hover view with UIPointerInteraction, F032 `FeatDiagrams/ConnectorEditor.swift` UIHoverGestureRecognizer → `CanvasAttachment.hover`.
+- F012 `FeatTransform/SelectionHandles.swift` `forwardTap`, F031 taps on selected shapes → return false from `gesture(_:at:host:)`.
+- F039 `FeatRuler/RulerView.swift` `RulerGesture` nearest-finger matching → `CanvasSample.touchID`; `RulerProcessor.swift` 6 pt Pencil band → `hitTest(_:isPencil:host:)`.
+- F038 and F062 `canvasView.superview` hosting → `host.fixedOverlayView`.
+- F033 history recorded even when `ink.addStrokes` fails → `commitStroke(_:page:completion:)`.
+- F047 `FeatTextDoc/TextDocViewController.swift` block id passed as a page id → its `reveal(block:animated:)` now satisfies the requirement; callers use `editor.reveal(block:animated:)`.
+- F036 collapsed-note hit area → `StickyDrawer.hitBounds`; F031 `FeatShapes/ShapeDrawer.swift` reliance on F004's undocumented 12 pt margin and F032 `FeatDiagrams/ConnectorDrawer.swift` 6 pt stub limit → `NibLimits.drawerMargin` / `paintBounds` (labels, arrowheads, curve bulges); F032 label knock-out colour → `context.paper`.
+- F036 (`collapsed` flag as export flag) and F037 (pins drawn in every render) → `context.purpose == .export` / `context.annotations`.
+- F029 `FeatLinks/LinkNavigator.swift` assumed insets (`TextBoxStyle.padding`, lineFragmentPadding 0, 6 pt tolerance) → `ctx.content.textLayout(for: item)`.
+- F028 full-page boxes: F026's drawer can return the laid-out text from `hitBounds` so the lasso stops catching the page-sized box.
+
+### G15 — Session state: temporary tools, finished tools, open panels, text focus
+
+```swift
+// EditorSession
+@Published public var openPanels: Set<String>
+@Published public private(set) var temporaryReturnTool: String?
+public var editingTextRef: String?          // item/block/card being edited while isEditingText
+public var editingTextRange: [Int]?         // [start, length] in plain-text units
+public func selectTemporarily(_ tool: String)
+public func endTemporaryTool()
+public func selectTool(_ tool: String)      // what tool.select does: clears a pending temporary return
+public func finishToolUse(sticky: Bool)     // back to temporaryReturnTool, else previousTool when not sticky; emits tool.finished
+// tool.select gains {temporary?: Bool}
+```
+Replaces: F011 `FeatLasso/SelectionCommands.swift` `toolOptions["lasso"]["returnTool"]` (`returnToolKey`) → `selectTemporarily` / `endTemporaryTool` (or `tool.select {tool, temporary: true}`); F010 `EraserTool.swift` auto-deselect `tool.select(previousTool)`, F034 `FeatImages/ImageTool.swift` manual return, F016 "hand back after one commit" → `host.finishToolUse(self)`; F017 `FeatDocChrome/ChromeCommands.swift` "chrome.state" open-panel store (for query.context) → `session.openPanels`; F029 `FeatLinks/LinkEditorSheet.swift` first-responder `selectedRange` probing → `session.editingTextRef` / `editingTextRange` (text editors F026, F036, F031, F047, F049 set them, adopt).
+
+### G16 — Live descriptor state and command conventions
+
+```swift
+// ToolbarItemDescriptor (vars, set after init)
+public var isEnabled: (@MainActor (EditorSession) -> Bool)?
+public var isOn: (@MainActor (EditorSession) -> Bool)?
+public var sessionParams: (@MainActor (EditorSession) -> JSONValue)?
+public var sessionTitle: (@MainActor (EditorSession) -> String)?
+public var sessionIcon: (@MainActor (EditorSession) -> String)?
+public var showsInCompactWidth: Bool
+public func resolvedParams(for session: EditorSession) -> JSONValue
+public func resolvedTitle(for session: EditorSession) -> String
+public func resolvedIcon(for session: EditorSession) -> String
+// MenuItemDescriptor (vars)
+public var isChecked: (@MainActor (MenuContext) -> Bool)?
+public var contextTitle: (@MainActor (MenuContext) -> String)?
+public var shortcut: KeyShortcut?                                     // display only
+public func resolvedTitle(for context: MenuContext) -> String
+// MenuContext (init gains folder:, textRange:)
+public var folder: FolderID?
+public var textRange: [Int]?
+// KeyCommandDescriptor (vars; the shell adopts: filter by docKinds, pass resolvedParams(for: session))
+public var docKinds: Set<DocumentKind>?
+public var sessionParams: (@MainActor (EditorSession) -> JSONValue)?
+public func resolvedParams(for session: EditorSession?) -> JSONValue
+// PanelContext / PanelDescriptor / SettingsPageDescriptor
+public var params: JSONValue                                          // panel.open params minus id
+public var presentation: PanelPresentation?
+public enum PanelPresentation: String, Codable, CaseIterable { case sidebar, window, floating, sheet, fullScreen, libraryTab }
+public var providesHeader: Bool
+public var keywords: [String]
+// CommandContext session defaults (user callers may omit doc / page / refs)
+public func documentOrSession(_ ref: String?, field: String = "doc") throws -> DocumentID
+public func pageOrSession(_ ref: String?, field: String = "page") throws -> (doc: DocumentID, page: PageID)
+public func refsOrSelection(_ refs: [String]?) -> [String]
+```
+`edit.undo` / `edit.redo`: `doc` may be omitted by the user (the invoking window's document); the schema still requires it for the AI, plugins and the bridge. §6.1 now pins the param conventions (session defaults, `position`/`anchor`, `[width, height]` sizes, frames with an optional 5th rotation value, TemplateRef JSON, page-point deltas, seconds for media time, `panel.open {id, params?}`, `ai.ask` → AIResponse JSON).
+
+Adopt: F016/F017 (evaluate the toolbar live state, pass `PanelContext.params`/`presentation`, honour `providesHeader`), the menu hosts (checkmarks, `contextTitle`, shortcut labels), the app shell (key command `docKinds` and `resolvedParams`), text editors (fill `MenuContext.textRange`), F027 search (`keywords`).
+
+Replaces:
+- F015 `FeatUndoUI/UndoButtons.swift` `UndoChrome` re-registering toolbar items and key commands with `{doc}` and "Undo <label>" titles → one registration with `sessionParams`, `sessionTitle`, `isEnabled`; `edit.undo {}` works from key commands.
+- F046 `FeatOutline` no bookmark toolbar item → a nav item with `isOn`, `sessionParams` and `sessionIcon`; `OutlineCommands.swift` `PageSetBookmarked.Params` optional decode → `ctx.pageOrSession`.
+- F038, F042, F062 on/active state → `isOn`; F015 compact width → `showsInCompactWidth`.
+- F012, F014 (`clipboard.copy`/`cut`/`paste`, `item.duplicate`), F046, F042 optional-refs defaults → `ctx.refsOrSelection` / `ctx.pageOrSession`.
+- F017 `FeatDocChrome/FeatDocChromeFeature.swift` "Scroll Horizontally/Vertically" opposite-only entry, F022 Before/After/Last submenus, F032 route submenu, F063 `FeatPresentation/FeatPresentationFeature.swift` paired checked/unchecked entries → one entry with `isChecked`.
+- F041 `FeatLayers/FeatLayersFeature.swift` re-registering Move to Layer titles, F028 `FeatPageText/FeatPageTextFeature.swift` "pagetext.start"/"pagetext.edit" pair → `contextTitle`.
+- F047 `FeatTextDoc/FeatTextDocFeature.swift` "textdoc.new" key command registered for the shortcut label → `MenuItemDescriptor.shortcut`; its `nib://new` deep-link workaround → `sessionParams` with a fresh id (after shell adoption).
+- F049 `FeatStudyEditor/StudySetViewController.swift` UIKeyCommands → `KeyCommandDescriptor.docKinds` (after shell adoption).
+- F020 `FeatLibraryOrganize/FeatLibraryOrganizeFeature.swift` per-folder panel ids (`organize.folder.new.<parent>`) and current folder from `ctx.nodes`, F022 `FeatPages` `MovePagesStash`, F037 `FeatComments/FeatCommentsFeature.swift` `CommentsState` target slot, F062 `{instant: true}` → `PanelContext.params` / `MenuContext.folder`.
+- F017 panel header by owner guess and window-mode width → `PanelDescriptor.providesHeader` / `PanelContext.presentation`.
+- F027 `FeatSettings/FeatSettingsFeature.swift` `keywords(_:)` table → `SettingsPageDescriptor.keywords` on each page.
+- F029 `FeatLinks/LinkEditorSheet.swift` selected range → `MenuContext.textRange`.
+
+### G17 — Selection outline
+
+```swift
+public var outline: [Point]?        // Selection; init(..., outline: [Point]? = nil)
+```
+Replaces: F011 `FeatLasso` `SelectionOutlines.bySession` → `session.selection.outline`; F012 transforms it with the items so a rotated selection keeps its outline.
+
+### G18 — Well-known ids
+
+```swift
+// CommandIDs
+public static let selectionClear = "selection.clear", textSetText = "text.setText", libraryRename = "library.rename"
+public static let clipboardCut = "clipboard.cut", itemRecolor = "item.recolor", itemDuplicate = "item.duplicate"
+public static let viewReveal = "view.reveal", viewSetReadOnly = "view.setReadOnly", panelClose = "panel.close", audioPlay = "audio.play"
+public static let windowShowLibrary = "window.showLibrary"      // NEW contracts command {folder?} (session)
+// PanelIDs
+public static let assistant = "aichat.panel", trash = "organize.trash", favourites = "organize.favourites"
+public static let templates = "templateui.manage", cloudBackup = "syncui.panel", about = "about.panel"
+public static let gallery = "pluginmanager.gallery", studyPractice = "studysession.practice", studyLearn = "studysession.learn"
+```
+Replaces: F014 `FeatClipboard/ClipboardCommands.swift` `"selection.clear"`, F028 `PageTextEditor.setTextCommand`, F047 `TextDocViewController.swift` `"library.rename"`, F058 `FeatSmartInk/EditHandwritingMode.swift` `"item.recolor"` / `"clipboard.cut"` literals → the constants; F017 `DocumentContainerViewController.swift` Back button and F018 `FeatWindows/TabStripView.swift` `showLibrary()` / `WindowCommands.swift` direct `navigator.showLibrary` → `app.perform(CommandIDs.windowShowLibrary, …)`; F017 assistant found by owner "aichat", F027 app-menu places guessed by owner, F035 gallery by owner "pluginmanager", F049 `FeatStudyEditor/CardEditorView.swift` practice/learn by owner → `PanelIDs`. Adopt: F085, F045, F070, F098, F080, F050 register their panels under these ids.
+
+### G19 — Device identity
+
+```swift
+public var deviceHex: String       // HLCClock and NibApp: 8 lowercase hex characters
+```
+Replaces: F001 `NibStore/NibStoreFeature.swift` `String(format: "%08x", app.clock.device)` → `app.deviceHex`.
+
+### G20 — NibTesting
+
+```swift
+public init(features: [NibFeature.Type] = [], fixtures: Bool = true, deviceID: UInt32 = 7, keepFeatureServices: Bool = false)   // Harness
+@discardableResult public func insert(_ items: [Item], page: PageID = Fixtures.page1, doc: DocumentID = Fixtures.docID) async throws -> [Item]
+// FakeCanvasHost: afterNextRender runs at once and records renderWaits; FakePDFService: words for word(_:page:at:)
+@MainActor public enum NibSnapshot {                  // offscreen SwiftUI snapshots (ImageRenderer)
+    public enum Variant: String, CaseIterable { case light, dark, largeText }   // largeText = AX3
+    public static func image<V: View>(_ view: V, size: CGSize, variant: Variant = .light, scale: CGFloat = 2) -> UIImage?
+    public static func images<V: View>(_ view: V, size: CGSize, scale: CGFloat = 2) -> [Variant: UIImage]
+    public static func fittingSize<V: View>(_ view: V, width: CGFloat, variant: Variant = .light) -> CGSize
+    public static func pixel(_ image: UIImage, at point: CGPoint) -> RGBA?
+}
+```
+Replaces: F001/F025 re-registering `NibStoreFeature` after Harness init → `Harness(features:, keepFeatureServices: true)`; F058 tests writing synthetic strokes into `InMemoryPersistence.pageItems` and stand-in `ink.addStrokes` → `h.insert(_:page:doc:)`; F037 `FeatComments` tests that render both panels through `UIHostingController.sizeThatFits` in every state → `NibSnapshot` (Light, Dark, AX3); Reduce Transparency and Increase Contrast stay F111 smoke scripts.
+
+### G21 — Query paging
+
+`ToolCatalog.metaTools` `nib_get` gains `cursor`; §6.1 makes `cursor` + `truncated` the paging rule for every read result over 20 KB. Replaces: nothing to remove; F003's additive `cursor` on query.get / query.tree is the sanctioned form.
+
+### G22 — PDF, backgrounds and recognition
+
+```swift
+// PageRecord.rotation pinned: turns only a PDF/image background clockwise, aspect-fitted and centred into size; items never rotate
+public func backgroundTransform(sourceSize: PageSize) -> Affine
+public static func backgroundTransform(sourceSize: PageSize, rotation: Int, pageSize: PageSize?) -> Affine
+public static let scanTextExtKey = "nib.scanText"
+// PDFService (default nil)
+func word(_ url: URL, page: Int, at point: Point) -> (text: String, rect: Rect)?
+// TextRecognition and TextRecognitionWord (decoding is now lenient: only text is required)
+public var words: [TextRecognitionWord]?
+public struct TextRecognitionWord: Codable, Equatable { public var text: String; public var bbox: Rect; public var itemIDs: [ElementID] }
+```
+Replaces: F024 `NibPDF/PDFCommands.swift` link placement, F042 `FeatReadOnly/ReadOnlyCommands.swift` `PDFPlacement`, F004 `NibRender/PDFRenderPool.swift` rotation → `PageRecord.backgroundTransform`; F042 whole-line long-press → `pdf.word(_:page:at:)` (adopt: F024 implements it in NibPDF); F055 `NibIndex/VisionRecognizer.swift` `recognizer as? VisionRecognizer` cast → `TextRecognition.words` (adopt: NibIndex's recognizer fills them); F055 `NibIndex/Indexer.swift` `IndexKeys.scanText` and F065 `FeatScan/ScanCommands.swift` `extKey` → `PageRecord.scanTextExtKey`.
+
+### G23 — Model additions
+
+```swift
+public var flipX: Bool?; public var flipY: Bool?                      // ImageItem
+public struct NibFragment: Equatable, Codable                         // "nib-fragment/1": make, expand, instantiated, mapAssets, assetRefs, union, decode, encoded
+public static func balanced(count: Int, after a: String? = nil, before b: String? = nil) -> [String]   // FractionalIndex
+public static func tapePatternRef(id: String) -> AssetRef             // PresetSwatch: "<id>.png"
+public static func tapePatternID(_ ref: AssetRef) -> String
+public static let highlighterAlpha: UInt8 = 0x80                      // RGBA
+// ToolPresets decodes leniently (patterns and selections default; swatches and widths required)
+```
+Replaces: F034 `FeatImages/ImageDrawer.swift` `Item.ext["images"]` flipX/flipY → `ImageItem.flipX/flipY` (read the ext as a fallback for existing items); F035 `FeatElements/ElementStore.swift` `ElementFragment` and F014 `FeatClipboard/Fragment.swift` `Fragment` → `NibFragment`; F051 `FeatStudyIO/StudyImporter.swift` `orderKeys` → `FractionalIndex.balanced`; F008 `FeatPresets/PresetCommands.swift` swatch pattern ids and F033 `FeatTape/TapePatterns.swift` `TapePatternRef` → `PresetSwatch.tapePatternRef(id:)` / `tapePatternID(_:)`; F009 highlighter alpha literal → `RGBA.highlighterAlpha`; F008 normalising of partial presets that failed to decode → keep the clamping, decoding now succeeds.
+
+### G24 — Geometry
+
+```swift
+public init?(array a: [Double])                  // Frame: [x, y, w, h] or [x, y, w, h, rotation]
+public var array: [Double]                        // Frame
+public var inverted: Affine?                      // Affine
+public static func quadraticControl(through start: Point, _ mid: Point, _ end: Point) -> [Point]   // ShapeItem
+// ShapeItem.points pinned: control points. .curve: 2 straight, 3 quadratic, 4 cubic, 5+ clamped B-spline.
+//   .arc: [start, control, end], control = tangent intersection for sweeps < 170°; wider sweeps / parabolas as quadratic.
+// Frame.applying fixed: non-uniform scale of a rotated frame is measured along the frame's own axes.
+```
+Replaces: F012 `FeatTransform/TransformCommands.swift` `TransformMath.frame(_:applying:)` overwrite → `Item.transformed(by:)` alone; F031 `FeatShapes/ShapeCommands.swift` frame array parsing, F009 and F030 frame building → `Frame(array:)` / `.array`; F009 and F030 through-point curves → `ShapeItem.quadraticControl(through:_:_:)`; F031 curve/arc semantics note → the pinned rule.
+
+### G25 — Rich text round trip
+
+```swift
+public extension NSAttributedString.Key { static let nibModelFont: Self; static let nibModelTraits: Self }
+// RichTextBridge.attributes writes them; textAttributes keeps a model family that is not installed here and a model
+// bold/italic the rendered family has no face for.
+```
+Replaces: F026 `FeatTextBox/TextBoxDrawer.swift` `modelFontKey` / `modelTraitsKey` ("nib.text.modelFont" / "nib.text.modelTraits") → the bridge's keys.
+
+### G26 — Export options and closure hooks
+
+```swift
+public enum ExportOptionKeys { public static let visibleLayersOnly, visibleLayers, annotations, background: String }
+public var docKinds: Set<DocumentKind>?          // ExporterDescriptor
+public var handler: (@MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?)?   // CommandHookDescriptor
+public init(id: String, owner: String, commands: [String], order: Int = 0, handler: @escaping @MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?)
+public var contextHandler: (@MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)?
+public static func guarding(id: String, owner: String, commands: [String], order: Int = 0,
+                            _ body: @escaping @MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?) -> CommandHookDescriptor
+```
+Closure hooks run before validation and authorization, for every principal and for typed `bus.run` calls. They return replacement params, return nil to let the call through, or throw to veto it. A guard (`contextHandler`) also gets a read-only `CommandContext` of the call: the principal, the session (`ctx.pageOrSession(_:)` resolves session defaults), and `ctx.app` / `ctx.content`. `ctx.mutate` throws inside a guard. Test: `testGuardHookSeesTheCallAndVetoesForEveryPrincipal`.
+Replaces: F041 `FeatLayers/LayerCommands.swift` `layer.exportOptions` hook command (extra id, lint warning) + `FeatLayersFeature.swift` hook registration → a closure hook on `export.run` writing `ExportOptionKeys.visibleLayersOnly` / `visibleLayers` (F066 reads them); F044 board item limit enforced only in its own commands → a `CommandHookDescriptor.guarding` hook on item-creating commands (`ink.addStrokes`, `shape.create`, `clipboard.paste`, …) that counts the target board's items; F051 `FeatStudyIO/StudyExporter.swift` "study.csv" throwing for other kinds → `docKinds: [.studySet]`.
+
+### G27 — Gateway and bridge
+
+```swift
+public var kind: String                                   // Principal: user, plugin, ai, bridge, sync
+public func setPresenter(_ presenter: ConfirmationPresenter?, forPrincipalKind kind: String)   // Gateway
+public func setPolicy(forPrincipalKind kind: String, _ policy: ((Principal) -> ConfirmationPolicy)?)
+public func confirmationPresenter(for principal: Principal) -> ConfirmationPresenter?
+public enum BridgeNames { enabledSetting, portSetting, networksSetting, originsSetting, tokenService, tokenAccount, statusEvent }
+public static let aiDirectToolsName = "ai.directTools"; public static let defaultAIDirectTools: [String]   // NibSettings
+```
+Replaces: F090 `NibBridge/NibBridgeFeature.swift` wrapping `gateway.presenter` (BridgeConfirmer) and chaining `gateway.policy` → `setPresenter(_:forPrincipalKind: "bridge")` / `setPolicy(forPrincipalKind: "bridge")`; F090 `BridgeCommands.swift` / `BridgeAuth.swift` literals shared with F091 → `BridgeNames`; F090 `MCPHandler.swift` `defaultDirectTools` → `NibSettings.defaultAIDirectTools`. Adopt: F085 registers its sheet for "ai" and F084 its policy.
+
+### Rejected and deferred (summary)
+
+- **NibDesign (33 lines, deferred):** NibSymbol glyphs, tokens (metrics, radii, motion), NibBadge principal kind, NibToolPalette bindings and popover API, NibPenSwatch pattern, progress bar tint, canvas-anchored droplets. The design-system passes own them.
+- **Catalogue rows (12, deferred):** extra ids already registered by F027 (settings.open), F031 (shape.tapAt), F034 (image.pick), F041 (layer.exportOptions, superseded by G26), F042 (pdf.tapAt), F043 (pencil.gesture, pencil.palette, pencil.actions), pdf.outline; the spec owner adds the rows to docs/forge-spec.json.
+- **App shell (11, deferred):** status-bar forwarding, tab model and band layout, openGate result, settings page forwarding, paste responder, editing-interaction configuration, key routing while editing text; plus shell adoption of `KeyCommandDescriptor.docKinds`/`sessionParams` and `SceneNavigator.addTab`.
+- **Other deferred (25):** later owners or design: F007 stabiliser rule, F045 covers, F054 transcripts, F055 recognition inputs, F073 shortcuts, F074 deep links, F019 library tabs, F101 spatial index and stroke preview, F004 hiding items attached to a collapsed note, per-message comment merge (F025/F108), item groups, system font designs, pen type in shapes, connector normals.
+- **Rejected (67):** by design (optional dependencies, provenance, non-undoable writes, locked codes, feature-internal seams), already in the contract, additive params the catalogue allows, platform or language limits, and observations. Recorded conventions: F025's NSFilePresenters use a background `presentedItemOperationQueue`; `tab.select` is 0-based with -1 = last tab (F018, F073 follows); `shape.recognize` returns `{shape: ShapeItem?, mergeWith?: [ref]}`; deep links `nib://open/<doc>/<page>?comment=<itemID>` route to `comment.tapAt`.
 
 ## Quick reference: a complete feature module (example, do not create)
 
@@ -243,6 +804,13 @@ public enum NibLimits {
     public static let boardItemLimit = 100_000
     public static let aiToolResultBytes = 20_000
     public static let undoDepth = 200
+    /// contracts-v2: largest file `CommandContext.inputFile` downloads (200 MB).
+    public static let maxDownloadBytes = 200 * 1_048_576
+    /// contracts-v2: how far an `ItemDrawer` may paint outside `Item.bounds` (arrowheads, nib width, connector labels,
+    /// text overflow). The renderer pads culling and tile invalidation by it.
+    public static let drawerMargin: Double = 12
+    /// contracts-v2: most points one `ink.erase` path may carry.
+    public static let maxErasePathPoints = 20_000
 }
 
 // MARK: - Identifiers
@@ -357,6 +925,9 @@ public final class HLCClock {
 
     public init(device: UInt32) { self.device = device }
 
+    /// contracts-v2: `device` as 8 lowercase hex characters (per-device file names).
+    public var deviceHex: String { String(format: "%08x", device) }
+
     public func tick() -> Rev {
         lock.lock()
         defer { lock.unlock() }
@@ -393,6 +964,24 @@ public enum FractionalIndex {
     /// A key strictly between `a` and `b` (nil = unbounded). Precondition: a < b when both are given.
     public static func between(_ a: String?, _ b: String?) -> String {
         String(mid(Array(a ?? ""), b.map { Array($0) }))
+    }
+
+    /// contracts-v2: `count` increasing keys strictly between `a` and `b` (nil = unbounded), built by bisection so they
+    /// stay short: about log62(count) + 1 characters (10,000 keys ≤ 4 characters), where `sequence` grows by one
+    /// character every few keys. For imports and batch inserts. Precondition: a < b when both are given.
+    public static func balanced(count: Int, after a: String? = nil, before b: String? = nil) -> [String] {
+        guard count > 0 else { return [] }
+        var out = [String](repeating: "", count: count)
+        func fill(_ lo: Int, _ hi: Int, _ left: String?, _ right: String?) {
+            guard lo <= hi else { return }
+            let mid = (lo + hi) / 2
+            let key = between(left, right)
+            out[mid] = key
+            fill(lo, mid - 1, left, key)
+            fill(mid + 1, hi, key, right)
+        }
+        fill(0, count - 1, a, b)
+        return out
     }
 
     /// `count` increasing keys after `a`.
@@ -458,6 +1047,9 @@ public struct RGBA: Hashable, Codable, CustomStringConvertible {
     public func withAlpha(_ alpha: Double) -> RGBA {
         RGBA(r, g, b, UInt8(max(0, min(255, (alpha * 255).rounded()))))
     }
+
+    /// contracts-v2: alpha a highlighter colour is stored with (the renderer blends it per paper, see `NibHighlighter`).
+    public static let highlighterAlpha: UInt8 = 0x80
 
     public static let black = RGBA(0x1A, 0x1A, 0x1A)
     public static let white = RGBA(0xFF, 0xFF, 0xFF)
@@ -670,12 +1262,35 @@ public struct Frame: Hashable, Codable {
     }
 
     /// Applies an affine transform (translation, uniform/non-uniform scale, rotation; shear is ignored).
+    /// contracts-v2 fix: a non-uniform scale of a ROTATED frame is measured along the frame's own axes (it used to be
+    /// measured along the page axes, which skewed rotated boxes). Similarity transforms and unrotated frames are
+    /// computed exactly as before.
     public func applying(_ t: Affine) -> Frame {
         let c = t.apply(center)
         let sx = hypot(t.a, t.b), sy = hypot(t.c, t.d)
-        let nw = w * sx, nh = h * sy
-        return Frame(x: c.x - nw / 2, y: c.y - nh / 2, w: nw, h: nh, rotation: rotation + atan2(t.b, t.a))
+        let scale = max(sx, sy, 1)
+        let similarity = abs(sx - sy) <= 1e-9 * scale && abs(t.a * t.c + t.b * t.d) <= 1e-9 * scale * scale
+        if rotation == 0 || similarity {
+            let nw = w * sx, nh = h * sy
+            return Frame(x: c.x - nw / 2, y: c.y - nh / 2, w: nw, h: nh, rotation: rotation + atan2(t.b, t.a))
+        }
+        let cs = cos(rotation), sn = sin(rotation)
+        let ux = t.a * cs + t.c * sn, uy = t.b * cs + t.d * sn
+        let vx = -t.a * sn + t.c * cs, vy = -t.b * sn + t.d * cs
+        let nw = w * hypot(ux, uy), nh = h * hypot(vx, vy)
+        let turn = atan2(cs * uy - sn * ux, cs * ux + sn * uy)
+        return Frame(x: c.x - nw / 2, y: c.y - nh / 2, w: nw, h: nh, rotation: rotation + turn)
     }
+
+    /// contracts-v2: the array form command params use: `[x, y, w, h]` or `[x, y, w, h, rotation]` (radians). nil when
+    /// the array has another length.
+    public init?(array a: [Double]) {
+        guard a.count == 4 || a.count == 5 else { return nil }
+        self.init(x: a[0], y: a[1], w: a[2], h: a[3], rotation: a.count == 5 ? a[4] : 0)
+    }
+
+    /// contracts-v2: `[x, y, w, h]`, plus the rotation as a 5th value when it is not 0.
+    public var array: [Double] { rotation == 0 ? [x, y, w, h] : [x, y, w, h, rotation] }
 }
 
 /// 2-D affine transform in CoreGraphics convention: x' = a·x + c·y + tx, y' = b·x + d·y + ty.
@@ -731,6 +1346,14 @@ public struct Affine: Hashable, Codable {
     }
 
     public var determinant: Double { a * d - b * c }
+
+    /// contracts-v2: the inverse transform; nil when it is not invertible.
+    public var inverted: Affine? {
+        let det = determinant
+        guard det != 0, det.isFinite else { return nil }
+        return Affine(a: d / det, b: -b / det, c: -c / det, d: a / det,
+                      tx: (c * ty - d * tx) / det, ty: (b * tx - a * ty) / det)
+    }
 
     public init(from decoder: Decoder) throws {
         var u = try decoder.unkeyedContainer()
@@ -1081,9 +1704,7 @@ extension Stroke: Codable {
             guard let data = Data(base64Encoded: b64) else {
                 throw DecodingError.dataCorruptedError(forKey: .ptsB64, in: c, debugDescription: "invalid base64 points")
             }
-            var floats = [Float](repeating: 0, count: data.count / MemoryLayout<Float>.size)
-            _ = floats.withUnsafeMutableBufferPointer { data.copyBytes(to: $0) }
-            points = Stroke.unpack(floats, fields: StrokePoint.fullFormat)
+            points = Stroke.unpackCompact(data)
         } else {
             let fmt = try c.decodeIfPresent(String.self, forKey: .fmt) ?? "xy"
             guard let fields = StrokePoint.formats[fmt] else {
@@ -1112,9 +1733,36 @@ extension Stroke: Codable {
         }
     }
 
+    /// contracts-v2: points from the compact package form (`ptsB64`: little-endian Float32 in `StrokePoint.fullFormat`
+    /// order), without JSON: page readers decode strokes straight from the file bytes.
+    public static func unpackCompact(_ data: Data) -> [StrokePoint] {
+        var floats = [Float](repeating: 0, count: data.count / MemoryLayout<Float>.size)
+        _ = floats.withUnsafeMutableBufferPointer { data.copyBytes(to: $0) }
+        return unpackFull(floats)
+    }
+
+    /// contracts-v2: points from a flat array in exactly the encoder's `StrokePoint.fullFormat` order (the fast path
+    /// of every "full" and compact decode: no per-field name lookups).
+    public static func unpackFull(_ v: [Float]) -> [StrokePoint] {
+        let s = StrokePoint.fullStride
+        let n = v.count / s
+        var out: [StrokePoint] = []
+        out.reserveCapacity(n)
+        v.withUnsafeBufferPointer { b in
+            for k in 0..<n {
+                let i = k * s
+                out.append(StrokePoint(x: b[i], y: b[i + 1], t: b[i + 2], force: b[i + 3], azimuth: b[i + 4],
+                                       altitude: b[i + 5], roll: b[i + 6], width: b[i + 7], height: b[i + 8],
+                                       opacity: b[i + 9]))
+            }
+        }
+        return out
+    }
+
     static func unpack(_ v: [Float], fields: [String]) -> [StrokePoint] {
         let stride = fields.count
         guard stride > 0 else { return [] }
+        if fields == StrokePoint.fullFormat { return unpackFull(v) }
         var out: [StrokePoint] = []
         out.reserveCapacity(v.count / stride)
         var i = 0
@@ -1402,6 +2050,12 @@ public struct ShapeItem: Codable, Equatable {
     public var frame: Frame
     /// Vertices / control points in page coordinates (line, polyline, polygon, arc, curve, arrow).
     /// Empty for box shapes, which are defined by `frame` alone.
+    /// contracts-v2 (pinned): points are CONTROL points, never points the curve passes through, so the shape stays inside
+    /// the points' bounds and `Item.bounds` is right.
+    /// - `.curve`: Bézier control points: 2 = straight, 3 = quadratic, 4 = cubic, 5+ = clamped uniform B-spline.
+    /// - `.arc`: [start, control, end]. For sweeps under 170° `control` is where the tangents at start and end meet
+    ///   (a conic arc, circular when |control − start| = |control − end|); wider sweeps and parabolas are sent as a
+    ///   quadratic start / control / end. Convert three through-points with `ShapeItem.quadraticControl(through:_:_:)`.
     public var points: [Point]
     public var style: ShapeItemStyle
     public var text: RichText?
@@ -1412,6 +2066,12 @@ public struct ShapeItem: Codable, Equatable {
         self.points = points
         self.style = style
         self.text = text
+    }
+
+    /// contracts-v2: the quadratic Bézier control points [start, control, end] of the curve through `start`, `mid` (at
+    /// t = 0.5) and `end`: control = 2·mid − (start + end) / 2.
+    public static func quadraticControl(through start: Point, _ mid: Point, _ end: Point) -> [Point] {
+        [start, Point(2 * mid.x - (start.x + end.x) / 2, 2 * mid.y - (start.y + end.y) / 2), end]
     }
 
     enum CodingKeys: String, CodingKey { case shape, frame, points, style, text }
@@ -1507,10 +2167,13 @@ public struct TextBoxStyle: Codable, Hashable {
     public var fullPage: Bool
     /// Default character attributes for runs that leave fields nil.
     public var defaults: TextAttributes
+    /// contracts-v2: paragraph defaults of a saved or default style (applied to new paragraphs); nil = natural / none.
+    public var align: ParagraphAlignment?
+    public var lineSpacing: Double?
 
     public init(background: RGBA? = nil, borderColor: RGBA? = nil, borderWidth: Double = 0, cornerRadius: Double = 0,
                 padding: Double = 4, shadow: Bool = false, autoGrow: Bool = true, fullPage: Bool = false,
-                defaults: TextAttributes = TextAttributes()) {
+                defaults: TextAttributes = TextAttributes(), align: ParagraphAlignment? = nil, lineSpacing: Double? = nil) {
         self.background = background
         self.borderColor = borderColor
         self.borderWidth = borderWidth
@@ -1520,10 +2183,13 @@ public struct TextBoxStyle: Codable, Hashable {
         self.autoGrow = autoGrow
         self.fullPage = fullPage
         self.defaults = defaults
+        self.align = align
+        self.lineSpacing = lineSpacing
     }
 
     enum CodingKeys: String, CodingKey {
         case background, borderColor, borderWidth, cornerRadius, padding, shadow, autoGrow, fullPage, defaults
+        case align, lineSpacing
     }
 
     public init(from decoder: Decoder) throws {
@@ -1537,6 +2203,8 @@ public struct TextBoxStyle: Codable, Hashable {
         autoGrow = try c.decodeIfPresent(Bool.self, forKey: .autoGrow) ?? true
         fullPage = try c.decodeIfPresent(Bool.self, forKey: .fullPage) ?? false
         defaults = try c.decodeIfPresent(TextAttributes.self, forKey: .defaults) ?? TextAttributes()
+        align = (try? c.decodeIfPresent(ParagraphAlignment.self, forKey: .align)) ?? nil
+        lineSpacing = (try? c.decodeIfPresent(Double.self, forKey: .lineSpacing)) ?? nil
     }
 }
 
@@ -1572,6 +2240,10 @@ public struct ImageItem: Codable, Equatable {
     /// Animated GIF: tiles show the first frame, a live view animates it while visible.
     public var animated: Bool
     public var altText: String?
+    /// contracts-v2: mirrored horizontally / vertically inside the frame (after `crop`); nil = not flipped. Every
+    /// drawer, live view and export honours them.
+    public var flipX: Bool?
+    public var flipY: Bool?
 
     public init(frame: Frame, asset: AssetRef, crop: Rect? = nil, mask: [Point]? = nil, animated: Bool = false, altText: String? = nil) {
         self.frame = frame
@@ -1582,7 +2254,7 @@ public struct ImageItem: Codable, Equatable {
         self.altText = altText
     }
 
-    enum CodingKeys: String, CodingKey { case frame, asset, crop, mask, animated, altText }
+    enum CodingKeys: String, CodingKey { case frame, asset, crop, mask, animated, altText, flipX, flipY }
 
     /// Lenient: `frame` and `asset` are required.
     public init(from decoder: Decoder) throws {
@@ -1593,6 +2265,8 @@ public struct ImageItem: Codable, Equatable {
         mask = try c.decodeIfPresent([Point].self, forKey: .mask)
         animated = try c.decodeIfPresent(Bool.self, forKey: .animated) ?? false
         altText = try c.decodeIfPresent(String.self, forKey: .altText)
+        flipX = try c.decodeIfPresent(Bool.self, forKey: .flipX)
+        flipY = try c.decodeIfPresent(Bool.self, forKey: .flipY)
     }
 }
 
@@ -1731,10 +2405,15 @@ public struct DisplayOp: Codable, Equatable {
     public var spacing: Double?
     /// Corner radius (rect) or dot radius (dots).
     public var radius: Double?
+    /// contracts-v2: `text` alignment inside `rect` (nil = natural / left).
+    public var align: ParagraphAlignment?
+    /// contracts-v2: `text` weight of the system font (ignored with `fontName`); nil = regular.
+    public var weight: DisplayFontWeight?
 
     public init(op: DisplayOpKind, rect: Rect? = nil, points: [Point]? = nil, stroke: RGBA? = nil, fill: RGBA? = nil,
                 width: Double? = nil, dash: [Double]? = nil, text: String? = nil, fontSize: Double? = nil,
-                fontName: String? = nil, asset: AssetRef? = nil, spacing: Double? = nil, radius: Double? = nil) {
+                fontName: String? = nil, asset: AssetRef? = nil, spacing: Double? = nil, radius: Double? = nil,
+                align: ParagraphAlignment? = nil, weight: DisplayFontWeight? = nil) {
         self.op = op
         self.rect = rect
         self.points = points
@@ -1748,7 +2427,14 @@ public struct DisplayOp: Codable, Equatable {
         self.asset = asset
         self.spacing = spacing
         self.radius = radius
+        self.align = align
+        self.weight = weight
     }
+}
+
+/// contracts-v2: font weights a `DisplayOp` text can use (template headings, planner labels).
+public enum DisplayFontWeight: String, Codable, CaseIterable {
+    case light, regular, medium, semibold, bold, heavy
 }
 
 /// A tiny vector format drawn by the host renderer (templates, plugin items, math graphs, AI diagrams).
@@ -2248,9 +2934,11 @@ public struct PageRecord: LWWRecord {
     public var trashedAt: Double?
     /// Fractional order key (see `DocumentContent.orderKey`).
     public var order: String
-    /// nil = infinite whiteboard board.
+    /// nil = infinite whiteboard board. The page as displayed (after `rotation`).
     public var size: PageSize?
-    /// 0, 90, 180 or 270.
+    /// 0, 90, 180 or 270, clockwise (contracts-v2, pinned): turns only a PDF or image BACKGROUND, which is then
+    /// aspect-fitted and centred into `size` (`backgroundTransform(sourceSize:)`). Items are stored in page points and
+    /// never rotated by it; rotating a page's content is a command that rewrites `size` and item geometry.
     public var rotation: Int
     public var background: Background
     public var bookmarked: Bool
@@ -2296,6 +2984,36 @@ public struct PageRecord: LWWRecord {
         title = try c.decodeIfPresent(String.self, forKey: .title)
         zoomReturnHeight = try c.decodeIfPresent(Double.self, forKey: .zoomReturnHeight)
         ext = try c.decodeIfPresent([String: JSONValue].self, forKey: .ext)
+    }
+}
+
+public extension PageRecord {
+    /// contracts-v2: `ext` key of the text recognised on a scanned page (F065 writes `[TextRecognition]`, NibIndex F055
+    /// and search read it).
+    static let scanTextExtKey = "nib.scanText"
+
+    /// contracts-v2: maps a background source page (PDF page or image, `sourceSize` in its own points, top-left origin)
+    /// into page points: turned clockwise by `rotation`, then aspect-fitted and centred into `size`. Identity when the
+    /// sizes match and rotation is 0. Boards (`size == nil`) draw the source unscaled at the origin. Renderers,
+    /// PDF link and text hit-testing, and exporters all use it.
+    func backgroundTransform(sourceSize: PageSize) -> Affine {
+        PageRecord.backgroundTransform(sourceSize: sourceSize, rotation: rotation, pageSize: size)
+    }
+
+    static func backgroundTransform(sourceSize: PageSize, rotation: Int, pageSize: PageSize?) -> Affine {
+        let w = sourceSize.width, h = sourceSize.height
+        let turn: Affine
+        switch ((rotation % 360) + 360) % 360 {
+        case 90: turn = Affine(a: 0, b: 1, c: -1, d: 0, tx: h, ty: 0)
+        case 180: turn = Affine(a: -1, b: 0, c: 0, d: -1, tx: w, ty: h)
+        case 270: turn = Affine(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: w)
+        default: turn = .identity
+        }
+        guard let page = pageSize, w > 0, h > 0 else { return turn }
+        let turned = (rotation / 90) % 2 == 0 ? PageSize(w, h) : PageSize(h, w)
+        let k = min(page.width / turned.width, page.height / turned.height)
+        let ox = (page.width - turned.width * k) / 2, oy = (page.height - turned.height * k) / 2
+        return turn.concatenating(Affine(a: k, b: 0, c: 0, d: k, tx: ox, ty: oy))
     }
 }
 
@@ -2803,6 +3521,15 @@ public struct PresetSwatch: Codable, Hashable {
         self.color = color
         self.pattern = pattern
     }
+
+    /// contracts-v2 (pinned): a library tape pattern is referenced as "<TapePatternDescriptor.id>.png"; the tape
+    /// feature (F033) resolves it through `content.tapePatterns` and copies the tile into the document on use.
+    public static func tapePatternRef(id: String) -> AssetRef { AssetRef(id + ".png") }
+
+    /// The `TapePatternDescriptor.id` a pattern ref names (a bare id without ".png" is accepted too).
+    public static func tapePatternID(_ ref: AssetRef) -> String {
+        ref.name.lowercased().hasSuffix(".png") ? String(ref.name.dropLast(4)) : ref.name
+    }
 }
 
 /// Per-tool presets: up to 12 color slots and exactly 3 thickness slots (each with its own line pattern).
@@ -2824,6 +3551,19 @@ public struct ToolPresets: Codable, Equatable {
         self.patterns = patterns ?? widths.map { _ in StrokePattern.solid }
         self.selectedSwatch = selectedSwatch
         self.selectedWidth = selectedWidth
+    }
+
+    enum CodingKeys: String, CodingKey { case swatches, widths, patterns, selectedSwatch, selectedWidth }
+
+    /// contracts-v2: lenient, so a partial preset written with `settings.set` still decodes: `swatches` and `widths` are
+    /// required; `patterns` defaults to solid for every width, the selections to 0 and 1.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        swatches = try c.decode([PresetSwatch].self, forKey: .swatches)
+        widths = try c.decode([Double].self, forKey: .widths)
+        patterns = try c.decodeIfPresent([StrokePattern].self, forKey: .patterns) ?? widths.map { _ in StrokePattern.solid }
+        selectedSwatch = try c.decodeIfPresent(Int.self, forKey: .selectedSwatch) ?? 0
+        selectedWidth = try c.decodeIfPresent(Int.self, forKey: .selectedWidth) ?? 1
     }
 
     public var color: RGBA { swatches.indices.contains(selectedSwatch) ? swatches[selectedSwatch].color : .black }
@@ -3010,6 +3750,260 @@ public enum NodeRef: Hashable, Codable, CustomStringConvertible {
 }
 ```
 
+### `NibKit/Sources/NibContracts/Model/Fragment.swift`
+
+```swift
+import Foundation
+
+/// contracts-v2: the clipboard, drag-and-drop, element and board-template format "nib-fragment/1" (UTI
+/// `app.nib.fragment`): `{"format": "nib-fragment/1", "items": [Item], "assets": {name: base64}, "bounds": [x, y, w, h]}`.
+/// Items keep their source ids, z keys and page geometry; `instantiated` re-mints ids, re-assigns z and remaps
+/// `attachedTo`, connector anchors and asset names when the fragment lands on a page. Shared by clipboard (F014),
+/// elements (F035), board templates (F044), content packs and plugins, so nobody keeps a byte-compatible copy.
+public struct NibFragment: Equatable {
+    public static let format = "nib-fragment/1"
+    public static let typeIdentifier = "app.nib.fragment"
+
+    public var items: [Item]
+    /// Asset bytes keyed by the asset name the items reference.
+    public var assets: [String: Data]
+    public var bounds: Rect
+
+    public init(items: [Item], assets: [String: Data] = [:], bounds: Rect? = nil) {
+        self.items = items
+        self.assets = assets
+        self.bounds = bounds ?? NibFragment.union(items)
+    }
+
+    // MARK: Building
+
+    /// A fragment of `items` (provenance and revisions stripped) carrying the bytes of every asset they reference.
+    public static func make(items: [Item], assetData: (AssetRef) -> Data?) -> NibFragment {
+        var assets: [String: Data] = [:]
+        var clean: [Item] = []
+        clean.reserveCapacity(items.count)
+        for item in items {
+            var n = item
+            n.rev = .zero
+            n.createdBy = nil
+            n.deleted = false
+            for ref in NibFragment.assetRefs(n) where assets[ref.name] == nil {
+                if let data = assetData(ref) { assets[ref.name] = data }
+            }
+            clean.append(n)
+        }
+        return NibFragment(items: clean, assets: assets)
+    }
+
+    /// The live items `ids` (in that order), then every item attached to them, so a container carries its contents.
+    /// Comments pinned to an item stay behind: they discuss the object, they are not part of it.
+    public static func expand(_ ids: [ElementID], in pageItems: [Item]) -> [Item] {
+        let live = pageItems.filter { !$0.deleted }
+        let byID = Dictionary(live.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var chosen = Set<ElementID>()
+        var out: [Item] = []
+        for id in ids {
+            if let item = byID[id], chosen.insert(id).inserted { out.append(item) }
+        }
+        var grew = !out.isEmpty
+        while grew {
+            grew = false
+            for item in live where item.kind != .comment && !chosen.contains(item.id) {
+                if let parent = item.attachedTo, chosen.contains(parent) {
+                    chosen.insert(item.id)
+                    out.append(item)
+                    grew = true
+                }
+            }
+        }
+        return out
+    }
+
+    // MARK: Landing on a page
+
+    /// The items ready to write: new ids (`ids` in creation order, the rest minted), z keys above `zAfter` in the
+    /// fragment's own z order, geometry moved by `translate`, references remapped (`attachedTo` and connector anchors
+    /// that point outside the fragment are dropped, keeping the connector end where it is), asset names mapped
+    /// through `assetMap`, and `layer` applied when given. Attachment loops from untrusted JSON are broken.
+    public func instantiated(translate d: Point, ids: [NibID] = [], zAfter: String?, layer: Int?,
+                             assets assetMap: [String: AssetRef] = [:]) -> [Item] {
+        var newIDs: [ElementID] = []
+        var map: [ElementID: ElementID] = [:]
+        for (i, item) in items.enumerated() {
+            let fresh = i < ids.count ? ids[i] : NibID.make()
+            newIDs.append(fresh)
+            if map[item.id] == nil { map[item.id] = fresh }
+        }
+        let order = items.indices.sorted { a, b in
+            (items[a].z, items[a].id.raw, a) < (items[b].z, items[b].id.raw, b)
+        }
+        let keys = FractionalIndex.sequence(after: zAfter, count: items.count)
+        var z = [String](repeating: "", count: items.count)
+        for (k, i) in order.enumerated() { z[i] = keys[k] }
+        let move = Affine.translation(d.x, d.y)
+
+        var out: [Item] = []
+        out.reserveCapacity(items.count)
+        for i in items.indices {
+            let source = items[i]
+            var n = d == .zero ? source : source.transformed(by: move)
+            n.id = newIDs[i]
+            n.rev = .zero
+            n.deleted = false
+            n.createdBy = nil
+            n.z = z[i]
+            n.attachedTo = source.attachedTo.flatMap { map[$0] }
+            if var c = n.connector {
+                c.from = NibFragment.remap(c.from, map)
+                c.to = NibFragment.remap(c.to, map)
+                n.connector = c
+            }
+            if var s = n.stroke {
+                InkModel.prepare(&s)                  // synthetic (AI / plugin) ink gets nib sizes; captured ink is untouched
+                n.stroke = s
+            }
+            if !assetMap.isEmpty { NibFragment.mapAssets(&n) { assetMap[$0.name] ?? $0 } }
+            n.layer = min(max(layer ?? n.layer, 0), NibLimits.layerCount - 1)
+            out.append(n)
+        }
+        var parent: [ElementID: ElementID] = [:]
+        for n in out { if let p = n.attachedTo { parent[n.id] = p } }
+        for i in out.indices {
+            var seen = Set<ElementID>()
+            var next = out[i].attachedTo
+            while let p = next, seen.insert(p).inserted {
+                if p == out[i].id {
+                    out[i].attachedTo = nil
+                    parent[out[i].id] = nil
+                    break
+                }
+                next = parent[p]
+            }
+        }
+        return out
+    }
+
+    /// A connector end anchored inside the fragment follows the copy; one anchored outside becomes a free end.
+    static func remap(_ end: ConnectorEnd, _ map: [ElementID: ElementID]) -> ConnectorEnd {
+        guard let target = end.item else { return end }
+        guard let mapped = map[target] else { return ConnectorEnd(point: end.point) }
+        var e = end
+        e.item = mapped
+        return e
+    }
+
+    // MARK: Assets
+
+    /// Rewrites every asset reference an item holds: image, tape pattern, custom display ops and inline text glyphs.
+    public static func mapAssets(_ item: inout Item, _ f: (AssetRef) -> AssetRef) {
+        if var image = item.image {
+            image.asset = f(image.asset)
+            item.image = image
+        }
+        if var stroke = item.stroke, let pattern = stroke.style.tapePattern {
+            stroke.style.tapePattern = f(pattern)
+            item.stroke = stroke
+        }
+        if var custom = item.custom {
+            for i in custom.display.ops.indices {
+                if let a = custom.display.ops[i].asset { custom.display.ops[i].asset = f(a) }
+            }
+            item.custom = custom
+        }
+        if var text = item.text {
+            mapRich(&text.text, f)
+            item.text = text
+        }
+        if var sticky = item.sticky {
+            mapRich(&sticky.text, f)
+            item.sticky = sticky
+        }
+        if var shape = item.shape, var label = shape.text {
+            mapRich(&label, f)
+            shape.text = label
+            item.shape = shape
+        }
+        if var connector = item.connector, var label = connector.label {
+            mapRich(&label, f)
+            connector.label = label
+            item.connector = connector
+        }
+    }
+
+    private static func mapRich(_ t: inout RichText, _ f: (AssetRef) -> AssetRef) {
+        for p in t.paragraphs.indices {
+            for r in t.paragraphs[p].runs.indices {
+                if let a = t.paragraphs[p].runs[r].attrs.attachment { t.paragraphs[p].runs[r].attrs.attachment = f(a) }
+            }
+        }
+    }
+
+    /// Every asset an item references (image, tape pattern, display-op images, inline glyphs), without duplicates.
+    public static func assetRefs(_ item: Item) -> [AssetRef] {
+        var out: [AssetRef] = []
+        var probe = item
+        mapAssets(&probe) { ref in
+            if !out.contains(ref) { out.append(ref) }
+            return ref
+        }
+        return out
+    }
+
+    // MARK: Helpers
+
+    /// Union of the items' bounds (`.zero` when empty).
+    public static func union(_ items: [Item]) -> Rect {
+        guard let first = items.first else { return .zero }
+        return items.dropFirst().reduce(first.bounds) { $0.union($1.bounds) }
+    }
+
+    /// Decodes fragment JSON, turning errors into `invalid_params`.
+    public static func decode(_ data: Data) throws -> NibFragment {
+        do {
+            return try JSONDecoder().decode(NibFragment.self, from: data)
+        } catch {
+            throw NibError(.invalidParams, "the Nib fragment could not be read (\(error.localizedDescription))",
+                           hint: "copy the items again, or pass nib-fragment/1 JSON")
+        }
+    }
+
+    public func encoded() -> Data? { try? JSONEncoder().encode(self) }
+}
+
+extension NibFragment: Codable {
+    enum CodingKeys: String, CodingKey { case format, items, assets, bounds }
+
+    /// Lenient: `format` may be left out (elements, board templates, AI JSON); `assets` defaults to none and
+    /// `bounds` to the union of the items. A different format version is refused.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let f = try c.decodeIfPresent(String.self, forKey: .format), f != NibFragment.format {
+            throw DecodingError.dataCorruptedError(forKey: .format, in: c,
+                                                   debugDescription: "unsupported fragment format '\(f)'; expected \(NibFragment.format)")
+        }
+        let items = try c.decodeIfPresent([Item].self, forKey: .items) ?? []
+        var assets: [String: Data] = [:]
+        for (name, b64) in try c.decodeIfPresent([String: String].self, forKey: .assets) ?? [:] {
+            guard let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters) else {
+                throw DecodingError.dataCorruptedError(forKey: .assets, in: c, debugDescription: "asset '\(name)' is not base64")
+            }
+            assets[name] = data
+        }
+        self.items = items
+        self.assets = assets
+        self.bounds = try c.decodeIfPresent(Rect.self, forKey: .bounds) ?? NibFragment.union(items)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(NibFragment.format, forKey: .format)
+        try c.encode(items, forKey: .items)
+        try c.encode(assets.mapValues { $0.base64EncodedString() }, forKey: .assets)
+        try c.encode(bounds, forKey: .bounds)
+    }
+}
+```
+
 ### `NibKit/Sources/NibContracts/Core/Errors.swift`
 
 ```swift
@@ -3113,6 +4107,17 @@ public enum Principal: Hashable, Codable, CustomStringConvertible {
     }
 
     public var isUser: Bool { self == .user }
+
+    /// contracts-v2: "user", "plugin", "ai", "bridge" or "sync" (per-kind gateway policies and presenters).
+    public var kind: String {
+        switch self {
+        case .user: return "user"
+        case .plugin: return "plugin"
+        case .ai: return "ai"
+        case .bridge: return "bridge"
+        case .sync: return "sync"
+        }
+    }
 
     /// The exposure bit a command needs for this principal to see it.
     public var exposure: Exposure {
@@ -3577,6 +4582,42 @@ public enum CommandIDs {
     // Extensibility
     public static let pluginInstall = "plugin.install"
     public static let aiAsk = "ai.ask"
+
+    // contracts-v2: more catalogue ids features call across modules (owners: ARCHITECTURE.md §6.5)
+    public static let selectionClear = "selection.clear"
+    public static let textSetText = "text.setText"
+    public static let libraryRename = "library.rename"
+    public static let clipboardCut = "clipboard.cut"
+    public static let itemRecolor = "item.recolor"
+    public static let itemDuplicate = "item.duplicate"
+    public static let viewReveal = "view.reveal"
+    public static let viewSetReadOnly = "view.setReadOnly"
+    public static let panelClose = "panel.close"
+    public static let audioPlay = "audio.play"
+    /// Contracts (always present): shows the library in the invoking window {folder?} (session).
+    public static let windowShowLibrary = "window.showLibrary"
+}
+
+/// contracts-v2: well-known panel ids, so a feature can open another feature's panel with `panel.open {id}` without
+/// guessing by owner. Owners register their panels under exactly these ids.
+public enum PanelIDs {
+    /// AI chat panel (F085).
+    public static let assistant = "aichat.panel"
+    /// Library Trash tab (F020).
+    public static let trash = "organize.trash"
+    /// Library Favourites tab (F020).
+    public static let favourites = "organize.favourites"
+    /// Manage Templates (F045).
+    public static let templates = "templateui.manage"
+    /// Cloud & Backup (F070).
+    public static let cloudBackup = "syncui.panel"
+    /// About (F098).
+    public static let about = "about.panel"
+    /// Plugin and content Gallery library tab (F080).
+    public static let gallery = "pluginmanager.gallery"
+    /// Study set Practice and Smart Learn panels (F050).
+    public static let studyPractice = "studysession.practice"
+    public static let studyLearn = "studysession.learn"
 }
 ```
 
@@ -3627,6 +4668,53 @@ public enum Mutation {
         }
     }
 
+    /// Identity of the written record (kind, document, page for items, id): the key undo rebasing works on.
+    var recordKey: RecordKey {
+        switch self {
+        case let .item(d, p, _, a): return RecordKey(kind: 0, doc: d, page: p, id: a.id)
+        case let .page(d, _, a): return RecordKey(kind: 1, doc: d, page: nil, id: a.id)
+        case let .meta(d, _, _): return RecordKey(kind: 2, doc: d, page: nil, id: d)
+        case let .block(d, _, a): return RecordKey(kind: 3, doc: d, page: nil, id: a.id)
+        case let .card(d, _, a): return RecordKey(kind: 4, doc: d, page: nil, id: a.id)
+        case let .audio(d, _, a): return RecordKey(kind: 5, doc: d, page: nil, id: a.id)
+        case let .outline(d, _, a): return RecordKey(kind: 6, doc: d, page: nil, id: a.id)
+        }
+    }
+
+    /// Revision of the written value (`after.rev`).
+    var afterRev: Rev {
+        switch self {
+        case let .item(_, _, _, a): return a.rev
+        case let .page(_, _, a): return a.rev
+        case let .meta(_, _, a): return a.rev
+        case let .block(_, _, a): return a.rev
+        case let .card(_, _, a): return a.rev
+        case let .audio(_, _, a): return a.rev
+        case let .outline(_, _, a): return a.rev
+        }
+    }
+
+    /// The same mutation with `after.rev` replaced (undo rebasing: the value is unchanged, only its revision moved).
+    func withAfterRev(_ rev: Rev) -> Mutation {
+        func stamped<T: LWWRecord>(_ r: T) -> T {
+            var x = r
+            x.rev = rev
+            return x
+        }
+        switch self {
+        case let .item(d, p, b, a): return .item(d, p, before: b, after: stamped(a))
+        case let .page(d, b, a): return .page(d, before: b, after: stamped(a))
+        case let .meta(d, b, a):
+            var m = a
+            m.rev = rev
+            return .meta(d, before: b, after: m)
+        case let .block(d, b, a): return .block(d, before: b, after: stamped(a))
+        case let .card(d, b, a): return .card(d, before: b, after: stamped(a))
+        case let .audio(d, b, a): return .audio(d, before: b, after: stamped(a))
+        case let .outline(d, b, a): return .outline(d, before: b, after: stamped(a))
+        }
+    }
+
     /// Ref of the written record and whether the write created or removed it (tombstone transitions).
     public var change: (ref: String, created: Bool, removed: Bool) {
         func classify(_ beforeDeleted: Bool?, _ afterDeleted: Bool) -> (Bool, Bool) {
@@ -3655,6 +4743,40 @@ public enum Mutation {
             let c = classify(b?.deleted, a.deleted)
             return (NodeRef.outline(d, a.id).description, c.0, c.1)
         }
+    }
+}
+
+/// Which record a mutation wrote: kind tag (0 item … 6 outline), document, page (items only) and id.
+struct RecordKey: Hashable {
+    let kind: UInt8
+    let doc: DocumentID
+    let page: PageID?
+    let id: NibID
+}
+
+/// Revisions an undo, redo or revert moved (contracts-v2). Reverting writes a record's older value with a FRESH
+/// revision; every stored mutation that still expects the record at the revision of that older value must now accept
+/// the fresh one instead, or the next undo on the same record would look like a later edit and be skipped.
+/// `map[key][old] = new` = "the value that had revision `old` now lives at revision `new`".
+struct RevRebase {
+    private(set) var map: [RecordKey: [Rev: Rev]] = [:]
+
+    var isEmpty: Bool { map.isEmpty }
+    var documents: Set<DocumentID> { Set(map.keys.map { $0.doc }) }
+
+    mutating func record(_ key: RecordKey, old: Rev, new: Rev) {
+        map[key, default: [:]][old] = new
+    }
+
+    /// The revision a record must carry now for a mutation that wrote `rev` to still be the latest write.
+    func current(_ key: RecordKey, _ rev: Rev) -> Rev {
+        map[key]?[rev] ?? rev
+    }
+
+    /// `m` with its after-revision moved when the record's value was re-stamped.
+    func apply(_ m: Mutation) -> Mutation {
+        guard let moves = map[m.recordKey], let rev = moves[m.afterRev] else { return m }
+        return m.withAfterRev(rev)
     }
 }
 
@@ -3802,6 +4924,18 @@ public protocol DocumentPersistence: AnyObject {
     func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL
     /// Records written by OTHER devices since this device last read them (folder sync). nil = nothing new.
     func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch?
+    /// contracts-v2: true when the document must not be written (saved by a newer format, unreadable files, read-only
+    /// package). Commits still apply in memory, but nothing is persisted. Default: false.
+    func isReadOnly(_ doc: DocumentID) -> Bool
+    /// contracts-v2: the highest revision of a page's items (tombstones included) as stored, WITHOUT loading the items
+    /// into memory (thumbnail and index validity checks). nil = unknown (the caller loads the page). Default: nil.
+    func contentRevision(_ doc: DocumentID, page: PageID) -> Rev?
+}
+
+@MainActor
+public extension DocumentPersistence {
+    func isReadOnly(_ doc: DocumentID) -> Bool { false }
+    func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? { nil }
 }
 
 @MainActor
@@ -3850,6 +4984,9 @@ public final class Workspace {
     public let events: EventBus
     private var heads: [DocumentID: DocumentContent] = [:]
     private var pageItems: [DocumentID: [PageID: [Item]]] = [:]
+    /// id → index into `pageItems[doc][page]`, built lazily and dropped whenever that array is re-sorted or rebuilt,
+    /// so replacing one item costs O(1) instead of a scan of the page (contracts-v2).
+    private var itemIndex: [DocumentID: [PageID: [ElementID: Int]]] = [:]
 
     public init(clock: HLCClock, persistence: DocumentPersistence, events: EventBus) {
         self.clock = clock
@@ -3874,6 +5011,7 @@ public final class Workspace {
         _ = try content(doc)
         let items = Workspace.sortedByZ(try persistence.loadItems(doc, page: page))
         pageItems[doc, default: [:]][page] = items
+        itemIndex[doc]?[page] = nil
         return items
     }
 
@@ -3905,12 +5043,37 @@ public final class Workspace {
     public var loadedDocuments: [DocumentID] { Array(heads.keys) }
     public func isLoaded(_ doc: DocumentID) -> Bool { heads[doc] != nil }
 
+    /// contracts-v2: true when the page's items are in memory (reading them costs no I/O).
+    public func isPageCached(_ doc: DocumentID, page: PageID) -> Bool { pageItems[doc]?[page] != nil }
+
+    /// contracts-v2: pages of `doc` whose items are in memory (e.g. to evict only pages you loaded yourself).
+    public func cachedPages(_ doc: DocumentID) -> Set<PageID> { Set(pageItems[doc]?.keys.map { $0 } ?? []) }
+
+    /// contracts-v2: the document head WITHOUT opening it: the loaded head when the document is open, else a fresh
+    /// read from persistence that is neither cached nor announced (`doc.opened` is not emitted). For library-wide
+    /// scans (favourite and trashed pages, catalogues). Throws `not_found`.
+    public func peekContent(_ doc: DocumentID) throws -> DocumentContent {
+        if let h = heads[doc] { return h }
+        return try persistence.loadHead(doc)
+    }
+
+    /// contracts-v2: the highest revision among a page's items (tombstones included): from memory when the page is
+    /// cached, else `persistence.contentRevision` (nil = unknown without loading the page). Thumbnail keys, caches.
+    public func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
+        if let items = pageItems[doc]?[page] { return items.map { $0.rev }.max() ?? .zero }
+        return persistence.contentRevision(doc, page: page)
+    }
+
+    /// contracts-v2: true when persistence refuses to write the document (see `DocumentPersistence.isReadOnly`).
+    public func isReadOnly(_ doc: DocumentID) -> Bool { persistence.isReadOnly(doc) }
+
     /// Flushes and drops a document from memory.
     public func close(_ doc: DocumentID) {
         guard heads[doc] != nil else { return }
         persistence.flush(doc)
         heads[doc] = nil
         pageItems[doc] = nil
+        itemIndex[doc] = nil
         events.emit(NibEventType.docClosed, doc: doc)
     }
 
@@ -3918,7 +5081,10 @@ public final class Workspace {
     public func evictPages(_ doc: DocumentID, keeping: Set<PageID>) {
         persistence.flush(doc)
         guard var cache = pageItems[doc] else { return }
-        for key in Array(cache.keys) where !keeping.contains(key) { cache[key] = nil }
+        for key in Array(cache.keys) where !keeping.contains(key) {
+            cache[key] = nil
+            itemIndex[doc]?[key] = nil
+        }
         pageItems[doc] = cache
     }
 
@@ -3928,43 +5094,147 @@ public final class Workspace {
 
     // MARK: Internal writes (DocTransaction, undo, merge)
 
+    /// Index of `id` in the cached page array (building the page's id index on first use).
+    private func position(_ id: ElementID, doc: DocumentID, page: PageID) -> Int? {
+        if let i = itemIndex[doc]?[page]?[id] { return i }
+        if itemIndex[doc]?[page] != nil { return nil }
+        guard let list = pageItems[doc]?[page] else { return nil }
+        var index: [ElementID: Int] = [:]
+        index.reserveCapacity(list.count)
+        for (i, it) in list.enumerated() where index[it.id] == nil { index[it.id] = i }
+        itemIndex[doc, default: [:]][page] = index
+        return index[id]
+    }
+
+    private func resort(_ doc: DocumentID, _ page: PageID) {
+        guard let list = pageItems[doc]?[page] else { return }
+        pageItems[doc]?[page] = Workspace.sortedByZ(list)
+        itemIndex[doc]?[page] = nil
+    }
+
     func currentItem(_ id: ElementID, doc: DocumentID, page: PageID) -> Item? {
-        (try? allItems(doc, page: page))?.first { $0.id == id }
+        guard (try? allItems(doc, page: page)) != nil, let i = position(id, doc: doc, page: page) else { return nil }
+        return pageItems[doc]?[page]?[i]
     }
 
     @discardableResult
     func writeItem(_ item: Item, doc: DocumentID, page: PageID) throws -> Item? {
-        var list = try allItems(doc, page: page)
-        var old: Item?
-        if let i = list.firstIndex(where: { $0.id == item.id }) {
-            old = list[i]
-            list[i] = item
-        } else {
-            list.append(item)
+        _ = try allItems(doc, page: page)
+        if let i = position(item.id, doc: doc, page: page), let old = pageItems[doc]?[page]?[i] {
+            pageItems[doc]?[page]?[i] = item
+            if old.z != item.z { resort(doc, page) }
+            return old
         }
-        if old?.z != item.z { list = Workspace.sortedByZ(list) }
-        pageItems[doc, default: [:]][page] = list
-        return old
+        let last = pageItems[doc]?[page]?.last
+        pageItems[doc]?[page]?.append(item)
+        if let last = last, (last.z, last.id.raw) > (item.z, item.id.raw) {
+            resort(doc, page)
+        } else if itemIndex[doc]?[page] != nil, let count = pageItems[doc]?[page]?.count {
+            itemIndex[doc]?[page]?[item.id] = count - 1
+        }
+        return nil
+    }
+
+    /// Writes several items of one page (later entries win for repeated ids); returns each write's previous value.
+    func writeItems(_ items: [Item], doc: DocumentID, page: PageID) throws -> [Item?] {
+        var list = try allItems(doc, page: page)
+        pageItems[doc]?[page] = []                      // keep `list` uniquely referenced while it is edited
+        var index: [ElementID: Int] = [:]
+        index.reserveCapacity(list.count + items.count)
+        for (i, it) in list.enumerated() where index[it.id] == nil { index[it.id] = i }
+        var olds: [Item?] = []
+        olds.reserveCapacity(items.count)
+        var needsSort = false
+        for item in items {
+            if let i = index[item.id] {
+                olds.append(list[i])
+                if list[i].z != item.z { needsSort = true }
+                list[i] = item
+            } else {
+                if let last = list.last, (last.z, last.id.raw) > (item.z, item.id.raw) { needsSort = true }
+                index[item.id] = list.count
+                list.append(item)
+                olds.append(nil)
+            }
+        }
+        if needsSort {
+            pageItems[doc, default: [:]][page] = Workspace.sortedByZ(list)
+            itemIndex[doc]?[page] = nil
+        } else {
+            pageItems[doc, default: [:]][page] = list
+            itemIndex[doc, default: [:]][page] = index
+        }
+        return olds
     }
 
     func removeItem(_ id: ElementID, doc: DocumentID, page: PageID) {
         pageItems[doc]?[page]?.removeAll { $0.id == id }
+        itemIndex[doc]?[page] = nil
     }
 
     @discardableResult
     func writeRecord<T: LWWRecord>(_ record: T, doc: DocumentID, at path: WritableKeyPath<DocumentContent, [T]>) throws -> T? {
-        var h = try content(doc)
-        var list = h[keyPath: path]
+        _ = try content(doc)
+        guard var h = heads.removeValue(forKey: doc) else { throw NibError.notFound("document \(doc)") }
         var old: T?
-        if let i = list.firstIndex(where: { $0.id == record.id }) {
-            old = list[i]
-            list[i] = record
+        if let i = h[keyPath: path].firstIndex(where: { $0.id == record.id }) {
+            old = h[keyPath: path][i]
+            h[keyPath: path][i] = record
         } else {
-            list.append(record)
+            h[keyPath: path].append(record)
+        }
+        heads[doc] = h
+        return old
+    }
+
+    /// Writes several records of one kind (later entries win for repeated ids); returns each write's previous value.
+    func writeRecords<T: LWWRecord>(_ records: [T], doc: DocumentID, at path: WritableKeyPath<DocumentContent, [T]>) throws -> [T?] {
+        _ = try content(doc)
+        guard var h = heads.removeValue(forKey: doc) else { throw NibError.notFound("document \(doc)") }
+        var list = h[keyPath: path]
+        h[keyPath: path] = []
+        var index: [NibID: Int] = [:]
+        for (i, r) in list.enumerated() where index[r.id] == nil { index[r.id] = i }
+        var olds: [T?] = []
+        olds.reserveCapacity(records.count)
+        for r in records {
+            if let i = index[r.id] {
+                olds.append(list[i])
+                list[i] = r
+            } else {
+                index[r.id] = list.count
+                list.append(r)
+                olds.append(nil)
+            }
         }
         h[keyPath: path] = list
         heads[doc] = h
-        return old
+        return olds
+    }
+
+    /// Rollback support: restores several records of one kind in one pass (`nil` value = remove the record; ids that
+    /// are not present are appended in `order`).
+    func restoreRecords<T: LWWRecord>(_ values: [NibID: T?], order: [NibID], doc: DocumentID,
+                                      at path: WritableKeyPath<DocumentContent, [T]>) {
+        guard !values.isEmpty, var h = heads.removeValue(forKey: doc) else { return }
+        let list = h[keyPath: path]
+        h[keyPath: path] = []
+        var out: [T] = []
+        out.reserveCapacity(list.count)
+        var placed = Set<NibID>()
+        for r in list {
+            guard let value = values[r.id] else {
+                out.append(r)
+                continue
+            }
+            guard let restored = value else { continue }
+            out.append(placed.insert(r.id).inserted ? restored : r)
+        }
+        for id in order where !placed.contains(id) {
+            if let value = values[id], let restored = value { out.append(restored) }
+        }
+        h[keyPath: path] = out
+        heads[doc] = h
     }
 
     func removeRecord<T: LWWRecord>(_ id: NibID, doc: DocumentID, at path: WritableKeyPath<DocumentContent, [T]>) {
@@ -4086,24 +5356,150 @@ public final class DocTransaction {
     /// Inserts or replaces an item. Empty `z` = keep the existing z, or top of page for new items.
     @discardableResult
     public func put(_ item: Item, doc: DocumentID, page: PageID) throws -> Item {
-        var it = item
-        guard it.isValid else {
-            throw NibError(.invariantViolation, "item \(it.id) must carry exactly the '\(it.kind.rawValue)' payload")
+        try putItem(item, doc: doc, page: page, inherited: nil)
+    }
+
+    /// contracts-v2: inserts or replaces `item` on `page`, keeping the provenance (`createdBy`) of the STORED record with
+    /// the same id on `sourcePage` (of `sourceDoc`, default `doc`; live or tombstoned) instead of stamping the principal.
+    /// For moves and copies of an existing record across pages or documents (`node.move`, `item.moveToPage`,
+    /// `page.moveTo`): the AI moving the user's handwriting keeps it the user's. The value is read from storage, never
+    /// from params, so it cannot be forged; throws `not_found` when no such record exists. `move(item:doc:from:to:)`
+    /// does a whole same-document move.
+    @discardableResult
+    public func put(_ item: Item, doc: DocumentID, page: PageID, keepingProvenanceFrom sourcePage: PageID,
+                    in sourceDoc: DocumentID? = nil) throws -> Item {
+        guard let source = workspace.currentItem(item.id, doc: sourceDoc ?? doc, page: sourcePage) else {
+            throw NibError.notFound("item \(item.id) on page \(sourcePage)")
         }
-        guard (0..<NibLimits.layerCount).contains(it.layer) else {
+        return try putItem(item, doc: doc, page: page, inherited: .some(source.createdBy))
+    }
+
+    /// contracts-v2: moves a live item to another page of the same document in one step: tombstones it on `source` and
+    /// writes it on `target` with the same id and its provenance kept (see `put(_:doc:page:keepingProvenanceFrom:in:)`),
+    /// optionally transformed. Empty `z` = top of the target page. `attachedTo` and connector anchors that do not
+    /// resolve to a live item on the target page are dropped (connector ends keep their points), so the transaction
+    /// still validates. `source == target` is a plain update. Returns the written item.
+    @discardableResult
+    public func move(item id: ElementID, doc: DocumentID, from source: PageID, to target: PageID,
+                     transform: Affine? = nil, z: String = "") throws -> Item {
+        let original = try workspace.item(doc, page: source, id: id)
+        var moved = transform.map { original.transformed(by: $0) } ?? original
+        if source == target {
+            if !z.isEmpty { moved.z = z }
+            return try put(moved, doc: doc, page: target)
+        }
+        guard try content(doc).page(target) != nil else { throw NibError.notFound("page \(target) in document \(doc)") }
+        try delete(item: id, doc: doc, page: source)
+        moved.z = z
+        moved.deleted = false
+        func live(_ other: ElementID?) -> Bool {
+            guard let other = other else { return false }
+            return workspace.currentItem(other, doc: doc, page: target)?.deleted == false
+        }
+        if moved.attachedTo != nil && !live(moved.attachedTo) { moved.attachedTo = nil }
+        if var c = moved.connector {
+            if c.from.item != nil && !live(c.from.item) { c.from = ConnectorEnd(point: c.from.point) }
+            if c.to.item != nil && !live(c.to.item) { c.to = ConnectorEnd(point: c.to.point) }
+            moved.connector = c
+        }
+        return try putItem(moved, doc: doc, page: target, inherited: .some(original.createdBy))
+    }
+
+    /// contracts-v2: inserts or replaces many items on one page in one pass (O(n) lookups, one sort), with the same
+    /// rules as `put(_:doc:page:)` applied to each in order (z, provenance, validation). For page-wide edits (erase,
+    /// clear, import, paste, board templates) near `NibLimits.boardItemLimit`, where per-item puts are quadratic.
+    @discardableResult
+    public func put(_ items: [Item], doc: DocumentID, page: PageID) throws -> [Item] {
+        guard !items.isEmpty else { return [] }
+        guard try content(doc).page(page) != nil else { throw NibError.notFound("page \(page) in document \(doc)") }
+        let current = try workspace.allItems(doc, page: page)
+        var byID: [ElementID: Item] = [:]
+        for it in current { byID[it.id] = it }
+        let valid = try items.map { try checked($0) }
+        // Items that get a fresh z on top: empty z, first occurrence, and not already on the page with a z. Each run of
+        // them takes balanced keys (short, see FractionalIndex.balanced) after the top at the run's start.
+        var seen = Set<ElementID>()
+        let fresh = valid.map { it -> Bool in
+            let first = seen.insert(it.id).inserted
+            return it.z.isEmpty && first && (byID[it.id]?.z ?? "").isEmpty
+        }
+        var top = current.last?.z
+        var runKeys: ArraySlice<String> = []
+        var prepared: [Item] = []
+        prepared.reserveCapacity(items.count)
+        for i in valid.indices {
+            var it = valid[i]
+            let existing = byID[it.id]
+            if it.z.isEmpty {
+                if fresh[i] {
+                    if runKeys.isEmpty {
+                        var j = i
+                        while j < fresh.count, fresh[j] { j += 1 }
+                        runKeys = FractionalIndex.balanced(count: j - i, after: top)[...]
+                    }
+                    it.z = runKeys.removeFirst()
+                } else if let z = existing?.z, !z.isEmpty {
+                    it.z = z
+                } else {
+                    it.z = FractionalIndex.between(top, nil)
+                }
+            }
+            if top.map({ it.z > $0 }) ?? true { top = it.z }
+            stampProvenance(&it, existing: existing, inherited: nil)
+            it.rev = workspace.clock.tick()
+            byID[it.id] = it
+            prepared.append(it)
+        }
+        let befores = try workspace.writeItems(prepared, doc: doc, page: page)
+        for (b, a) in zip(befores, prepared) { mutations.append(.item(doc, page, before: b, after: a)) }
+        return prepared
+    }
+
+    /// contracts-v2: tombstones many live items of one page in one pass (duplicates ignored). Throws `not_found`, and
+    /// writes nothing, when an id is not a live item of the page.
+    public func delete(items ids: [ElementID], doc: DocumentID, page: PageID) throws {
+        var byID: [ElementID: Item] = [:]
+        for it in try workspace.allItems(doc, page: page) { byID[it.id] = it }
+        var seen = Set<ElementID>()
+        var tombstones: [Item] = []
+        for id in ids where seen.insert(id).inserted {
+            guard var it = byID[id], !it.deleted else { throw NibError.notFound("item \(id) on page \(page)") }
+            it.deleted = true
+            tombstones.append(it)
+        }
+        try put(tombstones, doc: doc, page: page)
+    }
+
+    private func checked(_ item: Item) throws -> Item {
+        guard item.isValid else {
+            throw NibError(.invariantViolation, "item \(item.id) must carry exactly the '\(item.kind.rawValue)' payload")
+        }
+        guard (0..<NibLimits.layerCount).contains(item.layer) else {
             throw NibError.invalid("layer must be 0...\(NibLimits.layerCount - 1)")
         }
+        return item
+    }
+
+    /// Provenance cannot be forged: non-user principals always stamp themselves on create and never change it;
+    /// `inherited` (a stored record's `createdBy`, for moves) wins over both.
+    private func stampProvenance(_ it: inout Item, existing: Item?, inherited: String??) {
+        if let kept = inherited {
+            it.createdBy = kept
+        } else if let existing = existing {
+            if !principal.isUser { it.createdBy = existing.createdBy }
+        } else if !principal.isUser || it.createdBy == nil {
+            it.createdBy = principal.description
+        }
+    }
+
+    private func putItem(_ item: Item, doc: DocumentID, page: PageID, inherited: String??) throws -> Item {
+        var it = try checked(item)
         guard try content(doc).page(page) != nil else { throw NibError.notFound("page \(page) in document \(doc)") }
         let existing = workspace.currentItem(it.id, doc: doc, page: page)
         if it.z.isEmpty {
             if let z = existing?.z, !z.isEmpty { it.z = z } else { it.z = try topZ(doc, page: page) }
         }
-        // Provenance cannot be forged: non-user principals always stamp themselves on create and never change it.
-        if let existing = existing {
-            if !principal.isUser { it.createdBy = existing.createdBy }
-        } else if !principal.isUser || it.createdBy == nil {
-            it.createdBy = principal.description
-        }
+        stampProvenance(&it, existing: existing, inherited: inherited)
         it.rev = workspace.clock.tick()
         let before = try workspace.writeItem(it, doc: doc, page: page)
         mutations.append(.item(doc, page, before: before, after: it))
@@ -4159,6 +5555,57 @@ public final class DocTransaction {
         return try putRecord(c, doc: doc, at: \.cards) { .card(doc, before: $0, after: $1) }
     }
 
+    /// contracts-v2: inserts or replaces many blocks in one pass (empty `order` = appended in array order).
+    @discardableResult
+    public func put(_ blocks: [TextBlock], doc: DocumentID) throws -> [TextBlock] {
+        try putOrdered(blocks, doc: doc, at: \.blocks, last: try content(doc).liveBlocks.last?.order) {
+            .block(doc, before: $0, after: $1)
+        }
+    }
+
+    /// contracts-v2: inserts or replaces many cards in one pass (empty `order` = appended in array order), so an
+    /// importer appending thousands of cards to a set is linear, not quadratic.
+    @discardableResult
+    public func put(_ cards: [StudyCard], doc: DocumentID) throws -> [StudyCard] {
+        try putOrdered(cards, doc: doc, at: \.cards, last: try content(doc).liveCards.last?.order) {
+            .card(doc, before: $0, after: $1)
+        }
+    }
+
+    /// contracts-v2: inserts or replaces many pages in one pass (empty `order` = appended in array order). Every page is
+    /// validated first; nothing is written when one is invalid.
+    @discardableResult
+    public func put(_ pages: [PageRecord], doc: DocumentID) throws -> [PageRecord] {
+        for p in pages {
+            if let s = p.size, !(1.0...100_000.0).contains(s.width) || !(1.0...100_000.0).contains(s.height) {
+                throw NibError.invalid("page size out of range")
+            }
+            guard [0, 90, 180, 270].contains(p.rotation) else { throw NibError.invalid("rotation must be 0, 90, 180 or 270") }
+        }
+        return try putOrdered(pages, doc: doc, at: \.pages, last: try content(doc).livePages.last?.order) {
+            .page(doc, before: $0, after: $1)
+        }
+    }
+
+    /// contracts-v2: inserts or replaces many outline entries in one pass (empty `order` = appended in array order).
+    @discardableResult
+    public func put(_ entries: [OutlineEntry], doc: DocumentID) throws -> [OutlineEntry] {
+        try putOrdered(entries, doc: doc, at: \.outline, last: try content(doc).liveOutline.last?.order) {
+            .outline(doc, before: $0, after: $1)
+        }
+    }
+
+    /// contracts-v2: inserts or replaces many audio clips in one pass.
+    @discardableResult
+    public func put(_ clips: [AudioClip], doc: DocumentID) throws -> [AudioClip] {
+        guard !clips.isEmpty else { return [] }
+        var prepared = clips
+        for i in prepared.indices { prepared[i].rev = workspace.clock.tick() }
+        let befores = try workspace.writeRecords(prepared, doc: doc, at: \.audio)
+        for (b, a) in zip(befores, prepared) { mutations.append(.audio(doc, before: b, after: a)) }
+        return prepared
+    }
+
     @discardableResult
     public func put(_ clip: AudioClip, doc: DocumentID) throws -> AudioClip {
         try putRecord(clip, doc: doc, at: \.audio) { .audio(doc, before: $0, after: $1) }
@@ -4172,6 +5619,33 @@ public final class DocTransaction {
             e.order = FractionalIndex.between(last, nil)
         }
         return try putRecord(e, doc: doc, at: \.outline) { .outline(doc, before: $0, after: $1) }
+    }
+
+    private func putOrdered<T: OrderedRecord>(_ records: [T], doc: DocumentID, at path: WritableKeyPath<DocumentContent, [T]>,
+                                              last: String?, wrap: (T?, T) -> Mutation) throws -> [T] {
+        guard !records.isEmpty else { return [] }
+        var top = last
+        var runKeys: ArraySlice<String> = []
+        var prepared: [T] = []
+        prepared.reserveCapacity(records.count)
+        for i in records.indices {
+            var r = records[i]
+            if r.order.isEmpty {
+                // Each run of records without an order takes balanced keys after the top at the run's start.
+                if runKeys.isEmpty {
+                    var j = i
+                    while j < records.count, records[j].order.isEmpty { j += 1 }
+                    runKeys = FractionalIndex.balanced(count: j - i, after: top)[...]
+                }
+                r.order = runKeys.removeFirst()
+            }
+            if top.map({ r.order > $0 }) ?? true { top = r.order }
+            r.rev = workspace.clock.tick()
+            prepared.append(r)
+        }
+        let befores = try workspace.writeRecords(prepared, doc: doc, at: path)
+        for (b, a) in zip(befores, prepared) { mutations.append(wrap(b, a)) }
+        return prepared
     }
 
     private func putRecord<T: LWWRecord>(_ record: T, doc: DocumentID, at path: WritableKeyPath<DocumentContent, [T]>,
@@ -4203,39 +5677,94 @@ public final class DocTransaction {
     }
 
     /// Restores every record to its exact previous value (revisions included).
+    /// contracts-v2: consecutive record writes of one kind are restored in one pass (a failed 10,000-card import rolls
+    /// back in linear time).
     func rollback() {
-        for m in mutations.reversed() {
+        let ordered = Array(mutations.reversed())
+        var i = 0
+        while i < ordered.count {
+            let m = ordered[i]
             switch m {
             case let .item(d, p, b, a):
                 if let b = b { _ = try? workspace.writeItem(b, doc: d, page: p) } else { workspace.removeItem(a.id, doc: d, page: p) }
-            case let .page(d, b, a): restore(b, a.id, d, \.pages)
-            case let .meta(_, b, _): _ = try? workspace.writeMeta(b)
-            case let .block(d, b, a): restore(b, a.id, d, \.blocks)
-            case let .card(d, b, a): restore(b, a.id, d, \.cards)
-            case let .audio(d, b, a): restore(b, a.id, d, \.audio)
-            case let .outline(d, b, a): restore(b, a.id, d, \.outline)
+                i += 1
+            case let .meta(_, b, _):
+                _ = try? workspace.writeMeta(b)
+                i += 1
+            case let .page(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.pages) { if case let .page(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
+            case let .block(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.blocks) { if case let .block(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
+            case let .card(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.cards) { if case let .card(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
+            case let .audio(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.audio) { if case let .audio(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
+            case let .outline(d, _, _):
+                let j = runEnd(ordered, from: i)
+                restoreRun(ordered[i..<j], d, \DocumentContent.outline) { if case let .outline(_, b, a) = $0 { return (b, a) }; return nil }
+                i = j
             }
         }
         mutations.removeAll()
     }
 
-    private func restore<T: LWWRecord>(_ before: T?, _ id: NibID, _ doc: DocumentID, _ path: WritableKeyPath<DocumentContent, [T]>) {
-        if let b = before {
-            _ = try? workspace.writeRecord(b, doc: doc, at: path)
-        } else {
-            workspace.removeRecord(id, doc: doc, at: path)
+    /// End (exclusive) of the run of mutations starting at `start` that write the same record kind of the same document.
+    private func runEnd(_ muts: [Mutation], from start: Int) -> Int {
+        let first = muts[start].recordKey
+        var j = start + 1
+        while j < muts.count {
+            let k = muts[j].recordKey
+            guard k.kind == first.kind, k.doc == first.doc else { break }
+            j += 1
         }
+        return j
     }
+
+    /// Rollback of one run (newest first): each record ends at the `before` of its OLDEST write in the run.
+    private func restoreRun<T: LWWRecord>(_ run: ArraySlice<Mutation>, _ doc: DocumentID,
+                                          _ path: WritableKeyPath<DocumentContent, [T]>,
+                                          _ unwrap: (Mutation) -> (T?, T)?) {
+        var finals: [NibID: T?] = [:]
+        var order: [NibID] = []
+        for m in run {
+            guard let write = unwrap(m) else { continue }
+            if finals.updateValue(write.0, forKey: write.1.id) == nil { order.append(write.1.id) }
+        }
+        workspace.restoreRecords(finals, order: order, doc: doc, at: path)
+    }
+
+    /// Revisions this transaction's reverts re-stamped (see `RevRebase`); the bus applies them to the undo history.
+    private(set) var rebase = RevRebase()
 
     /// Undo/redo/revert: writes each mutation's `before` (or a tombstone when it was an insert) with a fresh
     /// revision — but only where the record still carries the reverted revision, so later edits by other
     /// devices or collaborators are never overwritten. Returns the number of skipped records.
+    ///
+    /// contracts-v2 fix: a record written several times in one undo group (drag then attach, debounced text commits)
+    /// is reverted all the way back. Reverting the newest write re-stamps the record, and the older write of the same
+    /// record now accepts that fresh revision (`RevRebase`), instead of looking changed-since and being skipped.
+    /// contracts-v2: consecutive record writes of one kind (a batch `put(_ cards:)`) are reverted in one pass, so
+    /// undoing a large import is linear.
     func revert(_ muts: [Mutation]) -> Int {
         var skipped = 0
-        for m in muts.reversed() {
+        let ordered = Array(muts.reversed())
+        var i = 0
+        while i < ordered.count {
+            let m = ordered[i]
+            let key = m.recordKey
+            let expected = rebase.current(key, m.afterRev)
             switch m {
             case let .item(d, p, b, a):
-                guard let cur = workspace.currentItem(a.id, doc: d, page: p), cur.rev == a.rev else {
+                i += 1
+                guard let cur = workspace.currentItem(a.id, doc: d, page: p), cur.rev == expected else {
                     skipped += 1
                     continue
                 }
@@ -4244,10 +5773,10 @@ public final class DocTransaction {
                 target.rev = workspace.clock.tick()
                 _ = try? workspace.writeItem(target, doc: d, page: p)
                 mutations.append(.item(d, p, before: cur, after: target))
-            case let .page(d, b, a):
-                if !revertRecord(b, a, d, \.pages, { .page(d, before: $0, after: $1) }) { skipped += 1 }
-            case let .meta(d, b, a):
-                guard let cur = try? workspace.content(d).meta, cur.rev == a.rev else {
+                if let b = b { rebase.record(key, old: b.rev, new: target.rev) }
+            case let .meta(d, b, _):
+                i += 1
+                guard let cur = try? workspace.content(d).meta, cur.rev == expected else {
                     skipped += 1
                     continue
                 }
@@ -4255,31 +5784,80 @@ public final class DocTransaction {
                 target.rev = workspace.clock.tick()
                 _ = try? workspace.writeMeta(target)
                 mutations.append(.meta(d, before: cur, after: target))
-            case let .block(d, b, a):
-                if !revertRecord(b, a, d, \.blocks, { .block(d, before: $0, after: $1) }) { skipped += 1 }
-            case let .card(d, b, a):
-                if !revertRecord(b, a, d, \.cards, { .card(d, before: $0, after: $1) }) { skipped += 1 }
-            case let .audio(d, b, a):
-                if !revertRecord(b, a, d, \.audio, { .audio(d, before: $0, after: $1) }) { skipped += 1 }
-            case let .outline(d, b, a):
-                if !revertRecord(b, a, d, \.outline, { .outline(d, before: $0, after: $1) }) { skipped += 1 }
+                rebase.record(key, old: b.rev, new: target.rev)
+            case let .page(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.pages, { if case let .page(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .page(d, before: $0, after: $1) })
+                i = j
+            case let .block(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.blocks, { if case let .block(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .block(d, before: $0, after: $1) })
+                i = j
+            case let .card(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.cards, { if case let .card(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .card(d, before: $0, after: $1) })
+                i = j
+            case let .audio(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.audio, { if case let .audio(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .audio(d, before: $0, after: $1) })
+                i = j
+            case let .outline(d, _, _):
+                let j = runEnd(ordered, from: i)
+                skipped += revertRun(ordered[i..<j], d, \DocumentContent.outline, { if case let .outline(_, b, a) = $0 { return (b, a) }; return nil },
+                                     { .outline(d, before: $0, after: $1) })
+                i = j
             }
         }
         return skipped
     }
 
-    private func revertRecord<T: LWWRecord>(_ before: T?, _ after: T, _ doc: DocumentID,
-                                            _ path: WritableKeyPath<DocumentContent, [T]>,
-                                            _ wrap: (T?, T) -> Mutation) -> Bool {
-        guard let cur = workspace.currentRecord(after.id, doc: doc, at: path), cur.rev == after.rev else { return false }
-        var target = before ?? after
-        if before == nil { target.deleted = true }
-        target.rev = workspace.clock.tick()
-        _ = try? workspace.writeRecord(target, doc: doc, at: path)
-        mutations.append(wrap(cur, target))
-        return true
+    /// Reverts one run (newest first) of record writes of one kind and document: current values are looked up once,
+    /// the run is checked in order exactly like single reverts (so double writes rebase), then written in one pass.
+    private func revertRun<T: LWWRecord>(_ run: ArraySlice<Mutation>, _ doc: DocumentID,
+                                         _ path: WritableKeyPath<DocumentContent, [T]>,
+                                         _ unwrap: (Mutation) -> (T?, T)?, _ wrap: (T?, T) -> Mutation) -> Int {
+        var current: [NibID: T] = [:]
+        if let list = try? workspace.content(doc)[keyPath: path] {
+            var wanted = Set<NibID>()
+            for m in run { if let write = unwrap(m) { wanted.insert(write.1.id) } }
+            for r in list where wanted.contains(r.id) && current[r.id] == nil { current[r.id] = r }
+        }
+        var skipped = 0
+        var targets: [T] = []
+        for m in run {
+            guard let write = unwrap(m) else { continue }
+            let (before, after) = write
+            let key = m.recordKey
+            guard let cur = current[after.id], cur.rev == rebase.current(key, m.afterRev) else {
+                skipped += 1
+                continue
+            }
+            var target = before ?? after
+            if before == nil { target.deleted = true }
+            target.rev = workspace.clock.tick()
+            current[after.id] = target
+            targets.append(target)
+            mutations.append(wrap(cur, target))
+            if let b = before { rebase.record(key, old: b.rev, new: target.rev) }
+        }
+        if !targets.isEmpty { _ = try? workspace.writeRecords(targets, doc: doc, at: path) }
+        return skipped
     }
 }
+
+/// Records kept in a fractional `order` key (batch puts append in array order).
+protocol OrderedRecord: LWWRecord {
+    var order: String { get set }
+}
+
+extension TextBlock: OrderedRecord {}
+extension StudyCard: OrderedRecord {}
+extension PageRecord: OrderedRecord {}
+extension OutlineEntry: OrderedRecord {}
 ```
 
 ### `NibKit/Sources/NibContracts/Core/Undo.swift`
@@ -4293,6 +5871,9 @@ public struct UndoEntry {
     public let principal: Principal
     public var mutations: [Mutation]
     public let at: Date
+    /// contracts-v2: the group's entries in OTHER documents undo and redo together with this one
+    /// (`CommandContext.linkUndoAcrossDocuments()`, e.g. a page moved between two documents).
+    public var linked: Bool = false
 
     public init(group: String, label: String, principal: Principal, mutations: [Mutation], at: Date = Date()) {
         self.group = group
@@ -4310,6 +5891,8 @@ public final class UndoHistory {
     public var limit = NibLimits.undoDepth
     private var undoStacks: [DocumentID: [UndoEntry]] = [:]
     private var redoStacks: [DocumentID: [UndoEntry]] = [:]
+    /// Groups whose entries undo across documents together (bounded: oldest dropped first).
+    private var linkedGroups: [String] = []
 
     public init() {}
 
@@ -4325,20 +5908,59 @@ public final class UndoHistory {
         redoStacks[doc] = nil
     }
 
+    /// True when `group` was linked across documents (`CommandContext.linkUndoAcrossDocuments()`).
+    public func isLinked(_ group: String) -> Bool { linkedGroups.contains(group) }
+
+    func link(_ group: String) {
+        guard !linkedGroups.contains(group) else { return }
+        linkedGroups.append(group)
+        if linkedGroups.count > 64 { linkedGroups.removeFirst(linkedGroups.count - 64) }
+        for (doc, stack) in undoStacks {
+            guard let top = stack.last, top.group == group else { continue }
+            undoStacks[doc]?[stack.count - 1].linked = true
+        }
+    }
+
     func record(_ cs: Changeset) {
+        let linked = linkedGroups.contains(cs.group)
         for doc in cs.documents {
             let muts = cs.mutations.filter { $0.document == doc }
             var stack = undoStacks[doc] ?? []
             if var top = stack.last, top.group == cs.group {
                 top.mutations.append(contentsOf: muts)
+                top.linked = top.linked || linked
                 stack[stack.count - 1] = top
             } else {
-                stack.append(UndoEntry(group: cs.group, label: cs.label, principal: cs.principal, mutations: muts))
+                var entry = UndoEntry(group: cs.group, label: cs.label, principal: cs.principal, mutations: muts)
+                entry.linked = linked
+                stack.append(entry)
                 if stack.count > limit { stack.removeFirst(stack.count - limit) }
             }
             undoStacks[doc] = stack
             redoStacks[doc] = []
         }
+    }
+
+    /// Moves stored after-revisions that an undo, redo or revert re-stamped (see `RevRebase`), in every stack.
+    func rebase(_ r: RevRebase) {
+        guard !r.isEmpty else { return }
+        for doc in r.documents {
+            if var stack = undoStacks[doc] {
+                for i in stack.indices { stack[i].mutations = stack[i].mutations.map { r.apply($0) } }
+                undoStacks[doc] = stack
+            }
+            if var stack = redoStacks[doc] {
+                for i in stack.indices { stack[i].mutations = stack[i].mutations.map { r.apply($0) } }
+                redoStacks[doc] = stack
+            }
+        }
+    }
+
+    /// Documents (other than `doc`) whose top undo (or redo) entry belongs to `group`.
+    func linkedDocuments(_ group: String, except doc: DocumentID, redo: Bool) -> [DocumentID] {
+        let stacks = redo ? redoStacks : undoStacks
+        return stacks.compactMap { d, stack in d != doc && stack.last?.group == group ? d : nil }
+            .sorted { $0.raw < $1.raw }
     }
 
     func popUndo(_ doc: DocumentID) -> UndoEntry? { undoStacks[doc]?.popLast() }
@@ -4369,12 +5991,38 @@ public enum NibEventType {
     public static let libraryChanged = "library.changed"
     public static let aiTurnFinished = "ai.turn.finished"
     public static let pluginMessage = "plugin.message"
+    /// Storage, folder sync or backup trouble or progress. Payload `SyncStatusPayload` (contracts-v2).
     public static let syncStatus = "sync.status"
     /// Laser pointer moved (F040 → presentation F063, collaboration F108). Payload {page, point: [x, y], mode:
     /// "dot" | "trail"}; a payload without `point` means the laser was lifted.
     public static let laserMoved = "laser.moved"
     /// Backup queue or last-run state changed (F068 → Cloud & Backup panel F070); query `backup.status` for details.
     public static let backupStatus = "backup.status"
+
+    // contracts-v2 (payload types in EventPayloads.swift)
+
+    /// `SessionRegistry.active` changed (a window became key). Payload {"session": id}.
+    public static let sessionActivated = "session.activated"
+    /// A session's `activeLayer` or `hiddenLayers` changed. Payload {"session": id}.
+    public static let layersChanged = "session.layers"
+    /// A tool finished one use (`EditorSession.finishToolUse`). Payload {"session": id, "tool": id}.
+    public static let toolFinished = "tool.finished"
+    /// Search indexing progress (NibIndex F055 → search UI F056). Payload `IndexProgressPayload`.
+    public static let indexProgress = "index.progress"
+    /// Audio playback position or state (F052 → Note Replay F053). Payload `AudioPlaybackPayload`.
+    public static let audioPlayback = "audio.playback"
+    /// Recording started, paused, resumed or stopped (F052). Payload `AudioRecordingPayload`.
+    public static let audioRecording = "audio.recording"
+    /// A Draw-and-Hold or Draw Shape stroke snapped to a shape (F009, F030 → Pencil Pro haptic F043). Payload
+    /// `ShapeSnappedPayload`.
+    public static let shapeSnapped = "shape.snapped"
+    /// Any feature asks for an Apple Pencil Pro haptic (ruler snaps F039, alignment guides F012); F043 plays it with
+    /// `UICanvasFeedbackGenerator`, the only module allowed to. Payload `PencilHapticPayload`.
+    public static let pencilHaptic = "pencil.haptic"
+    /// The element library changed (F035: collections, favourites, recents). Payload {"collection"?: id}.
+    public static let elementsChanged = "elements.changed"
+    /// MCP/HTTP bridge state changed (F090 → Bridge settings F091). Payload {"state": "off" | "starting" | "on" | …}.
+    public static let bridgeStatus = "bridge.status"
 }
 
 /// Events carry refs, not payloads: subscribers query for details.
@@ -4472,6 +6120,169 @@ public final class EventBus {
 }
 ```
 
+### `NibKit/Sources/NibContracts/Core/EventPayloads.swift`
+
+```swift
+import Foundation
+
+/// A typed event payload (contracts-v2). Emit with `events.emit(payload)`; read with `event.decode(P.self)`. Payloads
+/// travel as JSON (`NibEvent.payload`), so plugins, the bridge and the AI see the same fields.
+public protocol NibEventPayload: Codable {
+    /// The `NibEventType` this payload belongs to.
+    static var eventType: String { get }
+}
+
+public extension EventBus {
+    /// Emits `payload` under its `eventType`.
+    @discardableResult
+    func emit<P: NibEventPayload>(_ payload: P, principal: Principal? = nil, doc: DocumentID? = nil) -> NibEvent {
+        emit(P.eventType, principal: principal, doc: doc, payload: try? JSONValue.from(payload))
+    }
+}
+
+public extension NibEvent {
+    /// The payload as `P`, or nil when the event is of another type or its payload does not decode.
+    func decode<P: NibEventPayload>(_ type: P.Type) -> P? {
+        guard self.type == P.eventType, let p = payload else { return nil }
+        return try? p.decode(P.self)
+    }
+}
+
+/// `sync.status`: storage, folder sync (F025), backup (F068) or WebDAV (F069) state for the Cloud & Backup UI (F070).
+/// `state` is "idle" | "syncing" | "ok" | "warning" | "error"; `source` names the emitter ("store", "sync", "backup",
+/// "webdav"); `reason` is a stable code (store: "newerFormat", "futureRevision", "unreadable", "writeFailed",
+/// "walFailed"). `NibEvent.doc` carries the document when there is one.
+public struct SyncStatusPayload: NibEventPayload, Equatable {
+    public static let eventType = NibEventType.syncStatus
+    public var state: String
+    public var source: String
+    public var reason: String?
+    public var message: String?
+    /// Affected files (package-relative paths).
+    public var files: [String]?
+
+    public init(state: String, source: String, reason: String? = nil, message: String? = nil, files: [String]? = nil) {
+        self.state = state
+        self.source = source
+        self.reason = reason
+        self.message = message
+        self.files = files
+    }
+}
+
+/// `index.progress` (NibIndex F055): pages indexed so far in the current sweep.
+public struct IndexProgressPayload: NibEventPayload, Equatable {
+    public static let eventType = NibEventType.indexProgress
+    public var running: Bool
+    public var done: Int
+    public var total: Int
+    public var pending: Int
+
+    public init(running: Bool, done: Int, total: Int, pending: Int? = nil) {
+        self.running = running
+        self.done = done
+        self.total = total
+        self.pending = pending ?? max(0, total - done)
+    }
+}
+
+/// `laser.moved` (F040 → presentation F063, collaboration F108). `page` is a page ref, so the payload can be passed
+/// straight back to `laser.point`; no `point` = the laser was lifted.
+public struct LaserMovedPayload: NibEventPayload, Equatable {
+    public static let eventType = NibEventType.laserMoved
+    public var page: String
+    public var point: Point?
+    /// "dot" | "trail".
+    public var mode: String
+    public var color: RGBA?
+    /// `EditorSession.id` of the window the laser is in.
+    public var session: String?
+
+    public init(page: String, point: Point?, mode: String, color: RGBA? = nil, session: String? = nil) {
+        self.page = page
+        self.point = point
+        self.mode = mode
+        self.color = color
+        self.session = session
+    }
+}
+
+/// `audio.playback` (F052 → Note Replay F053): emitted on play, pause, seek and re-plan.
+public struct AudioPlaybackPayload: NibEventPayload, Equatable {
+    public static let eventType = NibEventType.audioPlayback
+    /// Clip ref "audio:D/A".
+    public var clip: String
+    /// Position in the clip (seconds).
+    public var t: Double
+    public var playing: Bool
+    /// Playback speed (0 while paused).
+    public var rate: Double
+    /// Wall clock of the sample (unix seconds), to extrapolate `t` between events.
+    public var at: Double
+
+    public init(clip: String, t: Double, playing: Bool, rate: Double, at: Double = Date().timeIntervalSince1970) {
+        self.clip = clip
+        self.t = t
+        self.playing = playing
+        self.rate = rate
+        self.at = at
+    }
+}
+
+/// `audio.recording` (F052).
+public struct AudioRecordingPayload: NibEventPayload, Equatable {
+    public static let eventType = NibEventType.audioRecording
+    public var clip: String
+    /// "recording" | "paused" | "stopped".
+    public var state: String
+    /// Seconds recorded so far.
+    public var duration: Double
+
+    public init(clip: String, state: String, duration: Double) {
+        self.clip = clip
+        self.state = state
+        self.duration = duration
+    }
+}
+
+/// `shape.snapped` (F009, F030): a stroke snapped to a shape while the Pencil was down.
+public struct ShapeSnappedPayload: NibEventPayload, Equatable {
+    public static let eventType = NibEventType.shapeSnapped
+    /// Page ref "page:D/P".
+    public var page: String
+    /// `ShapeKind` raw value.
+    public var shape: String
+    /// Where the snap happened (page points), for the haptic's location.
+    public var point: Point?
+    public var session: String?
+
+    public init(page: String, shape: String, point: Point? = nil, session: String? = nil) {
+        self.page = page
+        self.shape = shape
+        self.point = point
+        self.session = session
+    }
+}
+
+/// `pencil.haptic`: ask the Pencil Hardware feature (F043) for an Apple Pencil Pro haptic.
+public struct PencilHapticPayload: NibEventPayload, Equatable {
+    public static let eventType = NibEventType.pencilHaptic
+    /// "alignment" (snapped to a guide, angle or grid) | "levelChange" | "generic".
+    public var kind: String
+    /// Page ref and page point of the feedback, when known.
+    public var page: String?
+    public var point: Point?
+    public var session: String?
+
+    public init(kind: String = "alignment", page: String? = nil, point: Point? = nil, session: String? = nil) {
+        self.kind = kind
+        self.page = page
+        self.point = point
+        self.session = session
+    }
+}
+```
+
 ### `NibKit/Sources/NibContracts/Core/Bus.swift`
 
 ```swift
@@ -4525,6 +6336,26 @@ public struct CommandHookDescriptor: Registrable {
     public var command: String
     /// Principal the hook runs as (`.plugin(id)` for plugins).
     public var principal: Principal
+    /// contracts-v2: a native hook (features only) runs this closure instead of a command: it gets the command id and
+    /// params and returns replacement params, nil to let the call pass, or throws to veto it. It must not change
+    /// documents. Lets a feature hook `export.run` (layers) or item-creating commands (board limit) without
+    /// registering an extra command id. `command` is ignored when set.
+    public var handler: (@MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?)?
+    /// contracts-v2: a native guard that also sees the call: a READ-ONLY `CommandContext` with the caller's principal,
+    /// session and group (`ctx.pageOrSession(_:)` resolves session defaults, `ctx.app` / `ctx.content` reach the app;
+    /// `ctx.mutate` throws). Same contract as `handler` (replacement params, nil, or throw to veto) and preferred over it.
+    /// Runs for every principal and for typed `bus.run` calls. Build with `CommandHookDescriptor.guarding(...)`.
+    public var contextHandler: (@MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)?
+
+    /// contracts-v2: a native guard hook with the call's context (see `contextHandler`), e.g. a board item limit that
+    /// vetoes item-creating commands from any principal.
+    public static func guarding(id: String, owner: String, commands: [String], order: Int = 0,
+                                _ body: @escaping @MainActor (_ command: String, _ params: JSONValue, _ ctx: CommandContext) async throws -> JSONValue?)
+        -> CommandHookDescriptor {
+        var d = CommandHookDescriptor(id: id, owner: owner, commands: commands, command: "", order: order)
+        d.contextHandler = body
+        return d
+    }
 
     public init(id: String, owner: String, commands: [String], command: String, principal: Principal = .user, order: Int = 0) {
         self.id = id
@@ -4533,6 +6364,19 @@ public struct CommandHookDescriptor: Registrable {
         self.commands = commands
         self.command = command
         self.principal = principal
+        self.handler = nil
+    }
+
+    /// contracts-v2: a native closure hook (see `handler`).
+    public init(id: String, owner: String, commands: [String], order: Int = 0,
+                handler: @escaping @MainActor (_ command: String, _ params: JSONValue) async throws -> JSONValue?) {
+        self.id = id
+        self.order = order
+        self.owner = owner
+        self.commands = commands
+        self.command = ""
+        self.principal = .user
+        self.handler = handler
     }
 
     public func matches(_ commandID: String) -> Bool {
@@ -4591,6 +6435,64 @@ public final class CommandContext {
     /// The invoking session, else the most recently active window's session.
     public var activeSession: EditorSession? { session ?? bus.services.sessions.active }
 
+    // MARK: contracts-v2: typed access to the app
+
+    /// The app this command runs in (nil only for a `CommandBus` built outside `NibApp`). Prefer the typed accessors
+    /// below; never reach `NibApp.shared` from a command.
+    public var app: NibApp? { bus.app }
+    /// Non-UI registries: templates, drawers, importers, exporters, tape patterns, custom item types, key commands…
+    public var content: ContentRegistries { bus.content }
+    /// UI registries (toolbar, menus, panels, chrome overlays, canvas tools…); nil without an app.
+    public var ui: UIRegistries? { bus.app?.ui }
+    /// Navigator of the most recently active window (open tabs, show library, present modals); nil when headless.
+    public var navigator: SceneNavigator? { bus.app?.ui.activeNavigator }
+
+    /// True when the document must not be written: persistence refuses it (`DocumentPersistence.isReadOnly`, e.g. saved
+    /// by a newer Nib) or it is listed in the legacy `ServiceKeys.storeReadOnly` set.
+    public func isReadOnly(_ doc: DocumentID) -> Bool {
+        if workspace.isReadOnly(doc) { return true }
+        return services.get(ServiceKeys.storeReadOnly, as: NSSet.self)?.contains(doc.raw) ?? false
+    }
+
+    /// Makes this command's undo group ONE step across documents: undoing (or redoing) it in any of the documents it
+    /// changed also undoes it in the others, as long as it is still their latest step (`page.moveTo` between
+    /// documents, an AI turn that edits two notebooks).
+    public func linkUndoAcrossDocuments() {
+        bus.history.link(group)
+    }
+
+    // MARK: contracts-v2: session defaults (§6.1)
+
+    /// `ref` as a document id; when it is nil or empty, the invoking session's document (key commands, toolbar
+    /// buttons and menus run with static params). Throws `invalid_params` with a hint when neither exists.
+    public func documentOrSession(_ ref: String?, field: String = "doc") throws -> DocumentID {
+        if let r = ref, !r.isEmpty { return NodeRef.documentID(from: r) }
+        guard let doc = activeSession?.document else {
+            throw NibError.invalid("missing '\(field)' and no document is open", path: "$." + field)
+        }
+        return doc
+    }
+
+    /// `ref` as a page ("page:D/P"); when it is nil or empty, the invoking session's current page.
+    public func pageOrSession(_ ref: String?, field: String = "page") throws -> (doc: DocumentID, page: PageID) {
+        if let r = ref, !r.isEmpty {
+            guard case let .page(d, p)? = NodeRef(r) else {
+                throw NibError.invalid("'\(field)' must be a page ref like page:D/P", path: "$." + field)
+            }
+            return (d, p)
+        }
+        guard let s = activeSession, let d = s.document, let p = s.page else {
+            throw NibError.invalid("missing '\(field)' and no page is open", path: "$." + field)
+        }
+        return (d, p)
+    }
+
+    /// `refs` when given and non-empty, else the invoking session's selection refs ([] when nothing is selected).
+    public func refsOrSelection(_ refs: [String]?) -> [String] {
+        if let r = refs, !r.isEmpty { return r }
+        return activeSession?.selection.refs ?? []
+    }
+
     /// Runs synchronous writes atomically. Throwing (or an invariant failure) rolls everything back.
     /// All `mutate` calls in one command (and nested commands) share the undo group.
     /// `undoable: false` = persisted but not undoable (tape reveal, study grading, per-document view state).
@@ -4641,10 +6543,20 @@ public final class CommandContext {
     /// "tmp:<name>" (from `asset.upload`, renders, exports), "https://…" (downloaded to a temp file), and
     /// "file://…" only for the user principal or inside this app's tmp / Documents/Inbox folders — so the AI,
     /// plugins and the bridge can never read arbitrary sandbox paths (e.g. a locked document's package).
+    ///
+    /// contracts-v2 (security fix): downloads by non-user principals need `https`, the `network` scope, and — for plugins
+    /// whose manifest is known — a host listed in `network.hosts`; plain `http` is user-only. Every download is capped
+    /// at `NibLimits.maxDownloadBytes` and lands as `<tmp>/nib-downloads/<UUID>/<original file name>`, so importers can
+    /// title documents from `lastPathComponent`. `tmp:` names must be plain file names.
     public func inputFile(_ string: String) async throws -> URL {
         let fm = FileManager.default
         if string.hasPrefix("tmp:") {
-            guard let url = services.assets?.temporaryURL(AssetRef(String(string.dropFirst(4)))) else {
+            let name = String(string.dropFirst(4))
+            guard CommandContext.isPlainFileName(name) else {
+                throw NibError(.invalidParams, "invalid temporary asset name '\(name)'",
+                               hint: "pass the tmp: ref exactly as asset.upload returned it")
+            }
+            guard let url = services.assets?.temporaryURL(AssetRef(name)) else {
                 throw NibError.notFound("temporary asset \(string)")
             }
             return url
@@ -4653,14 +6565,9 @@ public final class CommandContext {
             throw NibError.invalid("not a URL: \(string)")
         }
         switch scheme {
-        case "https", "http" where principal.isUser:
-            let (tmp, response) = try await URLSession.shared.download(from: url)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                throw NibError(.unavailable, "download failed: \(url.absoluteString)")
-            }
-            let dest = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent)
-            try fm.moveItem(at: tmp, to: dest)
-            return dest
+        case "https", "http":
+            try authorizeDownload(url, scheme: scheme)
+            return try await CommandContext.download(url)
         case "file":
             if principal.isUser { return url }
             let path = url.standardizedFileURL.resolvingSymlinksInPath().path
@@ -4676,6 +6583,58 @@ public final class CommandContext {
             throw NibError.invalid("unsupported URL '\(string)'; use a tmp: ref from asset.upload or an https URL")
         }
     }
+
+    /// Who may download what (see `inputFile`).
+    func authorizeDownload(_ url: URL, scheme: String) throws {
+        if principal.isUser { return }
+        guard scheme == "https" else {
+            throw NibError(.permissionDenied, "only https URLs are accepted from \(principal)",
+                           hint: "use an https URL, or upload the bytes with asset.upload and pass the tmp: ref")
+        }
+        guard bus.gateway.grants(principal).contains(.network) else {
+            throw NibError(.permissionDenied, "downloading \(url.host ?? "a URL") needs the 'network' permission",
+                           hint: "upload the bytes with asset.upload and pass the tmp: ref")
+        }
+        if case let .plugin(id) = principal,
+           let manifest = services.get(ServiceKeys.pluginHost, as: PluginHosting.self)?.handle(id)?.manifest {
+            let host = (url.host ?? "").lowercased()
+            let hosts = (manifest.network?.hosts ?? []).map { $0.lowercased() }
+            guard hosts.contains(host) else {
+                throw NibError(.permissionDenied, "'\(host)' is not in the plugin's network.hosts",
+                               hint: "add the host to manifest network.hosts")
+            }
+        }
+    }
+
+    static func isPlainFileName(_ name: String) -> Bool {
+        !name.isEmpty && name.count <= 255 && !name.hasPrefix(".") && !name.contains("/") && !name.contains("\\")
+            && !name.contains("\0")
+    }
+
+    /// Downloads `url` (60 s timeout, `NibLimits.maxDownloadBytes` cap) into a fresh temporary folder, keeping its name.
+    static func download(_ url: URL) async throws -> URL {
+        let fm = FileManager.default
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 60
+        let (tmp, response) = try await URLSession.shared.download(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            try? fm.removeItem(at: tmp)
+            throw NibError(.unavailable, "download failed: \(url.absoluteString)")
+        }
+        let limit = Int64(NibLimits.maxDownloadBytes)
+        let size = ((try? fm.attributesOfItem(atPath: tmp.path))?[.size] as? NSNumber)?.int64Value ?? 0
+        guard response.expectedContentLength <= limit, size <= limit else {
+            try? fm.removeItem(at: tmp)
+            throw NibError(.invalidParams, "the file at \(url.absoluteString) is larger than \(limit / 1_048_576) MB")
+        }
+        let folder = fm.temporaryDirectory.appendingPathComponent("nib-downloads", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        let name = url.lastPathComponent
+        let dest = folder.appendingPathComponent(isPlainFileName(name) ? name : "download")
+        try fm.moveItem(at: tmp, to: dest)
+        return dest
+    }
 }
 
 /// Executes commands, commits transactions, drives undo/redo and merges remote changes.
@@ -4689,6 +6648,10 @@ public final class CommandBus {
     public let history: UndoHistory
     /// Before-command hooks (plugins' `contributes.commandHooks`, features). Run for every JSON and typed call.
     public let hooks = Registry<CommandHookDescriptor>()
+    /// contracts-v2: the owning app (set by `NibApp.init`; `CommandContext.app`).
+    public internal(set) weak var app: NibApp?
+    /// contracts-v2: the app's non-UI registries (`CommandContext.content`); an empty set for a bare bus.
+    public internal(set) var content = ContentRegistries()
     private var seq: UInt64 = 0
     private var observers: [UUID: (Changeset) -> Void] = [:]
 
@@ -4748,6 +6711,17 @@ public final class CommandBus {
         let group = inv.group ?? NibID.make().raw
         if !inv.skipHooks {
             for hook in hooks.all where hook.matches(d.id) {
+                if let guardBody = hook.contextHandler {
+                    let hookContext = CommandContext(bus: self, principal: inv.principal, group: group, depth: inv.depth,
+                                                     dryRun: inv.dryRun, session: inv.session, commandID: d.id,
+                                                     title: d.title, readOnly: true, inheritedPolicy: inv.inheritedPolicy)
+                    if let replaced = try await guardBody(d.id, params, hookContext), replaced != .null { params = replaced }
+                    continue
+                }
+                if let handler = hook.handler {
+                    if let replaced = try await handler(d.id, params), replaced != .null { params = replaced }
+                    continue
+                }
                 let r = try await execute(Invocation(command: hook.command, params: ["command": .string(d.id), "params": params],
                                                      principal: hook.principal, session: inv.session, group: group,
                                                      dryRun: inv.dryRun, depth: inv.depth + 1, readOnly: true, skipHooks: true))
@@ -4809,12 +6783,26 @@ public final class CommandBus {
 
     // MARK: Undo / redo / selective revert
 
+    /// Undoes the latest step of `doc` (and, for a group linked across documents, the same group's latest step in
+    /// every other document where it is still the latest). Returns false when there is nothing to undo.
     @discardableResult
     public func undo(_ doc: DocumentID) -> Bool {
         guard let entry = history.popUndo(doc) else { return false }
+        var entries = [(doc, entry)]
+        if entry.linked {
+            for other in history.linkedDocuments(entry.group, except: doc, redo: false) {
+                if let e = history.popUndo(other) { entries.append((other, e)) }
+            }
+        }
         let tx = DocTransaction(workspace: workspace, principal: .user, group: "undo:" + entry.group)
-        _ = tx.revert(entry.mutations)
-        history.pushRedo(UndoEntry(group: entry.group, label: entry.label, principal: entry.principal, mutations: tx.mutations), doc: doc)
+        for (_, e) in entries { _ = tx.revert(e.mutations) }
+        history.rebase(tx.rebase)
+        for (d, e) in entries {
+            var r = UndoEntry(group: e.group, label: e.label, principal: e.principal,
+                              mutations: tx.mutations.filter { $0.document == d })
+            r.linked = e.linked
+            history.pushRedo(r, doc: d)
+        }
         finishUnrecorded(tx, label: "Undo " + entry.label, command: CommandIDs.undo)
         return true
     }
@@ -4822,9 +6810,21 @@ public final class CommandBus {
     @discardableResult
     public func redo(_ doc: DocumentID) -> Bool {
         guard let entry = history.popRedo(doc) else { return false }
+        var entries = [(doc, entry)]
+        if entry.linked {
+            for other in history.linkedDocuments(entry.group, except: doc, redo: true) {
+                if let e = history.popRedo(other) { entries.append((other, e)) }
+            }
+        }
         let tx = DocTransaction(workspace: workspace, principal: .user, group: "redo:" + entry.group)
-        _ = tx.revert(entry.mutations)
-        history.pushUndo(UndoEntry(group: entry.group, label: entry.label, principal: entry.principal, mutations: tx.mutations), doc: doc)
+        for (_, e) in entries { _ = tx.revert(e.mutations) }
+        history.rebase(tx.rebase)
+        for (d, e) in entries {
+            var r = UndoEntry(group: e.group, label: e.label, principal: e.principal,
+                              mutations: tx.mutations.filter { $0.document == d })
+            r.linked = e.linked
+            history.pushUndo(r, doc: d)
+        }
         finishUnrecorded(tx, label: "Redo " + entry.label, command: CommandIDs.redo)
         return true
     }
@@ -4835,6 +6835,7 @@ public final class CommandBus {
         guard let entry = history.removeEntry(group: group, doc: doc) else { return nil }
         let tx = DocTransaction(workspace: workspace, principal: principal, group: NibID.make().raw)
         let skipped = tx.revert(entry.mutations)
+        history.rebase(tx.rebase)
         let n = tx.mutations.count
         if n > 0 { commit(tx, label: "Revert " + entry.label, command: CommandIDs.revertGroup, record: true) }
         return (n, skipped)
@@ -4930,11 +6931,33 @@ public final class Gateway {
     public var isLocked: (DocumentID) -> Bool
     public weak var presenter: ConfirmationPresenter?
     private var allowedGroups = Set<String>()
+    private var kindPresenters: [String: WeakPresenter] = [:]
+    private var kindPolicies: [String: (Principal) -> ConfirmationPolicy] = [:]
 
     public init() {
         grants = { p in Gateway.defaultGrants(p) }
         policy = { _ in .destructive }
         isLocked = { _ in false }
+        // Default policy: the principal kind's policy (`setPolicy`), else destructive.
+        policy = { [weak self] p in self?.kindPolicies[p.kind]?(p) ?? .destructive }
+    }
+
+    /// contracts-v2: the confirmation UI for one principal kind ("ai" → the AI chat's sheet F085, "bridge" → the bridge's
+    /// deadline-bound presenter F090), consulted before `presenter`. Kept weakly, like `presenter`. nil removes it.
+    /// No feature needs to wrap or replace another feature's presenter any more.
+    public func setPresenter(_ presenter: ConfirmationPresenter?, forPrincipalKind kind: String) {
+        kindPresenters[kind] = presenter.map { WeakPresenter($0) }
+    }
+
+    /// contracts-v2: the confirmation policy for one principal kind (read from that kind's security setting). The
+    /// default `policy` closure consults these; a feature that replaced `policy` wholesale bypasses them.
+    public func setPolicy(forPrincipalKind kind: String, _ policy: ((Principal) -> ConfirmationPolicy)?) {
+        kindPolicies[kind] = policy
+    }
+
+    /// The presenter that confirms for `principal`: its kind's presenter, else `presenter`.
+    public func confirmationPresenter(for principal: Principal) -> ConfirmationPresenter? {
+        kindPresenters[principal.kind]?.value ?? presenter
     }
 
     public nonisolated static func defaultGrants(_ p: Principal) -> Set<Scope> {
@@ -4965,7 +6988,7 @@ public final class Gateway {
         }
         guard needsConfirmation(d, principal: principal, inheritedPolicy: inheritedPolicy),
               !allowedGroups.contains(group) else { return }
-        guard let presenter = presenter else {
+        guard let presenter = confirmationPresenter(for: principal) else {
             throw NibError(.userDenied, "'\(d.title)' needs confirmation but no confirmation UI is available")
         }
         switch await presenter.confirm(ConfirmationRequest(principal: principal, command: d, params: params)) {
@@ -5009,6 +7032,12 @@ public final class Gateway {
         return out
     }
 }
+
+/// Weak box for per-kind presenters.
+private final class WeakPresenter {
+    weak var value: ConfirmationPresenter?
+    init(_ value: ConfirmationPresenter) { self.value = value }
+}
 ```
 
 ### `NibKit/Sources/NibContracts/Core/Session.swift`
@@ -5016,6 +7045,7 @@ public final class Gateway {
 ```swift
 import Foundation
 import Combine
+import CoreGraphics
 
 public struct Selection: Equatable {
     public var doc: DocumentID?
@@ -5023,12 +7053,17 @@ public struct Selection: Equatable {
     public var items: [ElementID]
     /// Page-coordinate bounds of the selection (lasso polygon bounds or item union).
     public var bounds: Rect?
+    /// contracts-v2: the lasso outline (page coordinates) when the selection came from a lasso; the transform feature
+    /// (F012) moves, scales and rotates it with the items, so everyone draws the same outline. nil = bounds only.
+    public var outline: [Point]?
 
-    public init(doc: DocumentID? = nil, page: PageID? = nil, items: [ElementID] = [], bounds: Rect? = nil) {
+    public init(doc: DocumentID? = nil, page: PageID? = nil, items: [ElementID] = [], bounds: Rect? = nil,
+                outline: [Point]? = nil) {
         self.doc = doc
         self.page = page
         self.items = items
         self.bounds = bounds
+        self.outline = outline
     }
 
     public var isEmpty: Bool { items.isEmpty }
@@ -5096,24 +7131,131 @@ public final class EditorSession: ObservableObject {
     /// Visible part of the current page in page coordinates.
     @Published public var visibleRect: Rect? = nil
     @Published public var readOnly = false
-    @Published public var activeLayer = 0
+    @Published public var activeLayer = 0 {
+        didSet { if oldValue != activeLayer { notify(NibEventType.layersChanged) } }
+    }
     /// Per-device layer visibility.
-    @Published public var hiddenLayers: Set<Int> = []
+    @Published public var hiddenLayers: Set<Int> = [] {
+        didSet { if oldValue != hiddenLayers { notify(NibEventType.layersChanged) } }
+    }
     /// Note Replay in progress (the canvas passes it to the renderer).
     @Published public var replay: ReplayState? = nil
     /// True while a text view (text box, block, card field) is first responder; single-key shortcuts are off.
     public var isEditingText = false
+    /// contracts-v2: what is being edited while `isEditingText` (item, block or card ref) and the selected range
+    /// [start, length] in plain-text units (UTF-16, list markers excluded). Set by the editing feature, cleared when
+    /// editing ends; read by link (F029), spellcheck and the AI's context.
+    public var editingTextRef: String?
+    public var editingTextRange: [Int]?
+    /// contracts-v2: this window's floating host (see `FloatingHosting`), set by the container's owner (the document
+    /// chrome F017, the library F019); nil until the window's container is on screen, and in headless runs.
+    public weak var floatingHost: FloatingHosting?
     /// Transient per-tool options (current preset slot, eraser size…), keyed by tool id.
     public var toolOptions: [String: JSONValue] = [:]
     /// The editor view controller showing `document` (set by the editor).
     public weak var editor: DocumentEditing?
 
+    /// contracts-v2: Pencil-down state of this window. The canvas (F006/F101) writes it; the document chrome mirrors it
+    /// into its droplet container (recede while writing, DESIGN.md §10.8); attachments, HUDs and palettes observe it.
+    /// Deliberately NOT `@Published`: a Pencil down must never re-evaluate SwiftUI bodies that observe the session.
+    public let inking: InkingSignal
+    /// contracts-v2: ids of the panels open in this window (sidebar tab, floating panels, sheets), kept by the chrome
+    /// host (F017) so `query.context` and other features can report and toggle them.
+    @Published public var openPanels: Set<String> = []
+    /// contracts-v2: the tool to return to after a temporary tool (quick lasso, Circle to Lasso, Edit Handwriting,
+    /// eyedropper). Set by `selectTemporarily`; cleared by `endTemporaryTool` and by any regular tool switch.
+    @Published public private(set) var temporaryReturnTool: String? = nil
+
     public init(id: NibID = NibID.make()) {
         self.id = id
+        self.inking = InkingSignal()
+    }
+
+    /// contracts-v2: switches to `tool` until `endTemporaryTool()` (or `finishToolUse`), remembering the current tool.
+    /// Nested temporary switches keep the first return tool.
+    public func selectTemporarily(_ tool: String) {
+        let back = temporaryReturnTool ?? self.tool
+        self.tool = tool
+        temporaryReturnTool = back
+    }
+
+    /// contracts-v2: returns from a temporary tool; no-op when none is active.
+    public func endTemporaryTool() {
+        guard let back = temporaryReturnTool else { return }
+        temporaryReturnTool = nil
+        tool = back
+    }
+
+    /// contracts-v2: a regular tool switch (`tool.select`): drops any pending temporary return.
+    public func selectTool(_ tool: String) {
+        temporaryReturnTool = nil
+        self.tool = tool
+    }
+
+    /// contracts-v2: a tool finished one use (an insert, a lasso, an erase). Returns to the temporary return tool when one
+    /// is set, else to `previousTool` when the tool is not `sticky`; emits `tool.finished` either way. Canvas tools call
+    /// it through `CanvasHost.finishToolUse(_:)`.
+    public func finishToolUse(sticky: Bool) {
+        let finished = tool
+        if temporaryReturnTool != nil {
+            endTemporaryTool()
+        } else if !sticky, let back = previousTool, back != tool {
+            tool = back
+        }
+        events?.emit(NibEventType.toolFinished, doc: document,
+                     payload: ["session": .string(id.raw), "tool": .string(finished)])
     }
 
     private func notify(_ kind: String) {
         events?.emit(kind, doc: document, payload: ["session": .string(id.raw)])
+    }
+}
+
+/// contracts-v2: whether the Pencil (or a drawing finger) is down in one window, and the stroke's bounds. Written by the
+/// canvas, read by chrome, HUDs and attachments that recede or pause while the user writes. Main actor only.
+@MainActor
+public final class InkingSignal {
+    public private(set) var isInking = false
+    /// Bounds of the current stroke in WINDOW coordinates (nil between strokes).
+    public private(set) var strokeBounds: CGRect?
+    private var observers: [UUID: @MainActor (InkingSignal) -> Void] = [:]
+
+    public init() {}
+
+    /// The stroke started (canvas only).
+    public func begin(strokeBounds: CGRect? = nil) {
+        isInking = true
+        self.strokeBounds = strokeBounds
+        notify()
+    }
+
+    /// The stroke grew (canvas only). Cheap: observers are called synchronously.
+    public func update(strokeBounds: CGRect) {
+        guard isInking else { return }
+        self.strokeBounds = strokeBounds
+        notify()
+    }
+
+    /// The stroke ended or was cancelled (canvas only).
+    public func end() {
+        guard isInking || strokeBounds != nil else { return }
+        isInking = false
+        strokeBounds = nil
+        notify()
+    }
+
+    /// Calls `handler` on every change until the subscription is cancelled.
+    @discardableResult
+    public func observe(_ handler: @escaping @MainActor (InkingSignal) -> Void) -> EventSubscription {
+        let id = UUID()
+        observers[id] = handler
+        return EventSubscription { [weak self] in
+            Task { @MainActor in self?.observers[id] = nil }
+        }
+    }
+
+    private func notify() {
+        for o in Array(observers.values) { o(self) }
     }
 }
 
@@ -5129,15 +7271,24 @@ public final class SessionRegistry {
     public func add(_ s: EditorSession) {
         if !sessions.contains(where: { $0 === s }) { sessions.append(s) }
         s.events = events
-        active = s
+        setActive(s)
     }
 
     public func remove(_ s: EditorSession) {
         sessions.removeAll { $0 === s }
-        if active === s { active = sessions.last }
+        if active === s { setActive(sessions.last) }
     }
 
-    public func activate(_ s: EditorSession) { active = s }
+    /// Makes `s` the active session; emits `session.activated` when it changes (contracts-v2).
+    public func activate(_ s: EditorSession) { setActive(s) }
+
+    private func setActive(_ s: EditorSession?) {
+        let changed = active !== s
+        active = s
+        if changed, let s = s {
+            events?.emit(NibEventType.sessionActivated, doc: s.document, payload: ["session": .string(s.id.raw)])
+        }
+    }
 
     public func session(_ id: NibID) -> EditorSession? { sessions.first { $0.id == id } }
 }
@@ -5182,6 +7333,8 @@ public protocol LibraryService: AnyObject {
     /// Copies an external `.nibnote` package (or a legacy `.nib` package, or a folder of them) into the library.
     func importPackage(at url: URL, into folder: FolderID?) throws -> DocumentID
     /// Rescans the disk (after sync, import, repair).
+    /// Implementations emit `library.changed` (`NibEventType.libraryChanged`) after EVERY catalog change: create,
+    /// rename, move, style, trash, restore, delete, import and refresh (title-based indexes and lists rely on it).
     func refresh()
     /// Switches the library to another folder (security-scoped URL chosen by the user).
     func setRoot(_ url: URL) throws
@@ -5248,6 +7401,8 @@ public struct RenderRequest {
     /// Draw numbered boxes over items (Set-of-Mark prompting for vision models).
     public var marks: Bool
     public var replay: ReplayState?
+    /// contracts-v2: what the render is for; handed to drawers as `DrawContext.purpose`.
+    public var purpose: DrawPurpose = .screen
 
     public init(doc: DocumentID, page: PageID, region: Rect? = nil, scale: Double = 2, layers: Set<Int>? = nil,
                 background: Bool = true, annotations: Bool = true, hidden: Set<ElementID> = [], marks: Bool = false,
@@ -5303,6 +7458,8 @@ public struct TextRecognition: Codable, Equatable {
     /// "ink", "typed", "pdf", "scan", "image", "transcript".
     public var source: String
     public var confidence: Double
+    /// contracts-v2: word boxes when the recognizer has them (Vision); nil = line only. `recognize.items` needs them.
+    public var words: [TextRecognitionWord]?
 
     public init(text: String, alternatives: [String] = [], bbox: Rect, itemIDs: [ElementID] = [], source: String, confidence: Double = 1) {
         self.text = text
@@ -5312,6 +7469,43 @@ public struct TextRecognition: Codable, Equatable {
         self.source = source
         self.confidence = confidence
     }
+
+    /// contracts-v2: lenient (only `text` is required), so feature JSON such as a page's "nib.scanText" ext decodes.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        text = try c.decode(String.self, forKey: .text)
+        alternatives = try c.decodeIfPresent([String].self, forKey: .alternatives) ?? []
+        bbox = try c.decodeIfPresent(Rect.self, forKey: .bbox) ?? .zero
+        itemIDs = try c.decodeIfPresent([ElementID].self, forKey: .itemIDs) ?? []
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "unknown"
+        confidence = try c.decodeIfPresent(Double.self, forKey: .confidence) ?? 1
+        words = try c.decodeIfPresent([TextRecognitionWord].self, forKey: .words)
+    }
+
+    enum CodingKeys: String, CodingKey { case text, alternatives, bbox, itemIDs, source, confidence, words }
+}
+
+/// contracts-v2: one recognised word with its box (page coordinates) and the items it came from.
+public struct TextRecognitionWord: Codable, Equatable {
+    public var text: String
+    public var bbox: Rect
+    public var itemIDs: [ElementID]
+
+    public init(text: String, bbox: Rect, itemIDs: [ElementID] = []) {
+        self.text = text
+        self.bbox = bbox
+        self.itemIDs = itemIDs
+    }
+
+    /// Lenient: `itemIDs` may be omitted (image and PDF words have none).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        text = try c.decode(String.self, forKey: .text)
+        bbox = try c.decodeIfPresent(Rect.self, forKey: .bbox) ?? .zero
+        itemIDs = try c.decodeIfPresent([ElementID].self, forKey: .itemIDs) ?? []
+    }
+
+    enum CodingKeys: String, CodingKey { case text, bbox, itemIDs }
 }
 
 public protocol TextRecognizer: AnyObject {
@@ -5356,6 +7550,13 @@ public protocol PDFService: AnyObject {
     func outline(_ url: URL) -> [PDFOutlineNode]
     /// Text and line rects of a drag selection between two page points.
     func selection(_ url: URL, page: Int, from: Point, to: Point) -> (text: String, rects: [Rect])
+    /// contracts-v2: the word under a page point (long-press selection in read-only mode); nil = none or unsupported.
+    /// Default: nil.
+    func word(_ url: URL, page: Int, at point: Point) -> (text: String, rect: Rect)?
+}
+
+public extension PDFService {
+    func word(_ url: URL, page: Int, at point: Point) -> (text: String, rect: Rect)? { nil }
 }
 
 // MARK: - Password lock (implemented by the Password Lock feature)
@@ -5551,7 +7752,8 @@ public enum ToolCatalog {
     public static let metaTools: [ToolSpec] = [
         spec("nib_context", "Where the user is: document, page, visible rect, tool, selection refs/bbox, tabs.", .empty),
         spec("nib_get", "Any node (library, folder, doc, page, item, block, card) as JSON; stroke points only with points=true.",
-             .obj(["ref": .ref, "depth": .int(min: 0, max: 4), "points": .bool(), "fields": .arr(.str())], required: ["ref"])),
+             .obj(["ref": .ref, "depth": .int(min: 0, max: 4), "points": .bool(), "fields": .arr(.str()),
+                   "cursor": .str("from the previous result when it was truncated")], required: ["ref"])),
         spec("nib_find", "Find items by kind, layer, area (bbox), field equality (where) or text inside a page or document.",
              .obj(["in": .ref, "kinds": .arr(.str()), "layer": .int(min: 0, max: 4), "bbox": .rect, "where": .anything(),
                    "text": .str(), "limit": .int(min: 1, max: 500), "cursor": .str()], required: ["in"])),
@@ -5632,6 +7834,27 @@ public enum ServiceKeys {
     /// `CollabTransport` implementations.
     public static let collabMultipeer = "collab.transport.multipeer"
     public static let collabRelay = "collab.transport.relay"
+    /// contracts-v2: NSSet of `DocumentID.raw` the store refuses to write (F001's interim publication). Prefer
+    /// `CommandContext.isReadOnly(_:)` / `NibApp.isReadOnly(_:)`, which also ask `DocumentPersistence.isReadOnly`.
+    public static let storeReadOnly = "store.readOnly"
+}
+
+/// contracts-v2: names shared by the MCP/HTTP bridge (F090) and its settings page (F091), which cannot import each other.
+/// Every setting is `security.*` (user only) and device-local; F091 reads and writes them through settings.get/set.
+public enum BridgeNames {
+    /// Bool, default false. Change it with `bridge.setEnabled {enabled, rotateToken?}`.
+    public static let enabledSetting = "security.bridge.enabled"
+    /// Int, default 7331.
+    public static let portSetting = "security.bridge.port"
+    /// [CIDR string]; unset = the bridge's default networks (see `settings.describe`).
+    public static let networksSetting = "security.bridge.networks"
+    /// [origin string], default [].
+    public static let originsSetting = "security.bridge.origins"
+    /// Keychain location of the bridge token (generic password, this device only).
+    public static let tokenService = "app.nib.bridge"
+    public static let tokenAccount = "token"
+    /// Event emitted when the bridge state changes (`NibEventType.bridgeStatus`).
+    public static let statusEvent = NibEventType.bridgeStatus
 }
 
 // MARK: - Plugin manifest (see docs/PLUGIN_API.md)
@@ -6306,7 +8529,9 @@ public enum NibSettings {
     public static let stylusMode = SettingKey("stylus.mode", default: StylusMode.pencilOnly)
     /// 0 = low (recommended), 1 = medium, 2 = high.
     public static let palmSensitivity = SettingKey("stylus.palmSensitivity", default: 0)
-    /// 0…7: handedness × wrist angle illustration index.
+    /// 0…7: handedness × wrist angle = hand × 4 + wrist (contracts-v2, pinned). Hand: 0 right, 1 left. Wrist: 0 below
+    /// the line, 1 angled, 2 level, 3 hooked. 0 (right hand, wrist below) is the default. Palm rejection (F101) and
+    /// Settings (F027) share this layout.
     public static let writingPosture = SettingKey("stylus.posture", default: 0)
     public static let reduceLatency = SettingKey("pen.reduceLatency", default: true, synced: true)
     public static let defaultLanguage = SettingKey("language.default", default: "en-US", synced: true)
@@ -6328,6 +8553,37 @@ public enum NibSettings {
     public static let defaultCover = SettingKey("templates.defaultCover", default: TemplateRef("cover.solid"), synced: true)
     public static let defaultPageSize = SettingKey("templates.defaultSize", default: PageSize.a4, synced: true)
     public static let coverByDefault = SettingKey("templates.coverByDefault", default: true, synced: true)
+
+    // contracts-v2
+
+    /// Settings › Appearance › Liquid: "full" | "calm" | "off" (NibDesign's `NibLiquidMode` raw values). Every droplet
+    /// container reads it (the document chrome, the toolbar palette, the library). Device-local.
+    public static let liquidMode = SettingKey("appearance.liquid", default: "full")
+    /// Style of new text boxes (F026 "Save as Default"); paste-and-match-style (F014) and page text (F028) use it.
+    public static let defaultTextStyle = SettingKey("text.defaultStyle", default: TextBoxStyle(), synced: true)
+    /// Draw and Hold: a held pen or pencil stroke snaps to a shape (F007 reads it, F030 owns the behaviour).
+    public static let drawAndHold = SettingKey("shapes.drawAndHold", default: true, synced: true)
+    /// Name of the AI direct-tools setting (owned and declared by the AI Agent, F084): [command id]. Unset =
+    /// `defaultAIDirectTools`. The bridge (F090) reads it untyped.
+    public static let aiDirectToolsName = "ai.directTools"
+    /// AI.md §4: commands offered to models as their own tools besides the meta-tools.
+    public static let defaultAIDirectTools = ["ink.writeText", "ink.setPoints", "text.createBox", "item.update",
+                                              "item.delete", "page.add", "shape.create", "diagram.create"]
+
+    /// Eraser settings owned by F010, read by the Zoom Window pane (F038) and the Pencil hover preview (F043).
+    /// Mode: "precision" | "standard" | "stroke".
+    public static let eraserMode = SettingKey("eraser.mode", default: "standard", synced: true)
+    /// Eraser diameter in SCREEN points (2…60).
+    public static let eraserSize = SettingKey("eraser.size", default: 14.0, synced: true)
+    /// Erase Filter: whether the eraser erases strokes drawn with `tool` (one key per ink tool).
+    public static func eraserFilter(_ tool: InkTool) -> SettingKey<Bool> {
+        SettingKey("eraser.filter." + tool.rawValue, default: true, synced: true)
+    }
+
+    /// Dynamic Ink: the pen reacts to Apple Pencil Pro barrel roll (F007 owns it; F043 offers the toggle).
+    public static let penReactsToRoll = SettingKey("pen.reactToRoll", default: true, synced: true)
+    /// The toolbar palette's layout (F016 owns it; F043's palette and plugins read it). nil = default layout.
+    public static let toolbarLayout = SettingKey<ToolbarLayoutSetting?>("toolbar.layout", default: nil, synced: true)
 
     public static let presetTools = ["pen", "pencil", "highlighter", "tape", "shape", "drawShape"]
 
@@ -6378,6 +8634,42 @@ public enum NibSettings {
         }
         s.declarePrefix("managed.", synced: false, summary: "Managed App Configuration values (read-only).",
                         owner: "builtin", readOnly: true)
+        s.declare(liquidMode, summary: "Liquid chrome: full, calm (half stretch, no necks) or off (solid, no motion).",
+                  owner: "builtin", schema: .str(choices: ["full", "calm", "off"]))
+        s.declare(defaultTextStyle, summary: "Style of new text boxes: TextBoxStyle fields, optionally align and lineSpacing.",
+                  owner: "builtin", schema: .anything("TextBoxStyle object"))
+        s.declare(drawAndHold, summary: "Hold the pen still at the end of a stroke to snap it to a shape.", owner: "builtin",
+                  schema: bool)
+        s.declare(eraserMode, summary: "Eraser mode: precision, standard or stroke.", owner: "builtin",
+                  schema: .str(choices: ["precision", "standard", "stroke"]))
+        s.declare(eraserSize, summary: "Eraser diameter in screen points.", owner: "builtin", schema: .num(min: 2, max: 60))
+        s.declare(penReactsToRoll, summary: "The pen nib turns with Apple Pencil Pro barrel roll.", owner: "builtin", schema: bool)
+        s.declare(toolbarLayout, summary: "Toolbar layout {order: [id], hidden: [id]} (tool or item ids); null = default.",
+                  owner: "builtin", schema: .obj(["order": .arr(.str()), "hidden": .arr(.str())]))
+        for tool in InkTool.allCases {
+            s.declare(eraserFilter(tool), summary: "The eraser erases \(tool.rawValue) strokes.", owner: "builtin", schema: bool)
+        }
+    }
+}
+
+/// contracts-v2: the value of `NibSettings.toolbarLayout` (F016 writes it through `toolbar.*` commands). Ids are toolbar
+/// descriptor ids or tool ids; items the layout never mentions follow the defaults.
+public struct ToolbarLayoutSetting: Codable, Equatable {
+    public var order: [String]
+    public var hidden: [String]
+
+    public init(order: [String] = [], hidden: [String] = []) {
+        self.order = order
+        self.hidden = hidden
+    }
+
+    enum CodingKeys: String, CodingKey { case order, hidden }
+
+    /// Lenient: both lists default to empty.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        order = try c.decodeIfPresent([String].self, forKey: .order) ?? []
+        hidden = try c.decodeIfPresent([String].self, forKey: .hidden) ?? []
     }
 }
 
@@ -6512,8 +8804,11 @@ public protocol Registrable {
 }
 
 /// Thread-safe ordered registry keyed by id (re-registering an id replaces it). Posts `.nibRegistryDidChange`.
+/// contracts-v2: the notification's userInfo says what changed (`RegistryChange` keys), and `generation` counts changes,
+/// so observers (tile caches, thumbnails) can drop only what an id change affects.
 public final class Registry<D: Registrable> {
     private var items: [D] = []
+    private var changes: UInt64 = 0
     private let lock = NSLock()
 
     public init() {}
@@ -6525,33 +8820,77 @@ public final class Registry<D: Registrable> {
         return items
     }
 
+    /// contracts-v2: incremented on every register / unregister.
+    public var generation: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return changes
+    }
+
     public func register(_ d: D) {
         lock.lock()
+        let replaced = items.contains { $0.id == d.id }
         items.removeAll { $0.id == d.id }
         items.append(d)
         items.sort { ($0.order, $0.id) < ($1.order, $1.id) }
+        changes &+= 1
+        let g = changes
         lock.unlock()
-        NotificationCenter.default.post(name: .nibRegistryDidChange, object: self)
+        post([d.id], owner: d.owner, kind: replaced ? RegistryChange.replaced : RegistryChange.registered, generation: g)
     }
 
     public func unregister(id: String) {
         lock.lock()
+        let owner = items.first { $0.id == id }?.owner
         items.removeAll { $0.id == id }
+        changes &+= 1
+        let g = changes
         lock.unlock()
-        NotificationCenter.default.post(name: .nibRegistryDidChange, object: self)
+        post([id], owner: owner, kind: RegistryChange.unregistered, generation: g)
     }
 
     public func unregister(owner: String) {
         lock.lock()
+        let ids = items.filter { $0.owner == owner }.map { $0.id }
         items.removeAll { $0.owner == owner }
+        changes &+= 1
+        let g = changes
         lock.unlock()
-        NotificationCenter.default.post(name: .nibRegistryDidChange, object: self)
+        post(ids, owner: owner, kind: RegistryChange.unregistered, generation: g)
     }
 
     public func get(_ id: String) -> D? {
         lock.lock()
         defer { lock.unlock() }
         return items.first { $0.id == id }
+    }
+
+    private func post(_ ids: [String], owner: String?, kind: String, generation: UInt64) {
+        var info: [String: Any] = [RegistryChange.idsKey: ids, RegistryChange.kindKey: kind,
+                                   RegistryChange.generationKey: generation]
+        if let o = owner { info[RegistryChange.ownerKey] = o }
+        NotificationCenter.default.post(name: .nibRegistryDidChange, object: self, userInfo: info)
+    }
+}
+
+/// contracts-v2: userInfo keys of `.nibRegistryDidChange` posted by a `Registry` (command registry posts carry none).
+public enum RegistryChange {
+    /// [String]: the ids registered, replaced or removed.
+    public static let idsKey = "ids"
+    /// String: owner of the changed entries (absent when unknown).
+    public static let ownerKey = "owner"
+    /// String: `registered`, `replaced` or `unregistered`.
+    public static let kindKey = "change"
+    /// UInt64: the registry's `generation` after the change.
+    public static let generationKey = "generation"
+
+    public static let registered = "registered"
+    public static let replaced = "replaced"
+    public static let unregistered = "unregistered"
+
+    /// The ids a registry notification names ([] for posts without userInfo, e.g. the command registry).
+    public static func ids(_ note: Notification) -> [String] {
+        note.userInfo?[idsKey] as? [String] ?? []
     }
 }
 
@@ -6587,6 +8926,76 @@ public struct TemplateRender {
     }
 }
 
+/// contracts-v2: insets from the page edges (points).
+public struct PageInsets: Codable, Hashable {
+    public var top: Double
+    public var left: Double
+    public var bottom: Double
+    public var right: Double
+
+    public init(top: Double = 0, left: Double = 0, bottom: Double = 0, right: Double = 0) {
+        self.top = top
+        self.left = left
+        self.bottom = bottom
+        self.right = right
+    }
+
+    public static let zero = PageInsets()
+}
+
+/// contracts-v2: layout facts a template publishes for other features: snap-to-grid (F012), the full-page text box's
+/// writing area (F028), Zoom Window line height, and how its pattern repeats on infinite boards (F004).
+public struct TemplateMetrics: Equatable {
+    /// Distance between ruled lines, grid lines or dots (points); nil = no regular grid.
+    public var spacing: Double?
+    /// The writing area inside the page (margins), nil = the whole page.
+    public var margins: PageInsets?
+    /// The pattern repeats every `repeatPeriod` (points, anchored at page origin 0,0); boards align tiles to it.
+    /// nil = not periodic (planners, covers) or unknown.
+    public var repeatPeriod: PageSize?
+
+    public init(spacing: Double? = nil, margins: PageInsets? = nil, repeatPeriod: PageSize? = nil) {
+        self.spacing = spacing
+        self.margins = margins
+        self.repeatPeriod = repeatPeriod
+    }
+}
+
+/// contracts-v2: ids of the built-in templates (the Templates feature, F005, registers them; `PageRecord` defaults to
+/// `blank`). Templates are optional: check `content.templates.get(id)` and fall back (whiteboard → notebook paper →
+/// blank) when one is missing.
+public enum TemplateIDs {
+    public static let blank = "builtin.blank"
+    public static let dots = "builtin.dots"
+    public static let grid = "builtin.grid"
+    public static let graph = "builtin.graph"
+    public static let isometric = "builtin.isometric"
+    public static let ruled = "builtin.ruled"
+    public static let ruledNarrow = "builtin.ruledNarrow"
+    public static let ruledWide = "builtin.ruledWide"
+    public static let cornell = "builtin.cornell"
+    public static let legalPad = "builtin.legalPad"
+    /// Zoom-adaptive infinite-board backgrounds.
+    public static let whiteboardDots = "builtin.whiteboardDots"
+    public static let whiteboardGrid = "builtin.whiteboardGrid"
+    public static let whiteboardLines = "builtin.whiteboardLines"
+}
+
+/// contracts-v2: parameter names shared by the built-in templates (`TemplateRef.params`, `TemplateParam.name`). A
+/// template declares the ones it honours in `params`; set a value only when `params` contains that name.
+public enum TemplateParamNames {
+    /// Paper colour, "#RRGGBB[AA]" (built-ins also accept a preset name such as "yellow").
+    public static let paper = "paper"
+    /// Rule, grid or dot colour, "#RRGGBB[AA]".
+    public static let line = "line"
+    /// Pattern pitch in points (read by `TemplateDefinition.metrics(for:size:)`).
+    public static let spacing = "spacing"
+    /// Writing margin in points, or `true` for 25 mm (read by `metrics(for:size:)`).
+    public static let margin = "margin"
+    /// Cover colour, "#RRGGBB[AA]".
+    public static let color = "color"
+}
+
 /// A parametric paper or cover template. Built-ins and plugin templates use the same type.
 public struct TemplateDefinition: Registrable {
     public var id: String
@@ -6602,7 +9011,16 @@ public struct TemplateDefinition: Registrable {
     /// Default Zoom Window return height (points).
     public var zoomReturnHeight: Double?
     /// Pure and thread-safe (called on render threads). `scale` = pixels per point so grids can adapt to zoom.
+    /// Patterns are anchored at the page origin (0, 0). Infinite boards (`PageRecord.size == nil`): the renderer calls
+    /// `renderRegion` with each tile's world rect when set, else `render` with `size` = the tile size and draws the
+    /// result at a tile origin aligned to `metrics(for:size:).repeatPeriod` (240 pt when nil).
     public var render: (_ params: [String: JSONValue], _ size: PageSize, _ scale: Double) -> TemplateRender
+    /// contracts-v2: draws only `region` (page coordinates; world coordinates on boards), so deep zoom on a large page
+    /// or board never builds ops for the whole page. Same purity rules as `render`. nil = `render` is used.
+    public var renderRegion: ((_ params: [String: JSONValue], _ size: PageSize, _ scale: Double, _ region: Rect) -> TemplateRender)?
+    /// contracts-v2: the template's grid spacing, margins and repeat period for `params` and `size` (nil for boards).
+    /// Pure and thread-safe. nil = derived from the "spacing" / "margin" params (see `metrics(for:size:)`).
+    public var metricsProvider: ((_ params: [String: JSONValue], _ size: PageSize?) -> TemplateMetrics)?
 
     public init(id: String, title: String, category: String, isCover: Bool = false, order: Int = 0, owner: String,
                 params: [TemplateParam] = [], defaults: [String: JSONValue] = [:], preferredSize: PageSize? = nil,
@@ -6620,9 +9038,48 @@ public struct TemplateDefinition: Registrable {
         self.zoomReturnHeight = zoomReturnHeight
         self.render = render
     }
+
+    /// contracts-v2: `renderRegion` when the template has one (and a region is given), else `render`.
+    public func renderOps(_ params: [String: JSONValue], size: PageSize, scale: Double, region: Rect?) -> TemplateRender {
+        if let region = region, let f = renderRegion { return f(params, size, scale, region) }
+        return render(params, size, scale)
+    }
+
+    /// contracts-v2: the template's metrics for `params` (merged over `defaults`). Without a `metricsProvider`:
+    /// `spacing` from a numeric "spacing" param, `margins` from a numeric "margin" param (points on every side) or
+    /// `true` (25 mm), `repeatPeriod` = spacing × spacing.
+    public func metrics(for params: [String: JSONValue], size: PageSize?) -> TemplateMetrics {
+        let p = defaults.merging(params) { _, new in new }
+        if let f = metricsProvider { return f(p, size) }
+        var m = TemplateMetrics()
+        if case let .number(n)? = p[TemplateParamNames.spacing], n > 0 {
+            m.spacing = n
+            m.repeatPeriod = PageSize(n, n)
+        }
+        switch p[TemplateParamNames.margin] {
+        case .number(let n)?: m.margins = PageInsets(top: n, left: n, bottom: n, right: n)
+        case .bool(true)?:
+            let mm25 = 25 * 72 / 25.4
+            m.margins = PageInsets(top: mm25, left: mm25, bottom: mm25, right: mm25)
+        default: break
+        }
+        return m
+    }
 }
 
 // MARK: - Item drawing
+
+/// contracts-v2: what a render is for, so drawers can leave out screen-only decorations.
+public enum DrawPurpose: String, Codable, CaseIterable {
+    /// Canvas tiles and live previews.
+    case screen
+    /// Page thumbnails (sidebar, library, previews).
+    case thumbnail
+    /// PDF / image / print export (F066): no pins, handles or screen-only affordances.
+    case export
+    /// `render.page` for the AI and plugins (marks may be drawn over it).
+    case query
+}
 
 public struct DrawContext {
     /// Already scaled so that 1 unit = 1 page point; origin = page top-left.
@@ -6636,9 +9093,18 @@ public struct DrawContext {
     public let assets: AssetStore?
     /// Note Replay state; nil = draw everything normally.
     public let replay: ReplayState?
+    /// contracts-v2: what the render is for (export leaves out comment pins; a collapsed sticky prints expanded when
+    /// the exporter asks for it).
+    public let purpose: DrawPurpose
+    /// contracts-v2: false = leave annotations out (comment pins, link underlines); mirrors `RenderRequest.annotations`.
+    public let annotations: Bool
+    /// contracts-v2: the paper colour under the item (template paper or background colour), for knock-outs such as
+    /// connector labels; nil = unknown (assume white, or black when `darkPaper`).
+    public let paper: RGBA?
 
     public init(cg: CGContext, scale: Double, doc: DocumentID, page: PageID, darkPaper: Bool = false,
-                assets: AssetStore? = nil, replay: ReplayState? = nil) {
+                assets: AssetStore? = nil, replay: ReplayState? = nil, purpose: DrawPurpose = .screen,
+                annotations: Bool = true, paper: RGBA? = nil) {
         self.cg = cg
         self.scale = scale
         self.doc = doc
@@ -6646,12 +9112,27 @@ public struct DrawContext {
         self.darkPaper = darkPaper
         self.assets = assets
         self.replay = replay
+        self.purpose = purpose
+        self.annotations = annotations
+        self.paper = paper
     }
 }
 
 /// Draws one kind of item into a tile, a thumbnail or an export. Must be thread-safe (render threads).
 public protocol ItemDrawer: AnyObject {
     func draw(_ item: Item, in context: DrawContext)
+    /// contracts-v2: the area that takes taps and lasso hits (page coordinates) when it differs from `Item.bounds`,
+    /// e.g. a collapsed sticky note (only its icon), a connector (its route). nil = `Item.bounds`. Default: nil.
+    func hitBounds(_ item: Item) -> Rect?
+    /// contracts-v2: everything the drawer paints for `item` (page coordinates) when it can reach further than
+    /// `Item.bounds` + `NibLimits.drawerMargin` (connector labels and arrowheads, curve bulges, text overflow). The
+    /// renderer culls and invalidates tiles with it. nil = `Item.bounds` + margin. Default: nil.
+    func paintBounds(_ item: Item) -> Rect?
+}
+
+public extension ItemDrawer {
+    func hitBounds(_ item: Item) -> Rect? { nil }
+    func paintBounds(_ item: Item) -> Rect? { nil }
 }
 
 /// Registered under `Item.drawKey` ("shape", "text", "stroke.tape", "custom.<owner>.<type>") or a kind name.
@@ -6678,12 +9159,21 @@ public struct ImportTarget {
     public var document: DocumentID?
     public var position: PagePosition
     public var anchorPage: PageID?
+    /// contracts-v2: the file's original name without extension (a download or `tmp:` asset has a generated local name);
+    /// importers title new documents from it. Filled by `import.files`.
+    public var displayName: String?
+    /// contracts-v2: caller-chosen ids for the records the import creates (documents or pages, in creation order;
+    /// `import.files {ids}`). Importers honour them like any creating command.
+    public var ids: [NibID]?
 
-    public init(folder: FolderID? = nil, document: DocumentID? = nil, position: PagePosition = .end, anchorPage: PageID? = nil) {
+    public init(folder: FolderID? = nil, document: DocumentID? = nil, position: PagePosition = .end, anchorPage: PageID? = nil,
+                displayName: String? = nil, ids: [NibID]? = nil) {
         self.folder = folder
         self.document = document
         self.position = position
         self.anchorPage = anchorPage
+        self.displayName = displayName
+        self.ids = ids
     }
 }
 
@@ -6726,6 +9216,19 @@ public struct ExportRequest: Codable {
     }
 }
 
+/// contracts-v2: well-known `ExportRequest.options` keys shared by exporters (F066) and features that add options through a
+/// command hook on `export.run` (layers F041).
+public enum ExportOptionKeys {
+    /// Bool: export only layers visible on this device.
+    public static let visibleLayersOnly = "visibleLayersOnly"
+    /// {"<documentID>": [layer index]}: the visible layers per document (set by the Layers hook).
+    public static let visibleLayers = "visibleLayers"
+    /// Bool: draw annotations (comment pins, link marks).
+    public static let annotations = "annotations"
+    /// Bool: draw page backgrounds (templates, PDFs).
+    public static let background = "background"
+}
+
 public struct ExporterDescriptor: Registrable {
     public var id: String
     public var title: String
@@ -6733,6 +9236,9 @@ public struct ExporterDescriptor: Registrable {
     public var utType: String
     public var order: Int
     public var owner: String
+    /// contracts-v2: document kinds this exporter applies to (nil = every kind), so Share & Export lists only the ones
+    /// that work (e.g. "study.csv" only for study sets).
+    public var docKinds: Set<DocumentKind>? = nil
     /// Writes files to a temporary folder and returns their URLs.
     public var handler: @MainActor (ExportRequest, CommandContext) async throws -> [URL]
 
@@ -6838,6 +9344,18 @@ public struct KeyCommandDescriptor: Registrable {
     public var scope: KeyScope
     public var order: Int
     public var owner: String
+    /// contracts-v2: only while the key window shows one of these document kinds (nil = any). Honoured by the shell.
+    public var docKinds: Set<DocumentKind>? = nil
+    /// contracts-v2: params computed from the key window's session when the key is pressed (selection, page, a fresh
+    /// id); merged over `params`. Use `resolvedParams(for:)`.
+    public var sessionParams: (@MainActor (EditorSession) -> JSONValue)? = nil
+
+    /// contracts-v2: `params` with `sessionParams(session)` merged over them (what the shell passes to the command).
+    @MainActor
+    public func resolvedParams(for session: EditorSession?) -> JSONValue {
+        guard let f = sessionParams, let s = session else { return params }
+        return params.merging(f(s))
+    }
 
     public init(id: String, title: String, shortcut: KeyShortcut, command: String, params: JSONValue = [:],
                 scope: KeyScope = .document, order: Int = 0, owner: String) {
@@ -7037,7 +9555,9 @@ public struct CustomItemTypeDescriptor: Registrable {
     }
 }
 
-/// An action users can bind to Apple Pencil double-tap or squeeze (offered by F043's settings).
+/// An action users can bind to Apple Pencil double-tap or squeeze (offered by F043's settings). The bound command gets
+/// {"gesture": "doubleTap"|"squeeze", "doc": "doc:D", "page"?: "page:D/P", "at"?: [x, y]} with `params` merged over it
+/// (the descriptor's params win).
 public struct PencilActionDescriptor: Registrable {
     public var id: String
     public var title: String
@@ -7056,6 +9576,43 @@ public struct PencilActionDescriptor: Registrable {
         self.gestures = gestures
         self.command = command
         self.params = params
+    }
+}
+
+// MARK: - Text layout (contracts-v2)
+
+/// Where an item's text lays out, so link hit-testing (F029), spellcheck (F104), search highlights (F056) and
+/// recognition find the same glyphs the drawer draws. TextKit rule for every text-bearing item: `lineFragmentPadding`
+/// = `TextLayoutInfo.lineFragmentPadding` (0) and no extra container inset.
+public struct TextLayoutInfo: Equatable {
+    public static let lineFragmentPadding: Double = 0
+    /// The text container in page coordinates: an unrotated box plus rotation about its centre (like `Frame`).
+    public var container: Frame
+    /// Attributes runs inherit (font size, colour).
+    public var base: TextAttributes
+    /// True = the text block is centred vertically in the container (shape labels); false = top-aligned.
+    public var centredVertically: Bool
+
+    public init(container: Frame, base: TextAttributes = TextAttributes(), centredVertically: Bool = false) {
+        self.container = container
+        self.base = base
+        self.centredVertically = centredVertically
+    }
+}
+
+/// Published by the feature that draws an item's text (F026 text boxes, F036 sticky notes, F031 shape labels,
+/// plugins' custom items), under the item's `drawKey` or kind name. `layout` is pure and thread-safe.
+public struct TextLayoutDescriptor: Registrable {
+    public var id: String
+    public var order: Int
+    public var owner: String
+    public var layout: (Item) -> TextLayoutInfo?
+
+    public init(key: String, owner: String, order: Int = 0, layout: @escaping (Item) -> TextLayoutInfo?) {
+        self.id = key
+        self.order = order
+        self.owner = owner
+        self.layout = layout
     }
 }
 
@@ -7078,11 +9635,37 @@ public final class ContentRegistries {
     public let blockKinds = Registry<BlockKindDescriptor>()
     public let customItemTypes = Registry<CustomItemTypeDescriptor>()
     public let pencilActions = Registry<PencilActionDescriptor>()
+    /// contracts-v2: text layout of text-bearing items (see `TextLayoutDescriptor`, `textLayout(for:)`).
+    public let textLayouts = Registry<TextLayoutDescriptor>()
 
     public init() {}
 
+    /// contracts-v2: where `item`'s text lays out: the registered `TextLayoutDescriptor` for its draw key or kind, else
+    /// for text boxes the frame inset by `TextBoxStyle.padding` (top-aligned, `style.defaults`); nil for items
+    /// without text.
+    public func textLayout(for item: Item) -> TextLayoutInfo? {
+        if let d = textLayouts.get(item.drawKey) ?? textLayouts.get(item.kind.rawValue) { return d.layout(item) }
+        guard item.kind == .text, let t = item.text else { return nil }
+        let p = t.style.padding
+        let f = t.frame
+        return TextLayoutInfo(container: Frame(x: f.x + p, y: f.y + p, w: max(0, f.w - 2 * p), h: max(0, f.h - 2 * p),
+                                               rotation: f.rotation),
+                              base: t.style.defaults)
+    }
+
     public func drawer(for item: Item) -> ItemDrawer? {
         drawers.get(item.drawKey)?.drawer ?? drawers.get(item.kind.rawValue)?.drawer
+    }
+
+    /// contracts-v2: where `item` takes taps and lasso hits: its drawer's `hitBounds`, else `Item.bounds`.
+    public func hitBounds(for item: Item) -> Rect {
+        drawer(for: item)?.hitBounds(item) ?? item.bounds
+    }
+
+    /// contracts-v2: what drawing `item` can touch: its drawer's `paintBounds`, else `Item.bounds` grown by
+    /// `NibLimits.drawerMargin`. Tile invalidation uses it for both the before and after value of a change.
+    public func paintBounds(for item: Item) -> Rect {
+        drawer(for: item)?.paintBounds(item) ?? item.bounds.insetBy(-NibLimits.drawerMargin)
     }
 
     public func template(_ ref: TemplateRef) -> TemplateDefinition? { templates.get(ref.id) }
@@ -7115,11 +9698,14 @@ enum CoreCommands {
         r.register(SettingsSet.self)
         r.register(SettingsList.self)
         r.register(SettingsDescribe.self)
+        r.register(WindowShowLibrary.self)
     }
 }
 
 struct DocParams: Codable {
-    var doc: String
+    /// contracts-v2: optional for the user (key commands, toolbar buttons): nil = the invoking window's document.
+    /// The schema still requires it, so the AI, plugins and the bridge always name the document.
+    var doc: String?
 }
 
 struct EditUndo: NibCommand {
@@ -7134,7 +9720,7 @@ struct EditUndo: NibCommand {
         examples: [["doc": "doc:FIXTUREDOC01"]], effect: .edit)
 
     static func run(_ p: DocParams, _ ctx: CommandContext) async throws -> Output {
-        let doc = NodeRef.documentID(from: p.doc)
+        let doc = try ctx.documentOrSession(p.doc)
         let label = ctx.bus.history.undoLabel(doc)
         return Output(done: ctx.bus.undo(doc), label: label)
     }
@@ -7152,7 +9738,7 @@ struct EditRedo: NibCommand {
         examples: [["doc": "doc:FIXTUREDOC01"]], effect: .edit)
 
     static func run(_ p: DocParams, _ ctx: CommandContext) async throws -> Output {
-        let doc = NodeRef.documentID(from: p.doc)
+        let doc = try ctx.documentOrSession(p.doc)
         let label = ctx.bus.history.redoLabel(doc)
         return Output(done: ctx.bus.redo(doc), label: label)
     }
@@ -7321,16 +9907,52 @@ struct CommandsBatch: NibCommand {
 struct ToolSelect: NibCommand {
     struct Params: Codable {
         var tool: String
+        /// contracts-v2: true = until the tool finishes one use or `EditorSession.endTemporaryTool()`, then back.
+        var temporary: Bool?
     }
     static let descriptor = CommandDescriptor(
         id: CommandIDs.toolSelect, title: "Select Tool",
         summary: "Activate a canvas tool in the current window: pen, pencil, highlighter, eraser, lasso, shape, text, tape, laser, or a plugin tool id.",
-        params: .obj(["tool": .str("tool id")], required: ["tool"]),
-        examples: [["tool": "pen"]], effect: .session, target: .app)
+        params: .obj(["tool": .str("tool id"),
+                      "temporary": .bool("true = return to the current tool after one use")], required: ["tool"]),
+        examples: [["tool": "pen"], ["tool": "lasso", "temporary": true]], effect: .session, target: .app)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
         guard let session = ctx.activeSession else { throw NibError.unavailable("an open editor window") }
-        session.tool = p.tool
+        if p.temporary == true {
+            session.selectTemporarily(p.tool)
+        } else {
+            session.selectTool(p.tool)
+        }
+        return NoResult()
+    }
+}
+
+/// contracts-v2: shows the library in the invoking window (the document chrome's Back button, the tab strip's Library
+/// button, the AI and plugins).
+struct WindowShowLibrary: NibCommand {
+    struct Params: Codable {
+        var folder: String?
+    }
+    static let descriptor = CommandDescriptor(
+        id: CommandIDs.windowShowLibrary, title: "Show Library",
+        summary: "Show the library in the current window, optionally opened at a folder ('folder:F' or a folder id).",
+        params: .obj(["folder": .str("folder ref folder:F or folder id; omit for the library root")]),
+        examples: [[:], ["folder": "folder:FIXTUREFLD01"]], effect: .session, target: .app)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
+        guard let navigator = ctx.navigator else { throw NibError.unavailable("a window") }
+        var folder: FolderID?
+        if let f = p.folder, !f.isEmpty, f != "lib" {
+            if case let .folder(id)? = NodeRef(f) {
+                folder = id
+            } else if NibID.isValid(f) {
+                folder = NibID(f)
+            } else {
+                throw NibError.invalid("'folder' must be a folder ref like folder:F", path: "$.folder")
+            }
+        }
+        navigator.showLibrary(folder: folder)
         return NoResult()
     }
 }
@@ -7567,6 +10189,11 @@ public extension NSAttributedString.Key {
     static let nibChecked = NSAttributedString.Key("nib.checked")
     static let nibIndent = NSAttributedString.Key("nib.indent")
     static let nibParagraphStyle = NSAttributedString.Key("nib.paragraphStyle")
+    /// contracts-v2: the model's font family (String) as stored, kept next to the rendered `.font` so a family that is
+    /// not installed on this device survives a round trip through TextKit.
+    static let nibModelFont = NSAttributedString.Key("nib.modelFont")
+    /// contracts-v2: the model's traits (Int: 1 bold, 2 italic), kept when the rendered family has no such face.
+    static let nibModelTraits = NSAttributedString.Key("nib.modelTraits")
 }
 
 /// `RichText` ⇄ `NSAttributedString` (TextKit editing and drawing). Links use `nib://` URLs for
@@ -7598,6 +10225,13 @@ public enum RichTextBridge {
             d[.baselineOffset] = CGFloat(Double(b) * size * 0.35)
         }
         d[.font] = font(sized, base: base)
+        if !(a.code ?? base.code ?? false) {
+            if let family = a.font ?? base.font { d[.nibModelFont] = family }
+            var traits = 0
+            if a.bold ?? base.bold ?? false { traits |= 1 }
+            if a.italic ?? base.italic ?? false { traits |= 2 }
+            if traits != 0 { d[.nibModelTraits] = traits }
+        }
         d[.foregroundColor] = (a.color ?? base.color ?? .black).uiColor
         if let h = a.highlight ?? base.highlight { d[.backgroundColor] = h.uiColor }
         if a.underline ?? base.underline ?? false { d[.underlineStyle] = NSUnderlineStyle.single.rawValue }
@@ -7668,6 +10302,17 @@ public enum RichTextBridge {
             } else if f.familyName != defaultFontFamily {
                 t.font = f.familyName
             }
+            if !traits.contains(.traitMonoSpace) {
+                // contracts-v2: a model family that is not installed here rendered as a fallback; keep the model's.
+                if let model = a[.nibModelFont] as? String, model != f.familyName, !UIFont.familyNames.contains(model) {
+                    t.font = model
+                }
+                // A model trait the rendered family has no face for (italic in a font without italics) is kept.
+                if let mt = a[.nibModelTraits] as? Int {
+                    if mt & 1 != 0, !traits.contains(.traitBold), !hasFace(f.familyName, .traitBold) { t.bold = true }
+                    if mt & 2 != 0, !traits.contains(.traitItalic), !hasFace(f.familyName, .traitItalic) { t.italic = true }
+                }
+            }
         }
         if let c = a[.foregroundColor] as? UIColor {
             let rgba = RGBA(c)
@@ -7719,6 +10364,12 @@ public enum RichTextBridge {
     }
 
     // MARK: Private
+
+    /// True when `family` has a face with `trait` (so a missing trait on rendered text was the user's choice).
+    static func hasFace(_ family: String, _ trait: UIFontDescriptor.SymbolicTraits) -> Bool {
+        guard let d = UIFontDescriptor(fontAttributes: [.family: family]).withSymbolicTraits(trait) else { return false }
+        return UIFont(descriptor: d, size: 12).fontDescriptor.symbolicTraits.contains(trait)
+    }
 
     static func alignment(_ a: ParagraphAlignment) -> NSTextAlignment {
         switch a {
@@ -7808,10 +10459,13 @@ public struct CanvasSample {
     public var isPencil: Bool
     public var isPredicted: Bool
     public var modifiers: KeyModifiers
+    /// contracts-v2: stable id of the touch this sample belongs to (multi-finger gestures: two-finger ruler rotation,
+    /// two-finger duplicate). 0 when unknown.
+    public var touchID: Int
 
     public init(page: PageID, location: Point, force: Double = 0.5, azimuth: Double = 0, altitude: Double = .pi / 2,
                 roll: Double = 0, timestamp: TimeInterval = 0, isPencil: Bool = true, isPredicted: Bool = false,
-                modifiers: KeyModifiers = []) {
+                modifiers: KeyModifiers = [], touchID: Int = 0) {
         self.page = page
         self.location = location
         self.force = force
@@ -7822,6 +10476,7 @@ public struct CanvasSample {
         self.isPencil = isPencil
         self.isPredicted = isPredicted
         self.modifiers = modifiers
+        self.touchID = touchID
     }
 }
 
@@ -7834,7 +10489,9 @@ public protocol CanvasHost: AnyObject {
     /// Current zoom (view points per page point).
     var zoomScale: Double { get }
     /// The scrolling canvas view (for presenting menus, loupes, pencil palettes). Named `canvasView` so a
-    /// UIViewController (whose `view` is `UIView!`) can conform.
+    /// UIViewController (whose `view` is `UIView!`) can conform. It is the scroll view itself: `viewPoint`, `pagePoint`
+    /// and `pageFrame` use its bounds coordinates, which move with scrolling and zoom; subviews added to it scroll with
+    /// the pages. Things that must stay put on screen go in `fixedOverlayView` (or are chrome overlays).
     var canvasView: UIView { get }
     /// Transient drawing layer of the ACTIVE TOOL in `canvasView` coordinates (previews, lasso path). Cleared by tools.
     /// Anything persistent (selection handles, underlines, presence cursors, minimap…) is a `CanvasAttachment`.
@@ -7849,10 +10506,66 @@ public protocol CanvasHost: AnyObject {
     func invalidate(page: PageID, rect: Rect?)
     /// Commits a finished stroke through `ink.addStrokes` (applies stroke processors first).
     func commitStroke(_ stroke: Stroke, page: PageID)
-    /// Cancels the in-progress PencilKit stroke (Draw-and-Hold takes over).
+    /// Cancels the in-progress PencilKit stroke (Draw-and-Hold takes over). Idempotent: after `strokeHeld` returns true
+    /// the canvas has already cancelled it, and a second call is harmless. Called from `strokeFinished`, it discards
+    /// the finished wet stroke (the tool commits something else instead, e.g. a recognised shape).
     func cancelWetStroke()
     /// Keeps a live view (animated GIF, video, plugin view) positioned over an item's frame; nil removes it.
     func attachLiveView(_ view: UIView?, item: ElementID, page: PageID)
+
+    // contracts-v2 (all have default implementations below; the canvas F006/F101 overrides them)
+
+    /// Runs `body` once the dry tiles of `page` have been redrawn after the latest commit, so a tool can drop its
+    /// preview without a flicker. Default: after 150 ms.
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void)
+    /// Page → `canvasView` affine (zoom, page layout and page rotation included); nil when the page is not laid out.
+    func pageTransform(_ page: PageID) -> CGAffineTransform?
+    /// A point on `source` expressed in the coordinates of `target` (a gesture that crosses pages); nil when either
+    /// page is not laid out.
+    func convert(_ point: Point, from source: PageID, to target: PageID) -> Point?
+    /// A view above the canvas that does NOT scroll or zoom (HUD-like attachments, panes). Default: the canvas view's
+    /// superview.
+    var fixedOverlayView: UIView { get }
+    /// A tool finished one use: returns to the previous (or temporary-return) tool when appropriate, see
+    /// `EditorSession.finishToolUse(sticky:)`.
+    func finishToolUse(_ tool: CanvasTool)
+    /// `commitStroke` with its outcome: the created item's id, or the error `ink.addStrokes` threw (a stroke dropped by
+    /// a processor succeeds with nil). Default: commits and reports success with nil.
+    func commitStroke(_ stroke: Stroke, page: PageID, completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void)
+}
+
+@MainActor
+public extension CanvasHost {
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            body()
+        }
+    }
+
+    func pageTransform(_ page: PageID) -> CGAffineTransform? {
+        guard pageFrame(page) != nil else { return nil }
+        let o = viewPoint(.zero, page: page)
+        let x = viewPoint(Point(100, 0), page: page)
+        let y = viewPoint(Point(0, 100), page: page)
+        return CGAffineTransform(a: (x.x - o.x) / 100, b: (x.y - o.y) / 100, c: (y.x - o.x) / 100, d: (y.y - o.y) / 100,
+                                 tx: o.x, ty: o.y)
+    }
+
+    func convert(_ point: Point, from source: PageID, to target: PageID) -> Point? {
+        if source == target { return point }
+        guard pageFrame(source) != nil, let t = pageTransform(target) else { return nil }
+        return Point(viewPoint(point, page: source).applying(t.inverted()))
+    }
+
+    var fixedOverlayView: UIView { canvasView.superview ?? canvasView }
+
+    func finishToolUse(_ tool: CanvasTool) { session.finishToolUse(sticky: tool.isSticky) }
+
+    func commitStroke(_ stroke: Stroke, page: PageID, completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void) {
+        commitStroke(stroke, page: page)
+        completion(.success(nil))
+    }
 }
 
 /// A canvas tool. Registered via `UIRegistries.canvasTools`; activated by `tool.select`.
@@ -7911,12 +10624,23 @@ public protocol CanvasAttachment: AnyObject {
     /// Scroll, zoom, page layout, selection or a commit changed: reposition what you draw.
     func canvasDidChange(_ host: CanvasHost)
     /// True = this attachment takes the touch that starts at `viewPoint` (asked before tap handlers and the active
-    /// tool, in registry order); the touch's samples then go to the touch methods below.
+    /// tool, in registry order); the touch's samples then go to the touch methods below. A claimed touch never pans,
+    /// zooms or inks the canvas.
     func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost)
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost)
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost)
     func touchesCancelled(host: CanvasHost)
+
+    // contracts-v2 (default implementations below)
+
+    /// `hitTest` with the input kind: the canvas calls this one. Default: `hitTest(viewPoint, host:)` for both.
+    func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool
+    /// Pointer or Pencil hover over the canvas (nil = hover ended). Default: nothing.
+    func hover(_ sample: CanvasSample?, host: CanvasHost)
+    /// A claimed touch turned out to be a tap, double-tap or long-press: return true to consume it, false to pass it on
+    /// to `content.tapHandlers` and then the active tool (e.g. double-tap text inside a selected shape). Default: false.
+    func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool
 }
 
 @MainActor
@@ -7928,6 +10652,9 @@ public extension CanvasAttachment {
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {}
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {}
     func touchesCancelled(host: CanvasHost) {}
+    func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool { hitTest(viewPoint, host: host) }
+    func hover(_ sample: CanvasSample?, host: CanvasHost) {}
+    func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool { false }
 }
 
 public struct CanvasAttachmentDescriptor: Registrable {
@@ -7947,10 +10674,13 @@ public struct CanvasAttachmentDescriptor: Registrable {
     }
 }
 
-/// Apple Pencil hardware events forwarded by the canvas (Pencil Hardware feature).
+/// Apple Pencil hardware events forwarded by the canvas (Pencil Hardware feature). The canvas (F006/F101) owns the one
+/// `UIPencilInteraction` and the Pencil hover recogniser per canvas and forwards through `ui.pencilHandler`; a handler
+/// that also installs its own (F043 before F101 lands) must drop duplicates.
 @MainActor
 public protocol PencilEventHandler: AnyObject {
     func pencilDoubleTap(session: EditorSession, host: CanvasHost)
+    /// `location` is in `host.canvasView` coordinates (like `CanvasHost.viewPoint`).
     func pencilSqueeze(began: Bool, location: CGPoint?, session: EditorSession, host: CanvasHost)
     func pencilHover(_ sample: CanvasSample?, session: EditorSession, host: CanvasHost)
 }
@@ -7964,6 +10694,13 @@ public protocol DocumentEditing: AnyObject {
     var canvasHost: CanvasHost? { get }
     func reveal(page: PageID, rect: Rect?, animated: Bool)
     func reloadAll()
+    /// contracts-v2: scrolls a text document to a block (outline, search, links). Default: `reveal(page: block, …)`.
+    func reveal(block: NibID, animated: Bool)
+}
+
+@MainActor
+public extension DocumentEditing {
+    func reveal(block: NibID, animated: Bool) { reveal(page: block, rect: nil, animated: animated) }
 }
 ```
 
@@ -8008,6 +10745,35 @@ public struct ToolbarItemDescriptor: Registrable {
     public var activeToolMenu: (@MainActor (EditorSession) -> AnyView)?
     /// Settings popover shown when the already-selected tool is tapped again.
     public var settings: (@MainActor (EditorSession) -> AnyView)?
+
+    // contracts-v2: live state. Set these after init; the toolbar and nav bar re-evaluate them on session changes,
+    // commits, undo/redo and `UIRegistries.setNeedsChromeUpdate()`.
+
+    /// Greyed out when false (Undo with nothing to undo). nil = always enabled.
+    public var isEnabled: (@MainActor (EditorSession) -> Bool)? = nil
+    /// Shown as on/selected when true (Zoom Window open, Read Only on, page bookmarked, timer running). nil = no state.
+    public var isOn: (@MainActor (EditorSession) -> Bool)? = nil
+    /// Params computed from the invoking window when tapped (the window's document, page or selection), merged over
+    /// `params`. Use `resolvedParams(for:)`.
+    public var sessionParams: (@MainActor (EditorSession) -> JSONValue)? = nil
+    /// Title for this window ("Undo Add Page"); nil = `title`.
+    public var sessionTitle: (@MainActor (EditorSession) -> String)? = nil
+    /// SF Symbol for this window ("bookmark.fill" when on); nil = `icon`.
+    public var sessionIcon: (@MainActor (EditorSession) -> String)? = nil
+    /// Also shown on compact width (iPhone); false = regular width only.
+    public var showsInCompactWidth: Bool = true
+
+    @MainActor
+    public func resolvedParams(for session: EditorSession) -> JSONValue {
+        guard let f = sessionParams else { return params }
+        return params.merging(f(session))
+    }
+
+    @MainActor
+    public func resolvedTitle(for session: EditorSession) -> String { sessionTitle?(session) ?? title }
+
+    @MainActor
+    public func resolvedIcon(for session: EditorSession) -> String { sessionIcon?(session) ?? icon }
 
     public init(id: String, title: String, icon: String, group: ToolbarGroup, order: Int, owner: String,
                 toolID: String? = nil, command: String? = nil, params: JSONValue = [:], shortcut: KeyShortcut? = nil,
@@ -8093,10 +10859,16 @@ public struct MenuContext {
     /// transcript lines use "audio:D/A" plus `index`.
     public var ref: String?
     public var index: Int?
+    /// contracts-v2: the library folder the menu was opened in (`libraryNew`, `libraryItem`); nil = root.
+    public var folder: FolderID?
+    /// contracts-v2: `textSelection` menus: the selected range [start, length] in plain-text units (UTF-16, list
+    /// markers excluded) of the item or block named by `ref`.
+    public var textRange: [Int]?
 
+    /// `sidebarPage` menus: `page` is the thumbnail's page and `nodes` holds every selected page.
     public init(app: NibApp, session: EditorSession? = nil, doc: DocumentID? = nil, page: PageID? = nil, point: Point? = nil,
                 selection: Selection = Selection(), itemKinds: Set<ItemKind> = [], nodes: [NibID] = [],
-                ref: String? = nil, index: Int? = nil) {
+                ref: String? = nil, index: Int? = nil, folder: FolderID? = nil, textRange: [Int]? = nil) {
         self.app = app
         self.session = session
         self.doc = doc
@@ -8107,6 +10879,8 @@ public struct MenuContext {
         self.nodes = nodes
         self.ref = ref
         self.index = index
+        self.folder = folder
+        self.textRange = textRange
     }
 }
 
@@ -8126,6 +10900,15 @@ public struct MenuItemDescriptor: Registrable {
     public var quick: Bool
     /// Sub-menu title this entry is grouped under (nil = top level).
     public var submenu: String?
+    /// contracts-v2: shows a checkmark when true (current scroll direction, connector route, presentation mode).
+    public var isChecked: (@MainActor (MenuContext) -> Bool)? = nil
+    /// contracts-v2: title for this context ("Move to Layer › <name>", "Start Typing" / "Edit Text"); nil = `title`.
+    public var contextTitle: (@MainActor (MenuContext) -> String)? = nil
+    /// contracts-v2: shortcut shown next to the entry (display only; the key itself is a `KeyCommandDescriptor`).
+    public var shortcut: KeyShortcut? = nil
+
+    @MainActor
+    public func resolvedTitle(for context: MenuContext) -> String { contextTitle?(context) ?? title }
 
     public init(id: String, title: String, icon: String? = nil, location: MenuLocation, order: Int, owner: String,
                 command: String,
@@ -8160,11 +10943,22 @@ public enum PanelPlacement: String, Codable, CaseIterable {
     case fullScreen
 }
 
+/// contracts-v2: how the chrome presents a panel this time (a floating panel shows as a sheet on compact width, a
+/// sidebar tab in Window mode takes the full width).
+public enum PanelPresentation: String, Codable, CaseIterable {
+    case sidebar, window, floating, sheet, fullScreen, libraryTab
+}
+
 public struct PanelContext {
     public var app: NibApp
     public var session: EditorSession?
     public var navigator: SceneNavigator?
     public var dismiss: @MainActor () -> Void
+    /// contracts-v2: the params `panel.open` was called with, minus `id` (which pages to move, which thread or folder to
+    /// show, `instant: true` to skip the bud animation). `[:]` when opened without params.
+    public var params: JSONValue = [:]
+    /// contracts-v2: the presentation the chrome chose; nil = the descriptor's placement.
+    public var presentation: PanelPresentation? = nil
 
     public init(app: NibApp, session: EditorSession?, navigator: SceneNavigator?, dismiss: @escaping @MainActor () -> Void) {
         self.app = app
@@ -8184,6 +10978,8 @@ public struct PanelDescriptor: Registrable {
     /// nil = any (library tabs ignore it).
     public var docKinds: Set<DocumentKind>?
     public var makeView: @MainActor (PanelContext) -> AnyView
+    /// contracts-v2: the view draws its own header (plugin panels draw NibPluginPanelChrome); the chrome then adds none.
+    public var providesHeader: Bool = false
 
     public init(id: String, title: String, icon: String, placement: PanelPlacement, order: Int, owner: String,
                 docKinds: Set<DocumentKind>? = nil, makeView: @escaping @MainActor (PanelContext) -> AnyView) {
@@ -8210,6 +11006,8 @@ public struct SettingsPageDescriptor: Registrable {
     public var order: Int
     public var owner: String
     public var makeView: @MainActor (NibApp) -> AnyView
+    /// contracts-v2: extra words settings search matches ("palm", "handedness", "iCloud").
+    public var keywords: [String] = []
 
     public init(id: String, title: String, icon: String, section: SettingsSection, order: Int, owner: String,
                 makeView: @escaping @MainActor (NibApp) -> AnyView) {
@@ -8271,12 +11069,36 @@ public struct ToolMenuDescriptor: Registrable {
     public var order: Int
     public var owner: String
     public var makeView: @MainActor (EditorSession) -> AnyView
+    /// contracts-v2: the options bar's own popover (thickness slider, colour editor), budding from a control inside
+    /// the bar. The bar's droplet clips its content, so the popover cannot live in `makeView`; the toolbar (F016) hands
+    /// it to the palette (NibDesign `NibToolOptions(bar:popover:)`), which places it beside the bar. nil = none.
+    public var makePopover: (@MainActor (EditorSession) -> ToolMenuPopover?)? = nil
 
     public init(tool: String, owner: String, order: Int = 0, makeView: @escaping @MainActor (EditorSession) -> AnyView) {
         self.id = tool
         self.order = order
         self.owner = owner
         self.makeView = makeView
+    }
+}
+
+/// contracts-v2: a popover that buds from the control whose bud anchor id is `source` (NibDesign `nibBudAnchor`)
+/// inside a tool's options bar. One popover at a time: open it only while the tool's settings popover is closed.
+/// Mirrors NibDesign's `NibToolOptionsPopover` field for field, so the toolbar converts it one to one.
+public struct ToolMenuPopover {
+    public var source: String
+    public var isPresented: Binding<Bool>
+    public var title: String
+    public var subtitle: String?
+    public var content: AnyView
+
+    public init<Content: View>(source: String, isPresented: Binding<Bool>, title: String, subtitle: String? = nil,
+                               @ViewBuilder content: () -> Content) {
+        self.source = source
+        self.isPresented = isPresented
+        self.title = title
+        self.subtitle = subtitle
+        self.content = AnyView(content())
     }
 }
 
@@ -8379,6 +11201,17 @@ public protocol SceneNavigator: AnyObject {
     func showLibrary(folder: FolderID?)
     func showSettings(page: String?)
     func presentModal(_ viewController: UIViewController)
+    /// contracts-v2: appends a document to `openDocuments` WITHOUT showing it or building its editor (tab restore).
+    /// Default (navigators that predate it): opens it as a new tab, which also shows it.
+    func addTab(_ doc: DocumentID)
+}
+
+@MainActor
+public extension SceneNavigator {
+    func addTab(_ doc: DocumentID) { openDocument(doc, page: nil, mode: .newTab) }
+    /// contracts-v2: the window's floating host (see `FloatingHosting`), also while the library shows. Default nil;
+    /// the shell forwards the library's or the active editor's host.
+    var floatingHost: FloatingHosting? { session.floatingHost }
 }
 
 /// Window lifecycle hooks (Tabs & Windows feature).
@@ -8400,7 +11233,11 @@ public final class ScreenRegistry {
     /// Returns nil when onboarding is complete.
     public var onboarding: (@MainActor (NibApp, SceneNavigator) -> UIViewController?)?
     /// The document toolbar view (Toolbar feature); embedded by the document chrome.
+    /// Superseded in contracts-v2 by `toolbarView` (the chrome prefers it when set).
     public var toolbar: (@MainActor (EditorSession, NibApp) -> UIView)?
+    /// contracts-v2: the toolbar as a SwiftUI view; the document chrome places it INSIDE its own droplet container (one
+    /// container per window, so the palette merges, necks and recedes with the bars). Preferred over `toolbar`.
+    public var toolbarView: (@MainActor (EditorSession, NibApp) -> AnyView)?
 
     public init() {}
 }
@@ -8418,6 +11255,9 @@ public final class UIRegistries {
     public let blockViews = Registry<BlockViewDescriptor>()
     /// Persistent canvas overlays and touch targets that are not the active tool (see `CanvasAttachment`).
     public let canvasAttachments = Registry<CanvasAttachmentDescriptor>()
+    /// contracts-v2: floating HUDs, bars, pills and popovers rendered by the document chrome inside the window's droplet
+    /// container (see `ChromeOverlayDescriptor`).
+    public let chromeOverlays = Registry<ChromeOverlayDescriptor>()
     public let screens: ScreenRegistry
     public var sceneHooks: SceneHooks?
     public var pencilHandler: PencilEventHandler?
@@ -8439,6 +11279,171 @@ public final class UIRegistries {
     public func toolbarItems(for kind: DocumentKind) -> [ToolbarItemDescriptor] {
         toolbar.all.filter { $0.docKinds.contains(kind) }
     }
+
+    /// contracts-v2: the chrome overlays to show in a window right now, bottom-most first (kind and visibility
+    /// applied). The chrome host calls it whenever `setNeedsChromeUpdate` fires, the registry or the session changes.
+    public func visibleChromeOverlays(_ context: ChromeContext) -> [ChromeOverlayDescriptor] {
+        chromeOverlays.all.filter { d in
+            (d.docKinds.map { k in context.kind.map { k.contains($0) } ?? false } ?? true) && d.isVisible(context)
+        }
+    }
+
+    /// contracts-v2: asks chrome hosts, toolbars and menus to re-evaluate visibility and live state (`isVisible`,
+    /// `isOn`, `isEnabled`, `sessionTitle`…) after a feature's own state changed (recording started, timer ended).
+    /// nil = every window.
+    public func setNeedsChromeUpdate(_ session: EditorSession? = nil) {
+        let info: [AnyHashable: Any]? = session.map { ["session": $0.id.raw] }
+        NotificationCenter.default.post(name: .nibChromeNeedsUpdate, object: self, userInfo: info)
+    }
+}
+
+// MARK: - Chrome overlays (contracts-v2)
+
+/// Where the document chrome places an overlay: over the canvas, under sheets, inside the safe area and clear of the
+/// bars and the palette.
+public enum ChromePlacement: String, Codable, CaseIterable {
+    /// Budded from the nav bar.
+    case topLeading, top, topTrailing
+    /// Vertically centred on the leading or trailing edge.
+    case leading, trailing
+    case center
+    /// Above the bottom edge (and above an iPhone bottom palette).
+    case bottomLeading, bottom, bottomTrailing
+    /// Next to `ChromeOverlayDescriptor.anchor` (a page rect or a window rect), flipping to stay on screen.
+    case anchored
+}
+
+/// The surface the host gives an overlay. The host maps it to NibDesign droplets (features never build their own glass
+/// for chrome); `.none` hosts the view as it is.
+public enum ChromeSurface: String, Codable, CaseIterable {
+    /// Clear HUD droplet (recording HUD, ruler angle, presenter HUD).
+    case hud
+    /// Clear bar droplet of readable width (audio playback bar, timer bar).
+    case bar
+    /// Small Clear pill ("Return to page", status).
+    case pill
+    /// Deep panel (Zoom Window pane).
+    case panel
+    /// Popover budded from `anchor`.
+    case popover
+    /// No surface: the view draws itself (still placed, stacked and receded by the host).
+    case none
+}
+
+/// What an `.anchored` overlay points at.
+public enum ChromeAnchor: Equatable {
+    /// A rect in page coordinates of the window's document; the host follows scrolling and zoom through the canvas.
+    case page(PageID, Rect)
+    /// A rect in window coordinates (a button's frame, a text selection).
+    case window(CGRect)
+}
+
+public struct ChromeContext {
+    public var app: NibApp
+    public var session: EditorSession
+    public var navigator: SceneNavigator?
+    /// Kind of the document the window shows (nil in the library).
+    public var kind: DocumentKind?
+    /// True on compact width (iPhone, narrow Split View).
+    public var isCompact: Bool
+    /// contracts-v2: the window's floating host, for an overlay that buds popovers of its own. Default:
+    /// `session.floatingHost`.
+    @MainActor
+    public var floatingHost: FloatingHosting? { session.floatingHost }
+
+    public init(app: NibApp, session: EditorSession, navigator: SceneNavigator? = nil, kind: DocumentKind? = nil,
+                isCompact: Bool = false) {
+        self.app = app
+        self.session = session
+        self.navigator = navigator
+        self.kind = kind
+        self.isCompact = isCompact
+    }
+}
+
+/// contracts-v2: the window's floating host. It puts popovers, HUDs, droplet frames and toasts INTO the window's one
+/// droplet container from code that lives outside it: a canvas attachment's popover budded from a point on the page
+/// (comment thread, spelling suggestions, lasso object menu), a UIKit text editor's formatting popover, a HUD, the Zoom
+/// Window's frame, a toast. NibDesign's `NibFloatingHost` does the work; the container's owner (the document chrome
+/// F017, the library F019) creates one per window and sets `EditorSession.floatingHost`. Everything presented merges,
+/// buds and recedes while the Pencil is down (`EditorSession.inking`) like the chrome, because it is in the same
+/// container. Prefer a `ChromeOverlayDescriptor` for anything that shows in every window; use the host for transient
+/// content that a gesture or a UIKit control opens.
+@MainActor
+public protocol FloatingHosting: AnyObject {
+    /// Shows `content`, or replaces what `id` showed. The content is laid out over the whole container, in its
+    /// coordinates: use a component that places itself (a bud popover from an anchor) or `.position`.
+    func present(_ id: String, content: AnyView)
+    func dismiss(_ id: String)
+    func isPresenting(_ id: String) -> Bool
+    /// A bud source at `rect` in `view`'s coordinates (a canvas view, a text view), so a popover can grow out of it.
+    /// False while the host is not on screen in `view`'s window.
+    @discardableResult
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool
+    func removeAnchor(_ id: String)
+    /// `rect` from `view`'s coordinates into the container's; nil while the host is not on screen in `view`'s window.
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect?
+    /// Shows a toast (replacing the one showing). `actionTitle` + `action` add one button (usually Undo).
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?)
+}
+
+public extension FloatingHosting {
+    /// `present(_:content:)` with a view builder.
+    func present<Content: View>(_ id: String, @ViewBuilder content: () -> Content) {
+        present(id, content: AnyView(content()))
+    }
+
+    func postToast(_ message: String) {
+        postToast(message, actionTitle: nil, action: nil)
+    }
+}
+
+/// A floating chrome element a feature contributes to every document window: the audio recording HUD and playback bar
+/// (F052), the Zoom Window pane (F038), the ruler angle HUD (F039), the Return-to-page pill (F029), the timer bar
+/// (F062), the presenter HUD (F063), a comment thread popover budded from its pin (F037). The document chrome (F017)
+/// renders every visible overlay inside the window's one droplet container, so overlays merge, bud and recede with
+/// the bars, and fade to 22 % while the Pencil is down (`EditorSession.inking`). Everything an overlay does still goes
+/// through commands. Re-evaluated on registry changes, session changes and `UIRegistries.setNeedsChromeUpdate()`.
+public struct ChromeOverlayDescriptor: Registrable {
+    public var id: String
+    /// Z-order: higher draws above lower (ties by id).
+    public var order: Int
+    public var owner: String
+    public var placement: ChromePlacement
+    public var surface: ChromeSurface
+    /// Fades to the recede opacity while the Pencil is down in this window (DESIGN.md §10.8).
+    public var recedesWhileWriting: Bool
+    /// Takes touches inside its frame; false = display only (touches fall through to the canvas).
+    public var isInteractive: Bool
+    /// nil = every document kind.
+    public var docKinds: Set<DocumentKind>?
+    public var isVisible: @MainActor (ChromeContext) -> Bool
+    /// `.anchored` only: what to point at (nil = hidden).
+    public var anchor: (@MainActor (ChromeContext) -> ChromeAnchor?)?
+    public var makeView: @MainActor (ChromeContext) -> AnyView
+
+    public init(id: String, owner: String, placement: ChromePlacement, surface: ChromeSurface = .hud, order: Int = 0,
+                recedesWhileWriting: Bool = true, isInteractive: Bool = true, docKinds: Set<DocumentKind>? = nil,
+                isVisible: @escaping @MainActor (ChromeContext) -> Bool = { _ in true },
+                anchor: (@MainActor (ChromeContext) -> ChromeAnchor?)? = nil,
+                makeView: @escaping @MainActor (ChromeContext) -> AnyView) {
+        self.id = id
+        self.order = order
+        self.owner = owner
+        self.placement = placement
+        self.surface = surface
+        self.recedesWhileWriting = recedesWhileWriting
+        self.isInteractive = isInteractive
+        self.docKinds = docKinds
+        self.isVisible = isVisible
+        self.anchor = anchor
+        self.makeView = makeView
+    }
+}
+
+public extension Notification.Name {
+    /// contracts-v2: posted by `UIRegistries.setNeedsChromeUpdate`; userInfo ["session": id] or nil for every window.
+    static let nibChromeNeedsUpdate = Notification.Name("NibChromeNeedsUpdate")
 }
 ```
 
@@ -8487,6 +11492,13 @@ public final class NibApp {
     public let content: ContentRegistries
     public let ui: UIRegistries
     public private(set) var featureIDs: [String] = []
+    /// contracts-v2: true once `start(_:)` has run every feature's `start` (registry changes after this point are
+    /// plugins, content packs or settings, not launch registration).
+    public private(set) var isStarted = false
+
+    /// contracts-v2: this app's device id as 8 lowercase hex characters (per-device package file names "doc.<hex>.json").
+    /// Equals `DeviceIdentity.hex` in the app; each `Harness(deviceID:)` gets its own.
+    public var deviceHex: String { clock.deviceHex }
 
     public init(persistence: DocumentPersistence? = nil, defaults: UserDefaults = .standard,
                 deviceID: UInt32 = DeviceIdentity.current, makeShared: Bool = true) {
@@ -8498,6 +11510,7 @@ public final class NibApp {
         let commands = CommandRegistry()
         let gateway = Gateway()
         let services = NibServices(settings: settings)
+        let content = ContentRegistries()
         self.events = events
         self.clock = clock
         self.settings = settings
@@ -8506,8 +11519,10 @@ public final class NibApp {
         self.gateway = gateway
         self.services = services
         self.bus = CommandBus(registry: commands, workspace: workspace, gateway: gateway, services: services, events: events)
-        self.content = ContentRegistries()
+        self.content = content
         self.ui = UIRegistries()
+        bus.content = content
+        bus.app = self
         services.sessions.events = events
         CoreCommands.register(commands)
         NibSettings.declareAll(settings)
@@ -8539,6 +11554,12 @@ public final class NibApp {
 
     public func start(_ features: [NibFeature.Type]) async {
         for f in features { await f.start(self) }
+        isStarted = true
+    }
+
+    /// contracts-v2: true when the document must not be written (see `CommandContext.isReadOnly`).
+    public func isReadOnly(_ doc: DocumentID) -> Bool {
+        workspace.isReadOnly(doc) || (services.get(ServiceKeys.storeReadOnly, as: NSSet.self)?.contains(doc.raw) ?? false)
     }
 
     /// Runs a command as the user from UI code (menus, buttons); errors are reported to the user by the shell.
@@ -8637,10 +11658,17 @@ public extension DisplayList {
         case .text:
             guard let text = op.text else { return }
             let size = CGFloat(op.fontSize ?? 14)
-            let font = op.fontName.flatMap { UIFont(name: $0, size: size) } ?? UIFont.systemFont(ofSize: size)
+            let font = op.fontName.flatMap { UIFont(name: $0, size: size) }
+                ?? UIFont.systemFont(ofSize: size, weight: DisplayList.uiWeight(op.weight ?? .regular))
+            var attributes: [NSAttributedString.Key: Any] = [.font: font,
+                                                             .foregroundColor: (op.stroke ?? op.fill ?? .black).uiColor]
+            if let align = op.align {
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.alignment = RichTextBridge.alignment(align)
+                attributes[.paragraphStyle] = paragraph
+            }
             UIGraphicsPushContext(cg)
-            (text as NSString).draw(in: r, withAttributes: [.font: font,
-                                                             .foregroundColor: (op.stroke ?? op.fill ?? .black).uiColor])
+            (text as NSString).draw(in: r, withAttributes: attributes)
             UIGraphicsPopContext()
         case .image:
             guard let asset = op.asset, let doc = doc, let data = try? assets?.data(asset, doc: doc),
@@ -8683,6 +11711,19 @@ public extension DisplayList {
                 }
                 y += step
             }
+        }
+    }
+}
+
+extension DisplayList {
+    static func uiWeight(_ w: DisplayFontWeight) -> UIFont.Weight {
+        switch w {
+        case .light: return .light
+        case .regular: return .regular
+        case .medium: return .medium
+        case .semibold: return .semibold
+        case .bold: return .bold
+        case .heavy: return .heavy
         }
     }
 }
@@ -9260,7 +12301,10 @@ public final class Harness {
     public let confirmer: AutoConfirm
 
     /// `deviceID` lets two-device tests (sync, collaboration) give each app its own HLC device id (e.g. 7 and 8).
-    public init(features: [NibFeature.Type] = [], fixtures: Bool = true, deviceID: UInt32 = 7) {
+    /// contracts-v2: `keepFeatureServices: true` keeps the persistence, library and asset store the features installed
+    /// in `register` (the real store in F001/F025 acceptance tests) instead of putting the in-memory ones back.
+    public init(features: [NibFeature.Type] = [], fixtures: Bool = true, deviceID: UInt32 = 7,
+                keepFeatureServices: Bool = false) {
         NibApp.isHostlessTest = true
         if !(Keychain.store is InMemorySecretStore) { Keychain.store = InMemorySecretStore() }
         let persistence = InMemoryPersistence()
@@ -9286,11 +12330,29 @@ public final class Harness {
             session.page = Fixtures.page1
         }
         app.register(features)
-        // Features may install real services in `register`; tests keep the in-memory ones.
-        app.workspace.persistence = persistence
-        app.services.library = library
-        app.services.assets = assets
-        app.settings.syncedBackend = nil
+        // Features may install real services in `register`; tests keep the in-memory ones unless asked not to.
+        if !keepFeatureServices {
+            app.workspace.persistence = persistence
+            app.services.library = library
+            app.services.assets = assets
+            app.settings.syncedBackend = nil
+        }
+    }
+
+    /// contracts-v2: writes items onto a page as the user in ONE undo step (one batch `DocTransaction.put`), without
+    /// needing the features that own ink or item commands. Returns the written items (z, rev and provenance stamped).
+    @discardableResult
+    public func insert(_ items: [Item], page: PageID = Fixtures.page1, doc: DocumentID = Fixtures.docID) async throws -> [Item] {
+        let id = "nibtesting.insert"
+        var written: [Item] = []
+        app.commands.register(CommandDescriptor(id: id, title: "Insert Items", summary: "NibTesting helper.",
+                                                effect: .edit, exposure: .ui)) { _, ctx in
+            written = try ctx.mutate { tx in try tx.put(items, doc: doc, page: page) }
+            return .null
+        }
+        defer { app.commands.unregister(id: id) }
+        try await app.bus.execute(Invocation(command: id, session: session))
+        return written
     }
 
     /// Runs a command through the JSON path (validation, permissions, confirmation) and returns its value.
@@ -9596,6 +12658,8 @@ public final class FakePDFService: PDFService {
     public var texts: [String: String] = [:]
     public var linkMap: [String: [PDFLinkInfo]] = [:]
     public var outlines: [String: [PDFOutlineNode]] = [:]
+    /// contracts-v2: words per file name for `word(_:page:at:)` (the first whose rect contains the point).
+    public var words: [String: [(text: String, rect: Rect)]] = [:]
 
     public init() {}
 
@@ -9609,6 +12673,9 @@ public final class FakePDFService: PDFService {
     public func outline(_ url: URL) -> [PDFOutlineNode] { outlines[url.lastPathComponent] ?? [] }
     public func selection(_ url: URL, page: Int, from: Point, to: Point) -> (text: String, rects: [Rect]) {
         (texts[url.lastPathComponent] ?? "", [Rect(x: from.x, y: from.y, width: max(1, to.x - from.x), height: 18)])
+    }
+    public func word(_ url: URL, page: Int, at point: Point) -> (text: String, rect: Rect)? {
+        words[url.lastPathComponent]?.first { $0.rect.contains(point) }
     }
 }
 
@@ -9656,6 +12723,8 @@ public final class FakeCanvasHost: CanvasHost {
     public private(set) var committed: [(stroke: Stroke, page: PageID)] = []
     public private(set) var wetStrokeCancels = 0
     public private(set) var liveViews: [ElementID: UIView] = [:]
+    /// contracts-v2: pages passed to `afterNextRender` (the fake runs the body at once).
+    public private(set) var renderWaits: [PageID] = []
 
     public init(app: NibApp, session: EditorSession, doc: DocumentID = Fixtures.docID,
                 pages: [PageID] = [Fixtures.page1, Fixtures.page2]) {
@@ -9695,6 +12764,12 @@ public final class FakeCanvasHost: CanvasHost {
     public func commitStroke(_ stroke: Stroke, page: PageID) { committed.append((stroke, page)) }
     public func cancelWetStroke() { wetStrokeCancels += 1 }
     public func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { liveViews[item] = view }
+
+    /// Runs `body` immediately (tests need no render delay) and records the page.
+    public func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) {
+        renderWaits.append(page)
+        body()
+    }
 }
 
 /// Collaboration transport inside one process: transports sharing a `Hub` that host/join the same code exchange
@@ -9755,6 +12830,78 @@ public final class InMemoryCollabTransport: CollabTransport {
         self.code = code
         hub.rooms[code, default: []].append(self)
         for t in room { t.onPeersChanged?(t.peers) }
+    }
+}
+```
+
+### `NibKit/Sources/NibTesting/Snapshot.swift`
+
+```swift
+import SwiftUI
+import UIKit
+import NibContracts
+
+/// contracts-v2: offscreen snapshots of SwiftUI views for hostless tests: the Light, Dark and AX3 states DESIGN.md
+/// §15.7 asks for, plus pixel reads for colour assertions. Rendering uses `ImageRenderer`, so pure SwiftUI renders;
+/// UIKit-backed views (UIViewRepresentable) render as placeholders. States that need a host app (Reduce Transparency,
+/// Increase Contrast, live glass) belong to smoke scripts (F111).
+@MainActor
+public enum NibSnapshot {
+    public enum Variant: String, CaseIterable {
+        case light, dark
+        /// Light at accessibility text size 3.
+        case largeText
+
+        public var colorScheme: ColorScheme { self == .dark ? .dark : .light }
+        public var dynamicTypeSize: DynamicTypeSize { self == .largeText ? .accessibility3 : .large }
+    }
+
+    /// `view` rendered at `size` (points) in `variant`; nil when nothing renders.
+    public static func image<V: View>(_ view: V, size: CGSize, variant: Variant = .light, scale: CGFloat = 2) -> UIImage? {
+        let styled = view
+            .frame(width: size.width, height: size.height)
+            .environment(\.colorScheme, variant.colorScheme)
+            .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
+        let renderer = ImageRenderer(content: styled)
+        renderer.scale = scale
+        return renderer.uiImage
+    }
+
+    /// `view` in every variant.
+    public static func images<V: View>(_ view: V, size: CGSize, scale: CGFloat = 2) -> [Variant: UIImage] {
+        var out: [Variant: UIImage] = [:]
+        for v in Variant.allCases {
+            if let image = image(view, size: size, variant: v, scale: scale) { out[v] = image }
+        }
+        return out
+    }
+
+    /// The size `view` wants at `width` in `variant` (UIHostingController.sizeThatFits), for layout assertions such as
+    /// "the panel still fits at AX3".
+    public static func fittingSize<V: View>(_ view: V, width: CGFloat, variant: Variant = .light) -> CGSize {
+        let styled = view
+            .environment(\.colorScheme, variant.colorScheme)
+            .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
+        let host = UIHostingController(rootView: styled)
+        return host.sizeThatFits(in: CGSize(width: width, height: CGFloat.greatestFiniteMagnitude))
+    }
+
+    /// The colour of the pixel at `point` (points, top-left origin); nil outside the image.
+    public static func pixel(_ image: UIImage, at point: CGPoint) -> RGBA? {
+        guard let cg = image.cgImage else { return nil }
+        let x = Int(point.x * image.scale)
+        let y = Int(point.y * image.scale)
+        guard x >= 0, y >= 0, x < cg.width, y < cg.height else { return nil }
+        var px: [UInt8] = [0, 0, 0, 0]
+        let drawn = px.withUnsafeMutableBytes { buffer -> Bool in
+            guard let ctx = CGContext(data: buffer.baseAddress, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: -CGFloat(x), y: CGFloat(y + 1 - cg.height), width: CGFloat(cg.width),
+                                    height: CGFloat(cg.height)))
+            return true
+        }
+        return drawn ? RGBA(px[0], px[1], px[2], px[3]) : nil
     }
 }
 ```
@@ -10188,7 +13335,15 @@ enum NameLookupCanary {
         BlockViewContext.self, BlockViewDescriptor.self, PluginPanelFactory.self, CanvasToolDescriptor.self, DocumentEditorDescriptor.self,
         OpenMode.self, SceneNavigator.self, SceneHooks.self, ScreenRegistry.self, UIRegistries.self,
         NibFeature.self, NibApp.self, SafeMode.self, InkOutline.self, FakeCanvasHost.self,
-        InMemoryCollabTransport.self
+        InMemoryCollabTransport.self,
+        // contracts-v2
+        NibEventPayload.self, SyncStatusPayload.self, IndexProgressPayload.self, LaserMovedPayload.self,
+        AudioPlaybackPayload.self, AudioRecordingPayload.self, ShapeSnappedPayload.self, PencilHapticPayload.self,
+        InkingSignal.self, TextRecognitionWord.self, RegistryChange.self, PageInsets.self, TemplateMetrics.self,
+        DrawPurpose.self, ExportOptionKeys.self, TextLayoutInfo.self, TextLayoutDescriptor.self, PanelPresentation.self,
+        ChromePlacement.self, ChromeSurface.self, ChromeAnchor.self, ChromeContext.self, ChromeOverlayDescriptor.self,
+        DisplayFontWeight.self, NibFragment.self, BridgeNames.self, PanelIDs.self, ToolbarLayoutSetting.self,
+        TemplateIDs.self, TemplateParamNames.self, FloatingHosting.self, ToolMenuPopover.self, NibSnapshot.self
     ]
 
     /// Protocols with associated types / Self requirements are checked as generic constraints.
@@ -10228,6 +13383,1095 @@ final class NameLookupCanaryTests: XCTestCase {
         let h = Harness()
         _ = CanaryView(app: h.app).body
     }
+}
+```
+
+### `NibKit/Tests/NibContractsTests/ContractsV2Tests.swift`
+
+```swift
+import XCTest
+import UIKit
+import SwiftUI
+import NibContracts
+import NibTesting
+
+/// contracts-v2: regression tests for the DocTransaction.revert fixes and coverage of the APIs added in the v2 pass
+/// (docs/CONTRACTS.md › contracts-v2 changelog).
+@MainActor
+final class ContractsV2Tests: XCTestCase {
+    private let doc = Fixtures.docID
+    private let page1 = Fixtures.page1
+    private let mathRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01"
+
+    // MARK: Undo / revert regressions
+
+    /// F031 (FeatShapesTests.testDroppingAnItemIntoAShapeAttachesItInTheSameUndoStep): a commit observer attaches the
+    /// moved item with `item.update` in the move's own undo group; one undo must revert BOTH the attach and the move.
+    func testAttachAfterMoveInTheSameGroupUndoesTheMoveToo() async throws {
+        let h = Harness()
+        registerMoveStandIns(h.app)
+        var pending: Task<Void, Never>?
+        let watcher = h.app.bus.observeCommits { cs in
+            guard cs.principal.isUser, cs.command == CommandIDs.itemTransform else { return }
+            let app = h.app, session = h.session, group = cs.group, ref = self.mathRef
+            pending = Task { @MainActor in
+                _ = try? await app.bus.execute(Invocation(command: CommandIDs.itemUpdate,
+                                                          params: ["ref": .string(ref), "patch": ["attachedTo": "FIXTURESHP01"]],
+                                                          session: session, group: group))
+            }
+        }
+        defer { watcher.cancel() }
+        // The maths item (72, 480, 120 × 40) moves inside the fixture rectangle (100, 200, 160 × 90).
+        try await h.run(CommandIDs.itemTransform, ["refs": [.string(mathRef)], "translate": [48, -260]])
+        await pending?.value
+        let math = try h.app.workspace.item(doc, page: page1, id: Fixtures.mathID)
+        XCTAssertEqual(math.attachedTo, Fixtures.shapeID)
+        XCTAssertEqual(math.frame, Frame(x: 120, y: 220, w: 120, h: 40))
+        XCTAssertEqual(h.undoDepth(doc), 1, "move and attach are one undo step")
+
+        XCTAssertTrue(h.app.bus.undo(doc))
+        let restored = try h.app.workspace.item(doc, page: page1, id: Fixtures.mathID)
+        XCTAssertNil(restored.attachedTo)
+        XCTAssertEqual(restored.frame, Frame(x: 72, y: 480, w: 120, h: 40))
+
+        XCTAssertTrue(h.app.bus.redo(doc))
+        let again = try h.app.workspace.item(doc, page: page1, id: Fixtures.mathID)
+        XCTAssertEqual(again.attachedTo, Fixtures.shapeID)
+        XCTAssertEqual(again.frame, Frame(x: 120, y: 220, w: 120, h: 40))
+    }
+
+    /// F005 / F028 / F036 / F044: one undo group that writes the same item, page record and document meta twice
+    /// (debounced text commits, a meta change applied in two steps) undoes all the way back and redoes all the way.
+    func testRecordWrittenTwiceInOneGroupIsFullyReverted() async throws {
+        let h = Harness()
+        let before = try h.snapshot()
+        let group = "TWICE0000001"
+        for text in ["One", "One two"] {
+            let ctx = try await probeContext(h, group: group)
+            try ctx.mutate { tx in
+                var it = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+                it.text?.text = RichText(plain: text)
+                try tx.put(it, doc: self.doc, page: self.page1)
+                var page = try XCTUnwrap(try tx.content(self.doc).page(self.page1))
+                page.title = text
+                try tx.put(page, doc: self.doc)
+                var meta = try tx.content(self.doc).meta
+                meta.language = text == "One" ? "de-DE" : "fr-FR"
+                try tx.putMeta(meta)
+            }
+        }
+        XCTAssertEqual(h.undoDepth(doc), 1)
+        let after = try h.snapshot()
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(), before, "both writes of each record are reverted")
+        XCTAssertTrue(h.app.bus.redo(doc))
+        XCTAssertEqual(try h.snapshot(), after)
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).text?.text.plainText, "One two")
+    }
+
+    /// F026 / F029 / F034 / F036 / F049: consecutive undo entries on the SAME item all undo (each revert re-stamps the
+    /// item, which used to make the next-older entry look "changed since" and be skipped), then all redo.
+    func testConsecutiveUndosOnOneItem() async throws {
+        let h = Harness()
+        let before = try h.snapshot()
+        var states: [JSONValue] = []
+        for step in 0..<3 {
+            let ctx = try await probeContext(h)
+            try ctx.mutate { tx in
+                var it = try tx.item(self.doc, page: self.page1, id: Fixtures.stickyID)
+                switch step {
+                case 0: it.locked = true
+                case 1: it.layer = 2
+                default: it.sticky?.text = RichText(plain: "edited")
+                }
+                try tx.put(it, doc: self.doc, page: self.page1)
+            }
+            states.append(try h.snapshot())
+        }
+        XCTAssertEqual(h.undoDepth(doc), 3)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(), states[1])
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(), states[0])
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertTrue(h.app.bus.redo(doc))
+        XCTAssertTrue(h.app.bus.redo(doc))
+        XCTAssertEqual(try h.snapshot(), states[1])
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(), states[0], "undo after redo still lines up")
+        XCTAssertTrue(h.app.bus.redo(doc))
+        XCTAssertTrue(h.app.bus.redo(doc))
+        XCTAssertEqual(try h.snapshot(), states[2])
+    }
+
+    /// F034: insert an image, crop it, flip it, then undo three times: the page is back to where it started.
+    func testInsertCropFlipThenThreeUndosRemovesTheImage() async throws {
+        let h = Harness()
+        let before = try h.snapshot()
+        let id: ElementID = "IMGV2TEST001"
+        let insert = try await probeContext(h)
+        try insert.mutate { tx in
+            try tx.put(Item.makeImage(ImageItem(frame: Frame(x: 50, y: 50, w: 100, h: 80), asset: Fixtures.pngAsset)).with(id: id),
+                       doc: self.doc, page: self.page1)
+        }
+        let crop = try await probeContext(h)
+        try crop.mutate { tx in
+            var it = try tx.item(self.doc, page: self.page1, id: id)
+            it.image?.crop = Rect(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
+            try tx.put(it, doc: self.doc, page: self.page1)
+        }
+        let flip = try await probeContext(h)
+        try flip.mutate { tx in
+            var it = try tx.item(self.doc, page: self.page1, id: id)
+            it.image?.flipX = true
+            try tx.put(it, doc: self.doc, page: self.page1)
+        }
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: id).image?.flipX, true)
+        for _ in 0..<3 { XCTAssertTrue(h.app.bus.undo(doc)) }
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertThrowsError(try h.app.workspace.item(doc, page: page1, id: id))
+    }
+
+    func testSelectiveRevertStillSkipsRecordsChangedLater() async throws {
+        let h = Harness()
+        let first = try await probeContext(h)
+        try first.mutate { tx in
+            var it = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+            it.locked = true
+            try tx.put(it, doc: self.doc, page: self.page1)
+        }
+        let later = try await probeContext(h)
+        try later.mutate { tx in
+            var it = try tx.item(self.doc, page: self.page1, id: Fixtures.textID)
+            it.layer = 3
+            try tx.put(it, doc: self.doc, page: self.page1)
+        }
+        let r = h.app.bus.revert(group: first.group, doc: doc)
+        XCTAssertEqual(r?.skipped, 1)
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: Fixtures.textID).layer, 3)
+    }
+
+    func testLinkedUndoAcrossDocuments() async throws {
+        let h = Harness()
+        let beforeA = try h.snapshot(Fixtures.docID)
+        let beforeB = try h.snapshot(Fixtures.whiteboardID)
+        let ctx = try await probeContext(h)
+        ctx.linkUndoAcrossDocuments()
+        try ctx.mutate { tx in
+            try tx.delete(item: Fixtures.stickyID, doc: Fixtures.docID, page: Fixtures.page1)
+            var board = try tx.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: Fixtures.boardShapeID)
+            board.locked = true
+            try tx.put(board, doc: Fixtures.whiteboardID, page: Fixtures.boardID)
+        }
+        XCTAssertTrue(h.app.bus.history.isLinked(ctx.group))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.whiteboardID))
+        XCTAssertEqual(try h.snapshot(Fixtures.docID), beforeA, "undo in one document undoes the linked step in the other")
+        XCTAssertEqual(try h.snapshot(Fixtures.whiteboardID), beforeB)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.stickyID))
+        XCTAssertTrue(try h.app.workspace.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: Fixtures.boardShapeID).locked)
+
+        // Unlinked groups keep per-document undo.
+        let plain = try await probeContext(h)
+        try plain.mutate { tx in
+            try tx.delete(item: Fixtures.textID, doc: Fixtures.docID, page: Fixtures.page1)
+            try tx.delete(item: Fixtures.boardShapeID, doc: Fixtures.whiteboardID, page: Fixtures.boardID)
+        }
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertThrowsError(try h.app.workspace.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: Fixtures.boardShapeID))
+    }
+
+    // MARK: Provenance, moves and batch writes
+
+    func testMoveKeepsProvenanceForNonUserPrincipals() async throws {
+        let h = Harness(features: [V2ProbeFeature.self])
+        let r = try await h.run("v2probe.create")
+        guard case let .item(_, _, id)? = NodeRef(r["ref"]?.stringValue ?? "") else { return XCTFail("no ref") }
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: id).createdBy, "user")
+
+        try await h.run("v2probe.move", ["id": .string(id.raw)], as: .ai("chat7"))
+        let moved = try h.app.workspace.item(doc, page: Fixtures.page2, id: id)
+        XCTAssertEqual(moved.createdBy, "user", "the AI moving the user's item keeps it the user's")
+        XCTAssertEqual(moved.frame?.x, 30)
+        XCTAssertThrowsError(try h.app.workspace.item(doc, page: page1, id: id))
+
+        // A plain put by the AI of a NEW item still stamps the AI.
+        let made = try await h.run("v2probe.create", as: .ai("chat7"))
+        guard case let .item(_, _, aiID)? = NodeRef(made["ref"]?.stringValue ?? "") else { return XCTFail("no ref") }
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: aiID).createdBy, "ai:chat7")
+
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.app.workspace.item(doc, page: page1, id: id).createdBy, "user", "undo puts it back")
+    }
+
+    func testBatchPutAndDelete() async throws {
+        let h = Harness()
+        let before = try h.snapshot()
+        let items = (0..<500).map { i in
+            Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: Float(i), y: 10), StrokePoint(x: Float(i), y: 20)]))
+        }
+        let ctx = try await probeContext(h)
+        let written = try ctx.mutate { tx in try tx.put(items, doc: self.doc, page: Fixtures.page2) }
+        XCTAssertEqual(written.count, 500)
+        let onPage = try h.app.workspace.items(doc, page: Fixtures.page2)
+        XCTAssertEqual(onPage.map { $0.id }, written.map { $0.id }, "appended in order, on top")
+        XCTAssertEqual(Set(onPage.map { $0.z }).count, 500)
+        XCTAssertLessThan(onPage.map { $0.z.count }.max() ?? 0, 10, "batch z keys are balanced, not one character longer every few items")
+        XCTAssertTrue(onPage.allSatisfy { $0.createdBy == "user" })
+
+        let del = try await probeContext(h)
+        XCTAssertThrowsError(try del.mutate { tx in
+            try tx.delete(items: [written[0].id, "NOTANITEM001"], doc: self.doc, page: Fixtures.page2)
+        })
+        XCTAssertEqual(try h.app.workspace.items(doc, page: Fixtures.page2).count, 500, "nothing written on failure")
+        try del.mutate { tx in try tx.delete(items: written.prefix(200).map { $0.id }, doc: self.doc, page: Fixtures.page2) }
+        XCTAssertEqual(try h.app.workspace.items(doc, page: Fixtures.page2).count, 300)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testBatchCardsAppendInOrder() async throws {
+        let h = Harness()
+        let cards = (0..<50).map { StudyCard(front: CardFace(text: RichText(plain: "Q\($0)")), back: CardFace()) }
+        let ctx = try await probeContext(h)
+        let written = try ctx.mutate { tx in try tx.put(cards, doc: Fixtures.studySetID) }
+        let live = try h.app.workspace.content(Fixtures.studySetID).liveCards
+        XCTAssertEqual(live.suffix(50).map { $0.id }, written.map { $0.id })
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.studySetID).liveCards.count, 2)
+    }
+
+    func testLargeCardImportUndoesRedoesAndRollsBackInOnePass() async throws {
+        let h = Harness()
+        let set = Fixtures.studySetID
+        let before = try h.snapshot(set)
+        let cards = (0..<10_000).map { StudyCard(front: CardFace(text: RichText(plain: "Q\($0)")), back: CardFace()) }
+
+        // A failed import leaves nothing behind (batched rollback).
+        let failing = try await probeContext(h)
+        XCTAssertThrowsError(try failing.mutate { tx -> Void in
+            _ = try tx.put(cards, doc: set)
+            throw NibError.invalid("importer stopped")
+        })
+        XCTAssertEqual(try h.snapshot(set), before)
+
+        // Import, then edit one imported card again in the same group: one undo removes everything.
+        let ctx = try await probeContext(h)
+        let written = try ctx.mutate { tx -> [StudyCard] in
+            let w = try tx.put(cards, doc: set)
+            var edited = w[42]
+            edited.front = CardFace(text: RichText(plain: "edited"))
+            try tx.put(edited, doc: set)
+            return w
+        }
+        XCTAssertEqual(try h.app.workspace.content(set).liveCards.count, 10_002)
+        XCTAssertLessThan(written.map { $0.order.count }.max() ?? 0, 10, "balanced order keys")
+        XCTAssertEqual(written.map { $0.order }, written.map { $0.order }.sorted(), "appended in array order")
+        XCTAssertTrue(h.app.bus.undo(set))
+        XCTAssertEqual(try h.app.workspace.content(set).liveCards.count, 2)
+        XCTAssertTrue(h.app.bus.redo(set))
+        let live = try h.app.workspace.content(set).liveCards
+        XCTAssertEqual(live.count, 10_002)
+        XCTAssertEqual(live.first { $0.id == written[42].id }?.front.text?.plainText, "edited")
+        XCTAssertTrue(h.app.bus.undo(set))
+        XCTAssertEqual(try h.app.workspace.content(set).liveCards.count, 2)
+    }
+
+    func testBatchPagesOutlineAndAudio() async throws {
+        let h = Harness()
+        let before = try h.snapshot()
+        let ctx = try await probeContext(h)
+        let invalid: [PageRecord] = [PageRecord(), PageRecord(rotation: 45)]
+        XCTAssertThrowsError(try ctx.mutate { tx in try tx.put(invalid, doc: self.doc) },
+                             "every page is validated before anything is written")
+        XCTAssertEqual(try h.snapshot(), before)
+
+        let newPages: [PageRecord] = (0..<20).map { _ in PageRecord() }
+        let pages = try ctx.mutate { tx in try tx.put(newPages, doc: self.doc) }
+        let live = try h.app.workspace.content(doc).livePages
+        XCTAssertEqual(live.suffix(20).map { $0.id }, pages.map { $0.id }, "appended in array order")
+        let entries: [OutlineEntry] = (0..<3).map { OutlineEntry(title: "Part \($0)", page: pages[$0].id) }
+        let outline = try ctx.mutate { tx in try tx.put(entries, doc: self.doc) }
+        XCTAssertEqual(try h.app.workspace.content(doc).liveOutline.suffix(3).map { $0.title }, ["Part 0", "Part 1", "Part 2"])
+        XCTAssertEqual(outline.count, 3)
+        let newClips = [AudioClip(name: "a", file: "a.m4a", start: 0), AudioClip(name: "b", file: "b.m4a", start: 5)]
+        let clips = try ctx.mutate { tx in try tx.put(newClips, doc: self.doc) }
+        XCTAssertTrue(clips.allSatisfy { $0.rev != .zero })
+        XCTAssertTrue(h.app.bus.undo(doc), "one context = one undo group for pages, outline and audio")
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testHarnessInsertIsOneUndoStep() async throws {
+        let h = Harness()
+        let written = try await h.insert([Item.makeSticky(StickyItem(frame: Frame(x: 1, y: 1, w: 50, h: 50))),
+                                          Item.makeSticky(StickyItem(frame: Frame(x: 60, y: 1, w: 50, h: 50)))],
+                                         page: Fixtures.page2)
+        XCTAssertEqual(written.count, 2)
+        XCTAssertEqual(h.undoDepth(doc), 1)
+        XCTAssertNil(h.app.commands.descriptor("nibtesting.insert"), "the helper command is removed again")
+    }
+
+    // MARK: CommandContext
+
+    func testCommandContextReachesTheAppAndSessionDefaults() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        XCTAssertTrue(ctx.app === h.app)
+        XCTAssertTrue(ctx.content === h.app.content)
+        XCTAssertTrue(ctx.ui === h.app.ui)
+        XCTAssertNil(ctx.navigator)
+        XCTAssertEqual(try ctx.documentOrSession(nil), doc)
+        XCTAssertEqual(try ctx.documentOrSession("doc:FIXTUREDOC02"), Fixtures.textDocID)
+        let page = try ctx.pageOrSession(nil)
+        XCTAssertEqual(page.doc, doc)
+        XCTAssertEqual(page.page, page1)
+        XCTAssertThrowsError(try ctx.pageOrSession("doc:FIXTUREDOC01"))
+        XCTAssertEqual(ctx.refsOrSelection(nil), [])
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        XCTAssertEqual(ctx.refsOrSelection([]), ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"])
+
+        XCTAssertFalse(ctx.isReadOnly(doc))
+        h.app.services.set(NSMutableSet(array: [doc.raw]), for: ServiceKeys.storeReadOnly)
+        XCTAssertTrue(ctx.isReadOnly(doc))
+        XCTAssertTrue(h.app.isReadOnly(doc))
+        XCTAssertFalse(ctx.isReadOnly(Fixtures.textDocID))
+        XCTAssertEqual(h.app.deviceHex, "00000007")
+    }
+
+    func testUndoFallsBackToTheSessionDocumentForTheUser() async throws {
+        let h = Harness()
+        let ctx = try await probeContext(h)
+        try ctx.mutate { tx in try tx.delete(item: Fixtures.stickyID, doc: self.doc, page: self.page1) }
+        let r = try await h.run(CommandIDs.undo)
+        XCTAssertEqual(r["done"], true)
+        XCTAssertNoThrow(try h.app.workspace.item(doc, page: page1, id: Fixtures.stickyID))
+        do {
+            try await h.run(CommandIDs.undo, [:], as: .ai("t"))
+            XCTFail("non-user callers must name the document")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+        }
+    }
+
+    func testInputFileSecurity() async throws {
+        let h = Harness(features: [V2ProbeFeature.self])
+        let host = FakePluginHost(hosts: ["example.org"])
+        h.app.services.set(host, for: ServiceKeys.pluginHost)
+        h.app.gateway.grants = { p in
+            if case .plugin = p { return [.documentRead, .network] }
+            return Gateway.defaultGrants(p)
+        }
+        func denied(_ url: String, as principal: Principal, _ code: NibError.Code,
+                    file: StaticString = #filePath, line: UInt = #line) async {
+            do {
+                try await h.run("v2probe.fetch", ["url": .string(url)], as: principal)
+                XCTFail("\(url) must be refused for \(principal)", file: file, line: line)
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, code, "\(url) as \(principal): \(e)", file: file, line: line)
+            } catch {
+                XCTFail("unexpected \(error)", file: file, line: line)
+            }
+        }
+        // The old `case "https", "http" where principal.isUser` let every non-user principal download over https.
+        await denied("http://example.org/a.pdf", as: .plugin("dev.test.plugin"), .permissionDenied)
+        await denied("https://evil.example.com/a.pdf", as: .plugin("dev.test.plugin"), .permissionDenied)
+        await denied("http://example.org/a.pdf", as: .ai("chat"), .permissionDenied)
+        h.app.gateway.grants = { p in
+            if case .ai = p { return [.documentRead] }
+            return Gateway.defaultGrants(p)
+        }
+        await denied("https://example.org/a.pdf", as: .ai("chat"), .permissionDenied)
+        await denied("tmp:../../secret", as: .user, .invalidParams)
+        await denied("tmp:.hidden", as: .user, .invalidParams)
+
+        let tmp = try h.assets.putTemporary(Data([1, 2, 3]), ext: "bin")
+        let ok = try await h.run("v2probe.fetch", ["url": .string("tmp:" + tmp.name)])
+        XCTAssertEqual(ok["size"], 3)
+        XCTAssertEqual(NibLimits.maxDownloadBytes, 200 * 1_048_576)
+    }
+
+    func testClosureHookTransformsAndVetoes() async throws {
+        let h = Harness(features: [V2ProbeFeature.self])
+        h.app.bus.hooks.register(CommandHookDescriptor(id: "v2.hook", owner: "test", commands: ["v2probe.*"]) { command, params in
+            if command == "v2probe.echo", params["veto"] == true { throw NibError(.userDenied, "vetoed") }
+            return command == "v2probe.echo" ? params.merging(["hooked": true]) : nil
+        })
+        let r = try await h.run("v2probe.echo", ["x": 1])
+        XCTAssertEqual(r["hooked"], true)
+        XCTAssertEqual(r["x"], 1)
+        do {
+            try await h.run("v2probe.echo", ["veto": true])
+            XCTFail("the hook vetoes")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .userDenied)
+        }
+    }
+
+    func testGuardHookSeesTheCallAndVetoesForEveryPrincipal() async throws {
+        let h = Harness(features: [V2ProbeFeature.self])
+        var seen: [(principal: String, page: PageID?, session: Bool)] = []
+        var mutateError: NibError?
+        let limit = 1
+        h.app.bus.hooks.register(CommandHookDescriptor.guarding(id: "v2.limit", owner: "test", commands: ["v2probe.create"]) { _, params, ctx in
+            let page = try ctx.pageOrSession(params["page"]?.stringValue)
+            seen.append((ctx.principal.kind, page.page, ctx.activeSession != nil))
+            do { try ctx.mutate { _ in } } catch let e as NibError { mutateError = e }
+            let count = try ctx.app?.workspace.items(page.doc, page: page.page).filter { $0.kind == .sticky }.count ?? 0
+            if count >= limit + 1 { throw NibError(.invalidParams, "board limit reached") }
+            return nil
+        })
+        XCTAssertEqual(h.session.page, Fixtures.page1)
+        let before = try h.app.workspace.items(doc, page: page1).filter { $0.kind == .sticky }.count
+        XCTAssertEqual(before, 1, "fixture page 1 has one sticky")
+        _ = try await h.run("v2probe.create")
+        XCTAssertEqual(mutateError?.code, .permissionDenied, "a guard runs read-only")
+        for principal in [Principal.ai("c"), .plugin("dev.test.plugin"), .user] {
+            do {
+                _ = try await h.run("v2probe.create", as: principal)
+                XCTFail("the guard vetoes \(principal.kind)")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams)
+            }
+        }
+        XCTAssertEqual(seen.map { $0.principal }, ["user", "ai", "plugin", "user"])
+        XCTAssertTrue(seen.allSatisfy { $0.page == Fixtures.page1 && $0.session }, "session defaults resolve inside the guard")
+        XCTAssertEqual(try h.app.workspace.items(doc, page: page1).filter { $0.kind == .sticky }.count, 2)
+
+        XCTAssertEqual(TemplateIDs.blank, PageRecord().background.template?.id)
+        XCTAssertEqual(TemplateIDs.whiteboardDots, "builtin.whiteboardDots")
+        let t = TemplateDefinition(id: TemplateIDs.ruled, title: "Ruled", category: "Writing", owner: "test",
+                                   defaults: [TemplateParamNames.spacing: 24, TemplateParamNames.margin: 10]) { _, _, _ in
+            TemplateRender(paper: .white)
+        }
+        XCTAssertEqual(t.metrics(for: [:], size: nil).spacing, 24)
+        XCTAssertEqual(t.metrics(for: [:], size: nil).margins?.left, 10)
+    }
+
+    func testGatewayPerKindPresenterAndPolicy() async throws {
+        let h = Harness(features: [V2ProbeFeature.self])
+        let bridgeConfirmer = AutoConfirm()
+        bridgeConfirmer.decision = .deny
+        h.app.gateway.setPresenter(bridgeConfirmer, forPrincipalKind: "bridge")
+        h.app.gateway.setPolicy(forPrincipalKind: "bridge") { _ in .always }
+        XCTAssertEqual(h.app.gateway.policy(.bridge("c")), .always)
+        XCTAssertEqual(h.app.gateway.policy(.ai("c")), .destructive)
+        do {
+            try await h.run("v2probe.create", as: .bridge("c"))
+            XCTFail("the bridge presenter denies")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .userDenied)
+        }
+        XCTAssertEqual(bridgeConfirmer.requests.count, 1)
+        XCTAssertTrue(h.confirmer.requests.isEmpty, "the app-wide presenter was not asked")
+        _ = try await h.run("v2probe.create", as: .ai("c"))
+        XCTAssertTrue(h.app.gateway.confirmationPresenter(for: .ai("c")) === h.confirmer)
+    }
+
+    // MARK: Session, events and registries
+
+    func testSessionEventsTemporaryToolsAndInking() async throws {
+        let h = Harness()
+        var types: [String] = []
+        let sub = h.app.events.subscribe { types.append($0.type) }
+        defer { sub.cancel() }
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+        h.app.services.sessions.activate(h.session)
+        XCTAssertEqual(types.filter { $0 == NibEventType.sessionActivated }.count, 2)
+        h.session.hiddenLayers = [1]
+        h.session.activeLayer = 2
+        XCTAssertEqual(types.filter { $0 == NibEventType.layersChanged }.count, 2)
+
+        h.session.tool = "pen"
+        try await h.run(CommandIDs.toolSelect, ["tool": "lasso", "temporary": true])
+        XCTAssertEqual(h.session.tool, "lasso")
+        XCTAssertEqual(h.session.temporaryReturnTool, "pen")
+        let canvas = FakeCanvasHost(h)
+        canvas.finishToolUse(StickyTestTool())
+        XCTAssertEqual(h.session.tool, "pen", "a temporary tool returns after one use")
+        XCTAssertNil(h.session.temporaryReturnTool)
+        XCTAssertTrue(types.contains(NibEventType.toolFinished))
+        try await h.run(CommandIDs.toolSelect, ["tool": "image"])
+        canvas.finishToolUse(OneShotTestTool())
+        XCTAssertEqual(h.session.tool, "pen", "a non-sticky tool hands back to the previous tool")
+
+        var seen: [Bool] = []
+        let watch = h.session.inking.observe { seen.append($0.isInking) }
+        h.session.inking.begin(strokeBounds: CGRect(x: 0, y: 0, width: 10, height: 10))
+        h.session.inking.update(strokeBounds: CGRect(x: 0, y: 0, width: 20, height: 10))
+        h.session.inking.end()
+        watch.cancel()
+        XCTAssertEqual(seen, [true, true, false])
+        XCTAssertNil(h.session.inking.strokeBounds)
+    }
+
+    func testTypedEventPayloads() {
+        let bus = EventBus()
+        var got: SyncStatusPayload?
+        let sub = bus.subscribe { got = $0.decode(SyncStatusPayload.self) ?? got }
+        defer { sub.cancel() }
+        let sent = SyncStatusPayload(state: "warning", source: "store", reason: "newerFormat", message: "read-only")
+        let e = bus.emit(sent, doc: Fixtures.docID)
+        XCTAssertEqual(e.type, NibEventType.syncStatus)
+        XCTAssertEqual(got, sent)
+        XCTAssertNil(e.decode(IndexProgressPayload.self))
+        let laser = bus.emit(LaserMovedPayload(page: "page:D/P", point: nil, mode: "dot", color: .black))
+        XCTAssertNil(laser.payload?["point"], "a lifted laser has no point")
+        XCTAssertEqual(laser.decode(LaserMovedPayload.self)?.mode, "dot")
+        XCTAssertEqual(IndexProgressPayload(running: true, done: 3, total: 10).pending, 7)
+        for type in [AudioPlaybackPayload.eventType, AudioRecordingPayload.eventType, ShapeSnappedPayload.eventType,
+                     PencilHapticPayload.eventType] {
+            XCTAssertFalse(type.isEmpty)
+        }
+    }
+
+    func testRegistryChangeNotificationsNameTheIDs() {
+        let registry = Registry<TapePatternDescriptor>()
+        let box = NoteBox()
+        let token = NotificationCenter.default.addObserver(forName: .nibRegistryDidChange, object: registry, queue: nil) {
+            box.notes.append($0)
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        registry.register(TapePatternDescriptor(id: "tape.a", title: "A", owner: "p") { Data() })
+        registry.register(TapePatternDescriptor(id: "tape.a", title: "A2", owner: "p") { Data() })
+        registry.register(TapePatternDescriptor(id: "tape.b", title: "B", owner: "p") { Data() })
+        registry.unregister(owner: "p")
+        let notes = box.notes
+        XCTAssertEqual(notes.map { RegistryChange.ids($0) }, [["tape.a"], ["tape.a"], ["tape.b"], ["tape.a", "tape.b"]])
+        XCTAssertEqual(notes.map { $0.userInfo?[RegistryChange.kindKey] as? String },
+                       [RegistryChange.registered, RegistryChange.replaced, RegistryChange.registered, RegistryChange.unregistered])
+        XCTAssertEqual(registry.generation, 4)
+    }
+
+    func testFloatingHostToolMenuPopoverAndSnapshots() throws {
+        let h = Harness()
+        let host = FakeFloatingHost()
+        XCTAssertNil(h.session.floatingHost)
+        h.session.floatingHost = host
+        let navigator = RecordingNavigator(session: h.session)
+        XCTAssertTrue(navigator.floatingHost === host, "the navigator forwards the window's host by default")
+        XCTAssertTrue(ChromeContext(app: h.app, session: h.session).floatingHost === host)
+        host.present("comment.thread") { Text("Thread") }
+        XCTAssertTrue(host.isPresenting("comment.thread"))
+        XCTAssertTrue(host.setAnchor("pin", rect: CGRect(x: 1, y: 2, width: 3, height: 4), in: UIView()))
+        host.postToast("Deleted")
+        XCTAssertEqual(host.toasts, ["Deleted"])
+        host.dismiss("comment.thread")
+        XCTAssertFalse(host.isPresenting("comment.thread"))
+
+        var open = true
+        var menu = ToolMenuDescriptor(tool: "pen", owner: "presets") { _ in AnyView(Text("bar")) }
+        XCTAssertNil(menu.makePopover)
+        menu.makePopover = { _ in
+            ToolMenuPopover(source: "pen.width", isPresented: Binding(get: { open }, set: { open = $0 }), title: "Thickness") {
+                Text("slider")
+            }
+        }
+        h.app.ui.toolMenus.register(menu)
+        let popover = try XCTUnwrap(h.app.ui.toolMenus.get("pen")?.makePopover?(h.session))
+        XCTAssertEqual(popover.source, "pen.width")
+        popover.isPresented.wrappedValue = false
+        XCTAssertFalse(open)
+
+        let red = try XCTUnwrap(NibSnapshot.image(Color(red: 1, green: 0, blue: 0), size: CGSize(width: 20, height: 20), scale: 1))
+        let p = try XCTUnwrap(NibSnapshot.pixel(red, at: CGPoint(x: 10, y: 10)))
+        XCTAssertGreaterThan(p.r, 200)
+        XCTAssertLessThan(p.g, 60)
+        XCTAssertNil(NibSnapshot.pixel(red, at: CGPoint(x: 30, y: 10)))
+        let variants = NibSnapshot.images(Color.primary, size: CGSize(width: 10, height: 10), scale: 1)
+        XCTAssertEqual(Set(variants.keys), Set(NibSnapshot.Variant.allCases))
+        let light = variants[.light].flatMap { NibSnapshot.pixel($0, at: CGPoint(x: 5, y: 5)) }
+        let dark = variants[.dark].flatMap { NibSnapshot.pixel($0, at: CGPoint(x: 5, y: 5)) }
+        XCTAssertNotEqual(light, dark, "Color.primary follows the variant's colour scheme")
+        let text = Text("The quick brown fox jumps over the lazy dog")
+        XCTAssertGreaterThan(NibSnapshot.fittingSize(text, width: 200, variant: .largeText).height,
+                             NibSnapshot.fittingSize(text, width: 200).height)
+    }
+
+    func testChromeOverlayRegistry() {
+        let h = Harness()
+        var recording = false
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "audio.hud", owner: "audio", placement: .top, surface: .hud, order: 20,
+            isVisible: { _ in recording }, makeView: { _ in AnyView(Text("REC")) }))
+        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: "zoom.pane", owner: "zoom", placement: .bottom, surface: .panel, order: 10, recedesWhileWriting: false,
+            docKinds: [.notebook], makeView: { _ in AnyView(Text("Zoom")) }))
+        let notebook = ChromeContext(app: h.app, session: h.session, kind: .notebook)
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(notebook).map { $0.id }, ["zoom.pane"])
+        recording = true
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(notebook).map { $0.id }, ["zoom.pane", "audio.hud"], "z-order by order")
+        let board = ChromeContext(app: h.app, session: h.session, kind: .whiteboard)
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(board).map { $0.id }, ["audio.hud"])
+        XCTAssertFalse(h.app.ui.chromeOverlays.get("zoom.pane")?.recedesWhileWriting ?? true)
+
+        let box = NoteBox()
+        let token = NotificationCenter.default.addObserver(forName: .nibChromeNeedsUpdate, object: h.app.ui, queue: nil) {
+            box.notes.append($0)
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        h.app.ui.setNeedsChromeUpdate(h.session)
+        XCTAssertEqual(box.notes.first?.userInfo?["session"] as? String, h.session.id.raw)
+    }
+
+    func testLiveDescriptorState() {
+        let h = Harness()
+        var item = ToolbarItemDescriptor(id: "undo", title: "Undo", icon: "arrow.uturn.backward", group: .navTrailing,
+                                         order: 0, owner: "t", command: CommandIDs.undo, params: ["x": 1])
+        item.sessionParams = { s in ["doc": .string(s.document.map { NodeRef.document($0).description } ?? "")] }
+        item.isEnabled = { _ in false }
+        item.sessionTitle = { _ in "Undo Add Page" }
+        XCTAssertEqual(item.resolvedParams(for: h.session), ["x": 1, "doc": "doc:FIXTUREDOC01"])
+        XCTAssertEqual(item.resolvedTitle(for: h.session), "Undo Add Page")
+        XCTAssertEqual(item.resolvedIcon(for: h.session), "arrow.uturn.backward")
+        XCTAssertEqual(item.isEnabled?(h.session), false)
+
+        var key = KeyCommandDescriptor(id: "k", title: "K", shortcut: KeyShortcut("k", .command), command: "x.y", owner: "t")
+        key.sessionParams = { s in ["page": .string(s.page?.raw ?? "")] }
+        XCTAssertEqual(key.resolvedParams(for: h.session), ["page": "FIXTUREPG001"])
+        XCTAssertEqual(key.resolvedParams(for: nil), [:])
+
+        var menu = MenuItemDescriptor(id: "m", title: "Scroll", location: .documentMore, order: 0, owner: "t", command: "x.y")
+        menu.isChecked = { _ in true }
+        menu.contextTitle = { ctx in ctx.textRange.map { "Range \($0)" } ?? "none" }
+        let ctx = MenuContext(app: h.app, folder: Fixtures.folderID, textRange: [2, 3])
+        XCTAssertEqual(menu.resolvedTitle(for: ctx), "Range [2, 3]")
+        XCTAssertEqual(menu.isChecked?(ctx), true)
+    }
+
+    // MARK: Model and geometry
+
+    func testTemplateMetricsAndRegionRendering() {
+        var t = TemplateDefinition(id: "t.grid", title: "Grid", category: "Essentials", owner: "t",
+                                   defaults: ["spacing": 24, "margin": true]) { _, size, _ in
+            TemplateRender(paper: .white, display: DisplayList(ops: [DisplayOp(op: .rect, rect: Rect(x: 0, y: 0, width: size.width, height: size.height))]))
+        }
+        let m = t.metrics(for: [:], size: .a4)
+        XCTAssertEqual(m.spacing, 24)
+        XCTAssertEqual(m.repeatPeriod, PageSize(24, 24))
+        XCTAssertEqual(m.margins?.left ?? 0, 25 * 72 / 25.4, accuracy: 1e-9)
+        XCTAssertEqual(t.metrics(for: ["spacing": 30], size: nil).spacing, 30)
+        XCTAssertEqual(t.renderOps([:], size: .a4, scale: 2, region: Rect(x: 0, y: 0, width: 10, height: 10)).display.ops.count, 1)
+        t.renderRegion = { _, _, _, region in
+            TemplateRender(paper: .white, display: DisplayList(ops: [DisplayOp(op: .dots, rect: region, spacing: 24),
+                                                                     DisplayOp(op: .dots, rect: region, spacing: 12)]))
+        }
+        t.metricsProvider = { _, _ in TemplateMetrics(spacing: 12) }
+        XCTAssertEqual(t.renderOps([:], size: .a4, scale: 2, region: Rect(x: 0, y: 0, width: 10, height: 10)).display.ops.count, 2)
+        XCTAssertEqual(t.renderOps([:], size: .a4, scale: 2, region: nil).display.ops.count, 1)
+        XCTAssertEqual(t.metrics(for: [:], size: .a4).spacing, 12)
+    }
+
+    func testDisplayOpTextAlignmentAndWeight() throws {
+        let op = DisplayOp(op: .text, rect: Rect(x: 0, y: 0, width: 200, height: 30), fill: .black, text: "Monday",
+                           fontSize: 18, align: .center, weight: .semibold)
+        let back = try JSONValue.from(op).decode(DisplayOp.self)
+        XCTAssertEqual(back, op)
+        XCTAssertNil(try JSONValue.parse(#"{"op":"text","text":"x"}"#).decode(DisplayOp.self).align)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 200, height: 30), format: format).image { ctx in
+            DisplayList(ops: [op]).draw(in: ctx.cgContext)
+        }
+        XCTAssertEqual(image.size.width, 200)
+    }
+
+    func testFrameArrayFormAndRotatedNonUniformScale() {
+        XCTAssertEqual(Frame(array: [1, 2, 3, 4]), Frame(x: 1, y: 2, w: 3, h: 4))
+        XCTAssertEqual(Frame(array: [1, 2, 3, 4, 0.5])?.rotation, 0.5)
+        XCTAssertNil(Frame(array: [1, 2, 3]))
+        XCTAssertEqual(Frame(x: 1, y: 2, w: 3, h: 4, rotation: 0.25).array, [1, 2, 3, 4, 0.25])
+
+        let plain = Frame(x: 0, y: 0, w: 100, h: 50)
+        XCTAssertEqual(plain.applying(.scale(2, 1)), Frame(x: 0, y: 0, w: 200, h: 50), "unrotated frames as before")
+        // A frame rotated 90°: its own width runs along the page's y axis, so a page-x stretch changes its HEIGHT.
+        let turned = Frame(x: 0, y: 0, w: 100, h: 50, rotation: .pi / 2)
+        let stretched = turned.applying(.scale(2, 1, about: turned.center))
+        XCTAssertEqual(stretched.w, 100, accuracy: 1e-9)
+        XCTAssertEqual(stretched.h, 100, accuracy: 1e-9)
+        XCTAssertEqual(stretched.rotation, .pi / 2, accuracy: 1e-9)
+        let rotated = turned.applying(.rotation(.pi / 2))
+        XCTAssertEqual(rotated.rotation, .pi, accuracy: 1e-12, "similarity transforms keep the old arithmetic")
+        XCTAssertEqual(rotated.w, 100, accuracy: 1e-9)
+
+        let t = Affine.rotation(0.3).concatenating(.translation(5, -2)).concatenating(.scale(2, 3))
+        let p = Point(7, 11)
+        let back = t.inverted.map { $0.apply(t.apply(p)) }
+        XCTAssertEqual(back?.x ?? 0, 7, accuracy: 1e-9)
+        XCTAssertEqual(back?.y ?? 0, 11, accuracy: 1e-9)
+        XCTAssertNil(Affine.scale(0, 1).inverted)
+    }
+
+    func testPageBackgroundTransform() {
+        let a4 = PageSize.a4
+        XCTAssertEqual(PageRecord.backgroundTransform(sourceSize: a4, rotation: 0, pageSize: a4), .identity)
+        // A landscape source turned 90° fits a portrait page exactly.
+        let src = PageSize(841.89, 595.28)
+        let t = PageRecord.backgroundTransform(sourceSize: src, rotation: 90, pageSize: a4)
+        let topLeft = t.apply(.zero), topRight = t.apply(Point(src.width, 0))
+        XCTAssertEqual(topLeft.x, a4.width, accuracy: 1e-6, "the source's top-left lands top-right")
+        XCTAssertEqual(topLeft.y, 0, accuracy: 1e-6)
+        XCTAssertEqual(topRight.x, a4.width, accuracy: 1e-6)
+        XCTAssertEqual(topRight.y, a4.height, accuracy: 1e-6)
+        // Letterboxed: a square source in A4 is centred vertically.
+        var page = PageRecord(size: a4)
+        page.rotation = 0
+        let square = page.backgroundTransform(sourceSize: PageSize(100, 100))
+        XCTAssertEqual(square.apply(.zero).y, (a4.height - a4.width) / 2, accuracy: 1e-6)
+        XCTAssertEqual(PageRecord.scanTextExtKey, "nib.scanText")
+    }
+
+    func testBalancedFractionalKeys() {
+        let keys = FractionalIndex.balanced(count: 10_000)
+        XCTAssertEqual(keys, keys.sorted())
+        XCTAssertEqual(Set(keys).count, 10_000)
+        XCTAssertLessThanOrEqual(keys.map { $0.count }.max() ?? 0, 4)
+        let inside = FractionalIndex.balanced(count: 20, after: "V", before: "W")
+        XCTAssertTrue(inside.allSatisfy { $0 > "V" && $0 < "W" })
+        XCTAssertEqual(inside, inside.sorted())
+    }
+
+    func testFragmentRoundTripAndInstantiate() throws {
+        let parent = Item(id: "PARENT000001", kind: .shape, z: "V",
+                          shape: ShapeItem(shape: .rectangle, frame: Frame(x: 0, y: 0, w: 100, h: 100)))
+        let child = Item(id: "CHILD0000001", kind: .image, z: "k", attachedTo: "PARENT000001",
+                         image: ImageItem(frame: Frame(x: 10, y: 10, w: 20, h: 20), asset: Fixtures.pngAsset))
+        let fragment = NibFragment.make(items: NibFragment.expand(["PARENT000001"], in: [parent, child])) { ref in
+            ref == Fixtures.pngAsset ? Fixtures.pngData : nil
+        }
+        XCTAssertEqual(fragment.items.count, 2)
+        XCTAssertEqual(fragment.assets[Fixtures.pngAsset.name], Fixtures.pngData)
+        let data = try XCTUnwrap(fragment.encoded())
+        let back = try NibFragment.decode(data)
+        XCTAssertEqual(back, fragment)
+        XCTAssertEqual(try JSONValue.parse(String(decoding: data, as: UTF8.self))["format"], "nib-fragment/1")
+        let placed = back.instantiated(translate: Point(5, 5), ids: ["NEWPARENT001"], zAfter: "z", layer: 1,
+                                       assets: [Fixtures.pngAsset.name: AssetRef("copied.png")])
+        XCTAssertEqual(placed[0].id, "NEWPARENT001")
+        XCTAssertEqual(placed[1].attachedTo, "NEWPARENT001")
+        XCTAssertEqual(placed[1].image?.asset, AssetRef("copied.png"))
+        XCTAssertEqual(placed[1].image?.frame.x, 15)
+        XCTAssertTrue(placed.allSatisfy { $0.layer == 1 && $0.z > "z" })
+        XCTAssertThrowsError(try NibFragment.decode(Data(#"{"format":"nib-fragment/9"}"#.utf8)))
+    }
+
+    func testModelAdditionsDecodeLeniently() throws {
+        let style = try JSONValue.parse(#"{"padding":6,"align":"center","lineSpacing":4}"#).decode(TextBoxStyle.self)
+        XCTAssertEqual(style.align, .center)
+        XCTAssertEqual(style.lineSpacing, 4)
+        XCTAssertNil(try JSONValue.parse(#"{"align":"sideways"}"#).decode(TextBoxStyle.self).align)
+        let old = try JSONValue.from(TextBoxStyle())
+        XCTAssertNil(old["align"], "unset paragraph defaults are not encoded")
+
+        let image = try JSONValue.parse(#"{"frame":{"x":0,"y":0,"w":1,"h":1},"asset":"a.png","flipX":true}"#).decode(ImageItem.self)
+        XCTAssertEqual(image.flipX, true)
+        XCTAssertNil(image.flipY)
+        XCTAssertNil(try JSONValue.from(ImageItem(frame: Frame(x: 0, y: 0, w: 1, h: 1), asset: AssetRef("a.png")))["flipX"])
+
+        let rec = try JSONValue.parse(#"{"text":"hi","words":[{"text":"hi","bbox":[1,2,3,4]}]}"#).decode(TextRecognition.self)
+        XCTAssertEqual(rec.words?.first?.text, "hi")
+        XCTAssertEqual(rec.bbox, .zero)
+
+        XCTAssertEqual(ShapeItem.quadraticControl(through: Point(0, 0), Point(50, 50), Point(100, 0)),
+                       [Point(0, 0), Point(50, 100), Point(100, 0)])
+        XCTAssertEqual(NibLimits.drawerMargin, 12)
+        XCTAssertEqual(RGBA.highlighterAlpha, RGBA.highlighterYellow.a)
+    }
+
+    func testStrokeFastPathsMatchTheGenericDecoder() throws {
+        let points = (0..<50).map { i in
+            StrokePoint(x: Float(i), y: Float(i) * 2, t: Float(i) * 0.01, force: 0.3, azimuth: 0.2, altitude: 1.1,
+                        roll: 0.4, width: 2, height: 3, opacity: 0.9)
+        }
+        let flat = points.flatMap { [$0.x, $0.y, $0.t, $0.force, $0.azimuth, $0.altitude, $0.roll, $0.width, $0.height, $0.opacity] }
+        XCTAssertEqual(Stroke.unpackFull(flat), points)
+        let data = flat.withUnsafeBufferPointer { Data(buffer: $0) }
+        XCTAssertEqual(Stroke.unpackCompact(data), points)
+        let encoder = JSONEncoder()
+        encoder.userInfo[.nibCompactPoints] = true
+        let stroke = Stroke(style: .defaultPen, points: points, t0: 5)
+        XCTAssertEqual(try JSONDecoder().decode(Stroke.self, from: try encoder.encode(stroke)).points, points)
+    }
+
+    func testPresetsTapeRefsSelectionOutlineAndToolbarLayout() async throws {
+        let partial = try JSONValue.parse(##"{"swatches":[{"color":"#112233"}],"widths":[1,2,3]}"##).decode(ToolPresets.self)
+        XCTAssertEqual(partial.patterns, [.solid, .solid, .solid])
+        XCTAssertEqual(partial.selectedWidth, 1)
+        XCTAssertThrowsError(try JSONValue.parse(#"{"widths":[1]}"#).decode(ToolPresets.self))
+        XCTAssertEqual(PresetSwatch.tapePatternRef(id: "tape.dots"), AssetRef("tape.dots.png"))
+        XCTAssertEqual(PresetSwatch.tapePatternID(AssetRef("tape.dots.png")), "tape.dots")
+        XCTAssertEqual(PresetSwatch.tapePatternID(AssetRef("builtin.dots")), "builtin.dots")
+
+        let h = Harness()
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID],
+                                        outline: [Point(0, 0), Point(10, 0), Point(5, 8)])
+        XCTAssertEqual(h.session.selection.outline?.count, 3)
+        h.session.editingTextRef = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
+        h.session.editingTextRange = [0, 5]
+        XCTAssertEqual(h.session.editingTextRange, [0, 5])
+        try await h.run(CommandIDs.settingsSet, ["name": "toolbar.layout", "value": ["order": ["pen"], "hidden": ["ruler"]]])
+        XCTAssertEqual(h.app.settings.get(NibSettings.toolbarLayout), ToolbarLayoutSetting(order: ["pen"], hidden: ["ruler"]))
+        XCTAssertTrue(h.app.settings.get(NibSettings.penReactsToRoll))
+    }
+
+    func testRichTextBridgeKeepsAModelFontThatIsNotInstalled() {
+        var run = TextAttributes()
+        run.font = "NoSuchFamilyV2"
+        let text = RichText(paragraphs: [Paragraph(runs: [TextRun("Hello", run)])])
+        let back = RichTextBridge.richText(RichTextBridge.attributed(text))
+        XCTAssertEqual(back.paragraphs.first?.runs.first?.attrs.font, "NoSuchFamilyV2")
+        let plain = RichTextBridge.richText(RichTextBridge.attributed(RichText(plain: "Hello")))
+        XCTAssertNil(plain.paragraphs.first?.runs.first?.attrs.font)
+    }
+
+    func testTextLayoutAndHitBounds() {
+        let content = ContentRegistries()
+        let box = Item.makeText(TextBoxItem(frame: Frame(x: 10, y: 20, w: 100, h: 40), text: RichText(plain: "x"),
+                                            style: TextBoxStyle(padding: 5)))
+        XCTAssertEqual(content.textLayout(for: box)?.container, Frame(x: 15, y: 25, w: 90, h: 30))
+        let note = Item.makeSticky(StickyItem(frame: Frame(x: 0, y: 0, w: 100, h: 100)))
+        XCTAssertNil(content.textLayout(for: note))
+        content.textLayouts.register(TextLayoutDescriptor(key: "sticky", owner: "sticky") { item in
+            item.sticky.map { TextLayoutInfo(container: Frame(x: $0.frame.x + 12, y: $0.frame.y + 12, w: 76, h: 60)) }
+        })
+        XCTAssertEqual(content.textLayout(for: note)?.container.x, 12)
+        XCTAssertEqual(TextLayoutInfo.lineFragmentPadding, 0)
+        XCTAssertEqual(content.hitBounds(for: note), note.bounds)
+        XCTAssertEqual(content.paintBounds(for: note), note.bounds.insetBy(-NibLimits.drawerMargin))
+        content.drawers.register(ItemDrawerEntry(key: "sticky", owner: "sticky", drawer: IconOnlyDrawer()))
+        XCTAssertEqual(content.hitBounds(for: note), Rect(x: 0, y: 0, width: 28, height: 28))
+        XCTAssertEqual(content.paintBounds(for: note), note.bounds.insetBy(-NibLimits.drawerMargin))
+    }
+
+    func testWorkspaceCacheAccessors() throws {
+        let h = Harness()
+        let w = h.app.workspace
+        var opened = 0
+        let sub = h.app.events.subscribe { if $0.type == NibEventType.docOpened { opened += 1 } }
+        defer { sub.cancel() }
+        XCTAssertEqual(try w.peekContent(Fixtures.textDocID).meta.kind, .textDocument)
+        XCTAssertFalse(w.isLoaded(Fixtures.textDocID), "peeking does not open the document")
+        XCTAssertEqual(opened, 0)
+        XCTAssertFalse(w.isPageCached(doc, page: Fixtures.page2))
+        XCTAssertNil(w.contentRevision(doc, page: Fixtures.page2), "unknown without loading (in-memory persistence)")
+        _ = try w.items(doc, page: page1)
+        XCTAssertTrue(w.isPageCached(doc, page: page1))
+        XCTAssertTrue(w.cachedPages(doc).contains(page1))
+        XCTAssertEqual(w.contentRevision(doc, page: page1), Rev(wallMs: 1, counter: 0, device: 0))
+        XCTAssertFalse(w.isReadOnly(doc))
+    }
+
+    func testWindowShowLibraryUsesTheNavigator() async throws {
+        let h = Harness()
+        do {
+            try await h.run(CommandIDs.windowShowLibrary)
+            XCTFail("no window")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .unavailable)
+        }
+        let nav = RecordingNavigator(session: h.session)
+        h.app.ui.activeNavigator = nav
+        try await h.run(CommandIDs.windowShowLibrary, ["folder": "folder:FIXTUREFLD01"])
+        XCTAssertEqual(nav.shownFolders, [Fixtures.folderID])
+        nav.addTab(Fixtures.textDocID)
+        XCTAssertEqual(nav.opened.map { $0.1 }, [.newTab], "default addTab opens a tab")
+
+        var done: Result<ElementID?, NibError>?
+        FakeCanvasHost(h).commitStroke(Stroke(style: .defaultPen, points: []), page: page1) { done = $0 }
+        if case .success(let id)? = done { XCTAssertNil(id) } else { XCTFail("the default completion reports success") }
+    }
+
+    func testNewSettingsAreDeclared() async throws {
+        let h = Harness()
+        for name in ["appearance.liquid", "text.defaultStyle", "shapes.drawAndHold"] {
+            XCTAssertNotNil(h.app.settings.descriptor(name), name)
+        }
+        try await h.run(CommandIDs.settingsSet, ["name": "appearance.liquid", "value": "calm"], as: .ai("t"))
+        XCTAssertEqual(h.app.settings.get(NibSettings.liquidMode), "calm")
+        XCTAssertEqual(NibSettings.defaultAIDirectTools.count, 8)
+        XCTAssertEqual(BridgeNames.portSetting, "security.bridge.port")
+        XCTAssertEqual(PanelIDs.trash, "organize.trash")
+    }
+
+    // MARK: Helpers
+
+    private func probeContext(_ h: Harness, group: String? = nil) async throws -> CommandContext {
+        var captured: CommandContext?
+        let d = CommandDescriptor(id: "test.v2probe", title: "Probe", summary: "test", effect: .edit, exposure: .ui)
+        h.app.commands.register(d) { _, ctx in
+            captured = ctx
+            return .null
+        }
+        try await h.app.bus.execute(Invocation(command: "test.v2probe", session: h.session, group: group))
+        return try XCTUnwrap(captured)
+    }
+
+    /// The stand-ins F031's test registers for item.transform (F012) and item.update (F003).
+    private func registerMoveStandIns(_ app: NibApp) {
+        app.commands.register(CommandDescriptor(id: CommandIDs.itemTransform, title: "Move", summary: "Test stand-in.",
+                                                params: .anything(), effect: .edit)) { json, ctx in
+            guard case let .item(doc, page, id)? = NodeRef(json["refs"]?[0]?.stringValue ?? ""),
+                  let dx = json["translate"]?[0]?.doubleValue, let dy = json["translate"]?[1]?.doubleValue else {
+                throw NibError.invalid("refs / translate")
+            }
+            try ctx.mutate { tx in
+                let item = try tx.item(doc, page: page, id: id)
+                try tx.put(item.transformed(by: .translation(dx, dy)), doc: doc, page: page)
+            }
+            return [:]
+        }
+        app.commands.register(CommandDescriptor(id: CommandIDs.itemUpdate, title: "Update", summary: "Test stand-in.",
+                                                params: .anything(), effect: .edit)) { json, ctx in
+            guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }
+            try ctx.mutate { tx in
+                let item = try tx.item(doc, page: page, id: id)
+                let merged = try JSONValue.from(item).merging(json["patch"] ?? [:]).decode(Item.self)
+                try tx.put(merged, doc: doc, page: page)
+            }
+            return [:]
+        }
+    }
+}
+
+private extension Item {
+    func with(id: ElementID) -> Item {
+        var it = self
+        it.id = id
+        return it
+    }
+}
+
+/// Commands the v2 tests call as other principals.
+enum V2ProbeFeature: NibFeature {
+    static let id = "v2probe"
+
+    static func register(_ app: NibApp) {
+        app.commands.register(CommandDescriptor(id: "v2probe.create", title: "Create", summary: "Adds a sticky note (test).",
+                                                examples: [[:]], effect: .edit)) { _, ctx in
+            let item = try ctx.mutate { tx in
+                try tx.put(Item.makeSticky(StickyItem(frame: Frame(x: 10, y: 10, w: 50, h: 50))), doc: Fixtures.docID,
+                           page: Fixtures.page1)
+            }
+            return ["ref": .string(NodeRef.item(Fixtures.docID, Fixtures.page1, item.id).description)]
+        }
+        app.commands.register(CommandDescriptor(id: "v2probe.move", title: "Move", summary: "Moves an item to page 2 (test).",
+                                                params: .obj(["id": .str()], required: ["id"]),
+                                                examples: [["id": "FIXTURESTY01"]], effect: .edit)) { json, ctx in
+            let id = NibID(json["id"]?.stringValue ?? "")
+            try ctx.mutate { tx in
+                try tx.move(item: id, doc: Fixtures.docID, from: Fixtures.page1, to: Fixtures.page2,
+                            transform: .translation(20, 0))
+            }
+            return [:]
+        }
+        app.commands.register(CommandDescriptor(id: "v2probe.fetch", title: "Fetch", summary: "Resolves a url param (test).",
+                                                params: .obj(["url": .str()], required: ["url"]),
+                                                examples: [["url": "tmp:x"]], effect: .read)) { json, ctx in
+            let url = try await ctx.inputFile(json["url"]?.stringValue ?? "")
+            let size = (try? Data(contentsOf: url).count) ?? -1
+            return ["size": .number(Double(size))]
+        }
+        app.commands.register(CommandDescriptor(id: "v2probe.echo", title: "Echo", summary: "Returns its params (test).",
+                                                examples: [[:]], effect: .read)) { json, _ in json }
+    }
+}
+
+/// Collects notifications from `@Sendable` observer blocks.
+private final class NoteBox {
+    var notes: [Notification] = []
+}
+
+/// Minimal plugin host exposing one plugin whose manifest allows `hosts`.
+@MainActor
+private final class FakePluginHost: PluginHosting {
+    let plugin: FakePluginHandle
+
+    init(hosts: [String]) {
+        var manifest = try! PluginManifest.fixture(id: "dev.test.plugin", permissions: ["document:read", "network"])
+        manifest.network = PluginNetwork(hosts: hosts)
+        plugin = FakePluginHandle(manifest: manifest)
+    }
+
+    var installed: [PluginInfo] { [] }
+    func handle(_ id: String) -> PluginRuntimeHandle? { id == plugin.manifest.id ? plugin : nil }
+    func folder(_ id: String) -> URL? { nil }
+    func load(_ id: String) async throws {}
+    func unload(_ id: String) {}
+    func setEnabled(_ id: String, _ enabled: Bool) async throws {}
+    var aiInstructions: [String] { [] }
+}
+
+@MainActor
+private final class FakePluginHandle: PluginRuntimeHandle {
+    let manifest: PluginManifest
+    init(manifest: PluginManifest) { self.manifest = manifest }
+    var logs: [String] { [] }
+    func invoke(command: String, params: JSONValue, context: CommandContext) async throws -> JSONValue { .null }
+    func deliver(_ event: NibEvent) {}
+    func postMessage(from panel: String, message: JSONValue) {}
+    func evaluate(_ javascript: String) async -> String { "" }
+    func stop() {}
+}
+
+@MainActor
+private final class StickyTestTool: CanvasTool {
+    let id = "lasso"
+    let inputMode = CanvasInputMode.samples
+}
+
+@MainActor
+private final class OneShotTestTool: CanvasTool {
+    let id = "image"
+    let inputMode = CanvasInputMode.taps
+    var isSticky: Bool { false }
+}
+
+/// A drawer whose hit area is only a 28 pt icon (collapsed sticky note).
+private final class IconOnlyDrawer: ItemDrawer {
+    func draw(_ item: Item, in context: DrawContext) {}
+    func hitBounds(_ item: Item) -> Rect? {
+        guard let f = item.frame else { return nil }
+        return Rect(x: f.x, y: f.y, width: 28, height: 28)
+    }
+}
+
+/// Records what features put into the window's droplet container.
+@MainActor
+private final class FakeFloatingHost: FloatingHosting {
+    private(set) var presented: [String: AnyView] = [:]
+    private(set) var anchors: [String: CGRect] = [:]
+    private(set) var toasts: [String] = []
+
+    func present(_ id: String, content: AnyView) { presented[id] = content }
+    func dismiss(_ id: String) { presented[id] = nil }
+    func isPresenting(_ id: String) -> Bool { presented[id] != nil }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool {
+        anchors[id] = rect
+        return true
+    }
+    func removeAnchor(_ id: String) { anchors[id] = nil }
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { rect }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) { toasts.append(message) }
+}
+
+@MainActor
+private final class RecordingNavigator: SceneNavigator {
+    let session: EditorSession
+    private(set) var shownFolders: [FolderID?] = []
+    private(set) var opened: [(DocumentID, OpenMode)] = []
+    init(session: EditorSession) { self.session = session }
+    var openDocuments: [DocumentID] { opened.map { $0.0 } }
+    var activeDocument: DocumentID? { opened.last?.0 }
+    var rootViewController: UIViewController? { nil }
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) { opened.append((doc, mode)) }
+    func closeDocument(_ doc: DocumentID) {}
+    func showLibrary(folder: FolderID?) { shownFolders.append(folder) }
+    func showSettings(page: String?) {}
+    func presentModal(_ viewController: UIViewController) {}
 }
 ```
 

@@ -1,0 +1,41 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLaser/FeatLaserFeature.swift:277 (LaserThrottle.offer)",
+      "problem": "The throttle replaces any waiting signal with the newest one, and that includes a waiting lift (point == nil). If a touch comes down within 33 ms of a lift (for example a quick tap-tap, or a bridge sending hide then point), the lift event is never sent. In Trail mode, presentation (F063) and collaboration (F108) then draw a line joining two separate strokes, because the payload gives no other way to see the break.",
+      "fix": "Add a stroke counter to LaserSignal and emit it in the payload as \"stroke\": Int. LaserTool increments it in touchesBegan, in tap, and when a hover starts. LaserHub.point increments it on the first point after a hide. Consumers can then detect a break even when the lift is coalesced away, and the 30 Hz cap is unchanged. Add a line to testThrottleKeepsEventsAt30HzAndDeliversTheLastState that offers a lift and then a new point inside one interval, and asserts that the emitted signal carries the new stroke number."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLaser/FeatLaserFeature.swift:112 (LaserStyle)",
+      "problem": "The laser's look is set by local literals that copy DESIGN.md §14.12: 12 pt dot, 12 pt glow, 45 % glow opacity, 4 pt trail and a 0.6 s fade duration. DESIGN.md §16 ('no literal ... duration') and ARCHITECTURE.md §22 ('a missing token is a contract request, never a local one for now') reject this. It is justified only by a ponytail comment, and lint does not catch it.",
+      "fix": "Keep LaserStyle as the workaround, but report the missing tokens in F040's final summary as a contract request (§15.11): NibMetrics.laserDotDiameter, laserGlowWidth, laserGlowOpacity and laserTrailWidth, plus NibMotion.laserFadeDuration: TimeInterval, the value behind NibMotion.laserFade. When the tokens land, replace the literals with them."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLaser/FeatLaserFeature.swift:194 (laser.point descriptor) and :230",
+      "problem": "laser.point reads a document's page list through ctx.workspace.content(doc), which loads the document if it is not open and emits doc.opened. The command only needs the `app` scope (session/app), so a plugin granted `app` but not `document:read` can check whether pages exist in any document, and can force documents to load. The error for a non-finite point also has no hint, which §15.6 requires.",
+      "fix": "Declare the descriptor with target: .document and extraScopes: [.documentRead]. Add a hint to the non-finite point error, for example: hint: \"pass [x, y] in page points, or omit point to hide the laser\"."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLaser/LaserTool.swift:152 / :311 (canvasDidChange -> LaserRenderer.redraw)",
+      "problem": "Every scroll or zoom frame, on every open canvas, runs a full render even when no laser is showing: 12 CGMutablePaths are rebuilt, 12 layer paths are set, and a CATransaction runs, all for nothing. That is wasted main-thread work while scrolling large notebooks.",
+      "fix": "In LaserRenderer.redraw(), return early when trail.head == nil and trail.samples is empty, because the layers are already cleared at that point."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLaser/LaserTool.swift:77 (LaserTool.hover)",
+      "problem": "The appearance is read only when a pointer hover starts. If laser.setMode runs during a continuous trackpad or mouse hover (from the AI, a plugin, or the options bar reached by keyboard), the laser keeps the old mode and colour until the hover ends. The events also keep reporting the stale mode.",
+      "fix": "Re-read LaserAppearance(settings: host.app.settings) on every hover sample, which costs three cheap settings reads. Alternatively, drop the `if !isHovering` guard in both hover and touchesBegan."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatLaserTests/FeatLaserTests.swift",
+      "problem": "Some tool and hub paths are untested: tap() (point, then lift), hover with a finger or pointer (it follows and lifts on nil) versus a hovering Pencil (it is ignored), independent throttling per window (session key), and LaserHub.flush rescheduling when a direct emit happens after a flush was already scheduled. testPointEmitsLaserMovedAtMost30TimesASecondAndNeverWrites also depends on wall-clock timing (`moved.count < 11`), so it can flake on a slow runner.",
+      "fix": "Add a test that drives LaserTool.tap and hover through FakeCanvasHost and asserts the laser.moved sequence (a point, then a payload without point), and that a Pencil hover emits nothing. Add a test that sends signals for two sessions through a LaserHub (created directly, with `now` injected) and asserts that each session is throttled on its own. In the timing test, rely on the spacing assertion and drop the `< 11` count bound, or drive LaserHub directly with an injected clock."
+    }
+  ]
+}

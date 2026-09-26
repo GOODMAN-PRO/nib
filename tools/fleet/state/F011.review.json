@@ -1,0 +1,53 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLasso/SelectionCommands.swift:413-424, 443-458, 476-504, 519-525, 550-582 (all selecting commands) via SelectionSupport.apply/enterLasso/clear",
+      "problem": "Dry runs are ignored. ARCHITECTURE 6.2 says a dry run changes nothing and emits nothing, and the AI's nib_run exposes dry_run for previews. But a dry-run selection.fromPolygon/fromRect/set/selectAll/tapAt still replaces the user's selection and SelectionOutlines entry and emits selectionChanged. A dry-run selection.fromLoop rolls back the stroke deletion but still switches the window's tool to lasso and stores a return tool.",
+      "fix": "In each run, compute the result and then return it early when ctx.dryRun is true, before SelectionSupport.apply / enterLasso / clear. For example, add a `dryRun: Bool` parameter to apply that builds the SelectionOutput without touching the session."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLasso/SelectionCommands.swift:41-47 (LassoPolygon.init), 413-423 (fromPolygon), 496-499 (fromLoop)",
+      "problem": "The number of polygon vertices is unbounded at the trust boundary. A plugin, AI or bridge caller can send a polygon with around 1M vertices (or pass a huge stroke to fromLoop). Every item then does O(m) containment and edge-prefilter passes on the main actor, far beyond the 16 ms command budget (ARCHITECTURE 14). The outline is also stored and re-projected on every scroll frame by SelectionOverlay.",
+      "fix": "In fromPolygon/fromLoop, if the polygon has more than about 4096 vertices, either throw invalid_params (path $.polygon, hint 'simplify the polygon') or reduce it with Geo.simplify(polygon, tolerance: 0.5) before LassoPolygon and before storing it as the outline."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLasso/SelectionCommands.swift:236-249 (SelectionOutlines.bySession)",
+      "problem": "The static per-session outline map is never pruned. A closed window's entry, which can hold a polygon of thousands of points, stays in memory for the life of the process.",
+      "fix": "Drop SelectionOutlines.bySession[host.session.id] in SelectionOverlay.detach(from:). Or prune ids that are missing from app.services.sessions.sessions in LassoHousekeeping's commit observer."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLasso/SelectionCommands.swift:615-628 (LassoHousekeeping.refresh)",
+      "problem": "Deleting a page does not clear a selection on that page. The changeset's removed refs are page refs, never the selection's item refs, so the guard returns early. The window keeps a Selection whose page is deleted: the overlay hides it (no pageFrame), but F013/F012 still act on stale refs.",
+      "fix": "In refresh, also run the live check when cs.headChanged(doc) is true and (try? app.workspace.content(doc).page(page))?.deleted != false, and call SelectionSupport.clear(session) if the page is gone."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLasso/SelectionCommands.swift:608-612; NibKit/Sources/FeatLasso/LassoSettingsView.swift:60",
+      "problem": "SettingsStore is documented as thread-safe and posts didChange on whatever thread writes the setting. Both subscribers touch main-actor state (app.ui.toolbar.register, SwiftUI @State) without hopping to main.",
+      "fix": "Add .receive(on: DispatchQueue.main) to both NotificationCenter publishers."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLasso/SelectionCommands.swift:264-273 (SelectionSupport.page)",
+      "problem": "The selecting commands accept a page in any document, not only the one the target window shows. An AI or plugin call can set session.selection to a document the window is not displaying. The overlay then silently hides it, while F013 and query.context report a selection the user cannot see.",
+      "fix": "When session.document is non-nil and differs from the doc in the ref, throw NibError(.invalidParams, \"page is not in the open document\", path: \"$.page\", hint: \"call query.context for the current page ref\")."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLasso/SelectionOverlay.swift:13",
+      "problem": "SelectionStyle.boxPadding is a raw 4 pt literal, although NibDesign has the same value as a token.",
+      "fix": "Use NibSpacing.xs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatLassoTests/FeatLassoTests.swift",
+      "problem": "Some risky branches are untested: (a) selection.tapAt returning handled:true for a tap inside the current selection's bounds; (b) selection.fromLoop when nothing is touched (the stroke is still deleted and the selection is cleared); (c) LassoTool.pagePoint for a lasso that crosses onto another page; (d) the bare-id form of fromLoop's stroke param.",
+      "fix": "Add one assertion-level test for each branch using the existing Harness and FakeCanvasHost patterns."
+    }
+  ]
+}
