@@ -1,0 +1,41 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatStudyIO/DelimitedParser.swift:113-128 (DelimitedParser.detectDelimiter), used by StudyImporter.swift:25",
+      "problem": "Delimiter detection counts physical lines (text split on newlines) that contain each candidate, so it does not see quotes. When quoted multi-line fields have continuation lines that contain ';' but no ',', the semicolon wins, and every csv/txt import silently produces garbled cards with the wrong count. This includes Nib's own study.exportCSV output, even though StudyExport says StudyImport reads the file back as-is. Reproduced by porting the logic: exporting the rows [\"Sum 0..n in C\", \"int s = 0;\nfor (int i = 0; i < n; i++)\n    s += i;\nreturn s;\"] and [\"Swap a and b\", \"t = a;\na = b;\nb = t;\"] gives hits {',': 2, ';': 7}, so ';' is chosen for both .csv and .txt. Code, chemistry and multi-line Excel cells hit this. The reverse also fails: a semicolon CSV whose multi-line cells contain commas. The round-trip test only uses single-line semicolons, so CI misses it.",
+      "fix": "Make detection quote-aware by reusing the parser. For each candidate, parse the first 64 KB with `DelimitedParser.parse(sample, delimiter: c)`, look at the first 20 rows, and score the rows that have at least 2 fields. Take the highest score, and on a tie take the earlier candidate (this keeps the current tab-first and comma-first behaviour). Add a test that `StudyImport.rows(from: StudyExport.encode(rows), format: .csv)` equals `rows` for the multi-line semicolon example above, with the same check for `.txt`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyIO/StudyImporter.swift:141-153 (StudyImport.append)",
+      "problem": "Appending through the importer, when import.files targets an existing study set, costs O(n*(m+n)) on the main actor. Each tx.put goes through Workspace.writeRecord, which does a linear firstIndex search and copies the whole shared cards array. A 20k-note Anki deck blocks the UI for many seconds inside one synchronous mutate, and undo reverts it at the same cost. The ponytail note admits the ceiling but nothing enforces it.",
+      "fix": "Enforce the ceiling. Past a threshold (for example rows.count > 5_000), create a new set named after the file in target.folder instead of appending, or throw invalid_params with a hint to import into a new set. File docs/contract-requests/F051-batch-card-put.md asking for a batch `DocTransaction.put(_ cards: [StudyCard], doc:)` that writes the array once."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyIO/StudyImporter.swift:38-42 (clean) with DelimitedParser.swift:187-198 (HTMLText.knownTags/strip)",
+      "problem": "Every import without a header (plain CSV, Quizlet, Nib's own export) strips well-known HTML tags and decodes entities. Card text about markup loses content: \"What does <b> do?\" becomes \"What does  do?\", and \"&lt;\" becomes \"<\". This is data loss on a Nib export-then-import round trip, and study.importText has no way to turn it off; only a '#html:false' first line in the file prevents it.",
+      "fix": "When html == nil, strip only if the text shows Anki markers (`<br`, `<div`, `&nbsp;`, `[sound:`) somewhere in the body, checked once in rows(from:) on the whole body, not per field. Otherwise keep the text verbatim. Add a test that the plain row \"What does <b> do?\tbold\" survives."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyIO/StudyExporter.swift:19-22 (StudyExport.field)",
+      "problem": "An exported first card whose front starts with a known Anki header key, such as \"#tags: …\", \"#deck: …\" or \"#separator:…\", is read by AnkiHeader.split as a header line on re-import. The card is dropped, and '#separator:' can even change the delimiter.",
+      "fix": "Also quote fields that start with '#': `guard s.hasPrefix(\"#\") || s.contains(where: …)`. On import, the first character is then '\"', so the header scan stops. Add a round-trip test whose first front is \"#tags: list them\"."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyIO/DelimitedParser.swift:190-198 (HTMLText.strip)",
+      "problem": "Each field containing '<', '&' or '[sound:' runs four `replacingOccurrences(options: .regularExpression)` calls, which compile their patterns on every call. A 10k-note Anki export with HTML means about 80k regex compilations during import. This runs off-main, but the import is still slow.",
+      "fix": "Precompile the four patterns as `static let` NSRegularExpression values, as `entityPattern` already does, and apply them with `stringByReplacingMatches`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatStudyIOTests/FeatStudyIOTests.swift",
+      "problem": "Some risky branches have no tests. dryRun is untested for study.importText (nothing created, ref and count still returned) and for the importer append path (rolled back). title(forFile:) with the '<UUID>-' download prefix and with a URL that has no path is untested. `folder: \"lib\"` and a bare folder id are untested.",
+      "fix": "Add one test: run study.importText through `h.app.bus.execute(Invocation(..., dryRun: true))` and assert that library.node(id) is nil. Assert `StudyImport.title(forFile: URL(fileURLWithPath: \"/tmp/0F8FAD5B-D9CB-469F-A165-70867728950E-Spanish.csv\")) == \"Spanish\"`."
+    }
+  ]
+}
