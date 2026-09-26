@@ -30,11 +30,27 @@ enum StudyTextFormat: String, CaseIterable {
 enum DelimitedParser {
     static let quote: Unicode.Scalar = "\""
 
+    /// One parsed row, and whether a `"` in it was read as literal text because it did not open or close a well-formed
+    /// quoted field. Parsing with the wrong delimiter leaves the quotes of real quoted fields stray.
+    struct Row: Equatable {
+        var fields: [String]
+        var strayQuote: Bool
+    }
+
     static func parse(_ text: String, delimiter: Unicode.Scalar) -> [[String]] {
-        let s = Array(text.unicodeScalars)
+        parse(Array(text.unicodeScalars), delimiter: delimiter)
+    }
+
+    static func parse(_ scalars: [Unicode.Scalar], delimiter: Unicode.Scalar) -> [[String]] {
+        scan(scalars, delimiter: delimiter, limit: .max).map(\.fields)
+    }
+
+    /// Parses at most `limit` non-blank rows.
+    static func scan(_ s: [Unicode.Scalar], delimiter: Unicode.Scalar, limit: Int) -> [Row] {
         let n = s.count
-        var rows: [[String]] = []
+        var rows: [Row] = []
         var row: [String] = []
+        var stray = false
         var field = String.UnicodeScalarView()
         var atFieldStart = true
         var i = (n > 0 && s[0] == "\u{FEFF}") ? 1 : 0
@@ -46,11 +62,12 @@ enum DelimitedParser {
 
         func endRow() {
             endField()
-            if row != [""] { rows.append(row) }
+            if row != [""] { rows.append(Row(fields: row, strayQuote: stray)) }
             row = []
+            stray = false
         }
 
-        while i < n {
+        while i < n && rows.count < limit {
             if atFieldStart, let q = quoted(s, at: i, delimiter: delimiter) {
                 var j = q.open + 1
                 while j < q.close {
@@ -73,6 +90,7 @@ enum DelimitedParser {
                 atFieldStart = true
                 i += (c == "\r" && i + 1 < n && s[i + 1] == "\n") ? 2 : 1
             } else {
+                if c == quote { stray = true }
                 field.append(c)
                 i += 1
             }
@@ -107,24 +125,35 @@ enum DelimitedParser {
         return nil
     }
 
-    /// The candidate found on the most of the first 20 non-blank lines (ties go to the earlier candidate; none found =
-    /// the first). ponytail: a line count, not a field-count consistency check — a semicolon CSV whose every line also
-    /// holds a decimal comma reads as comma-separated; such files can state `#separator:semicolon` on their first line.
     static func detectDelimiter(_ text: String, candidates: [Unicode.Scalar]) -> Unicode.Scalar {
+        detectDelimiter(Array(text.unicodeScalars), candidates: candidates)
+    }
+
+    /// Parses the first 20 rows with each candidate and picks the one whose rows read most cleanly: the largest share
+    /// of non-blank rows that split into two or more fields with no stray quote. Ties go to the earlier candidate, and
+    /// when nothing splits the first candidate wins. Parsing, not counting characters per line, keeps quoted multi-line
+    /// cells whole. Cells full of ";" (code, chemistry, Nib's own exports) can't outvote the "," between them, and the
+    /// reverse holds too. A wrong delimiter also strands the quotes of real quoted fields.
+    /// ponytail: no field-count consistency check. A quote-free semicolon CSV whose every line also holds a decimal
+    /// comma reads as comma-separated. Such files can state `#separator:semicolon` on their first line.
+    static func detectDelimiter(_ scalars: [Unicode.Scalar], candidates: [Unicode.Scalar]) -> Unicode.Scalar {
         guard let first = candidates.first else { return "\t" }
         guard candidates.count > 1 else { return first }
-        var hits = [Int](repeating: 0, count: candidates.count)
-        var lines = 0
-        for line in text.prefix(65_536).split(whereSeparator: { $0.isNewline }) {
-            guard line.contains(where: { !$0.isWhitespace }) else { continue }
-            let scalars = Set(line.unicodeScalars)
-            for (k, c) in candidates.enumerated() where scalars.contains(c) { hits[k] += 1 }
-            lines += 1
-            if lines == 20 { break }
+        var best = first
+        var bestClean = 0
+        var bestRows = 1
+        for candidate in candidates {
+            let rows = scan(scalars, delimiter: candidate, limit: 20)
+                .filter { row in row.fields.contains { field in field.contains { !$0.isWhitespace } } }
+            guard !rows.isEmpty else { continue }
+            let clean = rows.filter { $0.fields.count >= 2 && !$0.strayQuote }.count
+            if clean * bestRows > bestClean * rows.count {
+                best = candidate
+                bestClean = clean
+                bestRows = rows.count
+            }
         }
-        var best = 0
-        for k in hits.indices where hits[k] > hits[best] { best = k }
-        return candidates[best]
+        return best
     }
 }
 
@@ -132,7 +161,8 @@ enum DelimitedParser {
 /// `#guid column:1`, `#notetype column:2`, `#deck column:3`, `#tags column:5`, `#columns:…`, `#tags:…`.
 struct AnkiHeader: Equatable {
     var separator: Unicode.Scalar?
-    /// nil = not stated (only well-known HTML tags are stripped), false = keep markup as text.
+    /// nil = not stated (well-known HTML tags are stripped when the body carries Anki markup, else the text is kept
+    /// verbatim), false = keep markup as text.
     var html: Bool?
     /// 0-based columns holding Anki metadata (guid, note type, deck, tags) rather than card text.
     var metadataColumns: Set<Int> = []
@@ -182,18 +212,42 @@ struct AnkiHeader: Equatable {
 /// Turns Anki field HTML into plain card text: `<br>` and block starts become line breaks, tags and `[sound:…]` media
 /// references are dropped, entities decoded.
 enum HTMLText {
+    /// Markup that Anki writes into plain-text exports, even ones with no `#html:` header line. A file without any of
+    /// it is not HTML: its cards keep "<b>" and "&lt;" as typed ("What does <b> do?").
+    static let ankiMarkers = ["<br", "<div", "<img", "&nbsp;", "[sound:"]
+
+    static func hasAnkiMarkup<S: StringProtocol>(_ s: S) -> Bool {
+        ankiMarkers.contains { s.range(of: $0, options: .caseInsensitive) != nil }
+    }
+
     /// Tags stripped when a file does not declare `#html:true`, so plain text such as "x < 5" survives.
     /// ponytail: "a<b and c>d" without spaces still reads as a `<b …>` tag; add a real tokenizer if that ever matters.
     static let knownTags = "</?(a|abbr|b|big|blockquote|code|div|em|font|h[1-6]|hr|i|img|li|mark|ol|p|pre|s|small|span|"
         + "strike|strong|sub|sup|table|tbody|td|th|thead|tr|u|ul)(\\s[^>]*)?/?>"
 
+    // Compiled once: a 10,000-note deck runs `strip` on every field.
+    private static func regex(_ pattern: String) -> NSRegularExpression? {
+        try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }
+
+    private static let lineBreakTag = regex("<br\\s*/?>")
+    private static let blockStartTag = regex("<(div|p|li|tr|h[1-6])(\\s[^>]*)?>")
+    private static let knownTag = regex(knownTags)
+    private static let anyTagPattern = regex("</?[a-z!][^>]*>")
+    private static let soundReference = regex("\\[sound:[^\\]]*\\]")
+
+    private static func replace(_ re: NSRegularExpression?, in s: String, with template: String) -> String {
+        guard let re = re else { return s }
+        return re.stringByReplacingMatches(in: s, options: [], range: NSRange(location: 0, length: (s as NSString).length),
+                                           withTemplate: template)
+    }
+
     static func strip(_ s: String, anyTag: Bool) -> String {
         guard s.contains("<") || s.contains("&") || s.contains("[sound:") else { return s }
-        let options: String.CompareOptions = [.regularExpression, .caseInsensitive]
-        var t = s.replacingOccurrences(of: "<br\\s*/?>", with: "\n", options: options)
-        t = t.replacingOccurrences(of: "<(div|p|li|tr|h[1-6])(\\s[^>]*)?>", with: "\n", options: options)
-        t = t.replacingOccurrences(of: anyTag ? "</?[a-z!][^>]*>" : knownTags, with: "", options: options)
-        t = t.replacingOccurrences(of: "\\[sound:[^\\]]*\\]", with: "", options: options)
+        var t = replace(lineBreakTag, in: s, with: "\n")
+        t = replace(blockStartTag, in: t, with: "\n")
+        t = replace(anyTag ? anyTagPattern : knownTag, in: t, with: "")
+        t = replace(soundReference, in: t, with: "")
         return decodeEntities(t)
     }
 

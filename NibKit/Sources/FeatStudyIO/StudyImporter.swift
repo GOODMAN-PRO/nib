@@ -21,12 +21,15 @@ enum StudyImport {
 
     static func rows(from raw: String, format: StudyTextFormat) -> [StudyRow] {
         let (header, bodySlice) = AnkiHeader.split(dropBOM(raw))
-        let body = String(bodySlice)
+        let body = Array(bodySlice.unicodeScalars)
         let delimiter = header.separator ?? DelimitedParser.detectDelimiter(body, candidates: format.delimiters)
+        // With no `#html:` header, only a file that carries Anki markup has its markup stripped. A plain Quizlet or Nib
+        // file keeps "What does <b> do?" and "&lt;" verbatim.
+        let html = header.html ?? (HTMLText.hasAnkiMarkup(bodySlice) ? nil : false)
         var out: [StudyRow] = []
         for fields in DelimitedParser.parse(body, delimiter: delimiter) {
             let columns = fields.indices.filter { !header.metadataColumns.contains($0) }.prefix(2)
-                .map { clean(fields[$0], html: header.html) }
+                .map { clean(fields[$0], html: html) }
             let front = columns.first ?? ""
             let back = columns.count > 1 ? columns[1] : ""
             if front.isEmpty && back.isEmpty { continue }
@@ -35,6 +38,7 @@ enum StudyImport {
         return out
     }
 
+    /// `html`: true = strip every tag, nil = strip well-known tags, false = keep the text verbatim.
     static func clean(_ field: String, html: Bool?) -> String {
         var s = field.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
         if html != false { s = HTMLText.strip(s, anyTag: html == true) }
@@ -137,8 +141,16 @@ enum StudyImport {
         return try library.createDocument(DocumentContent(meta: meta, cards: cards), title: title, in: folder)
     }
 
-    /// Appends the rows to an existing study set as one undo step.
-    /// ponytail: each `tx.put` copies the card array, so appending is O(n²); fine for decks of a few thousand cards.
+    /// Appending costs about rows × (cards already in the set + rows) card copies on the main actor, and undo costs the
+    /// same again. Each `tx.put` copies the set's card array, and the contracts have no batch put. Past this budget
+    /// (5,000 rows into an empty set), `importFile` puts the rows in a new set instead of freezing the UI.
+    static let appendBudget = 25_000_000
+
+    static func appendsInPlace(rows: Int, existingCards: Int) -> Bool {
+        rows * (existingCards + rows) <= appendBudget
+    }
+
+    /// Appends the rows to an existing study set as one undo step (callers keep within `appendBudget`).
     @MainActor
     static func append(_ rows: [StudyRow], to doc: DocumentID, _ ctx: CommandContext) throws {
         if ctx.services.lock?.isLocked(doc) == true {
@@ -153,7 +165,8 @@ enum StudyImport {
     }
 
     /// `import.files` entry point: appends to the target document when it is a study set, else creates a new set named
-    /// after the file in the target folder.
+    /// after the file in the target folder. A file too large to append (`appendBudget`) becomes a new set next to the
+    /// target set.
     @MainActor
     static func importFile(_ url: URL, format: StudyTextFormat, target: ImportTarget,
                            _ ctx: CommandContext) async throws -> [DocumentID] {
@@ -162,12 +175,19 @@ enum StudyImport {
             throw NibError(.invalidParams, "no cards found in \(url.lastPathComponent)",
                            hint: "one card per line: question, then a tab or comma, then the answer")
         }
-        if let doc = target.document, try ctx.workspace.content(doc).meta.kind == .studySet {
-            try append(rows, to: doc, ctx)
-            return [doc]
+        var folder = target.folder
+        if let doc = target.document {
+            let content = try ctx.workspace.content(doc)
+            if content.meta.kind == .studySet {
+                if appendsInPlace(rows: rows.count, existingCards: content.cards.count) {
+                    try append(rows, to: doc, ctx)
+                    return [doc]
+                }
+                if folder == nil { folder = ctx.services.library?.node(doc)?.parent }
+            }
         }
         let id = NibID.make()
-        if !ctx.dryRun { try createSet(rows, id: id, title: title(forFile: url), folder: target.folder, ctx) }
+        if !ctx.dryRun { try createSet(rows, id: id, title: title(forFile: url), folder: folder, ctx) }
         return [id]
     }
 

@@ -1,8 +1,9 @@
 import Foundation
 import NibContracts
 
-/// Study-set export: one CSV row per live card, question then answer, RFC 4180 quoting, CRLF line ends. Files carry a
-/// UTF-8 byte-order mark so Excel and Numbers read non-ASCII terms correctly; `StudyImport` reads the file back as-is.
+/// Study-set export: one CSV row per live card, question then answer, RFC 4180 quoting (`field`), CRLF line ends.
+/// Files carry a UTF-8 byte-order mark so Excel and Numbers read non-ASCII terms correctly; `StudyImport` reads the
+/// file back as-is.
 /// Image and ink faces have no text and export as empty fields.
 /// ponytail: no spreadsheet-formula escaping (a leading "=" stays), so the file round-trips into Quizlet, Anki and Nib.
 enum StudyExport {
@@ -16,8 +17,11 @@ enum StudyExport {
         rows.map { row in row.map { field($0) }.joined(separator: ",") + "\r\n" }.joined()
     }
 
+    /// Quotes a field that holds a delimiter any study importer tries (",", ";", tab), a quote or a line break, or that
+    /// starts with "#". A leading quote stops the importer's Anki header scan, so a first card "#tags: …" stays a card.
     static func field(_ s: String) -> String {
-        guard s.contains(where: { $0 == "," || $0 == "\"" || $0.isNewline }) else { return s }
+        let special: (Character) -> Bool = { $0 == "," || $0 == ";" || $0 == "\t" || $0 == "\"" || $0.isNewline }
+        guard s.hasPrefix("#") || s.contains(where: special) else { return s }
         return "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 

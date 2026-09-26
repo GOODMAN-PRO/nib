@@ -37,6 +37,57 @@ final class DelimitedParserTests: XCTestCase {
         XCTAssertEqual(DelimitedParser.detectDelimiter("dog\tchien\ncat, the animal\tchat", candidates: ["\t", ",", ";"]), "\t")
         XCTAssertEqual(DelimitedParser.detectDelimiter("1 < 2;wahr\n3 > 4;falsch", candidates: [",", ";"]), ";")
         XCTAssertEqual(DelimitedParser.detectDelimiter("single column", candidates: ["\t", ",", ";"]), "\t")
+        let quizlet = "mitochondria\tpowerhouse of the cell, makes ATP\nribosome\tmakes proteins, reads mRNA\nnucleus\tDNA\n"
+        XCTAssertEqual(DelimitedParser.detectDelimiter(quizlet, candidates: ["\t", ",", ";"]), "\t")
+    }
+
+    func testScanFlagsQuotesThatAWrongDelimiterStrands() {
+        let text = "a,\"x;\ny\"\n"
+        XCTAssertEqual(DelimitedParser.scan(Array(text.unicodeScalars), delimiter: ",", limit: .max),
+                       [DelimitedParser.Row(fields: ["a", "x;\ny"], strayQuote: false)])
+        XCTAssertEqual(DelimitedParser.scan(Array(text.unicodeScalars), delimiter: ";", limit: .max),
+                       [DelimitedParser.Row(fields: ["a,\"x", ""], strayQuote: true),
+                        DelimitedParser.Row(fields: ["y\""], strayQuote: true)])
+        XCTAssertEqual(DelimitedParser.scan(Array("1,2\n\n3,4\n5,6".unicodeScalars), delimiter: ",", limit: 2).map(\.fields),
+                       [["1", "2"], ["3", "4"]])
+    }
+
+    /// Quoted multi-line cells full of the other delimiter (code, chemistry, Excel cells) must not outvote the real one.
+    func testDelimiterDetectionKeepsQuotedMultilineCellsWhole() {
+        let code = [StudyRow(front: "Sum 0..n in C", back: "int s = 0;\nfor (int i = 0; i < n; i++)\n    s += i;\nreturn s;"),
+                    StudyRow(front: "Swap a and b", back: "t = a;\na = b;\nb = t;")]
+        let csv = StudyExport.encode(code.map { [$0.front, $0.back] })
+        XCTAssertEqual(StudyImport.rows(from: csv, format: .csv), code)
+        XCTAssertEqual(StudyImport.rows(from: csv, format: .txt), code)
+
+        // Files from other apps that leave ";" unquoted.
+        let unquoted = "a;b,\"x;\ny;\nz;\"\r\nc;d,\"p;\nq;\"\r\n"
+        XCTAssertEqual(StudyImport.rows(from: unquoted, format: .csv),
+                       [StudyRow(front: "a;b", back: "x;\ny;\nz;"), StudyRow(front: "c;d", back: "p;\nq;")])
+
+        // The reverse: a semicolon CSV (Excel in comma-decimal locales) whose multi-line cells hold commas.
+        let semicolon = "Frage;Antwort\r\n\"Nenne drei Farben\";\"rot, grün,\nblau\"\r\nPi;3,14159\r\n"
+        let expected = [StudyRow(front: "Frage", back: "Antwort"), StudyRow(front: "Nenne drei Farben", back: "rot, grün,\nblau"),
+                        StudyRow(front: "Pi", back: "3,14159")]
+        XCTAssertEqual(StudyImport.rows(from: semicolon, format: .csv), expected)
+        XCTAssertEqual(StudyImport.rows(from: semicolon, format: .txt), expected)
+    }
+
+    // MARK: Export quoting
+
+    func testExportQuotesHashStartsAndEveryImportDelimiter() {
+        XCTAssertEqual(StudyExport.field("plain text"), "plain text")
+        XCTAssertEqual(StudyExport.field("#tags: list them"), "\"#tags: list them\"")
+        XCTAssertEqual(StudyExport.field("a;b"), "\"a;b\"")
+        XCTAssertEqual(StudyExport.field("a\tb"), "\"a\tb\"")
+        XCTAssertEqual(StudyExport.field("say \"hi\""), "\"say \"\"hi\"\"\"")
+
+        // A first card that looks like an Anki header line stays a card (and cannot switch the delimiter).
+        let rows = [StudyRow(front: "#tags: list them", back: "a, b"), StudyRow(front: "#separator:semicolon", back: "x;y"),
+                    StudyRow(front: "#1", back: "first")]
+        let csv = StudyExport.encode(rows.map { [$0.front, $0.back] })
+        XCTAssertEqual(StudyImport.rows(from: csv, format: .csv), rows)
+        XCTAssertEqual(StudyImport.rows(from: csv, format: .txt), rows)
     }
 
     // MARK: Rows, Anki headers and HTML
@@ -68,10 +119,27 @@ final class DelimitedParserTests: XCTestCase {
                        [StudyRow(front: "a", back: "<b>b</b>")])
     }
 
+    /// Without an `#html:` header, a file with no Anki markup is not HTML: cards about markup keep their text.
+    func testPlainFilesKeepMarkupAndEntitiesVerbatim() {
+        XCTAssertEqual(StudyImport.rows(from: "What does <b> do?\tbold\n&lt; means\tless than\n", format: .txt),
+                       [StudyRow(front: "What does <b> do?", back: "bold"), StudyRow(front: "&lt; means", back: "less than")])
+        let nibExport = StudyExport.encode([["What does <b> do?", "Makes text <b>bold</b> & strong"]])
+        XCTAssertEqual(StudyImport.rows(from: nibExport, format: .csv),
+                       [StudyRow(front: "What does <b> do?", back: "Makes text <b>bold</b> & strong")])
+        // One Anki marker anywhere in the body turns stripping on for the whole file.
+        XCTAssertEqual(StudyImport.rows(from: "What is <b>ATP</b>?\tenergy\nLine<BR>break\tx\n", format: .txt),
+                       [StudyRow(front: "What is ATP?", back: "energy"), StudyRow(front: "Line\nbreak", back: "x")])
+        XCTAssertTrue(HTMLText.hasAnkiMarkup("a&nbsp;b"))
+        XCTAssertTrue(HTMLText.hasAnkiMarkup(Substring("x [sound:a.mp3]")))
+        XCTAssertFalse(HTMLText.hasAnkiMarkup("x < 5 & <b>"))
+    }
+
     func testHTMLStrippingKeepsPlainComparisonsAndDecodesEntities() {
         XCTAssertEqual(HTMLText.strip("x < 5 and y > 3", anyTag: false), "x < 5 and y > 3")
         XCTAssertEqual(HTMLText.strip("a &amp; b &#233; &#x41; &eacute;", anyTag: false), "a & b é A &eacute;")
         XCTAssertEqual(HTMLText.strip("<span style=\"color: red\">red</span><img src=\"a.png\"/>", anyTag: false), "red")
+        XCTAssertEqual(HTMLText.strip("<P>one<BR/>two</p>[sound:a.mp3]<x-y>z</x-y>", anyTag: true), "\none\ntwoz")
+        XCTAssertEqual(HTMLText.strip("<x-y>z</x-y>", anyTag: false), "<x-y>z</x-y>")
     }
 
     func testTextDecodingFallsBackForUTF16AndWindows1252() {
