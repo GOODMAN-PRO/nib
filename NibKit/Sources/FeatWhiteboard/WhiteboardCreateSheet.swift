@@ -10,14 +10,26 @@ enum BoardPattern: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// F005's zoom-adaptive whiteboard backgrounds.
-    var templateID: String {
+    /// Paper templates to try, best first: F005's zoom-adaptive whiteboard backgrounds, then the matching notebook
+    /// paper. The first one registered in `content.templates` is used.
+    /// ponytail: the whiteboard template ids are F005's, not contract constants; pinning them (and the "paper" / "line"
+    /// parameter names) in the contracts is the request.
+    var candidates: [String] {
         switch self {
-        case .dots: return Whiteboard.dotsTemplate
-        case .grid: return "builtin.whiteboardGrid"
-        case .lined: return "builtin.whiteboardLines"
-        case .blank: return "builtin.blank"
+        case .dots: return [Whiteboard.dotsTemplate, "builtin.dots"]
+        case .grid: return ["builtin.whiteboardGrid", "builtin.grid"]
+        case .lined: return ["builtin.whiteboardLines", "builtin.ruled"]
+        case .blank: return ["builtin.blank"]
         }
+    }
+
+    func definition(in templates: Registry<TemplateDefinition>) -> TemplateDefinition? {
+        candidates.lazy.compactMap { templates.get($0) }.first
+    }
+
+    /// The patterns this app can draw; a pattern no installed template provides is not offered.
+    static func available(in templates: Registry<TemplateDefinition>) -> [BoardPattern] {
+        allCases.filter { $0.definition(in: templates) != nil }
     }
 
     var title: String {
@@ -61,29 +73,34 @@ struct WhiteboardDraft: Equatable {
         return t.isEmpty ? String(localized: "Untitled Whiteboard") : String(t.prefix(200))
     }
 
-    /// The board background: the pattern's template with the paper and rule colours of the chosen paper.
-    var template: TemplateRef {
-        TemplateRef(pattern.templateID, params: ["paper": .string(RGBA(paper.paper).hex),
-                                                 "line": .string(RGBA(rgb: paper.paper.ruleHex).hex)])
+    /// The board background: the registered template that draws the pattern, with the chosen paper's paper and rule
+    /// colours for the colour parameters that template declares. nil when no installed template draws the pattern.
+    func template(in templates: Registry<TemplateDefinition>) -> TemplateRef? {
+        guard let definition = pattern.definition(in: templates) else { return nil }
+        let declared = Set(definition.params.map(\.name))
+        var params: [String: JSONValue] = [:]
+        if declared.contains("paper") { params["paper"] = .string(RGBA(paper.paper).hex) }
+        if declared.contains("line") { params["line"] = .string(RGBA(rgb: paper.paper.ruleHex).hex) }
+        return TemplateRef(definition.id, params: params)
     }
 
-    func createParams(id: DocumentID, folder: FolderID?, includeTemplate: Bool) -> JSONValue {
+    func createParams(id: DocumentID, folder: FolderID?, template: TemplateRef?) -> JSONValue {
         var p: [String: JSONValue] = ["kind": .string(DocumentKind.whiteboard.rawValue), "title": .string(resolvedTitle),
                                       "id": .string(id.raw)]
         if let folder { p["folder"] = .string(NodeRef.folder(folder).description) }
-        if includeTemplate { p["template"] = (try? JSONValue.from(template)) ?? .string(template.id) }
+        if let template { p["template"] = (try? JSONValue.from(template)) ?? .string(template.id) }
         return .object(p)
     }
 
-    /// True when the new whiteboard's first board does not carry the chosen pattern and paper yet (a `doc.create`
-    /// that ignored or could not take the template).
-    func needsBackground(_ background: Background?) -> Bool {
+    /// True when the new whiteboard's first board does not carry `template` yet (a `doc.create` that ignored or could
+    /// not take it).
+    static func needsBackground(_ background: Background?, template: TemplateRef) -> Bool {
         background?.template?.id != template.id || background?.template?.params["paper"] != template.params["paper"]
     }
 
-    /// `page.setTemplate` for every board of `doc`.
-    func setTemplateParams(doc: DocumentID) -> JSONValue {
-        ["pages": [.string(NodeRef.document(doc).description)], "template": .string(template.id),
+    /// `page.setTemplate` for the given boards of `doc`.
+    static func setTemplateParams(doc: DocumentID, boards: [PageID], template: TemplateRef) -> JSONValue {
+        ["pages": .array(boards.map { .string(NodeRef.page(doc, $0).description) }), "template": .string(template.id),
          "params": .object(template.params)]
     }
 }
@@ -103,29 +120,34 @@ enum RecognitionLanguages {
 
 /// Creates the whiteboard with `doc.create` (kind whiteboard) and opens it. If `doc.create` cannot take the template
 /// as {id, params}, it is created with the default board and styled with `page.setTemplate`; a non-default language
-/// goes through `doc.setLanguage`. Those follow-ups are optional: a missing feature leaves the defaults.
+/// goes through `doc.setLanguage`. A follow-up that fails is reported like any failed command (the whiteboard exists
+/// by then, with the defaults for what failed).
 @MainActor
 enum WhiteboardCreator {
     @discardableResult
     static func create(_ draft: WhiteboardDraft, folder: FolderID?, app: NibApp, session: EditorSession?) async throws -> DocumentID {
         let id = NibID.make()
+        let template = draft.template(in: app.content.templates)
         do {
-            try await run(app, "doc.create", draft.createParams(id: id, folder: folder, includeTemplate: true), session)
-        } catch let error as NibError where error.code == .invalidParams {
+            try await run(app, "doc.create", draft.createParams(id: id, folder: folder, template: template), session)
+        } catch let error as NibError where error.code == .invalidParams && template != nil {
             Whiteboard.log.info("doc.create refused the template (\(error.message, privacy: .public)); styling the board afterwards")
-            try await run(app, "doc.create", draft.createParams(id: id, folder: folder, includeTemplate: false), session)
+            try await run(app, "doc.create", draft.createParams(id: id, folder: folder, template: nil), session)
         }
         let group = NibID.make().raw
         let content = try? app.workspace.content(id)
-        if draft.needsBackground(content?.livePages.first?.background) {
-            _ = try? await run(app, "page.setTemplate", draft.setTemplateParams(doc: id), session, group: group)
+        let boards = content?.livePages.map(\.id) ?? []
+        if let template, !boards.isEmpty,
+           WhiteboardDraft.needsBackground(content?.livePages.first?.background, template: template) {
+            await follow(app, "page.setTemplate",
+                         WhiteboardDraft.setTemplateParams(doc: id, boards: boards, template: template), session, group)
         }
         if let current = content?.meta.language, current != draft.language {
-            _ = try? await run(app, "doc.setLanguage",
-                           ["doc": .string(NodeRef.document(id).description), "language": .string(draft.language)],
-                           session, group: group)
+            await follow(app, "doc.setLanguage",
+                         ["doc": .string(NodeRef.document(id).description), "language": .string(draft.language)],
+                         session, group)
         }
-        _ = try? await run(app, CommandIDs.docOpen, ["doc": .string(NodeRef.document(id).description)], session)
+        await follow(app, CommandIDs.docOpen, ["doc": .string(NodeRef.document(id).description)], session, nil)
         return id
     }
 
@@ -134,6 +156,17 @@ enum WhiteboardCreator {
                     group: String? = nil) async throws -> JSONValue {
         try await app.bus.execute(Invocation(command: command, params: params, principal: .user, session: session,
                                              group: group)).value
+    }
+
+    /// A step after the whiteboard exists: its failure goes to the shell's error toast instead of failing the create.
+    private static func follow(_ app: NibApp, _ command: String, _ params: JSONValue, _ session: EditorSession?,
+                               _ group: String?) async {
+        do {
+            try await run(app, command, params, session, group: group)
+        } catch {
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                            userInfo: ["command": command, "error": NibError.wrap(error)])
+        }
     }
 }
 
@@ -147,6 +180,9 @@ struct WhiteboardCreateSheet: View {
     let session: EditorSession?
     let onDone: () -> Void
     private let languages: [String]
+    /// The patterns an installed template draws; with none, doc.create's default board is used and neither the
+    /// pattern nor the colour is offered.
+    private let patterns: [BoardPattern]
     @State private var draft: WhiteboardDraft
     @State private var creating = false
 
@@ -157,7 +193,10 @@ struct WhiteboardCreateSheet: View {
         self.onDone = onDone
         let language = app.settings.get(NibSettings.defaultLanguage)
         languages = RecognitionLanguages.all(including: language)
-        _draft = State(initialValue: WhiteboardDraft(language: language))
+        patterns = BoardPattern.available(in: app.content.templates)
+        var draft = WhiteboardDraft(language: language)
+        if let first = patterns.first, !patterns.contains(draft.pattern) { draft.pattern = first }
+        _draft = State(initialValue: draft)
     }
 
     var body: some View {
@@ -167,20 +206,23 @@ struct WhiteboardCreateSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: NibSpacing.xl) {
                     nameRow
-                    NibInspectorSection(String(localized: "Background")) {
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 88), spacing: NibSpacing.m)], spacing: NibSpacing.m) {
-                            ForEach(BoardPattern.allCases) { pattern in
-                                BoardPatternTile(pattern: pattern, paper: draft.paper.paper,
-                                                 isSelected: draft.pattern == pattern) { draft.pattern = pattern }
+                    if !patterns.isEmpty {
+                        NibInspectorSection(String(localized: "Background")) {
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: BoardPatternPreview.tileMinimum),
+                                                         spacing: NibSpacing.m)], spacing: NibSpacing.m) {
+                                ForEach(patterns) { pattern in
+                                    BoardPatternTile(pattern: pattern, paper: draft.paper.paper,
+                                                     isSelected: draft.pattern == pattern) { draft.pattern = pattern }
+                                }
                             }
                         }
-                    }
-                    NibInspectorSection(String(localized: "Colour"), value: draft.paper.title) {
-                        HStack(spacing: 0) {
-                            ForEach(BoardPaper.allCases) { paper in
-                                NibPenSwatch(NibSwatch(id: paper.rawValue, color: paper.paper.color, name: paper.title,
-                                                       ringsLight: !paper.paper.isDark, ringsDark: paper.paper.isDark),
-                                             isSelected: draft.paper == paper) { draft.paper = paper }
+                        NibInspectorSection(String(localized: "Colour"), value: draft.paper.title) {
+                            HStack(spacing: 0) {
+                                ForEach(BoardPaper.allCases) { paper in
+                                    NibPenSwatch(NibSwatch(id: paper.rawValue, color: paper.paper.color, name: paper.title,
+                                                           ringsLight: !paper.paper.isDark, ringsDark: paper.paper.isDark),
+                                                 isSelected: draft.paper == paper) { draft.paper = paper }
+                                }
                             }
                         }
                     }
@@ -206,7 +248,8 @@ struct WhiteboardCreateSheet: View {
     private var nameRow: some View {
         HStack(spacing: NibSpacing.l) {
             BoardPatternPreview(pattern: draft.pattern, paper: draft.paper.paper)
-                .frame(width: 104, height: 78)
+                .aspectRatio(4.0 / 3.0, contentMode: .fit)
+                .frame(width: BoardPatternPreview.previewWidth)
                 .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
                 .nibElevation(.paper)
             TextField(String(localized: "Untitled Whiteboard"), text: $draft.title)
@@ -258,7 +301,9 @@ extension WhiteboardCreateSheet {
 }
 
 /// A background choice: the pattern drawn on the chosen paper, with the sheet's one selection language (a 2 pt
-/// accent ring 3 pt outside).
+/// accent ring 3 pt outside, concentric with the thumbnail).
+/// ponytail: NibDesign has no selection-ring modifier (NibPageThumbnail draws its own); the ring is built from its
+/// tokens until one exists.
 struct BoardPatternTile: View {
     let pattern: BoardPattern
     let paper: NibPaper
@@ -275,8 +320,8 @@ struct BoardPatternTile: View {
                     .overlay {
                         if isSelected {
                             RoundedRectangle(cornerRadius: NibRadius.thumbnailEnvelope, style: .continuous)
-                                .strokeBorder(NibColor.accent, lineWidth: 2)
-                                .padding(-3)
+                                .strokeBorder(NibColor.accent, lineWidth: NibSpacing.xxs)
+                                .padding(-(NibRadius.thumbnailEnvelope - NibRadius.thumbnail))
                         }
                     }
                 Text(pattern.title)
@@ -297,6 +342,10 @@ struct BoardPatternTile: View {
 struct BoardPatternPreview: View {
     let pattern: BoardPattern
     let paper: NibPaper
+
+    /// The name row's preview and the narrowest pattern tile: half a page thumbnail wide (4:3).
+    static let previewWidth = NibMetrics.thumbnailWidth / 2
+    static let tileMinimum = NibMetrics.thumbnailWidth / 2
 
     var body: some View {
         Canvas { context, size in

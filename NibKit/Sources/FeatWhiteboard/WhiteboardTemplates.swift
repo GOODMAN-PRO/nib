@@ -309,7 +309,9 @@ struct BoardTemplatesPanel: View {
 
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 136), spacing: NibSpacing.m)], spacing: NibSpacing.m) {
+            // Cards at least three quarters of a page thumbnail wide: two columns in the floating panel.
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: NibMetrics.thumbnailWidth * 3 / 4), spacing: NibSpacing.m)],
+                      spacing: NibSpacing.m) {
                 ForEach(templates, id: \.id) { template in
                     Button { insert(template) } label: {
                         TemplateCard(template: template, isPlugin: template.owner != FeatWhiteboardFeature.id)

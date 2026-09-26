@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import ImageIO
 import os
 import NibContracts
 
@@ -77,6 +78,12 @@ struct BoardFragment {
     /// Union of the items' bounds (the JSON `bounds` may include margins; the placement centres the content itself).
     var bounds: Rect
 
+    /// Plugin and content-pack fragments are untrusted: each asset and all of them together are capped, and only
+    /// image and PDF files are stored.
+    static let maxAssetBytes = 20 * 1024 * 1024
+    static let maxTotalAssetBytes = 50 * 1024 * 1024
+    static let assetExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "heic", "webp", "pdf"]
+
     init(items: [Item], assets: [String: Data] = [:]) throws {
         let live = items.filter { !$0.deleted }
         guard let bounds = TemplatePlacement.union(live) else {
@@ -99,13 +106,36 @@ struct BoardFragment {
                            path: "$.template")
         }
         var assets: [String: Data] = [:]
+        var total = 0
         for (name, value) in json["assets"]?.objectValue ?? [:] {
-            guard let text = value.stringValue, let data = Data(base64Encoded: text) else {
+            let ext = Self.assetExtension(name)
+            guard Self.assetExtensions.contains(ext) else {
+                throw NibError(.invalidParams, "asset '\(name)' of the board template is not an image or PDF file",
+                               path: "$.template", hint: "name assets with one of: "
+                                   + Self.assetExtensions.sorted().joined(separator: ", "))
+            }
+            guard let text = value.stringValue else {
                 throw NibError(.invalidParams, "asset '\(name)' of the board template is not base64", path: "$.template")
+            }
+            // Refuse before decoding: base64 is 4 characters per 3 bytes.
+            guard text.utf8.count / 4 * 3 <= Self.maxAssetBytes + 3, let data = Data(base64Encoded: text),
+                  data.count <= Self.maxAssetBytes else {
+                throw NibError(.invalidParams, "asset '\(name)' of the board template is not base64 or is larger than "
+                                   + "\(Self.maxAssetBytes / 1_048_576) MB", path: "$.template")
+            }
+            total += data.count
+            guard total <= Self.maxTotalAssetBytes else {
+                throw NibError(.invalidParams, "the board template's assets are larger than "
+                                   + "\(Self.maxTotalAssetBytes / 1_048_576) MB together", path: "$.template")
             }
             assets[name] = data
         }
         try self.init(items: items, assets: assets)
+    }
+
+    /// The lower-cased file extension of an asset name ("logo.PNG" → "png").
+    static func assetExtension(_ name: String) -> String {
+        (name as NSString).pathExtension.lowercased()
     }
 }
 
@@ -351,7 +381,12 @@ struct BoardAdd: NibCommand {
         }
         if let id = p.id, !NibID.isValid(id) { throw NibError.invalid("id must be 1–64 of [A-Za-z0-9_-]", path: "$.id") }
         let title = p.title?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let template = p.template { _ = try WhiteboardSupport.template(template, ctx) }
+        if let template = p.template {
+            // Everything that could make the insertion fail is checked before the board exists, so a refused template
+            // never leaves an empty board behind (and a retry never adds a second one).
+            let plan = try BoardInsertTemplate.plan(WhiteboardSupport.template(template, ctx), ctx: ctx)
+            try BoardLimit.check(adding: plan.itemCount, to: 0)
+        }
         let board = try ctx.mutate { tx -> PageRecord in
             let content = try tx.content(doc)
             try WhiteboardSupport.requireWhiteboard(content, path: "$.doc")
@@ -471,18 +506,17 @@ struct BoardInsertTemplate: NibCommand {
             return TemplatePlacement.defaultCentre(content: TemplatePlacement.union(existing), templateSize: size)
         }
 
-        guard let fragmentJSON = template.spec["fragment"] else {
+        let insertion = try Self.plan(template, ctx: ctx)
+        if isBoard { try BoardLimit.check(adding: insertion.itemCount, to: existing.count) }
+        guard case let .fragment(fragment) = insertion else {
             return try await insertDiagram(template, page: p.page, doc: doc, pageID: pageID, ids: ids,
-                                           existing: existing, isBoard: isBoard, centre: centre, ctx: ctx)
+                                           existing: existing, centre: centre, ctx: ctx)
         }
-        let fragment = try BoardFragment(json: fragmentJSON)
-        if isBoard { try BoardLimit.check(adding: fragment.items.count, to: existing.count) }
         var assets: [String: AssetRef] = [:]
         if !fragment.assets.isEmpty {
             let store = try ctx.services.require(ctx.services.assets, "the asset store")
             for (name, data) in fragment.assets {
-                let ext = (name as NSString).pathExtension
-                assets[name] = try store.put(data, ext: ext.isEmpty ? "png" : ext, doc: doc)
+                assets[name] = try store.put(data, ext: BoardFragment.assetExtension(name), doc: doc)
             }
         }
         let target = centre(for: (fragment.bounds.width, fragment.bounds.height))
@@ -497,10 +531,40 @@ struct BoardInsertTemplate: NibCommand {
         return Output(refs: refs, template: template.id)
     }
 
+    /// What a board template inserts, checked before anything is written.
+    enum Plan {
+        case fragment(BoardFragment)
+        case diagram(nodes: Int, edges: Int)
+
+        /// Items the insertion adds to the board (a diagram adds a shape per node and a connector per edge).
+        var itemCount: Int {
+            switch self {
+            case let .fragment(fragment): return fragment.items.count
+            case let .diagram(nodes, edges): return nodes + edges
+            }
+        }
+    }
+
+    /// Parses a template's spec: a fragment (built-ins, plugins, content packs) or a `diagram.create` spec, which needs
+    /// the Diagrams feature installed.
+    static func plan(_ template: BoardTemplateDescriptor, ctx: CommandContext) throws -> Plan {
+        if let fragment = template.spec["fragment"] { return .fragment(try BoardFragment(json: fragment)) }
+        guard case let .object(params) = template.spec, let nodes = params["nodes"]?.arrayValue else {
+            throw NibError(.invalidParams, "board template '\(template.id)' is neither a fragment nor a diagram spec",
+                           path: "$.template")
+        }
+        guard ctx.bus.registry.descriptor(CommandIDs.diagramCreate) != nil else {
+            throw NibError(.unavailable, "board template '\(template.id)' is a diagram, and \(CommandIDs.diagramCreate) "
+                               + "is not installed", path: "$.template",
+                           hint: "pick a template whose spec is a fragment, e.g. whiteboard.mindMap")
+        }
+        return .diagram(nodes: nodes.count, edges: params["edges"]?.arrayValue?.count ?? 0)
+    }
+
     /// A `diagram.create` spec (plugins' `diagram` templates): node ids are replaced by the caller's or fresh ones so
     /// inserting a template twice never overwrites the first copy, then F032 lays it out in this command's undo group.
     private static func insertDiagram(_ template: BoardTemplateDescriptor, page: String, doc: DocumentID, pageID: PageID,
-                                      ids: [NibID], existing: [Item], isBoard: Bool,
+                                      ids: [NibID], existing: [Item],
                                       centre: @MainActor ((width: Double, height: Double)) -> Point,
                                       ctx: CommandContext) async throws -> Output {
         guard case .object(var params) = template.spec, let nodes = params["nodes"]?.arrayValue else {
@@ -526,7 +590,6 @@ struct BoardInsertTemplate: NibCommand {
         })
         params["ids"] = .array(remapped.compactMap { $0["id"] })
         params["page"] = .string(page)
-        if isBoard { try BoardLimit.check(adding: nodes.count + edges.count, to: existing.count) }
         let size = TemplatePlacement.estimatedSize(nodes: nodes.count, layout: params["layout"]?.stringValue ?? "tree")
         let target = centre(size)
         params["origin"] = .array([.number(target.x - size.width / 2), .number(target.y - size.height / 2)])
@@ -557,7 +620,7 @@ struct DocConvertToWhiteboard: NibCommand {
             + "paper kept as a locked card under its content.",
         params: .obj(["doc": .ref], required: ["doc"]),
         examples: [["doc": "doc:FIXTUREDOC01"]],
-        effect: .edit)
+        effect: .edit, destructive: true)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let doc = NodeRef.documentID(from: p.doc)
@@ -570,19 +633,37 @@ struct DocConvertToWhiteboard: NibCommand {
         guard !pages.isEmpty else { throw NibError.invalid("the notebook has no pages to convert", path: "$.doc") }
         var items: [PageID: [Item]] = [:]
         for page in pages { items[page.id] = try ctx.workspace.items(doc, page: page.id) }
+        let snapshot = ConversionSnapshot(pages: pages, items: items)
         let plan = NotebookLayout.boards(pages.map {
             PageSlotInput(id: $0.id, size: $0.size ?? .a4, rotation: $0.rotation, itemCount: items[$0.id]?.count ?? 0)
         })
         let slots = Dictionary(uniqueKeysWithValues: plan.joined().map { ($0.page, $0) })
 
-        // Slow work before the transaction: each page's paper becomes a card (PDF pages are rendered to images).
+        // Slow work before the transaction: each page's paper becomes a card. PDF pages are rendered to images one at a
+        // time, off the main actor; a page that cannot be rendered stops the conversion before anything is written.
+        let templates = WhiteboardSupport.registries(ctx)?.templates
         var cards: [PageID: Item] = [:]
+        var pdfURLs: [String: URL] = [:]
         for (index, page) in pages.enumerated() {
             guard let slot = slots[page.id] else { continue }
-            cards[page.id] = await PageCards.card(for: page, number: index + 1, frame: slot.frame, doc: doc, ctx: ctx)
+            var raster: AssetRef?
+            if page.background.kind == .pdf {
+                raster = try await PageCards.rasterisePDFPage(page, number: index + 1, doc: doc, ctx: ctx, urls: &pdfURLs)
+            }
+            cards[page.id] = PageCards.card(for: page, number: index + 1, frame: slot.frame, raster: raster,
+                                            templates: templates)
         }
 
         let boards = try ctx.mutate { tx -> [PageID] in
+            // The rendering above awaited: a sync merge or another window may have written meanwhile. Converting the
+            // stale snapshot would tombstone those edits, so the notebook must still be exactly what was read.
+            let fresh = try tx.content(doc)
+            var current: [PageID: [Item]] = [:]
+            for page in fresh.livePages { current[page.id] = try tx.items(doc, page: page.id) }
+            guard fresh.meta.kind == .notebook, ConversionSnapshot(pages: fresh.livePages, items: current) == snapshot else {
+                throw NibError(.conflict, "the notebook changed while converting, so it was left as it is", path: "$.doc",
+                               hint: "run doc.convertToWhiteboard again")
+            }
             // Every record is written once in this command, so undo restores it exactly (a record written twice in one
             // undo group would only be reverted to its intermediate state).
             for page in pages {
@@ -592,11 +673,14 @@ struct DocConvertToWhiteboard: NibCommand {
                 retired.trashedAt = nil
                 try tx.put(retired, doc: doc)
             }
+            let bookmarked = Set(pages.filter(\.bookmarked).map(\.id))
             var created: [PageID] = []
             var boardOf: [PageID: PageID] = [:]
             for (index, boardSlots) in plan.enumerated() {
-                let board = try tx.put(PageRecord(order: "", size: nil, background: .ofTemplate(Whiteboard.dotsTemplate),
-                                                  title: String(localized: "Board \(index + 1)")), doc: doc)
+                var record = PageRecord(order: "", size: nil, background: .ofTemplate(Whiteboard.dotsTemplate),
+                                        title: String(localized: "Board \(index + 1)"))
+                record.bookmarked = boardSlots.contains { bookmarked.contains($0.page) }
+                let board = try tx.put(record, doc: doc)
                 created.append(board.id)
                 let count = boardSlots.reduce(0) { $0 + 1 + (items[$1.page]?.count ?? 0) }
                 var zs = FractionalIndex.sequence(after: nil, count: count)[...]
@@ -608,31 +692,27 @@ struct DocConvertToWhiteboard: NibCommand {
                         used.insert(card.id)
                         try tx.put(card, doc: doc, page: board.id)
                     }
-                    let pageItems = items[slot.page] ?? []
-                    var remap: [ElementID: ElementID] = [:]
-                    for item in pageItems where used.contains(item.id) { remap[item.id] = NibID.make() }
-                    for item in pageItems {
-                        var moved = item.transformed(by: slot.transform)
-                        moved.id = remap[item.id] ?? item.id
-                        moved.attachedTo = item.attachedTo.map { remap[$0] ?? $0 }
-                        if var c = moved.connector {
-                            c.from.item = c.from.item.map { remap[$0] ?? $0 }
-                            c.to.item = c.to.item.map { remap[$0] ?? $0 }
-                            moved.connector = c
-                        }
-                        moved.z = zs.popFirst() ?? ""
-                        used.insert(moved.id)
-                        try tx.put(moved, doc: doc, page: board.id)
+                    for moved in NotebookLayout.rehome(items[slot.page] ?? [], transform: slot.transform, used: &used) {
+                        var item = moved
+                        item.z = zs.popFirst() ?? ""
+                        try tx.put(item, doc: doc, page: board.id)
                     }
                 }
             }
-            for clip in content.liveAudio {
+            // Recordings, outline entries and bookmarks follow their pages onto the boards.
+            for clip in fresh.liveAudio {
                 guard let page = clip.page, let board = boardOf[page] else { continue }
                 var moved = clip
                 moved.page = board
                 try tx.put(moved, doc: doc)
             }
-            var meta = try tx.content(doc).meta
+            for entry in fresh.liveOutline {
+                guard let page = entry.page, let board = boardOf[page] else { continue }
+                var moved = entry
+                moved.page = board
+                try tx.put(moved, doc: doc)
+            }
+            var meta = fresh.meta
             meta.kind = .whiteboard
             meta.coverEnabled = false
             meta.defaultTemplate = TemplateRef(Whiteboard.dotsTemplate)
@@ -644,35 +724,72 @@ struct DocConvertToWhiteboard: NibCommand {
     }
 }
 
+/// What a conversion read before its slow work (the page cards): the live pages in order and every item's revision.
+/// The transaction compares it with the notebook as it is then.
+struct ConversionSnapshot: Equatable {
+    var pages: [PageID]
+    var pageRevs: [Rev]
+    var items: [PageID: [ElementID: Rev]]
+
+    init(pages: [PageRecord], items: [PageID: [Item]]) {
+        self.pages = pages.map(\.id)
+        pageRevs = pages.map(\.rev)
+        var revs: [PageID: [ElementID: Rev]] = [:]
+        for page in pages {
+            revs[page.id] = Dictionary((items[page.id] ?? []).map { ($0.id, $0.rev) }, uniquingKeysWith: { first, _ in first })
+        }
+        self.items = revs
+    }
+}
+
+extension NotebookLayout {
+    /// A page's items moved onto its board slot. An id already used on the board (the cards, earlier pages) gets a
+    /// fresh one, and the page's own attachments and connector anchors follow the new id.
+    static func rehome(_ items: [Item], transform: Affine, used: inout Set<ElementID>) -> [Item] {
+        var remap: [ElementID: ElementID] = [:]
+        for item in items where used.contains(item.id) { remap[item.id] = NibID.make() }
+        return items.map { item in
+            var moved = item.transformed(by: transform)
+            moved.id = remap[item.id] ?? item.id
+            moved.attachedTo = item.attachedTo.map { remap[$0] ?? $0 }
+            if var c = moved.connector {
+                c.from.item = c.from.item.map { remap[$0] ?? $0 }
+                c.to.item = c.to.item.map { remap[$0] ?? $0 }
+                moved.connector = c
+            }
+            used.insert(moved.id)
+            return moved
+        }
+    }
+}
+
 /// The card a converted page leaves on its board, under its content: the page's image background as an image item, a
 /// PDF page rendered to an image, otherwise a vector card drawn from the page's template (crisp at any zoom). Cards are
 /// locked so writing over them never drags the paper.
 @MainActor
 enum PageCards {
-    static func card(for page: PageRecord, number: Int, frame: Frame, doc: DocumentID, ctx: CommandContext) async -> Item {
+    /// Pixels per point of a rendered PDF page.
+    /// ponytail: 2 px per point is sharp at 100 % and soft past 200 %; a vector PDF item type is the upgrade path.
+    static let pdfScale = 2.0
+
+    /// `raster` is the rendered page of a `.pdf` background (see `rasterisePDFPage`).
+    static func card(for page: PageRecord, number: Int, frame: Frame, raster: AssetRef?,
+                     templates: Registry<TemplateDefinition>?) -> Item {
         let title = page.title ?? String(localized: "Page \(number)")
-        switch page.background.kind {
-        case .image:
-            if let asset = page.background.asset {
-                return locked(.makeImage(ImageItem(frame: frame, asset: asset, altText: title)))
-            }
-        case .pdf:
-            if let asset = await renderedPage(page, doc: doc, ctx: ctx) {
-                return locked(.makeImage(ImageItem(frame: frame, asset: asset, altText: title)))
-            }
-        case .template, .color:
-            break
+        if let raster {
+            return locked(.makeImage(ImageItem(frame: frame, asset: raster, altText: title)))
+        }
+        if page.background.kind == .image, let asset = page.background.asset {
+            return locked(.makeImage(ImageItem(frame: frame, asset: asset, altText: title)))
         }
         let data: JSONValue = ["title": .string(title), "page": .string(page.id.raw),
                                "background": (try? JSONValue.from(page.background)) ?? .null]
         let custom = CustomItem(owner: FeatWhiteboardFeature.id, type: Whiteboard.pageCardType, frame: frame, data: data,
-                                display: display(for: page.background, size: page.size ?? .a4,
-                                                 templates: WhiteboardSupport.registries(ctx)?.templates))
+                                display: display(for: page.background, size: page.size ?? .a4, templates: templates))
         return locked(.makeCustom(custom))
     }
 
-    /// Paper plus the template's own drawing, in the card's (unrotated page) coordinates. A PDF page that could not be
-    /// rendered keeps its background in the card's data and shows plain paper.
+    /// Paper plus the template's own drawing, in the card's (unrotated page) coordinates.
     static func display(for background: Background, size: PageSize, templates: Registry<TemplateDefinition>?) -> DisplayList {
         var paper = RGBA.white
         var ops: [DisplayOp] = []
@@ -694,17 +811,43 @@ enum PageCards {
         return DisplayList(ops: [sheet] + ops)
     }
 
-    /// ponytail: 2 px per point is sharp at 100 % and soft past 200 %; a vector PDF item type is the upgrade path.
-    private static func renderedPage(_ page: PageRecord, doc: DocumentID, ctx: CommandContext) async -> AssetRef? {
-        guard let renderer = ctx.services.renderer, let assets = ctx.services.assets else { return nil }
-        let request = RenderRequest(doc: doc, page: page.id, scale: 2, background: true, annotations: false)
+    /// Renders a PDF-backed page to a PNG asset: through the renderer service, else straight from the PDF with Core
+    /// Graphics. Rendering and PNG encoding run off the main actor. A page neither can draw (damaged or locked PDF,
+    /// missing asset) throws `unavailable`, so a conversion never trades a PDF page for blank paper.
+    static func rasterisePDFPage(_ page: PageRecord, number: Int, doc: DocumentID, ctx: CommandContext,
+                                 urls: inout [String: URL]) async throws -> AssetRef {
+        let failure = NibError(.unavailable, "page \(number) of the PDF could not be rendered, so the notebook was not "
+                                   + "converted", path: "$.doc",
+                               hint: "check that the PDF opens in Nib (it may be damaged or password-protected), or move "
+                                   + "that page out of the notebook and convert again")
+        let assets = try ctx.services.require(ctx.services.assets, "the asset store")
+        let size = page.size ?? .a4
+        var png: Data?
+        if let renderer = ctx.services.renderer {
+            do {
+                let request = RenderRequest(doc: doc, page: page.id, scale: pdfScale, background: true, annotations: false)
+                let image = try await renderer.render(request).image
+                png = await Task.detached(priority: .userInitiated) { PageRaster.png(image) }.value
+            } catch {
+                Whiteboard.log.error("rendering page \(page.id.raw, privacy: .public) for the whiteboard failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        if png == nil, let ref = page.background.asset {
+            if urls[ref.name] == nil { urls[ref.name] = assets.url(ref, doc: doc) }
+            if let url = urls[ref.name] {
+                let index = page.background.pdfPage ?? 0
+                let scale = pdfScale
+                png = await Task.detached(priority: .userInitiated) {
+                    PageRaster.pdfPage(url: url, index: index, size: size, scale: scale).flatMap(PageRaster.png)
+                }.value
+            }
+        }
+        guard let png else { throw failure }
         do {
-            let result = try await renderer.render(request)
-            guard let png = UIImage(cgImage: result.image).pngData() else { return nil }
             return try assets.put(png, ext: "png", doc: doc)
         } catch {
-            Whiteboard.log.error("rendering page \(page.id.raw, privacy: .public) for the whiteboard failed: \(error.localizedDescription, privacy: .public)")
-            return nil
+            Whiteboard.log.error("storing page \(page.id.raw, privacy: .public) for the whiteboard failed: \(error.localizedDescription, privacy: .public)")
+            throw failure
         }
     }
 
@@ -712,5 +855,48 @@ enum PageCards {
         var it = item
         it.locked = true
         return it
+    }
+}
+
+/// Thread-safe raster helpers (Core Graphics and ImageIO only), run off the main actor.
+enum PageRaster {
+    /// Largest bitmap a converted page may take (a 100 000 pt page would otherwise ask for gigabytes).
+    static let maxPixels = 16_000_000.0
+
+    static func png(_ image: CGImage) -> Data? {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data as CFMutableData, "public.png" as CFString, 1, nil)
+        else { return nil }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return data as Data
+    }
+
+    /// Page `index` (0-based) of the PDF at `url`, aspect-fitted on white into a page of `size` points at `scale`
+    /// pixels per point, honouring the PDF page's own rotation. nil when the PDF cannot be opened or unlocked.
+    static func pdfPage(url: URL, index: Int, size: PageSize, scale: Double) -> CGImage? {
+        guard let document = CGPDFDocument(url as CFURL) else { return nil }
+        if document.isEncrypted && !document.isUnlocked && !document.unlockWithPassword("") { return nil }
+        guard index >= 0, let page = document.page(at: index + 1) else { return nil }
+        let points = max(size.width * size.height, 1)
+        let s = min(scale, (maxPixels / points).squareRoot())
+        let width = max(1, Int((size.width * s).rounded())), height = max(1, Int((size.height * s).rounded()))
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        context.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let box = page.getBoxRect(.cropBox)
+        guard box.width > 0, box.height > 0 else { return nil }
+        let angle = ((Int(page.rotationAngle) % 360) + 360) % 360
+        let turned = angle == 90 || angle == 270
+        let fit = min(CGFloat(width) / (turned ? box.height : box.width), CGFloat(height) / (turned ? box.width : box.height))
+        // PDF space is y-up like a bitmap context; /Rotate turns the page clockwise as displayed.
+        context.translateBy(x: CGFloat(width) / 2, y: CGFloat(height) / 2)
+        context.scaleBy(x: fit, y: fit)
+        context.rotate(by: -CGFloat(angle) * .pi / 180)
+        context.translateBy(x: -box.midX, y: -box.midY)
+        context.drawPDFPage(page)
+        return context.makeImage()
     }
 }

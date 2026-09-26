@@ -178,6 +178,8 @@ final class BoardsModel: ObservableObject {
         perform("page.moveTo", ["pages": refs(pages), "doc": .string(NodeRef.document(target).description)])
     }
 
+    /// `doc.create` gives the new whiteboard a first board; once the moved boards are there, that empty board goes to
+    /// the Trash in the same undo step, so the new whiteboard holds exactly the boards that were moved.
     func moveToNewWhiteboard() {
         let pages = moving
         showsMove = false
@@ -188,8 +190,11 @@ final class BoardsModel: ObservableObject {
             let create: JSONValue = ["kind": .string(DocumentKind.whiteboard.rawValue),
                                      "title": .string(String(localized: "Untitled Whiteboard")), "id": .string(target.raw)]
             guard await execute("doc.create", create, group: group) != nil else { return }
-            await execute("page.moveTo", ["pages": refs(pages), "doc": .string(NodeRef.document(target).description)],
-                          group: group)
+            let placeholder = (try? app.workspace.content(target))?.livePages.first?.id
+            guard await execute("page.moveTo", ["pages": refs(pages), "doc": .string(NodeRef.document(target).description)],
+                                group: group) != nil,
+                  let placeholder else { return }
+            await execute("page.trash", ["pages": [.string(NodeRef.page(target, placeholder).description)]], group: group)
         }
     }
 
@@ -380,6 +385,7 @@ struct BoardsList: View {
             }
             if model.renaming == board.id {
                 TextField(String(localized: "Board name"), text: $model.renameText)
+                    .accessibilityLabel(String(localized: "Board name"))
                     .font(NibFont.body)
                     .multilineTextAlignment(.center)
                     .submitLabel(.done)
@@ -409,13 +415,12 @@ struct BoardsList: View {
         .onTapGesture { model.isSelecting ? model.toggle(board.id) : model.open(board.id) }
         .hoverEffect(.highlight)
         .contextMenu { contextMenu(board) }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(board.title)
-        .accessibilityValue(String(localized: "Board \(board.number) of \(model.boards.count)"))
-        .accessibilityAddTraits(isCurrent || isSelected ? [.isButton, .isSelected] : [.isButton])
-        .accessibilityAction(named: Text(String(localized: "Rename"))) { model.beginRename(board) }
-        .accessibilityAction(named: Text(String(localized: "Move Up"))) { model.moveUp(board.id) }
-        .accessibilityAction(named: Text(String(localized: "Move Down"))) { model.moveDown(board.id) }
+        .modifier(BoardRowAccessibility(
+            isRenaming: model.renaming == board.id, title: board.title,
+            position: String(localized: "Board \(board.number) of \(model.boards.count)"),
+            traits: isCurrent || isSelected ? [.isButton, .isSelected] : [.isButton],
+            rename: { model.beginRename(board) }, moveUp: { model.moveUp(board.id) },
+            moveDown: { model.moveDown(board.id) }))
     }
 
     @ViewBuilder
@@ -444,7 +449,7 @@ struct BoardsList: View {
     private var selectionBar: some View {
         let chosen = model.selected
         return HStack(spacing: 0) {
-            Text(String(localized: "\(chosen.count) selected"))
+            Text(WhiteboardCopy.selectedBoards(chosen.count))
                 .font(NibFont.footnote)
                 .foregroundStyle(NibColor.labelSecondary)
                 .lineLimit(1)
@@ -466,6 +471,45 @@ struct BoardsList: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Selected boards"))
+    }
+}
+
+/// A board row for VoiceOver: one button with its name, position and actions (Rename, Move Up, Move Down). While it is
+/// being renamed it becomes a container instead, so the name field inside can be reached, read and edited.
+struct BoardRowAccessibility: ViewModifier {
+    let isRenaming: Bool
+    let title: String
+    let position: String
+    let traits: AccessibilityTraits
+    let rename: () -> Void
+    let moveUp: () -> Void
+    let moveDown: () -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isRenaming {
+            content.accessibilityElement(children: .contain)
+        } else {
+            content
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(title)
+                .accessibilityValue(position)
+                .accessibilityAddTraits(traits)
+                .accessibilityAction(named: Text(String(localized: "Rename")), rename)
+                .accessibilityAction(named: Text(String(localized: "Move Up")), moveUp)
+                .accessibilityAction(named: Text(String(localized: "Move Down")), moveDown)
+        }
+    }
+}
+
+/// Counts in whiteboard copy, pluralised by the system's grammar agreement ("1 board", "3 boards").
+enum WhiteboardCopy {
+    static func boards(_ count: Int) -> String {
+        String(AttributedString(localized: "^[\(count) board](inflect: true)").characters)
+    }
+
+    static func selectedBoards(_ count: Int) -> String {
+        String(AttributedString(localized: "^[\(count) board](inflect: true) selected").characters)
     }
 }
 
@@ -516,7 +560,7 @@ struct MoveBoardsSheet: View {
                     Section {
                         ForEach(targets) { node in
                             Button { model.move(to: node.id) } label: {
-                                NibRow(node.title, subtitle: node.pageCount.map { String(localized: "\($0) boards") },
+                                NibRow(node.title, subtitle: node.pageCount.map { WhiteboardCopy.boards($0) },
                                        icon: .whiteboard)
                             }
                         }
