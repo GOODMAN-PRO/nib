@@ -19,3 +19,4 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - F036: drop-to-attach criterion removed pending undo coalescing fix; restore after contracts-v2 (FIX pass). Update F036 line in contract-gaps.md.
 - App target: add user-fonts entitlement (com.apple.developer.user-fonts=[app-usage]) or UIAppSupportsInstalledFonts for F026 T-059/P-083 (owner of Nib/ Info.plist or integration).
 - Integration spec edit: add image.pick {source, page?|doc?|ref?|refs?, point?, position?, anchor?, ids?} (edit, user presence, sensitive) to F034 commands in forge-spec.json + ARCHITECTURE §6.5.
+- Integration spec edit: ARCHITECTURE catalogue: element.create gains optional fallback:Bool (F035).
