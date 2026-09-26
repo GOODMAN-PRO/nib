@@ -42,6 +42,53 @@ public enum Mutation {
         }
     }
 
+    /// Identity of the written record (kind, document, page for items, id): the key undo rebasing works on.
+    var recordKey: RecordKey {
+        switch self {
+        case let .item(d, p, _, a): return RecordKey(kind: 0, doc: d, page: p, id: a.id)
+        case let .page(d, _, a): return RecordKey(kind: 1, doc: d, page: nil, id: a.id)
+        case let .meta(d, _, _): return RecordKey(kind: 2, doc: d, page: nil, id: d)
+        case let .block(d, _, a): return RecordKey(kind: 3, doc: d, page: nil, id: a.id)
+        case let .card(d, _, a): return RecordKey(kind: 4, doc: d, page: nil, id: a.id)
+        case let .audio(d, _, a): return RecordKey(kind: 5, doc: d, page: nil, id: a.id)
+        case let .outline(d, _, a): return RecordKey(kind: 6, doc: d, page: nil, id: a.id)
+        }
+    }
+
+    /// Revision of the written value (`after.rev`).
+    var afterRev: Rev {
+        switch self {
+        case let .item(_, _, _, a): return a.rev
+        case let .page(_, _, a): return a.rev
+        case let .meta(_, _, a): return a.rev
+        case let .block(_, _, a): return a.rev
+        case let .card(_, _, a): return a.rev
+        case let .audio(_, _, a): return a.rev
+        case let .outline(_, _, a): return a.rev
+        }
+    }
+
+    /// The same mutation with `after.rev` replaced (undo rebasing: the value is unchanged, only its revision moved).
+    func withAfterRev(_ rev: Rev) -> Mutation {
+        func stamped<T: LWWRecord>(_ r: T) -> T {
+            var x = r
+            x.rev = rev
+            return x
+        }
+        switch self {
+        case let .item(d, p, b, a): return .item(d, p, before: b, after: stamped(a))
+        case let .page(d, b, a): return .page(d, before: b, after: stamped(a))
+        case let .meta(d, b, a):
+            var m = a
+            m.rev = rev
+            return .meta(d, before: b, after: m)
+        case let .block(d, b, a): return .block(d, before: b, after: stamped(a))
+        case let .card(d, b, a): return .card(d, before: b, after: stamped(a))
+        case let .audio(d, b, a): return .audio(d, before: b, after: stamped(a))
+        case let .outline(d, b, a): return .outline(d, before: b, after: stamped(a))
+        }
+    }
+
     /// Ref of the written record and whether the write created or removed it (tombstone transitions).
     public var change: (ref: String, created: Bool, removed: Bool) {
         func classify(_ beforeDeleted: Bool?, _ afterDeleted: Bool) -> (Bool, Bool) {
@@ -70,6 +117,40 @@ public enum Mutation {
             let c = classify(b?.deleted, a.deleted)
             return (NodeRef.outline(d, a.id).description, c.0, c.1)
         }
+    }
+}
+
+/// Which record a mutation wrote: kind tag (0 item … 6 outline), document, page (items only) and id.
+struct RecordKey: Hashable {
+    let kind: UInt8
+    let doc: DocumentID
+    let page: PageID?
+    let id: NibID
+}
+
+/// Revisions an undo, redo or revert moved (contracts-v2). Reverting writes a record's older value with a FRESH
+/// revision; every stored mutation that still expects the record at the revision of that older value must now accept
+/// the fresh one instead, or the next undo on the same record would look like a later edit and be skipped.
+/// `map[key][old] = new` = "the value that had revision `old` now lives at revision `new`".
+struct RevRebase {
+    private(set) var map: [RecordKey: [Rev: Rev]] = [:]
+
+    var isEmpty: Bool { map.isEmpty }
+    var documents: Set<DocumentID> { Set(map.keys.map { $0.doc }) }
+
+    mutating func record(_ key: RecordKey, old: Rev, new: Rev) {
+        map[key, default: [:]][old] = new
+    }
+
+    /// The revision a record must carry now for a mutation that wrote `rev` to still be the latest write.
+    func current(_ key: RecordKey, _ rev: Rev) -> Rev {
+        map[key]?[rev] ?? rev
+    }
+
+    /// `m` with its after-revision moved when the record's value was re-stamped.
+    func apply(_ m: Mutation) -> Mutation {
+        guard let moves = map[m.recordKey], let rev = moves[m.afterRev] else { return m }
+        return m.withAfterRev(rev)
     }
 }
 

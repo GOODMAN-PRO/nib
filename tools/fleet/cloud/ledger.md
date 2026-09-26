@@ -29,3 +29,10 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - F016 (after main integration): register toolbar.dock {dock, along?} (session, returns previous), persist dock setting, route NibToolPalette dock binding through it; remove workarounds.
 - F019 spec now has library.reorder {refs, folder?, after?|before?} + Manual sort + NibReflow.
 - F052 FIX: HOLD until contracts-v2 on main (HUD overlay, playback bar, live toolbar state, typed events), then FIX with the review (3 majors incl. audio.delete path traversal).
+
+## Contracts-v2 landed (session 2026-09-26)
+- v2/contracts green (run 36224576545); merged to main as 1741651; main CI 36225011717 pending -> marker/contracts-v2.
+- 368 gaps: 220 resolved, 67 rejected, 81 deferred; see docs/CONTRACTS.md changelog.
+- v2/spec agent: catalogue rows + unbuilt-feature spec edits (F066 layers export, F007 roll key, etc.)
+- IMPLEMENT launched: F002 F006 F013 F021 F023 F091 F102 F103; CI: F031; F052 FIX held -> launch now that v2 is on main (after spec).
+- TODO after main CI green: merge main into all feat/* branches (only those not being worked on by an agent; agents merge it themselves).
