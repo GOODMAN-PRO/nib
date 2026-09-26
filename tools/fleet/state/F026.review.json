@@ -1,0 +1,77 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTextBox/TextCommands.swift:81-86 (SavedTextStyle.json), 682 (TextSaveDefaultStyle.run); TextFormatInspector.swift:372-376, 400-401, 460-466 (TextFormatModel .defaults / saveAsDefault / saveStyle); TextBoxEditor.swift:338 (createBox style)",
+      "problem": "Saved text styles cannot clear optional fields. `SavedTextStyle.json` leaves out nil values (synthesised Codable skips background, borderColor and nil TextAttributes fields, and the code skips nil align and lineSpacing), and `text.saveDefaultStyle` deep-merges the style over the existing default. As a result: (1) in the text tool settings (`.defaults`), choosing No Fill or Line Spacing Auto changes nothing, because the old fill or spacing merges back in; (2) Set as Default for New Text, run from a box with no fill, Auto spacing or the default font, keeps the previous default's fill, spacing and font; (3) named styles saved with Save Style… inherit the default's fill and line spacing; (4) choosing No Fill on a new box before its first commit is undone by `text.createBox`, because the style object is merged over a default that has a fill, so the page shows a fill the overlay never showed.",
+      "fix": "Make `SavedTextStyle.json` explicit: emit `\"background\": null` and `\"borderColor\": null` when nil, `\"lineSpacing\": 0` when nil, `\"align\": \"natural\"` when nil, and write `box.defaults` as `TextLayout.resolved(...)` with link and attachment removed, so every field is present. In `TextBoxEditor.submit`, send the explicit JSON the same way. Add a test: save a default with a background, save `{background: null, lineSpacing: 0}`, then assert that `TextStyles.defaultStyle` has no background and nil lineSpacing. Add a second test: `.defaults` setBox No Fill clears the fill."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTextBox/TextBoxDrawer.swift:241-262 (TextLayout.relativeAttributes), used by TextBoxEditor.swift:445-452 (currentRichText) on every commit",
+      "problem": "The editor rebuilds each run's formatting from the UIFont it rendered, and every commit rewrites every run in the box. This loses formatting in two ways. (1) A run font that is not installed on this device resolves to a system fallback whose family starts with \".\" (or to Helvetica), so `font` is dropped and the run takes the box default. A custom or user-installed font chosen on one device (T-059) is therefore erased the first time the box is edited on another device. (2) Bold and italic are dropped in families that lack those faces. Italic is missing in Noteworthy, Marker Felt, Chalkboard SE, Bradley Hand, Snell Roundhand and American Typewriter, all from `TextFonts.preferred`. In those fonts, ⌘I and the I toggle apply italic, re-render, then commit it as off. Italics set by the AI with text.format also disappear on the next edit.",
+      "fix": "Carry the model attributes through the text view. In `TextLayout.attributed`, put each run's `font`, `bold` and `italic` on its characters under a private key (e.g. `nib.text.modelFont` holding the family, plus a trait bitmask). Keep that key in typing attributes: `applyAttributes`, `applyParagraphStyle` and `cleanTypingAttributes` must merge it rather than drop it. In `relativeAttributes`, prefer the stored family and traits when the rendered font is a fallback (family starts with \".\" or differs from the stored family) or lacks the stored trait. Add round-trip tests: a run in an uninstalled family \"NoSuchFont\", and italic text in \"Noteworthy\"; both must survive `TextLayout.richText(from: attributed(...))`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextBox/TextFormatInspector.swift:395-406, 415-439 (setBox / applyPreset / applyNamed for .items); TextCommands.swift:637-639",
+      "problem": "The inspector is registered for sticky notes, and its Style row and preset chips are always shown. But for `.items`, presets and named styles go through `text.setBoxStyle`, which throws 'is not a text box' for sticky notes. For a sticky note, or a mixed text-box + sticky selection, Title/Heading/Body/Caption and saved styles fail with an error toast. All refs share one `mutate`, so the text boxes in a mixed selection are not changed either. The Text Box section is shown whenever the first selected item is a text box, so it breaks the same way.",
+      "fix": "In `TextFormatModel`, split the refs by kind. Text boxes go to `text.setBoxStyle`. Sticky notes and other kinds get `text.format` with no range, using the style's `defaults` (link and attachment removed), plus `text.setParagraph` for align and lineSpacing. Run all calls under the same undo group. Filter the Text Box section and `setBox` refs to text boxes only. Add a Harness test that applies the \"heading\" preset through TextFormatModel(.items) to FIXTURESTY01."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextBox/TextCommands.swift:340-351 (TextRefs.range); AutoList.swift:329-348 (split)",
+      "problem": "AI and plugin ranges are not snapped to character boundaries. If `text.format` or `text.setParagraph` is called with a UTF-16 offset inside a surrogate pair, for example range [1, 1] on \"😀abc\", `AutoList.split` cuts the emoji into lone surrogates. Swift then repairs them to U+FFFD, so the user's text is corrupted (undo restores it). LLMs routinely miscount UTF-16 offsets.",
+      "fix": "In `TextRefs.range`, return `(text.plainText as NSString).rangeOfComposedCharacterSequences(for: NSRange(location: r[0], length: min(r[1], total - r[0])))`. Add a test that formats [1, 1] of \"😀abc\" and checks that plainText is unchanged."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextBox/TextCommands.swift:265-267 (RichTextEdit.normalized), 455 (createBox), 495 (setText)",
+      "problem": "Rich text from untrusted callers (the `text` schema is `.anything`) is stored unsanitised. `text.format` clamps size, but `text.createBox` and `text.setText` accept any run `size` (0, negative, 1e6), paragraph `indent` (negative, or huge, which becomes indent × 24 pt of head indent), negative or huge `lineSpacing`, and `link` values using the internal `nibasset:` scheme. These values go straight into TextKit and `fittedHeight`, producing huge frames, text drawn outside the box and very slow layouts.",
+      "fix": "Sanitise in `RichTextEdit.normalized`, which both commands already call: clamp size to 1…400, clamp indent to 0…AutoList.maxIndent, map lineSpacing ≤ 0 to nil and cap it at 100, and drop links whose url starts with `TextLayout.assetScheme + \":\"`. Add a test that setText with `{size: -5, indent: 99}` stores the clamped values."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextBox/TextBoxEditor.swift:272-278 (endEditing → autodetectLinks)",
+      "problem": "`link.autodetect` runs on every end of editing, even when the text did not change. A URL the user unlinked on purpose (link.remove) is linked again as soon as the box is opened and closed.",
+      "fix": "Run `autodetectLinks` only when this editing session committed new text. Record `didChangeText` when `submit` runs, or compare the text with the state at open, and skip autodetect otherwise."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextBox/TextFormatInspector.swift:562-588 (TextItemsInspector / TextToolSettingsView); FeatTextBoxFeature.swift:47",
+      "problem": "Both views build `@StateObject` from init parameters. When the host re-renders the same `AnyView(TextItemsInspector)` for a new selection, SwiftUI keeps the first model, so the inspector shows the previous box and applies formatting to it. The same happens to TextToolSettingsView when it was built before editing started: it keeps editing the defaults.",
+      "fix": "Give each view an identity from its input: `AnyView(TextItemsInspector(...).id(ids))` in the InspectorDescriptor closure, and `.id(editing?.id)` (or the kind) for TextToolSettingsView."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextBox/TextBoxEditor.swift:833-846; TextFormatInspector.swift:838-869 (font pickers)",
+      "problem": "User-installed fonts (T-059 'custom fonts', P-083 'installed fonts') do not appear in UIFontPickerViewController without the `com.apple.developer.user-fonts` = [\"app-usage\"] entitlement, and project.yml / the app entitlements do not declare it. F026 cannot add it itself (ownership).",
+      "fix": "In the feature's final summary, report T-059/P-083 as 'custom fonts pending app entitlement', and file the entitlement request with the orchestrator or app-target owner per ARCHITECTURE.md §15.11–12, so the gap is tracked rather than silently shipped."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextBox/TextBoxEditor.swift:206-210, 701-711; TextFormatInspector.swift:84-114, 1034-1045; TextBoxDrawer.swift:358-384",
+      "problem": "Design slop against DESIGN.md §15/§16. (1) The editing outline uses literals: `lineWidth = 1`, dash `[4, 4]`, a 3 pt inset and `radius + 3`, and 3 pt is off the 4 pt scale. (2) `TextKeyboardBar.swatchImage` hand-rolls a 22 pt swatch with a 0.5 pt ring. (3) Formatting glyphs are raw SF Symbol strings passed through `NibSymbol(systemName:)` (\"text.aligncenter\", \"list.number\", \"checklist\", \"decrease.indent\", ...), which gets around the token set. (4) The overlay shadow is `nibElevation(.rest)`, while the drawer uses a hard-coded 25 % black shadow (offset 2, blur 6, plus a text shadow when there is no fill), so the box visibly changes when editing starts and ends.",
+      "fix": "Use `NibSpacing.xs` for the outline gap. File a contract request (§16) for text-format NibSymbol tokens, a UIKit swatch image, and a focus-outline token, instead of hand-rolling them (§15.6). Draw the box shadow from one shared definition, a `TextLayout.shadow` used by both `layoutEditing` and `TextLayout.draw`, so editing and rendered states match."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextBox/TextFormatInspector.swift:548-557, 601-609, 781, 802, 925-928",
+      "problem": "Copy and accessibility gaps. (1) The section actions 'No Fill' and 'None' (highlight) are not verb + object (slop checklist). (2) The Save Text Style alert silently ignores invalid names (dots, more than 40 characters). (3) Deleting a named style is only possible from a long-press context menu, with no accessibility action. (4) The keyboard bar hides the point size from VoiceOver (`sizeLabel.isAccessibilityElement = false`), and the Smaller/Larger buttons carry no value.",
+      "fix": "Rename the actions to 'Remove Fill' and 'Remove Highlight'. Disable Save while `!TextSettings.isValidName(trimmed)` and say why in the message. Add `.accessibilityAction(named: String(localized: \"Delete Style\")) { model.deleteStyle(named: name) }` to the named chips. In `update(_:)`, set `accessibilityValue` to \"\\(size) pt\" on the Smaller/Larger buttons."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextBox/TextBoxDrawer.swift:146-158, 328-334; TextBoxEditor.swift:903-926; TextCommands.swift:294-299",
+      "problem": "Performance and accuracy. (1) The drawer decodes every inline glyph image from the asset store on every tile draw, with no cache. (2) `fittedHeight` measures glyphs as squares while drawing uses their real aspect ratio, so an auto-grow box's stored height can be shorter than the text drawn below it (selection bounds and tile culling come from the frame). (3) Each keystroke converts the whole text view to RichText two or three times: an explicit `st.model.refresh()` plus the `changes` sink, which refreshes again. (4) The full TextKit refit runs inside `mutate`, although ARCHITECTURE.md §14 says mutate bodies should be short.",
+      "fix": "Cache decoded glyph images in a static `NSCache` keyed by doc + asset name (it is thread-safe). Measure with the real image aspect when assets are available (pass `ctx.services.assets` into `fittedHeight`). Drop the explicit `st.model.refresh()` in `textViewDidChange` and `textViewDidChangeSelection`, since the `changes` sink already refreshes. Compute the fitted height before `ctx.mutate` from `workspace.item`, and only assign it inside."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTextBoxTests/FeatTextBoxTests.swift",
+      "problem": "The riskiest logic has no tests. Missing: the editor's UITextViewDelegate list paths (typed \"1. \" / \"- \" trigger, Return on an empty item, Backspace on a marker, Tab); `text.tapAt` reporting handled: true with a live editor on a FakeCanvasHost; the non-sticky tool reverting after `endEditing`, and staying when `text.pinned` (T-035); saved-style clearing; the surrogate-range and sanitisation cases above; and drawing on dark paper or with autoGrow off (clipping).",
+      "fix": "Add Harness/FakeCanvasHost tests. Drive `textView(_:shouldChangeTextIn:replacementText:)` on `editor.editingTextView` and assert the committed paragraphs. Run text.tapAt with the session's editor attached and assert handled == true and editor.isEditing. Set session.tool = \"text\", run beginNewBox + endEditing, and assert tool.select reverted unless text.pinned. Add one test for each of the fixes above."
+    }
+  ]
+}
