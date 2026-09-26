@@ -228,8 +228,9 @@ extension RGBA {
 // MARK: - Model
 
 /// Holds the format controls' state and turns every control into a command: `text.format`, `text.setParagraph` and
-/// `text.setBoxStyle` for selected boxes (one undo step per action), the editing overlay for the box being typed in,
-/// and `text.saveDefaultStyle` for the style of new boxes.
+/// `text.setBoxStyle` for selected boxes (one undo step per action; box styles go to text boxes only, and sticky notes
+/// take a style's character and paragraph settings through `text.setText`), the editing overlay for the box being
+/// typed in, and `text.saveDefaultStyle` for the style of new boxes.
 @MainActor
 final class TextFormatModel: ObservableObject {
     enum Kind {
@@ -247,6 +248,8 @@ final class TextFormatModel: ObservableObject {
     @Published private(set) var pinned = false
     private var cancellables = Set<AnyCancellable>()
     private let subscriptions = SubscriptionBag()
+    /// The last queued batch of commands (batches run in order).
+    private var pending: Task<Void, Never>?
 
     init(app: NibApp, session: EditorSession?, kind: Kind, editor: TextBoxEditor? = nil) {
         self.app = app
@@ -294,8 +297,8 @@ final class TextFormatModel: ObservableObject {
             next = TextFormatState(attrs: TextLayout.resolved(s.box.defaults), align: s.align ?? .natural, list: .plain,
                                    indent: 0, lineSpacing: s.lineSpacing, box: s.box, canEditParagraphs: false)
         case let .items(doc, page, ids):
-            let found = ids.compactMap { try? self.app.workspace.item(doc, page: page, id: $0) }.first
-            guard let item = found, let text = TextItems.richText(item) else {
+            let found = textItems(doc, page, ids)
+            guard let item = found.first, let text = TextItems.richText(item) else {
                 var off = state
                 off.enabled = false
                 next = off
@@ -303,11 +306,22 @@ final class TextFormatModel: ObservableObject {
             }
             let p = text.paragraphs.first ?? Paragraph()
             let defaults = item.text?.style.defaults ?? TextAttributes()
+            // The Text Box section shows when any selected item is a text box, and edits only those.
             next = TextFormatState(attrs: TextLayout.resolved(RichTextEdit.merged(defaults, p.runs.first?.attrs ?? TextAttributes())),
                                    align: p.align, list: p.list, indent: p.indent, lineSpacing: p.lineSpacing,
-                                   box: item.text?.style, canEditParagraphs: true, enabled: !item.locked)
+                                   box: found.first(where: { $0.kind == .text })?.text?.style, canEditParagraphs: true,
+                                   enabled: !item.locked)
         }
         if next != state { state = next }
+    }
+
+    /// The selected items that carry text, in selection order.
+    private func textItems(_ doc: DocumentID, _ page: PageID, _ ids: [ElementID]) -> [Item] {
+        ids.compactMap { try? app.workspace.item(doc, page: page, id: $0) }.filter { TextItems.richText($0) != nil }
+    }
+
+    private func refs(_ doc: DocumentID, _ page: PageID, _ items: [Item]) -> [JSONValue] {
+        items.map { .string(NodeRef.item(doc, page, $0.id).description) }
     }
 
     // MARK: Character
@@ -349,12 +363,12 @@ final class TextFormatModel: ObservableObject {
         case .editing:
             editor?.applyAttributes(a)
         case .defaults:
-            var s = TextStyles.defaultStyle(app.settings)
-            s.box.defaults = RichTextEdit.merged(s.box.defaults, a)
-            saveDefault(s)
+            changeDefault { $0.box.defaults = RichTextEdit.merged($0.box.defaults, a) }
         case let .items(doc, page, ids):
             let attrs = (try? JSONValue.from(a)) ?? [:]
-            performEach("text.format", ids.map { ["ref": .string(NodeRef.item(doc, page, $0).description), "attrs": attrs] })
+            run(refs(doc, page, textItems(doc, page, ids)).map { ref -> (String, JSONValue) in
+                ("text.format", ["ref": ref, "attrs": attrs])
+            })
         }
     }
 
@@ -370,10 +384,10 @@ final class TextFormatModel: ObservableObject {
         case .editing:
             editor?.applyParagraph(align: align, list: list, indentBy: indentBy, lineSpacing: lineSpacing)
         case .defaults:
-            var s = TextStyles.defaultStyle(app.settings)
-            if let a = align { s.align = a }
-            if let l = lineSpacing { s.lineSpacing = l > 0 ? l : nil }
-            saveDefault(s)
+            changeDefault { s in
+                if let a = align { s.align = a == .natural ? nil : a }
+                if let l = lineSpacing { s.lineSpacing = l > 0 ? min(l, 100) : nil }
+            }
         case let .items(doc, page, ids):
             var fields: [String: JSONValue] = [:]
             if let a = align { fields["align"] = .string(a.rawValue) }
@@ -381,27 +395,29 @@ final class TextFormatModel: ObservableObject {
             if let d = indentBy { fields["indentBy"] = .number(Double(d)) }
             if let l = lineSpacing { fields["lineSpacing"] = .number(l) }
             guard !fields.isEmpty else { return }
-            performEach("text.setParagraph", ids.map { id -> JSONValue in
+            run(refs(doc, page, textItems(doc, page, ids)).map { ref -> (String, JSONValue) in
                 var f = fields
-                f["ref"] = .string(NodeRef.item(doc, page, id).description)
-                return .object(f)
+                f["ref"] = ref
+                return ("text.setParagraph", .object(f))
             })
         }
     }
 
     // MARK: Box
 
-    /// Box style fields (merged over the current style).
+    /// Box style fields (merged over the current style). Selected sticky notes have no box style and are left alone.
     func setBox(_ fields: [String: JSONValue]) {
         switch kind {
         case .editing:
             editor?.applyBoxStyle(.object(fields))
         case .defaults:
-            let s = TextStyles.defaultStyle(app.settings)
-            if let merged = try? SavedTextStyle(json: s.json.merging(.object(fields))) { saveDefault(merged) }
+            changeDefault { s in
+                if let merged = try? SavedTextStyle(json: s.json.merging(.object(fields))) { s = merged }
+            }
         case let .items(doc, page, ids):
-            let refs = ids.map { JSONValue.string(NodeRef.item(doc, page, $0).description) }
-            performEach("text.setBoxStyle", [["refs": .array(refs), "style": .object(fields)]])
+            let boxes = refs(doc, page, textItems(doc, page, ids).filter { $0.kind == .text })
+            guard !boxes.isEmpty else { return }
+            run([("text.setBoxStyle", ["refs": .array(boxes), "style": .object(fields)])])
         }
     }
 
@@ -411,31 +427,52 @@ final class TextFormatModel: ObservableObject {
 
     // MARK: Styles
 
-    /// A preset (Title, Heading, Body, Caption): the paragraphs being edited, or the whole of each selected box.
+    /// A preset (Title, Heading, Body, Caption): the paragraphs being edited, or the whole of each selected item.
     func applyPreset(_ id: String) {
         guard let s = TextPresets.apply(id, to: TextStyles.defaultStyle(app.settings)) else { return }
         switch kind {
         case .editing:
             editor?.applyParagraphStyle(s)
         case .defaults:
-            saveDefault(s)
-        case .items:
-            var fields: [String: JSONValue] = ["defaults": (try? JSONValue.from(s.box.defaults)) ?? [:]]
-            if let a = s.align { fields["align"] = .string(a.rawValue) }
-            if let l = s.lineSpacing { fields["lineSpacing"] = .number(l) }
-            setBox(fields)
+            changeDefault { current in current = TextPresets.apply(id, to: current) ?? current }
+        case let .items(doc, page, ids):
+            var defaults = s.box.defaults
+            defaults.link = nil
+            defaults.attachment = nil
+            let fields: [String: JSONValue] = ["defaults": (try? JSONValue.from(defaults)) ?? [:],
+                                               "align": .string((s.align ?? .natural).rawValue),
+                                               "lineSpacing": .number(s.lineSpacing ?? 0)]
+            applyStyle(s, boxFields: fields, doc: doc, page: page, ids: ids)
         }
     }
 
     /// A saved named style: the whole box takes its look.
     func applyNamed(_ name: String) {
-        guard let s = TextStyles.named(name, app.settings) else { return }
+        guard let s = TextStyles.named(name, app.settings), case .object(let fields) = s.json else { return }
         switch kind {
         case .defaults:
             saveDefault(s)
-        case .editing, .items:
-            if case .object(let fields) = s.json { setBox(fields) }
+        case .editing:
+            setBox(fields)
+        case let .items(doc, page, ids):
+            applyStyle(s, boxFields: fields, doc: doc, page: page, ids: ids)
         }
+    }
+
+    /// A style on the selected items, as one undo step: text boxes take `boxFields` as their box style
+    /// (`text.setBoxStyle`); sticky notes and other items without a box style take the style's character and paragraph
+    /// settings on all of their text (`text.setText`, one write per item).
+    private func applyStyle(_ s: SavedTextStyle, boxFields: [String: JSONValue], doc: DocumentID, page: PageID,
+                            ids: [ElementID]) {
+        let found = textItems(doc, page, ids)
+        var calls: [(String, JSONValue)] = []
+        let boxes = refs(doc, page, found.filter { $0.kind == .text })
+        if !boxes.isEmpty { calls.append(("text.setBoxStyle", ["refs": .array(boxes), "style": .object(boxFields)])) }
+        for item in found where item.kind != .text {
+            guard let text = TextItems.richText(item), let styled = try? JSONValue.from(s.styling(text)) else { continue }
+            calls.append(("text.setText", ["ref": .string(NodeRef.item(doc, page, item.id).description), "text": styled]))
+        }
+        run(calls)
     }
 
     /// The current look as a style.
@@ -462,44 +499,66 @@ final class TextFormatModel: ObservableObject {
     func saveStyle(named raw: String) {
         let name = raw.trimmingCharacters(in: .whitespaces)
         guard TextSettings.isValidName(name) else { return }
-        perform("text.saveDefaultStyle", ["name": .string(name), "style": currentStyle().json])
+        run([("text.saveDefaultStyle", ["name": .string(name), "style": currentStyle().json])])
     }
 
     func deleteStyle(named name: String) {
-        perform(CommandIDs.settingsSet, ["name": .string(TextSettings.stylesPrefix + name), "value": .null])
+        run([(CommandIDs.settingsSet, ["name": .string(TextSettings.stylesPrefix + name), "value": .null])])
     }
 
     func setPinned(_ on: Bool) {
-        perform(CommandIDs.settingsSet, ["name": .string(TextSettings.pinned.name), "value": .bool(on)])
+        run([(CommandIDs.settingsSet, ["name": .string(TextSettings.pinned.name), "value": .bool(on)])])
     }
 
     private func saveDefault(_ s: SavedTextStyle) {
-        perform("text.saveDefaultStyle", ["style": s.json])
+        run([("text.saveDefaultStyle", ["style": s.json])])
+    }
+
+    /// Changes the style of new boxes. `change` runs when the batch does, on the default saved by then, so quick
+    /// successive changes build on each other instead of the last one restoring what the first removed.
+    private func changeDefault(_ change: @escaping (inout SavedTextStyle) -> Void) {
+        enqueue { [weak self] in
+            guard let self = self else { return }
+            var s = TextStyles.defaultStyle(self.app.settings)
+            change(&s)
+            await self.execute([("text.saveDefaultStyle", ["style": s.json])])
+        }
     }
 
     // MARK: Running commands
 
-    private func perform(_ command: String, _ params: JSONValue) {
-        performEach(command, [params])
+    /// Runs the calls in order as one undo step (after any batch still running), then refreshes.
+    private func run(_ calls: [(String, JSONValue)]) {
+        guard !calls.isEmpty else { return }
+        enqueue { [weak self] in await self?.execute(calls) }
     }
 
-    /// Runs the calls in order as one undo step, then refreshes.
-    private func performEach(_ command: String, _ calls: [JSONValue]) {
-        let group = NibID.make().raw
-        Task { @MainActor [weak self] in
-            guard let self = self else { return }
-            for params in calls {
-                do {
-                    _ = try await self.app.bus.execute(Invocation(command: command, params: params, principal: .user,
-                                                                  session: self.session, group: group))
-                } catch {
-                    NotificationCenter.default.post(name: .nibCommandFailed, object: self.app,
-                                                    userInfo: ["command": command, "error": NibError.wrap(error)])
-                    break
-                }
-            }
-            self.refresh()
+    private func enqueue(_ work: @escaping @MainActor () async -> Void) {
+        let previous = pending
+        pending = Task { @MainActor in
+            await previous?.value
+            await work()
         }
+    }
+
+    private func execute(_ calls: [(String, JSONValue)]) async {
+        let group = NibID.make().raw
+        for (command, params) in calls {
+            do {
+                _ = try await app.bus.execute(Invocation(command: command, params: params, principal: .user,
+                                                         session: session, group: group))
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                                userInfo: ["command": command, "error": NibError.wrap(error)])
+                break
+            }
+        }
+        refresh()
+    }
+
+    /// Waits for the queued commands (tests).
+    func flush() async {
+        await pending?.value
     }
 }
 
@@ -551,14 +610,16 @@ struct TextFormatInspector: View {
                 model.saveStyle(named: styleName)
                 styleName = ""
             }
+            .disabled(!TextSettings.isValidName(styleName.trimmingCharacters(in: .whitespaces)))
             Button(String(localized: "Cancel"), role: .cancel) { styleName = "" }
         } message: {
-            Text(String(localized: "Saved styles appear in the Style row of every text box."))
+            Text(String(localized: "Saved styles appear in the Style row of every text box. Names use up to 40 letters, digits, spaces, hyphens or underscores."))
         }
     }
 }
 
-/// The inspector for selected items, owning its model.
+/// The inspector for selected items, owning its model. `identity` gives each selection its own view (and model):
+/// a `@StateObject` built from init parameters would otherwise outlive the selection it was made for.
 @MainActor
 struct TextItemsInspector: View {
     @StateObject private var model: TextFormatModel
@@ -567,12 +628,17 @@ struct TextItemsInspector: View {
         _model = StateObject(wrappedValue: TextFormatModel(app: app, session: session, kind: .items(doc: doc, page: page, ids: ids)))
     }
 
+    static func identity(doc: DocumentID, page: PageID, ids: [ElementID]) -> String {
+        ([doc.raw, page.raw] + ids.map { $0.raw }).joined(separator: "/")
+    }
+
     var body: some View {
         TextFormatInspector(model: model)
     }
 }
 
 /// The text tool's settings popover: formats the box being edited, else sets the style of new boxes; plus Pin.
+/// `identity` tells the two apart, so a view made before editing started never keeps editing the defaults.
 @MainActor
 struct TextToolSettingsView: View {
     @StateObject private var model: TextFormatModel
@@ -580,6 +646,10 @@ struct TextToolSettingsView: View {
     init(app: NibApp, session: EditorSession) {
         let editing = TextBoxEditor.editor(for: session)?.editingState?.model
         _model = StateObject(wrappedValue: editing ?? TextFormatModel(app: app, session: session, kind: .defaults))
+    }
+
+    static func identity(_ session: EditorSession) -> String {
+        TextBoxEditor.editor(for: session)?.editingRef ?? "defaults"
     }
 
     var body: some View {
@@ -606,6 +676,9 @@ private struct TextStylesSection: View {
                                 } label: {
                                     Text(String(localized: "Delete Style"))
                                 }
+                            }
+                            .accessibilityAction(named: String(localized: "Delete Style")) {
+                                model.deleteStyle(named: name)
                             }
                     }
                 }
@@ -650,7 +723,9 @@ private struct TextFontSection: View {
                 .accessibilityLabel(String(localized: "Font"))
                 .accessibilityValue(model.state.family)
                 NibIconButton(.minus, label: String(localized: "Smaller Text"), size: .panel) { model.stepSize(-1) }
+                    .accessibilityValue(String(localized: "\(Int(model.state.size.rounded())) pt"))
                 NibIconButton(.plus, label: String(localized: "Larger Text"), size: .panel) { model.stepSize(1) }
+                    .accessibilityValue(String(localized: "\(Int(model.state.size.rounded())) pt"))
             }
         }
     }
@@ -778,7 +853,7 @@ private struct TextColourSection: View {
                     .frame(minHeight: NibMetrics.hitTarget)
             }
             NibInspectorSection(String(localized: "Highlight"),
-                                action: NibAction(String(localized: "None")) { model.setHighlight(nil) }) {
+                                action: NibAction(String(localized: "Remove Highlight")) { model.setHighlight(nil) }) {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
                     ForEach(NibHighlighter.allCases, id: \.self) { h in
                         NibPenSwatch(NibSwatch(id: h.rawValue, color: h.color, name: TextFormatOptions.highlighterName(h)),
@@ -799,7 +874,7 @@ private struct TextBoxStyleSection: View {
     var body: some View {
         let box = model.state.box ?? TextBoxStyle()
         return NibInspectorSection(String(localized: "Text Box"),
-                                   action: NibAction(String(localized: "No Fill")) { model.setBox(["background": .null]) }) {
+                                   action: NibAction(String(localized: "Remove Fill")) { model.setBox(["background": .null]) }) {
             VStack(alignment: .leading, spacing: NibSpacing.s) {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
                     ForEach(TextFormatOptions.fills) { fill in
@@ -884,6 +959,8 @@ final class TextKeyboardBar: UIInputView {
     private var toggles: [TextBoxEditor.Toggle: UIButton] = [:]
     private var styleButton: UIButton?
     private var fontButton: UIButton?
+    private var smallerButton: UIButton?
+    private var largerButton: UIButton?
     private var sizeLabel = UILabel()
     private var colourButton: UIButton?
     private var highlightButton: UIButton?
@@ -922,9 +999,12 @@ final class TextKeyboardBar: UIInputView {
         fontButton = font
         let smaller = button(symbol: .minus, label: String(localized: "Smaller Text")) { [weak self] in self?.model.stepSize(-1) }
         let larger = button(symbol: .plus, label: String(localized: "Larger Text")) { [weak self] in self?.model.stepSize(1) }
+        smallerButton = smaller
+        largerButton = larger
         sizeLabel.font = NibUIFont.hud
         sizeLabel.textColor = NibUIColor.label
         sizeLabel.adjustsFontForContentSizeCategory = true
+        // VoiceOver hears the size as the value of Smaller Text and Larger Text.
         sizeLabel.isAccessibilityElement = false
 
         let bold = toggleButton(.bold, title: "B", font: NibUIFont.font(.body, weight: .bold), label: String(localized: "Bold"))
@@ -1052,7 +1132,10 @@ final class TextKeyboardBar: UIInputView {
         }
         fontButton?.configuration?.attributedTitle = AttributedString(s.family, attributes: AttributeContainer([.font: NibUIFont.barTitle]))
         fontButton?.accessibilityValue = s.family
-        sizeLabel.text = String(localized: "\(Int(s.size.rounded())) pt")
+        let size = String(localized: "\(Int(s.size.rounded())) pt")
+        sizeLabel.text = size
+        smallerButton?.accessibilityValue = size
+        largerButton?.accessibilityValue = size
         colourButton?.configuration?.image = TextKeyboardBar.swatchImage(s.colour.uiColor)
         colourButton?.accessibilityValue = NibInk.allCases.first { $0.hex == s.colour.rgbHex }?.name
         alignButton?.configuration?.image = UIImage(nib: TextFormatOptions.alignmentSymbol(s.align))

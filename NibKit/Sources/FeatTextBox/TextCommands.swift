@@ -49,14 +49,21 @@ enum TextSettings {
 /// `TextBoxStyle` cannot hold. Stored as one JSON object: TextBoxStyle fields plus "align" and "lineSpacing".
 struct SavedTextStyle: Equatable {
     var box: TextBoxStyle
+    /// nil = natural.
     var align: ParagraphAlignment?
     /// Extra points between lines; nil = automatic.
     var lineSpacing: Double?
 
+    /// The `TextAttributes` JSON keys (a saved style writes every one of them, see `json`).
+    static let attributeKeys = ["font", "size", "color", "highlight", "bold", "italic", "underline", "strikethrough",
+                                "code", "baseline", "link", "attachment"]
+
     init(box: TextBoxStyle = TextBoxStyle(), align: ParagraphAlignment? = nil, lineSpacing: Double? = nil) {
-        self.box = box
-        self.align = align
-        self.lineSpacing = lineSpacing
+        var b = box
+        b.fullPage = false
+        self.box = b
+        self.align = align == .natural ? nil : align
+        self.lineSpacing = lineSpacing.flatMap { $0 > 0 ? min($0, 100) : nil }
     }
 
     init(json: JSONValue, path: String = "$.style") throws {
@@ -65,29 +72,62 @@ struct SavedTextStyle: Equatable {
             guard let a = ParagraphAlignment(rawValue: raw) else {
                 throw NibError.invalid("align must be one of \(ParagraphAlignment.allCases.map { $0.rawValue })", path: path + ".align")
             }
-            align = a
+            align = a == .natural ? nil : a
         }
         if let ls = o["lineSpacing"]?.doubleValue { lineSpacing = ls > 0 ? min(ls, 100) : nil }
         o["align"] = nil
         o["lineSpacing"] = nil
+        // A style never turns boxes into full-page text.
+        o["fullPage"] = nil
         do {
             box = try CommandRegistry.decode(TextBoxStyle.self, from: .object(o))
         } catch let e as NibError {
             throw NibError(.invalidParams, e.message, path: path, hint: "a TextBoxStyle: background, borderColor, borderWidth, cornerRadius, padding, shadow, autoGrow, defaults")
         }
         box = TextStyles.clamped(box)
+        box.defaults.link = nil
+        box.defaults.attachment = nil
     }
 
+    /// Every field written out, the unset ones as null (align "natural", lineSpacing 0). Styles are merged over
+    /// what they replace (`text.saveDefaultStyle` over the current default, `text.createBox` and `text.setBoxStyle`
+    /// over the default or the box), so a field left out would keep the old value: No Fill, Auto spacing or the
+    /// default font would never stick.
     var json: JSONValue {
-        guard case .object(var o) = (try? JSONValue.from(box)) ?? .object([:]) else { return .object([:]) }
-        if let a = align { o["align"] = .string(a.rawValue) }
-        if let l = lineSpacing { o["lineSpacing"] = .number(l) }
+        var b = box
+        b.fullPage = false
+        b.defaults.link = nil
+        b.defaults.attachment = nil
+        guard case .object(var o) = (try? JSONValue.from(b)) ?? .null else { return .object([:]) }
+        o["fullPage"] = nil
+        o["background"] = o["background"] ?? JSONValue.null
+        o["borderColor"] = o["borderColor"] ?? JSONValue.null
+        var defaults: [String: JSONValue] = [:]
+        if case .object(let d)? = o["defaults"] { defaults = d }
+        for key in SavedTextStyle.attributeKeys where defaults[key] == nil { defaults[key] = JSONValue.null }
+        o["defaults"] = .object(defaults)
+        o["align"] = .string((align ?? .natural).rawValue)
+        o["lineSpacing"] = .number(lineSpacing ?? 0)
         return .object(o)
     }
 
     /// The first paragraph of a new box in this style.
     var emptyText: RichText {
         RichText(paragraphs: [Paragraph(align: align ?? .natural, lineSpacing: lineSpacing)])
+    }
+
+    /// The style's character and paragraph settings on the whole of `text`, for items without a box style (sticky
+    /// notes, shape and connector labels).
+    func styling(_ text: RichText) -> RichText {
+        var attrs = box.defaults
+        attrs.link = nil
+        attrs.attachment = nil
+        var t = RichTextEdit.normalized(text)
+        if attrs != TextAttributes() {
+            t = RichTextEdit.apply(attrs, to: t, range: NSRange(location: 0, length: AutoList.length(t)))
+        }
+        return RichTextEdit.setParagraphs(t, indices: Array(t.paragraphs.indices), align: align ?? .natural,
+                                          lineSpacing: lineSpacing ?? 0)
     }
 
     /// Paragraph settings applied to text that does not set them itself.
@@ -175,7 +215,7 @@ enum TextStyles {
         s.borderWidth = min(max(0, s.borderWidth), 20)
         s.cornerRadius = min(max(0, s.cornerRadius), 200)
         s.padding = min(max(0, s.padding), 100)
-        if let size = s.defaults.size { s.defaults.size = min(max(1, size), 400) }
+        s.defaults = RichTextEdit.sanitized(s.defaults)
         return s
     }
 }
@@ -261,9 +301,29 @@ enum RichTextEdit {
         return t
     }
 
-    /// At least one paragraph (JSON may send an empty list).
+    /// Text from a caller, made safe to lay out: at least one paragraph (JSON may send an empty list), sizes 1…400,
+    /// super/subscript -1…1, indents 0…AutoList.maxIndent, line spacing nil (automatic) or up to 100, and no links in
+    /// the internal image-glyph scheme.
     static func normalized(_ text: RichText) -> RichText {
-        text.paragraphs.isEmpty ? .empty : text
+        var t = text.paragraphs.isEmpty ? RichText.empty : text
+        for i in t.paragraphs.indices {
+            t.paragraphs[i].indent = min(max(0, t.paragraphs[i].indent), AutoList.maxIndent)
+            if let ls = t.paragraphs[i].lineSpacing {
+                t.paragraphs[i].lineSpacing = ls > 0 && ls.isFinite ? min(ls, 100) : nil
+            }
+            for j in t.paragraphs[i].runs.indices {
+                t.paragraphs[i].runs[j].attrs = sanitized(t.paragraphs[i].runs[j].attrs)
+            }
+        }
+        return t
+    }
+
+    static func sanitized(_ attrs: TextAttributes) -> TextAttributes {
+        var a = attrs
+        if let size = a.size { a.size = size.isFinite ? min(max(1, size), 400) : nil }
+        if let b = a.baseline { a.baseline = min(max(-1, b), 1) }
+        if let url = a.link?.url, url.lowercased().hasPrefix(TextLayout.assetScheme + ":") { a.link = nil }
+        return a
     }
 }
 
@@ -291,10 +351,11 @@ enum TextItems {
         }
     }
 
-    /// Auto-growing text boxes fit their height to the text (T-061).
-    static func refit(_ item: inout Item) {
+    /// Auto-growing text boxes fit their height to the text (T-061). With the document's assets, inline images are
+    /// measured at their real aspect ratio, as the drawer draws them.
+    static func refit(_ item: inout Item, assets: AssetStore? = nil, doc: DocumentID? = nil) {
         guard var box = item.text, box.style.autoGrow, !box.style.fullPage else { return }
-        box.frame.h = TextLayout.fittedHeight(box)
+        box.frame.h = TextLayout.fittedHeight(box, assets: assets, doc: doc)
         item.text = box
     }
 
@@ -305,18 +366,49 @@ enum TextItems {
     }
 
     /// A live, unlocked item that carries text.
-    @MainActor static func editable(_ tx: DocTransaction, _ ref: String, path: String) throws -> Target {
+    @MainActor static func editable(_ workspace: Workspace, _ ref: String, path: String) throws -> Target {
         let (doc, page, id) = try TextRefs.item(ref, path: path)
-        let item = try tx.item(doc, page: page, id: id)
+        return try checked(workspace.item(doc, page: page, id: id), doc: doc, page: page, path: path)
+    }
+
+    static func checked(_ item: Item, doc: DocumentID, page: PageID, path: String) throws -> Target {
         guard richText(item) != nil else {
-            throw NibError(.invalidParams, "item \(id) is a \(item.kind.rawValue), which has no text", path: path,
+            throw NibError(.invalidParams, "item \(item.id) is a \(item.kind.rawValue), which has no text", path: path,
                            hint: "text commands work on text boxes, sticky notes, shapes and connectors")
         }
         guard !item.locked else {
-            throw NibError(.invalidParams, "item \(id) is locked", path: path,
+            throw NibError(.invalidParams, "item \(item.id) is locked", path: path,
                            hint: "unlock it first with item.setLocked {refs, locked: false}")
         }
         return Target(doc: doc, page: page, item: item)
+    }
+
+    /// Changes the text items `refs` (one write each, so the undo step stays whole). The change and the TextKit refit
+    /// run before `mutate`, which stays short (ARCHITECTURE §14); the transaction writes each result if the item is
+    /// still the one it was computed from, and recomputes it otherwise.
+    @MainActor static func edit(_ ctx: CommandContext, refs: [String], path: (Int) -> String,
+                                _ change: (inout Target) throws -> Void) throws {
+        let assets = ctx.services.assets
+        var prepared: [(original: Item, result: Target)] = []
+        for (i, ref) in refs.enumerated() {
+            var t = try editable(ctx.workspace, ref, path: path(i))
+            let original = t.item
+            try change(&t)
+            refit(&t.item, assets: assets, doc: t.doc)
+            prepared.append((original: original, result: t))
+        }
+        try ctx.mutate { tx in
+            for (i, p) in prepared.enumerated() {
+                var t = p.result
+                let current = try tx.item(t.doc, page: t.page, id: t.item.id)
+                if current != p.original {
+                    t = try checked(current, doc: t.doc, page: t.page, path: path(i))
+                    try change(&t)
+                    refit(&t.item, assets: assets, doc: t.doc)
+                }
+                try tx.put(t.item, doc: t.doc, page: t.page)
+            }
+        }
     }
 }
 
@@ -336,18 +428,25 @@ enum TextRefs {
         return (doc, page)
     }
 
-    /// `[start, length]` in UTF-16 units of the plain text, clamped to its end.
+    /// `[start, length]` in UTF-16 units of the plain text, clamped to its end and widened to whole characters, so an
+    /// offset inside a surrogate pair or a composed sequence (emoji, accents) never splits it.
     static func range(_ r: [Int]?, in text: RichText, path: String = "$.range") throws -> NSRange? {
         guard let r = r else { return nil }
         guard r.count == 2, r[0] >= 0, r[1] >= 0 else {
             throw NibError.invalid("range must be [start, length] with non-negative integers", path: path)
         }
-        let total = AutoList.length(text)
+        let plain = text.plainText as NSString
+        let total = plain.length
         guard r[0] <= total else {
             throw NibError(.invalidParams, "range starts after the end of the text (\(total) characters)", path: path,
                            hint: "offsets count UTF-16 units of the plain text, paragraphs joined by \\n")
         }
-        return NSRange(location: r[0], length: min(r[1], total - r[0]))
+        let raw = NSRange(location: r[0], length: min(r[1], total - r[0]))
+        guard raw.location < total else { return raw }
+        if raw.length == 0 {
+            return NSRange(location: plain.rangeOfComposedCharacterSequence(at: raw.location).location, length: 0)
+        }
+        return plain.rangeOfComposedCharacterSequences(for: raw)
     }
 }
 
@@ -455,7 +554,7 @@ struct TextCreateBox: NibCommand {
         let text = style.applyingParagraphDefaults(to: RichTextEdit.normalized(p.text ?? style.emptyText))
         var box = TextBoxItem(frame: frame, text: text, style: style.box)
         if box.style.autoGrow || !explicitHeight {
-            let fitted = TextLayout.fittedHeight(box)
+            let fitted = TextLayout.fittedHeight(box, assets: ctx.services.assets, doc: doc)
             box.frame.h = explicitHeight ? max(frame.h, fitted) : fitted
         }
         let layer = ctx.activeSession?.activeLayer ?? 0
@@ -493,14 +592,11 @@ struct TextSetText: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let text = RichTextEdit.normalized(p.text)
-        let ref = try ctx.mutate { tx -> String in
-            var t = try TextItems.editable(tx, p.ref, path: "$.ref")
+        let (doc, page, id) = try TextRefs.item(p.ref, path: "$.ref")
+        try TextItems.edit(ctx, refs: [p.ref], path: { _ in "$.ref" }) { t in
             TextItems.set(text, on: &t.item)
-            TextItems.refit(&t.item)
-            try tx.put(t.item, doc: t.doc, page: t.page)
-            return NodeRef.item(t.doc, t.page, t.item.id).description
         }
-        return Output(ref: ref)
+        return Output(ref: NodeRef.item(doc, page, id).description)
     }
 }
 
@@ -527,9 +623,8 @@ struct TextFormat: NibCommand {
         guard attrs != TextAttributes() else {
             throw NibError(.invalidParams, "attrs sets nothing", path: "$.attrs", hint: "e.g. {\"bold\": true} or {\"size\": 20}; links use link.set")
         }
-        if let size = attrs.size { attrs.size = min(max(1, size), 400) }
-        try ctx.mutate { tx in
-            var t = try TextItems.editable(tx, p.ref, path: "$.ref")
+        attrs = RichTextEdit.sanitized(attrs)
+        try TextItems.edit(ctx, refs: [p.ref], path: { _ in "$.ref" }) { t in
             guard var text = TextItems.richText(t.item) else { return }
             if let range = try TextRefs.range(p.range, in: text) {
                 text = RichTextEdit.apply(attrs, to: text, range: range)
@@ -542,8 +637,6 @@ struct TextFormat: NibCommand {
                 text = RichTextEdit.apply(attrs, to: text, range: NSRange(location: 0, length: AutoList.length(text)))
             }
             TextItems.set(text, on: &t.item)
-            TextItems.refit(&t.item)
-            try tx.put(t.item, doc: t.doc, page: t.page)
         }
         return NoResult()
     }
@@ -578,15 +671,12 @@ struct TextSetParagraph: NibCommand {
         guard p.align != nil || p.list != nil || p.indent != nil || p.indentBy != nil || p.lineSpacing != nil else {
             throw NibError.invalid("give at least one of align, list, indent, indentBy, lineSpacing")
         }
-        try ctx.mutate { tx in
-            var t = try TextItems.editable(tx, p.ref, path: "$.ref")
+        try TextItems.edit(ctx, refs: [p.ref], path: { _ in "$.ref" }) { t in
             guard var text = TextItems.richText(t.item) else { return }
             let range = try TextRefs.range(p.range, in: text)
             text = RichTextEdit.setParagraphs(text, indices: AutoList.paragraphIndices(text, range: range), align: p.align,
                                               list: p.list, indent: p.indent, indentBy: p.indentBy, lineSpacing: p.lineSpacing)
             TextItems.set(text, on: &t.item)
-            TextItems.refit(&t.item)
-            try tx.put(t.item, doc: t.doc, page: t.page)
         }
         return NoResult()
     }
@@ -630,28 +720,31 @@ struct TextSetBoxStyle: NibCommand {
         }
         var seen = Set<String>()
         let refs = p.refs.filter { seen.insert($0).inserted }   // one write per item keeps the undo step whole
-        try ctx.mutate { tx in
-            for (i, ref) in refs.enumerated() {
-                let path = "$.refs[\(i)]"
-                var t = try TextItems.editable(tx, ref, path: path)
-                guard var box = t.item.text else {
-                    throw NibError(.invalidParams, "\(ref) is not a text box", path: path, hint: "box styles apply to text boxes only")
-                }
-                let merged = try JSONValue.from(box.style).merging(.object(patch))
-                do {
-                    box.style = TextStyles.clamped(try CommandRegistry.decode(TextBoxStyle.self, from: merged))
-                } catch let e as NibError {
-                    throw NibError(.invalidParams, e.message, path: "$.style")
-                }
-                if let d = newDefaults { box.text = RichTextEdit.clearing(box.text, fieldsOf: d) }
-                if align != nil || lineSpacing != nil {
-                    box.text = RichTextEdit.setParagraphs(box.text, indices: Array(box.text.paragraphs.indices),
-                                                          align: align, lineSpacing: lineSpacing)
-                }
-                t.item.text = box
-                TextItems.refit(&t.item)
-                try tx.put(t.item, doc: t.doc, page: t.page)
+        let paths = refs.map { ref in p.refs.firstIndex(of: ref).map { "$.refs[\($0)]" } ?? "$.refs" }
+        for (i, ref) in refs.enumerated() {
+            let target = try TextItems.editable(ctx.workspace, ref, path: paths[i])
+            guard target.item.kind == .text else {
+                throw NibError(.invalidParams, "\(ref) is not a text box", path: paths[i],
+                               hint: "box styles apply to text boxes only; sticky notes take text.format and text.setParagraph")
             }
+        }
+        try TextItems.edit(ctx, refs: refs, path: { paths[$0] }) { t in
+            guard var box = t.item.text else {
+                throw NibError(.invalidParams, "item \(t.item.id) is not a text box", path: "$.refs",
+                               hint: "box styles apply to text boxes only")
+            }
+            let merged = try JSONValue.from(box.style).merging(.object(patch))
+            do {
+                box.style = TextStyles.clamped(try CommandRegistry.decode(TextBoxStyle.self, from: merged))
+            } catch let e as NibError {
+                throw NibError(.invalidParams, e.message, path: "$.style")
+            }
+            if let d = newDefaults { box.text = RichTextEdit.clearing(box.text, fieldsOf: d) }
+            if align != nil || lineSpacing != nil {
+                box.text = RichTextEdit.setParagraphs(box.text, indices: Array(box.text.paragraphs.indices),
+                                                      align: align, lineSpacing: lineSpacing)
+            }
+            t.item.text = box
         }
         return NoResult()
     }

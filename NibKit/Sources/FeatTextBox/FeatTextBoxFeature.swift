@@ -34,7 +34,8 @@ public enum FeatTextBoxFeature: NibFeature {
             owner: id, toolID: TextTool.toolID, shortcut: KeyShortcut("t"),
             settings: { [weak app] session in
                 guard let app = app else { return AnyView(EmptyView()) }
-                return AnyView(TextToolSettingsView(app: app, session: session))
+                return AnyView(TextToolSettingsView(app: app, session: session)
+                    .id(TextToolSettingsView.identity(session)))
             }))
 
         app.ui.inspectors.register(InspectorDescriptor(
@@ -44,7 +45,8 @@ public enum FeatTextBoxFeature: NibFeature {
                 if let editing = TextBoxEditor.editor(for: ctx.session)?.editingState, ids.contains(editing.id) {
                     return AnyView(TextFormatInspector(model: editing.model))
                 }
-                return AnyView(TextItemsInspector(app: ctx.app, session: ctx.session, doc: ctx.doc, page: ctx.page, ids: ids))
+                return AnyView(TextItemsInspector(app: ctx.app, session: ctx.session, doc: ctx.doc, page: ctx.page, ids: ids)
+                    .id(TextItemsInspector.identity(doc: ctx.doc, page: ctx.page, ids: ids)))
             })
 
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "text.editor", owner: id, order: -100) { host in

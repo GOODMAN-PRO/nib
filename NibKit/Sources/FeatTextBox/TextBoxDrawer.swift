@@ -21,6 +21,14 @@ enum TextLayout {
     static let assetKey = NSAttributedString.Key("nib.text.asset")
     /// Paragraph-level keys copied onto replacement characters and typing attributes.
     static let paragraphKeys: [NSAttributedString.Key] = [.paragraphStyle, .nibList, .nibIndent, .nibChecked, .nibParagraphStyle]
+    /// The run's font family and bold / italic as the model has them, on every character of the run (and on its
+    /// paragraph's marker and newline). The rendered `UIFont` cannot always say: a family that is not installed on this
+    /// device renders in a system fallback, and a family without an italic or bold face renders upright or regular.
+    /// `relativeAttributes` reads these back, so editing never rewrites what the device cannot show.
+    static let modelFontKey = NSAttributedString.Key("nib.text.modelFont")
+    /// Bit 1 = bold, bit 2 = italic.
+    static let modelTraitsKey = NSAttributedString.Key("nib.text.modelTraits")
+    static let modelKeys: [NSAttributedString.Key] = [modelFontKey, modelTraitsKey]
     /// An empty last paragraph has no character to carry its settings: they ride on the newline before it (JSON).
     static let trailingParagraphKey = NSAttributedString.Key("nib.text.trailingParagraph")
     static let linkColour = RGBA(nibHex: NibInk.cobalt.hex)
@@ -43,6 +51,70 @@ enum TextLayout {
                        color: a.color ?? .black, highlight: a.highlight, bold: a.bold ?? false, italic: a.italic ?? false,
                        underline: a.underline ?? false, strikethrough: a.strikethrough ?? false, code: a.code ?? false,
                        baseline: a.baseline ?? 0, link: a.link, attachment: a.attachment)
+    }
+
+    /// The model font keys for run attributes `a` over `base`.
+    static func modelAttributes(_ a: TextAttributes, base: TextAttributes) -> [NSAttributedString.Key: Any] {
+        var traits = 0
+        if a.bold ?? base.bold ?? false { traits |= 1 }
+        if a.italic ?? base.italic ?? false { traits |= 2 }
+        return [modelFontKey: a.font ?? base.font ?? RichTextBridge.defaultFontFamily, modelTraitsKey: traits]
+    }
+
+    /// Attributes for typing in run style `a` over `base`: the bridge's rendering plus the model font keys.
+    static func characterAttributes(_ a: TextAttributes, base: TextAttributes) -> [NSAttributedString.Key: Any] {
+        var d = RichTextBridge.attributes(a, base: base)
+        d.merge(modelAttributes(a, base: base)) { $1 }
+        return d
+    }
+
+    // MARK: Shadow
+
+    /// One shadow definition for the page drawing and the editing overlay, so a box looks the same while it is edited.
+    struct Shadow {
+        let offset: CGSize
+        let blur: CGFloat
+        let colour: RGBA
+
+        /// As a Quartz shadow. Quartz shadows ignore the transform, so offset and blur are scaled to stay in page
+        /// points at every zoom and render scale.
+        func apply(to cg: CGContext) {
+            let t = cg.userSpaceToDeviceSpaceTransform
+            let k = max(CGFloat(0.01), sqrt(abs(t.a * t.d - t.b * t.c)))
+            cg.setShadow(offset: CGSize(width: offset.width * k, height: offset.height * k), blur: blur * k,
+                         color: colour.cgColor)
+        }
+
+        /// As a text attribute: TextKit draws it with the glyphs, on the page and in the editing text view alike.
+        var textAttribute: NSShadow {
+            let s = NSShadow()
+            s.shadowOffset = offset
+            s.shadowBlurRadius = blur
+            s.shadowColor = colour.uiColor
+            return s
+        }
+    }
+
+    /// Under a filled box with `shadow` on.
+    static let boxShadow = Shadow(offset: CGSize(width: 0, height: 2), blur: 6, colour: RGBA(0, 0, 0, 64))
+    /// Under the text of an unfilled box with `shadow` on.
+    static let textShadow = Shadow(offset: CGSize(width: 0, height: 1), blur: 3, colour: RGBA(0, 0, 0, 64))
+    /// Room the box shadow needs around the box, in page points.
+    static let chromeOutset: CGFloat = 12
+
+    /// The text shadow a box style asks for (nil: none).
+    static func textShadowAttribute(_ style: TextBoxStyle) -> NSShadow? {
+        style.shadow && (style.background?.a ?? 0) == 0 ? textShadow.textAttribute : nil
+    }
+
+    /// Puts the style's text shadow on every character (display only: `richText(from:)` ignores it).
+    static func applyTextShadow(_ s: NSMutableAttributedString, style: TextBoxStyle) {
+        let full = NSRange(location: 0, length: s.length)
+        if let shadow = textShadowAttribute(style) {
+            s.addAttribute(.shadow, value: shadow, range: full)
+        } else {
+            s.removeAttribute(.shadow, range: full)
+        }
     }
 
     // MARK: RichText → attributed
@@ -74,6 +146,7 @@ enum TextLayout {
                 s.replaceCharacters(in: range, with: NSAttributedString(string: marker, attributes: attrs))
             }
         }
+        markModelFonts(s, text: text, base: base)
 
         // Inline image glyphs.
         var sentinels: [(NSRange, AssetRef)] = []
@@ -94,7 +167,7 @@ enum TextLayout {
                 let attrs = s.attributes(at: loc, effectiveRange: nil)
                 let font = attrs[.font] as? UIFont ?? RichTextBridge.font(TextAttributes(), base: base)
                 var keep: [NSAttributedString.Key: Any] = [.font: font, assetKey: ref.name]
-                for key in paragraphKeys { if let v = attrs[key] { keep[key] = v } }
+                for key in paragraphKeys + modelKeys { if let v = attrs[key] { keep[key] = v } }
                 if let g = glyph(ref, font), g.length == 1 {
                     let replacement = NSMutableAttributedString(attributedString: g)
                     replacement.addAttributes(keep, range: NSRange(location: 0, length: 1))
@@ -111,6 +184,29 @@ enum TextLayout {
             s.addAttribute(trailingParagraphKey, value: encoded, range: NSRange(location: s.length - 1, length: 1))
         }
         return s
+    }
+
+    /// Puts the model font keys on the bridge's output: each paragraph's marker takes its first run's, each run its
+    /// own, the newline after a paragraph its last run's (the bridge styles markers and newlines the same way).
+    private static func markModelFonts(_ s: NSMutableAttributedString, text: RichText, base: TextAttributes) {
+        var at = 0
+        func mark(_ length: Int, _ a: TextAttributes) {
+            let n = min(length, s.length - at)
+            guard n > 0 else { return }
+            s.addAttributes(modelAttributes(a, base: base), range: NSRange(location: at, length: n))
+            at += n
+        }
+        for (i, p) in text.paragraphs.enumerated() {
+            if at < s.length {
+                var marker = NSRange(location: at, length: 0)
+                if s.attribute(.nibListMarker, at: at, longestEffectiveRange: &marker,
+                               in: NSRange(location: at, length: s.length - at)) != nil {
+                    mark(marker.length, p.runs.first?.attrs ?? TextAttributes())
+                }
+            }
+            for r in p.runs { mark(r.text.utf16.count, r.attrs) }
+            if i < text.paragraphs.count - 1 { mark(1, p.runs.last?.attrs ?? TextAttributes()) }
+        }
     }
 
     static func trailingEncoding(_ p: Paragraph) -> String? {
@@ -142,18 +238,38 @@ enum TextLayout {
         return CGRect(x: 0, y: font.descender, width: h * max(0.1, aspect), height: h)
     }
 
-    /// A same-size stand-in used for measuring (no image decode on the main thread).
-    static func placeholderGlyph(_ font: UIFont) -> NSAttributedString {
+    /// A same-size stand-in used for measuring (no image drawing).
+    static func placeholderGlyph(_ font: UIFont, aspect: CGFloat = 1) -> NSAttributedString {
         let a = NSTextAttachment()
-        a.bounds = glyphBounds(font)
+        a.bounds = glyphBounds(font, aspect: aspect)
         return NSAttributedString(attachment: a)
+    }
+
+    /// Decoded inline images by document and asset (asset names are content hashes, so an entry never goes stale).
+    /// NSCache is thread-safe: tiles draw on render threads.
+    private static let glyphImages: NSCache<NSString, UIImage> = {
+        let c = NSCache<NSString, UIImage>()
+        c.countLimit = 128
+        return c
+    }()
+
+    static func glyphImage(_ ref: AssetRef, assets: AssetStore?, doc: DocumentID) -> UIImage? {
+        let key = NSString(string: doc.raw + "/" + ref.name)
+        if let hit = glyphImages.object(forKey: key) { return hit }
+        guard let data = try? assets?.data(ref, doc: doc), let image = UIImage(data: data) else { return nil }
+        glyphImages.setObject(image, forKey: key)
+        return image
+    }
+
+    static func aspect(_ image: UIImage) -> CGFloat {
+        image.size.height > 0 ? image.size.width / image.size.height : 1
     }
 
     /// The image glyph as drawn in tiles and exports.
     static func drawingGlyph(_ ref: AssetRef, font: UIFont, assets: AssetStore?, doc: DocumentID) -> NSAttributedString? {
-        guard let data = try? assets?.data(ref, doc: doc), let image = UIImage(data: data) else { return nil }
+        guard let image = glyphImage(ref, assets: assets, doc: doc) else { return nil }
         let a = NSTextAttachment(image: image)
-        a.bounds = glyphBounds(font, aspect: image.size.height > 0 ? image.size.width / image.size.height : 1)
+        a.bounds = glyphBounds(font, aspect: aspect(image))
         return NSAttributedString(attachment: a)
     }
 
@@ -251,13 +367,28 @@ enum TextLayout {
             if abs(size - (full.size ?? RichTextBridge.defaultFontSize)) > 0.05 { t.size = size }
             let traits = font.fontDescriptor.symbolicTraits
             // System families (".AppleSystemUI…") are the code font, or the fallback for a family that is not installed
-            // here; the latter keeps the default rather than rewriting the document's font.
+            // here; the latter never names the run's family.
             let isCode = traits.contains(.traitMonoSpace) && font.familyName.hasPrefix(".")
             if isCode != (full.code ?? false) { t.code = isCode }
-            if !isCode, !font.familyName.hasPrefix("."), font.familyName != full.font { t.font = font.familyName }
-            let bold = traits.contains(.traitBold)
+            var family: String? = font.familyName.hasPrefix(".") ? nil : font.familyName
+            var bold = traits.contains(.traitBold)
+            var italic = traits.contains(.traitItalic)
+            if !isCode, let model = a[modelFontKey] as? String, let flags = a[modelTraitsKey] as? Int {
+                let modelBold = flags & 1 != 0, modelItalic = flags & 2 != 0
+                if rendersAs(font, family: model, bold: modelBold, italic: modelItalic) {
+                    // The face is exactly what the model renders to here (a fallback, or a family without the
+                    // trait): the model is the truth.
+                    family = model
+                    bold = modelBold
+                    italic = modelItalic
+                } else if family == nil {
+                    // Something else changed the face (a system format action): read the traits from it, but a
+                    // fallback family still keeps the run's own.
+                    family = model
+                }
+            }
+            if !isCode, let f = family, f != full.font { t.font = f }
             if bold != (full.bold ?? false) { t.bold = bold }
-            let italic = traits.contains(.traitItalic)
             if italic != (full.italic ?? false) { t.italic = italic }
         }
         if let c = a[.foregroundColor] as? UIColor {
@@ -278,6 +409,39 @@ enum TextLayout {
         }
         if let url = t.link?.url, url.hasPrefix(assetScheme + ":") { t.link = nil }
         return t
+    }
+
+    /// A face as family name plus bold/italic traits.
+    private final class Face {
+        let family: String
+        let traits: UInt32
+
+        init(_ font: UIFont) {
+            family = font.familyName
+            traits = font.fontDescriptor.symbolicTraits.intersection([.traitBold, .traitItalic]).rawValue
+        }
+    }
+
+    /// Faces the bridge renders model fonts to, by family, traits and size (thread-safe).
+    private static let renderedFaces: NSCache<NSString, Face> = {
+        let c = NSCache<NSString, Face>()
+        c.countLimit = 256
+        return c
+    }()
+
+    /// Whether `font` is the face the bridge renders the model font (`family`, bold, italic) to on this device.
+    static func rendersAs(_ font: UIFont, family: String, bold: Bool, italic: Bool) -> Bool {
+        let size = (Double(font.pointSize) * 2).rounded() / 2
+        let key = NSString(string: "\(family)\u{1}\(bold)\u{1}\(italic)\u{1}\(size)")
+        let expected: Face
+        if let hit = renderedFaces.object(forKey: key) {
+            expected = hit
+        } else {
+            expected = Face(RichTextBridge.font(TextAttributes(font: family, size: size, bold: bold, italic: italic)))
+            renderedFaces.setObject(expected, forKey: key)
+        }
+        let rendered = Face(font)
+        return expected.family == rendered.family && expected.traits == rendered.traits
     }
 
     /// Model offset of a view offset: the view minus the generated marker characters before it.
@@ -324,10 +488,14 @@ enum TextLayout {
         return ceil(max(h, RichTextBridge.font(TextAttributes(), base: base).lineHeight))
     }
 
-    /// The height an auto-growing box needs so its text never clips (T-061).
-    static func fittedHeight(_ box: TextBoxItem) -> Double {
+    /// The height an auto-growing box needs so its text never clips (T-061). Inline images are measured at their real
+    /// aspect ratio when the document's assets are given (as the drawer draws them), else as squares.
+    static func fittedHeight(_ box: TextBoxItem, assets: AssetStore? = nil, doc: DocumentID? = nil) -> Double {
         let base = self.base(box.style, darkPaper: false)
-        let s = attributed(box.text, base: base) { _, font in placeholderGlyph(font) }
+        let s = attributed(box.text, base: base) { ref, font in
+            let image = doc.flatMap { glyphImage(ref, assets: assets, doc: $0) }
+            return placeholderGlyph(font, aspect: image.map(aspect) ?? 1)
+        }
         let pad = max(0, box.style.padding)
         let laid = layout(s, width: CGFloat(max(1, box.frame.w - 2 * pad)))
         return Double(textHeight(laid, base: base)) + 2 * pad
@@ -339,6 +507,7 @@ enum TextLayout {
         let base = self.base(box.style, darkPaper: darkPaper)
         let text = attributed(box.text, base: base) { ref, font in drawingGlyph(ref, font: font, assets: assets, doc: doc) }
         styleLinks(text)
+        applyTextShadow(text, style: box.style)
         let pad = CGFloat(max(0, box.style.padding))
         let laid = layout(text, width: max(1, CGFloat(box.frame.w) - 2 * pad))
         let needed = textHeight(laid, base: base) + 2 * pad
@@ -353,34 +522,10 @@ enum TextLayout {
             cg.rotate(by: CGFloat(box.frame.rotation))
             cg.translateBy(x: -rect.midX, y: -rect.midY)
         }
-        let radius = min(CGFloat(max(0, box.style.cornerRadius)), min(rect.width, rect.height) / 2)
-        let outline = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
-        let shadowColour = RGBA(0, 0, 0, 64).cgColor
-        if let fill = box.style.background, fill.a > 0 {
-            cg.saveGState()
-            if box.style.shadow { cg.setShadow(offset: CGSize(width: 0, height: 2), blur: 6, color: shadowColour) }
-            cg.addPath(outline)
-            cg.setFillColor(fill.cgColor)
-            cg.fillPath()
-            cg.restoreGState()
-        }
-        if let stroke = box.style.borderColor, stroke.a > 0, box.style.borderWidth > 0 {
-            let w = CGFloat(box.style.borderWidth)
-            let inner = rect.insetBy(dx: w / 2, dy: w / 2)
-            if inner.width > 0, inner.height > 0 {
-                let r = min(max(0, radius - w / 2), min(inner.width, inner.height) / 2)
-                cg.addPath(CGPath(roundedRect: inner, cornerWidth: r, cornerHeight: r, transform: nil))
-                cg.setStrokeColor(stroke.cgColor)
-                cg.setLineWidth(w)
-                cg.strokePath()
-            }
-        }
+        drawChrome(box.style, rect: rect, in: cg)
         if !box.style.autoGrow {
-            cg.addPath(outline)
+            cg.addPath(outline(box.style, rect: rect))
             cg.clip()
-        }
-        if box.style.shadow && (box.style.background?.a ?? 0) == 0 {
-            cg.setShadow(offset: CGSize(width: 0, height: 1), blur: 3, color: shadowColour)
         }
         let origin = CGPoint(x: rect.minX + pad, y: rect.minY + pad)
         let glyphs = laid.manager.glyphRange(for: laid.container)
@@ -388,6 +533,40 @@ enum TextLayout {
         laid.manager.drawBackground(forGlyphRange: glyphs, at: origin)
         laid.manager.drawGlyphs(forGlyphRange: glyphs, at: origin)
         UIGraphicsPopContext()
+    }
+
+    /// The box outline: `rect` with the style's corner radius (at most half the shorter side).
+    static func outline(_ style: TextBoxStyle, rect: CGRect) -> CGPath {
+        let radius = min(CGFloat(max(0, style.cornerRadius)), min(rect.width, rect.height) / 2)
+        return CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+    }
+
+    /// The box itself: fill (with the box shadow when `shadow` is on) and border. Shared by the page drawing and the
+    /// editing overlay (`TextBoxChromeView`), so a box looks the same while it is being edited.
+    static func drawChrome(_ style: TextBoxStyle, rect: CGRect, in cg: CGContext) {
+        guard rect.width > 0, rect.height > 0 else { return }
+        let radius = min(CGFloat(max(0, style.cornerRadius)), min(rect.width, rect.height) / 2)
+        if let fill = style.background, fill.a > 0 {
+            cg.saveGState()
+            if style.shadow { boxShadow.apply(to: cg) }
+            cg.addPath(outline(style, rect: rect))
+            cg.setFillColor(fill.cgColor)
+            cg.fillPath()
+            cg.restoreGState()
+        }
+        if let stroke = style.borderColor, stroke.a > 0, style.borderWidth > 0 {
+            let w = CGFloat(style.borderWidth)
+            let inner = rect.insetBy(dx: w / 2, dy: w / 2)
+            if inner.width > 0, inner.height > 0 {
+                let r = min(max(0, radius - w / 2), min(inner.width, inner.height) / 2)
+                cg.saveGState()
+                cg.addPath(CGPath(roundedRect: inner, cornerWidth: r, cornerHeight: r, transform: nil))
+                cg.setStrokeColor(stroke.cgColor)
+                cg.setLineWidth(w)
+                cg.strokePath()
+                cg.restoreGState()
+            }
+        }
     }
 
     /// Links on the page look like links (the editor uses `UITextView.linkTextAttributes` for the same look).

@@ -49,13 +49,18 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         var base: TextAttributes
         let darkPaper: Bool
         var lastCommitted: RichText?
+        /// The plain text when editing started: typed URLs are linked only when the text changed, so a link the user
+        /// removed on purpose stays removed.
+        let openedText: String
         let container: UIView
+        let chrome: TextBoxChromeView
         let outline: CAShapeLayer
         let textView: TextBoxTextView
         let model: TextFormatModel
 
         init(doc: DocumentID, page: PageID, id: ElementID, exists: Bool, createdByTool: Bool, box: TextBoxItem,
-             darkPaper: Bool, container: UIView, outline: CAShapeLayer, textView: TextBoxTextView, model: TextFormatModel) {
+             darkPaper: Bool, container: UIView, chrome: TextBoxChromeView, outline: CAShapeLayer,
+             textView: TextBoxTextView, model: TextFormatModel) {
             self.doc = doc
             self.page = page
             self.id = id
@@ -64,7 +69,9 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             self.box = box
             self.base = TextLayout.base(box.style, darkPaper: darkPaper)
             self.darkPaper = darkPaper
+            self.openedText = exists ? box.text.plainText : ""
             self.container = container
+            self.chrome = chrome
             self.outline = outline
             self.textView = textView
             self.model = model
@@ -203,10 +210,12 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         let container = UIView()
         container.backgroundColor = .clear
         container.isOpaque = false
+        let chrome = TextBoxChromeView(frame: .zero)
+        container.addSubview(chrome)
         let outline = CAShapeLayer()
         outline.fillColor = nil
         outline.lineWidth = 1
-        outline.lineDashPattern = [4, 4]
+        outline.lineDashPattern = [NSNumber(value: Double(NibSpacing.xs)), NSNumber(value: Double(NibSpacing.xs))]
         container.layer.addSublayer(outline)
 
         let tv = TextBoxTextView()
@@ -241,8 +250,8 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         host.canvasView.addSubview(container)
 
         let st = EditState(doc: doc, page: page, id: id, exists: exists, createdByTool: createdByTool, box: box,
-                           darkPaper: paperIsDark(doc: doc, page: page), container: container, outline: outline,
-                           textView: tv, model: model)
+                           darkPaper: paperIsDark(doc: doc, page: page), container: container, chrome: chrome,
+                           outline: outline, textView: tv, model: model)
         state = st
         applyInsets(st)
         render(box.text, selection: nil)
@@ -252,7 +261,6 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         host.session.isEditingText = true
         tv.becomeFirstResponder()
         if let p = caret { placeCaret(at: p) }
-        model.refresh()
         changes.send()
     }
 
@@ -274,7 +282,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                     deleteEmptyBox(st)
                 } else {
                     if text != st.lastCommitted { submit(text, for: st) }
-                    autodetectLinks(text, ref: st.ref)
+                    if text.plainText != st.openedText { autodetectLinks(text, ref: st.ref) }
                 }
             } else if !text.isEmpty {
                 submit(text, for: st)
@@ -289,11 +297,14 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         changes.send()
     }
 
+    /// The text tool is non-sticky unless pinned (T-035): a box started with it gives the previous tool back.
     private func revertTool(_ st: EditState) {
         guard st.createdByTool, let session = host?.session, session.tool == TextTool.toolID,
               !app.settings.get(TextSettings.pinned) else { return }
         let previous = session.previousTool.flatMap { $0 == TextTool.toolID ? nil : $0 } ?? "pen"
-        app.perform(CommandIDs.toolSelect, ["tool": .string(previous)], session: session)
+        enqueue { [weak self] in
+            await self?.execute(CommandIDs.toolSelect, ["tool": .string(previous)])
+        }
     }
 
     // MARK: Committing
@@ -335,7 +346,9 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             "page": .string(NodeRef.page(st.doc, st.page).description),
             "frame": .array([.number(f.x), .number(f.y), .number(f.w), .number(f.h)]),
             "text": textJSON,
-            "style": (try? JSONValue.from(st.box.style)) ?? .null,
+            // Every field explicit: the style is merged over the default, and a fill (or border) the user took off
+            // before this first commit must not come back from it.
+            "style": SavedTextStyle(box: st.box.style).json,
             "id": .string(st.id.raw)
         ]
         enqueue { [weak self] in
@@ -437,12 +450,12 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         applyInsets(st)
         render(box.text, selection: selection)
         st.lastCommitted = currentRichText()
-        st.model.refresh()
     }
 
     // MARK: Text view ⇄ model
 
-    private func currentRichText() -> RichText {
+    /// The text view's content as rich text (model offsets, markers dropped).
+    func currentRichText() -> RichText {
         guard let st = state else { return .empty }
         tagAttachments(st)
         let s = st.textView.textStorage
@@ -480,13 +493,13 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     }
 
     private func editingGlyph(_ ref: AssetRef, font: UIFont, doc: DocumentID) -> NSAttributedString? {
-        guard let data = try? app.services.assets?.data(ref, doc: doc) else { return nil }
         if #available(iOS 18.0, *), ref.ext == "heic" {
+            guard let data = try? app.services.assets?.data(ref, doc: doc) else { return nil }
             return NSAttributedString(adaptiveImageGlyph: NSAdaptiveImageGlyph(imageContent: data), attributes: [.font: font])
         }
-        guard let image = UIImage(data: data) else { return nil }
+        guard let image = TextLayout.glyphImage(ref, assets: app.services.assets, doc: doc) else { return nil }
         let attachment = NSTextAttachment(image: image)
-        attachment.bounds = TextLayout.glyphBounds(font, aspect: image.size.height > 0 ? image.size.width / image.size.height : 1)
+        attachment.bounds = TextLayout.glyphBounds(font, aspect: TextLayout.aspect(image))
         return NSAttributedString(attachment: attachment)
     }
 
@@ -497,6 +510,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         isRendering = true
         defer { isRendering = false }
         let s = TextLayout.attributed(text, base: st.base) { ref, font in self.editingGlyph(ref, font: font, doc: st.doc) }
+        TextLayout.applyTextShadow(s, style: st.box.style)
         tv.attributedText = s
         let first = text.paragraphs.first ?? Paragraph()
         if s.length == 0 {
@@ -572,11 +586,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         guard let st = state else { return }
         let tv = st.textView
         if tv.selectedRange.length == 0 {
-            let current = TextLayout.relativeAttributes(tv.typingAttributes, base: st.base)
-            var typing = RichTextBridge.attributes(RichTextEdit.merged(current, a), base: st.base)
-            for key in TextLayout.paragraphKeys { typing[key] = tv.typingAttributes[key] }
-            tv.typingAttributes = typing
-            st.model.refresh()
+            setTypingStyle(merging: a, st)
             changes.send()
             return
         }
@@ -611,13 +621,27 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         out = RichTextEdit.setParagraphs(out, indices: indices, align: style.align ?? .natural,
                                          lineSpacing: style.lineSpacing ?? 0)
         render(out, selection: selection)
-        if st.textView.selectedRange.length == 0 {
-            let current = TextLayout.relativeAttributes(st.textView.typingAttributes, base: st.base)
-            var typing = RichTextBridge.attributes(RichTextEdit.merged(current, attrs), base: st.base)
-            for key in TextLayout.paragraphKeys { typing[key] = st.textView.typingAttributes[key] }
-            st.textView.typingAttributes = typing
-        }
+        if st.textView.selectedRange.length == 0 { setTypingStyle(merging: attrs, st) }
         commitNow()
+    }
+
+    /// The typing style with `a` merged in: rendering, model font keys and the box's text shadow, keeping the
+    /// paragraph keys of where the caret is.
+    private func setTypingStyle(merging a: TextAttributes, _ st: EditState) {
+        let tv = st.textView
+        let current = TextLayout.relativeAttributes(tv.typingAttributes, base: st.base)
+        var typing = TextLayout.characterAttributes(RichTextEdit.merged(current, a), base: st.base)
+        for key in TextLayout.paragraphKeys { typing[key] = tv.typingAttributes[key] }
+        TextBoxEditor.setShadow(&typing, st.box.style)
+        tv.typingAttributes = typing
+    }
+
+    private static func setShadow(_ attrs: inout [NSAttributedString.Key: Any], _ style: TextBoxStyle) {
+        if let shadow = TextLayout.textShadowAttribute(style) {
+            attrs[.shadow] = shadow
+        } else {
+            attrs[.shadow] = nil
+        }
     }
 
     /// Box style fields (background, border, corners, padding, shadow, auto-grow, defaults, align, lineSpacing).
@@ -653,7 +677,6 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         st.base = TextLayout.base(st.box.style, darkPaper: st.darkPaper)
         applyInsets(st)
         render(text, selection: selection)
-        st.model.refresh()
     }
 
     // MARK: Layout
@@ -691,26 +714,21 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         tv.center = CGPoint(x: width * zoom / 2, y: height * zoom / 2)
         tv.transform = CGAffineTransform(scaleX: zoom, y: zoom)
 
+        // Fill, border and shadow come from the page's own drawing code (`TextLayout.drawChrome`).
         let style = st.box.style
-        let radius = CGFloat(max(0, style.cornerRadius)) * zoom
-        let layer = st.container.layer
-        layer.backgroundColor = style.background?.cgColor
-        layer.cornerRadius = radius
-        layer.borderWidth = CGFloat(max(0, style.borderWidth)) * zoom
-        layer.borderColor = style.borderColor?.cgColor
-        if style.shadow, style.background != nil {
-            layer.nibElevation(.rest, path: UIBezierPath(roundedRect: st.container.bounds, cornerRadius: radius).cgPath,
-                               dark: st.container.traitCollection.userInterfaceStyle == .dark)
-        } else {
-            layer.shadowPath = nil
-            layer.shadowColor = nil
-        }
+        let outset = TextLayout.chromeOutset * zoom
+        st.chrome.frame = st.container.bounds.insetBy(dx: -outset, dy: -outset)
+        let screenScale = host.canvasView.traitCollection.displayScale > 0 ? host.canvasView.traitCollection.displayScale : 2
+        st.chrome.update(style: style, size: CGSize(width: width, height: height), zoom: zoom, screenScale: screenScale)
+
+        // The focus outline sits one spacing step outside the box.
+        let gap = NibSpacing.xs
+        let radius = min(CGFloat(max(0, style.cornerRadius)) * zoom, min(st.container.bounds.width, st.container.bounds.height) / 2)
         st.outline.frame = st.container.bounds
         st.outline.strokeColor = NibUIColor.accent.resolvedColor(with: st.container.traitCollection).cgColor
-        st.outline.path = UIBezierPath(roundedRect: st.container.bounds.insetBy(dx: -3, dy: -3),
-                                       cornerRadius: radius + 3).cgPath
+        st.outline.path = UIBezierPath(roundedRect: st.container.bounds.insetBy(dx: -gap, dy: -gap),
+                                       cornerRadius: radius + gap).cgPath
 
-        let screenScale = host.canvasView.traitCollection.displayScale > 0 ? host.canvasView.traitCollection.displayScale : 2
         applyContentScale(tv, min(screenScale * zoom, 12))
     }
 
@@ -912,8 +930,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         }
         layoutEditing()
         scheduleCommit()
-        st.model.refresh()
-        changes.send()
+        changes.send()   // the format model refreshes on it
     }
 
     func textViewDidChangeSelection(_ textView: UITextView) {
@@ -921,7 +938,6 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         keepCaretOutOfMarkers(textView)
         cleanTypingAttributes(textView)
         ensureCaretVisible()
-        st.model.refresh()
         changes.send()
     }
 
@@ -1052,7 +1068,8 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     }
 
     /// Typing attributes never carry marker or glyph keys, and at a paragraph start they take that paragraph's
-    /// settings (not the previous paragraph's).
+    /// settings (not the previous paragraph's). The model font keys stay (typed text keeps its run's font even where
+    /// this device cannot show it), and the box's text shadow follows the style.
     private func cleanTypingAttributes(_ tv: UITextView) {
         var typing = tv.typingAttributes
         typing[.nibListMarker] = nil
@@ -1071,6 +1088,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             let own = TextLayout.typingAttributes(trailing, run: TextAttributes(), base: st.base)
             for key in TextLayout.paragraphKeys { typing[key] = own[key] }
         }
+        if let st = state { TextBoxEditor.setShadow(&typing, st.box.style) }
         tv.typingAttributes = typing
     }
 
@@ -1099,6 +1117,51 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         true
+    }
+}
+
+/// The box's fill, border and shadow under the editing text view, drawn by the page's own code
+/// (`TextLayout.drawChrome`), so a box looks the same while it is edited as on the page.
+final class TextBoxChromeView: UIView {
+    private var style = TextBoxStyle()
+    private var boxSize = CGSize.zero
+    private var zoom: CGFloat = 1
+    /// Keeps the backing store bounded at high zoom (fill, border and shadow stay smooth with fewer pixels).
+    private static let maxPixels: CGFloat = 4096
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isOpaque = false
+        backgroundColor = .clear
+        isUserInteractionEnabled = false
+        isAccessibilityElement = false
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    /// `size` is the box in page points, drawn at `zoom`; the view's frame is the box plus `TextLayout.chromeOutset`.
+    func update(style: TextBoxStyle, size: CGSize, zoom: CGFloat, screenScale: CGFloat) {
+        let longest = max(bounds.width, bounds.height, 1)
+        let scale = max(1, min(screenScale, TextBoxChromeView.maxPixels / longest))
+        if abs(contentScaleFactor - scale) > 0.01 {
+            contentScaleFactor = scale
+            setNeedsDisplay()
+        }
+        guard style != self.style || size != boxSize || zoom != self.zoom else { return }
+        self.style = style
+        boxSize = size
+        self.zoom = zoom
+        setNeedsDisplay()
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let cg = UIGraphicsGetCurrentContext(), zoom > 0 else { return }
+        cg.scaleBy(x: zoom, y: zoom)
+        let outset = TextLayout.chromeOutset
+        TextLayout.drawChrome(style, rect: CGRect(x: outset, y: outset, width: boxSize.width, height: boxSize.height), in: cg)
     }
 }
 
