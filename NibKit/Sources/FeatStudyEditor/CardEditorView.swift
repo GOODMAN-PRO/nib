@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import PencilKit
 import PhotosUI
+import ImageIO
 import UniformTypeIdentifiers
 import NibContracts
 import NibDesign
@@ -10,10 +11,12 @@ import NibDesign
 
 enum CardLayout {
     /// The preview card (DESIGN.md §14.11: 560 × 360, radius 20, `cardFace`).
-    static let cardWidth = CGFloat(CardFaces.canvas.width)
-    static let aspect = CGFloat(CardFaces.canvas.width / CardFaces.canvas.height)
+    static let cardWidth = NibMetrics.studyCardSize.width
+    static let aspect = NibMetrics.studyCardSize.width / NibMetrics.studyCardSize.height
     /// The editor pane: the card and its 24 pt margins.
     static let paneWidth = cardWidth + 2 * NibSpacing.xxl
+    /// How far a horizontal swipe on the card travels before it turns to the next or previous card.
+    static let swipeDistance = NibSpacing.x6
 }
 
 // MARK: - Editor root
@@ -102,10 +105,16 @@ struct CardListPane: View {
     }
 }
 
+/// The list's header. On iPhone and at accessibility sizes the language menu moves under the title, and the action
+/// row becomes a column of full-width buttons whenever it no longer fits on one line.
 struct StudySetHeader: View {
     @ObservedObject var model: StudySetModel
     let onDelete: () -> Void
     let onMove: () -> Void
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.dynamicTypeSize) private var typeSize
+
+    private var stacked: Bool { sizeClass == .compact || typeSize.isAccessibilitySize }
 
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.s) {
@@ -118,9 +127,11 @@ struct StudySetHeader: View {
                     Text(model.cards.count == 1 ? String(localized: "1 card") : String(localized: "\(model.cards.count) cards"))
                         .font(NibFont.footnote)
                         .foregroundStyle(NibColor.labelSecondary)
+                    if stacked { LanguageMenu(model: model) }
                 }
+                .layoutPriority(1)
                 Spacer(minLength: NibSpacing.s)
-                LanguageMenu(model: model)
+                if !stacked { LanguageMenu(model: model) }
                 if let scratch = model.scratchPanel {
                     NibIconButton(.quickNote, label: String(localized: "Scratch Paper"), size: .panel) {
                         Task { await model.open(scratch) }
@@ -133,50 +144,57 @@ struct StudySetHeader: View {
                     }
                 }
             }
-            HStack(spacing: NibSpacing.s) {
-                if model.selecting {
-                    selectionActions
-                } else {
-                    studyActions
-                }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: NibSpacing.s) { actions(column: false) }
+                VStack(alignment: .leading, spacing: NibSpacing.s) { actions(column: true) }
             }
         }
         .padding(.horizontal, NibSpacing.l)
         .padding(.vertical, NibSpacing.m)
     }
 
-    @ViewBuilder private var studyActions: some View {
+    @ViewBuilder private func actions(column: Bool) -> some View {
+        if model.selecting {
+            selectionActions(column: column)
+        } else {
+            studyActions(column: column)
+        }
+    }
+
+    @ViewBuilder private func studyActions(column: Bool) -> some View {
         if let practice = model.practicePanel {
-            NibButton(String(localized: "Practice"), kind: .secondary, size: .compact) {
+            NibButton(String(localized: "Practice"), kind: .secondary, size: .compact, expands: column) {
                 Task { await model.open(practice) }
             }
             .disabled(model.cards.isEmpty)
         }
         if let learn = model.smartLearnPanel {
-            NibButton(String(localized: "Smart Learn"), kind: .secondary, size: .compact) {
+            NibButton(String(localized: "Smart Learn"), kind: .secondary, size: .compact, expands: column) {
                 Task { await model.open(learn) }
             }
             .disabled(model.cards.isEmpty)
         }
-        Spacer(minLength: 0)
+        if !column { Spacer(minLength: 0) }
         if !model.readOnly && !model.cards.isEmpty {         // the empty state carries New Card otherwise
-            NibButton(String(localized: "New Card"), symbol: .plus, kind: .primary, size: .compact,
-                      shortcut: KeyboardShortcut(.return, modifiers: .command)) {
-                Task { await model.addCard(after: model.current) }
+            // ⌘⏎ itself is the editor's key command (one path, which knows whether the pane is being edited).
+            NibButton(String(localized: "New Card"), symbol: .plus, kind: .primary, size: .compact, expands: column) {
+                Task { await model.addCard(after: model.current, inPane: model.focus?.inPane ?? model.showsCardSheet) }
             }
+            .nibShortcutHint(StudySetModel.newCardShortcut)
         }
     }
 
-    @ViewBuilder private var selectionActions: some View {
+    @ViewBuilder private func selectionActions(column: Bool) -> some View {
         let count = model.selected.count
         Text(count == 1 ? String(localized: "1 selected") : String(localized: "\(count) selected"))
             .font(NibFont.footnote)
             .foregroundStyle(NibColor.labelSecondary)
-        Spacer(minLength: 0)
-        NibButton(String(localized: "Move To…"), symbol: .folder, kind: .secondary, size: .compact, action: onMove)
+        if !column { Spacer(minLength: 0) }
+        NibButton(String(localized: "Move To…"), symbol: .folder, kind: .secondary, size: .compact, expands: column,
+                  action: onMove)
             .disabled(count == 0)
         NibButton(count == 1 ? String(localized: "Delete 1 Card") : String(localized: "Delete \(count) Cards"),
-                  kind: .destructive, size: .compact, action: onDelete)
+                  kind: .destructive, size: .compact, expands: column, action: onDelete)
             .disabled(count == 0)
     }
 }
@@ -388,11 +406,13 @@ struct SideCell: View {
     }
 }
 
-/// A picture or freeform side in the list: a slot of light paper (paper is never inverted).
+/// A picture or freeform side in the list: a miniature of the card (its 560 × 360 shape, at most the thumbnail width)
+/// on light paper (paper is never inverted).
 struct FaceThumbnail: View {
     let model: StudySetModel
     let card: StudyCard
     let side: CardSide
+    @Environment(\.displayScale) private var displayScale
 
     var body: some View {
         let face = side.face(card)
@@ -400,9 +420,10 @@ struct FaceThumbnail: View {
         let shape = RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)
         ZStack {
             if mode == .image, face.kind == .image, let asset = face.asset {
-                CardPicture(model: model, asset: asset)
+                CardPicture(model: model, asset: asset, maxPixels: Int(NibMetrics.thumbnailWidth * max(displayScale, 1)))
                     .padding(NibSpacing.xs)
-            } else if mode == .ink, let ink = model.inkPicture(face, key: model.inkKey(card, side)) {
+            } else if mode == .ink,
+                      let ink = model.inkPicture(face, key: model.inkKey(card, side), displayScale: displayScale) {
                 Image(uiImage: ink)
                     .resizable()
                     .scaledToFit()
@@ -412,10 +433,13 @@ struct FaceThumbnail: View {
                 Text(mode == .image ? String(localized: "Add Image") : String(localized: "Draw"))
                     .font(NibFont.footnote)
                     .foregroundStyle(NibColor.labelSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(NibSpacing.xs)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .aspectRatio(CardLayout.aspect, contentMode: .fit)
         .frame(maxWidth: NibMetrics.thumbnailWidth)
-        .frame(height: 72)
         .background(NibPaper.white.color, in: shape)
         .overlay { shape.strokeBorder(NibColor.separator, lineWidth: 0.5) }
         .environment(\.colorScheme, .light)
@@ -424,10 +448,11 @@ struct FaceThumbnail: View {
     }
 }
 
-/// A picture stored in the set, loaded off the main thread.
+/// A picture stored in the set, decoded off the main thread at the size of its slot (`maxPixels` on the long edge).
 struct CardPicture: View {
     let model: StudySetModel
     let asset: AssetRef
+    let maxPixels: Int
     @State private var image: UIImage?
     @State private var failed = false
 
@@ -446,9 +471,9 @@ struct CardPicture: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: asset.name) {
+        .task(id: StudySetModel.pictureKey(asset, maxPixels: maxPixels)) {
             failed = false
-            image = await model.picture(asset)
+            image = await model.picture(asset, maxPixels: maxPixels)
             failed = image == nil
         }
         .accessibilityElement()
@@ -456,13 +481,14 @@ struct CardPicture: View {
     }
 }
 
-/// The card menu: every `MenuLocation.card` entry (this feature's, other features', plugins'), then Move to Study Set.
+/// The card menu: every `MenuLocation.card` entry (this feature's, other features', plugins'; only those that change
+/// nothing while the set is read-only), then Move to Study Set.
 struct CardMenu: View {
     @ObservedObject var model: StudySetModel
     let card: NibID
 
     var body: some View {
-        let items = model.readOnly ? [] : model.app.ui.menuItems(.card, model.menuContext(card))
+        let items = model.menuItems(card)
         let groups = items.compactMap { $0.submenu }.reduce(into: [String]()) { list, name in
             if !list.contains(name) { list.append(name) }
         }
@@ -553,7 +579,9 @@ struct CardEditorPane: View {
     @FocusState private var focus: CardField?
     @State private var tool = CardInkTool.pen(.carbon)
     @State private var photo: PhotosPickerItem?
+    @State private var choosesPhoto = false
     @State private var targeted = false
+    @Environment(\.displayScale) private var displayScale
 
     var body: some View {
         Group {
@@ -591,13 +619,19 @@ struct CardEditorPane: View {
             let mine = new?.inPane == true ? new : nil
             if focus != mine { focus = mine }
         }
+        // `.compatible` hands over JPEG rather than HEIC; `CardImages.normalized` bounds whatever arrives.
+        .photosPicker(isPresented: $choosesPhoto, selection: $photo, matching: .images, preferredItemEncoding: .compatible)
         .onChange(of: photo) { _, item in
             guard let item, let id = model.current else { return }
             let side = model.side
             photo = nil
             Task {
-                if let data = try? await item.loadTransferable(type: Data.self) {
+                let data = try? await item.loadTransferable(type: Data.self)
+                if let data {
                     await model.setImage(data, card: id, side: side)
+                } else {
+                    model.report(NibError(.unsupported, String(localized: "This photo could not be loaded.")),
+                                 command: CardUpdate.descriptor.id)
                 }
             }
         }
@@ -670,7 +704,7 @@ struct CardEditorPane: View {
         DragGesture(minimumDistance: NibSpacing.x3)
             .onEnded { value in
                 let dx = value.translation.width
-                guard abs(dx) > 80, abs(dx) > 2 * abs(value.translation.height) else { return }
+                guard abs(dx) > CardLayout.swipeDistance, abs(dx) > 2 * abs(value.translation.height) else { return }
                 Task { await model.step(dx < 0 ? 1 : -1) }
             }
     }
@@ -692,7 +726,7 @@ struct CardEditorPane: View {
                 .accessibilityLabel(side.title)
         case .image:
             if face.kind == .image, let asset = face.asset {
-                CardPicture(model: model, asset: asset)
+                CardPicture(model: model, asset: asset, maxPixels: Int(CardLayout.cardWidth * max(displayScale, 1)))
                     .padding(NibSpacing.m)
                     .frame(width: size.width, height: size.height)
             } else {
@@ -729,17 +763,8 @@ struct CardEditorPane: View {
                 case .text:
                     EmptyView()
                 case .image:
-                    PhotosPicker(selection: $photo, matching: .images) {
-                        HStack(spacing: NibSpacing.s) {
-                            Image(nib: .image)
-                            Text(String(localized: "Choose Photo"))
-                        }
-                        .font(NibFont.button)
-                        .foregroundStyle(NibColor.label)
-                        .padding(.horizontal, NibSpacing.l)
-                        .frame(minHeight: 38)
-                        .background(NibColor.fill3, in: Capsule())
-                        .frame(minHeight: NibMetrics.hitTarget)
+                    NibButton(String(localized: "Choose Photo"), symbol: .image, kind: .secondary, size: .compact) {
+                        choosesPhoto = true
                     }
                     if side.face(card).kind == .image {
                         NibIconButton(.trash, label: String(localized: "Remove Image"), size: .panel) {
@@ -935,6 +960,7 @@ struct ScratchPaperView: View {
     let onClose: @MainActor () -> Void
     @StateObject private var pad = ScratchPad()
     @State private var tool: CardInkTool
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     init(paper: RGBA, onClose: @escaping @MainActor () -> Void) {
         self.paper = paper
@@ -948,7 +974,8 @@ struct ScratchPaperView: View {
                            symbol: .quickNote, onClose: { onClose() })
             ScratchCanvas(pad: pad, tool: tool)
                 .background(Color(uiColor: paper.uiColor))
-                .clipShape(RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: NibRadius.concentric(NibRadius.panel, inset: NibSpacing.l),
+                                            style: .continuous))
                 .padding(.horizontal, NibSpacing.l)
             HStack(spacing: NibSpacing.xs) {
                 ForEach(CardInk.quickInks(on: paper), id: \.self) { ink in
@@ -963,7 +990,8 @@ struct ScratchPaperView: View {
             .padding(.horizontal, NibSpacing.l)
             .padding(.vertical, NibSpacing.s)
         }
-        .frame(minWidth: 300, idealWidth: NibMetrics.panelWidth, minHeight: 360, idealHeight: 480)
+        .frame(idealWidth: NibMetrics.panelWidth(typeSize), maxWidth: .infinity,
+               idealHeight: NibMetrics.floatingPanelSize.height, maxHeight: .infinity)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Scratch Paper"))
     }
@@ -1038,18 +1066,14 @@ enum CardPaste {
     }
 
     /// Lassoed ink as a freeform side: centred on the card and scaled down (never up) to fit inside the margin.
-    static func inkFace(from items: [Item], canvas: PageSize = CardFaces.canvas, margin: Double = 24) -> CardFace? {
+    static func inkFace(from items: [Item], canvas: PageSize = CardFaces.canvas, margin: Double = CardFaces.margin) -> CardFace? {
         let strokes = items.compactMap { $0.kind == .stroke ? $0.stroke : nil }.filter { $0.style.tool != .tape }
-        guard let first = strokes.first else { return nil }
-        let bounds = strokes.dropFirst().reduce(first.bounds) { $0.union($1.bounds) }
-        let fit = min(1, (canvas.width - 2 * margin) / max(bounds.width, 1), (canvas.height - 2 * margin) / max(bounds.height, 1))
-        let t = Affine.translation(-bounds.minX, -bounds.minY)
-            .concatenating(.scale(fit, fit))
-            .concatenating(.translation((canvas.width - bounds.width * fit) / 2, (canvas.height - bounds.height * fit) / 2))
-        return CardFace(kind: .ink, ink: strokes.map { $0.transformed(by: t) }, size: canvas)
+        guard let bounds = CardFaces.pointBounds(strokes) else { return nil }
+        return CardFace(kind: .ink, ink: CardFaces.centred(strokes, bounds: bounds, in: canvas, margin: margin), size: canvas)
     }
 
-    /// A lassoed picture's own bytes, else the lassoed ink rendered on transparent paper.
+    /// A lassoed picture's own bytes, else the lassoed ink rendered on transparent paper: at 2× for a small lasso,
+    /// never more than `CardImages.maxPixels` on its long edge (a lasso on a whiteboard can span thousands of points).
     static func imageData(from fragment: CardFragment) -> Data? {
         for item in fragment.items {
             if let name = item.image?.asset.name, let bytes = fragment.assets[name] { return bytes }
@@ -1057,9 +1081,12 @@ enum CardPaste {
         let strokes = fragment.items.compactMap { $0.kind == .stroke ? $0.stroke : nil }
         guard let first = strokes.first else { return nil }
         let bounds = strokes.dropFirst().reduce(first.bounds) { $0.union($1.bounds) }.insetBy(-8)
+        let longEdge = max(bounds.width, bounds.height)
+        guard longEdge.isFinite, longEdge > 0 else { return nil }
+        let scale = min(2, Double(CardImages.maxPixels) / longEdge)
         var image: UIImage?
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-            image = PKBridge.drawing(strokes).image(from: bounds.cg, scale: 2)
+            image = PKBridge.drawing(strokes).image(from: bounds.cg, scale: CGFloat(scale))
         }
         return image?.pngData()
     }
@@ -1111,14 +1138,71 @@ enum CardPaste {
     }
 }
 
+/// Pictures as a set stores and shows them. A stored picture is synced to every device and copied by `card.moveTo`,
+/// so photos are bounded on the way in; the list decodes small thumbnails, never the whole bitmap.
 enum CardImages {
-    /// Picture bytes as a set stores them: PNG, JPEG and GIF kept as they are, anything else (HEIC, TIFF) as PNG.
+    /// The longest edge a stored picture keeps (the 560 × 360 card at 3× is 1680 px wide).
+    static let maxPixels = 2048
+    static let jpegQuality = 0.85
+
+    /// Picture bytes as a set stores them. GIFs stay as they are (they may be animated), and so do PNG and JPEG
+    /// files within `maxPixels`. Anything larger, or in another format (HEIC, TIFF, …), is re-encoded at most
+    /// `maxPixels` on its long edge with its orientation applied: JPEG when opaque, PNG when it has alpha.
     static func normalized(_ data: Data) -> (data: Data, ext: String)? {
         let head = [UInt8](data.prefix(4))
-        if head.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return (data, "png") }
-        if head.starts(with: [0xFF, 0xD8, 0xFF]) { return (data, "jpg") }
         if head.starts(with: [0x47, 0x49, 0x46, 0x38]) { return (data, "gif") }
-        guard let png = UIImage(data: data)?.pngData() else { return nil }
-        return (png, "png")
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              CGImageSourceGetCount(source) > 0,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width > 0, height > 0 else { return nil }
+        let isPNG = head.starts(with: [0x89, 0x50, 0x4E, 0x47])
+        let isJPEG = head.starts(with: [0xFF, 0xD8, 0xFF])
+        if (isPNG || isJPEG) && max(width, height) <= maxPixels { return (data, isPNG ? "png" : "jpg") }
+        guard let image = thumbnail(source, maxPixels: maxPixels) else { return nil }
+        let opaque: Bool
+        if let alpha = properties[kCGImagePropertyHasAlpha] as? Bool {
+            opaque = !alpha
+        } else {
+            opaque = [CGImageAlphaInfo.none, .noneSkipFirst, .noneSkipLast].contains(image.alphaInfo)
+        }
+        let type = opaque ? UTType.jpeg : UTType.png
+        let out = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(out as CFMutableData, type.identifier as CFString, 1, nil) else {
+            return nil
+        }
+        let options: [CFString: Any] = opaque ? [kCGImageDestinationLossyCompressionQuality: jpegQuality] : [:]
+        CGImageDestinationAddImage(destination, image, options as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return (out as Data, opaque ? "jpg" : "png")
+    }
+
+    /// The picture decoded at most `maxPixels` on its long edge, orientation applied (never scaled up).
+    static func thumbnail(_ source: CGImageSource, maxPixels: Int) -> CGImage? {
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(maxPixels, 1),
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    }
+
+    /// A stored picture decoded for a slot `maxPixels` wide or tall (read from its file, not loaded whole).
+    static func picture(_ asset: AssetRef, doc: DocumentID, store: AssetStore, maxPixels: Int) -> UIImage? {
+        let noCache = [kCGImageSourceShouldCache: false] as CFDictionary
+        var source = store.url(asset, doc: doc).flatMap { CGImageSourceCreateWithURL($0 as CFURL, noCache) }
+        if source == nil, let data = try? store.data(asset, doc: doc) {
+            source = CGImageSourceCreateWithData(data as CFData, noCache)
+        }
+        guard let source, let image = thumbnail(source, maxPixels: maxPixels) else { return nil }
+        return UIImage(cgImage: image)
+    }
+
+    /// Bitmap bytes, the cost of a cached picture.
+    static func cost(_ image: UIImage) -> Int {
+        if let cg = image.cgImage { return cg.bytesPerRow * cg.height }
+        return Int(image.size.width * image.scale * image.size.height * image.scale) * 4
     }
 }

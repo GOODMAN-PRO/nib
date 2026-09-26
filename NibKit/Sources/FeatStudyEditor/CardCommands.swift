@@ -4,11 +4,18 @@ import NibContracts
 // MARK: - Faces
 
 /// Turns a side given to `card.add` / `card.update` into a stored `CardFace`. `CardFace`'s own decoder already accepts
-/// a plain string or {text?, asset?, ink?, size?} and infers the kind (ink > image > text); this normalises ink the way
-/// `ink.addStrokes` does (densify + nib sizes) and checks that an image side carries an asset.
+/// a plain string or {text?, asset?, ink?, size?} and infers the kind (ink > image > text); this bounds freeform ink
+/// to its card, normalises it the way `ink.addStrokes` does (densify + nib sizes) and checks that an image side
+/// carries an asset.
 enum CardFaces {
-    /// The editor's card (DESIGN.md §14.11), and the default canvas of a freeform side.
+    /// The editor's card (DESIGN.md §14.11, `NibMetrics.studyCardSize`), and the default canvas of a freeform side.
     static let canvas = PageSize(560, 360)
+    /// The largest canvas a freeform side keeps: four cards each way. A larger `size` shrinks, with its ink.
+    static let maxCanvas = PageSize(canvas.width * 4, canvas.height * 4)
+    /// Ink that strays off its card is brought back inside this margin (as lassoed ink is pasted).
+    static let margin = 24.0
+    /// The most stroke points one side may hold once AI and plugin ink is densified.
+    static let maxPoints = 250_000
 
     static func normalized(_ side: CardFace, path: String) throws -> CardFace {
         var face = side
@@ -21,23 +28,95 @@ enum CardFaces {
                                hint: "store the picture with asset.put {doc, base64, ext} and pass the returned name")
             }
         case .ink:
-            var strokes = face.ink ?? []
+            let bounded = try boundedInk(face.ink ?? [], size: face.size, path: path)
+            var strokes = bounded.strokes
             for i in strokes.indices { InkModel.prepare(&strokes[i]) }
             face.ink = strokes
-            if let s = face.size, !(1.0...10_000.0).contains(s.width) || !(1.0...10_000.0).contains(s.height) {
-                throw NibError.invalid("size must be 1 to 10000 points on each side", path: path + ".size")
-            }
-            face.size = face.size ?? fittedCanvas(strokes)
+            face.size = bounded.size
         }
         return face
     }
 
-    /// The default canvas, grown to hold strokes drawn beyond it (AI and plugin ink can land anywhere).
-    static func fittedCanvas(_ strokes: [Stroke]) -> PageSize {
-        strokes.reduce(canvas) { size, stroke in
-            let b = stroke.bounds
-            return PageSize(max(size.width, b.maxX), max(size.height, b.maxY))
+    /// A freeform side's strokes and canvas, bounded before anything allocates per point: coordinates must be finite,
+    /// a canvas over `maxCanvas` shrinks with its ink, ink off the card (beyond the margin) is moved, and scaled down
+    /// if it must be, to sit centred inside it, and the densified ink must stay under `maxPoints`. AI, plugin and
+    /// bridge ink can come from anywhere (an infinite whiteboard's coordinates, one long segment).
+    static func boundedInk(_ ink: [Stroke], size: PageSize?, path: String) throws -> (strokes: [Stroke], size: PageSize) {
+        for (i, stroke) in ink.enumerated() where !stroke.points.allSatisfy(isFiniteSample) {
+            throw NibError.invalid("stroke points must be finite numbers", path: path + ".ink[\(i)]")
         }
+        var canvas = CardFaces.canvas
+        if let s = size {
+            guard s.width.isFinite, s.height.isFinite, s.width >= 1, s.height >= 1 else {
+                throw NibError.invalid("size must be at least 1 point on each side", path: path + ".size")
+            }
+            canvas = s
+        }
+        var strokes = ink
+        let shrink = min(1, maxCanvas.width / canvas.width, maxCanvas.height / canvas.height)
+        if shrink < 1 {
+            canvas = PageSize(canvas.width * shrink, canvas.height * shrink)
+            strokes = strokes.map { $0.transformed(by: .scale(shrink, shrink)) }
+        }
+        if let b = pointBounds(strokes),
+           b.minX < -margin || b.minY < -margin || b.maxX > canvas.width + margin || b.maxY > canvas.height + margin {
+            strokes = centred(strokes, bounds: b, in: canvas)
+        }
+        guard densifiedCount(strokes) <= maxPoints else {
+            throw NibError(.invalidParams, "a freeform side holds at most \(maxPoints) points", path: path + ".ink",
+                           hint: "send fewer or shorter strokes")
+        }
+        return (strokes, canvas)
+    }
+
+    private static func isFiniteSample(_ p: StrokePoint) -> Bool {
+        p.x.isFinite && p.y.isFinite && p.t.isFinite && p.force.isFinite && p.azimuth.isFinite && p.altitude.isFinite
+            && p.roll.isFinite && p.width.isFinite && p.height.isFinite && p.opacity.isFinite
+    }
+
+    /// The union of the stroke points, in Double (spans of Float coordinates can overflow); nil without points.
+    static func pointBounds(_ strokes: [Stroke]) -> Rect? {
+        var minX = Double.infinity, minY = Double.infinity, maxX = -Double.infinity, maxY = -Double.infinity
+        for stroke in strokes {
+            for p in stroke.points {
+                minX = min(minX, Double(p.x))
+                minY = min(minY, Double(p.y))
+                maxX = max(maxX, Double(p.x))
+                maxY = max(maxY, Double(p.y))
+            }
+        }
+        guard minX.isFinite, minY.isFinite, maxX.isFinite, maxY.isFinite else { return nil }
+        return Rect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+
+    /// Strokes whose points span `bounds`, centred on a `size` card and scaled down (never up) to fit inside the margin.
+    static func centred(_ strokes: [Stroke], bounds b: Rect, in size: PageSize, margin: Double = CardFaces.margin) -> [Stroke] {
+        let m = min(margin, size.width / 4, size.height / 4)
+        let fit = min(1, (size.width - 2 * m) / max(b.width, 1), (size.height - 2 * m) / max(b.height, 1))
+        let t = Affine.translation(-b.minX, -b.minY)
+            .concatenating(.scale(fit, fit))
+            .concatenating(.translation((size.width - b.width * fit) / 2, (size.height - b.height * fit) / 2))
+        return strokes.map { $0.transformed(by: t) }
+    }
+
+    /// How many points the strokes hold once `InkModel.prepare` has densified them (1.5 pt spacing, ends tripled).
+    static func densifiedCount(_ strokes: [Stroke]) -> Int {
+        var total = 0
+        for stroke in strokes {
+            let pts = stroke.points
+            guard pts.count >= 2, pts.allSatisfy({ $0.width <= 0 }) else {
+                total += pts.count
+                continue
+            }
+            total += pts.count + 4
+            for i in 1..<pts.count {
+                let d = hypot(Double(pts[i].x) - Double(pts[i - 1].x), Double(pts[i].y) - Double(pts[i - 1].y))
+                guard d.isFinite, d / 1.5 < Double(maxPoints) else { return maxPoints + 1 }
+                total += max(0, Int((d / 1.5).rounded(.up)) - 1)
+            }
+            if total > maxPoints { return total }
+        }
+        return total
     }
 
     /// Plain text of a side as the editor shows it ("" for image and freeform sides).
@@ -45,16 +124,109 @@ enum CardFaces {
         face.kind == .text ? (face.text?.plainText ?? "") : ""
     }
 
-    /// Every asset a side names must already be in the set's package (asset.put first).
+    /// Every asset a side names must already be in the set's package (asset.put first). Only the file's presence is
+    /// checked: reading a photo to prove it exists would block the main actor.
     @MainActor
     static func checkAssets(_ sides: [(face: CardFace, path: String)], doc: DocumentID, services: NibServices) throws {
         guard let store = services.assets else { return }
         for side in sides {
             guard let asset = side.face.asset else { continue }
-            if (try? store.data(asset, doc: doc)) == nil {
+            guard let url = store.url(asset, doc: doc), FileManager.default.fileExists(atPath: url.path) else {
                 throw NibError(.notFound, "asset \(asset.name) is not stored in doc:\(doc.raw)", path: side.path + ".asset",
                                hint: "store the picture with asset.put {doc, base64, ext} and pass the returned name")
             }
+        }
+    }
+}
+
+/// Typed edits to a text side that keep its styling (bold, italics, links and paragraph styles from an import or the
+/// AI): characters the edit left alone keep their attributes, typed characters take those of the character before
+/// them in their paragraph (else the one after; links and inline images are never extended), and paragraphs keep
+/// their alignment, list and spacing. A new paragraph takes the style of the one it was split from, unchecked.
+enum CardText {
+    static func edited(_ old: RichText?, to plain: String) -> RichText {
+        guard let old, !old.paragraphs.isEmpty, !isPlain(old) else { return RichText(plain: plain) }
+        let newline: Unicode.Scalar = "\n"
+        var was: [Unicode.Scalar] = []
+        var attrs: [TextAttributes] = []
+        for (i, paragraph) in old.paragraphs.enumerated() {
+            if i > 0 {
+                was.append(newline)
+                attrs.append(TextAttributes())
+            }
+            for run in paragraph.runs {
+                for s in run.text.unicodeScalars {
+                    was.append(s)
+                    attrs.append(run.attrs)
+                }
+            }
+        }
+        let now = Array(plain.unicodeScalars)
+        let common = min(was.count, now.count)
+        var prefix = 0
+        while prefix < common, was[prefix] == now[prefix] { prefix += 1 }
+        var suffix = 0
+        while suffix < common - prefix, was[was.count - 1 - suffix] == now[now.count - 1 - suffix] { suffix += 1 }
+        let typedEnd = now.count - suffix
+        let shift = was.count - now.count                  // a suffix index in `now` + shift = its index in `was`
+        // Paragraph index of each position in the old text.
+        var paragraphAt = [Int](repeating: 0, count: was.count + 1)
+        for i in was.indices { paragraphAt[i + 1] = paragraphAt[i] + (was[i] == newline ? 1 : 0) }
+
+        var typed = TextAttributes()
+        if prefix > 0, was[prefix - 1] != newline {
+            typed = attrs[prefix - 1]
+        } else if prefix < was.count, was[prefix] != newline {
+            typed = attrs[prefix]
+        }
+        typed.link = nil
+        typed.attachment = nil
+
+        func oldStyle(_ index: Int, fresh: Bool) -> Paragraph {
+            var p = old.paragraphs[min(index, old.paragraphs.count - 1)]
+            p.runs = []
+            if fresh { p.checked = false }
+            return p
+        }
+        /// The style of the paragraph that starts after the newline at `j` in the new text.
+        func styleAfterNewline(_ j: Int) -> Paragraph {
+            if j < prefix { return oldStyle(paragraphAt[j + 1], fresh: false) }
+            if j >= typedEnd { return oldStyle(paragraphAt[j + shift + 1], fresh: false) }
+            return oldStyle(paragraphAt[prefix], fresh: true)
+        }
+
+        var paragraphs: [Paragraph] = []
+        var current = oldStyle(0, fresh: false)
+        var runText = String.UnicodeScalarView()
+        var runAttrs: TextAttributes?
+        func endRun() {
+            if let a = runAttrs, !runText.isEmpty { current.runs.append(TextRun(String(runText), a)) }
+            runText = String.UnicodeScalarView()
+            runAttrs = nil
+        }
+        for j in now.indices {
+            if now[j] == newline {
+                endRun()
+                paragraphs.append(current)
+                current = styleAfterNewline(j)
+                continue
+            }
+            let a = j < prefix ? attrs[j] : j >= typedEnd ? attrs[j + shift] : typed
+            if a != runAttrs {
+                endRun()
+                runAttrs = a
+            }
+            runText.append(now[j])
+        }
+        endRun()
+        paragraphs.append(current)
+        return RichText(paragraphs: paragraphs)
+    }
+
+    /// Default paragraph styles and character attributes throughout.
+    static func isPlain(_ text: RichText) -> Bool {
+        text.paragraphs.allSatisfy { p in
+            p == Paragraph(runs: p.runs) && p.runs.allSatisfy { $0.attrs == TextAttributes() }
         }
     }
 }
@@ -356,19 +528,20 @@ struct CardMoveTo: NibCommand {
                 throw NibError.invalid("ids must be 1 to 64 characters of [A-Za-z0-9_-]", path: "$.ids[\(n)]")
             }
         }
-        // Pictures live in each set's package: copy them into the destination before the transaction (slow work
-        // stays outside mutate; assets are immutable and deduplicated, so a rollback leaves nothing inconsistent).
-        var copied: [String: AssetRef] = [:]
+        // Pictures live in each set's package: copy them into the destination before the transaction, off the main
+        // actor (reading, hashing and writing photos is slow; AssetStore is thread-safe). Assets are immutable and
+        // deduplicated, so a rollback leaves nothing inconsistent.
+        var pending: [(src: DocumentID, asset: AssetRef)] = []
+        var queued = Set<String>()
         for t in targets where t.doc != dest {
             let live = try ctx.workspace.content(t.doc).liveCards
-            let i = try CardRefs.index(of: t.id, in: live, doc: t.doc, path: t.path)
-            let card = live[i]
-            for asset in [card.front.asset, card.back.asset].compactMap({ $0 }) where copied[t.doc.raw + "/" + asset.name] == nil {
-                let store = try ctx.services.require(ctx.services.assets, "the asset store")
-                let data = try store.data(asset, doc: t.doc)
-                copied[t.doc.raw + "/" + asset.name] = try store.put(data, ext: asset.ext.isEmpty ? "png" : asset.ext, doc: dest)
+            let card = live[try CardRefs.index(of: t.id, in: live, doc: t.doc, path: t.path)]
+            for asset in [card.front.asset, card.back.asset].compactMap({ $0 }) where queued.insert(t.doc.raw + "/" + asset.name).inserted {
+                pending.append((t.doc, asset))
             }
         }
+        var copied: [String: AssetRef] = [:]
+        if !pending.isEmpty { copied = try await copy(pending, to: dest, ctx) }
         let assets = copied
         func remap(_ face: CardFace, from src: DocumentID) -> CardFace {
             var f = face
@@ -410,5 +583,20 @@ struct CardMoveTo: NibCommand {
             return out
         }
         return Output(refs: refs)
+    }
+
+    /// Copies pictures into `dest`, keyed "<source doc>/<asset name>".
+    private static func copy(_ pending: [(src: DocumentID, asset: AssetRef)], to dest: DocumentID,
+                             _ ctx: CommandContext) async throws -> [String: AssetRef] {
+        let store = try ctx.services.require(ctx.services.assets, "the asset store")
+        return try await Task.detached(priority: .userInitiated) { () throws -> [String: AssetRef] in
+            var out: [String: AssetRef] = [:]
+            for item in pending {
+                let data = try store.data(item.asset, doc: item.src)
+                let ext = item.asset.ext.isEmpty ? "png" : item.asset.ext
+                out[item.src.raw + "/" + item.asset.name] = try store.put(data, ext: ext, doc: dest)
+            }
+            return out
+        }.value
     }
 }

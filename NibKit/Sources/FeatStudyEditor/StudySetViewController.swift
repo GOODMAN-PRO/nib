@@ -78,13 +78,28 @@ final class StudySetModel: ObservableObject {
     private var pendingCommit: Task<Void, Never>?
     private var observation: CommitObservation?
     private var readOnlyWatch: AnyCancellable?
+    /// Decoded pictures (slot-sized) and rendered freeform sides, bounded by bitmap bytes.
     private let pictures = NSCache<NSString, UIImage>()
     private let inkPictures = NSCache<NSString, UIImage>()
+    /// `card.moveTo` writes two sets and each keeps its own undo stack: the sets of each move this editor made, by
+    /// undo group, so undoing or redoing it in either set does the same in the other.
+    private var moves: [String: [DocumentID]] = [:]
+    /// A set's undo stack right after a move was undone there; its redo is mirrored only while the stack is unchanged.
+    private var undoneMoves: [String: [DocumentID: UndoMark]] = [:]
+
+    struct UndoMark: Equatable {
+        var depth: Int
+        var top: String?
+    }
+
+    static let newCardShortcut = KeyboardShortcut(.return, modifiers: .command)
 
     init(app: NibApp, doc: DocumentID, session: EditorSession) {
         self.app = app
         self.doc = doc
         self.session = session
+        pictures.totalCostLimit = 48 << 20
+        inkPictures.totalCostLimit = 16 << 20
         reload()
         observation = CommitObservation(app.bus.observeCommits { [weak self] cs in self?.didCommit(cs) })
         readOnlyWatch = session.$readOnly.sink { [weak self] value in self?.readOnly = value }
@@ -121,6 +136,7 @@ final class StudySetModel: ObservableObject {
     /// Any commit touching this set: refresh. A change that is not this editor's own typing (undo, sync, a
     /// collaborator, the AI, a plugin, a picture or stroke) replaces the drafts and input modes of the sides it changed.
     func didCommit(_ cs: Changeset) {
+        mirrorMoveUndo(cs)
         guard cs.documents.contains(doc) else { return }
         if !ownGroups.contains(cs.group) {
             var touched = Set<SideKey>()
@@ -135,6 +151,36 @@ final class StudySetModel: ObservableObject {
             }
         }
         reload()
+    }
+
+    /// Undoing (or redoing) one of this editor's moves in one set does the same in the other set, when that set's
+    /// stack still has the move on top (undo) or is as the mirrored undo left it (redo).
+    private func mirrorMoveUndo(_ cs: Changeset) {
+        let undoing = cs.command == CommandIDs.undo
+        guard undoing || cs.command == CommandIDs.redo else { return }
+        let prefix = undoing ? "undo:" : "redo:"
+        guard cs.group.hasPrefix(prefix) else { return }
+        let group = String(cs.group.dropFirst(prefix.count))
+        guard let docs = moves[group] else { return }
+        let history = app.bus.history
+        let others = docs.filter { !cs.documents.contains($0) }
+        if undoing {
+            for d in cs.documents where docs.contains(d) { undoneMoves[group, default: [:]][d] = mark(d) }
+            for other in others where history.entries(other).last?.group == group {
+                app.bus.undo(other)
+            }
+        } else {
+            for d in cs.documents { undoneMoves[group]?[d] = nil }
+            for other in others {
+                guard let m = undoneMoves[group]?[other], m == mark(other), history.canRedo(other) else { continue }
+                app.bus.redo(other)
+            }
+        }
+    }
+
+    private func mark(_ d: DocumentID) -> UndoMark {
+        let entries = app.bus.history.entries(d)
+        return UndoMark(depth: entries.count, top: entries.last?.group)
     }
 
     // MARK: Text
@@ -171,7 +217,8 @@ final class StudySetModel: ObservableObject {
         if face.kind == .text, (face.text?.plainText ?? "") == draft { return }
         let group = NibID.make().raw
         ownGroups.insert(group)
-        await update(key.card, key.side, CardFace(kind: .text, text: RichText(plain: draft)), group: group)
+        let text = CardText.edited(face.kind == .text ? face.text : nil, to: draft)
+        await update(key.card, key.side, CardFace(kind: .text, text: text), group: group)
         ownGroups.remove(group)
     }
 
@@ -321,7 +368,13 @@ final class StudySetModel: ObservableObject {
         await flush()
         if let f = focus, ids.contains(f.card) { focus = nil }
         let params = CardMoveTo.Params(refs: ids.map { ref($0) }, doc: NodeRef.document(set).description, ids: nil)
-        if await run(CardMoveTo.self, params) != nil { selecting = false }
+        let group = NibID.make().raw
+        moves[group] = [doc, set]
+        if await run(CardMoveTo.self, params, group: group) != nil {
+            selecting = false
+        } else {
+            moves[group] = nil
+        }
     }
 
     func update(_ id: NibID, _ side: CardSide, _ face: CardFace, group: String? = nil) async {
@@ -353,31 +406,42 @@ final class StudySetModel: ObservableObject {
         setMode(.image, card: id, side: side)
     }
 
-    func picture(_ asset: AssetRef) async -> UIImage? {
-        let key = asset.name as NSString
+    static func pictureKey(_ asset: AssetRef, maxPixels: Int) -> String { asset.name + "@" + String(maxPixels) }
+
+    /// A stored picture decoded off the main thread at most `maxPixels` on its long edge (list slots ask for a
+    /// thumbnail, the card for its own size), cached by bitmap bytes.
+    func picture(_ asset: AssetRef, maxPixels: Int) async -> UIImage? {
+        let key = StudySetModel.pictureKey(asset, maxPixels: maxPixels) as NSString
         if let hit = pictures.object(forKey: key) { return hit }
         guard let store = app.services.assets else { return nil }
         let doc = self.doc
         let image = await Task.detached(priority: .userInitiated) { () -> UIImage? in
-            guard let data = try? store.data(asset, doc: doc), let decoded = UIImage(data: data) else { return nil }
-            return decoded.preparingForDisplay() ?? decoded
+            CardImages.picture(asset, doc: doc, store: store, maxPixels: maxPixels)
         }.value
-        if let image { pictures.setObject(image, forKey: key) }
+        if let image { pictures.setObject(image, forKey: key, cost: CardImages.cost(image)) }
         return image
     }
 
     func inkKey(_ card: StudyCard, _ side: CardSide) -> String { card.id.raw + "/" + side.rawValue + "/" + card.rev.description }
 
-    /// A freeform side drawn on light paper (paper is never inverted), cached per card revision.
-    func inkPicture(_ face: CardFace, key: String) -> UIImage? {
+    /// The scale a freeform side renders at for a list slot: about twice the slot's pixels, never above 1×.
+    static func inkThumbnailScale(canvas: PageSize, displayScale: CGFloat) -> CGFloat {
+        let target = 2 * NibMetrics.thumbnailWidth * max(displayScale, 1)
+        let longEdge = CGFloat(max(canvas.width, canvas.height, 1))
+        return min(1, target / longEdge)
+    }
+
+    /// A freeform side drawn on light paper (paper is never inverted) for a list slot, cached per card revision.
+    func inkPicture(_ face: CardFace, key: String, displayScale: CGFloat) -> UIImage? {
         if let hit = inkPictures.object(forKey: key as NSString) { return hit }
         guard face.kind == .ink, let strokes = face.ink, !strokes.isEmpty else { return nil }
         let size = face.size ?? CardFaces.canvas
+        let scale = StudySetModel.inkThumbnailScale(canvas: size, displayScale: displayScale)
         var image: UIImage?
         UITraitCollection(userInterfaceStyle: .light).performAsCurrent {
-            image = PKBridge.drawing(strokes).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: 1)
+            image = PKBridge.drawing(strokes).image(from: CGRect(x: 0, y: 0, width: size.width, height: size.height), scale: scale)
         }
-        if let image { inkPictures.setObject(image, forKey: key as NSString) }
+        if let image { inkPictures.setObject(image, forKey: key as NSString, cost: CardImages.cost(image)) }
         return image
     }
 
@@ -465,19 +529,32 @@ final class StudySetModel: ObservableObject {
         MenuContext(app: app, session: session, doc: doc, ref: ref(id))
     }
 
+    /// The card menu's `MenuLocation.card` entries; while the set is read-only, only those whose command changes
+    /// nothing (read or session effect).
+    func menuItems(_ id: NibID) -> [MenuItemDescriptor] {
+        let items = app.ui.menuItems(.card, menuContext(id))
+        guard readOnly else { return items }
+        return items.filter { item in
+            guard let effect = app.commands.descriptor(item.command)?.effect else { return false }
+            return effect == .read || effect == .session
+        }
+    }
+
     func perform(_ item: MenuItemDescriptor, for id: NibID) {
         app.perform(item.command, item.params(menuContext(id)), session: session)
     }
 
-    /// Practice and Smart Learn belong to the study sessions feature; found by id so no ids are hard-wired.
-    func studyPanel(_ keyword: String) -> PanelDescriptor? {
-        app.ui.panels.all.first { d in
-            d.owner == "studysession" && d.id.lowercased().contains(keyword) && (d.docKinds?.contains(.studySet) ?? true)
-        }
+    /// Practice and Smart Learn are the study sessions feature's panels (F050), registered under these ids.
+    static let practicePanelID = "studysession.practice"
+    static let smartLearnPanelID = "studysession.smartLearn"
+
+    func studyPanel(_ id: String) -> PanelDescriptor? {
+        guard let d = app.ui.panels.get(id), d.docKinds?.contains(.studySet) ?? true else { return nil }
+        return d
     }
 
-    var practicePanel: PanelDescriptor? { studyPanel("practice") }
-    var smartLearnPanel: PanelDescriptor? { studyPanel("learn") }
+    var practicePanel: PanelDescriptor? { studyPanel(StudySetModel.practicePanelID) }
+    var smartLearnPanel: PanelDescriptor? { studyPanel(StudySetModel.smartLearnPanelID) }
     var scratchPanel: PanelDescriptor? { app.ui.panels.get(ScratchPaper.panelID) }
 
     /// `panel.open` through the document chrome; without it, the editor presents the panel itself.
@@ -522,6 +599,27 @@ final class CommitObservation {
 }
 
 // MARK: - View controller
+
+/// The app's first responder, found by sending an action down the responder chain (UIKit has no public getter).
+@MainActor
+enum FirstResponder {
+    static func current() -> UIResponder? {
+        let probe = FirstResponderProbe()
+        _ = UIApplication.shared.sendAction(#selector(UIResponder.nibStudyEditorReportFirstResponder(_:)), to: nil,
+                                            from: probe, for: nil)
+        return probe.found.flatMap { $0.isFirstResponder ? $0 : nil }
+    }
+}
+
+final class FirstResponderProbe: NSObject {
+    weak var found: UIResponder?
+}
+
+extension UIResponder {
+    @objc func nibStudyEditorReportFirstResponder(_ sender: Any?) {
+        (sender as? FirstResponderProbe)?.found = self
+    }
+}
 
 /// The `.studySet` document editor: the card list and the card editor (DESIGN.md §14.11), hosted in SwiftUI.
 final class StudySetViewController: UIViewController, DocumentEditing {
@@ -586,9 +684,10 @@ final class StudySetViewController: UIViewController, DocumentEditing {
     override var canBecomeFirstResponder: Bool { true }
 
     override var keyCommands: [UIKeyCommand]? {
-        var commands = [keyCommand(String(localized: "Next Field"), #selector(nextField), "\t"),
-                        keyCommand(String(localized: "Previous Field"), #selector(previousField), "\t", .shift)]
-        if !model.readOnly {
+        var commands: [UIKeyCommand] = []
+        if !model.readOnly {                  // read-only: Tab stays with the system (Full Keyboard Access)
+            commands.append(keyCommand(String(localized: "Next Field"), #selector(nextField), "\t"))
+            commands.append(keyCommand(String(localized: "Previous Field"), #selector(previousField), "\t", .shift))
             commands.append(keyCommand(String(localized: "New Card"), #selector(newCard), "\r", .command))
         }
         if model.focus != nil || model.selecting {
@@ -598,9 +697,16 @@ final class StudySetViewController: UIViewController, DocumentEditing {
     }
 
     /// Keeps the shortcuts working once no field is being edited (a resigned text view leaves no first responder).
+    /// Only when nothing outside this editor holds the keyboard: leaving a card field for the search field, the title
+    /// or a panel's composer must not take the keyboard back from it. A card field of this editor that is still
+    /// resigning (⎋) does not count.
     private func reclaimKeyboard() {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.model.focus == nil, self.panelController == nil, self.view.window != nil else { return }
+            guard let self, self.model.focus == nil, self.panelController == nil, self.view.window != nil,
+                  !self.isFirstResponder else { return }
+            if let holder = FirstResponder.current() {
+                guard let view = holder as? UIView, view.isDescendant(of: self.view) else { return }
+            }
             self.becomeFirstResponder()
         }
     }

@@ -25,6 +25,7 @@ public enum FeatStudyEditorFeature: NibFeature {
 /// bridge can do the same thing by calling the command.
 @MainActor
 enum StudyEditorMenus {
+    // Move Up / Move Down carry no icon: NibSymbol has no move glyph (contract request filed).
     static func register(_ app: NibApp, owner: String) {
         let menus = app.ui.menus
         menus.register(MenuItemDescriptor(
@@ -32,17 +33,17 @@ enum StudyEditorMenus {
             location: .libraryNew, order: 500, owner: owner, command: CommandIDs.batch,
             params: { ctx in StudyEditorMenus.newSet(in: ctx.ref) }))
         menus.register(MenuItemDescriptor(
-            id: "studyeditor.card.duplicate", title: String(localized: "Duplicate"), icon: "plus.square.on.square",
+            id: "studyeditor.card.duplicate", title: String(localized: "Duplicate"), icon: NibSymbol.duplicate.name,
             location: .card, order: 100, owner: owner, command: "card.add",
             params: { ctx in StudyEditorMenus.duplicate(ctx) },
             isVisible: { ctx in StudyEditorMenus.target(ctx) != nil }))
         menus.register(MenuItemDescriptor(
-            id: "studyeditor.card.moveUp", title: String(localized: "Move Up"), icon: "arrow.up",
+            id: "studyeditor.card.moveUp", title: String(localized: "Move Up"),
             location: .card, order: 200, owner: owner, command: "card.move",
             params: { ctx in StudyEditorMenus.moveUp(ctx) },
             isVisible: { ctx in (StudyEditorMenus.target(ctx)?.index ?? 0) > 0 }))
         menus.register(MenuItemDescriptor(
-            id: "studyeditor.card.moveDown", title: String(localized: "Move Down"), icon: "arrow.down",
+            id: "studyeditor.card.moveDown", title: String(localized: "Move Down"),
             location: .card, order: 210, owner: owner, command: "card.move",
             params: { ctx in StudyEditorMenus.moveDown(ctx) },
             isVisible: { ctx in StudyEditorMenus.target(ctx).map { $0.index + 1 < $0.cards.count } ?? false }))

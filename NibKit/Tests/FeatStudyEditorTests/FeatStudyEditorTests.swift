@@ -1,4 +1,8 @@
 import XCTest
+import UIKit
+import SwiftUI
+import ImageIO
+import UniformTypeIdentifiers
 import NibContracts
 import NibTesting
 @testable import FeatStudyEditor
@@ -161,6 +165,149 @@ final class FeatStudyEditorTests: XCTestCase {
         }
     }
 
+    func testMoveToTakesGivenIDsKeepsCardsAlreadyThereAndRefusesTakenIDs() async throws {
+        let h = harness()
+        let other = DocumentID("SECONDSET001")
+        let resident = StudyCard(id: NibID("RESIDENT0001"), front: CardFace(text: RichText(plain: "Here")), back: CardFace(),
+                                 order: "V")
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: other, kind: .studySet), cards: [resident]),
+                                         title: "Second", in: nil)
+        // A card already in the set keeps its id and goes to the end; the other takes the id given for it.
+        let r = try await h.run("card.moveTo", ["refs": ["card:SECONDSET001/RESIDENT0001", "card:FIXTUREDOC03/FIXTURECRD01"],
+                                                "doc": "doc:SECONDSET001", "ids": ["UNUSEDID0001", "MOVEDCARD001"]])
+        XCTAssertEqual(r["refs"]?[0]?.stringValue, "card:SECONDSET001/RESIDENT0001")
+        XCTAssertEqual(r["refs"]?[1]?.stringValue, "card:SECONDSET001/MOVEDCARD001")
+        XCTAssertEqual(try liveCards(h, other).map { $0.id.raw }, ["RESIDENT0001", "MOVEDCARD001"])
+        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card2])
+
+        // An id the set already uses, or ids that do not match the refs, are refused and nothing moves.
+        let before = try h.snapshot(Fixtures.studySetID)
+        let destination = try h.snapshot(other)
+        await expectError(.invalidParams) {
+            try await h.run("card.moveTo", ["refs": ["card:FIXTUREDOC03/FIXTURECRD02"], "doc": "doc:SECONDSET001",
+                                            "ids": ["RESIDENT0001"]])
+        }
+        await expectError(.invalidParams) {
+            try await h.run("card.moveTo", ["refs": ["card:FIXTUREDOC03/FIXTURECRD02"], "doc": "doc:SECONDSET001",
+                                            "ids": ["ONEID0000001", "TWOID0000001"]])
+        }
+        XCTAssertEqual(try h.snapshot(Fixtures.studySetID), before)
+        XCTAssertEqual(try h.snapshot(other), destination)
+
+        // Without ids, a card whose id the set already uses gets a fresh one.
+        try await h.run("card.add", ["doc": "doc:FIXTUREDOC03", "front": "Twin", "back": "b", "id": "RESIDENT0001"])
+        let twin = try await h.run("card.moveTo", ["refs": ["card:FIXTUREDOC03/RESIDENT0001"], "doc": "doc:SECONDSET001"])
+        let ref = try XCTUnwrap(twin["refs"]?[0]?.stringValue)
+        XCTAssertNotEqual(ref, "card:SECONDSET001/RESIDENT0001")
+        XCTAssertEqual(try liveCards(h, other).count, 3)
+        XCTAssertEqual(Set(try liveCards(h, other).map { $0.id }).count, 3)
+    }
+
+    func testMovingCardsFromTheEditorUndoesAndRedoesInBothSets() async throws {
+        let h = harness()
+        let other = DocumentID("SECONDSET001")
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: other, kind: .studySet)), title: "Second", in: nil)
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        await model.moveCards([Fixtures.card2], to: other)
+        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card1])
+        XCTAssertEqual(try liveCards(h, other).map { $0.id }, [Fixtures.card2])
+
+        // Undo in the set being edited takes the copies back out of the other set.
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card1, Fixtures.card2])
+        XCTAssertTrue(try liveCards(h, other).isEmpty)
+        XCTAssertEqual(h.undoDepth(other), 0)
+
+        // Redo moves them again, in both sets.
+        XCTAssertTrue(h.app.bus.redo(Fixtures.studySetID))
+        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card1])
+        XCTAssertEqual(try liveCards(h, other).map { $0.id }, [Fixtures.card2])
+
+        // Undo in the destination brings the cards back to the set they came from.
+        XCTAssertTrue(h.app.bus.undo(other))
+        XCTAssertTrue(try liveCards(h, other).isEmpty)
+        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card1, Fixtures.card2])
+
+        // A later edit in the other set stops the mirroring there: its own stack is left alone.
+        XCTAssertTrue(h.app.bus.redo(Fixtures.studySetID))
+        try await h.run("card.add", ["doc": "doc:SECONDSET001", "front": "New", "back": "b"])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertEqual(try liveCards(h, other).count, 2, "the destination's top entry is not the move")
+    }
+
+    // MARK: Freeform ink at the trust boundary
+
+    func testFreeformInkFromAnywhereIsBoundedToItsCard() async throws {
+        let h = harness()
+        // Ink copied from far out on a whiteboard, with no size: the default card, the ink moved onto it.
+        try await h.run("card.add", try JSONValue.parse(
+            #"{"doc": "doc:FIXTUREDOC03", "front": {"ink": [{"fmt": "xy", "pts": [50000, 50000, 50400, 50100]}]}, "back": "Far", "id": "FARINK000001"}"#))
+        // Negative coordinates, and a canvas far over the cap.
+        try await h.run("card.add", try JSONValue.parse(
+            #"{"doc": "doc:FIXTUREDOC03", "front": {"ink": [{"fmt": "xy", "pts": [-900, -300, -100, -40]}]}, "back": {"ink": [{"fmt": "xy", "pts": [9000, 9000, 9900, 9900]}], "size": {"width": 10000, "height": 10000}}, "id": "NEGINK000001"}"#))
+        for id in ["FARINK000001", "NEGINK000001"] {
+            let card = try XCTUnwrap(try liveCards(h).first(where: { $0.id == NibID(id) }))
+            for face in [card.front, card.back] where face.kind == .ink {
+                let size = try XCTUnwrap(face.size)
+                XCTAssertLessThanOrEqual(size.width, CardFaces.maxCanvas.width)
+                XCTAssertLessThanOrEqual(size.height, CardFaces.maxCanvas.height)
+                let b = try XCTUnwrap(CardFaces.pointBounds(face.ink ?? []))
+                XCTAssertGreaterThanOrEqual(b.minX, 0, id)
+                XCTAssertGreaterThanOrEqual(b.minY, 0, id)
+                XCTAssertLessThanOrEqual(b.maxX, size.width, id)
+                XCTAssertLessThanOrEqual(b.maxY, size.height, id)
+            }
+        }
+        let far = try XCTUnwrap(try liveCards(h).first(where: { $0.id == NibID("FARINK000001") }))
+        XCTAssertEqual(far.front.size, CardFaces.canvas)
+        XCTAssertLessThan(far.front.ink?.first?.points.count ?? .max, 1_000, "densified once it is on the card")
+        let big = try XCTUnwrap(try liveCards(h).first(where: { $0.id == NibID("NEGINK000001") }))
+        XCTAssertEqual(big.back.size?.width ?? 0, 1440, accuracy: 0.01, "10000 × 10000 shrinks, with its ink, to the cap")
+        XCTAssertEqual(big.back.size?.height ?? 0, 1440, accuracy: 0.01)
+
+        // One long AI segment is fitted before it is densified.
+        try await h.run("card.update", try JSONValue.parse(
+            #"{"ref": "card:FIXTUREDOC03/FIXTURECRD01", "back": {"ink": [{"fmt": "xy", "pts": [0, 100, 10000000, 100]}]}}"#))
+        XCTAssertLessThan(try liveCards(h).first?.back.ink?.first?.points.count ?? .max, 1_000)
+    }
+
+    func testFreeformInkRejectsNonFiniteNumbersAndTooManyPoints() async throws {
+        let h = harness()
+        // 1e39 is beyond Float: it arrives as infinity.
+        await expectError(.invalidParams) {
+            try await h.run("card.add", try JSONValue.parse(
+                #"{"doc": "doc:FIXTUREDOC03", "front": {"ink": [{"fmt": "xy", "pts": [1e39, 0, 10, 10]}]}, "back": "b"}"#))
+        }
+        let nan = CardFace(kind: .ink, ink: [Stroke(style: InkStyle(), points: [StrokePoint(x: .nan, y: 0), StrokePoint(x: 1, y: 1)])])
+        XCTAssertThrowsError(try CardFaces.normalized(nan, path: "$.front")) { error in
+            XCTAssertEqual((error as? NibError)?.code, .invalidParams)
+            XCTAssertEqual((error as? NibError)?.path, "$.front.ink[0]")
+        }
+        let zeroSize = CardFace(kind: .ink, ink: [], size: PageSize(0, 360))
+        XCTAssertThrowsError(try CardFaces.normalized(zeroSize, path: "$.back"))
+        // A zig-zag across a large card: far more points than a side holds once densified.
+        let zigzag = (0..<400).map { StrokePoint(x: $0 % 2 == 0 ? 0 : 2000, y: Float($0)) }
+        let dense = CardFace(kind: .ink, ink: [Stroke(style: InkStyle(), points: zigzag)], size: PageSize(2000, 1400))
+        XCTAssertThrowsError(try CardFaces.normalized(dense, path: "$.back")) { error in
+            XCTAssertEqual((error as? NibError)?.code, .invalidParams)
+        }
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 0)
+    }
+
+    func testFreeformThumbnailsRenderAtABoundedScale() throws {
+        let h = harness()
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        XCTAssertEqual(StudySetModel.inkThumbnailScale(canvas: CardFaces.canvas, displayScale: 3), 1)
+        let scale = StudySetModel.inkThumbnailScale(canvas: PageSize(50_000, 30_000), displayScale: 3)
+        XCTAssertLessThanOrEqual(50_000 * scale, 1_100)
+        // A side stored before canvases were capped still renders small.
+        let line = Stroke(style: InkStyle(), points: [StrokePoint(x: 100, y: 100, width: 2, height: 2),
+                                                      StrokePoint(x: 49_000, y: 29_000, width: 2, height: 2)])
+        let huge = CardFace(kind: .ink, ink: [line], size: PageSize(50_000, 30_000))
+        let image = try XCTUnwrap(model.inkPicture(huge, key: "huge", displayScale: 3))
+        XCTAssertLessThanOrEqual(image.size.width * image.scale, 1_100)
+    }
+
     // MARK: Order keys and list moves
 
     func testOrderKeysStayStrictlyIncreasing() {
@@ -255,6 +402,66 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertEqual(try liveCards(h).count, 2)
     }
 
+    func testEditingTextKeepsItsStyling() async throws {
+        let bold = TextAttributes(bold: true)
+        let link = TextAttributes(link: TextLink(url: "https://example.com"))
+        var text = RichText(paragraphs: [Paragraph(runs: [TextRun("Force", bold), TextRun(" = ma")], align: .center),
+                                         Paragraph(runs: [TextRun("see", link)], list: .bullet)])
+        text = CardText.edited(text, to: "Force = m·a\nsee")
+        XCTAssertEqual(text.paragraphs[0].runs, [TextRun("Force", bold), TextRun(" = m·a")])
+        XCTAssertEqual(text.paragraphs[0].align, .center)
+        XCTAssertEqual(text.paragraphs[1], Paragraph(runs: [TextRun("see", link)], list: .bullet))
+        text = CardText.edited(text, to: "Force = m·a\nsee more")
+        XCTAssertEqual(text.paragraphs[1].runs, [TextRun("see", link), TextRun(" more")], "typing after a link does not extend it")
+        text = CardText.edited(text, to: "Forces = m·a\nsee more")
+        XCTAssertEqual(text.paragraphs[0].runs[0], TextRun("Forces", bold), "typing inside bold text is bold")
+        text = CardText.edited(text, to: "Forces\n = m·a\nsee more")
+        XCTAssertEqual(text.paragraphs.map { $0.align }, [.center, .center, .natural], "a split paragraph keeps its style")
+        XCTAssertEqual(text.paragraphs.map { $0.list }, [.plain, .plain, .bullet])
+        XCTAssertEqual(text.plainText, "Forces\n = m·a\nsee more")
+        XCTAssertEqual(CardText.edited(RichText(plain: "a"), to: "ab"), RichText(plain: "ab"))
+        XCTAssertEqual(CardText.edited(nil, to: "x\ny"), RichText(plain: "x\ny"))
+
+        // Through the editor: a styled side keeps its bold after a typing pause.
+        let h = harness()
+        try await h.run("card.update", try JSONValue.parse(
+            #"{"ref": "card:FIXTUREDOC03/FIXTURECRD01", "front": {"text": {"paragraphs": [{"runs": [{"text": "Force", "attrs": {"bold": true}}, {"text": " = ma"}]}]}}}"#))
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        let field = CardField(card: Fixtures.card1, side: .front)
+        model.focus = field
+        model.setText("Force = m a", for: field)
+        await model.flush()
+        let front = try XCTUnwrap(try liveCards(h).first?.front.text)
+        XCTAssertEqual(front.plainText, "Force = m a")
+        XCTAssertEqual(front.paragraphs[0].runs.first, TextRun("Force", bold))
+    }
+
+    func testReadOnlyMenusKeepWhatChangesNothingAndStudyPanelsResolveByID() {
+        let h = harness()
+        h.app.commands.register(CommandDescriptor(id: "test.speakCard", title: "Speak Card", summary: "Read a card aloud.",
+                                                  effect: .read, owner: "test")) { _, _ in [:] }
+        h.app.ui.menus.register(MenuItemDescriptor(id: "test.card.speak", title: "Speak", location: .card, order: 50,
+                                                   owner: "test", command: "test.speakCard"))
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        let editable = model.menuItems(Fixtures.card1).map { $0.id }
+        XCTAssertTrue(editable.contains("test.card.speak"))
+        XCTAssertTrue(editable.contains("studyeditor.card.delete"))
+        h.session.readOnly = true
+        XCTAssertEqual(model.menuItems(Fixtures.card1).map { $0.id }, ["test.card.speak"])
+
+        // Practice and Smart Learn appear once the study sessions feature registers exactly these panel ids.
+        XCTAssertNil(model.practicePanel)
+        XCTAssertNil(model.smartLearnPanel)
+        for id in [StudySetModel.practicePanelID, StudySetModel.smartLearnPanelID] {
+            h.app.ui.panels.register(PanelDescriptor(id: id, title: id, icon: "rectangle.on.rectangle", placement: .sheet,
+                                                     order: 0, owner: "studysession", docKinds: [.studySet]) { _ in
+                AnyView(EmptyView())
+            })
+        }
+        XCTAssertEqual(model.practicePanel?.id, "studysession.practice")
+        XCTAssertEqual(model.smartLearnPanel?.id, "studysession.smartLearn")
+    }
+
     // MARK: Paste
 
     func testPasteFollowsTheSideModeWhenTheContentAllows() {
@@ -290,12 +497,88 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertNil(CardPaste.fragment(from: Data("{}".utf8)))
     }
 
-    func testPicturesKeepTheirFormat() throws {
+    func testLassoedInkRendersAsABoundedPicture() throws {
+        let wide = Stroke(style: InkStyle(), points: [StrokePoint(x: 0, y: 0, width: 2, height: 2),
+                                                      StrokePoint(x: 50_000, y: 800, width: 2, height: 2)])
+        let png = try XCTUnwrap(CardPaste.imageData(from: CardFragment(items: [Item.makeStroke(wide)], assets: [:])))
+        let image = try XCTUnwrap(UIImage(data: png)?.cgImage)
+        XCTAssertLessThanOrEqual(max(image.width, image.height), CardImages.maxPixels + 1)
+    }
+
+    // MARK: Pictures
+
+    /// A picture `width` × `height` px: grey and opaque, or RGBA with alpha.
+    private func picture(width: Int, height: Int, alpha: Bool, type: UTType) throws -> Data {
+        let context = try XCTUnwrap(alpha
+            ? CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            : CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                        space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue))
+        context.setFillColor(CGColor(gray: 0.4, alpha: alpha ? 0.5 : 1))
+        context.fill(CGRect(x: 0, y: 0, width: width / 2, height: height))
+        let image = try XCTUnwrap(context.makeImage())
+        let out = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(out as CFMutableData, type.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return out as Data
+    }
+
+    private func pixelSize(_ data: Data) throws -> (width: Int, height: Int) {
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data as CFData, nil))
+        let properties = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
+        let width = try XCTUnwrap((properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue)
+        let height = try XCTUnwrap((properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue)
+        return (width, height)
+    }
+
+    func testPicturesAreBoundedAndReencodedByTransparency() throws {
+        // Small PNG and JPEG files are kept byte for byte.
         let png = try XCTUnwrap(CardImages.normalized(Fixtures.pngData))
         XCTAssertEqual(png.ext, "png")
         XCTAssertEqual(png.data, Fixtures.pngData)
-        XCTAssertEqual(CardImages.normalized(Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00]))?.ext, "jpg")
+        let smallJPEG = try picture(width: 64, height: 48, alpha: false, type: .jpeg)
+        XCTAssertEqual(CardImages.normalized(smallJPEG)?.ext, "jpg")
+        XCTAssertEqual(CardImages.normalized(smallJPEG)?.data, smallJPEG)
         XCTAssertNil(CardImages.normalized(Data("not a picture".utf8)))
+        XCTAssertNil(CardImages.normalized(Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00])), "a JPEG header alone is not a picture")
+
+        // A large opaque picture in another format (a camera photo) becomes a JPEG at most maxPixels wide.
+        let tiff = try picture(width: 3000, height: 2000, alpha: false, type: .tiff)
+        let photo = try XCTUnwrap(CardImages.normalized(tiff))
+        XCTAssertEqual(photo.ext, "jpg")
+        XCTAssertEqual([UInt8](photo.data.prefix(3)), [0xFF, 0xD8, 0xFF])
+        let size = try pixelSize(photo.data)
+        XCTAssertEqual(max(size.width, size.height), CardImages.maxPixels)
+        XCTAssertEqual(Double(size.width) / Double(size.height), 1.5, accuracy: 0.01, "the aspect ratio is kept")
+        XCTAssertLessThan(photo.data.count, tiff.count)
+
+        // With alpha it stays lossless; a large JPEG shrinks too.
+        let clear = try XCTUnwrap(CardImages.normalized(try picture(width: 2500, height: 400, alpha: true, type: .tiff)))
+        XCTAssertEqual(clear.ext, "png")
+        XCTAssertEqual(try pixelSize(clear.data).width, CardImages.maxPixels)
+        let bigJPEG = try XCTUnwrap(CardImages.normalized(try picture(width: 4096, height: 1024, alpha: false, type: .jpeg)))
+        XCTAssertEqual(bigJPEG.ext, "jpg")
+        XCTAssertEqual(try pixelSize(bigJPEG.data).width, CardImages.maxPixels)
+    }
+
+    func testListSlotsDecodeThumbnailsAndSetImageStoresABoundedPhoto() async throws {
+        let h = harness()
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        await model.setImage(try picture(width: 3000, height: 2000, alpha: false, type: .tiff), card: Fixtures.card1, side: .back)
+        let back = try XCTUnwrap(try liveCards(h).first?.back)
+        XCTAssertEqual(back.kind, .image)
+        let asset = try XCTUnwrap(back.asset)
+        XCTAssertEqual(asset.ext, "jpg")
+        let stored = try pixelSize(try h.assets.data(asset, doc: Fixtures.studySetID))
+        XCTAssertEqual(max(stored.width, stored.height), CardImages.maxPixels)
+
+        let small = await model.picture(asset, maxPixels: 300)
+        let thumbnail = try XCTUnwrap(small)
+        XCTAssertLessThanOrEqual(max(thumbnail.size.width * thumbnail.scale, thumbnail.size.height * thumbnail.scale), 300)
+        let large = await model.picture(asset, maxPixels: 1680)
+        let full = try XCTUnwrap(large)
+        XCTAssertEqual(full.size.width * full.scale, 1680, accuracy: 1)
     }
 
     // MARK: Menus
