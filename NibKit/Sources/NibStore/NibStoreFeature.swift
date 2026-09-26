@@ -39,7 +39,12 @@ public enum NibStoreFeature: NibFeature {
         // A closed document was flushed by the workspace; drop what the store remembers of it.
         app.events.subscribe { e in
             guard e.type == NibEventType.docClosed, let doc = e.doc else { return }
-            MainActor.assumeIsolated { store.forget(doc) }
+            // The workspace emits it on the main actor; any other emitter is hopped over.
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { store.forget(doc) }
+            } else {
+                Task { @MainActor in store.forget(doc) }
+            }
         }
     }
 }

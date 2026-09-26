@@ -65,178 +65,14 @@ enum PackageCodec {
         return try (json as NSData).compressed(using: .lzfse) as Data
     }
 
-    /// Pages above this many JSON bytes take the chunked decode below.
-    static let chunkedDecodeMinimum = 64 * 1024
-
-    // ponytail: `Stroke.init(from:)` unpacks every point float through a string-keyed setter, which dominates decoding
-    // a big page (and more so in Debug builds). So big pages are cut into chunks decoded in parallel, and the points of
-    // top-level strokes skip that path: the scan empties their `ptsB64` strings and `fullPoints` fills them back in.
-    // A fullFormat fast path in `Stroke.unpack` (NibContracts) would make most of this unnecessary.
+    // ponytail: `JSONDecoder` is slow for big pages, most of all in Debug builds: `Stroke.init(from:)` unpacks every
+    // point float through a string-keyed setter and `Item.init(from:)` probes 19 keys per item. `PageReader` builds the
+    // stroke items this encoder writes directly and hands everything else to `JSONDecoder`. A fullFormat fast path in
+    // `Stroke.unpack` (NibContracts) would make the points part of it unnecessary.
     static func decodeItems(_ data: Data) throws -> [Item] {
         let json = try (data as NSData).decompressed(using: .lzfse) as Data
-        let chunks = json.withUnsafeBytes { decodeChunks($0, count: max(1, ProcessInfo.processInfo.activeProcessorCount)) }
-        guard !chunks.isEmpty else { return try JSONDecoder().decode([Item].self, from: json) }
-        var parts = [[Item]?](repeating: nil, count: chunks.count)
-        parts.withUnsafeMutableBufferPointer { buffer in
-            let out = buffer // each iteration writes only its own slot
-            DispatchQueue.concurrentPerform(iterations: chunks.count) { i in
-                out[i] = try? decode(chunks[i])
-            }
-        }
-        let decoded = parts.compactMap { $0 }
-        // A chunk that does not decode on its own: decode the whole page, which reports the real error.
-        guard decoded.count == chunks.count else { return try JSONDecoder().decode([Item].self, from: json) }
-        return Array(decoded.joined())
-    }
-
-    /// A JSON array of whole top-level elements of a page, in which the point strings of top-level strokes
-    /// (`[i].stroke.ptsB64`) are emptied; `points` holds them (unescaped base64) by element index within the chunk.
-    struct DecodeChunk {
-        var json = Data()
-        var points: [(index: Int, base64: Data)] = []
-    }
-
-    static func decode(_ chunk: DecodeChunk) throws -> [Item] {
-        var items = try JSONDecoder().decode([Item].self, from: chunk.json)
-        for (index, base64) in chunk.points {
-            guard items.indices.contains(index), items[index].stroke != nil, let data = Data(base64Encoded: base64) else {
-                throw NibError(.internalError, "stroke points do not match the page")
-            }
-            items[index].stroke?.points = fullPoints(data)
-        }
-        return items
-    }
-
-    /// Exactly what `Stroke.init(from:)` makes of `ptsB64` bytes: little-endian Float32s in `StrokePoint.fullFormat`
-    /// order, a trailing partial point dropped.
-    static func fullPoints(_ data: Data) -> [StrokePoint] {
-        let stride = StrokePoint.fullStride
-        var floats = [Float](repeating: 0, count: data.count / MemoryLayout<Float>.size)
-        _ = floats.withUnsafeMutableBufferPointer { data.copyBytes(to: $0) }
-        return floats.withUnsafeBufferPointer { buffer -> [StrokePoint] in
-            guard let f = buffer.baseAddress else { return [] }
-            var out: [StrokePoint] = []
-            out.reserveCapacity(buffer.count / stride)
-            var i = 0
-            while i + stride <= buffer.count {
-                out.append(StrokePoint(x: f[i], y: f[i + 1], t: f[i + 2], force: f[i + 3], azimuth: f[i + 4],
-                                       altitude: f[i + 5], roll: f[i + 6], width: f[i + 7], height: f[i + 8],
-                                       opacity: f[i + 9]))
-                i += stride
-            }
-            return out
-        }
-    }
-
-    /// `fullPoints` hard-codes this field order.
-    static let fullPointsMatchContract = StrokePoint.fullFormat
-        == ["x", "y", "t", "force", "azimuth", "altitude", "roll", "width", "height", "opacity"]
-
-    private static let quote = UInt8(ascii: "\""), backslash = UInt8(ascii: "\\"), slash = UInt8(ascii: "/")
-    private static let strokeKey = Array("stroke".utf8), pointsKey = Array("ptsB64".utf8)
-
-    /// Cuts the top-level JSON array in `bytes` into up to `count` chunks of whole elements of about equal size, in
-    /// one scan that tracks nesting depth, skips strings (escapes included) and notes the keys at depth 2 (item) and
-    /// 3 (stroke). Returns no chunks for small input or input that does not start with `[`.
-    static func decodeChunks(_ bytes: UnsafeRawBufferPointer, count: Int) -> [DecodeChunk] {
-        let n = bytes.count
-        guard count > 0, n >= chunkedDecodeMinimum, let raw = bytes.baseAddress else { return [] }
-        let base = raw.assumingMemoryBound(to: UInt8.self)
-        let comma = UInt8(ascii: ","), colon = UInt8(ascii: ":")
-        let openArray = UInt8(ascii: "["), openObject = UInt8(ascii: "{")
-        let closeArray = UInt8(ascii: "]"), closeObject = UInt8(ascii: "}")
-        guard base[0] == openArray else { return [] }
-
-        var cuts: [(offset: Int, element: Int)] = [] // commas that end a chunk, and the element after each
-        var strips: [(element: Int, open: Int, close: Int)] = [] // quotes around point strings to empty
-        var depth = 0
-        var element = 0
-        var inStroke = false // depth 2: the last key was "stroke"
-        var atPoints = false // depth 3: the last key was "ptsB64"
-        var i = 0
-        while i < n {
-            let b = base[i]
-            if b == quote {
-                guard let close = closingQuote(base, from: i + 1, end: n) else { return [] }
-                if depth == 2 || depth == 3 {
-                    var m = close + 1
-                    while m < n, base[m] == 0x20 || base[m] == 0x0A || base[m] == 0x0D || base[m] == 0x09 { m += 1 }
-                    let length = close - i - 1
-                    if m < n, base[m] == colon {
-                        let key: [UInt8] = length == 6 ? (depth == 2 ? strokeKey : pointsKey) : []
-                        let matches = !key.isEmpty && memcmp(base + i + 1, key, 6) == 0
-                        if depth == 2 { inStroke = matches } else { atPoints = matches }
-                    } else if depth == 3, inStroke, atPoints, length > 0, fullPointsMatchContract {
-                        strips.append((element, i, close))
-                    }
-                }
-                i = close + 1
-                continue
-            }
-            if b == openArray || b == openObject {
-                depth += 1
-            } else if b == closeArray || b == closeObject {
-                depth -= 1
-            } else if b == comma, depth == 1 {
-                element += 1
-                if cuts.count < count - 1, i >= n / count * (cuts.count + 1) { cuts.append((i, element)) }
-            }
-            i += 1
-        }
-
-        var chunks: [DecodeChunk] = []
-        var start = 1
-        var first = 0
-        var s = 0
-        for cut in cuts + [(offset: n, element: element + 1)] {
-            var chunk = DecodeChunk()
-            chunk.json.append(openArray)
-            var from = start
-            while s < strips.count, strips[s].close < cut.offset {
-                let strip = strips[s]
-                s += 1
-                // Only `\/` escapes (what JSONEncoder writes into base64) are unescaped here; anything else is left
-                // for the regular decoder.
-                guard let base64 = unescapedSlashes(base, from: strip.open + 1, to: strip.close) else { continue }
-                chunk.json.append(base + from, count: strip.open + 1 - from)
-                chunk.points.append((strip.element - first, base64))
-                from = strip.close
-            }
-            chunk.json.append(base + from, count: cut.offset - from)
-            if cut.offset < n { chunk.json.append(closeArray) }
-            chunks.append(chunk)
-            start = cut.offset + 1
-            first = cut.element
-        }
-        return chunks
-    }
-
-    /// The offset of the quote that closes a JSON string whose body starts at `from`: the next quote preceded by an
-    /// even number of backslashes.
-    private static func closingQuote(_ base: UnsafePointer<UInt8>, from: Int, end: Int) -> Int? {
-        var j = from
-        while let q = memchr(base + j, Int32(quote), end - j) {
-            let k = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(q))
-            var slashes = 0
-            while base[k - 1 - slashes] == backslash { slashes += 1 }
-            if slashes % 2 == 0 { return k }
-            j = k + 1
-        }
-        return nil
-    }
-
-    /// The string body `base[from..<to]` with `\/` unescaped; nil when it holds any other escape.
-    private static func unescapedSlashes(_ base: UnsafePointer<UInt8>, from: Int, to: Int) -> Data? {
-        var out = Data(capacity: to - from)
-        var s = from
-        while let p = memchr(base + s, Int32(backslash), to - s) {
-            let at = UnsafeRawPointer(base).distance(to: UnsafeRawPointer(p))
-            guard at + 1 < to, base[at + 1] == slash else { return nil }
-            out.append(base + s, count: at - s)
-            s = at + 1 // keeps the slash
-        }
-        out.append(base + s, count: to - s)
-        return out
+        if let page = PageReader.read(json) { return page.items }
+        return try JSONDecoder().decode([Item].self, from: json)
     }
 
     // MARK: Merge
@@ -330,6 +166,340 @@ enum PackageCodec {
     static func isExpired<T: LWWRecord>(_ record: T, now: Date) -> Bool {
         guard record.deleted else { return false }
         return Double(record.rev.wallMs) < (now.timeIntervalSince1970 - tombstoneLifetime) * 1000
+    }
+}
+
+/// Reads a page file's `[Item]` JSON. Stroke items exactly as `PackageCodec.encodeItems` writes them (sorted keys, no
+/// whitespace, plain ASCII strings, points in `ptsB64`) are built straight from the bytes; every other element, and
+/// every stroke holding a value this reader is not sure about, goes through `JSONDecoder` (in one batch). So the items
+/// are always the ones `JSONDecoder().decode([Item].self, from: json)` returns. `read` returns nil when the JSON is
+/// not a plain top-level array or an element does not decode: the caller then decodes the whole page, which also
+/// reports the error.
+struct PageReader {
+    struct Page {
+        var items: [Item]
+        /// How many elements went through `JSONDecoder`.
+        var decodedElements: Int
+    }
+
+    static func read(_ json: Data) -> Page? {
+        json.withUnsafeBytes { raw -> Page? in
+            guard raw.count >= 2, let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            let scratch = UnsafeMutableRawPointer.allocate(byteCount: raw.count, alignment: 1)
+            defer { scratch.deallocate() }
+            var reader = PageReader(p: base, n: raw.count, scratch: scratch)
+            return reader.page()
+        }
+    }
+
+    /// True when `StrokePoint` is ten `Float`s in `fullFormat` order on a little-endian host, i.e. laid out exactly
+    /// like `ptsB64` bytes, so points are copied instead of assembled one by one.
+    static let pointsAreRawFloats: Bool = {
+        let fields: [PartialKeyPath<StrokePoint>] = [\.x, \.y, \.t, \.force, \.azimuth, \.altitude, \.roll, \.width,
+                                                     \.height, \.opacity]
+        let order = ["x", "y", "t", "force", "azimuth", "altitude", "roll", "width", "height", "opacity"]
+        return StrokePoint.fullFormat == order && StrokePoint.fullStride == order.count
+            && MemoryLayout<StrokePoint>.size == 40 && MemoryLayout<StrokePoint>.stride == 40 && 1.littleEndian == 1
+            && fields.indices.allSatisfy { MemoryLayout<StrokePoint>.offset(of: fields[$0]) == $0 * 4 }
+    }()
+
+    /// Exactly what `Stroke.init(from:)` makes of decoded `ptsB64` bytes: little-endian Float32s in
+    /// `StrokePoint.fullFormat` order, a trailing partial point dropped.
+    static func points(_ data: Data) -> [StrokePoint] {
+        let count = data.count / (StrokePoint.fullStride * MemoryLayout<Float>.size)
+        guard pointsAreRawFloats else { return assembledPoints(data) }
+        return [StrokePoint](unsafeUninitializedCapacity: count) { buffer, initialized in
+            data.withUnsafeBytes { raw in
+                if count > 0, let from = raw.baseAddress, let to = buffer.baseAddress {
+                    UnsafeMutableRawPointer(to).copyMemory(from: from, byteCount: count * MemoryLayout<StrokePoint>.stride)
+                }
+            }
+            initialized = count
+        }
+    }
+
+    /// `points` for a `StrokePoint` layout that does not match the bytes: `Stroke.unpack` over `fullFormat`, spelled out.
+    static func assembledPoints(_ data: Data) -> [StrokePoint] {
+        let fields = StrokePoint.fullFormat
+        let stride = fields.count
+        var floats = [Float](repeating: 0, count: data.count / MemoryLayout<Float>.size)
+        _ = floats.withUnsafeMutableBufferPointer { data.copyBytes(to: $0) }
+        var out: [StrokePoint] = []
+        guard stride > 0 else { return out }
+        out.reserveCapacity(floats.count / stride)
+        var i = 0
+        while i + stride <= floats.count {
+            var point = StrokePoint(x: 0, y: 0, t: Float(out.count) * 0.008)
+            for (k, field) in fields.enumerated() {
+                switch field {
+                case "x": point.x = floats[i + k]
+                case "y": point.y = floats[i + k]
+                case "t": point.t = floats[i + k]
+                case "force": point.force = floats[i + k]
+                case "azimuth": point.azimuth = floats[i + k]
+                case "altitude": point.altitude = floats[i + k]
+                case "roll": point.roll = floats[i + k]
+                case "width": point.width = floats[i + k]
+                case "height": point.height = floats[i + k]
+                case "opacity": point.opacity = floats[i + k]
+                default: break
+                }
+            }
+            out.append(point)
+            i += stride
+        }
+        return out
+    }
+
+    private let p: UnsafePointer<UInt8>
+    private let n: Int
+    /// Room for the unescaped base64 of one stroke (a page's size is enough for any of its strings).
+    private let scratch: UnsafeMutableRawPointer
+    /// Style objects decoded on this page so far: where their JSON is, and the style it decodes to. Strokes drawn
+    /// with one pen share byte-identical style JSON, so each is decoded once.
+    private var styles: [(start: Int, count: Int, style: InkStyle)] = []
+
+    private mutating func page() -> Page? {
+        guard p[0] == 0x5B, p[n - 1] == 0x5D else { return nil } // [ … ]
+        var items: [Item] = []
+        var others: [(index: Int, start: Int, end: Int)] = []
+        var i = 1
+        while i < n - 1 {
+            if let read = stroke(at: i) {
+                items.append(read.item)
+                i = read.end
+            } else {
+                guard let end = valueEnd(i) else { return nil }
+                others.append((items.count, i, end))
+                items.append(Item(id: NibID(""), kind: .stroke)) // replaced by the batch decode below
+                i = end
+            }
+            if i == n - 1 { break }
+            guard p[i] == 0x2C, i + 1 < n - 1 else { return nil } // a comma, then another element
+            i += 1
+        }
+        guard !others.isEmpty else { return Page(items: items, decodedElements: 0) }
+
+        var batch = Data([0x5B])
+        for (k, other) in others.enumerated() {
+            if k > 0 { batch.append(0x2C) }
+            batch.append(p + other.start, count: other.end - other.start)
+        }
+        batch.append(0x5D)
+        guard let decoded = try? JSONDecoder().decode([Item].self, from: batch), decoded.count == others.count else {
+            return nil
+        }
+        for (k, other) in others.enumerated() { items[other.index] = decoded[k] }
+        return Page(items: items, decodedElements: others.count)
+    }
+
+    /// A stroke item in the exact form `encodeItems` writes, built the way `Item.init(from:)` and `Stroke.init(from:)`
+    /// would; nil for anything else (other kinds, other keys, escapes, unusual numbers), which `JSONDecoder` reads.
+    private mutating func stroke(at start: Int) -> (item: Item, end: Int)? {
+        var i = start
+        guard lit(&i, "{") else { return nil }
+        var attachedTo: String?
+        var createdBy: String?
+        if lit(&i, #""attachedTo":"#) {
+            guard let s = plainString(&i), lit(&i, ",") else { return nil }
+            attachedTo = s
+        }
+        if lit(&i, #""createdBy":"#) {
+            guard let s = plainString(&i), lit(&i, ",") else { return nil }
+            createdBy = s
+        }
+        guard lit(&i, #""deleted":"#), let deleted = bool(&i),
+              lit(&i, #","id":"#), let id = plainString(&i),
+              lit(&i, #","kind":"stroke","layer":"#), let layer = int(&i),
+              lit(&i, #","locked":"#), let locked = bool(&i),
+              lit(&i, #","rev":"#), let revision = rev(&i),
+              lit(&i, #","stroke":{"ptsB64":"#), let samples = points(&i),
+              lit(&i, #","style":"#), let inkStyle = style(&i),
+              lit(&i, #","t0":"#), let t0 = number(&i) else { return nil }
+        var tapeRevealed = false
+        if lit(&i, #","tapeRevealed":"#) {
+            guard let b = bool(&i) else { return nil }
+            tapeRevealed = b
+        }
+        guard lit(&i, #"},"z":"#), let z = plainString(&i), lit(&i, "}") else { return nil }
+        var item = Item(id: NibID(id), kind: .stroke, z: z, layer: layer, locked: locked,
+                        attachedTo: attachedTo.map { NibID($0) }, createdBy: createdBy,
+                        stroke: Stroke(style: inkStyle, points: samples, t0: t0, tapeRevealed: tapeRevealed))
+        item.rev = revision
+        item.deleted = deleted
+        return (item, i)
+    }
+
+    // MARK: Values
+
+    private func lit(_ i: inout Int, _ s: StaticString) -> Bool {
+        let count = s.utf8CodeUnitCount
+        guard n - i >= count, memcmp(p + i, s.utf8Start, count) == 0 else { return false }
+        i += count
+        return true
+    }
+
+    private func bool(_ i: inout Int) -> Bool? {
+        if lit(&i, "true") { return true }
+        if lit(&i, "false") { return false }
+        return nil
+    }
+
+    /// A JSON integer of at most 18 digits. Callers match the `,` or `}` after it, so a fraction or exponent fails.
+    private func int(_ i: inout Int) -> Int? {
+        var j = i
+        let negative = j < n && p[j] == 0x2D // -
+        if negative { j += 1 }
+        let first = j
+        var value = 0
+        while j < n, p[j] >= 0x30, p[j] <= 0x39, j - first < 18 {
+            value = value * 10 + Int(p[j] - 0x30)
+            j += 1
+        }
+        guard j > first, p[first] != 0x30 || j == first + 1 else { return nil } // JSON has no leading zeros
+        i = j
+        return negative ? -value : value
+    }
+
+    /// A non-negative JSON number without exponent. `Double(String)` and `JSONDecoder` both read the decimal text
+    /// with correct rounding (strtod), so they agree. Callers match the `,` or `}` after it, so an exponent fails.
+    private func number(_ i: inout Int) -> Double? {
+        var j = i
+        while j < n, p[j] >= 0x30, p[j] <= 0x39 { j += 1 }
+        let digits = j - i
+        guard digits > 0, digits <= 20, p[i] != 0x30 || digits == 1 else { return nil }
+        if j < n, p[j] == 0x2E { // .
+            j += 1
+            let fraction = j
+            while j < n, p[j] >= 0x30, p[j] <= 0x39 { j += 1 }
+            guard j > fraction, j - fraction <= 20 else { return nil }
+        }
+        guard let value = Double(String(decoding: UnsafeBufferPointer(start: p + i, count: j - i), as: UTF8.self)),
+              value.isFinite else { return nil }
+        i = j
+        return value
+    }
+
+    /// A JSON string of printable ASCII without escapes.
+    private func plainString(_ i: inout Int) -> String? {
+        guard i < n, p[i] == 0x22 else { return nil }
+        var j = i + 1
+        while j < n, p[j] != 0x22 {
+            guard p[j] >= 0x20, p[j] <= 0x7E, p[j] != 0x5C else { return nil }
+            j += 1
+        }
+        guard j < n else { return nil }
+        let s = String(decoding: UnsafeBufferPointer(start: p + i + 1, count: j - i - 1), as: UTF8.self)
+        i = j + 1
+        return s
+    }
+
+    /// A revision string in the plain form `Rev(string:)` reads: "<wallMs>.<counter>.<device>" in hex of at most
+    /// 16, 8 and 8 digits. Looser spellings `Rev(string:)` also accepts are left to `JSONDecoder`.
+    private func rev(_ i: inout Int) -> Rev? {
+        guard i < n, p[i] == 0x22,
+              let wall = hex(from: i + 1, atMost: 16), p[wall.end] == 0x2E,
+              let counter = hex(from: wall.end + 1, atMost: 8), p[counter.end] == 0x2E,
+              let device = hex(from: counter.end + 1, atMost: 8), p[device.end] == 0x22 else { return nil }
+        i = device.end + 1
+        return Rev(wallMs: wall.value, counter: UInt32(truncatingIfNeeded: counter.value),
+                   device: UInt32(truncatingIfNeeded: device.value))
+    }
+
+    /// A run of 1…`atMost` hex digits at `start`, its value and the offset after it (a byte exists there). strtoull
+    /// reads exactly the run: it starts with a digit (no space or sign to skip) and is not "0x"-prefixed.
+    private func hex(from start: Int, atMost: Int) -> (value: UInt64, end: Int)? {
+        guard start + 1 < n else { return nil }
+        let first = p[start]
+        guard (first >= 0x30 && first <= 0x39) || (first >= 0x61 && first <= 0x66) || (first >= 0x41 && first <= 0x46),
+              (p[start + 1] | 0x20) != 0x78 else { return nil } // x or X
+        var stop: UnsafeMutablePointer<CChar>?
+        let value = strtoull(UnsafeRawPointer(p + start).assumingMemoryBound(to: CChar.self), &stop, 16)
+        guard let stop = stop else { return nil }
+        let end = UnsafeRawPointer(p).distance(to: UnsafeRawPointer(stop))
+        guard end > start, end - start <= atMost, end < n else { return nil }
+        return (value, end)
+    }
+
+    /// The `ptsB64` string, whose only escapes may be `\/` (all `JSONEncoder` puts in base64), decoded like
+    /// `Stroke.init(from:)` does.
+    private func points(_ i: inout Int) -> [StrokePoint]? {
+        guard i < n, p[i] == 0x22, let quote = memchr(p + i + 1, 0x22, n - i - 1) else { return nil }
+        let end = UnsafeRawPointer(p).distance(to: UnsafeRawPointer(quote))
+        var s = i + 1
+        var length = 0
+        while s < end, let hit = memchr(p + s, 0x5C, end - s) {
+            let at = UnsafeRawPointer(p).distance(to: UnsafeRawPointer(hit))
+            guard at + 1 < end, p[at + 1] == 0x2F else { return nil } // only \/
+            (scratch + length).copyMemory(from: p + s, byteCount: at - s)
+            length += at - s
+            s = at + 1 // keeps the slash
+        }
+        (scratch + length).copyMemory(from: p + s, byteCount: end - s)
+        length += end - s
+        guard let data = Data(base64Encoded: Data(bytesNoCopy: scratch, count: length, deallocator: .none)) else {
+            return nil
+        }
+        i = end + 1
+        return PageReader.points(data)
+    }
+
+    private mutating func style(_ i: inout Int) -> InkStyle? {
+        guard i < n, p[i] == 0x7B else { return nil } // {
+        for known in styles where known.count <= n - i && memcmp(p + i, p + known.start, known.count) == 0 {
+            i += known.count
+            return known.style
+        }
+        guard let end = valueEnd(i),
+              let style = try? JSONDecoder().decode(InkStyle.self, from: Data(bytes: p + i, count: end - i)) else {
+            return nil
+        }
+        if styles.count < 64 { styles.append((i, end - i, style)) }
+        i = end
+        return style
+    }
+
+    // MARK: Structure
+
+    /// Where the JSON value starting at `start` ends (exclusive): strings and containers are skipped whole (escapes and
+    /// nesting included), scalars end before the next `,`, `]` or `}`. It does not validate; `JSONDecoder` does.
+    private func valueEnd(_ start: Int) -> Int? {
+        var depth = 0
+        var i = start
+        while i < n {
+            let b = p[i]
+            if b == 0x22 { // "
+                guard let close = closingQuote(i + 1) else { return nil }
+                i = close + 1
+                if depth == 0 { return i }
+                continue
+            }
+            if b == 0x7B || b == 0x5B { // { [
+                depth += 1
+            } else if b == 0x7D || b == 0x5D { // } ]
+                if depth == 0 { return i }
+                depth -= 1
+                if depth == 0 { return i + 1 }
+            } else if b == 0x2C, depth == 0 { // ,
+                return i
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    /// The offset of the quote that closes a JSON string whose body starts at `from`: the next quote preceded by an
+    /// even number of backslashes.
+    private func closingQuote(_ from: Int) -> Int? {
+        var j = from
+        while j < n, let q = memchr(p + j, 0x22, n - j) {
+            let k = UnsafeRawPointer(p).distance(to: UnsafeRawPointer(q))
+            var slashes = 0
+            while p[k - 1 - slashes] == 0x5C { slashes += 1 }
+            if slashes % 2 == 0 { return k }
+            j = k + 1
+        }
+        return nil
     }
 }
 

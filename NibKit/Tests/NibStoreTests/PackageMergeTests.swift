@@ -152,6 +152,8 @@ final class PackageMergeTests: XCTestCase {
             remote[i].rev = clock.tick()
         }
         let data = try PackageCodec.encodeItems(remote)
+        let json = try (data as NSData).decompressed(using: .lzfse) as Data
+        XCTAssertEqual(PageReader.read(json)?.decodedElements, 0, "every stroke is read directly")
 
         // Budget (ARCHITECTURE §20): decode and merge a 1k-stroke page < 50 ms, asserted ×4. Best of five runs (the
         // simulator shares its machine), so the first one also warms the decoder up.
@@ -164,58 +166,124 @@ final class PackageMergeTests: XCTestCase {
         }
         print("decode+merge of a 1k-stroke page: best \(Int(best * 1000)) ms of a 200 ms budget")
 
-        XCTAssertEqual(try PackageCodec.decodeItems(data), remote, "parallel chunks decode in order, losslessly")
+        XCTAssertEqual(try PackageCodec.decodeItems(data), remote, "decoded losslessly, in order")
         XCTAssertEqual(merged.count, 1000)
         XCTAssertEqual(merged.filter(\.deleted).count, 100)
         XCTAssertLessThan(best, 0.05 * 4)
     }
 
-    func testDecodeChunksCutOnlyBetweenTopLevelElements() throws {
-        // Strings hold escaped quotes and backslashes, brackets and commas; objects nest arrays of objects.
-        let element = #"{"a":"x\\\"],[{,","b":[1,{"c":"}]"},{"d":"\\"}],"e":"\""}"#
-        let json = Data(("[" + Array(repeating: element, count: 2000).joined(separator: ",") + "]").utf8)
-        let chunks = json.withUnsafeBytes { PackageCodec.decodeChunks($0, count: 4) }
-        XCTAssertEqual(chunks.count, 4)
-        var total = 0
-        for chunk in chunks {
-            let array = try XCTUnwrap(JSONSerialization.jsonObject(with: chunk.json) as? [[String: Any]])
-            XCTAssertEqual(array.first?["a"] as? String, #"x\"],[{,"#)
-            XCTAssertTrue(chunk.points.isEmpty)
-            total += array.count
-        }
-        XCTAssertEqual(total, 2000)
-        XCTAssertTrue(json.prefix(1000).withUnsafeBytes { PackageCodec.decodeChunks($0, count: 4) }.isEmpty,
-                      "small pages decode in one piece")
-    }
-
-    func testChunkedDecodeKeepsEveryKindOfItemIntact() throws {
-        // Big enough for the chunked path; strokes nested in math items and "ptsB64" keys outside strokes are left to
-        // the regular decoder, top-level stroke points take the fast path.
+    func testPageReaderMatchesJSONDecoderForEveryKindOfItem() throws {
         let clock = HLCClock(device: 7)
-        var items = try XCTUnwrap(Fixtures.sampleContent().1[Fixtures.page1])
-        for s in 0..<300 {
-            let points = (0..<20).map { StrokePoint(x: Float(s) + Float($0) * 0.5, y: Float($0), t: Float($0) * 0.01,
-                                                    force: 0.3, azimuth: 0.2, altitude: 1.1, roll: 0.1, width: 1.5,
-                                                    height: 1.5, opacity: 0.9) }
-            var item = Item.makeStroke(Stroke(style: .defaultPen, points: points, t0: 1_700_000_000))
-            if s % 50 == 0 { item.ext = ["plugin.x": ["ptsB64": "not points"]] }
-            if s % 70 == 0 { item.stroke?.points = [] }
+        let points = (0..<20).map { StrokePoint(x: Float($0) * 0.5, y: -Float($0), t: Float($0) * 0.01, force: 0.3,
+                                                azimuth: 0.2, altitude: 1.1, roll: -0.1, width: 1.5, height: 1.5,
+                                                opacity: 0.9) }
+        var tape = InkStyle.defaultTape
+        tape.tapePattern = AssetRef("0123abcd.png")
+        func stroke(_ id: ElementID, style: InkStyle = .defaultPen, t0: Double = 1_700_000_000.125) -> Item {
+            var item = Item(id: id, kind: .stroke, stroke: Stroke(style: style, points: points, t0: t0))
             item.rev = clock.tick()
-            items.append(item)
+            return item
         }
-        let ink = [Stroke(style: .defaultPencil, points: [StrokePoint(x: 1, y: 2), StrokePoint(x: 3, y: 4)], t0: 1)]
+        var items = try XCTUnwrap(Fixtures.sampleContent().1[Fixtures.page1]) // every kind of item
+        var direct = 2 // the fixture pen and tape strokes
+        items.append(stroke("PLAINSTROKE1"))
+        var revealed = stroke("TAPESTROKE01", style: tape, t0: 0)
+        revealed.stroke?.tapeRevealed = true
+        revealed.deleted = true
+        revealed.locked = true
+        revealed.layer = 3
+        items.append(revealed)
+        var attached = stroke("ATTACHSTROKE", style: .defaultPencil)
+        attached.attachedTo = Fixtures.shapeID
+        attached.createdBy = "plugin:dev.example"
+        attached.stroke?.points = []
+        items.append(attached)
+        var farRev = stroke("FARREVSTROKE", style: .defaultHighlighter, t0: 1e15)
+        farRev.rev = Rev(wallMs: .max, counter: .max, device: .max)
+        items.append(farRev)
+        direct += 4
+        // JSONDecoder reads these: plugin data, an escaped z key, non-ASCII provenance, strokes nested in a math item.
+        var withExt = stroke("EXTSTROKE001")
+        withExt.ext = ["plugin.x": ["ptsB64": "not points", "stroke": ["ptsB64": "AAAA"]]]
+        items.append(withExt)
+        var escaped = stroke("ESCAPEDZ0001")
+        escaped.z = "a/b\"c"
+        items.append(escaped)
+        var unicode = stroke("UNICODE00001")
+        unicode.createdBy = "ai:café"
+        items.append(unicode)
+        let ink = [Stroke(style: .defaultPencil, points: points, t0: 1)]
         var math = Item.makeMath(MathItem(frame: Frame(x: 0, y: 0, w: 10, h: 10), latex: ["x"], sourceInk: ink))
         math.rev = clock.tick()
-        items.insert(math, at: 150)
+        items.append(math)
+        items.append(stroke("LASTSTROKE01"))
+        direct += 1
 
         let data = try PackageCodec.encodeItems(items)
         let json = try (data as NSData).decompressed(using: .lzfse) as Data
-        XCTAssertGreaterThan(json.count, PackageCodec.chunkedDecodeMinimum)
-        let chunks = json.withUnsafeBytes { PackageCodec.decodeChunks($0, count: 3) }
-        XCTAssertEqual(chunks.count, 3)
-        XCTAssertEqual(chunks.map(\.points.count).reduce(0, +), 300 - 5 + 2, "300 strokes, 5 empty, 2 fixture strokes")
-        XCTAssertEqual(try chunks.flatMap { try PackageCodec.decode($0) }, items, "no chunk needs the fallback decode")
+        let page = try XCTUnwrap(PageReader.read(json))
+        XCTAssertEqual(page.items, items)
+        XCTAssertEqual(page.decodedElements, items.count - direct)
+        XCTAssertEqual(try JSONDecoder().decode([Item].self, from: json), items)
         XCTAssertEqual(try PackageCodec.decodeItems(data), items)
+    }
+
+    func testPageReaderLeavesUnusualSpellingsToJSONDecoder() throws {
+        var item = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 2), StrokePoint(x: 3, y: 4)],
+                                          t0: 1_700_000_000.5))
+        item.id = "SPELLSTROKE1"
+        item.rev = Rev(wallMs: 0x1a0dc2f4434, counter: 3, device: 0xdeadbeef)
+        var other = item
+        other.id = "SPELLSTROKE2"
+        let canonical = String(decoding: try PackageCodec.encoder().encode([item, other]), as: UTF8.self)
+        let rev = #""rev":"01a0dc2f4434.00000003.deadbeef""#
+        XCTAssertTrue(canonical.contains(rev))
+        XCTAssertTrue(canonical.contains(#""t0":1700000000.5"#))
+        XCTAssertEqual(PageReader.read(Data(canonical.utf8))?.decodedElements, 0)
+
+        let variants: [(String, String)] = [
+            (#","id":"#, #", "id":"#), // whitespace
+            (rev, #""rev":"01A0DC2F4434.00000003.DEADBEEF""#), // upper-case hex
+            (rev, #""rev":"0x1a0dc2f4434.3.deadbeef""#), // hex prefix
+            (rev, #""rev":"+1a0dc2f4434.3.deadbeef""#), // sign
+            (rev, #""rev":"0000001a0dc2f4434.3.deadbeef""#), // 17 digits
+            (rev, #""rev":"1a0dc2f4434..3.deadbeef""#), // empty part
+            (rev, #""rev":"not a rev""#),
+            (#""t0":1700000000.5"#, #""t0":1.7000000005e9"#), // exponent
+            (#""t0":1700000000.5"#, #""t0":-1700000000.5"#),
+            (#""t0":1700000000.5"#, #""t0":01700000000.5"#), // leading zero
+            (#""t0":1700000000.5"#, #""t0":1700000000."#),
+            (#","t0":1700000000.5"#, #","t0":1700000000.5,"t0":1"#), // duplicate key
+            (#""layer":0"#, #""layer":0.0"#),
+            (#""layer":0"#, #""layer":-0"#),
+            (#""deleted":false"#, #""deleted":null"#),
+            (#""kind":"stroke""#, #""kind":"stroke","future":{"a":[1]}"#), // unknown key
+            (#""stroke":{"ptsB64""#, #""stroke":{"fmt":"xy","ptsB64""#),
+            (#""ptsB64":"AACAPwAAAEA"#, #""ptsB64":"AACAPwAA!EA"#), // not base64
+            (#""ptsB64":"AACAPwAAAEA"#, #""ptsB64":"AACAPwAA\u0041EA"#), // another escape
+            (#""id":"SPELLSTROKE1""#, "\"id\":\"SPELL\tSTROKE1\""), // a raw tab
+            (#""id":"SPELLSTROKE1""#, #""id":"SPELL\"STROKE1""#), // an escaped quote
+            ("}]", "},]"), // trailing comma
+            ("}]", "}] "),
+            ("}]", "}]x"),
+            ("}]", "}"),
+        ]
+        for (target, replacement) in variants {
+            let json = canonical.replacingOccurrences(of: target, with: replacement)
+            XCTAssertNotEqual(json, canonical, replacement)
+            let expected = Result { try JSONDecoder().decode([Item].self, from: Data(json.utf8)) }
+            let actual = Result { try PackageCodec.decodeItems(try (Data(json.utf8) as NSData).compressed(using: .lzfse) as Data) }
+            switch (expected, actual) {
+            case (.success(let e), .success(let a)): XCTAssertEqual(a, e, replacement)
+            case (.failure, .failure): break
+            default: XCTFail("\(replacement): JSONDecoder gave \(expected), the page reader \(actual)")
+            }
+        }
+        for json in ["[]", "[ ]", "[1]", "[null]", "[,]", "]", "[", #"[{"id":"A","kind":"shape"}]"#] {
+            let expected = try? JSONDecoder().decode([Item].self, from: Data(json.utf8))
+            let actual = try? PackageCodec.decodeItems(try (Data(json.utf8) as NSData).compressed(using: .lzfse) as Data)
+            XCTAssertEqual(actual, expected, json)
+        }
     }
 
     func testConflictCopyAppearingAfterLoadIsMergedReportedOnceAndRemoved() throws {
