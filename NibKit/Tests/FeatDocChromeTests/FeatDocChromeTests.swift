@@ -427,6 +427,14 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(context.params, [:])
         XCTAssertEqual(context.presentation, .sheet)
 
+        // Keys beside `id` reach the panel too ({id, block} as well as {id, params: {block}}); `params` wins a tie.
+        try await h.run("panel.open", ["id": "test.thread", "block": "block:D/B", "filter": "open",
+                                       "params": ["filter": "all"]])
+        XCTAssertEqual(window.panelContext("test.thread", presentation: .floating).params,
+                       ["block": "block:D/B", "filter": "all"])
+        XCTAssertNil(PanelOpen.panelParams(["id": "x", "edge": "left"]))
+        XCTAssertEqual(PanelOpen.panelParams(["id": "x", "params": [:]]), [:])
+
         await assertCode(.invalidParams) { try await h.run("panel.open", ["id": "test.thread", "params": "thread"]) }
     }
 

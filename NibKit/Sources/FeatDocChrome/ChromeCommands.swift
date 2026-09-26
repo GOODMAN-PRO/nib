@@ -371,19 +371,15 @@ enum ChromeCommandSupport {
 }
 
 struct PanelOpen: NibCommand {
-    struct Params: Codable {
-        var id: String
-        var edge: String?
-        /// Handed to the panel as `PanelContext.params` (which pages, which thread, `instant: true`).
-        var params: JSONValue?
-    }
+    /// `{id, edge?, params?, …}`: the whole object, because every key besides `id` and `edge` is the panel's.
+    typealias Params = JSONValue
     struct Output: Codable {
         var id: String
         var placement: String
     }
     static let descriptor = CommandDescriptor(
         id: "panel.open", title: "Open Panel",
-        summary: "Open a registered panel by id where the user's placement settings say; params reach the panel; edge docks a floating panel left or right.",
+        summary: "Open a registered panel by id where the user's placement settings say; params (and any other keys) reach the panel; edge docks a floating panel.",
         params: .obj(["id": .str("panel id, e.g. 'chrome.editingSettings', PanelIDs.assistant or a plugin panel id"),
                       "edge": .str("floating panels only: the side edge it rests on",
                                    choices: SidebarSide.allCases.map { $0.rawValue }),
@@ -394,37 +390,55 @@ struct PanelOpen: NibCommand {
                    ["id": "dev.example.stats.panel", "params": ["instant": true]]],
         effect: .session, target: .app)
 
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+    /// `PanelContext.params` (contracts-v2): every key but `id` and `edge`, with the keys of a `params` object merged
+    /// in, so `{id, params: {thread}}` and `{id, thread}` both reach the panel as `{thread}`. nil when the call names
+    /// nothing for the panel (an open panel then keeps what it was opened with).
+    static func panelParams(_ fields: [String: JSONValue]) -> JSONValue? {
+        var merged: [String: JSONValue] = [:]
+        for (key, value) in fields where key != "id" && key != "edge" && key != "params" && value != .null {
+            merged[key] = value
+        }
+        let nested = fields["params"].flatMap { $0 == .null ? nil : $0 }
+        if case .object(let inner)? = nested {
+            for (key, value) in inner { merged[key] = value }
+        }
+        return merged.isEmpty && nested == nil ? nil : .object(merged)
+    }
+
+    static func run(_ p: JSONValue, _ ctx: CommandContext) async throws -> Output {
+        guard case .object(let fields) = p, let id = fields["id"]?.stringValue else {
+            throw NibError.invalid("missing required field 'id'", path: "$.id")
+        }
         var edge: SidebarSide?
-        if let raw = p.edge {
-            guard let parsed = SidebarSide(rawValue: raw) else {
+        if let raw = fields["edge"], raw != .null {
+            guard let parsed = raw.stringValue.flatMap(SidebarSide.init(rawValue:)) else {
                 throw NibError.invalid("edge must be 'left' or 'right'", path: "$.edge")
             }
             edge = parsed
         }
-        if let params = p.params, params != .null {
-            guard case .object = params else { throw NibError.invalid("params must be an object", path: "$.params") }
+        if let nested = fields["params"], nested != .null {
+            guard case .object = nested else { throw NibError.invalid("params must be an object", path: "$.params") }
         }
         let (store, app) = try ChromeCommandSupport.store(ctx)
         let (state, kind) = try ChromeCommandSupport.window(ctx, store)
-        guard let panel = app.ui.panels.get(p.id) else {
+        guard let panel = app.ui.panels.get(id) else {
             let known = app.ui.panels.all.filter { $0.placement != .libraryTab && PanelResolver.accepts($0, kind: kind) }
                 .map { $0.id }
-            throw NibError(.notFound, "unknown panel '\(p.id)'", path: "$.id",
+            throw NibError(.notFound, "unknown panel '\(id)'", path: "$.id",
                            hint: known.isEmpty ? "no document panels are installed"
                                                : "available panels: " + known.prefix(24).joined(separator: ", "))
         }
         guard PanelResolver.accepts(panel, kind: kind) else {
-            throw NibError.invalid("panel '\(p.id)' is not available in \(kind?.rawValue ?? "this") documents", path: "$.id")
+            throw NibError.invalid("panel '\(id)' is not available in \(kind?.rawValue ?? "this") documents", path: "$.id")
         }
         guard let spot = PanelResolver.spot(of: panel, settings: ctx.services.settings) else {
-            throw NibError.invalid("'\(p.id)' is a library panel; it opens in the library, not in a document", path: "$.id")
+            throw NibError.invalid("'\(id)' is a library panel; it opens in the library, not in a document", path: "$.id")
         }
         if edge != nil && spot != .floating {
-            throw NibError(.invalidParams, "edge docks floating panels; '\(p.id)' opens as \(spot.rawValue)",
-                           path: "$.edge", hint: "float it with settings.set chrome.panelPlacement.\(p.id) = floating")
+            throw NibError(.invalidParams, "edge docks floating panels; '\(id)' opens as \(spot.rawValue)",
+                           path: "$.edge", hint: "float it with settings.set chrome.panelPlacement.\(id) = floating")
         }
-        let params = p.params.flatMap { $0 == .null ? nil : $0 }
+        let params = panelParams(fields)
         if params?["instant"]?.boolValue == true { state.cancelTapAnimation() }
         state.open(panel.id, at: spot, params: params)
         if let edge { state.dock(panel.id, to: edge) }
