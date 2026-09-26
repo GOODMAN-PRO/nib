@@ -11,16 +11,23 @@ import NibDesign
 /// own PKCanvasView. The canvas shows the zoom box at magnification = writing width / box width over a render of that
 /// region; finished strokes are converted with `PKBridge` and committed through `CanvasHost.commitStroke` (stroke
 /// processors, then `ink.addStrokes`). Every action is a command, so plugins, the AI and the bridge can do the same.
+///
+/// Wet ink (ARCHITECTURE.md §8.1): a pane stroke stays on the pane's PKCanvasView until a render that includes its dry
+/// ink is on screen. Its content coordinates are page points, so wet strokes stay aligned when the box moves or zooms
+/// (auto-advance, New Line, drags, the slider); only a change of page, or hiding the pane, drops them at once.
 @MainActor
 final class ZoomWindowController: ObservableObject {
     /// Pane layout: 8 pt padding, a 44 pt control row, a 4 pt gap, then the writing area.
     static let padding = NibSpacing.s
     static let rowGap = NibSpacing.xs
-    /// Writing height of a new box: with the row and the padding the pane is its nominal 240 pt.
+    /// Writing height of a new box: with the row and the padding the pane is its nominal 240 pt (DESIGN.md §14.3).
+    /// ponytail: 240 is DESIGN.md's pane height; NibMetrics has no token for it (contract gap reported for F038).
     static let nominalWritingHeight: CGFloat = 240 - 2 * NibSpacing.s - NibMetrics.hitTarget - NibSpacing.xs
     static let writingRadius = NibRadius.concentric(NibRadius.panel, inset: NibSpacing.s)
     /// The highest zoom the slider offers: a box about one word wide.
     private static let narrowestBox = 40.0
+    /// ponytail: `ink.erase` takes at most 20 000 path points (F010's schema, not a contract); longer scrubs go in parts.
+    private static let maxErasePathPoints = 20_000
     private static let log = Logger(subsystem: "app.nib", category: "zoomwindow")
 
     let app: NibApp
@@ -37,12 +44,16 @@ final class ZoomWindowController: ObservableObject {
     @Published private(set) var pageRevision = 0
     /// The last UI command; the next one waits for it, and tests await it.
     private(set) var pending: Task<Void, Never>?
+    /// Wet pane strokes whose commits have landed; the next render that includes them removes them from the pane.
+    private(set) var landed = 0
+    /// Pane strokes handed to `commitStroke` whose changeset has not arrived yet. Only these can land, so ink written
+    /// on the main canvas (or by anyone else) on the same page never removes a pane stroke before its dry render.
+    private(set) var inFlight = 0
 
     private var hosting: UIHostingController<ZoomPane>?
     private var writing: ZoomWritingView?
     private var renderTask: Task<Void, Never>?
-    /// Wet pane strokes whose commits have landed; the next render that includes them removes them from the canvas.
-    private var landed = 0
+    private var shownDoc: DocumentID?
     private var shownPage: PageID?
     private var shownRect: Rect?
     private var maxWritingHeight: CGFloat = 320
@@ -83,6 +94,8 @@ final class ZoomWindowController: ObservableObject {
         }
         hosting = nil
         writing = nil
+        landed = 0
+        inFlight = 0
         host = nil
     }
 
@@ -106,27 +119,34 @@ final class ZoomWindowController: ObservableObject {
         if pane != paneSize { paneSize = pane }
 
         guard visible, canvas.window != nil else {
-            hosting?.view.isHidden = true
+            hidePane()
             return
         }
-        let h = ensurePane(in: container)
+        let h = ensurePane(in: container, above: canvas)
+        let wasHidden = h.view.isHidden
         h.view.isHidden = false
-        let compact = bounds.width < NibMetrics.compactBreakpoint
+        // The iPhone palette sits along the bottom in either orientation (and so does the compact layout's below
+        // 600 pt): dock above it. On a regular-width iPad the palette docks on an edge, so the pane takes the inset.
+        let compact = canvas.traitCollection.userInterfaceIdiom == .phone || bounds.width < NibMetrics.compactBreakpoint
         let bottom = canvas.safeAreaInsets.bottom + (compact ? NibMetrics.canvasBottomInsetCompact : inset)
         let frame = CGRect(x: bounds.minX + inset, y: bounds.maxY - bottom - pane.height, width: pane.width, height: pane.height)
         if h.view.frame != frame { h.view.frame = frame }
-        if writingChanged { scheduleRender() }
+        if wasHidden || writingChanged { scheduleRender() }
     }
 
     /// The box moved or the window opened: follow it with the canvas and a fresh render.
     func stateChanged() {
-        if shownPage != state.page || shownRect != state.rect {
+        let pageChanged = shownDoc != state.doc || shownPage != state.page
+        if pageChanged || shownRect != state.rect {
+            if pageChanged {
+                // Wet ink of another page: its commits (if any are still running) land there, not here.
+                clearWet()
+            }
+            // On the same page the wet strokes stay: they are in page points, so the new zoomScale and contentOffset
+            // keep them aligned, and the render after their commits land removes them.
+            shownDoc = state.doc
             shownPage = state.page
             shownRect = state.rect
-            // ponytail: wet strokes whose commit has not landed vanish until the render after it; a box move
-            // mid-commit is the only way to see that.
-            writing?.dropWet(Int.max)
-            landed = 0
             scheduleRender()
         }
         configureWriting()
@@ -138,35 +158,68 @@ final class ZoomWindowController: ObservableObject {
         return superview.convert(h.view.frame, to: view)
     }
 
-    private func ensurePane(in container: UIView) -> UIHostingController<ZoomPane> {
+    /// Whether the pane is on screen (so renders are worth making).
+    var isPaneShowing: Bool {
+        guard state.isOn, let h = hosting else { return false }
+        return !h.view.isHidden && h.view.superview != nil
+    }
+
+    /// Pane strokes still shown as wet ink.
+    var wetCount: Int { writing?.wetCount ?? 0 }
+
+    /// The pane's writing surface, made with the pane (once per canvas) and kept by the controller, so SwiftUI updates
+    /// never recreate the PKCanvasView.
+    func writingView() -> ZoomWritingView {
+        if let w = writing { return w }
+        let w = ZoomWritingView(frame: .zero)
+        w.onStroke = { [weak self] pk in self?.captured(pk) ?? false }
+        w.onErase = { [weak self] points in self?.erase(points) }
+        writing = w
+        configureWriting()
+        return w
+    }
+
+    private func ensurePane(in container: UIView, above canvas: UIView) -> UIHostingController<ZoomPane> {
         let h: UIHostingController<ZoomPane>
         if let existing = hosting {
             h = existing
         } else {
-            let w = ZoomWritingView(frame: .zero)
-            w.onStroke = { [weak self] pk in self?.captured(pk) }
-            w.onErase = { [weak self] points in self?.erase(points) }
-            writing = w
-            h = UIHostingController(rootView: ZoomPane(controller: self, state: state, writing: w))
+            h = UIHostingController(rootView: ZoomPane(controller: self, state: state, writing: writingView()))
             h.view.backgroundColor = .clear
             h.safeAreaRegions = []
+            h.view.isHidden = true                        // `layout` shows it and renders once it is placed
             hosting = h
-            configureWriting()
-            scheduleRender()
         }
         if h.view.superview !== container {
             h.willMove(toParent: nil)
             h.view.removeFromSuperview()
             h.removeFromParent()
-            if let parent = Self.viewController(of: container) {
-                parent.addChild(h)
-                container.addSubview(h.view)
-                h.didMove(toParent: parent)
+            let parent = Self.viewController(of: container)
+            if let parent { parent.addChild(h) }
+            // Right above the canvas: the window's chrome (palette, bars, HUDs) and its popovers stay above the pane.
+            if canvas.superview === container {
+                container.insertSubview(h.view, aboveSubview: canvas)
             } else {
                 container.addSubview(h.view)
             }
+            if let parent { h.didMove(toParent: parent) }
         }
         return h
+    }
+
+    private func hidePane() {
+        guard let h = hosting, !h.view.isHidden else { return }
+        h.view.isHidden = true
+        renderTask?.cancel()
+        // A hidden pane renders nothing, so its wet ink would go stale; its commits land on the page regardless, and
+        // the render when the pane shows again draws them.
+        clearWet()
+    }
+
+    private func clearWet() {
+        writing?.dropWet(Int.max)
+        landed = 0
+        inFlight = 0
     }
 
     private static func viewController(of view: UIView) -> UIViewController? {
@@ -231,12 +284,27 @@ final class ZoomWindowController: ObservableObject {
         }
     }
 
+    /// The eraser tool's settings, read untyped like the pen style (F010 owns the `eraser.*` keys): its on-screen
+    /// diameter, its mode and the ink tools its Erase Filter lets it erase.
+    func eraserOptions() -> (diameter: Double, mode: String, filter: [String]) {
+        let s = app.settings
+        let size = s.json("eraser.size")?.doubleValue ?? 14
+        let mode = s.json("eraser.mode")?.stringValue.flatMap { ["precision", "standard", "stroke"].contains($0) ? $0 : nil }
+        let filter = InkTool.allCases.filter { s.json("eraser.filter." + $0.rawValue)?.boolValue ?? true }.map { $0.rawValue }
+        return (min(max(size.isFinite ? size : 14, 2), 60), mode ?? "standard", filter)
+    }
+
     private func configureWriting() {
         guard let w = writing, let size = pageSize else { return }
         let style = inkStyle()
-        let policy: PKCanvasViewDrawingPolicy = app.settings.get(NibSettings.stylusMode) == .anyInput ? .anyInput : .pencilOnly
+        // The pane never scrolls, so a finger there has nothing else to do: it writes unless a paired Pencil is set
+        // to be the only thing that draws ("Only Draw with Apple Pencil"), which `.default` follows. That makes the
+        // pane usable on iPhone, which has no Pencil.
+        let anyInput = app.settings.get(NibSettings.stylusMode) == .anyInput
+        let fingersDraw = anyInput || !UIPencilInteraction.prefersPencilOnlyDrawing
         w.configure(box: state.rect, pageSize: size, tool: PKInkingTool(ink: PKBridge.ink(style), width: CGFloat(style.width)),
-                    erasing: session.tool == "eraser", policy: policy, showsZone: autoAdvanceOn)
+                    erasing: session.tool == "eraser", policy: anyInput ? .anyInput : .default, fingersDraw: fingersDraw,
+                    eraserDiameter: CGFloat(eraserOptions().diameter), showsZone: autoAdvanceOn)
     }
 
     private func settingsChanged() {
@@ -247,56 +315,88 @@ final class ZoomWindowController: ObservableObject {
 
     // MARK: Ink
 
-    private func captured(_ pk: PKStroke) {
+    /// A stroke the pane's canvas captured; false = not saved (the pane then removes its wet ink).
+    private func captured(_ pk: PKStroke) -> Bool {
         strokeFinished(PKBridge.stroke(from: pk, style: inkStyle()))
     }
 
-    /// A stroke finished in the pane (page coordinates): commit it, then let auto-advance move the box.
-    func strokeFinished(_ stroke: Stroke) {
-        guard let host, state.doc == host.documentID, let page = pageRecord, let size = page.size else { return }
+    /// A stroke finished in the pane (page coordinates): commit it, then let auto-advance move the box. Returns false,
+    /// and tells the user, when there is no live page to commit it to (it was deleted meanwhile).
+    @discardableResult
+    func strokeFinished(_ stroke: Stroke) -> Bool {
+        guard let host, state.doc == host.documentID, let page = pageRecord, let size = page.size else {
+            NotificationCenter.default.post(name: .nibCommandFailed, object: app, userInfo: [
+                "command": CommandIDs.inkAddStrokes,
+                "error": NibError(.unavailable, "the stroke was not saved: the Zoom Window's page is no longer available",
+                                  hint: "open the Zoom Window again on a page of this notebook")])
+            return false
+        }
         host.commitStroke(stroke, page: page.id)
+        inFlight += 1
         guard app.settings.get(NibSettings.zoomAutoAdvance), let doc = state.doc,
-              let bounds = Rect.bounding(stroke.polyline) else { return }
+              let bounds = Rect.bounding(stroke.polyline) else { return true }
         let box = state.rect
         if let next = state.autoAdvance.strokeFinished(bounds, box: box, margins: state.effectiveMargins(pageWidth: size.width),
                                                        returnHeight: store.returnHeight(page: page, box: box), pageSize: size) {
             perform(ZoomSetBox.descriptor.id, ZoomSetBox.params(doc: doc, page: page.id, rect: next))
         }
+        return true
     }
 
-    /// The eraser in the pane: one `ink.erase` per gesture along the path (pane points → page points).
-    private func erase(_ path: [CGPoint]) {
-        guard let doc = state.doc, let page = state.page, !path.isEmpty else { return }
+    /// The eraser in the pane: one `ink.erase` per gesture along the path (pane points → page points), with the eraser
+    /// tool's size, mode and filter. A longer scrub than `ink.erase` takes goes in parts that share one undo step.
+    func erase(_ path: [CGPoint]) {
+        guard let doc = state.doc, let page = state.page, pageRecord != nil, !path.isEmpty else { return }
+        let options = eraserOptions()
+        guard !options.filter.isEmpty else { return }         // the Erase Filter lets nothing be erased
         let m = magnification
-        let box = state.rect
-        let points: [JSONValue] = path.map { p in
-            .array([.number(box.x + Double(p.x) / m), .number(box.y + Double(p.y) / m)])
+        let pagePath = path.map { ZoomGeometry.pagePoint(pane: Point(Double($0.x), Double($0.y)), box: state.rect, magnification: m) }
+        let base: [String: JSONValue] = [
+            "page": .string(NodeRef.page(doc, page).description),
+            "radius": .number(ZoomGeometry.eraserRadius(diameter: options.diameter, magnification: m)),
+            "mode": .string(options.mode),
+            "filter": .array(options.filter.map { JSONValue.string($0) })
+        ]
+        let calls = ZoomGeometry.parts(pagePath, limit: Self.maxErasePathPoints).map { part -> JSONValue in
+            var params = base
+            params["path"] = .array(part.map { JSONValue.array([.number($0.x), .number($0.y)]) })
+            return .object(params)
         }
-        let mode = session.toolOptions["eraser"]?["mode"]?.stringValue ?? "standard"
-        // ponytail: an 8 pt circle under the Pencil in the pane; the eraser's size presets are not a contract.
-        perform(CommandIDs.inkErase, ["page": .string(NodeRef.page(doc, page).description), "path": .array(points),
-                                      "radius": .number(8 / m), "mode": .string(mode)])
+        enqueue(CommandIDs.inkErase, calls, group: NibID.make().raw)
     }
 
     private func committed(_ cs: Changeset) {
         guard let doc = state.doc, let pid = state.page, cs.documents.contains(doc) else { return }
         if cs.headChanged(doc) {
             pageRevision += 1
+            if state.isOn, pageRecord == nil {
+                // The box's page was deleted (navigator, undo, sync, a collaborator, the AI): close the window rather
+                // than write into nothing. zoom.toggle re-homes the box on a live page when it opens again.
+                close()
+                return
+            }
             scheduleRender()
         }
         guard cs.itemPages[doc]?.contains(pid) == true else { return }
-        if cs.principal.isUser, let w = writing {
-            landed = min(w.wetCount, landed + cs.summary(for: doc).created.count)
+        if inFlight > 0, cs.principal.isUser {
+            let created = cs.mutations.reduce(0) { n, m in
+                guard case let .item(d, p, _, _) = m, d == doc, p == pid, m.change.created else { return n }
+                return n + 1
+            }
+            let n = min(inFlight, created)
+            inFlight -= n
+            landed = min(wetCount, landed + n)
         }
         if let dirty = cs.dirtyRect(doc: doc, page: pid), !dirty.intersects(visibleRegion) { return }
         scheduleRender()
     }
 
-    /// Renders the visible region at the pane's pixel density; coalesces bursts (slider drags, commits).
+    /// Renders the visible region at the pane's pixel density while the pane shows; coalesces bursts (slider drags,
+    /// commits).
     private func scheduleRender() {
         renderTask?.cancel()
-        guard let writing, let renderer = app.services.renderer, let doc = state.doc, let pid = state.page,
-              pageSize != nil else { return }
+        guard isPaneShowing, let writing, let renderer = app.services.renderer, let doc = state.doc,
+              let pid = state.page, pageSize != nil else { return }
         let region = visibleRegion
         let screen = Double(writing.traitCollection.displayScale > 0 ? writing.traitCollection.displayScale : 2)
         let scale = min(magnification * screen, 4096 / max(region.width, 1))
@@ -323,13 +423,20 @@ final class ZoomWindowController: ObservableObject {
 
     /// Runs a command as the user in this window, after the previous one; errors become the shell's toast.
     func perform(_ command: String, _ params: JSONValue = [:], then done: (() -> Void)? = nil) {
+        enqueue(command, [params], group: nil, then: done)
+    }
+
+    /// Runs `calls` of one command in order (in one undo group when `group` is set), after the previous UI command.
+    private func enqueue(_ command: String, _ calls: [JSONValue], group: String?, then done: (() -> Void)? = nil) {
         let app = self.app
         let session = self.session
         let previous = pending
         pending = Task { @MainActor in
             _ = await previous?.value
             do {
-                _ = try await app.bus.execute(command, params, session: session)
+                for params in calls {
+                    _ = try await app.bus.execute(Invocation(command: command, params: params, session: session, group: group))
+                }
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                                 userInfo: ["command": command, "error": NibError.wrap(error)])
@@ -414,6 +521,9 @@ final class ZoomWindowController: ObservableObject {
 /// The pane's SwiftUI content on Deep glass. It is not in the window's droplet container (a canvas attachment cannot
 /// reach it), so it is a static `nibGlass` surface, which handles Reduce Transparency and Liquid Off itself.
 struct ZoomPane: View {
+    /// ponytail: the zoom slider's longest length; NibMetrics has no slider-width token (contract gap reported for F038).
+    private static let sliderMaxWidth: CGFloat = 280
+
     @ObservedObject var controller: ZoomWindowController
     @ObservedObject var state: ZoomState
     let writing: ZoomWritingView
@@ -440,7 +550,7 @@ struct ZoomPane: View {
                 .foregroundStyle(NibColor.label)
                 .accessibilityHidden(true)
             NibSlider(value: zoom, in: controller.magnificationRange, label: String(localized: "Zoom"))
-                .frame(maxWidth: 280)
+                .frame(maxWidth: Self.sliderMaxWidth)
                 .accessibilityValue(zoomText)
             Spacer(minLength: 0)
             NibButton(String(localized: "New Line"), kind: .secondary, size: .compact) { controller.newLine() }
@@ -504,14 +614,19 @@ struct ZoomWritingSurface: UIViewRepresentable {
 
 /// The pane's writing surface: a render of the visible region (paper and dry ink), the advance zone, and a transparent
 /// PKCanvasView whose content coordinates are page points (zoomScale = magnification, contentOffset = box origin), so
-/// captured strokes come out in page coordinates as `PKBridge.stroke(from:)` expects.
+/// captured strokes come out in page coordinates as `PKBridge.stroke(from:)` expects. With the eraser selected, an
+/// immediate press-and-drag recogniser traces the eraser path under a preview circle of the eraser's size.
 final class ZoomWritingView: UIView, PKCanvasViewDelegate {
     let paper = UIImageView()
     let zone = UIView()
     let canvas = PKCanvasView()
-    var onStroke: ((PKStroke) -> Void)?
+    /// A finished stroke; return false when it was not saved, and its wet ink is removed.
+    var onStroke: ((PKStroke) -> Bool)?
     var onErase: (([CGPoint]) -> Void)?
-    private let eraser = UIPanGestureRecognizer()
+    private let eraser = UILongPressGestureRecognizer()
+    private let halo = CAShapeLayer()
+    private let ring = CAShapeLayer()
+    private var eraserDiameter: CGFloat = 14
     private var erasePath: [CGPoint] = []
     private var box = Rect(x: 0, y: 0, width: 1, height: 1)
     private var pageSize = PageSize.a4
@@ -536,16 +651,30 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         canvas.showsHorizontalScrollIndicator = false
         canvas.contentInsetAdjustmentBehavior = .never
         canvas.delegate = self
+        // Begins on touch-down, so the whole path is traced and a tap erases too.
+        eraser.minimumPressDuration = 0
+        eraser.allowableMovement = .greatestFiniteMagnitude
         eraser.addTarget(self, action: #selector(erasing(_:)))
-        eraser.maximumNumberOfTouches = 1
         eraser.isEnabled = false
         addGestureRecognizer(eraser)
         addSubview(paper)
         addSubview(zone)
         addSubview(canvas)
+        // The eraser tool's cursor: a dark ring inside a light halo reads on any paper (paper is never inverted).
+        let paperTraits = UITraitCollection(userInterfaceStyle: .light)
+        halo.strokeColor = NibUIColor.background.resolvedColor(with: paperTraits).cgColor
+        ring.strokeColor = NibUIColor.label.resolvedColor(with: paperTraits).cgColor
+        ring.fillColor = NibUIColor.fill4.resolvedColor(with: paperTraits).cgColor
+        halo.fillColor = nil
+        halo.lineWidth = 3
+        ring.lineWidth = 1
+        for cursor in [halo, ring] {
+            cursor.isHidden = true
+            layer.addSublayer(cursor)
+        }
         isAccessibilityElement = true
         accessibilityLabel = String(localized: "Zoom Window writing area")
-        accessibilityHint = String(localized: "Write with Apple Pencil. The zoom box moves along as you write.")
+        accessibilityHint = String(localized: "Write here with Apple Pencil. The zoom box moves along as you write.")
         accessibilityTraits = .allowsDirectInteraction
     }
 
@@ -556,16 +685,20 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
     var wetCount: Int { canvas.drawing.strokes.count }
 
     func configure(box: Rect, pageSize: PageSize, tool: PKTool, erasing: Bool, policy: PKCanvasViewDrawingPolicy,
-                   showsZone: Bool) {
+                   fingersDraw: Bool, eraserDiameter: CGFloat, showsZone: Bool) {
         self.box = box
         self.pageSize = pageSize
+        self.eraserDiameter = eraserDiameter
         canvas.tool = tool
         canvas.drawingPolicy = policy
         canvas.drawingGestureRecognizer.isEnabled = !erasing
         eraser.isEnabled = erasing
         let pencil = NSNumber(value: UITouch.TouchType.pencil.rawValue)
         let direct = NSNumber(value: UITouch.TouchType.direct.rawValue)
-        eraser.allowedTouchTypes = policy == .anyInput ? [pencil, direct] : [pencil]
+        eraser.allowedTouchTypes = fingersDraw ? [pencil, direct] : [pencil]
+        accessibilityHint = fingersDraw
+            ? String(localized: "Write here with Apple Pencil or a finger. The zoom box moves along as you write.")
+            : String(localized: "Write here with Apple Pencil. The zoom box moves along as you write.")
         zone.isHidden = !showsZone
         setNeedsLayout()
     }
@@ -581,10 +714,14 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         let strokes = canvas.drawing.strokes
         let k = min(max(n, 0), strokes.count)
         guard k > 0 else { return }
+        replaceWet(Array(strokes.dropFirst(k)))
+    }
+
+    private func replaceWet(_ strokes: [PKStroke]) {
         ignoresChanges = true
-        canvas.drawing = PKDrawing(strokes: Array(strokes.dropFirst(k)))
+        canvas.drawing = PKDrawing(strokes: strokes)
         ignoresChanges = false
-        knownStrokes = canvas.drawing.strokes.count
+        knownStrokes = strokes.count
     }
 
     override func layoutSubviews() {
@@ -614,28 +751,84 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
     // MARK: PKCanvasViewDelegate
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+        guard !ignoresChanges else { return }
         let strokes = canvasView.drawing.strokes
-        defer { knownStrokes = strokes.count }
-        guard !ignoresChanges, strokes.count > knownStrokes else { return }
-        for s in strokes[knownStrokes...] { onStroke?(s) }
+        guard strokes.count > knownStrokes else {
+            knownStrokes = strokes.count
+            return
+        }
+        var kept = Array(strokes.prefix(knownStrokes))
+        var refused = false
+        for s in strokes[knownStrokes...] {
+            if onStroke?(s) ?? false {
+                kept.append(s)
+            } else {
+                refused = true
+            }
+        }
+        if refused {
+            replaceWet(kept)                                 // a stroke that was not saved must not look saved
+        } else {
+            knownStrokes = strokes.count
+        }
     }
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) { NibHaptics.isInking = true }
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) { NibHaptics.isInking = false }
 
-    @objc private func erasing(_ g: UIPanGestureRecognizer) {
+    // MARK: Eraser
+
+    @objc private func erasing(_ g: UILongPressGestureRecognizer) {
         let p = g.location(in: self)
         switch g.state {
         case .began:
             erasePath = [p]
+            showCursor(at: p)
         case .changed:
-            erasePath.append(p)
+            // Points closer than a fraction of the eraser add nothing (ink.erase sweeps a capsule between them).
+            if let last = erasePath.last, hypot(p.x - last.x, p.y - last.y) >= max(0.5, eraserDiameter * 0.075) {
+                erasePath.append(p)
+            }
+            moveCursor(to: p)
         case .ended:
-            erasePath.append(p)
-            onErase?(erasePath)
+            if erasePath.last != p { erasePath.append(p) }
+            hideCursor()
+            let path = erasePath
             erasePath = []
+            onErase?(path)
         default:
+            hideCursor()
             erasePath = []
         }
+    }
+
+    private func showCursor(at p: CGPoint) {
+        let r = eraserDiameter / 2
+        let circle = CGPath(ellipseIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r), transform: nil)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for cursor in [halo, ring] {
+            cursor.contentsScale = traitCollection.displayScale > 0 ? traitCollection.displayScale : 2
+            cursor.path = circle
+            cursor.position = p
+            cursor.isHidden = false
+        }
+        CATransaction.commit()
+    }
+
+    private func moveCursor(to p: CGPoint) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        halo.position = p
+        ring.position = p
+        CATransaction.commit()
+    }
+
+    private func hideCursor() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        halo.isHidden = true
+        ring.isHidden = true
+        CATransaction.commit()
     }
 }

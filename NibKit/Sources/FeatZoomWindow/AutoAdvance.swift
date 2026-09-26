@@ -93,6 +93,39 @@ enum ZoomGeometry {
         let w = min(max(width, minSize), pageSize.width)
         return clamp(Rect(x: box.x, y: box.y, width: w, height: w * aspect), to: pageSize)
     }
+
+    // MARK: The pane's eraser
+
+    /// `ink.erase` takes radii of 0.1…500 page points (F010's schema).
+    static let eraserRadiusRange: ClosedRange<Double> = 0.1...500
+
+    /// A point in the pane's writing area (view points from its top-left corner) on the page: the writing area shows
+    /// the box from its top-left corner at `magnification` view points per page point.
+    static func pagePoint(pane p: Point, box: Rect, magnification: Double) -> Point {
+        let m = max(magnification, .ulpOfOne)
+        return Point(box.x + p.x / m, box.y + p.y / m)
+    }
+
+    /// The eraser's radius on the page: the eraser tool's on-screen `diameter` shrinks with the pane's magnification,
+    /// as it does with the canvas's zoom, so it covers the same ink on screen as it would on the canvas.
+    static func eraserRadius(diameter: Double, magnification: Double) -> Double {
+        let r = diameter / 2 / max(magnification, 0.01)
+        return min(max(r.isFinite ? r : eraserRadiusRange.lowerBound, eraserRadiusRange.lowerBound), eraserRadiusRange.upperBound)
+    }
+
+    /// An eraser path in consecutive parts of at most `limit` points, each starting where the last ended, so the
+    /// swept path stays continuous across the parts. A path that fits (or a single point: a tap) is one part.
+    static func parts(_ path: [Point], limit: Int) -> [[Point]] {
+        guard path.count > limit, limit >= 2 else { return path.isEmpty ? [] : [path] }
+        var out: [[Point]] = []
+        var start = 0
+        while start < path.count - 1 {
+            let end = min(start + limit, path.count)
+            out.append(Array(path[start..<end]))
+            start = end - 1
+        }
+        return out
+    }
 }
 
 /// Auto-advance (`NibSettings.zoomAutoAdvance`), evaluated per finished stroke so a stroke is never cut: once a stroke

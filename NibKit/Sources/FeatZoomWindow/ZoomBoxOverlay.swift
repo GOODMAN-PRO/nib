@@ -166,9 +166,12 @@ final class ZoomBoxOverlay: CanvasAttachment {
 
     // MARK: Layout
 
+    /// Off when the box's page is gone (deleted from the navigator, by undo, sync, a collaborator or the AI): neither
+    /// the box nor the pane shows, so nothing can be written into a page that is not there.
     private var isVisible: Bool {
         guard let host else { return false }
         return state.isOn && state.doc == host.documentID && state.page != nil && !host.session.readOnly
+            && controller.pageRecord != nil
     }
 
     private func refresh() {
@@ -246,7 +249,8 @@ final class ZoomBoxOverlay: CanvasAttachment {
 }
 
 /// Draws the zoom box, its corner and bottom handles and the margin markers, in the page's frame. It takes a touch
-/// only on those parts, so ink and the wet-ink canvas everywhere else on the page are untouched.
+/// only on those parts, so ink and the wet-ink canvas everywhere else on the page are untouched. The box is DESIGN.md's
+/// `frame`: outline only, no body, so nothing tints the ink being written.
 final class ZoomOverlayView: UIView {
     let box = UIView()
     let corner = ZoomHandleView()
@@ -259,13 +263,16 @@ final class ZoomOverlayView: UIView {
     var hitPart: ((CGPoint) -> ZoomBoxOverlay.Part?)?
     /// The margin tabs sit this far above the box, clear of its hit area.
     static let tabRise = NibSpacing.x3
+    /// ponytail: the box outline, and the margin lines below, are literal widths: NibDesign has no outline-width token
+    /// and no UIKit `frame`/`handle` droplet a canvas attachment could use (contract gap reported for F038).
     static let lineWidth: CGFloat = 1.5
+    static let marginLineWidth: CGFloat = 1
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         box.isUserInteractionEnabled = false
-        box.backgroundColor = NibUIColor.accentWash
+        box.backgroundColor = .clear
         box.layer.borderWidth = Self.lineWidth
         box.layer.cornerCurve = .continuous
         for line in [leftLine, rightLine] {
@@ -314,8 +321,9 @@ final class ZoomOverlayView: UIView {
         bottom.center = CGPoint(x: r.midX, y: r.maxY)
         let top = r.minY - Self.tabRise
         let lineBottom = r.maxY + NibSpacing.s
-        leftLine.frame = CGRect(x: left - 0.5, y: top, width: 1, height: lineBottom - top)
-        rightLine.frame = CGRect(x: right - 0.5, y: top, width: 1, height: lineBottom - top)
+        let w = Self.marginLineWidth
+        leftLine.frame = CGRect(x: left - w / 2, y: top, width: w, height: lineBottom - top)
+        rightLine.frame = CGRect(x: right - w / 2, y: top, width: w, height: lineBottom - top)
         leftTab.center = CGPoint(x: left, y: top)
         rightTab.center = CGPoint(x: right, y: top)
     }
@@ -324,6 +332,8 @@ final class ZoomOverlayView: UIView {
 /// A rigid 12 pt bead with a 44 pt hit area and the pointer's lift effect. Precision affordances never deform
 /// (DESIGN.md §10.15), so there is no stretch, wobble or poke. Adjustable for VoiceOver where it has an action.
 final class ZoomHandleView: UIView, UIPointerInteractionDelegate {
+    /// ponytail: DESIGN.md §14.3's 12 pt handle bead; NibMetrics has no handle token and the `handle` droplet is
+    /// SwiftUI-only (contract gap reported for F038).
     static let diameter: CGFloat = 12
     var onIncrement: (() -> Void)?
     var onDecrement: (() -> Void)?

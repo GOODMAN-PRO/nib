@@ -116,4 +116,28 @@ final class AutoAdvanceTests: XCTestCase {
         let zoomed = ZoomGeometry.zoomed(box, width: 50, pageSize: page)
         XCTAssertEqual(zoomed, Rect(x: 50, y: 100, width: 50, height: 20))
     }
+
+    func testPanePointsMapOntoTheBoxAndTheEraserShrinksWithTheZoom() {
+        let b = Rect(x: 100, y: 200, width: 200, height: 50)
+        // The pane shows the box from its top-left corner at 3 view points per page point.
+        XCTAssertEqual(ZoomGeometry.pagePoint(pane: Point(0, 0), box: b, magnification: 3), Point(100, 200))
+        XCTAssertEqual(ZoomGeometry.pagePoint(pane: Point(600, 150), box: b, magnification: 3), Point(300, 250))
+        let p = ZoomGeometry.pagePoint(pane: Point(30, 15), box: b, magnification: 3)
+        XCTAssertEqual(p.x, 110, accuracy: 1e-9)
+        XCTAssertEqual(p.y, 205, accuracy: 1e-9)
+
+        // A 14 pt eraser on screen covers 14 / 3 page points in a 3× pane, within the radii ink.erase takes.
+        XCTAssertEqual(ZoomGeometry.eraserRadius(diameter: 14, magnification: 3), 7.0 / 3, accuracy: 1e-9)
+        XCTAssertEqual(ZoomGeometry.eraserRadius(diameter: 2, magnification: 100), ZoomGeometry.eraserRadiusRange.lowerBound)
+        XCTAssertEqual(ZoomGeometry.eraserRadius(diameter: 60, magnification: 0), ZoomGeometry.eraserRadiusRange.upperBound)
+    }
+
+    func testLongEraserPathsSplitIntoContinuousParts() {
+        let path = (0..<7).map { Point(Double($0), 0) }
+        // Each part starts where the last ended, so the swept path has no gap.
+        XCTAssertEqual(ZoomGeometry.parts(path, limit: 3).map { $0.map { $0.x } }, [[0, 1, 2], [2, 3, 4], [4, 5, 6]])
+        XCTAssertEqual(ZoomGeometry.parts(path, limit: 7), [path])
+        XCTAssertEqual(ZoomGeometry.parts([Point(5, 5)], limit: 3), [[Point(5, 5)]], "a tap is one part")
+        XCTAssertTrue(ZoomGeometry.parts([], limit: 3).isEmpty)
+    }
 }
