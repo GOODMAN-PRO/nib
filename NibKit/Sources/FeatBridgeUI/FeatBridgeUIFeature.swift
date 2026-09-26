@@ -35,7 +35,7 @@ public enum FeatBridgeUIFeature: NibFeature {
 
         app.content.keyCommands.register(KeyCommandDescriptor(
             id: BridgeUIIDs.keyCommand, title: String(localized: "Bridge Settings"),
-            shortcut: KeyShortcut("b", [.command, .option]), command: BridgeCalls.settingsOpenID,
+            shortcut: BridgeUIIDs.keyShortcut, command: BridgeCalls.settingsOpenID,
             params: ["page": .string(BridgeUIIDs.settingsPage)], scope: .global, order: 900, owner: id))
     }
 
@@ -50,6 +50,9 @@ enum BridgeUIIDs {
     static let settingsPage = "bridgeui.settings"
     static let statusOverlay = "bridgeui.status"
     static let keyCommand = "bridgeui.openSettings"
+    /// ⇧⌥⌘B. ⌥⌘B is F046's bookmark toggle (`page.setBookmarked`, document scope), so the global Bridge shortcut adds
+    /// Shift; no other feature maps ⇧⌥⌘B.
+    static let keyShortcut = KeyShortcut("b", [.command, .option, .shift])
     /// Bud source inside the pill and the id of the details popover it buds (one per window's floating host).
     static let pillAnchor = "bridgeui.pill"
     static let detailsPopover = "bridgeui.details"
@@ -64,13 +67,15 @@ enum BridgeUIIDs {
     }
 }
 
-/// This feature's own settings (device-local, not security: they only affect this iPad's screen and the address the
-/// pairing snippets show).
+/// This feature's own settings, both device-local.
 enum BridgeUISettings {
-    /// Keep the screen from locking while the bridge is on (iOS suspends the listener when the screen locks).
+    /// Keep the screen from locking while the bridge is on (iOS suspends the listener when the screen locks). Not a
+    /// security setting: it only affects this iPad's screen.
     static let keepScreenAwake = SettingKey("bridgeui.keepScreenAwake", default: true)
     /// A host name clients use instead of an IP address (Tailscale MagicDNS, e.g. "ipad.tail1234.ts.net"); "" = none.
-    static let hostName = SettingKey("bridgeui.hostName", default: "")
+    /// A security setting (user only): it decides where the pairing snippets and the QR code send the real bearer
+    /// token, so the AI, a plugin or a bridge client must never be able to point it at another host.
+    static let hostName = SettingKey("security.bridgeui.hostName", default: "")
 
     static func declare(_ s: SettingsStore, owner: String) {
         s.declare(keepScreenAwake, summary: "Keep the screen awake while the MCP bridge is on (it pauses when the screen locks).",
@@ -387,11 +392,13 @@ final class BridgeMonitor: ObservableObject {
         }
     }
 
-    /// Reads `bridge.status` and the token, then updates the screen lock and the pill's visibility.
-    func refresh() async {
+    /// Reads `bridge.status` and the token, then updates the screen lock and the pill's visibility. Poll ticks pass
+    /// `readToken: false`: the token only changes inside `bridge.setEnabled`, which emits `bridge.status` (an event
+    /// refresh reads it), so a poll reads the Keychain only when the bridge's `tokenMissing` disagrees with the token
+    /// on hand.
+    func refresh(readToken: Bool = true) async {
         guard let app = app else { return }
-        let token = BridgeToken.read()
-        if token != self.token { self.token = token }
+        if readToken { reloadToken() }
         guard app.commands.entry(BridgeCalls.statusID) != nil else {
             if isAvailable { isAvailable = false }
             if snapshot != nil { snapshot = nil }
@@ -402,6 +409,7 @@ final class BridgeMonitor: ObservableObject {
         do {
             let value = try await BridgeCalls.run(app, BridgeCalls.statusID)
             let next = try value.decode(BridgeSnapshot.self)
+            if !readToken, next.tokenMissing != (token == nil) { reloadToken() }
             if next != snapshot { snapshot = next }
             if refreshError != nil { refreshError = nil }
         } catch {
@@ -410,6 +418,15 @@ final class BridgeMonitor: ObservableObject {
             refreshError = e.message
         }
         applyDerivedState()
+    }
+
+    /// Number of Keychain reads so far (tests check that poll ticks skip them).
+    private(set) var tokenReads = 0
+
+    private func reloadToken() {
+        tokenReads += 1
+        let token = BridgeToken.read()
+        if token != self.token { self.token = token }
     }
 
     private func applyDerivedState() {
@@ -433,7 +450,7 @@ final class BridgeMonitor: ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(BridgeMonitor.pollInterval * 1_000_000_000))
                 guard let self = self, !Task.isCancelled, self.pollGeneration == generation, self.watchers > 0,
                       self.snapshot?.enabled == true else { break }
-                await self.refresh()
+                await self.refresh(readToken: false)
             }
             if let self = self, self.pollGeneration == generation { self.pollTask = nil }
         }
@@ -464,12 +481,14 @@ final class SystemIdleTimer: IdleTimerControlling {
 }
 
 /// Keeps the screen awake while the bridge is on (DESIGN / AI.md §9.1: iOS suspends the listener when the screen
-/// locks). It only ever releases the lock it took, so a screen kept awake by something else (presentation mode) stays
-/// awake.
+/// locks). It only ever releases the lock it took: a screen that something else (presentation mode) already kept awake
+/// when the bridge started holding stays awake when the bridge stops.
 @MainActor
 final class BridgeKeepAwake {
     let idleTimer: IdleTimerControlling?
     private(set) var isHolding = false
+    /// The idle timer was already off when the bridge started holding, so the lock is someone else's to release.
+    private var wasAlreadyDisabled = false
 
     init(idleTimer: IdleTimerControlling?) {
         self.idleTimer = idleTimer
@@ -484,6 +503,13 @@ final class BridgeKeepAwake {
     func update(_ hold: Bool) {
         guard hold != isHolding else { return }
         isHolding = hold
-        idleTimer?.isIdleTimerDisabled = hold
+        guard let timer = idleTimer else { return }
+        if hold {
+            wasAlreadyDisabled = timer.isIdleTimerDisabled
+            if !wasAlreadyDisabled { timer.isIdleTimerDisabled = true }
+        } else {
+            if !wasAlreadyDisabled { timer.isIdleTimerDisabled = false }
+            wasAlreadyDisabled = false
+        }
     }
 }

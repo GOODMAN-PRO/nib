@@ -204,7 +204,8 @@ enum BridgeOriginRules {
     }
 }
 
-/// The host name clients use instead of an IP address (`bridgeui.hostName`), e.g. a Tailscale MagicDNS name.
+/// The host name clients use instead of an IP address (`security.bridgeui.hostName`, user only), e.g. a Tailscale
+/// MagicDNS name.
 enum BridgeHostRules {
     /// "" for empty input (no host name); nil when it is neither an IP address nor a valid DNS name. A pasted URL or
     /// "name:port" keeps only the host.
@@ -401,6 +402,9 @@ final class BridgeSettingsModel: ObservableObject {
     @Published private(set) var hostNameMessage: String?
     @Published var networkText = ""
     @Published private(set) var networkMessage: String?
+    /// A network outside the private ranges (e.g. 0.0.0.0/0) waiting for the person to allow it; nothing is stored
+    /// until they do (`confirmPublicNetwork`).
+    @Published private(set) var pendingPublicNetwork: String?
     @Published var originText = ""
     @Published private(set) var originMessage: String?
     /// The last command that failed, in plain words.
@@ -587,14 +591,41 @@ final class BridgeSettingsModel: ObservableObject {
         }
     }
 
+    /// Adds the typed network. One that reaches past private networks widens who can try tokens against the bridge, so
+    /// it only becomes `pendingPublicNetwork` and waits for the person to allow it (like "Never Ask").
     func addNetwork() async {
         do {
             let list = try BridgeNetworkRules.adding(networkText, to: networks)
             networkMessage = nil
-            if await set(BridgeNames.networksSetting, .array(list.map { JSONValue.string($0) })) { networkText = "" }
+            if let entry = list.last, BridgeNetworkRules.isPublic(entry) {
+                pendingPublicNetwork = entry
+                return
+            }
+            pendingPublicNetwork = nil
+            await storeNetworks(list)
         } catch {
             networkMessage = (error as? BridgeInputError)?.message ?? NibError.wrap(error).message
         }
+    }
+
+    /// The person allowed `entry` (the pending public network): validated again against the list as it is now.
+    func confirmPublicNetwork(_ entry: String) async {
+        pendingPublicNetwork = nil
+        do {
+            let list = try BridgeNetworkRules.adding(entry, to: networks)
+            await storeNetworks(list)
+        } catch {
+            networkMessage = (error as? BridgeInputError)?.message ?? NibError.wrap(error).message
+        }
+    }
+
+    /// The person cancelled: nothing is stored and the typed text stays for editing.
+    func cancelPublicNetwork() {
+        pendingPublicNetwork = nil
+    }
+
+    private func storeNetworks(_ list: [String]) async {
+        if await set(BridgeNames.networksSetting, .array(list.map { JSONValue.string($0) })) { networkText = "" }
     }
 
     func removeNetwork(_ entry: String) async {
@@ -768,6 +799,19 @@ struct BridgeSettingsPage: View {
             Button(String(localized: "Cancel"), role: .cancel) {}
         } message: {
             Text(String(localized: "Connected agents could then change and delete notes without you seeing it first. You can still undo their changes."))
+        }
+        .confirmationDialog(String(localized: "Allow connections from outside private networks?"),
+                            isPresented: Binding(get: { model.pendingPublicNetwork != nil },
+                                                 set: { presented in if !presented { model.cancelPublicNetwork() } }),
+                            titleVisibility: .visible, presenting: model.pendingPublicNetwork) { entry in
+            Button(String(localized: "Allow"), role: .destructive) {
+                Task { await model.confirmPublicNetwork(entry) }
+            }
+            Button(String(localized: "Cancel"), role: .cancel) {
+                model.cancelPublicNetwork()
+            }
+        } message: { entry in
+            Text(String(localized: "\(entry) reaches past private networks: anyone who can reach this iPad from there could try tokens against the bridge."))
         }
     }
 
@@ -956,15 +1000,9 @@ struct BridgeSettingsPage: View {
         if let pairing = model.pairing {
             Section {
                 if model.tokenRevealed {
-                    HStack {
-                        Spacer(minLength: 0)
-                        NibQRCode(pairing.pairingURL,
-                                  label: String(localized: "QR code with this iPad's bridge address and token"))
-                            .frame(width: 200, height: 200)
-                            .privacySensitive()
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.vertical, NibSpacing.s)
+                    BridgeQRCode(payload: pairing.pairingURL)
+                        .equatable()
+                        .padding(.vertical, NibSpacing.s)
                 } else {
                     NibButton(String(localized: "Show QR Code"), symbol: .qrCode, kind: .secondary) {
                         model.tokenRevealed = true
@@ -1170,6 +1208,20 @@ private struct BridgeCopiedLine: View {
     }
 }
 
+/// The pairing QR code. `NibQRCode` renders its image (CIFilter + CIContext) in init, so this view is compared by its
+/// payload (`.equatable()`) and redraws only when the pairing URL changes, not on every keystroke or poll. It is as
+/// wide as a popover's content (the size of the Share-live QR) and never wider than the row.
+struct BridgeQRCode: View, Equatable {
+    let payload: String
+
+    var body: some View {
+        NibQRCode(payload, label: String(localized: "QR code with this iPad's bridge address and token"))
+            .frame(maxWidth: NibMetrics.popoverContentWidth)
+            .privacySensitive()
+            .frame(maxWidth: .infinity)
+    }
+}
+
 /// The bridge state with its dot: never colour alone (the title says it too).
 private struct BridgeStatusRow: View {
     let state: BridgeState
@@ -1188,7 +1240,7 @@ private struct BridgeStatusRow: View {
             if let dot = dot {
                 NibStatusDot(dot)
             }
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: NibSpacing.xxs) {
                 Text(state.title)
                     .font(NibFont.body)
                     .foregroundStyle(NibColor.label)
@@ -1218,7 +1270,7 @@ private struct BridgeListEntryRow: View {
 
     var body: some View {
         HStack(spacing: NibSpacing.s) {
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: NibSpacing.xxs) {
                 Text(verbatim: text)
                     .font(NibFont.code)
                     .foregroundStyle(NibColor.label)

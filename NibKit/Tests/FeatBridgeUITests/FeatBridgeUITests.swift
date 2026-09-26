@@ -150,14 +150,21 @@ final class FeatBridgeUITests: XCTestCase {
         let key = h.app.content.keyCommands.get(BridgeUIIDs.keyCommand)
         XCTAssertEqual(key?.command, "settings.open")
         XCTAssertEqual(key?.params["page"]?.stringValue, BridgeUIIDs.settingsPage)
-        XCTAssertEqual(key?.shortcut, KeyShortcut("b", [.command, .option]))
+        XCTAssertEqual(key?.shortcut, KeyShortcut("b", [.command, .option, .shift]),
+                       "⇧⌥⌘B: ⌥⌘B is F046's bookmark toggle")
+        XCTAssertNotEqual(key?.shortcut, KeyShortcut("b", [.command, .option]))
 
         for key in [BridgeUISettings.keepScreenAwake.name, BridgeUISettings.hostName.name] {
             let d = h.app.settings.descriptor(key)
             XCTAssertEqual(d?.owner, "bridgeui", key)
             XCTAssertEqual(d?.synced, false, "\(key) is device-local")
-            XCTAssertEqual(d?.userOnly, false, key)
         }
+        XCTAssertEqual(h.app.settings.descriptor(BridgeUISettings.keepScreenAwake.name)?.userOnly, false,
+                       "keeping the screen awake is not a security setting")
+        XCTAssertEqual(h.app.settings.descriptor(BridgeUISettings.hostName.name)?.userOnly, true,
+                       "the host name decides where the pairing snippets send the token")
+        XCTAssertTrue(BridgeUISettings.affectsBridge(BridgeUISettings.hostName.name))
+        XCTAssertTrue(BridgeUISettings.affectsBridge(BridgeUISettings.keepScreenAwake.name))
         XCTAssertTrue(h.app.commands.all().filter { $0.owner == "bridgeui" }.isEmpty,
                       "every action runs F090's or the contracts' commands; F091 owns none (ARCHITECTURE §6.5)")
         XCTAssertFalse(monitor.isStarted, "register never subscribes; start does")
@@ -266,12 +273,25 @@ final class FeatBridgeUITests: XCTestCase {
         try await h.run("bridge.setEnabled", ["enabled": true])
         await monitor.refresh()
         XCTAssertTrue(monitor.isPolling)
+        XCTAssertNotNil(monitor.token)
+        let keychainReads = monitor.tokenReads
 
         // Calls emit no event: the poll picks up the last call.
         fake?.lastCall = ["client": "claude-code", "tool": "nib_run", "command": "page.add",
                           "at": .number(Date().timeIntervalSince1970), "ok": true]
         let polled = await eventually { monitor.snapshot?.lastCall?.command == "page.add" }
         XCTAssertTrue(polled)
+        fake?.lastCall = ["client": "claude-code", "tool": "nib_run", "command": "page.rotate",
+                          "at": .number(Date().timeIntervalSince1970), "ok": true]
+        let polledAgain = await eventually { monitor.snapshot?.lastCall?.command == "page.rotate" }
+        XCTAssertTrue(polledAgain)
+        XCTAssertEqual(monitor.tokenReads, keychainReads, "poll ticks never read the Keychain")
+
+        // Unless the bridge's report disagrees with the token on hand (it went missing): then the poll re-reads it.
+        FakeBridge.removeToken()
+        let noticed = await eventually { monitor.token == nil }
+        XCTAssertTrue(noticed)
+        XCTAssertEqual(monitor.snapshot?.state, .tokenMissing)
 
         monitor.unwatch()
         XCTAssertFalse(monitor.isPolling)
@@ -315,6 +335,33 @@ final class FeatBridgeUITests: XCTestCase {
         await monitor.refresh()                               // bridge off
         XCTAssertTrue(timer.isIdleTimerDisabled)
         XCTAssertEqual(timer.writes, 1)
+    }
+
+    func testReleasesOnlyTheScreenLockItTook() async throws {
+        let (h, _, _) = makeHarness()
+        let timer = FakeIdleTimer()
+        timer.isIdleTimerDisabled = true                      // presentation mode already keeps the screen on
+        let monitor = BridgeMonitor(app: h.app, idleTimer: timer)
+
+        try await h.run("bridge.setEnabled", ["enabled": true])
+        await monitor.refresh()
+        XCTAssertTrue(monitor.keepAwake.isHolding)
+        XCTAssertTrue(timer.isIdleTimerDisabled)
+
+        try await h.run("bridge.setEnabled", ["enabled": false])
+        await monitor.refresh()
+        XCTAssertFalse(monitor.keepAwake.isHolding)
+        XCTAssertTrue(timer.isIdleTimerDisabled, "the bridge leaves presentation mode's lock alone")
+        XCTAssertEqual(timer.writes, 1, "only the test's own write")
+
+        // Once presentation mode lets go, the next time the bridge runs it takes and releases its own lock.
+        timer.isIdleTimerDisabled = false
+        try await h.run("bridge.setEnabled", ["enabled": true])
+        await monitor.refresh()
+        XCTAssertTrue(timer.isIdleTimerDisabled)
+        try await h.run("bridge.setEnabled", ["enabled": false])
+        await monitor.refresh()
+        XCTAssertFalse(timer.isIdleTimerDisabled)
     }
 
     func testKeepAwakeRule() {
@@ -440,6 +487,63 @@ final class FeatBridgeUITests: XCTestCase {
         XCTAssertEqual(h.app.settings.get(NibSettings.bridgeConfirmationPolicy), .always)
     }
 
+    /// The host name is where the pairing snippets and the QR code send the real token: the AI (e.g. prompt-injected by
+    /// an imported document), a plugin or a bridge client must not be able to point it at their own host.
+    func testHostNameIsUserOnly() async throws {
+        let (h, _, monitor) = makeHarness()
+        // Give plugins every scope a non-user principal can hold, so the only thing refusing them is the setting.
+        h.app.gateway.grants = { p in
+            if case .plugin = p { return Set(Scope.allCases).subtracting([.security]) }
+            return Gateway.defaultGrants(p)
+        }
+        let name = BridgeUISettings.hostName.name
+        XCTAssertTrue(name.hasPrefix("security."))
+
+        let model = BridgeSettingsModel(app: h.app, monitor: monitor)
+        await model.setEnabled(true)
+        model.hostNameText = "ipad.tail1234.ts.net"
+        await model.applyHostName()
+        XCTAssertNil(model.actionError, "the page runs settings.set as the user")
+        XCTAssertEqual(h.app.settings.get(BridgeUISettings.hostName), "ipad.tail1234.ts.net")
+
+        let attackers: [Principal] = [.ai("chat"), .bridge("claude-code"), .plugin("dev.test.plugin")]
+        for principal in attackers {
+            do {
+                try await h.run(CommandIDs.settingsSet, ["name": .string(name), "value": "attacker.example.com"], as: principal)
+                XCTFail("\(principal) must not change the pairing host")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .permissionDenied, "\(principal): \(e)")
+            }
+            do {
+                try await h.run(CommandIDs.settingsSet, ["name": .string(name), "value": .null], as: principal)
+                XCTFail("\(principal) must not reset the pairing host either")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .permissionDenied, "\(principal): \(e)")
+            }
+            do {
+                try await h.run(CommandIDs.settingsGet, ["name": .string(name)], as: principal)
+                XCTFail("\(principal) must not read a security setting")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .permissionDenied, "\(principal): \(e)")
+            }
+            let listed = try await h.run(CommandIDs.settingsList, ["prefix": "security.bridgeui."], as: principal)
+            XCTAssertEqual(listed["settings"]?.arrayValue?.count, 0, "\(principal) does not even see it")
+        }
+        XCTAssertEqual(h.app.settings.get(BridgeUISettings.hostName), "ipad.tail1234.ts.net")
+        XCTAssertEqual(model.addresses.first, BridgeAddress(host: "ipad.tail1234.ts.net", kind: .hostName))
+        XCTAssertEqual(model.pairing?.mcpURL, "http://ipad.tail1234.ts.net:7331/mcp", "the token still goes to the user's host")
+
+        // The same principals may still change this feature's non-security setting: the refusal is the security rule.
+        try await h.run(CommandIDs.settingsSet, ["name": .string(BridgeUISettings.keepScreenAwake.name), "value": false],
+                        as: .ai("chat"))
+        XCTAssertFalse(h.app.settings.get(BridgeUISettings.keepScreenAwake))
+
+        model.hostNameText = ""
+        await model.applyHostName()
+        XCTAssertNil(model.actionError)
+        XCTAssertEqual(h.app.settings.get(BridgeUISettings.hostName), "")
+    }
+
     // MARK: Settings the page writes
 
     func testPortIsValidatedAndWrittenThroughSettingsSet() async {
@@ -471,13 +575,39 @@ final class FeatBridgeUITests: XCTestCase {
         XCTAssertEqual(model.networks, FakeBridge.defaultNetworks)
         XCTAssertTrue(model.networksAreDefault)
 
+        // A private network is stored straight away.
+        model.networkText = "192.168.50.0/24"
+        await model.addNetwork()
+        XCTAssertNil(model.networkMessage)
+        XCTAssertNil(model.pendingPublicNetwork)
+        XCTAssertEqual(model.networkText, "")
+        XCTAssertEqual(model.networks, FakeBridge.defaultNetworks + ["192.168.50.0/24"])
+        XCTAssertFalse(model.networksAreDefault)
+        await model.removeNetwork("192.168.50.0/24")
+
+        // A network past the private ranges waits for the person to allow it.
         model.networkText = " 203.0.113.0/24 "
         await model.addNetwork()
         XCTAssertNil(model.networkMessage)
+        XCTAssertEqual(model.pendingPublicNetwork, "203.0.113.0/24")
+        XCTAssertEqual(model.networks, FakeBridge.defaultNetworks, "nothing is stored before the person allows it")
+        XCTAssertEqual(model.networkText, " 203.0.113.0/24 ")
+        await model.confirmPublicNetwork("203.0.113.0/24")
+        XCTAssertNil(model.pendingPublicNetwork)
         XCTAssertEqual(model.networkText, "")
         XCTAssertEqual(model.networks, FakeBridge.defaultNetworks + ["203.0.113.0/24"])
         XCTAssertTrue(BridgeNetworkRules.isPublic("203.0.113.0/24"), "the page warns about it")
         XCTAssertFalse(model.networksAreDefault)
+
+        // Cancelling stores nothing.
+        model.networkText = "0.0.0.0/0"
+        await model.addNetwork()
+        XCTAssertEqual(model.pendingPublicNetwork, "0.0.0.0/0")
+        model.cancelPublicNetwork()
+        XCTAssertNil(model.pendingPublicNetwork)
+        XCTAssertFalse(model.networks.contains("0.0.0.0/0"))
+        XCTAssertEqual(model.networkText, "0.0.0.0/0", "the typed text stays for editing")
+        model.networkText = ""
 
         model.networkText = "10.1.2.3/8"
         await model.addNetwork()
@@ -779,6 +909,13 @@ final class FeatBridgeUITests: XCTestCase {
             XCTAssertEqual(NibSnapshot.images(pill, size: CGSize(width: 320, height: 44)).count,
                            NibSnapshot.Variant.allCases.count)
         }
+        let pairingURL = BridgePairing(host: "192.168.1.20", port: 7331, token: "nib_" + String(repeating: "q", count: 43)).pairingURL
+        XCTAssertEqual(BridgeQRCode(payload: pairingURL), BridgeQRCode(payload: pairingURL),
+                       "the QR is compared by payload, so it re-renders only when the pairing URL changes")
+        XCTAssertNotEqual(BridgeQRCode(payload: pairingURL), BridgeQRCode(payload: pairingURL + "x"))
+        XCTAssertEqual(NibSnapshot.images(BridgeQRCode(payload: pairingURL).equatable(), size: CGSize(width: 390, height: 320)).count,
+                       NibSnapshot.Variant.allCases.count)
+
         let unavailable = makeHarness(bridge: false)
         await unavailable.2.refresh()
         XCTAssertNotNil(NibSnapshot.image(BridgeSettingsPage(app: unavailable.0.app, monitor: unavailable.2),
