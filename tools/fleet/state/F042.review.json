@@ -1,0 +1,41 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatReadOnly/ReadOnlyCommands.swift (PDFTapAt), FeatReadOnlyFeature.swift register",
+      "problem": "pdf.tapAt is registered but ARCHITECTURE.md section 6.5 lists only view.setReadOnly, pdf.markSelection and pdf.copyText for F042 (section 15.3 says register exactly the listed ids). `python Scripts/lint.py --feature F042` warns: 'F042 registers pdf.tapAt, which ARCHITECTURE section 6.5 does not list for it'. The extra id is needed because a TapHandlerDescriptor has to name a command, and it is conformant (schema, example, session effect).",
+      "fix": "Keep the command. Mention the deviation in the F042 summary so the architect adds the catalogue row in a separate contracts change (not on this branch): `| pdf.tapAt | session | page, point, ref?, gesture? | F042 | Tap chain: a long-press on PDF text selects the line and shows the text menu. |`"
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatReadOnly/PDFTextMenu.swift touchesCancelled / requery()",
+      "problem": "The selection can get stuck with no menu. If a handle drag is cancelled while a query is running and another query is already queued (requeryAfterQuery == true), touchesCancelled sets target = nil. When the running query finishes, it calls requery(), which returns at `guard let t = target` without ever calling presentMenu(), so presentWhenSettled stays true. The selection and its handles stay drawn with no edit menu, so tapping elsewhere does not clear it. The only ways out are dragging a handle again or a new long-press.",
+      "fix": "In touchesCancelled also set `requeryAfterQuery = false`. Or, in requery(), when the guard fails, run `if presentWhenSettled && drag == nil { presentMenu() }` before returning."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatReadOnly/PDFTextMenu.swift choose(.define) / ReadOnlyCommands.swift PDFTextPick",
+      "problem": "A long-press selects the whole line, so Define passes a multi-word line to UIReferenceLibraryViewController, which almost always shows 'No definition found' unless the user first narrows the selection with the handles.",
+      "fix": "Store the long-press point in PDFTextSelection. For Define, while the selection is still the untouched picked line, take the word of `s.text` at character index `selection(from: s.from, to: pressPoint).text.count` (one extra services.pdf.selection call) and fall back to the trimmed text otherwise."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatReadOnly/PDFTextMenu.swift (selection handles)",
+      "problem": "The handles are bare CALayers and dragging them is the only way to change the selection. That breaks DESIGN.md section 15.5 / Slop checklist 'every drag has an action': VoiceOver and Switch Control users can only act on whole single lines.",
+      "fix": "Add 'Extend to Next Line' and 'Extend to Previous Line' UIActions to the edit menu, at least when UIAccessibility.isVoiceOverRunning. Each sets target.to (or target.from) to the neighbouring line's anchors from `source.lines()` (the same maths as PDFTextPick) and calls requery()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatReadOnlyTests/FeatReadOnlyTests.swift",
+      "problem": "Two risky paths have no tests: (1) pdf.tapAt declining when `ref` is a non-stroke item (this keeps the long-press for text boxes, images and stickies over a PDF) but not when it is a stroke; (2) the handle-drag cancel and coalescing path in requery().",
+      "fix": "(1) Run pdf.tapAt with PDFTapAt.example plus `ref` = `item:FIXTUREDOC01/<page of Fixtures.textID>/FIXTURETXT01` and assert handled == false, then with `ref` = the Fixtures.strokeID ref and assert handled == true. (2) Call touchesBegan, then touchesMoved twice, then touchesCancelled, await attachment.query?.value, and assert the selection is still set and the menu was asked to present (or presentWhenSettled == false after the fix above)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatReadOnly/ReadOnlyCommands.swift PDFMarkSelection.run (`taken`)",
+      "problem": "`ctx.workspace.allItems(doc, page:)` is loaded and hashed into a Set on the main actor for every highlight or strikeout, even when the caller passed no ids. On pages with thousands of strokes this is wasted main-thread work.",
+      "fix": "Only build `taken` and check for conflicts when `!ids.isEmpty`."
+    }
+  ]
+}
