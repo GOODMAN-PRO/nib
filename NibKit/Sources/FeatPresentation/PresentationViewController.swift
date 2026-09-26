@@ -126,7 +126,7 @@ enum PresentationDisplay {
 @MainActor
 final class PresentationViewModel: ObservableObject {
     /// The viewport has to rest this long before its sharp render is made (scrolling re-renders nothing).
-    static let detailDelay: Double = 0.15
+    static let defaultDetailDelay: Double = 0.15
     /// Mirror snapshots: at most every 100 ms, and never more than a fifth of the main thread.
     /// ponytail: drawHierarchy on main; move to a render-server snapshot if mirroring ever costs ink latency.
     static let mirrorInterval: Double = 0.1
@@ -139,6 +139,8 @@ final class PresentationViewModel: ObservableObject {
     let source: PresentationPageSource
     var mode: ExternalDisplayMode
     var blank: Bool
+    /// How long the viewport rests before its sharp render (tests lengthen it to watch a pending one get cancelled).
+    var detailDelay = PresentationViewModel.defaultDetailDelay
     /// The display's size in points and its pixels per point (set by the view controller on layout).
     private(set) var canvasSize = CGSize(width: 1920, height: 1080)
     private(set) var pixelScale: CGFloat = 1
@@ -182,14 +184,17 @@ final class PresentationViewModel: ObservableObject {
     func setNeedsUpdate() {
         dirty = true
         guard !draining else { return }
-        Task { [weak self] in await self?.drain(detailDelay: PresentationViewModel.detailDelay) }
+        Task { [weak self] in
+            guard let self = self else { return }
+            await self.drain(detailDelay: self.detailDelay)
+        }
     }
 
     /// Brings `display` up to date now. Tests pass `detailDelay: 0` so the viewport's sharp render happens inline.
-    func update(detailDelay: Double = PresentationViewModel.detailDelay) async {
+    func update(detailDelay: Double? = nil) async {
         while draining { await Task.yield() }
         dirty = true
-        await drain(detailDelay: detailDelay)
+        await drain(detailDelay: detailDelay ?? self.detailDelay)
     }
 
     func stop() {
@@ -239,7 +244,14 @@ final class PresentationViewModel: ObservableObject {
             } else if base?.key.doc != page.doc || base?.key.page != page.page {
                 base = nil
             }
-            if dirty { return }                  // superseded while rendering: the next pass shows the latest state
+            // Changed while rendering. A newer version of the same page still shows this render now (the next pass
+            // renders the newer one), so a stream of commits never freezes the display; a page, mode or blank change
+            // drops it.
+            if dirty {
+                guard !blank, mode != .mirror, let now = source.current, now.doc == page.doc, now.page == page.page else {
+                    return
+                }
+            }
         }
         guard let base = base else {
             show(.idle)
@@ -255,8 +267,8 @@ final class PresentationViewModel: ObservableObject {
                               detail: detail, viewport: viewport, animated: mode == .presenter && samePage)
         lastFrame = frame
         display = .page(frame)
-        laser.reproject(page: page.page, camera: camera)
-        guard mode == .presenter, needsDetail(viewport: viewport, page: page, baseScale: key.scale),
+        laser.reproject(page: page.page, camera: camera, animated: frame.animated)
+        guard !dirty, mode == .presenter, needsDetail(viewport: viewport, page: page, baseScale: key.scale),
               detail?.region != viewport else { return }
         if detailDelay <= 0 {
             await renderDetail(page: page, viewport: viewport)
@@ -306,12 +318,16 @@ final class PresentationViewModel: ObservableObject {
         return clipped.isNull || clipped.isEmpty ? page.bounds : Rect(clipped)
     }
 
-    /// Pixels per point that fill the display with `rect`, capped so no render is larger than `maxPixels`.
+    /// Pixels per point that fill the display with `rect`, never below 0.05 but always capped last, so no render is
+    /// larger than `maxPixels` on its longest edge (a board with an item a million points away stays 4096 px).
     func fitScale(for rect: Rect) -> Double {
         guard rect.width > 0, rect.height > 0 else { return 1 }
         let px = Double(canvasSize.width * pixelScale), py = Double(canvasSize.height * pixelScale)
-        let s = min(px / rect.width, py / rect.height, Self.maxPixels / max(rect.width, rect.height))
-        return (max(s, 0.05) * 64).rounded() / 64         // 1/64 steps: a resize by a point never re-renders
+        let fit = min(px / rect.width, py / rect.height)
+        let cap = Self.maxPixels / max(rect.width, rect.height)
+        let s = min(max(fit, 0.05), cap)
+        let stepped = (s * 64).rounded(.down) / 64         // 1/64 steps: a resize by a point never re-renders
+        return stepped > 0 ? stepped : s                  // rounding down never passes the cap, nor reaches 0
     }
 
     private func needsDetail(viewport: Rect, page: PresentedPage, baseScale: Double) -> Bool {
@@ -374,58 +390,67 @@ final class PresentationViewModel: ObservableObject {
 
 // MARK: - Laser overlay
 
-/// The presenter's laser on the external display, in display points (DESIGN.md §14.12).
+/// The presenter's laser on the external display (DESIGN.md §14.12). The dot and the trail are kept in page points and
+/// drawn through `camera`, which glides with the same spring as the stage when the presenter scrolls, so they stay on
+/// their spot of the page while the camera moves.
 @MainActor
 final class LaserModel: ObservableObject {
     struct Segment: Identifiable {
         let id: Int
-        let from: CGPoint
-        let to: CGPoint
+        /// Page points.
+        let from: Point
+        let to: Point
         let color: UIColor
     }
 
     /// Fading segments kept at most (a 30 Hz trail fades in 600 ms, so about 18 are ever alive).
     static let maxSegments = 64
 
-    @Published private(set) var dot: CGPoint?
+    /// Page points → display points (the stage's camera).
+    @Published private(set) var camera: CGAffineTransform = .identity
+    /// The dot in page points; nil = lifted.
+    @Published private(set) var point: Point?
     @Published private(set) var segments: [Segment] = []
     private(set) var color: UIColor = NibUIColor.destructive
-    private var page: PageID?
-    private var pagePoint: Point?
+    /// The page the dot and the trail are on.
+    private(set) var page: PageID?
     private var nextID = 0
 
+    /// The dot in display points, where the camera ends up.
+    var dot: CGPoint? { point.map { $0.cg.applying(camera) } }
+
     func move(page: PageID, to point: Point, camera: CGAffineTransform, trail: Bool, color: UIColor) {
-        let p = point.cg.applying(camera)
-        if trail, let from = dot, from != p {
-            segments.append(Segment(id: nextID, from: from, to: p, color: color))
+        if page != self.page, !segments.isEmpty { segments.removeAll() }
+        if self.camera != camera { self.camera = camera }
+        if trail, page == self.page, let from = self.point, from != point {
+            segments.append(Segment(id: nextID, from: from, to: point, color: color))
             nextID += 1
             if segments.count > Self.maxSegments { segments.removeFirst(segments.count - Self.maxSegments) }
         }
         self.page = page
-        pagePoint = point
         self.color = color
-        dot = p
+        self.point = point
     }
 
-    /// The camera moved: keep the dot on the same spot of the page.
-    func reproject(page: PageID, camera: CGAffineTransform) {
-        guard dot != nil else { return }
-        guard page == self.page, let point = pagePoint else {
-            lift()
-            return
+    /// The camera moved. On the same page the dot and trail ride along (gliding with the stage when `animated`);
+    /// another page clears them.
+    func reproject(page: PageID, camera: CGAffineTransform, animated: Bool) {
+        if page != self.page { clear() }
+        guard camera != self.camera else { return }
+        if animated && (point != nil || !segments.isEmpty) {
+            NibMotion.animate(NibMotion.glide) { self.camera = camera }
+        } else {
+            self.camera = camera
         }
-        let p = point.cg.applying(camera)
-        if dot != p { dot = p }
     }
 
     func lift() {
-        if dot != nil { dot = nil }
-        page = nil
-        pagePoint = nil
+        if point != nil { point = nil }
     }
 
     func clear() {
         lift()
+        page = nil
         if !segments.isEmpty { segments.removeAll() }
     }
 
@@ -442,18 +467,82 @@ enum LaserStyle {
     static let trailWidth: CGFloat = 4
 }
 
+/// The camera as SwiftUI animates it: `PresentationCamera` only scales uniformly and translates, so three numbers
+/// interpolate exactly like the stage's `transform` does in UIKit.
+struct LaserCamera: Equatable {
+    var scale: CGFloat
+    var tx: CGFloat
+    var ty: CGFloat
+
+    init(_ t: CGAffineTransform) {
+        scale = t.a
+        tx = t.tx
+        ty = t.ty
+    }
+
+    var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>> {
+        get { AnimatablePair(scale, AnimatablePair(tx, ty)) }
+        set {
+            scale = newValue.first
+            tx = newValue.second.first
+            ty = newValue.second.second
+        }
+    }
+
+    func apply(_ p: Point) -> CGPoint {
+        CGPoint(x: CGFloat(p.x) * scale + tx, y: CGFloat(p.y) * scale + ty)
+    }
+}
+
+/// Centres a view on a page point through the camera. Only the camera animates: a new point lands at once, on the
+/// camera as it is right now.
+struct LaserPlacement: GeometryEffect {
+    var point: Point
+    var camera: LaserCamera
+
+    var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>> {
+        get { camera.animatableData }
+        set { camera.animatableData = newValue }
+    }
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        let p = camera.apply(point)
+        return ProjectionTransform(CGAffineTransform(translationX: p.x - size.width / 2, y: p.y - size.height / 2))
+    }
+}
+
+/// One trail segment between two page points, stroked in display points (the line keeps its 4 pt width at any zoom).
+struct LaserSegmentShape: Shape {
+    var from: Point
+    var to: Point
+    var camera: LaserCamera
+
+    var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>> {
+        get { camera.animatableData }
+        set { camera.animatableData = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: camera.apply(from))
+        path.addLine(to: camera.apply(to))
+        return path
+    }
+}
+
 struct LaserOverlayView: View {
     @ObservedObject var laser: LaserModel
 
     var body: some View {
+        let camera = LaserCamera(laser.camera)
         ZStack(alignment: .topLeading) {
             Color.clear
             ForEach(laser.segments) { segment in
-                LaserTrailSegment(segment: segment) { laser.remove(segment.id) }
+                LaserTrailSegment(segment: segment, camera: camera) { laser.remove(segment.id) }
             }
-            if let dot = laser.dot {
+            if let point = laser.point {
                 LaserDot(color: Color(uiColor: laser.color))
-                    .position(dot)
+                    .modifier(LaserPlacement(point: point, camera: camera))
             }
         }
         .ignoresSafeArea()
@@ -480,19 +569,17 @@ struct LaserDot: View {
 
 struct LaserTrailSegment: View {
     let segment: LaserModel.Segment
+    let camera: LaserCamera
     let onFaded: () -> Void
     @State private var faded = false
 
     var body: some View {
-        Path { path in
-            path.move(to: segment.from)
-            path.addLine(to: segment.to)
-        }
-        .stroke(Color(uiColor: segment.color), style: StrokeStyle(lineWidth: LaserStyle.trailWidth, lineCap: .round))
-        .opacity(faded ? 0 : 1)
-        .onAppear {
-            withAnimation(NibMotion.laserFade) { faded = true } completion: { onFaded() }
-        }
+        LaserSegmentShape(from: segment.from, to: segment.to, camera: camera)
+            .stroke(Color(uiColor: segment.color), style: StrokeStyle(lineWidth: LaserStyle.trailWidth, lineCap: .round))
+            .opacity(faded ? 0 : 1)
+            .onAppear {
+                withAnimation(NibMotion.laserFade) { faded = true } completion: { onFaded() }
+            }
     }
 }
 
@@ -629,6 +716,37 @@ final class PresentationViewController: UIViewController {
 
 // MARK: - Live source
 
+/// The union of a board's live items, kept current from commits: a commit costs only its own items' bounds, and the
+/// board is walked again only when an item on the union's edge moved inwards or went away.
+struct BoardExtent {
+    let doc: DocumentID
+    let page: PageID
+    /// nil = an empty board.
+    private(set) var union: Rect?
+
+    init(doc: DocumentID, page: PageID, items: [Item]) {
+        self.doc = doc
+        self.page = page
+        for item in items where !item.deleted { grow(item.bounds) }
+    }
+
+    /// Applies one item write. False: the union may have shrunk, so the caller has to rebuild it.
+    mutating func apply(before: Item?, after: Item) -> Bool {
+        let afterBounds = after.deleted ? nil : after.bounds
+        if let before = before, !before.deleted, let u = union {
+            let b = before.bounds
+            let inside = b.minX > u.minX && b.minY > u.minY && b.maxX < u.maxX && b.maxY < u.maxY
+            if !inside && !(afterBounds?.contains(b) ?? false) { return false }
+        }
+        if let a = afterBounds { grow(a) }
+        return true
+    }
+
+    private mutating func grow(_ r: Rect) {
+        union = union.map { $0.union(r) } ?? r
+    }
+}
+
 /// The active window's session, the workspace, the renderer and the main window.
 @MainActor
 final class LivePageSource: PresentationPageSource {
@@ -643,14 +761,22 @@ final class LivePageSource: PresentationPageSource {
     private var watches = Set<AnyCancellable>()
     private var subscriptions: [EventSubscription] = []
     private var version = 0
-    private var boardCache: (doc: DocumentID, page: PageID, version: Int, bounds: Rect?)?
+    /// The current page's position among the live pages (sorting them is O(n log n), and `current` runs on every
+    /// scroll frame): dropped whenever that document's head changes or it closes.
+    private var place: (doc: DocumentID, page: PageID, index: Int, count: Int)?
+    private var board: BoardExtent?
 
     init(app: NibApp) {
         self.app = app
         subscriptions.append(app.bus.observeCommits { [weak self] changeset in self?.committed(changeset) })
         subscriptions.append(app.events.subscribe { [weak self] event in self?.received(event) })
-        // The shell activates a window's session when the window becomes active; re-read then.
-        NotificationCenter.default.publisher(for: UIScene.didActivateNotification)
+        // The shell activates a window's session when the window becomes active, or (Split View, Stage Manager: both
+        // scenes stay active) when the other window becomes key; re-read then.
+        let center = NotificationCenter.default
+        center.publisher(for: UIScene.didActivateNotification)
+            .sink { [weak self] _ in self?.onChange?() }
+            .store(in: &watches)
+        center.publisher(for: UIWindow.didBecomeKeyNotification)
             .sink { [weak self] _ in self?.onChange?() }
             .store(in: &watches)
     }
@@ -660,14 +786,14 @@ final class LivePageSource: PresentationPageSource {
         guard let session = session, let doc = session.document, let pid = session.page else { return nil }
         if app.services.lock?.isLocked(doc) == true { return nil }
         guard let content = try? app.workspace.content(doc), let record = content.page(pid), !record.deleted,
-              let index = content.pageIndex(pid) else { return nil }
+              let place = placeOf(doc: doc, page: pid, content: content) else { return nil }
         let bounds: Rect
         if let size = record.size {
             bounds = Rect(x: 0, y: 0, width: size.width, height: size.height)
         } else {
             bounds = boardBounds(doc: doc, page: pid) ?? session.visibleRect ?? .zero
         }
-        return PresentedPage(doc: doc, page: pid, index: index, count: content.livePages.count, bounds: bounds,
+        return PresentedPage(doc: doc, page: pid, index: place.index, count: place.count, bounds: bounds,
                              visibleRect: session.visibleRect, version: version, hiddenLayers: session.hiddenLayers,
                              isBoard: record.size == nil)
     }
@@ -712,7 +838,26 @@ final class LivePageSource: PresentationPageSource {
         s.$hiddenLayers.dropFirst().sink { [weak self] _ in self?.onChange?() }.store(in: &sessionWatches)
     }
 
+    private func placeOf(doc: DocumentID, page: PageID, content: DocumentContent) -> (index: Int, count: Int)? {
+        if let p = place, p.doc == doc, p.page == page { return (p.index, p.count) }
+        let pages = content.livePages                      // one filter and sort for both numbers
+        guard let index = pages.firstIndex(where: { $0.id == page }) else { return nil }
+        place = (doc, page, index, pages.count)
+        return (index, pages.count)
+    }
+
     private func committed(_ changeset: Changeset) {
+        if let p = place, changeset.headChanged(p.doc) { place = nil }
+        if var b = board, changeset.itemPages[b.doc]?.contains(b.page) == true {
+            var intact = true
+            for case let .item(d, p, before, after) in changeset.mutations where d == b.doc && p == b.page {
+                if !b.apply(before: before, after: after) {
+                    intact = false
+                    break
+                }
+            }
+            board = intact ? b : nil                     // nil: rebuilt on the next read
+        }
         guard let s = session, let doc = s.document, let pid = s.page, changeset.documents.contains(doc) else { return }
         if changeset.itemPages[doc]?.contains(pid) == true || changeset.headChanged(doc) {
             version += 1
@@ -724,22 +869,25 @@ final class LivePageSource: PresentationPageSource {
         switch event.type {
         case NibEventType.laserMoved:
             onLaser?(LaserEvent(payload: event.payload))
-        case NibEventType.sessionDocument, NibEventType.pageChanged, NibEventType.docClosed:
+        case NibEventType.docClosed:
+            // A document merges from disk when it opens again: its cached numbers may be stale.
+            if let doc = event.doc {
+                if place?.doc == doc { place = nil }
+                if board?.doc == doc { board = nil }
+            }
+            onChange?()
+        case NibEventType.sessionDocument, NibEventType.pageChanged:
             onChange?()
         default:
             break
         }
     }
 
-    /// A board has no page size: Full Page shows its content (cached per content version).
+    /// A board has no page size: Full Page shows its content, plus a margin.
     private func boardBounds(doc: DocumentID, page: PageID) -> Rect? {
-        if let c = boardCache, c.doc == doc, c.page == page, c.version == version { return c.bounds }
-        var union: Rect?
-        for item in (try? app.workspace.items(doc, page: page)) ?? [] {
-            union = union.map { $0.union(item.bounds) } ?? item.bounds
+        if board?.doc != doc || board?.page != page {
+            board = BoardExtent(doc: doc, page: page, items: (try? app.workspace.items(doc, page: page)) ?? [])
         }
-        let bounds = union.map { $0.insetBy(-LivePageSource.boardMargin) }
-        boardCache = (doc, page, version, bounds)
-        return bounds
+        return board?.union.map { $0.insetBy(-LivePageSource.boardMargin) }
     }
 }

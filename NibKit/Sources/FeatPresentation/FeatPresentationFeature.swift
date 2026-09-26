@@ -22,6 +22,8 @@ public enum FeatPresentationFeature: NibFeature {
 
         // Share & Export › Presentation Mode, only while a display is connected. The mode in use carries a checkmark
         // (menu entries have no checked state, so each mode has a plain and a checked entry and one of them shows).
+        // The page modes need a page: they are offered in notebooks and whiteboards, Mirror everywhere. Choosing a
+        // mode also shows a blanked screen again.
         let submenu = String(localized: "Presentation Mode")
         for (i, mode) in ExternalDisplayMode.menuOrder.enumerated() {
             for checked in [false, true] {
@@ -29,8 +31,11 @@ public enum FeatPresentationFeature: NibFeature {
                     id: "presentation.mode." + mode.rawValue + (checked ? ".current" : ""), title: mode.title,
                     icon: checked ? NibSymbol.checkmark.name : nil, location: .shareExport, order: 800 + i, owner: id,
                     command: PresentSetMode.id,
-                    params: { _ in ["mode": .string(mode.rawValue)] },
-                    isVisible: { _ in controller.isConnected && (controller.mode == mode) == checked },
+                    params: { _ in ["mode": .string(mode.rawValue), "blank": .bool(false)] },
+                    isVisible: { ctx in
+                        controller.isConnected && (controller.mode == mode) == checked
+                            && (mode == .mirror || PresentationController.hasPages(ctx))
+                    },
                     submenu: submenu))
             }
         }
@@ -53,7 +58,8 @@ final class PresentationController: ObservableObject {
         let id: ObjectIdentifier
         let name: String
         let model: PresentationViewModel
-        let watch: AnyCancellable
+        /// The scene's disconnect notification (nil for displays connected without a scene, in tests).
+        var watch: AnyCancellable?
     }
 
     unowned let app: NibApp
@@ -78,7 +84,16 @@ final class PresentationController: ObservableObject {
     var isPresenting: Bool { isConnected && mode != .mirror }
     var displayNames: [String] { connections.map { $0.name } }
 
+    /// The page modes need a page to show: only notebooks and whiteboards have one.
+    static func hasPages(_ ctx: MenuContext) -> Bool {
+        guard let doc = ctx.doc ?? ctx.session?.document,
+              let kind = try? ctx.app.workspace.content(doc).meta.kind else { return false }
+        return kind == .notebook || kind == .whiteboard
+    }
+
+    /// Blank needs a display to black out: with none connected it stays off, so the next display never starts black.
     func setBlank(_ on: Bool) {
+        let on = on && isConnected
         if blank != on { blank = on }
         let mode = self.mode
         for c in connections { c.model.apply(mode: mode, blank: on) }
@@ -86,20 +101,30 @@ final class PresentationController: ObservableObject {
 
     /// `ui.externalDisplay`: called by the shell when an AirPlay or cable display connects.
     func makeViewController(for scene: UIWindowScene) -> UIViewController {
-        let model = PresentationViewModel(source: LivePageSource(app: app), mode: mode, blank: blank)
         let id = ObjectIdentifier(scene)
+        let viewController = connect(id: id, name: ExternalDisplayName.current(), source: LivePageSource(app: app))
         let watch = NotificationCenter.default.publisher(for: UIScene.didDisconnectNotification, object: scene)
             .sink { [weak self] _ in self?.disconnect(id) }
-        let name = ExternalDisplayName.current()
-        connections.append(Connection(id: id, name: name, model: model, watch: watch))
+        if let i = connections.firstIndex(where: { $0.id == id }) { connections[i].watch = watch }
+        return viewController
+    }
+
+    /// A display connected: it gets its own view model and view controller for as long as it stays connected, and
+    /// `present.setMode` / `settings.set` switch that same pair in place.
+    func connect(id: ObjectIdentifier, name: String, source: PresentationPageSource) -> PresentationViewController {
+        disconnect(id)                                  // the same scene connecting again replaces its old model
+        if connections.isEmpty && blank { blank = false }
+        let model = PresentationViewModel(source: source, mode: mode, blank: blank)
+        connections.append(Connection(id: id, name: name, model: model, watch: nil))
         model.setNeedsUpdate()
         if isPresenting {
-            UIAccessibility.post(notification: .announcement, argument: String(localized: "Presenting on \(name)"))
+            UIAccessibility.post(notification: .announcement,
+                                 argument: String(localized: "Presenting \(mode.title) on \(name)"))
         }
         return PresentationViewController(model: model)
     }
 
-    private func disconnect(_ id: ObjectIdentifier) {
+    func disconnect(_ id: ObjectIdentifier) {
         guard let i = connections.firstIndex(where: { $0.id == id }) else { return }
         connections[i].model.stop()
         connections.remove(at: i)
@@ -135,6 +160,8 @@ final class PresenterHUDModel: ObservableObject {
 
     @Published var layout = Layout.regular
     @Published var displayName = ""
+    /// The mode's title ("Full Page"), for VoiceOver: the menu shows the mode only as a checkmark icon.
+    @Published var modeTitle = ""
     @Published var page = 0
     @Published var pageCount = 0
     @Published var laserAvailable = false
@@ -174,17 +201,23 @@ struct PresenterHUD: View {
         .nibChromeTypeCap()
         .frame(maxHeight: .infinity)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(String(localized: "Presentation"))
+        .accessibilityLabel(hudLabel)
     }
 
-    private var presentingLabel: String { String(localized: "Presenting on \(model.displayName)") }
+    private var presentingText: String { String(localized: "Presenting on \(model.displayName)") }
+
+    /// "Presenting Full Page on Living Room TV" (and whether the screen is blanked): VoiceOver hears the mode here.
+    private var hudLabel: String {
+        let presenting = String(localized: "Presenting \(model.modeTitle) on \(model.displayName)")
+        return model.blank ? presenting + ", " + String(localized: "screen blanked") : presenting
+    }
 
     private var presenting: some View {
         HStack(spacing: NibSpacing.s) {
             Image(nib: .externalDisplay)
                 .font(NibFont.glyph(.bar))
             if model.layout == .regular {
-                Text(presentingLabel)
+                Text(presentingText)
                     .font(NibFont.barTitle)
                     .lineLimit(1)
             }
@@ -193,7 +226,7 @@ struct PresenterHUD: View {
         .padding(.leading, NibSpacing.m)
         .padding(.trailing, NibSpacing.xs)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(presentingLabel)
+        .accessibilityLabel(hudLabel)
     }
 
     private var pageCount: some View {
@@ -220,10 +253,12 @@ struct PresenterHUD: View {
     }
 }
 
-/// Hosts the presenter HUD on the active canvas while a page mode is on an external display. It floats over the
-/// visible part of the canvas and claims the touches that land on it, so they never ink.
-/// ponytail: a canvas attachment with static glass (the chrome's droplet container has no slot for feature HUDs);
-/// move it into the container if one appears.
+/// Hosts the presenter HUD on the active canvas while a page mode is on an external display (or the display is
+/// blanked, in any mode, so Blank can be undone). It floats over the visible part of the canvas and claims the touches
+/// that land on it, so they never ink.
+/// ponytail: a canvas attachment with static glass (the chrome's droplet container has no slot for feature HUDs and
+/// `nibIsInking` is internal to NibDesign, so it cannot recede while the Pencil is down); contract gap reported,
+/// move it into the container when a feature-HUD slot or a public inking signal lands.
 @MainActor
 final class PresenterHUDAttachment: CanvasAttachment {
     /// Canvases at least this wide (iPad landscape) spell out where they are presenting; narrower ones show the glyph.
@@ -234,6 +269,7 @@ final class PresenterHUDAttachment: CanvasAttachment {
     private weak var host: CanvasHost?
     private var hosting: UIHostingController<PresenterHUD>?
     private var watches = Set<AnyCancellable>()
+    private var commits: EventSubscription?
     private var refreshScheduled = false
     /// The HUD's measured size, kept while its content and the available width stay the same (scrolling only moves it).
     private var fitted: (width: CGFloat, size: CGSize)?
@@ -255,11 +291,21 @@ final class PresenterHUDAttachment: CanvasAttachment {
         host.canvasView.addSubview(hosting.view)
         self.hosting = hosting
 
+        // What the HUD says changes only with the controller, the page, the tool or the page table; scrolling and
+        // zooming (`canvasDidChange`) only move it.
         controller.objectWillChange.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &watches)
         host.session.$page.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &watches)
         host.session.$tool.sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &watches)
+        let doc = host.documentID
+        commits = host.app.bus.observeCommits { [weak self] changeset in
+            if changeset.headChanged(doc) { self?.scheduleRefresh() }
+        }
+        // The active window changes on activation, and (Split View, Stage Manager: both scenes stay active) when the
+        // other window becomes key.
         let center = NotificationCenter.default
         center.publisher(for: UIScene.didActivateNotification)
+            .sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &watches)
+        center.publisher(for: UIWindow.didBecomeKeyNotification)
             .sink { [weak self] _ in self?.scheduleRefresh() }.store(in: &watches)
         center.publisher(for: UIContentSizeCategory.didChangeNotification)
             .sink { [weak self] _ in
@@ -272,13 +318,15 @@ final class PresenterHUDAttachment: CanvasAttachment {
 
     func detach(from host: CanvasHost) {
         watches.removeAll()
+        commits?.cancel()
+        commits = nil
         hosting?.view.removeFromSuperview()
         hosting = nil
         self.host = nil
     }
 
     func canvasDidChange(_ host: CanvasHost) {
-        refresh()
+        reposition()
     }
 
     func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
@@ -296,33 +344,42 @@ final class PresenterHUDAttachment: CanvasAttachment {
         }
     }
 
+    /// Visibility and content, then position.
     private func refresh() {
         guard let host = host, let hosting = hosting else { return }
         let session = host.session
-        let visible = controller.isPresenting && host.app.services.sessions.active === session
+        let visible = (controller.isPresenting || controller.blank) && host.app.services.sessions.active === session
         hosting.view.isHidden = !visible
         guard visible else { return }
 
+        update(\.displayName, controller.displayNames.first ?? String(localized: "External Display"))
+        update(\.modeTitle, controller.mode.title)
+        if let content = try? host.app.workspace.content(host.documentID) {
+            let pages = content.livePages                  // one filter and sort for both numbers
+            update(\.pageCount, pages.count)
+            update(\.page, session.page.flatMap { id in pages.firstIndex { $0.id == id } }.map { $0 + 1 } ?? 0)
+        }
+        update(\.laserAvailable, host.app.ui.canvasTools.get("laser") != nil)
+        update(\.laserOn, session.tool == "laser")
+        update(\.blank, controller.blank)
+        reposition()
+    }
+
+    /// Layout and position only: cheap enough for every scroll and zoom frame.
+    private func reposition() {
+        guard let host = host, let hosting = hosting, !hosting.view.isHidden else { return }
         let canvas = host.canvasView
         let bounds = canvas.bounds
         let layout: PresenterHUDModel.Layout = bounds.width < NibMetrics.compactBreakpoint ? .compact
             : (bounds.width >= Self.fullLabelWidth ? .regular : .narrow)
         update(\.layout, layout)
-        update(\.displayName, controller.displayNames.first ?? String(localized: "External Display"))
-        if let content = try? host.app.workspace.content(host.documentID) {
-            update(\.pageCount, content.livePages.count)
-            update(\.page, session.page.flatMap { content.pageIndex($0) }.map { $0 + 1 } ?? 0)
-        }
-        update(\.laserAvailable, host.app.ui.canvasTools.get("laser") != nil)
-        update(\.laserOn, session.tool == "laser")
-        update(\.blank, controller.blank)
         if contentChanged {
             // SwiftUI renders the new state on its next pass: measure now, and once more after it has.
             contentChanged = false
             fitted = nil
             Task { [weak self] in
                 self?.fitted = nil
-                self?.refresh()
+                self?.reposition()
             }
         }
 
@@ -363,8 +420,10 @@ final class PresenterHUDAttachment: CanvasAttachment {
                          session: host.session)
     }
 
+    /// Back to mirroring the whole screen, never black.
     private func stop() {
         guard let host = host else { return }
-        host.app.perform(PresentSetMode.id, ["mode": .string(ExternalDisplayMode.mirror.rawValue)], session: host.session)
+        host.app.perform(PresentSetMode.id, ["mode": .string(ExternalDisplayMode.mirror.rawValue), "blank": .bool(false)],
+                         session: host.session)
     }
 }

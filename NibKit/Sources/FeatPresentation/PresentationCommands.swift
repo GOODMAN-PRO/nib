@@ -28,7 +28,8 @@ enum PresentationSettings {
 }
 
 /// `present.setMode {mode, blank?}`: the one presentation command. The presenter HUD, the Share & Export menu,
-/// plugins, the AI and the bridge all switch modes (and blank the screen) through it.
+/// plugins, the AI and the bridge all switch modes (and blank the screen) through it. A missing `blank` keeps the
+/// current state, so calling it with the current mode only reads the state (connection, displays, blank).
 struct PresentSetMode: NibCommand {
     static let id = "present.setMode"
 
@@ -47,11 +48,12 @@ struct PresentSetMode: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "present.setMode", title: "Presentation Mode",
-        summary: "External display: mirror (whole screen), presenter (active page, follows zoom/scroll) or fullPage (whole page, no animation); blank: true shows black.",
+        summary: "External display: mirror (whole screen), presenter (page follows zoom/scroll) or fullPage (whole page); blank true/false blacks out/shows; omitted keeps it.",
         params: .obj(["mode": .str("mirror | presenter | fullPage", choices: ExternalDisplayMode.allCases.map { $0.rawValue }),
-                      "blank": .bool("black out the external display (default false)")],
+                      "blank": .bool("true blacks out the connected display, false shows it again; omit to keep the current state")],
                      required: ["mode"]),
-        examples: [["mode": "presenter"], ["mode": "fullPage"], ["mode": "mirror"], ["mode": "presenter", "blank": true]],
+        examples: [["mode": "presenter"], ["mode": "fullPage"], ["mode": "mirror"], ["mode": "presenter", "blank": true],
+                   ["mode": "presenter", "blank": false]],
         effect: .session, target: .app)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
@@ -60,7 +62,7 @@ struct PresentSetMode: NibCommand {
                            hint: "use mirror, presenter or fullPage")
         }
         let controller = ctx.services.get(PresentationController.serviceKey, as: PresentationController.self)
-        controller?.setBlank(p.blank ?? false)
+        if let blank = p.blank { controller?.setBlank(blank) }
         ctx.services.settings.set(PresentationSettings.mode, mode)
         return Output(mode: mode.rawValue, blank: controller?.blank ?? false,
                       externalDisplay: controller?.isConnected ?? false, displays: controller?.displayNames ?? [])
