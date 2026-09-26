@@ -36,3 +36,4 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - v2/spec agent: catalogue rows + unbuilt-feature spec edits (F066 layers export, F007 roll key, etc.)
 - IMPLEMENT launched: F002 F006 F013 F021 F023 F091 F102 F103; CI: F031; F052 FIX held -> launch now that v2 is on main (after spec).
 - TODO after main CI green: merge main into all feat/* branches (only those not being worked on by an agent; agents merge it themselves).
+- contract gap (minor): ChromeOverlayDescriptor has no 'instant/no-motion' show option (F062 K key, DESIGN §9.3). Custom sound token missing (F062 uses system sound 1005).
