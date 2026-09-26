@@ -1,0 +1,41 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatInkSynth/GlyphSkeleton.swift:154-174 (centreLines) and :177-224 (thin)",
+      "problem": "Zhang-Suen as implemented deletes small solid blobs entirely: every pixel of a 2x2 block passes both conditions and all four go in the same sub-iteration, and larger dots can erode down to that shape. Nothing puts a vanished component back. I ran the same thin() in Python on filled discs 2-20 px across (a dot at emPixels 96 is about that size) and roughly 20% vanished. On real handwriting fonts: Comic Sans '.' and '·' come out with zero ink and '÷' loses both dots, so it reads as a minus. Segoe Print loses the dot of ';', Segoe Print Bold loses one dot of ':', and Gabriola loses the dot of '?'. This breaks the acceptance criterion (at least one stroke per non-space glyph) for dot-only glyphs. It also corrupts Math Assist answers written with ink.writeText (S-022), where '÷' turns into '−' and ':' disappears, and it can leave i/j dotless. Fallback fonts for characters the three handwriting fonts lack are exposed the same way. The tests only check that a glyph has at least one stroke, so a dotless i, a '÷' drawn as '−' or a '?' with no dot all still pass CI.",
+      "fix": "In centreLines, label the 8-connected components of g before thin() (a simple stack flood fill on the bordered grid). After thin() and removeRedundantPixels, check each component: if none of its pixels survived, set its pixel nearest the component's centroid back to 1. trace() already turns a degree-0 pixel into a dot chain. Add tests: a 2x2 block and a ~10 px disc each give exactly one polyline; for every InkSynthFont, 'i', 'j', ':', '?', '!' and '÷' give at least 2, 2, 2, 2, 2 and 3 strokes, and '.' gives at least 1."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/InkSynthCommands.swift:184-204 and :268-291",
+      "problem": "Time-of-check vs time-of-use. Caller ids are checked against the page's live items, and writeText checks that the page is not deleted, before the awaits (recognize.items and offMain typesetting). The write only happens later in ctx.mutate. DocTransaction.put inserts or replaces, so if a user, plugin or AI creates an item with the same id during the await, it is silently overwritten. Likewise, a page deleted during the await still gets ink written to it.",
+      "fix": "Run the checks again inside the mutate closure, just before InkSynthParams.write: call InkSynthParams.callerIDs(p.ids, doc:, page:, workspace: ctx.workspace, replacing:) again and `guard let rec = try tx.content(doc).page(page), !rec.deleted else { throw NibError.notFound(...) }`. Keep the early check so bad params still fail fast."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/InkSynthCommands.swift:160 and :138",
+      "problem": "`at` is only checked for being finite. Values beyond Float range, such as [1e39, 0], become +/-inf when StrokePoint(x: Float(...)) is built. Strokes with infinite coordinates then get stored. Both the AI and plugins can send this value.",
+      "fix": "Reject |at[i]| > 100_000 (the page-size limit DocTransaction enforces) with invalid_params at $.at, and add matching min/max to the schema's .num() items."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/InkSynthCommands.swift:78-90 (InkSynthParams.write)",
+      "problem": "InkModel.prepare (densify plus nib sizes) runs for every stroke inside the synchronous mutate body on the main actor. At the 5000-character cap that is about 10k strokes, and each put also does an O(n) insert into the page's item array. That goes well past the 16 ms main-actor budget, and §6.1 says heavy work must happen before mutate.",
+      "fix": "InkModel is nonisolated, so move the preparation into the offMain closure. Return layout.strokes already prepared (map InkModel.prepare there) and have write only build items and put them. Consider lowering maxCharacters to about 2000, and tell callers to write long text in several calls."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/InkSynthCommands.swift:187-190",
+      "problem": "When `at` is within 4 em of the page's right margin, or past it, the default maxWidth becomes nil and wrapping switches off completely. A long text then runs off the right edge of the page without limit.",
+      "fix": "Use `max(room, size * 4)` as the default wrap width when the page has a size, so text still wraps. Keep nil only for boards, where size is nil."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/InkSynthCommands.swift:277 / InkTypesetter.swift:254-255",
+      "problem": "The recognised old text is measured as it is returned. If recognize.items returns more than one line (text joined with '\\n'), verticalExtent measures a multi-line layout and the replacement ink comes out far too small. The new text, by contrast, is already flattened to one line.",
+      "fix": "In layout(_:matching:), flatten the old text the same way as the new text before calling verticalExtent: old.split(whereSeparator: { $0.isNewline }).joined(separator: \" \")."
+    }
+  ]
+}
