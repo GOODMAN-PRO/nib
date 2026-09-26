@@ -248,6 +248,31 @@ struct EditorChrome: View {
 
 - A popover that is not a palette tool's settings is a `NibBudPopover(placement:)`, a full-size child of the container: it buds from its source (a droplet id or a `nibBudAnchor`, even one another module owns) and positions itself beside it. `.droplet(id, style: .popover).budsFrom(sourceID, isPresented:)` is the raw form.
 - Toasts go through `.nibToast($item)` only: it places, times, replaces and announces them.
+- The palette docks by itself (`NibToolPalette(dock:)`: set the binding through your command, FeatToolbar's `toolbar.dock`). Anything else that docks like it is `.dropletDockable(id, length:, current:, onDock:)`, a full-size child of the container whose content lays itself out for `@Environment(\.nibDockEdge)`; `onDock` gets the dock a release or an accessibility action chose, and not adopting it sends the droplet home.
+- A reorderable grid (the library) shares one `NibReflow`:
+
+  ```swift
+  @State private var reflow = NibReflow<NodeID>()
+  ScrollView {
+      LazyVGrid(columns: columns, spacing: NibMetrics.libraryGutter) {
+          ForEach(notebooks) { n in
+              NotebookCard(n)
+                  .nibReflowItem(n.id, in: reflow)
+                  .nibReflowDraggable(n.id, in: reflow, order: notebooks.map(\.id)) { drop in
+                      switch drop {
+                      case .reorder(let move): model.reorder(move)   // now, then library.reorder {refs, after?, before?}
+                      case .combine(let a, into: let b): model.combine(a, into: b)   // library.move onto b
+                      case .none: break
+                      }
+                  }
+          }
+      }
+      .nibReflowSpace(reflow)
+  }
+  // …and in the window's NibDropletContainer: NibReflowCarrier(reflow) { id in NotebookCard(id) }
+  ```
+
+  Set `reflow.isPaused` while the card is fused with a folder film and `reflow.isCondensed` over the sidebar.
 - The canvas delegate sets `inking.isInking` on begin/end using tool and grows `inking.strokeBounds` as the stroke is drawn; nothing else observes it, so a Pencil down never re-evaluates the editor's body.
 - UIKit code uses `NibUIColor`, `NibUIFont`, `NibMotion.animateUIKit`, `NibHaptics`, `CALayer.nibElevation` and `UIImage(nib:)`.
 - Sheets, lists and Settings are opaque system surfaces: `List { NibRow(...) }.listStyle(.insetGrouped)`, `.nibSheet(isPresented:)`, `NibToggle`. There is no droplet in them.
@@ -258,7 +283,9 @@ struct EditorChrome: View {
 
 Files in the order below. Paths are relative to the repository root.
 
-Two files live beside these and are not reproduced here: `Gallery/DesignGallery.swift` (the Settings › Advanced › Developer screen that shows every token, component and droplet interaction in light and dark; the app shell registers it with `DesignGallery.registerSettingsPage(in:)`) and `NibKit/Tests/NibDesignTests/TokenContrastTests.swift` (WCAG contrast of the text tokens over the worst case beneath, §2.4 of DESIGN.md).
+Four files live beside these and are not reproduced here: `Gallery/DesignGallery.swift` (the Settings › Advanced › Developer screen that shows every token, component and droplet interaction in light and dark, the held rim included; the app shell registers it with `DesignGallery.registerSettingsPage(in:)`), `Gallery/DockAndReflowDemo.swift` (its Dock and reflow page: a `.dropletDockable` palette over a page of ink and a `NibReflow` notebook grid, to try the two drag feels on a device), `NibKit/Tests/NibDesignTests/TokenContrastTests.swift` (WCAG contrast of the text tokens over the worst case beneath, §2.4 of DESIGN.md) and `NibKit/Tests/NibDesignTests/GlassOpticsTests.swift` (Liquid Glass v2, DESIGN.md §10.9: the rim follows the top-left light with a counter-rim at half and is never a uniform stroke, every optic stays in the outer 4.5 pt so contrast holds under content, the held rim and shadow, Regular system glass with the accent as the only tint, `interactive` on touchable chrome, and the fallback selection of §12).
+
+**Liquid Glass v2 in code.** The optics numbers live in one place, `NibOptics` (§3.16), and reach both Metal functions as arguments, so the Swift and Metal argument lists must match one for one. On iOS 26 `DropletStyle.systemGlass` and `nibGlass` go through `NibSystemGlass` (Regular everywhere, the accent the only tint) and `NibGlassRenderer` picks system glass, water or the opaque union. The held rim is `DropletPresentation.rim` (`DropletStyle.rimStrength(lift:)`), drawn by `NibLiftRim` over iOS 26 glass and by the water shader through `WaterCluster.rim` on iOS 17–25. Outside the liquid files, three call sites follow: `Droplet.swift` (`GlassBody` draws `NibLiftRim` and no bud stroke, `FrameRim` draws its outline once, a droplet outside a container passes `isInteractive`), `DropletContainer.swift` (`NibShaders.waterField(cluster, iso:)`) and `Palette.swift` (`drawNibBeadRim`).
 
 ### 3.1 `NibKit/Sources/NibDesign/Modifiers/NibInteraction.swift`
 
@@ -438,21 +465,26 @@ public enum NibUIColor {
     public static let success = UIColor.systemGreen
     public static let warning = UIColor.systemOrange
 
-    // Water: what the droplet material is made of (DESIGN.md §3.3). Deep dark body is #1C1C1E @ 86 % (fix 3).
+    // Water: what the droplet material is made of (DESIGN.md §3.3). Deep dark body is #1C1C1E @ 86 % (fix 3). On iOS 26
+    // the system glass is the material and only the bodies (as the frozen tint while the Pencil is down) are used; the
+    // optics tokens below draw Nib's own water on iOS 17–25 (DESIGN.md §10.9).
     public static let clearBody = UIColor.nib(0xFFFFFF, 0.46, dark: 0x161618, 0.62, contrastLight: 0.72, contrastDark: 0.72)
     /// Clear over light paper: dark mode thickens to 80 % so a droplet over white paper is not a grey blob.
     public static let clearBodyOnPaper = UIColor.nib(0xFFFFFF, 0.46, dark: 0x161618, 0.80, contrastLight: 0.72, contrastDark: 0.86)
     public static let deepBody = UIColor.nib(0xF9F9FB, 0.72, dark: 0x1C1C1E, 0.86, contrastLight: 0.90, contrastDark: 0.92)
-    public static let deepGlassTint = UIColor.nib(0xFFFFFF, 0.35, dark: 0x1C1C1E, 0.45)
     public static let waterBody = UIColor.nib(0xFFFFFF, 0.08, dark: 0xFFFFFF, 0.03)
-    /// Edge and caustic are drawn over light paper only (DESIGN.md §3.3); over a flat desk they read as a pillow.
-    public static let waterEdge = UIColor.nib(0x141C28, 0.07, dark: 0xFFFFFF, 0.08)
-    public static let waterCaustic = UIColor.nib(0xFFFFFF, 0.12, dark: 0xFFFFFF, 0.10)
-    public static let waterRim = UIColor.nib(0xFFFFFF, 0.85, dark: 0xFFFFFF, 0.42)
-    /// A Tinted droplet's only optic.
+    /// The rim at full strength: a 0.8 pt line lit by the top-left key light, half as bright on the counter side, and
+    /// 22 % of it as the sheen inside the lit edge. Never a uniform stroke.
+    public static let waterRim = UIColor.nib(0xFFFFFF, 0.85, dark: 0xFFFFFF, 0.50)
+    /// A Tinted droplet's only optic (key and counter rim, no sheen).
     public static let tintRim = UIColor.nib(0xFFFFFF, 0.30, dark: 0xFFFFFF, 0.30)
     public static let waterLine = UIColor.nib(0x000000, 0.075, dark: 0xFFFFFF, 0.12, contrastLight: 0.25, contrastDark: 0.40)
     public static let waterLineBud = UIColor.nib(0x000000, 0.12, dark: 0xFFFFFF, 0.16, contrastLight: 0.25, contrastDark: 0.40)
+    /// The water's own shadow over a flat backdrop (desk, library, sheets), and over light paper. Light mode: deeper over
+    /// paper, where there is ink to separate from (the system glass's shadow grows over text). Dark mode: lighter over
+    /// paper, where the dark water already stands off the white page and a deep halo reads as a smudge.
+    public static let waterShadow = UIColor.nib(0x000000, 0.08, dark: 0x000000, 0.28)
+    public static let waterShadowOnPaper = UIColor.nib(0x000000, 0.13, dark: 0x000000, 0.18)
     public static let beadBody = UIColor.nib(0xFFFFFF, 0.70, dark: 0xFFFFFF, 0.22)
     /// Slider thumbs only; the selection bead has no shadow.
     public static let beadShadow = UIColor.nib(0x000000, 0.16, dark: 0x000000, 0.45)
@@ -489,14 +521,13 @@ public enum NibColor {
     public static let clearBody = Color(uiColor: NibUIColor.clearBody)
     public static let clearBodyOnPaper = Color(uiColor: NibUIColor.clearBodyOnPaper)
     public static let deepBody = Color(uiColor: NibUIColor.deepBody)
-    public static let deepGlassTint = Color(uiColor: NibUIColor.deepGlassTint)
     public static let waterBody = Color(uiColor: NibUIColor.waterBody)
-    public static let waterEdge = Color(uiColor: NibUIColor.waterEdge)
-    public static let waterCaustic = Color(uiColor: NibUIColor.waterCaustic)
     public static let waterRim = Color(uiColor: NibUIColor.waterRim)
     public static let tintRim = Color(uiColor: NibUIColor.tintRim)
     public static let waterLine = Color(uiColor: NibUIColor.waterLine)
     public static let waterLineBud = Color(uiColor: NibUIColor.waterLineBud)
+    public static let waterShadow = Color(uiColor: NibUIColor.waterShadow)
+    public static let waterShadowOnPaper = Color(uiColor: NibUIColor.waterShadowOnPaper)
     public static let beadBody = Color(uiColor: NibUIColor.beadBody)
     public static let beadShadow = Color(uiColor: NibUIColor.beadShadow)
     public static let swatchHairline = Color(uiColor: NibUIColor.swatchHairline)
@@ -879,16 +910,21 @@ public enum NibMotion {
     /// Liquid Off: set by `NibDropletContainer` from the Appearance setting, next to `NibHaptics.isEnabled`.
     public static var forcesReduced = false
 
+    /// A held droplet following the finger. Critically damped, so it never overshoots the finger; it trails it by
+    /// v·ζ·response/π (27 ms of travel: 27 pt at 1000 pt/s) and catches up within about 0.1 s of the finger stopping.
+    /// That slight lag is the water's weight (DESIGN.md §10.1).
     public static let follow = NibSpring(response: 0.085, dampingRatio: 1.0)
     public static let tap = NibSpring(response: 0.22, dampingRatio: 0.90)
     public static let lift = NibSpring(response: 0.30, dampingRatio: 0.72)
     /// Selection bead head: a selection indicator never overshoots.
     public static let glide = NibSpring(response: 0.20, dampingRatio: 1.0)
     public static let trail = NibSpring(response: 0.26, dampingRatio: 1.0)
-    /// The palette's dock only, from the full release velocity.
+    /// The palette's dock only (`.dropletDockable`, `NibToolPalette`), from the full release velocity: one small
+    /// overshoot, then the plip on arrival (DESIGN.md §10.11).
     public static let snap = NibSpring(response: 0.50, dampingRatio: 0.80)
     /// Grid and slot snaps, from `DropletPhysics.slotVelocity`: lands without passing the slot.
     public static let slot = NibSpring(response: 0.40, dampingRatio: 1.0)
+    /// Neighbours making room (the library's live reorder, `NibReflow`; page thumbnails) and folder films.
     public static let reflow = NibSpring(response: 0.44, dampingRatio: 0.86)
     public static let tether = NibSpring(response: 0.40, dampingRatio: 0.62)
     public static let bud = NibSpring(response: 0.42, dampingRatio: 0.76)
@@ -920,6 +956,9 @@ public enum NibMotion {
     public static let laserFade = Animation.linear(duration: 0.6)
 
     public static let recedeDelay: Double = 0.45
+    /// A HUD that answers a gesture (the ruler's angle, the pinch-zoom percentage) lingers this long after the fingers
+    /// lift, then fades out with `exit` (DESIGN.md §9.2).
+    public static let hudLinger: Double = 0.6
     public static let budRevealDelay: Double = 0.30
     public static let toastDuration: Double = 6
     public static let combineHold: Double = 0.38
@@ -951,7 +990,8 @@ import CoreHaptics
 import QuartzCore
 
 public enum NibHapticEvent: CaseIterable, Sendable {
-    case merge, split, bud, snap, select, armed, success, detent, warning
+    /// `plip`: a dockable droplet (the palette) arrives in its dock: one light, crisp drop, played once per landing.
+    case merge, split, bud, snap, plip, select, armed, success, detent, warning
 }
 
 /// Droplet haptics (DESIGN.md §11). Coalesced to one per 60 ms, silent while the Pencil is down or Liquid is Off.
@@ -1030,6 +1070,10 @@ final class PlipPlayer {
             transients([(0.30, 0.60, 0)]) { self.soft.impactOccurred(intensity: 0.4) }
         case .snap:
             transients([(0.55, 0.40, 0)]) { self.soft.impactOccurred(intensity: 0.7) }
+        case .plip:
+            // One light, crisp drop landing: lighter and sharper than a slot snap, a single transient (not the merge's
+            // two-tap plip).
+            transients([(0.40, 0.85, 0)]) { self.rigid.impactOccurred(intensity: 0.45) }
         }
     }
 
@@ -1225,9 +1269,47 @@ public enum NibGlass: Sendable {
     case clear, deep, tinted, bead
 }
 
+/// What Nib asks of the system glass on iOS 26+ (DESIGN.md §2.2). Every droplet is the Regular variant: Apple never
+/// mixes Regular and Clear in one interface, and Clear is for media-rich backdrops with a dimming layer beneath, which
+/// a page of handwriting is not. Regular already thickens itself for large surfaces (popovers, panels) and adapts its
+/// shadow and tint to what is beneath, so Deep is not tinted either: a tint means prominence, never thickness, and
+/// only the Tinted material (the one primary action) has one. `isInteractive` is set wherever the glass takes the touch.
+struct NibSystemGlass: Equatable {
+    var tintsAccent: Bool
+    var isInteractive: Bool
+
+    static func of(_ kind: NibGlass, interactive: Bool) -> NibSystemGlass {
+        NibSystemGlass(tintsAccent: kind == .tinted, isInteractive: interactive)
+    }
+
+    @available(iOS 26.0, *)
+    var glass: Glass {
+        (tintsAccent ? Glass.regular.tint(NibColor.accent) : Glass.regular).interactive(isInteractive)
+    }
+}
+
+/// Which recipe draws the droplet material (DESIGN.md §2.3, §12). The system glass handles Reduce Transparency (it
+/// frosts) and Increase Contrast (it borders) itself, so on iOS 26 only Liquid Off replaces it.
+enum NibGlassRenderer: Equatable {
+    /// System Liquid Glass (iOS 26+).
+    case system
+    /// Nib's water: body tint, rim, sheen, outline, shadow (iOS 17–25).
+    case water
+    /// One opaque fill with the 0.8 pt line: Liquid Off everywhere; Reduce Transparency and thermal throttling on 17–25.
+    case opaque
+
+    static func select(systemGlass: Bool, mode: NibLiquidMode, reduceTransparency: Bool,
+                       throttled: Bool = false) -> NibGlassRenderer {
+        if mode == .off { return .opaque }
+        if systemGlass { return .system }
+        return reduceTransparency || throttled ? .opaque : .water
+    }
+}
+
 public extension View {
     /// The droplet material on a single surface that has no physics, such as a floating HUD outside a container.
-    /// Inside a `NibDropletContainer` use `.droplet(_:style:)`, which merges, stretches and buds.
+    /// Inside a `NibDropletContainer` use `.droplet(_:style:)`, which merges, stretches and buds. `interactive`: the
+    /// surface holds controls, so on iOS 26 the glass answers touches the way system buttons do.
     func nibGlass(_ kind: NibGlass = .clear, cornerRadius: CGFloat? = nil, interactive: Bool = false) -> some View {
         modifier(NibGlassModifier(kind: kind, shape: NibDropletShape(cornerRadius: cornerRadius), interactive: interactive))
     }
@@ -1260,56 +1342,71 @@ struct NibGlassModifier: ViewModifier {
     @Environment(\.nibIsInking) private var frozen
 
     func body(content: Content) -> some View {
-        content.background { material }
-    }
-
-    @ViewBuilder private var material: some View {
-        if reduceTransparency || mode == .off {
-            opaque
-        } else if kind == .bead {
-            shape.fill(NibColor.beadBody)              // a bead is body plus rim: no shadow (DESIGN.md §2.2)
-                .overlay { NibWaterRimLayer(cornerRadius: shape.cornerRadius, rimOnly: true) }
-        } else {
-            glass
-        }
-    }
-
-    @ViewBuilder private var glass: some View {
         if #available(iOS 26.0, *) {
-            if frozen {
-                shape.fill(tint).glassEffect(.identity, in: shape)
-            } else {
-                Color.clear.glassEffect(systemGlass, in: shape)
-            }
+            // The glass is applied to the content itself, as Apple's custom-view guide does: its foreground effects
+            // (vibrant labels, the interactive response) reach the controls. One modifier chain in every state, so a
+            // Pencil down or a Liquid change never rebuilds the content.
+            content
+                .background { systemUnderlay }
+                .glassEffect(systemGlass, in: shape)
         } else {
-            water
+            content.background { fallback }
         }
+    }
+
+    private var renderer: NibGlassRenderer {
+        var hasSystemGlass = false
+        if #available(iOS 26.0, *) { hasSystemGlass = true }
+        return NibGlassRenderer.select(systemGlass: hasSystemGlass, mode: mode, reduceTransparency: reduceTransparency)
     }
 
     private var tint: Color {
         kind == .deep ? NibColor.deepBody : (kind == .tinted ? NibColor.accent : NibColor.clearBody)
     }
 
+    /// iOS 26: nothing under system glass, except the plain body tint while frozen (`.identity` above it), the opaque
+    /// fill under Liquid Off, and a bead, which is a plain fill because it only ever sits inside glass (never glass on
+    /// glass, no rim painted over the system's).
     @available(iOS 26.0, *)
-    private var systemGlass: Glass {
-        switch kind {
-        case .clear, .bead: return Glass.regular.interactive(interactive)
-        case .deep: return Glass.regular.tint(NibColor.deepGlassTint)
-        case .tinted: return Glass.regular.tint(NibColor.accent).interactive(interactive)
+    @ViewBuilder private var systemUnderlay: some View {
+        if renderer == .opaque {
+            opaque
+        } else if kind == .bead {
+            shape.fill(NibColor.beadBody)
+        } else if frozen {
+            shape.fill(tint)
         }
     }
 
-    /// iOS 17–25: body tint (plus frost for Deep, not while inking) and the rim shader. No backdrop refraction.
-    /// A lone surface has no page behind it to lens, so it gets the rim and outline only; Tinted gets its 30 % rim.
+    @available(iOS 26.0, *)
+    private var systemGlass: Glass {
+        if renderer == .opaque || kind == .bead || frozen { return .identity }
+        return NibSystemGlass.of(kind, interactive: interactive).glass
+    }
+
+    @ViewBuilder private var fallback: some View {
+        if renderer == .opaque {
+            opaque
+        } else if kind == .bead {
+            shape.fill(NibColor.beadBody)              // a bead is body plus its key rim: no shadow (DESIGN.md §2.2)
+                .overlay { NibWaterRimLayer(cornerRadius: shape.cornerRadius, bead: true) }
+        } else {
+            water
+        }
+    }
+
+    /// iOS 17–25: the water's shadow (outside the body only), frost under Deep (not while inking), the body tint and
+    /// the analytic optics. A lone surface has no page behind it, so it gets no edge lens; Tinted gets its rim and the
+    /// outline only.
     private var water: some View {
         ZStack {
+            NibWaterShadow(shape: shape)
             if kind == .deep && !frozen {
                 shape.fill(.ultraThinMaterial)
             }
             shape.fill(tint)
-            NibWaterRimLayer(cornerRadius: shape.cornerRadius, rimOnly: true, tinted: kind == .tinted)
+            NibWaterRimLayer(cornerRadius: shape.cornerRadius, rimOnly: kind == .tinted, tinted: kind == .tinted)
         }
-        .nibElevation(.rest)
     }
 
     private var opaque: some View {
@@ -1319,12 +1416,18 @@ struct NibGlassModifier: ViewModifier {
     }
 }
 
-/// The water optics of one shape, analytic (no field). `rimOnly` drops edge, caustic and specular (a lone surface,
-/// a bead, a Tinted droplet); `tinted` uses the Tinted rim.
+/// The water optics of one shape, analytic (no field), for iOS 17–25 surfaces with no container field: `nibGlass`,
+/// beads, folder films, the zoom-window frame. Always the directional rim (key rim, counter-rim half as bright) and the
+/// 0.8 pt outline under it; the sheen unless `rimOnly` (flat library films, frames, Tinted). `tinted` uses the Tinted
+/// rim. `bead` is the key rim alone, no counter-rim, sheen or outline, so a bead never reads as a raised button.
+/// `strength` is the rim strength (1 at rest, `DropletStyle.liftedRim` held).
 struct NibWaterRimLayer: View {
     let cornerRadius: CGFloat?
     var rimOnly = false
     var tinted = false
+    var bead = false
+    var outline = true
+    var strength: CGFloat = 1
 
     var body: some View {
         GeometryReader { proxy in
@@ -1332,10 +1435,68 @@ struct NibWaterRimLayer: View {
             Rectangle()
                 .fill(Color.white)
                 .padding(-1)                    // 1 pt outset so the anti-aliased edge is not cut
-                .colorEffect(NibShaders.waterRim(cornerRadius: r, optics: rimOnly ? 0 : 1, tinted: tinted))
+                .colorEffect(NibShaders.waterRim(cornerRadius: r, strength: strength, sheen: !(rimOnly || bead),
+                                                 counter: !bead, outline: outline && !bead, tinted: tinted))
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+    }
+}
+
+/// iOS 26: a held droplet's brighter rim (DESIGN.md §10.9, Held). Nothing is painted on the system glass at rest. The
+/// body of a droplet in a container never takes the touch, so the system cannot light it up; while it is held this
+/// adds only the difference, the key and counter rim at (strength − 1) × `waterRim`, plus-lighter onto the system's own
+/// rim. No outline, no sheen.
+struct NibLiftRim: View {
+    let cornerRadius: CGFloat?
+    let boost: CGFloat
+
+    var body: some View {
+        NibWaterRimLayer(cornerRadius: cornerRadius, rimOnly: true, outline: false, strength: boost)
+            .blendMode(.plusLighter)
+    }
+}
+
+/// The water's shadow on iOS 17–25 for a lone surface (DESIGN.md §10.9): the silhouette blurred at σ 8 pt, 5 pt down,
+/// in `waterShadow`, drawn outside the body only so it never shows through the translucent water. Droplets in a
+/// container get the same shadow from the field shader.
+struct NibWaterShadow: View {
+    let shape: NibDropletShape
+    /// How far the shadow reaches past the body: 5 pt down plus two blur radii of 8 pt, rounded up.
+    static let reach: CGFloat = 24
+
+    var body: some View {
+        let reach = Self.reach
+        Canvas { context, size in
+            let rect = CGRect(x: reach, y: reach, width: max(0, size.width - 2 * reach),
+                              height: max(0, size.height - 2 * reach))
+            let silhouette = shape.path(in: rect)
+            var outside = Path(CGRect(origin: .zero, size: size))
+            outside.addPath(silhouette)
+            context.clip(to: outside, style: FillStyle(eoFill: true))
+            context.addFilter(.shadow(color: NibColor.waterShadow, radius: 8, x: 0, y: NibOptics.shadowOffset,
+                                      options: .shadowOnly))
+            context.fill(silhouette, with: .color(.black))
+        }
+        .padding(-reach)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+extension GraphicsContext {
+    /// The selection bead's rim (DESIGN.md §10.7, §10.9). iOS 17–25: the key rim alone, `waterRim` in a crescent
+    /// 0.8 pt wide where the edge faces the top-left light and tapering to nothing where it turns away (the bead minus
+    /// itself moved 0.8 pt away from the light). No counter-rim, sheen or line: it must not read as a raised button.
+    /// Inside iOS 26 system glass the bead is a plain fill and this draws nothing (no rim over the system's glass).
+    mutating func drawNibBeadRim(_ bead: Path, systemGlass: Bool) {
+        guard !systemGlass else { return }
+        drawLayer { layer in
+            layer.fill(bead, with: .color(NibColor.waterRim))
+            layer.blendMode = .destinationOut
+            layer.fill(bead.offsetBy(dx: -NibOptics.light.dx * NibOptics.beadRim, dy: -NibOptics.light.dy * NibOptics.beadRim),
+                       with: .color(.black))
+        }
     }
 }
 
@@ -1474,8 +1635,8 @@ public extension View {
     func nibLiquidMode(_ mode: NibLiquidMode) -> some View { environment(\.nibLiquidMode, mode) }
 
     /// The frames of light paper (luminance > 0.6) under the container, in its coordinates: the editor passes its
-    /// visible pages, never dark papers. Droplets over them get edge and caustic (DESIGN.md §3.3), dark-mode Clear
-    /// thickens to 80 %, and they recede while the Pencil is down.
+    /// visible pages, never dark papers. Droplets over them get the edge lens and a deeper shadow on iOS 17–25
+    /// (DESIGN.md §3.3), dark-mode Clear thickens to 80 %, and they recede while the Pencil is down.
     func nibBackdrop(_ pages: [CGRect]) -> some View { environment(\.nibBackdrop, pages) }
 }
 ```
@@ -1616,6 +1777,16 @@ enum DropletPhysics {
     static let carefulReleaseStill: Double = 0.070
     static let maxReleaseSpeed: CGFloat = 5000
     static let maxSlotSpeed: CGFloat = 1200
+    /// Settle lead (DESIGN.md §10.3): when the stretch target falls back towards zero (the droplet slows down), the
+    /// surface reacts as if it had fallen 33 ms earlier, so it overshoots zero once by about 6 % of its peak for every
+    /// droplet size (water landing: half a visible cycle, never a second bounce). Without it the settle is a dead stop.
+    static let settleLead: CGFloat = 0.033
+
+    /// How far a held droplet trails the finger at `speed` with a critically damped follow spring: v·ζ·response/π
+    /// (27 pt at 1000 pt/s with `follow`). The slight lag is the water's weight (DESIGN.md §10.1).
+    static func followLag(speed: CGFloat, spring: NibSpring = NibMotion.follow) -> CGFloat {
+        speed * CGFloat(spring.dampingRatio * spring.response) / .pi
+    }
 
     /// UIScrollView-style resistance past [lo, hi]: edge + D·(1 − 1/(0.55·e/D + 1)).
     static func rubberBand(_ v: CGFloat, lo: CGFloat, hi: CGFloat, dimension d: CGFloat = rubberDimension) -> CGFloat {
@@ -1888,8 +2059,15 @@ struct DropletDynamics: Equatable, Sendable {
         if reduceMotion || cap == 0 {
             stretch.snap(to: 0)
         } else {
+            let wobble = NibMotion.wobble(minor: min(w, h))
+            if abs(target) < abs(stretch.target) {
+                // Settle lead: a target falling back towards zero kicks the surface by the spring force it would have
+                // felt had it fallen `settleLead` earlier. Rising targets (speeding up) get no lead.
+                let omega = 2 * CGFloat.pi / CGFloat(wobble.response)
+                stretch.velocity += omega * omega * DropletPhysics.settleLead * (target - stretch.target)
+            }
             stretch.target = target
-            stretch.step(dt, spring: NibMotion.wobble(minor: min(w, h)))
+            stretch.step(dt, spring: wobble)
         }
         return !(offset.isResting && size.isResting && corner.isResting && stretch.isResting
                  && lift.isResting && anchor.isResting)
@@ -1959,10 +2137,20 @@ public struct DropletStyle: Equatable, Sendable {
     public var bondsOnRequest = false
     /// Rim and outline only, no body (the zoom-window target frame). Drawn by the droplet itself, outside the union.
     public var drawsBody = true
-    /// Page-resident droplets sit on ink and never refract it (the chip, the lasso object menu).
+    /// Page-resident droplets sit on ink and never refract it (the chip, the lasso object menu). iOS 17–25: no edge lens.
+    /// iOS 26: the system glass always lenses, so these are docked clear of ink instead; they stay the Regular variant
+    /// like every other droplet (Clear glass is for media and never mixes with Regular, DESIGN.md §2.2).
     public var refracts = true
-    /// iOS 26 glass responds to touch with the system's own highlight.
+    /// Touchable chrome: `Glass.interactive()` on iOS 26 wherever the glass itself takes the touch (`nibGlass`, a
+    /// droplet outside a container). Inside a container the body sits behind the content and is never hit-tested, so
+    /// the poke (§10.2) and the held rim (`liftedRim`) are the press response there.
     public var isInteractive = true
+    /// Rim strength at rest (DESIGN.md §10.9): 1. `lifted` raises it to `liftedRim`.
+    public var rim: CGFloat = 1
+    /// Rim strength while the droplet is held, reached at full lift and following the lift spring there and back: the
+    /// key rim, counter-rim and sheen all scale by it (1.5 = half as bright again). 1 = never brightens (precision
+    /// handles). iOS 26 draws the difference over the system glass; iOS 17–25 feeds it to the water shader.
+    public var liftedRim: CGFloat = NibOptics.liftedRim
 
     public static let bar = DropletStyle(material: .clear, cornerRadius: nil, stretchCap: 0.10, rigidity: 0.5,
                                          neck: NeckParams(join: 11, t0: 26, off: 44))
@@ -1998,7 +2186,7 @@ public struct DropletStyle: Equatable, Sendable {
                                              neck: NeckParams(join: 11, t0: 26, off: 44))
     /// Precision affordances never deform (DESIGN.md §10.15): lasso and resize handles, the rotation bead.
     public static let handle = DropletStyle(material: .clear, cornerRadius: nil, stretchCap: 0, rigidity: 1, lift: 1.0,
-                                            poke: 0, refracts: false, isInteractive: false)
+                                            poke: 0, refracts: false, isInteractive: false, liftedRim: 1)
     /// The zoom-window target: rim and outline only, radius 18, draggable with stretch.
     public static let frame = DropletStyle(material: .clear, cornerRadius: NibRadius.zoomFrame, stretchCap: 0.06,
                                            rigidity: 1, lift: 1.0, poke: 0, drag: .free, drawsBody: false,
@@ -2011,17 +2199,28 @@ public struct DropletStyle: Equatable, Sendable {
         case .tinted: return .tinted
         }
     }
+
+    /// The same droplet shown as held: its rim at `liftedRim` without being dragged (a feature's own press-and-hold
+    /// state, the gallery). A drag brightens the rim by itself, following the lift spring.
+    public var lifted: DropletStyle {
+        var style = self
+        style.rim = max(rim, liftedRim)
+        return style
+    }
+
+    /// Rim strength at lift progress `progress` (0 at rest, 1 fully lifted): `rim` → `max(rim, liftedRim)`.
+    public func rimStrength(lift progress: CGFloat) -> CGFloat {
+        rim + (max(rim, liftedRim) - rim) * min(max(progress, 0), 1)
+    }
+
+    /// What this droplet asks of the system glass on iOS 26 (DESIGN.md §2.2).
+    var systemGlassSpec: NibSystemGlass { NibSystemGlass.of(glassKind, interactive: isInteractive) }
 }
 
 @available(iOS 26.0, *)
 extension DropletStyle {
-    var systemGlass: Glass {
-        switch material {
-        case .clear: return refracts ? Glass.regular.interactive(isInteractive) : Glass.clear.interactive(isInteractive)
-        case .deep: return Glass.regular.tint(NibColor.deepGlassTint)
-        case .tinted: return Glass.regular.tint(NibColor.accent).interactive(isInteractive)
-        }
-    }
+    /// Regular for every material (tinted with the accent only for Tinted), interactive for touchable chrome.
+    var systemGlass: Glass { systemGlassSpec.glass }
 }
 
 /// Where the palette rests: an edge plus a 0…1 position along it.
@@ -2071,6 +2270,9 @@ struct DropletPresentation: Equatable {
     /// to it before its own transform, so the clip lands on the body and nothing ever draws outside it.
     var bodyMask: Path?
     var isLifted = false
+    /// Rim strength (DESIGN.md §10.9): 1 at rest, rising to the style's `liftedRim` with the lift spring while held.
+    /// iOS 26 draws the difference over the system glass (`NibLiftRim`); iOS 17–25 passes it to the water shader.
+    var rim: CGFloat = 1
     /// Released and still flowing home (the proposal chip shows its anchor until then).
     var isSettling = false
     var isDrawn = false
@@ -2217,8 +2419,13 @@ final class DropletField {
         let frostPath: Path
         let frostOpacity: Double
         let budLine: Bool
-        /// Share of the droplet over light paper (edge, caustic, dark-mode Clear body).
+        /// Share of the droplet over light paper (edge lens, deeper shadow, dark-mode Clear body).
         let paper: Double
+        /// Lift progress (0 at rest, 1 fully lifted) and the rim strength it gives (DESIGN.md §10.9).
+        let lift: Double
+        let rim: Double
+        /// False for covers and thumbnails: their content carries its own lifted shadow.
+        let castsShadow: Bool
     }
 
     // Per-frame state: not observed (views observe their own node, and the water layers the clusters).
@@ -2237,6 +2444,9 @@ final class DropletField {
     @ObservationIgnored private var nextSatellite = 0
     @ObservationIgnored private var stroke: CGRect = .null
     @ObservationIgnored private var backdrop: [CGRect] = []
+    /// A dockable droplet's meniscus to the dock it reaches for (DESIGN.md §10.11), by droplet id. `DockMeniscus`
+    /// (DropletDock.swift) owns its rules; the field steps it and draws it as one of that droplet's necks.
+    @ObservationIgnored private var meniscuses: [String: DockMeniscus] = [:]
 
     // Observed by the leaf layers only (water, frost, necks), and written only when they change.
     private(set) var clusters: [WaterCluster] = []
@@ -2543,6 +2753,7 @@ final class DropletField {
                 .applying(p.contentTransform.inverted())
         }
         p.isLifted = e.isDragging
+        p.rim = e.style.rimStrength(lift: liftProgress(e))
         p.isSettling = !e.isDragging && !e.dyn.offset.isResting
         p.isDrawn = isDrawn(e)
         p.recedes = recedes(e)
@@ -2558,10 +2769,12 @@ final class DropletField {
                 let progress = Double(bodySize(e).width / max(e.rest.width, 1))
                 frost = min(max((progress - 0.25) / 0.5, 0), 1)
             }
+            let lift = liftProgress(e)
             return Render(id: id, material: e.style.material, path: bodyPath(e, inset: 0), innerPath: bodyPath(e, inset: 0.8),
                           frostPath: bodyPath(e, inset: 1.5), frostOpacity: frost,
                           budLine: e.bud.map { !$0.revealed || $0.closingAt != nil } ?? false,
-                          paper: e.style.refracts ? paperShare(visualBox(e)) : 0)
+                          paper: e.style.refracts ? paperShare(visualBox(e)) : 0,
+                          lift: Double(lift), rim: Double(e.style.rimStrength(lift: lift)), castsShadow: !e.style.restsDry)
         }
     }
 
@@ -2581,9 +2794,11 @@ final class DropletField {
             for n in own { frame = frame.union(n.path.boundingRect.insetBy(dx: -n.thickness, dy: -n.thickness)) }
             for s in sats { frame = frame.union(s.path.boundingRect) }
             let recede = ids.contains { id in entries[id].map(recedes) ?? false }
+            let optics = WaterCluster.optics(members)
             return WaterCluster(id: ids[0], renders: members, necks: own, satellites: sats,
                                 frame: frame.insetBy(dx: -pad, dy: -pad).integral,
-                                opacity: recede ? NibLiquid.recedeOpacity : 1)
+                                opacity: recede ? NibLiquid.recedeOpacity : 1,
+                                rim: optics.rim, shadow: optics.shadow, shadowY: optics.shadowY)
         }
     }
 
@@ -2857,6 +3072,16 @@ final class DropletField {
 
     // MARK: Necks and clusters
 
+    /// Where droplet `id`'s meniscus reaches (a dock frame), or nil to let it go.
+    func setMeniscus(_ id: String, towards dock: CGRect?) {
+        if meniscuses[id] == nil && dock == nil { return }
+        var m = meniscuses[id] ?? DockMeniscus()
+        guard m.target != dock else { return }
+        m.target = dock
+        meniscuses[id] = m
+        wake()
+    }
+
     private func neckParams(_ a: Entry, _ b: Entry) -> NeckParams? {
         let budNeck = NeckParams(join: metrics.mergeDistance, t0: 30, off: metrics.budNeckOff)
         if let bud = b.bud, bud.owner == a.id { return budNeck }
@@ -2911,6 +3136,19 @@ final class DropletField {
                                                     .of(b.style.material, paper: b.style.refracts ? paperShare(boxB) : 0))))
                 }
             }
+        }
+        for (id, var m) in meniscuses {
+            guard let e = entries[id], e.hasRest else {
+                meniscuses[id] = nil
+                continue
+            }
+            let box = visualBox(e)
+            if m.step(dt, body: box, enabled: necksOn && isDrawn(e), minimumNeck: metrics.minimumNeck) { busy = true }
+            if let s = m.segment {
+                result.append(Neck(id: id + "|" + DockMeniscus.neckID, from: s.from, to: s.to, thickness: s.thickness,
+                                   colour: .of(e.style.material, paper: e.style.refracts ? paperShare(box) : 0)))
+            }
+            meniscuses[id] = m.isIdle ? nil : m
         }
         links = linked
         if result != necks { necks = result }
@@ -3230,8 +3468,8 @@ struct FrostLayer: View {
 
 /// iOS 17–25: each cluster's droplets and necks as one metaball field in a canvas framed to the cluster. The Canvas
 /// blurs the silhouettes (σ 8 pt iPad / 6.5 pt iPhone); the Metal layer effect thresholds it with analytic
-/// anti-aliasing and shades body, edge, caustic, specular, rim and outline. Material kinds and the paper share travel
-/// in the colour channels.
+/// anti-aliasing and shades body, edge lens, sheen, outline, directional rim and the water's shadow (DESIGN.md §10.9).
+/// Material kinds and the paper share travel in the colour channels.
 struct WaterLayer: View {
     let field: DropletField
 
@@ -3266,7 +3504,7 @@ struct WaterClusterCanvas: View, Equatable {
                 }
             }
         }
-        .layerEffect(NibShaders.waterField(iso: iso), maxSampleOffset: CGSize(width: 6, height: 8))
+        .layerEffect(NibShaders.waterField(cluster, iso: iso), maxSampleOffset: CGSize(width: 6, height: 8))
     }
 }
 
@@ -3387,7 +3625,7 @@ struct DropletModifier: ViewModifier {
                             bondsWith: bondsWith, onDrag: onDrag, field: field, node: field.node(id),
                             namespace: namespace, bud: bud)
         } else {
-            content.nibGlass(style.glassKind, cornerRadius: style.cornerRadius)
+            content.nibGlass(style.glassKind, cornerRadius: style.cornerRadius, interactive: style.isInteractive)
         }
     }
 }
@@ -3500,15 +3738,12 @@ struct FrameRim: View {
     let presentation: DropletPresentation
 
     var body: some View {
-        let shape = NibDropletShape(cornerRadius: presentation.cornerRadius)
-        ZStack {
-            shape.stroke(NibColor.waterLine, lineWidth: 0.8)
-            NibWaterRimLayer(cornerRadius: presentation.cornerRadius, rimOnly: true)
-        }
-        .frame(width: max(0, presentation.bodySize.width), height: max(0, presentation.bodySize.height))
-        .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+        // The rim layer draws the 0.8 pt outline itself: no second stroke (DESIGN.md §10.9).
+        NibWaterRimLayer(cornerRadius: presentation.cornerRadius, rimOnly: true, strength: presentation.rim)
+            .frame(width: max(0, presentation.bodySize.width), height: max(0, presentation.bodySize.height))
+            .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 
@@ -3548,8 +3783,11 @@ struct GlassBody: View {
             .glassEffect(frozen ? .identity : style.systemGlass, in: shape)
             .modifier(GlassIDModifier(id: id, namespace: namespace))
             .overlay {
-                if presentation.budLine {
-                    shape.stroke(NibColor.waterLineBud, lineWidth: 0.8)
+                // Nothing is painted on system glass at rest: its own rim, shadow and lensing are the droplet (a bud's
+                // outline is for the iOS 17–25 water only). Held, the rim brightens (DESIGN.md §10.9).
+                if presentation.rim > 1.001 {
+                    NibLiftRim(cornerRadius: style.cornerRadius == nil ? nil : presentation.cornerRadius,
+                               boost: presentation.rim - 1)
                 }
             }
             .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
@@ -3612,30 +3850,101 @@ struct BudAnchorReader: View {
 ### 3.16 `NibKit/Sources/NibDesign/Liquid/NibShaders.swift`
 
 ```swift
+import Foundation
 import SwiftUI
 
-/// The Metal functions in Shaders/NibLiquid.metal, loaded from this module's bundle.
-enum NibShaders {
-    static let library = ShaderLibrary.bundle(.module)
-    static let specular: Float = 0.55
+/// The water's optics (DESIGN.md §10.9, Liquid Glass v2), in one place: the Metal shaders receive these numbers as
+/// arguments, the Canvas bead rim uses them, and NibDesignTests checks them. Every optic lives in the outer 4.5 pt of a
+/// droplet; the core is the body tint alone. Nothing is a uniform stroke except the 0.8 pt outline under the rim.
+enum NibOptics {
+    /// Unit vector toward the key light in screen space (y down): the top-left, azimuth 225°.
+    static let light = CGVector(dx: -0.7071, dy: -0.7071)
+    /// Key lobe `max(λ, 0)^1.5` and counter lobe `counter · max(−λ, 0)^2`, λ = outward normal · light.
+    static let keyPower: CGFloat = 1.5
+    static let counterPower: CGFloat = 2
+    /// The counter-rim (bottom-right) at its peak, relative to the key rim at its peak.
+    static let counter: CGFloat = 0.5
+    /// The sheen inside the lit edge, as a share of `waterRim`, times the key lobe squared.
+    static let sheen: CGFloat = 0.22
+    /// The rim and outline band: `1 − smoothstep(0.3, 1.1, d)`, d = depth inside the silhouette in points (≈ 0.8 pt).
+    static let edgeBand: (CGFloat, CGFloat) = (0.3, 1.1)
+    /// The sheen band: `1 − smoothstep(0.8, 4.5, d)`.
+    static let sheenBand: (CGFloat, CGFloat) = (0.8, 4.5)
+    /// Edge lens (iOS 17–25, over light paper only): the body thins by up to 35 % at the silhouette, back to full by
+    /// 4 pt, as if the glass bent the page in at its rim. Content sits ≥ 4.5 pt inside, so text contrast is untouched.
+    static let lens: CGFloat = 0.35
+    static let lensDepth: CGFloat = 4
+    /// Deeper than this nothing but the body is drawn: the clear core.
+    static let opticsDepth: CGFloat = 4.5
+    /// Rim strength while a droplet is held, at full lift (`DropletStyle.liftedRim` default).
+    static let liftedRim: CGFloat = 1.5
+    /// The water's shadow (iOS 17–25): the field (the silhouette blurred at σ) moved down 5 pt at rest, 8 pt held, drawn
+    /// outside the body only; its opacity grows by 60 % at full lift.
+    static let shadowOffset: CGFloat = 5
+    static let liftedShadowOffset: CGFloat = 8
+    static let liftedShadow: CGFloat = 1.6
+    /// The selection bead's key rim: the bead minus itself moved this far away from the light.
+    static let beadRim: CGFloat = 0.8
 
-    /// Layer effect over one cluster's field Canvas (iOS 17–25).
-    static func waterField(iso: Float) -> Shader {
-        library.nibWaterField(
-            .float(iso),
-            .color(NibColor.clearBody), .color(NibColor.clearBodyOnPaper), .color(NibColor.deepBody), .color(NibColor.accent),
-            .color(NibColor.waterBody), .color(NibColor.waterEdge), .color(NibColor.waterCaustic), .color(NibColor.waterRim),
-            .color(NibColor.tintRim), .color(NibColor.waterLine), .float(specular))
+    static func smoothstep(_ a: CGFloat, _ b: CGFloat, _ x: CGFloat) -> CGFloat {
+        let t = min(max((x - a) / (b - a), 0), 1)
+        return t * t * (3 - 2 * t)
     }
 
-    /// Colour effect for one static shape (`nibGlass` fallback, folder films, frames): analytic rounded-rect distance,
-    /// no sampling. `optics` 0 draws the rim and outline only; `tinted` uses the Tinted rim.
-    static func waterRim(cornerRadius: CGFloat, optics: Float, tinted: Bool) -> Shader {
+    /// λ for an outward unit normal.
+    static func lambda(_ outward: CGVector) -> CGFloat { outward.dx * light.dx + outward.dy * light.dy }
+
+    static func key(_ outward: CGVector) -> CGFloat { pow(max(lambda(outward), 0), keyPower) }
+
+    /// How lit the rim is at an edge whose outward normal is `outward`: 1 facing the light, `counter` facing away, 0
+    /// where the edge runs parallel to the light.
+    static func rimLight(_ outward: CGVector) -> CGFloat {
+        key(outward) + counter * pow(max(-lambda(outward), 0), counterPower)
+    }
+
+    /// The rim's alpha at depth `d` for an edge facing `outward`, at strength `strength`, over a rim colour of alpha `a`.
+    static func rimAlpha(_ outward: CGVector, depth d: CGFloat, strength: CGFloat = 1, colourAlpha a: CGFloat) -> CGFloat {
+        min(a * rimLight(outward) * (1 - smoothstep(edgeBand.0, edgeBand.1, d)) * strength, 1)
+    }
+
+    /// The body's opacity factor at depth `d` over a droplet whose share over light paper is `paper` (edge lens).
+    static func lensFactor(depth d: CGFloat, paper: CGFloat) -> CGFloat {
+        1 - lens * min(max(paper, 0), 1) * (1 - smoothstep(0, lensDepth, d))
+    }
+}
+
+/// The Metal functions in Shaders/NibLiquid.metal, loaded from this module's bundle. The argument lists here and the
+/// function signatures there must match one for one.
+enum NibShaders {
+    static let library = ShaderLibrary.bundle(.module)
+
+    /// Layer effect over one cluster's field Canvas (iOS 17–25): body, edge lens, sheen, outline, directional rim and
+    /// the water's shadow. It samples ±1.5 pt around each pixel and 8 pt above it at most.
+    static func waterField(_ cluster: WaterCluster, iso: Float) -> Shader {
+        waterField(iso: iso, rim: cluster.rim, shadow: cluster.shadow, shadowY: cluster.shadowY)
+    }
+
+    static func waterField(iso: Float, rim: Float = 1, shadow: Float = 1,
+                           shadowY: Float = Float(NibOptics.shadowOffset)) -> Shader {
+        library.nibWaterField(
+            .float(iso), .float(rim), .float(shadow), .float(shadowY),
+            .float(NibOptics.light.dx), .float(NibOptics.light.dy), .float(NibOptics.counter), .float(NibOptics.sheen),
+            .float(NibOptics.lens),
+            .color(NibColor.clearBody), .color(NibColor.clearBodyOnPaper), .color(NibColor.deepBody), .color(NibColor.accent),
+            .color(NibColor.waterBody), .color(NibColor.waterRim), .color(NibColor.tintRim), .color(NibColor.waterLine),
+            .color(NibColor.waterShadow), .color(NibColor.waterShadowOnPaper))
+    }
+
+    /// Colour effect for one static shape (`nibGlass` on iOS 17–25, beads, folder films, frames, the held rim on iOS 26):
+    /// analytic rounded-rect distance, no sampling. `sheen` false drops the sheen, `counter` false the counter-rim,
+    /// `outline` false the 0.8 pt line; `tinted` uses the Tinted rim.
+    static func waterRim(cornerRadius: CGFloat, strength: CGFloat, sheen: Bool, counter: Bool, outline: Bool,
+                         tinted: Bool) -> Shader {
         library.nibWaterRim(
-            .boundingRect, .float(cornerRadius), .float(optics),
-            .color(NibColor.waterEdge), .color(NibColor.waterCaustic),
-            .color(tinted ? NibColor.tintRim : NibColor.waterRim), .color(NibColor.waterLine),
-            .float(tinted ? 0 : specular))
+            .boundingRect, .float(cornerRadius), .float(strength),
+            .float(NibOptics.light.dx), .float(NibOptics.light.dy), .float(counter ? NibOptics.counter : CGFloat(0)),
+            .float(sheen ? NibOptics.sheen : 0), .float(outline ? Float(1) : Float(0)),
+            .color(tinted ? NibColor.tintRim : NibColor.waterRim), .color(NibColor.waterLine))
     }
 }
 ```
@@ -3657,6 +3966,23 @@ struct WaterCluster: Identifiable, Equatable {
     var frame: CGRect
     /// 0.22 while any member recedes (the union cannot fade one member without changing its shape).
     var opacity: Double
+    /// The union's rim strength (its most lifted member's), shadow opacity multiplier and shadow offset (DESIGN.md §10.9).
+    var rim: Float = 1
+    var shadow: Float = 1
+    var shadowY: Float = Float(NibOptics.shadowOffset)
+
+    /// One union has one rim and one shadow: the rim follows the most lifted member; the shadow deepens from 1× at 5 pt
+    /// to 1.6× at 8 pt with the lift of the members that cast one, and is 0 when none does (lifted covers and
+    /// thumbnails bring their own).
+    static func optics(_ members: [DropletField.Render]) -> (rim: Float, shadow: Float, shadowY: Float) {
+        let rim = members.map(\.rim).max() ?? 1
+        let casting = members.filter(\.castsShadow)
+        guard !casting.isEmpty else { return (Float(rim), 0, Float(NibOptics.shadowOffset)) }
+        let lift = CGFloat(min(max(casting.map(\.lift).max() ?? 0, 0), 1))
+        let shadow = 1 + (NibOptics.liftedShadow - 1) * lift
+        let y = NibOptics.shadowOffset + (NibOptics.liftedShadowOffset - NibOptics.shadowOffset) * lift
+        return (Float(rim), Float(shadow), Float(y))
+    }
 
     /// Union-find over the linked pairs; groups keep the order of `ids`.
     static func groups(_ ids: [String], linked: Set<DropletField.PairKey>) -> [[String]] {
@@ -3684,6 +4010,1207 @@ struct WaterCluster: Identifiable, Equatable {
 }
 ```
 
+### 3.17a `NibKit/Sources/NibDesign/Liquid/DropletDock.swift`
+
+The palette's water dock (DESIGN.md §10.1–10.3, §10.10, §10.11), public so any droplet that docks like the palette can use it. `DropletDockModel` is the pure dock logic (region, frames, the projected release, the nearest dock with the top's +40 pt bias, the 200 / 160 pt capture radius, the meniscus law) and is unit-tested (§3.28a). `.dropletDockable(_:length:thickness:docks:current:style:reservedTrailing:onDock:)` makes a full-size child of the container a dockable droplet; its content reads `@Environment(\.nibDockEdge)` for its axis. `NibDock.commandValue` / `init?(commandValue:)` are the `toolbar.dock` names (left, right, top, bottom). Internally `DockMeniscus` is the neck to the dock that `DropletField` draws, `DropletDockDriver` is the hold-and-release path `NibToolPalette` shares, and `DockLanding` arms the one plip.
+
+```swift
+import SwiftUI
+import QuartzCore
+
+// MARK: - The dock model (pure)
+
+/// Where a dockable droplet (the tool palette) rests and which dock a release chooses (DESIGN.md §10.11). Pure value
+/// logic in one coordinate space (the container's, `NibLiquid.space`): every number the dock feel runs on lives here and
+/// is unit-tested.
+public struct DropletDockModel: Equatable, Sendable {
+    /// A release docks to the nearest dock only when the projected finger is within this distance of that dock's centre
+    /// line (the top counts `topBias` further). Anywhere else the droplet flows home to the dock it left: nothing rests
+    /// where it lands, and a drop in the middle of the page never moves the palette by accident.
+    public static let captureRadius: CGFloat = 200
+    /// iPhone (compact width): a narrower page and only the top and bottom docks.
+    public static let captureRadiusCompact: CGFloat = 160
+    /// The top dock sits under the bars, so it is chosen only on purpose: its distance counts 40 pt more.
+    public static let topBias: CGFloat = 40
+    /// The body is home when its centre is this close to its dock: the one plip plays then.
+    public static let arrivalTolerance: CGFloat = 1.5
+    /// A release that has not arrived within this time never plips (it was interrupted by another drag).
+    public static let arrivalTimeout: Double = 1.5
+    /// The meniscus (a neck, DESIGN.md §10.5): it starts to reach for the dock at a 72 pt gap, touches and fuses at 20 pt,
+    /// is 26 pt thick at contact, thins as t₀·(1 − gap/off)^0.7 and pinches when t < t_min (≈ 52 pt on iPad).
+    public static let meniscusJoin: CGFloat = 20
+    public static let meniscusThickness: CGFloat = 26
+    public static let meniscusOff: CGFloat = 72
+
+    /// The rect every docked frame stays inside (below the bars, 16 pt in from the edges).
+    public var region: CGRect
+    /// The droplet's size docked at the top or bottom.
+    public var horizontal: CGSize
+    /// The droplet's size docked at the left or right edge.
+    public var vertical: CGSize
+    /// The docks this device offers (compact widths keep the top and bottom only).
+    public let docks: [NibDock]
+    public var captureRadius: CGFloat
+
+    public init(region: CGRect, horizontal: CGSize, vertical: CGSize, docks: [NibDock] = NibDock.allCases,
+                compact: Bool = false) {
+        self.region = region
+        self.horizontal = horizontal
+        self.vertical = vertical
+        let allowed = compact ? docks.filter { !$0.isVertical } : docks
+        self.docks = allowed.isEmpty ? [.bottom] : allowed
+        self.captureRadius = compact ? Self.captureRadiusCompact : Self.captureRadius
+    }
+
+    /// A droplet `length` long and `thickness` thick (the palette: its length and 56 pt).
+    public init(region: CGRect, length: CGFloat, thickness: CGFloat, docks: [NibDock] = NibDock.allCases,
+                compact: Bool = false) {
+        self.init(region: region, horizontal: CGSize(width: length, height: thickness),
+                  vertical: CGSize(width: thickness, height: length), docks: docks, compact: compact)
+    }
+
+    /// The docks' region in a full-window view of `size`: below the bars (safe area + 8 + 44 + 16), 16 pt in from the
+    /// sides, 16 pt above the bottom safe area (8 on iPhone, just above the home indicator), less `reservedTrailing` (a
+    /// docked assistant panel moves the right dock to its leading edge).
+    public static func region(size: CGSize, safeArea s: EdgeInsets, compact: Bool,
+                              reservedTrailing: CGFloat = 0) -> CGRect {
+        let top = s.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.l
+        let bottom = s.bottom + (compact ? NibSpacing.s : NibSpacing.l)
+        return CGRect(x: s.leading + NibSpacing.l, y: top,
+                      width: max(0, size.width - s.leading - s.trailing - 2 * NibSpacing.l - reservedTrailing),
+                      height: max(0, size.height - top - bottom))
+    }
+
+    public func size(for edge: NibDock) -> CGSize { edge.isVertical ? vertical : horizontal }
+
+    /// The frame docked at `dock`: `along` 0…1 slides it from the start of its edge to the end.
+    public func frame(for dock: NibPaletteDock) -> CGRect {
+        let s = size(for: dock.edge), r = region
+        let t = min(max(dock.along, 0), 1)
+        func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * t }
+        let c: CGPoint
+        switch dock.edge {
+        case .leading: c = CGPoint(x: r.minX + s.width / 2, y: lerp(r.minY + s.height / 2, r.maxY - s.height / 2))
+        case .trailing: c = CGPoint(x: r.maxX - s.width / 2, y: lerp(r.minY + s.height / 2, r.maxY - s.height / 2))
+        case .top: c = CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.minY + s.height / 2)
+        case .bottom: c = CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.maxY - s.height / 2)
+        }
+        return CGRect(x: c.x - s.width / 2, y: c.y - s.height / 2, width: s.width, height: s.height)
+    }
+
+    /// The `along` that centres the droplet on `point` (clamped to its edge).
+    public func along(for point: CGPoint, on edge: NibDock) -> CGFloat {
+        let s = size(for: edge)
+        let t = edge.isVertical
+            ? (point.y - (region.minY + s.height / 2)) / max(1, region.height - s.height)
+            : (point.x - (region.minX + s.width / 2)) / max(1, region.width - s.width)
+        return min(max(t, 0), 1)
+    }
+
+    public func along(ofFrame frame: CGRect, on edge: NibDock) -> CGFloat {
+        along(for: CGPoint(x: frame.midX, y: frame.midY), on: edge)
+    }
+
+    /// Distance from `p` to the line the droplet's centre sits on at `edge` (perpendicular to the edge; anywhere along
+    /// it counts), plus 40 pt for the top.
+    public func distance(from p: CGPoint, to edge: NibDock) -> CGFloat {
+        let s = size(for: edge)
+        switch edge {
+        case .leading: return abs(p.x - (region.minX + s.width / 2))
+        case .trailing: return abs(p.x - (region.maxX - s.width / 2))
+        case .top: return abs(p.y - (region.minY + s.height / 2)) + Self.topBias
+        case .bottom: return abs(p.y - (region.maxY - s.height / 2))
+        }
+    }
+
+    /// The nearest dock this device offers (top biased by 40 pt).
+    public func nearestDock(to p: CGPoint) -> NibDock {
+        docks.min { distance(from: p, to: $0) < distance(from: p, to: $1) } ?? .bottom
+    }
+
+    /// The nearest dock if `p` is within its capture radius, otherwise nil.
+    public func capturedDock(at p: CGPoint) -> NibDock? {
+        let edge = nearestDock(to: p)
+        return distance(from: p, to: edge) <= captureRadius ? edge : nil
+    }
+
+    /// The landing a release projects: p + v·0.12 s, with v zeroed if the finger rested ≥ 70 ms and capped at 5000 pt/s.
+    public static func projectedPoint(finger p: CGPoint, velocity v: CGVector, stillFor: Double) -> CGPoint {
+        DropletPhysics.projectedLanding(p, velocity: DropletPhysics.releaseVelocity(v, stillFor: stillFor))
+    }
+
+    /// The dock a release lands in, from the projected point: the nearest dock within the capture radius, centred on
+    /// the projected point along it; otherwise home (`current`).
+    public func release(projected p: CGPoint, from current: NibPaletteDock) -> NibPaletteDock {
+        guard let edge = capturedDock(at: p) else { return validated(current) }
+        return NibPaletteDock(edge: edge, along: along(for: p, on: edge))
+    }
+
+    /// `release(projected:from:)` from the raw finger, velocity and stillness.
+    public func release(finger: CGPoint, velocity: CGVector, stillFor: Double,
+                        from current: NibPaletteDock) -> NibPaletteDock {
+        release(projected: Self.projectedPoint(finger: finger, velocity: velocity, stillFor: stillFor), from: current)
+    }
+
+    /// A dock this device does not offer (a side edge on iPhone) becomes the bottom, else the first dock offered.
+    public func validated(_ dock: NibPaletteDock) -> NibPaletteDock {
+        if docks.contains(dock.edge) { return dock }
+        return NibPaletteDock(edge: docks.contains(.bottom) ? .bottom : docks[0], along: 0.5)
+    }
+
+    /// While held: the frame the meniscus reaches for (the dock the finger is within capture of, slid along its edge to
+    /// face the body), or nil.
+    public func meniscusTarget(finger: CGPoint, body: CGRect) -> CGRect? {
+        guard let edge = capturedDock(at: finger) else { return nil }
+        return frame(for: NibPaletteDock(edge: edge, along: along(for: CGPoint(x: body.midX, y: body.midY), on: edge)))
+    }
+
+    static var meniscusParams: NeckParams {
+        NeckParams(join: meniscusJoin, t0: meniscusThickness, off: meniscusOff)
+    }
+
+    /// The meniscus thickness at `gap`: t₀·(1 − gap/off)^0.7 (the §10.5 law), 0 beyond `off`.
+    public static func meniscusThickness(gap: CGFloat) -> CGFloat {
+        DropletPhysics.neckThickness(gap: gap, params: meniscusParams)
+    }
+
+    /// How far across the gap the tongue reaches before it touches: 0 at `off`, 1 at `join` (smoothstep).
+    public static func meniscusReach(gap: CGFloat) -> CGFloat {
+        let t = min(max((meniscusOff - gap) / (meniscusOff - meniscusJoin), 0), 1)
+        return t * t * (3 - 2 * t)
+    }
+
+    /// The gap at which a fused meniscus pinches: where t falls below the thinnest bridge the field can hold.
+    public static func meniscusPinchGap(minimumNeck: CGFloat) -> CGFloat {
+        meniscusOff * (1 - pow(min(minimumNeck / meniscusThickness, 1), 1 / 0.7))
+    }
+
+    public static func hasArrived(centre: CGPoint, at target: CGPoint) -> Bool {
+        let dx = centre.x - target.x, dy = centre.y - target.y
+        return (dx * dx + dy * dy).squareRoot() <= arrivalTolerance
+    }
+}
+
+public extension NibDock {
+    /// The dock as commands, plugins and the assistant name it (`toolbar.dock {dock}`): "left", "right", "top",
+    /// "bottom". Left and right are the leading and trailing edges (mirrored in right-to-left layouts).
+    var commandValue: String {
+        switch self {
+        case .leading: return "left"
+        case .trailing: return "right"
+        case .top: return "top"
+        case .bottom: return "bottom"
+        }
+    }
+
+    init?(commandValue: String) {
+        switch commandValue.lowercased() {
+        case "left", "leading": self = .leading
+        case "right", "trailing": self = .trailing
+        case "top": self = .top
+        case "bottom": self = .bottom
+        default: return nil
+        }
+    }
+}
+
+// MARK: - The meniscus
+
+/// The palette's meniscus to the dock it reaches for (DESIGN.md §10.11): a tongue that grows out of the body as it nears
+/// the dock, fuses when it touches, then holds on like every neck (§10.5) and pinches when it is thinner than the field
+/// can hold. `DropletField` steps it and draws `segment` as a neck of its droplet; the rules are all here. It never plays
+/// a haptic: the one plip is the arrival.
+struct DockMeniscus: Equatable {
+    enum Phase: Equatable {
+        case idle, reaching, fused, retracting
+    }
+
+    struct Segment: Equatable {
+        var from: CGPoint
+        var to: CGPoint
+        var thickness: CGFloat
+    }
+
+    static let neckID = "dock.meniscus"
+
+    /// The dock frame to reach for; nil lets go (whatever is out retracts).
+    var target: CGRect?
+    private(set) var phase: Phase = .idle
+    private(set) var segment: Segment?
+    private var last: CGRect?
+    private var thickness = SpringValue(0, epsilon: 0.05)
+    /// How far the far end sits past the body's edge point, towards the dock (negative: inside the body).
+    private var extent = SpringValue(0, epsilon: 0.05)
+
+    var isIdle: Bool { target == nil && last == nil }
+
+    /// One frame. `body` is the droplet's visual box; `enabled` is false under Reduce Motion, Calm and Liquid Off (no
+    /// necks) and while the droplet is not drawn. Returns true while anything moves.
+    mutating func step(_ dt: CGFloat, body: CGRect, enabled: Bool, minimumNeck: CGFloat) -> Bool {
+        if let target { last = target }
+        guard let dock = last else {
+            segment = nil
+            return false
+        }
+        let short = min(min(body.width, body.height), min(dock.width, dock.height)) / 2
+        let g = DropletPhysics.gap(body, dock, minCorner: short)
+        let gap = g.gap
+        let t = DropletDockModel.meniscusThickness(gap: gap)
+        let inA = min(8, min(body.width, body.height) / 3)
+        let inB = min(8, min(dock.width, dock.height) / 3)
+        let letGo = target == nil || !enabled
+        if letGo {
+            if phase != .idle { phase = .retracting }
+        } else {
+            switch phase {
+            case .idle, .reaching:
+                if gap < DropletDockModel.meniscusJoin {
+                    phase = .fused
+                } else {
+                    phase = gap < DropletDockModel.meniscusOff ? .reaching : .idle
+                }
+            case .fused:
+                if t < minimumNeck { phase = .retracting }
+            case .retracting:
+                // A pinched meniscus re-arms only once the body is out of reach again (or it touches again).
+                if gap < DropletDockModel.meniscusJoin {
+                    phase = .fused
+                } else if gap >= DropletDockModel.meniscusOff {
+                    phase = .idle
+                }
+            }
+        }
+        switch phase {
+        case .idle, .retracting:
+            thickness.target = 0
+            extent.target = -inA
+        case .reaching:
+            thickness.target = t
+            extent.target = max(-inA, DropletDockModel.meniscusReach(gap: gap) * gap - t / 2)
+        case .fused:
+            thickness.target = t
+            extent.target = gap + inB
+        }
+        thickness.step(dt, spring: NibMotion.neck)
+        extent.step(dt, spring: NibMotion.neck)
+        let moving = !(thickness.isResting && extent.isResting)
+
+        if letGo && thickness.value < 0.3 {
+            phase = .idle
+            last = nil
+            segment = nil
+            return false
+        }
+        let ca = CGPoint(x: body.midX, y: body.midY), cb = CGPoint(x: dock.midX, y: dock.midY)
+        var dx = g.pointB.x - g.pointA.x, dy = g.pointB.y - g.pointA.y
+        var length = (dx * dx + dy * dy).squareRoot()
+        if length < 0.5 {
+            dx = cb.x - ca.x
+            dy = cb.y - ca.y
+            length = (dx * dx + dy * dy).squareRoot()
+        }
+        guard length > 0.001, thickness.value > 0.8 else {
+            segment = nil
+            return moving
+        }
+        let nx = dx / length, ny = dy / length
+        let from = CGPoint(x: g.pointA.x - nx * inA, y: g.pointA.y - ny * inA)
+        let reach = max(extent.value, -inA + 0.5)
+        segment = Segment(from: from, to: CGPoint(x: g.pointA.x + nx * reach, y: g.pointA.y + ny * reach),
+                          thickness: thickness.value)
+        return moving
+    }
+}
+
+// MARK: - The driver (shared by `.dropletDockable` and `NibToolPalette`)
+
+/// A release: the dock chosen, the frame it rests in (fused to or 16 pt clear of its neighbours) and the velocity the
+/// snap starts from.
+struct DockRelease: Equatable {
+    var dock: NibPaletteDock
+    var frame: CGRect
+    var velocity: CGVector
+}
+
+/// An armed arrival: the plip plays once, the first time the released body reaches `centre` (within 1.5 pt) or comes
+/// to rest. The snap overshoots by about 4 pt and comes back, but the landing is disarmed by then: one plip.
+struct DockLanding: Equatable {
+    enum Outcome: Equatable {
+        case waiting, arrived, expired
+    }
+
+    var centre: CGPoint
+    var since: CFTimeInterval = CACurrentMediaTime()
+
+    func check(body: CGPoint, settling: Bool, now: CFTimeInterval) -> Outcome {
+        if now - since > DropletDockModel.arrivalTimeout { return .expired }
+        return DropletDockModel.hasArrived(centre: body, at: centre) || !settling ? .arrived : .waiting
+    }
+}
+
+/// Drives one dockable droplet of a container: hold, meniscus, release to a dock. The palette and every other
+/// dockable use it, so they feel the same.
+struct DropletDockDriver {
+    let id: String
+    let field: DropletField
+
+    func begin(at location: CGPoint) {
+        field.beginDrag(id, at: location)
+    }
+
+    /// While held: follow the finger (`follow`), and reach for the dock the finger is within capture of.
+    func move(to location: CGPoint, model: DropletDockModel) {
+        field.drag(id, to: location)
+        let body = field.visualFrame(id) ?? CGRect(origin: location, size: .zero)
+        field.setMeniscus(id, towards: model.meniscusTarget(finger: location, body: body))
+    }
+
+    /// Ends the drag: the release velocity (careful-release rule, capped) projects the landing, the model picks the
+    /// dock, the body rests fused to or 16 pt clear of its neighbours, and the meniscus now reaches for that dock (the
+    /// body swallows it as it lands). The droplet springs there with `snap` from the full release velocity.
+    func release(at location: CGPoint, velocity: CGVector, from current: NibPaletteDock,
+                 model: DropletDockModel) -> DockRelease {
+        let v = field.endDrag(id, velocity: velocity)
+        var next = model.release(projected: DropletPhysics.projectedLanding(location, velocity: v), from: current)
+        let rested = field.restingRect(model.frame(for: next), excluding: id,
+                                       along: next.isVertical ? .vertical : .horizontal)
+        next.along = model.along(ofFrame: rested, on: next.edge)
+        field.setMeniscus(id, towards: rested)
+        return DockRelease(dock: next, frame: rested, velocity: v)
+    }
+
+    /// The body is home: let the meniscus go and play the one plip.
+    func arrive() {
+        field.setMeniscus(id, towards: nil)
+        NibHaptics.play(.plip)
+    }
+}
+
+/// Plays the arrival plip once the released body reaches its dock (or comes to rest), then disarms. A leaf: it reads
+/// the droplet's node, so only it re-renders per frame.
+struct DockArrivalWatcher: View {
+    let id: String
+    let node: DropletNode?
+    let field: DropletField?
+    @Binding var landing: DockLanding?
+
+    var body: some View {
+        Color.clear
+            .onChange(of: node?.presentation) { _, p in
+                guard let target = landing, let p, !p.isLifted, let field, let box = field.visualFrame(id) else { return }
+                switch target.check(body: CGPoint(x: box.midX, y: box.midY), settling: p.isSettling,
+                                    now: CACurrentMediaTime()) {
+                case .waiting:
+                    break
+                case .arrived:
+                    landing = nil
+                    DropletDockDriver(id: id, field: field).arrive()
+                case .expired:
+                    landing = nil
+                    field.setMeniscus(id, towards: nil)
+                }
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+    }
+}
+
+// MARK: - `.dropletDockable`
+
+private struct NibDockEdgeKey: EnvironmentKey {
+    static let defaultValue: NibDock? = nil
+}
+
+public extension EnvironmentValues {
+    /// The edge a `.dropletDockable` droplet is laid out for: lay the content out vertically for `.leading` and
+    /// `.trailing`. It switches at the midpoint of a re-form, while the content is invisible. nil outside a dockable.
+    var nibDockEdge: NibDock? {
+        get { self[NibDockEdgeKey.self] }
+        set { self[NibDockEdgeKey.self] = newValue }
+    }
+}
+
+public extension View {
+    /// Makes this view a dockable droplet of the enclosing `NibDropletContainer` (DESIGN.md §10.1–10.3, §10.10,
+    /// §10.11). Place it as a full-size child of the container: it positions itself at `current`, and lays its content
+    /// out `length` × `thickness` (read `@Environment(\.nibDockEdge)` for the axis).
+    ///
+    /// Held, it is a bead of water: it lifts, its rim strengthens, it follows the finger with `follow` (a slight lag),
+    /// stretches with its speed about the grab point, settles with one small wobble, keeps lensing the page, and grows a
+    /// meniscus towards the dock it would land in. Released, it projects the fling (p + v·0.12 s), picks the nearest
+    /// dock within the capture radius (else flows home), springs there with `snap` from the release velocity, re-forms
+    /// when the orientation changes, and plays one plip on arrival. Under Reduce Motion it cross-fades.
+    ///
+    /// - Parameters:
+    ///   - id: the droplet's id, unique in the container.
+    ///   - length, thickness: its size along and across its dock (the palette: its length and 56 pt).
+    ///   - docks: the edges it may use (compact widths keep top and bottom only).
+    ///   - current: where it rests. Changing it from outside (a command, an accessibility action) moves it there.
+    ///   - style: its droplet style (`.palette`).
+    ///   - reservedTrailing: width kept clear at the trailing edge (a docked assistant panel).
+    ///   - onDock: the dock a release or an accessibility action chose. Set `current` from it (FeatToolbar runs
+    ///     `toolbar.dock`); leaving `current` unchanged sends the droplet home.
+    func dropletDockable(_ id: String, length: CGFloat, thickness: CGFloat = NibMetrics.paletteThickness,
+                         docks: [NibDock] = NibDock.allCases, current: NibPaletteDock,
+                         style: DropletStyle = .palette, reservedTrailing: CGFloat = 0,
+                         onDock: @escaping (NibPaletteDock) -> Void) -> some View {
+        modifier(DropletDockableModifier(id: id, length: length, thickness: thickness, docks: docks, current: current,
+                                         style: style, reservedTrailing: reservedTrailing, onDock: onDock))
+    }
+}
+
+struct DropletDockableModifier: ViewModifier {
+    let id: String
+    let length: CGFloat
+    let thickness: CGFloat
+    let docks: [NibDock]
+    let current: NibPaletteDock
+    let style: DropletStyle
+    let reservedTrailing: CGFloat
+    let onDock: (NibPaletteDock) -> Void
+
+    @Environment(DropletField.self) private var field: DropletField?
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.nibLiquidMode) private var mode
+    /// The dock the content is laid out for. It lags `current` through a re-form (the axis switches at the midpoint).
+    @State private var laidOut: NibPaletteDock?
+    /// The dock a running re-form spreads into.
+    @State private var pending: NibPaletteDock?
+    @State private var dragging = false
+    @State private var releaseVelocity: CGVector = .zero
+    @State private var landing: DockLanding?
+    @State private var opacity: Double = 1
+    @GestureState private var live = false
+
+    func body(content: Content) -> some View {
+        GeometryReader { proxy in
+            let compact = sizeClass == .compact
+            let origin = proxy.frame(in: NibLiquid.space).origin
+            let model = DropletDockModel(
+                region: DropletDockModel.region(size: proxy.size, safeArea: proxy.safeAreaInsets, compact: compact,
+                                                reservedTrailing: reservedTrailing)
+                    .offsetBy(dx: origin.x, dy: origin.y),
+                length: length, thickness: thickness, docks: docks, compact: compact)
+            let wanted = model.validated(current)
+            let dock = laidOut ?? wanted
+            let frame = model.frame(for: dock)
+            let driver = field.map { DropletDockDriver(id: id, field: $0) }
+            ZStack(alignment: .topLeading) {
+                content
+                    .environment(\.nibDockEdge, dock.edge)
+                    .frame(width: frame.width, height: frame.height)
+                    .droplet(id, style: style, managesDrag: false)
+                    .opacity(opacity)
+                    .gesture(dragGesture(driver: driver, model: model))
+                    .accessibilityActions {
+                        ForEach(model.docks, id: \.self) { edge in
+                            Button(edge.moveTitle) { onDock(NibPaletteDock(edge: edge, along: 0.5)) }
+                        }
+                    }
+                    .position(x: frame.midX - origin.x, y: frame.midY - origin.y)
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+            .background(DockArrivalWatcher(id: id, node: field?.node(id), field: field, landing: $landing))
+            .onAppear { if laidOut == nil { laidOut = wanted } }
+            .onChange(of: wanted) { _, next in adopt(next, model: model) }
+            .onChange(of: live) { _, isLive in
+                // A cancelled drag (no onEnded) still lets go: the droplet flows home with no velocity.
+                guard !isLive else { return }
+                DispatchQueue.main.async {
+                    guard dragging, let driver else { return }
+                    dragging = false
+                    let box = field?.visualFrame(id) ?? frame
+                    let r = driver.release(at: CGPoint(x: box.midX, y: box.midY), velocity: .zero,
+                                           from: laidOut ?? wanted, model: model)
+                    landing = DockLanding(centre: CGPoint(x: r.frame.midX, y: r.frame.midY))
+                }
+            }
+        }
+        .background(ReshapeWatcher(node: field?.node(id)) {
+            if let pending {
+                laidOut = pending
+                self.pending = nil
+            }
+        })
+    }
+
+    private func dragGesture(driver: DropletDockDriver?, model: DropletDockModel) -> some Gesture {
+        DragGesture(minimumDistance: DropletPhysics.pickupSlop, coordinateSpace: NibLiquid.space)
+            .updating($live) { _, state, _ in state = true }
+            .onChanged { value in
+                guard let driver else { return }
+                if !dragging {
+                    dragging = true
+                    landing = nil
+                    driver.begin(at: value.startLocation)
+                }
+                driver.move(to: value.location, model: model)
+            }
+            .onEnded { value in
+                guard let driver, dragging else { return }
+                dragging = false
+                let from = laidOut ?? model.validated(current)
+                let r = driver.release(at: value.location,
+                                       velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height),
+                                       from: from, model: model)
+                releaseVelocity = r.velocity
+                landing = DockLanding(centre: CGPoint(x: r.frame.midX, y: r.frame.midY))
+                if r.dock != from { onDock(r.dock) }
+            }
+    }
+
+    /// `current` changed (a release, an accessibility action, a command): move there. Same axis: the new layout
+    /// position animates from where the body is (FLIP, `snap`, from the release velocity). Other axis: re-form (§10.10).
+    /// Reduce Motion or Liquid Off: fade out, move, fade in.
+    private func adopt(_ next: NibPaletteDock, model: DropletDockModel) {
+        let shown = laidOut ?? next
+        let velocity = releaseVelocity
+        releaseVelocity = .zero
+        guard next != shown else { return }
+        if reduceMotion || mode == .off {
+            withAnimation(NibMotion.exit) { opacity = 0 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                laidOut = next
+                pending = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.reduced.response) {
+                    withAnimation(NibMotion.enter) { opacity = 1 }
+                }
+            }
+        } else if next.isVertical != shown.isVertical, let field {
+            let target = model.frame(for: next)
+            pending = next
+            field.beginReshape(id, towards: CGPoint(x: target.midX, y: target.midY), velocity: velocity)
+        } else {
+            laidOut = next
+        }
+    }
+}
+```
+
+### 3.17b `NibKit/Sources/NibDesign/Liquid/NibReflow.swift`
+
+The library's live reorder (DESIGN.md §10.12, §14.1). `NibReflowModel` is the pure logic (the gap under the finger with 24 pt hysteresis, the combine zone that holds a cover still, the outside margin, every item's target slot, the move as from / to / after / before) and is unit-tested (§3.28b). `NibReflow` is the observable a grid shares: `.nibReflowSpace` on the grid's content, `.nibReflowItem` (the neighbours spring aside with `reflow`) and `.nibReflowDraggable` (0.3 s press, then 6 pt; "Move earlier" / "Move later" actions) on each cell, and `NibReflowCarrier` in the window's droplet container: the lifted card as a `card` droplet, and the armed cover necking with it. A drop is `.reorder` (apply it to the data in the same update, then run `library.reorder`), `.combine` (`library.move` onto the notebook) or `.none`.
+
+```swift
+import SwiftUI
+import Observation
+import QuartzCore
+
+// MARK: - Numbers
+
+/// The library's live reorder (DESIGN.md §10.12, §14.1): home-screen reflow with water easing.
+public enum NibReflowMetrics {
+    /// The finger must be this much closer to another slot's centre than to the gap's before the gap moves (it moves
+    /// half of this past the midpoint), so the gap never flickers at a boundary.
+    public static let hysteresis: CGFloat = 24
+    /// The inner share of a cover that is its combine zone: while the finger is in it, that cover holds still, so a
+    /// combine can arm after `NibMotion.combineHold` (380 ms).
+    public static let combineCore: CGFloat = 0.70
+    /// Further than this outside every slot (over the sidebar, a folder tile, the bars) the gap closes back at home.
+    public static let outsideMargin: CGFloat = 24
+    /// A press this long lifts a card out of a scroll view (then 6 pt of movement picks it up).
+    public static let liftDelay: Double = 0.3
+    /// The cover a combine is armed on swells to this.
+    public static let armedScale: CGFloat = 1.03
+    /// A carrier that has not landed within this long after the drop is removed anyway.
+    public static let landingTimeout: Double = 1.2
+    /// The coordinate space of a reflowing grid (`.nibReflowSpace`): put it on the scrolled content, so frames and the
+    /// finger stay put while the grid scrolls.
+    public static let space = NamedCoordinateSpace.named("nib.reflow")
+}
+
+// MARK: - The model (pure)
+
+/// A slot grid: slot i's frame in the reflow space (the library's cover grid, 164 pt pitch in 11-inch landscape).
+public struct NibReflowLayout: Equatable, Sendable {
+    public var columns: Int
+    public var cell: CGSize
+    public var spacing: CGSize
+    public var origin: CGPoint
+
+    public init(columns: Int, cell: CGSize,
+                spacing: CGSize = CGSize(width: NibMetrics.libraryGutter, height: NibMetrics.libraryGutter),
+                origin: CGPoint = .zero) {
+        self.columns = columns
+        self.cell = cell
+        self.spacing = spacing
+        self.origin = origin
+    }
+
+    public func slot(_ index: Int) -> CGRect {
+        let c = max(columns, 1)
+        return CGRect(x: origin.x + CGFloat(index % c) * (cell.width + spacing.width),
+                      y: origin.y + CGFloat(index / c) * (cell.height + spacing.height),
+                      width: cell.width, height: cell.height)
+    }
+
+    public func slots(count: Int) -> [CGRect] { (0..<max(count, 0)).map { slot($0) } }
+}
+
+/// A finished reorder: the item moves from `from` to `to` (indices in the order the drag began with).
+public struct NibReflowMove<ID: Hashable>: Equatable {
+    public let id: ID
+    public let from: Int
+    public let to: Int
+    /// The neighbours it lands between (nil at either end): what `library.reorder {after?, before?}` takes.
+    public let after: ID?
+    public let before: ID?
+
+    public init(id: ID, from: Int, to: Int, in order: [ID]) {
+        self.id = id
+        self.from = from
+        self.to = to
+        let result = NibReflowModel<ID>.reordered(order, from: from, to: to)
+        after = to > 0 && to - 1 < result.count ? result[to - 1] : nil
+        before = to + 1 < result.count ? result[to + 1] : nil
+    }
+}
+
+/// What a drop means. `.reorder` is recorded as an undoable reorder command; `.combine` as a merge (§10.12).
+public enum NibReflowDrop<ID: Hashable>: Equatable {
+    /// Back where it was.
+    case none
+    case reorder(NibReflowMove<ID>)
+    /// Dropped while a combine was armed on `into`.
+    case combine(ID, into: ID)
+}
+
+/// The live insertion point of a drag and every item's target slot. Pure value logic: the finger, the ordered ids and
+/// their slot frames in; the gap and the offsets out (DESIGN.md §10.12).
+///
+/// - The gap sits at the slot nearest the finger. It moves only when the finger is `hysteresis` closer to another
+///   slot's centre than to the gap's, so it never flickers at a boundary.
+/// - While the finger is in the inner 70 % of another cover (its combine zone), that cover holds still: the reflow
+///   waits, so a combine can arm. Paused (a combine armed, a folder fused), nothing moves.
+/// - Outside every slot by more than `outsideMargin`, the gap closes back at home.
+public struct NibReflowModel<ID: Hashable>: Equatable {
+    public let ids: [ID]
+    public let slots: [CGRect]
+    /// The dragged item's index.
+    public let from: Int
+    /// Where the gap is: the index the dragged item would land at.
+    public private(set) var insertion: Int
+    public var hysteresis: CGFloat
+    /// Covers can combine (notebooks): their inner 70 % holds the reflow. Page thumbnails do not.
+    public var combines: Bool
+    public var outsideMargin: CGFloat
+
+    /// nil unless `dragged` is in `ids` and every id has a slot.
+    public init?(ids: [ID], slots: [CGRect], dragged: ID, combines: Bool = true,
+                 hysteresis: CGFloat = NibReflowMetrics.hysteresis,
+                 outsideMargin: CGFloat = NibReflowMetrics.outsideMargin) {
+        guard ids.count == slots.count, let i = ids.firstIndex(of: dragged) else { return nil }
+        self.ids = ids
+        self.slots = slots
+        self.from = i
+        self.insertion = i
+        self.hysteresis = hysteresis
+        self.combines = combines
+        self.outsideMargin = outsideMargin
+    }
+
+    public var dragged: ID { ids[from] }
+
+    /// Where the item at `index` is shown for the current gap: the ones between home and the gap shift one slot.
+    public func targetIndex(ofIndex i: Int) -> Int {
+        if i == from { return insertion }
+        if from < insertion && i > from && i <= insertion { return i - 1 }
+        if insertion < from && i >= insertion && i < from { return i + 1 }
+        return i
+    }
+
+    public func targetIndex(of id: ID) -> Int? { ids.firstIndex(of: id).map { targetIndex(ofIndex: $0) } }
+
+    public func targetSlot(of id: ID) -> CGRect? { targetIndex(of: id).map { slots[$0] } }
+
+    /// How far the item is shown from its own slot (centre to centre).
+    public func offset(of id: ID) -> CGSize {
+        guard let i = ids.firstIndex(of: id) else { return .zero }
+        let a = slots[i], b = slots[targetIndex(ofIndex: i)]
+        return CGSize(width: b.midX - a.midX, height: b.midY - a.midY)
+    }
+
+    /// The cover whose shown frame's inner 70 % holds `p` (never the dragged one): a combine target.
+    public func combineCandidate(at p: CGPoint) -> ID? {
+        guard combines else { return nil }
+        let inset = (1 - NibReflowMetrics.combineCore) / 2
+        for i in ids.indices where i != from {
+            let r = slots[targetIndex(ofIndex: i)]
+            if r.insetBy(dx: r.width * inset, dy: r.height * inset).contains(p) { return ids[i] }
+        }
+        return nil
+    }
+
+    /// The slot the finger asks for (before hysteresis): the nearest slot centre, or home when `p` is outside every
+    /// slot by more than `outsideMargin`.
+    public func candidate(at p: CGPoint) -> Int { nearest(p).index }
+
+    /// Moves the gap for the finger at `p`. Returns true when it moved (the neighbours reflow).
+    @discardableResult
+    public mutating func update(finger p: CGPoint, paused: Bool = false) -> Bool {
+        guard !paused, combineCandidate(at: p) == nil else { return false }
+        let n = nearest(p)
+        guard n.index != insertion else { return false }
+        if n.inside {
+            guard Self.distance(p, slots[n.index]) + hysteresis < Self.distance(p, slots[insertion]) else { return false }
+        }
+        insertion = n.index
+        return true
+    }
+
+    /// The reorder the current gap means, nil if the item would land at home.
+    public var move: NibReflowMove<ID>? {
+        insertion == from ? nil : NibReflowMove(id: dragged, from: from, to: insertion, in: ids)
+    }
+
+    /// `ids` with the item at `from` moved to `to`.
+    public static func reordered(_ ids: [ID], from: Int, to: Int) -> [ID] {
+        guard ids.indices.contains(from), ids.indices.contains(to) else { return ids }
+        var r = ids
+        let x = r.remove(at: from)
+        r.insert(x, at: to)
+        return r
+    }
+
+    private func nearest(_ p: CGPoint) -> (index: Int, inside: Bool) {
+        var best = from, bestDistance = CGFloat.infinity, inside = false
+        for (i, r) in slots.enumerated() {
+            if r.insetBy(dx: -outsideMargin, dy: -outsideMargin).contains(p) { inside = true }
+            let d = Self.distance(p, r)
+            if d < bestDistance {
+                bestDistance = d
+                best = i
+            }
+        }
+        return inside ? (best, true) : (from, false)
+    }
+
+    static func distance(_ p: CGPoint, _ r: CGRect) -> CGFloat {
+        let dx = p.x - r.midX, dy = p.y - r.midY
+        return (dx * dx + dy * dy).squareRoot()
+    }
+}
+
+// MARK: - The live reorder
+
+/// A live reorder for SwiftUI: the pure `NibReflowModel` plus the item frames, the lifted carrier and combine arming.
+/// Items read only their own offset (`.nibReflowItem`), so a moved gap re-renders only the items that move.
+///
+/// Usage: `.nibReflowSpace(reflow)` on the grid's content; `.nibReflowItem(id, in: reflow)` and
+/// `.nibReflowDraggable(id, in: reflow, order:onDrop:)` on each cell; a `NibReflowCarrier` in the window's droplet
+/// container (the lifted card as water). In `onDrop`, apply a `.reorder` to your data in that same update (optimistic:
+/// the neighbours are already where the new order puts them) and record it as one undoable command
+/// (`library.reorder`); a `.combine` is a merge (`library.move` onto the notebook).
+@Observable
+public final class NibReflow<ID: Hashable> {
+    /// The lifted item, in global coordinates (the carrier follows it).
+    public struct Lift: Equatable {
+        public enum Phase: Equatable {
+            case dragging
+            case released(CGVector)
+        }
+
+        public let id: ID
+        public var start: CGPoint
+        public var location: CGPoint
+        public var phase: Phase
+    }
+
+    /// The drag in progress (nil between drags).
+    public private(set) var model: NibReflowModel<ID>?
+    /// The carrier's state (only the carrier reads it: it changes with every finger move).
+    public private(set) var lift: Lift?
+    /// The item that is lifted (its cell hides while a carrier draws it).
+    public private(set) var carried: ID?
+    /// Where the carrier rests, in global coordinates: the item's home slot while dragging, the slot it lands in once
+    /// dropped (the field flies it there from wherever the finger let go).
+    public private(set) var carrierFrame: CGRect?
+    /// The cover a combine is armed on (the finger held in its inner 70 % for 380 ms): the reflow pauses.
+    public private(set) var armed: ID?
+    /// The armed cover's frame, in global coordinates (it holds still while armed, and until the card has flowed in).
+    public private(set) var armedFrame: CGRect?
+    /// Hold the reflow from outside: the card fused with a folder film, or it is over the sidebar.
+    public var isPaused = false
+    /// The card is over the sidebar: the carrier condenses to 50 % around the finger (§10.12).
+    public var isCondensed = false
+    /// Neighbours spring with `reflow` while a drag is on; a drop that reorders the data resets them at once.
+    public private(set) var animatesOffsets = true
+    /// A `NibReflowCarrier` draws the lifted card (and the armed cover) as water.
+    public internal(set) var hasCarrier = false
+    /// A uniform grid computes slots itself; otherwise the cells' measured frames are used.
+    public var layout: NibReflowLayout?
+    public let combines: Bool
+
+    @ObservationIgnored var frames: [ID: CGRect] = [:]
+    @ObservationIgnored var spaceOrigin: CGPoint = .zero
+    @ObservationIgnored private var order: [ID] = []
+    @ObservationIgnored private var hover: ID?
+    @ObservationIgnored private var armWork: DispatchWorkItem?
+    @ObservationIgnored private var landingWork: DispatchWorkItem?
+
+    public init(layout: NibReflowLayout? = nil, combines: Bool = true) {
+        self.layout = layout
+        self.combines = combines
+    }
+
+    public var isDragging: Bool { lift?.phase == .dragging }
+
+    public func offset(for id: ID) -> CGSize { model?.offset(of: id) ?? .zero }
+
+    public func isCarried(_ id: ID) -> Bool { carried == id }
+
+    /// The frame an item is shown at now, in global coordinates (nil when no drag is on).
+    public func globalFrame(of id: ID) -> CGRect? {
+        guard let r = model?.targetSlot(of: id) else { return nil }
+        return r.offsetBy(dx: spaceOrigin.x, dy: spaceOrigin.y)
+    }
+
+    /// Lifts `id` (in `order`, the items as the grid shows them) under the finger at `point` (reflow space).
+    public func begin(_ id: ID, order: [ID], at point: CGPoint) {
+        cancelArming()
+        landingWork?.cancel()
+        var ids: [ID] = [], slots: [CGRect] = []
+        for (i, x) in order.enumerated() {
+            if let layout {
+                ids.append(x)
+                slots.append(layout.slot(i))
+            } else if let f = frames[x] {
+                ids.append(x)
+                slots.append(f)
+            }
+        }
+        guard let m = NibReflowModel(ids: ids, slots: slots, dragged: id, combines: combines) else { return }
+        self.order = order
+        animatesOffsets = true
+        armed = nil
+        armedFrame = nil
+        model = m
+        carried = id
+        let g = global(point)
+        carrierFrame = m.slots[m.from].offsetBy(dx: spaceOrigin.x, dy: spaceOrigin.y)
+        lift = Lift(id: id, start: g, location: g, phase: .dragging)
+    }
+
+    /// The finger moved (reflow space): the carrier follows, the gap reflows (unless paused or held), a combine arms.
+    public func move(to point: CGPoint) {
+        guard var m = model, var l = lift, l.phase == .dragging else { return }
+        l.location = global(point)
+        lift = l
+        arm(m.combineCandidate(at: point), at: point, in: m)
+        if m.update(finger: point, paused: isPaused || armed != nil) { model = m }
+    }
+
+    /// Drops. The carrier flows to where the item now belongs (its new slot, or into the armed cover). Apply a
+    /// `.reorder` to the data in this same update.
+    @discardableResult
+    public func end(velocity: CGVector = .zero) -> NibReflowDrop<ID> {
+        cancelArming()
+        guard let m = model, var l = lift else { return .none }
+        let drop: NibReflowDrop<ID>
+        var rest = m.slots[m.from]
+        if let armed, combines {
+            drop = .combine(m.dragged, into: armed)
+            rest = m.targetSlot(of: armed) ?? rest
+        } else if let move = m.move {
+            drop = .reorder(fullOrderMove(move, in: m))
+            rest = m.slots[m.insertion]
+        } else {
+            drop = .none
+        }
+        // A reorder lands the data where the neighbours already are: reset them without animation. Otherwise they
+        // spring back to their own slots.
+        if case .reorder = drop { animatesOffsets = false }
+        carrierFrame = rest.offsetBy(dx: spaceOrigin.x, dy: spaceOrigin.y)
+        l.phase = .released(velocity)
+        lift = l
+        model = nil
+        isPaused = false
+        isCondensed = false
+        scheduleLandingTimeout()
+        return drop
+    }
+
+    /// Abandons the drag: the neighbours spring back and the carrier flows home.
+    public func cancel() {
+        guard let m = model else { return }
+        if m.insertion != m.from {
+            model = NibReflowModel(ids: m.ids, slots: m.slots, dragged: m.dragged, combines: m.combines)
+        }
+        armed = nil
+        armedFrame = nil
+        _ = end()
+    }
+
+    /// The carrier is home: the cell shows again.
+    func landed() {
+        landingWork?.cancel()
+        lift = nil
+        carried = nil
+        carrierFrame = nil
+        armed = nil
+        armedFrame = nil
+        animatesOffsets = true
+    }
+
+    private func global(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x + spaceOrigin.x, y: p.y + spaceOrigin.y) }
+
+    /// The move in the order the caller passed (the model may hold only the cells that were measured).
+    private func fullOrderMove(_ move: NibReflowMove<ID>, in m: NibReflowModel<ID>) -> NibReflowMove<ID> {
+        guard m.ids != order, let from = order.firstIndex(of: move.id),
+              let to = order.firstIndex(of: m.ids[m.insertion]) else { return move }
+        return NibReflowMove(id: move.id, from: from, to: to, in: order)
+    }
+
+    /// Combine arming (§10.12): the finger in a cover's inner 70 % for 380 ms arms it (armed haptic); leaving the
+    /// cover disarms it and the reflow resumes. Proximity alone draws nothing.
+    private func arm(_ candidate: ID?, at p: CGPoint, in m: NibReflowModel<ID>) {
+        if let armed {
+            if let r = m.targetSlot(of: armed), r.contains(p) { return }
+            self.armed = nil
+            armedFrame = nil
+        }
+        guard candidate != hover else { return }
+        hover = candidate
+        armWork?.cancel()
+        armWork = nil
+        guard let candidate, combines else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.hover == candidate, self.isDragging else { return }
+            self.armed = candidate
+            self.armedFrame = self.globalFrame(of: candidate)
+            NibHaptics.play(.armed)
+        }
+        armWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.combineHold, execute: work)
+    }
+
+    private func cancelArming() {
+        armWork?.cancel()
+        armWork = nil
+        hover = nil
+    }
+
+    private func scheduleLandingTimeout() {
+        landingWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let l = self.lift, l.phase != .dragging else { return }
+            self.landed()
+        }
+        landingWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + NibReflowMetrics.landingTimeout, execute: work)
+    }
+}
+
+// MARK: - SwiftUI
+
+public extension View {
+    /// The reflow's coordinate space: put it on the grid's content (inside its scroll view).
+    func nibReflowSpace<ID: Hashable>(_ reflow: NibReflow<ID>) -> some View {
+        coordinateSpace(NibReflowMetrics.space)
+            .onGeometryChange(for: CGPoint.self) { proxy in
+                proxy.frame(in: .global).origin
+            } action: { origin in
+                reflow.spaceOrigin = origin
+            }
+    }
+
+    /// One reorderable cell: it springs aside with `reflow` to open the gap, reports its slot, hides while the carrier
+    /// draws it, and swells to 1.03 when a combine arms on it (the carrier draws that too, as water).
+    func nibReflowItem<ID: Hashable>(_ id: ID, in reflow: NibReflow<ID>) -> some View {
+        modifier(NibReflowItemModifier(id: id, reflow: reflow))
+    }
+
+    /// Makes a cell liftable: a 0.3 s press, then 6 pt of movement, lifts it; moving reflows its neighbours; lifting
+    /// the finger calls `onDrop`. Also adds "Move earlier" and "Move later" accessibility actions (every drag has an
+    /// action equivalent).
+    func nibReflowDraggable<ID: Hashable>(_ id: ID, in reflow: NibReflow<ID>, order: [ID],
+                                          onDrop: @escaping (NibReflowDrop<ID>) -> Void) -> some View {
+        modifier(NibReflowDragModifier(id: id, reflow: reflow, order: order, onDrop: onDrop))
+    }
+}
+
+struct NibReflowItemModifier<ID: Hashable>: ViewModifier {
+    let id: ID
+    let reflow: NibReflow<ID>
+
+    func body(content: Content) -> some View {
+        let offset = reflow.offset(for: id)
+        let armed = reflow.armed == id
+        let drawnByCarrier = reflow.hasCarrier && (reflow.isCarried(id) || armed)
+        content
+            .scaleEffect(armed ? NibReflowMetrics.armedScale : 1)
+            .animation(NibMotion.lift.animation, value: armed)
+            .opacity(drawnByCarrier ? 0 : 1)
+            .offset(offset)
+            .animation(reflow.animatesOffsets ? NibMotion.reflow.animation : nil, value: offset)
+            .onGeometryChange(for: CGRect.self) { proxy in
+                proxy.frame(in: NibReflowMetrics.space)
+            } action: { frame in
+                reflow.frames[id] = frame
+            }
+    }
+}
+
+struct NibReflowDragModifier<ID: Hashable>: ViewModifier {
+    let id: ID
+    let reflow: NibReflow<ID>
+    let order: [ID]
+    let onDrop: (NibReflowDrop<ID>) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .gesture(
+                LongPressGesture(minimumDuration: NibReflowMetrics.liftDelay)
+                    .sequenced(before: DragGesture(minimumDistance: DropletPhysics.pickupSlop,
+                                                   coordinateSpace: NibReflowMetrics.space))
+                    .onChanged { value in
+                        guard case .second(true, let drag?) = value else { return }
+                        if !reflow.isDragging { reflow.begin(id, order: order, at: drag.startLocation) }
+                        reflow.move(to: drag.location)
+                    }
+                    .onEnded { value in
+                        guard case .second(true, let drag?) = value, reflow.isDragging else {
+                            reflow.cancel()
+                            return
+                        }
+                        onDrop(reflow.end(velocity: CGVector(dx: drag.velocity.width, dy: drag.velocity.height)))
+                    }
+            )
+            .accessibilityAction(named: Text(String(localized: "Move earlier", bundle: .module))) { step(-1) }
+            .accessibilityAction(named: Text(String(localized: "Move later", bundle: .module))) { step(1) }
+    }
+
+    private func step(_ delta: Int) {
+        guard let i = order.firstIndex(of: id), order.indices.contains(i + delta) else { return }
+        onDrop(.reorder(NibReflowMove(id: id, from: i, to: i + delta, in: order)))
+    }
+}
+
+// MARK: - The carrier
+
+extension DropletStyle {
+    /// The cover a combine is armed on, as water under its own content: a 3 pt envelope (radius 8) with the held rim
+    /// (it rises to meet the card) that necks with the lifted card (§10.12). Rigid: it does not move.
+    static var armedCover: DropletStyle {
+        var s = DropletStyle.card
+        s.cornerRadius = NibRadius.cardEnvelope
+        s.stretchCap = 0
+        s.poke = 0
+        s.lift = 1
+        s.envelope = 0
+        s.restsDry = false
+        s.drag = .fixed
+        s.isInteractive = false
+        return s.lifted
+    }
+}
+
+/// The lifted card as water (DESIGN.md §10.12): a `card` droplet in the window's droplet container that follows the
+/// finger through a `NibReflow` drag (lift, 3 pt envelope, stretch, settle), condenses over the sidebar, necks with the
+/// cover a combine is armed on, and flows with `slot` to where the item now belongs when it is dropped. Place it as a
+/// full-size child of the `NibDropletContainer`; `content` draws an item exactly as its grid cell does (the cell hides
+/// while the carrier draws it).
+public struct NibReflowCarrier<ID: Hashable, Content: View>: View {
+    let reflow: NibReflow<ID>
+    let id: String
+    let content: (ID) -> Content
+    @Environment(DropletField.self) private var field: DropletField?
+
+    public init(_ reflow: NibReflow<ID>, id: String = "reflow.carrier", @ViewBuilder content: @escaping (ID) -> Content) {
+        self.reflow = reflow
+        self.id = id
+        self.content = content
+    }
+
+    public var body: some View {
+        GeometryReader { proxy in
+            let global = proxy.frame(in: .global).origin
+            let local = proxy.frame(in: NibLiquid.space).origin
+            // Global → this view, and global → the container's space (where the field works).
+            let toView = { (p: CGPoint) -> CGPoint in CGPoint(x: p.x - global.x, y: p.y - global.y) }
+            let toField = { (p: CGPoint) -> CGPoint in CGPoint(x: p.x - global.x + local.x, y: p.y - global.y + local.y) }
+            ZStack(alignment: .topLeading) {
+                if let armed = reflow.armed, let frame = reflow.armedFrame {
+                    ArmedCover(id: id + ".target", frame: frame.offsetBy(dx: -global.x, dy: -global.y)) {
+                        content(armed)
+                    }
+                }
+                if let carried = reflow.carried, let rest = reflow.carrierFrame {
+                    let centre = toView(CGPoint(x: rest.midX, y: rest.midY))
+                    content(carried)
+                        .frame(width: rest.width, height: rest.height)
+                        .modifier(DropletModifier(id: id, style: .card, managesDrag: false,
+                                                  dragScale: reflow.isCondensed ? 0.5 : 1,
+                                                  bondsWith: reflow.armed == nil ? nil : id + ".target", onDrag: nil))
+                        .position(centre)
+                        .background(CarrierDriver(reflow: reflow, id: id, toField: toField))
+                }
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
+        }
+        .allowsHitTesting(false)
+        .onAppear { reflow.hasCarrier = true }
+        .onDisappear { reflow.hasCarrier = false }
+    }
+}
+
+/// The armed cover: its content over a 3 pt water envelope that swells to 1.03 with `lift` (the body's growth runs on
+/// the field's size spring).
+struct ArmedCover<Content: View>: View {
+    let id: String
+    let frame: CGRect
+    @ViewBuilder let content: () -> Content
+    @State private var swelled = false
+
+    var body: some View {
+        let s = swelled ? NibReflowMetrics.armedScale : 1
+        content()
+            .frame(width: frame.width, height: frame.height)
+            .scaleEffect(s)
+            .frame(width: frame.width * s + 6, height: frame.height * s + 6)
+            .droplet(id, style: .armedCover, managesDrag: false)
+            .position(x: frame.midX, y: frame.midY)
+            .onAppear { withAnimation(NibMotion.lift.animation) { swelled = true } }
+    }
+}
+
+/// Feeds the carrier droplet the finger (begin, follow, release) and tells the reflow when it has landed. A leaf: it
+/// reads the carrier's node, so only it re-renders per frame.
+struct CarrierDriver<ID: Hashable>: View {
+    let reflow: NibReflow<ID>
+    let id: String
+    let toField: (CGPoint) -> CGPoint
+    @Environment(DropletField.self) private var field: DropletField?
+
+    var body: some View {
+        Color.clear
+            .onChange(of: reflow.lift) { _, lift in drive(lift) }
+            .onChange(of: field?.node(id).presentation) { _, p in
+                // The droplet registers a frame after it appears: catch up with the finger, then watch for the landing.
+                drive(reflow.lift)
+                guard let p, let lift = reflow.lift, case .released = lift.phase, !p.isLifted, !p.isSettling else {
+                    return
+                }
+                reflow.landed()
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+    }
+
+    private func drive(_ lift: NibReflow<ID>.Lift?) {
+        guard let field, let lift, field.visualFrame(id) != nil else { return }
+        switch lift.phase {
+        case .dragging:
+            if !field.isDragging(id) { field.beginDrag(id, at: toField(lift.start)) }
+            field.drag(id, to: toField(lift.location))
+        case .released(let velocity):
+            if field.isDragging(id) { field.endDrag(id, velocity: velocity) }
+        }
+    }
+}
+```
+
 ### 3.18 `NibKit/Sources/NibDesign/Shaders/NibLiquid.metal`
 
 ```metal
@@ -3691,72 +5218,94 @@ struct WaterCluster: Identifiable, Equatable {
 #include <SwiftUI/SwiftUI_Metal.h>
 using namespace metal;
 
-// Nib's water (docs/DESIGN.md §10.9). Light from the top-left: azimuth 225°, elevation 40°; screen y points down.
-constant float3 kLight = float3(-0.5417, -0.5417, 0.6428);
+// Nib's water on iOS 17–25 (docs/DESIGN.md §10.9, Liquid Glass v2). Every optic lives in the outer 4.5 pt: a 0.8 pt rim
+// lit by the top-left key light with a counter-rim half as bright opposite it, a sheen inside the lit edge and, over
+// light paper, a body that thins toward the silhouette where the glass would bend the page. The core is the body tint
+// alone. The numbers arrive from NibOptics (NibShaders.swift); the argument lists there and here match one for one.
 
 static inline half4 over(half4 src, half4 dst) {
     return src + dst * (1.0h - src.a);
 }
 
-// d: signed distance to the surface in points (+ inside). dRim / dCaustic: the same at p − (1.1, 1.5) and p + (4, 6).
-// n2: unit vector pointing into the droplet. Height = smoothstep(0, 8 pt, d): a flat puddle with a rounded rim.
-// Edge and caustic come in already scaled by how much there is to lens (light paper) and by 1 − tinted.
-static inline half4 waterOptics(half4 body, float d, float dRim, float dCaustic, float2 n2,
-                                half4 edge, half4 caustic, half4 rim, half4 line, float specular) {
-    float cover = saturate(d + 0.5);
-    float edgeK = 1.0 - smoothstep(0.0, 2.6, d);
-    float lineK = 1.0 - smoothstep(0.3, 1.1, d);
-    float rimK = saturate(0.5 - dRim) * cover;
-    float causticK = (1.0 - smoothstep(-2.0, 2.0, dCaustic)) * smoothstep(0.0, 3.0, d);
-    float t = saturate(d / 8.0);
-    float slope = 6.0 * t * (1.0 - t) / 8.0 * 6.5;
-    float3 n = normalize(float3(-n2 * slope, 1.0));
-    float3 h = normalize(kLight + float3(0.0, 0.0, 1.0));
-    float spec = pow(saturate(dot(n, h)), 40.0) * specular * cover;
-    half hs = half(spec);
+// `c` (premultiplied) at `k` times its own alpha, the result's alpha capped at 1.
+static inline half4 scaled(half4 c, float k) {
+    float a = float(c.a);
+    if (a <= 0.0 || k <= 0.0) {
+        return half4(0.0h);
+    }
+    return c * half(min(k, 1.0 / a));
+}
+
+// body: premultiplied body colour. d: distance inside the silhouette in points. outward: unit normal pointing out of
+// the water. light: unit vector toward the key light (screen space, y down). strength: rim strength (1 at rest, 1.5
+// held). counter: the counter-rim's peak relative to the key rim's. sheen: the sheen's share of the rim colour.
+static inline half4 waterOptics(half4 body, float d, float2 outward, float2 light, half4 rim, half4 line,
+                                float strength, float counter, float sheen) {
+    float lambda = dot(outward, light);
+    float k = max(lambda, 0.0);
+    float c = max(-lambda, 0.0);
+    float key = k * sqrt(k);                                  // max(λ, 0)^1.5
+    float lit = key + counter * c * c;                        // + counter · max(−λ, 0)^2
+    float band = 1.0 - smoothstep(0.3, 1.1, d);               // the 0.8 pt edge: outline and rim
+    float glow = 1.0 - smoothstep(0.8, 4.5, d);               // the sheen inside the lit edge
 
     half4 o = body;
-    o = over(edge * half(edgeK), o);
-    o = over(caustic * half(causticK), o);
-    o = over(half4(hs, hs, hs, hs), o);
-    o = over(rim * half(rimK), o);
-    o = over(line * half(lineK), o);
-    return o * half(cover);
+    o = over(scaled(rim, sheen * key * key * glow * strength), o);
+    o = over(line * half(band), o);                           // under the rim: it shows where the rim is dim
+    o = over(scaled(rim, lit * band * strength), o);
+    return o;
 }
 
 // Layer effect over a cluster's blurred field. Alpha = union coverage; r, g, b = clear, deep, tinted coverage, scaled
-// by k = 0.5 + 0.5 × the share over light paper, so (r + g + b) / a recovers that share.
-[[ stitchable ]] half4 nibWaterField(float2 position, SwiftUI::Layer layer, float iso,
+// by k = 0.5 + 0.5 × the share over light paper, so (r + g + b) / a recovers that share. strength: rim strength.
+// shadowK: shadow opacity multiplier (0 = none, 1 at rest, 1.6 held). shadowY: shadow offset downward in points.
+[[ stitchable ]] half4 nibWaterField(float2 position, SwiftUI::Layer layer, float iso, float strength, float shadowK,
+                                     float shadowY, float lightX, float lightY, float counter, float sheen, float lens,
                                      half4 clearBody, half4 clearBodyPaper, half4 deepBody, half4 tintBody,
-                                     half4 waterBody, half4 edge, half4 caustic, half4 rim, half4 tintRim,
-                                     half4 line, float specular) {
+                                     half4 waterBody, half4 rim, half4 tintRim, half4 line,
+                                     half4 shadowDesk, half4 shadowPaper) {
     half4 c = layer.sample(position);
     float f = float(c.a);
-    if (f < iso * 0.35) {
-        return half4(0.0h);
+    float cover = 0.0;
+    half4 o = half4(0.0h);
+    if (f >= iso * 0.35) {
+        const float e = 1.5;
+        float fx = (float(layer.sample(position + float2(e, 0.0)).a) - float(layer.sample(position - float2(e, 0.0)).a))
+                   / (2.0 * e);
+        float fy = (float(layer.sample(position + float2(0.0, e)).a) - float(layer.sample(position - float2(0.0, e)).a))
+                   / (2.0 * e);
+        float2 g = float2(fx, fy);
+        float gl = max(length(g), 0.0001);
+        float d = (f - iso) / gl;
+        if (d >= -0.5) {
+            cover = saturate(d + 0.5);
+            float kinds = max(float(c.r) + float(c.g) + float(c.b), 0.0001);
+            float paper = saturate((kinds / max(f, 0.0001) - 0.5) * 2.0);
+            float tinted = float(c.b) / kinds;
+            half4 clear = mix(clearBody, clearBodyPaper, half4(half(paper)));
+            half4 body = clear * half(float(c.r) / kinds) + deepBody * half(float(c.g) / kinds) + tintBody * half(tinted);
+            body = over(waterBody * half(1.0 - tinted), body);
+            // Edge lens: only where there is a page to bend, never on Tinted.
+            body = body * half(1.0 - lens * paper * (1.0 - tinted) * (1.0 - smoothstep(0.0, 4.0, d)));
+            half4 r = mix(rim, tintRim, half4(half(tinted)));
+            // The field grows inward, so −∇f points out of the water.
+            o = waterOptics(body, d, -g / gl, float2(lightX, lightY), r, line, strength, counter,
+                            sheen * (1.0 - tinted)) * half(cover);
+        }
     }
-    float fx = float(layer.sample(position + float2(1.0, 0.0)).a - layer.sample(position - float2(1.0, 0.0)).a) * 0.5;
-    float fy = float(layer.sample(position + float2(0.0, 1.0)).a - layer.sample(position - float2(0.0, 1.0)).a) * 0.5;
-    float2 g = float2(fx, fy);
-    float gl = max(length(g), 0.0001);
-    float d = (f - iso) / gl;
-    if (d < -0.5) {
-        return half4(0.0h);
+    // The shadow: the field is the silhouette blurred at σ, so the field `shadowY` points higher is the water's soft
+    // shadow. It is drawn only where the water is not, so it never shows through the translucent body.
+    if (cover < 1.0 && shadowK > 0.0) {
+        half4 s = layer.sample(position - float2(0.0, shadowY));
+        float fs = float(s.a);
+        if (fs > 0.002) {
+            float sk = max(float(s.r) + float(s.g) + float(s.b), 0.0001);
+            float sp = saturate((sk / fs - 0.5) * 2.0);
+            half4 shadow = scaled(mix(shadowDesk, shadowPaper, half4(half(sp))), shadowK * saturate(fs / iso));
+            o = o + shadow * half(1.0 - cover);
+        }
     }
-    float dRim = (float(layer.sample(position - float2(1.1, 1.5)).a) - iso) / gl;
-    float dCaustic = (float(layer.sample(position + float2(4.0, 6.0)).a) - iso) / gl;
-
-    float kinds = max(float(c.r) + float(c.g) + float(c.b), 0.0001);
-    float paper = saturate((kinds / max(f, 0.0001) - 0.5) * 2.0);
-    float tinted = float(c.b) / kinds;
-    half4 clear = mix(clearBody, clearBodyPaper, half4(half(paper)));
-    half4 body = clear * half(float(c.r) / kinds) + deepBody * half(float(c.g) / kinds) + tintBody * half(tinted);
-    body = over(waterBody * half(1.0 - tinted), body);
-    // Edge and caustic only where there is something to lens; Tinted gets its rim and the outline, nothing else.
-    half optics = half(paper * (1.0 - tinted));
-    half4 r = mix(rim, tintRim, half4(half(tinted)));
-    return waterOptics(body, d, dRim, dCaustic, g / gl, edge * optics, caustic * optics, r, line,
-                       specular * (1.0 - tinted));
+    return o;
 }
 
 static inline float roundedBoxSDF(float2 p, float2 halfSize, float radius) {
@@ -3764,26 +5313,27 @@ static inline float roundedBoxSDF(float2 p, float2 halfSize, float radius) {
     return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
 }
 
-// Colour effect for one static shape drawn with a 1 pt outset (nibGlass on iOS 17–25, folder films, frames). The
-// material underneath provides the body; this adds the optics. `optics` 0 = rim and outline only.
-[[ stitchable ]] half4 nibWaterRim(float2 position, half4 color, float4 bounds, float radius, float optics,
-                                   half4 edge, half4 caustic, half4 rim, half4 line, float specular) {
+// Colour effect for one static shape drawn with a 1 pt outset (nibGlass on iOS 17–25, beads, folder films, frames, the
+// held rim over iOS 26 glass). The body underneath is drawn by SwiftUI; this adds the optics. counter 0 drops the
+// counter-rim, sheen 0 the sheen, lineOn 0 the outline.
+[[ stitchable ]] half4 nibWaterRim(float2 position, half4 color, float4 bounds, float radius, float strength,
+                                   float lightX, float lightY, float counter, float sheen, float lineOn,
+                                   half4 rim, half4 line) {
     float2 halfSize = bounds.zw * 0.5 - 1.0;
     float2 centre = bounds.xy + bounds.zw * 0.5;
     float r = min(radius, min(halfSize.x, halfSize.y));
     float2 p = position - centre;
     float d = -roundedBoxSDF(p, halfSize, r);
-    if (d < -0.5) {
+    if (d < -0.5 || d > 5.0) {
         return half4(0.0h);
     }
-    float dRim = -roundedBoxSDF(p - float2(1.1, 1.5), halfSize, r);
-    float dCaustic = -roundedBoxSDF(p + float2(4.0, 6.0), halfSize, r);
-    float e = 0.5;
-    float2 g = float2(roundedBoxSDF(p - float2(e, 0.0), halfSize, r) - roundedBoxSDF(p + float2(e, 0.0), halfSize, r),
-                      roundedBoxSDF(p - float2(0.0, e), halfSize, r) - roundedBoxSDF(p + float2(0.0, e), halfSize, r));
-    float gl = max(length(g), 0.0001);
-    half o = half(optics);
-    return waterOptics(half4(0.0h), d, dRim, dCaustic, g / gl, edge * o, caustic * o, rim, line, specular * optics);
+    const float e = 0.5;
+    float2 g = float2(roundedBoxSDF(p + float2(e, 0.0), halfSize, r) - roundedBoxSDF(p - float2(e, 0.0), halfSize, r),
+                      roundedBoxSDF(p + float2(0.0, e), halfSize, r) - roundedBoxSDF(p - float2(0.0, e), halfSize, r));
+    float2 outward = g / max(length(g), 0.0001);
+    half4 o = waterOptics(half4(0.0h), d, outward, float2(lightX, lightY), rim, line * half(lineOn), strength, counter,
+                          sheen);
+    return o * half(saturate(d + 0.5));
 }
 ```
 
@@ -4638,6 +6188,8 @@ public struct NibToolPalette<Settings: View>: View {
 
     @Environment(DropletField.self) private var field: DropletField?
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.nibLiquidMode) private var liquidMode
     @ScaledMetric(relativeTo: .body) private var scaledThick: CGFloat = 56
     @ScaledMetric(relativeTo: .body) private var scaledPitch: CGFloat = 44
     @State private var shownDock: NibPaletteDock?
@@ -4649,6 +6201,10 @@ public struct NibToolPalette<Settings: View>: View {
     @State private var popoverSize = CGSize(width: NibMetrics.popoverWidth, height: 412)
     @State private var moreSize = CGSize(width: NibMetrics.popoverWidth, height: 124)
     @State private var optionsSize = CGSize(width: 200, height: NibMetrics.barHeight)
+    /// A released drag on its way to its dock: the one plip plays when it arrives (DESIGN.md §10.11).
+    @State private var landing: DockLanding?
+    /// Reduce Motion and Liquid Off cross-fade the palette to its new dock (DESIGN.md §10.10).
+    @State private var fade: Double = 1
 
     enum DragMode {
         case move, scrub
@@ -4754,43 +6310,22 @@ public struct NibToolPalette<Settings: View>: View {
     }
 
     private func region(_ proxy: GeometryProxy) -> CGRect {
-        let s = proxy.safeAreaInsets
-        let top = s.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.l
-        let bottom = s.bottom + (compact ? NibSpacing.s : NibSpacing.l)
-        return CGRect(x: s.leading + NibSpacing.l, y: top,
-                      width: max(0, proxy.size.width - s.leading - s.trailing - 2 * NibSpacing.l - reservedTrailing),
-                      height: max(0, proxy.size.height - top - bottom))
+        DropletDockModel.region(size: proxy.size, safeArea: proxy.safeAreaInsets, compact: compact,
+                                reservedTrailing: reservedTrailing)
     }
 
-    private func centre(_ d: NibPaletteDock, size s: CGSize, in r: CGRect) -> CGPoint {
-        let t = min(max(d.along, 0), 1)
-        func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * t }
-        switch d.edge {
-        case .leading: return CGPoint(x: r.minX + s.width / 2, y: lerp(r.minY + s.height / 2, r.maxY - s.height / 2))
-        case .trailing: return CGPoint(x: r.maxX - s.width / 2, y: lerp(r.minY + s.height / 2, r.maxY - s.height / 2))
-        case .top: return CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.minY + s.height / 2)
-        case .bottom: return CGPoint(x: lerp(r.minX + s.width / 2, r.maxX - s.width / 2), y: r.maxY - s.height / 2)
-        }
+    /// The dock engine (DESIGN.md §10.11) for region `r`, shifted by `origin` into the container's space: the palette's
+    /// size in each orientation, the docks this device offers, the capture radius and the meniscus.
+    private func dockModel(_ r: CGRect, origin: CGPoint = .zero) -> DropletDockModel {
+        DropletDockModel(region: r.offsetBy(dx: origin.x, dy: origin.y),
+                         horizontal: CGSize(width: length(arrange(maxLength: r.width)), height: thick),
+                         vertical: CGSize(width: thick, height: length(arrange(maxLength: r.height))),
+                         docks: allowedEdges, compact: compact)
     }
 
-    private func dockFor(_ p: CGPoint, in r: CGRect, _ a: Arrangement) -> NibPaletteDock {
-        func distance(_ e: NibDock) -> CGFloat {
-            switch e {
-            case .leading: return abs(p.x - r.minX)
-            case .trailing: return abs(p.x - r.maxX)
-            case .top: return abs(p.y - r.minY) + 40
-            case .bottom: return abs(p.y - r.maxY)
-            }
-        }
-        let edge = edges.min { distance($0) < distance($1) } ?? .bottom
-        let s = size(NibPaletteDock(edge: edge), a)
-        let along: CGFloat
-        if edge.isVertical {
-            along = (p.y - (r.minY + s.height / 2)) / max(1, r.height - s.height)
-        } else {
-            along = (p.x - (r.minX + s.width / 2)) / max(1, r.width - s.width)
-        }
-        return NibPaletteDock(edge: edge, along: min(max(along, 0), 1))
+    private func centre(_ d: NibPaletteDock, in r: CGRect) -> CGPoint {
+        let f = dockModel(r).frame(for: d)
+        return CGPoint(x: f.midX, y: f.midY)
     }
 
     /// A slot's rect across the palette's full thickness, in the palette's centred coordinates.
@@ -4819,13 +6354,13 @@ public struct NibToolPalette<Settings: View>: View {
             let map = slots(a)
             let origin = proxy.frame(in: NibLiquid.space).origin
             let d = current
-            let s = size(d, a)
-            let c = centre(d, size: s, in: r)
+            let c = centre(d, in: r)
             let bounds = CGRect(origin: .zero, size: proxy.size)
             let slotAt = { (along: CGFloat) -> CGRect in slotRect(along, d, a).offsetBy(dx: c.x, dy: c.y) }
             ZStack(alignment: .topLeading) {
                 palette(d, a, map)
                     .gesture(dragGesture(region: r, origin: origin, arrangement: a, slots: map))
+                    .opacity(fade)
                     .position(c)
                 if let tool = a.natives.first(where: { $0.id == selection }) ?? a.plugins.first(where: { $0.id == selection }),
                    tool.hasSettings, let along = map[tool.id] {
@@ -4846,6 +6381,7 @@ public struct NibToolPalette<Settings: View>: View {
                 registerAnchors(key.slots, d, a)
                 if let along = map[selection] { field?.setBead(id, head: along, glide: false) }
             }
+            .background(DockArrivalWatcher(id: id, node: field?.node(id), field: field, landing: $landing))
             .onChange(of: selection) { _, newValue in
                 let glide = tapped == newValue
                 tapped = nil
@@ -5014,8 +6550,9 @@ public struct NibToolPalette<Settings: View>: View {
                         mode = .move
                         settingsOpen = false
                         moreOpen = false
+                        landing = nil
                         field.dismissBuds()
-                        field.beginDrag(id, at: value.startLocation)
+                        DropletDockDriver(id: id, field: field).begin(at: value.startLocation)
                     }
                 }
                 switch mode {
@@ -5025,7 +6562,9 @@ public struct NibToolPalette<Settings: View>: View {
                     let lo = scrubbable.map(\.1).min() ?? a, hi = scrubbable.map(\.1).max() ?? a
                     field.scrubBead(id, to: min(max(a, lo), hi))        // never onto More or the swatches
                 case .move:
-                    field.drag(id, to: value.location)
+                    // Held, the palette is a bead of water: it follows with `follow`, and its meniscus reaches for the
+                    // dock the finger is within capture of.
+                    DropletDockDriver(id: id, field: field).move(to: value.location, model: dockModel(r, origin: origin))
                 case .none:
                     break
                 }
@@ -5047,26 +6586,32 @@ public struct NibToolPalette<Settings: View>: View {
                     return
                 }
                 guard mode == .move else { return }
-                let v = field.endDrag(id, velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height))
-                let projected = DropletPhysics.projectedLanding(value.location, velocity: v)
-                let local = CGPoint(x: projected.x - origin.x, y: projected.y - origin.y)
-                var next = dockFor(local, in: r, a)
-                let nextSize = size(next, a)
-                let nextCentre = centre(next, size: nextSize, in: r)
-                let rect = CGRect(x: nextCentre.x - nextSize.width / 2 + origin.x, y: nextCentre.y - nextSize.height / 2 + origin.y,
-                                  width: nextSize.width, height: nextSize.height)
-                let rested = field.restingRect(rect, excluding: id, along: next.isVertical ? .vertical : .horizontal)
-                if next.isVertical {
-                    next.along = min(max((rested.minY - origin.y - r.minY) / max(1, r.height - nextSize.height), 0), 1)
-                } else {
-                    next.along = min(max((rested.minX - origin.x - r.minX) / max(1, r.width - nextSize.width), 0), 1)
+                // The projected finger picks the dock within the capture radius (else home); the palette springs there
+                // with `snap` from the full release velocity, re-forms if the axis changes, and plips on arrival.
+                let release = DropletDockDriver(id: id, field: field).release(
+                    at: value.location, velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height),
+                    from: current, model: dockModel(r, origin: origin))
+                let next = release.dock
+                let arrival = DockLanding(centre: CGPoint(x: release.frame.midX, y: release.frame.midY))
+                if (reduceMotion || liquidMode == .off) && next != current {
+                    // Fade out, move while invisible (the body glides with `reduced`), fade in.
+                    withAnimation(NibMotion.exit) { fade = 0 }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                        dock = next
+                        landing = DockLanding(centre: arrival.centre)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.reduced.response) {
+                            withAnimation(NibMotion.enter) { fade = 1 }
+                        }
+                    }
+                    return
                 }
                 if next.isVertical != current.isVertical {
                     shownDock = current
-                    field.beginReshape(id, towards: CGPoint(x: rested.midX, y: rested.midY), velocity: v)
+                    field.beginReshape(id, towards: CGPoint(x: release.frame.midX, y: release.frame.midY),
+                                       velocity: release.velocity)
                 }
+                landing = arrival
                 dock = next
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) { NibHaptics.play(.snap) }
             }
     }
 }
@@ -5100,6 +6645,7 @@ struct NibSelectionBead: View {
         let head = node?.head ?? fallbackHead, tail = node?.tail ?? fallbackHead
         let g = BeadPhysics.geometry(head: head, tail: tail, radius: NibMetrics.beadRadius)
         let across = thickness / 2
+        let systemGlass = field?.usesSystemGlass ?? false
         Canvas { context, _ in
             func point(_ a: CGFloat) -> CGPoint { vertical ? CGPoint(x: across, y: a) : CGPoint(x: a, y: across) }
             let h = point(g.head), t = point(g.tail)
@@ -5117,12 +6663,8 @@ struct NibSelectionBead: View {
                 layer.opacity = 0.15
                 layer.fill(bead, with: .color(ink))
             }
-            // The rim: the bead minus itself shifted down-right, a hairline highlight on the top-left.
-            context.drawLayer { layer in
-                layer.fill(bead, with: .color(NibColor.waterRim))
-                layer.blendMode = .destinationOut
-                layer.fill(bead.offsetBy(dx: 0.9, dy: 1.2), with: .color(.black))
-            }
+            // The key rim on the top-left (iOS 17–25); inside iOS 26 glass the bead is a plain fill (DESIGN.md §10.7).
+            context.drawNibBeadRim(bead, systemGlass: systemGlass)
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -6945,6 +8487,472 @@ final class DropletPhysicsTests: XCTestCase {
 }
 ```
 
+### 3.28a `NibKit/Tests/NibDesignTests/DropletDockTests.swift`
+
+The dock model, the meniscus (reach, fuse at 20 pt, pinch at 51.6 / 56.5 pt), the follow lag, the one-dip settle across sizes and speeds, and the snap's single plip.
+
+```swift
+import XCTest
+import CoreGraphics
+import SwiftUI
+@testable import NibDesign
+
+/// The palette's water dock and hold (DESIGN.md §10.1–10.3, §10.10, §10.11).
+final class DropletDockTests: XCTestCase {
+    /// iPad Pro 11-inch landscape (1194 × 834, 24 pt status bar, 20 pt home indicator) with the 469 × 56 palette:
+    /// region x 16…1178, y 92…798; centre lines left 44, right 1150, top 120 (+40), bottom 770.
+    private let iPad = DropletDockModel(
+        region: DropletDockModel.region(size: CGSize(width: 1194, height: 834),
+                                        safeArea: EdgeInsets(top: 24, leading: 0, bottom: 20, trailing: 0), compact: false),
+        length: 469, thickness: 56)
+
+    /// iPhone (393 × 852, safe area 59 / 34) with the 349 × 56 palette: region y 127…810; top 155 (+40), bottom 782.
+    private let iPhone = DropletDockModel(
+        region: DropletDockModel.region(size: CGSize(width: 393, height: 852),
+                                        safeArea: EdgeInsets(top: 59, leading: 0, bottom: 34, trailing: 0), compact: true),
+        length: 349, thickness: 56, compact: true)
+
+    // MARK: Model
+
+    func testRegionSitsBelowTheBarsSixteenPointsIn() {
+        XCTAssertEqual(iPad.region, CGRect(x: 16, y: 92, width: 1162, height: 706))
+        XCTAssertEqual(iPhone.region, CGRect(x: 16, y: 127, width: 361, height: 683))
+        let reserved = DropletDockModel.region(size: CGSize(width: 1194, height: 834), safeArea: EdgeInsets(),
+                                               compact: false, reservedTrailing: 344)
+        XCTAssertEqual(reserved.maxX, 1194 - 16 - 344, accuracy: 1e-9)   // the right dock moves to the panel's edge
+    }
+
+    func testFramesSlideAlongTheirEdge() {
+        XCTAssertEqual(iPad.frame(for: NibPaletteDock(edge: .leading, along: 0.5)),
+                       CGRect(x: 16, y: 210.5, width: 56, height: 469))
+        XCTAssertEqual(iPad.frame(for: NibPaletteDock(edge: .bottom, along: 0)), CGRect(x: 16, y: 742, width: 469, height: 56))
+        XCTAssertEqual(iPad.frame(for: NibPaletteDock(edge: .trailing, along: 1)).maxY, 798, accuracy: 1e-9)
+        let f = iPad.frame(for: NibPaletteDock(edge: .top, along: 0.3))
+        XCTAssertEqual(iPad.along(ofFrame: f, on: .top), 0.3, accuracy: 1e-9)
+    }
+
+    func testReleaseProjectsTheFlingAndACarefulReleaseNeverFlings() {
+        let p = CGPoint(x: 600, y: 400)
+        let flung = DropletDockModel.projectedPoint(finger: p, velocity: CGVector(dx: 2000, dy: 0), stillFor: 0.01)
+        XCTAssertEqual(flung.x, 840, accuracy: 1e-9)                                  // p + v·0.12 s
+        XCTAssertEqual(flung.y, 400, accuracy: 1e-9)
+        XCTAssertEqual(DropletDockModel.projectedPoint(finger: p, velocity: CGVector(dx: 2000, dy: 0), stillFor: 0.07), p)
+        let capped = DropletDockModel.projectedPoint(finger: p, velocity: CGVector(dx: 9000, dy: 0), stillFor: 0)
+        XCTAssertEqual(capped.x, 600 + 5000 * 0.12, accuracy: 1e-9)                  // capped at 5000 pt/s
+    }
+
+    func testTheTopIsChosenOnlyOnPurpose() {
+        let p = CGPoint(x: 100, y: 150)                  // 30 pt below the top line, 56 pt from the left line
+        XCTAssertEqual(iPad.distance(from: p, to: .top), 30 + 40, accuracy: 1e-9)
+        XCTAssertEqual(iPad.nearestDock(to: p), .leading)
+        XCTAssertEqual(iPad.nearestDock(to: CGPoint(x: 600, y: 125)), .top)
+        XCTAssertEqual(iPad.nearestDock(to: CGPoint(x: 600, y: 700)), .bottom)
+        XCTAssertEqual(iPad.nearestDock(to: CGPoint(x: 1100, y: 400)), .trailing)
+    }
+
+    func testCaptureRadiusOrHome() {
+        XCTAssertEqual(DropletDockModel.captureRadius, 200)
+        XCTAssertEqual(DropletDockModel.captureRadiusCompact, 160)
+        let home = NibPaletteDock(edge: .leading, along: 0.2)
+        // Mid-page: the nearest dock (bottom, 340 pt) is outside the capture radius, so the palette flows home.
+        XCTAssertNil(iPad.capturedDock(at: CGPoint(x: 600, y: 430)))
+        XCTAssertEqual(iPad.release(projected: CGPoint(x: 600, y: 430), from: home), home)
+        // 170 pt above the bottom line: captured.
+        XCTAssertEqual(iPad.capturedDock(at: CGPoint(x: 600, y: 600)), .bottom)
+        // Exactly at the radius counts; one point further does not.
+        XCTAssertEqual(iPad.capturedDock(at: CGPoint(x: 1150 - 200, y: 430)), .trailing)
+        XCTAssertNil(iPad.capturedDock(at: CGPoint(x: 1150 - 201, y: 430)))
+        // A fling from mid-page towards the right lands on the right edge, centred on the projected point.
+        let flung = iPad.release(finger: CGPoint(x: 900, y: 430), velocity: CGVector(dx: 2500, dy: 0), stillFor: 0,
+                                 from: home)
+        XCTAssertEqual(flung.edge, .trailing)
+        XCTAssertEqual(flung.along, (430 - 326.5) / 237, accuracy: 1e-9)
+        // The same point released carefully (still ≥ 70 ms) does not fling: home.
+        XCTAssertEqual(iPad.release(finger: CGPoint(x: 900, y: 430), velocity: CGVector(dx: 2500, dy: 0), stillFor: 0.2,
+                                    from: home), home)
+    }
+
+    func testIPhoneDocksTopAndBottomOnly() {
+        XCTAssertEqual(iPhone.docks, [.top, .bottom])
+        XCTAssertNil(iPhone.capturedDock(at: CGPoint(x: 20, y: 470)))                   // the left edge is not a dock
+        XCTAssertEqual(iPhone.capturedDock(at: CGPoint(x: 20, y: 650)), .bottom)
+        XCTAssertEqual(iPhone.capturedDock(at: CGPoint(x: 200, y: 200)), .top)          // 45 + 40 = 85 ≤ 160
+        XCTAssertEqual(iPhone.validated(NibPaletteDock(edge: .leading)).edge, .bottom)
+        XCTAssertEqual(iPhone.validated(NibPaletteDock(edge: .top, along: 0.4)), NibPaletteDock(edge: .top, along: 0.4))
+    }
+
+    func testCommandValuesRoundTrip() {
+        for edge in NibDock.allCases { XCTAssertEqual(NibDock(commandValue: edge.commandValue), edge) }
+        XCTAssertEqual(NibDock.leading.commandValue, "left")
+        XCTAssertEqual(NibDock.trailing.commandValue, "right")
+        XCTAssertNil(NibDock(commandValue: "middle"))
+    }
+
+    // MARK: Meniscus
+
+    func testMeniscusThicknessReachAndPinch() {
+        XCTAssertEqual(DropletDockModel.meniscusThickness(gap: 0), 26, accuracy: 1e-9)
+        XCTAssertEqual(DropletDockModel.meniscusThickness(gap: 36), 26 * pow(0.5, 0.7), accuracy: 1e-9)
+        XCTAssertEqual(DropletDockModel.meniscusThickness(gap: 72), 0, accuracy: 1e-9)
+        XCTAssertEqual(DropletDockModel.meniscusReach(gap: 72), 0, accuracy: 1e-9)
+        XCTAssertEqual(DropletDockModel.meniscusReach(gap: 46), 0.5, accuracy: 1e-9)
+        XCTAssertEqual(DropletDockModel.meniscusReach(gap: 20), 1, accuracy: 1e-9)
+        let pinch = DropletDockModel.meniscusPinchGap(minimumNeck: DropletMetrics.regular.minimumNeck)
+        XCTAssertEqual(pinch, 51.6, accuracy: 0.2)                                     // holds on well past the 20 pt join
+        XCTAssertEqual(DropletDockModel.meniscusThickness(gap: pinch), DropletMetrics.regular.minimumNeck, accuracy: 1e-6)
+        XCTAssertEqual(DropletDockModel.meniscusPinchGap(minimumNeck: DropletMetrics.compact.minimumNeck), 56.5,
+                       accuracy: 0.2)
+    }
+
+    func testMeniscusGrowsFusesHoldsOnAndPinches() {
+        let dock = CGRect(x: 16, y: 210.5, width: 56, height: 469)                     // the left dock
+        func body(gap: CGFloat) -> CGRect { CGRect(x: 72 + gap, y: 210.5, width: 56, height: 469) }
+        let tMin = DropletMetrics.regular.minimumNeck
+        var m = DockMeniscus()
+        m.target = dock
+        func run(_ gap: CGFloat, frames: Int = 40) {
+            for _ in 0..<frames { _ = m.step(1.0 / 120, body: body(gap: gap), enabled: true, minimumNeck: tMin) }
+        }
+        run(100)
+        XCTAssertEqual(m.phase, .idle)
+        XCTAssertNil(m.segment)
+        run(50)                                                          // inside 72 pt: a tongue reaches out
+        XCTAssertEqual(m.phase, .reaching)
+        let tongue = m.segment
+        XCTAssertNotNil(tongue)
+        if let tongue {
+            XCTAssertLessThan(tongue.to.x, 122)                          // out of the body, towards the dock…
+            XCTAssertGreaterThan(tongue.to.x - tongue.thickness / 2, 72)  // …not touching it yet
+            XCTAssertEqual(tongue.thickness, DropletDockModel.meniscusThickness(gap: 50), accuracy: 0.1)
+        }
+        run(15)                                                          // inside 20 pt: it touches and fuses
+        XCTAssertEqual(m.phase, .fused)
+        XCTAssertLessThan(m.segment?.to.x ?? .infinity, 72)
+        run(45)                                                          // pulled back out: it holds on
+        XCTAssertEqual(m.phase, .fused)
+        run(55)                                                          // thinner than the field can hold: it pinches
+        XCTAssertEqual(m.phase, .retracting)
+        run(60, frames: 120)
+        XCTAssertNil(m.segment)
+        m.target = nil
+        run(60, frames: 120)
+        XCTAssertTrue(m.isIdle)
+    }
+
+    func testNoMeniscusWithoutNecks() {
+        var m = DockMeniscus()
+        m.target = CGRect(x: 16, y: 0, width: 56, height: 469)
+        for _ in 0..<60 {
+            _ = m.step(1.0 / 120, body: CGRect(x: 80, y: 0, width: 56, height: 469), enabled: false, minimumNeck: 10.76)
+        }
+        XCTAssertNil(m.segment)                                          // Reduce Motion, Calm and Liquid Off
+    }
+
+    // MARK: Hold and snap
+
+    func testSpringsAreTheSpecifiedOnes() {
+        XCTAssertEqual(NibMotion.follow, NibSpring(response: 0.085, dampingRatio: 1.0))
+        XCTAssertEqual(NibMotion.snap, NibSpring(response: 0.50, dampingRatio: 0.80))
+        XCTAssertEqual(NibMotion.reflow, NibSpring(response: 0.44, dampingRatio: 0.86))
+        XCTAssertEqual(NibMotion.hudLinger, 0.6, accuracy: 1e-12)
+        XCTAssertTrue(NibHapticEvent.allCases.contains(.plip))
+    }
+
+    /// The held palette trails the finger slightly (the water's weight) and catches up once the finger stops.
+    func testAHeldDropletLagsTheFingerSlightly() {
+        XCTAssertEqual(DropletPhysics.followLag(speed: 1000), 27.06, accuracy: 0.01)
+        var d = DropletDynamics()
+        d.size.snap(to: CGPoint(x: 469, y: 56))
+        d.positionSpring = NibMotion.follow
+        var finger: CGFloat = 0
+        var lag: CGFloat = 0
+        for _ in 0..<60 {                                               // 0.5 s at 1000 pt/s
+            finger += 1000.0 / 120
+            d.offset.target = CGPoint(x: finger, y: 0)
+            _ = d.step(1.0 / 120, style: .palette, reduceMotion: false, calm: false)
+            lag = finger - d.offset.x.value
+        }
+        XCTAssertGreaterThan(lag, 15)                                   // it lags…
+        XCTAssertLessThan(lag, 30)                                      // …by about 27 ms of travel, never more
+        for _ in 0..<24 { _ = d.step(1.0 / 120, style: .palette, reduceMotion: false, calm: false) }
+        XCTAssertLessThan(abs(finger - d.offset.x.value), 1)             // caught up within 0.2 s
+        XCTAssertLessThanOrEqual(d.offset.x.value, finger + 0.05)       // and never passes the finger
+    }
+
+    /// Water, not jelly: as the held palette slows to a stop its stretch dips below zero once, by a visible but small
+    /// amount (3–10 % of the peak), and never bounces back up.
+    func testTheSettleIsOneSmallDip() {
+        for (w, h, style) in [(CGFloat(469), CGFloat(56), DropletStyle.palette), (140, 182, .card), (44, 44, .bar)] {
+            for speed in [CGFloat(300), 1500, 4000] {
+                var d = DropletDynamics()
+                d.size.snap(to: CGPoint(x: w, y: h))
+                d.positionSpring = NibMotion.follow
+                var finger: CGFloat = 0
+                var peak: CGFloat = 0
+                for _ in 0..<48 {
+                    finger += speed / 120
+                    d.offset.target = CGPoint(x: finger, y: 0)
+                    _ = d.step(1.0 / 120, style: style, reduceMotion: false, calm: false)
+                    peak = max(peak, d.stretch.value)
+                }
+                var trough: CGFloat = 0
+                var rebound: CGFloat = -1
+                for _ in 0..<180 {                                       // the finger stops
+                    _ = d.step(1.0 / 120, style: style, reduceMotion: false, calm: false)
+                    if d.stretch.value < trough {
+                        trough = d.stretch.value
+                        rebound = -1
+                    } else if trough < 0 {
+                        rebound = max(rebound, d.stretch.value)
+                    }
+                }
+                XCTAssertGreaterThan(peak, 0)
+                XCTAssertLessThanOrEqual(-trough, 0.10 * peak, "\(style) at \(speed) pt/s undershoots more than 10 %")
+                XCTAssertGreaterThanOrEqual(-trough, 0.03 * peak, "\(style) at \(speed) pt/s has no visible settle")
+                XCTAssertLessThan(rebound, 0.01 * peak, "\(style) at \(speed) pt/s bounces back up (jelly)")
+                XCTAssertEqual(d.stretch.value, 0, accuracy: 0.001)
+            }
+        }
+    }
+
+    /// The dock snap starts from the release velocity, overshoots a little (about 4 pt) and plays exactly one plip.
+    func testTheSnapPlipsOnceOnArrival() {
+        for (start, velocity) in [(CGFloat(-300), CGFloat(0)), (-300, 2000), (-600, 5000), (-100, -1500)] {
+            var p = SpringPoint(CGPoint(x: start, y: 0))
+            p.target = .zero
+            p.velocity = CGVector(dx: velocity, dy: 0)
+            var landing: DockLanding? = DockLanding(centre: .zero, since: 0)
+            var plips = 0
+            var arrivedAt: Double?
+            var overshoot: CGFloat = 0
+            for i in 1...240 {
+                p.step(1.0 / 120, spring: NibMotion.snap)
+                overshoot = max(overshoot, p.value.x)
+                let now = Double(i) / 120
+                if let l = landing {
+                    switch l.check(body: p.value, settling: !p.isResting, now: now) {
+                    case .arrived:
+                        plips += 1
+                        arrivedAt = now
+                        landing = nil
+                    case .expired:
+                        landing = nil
+                    case .waiting:
+                        break
+                    }
+                }
+            }
+            XCTAssertEqual(plips, 1)
+            XCTAssertLessThan(arrivedAt ?? 1, 0.4)
+            XCTAssertLessThan(overshoot, 12)
+            XCTAssertTrue(p.isResting)
+        }
+    }
+
+    func testALandingThatNeverArrivesExpiresSilently() {
+        let l = DockLanding(centre: .zero, since: 0)
+        XCTAssertEqual(l.check(body: CGPoint(x: 50, y: 0), settling: true, now: 1.0), .waiting)
+        XCTAssertEqual(l.check(body: CGPoint(x: 50, y: 0), settling: true, now: 1.6), .expired)
+        XCTAssertEqual(l.check(body: CGPoint(x: 1, y: 1), settling: true, now: 0.2), .arrived)
+        XCTAssertEqual(l.check(body: CGPoint(x: 50, y: 0), settling: false, now: 0.2), .arrived)   // came to rest
+    }
+}
+```
+
+### 3.28b `NibKit/Tests/NibDesignTests/NibReflowTests.swift`
+
+The reflow model: slots, one-slot shifts across rows, hysteresis at a boundary, the outside margin, pause, the combine zone, the move's neighbours, and the observable's drop, cancel, measured-frame mapping and combine arming.
+
+```swift
+import XCTest
+import CoreGraphics
+import SwiftUI
+@testable import NibDesign
+
+/// The library's live reorder (DESIGN.md §10.12, §14.1): the gap follows the finger with hysteresis, neighbours move
+/// one slot, a combine zone holds the reflow, and a drop reports (from, to).
+final class NibReflowTests: XCTestCase {
+    /// Four 140 × 182 covers per row on the 24 pt gutter: a 164 × 206 pitch.
+    private let layout = NibReflowLayout(columns: 4, cell: CGSize(width: 140, height: 182))
+    private let ids = ["a", "b", "c", "d", "e", "f", "g", "h"]
+
+    private func centre(_ i: Int) -> CGPoint {
+        let r = layout.slot(i)
+        return CGPoint(x: r.midX, y: r.midY)
+    }
+
+    private func model(dragging id: String, combines: Bool = false) -> NibReflowModel<String> {
+        NibReflowModel(ids: ids, slots: layout.slots(count: ids.count), dragged: id, combines: combines)!
+    }
+
+    func testGridSlots() {
+        XCTAssertEqual(layout.slot(0), CGRect(x: 0, y: 0, width: 140, height: 182))
+        XCTAssertEqual(layout.slot(5), CGRect(x: 164, y: 206, width: 140, height: 182))
+        XCTAssertNil(NibReflowModel(ids: ids, slots: layout.slots(count: 3), dragged: "a"))
+        XCTAssertNil(NibReflowModel(ids: ids, slots: layout.slots(count: ids.count), dragged: "z"))
+    }
+
+    func testNeighboursShiftOneSlotTowardsHome() {
+        var m = model(dragging: "b")
+        XCTAssertEqual(m.insertion, 1)
+        XCTAssertTrue(m.update(finger: centre(3)))
+        XCTAssertEqual(m.insertion, 3)
+        XCTAssertEqual(m.targetIndex(of: "a"), 0)
+        XCTAssertEqual(m.targetIndex(of: "c"), 1)
+        XCTAssertEqual(m.targetIndex(of: "d"), 2)
+        XCTAssertEqual(m.targetIndex(of: "b"), 3)
+        XCTAssertEqual(m.targetIndex(of: "e"), 4)
+        XCTAssertEqual(m.offset(of: "c"), CGSize(width: -164, height: 0))
+        XCTAssertEqual(m.offset(of: "e"), .zero)
+        // Backwards across a row: the gap moves to 0 and a shifts forward into slot 1.
+        XCTAssertTrue(m.update(finger: centre(0)))
+        XCTAssertEqual(m.targetIndex(of: "a"), 1)
+        XCTAssertEqual(m.targetIndex(of: "c"), 2)
+        XCTAssertEqual(m.offset(of: "a"), CGSize(width: 164, height: 0))
+    }
+
+    func testTheGapWrapsRows() {
+        var m = model(dragging: "b")
+        m.update(finger: centre(5))
+        XCTAssertEqual(m.insertion, 5)
+        XCTAssertEqual(m.targetIndex(of: "e"), 3)                                     // row 2 → end of row 1
+        XCTAssertEqual(m.offset(of: "e"), CGSize(width: 3 * 164, height: -206))
+        XCTAssertEqual(m.targetIndex(of: "f"), 4)
+        XCTAssertEqual(m.targetIndex(of: "g"), 6)
+    }
+
+    func testHysteresisKeepsTheGapStillAtABoundary() {
+        var m = model(dragging: "b")
+        m.update(finger: centre(3))
+        let mid = (centre(2).x + centre(3).x) / 2                                     // 480
+        // Jitter of ±5 pt around the midpoint between two slots never moves the gap.
+        for dx in stride(from: CGFloat(-5), through: 5, by: 1) {
+            XCTAssertFalse(m.update(finger: CGPoint(x: mid + dx, y: 91)))
+            XCTAssertEqual(m.insertion, 3)
+        }
+        // 12 pt past the midpoint (half of the 24 pt hysteresis) it moves, and then holds on the other side.
+        XCTAssertFalse(m.update(finger: CGPoint(x: mid - 11, y: 91)))
+        XCTAssertTrue(m.update(finger: CGPoint(x: mid - 13, y: 91)))
+        XCTAssertEqual(m.insertion, 2)
+        XCTAssertFalse(m.update(finger: CGPoint(x: mid + 11, y: 91)))
+        XCTAssertEqual(m.insertion, 2)
+    }
+
+    func testOutsideTheGridTheGapClosesAtHome() {
+        var m = model(dragging: "b")
+        m.update(finger: centre(3))
+        XCTAssertTrue(m.update(finger: CGPoint(x: -200, y: 91)))                      // over the sidebar
+        XCTAssertEqual(m.insertion, 1)
+        XCTAssertNil(m.move)
+        XCTAssertEqual(m.offset(of: "c"), .zero)
+    }
+
+    func testPausedHoldsEverything() {
+        var m = model(dragging: "b")
+        XCTAssertFalse(m.update(finger: centre(3), paused: true))
+        XCTAssertEqual(m.insertion, 1)
+    }
+
+    func testACoverHoldsStillWhileTheFingerIsInItsCombineZone() {
+        var m = model(dragging: "b", combines: true)
+        // The finger on d's centre: d is the combine candidate and does not move away.
+        XCTAssertEqual(m.combineCandidate(at: centre(3)), "d")
+        XCTAssertFalse(m.update(finger: centre(3)))
+        XCTAssertEqual(m.insertion, 1)
+        // The dragged card's own slot is never a combine target.
+        XCTAssertNil(m.combineCandidate(at: centre(1)))
+        // At d's edge (outside its inner 70 %) the reflow goes on and d makes room.
+        let edge = CGPoint(x: layout.slot(3).minX + 10, y: 91)
+        XCTAssertNil(m.combineCandidate(at: edge))
+        XCTAssertTrue(m.update(finger: edge))
+        XCTAssertEqual(m.insertion, 3)
+        XCTAssertEqual(m.targetIndex(of: "d"), 2)
+        // Page thumbnails never combine.
+        XCTAssertNil(model(dragging: "b").combineCandidate(at: centre(3)))
+    }
+
+    func testDropReportsFromToAndNeighbours() {
+        var m = model(dragging: "b")
+        XCTAssertNil(m.move)
+        m.update(finger: centre(3))
+        let move = m.move
+        XCTAssertEqual(move?.id, "b")
+        XCTAssertEqual(move?.from, 1)
+        XCTAssertEqual(move?.to, 3)
+        XCTAssertEqual(move?.after, "d")
+        XCTAssertEqual(move?.before, "e")
+        XCTAssertEqual(NibReflowModel.reordered(ids, from: 1, to: 3), ["a", "c", "d", "b", "e", "f", "g", "h"])
+        XCTAssertEqual(NibReflowModel.reordered(ids, from: 6, to: 0), ["g", "a", "b", "c", "d", "e", "f", "h"])
+        XCTAssertEqual(NibReflowModel.reordered(ids, from: 9, to: 0), ids)
+        let first = NibReflowMove(id: "c", from: 2, to: 0, in: ids)
+        XCTAssertNil(first.after)
+        XCTAssertEqual(first.before, "a")
+        let last = NibReflowMove(id: "a", from: 0, to: 7, in: ids)
+        XCTAssertEqual(last.after, "h")
+        XCTAssertNil(last.before)
+    }
+
+    // MARK: The observable
+
+    func testALiveReorderEndsInAReorder() {
+        let reflow = NibReflow<String>(layout: layout, combines: false)
+        reflow.begin("b", order: ids, at: centre(1))
+        XCTAssertTrue(reflow.isDragging)
+        XCTAssertTrue(reflow.isCarried("b"))
+        reflow.move(to: CGPoint(x: centre(2).x, y: 91))
+        reflow.move(to: centre(3))
+        XCTAssertEqual(reflow.offset(for: "c"), CGSize(width: -164, height: 0))
+        XCTAssertTrue(reflow.animatesOffsets)
+        let drop = reflow.end(velocity: CGVector(dx: 300, dy: 0))
+        XCTAssertEqual(drop, .reorder(NibReflowMove(id: "b", from: 1, to: 3, in: ids)))
+        XCTAssertFalse(reflow.animatesOffsets)                     // the data now holds the order: no spring back
+        XCTAssertEqual(reflow.offset(for: "c"), .zero)
+        XCTAssertEqual(reflow.carrierFrame, layout.slot(3))        // the carrier lands in the gap
+        reflow.landed()
+        XCTAssertNil(reflow.carried)
+        XCTAssertTrue(reflow.animatesOffsets)
+    }
+
+    func testCancelSpringsEveryoneBack() {
+        let reflow = NibReflow<String>(layout: layout, combines: false)
+        reflow.begin("b", order: ids, at: centre(1))
+        reflow.move(to: centre(3))
+        reflow.cancel()
+        XCTAssertTrue(reflow.animatesOffsets)
+        XCTAssertEqual(reflow.carrierFrame, layout.slot(1))
+    }
+
+    func testMeasuredFramesMapTheMoveToTheFullOrder() {
+        // Only c…f are on screen (a lazy grid): the move still comes back in the caller's order.
+        let reflow = NibReflow<String>(combines: false)
+        for (i, id) in ["c", "d", "e", "f"].enumerated() { reflow.frames[id] = layout.slot(i) }
+        reflow.begin("c", order: ids, at: centre(0))
+        reflow.move(to: centre(2))
+        XCTAssertEqual(reflow.end(), .reorder(NibReflowMove(id: "c", from: 2, to: 4, in: ids)))
+    }
+
+    func testHoldingOverACoverArmsACombineAndPausesTheReflow() {
+        let reflow = NibReflow<String>(layout: layout, combines: true)
+        reflow.begin("b", order: ids, at: centre(1))
+        reflow.move(to: centre(3))
+        XCTAssertNil(reflow.armed)                                 // proximity alone draws nothing
+        let held = expectation(description: "held 380 ms")
+        DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.combineHold + 0.15) { held.fulfill() }
+        wait(for: [held], timeout: 2)
+        XCTAssertEqual(reflow.armed, "d")
+        XCTAssertEqual(reflow.armedFrame, layout.slot(3))
+        reflow.move(to: CGPoint(x: layout.slot(3).minX + 6, y: 91))  // still over d: armed, reflow paused
+        XCTAssertEqual(reflow.armed, "d")
+        XCTAssertEqual(reflow.offset(for: "c"), .zero)
+        XCTAssertEqual(reflow.end(), .combine("b", into: "d"))
+        XCTAssertEqual(reflow.carrierFrame, layout.slot(3))        // it flows into the cover…
+        XCTAssertEqual(reflow.armedFrame, layout.slot(3))          // …which stays until the card is in
+        reflow.landed()
+        XCTAssertNil(reflow.armed)
+    }
+}
+```
+
 ---
 
 ## 4. Lint rules
@@ -6975,11 +8983,271 @@ Inside `NibDesign` itself, review checks that every `String(localized:` passes `
 
 ## 5. Device checks the simulator cannot make
 
-The code compiles and the physics is unit-tested in CI, but these six things can only be judged on hardware. They are the first `tools/smoke` scripts for F111, and nothing ships until a person has looked at each one:
+The code compiles and the physics is unit-tested in CI, but these seven things can only be judged on hardware. They are the first `tools/smoke` scripts for F111, and nothing ships until a person has looked at each one:
 
-1. **iOS 26 glass follows our geometry.** The body is sized by `.frame` and moved by `.offset` after `.glassEffect`, which the union honours. Necks are rotated capsules (`rotationEffect` after `glassEffect`): check that they merge. If they don't, set `NeckGlassLayer` necks to axis-aligned capsules. Check too that `Glass.identity` over the body tint (while the Pencil is down) is indistinguishable at 22 %.
+1. **iOS 26 glass follows our geometry.** The body is sized by `.frame` and moved by `.offset` after `.glassEffect`, which the union honours. Necks are rotated capsules (`rotationEffect` after `glassEffect`): check that they merge. If they don't, set `NeckGlassLayer` necks to axis-aligned capsules. Check too that `Glass.identity` over the body tint (while the Pencil is down) is indistinguishable at 22 %. Check that the held rim (`NibLiftRim`, plus-lighter) lands on the system's own rim as one brighter edge, not as a second line inside it, on capsules and on 26 and 28 pt corners; if it doubles, move it out by the difference.
 2. **The iOS 17 field costs ≤ 1.2 ms of GPU per frame on an A12** (iPad mini 5 / iPhone XS), **measured again with per-cluster canvases**. Measure it with the Metal HUD (`MTL_HUD_ENABLED=1`) while dragging the palette over the page, and check with Instruments that the main thread stays under 3 ms per frame (only the moving droplet's node and its cluster's canvas update). If the GPU goes over, `WaterOpaqueLayer` (one path union, no blur, no shader) is the automatic Calm path, and it must measure cheaper than the field.
 3. **Touches pass through the container to the canvas** where no droplet is drawn (ZStack sibling layout, §2), and never while a bud is open (the dismiss area covers the safe-area strips).
 4. **The Pencil is not rejected by chrome gestures on iOS 17.** SwiftUI gestures can't filter touch type, so a Pencil press that starts on a droplet can drag it. The editor sets PencilKit's `drawingPolicy` so strokes that start on the page never reach chrome. Revisit with `UIGestureRecognizerRepresentable` (`allowedTouchTypes = [.direct]`, iOS 18) after the device check.
 5. **Blur radius calibration.** `GraphicsContext.Filter.blur(radius:)` is treated as σ. If bridges start noticeably later or earlier than 11 pt on device, adjust `DropletMetrics.regular.fieldBlur`; `minimumNeck` follows it automatically.
-6. **Contrast over ink.** With the palette and bars over a page of black handwriting, the bar subtitle and HUD digits (`label`, semibold) read at ≥ 4.5:1 in light mode, and dark-mode Clear over white paper (80 %) is a dark surface, not a grey blob (DESIGN.md §2.4).
+6. **Contrast over ink.** With the palette and bars over a page of black handwriting, the bar subtitle and HUD digits (`label`, semibold) read at ≥ 4.5:1 in light mode, and dark-mode Clear over white paper (80 %) is a dark surface, not a grey blob (DESIGN.md §2.4). On iOS 26, check the same for Deep popovers and the assistant as plain Regular glass (no tint): 15 pt body text over dense handwriting. If a panel fails, the fix is the panel's placement or the system's Tinted glass preference, not a tint on the glass.
+7. **The rim reads as Apple's.** Side by side with a system toolbar on iOS 26, a Clear droplet on iOS 17 or 18 shows a thin rim brightest at the top-left corner, fainter at the bottom-right, none at the other two corners, no second line inside it and no grey band; a dragged droplet's rim visibly brightens and settles back with the lift.
+8. **The dock and the reflow feel like water.** Hold the palette and drag it at walking speed and then flick it: it trails the finger slightly (never more than about 27 ms of travel), stretches, and dips once as it stops, with no second bounce. Bring it within 72 pt of an edge: the meniscus reaches out, fuses at 20 pt, and pinches at about 52 pt when pulled back. Release: one plip as it lands, none from the overshoot. In the library, drag a notebook along a row and back across a boundary slowly: the gap moves once per slot and never flickers; hold over a cover's centre: it arms after 380 ms and nothing moves until the finger leaves it.
+
+---
+
+## NibDesign v2 additions
+
+The gaps the first wave of feature agents reported (tools/fleet/contract-gaps.md, their `ponytail:` stand-ins) and the components the 61 features without a branch will need (docs/forge-spec.json), closed inside `NibDesign`. Everything is additive: no public declaration was renamed or removed, and every v1 initialiser still resolves (`NibDesignV2Tests.testEveryInitialiserResolves` calls each v1 initialiser beside its v2 overload). §3 above lists the v1 sources; the files on disk are authoritative for the v2 members below. New components live in new files under `Components/`; DESIGN.md §4–8 and §13 carry the spec rows.
+
+Tests: `NibKit/Tests/NibDesignTests/NibDesignV2Tests.swift` (every symbol token resolves and is allowed on the CI OS, the swatch ring rule reproduces `NibInk.needsRing`, width text in both units, waveform bars, presence folding, outline indent, principal mapping, QR rendering, UIKit type roles, CSS tokens, the floating host, every initialiser).
+
+### 1. Tokens
+
+**`NibSymbol`** (`Tokens/NibSymbol.swift`, DESIGN.md §8.3): 72 new tokens plus `imagePlayground`, an OS-gated `NibSymbol?`. `static let all: [NibSymbol]` (internal) lists every token for the gallery and the resolve test.
+
+```swift
+// Tools and colour
+static let eyedropper, customColour, drawShape, layers, editHandwriting, recognisedText, convertToText, straighten,
+           insertSpace, math, graph, table, dragHandle: NibSymbol
+// Editing
+static let cut, copy, paste, duplicate, link, arrange, screenshot, crop, flipHorizontal, flipVertical, replace, unlock,
+           touchID, print, saveToFiles, newWindow, externalLink, qrCode: NibSymbol
+static var imagePlayground: NibSymbol? { get }       // nil below iOS 18.1
+// Text formatting
+static let bold, italic, underline, strikethrough, textSuperscript, textSubscript, inlineCode, fontSize, alignLeft,
+           alignCentre, alignRight, justify, listBulleted, listNumbered, checklist, indent, outdent, lineSpacing: NibSymbol
+// Audio, time, places
+static let recordDot, skipBack10, skipForward10, transcript, speak, timer, stopwatch, lap, history, profile, language,
+           notifications, reminder, info, advanced, templates, minimap, fitToContent, calendar, cloud, backup,
+           diagnostics, dictionary: NibSymbol
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| F008 no eyedropper / colour-picker glyph | `.eyedropper`, `.customColour` | F008 `PresetSymbols` (FeatPresets/ColorSlotEditor.swift) |
+| F014 no paste glyph | `.paste` (menu icon string: `NibSymbol.paste.name`) | F014 `icon: nil` on Paste and Match Style (FeatClipboard/FeatClipboardFeature.swift) |
+| F018 no new-window glyph | `.newWindow` | F018 `WindowMenus.newWindowIcon` literal (FeatWindows/FeatWindowsFeature.swift) |
+| F026, F028 no text-format glyphs (bold, italic, underline, strikethrough, alignment, lists, indent, outdent, line spacing) | `.bold` … `.lineSpacing` | F026 `TextFormatOptions.symbol(_:fallback:)` (FeatTextBox/TextFormatInspector.swift); F028 `PageTextGlyph` (FeatPageText/PageTextEditor.swift) |
+| F027 no profile, language, notifications, templates, about, advanced, external-link glyphs | `.profile`, `.language`, `.notifications`, `.templates`, `.info`, `.advanced`, `.externalLink` | F027 literals in FeatSettings/FeatSettingsFeature.swift, LanguagePage.swift, SettingsRootViewController.swift |
+| F030 no Draw Shape glyph | `.drawShape` | F030's use of `.documentWrite` (FeatShapeRecognition/FeatShapeRecognitionFeature.swift) |
+| F034 no crop, flip, replace, paste, Image Playground glyphs | `.crop`, `.flipHorizontal`, `.flipVertical`, `.replace`, `.paste`, `.imagePlayground` | F034 `ImageIcons` (FeatImages/ImageTool.swift) |
+| F037 no link glyph | `.link`, `.copy` | F037 icon-less Copy Link entry (FeatComments) |
+| F041 no layers glyph | `.layers` | F041 `LayerGlyph` (FeatLayers/LayersPanel.swift) |
+| F044 no minimap, fit, templates glyphs | `.minimap`, `.fitToContent`, `.templates` | F044 `MinimapView` statics and the BoardsPanel literal (FeatWhiteboard) |
+| F052 no record-dot or ±10 s glyphs | `.recordDot`, `.skipBack10`, `.skipForward10` | F052 AudioPanel.swift statics and `recordDot` (FeatAudio) |
+| F058 no straighten, align, insert space, cut, paste, colour, edit-all glyphs | `.straighten`, `.alignLeft`/`.alignCentre`/`.alignRight`, `.insertSpace`, `.cut`, `.paste`, `.customColour`, `.recognisedText`, `.editHandwriting` | F058 `SmartInkSymbol` (FeatSmartInk/EditHandwritingMode.swift) |
+| F062 no timer, stopwatch, flag glyphs | `.timer`, `.stopwatch`, `.lap` | F062 `TimeKeeperView` statics (FeatTimeKeeper) |
+
+**`NibFont` / `NibUIFont`** (`Tokens/NibFont.swift`, DESIGN.md §4.1):
+
+```swift
+extension NibFont {
+    static let badgeNumber: Font                       // SF Rounded bold footnote (NibBadge .number now uses it)
+    static let documentBody: Font                      // New York 17
+    static func documentHeading(_ level: Int) -> Font  // New York bold title / title2 / title3
+}
+extension NibUIFont {   // every §4.1 role for UIKit except math; all scale with UIFontMetrics
+    static var display, displayEditorial, title1, title2, title3, emptyTitle, cardFace, bodyEmphasis, callout,
+               chatEmphasis, button, footnoteEmphasis, caption1Emphasis, caption2, hudLarge, badgeNumber, code,
+               documentBody: UIFont { get }
+    static func documentHeading(_ level: Int) -> UIFont
+}
+```
+
+Resolves F037, F039, F046, F047 (UIKit roles built with `NibUIFont.font(…)` by hand) and F102/F103 (text-document body and headings). Replaces `NibUIFont.font(.body, design: .serif)` and the serif `title1/2/3` headings in FeatTextDoc (F047), `font(.footnote, weight: .bold, design: .rounded)` for comment pins (F037), `font(.caption2, weight: .medium)` in FeatRuler (F039), `font(.body/.footnote, weight: .semibold)` in FeatOutline (F046).
+
+**`NibSpacing.swift`** (DESIGN.md §5, §5.1, §5.2, §6):
+
+```swift
+extension NibRadius { static let ruler: CGFloat /* 6 */; static let pageWash: CGFloat /* 4 */ }
+extension NibMetrics {
+    static let optionTileHeight, statusDot, presenceBead, liveCursorBead, tabCapsuleHeight, rowThumbnailWidth,
+               outlineIndent, settingsSectionListWidth, searchWidth, searchResultsMaxHeight, commandBarWidth,
+               onboardingCardWidth, zoomPaneHeight, audioBarWidth, textColumnWidth, laserDot, laserGlow, laserTrail,
+               proposalBadgeX, popoverContentWidth, handleBead, rotationHandleOffset: CGFloat
+    static let presenceMaxShown, maxVisibleTabs, outlineMaxDepth: Int
+    static let settingsSheetSize, newDocumentSheetSize, coverPreviewSize, coverStripSize, paperTileSize,
+               pluginManagerSheetSize, developerConsoleSize, floatingPanelSize, searchSnippetSize, studyCardSize,
+               minimapSize, minimapSizeCompact: CGSize
+}
+public enum NibStroke {   // hairline 0.5, outline 0.8, thin 1, emphasis 1.5, ring 2, thick 3, ringOutset 3
+    static let dash: [CGFloat]            // [4, 4]
+    static let dashed: StrokeStyle        // thin + dash, for SwiftUI
+    static var layerDash: [NSNumber]      // for CAShapeLayer.lineDashPattern
+}
+public enum NibOpacity { static let disabled, unselectedTool, recede, ghostInk, replayPending, laserGlow: Double }
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| F014 no stroke or border-width token | `NibStroke.ring` (drop highlight) | `NibSpacing.xxs` as a line width (FeatClipboard/CanvasDragDrop.swift) |
+| F026 no focus-outline width or dash token | `NibStroke.thin` + `NibStroke.layerDash` | `lineWidth = 1`, `lineDashPattern = [4, 4]` (FeatTextBox/TextBoxEditor.swift) |
+| F027 no settings sheet, section list or stroke tokens | `NibMetrics.settingsSheetSize`, `.settingsSectionListWidth`; `NibStroke.thin`, `.thick` | F027 local constants (FeatSettings/SettingsRootViewController.swift, StylusPage.swift). The 56 pt posture cell stays local: it is one screen's layout, not a system measure |
+| F028 no hairline divider token | `NibStroke.hairline`, `NibStroke.thin`; `NibPenSwatch.Size.palette.diameter` | F028 `BarLiteral` (FeatPageText/PageTextEditor.swift) |
+| F039 no ruler radius (and no HUD linger, now `NibMotion.hudLinger` from the physics branch) | `NibRadius.ruler` | `NibRadius.badge` on the ruler body; `RulerAttachment.hudLinger` (FeatRuler) |
+| F040 no laser metrics | `NibMetrics.laserDot`, `.laserGlow`, `.laserTrail`, `NibOpacity.laserGlow` | F040 `LaserStyle` sizes (FeatLaser/FeatLaserFeature.swift); the 0.6 s fade is a motion token (below) |
+| F044 no minimap size; no selection ring | `NibMetrics.minimapSize`, `.minimapSizeCompact`; `.nibSelectionRing(_:cornerRadius:)` | F044 `MinimapGeometry.mapSize(compact:)` derived from the thumbnail width (FeatWhiteboard/MinimapView.swift) |
+| F046 no row-thumbnail or indent metrics | `NibMetrics.rowThumbnailWidth`, `.outlineIndent`, `.outlineMaxDepth` | F046 `OutlineMetrics` (FeatOutline/OutlinePanel.swift) |
+| Unbuilt F019, F021, F045, F050, F052, F056, F072, F073, F080, F085, F093, F108 | the §14 screen metrics, `NibOpacity.ghostInk`, `.replayPending` | – |
+
+### 2. Palette, tools and swatches
+
+```swift
+// Components/Palette.swift
+extension NibTool {
+    let registersShortcut: Bool
+    init(id:label:symbol:isPlugin:hasSettings:value:shortcut: KeyboardShortcut?, registersShortcut: Bool, tint:)
+}
+extension NibSwatch {
+    let pattern: NibSwatchPattern?
+    init(id: String, color: Color, name: String, ringsLight: Bool = false, ringsDark: Bool = false,
+         pattern: NibSwatchPattern?)
+}
+extension NibPenSwatch {
+    init(_ swatch: NibSwatch, pattern: NibSwatchPattern?, isSelected: Bool, size: Size = .popover, action:)
+}
+extension NibPenSwatch.Size { var diameter: CGFloat }
+struct NibWidthPresetButton: View { init(diameter: CGFloat, isSelected: Bool, label: String, action: @escaping () -> Void) }
+extension NibMetrics { static let widthPresetDots: [CGFloat]; static func widthPresetDot(_ index: Int) -> CGFloat }
+extension View { func nibTooltip(_ text: String) -> some View }   // Components/Buttons.swift
+// NibIconButton, NibToolButton, NibDropletButton, NibOptionTile, NibWidthPresetButton read `isEnabled` and dim to 40 %
+extension NibToolPalette {
+    init(id:tools:moreTools:selection:swatches:swatch:dock:allowedEdges:reservedTrailing:
+         toolOptions: @escaping (String) -> NibToolOptions?, settingsPresented: Binding<Bool>? = nil,
+         morePresented: Binding<Bool>? = nil, onReselect: ((String) -> Void)? = nil,
+         @ViewBuilder settings: @escaping (String) -> Settings)
+}
+// Components/NibToolOptions.swift
+struct NibToolOptions { init(bar: AnyView, popover: NibToolOptionsPopover? = nil)
+                        init<Bar: View>(popover: NibToolOptionsPopover? = nil, @ViewBuilder bar: () -> Bar) }
+struct NibToolOptionsPopover { init<C: View>(source: String, isPresented: Binding<Bool>, title: String,
+                                             subtitle: String? = nil, @ViewBuilder content: () -> C) }
+extension View { func onNibBudChange(_ action: @escaping (Bool) -> Void) -> some View
+                 func nibShortcutHint(_ shortcut: KeyboardShortcut?) -> some View }
+// Components/NibSwatches.swift
+struct NibSwatchPattern: Hashable { init(id: String, image: UIImage, tilePoints: CGFloat = 11, name: String? = nil) }
+extension NibSwatch { init(id: String, hex: UInt32, name: String, pattern: NibSwatchPattern? = nil)
+                      init(ink: NibInk, pattern: NibSwatchPattern?)
+                      init(highlighter:), init(paper:), init(cloth:), init(folder:) }
+extension NibHighlighter, NibPaper, NibCoverCloth, NibFolderColor { var name: String }
+struct NibSwatchGrid: View { init(swatches:selection: Binding<String?>, columns: Int = 6, noneLabel: String? = nil,
+                                  size: NibPenSwatch.Size = .popover) }
+struct NibOptionTile<Preview: View>: View { init(_ title:isSelected:action:preview:), init(_ title:symbol:isSelected:action:) }
+struct NibOptionGlyph: View
+extension UIImage { static func nibSwatch(_ swatch: NibSwatch, size: NibPenSwatch.Size = .palette,
+                                          isSelected: Bool = false) -> UIImage }
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| F008 NibPenSwatch has no tape-pattern overlay | `NibSwatch(pattern:)`, `NibPenSwatch(_:pattern:…)`, `NibSwatchPattern` (the palette's quick swatches show patterns too) | F008 `PatternSwatch` (FeatPresets/ColorSlotEditor.swift). `PatternTile`'s loader stays in the feature: it produces the `UIImage` |
+| F008 a tool options bar cannot bud a popover | `NibToolPalette(toolOptions:)` returning `NibToolOptions(popover:)`; the palette places the popover as a full-size child, beside the bar, and closes it on tool change | F008's inline Thickness and colour-editor modes of the bar (FeatPresets). Needs the contract change below so a `ToolMenuDescriptor` can carry the popover |
+| F016 the palette reports no re-tap and hides its popover state; no public open-bud signal | `onReselect:`, `settingsPresented:`, `morePresented:`, `.onNibBudChange(_:)` | F016 `settingsBudOpen` / the `hasSettings` toggle trick and `ToolSettingsBud` (FeatToolbar/ActiveToolMenuHost.swift); the iOS 18 `hitTest` guess in FeatToolbar/ToolbarView.swift becomes "while a bud is open, keep every touch" |
+| F043 no tooltips on icon and tool buttons; `NibIconButton` does not dim when disabled; no public preset-dot sizes | `nibTooltip` built into `NibIconButton`, `NibToolButton` and `NibWidthPresetButton`; those and `NibDropletButton`, `NibOptionTile` dim themselves; `NibWidthPresetButton`, `NibMetrics.widthPresetDots`; `NibStroke.hairline` for the hover-dot outline | F043's `.help(…)` and `.opacity(… disabledOpacity)` on palette buttons and `PalettePlan.dotSizes` / `widthRow` (FeatPencilHardware/SqueezePalette.swift). Drop the hand dimming when merging: it would now dim twice |
+| F016 tool keys register twice | `NibTool(shortcut:registersShortcut: false)` + `nibShortcutHint` | F016's `shortcut: nil` on palette tools, which hid the KeyHints |
+| F009, F008, F026, F036, F044 local colour-name tables | `NibHighlighter.name`, `NibPaper.name`, `NibCoverCloth.name`, `NibFolderColor.name` | F009 `NibHighlighter.title` (FeatHighlighter/HighlighterTool.swift), F008 `highlighterName`, F026 `highlighterName` / `paperName`, F044 `BoardPaper.title`. F036's sticky colours are its own palette and keep their names |
+| F028, F026 no UIKit swatch image | `UIImage.nibSwatch(_:size:isSelected:)` (light and dark in one asset, pattern included) | F028 `PageTextBar.swatch(_:ring:)`, F026 `swatchImage(_:)` |
+| Unbuilt F007, F013, F031, F033, F036, F040 colour and choice grids | `NibSwatchGrid`, `NibOptionTile` | – |
+
+### 3. Controls, badges and library
+
+```swift
+extension NibButton.Kind { case destructivePlain }
+extension NibBadgeKind { case principal(NibPrincipalKind); case capsule(String) }
+enum NibPrincipalKind: String, CaseIterable, Sendable { case you, assistant, plugin, bridge, collaborator
+                                                        init(_ principal: Principal); var title: String; var symbol: NibSymbol }
+extension NibStrokeWidthSlider { enum Unit { case millimetres, points }
+                                 init(width:range:presets:title: String, unit: Unit) }
+extension NibProgressBar { enum Style { case standard, critical }; init(value: Double, style: Style) }
+extension NibFolderTile { init(name:count:color:glyph: NibFolderGlyph, isTargeted:isFused:) }
+enum NibFolderGlyph: Hashable, Sendable { case symbol(NibSymbol), emoji(String) }
+struct NibFolderGlyphView: View { init(glyph:color:size:) }
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| F010 NibStrokeWidthSlider is millimetres-only and titled "Thickness" | `NibStrokeWidthSlider(width:range:presets:title:unit: .points)` | F010's hand-built size presets (FeatEraser/EraserSettingsView.swift) |
+| F010 no destructive plain button | `NibButton(kind: .destructivePlain)` | `NibButton(.destructive)` for Clear Page (FeatEraser) |
+| F015 NibBadge has no principal kind | `NibBadge(.principal(NibPrincipalKind(principal)))` | F015 `PrincipalBadge` and `HistoryPrincipal.Kind.title/.symbol` (FeatUndoUI/HistoryPanel.swift) |
+| F020 NibFolderTile has no icon or emoji | `NibFolderTile(glyph:)`, `NibFolderGlyphView` | F020's own Favourites tile and `FolderGlyph` (FeatLibraryOrganize/FeatLibraryOrganizeFeature.swift, FavoritesPanel.swift) |
+| F062 NibProgressBar has no critical tint | `NibProgressBar(value:style: .critical)` | F062 `TimeKeeperProgress` (FeatTimeKeeper) |
+| Unbuilt F080 "Update" capsule; F013 "Made by Assistant" | `NibBadge(.capsule("Update"))`, `NibPrincipalKind.title` | – |
+
+### 4. New components
+
+```swift
+// Components/NibStatus.swift
+struct NibHUDGroup<Content: View>: View { init(id: String, @ViewBuilder content: () -> Content) }
+struct NibHUDText: View { init(_ primary: String, secondary: String? = nil) }
+struct NibStatusDot: View { enum Kind { case unseen, connected, recording, warning }; init(_ kind: Kind) }
+struct NibPresenceStack: View { struct Person { init(id:name:initials:colorIndex:) }; init(_ people: [Person], compact: Bool = false) }
+struct NibWaveform: View { init(levels: [Double], bars: Int = 24, height: CGFloat = 20) }
+struct NibBanner: View { enum Style { case info, warning }
+                         init(_ message: String, style: Style = .warning, symbol: NibSymbol? = nil, action: NibAction? = nil) }
+struct NibTraceRow: View { enum Phase { case running, done, warning }; init(_ text: String, phase: Phase) }
+struct NibDropletButton: View { enum Kind { case clear, tinted }
+                                init(id:title:symbol:detail:kind:shortcut:action:), init(id:symbol:label:kind:shortcut:action:) }
+// Components/NibForms.swift
+struct NibSecureField: View { init(text: Binding<String>, prompt: String, onSubmit: @escaping () -> Void = {}) }
+struct NibCodeBlock: View { init(_ text: String, onCopy: (() -> Void)? = nil) }
+struct NibQRCode: View { init(_ payload: String, label: String) }
+struct NibPermissionRow<Accessory: View>: View { enum Change { case unchanged, added, removed }
+                                                 init(_ text:symbol:change:accessory:), init(_ text:symbol:change:) }
+// Components/NibLists.swift
+struct NibOutlineRow<Leading: View>: View { init(_ title:depth:pageLabel:isSelected:isExpanded:reservesDisclosure:leading:) }
+struct NibMiniPageThumbnail<Content: View>: View { init(aspectRatio:width:content:) }
+struct NibPaperTile<Content: View>: View { init(name:isSelected:size:action:content:) }
+struct NibFlashcard<Front: View, Back: View>: View { init(isFlipped:fill:front:back:) }
+extension View { func nibSelectionRing(_ isSelected: Bool, cornerRadius: CGFloat) -> some View
+                 func nibFadeBottomEdge(_ height: CGFloat = NibSpacing.l) -> some View }
+// Components/NibFloatingHost.swift
+@MainActor @Observable final class NibFloatingHost {
+    init(); var toast: NibToastItem?; var toastBinding: Binding<NibToastItem?> { get }
+    func present<C: View>(_ id: String, @ViewBuilder content: () -> C); func dismiss(_ id: String)
+    func isPresenting(_ id: String) -> Bool; var presentedIDs: [String] { get }
+    func setAnchor(_ id: String, rect: CGRect); @discardableResult func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool
+    func removeAnchor(_ id: String); func containerRect(_ rect: CGRect, from view: UIView) -> CGRect?
+    func post(_ toast: NibToastItem)
+}
+struct NibFloatingLayer: View { init(host: NibFloatingHost) }
+// Components/NibCanvasHandles.swift (UIKit)
+final class NibHandleView: UIView { enum Style { case clear, tinted }; var style: Style; init(style: Style = .clear) }
+final class NibFrameView: UIView { init(frame: CGRect) }
+// Components/NibPageThumbnailView.swift (UIKit) and Components/Library.swift
+final class NibPageThumbnailView: UIView { var image: UIImage?; var isCurrent: Bool; var aspectRatio: CGFloat; var width: CGFloat
+                                           init(width: CGFloat = NibMetrics.rowThumbnailWidth, aspectRatio: CGFloat = 595.0 / 842.0) }
+extension NibPageThumbnail { init(number:isCurrent:isSelected:aspectRatio:width:showsNumber: Bool, content:) }
+// Components/NibWebTokens.swift
+enum NibWebTokens { static func stylesheet(for traits: UITraitCollection) -> String
+                    static func variables(for traits: UITraitCollection) -> [(name: String, value: String)] }
+```
+
+| Gap | Resolved by | Replaces |
+|---|---|---|
+| NibBudPopover and droplets are unreachable from UIKit code and canvas attachments (F026 keyboard-bar popovers, F029 return pill, F037 thread popover, F038 zoom frame, F039 angle HUD, F044 minimap, F052 recording HUD and audio bar, F062 Time Keeper bar, F063 presenter HUD) and `nibToast` needs a container (F020) | `NibFloatingHost` + `NibFloatingLayer`: present by id, bud from a UIKit rect (`setAnchor(_:rect:in:)`), `post(toast)` | The system UIKit popover (F026), the static `nibGlass` HUDs hosted in the canvas (F029, F039, F062, F063), F037's floating Deep panel for one thread, F038's rigid UIKit box, F020's VoiceOver-only announcements. Needs the chrome to install the layer (below) |
+| F038, F012 a canvas attachment cannot put a `frame` or `handle` droplet on the canvas | `NibHandleView` (rigid 12 pt bead, `clear` or `tinted`), `NibFrameView` (rim and water line, radius 18); `NibMetrics.handleBead`, `.rotationHandleOffset`, `.zoomPaneHeight`, `.popoverContentWidth`; `NibStroke.emphasis` / `.thin` for the 1.5 / 1 pt outlines | F038's UIKit box (FeatZoomWindow, accent outline over `accentWash`) and its local pane metrics; F012's CALayer beads (FeatTransform/SelectionHandles.swift) |
+| F046 no hierarchical row, no 40 pt thumbnail without a number, no UIKit thumbnail | `NibOutlineRow`, `NibMiniPageThumbnail`, `NibPageThumbnail(…, showsNumber: false)`, `NibPageThumbnailView` (UIKit cells) | F046 `BookmarkRowView` and `PageThumbnailImage` (FeatOutline/OutlinePanel.swift) and the thumbnail layers of its UIKit `OutlineCell`, which keeps the drag table and takes `NibMetrics.outlineIndent` / `.rowThumbnailWidth` / `NibUIFont` |
+| F052, F056, F063, F091, F108 HUDs with several parts | `NibHUDGroup`, `NibHUDText`, `NibStatusDot`, `NibWaveform` | F052's recorder row in the Audio tab, F063's `presentation.hud` content |
+| Unbuilt F019, F021, F045, F050, F070, F071, F072, F076, F079, F080, F081, F085, F086, F091, F094, F103, F108 | `NibDropletButton`, `NibBanner`, `NibTraceRow`, `NibSecureField`, `NibCodeBlock`, `NibQRCode`, `NibPermissionRow`, `NibPresenceStack`, `NibPaperTile`, `nibSelectionRing`, `nibFadeBottomEdge`, `NibFlashcard`, `NibOutlineRow`, `NibWebTokens` (plugin HTML panels' `--nib-*` variables, DESIGN.md §14.10) | – |
+
+### 5. Localisation
+
+`Localizable.xcstrings` now lists every `String(localized:bundle: .module)` key of the module (157, with format specifiers as Swift emits them: `%@`, `%lld`), with translator comments on the colour, paper, cloth and principal names and the unit strings, so F095 can translate the design system's own strings.
+
+### 6. What still needs another owner
+
+| Needed change | Owner | For |
+|---|---|---|
+| `ToolMenuDescriptor` (or `ToolbarItemDescriptor.activeToolMenu`) carries an optional popover: `source` anchor id, `title`, `isPresented`, content; F016 passes it as `NibToolOptions(popover:)` | NibContracts, then F016 | F008 |
+| A per-window accessor for the chrome's `NibFloatingHost` and `NibInkingState` (a `ServiceKeys` constant or `DocumentEditing` properties) | NibContracts | F012, F016, F026, F029, F037, F038, F039, F044, F052, F062, F063 |
+| Install `NibFloatingLayer(host:)` in the document chrome's container and present `host.toastBinding`; the library root does the same for its container | F017, F019 | as above, F020 |
+| A SwiftUI `ui.screens.toolbar` rendered inside the chrome's one container (the palette's second container cannot merge or share buds) | NibContracts, F016, F017 | F016 |
+| A public inking input for a lone `nibGlass` surface outside a container (`nibIsInking` is internal) | Glass optics (Modifiers/NibSurfaces.swift, Liquid/NibLiquid.swift) | F062, F044 |
+| A pure-black letterbox colour token (`#000000`) for external displays | Glass optics (Tokens/NibColor.swift) | F063 |
+| Droplets that follow a canvas transform per frame (a refracting, stretching zoom frame on the canvas); `NibHandleView` / `NibFrameView` draw the rigid look with the water tokens meanwhile | Glass optics | F012, F038 |
+| Gallery entries for every v2 component and token | Glass optics (Gallery/**) | DESIGN.md §13 "every state is in the gallery" |
+| `NibMotion.laserFadeDuration` (0.6 s as a `TimeInterval` for CALayer fades; `laserFade` is only a SwiftUI `Animation`). `NibMotion.hudLinger` (F039) landed with the physics branch | Drag physics (Tokens/NibMotion.swift) | F040 |
+| A Pencil Pro alignment haptic features may request (`UICanvasFeedbackGenerator.alignmentOccurred(at:)` behind `NibHaptics`) | Drag physics (Tokens/NibHaptics.swift) | F030, F039, F043 |
+| Move `nibShortcutHint` beside `nibShortcut` in Modifiers/NibInteraction.swift (it lives in Components/NibToolOptions.swift until then) | Drag physics | – |
+| DESIGN.md §14.11 puts caption2 on the Clear grading droplets, which §2.4 bans; `NibDropletButton` uses caption1 semibold `label`. §14.12 (laser `destructive`) and §14.3 (Vermilion default) disagree | DESIGN.md §14 owner | F050, F040 |

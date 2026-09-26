@@ -164,12 +164,35 @@ public struct Frame: Hashable, Codable {
     }
 
     /// Applies an affine transform (translation, uniform/non-uniform scale, rotation; shear is ignored).
+    /// contracts-v2 fix: a non-uniform scale of a ROTATED frame is measured along the frame's own axes (it used to be
+    /// measured along the page axes, which skewed rotated boxes). Similarity transforms and unrotated frames are
+    /// computed exactly as before.
     public func applying(_ t: Affine) -> Frame {
         let c = t.apply(center)
         let sx = hypot(t.a, t.b), sy = hypot(t.c, t.d)
-        let nw = w * sx, nh = h * sy
-        return Frame(x: c.x - nw / 2, y: c.y - nh / 2, w: nw, h: nh, rotation: rotation + atan2(t.b, t.a))
+        let scale = max(sx, sy, 1)
+        let similarity = abs(sx - sy) <= 1e-9 * scale && abs(t.a * t.c + t.b * t.d) <= 1e-9 * scale * scale
+        if rotation == 0 || similarity {
+            let nw = w * sx, nh = h * sy
+            return Frame(x: c.x - nw / 2, y: c.y - nh / 2, w: nw, h: nh, rotation: rotation + atan2(t.b, t.a))
+        }
+        let cs = cos(rotation), sn = sin(rotation)
+        let ux = t.a * cs + t.c * sn, uy = t.b * cs + t.d * sn
+        let vx = -t.a * sn + t.c * cs, vy = -t.b * sn + t.d * cs
+        let nw = w * hypot(ux, uy), nh = h * hypot(vx, vy)
+        let turn = atan2(cs * uy - sn * ux, cs * ux + sn * uy)
+        return Frame(x: c.x - nw / 2, y: c.y - nh / 2, w: nw, h: nh, rotation: rotation + turn)
     }
+
+    /// contracts-v2: the array form command params use: `[x, y, w, h]` or `[x, y, w, h, rotation]` (radians). nil when
+    /// the array has another length.
+    public init?(array a: [Double]) {
+        guard a.count == 4 || a.count == 5 else { return nil }
+        self.init(x: a[0], y: a[1], w: a[2], h: a[3], rotation: a.count == 5 ? a[4] : 0)
+    }
+
+    /// contracts-v2: `[x, y, w, h]`, plus the rotation as a 5th value when it is not 0.
+    public var array: [Double] { rotation == 0 ? [x, y, w, h] : [x, y, w, h, rotation] }
 }
 
 /// 2-D affine transform in CoreGraphics convention: x' = a·x + c·y + tx, y' = b·x + d·y + ty.
@@ -225,6 +248,14 @@ public struct Affine: Hashable, Codable {
     }
 
     public var determinant: Double { a * d - b * c }
+
+    /// contracts-v2: the inverse transform; nil when it is not invertible.
+    public var inverted: Affine? {
+        let det = determinant
+        guard det != 0, det.isFinite else { return nil }
+        return Affine(a: d / det, b: -b / det, c: -c / det, d: a / det,
+                      tx: (c * ty - d * tx) / det, ty: (b * tx - a * ty) / det)
+    }
 
     public init(from decoder: Decoder) throws {
         var u = try decoder.unkeyedContainer()

@@ -48,18 +48,20 @@ A droplet is always three layers, bottom to top. No feature adds a fourth.
 
 | # | Layer | What it does |
 |---|---|---|
-| 1 | **Lens** | What is behind the droplet, bent at the rim (iOS 26+) or frosted (iOS 17–25 Deep). The core stays clear |
-| 2 | **Water** | The union silhouette of every droplet in the container: body tint, edge thickness, caustic, specular, rim, outline. Merges, necks and pinches happen here |
+| 1 | **Lens** | What is behind the droplet, bent in a band at the rim (iOS 26+) or frosted (iOS 17–25 Deep). The core stays clear |
+| 2 | **Water** | The union silhouette of every droplet in the container: body tint, the light-directional rim, sheen, outline and shadow (§10.9). Merges, necks and pinches happen here. On iOS 26 the system glass is this layer, and Nib paints nothing on it at rest |
 | 3 | **Content** | Icons, labels, controls. Never filtered or refracted; they follow the droplet's transform with a rigidity factor (§10.2) |
 
 ### 2.2 The four materials
 
 | Material | Used for | Body tint (light / dark) | iOS 26+ | iOS 17–25 |
 |---|---|---|---|---|
-| **Clear** | Tool palette, top bars, HUDs, proposal chip and its anchor, lifted cards and thumbnails, selection handles | `#FFFFFF` 46 % / `#161618` 62 % (**80 % over light paper**) | `Glass.regular.interactive()` | Body tint + water optics, no blur |
-| **Deep** | Anything with dense UI or text: popovers, assistant, plugin panels, search results, page navigator, toasts | `#F9F9FB` 72 % / **`#1C1C1E` 86 %** | `Glass.regular.tint(deepGlassTint)` | `.ultraThinMaterial` frost + body tint + optics |
-| **Tinted** | The one primary action on a surface (New, Create) | Accent 100 % | `Glass.regular.tint(accent)` | Opaque accent with a rim (white 30 %) and the outline only: no edge, caustic or specular |
-| **Bead** | Selection bead, slider thumbs, anchor beads, page-number beads | `#FFFFFF` 70 % / `#FFFFFF` 22 %, plus the current ink at 15 % on the selection bead | Plain fill with a rim, no shadow (it lives *inside* a droplet) | Same |
+| **Clear** | Tool palette, top bars, HUDs, proposal chip and its anchor, lifted cards and thumbnails, selection handles | `#FFFFFF` 46 % / `#161618` 62 % (**80 % over light paper**) | `Glass.regular.interactive()` | Body tint + water optics (§10.9), no blur |
+| **Deep** | Anything with dense UI or text: popovers, assistant, plugin panels, search results, page navigator, toasts | `#F9F9FB` 72 % / **`#1C1C1E` 86 %** | `Glass.regular`, untinted: the system thickens large glass itself | `.ultraThinMaterial` frost + body tint + optics |
+| **Tinted** | The one primary action on a surface (New, Create) | Accent 100 % | `Glass.regular.tint(accent).interactive()` | Opaque accent with its rim (`tintRim`, key and counter) and the outline only: no sheen, no edge lens |
+| **Bead** | Selection bead, slider thumbs, anchor beads, page-number beads | `#FFFFFF` 70 % / `#FFFFFF` 22 %, plus the current ink at 15 % on the selection bead | Plain fill, no rim, no shadow: it lives *inside* glass, and nothing is painted on the system's glass | Fill plus the key rim only (§10.9), no shadow |
+
+**One glass variant.** On iOS 26 every droplet is the Regular variant, page-resident ones included. Apple's Clear variant is more transparent, not less refractive; it is for media-rich backdrops with a dimming layer beneath, and Regular and Clear never mix in one interface. A tint means prominence, never thickness, so the Tinted primary is the only tinted glass: Deep is plain Regular, which the system already makes thicker, softer and more legible as it grows to popover and panel sizes. `interactive()` is set wherever the glass itself takes the touch: `nibGlass` applies the glass to its content (Apple's custom-view pattern), and a droplet outside a container passes its style's `isInteractive`. Inside a container the body sits behind the content and is never hit-tested, so the poke (§10.2) and the held rim (§10.9) are the press response there.
 
 **Why Clear still has a body.** Clear droplets hover over dense black handwriting. Crystal-clear water with no body makes black icons over black ink unreadable. The 46 % body keeps the core readable and leaves the rim fully refractive. The drag test showed that a 14 % veil fails over ink.
 
@@ -69,14 +71,15 @@ A droplet is always three layers, bottom to top. No feature adds a fourth.
 
 | | iOS 26 and later | iOS 17–25 (in practice 17 and 18) |
 |---|---|---|
-| Body and lens | System Liquid Glass, which refracts any backdrop including PencilKit | Body tint (Clear) or frost + tint (Deep). The page is not refracted |
+| Body and lens | System Liquid Glass (Regular), which refracts any backdrop including PencilKit in a band at its rim | Body tint (Clear) or frost + tint (Deep); over light paper the body thins at the rim (the edge lens). The page is not displaced |
 | Union and merge | `GlassEffectContainer(spacing: 11)` | One metaball field per cluster of nearby droplets (each cluster its own canvas, framed to its bounds, so resting clusters never redraw): silhouettes blurred at σ 8 pt, thresholded at 0.479 with analytic anti-aliasing in Metal |
 | Necks with memory | Glass capsules between droplets inside the container | Capsules drawn into the field |
-| Rim, edge, caustic, specular | System | `nibWaterField` shader (§10.9) |
+| Rim, sheen, shadow | System, plus the held rim boost (§10.9) | `nibWaterField` shader (§10.9): directional rim, sheen, outline, edge lens and shadow |
 | Stretch | Axis-aligned, through the glass frame | Full affine (any axis) |
-| Reduce Transparency | System frosting | Opaque `chromeOpaque` union with the 0.8 pt line |
+| Reduce Transparency | System frosting: the glass stays glass (`nibGlass` included) | Opaque `chromeOpaque` union with the 0.8 pt line |
+| Increase Contrast | System (black or white glass with a contrasting border) | `waterLine` 25 % / 40 %, bodies 72 % / 90 % |
 
-The feel (every spring, stretch cap, neck, bud and haptic) is identical on both. Only the optics differ.
+The feel (every spring, stretch cap, neck, bud and haptic) is identical on both. Only the optics differ. **On iOS 26 Nib draws nothing on top of the system glass at rest**: no rim, outline, sheen or bud outline. A second rim over the system's reads as a double, heavy edge. The only addition is the held rim (§10.9), because a droplet's body never takes the touch and the system cannot light it up itself.
 
 ### 2.4 Rules
 
@@ -136,19 +139,20 @@ Pool is a half-step deeper than system blue so 15 pt text passes AA on white. Th
 | `clearBody` | `#FFFFFF` 46 % | `#161618` 62 % | Clear body (Increase Contrast 72 %) |
 | `clearBodyOnPaper` | `#FFFFFF` 46 % | **`#161618` 80 %** | Clear body over light paper; mixed in by how much of the droplet is over it |
 | `deepBody` | `#F9F9FB` 72 % | **`#1C1C1E` 86 %** | Deep body (Increase Contrast 90 % / 92 %) |
-| `deepGlassTint` | `#FFFFFF` 35 % | `#1C1C1E` 45 % | Deep on iOS 26 system glass |
 | `waterBody` | `#FFFFFF` 8 % | `#FFFFFF` 3 % | Tint of the union on top of the body |
-| `waterEdge` | `#141C28` **7 %** | `#FFFFFF` 8 % | Edge thickness, the dark ring of a real drop. Over light paper only |
-| `waterCaustic` | `#FFFFFF` **12 %** | **`#FFFFFF` 10 %** | Bright crescent opposite the light. Over light paper only |
-| `waterRim` | `#FFFFFF` 85 % | `#FFFFFF` 42 % | Hairline highlight facing the light |
-| `tintRim` | `#FFFFFF` 30 % | `#FFFFFF` 30 % | The rim of a Tinted droplet (its only optic) |
-| `waterLine` | `#000000` 7.5 % | `#FFFFFF` 12 % | 0.8 pt outline so a droplet reads over white paper (Increase Contrast 25 % / 40 %) |
-| `waterLineBud` | **`#000000` 12 %** | `#FFFFFF` 16 % | Outline of a budding or retracting droplet, from its first frame |
+| `waterRim` | `#FFFFFF` 85 % | **`#FFFFFF` 50 %** | The rim at full strength: a 0.8 pt line lit by the top-left key light, half as bright on the counter side, never a uniform stroke; 22 % of it is the sheen (§10.9) |
+| `tintRim` | `#FFFFFF` 30 % | `#FFFFFF` 30 % | The rim of a Tinted droplet (its only optic), key and counter |
+| `waterLine` | `#000000` 7.5 % | `#FFFFFF` 12 % | 0.8 pt outline under the rim so a droplet reads over white paper (Increase Contrast 25 % / 40 %) |
+| `waterLineBud` | **`#000000` 12 %** | `#FFFFFF` 16 % | Outline of a budding or retracting droplet, from its first frame (iOS 17–25 only) |
+| `waterShadow` | `#000000` 8 % | `#000000` 28 % | The water's shadow over a flat backdrop (§10.9) |
+| `waterShadowOnPaper` | `#000000` 13 % | `#000000` 18 % | The same over light paper: deeper in light mode, where there is ink to separate from; lighter in dark mode, where the dark water already stands off the white page |
 | `beadBody` | `#FFFFFF` **70 %** | `#FFFFFF` 22 % | Bead material (with the Carbon tint it lands near `#E6E6E6`, not mid-grey) |
 | `beadShadow` | `#000000` 16 % | `#000000` 45 % | Slider thumbs only; the selection bead has no shadow |
 | `swatchRing` | `#000000` 22 % | `#FFFFFF` 35 % | 1 pt ring on inks that vanish against the chrome: Chalk in light mode, Carbon and Midnight in dark mode |
 
-**Optics follow the backdrop.** Edge and caustic exist to show a lens bending something. Over a flat backdrop (the desk, the white library, sheets) there is nothing to bend, and the two bands read as a neumorphic pillow, so they are drawn only where the droplet is over light paper. On iOS 17–25 the container measures this as the share of each droplet's area over the page frames the editor registers (`nibBackdrop`), and the same share mixes `clearBody` toward `clearBodyOnPaper`. The rim and the 0.8 pt line are always drawn: they are enough to separate a droplet from a flat surface.
+The optics tokens (`waterRim`, `tintRim`, `waterLine`, `waterLineBud`, `waterShadow`, `waterShadowOnPaper`) draw Nib's own water on iOS 17–25. On iOS 26 the system glass has its own rim, shadow and tint, and only the bodies are used (as the plain tint under `Glass.identity` while the Pencil is down) plus `waterRim` for the held rim.
+
+**Optics follow the backdrop.** The edge lens exists to show glass bending something. Over a flat backdrop (the desk, the white library, sheets) there is nothing to bend, so it is drawn only where the droplet is over light paper. The shadow follows it too: in light mode it deepens over paper (8 → 13 %), as the system glass's shadow grows over text; in dark mode it lightens there (28 → 18 %), because the dark water already stands off the white page and a deep halo on white reads as a smudge. On iOS 17–25 the container measures this as the share of each droplet's area over the page frames the editor registers (`nibBackdrop`), and the same share mixes `clearBody` toward `clearBodyOnPaper`. The rim, sheen and 0.8 pt line are always drawn: they are enough to separate a droplet from a flat surface.
 
 ### 3.4 Ink: the 12 default pens
 
@@ -226,6 +230,11 @@ SF Mono appears only in the plugin developer console and the "Show tool calls" d
 | `caption2` | `.caption2` | 11 / 13 | Medium | Pen-type labels, usage line, badges |
 | `hud` | `.footnote` rounded, monospaced digits | 13 / 16 | Semibold | "3 / 12", "0.50 mm", "125 %", "04:12" |
 | `math` | `.callout` serif italic | 16 / 21 | Regular | Formulas in the assistant |
+| `badgeNumber` | `.footnote` rounded | 13 / 18 | Bold | Proofreader and comment-pin numbers on their 22 pt discs |
+| `documentBody` | `.body` serif | 17 / 22 | Regular | The default body of a text document (§14.17) |
+| `documentHeading(1…3)` | `.title` / `.title2` / `.title3` serif | 28 / 22 / 20 | Bold | Text-document headings H1–H3; deeper levels read as H3 |
+
+UIKit surfaces (outline and bookmark rows, the keyboard formatting bar, text documents, comment pins) use the same roles through `NibUIFont`, which has every row of this table except `math`, each scaled with `UIFontMetrics`.
 
 ### 4.2 Dynamic Type
 
@@ -264,6 +273,54 @@ Base unit 4 pt; 2 pt only inside controls.
 - Folder tiles 78 pt tall on the same 24 pt gutter; their width is computed, `(content width − 3 × 24) / 4` on iPad (188.5 pt in 11″ landscape), never hard-coded. Names are one line with tail truncation. Sidebar 320.
 - Size classes: below 600 pt wide (iPhone, Slide Over, half Split View on 11″) Nib uses the compact layout; otherwise the regular one. Library columns re-flow at 600, 900 and 1180 pt.
 
+**Screen metrics** (`NibMetrics`, from the screens in §14; a screen never re-derives these numbers):
+
+| Token | Value | Where |
+|---|---|---|
+| `optionTileHeight` | 52 | Popover choice grids: pen types, shape kinds, tape patterns, More (`NibOptionTile`) |
+| `popoverContentWidth` | 280 | What a 312 pt popover's content lays out in (sliders, grids) |
+| `handleBead` / `rotationHandleOffset` | 12 / 24 | Selection and frame handles (44 pt hit areas); the rotation bead above the top edge |
+| `statusDot` | 6 | Unseen changes, the bridge's connected dot, recording (`NibStatusDot`) |
+| `presenceBead` / `presenceMaxShown` | 22 / 3 | Collaborator initials after the title, then "+N" |
+| `liveCursorBead` | 10 | A collaborator's cursor on the page |
+| `tabCapsuleHeight` / `maxVisibleTabs` | 32 / 5 | Document tabs between the bars |
+| `rowThumbnailWidth` | 40 | Bookmark and outline rows |
+| `outlineIndent` / `outlineMaxDepth` | 16 / 4 | Outline rows indent per level, then stop |
+| `settingsSheetSize` / `settingsSectionListWidth` | 760 × 706 / 220 | Settings on iPad |
+| `newDocumentSheetSize` | 720 × 640 | New Notebook sheet |
+| `coverPreviewSize` / `coverStripSize` / `paperTileSize` | 104 × 136 / 88 × 116 / 104 × 135 | New Notebook: live cover, cover strip, paper grid |
+| `pluginManagerSheetSize` / `developerConsoleSize` | 780 × 690 / 480 × 320 | Plugin manager (list 320), developer console |
+| `floatingPanelSize` | 344 × 560 | Floating Deep panels, the Elements panel's maximum |
+| `searchWidth` / `searchResultsMaxHeight` / `searchSnippetSize` | 560 / 600 / 120 × 60 | Global search field, results panel, handwriting snippets |
+| `commandBarWidth` | 560 | ⌘K |
+| `onboardingCardWidth` | 480 | Onboarding card (iPhone: width − 32) |
+| `studyCardSize` | 560 × 360 | Practice card and the editor's preview |
+| `zoomPaneHeight` | 240 | Zoom Window pane |
+| `minimapSize` / `minimapSizeCompact` | 208 × 144 / 168 × 116 | A whiteboard's minimap |
+| `audioBarWidth` | 320 | Audio playback bar |
+| `textColumnWidth` | 680 | Text documents |
+| `laserDot` / `laserGlow` / `laserTrail` | 12 / 12 / 4 | Laser |
+| `proposalBadgeX` | 52 | x of the assistant's margin badges, in page points |
+
+### 5.1 Stroke widths
+
+Nothing strokes at a width off this list (`NibStroke`).
+
+| Token | pt | Use |
+|---|---|---|
+| `hairline` | 0.5 | Separators and dividers, the swatch hairline |
+| `outline` | 0.8 | A droplet's `waterLine`, the Reduce Transparency outline |
+| `thin` | 1 | The permanent swatch ring, guides, the lasso marquee, template rules, ruler ticks |
+| `emphasis` | 1.5 | The Zoom Window box, the dashed addition rule (Differentiate Without Colour) |
+| `ring` | 2 | Focus rings, selection rings (current page, chosen paper, selected swatch), drop-target borders |
+| `thick` | 3 | Progress bars, illustration pen strokes |
+| `ringOutset` | 3 | How far outside its shape a selection ring sits |
+| `dash` (`dashed`, `layerDash`) | 4 / 4 at `thin` | The one dash: the lasso marquee, a text box's editing outline, spacing guides |
+
+### 5.2 Opacities with a meaning
+
+Colour tokens carry their own alpha. These are for content and state (`NibOpacity`): disabled 40 %, unselected palette tool 74 %, receding droplet 22 % (§10.8), assistant ghost ink 42 % (§14.9), replay's not-yet-reached strokes 30 % (§14.13), laser glow 45 % (§14.12).
+
 ---
 
 ## 6. Radii
@@ -286,8 +343,10 @@ Continuous corners everywhere (`.continuous`, `CALayerCornerCurve.continuous`).
 | Segmented track / knob | 9 / 7 |
 | Plugin and settings icon squircle | 7 |
 | Badge | 6 |
+| Ruler body (`NibRadius.ruler`, an opaque on-page object) | 6 |
 | Notebook cover | 5 at the spine, 8 at the fore-edge |
-| Page thumbnail | 4 (the current-page ring 7) |
+| Page thumbnail, paper and cover tiles | 4 (the current-page and selection ring 7) |
+| Search hits and citations washed on the page (`NibRadius.pageWash`) | 4 |
 | Page | 0 |
 
 **Concentric rule.** A shape inside a shape shares its centre of curvature: `inner = outer − inset`, minimum 8 (`NibRadius.concentric`). Capsules stay capsules. Radii off this table are a lint error.
@@ -364,6 +423,20 @@ SF Symbols only. Palette tools are Medium at 23 pt; bars Regular at 21 pt; sideb
 | Plugin permissions | `hand.raised`, network `network`, AI `drop`, document write `pencil.and.outline` |
 | Keyboard | `command`, `keyboard` |
 
+### 8.3 More tools, actions and places (v2)
+
+Each is a `NibSymbol` token (named first); features never spell an SF Symbol. Every name exists on iOS 17, except Image Playground, which is `NibSymbol.imagePlayground` (nil below iOS 18.1, so the entry hides).
+
+| Group | Tokens and symbols |
+|---|---|
+| Colour | `eyedropper` `eyedropper`, `customColour` `paintpalette` ("Custom…", the object menu's Colour) |
+| Tools | `drawShape` `pencil.and.outline`, `layers` `square.3.layers.3d`, `editHandwriting` `scribble`, `recognisedText` `text.viewfinder`, `convertToText` `character.textbox`, `straighten` `level`, `insertSpace` `arrow.up.and.down`, `math` `x.squareroot`, `graph` `chart.xyaxis.line`, `table` `tablecells`, `dragHandle` `line.3.horizontal` |
+| Editing | `cut` `scissors`, `copy` `doc.on.doc`, `paste` `doc.on.clipboard`, `duplicate` `plus.square.on.square`, `link` `link`, `arrange` `square.stack.3d.up`, `screenshot` `camera.viewfinder`, `crop` `crop`, `flipHorizontal` / `flipVertical` `arrow.left.and.right.righttriangle.left.righttriangle.right` / `arrow.up.and.down.righttriangle.up.righttriangle.down`, `replace` `arrow.2.squarepath` |
+| Text formatting | `bold`, `italic`, `underline`, `strikethrough`, `textSuperscript` `textformat.superscript`, `textSubscript` `textformat.subscript`, `inlineCode` `chevron.left.forwardslash.chevron.right`, `fontSize` `textformat.size`, `alignLeft` / `alignCentre` / `alignRight` / `justify` `text.alignleft` / `text.aligncenter` / `text.alignright` / `text.justify`, `listBulleted` `list.bullet`, `listNumbered` `list.number`, `checklist`, `indent` `increase.indent`, `outdent` `decrease.indent`, `lineSpacing` `arrow.up.and.down.text.horizontal` |
+| Audio and time | `recordDot` `record.circle`, `skipBack10` / `skipForward10` `gobackward.10` / `goforward.10`, `transcript` `captions.bubble`, `speak` `speaker.wave.2`, `timer`, `stopwatch`, `lap` `flag`, `history` `clock.arrow.circlepath` |
+| Documents and sharing | `unlock` `lock.open`, `touchID` `touchid`, `print` `printer`, `saveToFiles` `square.and.arrow.down.on.square`, `newWindow` `macwindow.badge.plus`, `externalLink` `arrow.up.forward.app`, `qrCode` `qrcode`, `templates` `rectangle.3.group`, `minimap` `map`, `fitToContent` `arrow.up.left.and.arrow.down.right` |
+| Settings and places | `profile` `person.crop.circle`, `language` `globe`, `notifications` `bell.badge`, `reminder` `bell`, `info` `info.circle` (About, info notices), `advanced` `wrench.and.screwdriver`, `calendar`, `cloud` `icloud`, `backup` `externaldrive`, `diagnostics` `stethoscope`, `dictionary` `character.book.closed` |
+
 ---
 
 ## 9. Motion
@@ -374,14 +447,14 @@ Every animated value is a spring from `NibMotion`: k = (2π / response)², c = 4
 
 | Token | Response (s) | ζ | Used for |
 |---|---|---|---|
-| `follow` | 0.085 | 1.00 | A droplet following the finger (one frame of viscosity) |
+| `follow` | 0.085 | 1.00 | A held droplet following the finger. Critically damped: it trails the finger by v × 27 ms (27 pt at 1000 pt/s) and never passes it. That slight lag is the water's weight (§10.1) |
 | `tap` | 0.22 | 0.90 | Button press scale 0.96 |
-| `lift` | 0.30 | 0.72 | Pick-up scale 1 → 1.035–1.05 |
+| `lift` | 0.30 | 0.72 | Pick-up scale 1 → 1.035–1.05; the armed cover's 1.03 swell (§10.12) |
 | `glide` | 0.20 | 1.00 | Selection bead head. A selection indicator never overshoots; tool switching happens tens of times a minute |
 | `trail` | 0.26 | 1.00 | Selection bead tail (the short lag makes the teardrop on long jumps) |
-| `snap` | 0.50 | 0.80 | **The palette's dock only**, starting from the full release velocity (measured overshoot 4 pt) |
+| `snap` | 0.50 | 0.80 | **The palette's dock only** (`.dropletDockable`, `NibToolPalette`), starting from the full release velocity: overshoot 3.5–4.5 pt from a 300 pt throw (11 pt for a 5000 pt/s fling), arrival in 0.25–0.37 s, then one plip (§10.11) |
 | `slot` | 0.40 | 1.00 | Grid and slot snaps (library cards, page thumbnails, floating panels): only the part of the release velocity that points at the slot, capped at 1200 pt/s and at ω·distance, so it never overshoots |
-| `reflow` | 0.44 | 0.86 | Neighbours making room (grid, thumbnails), folder films |
+| `reflow` | 0.44 | 0.86 | Neighbours making room: the library's live reorder (`NibReflow`, §10.12), page thumbnails; folder films |
 | `tether` | 0.40 | 0.62 | Proposal chip flowing back to its dock (one visible overshoot) |
 | `bud` | 0.42 | 0.76 | Popover position while budding |
 | `budSize` | 0.46 | 0.80 | Popover size while budding |
@@ -389,7 +462,7 @@ Every animated value is a spring from `NibMotion`: k = (2π / response)², c = 4
 | `retract` | 0.30 | 0.90 | Popover folding back into its button |
 | `neck` | 0.14 | 1.00 | Neck thickness |
 | `absorb` | 0.22 | 1.00 | Satellite drop and cards flowing into a folder |
-| `wobble` | clamp(0.14·√(minor / 44), 0.14, 0.26) | 0.68 | Surface tension (§10.3): about 5 % overshoot, under one visible cycle |
+| `wobble` | clamp(0.14·√(minor / 44), 0.14, 0.26) | 0.68 | Surface tension (§10.3): with the 33 ms settle lead, one dip of about 6 % of the peak (never over 10 %), under one visible cycle |
 | `thumb` | 0.16 | 0.72 | Slider-thumb stretch |
 | `sheet` | 0.48 | 0.90 | Sheets and panels docking |
 | `reduced` | 0.26 | 1.00 | Replaces every spring under Reduce Motion and Liquid Off (`NibSpring.animation` does this itself) |
@@ -402,6 +475,7 @@ Floors, enforced by review and by the springs' unit tests: stretch springs (`wob
 - A budded droplet's content fades in over 220 ms with blur 3 → 0 pt; it is revealed *through* the droplet, clipped to its shape, and never scales up from 0.
 - Colour changes lead motion: a newly selected tool's glyph reaches full strength within 120 ms, before the bead arrives. Accepting an AI change turns ghost ink into ink over 350 ms.
 - The laser trail fades linearly over 600 ms: the only linear motion in Nib, because it is time made visible.
+- A HUD that answers a gesture (the ruler's angle, the pinch-zoom percentage) lingers **0.6 s** after the fingers lift (`NibMotion.hudLinger`), then fades out with the exit timing (120 ms). While the fingers are down it never fades.
 
 ### 9.3 What never animates
 
@@ -423,7 +497,8 @@ This is the complete behaviour, implemented by `DropletPhysics`, `DropletField` 
 ### 10.1 Drag
 
 - **Pickup** after 6 pt of movement (less is a tap). The droplet lifts to 1.035 (palette, bars), 1.045 (cards, thumbnails) or 1.05 (chip) with `lift`, goes to E2, and a card or thumbnail grows a 3 pt water envelope, concentric with it. The lift and its shadow carry the pickup, as iOS drag previews do; a wide envelope over a flat backdrop only reads as a die-cut sticker outline.
-- **Follow.** Target = finger − grab offset; position springs to it with `follow`. Weight is expressed in shape, never in positional lag.
+- **Follow.** Target = finger − grab offset; position springs to it with `follow` (0.085 s, ζ 1). Being critically damped it never passes the finger; it trails it by v·ζ·response/π, that is **v × 27 ms** (27 pt at 1000 pt/s, 108 pt at a 4000 pt/s flick), and catches up within 0.1 s of the finger stopping. That slight lag is the water's weight, together with the stretch (§10.2) and the settle (§10.3): a held droplet is a bead being pulled along, not a sticker glued to the finger. It is never more than this: no extra smoothing, no inertia after release other than the release velocity (§10.3).
+- **Held: a bead of water.** While the finger is down the droplet is lifted (1.035 for the palette, with `lift`), its rim brightens to 1.5× with the lift (`DropletStyle.liftedRim`, §10.9), it follows with `follow`, stretches with its own speed about the grab point, volume-preserving, within its cap (§10.2), dips once as it slows (§10.3), keeps lensing the page under it (a held Clear droplet keeps its Regular glass on iOS 26 and its edge lens on iOS 17–25; only the Pencil freezes it, §10.8), and, for the palette, grows a meniscus towards the dock it would land in (§10.11).
 - **Bounds.** Past the container edges (8 pt inset) the droplet rubber-bands: `edge + D·(1 − 1/(0.55·e/D + 1))`, D = 120 pt.
 - **One finger.** The first pointer owns the drag; extra touches are ignored until it lifts.
 - **Fingers move chrome; the Pencil writes.** A stroke that starts on the page never reaches a droplet.
@@ -447,8 +522,9 @@ This is the complete behaviour, implemented by `DropletPhysics`, `DropletField` 
 
 - The stretch is itself a spring toward s\*. When you stop, s\* → 0 and s dips just below zero once: the droplet flattens slightly across its old direction of travel, like a drop landing, and is round again.
 - `wobble` response `clamp(0.14·√(minor / 44 pt), 0.14, 0.26)` s at ζ 0.68: a 44 pt bar 0.14 s, the 56 pt palette 0.16 s, a 140 pt card 0.25 s, panels 0.26 s. **About half a visible cycle, the undershoot ≤ 10 % of the peak.** Water at UI scale is quick and tight; 1.5 cycles at ζ 0.5 is jelly.
+- **Settle lead (33 ms).** A held droplet slows through its `follow` spring, so s\* falls over 40–80 ms, and a spring chasing a falling target barely dips (1–3 %, nobody sees it: a dead stop). So whenever s\* falls back towards zero the stretch velocity is kicked by ω²·0.033 s·Δs\* (ω = 2π / wobble response), as if the fall had come 33 ms earlier. Every droplet size then dips once by about **6 % of its peak** (unit-tested between 3 % and 10 % for the bar, the palette and a card at 300, 1500 and 4000 pt/s) and never comes back above 1 %: one visible drop-landing, no bounce. A rising s\* (speeding up) gets no lead.
 - **Release** projects a landing point `p + v·0.12 s`. If the finger was still for ≥ 70 ms before lifting, v = 0: a careful placement never flings. Release speed is capped at 5000 pt/s.
-- The palette then springs to its dock with `snap`, **starting at the full release velocity**. Everything that lands in a slot (library cards, thumbnails, floating panels) uses `slot` with only the part of the velocity that points at the slot, capped at 1200 pt/s and at ω·distance (ω = 2π / 0.40 s), so it can never overshoot and never leaves its container. A snap haptic plays about 260 ms in. **Nothing rests where it lands**: every droplet has a home (a dock, a slot, its anchor, its layout position) and flows to it.
+- The palette then springs to its dock with `snap`, **starting at the full release velocity**, and plays **one plip** (`NibHaptics.plip`) the first time its centre is within 1.5 pt of the dock, or when it comes to rest (typically 0.25–0.37 s in). The snap's 4 pt overshoot takes it out of that band and back, but the landing is disarmed by then: one plip per landing, none if it has not arrived within 1.5 s (another drag took over). Everything that lands in a slot (library cards, thumbnails, floating panels) uses `slot` with only the part of the velocity that points at the slot, capped at 1200 pt/s and at ω·distance (ω = 2π / 0.40 s), so it can never overshoot and never leaves its container; a slot's snap haptic plays about 260 ms in. **Nothing rests where it lands**: every droplet has a home (a dock, a slot, its anchor, its layout position) and flows to it.
 - Any change of a droplet's layout position (a dock change, a reflow, a popover re-placed) animates from where it is on screen to the new place with the droplet's current velocity (FLIP).
 
 ### 10.4 Merge (union)
@@ -481,7 +557,7 @@ Real water holds on longer than it takes to join. A **neck** is a capsule of thi
 2. Its centre springs to the popover's rest with `bud`; its size springs to W × H (radius 15 → 26) with `budSize`.
 3. The neck (t₀ 30) thins as it leaves and **pinches at a 16 pt gap**, about 80 % of the travel and 180 ms in. A bud haptic plays.
 4. **Content** is revealed on the pinch or at 300 ms, whichever comes first: opacity 0 → 1 and blur 3 → 0 over 220 ms, **clipped to the droplet's shape (from C)**. The clip is the body itself: its size, radius and full transform (stretch, axis, grab origin, lift). The content keeps its own gentler rigidity transform *inside* that clip, so nothing ever draws outside the body, not even mid-bud. Content never scales up from 0.
-5. **Visibility (fix 4).** From its first frame until the reveal, the bud carries the `waterLineBud` outline (12 % black in light mode) and its body tint, so it is visible over the grey desk. Frost fades in with growth: `clamp((progress − 0.25) / 0.5)`.
+5. **Visibility (fix 4).** From its first frame until the reveal, the bud carries its body tint and, on iOS 17–25, the `waterLineBud` outline (12 % black in light mode), so it is visible over the grey desk. Frost fades in with growth: `clamp((progress − 0.25) / 0.5)`. On iOS 26 the bud is system glass from its first frame, born inside the palette's glass (`glassEffectID`): its own rim and shadow carry it, and nothing is stroked over it.
 6. **Close** (tap the tool again, tap outside, start dragging the palette, press Escape). Content fades out in 120 ms. After 70 ms the droplet retracts to the tool with `retract` (size 28, radius 14), rejoins the palette at 11 pt (merge haptic) and disappears once it is < 34 pt and within 5 pt of the tool.
 7. **A touch outside an open popover only dismisses it. It never inks.**
 8. **From the keyboard** (a shortcut, ⌘K) the popover or panel appears in place with no bud (`instant`).
@@ -494,7 +570,7 @@ While a bud is open it is modal for VoiceOver (focus moves into it when its cont
 
 - Two circles: a head (r 20) on `glide` and a tail (r 15.6) chasing the head on `trail`, joined by a neck. A moving bead is one drop that rounds up on arrival. Tool switching is a tens-of-times-a-minute action, so it is quick: the head never overshoots the tool (`glide` ζ 1) and a 220 pt jump is within 1.2 pt of the tool in about 0.25 s.
 - **It never splits (fix 1, from C).** The tail is never more than **1.0·r = 20 pt** behind the head, so the teardrop shows only on jumps longer than three tools, and the neck's half-width never drops below **0.72 × the tail radius** (so the neck is ≥ 22.5 pt wide).
-- **Ink tint (from B).** The bead takes the current ink at ≤ 15 %. It stays clear water, body plus rim: no shadow, no edge ring, no specular (inside the palette it must not read as a raised button). No marbling, no gloss.
+- **Ink tint (from B).** The bead takes the current ink at ≤ 15 %. It stays clear water: body plus, on iOS 17–25, the key rim alone (§10.9); no counter-rim, sheen, line or shadow, so inside the palette it never reads as a raised button. Inside iOS 26 glass it is a plain fill with no rim at all, like the system's own selection indicators. No marbling, no gloss.
 - **Passing lens.** Icons within 30 pt of the head magnify up to 1.13×: `1 + 0.13·max(0, 1 − d/30)`.
 - **Colour leads (from C).** The new tool's glyph reaches full strength within 120 ms, before the bead arrives.
 - **Scrub.** Press the selected tool and move along the palette's axis: the head follows directly; on release the bead snaps to the nearest tool, which becomes selected. Moving across the axis drags the palette instead.
@@ -511,20 +587,52 @@ While a bud is open it is modal for VoiceOver (focus moves into it when its cont
 
 ### 10.9 Optics
 
-Light from the top-left: azimuth 225°, elevation 40°.
+Every optic lives in the outer 4.5 pt of a droplet. The core is the body alone: clear, quiet and legible. The rim is lit by one key light at the top-left and is never a uniform stroke. On iOS 26 all of this is the system's (§2.3) and Nib adds only the held rim; the numbers below draw the iOS 17–25 water and the mockup.
+
+**Liquid Glass v2 (September 2026).** A redo of the optics against Apple's iOS 26 Liquid Glass (WWDC25 "Meet Liquid Glass" and "Build a SwiftUI app with the new design", the HIG Materials page, *Applying Liquid Glass to custom views*), after the mockup's rim and highlights read wrong. What changed, and why:
+
+1. **iOS 26 leans on the system.** Nothing is painted on system glass at rest. The `waterLineBud` stroke over budding glass is gone: a second line over the system's rim is a double, heavy edge. The one addition is the held rim, because a droplet's body never takes the touch and the system cannot light it up.
+2. **One variant.** Page-resident droplets used `Glass.clear`, which is more transparent, not less refractive, needs media and a dimming layer beneath, and must never mix with Regular. Deep dropped its white / `#1C1C1E` tint (a tint used for thickness muddies the glass; Regular thickens large surfaces itself). Only Tinted is tinted.
+3. **Interactive where the glass takes the touch.** `nibGlass` applies the glass to its content, as Apple's guide does, so the glass's foreground treatment and `interactive()` reach the controls; a droplet outside a container passes its style's `isInteractive`; Reduce Transparency no longer swaps `nibGlass` to opaque on iOS 26 (the system frosts it).
+4. **The rim is a hairline that follows the light.** It was the union minus itself offset by (1.1, 1.5) pt in white 85 %: a 1.9 pt crescent on the top-left and nothing opposite. It is now a 0.8 pt line whose brightness follows the edge normal: full facing the key light, half on the counter side, none where the edge runs along the light.
+5. **No specular blob, caustic band or dark ring.** The Blinn-Phong specular (a band 2 to 4 pt inside the rim that read as a second rim), the 7 pt caustic band (a grey smudge in dark mode) and the 2.6 pt dark edge ring (a uniform stroke beside the line) are gone. In their place: a sheen inside the lit edge, the edge lens over light paper, and nothing deeper than 4.5 pt.
+6. **Shadow.** The iOS 17–25 water cast none. It now casts its own, outside the body only, following the backdrop (§3.3) and deeper while held.
+7. **Held.** A dragged droplet's rim brightens to 1.5× with the lift spring (`DropletStyle.liftedRim`; `DropletStyle.lifted` shows it at rest).
+8. **The mockup's lens** spanned the whole capsule (a ramp of 0.95·r + 2 pt: no clear core) and sampled inward (magnifying). Apple's rim samples outward: it shows what lies just outside, compressed into a band. It is now a band of at most 12 pt.
+9. The zoom frame drew its outline twice, and the selection bead's rim was a 1.5 pt crescent. Both follow the rim rules now.
+
+**Geometry.** The key light is at the top-left, azimuth 225°: in screen space (y down) the unit vector toward it is **L = (−0.7071, −0.7071)**. Per pixel: d is the distance inside the silhouette in points (negative outside); N̂ is the outward unit normal (for the field, minus its normalised gradient; for a static shape, the gradient of its rounded-rect distance); **λ = N̂ · L**; s is the rim strength (1 at rest, up to 1.5 held). Bands: `edge(d) = 1 − smoothstep(0.3, 1.1, d)` (the 0.8 pt edge), `glow(d) = 1 − smoothstep(0.8, 4.5, d)`, `lensBand(d) = 1 − smoothstep(0, 4, d)`, and coverage `cover(d) = clamp(d + 0.5, 0, 1)` for the anti-aliasing. Colours are premultiplied and composited with source-over, bottom to top in the order of the table; each alpha is capped at 1.
 
 | Element | Value |
 |---|---|
-| Lens (Clear, iOS 26 system) | Refraction at the rim only, frosted core. The mockup uses an inward displacement `−n̂·A·(1 − d/ramp)^1.8` for depth d < ramp, ramp 0.95·r + 2 pt, A = 0.15·minor + 2 pt (**0.08·minor + 1 on droplets under 60 pt thick**, so ink under a palette never doubles), then **blur 5 pt** (handwriting under a label must not read as competing structure), saturation 1.7, brightness +4 %, then the body. Page-resident droplets (the proposal chip, the lasso object menu) never refract: they sit on ink |
-| Deep lens | Blur 26 pt, saturation 1.8, no displacement (iOS 17–25: `.ultraThinMaterial`) |
-| Edge | Inner band `1 − smoothstep(0, 2.6 pt, d)` in `waterEdge`, over light paper only (§3.3) |
-| Caustic | Union minus the union offset by (−4, −6) pt, softened, in `waterCaustic`, over light paper only |
-| Specular | Blinn-Phong on the height `smoothstep(0, 8 pt, d)` × 6.5; exponent 40, kₛ 0.55. Not on beads, not on Tinted |
-| Rim | Union minus the union offset by (1.1, 1.5) pt, in `waterRim` (a 0.8–1.2 pt highlight on the top-left); `tintRim` on Tinted |
-| Outline | `1 − smoothstep(0.3, 1.1 pt, d)` in `waterLine` |
-| **Tinted** | Rim and outline only. The water stack over an accent fill is a glossy candy button: no edge band, no caustic, no specular |
+| Key lobe | `key = max(λ, 0)^1.5`: 1 where the edge faces the light (the top-left corner), 0.595 along a bar's top edge and a vertical palette's left edge, 0 where the edge runs along the light (top-right and bottom-left) |
+| Counter lobe | `counter = 0.5 · max(−λ, 0)^2`: 0.5 at the bottom-right, 0.25 along a bar's bottom edge |
+| Body | The material's body tint (§2.2), then `waterBody` (not on Tinted) |
+| Edge lens | iOS 17–25, over light paper only: the body's opacity × `1 − 0.35 · paper · lensBand(d)`, so it thins by up to 35 % at the silhouette and is whole again 4 pt in, as if the glass bent the page in at its rim. Not on Tinted, not on page-resident droplets |
+| Sheen | `waterRim` × `0.22 · key² · glow(d) · s`: a soft glow inside the lit edge, gone by 4.5 pt. Not on Tinted, beads, library films or the zoom frame |
+| Outline | `waterLine` × `edge(d)`, all round, under the rim: it shows where the rim is dim, so the silhouette always reads over white paper |
+| Rim | `waterRim` × `edge(d) · (key + counter) · s` (`tintRim` on Tinted). Light mode, Clear over the desk: white 85 % at the top-left corner, 51 % along the top edge, 21 % along the bottom edge, nothing at the top-right. Dark: 50 %, 30 %, 12.5 % |
+| Core | Deeper than 4.5 pt: the body alone. Content sits ≥ 4.5 pt inside a droplet (§10.4), so no optic ever touches a glyph and §2.4 contrast holds |
+| Shadow | iOS 17–25. The field (the silhouette already blurred at σ 8 pt, 6.5 on iPhone) sampled 5 pt above the pixel, alpha × `min(f / iso, 1)`, in `mix(waterShadow, waterShadowOnPaper, paper)`, drawn only where the water is not (× `1 − cover`), so it never shows through the body. Held: 8 pt and × 1.6, eased with the lift. No water shadow under a lifted cover or thumbnail (their `coverLifted` carries it). A lone `nibGlass`: the silhouette's shadow at blur radius 8 pt, 5 pt down, in `waterShadow`, clipped to outside the body |
+| Held | `s = 1 + 0.5 · lift progress` (`DropletStyle.liftedRim` 1.5; handles 1). iOS 17–25: rim and sheen × s. iOS 26 (`NibLiftRim`): `waterRim` × `edge(d) · (key + counter) · (s − 1)`, plus-lighter over the system glass; no outline, no sheen. One union has one rim: the most lifted member's |
+| Tinted | Rim (`tintRim`, key and counter) and outline only |
+| Bead | iOS 17–25: `beadBody` + the ink at 15 % + the key rim as a crescent, the bead minus itself moved 0.8 pt away from the light (by 0.57, 0.57), in `waterRim`: 0.8 pt at the top-left, tapering to nothing at the sides. No counter-rim, sheen, line or shadow. iOS 26: the fill only |
+| Deep frost | iOS 17–25: `.ultraThinMaterial` under the body, inset 1.5 pt, not while the Pencil is down |
 
-In Metal (`nibWaterField`, iOS 17–25) d is the field's distance estimate `(f − iso) / |∇f|`, which gives analytic anti-aliasing and the normal for the specular in one pass.
+In Metal (`nibWaterField`, iOS 17–25) d is the field's distance estimate `(f − iso) / length(∇f)`, with ∇f from central differences 1.5 pt either side, which gives analytic anti-aliasing and the normal in one pass: six samples a pixel at most (one, four for the gradient, one for the shadow). Static shapes use `nibWaterRim` with the rounded-rect distance. The numbers reach both shaders from `NibOptics`, which the tests check.
+
+**iOS 26.** Every droplet is `Glass.regular` (Tinted adds `.tint(accent)`), with `.interactive()` wherever the glass takes the touch, in one `GlassEffectContainer(spacing: 11)` (9 on iPhone) with a `glassEffectID` per droplet, and `Glass.identity` over the plain body tint while the Pencil is down. The lensing, the rim highlights (which move with the device), the adaptive shadow and tint, and the light and dark flip are the system's.
+
+**The mockup** imitates the iOS 26 look in HTML. Per droplet, bottom to top:
+
+| Layer | Value |
+|---|---|
+| Shadow | `box-shadow: 0 5px 16px rgba(0, 0, 0, a)` with a = 8 % over the desk and 13 % when more than half the droplet is over light paper (dark 28 % / 18 %). Held: `0 8px 16px` and a × 1.6, eased with the lift. `box-shadow` paints outside the border box only, which is what the water needs |
+| Clear lens | Displacement in a band at the rim, sampling **outward**: at depth δ < w the pixel shows `p + N̂ · A · (1 − δ/w)^2.5`, w = clamp(0.22 · minor, 6, 12) pt, A = clamp(0.1 · minor, 2.5, 6) pt (a 44 pt bar: w 9.7, A 4.4; the 56 pt palette: 12 and 5.6; a popover: 12 and 6). The band stays sharp; the core is blurred 5 pt with saturation 1.7 and brightness +4 %, cross-faded by (1 − δ/w)², for example a displaced lens under a blurred core layer whose mask fades out across the band. Page-resident droplets (the chip, the lasso menu) get no displacement |
+| Deep lens | Blur 26 pt, saturation 1.8, no displacement |
+| Body | The body tint (§2.2) |
+| Water | Outline, sheen and rim from the table above. As an SVG filter over the union m: ring = m minus m eroded 0.8 pt; key map = `feDiffuseLighting` on m blurred at σ 1.2 (surfaceScale 4, `feDistantLight` azimuth 225, elevation 0), luminance to alpha, then `feFuncA` gamma exponent 1.5; counter map = the same at azimuth 45 with exponent 2, × 0.5; rim = (key + counter) inside the ring, flooded `waterRim` × s; sheen = the key map squared inside m minus m eroded 4.5 pt, blurred σ 1.5, × 0.22 × s. The mockup does not draw the edge lens: its displacement lens is the lens |
+| Bead | Body, the ink at 15 %, and the key rim crescent (the bead minus itself moved by 0.57, 0.57) in `waterRim` |
 
 ### 10.10 Re-forming the palette (fix 2)
 
@@ -536,7 +644,9 @@ When a fling docks the palette on an edge of the other orientation (vertical ↔
 4. At the midpoint (long side ≤ 1.5 × thickness) the layout switches axis while the content is invisible.
 5. The body spreads to the new length with `reform`; the icons appear in their new slots; the bead rides along.
 
-Under Reduce Motion the palette cross-fades to its new dock with `reduced`.
+Any change of the dock's axis re-forms: a release, an accessibility action, `toolbar.dock`, or a size-class change that takes the side docks away (Split View narrowing to compact moves a side dock to the bottom). `NibToolPalette` and `.dropletDockable` keep laying the content out for the old dock until the gather reaches its midpoint; `@Environment(\.nibDockEdge)` switches there, while the content is invisible. A move along the same axis is not a re-form: the body flows to its new place from where it is (FLIP) with `snap` and the release velocity.
+
+Under Reduce Motion and Liquid Off the palette cross-fades to its new dock: it fades out in 120 ms, moves with `reduced` while invisible (0.26 s, no overshoot), and fades in over 220 ms. No stretch, no meniscus.
 
 ### 10.11 Docks
 
@@ -545,15 +655,41 @@ Under Reduce Motion the palette cross-fades to its new dock with `reduced`.
 | iPad | Left or right edge (vertical, anywhere along the edge below the bars), bottom (horizontal), top below the bars (horizontal, +40 pt bias so the top is picked only on purpose). With the assistant docked, the right edge moves to the panel's leading edge |
 | iPhone | Bottom (default) or top below the bars, horizontal only |
 
-VoiceOver and Full Keyboard Access get "Move palette to the left edge / right edge / top / bottom" actions.
+The dock is one engine, `DropletDockModel` plus its driver, used by `NibToolPalette` and by `.dropletDockable` (any other droplet that docks like the palette), so they feel the same. Every number below is in `DropletDockModel` and unit-tested.
+
+| Quantity | Value |
+|---|---|
+| Region | Below the bars: safe area + 8 + 44 + 16 pt; 16 pt in from the sides; 16 pt above the bottom safe area (8 pt on iPhone, just above the home indicator); minus the docked assistant panel at the trailing edge. `along` 0…1 slides the palette from one end of its edge to the other |
+| Distance to a dock | From the point to the line the palette's centre sits on at that dock (perpendicular to the edge: anywhere along it counts). The top counts **+40 pt** |
+| Release point | The projected finger, `p + v·0.12 s`, with v zeroed if the finger was still ≥ 70 ms and capped at 5000 pt/s (§10.3) |
+| Capture radius | **200 pt** (iPad), **160 pt** (iPhone). The nearest dock within it wins, centred on the projected point along its edge, then fused (1 pt) to or pushed 16 pt clear of its neighbours along the dock (§10.4). Outside every capture radius the palette flows **home** to the dock it left: a drop in the middle of the page never moves it by accident (a mid-page drop on an 11-inch iPad is 320–550 pt from every dock) |
+| Settle | `snap` (0.50 s, ζ 0.80) from the full release velocity; about 4 pt overshoot; **one plip** when it is within 1.5 pt of the dock (§10.3). Other axis: re-form (§10.10) |
+| Held | A bead of water (§10.1): lift 1.035, rim 1.5×, `follow` lag, stretch cap 0.09 about the grab point, one settle dip |
+
+**Meniscus** (a neck, §10.5). While the palette is held, the dock the finger is within capture of (current finger, not projected) is where the water reaches: its frame slid along the edge to face the body.
+
+| Gap between the body and that dock frame | Water |
+|---|---|
+| ≥ 72 pt (`off`) | Nothing |
+| 72 → 20 pt | A tongue grows out of the body towards the dock (from 8 pt inside the body): its far edge reaches `smoothstep((72 − gap) / 52)` of the gap, its thickness is t = 26·(1 − gap/72)^0.7 (t₀ 26, the palette ↔ bars value) |
+| < 20 pt (`join`) | It touches and fuses: a bridge 8 pt into the dock frame, t from the same law (26 pt at contact) |
+| Pulled back out | It holds on, thinning by the law, and pinches when t < t_min: at **51.6 pt** on iPad (σ 8), **56.5 pt** on iPhone (σ 6.5). It re-arms beyond 72 pt |
+| Released | It reaches for the landing dock and the body swallows it as it arrives; released towards another dock it thins and pinches |
+
+The meniscus springs with `neck`, is drawn in the droplet's own union (a neck of the field on iOS 17–25, a glass capsule inside the `GlassEffectContainer` on iOS 26), plays no haptic of its own (the one haptic is the arrival plip), and is not drawn under Reduce Motion, Calm or Liquid Off. Pulling the palette off its own dock shows the same thing in reverse: the water holds on and pinches at 51.6 pt.
+
+VoiceOver and Full Keyboard Access get "Move palette to the left edge / right edge / top / bottom" actions (no plip: haptics answer touch). Plugins, the assistant and ⌘K move it with `toolbar.dock {dock: "top" | "bottom" | "left" | "right", along?}` (FeatToolbar), which persists the dock per device and returns the previous one for Undo. Left and right are the leading and trailing edges, mirrored in right-to-left languages.
 
 ### 10.12 Library drag
 
-- **Lift.** The cover lifts to 1.045 with `coverLifted` and becomes a Clear droplet: a **3 pt** water envelope (radius 8, concentric with the cover's 5 pt spine) grows around it, the cover stays opaque and crisp, stretch cap 0.10 with rigidity 0.70, the title fades out. Neighbours reflow with `reflow`.
-- **Combine** (notebook → notebook). Arms only when the finger is inside the **inner 70 %** of the target cover (from C) **and** has been held there **380 ms**. Then, and only then, the target swells to 1.03, grows its own envelope, a neck forms between the two (the visual promise that they will combine) and an armed haptic plays. Proximity alone draws nothing. On drop the dragged drop flows in and the stack becomes "New Folder"; a toast buds up: "Made "New Folder" from 2 notebooks · Undo", 6 s.
-- **Folder film** (from B). When a drag starts, every folder tile grows a water film over 260 ms (`reflow`, 35 ms stagger). Brought within 13 pt of a folder, the card fuses with its film (accent wash tint, merge haptic). On drop the card flows into the folder with `absorb`, shrinking to 12 % and fading in 220 ms; the folder takes a small gulp (scale 1.03 → 1); the grid closes the gap; a toast: "Moved to Physics 9702 · Undo". Films evaporate 260 ms after the drop.
+- **Lift.** A 0.3 s press, then 6 pt of movement (the grid scrolls, so a plain drag is a scroll). The cover lifts to 1.045 with `coverLifted` and becomes a Clear droplet: a **3 pt** water envelope (radius 8, concentric with the cover's 5 pt spine) grows around it, the cover stays opaque and crisp, stretch cap 0.10 with rigidity 0.70, the title fades out. The lifted cover is a `NibReflowCarrier` in the window's droplet container (the grid sits below the container, in a scroll view); its grid cell hides while it is carried.
+- **Live reflow** (`NibReflow`, like home-screen icons with water easing). The gap follows the finger: it sits at the slot whose centre is nearest the finger, and moves only when the finger is **24 pt** closer to another slot's centre than to the gap's (12 pt past the midpoint), so it never flickers at a boundary. The covers between the card's home and the gap move one slot towards home with `reflow` (0.44 s, ζ 0.86), wrapping rows; the rest stay still. More than **24 pt** outside every slot (over the sidebar, the folder tiles, the bars) the gap closes back at home. While the finger is in another cover's inner 70 % (its combine zone) that cover holds still, so a combine can arm; at its edge the reflow goes on.
+- **Combine** (notebook → notebook). Arms only when the finger is inside the **inner 70 %** of the target cover (from C) **and** has been held there **380 ms**. Then, and only then, the target swells to 1.03, grows its own envelope, a neck forms between the two (the visual promise that they will combine) and an armed haptic plays. Proximity alone draws nothing. **While armed the reflow pauses** (nothing moves under the finger); leaving the target cover disarms it and the reflow resumes. On drop the dragged drop flows in and the stack becomes "New Folder"; a toast buds up: "Made "New Folder" from 2 notebooks · Undo", 6 s.
+- **Folder film** (from B). When a drag starts, every folder tile grows a water film over 260 ms (`reflow`, 35 ms stagger). Brought within 13 pt of a folder, the card fuses with its film (accent wash tint, merge haptic) and the notebooks' reflow pauses (`NibReflow.isPaused`). On drop the card flows into the folder with `absorb`, shrinking to 12 % and fading in 220 ms; the folder takes a small gulp (scale 1.03 → 1); the grid closes the gap; a toast: "Moved to Physics 9702 · Undo". Films evaporate 260 ms after the drop.
 - **Sidebar drop** (from C). Over the sidebar the lifted card condenses to 50 % around the finger. The hovered folder row grows a droplet pill from its glyph with "+1"; dropping absorbs the card into the row.
+- **Drop in the grid** reorders: the drop reports the move, `(from, to)` plus the notebooks it now sits after and before. FeatLibraryUI applies it to the grid in the same update (the neighbours are already in their new slots, so nothing moves twice) and records one undoable `library.reorder`, which sets that folder's sort to Manual. The carrier flows into its new slot and the cell shows again when it rests (within 1.2 s).
 - **Release elsewhere** returns the card to its (possibly new) slot with `slot`: only the part of the release velocity that points at the slot, capped at 1200 pt/s and at ω·distance. A 2500 pt/s fling lands on its slot without passing it. Multi-select drags a stacked carrier (up to 3 covers fanned 4°).
+- **Accessibility.** Every cover has "Move earlier" and "Move later" actions (the same `library.reorder`), besides "Move to folder…".
 
 ### 10.13 Settings switch (from B)
 
@@ -596,7 +732,8 @@ Every press is scale 0.96 on `tap` (the Tinted primary, covers, buttons, icon bu
 | **Merge "plip"**: two droplets join, a popover folds back, a card fuses with a folder | (0.45, 0.70) at 0 ms, then (0.20, 0.35) at +18 ms | `.soft` 0.5 |
 | **Split**: a neck pinches, a tether snaps | (0.35, 0.90) | `.rigid` 0.35 |
 | **Bud**: a popover pinches free | (0.30, 0.60) | `.soft` 0.4 |
-| **Snap**: dock or slot arrival | (0.55, 0.40) | `.soft` 0.7 |
+| **Snap**: slot arrival (cards, thumbnails, floating panels) | (0.55, 0.40) | `.soft` 0.7 |
+| **Plip**: the palette lands in its dock, once per landing (§10.11) | (0.40, 0.85) | `.rigid` 0.45 |
 | **Select**: the bead arrives | – | selection |
 | **Armed**: card held over card 380 ms | plip | `.soft` 0.6 |
 | **Detent**: slider presets, 0 %, 100 % | – | selection |
@@ -610,9 +747,9 @@ Every press is scale 0.96 on `tap` (the Tinted primary, covers, buttons, icon bu
 | Setting | Behaviour |
 |---|---|
 | **Reduce Motion** | Every spring becomes `reduced` (0.26 s, ζ 1), including every `NibMotion.x.animation` a component or feature uses. Stretch caps 0, no necks, no poke. A bud becomes a 200 ms cross-fade with scale 0.96 → 1 at the final position. The bead moves with `reduced` (no teardrop). The palette cross-fades to its new dock. Merges still happen (they are geometry). Haptics stay |
-| **Reduce Transparency** | No lens. Droplets become one `chromeOpaque` path union per cluster with the 0.8 pt `waterLine` (no blur, no shader, no shadow: the cheap path, also used when hot); Deep panels become `backgroundSecondary`; Tinted stays accent. The union shape and merges remain; specular, caustic and edge go |
-| **Increase Contrast** | `waterLine` 25 % (light) / 40 % (dark); Clear body 72 %, Deep 90 %; `separator` at 100 % alpha |
-| **Liquid: Full / Calm / Off** (Settings › General › Appearance) | Calm halves every stretch cap and removes necks. Off applies the Reduce Motion and Reduce Transparency fallbacks and silences droplet haptics, whatever the system settings are |
+| **Reduce Transparency** | iOS 26: the system glass frosts itself and stays glass, `nibGlass` included (Apple's own treatment; Nib does not replace it). iOS 17–25: no lens; droplets become one `chromeOpaque` path union per cluster with the 0.8 pt `waterLine` (no blur, no shader, no shadow: the cheap path, also used when hot); Deep panels become `backgroundSecondary`; Tinted stays accent. The union shape and merges remain; the rim, sheen, edge lens and shadow go |
+| **Increase Contrast** | iOS 26: the system's (black or white glass with a contrasting border). iOS 17–25: `waterLine` 25 % (light) / 40 % (dark); Clear body 72 %, Deep 90 %. Both: `separator` at 100 % alpha |
+| **Liquid: Full / Calm / Off** (Settings › General › Appearance) | Calm halves every stretch cap and removes necks. Off applies the Reduce Motion and the iOS 17–25 Reduce Transparency fallbacks (the opaque union, on iOS 26 too) and silences droplet haptics, whatever the system settings are |
 | **Differentiate Without Colour** | AI deletions get "−" markers at line start and numbers; additions are underlined with a 1.5 pt dashed rule; the selected ink also gets its ring |
 | **VoiceOver** | Droplets are containers labelled by function ("Tools", "Pen settings", "Proposed edit: fix period"). The bead is not an element: the selected tool carries the Selected trait and a value ("Pen, selected, Carbon, 0.5 millimetres"). Dragging always has an action equivalent (dock moves, "Move to folder…", "Reorder page"). AI proposals expose Accept and Discard as custom actions on the changed ink, announced as "Proposed change 1 of 3: replace formula". Merges and splits are announced only when they change meaning ("Moved to Chemistry. Undo available.") |
 | **Dynamic Type** | §4.2 |
@@ -625,7 +762,7 @@ Every press is scale 0.96 on `tap` (the Tinted primary, covers, buttons, icon bu
 
 Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, sizes, states and the one rule people get wrong. Every state is in `NibDesignGallery`, which NibTesting snapshots in Light, Dark, Reduce Transparency, Increase Contrast and AX3.
 
-**Common states** (unless a row says otherwise). *Default* as specified. *Pressed*: scale 0.96 on `tap` (plus a poke on droplets); the same 0.96 for every button, icon button and tool. *Selected*: glyph at 100 % (unselected tools 74 %), `.isSelected` trait, never colour alone. *Disabled*: 40 % opacity, no hit testing. *Focus*: 2 pt accent ring 2 pt outside, concentric. *Hover*: system highlight in the control's shape. *Shortcut*: `KeyHint` beside the control after 500 ms of hover and while ⌘ is held; every `NibButton`, `NibIconButton` and `NibTool` takes an optional `KeyboardShortcut`.
+**Common states** (unless a row says otherwise). *Default* as specified. *Pressed*: scale 0.96 on `tap` (plus a poke on droplets); the same 0.96 for every button, icon button and tool. *Selected*: glyph at 100 % (unselected tools 74 %), `.isSelected` trait, never colour alone. *Disabled*: 40 % opacity, no hit testing; every Nib button, icon button, tool, droplet button, option tile and width preset dims itself when `.disabled`, so features never dim by hand. *Focus*: 2 pt accent ring 2 pt outside, concentric. *Hover*: system highlight in the control's shape; icon-only controls (`NibIconButton`, `NibToolButton`, width presets) also show their label as the pointer tooltip (`nibTooltip`), which is not repeated as a VoiceOver hint. *Shortcut*: `KeyHint` beside the control after 500 ms of hover and while ⌘ is held; every `NibButton`, `NibIconButton` and `NibTool` takes an optional `KeyboardShortcut`.
 
 ### 13.1 Surfaces and liquid
 
@@ -633,10 +770,12 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 |---|---|---|---|
 | **`NibDropletContainer`** | One per window, a sibling layer above the canvas. Holds every floating droplet; defines `NibLiquid.space`; runs the physics; draws the water (iOS 17–25) or hosts the `GlassEffectContainer` (26+) | Put bars, palette, HUDs, popovers, chips, toasts and floating panels inside it | Put it inside a ScrollView or List; nest containers; put content (pages, lists) inside it |
 | **`.droplet(_:style:)`** | Presets: `bar`, `hud`, `palette`, `popover`, `panel`, `floatingPanel`, `chip`, `anchor`, `card`, `thumbnail`, `toast`, `primary`, `handle` (rigid: cap 0, no poke), `frame` (rim and outline only, no body: the zoom-window target). `bondsWith:` names the one droplet a `card` may neck with (once a combine arms) | Give every droplet a stable, unique id | Hand-roll a glass or material background; animate a droplet's frame yourself; give a toast a droplet yourself (use `.nibToast`) |
-| **`.nibBackdrop(_:)`** | The frames of light paper under the container (the editor passes its visible pages) | Update it as pages scroll | Pass dark papers (they get no edge or caustic) |
+| **`.nibBackdrop(_:)`** | The frames of light paper under the container (the editor passes its visible pages) | Update it as pages scroll | Pass dark papers (they get no edge lens and the flat-backdrop shadow) |
 | **`.budsFrom(_:isPresented:)`** | Popover presentation that grows out of a droplet or `nibBudAnchor` | Keep the popover in the view tree and toggle `isPresented` | Use `.popover` or `.sheet` for tool settings; pass `instant: false` for keyboard invocations |
-| **`nibGlass`** | The material on one surface with no physics | Use it only outside a container (rare) | Stack it on another glass |
+| **`nibGlass`** | The material on one surface with no physics. iOS 26: the glass is applied to the content itself; `interactive:` for a surface that holds controls | Use it only outside a container (rare); pass `interactive: true` when it holds controls | Stack it on another glass |
 | **`nibCard`** | Opaque surface (folder tiles, study cards, cells) with a radius and optional elevation | Use it for anything that is content, not chrome | Put a border and a wide soft shadow on the same card |
+| **`NibFloatingHost` + `NibFloatingLayer`** | The window's owner places `NibFloatingLayer(host:)` as a full-size child of its container and presents `host.toast` with `.nibToast(host.toastBinding)`; code outside the container (canvas attachments, UIKit editors, library tabs) calls `host.present(id) { … }`, `dismiss(id)`, `setAnchor(id, rect:in:)` and `post(toast)` | Bud popovers from a point on the page (`NibBudPopover(source:)` after `setAnchor`), float HUDs and the Zoom Window `frame`; everything recedes and merges like the chrome | Make a second container or a static `nibGlass` HUD because the chrome is out of reach |
+| **`.onNibBudChange(_:)`** | Reports whether any bud is open in the container | Stop forwarding touches to the canvas while one is open (§10.6.7) | Read the container's internals |
 
 ### 13.2 Chrome
 
@@ -646,6 +785,11 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`NibToolbarItem`** | `NibIconButton(.bar)`: 21 pt Regular glyph in a 40 pt visual, 44 pt hit | – | *On* (e.g. bookmarked): glyph in accent. Requires a label |
 | **`NibBarTitle`** | Title (barTitle) over subtitle (caption1 **semibold, `label`**: §2.4) | Truncates the title first | The subtitle turns `warning` for "Offline · changes saved on this iPad" |
 | **`NibHUD`** | Optional icon button + primary number + secondary part, both in `hud` type and `label` | 40 pt tall, always | Digits change with no animation. Capped at xxxLarge |
+| **`NibHUDGroup` + `NibHUDText`** | A `hud` droplet holding any mix of `NibHUDText` (primary + lighter secondary, both `label`), `NibIconButton(.bar)`s, `NibStatusDot` and `NibWaveform` | 40 pt tall, 4 pt inner padding | "3 of 11" with previous and next, the presenter HUD, the recording HUD, "Following Sam · Stop", the bridge status pill. Capped at xxxLarge |
+| **`NibDropletButton`** | One droplet that is one button: glyph and/or title (`button` type) with an optional detail line (caption1 semibold `label`, the one small type allowed on Clear); `tinted` (accent, `onAccent`) or `clear` | ≥ 44 × 44; icon-only is 44 × 44 | The library's "+ New" (Tinted, at most one per screen), the iPhone search and New droplets, the study grading droplets (Again · Hard · Good · Easy + next interval: §14.11's caption2 becomes caption1 semibold to meet §2.4). Large Content Viewer; capped at xxxLarge |
+| **`NibStatusDot`** | 6 pt dot: `unseen` (accent), `connected` (success), `recording` (destructive), `warning` | 6 | Never the only signal: beside a label, or the element carries a value |
+| **`NibPresenceStack`** | Up to three 22 pt `presence` beads after the title, then a "+N" bead; compact: one bead and the count | 22 pt beads, 4 pt apart | VoiceOver reads the names as a list |
+| **`NibWaveform`** | 2 pt bars 4 pt apart in `labelSecondary`, newest on the right, at least 2 pt tall | 24 bars × 20 pt by default | Redraws when its levels change; nothing moves on its own |
 | **`NibToast`** | Deep capsule: one line of callout + one action (accent) | ≥ 48 pt tall, ≤ 480 wide, bottom-centre 24 pt above the safe area | Presented only through `.nibToast($item)`, which places it, buds it up from below, dismisses it after 6 s (paused while VoiceOver runs), replaces any toast already showing and posts it as a VoiceOver announcement |
 
 ### 13.3 Tools
@@ -654,29 +798,38 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 |---|---|---|---|
 | **`NibToolPalette`** | Tools, More, a 17 pt divider slot, quick swatches, then plugin tools after a second divider, the bead, the selected tool's popover | 56 pt thick; 44 pt pitch (46 iPhone); 6 pt ends; 469 pt for 6 tools + More + 3 inks. At the type cap thickness grows to 64 and pitch to 52 (54 iPhone) | Tap selects; tapping the selected tool buds its settings; tapping More buds a grid of the other tools (the bead stays put); drag the body to dock; scrub the bead (never onto More). Plugin tools carry a 5 pt dot. Too many tools for the dock's length: the least recently used collapse into More, never the selected tool. A tool chosen from More takes the last native slot. Capped at xxxLarge |
 | **`NibToolButton`** | 23 pt Medium glyph (28 at cap), passing-lens scale | 44 × 44 | Unselected 74 %, selected 100 % within 120 ms; Large Content Viewer. A pen or pencil glyph's colour stripe shows the current ink; the highlighter's shows the current highlight colour; no other glyph is tinted. VoiceOver value: "Carbon, 0.5 millimetres" |
-| **`NibToolOptionsBar`** | The active tool's contextual options (a tool's `activeToolMenu`): a Clear `bar` droplet | 44 pt tall | Fused (1 pt overlap) to the palette's far side, level with the selected tool; rendered by the palette, so tools never place it themselves |
-| **`NibPenSwatch`** | Flat circle + 0.5 pt hairline; selected: 2 pt label ring 2.5 pt outside | 22 (palette), 26 (popover), 28 (iPhone) in a 44 pt cell | Chalk (light mode) and Carbon and Midnight (dark mode) keep a 1 pt `swatchRing` always. Never glossy |
-| **Selection bead** | Head r 20, tail r 15.6, neck ≥ 22.5 pt, `beadBody` + ink 15 % + rim. No shadow, no specular | – | Not an accessibility element |
+| **`NibToolOptionsBar`** | The active tool's contextual options (a tool's `activeToolMenu`): a Clear `bar` droplet | 44 pt tall | Fused (1 pt overlap) to the palette's far side, level with the selected tool; rendered by the palette, so tools never place it themselves. `NibToolPalette(toolOptions:)` returns a `NibToolOptions`: the bar and, optionally, one `NibToolOptionsPopover` budded from a `nibBudAnchor` inside the bar (the thickness slider, the colour editor), which the palette places with its own rule and closes when the tool changes |
+| **`NibToolPalette` hooks** | `settingsPresented:` and `morePresented:` mirror the settings popover and the More grid both ways; `onReselect:` reports a tap on the selected tool | – | The chrome opens the settings popover from a chevron in the options bar, keeps one popover open at a time, and guards canvas touches while one is open. `NibTool(shortcut:registersShortcut: false)` shows the tool key as a `KeyHint` without registering it twice (`nibShortcutHint`) |
+| **`NibPenSwatch`** | Flat circle + 0.5 pt hairline; selected: 2 pt label ring 2.5 pt outside | 22 (palette), 26 (popover), 28 (iPhone) in a 44 pt cell (`NibPenSwatch.Size.diameter`) | Chalk (light mode) and Carbon and Midnight (dark mode) keep a 1 pt `swatchRing` always. Never glossy. A tape swatch tiles its `NibSwatchPattern` over the colour inside the same circle (`NibSwatch(pattern:)` or `NibPenSwatch(_:pattern:)`); VoiceOver reads "Cobalt, Dots". UIKit bars use `UIImage.nibSwatch(_:size:isSelected:)`, drawn for light and dark in one image |
+| **`NibSwatchGrid`** | `NibPenSwatch`es in a grid, optionally led by a None well (empty circle, diagonal hairline) | 44 pt cells, 6 columns in a popover (12 inks = 6 × 2) | Selection by swatch id (None = nil). "Custom…" is the enclosing `NibInspectorSection`'s link. `NibSwatch(highlighter:)`, `(paper:)`, `(cloth:)`, `(folder:)`, `(id:hex:name:)` ring a colour the way inks are ringed (luminance > 0.8 in light mode, < 0.035 in dark mode) |
+| **`NibHandleView` / `NibFrameView`** (UIKit) | A rigid 12 pt handle bead in a 44 pt view: `clear` (Clear body over paper, rim, 0.8 pt water line, E1; `chromeOpaque` under Reduce Transparency) or `tinted` (accent, Tinted rim). The Zoom Window box: rim and water line only, radius 18 | 44 × 44; any box size | For canvas attachments, which cannot reach the container: handles never deform anyway (§10.15). Inside the container the box is `.droplet(style: .frame)` through `NibFloatingHost` |
+| **`NibOptionTile`** | Glyph (`NibOptionGlyph`, 22 pt) or small preview over a caption2 label | ≥ 52 pt tall, full cell width | Selected on `fill3` (radius 10), label `label`; others `labelSecondary`. Pen types, shape kinds, tape patterns, the More grid |
+| **Selection bead** | Head r 20, tail r 15.6, neck ≥ 22.5 pt, `beadBody` + ink 15 % + the key rim (iOS 17–25; none inside iOS 26 glass). No shadow, no sheen | – | Not an accessibility element |
 | **`NibPopoverPanel` / `NibBudPopover`** | Title (headline) + optional subtitle; content in `NibInspectorSection`s | 312 wide (iPhone 345: screen − 48), padding 16, scrolls past 520 | Deep; buds; one popover open at a time. `NibBudPopover(placement:)` positions itself from its source (§10.6) |
 | **`NibInspectorSection`** | Label (footnote semibold secondary) + value (hud) or link (accent, 44 pt hit) + content | 8 pt label-to-content | – |
 | **`NibInspectorRow`** | Optional 24 pt glyph, title, subtitle, accessory | ≥ 44 pt | – |
 | **`NibSlider`** | 4 pt `fill1` track, `label` fill, 28 pt white bead thumb | 44 pt tall | Thumb stretches up to **0.10** with speed (`thumb` spring, about its grab side) and settles in one small undershoot; detent haptics |
-| **`NibStrokeWidthSlider`** | Three preset dots (5, 8, 12 pt) + value in mm + bead slider | Presets 44 × 40 | Selected preset on `fill3` |
+| **`NibStrokeWidthSlider`** | Three preset dots (5, 8, 12 pt) + value in mm + bead slider | Presets 44 × 40 | Selected preset on `fill3`. `init(width:range:presets:title:unit:)` titles it and measures in `.millimetres` ("0.50 mm") or `.points` ("12 pt", the eraser's Size) |
+| **`NibWidthPresetButton`** | One preset: a `label` dot (`NibMetrics.widthPresetDot(index)`: 5, 8, 12 pt) in a 44 × 40 cell | 44 pt hit | Selected on `fill3` (radius 12). The slider's presets, the Pencil palette's widths, options bars: a thickness looks the same everywhere. A hover outline of a width is a `NibStroke.hairline` circle |
 | **`NibSegmentedControl`** | `fill3` track (radius 9, 2 pt inset), `backgroundTertiary` knob (radius 7, E1) | 32 pt visual; each segment's hit area is 44 pt tall | Knob glides on `tap`; selected label semibold |
 
 ### 13.4 Controls and text
 
 | Component | Anatomy | Sizes | States and notes |
 |---|---|---|---|
-| **`NibButton`** | Capsule; optional glyph; `button` type. Kinds: primary (accent fill), secondary (`fill3`), destructive (`destructive` text on `fill3`: never a red fill), plain (accent text) | ≥ 44 pt regular, 38 pt compact visual (44 hit); two lines at AX sizes | Label is verb + object ("Create Notebook", "Delete 4 items"). One filled primary per surface |
+| **`NibButton`** | Capsule; optional glyph; `button` type. Kinds: primary (accent fill), secondary (`fill3`), destructive (`destructive` text on `fill3`: never a red fill), plain (accent text), destructivePlain (`destructive` text, no fill) | ≥ 44 pt regular, 38 pt compact visual (44 hit); two lines at AX sizes | Label is verb + object ("Create Notebook", "Delete 4 items"). One filled primary per surface. destructivePlain is for a destructive action outside the surface's button row (the eraser's "Clear Page"), always confirmed by the system |
 | **`NibIconButton`** | Glyph in a 40 pt visual; `round` = 30 pt `fill3` disc; `send` = 32 pt `fill3` disc with a `label` arrow | 44 hit | Always has an accessibility label |
 | **`NibToggle`** | System switch on iOS 26; squash thumb (§10.13) below | 51 × 31 | Green when on |
 | **`NibSearchField`** | Magnifier, field, clear button | ≥ 44 pt capsule | `filled` on opaque surfaces (`fill4`), `onDroplet` inside a Clear droplet (no fill) |
 | **`NibField`** | Field on `fill4`, radius 22 (`NibRadius.composer`), grows to 5 lines | ≥ 44 pt | Placeholder in `labelTertiary`, focus ring accent |
 | **`NibChip`** | Context (removable, `fill3`, ≥ 28 pt, remove button with a 28 × 44 hit area), citation (accent wash, radius 6, 20 pt visual inline, 44 pt hit), filter (selected on `fill2`) | Never wraps | Context chips say exactly what the model reads |
-| **`NibBadge`** | Type (20 pt white square on covers), number (22 pt accent disc, SF Rounded bold), destructive number, count, "Plugin" capsule, presence (22 pt initials) | – | – |
+| **`NibBadge`** | Type (20 pt white square on covers), number (22 pt accent disc, `badgeNumber`), destructive number, count, "Plugin" capsule, presence (22 pt initials), principal (glyph + "You" / "Assistant" / "Plugin" / "Bridge" / "Collaborator" on a `fill3` capsule; the assistant's drop in accent), capsule (any short word: "Update") | – | `NibPrincipalKind(principal)` maps a command's principal |
 | **`KeyHint`** | Keys in caption2 on `fill3`, radius 6 | ≥ 22 × 20 | Shown while ⌘ is held, after 500 ms of hover, in menus and in ⌘K |
-| **`NibProgressBar`** | A 3 pt `fill1` track with a `label` fill, capsule ends | 3 pt tall | The only determinate progress (export, import, study sessions); never a liquid loader |
+| **`NibProgressBar`** | A 3 pt `fill1` track with a `label` fill, capsule ends | 3 pt tall | The only determinate progress (export, import, study sessions); never a liquid loader. `style: .critical` fills in `destructive` (a timer's last seconds) |
+| **`NibSecureField`** | Secure field on `fill4`, radius 10, with a show/hide eye (44 pt) | ≥ 44 pt | Passwords, API keys, tokens: only in Settings and the lock prompt. Privacy-sensitive (redacted in snapshots) |
+| **`NibCodeBlock`** | `code` type on `fill4`, radius 12, selectable, optional Copy icon button | – | Only for the developer console, raw tool calls and pasteable configuration (the bridge's `claude mcp add …`). The caller writes the pasteboard |
+| **`NibQRCode`** | Black modules on a white card (radius 10, 12 pt quiet zone), no interpolation | Square, any size | Pairing and joining. White in dark mode too; VoiceOver reads its label |
+| **`NibBanner`** | Glyph (`warning` triangle or `info`), one or two lines of callout, at most one plain accent action, on `fill4` radius 12 | ≥ 44 pt | Sync conflicts, a newer-format document, safe mode, offline, the assistant's inline error with Retry (§14.18). Never glass, never a toast |
 | **`NibPageBeads`** | Onboarding progress: 8 pt beads 8 pt apart, the selection bead gliding between them | – | Not a page control people swipe; VoiceOver reads "Step 2 of 4" |
 | **`NibEmptyState`** | 44 pt glyph in tertiary, New York title, one sentence, ≤ 1 primary + 1 secondary | ≤ 420 wide | No illustration, no mascot, no confetti |
 
@@ -686,9 +839,14 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 |---|---|---|---|
 | **`NibDocumentCard`** | Cover (5/8 radii, `cover` elevation), title (footnote semibold, 2 lines), subtitle (caption1, star for favourites), type badge | 140 × 182 (iPhone 110 × 143) | Lifted: 3 pt envelope, `coverLifted`, title hidden. Absorbed: 12 % and faded toward the folder. Select mode: a check bead on the cover (`isSelected`). Tap: press scale then open |
 | **`NibClothCover`** | Flat cloth, spine, band | – | No printed title, no gradient |
-| **`NibFolderTile`** | Folder glyph in folder colour, full name (one line, tail truncation), count, on `backgroundSecondary` | 78 tall, width from the grid (§5), radius 14 | Targeted: water film; fused: accent wash + 1.03 |
+| **`NibFolderTile`** | Folder glyph in folder colour, full name (one line, tail truncation), count, on `backgroundSecondary` | 78 tall, width from the grid (§5), radius 14 | Targeted: water film; fused: accent wash + 1.03. `glyph: NibFolderGlyph` shows another symbol in the folder colour or the emoji the person chose (their content, not Nib's iconography); `NibFolderGlyphView` draws the same glyph in rows and menus |
 | **`NibSidebarRow`** | 22 pt Regular glyph, title (body, one line, tail truncation), count (secondary, right) | 44 pt, radius 10 selection on `fill3` | Selected: semibold title, accent glyph. The same full folder name as the tiles ("Computer Science 9618") |
 | **`NibPageThumbnail`** | Page render (radius 4, paper elevation), number (caption1) | 176 wide in the navigator | Current: 2 pt accent ring 3 pt outside (radius 7), accent number. Select mode: check bead. Reorder: `.droplet(style: .thumbnail)` |
+| **`NibMiniPageThumbnail`** | Page render, radius 4, paper elevation, no number | 40 wide (`rowThumbnailWidth`) | Bookmark and outline rows; decorative for VoiceOver. `NibPageThumbnail(…, width: NibMetrics.rowThumbnailWidth, showsNumber: false)` keeps the current ring and check bead without the number |
+| **`NibPageThumbnailView`** (UIKit) | The same render for table cells: radius 4, paper elevation, a paper-coloured placeholder while loading, the current-page ring | 40 wide by default; height from `aspectRatio` | Outline and bookmark tables that need UIKit drag and drop. Not an accessibility element: the row speaks |
+| **`NibOutlineRow`** | Optional disclosure chevron (28 pt, 44 pt hit), optional leading preview, title (body; semibold when selected), page in `hud` secondary | ≥ 44 pt; 16 pt indent per level, stopping at level 4 | Selected on `fill3` (radius 10). Outline and bookmark tabs, the text-document outline. Opaque or Deep surfaces only |
+| **`NibPaperTile` + `.nibSelectionRing`** | A paper, template or cover render (radius 4, paper elevation) with its name (caption1) | 104 × 135 in the paper grid, 88 × 116 in the cover strip | Selected: the 2 pt accent ring 3 pt outside and the name in accent, the one selection language per sheet. `.nibFadeBottomEdge()` fades the grid's last 16 pt |
+| **`NibFlashcard`** | A paper card (radius 20, E1) with a front and a back | `studyCardSize` 560 × 360 (iPhone: width − 32) | Flips around Y with `sheet`, each face only on its own half-turn; Reduce Motion cross-fades; VoiceOver reads the face that shows |
 
 ### 13.6 Assistant and plugins
 
@@ -699,6 +857,9 @@ Feature UI is composed only of these (`NibDesign`). Each row gives anatomy, size
 | **`NibProposalChip` + `NibTether`** | Chip (drop mark, change name in 15 pt semibold, Accept disc, Discard) docked in the page's trailing margin, clear of ink; while it is dragged it hangs from a 26 pt anchor bead on the change by a water stem | 204 × 44. Pull: the anchor grows on the change, the stem thins and pinches at 65 pt, leaving a 5 pt satellite; release: flows back to its dock with `tether`, then the anchor dries away. Never refracts |
 | **`NibPanelHeader`** | Glyph in a 30 pt `fill3` disc, title (headline), subtitle (caption1 secondary), optional badge, optional More menu, round Close | 60 pt minimum, grows with Dynamic Type. The header of the assistant, plugin panels, the transcript and comments |
 | **`NibPluginPanelChrome`** | `NibPanelHeader` with the "Plugin" badge and the More menu (Reload, Permissions, Report a Problem); content below a soft hairline | 344 wide (420 at AX sizes). The plugin draws only inside; it cannot draw glass |
+| **`NibTraceRow`** | caption1 `labelSecondary` text after a small activity indicator (running), a `success` check (done) or a `warning` triangle | The assistant's tool trace and every AI loading state (§14.18); never a pulsing bead. VoiceOver adds "In progress" while running |
+| **`NibPermissionRow`** | 24 pt glyph + the permission as a plain sentence (body) + accessory (its `NibToggle`) | In an update's diff: added in accent with "+", removed struck through in `labelSecondary`; VoiceOver says "Added" / "Removed" first |
+| **`NibWebTokens`** | `stylesheet(for:)`: every colour, spacing, radius and type token as `--nib-…` CSS variables for the traits, `color-scheme`, body text in `label` at `-apple-system-body`, a transparent page | Plugin HTML panels inject it at document start and again when the traits change |
 
 ### 13.7 Sheets and lists
 
@@ -723,7 +884,8 @@ Frames in points. iPad Pro 11″ landscape 1194 × 834, portrait 834 × 1194 (13
 - **Sidebar** 320 pt, opaque `backgroundSecondary` (no glass in navigation). "Library" (display) at y 80. `NibSidebarRow`s, 44 pt with 12 pt insets: Documents, Favourites, Shared, Recents, Study Sets, Gallery, Trash, with counts right-aligned in secondary. The selected row is on `fill3` with a semibold label and an accent glyph. "Folders" disclosure lists folders with their coloured glyphs and full names. The bottom row shows sync ("OneDrive · Up to date") and Settings.
 - **Content**: "Documents" (display) at x 344, y 80, with "23 items · Date modified" (caption1). "Folders" (title3), then four folder tiles 78 tall on the 24 pt gutter (188.5 pt wide in 11″ landscape). "Notebooks" (title3), then the cover grid (164 pt pitch). Every library measure sits on the 24 pt gutter.
 - **Floating chrome** (droplet container), top-right at y 32: a Clear bar (Search, Sort, Select; 3 × 44 + 8) and, 16 pt away, the Tinted "+ New" droplet (96 × 44), which buds the New menu (Notebook, QuickNote, Whiteboard, Text document, Study set, Import files, Scan document).
-- **Liquid moments**: §10.12 (lift, reach, combine, folder film, sidebar drop, absorb, toast with Undo).
+- **Liquid moments**: §10.12 (lift, live reflow, combine, folder film, sidebar drop, absorb, toast with Undo).
+- **Reorder**: press and hold a cover (0.3 s), then drag it: the other covers spring aside with `reflow` and the gap follows the finger (24 pt hysteresis, so it never flickers); drop to put it there. That records one undoable `library.reorder` and sets the folder's sort to **Manual** ("23 items · Manual"); choosing another sort keeps the manual order for when Manual is chosen again. Holding over another cover's centre for 380 ms combines instead; over a folder tile it files the notebook. VoiceOver: "Move earlier" / "Move later" on every cover.
 - **Select mode**: covers show check beads; a Clear action bar buds up at the bottom centre (Move, Share, Duplicate, Favourite, Delete). Delete asks with a system confirmation dialog.
 - **Context menu** on a cover: the system context menu with a cover preview.
 
@@ -749,13 +911,15 @@ Frames in points. iPad Pro 11″ landscape 1194 × 834, portrait 834 × 1194 (13
 
 **iPad portrait**: the page fits 800 pt wide. The palette docks at the top, horizontal, below the bars; popovers bud downward.
 
-**iPhone (mockup 04)**: the page fits the width with 12 pt desk margins. Leading bar (back + truncated title, 212 × 44), trailing bar (Undo, Assistant, More; 3 × 44 + 8). Palette horizontal at the bottom, 8 pt above the home indicator: Pen, Highlighter, Eraser, Lasso, Text, More, then one ink (349 × 56). **The canvas has a bottom content inset of 80 pt (palette 56 + 8 + 16)**, so the last line can always scroll above the palette; the palette's rim lens is halved there (§10.9) so ink passing under it never doubles. Popovers bud upward, 345 pt wide. The page HUD hides while scrolling (150 ms fade).
+**iPhone (mockup 04)**: the page fits the width with 12 pt desk margins. Leading bar (back + truncated title, 212 × 44), trailing bar (Undo, Assistant, More; 3 × 44 + 8). Palette horizontal at the bottom, 8 pt above the home indicator: Pen, Highlighter, Eraser, Lasso, Text, More, then one ink (349 × 56). **The canvas has a bottom content inset of 80 pt (palette 56 + 8 + 16)**, so the last line can always scroll above the palette; the palette's rim lens is a narrow band there (§10.9: w and A scale with its 56 pt thickness), so ink passing under it is compressed at the rim, not smeared. Popovers bud upward, 345 pt wide. The page HUD hides while scrolling (150 ms fade).
 
 **Read-only mode**: the palette retracts into the leading bar (a reverse bud); the bar's subtitle reads "Read only" with `lock`; tapping it offers "Edit".
 
 **Locked document**: the page is replaced by a paper-coloured field with `lock` at 44 pt, "Locked" (emptyTitle) and a Face ID button.
 
 ### 14.3 Tool palette and tool settings (mockup 02)
+
+**Docking.** Drag the palette's body (dragging along the axis from the selected tool scrubs the bead instead) and it is a bead of water: it lifts to 1.035, its rim brightens, it trails the finger by v × 27 ms, stretches with its speed and dips once as it slows (§10.1–10.3). Near a dock (the finger within 200 pt of it, 160 on iPhone; the top counts 40 pt more) a meniscus reaches out and fuses at 20 pt. Released or flung, it snaps to the dock the projected finger is within capture of, with `snap`, and plips once as it lands; a mid-page drop flows home. Left and right re-form between vertical and horizontal (§10.10). iPhone: top and bottom only. `toolbar.dock` moves it from ⌘K, plugins and the assistant (§10.11).
 
 The palette is `NibToolPalette`: six everyday tools by default (pen, highlighter, eraser, lasso, shapes, text) and **More** (`ellipsis`), which buds a grid of the occasional ones (image, tape, elements, laser, ruler); a divider, three quick inks, then plugin tools after a second divider. That is 469 pt, less than Goodnotes exposes by default. The toolbar customisation sheet (from More › Customise Toolbar) is an opaque list with reorder handles, hide (−) and show (+), and saved layouts; people who want all ten tools on the palette put them there. Every tool popover is a Deep `NibPopoverPanel` budded from its tool; sections below are `NibInspectorSection`s, top to bottom. A tool's contextual options (`activeToolMenu`) appear in a `NibToolOptionsBar` fused to the palette's far side.
 
@@ -1007,7 +1171,8 @@ A reviewer rejects a change that fails any line. "Slop" is anything someone coul
 - [ ] Every icon-only control is labelled; state is never colour alone; every drag has an action.
 - [ ] Focus rings visible for Full Keyboard Access, outside the control and concentric with it; hover is the system highlight; every shortcut shows its `KeyHint`.
 - [ ] Text ≤ 14 pt on a droplet passes 4.5:1 over black ink (§2.4); `labelSecondary` never on Clear.
-- [ ] Nothing page-resident sits over ink or refracts it; edge and caustic only over light paper.
+- [ ] Nothing page-resident sits over ink or refracts it; the edge lens only over light paper.
+- [ ] Nothing painted on iOS 26 system glass except the held rim; one glass variant (Regular), the accent the only tint; rims follow the light (never a uniform stroke) and every optic stays in the outer 4.5 pt.
 - [ ] A tap outside a popover dismisses it and never inks.
 
 **Trust (AI and plugins)**
@@ -1051,5 +1216,7 @@ A reviewer rejects a change that fails any line. "Slop" is anything someone coul
 | Water, not jelly: `wobble` ζ 0.68 at 0.14–0.26 s, rendered stretch clamped to its cap, slider thumb cap 0.10, `glide`/`trail` ζ 1, `slot` for grid snaps, `reform` for re-forming, the stretch-axis regime blended; rigid handles; no ripple | Second critique (measured jelly and overshoot in the mockup) |
 | Bud content clipped by the body's own geometry; page-resident droplets never over ink and never refracting; the chip docked in the margin with its stem only while dragged; badges all in the margin; no ghost outline | Second critique |
 | Text on Clear as a measurable contrast rule; Clear core blur 5 pt; edge and caustic over light paper only; dark Clear 80 % over paper; Tinted without water optics; bead without shadow | Second critique |
+| Liquid Glass v2: nothing painted on iOS 26 glass at rest; Regular everywhere with the accent the only tint; `interactive()` where the glass takes the touch; a 0.8 pt rim lit from the top-left with a counter-rim at half; sheen, edge lens and shadow in place of specular, caustic and dark ring; a clear core deeper than 4.5 pt; the held rim at 1.5×; an outward, banded lens in the mockup | Redo pass against Apple's iOS 26 Liquid Glass (user feedback on the mockup: "rim / highlights wrong", §10.9) |
 | Recede by page overlap or 24 pt from the stroke (broader than the killed proximity-only rule: everything over the page still recedes); docked panels clear of the canvas stay readable | Second critique |
 | Six tools + More (469 pt); composer without "+" and with Send only when there is text; one filled button per proposal card; 24 pt library gutter; en-GB copy | Second critique |
+| Mockup v2 (`design/mockup.html`): the v2 optics drawn in SVG (union rim from key and counter lobes, sheen, outline; each droplet's exact body joined to the metaball so the rim sits on the lens edge; necks in Clear's body tint), the outward banded lens over a blurred core, the water's own shadow and the held rim on the held droplet only; the palette's water dock (capture radius, fling projection, meniscus, one plip, persisted dock) and the library's live reflow with Undo, number for number with `DropletDockModel` and `NibReflowModel` | User feedback on the mockup: "fix all the liquid glass things", reordering notebooks should move the others, the toolbar should snap and feel like a bead of water while held |
