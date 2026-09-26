@@ -4,11 +4,12 @@ import Combine
 import NibContracts
 import NibDesign
 
-/// The Audio sidebar tab (S-045, S-047, S-048, S-056, S-088, S-116; DESIGN.md §14.13): the recorder (dot, clock, live
-/// waveform, Pause and Stop) while recording, the document's clips (tap to play; Rename, Share, Delete and other
-/// features' actions from `MenuLocation.audioClip`), and the playback bar (play/pause, ±10 s, the document timeline
-/// with a dot where each clip starts, speed, skip silence, noise reduction). It sits inside the sidebar's Deep panel,
-/// so it draws no droplets of its own. Every action runs an `audio.*` command.
+/// The Audio sidebar tab (S-045, S-047, S-048, S-116; DESIGN.md §14.13 "Recordings list"): a compact row for the
+/// app-wide recording (Stop, and Show when it records elsewhere), Record Audio, and the document's clips (date,
+/// duration, page; tap to play; Rename, Share, Delete and other features' actions from `MenuLocation.audioClip`). The
+/// recording HUD and the playback bar are chrome overlays (RecorderHUD, AudioPlaybackBar), so they stay on screen
+/// with the tab closed. It sits inside the sidebar's Deep panel, so it draws no droplets of its own. Every action
+/// runs an `audio.*` command.
 struct AudioPanelView: View {
     @ObservedObject var audio: AudioController
     @StateObject private var model: AudioPanelModel
@@ -27,9 +28,6 @@ struct AudioPanelView: View {
 
     private var app: NibApp { model.app }
 
-    /// Clips that can play: everything but the one being recorded.
-    private var playable: [AudioClip] { model.clips.filter { $0.id != audio.recording?.clip } }
-
     var body: some View {
         VStack(spacing: 0) {
             notices
@@ -43,12 +41,6 @@ struct AudioPanelView: View {
                 }
             } else {
                 clipList
-                if let doc = model.doc, !playable.isEmpty {
-                    Rectangle()
-                        .fill(NibColor.separatorSoft)
-                        .frame(height: 0.5)
-                    AudioPlaybackBar(audio: audio, doc: doc, clips: playable, perform: execute)
-                }
             }
         }
         .onAppear { model.start() }
@@ -65,7 +57,7 @@ struct AudioPanelView: View {
         } message: { pending in
             Text(pending.message)
         }
-        .sheet(item: $share) { item in
+        .sheet(item: $share, onDismiss: removeShareCopies) { item in
             ShareSheet(url: item.url)
                 .ignoresSafeArea()
         }
@@ -80,65 +72,37 @@ struct AudioPanelView: View {
 
     @ViewBuilder
     private var notices: some View {
+        if audio.microphoneDenied {
+            NibBanner(String(localized: "Microphone access is off for Nib. Turn it on in Settings to record."),
+                      symbol: .microphone,
+                      action: NibAction(String(localized: "Open Settings"), handler: openSettings))
+                .padding(.horizontal, NibSpacing.s)
+                .padding(.top, NibSpacing.s)
+        }
         if let message = failure ?? audio.lastError {
-            notice(message) {
+            NibBanner(message, action: NibAction(String(localized: "Dismiss"), handler: {
                 failure = nil
                 audio.lastError = nil
-            }
-        }
-        if audio.microphoneDenied {
-            HStack(alignment: .top, spacing: NibSpacing.s) {
-                Image(nib: .warningTriangle)
-                    .font(NibFont.footnote)
-                    .foregroundStyle(NibColor.warning)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: NibSpacing.xxs) {
-                    Text(String(localized: "Microphone access is off for Nib. Turn it on in Settings to record."))
-                        .font(NibFont.footnote)
-                        .foregroundStyle(NibColor.label)
-                    Button(String(localized: "Open Settings")) {
-                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
-                    }
-                    .font(NibFont.footnoteEmphasis)
-                    .foregroundStyle(NibColor.accent)
-                    .buttonStyle(.plain)
-                    .frame(minHeight: NibMetrics.hitTarget, alignment: .leading)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, NibSpacing.m)
+            }))
+            .padding(.horizontal, NibSpacing.s)
             .padding(.top, NibSpacing.s)
         }
     }
 
-    private func notice(_ message: String, dismiss: @escaping () -> Void) -> some View {
-        HStack(alignment: .top, spacing: NibSpacing.s) {
-            Image(nib: .warningTriangle)
-                .font(NibFont.footnote)
-                .foregroundStyle(NibColor.warning)
-                .accessibilityHidden(true)
-            Text(message)
-                .font(NibFont.footnote)
-                .foregroundStyle(NibColor.label)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            NibIconButton(.xmark, label: String(localized: "Dismiss"), size: .round, action: dismiss)
-        }
-        .padding(.leading, NibSpacing.m)
-        .padding(.top, NibSpacing.xs)
+    private func openSettings() {
+        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
     }
 
-    // MARK: Recorder
+    // MARK: Recording
 
     @ViewBuilder
     private var recorder: some View {
         if let r = audio.recording {
-            if r.doc == model.doc {
-                RecorderView(audio: audio, paused: r.pausedAt != nil,
-                             pause: { execute("audio.record", ["action": .string(r.pausedAt == nil ? "pause" : "resume")]) },
-                             stop: { execute("audio.record", ["action": "stop"]) })
-            } else {
-                elsewhere(r)
-            }
+            RecordingRow(audio: audio, recording: r, elsewhere: r.doc == model.doc ? nil : title(of: r.doc),
+                         show: { execute(CommandIDs.docOpen, ["doc": .string(NodeRef.document(r.doc).description)]) },
+                         stop: {
+                             execute("audio.record", ["doc": .string(NodeRef.document(r.doc).description), "action": "stop"])
+                         })
         } else if model.doc != nil && !model.clips.isEmpty {
             NibButton(String(localized: "Record Audio"), symbol: .record, kind: .primary, expands: true) { startRecording() }
                 .padding(.horizontal, NibSpacing.m)
@@ -146,34 +110,8 @@ struct AudioPanelView: View {
         }
     }
 
-    /// One recording app-wide: from another document's tab it can be found and stopped.
-    private func elsewhere(_ r: AudioController.Recording) -> some View {
-        let title = app.services.library?.node(r.doc)?.title ?? String(localized: "another document")
-        return HStack(spacing: NibSpacing.s) {
-            Circle()
-                .fill(NibColor.destructive)
-                .frame(width: 10, height: 10)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(String(localized: "Recording"))
-                    .font(NibFont.headline)
-                    .foregroundStyle(NibColor.label)
-                Text(String(localized: "In \u{201C}\(title)\u{201D}"))
-                    .font(NibFont.caption1)
-                    .foregroundStyle(NibColor.labelSecondary)
-                    .lineLimit(2)
-            }
-            Spacer(minLength: 0)
-            NibButton(String(localized: "Show"), kind: .plain, size: .compact) {
-                execute(CommandIDs.docOpen, ["doc": .string(NodeRef.document(r.doc).description)])
-            }
-            NibIconButton(.stop, label: String(localized: "Stop Recording"), size: .panel) {
-                execute("audio.record", ["action": "stop"])
-            }
-        }
-        .padding(.leading, NibSpacing.m)
-        .padding(.vertical, NibSpacing.xs)
-        .accessibilityElement(children: .contain)
+    private func title(of doc: DocumentID) -> String {
+        app.services.library?.node(doc)?.title ?? String(localized: "another document")
     }
 
     // MARK: Clips
@@ -193,12 +131,13 @@ struct AudioPanelView: View {
     private func row(_ clip: AudioClip) -> some View {
         let doc = model.doc
         let recordingThis = audio.recording?.clip == clip.id && audio.recording?.doc == doc
+        let saving = doc.map { audio.isFinalising($0, clip.id) } ?? false
         let current = audio.playback.map { $0.clip == clip.id && $0.doc == doc } ?? false
         let playing = current && audio.playback?.isPlaying == true
         let items = menuItems(clip)
-        return AudioClipRow(clip: clip, subtitle: subtitle(clip, recording: recordingThis), isCurrent: current,
-                            isPlaying: playing, isRecording: recordingThis) {
-            guard let doc, !recordingThis else { return }
+        return AudioClipRow(clip: clip, subtitle: subtitle(clip, recording: recordingThis, saving: saving),
+                            isCurrent: current, isPlaying: playing, isRecording: recordingThis) {
+            guard let doc, !recordingThis, !saving else { return }
             if playing {
                 execute("audio.pause", [:])
             } else {
@@ -216,7 +155,7 @@ struct AudioPanelView: View {
                     run(item, clip)
                 } label: {
                     Label {
-                        Text(item.title)
+                        Text(item.resolvedTitle(for: menuContext(clip)))
                     } icon: {
                         if let symbol = item.icon.flatMap(NibSymbol.init(systemName:)) { Image(nib: symbol) }
                     }
@@ -226,24 +165,33 @@ struct AudioPanelView: View {
         .accessibilityActions {
             Button(String(localized: "Rename")) { startRename(clip) }
             ForEach(items, id: \.id) { item in
-                Button(item.title) { run(item, clip) }
+                Button(item.resolvedTitle(for: menuContext(clip))) { run(item, clip) }
             }
         }
     }
 
-    private func subtitle(_ clip: AudioClip, recording: Bool) -> String {
+    private func subtitle(_ clip: AudioClip, recording: Bool, saving: Bool) -> String {
         let when = Date(timeIntervalSince1970: clip.start).formatted(date: .abbreviated, time: .shortened)
         var parts = [when]
-        parts.append(recording ? String(localized: "Recording") : AudioText.clock(clip.duration))
+        if recording {
+            parts.append(String(localized: "Recording"))
+        } else if saving {
+            parts.append(String(localized: "Saving…"))
+        } else {
+            parts.append(AudioText.clock(clip.duration))
+        }
         if let page = clip.page, let number = model.pages[page] { parts.append(String(localized: "Page \(number)")) }
         return parts.joined(separator: " · ")
     }
 
+    private func menuContext(_ clip: AudioClip) -> MenuContext {
+        MenuContext(app: app, session: model.session, doc: model.doc, page: clip.page,
+                    ref: model.doc.map { NodeRef.audio($0, clip.id).description })
+    }
+
     private func menuItems(_ clip: AudioClip) -> [MenuItemDescriptor] {
-        guard let doc = model.doc else { return [] }
-        let context = MenuContext(app: app, session: model.session, doc: doc, page: clip.page,
-                                  ref: NodeRef.audio(doc, clip.id).description)
-        return app.ui.menuItems(.audioClip, context)
+        guard model.doc != nil else { return [] }
+        return app.ui.menuItems(.audioClip, menuContext(clip))
     }
 
     // MARK: Actions
@@ -254,18 +202,16 @@ struct AudioPanelView: View {
     }
 
     private func run(_ item: MenuItemDescriptor, _ clip: AudioClip) {
-        guard let doc = model.doc else { return }
-        let context = MenuContext(app: app, session: model.session, doc: doc, page: clip.page,
-                                  ref: NodeRef.audio(doc, clip.id).description)
-        let params = item.params(context)
+        let params = item.params(menuContext(clip))
         guard item.destructive else {
             execute(item.command, params)
             return
         }
         let deleting = item.command == "audio.delete"
+        let title = item.resolvedTitle(for: menuContext(clip))
         confirming = PendingAction(
-            title: deleting ? String(localized: "Delete \u{201C}\(clip.name)\u{201D}?") : item.title,
-            button: item.title, command: item.command, params: params,
+            title: deleting ? String(localized: "Delete \u{201C}\(clip.name)\u{201D}?") : title,
+            button: title, command: item.command, params: params,
             message: deleting
                 ? String(localized: "The recording and its audio file are removed from this document for good. This can't be undone.")
                 : String(localized: "This can't be undone."))
@@ -313,6 +259,16 @@ struct AudioPanelView: View {
             try AudioFiles.shareCopy(of: file, name: title, ext: suffix)
         }.value
         share = ShareItem(url: copy)
+        model.sharedCopies.append(copy)
+    }
+
+    /// The share sheet is gone: its named copies are no longer needed.
+    private func removeShareCopies() {
+        let copies = model.sharedCopies
+        model.sharedCopies = []
+        Task.detached(priority: .utility) {
+            for url in copies { AudioFiles.removeShareCopy(url) }
+        }
     }
 
     private var confirmBinding: Binding<Bool> {
@@ -329,6 +285,8 @@ final class AudioPanelModel: ObservableObject {
     @Published private(set) var clips: [AudioClip] = []
     /// Page numbers (1-based) for the clip rows.
     @Published private(set) var pages: [PageID: Int] = [:]
+    /// Share-sheet copies to remove once the sheet is dismissed.
+    var sharedCopies: [URL] = []
     private var commits: EventSubscription?
     private var cancellables = Set<AnyCancellable>()
 
@@ -374,78 +332,62 @@ final class AudioPanelModel: ObservableObject {
         pages = numbers
     }
 
-    /// A clip at zero length with nothing recording was cut short by a crash: `audio.record stop` repairs it.
+    /// A clip at zero length with nothing recording was cut short by a crash: `audio.record stop` finishes it.
     private func repairIfNeeded() {
-        guard let doc, AudioController.of(app.services)?.recording == nil,
-              clips.contains(where: { $0.duration <= 0 }) else { return }
+        guard let doc, let audio = AudioController.of(app.services), audio.recording == nil,
+              clips.contains(where: { $0.duration <= 0 && !audio.isFinalising(doc, $0.id) }) else { return }
         app.perform("audio.record", ["doc": .string(NodeRef.document(doc).description), "action": "stop"],
                     session: session)
     }
 }
 
-/// While recording in this document: a `destructive` dot, the clock in HUD type, a live waveform in
-/// `labelSecondary` bars (no colour), Pause and Stop.
-private struct RecorderView: View {
+/// The recording in the tab: the dot, "Recording" or "Paused" with the clock, Show (when it records in another
+/// document) and Stop. The HUD at top centre has Pause as well.
+private struct RecordingRow: View {
     @ObservedObject var audio: AudioController
-    let paused: Bool
-    let pause: () -> Void
+    let recording: AudioController.Recording
+    /// The other document's title, nil when it records in this one.
+    let elsewhere: String?
+    let show: () -> Void
     let stop: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: NibSpacing.s) {
-            HStack(spacing: NibSpacing.s) {
-                Circle()
-                    .fill(paused ? NibColor.labelTertiary : NibColor.destructive)
-                    .frame(width: 10, height: 10)
+        let paused = recording.pausedAt != nil
+        HStack(spacing: NibSpacing.s) {
+            if paused {
+                Image(nib: .pause)
+                    .font(NibFont.caption1Emphasis)
+                    .foregroundStyle(NibColor.labelSecondary)
                     .accessibilityHidden(true)
-                Text(paused ? String(localized: "Paused") : String(localized: "Recording"))
-                    .font(NibFont.headline)
-                    .foregroundStyle(NibColor.label)
-                Spacer(minLength: NibSpacing.s)
+            } else {
+                NibStatusDot(.recording)
+            }
+            VStack(alignment: .leading, spacing: NibSpacing.xxs) {
                 TimelineView(.animation(minimumInterval: 0.5, paused: paused)) { _ in
-                    Text(AudioText.clock(audio.elapsed))
-                        .font(NibFont.hud)
+                    Text(paused ? String(localized: "Paused · \(AudioText.clock(audio.elapsed))")
+                                : String(localized: "Recording · \(AudioText.clock(audio.elapsed))"))
+                        .font(NibFont.headline)
+                        .monospacedDigit()
                         .foregroundStyle(NibColor.label)
-                        .accessibilityLabel(String(localized: "Recorded time"))
-                        .accessibilityValue(AudioText.spoken(audio.elapsed))
+                }
+                if let elsewhere {
+                    Text(String(localized: "In \u{201C}\(elsewhere)\u{201D}"))
+                        .font(NibFont.caption1)
+                        .foregroundStyle(NibColor.labelSecondary)
+                        .lineLimit(2)
                 }
             }
-            TimelineView(.animation(minimumInterval: 0.1, paused: paused)) { _ in
-                LiveWaveform(levels: audio.recorder?.meter.recent ?? [])
+            Spacer(minLength: 0)
+            if elsewhere != nil {
+                NibButton(String(localized: "Show"), kind: .plain, size: .compact, action: show)
             }
-            .frame(height: 28)
-            HStack(spacing: NibSpacing.s) {
-                NibButton(paused ? String(localized: "Resume") : String(localized: "Pause"),
-                          symbol: paused ? NibSymbol.microphone : NibSymbol.pause, kind: .secondary, size: .compact, expands: true,
-                          action: pause)
-                NibButton(String(localized: "Stop"), symbol: .stop, kind: .primary, size: .compact, expands: true,
-                          action: stop)
-            }
+            NibIconButton(.stop, label: String(localized: "Stop Recording"), size: .panel, action: stop)
         }
-        .padding(NibSpacing.m)
+        .padding(.leading, NibSpacing.m)
+        .padding(.vertical, NibSpacing.xs)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(paused ? String(localized: "Recording paused") : String(localized: "Recording"))
-    }
-}
-
-/// Recent input levels as capsule bars, newest on the right. Real input, never an idle animation.
-private struct LiveWaveform: View {
-    let levels: [Float]
-
-    var body: some View {
-        Canvas { context, size in
-            let bar: CGFloat = 2
-            let pitch: CGFloat = 4
-            let count = max(0, Int(size.width / pitch))
-            let shown = Array(levels.suffix(count))
-            let start = size.width - CGFloat(shown.count) * pitch
-            for (i, level) in shown.enumerated() {
-                let h = max(bar, CGFloat(level) * size.height)
-                let rect = CGRect(x: start + CGFloat(i) * pitch, y: (size.height - h) / 2, width: bar, height: h)
-                context.fill(Capsule().path(in: rect), with: .color(NibColor.labelSecondary))
-            }
-        }
-        .accessibilityHidden(true)
+        .accessibilityValue(AudioText.spoken(audio.elapsed))
     }
 }
 
@@ -464,18 +406,16 @@ private struct AudioClipRow: View {
             HStack(spacing: NibSpacing.m) {
                 Group {
                     if isRecording {
-                        Circle()
-                            .fill(NibColor.destructive)
-                            .frame(width: 10, height: 10)
+                        NibStatusDot(.recording)
                     } else {
                         Image(nib: isPlaying ? .pause : .play)
                             .font(NibFont.glyph(.panel))
                             .foregroundStyle(isCurrent ? NibColor.accent : NibColor.labelSecondary)
                     }
                 }
-                .frame(width: 24)
+                .frame(width: NibSpacing.xxl)
                 .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: NibSpacing.xxs) {
                     Text(clip.name)
                         .font(isCurrent ? NibFont.bodyEmphasis : NibFont.body)
                         .foregroundStyle(NibColor.label)
@@ -505,169 +445,257 @@ private struct AudioClipRow: View {
     }
 }
 
-/// Play/pause, ±10 s, the document timeline (one bead scrubber over every clip, a dot where each clip starts),
-/// elapsed and total, speed, skip silence and noise reduction.
+// MARK: - Chrome overlays
+
+/// Mirrors a window's Pencil-down state (`EditorSession.inking`) into SwiftUI for one overlay: the HUD and the bar stop
+/// redrawing their clock, waveform and scrubber while the Pencil is down, so nothing near live ink re-renders (the
+/// chrome host recedes them to 22 %). Only the down and up transitions publish, never the stroke's growth.
+@MainActor
+final class InkingWatcher: ObservableObject {
+    @Published private(set) var isInking = false
+    private var subscription: EventSubscription?
+    private weak var signal: InkingSignal?
+
+    func watch(_ signal: InkingSignal) {
+        guard self.signal !== signal || subscription == nil else { return }
+        subscription?.cancel()
+        self.signal = signal
+        isInking = signal.isInking
+        subscription = signal.observe { [weak self] s in
+            guard let self, self.isInking != s.isInking else { return }
+            self.isInking = s.isInking
+        }
+    }
+
+    func stop() {
+        subscription?.cancel()
+        subscription = nil
+        signal = nil
+    }
+}
+
+/// Runs an `audio.*` command as the user from a chrome overlay; a failure is a toast in that window (or the Audio
+/// tab's notice where the window has no floating host).
+@MainActor
+enum AudioChromeActions {
+    static func perform(_ app: NibApp, _ command: String, _ params: JSONValue, session: EditorSession,
+                        host: FloatingHosting?, audio: AudioController) {
+        Task { @MainActor in
+            do {
+                _ = try await app.bus.execute(command, params, session: session)
+            } catch {
+                let message = NibError.wrap(error).message
+                if let host {
+                    host.postToast(message)
+                } else {
+                    audio.lastError = message
+                }
+            }
+        }
+    }
+}
+
+/// The recording HUD (DESIGN.md §14.13): a `destructive` dot, the timer in hud type, the live waveform in
+/// `labelSecondary` bars, Pause and Stop. A `.top` `.hud` chrome overlay: the host buds it from the trailing bar to top
+/// centre inside the window's droplet container, gives it the Clear 40 pt HUD droplet (NibHUDGroup's surface), and
+/// recedes it while the Pencil is down. It shows in every document window, since the recording is app-wide.
+struct RecorderHUD: View {
+    @ObservedObject var audio: AudioController
+    let app: NibApp
+    let session: EditorSession
+    let host: FloatingHosting?
+    @StateObject private var inking = InkingWatcher()
+
+    var body: some View {
+        Group {
+            if let r = audio.recording {
+                content(r)
+            }
+        }
+        .onAppear { inking.watch(session.inking) }
+        .onDisappear { inking.stop() }
+    }
+
+    private func content(_ r: AudioController.Recording) -> some View {
+        let paused = r.pausedAt != nil
+        let frozen = paused || inking.isInking
+        return HStack(spacing: NibSpacing.xxs) {
+            if !paused {
+                NibStatusDot(.recording)
+                    .padding(.leading, NibSpacing.s)
+            }
+            TimelineView(.animation(minimumInterval: 0.5, paused: frozen)) { _ in
+                NibHUDText(AudioText.clock(audio.elapsed), secondary: paused ? String(localized: "Paused") : nil)
+                    .accessibilityLabel(paused ? String(localized: "Recording paused") : String(localized: "Recording"))
+                    .accessibilityValue(AudioText.spoken(audio.elapsed))
+            }
+            TimelineView(.animation(minimumInterval: 0.1, paused: frozen)) { _ in
+                NibWaveform(levels: audio.recorder?.meter.recentLevels ?? [])
+            }
+            NibIconButton(paused ? .recordDot : .pause,
+                          label: paused ? String(localized: "Resume Recording") : String(localized: "Pause Recording"),
+                          size: .bar) {
+                run(r, paused ? "resume" : "pause")
+            }
+            NibIconButton(.stop, label: String(localized: "Stop Recording"), size: .bar) {
+                run(r, "stop")
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private func run(_ r: AudioController.Recording, _ action: String) {
+        AudioChromeActions.perform(app, "audio.record",
+                                   ["doc": .string(NodeRef.document(r.doc).description), "action": .string(action)],
+                                   session: session, host: host, audio: audio)
+    }
+}
+
+/// The playback bar (DESIGN.md §14.13): play/pause, a bead scrubber over the document's clips laid end to end (a dot
+/// where each later clip starts), elapsed/total in hud type, and the speed, which opens the options (speed, ±10 s,
+/// skip silence, noise reduction, Close Player). A `.bottom` `.bar` chrome overlay (320 × 44, above the palette on
+/// iPhone): the host gives it the Clear bar droplet and recedes it while the Pencil is down.
 struct AudioPlaybackBar: View {
     @ObservedObject var audio: AudioController
-    let doc: DocumentID
-    let clips: [AudioClip]
-    let perform: (String, JSONValue) -> Void
+    let app: NibApp
+    let session: EditorSession
+    let host: FloatingHosting?
+    @StateObject private var inking = InkingWatcher()
     @State private var scrub: Double?
     @State private var commit: Task<Void, Never>?
 
-    private var loaded: AudioController.Playback? {
-        guard let p = audio.playback, p.doc == doc, clips.contains(where: { $0.id == p.clip }) else { return nil }
+    /// The document the bar plays: the loaded clip's, else the window's.
+    private var doc: DocumentID? { audio.playback?.doc ?? session.document }
+
+    var body: some View {
+        let clips = doc.map { audio.playableClips($0) } ?? []
+        let loaded = loadedPlayback(clips)
+        TimelineView(.animation(minimumInterval: 0.25, paused: loaded?.isPlaying != true || inking.isInking)) { _ in
+            content(clips: clips, loaded: loaded)
+        }
+        .onAppear { inking.watch(session.inking) }
+        .onDisappear { inking.stop() }
+    }
+
+    private func loadedPlayback(_ clips: [AudioClip]) -> AudioController.Playback? {
+        guard let p = audio.playback, clips.contains(where: { $0.id == p.clip }) else { return nil }
         return p
     }
 
-    private var timeline: AudioTimeline {
+    private func makeTimeline(_ clips: [AudioClip], loaded: AudioController.Playback?) -> AudioTimeline {
         var durations: [NibID: Double] = [:]
         if let p = loaded { durations[p.clip] = p.duration }
         return AudioTimeline(clips: clips, durations: durations)
     }
 
-    var body: some View {
-        TimelineView(.animation(minimumInterval: 0.25, paused: loaded?.isPlaying != true)) { _ in
-            content(timeline)
-        }
-    }
-
-    private func content(_ timeline: AudioTimeline) -> some View {
+    private func content(clips: [AudioClip], loaded: AudioController.Playback?) -> some View {
+        let timeline = makeTimeline(clips, loaded: loaded)
         let settings = audio.playbackSettings
         let playing = loaded?.isPlaying == true
-        let current = scrub ?? now(timeline)
-        return VStack(spacing: NibSpacing.xxs) {
-            NibSlider(value: positionBinding(timeline), in: 0...max(timeline.total, 0.01),
-                      label: String(localized: "Playback position"))
+        let current = scrub ?? now(timeline, loaded: loaded)
+        return HStack(spacing: NibSpacing.xxs) {
+            NibIconButton(playing ? .pause : .play, label: playing ? String(localized: "Pause") : String(localized: "Play"),
+                          size: .bar) {
+                toggle(clips, loaded: loaded)
+            }
+            NibSlider(value: positionBinding(timeline, loaded: loaded), in: 0...max(timeline.total, 0.01),
+                      label: String(localized: "Playback position"), detents: timeline.markPositions)
+                .overlay { ClipStartMarks(fractions: timeline.marks) }
                 .accessibilityValue(String(localized: "\(AudioText.spoken(current)) of \(AudioText.spoken(timeline.total))"))
-            marks(timeline)
-            HStack {
-                Text(AudioText.clock(current))
-                Spacer(minLength: NibSpacing.s)
-                Text(AudioText.clock(timeline.total))
-            }
-            .font(NibFont.hud)
-            .foregroundStyle(NibColor.labelSecondary)
-            .padding(.horizontal, NibSpacing.xs)
-            .accessibilityHidden(true)
-            HStack(spacing: 0) {
-                speedMenu(settings.speed)
-                Spacer(minLength: 0)
-                NibIconButton(AudioSymbols.back10, label: String(localized: "Back 10 Seconds"), size: .panel,
-                              shortcut: KeyboardShortcut(.leftArrow, modifiers: [.command, .option])) {
-                    skip(-10, timeline)
-                }
-                .disabled(loaded == nil)
-                NibIconButton(playing ? .pause : .play, label: playing ? String(localized: "Pause") : String(localized: "Play"),
-                              size: .bar, shortcut: KeyboardShortcut("p", modifiers: [.command, .option])) {
-                    toggle()
-                }
-                NibIconButton(AudioSymbols.forward10, label: String(localized: "Forward 10 Seconds"), size: .panel,
-                              shortcut: KeyboardShortcut(.rightArrow, modifiers: [.command, .option])) {
-                    skip(10, timeline)
-                }
-                .disabled(loaded == nil)
-                Spacer(minLength: 0)
-                optionsMenu(settings)
-            }
-            if settings.skipSilence || settings.noiseReduction {
-                Text(optionsSummary(settings))
-                    .font(NibFont.caption1)
-                    .foregroundStyle(NibColor.labelSecondary)
-                    .frame(maxWidth: .infinity, alignment: .center)
-            }
+            NibHUDText(AudioText.clock(current), secondary: "/ " + AudioText.clock(timeline.total))
+                .accessibilityHidden(true)
+            optionsMenu(settings, timeline: timeline, loaded: loaded)
         }
-        .padding(.horizontal, NibSpacing.s)
-        .padding(.vertical, NibSpacing.s)
+        .padding(.horizontal, NibSpacing.xs)
+        .frame(maxWidth: NibMetrics.audioBarWidth, minHeight: NibMetrics.hitTarget)
+        .nibChromeTypeCap()
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Playback"))
     }
 
-    /// Dots under the track where the second and later clips begin, aligned with NibSlider's 14 pt thumb inset.
-    private func marks(_ timeline: AudioTimeline) -> some View {
-        GeometryReader { proxy in
-            let width = max(1, proxy.size.width - 28)
-            ForEach(Array(timeline.marks.enumerated()), id: \.offset) { _, fraction in
-                Circle()
-                    .fill(NibColor.labelSecondary)
-                    .frame(width: 5, height: 5)
-                    .position(x: 14 + CGFloat(fraction) * width, y: proxy.size.height / 2)
-            }
-        }
-        .frame(height: 6)
-        .accessibilityHidden(true)
-    }
-
-    private func speedMenu(_ speed: Double) -> some View {
+    /// The speed on the bar (1×, 1.5×, 2×…) opens the options: speed, ±10 s, skip silence, noise reduction, Close.
+    private func optionsMenu(_ settings: AudioController.PlaybackSettings, timeline: AudioTimeline,
+                             loaded: AudioController.Playback?) -> some View {
         Menu {
-            Picker(String(localized: "Speed"), selection: Binding(get: { speed }, set: { value in
+            Picker(String(localized: "Speed"), selection: Binding(get: { settings.speed }, set: { value in
                 perform("audio.setPlayback", ["speed": .number(value)])
             })) {
                 ForEach(AudioSettings.speeds, id: \.self) { s in
                     Text(AudioText.speed(s)).tag(s)
                 }
             }
+            Section {
+                Button {
+                    skip(-10, timeline, loaded: loaded)
+                } label: {
+                    Label { Text(String(localized: "Back 10 Seconds")) } icon: { Image(nib: .skipBack10) }
+                }
+                .disabled(loaded == nil)
+                Button {
+                    skip(10, timeline, loaded: loaded)
+                } label: {
+                    Label { Text(String(localized: "Forward 10 Seconds")) } icon: { Image(nib: .skipForward10) }
+                }
+                .disabled(loaded == nil)
+            }
+            Section {
+                Toggle(String(localized: "Skip Silence"), isOn: Binding(get: { settings.skipSilence }, set: { on in
+                    perform("audio.setPlayback", ["skipSilence": .bool(on)])
+                }))
+                Toggle(String(localized: "Reduce Noise"), isOn: Binding(get: { settings.noiseReduction }, set: { on in
+                    perform("audio.setPlayback", ["noiseReduction": .bool(on)])
+                }))
+            }
+            Section {
+                Button {
+                    perform("audio.pause", ["close": true])
+                } label: {
+                    Label { Text(String(localized: "Close Player")) } icon: { Image(nib: .xmark) }
+                }
+                .disabled(loaded == nil)
+            }
         } label: {
-            Text(AudioText.speed(speed))
+            Text(AudioText.speed(settings.speed))
                 .font(NibFont.hud)
                 .foregroundStyle(NibColor.label)
                 .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
                 .contentShape(Rectangle())
         }
         .hoverEffect(.highlight)
-        .accessibilityLabel(String(localized: "Playback Speed"))
-        .accessibilityValue(AudioText.speed(speed))
-    }
-
-    private func optionsMenu(_ settings: AudioController.PlaybackSettings) -> some View {
-        Menu {
-            Toggle(String(localized: "Skip Silence"), isOn: Binding(get: { settings.skipSilence }, set: { on in
-                perform("audio.setPlayback", ["skipSilence": .bool(on)])
-            }))
-            Toggle(String(localized: "Reduce Noise"), isOn: Binding(get: { settings.noiseReduction }, set: { on in
-                perform("audio.setPlayback", ["noiseReduction": .bool(on)])
-            }))
-        } label: {
-            Image(nib: .moreCircle)
-                .font(NibFont.glyph(.panel))
-                .foregroundStyle(NibColor.label)
-                .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-                .contentShape(Rectangle())
-        }
-        .hoverEffect(.highlight)
         .accessibilityLabel(String(localized: "Playback Options"))
+        .accessibilityValue(optionsValue(settings))
     }
 
-    private func optionsSummary(_ settings: AudioController.PlaybackSettings) -> String {
-        var parts: [String] = []
+    private func optionsValue(_ settings: AudioController.PlaybackSettings) -> String {
+        var parts = [AudioText.speed(settings.speed)]
         if settings.skipSilence { parts.append(String(localized: "Skipping silence")) }
         if settings.noiseReduction { parts.append(String(localized: "Reducing noise")) }
-        return parts.joined(separator: " · ")
+        return parts.joined(separator: ", ")
     }
 
     // MARK: Position
 
-    private func now(_ timeline: AudioTimeline) -> Double {
+    private func now(_ timeline: AudioTimeline, loaded: AudioController.Playback?) -> Double {
         guard let p = loaded else { return 0 }
         return timeline.position(of: p.clip, at: audio.position) ?? 0
     }
 
     /// Dragging moves the bead at once and seeks a quarter second after the finger rests.
-    private func positionBinding(_ timeline: AudioTimeline) -> Binding<Double> {
-        Binding(get: { scrub ?? now(timeline) }, set: { value in
+    private func positionBinding(_ timeline: AudioTimeline, loaded: AudioController.Playback?) -> Binding<Double> {
+        Binding(get: { scrub ?? now(timeline, loaded: loaded) }, set: { value in
             scrub = value
             commit?.cancel()
             commit = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard !Task.isCancelled else { return }
-                go(to: value, timeline)
+                go(to: value, timeline, loaded: loaded)
                 scrub = nil
             }
         })
     }
 
-    private func go(to position: Double, _ timeline: AudioTimeline) {
-        guard let target = timeline.locate(position) else { return }
+    private func go(to position: Double, _ timeline: AudioTimeline, loaded: AudioController.Playback?) {
+        guard let doc, let target = timeline.locate(position) else { return }
         if let p = loaded, p.clip == target.clip {
             perform("audio.seek", ["t": .number(target.t)])
         } else {
@@ -675,27 +703,49 @@ struct AudioPlaybackBar: View {
         }
     }
 
-    private func skip(_ seconds: Double, _ timeline: AudioTimeline) {
-        go(to: now(timeline) + seconds, timeline)
+    private func skip(_ seconds: Double, _ timeline: AudioTimeline, loaded: AudioController.Playback?) {
+        go(to: now(timeline, loaded: loaded) + seconds, timeline, loaded: loaded)
     }
 
-    private func toggle() {
+    private func toggle(_ clips: [AudioClip], loaded: AudioController.Playback?) {
+        guard let doc else { return }
         if let p = loaded {
             if p.isPlaying {
                 perform("audio.pause", [:])
             } else {
                 perform("audio.play", ["clip": .string(NodeRef.audio(doc, p.clip).description)])
             }
-        } else if let first = clips.first {
+        } else if let first = clips.first(where: { $0.duration > 0 }) {
             perform("audio.play", ["clip": .string(NodeRef.audio(doc, first.id).description), "t": 0])
         }
     }
+
+    private func perform(_ command: String, _ params: JSONValue) {
+        AudioChromeActions.perform(app, command, params, session: session, host: host, audio: audio)
+    }
 }
 
-/// Glyphs the playback bar needs that NibSymbol has no token for (validated; they fall back to the chevrons).
-enum AudioSymbols {
-    static let back10 = NibSymbol(systemName: "gobackward.10") ?? .back
-    static let forward10 = NibSymbol(systemName: "goforward.10") ?? .forward
+/// Dots on the scrubber where the second and later clips begin (display only). NibSlider has no marks API (contract
+/// gap), so they are laid over it along its track.
+private struct ClipStartMarks: View {
+    /// NibSlider's track runs between the centres of its 28 pt bead (NibDesign Components/Controls.swift,
+    /// `NibSlider`): keep this in step with it.
+    static let trackInset: CGFloat = 14
+    let fractions: [Double]
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = max(1, proxy.size.width - 2 * Self.trackInset)
+            ForEach(Array(fractions.enumerated()), id: \.offset) { _, fraction in
+                Circle()
+                    .fill(NibColor.label)
+                    .frame(width: NibMetrics.statusDot, height: NibMetrics.statusDot)
+                    .position(x: Self.trackInset + CGFloat(fraction) * width, y: proxy.size.height / 2 + NibSpacing.s)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
 }
 
 enum AudioText {

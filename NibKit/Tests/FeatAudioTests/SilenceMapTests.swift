@@ -113,4 +113,75 @@ final class SilenceMapTests: XCTestCase {
         XCTAssertTrue(atEnd.segments.isEmpty)
         XCTAssertEqual(atEnd.clipTime(afterPlaying: 3), 60)
     }
+
+    // MARK: Buffers the engine schedules
+
+    private func plan(_ spans: [(Double, Double)]) -> PlaybackPlan {
+        PlaybackPlan(origin: spans.first?.0 ?? 0, segments: spans.map { SilenceMap.Span(start: $0.0, end: $0.1) },
+                     skipsSilence: spans.count > 1)
+    }
+
+    func testChunksSplitSegmentsAndRampOnlyWhereSkipSilenceCut() {
+        // 100 frames per second: [0.5, 2.0) and [3.0, 3.3) of the clip, 60 frames per buffer.
+        let chunks = plan([(0.5, 2.0), (3.0, 3.3)]).chunks(sampleRate: 100, fileLength: 1_000, maxFrames: 60)
+        XCTAssertEqual(chunks, [
+            PlaybackChunk(start: 50, count: 60, fadeIn: false, fadeOut: false),
+            PlaybackChunk(start: 110, count: 60, fadeIn: false, fadeOut: false),
+            PlaybackChunk(start: 170, count: 30, fadeIn: false, fadeOut: true),    // the cut before the skip
+            PlaybackChunk(start: 300, count: 30, fadeIn: true, fadeOut: false),    // the cut after it; the plan's end
+        ])
+        XCTAssertEqual(chunks.reduce(0) { $0 + $1.count }, 180)
+        // One buffer spanning a whole middle segment fades in and out.
+        let middle = plan([(0, 1), (2, 2.5), (3, 4)]).chunks(sampleRate: 100, fileLength: 1_000, maxFrames: 1_000)
+        XCTAssertEqual(middle[1], PlaybackChunk(start: 200, count: 50, fadeIn: true, fadeOut: true))
+        XCTAssertEqual(middle.map { $0.fadeIn }, [false, true, true])
+        XCTAssertEqual(middle.map { $0.fadeOut }, [true, true, false])
+    }
+
+    func testChunksClampToTheFileAndSkipEmptySegments() {
+        // The record says 10 s, the file holds 2.5 s: nothing past the file's end is read.
+        let clamped = plan([(1, 10)]).chunks(sampleRate: 100, fileLength: 250, maxFrames: 100)
+        XCTAssertEqual(clamped.map { $0.start }, [100, 200])
+        XCTAssertEqual(clamped.map { $0.count }, [100, 50])
+        // Segments that start past the end, or round to nothing, yield no buffers.
+        XCTAssertEqual(plan([(3, 4)]).chunks(sampleRate: 100, fileLength: 250, maxFrames: 100), [])
+        XCTAssertEqual(plan([(1.001, 1.004), (1.5, 1.6)]).chunks(sampleRate: 100, fileLength: 250, maxFrames: 100),
+                       [PlaybackChunk(start: 150, count: 10, fadeIn: true, fadeOut: false)])
+        XCTAssertEqual(PlaybackPlan(origin: 0, segments: [], skipsSilence: false)
+                        .chunks(sampleRate: 100, fileLength: 250, maxFrames: 100), [])
+        // A zero or negative buffer size still makes progress.
+        XCTAssertEqual(plan([(0, 0.03)]).chunks(sampleRate: 100, fileLength: 250, maxFrames: 0).count, 3)
+    }
+
+    func testTheCursorWalksTheSameChunksOneAtATime() {
+        let p = plan([(0, 1.3), (2, 2.2)])
+        var cursor = PlaybackPlan.ChunkCursor(plan: p, sampleRate: 1_000, fileLength: 10_000, maxFrames: 400)
+        var walked: [PlaybackChunk] = []
+        while let c = cursor.next() { walked.append(c) }
+        XCTAssertEqual(walked, p.chunks(sampleRate: 1_000, fileLength: 10_000, maxFrames: 400))
+        XCTAssertNil(cursor.next(), "stays exhausted")
+        XCTAssertEqual(walked.count, 5)
+    }
+
+    /// onFinish fires once the plan has run out of chunks AND every scheduled buffer has played.
+    func testProgressFinishesOnlyAfterTheLastScheduledBufferPlays() {
+        var progress = PlaybackProgress()
+        for _ in 0..<3 { progress.scheduled() }
+        progress.played()
+        XCTAssertFalse(progress.isFinished)
+        progress.ranOut()
+        XCTAssertFalse(progress.isFinished, "two buffers still play")
+        progress.played()
+        XCTAssertFalse(progress.isFinished)
+        progress.played()
+        XCTAssertTrue(progress.isFinished)
+        XCTAssertEqual(progress.pending, 0)
+        progress.played()
+        XCTAssertEqual(progress.pending, 0, "a late callback never goes negative")
+
+        var empty = PlaybackProgress()
+        XCTAssertFalse(empty.isFinished, "not before the plan ran out")
+        empty.ranOut()
+        XCTAssertTrue(empty.isFinished, "an empty plan finishes at once")
+    }
 }

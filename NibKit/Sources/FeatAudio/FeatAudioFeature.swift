@@ -6,9 +6,10 @@ import os
 import NibContracts
 import NibDesign
 
-/// Audio recording and playback (F052): one app-wide recording into a document's `audio/<clip>.caf` (AAC in CAF,
-/// written continuously), the Audio sidebar tab with the clip list and the playback bar (speed, ±10 s, skip silence,
-/// noise reduction), Quick Record, and the recording indicator on the toolbar accessory and the sidebar tab.
+/// Audio recording and playback (F052): one app-wide recording into a document (written crash-safe to
+/// `audio/<clip>.aac` while it runs, kept as `audio/<clip>.caf`, AAC in CAF), the recording HUD at top centre and the
+/// playback bar at bottom centre (chrome overlays: speed, ±10 s, skip silence, noise reduction), the Audio sidebar tab
+/// with the clip list, Quick Record, and the recording indicator on the toolbar accessory and the HUD.
 /// Every action is an `audio.*` command (AudioCommands.swift).
 public enum FeatAudioFeature: NibFeature {
     public static let id = "audio"
@@ -35,17 +36,9 @@ public enum FeatAudioFeature: NibFeature {
                              summary: "Reduce background noise while audio plays (high-pass filter and noise gate).",
                              owner: id, schema: .bool())
 
-        AudioIndicators.register(app, audio: audio, recording: false)
+        AudioIndicators.register(app, audio: audio)
         registerMenus(app)
-        app.content.keyCommands.register(KeyCommandDescriptor(
-            id: "audio.record", title: String(localized: "Start or Stop Recording"),
-            shortcut: KeyShortcut("r", [.command, .shift]), command: "audio.record",
-            params: ["action": "toggle"], scope: .document, owner: id))
-
-        audio.recordingChanged = { [weak app, weak audio] recording in
-            guard let app, let audio else { return }
-            AudioIndicators.register(app, audio: audio, recording: recording)
-        }
+        registerKeys(app, audio: audio)
     }
 
     public static func start(_ app: NibApp) async {
@@ -63,7 +56,10 @@ public enum FeatAudioFeature: NibFeature {
         app.ui.menus.register(MenuItemDescriptor(
             id: "audio.more.stop", title: String(localized: "Stop Recording"), icon: NibSymbol.stop.name,
             location: .documentMore, order: 400, owner: id, command: "audio.record",
-            params: { _ in ["action": "stop"] },
+            params: { ctx in
+                guard let r = AudioController.of(ctx.app.services)?.recording else { return ["action": "stop"] }
+                return ["doc": .string(NodeRef.document(r.doc).description), "action": "stop"]
+            },
             isVisible: { ctx in AudioController.of(ctx.app.services)?.recording != nil }))
         app.ui.menus.register(MenuItemDescriptor(
             id: "audio.new.quickRecord", title: String(localized: "Quick Record"), icon: NibSymbol.microphone.name,
@@ -97,33 +93,103 @@ public enum FeatAudioFeature: NibFeature {
             params: { ctx in ["clip": .string(ctx.ref ?? "")] },
             isVisible: { ctx in ctx.ref != nil }, destructive: true))
     }
+
+    /// ⌘⇧R records or stops; ⌘⌥P, ⌘⌥← and ⌘⌥→ drive playback in any document window, whether or not the playback bar
+    /// or the Audio tab is on screen. Their params come from the window when the key is pressed.
+    private static func registerKeys(_ app: NibApp, audio: AudioController) {
+        var record = KeyCommandDescriptor(
+            id: "audio.record", title: String(localized: "Start or Stop Recording"),
+            shortcut: KeyShortcut("r", [.command, .shift]), command: "audio.record",
+            params: ["action": "toggle"], scope: .document, owner: id)
+        record.docKinds = AudioIndicators.docKinds
+        record.sessionParams = { [weak audio] session in AudioIndicators.recordParams(session, audio) }
+        app.content.keyCommands.register(record)
+
+        var playPause = KeyCommandDescriptor(
+            id: AudioIndicators.playPauseKey, title: String(localized: "Play or Pause Audio"),
+            shortcut: KeyShortcut("p", [.command, .option]), command: "audio.play",
+            params: ["toggle": true], scope: .document, order: 10, owner: id)
+        playPause.docKinds = AudioIndicators.docKinds
+        playPause.sessionParams = { [weak audio] session in
+            guard let clip = audio?.keyClip(for: session) else { return [:] }
+            return ["clip": .string(clip)]
+        }
+        app.content.keyCommands.register(playPause)
+
+        for (keyID, title, key, seconds) in [
+            ("audio.back10", String(localized: "Back 10 Seconds"), "left", -10.0),
+            ("audio.forward10", String(localized: "Forward 10 Seconds"), "right", 10.0),
+        ] {
+            var skip = KeyCommandDescriptor(
+                id: keyID, title: title, shortcut: KeyShortcut(key, [.command, .option]), command: "audio.seek",
+                params: ["t": 0], scope: .document, order: 20, owner: id)
+            skip.docKinds = AudioIndicators.docKinds
+            skip.sessionParams = { [weak audio] _ in
+                guard let audio, audio.playback != nil else { return [:] }
+                return ["t": .number(max(0, audio.position + seconds))]
+            }
+            app.content.keyCommands.register(skip)
+        }
+    }
 }
 
-/// The recording indicator (S-048, P-084): while anything records, the toolbar accessory turns into Stop and the
-/// Audio sidebar tab carries the record dot in every window. Re-registering an id replaces it, and the toolbar and
-/// sidebar hosts redraw on `.nibRegistryDidChange`.
+/// The recording indicator (S-048, P-084), the Audio tab and the chrome overlays, each registered once and read live:
+/// the toolbar accessory turns into Stop (`isOn`, `sessionIcon`, `sessionTitle`), the recording HUD shows at top
+/// centre in every document window while anything records, and the playback bar at bottom centre while a clip is
+/// loaded. `AudioController.chromeChanged()` asks the hosts to re-evaluate them.
 @MainActor
 enum AudioIndicators {
     static let panelID = "audio"
     static let toolbarID = "audio.record"
+    static let recorderOverlayID = "audio.recorder"
+    static let playerOverlayID = "audio.player"
+    /// ⌘⌥P (a key command, not a command id).
+    static let playPauseKey = "audio.playPause"
     /// Study sets have no audio (Goodnotes has none on flashcards either).
     static let docKinds: Set<DocumentKind> = [.notebook, .whiteboard, .textDocument]
 
-    static func register(_ app: NibApp, audio: AudioController, recording: Bool) {
+    static func register(_ app: NibApp, audio: AudioController) {
         let owner = FeatAudioFeature.id
-        app.ui.toolbar.register(ToolbarItemDescriptor(
-            id: toolbarID,
-            title: recording ? String(localized: "Stop Recording") : String(localized: "Record Audio"),
-            icon: recording ? NibSymbol.stop.name : NibSymbol.record.name,
+        var item = ToolbarItemDescriptor(
+            id: toolbarID, title: String(localized: "Record Audio"), icon: NibSymbol.record.name,
             group: .accessories, order: 300, owner: owner, command: "audio.record", params: ["action": "toggle"],
-            docKinds: docKinds))
+            docKinds: docKinds)
+        item.isOn = { [weak audio] _ in audio?.recording != nil }
+        item.sessionIcon = { [weak audio] _ in audio?.recording != nil ? NibSymbol.stop.name : NibSymbol.record.name }
+        item.sessionTitle = { [weak audio] _ in
+            audio?.recording != nil ? String(localized: "Stop Recording") : String(localized: "Record Audio")
+        }
+        item.sessionParams = { [weak audio] session in recordParams(session, audio) }
+        app.ui.toolbar.register(item)
+
         app.ui.panels.register(PanelDescriptor(
-            id: panelID,
-            title: recording ? String(localized: "Recording") : String(localized: "Audio"),
-            icon: recording ? recordDot : NibSymbol.record.name,
+            id: panelID, title: String(localized: "Audio"), icon: NibSymbol.record.name,
             placement: .sidebarTab, order: 300, owner: owner, docKinds: docKinds) { context in
                 AnyView(AudioPanelView(context: context, audio: audio))
             })
+
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: recorderOverlayID, owner: owner, placement: .top, surface: .hud, order: 300,
+            recedesWhileWriting: true, docKinds: docKinds,
+            isVisible: { [weak audio] _ in audio?.recording != nil },
+            makeView: { context in
+                AnyView(RecorderHUD(audio: audio, app: context.app, session: context.session,
+                                    host: context.floatingHost))
+            }))
+        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+            id: playerOverlayID, owner: owner, placement: .bottom, surface: .bar, order: 300,
+            recedesWhileWriting: true, docKinds: docKinds,
+            isVisible: { [weak audio] context in audio?.showsPlayer(in: context.session) ?? false },
+            makeView: { context in
+                AnyView(AudioPlaybackBar(audio: audio, app: context.app, session: context.session,
+                                         host: context.floatingHost))
+            }))
+    }
+
+    /// Record/Stop from the toolbar and ⌘⇧R: start in the window's document, or stop wherever the recording is.
+    static func recordParams(_ session: EditorSession, _ audio: AudioController?) -> JSONValue {
+        guard audio?.recording == nil, let doc = session.document else { return [:] }
+        return ["doc": .string(NodeRef.document(doc).description)]
     }
 
     /// A document menu is for a kind that can hold recordings.
@@ -131,10 +197,6 @@ enum AudioIndicators {
         guard let doc = ctx.doc, let kind = (try? ctx.app.workspace.content(doc))?.meta.kind else { return false }
         return docKinds.contains(kind)
     }
-
-    /// The tab's dot while recording. NibSymbol has no record-dot token (contract gap), so the name is validated
-    /// like a descriptor's icon string, falling back to the microphone.
-    static let recordDot = (NibSymbol(systemName: "record.circle") ?? .microphone).name
 }
 
 /// Playback preferences (device-local; written only by `audio.setPlayback`).
@@ -148,8 +210,8 @@ enum AudioSettings {
     static let speeds: [Double] = [0.5, 0.75, 1, 1.25, 1.5, 2]
 }
 
-/// App-wide audio state: the one recording and the one playback, shared by the commands and every window's Audio
-/// tab (a service, `serviceKey`). Recording lives in Recorder.swift, playback in Player.swift.
+/// App-wide audio state: the one recording and the one playback, shared by the commands, the chrome overlays and
+/// every window's Audio tab (a service, `serviceKey`). Recording lives in Recorder.swift, playback in Player.swift.
 @MainActor
 final class AudioController: ObservableObject {
     static let serviceKey = "audio.controller"
@@ -194,12 +256,13 @@ final class AudioController: ObservableObject {
     // Recording (Recorder.swift).
     @Published var recording: Recording?
     @Published var microphoneDenied = false
-    /// The last failure the Audio tab shows inline (a full disk, a busy microphone).
+    /// The last failure the Audio tab shows inline (a full disk, a busy microphone, a call that paused recording).
     @Published var lastError: String?
+    /// Clips ("doc/clip") whose recording is being turned into the clip's file (the Audio tab says "Saving…").
+    @Published var finalising: Set<String> = []
     var recorder: Recorder?
     var starting = false
     var resumeAfterInterruption = false
-    var recordingChanged: (@MainActor (Bool) -> Void)?
 
     // Playback (Player.swift).
     @Published var playback: Playback?
@@ -214,6 +277,19 @@ final class AudioController: ObservableObject {
 
     init(app: NibApp) {
         self.app = app
+    }
+
+    /// Recording or playback changed: toolbars, menus and chrome hosts re-evaluate the live toolbar item and the
+    /// overlays' visibility in every window.
+    func chromeChanged() {
+        app?.ui.setNeedsChromeUpdate()
+    }
+
+    /// The clip ⌘⌥P plays or pauses in a window: the loaded one, else the window document's first clip with audio.
+    func keyClip(for session: EditorSession) -> String? {
+        if let p = playback { return NodeRef.audio(p.doc, p.clip).description }
+        guard let doc = session.document, let clip = playableClips(doc).first(where: { $0.duration > 0 }) else { return nil }
+        return NodeRef.audio(doc, clip.id).description
     }
 
     /// Interruptions (calls), route changes (headphones out) and termination; never in hostless tests.
@@ -231,9 +307,5 @@ final class AudioController: ObservableObject {
         NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)
             .sink { [weak self] _ in self?.recorder?.closeFile() }
             .store(in: &cancellables)
-    }
-
-    func emit(_ type: String, doc: DocumentID, _ payload: [String: JSONValue]) {
-        app?.events.emit(type, principal: .user, doc: doc, payload: .object(payload))
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AudioToolbox
 import os
 import NibContracts
 
@@ -31,11 +32,12 @@ final class MicrophoneSource: AudioSampleSource {
     func prepare() throws -> Double {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+            // A Bluetooth headset or AirPods can be the microphone (HFP); A2DP keeps playback on them afterwards.
+            try session.setCategory(.playAndRecord, mode: .default,
+                                    options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
             try session.setActive(true)
         } catch {
-            throw NibError(.unavailable, "The microphone is busy: \(error.localizedDescription)",
-                           hint: "end the call or the other recording, then try again")
+            throw Self.busy(error)
         }
         let format = engine.inputNode.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw NibError.unavailable("a microphone") }
@@ -43,6 +45,12 @@ final class MicrophoneSource: AudioSampleSource {
     }
 
     func start(_ deliver: @escaping (AVAudioPCMBuffer) -> Void) throws {
+        // After an interruption (a call) iOS has deactivated the session: activate it again before the engine starts.
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            throw Self.busy(error)
+        }
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw NibError.unavailable("a microphone") }
@@ -78,6 +86,11 @@ final class MicrophoneSource: AudioSampleSource {
         stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
+
+    private static func busy(_ error: Error) -> NibError {
+        NibError(.unavailable, "The microphone is busy: \(error.localizedDescription)",
+                 hint: "end the call or the other recording, then try again")
+    }
 }
 
 /// Recent input levels (0…1, one per 50 ms) for the live waveform. Written on the recorder's queue, read by the UI.
@@ -109,16 +122,31 @@ final class LevelMeter {
         defer { lock.unlock() }
         return values
     }
+
+    /// For NibWaveform.
+    var recentLevels: [Double] { recent.map { Double($0) } }
 }
 
-/// Writes one recording: mono float PCM from a source, encoded to AAC in CAF as it arrives, so a crash keeps
-/// everything recorded up to the last buffer (S-057). Also builds the clip's silence map and the level meter on the
-/// way. Not main-actor: capture arrives on the source's thread, writing happens on a private serial queue.
+/// Writes one recording: mono float PCM from a source, encoded to AAC as it arrives into the clip's live file,
+/// `audio/<clip>.aac` (AAC in ADTS). ADTS frames every AAC packet with its own header, so the file is readable up to
+/// the last packet written even when Nib never closes it: a crash, jetsam killing a backgrounded recorder, a battery
+/// pull (S-057). AAC in CAF would not be: its packet table is written only when the file closes. On stop the packets
+/// are copied, not re-encoded, into the clip's `audio/<clip>.caf` (`AudioFiles.finalise`). Also builds the clip's
+/// silence map and the level meter on the way. Not main-actor: capture arrives on the source's thread, writing
+/// happens on a private serial queue.
 final class Recorder {
     struct Result {
         var duration: Double
+        /// PCM frames written (the valid frames of the finished file).
+        var frames: Int64
         var silence: SilenceMap
     }
+
+    /// Sample rates the AAC encoder and the ADTS header take; other inputs are resampled to 48 kHz.
+    static let aacRates: Set<Double> = [8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000]
+    /// The longest pause `resume(after:)` fills with silence. A longer break ends the clip and resuming starts a new
+    /// one (AudioRecord), so hours of silence are never encoded.
+    static let maximumFill: Double = 600
 
     let url: URL
     let sampleRate: Double
@@ -129,24 +157,28 @@ final class Recorder {
 
     private let source: AudioSampleSource
     private let queue = DispatchQueue(label: "app.nib.audio.recorder", qos: .userInitiated)
+    private let fillLock = NSLock()
+    private var pendingFill = 0                          // fillLock: silence frames queued, not yet written
     private var file: AVAudioFile?                       // queue
     private var frames: AVAudioFramePosition = 0         // queue
     private var silence: SilenceMap.Builder              // queue
     private var failed = false                           // queue
     private var converter: AVAudioConverter?             // the delivering thread
 
+    /// `url` is the live file (`.aac`).
     init(url: URL, source: AudioSampleSource) throws {
-        let rate = try source.prepare()
-        guard rate > 0,
+        let input = try source.prepare()
+        let rate = Self.aacRates.contains(input) ? input : 48_000
+        guard input > 0,
               let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false)
         else {
             source.close()
             throw NibError.unavailable("a microphone")
         }
         let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: rate,
-                                       AVNumberOfChannelsKey: 1, AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue]
+                                       AVNumberOfChannelsKey: 1, AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
+                                       AVAudioFileTypeKey: kAudioFileAAC_ADTSType]
         do {
-            // The .caf extension selects the CAF container.
             file = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
         } catch {
             source.close()
@@ -168,28 +200,44 @@ final class Recorder {
         source.stop()
     }
 
-    /// Writes `gap` seconds of silence first, so the recording stays aligned with the wall clock and ink written
-    /// after a pause still links to the right moment (Note Replay), then captures again.
+    /// Writes `gap` seconds of silence first (at most `maximumFill`), so the recording stays aligned with the wall
+    /// clock and ink written after a pause still links to the right moment (Note Replay), then captures again.
     func resume(after gap: Double) throws {
-        writeSilence(gap)
+        writeSilence(min(max(0, gap), Self.maximumFill))
         try start()
     }
 
-    /// Ends the recording: drains pending writes and closes the file (releasing the AVAudioFile writes the CAF
-    /// packet table). Duration counts the frames actually written.
-    func finish() -> Result {
+    /// Ends the recording: stops capture, waits for the queued writes (a pause filler included) off the main actor
+    /// and closes the file. Duration counts the frames actually written.
+    func finish() async -> Result {
         source.close()
-        return queue.sync {
-            let result = Result(duration: Double(frames) / sampleRate, silence: silence.finish())
-            file = nil
-            return result
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Result, Never>) in
+            queue.async { [self] in
+                let result = Result(duration: Double(frames) / sampleRate, frames: Int64(frames), silence: silence.finish())
+                file = nil
+                continuation.resume(returning: result)
+            }
         }
     }
 
-    /// App termination: close the file so the packet table is written; the clip's duration is repaired later.
+    /// App termination: closes the file when that is quick. With a pause filler still encoding it only stops
+    /// capture; the ADTS file is readable either way, and the next launch finishes the clip.
     func closeFile() {
         source.close()
+        guard pendingFillFrames == 0 else { return }
         queue.sync { file = nil }
+    }
+
+    /// Silence frames queued by `resume(after:)` that are not written yet.
+    var pendingFillFrames: Int {
+        fillLock.lock()
+        defer { fillLock.unlock() }
+        return pendingFill
+    }
+
+    /// Waits until everything delivered so far is written (tests read the live file without closing it).
+    func drainForTesting() {
+        queue.sync {}
     }
 
     // MARK: Writing
@@ -217,7 +265,7 @@ final class Recorder {
             }
             return out
         }
-        // Another rate (the input changed mid-recording) or integer samples: convert.
+        // Another rate (the input changed mid-recording, or one AAC does not take) or integer samples: convert.
         if converter == nil || converter?.inputFormat != src { converter = AVAudioConverter(from: src, to: format) }
         guard let converter else { return nil }
         let capacity = AVAudioFrameCount((Double(buffer.frameLength) * sampleRate / src.sampleRate).rounded(.up)) + 64
@@ -257,9 +305,10 @@ final class Recorder {
     private func writeSilence(_ seconds: Double) {
         let total = Int((seconds * sampleRate).rounded())
         guard total > 0 else { return }
-        // ponytail: silence is encoded like audio; a pause of hours costs seconds of CPU on this queue at resume.
+        adjustFill(total)
         queue.async { [self] in
             var left = total
+            defer { adjustFill(-left) }
             while left > 0 {
                 let n = min(left, 16_384)
                 guard let b = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(n)),
@@ -268,8 +317,15 @@ final class Recorder {
                 d.initialize(repeating: 0, count: n)
                 write(b)
                 left -= n
+                adjustFill(-n)
             }
         }
+    }
+
+    private func adjustFill(_ delta: Int) {
+        fillLock.lock()
+        pendingFill = max(0, pendingFill + delta)
+        fillLock.unlock()
     }
 }
 
@@ -282,10 +338,22 @@ extension AudioController {
         return max(0, (r.pausedAt ?? clock()) - r.startedAt)
     }
 
-    /// Opens the microphone (asking for permission the first time) and starts writing `url`. Returns the start time.
+    /// The app-wide recording for reads (`audio.setPlayback {}`, `audio.record`).
+    var recordingStatus: RecordingStatus? {
+        guard let r = recording else { return nil }
+        return RecordingStatus(clip: NodeRef.audio(r.doc, r.clip).description, doc: NodeRef.document(r.doc).description,
+                               state: r.pausedAt == nil ? "recording" : "paused", duration: elapsed)
+    }
+
+    /// Opens the microphone (asking for permission the first time) and starts writing the live file `url`. Returns
+    /// the start time.
     func startRecording(doc: DocumentID, page: PageID?, clip: NibID, url: URL) async throws -> Double {
-        if recording != nil || starting {
-            throw NibError(.conflict, "Nib is already recording", hint: "stop it first with audio.record {\"action\": \"stop\"}")
+        if let r = recording {
+            throw NibError(.conflict, "Nib is already recording",
+                           hint: "stop it first with audio.record {\"doc\": \"\(NodeRef.document(r.doc))\", \"action\": \"stop\"}")
+        }
+        if starting {
+            throw NibError(.conflict, "Nib is already starting a recording", hint: "wait a moment, then try again")
         }
         // A second Record tap while the first waits for the permission prompt must not open a second microphone.
         starting = true
@@ -297,16 +365,17 @@ extension AudioController {
         do {
             try recorder.start()
         } catch {
-            _ = recorder.finish()
+            _ = await recorder.finish()
             try? FileManager.default.removeItem(at: url)
             throw error
         }
+        LiveRecordings.add(doc: doc, clip: clip)
         let now = clock()
         self.recorder = recorder
         recording = Recording(doc: doc, clip: clip, page: page, startedAt: now, pausedAt: nil)
         microphoneDenied = false
         lastError = nil
-        recordingChanged?(true)
+        chromeChanged()
         emitRecording("recording")
         return now
     }
@@ -316,7 +385,15 @@ extension AudioController {
         guard r.pausedAt == nil else { return }
         recorder.pause()
         recording?.pausedAt = clock()
+        chromeChanged()
         emitRecording("paused")
+    }
+
+    /// True when resuming now would fill more silence than `Recorder.maximumFill`: `audio.record` then ends the clip
+    /// where it was paused and records on into a new clip that starts at the resume time.
+    var resumeStartsANewClip: Bool {
+        guard let paused = recording?.pausedAt else { return false }
+        return clock() - paused > Recorder.maximumFill
     }
 
     func resumeRecording() throws {
@@ -324,37 +401,93 @@ extension AudioController {
         guard let paused = r.pausedAt else { return }
         try recorder.resume(after: max(0, clock() - paused))
         recording?.pausedAt = nil
+        resumeAfterInterruption = false
+        chromeChanged()
         emitRecording("recording")
     }
 
-    /// Stops and closes the file; the caller finalises the clip record with the returned duration.
-    func finishRecording() -> (recording: Recording, result: Recorder.Result)? {
+    /// Stops capture and closes the live file off the main actor. The clip stays in `finalising` until the caller
+    /// is done with it (`doneFinalising`): `audio.record stop` converts it, delete removes it.
+    func finishRecording() async -> (recording: Recording, result: Recorder.Result)? {
         guard let r = recording, let recorder else { return nil }
-        let result = recorder.finish()
+        // Cleared before waiting, so a second Stop or a Delete does not finish it twice.
         self.recorder = nil
         recording = nil
         resumeAfterInterruption = false
+        finalising.insert(Self.key(r.doc, r.clip))
+        chromeChanged()
+        let result = await recorder.finish()
         storeSilence(result.silence, doc: r.doc, clip: r.clip)
-        recordingChanged?(false)
-        emit("audio.recording", doc: r.doc, ["clip": .string(NodeRef.audio(r.doc, r.clip).description),
-                                             "state": "stopped", "duration": .number(result.duration)])
+        app?.events.emit(AudioRecordingPayload(clip: NodeRef.audio(r.doc, r.clip).description, state: "stopped",
+                                               duration: result.duration), principal: .user, doc: r.doc)
         return (r, result)
     }
 
     /// Stops without keeping anything (the clip record could not be created).
-    func abortRecording() {
-        let url = recorder?.url
-        guard finishRecording() != nil, let url else { return }
+    func abortRecording() async {
+        guard let url = recorder?.url, let finished = await finishRecording() else { return }
+        let r = finished.recording
         try? FileManager.default.removeItem(at: url)
+        LiveRecordings.remove(doc: r.doc, clip: r.clip)
+        forgetSilence(doc: r.doc, clip: r.clip)
+        doneFinalising(r.doc, r.clip)
+    }
+
+    /// Copies a finished recording's live file into the clip's AAC-in-CAF file off the main actor. On failure (a full
+    /// disk) the live file stays and the next `audio.record stop` in the document tries again (recovery).
+    func save(_ r: Recording, frames: Int64, live: URL, target: URL, isDeleted: @escaping @MainActor () -> Bool) async -> Bool {
+        defer { doneFinalising(r.doc, r.clip) }
+        let saved = await Task.detached(priority: .userInitiated) { () -> Bool in
+            (try? AudioFiles.finalise(live: live, into: target, validFrames: frames)) != nil
+        }.value
+        if isDeleted() {
+            // Deleted while it was being saved: nothing may be left behind.
+            try? FileManager.default.removeItem(at: target)
+            try? FileManager.default.removeItem(at: live)
+            LiveRecordings.remove(doc: r.doc, clip: r.clip)
+            return false
+        }
+        guard saved else {
+            Self.log.error("could not finish the audio file of clip \(r.clip.raw, privacy: .public)")
+            if lastError == nil {
+                lastError = String(localized: "The recording is kept, but it could not be finished for playback yet. Free up some space; Nib tries again when you open the Audio tab.")
+            }
+            return false
+        }
+        LiveRecordings.remove(doc: r.doc, clip: r.clip)
+        return true
+    }
+
+    func doneFinalising(_ doc: DocumentID, _ clip: NibID) {
+        finalising.remove(Self.key(doc, clip))
+    }
+
+    func isFinalising(_ doc: DocumentID, _ clip: NibID) -> Bool {
+        finalising.contains(Self.key(doc, clip))
     }
 
     static let notRecording = NibError(.conflict, "Nib is not recording",
                                        hint: "start with audio.record {\"doc\": \"doc:D\", \"action\": \"start\"}")
 
+    static func key(_ doc: DocumentID, _ clip: NibID) -> String { doc.raw + "/" + clip.raw }
+
+    /// A hint that names the recording's document (the schema requires `doc` from the AI, plugins and the bridge).
+    func stopHint() -> String {
+        guard let r = recording else { return "stop the recording first" }
+        return "stop the recording first with audio.record {\"doc\": \"\(NodeRef.document(r.doc))\", \"action\": \"stop\"}"
+    }
+
+    /// Microphone checks that need no prompt: a denied permission (and no microphone in hostless tests).
+    func checkMicrophone() throws {
+        if makeSource != nil { return }
+        if NibApp.isHostlessTest { throw NibError.unavailable("the microphone (hostless test)") }
+        if AVAudioApplication.shared.recordPermission == .denied { throw microphoneOff() }
+    }
+
     private func emitRecording(_ state: String) {
         guard let r = recording else { return }
-        emit("audio.recording", doc: r.doc, ["clip": .string(NodeRef.audio(r.doc, r.clip).description),
-                                             "state": .string(state), "duration": .number(elapsed)])
+        app?.events.emit(AudioRecordingPayload(clip: NodeRef.audio(r.doc, r.clip).description, state: state,
+                                               duration: elapsed), principal: .user, doc: r.doc)
     }
 
     private func captureSource() async throws -> AudioSampleSource {
@@ -398,7 +531,8 @@ extension AudioController {
         }
     }
 
-    /// A call or another app took the session: pause, and resume when iOS says so.
+    /// A call or another app took the session: pause, and resume through `audio.record` when iOS says so (a long
+    /// call starts a new clip). A resume that iOS does not offer, or that fails, is said on the Audio tab.
     func interrupted(_ note: Notification) {
         guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
@@ -412,10 +546,54 @@ extension AudioController {
         case .ended:
             let options = AVAudioSession.InterruptionOptions(
                 rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
-            if resumeAfterInterruption, options.contains(.shouldResume) { try? resumeRecording() }
+            guard resumeAfterInterruption, let r = recording else { return }
             resumeAfterInterruption = false
+            let paused = String(localized: "Recording paused by a call or another app. Resume to continue.")
+            guard options.contains(.shouldResume), let app else {
+                lastError = paused
+                return
+            }
+            let params: JSONValue = ["doc": .string(NodeRef.document(r.doc).description), "action": "resume"]
+            Task { @MainActor [weak self] in
+                do {
+                    _ = try await app.bus.execute("audio.record", params)
+                } catch {
+                    Self.log.error("resume failed: \(NibError.wrap(error).message, privacy: .public)")
+                    self?.lastError = paused
+                }
+            }
         @unknown default:
             break
         }
+    }
+}
+
+/// Clips this device is recording, or was recording when it crashed, so recovery knows a live file is its own and
+/// finishes it at once. Device-local (Caches), like the silence maps.
+enum LiveRecordings {
+    /// A live file this device did not record (folder sync) is left alone until it has been quiet this long: the
+    /// device that records it may still be writing.
+    static let quietPeriod: TimeInterval = 600
+
+    private static func marker(doc: DocumentID, clip: NibID) -> URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Nib/audio-live", isDirectory: true)
+            .appendingPathComponent("\(doc.raw)-\(clip.raw)")
+    }
+
+    static func add(doc: DocumentID, clip: NibID) {
+        guard let url = marker(doc: doc, clip: clip) else { return }
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data().write(to: url)
+    }
+
+    static func contains(doc: DocumentID, clip: NibID) -> Bool {
+        guard let url = marker(doc: doc, clip: clip) else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    static func remove(doc: DocumentID, clip: NibID) {
+        guard let url = marker(doc: doc, clip: clip) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 }

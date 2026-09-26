@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AudioToolbox
 import NibContracts
 
 // MARK: - Pure playback logic (unit-tested)
@@ -35,6 +36,71 @@ struct PlaybackPlan: Equatable {
         }
         return segments.last?.end ?? origin
     }
+
+    /// Every buffer the engine schedules for this plan, in order (tests; the engine walks a `ChunkCursor`).
+    func chunks(sampleRate: Double, fileLength: Int64, maxFrames: Int64) -> [PlaybackChunk] {
+        var cursor = ChunkCursor(plan: self, sampleRate: sampleRate, fileLength: fileLength, maxFrames: maxFrames)
+        var out: [PlaybackChunk] = []
+        while let chunk = cursor.next() { out.append(chunk) }
+        return out
+    }
+
+    /// Walks the plan's segments in file frames, at most `maxFrames` at a time, clamped to the file's length.
+    struct ChunkCursor {
+        let plan: PlaybackPlan
+        let sampleRate: Double
+        let fileLength: Int64
+        let maxFrames: Int64
+        private var segment = 0
+        private var frame: Int64?
+
+        init(plan: PlaybackPlan, sampleRate: Double, fileLength: Int64, maxFrames: Int64) {
+            self.plan = plan
+            self.sampleRate = max(sampleRate, 1)
+            self.fileLength = max(fileLength, 0)
+            self.maxFrames = max(maxFrames, 1)
+        }
+
+        mutating func next() -> PlaybackChunk? {
+            while segment < plan.segments.count {
+                let span = plan.segments[segment]
+                let first = max(0, Int64((span.start * sampleRate).rounded()))
+                let end = min(Int64((span.end * sampleRate).rounded()), fileLength)
+                let from = frame ?? first
+                guard from < end else {
+                    segment += 1
+                    frame = nil
+                    continue
+                }
+                let count = min(end - from, maxFrames)
+                frame = from + count
+                // 8 ms ramps where skip-silence cut (not at the plan's own start and end), so a jump never clicks.
+                return PlaybackChunk(start: from, count: count, fadeIn: from == first && segment > 0,
+                                     fadeOut: from + count >= end && segment < plan.segments.count - 1)
+            }
+            return nil
+        }
+    }
+}
+
+/// One buffer of a plan: file frames [start, start + count), faded in or out where skip-silence cut.
+struct PlaybackChunk: Equatable {
+    var start: Int64
+    var count: Int64
+    var fadeIn: Bool
+    var fadeOut: Bool
+}
+
+/// The engine's count of buffers in flight: a plan is finished once it ran out of chunks and every scheduled
+/// buffer has played.
+struct PlaybackProgress: Equatable {
+    private(set) var pending = 0
+    private(set) var exhausted = false
+
+    mutating func scheduled() { pending += 1 }
+    mutating func ranOut() { exhausted = true }
+    mutating func played() { pending = max(0, pending - 1) }
+    var isFinished: Bool { exhausted && pending == 0 }
 }
 
 /// All clips of a document laid end to end: the playback bar's timeline, with a dot where each clip starts.
@@ -76,7 +142,12 @@ struct AudioTimeline: Equatable {
     /// Where the second and later clips start, as fractions of the timeline (the dots).
     var marks: [Double] {
         guard total > 0 else { return [] }
-        return entries.dropFirst().filter { $0.duration > 0 }.map { $0.offset / total }
+        return markPositions.map { $0 / total }
+    }
+
+    /// Where the second and later clips start, in timeline seconds (the scrubber's detents).
+    var markPositions: [Double] {
+        entries.dropFirst().filter { $0.duration > 0 }.map { $0.offset }
     }
 }
 
@@ -166,19 +237,16 @@ protocol PlaybackEngine: AnyObject {
 /// private queue a quarter second at a time, three ahead, so the noise reducer runs in Swift (testable) and silence
 /// is skipped by simply not scheduling it.
 final class AVPlaybackEngine: PlaybackEngine {
-    private static let chunk: AVAudioFrameCount = 12_000
+    private static let chunk: Int64 = 12_000
     private static let lookahead = 3
 
     private struct Reader {
-        let plan: PlaybackPlan
+        var cursor: PlaybackPlan.ChunkCursor
         let sampleRate: Double
         let generation: Int
         let onFinish: @MainActor () -> Void
         var reducers: [NoiseReducer]
-        var segment = 0
-        var frame: AVAudioFramePosition?
-        var pending = 0
-        var exhausted = false
+        var progress = PlaybackProgress()
     }
 
     private let engine = AVAudioEngine()
@@ -243,10 +311,12 @@ final class AVPlaybackEngine: PlaybackEngine {
             generation += 1
             reduceNoise = noiseReduction
             let format = file.processingFormat
-            reader = Reader(plan: plan, sampleRate: format.sampleRate, generation: generation, onFinish: onFinish,
+            let cursor = PlaybackPlan.ChunkCursor(plan: plan, sampleRate: format.sampleRate, fileLength: file.length,
+                                                  maxFrames: Self.chunk)
+            reader = Reader(cursor: cursor, sampleRate: format.sampleRate, generation: generation, onFinish: onFinish,
                             reducers: (0..<Int(format.channelCount)).map { _ in NoiseReducer(sampleRate: format.sampleRate) })
             for _ in 0..<Self.lookahead { scheduleNext() }
-            return (reader?.pending ?? 0) == 0
+            return (reader?.progress.pending ?? 0) == 0
         }
         if empty {
             queue.sync { reader = nil }
@@ -286,43 +356,29 @@ final class AVPlaybackEngine: PlaybackEngine {
         if engine.isRunning { engine.pause() }
     }
 
-    /// The queue: reads, processes and schedules the next chunk of the plan, or marks the plan exhausted.
+    /// The queue: reads, processes and schedules the plan's next chunk, or marks the plan as run out.
     private func scheduleNext() {
         guard var r = reader, let file else { return }
         let format = file.processingFormat
-        while r.segment < r.plan.segments.count {
-            let seg = r.plan.segments[r.segment]
-            let first = AVAudioFramePosition((seg.start * r.sampleRate).rounded())
-            let end = min(AVAudioFramePosition((seg.end * r.sampleRate).rounded()), file.length)
-            let from = r.frame ?? first
-            guard from < end else {
-                r.segment += 1
-                r.frame = nil
-                continue
-            }
-            let count = AVAudioFrameCount(min(end - from, AVAudioFramePosition(Self.chunk)))
+        while let chunk = r.cursor.next() {
+            let count = AVAudioFrameCount(chunk.count)
             guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: count) else { break }
             do {
-                file.framePosition = from
+                file.framePosition = chunk.start
                 try file.read(into: buffer, frameCount: count)
             } catch {
                 break
             }
-            let n = AVAudioFramePosition(buffer.frameLength)
-            guard n > 0 else { break }
-            r.frame = from + n
+            let frames = Int(buffer.frameLength)
+            guard frames > 0 else { continue }
             if let data = buffer.floatChannelData {
-                let frames = Int(buffer.frameLength)
-                let cutBefore = from == first && r.segment > 0
-                let cutAfter = from + n >= end && r.segment < r.plan.segments.count - 1
                 for ch in 0..<min(Int(format.channelCount), r.reducers.count) {
                     if reduceNoise { r.reducers[ch].process(data[ch], count: frames) }
-                    // 8 ms ramps where skip-silence cut, so a jump never clicks.
-                    if cutBefore { Self.ramp(data[ch], count: frames, sampleRate: r.sampleRate, fadeIn: true) }
-                    if cutAfter { Self.ramp(data[ch], count: frames, sampleRate: r.sampleRate, fadeIn: false) }
+                    if chunk.fadeIn { Self.ramp(data[ch], count: frames, sampleRate: r.sampleRate, fadeIn: true) }
+                    if chunk.fadeOut { Self.ramp(data[ch], count: frames, sampleRate: r.sampleRate, fadeIn: false) }
                 }
             }
-            r.pending += 1
+            r.progress.scheduled()
             let gen = r.generation
             reader = r
             player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
@@ -330,18 +386,17 @@ final class AVPlaybackEngine: PlaybackEngine {
             }
             return
         }
-        r.exhausted = true
-        r.segment = r.plan.segments.count
+        r.progress.ranOut()
         reader = r
     }
 
     /// The queue: a buffer finished playing.
     private func played(_ gen: Int) {
         guard var r = reader, r.generation == gen else { return }
-        r.pending -= 1
+        r.progress.played()
         reader = r
         scheduleNext()
-        guard let done = reader, done.exhausted, done.pending == 0 else { return }
+        guard let done = reader, done.progress.isFinished else { return }
         reader = nil
         let finish = done.onFinish
         Task { @MainActor in finish() }
@@ -365,6 +420,10 @@ enum AudioExportFormat: String, CaseIterable {
 }
 
 enum AudioFiles {
+    /// Frames Apple's AAC encoder puts before the first sample. ADTS has no field for them, so a CAF made from a live
+    /// ADTS file records them in its packet table, and a transcode from ADTS skips them.
+    static let aacPriming: Int64 = 2_112
+
     /// Seconds of audio in a file; nil when it cannot be read.
     static func duration(of url: URL) -> Double? {
         guard let f = try? AVAudioFile(forReading: url), f.processingFormat.sampleRate > 0 else { return nil }
@@ -388,20 +447,175 @@ enum AudioFiles {
         return builder.finish()
     }
 
-    /// The bytes of a clip in `format`. CAF is the file as recorded; M4A is re-encoded to AAC in MPEG-4.
+    /// Turns a recording's live ADTS file into the clip's AAC-in-CAF file: the packets are copied, not re-encoded
+    /// (a transcode is the fallback), into `<clip>.part.caf`, checked, and moved over `target`; then the live file is
+    /// removed. `validFrames` is the PCM the recorder wrote (nil after a crash). Returns the clip's length in seconds.
+    @discardableResult
+    static func finalise(live: URL, into target: URL, validFrames: Int64?) throws -> Double {
+        let fm = FileManager.default
+        let part = target.deletingLastPathComponent()
+            .appendingPathComponent(target.deletingPathExtension().lastPathComponent + ".part.caf")
+        try? fm.removeItem(at: part)
+        defer { try? fm.removeItem(at: part) }
+        let bytes = ((try? fm.attributesOfItem(atPath: live.path))?[.size] as? NSNumber)?.int64Value
+        if validFrames == 0 || bytes == 0 {
+            // Stopped before any audio arrived: an empty clip file, so the record has a file to point at. A live
+            // file with bytes in it is never replaced by an empty one (a failed copy throws and keeps it).
+            try emptyFile(like: live, at: part)
+        } else {
+            do {
+                try remux(live, to: part, type: kAudioFileCAFType, validFrames: validFrames)
+                try verify(part)
+            } catch {
+                try? fm.removeItem(at: part)
+                try transcode(live, to: part, skipFrames: aacPriming)
+                try verify(part)
+            }
+        }
+        if fm.fileExists(atPath: target.path) {
+            _ = try fm.replaceItemAt(target, withItemAt: part)
+        } else {
+            try fm.moveItem(at: part, to: target)
+        }
+        try? fm.removeItem(at: live)
+        return duration(of: target) ?? 0
+    }
+
+    /// Crash recovery (S-057): finishes a clip whose live file was never finalised, and returns its length. A live
+    /// file another device may still be writing (folder sync) waits until it has been quiet for a while.
+    static func recover(live: URL, into target: URL, ours: Bool, now: Date = Date()) -> Double? {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: live.path) {
+            if !ours, let modified = (try? fm.attributesOfItem(atPath: live.path))?[.modificationDate] as? Date,
+               now.timeIntervalSince(modified) < LiveRecordings.quietPeriod {
+                return nil
+            }
+            guard (try? finalise(live: live, into: target, validFrames: nil)) != nil else { return nil }
+        }
+        return duration(of: target)
+    }
+
+    /// Copies the AAC packets of `source` into a new file of `type` (CAF after a recording, M4A for export) without
+    /// re-encoding. Priming and padding come from the source's packet table, or, for ADTS, from the encoder's
+    /// priming and `validFrames`. A last frame that a crash cut short ends the copy.
+    static func remux(_ source: URL, to dest: URL, type: AudioFileTypeID, validFrames: Int64? = nil) throws {
+        var inputID: AudioFileID?
+        try check(AudioFileOpenURL(source as CFURL, .readPermission, 0, &inputID), "open the audio")
+        guard let input = inputID else { throw failure("open the audio") }
+        defer { _ = AudioFileClose(input) }
+
+        var format = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        try check(AudioFileGetProperty(input, kAudioFilePropertyDataFormat, &size, &format), "read the audio format")
+        guard format.mFormatID == kAudioFormatMPEG4AAC, format.mFramesPerPacket > 0 else {
+            throw NibError.unsupported("copying this audio format")
+        }
+        var sourceType: AudioFileTypeID = 0
+        size = UInt32(MemoryLayout<AudioFileTypeID>.size)
+        _ = AudioFileGetProperty(input, kAudioFilePropertyFileFormat, &size, &sourceType)
+
+        try? FileManager.default.removeItem(at: dest)
+        var outputID: AudioFileID?
+        try check(AudioFileCreateWithURL(dest as CFURL, type, &format, .eraseFile, &outputID), "create the audio file")
+        guard let output = outputID else { throw failure("create the audio file") }
+        var isOpen = true
+        defer { if isOpen { _ = AudioFileClose(output) } }
+
+        var cookieSize: UInt32 = 0
+        if AudioFileGetPropertyInfo(input, kAudioFilePropertyMagicCookieData, &cookieSize, nil) == noErr, cookieSize > 0 {
+            let cookie = UnsafeMutableRawPointer.allocate(byteCount: Int(cookieSize), alignment: 8)
+            defer { cookie.deallocate() }
+            if AudioFileGetProperty(input, kAudioFilePropertyMagicCookieData, &cookieSize, cookie) == noErr {
+                try check(AudioFileSetProperty(output, kAudioFilePropertyMagicCookieData, cookieSize, cookie),
+                          "write the codec settings")
+            }
+        }
+
+        var maxPacket: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        if AudioFileGetProperty(input, kAudioFilePropertyPacketSizeUpperBound, &size, &maxPacket) != noErr || maxPacket == 0 {
+            size = UInt32(MemoryLayout<UInt32>.size)
+            _ = AudioFileGetProperty(input, kAudioFilePropertyMaximumPacketSize, &size, &maxPacket)
+        }
+        // AAC packets are at most 768 bytes per channel; room for any header or odd upper bound.
+        maxPacket = max(maxPacket, 2_048 * max(format.mChannelsPerFrame, 1))
+        let batch: UInt32 = 256
+        let capacity = Int(maxPacket) * Int(batch)
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: 16)
+        defer { buffer.deallocate() }
+        let descriptions = UnsafeMutablePointer<AudioStreamPacketDescription>.allocate(capacity: Int(batch))
+        defer { descriptions.deallocate() }
+
+        var packets: Int64 = 0
+        while true {
+            var bytes = UInt32(capacity)
+            var count = batch
+            let status = AudioFileReadPacketData(input, false, &bytes, descriptions, packets, &count, buffer)
+            if count > 0 {
+                var written = count
+                try check(AudioFileWritePackets(output, false, bytes, descriptions, packets, &written, buffer),
+                          "write the audio")
+                packets += Int64(count)
+            }
+            if status != noErr || count == 0 {
+                if status != noErr && status != kAudioFileEndOfFileError && packets == 0 {
+                    throw failure("read the audio (\(status))")
+                }
+                break
+            }
+        }
+        guard packets > 0 else { throw NibError(.notFound, "the recording has no audio") }
+
+        let total = packets * Int64(format.mFramesPerPacket)
+        var table = AudioFilePacketTableInfo()
+        size = UInt32(MemoryLayout<AudioFilePacketTableInfo>.size)
+        if sourceType == kAudioFileAAC_ADTSType {
+            let priming = min(aacPriming, total)
+            let valid = min(max(0, validFrames ?? (total - priming)), total - priming)
+            table = AudioFilePacketTableInfo(mNumberValidFrames: valid, mPrimingFrames: Int32(priming),
+                                             mRemainderFrames: Int32(clamping: total - priming - valid))
+            _ = AudioFileSetProperty(output, kAudioFilePropertyPacketTableInfo, size, &table)
+        } else if AudioFileGetProperty(input, kAudioFilePropertyPacketTableInfo, &size, &table) == noErr,
+                  table.mNumberValidFrames > 0 {
+            _ = AudioFileSetProperty(output, kAudioFilePropertyPacketTableInfo, size, &table)
+        }
+        isOpen = false
+        try check(AudioFileClose(output), "close the audio file")
+    }
+
+    /// Opens `url` and decodes its first frames: a copy the decoder cannot read is caught before it replaces anything.
+    static func verify(_ url: URL) throws {
+        let file = try AVAudioFile(forReading: url)
+        let format = file.processingFormat
+        guard file.length > 0, format.sampleRate > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(min(file.length, 4_096)))
+        else { throw failure("check the converted audio") }
+        try file.read(into: buffer, frameCount: buffer.frameCapacity)
+        guard buffer.frameLength > 0 else { throw failure("decode the converted audio") }
+    }
+
+    /// The bytes of a clip in `format`. CAF is the file as recorded; M4A carries the same AAC packets in MPEG-4
+    /// (a transcode only when the copy fails). Both are memory-mapped, not read into memory.
     static func exportData(_ source: URL, format: AudioExportFormat) throws -> Data {
         switch format {
         case .caf:
-            return try Data(contentsOf: source)
+            return try Data(contentsOf: source, options: .alwaysMapped)
         case .m4a:
             let out = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".m4a")
             defer { try? FileManager.default.removeItem(at: out) }
-            try transcode(source, to: out)
-            return try Data(contentsOf: out)
+            do {
+                try remux(source, to: out, type: kAudioFileM4AType)
+                try verify(out)
+            } catch {
+                try? FileManager.default.removeItem(at: out)
+                try transcode(source, to: out)
+            }
+            return try Data(contentsOf: out, options: .alwaysMapped)
         }
     }
 
-    private static func transcode(_ source: URL, to out: URL) throws {
+    /// Decodes and re-encodes to AAC in the container `out`'s extension names (the fallback of `remux`).
+    static func transcode(_ source: URL, to out: URL, skipFrames: AVAudioFramePosition = 0) throws {
         let input = try AVAudioFile(forReading: source)
         let format = input.processingFormat
         let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: format.sampleRate,
@@ -409,6 +623,7 @@ enum AudioFiles {
                                        AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue]
         let output = try AVAudioFile(forWriting: out, settings: settings, commonFormat: format.commonFormat,
                                      interleaved: format.isInterleaved)
+        if skipFrames > 0 && input.length > skipFrames { input.framePosition = skipFrames }
         let chunk: AVAudioFrameCount = 65_536
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: chunk) else {
             throw NibError(.internalError, "could not allocate an audio buffer")
@@ -418,20 +633,41 @@ enum AudioFiles {
             guard buffer.frameLength > 0 else { break }
             try output.write(from: buffer)
         }
-        // `output` is released on return, which closes the M4A file.
+        // `output` is released on return, which closes the file.
+    }
+
+    /// An AAC file with no audio, in the container `url`'s extension names.
+    private static func emptyFile(like live: URL, at url: URL) throws {
+        let rate = (try? AVAudioFile(forReading: live))?.processingFormat.sampleRate ?? 48_000
+        let settings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: rate > 0 ? rate : 48_000,
+                                       AVNumberOfChannelsKey: 1, AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue]
+        _ = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
     }
 
     /// A share-sheet copy named after the clip ("Lecture 3.m4a") in a private temporary folder.
     static func shareCopy(of url: URL, name: String, ext: String) throws -> URL {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("NibAudioShare", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let invalid = CharacterSet(charactersIn: "/\\:?%*|\"<>").union(.newlines)
         var base = name.components(separatedBy: invalid).joined(separator: " ").trimmingCharacters(in: .whitespaces)
         if base.isEmpty { base = "Recording" }
         let dest = folder.appendingPathComponent(base).appendingPathExtension(ext)
-        try? FileManager.default.removeItem(at: dest)
         try FileManager.default.copyItem(at: url, to: dest)
         return dest
+    }
+
+    /// Removes a share copy (and its private folder) once the share sheet is gone.
+    static func removeShareCopy(_ url: URL) {
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    }
+
+    private static func check(_ status: OSStatus, _ what: String) throws {
+        guard status == noErr else { throw failure("\(what) (\(status))") }
+    }
+
+    private static func failure(_ what: String) -> NibError {
+        NibError(.internalError, "Nib could not \(what)")
     }
 }
 
@@ -462,6 +698,17 @@ enum SilenceCache {
 
 // MARK: - Controller: playback
 
+/// The app-wide recording as reads report it.
+struct RecordingStatus: Codable, Equatable {
+    /// "audio:D/A".
+    var clip: String
+    /// "doc:D".
+    var doc: String
+    /// "recording" or "paused".
+    var state: String
+    var duration: Double
+}
+
 /// What every playback command returns (`audio.setPlayback {}` reads it without changing anything).
 struct PlaybackStatus: Codable, Equatable {
     var clip: String?
@@ -471,6 +718,8 @@ struct PlaybackStatus: Codable, Equatable {
     var speed: Double
     var skipSilence: Bool
     var noiseReduction: Bool
+    /// Whether, and into which clip, Nib is recording (nil = not recording).
+    var recording: RecordingStatus?
 }
 
 extension AudioController {
@@ -499,13 +748,30 @@ extension AudioController {
         let s = playbackSettings
         return PlaybackStatus(clip: playback.map { NodeRef.audio($0.doc, $0.clip).description }, t: position,
                               duration: playback?.duration ?? 0, playing: playback?.isPlaying ?? false,
-                              speed: s.speed, skipSilence: s.skipSilence, noiseReduction: s.noiseReduction)
+                              speed: s.speed, skipSilence: s.skipSilence, noiseReduction: s.noiseReduction,
+                              recording: recordingStatus)
+    }
+
+    /// A document's clips that can play (every live clip but the one recording), in recording order.
+    func playableClips(_ doc: DocumentID) -> [AudioClip] {
+        guard let content = try? app?.workspace.content(doc) else { return [] }
+        let recordingClip = recording?.doc == doc ? recording?.clip : nil
+        return content.liveAudio.filter { $0.id != recordingClip }
+    }
+
+    /// The playback bar shows while nothing records and a clip is loaded (playing anywhere, or paused in this window's
+    /// document), or while this window's Audio tab is open on a document with clips.
+    func showsPlayer(in session: EditorSession) -> Bool {
+        guard recording == nil else { return false }
+        if let p = playback { return p.isPlaying || p.doc == session.document }
+        guard session.openPanels.contains(AudioIndicators.panelID), let doc = session.document else { return false }
+        return playableClips(doc).contains { $0.duration > 0 }
     }
 
     /// Plays `clip` from `t` (nil = where it was paused, or the start).
     func play(doc: DocumentID, clip: AudioClip, url: URL, at t: Double?) throws {
         if recording != nil {
-            throw NibError(.conflict, "Nib is recording", hint: "stop the recording with audio.record {\"action\": \"stop\"} first")
+            throw NibError(.conflict, "Nib is recording", hint: stopHint())
         }
         let output = try playbackEngine()
         let same = playback.map { $0.doc == doc && $0.clip == clip.id } ?? false
@@ -519,6 +785,7 @@ extension AudioController {
         if t == nil && start >= duration - 0.05 { start = 0 }
         playback = Playback(doc: doc, clip: clip.id, url: url, duration: duration, isPlaying: false, position: start)
         try begin(at: start)
+        chromeChanged()
     }
 
     func pausePlayback() {
@@ -530,6 +797,7 @@ extension AudioController {
         plan = nil
         playback = p
         emitPlayback()
+        chromeChanged()
     }
 
     func seek(to t: Double) throws {
@@ -556,13 +824,17 @@ extension AudioController {
         if plan?.skipsSilence != s.skipSilence { try begin(at: position) } else { emitPlayback() }
     }
 
-    /// Unloads playback (a new recording, a deleted clip).
+    /// Unloads playback (Close Player, a new recording, a deleted clip); the playback bar hides.
     func stopPlayback() {
-        guard playback != nil else { return }
+        guard let p = playback else { return }
+        let t = position
         playGeneration += 1
         engine?.stop()
         plan = nil
         playback = nil
+        app?.events.emit(AudioPlaybackPayload(clip: NodeRef.audio(p.doc, p.clip).description, t: t, playing: false,
+                                              rate: 0, at: clock()), principal: .user, doc: p.doc)
+        chromeChanged()
     }
 
     func stopPlayback(doc: DocumentID, clip: NibID) {
@@ -570,12 +842,12 @@ extension AudioController {
     }
 
     func storeSilence(_ map: SilenceMap, doc: DocumentID, clip: NibID) {
-        silenceMaps[doc.raw + "/" + clip.raw] = map
+        silenceMaps[Self.key(doc, clip)] = map
         SilenceCache.save(map, doc: doc, clip: clip)
     }
 
     func forgetSilence(doc: DocumentID, clip: NibID) {
-        silenceMaps[doc.raw + "/" + clip.raw] = nil
+        silenceMaps[Self.key(doc, clip)] = nil
         SilenceCache.remove(doc: doc, clip: clip)
     }
 
@@ -630,16 +902,17 @@ extension AudioController {
         p.position = p.duration
         playback = p
         emitPlayback()
-        guard let app, let content = try? app.workspace.content(p.doc) else { return }
-        let clips = content.liveAudio.filter { $0.id != recording?.clip }
+        chromeChanged()
+        guard let app else { return }
+        let clips = playableClips(p.doc)
         guard let i = clips.firstIndex(where: { $0.id == p.clip }), i + 1 < clips.count else { return }
-        app.perform("audio.play", ["clip": .string(NodeRef.audio(p.doc, clips[i + 1].id).description), "t": 0])
+        app.perform(CommandIDs.audioPlay, ["clip": .string(NodeRef.audio(p.doc, clips[i + 1].id).description), "t": 0])
     }
 
     /// The clip's silence map from memory or Caches; otherwise it is built in the background and playback re-plans
     /// when it is ready.
     private func silenceMap(for p: Playback) -> SilenceMap? {
-        let key = p.doc.raw + "/" + p.clip.raw
+        let key = Self.key(p.doc, p.clip)
         if let m = silenceMaps[key], abs(m.duration - p.duration) < 0.5 { return m }
         if let m = SilenceCache.load(doc: p.doc, clip: p.clip), abs(m.duration - p.duration) < 0.5 {
             silenceMaps[key] = m
@@ -665,12 +938,11 @@ extension AudioController {
         }
     }
 
+    /// `audio.playback` for Note Replay (F053) and plugins: on play, pause, seek and re-plan.
     private func emitPlayback() {
         guard let p = playback else { return }
-        emit("audio.playback", doc: p.doc, [
-            "clip": .string(NodeRef.audio(p.doc, p.clip).description), "t": .number(position),
-            "playing": .bool(p.isPlaying), "rate": .number(p.isPlaying ? playbackSettings.speed : 0),
-            "at": .number(clock()),
-        ])
+        app?.events.emit(AudioPlaybackPayload(clip: NodeRef.audio(p.doc, p.clip).description, t: position,
+                                              playing: p.isPlaying, rate: p.isPlaying ? playbackSettings.speed : 0,
+                                              at: clock()), principal: .user, doc: p.doc)
     }
 }
