@@ -12,6 +12,10 @@ public enum NibReflowMetrics {
     /// The inner share of a cover that is its combine zone: while the finger is in it, that cover holds still, so a
     /// combine can arm after `NibMotion.combineHold` (380 ms).
     public static let combineCore: CGFloat = 0.70
+    /// While the finger is on a cover the gap would displace, the gap waits this long (seconds) before it moves. The
+    /// gap switches as the finger reaches a neighbour's outer edge, before its combine zone; without the wait the
+    /// neighbour would slide away before a combine could start. Covers that combine only.
+    public static let dwell: Double = 0.18
     /// Further than this outside every slot (over the sidebar, a folder tile, the bars) the gap closes back at home.
     public static let outsideMargin: CGFloat = 24
     /// A press this long lifts a card out of a scroll view (then 6 pt of movement picks it up).
@@ -88,8 +92,18 @@ public enum NibReflowDrop<ID: Hashable>: Equatable {
 ///   slot's centre than to the gap's, so it never flickers at a boundary.
 /// - While the finger is in the inner 70 % of another cover (its combine zone), that cover holds still: the reflow
 ///   waits, so a combine can arm. Paused (a combine armed, a folder fused), nothing moves.
+/// - While the finger is on the cover the gap would displace (outside its combine zone), the gap waits `dwell`
+///   (180 ms) before it moves, so a finger heading for that cover's middle reaches its combine zone first. A finger
+///   that rests there gets the gap once the dwell is over; in a gutter the gap moves at once. Covers that combine only,
+///   and only with a clock (`update(finger:paused:now:)`).
 /// - Outside every slot by more than `outsideMargin`, the gap closes back at home.
 public struct NibReflowModel<ID: Hashable>: Equatable {
+    /// A gap the finger asks for while it is on the cover there: `index` since `since` (the caller's clock).
+    public struct Pending: Equatable, Sendable {
+        public let index: Int
+        public let since: Double
+    }
+
     public let ids: [ID]
     public let slots: [CGRect]
     /// The dragged item's index.
@@ -100,11 +114,15 @@ public struct NibReflowModel<ID: Hashable>: Equatable {
     /// Covers can combine (notebooks): their inner 70 % holds the reflow. Page thumbnails do not.
     public var combines: Bool
     public var outsideMargin: CGFloat
+    /// How long the gap waits while the finger is on the cover it would displace (seconds; 0 moves it at once).
+    public var dwell: Double
+    /// The gap waiting out the dwell, if any.
+    public private(set) var pending: Pending?
 
     /// nil unless `dragged` is in `ids` and every id has a slot.
     public init?(ids: [ID], slots: [CGRect], dragged: ID, combines: Bool = true,
                  hysteresis: CGFloat = NibReflowMetrics.hysteresis,
-                 outsideMargin: CGFloat = NibReflowMetrics.outsideMargin) {
+                 outsideMargin: CGFloat = NibReflowMetrics.outsideMargin, dwell: Double = NibReflowMetrics.dwell) {
         guard ids.count == slots.count, let i = ids.firstIndex(of: dragged) else { return nil }
         self.ids = ids
         self.slots = slots
@@ -113,6 +131,7 @@ public struct NibReflowModel<ID: Hashable>: Equatable {
         self.hysteresis = hysteresis
         self.combines = combines
         self.outsideMargin = outsideMargin
+        self.dwell = dwell
     }
 
     public var dragged: ID { ids[from] }
@@ -151,15 +170,42 @@ public struct NibReflowModel<ID: Hashable>: Equatable {
     /// slot by more than `outsideMargin`.
     public func candidate(at p: CGPoint) -> Int { nearest(p).index }
 
-    /// Moves the gap for the finger at `p`. Returns true when it moved (the neighbours reflow).
+    /// Moves the gap for the finger at `p`, as if the finger had rested on each cover for the dwell (no clock: the
+    /// geometry alone). Returns true when it moved (the neighbours reflow).
     @discardableResult
     public mutating func update(finger p: CGPoint, paused: Bool = false) -> Bool {
+        advance(p, paused: paused, now: nil)
+    }
+
+    /// Moves the gap for the finger at `p` at time `now` (seconds, any steady clock). Returns true when it moved.
+    /// While the finger is on the cover the gap would displace, it moves only once the finger has asked for it for
+    /// `dwell`; call again with a later `now` (the finger resting) to let it move.
+    @discardableResult
+    public mutating func update(finger p: CGPoint, paused: Bool = false, now: Double) -> Bool {
+        advance(p, paused: paused, now: now)
+    }
+
+    private mutating func advance(_ p: CGPoint, paused: Bool, now: Double?) -> Bool {
         guard !paused, combineCandidate(at: p) == nil else { return false }
         let n = nearest(p)
-        guard n.index != insertion else { return false }
-        if n.inside {
-            guard Self.distance(p, slots[n.index]) + hysteresis < Self.distance(p, slots[insertion]) else { return false }
+        guard n.index != insertion else {
+            pending = nil
+            return false
         }
+        if n.inside, Self.distance(p, slots[n.index]) + hysteresis >= Self.distance(p, slots[insertion]) {
+            pending = nil
+            return false
+        }
+        // The cover shown in that slot would slide away from under the finger: wait out the dwell first, so heading
+        // for its middle (its combine zone) wins.
+        if let now, combines, dwell > 0, slots[n.index].contains(p) {
+            guard let pending, pending.index == n.index else {
+                self.pending = Pending(index: n.index, since: now)
+                return false
+            }
+            guard now - pending.since >= dwell else { return false }
+        }
+        pending = nil
         insertion = n.index
         return true
     }
@@ -253,6 +299,9 @@ public final class NibReflow<ID: Hashable> {
     @ObservationIgnored private var hover: ID?
     @ObservationIgnored private var armWork: DispatchWorkItem?
     @ObservationIgnored private var landingWork: DispatchWorkItem?
+    /// The finger (reflow space) and the re-check that gives a finger resting on a cover its gap after the dwell.
+    @ObservationIgnored private var finger: CGPoint = .zero
+    @ObservationIgnored private var dwellWork: DispatchWorkItem?
 
     public init(layout: NibReflowLayout? = nil, combines: Bool = true) {
         self.layout = layout
@@ -274,6 +323,7 @@ public final class NibReflow<ID: Hashable> {
     /// Lifts `id` (in `order`, the items as the grid shows them) under the finger at `point` (reflow space).
     public func begin(_ id: ID, order: [ID], at point: CGPoint) {
         cancelArming()
+        cancelDwell()
         landingWork?.cancel()
         var ids: [ID] = [], slots: [CGRect] = []
         for (i, x) in order.enumerated() {
@@ -297,13 +347,32 @@ public final class NibReflow<ID: Hashable> {
         lift = Lift(id: id, start: g, location: g, phase: .dragging)
     }
 
-    /// The finger moved (reflow space): the carrier follows, the gap reflows (unless paused or held), a combine arms.
+    /// The finger moved (reflow space): the carrier follows, the gap reflows (unless paused, held, or waiting out the
+    /// dwell on a cover), a combine arms.
     public func move(to point: CGPoint) {
-        guard var m = model, var l = lift, l.phase == .dragging else { return }
+        guard let m = model, var l = lift, l.phase == .dragging else { return }
         l.location = global(point)
         lift = l
+        finger = point
         arm(m.combineCandidate(at: point), at: point, in: m)
-        if m.update(finger: point, paused: isPaused || armed != nil) { model = m }
+        updateGap()
+    }
+
+    /// Runs the gap for the finger now. A finger resting on the cover the gap would displace gets the gap once the
+    /// dwell is over, without moving again.
+    private func updateGap() {
+        cancelDwell()
+        guard var m = model, isDragging else { return }
+        let before = m.pending
+        let now = CACurrentMediaTime()
+        let moved = m.update(finger: finger, paused: isPaused || armed != nil, now: now)
+        if moved || m.pending != before { model = m }
+        // Still waiting: look again when the dwell is over. (A dwell that is over but held, by a combine zone or a
+        // pause, waits for the finger to move.)
+        guard let pending = m.pending, now < pending.since + m.dwell else { return }
+        let work = DispatchWorkItem { [weak self] in self?.updateGap() }
+        dwellWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (pending.since + m.dwell - now) + 0.01, execute: work)
     }
 
     /// Drops. The carrier flows to where the item now belongs (its new slot, or into the armed cover). Apply a
@@ -311,6 +380,7 @@ public final class NibReflow<ID: Hashable> {
     @discardableResult
     public func end(velocity: CGVector = .zero) -> NibReflowDrop<ID> {
         cancelArming()
+        cancelDwell()
         guard let m = model, var l = lift else { return .none }
         let drop: NibReflowDrop<ID>
         var rest = m.slots[m.from]
@@ -394,6 +464,11 @@ public final class NibReflow<ID: Hashable> {
         armWork?.cancel()
         armWork = nil
         hover = nil
+    }
+
+    private func cancelDwell() {
+        dwellWork?.cancel()
+        dwellWork = nil
     }
 
     private func scheduleLandingTimeout() {
