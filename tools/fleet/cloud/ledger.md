@@ -7,7 +7,9 @@ Workflow cap = 2 concurrent (4 CPUs) -> using background Agent calls; me as sche
 - v2/glass      Liquid Glass redo (D1a)       GREEN (run 36221916103, 8b0ef70)
 - v2/mockup     mockup.html update            running
 - v2/physics    toolbar dock/bead + reflow    GREEN (run 36222900495, 9ecd6b1; includes v2/glass). dstokens asked to merge it.
-- v2/dstokens   NibDesign gap tokens/comps    running
+- v2/dstokens   NibDesign gap tokens/comps    GREEN (run 36223679248, 63aba8b; = glass+physics+tokens)
+- main: merged design v2 as 0bce516; main CI run 36224117203 pending -> then tag design-v2
+- F016 dock adoption agent running
 Next: integrator merges 4 branches -> main, CI green, tag contracts-v2 + design-v2, merge main into all feat/*; then F016 dock adoption; mockup update + republish.
 
 ## Fleet jobs launched
