@@ -1,0 +1,77 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDocChrome/DocumentContainerViewController.swift:596-600 (sidebarContent), :222-230 and :280-288 (ChromeDocumentModel init/configurationChanged); ChromeCommands.swift:136-144 (reconcile)",
+      "problem": "The doc-kind filter only applies when a panel opens. ChromeState belongs to the window session, so it survives a document switch in that window (back to the library and open another document, or a tab switch). Nothing reconciles it against the new document's kind, and sidebarContent adds the stale panel back with `[selected] + tabs`. Scenario: open a notebook, show the notebook-only Pages tab, go back to the library, open a text document. Pages still docks, insets the editor and renders against the text document. Notebook-only floating panels stay open the same way. The spec requires sidebar panels to be filtered by doc kind.",
+      "fix": "Make reconciliation kind-aware and run it when the container is built and whenever snapshot.kind changes: `state.reconcile { id in app.ui.panels.get(id).flatMap { PanelResolver.accepts($0, kind: kind) ? PanelResolver.placement(of: $0, settings: settings) : nil } }`. Use the same resolver in configurationChanged. In sidebarContent, keep the `[selected] + tabs` fallback only when `PanelResolver.accepts(selected, kind:)`. Add a test that opens a `.notebook`-only panel, builds a container for FIXTUREDOC04 on the same session and asserts the panel is closed."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDocChrome/ChromeCommands.swift:112-131 (ChromeState.toggleSidebar); DocumentContainerViewController.swift:613 (sidebarVisible)",
+      "problem": "sidebar.toggle picks its side from NibSettings.sidebarOnRight alone and ignores which side is actually showing. Scenario (D-136 + D-117): sidebarOnRight=false, Outline moved to the right, Outline open. The nav Sidebar button shows On (`!state.tabs.isEmpty`), but tapping it opens Pages on the left instead of hiding the sidebar. Tapping 'Show as Window' in the Outline header opens Pages full-window instead of switching Outline to Window mode.",
+      "fix": "Prefer a visible side first: `let side = [preferred, preferred.other].first { tabs[$0] != nil } ?? (available(preferred).isEmpty && !available(preferred.other).isEmpty ? preferred.other : preferred)`. Add a ChromeState unit test: right side open, preferred left with tabs available; toggle() hides the right side and toggle(mode: .window) switches the mode without opening the left side."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/DocumentContainerViewController.swift:437-438 (prefersStatusBarHidden); Nib/App/ShellViewController.swift",
+      "problem": "P-106 does nothing in the app. ShellViewController is the window root and does not override childForStatusBarHidden, so UIKit never asks the container's prefersStatusBarHidden, and setNeedsStatusBarAppearanceUpdate up the chain changes nothing. The test only checks the property's value. The shell is scaffold code, so F017 cannot fix this itself.",
+      "fix": "Escalate as ARCHITECTURE §15.11/§15.12 require: send a contract request to the orchestrator/shell owner asking for `override var childForStatusBarHidden: UIViewController? { content }` (and childForStatusBarStyle) in ShellViewController. List P-106 as blocked on that in the feature summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/DocumentContainerViewController.swift:117-118, :403",
+      "problem": "The window's NibInkingState is published under an invented service key, `chrome.inking.<sessionId>`. No contract, spec or other feature mentions this key, so the canvas (F006) will never write to it, and droplets never recede while the Pencil is down (DESIGN §10.8, §15 rule 3, Slop checklist 'chrome ... recedes to 22 %'). This invents a contract API, which §15.11 forbids. Each window's entry also stays in services for good.",
+      "fix": "File a contract request for a ServiceKeys constant or EditorSession property through which the canvas can reach the window's NibInkingState. Until it lands, keep the key but name it in that request so F006 can adopt it. Remove the service entry when the session is removed."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/DocumentContainerViewController.swift:154-157 (closePanel)",
+      "problem": "closePanel mutates the state first and then runs panel.close. Every close from the UI (panel header Close, sheet swipe, NibPanelHeader onClose) therefore reaches the bus as a no-op returning `closed: false`. Hooks, plugins and bridge observers see a call that says nothing was open.",
+      "fix": "Close buttons should call `tap(\"panel.close\", [\"id\": id])` only. Keep the synchronous local `state.close` just for swipe-dismiss of sheets and covers, where SwiftUI needs the binding to settle at once."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/FloatingPanelHost.swift:97-114 (handle / dock)",
+      "problem": "Moving a floating panel, by drag or by the VoiceOver 'Move to Left/Right Edge' actions, writes state.floatingCentres directly. No command can do it, so the AI, plugins and the bridge cannot dock a floating panel to an edge. That breaks the modify-anything guarantee for something the user can do.",
+      "fix": "Add an optional `edge: left|right` param (with choices and an example) to panel.open that sets floatingCentres through FloatingSnap.rest. Route the drag end and both accessibility actions through `chrome.run(\"panel.open\", [\"id\": ..., \"edge\": ...])`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/NavBar.swift:291-293",
+      "problem": "Passing `shortcut:` to the Sidebar NibToolbarItem registers a SwiftUI .keyboardShortcut(⌃⌘S) on top of the shell's UIKeyCommand. When the hosting controller is in the responder chain (canvas first responder), the SwiftUI binding fires through chrome.tap, so a keyboard-triggered layout change animates (DESIGN §9.3). The ⌘-hold overlay also lists the shortcut twice.",
+      "fix": "Drop `shortcut:` from the Sidebar nav item, since the registered KeyCommandDescriptor already provides ⌃⌘S and its overlay entry. Alternatively, file a NibDesign request for a hint-only shortcut and use that."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/FeatDocChromeFeature.swift:31-68 (registerMenus); NavBar.swift:200-201",
+      "problem": "Read-only mode is only partly done. DESIGN §14.2 says the subtitle reads 'Read only' with `lock` and that tapping the title offers 'Edit'. The subtitle has no lock glyph and the title menu has no Edit entry.",
+      "fix": "Register a `.documentTitle` MenuItemDescriptor 'Edit' (order 0, command view.setReadOnly, params [\"on\": false]) with isVisible `ctx.session?.readOnly == true && ctx.app.commands.entry(\"view.setReadOnly\") != nil`. Show `lock` next to the read-only subtitle."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/DocumentContainerViewController.swift:623-642 (menuRows overflow); NavBar.swift:334-342 (ChromeMenuRow)",
+      "problem": "In compact windows, Sidebar, Read Only and Bookmark move into More as plain rows and lose their on/off state. Neither sighted nor VoiceOver users can tell whether read-only or the sidebar is on.",
+      "fix": "Carry `isOn` into ChromeMenuRow. Render a checkmark accessory and add the `.isSelected` trait when it is set."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/DocumentContainerViewController.swift:317-331 (ChromeBackdrop.update); NavBar.swift:372-376 (ChromePopovers)",
+      "problem": "Performance on large notebooks. During scroll (every 50 ms), ChromeBackdrop.update runs `content.livePages`, which filters and sorts, then calls pageFrame and convert on every page, so each tick costs O(n log n) (about 1,000 pages for an imported textbook). Separately, every chrome body pass builds the rows of all four popovers, evaluating every menu item's isVisible and params closures, even with no menu open.",
+      "fix": "Walk outward from the index of session.page and stop at the first page on each side that does not intersect the view. Build ChromeMenuList rows only for `openMenu` (pass `[]` for closed popovers)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/SidebarHost.swift:31-55; FeatDocChromeFeature.swift:133-138, :197-201",
+      "problem": "SidebarPanelView builds its own header (Text + icon buttons) although NibPanelHeader exists (DESIGN §15 rule 6). The Editing Settings and Move sheets use system toolbar Done/Cancel buttons, while Rename uses NibSheetHeader, so the chrome's sheets are inconsistent.",
+      "fix": "Use `NibPanelHeader(title:symbol:onClose:menu:)` with the mode toggle and PanelPlacementMenu in `menu`. Give the Editing Settings and Move to Folder sheets NibSheetHeader."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDocChrome/DocumentContainerViewController.swift:174-181 (goToLibrary); FeatDocChromeFeature.swift:61-67 (closeOthers isVisible)",
+      "problem": "Back runs a command only when F019's library.setView is installed. The navigation itself is a direct navigator.showLibrary call with no command equivalent. Separately, 'Close Other Tabs' decides visibility from ui.activeNavigator, which can be a different window from ctx.session's.",
+      "fix": "Assert in a test that Back runs library.setView when it is registered, and confirm with F019 that library.setView returns the active window to the library. For closeOthers, check `ctx.app.ui.activeNavigator?.session === ctx.session` before counting that navigator's openDocuments."
+    }
+  ]
+}
