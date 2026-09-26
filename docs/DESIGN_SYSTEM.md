@@ -6188,6 +6188,8 @@ public struct NibToolPalette<Settings: View>: View {
 
     @Environment(DropletField.self) private var field: DropletField?
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.nibLiquidMode) private var liquidMode
     @ScaledMetric(relativeTo: .body) private var scaledThick: CGFloat = 56
     @ScaledMetric(relativeTo: .body) private var scaledPitch: CGFloat = 44
     @State private var shownDock: NibPaletteDock?
@@ -6201,6 +6203,8 @@ public struct NibToolPalette<Settings: View>: View {
     @State private var optionsSize = CGSize(width: 200, height: NibMetrics.barHeight)
     /// A released drag on its way to its dock: the one plip plays when it arrives (DESIGN.md §10.11).
     @State private var landing: DockLanding?
+    /// Reduce Motion and Liquid Off cross-fade the palette to its new dock (DESIGN.md §10.10).
+    @State private var fade: Double = 1
 
     enum DragMode {
         case move, scrub
@@ -6356,6 +6360,7 @@ public struct NibToolPalette<Settings: View>: View {
             ZStack(alignment: .topLeading) {
                 palette(d, a, map)
                     .gesture(dragGesture(region: r, origin: origin, arrangement: a, slots: map))
+                    .opacity(fade)
                     .position(c)
                 if let tool = a.natives.first(where: { $0.id == selection }) ?? a.plugins.first(where: { $0.id == selection }),
                    tool.hasSettings, let along = map[tool.id] {
@@ -6587,12 +6592,25 @@ public struct NibToolPalette<Settings: View>: View {
                     at: value.location, velocity: CGVector(dx: value.velocity.width, dy: value.velocity.height),
                     from: current, model: dockModel(r, origin: origin))
                 let next = release.dock
+                let arrival = DockLanding(centre: CGPoint(x: release.frame.midX, y: release.frame.midY))
+                if (reduceMotion || liquidMode == .off) && next != current {
+                    // Fade out, move while invisible (the body glides with `reduced`), fade in.
+                    withAnimation(NibMotion.exit) { fade = 0 }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                        dock = next
+                        landing = DockLanding(centre: arrival.centre)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + NibMotion.reduced.response) {
+                            withAnimation(NibMotion.enter) { fade = 1 }
+                        }
+                    }
+                    return
+                }
                 if next.isVertical != current.isVertical {
                     shownDock = current
                     field.beginReshape(id, towards: CGPoint(x: release.frame.midX, y: release.frame.midY),
                                        velocity: release.velocity)
                 }
-                landing = DockLanding(centre: CGPoint(x: release.frame.midX, y: release.frame.midY))
+                landing = arrival
                 dock = next
             }
     }
