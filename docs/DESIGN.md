@@ -292,6 +292,7 @@ Base unit 4 pt; 2 pt only inside controls.
 | `onboardingCardWidth` | 480 | Onboarding card (iPhone: width − 32) |
 | `studyCardSize` | 560 × 360 | Practice card and the editor's preview |
 | `zoomPaneHeight` | 240 | Zoom Window pane |
+| `minimapSize` / `minimapSizeCompact` | 208 × 144 / 168 × 116 | A whiteboard's minimap |
 | `audioBarWidth` | 320 | Audio playback bar |
 | `textColumnWidth` | 680 | Text documents |
 | `laserDot` / `laserGlow` / `laserTrail` | 12 / 12 / 4 | Laser |

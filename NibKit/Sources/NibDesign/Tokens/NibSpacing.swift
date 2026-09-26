@@ -148,6 +148,9 @@ public enum NibMetrics {
     public static let onboardingCardWidth: CGFloat = 480
     /// Study cards: the practice card and the editor's preview (`NibFlashcard`).
     public static let studyCardSize = CGSize(width: 560, height: 360)
+    /// A whiteboard's minimap: 208 × 144, 168 × 116 in compact windows.
+    public static let minimapSize = CGSize(width: 208, height: 144)
+    public static let minimapSizeCompact = CGSize(width: 168, height: 116)
     /// The Zoom Window's writing pane, docked at the bottom (full width − 32).
     public static let zoomPaneHeight: CGFloat = 240
     /// The audio playback bar (bottom centre; above the palette on iPhone).

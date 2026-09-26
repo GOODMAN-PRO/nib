@@ -7058,7 +7058,8 @@ extension NibMetrics {
                proposalBadgeX, popoverContentWidth, handleBead, rotationHandleOffset: CGFloat
     static let presenceMaxShown, maxVisibleTabs, outlineMaxDepth: Int
     static let settingsSheetSize, newDocumentSheetSize, coverPreviewSize, coverStripSize, paperTileSize,
-               pluginManagerSheetSize, developerConsoleSize, floatingPanelSize, searchSnippetSize, studyCardSize: CGSize
+               pluginManagerSheetSize, developerConsoleSize, floatingPanelSize, searchSnippetSize, studyCardSize,
+               minimapSize, minimapSizeCompact: CGSize
 }
 public enum NibStroke {   // hairline 0.5, outline 0.8, thin 1, emphasis 1.5, ring 2, thick 3, ringOutset 3
     static let dash: [CGFloat]            // [4, 4]
@@ -7076,6 +7077,7 @@ public enum NibOpacity { static let disabled, unselectedTool, recede, ghostInk, 
 | F028 no hairline divider token | `NibStroke.hairline`, `NibStroke.thin`; `NibPenSwatch.Size.palette.diameter` | F028 `BarLiteral` (FeatPageText/PageTextEditor.swift) |
 | F039 no ruler radius | `NibRadius.ruler` | `NibRadius.badge` on the ruler body (FeatRuler) |
 | F040 no laser metrics | `NibMetrics.laserDot`, `.laserGlow`, `.laserTrail`, `NibOpacity.laserGlow` | F040 `LaserStyle` sizes (FeatLaser/FeatLaserFeature.swift); the 0.6 s fade is a motion token (below) |
+| F044 no minimap size; no selection ring | `NibMetrics.minimapSize`, `.minimapSizeCompact`; `.nibSelectionRing(_:cornerRadius:)` | F044 `MinimapGeometry.mapSize(compact:)` derived from the thumbnail width (FeatWhiteboard/MinimapView.swift) |
 | F046 no row-thumbnail or indent metrics | `NibMetrics.rowThumbnailWidth`, `.outlineIndent`, `.outlineMaxDepth` | F046 `OutlineMetrics` (FeatOutline/OutlinePanel.swift) |
 | Unbuilt F019, F021, F045, F050, F052, F056, F072, F073, F080, F085, F093, F108 | the §14 screen metrics, `NibOpacity.ghostInk`, `.replayPending` | – |
 

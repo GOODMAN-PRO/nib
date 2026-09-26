@@ -248,6 +248,7 @@ final class NibDesignV2Tests: XCTestCase {
         XCTAssertEqual(NibMetrics.popoverContentWidth, NibMetrics.popoverWidth - 2 * NibSpacing.l)
         XCTAssertEqual((0..<5).map { NibMetrics.widthPresetDot($0) }, [5, 8, 12, 15, 18])
         XCTAssertEqual(NibMetrics.widthPresetDot(-1), 5)
+        XCTAssertLessThan(NibMetrics.minimapSizeCompact.width, NibMetrics.minimapSize.width)
         let registered = NibTool(id: "pen", label: "Pen", symbol: .pen, shortcut: KeyboardShortcut("p"))
         XCTAssertTrue(registered.registersShortcut)
         XCTAssertEqual(registered.registeredShortcut, KeyboardShortcut("p"))
