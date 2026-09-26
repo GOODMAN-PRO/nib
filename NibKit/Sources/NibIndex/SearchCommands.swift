@@ -192,11 +192,13 @@ struct SearchText: NibCommand {
         let terms = SearchDatabase.terms(query)
         var results: [Hit] = []
         for h in hits {
-            // Locked documents are excluded while locked; trashed documents are not searched.
+            // Locked documents are excluded while locked; trashed documents are not searched. Documents open in the
+            // workspace but outside the library (indexed on purpose) stay searchable.
             if ctx.services.lock?.isLocked(h.doc) == true { continue }
             let node = library?.node(h.doc)
-            if library != nil && (node == nil || node?.trashedAt != nil) { continue }
+            if library != nil && (node?.trashedAt != nil || (node == nil && !ctx.workspace.isLoaded(h.doc))) { continue }
             let pageID: PageID? = h.block.page ?? (h.key.hasPrefix("#") ? nil : PageID(h.key))
+            // Open documents: live positions (pending edits included). Others: the position the index keeps current.
             var pageIndex = h.pageIndex
             if let pid = pageID, ctx.workspace.isLoaded(h.doc), let content = try? ctx.workspace.content(h.doc) {
                 if content.page(pid)?.deleted ?? true { continue }
@@ -341,6 +343,7 @@ struct IndexRebuild: NibCommand {
             let units = try await indexer.rebuild(doc: doc)
             return Output(scope: NodeRef.document(doc).description, documents: 1, units: units, scheduled: false)
         }
-        return Output(scope: "lib", documents: try indexer.rebuildAll(), units: nil, scheduled: true)
+        let queued = try await indexer.rebuildAll()
+        return Output(scope: "lib", documents: queued, units: nil, scheduled: true)
     }
 }

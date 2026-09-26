@@ -192,7 +192,7 @@ final class SearchDatabase {
         }
         if try userVersion() != SearchDatabase.schemaVersion {
             try exec("DROP TABLE IF EXISTS fts; DROP TABLE IF EXISTS tri; DROP TABLE IF EXISTS blocks; "
-                     + "DROP TABLE IF EXISTS units; DROP TABLE IF EXISTS ocr")
+                     + "DROP TABLE IF EXISTS units; DROP TABLE IF EXISTS ocr; DROP TABLE IF EXISTS stamps")
         }
         try exec("""
             CREATE TABLE IF NOT EXISTS units (doc TEXT NOT NULL, page TEXT NOT NULL, version TEXT NOT NULL,
@@ -202,6 +202,7 @@ final class SearchDatabase {
             CREATE INDEX IF NOT EXISTS blocks_unit ON blocks(doc, page);
             CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(text, alts, tokenize = 'unicode61 remove_diacritics 2');
             CREATE TABLE IF NOT EXISTS ocr (key TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS stamps (doc TEXT PRIMARY KEY, stamp TEXT NOT NULL);
             """)
         do {
             try exec("CREATE VIRTUAL TABLE IF NOT EXISTS tri USING fts5(text, alts, tokenize = 'trigram')")
@@ -333,10 +334,17 @@ final class SearchDatabase {
         try transaction { try deleteRows("doc = ? AND page = ?", [.text(doc.raw), .text(key)]) }
     }
 
+    /// Drops everything stored for a document: its units, its stamp and its cached OCR results.
     func removeDocument(_ doc: DocumentID) throws {
         lock.lock()
         defer { lock.unlock() }
-        try transaction { try deleteRows("doc = ?", [.text(doc.raw)]) }
+        try transaction {
+            try deleteRows("doc = ?", [.text(doc.raw)])
+            try run("DELETE FROM stamps WHERE doc = ?", [.text(doc.raw)])
+            let image = SearchDatabase.ocrPrefix("img", doc), pdf = SearchDatabase.ocrPrefix("pdf", doc)
+            try run("DELETE FROM ocr WHERE substr(key, 1, length(?)) = ? OR substr(key, 1, length(?)) = ?",
+                    [.text(image), .text(image), .text(pdf), .text(pdf)])
+        }
     }
 
     func removeAll() throws {
@@ -348,10 +356,46 @@ final class SearchDatabase {
             try run("DELETE FROM blocks")
             try run("DELETE FROM units")
             try run("DELETE FROM ocr")
+            try run("DELETE FROM stamps")
         }
     }
 
+    /// Sets the stored position of pages (unit key → 0-based index among live pages) where it changed.
+    func setPageIndexes(doc: DocumentID, _ indexes: [String: Int]) throws {
+        guard !indexes.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        try transaction {
+            for (key, index) in indexes {
+                try run("UPDATE units SET page_index = ? WHERE doc = ? AND page = ? AND page_index IS NOT ?",
+                        [.int(Int64(index)), .text(doc.raw), .text(key), .int(Int64(index))])
+            }
+        }
+    }
+
+    // MARK: Document stamps (what the last completed sweep pass over a document saw)
+
+    func stamp(doc: DocumentID) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        let rows = (try? query("SELECT stamp FROM stamps WHERE doc = ?", [.text(doc.raw)]) { $0.text(0) }) ?? []
+        return rows.first ?? nil
+    }
+
+    func setStamp(doc: DocumentID, _ stamp: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try run("INSERT OR REPLACE INTO stamps (doc, stamp) VALUES (?, ?)", [.text(doc.raw), .text(stamp)])
+    }
+
     // MARK: OCR cache (image items and text-less PDF pages, keyed by immutable asset + language)
+
+    /// Keys are "<kind>|<doc>|<asset>|…" (kind img or pdf), so a document's rows share this prefix.
+    static func ocrPrefix(_ kind: String, _ doc: DocumentID) -> String { kind + "|" + doc.raw + "|" }
+
+    static func ocrKey(_ kind: String, _ doc: DocumentID, _ parts: [String]) -> String {
+        ocrPrefix(kind, doc) + parts.joined(separator: "|")
+    }
 
     func ocr(_ key: String) -> Data? {
         lock.lock()

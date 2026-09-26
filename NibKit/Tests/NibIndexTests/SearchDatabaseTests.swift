@@ -120,6 +120,45 @@ final class SearchDatabaseTests: XCTestCase {
         XCTAssertNil(reopened.ocr("missing"))
     }
 
+    func testRemoveDocumentDropsItsOCRCacheAndStamp() throws {
+        let db = try SearchDatabase(url: nil)
+        // An id that extends docA's and contains a LIKE wildcard must survive docA's removal.
+        let lookalike: DocumentID = "DOCUMENTAAAA_2"
+        let image = SearchDatabase.ocrKey("img", docA, ["x.png", "en-US"])
+        let pdf = SearchDatabase.ocrKey("pdf", docA, ["y.pdf", "0", "en-US"])
+        let other = SearchDatabase.ocrKey("img", docB, ["x.png", "en-US"])
+        let similar = SearchDatabase.ocrKey("img", lookalike, ["x.png", "en-US"])
+        for key in [image, pdf, other, similar] { db.setOCR(key, Data("{}".utf8)) }
+        try db.replaceUnit(unit(docA, "P1"), blocks: [block("alpha")])
+        try db.setStamp(doc: docA, "s1")
+        try db.setStamp(doc: docB, "s2")
+        XCTAssertEqual(db.stamp(doc: docA), "s1")
+
+        try db.removeDocument(docA)
+        XCTAssertNil(db.ocr(image))
+        XCTAssertNil(db.ocr(pdf))
+        XCTAssertNotNil(db.ocr(other))
+        XCTAssertNotNil(db.ocr(similar))
+        XCTAssertNil(db.stamp(doc: docA))
+        XCTAssertEqual(db.stamp(doc: docB), "s2")
+        XCTAssertTrue(try search(db, "alpha").isEmpty)
+
+        try db.removeAll()
+        XCTAssertNil(db.stamp(doc: docB))
+        XCTAssertNil(db.ocr(other))
+    }
+
+    func testSetPageIndexesUpdatesStoredPositions() throws {
+        let db = try SearchDatabase(url: nil)
+        try db.replaceUnit(unit(docA, "P1"), blocks: [block("alpha")])
+        try db.replaceUnit(unit(docA, "P2"), blocks: [block("beta")])
+        try db.setPageIndexes(doc: docA, ["P1": 1, "P2": 0, "GONE": 7])
+        XCTAssertEqual(try search(db, "alpha").first?.pageIndex, 1)
+        XCTAssertEqual(try search(db, "beta").first?.pageIndex, 0)
+        XCTAssertEqual(db.version(doc: docA, key: "P1"), "v1", "positions change without touching versions")
+        XCTAssertNil(db.version(doc: docA, key: "GONE"))
+    }
+
     func testTranscriptFilesMergePerLineByRev() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("nib-transcript-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

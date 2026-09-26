@@ -45,13 +45,27 @@ final class VisionRecognizer: TextRecognizer {
         }
     }
 
-    /// Lines with words and stroke ids (what `recognize.items` and the index store).
+    /// Lines with words and stroke ids (what `recognize.items` and the index store). Strokes are grouped by
+    /// `InkLayout.plan`, so notes spread over a large board or page are each rendered at the target x-height instead of
+    /// sharing one downscaled bitmap.
     func recognizeInk(_ items: [Item], language: String) async throws -> [InkLine] {
         let strokes = items.filter { $0.kind == .stroke && !($0.stroke?.points.isEmpty ?? true) }
-        guard let render = InkRender.make(strokes) else { return [] }
-        let observations = try VisionRecognizer.perform(render.image, languages: VisionRecognizer.languages(for: language),
-                                                        minimumTextPixels: InkLayout.targetXHeight / 2)
-        return observations.compactMap { o -> InkLine? in
+        let plan = InkLayout.plan(strokes.map { InkRender.bounds(of: $0) })
+        let languages = VisionRecognizer.languages(for: language)
+        var out: [InkLine] = []
+        for group in plan.groups {
+            try Task.checkCancellation()
+            let members = group.map { strokes[$0] }
+            guard let render = InkRender.make(members, scale: plan.scale) else { continue }
+            let observations = try VisionRecognizer.perform(render.image, languages: languages,
+                                                            minimumTextPixels: InkLayout.targetXHeight / 2)
+            out += VisionRecognizer.lines(observations, render: render, strokes: members)
+        }
+        return out
+    }
+
+    static func lines(_ observations: [VNRecognizedTextObservation], render: InkRender, strokes: [Item]) -> [InkLine] {
+        observations.compactMap { o -> InkLine? in
             let candidates = o.topCandidates(3)
             guard let top = candidates.first else { return nil }
             let text = top.string
@@ -138,13 +152,19 @@ struct InkRender {
                     width: Double(r.width) * width / scale, height: Double(r.height) * height / scale)
     }
 
-    static func make(_ strokes: [Item]) -> InkRender? {
+    /// Bounds of a stroke's centre line (what the render scale and grouping are measured on).
+    static func bounds(of item: Item) -> Rect {
+        item.stroke.flatMap { Rect.bounding($0.polyline) } ?? .zero
+    }
+
+    /// Renders the strokes at `scale` pixels per point (reduced only if the render would exceed the caps).
+    static func make(_ strokes: [Item], scale target: Double) -> InkRender? {
         let list = strokes.compactMap { $0.stroke }.filter { !$0.points.isEmpty }
         let rects = list.compactMap { Rect.bounding($0.polyline) }
         guard var bounds = rects.first else { return nil }
         for r in rects.dropFirst() { bounds = bounds.union(r) }
-        let scale = InkLayout.renderScale(strokeHeights: rects.map { $0.height }, bounds: bounds)
-        let margin = 16.0
+        let scale = InkLayout.cappedScale(target, bounds: bounds)
+        let margin = InkLayout.margin
         let w = Int((bounds.width * scale + 2 * margin).rounded(.up)), h = Int((bounds.height * scale + 2 * margin).rounded(.up))
         guard w > 0, h > 0,
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
@@ -179,23 +199,119 @@ struct InkRender {
     }
 }
 
+/// Strokes grouped for recognition renders (indices into the stroke list), all rendered at `scale` pixels per point.
+struct InkPlan: Equatable {
+    var scale: Double
+    var groups: [[Int]]
+}
+
 /// Pure geometry shared by recognition, `recognize.items` and the index.
 enum InkLayout {
     /// Target x-height of handwriting in the recognition render (pixels).
     static let targetXHeight = 32.0
     static let maxSide = 4096.0
     static let maxPixels = 16_000_000.0
+    /// White border around the ink in a render (pixels).
+    static let margin = 16.0
 
-    /// Pixels per point so the median stroke's x-height lands near `targetXHeight`, capped so the render stays
-    /// within `maxSide` × `maxSide` and `maxPixels`.
-    static func renderScale(strokeHeights: [Double], bounds: Rect) -> Double {
-        let tall = strokeHeights.filter { $0 > 1 }.sorted()
-        let median = tall.isEmpty ? 10 : tall[tall.count / 2]
+    /// Median height of the strokes taller than 1 pt (10 pt when there are none).
+    static func medianHeight(_ heights: [Double]) -> Double {
+        let tall = heights.filter { $0 > 1 }.sorted()
+        return tall.isEmpty ? 10 : tall[tall.count / 2]
+    }
+
+    /// Pixels per point so the median stroke's x-height lands near `targetXHeight`.
+    static func targetScale(strokeHeights: [Double]) -> Double {
         // A stroke spans ~1.4 x-heights on average (ascenders, descenders, joined letters).
-        var scale = min(max(targetXHeight / max(median / 1.4, 1), 0.5), 12)
-        scale = min(scale, maxSide / max(bounds.width, bounds.height, 1))
-        scale = min(scale, (maxPixels / max(bounds.width * bounds.height, 1)).squareRoot())
-        return scale
+        min(max(targetXHeight / max(medianHeight(strokeHeights) / 1.4, 1), 0.5), 12)
+    }
+
+    /// `scale`, lowered only as far as needed for a render of `bounds` (plus margins) to stay within `maxSide` ×
+    /// `maxSide` and `maxPixels`.
+    static func cappedScale(_ scale: Double, bounds: Rect) -> Double {
+        var s = min(scale, (maxSide - 2 * margin) / max(bounds.width, bounds.height, 1))
+        s = min(s, (maxPixels / max(bounds.width * bounds.height, 1)).squareRoot())
+        return s
+    }
+
+    /// The scale one render of all these strokes would use.
+    static func renderScale(strokeHeights: [Double], bounds: Rect) -> Double {
+        cappedScale(targetScale(strokeHeights: strokeHeights), bounds: bounds)
+    }
+
+    /// Groups strokes (given by their bounds) into renders that all keep the page's target scale:
+    /// 1. strokes whose bounds, grown by half a median stroke height, touch form clusters (union-find; very long
+    ///    strokes such as arrows or frames are not text and never link clusters together);
+    /// 2. a cluster too big for one render at the target scale is cut into tiles (each stroke joins the tile holding
+    ///    its centre, and tiles leave room for strokes that straddle an edge);
+    /// 3. clusters and tiles, in reading order, share a render while their union still fits, so a normal page is
+    ///    still read in one pass.
+    static func plan(_ bounds: [Rect]) -> InkPlan {
+        guard !bounds.isEmpty else { return InkPlan(scale: 1, groups: []) }
+        let heights = bounds.map { $0.height }
+        let scale = targetScale(strokeHeights: heights)
+        let gap = medianHeight(heights)
+        let tile = (min(maxSide, maxPixels.squareRoot()) - 2 * margin) * 0.85 / scale
+        let linkLimit = tile * 0.15
+        func fits(_ r: Rect) -> Bool { cappedScale(scale, bounds: r) >= scale }
+        func box(_ ids: [Int]) -> Rect { ids.dropFirst().reduce(bounds[ids[0]]) { $0.union(bounds[$1]) } }
+
+        var parent = Array(bounds.indices)
+        func root(_ i: Int) -> Int {
+            var i = i
+            while parent[i] != i {
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            }
+            return i
+        }
+        let grown = bounds.map { $0.insetBy(-gap / 2) }
+        let linkable = bounds.indices.filter { max(bounds[$0].width, bounds[$0].height) <= linkLimit }
+            .sorted { grown[$0].minX < grown[$1].minX }
+        // Sweep along x: only strokes whose grown boxes overlap in x are compared.
+        for (a, i) in linkable.enumerated() {
+            var b = a + 1
+            while b < linkable.count, grown[linkable[b]].minX <= grown[i].maxX {
+                let j = linkable[b]
+                if grown[j].minY <= grown[i].maxY && grown[i].minY <= grown[j].maxY {
+                    let ri = root(i), rj = root(j)
+                    if ri != rj { parent[rj] = ri }
+                }
+                b += 1
+            }
+        }
+        var clusters: [Int: [Int]] = [:]
+        for i in bounds.indices { clusters[root(i), default: []].append(i) }
+
+        var pieces: [(ids: [Int], box: Rect)] = []
+        for ids in clusters.values {
+            let b = box(ids)
+            if fits(b) {
+                pieces.append((ids, b))
+                continue
+            }
+            var tiles: [Int: [Int]] = [:]
+            let columns = Int((b.width / tile).rounded(.down)) + 1
+            for i in ids {
+                let c = bounds[i].center
+                let col = min(Int(((c.x - b.minX) / tile).rounded(.down)), columns - 1)
+                let row = Int(((c.y - b.minY) / tile).rounded(.down))
+                tiles[row * columns + col, default: []].append(i)
+            }
+            for t in tiles.values { pieces.append((t, box(t))) }
+        }
+        pieces.sort { ($0.box.minY, $0.box.minX, $0.ids.min() ?? 0) < ($1.box.minY, $1.box.minX, $1.ids.min() ?? 0) }
+
+        var groups: [(ids: [Int], box: Rect)] = []
+        for p in pieces {
+            if let g = groups.firstIndex(where: { fits($0.box.union(p.box)) }) {
+                groups[g].ids += p.ids
+                groups[g].box = groups[g].box.union(p.box)
+            } else {
+                groups.append(p)
+            }
+        }
+        return InkPlan(scale: scale, groups: groups.map { $0.ids.sorted() })
     }
 
     static func overlap(_ a: Rect, _ b: Rect) -> Double {
