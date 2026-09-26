@@ -35,6 +35,10 @@ struct NavItem: Identifiable, Equatable {
     var isOn = false
     var order: Int
     var action: Action
+    /// A feature item's live `isEnabled` (contracts-v2): greyed out and not tappable when false.
+    var isEnabled = true
+    /// `ToolbarItemDescriptor.showsInCompactWidth`: false keeps the item off the bar (and More) on compact width.
+    var showsInCompactWidth = true
 }
 
 struct NavBarItems: Equatable {
@@ -45,8 +49,9 @@ struct NavBarItems: Equatable {
 }
 
 /// Builds the nav bar (D-079): leading Library, Sidebar, Search, Assistant, Read Only, Bookmark; trailing Add Page,
-/// Share and Export, More; plus every `ui.toolbar` item registered for `navLeading` / `navTrailing`. A feature that
-/// registers its own item for one of these commands replaces the chrome's built-in one.
+/// Share and Export, More; plus every `ui.toolbar` item registered for `navLeading` / `navTrailing`, with its live
+/// state evaluated for the window's session (contracts-v2 `isOn`, `isEnabled`, `sessionParams`, `sessionTitle`,
+/// `sessionIcon`). A feature that registers its own item for one of these commands replaces the chrome's built-in one.
 @MainActor
 enum NavBarModel {
     static let library = "chrome.nav.library"
@@ -73,6 +78,8 @@ enum NavBarModel {
         var registered: [ToolbarItemDescriptor]
         var commandExists: @MainActor (String) -> Bool
         var hasMenu: @MainActor (MenuLocation) -> Bool
+        /// The window the live state of registered items is evaluated for (nil: their static values).
+        var session: EditorSession? = nil
     }
 
     static func build(_ input: Input) -> NavBarItems {
@@ -80,7 +87,7 @@ enum NavBarModel {
         var trailing: [NavItem] = []
         var features: [NavItem] = []
         for descriptor in input.registered where descriptor.group == .navLeading || descriptor.group == .navTrailing {
-            guard let item = navItem(for: descriptor, tool: input.tool) else { continue }
+            guard let item = navItem(for: descriptor, tool: input.tool, session: input.session) else { continue }
             features.append(item)
             if descriptor.group == .navLeading {
                 leading.append(item)
@@ -145,7 +152,8 @@ enum NavBarModel {
     }
 
     /// Compact windows (DESIGN.md §14.2, iPhone): leading keeps Library (the title joins it); trailing keeps the first
-    /// feature item (Undo), the Assistant and More; everything else moves into More.
+    /// feature item (Undo), the Assistant and More; everything else moves into More. Items registered for regular
+    /// widths only (`showsInCompactWidth` false) do not show at all.
     static func split(_ items: NavBarItems, compact: Bool) -> NavBarItems {
         guard compact else { return items }
         var leading: [NavItem] = []
@@ -153,14 +161,14 @@ enum NavBarModel {
         var kept: NavItem?
         var more: NavItem?
         var overflow: [NavItem] = []
-        for item in items.leading {
+        for item in items.leading where item.showsInCompactWidth {
             switch item.id {
             case library: leading.append(item)
             case assistant: assistantItem = item
             default: overflow.append(item)
             }
         }
-        for item in items.trailing {
+        for item in items.trailing where item.showsInCompactWidth {
             if item.id == NavBarModel.more {
                 more = item
             } else if case .menu = item.action {
@@ -175,18 +183,26 @@ enum NavBarModel {
         return NavBarItems(leading: leading, trailing: trailing, overflow: overflow)
     }
 
-    static func navItem(for descriptor: ToolbarItemDescriptor, tool: String) -> NavItem? {
+    /// A registered nav item as the window sees it now: `resolvedParams`, `resolvedTitle`, `resolvedIcon`, and its
+    /// `isOn` / `isEnabled` (a tool item without `isOn` is on while it is the selected tool).
+    static func navItem(for descriptor: ToolbarItemDescriptor, tool: String, session: EditorSession? = nil) -> NavItem? {
         let action: NavItem.Action
         if let command = descriptor.command {
-            action = .command(command, descriptor.params)
+            action = .command(command, session.map { descriptor.resolvedParams(for: $0) } ?? descriptor.params)
         } else if let toolID = descriptor.toolID {
             action = .command(CommandIDs.toolSelect, ["tool": .string(toolID)])
         } else {
             return nil
         }
-        return NavItem(id: descriptor.id, title: descriptor.title,
-                       symbol: NibSymbol(systemName: descriptor.icon) ?? .puzzle,
-                       isOn: descriptor.toolID != nil && descriptor.toolID == tool, order: descriptor.order, action: action)
+        let title = session.map { descriptor.resolvedTitle(for: $0) } ?? descriptor.title
+        let icon = session.map { descriptor.resolvedIcon(for: $0) } ?? descriptor.icon
+        var isOn = descriptor.toolID != nil && descriptor.toolID == tool
+        if let session, let live = descriptor.isOn { isOn = live(session) }
+        var isEnabled = true
+        if let session, let live = descriptor.isEnabled { isEnabled = live(session) }
+        return NavItem(id: descriptor.id, title: title, symbol: NibSymbol(systemName: icon) ?? .puzzle, isOn: isOn,
+                       order: descriptor.order, action: action, isEnabled: isEnabled,
+                       showsInCompactWidth: descriptor.showsInCompactWidth)
     }
 
     /// Two owners registering the same command with the same params show once.
@@ -219,7 +235,7 @@ enum NavBarModel {
 /// Three Clear bar droplets: leading actions, the title (tap for the document menu) and trailing menus. In compact
 /// windows the title rides in the leading bar.
 struct NavBarView: View {
-    let chrome: ChromeContext
+    let chrome: ChromeWindow
     let items: NavBarItems
     let title: String
     let subtitle: String?
@@ -293,7 +309,9 @@ struct NavBarView: View {
                 NibToolbarItem(item.symbol, label: item.title, isOn: item.isOn) { chrome.tap(command, params) }
                     .contextMenu { sidebarModes(command, visible: item.isOn) }
             } else {
+                // NibDesign buttons dim themselves when disabled.
                 NibToolbarItem(item.symbol, label: item.title, isOn: item.isOn) { chrome.tap(command, params) }
+                    .disabled(!item.isEnabled)
             }
         }
     }
@@ -329,6 +347,26 @@ struct NavBarView: View {
     }
 }
 
+/// The nav bar in its strip. Its own view: it alone observes the live descriptor state (`ChromeLiveState`), so a
+/// commit or a selection change re-evaluates the bar and nothing else of the chrome.
+struct NavBarHost: View {
+    let chrome: ChromeWindow
+    @ObservedObject var live: ChromeLiveState
+    let snapshot: ChromeDocumentModel.Snapshot
+    let layout: ChromeLayout
+    let sidebarMode: SidebarMode
+    @Binding var openMenu: ChromeMenu?
+
+    var body: some View {
+        let items = chrome.navItems(snapshot: snapshot, compact: layout.isCompact)
+        NavBarView(chrome: chrome, items: items, title: snapshot.title, subtitle: NavBarModel.subtitle(snapshot),
+                   readOnly: snapshot.readOnly, titleHasMenu: !chrome.menuItems(.documentTitle).isEmpty,
+                   compact: layout.isCompact, sidebarMode: sidebarMode, openMenu: $openMenu)
+            .frame(width: layout.bar.width, height: layout.bar.height)
+            .position(x: layout.bar.midX, y: layout.bar.midY)
+    }
+}
+
 // MARK: - Popovers
 
 struct ChromeMenuRow: Identifiable {
@@ -338,8 +376,12 @@ struct ChromeMenuRow: Identifiable {
     var destructive = false
     /// Rows with the same section are grouped under it (a menu item's `submenu`).
     var section: String? = nil
-    /// A toggle that moved into More (Sidebar, Read Only, Bookmark): a checkmark while it is on.
+    /// A checkmark: a toggle that moved into More (Sidebar, Read Only, Bookmark) while it is on, or an entry's live
+    /// `isChecked` (contracts-v2).
     var isOn = false
+    var isEnabled = true
+    /// A display-only shortcut label ("⌃⌘S", `MenuItemDescriptor.shortcut`).
+    var shortcut: String? = nil
     let action: () -> Void
 }
 
@@ -439,6 +481,10 @@ struct ChromeMenuList: View {
                             .foregroundStyle(row.destructive ? NibColor.destructive : NibColor.label)
                             .multilineTextAlignment(.leading)
                         Spacer(minLength: NibSpacing.s)
+                        if let shortcut = row.shortcut {
+                            KeyHint(shortcut)
+                                .accessibilityHidden(true)
+                        }
                         if row.isOn {
                             Image(nib: .checkmark)
                                 .font(NibFont.glyph(.panel))
@@ -450,6 +496,8 @@ struct ChromeMenuList: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)))
+                .disabled(!row.isEnabled)
+                .opacity(row.isEnabled ? 1 : NibOpacity.disabled)
                 .accessibilityAddTraits(row.isOn ? .isSelected : [])
             }
         }

@@ -29,14 +29,25 @@ struct ChromeLayout: Equatable {
     var bar: CGRect
     /// The editor (canvas) frame: the whole window unless a sidebar is docked.
     var editor: CGRect
-    /// The toolbar's region: below the bars, beside any sidebar, so the palette never docks under a panel.
+    /// The tool palette's layer (`ui.screens.toolbarView`): the full window height, between open sidebars, so the
+    /// palette never docks under a panel and its right dock moves to a docked assistant's leading edge. NibDesign's
+    /// dock region keeps the palette below the bars by itself (safe area + 8 + 44 + 16).
     var toolbar: CGRect
+    /// The window's safe area where it overlaps `toolbar`, as padding: the chrome's root ignores the safe area, so
+    /// without it the top dock would sit under the status bar and the bottom dock over the home indicator.
+    var toolbarInsets: EdgeInsets
     var left: CGRect?
     var right: CGRect?
     /// Window mode: the sidebar's panel over the whole window below the bars.
     var window: CGRect?
     /// Where floating panels may rest.
     var floatingRegion: CGRect
+    /// Where chrome overlays rest (contracts-v2 `ChromeOverlayDescriptor`): inside the safe area, below the bars,
+    /// between open sidebars, 16 pt above the bottom safe area (on iPhone above the bottom palette: 56 + 8 + 16).
+    var overlayRegion: CGRect
+    /// The frame `.nibToast` places toasts at the bottom of (24 pt above its bottom edge): the safe area's bottom, on
+    /// iPhone the overlay region's, so a toast never covers the palette.
+    var toast: CGRect
 
     /// `left` / `right`: the width of the panel a side shows, nil when that side is closed.
     init(size: CGSize, safeArea: UIEdgeInsets, left leftWidth: CGFloat?, right rightWidth: CGFloat?, mode: SidebarMode) {
@@ -81,25 +92,37 @@ struct ChromeLayout: Equatable {
         let docked = presentation == .docked
         let floatMinX = docked ? max(minX, (left?.maxX ?? 0) + inset) : minX
         let floatMaxX = docked ? max(floatMinX, min(maxX, (right?.minX ?? width) - inset)) : maxX
+        let overlayMinX = max(minX, left.map { $0.maxX + inset } ?? minX)
+        let overlayMaxX = max(overlayMinX, min(maxX, right.map { $0.minX - inset } ?? maxX))
+        let overlayBottom = compact ? height - safeArea.bottom - NibMetrics.canvasBottomInsetCompact
+                                    : height - safeArea.bottom - inset
+        let overlay = CGRect(x: overlayMinX, y: top, width: overlayMaxX - overlayMinX,
+                             height: max(0, overlayBottom - top))
 
         self.isCompact = compact
         self.presentation = presentation
         self.bar = bar
         self.editor = editor
-        self.toolbar = CGRect(x: toolMinX, y: bar.maxY, width: toolMaxX - toolMinX, height: max(0, height - bar.maxY))
+        self.toolbar = CGRect(x: toolMinX, y: 0, width: toolMaxX - toolMinX, height: height)
+        self.toolbarInsets = EdgeInsets(top: safeArea.top, leading: max(0, safeArea.left - toolMinX),
+                                        bottom: safeArea.bottom, trailing: max(0, toolMaxX - (width - safeArea.right)))
         self.left = left
         self.right = right
         self.window = window
         self.floatingRegion = CGRect(x: floatMinX, y: top, width: floatMaxX - floatMinX, height: bottom - top)
+        self.overlayRegion = overlay
+        let toastBottom = compact ? overlay.maxY + NibSpacing.xxl : height - safeArea.bottom
+        self.toast = CGRect(x: toolMinX, y: 0, width: toolMaxX - toolMinX, height: max(0, toastBottom))
     }
 }
 
 // MARK: - Shared context
 
-/// Everything a chrome view needs to act: the app, the window's session and chrome state. UI actions go through
-/// `tap`/`run`, which run commands as the user, so plugins, the AI and the bridge can do the same things.
+/// Everything a chrome view needs to act in one window: the app, the window's session and chrome state. UI actions go
+/// through `tap`/`run`, which run commands as the user, so plugins, the AI and the bridge can do the same things.
+/// (Not `ChromeContext`: that is the contracts' context handed to chrome overlays.)
 @MainActor
-final class ChromeContext {
+final class ChromeWindow {
     let app: NibApp
     let doc: DocumentID
     let session: EditorSession
@@ -142,20 +165,25 @@ final class ChromeContext {
         return NavBarModel.dedupe(app.ui.menuItems(location, context), context: context)
     }
 
-    func panelContext(_ id: String) -> PanelContext {
-        PanelContext(app: app, session: session, navigator: navigator, dismiss: { [weak self] in self?.closePanel(id) })
+    /// What a panel gets (contracts-v2): the params `panel.open` was called with and how the chrome shows it.
+    func panelContext(_ id: String, presentation: PanelPresentation) -> PanelContext {
+        var context = PanelContext(app: app, session: session, navigator: navigator,
+                                   dismiss: { [weak self] in self?.closePanel(id) })
+        context.params = state.params[id] ?? [:]
+        context.presentation = presentation
+        return context
     }
 
     /// A panel's own Close runs `panel.close`, so hooks, plugins and the bridge see what closed.
     func closePanel(_ id: String) {
-        tap("panel.close", ["id": .string(id)])
+        tap(CommandIDs.panelClose, ["id": .string(id)])
     }
 
     /// Swiping a sheet or cover away: SwiftUI needs its binding to settle at once, so the state closes first and
     /// `panel.close` follows.
     func dismissPanel(_ id: String) {
         state.close(id)
-        run("panel.close", ["id": .string(id)])
+        run(CommandIDs.panelClose, ["id": .string(id)])
     }
 
     /// Open panels move to where the settings now put them; unregistered panels and panels a document of `kind` does
@@ -166,29 +194,60 @@ final class ChromeContext {
         state.reconcile { PanelResolver.target($0, panels: panels, kind: kind, settings: settings) }
     }
 
-    /// Native panels get the chrome's header; plugin panels draw theirs (NibPluginPanelChrome, F081).
-    func drawsHeader(_ panel: PanelDescriptor) -> Bool { app.featureIDs.contains(panel.owner) }
+    /// The chrome adds its `NibPanelHeader` unless the panel draws its own (contracts-v2 `providesHeader`: plugin
+    /// panels with NibPluginPanelChrome, F081).
+    func drawsHeader(_ panel: PanelDescriptor) -> Bool { !panel.providesHeader }
 
     func sidebarTabs(_ side: SidebarSide, kind: DocumentKind) -> [PanelDescriptor] {
         PanelResolver.tabs(app.ui.panels.all, side: side, kind: kind, settings: app.settings)
     }
 
-    /// The AI chat panel (F085), which the nav bar's Assistant button opens.
+    /// The AI chat panel (F085, `PanelIDs.assistant`), which the nav bar's Assistant button opens.
     func assistantPanel(kind: DocumentKind) -> PanelDescriptor? {
-        app.ui.panels.all.first {
-            $0.owner == "aichat" && $0.placement != .libraryTab && PanelResolver.accepts($0, kind: kind)
-        }
+        guard let panel = app.ui.panels.get(PanelIDs.assistant), panel.placement != .libraryTab,
+              PanelResolver.accepts(panel, kind: kind) else { return nil }
+        return panel
     }
 
-    /// Back to the library, in the document's folder. `library.setView` (F019) runs when it is installed; returning the
-    /// window to the library has no command yet (contract request), so the navigator does it.
+    /// The nav bar for this window now (live descriptor state evaluated for its session).
+    func navItems(snapshot: ChromeDocumentModel.Snapshot, compact: Bool) -> NavBarItems {
+        let assistant = assistantPanel(kind: snapshot.kind)
+        let hasSidebar = !sidebarTabs(.left, kind: snapshot.kind).isEmpty || !sidebarTabs(.right, kind: snapshot.kind).isEmpty
+        let input = NavBarModel.Input(
+            doc: doc, kind: snapshot.kind, page: snapshot.page, readOnly: snapshot.readOnly,
+            bookmarked: snapshot.bookmarked, tool: snapshot.tool, hasSidebar: hasSidebar,
+            sidebarVisible: !state.tabs.isEmpty, assistantPanel: assistant?.id,
+            assistantOpen: assistant.map { state.spot(of: $0.id) != nil } ?? false,
+            registered: app.ui.toolbarItems(for: snapshot.kind),
+            commandExists: { [weak self] in self?.has($0) ?? false },
+            hasMenu: { [weak self] in !(self?.menuItems($0).isEmpty ?? true) },
+            session: session)
+        return NavBarModel.split(NavBarModel.build(input), compact: compact)
+    }
+
+    /// Back to the library, in the document's folder: `window.showLibrary` (contracts-v2), then `library.setView`
+    /// (F019) when it is installed. The tap happened in this window, so it is the most recently active one, which is
+    /// the window `window.showLibrary` acts on.
     func goToLibrary() {
         let folder = app.services.library?.node(doc)?.parent
-        if has("library.setView") {
-            let params: JSONValue = folder.map { f -> JSONValue in ["folder": .string(NodeRef.folder(f).description)] } ?? [:]
-            run("library.setView", params)
+        let params: JSONValue = folder.map { f -> JSONValue in ["folder": .string(NodeRef.folder(f).description)] } ?? [:]
+        if let navigator, app.ui.activeNavigator !== navigator { app.ui.activeNavigator = navigator }
+        let setsView = has("library.setView")
+        let app = self.app
+        let session = self.session
+        Task { @MainActor in
+            var command = CommandIDs.windowShowLibrary
+            do {
+                try await app.bus.execute(command, params, session: session)
+                if setsView {
+                    command = "library.setView"
+                    try await app.bus.execute(command, params, session: session)
+                }
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                                userInfo: ["command": command, "error": NibError.wrap(error)])
+            }
         }
-        navigator?.showLibrary(folder: folder)
     }
 }
 
@@ -226,13 +285,13 @@ final class ChromeDocumentModel: ObservableObject {
     @Published private(set) var revision = 0
     /// The document's live pages in order, re-read on commits (not published: the backdrop reads them while scrolling).
     private(set) var pages: [PageRecord] = []
-    private let chrome: ChromeContext
+    private let chrome: ChromeWindow
     private var page: PageID?
     private var readOnly: Bool
     private var tool: String
     private var cancellables = Set<AnyCancellable>()
 
-    init(chrome: ChromeContext) {
+    init(chrome: ChromeWindow) {
         let session = chrome.session
         self.chrome = chrome
         page = session.page
@@ -305,7 +364,7 @@ final class ChromeDocumentModel: ObservableObject {
         refresh()
     }
 
-    private static func read(_ chrome: ChromeContext, page: PageID?, readOnly: Bool,
+    private static func read(_ chrome: ChromeWindow, page: PageID?, readOnly: Bool,
                              tool: String) -> (Snapshot, [PageRecord]) {
         let app = chrome.app
         let content = try? app.workspace.content(chrome.doc)
@@ -326,6 +385,46 @@ final class ChromeDocumentModel: ObservableObject {
     }
 }
 
+/// Ticks whenever the live state of nav-bar items may have changed (contracts-v2 `isOn`, `isEnabled`, `sessionTitle`,
+/// `sessionIcon`, `sessionParams`): commits, undo and redo in this document, the window's selection and open panels,
+/// and `UIRegistries.setNeedsChromeUpdate`. Only the nav bar observes it, so a stroke's commit re-evaluates the bar and
+/// nothing else.
+@MainActor
+final class ChromeLiveState: ObservableObject {
+    @Published private(set) var tick = 0
+    private var pending = false
+    private var cancellables = Set<AnyCancellable>()
+
+    init(chrome: ChromeWindow) {
+        let doc = chrome.doc
+        let commits = chrome.app.bus.observeCommits { [weak self] changeset in
+            if changeset.documents.contains(doc) { self?.bump() }
+        }
+        cancellables.insert(AnyCancellable { commits.cancel() })
+        let session = chrome.session
+        let sessionID = session.id.raw
+        session.$selection.map { _ in () }
+            .merge(with: session.$openPanels.map { _ in () })
+            .sink { [weak self] _ in self?.bump() }
+            .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: .nibChromeNeedsUpdate)
+            .filter { note in (note.userInfo?["session"] as? String).map { $0 == sessionID } ?? true }
+            .sink { [weak self] _ in self?.bump() }
+            .store(in: &cancellables)
+    }
+
+    /// One re-evaluation per main-actor turn, after the change has landed (@Published announces before it stores).
+    func bump() {
+        guard !pending else { return }
+        pending = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.pending = false
+            self.tick &+= 1
+        }
+    }
+}
+
 /// The visible light pages under the droplet container (`nibBackdrop`, DESIGN.md §3.3): droplets over them get the
 /// paper optics and recede while the Pencil is down. Dark papers are left out.
 @MainActor
@@ -337,12 +436,13 @@ final class ChromeBackdrop: ObservableObject {
     /// `live`: the document's pages in order; `current`: the index of the session's page. Pages lie in order, so the
     /// visible ones are a run around the current page: the walk stops at the first page off screen on each side, and a
     /// scroll tick costs the visible pages, not the document.
-    func update(chrome: ChromeContext, live: [PageRecord], current: Int?, in view: UIView) {
+    func update(chrome: ChromeWindow, live: [PageRecord], current: Int?, in view: UIView) {
         guard let host = chrome.session.editor?.canvasHost, !live.isEmpty else {
             if !pages.isEmpty { pages = [] }
             return
         }
-        let source: UIView = (host as? UIViewController)?.view ?? host.canvasView
+        // `pageFrame` is in the canvas view's bounds coordinates, which move with scrolling (contracts-v2 G14).
+        let source = host.canvasView
         func visibleFrame(_ index: Int) -> CGRect? {
             guard let frame = host.pageFrame(live[index].id) else { return nil }
             let rect = source.convert(frame, to: view)
@@ -389,6 +489,55 @@ final class ChromeBackdrop: ObservableObject {
     }
 }
 
+/// Mirrors the window's Pencil state (contracts-v2 `EditorSession.inking`, which the canvas writes) into the droplet
+/// container's `NibInkingState`, the one thing the container reads: bars, the palette, panels and overlays over the
+/// page or near the stroke recede to 22 % and stop sampling the page (DESIGN.md §10.8). Stroke bounds arrive in window
+/// coordinates and are handed on in the container's. `recedes` holds from Pencil down until 450 ms after it lifts (the
+/// container's own timing), for the overlays the chrome fades itself.
+@MainActor
+final class ChromeInkingMirror: ObservableObject {
+    let state = NibInkingState()
+    @Published private(set) var recedes = false
+    /// The container's view, for converting window coordinates (nil or off screen: they are used as they are).
+    weak var view: UIView?
+    private var subscription: AnyCancellable?
+    private var restoreGeneration = 0
+    private var restorePending = false
+
+    init(session: EditorSession) {
+        let signal = session.inking
+        let token = signal.observe { [weak self] in self?.mirror($0) }
+        subscription = AnyCancellable { token.cancel() }
+        mirror(signal)
+    }
+
+    func mirror(_ signal: InkingSignal) {
+        let bounds = signal.strokeBounds.map { containerRect($0) } ?? .null
+        if state.isInking != signal.isInking { state.isInking = signal.isInking }
+        if state.strokeBounds != bounds { state.strokeBounds = bounds }
+        if signal.isInking {
+            restoreGeneration &+= 1
+            restorePending = false
+            if !recedes { recedes = true }
+        } else if recedes, !restorePending {
+            restorePending = true
+            restoreGeneration &+= 1
+            let generation = restoreGeneration
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(NibMotion.recedeDelay * 1_000_000_000))
+                guard let self, self.restorePending, self.restoreGeneration == generation else { return }
+                self.restorePending = false
+                self.recedes = false
+            }
+        }
+    }
+
+    private func containerRect(_ rect: CGRect) -> CGRect {
+        guard let view, view.window != nil else { return rect }
+        return view.convert(rect, from: nil)
+    }
+}
+
 /// What a sheet shows: a modal panel anywhere, and in compact windows the sidebar or the front floating panel.
 enum PresentedSheet: Hashable {
     case modal(String)
@@ -407,28 +556,37 @@ enum PresentedSheet: Hashable {
 
 // MARK: - View controller
 
-/// `ui.screens.documentContainer`: the editor view controller and the toolbar under one droplet container holding
-/// the nav bar, sidebars, floating panels and popovers; sheets for modal panels.
+/// `ui.screens.documentContainer`: the editor view controller under the window's one droplet container, which holds
+/// the nav bar, the tool palette (`ui.screens.toolbarView`), sidebars, floating panels, chrome overlays, popovers and
+/// the window's floating host (contracts-v2 `EditorSession.floatingHost`); sheets for modal panels.
 final class DocumentContainerViewController: UIViewController {
-    private let chrome: ChromeContext
+    private let chrome: ChromeWindow
     private let editor: UIViewController
     private let model: ChromeDocumentModel
+    private let live: ChromeLiveState
     private let geometry: ChromeGeometry
     private let backdrop: ChromeBackdrop
-    private let inking: NibInkingState
+    private let inking: ChromeInkingMirror
+    private let overlays: ChromeOverlayModel
+    /// The window's floating host while this container is on screen.
+    let floatingHost: ChromeFloatingHost
     private var cancellables = Set<AnyCancellable>()
 
     init(editor: UIViewController, document: DocumentID, app: NibApp, navigator: SceneNavigator) {
         let session = navigator.session
         let store = app.services.get(ChromeStateStore.serviceKey, as: ChromeStateStore.self) ?? ChromeStateStore(app: app)
-        let chrome = ChromeContext(app: app, doc: document, session: session, state: store.state(for: session),
-                                   navigator: navigator)
+        let chrome = ChromeWindow(app: app, doc: document, session: session, state: store.state(for: session),
+                                  navigator: navigator)
+        let model = ChromeDocumentModel(chrome: chrome)
         self.chrome = chrome
         self.editor = editor
-        self.model = ChromeDocumentModel(chrome: chrome)
+        self.model = model
+        self.live = ChromeLiveState(chrome: chrome)
         self.geometry = ChromeGeometry()
         self.backdrop = ChromeBackdrop()
-        self.inking = store.inking(for: session)
+        self.inking = ChromeInkingMirror(session: session)
+        self.overlays = ChromeOverlayModel(chrome: chrome, kind: model.snapshot.kind)
+        self.floatingHost = ChromeFloatingHost()
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -439,9 +597,12 @@ final class DocumentContainerViewController: UIViewController {
         view.backgroundColor = NibUIColor.desk
         // The shell reveals the opening page right after showing this controller: the editor must exist by then.
         editor.loadViewIfNeeded()
-        let toolbar = chrome.app.ui.screens.toolbar?(chrome.session, chrome.app)
+        inking.view = view
+        overlays.containerView = view
+        let toolbar = chrome.app.ui.screens.toolbarView?(chrome.session, chrome.app)
         let root = ChromeRootView(chrome: chrome, editor: editor, toolbar: toolbar, inking: inking, backdrop: backdrop,
-                                  geometry: geometry, model: model)
+                                  overlays: overlays, floating: floatingHost.host, live: live, geometry: geometry,
+                                  model: model)
         let host = UIHostingController(rootView: root)
         host.view.backgroundColor = .clear
         addChild(host)
@@ -449,7 +610,20 @@ final class DocumentContainerViewController: UIViewController {
         host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(host.view)
         host.didMove(toParent: self)
+        publishFloatingHost()
         observe()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        publishFloatingHost()
+    }
+
+    /// Another container (the next document, the library) takes over the window's floating host; a full-screen panel
+    /// covering this one hides it until this container shows again.
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        if chrome.session.floatingHost === floatingHost { chrome.session.floatingHost = nil }
     }
 
     override func viewDidLayoutSubviews() {
@@ -469,6 +643,11 @@ final class DocumentContainerViewController: UIViewController {
 
     override var preferredStatusBarUpdateAnimation: UIStatusBarAnimation { .fade }
 
+    /// contracts-v2 `EditorSession.floatingHost` (and so `navigator.floatingHost`, `ChromeContext.floatingHost`).
+    private func publishFloatingHost() {
+        if chrome.session.floatingHost !== floatingHost { chrome.session.floatingHost = floatingHost }
+    }
+
     private func observe() {
         NotificationCenter.default.publisher(for: SettingsStore.didChange, object: chrome.app.settings)
             .compactMap { $0.userInfo?["name"] as? String }
@@ -482,6 +661,12 @@ final class DocumentContainerViewController: UIViewController {
             .merge(with: model.$snapshot.map { _ in () })
             .throttle(for: .milliseconds(50), scheduler: DispatchQueue.main, latest: true)
             .sink { [weak self] _ in self?.updateBackdrop() }
+            .store(in: &cancellables)
+        model.$snapshot.map(\.kind).removeDuplicates()
+            .sink { [weak self] kind in self?.overlays.update(kind: kind) }
+            .store(in: &cancellables)
+        geometry.$size.map { ChromeLayout.isCompact(width: $0.width) }.removeDuplicates()
+            .sink { [weak self] compact in self?.overlays.update(isCompact: compact) }
             .store(in: &cancellables)
     }
 
@@ -502,27 +687,36 @@ final class DocumentContainerViewController: UIViewController {
 
 // MARK: - SwiftUI root
 
-/// The window: editor and toolbar at the bottom, one droplet container above them (DESIGN.md §15.2). Empty areas of
-/// the container pass touches through to the canvas.
+/// The window: the editor at the bottom, one droplet container above it (DESIGN.md §15.2) with, bottom to top, the
+/// sidebars, chrome overlays, the tool palette, floating panels, the nav bar, its popovers and the floating host.
+/// Empty areas of the container pass touches through to the canvas.
 struct ChromeRootView: View {
-    let chrome: ChromeContext
+    let chrome: ChromeWindow
     let editor: UIViewController
-    let toolbar: UIView?
-    let inking: NibInkingState
+    /// `ui.screens.toolbarView` (F016), nil when no toolbar is installed.
+    let toolbar: AnyView?
+    let inking: ChromeInkingMirror
     let backdrop: ChromeBackdrop
+    let overlays: ChromeOverlayModel
+    let floating: NibFloatingHost
+    let live: ChromeLiveState
     @ObservedObject private var geometry: ChromeGeometry
     @ObservedObject private var state: ChromeState
     @ObservedObject private var model: ChromeDocumentModel
     @Environment(\.dynamicTypeSize) private var typeSize
     @State private var openMenu: ChromeMenu? = nil
 
-    init(chrome: ChromeContext, editor: UIViewController, toolbar: UIView?, inking: NibInkingState,
-         backdrop: ChromeBackdrop, geometry: ChromeGeometry, model: ChromeDocumentModel) {
+    init(chrome: ChromeWindow, editor: UIViewController, toolbar: AnyView?, inking: ChromeInkingMirror,
+         backdrop: ChromeBackdrop, overlays: ChromeOverlayModel, floating: NibFloatingHost, live: ChromeLiveState,
+         geometry: ChromeGeometry, model: ChromeDocumentModel) {
         self.chrome = chrome
         self.editor = editor
         self.toolbar = toolbar
         self.inking = inking
         self.backdrop = backdrop
+        self.overlays = overlays
+        self.floating = floating
+        self.live = live
         _geometry = ObservedObject(wrappedValue: geometry)
         _state = ObservedObject(wrappedValue: chrome.state)
         _model = ObservedObject(wrappedValue: model)
@@ -530,7 +724,6 @@ struct ChromeRootView: View {
 
     var body: some View {
         let layout = currentLayout
-        let items = navItems(layout)
         let motion: Animation? = state.animatesChanges ? NibMotion.sheet.animation : nil
         ZStack(alignment: .topLeading) {
             NibColor.desk
@@ -539,18 +732,14 @@ struct ChromeRootView: View {
                 .frame(width: layout.editor.width, height: layout.editor.height)
                 .position(x: layout.editor.midX, y: layout.editor.midY)
                 .animation(motion, value: layout.editor)
-            if let toolbar {
-                ToolbarHost(toolbar: toolbar)
-                    .frame(width: layout.toolbar.width, height: layout.toolbar.height)
-                    .position(x: layout.toolbar.midX, y: layout.toolbar.midY)
-                    .animation(motion, value: layout.toolbar)
-            }
-            BackdropReader(backdrop: backdrop) {
-                NibDropletContainer(inking: inking) {
-                    overlay(layout, items: items)
+            BackdropReader(backdrop: backdrop, inking: inking, overlays: overlays) {
+                NibDropletContainer(inking: inking.state) {
+                    overlay(layout, motion: motion)
                 }
             }
         }
+        // Settings › Appearance › Liquid (contracts-v2 NibSettings.liquidMode) for the whole container.
+        .nibLiquidMode(liquidMode)
         .frame(width: geometry.size.width, height: geometry.size.height)
         .ignoresSafeArea()
         .nibSheet(isPresented: sheetBinding(compact: layout.isCompact)) { sheetContent }
@@ -561,6 +750,10 @@ struct ChromeRootView: View {
     private var currentLayout: ChromeLayout {
         ChromeLayout(size: geometry.size, safeArea: geometry.safeArea, left: sidebarWidth(.left),
                      right: sidebarWidth(.right), mode: state.mode)
+    }
+
+    private var liquidMode: NibLiquidMode {
+        NibLiquidMode(rawValue: chrome.app.settings.get(NibSettings.liquidMode)) ?? .full
     }
 
     /// Sidebar tabs are the 240 pt navigator; a docked floating panel (the assistant, plugins) keeps its 344 / 420.
@@ -578,22 +771,30 @@ struct ChromeRootView: View {
     // MARK: Droplets
 
     @ViewBuilder
-    private func overlay(_ layout: ChromeLayout, items: NavBarItems) -> some View {
+    private func overlay(_ layout: ChromeLayout, motion: Animation?) -> some View {
         let snapshot = model.snapshot
         ZStack(alignment: .topLeading) {
             sidebars(layout)
+            ChromeOverlayLayer(model: overlays, inking: inking, region: layout.overlayRegion)
+            if let toolbar {
+                // Full height between open sidebars; padded by the safe area the root ignores (see ChromeLayout).
+                toolbar
+                    .padding(layout.toolbarInsets)
+                    .frame(width: layout.toolbar.width, height: layout.toolbar.height)
+                    .position(x: layout.toolbar.midX, y: layout.toolbar.midY)
+                    .animation(motion, value: layout.toolbar)
+            }
             if !layout.isCompact {
                 FloatingPanelsView(chrome: chrome, state: state, region: layout.floatingRegion,
                                    size: floatingSize(layout))
             }
-            NavBarView(chrome: chrome, items: items, title: snapshot.title, subtitle: NavBarModel.subtitle(snapshot),
-                       readOnly: snapshot.readOnly, titleHasMenu: !chrome.menuItems(.documentTitle).isEmpty,
-                       compact: layout.isCompact, sidebarMode: state.mode, openMenu: $openMenu)
-                .frame(width: layout.bar.width, height: layout.bar.height)
-                .position(x: layout.bar.midX, y: layout.bar.midY)
+            NavBarHost(chrome: chrome, live: live, snapshot: snapshot, layout: layout, sidebarMode: state.mode,
+                       openMenu: $openMenu)
             ChromePopovers(openMenu: $openMenu, documentTitle: snapshot.title,
                            width: layout.isCompact ? max(0, geometry.size.width - 2 * NibSpacing.xxl) : NibMetrics.popoverWidth,
-                           rows: { menuRows($0, overflow: items.overflow) })
+                           rows: { menuRows($0, compact: layout.isCompact) })
+            NibFloatingLayer(host: floating)
+            ChromeToastLayer(host: floating, frame: layout.toast)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
@@ -601,7 +802,8 @@ struct ChromeRootView: View {
     @ViewBuilder
     private func sidebars(_ layout: ChromeLayout) -> some View {
         if let frame = layout.window, let side = windowSide, let content = sidebarContent(side) {
-            SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected, mode: .window)
+            SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected, mode: .window,
+                             presentation: .window)
                 .frame(width: frame.width, height: frame.height)
                 .droplet("chrome.sidebar.window", style: .panel)
                 .position(x: frame.midX, y: frame.midY)
@@ -609,7 +811,7 @@ struct ChromeRootView: View {
             ForEach(SidebarSide.allCases, id: \.self) { side in
                 if let frame = (side == .left ? layout.left : layout.right), let content = sidebarContent(side) {
                     SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected,
-                                     mode: .sidebar)
+                                     mode: .sidebar, presentation: .sidebar)
                         .frame(width: frame.width, height: frame.height)
                         .droplet("chrome.sidebar." + side.rawValue, style: .panel)
                         .position(x: frame.midX, y: frame.midY)
@@ -633,51 +835,38 @@ struct ChromeRootView: View {
         return (tabs.contains(where: { $0.id == id }) ? tabs : [selected] + tabs, selected)
     }
 
-    // MARK: Nav bar
-
-    private func navItems(_ layout: ChromeLayout) -> NavBarItems {
-        let snapshot = model.snapshot
-        let assistant = chrome.assistantPanel(kind: snapshot.kind)
-        let hasSidebar = !chrome.sidebarTabs(.left, kind: snapshot.kind).isEmpty
-            || !chrome.sidebarTabs(.right, kind: snapshot.kind).isEmpty
-        let context = chrome
-        let input = NavBarModel.Input(
-            doc: chrome.doc, kind: snapshot.kind, page: snapshot.page, readOnly: snapshot.readOnly,
-            bookmarked: snapshot.bookmarked, tool: snapshot.tool, hasSidebar: hasSidebar,
-            sidebarVisible: !state.tabs.isEmpty, assistantPanel: assistant?.id,
-            assistantOpen: assistant.map { state.placement(of: $0.id) != nil } ?? false,
-            registered: chrome.app.ui.toolbarItems(for: snapshot.kind),
-            commandExists: { context.has($0) },
-            hasMenu: { !context.menuItems($0).isEmpty })
-        return NavBarModel.split(NavBarModel.build(input), compact: layout.isCompact)
-    }
+    // MARK: Menus
 
     /// A popover's rows. In compact windows More also carries the nav items that did not fit (Add Page and Share
-    /// become sections of it).
-    private func menuRows(_ menu: ChromeMenu, overflow: [NavItem]) -> [ChromeMenuRow] {
+    /// become sections of it). Entries show their live title, checkmark and shortcut (contracts-v2).
+    private func menuRows(_ menu: ChromeMenu, compact: Bool) -> [ChromeMenuRow] {
+        let context = chrome.menuContext()
         var rows: [ChromeMenuRow] = []
         if menu == .more {
-            for item in overflow {
+            for item in chrome.navItems(snapshot: model.snapshot, compact: compact).overflow {
                 switch item.action {
                 case .command(let command, let params):
-                    rows.append(ChromeMenuRow(id: item.id, title: item.title, symbol: item.symbol, isOn: item.isOn) {
+                    rows.append(ChromeMenuRow(id: item.id, title: item.title, symbol: item.symbol, isOn: item.isOn,
+                                              isEnabled: item.isEnabled) {
                         openMenu = nil
                         chrome.tap(command, params)
                     })
                 case .menu(let submenu):
-                    rows += chrome.menuItems(submenu.location).map { row($0, section: item.title) }
+                    rows += chrome.menuItems(submenu.location).map { row($0, section: item.title, context: context) }
                 case .library:
                     break
                 }
             }
         }
-        rows += chrome.menuItems(menu.location).map { row($0, section: $0.submenu) }
+        rows += chrome.menuItems(menu.location).map { row($0, section: $0.submenu, context: context) }
         return rows
     }
 
-    private func row(_ item: MenuItemDescriptor, section: String?) -> ChromeMenuRow {
-        ChromeMenuRow(id: item.id, title: item.title, symbol: item.icon.flatMap { NibSymbol(systemName: $0) },
-                      destructive: item.destructive, section: section) {
+    private func row(_ item: MenuItemDescriptor, section: String?, context: MenuContext) -> ChromeMenuRow {
+        ChromeMenuRow(id: item.id, title: item.resolvedTitle(for: context),
+                      symbol: item.icon.flatMap { NibSymbol(systemName: $0) }, destructive: item.destructive,
+                      section: section, isOn: item.isChecked?(context) ?? false,
+                      shortcut: item.shortcut.map { ChromeShortcuts.display($0) }) {
             openMenu = nil
             chrome.run(item)
         }
@@ -697,12 +886,12 @@ struct ChromeRootView: View {
         switch PresentedSheet.current(state, compact: ChromeLayout.isCompact(width: geometry.size.width)) {
         case .modal(let id)?:
             if let panel = chrome.app.ui.panels.get(id) {
-                panel.makeView(chrome.panelContext(id))
+                panel.makeView(chrome.panelContext(id, presentation: .sheet))
             }
         case .sidebar(let side)?:
             if let content = sidebarContent(side) {
                 SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected,
-                                 mode: state.mode, showsModeToggle: false)
+                                 mode: state.mode, presentation: .sheet, showsModeToggle: false)
                     .presentationDetents([.large])
             }
         case .floating(let id)?:
@@ -734,7 +923,7 @@ struct ChromeRootView: View {
     @ViewBuilder
     private var coverContent: some View {
         if let id = state.cover, let panel = chrome.app.ui.panels.get(id) {
-            panel.makeView(chrome.panelContext(id))
+            panel.makeView(chrome.panelContext(id, presentation: .fullScreen))
         }
     }
 }
@@ -754,26 +943,39 @@ struct EditorHost: UIViewControllerRepresentable {
     }
 }
 
-/// Hosts `ui.screens.toolbar` (F016) in the region below the bars.
-struct ToolbarHost: UIViewRepresentable {
-    let toolbar: UIView
-
-    func makeUIView(context: Context) -> UIView { toolbar }
-
-    func updateUIView(_ uiView: UIView, context: Context) {}
-}
-
-/// Re-renders only the backdrop while pages scroll, never the chrome inside.
+/// Re-renders only the backdrop while pages scroll, never the chrome inside. While the Pencil is down (and the 450 ms
+/// after), the frames of the overlays that recede join the light pages: the container recedes every droplet whose
+/// frame meets the backdrop (DESIGN.md §10.8), so an overlay's water and content fade together on every OS, and the
+/// page optics these frames would otherwise add are frozen then anyway.
 struct BackdropReader<Content: View>: View {
     @ObservedObject private var backdrop: ChromeBackdrop
+    @ObservedObject private var inking: ChromeInkingMirror
+    private let overlays: ChromeOverlayModel
     private let content: Content
 
-    init(backdrop: ChromeBackdrop, @ViewBuilder content: () -> Content) {
+    init(backdrop: ChromeBackdrop, inking: ChromeInkingMirror, overlays: ChromeOverlayModel,
+         @ViewBuilder content: () -> Content) {
         _backdrop = ObservedObject(wrappedValue: backdrop)
+        _inking = ObservedObject(wrappedValue: inking)
+        self.overlays = overlays
         self.content = content()
     }
 
     var body: some View {
-        content.nibBackdrop(backdrop.pages)
+        content.nibBackdrop(backdrop.pages + (inking.recedes ? overlays.recedingFrames : []))
+    }
+}
+
+/// Toasts of the window's floating host (`FloatingHosting.postToast`), placed by `.nibToast` at the bottom centre of
+/// `frame`. Its own view, so a toast re-renders only this.
+struct ChromeToastLayer: View {
+    let host: NibFloatingHost
+    let frame: CGRect
+
+    var body: some View {
+        Color.clear
+            .frame(width: frame.width, height: frame.height)
+            .nibToast(host.toastBinding)
+            .position(x: frame.midX, y: frame.midY)
     }
 }

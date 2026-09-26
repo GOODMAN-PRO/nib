@@ -2,9 +2,11 @@ import SwiftUI
 import NibContracts
 import NibDesign
 
-/// Document chrome (F017): `ui.screens.documentContainer` wraps every editor with the nav bar, the toolbar, the
-/// sidebar host, floating panels and sheets. Panels, nav-bar items and menu entries come from the registries, so
-/// features and plugins add theirs without touching this module.
+/// Document chrome (F017): `ui.screens.documentContainer` wraps every editor with the window's one droplet container:
+/// the nav bar, the tool palette (`ui.screens.toolbarView`), the sidebar host, floating panels, chrome overlays
+/// (`ui.chromeOverlays`) and the window's floating host (`EditorSession.floatingHost`), plus sheets. Panels, nav-bar
+/// items, overlays and menu entries come from the registries, so features and plugins add theirs without touching
+/// this module.
 public enum FeatDocChromeFeature: NibFeature {
     public static let id = "chrome"
 
@@ -16,7 +18,7 @@ public enum FeatDocChromeFeature: NibFeature {
         app.commands.register(DocSetScrollDirection.self)
         app.settings.declarePrefix(ChromeSettings.placementPrefix, synced: false,
                                    summary: "Where one panel shows in documents on this device: left, right or floating (null = its default).",
-                                   owner: id, schema: .str(choices: ChromePlacement.overrides.map { $0.rawValue }))
+                                   owner: id, schema: .str(choices: PanelSpot.overrides.map { $0.rawValue }))
         app.ui.screens.documentContainer = { editor, doc, hostApp, navigator in
             DocumentContainerViewController(editor: editor, document: doc, app: hostApp, navigator: navigator)
         }
@@ -37,20 +39,21 @@ public enum FeatDocChromeFeature: NibFeature {
             isVisible: { ctx in
                 ctx.session?.readOnly == true && ctx.app.commands.entry("view.setReadOnly") != nil
             }))
+        // Scrolling Direction (D-080): both directions for notebooks, the current one ticked (contracts-v2 isChecked).
         for direction in ScrollDirection.allCases {
             let horizontal = direction == .horizontal
-            app.ui.menus.register(MenuItemDescriptor(
+            var entry = MenuItemDescriptor(
                 id: horizontal ? "chrome.more.scrollHorizontal" : "chrome.more.scrollVertical",
-                title: horizontal ? String(localized: "Scroll Horizontally") : String(localized: "Scroll Vertically"),
+                title: horizontal ? String(localized: "Horizontal") : String(localized: "Vertical"),
                 icon: horizontal ? "arrow.left.and.right" : "arrow.up.and.down",
-                location: .documentMore, order: 100, owner: id, command: "doc.setScrollDirection",
+                location: .documentMore, order: horizontal ? 110 : 100, owner: id, command: "doc.setScrollDirection",
                 params: { ctx in
                     ["doc": .string(ChromeMenuSupport.docRef(ctx)), "direction": .string(direction.rawValue)]
                 },
-                isVisible: { ctx in
-                    guard let current = ChromeMenuSupport.scrollDirection(ctx) else { return false }
-                    return current != direction
-                }))
+                isVisible: { ChromeMenuSupport.scrollDirection($0) != nil },
+                submenu: String(localized: "Scrolling Direction"))
+            entry.isChecked = { ChromeMenuSupport.scrollDirection($0) == direction }
+            app.ui.menus.register(entry)
         }
         app.ui.menus.register(MenuItemDescriptor(
             id: "chrome.more.editingSettings", title: String(localized: "Document Editing Settings"), icon: "gearshape",
@@ -77,16 +80,24 @@ public enum FeatDocChromeFeature: NibFeature {
             }))
     }
 
+    /// The title and More sheets draw their own `NibSheetHeader` (contracts-v2 `providesHeader`).
     private static func registerPanels(_ app: NibApp) {
-        app.ui.panels.register(PanelDescriptor(
-            id: ChromePanels.editingSettings, title: String(localized: "Document Editing"), icon: "gearshape",
-            placement: .sheet, order: 900, owner: id) { context in AnyView(EditingSettingsSheet(context: context)) })
-        app.ui.panels.register(PanelDescriptor(
-            id: ChromePanels.rename, title: String(localized: "Rename Document"), icon: "pencil",
-            placement: .sheet, order: 910, owner: id) { context in AnyView(RenameDocumentSheet(context: context)) })
-        app.ui.panels.register(PanelDescriptor(
-            id: ChromePanels.move, title: String(localized: "Move to Folder"), icon: "folder",
-            placement: .sheet, order: 920, owner: id) { context in AnyView(MoveDocumentSheet(context: context)) })
+        func sheet(_ panelID: String, _ title: String, _ icon: String, order: Int,
+                   _ make: @escaping @MainActor (PanelContext) -> AnyView) {
+            var panel = PanelDescriptor(id: panelID, title: title, icon: icon, placement: .sheet, order: order, owner: id,
+                                        makeView: make)
+            panel.providesHeader = true
+            app.ui.panels.register(panel)
+        }
+        sheet(ChromePanels.editingSettings, String(localized: "Document Editing"), "gearshape", order: 900) {
+            AnyView(EditingSettingsSheet(context: $0))
+        }
+        sheet(ChromePanels.rename, String(localized: "Rename Document"), "pencil", order: 910) {
+            AnyView(RenameDocumentSheet(context: $0))
+        }
+        sheet(ChromePanels.move, String(localized: "Move to Folder"), "folder", order: 920) {
+            AnyView(MoveDocumentSheet(context: $0))
+        }
     }
 }
 

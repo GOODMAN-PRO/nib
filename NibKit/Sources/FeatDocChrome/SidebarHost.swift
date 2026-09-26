@@ -4,23 +4,26 @@ import NibDesign
 
 /// One sidebar side (D-065, D-117, D-136): the selected panel with a tab strip for every panel placed on that side,
 /// a Sidebar / Window switch, the panel's position menu and Close. The caller makes it a Deep `panel` droplet (docked,
-/// over the page or full-window) or puts it in a sheet (compact windows).
+/// over the page or full-window) or puts it in a sheet (compact windows). A panel that draws its own header
+/// (contracts-v2 `providesHeader`) gets the tab strip only.
 struct SidebarPanelView: View {
-    let chrome: ChromeContext
+    let chrome: ChromeWindow
     let side: SidebarSide
     let tabs: [PanelDescriptor]
     let selected: PanelDescriptor
     let mode: SidebarMode
+    /// What the panel is told about how it shows (`PanelContext.presentation`): sidebar, window or sheet.
+    let presentation: PanelPresentation
     var showsModeToggle = true
 
     var body: some View {
         VStack(spacing: 0) {
-            header
+            if chrome.drawsHeader(selected) { header }
             tabStrip
             Rectangle()
                 .fill(NibColor.separatorSoft)
-                .frame(height: 0.5)
-            selected.makeView(chrome.panelContext(selected.id))
+                .frame(height: NibStroke.hairline)
+            selected.makeView(chrome.panelContext(selected.id, presentation: presentation))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .id(selected.id)
         }
@@ -39,7 +42,7 @@ struct SidebarPanelView: View {
                     chrome.tap("sidebar.toggle", ["mode": .string(next.rawValue)])
                 }
             }
-            PanelPlacementMenu(chrome: chrome, panel: selected, current: side.placement)
+            PanelPlacementMenu(chrome: chrome, panel: selected, current: side.spot)
         }
     }
 
@@ -78,9 +81,9 @@ struct SidebarPanelView: View {
 /// D-136: move one panel to the left or right sidebar or float it. Writes the device setting
 /// `chrome.panelPlacement.<panelId>` through `settings.set`; open panels follow at once.
 struct PanelPlacementMenu: View {
-    let chrome: ChromeContext
+    let chrome: ChromeWindow
     let panel: PanelDescriptor
-    let current: ChromePlacement
+    let current: PanelSpot
 
     var body: some View {
         Menu {
@@ -105,13 +108,13 @@ struct PanelPlacementMenu: View {
         chrome.app.settings.json(ChromeSettings.placementName(panel.id)) != nil
     }
 
-    private func option(_ placement: ChromePlacement, _ title: String, symbol: NibSymbol) -> some View {
+    private func option(_ spot: PanelSpot, _ title: String, symbol: NibSymbol) -> some View {
         Button {
-            set(placement.rawValue)
+            set(spot.rawValue)
         } label: {
             Label { Text(title) } icon: { Image(nib: symbol) }
         }
-        .disabled(current == placement)
+        .disabled(current == spot)
     }
 
     private func set(_ value: String?) {
