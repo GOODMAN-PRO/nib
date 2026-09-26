@@ -252,10 +252,12 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertEqual(moved([6, 6], old, "Hello blo-cks"), [6, 7], "typing inside grows them")
         XCTAssertEqual(moved([0, 5], old, "Hello blocks"), [0, 5])
         XCTAssertEqual(moved([6, 6], old, "Hello "), [6, 0], "deleting the words leaves an empty place")
-        XCTAssertEqual(moved([0, 5], old, "Hellocks"), [0, 3], "deleting across the end cuts them")
-        XCTAssertEqual(moved([6, 6], old, "Hellocks"), [3, 5], "deleting across the start cuts them")
+        // "Helocks": "lo bl" (3..<8) deleted.
+        XCTAssertEqual(CommentAnchors.edit(from: old, to: "Helocks"), CommentAnchors.Edit(start: 3, oldEnd: 8, newEnd: 3))
+        XCTAssertEqual(moved([0, 5], old, "Helocks"), [0, 3], "deleting across the end cuts them")
+        XCTAssertEqual(moved([6, 6], old, "Helocks"), [3, 4], "deleting across the start cuts them")
         XCTAssertEqual(moved([6, 6], old, "Hello bricks"), [6, 6], "replacing inside keeps the span")
-        XCTAssertEqual(moved([6, 0], old, "Hello big blocks"), [10, 0], "an empty place moves with the text after it")
+        XCTAssertEqual(moved([6, 0], old, "Hello new blocks"), [10, 0], "an empty place moves with the text after it")
         // UTF-16: an emoji is two units.
         let emoji = "a\u{1F600}b"
         XCTAssertEqual(moved([3, 1], emoji, "ab"), [1, 1])
@@ -264,7 +266,8 @@ final class BlockCommentTests: XCTestCase {
         let comments = [BlockComment(id: "C1", author: "", text: "x", rangeStart: 6, rangeLength: 6),
                         BlockComment(id: "C2", author: "", text: "y", rangeStart: 0, rangeLength: 50)]
         let rebased = CommentAnchors.rebase(comments, from: old, to: "Oh, Hello blocks")
-        XCTAssertEqual(rebased.map { [$0.rangeStart, $0.rangeLength] }, [[10, 6], [0, 16]], "ranges past the end are cut")
+        XCTAssertEqual(rebased.map { [$0.rangeStart, $0.rangeLength] }, [[10, 6], [4, 12]],
+                       "text typed at a range's start stays outside it; ranges past the end are cut")
         XCTAssertEqual(CommentAnchors.clamp(NSRange(location: 20, length: 5), length: 12), NSRange(location: 12, length: 0))
     }
 
