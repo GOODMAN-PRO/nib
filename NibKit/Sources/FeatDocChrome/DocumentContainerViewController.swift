@@ -229,12 +229,12 @@ final class ChromeWindow {
     /// (F019) when it is installed. The tap happened in this window, so it is the most recently active one, which is
     /// the window `window.showLibrary` acts on.
     func goToLibrary() {
+        let app = self.app
+        let session = self.session
         let folder = app.services.library?.node(doc)?.parent
         let params: JSONValue = folder.map { f -> JSONValue in ["folder": .string(NodeRef.folder(f).description)] } ?? [:]
         if let navigator, app.ui.activeNavigator !== navigator { app.ui.activeNavigator = navigator }
         let setsView = has("library.setView")
-        let app = self.app
-        let session = self.session
         Task { @MainActor in
             var command = CommandIDs.windowShowLibrary
             do {

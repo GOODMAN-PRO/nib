@@ -171,7 +171,7 @@ final class FeatDocChromeTests: XCTestCase {
             id: "test.pointer", owner: "tests", placement: .anchored, surface: .popover, order: 20,
             anchor: { _ in flag.on ? ChromeAnchor.window(CGRect(x: 100, y: 200, width: 30, height: 30)) : nil },
             makeView: { _ in AnyView(Color.clear.frame(width: 200, height: 100)) }))
-        let model = ChromeOverlayModel(chrome: try window(h), kind: .notebook)
+        let model = ChromeOverlayModel(chrome: try makeWindow(h), kind: .notebook)
         XCTAssertEqual(model.overlays.map { $0.id }, ["test.hud", "test.bar"], "z-order: lowest order first")
         XCTAssertEqual(model.context.kind, .notebook)
 
@@ -205,7 +205,7 @@ final class FeatDocChromeTests: XCTestCase {
         h.app.ui.chromeOverlays.register(overlay("test.hud", .topTrailing, size: CGSize(width: 80, height: 30)))
         h.app.ui.chromeOverlays.register(overlay("test.free", .bottomLeading, surface: .none,
                                                  size: CGSize(width: 60, height: 30)))
-        let model = ChromeOverlayModel(chrome: try window(h), kind: .notebook)
+        let model = ChromeOverlayModel(chrome: try makeWindow(h), kind: .notebook)
         let region = CGRect(x: 16, y: 88, width: 968, height: 696)
         let layer = ChromeOverlayLayer(model: model, inking: ChromeInkingMirror(session: h.session), region: region)
         _ = NibSnapshot.image(layer, size: CGSize(width: 1000, height: 800))
@@ -406,7 +406,7 @@ final class FeatDocChromeTests: XCTestCase {
     func testPanelOpenParamsReachThePanel() async throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         h.app.ui.panels.register(panel("test.thread", .floating))
-        let window = try window(h)
+        let window = try makeWindow(h)
 
         // contracts-v2: panel.open {id, params} hands params to the panel as PanelContext.params.
         try await h.run("panel.open", ["id": "test.thread", "params": ["thread": "item:A/B/C", "instant": true]])
@@ -440,7 +440,7 @@ final class FeatDocChromeTests: XCTestCase {
 
     func testPanelsDrawTheirOwnHeaderWhenTheySaySo() throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
-        let window = try window(h)
+        let window = try makeWindow(h)
         var plugin = panel("test.plugin", .floating)
         plugin.providesHeader = true
         XCTAssertFalse(window.drawsHeader(plugin))
@@ -721,7 +721,7 @@ final class FeatDocChromeTests: XCTestCase {
         return store.state(for: h.session)
     }
 
-    private func window(_ h: Harness) throws -> ChromeWindow {
+    private func makeWindow(_ h: Harness) throws -> ChromeWindow {
         ChromeWindow(app: h.app, doc: Fixtures.docID, session: h.session, state: try chromeState(h),
                      navigator: TestNavigator(session: h.session))
     }

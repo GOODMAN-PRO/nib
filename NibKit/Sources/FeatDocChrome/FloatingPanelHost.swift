@@ -260,12 +260,12 @@ enum ChromeOverlayMotion {
 enum ChromeOverlayRecede {
     /// The frames the container should recede (droplet overlays that recede while writing).
     static func backdropFrames(_ overlays: [ChromeOverlayDescriptor], frames: [String: CGRect]) -> [CGRect] {
-        overlays.filter { $0.recedesWhileWriting && $0.surface != .none }.compactMap { frames[$0.id] }
+        overlays.filter { $0.recedesWhileWriting && $0.surface != ChromeSurface.none }.compactMap { frames[$0.id] }
     }
 
     /// The opacity the chrome gives an overlay itself: 22 % for a surface-less overlay that recedes, while `receding`.
     static func opacity(_ overlay: ChromeOverlayDescriptor, receding: Bool) -> Double {
-        receding && overlay.recedesWhileWriting && overlay.surface == .none ? NibLiquid.recedeOpacity : 1
+        receding && overlay.recedesWhileWriting && overlay.surface == ChromeSurface.none ? NibLiquid.recedeOpacity : 1
     }
 }
 
