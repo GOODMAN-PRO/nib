@@ -20,6 +20,10 @@ public enum FeatTextDocFeature: NibFeature {
 
         for d in BuiltinBlockKinds.descriptors(owner: id) { app.content.blockKinds.register(d) }
         for m in TextDocMenus.items(owner: id) { app.ui.menus.register(m) }
+
+        app.settings.declarePrefix(TextDocTitle.settingPrefix, synced: false,
+                                   summary: "Per text document: the name automatic naming gave it last (D-132); a different name means the user chose one.",
+                                   owner: id, schema: .str("document name"))
     }
 
     /// ⇧⌘T in the library makes a new text document (the `nib://new` deep link creates and opens it). The keyboard
@@ -182,15 +186,16 @@ enum TextDocMenus {
         return ["calls": .array(calls)]
     }
 
+    /// block.move params one step up or down. At the edge the block stays where it is (block.move without `after`
+    /// would send it to the top).
     static func moveParams(_ ctx: MenuContext, up: Bool) -> JSONValue {
         guard let b = block(ctx) else { return [:] }
         let ref = NodeRef.block(b.doc, b.block.id).description
-        if up {
-            let after = b.index >= 2 ? NodeRef.block(b.doc, b.all[b.index - 2].id).description : NodeRef.document(b.doc).description
-            return ["ref": .string(ref), "after": .string(after)]
-        }
-        guard b.index + 1 < b.all.count else { return ["ref": .string(ref)] }
-        return ["ref": .string(ref), "after": .string(NodeRef.block(b.doc, b.all[b.index + 1].id).description)]
+        let top = NodeRef.document(b.doc).description
+        func after(_ i: Int) -> String { i >= 0 ? NodeRef.block(b.doc, b.all[i].id).description : top }
+        if up { return ["ref": .string(ref), "after": .string(after(b.index - 2))] }
+        let target = b.index + 1 < b.all.count ? b.index + 1 : b.index - 1
+        return ["ref": .string(ref), "after": .string(after(target))]
     }
 
     /// A copy right below: block.insert with every field it takes, then block.update for indent and checked.

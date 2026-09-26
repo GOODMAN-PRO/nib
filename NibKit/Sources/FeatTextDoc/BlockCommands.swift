@@ -542,9 +542,17 @@ enum BlockMedia {
         return r
     }
 
+    /// The largest image a block imports (a picked photo is far below it; an AI or bridge link to a huge file is not).
+    static let maxImageBytes = 100 * 1024 * 1024
+
+    /// An asset of the document, checked by its file (never read into memory just to see that it exists).
     static func existingAsset(_ name: String, doc: DocumentID, ctx: CommandContext) throws -> AssetRef {
+        guard !name.isEmpty, !name.contains("/"), !name.contains("\\"), !name.hasPrefix(".") else {
+            throw NibError(.invalidParams, "'\(name)' is not an asset name", path: "$.asset",
+                           hint: "pass the name asset.put returned, e.g. 3f2a….png")
+        }
         let ref = AssetRef(name)
-        if let store = ctx.services.assets, (try? store.data(ref, doc: doc)) == nil {
+        if let store = ctx.services.assets, store.url(ref, doc: doc) == nil {
             throw NibError(.notFound, "asset \(name) not found in doc:\(doc.raw)", path: "$.asset",
                            hint: "store the image with asset.put first, or pass url")
         }
@@ -555,9 +563,18 @@ enum BlockMedia {
     static func importImage(_ url: String, doc: DocumentID, ctx: CommandContext) async throws -> AssetRef {
         let store = try ctx.services.require(ctx.services.assets, "asset storage")
         let file = try await ctx.inputFile(url)
+        // `inputFile` downloads web links to a temporary file of their own: it goes once the image is stored.
+        let scheme = URL(string: url)?.scheme?.lowercased()
+        let downloaded = scheme == "https" || scheme == "http"
+        defer { if downloaded { try? FileManager.default.removeItem(at: file) } }
+        let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard size <= maxImageBytes else {
+            throw NibError(.invalidParams, "the image is larger than 100 MB", path: "$.url",
+                           hint: "downscale it or upload a smaller file")
+        }
         // File I/O, decoding and hashing stay off the main actor.
         let stored: AssetRef? = try await Task.detached(priority: .userInitiated) { () throws -> AssetRef? in
-            let data = try Data(contentsOf: file)
+            let data = try Data(contentsOf: file, options: .mappedIfSafe)
             guard let ext = BlockMedia.imageExtension(data) else { return nil }
             return try store.put(data, ext: ext, doc: doc)
         }.value
@@ -575,12 +592,19 @@ enum BlockMedia {
     }
 
     static func videoURL(_ s: String) throws -> String {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let u = URL(string: trimmed), let scheme = u.scheme?.lowercased(), scheme == "https" || scheme == "http",
-              u.host != nil else {
+        guard let u = webURL(s) else {
             throw NibError(.invalidParams, "a video block needs an http(s) link", path: "$.url",
                            hint: "pass the video's page or file URL, e.g. https://example.com/lecture.mp4")
         }
         return u.absoluteString
+    }
+
+    /// An http(s) link with a host, or nil. Stored video links are checked again before they are shown or opened,
+    /// because sync, remote patches and generic node edits reach `TextBlock.url` without block.update.
+    nonisolated static func webURL(_ s: String) -> URL? {
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let u = URL(string: trimmed), let scheme = u.scheme?.lowercased(), scheme == "https" || scheme == "http",
+              u.host != nil else { return nil }
+        return u
     }
 }

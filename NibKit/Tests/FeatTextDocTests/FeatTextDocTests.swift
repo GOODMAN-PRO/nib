@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import LinkPresentation
 import NibContracts
 import NibTesting
 @testable import FeatTextDoc
@@ -31,6 +32,55 @@ final class FeatTextDocTests: XCTestCase {
         } catch {
             XCTFail("unexpected \(error)", file: file, line: line)
         }
+    }
+
+    private func openEditor(_ h: Harness) -> TextDocViewController {
+        let editor = TextDocViewController(doc: doc, session: h.session, app: h.app)
+        editor.loadViewIfNeeded()
+        return editor
+    }
+
+    /// Polls `condition` on the main actor until it holds (async work: debounced renames, queued edits).
+    private func waitUntil(_ what: String, timeout: TimeInterval = 5, file: StaticString = #filePath, line: UInt = #line,
+                           _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else {
+                XCTFail("timed out waiting for \(what)", file: file, line: line)
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    /// The Library Store's library.rename (F002), for tests that only register this feature.
+    private func registerRename(_ h: Harness) {
+        let library = h.library
+        let descriptor = CommandDescriptor(
+            id: "library.rename", title: "Rename", summary: "Rename a document (test stand-in).",
+            params: .obj(["ref": .ref, "title": .str("new name")], required: ["ref", "title"]),
+            effect: .library, target: .library)
+        h.app.commands.register(descriptor) { json, _ in
+            guard let ref = json["ref"]?.stringValue, let title = json["title"]?.stringValue else {
+                throw NibError.invalid("ref and title are required")
+            }
+            try library.rename(NodeRef.documentID(from: ref), to: title)
+            return [:]
+        }
+    }
+
+    /// Every title in a menu, submenus included.
+    private func titles(_ menu: UIMenu) -> [String] {
+        menu.children.flatMap { element -> [String] in
+            if let sub = element as? UIMenu { return [sub.title] + titles(sub) }
+            return [element.title]
+        }
+    }
+
+    private func environment(_ kind: BlockKind) -> BlockCell.Environment {
+        BlockCell.Environment(style: BlockStyle.make(kind: kind), captionStyle: BlockStyle.make(kind: kind, caption: true),
+                              marker: nil, placeholder: nil, alwaysShowsPlaceholder: false, readOnly: false,
+                              accessoryWidth: 0, aiAvailable: false, isFirst: false)
     }
 
     // MARK: Registration and conformance
@@ -406,6 +456,282 @@ final class FeatTextDocTests: XCTestCase {
         XCTAssertEqual(TextDocTitle.sanitize(String(repeating: "a", count: 200)).count, TextDocTitle.maxLength)
     }
 
+    func testUpdateSetsVideoLinksAndStoredImagesAndRefusesTextWithoutAPlace() async throws {
+        let h = harness()
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "video", "id": "VIDEO2"])
+        try await h.run("block.update", ["ref": "block:FIXTUREDOC02/VIDEO2", "url": "https://example.com/talk.mp4"])
+        XCTAssertEqual(try block(h, "VIDEO2").url, "https://example.com/talk.mp4")
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.update", ["ref": "block:FIXTUREDOC02/VIDEO2", "url": "javascript:alert(1)"])
+        }
+        XCTAssertEqual(try block(h, "VIDEO2").url, "https://example.com/talk.mp4", "a refused link changes nothing")
+
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "image", "id": "IMAGE2"])
+        try await h.run("block.update", ["ref": "block:FIXTUREDOC02/IMAGE2", "asset": "fixture-image.png", "caption": "Cell"])
+        let image = try block(h, "IMAGE2")
+        XCTAssertEqual(image.asset, Fixtures.pngAsset)
+        XCTAssertEqual(image.caption?.plainText, "Cell")
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.update", ["ref": "block:FIXTUREDOC02/IMAGE2", "asset": "../fixture-image.png"])
+        }
+        await assertError(.notFound) {
+            _ = try await h.run("block.update", ["ref": "block:FIXTUREDOC02/IMAGE2", "asset": "missing.png"])
+        }
+
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "divider", "id": "RULE2"])
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.update", ["ref": "block:FIXTUREDOC02/RULE2", "text": "no place for this"])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.update", ["ref": .string(table), "text": "cells hold table text"])
+        }
+        XCTAssertEqual(try block(h, "FIXTUREBLK03").table?.rows[0][0].text.plainText, "A1")
+    }
+
+    func testOnlyWebLinksAreShownOrOpened() throws {
+        XCTAssertEqual(BlockMedia.webURL(" https://example.com/v.mp4 ")?.absoluteString, "https://example.com/v.mp4")
+        XCTAssertNotNil(BlockMedia.webURL("http://example.com/v"))
+        XCTAssertNil(BlockMedia.webURL("javascript:alert(1)"))
+        XCTAssertNil(BlockMedia.webURL("file:///private/var/mobile/secret.mov"))
+        XCTAssertNil(BlockMedia.webURL("nib://open?doc=FIXTUREDOC01"))
+
+        // A link that reached the block without block.update (sync, node.set) is not offered.
+        let h = harness()
+        let editor = openEditor(h)
+        var video = TextBlock(id: "VIDEO3", kind: .video)
+        video.url = "javascript:alert(1)"
+        XCTAssertFalse(titles(editor.blockMenu(for: video)).contains("Open Video"))
+        video.url = "https://example.com/lecture.mp4"
+        XCTAssertTrue(titles(editor.blockMenu(for: video)).contains("Open Video"))
+    }
+
+    func testMoveMenuStepsOneBlockAndStaysPutAtTheEdges() async throws {
+        let h = harness()
+        func params(_ ref: String, up: Bool) -> JSONValue {
+            TextDocMenus.moveParams(MenuContext(app: h.app, session: h.session, doc: doc, ref: ref), up: up)
+        }
+        XCTAssertEqual(params(heading, up: false)["after"]?.stringValue, paragraph)
+        XCTAssertEqual(params(paragraph, up: true)["after"]?.stringValue, "doc:FIXTUREDOC02")
+        XCTAssertEqual(params(paragraph, up: false)["after"]?.stringValue, table)
+        XCTAssertEqual(params(table, up: true)["after"]?.stringValue, heading)
+        for (ref, up) in [(heading, true), (table, false)] {
+            let depth = h.undoDepth(doc)
+            try await h.run("block.move", params(ref, up: up))
+            XCTAssertEqual(try ids(h), ["FIXTUREBLK01", "FIXTUREBLK02", "FIXTUREBLK03"], "\(ref) stays at the edge")
+            XCTAssertEqual(h.undoDepth(doc), depth)
+        }
+        try await h.run("block.move", params(paragraph, up: false))
+        XCTAssertEqual(try ids(h), ["FIXTUREBLK01", "FIXTUREBLK03", "FIXTUREBLK02"])
+        try await h.run("block.move", params(paragraph, up: true))
+        XCTAssertEqual(try ids(h), ["FIXTUREBLK01", "FIXTUREBLK02", "FIXTUREBLK03"])
+    }
+
+    // MARK: Editor
+
+    func testAnEmbeddedViewFollowsItsBlockAcrossReusedCells() {
+        let host = StubCellHost()
+        let tableBlock = TextBlock(id: "TABLEBLK", kind: .table)
+        let text = TextBlock(id: "TEXTBLK", kind: .paragraph, text: RichText(plain: "Text"))
+        let a = BlockCell(frame: CGRect(x: 0, y: 0, width: 600, height: 200))
+        let b = BlockCell(frame: CGRect(x: 0, y: 0, width: 600, height: 200))
+        a.host = host
+        b.host = host
+
+        a.configure(tableBlock, environment: environment(.table))
+        XCTAssertTrue(host.tableView.isDescendant(of: a.contentView))
+        // The table scrolls off and comes back in another cell.
+        b.configure(tableBlock, environment: environment(.table))
+        XCTAssertTrue(host.tableView.isDescendant(of: b.contentView))
+        XCTAssertFalse(host.tableView.isDescendant(of: a.contentView))
+        // ...and later in the first cell again, which still remembers having shown it.
+        a.configure(tableBlock, environment: environment(.table))
+        XCTAssertTrue(host.tableView.isDescendant(of: a.contentView), "the view is attached again, not left in the other cell")
+
+        // A reused cell gives the view back, and another block never takes it along.
+        a.prepareForReuse()
+        XCTAssertNil(host.tableView.superview)
+        a.configure(text, environment: environment(.paragraph))
+        b.configure(tableBlock, environment: environment(.table))
+        XCTAssertTrue(host.tableView.isDescendant(of: b.contentView))
+        XCTAssertFalse(host.tableView.isDescendant(of: a.contentView))
+    }
+
+    func testCustomBlockViewsAreMadeAgainWhenTheirPayloadChanges() async throws {
+        let h = harness()
+        var made = 0
+        h.app.ui.blockViews.register(BlockViewDescriptor(customType: "dev.nib.charts.bar", owner: "dev.nib.charts") { _ in
+            made += 1
+            return UIView()
+        })
+        var tables = 0
+        h.app.ui.blockViews.register(BlockViewDescriptor(kind: .table, owner: "tables") { _ in
+            tables += 1
+            return UIView()
+        })
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "custom", "id": "CHART1",
+                                         "custom": ["owner": "dev.nib.charts", "type": "bar", "data": ["v": 1]]])
+        let editor = openEditor(h)
+        let chart = try XCTUnwrap(editor.block(NibID("CHART1")))
+        let first = try XCTUnwrap(editor.embeddedView(for: chart))
+        XCTAssertTrue(editor.embeddedView(for: chart) === first, "an unchanged block keeps its view")
+        XCTAssertEqual(made, 1)
+
+        var changed = chart
+        changed.custom?.data = ["v": 2]
+        let second = try XCTUnwrap(editor.embeddedView(for: changed))
+        XCTAssertFalse(second === first, "new data, new view")
+        XCTAssertEqual(made, 2)
+
+        var turned = changed
+        turned.kind = .paragraph
+        turned.custom = nil
+        XCTAssertNil(editor.embeddedView(for: turned))
+        XCTAssertEqual(made, 2)
+
+        // Tables watch their own data: their view stays.
+        let tableBlock = try XCTUnwrap(editor.block(Fixtures.tableBlockID))
+        let tableView = try XCTUnwrap(editor.embeddedView(for: tableBlock))
+        var edited = tableBlock
+        edited.table?.rows[0][0].text = RichText(plain: "Z1")
+        XCTAssertTrue(editor.embeddedView(for: edited) === tableView)
+        XCTAssertEqual(tables, 1)
+    }
+
+    func testTextSelectionMenuEntriesAppearOverSelectedBlockText() throws {
+        let h = harness()
+        h.app.ui.menus.register(MenuItemDescriptor(
+            id: "test.define", title: "Define Word", location: .textSelection, order: 1, owner: "test",
+            command: "block.update", isVisible: { ctx in ctx.ref == "block:FIXTUREDOC02/FIXTUREBLK02" }))
+        let editor = openEditor(h)
+        let tv = BlockTextView()
+        tv.blockID = Fixtures.paragraphBlockID
+        let style = BlockStyle.make(kind: .paragraph)
+        tv.style = style
+        tv.attributedText = style.attributed(RichText(plain: "Hello blocks"))
+
+        let menu = try XCTUnwrap(editor.textView(tv, editMenuForTextIn: NSRange(location: 0, length: 5), suggestedActions: []))
+        XCTAssertTrue(titles(menu).contains("Define Word"))
+        XCTAssertNil(editor.textView(tv, editMenuForTextIn: NSRange(location: 2, length: 0), suggestedActions: []),
+                     "a caret without a selection keeps the system menu")
+        tv.role = .caption
+        let caption = try XCTUnwrap(editor.textView(tv, editMenuForTextIn: NSRange(location: 0, length: 5), suggestedActions: []))
+        XCTAssertTrue(titles(caption).contains("Define Word"), "captions offer them too, for their block")
+        tv.blockID = Fixtures.headingBlockID
+        XCTAssertNil(editor.textView(tv, editMenuForTextIn: NSRange(location: 0, length: 5), suggestedActions: []),
+                     "entries see the block they are for")
+    }
+
+    func testTheNameFollowsTheFirstLineUntilTheUserRenamesTheDocument() async throws {
+        let h = harness()
+        registerRename(h)
+        try h.library.rename(doc, to: "Fixture Text")
+        let editor = TextDocViewController(doc: doc, session: h.session, app: h.app)
+        editor.titleDebounce = 0.05
+        editor.loadViewIfNeeded()
+        XCTAssertTrue(editor.followsFirstLine)
+
+        try await h.run("block.update", ["ref": .string(heading), "text": "Cell biology"])
+        try await waitUntil("the automatic rename") { h.library.node(doc)?.title == "Cell biology" }
+        XCTAssertEqual(h.app.settings.get(TextDocTitle.settingKey(doc)), "Cell biology")
+
+        // Renamed by hand: the name is the user's from now on, here and on the next open.
+        try h.library.rename(doc, to: "Biology notes")
+        try await h.run("block.update", ["ref": .string(heading), "text": "Cells"])
+        try await waitUntil("automatic naming to stop") { !editor.followsFirstLine }
+        XCTAssertEqual(h.library.node(doc)?.title, "Biology notes")
+        XCTAssertEqual(h.app.settings.get(TextDocTitle.settingKey(doc)), "")
+        XCTAssertFalse(openEditor(h).followsFirstLine)
+    }
+
+    func testAnAutomaticNameCatchesUpWithEditsMadeWhileTheDocumentWasClosed() async throws {
+        let h = harness()
+        registerRename(h)
+        // The editor gave this name last time; the first line changed since (AI chat, bridge, another device).
+        h.app.settings.set(TextDocTitle.settingKey(doc), "Fixture Text Document")
+        let editor = openEditor(h)
+        XCTAssertTrue(editor.followsFirstLine)
+        try await waitUntil("the catch-up rename") { h.library.node(doc)?.title == "Fixture Text" }
+
+        // A name nobody gave automatically is left alone.
+        let other = harness()
+        registerRename(other)
+        XCTAssertFalse(openEditor(other).followsFirstLine)
+        XCTAssertEqual(other.library.node(doc)?.title, "Fixture Text Document")
+    }
+
+    func testHookCommandsAndUndoWaitForQueuedEdits() async throws {
+        let h = harness()
+        let editor = openEditor(h)
+        let before = try h.snapshot(doc)
+        let output = await editor.run(BlockUpdate.self, BlockUpdate.Params(ref: paragraph, text: RichText(plain: "Edited")))
+        XCTAssertNotNil(output)
+        XCTAssertEqual(try block(h, "FIXTUREBLK02").text.plainText, "Edited")
+        editor.undoDocument()
+        await editor.flushEdits()
+        XCTAssertEqual(try h.snapshot(doc), before)
+        editor.redoDocument()
+        await editor.flushEdits()
+        XCTAssertEqual(try block(h, "FIXTUREBLK02").text.plainText, "Edited")
+    }
+
+    func testAProposalChangesNothingUntilAcceptedAndIsThenOneUndoStep() async throws {
+        let h = harness()
+        let editor = openEditor(h)
+        let id = Fixtures.paragraphBlockID
+        let before = try h.snapshot(doc)
+        editor.showProposal(BlockProposal(title: "Make Concise", text: "Hi blocks\n\nA second thought", replaces: true), for: id)
+        XCTAssertNotNil(editor.proposals[id])
+        await editor.flushEdits()
+        XCTAssertEqual(try h.snapshot(doc), before, "a proposal is only a preview")
+
+        let depth = h.undoDepth(doc)
+        editor.resolveProposal(for: id, .replace)
+        await editor.flushEdits()
+        XCTAssertNil(editor.proposals[id])
+        let blocks = try live(h)
+        XCTAssertEqual(blocks.map { $0.text.plainText }, ["Fixture Text", "Hi blocks", "A second thought", ""])
+        XCTAssertEqual(blocks[2].kind, .paragraph)
+        XCTAssertEqual(h.undoDepth(doc), depth + 1, "Replace is one undo step")
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(doc), before)
+
+        editor.showProposal(BlockProposal(title: "Explain", text: "An answer", replaces: false), for: id)
+        editor.resolveProposal(for: id, .discard)
+        await editor.flushEdits()
+        XCTAssertEqual(try h.snapshot(doc), before, "Discard changes nothing")
+
+        editor.showProposal(BlockProposal(title: "Explain", text: "An answer", replaces: false), for: id)
+        editor.resolveProposal(for: id, .insertBelow)
+        await editor.flushEdits()
+        XCTAssertEqual(try live(h).map { $0.text.plainText }, ["Fixture Text", "Hello blocks", "An answer", ""])
+    }
+
+    func testAssistantAnswersBecomeCleanParagraphs() {
+        XCTAssertEqual(BlockAssistant.clean("  Shorter text.  \n"), "Shorter text.")
+        XCTAssertEqual(BlockAssistant.clean("```\nlet x = 1\n```"), "let x = 1")
+        XCTAssertEqual(BlockAssistant.clean("```swift\nlet x = 1\nlet y = 2\n```"), "let x = 1\nlet y = 2")
+        XCTAssertEqual(BlockAssistant.clean("Use ```code``` here"), "Use ```code``` here")
+        XCTAssertEqual(BlockAssistant.paragraphs(" One \n\n Two\n"), ["One", "Two"])
+    }
+
+    func testInlineImagesLeaveTheTextToBecomeImageBlocks() throws {
+        let tv = UITextView()
+        let text = NSMutableAttributedString(string: "ab")
+        let attachment = NSTextAttachment()
+        attachment.image = UIImage(data: Fixtures.pngData)
+        text.insert(NSAttributedString(attachment: attachment), at: 1)
+        tv.attributedText = text
+        let images = BlockAttachments.takeImages(from: tv)
+        XCTAssertEqual(images.count, 1)
+        XCTAssertNotNil(BlockMedia.imageExtension(images[0]), "the image's bytes survive")
+        XCTAssertEqual(tv.text, "ab")
+        XCTAssertTrue(BlockAttachments.takeImages(from: tv).isEmpty)
+        let removed = [NSRange(location: 0, length: 2), NSRange(location: 5, length: 1)]
+        XCTAssertEqual(BlockAttachments.caretAfterRemoving(removed, caret: 4, length: 10), 2)
+        XCTAssertEqual(BlockAttachments.caretAfterRemoving(removed, caret: 1, length: 10), 0)
+        XCTAssertEqual(BlockAttachments.caretAfterRemoving(removed, caret: 9, length: 7), 6)
+    }
+
     // MARK: Hooks
 
     func testHooksAreKeyedOrderedAndRemovable() {
@@ -453,4 +779,24 @@ final class FeatTextDocTests: XCTestCase {
         XCTAssertLessThan(insertAll, 0.2 * 4)
         XCTAssertLessThan(reconfigureAll, 0.2 * 4)
     }
+}
+
+/// A cell host that hands out one shared table view, like the editor's per-block cache does.
+@MainActor
+private final class StubCellHost: BlockCellHost {
+    let tableView = UIView()
+    var documentID: DocumentID { Fixtures.textDocID }
+    var assetStore: AssetStore? { nil }
+    func loadImage(_ asset: AssetRef, maxPixel: CGFloat, completion: @escaping (UIImage?) -> Void) { completion(nil) }
+    func cachedAspect(_ asset: AssetRef) -> CGFloat? { nil }
+    func linkMetadata(for url: URL, completion: @escaping (LPLinkMetadata) -> Void) -> LPLinkMetadata? { nil }
+    func embeddedView(for block: TextBlock) -> UIView? { block.kind == .table ? tableView : nil }
+    func embeddedHeight(for block: NibID) -> CGFloat? { 120 }
+    func cellDidToggleCheckbox(_ cell: BlockCell) {}
+    func cell(_ cell: BlockCell, addImageFrom source: BlockImageSource) {}
+    func cellDidRequestVideoLink(_ cell: BlockCell) {}
+    func cellDidTapCustom(_ cell: BlockCell) {}
+    func aiMenuElements(for cell: BlockCell) -> [UIMenuElement] { [] }
+    func accessibilityActions(for cell: BlockCell) -> [UIAccessibilityCustomAction] { [] }
+    func cell(_ cell: BlockCell, resolveProposal choice: BlockProposal.Choice) {}
 }
