@@ -33,14 +33,15 @@ public enum FeatSmartInkFeature: NibFeature {
         })
         // An occasional tool (the palette's More grid by default), so its options bar has a slot to fuse to.
         app.ui.toolbar.register(ToolbarItemDescriptor(id: toolID, title: String(localized: "Edit Handwriting"),
-                                                      icon: "scribble", group: .tools, order: 900, owner: id,
+                                                      icon: NibSymbol.editHandwriting.name, group: .tools, order: 900,
+                                                      owner: id,
                                                       toolID: toolID))
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "smartink.overlay", owner: id, order: 50) { _ in
             EditHandwritingOverlay()
         })
         registerMenus(app)
         app.ui.settingsPages.register(SettingsPageDescriptor(id: "smartink", title: String(localized: "Smart Ink"),
-                                                             icon: "scribble", section: .writing, order: 40,
+                                                             icon: NibSymbol.editHandwriting.name, section: .writing, order: 40,
                                                              owner: id) { app in
             AnyView(SmartInkSettingsView(app: app))
         })
@@ -60,16 +61,17 @@ public enum FeatSmartInkFeature: NibFeature {
         let tool = toolID
         let space = menuSpace
         app.ui.menus.register(MenuItemDescriptor(
-            id: "smartink.editHandwriting", title: String(localized: "Edit Handwriting"), icon: "scribble",
+            id: "smartink.editHandwriting", title: String(localized: "Edit Handwriting"),
+            icon: NibSymbol.editHandwriting.name,
             location: .objectMenu, order: 600, owner: id, command: CommandIDs.toolSelect,
             params: { _ in ["tool": .string(tool)] }, isVisible: editable, submenu: smartInk))
         app.ui.menus.register(MenuItemDescriptor(
-            id: "smartink.straighten", title: String(localized: "Straighten Lines"), icon: "level",
+            id: "smartink.straighten", title: String(localized: "Straighten Lines"), icon: NibSymbol.straighten.name,
             location: .objectMenu, order: 610, owner: id, command: HandwritingStraighten.descriptor.id,
             params: { ctx in ["refs": .array(ctx.selection.refs.map { .string($0) })] },
             isVisible: editable, submenu: smartInk))
         app.ui.menus.register(MenuItemDescriptor(
-            id: "smartink.insertSpace", title: String(localized: "Insert Space"), icon: "arrow.up.and.down",
+            id: "smartink.insertSpace", title: String(localized: "Insert Space"), icon: NibSymbol.insertSpace.name,
             location: .pageLongPress, order: 600, owner: id, command: HandwritingInsertSpace.descriptor.id,
             params: { ctx in
                 guard let doc = ctx.doc, let page = ctx.page, let point = ctx.point else { return [:] }
@@ -86,6 +88,8 @@ public enum FeatSmartInkFeature: NibFeature {
 
 /// While `smartink.autoStraighten` is on, the strokes of a writing burst are levelled with `handwriting.straighten`
 /// once the Pencil has rested for a moment: one undo step per burst, and nothing moves while the Pencil is down.
+/// Each line is levelled about its left end, so a line written in two bursts (a pause mid-line) continues level
+/// instead of stepping.
 @MainActor
 final class AutoStraightener {
     /// Seconds without a new stroke before a burst is straightened.
@@ -93,9 +97,31 @@ final class AutoStraightener {
     /// Lines flatter than this (degrees) stay exactly as written.
     static let minimumAngle: Double = 2
 
+    /// Strokes written on one page in one window, waiting for the pause.
+    struct Burst {
+        let doc: DocumentID
+        let page: PageID
+        var ids: [ElementID]
+        /// The window that wrote them (its read-only state and undo stack apply).
+        weak var session: EditorSession?
+        /// Written with no window (a test host, a scripted session): runs without one.
+        let windowless: Bool
+
+        init(doc: DocumentID, page: PageID, ids: [ElementID], session: EditorSession?) {
+            self.doc = doc
+            self.page = page
+            self.ids = ids
+            self.session = session
+            self.windowless = session == nil
+        }
+    }
+
     private weak var app: NibApp?
     private var subscription: EventSubscription?
-    private var burst: (doc: DocumentID, page: PageID, ids: [ElementID])?
+    /// True while the Pencil is down: the canvas raises `NibHaptics.isInking` (DESIGN.md §10.8).
+    var isInking: () -> Bool = { NibHaptics.isInking }
+    /// Oldest first; a new page (or window) starts a new burst, and all of them wait for the same pause.
+    private(set) var bursts: [Burst] = []
     private var timer: Task<Void, Never>?
 
     init(app: NibApp) { self.app = app }
@@ -104,19 +130,21 @@ final class AutoStraightener {
         subscription = app?.bus.observeCommits { [weak self] changes in self?.observe(changes) }
     }
 
-    /// Pen and pencil strokes the user just wrote (`ink.addStrokes`) join the burst; another page flushes it first.
+    /// Pen and pencil strokes the user just wrote (`ink.addStrokes`) join the current burst of their page and window.
     func observe(_ changes: Changeset) {
         guard let app, changes.principal.isUser, changes.command == CommandIDs.inkAddStrokes,
               app.settings.get(FeatSmartInkFeature.autoStraighten) else { return }
+        // The commit comes from the window being written in, which is the active one.
+        let session = app.services.sessions.active
         var added = false
         for mutation in changes.mutations {
             guard case let .item(doc, page, before, after) = mutation, before == nil,
                   Handwriting.isHandwriting(after) else { continue }
-            if let b = burst, b.doc == doc, b.page == page {
-                burst?.ids.append(after.id)
+            if let last = bursts.indices.last, bursts[last].doc == doc, bursts[last].page == page,
+               bursts[last].session === session {
+                bursts[last].ids.append(after.id)
             } else {
-                flush()
-                burst = (doc: doc, page: page, ids: [after.id])
+                bursts.append(Burst(doc: doc, page: page, ids: [after.id], session: session))
             }
             added = true
         }
@@ -128,35 +156,36 @@ final class AutoStraightener {
         timer = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(AutoStraightener.pause * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            self?.fire()
+            self?.flush()
         }
     }
 
-    private func fire() {
-        // The canvas raises this while the Pencil is down (DESIGN.md §10.8): wait for the next pause.
-        if NibHaptics.isInking {
+    /// Straightens every waiting burst, unless the Pencil is down: then it waits for the next pause.
+    func flush() {
+        guard !isInking() else {
             schedule()
             return
         }
-        flush()
-    }
-
-    private func flush() {
         timer?.cancel()
         timer = nil
-        guard let app, let b = burst else { return }
-        burst = nil
-        let session = app.services.sessions.active
-        guard !(session?.readOnly ?? false) else { return }
-        let items = (try? app.workspace.items(b.doc, page: b.page)) ?? []
-        let live = Set(items.filter { Handwriting.isHandwriting($0) }.map { $0.id })
-        let refs = b.ids.filter { live.contains($0) }.map { JSONValue.string(NodeRef.item(b.doc, b.page, $0).description) }
-        guard !refs.isEmpty else { return }
-        let params: JSONValue = ["refs": .array(refs), "minAngle": .number(AutoStraightener.minimumAngle)]
-        Task {
-            // Best effort: a burst that was erased or locked meanwhile simply stays as written.
-            _ = try? await app.bus.execute(Invocation(command: HandwritingStraighten.descriptor.id, params: params,
-                                                      session: session))
+        guard let app else { return }
+        let waiting = bursts
+        bursts = []
+        for b in waiting {
+            // The window was closed, or went read-only, since the burst was written.
+            if (b.session == nil && !b.windowless) || b.session?.readOnly == true { continue }
+            let session = b.session
+            let items = (try? app.workspace.items(b.doc, page: b.page)) ?? []
+            let live = Set(items.filter { Handwriting.isHandwriting($0) }.map { $0.id })
+            let refs = b.ids.filter { live.contains($0) }.map { JSONValue.string(NodeRef.item(b.doc, b.page, $0).description) }
+            guard !refs.isEmpty else { continue }
+            let params: JSONValue = ["refs": .array(refs), "minAngle": .number(AutoStraightener.minimumAngle),
+                                     "pivot": .string(InkPivot.left.rawValue)]
+            Task {
+                // Best effort: a burst that was erased or locked meanwhile simply stays as written.
+                _ = try? await app.bus.execute(Invocation(command: HandwritingStraighten.descriptor.id, params: params,
+                                                          session: session))
+            }
         }
     }
 }

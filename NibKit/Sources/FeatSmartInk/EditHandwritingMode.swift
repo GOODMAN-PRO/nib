@@ -10,8 +10,9 @@ import NibDesign
 // - `EditHandwritingOverlay` (a canvas attachment): the column frame, the side handles that reflow, the selected
 //   word's outline and the live reflow preview. Precision affordances: rigid, never animated, never liquid;
 // - `EditHandwritingOptions` (the tool's options bar, fused to the palette by the toolbar): every action.
-// Every change runs a command (handwriting.*, item.recolor, item.delete, clipboard.*), so it is undoable and the
-// AI, plugins and the bridge can do the same.
+// Every change runs a command (handwriting.*, item.recolor, item.delete, item.transform, clipboard.*), so it is
+// undoable and the AI, plugins and the bridge can do the same. Layouts run off the main actor. Side-by-side columns
+// (margin notes, two-column pages) are laid out separately; the frame and side handles act on one column at a time.
 
 // MARK: - Model
 
@@ -34,8 +35,10 @@ final class EditHandwritingModel: ObservableObject {
         var ids: [ElementID]
     }
 
-    /// A side handle being dragged: the column it would give (layout frame) and where each stroke would go (page).
+    /// A side handle being dragged: the column it reflows, the column it would give (layout frame) and where each of
+    /// that column's strokes would go (page).
     struct Preview: Equatable {
+        var column: Int
         var left: Double
         var width: Double
         var moves: [ElementID: Point]
@@ -51,15 +54,22 @@ final class EditHandwritingModel: ObservableObject {
     /// The strokes being edited; nil until a block is picked (tool chosen without a selection).
     @Published private(set) var target: Target?
     @Published private(set) var layout = InkLayout.empty
+    /// The column the frame and the side handles act on (`layout.columns`): the one with the selected word, the one
+    /// tapped last, or the largest.
+    @Published private(set) var activeColumn = 0
     /// Stroke ids of the selected word (blue outline), empty when none.
     @Published private(set) var selectedWord: [ElementID] = []
     @Published private(set) var preview: Preview?
     @Published private(set) var isInsertingSpace = false
     @Published private(set) var spaceDraft: SpaceDraft?
     @Published private(set) var isBusy = false
+    /// A short status for the options bar (and VoiceOver), such as items pushed off the page.
+    @Published private(set) var notice: String?
 
     /// Current items of the target, for drawing the preview.
     private(set) var strokes: [ElementID: Item] = [:]
+    /// Bumped whenever a layout is applied (the overlay rebuilds its preview ink from it).
+    private(set) var revision = 0
     private var hints: [InkHint] = []
     private weak var app: NibApp?
     private weak var session: EditorSession?
@@ -68,8 +78,14 @@ final class EditHandwritingModel: ObservableObject {
     private var commits: EventSubscription?
     private var selectionSink: AnyCancellable?
     private var reloadPending = false
+    /// Layouts run off the main actor; only the newest one started is applied.
+    private var reloadSerial = 0
+    private var appliedSerial = 0
     /// Bumped whenever the target changes, so late recognition results are dropped.
     private var generation = 0
+    /// The first stroke of the active column, so the column is followed across reloads.
+    private var activeAnchor: ElementID?
+    private var noticeTask: Task<Void, Never>?
     /// The previous tap, for double-tap detection.
     private var lastTap: (point: Point, time: CFTimeInterval)?
     /// A block is being picked off the main actor; taps meanwhile wait here.
@@ -85,9 +101,13 @@ final class EditHandwritingModel: ObservableObject {
     static let doubleTapInterval: CFTimeInterval = 0.4
 
     var canEdit: Bool { isActive && target != nil && !isBusy && !(session?.readOnly ?? true) }
-    var columnLeft: Double { preview?.left ?? layout.box.minX }
-    var columnWidth: Double { preview?.width ?? layout.box.width }
-    var minimumWidth: Double { max(layout.widestWord, 2 * layout.xHeight, 1) }
+    var column: InkColumn? { layout.columns.indices.contains(activeColumn) ? layout.columns[activeColumn] : nil }
+    var columnLeft: Double { preview?.left ?? column?.box.minX ?? 0 }
+    var columnWidth: Double { preview?.width ?? column?.box.width ?? 0 }
+    var minimumWidth: Double {
+        let widest = column == nil ? 0 : layout.words(ofColumn: activeColumn).map { $0.box.width }.max() ?? 0
+        return max(widest, 2 * layout.xHeight, 1)
+    }
 
     var selectedWordLocation: (line: Int, word: Int)? {
         guard let first = selectedWord.first else { return nil }
@@ -141,6 +161,7 @@ final class EditHandwritingModel: ObservableObject {
                 setTarget(Target(doc: doc, page: page, ids: ids))
             }
         }
+        // Every commit on the document (the mode's own commands, undo, sync) lays the target out again.
         commits = app.bus.observeCommits { [weak self] changes in
             guard let self, let doc = self.doc, changes.documents.contains(doc) else { return }
             self.scheduleReload()
@@ -161,12 +182,16 @@ final class EditHandwritingModel: ObservableObject {
         isActive = false
         target = nil
         layout = .empty
+        activeColumn = 0
+        activeAnchor = nil
         strokes = [:]
         hints = []
         selectedWord = []
         preview = nil
         isInsertingSpace = false
         spaceDraft = nil
+        noticeTask?.cancel()
+        notice = nil
         lastTap = nil
         queuedTap = nil
         picking = false
@@ -183,16 +208,26 @@ final class EditHandwritingModel: ObservableObject {
         app.perform(CommandIDs.toolSelect, ["tool": .string(back)], session: session)
     }
 
-    /// Re-reads the target's strokes and lays them out again (after every commit, undo or sync on the document).
-    /// ponytail: synchronous; a paragraph lays out in a few milliseconds. Move it off the main actor if whole dense
-    /// pages in edit mode ever stutter.
-    func reload() {
+    /// Re-reads the target's strokes and lays them out again, off the main actor (a whole page can take longer than
+    /// a frame). Runs after every commit, undo or sync on the document; a result is dropped when the target changed
+    /// or a newer layout was applied meanwhile. Returns once this layout (or a newer one) is in.
+    func reload() async {
         guard let app, let t = target else { return }
+        reloadSerial += 1
+        let serial = reloadSerial
+        let generation = self.generation
         var byID: [ElementID: Item] = [:]
         for item in (try? app.workspace.items(t.doc, page: t.page)) ?? [] where Handwriting.isHandwriting(item) {
             byID[item.id] = item
         }
         let ids = t.ids.filter { byID[$0] != nil }
+        var current: [ElementID: Item] = [:]
+        for id in ids { current[id] = byID[id] }
+        let glyphs = ids.compactMap { id -> InkGlyph? in current[id].flatMap { InkGlyph(item: $0) } }
+        let next = glyphs.isEmpty ? InkLayout.empty : await Handwriting.layout(glyphs, hints: hints)
+        guard generation == self.generation, target == t, serial > appliedSerial else { return }
+        appliedSerial = serial
+        revision += 1
         guard !ids.isEmpty else {
             target = nil
             layout = .empty
@@ -202,13 +237,12 @@ final class EditHandwritingModel: ObservableObject {
             return
         }
         if ids != t.ids { target = Target(doc: t.doc, page: t.page, ids: ids) }
-        var current: [ElementID: Item] = [:]
-        for id in ids { current[id] = byID[id] }
         strokes = current
-        let glyphs = ids.compactMap { id -> InkGlyph? in current[id].flatMap { InkGlyph(item: $0) } }
-        layout = InkLayout.analyze(glyphs, hints: hints)
+        if let p = preview, !next.columns.indices.contains(p.column) { preview = nil }
+        layout = next
         let live = Set(ids)
         if !selectedWord.allSatisfy({ live.contains($0) }) { selectedWord = [] }
+        followActiveColumn()
     }
 
     private func scheduleReload() {
@@ -217,7 +251,7 @@ final class EditHandwritingModel: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.reloadPending = false
-            self.reload()
+            await self.reload()
         }
     }
 
@@ -226,15 +260,20 @@ final class EditHandwritingModel: ObservableObject {
         selectedWord = []
         preview = nil
         hints = []
+        activeAnchor = nil
         generation += 1
-        reload()
-        loadHints(generation)
+        let generation = self.generation
+        Task { [weak self] in
+            await self?.reload()
+            self?.loadHints(generation)
+        }
     }
 
     /// Recognised words refine the layout once they arrive (Vision word boxes).
     private func loadHints(_ generation: Int) {
-        guard let app, let t = target else { return }
+        guard let app, let t = target, generation == self.generation else { return }
         let recognition = Handwriting.Target(doc: t.doc, page: t.page, items: t.ids.compactMap { strokes[$0] })
+        guard !recognition.items.isEmpty else { return }
         let session = self.session
         Task { [weak self] in
             let hints = await Handwriting.hints(for: recognition, services: app.services, workspace: app.workspace) { params in
@@ -242,15 +281,43 @@ final class EditHandwritingModel: ObservableObject {
             }
             guard let self, generation == self.generation, !hints.isEmpty else { return }
             self.hints = hints
-            self.reload()
+            await self.reload()
         }
+    }
+
+    /// Keeps the active column on the selected word's column, else on the column it was on, else the largest.
+    private func followActiveColumn() {
+        guard !layout.columns.isEmpty else {
+            activeColumn = 0
+            activeAnchor = nil
+            return
+        }
+        if let at = selectedWordLocation, let c = layout.column(ofLine: at.line) {
+            activate(column: c)
+        } else if let anchor = activeAnchor,
+                  let c = layout.columns.indices.first(where: { layout.ids(ofColumn: $0).contains(anchor) }) {
+            activate(column: c)
+        } else {
+            let sizes = layout.columns.indices.map { layout.words(ofColumn: $0).count }
+            activate(column: sizes.indices.max { sizes[$0] < sizes[$1] } ?? 0)
+        }
+    }
+
+    private func activate(column c: Int) {
+        guard layout.columns.indices.contains(c) else { return }
+        if activeColumn != c {
+            activeColumn = c
+            preview = nil
+        }
+        activeAnchor = layout.lines[layout.columns[c].lines.lowerBound].ids.first
     }
 
     // MARK: Picking and selecting
 
     /// A tap in the mode (finger, Pencil or pointer; `time` in `CACurrentMediaTime` seconds). With no block yet it
-    /// picks the block under the tap. In the block, a double-tap on a word selects it (blue outline) and a single tap
-    /// clears the word selection; a tap outside the block finishes (Done).
+    /// picks the block under the tap. In the block, a double-tap on a word selects it (blue outline), a single tap
+    /// clears the word selection and makes the tapped column the one the side handles reflow; a tap outside the
+    /// block finishes (Done).
     func tap(at point: Point, page: PageID, time: CFTimeInterval = CACurrentMediaTime()) {
         guard isActive else { return }
         let reach = max(12, layout.xHeight)
@@ -277,13 +344,18 @@ final class EditHandwritingModel: ObservableObject {
             insertLineSpace(atY: point.y)
             return
         }
+        let margin = max(layout.xHeight, 8)
         if let hit = layout.word(at: point, slop: max(4, 0.3 * layout.xHeight)) {
+            if let c = layout.column(ofLine: hit.line) { activate(column: c) }
             if isDouble {
                 select(line: hit.line, word: hit.word)
             } else if layout.lines[hit.line].words[hit.word].ids != selectedWord {
                 selectedWord = []
             }
-        } else if layout.contains(point, margin: max(layout.xHeight, 8)) {
+        } else if let c = layout.column(at: point, margin: margin) {
+            activate(column: c)
+            selectedWord = []
+        } else if layout.contains(point, margin: margin) {
             selectedWord = []
         } else {
             finish()
@@ -314,11 +386,16 @@ final class EditHandwritingModel: ObservableObject {
             }) else { return }
             self.setTarget(Target(doc: doc, page: page, ids: block))
             NibHaptics.play(.select)
-            if let q = queued { self.handleTap(at: q.point, page: q.page, isDouble: q.isDouble) }
+            if let q = queued {
+                // The block's layout is on its way: replay the tap on it.
+                await self.reload()
+                self.handleTap(at: q.point, page: q.page, isDouble: q.isDouble)
+            }
         }
     }
 
-    /// Edits every pen and pencil stroke on the current page (the picker's keyboard and VoiceOver equivalent).
+    /// Edits every pen and pencil stroke on the current page (the picker's keyboard and VoiceOver equivalent). Its
+    /// columns are laid out separately; the side handles reflow one column at a time.
     func selectAllOnPage() {
         guard isActive, let app, let doc, let page = session?.page ?? target?.page else { return }
         let ids = ((try? app.workspace.items(doc, page: page)) ?? []).filter { Handwriting.isHandwriting($0) }.map { $0.id }
@@ -331,6 +408,7 @@ final class EditHandwritingModel: ObservableObject {
 
     private func select(line: Int, word: Int) {
         let w = layout.lines[line].words[word]
+        if let c = layout.column(ofLine: line) { activate(column: c) }
         guard selectedWord != w.ids else { return }
         selectedWord = w.ids
         NibHaptics.play(.select)
@@ -363,34 +441,42 @@ final class EditHandwritingModel: ObservableObject {
 
     // MARK: Reflow (side handles)
 
+    /// The active column laid out `width` wide from layout x `left`.
     func previewReflow(left: Double, width: Double) {
-        guard canEdit else { return }
+        guard canEdit, column != nil else { return }
         let w = max(width, minimumWidth)
-        preview = Preview(left: left, width: w, moves: layout.reflow(width: w, left: left).moves)
+        preview = Preview(column: activeColumn, left: left, width: w,
+                          moves: layout.reflow(column: activeColumn, width: w, left: left).moves)
     }
 
     func cancelPreview() { preview = nil }
 
-    /// Commits the dragged column with handwriting.reflow; the preview stays until the new layout is in.
+    /// Commits the dragged column with handwriting.reflow on that column's strokes; the preview stays until the new
+    /// layout is in.
     func commitReflow() async {
         guard let p = preview else { return }
-        let changed = abs(p.left - layout.box.minX) > 0.5 || abs(p.width - layout.box.width) > 0.5
-        guard changed, let t = target else {
+        guard target != nil, layout.columns.indices.contains(p.column) else {
             preview = nil
             return
         }
-        await run("handwriting.reflow", ["refs": refs(t.ids), "width": .number(p.width),
-                                         "left": .number(layout.pageLeft(fromLayout: p.left))],
+        let box = layout.columns[p.column].box
+        guard abs(p.left - box.minX) > 0.5 || abs(p.width - box.width) > 0.5 else {
+            preview = nil
+            return
+        }
+        let ids = layout.ids(ofColumn: p.column)
+        let left = layout.pageLeft(fromLayout: p.left, column: p.column)
+        await run("handwriting.reflow", ["refs": refs(ids), "width": .number(p.width), "left": .number(left)],
                   group: NibID.make().raw)
-        reload()
+        await reload()
         preview = nil
     }
 
-    /// Widens (+1) or narrows (−1) the column by a tenth: the side handles' VoiceOver and keyboard equivalent.
+    /// Widens (+1) or narrows (−1) the active column by a tenth: the side handles' VoiceOver and keyboard equivalent.
     func stepWidth(_ direction: Int) {
-        guard canEdit, !layout.isEmpty else { return }
-        let step = max(layout.box.width * 0.1, 2 * layout.xHeight)
-        previewReflow(left: layout.box.minX, width: layout.box.width + Double(direction) * step)
+        guard canEdit, let box = column?.box else { return }
+        let step = max(box.width * 0.1, 2 * layout.xHeight)
+        previewReflow(left: box.minX, width: box.width + Double(direction) * step)
         Task { await commitReflow() }
     }
 
@@ -413,71 +499,89 @@ final class EditHandwritingModel: ObservableObject {
         perform("item.recolor", ["refs": refs(selectedWord), "color": .string(String(format: "#%06X", ink.hex))])
     }
 
-    func deleteWord() { removeWord(using: CommandIDs.itemDelete) }
-    func cutWord() { removeWord(using: "clipboard.cut") }
+    func deleteWord() async { await removeWord(using: CommandIDs.itemDelete) }
+    func cutWord() async { await removeWord(using: "clipboard.cut") }
 
-    /// Removes the selected word, then reflows the rest into the same column so the gap closes (one undo step).
-    private func removeWord(using command: String) {
-        guard canEdit, let t = target, !selectedWord.isEmpty else { return }
-        let removed = Set(selectedWord)
-        let remaining = t.ids.filter { !removed.contains($0) }
-        let wordRefs = refs(selectedWord)
-        let width = layout.box.width
-        let left = layout.pageLeft
-        Task {
-            let group = NibID.make().raw
-            guard await run(command, ["refs": wordRefs], group: group) != nil else { return }
-            selectedWord = []
-            reload()
-            guard !remaining.isEmpty else { return }
-            await run("handwriting.reflow", ["refs": refs(remaining), "width": .number(width), "left": .number(left)],
-                      group: group)
-            reload()
+    /// Removes the selected word, closes its hole (the rest of its line moves left, or the lines below move up), then
+    /// reflows its column at the same width and left edge so the text flows on: one undo step.
+    private func removeWord(using command: String) async {
+        guard canEdit, let at = selectedWordLocation, let c = layout.column(ofLine: at.line) else { return }
+        let word = layout.lines[at.line].words[at.word]
+        let removed = Set(word.ids)
+        let rest = layout.ids(ofColumn: c).filter { !removed.contains($0) }
+        let hole = layout.closingHole(line: at.line, word: at.word)
+        let width = layout.columns[c].box.width
+        let left = layout.pageLeft(ofColumn: c)
+        let group = NibID.make().raw
+        guard await run(command, ["refs": refs(word.ids)], group: group) != nil else { return }
+        selectedWord = []
+        if let hole, !hole.ids.isEmpty {
+            await run(CommandIDs.itemTransform, ["refs": refs(hole.ids), "translate": [.number(hole.by.x), .number(hole.by.y)]],
+                      group: group, quiet: true)
         }
+        guard !rest.isEmpty else { return }
+        await run("handwriting.reflow", ["refs": refs(rest), "width": .number(width), "left": .number(left)], group: group)
     }
 
-    /// Pastes after the selected word (or at the end) and flows the text around it (one undo step).
-    func paste() {
-        guard canEdit, let app, let t = target else { return }
-        let anchor = selectedWordLocation ?? layout.lines.indices.last.map { (line: $0, word: layout.lines[$0].words.count - 1) }
-        guard let a = anchor else { return }
-        let line = layout.lines[a.line]
-        let word = line.words[a.word]
-        let at = layout.toPage(Point(word.box.maxX + max(layout.wordGap, layout.xHeight), line.center))
-        let width = layout.box.width
-        let left = layout.pageLeft
+    /// Pastes after the selected word (or at the end of the active column) and flows the text around it, as one undo
+    /// step: the pasted handwriting is laid out on one line, placed just after the word, the rest of the word's line
+    /// moves right to make room (nothing overlaps, so reading order is word, pasted words, next word), and the column
+    /// reflows at its width and left edge.
+    func paste() async {
+        guard canEdit, let app, let t = target,
+              let anchor = selectedWordLocation ?? layout.lastWord(ofColumn: activeColumn),
+              let c = layout.column(ofLine: anchor.line) else { return }
+        let before = layout
+        let columnIDs = before.ids(ofColumn: c)
+        let width = before.columns[c].box.width
+        let left = before.pageLeft(ofColumn: c)
+        let probe = before.room(after: anchor.line, word: anchor.word, width: 0).at
         let pageRef = NodeRef.page(t.doc, t.page).description
-        Task {
-            let group = NibID.make().raw
-            guard let result = await run(CommandIDs.clipboardPaste,
-                                         ["page": .string(pageRef), "at": [.number(at.x), .number(at.y)]],
-                                         group: group) else { return }
-            // Paste selects what it pasted; the mode shows its own selection instead.
-            session?.selection = Selection()
-            let pasted: [ElementID] = (result["refs"]?.arrayValue ?? []).compactMap { value in
-                guard let s = value.stringValue, case let .item(d, p, id)? = NodeRef(s), d == t.doc, p == t.page else {
-                    return nil
-                }
-                return id
+        let group = NibID.make().raw
+        guard let result = await run(CommandIDs.clipboardPaste,
+                                     ["page": .string(pageRef), "at": [.number(probe.x), .number(probe.y)]],
+                                     group: group) else { return }
+        // Paste selects what it pasted; the mode shows its own selection instead.
+        session?.selection = Selection()
+        let pastedRefs: [ElementID] = (result["refs"]?.arrayValue ?? []).compactMap { value in
+            guard let s = value.stringValue, case let .item(d, p, id)? = NodeRef(s), d == t.doc, p == t.page else {
+                return nil
             }
-            let items = ((try? app.workspace.items(t.doc, page: t.page)) ?? [])
-                .filter { pasted.contains($0.id) && Handwriting.isHandwriting($0) }
-            guard !items.isEmpty else { return }
-            // Paste centres its content on `at`; start it just after the anchor word so reading order puts it there.
-            let bounds = InkLayout.union(items.compactMap { InkGlyph(item: $0)?.bounds })
-            let dx = at.x - bounds.minX
-            let dy = at.y - bounds.midY
-            if abs(dx) > 0.5 || abs(dy) > 0.5 {
-                await run(CommandIDs.itemTransform, ["refs": refs(items.map { $0.id }), "translate": [.number(dx), .number(dy)]],
-                          group: group, quiet: true)
-            }
-            let ids = t.ids + items.map { $0.id }
-            target = Target(doc: t.doc, page: t.page, ids: ids)
-            reload()
-            await run("handwriting.reflow", ["refs": refs(ids), "width": .number(width), "left": .number(left)],
-                      group: group)
-            reload()
+            return id
         }
+        let handwriting = Set(((try? app.workspace.items(t.doc, page: t.page)) ?? [])
+            .filter { Handwriting.isHandwriting($0) }.map { $0.id })
+        let pasted = pastedRefs.filter { handwriting.contains($0) }
+        guard !pasted.isEmpty else { return }
+        // 1. One line, whatever the clipboard's layout.
+        if pasted.count > 1 {
+            await run("handwriting.reflow", ["refs": refs(pasted), "width": .number(SmartInkSchema.coordinateLimit),
+                                             "joinParagraphs": true], group: group)
+        }
+        // 2. Right after the word, on its line; 3. the rest of the line moves right by the pasted width.
+        let glyphs = ((try? app.workspace.items(t.doc, page: t.page)) ?? [])
+            .filter { pasted.contains($0.id) }.compactMap { InkGlyph(item: $0) }
+        let bounds = InkLayout.union(glyphs.map { $0.bounds })
+        // Centre lines meet (letters sit at the same height as the word's), not bounding boxes.
+        let own = await Handwriting.layout(glyphs, hints: [])
+        let centre = own.lines.first.map { own.toPage(Point($0.box.midX, $0.center)).y } ?? bounds.midY
+        let room = before.room(after: anchor.line, word: anchor.word, width: bounds.width)
+        let dx = room.at.x - bounds.minX
+        let dy = room.at.y - centre
+        if abs(dx) > 0.01 || abs(dy) > 0.01 {
+            await run(CommandIDs.itemTransform, ["refs": refs(pasted), "translate": [.number(dx), .number(dy)]],
+                      group: group, quiet: true)
+        }
+        if !room.ids.isEmpty, room.by != .zero {
+            await run(CommandIDs.itemTransform, ["refs": refs(room.ids), "translate": [.number(room.by.x), .number(room.by.y)]],
+                      group: group, quiet: true)
+        }
+        // 4. The column flows again, pasted words included.
+        let known = Set(target?.ids ?? t.ids)
+        target = Target(doc: t.doc, page: t.page, ids: (target?.ids ?? t.ids) + pasted.filter { !known.contains($0) })
+        await run("handwriting.reflow", ["refs": refs(columnIDs + pasted), "width": .number(width), "left": .number(left)],
+                  group: group)
+        scheduleReload()
     }
 
     // MARK: Insert space (T-113)
@@ -513,7 +617,8 @@ final class EditHandwritingModel: ObservableObject {
 
     func cancelSpace() { spaceDraft = nil }
 
-    /// One line of space at `y`, or between the selected word's line and the next (below the last line otherwise).
+    /// One line of space at `y`, or between the selected word's line and the next line of its column (below the
+    /// active column's last line otherwise).
     func insertLineSpace(atY y: Double? = nil) {
         guard canEdit, !layout.isEmpty else { return }
         insertSpace(y: y ?? defaultSpaceY(), height: layout.pitch > 0 ? layout.pitch : 32)
@@ -523,17 +628,24 @@ final class EditHandwritingModel: ObservableObject {
 
     private func defaultSpaceY() -> Double {
         let lines = layout.lines
-        let i = selectedWordLocation?.line ?? lines.count - 1
-        let below = i + 1 < lines.count
+        let c = selectedWordLocation.flatMap { layout.column(ofLine: $0.line) } ?? min(activeColumn, layout.columns.count - 1)
+        let range = layout.columns[c].lines
+        let i = selectedWordLocation?.line ?? range.upperBound - 1
+        let below = i + 1 < range.upperBound
             ? (lines[i].box.maxY + lines[i + 1].box.minY) / 2
             : lines[i].box.maxY + 0.25 * layout.pitch
         return layout.toPage(Point(lines[i].box.midX, below)).y
     }
 
     private func insertSpace(y: Double, height: Double) {
-        guard let t = target else { return }
-        perform("handwriting.insertSpace", ["page": .string(NodeRef.page(t.doc, t.page).description),
-                                            "y": .number(y), "height": .number(height)])
+        guard canEdit, let t = target else { return }
+        let params: JSONValue = ["page": .string(NodeRef.page(t.doc, t.page).description), "y": .number(y),
+                                 "height": .number(height)]
+        Task {
+            guard let out = await run("handwriting.insertSpace", params, group: NibID.make().raw) else { return }
+            let off = out["offPage"]?.intValue ?? 0
+            if off > 0 { show(notice: String(localized: "Moved past the bottom of the page: \(off)")) }
+        }
     }
 
     // MARK: Running commands
@@ -543,12 +655,10 @@ final class EditHandwritingModel: ObservableObject {
         return .array(ids.map { .string(NodeRef.item(t.doc, t.page, $0).description) })
     }
 
+    /// Runs one command as its own undo step; the commit observer lays the target out again.
     private func perform(_ command: String, _ params: JSONValue) {
         guard canEdit else { return }
-        Task {
-            await run(command, params, group: NibID.make().raw)
-            reload()
-        }
+        Task { await run(command, params, group: NibID.make().raw) }
     }
 
     /// Runs a command as the user in `group` (several calls = one undo step). Failures reach the shell's toast unless
@@ -566,6 +676,18 @@ final class EditHandwritingModel: ObservableObject {
                                                 userInfo: ["command": command, "error": NibError.wrap(error)])
             }
             return nil
+        }
+    }
+
+    /// Shows a status in the options bar for as long as a toast stays, and announces it.
+    private func show(notice text: String) {
+        noticeTask?.cancel()
+        notice = text
+        announce(text)
+        noticeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(NibMotion.toastDuration * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.notice = nil
         }
     }
 
@@ -669,6 +791,11 @@ final class EditHandwritingOverlay: NSObject, CanvasAttachment, UIPointerInterac
     private var armed: Side?
     private var drag: HandleDrag?
     private var hidden: (page: PageID, ids: Set<ElementID>)?
+    /// The preview ink built for (layout revision, column): one path set per word, in page coordinates, so a
+    /// handle drag only moves layers.
+    private var inkBuilt: (revision: Int, column: Int)?
+    /// First stroke of each word whose layer `EditHandwritingView` holds, in the same order.
+    private var inkWords: [ElementID] = []
 
     func attach(to host: CanvasHost) {
         self.host = host
@@ -687,6 +814,9 @@ final class EditHandwritingOverlay: NSObject, CanvasAttachment, UIPointerInterac
     func detach(from host: CanvasHost) {
         sink = nil
         setHidden(nil, host: host)
+        view.setInk(nil)
+        inkBuilt = nil
+        inkWords = []
         view.removeFromSuperview()
         self.host = nil
         model = nil
@@ -750,12 +880,14 @@ final class EditHandwritingOverlay: NSObject, CanvasAttachment, UIPointerInterac
         guard let host, let model else { return }
         view.frame = host.canvasView.bounds
         guard model.isActive, let target = model.target, target.doc == host.documentID,
-              host.pageFrame(target.page) != nil, !model.layout.isEmpty else {
+              host.pageFrame(target.page) != nil, !model.layout.isEmpty, model.column != nil else {
             view.show(nil)
+            showInk(nil, model: model, toView: .identity)
             setHidden(nil, host: host)
             return
         }
         let layout = model.layout
+        let active = model.preview.map { $0.column } ?? model.activeColumn
         let toView = transform(host: host, page: target.page)
         func project(_ p: Point) -> CGPoint { CGPoint(x: p.x, y: p.y).applying(toView) }
         let scale = Double(hypot(toView.a, toView.b))
@@ -770,32 +902,14 @@ final class EditHandwritingOverlay: NSObject, CanvasAttachment, UIPointerInterac
             box.y += shift.y
             return box
         }
-        let text = InkLayout.union(layout.words.map { placed($0) })
+        let columnWords = layout.words(ofColumn: active)
+        let text = InkLayout.union(columnWords.map { placed($0) })
         let column = Rect(x: model.columnLeft, y: text.minY, width: model.columnWidth, height: text.height)
         let handles = [layout.toPage(Point(column.minX, column.midY)), layout.toPage(Point(column.maxX, column.midY))]
 
         var word: [CGPoint]?
         if let at = model.selectedWordLocation {
             word = layout.pageCorners(placed(layout.lines[at.line].words[at.word]).insetBy(-0.15 * layout.xHeight)).map(project)
-        }
-
-        var ink: [EditHandwritingView.InkPath] = []
-        if let preview = model.preview {
-            var groups: [String: (color: CGColor, width: CGFloat, path: CGMutablePath)] = [:]
-            for id in target.ids {
-                guard let stroke = model.strokes[id]?.stroke, let first = stroke.points.first else { continue }
-                let v = preview.moves[id] ?? .zero
-                let c = stroke.style.color
-                let key = c.hex + "/" + String(stroke.style.width)
-                var entry = groups[key] ?? (color: NibPalette.cgColor(SmartInkColour.rgb(c), alpha: CGFloat(c.alpha)),
-                                            width: CGFloat(stroke.style.width * scale), path: CGMutablePath())
-                entry.path.move(to: project(Point(Double(first.x) + v.x, Double(first.y) + v.y)))
-                for p in stroke.points.dropFirst() {
-                    entry.path.addLine(to: project(Point(Double(p.x) + v.x, Double(p.y) + v.y)))
-                }
-                groups[key] = entry
-            }
-            ink = groups.values.map { EditHandwritingView.InkPath(path: $0.path, color: $0.color, width: $0.width) }
         }
 
         var space: [CGPoint]?
@@ -811,11 +925,57 @@ final class EditHandwritingOverlay: NSObject, CanvasAttachment, UIPointerInterac
             column: layout.pageCorners(column.insetBy(-pad)).map(project),
             handles: handles.map(project),
             word: word,
-            ink: ink,
             space: space,
             summary: String(localized: "\(lineCount) lines, \(wordCount) words"),
             wordText: model.selectedWordText))
-        setHidden(model.preview == nil ? nil : (page: target.page, ids: Set(target.ids)), host: host)
+        showInk(model.preview, model: model, toView: toView)
+        setHidden(model.preview == nil ? nil : (page: target.page, ids: Set(layout.ids(ofColumn: active))), host: host)
+    }
+
+    /// The preview ink: while a handle is dragged, the column's words are drawn where the reflow would put them (the
+    /// real strokes hide). Paths are built once per layout and column; each move only sets per-word transforms, so
+    /// a drag over a whole page stays within the frame budget.
+    private func showInk(_ preview: EditHandwritingModel.Preview?, model: EditHandwritingModel, toView: CGAffineTransform) {
+        guard let preview else {
+            if inkBuilt != nil {
+                view.setInk(nil)
+                inkBuilt = nil
+                inkWords = []
+            }
+            return
+        }
+        if inkBuilt?.revision != model.revision || inkBuilt?.column != preview.column {
+            var words: [[EditHandwritingView.InkPath]] = []
+            var firsts: [ElementID] = []
+            for word in model.layout.words(ofColumn: preview.column) {
+                guard let first = word.ids.first else { continue }
+                var groups: [String: (path: CGMutablePath, color: CGColor, width: CGFloat)] = [:]
+                var order: [String] = []
+                for id in word.ids {
+                    guard let stroke = model.strokes[id]?.stroke, let start = stroke.points.first else { continue }
+                    let c = stroke.style.color
+                    let key = c.hex + "/" + String(stroke.style.width)
+                    if groups[key] == nil { order.append(key) }
+                    let entry = groups[key] ?? (path: CGMutablePath(),
+                                                color: NibPalette.cgColor(SmartInkColour.rgb(c), alpha: CGFloat(c.alpha)),
+                                                width: CGFloat(stroke.style.width))
+                    entry.path.move(to: CGPoint(x: Double(start.x), y: Double(start.y)))
+                    for p in stroke.points.dropFirst() { entry.path.addLine(to: CGPoint(x: Double(p.x), y: Double(p.y))) }
+                    groups[key] = entry
+                }
+                words.append(order.compactMap { key in
+                    groups[key].map { EditHandwritingView.InkPath(path: $0.path, color: $0.color, width: $0.width) }
+                })
+                firsts.append(first)
+            }
+            view.setInk(words)
+            inkWords = firsts
+            inkBuilt = (revision: model.revision, column: preview.column)
+        }
+        view.placeInk(inkWords.map { id in
+            let v = preview.moves[id] ?? .zero
+            return CGAffineTransform(translationX: v.x, y: v.y).concatenating(toView)
+        })
     }
 
     /// Page → overlay-view transform, from three projected points (handles zoom, scroll and rotated pages).
@@ -863,9 +1023,9 @@ final class EditHandwritingOverlay: NSObject, CanvasAttachment, UIPointerInterac
         }
         var list: [UIAccessibilityCustomAction] = []
         if !model.selectedWord.isEmpty {
-            list.append(action(String(localized: "Delete Word")) { model.deleteWord() })
-            list.append(action(String(localized: "Cut Word")) { model.cutWord() })
-            list.append(action(String(localized: "Paste After Word")) { model.paste() })
+            list.append(action(String(localized: "Delete Word")) { Task { await model.deleteWord() } })
+            list.append(action(String(localized: "Cut Word")) { Task { await model.cutWord() } })
+            list.append(action(String(localized: "Paste After Word")) { Task { await model.paste() } })
         }
         list.append(action(String(localized: "Next Word")) { model.stepWord(1) })
         list.append(action(String(localized: "Previous Word")) { model.stepWord(-1) })
@@ -901,6 +1061,7 @@ final class EditHandwritingOverlay: NSObject, CanvasAttachment, UIPointerInterac
 /// word's accent outline, the preview ink and the insert-space band. Touches fall through to the canvas; only the
 /// pointer's hover stops here, over a handle.
 final class EditHandwritingView: UIView {
+    /// Strokes of one colour and width, in page coordinates.
     struct InkPath {
         var path: CGPath
         var color: CGColor
@@ -913,14 +1074,13 @@ final class EditHandwritingView: UIView {
         /// Left and right handle centres.
         var handles: [CGPoint]
         var word: [CGPoint]?
-        var ink: [InkPath]
         var space: [CGPoint]?
         var summary: String
         var wordText: String?
     }
 
     /// Handle bead diameter (DESIGN.md §14.3: 12 pt beads, 44 pt hit areas).
-    static let bead: CGFloat = 12
+    static let bead: CGFloat = NibMetrics.handleBead
     private static let beadPath = CGPath(ellipseIn: CGRect(x: -EditHandwritingView.bead / 2, y: -EditHandwritingView.bead / 2,
                                                            width: EditHandwritingView.bead, height: EditHandwritingView.bead),
                                          transform: nil)
@@ -930,7 +1090,8 @@ final class EditHandwritingView: UIView {
     private(set) var content: Content?
 
     private let inkLayer = CALayer()
-    private var inkShapes: [CAShapeLayer] = []
+    /// One layer per previewed word (its paths are in page coordinates; its transform places it).
+    private var inkWords: [CALayer] = []
     private let bandLayer = CAShapeLayer()
     private let frameLayer = CAShapeLayer()
     private let wordLayer = CAShapeLayer()
@@ -949,16 +1110,16 @@ final class EditHandwritingView: UIView {
         layer.addSublayer(frameLayer)
         layer.addSublayer(wordLayer)
         frameLayer.fillColor = nil
-        frameLayer.lineWidth = 1
-        frameLayer.lineDashPattern = [4, 4]
+        frameLayer.lineWidth = NibStroke.thin
+        frameLayer.lineDashPattern = NibStroke.layerDash
         frameLayer.lineJoin = .round
         wordLayer.fillColor = nil
-        wordLayer.lineWidth = 1.5
+        wordLayer.lineWidth = NibStroke.emphasis
         wordLayer.lineJoin = .round
-        bandLayer.lineWidth = 1
+        bandLayer.lineWidth = NibStroke.thin
         for h in handleLayers {
             h.path = EditHandwritingView.beadPath
-            h.lineWidth = 1
+            h.lineWidth = NibStroke.thin
             h.isHidden = true
             layer.addSublayer(h)
         }
@@ -990,8 +1151,6 @@ final class EditHandwritingView: UIView {
             wordLayer.path = nil
             bandLayer.path = nil
             handleLayers.forEach { $0.isHidden = true }
-            inkShapes.forEach { $0.removeFromSuperlayer() }
-            inkShapes = []
             accessibilityElements = nil
             return
         }
@@ -1002,21 +1161,45 @@ final class EditHandwritingView: UIView {
             h.isHidden = false
             h.position = c.handles[i]
         }
-        while inkShapes.count < c.ink.count {
-            let s = CAShapeLayer()
-            s.fillColor = nil
-            s.lineCap = .round
-            s.lineJoin = .round
-            inkLayer.addSublayer(s)
-            inkShapes.append(s)
-        }
-        while inkShapes.count > c.ink.count { inkShapes.removeLast().removeFromSuperlayer() }
-        for (s, ink) in zip(inkShapes, c.ink) {
-            s.path = ink.path
-            s.strokeColor = ink.color
-            s.lineWidth = ink.width
-        }
         updateAccessibility(c)
+    }
+
+    /// Replaces the preview ink: one layer per word holding its paths (page coordinates). Nil removes it.
+    func setInk(_ words: [[InkPath]]?) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        inkWords.forEach { $0.removeFromSuperlayer() }
+        inkWords = []
+        for paths in words ?? [] {
+            let word = CALayer()
+            word.anchorPoint = .zero
+            word.bounds = .zero
+            word.position = .zero
+            for ink in paths {
+                let shape = CAShapeLayer()
+                shape.anchorPoint = .zero
+                shape.bounds = .zero
+                shape.position = .zero
+                shape.path = ink.path
+                shape.strokeColor = ink.color
+                shape.fillColor = nil
+                shape.lineWidth = ink.width
+                shape.lineCap = .round
+                shape.lineJoin = .round
+                word.addSublayer(shape)
+            }
+            inkLayer.addSublayer(word)
+            inkWords.append(word)
+        }
+    }
+
+    /// Places each previewed word (page → view, including its reflow shift): only transforms change per move.
+    func placeInk(_ transforms: [CGAffineTransform]) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        for (layer, t) in zip(inkWords, transforms) { layer.setAffineTransform(t) }
     }
 
     private func updateAccessibility(_ c: Content) {
@@ -1087,21 +1270,6 @@ final class WidthHandleElement: UIAccessibilityElement {
 
 // MARK: - Options bar
 
-/// Glyphs Nib's symbol table does not carry yet (contract gap: see the feature's report), with safe fallbacks.
-enum SmartInkSymbol {
-    static let straighten = named("level", or: .ruler)
-    static let alignLeft = named("text.alignleft", or: .listView)
-    static let alignCentre = named("text.aligncenter", or: .listView)
-    static let alignRight = named("text.alignright", or: .listView)
-    static let insertSpace = named("arrow.up.and.down", or: .plus)
-    static let cut = named("scissors", or: .minus)
-    static let paste = named("doc.on.clipboard", or: .attach)
-    static let colours = named("paintpalette", or: .pen)
-    static let editAll = named("text.viewfinder", or: .select)
-
-    private static func named(_ name: String, or fallback: NibSymbol) -> NibSymbol { NibSymbol(systemName: name) ?? fallback }
-}
-
 enum SmartInkColour {
     /// 0xRRGGBB of an ink colour (alpha dropped), comparable with `NibInk.hex`.
     static func rgb(_ c: RGBA) -> UInt32 { UInt32(c.r) << 16 | UInt32(c.g) << 8 | UInt32(c.b) }
@@ -1117,7 +1285,7 @@ struct EditHandwritingOptions: View {
         HStack(spacing: 0) {
             Group {
                 if model.target == nil {
-                    NibToolbarItem(SmartInkSymbol.editAll, label: String(localized: "Edit All Handwriting on This Page")) {
+                    NibToolbarItem(.recognisedText, label: String(localized: "Edit All Handwriting on This Page")) {
                         model.selectAllOnPage()
                     }
                 } else if model.selectedWord.isEmpty {
@@ -1127,6 +1295,10 @@ struct EditHandwritingOptions: View {
                 }
             }
             .disabled(model.isBusy)
+            if let notice = model.notice {
+                NibBarSeparator()
+                NibHUDText(notice)
+            }
             NibBarSeparator()
             NibToolbarItem(.checkmark, label: String(localized: "Done"), shortcut: KeyboardShortcut(.escape, modifiers: [])) {
                 model.finish()
@@ -1135,7 +1307,7 @@ struct EditHandwritingOptions: View {
     }
 
     @ViewBuilder private var lineTools: some View {
-        NibToolbarItem(SmartInkSymbol.straighten, label: String(localized: "Straighten Lines"),
+        NibToolbarItem(.straighten, label: String(localized: "Straighten Lines"),
                        shortcut: KeyboardShortcut("l", modifiers: [.command, .option])) { model.straighten() }
         if sizeClass == .compact {
             Menu {
@@ -1143,18 +1315,18 @@ struct EditHandwritingOptions: View {
                 Button(String(localized: "Align Centre")) { model.align(.centre) }
                 Button(String(localized: "Align Right")) { model.align(.right) }
             } label: {
-                glyph(SmartInkSymbol.alignLeft)
+                glyph(.alignLeft)
             }
             .accessibilityLabel(String(localized: "Align"))
         } else {
-            NibToolbarItem(SmartInkSymbol.alignLeft, label: String(localized: "Align Left"),
+            NibToolbarItem(.alignLeft, label: String(localized: "Align Left"),
                            shortcut: KeyboardShortcut("{", modifiers: .command)) { model.align(.left) }
-            NibToolbarItem(SmartInkSymbol.alignCentre, label: String(localized: "Align Centre"),
+            NibToolbarItem(.alignCentre, label: String(localized: "Align Centre"),
                            shortcut: KeyboardShortcut("|", modifiers: .command)) { model.align(.centre) }
-            NibToolbarItem(SmartInkSymbol.alignRight, label: String(localized: "Align Right"),
+            NibToolbarItem(.alignRight, label: String(localized: "Align Right"),
                            shortcut: KeyboardShortcut("}", modifiers: .command)) { model.align(.right) }
         }
-        NibToolbarItem(SmartInkSymbol.insertSpace, label: String(localized: "Insert Space"), isOn: model.isInsertingSpace,
+        NibToolbarItem(.insertSpace, label: String(localized: "Insert Space"), isOn: model.isInsertingSpace,
                        shortcut: KeyboardShortcut(.return, modifiers: [.command, .option])) {
             model.toggleInsertSpace()
         }
@@ -1164,7 +1336,7 @@ struct EditHandwritingOptions: View {
                 Button(String(localized: "Narrow Column")) { model.stepWidth(-1) }
                 Button(String(localized: "Widen Column")) { model.stepWidth(1) }
                 Button(String(localized: "Insert a Line of Space")) { model.insertLineSpace() }
-                Button(String(localized: "Paste at the End")) { model.paste() }
+                Button(String(localized: "Paste at the End")) { Task { await model.paste() } }
             } label: {
                 glyph(.moreCircle)
             }
@@ -1175,7 +1347,7 @@ struct EditHandwritingOptions: View {
                            shortcut: KeyboardShortcut("[", modifiers: [.command, .option])) { model.stepWidth(-1) }
             NibToolbarItem(.plus, label: String(localized: "Widen Column"),
                            shortcut: KeyboardShortcut("]", modifiers: [.command, .option])) { model.stepWidth(1) }
-            NibToolbarItem(SmartInkSymbol.paste, label: String(localized: "Paste at the End")) { model.paste() }
+            NibToolbarItem(.paste, label: String(localized: "Paste at the End")) { Task { await model.paste() } }
             NibToolbarItem(.forward, label: String(localized: "Select First Word"),
                            shortcut: KeyboardShortcut(.rightArrow, modifiers: .option)) { model.stepWord(1) }
         }
@@ -1192,14 +1364,14 @@ struct EditHandwritingOptions: View {
                 Button(ink.name) { model.recolour(ink) }
             }
         } label: {
-            glyph(SmartInkSymbol.colours)
+            glyph(.customColour)
         }
         .accessibilityLabel(String(localized: "Word Colour"))
         NibBarSeparator()
-        NibToolbarItem(SmartInkSymbol.cut, label: String(localized: "Cut Word")) { model.cutWord() }
+        NibToolbarItem(.cut, label: String(localized: "Cut Word")) { Task { await model.cutWord() } }
         NibToolbarItem(.trash, label: String(localized: "Delete Word"),
-                       shortcut: KeyboardShortcut(.delete, modifiers: [])) { model.deleteWord() }
-        NibToolbarItem(SmartInkSymbol.paste, label: String(localized: "Paste After Word")) { model.paste() }
+                       shortcut: KeyboardShortcut(.delete, modifiers: [])) { Task { await model.deleteWord() } }
+        NibToolbarItem(.paste, label: String(localized: "Paste After Word")) { Task { await model.paste() } }
         NibBarSeparator()
         NibToolbarItem(.back, label: String(localized: "Previous Word"),
                        shortcut: KeyboardShortcut(.leftArrow, modifiers: .option)) { model.stepWord(-1) }

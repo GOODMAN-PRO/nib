@@ -174,6 +174,21 @@ final class InkLayoutTests: XCTestCase {
         XCTAssertTrue(level.straightening().isEmpty)
     }
 
+    /// Levelling about the left end keeps the line's start where it was (a line continued after a pause meets it);
+    /// about the centre, the start moves by tan(angle) × half the line.
+    func testStraighteningAboutTheLeftEnd() {
+        var s = Synth()
+        s.line([3, 4, 3, 2, 4, 3], y: 200, tilt: tan(6 * Double.pi / 180))
+        let layout = InkLayout.analyze(s.glyphs)
+        let start = s.strokes[0].points[0]
+        let left = layout.straightening(pivot: .left)
+        let centre = layout.straightening(pivot: .centre)
+        XCTAssertLessThan(abs(left[s.ids[0]]!.apply(start).y - start.y), 1)
+        XCTAssertGreaterThan(abs(centre[s.ids[0]]!.apply(start).y - start.y), 8)
+        let level = InkLayout.analyze(s.transformed(left))
+        XCTAssertLessThan(abs(level.skew + atan(level.lines[0].slope)) * 180 / .pi, 0.75)
+    }
+
     func testAlignmentMovesLinesToTheBlockEdges() {
         var s = Synth()
         s.line([3, 3], y: 100)          // 72…142
@@ -203,6 +218,17 @@ final class InkLayoutTests: XCTestCase {
         let split = InkLayout.analyze(close.glyphs, hints: [InkHint(ids: [close.ids[0]], text: "a"),
                                                              InkHint(ids: [close.ids[1]], text: "b")])
         XCTAssertEqual(split.words.map { $0.text }, ["a", "b"])
+
+        // Overlapping strokes (a cursive join, a t-bar reaching into the next word) are one word by geometry, but
+        // recognition decides first: different recognised words never share a word.
+        var overlapping = Synth()
+        overlapping.line([1], y: 100)
+        overlapping.line([1], x: 78, y: 100)   // 2 pt overlap
+        XCTAssertEqual(InkLayout.analyze(overlapping.glyphs).words.count, 1)
+        let apartByHint = InkLayout.analyze(overlapping.glyphs, hints: [InkHint(ids: [overlapping.ids[0]], text: "a"),
+                                                                        InkHint(ids: [overlapping.ids[1]], text: "b")])
+        XCTAssertEqual(apartByHint.words.map { $0.text }, ["a", "b"])
+        XCTAssertEqual(apartByHint.words.map { $0.ids }, [[overlapping.ids[0]], [overlapping.ids[1]]])
     }
 
     func testHintsFromRecognitionResult() throws {
@@ -256,19 +282,238 @@ final class InkLayoutTests: XCTestCase {
         locked.locked = true
         items.append(locked)
 
-        let moved = SpaceInsertion.moved(items, y: 300, height: 40)
-        let ids = Set(moved.map { $0.id })
+        let result = SpaceInsertion.insert(items, y: 300, height: 40, pageHeight: PageSize.a4.height)
+        XCTAssertEqual(result.height, 40)
+        XCTAssertEqual(result.offPage, 0)
+        let ids = Set(result.items.map { $0.id })
         XCTAssertEqual(ids, [Fixtures.textID, Fixtures.tapeID, Fixtures.commentID, Fixtures.mathID, Fixtures.imageID,
                              Fixtures.customID, "CONNTEXT0001"])
-        let text = moved.first { $0.id == Fixtures.textID }
+        let text = result.items.first { $0.id == Fixtures.textID }
         XCTAssertEqual(text?.text?.frame.y ?? 0, 440, accuracy: 1e-9)
-        let connector = moved.first { $0.id == "CONNTEXT0001" }?.connector
+        let connector = result.items.first { $0.id == "CONNTEXT0001" }?.connector
         XCTAssertEqual(connector?.from.point, Point(260, 245))
         XCTAssertEqual(connector?.to.point, Point(72, 460))
+        XCTAssertTrue(SpaceInsertion.insert(items, y: 300, height: 0).items.isEmpty)
+    }
 
-        // A negative height closes space the same way.
-        let up = SpaceInsertion.moved(items, y: 300, height: -20)
-        XCTAssertEqual(up.first { $0.id == Fixtures.textID }?.text?.frame.y ?? 0, 380, accuracy: 1e-9)
-        XCTAssertTrue(SpaceInsertion.moved(items, y: 300, height: 0).isEmpty)
+    /// Closing space stops at the lowest bottom of what stays above y (here the shape), so nothing is pulled up over it.
+    func testClosingSpaceIsClampedToTheFreeGapAboveY() throws {
+        let items = Fixtures.sampleContent().1[Fixtures.page1] ?? []
+        let shape = try XCTUnwrap(items.first { $0.id == Fixtures.shapeID })
+        let free = 300 - shape.bounds.maxY
+        XCTAssertGreaterThan(free, 0)
+        XCTAssertLessThan(free, 20)
+
+        let small = SpaceInsertion.insert(items, y: 300, height: -free / 2, pageHeight: PageSize.a4.height)
+        XCTAssertEqual(small.height, -free / 2, accuracy: 1e-9)
+        XCTAssertEqual(small.items.first { $0.id == Fixtures.textID }?.text?.frame.y ?? 0, 400 - free / 2, accuracy: 1e-9)
+
+        let clamped = SpaceInsertion.insert(items, y: 300, height: -120, pageHeight: PageSize.a4.height)
+        XCTAssertEqual(clamped.height, -free, accuracy: 1e-9)
+        XCTAssertEqual(clamped.items.first { $0.id == Fixtures.textID }?.text?.frame.y ?? 0, 400 - free, accuracy: 1e-9)
+        let movedTop = clamped.items.map { $0.bounds.minY }.min() ?? 0
+        XCTAssertGreaterThanOrEqual(movedTop, shape.bounds.maxY - 1e-9, "nothing lands on the shape")
+
+        // Right under the shape there is no room at all.
+        XCTAssertTrue(SpaceInsertion.insert(items, y: shape.bounds.maxY, height: -10, pageHeight: PageSize.a4.height).items.isEmpty)
+    }
+
+    func testInsertSpaceCountsItemsPushedOffThePage() {
+        let items = Fixtures.sampleContent().1[Fixtures.page1] ?? []
+        // The custom box (top 700) leaves the A4 page (842 pt); the tape (600) and the rest stay on it.
+        let result = SpaceInsertion.insert(items, y: 300, height: 200, pageHeight: PageSize.a4.height)
+        XCTAssertEqual(result.offPage, 1)
+        XCTAssertEqual(SpaceInsertion.insert(items, y: 300, height: 200, pageHeight: nil).offPage, 0, "boards have no bottom")
+        XCTAssertEqual(SpaceInsertion.insert(items, y: 300, height: 20, pageHeight: PageSize.a4.height).offPage, 0)
+    }
+
+    // MARK: Paragraphs on real (ragged) handwriting
+
+    /// Ragged right edges (226 / 184 / 216 / 184) with short first words never break a paragraph.
+    func testRaggedParagraphIsOneParagraph() {
+        var s = Synth()
+        s.line([3, 3, 2, 4], y: 100)       // 72…226
+        s.line([2, 4, 3], y: 130)          // 72…184
+        s.line([2, 3, 3, 3], y: 160)       // 72…216
+        s.line([2, 3, 4], y: 190)          // 72…184
+        let layout = InkLayout.analyze(s.glyphs)
+        XCTAssertEqual(layout.lines.map { $0.box.maxX }, [226, 184, 216, 184])
+        XCTAssertEqual(layout.lines.map { $0.startsParagraph }, [true, false, false, false])
+
+        // Reflowed as one paragraph at its own width: line 3's first word joins line 2.
+        let result = layout.reflow(width: layout.box.width)
+        XCTAssertPoint(result.moves[s.words[7][0]], Point(72 + 18 + 14 + 38 + 14 + 28 + 14 - 72, -30))
+        let again = InkLayout.analyze(s.moved(result.moves))
+        XCTAssertEqual(again.words.map { $0.ids }, s.words)
+    }
+
+    /// Deleting the last word of a line (or cutting it) leaves the line short; the next reflow still pulls the next
+    /// line's first word up into the space.
+    func testReflowAfterDeletingALineEndPullsTheNextWordUp() {
+        var s = Synth.paragraph()
+        let removed = Set(s.words[3])
+        s.strokes.removeAll { removed.contains($0.id) }
+        s.words.remove(at: 3)
+        let layout = InkLayout.analyze(s.glyphs)
+        XCTAssertEqual(layout.lines[0].box.maxX, 174)
+        XCTAssertEqual(layout.lines.map { $0.startsParagraph }, [true, false, false])
+        let result = layout.reflow(width: 154, left: 72)
+        // Line 2's first word (18 pt) now fits after line 1's last word: 174 + 14 = 188.
+        XCTAssertPoint(result.moves[s.words[3][0]], Point(188 - 72, -30))
+        let again = InkLayout.analyze(s.moved(result.moves))
+        XCTAssertEqual(again.words.map { $0.ids }, s.words)
+        XCTAssertEqual(again.lines[0].words.count, 4)
+    }
+
+    // MARK: Columns
+
+    /// Two columns side by side: each reflows in its own column and keeps its own reading order; alignment works per
+    /// column, so the right column never lands on the left one.
+    func testSideBySideColumnsNeverMix() {
+        var s = Synth()
+        for y in [100.0, 130, 160] { s.line(y == 160 ? [3, 2] : [3, 3, 2, 4], y: y) }            // 72…226
+        let leftWords = s.words.count
+        for y in [100.0, 130, 160] { s.line(y == 160 ? [2, 3] : [2, 4, 3, 3], x: 400, y: y) }   // 400…554
+        let left = Set(s.words[..<leftWords].flatMap { $0 })
+        let right = Set(s.words[leftWords...].flatMap { $0 })
+
+        let layout = InkLayout.analyze(s.glyphs)
+        XCTAssertEqual(layout.columns.count, 2)
+        XCTAssertEqual(layout.words.map { $0.ids }, s.words, "one column after the other, never interleaved")
+        XCTAssertEqual(Set(layout.ids(ofColumn: 0)), left)
+        XCTAssertEqual(Set(layout.ids(ofColumn: 1)), right)
+        XCTAssertEqual(layout.blocks().map { Set($0) }, [left, right])
+
+        let result = layout.reflow(width: 77)
+        let again = InkLayout.analyze(s.moved(result.moves))
+        XCTAssertEqual(again.columns.count, 2)
+        XCTAssertEqual(again.words.map { $0.ids }, s.words)
+        XCTAssertEqual(Set(again.ids(ofColumn: 0)), left)
+        XCTAssertEqual(Set(again.ids(ofColumn: 1)), right)
+        XCTAssertEqual(again.columns[0].box.minX, 72, accuracy: 0.01)
+        XCTAssertEqual(again.columns[1].box.minX, 400, accuracy: 0.01)
+        XCTAssertLessThanOrEqual(again.columns[0].box.width, 77.5)
+        XCTAssertLessThanOrEqual(again.columns[1].box.width, 77.5)
+
+        // A shifted left edge moves both columns by the same amount.
+        let shifted = InkLayout.analyze(s.moved(layout.reflow(width: 77, left: 92).moves))
+        XCTAssertEqual(shifted.columns.map { $0.box.minX }, [92, 420])
+
+        // Left alignment leaves the (already aligned) right column where it is.
+        let aligned = layout.alignment(.right)
+        XCTAssertTrue(aligned.keys.allSatisfy { left.contains($0) || right.contains($0) })
+        XCTAssertNil(layout.alignment(.left)[s.words[leftWords][0]])
+        XCTAssertTrue(layout.alignment(.left).isEmpty)
+        let lastRight = s.words[s.words.count - 1][0]
+        XCTAssertPoint(aligned[lastRight], Point(554 - (400 + 18 + 14 + 28), 0))
+    }
+
+    /// A heading over two columns stays with the column it continues, and reading order is heading, left, right.
+    func testHeadingOverTwoColumnsReadsInOrder() {
+        var s = Synth()
+        s.line([4, 4, 4, 4, 4, 4, 4, 4, 4], y: 60)                                               // 72…488
+        let heading = s.words.count
+        for y in [100.0, 130, 160] { s.line([3, 3, 2, 4], y: y) }
+        for y in [100.0, 130, 160] { s.line([2, 4, 3, 3], x: 400, y: y) }
+        let layout = InkLayout.analyze(s.glyphs)
+        XCTAssertEqual(layout.columns.count, 2)
+        XCTAssertEqual(layout.words.map { $0.ids }, s.words)
+        XCTAssertEqual(layout.words(ofColumn: 0).count, heading + 12)
+    }
+
+    // MARK: Skew and trust boundaries
+
+    /// A paragraph slanted 6° reflows along its own lines, keeps its word order, and its left edge lands on the
+    /// requested page x (what handwriting.reflow's `left` and the mode's side handles rely on).
+    func testSkewedParagraphReflowsToTheRequestedLeft() {
+        var s = Synth()
+        let tilt = tan(6 * Double.pi / 180)
+        s.line([3, 3, 2, 4, 3], y: 100, tilt: tilt)
+        s.line([2, 4, 3, 3, 2], y: 130, tilt: tilt)
+        s.line([3, 2, 4], y: 160, tilt: tilt)
+        let layout = InkLayout.analyze(s.glyphs)
+        XCTAssertEqual(layout.skew * 180 / .pi, 6, accuracy: 0.75)
+        XCTAssertEqual(layout.lines.count, 3)
+
+        for requested in [layout.pageLeft, layout.pageLeft + 40, layout.pageLeft - 25] {
+            let left = layout.layoutLeft(fromPage: requested)
+            XCTAssertEqual(layout.pageLeft(fromLayout: left), requested, accuracy: 1e-9)
+            let result = layout.reflow(width: layout.box.width * 0.6, left: left)
+            let again = InkLayout.analyze(s.moved(result.moves))
+            XCTAssertEqual(again.words.map { $0.ids }, s.words, "reading order changed")
+            XCTAssertEqual(again.pageLeft, requested, accuracy: 0.5)
+            XCTAssertLessThan(abs(again.skew - layout.skew) * 180 / .pi, 0.6, "still read along its own slant")
+        }
+    }
+
+    /// Hostile or corrupt coordinates never crash the analysis: they are not handwriting.
+    func testAnalysisSurvivesHugeCoordinates() {
+        let s = Synth.paragraph()
+        let huge = InkGlyph(id: "HUGEX0000001", points: [Point(1e20, 100), Point(1e20 + 8, 110)])
+        let far = InkGlyph(id: "HUGEY0000001", points: [Point(100, -1e300), Point(108, 1e300)])
+        let layout = InkLayout.analyze(s.glyphs + [huge, far])
+        XCTAssertEqual(layout.lines.count, 3)
+        XCTAssertFalse(layout.ids.contains("HUGEX0000001"))
+        XCTAssertEqual(InkLayout.estimateSkew(s.glyphs + [huge, far], size: 10), 0)
+        XCTAssertEqual(InkLayout.analyze([huge]), .empty)
+
+        func stroke(_ x: Float) -> Item {
+            Item(id: "HUGESTROKE01", kind: .stroke,
+                 stroke: Stroke(style: .defaultPen, points: [StrokePoint(x: x, y: 100), StrokePoint(x: 80, y: 110)], t0: 1))
+        }
+        XCTAssertNil(InkGlyph(item: stroke(1e20)))
+        XCTAssertNil(InkGlyph(item: stroke(.infinity)))
+        XCTAssertNil(InkGlyph(item: stroke(.nan)))
+        XCTAssertNotNil(InkGlyph(item: stroke(72)))
+    }
+
+    // MARK: Word edits
+
+    func testClosingTheHoleOfARemovedWord() throws {
+        let s = Synth.paragraph()
+        let layout = InkLayout.analyze(s.glyphs)
+        // A word inside a line: the rest of the line moves left into its place.
+        let inside = try XCTUnwrap(layout.closingHole(line: 1, word: 0))
+        XCTAssertEqual(Set(inside.ids), Set(s.words[5] + s.words[6] + s.words[7]))
+        XCTAssertPoint(inside.by, Point(-32, 0))
+        // The last word of a line leaves nothing to close.
+        XCTAssertNil(layout.closingHole(line: 0, word: 3))
+
+        // A word alone on its line: the lines below move up one line.
+        var t = Synth()
+        t.line([3, 3], y: 100)
+        t.line([4], y: 130)
+        t.line([3, 3], y: 160)
+        let lone = InkLayout.analyze(t.glyphs)
+        let up = try XCTUnwrap(lone.closingHole(line: 1, word: 0))
+        XCTAssertEqual(Set(up.ids), Set(t.words[3] + t.words[4]))
+        XCTAssertPoint(up.by, Point(0, -30))
+        XCTAssertNil(lone.closingHole(line: 2, word: 1), "the last word of a line leaves nothing to close")
+
+        // Before a blank line, the lines below move up by no more than the lone line's own line: the blank stays.
+        var u = Synth()
+        u.line([3, 3], y: 100)
+        u.line([3, 3], y: 130)
+        u.line([4], y: 160)
+        u.line([3], y: 220)
+        let beforeBlank = InkLayout.analyze(u.glyphs)
+        XCTAssertEqual(beforeBlank.lines.map { $0.startsParagraph }, [true, false, false, true])
+        let kept = try XCTUnwrap(beforeBlank.closingHole(line: 2, word: 0))
+        XCTAssertEqual(Set(kept.ids), Set(u.words[5]))
+        XCTAssertPoint(kept.by, Point(0, -30))
+    }
+
+    func testRoomForPastedWords() {
+        let s = Synth.paragraph()
+        let layout = InkLayout.analyze(s.glyphs)
+        // After the first word of line 1 (72…100): pasted ink starts one gap later, the rest of the line moves right.
+        let room = layout.room(after: 0, word: 0, width: 40)
+        XCTAssertPoint(room.at, Point(100 + 14, layout.lines[0].centerY(at: 114)))
+        XCTAssertEqual(Set(room.ids), Set(s.words[1] + s.words[2] + s.words[3]))
+        XCTAssertPoint(room.by, Point(114 + 40 + 14 - 114, 0))
+        // At the end of a line nothing moves.
+        let end = layout.room(after: 0, word: 3, width: 40)
+        XCTAssertTrue(end.ids.isEmpty)
+        XCTAssertEqual(end.by, .zero)
     }
 }

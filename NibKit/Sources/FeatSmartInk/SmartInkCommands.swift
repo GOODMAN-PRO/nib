@@ -89,19 +89,25 @@ enum Handwriting {
         return await layout(target.glyphs, hints: hints)
     }
 
-    /// Writes per-stroke transforms in one transaction; returns how many strokes changed.
+    /// Writes per-stroke transforms for every target (page) in one transaction, so a multi-page call changes all its
+    /// pages or none. Each transform applies to the stroke as it is at write time. Returns how many strokes changed.
     @discardableResult
-    static func write(_ transforms: [ElementID: Affine], to target: Target, ctx: CommandContext) throws -> Int {
-        let changes = target.items.compactMap { item -> (ElementID, Affine)? in
-            guard let t = transforms[item.id], !isIdentity(t) else { return nil }
-            return (item.id, t)
+    static func write(_ plans: [(target: Target, transforms: [ElementID: Affine])], ctx: CommandContext) throws -> Int {
+        var changes: [(doc: DocumentID, page: PageID, id: ElementID, transform: Affine)] = []
+        for plan in plans {
+            for item in plan.target.items {
+                guard let t = plan.transforms[item.id], !isIdentity(t) else { continue }
+                changes.append((doc: plan.target.doc, page: plan.target.page, id: item.id, transform: t))
+            }
         }
         guard !changes.isEmpty else { return 0 }
         return try ctx.mutate { tx in
             var n = 0
-            for (id, t) in changes {
-                guard let current = try? tx.item(target.doc, page: target.page, id: id) else { continue }
-                try tx.put(current.transformed(by: t), doc: target.doc, page: target.page)
+            for change in changes {
+                guard let current = try? tx.item(change.doc, page: change.page, id: change.id), !current.deleted else {
+                    continue
+                }
+                try tx.put(current.transformed(by: change.transform), doc: change.doc, page: change.page)
                 n += 1
             }
             return n
@@ -128,6 +134,8 @@ enum Handwriting {
 enum SmartInkSchema {
     static let strokeRef: JSONValue = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"
     static let refs: JSONSchema = .arr(.ref, "stroke item refs (item:D/P/I); other items are ignored")
+    /// Page coordinates a command may place ink at (the ink coordinate limit).
+    static let coordinateLimit: Double = 100_000
 }
 
 // MARK: - handwriting.words
@@ -152,6 +160,9 @@ struct HandwritingWords: NibCommand {
         /// Degrees, clockwise on screen.
         var angle: Double
         var xHeight: Double
+        /// Column on its page (0 = first in reading order): side-by-side columns and margin notes are read one after
+        /// the other, never interleaved.
+        var column: Int
         var paragraphStart: Bool
         var listItem: Bool
         var text: String?
@@ -169,7 +180,7 @@ struct HandwritingWords: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "handwriting.words", title: "Handwriting Lines and Words",
-        summary: "Group handwriting strokes into lines and words: bboxes, baselines, angles, paragraph starts and recognised text when available.",
+        summary: "Group handwriting strokes into lines and words, column by column in reading order: bboxes, baselines, angles, paragraph starts and recognised text when available.",
         params: .obj(["refs": SmartInkSchema.refs,
                       "cursor": .str("from a truncated result: continue from this line")],
                      required: ["refs"]),
@@ -183,7 +194,7 @@ struct HandwritingWords: NibCommand {
         for target in targets {
             let layout = await Handwriting.layout(target, ctx: ctx)
             if spacing == 0 { spacing = layout.pitch }
-            for line in layout.lines {
+            for (i, line) in layout.lines.enumerated() {
                 let left = layout.toPage(Point(line.box.minX, line.centerY(at: line.box.minX) + line.baselineOffset))
                 let right = layout.toPage(Point(line.box.maxX, line.centerY(at: line.box.maxX) + line.baselineOffset))
                 let words = line.words.map { w in
@@ -193,7 +204,8 @@ struct HandwritingWords: NibCommand {
                 lines.append(Line(page: target.pageRef, bbox: Handwriting.rounded(layout.pageBounds(line.box)),
                                   baseline: [Handwriting.rounded(left), Handwriting.rounded(right)],
                                   angle: Handwriting.rounded((layout.skew + atan(line.slope)) * 180 / .pi),
-                                  xHeight: Handwriting.rounded(line.xHeight), paragraphStart: line.startsParagraph,
+                                  xHeight: Handwriting.rounded(line.xHeight), column: layout.column(ofLine: i) ?? 0,
+                                  paragraphStart: line.startsParagraph,
                                   listItem: line.isListItem,
                                   text: texts.count == line.words.count ? texts.joined(separator: " ") : nil,
                                   words: words))
@@ -226,6 +238,7 @@ struct HandwritingReflow: NibCommand {
         var refs: [String]
         var width: Double
         var left: Double?
+        var joinParagraphs: Bool?
     }
 
     struct Output: Codable {
@@ -237,26 +250,34 @@ struct HandwritingReflow: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "handwriting.reflow", title: "Reflow Handwriting",
-        summary: "Reflow handwriting into a column of a new width by moving whole words (strokes are only translated; paragraphs, lists and indents are kept).",
+        summary: "Reflow handwriting into columns of a new width by moving whole words (strokes are only translated; paragraphs, lists and indents are kept). Side-by-side columns reflow separately, each keeping its own left edge and top.",
         params: .obj(["refs": SmartInkSchema.refs,
-                      "width": .num("column width in page points", min: 1, max: 100_000),
-                      "left": .num("page x of the column's left edge (default: where it is now)")],
+                      "width": .num("column width in page points", min: 1, max: SmartInkSchema.coordinateLimit),
+                      "left": .num("page x of the left edge (default: where it is now); every column moves by the same amount",
+                                   min: -SmartInkSchema.coordinateLimit, max: SmartInkSchema.coordinateLimit),
+                      "joinParagraphs": .bool("true = flow each column as one paragraph, ignoring paragraph breaks")],
                      required: ["refs", "width"]),
         examples: [["refs": [SmartInkSchema.strokeRef], "width": 240]],
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        guard p.width.isFinite, p.width >= 1 else { throw NibError.invalid("width must be at least 1 point", path: "$.width") }
-        if let left = p.left, !left.isFinite { throw NibError.invalid("left must be a number", path: "$.left") }
-        var moved = 0
+        guard p.width.isFinite, p.width >= 1, p.width <= SmartInkSchema.coordinateLimit else {
+            throw NibError.invalid("width must be 1 to \(Int(SmartInkSchema.coordinateLimit)) points", path: "$.width")
+        }
+        if let left = p.left, !(left.isFinite && abs(left) <= SmartInkSchema.coordinateLimit) {
+            throw NibError.invalid("left must be a page x within ±\(Int(SmartInkSchema.coordinateLimit))", path: "$.left")
+        }
+        var plans: [(target: Handwriting.Target, transforms: [ElementID: Affine])] = []
         var lines = 0
         for target in try Handwriting.targets(p.refs, workspace: ctx.workspace) {
             let layout = await Handwriting.layout(target, ctx: ctx)
             let width = max(p.width, layout.widestWord)
-            let result = layout.reflow(width: width, left: p.left.map { layout.layoutLeft(fromPage: $0) })
-            moved += try Handwriting.write(Handwriting.translations(result.moves), to: target, ctx: ctx)
+            let result = layout.reflow(width: width, left: p.left.map { layout.layoutLeft(fromPage: $0) },
+                                       joinParagraphs: p.joinParagraphs ?? false)
+            plans.append((target: target, transforms: Handwriting.translations(result.moves)))
             lines += result.lineCount
         }
+        let moved = try Handwriting.write(plans, ctx: ctx)
         return Output(moved: moved, lines: lines)
     }
 }
@@ -268,6 +289,8 @@ struct HandwritingStraighten: NibCommand {
         var refs: [String]
         /// Degrees; flatter lines stay as written (default 0.5).
         var minAngle: Double?
+        /// "centre" (default) or "left".
+        var pivot: String?
     }
 
     struct Output: Codable {
@@ -278,9 +301,11 @@ struct HandwritingStraighten: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "handwriting.straighten", title: "Straighten Lines",
-        summary: "Straighten slanted handwritten lines: each line is sheared (or rotated past 15°) to horizontal about its centre.",
+        summary: "Straighten slanted handwritten lines: each line is sheared (or rotated past 15°) to horizontal about its centre, or about its left end (pivot left: a continued line meets what is already level).",
         params: .obj(["refs": SmartInkSchema.refs,
-                      "minAngle": .num("degrees: lines flatter than this stay as written (default 0.5)", min: 0, max: 45)],
+                      "minAngle": .num("degrees: lines flatter than this stay as written (default 0.5)", min: 0, max: 45),
+                      "pivot": .str("where each line is levelled from: centre (default, or center) or left",
+                                    choices: ["centre", "center", "left"])],
                      required: ["refs"]),
         examples: [["refs": [SmartInkSchema.strokeRef]]],
         effect: .edit)
@@ -288,15 +313,24 @@ struct HandwritingStraighten: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let minimum = p.minAngle ?? 0.5
         guard minimum.isFinite, minimum >= 0 else { throw NibError.invalid("minAngle must be 0 or more degrees", path: "$.minAngle") }
+        let pivot: InkPivot
+        switch (p.pivot ?? "centre").lowercased() {
+        case "centre", "center": pivot = .centre
+        case "left": pivot = .left
+        default: throw NibError.invalid("pivot must be centre or left", path: "$.pivot")
+        }
+        var plans: [(target: Handwriting.Target, transforms: [ElementID: Affine])] = []
         var straightened = 0
         var lines = 0
         for target in try Handwriting.targets(p.refs, workspace: ctx.workspace) {
-            let layout = await Handwriting.layout(target, ctx: ctx)
-            let transforms = layout.straightening(minimumAngle: minimum * .pi / 180)
+            // Line geometry only: recognised words would not change it, so no recognition runs.
+            let layout = await Handwriting.layout(target.glyphs, hints: [])
+            let transforms = layout.straightening(minimumAngle: minimum * .pi / 180, pivot: pivot)
             straightened += layout.lines.filter { line in line.ids.contains { transforms[$0] != nil } }.count
             lines += layout.lines.count
-            try Handwriting.write(transforms, to: target, ctx: ctx)
+            plans.append((target: target, transforms: transforms))
         }
+        try Handwriting.write(plans, ctx: ctx)
         return Output(straightened: straightened, lines: lines)
     }
 }
@@ -315,7 +349,7 @@ struct HandwritingAlign: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "handwriting.align", title: "Align Handwriting",
-        summary: "Align handwritten lines to the left edge, centre or right edge of their block.",
+        summary: "Align handwritten lines to the left edge, centre or right edge of their column (side-by-side columns align separately).",
         params: .obj(["refs": SmartInkSchema.refs,
                       "align": .str("left, centre (or center) or right", choices: ["left", "centre", "center", "right"])],
                      required: ["refs", "align"]),
@@ -330,12 +364,13 @@ struct HandwritingAlign: NibCommand {
         case "right": alignment = .right
         default: throw NibError.invalid("align must be left, centre or right", path: "$.align")
         }
-        var moved = 0
+        var plans: [(target: Handwriting.Target, transforms: [ElementID: Affine])] = []
         for target in try Handwriting.targets(p.refs, workspace: ctx.workspace) {
-            let layout = await Handwriting.layout(target, ctx: ctx)
-            moved += try Handwriting.write(Handwriting.translations(layout.alignment(alignment)), to: target, ctx: ctx)
+            // Line geometry only: no recognition.
+            let layout = await Handwriting.layout(target.glyphs, hints: [])
+            plans.append((target: target, transforms: Handwriting.translations(layout.alignment(alignment))))
         }
-        return Output(moved: moved)
+        return Output(moved: try Handwriting.write(plans, ctx: ctx))
     }
 }
 
@@ -350,13 +385,18 @@ struct HandwritingInsertSpace: NibCommand {
 
     struct Output: Codable {
         var moved: Int
+        /// The space opened (negative: closed). Closing never pulls items up past what stays above y.
+        var height: Double
+        /// Moved items now below the bottom of the page (tell the user: they are off the page).
+        var offPage: Int
     }
 
     static let descriptor = CommandDescriptor(
         id: "handwriting.insertSpace", title: "Insert Space",
-        summary: "Insert vertical space at page y, pushing the ink and items below down by height (a negative height closes space).",
+        summary: "Insert vertical space at page y, pushing the ink and items below down by height. A negative height closes space, at most up to the lowest item above y. Reports items pushed past the page bottom.",
         params: .obj(["page": .ref,
-                      "y": .num("page y where the space opens"),
+                      "y": .num("page y where the space opens", min: -SmartInkSchema.coordinateLimit,
+                                max: SmartInkSchema.coordinateLimit),
                       "height": .num("points of space; negative closes space", min: -10_000, max: 10_000)],
                      required: ["page", "y", "height"]),
         examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001", "y": 300, "height": 40]],
@@ -366,14 +406,21 @@ struct HandwritingInsertSpace: NibCommand {
         guard case let .page(doc, page)? = NodeRef(p.page) else {
             throw NibError(.invalidParams, "'\(p.page)' is not a page ref", path: "$.page", hint: "pass page:D/P")
         }
-        guard p.y.isFinite, p.height.isFinite else { throw NibError.invalid("y and height must be numbers", path: "$.height") }
-        guard try ctx.workspace.content(doc).page(page) != nil else { throw NibError.notFound("page \(page)") }
-        let items = try ctx.workspace.items(doc, page: page)
-        let moved = SpaceInsertion.moved(items, y: p.y, height: p.height)
-        guard !moved.isEmpty else { return Output(moved: 0) }
-        try ctx.mutate { tx in
-            for item in moved { try tx.put(item, doc: doc, page: page) }
+        guard p.y.isFinite, abs(p.y) <= SmartInkSchema.coordinateLimit else {
+            throw NibError.invalid("y must be a page y within ±\(Int(SmartInkSchema.coordinateLimit))", path: "$.y")
         }
-        return Output(moved: moved.count)
+        guard p.height.isFinite, abs(p.height) <= 10_000 else {
+            throw NibError.invalid("height must be within ±10000 points", path: "$.height")
+        }
+        guard let record = try ctx.workspace.content(doc).page(page), !record.deleted else {
+            throw NibError.notFound("page \(page)")
+        }
+        let items = try ctx.workspace.items(doc, page: page)
+        let result = SpaceInsertion.insert(items, y: p.y, height: p.height, pageHeight: record.size?.height)
+        guard !result.items.isEmpty else { return Output(moved: 0, height: 0, offPage: 0) }
+        try ctx.mutate { tx in
+            for item in result.items { try tx.put(item, doc: doc, page: page) }
+        }
+        return Output(moved: result.items.count, height: Handwriting.rounded(result.height), offPage: result.offPage)
     }
 }
