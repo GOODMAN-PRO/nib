@@ -143,7 +143,8 @@ public enum ToolCatalog {
     public static let metaTools: [ToolSpec] = [
         spec("nib_context", "Where the user is: document, page, visible rect, tool, selection refs/bbox, tabs.", .empty),
         spec("nib_get", "Any node (library, folder, doc, page, item, block, card) as JSON; stroke points only with points=true.",
-             .obj(["ref": .ref, "depth": .int(min: 0, max: 4), "points": .bool(), "fields": .arr(.str())], required: ["ref"])),
+             .obj(["ref": .ref, "depth": .int(min: 0, max: 4), "points": .bool(), "fields": .arr(.str()),
+                   "cursor": .str("from the previous result when it was truncated")], required: ["ref"])),
         spec("nib_find", "Find items by kind, layer, area (bbox), field equality (where) or text inside a page or document.",
              .obj(["in": .ref, "kinds": .arr(.str()), "layer": .int(min: 0, max: 4), "bbox": .rect, "where": .anything(),
                    "text": .str(), "limit": .int(min: 1, max: 500), "cursor": .str()], required: ["in"])),
