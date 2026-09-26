@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/FeatPageText/PageTextCommands.swift:270 (item.locked = true); PageTextEditor.swift:651-669 (commits via text.setText); NibKit/Tests/FeatPageTextTests/FeatPageTextTests.swift:25-43 (FakeSetText)",
+      "problem": "ensureBox creates the full-page box with item.locked = true. The editor saves typed text only through F026's text.setText. F026's real implementation (feat/F026, TextCommands.swift, TextItems.editable) throws invalid_params \"item … is locked\" for locked items, whatever the principal. Once F026 merges, every debounced commit and the final commit on Done fail. commitNow and finish clear `dirty` before sending, so when the text view is removed everything typed in the session is lost, with only a toast. The test stand-in FakeSetText skips the lock check, so CI passes while the real integration fails. text.format and text.setParagraph refuse the box in the same way, for the AI and plugins as well as the user.",
+      "fix": "Keep the lock. F012 transform, the F010 eraser and F026's text tool and text.tapAt rely on it to leave the page box alone. Commit through CommandIDs.itemUpdate instead of text.setText: `Invocation(command: CommandIDs.itemUpdate, params: [\"ref\": .string(ref), \"patch\": [\"text\": [\"text\": json]]], session: session, group: group)`. F003's item.update checks only the document lock, not item.locked. Replace FakeSetText with a fake that rejects `item.locked` the way F026's TextItems.editable does (or a FakeItemUpdate that applies patch.text.text), and assert the committed text in testEditorOpensOverTheBoxAndCommitsOneUndoStep. The other option is to drop `locked`, but then F026's TextHitTest and tapAt must skip `style.fullPage` boxes, which F028 does not own."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPageText/PageTextEditor.swift:651-669 (commitNow/send), 253-288 (finish)",
+      "problem": "A failed commit loses text. `dirty = false` is set before `send`, and `send` only reports the error. Nothing retries, and finish sends once and then removes the view. A hook veto, a notFound after a sync or a validation error therefore drops the only copy of the typed text.",
+      "fix": "Make `send` return Bool. In commitNow, set `dirty = true` again and call scheduleCommit() when it fails. In finish, if the final send fails, call beginEditing on the same box and install the unsaved RichText instead of discarding it, so the user can retry or copy the text."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPageText/PageTextEditor.swift:436-444, 598-607, 384-392, 873-882",
+      "problem": "Every keystroke re-lays out and re-converts the whole text. updateOverflow runs boundingRect over the full string (a fresh TextKit layout). normalizeIfNeeded rebuilds the whole NSAttributedString. currentRichText() runs 3 to 5 times per change (textChanged, updateBar, fixTypingAttributes). A full page of caption text, or text on a large custom page, makes typing lag on A12-class iPads.",
+      "fix": "In updateOverflow, read `tv.layoutManager.usedRect(for: tv.textContainer).height` (the text view is TextKit 1 and has already laid out; add one line height when the text ends in \\n) instead of calling PageTextLayout.usedHeight. Compute currentRichText() once in textChanged and pass it to normalizeIfNeeded and updateBar."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPageText/PageTextEditor.swift:80-86 (contentScale cap), 345-346",
+      "problem": "The backing-scale cap allows 16 M pixels for the page-sized text view. That is about 64 MB of layer memory at zoom of roughly 2.5x or more on an A4 page. It is re-rasterised whenever the scale changes by more than 0.01, which happens on most frames of a pinch.",
+      "fix": "Lower the cap to about 4 M pixels (16 MB), for example `(4_000_000 / area).squareRoot()`. Only re-apply the content scale once it changes by 25 % or more, or when the zoom gesture ends (canvasDidChange after zooming stops), not on every frame."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPageText/PageTextCommands.swift:208-214; PageTextEditor.swift:215-250",
+      "problem": "The long-press items hide in read-only mode, but ⌥⌘T (and any user invocation) still creates the box and opens a live editor in a read-only session. F026's TextBoxEditor guards `!host.session.readOnly`; this editor does not.",
+      "fix": "In StartPageText.run, throw NibError(.permissionDenied, \"this window is in read-only mode\", hint: \"view.setReadOnly {on: false}\") when `ctx.activeSession?.readOnly == true` and the session shows `doc`. Add `!host.session.readOnly` to the guard in beginEditing."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPageText/FeatPageTextFeature.swift:42-45",
+      "problem": "The code comment says \"Edit Text once it has some\", but hasPageText only checks that a box exists. After Start Typing and then Done with nothing typed, the page shows \"Edit Text\" although it has no text.",
+      "fix": "`items.contains { PageTextModel.isFullPageBox($0) && !($0.text?.text.plainText.isEmpty ?? true) }`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPageText/PageTextEditor.swift:884-908 (accessibilityActions), 813-816",
+      "problem": "Checklist items can be toggled only by tapping the checkbox glyph, so VoiceOver users cannot check or uncheck a to-do. Numbered list and checklist have no custom action either (only bullets do).",
+      "fix": "Add custom actions: \"Toggle Checkbox\" (changeParagraphs { PageTextModel.togglingChecked(caretSpot().paragraph, in: $0) }), \"Numbered List\" and \"Checklist\" (setList(.number/.todo, toggles: true))."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPageText/PageTextEditor.swift:89-98, 1169-1181, 1249-1258",
+      "problem": "The bar hand-rolls parts that NibDesign should provide (DESIGN.md §15.6). A 22 pt swatch with 1 pt and 0.5 pt stroke literals copies Palette's swatch in UIKit. The separator is a 0.5 pt literal. Fixed glyphs (bold, italic, underline, strikethrough, increase.indent, decrease.indent) come from raw SF Symbol strings through NibSymbol(systemName:), which is meant for descriptor `icon` strings.",
+      "fix": "List the missing NibSymbol cases (bold, italic, underline, strikethrough, indent, outdent), a UIKit swatch image and a hairline divider token as a contract request in the feature summary (ARCHITECTURE §15.11). Until they land, put the literals in one private enum with a comment naming the DESIGN value each one copies (§5 palette divider, §13 swatch ring)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPageText/PageTextCommands.swift:195",
+      "problem": "The `page` param is declared as `.str(…)`, not as a ref. The AI catalogue and schema validation therefore do not treat it as a node ref, unlike page.add and other page commands.",
+      "fix": "Use `\"page\": .ref` and keep the defaulting behaviour in the summary text."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatPageTextTests/FeatPageTextTests.swift",
+      "problem": "Several risky paths have no tests: the editor reloading on an outside change, and on edit.undo while editing (which also starts a new undo group); rejecting an insert that does not fit, setting pageFull and showing the prompt row; addPageAndContinue (page.add plus box in one undo step); re-fitting and moving an existing box that is out of place back to the bottom; and several debounced commits merging into one undo entry. The one-undo-step test only exercises the single commit that finish sends.",
+      "fix": "Add Harness tests for each path. Use FakeCanvasHost and FakeSetText/FakeItemUpdate, plus a fake page.add that puts a PageRecord with the given id. Drive the editor through perform(key:), textView(_:shouldChangeTextIn:replacementText:) with a long string, and h.app.bus.undo(Fixtures.docID). For an existing box, seed it with a moved frame and a top z, then assert the frame, items.first and one added undo entry."
+    }
+  ]
+}
