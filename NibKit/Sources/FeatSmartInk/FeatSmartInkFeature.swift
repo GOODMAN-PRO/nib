@@ -64,7 +64,7 @@ public enum FeatSmartInkFeature: NibFeature {
             id: "smartink.editHandwriting", title: String(localized: "Edit Handwriting"),
             icon: NibSymbol.editHandwriting.name,
             location: .objectMenu, order: 600, owner: id, command: CommandIDs.toolSelect,
-            params: { _ in ["tool": .string(tool)] }, isVisible: editable, submenu: smartInk))
+            params: { _ in ["tool": .string(tool), "temporary": true] }, isVisible: editable, submenu: smartInk))
         app.ui.menus.register(MenuItemDescriptor(
             id: "smartink.straighten", title: String(localized: "Straighten Lines"), icon: NibSymbol.straighten.name,
             location: .objectMenu, order: 610, owner: id, command: HandwritingStraighten.descriptor.id,
@@ -118,8 +118,6 @@ final class AutoStraightener {
 
     private weak var app: NibApp?
     private var subscription: EventSubscription?
-    /// True while the Pencil is down: the canvas raises `NibHaptics.isInking` (DESIGN.md §10.8).
-    var isInking: () -> Bool = { NibHaptics.isInking }
     /// Oldest first; a new page (or window) starts a new burst, and all of them wait for the same pause.
     private(set) var bursts: [Burst] = []
     private var timer: Task<Void, Never>?
@@ -160,9 +158,12 @@ final class AutoStraightener {
         }
     }
 
-    /// Straightens every waiting burst, unless the Pencil is down: then it waits for the next pause.
+    /// Straightens every waiting burst, unless the Pencil is down in the window that wrote one (or the active window):
+    /// then it waits for the next pause.
     func flush() {
-        guard !isInking() else {
+        let writing = bursts.contains { $0.session?.inking.isInking == true }
+            || (app?.services.sessions.active?.inking.isInking ?? false)
+        guard !writing else {
             schedule()
             return
         }

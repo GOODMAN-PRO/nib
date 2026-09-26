@@ -10,9 +10,11 @@ final class FeatSmartInkTests: XCTestCase {
     private let doc = Fixtures.docID
     private let page = Fixtures.page2
 
-    /// Puts synthetic handwriting on the empty fixture page (before anything loads it); returns its item refs.
-    private func install(_ s: Synth, in h: Harness) -> [String] {
-        h.persistence.pageItems[doc, default: [:]][page] = items(s)
+    /// Puts synthetic handwriting on the empty fixture page (contracts-v2 `Harness.insert`), then clears the undo
+    /// history so each test counts only its own steps; returns the item refs.
+    private func install(_ s: Synth, in h: Harness) async throws -> [String] {
+        try await h.insert(items(s), page: page, doc: doc)
+        h.app.bus.history.clear(doc)
         return s.ids.map { ref($0) }
     }
 
@@ -61,8 +63,8 @@ final class FeatSmartInkTests: XCTestCase {
     }
 
     /// The mode on the synthetic paragraph, laid out and ready.
-    private func editMode(_ h: Harness, _ s: Synth) async -> (EditHandwritingModel, EditHandwritingTool, FakeCanvasHost) {
-        _ = install(s, in: h)
+    private func editMode(_ h: Harness, _ s: Synth) async throws -> (EditHandwritingModel, EditHandwritingTool, FakeCanvasHost) {
+        _ = try await install(s, in: h)
         h.session.page = page
         h.session.selection = Selection(doc: doc, page: page, items: s.ids)
         let host = FakeCanvasHost(h)
@@ -119,7 +121,7 @@ final class FeatSmartInkTests: XCTestCase {
         let object = h.app.ui.menuItems(.objectMenu, ctx)
         let edit = object.first { $0.id == "smartink.editHandwriting" }
         XCTAssertEqual(edit?.command, CommandIDs.toolSelect)
-        let tool: JSONValue = ["tool": "smartink.edit"]
+        let tool: JSONValue = ["tool": "smartink.edit", "temporary": true]
         XCTAssertEqual(edit?.params(ctx), tool)
         let straighten = object.first { $0.id == "smartink.straighten" }
         let refs: JSONValue = ["refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"]]
@@ -142,7 +144,7 @@ final class FeatSmartInkTests: XCTestCase {
     func testReflowToHalfWidthIsOneUndoableTranslation() async throws {
         let h = Harness(features: [FeatSmartInkFeature.self])
         let s = Synth.paragraph()
-        let refs = install(s, in: h)
+        let refs = try await install(s, in: h)
         let before = try h.snapshot()
         let original = try strokePoints(h)
         let lines3 = try await lines(h, refs)
@@ -182,7 +184,7 @@ final class FeatSmartInkTests: XCTestCase {
         let h = Harness(features: [FeatSmartInkFeature.self])
         var s = Synth()
         s.line([3, 4, 3, 2, 4, 3], y: 200, tilt: tan(6 * .pi / 180))
-        let refs = install(s, in: h)
+        let refs = try await install(s, in: h)
         let before = try h.snapshot()
         let slanted = try await lines(h, refs).first?["angle"]?.doubleValue ?? 0
         XCTAssertEqual(slanted, 6, accuracy: 0.75)
@@ -206,7 +208,7 @@ final class FeatSmartInkTests: XCTestCase {
         var s = Synth()
         s.line([3, 3], y: 100)
         s.line([3, 3, 3], y: 130)
-        let refs = install(s, in: h)
+        let refs = try await install(s, in: h)
         let before = try h.snapshot()
         let out = try await h.run("handwriting.align", ["refs": json(refs), "align": "right"])
         XCTAssertEqual(out["moved"]?.intValue, 6)
@@ -253,7 +255,7 @@ final class FeatSmartInkTests: XCTestCase {
         var s = Synth()
         s.line([1], y: 100)
         s.line([1], x: 88, y: 100)   // 8 pt apart: two words by geometry alone
-        let refs = install(s, in: h)
+        let refs = try await install(s, in: h)
         let apart = try await lines(h, refs).first?["words"]?.arrayValue?.count
         XCTAssertEqual(apart, 2)
 
@@ -266,7 +268,7 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertEqual(out["text"]?.stringValue, "it")
     }
 
-    func testInvalidParamsAreReported() async {
+    func testInvalidParamsAreReported() async throws {
         let h = Harness(features: [FeatSmartInkFeature.self])
         let stroke = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"
         var code = await errorCode { _ = try await h.run("handwriting.align", ["refs": [.string(stroke)], "align": "middle"]) }
@@ -292,7 +294,7 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertEqual(code, .invalidParams)
         // Inserted strokes must share a page with refs, and `after` must be one of refs.
         let s = Synth.paragraph()
-        let refs = install(s, in: h)
+        let refs = try await install(s, in: h)
         code = await errorCode { _ = try await h.run("handwriting.reflow", ["refs": json(refs), "width": 100, "insert": [.string(stroke)]]) }
         XCTAssertEqual(code, .invalidParams)
         code = await errorCode {
@@ -312,7 +314,7 @@ final class FeatSmartInkTests: XCTestCase {
         s.line([3, 3, 2, 4, 3], y: 100, tilt: tilt)
         s.line([2, 4, 3, 3, 2], y: 130, tilt: tilt)
         s.line([3, 2, 4], y: 160, tilt: tilt)
-        let refs = install(s, in: h)
+        let refs = try await install(s, in: h)
         let before = try layout(h)
         XCTAssertEqual(before.skew * 180 / .pi, 6, accuracy: 0.75)
         let requested = before.pageLeft + 30
@@ -332,7 +334,7 @@ final class FeatSmartInkTests: XCTestCase {
         for y in [100.0, 130, 160] { s.line([3, 3, 2, 4], y: y) }
         let leftCount = s.words.count
         for y in [100.0, 130, 160] { s.line([2, 4, 3, 3], x: 400, y: y) }
-        let refs = install(s, in: h)
+        let refs = try await install(s, in: h)
         // Each column: 12 words of 28/28/18/38 (left) or 18/38/28/28 (right) pt, two to a 77 pt line.
         let out = try await h.run("handwriting.reflow", ["refs": json(refs), "width": 77])
         XCTAssertEqual(out["lines"]?.intValue, 12)
@@ -350,7 +352,7 @@ final class FeatSmartInkTests: XCTestCase {
     func testEditModeDoubleTapSelectsAWord() async throws {
         let h = Harness(features: [FeatSmartInkFeature.self])
         let s = Synth.paragraph()
-        let (model, tool, host) = await editMode(h, s)
+        let (model, tool, host) = try await editMode(h, s)
         XCTAssertTrue(model.isActive)
         XCTAssertEqual(model.target?.ids.count, s.ids.count)
         XCTAssertEqual(model.layout.lines.count, 3)
@@ -382,7 +384,7 @@ final class FeatSmartInkTests: XCTestCase {
         let h = Harness(features: [FeatSmartInkFeature.self])
         installItemDelete(h)
         let s = Synth.paragraph()
-        let (model, tool, host) = await editMode(h, s)
+        let (model, tool, host) = try await editMode(h, s)
         let before = try h.snapshot()
         let word = model.layout.lines[1].words[0]
         model.tap(at: word.box.center, page: page, time: 100)
@@ -405,8 +407,8 @@ final class FeatSmartInkTests: XCTestCase {
     }
 
     /// Paste After Word on a mid-line word: the clipboard's handwriting (two lines) flows in as one run right after
-    /// the word and the column reflows: reading order word, pasted, next word, and no word boxes overlap. Two undo
-    /// steps (Paste, Reflow) that together restore the page.
+    /// the word and the column reflows: reading order word, pasted, next word, and no word boxes overlap. One undo
+    /// step restores the page (the pasted strokes are created and then moved in that step).
     func testEditModePastesAfterAMidLineWord() async throws {
         let h = Harness(features: [FeatSmartInkFeature.self])
         // The clipboard: "ab" over "cde", as a stand-in for F014's clipboard.paste (centred at `at`).
@@ -427,7 +429,7 @@ final class FeatSmartInkTests: XCTestCase {
             return ["refs": .array(clipItems.map { .string(NodeRef.item(d, p, $0.id).description) })]
         }
         let s = Synth.paragraph()
-        let (model, tool, host) = await editMode(h, s)
+        let (model, tool, host) = try await editMode(h, s)
         let before = try h.snapshot()
         let anchor = model.layout.lines[0].words[1]
         model.tap(at: anchor.box.center, page: page, time: 100)
@@ -446,8 +448,7 @@ final class FeatSmartInkTests: XCTestCase {
         for line in after.lines { XCTAssertEqual(line.box.minX, 72, accuracy: 0.01) }
         XCTAssertLessThanOrEqual(after.box.width, 154.5)
         XCTAssertEqual(Set(model.target?.ids ?? []), Set(s.ids + pasted), "the pasted words are edited too")
-        XCTAssertEqual(h.undoDepth(doc), 2, "Paste, then Reflow")
-        h.app.bus.undo(doc)
+        XCTAssertEqual(h.undoDepth(doc), 1, "paste and reflow are one undo step")
         h.app.bus.undo(doc)
         XCTAssertEqual(try h.snapshot(), before)
         tool.deactivate(host)
@@ -509,13 +510,12 @@ final class FeatSmartInkTests: XCTestCase {
         try await h.run(CommandIDs.inkAddStrokes)
         XCTAssertEqual(straightener.bursts.map { $0.page }, [page, Fixtures.page1], "a new page keeps the first burst")
 
-        var inking = true
-        straightener.isInking = { inking }
+        h.session.inking.begin()
         straightener.flush()
         XCTAssertEqual(straightener.bursts.count, 2, "nothing moves while the Pencil is down")
         XCTAssertEqual(h.undoDepth(doc), 2)
 
-        inking = false
+        h.session.inking.end()
         let leftEnd = try XCTUnwrap(h.app.workspace.item(doc, page: page, id: s.ids[0]).stroke?.polyline.first)
         straightener.flush()
         XCTAssertTrue(straightener.bursts.isEmpty)

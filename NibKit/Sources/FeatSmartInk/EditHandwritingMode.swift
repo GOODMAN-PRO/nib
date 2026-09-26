@@ -197,14 +197,16 @@ final class EditHandwritingModel: ObservableObject {
         picking = false
     }
 
-    /// Done: hand the edited strokes back to the lasso as its selection and return to the previous tool.
+    /// Done: hand the edited strokes back to the lasso as its selection and return to the tool the mode was entered
+    /// from (the temporary return tool when the object menu entered it, else the previous tool).
     func finish(restoreSelection: Bool = true) {
         guard isActive, let app, let session else { return }
         selectionSink = nil
         if restoreSelection, let t = target, !layout.isEmpty {
             session.selection = Selection(doc: t.doc, page: t.page, items: t.ids, bounds: layout.pageBounds(layout.box))
         }
-        let back = previousTool.flatMap { $0 == FeatSmartInkFeature.toolID ? nil : $0 } ?? "lasso"
+        let back = (session.temporaryReturnTool ?? previousTool).flatMap { $0 == FeatSmartInkFeature.toolID ? nil : $0 }
+            ?? "lasso"
         app.perform(CommandIDs.toolSelect, ["tool": .string(back)], session: session)
     }
 
@@ -496,11 +498,11 @@ final class EditHandwritingModel: ObservableObject {
 
     func recolour(_ ink: NibInk) {
         guard !selectedWord.isEmpty else { return }
-        perform("item.recolor", ["refs": refs(selectedWord), "color": .string(String(format: "#%06X", ink.hex))])
+        perform(CommandIDs.itemRecolor, ["refs": refs(selectedWord), "color": .string(String(format: "#%06X", ink.hex))])
     }
 
     func deleteWord() async { await removeWord(using: CommandIDs.itemDelete) }
-    func cutWord() async { await removeWord(using: "clipboard.cut") }
+    func cutWord() async { await removeWord(using: CommandIDs.clipboardCut) }
 
     /// Removes the selected word and flows its column on at the same width and left edge, as one undo step: the
     /// column first reflows as if the word were gone (its paragraphs read with it, so the hole never looks like an
@@ -524,11 +526,9 @@ final class EditHandwritingModel: ObservableObject {
         }
     }
 
-    /// Pastes after the selected word (or at the end of the active column) and flows the column around it: the
-    /// pasted handwriting becomes one run of words right after the word (reading order word, pasted words, next word,
-    /// nothing overlapping) and the column reflows at its width and left edge. Two undo steps, Paste then Reflow: the
-    /// history reverts only an item's last change within one step, so pasted strokes must not be created and moved in
-    /// the same step.
+    /// Pastes after the selected word (or at the end of the active column) and flows the column around it, as one undo
+    /// step: the pasted handwriting becomes one run of words right after the word (reading order word, pasted words,
+    /// next word, nothing overlapping) and the column reflows at its width and left edge.
     func paste() async {
         guard canEdit, let app, let t = target,
               let anchor = selectedWordLocation ?? layout.lastWord(ofColumn: activeColumn),
@@ -539,9 +539,10 @@ final class EditHandwritingModel: ObservableObject {
         let left = layout.pageLeft(ofColumn: c)
         let at = layout.insertionPoint(after: anchor.line, word: anchor.word)
         let pageRef = NodeRef.page(t.doc, t.page).description
+        let group = NibID.make().raw
         guard let result = await run(CommandIDs.clipboardPaste,
                                      ["page": .string(pageRef), "at": [.number(at.x), .number(at.y)]],
-                                     group: NibID.make().raw) else { return }
+                                     group: group) else { return }
         // Paste selects what it pasted; the mode shows its own selection instead.
         session?.selection = Selection()
         let pastedRefs: [ElementID] = (result["refs"]?.arrayValue ?? []).compactMap { value in
@@ -560,7 +561,7 @@ final class EditHandwritingModel: ObservableObject {
         await run("handwriting.reflow", ["refs": refs(columnIDs), "width": .number(width), "left": .number(left),
                                          "insert": refs(pasted),
                                          "after": .string(NodeRef.item(t.doc, t.page, after).description)],
-                  group: NibID.make().raw)
+                  group: group)
         scheduleReload()
     }
 
@@ -624,7 +625,14 @@ final class EditHandwritingModel: ObservableObject {
         Task {
             guard let out = await run("handwriting.insertSpace", params, group: NibID.make().raw) else { return }
             let off = out["offPage"]?.intValue ?? 0
-            if off > 0 { show(notice: String(localized: "Moved past the bottom of the page: \(off)")) }
+            guard off > 0 else { return }
+            let text = String(localized: "Moved past the bottom of the page: \(off)")
+            // The window's toast (it also announces); without one, the options bar shows it.
+            if let host = session?.floatingHost {
+                host.postToast(text)
+            } else {
+                show(notice: text)
+            }
         }
     }
 
