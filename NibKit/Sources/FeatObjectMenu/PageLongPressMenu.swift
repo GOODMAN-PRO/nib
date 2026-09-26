@@ -176,7 +176,7 @@ final class InputProbe: UIGestureRecognizer {
 /// "objectmenu.menus": the object menu, the page menu and the right-click menus of one canvas.
 @MainActor
 final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInteractionDelegate,
-    UIEditMenuInteractionDelegate, UIColorPickerViewControllerDelegate {
+    @preconcurrency UIEditMenuInteractionDelegate, UIColorPickerViewControllerDelegate {
     private(set) weak var host: CanvasHost?
     let model: ObjectMenuModel
     private var contextMenu: UIContextMenuInteraction?
