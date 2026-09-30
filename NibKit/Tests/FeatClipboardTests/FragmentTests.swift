@@ -29,7 +29,7 @@ final class FragmentTests: XCTestCase {
 
     func testJSONRoundTripPreservesGeometryStylesAndAssets() throws {
         let items = fixtureItems()
-        let fragment = Fragment.make(items: items) { $0 == Fixtures.pngAsset ? Fixtures.pngData : nil }
+        let fragment = NibFragment.make(items: items) { $0 == Fixtures.pngAsset ? Fixtures.pngData : nil }
         XCTAssertEqual(fragment.assets, [Fixtures.pngAsset.name: Fixtures.pngData])
 
         let data = try XCTUnwrap(fragment.encoded())
@@ -38,7 +38,7 @@ final class FragmentTests: XCTestCase {
         XCTAssertEqual(json["assets"]?[Fixtures.pngAsset.name], JSONValue.string(Fixtures.pngData.base64EncodedString()))
         XCTAssertEqual(json["items"]?.arrayValue?.count, items.count)
 
-        let back = try Fragment.decode(data)
+        let back = try NibFragment.decode(data)
         XCTAssertEqual(back.assets, fragment.assets)
         XCTAssertEqual(back.items.count, items.count)
         for (a, b) in zip(items, back.items) {
@@ -61,15 +61,15 @@ final class FragmentTests: XCTestCase {
 
     func testDecodingIsLenientAndRefusesOtherVersions() throws {
         let minimal = #"{"items":[{"kind":"text","text":{"frame":{"x":10,"y":20,"w":30,"h":40}}}]}"#
-        let fragment = try Fragment.decode(Data(minimal.utf8))
+        let fragment = try NibFragment.decode(Data(minimal.utf8))
         XCTAssertEqual(fragment.items.first?.kind, .text)
         XCTAssertEqual(fragment.bounds, Rect(x: 10, y: 20, width: 30, height: 40))
         XCTAssertTrue(fragment.assets.isEmpty)
 
-        XCTAssertThrowsError(try Fragment.decode(Data(#"{"format":"nib-fragment/2","items":[]}"#.utf8))) { error in
+        XCTAssertThrowsError(try NibFragment.decode(Data(#"{"format":"nib-fragment/2","items":[]}"#.utf8))) { error in
             XCTAssertEqual((error as? NibError)?.code, .invalidParams)
         }
-        XCTAssertThrowsError(try Fragment.decode(Data(#"{"items":[],"assets":{"a.png":"abc"}}"#.utf8)))
+        XCTAssertThrowsError(try NibFragment.decode(Data(#"{"items":[],"assets":{"a.png":"abc"}}"#.utf8)))
     }
 
     // MARK: Landing on a page
@@ -80,7 +80,7 @@ final class FragmentTests: XCTestCase {
         inner.attachedTo = Fixtures.shapeID
         inner.z = "l"                                   // between the shape ("k") and the sticky ("w")
         let source = [fixture(Fixtures.shapeID), fixture(Fixtures.stickyID), fixture(Fixtures.connectorID), inner]
-        let fragment = Fragment.make(items: source) { _ in nil }
+        let fragment = NibFragment.make(items: source) { _ in nil }
 
         let out = fragment.instantiated(translate: Point(10, 20), ids: ["NEWSHAPE0001"], zAfter: "z", layer: 2)
 
@@ -111,7 +111,7 @@ final class FragmentTests: XCTestCase {
     func testReferencesOutsideTheFragmentAreLetGo() {
         var pinned = Item.makeText(TextBoxItem(frame: Frame(x: 0, y: 0, w: 10, h: 10), text: RichText(plain: "x")))
         pinned.attachedTo = "SOMEWHEREELS"
-        let out = Fragment(items: [fixture(Fixtures.connectorID), pinned]).instantiated(translate: .zero, zAfter: nil, layer: nil)
+        let out = NibFragment(items: [fixture(Fixtures.connectorID), pinned]).instantiated(translate: .zero, zAfter: nil, layer: nil)
         let connector = out[0].connector
         XCTAssertNil(connector?.from.item)
         XCTAssertNil(connector?.from.side)
@@ -128,7 +128,7 @@ final class FragmentTests: XCTestCase {
             n.attachedTo = parent
             return n
         }
-        let fragment = Fragment(items: [box("SELFLOOP0001", attachedTo: "SELFLOOP0001"),
+        let fragment = NibFragment(items: [box("SELFLOOP0001", attachedTo: "SELFLOOP0001"),
                                         box("PAIRLOOPA001", attachedTo: "PAIRLOOPB001"),
                                         box("PAIRLOOPB001", attachedTo: "PAIRLOOPA001")])
         let out = fragment.instantiated(translate: .zero, zAfter: nil, layer: nil)
@@ -148,7 +148,7 @@ final class FragmentTests: XCTestCase {
         pin.attachedTo = Fixtures.shapeID
         let page = fixtureItems() + [inner, nested, pin]
 
-        let chosen = Fragment.expand([Fixtures.shapeID, Fixtures.shapeID], in: page)
+        let chosen = NibFragment.expand([Fixtures.shapeID, Fixtures.shapeID], in: page)
         XCTAssertEqual(chosen.map { $0.id }, [Fixtures.shapeID, inner.id, nested.id])
     }
 
@@ -159,7 +159,7 @@ final class FragmentTests: XCTestCase {
         let text = Item.makeText(TextBoxItem(frame: Frame(x: 0, y: 0, w: 20, h: 20),
                                              text: RichText(paragraphs: [Paragraph(runs: [glyph])])))
         let bytes: [String: Data] = [Fixtures.pngAsset.name: Data([1]), "tile.png": Data([2]), "glyph.png": Data([3])]
-        let fragment = Fragment.make(items: [fixture(Fixtures.imageID), tape, text]) { bytes[$0.name] }
+        let fragment = NibFragment.make(items: [fixture(Fixtures.imageID), tape, text]) { bytes[$0.name] }
         XCTAssertEqual(fragment.assets, bytes)
 
         let map = [Fixtures.pngAsset.name: AssetRef("a.png"), "tile.png": AssetRef("b.png"), "glyph.png": AssetRef("c.png")]
@@ -192,8 +192,8 @@ final class FragmentTests: XCTestCase {
     }
 
     func testCombineLaysFragmentsOutInARowWithoutIDClashes() throws {
-        let one = Fragment(items: [fixture(Fixtures.shapeID)])
-        let combined = try XCTUnwrap(Fragment.combine([one, Fragment(items: []), one], gap: 16))
+        let one = NibFragment(items: [fixture(Fixtures.shapeID)])
+        let combined = try XCTUnwrap(NibFragment.combine([one, NibFragment(items: []), one], gap: 16))
         XCTAssertEqual(combined.items.count, 2)
         XCTAssertNotEqual(combined.items[0].id, combined.items[1].id)
         let first = combined.items[0].bounds
@@ -203,7 +203,7 @@ final class FragmentTests: XCTestCase {
         XCTAssertEqual(second.minX, first.maxX + 16, accuracy: 1e-6)
         XCTAssertEqual(second.minY, 0, accuracy: 1e-6)
         XCTAssertLessThan(combined.items[0].z, combined.items[1].z)
-        XCTAssertNil(Fragment.combine([]))
+        XCTAssertNil(NibFragment.combine([]))
     }
 
     // MARK: External content and text

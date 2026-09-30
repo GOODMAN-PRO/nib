@@ -90,9 +90,9 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
               let hit = host.pagePoint(location), hit.page == page,
               host.app.services.lock?.isLocked(doc) != true,
               let pageItems = try? host.app.workspace.items(doc, page: page) else { return nil }
-        let items = Fragment.expand(selection.items, in: pageItems)
+        let items = NibFragment.expand(selection.items, in: pageItems)
         guard !items.isEmpty else { return nil }
-        let bounds = selection.bounds ?? Fragment.union(items)
+        let bounds = selection.bounds ?? NibFragment.union(items)
         let slop = Double(NibMetrics.hitTarget) / 2 / max(host.zoomScale, 0.01)
         guard bounds.insetBy(-slop).contains(hit.point) else { return nil }
         let context = CanvasDragContext(host: ObjectIdentifier(host), doc: doc, page: page, start: hit.point,
@@ -107,9 +107,9 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         let page = source.context.page
         let items = source.items
         let store = app.services.assets
-        if let data = Fragment.make(items: items, assetData: { ref in try? store?.data(ref, doc: doc) }).encoded() {
+        if let data = NibFragment.make(items: items, assetData: { ref in try? store?.data(ref, doc: doc) }).encoded() {
             // Other Nib windows read the fragment; other apps never see it.
-            DragFlavours.now(provider, Fragment.typeIdentifier, visibility: .ownProcess, data: data)
+            DragFlavours.now(provider, NibFragment.typeIdentifier, visibility: .ownProcess, data: data)
         }
         let prepared = recognized?.ids == host.session.selection.items ? recognized?.text : nil
         let png: @MainActor () async -> Data? = {
@@ -146,7 +146,7 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         let doc = host.documentID
         guard !selection.isEmpty, selection.doc == doc, let page = selection.page,
               let pageItems = try? host.app.workspace.items(doc, page: page) else { return }
-        let items = Fragment.expand(selection.items, in: pageItems)
+        let items = NibFragment.expand(selection.items, in: pageItems)
         guard !items.isEmpty, items.count <= CanvasDragDrop.prerecognizeLimit,
               items.allSatisfy({ ClipboardText.isHandwriting($0) }) else { return }
         let app = host.app
@@ -184,7 +184,7 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
     static func apply(_ payload: DropReader.Payload, doc: DocumentID, page: PageID, at point: Point, app: NibApp,
                       session: EditorSession) async {
         var added = false
-        if let fragment = Fragment.combine(payload.fragments) {
+        if let fragment = NibFragment.combine(payload.fragments) {
             let params = ClipboardPaste.Params(page: NodeRef.page(doc, page).description, at: [point.x, point.y],
                                                fragment: fragment)
             do {
@@ -239,7 +239,7 @@ final class CanvasDragDrop: NSObject, CanvasAttachment {
         view.isAccessibilityElement = false
         view.accessibilityElementsHidden = true
         view.backgroundColor = NibUIColor.accentWash
-        view.layer.borderWidth = NibSpacing.xxs
+        view.layer.borderWidth = NibStroke.ring
         view.alpha = 0
         return view
     }
@@ -291,10 +291,12 @@ extension CanvasDragDrop: UIDragInteractionDelegate {
 
 extension CanvasDragDrop: UIDropInteractionDelegate {
     func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
-        guard let host = host, !host.session.readOnly, host.app.services.lock?.isLocked(host.documentID) != true else {
+        // Read-only mode (the window's), documents Nib will not write, and locked documents take no drops.
+        guard let host = host, !host.session.readOnly, !host.app.isReadOnly(host.documentID),
+              host.app.services.lock?.isLocked(host.documentID) != true else {
             return false
         }
-        return session.hasItemsConforming(toTypeIdentifiers: [Fragment.typeIdentifier, UTType.item.identifier])
+        return session.hasItemsConforming(toTypeIdentifiers: [NibFragment.typeIdentifier, UTType.item.identifier])
     }
 
     func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
@@ -367,7 +369,7 @@ enum DragFlavours {
 /// copied to a temporary folder for `import.files`.
 enum DropReader {
     struct Payload {
-        var fragments: [Fragment] = []
+        var fragments: [NibFragment] = []
         var files: [URL] = []
     }
 
@@ -376,8 +378,8 @@ enum DropReader {
         var out = Payload()
         for provider in providers {
             let types = provider.registeredTypeIdentifiers
-            if types.contains(Fragment.typeIdentifier) || provider.hasItemConformingToTypeIdentifier(Fragment.typeIdentifier) {
-                if let data = await loadData(provider, Fragment.typeIdentifier), let fragment = try? Fragment.decode(data) {
+            if types.contains(NibFragment.typeIdentifier) || provider.hasItemConformingToTypeIdentifier(NibFragment.typeIdentifier) {
+                if let data = await loadData(provider, NibFragment.typeIdentifier), let fragment = try? NibFragment.decode(data) {
                     out.fragments.append(fragment)
                 }
                 continue

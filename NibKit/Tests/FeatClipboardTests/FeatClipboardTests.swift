@@ -3,6 +3,7 @@ import UIKit
 import UniformTypeIdentifiers
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatClipboard
 
 @MainActor
@@ -41,7 +42,9 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertEqual(problems, [])
         let h = Harness(features: [FeatClipboardFeature.self])
         let owned = h.app.commands.all().filter { $0.owner == FeatClipboardFeature.id }.map { $0.id }
-        XCTAssertEqual(owned, ["clipboard.copy", "clipboard.cut", "clipboard.paste", "item.duplicate"])
+        XCTAssertEqual(owned.sorted(), ["clipboard.copy", "clipboard.copyText", "clipboard.cut", "clipboard.paste", "item.duplicate"])
+        XCTAssertEqual(Set(owned), [CommandIDs.clipboardCopy, CommandIDs.clipboardCopyText, CommandIDs.clipboardCut,
+                                    CommandIDs.clipboardPaste, CommandIDs.itemDuplicate])
     }
 
     /// Acceptance: copy → paste into another document keeps geometry and styles, mints new ids, remaps the connector
@@ -55,7 +58,7 @@ final class FeatClipboardTests: XCTestCase {
 
         let copied = try await h.run("clipboard.copy", ["refs": .array(source)])
         XCTAssertEqual(copied["count"], 4)
-        XCTAssertTrue(board.contains([Fragment.typeIdentifier]))
+        XCTAssertTrue(board.contains([NibFragment.typeIdentifier]))
         XCTAssertTrue(board.contains([UTType.png.identifier]))
         XCTAssertEqual(board.strings, ["Remember"])
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0, "copying changes nothing")
@@ -85,8 +88,8 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertEqual(new[2].connector?.style, old[2].connector?.style)
         let asset = try XCTUnwrap(new[3].image?.asset)
         XCTAssertEqual(try h.assets.data(asset, doc: Fixtures.whiteboardID), Fixtures.pngData)
-        XCTAssertEqual(Fragment.union(new).midX, 500, accuracy: 1e-6)
-        XCTAssertEqual(Fragment.union(new).midY, 500, accuracy: 1e-6)
+        XCTAssertEqual(NibFragment.union(new).midX, 500, accuracy: 1e-6)
+        XCTAssertEqual(NibFragment.union(new).midY, 500, accuracy: 1e-6)
 
         XCTAssertTrue(h.app.bus.undo(Fixtures.whiteboardID))
         XCTAssertEqual(try h.app.workspace.items(Fixtures.whiteboardID, page: Fixtures.boardID).count, 1)
@@ -134,7 +137,7 @@ final class FeatClipboardTests: XCTestCase {
         XCTAssertNil(connector?.from.item)
         XCTAssertEqual(connector?.from.point, Point(260, 245))
         XCTAssertEqual(connector?.to.item, Fixtures.stickyID)
-        XCTAssertTrue(board.contains([Fragment.typeIdentifier]))
+        XCTAssertTrue(board.contains([NibFragment.typeIdentifier]))
 
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(try h.snapshot(), before)
@@ -200,12 +203,19 @@ final class FeatClipboardTests: XCTestCase {
         let board = useMemoryBoard()
         defer { restoreBoard() }
         let h = Harness(features: [FeatClipboardFeature.self])
-        h.app.settings.setJSON("text.styles.default", ["size": 24, "color": "#0066E0"])
+        var saved = TextBoxStyle()
+        saved.defaults.size = 24
+        saved.defaults.color = RGBA(hex: "#0066E0")
+        saved.align = .center
+        saved.fullPage = true                            // a pasted box is never full-page
+        h.app.settings.set(NibSettings.defaultTextStyle, saved)
         board.items = [[UTType.utf8PlainText.identifier: "Styled"]]
         let out = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "matchStyle": true])
         let box = try XCTUnwrap(try items(refs(out), in: h).first?.text)
         XCTAssertEqual(box.style.defaults.size, 24)
         XCTAssertEqual(box.style.defaults.color, RGBA(hex: "#0066E0"))
+        XCTAssertEqual(box.style.align, .center)
+        XCTAssertFalse(box.style.fullPage)
     }
 
     func testEmptyClipboardPastesNothing() async throws {
@@ -255,11 +265,13 @@ final class FeatClipboardTests: XCTestCase {
         h.session.selection = Selection()
         let nothingCopied = try await h.run("clipboard.copy", [:])
         let nothingCut = try await h.run("clipboard.cut", [:])
+        let nothingEmpty = try await h.run("clipboard.copy", ["refs": []])
         XCTAssertEqual(nothingCopied["count"], 0)
         XCTAssertEqual(nothingCut["count"], 0)
+        XCTAssertEqual(nothingEmpty["count"], 0, "the user's empty refs mean the selection (§6.1 session defaults)")
         do {
-            _ = try await h.run("clipboard.copy", ["refs": []])
-            XCTFail("an explicit empty refs list is an error")
+            _ = try await h.run("clipboard.copy", ["refs": []], as: .ai("t"))
+            XCTFail("callers other than the user must name the items")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .invalidParams)
         }
@@ -278,13 +290,127 @@ final class FeatClipboardTests: XCTestCase {
         let matchStyle = byShortcut[KeyShortcut("v", [.command, .option, .shift])]
         XCTAssertEqual(matchStyle?.command, "clipboard.paste")
         XCTAssertEqual(matchStyle?.params["matchStyle"], true)
+        XCTAssertEqual(keys.count, 5)
         XCTAssertTrue(keys.allSatisfy { $0.scope == .canvas }, "text fields keep ⌘C / ⌘V while editing")
+        XCTAssertTrue(keys.allSatisfy { $0.docKinds == [.notebook, .whiteboard] })
 
         let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page2, point: Point(50, 60))
         XCTAssertTrue(h.app.ui.menuItems(.pageLongPress, context).isEmpty, "hidden without text on the clipboard")
         board.items = [[UTType.utf8PlainText.identifier: "Some text"]]
-        let entry = try? XCTUnwrap(h.app.ui.menuItems(.pageLongPress, context).first { $0.id == "clipboard.pasteAndMatchStyle" })
+        let entry = h.app.ui.menuItems(.pageLongPress, context).first { $0.id == "clipboard.pasteAndMatchStyle" }
+        XCTAssertNotNil(entry)
+        XCTAssertEqual(entry?.icon, NibSymbol.paste.name)
         XCTAssertEqual(entry?.params(context), ["matchStyle": true, "page": "page:FIXTUREDOC01/FIXTUREPG002", "at": [50, 60]])
+
+        h.app.services.set(NSSet(object: Fixtures.docID.raw), for: ServiceKeys.storeReadOnly)
+        XCTAssertTrue(h.app.ui.menuItems(.pageLongPress, context).isEmpty, "hidden in documents Nib will not write")
+    }
+
+    /// Shell v2: the keys fill in the key window's selection or page, and only run in notebooks and whiteboards.
+    func testKeyCommandsResolveTheSessionAndStayOnCanvasDocuments() {
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let keys = Dictionary(uniqueKeysWithValues: h.app.content.keyCommands.all
+            .filter { $0.owner == FeatClipboardFeature.id }.map { ($0.id, $0) })
+        let copy = keys["clipboard.key.copy"]
+        let paste = keys["clipboard.key.paste"]
+        let matchStyle = keys["clipboard.key.pasteAndMatchStyle"]
+
+        XCTAssertEqual(copy?.resolvedParams(for: h.session), [:], "nothing selected: the command does nothing")
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID, Fixtures.textID])
+        XCTAssertEqual(copy?.resolvedParams(for: h.session),
+                       ["refs": [.string(page1 + "FIXTURESHP01"), .string(page1 + "FIXTURETXT01")]])
+        XCTAssertEqual(keys["clipboard.key.duplicate"]?.resolvedParams(for: h.session)["refs"]?.arrayValue?.count, 2)
+        XCTAssertEqual(paste?.resolvedParams(for: h.session), ["page": "page:FIXTUREDOC01/FIXTUREPG001"])
+        XCTAssertEqual(matchStyle?.resolvedParams(for: h.session), ["matchStyle": true, "page": "page:FIXTUREDOC01/FIXTUREPG001"])
+        h.session.page = nil
+        XCTAssertEqual(paste?.resolvedParams(for: h.session), [:])
+
+        let all = h.app.content.keyCommands.all
+        for kind in [DocumentKind.notebook, .whiteboard] {
+            let live = KeyCommandRouting.active(all, in: KeyCommandContext(docKind: kind)).filter { $0.owner == FeatClipboardFeature.id }
+            XCTAssertEqual(live.count, 5, "\(kind)")
+            let editing = KeyCommandContext(docKind: kind, isEditingText: true)
+            XCTAssertTrue(KeyCommandRouting.active(all, in: editing).allSatisfy { $0.owner != FeatClipboardFeature.id })
+        }
+        for kind: DocumentKind? in [.textDocument, .studySet, nil] {
+            let live = KeyCommandRouting.active(all, in: KeyCommandContext(docKind: kind))
+            XCTAssertTrue(live.allSatisfy { $0.owner != FeatClipboardFeature.id }, "\(String(describing: kind))")
+        }
+
+        // F102's block duplicate on ⌘D in text documents never races ours.
+        var block = KeyCommandDescriptor(id: "textdoc.key.duplicate", title: "Duplicate", shortcut: KeyShortcut("d", [.command]),
+                                         command: "block.duplicate", scope: .canvas, order: 10, owner: "textdoc")
+        block.docKinds = [.textDocument]
+        let withBlock = all + [block]
+        XCTAssertEqual(KeyCommandRouting.active(withBlock, in: KeyCommandContext(docKind: .textDocument))
+            .first { $0.shortcut == KeyShortcut("d", [.command]) }?.id, "textdoc.key.duplicate")
+        XCTAssertEqual(KeyCommandRouting.active(withBlock, in: KeyCommandContext(docKind: .notebook))
+            .first { $0.shortcut == KeyShortcut("d", [.command]) }?.id, "clipboard.key.duplicate")
+    }
+
+    /// Documents Nib will not write (saved by a newer Nib): cut, paste and duplicate refuse them for every caller;
+    /// copy still works.
+    func testReadOnlyDocumentsRefuseEdits() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        h.app.services.set(NSSet(object: Fixtures.docID.raw), for: ServiceKeys.storeReadOnly)
+        board.items = [[UTType.utf8PlainText.identifier: "Pasted"]]
+        let before = try h.snapshot()
+        let shape: JSONValue = ["refs": [.string(page1 + "FIXTURESHP01")]]
+        let calls: [(String, JSONValue)] = [("clipboard.cut", shape), ("item.duplicate", shape),
+                                            ("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])]
+        for (command, params) in calls {
+            for principal in [Principal.user, .ai("t")] {
+                do {
+                    _ = try await h.run(command, params, as: principal)
+                    XCTFail("\(command) should refuse a read-only document")
+                } catch let e as NibError {
+                    XCTAssertEqual(e.code, .unsupported, command)
+                }
+            }
+        }
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(board.strings, ["Pasted"], "a refused cut leaves the clipboard alone")
+
+        let copied = try await h.run("clipboard.copy", shape)
+        XCTAssertEqual(copied["count"], 1)
+        XCTAssertTrue(board.contains([NibFragment.typeIdentifier]))
+    }
+
+    /// clipboard.copyText (F037's Copy Text / Copy Link): text, a link, or both, replacing the clipboard.
+    func testCopyTextPutsTextAndLinks() async throws {
+        let board = useMemoryBoard()
+        defer { restoreBoard() }
+        let h = Harness(features: [FeatClipboardFeature.self])
+        let url = UTType.url.identifier
+        let plain = UTType.utf8PlainText.identifier
+
+        let text = try await h.run(CommandIDs.clipboardCopyText, ["text": "Remember the milk"])
+        XCTAssertEqual(text["types"], [.string(plain)])
+        XCTAssertEqual(board.strings, ["Remember the milk"])
+        XCTAssertFalse(board.contains([url]))
+
+        let link = try await h.run(CommandIDs.clipboardCopyText, ["url": "nib://doc/FIXTUREDOC01"])
+        XCTAssertEqual(link["types"], [.string(url), .string(plain)])
+        XCTAssertEqual(board.items.count, 1, "the clipboard is replaced")
+        XCTAssertEqual(board.items.first?[url] as? URL, URL(string: "nib://doc/FIXTUREDOC01"))
+        XCTAssertEqual(board.strings, ["nib://doc/FIXTUREDOC01"], "text-only apps get the link")
+
+        _ = try await h.run(CommandIDs.clipboardCopyText, ClipboardCopyText.example, as: .ai("t"))
+        XCTAssertEqual(board.items.first?[url] as? URL, URL(string: "https://example.com/notes"))
+        XCTAssertEqual(board.strings, ["Remember the milk"])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+
+        for bad: JSONValue in [[:], ["text": ""], ["url": "not a link"], ["url": ""]] {
+            do {
+                _ = try await h.run(CommandIDs.clipboardCopyText, bad)
+                XCTFail("\(bad) should be refused")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams)
+            }
+        }
+        XCTAssertEqual(board.strings, ["Remember the milk"], "a refused call leaves the clipboard alone")
     }
 
     /// Read-only mode (F042): ⌘X, ⌘V, ⌥⇧⌘V and ⌘D change nothing.
@@ -371,12 +497,12 @@ final class FeatClipboardTests: XCTestCase {
         let board = useMemoryBoard()
         defer { restoreBoard() }
         let h = Harness(features: [FeatClipboardFeature.self])
-        board.items = [[Fragment.typeIdentifier: Data("{not a fragment".utf8), UTType.utf8PlainText.identifier: "Fallback"]]
+        board.items = [[NibFragment.typeIdentifier: Data("{not a fragment".utf8), UTType.utf8PlainText.identifier: "Fallback"]]
         let out = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
         XCTAssertEqual(out["source"], "text")
         XCTAssertEqual(try items(refs(out), in: h).first?.text?.text.plainText, "Fallback")
 
-        board.items = [[Fragment.typeIdentifier: Data("{not a fragment".utf8)]]
+        board.items = [[NibFragment.typeIdentifier: Data("{not a fragment".utf8)]]
         let broken = try await h.run("clipboard.paste", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
         XCTAssertEqual(broken["source"], "empty")
     }
@@ -400,9 +526,9 @@ final class FeatClipboardTests: XCTestCase {
 
     func testDropReaderTurnsProvidersIntoFragments() async throws {
         let shape = try Harness(features: []).app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
-        let data = try XCTUnwrap(Fragment(items: [shape]).encoded())
+        let data = try XCTUnwrap(NibFragment(items: [shape]).encoded())
         let fragmentProvider = NSItemProvider()
-        DragFlavours.now(fragmentProvider, Fragment.typeIdentifier, visibility: .all, data: data)
+        DragFlavours.now(fragmentProvider, NibFragment.typeIdentifier, visibility: .all, data: data)
         let imageProvider = NSItemProvider()
         DragFlavours.now(imageProvider, UTType.png.identifier, visibility: .all, data: Fixtures.pngData)
         let textProvider = NSItemProvider(object: "Dropped text" as NSString)
@@ -411,7 +537,7 @@ final class FeatClipboardTests: XCTestCase {
                                             limits: PasteLimits(page: .a4))
         XCTAssertEqual(payload.fragments.map { $0.items.first?.kind }, [.shape, .image, .text])
         XCTAssertTrue(payload.files.isEmpty)
-        let combined = try XCTUnwrap(Fragment.combine(payload.fragments))
+        let combined = try XCTUnwrap(NibFragment.combine(payload.fragments))
         XCTAssertEqual(combined.items.count, 3)
         XCTAssertEqual(combined.assets.count, 1)
     }
