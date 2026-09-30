@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/FeatDiagnostics/FeatDiagnosticsFeature.swift:122 (FeatureCatalog.required) and :494-560 (DiagnosticsSetFeatureEnabledCommand); NibKit/Tests/FeatDiagnosticsTests/FeatDiagnosticsTests.swift:374-376",
+      "problem": "diagnostics.setFeatureEnabled is `.session` on `.app`, so it is not mutating, destructive or sensitive. The gateway therefore never confirms it for AI or bridge callers, even under the `always` policy, and a plugin granted `app` can run it too. Any of these callers can run `{id: \"lock\", enabled: false}` (or `managed`). At the next launch F071 is not registered. `services.lock` is nil and `gateway.isLocked` falls back to `{ _ in false }`, so F003's `Shapes.isLocked` returns false and `ui.openGate` is nil. Every password-locked document then opens without a password and is readable by the assistant, plugins and the bridge. Turning off `managed` the same way drops the MDM-enforced restrictions. ARCHITECTURE.md §6.4 says a principal can never widen its own permissions. The test at line 374 asserts that `.ai(\"chat\")` can turn features off without confirmation. From the page itself, anyone holding the unlocked device can switch off Password lock without the password.",
+      "fix": "Add `FeatureCatalog.guarded: Set<String> = [\"lock\", \"managed\"]`. In `DiagnosticsSetFeatureEnabledCommand.run`, throw `NibError(.permissionDenied, \"'lock' can only be turned off by you in Settings\")` when `!ctx.principal.isUser && !p.enabled && guarded.contains(id)`. Simplest option: treat both as required (show them as \"Always on\" in TroubleshootingModel.featureRows). Otherwise, for the user, ask for the password through the lock feature before writing SafeMode.disabledFeatures. Replace the AI assertion in testFeatureSwitchesWriteSafeModeChoicesForTheNextLaunch with tests that `.ai(\"chat\")` and `.bridge(\"x\")` get `permissionDenied` for `lock` and `managed`, and that `laser` still works."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDiagnostics/FeatDiagnosticsFeature.swift:122 (FeatureCatalog.required), :373-386 (DiagnosticsRuntime.start); NibKit/Sources/FeatDiagnostics/TroubleshootingPage.swift:696-705",
+      "problem": "Outside safe mode, the Troubleshooting page is the only way to turn a feature back on, and the page is reached only through Settings. DESIGN.md §14 puts Settings at the bottom of the library sidebar, which F019 `libraryui` provides. If a person turns off `libraryui`, the shell's FallbackLibraryViewController (Nib/App/ShellViewController.swift) has no Settings entry. If they turn off `settings`, `settings.open` is gone. Either way, after relaunch nothing on screen leads back to Troubleshooting. On a device without a hardware keyboard (⌘, is F073's) the person is stuck until they reinstall. The page footer says the features Nib needs stay on, but these two can be switched off.",
+      "fix": "In `DiagnosticsRuntime.start`, when `disabledAtLaunch` is not empty (at least when it intersects [\"libraryui\", \"settings\", \"chrome\"]), present the SafeModeNotice alert with an \"Open Troubleshooting\" action once per launch, with copy such as \"Some features are turned off\". `TroubleshootingNavigation.open` already falls back to `activeNavigator?.showSettings(page:)`, which works without F019 and F027. Or add a `nib_reset_features` switch to Settings.bundle that `register` reads to clear `SafeMode.disabledFeatures` for the next launch. Add a test that a runtime with `disabledAtLaunch = [\"libraryui\"]` schedules the notice."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDiagnostics/DiagnosticsExporter.swift:84-107 (DiagnosticsRedactor.redact), called from :613-619",
+      "problem": "Redaction runs one full `NSMutableString.replaceOccurrences` pass over the whole log for every library title and path component, so the cost is O(titles × log length). This is the default export path (titles off). I measured it with `swiftc -O` on an M1 Pro: 3,000 titles against a 20,000-line log (2.2 M characters, the `logLimit`) took 22 s. A 10,000-document library needs more than a minute, and an iPad is slower again, all behind a spinner before the share sheet appears. Matching is also literal substring with no word boundary. A title such as \"Nib\" or \"app\" rewrites \"app.nib/...\" in every line. Percent-encoded (`Physics%209702`) and decomposed (NFD) spellings, which URLs and file-system errors log, are not masked. That breaks the page's promise that titles are left out unless turned on.",
+      "fix": "Build one matcher and scan each log line once. Either use an Aho-Corasick automaton over the titles, or bucket titles by their first 3 UTF-16 units in a dictionary and check candidates only at positions whose prefix hits. Accept a match only at word or path boundaries. Seed the matcher with each title's NFC, NFD and `addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)` forms. Add a test: 10,000 titles × 20,000 lines finish in under ~1 s, \"Physics%209702\" is masked, and a title \"app\" leaves \"app.nib/diagnostics\" intact."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatDiagnostics/FeatDiagnosticsFeature.swift:394-422 (startTemporaryDiagnosticModeIfRequested); NibKit/Sources/FeatDiagnostics/DiagnosticsExporter.swift:813-842 (LibraryArchiver.archive)",
+      "problem": "The raw library copy can run for minutes (multi-GB libraries, PDFs, audio). It runs in a `Task.detached` with no `UIApplication.beginBackgroundTask`. The switch is turned off before the copy starts. The usual next step for the person is to go to the Files app to look for the zip, which suspends Nib a few seconds later. If iOS then ends the process, the copy never finishes and is never retried. The hidden `.Nib Library <stamp>.zip.partial` stays in Documents/diagnostics for good. The Files app hides dot-files, `latestCopy` skips hidden files, and nothing sweeps them, so gigabytes that also contain the person's notes sit where they can't be seen or deleted. The page shows `.idle` with no sign the copy failed.",
+      "fix": "Wrap the copy in `UIApplication.shared.beginBackgroundTask(withName: \"Temporary Diagnostic Mode\")` and end it in the completion. At the start of every launch (in `start`, before checking the switch), delete any `.*.partial` files in `libraryCopyFolder`. When stale partials were found, set `libraryCopy = .failed(\"The last library copy was interrupted. Turn Temporary Diagnostic Mode on again.\")`. Add a test that plants a stale partial, runs `start`, and asserts the file is gone and the state is `.failed`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDiagnostics/FeatDiagnosticsFeature.swift:455-462 (DiagnosticsExportCommand.descriptor)",
+      "problem": "The export always carries library statistics and, with includeTitles, every document and folder title and path. The command needs only the `app` scope, so a plugin granted just \"Control the app\" can get a full library listing it was never granted (`library:read`). The Output also returns nothing an AI or bridge caller can read: the state is only inside the zip. No query reports safe mode or the features that are off without changing something.",
+      "fix": "Add `extraScopes: [.libraryRead]` to the descriptor. Add `summary: String`, `launchedInSafeMode: Bool` and `disabled: [String]` to `DiagnosticsExportCommand.Output`, so `diagnostics.export` also works as the read path for the assistant and the bridge."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDiagnostics/FeatDiagnosticsFeature.swift:373-386; NibKit/Sources/FeatDiagnostics/DiagnosticsExporter.swift:813-838",
+      "problem": "Temporary Diagnostic Mode checks the switch only in `start`. That runs after the other ~75 features have been started one by one (NibApp.start awaits each in turn). If a launch crashes in an earlier feature, which is the case the Settings footer names (\"Use it when Nib can't open\"), no copy is ever made. Returning from the Settings app without a cold launch does nothing either. When the library root is the default Documents folder, the copy lands inside the library. It then appears as a \"diagnostics\" folder, is counted in library.json storage, and is included in the iCloud device backup.",
+      "fix": "In `register`, enqueue `Task { @MainActor in runtime.startTemporaryDiagnosticModeIfRequested(...) }`, resolving the library root inside the task. It then runs before the shell's start task. Also check on `UIApplication.didBecomeActiveNotification`. Set `URLResourceValues.isExcludedFromBackup = true` on the finished zip. Skip `libraryCopyFolder` in `LibraryStorage.measure`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDiagnostics/DiagnosticsExporter.swift:602-605 (DiagnosticsExporter.build)",
+      "problem": "Every export deletes the shared `nib-diagnostics` temp folder first. A second export (the assistant or the bridge, while the person's share sheet for the first is still open) deletes the file the share sheet is sending.",
+      "fix": "Build each export in `exportDirectory/<UUID>/`. Prune only subfolders older than an hour, or all but the newest two."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDiagnostics/TroubleshootingPage.swift:454-460 and :473-483",
+      "problem": "The feature filter is a raw `TextField` with a hand-copied NibSearchField configuration, so it has no search glyph and no clear button. \"Show All Features\" is a hand-rolled `Button { Text().foregroundStyle(NibColor.accent) }`. DESIGN.md §15.1/§15.6 says compose `Nib*` components and don't hand-roll one when it exists.",
+      "fix": "Use `NibSearchField(text: $model.filter, prompt: String(localized: \"Find a Feature\"))` and `NibButton(title, kind: .plain) { … }`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatDiagnostics/FeatDiagnosticsFeature.swift:124-235 (FeatureCatalog.all); NibKit/Tests/FeatDiagnosticsTests/FeatDiagnosticsTests.swift:418-433",
+      "problem": "The 108 feature ids and the split-half `parent` links are a hand-copied list. The test checks only the count and internal consistency. A new or renamed feature, or a new split half, drifts silently. A second half without its `parent` link stays registered when its first half is turned off, and ARCHITECTURE.md §3 says second halves use the first half's internal hooks.",
+      "fix": "Add a test that reads docs/ARCHITECTURE.md (as NibContractsTests/CommandCatalogueTests does) and parses the §3 table. It asserts that the set of `Entry type / id` keys equals `FeatureCatalog.ids`. For F101–F110 it asserts that `parent` is the first-listed `Depends on` feature in the same module."
+    },
+    {
+      "severity": "minor",
+      "where": "Nib/Settings.bundle/Root.plist; NibKit/Sources/FeatDiagnostics/FeatDiagnosticsFeature.swift:47-49, :455, :513",
+      "problem": "The Settings.bundle group title, footer and switch title have no `StringsTable` or `en.lproj/Root.strings`, so F095 cannot localise them. The command ids are string literals although `CommandIDs.diagnosticsExport` and `CommandIDs.diagnosticsSetFeatureEnabled` exist.",
+      "fix": "Add `<key>StringsTable</key><string>Root</string>` and a `Settings.bundle/en.lproj/Root.strings` holding the three strings (F076-owned path, or request it via the spec owner). Use the `CommandIDs` constants in `DiagnosticsIDs` and in both descriptors."
+    }
+  ]
+}

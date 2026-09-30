@@ -1,0 +1,41 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIProviders/OpenAICompatibleProvider.swift: OpenAICompatibleProvider.run (SSE path, lines 58-76) + OpenAIStreamDecoder.finish (line 418); same pattern in NibHTTPProvider.stream (line 59) / NibAgentStreamDecoder.finish",
+      "problem": "A 2xx answer that carries no recognisable event (e.g. a text/html page from a wrong base URL or a web UI's SPA fallback, or an empty body) finishes as a successful empty turn: the SSE parser ignores every HTML line, and decoder.finish() emits .stop(reason: \"end_turn\"). The user gets a blank reply with no error or hint. The Anthropic adapter already treats a stream without a stop reason as an error, so the three adapters disagree.",
+      "fix": "In OpenAIStreamDecoder, record whether any chunk or [DONE] was parsed (set a sawChunk flag in handle). In run, when the stream ends with sawChunk == false, throw NibError(.unavailable, \"<name> did not answer with an event stream.\", hint: ProviderErrors.checkBaseURLHint) instead of calling finish(). Optionally reject a 2xx whose Content-Type is text/html before reading. Do the same in NibHTTPProvider when the body had no event at all. Add a ProviderStreamTests case: 200 text/html \"<html>...\" -> NibError .unavailable."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIProviders/OpenAICompatibleProvider.swift: transcribe (lines 113-132) and generateImage (lines 146-160)",
+      "problem": "When a transcription or image model is configured but the server has no such endpoint (OpenRouter, Ollama and LM Studio answer 404, 405 or 501), the call fails as not_found, invalid_params or unavailable with the hint \"check the base URL\". The AIProvider contract and AI.md §2.3 both say to throw NibError(.unsupported) for this case. Callers that fall back to on-device transcription or Image Playground when they get .unsupported (F089, F087) will not fall back.",
+      "fix": "In both methods, catch HTTPStatusError with status 404, 405 or 501 (after the existing response_format retry) and throw NibError(.unsupported, \"<name> has no /audio/transcriptions endpoint.\" or \"/images/generations\", hint: \"transcribe on device\" or \"use Image Playground\"). Add a stub test that returns 404 and asserts .unsupported."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIProviders/NibAIProvidersFeature.swift: ProviderRequests.systemBoundary / systemParts (lines 109-120), used by AnthropicWire.systemBlocks",
+      "problem": "The static and per-turn split of the system prompt (AI.md §5) depends on a U+001E marker inside ChatRequest.system. This convention is not in NibContracts or AI.md, so F084 cannot know it. F084 will send one concatenated string, the per-turn context then lands inside the cache_control block, and the Anthropic system cache is rewritten on every turn instead of caching only the static prompt.",
+      "fix": "Document the marker on the public NibAIProvidersFeature doc comment (\"ChatRequest.system = static + \\u{1E} + dynamic; only the part before U+001E is cached\"). Record a contract request in tools/fleet/contract-gaps.md (or docs/contract-requests via the spec owner) for a NibContracts constant or field, e.g. ChatRequest.systemCacheBoundary, so F084 builds the prompt that way."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIProviders/ProviderStore.swift: loadIfNeeded (lines 266-273) + persist (lines 281-296)",
+      "problem": "An entry that fails to decode (for example a newer AIProviderKind case written by a later build, which then runs under an older sideloaded build) is skipped at load. The next save, activate or delete rewrites ai-providers.json without it, so that provider is lost for good and its Keychain key is orphaned.",
+      "fix": "Keep the raw JSONValue of each entry that does not decode in a private preserved list, and append those entries unchanged to providers in persist(). Either encode FileFormat.providers as [JSONValue], or write decoded entries followed by the preserved raw ones. Add a test: a file with one valid and one unknown-kind entry, then save another config, then both unknown entries are still in the file."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIProviders/ProviderStore.swift: save (lines 111-141) and delete (lines 149-157)",
+      "problem": "The Keychain changes before the file does, and a failed persist rolls back only the entry list. If you replace or clear (\"\") the key of an existing provider and persist fails, the old key is already overwritten or deleted while entries and hasKey revert. delete removes the key and the in-memory entry, but if persist fails the file still lists the provider with hasKey = true. Both cases leave a provider that reports \"credentials missing\", or that silently sends the new key, after a failed save.",
+      "fix": "In save, read the previous key first (let oldKey = secrets.get(...)) and restore it in the catch for existing entries as well as new ones. In delete, remove the entry and persist first, and delete the Keychain item only after persist succeeds (restore the entry if persist throws)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibAIProviders/OpenAICompatibleProvider.swift: transcribe / MultipartForm (lines 106-123, 501-522)",
+      "problem": "The whole recording is loaded (Data(contentsOf:)) and then copied into an in-memory multipart body, which URLSession copies again. For long meeting recordings (F089), peak memory is two to three times the file size, and more on each retry with response_format=json.",
+      "fix": "Write the multipart body once to a temporary file (header, then stream the audio file with FileHandle, then trailer) and send it with session.upload(for:fromFile:). Reuse that file for the json retry and delete it in a defer."
+    }
+  ]
+}
