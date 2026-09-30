@@ -110,7 +110,7 @@ struct PageAdd: NibCommand {
         var specs: [PageSpec]
         switch source {
         case "blank":
-            specs = Array(repeating: PageSpec(background: .ofTemplate("builtin.blank"), size: size), count: count)
+            specs = Array(repeating: PageSpec(background: .ofTemplate(TemplateIDs.blank), size: size), count: count)
         case "template":
             guard let background = try BackgroundArg.parse(p.template) else {
                 throw NibError(.invalidParams, "source template needs template", path: "$.template",
@@ -118,7 +118,7 @@ struct PageAdd: NibCommand {
             }
             specs = Array(repeating: PageSpec(background: background, size: size), count: count)
         case "choose":
-            let chosen = try await PageAdd.chooseTemplate(size: size, ctx)
+            let chosen = try await PageAdd.chooseTemplate(size: size, doc: doc, ctx)
             specs = Array(repeating: chosen, count: count)
         case "pdf":
             specs = try await PageAdd.pdfPages(p, doc: doc, count: count, explicitSize: explicitSize, fallback: size, ctx: ctx)
@@ -161,19 +161,36 @@ struct PageAdd: NibCommand {
         return "current"
     }
 
-    /// Add Page › Choose Template: F045's picker (`template.choose`) returns the paper; nothing is added on cancel.
-    static func chooseTemplate(size: PageSize?, _ ctx: CommandContext) async throws -> PageSpec {
+    /// Add Page › Choose Template: F045's picker, `template.choose {kind: paper, size?, doc}` → `{background, size}`
+    /// (ARCHITECTURE §6.5, spec pass 2). With `doc` the picker stores a custom paper's file in this document and the
+    /// Background names it; a picker that hands back a temporary (`tmp:`) file instead has it copied in here, so the
+    /// page keeps its paper after the temporary file expires. `size` preselects the page size (page points,
+    /// `[width, height]`); the answer's size wins. Nothing is added on cancel (user_denied).
+    static func chooseTemplate(size: PageSize?, doc: DocumentID, _ ctx: CommandContext) async throws -> PageSpec {
         guard ctx.principal.isUser else {
             throw NibError(.permissionDenied, "source 'choose' shows the template picker, which only the user can answer",
                            path: "$.source", hint: "call template.list, then page.add with source 'template' and template")
         }
-        var args: [String: JSONValue] = ["kind": "paper"]
+        var args: [String: JSONValue] = ["kind": "paper", "doc": .string(NodeRef.document(doc).description)]
         if let size { args["size"] = .array([.number(size.width), .number(size.height)]) }
-        let picked = try await ctx.execute("template.choose", .object(args))
-        guard let background = try BackgroundArg.parse(picked["background"], path: "$.template") else {
+        let picked = try await ctx.execute(CommandIDs.templateChoose, .object(args))
+        guard var background = try BackgroundArg.parse(picked["background"], path: "$.template") else {
             throw NibError(.userDenied, "no template was chosen")
         }
+        if let asset = background.asset, asset.name.hasPrefix("tmp:"), !ctx.dryRun {
+            background.asset = try await PageAdd.keep(temporary: asset, in: doc, ctx)
+        }
         return PageSpec(background: background, size: try PageSizeArg.parse(picked["size"]) ?? size)
+    }
+
+    /// A temporary asset ("tmp:<name>") stored in `doc`, read and stored off the main actor.
+    static func keep(temporary asset: AssetRef, in doc: DocumentID, _ ctx: CommandContext) async throws -> AssetRef {
+        let url = try await ctx.inputFile(asset.name)
+        let store = try ctx.services.require(ctx.services.assets, "the asset store")
+        let ext = url.pathExtension.isEmpty ? AssetRef(String(asset.name.dropFirst(4))).ext : url.pathExtension
+        return try await Task.detached(priority: .userInitiated) {
+            try store.put(Data(contentsOf: url), ext: ext.isEmpty ? "bin" : ext, doc: doc)
+        }.value
     }
 
     /// One page per PDF page from `pdfPage`, each sized like its PDF page (D-091: pages from a file into this document).
@@ -383,21 +400,19 @@ struct PageMoveTo: NibCommand {
         let chosen = try NewPageIDs.parse(id: nil, ids: p.ids, count: sources.count)
         // Every refusal comes before any bytes are copied.
         var plan = try MovePlan(sources, to: target, ids: chosen, ctx)
-        var maps: [DocumentID: AssetMap] = [:]
-        // Assets travel with the pages, copied off the main actor. A dry run (AI preview) copies nothing; its pages keep
-        // their references.
-        if !ctx.dryRun, plan.assets.contains(where: { !$0.assets.isEmpty }) {
+        var map = AssetMap()
+        // Assets travel with the pages, copied off the main actor in ONE job for every page that leaves, whichever
+        // document it leaves: a PDF behind several of them (the page sidebar's multi-page move) is cut once to the pages
+        // they show and written to the target once. A dry run (AI preview) copies nothing; its pages keep their
+        // references.
+        if !ctx.dryRun, !plan.assets.isEmpty {
             let store = try ctx.services.require(ctx.services.assets, "the asset store")
-            let jobs = plan.assets
-            maps = try await Task.detached(priority: .userInitiated) { () -> [DocumentID: AssetMap] in
+            let assets = plan.assets
+            let pdfUse = plan.pdfUse
+            map = try await Task.detached(priority: .userInitiated) { () -> AssetMap in
                 // Everything is read first: a file that is there but unreadable stops the move before anything is stored.
-                let filled = try jobs.map { job in
-                    try (doc: job.doc, assets: AssetTransfer.fill(job.assets, pdfUse: job.pdfUse, skipping: target,
-                                                                  store: store, strict: true))
-                }
-                var out: [DocumentID: AssetMap] = [:]
-                for job in filled { out[job.doc] = try AssetTransfer.install(job.assets, into: target, store: store) }
-                return out
+                let filled = try AssetTransfer.fill(assets, pdfUse: pdfUse, for: target, store: store, strict: true)
+                return try AssetTransfer.install(filled, into: target, store: store)
             }.value
             // The documents may have changed while the bytes were copied: plan again from their current state.
             plan = try MovePlan(sources, to: target, ids: chosen, ctx)
@@ -413,7 +428,6 @@ struct PageMoveTo: NibCommand {
                     try tx.put(page, doc: target)
                     continue
                 }
-                let map = maps[m.doc] ?? AssetMap()
                 let original = try tx.items(m.doc, page: m.page.id)
                 let items = ItemCloner.clone(AssetRefs.rewriting(original, map.names), freshIDs: m.freshItems)
                 let page = PageFactory.fitted(PageFactory.copy(of: AssetRefs.rewriting(m.page, map), id: m.newID, order: plan.keys[i]),
@@ -438,8 +452,10 @@ struct MovePlan {
     /// In the order given; pages already in the target only move to its end.
     let moving: [(doc: DocumentID, page: PageRecord, newID: PageID, freshItems: Bool)]
     let keys: [String]
-    /// Per source document: the assets its leaving pages use, and the PDF pages in use.
-    let assets: [(doc: DocumentID, assets: [PagesPayload.Asset], pdfUse: [String: [Int]])]
+    /// The assets the leaving pages use, each once with a document that holds it (names are content hashes, so a PDF
+    /// two source documents share is one asset), and the PDF pages in use across every leaving page.
+    let assets: [PagesPayload.Asset]
+    let pdfUse: [String: [Int]]
     /// Per source document: old page id → id in the target.
     let movedIDs: [DocumentID: [PageID: PageID]]
 
@@ -484,21 +500,24 @@ struct MovePlan {
             movedIDs[r.doc, default: [:]][r.page.id] = newID
         }
 
-        var assets: [(doc: DocumentID, assets: [PagesPayload.Asset], pdfUse: [String: [Int]])] = []
-        for doc in leaving.keys.sorted() {
-            let pages = records.filter { $0.doc == doc }.map { $0.page }
-            var items: [Item] = []
-            for page in pages { items += try ctx.workspace.items(doc, page: page.id) }
-            let names = pages.reduce(AssetRefs.names(in: items)) { $0.union(AssetRefs.names(of: $1)) }
-            assets.append((doc, names.sorted().map { PagesPayload.Asset(name: $0, data: nil, pdfPages: nil, doc: doc) },
-                           AssetRefs.pdfPagesInUse(pages, items: items)))
+        var owners: [String: DocumentID] = [:]
+        var leavingPages: [PageRecord] = []
+        var leavingItems: [Item] = []
+        for r in records where r.doc != target {
+            let items = try ctx.workspace.items(r.doc, page: r.page.id)
+            for name in AssetRefs.names(of: r.page).union(AssetRefs.names(in: items)) where owners[name] == nil {
+                owners[name] = r.doc
+            }
+            leavingPages.append(r.page)
+            leavingItems += items
         }
 
         let staying = targetContent.livePages.filter { page in !records.contains { $0.doc == target && $0.page.id == page.id } }
         self.targetKind = targetContent.meta.kind
         self.moving = moving
-        self.keys = OrderKeys.between(staying.last?.order, nil, count: records.count)
-        self.assets = assets
+        self.keys = FractionalIndex.balanced(count: records.count, after: staying.last?.order)
+        self.assets = owners.keys.sorted().map { PagesPayload.Asset(name: $0, data: nil, pdfPages: nil, doc: owners[$0]) }
+        self.pdfUse = AssetRefs.pdfPagesInUse(leavingPages, items: leavingItems)
         self.movedIDs = movedIDs
     }
 }
@@ -551,7 +570,7 @@ struct PageReorder: NibCommand {
         }
         let position: PagePosition = p.before != nil ? .before : (p.after != nil ? .after : .end)
         let bounds = OrderKeys.bounds(position, anchor: anchor?.page, in: remaining)
-        let keys = OrderKeys.between(bounds.lo, bounds.hi, count: records.count)
+        let keys = FractionalIndex.balanced(count: records.count, after: bounds.lo, before: bounds.hi)
         try ctx.mutate { tx in
             for (i, record) in records.enumerated() {
                 var page = record
@@ -601,7 +620,7 @@ struct PageRotate: NibCommand {
             let doc: DocumentID
             switch all {
             case .string(let ref): doc = NodeRef.documentID(from: ref)
-            case .bool: doc = try PageArgs.document(nil, ctx, path: "$.all")
+            case .bool: doc = try PageArgs.document(nil, ctx, field: "all")
             default: throw NibError.invalid("all must be a doc ref or true", path: "$.all")
             }
             let content = try PageArgs.pagedContent(doc, ctx, path: "$.all")
@@ -749,14 +768,12 @@ struct PagePurge: NibCommand {
 
 @MainActor
 enum PageArgs {
-    /// The `doc` param, else the invoking window's open document.
-    static func document(_ ref: String?, _ ctx: CommandContext, path: String = "$.doc") throws -> DocumentID {
-        if let ref, !ref.isEmpty { return NodeRef.documentID(from: ref) }
-        if let doc = ctx.activeSession?.document {
-            try unlocked(doc, ctx, path: path)
-            return doc
-        }
-        throw NibError(.invalidParams, "no document given and none is open", path: path, hint: "pass doc, e.g. \"doc:<id>\"")
+    /// The `doc` param, else the invoking window's open document (`ctx.documentOrSession`, §6.1 session defaults). The
+    /// gateway checks locks only on documents named in the params, so one taken from the window is checked here.
+    static func document(_ ref: String?, _ ctx: CommandContext, field: String = "doc") throws -> DocumentID {
+        let doc = try ctx.documentOrSession(ref, field: field)
+        if ref?.isEmpty ?? true { try unlocked(doc, ctx, path: "$." + field) }
+        return doc
     }
 
     /// The gateway refuses locked documents named in the params; a document taken from the open window is checked here.
@@ -951,20 +968,23 @@ enum PagePasting {
         let chosen = try NewPageIDs.parse(id: id, ids: ids, count: payload.pages.count)
         try NewPageIDs.checkUnused(chosen, in: ctx.workspace.content(doc))
         let intoSource = payload.source == NodeRef.document(doc).description
-        // Back in its own document a page keeps its references; anywhere else its PDF page must travel with it.
-        if !intoSource, let gap = payload.missingPDFPages.first {
+        // Back in its own document a page keeps its references; anywhere else its PDF page must travel with it, unless
+        // this document already holds that PDF (same name, same bytes).
+        let store = ctx.services.assets
+        let held = intoSource ? [] : Set(payload.assets.map { $0.name }.filter { store?.url(AssetRef($0), doc: doc) != nil })
+        if !intoSource, let gap = payload.missingPDFPages(held: held).first {
             throw NibError(.invalidParams,
                            "page \(gap.page.raw) shows PDF page \(gap.pdfPage) of \(gap.asset), which the payload's assets do not carry",
                            hint: "list every PDF page the pages show in that asset's pdfPages, or include the whole PDF")
         }
         var map = AssetMap()
         if !ctx.dryRun, !payload.assets.isEmpty, !intoSource {
-            let store = try ctx.services.require(ctx.services.assets, "the asset store")
+            let assetStore = try ctx.services.require(store, "the asset store")
             let assets = payload.assets
             let pdfUse = payload.pdfUse
             map = try await Task.detached(priority: .userInitiated) {
-                try AssetTransfer.install(AssetTransfer.fill(assets, pdfUse: pdfUse, skipping: doc, store: store, strict: false),
-                                          into: doc, store: store)
+                try AssetTransfer.install(AssetTransfer.fill(assets, pdfUse: pdfUse, for: doc, store: assetStore, strict: false),
+                                          into: doc, store: assetStore)
             }.value
         }
         // The document may have changed while the assets were copied: place the pages in it as it is now.
@@ -1055,56 +1075,6 @@ enum NewPageIDs {
 }
 
 enum OrderKeys {
-    private static let digits = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
-
-    /// `count` increasing keys strictly between `lo` and `hi` (nil = unbounded). Several keys are spread evenly over
-    /// the gap at the smallest width that fits them (the same base-62 digits as `FractionalIndex`), so a 2000-page
-    /// import gets keys a few characters long instead of a chain that grows by one character every few pages.
-    static func between(_ lo: String?, _ hi: String?, count: Int) -> [String] {
-        guard count > 1 else { return count == 1 ? [FractionalIndex.between(lo, hi)] : [] }
-        let a = Array(lo ?? "")
-        let b = hi.map { Array($0) }
-        var shared = 0
-        if let b { while shared < a.count, shared < b.count, a[shared] == b[shared] { shared += 1 } }
-        let prefix = String(a[0..<shared])
-        let low = Array(a[shared...])
-        let high = b.map { Array($0[shared...]) }
-        // Width w: the keys are w-digit numbers strictly between lo and hi read as w-digit numbers.
-        // ponytail: up to 8 digits past the common prefix (Int arithmetic); longer gaps chain as FractionalIndex does.
-        for width in 1...8 {
-            let lower = value(low, width)
-            let upper = high.map { value($0, width) + ($0.count > width ? 1 : 0) } ?? power(width)
-            let gap = upper - lower
-            guard gap > count else { continue }
-            return (1...count).map { i in
-                var v = lower + i * gap / (count + 1)
-                var key: [Character] = []
-                for _ in 0..<width {
-                    key.insert(digits[v % 62], at: 0)
-                    v /= 62
-                }
-                // A trailing "0" would leave no key between it and its prefix.
-                while key.last == "0" { key.removeLast() }
-                return prefix + String(key)
-            }
-        }
-        var out: [String] = []
-        var last = lo
-        for _ in 0..<count {
-            let key = FractionalIndex.between(last, hi)
-            out.append(key)
-            last = key
-        }
-        return out
-    }
-
-    /// The first `width` digits of `key` as a number (missing digits are 0).
-    private static func value(_ key: [Character], _ width: Int) -> Int {
-        (0..<width).reduce(0) { v, i in v * 62 + (i < key.count ? digits.firstIndex(of: key[i]) ?? 0 : 0) }
-    }
-
-    private static func power(_ width: Int) -> Int { (0..<width).reduce(1) { v, _ in v * 62 } }
-
     /// The neighbours a page inserted at `position` sits between (`pages` live, in order), as `orderKey` places it.
     static func bounds(_ position: PagePosition, anchor: PageID?, in pages: [PageRecord]) -> (lo: String?, hi: String?) {
         switch position {
@@ -1119,11 +1089,12 @@ enum OrderKeys {
         }
     }
 
-    /// Keys for `count` consecutive new pages: one from `DocumentContent.orderKey`, several spread over the same gap.
+    /// Keys for `count` consecutive new pages: one from `DocumentContent.orderKey`, several spread over the same gap by
+    /// `FractionalIndex.balanced` (contracts-v2 G23), so a 2000-page PDF import gets keys a few characters long.
     static func keys(_ position: PagePosition, anchor: PageID?, count: Int, in content: DocumentContent) -> [String] {
         guard count > 1 else { return count == 1 ? [content.orderKey(position, relativeTo: anchor)] : [] }
         let gap = bounds(position, anchor: anchor, in: content.livePages)
-        return between(gap.lo, gap.hi, count: count)
+        return FractionalIndex.balanced(count: count, after: gap.lo, before: gap.hi)
     }
 }
 

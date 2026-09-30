@@ -105,10 +105,10 @@ enum PageMenuTarget {
         return .object(o)
     }
 
-    /// `panel.open` of the Move Pages sheet with the pages it moves (`PanelContext.params["pages"]`), the same way the
-    /// page sidebar (F023) opens it for a selection.
+    /// `panel.open {id: PanelIDs.movePages, pages}`: the Move Pages sheet with the pages it moves
+    /// (`PanelContext.params["pages"]`, contracts-v2.1), the same call the page sidebar (F023) makes for a selection.
     static func moveParams(_ ctx: MenuContext) -> JSONValue {
-        .object(["id": .string(PageDialogs.movePagesID), "pages": .array(refs(ctx).map { JSONValue.string($0) })])
+        .object(["id": .string(PanelIDs.movePages), "pages": .array(refs(ctx).map { JSONValue.string($0) })])
     }
 }
 
@@ -116,13 +116,17 @@ enum PageMenuTarget {
 enum PageMenus {
     static let owner = FeatPagesFeature.id
     static let goToPageKey = "pages.goToPage"
+    static let goToPageShortcut = KeyShortcut("g", [.command, .option])
 
     static func register(_ app: NibApp) {
         registerAddPage(app.ui.menus)
         registerDocumentMore(app.ui.menus)
-        app.content.keyCommands.register(KeyCommandDescriptor(
-            id: goToPageKey, title: String(localized: "Go to Page"), shortcut: KeyShortcut("g", [.command, .option]),
-            command: CommandIDs.panelOpen, params: ["id": .string(PageDialogs.goToPageID)], scope: .document, owner: owner))
+        // ⌥⌘G, live only in notebooks (the only documents Go to Page serves), so it never shadows another kind's key.
+        var key = KeyCommandDescriptor(
+            id: goToPageKey, title: String(localized: "Go to Page"), shortcut: goToPageShortcut,
+            command: CommandIDs.panelOpen, params: ["id": .string(PageDialogs.goToPageID)], scope: .document, owner: owner)
+        key.docKinds = [.notebook]
+        app.content.keyCommands.register(key)
     }
 
     // MARK: Add Page (+): the ticked place (Before / After / Last), then Current Template, Choose Template, Import, Paste
@@ -155,8 +159,8 @@ enum PageMenus {
             params: { PageMenus.plan($0)?.importPanel ?? ["id": .string(PageDialogs.importID)] },
             isVisible: { PageMenus.isNotebook($0) }))
         menus.register(MenuItemDescriptor(
-            id: "pages.add.paste", title: String(localized: "Paste Pages"),
-            location: .addPage, order: 203, owner: owner, command: "page.paste",
+            id: "pages.add.paste", title: String(localized: "Paste Pages"), icon: NibSymbol.paste.name,
+            location: .addPage, order: 203, owner: owner, command: CommandIDs.pagePaste,
             params: { PageMenus.plan($0)?.paste ?? [:] },
             isVisible: { PageMenus.isNotebook($0) && PageClipboard.hasPages }))
     }
@@ -169,17 +173,18 @@ enum PageMenus {
         let visible: @MainActor (MenuContext) -> Bool = { ctx in
             PageMenus.isNotebook(ctx) && !PageMenuTarget.refs(ctx).isEmpty
         }
-        let actions: [(key: String, title: String, command: String, degrees: Int?)] = [
-            ("copy", String(localized: "Copy"), "page.copy", nil),
-            ("duplicate", String(localized: "Duplicate"), "page.duplicate", nil),
-            ("rotateClockwise", String(localized: "Rotate Clockwise"), "page.rotate", 90),
-            ("rotateAnticlockwise", String(localized: "Rotate Anticlockwise"), "page.rotate", 270)
+        // ponytail: no NibSymbol rotate glyph yet (a NibDesign gap), so the rotate entries have no icon.
+        let actions: [(key: String, title: String, icon: String?, command: String, degrees: Int?)] = [
+            ("copy", String(localized: "Copy"), NibSymbol.copy.name, CommandIDs.pageCopy, nil),
+            ("duplicate", String(localized: "Duplicate"), NibSymbol.duplicate.name, CommandIDs.pageDuplicate, nil),
+            ("rotateClockwise", String(localized: "Rotate Clockwise"), nil, CommandIDs.pageRotate, 90),
+            ("rotateAnticlockwise", String(localized: "Rotate Anticlockwise"), nil, CommandIDs.pageRotate, 270)
         ]
         for (i, action) in actions.enumerated() {
             let degrees = action.degrees
             menus.register(MenuItemDescriptor(
-                id: "pages.documentMore." + action.key, title: action.title, location: .documentMore, order: 400 + i,
-                owner: owner, command: action.command, params: { PageMenuTarget.params($0, degrees: degrees) },
+                id: "pages.documentMore." + action.key, title: action.title, icon: action.icon, location: .documentMore,
+                order: 400 + i, owner: owner, command: action.command, params: { PageMenuTarget.params($0, degrees: degrees) },
                 isVisible: visible, submenu: thisPage))
         }
         menus.register(MenuItemDescriptor(
@@ -188,15 +193,17 @@ enum PageMenus {
             params: { PageMenuTarget.moveParams($0) }, isVisible: visible, submenu: thisPage))
         menus.register(MenuItemDescriptor(
             id: "pages.documentMore.trash", title: String(localized: "Move to Trash"), icon: NibSymbol.trash.name,
-            location: .documentMore, order: 409, owner: owner, command: "page.trash",
+            location: .documentMore, order: 409, owner: owner, command: CommandIDs.pageTrash,
             params: { PageMenuTarget.params($0) }, isVisible: visible, destructive: true, submenu: thisPage))
-        menus.register(MenuItemDescriptor(
+        var goToPage = MenuItemDescriptor(
             id: "pages.documentMore.goToPage", title: String(localized: "Go to Page…"), icon: NibSymbol.pages.name,
             location: .documentMore, order: 380, owner: owner, command: CommandIDs.panelOpen,
-            params: { _ in ["id": .string(PageDialogs.goToPageID)] }, isVisible: { PageMenus.isNotebook($0) }))
+            params: { _ in ["id": .string(PageDialogs.goToPageID)] }, isVisible: { PageMenus.isNotebook($0) })
+        goToPage.shortcut = goToPageShortcut
+        menus.register(goToPage)
         menus.register(MenuItemDescriptor(
             id: "pages.documentMore.rotateAll", title: String(localized: "Rotate All Pages"),
-            location: .documentMore, order: 390, owner: owner, command: "page.rotate",
+            location: .documentMore, order: 390, owner: owner, command: CommandIDs.pageRotate,
             params: { ctx in
                 guard let doc = ctx.doc ?? ctx.session?.document else { return [:] }
                 return ["all": .string(NodeRef.document(doc).description)]

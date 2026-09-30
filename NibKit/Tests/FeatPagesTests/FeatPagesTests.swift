@@ -25,9 +25,19 @@ final class FeatPagesTests: XCTestCase {
         let key = h.app.content.keyCommands.get(PageMenus.goToPageKey)
         XCTAssertEqual(key?.shortcut, KeyShortcut("g", [.command, .option]))
         XCTAssertEqual(key?.params["id"]?.stringValue, PageDialogs.goToPageID)
-        XCTAssertNotNil(h.app.ui.panels.get(PageDialogs.goToPageID))
-        XCTAssertNotNil(h.app.ui.panels.get(PageDialogs.movePagesID))
-        XCTAssertNotNil(h.app.ui.panels.get(PageDialogs.importID))
+        XCTAssertEqual(key?.docKinds, [.notebook], "⌥⌘G is live only where Go to Page works")
+        let notebook = KeyCommandContext(inDocument: true, docKind: .notebook)
+        XCTAssertTrue(key?.isActive(in: notebook) ?? false)
+        XCTAssertFalse(key?.isActive(in: KeyCommandContext(inDocument: true, docKind: .textDocument)) ?? true)
+        XCTAssertFalse(key?.isActive(in: KeyCommandContext(inDocument: false, docKind: nil, hasTabs: true)) ?? true,
+                       "never in the library, even with tabs open")
+        // The Move Pages sheet is the contracts-v2.1 well-known panel, so F023 and plugins open it by PanelIDs.
+        XCTAssertEqual(PageDialogs.movePagesID, PanelIDs.movePages)
+        for id in [PageDialogs.goToPageID, PanelIDs.movePages, PageDialogs.importID] {
+            let panel = try? XCTUnwrap(h.app.ui.panels.get(id))
+            XCTAssertEqual(panel?.placement, .sheet, id)
+            XCTAssertEqual(panel?.providesHeader, true, "\(id) draws its own sheet header; the chrome adds none")
+        }
         XCTAssertNotNil(h.app.settings.descriptor(AddPagePosition.key.name), "the Add Page position is a declared setting")
     }
 
@@ -110,8 +120,14 @@ final class FeatPagesTests: XCTestCase {
         let rotate = items.first { $0.id == "pages.documentMore.rotateAnticlockwise" }
         XCTAssertEqual(rotate?.params(ctx)["degrees"]?.intValue, 270)
         let move = items.first { $0.id == "pages.documentMore.move" }
-        XCTAssertEqual(move?.params(ctx)["id"]?.stringValue, PageDialogs.movePagesID)
+        XCTAssertEqual(move?.params(ctx)["id"]?.stringValue, PanelIDs.movePages)
         XCTAssertEqual(move?.params(ctx)["pages"], pages, "the sheet is told which page to move")
+        XCTAssertEqual(items.first { $0.id == "pages.documentMore.copy" }?.command, CommandIDs.pageCopy)
+        // NibDesign v2's copy and duplicate glyphs (NibSymbol.copy / .duplicate).
+        XCTAssertEqual(items.first { $0.id == "pages.documentMore.copy" }?.icon, "doc.on.doc")
+        XCTAssertEqual(items.first { $0.id == "pages.documentMore.duplicate" }?.icon, "plus.square.on.square")
+        let goTo = items.first { $0.id == "pages.documentMore.goToPage" }
+        XCTAssertEqual(goTo?.shortcut, PageMenus.goToPageShortcut, "the menu shows the ⌥⌘G key")
         let board = MenuContext(app: h.app, session: h.session, doc: Fixtures.whiteboardID, page: Fixtures.boardID)
         XCTAssertFalse(h.app.ui.menuItems(.documentMore, board).contains { $0.id == "pages.documentMore.trash" })
     }
@@ -134,8 +150,14 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertEqual(MovePagesSelection.refs(["pages": ["page:FIXTUREDOC01/FIXTUREPG001", "page:FIXTUREDOC01/FIXTUREPG001"]],
                                                openDoc: open.doc, openPage: open.page),
                        ["page:FIXTUREDOC01/FIXTUREPG001"], "each page once")
-        XCTAssertEqual(MovePagesSelection.refs(["params": ["pages": ["FIXTUREPG003"]]], openDoc: open.doc, openPage: open.page),
-                       ["page:FIXTUREDOC01/FIXTUREPG003"], "nested params and bare ids in the open document")
+        XCTAssertEqual(MovePagesSelection.refs(["pages": ["FIXTUREPG003"]], openDoc: open.doc, openPage: open.page),
+                       ["page:FIXTUREDOC01/FIXTUREPG003"], "bare ids are pages of the open document")
+        // Pages from two documents (a plugin or the AI may name any): both are sources, never offered as the target.
+        var mixed = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+        mixed.params = ["pages": ["page:FIXTUREDOC01/FIXTUREPG001", "page:FIXTUREDOC04/FIXTUREBRD01"]]
+        let both = MovePagesSheet(context: mixed)
+        XCTAssertEqual(both.pages.count, 2)
+        XCTAssertFalse(both.candidates.contains { $0.id == Fixtures.docID || $0.id == Fixtures.whiteboardID })
         XCTAssertEqual(MovePagesSelection.refs(["pages": "page:FIXTUREDOC01/FIXTUREPG001"], openDoc: open.doc, openPage: open.page),
                        ["page:FIXTUREDOC01/FIXTUREPG001"])
         XCTAssertEqual(MovePagesSelection.refs(["pages": [], "id": "x"], openDoc: open.doc, openPage: open.page), [],
@@ -179,35 +201,48 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertThrowsError(try BackgroundArg.parse(["kind": "nonsense"]))
     }
 
+    private func notebook(_ orders: [String]) -> DocumentContent {
+        DocumentContent(meta: DocumentMeta(kind: .notebook),
+                        pages: orders.enumerated().map { PageRecord(id: NibID("P\($0.offset + 1)"), order: $0.element) })
+    }
+
     func testOrderKeysStayBetweenTheirNeighbours() {
-        let pages = [PageRecord(id: "P1", order: "V"), PageRecord(id: "P2", order: "k")]
-        let bounds = OrderKeys.bounds(.after, anchor: "P1", in: pages)
+        let content = notebook(["V", "k"])
+        let bounds = OrderKeys.bounds(.after, anchor: "P1", in: content.livePages)
         XCTAssertEqual(bounds.lo, "V")
         XCTAssertEqual(bounds.hi, "k")
-        let keys = OrderKeys.between(bounds.lo, bounds.hi, count: 5)
+        let keys = OrderKeys.keys(.after, anchor: "P1", count: 5, in: content)
         XCTAssertEqual(keys, keys.sorted())
         XCTAssertEqual(Set(keys).count, 5)
         XCTAssertTrue(keys.allSatisfy { $0 > "V" && $0 < "k" })
-        XCTAssertEqual(OrderKeys.between("V", "k", count: 1), [FractionalIndex.between("V", "k")])
-        XCTAssertEqual(OrderKeys.bounds(.start, anchor: nil, in: pages).hi, "V")
-        XCTAssertEqual(OrderKeys.bounds(.before, anchor: "missing", in: pages).lo, "k", "an unknown anchor means the end")
+        XCTAssertEqual(OrderKeys.keys(.after, anchor: "P1", count: 1, in: content), [content.orderKey(.after, relativeTo: "P1")])
+        XCTAssertEqual(OrderKeys.bounds(.start, anchor: nil, in: content.livePages).hi, "V")
+        XCTAssertEqual(OrderKeys.bounds(.before, anchor: "missing", in: content.livePages).lo, "k", "an unknown anchor means the end")
     }
 
     func testBulkOrderKeysStayShortAndIncreasing() {
-        // A 2000-page PDF imported at the end, between neighbours, and between keys sharing a prefix.
-        let gaps: [(lo: String?, hi: String?)] = [("t", nil), ("V", "k"), ("Vzzz", "W"), ("abc1", "abc2"), (nil, "0001")]
-        for gap in gaps {
-            let label = (gap.lo ?? "nil") + "…" + (gap.hi ?? "nil")
-            let keys = OrderKeys.between(gap.lo, gap.hi, count: PageCommands.maxNewPages)
+        // A 2000-page PDF imported at the end, between neighbours, and between keys sharing a prefix
+        // (FractionalIndex.balanced, contracts-v2 G23, instead of a key chain that grows every few pages).
+        let places: [(orders: [String], position: PagePosition, anchor: PageID?, lo: String?, hi: String?)] = [
+            (["t"], .end, nil, "t", nil),
+            (["V", "k"], .after, "P1", "V", "k"),
+            (["Vzzz", "W"], .before, "P2", "Vzzz", "W"),
+            (["abc1", "abc2"], .after, "P1", "abc1", "abc2"),
+            (["0001"], .start, nil, nil, "0001")
+        ]
+        for place in places {
+            let label = (place.lo ?? "nil") + "…" + (place.hi ?? "nil")
+            let keys = OrderKeys.keys(place.position, anchor: place.anchor, count: PageCommands.maxNewPages,
+                                      in: notebook(place.orders))
             XCTAssertEqual(keys.count, PageCommands.maxNewPages, label)
             XCTAssertEqual(Set(keys).count, keys.count, label)
             XCTAssertEqual(keys, keys.sorted(), label)
-            XCTAssertTrue(keys.allSatisfy { key in key > (gap.lo ?? "") && gap.hi.map { key < $0 } ?? true }, label)
+            XCTAssertTrue(keys.allSatisfy { key in key > (place.lo ?? "") && place.hi.map { key < $0 } ?? true }, label)
             XCTAssertFalse(keys.contains { $0.hasSuffix("0") }, label)
-            // Two digits past the longer neighbour always fit 2000 keys (62 × 62 > 2001).
-            XCTAssertLessThanOrEqual(keys.map { $0.count }.max() ?? 0, max(gap.lo?.count ?? 0, gap.hi?.count ?? 0) + 2, label)
+            XCTAssertLessThanOrEqual(keys.map { $0.count }.max() ?? 0, max(place.lo?.count ?? 0, place.hi?.count ?? 0) + 2, label)
         }
-        XCTAssertLessThanOrEqual(OrderKeys.between("t", nil, count: PageCommands.maxNewPages).map { $0.count }.max() ?? 0, 4)
+        let appended = OrderKeys.keys(.end, anchor: nil, count: PageCommands.maxNewPages, in: notebook(["t"]))
+        XCTAssertLessThanOrEqual(appended.map { $0.count }.max() ?? 0, 4)
     }
 
     func testCurrentTemplateSkipsCoversPDFsAndPhotos() {
@@ -260,6 +295,21 @@ final class FeatPagesTests: XCTestCase {
         let tall = ImagePageSize.fit(width: 1000, height: 2000)
         XCTAssertEqual(tall.height, PageSize.a4.height, accuracy: 0.001)
         XCTAssertEqual(tall.width, PageSize.a4.height / 2, accuracy: 0.001)
+    }
+
+    func testSidebarPayloadFormatRule() throws {
+        // The rule the page sidebar (F023) applies to drops: nib-pages/1 and its minor revisions, never a newer major.
+        func usable(_ format: String) -> Bool {
+            PagesPayload.decode(Data(#"{"format": "\#(format)", "pages": [{"page": {"id": "P1", "order": "V"}}]}"#.utf8)) != nil
+        }
+        XCTAssertTrue(usable("nib-pages/1"))
+        XCTAssertTrue(usable("nib-pages/1.3"))
+        XCTAssertFalse(usable("nib-pages/2"))
+        XCTAssertFalse(usable("nib-pages/10"), "a newer major version, not a revision of 1")
+        XCTAssertNil(PagesPayload.decode(Data(#"{"format": "nib-pages/1", "pages": []}"#.utf8)), "no pages, nothing to paste")
+        let bare = try XCTUnwrap(PagesPayload.decode(Data(#"{"pages": [{"page": {"id": "P1", "order": "V"}}]}"#.utf8)))
+        XCTAssertEqual(bare.format, PagesPayload.currentFormat, "a payload without a format is read as nib-pages/1")
+        XCTAssertEqual(bare.pages.first?.items, [], "items may be left out")
     }
 
     func testAssetReferencesAreFoundAndRenamedByItemKind() {

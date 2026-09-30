@@ -6,33 +6,37 @@ import NibDesign
 
 // The page sheets: Go to Page (⌥⌘G, More › Go to Page…), Move Pages (Move to Another Notebook…) and Add Page ›
 // Import… (the system document picker). All are opened with panel.open, act through commands, and are opaque sheets:
-// no droplets on sheets (DESIGN.md §2.4, §10.15). What a sheet acts on arrives as `PanelContext.params`.
+// no droplets on sheets (DESIGN.md §2.4, §10.15). What a sheet acts on arrives as `PanelContext.params` (the flat
+// `panel.open` keys but `id` and `edge`, §6.1). Each draws its own header (a `NibSheetHeader`, or the system picker's),
+// so each declares `providesHeader` and the chrome adds none.
 
 @MainActor
 enum PageDialogs {
     static let goToPageID = "pages.goToPage"
-    /// `panel.open {id: "pages.movePages", pages?: ["page:D/P", …]}`: moves exactly those pages (default: the open page).
-    static let movePagesID = "pages.movePages"
+    /// `panel.open {id: PanelIDs.movePages, pages?: ["page:D/P", …]}` (contracts-v2.1): moves exactly those pages
+    /// (default: the open page).
+    static let movePagesID = PanelIDs.movePages
     /// `panel.open {id: "pages.import", doc?, position?, anchor?}`: where the picked files go (default: the open
     /// document, at the Add Page position relative to the open page).
     static let importID = "pages.import"
 
     static func register(_ app: NibApp) {
-        app.ui.panels.register(PanelDescriptor(
-            id: goToPageID, title: String(localized: "Go to Page"), icon: NibSymbol.pages.name, placement: .sheet,
-            order: 900, owner: FeatPagesFeature.id, docKinds: [.notebook]) { context in
-                AnyView(GoToPageDialog(context: context))
-            })
-        app.ui.panels.register(PanelDescriptor(
-            id: movePagesID, title: String(localized: "Move Pages"), icon: NibSymbol.notebook.name, placement: .sheet,
-            order: 901, owner: FeatPagesFeature.id, docKinds: [.notebook, .whiteboard]) { context in
-                AnyView(MovePagesSheet(context: context))
-            })
-        app.ui.panels.register(PanelDescriptor(
-            id: importID, title: String(localized: "Import"), icon: NibSymbol.importFile.name,
-            placement: .sheet, order: 902, owner: FeatPagesFeature.id, docKinds: [.notebook]) { context in
-                AnyView(ImportPagesSheet(context: context))
-            })
+        func sheet(_ id: String, _ title: String, _ icon: NibSymbol, order: Int, kinds: Set<DocumentKind>,
+                   _ make: @escaping @MainActor (PanelContext) -> AnyView) {
+            var panel = PanelDescriptor(id: id, title: title, icon: icon.name, placement: .sheet, order: order,
+                                        owner: FeatPagesFeature.id, docKinds: kinds, makeView: make)
+            panel.providesHeader = true
+            app.ui.panels.register(panel)
+        }
+        sheet(goToPageID, String(localized: "Go to Page"), .pages, order: 900, kinds: [.notebook]) {
+            AnyView(GoToPageDialog(context: $0))
+        }
+        sheet(movePagesID, String(localized: "Move Pages"), .notebook, order: 901, kinds: [.notebook, .whiteboard]) {
+            AnyView(MovePagesSheet(context: $0))
+        }
+        sheet(importID, String(localized: "Import"), .importFile, order: 902, kinds: [.notebook]) {
+            AnyView(ImportPagesSheet(context: $0))
+        }
     }
 }
 
@@ -169,11 +173,12 @@ struct GoToPageDialog: View {
 
 /// The pages the Move Pages sheet moves.
 enum MovePagesSelection {
-    /// `PanelContext.params["pages"]` (page refs; a bare page id is read in the open document; `{params: {pages}}` is
-    /// read too), exactly those and in that order. Without the key, the open page. Unusable entries are left out, so
-    /// a selection that names nothing movable moves nothing (it never falls back to the open page).
+    /// `PanelContext.params["pages"]` (page refs; a bare page id is read in the open document), exactly those and in
+    /// that order. The chrome flattens `panel.open {id, params: {pages}}` into the same key (§6.1). Without the key,
+    /// the open page. Unusable entries are left out, so a selection that names nothing movable moves nothing (it never
+    /// falls back to the open page).
     static func refs(_ params: JSONValue, openDoc: DocumentID?, openPage: PageID?) -> [String] {
-        guard let given = params["pages"] ?? params["params"]?["pages"] else {
+        guard let given = params["pages"] else {
             guard let openDoc, let openPage else { return [] }
             return [NodeRef.page(openDoc, openPage).description]
         }
@@ -226,8 +231,10 @@ enum MovePagesTargets {
 @MainActor
 struct MovePagesSheet: View {
     let context: PanelContext
-    private let pages: [String]
-    private let candidates: [LibraryNode]
+    /// The page refs this sheet moves, in order.
+    let pages: [String]
+    /// Where they can go: other live notebooks and whiteboards, newest first.
+    let candidates: [LibraryNode]
     @State private var query = ""
 
     init(context: PanelContext) {
@@ -306,8 +313,10 @@ struct MovePagesSheet: View {
             if let lock = app.services.lock, lock.isLocked(node.id) {
                 guard await lock.unlock(node.id) else { return }
             }
-            app.perform("page.moveTo", ["pages": .array(refs.map { JSONValue.string($0) }),
-                                        "doc": .string(NodeRef.document(node.id).description)], session: session)
+            // Every page in ONE page.moveTo: one undo step (in either document), and a PDF behind several of them is
+            // cut and written once.
+            app.perform(CommandIDs.pageMoveTo, ["pages": .array(refs.map { JSONValue.string($0) }),
+                                                "doc": .string(NodeRef.document(node.id).description)], session: session)
             dismiss()
         }
     }

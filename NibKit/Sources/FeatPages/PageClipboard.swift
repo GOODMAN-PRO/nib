@@ -6,10 +6,12 @@ import NibContracts
 // MARK: - Payload
 
 /// The page clipboard: pages, their live items and the assets they reference, as JSON on the pasteboard under UTI
-/// `app.nib.pages` (the page-level sibling of the "nib-fragment/1" item fragment). The sidebar's drag between windows
-/// (F023) carries the same JSON, and `page.paste {payload}` accepts it directly. Asset bytes travel as base64 (`data`);
-/// a PDF used only as page backgrounds is cut down to the PDF pages in use, listed in `pdfPages` (source page numbers
-/// in the order they appear in `data`). Stroke points travel in the compact package form (`ptsB64`).
+/// `app.nib.pages` (the page-level sibling of the "nib-fragment/1" item fragment). The page sidebar's drag between
+/// windows (F023, FeatSidebar's own copy of this format) carries the same JSON, and `page.paste {payload}` accepts it
+/// directly. Asset bytes travel as base64 (`data`); a PDF used only as page backgrounds is cut down to the PDF pages in
+/// use, listed in `pdfPages` (source page numbers in the order they appear in `data`, any order). Stroke points travel
+/// in the compact package form (`ptsB64`); plain `pts` arrays decode too. ponytail: FeatSidebar keeps a byte-compatible
+/// copy of this type (no shared contract type yet); `testSidebarPayloadsPasteAsTheyAre` pins the shape both write.
 struct PagesPayload: Codable, Equatable {
     static let currentFormat = "nib-pages/1"
 
@@ -67,8 +69,11 @@ struct PagesPayload: Codable, Equatable {
         assets = try c.decodeIfPresent([Asset].self, forKey: .assets) ?? []
     }
 
-    /// Any "nib-pages/1…" payload with at least one page (a newer major format is refused).
-    var isUsable: Bool { format.hasPrefix("nib-pages/1") && !pages.isEmpty }
+    /// "nib-pages/1" or a minor revision of it ("nib-pages/1.2") with at least one page, the rule the page sidebar
+    /// applies to drops. A newer major format ("nib-pages/2", and "nib-pages/10") is refused.
+    var isUsable: Bool {
+        (format == PagesPayload.currentFormat || format.hasPrefix(PagesPayload.currentFormat + ".")) && !pages.isEmpty
+    }
 
     static func decode(_ data: Data) -> PagesPayload? {
         guard let p = try? JSONDecoder().decode(PagesPayload.self, from: data), p.isUsable else { return nil }
@@ -113,10 +118,11 @@ struct PagesPayload: Codable, Equatable {
     var pdfUse: [String: [Int]] { AssetRefs.pdfPagesInUse(pages.map { $0.page }, items: pages.flatMap { $0.items }) }
 
     /// Pages showing a PDF page that the payload's bytes do not hold: the PDF travels only as cuts (`pdfPages`) and
-    /// none of them has that page. Pasted into another document they would point at a PDF page that is not there.
-    var missingPDFPages: [(page: PageID, asset: String, pdfPage: Int)] {
+    /// none of them has that page. Pasted into another document they would point at a PDF page that is not there,
+    /// unless that document already holds the whole file (`held`: asset names are content hashes).
+    func missingPDFPages(held: Set<String> = []) -> [(page: PageID, asset: String, pdfPage: Int)] {
         var carried: [String: Set<Int>] = [:]
-        var whole = Set<String>()
+        var whole = held
         for asset in assets where asset.data != nil {
             if let numbers = asset.pdfPages { carried[asset.name, default: []].formUnion(numbers) } else { whole.insert(asset.name) }
         }
@@ -215,8 +221,9 @@ struct AssetMap: Equatable {
     var pdfPages: [String: [Int: Int]] = [:]
 }
 
-/// The asset references pages and items hold: page backgrounds, images, tape patterns, rich-text attachments and
-/// custom display lists. Typed, so ink points and other item data are never walked.
+/// The asset references pages and items hold: page backgrounds, plus what items hold (images, tape patterns, rich-text
+/// attachments and custom display lists), read and rewritten through `NibFragment` (contracts-v2 G23), the walk the
+/// item clipboard and the page sidebar use too. Typed, so ink points and other item data are never walked.
 enum AssetRefs {
     static func names(of page: PageRecord) -> Set<String> {
         guard let name = page.background.asset?.name, !name.isEmpty else { return [] }
@@ -226,40 +233,9 @@ enum AssetRefs {
     static func names(in items: [Item]) -> Set<String> {
         var out = Set<String>()
         for item in items {
-            var copy = item
-            visit(&copy) { ref in
-                if !ref.name.isEmpty { out.insert(ref.name) }
-                return ref
-            }
+            for ref in NibFragment.assetRefs(item) where !ref.name.isEmpty { out.insert(ref.name) }
         }
         return out
-    }
-
-    /// Calls `f` on every asset reference `item` holds and stores what it returns.
-    static func visit(_ item: inout Item, _ f: (AssetRef) -> AssetRef) {
-        if let a = item.image?.asset { item.image?.asset = f(a) }
-        if let a = item.stroke?.style.tapePattern { item.stroke?.style.tapePattern = f(a) }
-        if let t = item.text?.text { item.text?.text = visit(t, f) }
-        if let t = item.shape?.text { item.shape?.text = visit(t, f) }
-        if let t = item.sticky?.text { item.sticky?.text = visit(t, f) }
-        if let t = item.connector?.label { item.connector?.label = visit(t, f) }
-        if let ops = item.custom?.display.ops, ops.contains(where: { $0.asset != nil }) {
-            item.custom?.display.ops = ops.map { op in
-                var op = op
-                if let a = op.asset { op.asset = f(a) }
-                return op
-            }
-        }
-    }
-
-    private static func visit(_ text: RichText, _ f: (AssetRef) -> AssetRef) -> RichText {
-        var t = text
-        for p in t.paragraphs.indices {
-            for r in t.paragraphs[p].runs.indices {
-                if let a = t.paragraphs[p].runs[r].attrs.attachment { t.paragraphs[p].runs[r].attrs.attachment = f(a) }
-            }
-        }
-        return t
     }
 
     /// `items` with renamed assets (old → new).
@@ -267,7 +243,7 @@ enum AssetRefs {
         guard !names.isEmpty else { return items }
         return items.map { item in
             var item = item
-            visit(&item) { ref in names[ref.name].map { AssetRef($0) } ?? ref }
+            NibFragment.mapAssets(&item) { ref in names[ref.name].map { AssetRef($0) } ?? ref }
             return item
         }
     }
@@ -306,16 +282,19 @@ enum AssetRefs {
 /// Copies asset bytes into a document package. Blocking file and PDF work: callers run it in a detached task
 /// (`AssetStore` is thread-safe by contract).
 enum AssetTransfer {
-    /// `assets` with their bytes: as given, else read from the document that holds them (skipped when that is
-    /// `target`, where the references already work). PDFs in `pdfUse` are cut down to those pages. An asset that
-    /// cannot be read is left out and keeps its reference, unless `strict` (moves) and its file is there: then this
-    /// throws, before anything was stored.
-    static func fill(_ assets: [PagesPayload.Asset], pdfUse: [String: [Int]], skipping target: DocumentID? = nil,
+    /// `assets` with their bytes: as given, else read from the document that holds them. PDFs in `pdfUse` are cut
+    /// down to those pages, each PDF once however many pages show it. An asset `target` already holds is left out:
+    /// names are content hashes, so its references work there as they are, and nothing is read, cut or stored for it
+    /// (moving pages back into a document that has their PDF copies nothing). An asset that cannot be read is left out
+    /// and keeps its reference, unless `strict` (moves) and its file is there: then this throws, before anything was
+    /// stored.
+    static func fill(_ assets: [PagesPayload.Asset], pdfUse: [String: [Int]], for target: DocumentID? = nil,
                      store: AssetStore, strict: Bool) throws -> [PagesPayload.Asset] {
         var out: [PagesPayload.Asset] = []
         for var asset in assets {
+            if let target, asset.doc == target || store.url(AssetRef(asset.name), doc: target) != nil { continue }
             if asset.data == nil {
-                guard let doc = asset.doc, doc != target else { continue }
+                guard let doc = asset.doc else { continue }
                 let ref = AssetRef(asset.name)
                 if let pages = pdfUse[asset.name], let url = store.url(ref, doc: doc), let cut = PDFCut.pages(pages, of: url) {
                     asset.data = cut
@@ -403,23 +382,30 @@ enum PDFCut {
         return out.dataRepresentation()
     }
 
-    /// Several cuts of one PDF (each with its `pdfPages`) as one cut: every source page once, in first-seen order.
-    /// nil when a cut cannot be read or holds fewer pages than it lists.
+    /// Several cuts of one PDF (each with its `pdfPages`) as one cut: every source page once, in source page order
+    /// (the page sidebar's merge rule, so a drag and a paste of the same pages store the same bytes). nil when a cut
+    /// cannot be read or holds fewer pages than it lists.
     static func combine(_ cuts: [PagesPayload.Asset]) -> PagesPayload.Asset? {
         guard let name = cuts.first?.name else { return nil }
-        let out = PDFDocument()
-        var numbers: [Int] = []
-        var seen = Set<Int>()
+        var sources: [PDFDocument] = []
+        var chosen: [Int: PDFPage] = [:]
         for cut in cuts {
             guard let data = cut.data, let listed = cut.pdfPages, let pdf = PDFDocument(data: data), !pdf.isLocked,
                   pdf.pageCount >= listed.count else { return nil }
-            for (i, number) in listed.enumerated() where seen.insert(number).inserted {
+            sources.append(pdf)
+            for (i, number) in listed.enumerated() where chosen[number] == nil {
                 guard let page = pdf.page(at: i)?.copy() as? PDFPage else { return nil }
-                out.insert(page, at: out.pageCount)
-                numbers.append(number)
+                chosen[number] = page
             }
         }
-        guard let data = out.dataRepresentation() else { return nil }
+        let numbers = chosen.keys.sorted()
+        let out = PDFDocument()
+        for number in numbers {
+            guard let page = chosen[number] else { return nil }
+            out.insert(page, at: out.pageCount)
+        }
+        // The copied pages draw from their source documents until the combined PDF is written.
+        guard let data = withExtendedLifetime(sources, { out.dataRepresentation() }) else { return nil }
         return PagesPayload.Asset(name: name, data: data, pdfPages: numbers)
     }
 }
