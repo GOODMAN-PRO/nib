@@ -468,7 +468,7 @@ struct ImagePick: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "image.pick", title: "Choose Image",
-        summary: "Show a picker (photos, camera, scan, files, paste, playground) and insert the result on page at point, add it as pages of doc at position/anchor, replace ref, or seed Image Playground with refs; returns {refs}.",
+        summary: "Show a picker (photos, camera, scan, files, paste, playground); insert on page at point, add pages to doc, replace ref, or seed Image Playground with refs.",
         params: .obj([
             "source": .str("where the image comes from", choices: ImagePickSource.allCases.map { $0.rawValue }),
             "page": .ref,
