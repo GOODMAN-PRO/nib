@@ -110,10 +110,17 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         if let observer = keyObserver { NotificationCenter.default.removeObserver(observer) }
         keyObserver = nil
         guard let shell = shell, let app = NibApp.shared else { return }
+        // Hand over before the session goes, so `sessions.remove` never makes the newest session active on its own
+        // (with a `session.activated` for a window the user did not pick). A closing window that is not the active one
+        // leaves the active window as it is, and re-syncs its session when the two had drifted apart.
+        if app.ui.activeNavigator === shell || app.services.sessions.active === shell.session {
+            let current = app.ui.activeNavigator as? ShellViewController
+            let successor = current.flatMap { $0 === shell ? nil : $0 } ?? SceneDelegate.nextWindow(after: scene)
+            if current === shell { app.ui.activeNavigator = nil }
+            successor?.activateWindow()
+        }
         app.services.sessions.remove(shell.session)
-        guard app.ui.activeNavigator === shell else { return }
-        app.ui.activeNavigator = nil
-        SceneDelegate.nextWindow(after: scene)?.activateWindow()
+        ShellViewController.windowDidClose(shell)
     }
 
     func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
@@ -121,17 +128,14 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         return NibApp.shared?.ui.sceneHooks?.restorationActivity(shell)
     }
 
-    /// The window that takes over when `closed` goes away: the key window, else the most recently active session's,
-    /// else any foreground window.
+    /// The window that takes over when `closed` goes away: the key window, else the foreground window the user
+    /// activated most recently, else any foreground window (nil when no other window is in the foreground).
     private static func nextWindow(after closed: UIScene) -> ShellViewController? {
         let shells = UIApplication.shared.connectedScenes
             .filter { $0 !== closed && $0.activationState != .unattached && $0.activationState != .background }
             .compactMap { ($0.delegate as? SceneDelegate)?.shell }
         if let key = shells.first(where: { $0.isKeyWindow }) { return key }
-        if let active = NibApp.shared?.services.sessions.active, let owner = shells.first(where: { $0.session === active }) {
-            return owner
-        }
-        return shells.first
+        return ShellViewController.mostRecentlyActivated(among: shells) ?? shells.first
     }
 }
 

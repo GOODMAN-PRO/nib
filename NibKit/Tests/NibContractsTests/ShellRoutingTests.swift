@@ -10,6 +10,7 @@ final class ShellRoutingTests: XCTestCase {
     private let notebook = KeyCommandContext(docKind: .notebook)
     private let textDocument = KeyCommandContext(docKind: .textDocument)
     private let editingNotebookText = KeyCommandContext(docKind: .notebook, isEditingText: true)
+    private let libraryWithTabs = KeyCommandContext(docKind: nil, hasTabs: true)
 
     private func key(_ id: String, _ shortcut: KeyShortcut = KeyShortcut("k", [.command]), scope: KeyScope,
                      order: Int = 0, docKinds: Set<DocumentKind>? = nil) -> KeyCommandDescriptor {
@@ -47,6 +48,31 @@ final class ShellRoutingTests: XCTestCase {
         XCTAssertTrue(key("e", scope: .document, docKinds: []).isActive(in: textDocument), "empty = any kind")
     }
 
+    func testTabKeysStayLiveInTheLibraryWhileTheWindowHasTabs() {
+        // F018's ⌘1 (tab.select) and ⌘W (tab.close), with the library shown and the tab strip on screen.
+        var tab1 = key("windows.key.tab1", KeyShortcut("1", [.command]), scope: .document, order: 131)
+        tab1.whileTabsOpen = true
+        var closeTab = key("windows.key.closeTab", KeyShortcut("w", [.command]), scope: .document, order: 110)
+        closeTab.whileTabsOpen = true
+        let find = key("find", KeyShortcut("f", [.command]), scope: .document)
+        XCTAssertTrue(tab1.isActive(in: libraryWithTabs), "⌘1 switches tabs from the library while the strip shows")
+        XCTAssertEqual(KeyCommandRouting.active([tab1, closeTab, find], in: libraryWithTabs).map(\.id),
+                       ["windows.key.tab1", "windows.key.closeTab"], "other document keys wait for a document")
+        XCTAssertEqual(KeyCommandRouting.active([tab1, closeTab, find], in: library).map(\.id), [],
+                       "no tabs: ⌘1 and ⌘W stay with the system")
+        XCTAssertEqual(KeyCommandRouting.active([tab1, closeTab, find], in: notebook).map(\.id),
+                       ["windows.key.tab1", "windows.key.closeTab", "find"])
+
+        XCTAssertFalse(find.isActive(in: libraryWithTabs))
+        var limited = tab1
+        limited.docKinds = [.notebook]
+        XCTAssertFalse(limited.isActive(in: libraryWithTabs), "a key limited to kinds still needs its document")
+        var canvas = key("c", KeyShortcut("2", [.command]), scope: .canvas)
+        canvas.whileTabsOpen = true
+        XCTAssertFalse(canvas.isActive(in: libraryWithTabs), "only .document keys take whileTabsOpen")
+        XCTAssertTrue(key("l", scope: .library).isActive(in: libraryWithTabs))
+    }
+
     // MARK: One command per shortcut
 
     func testTheMostSpecificCommandWinsASharedShortcut() {
@@ -59,10 +85,38 @@ final class ShellRoutingTests: XCTestCase {
         XCTAssertEqual(KeyCommandRouting.active(all, in: notebook).map(\.id), ["clipboard.key.duplicate"])
         XCTAssertEqual(KeyCommandRouting.active(all, in: library).map(\.id), [])
 
-        // A global ⌘K and a document ⌘K: the document one inside a document, the global one in the library.
-        let bar = key("commandbar", scope: .global), link = key("link.add", scope: .document, order: 900)
-        XCTAssertEqual(KeyCommandRouting.active([bar, link], in: notebook).map(\.id), ["link.add"])
-        XCTAssertEqual(KeyCommandRouting.active([bar, link], in: library).map(\.id), ["commandbar"])
+        // A global key and a document key on the same shortcut: the document one inside a document, the global one
+        // in the library.
+        let global = key("global", scope: .global), document = key("document", scope: .document, order: 900)
+        XCTAssertEqual(KeyCommandRouting.active([global, document], in: notebook).map(\.id), ["document"])
+        XCTAssertEqual(KeyCommandRouting.active([global, document], in: library).map(\.id), ["global"])
+    }
+
+    func testFewerDocumentKindsWinAndEveryKindTiesWithAnyKind() {
+        let cmdP = KeyShortcut("p", [.command, .option])
+        // F043's Show Pencil Palette (any kind) and F052's Play or Pause Audio (three kinds), both .document.
+        let palette = key("pencilhw.palette", cmdP, scope: .document)
+        let audio = key("audio.playPause", cmdP, scope: .document, order: 10,
+                        docKinds: [.notebook, .whiteboard, .textDocument])
+        XCTAssertEqual(KeyCommandRouting.active([palette, audio], in: notebook).map(\.id), ["audio.playPause"])
+        XCTAssertEqual(KeyCommandRouting.active([palette, audio], in: KeyCommandContext(docKind: .studySet)).map(\.id),
+                       ["pencilhw.palette"])
+
+        let two = key("two", scope: .canvas, docKinds: [.notebook, .whiteboard])
+        let one = key("one", scope: .document, order: 9, docKinds: [.notebook])
+        XCTAssertTrue(KeyCommandRouting.precedes(one, two), "fewer kinds first, before the scope")
+        XCTAssertFalse(KeyCommandRouting.precedes(two, one))
+
+        // Every kind is the same as nil or empty: the scope, then the order, then the id decide.
+        let every = key("every", scope: .document, order: 5, docKinds: Set(DocumentKind.allCases))
+        let anyCanvas = key("anyCanvas", scope: .canvas, order: 7)
+        let anyDocument = key("anyDocument", scope: .document, order: 1, docKinds: [])
+        XCTAssertTrue(KeyCommandRouting.precedes(anyCanvas, every), "the narrower scope wins over every kind")
+        XCTAssertFalse(KeyCommandRouting.precedes(every, anyCanvas))
+        XCTAssertTrue(KeyCommandRouting.precedes(anyDocument, every), "same scope: the lower order")
+        let sameOrder = key("aSame", scope: .document, order: 5)
+        XCTAssertTrue(KeyCommandRouting.precedes(sameOrder, every), "then the id")
+        XCTAssertEqual(KeyCommandRouting.active([every, anyCanvas], in: textDocument).map(\.id), ["anyCanvas"])
     }
 
     func testOrderThenIdBreakTiesAndRegistryOrderIsKept() {
@@ -100,7 +154,9 @@ final class ShellRoutingTests: XCTestCase {
         XCTAssertEqual(KeyCommandContext(docKind: nil), KeyCommandContext(inDocument: false, docKind: nil))
         XCTAssertEqual(KeyCommandContext(docKind: .whiteboard, isEditingText: true),
                        KeyCommandContext(inDocument: true, docKind: .whiteboard, isEditingText: true))
+        XCTAssertEqual(libraryWithTabs, KeyCommandContext(inDocument: false, docKind: nil, hasTabs: true))
         XCTAssertNotEqual(notebook, editingNotebookText)
+        XCTAssertNotEqual(library, libraryWithTabs, "opening or closing the last tab rebuilds the window's keys")
     }
 
     func testSessionParamsMergeOverStaticParamsWhenTheKeyRuns() {

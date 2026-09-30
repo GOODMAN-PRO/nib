@@ -68,8 +68,32 @@ final class ShellViewController: UIViewController, SceneNavigator {
     /// The scene delegate calls it when the window becomes key or its scene becomes active, and the key-command bridge
     /// before every command it runs.
     func activateWindow() {
+        ShellViewController.noteActivation(self)
         if app.ui.activeNavigator !== self { app.ui.activeNavigator = self }
         app.services.sessions.activate(session)   // emits `session.activated` only when it changes
+    }
+
+    /// Every window, most recently activated first: which one takes over when the active window closes.
+    private static var activationOrder: [WeakShell] = []
+
+    private struct WeakShell {
+        weak var shell: ShellViewController?
+    }
+
+    private static func noteActivation(_ shell: ShellViewController) {
+        guard activationOrder.first?.shell !== shell else { return }
+        activationOrder.removeAll { $0.shell == nil || $0.shell === shell }
+        activationOrder.insert(WeakShell(shell: shell), at: 0)
+    }
+
+    /// The window among `candidates` that was activated most recently (nil when none of them ever was).
+    static func mostRecentlyActivated(among candidates: [ShellViewController]) -> ShellViewController? {
+        activationOrder.lazy.compactMap { $0.shell }.first { shell in candidates.contains { $0 === shell } }
+    }
+
+    /// Forgets a window whose scene went away.
+    static func windowDidClose(_ shell: ShellViewController) {
+        activationOrder.removeAll { $0.shell == nil || $0.shell === shell }
     }
 
     /// The window became key (the scene delegate observes `UIWindow.didBecomeKeyNotification`): commands now target it,
@@ -188,12 +212,14 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override var canBecomeFirstResponder: Bool { true }
 
-    /// What decides which key commands are live in this window: the document kind it shows, and whether text has the
+    /// What decides which key commands are live in this window: the document kind it shows, whether text has the
     /// keyboard (a Nib text editor sets `session.isEditingText`; any other text field or view in the window counts too,
-    /// so typing in a search field or a rename alert never switches tools).
+    /// so typing in a search field or a rename alert never switches tools), and whether it has tabs (the tab keys stay
+    /// live in the library while the tab strip shows).
     var keyCommandContext: KeyCommandContext {
         let typing = session.isEditingText || ShellFocus.isEditingText(in: viewIfLoaded?.window)
-        return KeyCommandContext(inDocument: showsDocument, docKind: shownKind, isEditingText: typing)
+        return KeyCommandContext(inDocument: showsDocument, docKind: shownKind, isEditingText: typing,
+                                 hasTabs: !openDocuments.isEmpty)
     }
 
     /// One UIKeyCommand per shortcut: the registered descriptors live in this window (`KeyScope`, `docKinds`), the most

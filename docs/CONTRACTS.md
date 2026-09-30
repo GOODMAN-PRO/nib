@@ -9,7 +9,7 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 | **C** | App shell (`AppDelegate.swift`, `ShellViewController.swift`) | Architect only |
 | **D** | `project.yml`, CI workflow, `pick_sim.py`, `lint.py` | Architect only |
 
-16,903 lines across 55 files. Every file starts with its repository path as a heading.
+17,137 lines across 56 files. Every file starts with its repository path as a heading.
 
 ## How to use this file
 
@@ -23,14 +23,14 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 **contracts-v2.1** (branch `v2/contracts2`, additive). `CommandIDs` gains a constant for each of the 313 ARCHITECTURE.md §6.5 catalogue ids that had none (among them `settingsOpen`, `shapeTapAt`, `imagePick`, `pdfTapAt`, `pencilGesture`, `pencilPalette`, `pencilActions`, `layerExportOptions`, `outlineList`, `clipboardCopyText`, `toolbarDock` and `libraryReorder`). Each name is the id in camel case: `ai.chat.delete` → `aiChatDelete`. `PanelIDs` now matches the §13 panel id list: it gains `studySmartLearn = "studysession.smartLearn"`, which is the id F049 opens. `studyLearn` is superseded by it. It shipped as "studysession.learn", which no feature registers, and now holds the Smart Learn id. `PanelIDs` also gains `movePages = "pages.movePages"`, F022's Move Pages sheet. F023 opens it with `panel.open {id, pages}`. Adopt: F022's `MovePagesSheet` moves the refs in `PanelContext.params["pages"]` and falls back to the open page when there are none. The new `NibContractsTests/CommandCatalogueTests.swift` reads docs/ARCHITECTURE.md and fails when a §6.5 row has no `CommandIDs` constant, when a constant names an id that is not in the catalogue, or when `PanelIDs` differs from the §13 list. A spec change that adds a catalogue row or a panel id must add the constant in the same change.
 
 **contracts-v2.2** (branch `v2/shell`, additive: new types and helpers only, nothing renamed or re-signed). The app shell (Part C) adopts the contracts-v2 descriptor state and settles most of the shell items the v2 triage deferred to it. The routing rules are pure helpers in `NibContracts`, so they are unit-tested (`NibContractsTests/ShellRoutingTests.swift`) and the shell only wires them to UIKit.
-- **Key commands.** `KeyCommandContext` is the state of one window that decides which key commands are live there: whether it shows a document, the document's kind, and whether text has the keyboard. `KeyCommandDescriptor.isActive(in:)` applies `scope` and `docKinds` (nil or empty = any kind; a command limited to kinds is never live in the library). `KeyCommandRouting.active(_:in:)` gives the shell one command per shortcut. A command limited to `docKinds` wins over one for any kind, then the narrower scope (`.canvas`, then `.document` or `.library`, then `.global`), then the lower `order`, then the id. So F014's ⌘D (`item.duplicate`, any kind) and a text-document ⌘D no longer race, and a document ⌘K beats a global ⌘K inside documents. `KeyCommandRouting.overridesSystemKeys(_:in:)` sets `UIKeyCommand.wantsPriorityOverSystemBehavior`: while text has the keyboard, keys without ⌘, ⌥ or ⌃ leave typing, cursor movement and Escape to the text view. When a key runs, the shell passes `resolvedParams(for:)` (the key window session's `sessionParams` merged over `params`). Any focused text field or text view (a settings search field, a rename alert) counts as editing text, not only `EditorSession.isEditingText`.
+- **Key commands.** `KeyCommandContext` is the state of one window that decides which key commands are live there: whether it shows a document, the document's kind, whether text has the keyboard, and whether the window has open tabs. `KeyCommandDescriptor.isActive(in:)` applies `scope` and `docKinds` (nil or empty = any kind; a command limited to kinds is never live in the library). The rule for `.document` changes: a `.document` key is live only while the window shows a document, and no longer while it shows the library with tabs open (on main it was live whenever the window had a selected tab, so it ran with no document in the library). The exception is a `.document` key with the new `whileTabsOpen` flag, which is for tab switching and closing: it stays live in the library while the window has tabs (`KeyCommandContext.hasTabs`, so the tab strip is on screen) and is off in a window without tabs, so the system keeps the keys there. `KeyCommandRouting.active(_:in:)` gives the shell one command per shortcut. The command limited to fewer document kinds wins (nil, empty and every kind count the same), then the narrower scope (`.canvas`, then `.document` or `.library`, then `.global`), then the lower `order`, then the id. So F014's ⌘D (`item.duplicate`, any kind) and a text-document ⌘D no longer race. Among the built features the rule settles one clash differently from main, where UIKit took the first registered key: ⌥⌘P is F043's Show Pencil Palette (any kind) and F052's Play or Pause Audio (notebooks, whiteboards, text documents), and F052 now wins in its kinds, so the palette key works only in study sets. The ⌘K clash (F029's Add Link at `.document`, the DESIGN.md §14.16 command bar at `.global`; contract-gaps F029) is not settled here and stays open for the spec owner. Under this rule a `.document` ⌘K would hide the command bar in every document. The consistent resolution: F029 serves ⌘K only while text is being edited, from the text editors' own key sets (as F102 does), and the command bar keeps ⌘K at `.global`. `KeyCommandRouting.overridesSystemKeys(_:in:)` sets `UIKeyCommand.wantsPriorityOverSystemBehavior`: while text has the keyboard, keys without ⌘, ⌥ or ⌃ leave typing, cursor movement and Escape to the text view. When a key runs, the shell passes `resolvedParams(for:)` (the key window session's `sessionParams` merged over `params`). Any focused text field or text view (a settings search field, a rename alert) counts as editing text, not only `EditorSession.isEditingText`.
 - **⌘Z / ⇧⌘Z.** `UndoRoute.forCommand(_:params:session:history:window:)` decides where a key command that runs `edit.undo` / `edit.redo` acts: the document's history while it has a step, else the window's UndoManager (window-level steps such as F016's "Move Palette"), else nothing. The shell runs the window's undo itself. It validates the key with the same route: `canPerformAction` enables ⌘Z exactly when one of the two can act, so a disabled ⌘Z falls through to the system, and a window step is titled with `UndoManager.undoMenuItemTitle`.
-- **Key window.** The shell makes the key window the active one: `ui.activeNavigator` (what `ctx.navigator` returns) and `services.sessions.activate` (which emits `session.activated`). It does this when a window becomes key, when a scene becomes active while no other window is key, and before every key command it runs. A closed window hands over to the key window. So `window.showLibrary`, `doc.open`, `panel.open` and confirmation alerts act on the window the user works in, and command-failure toasts show only there.
+- **Key window.** The shell makes the key window the active one: `ui.activeNavigator` (what `ctx.navigator` returns) and `services.sessions.activate` (which emits `session.activated`). It does this when a window becomes key, when a scene becomes active while no other window is key, and before every key command it runs. A closing window hands over before its session is removed: to the key window, else to the foreground window activated most recently, so `sessions.remove` never makes the newest session active on its own. As a result `window.showLibrary`, `doc.open`, `panel.open` and confirmation alerts act on the window the user works in, and command-failure toasts show only there.
 - **Presentation.** The shell forwards `childForStatusBarHidden`, `childForStatusBarStyle`, `childForHomeIndicatorAutoHidden`, `childForScreenEdgesDeferringSystemGestures` and `childViewControllerForPointerLock` to the shown screen. The document chrome's `prefersStatusBarHidden` (P-106, `editing.hideStatusBar`) and full-screen modes now take effect.
 - **Tabs.** `SceneNavigator.addTab(_:)` is implemented: a restored tab joins the tab strip without being shown or building its editor.
 - **Fonts.** The app target has the `com.apple.developer.user-fonts` entitlement (`app-usage`), for fonts installed from font provider apps (F026 T-059, P-083).
 
-Adopt: F015's ⌘Z / ⇧⌘Z keys work unchanged (their `sessionParams` name the window's document; the shell falls back to the window's UndoManager). F102 may register its block duplicate on ⌘D with `docKinds: [.textDocument]`: it then wins over F014's ⌘D in text documents only. F049 moves the `StudySetViewController` UIKeyCommands to descriptors with `docKinds: [.studySet]`. F047 gives its new-document key a fresh id through `sessionParams`. F018 restores tabs with `addTab` and drops `SceneHooksImpl.maxRestoredTabs`. Still deferred for the shell: the paste responder, forwarding the settings page to `settingsRoot`, the tab band layout and the open-gate result.
+Adopt: F015's ⌘Z / ⇧⌘Z keys work unchanged (their `sessionParams` name the window's document; the shell falls back to the window's UndoManager). F102 may register its block duplicate on ⌘D with `docKinds: [.textDocument]`: it then wins over F014's ⌘D in text documents only. F014 sets `docKinds: [.notebook, .whiteboard]` on its ⌘X, ⌘C, ⌘V, ⌥⇧⌘V and ⌘D keys, so they no longer run the canvas clipboard commands in study sets and text documents. F049 keeps ⇥, ⇧⇥ and ⎋ as `StudySetViewController`'s own UIKeyCommands. They must work while a card field is being edited, and they depend on the editor's read-only and focus state. As descriptors they would lose: a `.canvas` key is dropped while text is edited, and at `.document` a key without ⌘, ⌥ or ⌃ leaves Tab and Escape to the text view. Only ⌘⏎ New Card may move to a descriptor (`.document`, `docKinds: [.studySet]`, `sessionParams` naming the set), and only once its command finds the card from the session. F047 gives its new-document key a fresh id through `sessionParams`. F018 restores tabs with `addTab` and drops `SceneHooksImpl.maxRestoredTabs`. It also sets `whileTabsOpen` on its ⌘W, ⌥⌘W and ⌘1–9 keys (still `.document`), so they switch and close tabs from the library while the strip shows. F073 does the same for the ⌘1–9 keys it registers. F017 drops the `ui.activeNavigator` assignment in `DocumentContainerViewController.goToLibrary`, because the shell already made the window of the tap the active one, together with the session. It also drops the stale comment on `prefersStatusBarHidden`, because the shell now forwards it. F043 moves Show Pencil Palette off ⌥⌘P, which F052's audio key takes in notebooks, whiteboards and text documents, to a free shortcut (⌃⌘P is unused). Still deferred for the shell: the paste responder, forwarding the settings page to `settingsRoot`, the tab band layout, the open-gate result, and per-tab page memory (the shell opens a switched-to or closed-to tab at its first page; F018 keeps its page-memory workaround, contract-gaps F018).
 
 **Spec pass 2** (docs only: no API, constant or source change). It pins conventions the sources leave open, matching what the built features already do. `PanelContext.params` is one flat object: every key of the `panel.open` call except `id` and `edge`, with the keys of a nested `params` object merged over them. So `{id, pages}` and `{id, params: {pages}}` both reach the panel as `{pages}`, and a call that names nothing gives `[:]` (the source comment's "params minus id"). In a window with no open document, `panel.open` / `panel.close` (F017) forward to `library.setView {panel, params?, close?}` (F019, additive params). The library then presents `.sheet`, `.fullScreen` and `.floating` panels over itself with a `PanelContext` for that window, and selects `.libraryTab` panels in its sidebar; this settles the deferred F019 library-tab routing. Library menus fill `MenuContext.folder`. The pinned results (ARCHITECTURE.md §6.5) are:
 - `template.choose` → `{background, size}`, with `kind` paper | cover and an additive `doc?`;
@@ -9811,6 +9811,10 @@ public struct KeyCommandDescriptor: Registrable {
     /// contracts-v2: params computed from the key window's session when the key is pressed (selection, page, a fresh
     /// id); merged over `params`. Use `resolvedParams(for:)`.
     public var sessionParams: (@MainActor (EditorSession) -> JSONValue)? = nil
+    /// contracts-v2.2: a `.document` key that is also live while the window shows the library with tabs open (its tab
+    /// strip is on screen, `KeyCommandContext.hasTabs`): the tab switching and closing keys (⌘1–9, ⌘W, ⌥⌘W). Without
+    /// tabs it stays off, so the system keeps the keys. Other scopes ignore it.
+    public var whileTabsOpen: Bool = false
 
     /// contracts-v2: `params` with `sessionParams(session)` merged over them (what the shell passes to the command).
     @MainActor
@@ -9842,29 +9846,34 @@ public struct KeyCommandContext: Equatable {
     /// Text has the keyboard in the window (`EditorSession.isEditingText`, or any text field or text view with focus),
     /// so `.canvas` keys stand back and plain keys leave typing alone (`KeyCommandRouting.overridesSystemKeys`).
     public var isEditingText: Bool
+    /// The window has open tabs (`SceneNavigator.openDocuments`), also while it shows the library with its tab strip:
+    /// `.document` keys marked `whileTabsOpen` stay live there.
+    public var hasTabs: Bool
 
-    public init(inDocument: Bool, docKind: DocumentKind?, isEditingText: Bool = false) {
+    public init(inDocument: Bool, docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false) {
         self.inDocument = inDocument
         self.docKind = docKind
         self.isEditingText = isEditingText
+        self.hasTabs = hasTabs
     }
 
     /// A window showing a document of `docKind` (nil: the library).
-    public init(docKind: DocumentKind?, isEditingText: Bool = false) {
-        self.init(inDocument: docKind != nil, docKind: docKind, isEditingText: isEditingText)
+    public init(docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false) {
+        self.init(inDocument: docKind != nil, docKind: docKind, isEditingText: isEditingText, hasTabs: hasTabs)
     }
 }
 
 public extension KeyCommandDescriptor {
     /// contracts-v2.2: true when this key command is live in a window in `context`. Its `scope` must admit the window
     /// (`.global` always, `.library` without a document, `.document` with one, `.canvas` with one while no text is
-    /// being edited) and its `docKinds` (nil or empty = any kind) must contain the kind of the document shown, so a
-    /// command limited to kinds is never live in the library.
+    /// being edited; a `.document` key marked `whileTabsOpen` also in the library while the window has tabs) and its
+    /// `docKinds` (nil or empty = any kind) must contain the kind of the document shown, so a command limited to kinds
+    /// is never live in the library.
     func isActive(in context: KeyCommandContext) -> Bool {
         switch scope {
         case .global: break
         case .library: if context.inDocument { return false }
-        case .document: if !context.inDocument { return false }
+        case .document: if !context.inDocument && !(whileTabsOpen && context.hasTabs) { return false }
         case .canvas: if !context.inDocument || context.isEditingText { return false }
         }
         guard let kinds = docKinds, !kinds.isEmpty else { return true }
@@ -9876,12 +9885,12 @@ public extension KeyCommandDescriptor {
 /// contracts-v2.2: which key commands a window offers, and which one wins when several share a shortcut (the shell
 /// hands UIKit one command per shortcut, so two features mapping the same keys never race).
 public enum KeyCommandRouting {
-    /// True when `a` wins over `b` for the same shortcut, most specific first: a command limited to document kinds
-    /// (`docKinds`) before one for any kind; then the narrower scope (`.canvas`, then `.document` or `.library`, then
-    /// `.global`); then the lower `order`; then the id.
+    /// True when `a` wins over `b` for the same shortcut, most specific first: the command limited to fewer document
+    /// kinds (`docKinds`; nil, empty and every kind all count as every kind, so they tie); then the narrower scope
+    /// (`.canvas`, then `.document` or `.library`, then `.global`); then the lower `order`; then the id.
     public static func precedes(_ a: KeyCommandDescriptor, _ b: KeyCommandDescriptor) -> Bool {
-        let ak = a.docKinds.map { !$0.isEmpty } ?? false, bk = b.docKinds.map { !$0.isEmpty } ?? false
-        if ak != bk { return ak }
+        let ak = kindCount(a), bk = kindCount(b)
+        if ak != bk { return ak < bk }
         let ar = rank(a.scope), br = rank(b.scope)
         if ar != br { return ar < br }
         if a.order != b.order { return a.order < b.order }
@@ -9906,6 +9915,12 @@ public enum KeyCommandRouting {
     /// cursor movement and the text view's own Escape win.
     public static func overridesSystemKeys(_ d: KeyCommandDescriptor, in context: KeyCommandContext) -> Bool {
         !context.isEditingText || !d.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
+    }
+
+    /// How many document kinds a command is live in: its `docKinds`, or every kind when they are nil or empty.
+    private static func kindCount(_ d: KeyCommandDescriptor) -> Int {
+        guard let kinds = d.docKinds, !kinds.isEmpty else { return DocumentKind.allCases.count }
+        return kinds.count
     }
 
     private static func rank(_ scope: KeyScope) -> Int {
@@ -15603,6 +15618,7 @@ final class ShellRoutingTests: XCTestCase {
     private let notebook = KeyCommandContext(docKind: .notebook)
     private let textDocument = KeyCommandContext(docKind: .textDocument)
     private let editingNotebookText = KeyCommandContext(docKind: .notebook, isEditingText: true)
+    private let libraryWithTabs = KeyCommandContext(docKind: nil, hasTabs: true)
 
     private func key(_ id: String, _ shortcut: KeyShortcut = KeyShortcut("k", [.command]), scope: KeyScope,
                      order: Int = 0, docKinds: Set<DocumentKind>? = nil) -> KeyCommandDescriptor {
@@ -15640,6 +15656,31 @@ final class ShellRoutingTests: XCTestCase {
         XCTAssertTrue(key("e", scope: .document, docKinds: []).isActive(in: textDocument), "empty = any kind")
     }
 
+    func testTabKeysStayLiveInTheLibraryWhileTheWindowHasTabs() {
+        // F018's ⌘1 (tab.select) and ⌘W (tab.close), with the library shown and the tab strip on screen.
+        var tab1 = key("windows.key.tab1", KeyShortcut("1", [.command]), scope: .document, order: 131)
+        tab1.whileTabsOpen = true
+        var closeTab = key("windows.key.closeTab", KeyShortcut("w", [.command]), scope: .document, order: 110)
+        closeTab.whileTabsOpen = true
+        let find = key("find", KeyShortcut("f", [.command]), scope: .document)
+        XCTAssertTrue(tab1.isActive(in: libraryWithTabs), "⌘1 switches tabs from the library while the strip shows")
+        XCTAssertEqual(KeyCommandRouting.active([tab1, closeTab, find], in: libraryWithTabs).map(\.id),
+                       ["windows.key.tab1", "windows.key.closeTab"], "other document keys wait for a document")
+        XCTAssertEqual(KeyCommandRouting.active([tab1, closeTab, find], in: library).map(\.id), [],
+                       "no tabs: ⌘1 and ⌘W stay with the system")
+        XCTAssertEqual(KeyCommandRouting.active([tab1, closeTab, find], in: notebook).map(\.id),
+                       ["windows.key.tab1", "windows.key.closeTab", "find"])
+
+        XCTAssertFalse(find.isActive(in: libraryWithTabs))
+        var limited = tab1
+        limited.docKinds = [.notebook]
+        XCTAssertFalse(limited.isActive(in: libraryWithTabs), "a key limited to kinds still needs its document")
+        var canvas = key("c", KeyShortcut("2", [.command]), scope: .canvas)
+        canvas.whileTabsOpen = true
+        XCTAssertFalse(canvas.isActive(in: libraryWithTabs), "only .document keys take whileTabsOpen")
+        XCTAssertTrue(key("l", scope: .library).isActive(in: libraryWithTabs))
+    }
+
     // MARK: One command per shortcut
 
     func testTheMostSpecificCommandWinsASharedShortcut() {
@@ -15652,10 +15693,38 @@ final class ShellRoutingTests: XCTestCase {
         XCTAssertEqual(KeyCommandRouting.active(all, in: notebook).map(\.id), ["clipboard.key.duplicate"])
         XCTAssertEqual(KeyCommandRouting.active(all, in: library).map(\.id), [])
 
-        // A global ⌘K and a document ⌘K: the document one inside a document, the global one in the library.
-        let bar = key("commandbar", scope: .global), link = key("link.add", scope: .document, order: 900)
-        XCTAssertEqual(KeyCommandRouting.active([bar, link], in: notebook).map(\.id), ["link.add"])
-        XCTAssertEqual(KeyCommandRouting.active([bar, link], in: library).map(\.id), ["commandbar"])
+        // A global key and a document key on the same shortcut: the document one inside a document, the global one
+        // in the library.
+        let global = key("global", scope: .global), document = key("document", scope: .document, order: 900)
+        XCTAssertEqual(KeyCommandRouting.active([global, document], in: notebook).map(\.id), ["document"])
+        XCTAssertEqual(KeyCommandRouting.active([global, document], in: library).map(\.id), ["global"])
+    }
+
+    func testFewerDocumentKindsWinAndEveryKindTiesWithAnyKind() {
+        let cmdP = KeyShortcut("p", [.command, .option])
+        // F043's Show Pencil Palette (any kind) and F052's Play or Pause Audio (three kinds), both .document.
+        let palette = key("pencilhw.palette", cmdP, scope: .document)
+        let audio = key("audio.playPause", cmdP, scope: .document, order: 10,
+                        docKinds: [.notebook, .whiteboard, .textDocument])
+        XCTAssertEqual(KeyCommandRouting.active([palette, audio], in: notebook).map(\.id), ["audio.playPause"])
+        XCTAssertEqual(KeyCommandRouting.active([palette, audio], in: KeyCommandContext(docKind: .studySet)).map(\.id),
+                       ["pencilhw.palette"])
+
+        let two = key("two", scope: .canvas, docKinds: [.notebook, .whiteboard])
+        let one = key("one", scope: .document, order: 9, docKinds: [.notebook])
+        XCTAssertTrue(KeyCommandRouting.precedes(one, two), "fewer kinds first, before the scope")
+        XCTAssertFalse(KeyCommandRouting.precedes(two, one))
+
+        // Every kind is the same as nil or empty: the scope, then the order, then the id decide.
+        let every = key("every", scope: .document, order: 5, docKinds: Set(DocumentKind.allCases))
+        let anyCanvas = key("anyCanvas", scope: .canvas, order: 7)
+        let anyDocument = key("anyDocument", scope: .document, order: 1, docKinds: [])
+        XCTAssertTrue(KeyCommandRouting.precedes(anyCanvas, every), "the narrower scope wins over every kind")
+        XCTAssertFalse(KeyCommandRouting.precedes(every, anyCanvas))
+        XCTAssertTrue(KeyCommandRouting.precedes(anyDocument, every), "same scope: the lower order")
+        let sameOrder = key("aSame", scope: .document, order: 5)
+        XCTAssertTrue(KeyCommandRouting.precedes(sameOrder, every), "then the id")
+        XCTAssertEqual(KeyCommandRouting.active([every, anyCanvas], in: textDocument).map(\.id), ["anyCanvas"])
     }
 
     func testOrderThenIdBreakTiesAndRegistryOrderIsKept() {
@@ -15693,7 +15762,9 @@ final class ShellRoutingTests: XCTestCase {
         XCTAssertEqual(KeyCommandContext(docKind: nil), KeyCommandContext(inDocument: false, docKind: nil))
         XCTAssertEqual(KeyCommandContext(docKind: .whiteboard, isEditingText: true),
                        KeyCommandContext(inDocument: true, docKind: .whiteboard, isEditingText: true))
+        XCTAssertEqual(libraryWithTabs, KeyCommandContext(inDocument: false, docKind: nil, hasTabs: true))
         XCTAssertNotEqual(notebook, editingNotebookText)
+        XCTAssertNotEqual(library, libraryWithTabs, "opening or closing the last tab rebuilds the window's keys")
     }
 
     func testSessionParamsMergeOverStaticParamsWhenTheKeyRuns() {
@@ -16524,10 +16595,17 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         if let observer = keyObserver { NotificationCenter.default.removeObserver(observer) }
         keyObserver = nil
         guard let shell = shell, let app = NibApp.shared else { return }
+        // Hand over before the session goes, so `sessions.remove` never makes the newest session active on its own
+        // (with a `session.activated` for a window the user did not pick). A closing window that is not the active one
+        // leaves the active window as it is, and re-syncs its session when the two had drifted apart.
+        if app.ui.activeNavigator === shell || app.services.sessions.active === shell.session {
+            let current = app.ui.activeNavigator as? ShellViewController
+            let successor = current.flatMap { $0 === shell ? nil : $0 } ?? SceneDelegate.nextWindow(after: scene)
+            if current === shell { app.ui.activeNavigator = nil }
+            successor?.activateWindow()
+        }
         app.services.sessions.remove(shell.session)
-        guard app.ui.activeNavigator === shell else { return }
-        app.ui.activeNavigator = nil
-        SceneDelegate.nextWindow(after: scene)?.activateWindow()
+        ShellViewController.windowDidClose(shell)
     }
 
     func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
@@ -16535,17 +16613,14 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         return NibApp.shared?.ui.sceneHooks?.restorationActivity(shell)
     }
 
-    /// The window that takes over when `closed` goes away: the key window, else the most recently active session's,
-    /// else any foreground window.
+    /// The window that takes over when `closed` goes away: the key window, else the foreground window the user
+    /// activated most recently, else any foreground window (nil when no other window is in the foreground).
     private static func nextWindow(after closed: UIScene) -> ShellViewController? {
         let shells = UIApplication.shared.connectedScenes
             .filter { $0 !== closed && $0.activationState != .unattached && $0.activationState != .background }
             .compactMap { ($0.delegate as? SceneDelegate)?.shell }
         if let key = shells.first(where: { $0.isKeyWindow }) { return key }
-        if let active = NibApp.shared?.services.sessions.active, let owner = shells.first(where: { $0.session === active }) {
-            return owner
-        }
-        return shells.first
+        return ShellViewController.mostRecentlyActivated(among: shells) ?? shells.first
     }
 }
 
@@ -16663,8 +16738,32 @@ final class ShellViewController: UIViewController, SceneNavigator {
     /// The scene delegate calls it when the window becomes key or its scene becomes active, and the key-command bridge
     /// before every command it runs.
     func activateWindow() {
+        ShellViewController.noteActivation(self)
         if app.ui.activeNavigator !== self { app.ui.activeNavigator = self }
         app.services.sessions.activate(session)   // emits `session.activated` only when it changes
+    }
+
+    /// Every window, most recently activated first: which one takes over when the active window closes.
+    private static var activationOrder: [WeakShell] = []
+
+    private struct WeakShell {
+        weak var shell: ShellViewController?
+    }
+
+    private static func noteActivation(_ shell: ShellViewController) {
+        guard activationOrder.first?.shell !== shell else { return }
+        activationOrder.removeAll { $0.shell == nil || $0.shell === shell }
+        activationOrder.insert(WeakShell(shell: shell), at: 0)
+    }
+
+    /// The window among `candidates` that was activated most recently (nil when none of them ever was).
+    static func mostRecentlyActivated(among candidates: [ShellViewController]) -> ShellViewController? {
+        activationOrder.lazy.compactMap { $0.shell }.first { shell in candidates.contains { $0 === shell } }
+    }
+
+    /// Forgets a window whose scene went away.
+    static func windowDidClose(_ shell: ShellViewController) {
+        activationOrder.removeAll { $0.shell == nil || $0.shell === shell }
     }
 
     /// The window became key (the scene delegate observes `UIWindow.didBecomeKeyNotification`): commands now target it,
@@ -16783,12 +16882,14 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override var canBecomeFirstResponder: Bool { true }
 
-    /// What decides which key commands are live in this window: the document kind it shows, and whether text has the
+    /// What decides which key commands are live in this window: the document kind it shows, whether text has the
     /// keyboard (a Nib text editor sets `session.isEditingText`; any other text field or view in the window counts too,
-    /// so typing in a search field or a rename alert never switches tools).
+    /// so typing in a search field or a rename alert never switches tools), and whether it has tabs (the tab keys stay
+    /// live in the library while the tab strip shows).
     var keyCommandContext: KeyCommandContext {
         let typing = session.isEditingText || ShellFocus.isEditingText(in: viewIfLoaded?.window)
-        return KeyCommandContext(inDocument: showsDocument, docKind: shownKind, isEditingText: typing)
+        return KeyCommandContext(inDocument: showsDocument, docKind: shownKind, isEditingText: typing,
+                                 hasTabs: !openDocuments.isEmpty)
     }
 
     /// One UIKeyCommand per shortcut: the registered descriptors live in this window (`KeyScope`, `docKinds`), the most
