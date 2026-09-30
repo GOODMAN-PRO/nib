@@ -142,14 +142,23 @@ enum ManifestValidator {
 
         let c = m.contributes
         let declared = Dictionary((c?.commands ?? []).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        /// A command a contribution points at: this plugin's own must be declared; others (built-in or another
-        /// plugin's) are resolved when invoked.
+        /// A command the user invokes explicitly (menus, toolbar buttons, key bindings, Pencil actions): this plugin's
+        /// own must be declared; others (built-in or another plugin's) are resolved when invoked.
         func command(_ id: String, _ path: String) {
             if id.isEmpty { return fail("missing command id", path) }
             if id.hasPrefix(prefix), declared[id] == nil {
                 fail("'\(id)' is not declared in contributes?.commands", path)
             } else if !matches(id, "^[a-z][A-Za-z0-9-]*(\\.[A-Za-z0-9-]+)+$") {
                 fail("'\(id)' is not a command id", path)
+            }
+        }
+        /// A command the host runs on the user's behalf without the user naming it (canvas tools, stroke processors,
+        /// tap handlers, item edits, blocks, importers, exporters): it runs as the user, so it must be one of the
+        /// plugin's own commands, whose JavaScript then calls other commands as the plugin, with its grants.
+        func ownCommand(_ id: String, _ path: String) {
+            if id.isEmpty { return fail("missing command id", path) }
+            if declared[id] == nil {
+                fail("'\(id)' must be one of this plugin's own commands (declared in contributes.commands)", path)
             }
         }
         func owned(_ id: String, _ path: String) {
@@ -227,7 +236,7 @@ enum ManifestValidator {
             if let preview = tool.preview, PluginToolPreview(rawValue: preview) == nil {
                 fail("preview is ink, lasso or none", p + ".preview")
             }
-            command(tool.command, p + ".command")
+            ownCommand(tool.command, p + ".command")
         }
         let settingKeys = Set(c?.settings?["properties"]?.objectValue?.keys.map { $0 } ?? [])
         for (i, opt) in (c?.toolOptions ?? []).enumerated() {
@@ -321,7 +330,7 @@ enum ManifestValidator {
                 for (j, e) in h.extensions.enumerated() where !matches(FileHandlerMapping.normalize(e), "^[a-z0-9]+$") {
                     fail("'\(e)' is not a file extension", "\(p).extensions[\(j)]")
                 }
-                command(h.command, p + ".command")
+                ownCommand(h.command, p + ".command")
             }
         }
         // Custom item types
@@ -331,7 +340,7 @@ enum ManifestValidator {
             let p = "$.contributes.itemTypes[\(i)]"
             if !matches(t.type, namePattern) { fail("type is [A-Za-z0-9_-]", p + ".type") }
             if t.title.isEmpty { fail("title must not be empty", p + ".title") }
-            if let e = t.edit { command(e, p + ".edit") }
+            if let e = t.edit { ownCommand(e, p + ".edit") }
             if let schema = t.inspector, !SchemaConverter.isObjectSchema(schema) {
                 fail("inspector must be a JSON Schema object with properties", p + ".inspector")
             }
@@ -341,7 +350,7 @@ enum ManifestValidator {
         for (i, t) in (c?.tapHandlers ?? []).enumerated() {
             let p = "$.contributes.tapHandlers[\(i)]"
             if CanvasGesture(rawValue: t.gesture) == nil { fail("gesture is tap, doubleTap or longPress", p + ".gesture") }
-            command(t.command, p + ".command")
+            ownCommand(t.command, p + ".command")
             for (j, k) in (t.itemKinds ?? []).enumerated() where ItemKind(rawValue: k) == nil {
                 fail("unknown item kind '\(k)'", "\(p).itemKinds[\(j)]")
             }
@@ -356,14 +365,14 @@ enum ManifestValidator {
             if !matches(b.type, namePattern) { fail("type is [A-Za-z0-9_-]", p + ".type") }
             if b.title.isEmpty { fail("title must not be empty", p + ".title") }
             if let h = b.height, !(h > 0 && h <= 4_000) { fail("height is 1…4000 points", p + ".height") }
-            command(b.command, p + ".command")
+            ownCommand(b.command, p + ".command")
         }
         // Stroke processors
         unique(c?.strokeProcessors, { $0.id }, "$.contributes.strokeProcessors")
         for (i, s) in (c?.strokeProcessors ?? []).enumerated() {
             let p = "$.contributes.strokeProcessors[\(i)]"
             owned(s.id, p + ".id")
-            command(s.command, p + ".command")
+            ownCommand(s.command, p + ".command")
             for (j, t) in (s.tools ?? []).enumerated() where InkTool(rawValue: t) == nil {
                 fail("unknown ink tool '\(t)'", "\(p).tools[\(j)]")
             }
@@ -591,6 +600,15 @@ final class PluginHost: PluginHosting {
             finish(.failed, e)
             throw e
         }
+        // PDF templates are converted before anything starts (off the main actor; an unreadable one fails the load).
+        let pdfs: [String: PDFTemplateConverter.Page]
+        do {
+            pdfs = try await ContributionMapper.convertPDFTemplates(scan.manifest, folder: folder, pdf: app.services.pdf)
+        } catch {
+            finish(.failed, error)
+            throw error
+        }
+        guard generations[id] == generation else { return }
         // The grant is live while main.js boots (it may call commands at start-up).
         authority.setLoaded(id, permissions: scan.manifest.permissions, sha256: scan.sha256)
         let handle: PluginRuntimeHandle
@@ -608,7 +626,7 @@ final class PluginHost: PluginHosting {
         handles[id] = handle
         do {
             let mapper = ContributionMapper(app: app, host: self, manifest: scan.manifest, folder: folder)
-            try mapper.map()
+            try mapper.map(pdfs: pdfs)
         } catch {
             ContributionMapper.unmap(owner: id, app: app)
             handles[id] = nil
@@ -616,6 +634,21 @@ final class PluginHost: PluginHosting {
             authority.removeLoaded(id)
             finish(.failed, error)
             throw error
+        }
+        // The runtime and the mapper read files after the hash was taken (main.js now, panels and packs lazily): a
+        // folder that changed in between (a sync landing mid-load) is not what was approved, so it stops again.
+        let after = await Task.detached(priority: .userInitiated) {
+            (try? PluginFolderHash.files(folder)).map(PluginFolderHash.signature)
+        }.value
+        guard generations[id] == generation else { return }
+        guard after == scan.signature else {
+            unload(id)
+            let e = NibError(.permissionDenied, "plugin \(id) changed on disk while it was starting",
+                             hint: "review it with plugin.review {\"id\": \"\(id)\"}")
+            record.state = .needsReview
+            record.error = e.message
+            records[id] = record
+            throw e
         }
         finish(.running, nil)
         hostLog.info("plugin \(id, privacy: .public) \(scan.manifest.version, privacy: .public) loaded")
@@ -698,11 +731,33 @@ final class PluginHost: PluginHosting {
     /// whose files or grant no longer match is stopped (needs review), and with `startApproved` new or newly approved
     /// plugins are loaded.
     func refresh(startApproved: Bool) async {
-        guard let root = pluginsFolder else {
-            for id in Array(records.keys) {
+        await rescan(startApproved: startApproved, listing: false)
+    }
+
+    /// `plugin.list` (a read): re-reads the records and inspects plugin folders but never stops, starts or restarts a
+    /// plugin (the caller may be one, or the AI in ask mode). A running plugin that changed, lost its grant or its
+    /// folder is left to a scheduled rescan.
+    func refreshForListing() async {
+        await rescan(startApproved: false, listing: true)
+    }
+
+    private func rescan(startApproved: Bool, listing: Bool) async {
+        var needsRescan = false
+        /// Stops a plugin, or in a listing only notes that the scheduled rescan must.
+        func stop(_ id: String) -> Bool {
+            guard listing else {
                 unload(id)
-                records[id] = nil
+                return true
             }
+            if handles[id] != nil {
+                needsRescan = true
+                return false
+            }
+            return true
+        }
+        defer { if needsRescan { scheduleRefresh() } }
+        guard let root = pluginsFolder else {
+            for id in Array(records.keys) where stop(id) { records[id] = nil }
             return
         }
         let fm = FileManager.default
@@ -710,8 +765,7 @@ final class PluginHost: PluginHosting {
                                                  options: [.skipsHiddenFiles])) ?? []
         let folders = names.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
         let ids = Set(folders.map { $0.lastPathComponent }.filter { ManifestValidator.isValidPluginID($0) })
-        for gone in Set(records.keys).subtracting(ids) {
-            unload(gone)
+        for gone in Set(records.keys).subtracting(ids) where stop(gone) {
             records[gone] = nil
         }
         authority.store.reload()
@@ -722,7 +776,7 @@ final class PluginHost: PluginHosting {
                 let approved = authority.store.grant(id)?.sha256 == r.sha256
                 switch r.state {
                 case .running where !approved:
-                    unload(id)
+                    guard stop(id) else { break }
                     var changed = r
                     changed.state = .needsReview
                     changed.error = "the grant no longer matches this plugin"
@@ -736,16 +790,19 @@ final class PluginHost: PluginHosting {
                 }
                 continue
             }
-            if startApproved || records[id]?.state == .running {
+            if listing && handles[id] != nil {
+                needsRescan = true
+            } else if startApproved || records[id]?.state == .running {
                 do { try await load(id) } catch { hostLog.error("plugin \(id, privacy: .public): \(NibError.wrap(error).message, privacy: .public)") }
             } else {
-                await inspect(id, folder: folder)
+                await inspect(id, folder: folder, listing: listing)
             }
         }
     }
 
-    /// Reads a plugin folder for listings without starting anything (a changed running plugin is stopped).
-    private func inspect(_ id: String, folder: URL) async {
+    /// Reads a plugin folder for listings without starting anything (a changed running plugin is stopped, except in a
+    /// listing, which only reads).
+    private func inspect(_ id: String, folder: URL, listing: Bool) async {
         let scan = try? await Task.detached { try PackageScan.read(folder) }.value
         var record = records[id] ?? PluginRecord(id: id, folder: folder)
         guard let s = scan else {
@@ -760,7 +817,7 @@ final class PluginHost: PluginHosting {
         record.signature = s.signature
         let approved = authority.store.grant(id)?.sha256 == s.sha256
         if !approved {
-            unload(id)
+            if !listing { unload(id) }
             record.state = .needsReview
         } else if let problem = ManifestValidator.problems(s.manifest, folder: folder, folderName: id).first {
             record.state = .failed

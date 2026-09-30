@@ -78,13 +78,15 @@ struct PluginListCommand: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "plugin.list", title: "List Plugins",
+        id: CommandIDs.pluginList, title: "List Plugins",
         summary: "Installed plugins with version, declared and granted permissions, state (running, disabled, needsReview, failed) and command ids.",
         examples: [[:]], effect: .read, target: .app)
 
     static func run(_ params: Params, _ ctx: CommandContext) async throws -> Output {
         let host = try PluginCommands.host(ctx)
-        await host.refresh(startApproved: false)
+        // A read: re-reads the plugins folder but never stops or restarts a plugin (a changed running one is left to
+        // the scheduled rescan).
+        await host.refreshForListing()
         let entries = host.records.values.sorted { $0.id < $1.id }.map { r -> Entry in
             let m = r.manifest
             return Entry(id: r.id, name: m?.name ?? r.id, version: m?.version ?? "", author: m?.author,
@@ -113,7 +115,7 @@ struct PluginEnableCommand: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "plugin.enable", title: "Enable Plugin",
+        id: CommandIDs.pluginEnable, title: "Enable Plugin",
         summary: "Turn an installed plugin on or off on this device (needs plugins:manage; the user always confirms for the AI and the bridge).",
         params: .obj(["id": PluginCommands.idSchema, "enabled": .bool("true = run it, false = switch it off")],
                      required: ["id", "enabled"]),
@@ -141,7 +143,7 @@ struct PluginReloadCommand: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "plugin.reload", title: "Reload Plugin",
+        id: CommandIDs.pluginReload, title: "Reload Plugin",
         summary: "Reload a plugin from its folder after its files changed: re-read the manifest, re-check its approval, restart it.",
         params: .obj(["id": PluginCommands.idSchema], required: ["id"]),
         examples: [["id": "dev.nib.hello"]], effect: .session, target: .app)
@@ -178,7 +180,7 @@ struct PluginLogsCommand: NibCommand {
     static let maxBytes = 18_000
 
     static let descriptor = CommandDescriptor(
-        id: "plugin.logs", title: "Plugin Logs",
+        id: CommandIDs.pluginLogs, title: "Plugin Logs",
         summary: "Recent console output (console.log/warn/error) of a plugin, newest last; a plugin can read only its own logs.",
         params: .obj(["id": PluginCommands.idSchema, "limit": .int("lines, newest kept (default 200)", min: 1, max: maxLimit)],
                      required: ["id"]),
@@ -230,7 +232,7 @@ struct PluginSDKTypesCommand: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "plugin.sdkTypes", title: "Plugin SDK Types",
+        id: CommandIDs.pluginSdkTypes, title: "Plugin SDK Types",
         summary: "TypeScript definitions (nib.d.ts) of the plugin API and of every command a plugin can call, from the live registry; paged with cursor.",
         params: .obj(["cursor": .str("from the previous page when it was truncated")]),
         examples: [[:]], effect: .read, target: .app)
@@ -260,7 +262,7 @@ struct PluginDocsCommand: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "plugin.docs", title: "Plugin Docs",
+        id: CommandIDs.pluginDocs, title: "Plugin Docs",
         summary: "The plugin authoring reference: manifest rules and schema, permissions, contribution points, JS API, events and limits; paged with cursor.",
         params: .obj(["cursor": .str("from the previous page when it was truncated")]),
         examples: [[:]], effect: .read, target: .app)
