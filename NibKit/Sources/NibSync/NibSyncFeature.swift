@@ -39,7 +39,10 @@ public enum NibSyncFeature: NibFeature {
     ) { _, params, ctx in
         guard let raw = params["doc"]?.stringValue, !raw.isEmpty,
               let watcher = ctx.services.get(FolderWatcher.serviceKey, as: FolderWatcher.self) else { return nil }
-        await watcher.ensureDownloaded(NodeRef.documentID(from: raw))
+        guard await watcher.ensureDownloaded(NodeRef.documentID(from: raw)) else {
+            throw NibError(.unavailable, "this document is still downloading from iCloud",
+                           hint: "try again once it has downloaded")
+        }
         return nil
     }
 }
@@ -89,15 +92,50 @@ enum LibraryMenu {
     /// Known library folders in a stable menu order (by name).
     @MainActor
     static func locations(_ app: NibApp) -> [KnownLocation] {
-        KnownLocations.listed(app.settings, library: app.services.library).sorted { a, b in
-            let order = a.name.localizedStandardCompare(b.name)
-            return order == .orderedSame ? a.id < b.id : order == .orderedAscending
+        let cache: LocationMenuCache
+        if let stored = app.services.get(LocationMenuCache.serviceKey, as: LocationMenuCache.self) {
+            cache = stored
+        } else {
+            cache = LocationMenuCache(settings: app.settings)
+            app.services.set(cache, for: LocationMenuCache.serviceKey)
         }
+        return cache.locations(app)
     }
 
     @MainActor
     static func location(_ slot: Int, _ app: NibApp) -> KnownLocation? {
         let all = locations(app)
         return slot < all.count ? all[slot] : nil
+    }
+}
+
+/// Menu closures share the decoded, sorted settings until a location setting or the root changes.
+@MainActor
+final class LocationMenuCache {
+    static let serviceKey = "sync.locationMenuCache"
+    private var cached: [KnownLocation]?
+    private var root: URL?
+    private var observer: NSObjectProtocol?
+
+    init(settings: SettingsStore) {
+        observer = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: settings,
+                                                          queue: .main) { [weak self] notification in
+            guard let name = notification.userInfo?["name"] as? String, name.hasPrefix(KnownLocations.prefix) else { return }
+            FolderWatcher.onMain { self?.cached = nil }
+        }
+    }
+
+    deinit { if let observer = observer { NotificationCenter.default.removeObserver(observer) } }
+
+    func locations(_ app: NibApp) -> [KnownLocation] {
+        if root != app.services.library?.rootURL { cached = nil }
+        root = app.services.library?.rootURL
+        if let cached = cached { return cached }
+        let list = KnownLocations.listed(app.settings, library: app.services.library).sorted { a, b in
+            let order = a.name.localizedStandardCompare(b.name)
+            return order == .orderedSame ? a.id < b.id : order == .orderedAscending
+        }
+        cached = list
+        return list
     }
 }

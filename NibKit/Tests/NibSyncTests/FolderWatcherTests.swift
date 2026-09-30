@@ -281,6 +281,28 @@ final class FolderWatcherTests: XCTestCase {
         XCTAssertThrowsError(try LibraryRelocate.validate(other, source: library))
     }
 
+    func testVerificationFailsForMissingSourceAndEnumerationFailure() throws {
+        let source = try temporaryFolder("Source")
+        let destination = try temporaryFolder("Destination")
+        try folder(destination, "Missing.nibnote")
+        XCTAssertEqual(LibraryCopier.verify(["Missing.nibnote"], source: source, destination: destination), ["Missing.nibnote"])
+        // A dangling child cannot be read; it must not turn into a zero-byte verified file.
+        try folder(source, "Broken.nibnote")
+        try folder(destination, "Broken.nibnote")
+        try FileManager.default.createSymbolicLink(atPath: source.appendingPathComponent("Broken.nibnote/dangling").path,
+                                                  withDestinationPath: source.appendingPathComponent("missing-target").path)
+        XCTAssertFalse(LibraryCopier.verify(["Broken.nibnote"], source: source, destination: destination).isEmpty)
+    }
+
+    func testCopyDoesNotReplaceADestinationItemThatAppearedAfterValidation() throws {
+        let source = try temporaryFolder("Source")
+        let destination = try temporaryFolder("Destination")
+        try file(source, "document.txt", "source")
+        try file(destination, "document.txt", "keep me")
+        XCTAssertThrowsError(try LibraryCopier.copy(LibraryCopier.topLevelItems(of: source), to: destination) { _, _, _ in })
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("document.txt")), Data("keep me".utf8))
+    }
+
     func testCopierCopiesVerifiesAndRemoves() throws {
         let source = try temporaryFolder("Source")
         let destination = try temporaryFolder("Destination")
@@ -311,7 +333,7 @@ final class FolderWatcherTests: XCTestCase {
 
         // Prefs written to the old folder while switching are carried over.
         try file(source, ".nib-library/prefs.00000007.json", #"{"a":2}"#)
-        LibraryRelocate.carryPrefs(from: source, to: destination)
+        try LibraryRelocate.carryPrefs(from: source, to: destination)
         XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent(".nib-library/prefs.00000007.json")), #"{"a":2}"#)
 
         // Moving removes the originals.

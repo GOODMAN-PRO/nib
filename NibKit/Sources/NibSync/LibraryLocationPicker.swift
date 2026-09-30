@@ -20,6 +20,8 @@ final class FolderPicker: NSObject, UIDocumentPickerDelegate {
 
     /// Keeps the delegate alive while the picker is up (the picker holds its delegate weakly).
     private static var active: FolderPicker?
+    /// Used only by hostless tests to exercise the real relocation command.
+    static var testOutcome: Outcome?
     private var continuation: CheckedContinuation<Outcome, Never>?
 
     static func pick(on navigator: SceneNavigator, startingAt directory: URL?) async -> Outcome {
@@ -70,6 +72,13 @@ enum PickerHost {
 
     /// Shows the folder picker and returns the chosen folder, or throws `user_denied` (cancelled) / `unavailable`.
     static func pickFolder(_ ctx: CommandContext, startingAt directory: URL?) async throws -> URL {
+        if NibApp.isHostlessTest, let outcome = FolderPicker.testOutcome {
+            switch outcome {
+            case .picked(let url): return url
+            case .cancelled: throw NibError(.userDenied, "no folder was chosen")
+            case .notShown: throw NibError.unavailable("the folder picker")
+            }
+        }
         guard let navigator = await navigator(ctx.app) else {
             throw NibError(.unavailable, "there is no window to show the folder picker in",
                            hint: "run this from the app while it is in the foreground")
@@ -287,10 +296,14 @@ enum LibraryCopier {
             let target = destination.appendingPathComponent(name)
             var coordinationError: NSError?
             var copyError: Error?
+            var startedCopy = false
             NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: source, options: [], writingItemAt: target,
                                                              options: .forReplacing, error: &coordinationError) { from, to in
                 do {
-                    if fm.fileExists(atPath: to.path) { try fm.removeItem(at: to) }
+                    guard !fm.fileExists(atPath: to.path) else {
+                        throw NibError(.invalidParams, "“\(name)” already exists in the destination", hint: "choose an empty folder")
+                    }
+                    startedCopy = true
                     try fm.copyItem(at: from, to: to)
                 } catch {
                     copyError = error
@@ -298,6 +311,8 @@ enum LibraryCopier {
             }
             if let e = coordinationError ?? copyError {
                 log.error("copying \(name, privacy: .private) failed: \(e.localizedDescription, privacy: .public)")
+                // copyItem may have created part of the target before failing. Never remove a pre-existing target.
+                if startedCopy { _ = remove([target]) }
                 _ = remove(created)
                 throw NibError(.internalError, "“\(name)” could not be copied: \(e.localizedDescription)",
                                hint: "check that the destination has enough space, then try again")
@@ -316,33 +331,66 @@ enum LibraryCopier {
     static func verify(_ names: [String], source: URL, destination: URL) -> [String] {
         var problems: [String] = []
         for name in names {
-            let from = inventory(source.appendingPathComponent(name))
-            let to = inventory(destination.appendingPathComponent(name))
-            for (path, size) in from where to[path] != size { problems.append(SyncFiles.join(name, path)) }
+            let from = detailedInventory(source.appendingPathComponent(name))
+            let to = detailedInventory(destination.appendingPathComponent(name))
+            guard from.files[""] != nil, !from.failed, !to.failed else {
+                problems.append(name)
+                continue
+            }
+            for (path, stamp) in from.files where to.files[path]?.size != stamp.size {
+                problems.append(SyncFiles.join(name, path))
+            }
         }
         return problems.sorted()
     }
 
-    /// Regular files (size) and directories (-1) at and below `url`, by path relative to it ("" = `url` itself).
-    static func inventory(_ url: URL) -> [String: Int] {
-        var out: [String: Int] = [:]
-        let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey]
-        let rootValues = try? url.resourceValues(forKeys: Set(keys))
-        guard rootValues != nil else { return out }
-        guard rootValues?.isDirectory == true else {
-            out[""] = rootValues?.fileSize ?? 0
-            return out
+    struct Inventory: Equatable {
+        var files: [String: FileStamp] = [:]
+        var failed = false
+    }
+
+    /// Includes mtimes so a same-size rewrite invalidates permission to delete the originals.
+    static func detailedInventory(_ url: URL) -> Inventory {
+        var out = Inventory()
+        let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+        func record(_ item: URL, _ path: String) {
+            do {
+                let values = try item.resourceValues(forKeys: Set(keys))
+                guard values.isDirectory == true || values.fileSize != nil else { out.failed = true; return }
+                out.files[path] = FileStamp(modified: values.contentModificationDate?.timeIntervalSince1970 ?? 0,
+                                            size: values.isDirectory == true ? -1 : (values.fileSize ?? 0))
+            } catch { out.failed = true }
         }
-        out[""] = -1
+        record(url, "")
+        guard out.files[""]?.size == -1 else { return out }
         let base = url.standardizedFileURL.path
-        guard let walker = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys, options: []) else {
+        guard let walker = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys, options: [],
+                                                           errorHandler: { _, _ in out.failed = true; return true }) else {
+            out.failed = true
             return out
         }
         for case let item as URL in walker {
             let full = item.standardizedFileURL.path
             let rel = full.hasPrefix(base + "/") ? String(full.dropFirst(base.count + 1)) : item.lastPathComponent
-            let values = try? item.resourceValues(forKeys: Set(keys))
-            out[rel] = values?.isDirectory == true ? -1 : (values?.fileSize ?? 0)
+            record(item, rel)
+        }
+        return out
+    }
+
+    /// Regular files (size) and directories (-1), retained for copy progress and diagnostics.
+    static func inventory(_ url: URL) -> [String: Int] {
+        detailedInventory(url).files.mapValues { $0.size ?? 0 }
+    }
+
+    /// Fresh top-level listing as well as descendants: detects new or renamed packages during a copy.
+    static func sourceInventory(_ root: URL) -> Inventory {
+        var out = Inventory()
+        do { _ = try FileManager.default.contentsOfDirectory(atPath: root.path) }
+        catch { out.failed = true }
+        for item in topLevelItems(of: root) {
+            let inventory = detailedInventory(item)
+            out.failed = out.failed || inventory.failed
+            for (path, stamp) in inventory.files { out.files[SyncFiles.join(item.lastPathComponent, path)] = stamp }
         }
         return out
     }

@@ -134,6 +134,8 @@ struct PackageListing: Equatable {
 
 /// The library folder's structure as the watcher last saw it.
 struct LibraryScan: Equatable {
+    /// Package prefixes excluded from metadata while their documents are loaded.
+    var loaded: Set<String> = []
     /// Library-relative paths of the live folders and packages (as the library catalog lists them).
     var tree: Set<String> = []
     /// Library-relative paths of everything in the Trash.
@@ -306,6 +308,7 @@ struct FolderScanner {
     func scanLibrary(root: URL, skipInbox: Bool, loaded: Set<String>, cache: [String: PackageListing],
                      useCache: Bool) -> (LibraryScan, [String: PackageListing]) {
         var scan = LibraryScan()
+        scan.loaded = loaded
         var newCache: [String: PackageListing] = [:]
         var walker = Walker(scanner: self, loaded: loaded, cache: cache, useCache: useCache)
         walker.walk(root, relative: "", inTrash: false, trashTop: false, isRoot: true, skipInbox: skipInbox,
@@ -489,7 +492,11 @@ enum SyncDiff {
     static func needsRefresh(old: LibraryScan?, new: LibraryScan, catalogTree: () -> Set<String>?,
                              catalogTrash: () -> Set<String>?) -> Bool {
         guard let old = old else { return false }
-        if old.meta != new.meta { return true }
+        let loaded = old.loaded.union(new.loaded)
+        func unloaded(_ meta: [String: FileStamp]) -> [String: FileStamp] {
+            meta.filter { key, _ in !loaded.contains { key.hasPrefix($0 + "/") } }
+        }
+        if unloaded(old.meta) != unloaded(new.meta) { return true }
         if old.tree != new.tree, let catalog = catalogTree(), catalog != new.tree { return true }
         if old.trash != new.trash, let catalog = catalogTrash(), catalog != new.trashTop { return true }
         return false
@@ -649,7 +656,7 @@ final class FolderWatcher {
     var pollInterval: TimeInterval = 30
     /// Seconds between polls while iCloud downloads files an open document needs.
     var downloadPollInterval: TimeInterval = 3
-    /// Seconds to wait for an evicted package before opening it anyway.
+    /// Seconds to wait for an evicted package before refusing the open.
     var downloadTimeout: TimeInterval = 30
     /// Presenter events are coalesced for this long before a check.
     var presenterDelay: TimeInterval = 0.4
@@ -658,6 +665,10 @@ final class FolderWatcher {
     /// Other devices' file stamps of each loaded document as last merged.
     private var baselines: [DocumentID: [String: FileStamp]] = [:]
     private var libraryBaseline: LibraryScan?
+    private var rootGeneration: UInt64 = 0
+    /// Hostless tests can hold a scan across a root change and simulate evicted items.
+    var testAfterScan: (() async -> Void)?
+    var testEvictedItems: (@Sendable (URL) -> [String])?
     private var packageCache: [String: PackageListing] = [:]
     /// Last `sync.status` sent per document ("" = the library).
     private var statuses: [String: SyncStatusPayload] = [:]
@@ -801,6 +812,7 @@ final class FolderWatcher {
 
     /// The library moved to another folder: everything known about the old one is dropped.
     func rootChanged() {
+        rootGeneration &+= 1
         libraryBaseline = nil
         packageCache = [:]
         // A library-level problem (unavailable or moved folder, a failed move) belonged to the folder left behind.
@@ -896,11 +908,13 @@ final class FolderWatcher {
 
     private func runCheck(full: Bool, reconcile: Bool) async -> SyncReport {
         guard let app = app else { return SyncReport() }
+        guard app.services.get(RelocationGate.serviceKey, as: RelocationGate.self)?.relocating != true else { return SyncReport() }
         checks += 1
         var report = SyncReport()
         let workspace = app.workspace
         let library = app.services.library
         let root = library?.rootURL.standardizedFileURL
+        let generation = rootGeneration
 
         var request = FolderScanner.Request()
         for doc in workspace.loadedDocuments {
@@ -916,6 +930,10 @@ final class FolderWatcher {
         request.useCache = !full
         let scanner = FolderScanner(device: device)
         let result = await Task.detached(priority: .utility) { scanner.run(request) }.value
+        if NibApp.isHostlessTest { await testAfterScan?() }
+        // No old-root result (documents, cache or status) may be applied after switching libraries.
+        guard rootGeneration == generation, library?.rootURL.standardizedFileURL == root,
+              app.services.get(RelocationGate.serviceKey, as: RelocationGate.self)?.relocating != true else { return report }
 
         // Loaded documents: merge what other devices wrote.
         var packageMissing = false
@@ -982,10 +1000,10 @@ final class FolderWatcher {
             packageCache = result.cache
             let catalogTree = { library.map { Set($0.allNodes().map { $0.path }) } }
             let catalogTrash = { library.map { Set($0.trashedNodes().map { $0.path }) } }
-            // The first scan after launch or a switch only sets the baseline (the library scans the folder itself then).
+            // Reconcile the first scan too: a remote addition may have missed the library's launch scan.
             var refresh = packageMissing || SyncDiff.needsRefresh(old: libraryBaseline, new: scan, catalogTree: catalogTree,
                                                                    catalogTrash: catalogTrash)
-            if reconcile && !refresh {
+            if (reconcile || libraryBaseline == nil) && !refresh {
                 refresh = (catalogTree().map { $0 != scan.tree } ?? false) || (catalogTrash().map { $0 != scan.trashTop } ?? false)
             }
             libraryBaseline = scan
@@ -1050,14 +1068,15 @@ final class FolderWatcher {
     func ensureDownloaded(_ doc: DocumentID) async -> Bool {
         guard let app = app, !app.workspace.isLoaded(doc), let url = app.services.packages.url(doc) else { return true }
         let scanner = FolderScanner(device: device)
-        var missing = await Task.detached(priority: .userInitiated) { scanner.evictedItems(inPackage: url) }.value
+        let probe = NibApp.isHostlessTest ? testEvictedItems : nil
+        var missing = await Task.detached(priority: .userInitiated) { probe?(url) ?? scanner.evictedItems(inPackage: url) }.value
         guard !missing.isEmpty else { return true }
         setStatus(doc, state: "downloading", reason: "evicted",
                   message: String(localized: "Downloading from iCloud…"), files: missing)
         let deadline = Date().addingTimeInterval(downloadTimeout)
         while !missing.isEmpty && Date() < deadline {
             try? await Task.sleep(nanoseconds: 300_000_000)
-            missing = await Task.detached(priority: .userInitiated) { scanner.evictedItems(inPackage: url) }.value
+            missing = await Task.detached(priority: .userInitiated) { probe?(url) ?? scanner.evictedItems(inPackage: url) }.value
         }
         if missing.isEmpty {
             setStatus(doc, state: "idle")

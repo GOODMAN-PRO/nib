@@ -15,6 +15,9 @@ final class FolderTestPersistence: DocumentPersistence {
     let locator: PackageLocator
     private(set) var remoteChangesCalls = 0
     private var heads: [DocumentID: DocumentContent] = [:]
+    var defersWrites = false
+    private var pending: [(DocumentID, DocumentContent?, [PageID: [Item]])] = []
+    private(set) var flushes = 0
     private var itemRevs: [DocumentID: [PageID: [NibID: Rev]]] = [:]
 
     init(device: String, locator: PackageLocator) {
@@ -95,6 +98,10 @@ final class FolderTestPersistence: DocumentPersistence {
     }
 
     func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        if defersWrites {
+            pending.append((doc, head, pages))
+            return
+        }
         guard let pkg = try? package(doc) else { return }
         if let h = head {
             heads[doc] = h
@@ -106,7 +113,15 @@ final class FolderTestPersistence: DocumentPersistence {
         }
     }
 
-    func flush(_ doc: DocumentID) {}
+    func flush(_ doc: DocumentID) {
+        flushes += 1
+        let writes = pending.filter { $0.0 == doc }
+        pending.removeAll { $0.0 == doc }
+        let deferred = defersWrites
+        defersWrites = false
+        for (id, head, pages) in writes { didChange(id, head: head, pages: pages) }
+        defersWrites = deferred
+    }
 
     func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL {
         let url = try package(doc).appendingPathComponent(relativePath)
@@ -438,6 +453,227 @@ final class NibSyncTests: XCTestCase {
         XCTAssertEqual(warning?.state, "warning")
         XCTAssertEqual(warning?.reason, "futureRevision")
         XCTAssertEqual(warning?.files, ["pages/FIXTUREPG001/00000008.nibpage"])
+    }
+
+    func testOpenAndCloseDoNotRefreshOtherDevicesUnchangedHeads() async throws {
+        let root = try temporaryFolder()
+        let pkg = root.appendingPathComponent("Shared.nibnote")
+        try seedNotebook(in: pkg)
+        try FolderTestPersistence.writeHead(Fixtures.sampleContent().0, device: "00000008", into: pkg)
+        let a = try device(7, root: root, pkg: pkg)
+        a.app.workspace.close(Fixtures.docID)
+        _ = await a.watcher.check()
+        _ = try a.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        let checked = await a.watcher.check()
+        XCTAssertFalse(checked.refreshed)
+        XCTAssertEqual(a.library.refreshes, 0)
+        a.app.workspace.close(Fixtures.docID)
+        let closed = await a.watcher.check()
+        XCTAssertFalse(closed.refreshed)
+        XCTAssertEqual(a.library.refreshes, 0)
+    }
+
+    func testFirstWatcherScanReconcilesAnAdditionMissedByCatalogLaunch() async throws {
+        let root = try temporaryFolder()
+        let pkg = root.appendingPathComponent("Shared.nibnote")
+        try seedNotebook(in: pkg)
+        let a = try device(7, root: root, pkg: pkg)
+        try seedNotebook(in: root.appendingPathComponent("Arrived.nibnote"))
+        let report = await a.watcher.check()
+        XCTAssertTrue(report.refreshed)
+        XCTAssertEqual(a.library.refreshes, 1)
+        XCTAssertTrue(a.library.nodes.contains { $0.path == "Arrived.nibnote" })
+    }
+
+    func testOldRootScanIsDiscardedAfterSwitch() async throws {
+        let root = try temporaryFolder()
+        let pkg = root.appendingPathComponent("Shared.nibnote")
+        try seedNotebook(in: pkg)
+        let a = try device(7, root: root, pkg: pkg)
+        let newRoot = try temporaryFolder("New Library")
+        a.watcher.testAfterScan = {
+            a.app.workspace.close(Fixtures.docID)
+            try! a.library.setRoot(newRoot)
+            a.watcher.rootChanged()
+        }
+        let stale = await a.watcher.check()
+        XCTAssertFalse(stale.refreshed)
+        XCTAssertEqual(a.library.refreshes, 0)
+        a.watcher.testAfterScan = nil
+        let current = await a.watcher.check()
+        XCTAssertFalse(current.refreshed)
+        XCTAssertEqual(a.library.refreshes, 0)
+    }
+
+    func testOpenRefusesEvictedItemsAfterDownloadTimeout() async throws {
+        let root = try temporaryFolder()
+        let pkg = root.appendingPathComponent("Shared.nibnote")
+        try seedNotebook(in: pkg)
+        let a = try device(7, root: root, pkg: pkg)
+        a.app.workspace.close(Fixtures.docID)
+        a.watcher.downloadTimeout = 0
+        a.watcher.testEvictedItems = { _ in ["doc.00000008.json", "pages/P/00000008.nibpage"] }
+        var opened = false
+        for command in [CommandIDs.docOpen, CommandIDs.windowOpen] {
+            a.app.commands.register(CommandDescriptor(id: command, title: "Open", summary: "Test open",
+                                                      params: .obj(["doc": .str()]), effect: .session)) { _, _ in
+                opened = true
+                return .null
+            }
+            do {
+                try await a.harness.run(command, ["doc": .string(NodeRef.document(Fixtures.docID).description)])
+                XCTFail("evicted document must not open")
+            } catch let error as NibError {
+                XCTAssertEqual(error.code, .unavailable)
+                XCTAssertEqual(error.message, "this document is still downloading from iCloud")
+                XCTAssertNotNil(error.hint)
+            }
+        }
+        XCTAssertFalse(opened)
+        XCTAssertFalse(a.app.workspace.isLoaded(Fixtures.docID))
+    }
+
+    private func relocationDevice() throws -> (Device, URL, URL) {
+        let source = try temporaryFolder("Source")
+        let destination = try temporaryFolder("Destination")
+        let pkg = source.appendingPathComponent("Shared.nibnote")
+        try FileManager.default.createDirectory(at: pkg, withIntermediateDirectories: true)
+        let (content, items) = Fixtures.sampleContent()
+        try FolderTestPersistence.writeHead(content, device: "00000007", into: pkg)
+        for (page, list) in items {
+            try FolderTestPersistence.writeItems(list, page: page, device: "00000007", into: pkg)
+        }
+        FolderPicker.testOutcome = .picked(destination)
+        addTeardownBlock {
+            await MainActor.run {
+                FolderPicker.testOutcome = nil
+                LibraryRelocate.testCheckpoint = nil
+            }
+        }
+        return (try device(7, root: source, pkg: pkg), source, destination)
+    }
+
+    func testMoveClosesAndFlushesPendingEditsAndGuardsCommandsUntilComplete() async throws {
+        let (a, source, destination) = try relocationDevice()
+        a.persistence.defersWrites = true
+        try await a.harness.insert([stroke("PENDINGEDIT1")])
+        LibraryRelocate.testCheckpoint = { phase in
+            guard phase == "beforeCopy" else { return }
+            XCTAssertFalse(a.app.workspace.isLoaded(Fixtures.docID))
+            XCTAssertGreaterThan(a.persistence.flushes, 0)
+            for command in [CommandIDs.docOpen, CommandIDs.windowOpen, CommandIDs.librarySwitch] {
+                if command != CommandIDs.librarySwitch {
+                    a.app.commands.register(CommandDescriptor(id: command, title: "Open", summary: "Test open",
+                                                              params: .obj(["doc": .str()]), effect: .session)) { _, _ in
+                        XCTFail("open handler ran while relocating")
+                        return .null
+                    }
+                }
+                do {
+                    let params: JSONValue = command == CommandIDs.librarySwitch ? ["location": "app"] : ["doc": "doc:FIXTUREDOC01"]
+                    try await a.harness.run(command, params)
+                    XCTFail("command must be refused during relocation")
+                } catch let error as NibError {
+                    XCTAssertEqual(error.code, .unavailable)
+                    XCTAssertEqual(error.message, "the library is being moved")
+                }
+            }
+        }
+        let result = try await a.harness.run("library.relocate", ["copy": false]).decode(LibraryRelocate.Output.self)
+        XCTAssertTrue(result.removedOriginal)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.appendingPathComponent("Shared.nibnote").path))
+        let pages = FolderTestPersistence.pageFiles(destination.appendingPathComponent("Shared.nibnote"), Fixtures.page1)
+        let copied = try pages.flatMap { try JSONDecoder().decode([Item].self, from: Data(contentsOf: $0)) }
+        XCTAssertTrue(copied.contains { $0.id == "PENDINGEDIT1" })
+        XCTAssertEqual(a.library.refreshes, 0)
+        XCTAssertNil(a.app.bus.hooks.get("sync.relocating"))
+        XCTAssertEqual(a.app.services.get(RelocationGate.serviceKey, as: RelocationGate.self)?.relocating, false)
+    }
+
+    func testMoveCopiesAnEditCommittedDuringRelocationAndKeepsChangedSource() async throws {
+        let (a, source, destination) = try relocationDevice()
+        let b = try device(8, root: source, pkg: source.appendingPathComponent("Shared.nibnote"))
+        LibraryRelocate.testCheckpoint = { phase in
+            guard phase == "beforeCopy" else { return }
+            // The move is in flight, the source snapshot was taken, and this app's document has closed.
+            // A second writer can still change the folder, so its edit must be copied and originals retained.
+            try await b.harness.insert([self.stroke("DURINGMOVE01")])
+        }
+        let result = try await a.harness.run("library.relocate", ["copy": false]).decode(LibraryRelocate.Output.self)
+        XCTAssertFalse(result.removedOriginal)
+        let pages = FolderTestPersistence.pageFiles(destination.appendingPathComponent("Shared.nibnote"), Fixtures.page1)
+        let copied = try pages.flatMap { try JSONDecoder().decode([Item].self, from: Data(contentsOf: $0)) }
+        XCTAssertTrue(copied.contains { $0.id == "DURINGMOVE01" })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.appendingPathComponent("Shared.nibnote").path))
+    }
+
+    func testMoveFailureReleasesGuardAndPreservesDestinationCollision() async throws {
+        let (a, source, destination) = try relocationDevice()
+        let target = destination.appendingPathComponent("Shared.nibnote")
+        LibraryRelocate.testCheckpoint = { phase in
+            guard phase == "beforeCopy" else { return }
+            try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+            try Data("provider created this".utf8).write(to: target.appendingPathComponent("keep.txt"))
+        }
+        do {
+            try await a.harness.run("library.relocate", ["copy": false])
+            XCTFail("destination collision must fail")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .internalError)
+        }
+        XCTAssertEqual(try Data(contentsOf: target.appendingPathComponent("keep.txt")), Data("provider created this".utf8))
+        XCTAssertEqual(a.library.rootURL, source)
+        XCTAssertNil(a.app.bus.hooks.get("sync.relocating"))
+        XCTAssertEqual(a.app.services.get(RelocationGate.serviceKey, as: RelocationGate.self)?.relocating, false)
+    }
+
+    func testLocationMenuCacheInvalidatesWhenRememberedLocationsChange() throws {
+        let first = try temporaryFolder("First")
+        let second = try temporaryFolder("Second")
+        let h = Harness(features: [NibSyncFeature.self], fixtures: false, keepFeatureServices: true)
+        h.app.services.library = FolderTestLibrary(root: first)
+        XCTAssertEqual(LibraryMenu.locations(h.app).count, 1)
+        let entry = KnownLocations.entry(for: second, bookmark: try Bookmarks.make(second), existing: [], now: 1)
+        KnownLocations.save(entry, h.app.settings)
+        XCTAssertEqual(LibraryMenu.locations(h.app).count, 2)
+        KnownLocations.remove(entry.id, h.app.settings)
+        XCTAssertEqual(LibraryMenu.locations(h.app).count, 1)
+    }
+
+    func testMoveKeepsOriginalForSameSizeRewriteAndNewPackageAfterVerification() async throws {
+        let (a, source, _) = try relocationDevice()
+        let loose = source.appendingPathComponent("edit.txt")
+        try Data("before".utf8).write(to: loose)
+        LibraryRelocate.testCheckpoint = { phase in
+            guard phase == "afterVerify" else { return }
+            try Data("after!".utf8).write(to: loose)
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)], ofItemAtPath: loose.path)
+            try FileManager.default.createDirectory(at: source.appendingPathComponent("New.nibnote"), withIntermediateDirectories: true)
+        }
+        let result = try await a.harness.run("library.relocate", ["copy": false]).decode(LibraryRelocate.Output.self)
+        XCTAssertFalse(result.removedOriginal)
+        XCTAssertEqual(try Data(contentsOf: loose), Data("after!".utf8))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.appendingPathComponent("New.nibnote").path))
+        XCTAssertTrue(KnownLocations.all(a.app.settings).contains { KnownLocations.matches($0, source) })
+        XCTAssertEqual(a.watcher.currentStatuses["lib"]?.reason, "originalKept")
+    }
+
+    func testMoveKeepsOriginalWhenCarryingPrefsFails() async throws {
+        let (a, source, destination) = try relocationDevice()
+        let relative = NibFormat.libraryDirectory + "/prefs.00000007.json"
+        try FileManager.default.createDirectory(at: source.appendingPathComponent(NibFormat.libraryDirectory), withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: source.appendingPathComponent(relative))
+        LibraryRelocate.testCheckpoint = { phase in
+            guard phase == "afterVerify" else { return }
+            try Data("{\"changed\":true}".utf8).write(to: source.appendingPathComponent(relative))
+            try FileManager.default.removeItem(at: destination.appendingPathComponent(relative))
+            try FileManager.default.createDirectory(at: destination.appendingPathComponent(relative), withIntermediateDirectories: true)
+        }
+        let result = try await a.harness.run("library.relocate", ["copy": false]).decode(LibraryRelocate.Output.self)
+        XCTAssertFalse(result.removedOriginal)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.appendingPathComponent(relative).path))
+        XCTAssertTrue(KnownLocations.all(a.app.settings).contains { KnownLocations.matches($0, source) })
+        XCTAssertTrue(a.watcher.currentStatuses["lib"]?.message?.contains("preferences") == true)
     }
 
     // MARK: Commands

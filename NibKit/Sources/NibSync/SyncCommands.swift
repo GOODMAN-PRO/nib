@@ -180,7 +180,9 @@ enum KnownLocations {
     static func listed(_ settings: SettingsStore, library: LibraryService?) -> [KnownLocation] {
         var list = all(settings)
         if let root = library?.rootURL, !list.contains(where: { matches($0, root) }) {
-            list.insert(entry(for: root, bookmark: nil, existing: [], now: SyncCommands.now), at: 0)
+            let inApp = LibraryFolder.isAppDocuments(root)
+            list.insert(KnownLocation(id: makeID(for: root), name: inApp ? String(localized: "Nib (inside the app)") : root.lastPathComponent,
+                                      path: LibraryFolder.canonicalPath(root), bookmark: "", inApp: inApp, added: SyncCommands.now), at: 0)
         }
         if let root = library?.rootURL, let i = list.firstIndex(where: { matches($0, root) }), i > 0 {
             list.insert(list.remove(at: i), at: 0)
@@ -238,27 +240,31 @@ struct LibraryLocationsList: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let library = ctx.services.library
         let root = library?.rootURL
-        var out = Output(current: nil, locations: [])
-        for location in KnownLocations.listed(ctx.services.settings, library: library) {
-            let isCurrent = root.map { KnownLocations.matches(location, $0) } ?? false
-            var available = false
-            var isLibrary = false
-            var provider = location.inApp ? "app" : "files"
-            if isCurrent, let root = root {
-                available = LibraryFolder.isDirectory(root)
-                isLibrary = LibraryFolder.isLibrary(root)
-                provider = LibraryFolder.provider(root)
-            } else if let opened = try? KnownLocations.open(location) {
-                available = true
-                isLibrary = LibraryFolder.isLibrary(opened.url)
-                provider = LibraryFolder.provider(opened.url)
-                opened.access?.end()
+        let locations = KnownLocations.listed(ctx.services.settings, library: library)
+        let out = await Task.detached(priority: .utility) {
+            var out = Output(current: nil, locations: [])
+            for location in locations {
+                let isCurrent = root.map { KnownLocations.matches(location, $0) } ?? false
+                var available = false
+                var isLibrary = false
+                var provider = location.inApp ? "app" : "files"
+                if isCurrent, let root = root {
+                    available = LibraryFolder.isDirectory(root)
+                    isLibrary = LibraryFolder.isLibrary(root)
+                    provider = LibraryFolder.provider(root)
+                } else if let opened = try? KnownLocations.open(location) {
+                    defer { opened.access?.end() }
+                    available = true
+                    isLibrary = LibraryFolder.isLibrary(opened.url)
+                    provider = LibraryFolder.provider(opened.url)
+                }
+                if isCurrent { out.current = location.id }
+                out.locations.append(LocationInfo(id: location.id, name: location.name, path: location.path, provider: provider,
+                                                  current: isCurrent, available: available, isLibrary: isLibrary,
+                                                  inApp: location.inApp, lastUsed: location.lastUsed))
             }
-            if isCurrent { out.current = location.id }
-            out.locations.append(LocationInfo(id: location.id, name: location.name, path: location.path, provider: provider,
-                                              current: isCurrent, available: available, isLibrary: isLibrary,
-                                              inApp: location.inApp, lastUsed: location.lastUsed))
-        }
+            return out
+        }.value
         return out
     }
 }
@@ -421,6 +427,7 @@ struct LibraryRelocate: NibCommand {
     }
 
     static let log = Logger(subsystem: "app.nib", category: "sync")
+    @MainActor static var testCheckpoint: ((String) async throws -> Void)?
 
     static let descriptor = CommandDescriptor(
         id: "library.relocate", title: String(localized: "Move Library"),
@@ -446,6 +453,28 @@ struct LibraryRelocate: NibCommand {
         let pickedAccess = ScopedAccess(picked)
         defer { pickedAccess.end() }
         try validate(picked, source: source)
+        guard library.rootURL.standardizedFileURL == source.standardizedFileURL,
+              ctx.services.get(RelocationGate.serviceKey, as: RelocationGate.self)?.relocating != true else {
+            throw NibError(.unavailable, "the library changed while choosing a destination", hint: "try the move again")
+        }
+
+        // Close flushes the debounce window while the locator still points to the old packages.
+        // The guard remains installed across every suspension, including cleanup on failure.
+        let gate = RelocationGate()
+        ctx.services.set(gate, for: RelocationGate.serviceKey)
+        gate.relocating = true
+        let guarded = (ctx.app?.commands.all() ?? []).filter { $0.effect == .library || $0.effect == .edit }.map { $0.id }
+        let hookID = "sync.relocating"
+        ctx.bus.hooks.register(.guarding(id: hookID, owner: NibSyncFeature.id,
+                                        commands: guarded + [CommandIDs.docOpen, CommandIDs.windowOpen], order: -1000) { _, _, _ in
+            if gate.relocating { throw NibError(.unavailable, "the library is being moved") }
+            return nil
+        })
+        defer {
+            gate.relocating = false
+            ctx.bus.hooks.unregister(id: hookID)
+        }
+        for doc in ctx.workspace.loadedDocuments { ctx.workspace.close(doc) }
 
         // The old folder stays reachable through the whole move: the library stops its own access when it switches.
         let sourceBookmark = LibraryFolder.isAppDocuments(source) ? nil : try? Bookmarks.make(source)
@@ -464,11 +493,9 @@ struct LibraryRelocate: NibCommand {
             }
         }
 
-        // Everything open reaches the disk before it is copied.
-        for doc in ctx.workspace.loadedDocuments { ctx.workspace.persistence.flush(doc) }
         watcher?.setStatus(nil, state: "checking", reason: "relocating",
                            message: String(localized: "Preparing to copy the library…"))
-        let items = LibraryCopier.topLevelItems(of: from)
+        let items = await Task.detached(priority: .utility) { LibraryCopier.topLevelItems(of: from) }.value
         let missing = await Task.detached(priority: .userInitiated) { await LibraryCopier.download(items, timeout: 120) }.value
         guard missing.isEmpty else {
             let e = NibError(.unavailable, "\(missing.count) items of the library are still downloading from iCloud",
@@ -476,6 +503,8 @@ struct LibraryRelocate: NibCommand {
             watcher?.setStatus(nil, state: "error", reason: "relocateFailed", message: e.message)
             throw e
         }
+        let beforeCopy = await Task.detached(priority: .utility) { LibraryCopier.sourceInventory(from) }.value
+        if NibApp.isHostlessTest { try await testCheckpoint?("beforeCopy") }
         let outcome: LibraryCopier.Outcome
         do {
             outcome = try await Task.detached(priority: .userInitiated) {
@@ -493,11 +522,14 @@ struct LibraryRelocate: NibCommand {
             throw e
         }
         let created = outcome.items.map { picked.appendingPathComponent($0) }
-        let problems = await Task.detached(priority: .userInitiated) {
-            LibraryCopier.verify(outcome.items, source: from, destination: picked)
+        let (problems, verified) = await Task.detached(priority: .userInitiated) {
+            let before = LibraryCopier.sourceInventory(from)
+            let problems = LibraryCopier.verify(outcome.items, source: from, destination: picked)
+            let after = LibraryCopier.sourceInventory(from)
+            return (problems, before == after && !after.failed ? after : LibraryCopier.Inventory(failed: true))
         }.value
         guard problems.isEmpty else {
-            LibraryCopier.remove(created)
+            _ = await Task.detached(priority: .utility) { LibraryCopier.remove(created) }.value
             log.error("library copy differs in \(problems.count) files")
             let e = NibError(.internalError, "the copy is incomplete: \(problems.count) files differ from the library",
                              hint: "try again; the old library is unchanged")
@@ -507,41 +539,58 @@ struct LibraryRelocate: NibCommand {
 
         let known = KnownLocations.all(settings)
         let leaving = KnownLocations.entry(for: source, bookmark: sourceBookmark, existing: known, now: SyncCommands.now)
+        if NibApp.isHostlessTest { try await testCheckpoint?("afterVerify") }
+        var prefsError: String?
+        do {
+            try await Task.detached(priority: .utility) { try carryPrefs(from: from, to: picked) }.value
+        } catch {
+            prefsError = error.localizedDescription
+        }
         do {
             try library.setRoot(picked)
         } catch {
-            LibraryCopier.remove(created)
+            _ = await Task.detached(priority: .utility) { LibraryCopier.remove(created) }.value
             let e = NibError.wrap(error)
             watcher?.setStatus(nil, state: "error", reason: "relocateFailed", message: e.message)
             throw e
         }
-        // Synced settings still waiting to be written went to the old folder while the library switched: bring them.
-        carryPrefs(from: from, to: picked)
-        library.refresh()
 
         var removed = false
         let now = SyncCommands.now
-        if p.copy {
+        if NibApp.isHostlessTest { try await testCheckpoint?("beforeRemove") }
+        // A fresh inventory includes additions, renames and same-size rewrites, even after verification.
+        let current = await Task.detached(priority: .utility) { LibraryCopier.sourceInventory(from) }.value
+        var retainedReason: String?
+        let verifiedNames = Set(verified.files.keys.compactMap { $0.split(separator: "/").first.map(String.init) })
+        if !p.copy {
+            if let error = prefsError {
+                retainedReason = "The old library was kept because preferences could not be copied: \(error)"
+            } else if beforeCopy.failed || verified.failed || current.failed || beforeCopy != verified || current != verified || verifiedNames != Set(outcome.items) {
+                retainedReason = "The old library was kept because its contents changed during the move."
+            } else {
+                let failed = await Task.detached(priority: .utility) { LibraryCopier.remove(items) }.value
+                removed = failed.isEmpty
+                if !removed { retainedReason = "The old library was kept because \(failed.count) items could not be removed." }
+            }
+        }
+        if removed {
+            KnownLocations.remove(leaving.id, settings)
+        } else {
             var left = leaving
             left.lastUsed = now
             KnownLocations.save(left, settings)
-        } else {
-            let failed = LibraryCopier.remove(items)
-            removed = failed.isEmpty
-            if removed {
-                KnownLocations.remove(leaving.id, settings)
-            } else {
-                var left = leaving
-                left.lastUsed = now
-                KnownLocations.save(left, settings)
-                log.error("\(failed.count) items of the old library could not be removed")
-            }
         }
         var entry = KnownLocations.entry(for: picked, bookmark: destinationBookmark,
                                          existing: known.filter { $0.id != leaving.id }, now: now)
         entry.lastUsed = now + 0.001
         KnownLocations.save(entry, settings)
-        watcher?.setStatus(nil, state: "idle")
+        if let message = retainedReason {
+            watcher?.setStatus(nil, state: "warning", reason: "originalKept", message: message)
+        } else if let error = prefsError {
+            watcher?.setStatus(nil, state: "warning", reason: "prefsNotCopied", message: error)
+        } else {
+            watcher?.setStatus(nil, state: "idle")
+        }
         return Output(location: entry.id, name: entry.name, path: entry.path, provider: LibraryFolder.provider(picked),
                       files: outcome.files, bytes: outcome.bytes, removedOriginal: removed)
     }
@@ -563,7 +612,10 @@ struct LibraryRelocate: NibCommand {
             throw NibError(.invalidParams, "“\(picked.lastPathComponent)” already holds a Nib library",
                            hint: "switch to it with library.chooseFolder, or choose an empty folder")
         }
-        if !LibraryFolder.visibleEntries(picked).isEmpty {
+        let visible = LibraryFolder.visibleEntries(picked).filter {
+            !LibraryFolder.isAppDocuments(picked) || $0 != SyncFiles.inboxName
+        }
+        if !visible.isEmpty {
             throw NibError(.invalidParams, "“\(picked.lastPathComponent)” is not empty",
                            hint: "choose an empty folder (New Folder in the picker makes one)")
         }
@@ -571,18 +623,23 @@ struct LibraryRelocate: NibCommand {
 
     /// Copies the old folder's synced prefs files over the new folder's (coordinated), so preferences changed while
     /// the library switched are not lost.
-    static func carryPrefs(from source: URL, to destination: URL) {
+    nonisolated static func carryPrefs(from source: URL, to destination: URL) throws {
         let fm = FileManager.default
         let old = source.appendingPathComponent(NibFormat.libraryDirectory, isDirectory: true)
         let new = destination.appendingPathComponent(NibFormat.libraryDirectory, isDirectory: true)
-        for name in (try? fm.contentsOfDirectory(atPath: old.path)) ?? [] where SyncFiles.isPrefs(name) {
+        guard fm.fileExists(atPath: old.path) else { return }
+        for name in try fm.contentsOfDirectory(atPath: old.path) where SyncFiles.isPrefs(name) {
             let a = old.appendingPathComponent(name), b = new.appendingPathComponent(name)
-            guard (try? Data(contentsOf: a)) != (try? Data(contentsOf: b)) else { continue }
-            do {
-                try LibraryCopier.replace(b, with: a)
-            } catch {
-                log.error("could not carry \(name, privacy: .public) over: \(error.localizedDescription, privacy: .public)")
-            }
+            let data = try Data(contentsOf: a)
+            guard data != (try? Data(contentsOf: b)) else { continue }
+            try LibraryCopier.replace(b, with: a)
         }
     }
+}
+
+/// One gate per active relocation; the command guard owns its lifetime.
+@MainActor
+final class RelocationGate {
+    static let serviceKey = "sync.relocation"
+    var relocating = false
 }
