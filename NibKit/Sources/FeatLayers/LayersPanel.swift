@@ -3,13 +3,6 @@ import Combine
 import NibContracts
 import NibDesign
 
-enum LayerGlyph {
-    /// DESIGN.md §8 names no layers glyph and NibSymbol has no `.layers` case (contract request: add
-    /// `NibSymbol.layers` = "square.3.layers.3d"); descriptor icon strings resolve through `NibSymbol(systemName:)`.
-    static let name = "square.3.layers.3d"
-    static var symbol: NibSymbol { NibSymbol(systemName: name) ?? .pages }
-}
-
 // MARK: - Registrations (panel, menus, shortcuts, settings page)
 
 @MainActor
@@ -17,39 +10,55 @@ enum LayersChrome {
     static let panelID = "layers"
     static let moreMenuID = "layers.panel.more"
     static let panelKeyID = "layers.panel.key"
+    static let panelShortcut = KeyShortcut("l", [.command, .option])
 
     static func activeKeyID(_ layer: Int) -> String { "layers.active.\(layer)" }
     static func moveMenuID(_ layer: Int) -> String { "layers.moveTo.\(layer)" }
 
     /// Always present; each entry checks `layers.show` itself.
     static func registerMenus(_ app: NibApp, owner: String) {
-        app.ui.menus.register(MenuItemDescriptor(
-            id: moreMenuID, title: String(localized: "Layers"), icon: LayerGlyph.name, location: .documentMore,
+        var more = MenuItemDescriptor(
+            id: moreMenuID, title: String(localized: "Layers"), icon: NibSymbol.layers.name, location: .documentMore,
             order: 450, owner: owner, command: CommandIDs.panelOpen,
             params: { _ in ["id": .string(panelID)] },
             isVisible: { ctx in
                 guard ctx.app.settings.get(LayerSettings.show), let doc = ctx.doc,
                       let kind = try? ctx.app.workspace.content(doc).meta.kind else { return false }
                 return LayerModel.documentKinds.contains(kind)
-            }))
-        registerMoveMenu(app, owner: owner, names: LayerModel.all.map(LayerModel.defaultName))
-        app.ui.settingsPages.register(SettingsPageDescriptor(
-            id: "layers.settings", title: String(localized: "Layers"), icon: LayerGlyph.name, section: .editing,
-            order: 700, owner: owner, makeView: { app in AnyView(LayersSettingsView(app: app)) }))
+            })
+        more.shortcut = panelShortcut
+        app.ui.menus.register(more)
+        registerMoveMenu(app, owner: owner)
+        var page = SettingsPageDescriptor(
+            id: "layers.settings", title: String(localized: "Layers"), icon: NibSymbol.layers.name, section: .editing,
+            order: 700, owner: owner, makeView: { app in AnyView(LayersSettingsView(app: app)) })
+        page.keywords = [String(localized: "Hide"), String(localized: "Show"), String(localized: "Visible"),
+                         String(localized: "Active Layer"), String(localized: "Move to Layer")]
+        app.ui.settingsPages.register(page)
     }
 
-    /// Object menu › Move to Layer › <layer names of the active window's document>.
-    static func registerMoveMenu(_ app: NibApp, owner: String, names: [String]) {
+    /// Object menu › Move to Layer › <layer names of the menu's document>: one registration per layer, titled per
+    /// window through `contextTitle`, so two windows showing different documents each see their own names.
+    static func registerMoveMenu(_ app: NibApp, owner: String) {
         for layer in LayerModel.all {
-            app.ui.menus.register(MenuItemDescriptor(
-                id: moveMenuID(layer), title: names[layer], location: .objectMenu, order: 700 + layer, owner: owner,
-                command: LayerCommandIDs.moveItems,
+            var entry = MenuItemDescriptor(
+                id: moveMenuID(layer), title: LayerModel.defaultName(layer), location: .objectMenu, order: 700 + layer,
+                owner: owner, command: CommandIDs.layerMoveItems,
                 params: { ctx in
                     ["refs": .array(ctx.selection.refs.map { JSONValue.string($0) }), "layer": .number(Double(layer))]
                 },
                 isVisible: { ctx in canMove(ctx, to: layer) },
-                submenu: String(localized: "Move to Layer")))
+                submenu: String(localized: "Move to Layer"))
+            entry.contextTitle = { ctx in layerNames(ctx)[layer] }
+            app.ui.menus.register(entry)
         }
+    }
+
+    /// The five layer names of the document a menu is for (the selection's, else the window's).
+    static func layerNames(_ ctx: MenuContext) -> [String] {
+        let doc = ctx.selection.doc ?? ctx.doc ?? ctx.session?.document
+        let layers = doc.flatMap { try? ctx.app.workspace.content($0).meta.layers } ?? []
+        return LayerModel.normalized(layers).map { $0.name }
     }
 
     /// Offered while layers are on, for a selection that is not already entirely on `layer`.
@@ -72,17 +81,22 @@ enum LayersChrome {
             return
         }
         app.ui.panels.register(PanelDescriptor(
-            id: panelID, title: String(localized: "Layers"), icon: LayerGlyph.name, placement: .sidebarTab, order: 500,
-            owner: owner, docKinds: LayerModel.documentKinds,
+            id: panelID, title: String(localized: "Layers"), icon: NibSymbol.layers.name, placement: .sidebarTab,
+            order: 500, owner: owner, docKinds: LayerModel.documentKinds,
             makeView: { context in AnyView(LayersPanelRoot(context: context)) }))
-        app.content.keyCommands.register(KeyCommandDescriptor(
-            id: panelKeyID, title: String(localized: "Layers"), shortcut: KeyShortcut("l", [.command, .option]),
-            command: CommandIDs.panelOpen, params: ["id": .string(panelID)], scope: .document, order: 500, owner: owner))
+        // Live only in notebooks and whiteboards (contracts-v2.2 key routing), where layers exist.
+        var panelKey = KeyCommandDescriptor(
+            id: panelKeyID, title: String(localized: "Layers"), shortcut: panelShortcut,
+            command: CommandIDs.panelOpen, params: ["id": .string(panelID)], scope: .document, order: 500, owner: owner)
+        panelKey.docKinds = LayerModel.documentKinds
+        app.content.keyCommands.register(panelKey)
         for layer in LayerModel.all {
-            app.content.keyCommands.register(KeyCommandDescriptor(
+            var key = KeyCommandDescriptor(
                 id: activeKeyID(layer), title: String(localized: "Draw on Layer \(layer + 1)"),
-                shortcut: KeyShortcut(String(layer + 1), [.command, .option]), command: LayerCommandIDs.setActive,
-                params: ["layer": .number(Double(layer))], scope: .document, order: 501 + layer, owner: owner))
+                shortcut: KeyShortcut(String(layer + 1), [.command, .option]), command: CommandIDs.layerSetActive,
+                params: ["layer": .number(Double(layer))], scope: .document, order: 501 + layer, owner: owner)
+            key.docKinds = LayerModel.documentKinds
+            app.content.keyCommands.register(key)
         }
     }
 }
@@ -104,7 +118,7 @@ struct LayersPanelRoot: View {
 
 struct LayersEmptyState: View {
     var body: some View {
-        NibEmptyState(symbol: LayerGlyph.symbol, title: String(localized: "No notebook open"),
+        NibEmptyState(symbol: .layers, title: String(localized: "No notebook open"),
                       message: String(localized: "Open a notebook or whiteboard to see its layers."))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -159,9 +173,9 @@ struct LayersPanel: View {
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 ForEach(rows) { row in
                     LayerRowView(row: row, isBoard: meta.kind == .whiteboard, canMoveSelection: !selection.isEmpty,
-                                 onActivate: { run(LayerCommandIDs.setActive, ["layer": .number(Double(row.index))]) },
+                                 onActivate: { run(CommandIDs.layerSetActive, ["layer": .number(Double(row.index))]) },
                                  onToggleVisible: {
-                                     run(LayerCommandIDs.setVisible, ["layer": .number(Double(row.index)),
+                                     run(CommandIDs.layerSetVisible, ["layer": .number(Double(row.index)),
                                                                      "visible": .bool(row.isHidden)])
                                  },
                                  onRename: {
@@ -234,12 +248,12 @@ struct LayersPanel: View {
     private func commitRename(doc: DocumentID) {
         guard let layer = renaming else { return }
         renaming = nil
-        run(LayerCommandIDs.rename, ["doc": .string(NodeRef.document(doc).description),
+        run(CommandIDs.layerRename, ["doc": .string(NodeRef.document(doc).description),
                                      "layer": .number(Double(layer)), "name": .string(draftName)])
     }
 
     private func moveSelection(to layer: Int) {
-        run(LayerCommandIDs.moveItems, ["refs": .array(session.selection.refs.map { JSONValue.string($0) }),
+        run(CommandIDs.layerMoveItems, ["refs": .array(session.selection.refs.map { JSONValue.string($0) }),
                                         "layer": .number(Double(layer))])
     }
 

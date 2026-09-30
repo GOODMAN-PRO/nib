@@ -1,16 +1,7 @@
 import Foundation
 import NibContracts
 
-// MARK: - Ids and settings
-
-/// Command ids owned by F041 (ARCHITECTURE §6.5), plus the export hook (see `LayerExportOptions`).
-enum LayerCommandIDs {
-    static let setActive = "layer.setActive"
-    static let setVisible = "layer.setVisible"
-    static let rename = "layer.rename"
-    static let moveItems = "layer.moveItems"
-    static let exportOptions = "layer.exportOptions"
-}
+// MARK: - Settings
 
 /// How one document's layers look on THIS device: hidden layers and the active layer. Session state (never in the
 /// document), persisted per document in device settings so reopening a notebook keeps its hidden layers here only.
@@ -63,7 +54,7 @@ enum LayerModel {
     static let documentKinds: Set<DocumentKind> = [.notebook, .whiteboard]
     static let maxNameLength = 100
     /// Commits that write to a hidden layer without "editing" it: moving items there on purpose, undo/redo, reverts.
-    static let passiveCommands: Set<String> = [LayerCommandIDs.moveItems, CommandIDs.undo, CommandIDs.redo,
+    static let passiveCommands: Set<String> = [CommandIDs.layerMoveItems, CommandIDs.undo, CommandIDs.redo,
                                                CommandIDs.revertGroup]
 
     /// The name `LayerInfo` decodes to when none is stored.
@@ -145,12 +136,15 @@ enum LayerModel {
     }
 
     /// `export.run` params with this device's visible layers added as `options.visibleLayers` ({docID: [layer]}, only
-    /// for documents with hidden layers) and `options.visibleLayersOnly: true`. nil = leave the call unchanged: nothing
-    /// is hidden, or the caller already chose (`visibleLayers` given, or `visibleLayersOnly: false` to export all).
+    /// for documents with hidden layers) and `options.visibleLayersOnly: true` (`ExportOptionKeys`, F066 reads them).
+    /// nil = leave the call unchanged: nothing is hidden, or the caller already chose (`visibleLayers` given, or
+    /// `visibleLayersOnly: false` to export all).
     static func exportParams(_ params: JSONValue, visible: (DocumentID) -> Set<Int>) -> JSONValue? {
         guard case .object(var p) = params else { return nil }
         var options = p["options"]?.objectValue ?? [:]
-        if options["visibleLayers"] != nil || options["visibleLayersOnly"] == .bool(false) { return nil }
+        if options[ExportOptionKeys.visibleLayers] != nil || options[ExportOptionKeys.visibleLayersOnly] == .bool(false) {
+            return nil
+        }
         let docsValue = p["docs"] ?? p["doc"]
         let refs: [JSONValue] = docsValue?.arrayValue ?? docsValue.map { [$0] } ?? []
         var map: [String: JSONValue] = [:]
@@ -162,8 +156,8 @@ enum LayerModel {
             }
         }
         guard !map.isEmpty else { return nil }
-        options["visibleLayersOnly"] = .bool(true)
-        options["visibleLayers"] = .object(map)
+        options[ExportOptionKeys.visibleLayersOnly] = .bool(true)
+        options[ExportOptionKeys.visibleLayers] = .object(map)
         p["options"] = .object(options)
         return .object(p)
     }
@@ -355,7 +349,8 @@ struct LayerSetVisible: NibCommand {
 
 struct LayerRename: NibCommand {
     struct Params: Codable {
-        var doc: String
+        /// The user may omit it: the invoking window's document (§6.1 session defaults).
+        var doc: String?
         var layer: Int
         var name: String
     }
@@ -374,7 +369,7 @@ struct LayerRename: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         try LayerModel.check(p.layer, path: "$.layer")
         let name = try LayerModel.cleanName(p.name, layer: p.layer)
-        let doc = NodeRef.documentID(from: p.doc)
+        let doc = try ctx.documentOrSession(p.doc)
         try ctx.mutate { (tx: DocTransaction) -> Void in
             var meta = try tx.content(doc).meta
             guard LayerModel.documentKinds.contains(meta.kind) else {
@@ -392,7 +387,8 @@ struct LayerRename: NibCommand {
 
 struct LayerMoveItems: NibCommand {
     struct Params: Codable {
-        var refs: [String]
+        /// The user may omit it: the invoking window's selection (§6.1 session defaults).
+        var refs: [String]?
         var layer: Int
     }
     struct Output: Codable {
@@ -417,9 +413,10 @@ struct LayerMoveItems: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         try LayerModel.check(p.layer, path: "$.layer")
-        guard !p.refs.isEmpty else { throw NibError.invalid("refs is empty", path: "$.refs") }
+        let refs = ctx.refsOrSelection(p.refs)
+        guard !refs.isEmpty else { throw NibError.invalid("refs is empty and nothing is selected", path: "$.refs") }
         var groups: [Group] = []
-        for (i, ref) in p.refs.enumerated() {
+        for (i, ref) in refs.enumerated() {
             guard case let .item(doc, page, id)? = NodeRef(ref) else {
                 throw NibError(.invalidParams, "expected an item ref (item:D/P/I)", path: "$.refs[\(i)]",
                                hint: "query.find returns item refs")
@@ -440,11 +437,14 @@ struct LayerMoveItems: NibCommand {
                     throw NibError(.notFound, "item \(entry.id) not found on page \(g.page)", path: entry.path)
                 }
                 let ids = LayerModel.withAttachedChildren(Set(g.ids.map { $0.id }), in: items)
+                var changed: [Item] = []
                 for var item in items where ids.contains(item.id) && item.layer != p.layer {
                     item.layer = p.layer
-                    try tx.put(item, doc: g.doc, page: g.page)
+                    changed.append(item)
                     moved.insert(item.id)
                 }
+                // One batch write per page: a whole-page selection stays linear (§6.1 batch writes).
+                try tx.put(changed, doc: g.doc, page: g.page)
             }
             return moved
         }
@@ -456,38 +456,36 @@ struct LayerMoveItems: NibCommand {
     }
 }
 
-/// Command hook on `export.run` and `render.page` (registered in `app.bus.hooks`): exports and renders include only
-/// the layers visible on this device, also for documents no window shows. Off while `layers.show` is off (every layer
-/// is shown then). ponytail: an id beyond §6.5's four because hooks must be `read` commands; reported as a contract gap.
-struct LayerExportOptions: NibCommand {
-    struct Params: Codable {
-        var command: String?
-        var params: JSONValue?
-    }
-    static let hooked = [CommandIDs.exportRun, CommandIDs.renderPage]
-    static let example: JSONValue = ["command": "export.run",
-                                     "params": ["docs": ["doc:FIXTUREDOC01"], "format": "pdf"]]
-    static let descriptor = CommandDescriptor(
-        id: "layer.exportOptions", title: "Export Visible Layers",
-        summary: "Hook for export.run and render.page: adds options.visibleLayers {docID: [layers]} or layers, so layers hidden on this device are left out.",
-        params: .obj(["command": .str(), "params": .anything("the export.run or render.page params")], required: ["command"]),
-        examples: [example], effect: .read, target: .app)
+/// Exports and renders include only the layers visible on this device, also for documents no window shows: a
+/// contracts-v2 closure hook (G26) on `export.run` and `render.page` in `app.bus.hooks`. It writes
+/// `ExportOptionKeys.visibleLayersOnly` / `visibleLayers` into export.run's `options` (F066 reads them) and `layers`
+/// into render.page, unless the caller already chose. Off while `layers.show` is off (every layer is shown then).
+/// A guard hook sees the call's context, so the invoking window's view wins over the stored one. It replaces the v1
+/// `layer.exportOptions` hook command, which existed only because command hooks had to be read commands.
+@MainActor
+enum LayerExportHook {
+    static let id = "layers.visibleLayersOnly"
+    static let commands = [CommandIDs.exportRun, CommandIDs.renderPage]
 
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> JSONValue {
+    static func descriptor(owner: String) -> CommandHookDescriptor {
+        .guarding(id: id, owner: owner, commands: commands) { command, params, ctx in
+            rewrite(command, params, ctx)
+        }
+    }
+
+    /// The call's params with this device's visible layers added, or nil to let it through unchanged.
+    static func rewrite(_ command: String, _ params: JSONValue, _ ctx: CommandContext) -> JSONValue? {
         let sessions = ctx.services.sessions
         let settings = ctx.services.settings
+        guard settings.get(LayerSettings.show) else { return nil }
         let caller = ctx.session
-        guard settings.get(LayerSettings.show), let params = p.params else { return [:] }
         let visible = { (doc: DocumentID) -> Set<Int> in
             LayerView.visibleLayers(doc, sessions: sessions, settings: settings, preferring: caller)
         }
-        let changed: JSONValue?
-        switch p.command ?? "" {
-        case CommandIDs.exportRun: changed = LayerModel.exportParams(params, visible: visible)
-        case CommandIDs.renderPage: changed = LayerModel.renderParams(params, visible: visible)
-        default: changed = nil
+        switch command {
+        case CommandIDs.exportRun: return LayerModel.exportParams(params, visible: visible)
+        case CommandIDs.renderPage: return LayerModel.renderParams(params, visible: visible)
+        default: return nil
         }
-        guard let changed else { return [:] }
-        return ["params": changed]
     }
 }

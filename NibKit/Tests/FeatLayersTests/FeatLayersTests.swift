@@ -39,21 +39,29 @@ final class FeatLayersTests: XCTestCase {
     func testRegistersCommandsHookMenusAndSettings() {
         let h = harness()
         XCTAssertEqual(FeatLayersFeature.id, "layers")
-        for id in ["layer.setActive", "layer.setVisible", "layer.rename", "layer.moveItems", "layer.exportOptions"] {
+        for id in [CommandIDs.layerSetActive, CommandIDs.layerSetVisible, CommandIDs.layerRename, CommandIDs.layerMoveItems] {
             XCTAssertEqual(h.app.commands.descriptor(id)?.owner, FeatLayersFeature.id, id)
         }
         XCTAssertEqual(h.app.commands.descriptor("layer.setActive")?.effect, .session)
         XCTAssertEqual(h.app.commands.descriptor("layer.setVisible")?.effect, .session)
         XCTAssertEqual(h.app.commands.descriptor("layer.rename")?.effect, .edit)
         XCTAssertEqual(h.app.commands.descriptor("layer.moveItems")?.effect, .edit)
-        XCTAssertTrue(h.app.bus.hooks.all.contains {
-            $0.matches(CommandIDs.exportRun) && $0.matches(CommandIDs.renderPage) && $0.command == "layer.exportOptions"
-        })
+        // The export hook is a contracts-v2 closure guard (G26), not an extra hook command.
+        XCTAssertNil(h.app.commands.descriptor(CommandIDs.layerExportOptions))
+        let hook = h.app.bus.hooks.all.first { $0.owner == FeatLayersFeature.id }
+        XCTAssertEqual(hook?.id, "layers.visibleLayersOnly")
+        XCTAssertEqual(hook?.matches(CommandIDs.exportRun), true)
+        XCTAssertEqual(hook?.matches(CommandIDs.renderPage), true)
+        XCTAssertNotNil(hook?.contextHandler)
         XCTAssertEqual(h.app.settings.descriptor("layers.show")?.synced, true)
         XCTAssertEqual(h.app.settings.descriptor("layers.view.FIXTUREDOC01")?.synced, false)
         XCTAssertNotNil(h.app.ui.menus.get("layers.moveTo.4"))
-        XCTAssertNotNil(h.app.ui.menus.get("layers.panel.more"))
-        XCTAssertNotNil(h.app.ui.settingsPages.get("layers.settings"))
+        let more = h.app.ui.menus.get("layers.panel.more")
+        XCTAssertEqual(more?.icon, "square.3.layers.3d")
+        XCTAssertEqual(more?.shortcut, KeyShortcut("l", [.command, .option]), "the menu shows the panel's key")
+        let page = h.app.ui.settingsPages.get("layers.settings")
+        XCTAssertEqual(page?.icon, "square.3.layers.3d")
+        XCTAssertFalse(page?.keywords.isEmpty ?? true, "settings search finds the page by its words")
     }
 
     // MARK: Rename
@@ -105,6 +113,29 @@ final class FeatLayersTests: XCTestCase {
         XCTAssertEqual(try item(h, "LAYERCHILD01").layer, 3)
     }
 
+    func testUserCallersMayOmitRefsAndDocForTheWindowsSelectionAndDocument() async throws {
+        let h = harness()
+        // Menus and keys run with static params: the user's layer.moveItems takes the window's selection and
+        // layer.rename the window's document (§6.1 session defaults).
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.textID])
+        let out = try await h.run("layer.moveItems", ["layer": 2])
+        XCTAssertEqual(out["moved"]?.intValue, 1)
+        XCTAssertEqual(try item(h, Fixtures.textID).layer, 2)
+        XCTAssertEqual(try item(h, Fixtures.strokeID).layer, 0)
+        XCTAssertTrue(h.session.selection.isEmpty, "a selection that left the active layer is dropped")
+
+        let renamed = try await h.run("layer.rename", ["layer": 4, "name": "Answers"])
+        XCTAssertEqual(renamed["doc"]?.stringValue, "doc:FIXTUREDOC01")
+        XCTAssertEqual(try layerName(h, 4), "Answers")
+
+        // Nothing selected: nothing to move. The AI, plugins and the bridge still pass refs and doc.
+        await assertError(.invalidParams) { _ = try await h.run("layer.moveItems", ["layer": 1]) }
+        await assertError(.invalidParams) { _ = try await h.run("layer.moveItems", ["layer": 1], as: .ai("chat")) }
+        await assertError(.invalidParams) {
+            _ = try await h.run("layer.rename", ["layer": 1, "name": "Notes"], as: .ai("chat"))
+        }
+    }
+
     func testRejectsBadParamsAndDocumentsWithoutLayers() async {
         let h = harness()
         await assertError(.invalidParams) {
@@ -138,7 +169,7 @@ final class FeatLayersTests: XCTestCase {
         await FeatLayersFeature.start(h.app)
         // A stand-in renderer that returns the params it received (after hooks).
         h.app.commands.register(CommandDescriptor(id: CommandIDs.renderPage, title: "Render", summary: "Echo the params.",
-                                                  effect: .read)) { params, _ in params }
+                                                  params: .anything("render.page params"), effect: .read)) { params, _ in params }
         let page1: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG001"]
         h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
 
@@ -179,6 +210,9 @@ final class FeatLayersTests: XCTestCase {
         XCTAssertEqual(unopened["layers"], visible)
         let board = try await h.run(CommandIDs.renderPage, ["page": "page:FIXTUREDOC04/FIXTUREBRD01"])
         XCTAssertNil(board["layers"], "nothing hidden on the board: the call is unchanged")
+        // The guard hook runs for every principal: an AI or bridge render leaves the hidden layer out too.
+        let aiRender = try await h.run(CommandIDs.renderPage, page1, as: .ai("chat"))
+        XCTAssertEqual(aiRender["layers"], visible)
     }
 
     func testTurningLayersOffShowsEveryLayerAndOnRestoresTheView() async throws {
@@ -338,8 +372,17 @@ final class FeatLayersTests: XCTestCase {
         let panel = try XCTUnwrap(h.app.ui.panels.get("layers"))
         XCTAssertEqual(panel.placement, .sidebarTab)
         XCTAssertEqual(panel.docKinds, Set([DocumentKind.notebook, .whiteboard]))
-        XCTAssertEqual(h.app.content.keyCommands.get("layers.active.2")?.command, "layer.setActive")
-        XCTAssertEqual(h.app.content.keyCommands.get("layers.panel.key")?.params["id"]?.stringValue, "layers")
+        let key = try XCTUnwrap(h.app.content.keyCommands.get("layers.active.2"))
+        XCTAssertEqual(key.command, "layer.setActive")
+        let panelKey = try XCTUnwrap(h.app.content.keyCommands.get("layers.panel.key"))
+        XCTAssertEqual(panelKey.params["id"]?.stringValue, "layers")
+        // The keys are live only where layers exist (contracts-v2.2 key routing).
+        for k in [key, panelKey] {
+            XCTAssertEqual(k.docKinds, Set([DocumentKind.notebook, .whiteboard]))
+            XCTAssertTrue(k.isActive(in: KeyCommandContext(inDocument: true, docKind: .whiteboard)))
+            XCTAssertFalse(k.isActive(in: KeyCommandContext(inDocument: true, docKind: .textDocument)))
+            XCTAssertFalse(k.isActive(in: KeyCommandContext(inDocument: false, docKind: nil, hasTabs: true)))
+        }
 
         h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
         let menu = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1,
@@ -354,14 +397,25 @@ final class FeatLayersTests: XCTestCase {
         XCTAssertFalse(LayersChrome.canMove(menu, to: 3))
     }
 
-    func testMoveMenuShowsTheDocumentsLayerNames() async throws {
+    func testMoveMenuShowsEachWindowsLayerNames() async throws {
         let h = harness()
         await FeatLayersFeature.start(h.app)
-        XCTAssertEqual(h.app.ui.menus.get("layers.moveTo.1")?.title, "Layer 2")
+        let entry = try XCTUnwrap(h.app.ui.menus.get("layers.moveTo.1"))
+        let notebook = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1,
+                                   selection: Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID]))
+        let board = MenuContext(app: h.app, doc: Fixtures.whiteboardID)
+        XCTAssertEqual(entry.title, "Layer 2")
+        XCTAssertEqual(entry.resolvedTitle(for: notebook), "Layer 2")
+
         _ = try await h.run("layer.rename", ["doc": "doc:FIXTUREDOC01", "layer": 1, "name": "Diagrams"])
-        XCTAssertEqual(h.app.ui.menus.get("layers.moveTo.1")?.title, "Diagrams")
+        _ = try await h.run("layer.rename", ["doc": "doc:FIXTUREDOC04", "layer": 1, "name": "Sketches"])
+        // Two windows showing different documents each see their own names, from one registration.
+        XCTAssertEqual(entry.resolvedTitle(for: notebook), "Diagrams")
+        XCTAssertEqual(entry.resolvedTitle(for: board), "Sketches")
+        XCTAssertEqual(h.app.ui.menus.get("layers.moveTo.1")?.resolvedTitle(for: notebook), "Diagrams")
         h.app.bus.undo(Fixtures.docID)
-        XCTAssertEqual(h.app.ui.menus.get("layers.moveTo.1")?.title, "Layer 2")
+        XCTAssertEqual(entry.resolvedTitle(for: notebook), "Layer 2")
+        XCTAssertEqual(entry.resolvedTitle(for: board), "Sketches")
     }
 
     // MARK: Pure model
