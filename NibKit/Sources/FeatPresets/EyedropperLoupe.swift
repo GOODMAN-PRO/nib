@@ -309,7 +309,7 @@ final class EyedropperLoupeView: UIView {
         layer.addSublayer(ring)
         edge.path = circle
         edge.fillColor = nil
-        edge.lineWidth = 1
+        edge.lineWidth = NibStroke.thin
         layer.addSublayer(edge)
 
         // One page point under the reticle, framed twice so it reads on any colour.
@@ -317,10 +317,10 @@ final class EyedropperLoupeView: UIView {
         let square = UIBezierPath(rect: CGRect(x: bounds.midX - cell / 2, y: bounds.midY - cell / 2, width: cell, height: cell)).cgPath
         halo.path = square
         halo.fillColor = nil
-        halo.lineWidth = 3
+        halo.lineWidth = NibStroke.thick
         reticle.path = square
         reticle.fillColor = nil
-        reticle.lineWidth = 1
+        reticle.lineWidth = NibStroke.thin
         layer.addSublayer(halo)
         layer.addSublayer(reticle)
 

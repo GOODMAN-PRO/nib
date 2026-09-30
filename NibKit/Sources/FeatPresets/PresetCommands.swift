@@ -3,19 +3,22 @@ import NibContracts
 
 // MARK: - Rules
 
-/// What `preset.setSwatch` does to a tape slot's pattern: omitted keeps it, "" removes it, an id sets it.
+/// What `preset.setSwatch` does to a tape slot's pattern: omitted keeps it, "" removes it, a pattern id sets it. The
+/// id is a `TapePatternDescriptor.id`, bare or as its pinned ref ("<id>.png"); the slot stores the pinned ref
+/// (contracts-v2 `PresetSwatch.tapePatternRef(id:)`), which the tape tool resolves.
 enum PatternChange: Equatable {
     case keep
     case clear
-    case set(AssetRef)
+    /// A `TapePatternDescriptor.id`.
+    case set(String)
 
     init(_ raw: String?) {
         guard let raw else {
             self = .keep
             return
         }
-        let id = raw.trimmingCharacters(in: .whitespaces)
-        self = id.isEmpty ? .clear : .set(AssetRef(id))
+        let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        self = trimmed.isEmpty ? .clear : .set(PresetSwatch.tapePatternID(AssetRef(trimmed)))
     }
 }
 
@@ -39,8 +42,8 @@ enum PresetRules {
         }
     }
 
-    /// Highlighter colours given without alpha take the default highlighter opacity (they render beneath ink).
-    static var highlighterAlpha: UInt8 { ToolPresets.defaults(for: "highlighter").swatches.first?.color.a ?? 128 }
+    /// Highlighter colours given without alpha take the highlighter opacity (they render beneath ink).
+    static let highlighterAlpha = RGBA.highlighterAlpha
 
     static func toolSchema(allowCurrent: Bool = false) -> JSONSchema {
         let choices = allowCurrent ? tools + ["current"] : tools
@@ -56,7 +59,8 @@ enum PresetRules {
     }
 
     /// Repairs state synced from another device or written with `settings.set`: 1…12 colour slots, exactly three
-    /// thickness slots inside the tool's bounds, one line pattern per thickness slot, selections in range.
+    /// thickness slots inside the tool's bounds, one line pattern per thickness slot, selections in range. A partial
+    /// preset (no patterns or selections) now decodes (contracts-v2 lenient `ToolPresets`), and lands here to be clamped.
     static func normalized(_ presets: ToolPresets, tool: String) -> ToolPresets {
         let defaults = ToolPresets.defaults(for: tool)
         var p = presets
@@ -123,11 +127,11 @@ enum PresetRules {
             break
         case .clear:
             p.swatches[index].pattern = nil
-        case .set(let ref):
+        case .set(let id):
             guard tool == "tape" else {
                 throw NibError(.invalidParams, "patterns apply to tape slots only", path: "$.pattern")
             }
-            p.swatches[index].pattern = ref
+            p.swatches[index].pattern = PresetSwatch.tapePatternRef(id: id)
         }
         return p
     }
@@ -253,10 +257,6 @@ struct PresetSelect: NibCommand {
 }
 
 struct PresetSetSwatch: NibCommand {
-    /// Each app's tape patterns by its command bus, set in `FeatPresetsFeature.register`: the check uses the invoking
-    /// app's registry (a process can hold several apps, and `NibApp.shared` may be nil).
-    static let tapePatterns = NSMapTable<CommandBus, Registry<TapePatternDescriptor>>.weakToWeakObjects()
-
     struct Params: Codable {
         var tool: String
         var index: Int
@@ -265,11 +265,11 @@ struct PresetSetSwatch: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "preset.setSwatch", title: "Change Colour Preset",
-        summary: "Change one colour slot of a tool (#RRGGBB[AA]); tape slots also take a pattern id from tape.patterns ('' removes it).",
+        summary: "Change one colour slot of a tool (#RRGGBB[AA]); tape slots also take a pattern id from tape.patterns ('' removes it), stored as '<id>.png'.",
         params: .obj(["tool": PresetRules.toolSchema(),
                       "index": .int("colour slot, 0-based", min: 0, max: 11),
                       "color": .color,
-                      "pattern": .str("tape only: pattern id from tape.patterns; '' removes the pattern; omit to keep it")],
+                      "pattern": .str("tape only: pattern id from tape.patterns (bare or '<id>.png'); '' removes the pattern; omit to keep it")],
                      required: ["tool", "index", "color"]),
         examples: [["tool": "pen", "index": 0, "color": "#2156D9"], ["tool": "highlighter", "index": 1, "color": "#86E3AE"]],
         effect: .session, target: .app)
@@ -278,12 +278,9 @@ struct PresetSetSwatch: NibCommand {
         try PresetRules.checkTool(p.tool)
         let colour = try PresetRules.colour(p.color, tool: p.tool)
         let change = PatternChange(p.pattern)
-        if case .set(let ref) = change, p.tool == "tape" {
-            guard let patterns = tapePatterns.object(forKey: ctx.bus) else { throw NibError.unavailable("tape patterns") }
-            guard patterns.get(ref.name) != nil else {
-                throw NibError(.notFound, "tape pattern '\(ref.name)' not found", path: "$.pattern",
-                               hint: "call tape.patterns for the available pattern ids")
-            }
+        if case .set(let id) = change, p.tool == "tape", ctx.content.tapePatterns.get(id) == nil {
+            throw NibError(.notFound, "tape pattern '\(id)' not found", path: "$.pattern",
+                           hint: "call tape.patterns for the available pattern ids")
         }
         let next = try PresetRules.update(p.tool, in: ctx.services.settings) {
             try PresetRules.setSwatch($0, tool: p.tool, index: p.index, color: colour, pattern: change)

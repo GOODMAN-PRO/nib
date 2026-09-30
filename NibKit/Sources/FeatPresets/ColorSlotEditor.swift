@@ -6,11 +6,12 @@ import NibDesign
 
 // MARK: - Colour helpers
 
-/// One colour the editor offers: an ink, or a highlighter for the highlighter tool.
+/// One colour the editor offers: an ink, or a highlighter for the highlighter tool, with its NibDesign swatch.
 struct PaletteInk: Identifiable {
-    let id: String
     let colour: RGBA
-    let name: String
+    let swatch: NibSwatch
+    var id: String { swatch.id }
+    var name: String { swatch.name }
 }
 
 /// Conversions between the model's `RGBA` and the platform's colours, names for VoiceOver and the swatch ring rule.
@@ -72,43 +73,25 @@ enum PresetColour {
 
     static func name(_ c: RGBA) -> String {
         if let ink = NibInk.allCases.first(where: { sameRGB(rgba($0), c) }) { return ink.name }
-        if let h = NibHighlighter.allCases.first(where: { sameRGB(rgba($0), c) }) { return highlighterName(h) }
+        if let h = NibHighlighter.allCases.first(where: { sameRGB(rgba($0), c) }) { return h.name }
         return String(localized: "Custom colour \(rgbHex(c))")
     }
 
-    static func highlighterName(_ h: NibHighlighter) -> String {
-        switch h {
-        case .lemon: return String(localized: "Lemon")
-        case .apricot: return String(localized: "Apricot")
-        case .mint: return String(localized: "Mint")
-        case .sky: return String(localized: "Sky")
-        case .lilac: return String(localized: "Lilac")
-        case .blush: return String(localized: "Blush")
-        }
-    }
-
-    static func swatch(_ c: RGBA, id: String, name: String) -> NibSwatch {
-        NibSwatch(id: id, color: color(c), name: name, ringsLight: needsRing(c, dark: false), ringsDark: needsRing(c, dark: true))
+    static func swatch(_ c: RGBA, id: String, name: String, pattern: NibSwatchPattern? = nil) -> NibSwatch {
+        NibSwatch(id: id, color: color(c), name: name, ringsLight: needsRing(c, dark: false), ringsDark: needsRing(c, dark: true),
+                  pattern: pattern)
     }
 
     /// The colours offered for a tool: the six highlighters for the highlighter, the twelve inks for every other tool.
     static func palette(for tool: String) -> [PaletteInk] {
         if tool == "highlighter" {
-            return NibHighlighter.allCases.map { PaletteInk(id: $0.rawValue, colour: rgba($0), name: highlighterName($0)) }
+            return NibHighlighter.allCases.map { PaletteInk(colour: rgba($0), swatch: NibSwatch(highlighter: $0)) }
         }
-        return NibInk.allCases.map { PaletteInk(id: $0.rawValue, colour: rgba($0), name: $0.name) }
+        return NibInk.allCases.map { PaletteInk(colour: rgba($0), swatch: NibSwatch(ink: $0)) }
     }
 }
 
-/// Glyphs NibSymbol has no token for yet (contract gap): validated through `NibSymbol(systemName:)` with a token fallback.
-// ponytail: stand-ins until contract request F008-pattern-swatch-and-symbols adds NibSymbol.customColour and
-// NibSymbol.eyedropper (filed in the F008 feature summary); switch to the tokens and delete this enum then.
-enum PresetSymbols {
-    static let customColour = NibSymbol(systemName: "paintpalette") ?? .plus
-    static let eyedropper = NibSymbol(systemName: "eyedropper") ?? .search
-}
-
-// MARK: - Colour editor (the options bar while one colour slot is edited or a colour is added)
+// MARK: - Colour editor (the options bar's popover while one colour slot is edited or a colour is added)
 
 /// What the colour editor changes: one existing slot, or a new one.
 enum ColourTarget: Equatable {
@@ -116,96 +99,53 @@ enum ColourTarget: Equatable {
     case add
 }
 
-/// The options bar while a colour slot is edited (tap the selected colour again) or a colour is added (+): the tool's
-/// colours (the six highlighters for the highlighter), the tape patterns for tape, Custom (the system colour picker:
-/// grid, spectrum, sliders with hex and the system eyedropper), Pick Colour from Page (the in-document loupe) and
-/// Remove. It lives in the same Clear bar droplet, which re-forms around the new row.
-struct ColourEditorRow: View {
-    let app: NibApp
-    let session: EditorSession
-    let tool: String
-    let presets: ToolPresets
-    let target: ColourTarget
-    let stripWidth: (Int) -> CGFloat
-    let onDone: () -> Void
+/// The options bar's popover while a colour slot is edited (tap the selected colour again) or a colour is added (+):
+/// for tape its patterns, the tool's colours (the six highlighters for the highlighter, the twelve inks otherwise),
+/// Custom (the system colour picker: grid, spectrum, sliders with hex and the system eyedropper), From Page (the
+/// in-document loupe) and, for an existing slot, Remove.
+struct ColourEditor: View {
+    let model: PresetMenuModel
 
-    private var slot: Int? {
-        if case .slot(let i) = target, presets.swatches.indices.contains(i) { return i }
-        return nil
-    }
-
-    /// The slot being edited, or the selected one when adding (its colour seeds the picker and the patterns).
-    private var current: PresetSwatch { presets.swatches[slot ?? presets.selectedSwatch] }
-    private var inks: [PaletteInk] { PresetColour.palette(for: tool) }
-    private var patterns: [TapePatternDescriptor] { tool == "tape" ? app.content.tapePatterns.all : [] }
+    private var inks: [PaletteInk] { PresetColour.palette(for: model.tool) }
 
     var body: some View {
-        HStack(spacing: 0) {
-            NibIconButton(.back, label: String(localized: "Back to Presets"), shortcut: .cancelAction, action: onDone)
-            strip
-            NibBarSeparator()
-            NibIconButton(PresetSymbols.customColour, label: String(localized: "Custom Colour"), action: openPicker)
-            if EyedropperAttachment.canPick(session: session, app: app) {
-                NibIconButton(PresetSymbols.eyedropper, label: String(localized: "Pick Colour from Page"), action: pickFromPage)
+        let slot = model.colourSlot
+        VStack(alignment: .leading, spacing: NibSpacing.m) {
+            if model.tool == "tape", let registry = model.app?.content.tapePatterns {
+                NibInspectorSection(String(localized: "Pattern")) {
+                    TapePatternGrid(model: model, registry: registry)
+                }
             }
-            if let slot, presets.swatches.count > 1 {
-                NibIconButton(.trash, label: String(localized: "Remove Colour")) { remove(slot) }
+            NibInspectorSection(slot == nil ? String(localized: "New Colour") : String(localized: "Colour")) {
+                NibSwatchGrid(swatches: inks.map(\.swatch), selection: inkSelection(slot: slot))
+            }
+            HStack(spacing: NibSpacing.s) {
+                NibButton(String(localized: "Custom"), symbol: .customColour, size: .compact) { model.openPicker() }
+                    .accessibilityLabel(String(localized: "Custom Colour"))
+                if model.canPickFromPage {
+                    NibButton(String(localized: "From Page"), symbol: .eyedropper, size: .compact) { model.pickFromPage() }
+                        .accessibilityLabel(String(localized: "Pick Colour from Page"))
+                }
+                Spacer(minLength: 0)
+                if slot != nil, model.presets.swatches.count > 1 {
+                    NibIconButton(.trash, label: String(localized: "Remove Colour")) { model.removeEdited() }
+                }
             }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(slot == nil ? String(localized: "Add a colour") : String(localized: "Change colour"))
     }
 
-    private var strip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 0) {
-                if tool == "tape" {
-                    patternItems
-                    NibBarSeparator()
-                }
-                ForEach(inks) { ink in
-                    NibPenSwatch(PresetColour.swatch(ink.colour, id: ink.id, name: ink.name),
-                                 isSelected: slot != nil && PresetColour.sameRGB(ink.colour, current.color), size: .palette) {
-                        pick(ink.colour)
-                    }
-                }
-            }
-        }
-        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-        .frame(width: stripWidth(inks.count + (tool == "tape" ? patterns.count + 1 : 0)), height: NibMetrics.hitTarget)
-    }
-
-    @ViewBuilder private var patternItems: some View {
-        let colour = PresetColour.display(current.color, tool: tool)
-        NibPenSwatch(PresetColour.swatch(colour, id: "none", name: String(localized: "No Pattern")),
-                     isSelected: slot != nil && current.pattern == nil, size: .palette) {
-            setPattern(nil)
-        }
-        ForEach(patterns, id: \.id) { d in
-            PatternSwatch(colour: colour, patternID: d.id, registry: app.content.tapePatterns, name: d.title,
-                          isSelected: slot != nil && current.pattern?.name == d.id) {
-                setPattern(d.id)
-            }
-        }
-    }
-
-    // MARK: Actions (every one is a preset command)
-
-    private func pick(_ colour: RGBA) {
-        let hex = PresetColour.rgbHex(colour)
-        if let slot {
-            PresetActions.run(app, session: session, [PresetActions.call("preset.setSwatch", tool,
-                                                                          ["index": .number(Double(slot)), "color": .string(hex)])])
-        } else {
-            PresetActions.run(app, session: session, [PresetActions.call("preset.addSwatch", tool, ["color": .string(hex)])])
-        }
-        onDone()
-    }
-
-    private func setPattern(_ id: String?) {
-        PresetActions.run(app, session: session, Self.patternCalls(tool: tool, slot: slot, count: presets.swatches.count,
-                                                                   hex: current.color.hex, pattern: id))
-        onDone()
+    /// The ink matching the edited slot (none while adding); choosing one sets the slot or adds it.
+    private func inkSelection(slot: Int?) -> Binding<String?> {
+        let inks = self.inks, model = self.model
+        return Binding(get: {
+            guard slot != nil else { return nil }
+            return inks.first { PresetColour.sameRGB($0.colour, model.editedSwatch.color) }?.id
+        }, set: { id in
+            guard let ink = inks.first(where: { $0.id == id }) else { return }
+            model.pick(ink.colour)
+        })
     }
 
     /// The commands a pattern choice runs. nil = plain colour. Adding a pattern adds a slot in the current colour, then
@@ -222,106 +162,53 @@ struct ColourEditorRow: View {
         }
         return calls
     }
-
-    private func openPicker() {
-        let app = self.app, session = self.session, tool = self.tool, slot = self.slot
-        let title = String(localized: "\(PresetText.toolName(tool)) Colour")
-        SystemColourPicker.present(title: title, initial: current.color, supportsAlpha: tool != "highlighter",
-                                   commitsOnFinishOnly: slot == nil, app: app, session: session) { colour in
-            let hex = tool == "highlighter" ? PresetColour.rgbHex(colour) : colour.hex
-            if let slot {
-                PresetActions.run(app, session: session, [PresetActions.call("preset.setSwatch", tool,
-                                                                              ["index": .number(Double(slot)), "color": .string(hex)])])
-            } else {
-                PresetActions.run(app, session: session, [PresetActions.call("preset.addSwatch", tool, ["color": .string(hex)])])
-            }
-        }
-        onDone()
-    }
-
-    private func pickFromPage() {
-        let target: ColourTarget = slot.map { ColourTarget.slot($0) } ?? .add
-        EyedropperAttachment.begin(EyedropperAttachment.Request(tool: tool, target: target), session: session)
-        onDone()
-    }
-
-    private func remove(_ index: Int) {
-        PresetActions.run(app, session: session, [PresetActions.call("preset.removeSwatch", tool, ["index": .number(Double(index))])])
-        onDone()
-    }
 }
 
-// MARK: - Tape pattern swatches
+// MARK: - Tape patterns
 
-/// A tape slot that carries a pattern: the tile over the slot's colour, drawn like `NibPenSwatch` (flat, a 0.5 pt
-/// hairline, the 2 pt label ring 2.5 pt outside when selected, a 44 pt hit target).
-// ponytail: mirrors NibPenSwatch(size: .palette) metrics line for line because NibDesign has no pattern overlay yet;
-// contract request F008-pattern-swatch-and-symbols (filed in the F008 feature summary) asks NibPenSwatch for one.
-// Replace this view with NibPenSwatch(pattern:) once it lands.
-struct PatternSwatch: View {
-    let colour: RGBA
-    let patternID: String
+/// The tape patterns (`content.tapePatterns`) in the edited slot's colour, No Pattern first.
+struct TapePatternGrid: View {
+    let model: PresetMenuModel
     let registry: Registry<TapePatternDescriptor>
-    let name: String
-    let isSelected: Bool
-    let action: () -> Void
-
-    private static let diameter: CGFloat = 22
+    @State private var tiles: [String: NibSwatchPattern] = [:]
 
     var body: some View {
-        let diameter = Self.diameter
-        Button(action: action) {
-            Circle()
-                .fill(PresetColour.color(colour))
-                .overlay { PatternTile(patternID: patternID, registry: registry).clipShape(Circle()) }
-                .overlay { Circle().strokeBorder(NibColor.swatchHairline, lineWidth: 0.5) }
-                .frame(width: diameter, height: diameter)
-                .overlay {
-                    if isSelected {
-                        Circle()
-                            .stroke(NibColor.label, lineWidth: 2)
-                            .frame(width: diameter + 7, height: diameter + 7)
-                    }
+        let descriptors = registry.all
+        let colour = PresetColour.display(model.editedSwatch.color, tool: model.tool)
+        let name = PresetColour.name(colour)
+        // Until its tile has loaded a swatch reads as its pattern's title; then as "Lemon, Dots".
+        let swatches = descriptors.map { d in
+            PresetColour.swatch(colour, id: d.id, name: tiles[d.id] == nil ? d.title : name, pattern: tiles[d.id])
+        }
+        NibSwatchGrid(swatches: swatches, selection: selection, noneLabel: String(localized: "No Pattern"))
+            .task(id: descriptors.map(\.id)) {
+                for d in descriptors where tiles[d.id] == nil {
+                    if let tile = await TapePatternCache.pattern(d.id, registry: registry) { tiles[d.id] = tile }
                 }
-                .animation(NibMotion.colorChange, value: isSelected)
-                .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(NibPressStyle(shape: Circle()))
-        .accessibilityLabel(name)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-}
-
-/// A tape pattern tile, tiled at swatch scale. Loaded off the main actor once per pattern.
-struct PatternTile: View {
-    let patternID: String
-    let registry: Registry<TapePatternDescriptor>
-    @State private var image: UIImage?
-
-    init(patternID: String, registry: Registry<TapePatternDescriptor>) {
-        self.patternID = patternID
-        self.registry = registry
-    }
-
-    var body: some View {
-        Group {
-            if let image {
-                Image(uiImage: image).resizable(resizingMode: .tile)
-            } else {
-                Color.clear
             }
-        }
-        .accessibilityHidden(true)
-        .task(id: patternID) { image = await TapePatternCache.image(patternID, registry: registry) }
+    }
+
+    /// The edited slot's pattern (No Pattern while adding); choosing one sets it, or adds a slot that carries it.
+    private var selection: Binding<String?> {
+        let model = self.model
+        return Binding(get: { model.colourSlot == nil ? nil : model.editedPatternID },
+                       set: { model.setTapePattern($0) })
     }
 }
 
+/// Tape pattern tiles for swatches, decoded once per pattern off the main actor. NibDesign tiles them over the colour
+/// (`NibSwatchPattern`); loading the image stays here.
 @MainActor
 enum TapePatternCache {
     /// One tile spans this many points inside a swatch.
     static let tilePoints: CGFloat = 11
     private static var images: [String: UIImage] = [:]
+
+    /// A `TapePatternDescriptor.id` as a swatch pattern, named for VoiceOver ("Lemon, Dots").
+    static func pattern(_ id: String, registry: Registry<TapePatternDescriptor>) async -> NibSwatchPattern? {
+        guard let image = await image(id, registry: registry) else { return nil }
+        return NibSwatchPattern(id: id, image: image, tilePoints: tilePoints, name: registry.get(id)?.title)
+    }
 
     static func image(_ id: String, registry: Registry<TapePatternDescriptor>) async -> UIImage? {
         if let cached = images[id] { return cached }

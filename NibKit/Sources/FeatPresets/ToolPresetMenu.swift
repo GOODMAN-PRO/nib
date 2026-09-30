@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import Combine
+import Observation
 import UniformTypeIdentifiers
 import NibContracts
 import NibDesign
@@ -75,64 +76,329 @@ enum PresetStroke {
     }
 }
 
-/// What the options bar shows. The bar is one Clear droplet: a new row re-lays it out and the water re-forms.
-enum PresetBarMode: Equatable {
-    /// Three thickness slots, the colour slots and +.
-    case slots
+// MARK: - Menu state
+
+/// What the options bar buds (contracts-v2 `ToolMenuDescriptor.makePopover`): the palette places it beside the bar,
+/// as a full-size child of the window's container, and closes it when the tool changes.
+enum PresetPopover: Equatable {
     /// A thickness slot's slider (mm and pt) and, for the pen and pencil, its line pattern.
     case width(Int)
     /// Changing one colour slot, or adding one.
     case colour(ColourTarget)
-    /// Remove and reorder colour slots, restore the defaults.
-    case arrange
+}
+
+/// The state one window's options bar and its popover share for one tool: the tool's presets (read from
+/// `NibSettings.presets(tool)` and following every change to it: this window, another window, a synced device, the
+/// AI), which popover is open, and whether the bar is rearranging. Observable, so the bar, the popover and whatever
+/// reads the popover's `isPresented` (the palette's bud) follow it. Every change it makes is a `preset.*` command.
+@MainActor
+@Observable
+final class PresetMenuModel {
+    let tool: String
+    @ObservationIgnored private(set) weak var app: NibApp?
+    @ObservationIgnored private(set) weak var session: EditorSession?
+
+    private(set) var presets: ToolPresets
+    /// The open popover; nil while closed.
+    private(set) var popover: PresetPopover?
+    /// What the popover shows and the control it buds from: the open one, or the last one while it retracts.
+    private(set) var shown: PresetPopover = .width(1)
+    /// Remove and reorder colour slots, restore the defaults (a mode of the bar itself).
+    private(set) var arranging = false
+    /// The thickness slider (0…1 on the tool's logarithmic scale) of the thickness slot `shown` names.
+    private(set) var widthPosition: Double = 0
+
+    @ObservationIgnored private var settingsWatch: AnyCancellable?
+    @ObservationIgnored private var pendingWidth: Task<Void, Never>?
+
+    init(app: NibApp, session: EditorSession, tool: String) {
+        self.app = app
+        self.session = session
+        self.tool = tool
+        let initial = PresetRules.normalized(app.settings.get(PresetRules.key(tool)), tool: tool)
+        presets = initial
+        widthPosition = WidthScale.position(initial.widths[1], range: PresetRules.widthRange(tool))
+        let name = PresetRules.key(tool).name
+        // The store posts on the writing thread (a synced-prefs merge can be off main).
+        settingsWatch = NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
+            .filter { ($0.userInfo?["name"] as? String) == name }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.reload() }
+    }
+
+    /// The control the popover buds from carries this `nibBudAnchor` (the one `shown` names), so the source id the
+    /// palette holds never goes stale.
+    static func anchorID(_ tool: String) -> String { "presets.\(tool).popoverSource" }
+
+    var range: ClosedRange<Double> { PresetRules.widthRange(tool) }
+
+    /// The thickness the slider shows, rounded to 0.01 pt.
+    var editedWidth: Double { WidthScale.width(at: widthPosition, range: range) }
+
+    /// The colour slot the colour popover edits; nil when it adds one (or that slot is gone).
+    var colourSlot: Int? {
+        if case .colour(.slot(let i)) = shown, presets.swatches.indices.contains(i) { return i }
+        return nil
+    }
+
+    /// The slot being edited, or the selected one when adding (its colour seeds the picker and the patterns).
+    var editedSwatch: PresetSwatch { presets.swatches[colourSlot ?? presets.selectedSwatch] }
+
+    /// The edited slot's pattern as a `TapePatternDescriptor.id` (the pinned "<id>.png" ref, or a bare legacy id).
+    var editedPatternID: String? { editedSwatch.pattern.map(PresetSwatch.tapePatternID) }
+
+    var isPresented: Binding<Bool> {
+        Binding(get: { [weak self] in self?.popover != nil },
+                set: { [weak self] presented in if !presented { self?.close() } })
+    }
+
+    /// The popover the palette buds beside the bar. Its title is the tool; each editor titles its own section.
+    func makePopover() -> ToolMenuPopover {
+        ToolMenuPopover(source: Self.anchorID(tool), isPresented: isPresented, title: PresetText.toolName(tool)) {
+            PresetPopoverContent(model: self)
+        }
+    }
+
+    // MARK: State
+
+    func reload() {
+        guard let app else { return }
+        let fresh = PresetRules.normalized(app.settings.get(PresetRules.key(tool)), tool: tool)
+        if fresh != presets { presets = fresh }
+        // A slot another window, device or the AI removed closes its editor.
+        if case .colour(.slot(let i))? = popover, i >= fresh.swatches.count { close() }
+        // The slider follows a thickness changed elsewhere, unless the finger is still on it.
+        if case .width(let i) = shown, pendingWidth == nil {
+            let position = WidthScale.position(fresh.widths[i], range: range)
+            if abs(position - widthPosition) > 1e-9 { widthPosition = position }
+        }
+    }
+
+    func open(_ next: PresetPopover) {
+        commitWidth()
+        arranging = false
+        shown = next
+        if case .width(let i) = next { widthPosition = WidthScale.position(presets.widths[i], range: range) }
+        popover = next
+        didChangePresentation()
+    }
+
+    func close() {
+        commitWidth()
+        guard popover != nil else { return }
+        popover = nil
+        didChangePresentation()
+    }
+
+    func beginArranging() {
+        close()
+        arranging = true
+        UIAccessibility.post(notification: .layoutChanged, argument: nil)
+    }
+
+    func endArranging() {
+        arranging = false
+        UIAccessibility.post(notification: .layoutChanged, argument: nil)
+    }
+
+    /// Asks the palette's host to re-read the popover (contracts-v2 `setNeedsChromeUpdate`) and moves VoiceOver.
+    private func didChangePresentation() {
+        app?.ui.setNeedsChromeUpdate(session)
+        UIAccessibility.post(notification: .layoutChanged, argument: nil)
+    }
+
+    // MARK: Bar actions
+
+    /// Tapping the selected thickness toggles its popover; another one selects it.
+    func tapWidth(_ i: Int) {
+        if i == presets.selectedWidth {
+            popover == .width(i) ? close() : open(.width(i))
+        } else {
+            close()
+            run([PresetActions.call("preset.select", tool, ["width": .number(Double(i))])])
+        }
+    }
+
+    /// Tapping the selected colour toggles its editor; another one selects it.
+    func tapSwatch(_ i: Int) {
+        if i == presets.selectedSwatch {
+            popover == .colour(.slot(i)) ? close() : open(.colour(.slot(i)))
+        } else {
+            close()
+            run([PresetActions.call("preset.select", tool, ["swatch": .number(Double(i))])])
+        }
+    }
+
+    func addColour() {
+        popover == .colour(.add) ? close() : open(.colour(.add))
+    }
+
+    func remove(_ i: Int) {
+        run([PresetActions.call("preset.removeSwatch", tool, ["index": .number(Double(i))])])
+    }
+
+    func move(_ from: Int, _ to: Int) {
+        run([PresetActions.call("preset.moveSwatch", tool, ["from": .number(Double(from)), "to": .number(Double(to))])])
+    }
+
+    func reset() {
+        close()
+        arranging = false
+        run([PresetActions.call("preset.reset", tool)])
+    }
+
+    // MARK: Thickness popover
+
+    /// The slider moved: the thickness commits once it rests for a quarter second, or when the popover closes.
+    func setWidthPosition(_ position: Double) {
+        widthPosition = min(max(position, 0), 1)
+        pendingWidth?.cancel()
+        pendingWidth = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            self?.commitWidth()
+        }
+    }
+
+    @discardableResult
+    func commitWidth() -> Task<Bool, Never>? {
+        pendingWidth?.cancel()
+        pendingWidth = nil
+        guard case .width(let i) = shown, presets.widths.indices.contains(i) else { return nil }
+        let w = editedWidth
+        guard abs(w - presets.widths[i]) >= 0.005 else { return nil }
+        return run([PresetActions.call("preset.setWidth", tool, ["index": .number(Double(i)), "width": .number(w)])])
+    }
+
+    @discardableResult
+    func setPattern(_ pattern: StrokePattern) -> Task<Bool, Never>? {
+        guard case .width(let i) = shown else { return nil }
+        pendingWidth?.cancel()
+        pendingWidth = nil
+        return run([PresetActions.call("preset.setWidth", tool, ["index": .number(Double(i)), "width": .number(editedWidth),
+                                                                 "pattern": .string(pattern.rawValue)])])
+    }
+
+    // MARK: Colour popover
+
+    /// One of the offered colours: sets the edited slot, or adds a slot.
+    @discardableResult
+    func pick(_ colour: RGBA) -> Task<Bool, Never>? {
+        let hex = PresetColour.rgbHex(colour)
+        let call = colourSlot.map { slot in
+            PresetActions.call("preset.setSwatch", tool, ["index": .number(Double(slot)), "color": .string(hex)])
+        } ?? PresetActions.call("preset.addSwatch", tool, ["color": .string(hex)])
+        close()
+        return run([call])
+    }
+
+    /// A tape pattern (nil: plain colour) for the edited slot, or a new slot in the current colour that carries it.
+    @discardableResult
+    func setTapePattern(_ id: String?) -> Task<Bool, Never>? {
+        let calls = ColourEditor.patternCalls(tool: tool, slot: colourSlot, count: presets.swatches.count,
+                                              hex: editedSwatch.color.hex, pattern: id)
+        close()
+        return run(calls)
+    }
+
+    /// The system colour picker (grid, spectrum, sliders with hex, the system eyedropper).
+    func openPicker() {
+        guard let app, let session else { return }
+        let tool = self.tool, slot = colourSlot
+        SystemColourPicker.present(title: String(localized: "\(PresetText.toolName(tool)) Colour"),
+                                   initial: editedSwatch.color, supportsAlpha: tool != "highlighter",
+                                   commitsOnFinishOnly: slot == nil, app: app, session: session) { colour in
+            let hex = tool == "highlighter" ? PresetColour.rgbHex(colour) : colour.hex
+            let call = slot.map { i in
+                PresetActions.call("preset.setSwatch", tool, ["index": .number(Double(i)), "color": .string(hex)])
+            } ?? PresetActions.call("preset.addSwatch", tool, ["color": .string(hex)])
+            PresetActions.run(app, session: session, [call])
+        }
+        close()
+    }
+
+    var canPickFromPage: Bool {
+        guard let app, let session else { return false }
+        return EyedropperAttachment.canPick(session: session, app: app)
+    }
+
+    /// The in-document loupe; lifting sets the edited slot (or adds one).
+    func pickFromPage() {
+        guard let session else { return }
+        EyedropperAttachment.begin(EyedropperAttachment.Request(tool: tool, target: colourSlot.map { .slot($0) } ?? .add),
+                                   session: session)
+        close()
+    }
+
+    func removeEdited() {
+        guard let slot = colourSlot else { return }
+        close()
+        remove(slot)
+    }
+
+    @discardableResult
+    private func run(_ calls: [PresetActions.Call]) -> Task<Bool, Never> {
+        guard let app else { return Task { false } }
+        return PresetActions.run(app, session: session, calls)
+    }
+}
+
+/// Each window's `PresetMenuModel` per tool, so the options bar (`makeView`) and its popover (`makePopover`) of one
+/// window share one state. Captured by the `ToolMenuDescriptor`s; a closed window's models go with its session.
+@MainActor
+final class PresetMenus {
+    private struct Entry {
+        weak var session: EditorSession?
+        let model: PresetMenuModel
+    }
+
+    private weak var app: NibApp?
+    private var entries: [String: Entry] = [:]
+
+    init(app: NibApp) {
+        self.app = app
+    }
+
+    func model(_ tool: String, session: EditorSession) -> PresetMenuModel? {
+        entries = entries.filter { $0.value.session != nil }
+        let key = session.id.raw + " " + tool
+        if let entry = entries[key], entry.session === session { return entry.model }
+        guard let app else { return nil }
+        let model = PresetMenuModel(app: app, session: session, tool: tool)
+        entries[key] = Entry(session: session, model: model)
+        return model
+    }
 }
 
 // MARK: - The tool menu
 
 /// The contextual options of the pen, pencil, highlighter, tape, shape and draw-shape tools, rendered by the palette
-/// inside its `NibToolOptionsBar`. Everything it changes goes through `preset.*` commands; it reads
-/// `NibSettings.presets(tool)` and follows every change to it (this window, another window, a synced device, the AI).
+/// inside its `NibToolOptionsBar`: three thickness slots, the colour slots and +, or while rearranging, removable and
+/// draggable slots and Restore Defaults. The thickness slider and the colour editor bud from here as the menu's
+/// popover (`PresetMenuModel.makePopover`).
 struct ToolPresetMenu: View {
-    let app: NibApp
-    let session: EditorSession
-    let tool: String
+    let model: PresetMenuModel
 
-    @State private var presets: ToolPresets
-    @State private var mode: PresetBarMode = .slots
     @State private var confirmReset = false
     @State private var dragged: Int?
     @Environment(\.horizontalSizeClass) private var sizeClass
 
-    init(app: NibApp, session: EditorSession, tool: String, mode: PresetBarMode = .slots) {
-        self.app = app
-        self.session = session
-        self.tool = tool
-        _presets = State(initialValue: PresetRules.normalized(app.settings.get(PresetRules.key(tool)), tool: tool))
-        _mode = State(initialValue: mode)
-    }
+    private var presets: ToolPresets { model.presets }
+    private var tool: String { model.tool }
 
     var body: some View {
         Group {
-            switch mode {
-            case .slots:
-                slotsRow
-            case .width(let index):
-                WidthEditorRow(app: app, session: session, tool: tool, index: index, presets: presets) { setMode(.slots) }
-            case .colour(let target):
-                ColourEditorRow(app: app, session: session, tool: tool, presets: presets, target: target,
-                                stripWidth: stripWidth) { setMode(.slots) }
-            case .arrange:
+            if model.arranging {
                 arrangeRow
+            } else {
+                slotsRow
             }
         }
-        // The store posts on the writing thread (a synced-prefs merge can be off main).
-        .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange).receive(on: DispatchQueue.main)) { note in
-            if (note.userInfo?["name"] as? String) == PresetRules.key(tool).name { reload() }
-        }
-        .onAppear(perform: reload)
+        .onAppear { model.reload() }
+        .onChange(of: model.arranging) { _, _ in dragged = nil }
         .confirmationDialog(String(localized: "Restore the default colours and thicknesses?"),
                             isPresented: $confirmReset, titleVisibility: .visible) {
-            Button(String(localized: "Restore Defaults"), role: .destructive, action: reset)
+            Button(String(localized: "Restore Defaults"), role: .destructive) { model.reset() }
             Button(String(localized: "Cancel"), role: .cancel) {}
         } message: {
             Text(String(localized: "Your own \(PresetText.toolName(tool)) colours and thicknesses are replaced."))
@@ -146,17 +412,20 @@ struct ToolPresetMenu: View {
     private var slotsRow: some View {
         HStack(spacing: 0) {
             ForEach(0..<PresetRules.widthSlots, id: \.self) { i in
+                let selected = i == presets.selectedWidth
                 LineSampleButton(lineWidth: WidthScale.slotLineWidth(presets.widths[i], tool: tool), pattern: presets.patterns[i],
-                                 isSelected: i == presets.selectedWidth, label: String(localized: "Thickness \(i + 1)"),
+                                 isSelected: selected, label: String(localized: "Thickness \(i + 1)"),
                                  value: PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i]),
-                                 hint: i == presets.selectedWidth ? String(localized: "Double-tap to adjust.") : nil) {
-                    tapWidth(i)
+                                 hint: selected ? String(localized: "Double-tap to adjust.") : nil) {
+                    model.tapWidth(i)
                 }
+                .presetPopoverSource(tool, model.shown == .width(i))
             }
             NibBarSeparator()
             swatchStrip(arranging: false)
             if presets.swatches.count < ToolPresets.maxSwatches {
-                NibIconButton(.plus, label: String(localized: "Add Colour")) { setMode(.colour(.add)) }
+                NibIconButton(.plus, label: String(localized: "Add Colour")) { model.addColour() }
+                    .presetPopoverSource(tool, model.shown == .colour(.add))
             }
         }
     }
@@ -169,7 +438,7 @@ struct ToolPresetMenu: View {
                 NibHaptics.play(.warning)
                 confirmReset = true
             }
-            NibIconButton(.checkmark, label: String(localized: "Done"), shortcut: .cancelAction) { setMode(.slots) }
+            NibIconButton(.checkmark, label: String(localized: "Done"), shortcut: .cancelAction) { model.endArranging() }
         }
     }
 
@@ -200,10 +469,11 @@ struct ToolPresetMenu: View {
     private func swatchSlot(_ i: Int, _ swatch: PresetSwatch, arranging: Bool) -> some View {
         let name = PresetColour.name(swatch.color)
         let removable = presets.swatches.count > 1
+        let registry = model.app?.content.tapePatterns
         if arranging {
             SwatchSlot(tool: tool, swatch: swatch, name: removable ? String(localized: "Remove \(name)") : name,
-                       isSelected: false, registry: app.content.tapePatterns) {
-                if removable { remove(i) }
+                       isSelected: false, registry: registry) {
+                if removable { model.remove(i) }
             }
             .overlay(alignment: .topTrailing) {
                 if removable { RemoveBadge() }
@@ -213,156 +483,91 @@ struct ToolPresetMenu: View {
                 return NSItemProvider(object: SwatchDropDelegate.payload(i) as NSString)
             }
             .onDrop(of: [UTType.plainText], delegate: SwatchDropDelegate(index: i, dragged: $dragged) { from, to in
-                move(from, to)
+                model.move(from, to)
             })
             .accessibilityAction(named: Text(String(localized: "Move Left"))) {
-                if i > 0 { move(i, i - 1) }
+                if i > 0 { model.move(i, i - 1) }
             }
             .accessibilityAction(named: Text(String(localized: "Move Right"))) {
-                if i < presets.swatches.count - 1 { move(i, i + 1) }
+                if i < presets.swatches.count - 1 { model.move(i, i + 1) }
             }
         } else {
-            SwatchSlot(tool: tool, swatch: swatch, name: name, isSelected: i == presets.selectedSwatch,
-                       registry: app.content.tapePatterns) {
-                tapSwatch(i)
+            SwatchSlot(tool: tool, swatch: swatch, name: name, isSelected: i == presets.selectedSwatch, registry: registry) {
+                model.tapSwatch(i)
             }
+            .presetPopoverSource(tool, model.shown == .colour(.slot(i)))
             .contextMenu {
-                Button(String(localized: "Change Colour")) { setMode(.colour(.slot(i))) }
-                Button(String(localized: "Rearrange Colours")) { setMode(.arrange) }
+                Button(String(localized: "Change Colour")) { model.open(.colour(.slot(i))) }
+                Button(String(localized: "Rearrange Colours")) { model.beginArranging() }
                 if removable {
-                    Button(String(localized: "Remove Colour"), role: .destructive) { remove(i) }
+                    Button(String(localized: "Remove Colour"), role: .destructive) { model.remove(i) }
                 }
                 Button(String(localized: "Restore Default Presets"), role: .destructive) { confirmReset = true }
             }
-            .accessibilityAction(named: Text(String(localized: "Change Colour"))) { setMode(.colour(.slot(i))) }
-            .accessibilityAction(named: Text(String(localized: "Rearrange Colours"))) { setMode(.arrange) }
+            .accessibilityAction(named: Text(String(localized: "Change Colour"))) { model.open(.colour(.slot(i))) }
+            .accessibilityAction(named: Text(String(localized: "Rearrange Colours"))) { model.beginArranging() }
         }
-    }
-
-    // MARK: Actions (every change is a preset command)
-
-    private func setMode(_ next: PresetBarMode) {
-        mode = next
-        dragged = nil
-        UIAccessibility.post(notification: .layoutChanged, argument: nil)
-    }
-
-    private func reload() {
-        let fresh = PresetRules.normalized(app.settings.get(PresetRules.key(tool)), tool: tool)
-        if fresh != presets { presets = fresh }
-        if case .colour(.slot(let i)) = mode, i >= fresh.swatches.count { mode = .slots }
-    }
-
-    private func run(_ calls: [PresetActions.Call]) {
-        PresetActions.run(app, session: session, calls)
-    }
-
-    private func tapWidth(_ i: Int) {
-        if i == presets.selectedWidth {
-            setMode(.width(i))
-        } else {
-            run([PresetActions.call("preset.select", tool, ["width": .number(Double(i))])])
-        }
-    }
-
-    private func tapSwatch(_ i: Int) {
-        if i == presets.selectedSwatch {
-            setMode(.colour(.slot(i)))
-        } else {
-            run([PresetActions.call("preset.select", tool, ["swatch": .number(Double(i))])])
-        }
-    }
-
-    private func remove(_ i: Int) {
-        run([PresetActions.call("preset.removeSwatch", tool, ["index": .number(Double(i))])])
-    }
-
-    private func move(_ from: Int, _ to: Int) {
-        run([PresetActions.call("preset.moveSwatch", tool, ["from": .number(Double(from)), "to": .number(Double(to))])])
-    }
-
-    private func reset() {
-        run([PresetActions.call("preset.reset", tool)])
-        setMode(.slots)
     }
 }
 
-// MARK: - Thickness editor
-
-/// The options bar while one thickness slot is adjusted: back, a bead slider (logarithmic), the value in millimetres
-/// and points, and for the pen and pencil the line pattern. The slider commits once it rests for a quarter second.
-struct WidthEditorRow: View {
-    let app: NibApp
-    let session: EditorSession
-    let tool: String
-    let index: Int
-    let presets: ToolPresets
-    let onDone: () -> Void
-
-    @State private var position: Double
-    @Environment(\.horizontalSizeClass) private var sizeClass
-
-    init(app: NibApp, session: EditorSession, tool: String, index: Int, presets: ToolPresets, onDone: @escaping () -> Void) {
-        self.app = app
-        self.session = session
-        self.tool = tool
-        self.index = index
-        self.presets = presets
-        self.onDone = onDone
-        _position = State(initialValue: WidthScale.position(presets.widths[index], range: PresetRules.widthRange(tool)))
+extension View {
+    /// The bud source of the tool's popover, on the one control `PresetMenuModel.shown` names. A background, so the
+    /// control keeps its identity when the source moves to another one.
+    func presetPopoverSource(_ tool: String, _ isSource: Bool) -> some View {
+        background {
+            if isSource {
+                Color.clear.nibBudAnchor(PresetMenuModel.anchorID(tool))
+            }
+        }
     }
+}
 
-    private var width: Double { WidthScale.width(at: position, range: PresetRules.widthRange(tool)) }
-    private var pattern: StrokePattern { presets.patterns[index] }
+// MARK: - The popover
+
+/// The options bar's popover: the thickness editor or the colour editor, whichever `PresetMenuModel.shown` names.
+struct PresetPopoverContent: View {
+    let model: PresetMenuModel
 
     var body: some View {
-        HStack(spacing: 0) {
-            NibIconButton(.back, label: String(localized: "Back to Presets"), shortcut: .cancelAction) {
-                commit()
-                onDone()
+        switch model.shown {
+        case .width(let index):
+            WidthEditor(model: model, index: index)
+        case .colour:
+            ColourEditor(model: model)
+        }
+    }
+}
+
+/// One thickness slot: its value in millimetres and points over a bead slider (logarithmic, so the fine pen widths get
+/// most of the travel) and, for the pen and pencil, its line pattern. The slider commits once it rests for a quarter
+/// second, and when the popover closes.
+struct WidthEditor: View {
+    let model: PresetMenuModel
+    let index: Int
+
+    var body: some View {
+        let width = model.editedWidth
+        let pattern = model.presets.patterns.indices.contains(index) ? model.presets.patterns[index] : .solid
+        VStack(alignment: .leading, spacing: NibSpacing.m) {
+            NibInspectorSection(String(localized: "Thickness \(index + 1)"),
+                                value: "\(PresetText.millimetres(width)) · \(PresetText.points(width))") {
+                NibSlider(value: Binding(get: { model.widthPosition }, set: { model.setWidthPosition($0) }),
+                          label: String(localized: "Thickness"))
+                    .accessibilityValue(PresetText.widthValue(width, pattern: pattern))
             }
-            // iPhone: 44 + 88 + 64 + 13 + 3 × 44 fits the 361 pt the screen leaves the bar.
-            NibSlider(value: $position, label: String(localized: "Thickness"))
-                .frame(width: sizeClass == .compact ? 88 : 176)
-                .accessibilityValue(PresetText.widthValue(width, pattern: pattern))
-            VStack(alignment: .leading, spacing: 0) {
-                Text(PresetText.millimetres(width)).font(NibFont.hud)
-                Text(PresetText.points(width)).font(NibFont.caption2)
-            }
-            .foregroundStyle(NibColor.label)
-            .lineLimit(1)
-            .minimumScaleFactor(0.8)
-            .frame(minWidth: 56, alignment: .leading)
-            .padding(.leading, NibSpacing.s)
-            .accessibilityHidden(true)
-            if PresetRules.patternTools.contains(tool) {
-                NibBarSeparator()
-                ForEach(StrokePattern.allCases, id: \.self) { p in
-                    LineSampleButton(lineWidth: 2.5, pattern: p, isSelected: p == pattern,
-                                     label: PresetText.patternName(p), value: nil, hint: nil) {
-                        setPattern(p)
+            if PresetRules.patternTools.contains(model.tool) {
+                NibInspectorSection(String(localized: "Line")) {
+                    HStack(spacing: 0) {
+                        ForEach(StrokePattern.allCases, id: \.self) { p in
+                            LineSampleButton(lineWidth: NibStroke.thick, pattern: p, isSelected: p == pattern,
+                                             label: PresetText.patternName(p), value: nil, hint: nil) {
+                                model.setPattern(p)
+                            }
+                        }
                     }
                 }
             }
         }
-        .task(id: position) {
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            if !Task.isCancelled { commit() }
-        }
-        .onDisappear(perform: commit)
-    }
-
-    private func commit() {
-        let w = width
-        guard presets.widths.indices.contains(index), abs(w - presets.widths[index]) >= 0.005 else { return }
-        PresetActions.run(app, session: session, [PresetActions.call("preset.setWidth", tool,
-                                                                      ["index": .number(Double(index)), "width": .number(w)])])
-    }
-
-    private func setPattern(_ p: StrokePattern) {
-        PresetActions.run(app, session: session, [PresetActions.call("preset.setWidth", tool,
-                                                                      ["index": .number(Double(index)), "width": .number(width),
-                                                                       "pattern": .string(p.rawValue)])])
     }
 }
 
@@ -406,24 +611,31 @@ struct LineSample: Shape {
     }
 }
 
-/// One colour slot: a flat swatch, or for tape the pattern over its colour.
+/// One colour slot: a flat swatch, or for tape the pattern over its colour (NibDesign v2 `NibPenSwatch(_:pattern:)`;
+/// the tile is loaded here, `TapePatternCache`).
 struct SwatchSlot: View {
     let tool: String
     let swatch: PresetSwatch
     let name: String
     let isSelected: Bool
-    let registry: Registry<TapePatternDescriptor>
+    let registry: Registry<TapePatternDescriptor>?
     let action: () -> Void
+    @State private var pattern: NibSwatchPattern?
+
+    /// The slot's `TapePatternDescriptor.id` (tape only).
+    private var patternID: String? { tool == "tape" ? swatch.pattern.map(PresetSwatch.tapePatternID) : nil }
 
     var body: some View {
         let colour = PresetColour.display(swatch.color, tool: tool)
-        if tool == "tape", let pattern = swatch.pattern {
-            PatternSwatch(colour: colour, patternID: pattern.name, registry: registry, name: name, isSelected: isSelected,
-                          action: action)
-        } else {
-            NibPenSwatch(PresetColour.swatch(colour, id: swatch.color.hex, name: name), isSelected: isSelected, size: .palette,
-                         action: action)
-        }
+        NibPenSwatch(PresetColour.swatch(colour, id: swatch.color.hex, name: name), pattern: pattern, isSelected: isSelected,
+                     size: .palette, action: action)
+            .task(id: patternID) {
+                guard let id = patternID, let registry else {
+                    pattern = nil
+                    return
+                }
+                pattern = await TapePatternCache.pattern(id, registry: registry)
+            }
     }
 }
 
