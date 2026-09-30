@@ -44,9 +44,9 @@ struct BoxMemo {
 /// Handle geometry in canvas-view space for one selection box (pure: drawing, hit testing and tests share it).
 struct HandleLayout {
     /// 12 pt beads (DESIGN.md §14.3).
-    static let bead = NibSpacing.m
+    static let bead = NibMetrics.handleBead
     /// The rotation bead floats 24 pt above the top edge on a hairline.
-    static let rotationLift = NibSpacing.xxl
+    static let rotationLift = NibMetrics.rotationHandleOffset
     /// Every handle answers within a 44 pt target.
     static let reach = NibMetrics.hitTarget / 2
     /// Sides shorter than this on screen keep only their corners.
@@ -134,30 +134,34 @@ struct HandleLayout {
 
 /// "transform.handles": the selection's scale, resize and rotation handles and drag-to-move, claimed before the tap
 /// handlers and the active tool, so they work whatever tool is active (ARCHITECTURE.md §8.5). Two fingers, or
-/// Option, drag out a copy. Handles are rigid water beads: Clear corners, Tinted edges, a Clear rotation bead on a
-/// hairline (DESIGN.md §14.3); nothing on them deforms or animates.
+/// Option, drag out a copy. Handles are rigid water beads (`NibHandleView`): Clear corners, Tinted edges, a Clear
+/// rotation bead on a hairline (DESIGN.md §14.3); nothing on them deforms or animates. A pointer or a hovering Pencil
+/// over a handle washes its 44 pt hit area. Taps, double-taps and long-presses on the selection are not drags: they
+/// pass on to the tap handlers (`gesture(_:at:host:)` returns false).
 @MainActor
-final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDelegate, UIPointerInteractionDelegate {
+final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDelegate {
     static let id = "transform.handles"
     /// Above the page tiles.
     static let zPosition: CGFloat = 10
 
     private weak var host: CanvasHost?
-    private let container = CALayer()
+    /// Holds everything drawn, in canvas-view coordinates; it never takes a touch (the canvas routes them here).
+    private let overlay: UIView
     private let preview = CALayer()
+    private let hoverRing = CAShapeLayer()
     private let stem = CAShapeLayer()
-    private let cornerBeads = (0..<4).map { _ in CAShapeLayer() }
-    private let edgeBeads = (0..<4).map { _ in CAShapeLayer() }
-    private let rotationBead = CAShapeLayer()
+    private let cornerBeads: [NibHandleView]
+    private let edgeBeads: [NibHandleView]
+    private let rotationBead: NibHandleView
     private let accessView: HandleAccessView
     private var twoFinger: UIPanGestureRecognizer?
     private(set) var box: SelectionBox?
     private(set) var layout: HandleLayout?
     private(set) var drag: DragController?
+    /// The handle under the pointer or a hovering Pencil (never the body).
+    private(set) var hovered: HandleTarget?
     /// The last drag's commit, so tests can await it.
     private(set) var pendingCommit: Task<Void, Never>?
-    /// The last tap forwarded to `content.tapHandlers`, so tests can await it.
-    private(set) var pendingTap: Task<Void, Never>?
     private var pendingTarget: HandleTarget?
     private var touchStreamActive = false
     private var ignoringTouchStream = false
@@ -170,7 +174,13 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
     /// What the VoiceOver actions were built for (next/previous page depends on the page and the live page order).
     private var actionsFor: (page: PageID, ids: Set<ElementID>, pages: [PageID])?
 
+    private var beads: [NibHandleView] { cornerBeads + edgeBeads + [rotationBead] }
+
     override init() {
+        overlay = UIView(frame: .zero)
+        cornerBeads = (0..<4).map { _ in NibHandleView(style: .clear) }
+        edgeBeads = (0..<4).map { _ in NibHandleView(style: .tinted) }
+        rotationBead = NibHandleView(style: .clear)
         accessView = HandleAccessView(frame: .zero)
         super.init()
     }
@@ -179,19 +189,20 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
 
     func attach(to host: CanvasHost) {
         self.host = host
-        container.zPosition = Self.zPosition
-        container.addSublayer(preview)
-        container.addSublayer(stem)
-        for bead in cornerBeads + edgeBeads + [rotationBead] { container.addSublayer(bead) }
-        host.canvasView.layer.addSublayer(container)
-
-        accessView.owner = self
-        accessView.layer.zPosition = Self.zPosition
-        accessView.addInteraction(UIPointerInteraction(delegate: self))
-        accessView.registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) {
-            [weak self] (_: HandleAccessView, _: UITraitCollection) in
+        overlay.isUserInteractionEnabled = false
+        overlay.clipsToBounds = false
+        overlay.layer.zPosition = Self.zPosition
+        overlay.layer.addSublayer(preview)
+        overlay.layer.addSublayer(hoverRing)
+        overlay.layer.addSublayer(stem)
+        for bead in beads { overlay.addSubview(bead) }
+        overlay.registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) {
+            [weak self] (_: UIView, _: UITraitCollection) in
             self?.drawHandles()
         }
+        host.canvasView.addSubview(overlay)
+
+        accessView.layer.zPosition = Self.zPosition
         host.canvasView.addSubview(accessView)
 
         let pan = DuplicatePan(target: self, action: #selector(twoFingerPan(_:)))
@@ -211,7 +222,8 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         cached = nil
         drag?.cancel()
         drag = nil
-        container.removeFromSuperlayer()
+        hovered = nil
+        overlay.removeFromSuperview()
         accessView.removeFromSuperview()
         if let pan = twoFinger { host.canvasView.removeGestureRecognizer(pan) }
         twoFinger = nil
@@ -233,7 +245,7 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         touchStreamActive = true
         guard !ignoringTouchStream, drag == nil, let target = pendingTarget else { return }
         startDrag(target, at: host.viewPoint(sample.location, page: sample.page),
-                  duplicate: target == .body && sample.modifiers.contains(.option))
+                  duplicate: target == .body && sample.modifiers.contains(.option), isPencil: sample.isPencil)
     }
 
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {
@@ -242,44 +254,11 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         d.update(to: host.viewPoint(s.location, page: s.page), modifiers: s.modifiers)
     }
 
+    /// A touch that never passed the drag slop commits nothing: the canvas offers it as a tap (`gesture`).
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
         defer { endTouchStream() }
         guard !ignoringTouchStream, let d = drag else { return }
-        let v = host.viewPoint(sample.location, page: sample.page)
-        let tapped = d.isTap(at: v)
-        finish(d, at: v, modifiers: sample.modifiers)
-        if tapped { pendingTap = forwardTap(sample, host: host) }
-    }
-
-    /// A touch on the selection that never became a drag is a tap: it goes to `content.tapHandlers` in order (link
-    /// taps, selection.tapAt, editing the selected text or note…) until one returns {"handled": true}.
-    /// ponytail: single taps only; double-taps, long-presses and the active tool's own tap need a contract way for
-    /// an attachment to decline a touch it already claimed (CanvasAttachment has none yet).
-    private func forwardTap(_ sample: CanvasSample, host: CanvasHost) -> Task<Void, Never>? {
-        let doc = host.documentID
-        let items = (try? host.app.workspace.items(doc, page: sample.page)) ?? []
-        let top = items.last { TransformMath.box($0).contains(sample.location) }
-        let readOnly = host.session.readOnly
-        let handlers = host.app.content.tapHandlers.all.filter { h in
-            guard h.gesture == .tap, !readOnly || h.worksInReadOnly else { return false }
-            if let kinds = h.itemKinds, !(top.map { kinds.contains($0.kind) } ?? false) { return false }
-            if let keys = h.drawKeys, !(top.map { keys.contains($0.drawKey) } ?? false) { return false }
-            return true
-        }
-        guard !handlers.isEmpty else { return nil }
-        var params: [String: JSONValue] = [
-            "page": .string(NodeRef.page(doc, sample.page).description),
-            "point": .array([.number(sample.location.x), .number(sample.location.y)]),
-            "gesture": .string(CanvasGesture.tap.rawValue)
-        ]
-        if let top { params["ref"] = .string(NodeRef.item(doc, sample.page, top.id).description) }
-        let bus = host.app.bus, session = host.session
-        return Task { @MainActor in
-            for h in handlers {
-                let r = try? await bus.execute(h.command, .object(params), session: session)
-                if r?["handled"]?.boolValue == true { return }
-            }
-        }
+        finish(d, at: host.viewPoint(sample.location, page: sample.page), modifiers: sample.modifiers)
     }
 
     func touchesCancelled(host: CanvasHost) {
@@ -288,13 +267,37 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         cancelDrag()
     }
 
+    /// A tap, double-tap or long-press on the selection is not a transform: it goes on to `content.tapHandlers` (link
+    /// taps, selection.tapAt, editing the selected text or note…) and then the active tool. A drag it interrupted
+    /// before it moved is dropped, and the rest of that touch is ignored.
+    func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool {
+        if let d = drag, !d.isDragging, !d.isCommitting {
+            d.cancel()
+            drag = nil
+            if touchStreamActive { ignoringTouchStream = true }
+            refresh()
+        }
+        return false
+    }
+
+    /// Pointer or Pencil hover: the handle under it shows its hit area.
+    func hover(_ sample: CanvasSample?, host: CanvasHost) {
+        var next: HandleTarget?
+        if let s = sample, drag == nil, let t = layout?.target(at: host.viewPoint(s.location, page: s.page)), t != .body {
+            next = t
+        }
+        guard next != hovered else { return }
+        hovered = next
+        drawHandles()
+    }
+
     // MARK: Drags
 
-    private func startDrag(_ target: HandleTarget, at v: CGPoint, duplicate: Bool) {
+    private func startDrag(_ target: HandleTarget, at v: CGPoint, duplicate: Bool, isPencil: Bool) {
         guard let host, let box else { return }
-        drag = DragController(host: host, box: box, target: target, start: v, duplicate: duplicate, layer: preview) {
-            [weak self] in self?.drawHandles()
-        }
+        hovered = nil
+        drag = DragController(host: host, box: box, target: target, start: v, duplicate: duplicate, isPencil: isPencil,
+                              layer: preview) { [weak self] in self?.drawHandles() }
     }
 
     private func finish(_ d: DragController, at v: CGPoint, modifiers: KeyModifiers) {
@@ -305,7 +308,7 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
             if let a = outcome?.affine, !d.duplicate {
                 let moved = box.items.map { TransformMath.apply(a, to: $0) }
                 self.memo = BoxMemo(doc: box.doc, page: box.page, ids: box.ids,
-                                    frame: TransformMath.frame(box.frame, applying: a),
+                                    frame: TransformMath.upright(box.frame.applying(a)),
                                     bounds: TransformMath.union(moved.map(TransformMath.box)) ?? .zero)
             } else if outcome != nil {
                 self.memo = nil
@@ -339,7 +342,7 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
             }
             if touchStreamActive { ignoringTouchStream = true }   // the first finger's stream now belongs to the copy
             refresh()
-            startDrag(.body, at: v, duplicate: true)
+            startDrag(.body, at: v, duplicate: true, isPencil: false)
         case .changed:
             drag?.update(to: v, modifiers: m)
         case .ended:
@@ -358,7 +361,7 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         return m
     }
 
-    // MARK: Model → layers
+    // MARK: Model → views
 
     private func refresh() {
         box = host.flatMap { currentBox($0) }
@@ -399,55 +402,50 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
-        guard let host, let box, drag?.isCommitting != true else {
-            for l in cornerBeads + edgeBeads + [rotationBead, stem] { l.isHidden = true }
+        guard let host, let box, drag?.isCommitting != true, let toView = host.pageTransform(box.page) else {
+            for bead in beads { bead.isHidden = true }
+            stem.isHidden = true
+            hoverRing.isHidden = true
             layout = nil
+            hovered = nil
             accessView.isHidden = true
             return
         }
-        let toView = host.pageToView(box.page)
         var corners = box.frame.corners.map { $0.cg.applying(toView) }
         if let d = drag, d.isDragging { corners = corners.map { $0.applying(d.viewTransform) } }
         let l = HandleLayout(corners: corners)
         layout = l
 
-        let traits = host.canvasView.traitCollection
-        let dark = traits.userInterfaceStyle == .dark
-        let clear = UIAccessibility.isReduceTransparencyEnabled ? NibUIColor.chromeOpaque : NibUIColor.clearBodyOnPaper
-        let body = clear.resolvedColor(with: traits).cgColor
-        let line = NibUIColor.waterLine.resolvedColor(with: traits).cgColor
-        let accent = NibUIColor.accent.resolvedColor(with: traits).cgColor
-        let rim = NibUIColor.tintRim.resolvedColor(with: traits).cgColor
-        let r = HandleLayout.bead / 2
-        let path = CGPath(ellipseIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r), transform: nil)
-        func place(_ bead: CAShapeLayer, at p: CGPoint, fill: CGColor, stroke: CGColor, visible: Bool) {
-            bead.isHidden = !visible
-            bead.path = path
-            bead.position = p
-            bead.fillColor = fill
-            bead.strokeColor = stroke
-            bead.lineWidth = 1
-            bead.nibElevation(.rest, path: path, dark: dark)
-        }
-        for i in 0..<4 { place(cornerBeads[i], at: l.corners[i], fill: body, stroke: line, visible: true) }
         for i in 0..<4 {
-            place(edgeBeads[i], at: l.edges[i], fill: accent, stroke: rim,
-                  visible: i % 2 == 0 ? l.showsTopBottom : l.showsLeftRight)
+            cornerBeads[i].isHidden = false
+            cornerBeads[i].center = l.corners[i]
+            edgeBeads[i].isHidden = !(i % 2 == 0 ? l.showsTopBottom : l.showsLeftRight)
+            edgeBeads[i].center = l.edges[i]
         }
-        place(rotationBead, at: l.rotation, fill: body, stroke: line, visible: true)
+        rotationBead.isHidden = false
+        rotationBead.center = l.rotation
+
+        let traits = host.canvasView.traitCollection
         let stemPath = CGMutablePath()
         stemPath.move(to: l.edges[0])
         stemPath.addLine(to: l.rotation)
         stem.path = stemPath
         stem.fillColor = nil
-        stem.strokeColor = accent
-        stem.lineWidth = 1 / max(traits.displayScale, 1)
+        stem.strokeColor = NibUIColor.accent.resolvedColor(with: traits).cgColor
+        stem.lineWidth = NibStroke.hairline
         stem.isHidden = false
+
+        if drag == nil, let h = hovered, let c = l.centre(of: h) {
+            let d = NibMetrics.hitTarget
+            hoverRing.path = CGPath(ellipseIn: CGRect(x: c.x - d / 2, y: c.y - d / 2, width: d, height: d), transform: nil)
+            hoverRing.fillColor = NibUIColor.accentWash.resolvedColor(with: traits).cgColor
+            hoverRing.isHidden = false
+        } else {
+            hoverRing.isHidden = true
+        }
 
         accessView.isHidden = false
         accessView.frame = l.bounds
-        // Topmost for pointer hover (it passes every touch through, so the ink view below still gets the Pencil).
-        if host.canvasView.subviews.last !== accessView { host.canvasView.bringSubviewToFront(accessView) }
         updateAccessibility(box, host: host)
     }
 
@@ -517,31 +515,6 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
         return list
     }
 
-    // MARK: Pointer (iPad trackpad and mouse)
-
-    /// True over a handle bead (not the body): the pointer then morphs into the bead's hover shape.
-    func hoversHandle(_ canvasPoint: CGPoint) -> Bool {
-        guard drag == nil, let t = layout?.target(at: canvasPoint) else { return false }
-        return t != .body
-    }
-
-    func pointerInteraction(_ interaction: UIPointerInteraction, regionFor request: UIPointerRegionRequest,
-                            defaultRegion: UIPointerRegion) -> UIPointerRegion? {
-        guard let host, drag == nil, let layout else { return nil }
-        let p = accessView.convert(request.location, to: host.canvasView)
-        guard let t = layout.target(at: p), t != .body, let c = layout.centre(of: t) else { return nil }
-        let reach = HandleLayout.reach
-        let rect = accessView.convert(CGRect(x: c.x - reach, y: c.y - reach, width: 2 * reach, height: 2 * reach),
-                                      from: host.canvasView)
-        return UIPointerRegion(rect: rect, identifier: String(describing: t))
-    }
-
-    func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
-        let d = HandleLayout.bead + NibSpacing.s
-        let rect = CGRect(x: region.rect.midX - d / 2, y: region.rect.midY - d / 2, width: d, height: d)
-        return UIPointerStyle(shape: .roundedRect(rect, radius: NibRadius.capsule(d)))
-    }
-
     // MARK: Two-finger duplicate
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
@@ -599,26 +572,18 @@ final class DuplicatePan: UIPanGestureRecognizer {
     }
 }
 
-/// An invisible view over the handles: the VoiceOver element for the selection and the pointer's hover target.
-/// Touches always fall through to the canvas.
+/// An invisible view over the handles: the VoiceOver element for the selection. It never takes a touch.
 final class HandleAccessView: UIView {
-    weak var owner: SelectionHandles?
-
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = nil
         isOpaque = false
+        isUserInteractionEnabled = false
         isAccessibilityElement = true
     }
 
     required init?(coder: NSCoder) {
         return nil
-    }
-
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        guard event?.type == .hover, let owner, let canvas = superview,
-              owner.hoversHandle(convert(point, to: canvas)) else { return nil }
-        return self
     }
 
     /// Double-tapping the selection with VoiceOver does nothing; its actions do the work.

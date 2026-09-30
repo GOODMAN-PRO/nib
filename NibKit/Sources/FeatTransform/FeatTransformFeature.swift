@@ -17,11 +17,7 @@ public enum FeatTransformFeature: NibFeature {
             SelectionHandles()
         })
 
-        for nudge in Nudge.all {
-            app.content.keyCommands.register(KeyCommandDescriptor(
-                id: nudge.id, title: nudge.title, shortcut: nudge.shortcut, command: CommandIDs.itemTransform,
-                params: ["translate": nudge.translate], scope: .canvas, order: 700, owner: id))
-        }
+        for nudge in Nudge.all { app.content.keyCommands.register(nudge.descriptor) }
 
         app.ui.settingsPages.register(SettingsPageDescriptor(
             id: "transform.snapping", title: String(localized: "Alignment and snapping"), icon: NibSymbol.pages.name,
@@ -31,13 +27,26 @@ public enum FeatTransformFeature: NibFeature {
     }
 }
 
-/// Arrow keys nudge the selection 1 pt, 10 pt with Shift (T-111). The command's refs default to the selection, and a
-/// nudge with nothing selected does nothing.
+/// Arrow keys nudge the selection 1 pt, 10 pt with Shift (T-111), on the canvas of notebooks and whiteboards only (the
+/// shell leaves the arrows to study sets and text documents). The key names the key window's selection
+/// (`sessionParams`); a nudge with nothing selected does nothing.
 struct Nudge {
     let id: String
     let title: String
     let shortcut: KeyShortcut
     let translate: JSONValue
+
+    @MainActor var descriptor: KeyCommandDescriptor {
+        var d = KeyCommandDescriptor(id: id, title: title, shortcut: shortcut, command: CommandIDs.itemTransform,
+                                     params: ["translate": translate], scope: .canvas, order: 700,
+                                     owner: FeatTransformFeature.id)
+        d.docKinds = [.notebook, .whiteboard]
+        d.sessionParams = { session in
+            let refs = session.selection.refs
+            return refs.isEmpty ? [:] : ["refs": .array(refs.map { .string($0) })]
+        }
+        return d
+    }
 
     static var all: [Nudge] {
         let directions: [(key: String, near: String, far: String, dx: Double, dy: Double)] = [

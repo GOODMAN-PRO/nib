@@ -33,8 +33,9 @@ final class FeatTransformTests: XCTestCase {
         return attachment
     }
 
-    private func sample(_ page: PageID, _ x: Double, _ y: Double, _ modifiers: KeyModifiers = []) -> CanvasSample {
-        CanvasSample(page: page, location: Point(x, y), isPencil: false, modifiers: modifiers)
+    private func sample(_ page: PageID, _ x: Double, _ y: Double, _ modifiers: KeyModifiers = [],
+                        pencil: Bool = false) -> CanvasSample {
+        CanvasSample(page: page, location: Point(x, y), isPencil: pencil, modifiers: modifiers)
     }
 
     // MARK: Registration
@@ -44,7 +45,7 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(problems, [])
     }
 
-    func testArrowKeysNudgeOneAndTenPoints() throws {
+    func testArrowKeysNudgeOneAndTenPoints() async throws {
         let h = Harness(features: [FeatTransformFeature.self])
         let keys = h.app.content.keyCommands.all.filter { $0.owner == FeatTransformFeature.id }
         XCTAssertEqual(keys.count, 8)
@@ -54,6 +55,18 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(up.scope, .canvas)
         let far = try XCTUnwrap(keys.first { $0.shortcut == KeyShortcut("right", [.shift]) })
         XCTAssertEqual(far.params["translate"], .array([.number(10), .number(0)]))
+        // Canvas documents only, so the arrows stay free in study sets and text documents.
+        XCTAssertTrue(keys.allSatisfy { $0.docKinds == [.notebook, .whiteboard] })
+        XCTAssertTrue(up.isActive(in: KeyCommandContext(docKind: .whiteboard)))
+        XCTAssertFalse(up.isActive(in: KeyCommandContext(docKind: .studySet)))
+        XCTAssertFalse(up.isActive(in: KeyCommandContext(docKind: .notebook, isEditingText: true)))
+        // The key names the key window's selection; with nothing selected it passes no refs.
+        XCTAssertNil(up.resolvedParams(for: h.session)["refs"])
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        XCTAssertEqual(up.resolvedParams(for: h.session)["refs"], .array([ref(Fixtures.shapeID)]))
+        XCTAssertEqual(up.resolvedParams(for: h.session)["translate"], .array([.number(0), .number(-1)]))
+        try await h.run(up.command, up.resolvedParams(for: h.session))
+        XCTAssertEqual(try item(h, Fixtures.shapeID).shape?.frame.y, 199)
     }
 
     // MARK: item.transform
@@ -201,17 +214,49 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(first.y, 1)
     }
 
-    func testRotatedFrameResizesAlongItsOwnAxes() {
-        let f = Frame(x: 100, y: 100, w: 80, h: 40, rotation: .pi / 6)
+    func testRotatedFrameResizesAlongItsOwnAxes() throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        var shape = try item(h, Fixtures.shapeID)
+        shape.frame = Frame(x: 100, y: 100, w: 80, h: 40, rotation: .pi / 6)
+        let f = try XCTUnwrap(shape.frame)
         let c = f.center
         let t = Affine.rotation(-f.rotation, about: c).concatenating(.scale(2, 1, about: c))
             .concatenating(.rotation(f.rotation, about: c))
-        let g = TransformMath.frame(f, applying: t)
+        let g = try XCTUnwrap(TransformMath.apply(t, to: shape).frame)
         XCTAssertEqual(g.w, 160, accuracy: 1e-9)
         XCTAssertEqual(g.h, 40, accuracy: 1e-9)
         XCTAssertEqual(g.rotation, .pi / 6, accuracy: 1e-9)
         XCTAssertEqual(g.center.x, c.x, accuracy: 1e-9)
         XCTAssertEqual(g.center.y, c.y, accuracy: 1e-9)
+    }
+
+    func testAFullTurnLeavesABoxExactlyUpright() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let refs = JSONValue.array([ref(Fixtures.shapeID)])
+        for _ in 0..<4 { try await h.run("item.transform", ["refs": refs, "rotate": 90]) }
+        XCTAssertEqual(try item(h, Fixtures.shapeID).shape?.frame.rotation, 0)
+    }
+
+    func testTheSelectionOutlineTurnsWithTheItems() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let outline = [Point(90, 190), Point(270, 190), Point(270, 300), Point(90, 300)]
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID],
+                                        bounds: Rect(x: 100, y: 200, width: 160, height: 90), outline: outline)
+        try await h.run("item.transform", ["rotate": 90, "origin": [180, 245]])
+        let turned = try XCTUnwrap(h.session.selection.outline)
+        let expected = outline.map { Affine.rotation(.pi / 2, about: Point(180, 245)).apply($0) }
+        XCTAssertEqual(turned.count, 4)
+        for (a, b) in zip(turned, expected) {
+            XCTAssertEqual(a.x, b.x, accuracy: 1e-9)
+            XCTAssertEqual(a.y, b.y, accuracy: 1e-9)
+        }
+        try await h.run("item.moveToPage", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "offset": [0, 40]])
+        XCTAssertEqual(h.session.selection.page, page2)
+        let moved = try XCTUnwrap(h.session.selection.outline)
+        for (a, b) in zip(moved, expected) {
+            XCTAssertEqual(a.x, b.x, accuracy: 1e-9)
+            XCTAssertEqual(a.y, b.y + 40, accuracy: 1e-9)
+        }
     }
 
     func testRefsDefaultToTheSelectionAndNothingSelectedIsANoOp() async throws {
@@ -242,6 +287,29 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(connector.to.item, Fixtures.stickyID)
         XCTAssertTrue(h.app.bus.undo(doc))
         XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testAMoveByTheAssistantKeepsWhoMadeTheItem() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        edit(h, Fixtures.shapeID) { $0.createdBy = "user" }
+        try await h.run("item.moveToPage", ["refs": .array([ref(Fixtures.shapeID)]), "page": "page:FIXTUREDOC01/FIXTUREPG002"],
+                        as: .ai("t"))
+        XCTAssertEqual(try item(h, Fixtures.shapeID, on: page2).createdBy, "user")
+    }
+
+    func testMovedItemsKeepTheirStackingOrderOnTopOfThePage() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        edit(h, Fixtures.textID) { $0.attachedTo = Fixtures.stickyID }
+        let before = try h.app.workspace.items(doc, page: page1).map(\.id)
+        let refs = JSONValue.array([ref(Fixtures.shapeID), ref(Fixtures.stickyID)])
+        try await h.run("item.moveToPage", ["refs": refs, "page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        let moved = try h.app.workspace.items(doc, page: page2)
+        XCTAssertEqual(moved.map(\.id), before.filter { Set(moved.map(\.id)).contains($0) })
+        XCTAssertEqual(Set(moved.map(\.id)), [Fixtures.shapeID, Fixtures.stickyID, Fixtures.textID, Fixtures.connectorID])
+        XCTAssertEqual(try item(h, Fixtures.textID, on: page2).attachedTo, Fixtures.stickyID, "attached before or after")
+        let line = try XCTUnwrap(try item(h, Fixtures.connectorID, on: page2).connector)
+        XCTAssertEqual(line.from.item, Fixtures.shapeID)
+        XCTAssertEqual(line.to.item, Fixtures.stickyID)
     }
 
     func testMovingBothEndsCarriesTheConnectorAndFollowsTheSelection() async throws {
@@ -365,6 +433,7 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(try item(h, Fixtures.connectorID).connector?.from.point, Point(300, 275))
         XCTAssertNil(host.hidden[page1])
         XCTAssertEqual(h.undoDepth(doc), depth + 1)
+        XCTAssertEqual(host.renderWaits, [page1], "the preview waits for the tiles to redraw")
     }
 
     func testDroppingOnAnotherPageMovesTheItemsThere() async throws {
@@ -420,29 +489,48 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertNil(host.hidden[page1])
     }
 
-    func testATapOnTheSelectionGoesToTheTapHandlers() async throws {
+    func testTapsOnTheSelectionPassOnToTheTapHandlers() async throws {
         let h = Harness(features: [FeatTransformFeature.self])
-        let taps = TapRecorder()
-        h.app.commands.register(CommandDescriptor(id: "test.tapAt", title: "Tap", summary: "Records taps.", effect: .session)) {
-            params, _ in
-            taps.calls.append(params)
-            return ["handled": true]
-        }
-        h.app.content.tapHandlers.register(TapHandlerDescriptor(id: "test.tap", owner: "test", gesture: .tap,
-                                                                command: "test.tapAt", itemKinds: [.shape]))
         let host = FakeCanvasHost(h)
         let handles = try makeHandles(h, host)
         h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        for gesture in CanvasGesture.allCases {
+            XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 245), host: host))
+            XCTAssertFalse(handles.gesture(gesture, at: sample(page1, 180, 245), host: host), gesture.rawValue)
+        }
+    }
+
+    func testALongPressThenDragMovesNothing() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        let before = try h.snapshot()
         XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 245), host: host))
         handles.touchesBegan(sample(page1, 180, 245), host: host)
-        handles.touchesEnded(sample(page1, 181, 246), host: host)
-        await handles.pendingTap?.value
-        let call = try XCTUnwrap(taps.calls.first)
-        XCTAssertEqual(taps.calls.count, 1)
-        XCTAssertEqual(call["gesture"], "tap")
-        XCTAssertEqual(call["ref"], ref(Fixtures.shapeID))
-        XCTAssertEqual(call["page"], "page:FIXTUREDOC01/FIXTUREPG001")
-        XCTAssertEqual(call["point"], [181, 246])
+        XCTAssertFalse(handles.gesture(.longPress, at: sample(page1, 180, 245), host: host))
+        XCTAssertNil(handles.drag)
+        handles.touchesMoved([sample(page1, 260, 300)], host: host)
+        handles.touchesEnded(sample(page1, 260, 300), host: host)
+        XCTAssertNil(handles.pendingCommit)
+        XCTAssertNil(host.hidden[page1])
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testHoverWashesTheHandleUnderThePointer() throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        handles.canvasDidChange(host)
+        handles.hover(sample(page1, 101, 201), host: host)
+        XCTAssertEqual(handles.hovered, .corner(0))
+        handles.hover(sample(page1, 180, 245), host: host)
+        XCTAssertNil(handles.hovered, "the body has no hover wash")
+        handles.hover(sample(page1, 180, 176, pencil: true), host: host)
+        XCTAssertEqual(handles.hovered, .rotate, "a hovering Pencil too")
+        handles.hover(nil, host: host)
+        XCTAssertNil(handles.hovered)
     }
 
     // MARK: Drags
@@ -562,6 +650,31 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(frame.y, 200, accuracy: 1e-9)
     }
 
+    func testAPencilSnapAsksThePencilForItsHaptic() async throws {
+        let h = Harness(features: [FeatTransformFeature.self])
+        h.app.settings.set(NibSettings.alignObjects, true)
+        h.app.settings.set(NibSettings.snapToGrid, false)
+        var haptics: [PencilHapticPayload] = []
+        let subscription = h.app.events.subscribe { e in
+            if let p = e.decode(PencilHapticPayload.self) { haptics.append(p) }
+        }
+        defer { subscription.cancel() }
+        let host = FakeCanvasHost(h)
+        let handles = try makeHandles(h, host)
+        h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
+        XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 245), host: host))
+        handles.touchesBegan(sample(page1, 180, 245, pencil: true), host: host)
+        handles.touchesMoved([sample(page1, 478, 245, pencil: true)], host: host)   // left edge 398 → the note's 400
+        handles.touchesMoved([sample(page1, 479, 245, pencil: true)], host: host)   // still the same snap
+        handles.touchesEnded(sample(page1, 479, 245, pencil: true), host: host)
+        await handles.pendingCommit?.value
+        XCTAssertEqual(haptics.count, 1, "once per snap, not per frame")
+        XCTAssertEqual(haptics.first?.kind, "alignment")
+        XCTAssertEqual(haptics.first?.page, "page:FIXTUREDOC01/FIXTUREPG001")
+        XCTAssertEqual(haptics.first?.session, h.session.id.raw)
+        XCTAssertEqual(try item(h, Fixtures.shapeID).shape?.frame.x ?? 0, 400, accuracy: 1e-9)
+    }
+
     func testDraggingSnapsToANeighboursEdge() async throws {
         let h = Harness(features: [FeatTransformFeature.self])
         h.app.settings.set(NibSettings.alignObjects, true)
@@ -579,12 +692,6 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(frame.x, 400, accuracy: 1e-9)
         XCTAssertEqual(frame.y, 200, accuracy: 1e-9)
     }
-}
-
-/// Tap handler calls seen by a test.
-@MainActor
-private final class TapRecorder {
-    var calls: [JSONValue] = []
 }
 
 /// Stands in for item.duplicate (another feature): copies items in place under the caller's ids, then shifts them.

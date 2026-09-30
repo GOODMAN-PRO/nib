@@ -3,21 +3,10 @@ import os
 import NibContracts
 import NibDesign
 
-@MainActor
-extension CanvasHost {
-    /// Page → canvas-view affine, measured through `viewPoint`, so zoom, page layout and page rotation all count.
-    func pageToView(_ page: PageID) -> CGAffineTransform {
-        let o = viewPoint(.zero, page: page)
-        let x = viewPoint(Point(100, 0), page: page)
-        let y = viewPoint(Point(0, 100), page: page)
-        return CGAffineTransform(a: (x.x - o.x) / 100, b: (x.y - o.y) / 100, c: (y.x - o.x) / 100, d: (y.y - o.y) / 100,
-                                 tx: o.x, ty: o.y)
-    }
-}
-
 /// One drag of the selection: move (across pages too), corner scale, edge resize or rotation, with a live preview
 /// (a snapshot layer over the hidden originals), alignment and spacing guides, grid snapping and snap haptics. On
 /// release it commits through commands (item.transform / item.moveToPage, item.duplicate for copies) in one undo group.
+/// Page ↔ view mapping is the canvas's own `CanvasHost.pageTransform(_:)` (zoom, page layout and rotation included).
 @MainActor
 final class DragController {
     enum Phase { case armed, dragging, committing, finished }
@@ -51,8 +40,6 @@ final class DragController {
     static let shiftAngleStep = Double.pi / 12
     /// Longest edge of the raster snapshot, in pixels.
     static let maxSnapshotPixels: Double = 4096
-    /// How long the snapshot stays over its drop spot while the dry tiles redraw underneath.
-    static let settleNanoseconds: UInt64 = 120_000_000
 
     private static let log = Logger(subsystem: "app.nib", category: "transform")
 
@@ -60,6 +47,8 @@ final class DragController {
     let box: SelectionBox
     let target: HandleTarget
     let duplicate: Bool
+    /// A Pencil drives the drag: its snap haptic is asked of the Pencil feature (`PencilHapticPayload`).
+    let isPencil: Bool
     private(set) var phase = Phase.armed
     /// Live view-space transform of the selection.
     private(set) var viewTransform = CGAffineTransform.identity
@@ -89,6 +78,8 @@ final class DragController {
     private var snapshotRegion: Rect?
     private var snapshotToken = 0
     private var lastCommand = CommandIDs.itemTransform
+    /// The last page → view transform seen per page (a page scrolled out of layout keeps its last one).
+    private var transforms: [PageID: CGAffineTransform] = [:]
     private let snapshot = CALayer()
     private let vector = CALayer()
     private let solidGuides = CAShapeLayer()
@@ -103,12 +94,13 @@ final class DragController {
         phase == .armed && hypot(v.x - start.x, v.y - start.y) < Self.slop
     }
 
-    init(host: CanvasHost, box: SelectionBox, target: HandleTarget, start: CGPoint, duplicate: Bool,
+    init(host: CanvasHost, box: SelectionBox, target: HandleTarget, start: CGPoint, duplicate: Bool, isPencil: Bool,
          layer: CALayer, changed: @escaping () -> Void) {
         self.host = host
         self.box = box
         self.target = target
         self.duplicate = duplicate
+        self.isPencil = isPencil
         self.start = start
         self.parent = layer
         self.changed = changed
@@ -125,9 +117,11 @@ final class DragController {
             c.kind == .connector && !travelling.contains(c.id)
                 && TransformGraph.anchors(c).contains { travelling.contains($0) }
         }
-        let sp = Point(start.applying(host.pageToView(box.page).inverted()))
+        let pageToView = host.pageTransform(box.page) ?? .identity
+        let sp = Point(start.applying(pageToView.inverted()))
         startPage = sp
         grab = DragController.handleLocal(target, box.frame) - DragController.local(sp, in: box.frame)
+        transforms[box.page] = pageToView
     }
 
     // MARK: Gesture
@@ -200,8 +194,8 @@ final class DragController {
         }
         let over = host.pagePoint(v)?.page ?? dropPage
         dropPage = over
-        let toOver = host.pageToView(over)
-        let movedView = box.frame.bounds.cg.applying(host.pageToView(box.page)).offsetBy(dx: d.x, dy: d.y)
+        let toOver = toView(over)
+        let movedView = box.frame.bounds.cg.applying(toView(box.page)).offsetBy(dx: d.x, dy: d.y)
         let result = engine(for: over).move(Rect(movedView.applying(toOver.inverted())), lockX: lockX, lockY: lockY)
         let snap = CGSize(width: result.offset.x, height: result.offset.y).applying(toOver)
         d.x += snap.width
@@ -341,12 +335,21 @@ final class DragController {
         return Point(c.x + l.x * cs - l.y * sn, c.y + l.x * sn + l.y * cs)
     }
 
+    /// Page → canvas-view transform from the canvas; the last one seen while a page is not laid out.
+    private func toView(_ page: PageID) -> CGAffineTransform {
+        if let t = host.pageTransform(page) {
+            transforms[page] = t
+            return t
+        }
+        return transforms[page] ?? transforms[box.page] ?? .identity
+    }
+
     private func pagePoint(_ v: CGPoint) -> Point {
-        Point(v.applying(host.pageToView(box.page).inverted()))
+        Point(v.applying(toView(box.page).inverted()))
     }
 
     private func viewAffine(_ a: Affine) -> CGAffineTransform {
-        let m = host.pageToView(box.page)
+        let m = toView(box.page)
         return m.inverted().concatenating(a.cg).concatenating(m)
     }
 
@@ -376,27 +379,29 @@ final class DragController {
         return e
     }
 
-    /// The page template's own line spacing (rendered once per drag), else its "spacing" parameter.
+    /// The grid the page template publishes (`TemplateDefinition.metrics(for:size:)`, contracts-v2 G7).
     private func templateGrid(_ record: PageRecord) -> GuideEngine.Grid? {
         guard record.background.kind == .template, let ref = record.background.template,
               let definition = host.app.content.template(ref) else { return nil }
-        var params = definition.defaults
-        for (k, v) in ref.params { params[k] = v }
-        let size = record.size ?? PageSize(4096, 4096)
-        if let grid = GuideEngine.Grid.from(definition.render(params, size, 1).display) { return grid }
-        guard let step = params["spacing"]?.doubleValue, step >= 1 else { return nil }
-        return GuideEngine.Grid(x: GuideEngine.Lines(origin: 0, step: step), y: GuideEngine.Lines(origin: 0, step: step))
+        return GuideEngine.Grid.from(definition.metrics(for: ref.params, size: record.size))
     }
 
     // MARK: Haptics
 
-    /// Apple Pencil Pro (and the device) feel a snap the moment it engages, never per frame.
+    /// A snap is felt the moment it engages, never per frame. A Pencil drag asks the Pencil feature for the Apple
+    /// Pencil Pro haptic (`pencil.haptic`, which honours the Pencil haptics setting); a finger or pointer drag plays the
+    /// canvas feedback itself.
     private func signal(_ key: SnapKey, at v: CGPoint) {
         defer { lastSnap = key }
         let engaged = (key.x != nil && key.x != lastSnap.x) || (key.y != nil && key.y != lastSnap.y)
             || (key.angle != nil && key.angle != lastSnap.angle)
         guard engaged else { return }
-        if #available(iOS 17.5, *) {
+        if isPencil {
+            let point = Point(v.applying(toView(guidePage).inverted()))
+            host.app.events.emit(PencilHapticPayload(kind: "alignment", page: NodeRef.page(box.doc, guidePage).description,
+                                                     point: point, session: host.session.id.raw),
+                                 doc: box.doc)
+        } else if #available(iOS 17.5, *) {
             let generator = (feedback as? UICanvasFeedbackGenerator) ?? UICanvasFeedbackGenerator(view: host.canvasView)
             feedback = generator
             generator.alignmentOccurred(at: v)
@@ -417,8 +422,8 @@ final class DragController {
         for (layer, dashed) in [(solidGuides, false), (dashedGuides, true)] {
             layer.strokeColor = accent
             layer.fillColor = nil
-            layer.lineWidth = 1
-            layer.lineDashPattern = dashed ? [4, 4] : nil
+            layer.lineWidth = NibStroke.thin
+            layer.lineDashPattern = dashed ? NibStroke.layerDash : nil
             parent.addSublayer(layer)
         }
         for c in stretched {
@@ -438,12 +443,14 @@ final class DragController {
         parent.addSublayer(vector)
         parent.addSublayer(snapshot)
         CATransaction.commit()
-        if #available(iOS 17.5, *) {
-            let generator = UICanvasFeedbackGenerator(view: host.canvasView)
-            generator.prepare()
-            feedback = generator
-        } else {
-            NibHaptics.prepare()
+        if !isPencil {                                                  // the Pencil feature plays Pencil snaps
+            if #available(iOS 17.5, *) {
+                let generator = UICanvasFeedbackGenerator(view: host.canvasView)
+                generator.prepare()
+                feedback = generator
+            } else {
+                NibHaptics.prepare()
+            }
         }
         requestSnapshot()
     }
@@ -513,7 +520,7 @@ final class DragController {
                 shape.path = path
                 shape.fillColor = wash
                 shape.strokeColor = accent
-                shape.lineWidth = CGFloat(1 / zoom)
+                shape.lineWidth = NibStroke.thin / CGFloat(zoom)
             }
             vector.addSublayer(shape)
         }
@@ -532,25 +539,25 @@ final class DragController {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
-        let toView = host.pageToView(box.page)
+        let m = toView(box.page)
         if let region = snapshotRegion {
             snapshot.bounds = CGRect(x: 0, y: 0, width: region.width, height: region.height)
             snapshot.setAffineTransform(CGAffineTransform(translationX: region.x, y: region.y)
-                .concatenating(toView).concatenating(viewTransform))
+                .concatenating(m).concatenating(viewTransform))
         }
-        vector.setAffineTransform(toView.concatenating(viewTransform))
+        vector.setAffineTransform(m.concatenating(viewTransform))
         for (layer, c) in zip(connectorLayers, stretched) {
             guard let con = c.connector else { continue }
             func end(_ e: ConnectorEnd) -> CGPoint {
-                let p = e.point.cg.applying(toView)
+                let p = e.point.cg.applying(m)
                 return e.item.map { movingIDs.contains($0) } == true ? p.applying(viewTransform) : p
             }
             let path = CGMutablePath()
-            path.addLines(between: [end(con.from)] + con.bends.map { $0.cg.applying(toView) } + [end(con.to)])
+            path.addLines(between: [end(con.from)] + con.bends.map { $0.cg.applying(m) } + [end(con.to)])
             layer.path = path
         }
         let solid = CGMutablePath(), dashed = CGMutablePath()
-        let onPage = host.pageToView(guidePage)
+        let onPage = toView(guidePage)
         for g in guides {
             let a = g.vertical ? Point(g.position, g.start) : Point(g.start, g.position)
             let b = g.vertical ? Point(g.position, g.end) : Point(g.end, g.position)
@@ -577,11 +584,8 @@ final class DragController {
             DragController.remove(layers)
             return
         }
-        // The dry tiles redraw under the snapshot for a moment, so moved ink never blinks.
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: DragController.settleNanoseconds)
-            DragController.remove(layers)
-        }
+        // The snapshot stays over the drop spot until the dry tiles there have redrawn, so moved ink never blinks.
+        host.afterNextRender(page: dropPage) { DragController.remove(layers) }
     }
 
     private static func remove(_ layers: [CALayer]) {
@@ -596,11 +600,11 @@ final class DragController {
     private func plan() -> Plan? {
         switch target {
         case .body:
-            let src = host.pageToView(box.page)
+            let src = toView(box.page)
             let origin = Point(box.frame.bounds.x, box.frame.bounds.y)
             let movedView = origin.cg.applying(src).applying(CGAffineTransform(translationX: viewDelta.x, y: viewDelta.y))
             if dropPage != box.page {
-                return .moveToPage(dropPage, Point(movedView.applying(host.pageToView(dropPage).inverted())) - origin)
+                return .moveToPage(dropPage, Point(movedView.applying(toView(dropPage).inverted())) - origin)
             }
             let d = Point(movedView.applying(src.inverted())) - origin
             if !duplicate && abs(d.x) < 1e-6 && abs(d.y) < 1e-6 { return nil }
@@ -620,9 +624,9 @@ final class DragController {
         return list?.isEmpty == false ? list : nil
     }
 
-    /// A drag-duplicate writes each copy exactly once: DocTransaction.revert cannot undo a record that one undo group
-    /// writes twice, so "item.duplicate in place, then move the copy" would leave the copy behind on undo. On its own
-    /// page the copy is item.duplicate with the drag as its offset; on another page it is item.moveToPage {copy: true}.
+    /// Every command of the drop shares one undo group, so one undo takes it all back. A drag-duplicate is a single
+    /// write per copy: on its own page item.duplicate with the drag as its offset, on another page
+    /// item.moveToPage {copy: true} (which keeps links inside the copied set pointing at the copies).
     private func commit(_ plan: Plan) async throws -> Outcome {
         let group = NibID.make().raw                                    // the whole drop is one undo step
         let refs = Self.strings(box.refs)
@@ -635,8 +639,8 @@ final class DragController {
         case .translate(let d):
             if duplicate {
                 let ids = box.items.map { _ in NibID.make().raw }
-                let result = try await run("item.duplicate", ["refs": refs, "ids": Self.strings(ids),
-                                                              "offset": Self.numbers([d.x, d.y])])
+                let result = try await run(CommandIDs.itemDuplicate, ["refs": refs, "ids": Self.strings(ids),
+                                                                        "offset": Self.numbers([d.x, d.y])])
                 await select(Self.refs(in: result) ?? ids.map { NodeRef.item(box.doc, box.page, NibID($0)).description })
                 return Outcome(affine: nil)
             }
@@ -650,7 +654,9 @@ final class DragController {
             ]
             if duplicate { params["copy"] = .bool(true) }
             let result = try await run(CommandIDs.itemMoveToPage, .object(params))
-            await select(result["moved"]?.arrayValue?.compactMap { $0.stringValue } ?? [])
+            let moved = result["moved"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+            // item.moveToPage already carried the selection (and its lasso outline) along with a move.
+            if duplicate || Set(host.session.selection.refs) != Set(moved) { await select(moved) }
             return Outcome(affine: nil)
         case .matrix(let a):
             _ = try await run(CommandIDs.itemTransform, ["refs": refs, "matrix": Self.numbers([a.a, a.b, a.c, a.d, a.tx, a.ty])])

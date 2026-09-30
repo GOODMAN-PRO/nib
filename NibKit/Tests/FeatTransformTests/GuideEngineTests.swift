@@ -85,17 +85,26 @@ final class GuideEngineTests: XCTestCase {
         XCTAssertNil(r.snapY)
     }
 
-    func testGridComesFromTheTemplateLines() {
-        let display = DisplayList(ops: [
-            DisplayOp(op: .rect, rect: Rect(x: 0, y: 0, width: 595, height: 842)),
-            DisplayOp(op: .hlines, rect: Rect(x: 0, y: 60, width: 595, height: 780), spacing: 24),
-            DisplayOp(op: .vlines, rect: Rect(x: 36, y: 0, width: 500, height: 800), spacing: 20)
-        ])
-        XCTAssertEqual(GuideEngine.Grid.from(display),
-                       GuideEngine.Grid(x: GuideEngine.Lines(origin: 36, step: 20), y: GuideEngine.Lines(origin: 60, step: 24)))
-        let dots = DisplayList(ops: [DisplayOp(op: .dots, rect: Rect(x: 0, y: 0, width: 400, height: 400), spacing: 16)])
-        XCTAssertEqual(GuideEngine.Grid.from(dots)?.x, GuideEngine.Lines(origin: 0, step: 16))
-        XCTAssertEqual(GuideEngine.Grid.from(dots)?.y, GuideEngine.Lines(origin: 0, step: 16))
-        XCTAssertNil(GuideEngine.Grid.from(DisplayList(ops: [DisplayOp(op: .rect, rect: .zero)])))
+    func testGridComesFromTheTemplateMetrics() {
+        // A lattice (dots, grid lines) repeats from the page origin on both axes.
+        let lattice = TemplateMetrics(spacing: 20, repeatPeriod: PageSize(20, 20))
+        XCTAssertEqual(GuideEngine.Grid.from(lattice),
+                       GuideEngine.Grid(x: GuideEngine.Lines(origin: 0, step: 20), y: GuideEngine.Lines(origin: 0, step: 20)))
+        // Ruled rows snap vertically only, from the top of the writing area.
+        let ruled = TemplateMetrics(spacing: 24, margins: PageInsets(top: 60, left: 80, bottom: 12, right: 0))
+        XCTAssertEqual(GuideEngine.Grid.from(ruled), GuideEngine.Grid(x: nil, y: GuideEngine.Lines(origin: 60, step: 24)))
+        XCTAssertNil(GuideEngine.Grid.from(TemplateMetrics()))
+        XCTAssertNil(GuideEngine.Grid.from(TemplateMetrics(repeatPeriod: PageSize(41.6, 24))), "isometric: no square grid")
+    }
+
+    func testATemplateWithOnlyASpacingParamSnapsOnBothAxes() {
+        let definition = TemplateDefinition(id: "test.squares", title: "Squares", category: "Test", owner: "test",
+                                            defaults: ["spacing": 16]) { _, _, _ in TemplateRender(paper: .white) }
+        let grid = GuideEngine.Grid.from(definition.metrics(for: [:], size: .a4))
+        XCTAssertEqual(grid?.x, GuideEngine.Lines(origin: 0, step: 16))
+        XCTAssertEqual(grid?.y, GuideEngine.Lines(origin: 0, step: 16))
+        let r = engine([], grid: grid, align: false, snapToGrid: true).move(Rect(x: 13, y: 35, width: 30, height: 20))
+        XCTAssertEqual(r.offset.x, 3, accuracy: 1e-9)                   // left 13 → 16
+        XCTAssertEqual(r.offset.y, -3, accuracy: 1e-9)                  // top 35 → 32
     }
 }

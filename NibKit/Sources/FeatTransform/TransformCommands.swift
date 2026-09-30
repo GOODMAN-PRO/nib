@@ -20,23 +20,20 @@ enum TransformMath {
         return r
     }
 
-    /// A frame under an affine, measured along the frame's OWN axes: a rotated box resized along one side stays a box
-    /// with that side scaled (`Frame.applying` measures along page axes, which skews rotated boxes).
-    static func frame(_ f: Frame, applying t: Affine) -> Frame {
-        let c = t.apply(f.center)
-        let cs = cos(f.rotation), sn = sin(f.rotation)
-        let ux = t.a * cs + t.c * sn, uy = t.b * cs + t.d * sn          // image of the frame's x axis
-        let vx = -t.a * sn + t.c * cs, vy = -t.b * sn + t.d * cs        // image of the frame's y axis
-        let w = f.w * hypot(ux, uy), h = f.h * hypot(vx, vy)
-        let rotation = hypot(ux, uy) < 1e-12 ? f.rotation : atan2(uy, ux)
-        return Frame(x: c.x - w / 2, y: c.y - h / 2, w: w, h: h, rotation: normalized(rotation))
-    }
-
-    /// `Item.transformed(by:)` with the exact frame rule above for boxed kinds.
+    /// `Item.transformed(by:)` (a rotated frame is measured along its own axes, contracts-v2 G24), with the frame's
+    /// angle brought back into (-π, π] so a box turned upright again is exactly unrotated (guides and grid snapping
+    /// only work on unrotated boxes).
     static func apply(_ t: Affine, to item: Item) -> Item {
         var out = item.transformed(by: t)
-        if let f = item.frame { out.frame = frame(f, applying: t) }
+        if let f = out.frame { out.frame = upright(f) }
         return out
+    }
+
+    /// `f` with its rotation normalised (see `normalized`).
+    static func upright(_ f: Frame) -> Frame {
+        var g = f
+        g.rotation = normalized(f.rotation)
+        return g
     }
 
     /// Angle in (-π, π]; tiny values become exactly 0 so unrotated boxes stay on the fast path.
@@ -111,6 +108,11 @@ enum TransformGraph {
     static func anchors(_ item: Item) -> [ElementID] {
         guard let c = item.connector else { return [] }
         return [c.from.item, c.to.item].compactMap { $0 }
+    }
+
+    /// Every item `item` links to: its container (`attachedTo`) and its connector anchors.
+    static func links(_ item: Item) -> [ElementID] {
+        (item.attachedTo.map { [$0] } ?? []) + anchors(item)
     }
 
     /// `ids` plus every live item that travels with them, each mapped to the travelling item that pulled it in
@@ -204,25 +206,17 @@ struct TargetRef {
 
 @MainActor
 enum TransformTargets {
-    /// Parses `refs`; nil refs means the active session's selection. Returns nil when refs were omitted and nothing is
-    /// selected (arrow-key nudges then do nothing instead of failing).
-    /// Only the user's own key commands get that silent no-op: the AI and plugins are told nothing is selected.
+    /// Parses `refs`, which default to the invoking session's selection (`CommandContext.refsOrSelection`). Returns nil
+    /// when there are none and nothing is selected: the user's arrow-key nudges then do nothing instead of failing,
+    /// while the AI and plugins are told nothing is selected.
     static func resolve(_ refs: [String]?, _ ctx: CommandContext) throws -> [TargetRef]? {
-        let list: [String]
-        if let refs = refs {
-            guard !refs.isEmpty else {
-                throw NibError(.invalidParams, "refs is empty", path: "$.refs", hint: "pass item refs, or omit refs to use the selection")
+        let list = ctx.refsOrSelection(refs)
+        if list.isEmpty {
+            guard ctx.principal.isUser else {
+                throw NibError(.invalidParams, "nothing is selected", path: "$.refs",
+                               hint: "pass item refs (query.find lists them)")
             }
-            list = refs
-        } else {
-            list = ctx.activeSession?.selection.refs ?? []
-            if list.isEmpty {
-                guard ctx.principal.isUser else {
-                    throw NibError(.invalidParams, "nothing is selected", path: "$.refs",
-                                   hint: "pass item refs (query.find lists them)")
-                }
-                return nil
-            }
+            return nil
         }
         return try list.enumerated().map { i, s in
             guard case let .item(doc, page, id)? = NodeRef(s) else {
@@ -247,15 +241,17 @@ enum TransformTargets {
     }
 
     /// Keeps the invoking window's selection on the items it names after they moved (bounds, and page for
-    /// item.moveToPage), so handles, query.context and the object menu follow the edit.
-    static func follow(_ ctx: CommandContext, doc: DocumentID, from: PageID, to: PageID, items: [Item]) {
+    /// item.moveToPage), so handles, query.context and the object menu follow the edit. A lasso outline goes through
+    /// `t` with the items, so a rotated selection keeps its drawn outline (`Selection.outline`, contracts-v2 G17).
+    static func follow(_ ctx: CommandContext, doc: DocumentID, from: PageID, to: PageID, items: [Item], by t: Affine) {
         guard !ctx.dryRun, let s = ctx.activeSession, s.selection.doc == doc, s.selection.page == from,
               !s.selection.items.isEmpty else { return }
         var byID: [ElementID: Item] = [:]
         for it in items { byID[it.id] = it }
         guard s.selection.items.allSatisfy({ byID[$0] != nil }) else { return }
         let bounds = TransformMath.union(s.selection.items.compactMap { byID[$0] }.map(TransformMath.box))
-        let next = Selection(doc: doc, page: to, items: s.selection.items, bounds: bounds)
+        let outline = s.selection.outline.map { $0.map { t.apply($0) } }
+        let next = Selection(doc: doc, page: to, items: s.selection.items, bounds: bounds, outline: outline)
         if next != s.selection { s.selection = next }
     }
 }
@@ -296,18 +292,17 @@ enum TransformWriter {
         return Set(via.keys)
     }
 
-    /// `tx.put` for a transformed item, refusing geometry beyond `TransformMath.limit` (the transaction rolls back).
-    @discardableResult
-    private static func put(_ item: Item, doc: DocumentID, page: PageID, tx: DocTransaction) throws -> Item {
+    /// `item` when its geometry stays within `TransformMath.limit`; otherwise throws (the transaction rolls back).
+    private static func bounded(_ item: Item) throws -> Item {
         guard TransformMath.inRange(item) else {
             throw NibError(.invalidParams, "the result is out of range", path: "$",
                            hint: "keep items within 1000000 pt of the page origin")
         }
-        return try tx.put(item, doc: doc, page: page)
+        return item
     }
 
     /// Transforms targets on one page plus everything travelling with them, re-pins anchored connector ends, and
-    /// returns the transformed targets.
+    /// returns the transformed targets. Every changed item is written in one batch (a 5,000-stroke nudge is linear).
     static func transform(_ refs: [TargetRef], doc: DocumentID, page: PageID, by t: Affine,
                           tx: DocTransaction) throws -> [Item] {
         let items = try tx.items(doc, page: page)
@@ -330,14 +325,16 @@ enum TransformWriter {
             lookup[c.id] = TransformGraph.refit(current, lookup: lookup, moved: moved, t: t, alreadyTransformed: inMoved)
             changed.insert(c.id)
         }
+        var writes: [Item] = []
         for it in items where changed.contains(it.id) {
-            if let next = lookup[it.id], next != it { try put(next, doc: doc, page: page, tx: tx) }
+            if let next = lookup[it.id], next != it { writes.append(try bounded(next)) }
         }
+        try tx.put(writes, doc: doc, page: page)
         return refs.compactMap { lookup[$0.id] }
     }
 
-    /// Moves targets (and what travels with them) to another page of the same document, keeping ids; returns the
-    /// moved targets as they now are on `dest`.
+    /// Moves targets (and what travels with them) to another page of the same document, keeping ids and provenance
+    /// (`DocTransaction.move`); returns the moved targets as they now are on `dest`.
     static func move(_ refs: [TargetRef], doc: DocumentID, from src: PageID, to dest: PageID, offset: Point?,
                      tx: DocTransaction) throws -> [Item] {
         let items = try tx.items(doc, page: src)
@@ -349,28 +346,39 @@ enum TransformWriter {
         let targets = Set(refs.map(\.id))
         let moved = try travellers(refs, items, byID)
         let shift = offset.map { Affine.translation($0.x, $0.y) }
-        var placed: [Item] = []
-        for it in items where moved.contains(it.id) {                  // bottom first: z order survives the move
-            var n = shift.map { TransformMath.apply($0, to: it) } ?? it
-            if let parent = n.attachedTo, !moved.contains(parent) { n.attachedTo = nil }
-            if n.kind == .connector { n = TransformGraph.detaching(n) { !moved.contains($0) } }
-            n.z = try tx.topZ(doc, page: dest)                          // top of the destination page (even over a tombstone)
-            placed.append(try put(n, doc: doc, page: dest, tx: tx))
+        // They land on top of the destination page in their own stacking order (bottom first; even over a tombstone).
+        let travelling = items.filter { moved.contains($0.id) }
+        let top = try tx.topZ(doc, page: dest)
+        var z: [ElementID: String] = [:]
+        for (it, key) in zip(travelling, FractionalIndex.balanced(count: travelling.count, after: top)) { z[it.id] = key }
+        // `move` drops a link (attachedTo, a connector anchor) to anything not yet live on the destination page, so a
+        // container or an anchored shape moves before what links to it. Links to items staying behind are dropped.
+        var placed: [ElementID: Item] = [:]
+        var pending = travelling
+        while !pending.isEmpty {
+            var ready = pending.filter { TransformGraph.links($0).allSatisfy { !moved.contains($0) || placed[$0] != nil } }
+            if ready.isEmpty { ready = pending }                        // a cycle of links: no order keeps them all
+            for it in ready {
+                placed[it.id] = try bounded(tx.move(item: it.id, doc: doc, from: src, to: dest, transform: shift,
+                                                    z: z[it.id] ?? ""))
+            }
+            let done = Set(ready.map(\.id))
+            pending.removeAll { done.contains($0.id) }
         }
-        for it in items where moved.contains(it.id) { try tx.delete(item: it.id, doc: doc, page: src) }
+        var cut: [Item] = []
         for c in items where c.kind == .connector && !moved.contains(c.id) {
-            let cut = TransformGraph.detaching(c) { moved.contains($0) }
-            if cut != c { try tx.put(cut, doc: doc, page: src) }
+            let detached = TransformGraph.detaching(c) { moved.contains($0) }
+            if detached != c { cut.append(detached) }
         }
-        return placed.filter { targets.contains($0.id) }
+        try tx.put(cut, doc: doc, page: src)
+        return travelling.filter { targets.contains($0.id) }.compactMap { placed[$0.id] }
     }
 
     /// Puts copies of the targets and everything travelling with them on `dest` (which may be `src`), `offset` away,
     /// and leaves the originals untouched; returns the targets' copies. Copies take the caller's `ids` from `next`
     /// on, in creation order (the targets in `refs` order, then what travels with them bottom first), then minted
-    /// ones. Links inside the copied set point at the copies; links to anything left behind are dropped.
-    /// Every record is written once, so the copy undoes in one step: DocTransaction.revert cannot undo a record that
-    /// one undo group writes twice, which rules out item.duplicate followed by item.moveToPage for a copy.
+    /// ones. Links inside the copied set point at the copies; links to anything left behind are dropped. The copies
+    /// are written in one batch, on top of the page in their originals' stacking order.
     static func copy(_ refs: [TargetRef], doc: DocumentID, from src: PageID, to dest: PageID, offset: Point?,
                      ids: [ElementID], next: inout Int, tx: DocTransaction) throws -> [Item] {
         let items = try tx.items(doc, page: src)
@@ -395,7 +403,8 @@ enum TransformWriter {
             next += 1
         }
         let shift = offset.map { Affine.translation($0.x, $0.y) }
-        var placed: [ElementID: Item] = [:]
+        var copies: [Item] = []
+        var slot: [ElementID: Int] = [:]
         for it in items where copied.contains(it.id) {                 // bottom first: z order survives the copy
             guard let id = fresh[it.id] else { continue }
             var n = shift.map { TransformMath.apply($0, to: it) } ?? it
@@ -403,10 +412,12 @@ enum TransformWriter {
             n.createdBy = nil                                           // stamped with whoever made the copy
             n.attachedTo = it.attachedTo.flatMap { fresh[$0] }
             if n.kind == .connector { n = TransformGraph.remapping(n, fresh) }
-            n.z = try tx.topZ(doc, page: dest)
-            placed[it.id] = try put(n, doc: doc, page: dest, tx: tx)
+            n.z = ""                                                    // the batch stacks them on top, in this order
+            slot[it.id] = copies.count
+            copies.append(try bounded(n))
         }
-        return refs.compactMap { placed[$0.id] }
+        let written = try tx.put(copies, doc: doc, page: dest)
+        return refs.compactMap { slot[$0.id].map { written[$0] } }
     }
 }
 
@@ -472,7 +483,7 @@ struct ItemTransform: NibCommand {
             try groups.map { try TransformWriter.transform($0.refs, doc: $0.doc, page: $0.page, by: t, tx: tx) }
         }
         for (g, items) in zip(groups, results) {
-            TransformTargets.follow(ctx, doc: g.doc, from: g.page, to: g.page, items: items)
+            TransformTargets.follow(ctx, doc: g.doc, from: g.page, to: g.page, items: items, by: t)
         }
         return Output(refs: targets.map { NodeRef.item($0.doc, $0.page, $0.id).description },
                       bbox: TransformMath.rectJSON(TransformMath.union(results.flatMap { $0 }.map(TransformMath.box))))
@@ -555,7 +566,8 @@ struct ItemMoveToPage: NibCommand {
         }
         if !copying {                                                 // a copy leaves the selection on the originals
             for (g, items) in zip(groups, results) {
-                TransformTargets.follow(ctx, doc: doc, from: g.page, to: record.id, items: items)
+                TransformTargets.follow(ctx, doc: doc, from: g.page, to: record.id, items: items,
+                                        by: offset.map { .translation($0.x, $0.y) } ?? .identity)
             }
         }
         return Output(moved: results.flatMap { $0 }.map { NodeRef.item(doc, record.id, $0.id).description },

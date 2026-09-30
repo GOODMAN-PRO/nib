@@ -37,26 +37,15 @@ struct GuideEngine {
         var x: Lines?
         var y: Lines?
 
-        /// Grid lines of a rendered template: `vlines` give x, `hlines` give y, `dots` give both (first op wins).
-        static func from(_ display: DisplayList) -> Grid? {
-            var x: Lines?
-            var y: Lines?
-            for op in display.ops {
-                guard let r = op.rect else { continue }
-                let step = max(op.spacing ?? 24, 1)       // DisplayList.draw's own default spacing
-                switch op.op {
-                case .hlines:
-                    if y == nil { y = Lines(origin: r.minY, step: step) }
-                case .vlines:
-                    if x == nil { x = Lines(origin: r.minX, step: step) }
-                case .dots:
-                    if x == nil { x = Lines(origin: r.minX, step: step) }
-                    if y == nil { y = Lines(origin: r.minY, step: step) }
-                default:
-                    break
-                }
+        /// The grid a template publishes (`TemplateDefinition.metrics(for:size:)`): `spacing` apart. A periodic pattern
+        /// (dots, grid lines: `repeatPeriod`) is anchored at the page origin on both axes; rows without a period
+        /// (ruled paper under its header) only snap vertically, from the top of the writing area.
+        static func from(_ m: TemplateMetrics) -> Grid? {
+            guard let step = m.spacing, step >= 1 else { return nil }
+            if m.repeatPeriod != nil {
+                return Grid(x: Lines(origin: 0, step: step), y: Lines(origin: 0, step: step))
             }
-            return x == nil && y == nil ? nil : Grid(x: x, y: y)
+            return Grid(x: nil, y: Lines(origin: m.margins?.top ?? 0, step: step))
         }
     }
 
