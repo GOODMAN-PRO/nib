@@ -103,9 +103,6 @@ struct RPCError: Error, Equatable {
 @MainActor
 final class MCPHandler {
     static let protocolVersions = ["2025-06-18", "2025-03-26", "2024-11-05"]
-    /// `ai.directTools` default (AI.md §4) when the AI Agent feature has not declared or changed the setting.
-    static let defaultDirectTools = ["ink.writeText", "ink.setPoints", "text.createBox", "item.update", "item.delete",
-                                     "page.add", "shape.create", "diagram.create"]
     static let eventsTool = ToolSpec(
         name: "nib_events",
         description: "Wait for changes: events newer than `since` (long-polls up to `wait` seconds, max 25); pass the returned `last` as the next `since`.",
@@ -273,9 +270,11 @@ final class MCPHandler {
         return (result, sid)
     }
 
-    /// The same catalogue as the in-app agent in edit mode, built for `Exposure.bridge`, plus `nib_events`.
+    /// The same catalogue as the in-app agent in edit mode, built for `Exposure.bridge`, plus `nib_events`. The direct
+    /// tools are the AI Agent's `ai.directTools` setting (owned by F084, read untyped), else the AI.md §4 default.
     func toolList() -> [ToolSpec] {
-        let direct = app.settings.json("ai.directTools")?.arrayValue?.compactMap { $0.stringValue } ?? MCPHandler.defaultDirectTools
+        let direct = app.settings.json(NibSettings.aiDirectToolsName)?.arrayValue?.compactMap { $0.stringValue }
+            ?? NibSettings.defaultAIDirectTools
         return ToolCatalog.tools(app.commands, exposure: .bridge, readOnly: false, direct: direct) + [MCPHandler.eventsTool]
     }
 
@@ -479,7 +478,7 @@ final class MCPHandler {
             var size = 0
             var last = cursor
             for e in bus.events(since: cursor) {
-                let hidden = e.type == BridgeController.statusEvent || (e.doc.map { app.gateway.isLocked($0) } ?? false)
+                let hidden = e.type == BridgeNames.statusEvent || (e.doc.map { app.gateway.isLocked($0) } ?? false)
                 guard !hidden, let json = try? JSONValue.from(e) else {
                     last = e.seq
                     continue

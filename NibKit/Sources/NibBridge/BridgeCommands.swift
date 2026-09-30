@@ -2,17 +2,16 @@ import Foundation
 import NibContracts
 
 /// Bridge settings. All are `security.*`: only the user reads or changes them (FEATURES.md › Exceptions).
-/// F091 (Bridge settings page) uses these names through `settings.get` / `settings.set` as the user:
-/// `security.bridge.enabled` (Bool), `security.bridge.port` (Int), `security.bridge.networks` ([CIDR string]),
-/// `security.bridge.origins` ([origin string]); the token is the Keychain item `BridgeSecrets` names.
+/// Their names are the contracts' `BridgeNames`, which the Bridge settings page (F091) reads and writes through
+/// `settings.get` / `settings.set` as the user; the token is the Keychain item `BridgeNames.tokenService`/`tokenAccount`.
 /// ponytail: `networks` and `origins` are one array key each, not one key per entry (ARCHITECTURE.md §15.5): they are
 /// device-local (never synced, so no two-device merge), user-only, and the settings page replaces the whole list.
 /// Move to `declarePrefix` per-entry keys if they ever sync.
 enum BridgeSettings {
-    static let enabled = SettingKey("security.bridge.enabled", default: false)
-    static let port = SettingKey("security.bridge.port", default: 7331)
-    static let networks = SettingKey("security.bridge.networks", default: BridgeNetworks.defaults)
-    static let origins = SettingKey("security.bridge.origins", default: [String]())
+    static let enabled = SettingKey(BridgeNames.enabledSetting, default: false)
+    static let port = SettingKey(BridgeNames.portSetting, default: 7331)
+    static let networks = SettingKey(BridgeNames.networksSetting, default: BridgeNetworks.defaults)
+    static let origins = SettingKey(BridgeNames.originsSetting, default: [String]())
 
     static func declare(_ s: SettingsStore, owner: String) {
         s.declare(enabled, summary: "MCP/HTTP bridge is on (user only; change it with bridge.setEnabled).",
@@ -83,7 +82,8 @@ struct BridgeSetEnabled: NibCommand {
         let controller = try BridgeController.resolve(ctx.services)
         var issued = false
         if p.rotateToken == true || (p.enabled && BridgeSecrets.token() == nil) {
-            guard Keychain.setString(BridgeAuth.generateToken(), service: BridgeSecrets.service, account: BridgeSecrets.account) else {
+            guard Keychain.setString(BridgeAuth.generateToken(), service: BridgeNames.tokenService,
+                                     account: BridgeNames.tokenAccount) else {
                 throw NibError(.unavailable, "the Keychain did not store the bridge token",
                                hint: "try again; the bridge stays off without a token")
             }

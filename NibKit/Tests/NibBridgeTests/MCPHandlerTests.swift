@@ -96,6 +96,30 @@ final class MCPHandlerTests: XCTestCase {
         XCTAssertEqual(tools.last?["inputSchema"]?["properties"]?["wait"]?["maximum"], 25)
     }
 
+    func testDirectToolsFollowTheAIDirectToolsSettingElseTheContractDefault() async throws {
+        let (h, c) = try make()
+        for id in NibSettings.defaultAIDirectTools + ["test.extra"] {
+            h.app.commands.register(CommandDescriptor(
+                id: id, title: id, summary: "Test stand-in for \(id).", examples: [[:]], effect: .edit, target: .app)) { _, _ in [:] }
+        }
+        func names() async throws -> [String] {
+            let r = await post(c.mcp, #"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+            return try XCTUnwrap(try json(r)["result"]?["tools"]?.arrayValue).compactMap { $0["name"]?.stringValue }
+        }
+        let meta = ToolCatalog.metaTools.map { $0.name }
+        let defaults = NibSettings.defaultAIDirectTools.compactMap { h.app.commands.descriptor($0)?.toolName }
+        XCTAssertEqual(defaults.count, NibSettings.defaultAIDirectTools.count)
+        let unset = try await names()
+        XCTAssertEqual(unset, meta + defaults + ["nib_events"], "unset: the AI.md §4 default list")
+        h.app.settings.setJSON(NibSettings.aiDirectToolsName, ["test.extra", "page.add"])
+        let chosen = try await names()
+        XCTAssertEqual(chosen, meta + ["test__extra", "page__add", "nib_events"],
+                       "the AI Agent's setting decides, as for the in-app agent")
+        XCTAssertEqual(c.mcp.toolList().map { $0.name },
+                       ToolCatalog.tools(h.app.commands, exposure: .bridge, readOnly: false,
+                                         direct: ["test.extra", "page.add"]).map { $0.name } + ["nib_events"])
+    }
+
     func testToolsCallRunsAsTheBridgeClient() async throws {
         let (_, c) = try make()
         let sid = try await initialize(c.mcp)
@@ -150,7 +174,7 @@ final class MCPHandlerTests: XCTestCase {
 
     func testRenderIsAnImageResultWithAnAssetLink() async throws {
         let (h, c) = try make()
-        Keychain.set(Data(BridgeTestCommands.token.utf8), service: BridgeSecrets.service, account: BridgeSecrets.account)
+        Keychain.set(Data(BridgeTestCommands.token.utf8), service: BridgeNames.tokenService, account: BridgeNames.tokenAccount)
         let r = await post(c.mcp, #"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"nib_render","arguments":{"page":"page:FIXTUREDOC01/FIXTUREPG001"}}}"#)
         let result = try XCTUnwrap(try json(r)["result"])
         XCTAssertEqual(result["isError"], false)
@@ -245,7 +269,7 @@ final class MCPHandlerTests: XCTestCase {
         h.app.gateway.isLocked = { $0 == Fixtures.whiteboardID }
         h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.docID)
         h.app.events.emit(NibEventType.pageChanged, doc: Fixtures.whiteboardID)
-        h.app.events.emit(BridgeController.statusEvent)
+        h.app.events.emit(NibEventType.bridgeStatus)
         let r = await post(c.mcp, #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nib_events","arguments":{"since":\#(start),"wait":0}}}"#)
         let body = try toolText(r)
         let events = try XCTUnwrap(body["events"]?.arrayValue)
@@ -268,9 +292,10 @@ final class MCPHandlerTests: XCTestCase {
         let r = await post(c.mcp, #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nib_run","arguments":{"command":"test.slow","params":{}}}}"#)
         XCTAssertEqual(try toolText(r)["error"]?["code"], "timeout")
 
-        // A confirmation nobody answers is denied after the confirmer's timeout (115 s in the app).
+        // A confirmation nobody answers is denied after the confirmer's timeout (115 s in the app). The dialog is
+        // the app's presenter as it is now (installed after the bridge registered).
         let silent = SilentPresenter()
-        c.confirmer.inner = silent
+        h.app.gateway.presenter = silent
         c.confirmer.timeout = 0.1
         c.mcp.toolTimeout = 5
         let call = #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nib_run","arguments":{"command":"test.wipe","params":{"page":"page:FIXTUREDOC01/FIXTUREPG001"}}}}"#
@@ -284,7 +309,7 @@ final class MCPHandlerTests: XCTestCase {
         let (h, c) = try make()
         let late = SilentPresenter()
         late.delay = 0.4
-        c.confirmer.inner = late
+        h.app.gateway.presenter = late
         c.mcp.toolTimeout = 0.2
         let r = await post(c.mcp, #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nib_run","arguments":{"command":"test.wipe","params":{"page":"page:FIXTUREDOC01/FIXTUREPG001","title":"Late"}}}}"#)
         XCTAssertEqual(try toolText(r)["error"]?["code"], "timeout")

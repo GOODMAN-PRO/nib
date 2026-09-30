@@ -28,8 +28,8 @@ public enum NibBridgeFeature: NibFeature {
 @MainActor
 final class BridgeController {
     static let serviceKey = "bridge.controller"
-    /// Emitted on the app event bus when the state or the set of clients changes (status pill, settings page).
-    static let statusEvent = "bridge.status"
+    /// The principal kind whose confirmations and policy the bridge owns (`Principal.bridge(_:).kind`).
+    static let principalKind = "bridge"
 
     enum State: String {
         case off, starting, listening, suspended, failed, tokenMissing
@@ -62,7 +62,8 @@ final class BridgeController {
         self.assets = assets
         self.mcp = mcp
         router = BridgeRouter(app: app, mcp: mcp, assets: assets)
-        confirmer = BridgeConfirmer()
+        // The dialog itself is the app's confirmation UI (the shell's alert, or whatever the app installed since).
+        confirmer = BridgeConfirmer(inner: { [weak gateway = app.gateway] in gateway?.presenter })
         mcp.onActivity = { [weak self] activity in self?.note(activity) }
     }
 
@@ -71,19 +72,15 @@ final class BridgeController {
         return c
     }
 
-    /// Bridge principals follow `security.bridge.confirmationPolicy`; confirmations they trigger are shown by the
-    /// existing presenter and answered with Deny after 115 s, so a request never waits more than 120 s.
+    /// Bridge principals follow `security.bridge.confirmationPolicy`; confirmations they trigger go to the bridge's
+    /// presenter, which shows the app's dialog and answers Deny after 115 s, so a request never waits more than 120 s.
+    /// Both are registered for the "bridge" principal kind only, so no other feature's policy or presenter is wrapped.
     func installGatewayHooks() {
         let settings = app.settings
-        let previous = app.gateway.policy
-        app.gateway.policy = { principal in
-            if case .bridge = principal { return settings.get(NibSettings.bridgeConfirmationPolicy) }
-            return previous(principal)
+        app.gateway.setPolicy(forPrincipalKind: BridgeController.principalKind) { _ in
+            settings.get(NibSettings.bridgeConfirmationPolicy)
         }
-        if let current = app.gateway.presenter {
-            confirmer.inner = current
-            app.gateway.presenter = confirmer
-        }
+        app.gateway.setPresenter(confirmer, forPrincipalKind: BridgeController.principalKind)
     }
 
     func startObserving() {
@@ -221,7 +218,7 @@ final class BridgeController {
     }
 
     private func emitStatus() {
-        app.events.emit(BridgeController.statusEvent, payload: ["state": .string(state.rawValue)])
+        app.events.emit(BridgeNames.statusEvent, payload: ["state": .string(state.rawValue)])
     }
 
     private func note(_ activity: BridgeActivity) {
@@ -243,17 +240,22 @@ final class BridgeController {
     }
 }
 
-/// Wraps the app's confirmation presenter: requests from bridge principals are answered with Deny when nobody
-/// responds on the device within `timeout` (the sheet may stay up; a late answer is ignored), or once the tool call
-/// itself timed out (its work task is cancelled, and this runs inside it), so a late Allow never applies a change the
-/// agent was told timed out. Everyone else passes straight through.
+/// The bridge's confirmation presenter (`Gateway.setPresenter(_:forPrincipalKind: "bridge")`): it shows the app's
+/// dialog (`inner`) and answers Deny when nobody responds on the device within `timeout` (the sheet may stay up; a late
+/// answer is ignored), or once the tool call itself timed out (its work task is cancelled, and this runs inside it),
+/// so a late Allow never applies a change the agent was told timed out.
 @MainActor
 final class BridgeConfirmer: ConfirmationPresenter {
-    var inner: ConfirmationPresenter?
+    /// The presenter that asks the person, looked up per request so a presenter installed after launch is used.
+    var inner: () -> ConfirmationPresenter?
     var timeout: TimeInterval = 115
 
+    init(inner: @escaping () -> ConfirmationPresenter?) {
+        self.inner = inner
+    }
+
     func confirm(_ request: ConfirmationRequest) async -> ConfirmationDecision {
-        guard let inner = inner else { return .deny }
+        guard let inner = inner(), inner !== self else { return .deny }
         guard case .bridge = request.principal else { return await inner.confirm(request) }
         guard !Task.isCancelled else { return .deny }
         let decision = try? await Deadline.run(seconds: timeout, timeout: { NibError(.userDenied, "no answer on the device") }) {

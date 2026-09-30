@@ -2,15 +2,13 @@ import Foundation
 import Network
 import NibContracts
 
-/// Where the bridge token lives: Keychain generic password, service "app.nib.bridge", account "token" (device only,
-/// never synced). `bridge.setEnabled` writes it; the Bridge settings page (F091) reads it to show / copy / pair.
+/// The bridge token: a Keychain generic password at `BridgeNames.tokenService` / `tokenAccount` (device only, never
+/// synced). `bridge.setEnabled` writes it; the Bridge settings page (F091) reads it to show / copy / pair.
 enum BridgeSecrets {
-    static let service = "app.nib.bridge"
-    static let account = "token"
-
     /// nil when missing (never issued, or lost after re-signing with another team: "credentials missing — re-enter").
     static func token() -> String? {
-        guard let t = Keychain.getString(service: service, account: account), !t.isEmpty else { return nil }
+        guard let t = Keychain.getString(service: BridgeNames.tokenService, account: BridgeNames.tokenAccount),
+              !t.isEmpty else { return nil }
         return t
     }
 }

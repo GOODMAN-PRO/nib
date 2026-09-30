@@ -70,7 +70,7 @@ final class NibBridgeTests: XCTestCase {
 
     /// The Keychain fake is shared by every Harness in the process, so each test sets the token it expects.
     private func setToken(_ value: String?) {
-        Keychain.setString(value, service: BridgeSecrets.service, account: BridgeSecrets.account)
+        Keychain.setString(value, service: BridgeNames.tokenService, account: BridgeNames.tokenAccount)
     }
 
     private func make() throws -> (Harness, BridgeController, RecordingServer) {
@@ -100,7 +100,7 @@ final class NibBridgeTests: XCTestCase {
         XCTAssertEqual(problems, [])
         let h = Harness(features: [NibBridgeFeature.self])
         XCTAssertEqual(h.app.commands.all().filter { $0.owner == NibBridgeFeature.id }.map { $0.id },
-                       ["bridge.setEnabled", "bridge.status"])
+                       [CommandIDs.bridgeSetEnabled, CommandIDs.bridgeStatus])
         XCTAssertEqual(h.app.commands.descriptor("bridge.setEnabled")?.effect, .session)
         XCTAssertTrue(h.app.commands.descriptor("bridge.setEnabled")?.scopes.contains(.security) ?? false)
         XCTAssertEqual(h.app.commands.descriptor("bridge.status")?.effect, .read)
@@ -440,5 +440,73 @@ final class NibBridgeTests: XCTestCase {
         var sensitive = edit
         sensitive.sensitive = true
         XCTAssertTrue(gateway.needsConfirmation(sensitive, principal: .bridge("x")), "sensitive commands are always confirmed")
+    }
+
+    func testConfirmationHooksBelongToTheBridgePrincipalKindOnly() async throws {
+        let (h, c, _) = try make()
+        let gateway = h.app.gateway
+        XCTAssertTrue(gateway.confirmationPresenter(for: .bridge("x")) === c.confirmer, "registered for \"bridge\"")
+        XCTAssertTrue(gateway.confirmationPresenter(for: .ai("chat")) === h.confirmer, "other kinds keep the app's presenter")
+        XCTAssertTrue(gateway.presenter === h.confirmer, "the app's presenter is not wrapped or replaced")
+
+        // Another feature's policy for its own kind leaves the bridge's alone, and the other way round.
+        gateway.setPolicy(forPrincipalKind: "ai") { _ in .never }
+        h.app.settings.set(NibSettings.bridgeConfirmationPolicy, .always)
+        XCTAssertEqual(gateway.policy(.bridge("x")), .always)
+        XCTAssertEqual(gateway.policy(.ai("chat")), .never)
+        XCTAssertEqual(gateway.policy(.plugin("p")), .destructive)
+
+        // A presenter the app installs after the bridge registered is the one that asks, still under the deadline.
+        let later = AutoConfirm()
+        later.decision = .deny
+        gateway.presenter = later
+        do {
+            _ = try await h.run("test.wipe", ["page": "page:FIXTUREDOC01/FIXTUREPG001"], as: .bridge("claude-code"))
+            XCTFail("denied on the device")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .userDenied)
+        }
+        XCTAssertEqual(later.requests.map { $0.command.id }, ["test.wipe"])
+        XCTAssertTrue(h.confirmer.requests.isEmpty)
+
+        // With no confirmation UI at all the bridge answers Deny instead of waiting.
+        gateway.presenter = nil
+        let decision = await c.confirmer.confirm(ConfirmationRequest(
+            principal: .bridge("x"), command: try XCTUnwrap(h.app.commands.descriptor("test.wipe")), params: [:]))
+        XCTAssertEqual(decision, .deny)
+    }
+
+    func testSettingsTokenAndStatusEventUseTheSharedBridgeNames() async throws {
+        let (h, c, _) = try make()
+        var ports: [UInt16] = []
+        let recorder = RecordingServer()
+        c.makeServer = { port in
+            ports.append(port)
+            return recorder
+        }
+        setToken(nil)
+        let declared = Set(h.app.settings.declaredSettings.map { $0.name })
+        for name in [BridgeNames.enabledSetting, BridgeNames.portSetting, BridgeNames.networksSetting, BridgeNames.originsSetting] {
+            XCTAssertTrue(declared.contains(name), name)
+            XCTAssertEqual(h.app.settings.descriptor(name)?.synced, false, "\(name) stays on this device")
+        }
+        XCTAssertEqual(h.app.settings.descriptor(BridgeNames.portSetting)?.defaultValue, 7331)
+
+        var events: [NibEvent] = []
+        let sub = h.app.events.subscribe { events.append($0) }
+        defer { sub.cancel() }
+        _ = try await h.run(CommandIDs.bridgeSetEnabled, ["enabled": true])
+        let stored = try XCTUnwrap(Keychain.getString(service: BridgeNames.tokenService, account: BridgeNames.tokenAccount))
+        XCTAssertTrue(BridgeAuth.isWellFormed(stored), "F091 reads the token where BridgeNames says")
+        XCTAssertEqual(h.app.settings.json(BridgeNames.enabledSetting), true)
+        let status = events.filter { $0.type == BridgeNames.statusEvent }
+        XCTAssertEqual(status.last?.type, NibEventType.bridgeStatus)
+        XCTAssertEqual(status.last?.payload?["state"], "starting")
+
+        // The settings page writes the port untyped by its shared name; the listener moves to it.
+        h.app.settings.setJSON(BridgeNames.portSetting, 7400)
+        c.reconcile()
+        XCTAssertEqual(ports, [7331, 7400])
+        XCTAssertEqual(c.status().port, 7400)
     }
 }
