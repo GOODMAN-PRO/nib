@@ -87,6 +87,14 @@ struct BlockCommentEdit: NibCommand {
         /// block's text. Its id, author, time and state stay. The comment may come from a block deleted in the same
         /// change (a block merged into the one before it keeps its comments this way).
         var block: String?
+        /// Additive: more comments of the same block moved to their own ranges in the same write (one change, not
+        /// one per comment: the comment keeper re-anchors every comment a keystroke moved this way). Not with `block`.
+        var moves: [Move]?
+    }
+
+    struct Move: Codable {
+        var comment: String
+        var range: [Int]
     }
 
     private static let ex1: JSONValue = ["ref": "block:FIXTUREDOC02/FIXTUREBLK02", "comment": "FIXTURECMB01",
@@ -104,7 +112,11 @@ struct BlockCommentEdit: NibCommand {
             "comment": .str("the comment's id (query.get lists a block's comments)"),
             "text": .str("the new text of the comment"),
             "range": .arr(.int(min: 0), "optional: [start, length] to move the comment to, in UTF-16 units of the block's plain text"),
-            "block": .str("optional: block:<doc>/<block> of the same document to move the comment to (range is then required, in that block's text)")
+            "block": .str("optional: block:<doc>/<block> of the same document to move the comment to (range is then required, in that block's text)"),
+            "moves": .arr(.obj(["comment": .str("another comment id of the same block"),
+                                "range": .arr(.int(min: 0), "[start, length] to move it to")],
+                               required: ["comment", "range"]),
+                          "optional: more comments of this block to move in the same change, each {comment, range} (not with block)")
         ], required: ["ref", "comment", "text"]),
         examples: [ex1, ex2, ex3],
         effect: .edit)
@@ -119,20 +131,35 @@ struct BlockCommentEdit: NibCommand {
                 throw NibError(.invalidParams, "a comment moves only to a block of its own document", path: "$.block",
                                hint: "pass a block of doc:\(doc.raw)")
             }
-            if target != id { return try move(p, text: text, doc: doc, from: id, to: target, ctx) }
+            if target != id {
+                guard (p.moves ?? []).isEmpty else {
+                    throw NibError(.invalidParams, "moves works within one block", path: "$.moves",
+                                   hint: "move comments to another block one call at a time")
+                }
+                return try move(p, text: text, doc: doc, from: id, to: target, ctx)
+            }
         }
         let current = try BlockRules.liveBlock(id, doc: doc, in: ctx.workspace.content(doc), path: "$.ref")
+        let length = BlockCommentRules.length(of: current)
         let i = try BlockCommentRules.index(of: p.comment, in: current, path: "$.comment")
         var edited = current.comments?[i] ?? BlockComment(author: "", text: text)
         edited.text = text
         if let raw = p.range {
-            let r = try BlockCommentRules.range(raw, length: BlockCommentRules.length(of: current), path: "$.range",
-                                                allowEmpty: true)
+            let r = try BlockCommentRules.range(raw, length: length, path: "$.range", allowEmpty: true)
             edited.rangeStart = r.location
             edited.rangeLength = r.length
         }
+        var ranges: [NibID: NSRange] = [:]
+        for (k, m) in (p.moves ?? []).enumerated() {
+            let j = try BlockCommentRules.index(of: m.comment, in: current, path: "$.moves[\(k)].comment")
+            let r = try BlockCommentRules.range(m.range, length: length, path: "$.moves[\(k)].range", allowEmpty: true)
+            if let c = current.comments?[j], c.id != edited.id { ranges[c.id] = r }
+        }
         // Nothing changes: no write, so no empty undo step.
-        guard edited != current.comments?[i] else { return NoResult() }
+        let movesAny = ranges.contains { id, r in
+            current.comments?.contains { $0.id == id && ($0.rangeStart != r.location || $0.rangeLength != r.length) } ?? false
+        }
+        guard edited != current.comments?[i] || movesAny else { return NoResult() }
         try ctx.mutate { (tx: DocTransaction) -> Void in
             var b = try BlockRules.liveBlock(id, doc: doc, in: tx.content(doc), path: "$.ref")
             let j = try BlockCommentRules.index(of: p.comment, in: b, path: "$.comment")
@@ -141,6 +168,11 @@ struct BlockCommentEdit: NibCommand {
             c.rangeStart = edited.rangeStart
             c.rangeLength = edited.rangeLength
             b.comments?[j] = c
+            for (other, r) in ranges {
+                guard let k = b.comments?.firstIndex(where: { $0.id == other }) else { continue }
+                b.comments?[k].rangeStart = r.location
+                b.comments?[k].rangeLength = r.length
+            }
             try tx.put(b, doc: doc)
         }
         return NoResult()
@@ -351,7 +383,18 @@ enum CommentAnchors {
         let start: Int
         let oldEnd: Int
         let newEnd: Int
+        /// The leftmost place the same change fits. Inserting or deleting next to a run of repeated characters
+        /// ("b" typed before "blocks") gives the same text anywhere from `lowest` to `start`; the diff finds the
+        /// rightmost place. Equal to `start` for a replacement, or when there is only one place.
+        let lowest: Int
         var delta: Int { newEnd - oldEnd }
+
+        init(start: Int, oldEnd: Int, newEnd: Int, lowest: Int? = nil) {
+            self.start = start
+            self.oldEnd = oldEnd
+            self.newEnd = newEnd
+            self.lowest = min(lowest ?? start, start)
+        }
     }
 
     static func edit(from old: String, to new: String) -> Edit? {
@@ -362,13 +405,27 @@ enum CommentAnchors {
         while p < shorter && a[p] == b[p] { p += 1 }
         var s = 0
         while s < shorter - p && a[a.count - 1 - s] == b[b.count - 1 - s] { s += 1 }
-        return Edit(start: p, oldEnd: a.count - s, newEnd: b.count - s)
+        let oldEnd = a.count - s, newEnd = b.count - s
+        var q = p
+        if oldEnd == p, newEnd > p {
+            // An insertion slides left while the character before it equals the last inserted one.
+            let d = newEnd - p
+            while q > 0 && a[q - 1] == b[q - 1 + d] { q -= 1 }
+        } else if newEnd == p, oldEnd > p {
+            // A deletion slides left while the character before it equals the last deleted one.
+            let d = oldEnd - p
+            while q > 0 && a[q - 1] == a[q - 1 + d] { q -= 1 }
+        }
+        return Edit(start: p, oldEnd: oldEnd, newEnd: newEnd, lowest: q)
     }
 
     /// Where `range` goes. Text inserted at a range's start or end stays outside it; text replaced inside it (or
-    /// across one of its ends) becomes part of it; a range whose text is deleted collapses to where it was.
+    /// across one of its ends) becomes part of it; a range whose text is deleted collapses to where it was. An
+    /// insertion or deletion that could equally have happened before a range's start (repeated characters) is taken
+    /// to be outside it, so "b" typed before "blocks" does not join the comment on "blocks".
     static func map(_ range: NSRange, through e: Edit) -> NSRange {
         func start(_ x: Int) -> Int {
+            if e.lowest < e.start, x >= e.lowest + (e.oldEnd - e.start), x < e.oldEnd { return x + e.delta }
             if x < e.start { return x }
             if x >= e.oldEnd { return x + e.delta }
             return e.start
@@ -406,6 +463,18 @@ enum CommentAnchors {
 
     static func range(of c: BlockComment, length: Int) -> NSRange {
         clamp(NSRange(location: c.rangeStart, length: c.rangeLength), length: length)
+    }
+
+    /// Where words chosen in `old` text are in `new` text, for a comment still being written: followed through the
+    /// change, or the whole text when the words were deleted meanwhile (the comment keeps a place, and its text is
+    /// not lost). Nil when `new` is empty.
+    static func follow(_ range: NSRange, from old: String, to new: String) -> NSRange? {
+        let length = (new as NSString).length
+        var r = range
+        if old != new, let e = edit(from: old, to: new) { r = map(range, through: e) }
+        r = clamp(r, length: length)
+        if r.length == 0 { r = NSRange(location: 0, length: length) }
+        return r.length > 0 ? r : nil
     }
 
     // MARK: Text moving between blocks
@@ -673,13 +742,23 @@ final class CommentAnchorKeeper {
         return recent.first { $0.group == key }?.edits ?? []
     }
 
+    /// Writes what `observe` scheduled: per undo group one commands.batch, with one block.editComment per comment
+    /// that goes to another block and ONE per block whose comments moved on its text (the first comment, the others
+    /// in its `moves`), so a keystroke before several comments is one more change, not one per comment.
     private func flush() async {
         let moving = moves
         let work = pending
         moves = []
         pending = [:]
         guard let app = app else { return }
+        var groups: [String] = []
+        var calls: [String: [JSONValue]] = [:]
+        func add(_ params: JSONValue, group: String) {
+            if calls[group] == nil { groups.append(group) }
+            calls[group, default: []].append(["command": .string(BlockCommentEdit.descriptor.id), "params": params])
+        }
         // Moves first: a comment that goes to another block is not re-anchored in the block it leaves.
+        var leaving = Set<NibID>()
         for m in moving {
             guard let content = try? app.workspace.content(m.doc),
                   let from = BlockCommentRules.block(m.from, holding: m.comment.raw, in: content),
@@ -687,9 +766,10 @@ final class CommentAnchorKeeper {
                   let to = content.blocks.first(where: { $0.id == m.to && !$0.deleted }), BlockRules.isText(to.kind),
                   !(to.comments ?? []).contains(where: { $0.id == m.comment }) else { continue }
             let range = CommentAnchors.clamp(m.range, length: BlockCommentRules.length(of: to))
-            await edit(["ref": .string(NodeRef.block(m.doc, m.from).description), "comment": .string(m.comment.raw),
-                        "text": .string(c.text), "block": .string(NodeRef.block(m.doc, m.to).description),
-                        "range": CommentActions.range(range)], group: m.group)
+            leaving.insert(m.comment)
+            add(["ref": .string(NodeRef.block(m.doc, m.from).description), "comment": .string(m.comment.raw),
+                 "text": .string(c.text), "block": .string(NodeRef.block(m.doc, m.to).description),
+                 "range": CommentActions.range(range)], group: m.group)
         }
         for (key, job) in work.sorted(by: { ($0.key.doc.raw, $0.key.block.raw) < ($1.key.doc.raw, $1.key.block.raw) }) {
             guard let content = try? app.workspace.content(key.doc),
@@ -697,16 +777,28 @@ final class CommentAnchorKeeper {
             let now = Dictionary((block.comments ?? []).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             let was = Dictionary(job.stored.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             let length = BlockCommentRules.length(of: block)
-            let ref = NodeRef.block(key.doc, key.block).description
-            for c in job.target {
+            var changed: [(comment: BlockComment, range: NSRange)] = []
+            for c in job.target where !leaving.contains(c.id) {
                 // Only a comment still where the change found it: one moved, edited or deleted since keeps that.
                 guard let current = now[c.id], let stored = was[c.id], Self.hasText(current),
                       current.rangeStart == stored.rangeStart, current.rangeLength == stored.rangeLength,
                       c.rangeStart != stored.rangeStart || c.rangeLength != stored.rangeLength else { continue }
-                let range = CommentAnchors.clamp(NSRange(location: c.rangeStart, length: c.rangeLength), length: length)
-                await edit(["ref": .string(ref), "comment": .string(c.id.raw), "text": .string(current.text),
-                            "range": CommentActions.range(range)], group: job.group)
+                changed.append((current, CommentAnchors.clamp(NSRange(location: c.rangeStart, length: c.rangeLength),
+                                                              length: length)))
             }
+            guard let first = changed.first else { continue }
+            var params: JSONValue = ["ref": .string(NodeRef.block(key.doc, key.block).description),
+                                     "comment": .string(first.comment.id.raw), "text": .string(first.comment.text),
+                                     "range": CommentActions.range(first.range)]
+            if changed.count > 1 {
+                params = params.merging(["moves": .array(changed.dropFirst().map { c in
+                    ["comment": .string(c.comment.id.raw), "range": CommentActions.range(c.range)]
+                })])
+            }
+            add(params, group: job.group)
+        }
+        for group in groups {
+            await run(calls[group] ?? [], group: group)
         }
     }
 
@@ -714,14 +806,21 @@ final class CommentAnchorKeeper {
         !c.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private func edit(_ params: JSONValue, group: String) async {
-        guard let app = app else { return }
+    /// One commands.batch in `group` (the edit's undo group, so undo takes text and ranges back together). A call
+    /// that fails leaves those comments where they were; the others still move.
+    private func run(_ calls: [JSONValue], group: String) async {
+        guard let app = app, !calls.isEmpty else { return }
         do {
-            let inv = Invocation(command: BlockCommentEdit.descriptor.id, params: params, principal: .user, group: group)
-            _ = try await app.bus.execute(inv)
+            let inv = Invocation(command: CommandIDs.batch, params: ["calls": .array(calls), "stopOnError": false],
+                                 principal: .user, group: group)
+            let out = try await app.bus.execute(inv).value
+            for (call, result) in zip(calls, out["results"]?.arrayValue ?? []) where result["ok"]?.boolValue != true {
+                let comment = call["params"]?["comment"]?.stringValue ?? ""
+                let why = result["error"]?["message"]?.stringValue ?? "refused"
+                log.info("comment \(comment, privacy: .public) kept its place: \(why, privacy: .public)")
+            }
         } catch {
-            let comment = params["comment"]?.stringValue ?? ""
-            log.info("comment \(comment, privacy: .public) kept its place: \(NibError.wrap(error).description, privacy: .public)")
+            log.info("comments kept their places: \(NibError.wrap(error).description, privacy: .public)")
         }
     }
 }
@@ -748,14 +847,24 @@ enum BlockCommentsEditor {
     }
 
     /// What ⇧⌘M adds to panel.open in `session`'s window: a composer on the words selected last in its text document
-    /// ({block, range, compose: true}), or nothing (the Comments tab opens on its list).
+    /// ({block, range, compose: true}), or nothing (the Comments tab opens on its list). `request` is new on every
+    /// press, so a Comments tab already on screen composes again after its composer was cancelled (the same words
+    /// would otherwise hand the tab the same params, and it would not notice).
     static func keyParams(_ session: EditorSession) -> JSONValue {
         guard let editor = session.editor as? TextDocViewController, !editor.isReadOnly,
               let selection = TextDocExtrasState.of(editor).lastSelection, let block = editor.block(selection.block),
               BlockRules.isText(block.kind) else { return [:] }
         let range = CommentAnchors.clamp(selection.range, length: BlockCommentRules.length(of: block))
         guard range.length > 0 else { return [:] }
-        return ["block": .string(editor.blockRef(block.id)), "range": CommentActions.range(range), "compose": true]
+        return ["block": .string(editor.blockRef(block.id)), "range": CommentActions.range(range), "compose": true,
+                "request": .string(NibID.make().raw)]
+    }
+
+    /// Forgets the words selected last once a comment was posted on them (⇧⌘M would otherwise offer them again).
+    static func forgetSelection(in editor: TextDocViewController?, block: NibID) {
+        guard let editor = editor else { return }
+        let state = TextDocExtrasState.of(editor)
+        if state.lastSelection?.block == block { state.lastSelection = nil }
     }
 
     static func install() {
@@ -835,7 +944,7 @@ enum BlockCommentsEditor {
         if CommentThreads.threads(in: block).contains(where: { !$0.isResolved }) {
             out.append(UIAction(title: String(localized: "Show Comments"), image: UIImage(nib: .comment)) { _ in
                 let params: JSONValue = ["id": .string(TextDocCommentsPanel.panelID),
-                                         "block": .string(editor.blockRef(id))]
+                                         "block": .string(editor.blockRef(id)), "request": .string(NibID.make().raw)]
                 editor.app.perform(CommandIDs.panelOpen, params, session: editor.session)
             })
         }
@@ -923,7 +1032,8 @@ enum CommentHighlighter {
             rules = existing
         } else {
             rules = CAShapeLayer()
-            rules.lineDashPattern = [NSNumber(value: Double(NibStroke.hairline * 2)), NSNumber(value: Double(NibStroke.hairline * 2))]
+            // The one dash (NibStroke.dash at its thin width) stands in for TextKit 2's dotted underline here.
+            rules.lineDashPattern = NibStroke.layerDash
             marks.addSublayer(rules)
         }
         let manager = tv.layoutManager
@@ -937,8 +1047,8 @@ enum CommentHighlighter {
                                             in: tv.textContainer) { rect, _ in
                 let box = rect.offsetBy(dx: inset.left, dy: inset.top)
                 fill.addRect(box)
-                stroke.move(to: CGPoint(x: box.minX, y: box.maxY - NibStroke.hairline))
-                stroke.addLine(to: CGPoint(x: box.maxX, y: box.maxY - NibStroke.hairline))
+                stroke.move(to: CGPoint(x: box.minX, y: box.maxY - NibStroke.thin / 2))
+                stroke.addLine(to: CGPoint(x: box.maxX, y: box.maxY - NibStroke.thin / 2))
             }
         }
         marks.frame = tv.layer.bounds
@@ -947,11 +1057,12 @@ enum CommentHighlighter {
         rules.frame = marks.bounds
         rules.path = stroke
         rules.fillColor = nil
-        rules.lineWidth = NibStroke.hairline
+        rules.lineWidth = NibStroke.thin
         rules.strokeColor = line.resolvedColor(with: tv.traitCollection).cgColor
     }
 
-    private static let markLayerName = TextDocExtrasHookIDs.prefix + "comment.marks"
+    /// The TextKit 1 wash and rules (a shape layer behind the glyphs).
+    static let markLayerName = TextDocExtrasHookIDs.prefix + "comment.marks"
 }
 
 // MARK: - Presenting the comment card
@@ -963,20 +1074,28 @@ enum CommentPresenter {
     static let presentationID = TextDocExtrasHookIDs.prefix + "comment.card"
     static let anchorID = TextDocExtrasHookIDs.prefix + "comment.anchor"
 
+    /// The composer on `range` of the block's text. The card stays open while the comment is added and closes only
+    /// once it was: when block.comment is refused (the document got locked, the block went) the words typed stay in
+    /// the field, next to the shell's toast saying why.
     static func newComment(in editor: TextDocViewController, block id: NibID, range: NSRange) {
         guard !editor.isReadOnly, let block = editor.block(id) else { return }
         let runner = TextDocCommandRunner(app: editor.app, session: editor.session, doc: editor.documentID)
         let excerpt = CommentThreads.excerpt(range, in: block)
         let ref = editor.blockRef(id)
+        let original = block.text.plainText
         present(in: editor, block: id, range: range, title: String(localized: "New Comment")) { chrome, dismiss in
-            CommentComposerView(excerpt: excerpt, chrome: chrome, onCancel: dismiss) { text in
+            CommentComposerView(excerpt: excerpt, chrome: chrome, onCancel: dismiss) { [weak editor] text in
+                // The block's text may have changed while the comment was written (typing queued before the card,
+                // the assistant, sync): the words are followed to where they are now.
+                await editor?.flushEdits()
+                let now = runner.liveBlock(id)?.text.plainText ?? original
+                let target = CommentAnchors.follow(range, from: original, to: now) ?? range
+                let params: JSONValue = ["ref": .string(ref), "range": CommentActions.range(target), "text": .string(text)]
+                guard await runner.run(BlockCommentAdd.descriptor.id, params) != nil else { return false }
+                BlockCommentsEditor.forgetSelection(in: editor, block: id)
                 dismiss()
-                Task { @MainActor in
-                    let params: JSONValue = ["ref": .string(ref), "range": [.number(Double(range.location)), .number(Double(range.length))],
-                                             "text": .string(text)]
-                    guard await runner.run(BlockCommentAdd.descriptor.id, params) != nil else { return }
-                    UIAccessibility.post(notification: .announcement, argument: String(localized: "Comment added"))
-                }
+                UIAccessibility.post(notification: .announcement, argument: String(localized: "Comment added"))
+                return true
             }
         }
     }
@@ -1122,6 +1241,8 @@ final class CommentThreadModel: ObservableObject {
     @Published var editing: NibID?
     @Published var editDraft = ""
     @Published private(set) var isBusy = false
+    /// Set to put the keyboard in the reply field (Reply in the Comments tab's row menu); the view clears it.
+    @Published var focusReply = false
 
     let runner: TextDocCommandRunner
     let block: NibID
@@ -1253,16 +1374,22 @@ struct CommentQuoteView: View {
 }
 
 /// A new comment: the words it is on, a field, and Comment (⌘↩) / Cancel (⎋). A sheet puts both in its header.
+/// `onPost` adds the comment and returns true once it was added; the field keeps its text until then (and after a
+/// refusal), and Comment is off while it runs.
 struct CommentComposerView: View {
     let excerpt: String
     let chrome: CommentChrome
     var isPosting = false
+    /// False while there is nothing to comment on (the block went): the text stays, Comment is off.
+    var isEnabled = true
     let onCancel: @MainActor () -> Void
-    let onPost: @MainActor (String) -> Void
+    let onPost: @MainActor (String) async -> Bool
     @State private var draft = ""
+    @State private var sending = false
     @FocusState private var focused: Bool
 
     private var trimmed: String { draft.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var canPost: Bool { !trimmed.isEmpty && isEnabled && !isPosting && !sending }
 
     private var sheetTitle: String? {
         if case .sheet(let title) = chrome { return title }
@@ -1273,7 +1400,7 @@ struct CommentComposerView: View {
         VStack(alignment: .leading, spacing: NibSpacing.m) {
             if let title = sheetTitle {
                 NibSheetHeader(title, primaryTitle: String(localized: "Comment"),
-                               isPrimaryEnabled: !trimmed.isEmpty && !isPosting,
+                               isPrimaryEnabled: canPost,
                                onCancel: { onCancel() }, onPrimary: { post() })
             }
             VStack(alignment: .leading, spacing: NibSpacing.m) {
@@ -1287,7 +1414,7 @@ struct CommentComposerView: View {
                         NibButton(String(localized: "Cancel"), kind: .plain, size: .compact, shortcut: .cancelAction) { onCancel() }
                         NibButton(String(localized: "Comment"), kind: .primary, size: .compact,
                                   shortcut: KeyboardShortcut(.return, modifiers: .command)) { post() }
-                            .disabled(trimmed.isEmpty || isPosting)
+                            .disabled(!canPost)
                     }
                 }
             }
@@ -1298,8 +1425,13 @@ struct CommentComposerView: View {
     }
 
     private func post() {
-        guard !trimmed.isEmpty, !isPosting else { return }
-        onPost(trimmed)
+        guard canPost else { return }
+        let text = trimmed
+        sending = true
+        Task { @MainActor in
+            _ = await onPost(text)
+            sending = false
+        }
     }
 }
 
@@ -1327,6 +1459,16 @@ struct CommentThreadView: View {
             }
             if isSheet { Spacer(minLength: 0) }
         }
+        .onAppear { if model.focusReply { focusReplyField() } }
+        .onChange(of: model.focusReply) { _, focus in
+            if focus { focusReplyField() }
+        }
+    }
+
+    /// Reply asked for the keyboard: the reply field takes it (after this update, once the field is on screen).
+    private func focusReplyField() {
+        model.focusReply = false
+        Task { @MainActor in replyFocused = true }
     }
 
     private var isSheet: Bool {
@@ -1452,12 +1594,14 @@ struct CommentMessageRow: View {
 
 // MARK: - Comments sidebar tab
 
-/// The Comments tab of text documents: every thread in document order, open or resolved. A row reveals its words in
-/// the editor and opens into the full thread (replies, edit, delete, resolve).
+/// The Comments tab of text documents: every thread in document order, open or resolved. A row scrolls the editor to
+/// its words and opens into the full thread (replies, edit, delete, resolve); the caret stays where it was, so typing
+/// never lands on the commented words. Show in Document selects them.
 ///
 /// `panel.open {id: "textdocextras.comments", …}` params: `block` (block:D/B) opens that block's first thread, with
 /// `comment` the thread of that comment; `block` + `range` ([start, length] of its plain text) + `compose: true` puts a
-/// composer for a new comment on those words at the top (⇧⌘M while no text is edited).
+/// composer for a new comment on those words at the top (⇧⌘M while no text is edited). `request`, any string, makes
+/// a repeated call with otherwise equal params reach a tab already on screen.
 struct TextDocCommentsPanel: View {
     static let panelID = TextDocExtrasHookIDs.prefix + "comments"
 
@@ -1486,17 +1630,17 @@ struct TextDocCommentsPanel: View {
                 .padding(.horizontal, NibSpacing.m)
                 .padding(.vertical, NibSpacing.xs)
             if let draft = model.draft {
+                // On the panel itself (no card behind the field), set off from the list by a hairline.
                 CommentComposerView(excerpt: draft.excerpt, chrome: .panel, isPosting: model.isPosting,
-                                    onCancel: { model.cancelDraft() }) { text in
-                    model.postDraft(text)
+                                    isEnabled: draft.canPost, onCancel: { model.cancelDraft() }) { text in
+                    await model.postDraft(text)
                 }
                 .id(draft.token)
-                .padding(NibSpacing.m)
-                .background(NibColor.fill3, in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
-                .padding(.horizontal, NibSpacing.s)
-                .padding(.bottom, NibSpacing.xs)
+                .padding(.horizontal, NibSpacing.m)
+                .padding(.vertical, NibSpacing.s)
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel(String(localized: "New Comment"))
+                CommentsPanelHairline()
             }
             if model.rows.isEmpty {
                 if model.draft == nil {
@@ -1519,6 +1663,11 @@ struct TextDocCommentsPanel: View {
                         .padding(.horizontal, NibSpacing.s)
                         .padding(.vertical, NibSpacing.s)
                     }
+                    .onAppear {
+                        // A thread panel.open asked for while the tab was being made.
+                        guard let target = model.scrollTarget else { return }
+                        proxy.scrollTo(target, anchor: .top)
+                    }
                     .onChange(of: model.scrollTarget) { _, target in
                         guard let target = target else { return }
                         proxy.scrollTo(target, anchor: .top)
@@ -1528,8 +1677,20 @@ struct TextDocCommentsPanel: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Comments"))
+        // Editor work a panel.open asked for runs once the tab is on screen, never while SwiftUI builds it.
+        .onAppear { model.performPendingReveal() }
         // panel.open again while the tab is on screen: the chrome hands the same view new params.
         .onChange(of: params) { _, next in model.apply(next) }
+    }
+}
+
+/// The hairline that sets the open thread and the composer off from the rows around them.
+struct CommentsPanelHairline: View {
+    var body: some View {
+        Rectangle()
+            .fill(NibColor.separatorSoft)
+            .frame(height: NibStroke.hairline)
+            .accessibilityHidden(true)
     }
 }
 
@@ -1537,14 +1698,19 @@ struct CommentsPanelRow: View {
     @ObservedObject var model: CommentsPanelModel
     let row: CommentsPanelModel.Row
 
+    private var isExpanded: Bool { model.expandedID == row.id && model.expanded != nil }
+
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.s) {
             if let expanded = model.expanded, model.expandedID == row.id {
+                // The open thread sits on the panel (no fill behind its fields), between hairlines.
+                CommentsPanelHairline()
                 CommentQuoteView(excerpt: row.excerpt)
                 CommentThreadView(model: expanded, chrome: .panel, showsQuote: false) { model.collapse() }
                 NibButton(String(localized: "Show in Document"), symbol: .forward, kind: .plain, size: .compact) {
                     model.showInDocument(row)
                 }
+                CommentsPanelHairline()
             } else {
                 Button {
                     model.open(row)
@@ -1557,9 +1723,8 @@ struct CommentsPanelRow: View {
                 .accessibilityHint(String(localized: "Shows the comment and where it is"))
             }
         }
-        .padding(NibSpacing.m)
-        .background(model.expandedID == row.id ? NibColor.fill3 : Color.clear,
-                    in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
+        .padding(.horizontal, NibSpacing.m)
+        .padding(.vertical, isExpanded ? 0 : NibSpacing.m)
     }
 
     private var summary: some View {
@@ -1603,7 +1768,7 @@ struct CommentsPanelRow: View {
         }
         if !model.isReadOnly {
             Button {
-                model.open(row)
+                model.reply(row)
             } label: {
                 Label { Text(String(localized: "Reply")) } icon: { Image(nib: .comment) }
             }
@@ -1658,13 +1823,17 @@ final class CommentsPanelModel: ObservableObject {
     }
 
     /// A new comment being written in the tab: the words it will be on. `text` is the block's plain text `range`
-    /// points into; the range follows the block's text while the comment is written (`token` stays).
+    /// points into; the range follows the block's text while the comment is written (`token` stays, and with it the
+    /// composer and the words typed in it).
     struct Draft: Equatable {
         let token: String
         var block: NibID
         var range: NSRange
         var text: String
         var excerpt: String
+        /// False while there is nothing to post on: the block went, or the window reads only. The composer and its
+        /// text stay, Comment is off.
+        var canPost = true
     }
 
     @Published var filter: Filter = .open {
@@ -1690,6 +1859,8 @@ final class CommentsPanelModel: ObservableObject {
     private var requested: (block: NibID?, comment: NibID?)?
     /// Words `panel.open {block, range, compose: true}` asked to comment on: a draft once the document is known.
     private var requestedDraft: (block: NibID, range: [Int])?
+    /// The thread whose words the editor still has to scroll to (a request opened it while the tab was being made).
+    private(set) var pendingReveal: Row?
 
     init(app: NibApp, session: EditorSession?, params: JSONValue, leave: (@MainActor () -> Void)? = nil) {
         self.app = app
@@ -1730,6 +1901,7 @@ final class CommentsPanelModel: ObservableObject {
     func apply(_ params: JSONValue) {
         read(params)
         rebuild()
+        performPendingReveal()
     }
 
     /// Coalesces bursts of commits (typing) into one rebuild after they landed.
@@ -1779,14 +1951,26 @@ final class CommentsPanelModel: ObservableObject {
             let row = out.first { r in request.comment.map { r.thread.contains($0) } ?? false }
                 ?? out.first { r in request.block.map { r.thread.block == $0 } ?? false }
             if let row = row {
-                open(row)
+                // Only state here: rebuild also runs while SwiftUI makes the tab (from init), where the editor must
+                // not scroll or lay out. The tab's onAppear (or apply, for a tab on screen) does that part.
+                expand(row)
                 scrollTarget = row.id
+                pendingReveal = row
             }
         }
     }
 
-    /// Turns a requested composer into a draft on the block's text as it is now; a draft whose block went, or that
-    /// the window can no longer edit, closes.
+    /// Scrolls the editor to the thread a request opened, once the tab can drive the editor.
+    func performPendingReveal() {
+        guard let row = pendingReveal else { return }
+        pendingReveal = nil
+        scrollEditor(to: row)
+    }
+
+    /// Turns a requested composer into a draft on the block's text as it is now, and keeps a draft on its words while
+    /// the text changes. A draft is never dropped by a change it did not make: when its words are deleted it goes on
+    /// the whole block, and while its block is gone (or the window reads only) it stays with Comment off, so the
+    /// words typed in it are never lost.
     private func resolveDraft(_ runner: TextDocCommandRunner) {
         if let request = requestedDraft {
             requestedDraft = nil
@@ -1802,52 +1986,77 @@ final class CommentsPanelModel: ObservableObject {
         }
         guard var d = draft else { return }
         guard !isReadOnly, let b = runner.liveBlock(d.block), BlockRules.isText(b.kind) else {
-            draft = nil
+            if d.canPost {
+                d.canPost = false
+                d.excerpt = ""
+                draft = d
+            }
             return
         }
-        // The block's text changed while the comment is written: its words are followed, and when they are gone
-        // there is nothing left to comment on.
         let text = b.text.plainText
-        guard text != d.text else { return }
-        let range = CommentAnchors.edit(from: d.text, to: text).map { CommentAnchors.map(d.range, through: $0) } ?? d.range
-        d.range = CommentAnchors.clamp(range, length: BlockCommentRules.length(of: b))
-        d.text = text
-        d.excerpt = CommentThreads.excerpt(d.range, in: b)
-        draft = d.range.length > 0 ? d : nil
+        guard text != d.text || !d.canPost else { return }
+        // The block's text changed while the comment is written: its words are followed.
+        if let range = CommentAnchors.follow(d.range, from: d.text, to: text) {
+            d.range = range
+            d.text = text
+            d.excerpt = CommentThreads.excerpt(range, in: b)
+            d.canPost = true
+        } else {
+            // An empty block: nothing to comment on until it has text again.
+            d.excerpt = ""
+            d.canPost = false
+        }
+        if d != draft { draft = d }
     }
 
     func cancelDraft() {
         draft = nil
     }
 
-    /// Posts the draft with block.comment; the new thread then opens in the list. A failed call keeps the composer
-    /// and its text (the shell shows why).
-    func postDraft(_ text: String) {
-        guard let runner = runner, let d = draft, !isPosting else { return }
+    /// Posts the draft with block.comment; the new thread then opens in the list. True once the comment was added;
+    /// a refused call keeps the composer and its text (the shell shows why).
+    @discardableResult
+    func postDraft(_ text: String) async -> Bool {
+        guard let runner = runner, !isPosting else { return false }
+        // Words followed up to the latest commit (rebuilds are coalesced; one may still be on its way).
+        resolveDraft(runner)
+        guard let d = draft, d.canPost else { return false }
         let id = NibID.make()
         let params: JSONValue = ["ref": .string(runner.blockRef(d.block)), "range": CommentActions.range(d.range),
                                  "text": .string(text), "id": .string(id.raw)]
         isPosting = true
-        Task { @MainActor in
-            let ok = await runner.run(BlockCommentAdd.descriptor.id, params) != nil
-            isPosting = false
-            guard ok else { return }
-            if draft?.token == d.token { draft = nil }
-            UIAccessibility.post(notification: .announcement, argument: String(localized: "Comment added"))
-            if filter != .open { filter = .open }
-            requested = (d.block, id)
-            rebuild()
-        }
+        let ok = await runner.run(BlockCommentAdd.descriptor.id, params) != nil
+        isPosting = false
+        guard ok else { return false }
+        if draft?.token == d.token { draft = nil }
+        BlockCommentsEditor.forgetSelection(in: runner.editor, block: d.block)
+        UIAccessibility.post(notification: .announcement, argument: String(localized: "Comment added"))
+        if filter != .open { filter = .open }
+        requested = (d.block, id)
+        rebuild()
+        performPendingReveal()
+        return true
     }
 
-    /// Opens a thread in place and shows its words in the editor.
+    /// Opens a thread in place and scrolls the editor to its words. The caret and the keyboard stay where they are:
+    /// a reply is typed in the thread's field, never over the commented words.
     func open(_ row: Row) {
+        expand(row)
+        scrollEditor(to: row)
+    }
+
+    /// Reply (the row's menu): the thread opens with the keyboard in its reply field.
+    func reply(_ row: Row) {
+        open(row)
+        expanded?.focusReply = true
+    }
+
+    private func expand(_ row: Row) {
         guard let runner = runner else { return }
-        if expandedID != row.id {
+        if expandedID != row.id || expanded == nil {
             expanded = CommentThreadModel(runner: runner, block: row.thread.block, thread: row.thread)
             expandedID = row.id
         }
-        reveal(row)
     }
 
     func collapse() {
@@ -1855,22 +2064,25 @@ final class CommentsPanelModel: ObservableObject {
         expandedID = nil
     }
 
-    /// Show in Document: the words in the editor, with the tab out of the way when it covers them.
-    func showInDocument(_ row: Row) {
-        reveal(row)
-        leave?()
+    /// Scrolls the editor to the block with the commented words; nothing else changes there.
+    private func scrollEditor(to row: Row) {
+        runner?.editor?.reveal(block: row.thread.block, animated: !UIAccessibility.isReduceMotionEnabled)
     }
 
-    /// Scrolls the editor to the commented words and selects them (read-only windows only scroll).
-    func reveal(_ row: Row) {
-        guard let editor = runner?.editor else { return }
-        let id = row.thread.block
-        editor.reveal(block: id, animated: !UIAccessibility.isReduceMotionEnabled)
-        guard !editor.isReadOnly else { return }
-        editor.focus(id, at: row.thread.range.location)
-        if let tv = editor.cell(for: id)?.textView, tv.isFirstResponder {
-            tv.selectedRange = CommentAnchors.clamp(row.thread.range, length: tv.textStorage.length)
+    /// Show in Document: the commented words selected in the editor (read-only windows only scroll to them), with
+    /// the tab out of the way when it covers them. The one action that moves the caret, because it was asked to.
+    func showInDocument(_ row: Row) {
+        if let editor = runner?.editor {
+            let id = row.thread.block
+            editor.reveal(block: id, animated: !UIAccessibility.isReduceMotionEnabled)
+            if !editor.isReadOnly {
+                editor.focus(id, at: row.thread.range.location)
+                if let tv = editor.cell(for: id)?.textView, tv.isFirstResponder {
+                    tv.selectedRange = CommentAnchors.clamp(row.thread.range, length: tv.textStorage.length)
+                }
+            }
         }
+        leave?()
     }
 
     func setResolved(_ row: Row, _ resolved: Bool) {

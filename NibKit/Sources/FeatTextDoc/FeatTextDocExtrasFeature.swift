@@ -12,6 +12,15 @@ import NibDesign
 /// and F047's block.update for links and headings), so plugins, the assistant and the bridge can do what the editor
 /// does, and undo covers all of it. ⇧⌘M is a registered key command limited to text documents (contracts-v2.2
 /// `docKinds` and `sessionParams`) that the editor also serves while a block is edited.
+///
+/// Printing: text documents print through `TextDocPageRenderer` (the "textdoc.pdf" exporter's layout, paginated for
+/// the paper the user picks). Until F067's print.present can route a text document to it, ⌘P in the editor
+/// (`TextDocPrinter`, a `TextDocHooks` key, live while a block has the caret) is the way in; there is no touch path
+/// yet. `TextDocPrinter.present(doc:app:session:)` needs no editor (the blocks come from `app.workspace`), and
+/// `TextDocPrinter.renderer(doc:app:session:)` makes the renderer for a print controller someone else configures.
+/// F067's print.present {doc} for a `.textDocument` must print with that renderer (and own ⌘P as a
+/// `KeyCommandDescriptor` with `docKinds` and `sessionParams` naming the document), which needs a contracts-level way
+/// to reach it from another module: docs/contract-requests/F103-print.md.
 public enum FeatTextDocExtrasFeature: NibFeature {
     public static let id = "textdocextras"
 
@@ -130,6 +139,9 @@ final class TextDocExtrasState {
     var lastSelection: TextDocSelection?
     /// Pending auto-link passes, per block (debounced while typing).
     var autoLinkTasks: [NibID: Task<Void, Never>] = [:]
+    /// Blocks whose last pass left the address at the caret unlinked (it may still be typed): a caret move there arms
+    /// another pass.
+    var autoLinkDeferred: Set<NibID> = []
     /// Addresses the user unlinked by hand, per block: auto-linking leaves them alone for the rest of the session.
     var unlinked: [NibID: Set<String>] = [:]
     /// The comment sheet on screen (compact width, or a window without a floating host).

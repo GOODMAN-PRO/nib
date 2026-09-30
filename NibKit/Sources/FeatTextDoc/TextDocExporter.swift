@@ -1,18 +1,23 @@
 import UIKit
+import ImageIO
 import UniformTypeIdentifiers
 import NibContracts
 import NibDesign
 
-// PDF export ("textdoc.pdf") and printing of text documents. One layout engine serves both: a UIPrintPageRenderer
-// subclass that paginates the blocks itself (TextKit 1 line by line, tables row by row), so printed text, links and
-// tables stay vector. Export renders it into a PDF on a fixed paper; printing hands it to UIPrintInteractionController,
-// which picks the paper. The document is captured on the main actor as values; layout and drawing run anywhere.
+// PDF export ("textdoc.pdf") and printing of text documents. One layout engine serves both: `TextDocPrintLayout`
+// paginates the blocks itself (TextKit 1 line by line, tables row by row), so printed text, links and tables stay
+// vector. Export lays out and draws a PDF on a fixed paper, off the main actor, straight into the file; printing hands
+// a UIPrintPageRenderer over the same layout to UIPrintInteractionController, which picks the paper. The document is
+// captured on the main actor as values; images are measured up front and decoded one page at a time while drawing.
 
 // MARK: - Metrics
 
+/// Paper geometry, not UI: NibDesign has no print tokens (DESIGN §15.6). These three are requested as tokens in
+/// docs/contract-requests/F103-print-metrics.md (a print margin, a print type scale, the page-number band) and stay
+/// here until NibDesign has them.
 enum TextDocPrintMetrics {
     /// Printed type uses the reading column's roles at the Large Dynamic Type size, scaled to print size (body 17 pt
-    /// becomes 11.9 pt, the size of printed prose). Paper geometry, not UI: NibDesign has no print tokens.
+    /// becomes 11.9 pt, the size of printed prose).
     static let typeScale: CGFloat = 0.7
     /// Page margins: three quarters of an inch on every side.
     static let margin: CGFloat = 54
@@ -88,18 +93,13 @@ enum TextDocExporter {
             let name = uniqueName(requested ?? title, used: &used)
             jobs.append((snapshot, folder.appendingPathComponent(name).appendingPathExtension("pdf")))
         }
-        // The layout (TextKit, images, tables) is the slow part: it runs off the main actor. The print renderer then
-        // draws the laid-out pages into the PDF, and the files are written off the main actor again.
-        let layouts = await Task.detached(priority: .userInitiated) {
-            jobs.map { TextDocPrintLayout($0.0, size: TextDocPrintMetrics.contentRect(paper: $0.0.paper).size) }
-        }.value
-        var files: [(Data, URL)] = []
-        for (job, layout) in zip(jobs, layouts) {
-            files.append((TextDocPDF.data(job.0, layout: layout), job.1))
-        }
+        // Layout (TextKit, tables), drawing and writing run off the main actor, one document at a time, each page
+        // straight into its file: no document is held as PDF data, and one document's layout goes before the next.
         try await Task.detached(priority: .userInitiated) {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            for (data, url) in files { try data.write(to: url, options: .atomic) }
+            for (snapshot, url) in jobs {
+                try TextDocPDF.write(snapshot, to: url)
+            }
         }.value
         return jobs.map { $0.1 }
     }
@@ -172,6 +172,8 @@ struct TextDocPrintType {
     let footnote: CGFloat
     /// New York, the reading face (`NibUIFont.documentBody`).
     let serif: UIFontDescriptor
+    /// The H1–H3 faces (`NibUIFont.documentHeading(1...3)`), sized for print by `heading(_:)`.
+    let headings: [UIFontDescriptor]
     let label: UIColor
     let secondary: UIColor
     let separator: UIColor
@@ -198,6 +200,7 @@ struct TextDocPrintType {
         return TextDocPrintType(
             body: body, title1: size(.title1), title2: size(.title2), title3: size(.title3), small: size(.subheadline),
             footnote: size(.footnote), serif: NibUIFont.documentBody.fontDescriptor,
+            headings: (1...3).map { NibUIFont.documentHeading($0).fontDescriptor },
             label: label, secondary: secondary, separator: NibUIColor.separator.resolvedColor(with: light),
             codeFill: NibUIColor.fill4.resolvedColor(with: light), link: accent,
             checked: UIImage(nib: .checkCircleFill)?.withConfiguration(glyph).withTintColor(accent, renderingMode: .alwaysOriginal),
@@ -212,6 +215,12 @@ struct TextDocPrintType {
         return UIFont(descriptor: d, size: size)
     }
 
+    /// A heading's face (`NibUIFont.documentHeading(level)`) at its print size.
+    func heading(_ level: Int) -> UIFont {
+        let i = min(max(level, 1), 3) - 1
+        return UIFont(descriptor: headings[i], size: [title1, title2, title3][i])
+    }
+
     /// The block style of the editor (BlockStyle), at print size.
     func style(_ kind: BlockKind, checked: Bool = false, caption: Bool = false) -> BlockStyle {
         if caption {
@@ -220,13 +229,13 @@ struct TextDocPrintType {
         }
         switch kind {
         case .heading1:
-            return BlockStyle(kind: kind, isCaption: false, dimmed: false, baseFont: font(title1, bold: true), serif: true,
+            return BlockStyle(kind: kind, isCaption: false, dimmed: false, baseFont: heading(1), serif: true,
                               bold: true, code: false)
         case .heading2:
-            return BlockStyle(kind: kind, isCaption: false, dimmed: false, baseFont: font(title2, bold: true), serif: true,
+            return BlockStyle(kind: kind, isCaption: false, dimmed: false, baseFont: heading(2), serif: true,
                               bold: true, code: false)
         case .heading3:
-            return BlockStyle(kind: kind, isCaption: false, dimmed: false, baseFont: font(title3, bold: true), serif: true,
+            return BlockStyle(kind: kind, isCaption: false, dimmed: false, baseFont: heading(3), serif: true,
                               bold: true, code: false)
         case .code:
             return BlockStyle(kind: kind, isCaption: false, dimmed: false,
@@ -239,6 +248,10 @@ struct TextDocPrintType {
     }
 
     /// Rich text as it prints: the block style's attributes with every colour resolved for paper and links marked.
+    /// Text drawn into a PDF turns its `.link` values into live link annotations, so only web and mail addresses
+    /// (`AutoLinker.schemes`) keep theirs: a nib:// id means nothing outside Nib, and a file: or javascript: link
+    /// that came in with synced, plugin or assistant text must not become a live link in a PDF. They still print
+    /// as links.
     func attributed(_ text: RichText, _ style: BlockStyle) -> NSAttributedString {
         let s = NSMutableAttributedString(attributedString: style.attributed(text))
         guard s.length > 0 else { return NSAttributedString(string: " ", attributes: [.font: style.baseFont]) }
@@ -250,10 +263,18 @@ struct TextDocPrintType {
             }
         }
         s.enumerateAttribute(.link, in: whole, options: []) { value, range, _ in
-            guard value != nil else { return }
+            guard let value = value else { return }
             s.addAttributes([.foregroundColor: link, .underlineStyle: NSUnderlineStyle.single.rawValue], range: range)
+            if !Self.opensOutsideNib(value) { s.removeAttribute(.link, range: range) }
         }
         return s
+    }
+
+    /// True for a web or mail address, the links a PDF may carry.
+    static func opensOutsideNib(_ link: Any) -> Bool {
+        guard let url = (link as? URL) ?? (link as? String).flatMap({ URL(string: $0) }),
+              let scheme = url.scheme?.lowercased() else { return false }
+        return AutoLinker.schemes.contains(scheme)
     }
 }
 
@@ -305,8 +326,9 @@ final class PrintTextFlow {
         return lines[i].minY + manager.location(forGlyphAt: range.location).y
     }
 
-    /// Draws lines `r` with the first one's top at `origin`; `links` adds PDF link annotations over linked text.
-    func draw(_ r: Range<Int>, at origin: CGPoint, links: Bool) {
+    /// Draws lines `r` with the first one's top at `origin`. In a PDF, TextKit makes linked text a live link itself
+    /// (`TextDocPrintType.attributed` keeps only web and mail links).
+    func draw(_ r: Range<Int>, at origin: CGPoint) {
         guard !r.isEmpty else { return }
         let first = glyphRanges[r.lowerBound], last = glyphRanges[r.upperBound - 1]
         let glyphs = NSRange(location: first.location, length: NSMaxRange(last) - first.location)
@@ -314,17 +336,6 @@ final class PrintTextFlow {
         let offset = CGPoint(x: origin.x, y: origin.y - lines[r.lowerBound].minY)
         manager.drawBackground(forGlyphRange: glyphs, at: offset)
         manager.drawGlyphs(forGlyphRange: glyphs, at: offset)
-        guard links else { return }
-        let chars = manager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
-        storage.enumerateAttribute(.link, in: chars, options: []) { value, range, _ in
-            guard let url = (value as? URL) ?? (value as? String).flatMap({ URL(string: $0) }) else { return }
-            let g = NSIntersectionRange(manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil), glyphs)
-            guard g.length > 0 else { return }
-            manager.enumerateEnclosingRects(forGlyphRange: g, withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
-                                            in: container) { rect, _ in
-                UIGraphicsSetPDFContextURLForRect(url, rect.offsetBy(dx: offset.x, dy: offset.y))
-            }
-        }
     }
 }
 
@@ -478,7 +489,8 @@ final class TextDocPrintLayout {
 
     enum Content {
         case text(PrintTextFlow, Decoration)
-        case image(UIImage)
+        /// Decoded while its page is drawn (at most `maxPixel` on its long side), never held by the layout.
+        case image(AssetRef, maxPixel: CGFloat)
         case rule
         case table(PrintTable)
         case drawing(DisplayList, scale: CGFloat)
@@ -609,15 +621,15 @@ final class TextDocPrintLayout {
                 units.append(Unit(content: .rule, x: x0, width: w0, height: NibSpacing.xxl * k, spaceBefore: space.before,
                                   spaceAfter: space.after))
             case .image:
+                // Only the image's size is read here (its header); the pixels are decoded when its page is drawn.
                 if let asset = b.asset, let store = snapshot.assets,
-                   let image = BlockImageLoader.load(store, asset: asset, doc: snapshot.doc, maxPixel: w0 * 3),
-                   image.size.width > 0, image.size.height > 0 {
-                    let aspect = image.size.height / image.size.width
+                   let pixels = TextDocPrintImages.pixelSize(store, asset: asset, doc: snapshot.doc) {
+                    let aspect = pixels.height / pixels.width
                     let maxHeight = min(pageHeight, TextDocMetrics.maxImageHeight * k)
                     var size = CGSize(width: w0, height: w0 * aspect)
                     if size.height > maxHeight { size = CGSize(width: maxHeight / aspect, height: maxHeight) }
-                    units.append(Unit(content: .image(image), x: x0 + (w0 - size.width) / 2, width: size.width,
-                                      height: size.height, spaceBefore: space.before,
+                    units.append(Unit(content: .image(asset, maxPixel: w0 * 3), x: x0 + (w0 - size.width) / 2,
+                                      width: size.width, height: size.height, spaceBefore: space.before,
                                       spaceAfter: b.caption == nil ? space.after : 0, keepWithNext: b.caption != nil))
                 }
                 caption(b.caption, kind: b.kind, x: x0, width: w0)
@@ -751,7 +763,7 @@ final class TextDocPrintLayout {
 
     // MARK: Drawing
 
-    func draw(page index: Int, in frame: CGRect, links: Bool) {
+    func draw(page index: Int, in frame: CGRect) {
         guard pages.indices.contains(index), let cg = UIGraphicsGetCurrentContext() else { return }
         cg.saveGState()
         defer { cg.restoreGState() }
@@ -794,9 +806,16 @@ final class TextDocPrintLayout {
                     cg.addPath(CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil))
                     cg.fillPath()
                 }
-                flow.draw(p.parts, at: origin, links: links)
-            case .image(let image):
-                image.draw(in: CGRect(x: origin.x, y: origin.y, width: u.width, height: p.height))
+                flow.draw(p.parts, at: origin)
+            case .image(let asset, let maxPixel):
+                // Decoded for this page and released after it: a document of many images never holds them all.
+                autoreleasepool {
+                    guard let store = snapshot.assets,
+                          let image = BlockImageLoader.load(store, asset: asset, doc: snapshot.doc, maxPixel: maxPixel) else {
+                        return
+                    }
+                    image.draw(in: CGRect(x: origin.x, y: origin.y, width: u.width, height: p.height))
+                }
             case .rule:
                 cg.setStrokeColor(type.separator.cgColor)
                 cg.setLineWidth(NibStroke.hairline)
@@ -819,14 +838,12 @@ final class TextDocPrintLayout {
 
 // MARK: - Renderer (printing and PDF export)
 
-/// Paginates and draws a text document for UIPrintInteractionController (paper chosen by the user) or into a PDF
-/// (a fixed paper, with a layout made beforehand off the main actor). Layout is made once per content size, behind a
-/// lock, because the print system may ask for pages from its own thread.
-final class TextDocPageRenderer: UIPrintPageRenderer {
+/// Paginates and draws a text document for UIPrintInteractionController (paper chosen by the user; `paper` nil), or
+/// on a fixed paper. Layout is made once per content size, behind a lock, because the print system may ask for pages
+/// from its own thread. (Not final: tests stand in a paper for the print system's.)
+class TextDocPageRenderer: UIPrintPageRenderer {
     let snapshot: TextDocPrintSnapshot
     private let fixedPaper: CGSize?
-    /// PDF export: linked text gets clickable link annotations.
-    var annotatesLinks = false
     private let lock = NSLock()
     private var cached: TextDocPrintLayout?
 
@@ -868,13 +885,18 @@ final class TextDocPageRenderer: UIPrintPageRenderer {
     override var numberOfPages: Int { max(1, layout().pages.count) }
 
     override func drawContentForPage(at pageIndex: Int, in contentRect: CGRect) {
-        layout().draw(page: pageIndex, in: self.contentRect, links: annotatesLinks)
+        layout().draw(page: pageIndex, in: self.contentRect)
     }
 
     override func drawFooterForPage(at pageIndex: Int, in footerRect: CGRect) {
-        let content = self.contentRect
-        let type = snapshot.type
-        let number = NSAttributedString(string: "\(pageIndex + 1)", attributes: [
+        TextDocPrintLayout.drawPageNumber(pageIndex, below: contentRect, type: snapshot.type)
+    }
+}
+
+extension TextDocPrintLayout {
+    /// The page number, centred in the band under the text.
+    static func drawPageNumber(_ index: Int, below content: CGRect, type: TextDocPrintType) {
+        let number = NSAttributedString(string: "\(index + 1)", attributes: [
             .font: type.font(type.footnote), .foregroundColor: type.secondary])
         let size = number.size()
         number.draw(at: CGPoint(x: content.midX - size.width / 2,
@@ -882,30 +904,69 @@ final class TextDocPageRenderer: UIPrintPageRenderer {
     }
 }
 
-@MainActor
+/// A text document as a PDF on its snapshot's paper, with its title in the PDF's info and web links clickable. Runs
+/// on any thread (export draws off the main actor); each page is drawn in its own autorelease pool, so the images
+/// decoded for it go with it.
 enum TextDocPDF {
-    /// The document as PDF data on its snapshot's paper, with its title in the PDF's info, drawn by the print
-    /// renderer. Pass the layout when it was made already (off the main actor, for the snapshot's paper).
+    /// Writes the PDF to `url` page by page. Pass the layout when it was made already (for the snapshot's paper).
+    static func write(_ snapshot: TextDocPrintSnapshot, layout: TextDocPrintLayout? = nil, to url: URL) throws {
+        try renderer(snapshot).writePDF(to: url) { context in draw(snapshot, layout: layout, into: context) }
+    }
+
+    /// The same PDF as data (tests, small documents).
     static func data(_ snapshot: TextDocPrintSnapshot, layout: TextDocPrintLayout? = nil) -> Data {
-        let renderer = TextDocPageRenderer(snapshot: snapshot, paper: snapshot.paper, layout: layout)
-        renderer.annotatesLinks = true
+        renderer(snapshot).pdfData { context in draw(snapshot, layout: layout, into: context) }
+    }
+
+    private static func renderer(_ snapshot: TextDocPrintSnapshot) -> UIGraphicsPDFRenderer {
         let format = UIGraphicsPDFRendererFormat()
         format.documentInfo = [kCGPDFContextTitle as String: snapshot.title, kCGPDFContextCreator as String: "Nib"]
-        let bounds = CGRect(origin: .zero, size: snapshot.paper)
-        return UIGraphicsPDFRenderer(bounds: bounds, format: format).pdfData { context in
-            let count = renderer.numberOfPages
-            renderer.prepare(forDrawingPages: NSRange(location: 0, length: count))
-            for i in 0..<count {
+        return UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: snapshot.paper), format: format)
+    }
+
+    private static func draw(_ snapshot: TextDocPrintSnapshot, layout: TextDocPrintLayout?,
+                             into context: UIGraphicsPDFRendererContext) {
+        let content = TextDocPrintMetrics.contentRect(paper: snapshot.paper)
+        let layout = layout ?? TextDocPrintLayout(snapshot, size: content.size)
+        for i in 0..<max(1, layout.pages.count) {
+            autoreleasepool {
                 context.beginPage()
-                renderer.drawPage(at: i, in: renderer.printableRect)
+                layout.draw(page: i, in: content)
+                TextDocPrintLayout.drawPageNumber(i, below: content, type: snapshot.type)
             }
         }
     }
 }
 
+/// Image blocks on paper: measured from the file's header when the layout is made, decoded when a page is drawn.
+enum TextDocPrintImages {
+    /// The image's size in pixels, upright (EXIF orientation applied), without decoding it. Nil when the asset is
+    /// missing or is not an image.
+    static func pixelSize(_ store: AssetStore, asset: AssetRef, doc: DocumentID) -> CGSize? {
+        if let url = store.url(asset, doc: doc), let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let size = pixelSize(source) {
+            return size
+        }
+        guard let data = try? store.data(asset, doc: doc),
+              let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        return pixelSize(source)
+    }
+
+    private static func pixelSize(_ source: CGImageSource) -> CGSize? {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let w = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              let h = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue, w > 0, h > 0 else { return nil }
+        // Orientations 5–8 turn the image a quarter: its upright width is the stored height.
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        return orientation >= 5 ? CGSize(width: h, height: w) : CGSize(width: w, height: h)
+    }
+}
+
 // MARK: - Printing
 
-/// ⌘P in a text document: the system print sheet with this document laid out for the paper the user picks.
+/// ⌘P in a text document: the system print sheet with this document laid out for the paper the user picks. The key
+/// is a `TextDocHooks` key (live while a block has the caret) until F067's print.present routes text documents here
+/// (docs/contract-requests/F103-print.md); `present(doc:app:session:)` and `renderer(doc:app:session:)` need no editor.
 @MainActor
 enum TextDocPrinter {
     static let keyID = TextDocExtrasHookIDs.prefix + "print"
@@ -919,23 +980,51 @@ enum TextDocPrinter {
     }
 
     static func present(from editor: TextDocViewController) {
-        let runner = TextDocCommandRunner(app: editor.app, session: editor.session, doc: editor.documentID)
+        present(doc: editor.documentID, app: editor.app, session: editor.session)
+    }
+
+    /// The renderer that prints text document `doc` on the paper the print system picks: its blocks from the
+    /// workspace (with the typing of `session`'s editor when it shows the document). Throws for another kind, or a
+    /// locked document.
+    static func renderer(doc: DocumentID, app: NibApp, session: EditorSession?) throws -> TextDocPageRenderer {
+        if app.services.lock?.isLocked(doc) == true {
+            throw NibError(.locked, "doc:\(doc.raw) is locked", hint: "unlock the document, then print it")
+        }
+        let content = try app.workspace.content(doc)
+        guard content.meta.kind == .textDocument else {
+            throw NibError(.unsupported, "doc:\(doc.raw) is a \(content.meta.kind.rawValue), not a text document")
+        }
+        let blocks = TextDocCommandRunner(app: app, session: session, doc: doc).liveBlocks()
+        let title = app.services.library?.node(doc)?.title ?? TextDocTitle.derive(from: blocks)
+            ?? String(localized: "Text Document")
+        let snapshot = TextDocPrintSnapshot.make(doc: doc, title: title, blocks: blocks, assets: app.services.assets,
+                                                 options: [:])
+        return TextDocPageRenderer(snapshot: snapshot, paper: nil)
+    }
+
+    /// The system print sheet for text document `doc`, over `session`'s window (anchored at its top trailing corner
+    /// on regular width). A refusal becomes a toast in that window.
+    static func present(doc: DocumentID, app: NibApp, session: EditorSession?) {
+        let runner = TextDocCommandRunner(app: app, session: session, doc: doc)
         guard !NibApp.isHostlessTest, UIPrintInteractionController.isPrintingAvailable else {
             runner.toast(String(localized: "Printing is not available on this device."))
             return
         }
-        let blocks = runner.liveBlocks()
-        let title = editor.app.services.library?.node(editor.documentID)?.title ?? TextDocTitle.derive(from: blocks)
-            ?? String(localized: "Text Document")
-        let snapshot = TextDocPrintSnapshot.make(doc: editor.documentID, title: title, blocks: blocks,
-                                                 assets: editor.app.services.assets, options: [:])
+        let renderer: TextDocPageRenderer
+        do {
+            renderer = try self.renderer(doc: doc, app: app, session: session)
+        } catch {
+            runner.toast(NibError.wrap(error).message)
+            return
+        }
         let info = UIPrintInfo.printInfo()
         info.outputType = .general
-        info.jobName = title
+        info.jobName = renderer.snapshot.title
         let controller = UIPrintInteractionController.shared
         controller.printInfo = info
-        controller.printPageRenderer = TextDocPageRenderer(snapshot: snapshot, paper: nil)
-        if editor.traitCollection.horizontalSizeClass == .regular, let view = editor.view {
+        controller.printPageRenderer = renderer
+        if let view = (session?.editor as? UIViewController)?.viewIfLoaded, view.window != nil,
+           view.traitCollection.horizontalSizeClass == .regular {
             let anchor = CGRect(x: view.bounds.maxX - NibMetrics.hitTarget, y: view.safeAreaInsets.top, width: 1, height: 1)
             _ = controller.present(from: anchor, in: view, animated: true, completionHandler: nil)
         } else {

@@ -299,28 +299,34 @@ struct TextDocOutlinePanel: View {
         }
     }
 
+    /// A row is a button (Full Keyboard Access focuses it and draws its ring; Space and Return open it); the
+    /// disclosure chevron inside keeps its own button.
     private func row(_ e: TextDocOutlineEntry) -> some View {
         let isCurrent = model.currentRow == e.id
         let expanded: Binding<Bool>? = e.hasChildren
             ? Binding(get: { !model.isCollapsed(e.id) }, set: { model.setExpanded(e.id, $0) })
             : nil
-        return NibOutlineRow(title(e), depth: e.depth, isSelected: isCurrent, isExpanded: expanded,
-                             reservesDisclosure: model.hasNesting)
-            .onTapGesture { open(e) }
-            .hoverEffect(.highlight)
-            .contextMenu { levelMenu(e) }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(title(e))
-            .accessibilityValue(levelName(e.level))
-            .accessibilityAddTraits(isCurrent ? [.isButton, .isSelected] : .isButton)
-            .accessibilityAction { open(e) }
-            .accessibilityActions {
-                if e.hasChildren {
-                    Button(model.isCollapsed(e.id) ? String(localized: "Expand") : String(localized: "Collapse")) {
-                        model.setExpanded(e.id, model.isCollapsed(e.id))
-                    }
+        return Button {
+            open(e)
+        } label: {
+            NibOutlineRow(title(e), depth: e.depth, isSelected: isCurrent, isExpanded: expanded,
+                          reservesDisclosure: model.hasNesting)
+        }
+        .buttonStyle(.plain)
+        .hoverEffect(.highlight)
+        .contextMenu { levelMenu(e) }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title(e))
+        .accessibilityValue(levelName(e.level))
+        .accessibilityAddTraits(isCurrent ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { open(e) }
+        .accessibilityActions {
+            if e.hasChildren {
+                Button(model.isCollapsed(e.id) ? String(localized: "Expand") : String(localized: "Collapse")) {
+                    model.setExpanded(e.id, model.isCollapsed(e.id))
                 }
             }
+        }
     }
 
     @ViewBuilder

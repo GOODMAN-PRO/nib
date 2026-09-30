@@ -32,16 +32,46 @@ enum AutoLinker {
     }
 
     /// `text` with every address that is not linked yet (and not inline code, and not in `skipping`) linked; nil
-    /// when there is nothing to link. Existing links, including links to pages and audio, are never changed.
-    static func linked(_ text: RichText, skipping: Set<String> = []) -> RichText? {
+    /// when there is nothing to link. Links someone made, including links to pages and audio, are never changed; an
+    /// auto-link on the start of a longer address ("https://exa", linked while "https://example.com" was still being
+    /// typed) grows to the whole address. With `caret` (a pass while typing), an address the caret is in or at the end
+    /// of is left for later: it may not be finished yet.
+    static func linked(_ text: RichText, skipping: Set<String> = [], caret: NSRange? = nil) -> RichText? {
         var out = text
-        var changed = false
         for m in matches(in: text.plainText) where !skipping.contains(m.url.absoluteString) {
-            guard !touches(out, m.range, where: { $0.link != nil || $0.code == true }) else { continue }
+            if let caret = caret, isTyping(at: caret, in: m.range) { continue }
+            guard !touches(out, m.range, where: { $0.code == true }) else { continue }
+            let existing = links(in: out).filter { NSIntersectionRange($0.range, m.range).length > 0 }
+            if !existing.isEmpty {
+                // Linked already, or linked by someone: left alone. Only auto-links wholly inside the address (its
+                // start, linked before the rest was typed) give way to it.
+                let plain = out.plainText as NSString
+                let grows = existing.allSatisfy { l in
+                    l.range.location >= m.range.location && NSMaxRange(l.range) <= NSMaxRange(m.range)
+                        && l.range != m.range && isAutoLink(l.link, text: plain.substring(with: l.range))
+                }
+                guard grows else { continue }
+            }
             out = apply(in: m.range, to: out) { $0.link = TextLink(url: m.url.absoluteString) }
-            changed = true
         }
-        return changed ? out : nil
+        return out != text ? out : nil
+    }
+
+    /// True when a caret or selection `caret` is inside `range` or at its end: the address there may still be typed.
+    static func isTyping(at caret: NSRange, in range: NSRange) -> Bool {
+        [caret.location, NSMaxRange(caret)].contains { NSLocationInRange($0, range) || $0 == NSMaxRange(range) }
+    }
+
+    /// True when `link` is what auto-linking makes of `text`: a web or mail link to exactly that address (not a link
+    /// someone chose, which may point anywhere).
+    static func isAutoLink(_ link: TextLink, text: String) -> Bool {
+        guard let url = link.url, link.document == nil, link.page == nil, link.audioClip == nil, !text.isEmpty else {
+            return false
+        }
+        if let m = matches(in: text).first, m.range == NSRange(location: 0, length: (text as NSString).length),
+           m.url.absoluteString == url { return true }
+        let u = url.lowercased(), t = text.lowercased()
+        return u == t || u == "mailto:" + t || u == "http://" + t || u == "https://" + t
     }
 
     /// `text` with `link` on `range` (nil removes links there). Runs split at the range's ends; nothing else changes.
@@ -187,7 +217,8 @@ enum AutoLinkEditor {
         }
     }
 
-    /// Arms (after a space, a line break or a paste) or pushes back (any other key) the block's auto-link pass.
+    /// Arms (after a space, a line break, punctuation or a paste) or pushes back (any other key) the block's auto-link
+    /// pass. A pass armed by typing leaves the address at the caret alone (`link(_:in:typing:)`).
     static func typed(_ change: TextDocTextChange, in editor: TextDocViewController) {
         guard !change.isCaption, change.block.kind != .code, BlockRules.isText(change.block.kind) else { return }
         let state = TextDocExtrasState.of(editor)
@@ -195,42 +226,60 @@ enum AutoLinkEditor {
         let r = change.replacement
         let trigger = (r as NSString).length > 1 || r.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
             || r.rangeOfCharacter(from: .punctuationCharacters) != nil
-        guard trigger || state.autoLinkTasks[id] != nil else { return }
-        schedule(id, in: editor, after: delay)
+        guard trigger || state.autoLinkTasks[id] != nil || state.autoLinkDeferred.contains(id) else { return }
+        schedule(id, in: editor, after: delay, typing: true)
     }
 
-    /// When the caret leaves a block, links it right away.
+    /// When the caret leaves a block, links it right away, the address it was at included. A caret moving within a
+    /// block whose address at the caret was left for later arms a pass, which links it once the caret is off it.
     static func focusChanged(in editor: TextDocViewController) {
         let state = TextDocExtrasState.of(editor)
         let now = editor.focusedBlockID
         if let previous = state.lastFocusedBlock, previous != now {
-            schedule(previous, in: editor, after: 0)
+            schedule(previous, in: editor, after: 0, typing: false)
+        } else if let now = now, state.autoLinkDeferred.contains(now) {
+            schedule(now, in: editor, after: delay, typing: true)
         }
         state.lastFocusedBlock = now
     }
 
-    static func schedule(_ id: NibID, in editor: TextDocViewController, after seconds: TimeInterval) {
+    static func schedule(_ id: NibID, in editor: TextDocViewController, after seconds: TimeInterval, typing: Bool) {
         let state = TextDocExtrasState.of(editor)
         state.autoLinkTasks[id]?.cancel()
         state.autoLinkTasks[id] = Task { @MainActor [weak editor] in
             if seconds > 0 { try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) }
             guard !Task.isCancelled, let editor = editor else { return }
             TextDocExtrasState.of(editor).autoLinkTasks[id] = nil
-            await link(id, in: editor)
+            await link(id, in: editor, typing: typing)
         }
     }
 
-    /// Links the block's addresses with one block.update, queued behind the keystrokes before it.
-    static func link(_ id: NibID, in editor: TextDocViewController) async {
+    /// Links the block's addresses with one block.update, queued behind the keystrokes before it. `typing`: the pass
+    /// was armed by typing, so an address the caret is in or at the end of is not linked yet (a half-typed
+    /// "https://exa" must not become a link to it); it is linked once a space, a line break or a caret move ends it,
+    /// or when the caret leaves the block.
+    static func link(_ id: NibID, in editor: TextDocViewController, typing: Bool = false) async {
         await editor.flushEdits()
-        guard !editor.isReadOnly, let block = editor.block(id), BlockRules.isText(block.kind), block.kind != .code else { return }
-        if let tv = editor.focusedTextView, tv.blockID == id, tv.isBusy {
-            // An IME composition or a Writing Tools pass is running in this block: try again when it is done.
-            schedule(id, in: editor, after: delay)
+        let state = TextDocExtrasState.of(editor)
+        guard !editor.isReadOnly, let block = editor.block(id), BlockRules.isText(block.kind), block.kind != .code else {
+            state.autoLinkDeferred.remove(id)
             return
         }
-        let skip = TextDocExtrasState.of(editor).unlinked[id] ?? []
-        guard let text = AutoLinker.linked(block.text, skipping: skip) else { return }
+        let tv = editor.focusedTextView.flatMap { $0.blockID == id && $0.role == .body ? $0 : nil }
+        if let tv = tv, tv.isBusy {
+            // An IME composition or a Writing Tools pass is running in this block: try again when it is done.
+            schedule(id, in: editor, after: delay, typing: typing)
+            return
+        }
+        let caret = typing ? tv?.selectedRange : nil
+        let plain = block.text.plainText
+        if let caret = caret, AutoLinker.matches(in: plain).contains(where: { AutoLinker.isTyping(at: caret, in: $0.range) }) {
+            state.autoLinkDeferred.insert(id)
+        } else {
+            state.autoLinkDeferred.remove(id)
+        }
+        let skip = state.unlinked[id] ?? []
+        guard let text = AutoLinker.linked(block.text, skipping: skip, caret: caret) else { return }
         _ = await editor.run(BlockUpdate.self, BlockUpdate.Params(ref: editor.blockRef(id), text: text))
     }
 

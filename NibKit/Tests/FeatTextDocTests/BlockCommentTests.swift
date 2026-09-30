@@ -253,12 +253,22 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertEqual(moved([6, 6], old, "Hello blo-cks"), [6, 7], "typing inside grows them")
         XCTAssertEqual(moved([0, 5], old, "Hello blocks"), [0, 5])
         XCTAssertEqual(moved([6, 6], old, "Hello "), [6, 0], "deleting the words leaves an empty place")
-        // "Helocks": "lo bl" (3..<8) deleted.
-        XCTAssertEqual(CommentAnchors.edit(from: old, to: "Helocks"), CommentAnchors.Edit(start: 3, oldEnd: 8, newEnd: 3))
+        // "Helocks": "lo bl" (3..<8) deleted; "llo b" (2..<7) gives the same text.
+        XCTAssertEqual(CommentAnchors.edit(from: old, to: "Helocks"),
+                       CommentAnchors.Edit(start: 3, oldEnd: 8, newEnd: 3, lowest: 2))
         XCTAssertEqual(moved([0, 5], old, "Helocks"), [0, 3], "deleting across the end cuts them")
         XCTAssertEqual(moved([6, 6], old, "Helocks"), [3, 4], "deleting across the start cuts them")
         XCTAssertEqual(moved([6, 6], old, "Hello bricks"), [6, 6], "replacing inside keeps the span")
         XCTAssertEqual(moved([6, 0], old, "Hello new blocks"), [10, 0], "an empty place moves with the text after it")
+        // A character equal to the first of the words, typed before them: the diff puts it after the "b", but the
+        // same text comes from typing it before, so the comment does not grow over it.
+        XCTAssertEqual(CommentAnchors.edit(from: old, to: "Hello bblocks"),
+                       CommentAnchors.Edit(start: 7, oldEnd: 7, newEnd: 8, lowest: 6))
+        XCTAssertEqual(moved([6, 6], old, "Hello bblocks"), [7, 6], "b typed before 'blocks' stays outside")
+        XCTAssertEqual(moved([0, 7], old, "Hello bblocks"), [0, 7], "and after 'Hello b' too")
+        XCTAssertEqual(moved([1, 2], "aab", "ab"), [0, 2], "a repeated character deleted before the words")
+        XCTAssertEqual(moved([0, 2], "abb", "ab"), [0, 2], "and after them")
+        XCTAssertEqual(moved([0, 5], "Hello", "Helllo"), [0, 6], "typed inside, it still grows them")
         // UTF-16: an emoji is two units.
         let emoji = "a\u{1F600}b"
         XCTAssertEqual(moved([3, 1], emoji, "ab"), [1, 1])
@@ -306,6 +316,68 @@ final class BlockCommentTests: XCTestCase {
         try await h.run("block.update", ["ref": .string(paragraph), "kind": "image"])
         await keeper.idle()
         XCTAssertEqual(try block(h, "FIXTUREBLK02").comments, kept)
+    }
+
+    func testEditsLandingBeforeTheKeeperRunsAreRebasedOneAfterTheOther() async throws {
+        let h = harness()
+        await FeatTextDocExtrasFeature.start(h.app)
+        let keeper = try XCTUnwrap(h.app.services.get(CommentAnchorKeeper.serviceKey, as: CommentAnchorKeeper.self))
+        try await h.run("block.comment", ["ref": .string(paragraph), "range": [6, 6], "text": "Plural?", "id": "RAPID01"])
+        let original = try XCTUnwrap(try block(h, "FIXTUREBLK02").comments)
+        let depth = h.undoDepth(doc)
+
+        // Two keystrokes' commits before the keeper had its turn: the second continues from where the first left.
+        try await h.run("block.update", ["ref": .string(paragraph), "text": "Oh, Hello blocks"])
+        try await h.run("block.update", ["ref": .string(paragraph), "text": "Oh, Hello big blocks"])
+        await keeper.idle()
+        let expected = CommentAnchors.rebase(CommentAnchors.rebase(original, from: "Hello blocks", to: "Oh, Hello blocks"),
+                                             from: "Oh, Hello blocks", to: "Oh, Hello big blocks")
+        let b = try block(h, "FIXTUREBLK02")
+        XCTAssertEqual(b.comments?.map { [$0.rangeStart, $0.rangeLength] }, expected.map { [$0.rangeStart, $0.rangeLength] })
+        XCTAssertEqual(CommentThreads.excerpt(CommentAnchors.range(of: try comment(b, "FIXTURECMB01"), length: 20), in: b), "Hello")
+        XCTAssertEqual(CommentThreads.excerpt(CommentAnchors.range(of: try comment(b, "RAPID01"), length: 20), in: b), "blocks")
+        XCTAssertLessThanOrEqual(h.undoDepth(doc), depth + 2, "the ranges ride in the edits' own undo steps")
+    }
+
+    func testAKeystrokeBeforeSeveralCommentsIsOneMoreChangeNotOnePerComment() async throws {
+        let h = harness()
+        await FeatTextDocExtrasFeature.start(h.app)
+        let keeper = try XCTUnwrap(h.app.services.get(CommentAnchorKeeper.serviceKey, as: CommentAnchorKeeper.self))
+        try await h.run("block.comment", ["ref": .string(paragraph), "range": [6, 6], "text": "Plural?", "id": "BATCH01"])
+        var commits = 0
+        let subscription = h.app.bus.observeCommits { cs in
+            if cs.documents.contains(Fixtures.textDocID) { commits += 1 }
+        }
+        defer { subscription.cancel() }
+        var text = "Hello blocks"
+        for typed in ["a", "b", "c"] {
+            text = typed + text
+            commits = 0
+            try await h.run("block.update", ["ref": .string(paragraph), "text": .string(text)])
+            await keeper.idle()
+            XCTAssertEqual(commits, 2, "\(typed): the text, then both comments' ranges in one change")
+        }
+        let b = try block(h, "FIXTUREBLK02")
+        XCTAssertEqual([try comment(b, "FIXTURECMB01").rangeStart, try comment(b, "BATCH01").rangeStart], [3, 9])
+
+        // block.editComment moves several comments of a block in one write, and refuses what it cannot do.
+        try await h.run("block.editComment", ["ref": .string(paragraph), "comment": "FIXTURECMB01", "text": "Nice",
+                                              "range": [0, 3], "moves": [["comment": "BATCH01", "range": [3, 5]]]])
+        let moved = try block(h, "FIXTUREBLK02")
+        XCTAssertEqual([try comment(moved, "FIXTURECMB01").rangeLength, try comment(moved, "BATCH01").rangeStart], [3, 3])
+        await assertError(.notFound) {
+            _ = try await h.run("block.editComment", ["ref": .string(self.paragraph), "comment": "FIXTURECMB01", "text": "Nice",
+                                                      "moves": [["comment": "NOPE", "range": [0, 1]]]])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.editComment", ["ref": .string(self.paragraph), "comment": "FIXTURECMB01", "text": "Nice",
+                                                      "moves": [["comment": "BATCH01", "range": [0, 99]]]])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.editComment", ["ref": .string(self.paragraph), "comment": "FIXTURECMB01", "text": "Nice",
+                                                      "block": .string(self.heading), "range": [0, 1],
+                                                      "moves": [["comment": "BATCH01", "range": [0, 1]]]])
+        }
     }
 
     func testACommentMovesToAnotherBlockKeepingWhoWroteItAndWhen() async throws {
@@ -547,6 +619,14 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertEqual(params["block"]?.stringValue, paragraph)
         XCTAssertEqual(params["range"], [6, 6])
         XCTAssertEqual(params["compose"]?.boolValue, true)
+        let again = key.resolvedParams(for: h.session)
+        XCTAssertNotNil(params["request"]?.stringValue)
+        XCTAssertNotEqual(again["request"], params["request"],
+                          "every press reaches a Comments tab on screen, even on the same words")
+
+        // Posted on those words: they are forgotten (⇧⌘M would offer them a second time).
+        BlockCommentsEditor.forgetSelection(in: editor, block: Fixtures.paragraphBlockID)
+        XCTAssertNil(TextDocExtrasState.of(editor).lastSelection)
 
         // Words past the end of the block's text now (it changed since) are cut to it; none left, no composer.
         TextDocExtrasState.of(editor).lastSelection = TextDocSelection(block: Fixtures.paragraphBlockID,
@@ -573,7 +653,8 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertNil(model.expandedID, "composing opens no existing thread")
 
         let depth = h.undoDepth(doc)
-        model.postDraft("Plural?")
+        let posted = await model.postDraft("Plural?")
+        XCTAssertTrue(posted)
         try await waitUntil("the new comment") { model.draft == nil && model.rows.count == 2 }
         XCTAssertEqual(h.undoDepth(doc), depth + 1)
         let b = try block(h, "FIXTUREBLK02")
@@ -591,12 +672,33 @@ final class BlockCommentTests: XCTestCase {
         try await waitUntil("the draft follows its words") { model.draft?.range == NSRange(location: 4, length: 5) }
         XCTAssertEqual(model.draft?.excerpt, "Hello")
         XCTAssertEqual(model.draft?.token, token, "the composer and its text stay")
+        // Its words deleted meanwhile: the composer and its text stay, now on the whole block.
         try await h.run("block.update", ["ref": .string(paragraph), "text": "Oh, blocks"])
-        try await waitUntil("the words are gone") { model.draft == nil }
+        try await waitUntil("the draft on the whole block") { model.draft?.range == NSRange(location: 0, length: 10) }
+        XCTAssertEqual(model.draft?.token, token, "the words typed in it are not lost")
+        XCTAssertEqual(model.draft?.excerpt, "Oh, blocks")
+        XCTAssertEqual(model.draft?.canPost, true)
+        // Its block gone: still there, with Comment off, until the block is back.
+        try await h.run("block.delete", ["refs": [.string(paragraph)]])
+        try await waitUntil("the block is gone") { model.draft?.canPost == false }
+        XCTAssertEqual(model.draft?.token, token)
+        let refused = await model.postDraft("Lost?")
+        XCTAssertFalse(refused, "nothing to post on")
+        XCTAssertTrue(h.app.bus.undo(doc))
+        try await waitUntil("the block is back") { model.draft?.canPost == true }
+        XCTAssertEqual(model.draft?.excerpt, "Oh, blocks")
+
         model.apply(["block": .string(paragraph), "range": [0, 3], "compose": true])
         XCTAssertEqual(model.draft?.excerpt, "Oh,")
         model.cancelDraft()
         XCTAssertNil(model.draft)
+        // ⇧⌘M again on the same words after Cancel: a composer again.
+        model.apply(["block": .string(paragraph), "range": [0, 3], "compose": true])
+        XCTAssertEqual(model.draft?.excerpt, "Oh,")
+        model.cancelDraft()
+        model.apply(["block": .string(paragraph), "range": [0, 3], "compose": true])
+        XCTAssertEqual(model.draft?.excerpt, "Oh,")
+        model.cancelDraft()
         model.apply(["block": .string(table), "range": [0, 1], "compose": true])
         XCTAssertNil(model.draft, "a table has no text to comment on")
         h.session.readOnly = true
@@ -616,7 +718,7 @@ final class BlockCommentTests: XCTestCase {
         let width: CGFloat = 280   // a popover's content width
         let card = CommentThreadView(model: model, chrome: .popover, showsQuote: true) {}
             .frame(width: width)
-        let composer = CommentComposerView(excerpt: "Hello", chrome: .panel, onCancel: {}) { _ in }
+        let composer = CommentComposerView(excerpt: "Hello", chrome: .panel, onCancel: {}) { _ in true }
             .frame(width: width)
         for view in [AnyView(card), AnyView(composer)] {
             let images = NibSnapshot.images(view, size: CGSize(width: width, height: 360))
@@ -940,5 +1042,199 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertEqual(TextDocExporter.uniqueName("Biology: cells/notes.pdf", used: &used), "Biology- cells-notes")
         XCTAssertEqual(TextDocExporter.uniqueName("Biology- cells-notes", used: &used), "Biology- cells-notes 2")
         XCTAssertEqual(TextDocExporter.uniqueName("   ", used: &used), "Text Document")
+    }
+
+    // MARK: The Comments tab and the editor
+
+    func testOpeningAThreadInTheTabLeavesTheCaretAndTheTextAlone() async throws {
+        let h = harness()
+        let editor = openEditor(h)
+        h.session.editor = editor
+        // In a window, so a text view could take the keyboard if something asked it to.
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 1000))
+        window.rootViewController = editor
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        editor.view.layoutIfNeeded()
+        let before = try block(h, "FIXTUREBLK02").text
+
+        let model = CommentsPanelModel(app: h.app, session: h.session, params: ["block": .string(paragraph)])
+        XCTAssertNotNil(model.expandedID, "panel.open {block} opens that block's thread")
+        XCTAssertNotNil(model.pendingReveal, "the editor is scrolled once the tab is on screen, not while it is made")
+        model.performPendingReveal()
+        XCTAssertNil(model.pendingReveal)
+
+        let row = try XCTUnwrap(model.rows.first)
+        let tv = editor.cell(for: Fixtures.paragraphBlockID)?.textView
+        let selection = tv?.selectedRange
+        model.collapse()
+        model.open(row)
+        XCTAssertEqual(model.expandedID, row.id)
+        XCTAssertFalse(tv?.isFirstResponder ?? false, "opening a thread never gives the document the keyboard")
+        XCTAssertNil(editor.focusedBlockID)
+        XCTAssertFalse(h.session.isEditingText)
+        if let tv = tv, let selection = selection {
+            XCTAssertEqual(tv.selectedRange, selection, "nor selects the commented words (a key would replace them)")
+        }
+
+        // Reply puts the keyboard in the thread's reply field, not in the document.
+        model.reply(row)
+        XCTAssertEqual(model.expanded?.focusReply, true)
+        XCTAssertFalse(tv?.isFirstResponder ?? false)
+        XCTAssertNil(editor.focusedBlockID)
+
+        await editor.flushEdits()
+        XCTAssertEqual(try block(h, "FIXTUREBLK02").text, before, "the commented words are unchanged")
+    }
+
+    // MARK: Auto-linking while typing
+
+    func testAHalfTypedAddressIsNotLinkedAndAnEarlyAutoLinkGrowsToTheWholeAddress() throws {
+        // A pass while the caret is at the end of "https://exa" (the address may still be typed) links nothing.
+        let typing = RichText(plain: "see https://exa")
+        XCTAssertNil(AutoLinker.linked(typing, caret: NSRange(location: 15, length: 0)))
+        XCTAssertNil(AutoLinker.linked(typing, caret: NSRange(location: 8, length: 0)), "nor with the caret inside it")
+        XCTAssertTrue(AutoLinker.isTyping(at: NSRange(location: 15, length: 0), in: NSRange(location: 4, length: 11)))
+        XCTAssertFalse(AutoLinker.isTyping(at: NSRange(location: 16, length: 0), in: NSRange(location: 4, length: 11)))
+        // Once a space ends it, or without a caret (the caret left the block), it is linked.
+        let ended = try XCTUnwrap(AutoLinker.linked(RichText(plain: "see https://example.com "),
+                                                    caret: NSRange(location: 24, length: 0)))
+        XCTAssertEqual(AutoLinker.links(in: ended).map { $0.link.url }, ["https://example.com"])
+
+        // An auto-link made before the rest was typed: "https://exa" linked, "mple.com " typed after it unlinked.
+        let early = AutoLinker.setLink(TextLink(url: "https://exa"), in: typing, range: NSRange(location: 4, length: 11))
+        var grown = early
+        grown.paragraphs[0].runs.append(TextRun("mple.com "))
+        let fixed = try XCTUnwrap(AutoLinker.linked(grown))
+        let links = AutoLinker.links(in: fixed)
+        XCTAssertEqual(links.count, 1)
+        XCTAssertEqual(links.first?.link.url, "https://example.com")
+        XCTAssertEqual(links.first?.range, NSRange(location: 4, length: 19), "one link over the whole address")
+        XCTAssertEqual(fixed.plainText, "see https://example.com ")
+
+        // A link someone chose inside the address is theirs: left alone.
+        let chosen = AutoLinker.setLink(TextLink(url: "https://elsewhere.org"), in: RichText(plain: "see https://example.com "),
+                                        range: NSRange(location: 4, length: 11))
+        XCTAssertNil(AutoLinker.linked(chosen))
+        XCTAssertTrue(AutoLinker.isAutoLink(TextLink(url: "mailto:ada@example.org"), text: "ada@example.org"))
+        XCTAssertFalse(AutoLinker.isAutoLink(TextLink(url: "https://elsewhere.org"), text: "https://exa"))
+        XCTAssertFalse(AutoLinker.isAutoLink(TextLink(document: "FIXTUREDOC01"), text: "https://exa"))
+    }
+
+    // MARK: Highlights on TextKit 1
+
+    func testTheTextKit1HighlightIsAShapeLayerBehindTheWords() throws {
+        let h = harness()
+        let editor = openEditor(h)
+        let cell = BlockCell(frame: CGRect(x: 0, y: 0, width: 600, height: 100))
+        let b = try block(h, "FIXTUREBLK02")
+        let env = BlockCell.Environment(style: BlockStyle.make(kind: .paragraph), captionStyle: BlockStyle.make(kind: .paragraph, caption: true),
+                                        marker: nil, placeholder: nil, alwaysShowsPlaceholder: false, readOnly: false,
+                                        accessoryWidth: 0, aiAvailable: false, isFirst: false)
+        cell.configure(b, environment: env)
+        _ = cell.textView.layoutManager   // another part of the app asked for TextKit 1
+        XCTAssertNil(cell.textView.textLayoutManager, "the view now runs on TextKit 1")
+        cell.layoutIfNeeded()
+        BlockCommentsEditor.decorate(cell, block: b, editor: editor)
+        let marks = try XCTUnwrap(cell.textView.layer.sublayers?.first { $0.name == "textdocextras.comment.marks" } as? CAShapeLayer)
+        XCTAssertFalse(marks.path?.isEmpty ?? true, "the commented words are washed")
+        let rules = try XCTUnwrap(marks.sublayers?.first as? CAShapeLayer)
+        XCTAssertFalse(rules.path?.isEmpty ?? true, "with a rule under them (never colour alone)")
+        XCTAssertFalse(rules.lineDashPattern?.isEmpty ?? true, "dashed, like the dotted underline of TextKit 2")
+        let text = cell.textView.attributedText ?? NSAttributedString()
+        XCTAssertEqual(BlockStyle.make(kind: .paragraph).richText(from: text), RichText(plain: "Hello blocks"),
+                       "nothing entered the text")
+
+        // Resolved: the wash goes.
+        var resolved = b
+        resolved.comments = b.comments?.map { c in
+            var c = c
+            c.resolved = true
+            return c
+        }
+        BlockCommentsEditor.decorate(cell, block: resolved, editor: editor)
+        XCTAssertTrue(marks.path?.isEmpty ?? true)
+    }
+
+    // MARK: Printing
+
+    /// The print system's paper, stood in (the renderer asks for it when it paginates).
+    private final class StubPaperRenderer: TextDocPageRenderer {
+        override var paperRect: CGRect { CGRect(x: 0, y: 0, width: 612, height: 792) }
+        override var printableRect: CGRect { paperRect.insetBy(dx: 18, dy: 18) }
+    }
+
+    func testThePrintRendererPaginatesForThePaperThePrintSystemPicks() throws {
+        let h = harness()
+        h.session.document = doc
+        let renderer = try TextDocPrinter.renderer(doc: doc, app: h.app, session: h.session)
+        XCTAssertEqual(renderer.snapshot.title, "Fixture Text Document")
+        let stub = StubPaperRenderer(snapshot: renderer.snapshot, paper: nil)
+        XCTAssertGreaterThanOrEqual(stub.numberOfPages, 1)
+        let content = stub.contentRect
+        XCTAssertEqual(content.minX, TextDocPrintMetrics.margin, "at least a margin from the paper's edge")
+        XCTAssertLessThanOrEqual(content.maxY, 792 - TextDocPrintMetrics.margin)
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 612, height: 792)).image { _ in
+            stub.prepare(forDrawingPages: NSRange(location: 0, length: stub.numberOfPages))
+            for i in 0..<stub.numberOfPages { stub.drawPage(at: i, in: stub.paperRect) }
+        }
+        XCTAssertEqual(image.size, CGSize(width: 612, height: 792))
+
+        XCTAssertThrowsError(try TextDocPrinter.renderer(doc: Fixtures.docID, app: h.app, session: h.session),
+                             "a notebook is not printed as a text document")
+        h.app.services.lock = FakeLockService(locked: [doc])
+        XCTAssertThrowsError(try TextDocPrinter.renderer(doc: doc, app: h.app, session: h.session), "nor a locked one")
+    }
+
+    func testOnlyWebAndMailLinksBecomeLiveInThePDF() throws {
+        let h = harness()
+        var text = RichText(plain: "web mail page script")
+        text = AutoLinker.setLink(TextLink(url: "https://example.com/a"), in: text, range: NSRange(location: 0, length: 3))
+        text = AutoLinker.setLink(TextLink(url: "mailto:ada@example.org"), in: text, range: NSRange(location: 4, length: 4))
+        text = AutoLinker.setLink(TextLink(url: "nib://doc/FIXTUREDOC01"), in: text, range: NSRange(location: 9, length: 4))
+        text = AutoLinker.setLink(TextLink(url: "javascript:alert(1)"), in: text, range: NSRange(location: 14, length: 6))
+        let blocks = [TextBlock(id: "L1", kind: .paragraph, text: text)]
+        let snapshot = TextDocPrintSnapshot.make(doc: doc, title: "Links", blocks: blocks, assets: h.assets, options: [:])
+        let pdf = try XCTUnwrap(PDFDocument(data: TextDocPDF.data(snapshot)))
+        let urls = (0..<pdf.pageCount).flatMap { pdf.page(at: $0)?.annotations ?? [] }.compactMap { $0.url?.absoluteString }
+        XCTAssertEqual(urls.filter { $0 == "https://example.com/a" }.count, 1, "a web link is one live link")
+        XCTAssertEqual(urls.filter { $0 == "mailto:ada@example.org" }.count, 1)
+        XCTAssertFalse(urls.contains { $0.hasPrefix("nib:") }, "Nib's own ids mean nothing outside Nib")
+        XCTAssertFalse(urls.contains { $0.hasPrefix("javascript:") }, "nor does a script become a live link")
+    }
+
+    // MARK: Design gate (DESIGN §15.7): the Outline and Comments tabs in every variant
+
+    func testTheOutlineAndCommentsTabsRenderInEveryVariant() async throws {
+        let h = harness()
+        h.session.document = doc
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "heading2", "text": "Background", "id": "SNAPH2A"])
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "heading3", "text": "Earlier work", "id": "SNAPH3A"])
+        try await h.run("block.insert", ["doc": "doc:FIXTUREDOC02", "kind": "heading2", "text": "Method", "id": "SNAPH2B"])
+        try await h.run("block.comment", ["ref": .string(paragraph), "range": [6, 6], "text": "Plural?", "id": "SNAPC01"])
+        try await h.run("block.comment", ["ref": .string(paragraph), "range": [6, 6], "text": "Yes, both of them", "id": "SNAPC02"])
+        func context(_ params: JSONValue) -> PanelContext {
+            var c = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+            c.params = params
+            return c
+        }
+        let outline = TextDocOutlineModel(app: h.app, session: h.session)
+        XCTAssertEqual(outline.entries.map { $0.depth }, [1, 2, 3, 2], "the fixture heading with nested H2 and H3")
+        let size = CGSize(width: 320, height: 480)
+        let views: [(String, AnyView)] = [
+            ("outline", AnyView(TextDocOutlinePanel(context: context([:])))),
+            ("comments list", AnyView(TextDocCommentsPanel(context: context([:])))),
+            ("comments thread", AnyView(TextDocCommentsPanel(context: context(["block": .string(paragraph),
+                                                                               "comment": "SNAPC01"])))),
+            ("comments draft", AnyView(TextDocCommentsPanel(context: context(["block": .string(paragraph), "range": [0, 5],
+                                                                              "compose": true]))))
+        ]
+        for (name, view) in views {
+            let images = NibSnapshot.images(view, size: size)
+            XCTAssertEqual(Set(images.keys), Set(NibSnapshot.Variant.allCases), name)
+        }
     }
 }
