@@ -7,13 +7,19 @@ import NibDesign
 /// Keyboard shortcuts and pointer (F073): T-085, D-082, P-050 to P-055, P-057, T-111.
 ///
 /// - Registers the global, library and document key commands (`GlobalShortcuts`), each mapped to a command another
-///   feature owns, with discoverability titles; the shell turns them into UIKeyCommands.
-/// - Keeps every key combination registered once: another owner that maps the same keys for its own command keeps
-///   them (`KeyboardRuntime`), live, as features and plugins register and unregister.
+///   feature owns, with discoverability titles; the shell turns them into UIKeyCommands and passes
+///   `resolvedParams(for:)`, so keys that read the window use `sessionParams`.
+/// - Never registers a key combination twice: another owner that maps the same keys keeps them, and this feature's
+///   shortcut comes back when it goes (`KeyboardRuntime`), live, as features and plugins register and unregister.
+///   Clashes between two other owners are the shell's (`KeyCommandRouting.active`); the list marks the keys that lose
+///   everywhere.
 /// - Settings › General › Keyboard and Pointer: the single-key shortcut switch (`keyboard.singleKeyShortcuts`, run
-///   through `settings.set`) and every shortcut, searchable.
-/// - Pointer: right-click on a page runs `menu.showAt`, ⌘-scroll zooms towards the pointer, UIKit buttons hover
-///   (`PointerSupport`).
+///   through `settings.set`) and every shortcut, searchable, with the text formatting keys the text views handle.
+///   Contract gap: `KeyCommandContext` has no single-key flag for `KeyCommandRouting` to filter on, so while the switch
+///   is off the runtime moves every owner's single-key descriptors to a placement no window offers
+///   (`KeyPlacement.inert`) and gives them back when it is on again.
+/// - Pointer: right-click on a page runs `menu.showAt`, ⌘-scroll zooms towards the pointer, UIKit buttons in the
+///   chrome hover (`PointerSupport`).
 public enum FeatKeyboardFeature: NibFeature {
     public static let id = "keyboard"
 
@@ -22,7 +28,6 @@ public enum FeatKeyboardFeature: NibFeature {
         let catalog = GlobalShortcuts.catalog(app: app, owner: id)
         app.services.set(KeyboardRuntime(app: app, owner: id, catalog: catalog), for: KeyboardRuntime.serviceKey)
         for d in catalog { app.content.keyCommands.register(d) }
-        app.bus.hooks.register(GlobalShortcuts.sessionHook(catalog: catalog, owner: id))
         PointerSupport.register(app, owner: id)
         KeyboardPanels.register(app, owner: id)
 
@@ -121,7 +126,7 @@ struct ShortcutEntry: Identifiable, Equatable {
         case active
         /// Switched off by the single-key setting.
         case singleKeysOff
-        /// Another shortcut holds the same keys.
+        /// Another shortcut wins these keys wherever this one works (`ShortcutRules.hidden`).
         case keysTaken
     }
 
@@ -135,54 +140,111 @@ struct ShortcutEntry: Identifiable, Equatable {
 }
 
 struct ShortcutSection: Identifiable, Equatable {
-    let scope: KeyScope
+    enum Group: Hashable {
+        case scope(KeyScope)
+        /// Keys the text views handle themselves while text is being edited (display only).
+        case textEditing
+    }
+
+    let group: Group
     let entries: [ShortcutEntry]
-    var id: String { scope.rawValue }
+
+    var id: String {
+        switch group {
+        case .scope(let scope): return scope.rawValue
+        case .textEditing: return "textEditing"
+        }
+    }
+
+    var scope: KeyScope? {
+        if case .scope(let scope) = group { return scope }
+        return nil
+    }
+}
+
+/// A shortcut the list shows but nobody registers.
+struct ListedShortcut: Equatable {
+    let id: String
+    let title: String
+    let shortcut: KeyShortcut
 }
 
 enum ShortcutDirectory {
     static let scopeOrder: [KeyScope] = [.global, .library, .document, .canvas]
 
-    /// Every titled shortcut (registered ones, then those the single-key setting switched off, then those whose keys
-    /// another shortcut holds), grouped by where it works and sorted by title; `query` matches titles and keys.
-    /// Untitled aliases (⌘= for ⌘+) are left out.
-    static func sections(active: [KeyCommandDescriptor], off: [KeyCommandDescriptor] = [],
-                         taken: [KeyCommandDescriptor] = [], query: String) -> [ShortcutSection] {
+    /// The formatting keys of the text box editor (F026, P-055): its text view's own UIKeyCommands, live only while it
+    /// edits, so they are listed here and never registered.
+    static var textEditingKeys: [ListedShortcut] {
+        [ListedShortcut(id: "text.bold", title: String(localized: "Bold"), shortcut: KeyShortcut("b", .command)),
+         ListedShortcut(id: "text.italic", title: String(localized: "Italic"), shortcut: KeyShortcut("i", .command)),
+         ListedShortcut(id: "text.underline", title: String(localized: "Underline"), shortcut: KeyShortcut("u", .command)),
+         ListedShortcut(id: "text.strikethrough", title: String(localized: "Strikethrough"),
+                        shortcut: KeyShortcut("x", [.command, .shift])),
+         ListedShortcut(id: "text.alignLeft", title: String(localized: "Align Left"), shortcut: KeyShortcut("{", .command)),
+         ListedShortcut(id: "text.alignCentre", title: String(localized: "Align Centre"),
+                        shortcut: KeyShortcut("|", .command)),
+         ListedShortcut(id: "text.alignRight", title: String(localized: "Align Right"),
+                        shortcut: KeyShortcut("}", .command)),
+         ListedShortcut(id: "text.outdent", title: String(localized: "Outdent"), shortcut: KeyShortcut("tab", .shift)),
+         ListedShortcut(id: "text.finishEditing", title: String(localized: "Finish Editing"),
+                        shortcut: KeyShortcut("escape"))]
+    }
+
+    /// Every titled shortcut (those the single-key setting switched off, then the registered ones, marking those
+    /// another shortcut wins everywhere), grouped by where it works and sorted by title, then the text editing keys;
+    /// `query` matches titles and keys. Untitled aliases (⌘= for ⌘+) are left out.
+    static func sections(active: [KeyCommandDescriptor], off: [KeyCommandDescriptor] = [], query: String) -> [ShortcutSection] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hidden = ShortcutRules.hidden(in: active)
         var seen = Set<String>()
-        var entries: [KeyScope: [ShortcutEntry]] = [:]
-        let all = active.map { ($0, ShortcutEntry.Status.active) } + off.map { ($0, ShortcutEntry.Status.singleKeysOff) }
-            + taken.map { ($0, ShortcutEntry.Status.keysTaken) }
-        for (d, status) in all {
-            let title = d.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !title.isEmpty, seen.insert(d.id).inserted else { continue }
-            let keys = ShortcutFormatter.display(d.shortcut)
-            if !q.isEmpty, !title.localizedStandardContains(q), !keys.localizedStandardContains(q) { continue }
-            entries[d.scope, default: []].append(ShortcutEntry(id: d.id, title: title, keys: keys,
-                                                               spoken: ShortcutFormatter.spoken(d.shortcut), status: status))
+        var entries: [ShortcutSection.Group: [ShortcutEntry]] = [:]
+
+        func add(id: String, title raw: String, shortcut: KeyShortcut, group: ShortcutSection.Group,
+                 status: ShortcutEntry.Status) {
+            let title = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty, seen.insert(id).inserted else { return }
+            let keys = ShortcutFormatter.display(shortcut)
+            if !q.isEmpty, !title.localizedStandardContains(q), !keys.localizedStandardContains(q) { return }
+            entries[group, default: []].append(ShortcutEntry(id: id, title: title, keys: keys,
+                                                             spoken: ShortcutFormatter.spoken(shortcut), status: status))
         }
-        return scopeOrder.compactMap { scope in
-            guard let list = entries[scope], !list.isEmpty else { return nil }
+
+        for d in off {
+            add(id: d.id, title: d.title, shortcut: d.shortcut, group: .scope(d.scope), status: .singleKeysOff)
+        }
+        for d in active {
+            add(id: d.id, title: d.title, shortcut: d.shortcut, group: .scope(d.scope),
+                status: hidden.contains(d.id) ? .keysTaken : .active)
+        }
+        for k in textEditingKeys {
+            add(id: k.id, title: k.title, shortcut: k.shortcut, group: .textEditing, status: .active)
+        }
+
+        let groups = scopeOrder.map { ShortcutSection.Group.scope($0) } + [.textEditing]
+        return groups.compactMap { group in
+            guard let list = entries[group], !list.isEmpty else { return nil }
             let sorted = list.sorted {
                 let order = $0.title.localizedStandardCompare($1.title)
                 return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
             }
-            return ShortcutSection(scope: scope, entries: sorted)
+            return ShortcutSection(group: group, entries: sorted)
         }
     }
 
-    static func title(_ scope: KeyScope) -> String {
-        switch scope {
-        case .global: return String(localized: "Everywhere")
-        case .library: return String(localized: "Library")
-        case .document: return String(localized: "Documents")
-        case .canvas: return String(localized: "On the Page")
+    static func title(_ group: ShortcutSection.Group) -> String {
+        switch group {
+        case .scope(.global): return String(localized: "Everywhere")
+        case .scope(.library): return String(localized: "Library")
+        case .scope(.document): return String(localized: "Documents")
+        case .scope(.canvas): return String(localized: "On the Page")
+        case .textEditing: return String(localized: "While Editing Text")
         }
     }
 
-    static func footer(_ scope: KeyScope) -> String? {
-        switch scope {
-        case .canvas: return String(localized: "These work while you are not typing in a text box.")
+    static func footer(_ group: ShortcutSection.Group) -> String? {
+        switch group {
+        case .scope(.canvas): return String(localized: "These work while you are not typing in a text box.")
+        case .textEditing: return String(localized: "These work while you type in a text box.")
         default: return nil
         }
     }
@@ -203,8 +265,7 @@ struct KeyboardSettingsView: View {
         let _ = revision
         let enabled = app.settings.get(KeyboardSettings.singleKeyShortcuts)
         let sections = ShortcutDirectory.sections(active: app.content.keyCommands.all,
-                                                  off: runtime?.withheldDescriptors ?? [],
-                                                  taken: runtime?.shadowedDescriptors ?? [], query: query)
+                                                  off: runtime?.withheldDescriptors ?? [], query: query)
         List {
             Section {
                 KeyboardSettingToggle(app: app, title: String(localized: "Single-key shortcuts"),
@@ -252,9 +313,9 @@ struct KeyboardSettingsView: View {
                         ShortcutRow(entry: entry)
                     }
                 } header: {
-                    Text(ShortcutDirectory.title(section.scope))
+                    Text(ShortcutDirectory.title(section.group))
                 } footer: {
-                    if let footer = ShortcutDirectory.footer(section.scope) { Text(footer) }
+                    if let footer = ShortcutDirectory.footer(section.group) { Text(footer) }
                 }
             }
         }
@@ -292,7 +353,7 @@ private struct ShortcutRow: View {
     }
 }
 
-/// A switch bound to one declared setting; flipping it runs `settings.set`.
+/// A switch bound to one declared setting; flipping it runs `settings.set`, and a call that fails puts the switch back.
 private struct KeyboardSettingToggle: View {
     let app: NibApp
     let title: String
@@ -306,7 +367,14 @@ private struct KeyboardSettingToggle: View {
             .onChange(of: stored) { _, value in isOn = value }
             .onChange(of: isOn) { _, value in
                 guard value != stored else { return }
-                app.perform(CommandIDs.settingsSet, ["name": .string(name), "value": .bool(value)])
+                let params: JSONValue = ["name": .string(name), "value": .bool(value)]
+                Task { @MainActor in
+                    do {
+                        _ = try await app.bus.execute(CommandIDs.settingsSet, params, session: app.services.sessions.active)
+                    } catch {
+                        isOn = stored
+                    }
+                }
             }
     }
 }

@@ -7,9 +7,8 @@ import NibContracts
 //
 // Every shortcut is a `KeyCommandDescriptor` that runs a command another feature owns; the app shell turns the
 // registry into UIKeyCommands (their titles are the ⌘-hold discoverability overlay). Shortcuts that need the
-// window's document, page, selection or zoom compute their params with `sessionParams` (contracts-v2 G16). Until the
-// shell passes `resolvedParams(for:)`, a before-command hook resolves the same closure: the static params carry a
-// marker naming the descriptor, and the hook swaps it for the resolved params of the invoking window.
+// window's document, page, selection or zoom compute their params with `sessionParams` (contracts-v2 G16): the shell
+// passes `resolvedParams(for:)` of the key window's session when a key runs (contracts-v2.2).
 
 // MARK: - Where a shortcut fires
 
@@ -72,6 +71,20 @@ enum ShortcutRules {
         return out.sorted { ($0.0, $0.1) < ($1.0, $1.1) }
     }
 
+    /// Ids of the descriptors that are live somewhere yet never reach the keyboard: in every situation where they are
+    /// live, the shell hands their shortcut to another command (`KeyCommandRouting.active`, contracts-v2.2). Read
+    /// only; the shortcut list marks them.
+    static func hidden(in descriptors: [KeyCommandDescriptor]) -> Set<String> {
+        var live = Set<String>()
+        var reached = Set<String>()
+        for situation in allSituations {
+            let context = situation.context
+            for d in descriptors where d.isActive(in: context) { live.insert(d.id) }
+            for d in KeyCommandRouting.active(descriptors, in: context) { reached.insert(d.id) }
+        }
+        return live.subtracting(reached)
+    }
+
     /// A single-key shortcut: one printable character with no modifier but Shift (P, E, ⇧P, [ ], 1–9). Named keys
     /// (Escape, Delete, arrows, Return, Tab, Space) are editing and navigation keys, not single-key shortcuts.
     static func isSingleKey(_ shortcut: KeyShortcut) -> Bool {
@@ -89,17 +102,11 @@ struct ArbiterPlan: Equatable {
     var yielded: Set<String> = []
 }
 
-/// Which of the other owners' shortcuts to take out of the registry (and which to put back) so no two claim the same
-/// keys in the same situation.
-struct ShadowPlan: Equatable {
-    var shadow: [String] = []
-    var restore: [String] = []
-}
-
 enum ShortcutArbiter {
     /// This feature maps shortcuts that other features may also register for their own commands (⌃⌘S sidebar,
     /// ⌥⌘G Go to Page, Delete, plugins). The other owner always wins: ours is removed while theirs exists and comes
-    /// back when it goes. `registered` holds the ids now in the registry.
+    /// back when it goes. `registered` holds the ids now in the registry. Clashes between two other owners are left to
+    /// the shell, which offers one command per shortcut in each window (`KeyCommandRouting.active`).
     static func plan(mine: [KeyCommandDescriptor], others: [KeyCommandDescriptor], registered: Set<String>) -> ArbiterPlan {
         var plan = ArbiterPlan()
         let byKeys = Dictionary(grouping: others) { ShortcutRules.normalized($0.shortcut) }
@@ -110,37 +117,6 @@ enum ShortcutArbiter {
                 if registered.contains(m.id) { plan.remove.append(m.id) }
             } else if !registered.contains(m.id) {
                 plan.add.append(m.id)
-            }
-        }
-        return plan
-    }
-
-    /// Two other owners that claim the same keys (a plugin and a feature, two features) cannot both have them: UIKit
-    /// would pick one at random. The winner is, in turn: the one whose owner also owns its command (a feature's key
-    /// for its own action beats a key that maps someone else's), the lower `order`, the smaller id. Losers leave the
-    /// registry (`shadow`) and come back (`restore`) when their keys are free again. `shadowed` are the losers of
-    /// earlier passes, in their latest registration.
-    static func shadowing(registered: [KeyCommandDescriptor], shadowed: [KeyCommandDescriptor],
-                          ownsCommand: (KeyCommandDescriptor) -> Bool) -> ShadowPlan {
-        let registeredIDs = Set(registered.map { $0.id })
-        let candidates = registered + shadowed.filter { !registeredIDs.contains($0.id) }
-        let owns = Dictionary(candidates.map { ($0.id, ownsCommand($0)) }, uniquingKeysWith: { a, _ in a })
-        let ranked = candidates.sorted { a, b in
-            let oa = owns[a.id] ?? false
-            let ob = owns[b.id] ?? false
-            if oa != ob { return oa }
-            if a.order != b.order { return a.order < b.order }
-            return a.id < b.id
-        }
-        var plan = ShadowPlan()
-        var winners: [KeyShortcut: [KeyCommandDescriptor]] = [:]
-        for c in ranked {
-            let keys = ShortcutRules.normalized(c.shortcut)
-            if (winners[keys] ?? []).contains(where: { ShortcutRules.overlap(c, $0) }) {
-                if registeredIDs.contains(c.id) { plan.shadow.append(c.id) }
-            } else {
-                winners[keys, default: []].append(c)
-                if !registeredIDs.contains(c.id) { plan.restore.append(c.id) }
             }
         }
         return plan
@@ -156,17 +132,20 @@ struct ShortcutContext: Equatable {
     var doc: DocumentID?
     var kind: DocumentKind?
     var page: PageID?
+    /// The folder holding the shown document (nil: none shown, or it sits at the library root).
+    var folder: FolderID?
     /// Item refs of the selection on the window's document.
     var selection: [String]
     var readOnly: Bool
     /// Current zoom of the canvas (1 = 100 %).
     var zoom: Double
 
-    init(doc: DocumentID? = nil, kind: DocumentKind? = nil, page: PageID? = nil, selection: [String] = [],
-         readOnly: Bool = false, zoom: Double = 1) {
+    init(doc: DocumentID? = nil, kind: DocumentKind? = nil, page: PageID? = nil, folder: FolderID? = nil,
+         selection: [String] = [], readOnly: Bool = false, zoom: Double = 1) {
         self.doc = doc
         self.kind = kind
         self.page = page
+        self.folder = folder
         self.selection = selection
         self.readOnly = readOnly
         self.zoom = zoom
@@ -176,13 +155,17 @@ struct ShortcutContext: Equatable {
     init(session: EditorSession, app: NibApp?) {
         let doc = session.document
         var kind: DocumentKind?
+        var folder: FolderID?
         if let doc {
-            kind = app?.services.library?.node(doc)?.documentKind ?? (try? app?.workspace.content(doc).meta.kind)
+            let node = app?.services.library?.node(doc)
+            kind = node?.documentKind ?? (try? app?.workspace.content(doc).meta.kind)
+            if let node, node.trashedAt == nil { folder = node.parent }
         }
         let selection = session.selection.doc == doc ? session.selection.refs : []
         let readOnly = session.readOnly || (doc.map { app?.isReadOnly($0) ?? false } ?? false)
         let zoom = session.editor?.canvasHost?.zoomScale ?? session.zoom
-        self.init(doc: doc, kind: kind, page: session.page, selection: selection, readOnly: readOnly, zoom: zoom)
+        self.init(doc: doc, kind: kind, page: session.page, folder: folder, selection: selection, readOnly: readOnly,
+                  zoom: zoom)
     }
 
     var isCanvas: Bool { kind.map { Self.canvasKinds.contains($0) } ?? false }
@@ -210,6 +193,9 @@ enum ZoomLadder {
 /// Params of the session-dependent shortcuts. Those that may not apply (nothing selected, not a page canvas, read
 /// only) run `commands.batch`, whose `calls` are empty then: the key does nothing instead of reporting an error.
 enum ShortcutActions {
+    /// Id of F021's New Notebook sheet (not in `PanelIDs`: contract gap). ⌥⌘N opens it as + New › Notebook does.
+    static let newNotebookPanel = "create.newNotebook"
+
     static func batch(_ calls: [(command: String, params: JSONValue)]) -> JSONValue {
         let list: [JSONValue] = calls.map { ["command": .string($0.command), "params": $0.params] }
         return ["calls": .array(list)]
@@ -241,16 +227,21 @@ enum ShortcutActions {
         return batch([(CommandIDs.viewZoom, ["scale": .number(ZoomLadder.step(from: c.zoom, zoomIn: zoomIn))])])
     }
 
-    /// ⌘0 and ⌥⌘0: fixed zooms (`fit` or `actual`), on a page canvas.
-    static func zoomPreset(_ c: ShortcutContext, _ params: JSONValue) -> JSONValue {
-        guard c.isCanvas else { return nothing }
-        return batch([(CommandIDs.viewZoom, params)])
+    /// ⌥⌘N: `panel.open` params of the New Notebook sheet, as F021 registers the key.
+    static var newNotebook: JSONValue {
+        ["id": .string(newNotebookPanel), "kind": .string(DocumentKind.notebook.rawValue)]
     }
 
-    /// ⌥⌘G: the Go to Page sheet, on a page canvas.
-    static func goToPage(_ c: ShortcutContext) -> JSONValue {
-        guard c.isCanvas, c.doc != nil else { return nothing }
-        return batch([(CommandIDs.panelOpen, ["id": .string(KeyboardPanelIDs.goToPage)])])
+    /// ⌥⌘N from a document: the new notebook goes next to it (in its folder).
+    static func newNotebookFolder(_ c: ShortcutContext) -> JSONValue {
+        guard let folder = c.folder else { return [:] }
+        return ["folder": .string(NodeRef.folder(folder).description)]
+    }
+
+    /// ⇧⌘T, as F047 registers it: doc.create with a fresh id, then doc.open, at the library's top level.
+    static func newTextDocument(id: DocumentID = NibID.make()) -> JSONValue {
+        batch([(CommandIDs.docCreate, ["kind": .string(DocumentKind.textDocument.rawValue), "id": .string(id.raw)]),
+               (CommandIDs.docOpen, ["doc": .string(NodeRef.document(id).description)])])
     }
 
     /// ⇧⌘E: the export dialog for the whole document.
@@ -284,11 +275,6 @@ enum KeyboardPanelIDs {
 @MainActor
 enum GlobalShortcuts {
     static let prefix = "keyboard."
-    /// Param key naming the descriptor whose `sessionParams` the hook resolves (removed before the command runs).
-    static let marker = "keyboardShortcut"
-    static let hookID = "keyboard.sessionParams"
-    static let newNotebookURL = NibFormat.urlScheme + "://new?kind=" + DocumentKind.notebook.rawValue
-    static let newTextDocumentURL = NibFormat.urlScheme + "://new?kind=" + DocumentKind.textDocument.rawValue
 
     /// Every key command this feature registers, in display order. `app` is captured weakly by the session closures.
     static func catalog(app: NibApp?, owner: String) -> [KeyCommandDescriptor] {
@@ -298,12 +284,9 @@ enum GlobalShortcuts {
         func key(_ name: String, _ title: String, _ shortcut: KeyShortcut, _ command: String, _ params: JSONValue = [:],
                  scope: KeyScope, kinds: Set<DocumentKind>? = nil, whileTabsOpen: Bool = false,
                  session resolve: ((ShortcutContext) -> JSONValue)? = nil) {
-            let id = prefix + name
             order += 1
-            var staticParams = params
-            if resolve != nil { staticParams = staticParams.merging([marker: .string(id)]) }
-            var d = KeyCommandDescriptor(id: id, title: title, shortcut: shortcut, command: command, params: staticParams,
-                                         scope: scope, order: order, owner: owner)
+            var d = KeyCommandDescriptor(id: prefix + name, title: title, shortcut: shortcut, command: command,
+                                         params: params, scope: scope, order: order, owner: owner)
             d.docKinds = kinds
             d.whileTabsOpen = whileTabsOpen
             if let resolve {
@@ -318,12 +301,15 @@ enum GlobalShortcuts {
         // File (P-051): everywhere.
         key("newWindow", String(localized: "New Window"), KeyShortcut("n", .command), CommandIDs.windowOpen,
             scope: .global)
+        // ⌥⌘N and ⇧⌘T run the same command with the same params as F021 and F047 register them (they register theirs
+        // only when nobody maps the keys): the New Notebook sheet in the shown document's folder, and a fresh text
+        // document at the library's top level.
         key("newNotebook", String(localized: "New Notebook"), KeyShortcut("n", [.command, .option]),
-            CommandIDs.appOpenURL, ["url": .string(newNotebookURL)], scope: .global)
+            CommandIDs.panelOpen, ShortcutActions.newNotebook, scope: .global, session: ShortcutActions.newNotebookFolder)
         key("quickNote", String(localized: "New QuickNote"), KeyShortcut("n", [.command, .shift]),
             CommandIDs.docQuickNote, scope: .global)
-        key("newTextDocument", String(localized: "New Text Document"), KeyShortcut("t", [.command, .shift]),
-            CommandIDs.appOpenURL, ["url": .string(newTextDocumentURL)], scope: .global)
+        key("newTextDocument", String(localized: "New Text Document"), KeyShortcut("t", [.command, .shift]), batch,
+            scope: .library, session: { _ in ShortcutActions.newTextDocument() })
         key("open", String(localized: "Open…"), KeyShortcut("o", .command), CommandIDs.searchOpen,
             ["scope": "library"], scope: .global)
 
@@ -350,8 +336,8 @@ enum GlobalShortcuts {
             CommandIDs.searchStep, ["direction": "previous"], scope: .document)
 
         // View and navigation (P-053).
-        key("goToPage", String(localized: "Go to Page…"), KeyShortcut("g", [.command, .option]), batch,
-            ShortcutActions.nothing, scope: .document, kinds: canvas, session: ShortcutActions.goToPage)
+        key("goToPage", String(localized: "Go to Page…"), KeyShortcut("g", [.command, .option]), CommandIDs.panelOpen,
+            ["id": .string(KeyboardPanelIDs.goToPage)], scope: .document, kinds: canvas)
         key("zoomIn", String(localized: "Zoom In"), KeyShortcut("+", .command), batch, ShortcutActions.nothing,
             scope: .document, kinds: canvas, session: { ShortcutActions.zoomStep($0, zoomIn: true) })
         // ⌘= is the same key without Shift on most layouts; no title, so it stays out of the ⌘-hold overlay.
@@ -359,12 +345,11 @@ enum GlobalShortcuts {
             scope: .document, kinds: canvas, session: { ShortcutActions.zoomStep($0, zoomIn: true) })
         key("zoomOut", String(localized: "Zoom Out"), KeyShortcut("-", .command), batch, ShortcutActions.nothing,
             scope: .document, kinds: canvas, session: { ShortcutActions.zoomStep($0, zoomIn: false) })
-        key("zoomToFit", String(localized: "Zoom to Fit"), KeyShortcut("0", .command), batch, ShortcutActions.nothing,
-            scope: .document, kinds: canvas, session: { ShortcutActions.zoomPreset($0, ["fit": true]) })
+        key("zoomToFit", String(localized: "Zoom to Fit"), KeyShortcut("0", .command), CommandIDs.viewZoom,
+            ["fit": true], scope: .document, kinds: canvas)
         // ⌘9 is the last tab (contracts-v2: tab.select −1), so Actual Size takes ⌥⌘0.
-        key("actualSize", String(localized: "Actual Size"), KeyShortcut("0", [.command, .option]), batch,
-            ShortcutActions.nothing, scope: .document, kinds: canvas,
-            session: { ShortcutActions.zoomPreset($0, ["actual": true]) })
+        key("actualSize", String(localized: "Actual Size"), KeyShortcut("0", [.command, .option]), CommandIDs.viewZoom,
+            ["actual": true], scope: .document, kinds: canvas)
         key("sidebar", String(localized: "Show or Hide Sidebar"), KeyShortcut("s", [.command, .control]),
             CommandIDs.sidebarToggle, scope: .document)
         for n in 1...9 {
@@ -381,29 +366,6 @@ enum GlobalShortcuts {
         key("selectAll", String(localized: "Select All"), KeyShortcut("a", .command), batch, ShortcutActions.nothing,
             scope: .canvas, kinds: canvas, session: ShortcutActions.selectAll)
         return list
-    }
-
-    /// The before-command hook that resolves `sessionParams` for calls carrying the marker (the shell runs key
-    /// commands with their static params until it adopts `resolvedParams(for:)`; after that the marker is still
-    /// there and resolving again gives the same params).
-    static func sessionHook(catalog: [KeyCommandDescriptor], owner: String) -> CommandHookDescriptor {
-        var byID: [String: KeyCommandDescriptor] = [:]
-        for d in catalog { byID[d.id] = d }
-        let commands = Set(catalog.filter { $0.sessionParams != nil }.map { $0.command }).sorted()
-        return CommandHookDescriptor.guarding(id: hookID, owner: owner, commands: commands, order: -1_000) { _, params, ctx in
-            resolveMarker(params, byID: byID, session: ctx.activeSession)
-        }
-    }
-
-    /// `params` without the marker, with the named descriptor's session params merged over them; nil (pass the
-    /// call through untouched) when there is no marker.
-    static func resolveMarker(_ params: JSONValue, byID: [String: KeyCommandDescriptor],
-                              session: EditorSession?) -> JSONValue? {
-        guard case .object(var object) = params, let id = object[marker]?.stringValue else { return nil }
-        object[marker] = nil
-        let base = JSONValue.object(object)
-        guard let d = byID[id], let session, let dynamic = d.sessionParams else { return base }
-        return base.merging(dynamic(session))
     }
 }
 
@@ -422,9 +384,37 @@ enum KeyboardSettings {
 
 // MARK: - Runtime
 
-/// Keeps `content.keyCommands` free of duplicates and applies the single-key switch, live: at start and after every
-/// registry or setting change. Single-key descriptors of any owner are taken out of the registry while the switch is
-/// off (the shell builds UIKeyCommands from the registry) and put back when it is on again.
+/// Where a key command is offered: its scope and document kinds, as the owner registered them.
+struct KeyPlacement: Equatable {
+    var scope: KeyScope
+    var docKinds: Set<DocumentKind>?
+
+    init(scope: KeyScope, docKinds: Set<DocumentKind>?) {
+        self.scope = scope
+        self.docKinds = docKinds
+    }
+
+    init(_ d: KeyCommandDescriptor) { self.init(scope: d.scope, docKinds: d.docKinds) }
+
+    /// A placement `KeyCommandDescriptor.isActive(in:)` never admits: `.library` needs a window without a document,
+    /// and a kind limit needs one with a document. A single-key shortcut switched off keeps its registration (its
+    /// owner still sees, replaces and unregisters it) but moves here, so no window offers it.
+    static let inert = KeyPlacement(scope: .library, docKinds: [.notebook])
+
+    func apply(to d: KeyCommandDescriptor) -> KeyCommandDescriptor {
+        var out = d
+        out.scope = scope
+        out.docKinds = docKinds
+        return out
+    }
+}
+
+/// Keeps `content.keyCommands` free of duplicates of this feature's shortcuts and applies the single-key switch,
+/// live: at start and after every registry or setting change. While the switch is off, every owner's single-key
+/// descriptors stay registered but inert (`KeyPlacement.inert`); switching it on gives back the placement each still
+/// registered one had. There is no contract flag for this yet (a single-key switch in `KeyCommandContext` that
+/// `KeyCommandRouting` filters on; contract gap), so the switch rewrites placements. Clashes between two other owners
+/// are the shell's (`KeyCommandRouting.active`).
 @MainActor
 final class KeyboardRuntime {
     static let serviceKey = "keyboard.runtime"
@@ -432,10 +422,8 @@ final class KeyboardRuntime {
     private weak var app: NibApp?
     let owner: String
     let catalog: [KeyCommandDescriptor]
-    /// Single-key descriptors switched off, by id (the latest registration of each).
-    private(set) var withheld: [String: KeyCommandDescriptor] = [:]
-    /// Other owners' descriptors whose keys another owner won (`ShortcutArbiter.shadowing`), by id.
-    private(set) var shadowed: [String: KeyCommandDescriptor] = [:]
+    /// Single-key descriptors switched off, by id: the placement their owner gave them.
+    private(set) var withheld: [String: KeyPlacement] = [:]
     /// This feature's shortcuts left to another owner that maps the same keys.
     private(set) var yielded: Set<String> = []
     private(set) var isStarted = false
@@ -453,11 +441,13 @@ final class KeyboardRuntime {
 
     var singleKeysEnabled: Bool { app?.settings.get(KeyboardSettings.singleKeyShortcuts) ?? true }
 
-    /// Descriptors switched off by the single-key setting (for the shortcut list).
-    var withheldDescriptors: [KeyCommandDescriptor] { withheld.values.sorted { $0.id < $1.id } }
-
-    /// Other owners' descriptors whose keys another shortcut holds (for the shortcut list).
-    var shadowedDescriptors: [KeyCommandDescriptor] { shadowed.values.sorted { $0.id < $1.id } }
+    /// Descriptors switched off by the single-key setting, as their owners placed them (for the shortcut list).
+    var withheldDescriptors: [KeyCommandDescriptor] {
+        guard let registry = app?.content.keyCommands else { return [] }
+        return withheld.sorted { $0.key < $1.key }.compactMap { id, placement in
+            registry.get(id).map { placement.apply(to: $0) }
+        }
+    }
 
     func start() {
         guard !isStarted, let app else { return }
@@ -465,11 +455,8 @@ final class KeyboardRuntime {
         reconcile()
         let center = NotificationCenter.default
         observers.add(center.addObserver(forName: .nibRegistryDidChange, object: app.content.keyCommands,
-                                            queue: nil) { [weak self] note in
-            let ids = RegistryChange.ids(note)
-            let kind = note.userInfo?[RegistryChange.kindKey] as? String
-            let changedOwner = note.userInfo?[RegistryChange.ownerKey] as? String
-            KeyboardRuntime.onMain { self?.registryChanged(ids: ids, kind: kind, owner: changedOwner) }
+                                            queue: nil) { [weak self] _ in
+            KeyboardRuntime.onMain { self?.reconcile() }
         })
         observers.add(center.addObserver(forName: SettingsStore.didChange, object: app.settings,
                                             queue: nil) { [weak self] note in
@@ -488,60 +475,24 @@ final class KeyboardRuntime {
         }
     }
 
-    func registryChanged(ids: [String], kind: String?, owner changedOwner: String?) {
-        guard !reconciling, let app else { return }
-        if kind == RegistryChange.unregistered {
-            // The owner dropped a key it had while it was out of the registry: forget it, so it does not come back.
-            for id in ids {
-                withheld[id] = nil
-                shadowed[id] = nil
-            }
-            if let o = changedOwner, o != owner, !app.content.keyCommands.all.contains(where: { $0.owner == o }) {
-                withheld = withheld.filter { $0.value.owner != o }
-                shadowed = shadowed.filter { $0.value.owner != o }
-            }
-        }
-        reconcile()
-    }
-
-    /// Applies the single-key switch, settles other owners' clashes, then arbitrates this feature's shortcuts against
-    /// every other owner's.
+    /// Applies the single-key switch, then arbitrates this feature's shortcuts against every other owner's.
     func reconcile() {
         guard !reconciling, let app else { return }
         reconciling = true
         defer { reconciling = false }
         let registry = app.content.keyCommands
+        // Forget keys their owners unregistered or registered again (those are theirs as they are now).
+        withheld = withheld.filter { id, _ in registry.get(id).map { KeyPlacement($0) == .inert } ?? false }
         if singleKeysEnabled {
-            for (id, d) in withheld.sorted(by: { $0.key < $1.key }) where registry.get(id) == nil {
-                registry.register(d)
+            for (id, placement) in withheld.sorted(by: { $0.key < $1.key }) {
+                if let d = registry.get(id) { registry.register(placement.apply(to: d)) }
             }
             withheld.removeAll()
         } else {
-            for d in registry.all where ShortcutRules.isSingleKey(d.shortcut) {
-                withheld[d.id] = d
-                registry.unregister(id: d.id)
+            for d in registry.all where ShortcutRules.isSingleKey(d.shortcut) && withheld[d.id] == nil {
+                withheld[d.id] = KeyPlacement(d)
+                registry.register(KeyPlacement.inert.apply(to: d))
             }
-            for (id, d) in shadowed where ShortcutRules.isSingleKey(d.shortcut) {
-                withheld[id] = d
-                shadowed[id] = nil
-            }
-        }
-
-        let commands = app.commands
-        let shadow = ShortcutArbiter.shadowing(
-            registered: registry.all.filter { $0.owner != owner }, shadowed: Array(shadowed.values),
-            ownsCommand: { commands.descriptor($0.command)?.owner == $0.owner })
-        for id in shadow.shadow {
-            guard let d = registry.get(id) else { continue }
-            shadowed[id] = d
-            registry.unregister(id: id)
-        }
-        for id in shadow.restore {
-            guard let d = shadowed.removeValue(forKey: id) else { continue }
-            registry.register(d)
-        }
-        if !shadow.shadow.isEmpty {
-            log.info("key clash: kept the winner, set aside \(shadow.shadow.joined(separator: ", "), privacy: .public)")
         }
 
         let all = registry.all

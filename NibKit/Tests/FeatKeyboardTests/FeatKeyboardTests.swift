@@ -30,6 +30,9 @@ private final class Recorder {
 /// A custom control, as a feature would build one in UIKit.
 private final class TestControl: UIControl {}
 
+/// A feature's own text field subclass: it keeps its I-beam pointer.
+private final class TestField: UITextField {}
+
 /// Stands in for the object menu feature's own right-click menu on the canvas.
 @MainActor
 private final class MenuDelegate: NSObject, UIContextMenuInteractionDelegate {
@@ -69,10 +72,16 @@ final class FeatKeyboardTests: XCTestCase {
         return recorder
     }
 
-    /// Runs a key command exactly as the app shell does today: the command with the static params, in the window.
+    /// Runs a key command exactly as the app shell does (contracts-v2.2): the command with `resolvedParams(for:)` of
+    /// the window's session.
     private func press(_ h: Harness, _ name: String) async throws {
         let d = try key(h, name)
-        _ = try await h.app.bus.execute(Invocation(command: d.command, params: d.params, session: h.session))
+        _ = try await h.app.bus.execute(Invocation(command: d.command, params: d.resolvedParams(for: h.session),
+                                                   session: h.session))
+    }
+
+    private func setSingleKeys(_ h: Harness, _ on: Bool) async throws {
+        try await h.run(CommandIDs.settingsSet, ["name": .string(KeyboardSettings.singleKeyShortcuts.name), "value": .bool(on)])
     }
 
     private func descriptor(_ id: String, _ key: String, _ modifiers: KeyModifiers = [], scope: KeyScope,
@@ -112,10 +121,11 @@ final class FeatKeyboardTests: XCTestCase {
             if let params { XCTAssertEqual(d.params, params, name, line: line) }
         }
         try check("newWindow", "n", .command, "window.open", scope: .global, [:])
-        try check("newNotebook", "n", [.command, .option], "app.openURL", scope: .global, ["url": "nib://new?kind=notebook"])
+        // As F021 registers ⌥⌘N (+ New › Notebook) and F047 registers ⇧⌘T.
+        try check("newNotebook", "n", [.command, .option], "panel.open", scope: .global,
+                  ["id": "create.newNotebook", "kind": "notebook"])
         try check("quickNote", "n", [.command, .shift], "doc.quickNote", scope: .global, [:])
-        try check("newTextDocument", "t", [.command, .shift], "app.openURL", scope: .global,
-                  ["url": "nib://new?kind=textDocument"])
+        try check("newTextDocument", "t", [.command, .shift], "commands.batch", scope: .library, [:])
         try check("open", "o", .command, "search.open", scope: .global, ["scope": "library"])
         try check("searchLibrary", "f", .command, "search.open", scope: .library, ["scope": "library"])
         try check("rename", "r", .command, "panel.open", scope: .document, ["id": "keyboard.rename"])
@@ -125,11 +135,11 @@ final class FeatKeyboardTests: XCTestCase {
         try check("find", "f", .command, "search.open", scope: .document, ["scope": "document"])
         try check("findNext", "g", .command, "search.step", scope: .document, ["direction": "next"])
         try check("findPrevious", "g", [.command, .shift], "search.step", scope: .document, ["direction": "previous"])
-        try check("goToPage", "g", [.command, .option], "commands.batch", scope: .document)
+        try check("goToPage", "g", [.command, .option], "panel.open", scope: .document, ["id": "keyboard.goToPage"])
         try check("zoomIn", "+", .command, "commands.batch", scope: .document)
         try check("zoomOut", "-", .command, "commands.batch", scope: .document)
-        try check("zoomToFit", "0", .command, "commands.batch", scope: .document)
-        try check("actualSize", "0", [.command, .option], "commands.batch", scope: .document)
+        try check("zoomToFit", "0", .command, "view.zoom", scope: .document, ["fit": true])
+        try check("actualSize", "0", [.command, .option], "view.zoom", scope: .document, ["actual": true])
         try check("sidebar", "s", [.command, .control], "sidebar.toggle", scope: .document, [:])
         for n in 1...9 {
             try check("tab\(n)", String(n), .command, "tab.select", scope: .document,
@@ -144,9 +154,13 @@ final class FeatKeyboardTests: XCTestCase {
         try check("selectAll", "a", .command, "commands.batch", scope: .canvas)
         XCTAssertFalse(h.app.content.keyCommands.all.contains { $0.shortcut == KeyShortcut("w", [.command, .shift]) },
                        "⇧⌘W is New Whiteboard's (F044)")
-        XCTAssertEqual(try key(h, "zoomIn").docKinds, [.notebook, .whiteboard])
-        XCTAssertEqual(try key(h, "delete").docKinds, [.notebook, .whiteboard])
+        for name in ["zoomIn", "zoomToFit", "actualSize", "goToPage", "delete"] {
+            XCTAssertEqual(try key(h, name).docKinds, [.notebook, .whiteboard], name)
+        }
         XCTAssertNil(try key(h, "find").docKinds)
+        for d in h.app.content.keyCommands.all {
+            XCTAssertNil(d.params["keyboardShortcut"], "\(d.id): static params are what plugins and the AI read")
+        }
     }
 
     func testOtherOwnersKeepTheirKeysAndNothingIsDuplicated() async throws {
@@ -187,47 +201,53 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertTrue(try runtime(h).yielded.isEmpty)
     }
 
-    func testClashesBetweenOtherOwnersAreSettled() async throws {
+    func testClashesBetweenOtherOwnersAreLeftToTheShell() async throws {
         let h = Harness(features: [])
         let registry = h.app.content.keyCommands
-        h.app.commands.register(CommandDescriptor(id: "pencil.palette", title: "Palette", summary: "Test stand-in.",
-                                                  effect: .session, target: .app, exposure: .ui, owner: "pencilhw")) { _, _ in .null }
-        // The Pencil feature maps ⌥⌘P to its own command; audio maps the same keys to a command it does not own here.
+        // The Pencil feature and audio both map ⌥⌘P at `.document` for every kind; the lower order wins everywhere.
         registry.register(descriptor("pencilhw.palette", "p", [.command, .option], scope: .document, owner: "pencilhw",
                                      command: "pencil.palette"))
         var audio = descriptor("audio.key.play", "p", [.command, .option], scope: .document, owner: "audio",
                                command: "audio.play")
         audio.order = -5
         registry.register(audio)
+        // A plugin's ⌘D for every kind and the clipboard's ⌘D on canvases: each wins somewhere.
+        registry.register(descriptor("dev.plugin.d", "d", .command, scope: .document, owner: "dev.plugin"))
+        registry.register(descriptor("clipboard.duplicate", "d", .command, scope: .document,
+                                     kinds: [.notebook, .whiteboard], owner: "clipboard"))
         h.app.register([FeatKeyboardFeature.self])
         await FeatKeyboardFeature.start(h.app)
-        let rt = try runtime(h)
 
-        XCTAssertNotNil(registry.get("pencilhw.palette"), "a key for the owner's own command wins")
-        XCTAssertNil(registry.get("audio.key.play"))
-        XCTAssertEqual(rt.shadowedDescriptors.map { $0.id }, ["audio.key.play"])
-        XCTAssertTrue(ShortcutRules.conflicts(in: registry.all).isEmpty)
-        let list = ShortcutDirectory.sections(active: registry.all, taken: rt.shadowedDescriptors, query: "")
-        XCTAssertEqual(list.flatMap { $0.entries }.first { $0.id == "audio.key.play" }?.status, .keysTaken)
+        for id in ["pencilhw.palette", "audio.key.play", "dev.plugin.d", "clipboard.duplicate"] {
+            XCTAssertNotNil(registry.get(id), "\(id): other owners' registrations are left alone")
+        }
+        let mine = Set(registry.all.filter { $0.owner == FeatKeyboardFeature.id }.map { $0.id })
+        XCTAssertTrue(ShortcutRules.conflicts(in: registry.all).allSatisfy { !mine.contains($0.0) && !mine.contains($0.1) },
+                      "\(ShortcutRules.conflicts(in: registry.all))")
 
-        registry.unregister(id: "pencilhw.palette")
-        XCTAssertNotNil(registry.get("audio.key.play"), "the keys are free again")
-        XCTAssertTrue(rt.shadowedDescriptors.isEmpty)
+        // The shell's routing: audio wins ⌥⌘P everywhere; ⌘D is the clipboard's on canvases, the plugin's elsewhere.
+        XCTAssertEqual(ShortcutRules.hidden(in: registry.all), ["pencilhw.palette"])
+        let list = ShortcutDirectory.sections(active: registry.all, query: "").flatMap { $0.entries }
+        XCTAssertEqual(list.first { $0.id == "pencilhw.palette" }?.status, .keysTaken)
+        XCTAssertEqual(list.first { $0.id == "audio.key.play" }?.status, .active)
+        XCTAssertEqual(list.first { $0.id == "dev.plugin.d" }?.status, .active)
+
+        registry.unregister(id: "audio.key.play")
+        XCTAssertTrue(ShortcutRules.hidden(in: registry.all).isEmpty)
     }
 
-    func testShadowingRanksOwnersThenOrderThenID() {
+    func testHiddenKeysFollowTheShellsRanking() {
+        // Fewer document kinds win, then the narrower scope, then the lower order, then the id.
         var early = descriptor("b.early", "k", .command, scope: .document, owner: "b")
         early.order = 1
         var late = descriptor("a.late", "k", .command, scope: .document, owner: "a")
         late.order = 2
-        let owner = descriptor("c.owner", "K", .command, scope: .canvas, kinds: [.notebook], owner: "c")
-        let elsewhere = descriptor("d.library", "k", .command, scope: .library, owner: "d")
-        let plan = ShortcutArbiter.shadowing(registered: [late, early, elsewhere], shadowed: [owner],
-                                             ownsCommand: { $0.owner == "c" })
-        XCTAssertEqual(plan, ShadowPlan(shadow: ["b.early", "a.late"], restore: ["c.owner"]))
-        let withoutOwner = ShortcutArbiter.shadowing(registered: [late, early, elsewhere], shadowed: [],
-                                                     ownsCommand: { _ in false })
-        XCTAssertEqual(withoutOwner, ShadowPlan(shadow: ["a.late"], restore: []))
+        let notebooks = descriptor("c.notebooks", "k", .command, scope: .canvas, kinds: [.notebook], owner: "c")
+        let library = descriptor("d.library", "k", .command, scope: .library, owner: "d")
+        let global = descriptor("e.global", "k", .command, scope: .global, owner: "e")
+        XCTAssertEqual(ShortcutRules.hidden(in: [late, early, notebooks, library, global]), ["a.late", "e.global"])
+        XCTAssertEqual(ShortcutRules.hidden(in: [late, early]), ["a.late"])
+        XCTAssertTrue(ShortcutRules.hidden(in: [early, library]).isEmpty, "the library and documents never share keys")
     }
 
     // MARK: Single-key shortcuts can be switched off (P-054)
@@ -236,32 +256,53 @@ final class FeatKeyboardTests: XCTestCase {
         let h = Harness(features: [])
         let registry = h.app.content.keyCommands
         let tools = ["p", "e", "["]
-        for k in tools { registry.register(descriptor("toolbar.key." + k, k, scope: .canvas, owner: "toolbar")) }
+        for k in tools {
+            registry.register(descriptor("toolbar.key." + k, k, scope: .canvas, kinds: [.notebook, .whiteboard],
+                                         owner: "toolbar"))
+        }
         registry.register(descriptor("toolbar.key.nextPen", "p", .shift, scope: .canvas, owner: "toolbar"))
         registry.register(descriptor("pencilhw.palette", "p", [.command, .option], scope: .document, owner: "pencilhw"))
+        registry.register(descriptor("pencilhw.key.swap", "s", scope: .canvas, owner: "pencilhw"))
         h.app.register([FeatKeyboardFeature.self])
         await FeatKeyboardFeature.start(h.app)
         let rt = try runtime(h)
         XCTAssertEqual(h.app.settings.descriptor(KeyboardSettings.singleKeyShortcuts.name)?.synced, false)
-
-        try await h.run(CommandIDs.settingsSet, ["name": .string(KeyboardSettings.singleKeyShortcuts.name), "value": false])
-        for id in ["toolbar.key.p", "toolbar.key.e", "toolbar.key.[", "toolbar.key.nextPen"] {
-            XCTAssertNil(registry.get(id), "\(id) is off")
+        func isOff(_ id: String) -> Bool {
+            guard let d = registry.get(id) else { return false }
+            return ShortcutRules.situations(of: d).isEmpty
         }
-        XCTAssertNotNil(registry.get("pencilhw.palette"), "shortcuts with ⌘, ⌥ or ⌃ stay")
-        XCTAssertNotNil(registry.get("keyboard.delete"), "Delete and Escape are not single-key shortcuts")
-        XCTAssertNotNil(registry.get("keyboard.deselect"))
 
-        // Registered while off: withheld at once. Dropped by its owner while off: forgotten.
+        try await setSingleKeys(h, false)
+        for id in ["toolbar.key.p", "toolbar.key.e", "toolbar.key.[", "toolbar.key.nextPen", "pencilhw.key.swap"] {
+            XCTAssertTrue(isOff(id), "\(id) stays registered but no window offers it")
+        }
+        XCTAssertEqual(registry.all.filter { $0.owner == "toolbar" }.count, 4, "owners still see their keys")
+        XCTAssertNotNil(registry.get("pencilhw.palette"))
+        XCTAssertFalse(isOff("pencilhw.palette"), "shortcuts with ⌘, ⌥ or ⌃ stay")
+        XCTAssertFalse(isOff("keyboard.delete"), "Delete and Escape are not single-key shortcuts")
+        XCTAssertFalse(isOff("keyboard.deselect"))
+        XCTAssertEqual(rt.withheldDescriptors.first { $0.id == "toolbar.key.p" }?.scope, .canvas,
+                       "the list shows where the key works when it is on")
+
+        // Registered while off: switched off at once. Dropped by its owner while off: gone for good. Replaced by its
+        // owner while off: switched off in its new form.
         registry.register(descriptor("toolbar.key.h", "h", scope: .canvas, owner: "toolbar"))
-        XCTAssertNil(registry.get("toolbar.key.h"))
+        XCTAssertTrue(isOff("toolbar.key.h"))
         registry.unregister(id: "toolbar.key.e")
+        registry.register(descriptor("toolbar.key.[", "[", scope: .document, kinds: [.whiteboard], owner: "toolbar"))
+        XCTAssertTrue(isOff("toolbar.key.["))
+        // An owner that drops its last ⌘ key keeps its switched-off single keys.
+        registry.unregister(id: "pencilhw.palette")
         XCTAssertEqual(Set(rt.withheldDescriptors.map { $0.id }),
-                       ["toolbar.key.p", "toolbar.key.[", "toolbar.key.nextPen", "toolbar.key.h"])
+                       ["toolbar.key.p", "toolbar.key.[", "toolbar.key.nextPen", "toolbar.key.h", "pencilhw.key.swap"])
 
-        try await h.run(CommandIDs.settingsSet, ["name": .string(KeyboardSettings.singleKeyShortcuts.name), "value": true])
-        for id in ["toolbar.key.p", "toolbar.key.[", "toolbar.key.nextPen", "toolbar.key.h"] {
-            XCTAssertNotNil(registry.get(id), "\(id) is back")
+        try await setSingleKeys(h, true)
+        XCTAssertEqual(registry.get("toolbar.key.p")?.scope, .canvas)
+        XCTAssertEqual(registry.get("toolbar.key.p")?.docKinds, [.notebook, .whiteboard])
+        XCTAssertEqual(registry.get("toolbar.key.[")?.scope, .document, "the owner's latest registration")
+        XCTAssertEqual(registry.get("toolbar.key.[")?.docKinds, [.whiteboard])
+        for id in ["toolbar.key.p", "toolbar.key.[", "toolbar.key.nextPen", "toolbar.key.h", "pencilhw.key.swap"] {
+            XCTAssertFalse(isOff(id), "\(id) is back")
         }
         XCTAssertNil(registry.get("toolbar.key.e"))
         XCTAssertTrue(rt.withheldDescriptors.isEmpty)
@@ -300,10 +341,10 @@ final class FeatKeyboardTests: XCTestCase {
 
     // MARK: Shortcuts that read the window
 
-    func testSessionShortcutsResolveTheWindowThroughTheHook() async throws {
+    func testSessionShortcutsResolveTheWindow() async throws {
         let h = await started()
         let recorder = stand(in: h, for: ["item.delete", "selection.clear", "selection.selectAll", "view.zoom",
-                                          "export.present", "print.present", "panel.open"])
+                                          "export.present", "print.present", "panel.open", "doc.create", "doc.open"])
         let stroke = NodeRef.item(doc, Fixtures.page1, Fixtures.strokeID).description
         let page = NodeRef.page(doc, Fixtures.page1).description
         h.session.selection = Selection(doc: doc, page: Fixtures.page1, items: [Fixtures.strokeID])
@@ -326,13 +367,20 @@ final class FeatKeyboardTests: XCTestCase {
         try await press(h, "actualSize")
         XCTAssertEqual(recorder.params("view.zoom"), [["fit": true], ["actual": true]])
 
-        // Once the shell passes resolvedParams(for:), the same keys resolve the same way (the marker is dropped).
-        recorder.calls.removeAll()
-        let print = try key(h, "print")
-        let resolved = print.resolvedParams(for: h.session)
-        _ = try await h.app.bus.execute(Invocation(command: print.command, params: resolved, session: h.session))
-        XCTAssertEqual(recorder.params("print.present"), [["doc": "doc:FIXTUREDOC01"]])
-        XCTAssertNil(recorder.params("print.present").first?[GlobalShortcuts.marker])
+        // ⌥⌘N from a document: the New Notebook sheet in the document's folder.
+        try await press(h, "newNotebook")
+        XCTAssertEqual(recorder.params("panel.open").last,
+                       ["id": "create.newNotebook", "kind": "notebook",
+                        "folder": .string(NodeRef.folder(Fixtures.folderID).description)])
+        // ⇧⌘T: a fresh text document each time, created then opened.
+        try await press(h, "newTextDocument")
+        try await press(h, "newTextDocument")
+        let created = recorder.params("doc.create")
+        XCTAssertEqual(created.count, 2)
+        XCTAssertEqual(created.compactMap { $0["kind"]?.stringValue }, ["textDocument", "textDocument"])
+        let ids = created.compactMap { $0["id"]?.stringValue }
+        XCTAssertEqual(Set(ids).count, 2, "every press makes a new document")
+        XCTAssertEqual(recorder.params("doc.open"), ids.map { ["doc": .string(NodeRef.document(NibID($0)).description)] })
     }
 
     func testZoomKeysStepFromTheCanvasZoom() async throws {
@@ -366,10 +414,16 @@ final class FeatKeyboardTests: XCTestCase {
         h.session.document = Fixtures.textDocID
         h.session.page = nil
         h.session.selection = Selection()
-        for name in ["delete", "deselect", "selectAll", "zoomIn", "zoomOut", "zoomToFit", "actualSize", "goToPage"] {
+        for name in ["delete", "deselect", "selectAll", "zoomIn", "zoomOut"] {
             try await press(h, name)
         }
         XCTAssertTrue(recorder.calls.isEmpty, "\(recorder.calls)")
+        // Keys whose call is always the same are never offered there.
+        let text = KeyCommandContext(docKind: .textDocument, hasTabs: true)
+        for name in ["zoomToFit", "actualSize", "goToPage"] {
+            XCTAssertFalse(try key(h, name).isActive(in: text), name)
+            XCTAssertTrue(try key(h, name).isActive(in: KeyCommandContext(docKind: .whiteboard, hasTabs: true)), name)
+        }
     }
 
     func testShortcutContextAndActions() {
@@ -383,9 +437,13 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertEqual(ShortcutActions.sharePage(text), ["docs": ["doc:FIXTUREDOC02"]])
         XCTAssertEqual(ShortcutActions.selectAll(text), ShortcutActions.nothing)
         XCTAssertEqual(ShortcutActions.exportDocument(ShortcutContext()), [:])
-        XCTAssertNil(GlobalShortcuts.resolveMarker(["docs": []], byID: [:], session: nil), "calls without the marker pass untouched")
-        XCTAssertEqual(GlobalShortcuts.resolveMarker(["a": 1, GlobalShortcuts.marker: "keyboard.gone"], byID: [:], session: nil),
-                       ["a": 1])
+        XCTAssertEqual(ShortcutActions.newNotebookFolder(ShortcutContext()), [:], "from the library: the root")
+        XCTAssertEqual(ShortcutActions.newNotebookFolder(ShortcutContext(doc: doc, folder: Fixtures.folderID)),
+                       ["folder": .string(NodeRef.folder(Fixtures.folderID).description)])
+        let id = NibID("NEWTEXTDOC01")
+        XCTAssertEqual(ShortcutActions.newTextDocument(id: id),
+                       ["calls": [["command": "doc.create", "params": ["kind": "textDocument", "id": "NEWTEXTDOC01"]],
+                                  ["command": "doc.open", "params": ["doc": "doc:NEWTEXTDOC01"]]]])
     }
 
     // MARK: Zoom and pointer math
@@ -408,6 +466,47 @@ final class FeatKeyboardTests: XCTestCase {
                                             pointer: CGPoint(x: 150, y: 250), zoom: 2)
         XCTAssertEqual(c.dx, 25, accuracy: 1e-9)
         XCTAssertEqual(c.dy, 25, accuracy: 1e-9)
+    }
+
+    func testScrollZoomKeepsThePointerAnchorToTheLastStep() async throws {
+        let h = await started()
+        let host = FakeCanvasHost(h)
+        let recorder = Recorder()
+        h.app.commands.register(CommandDescriptor(id: "view.zoom", title: "Zoom", summary: "Test stand-in.",
+                                                  effect: .session, target: .app, exposure: .ui)) { json, _ in
+            recorder.calls.append(("view.zoom", json))
+            host.zoomScale = json["scale"]?.doubleValue ?? host.zoomScale
+            return .null
+        }
+        h.app.commands.register(CommandDescriptor(id: "view.scrollBy", title: "Scroll", summary: "Test stand-in.",
+                                                  effect: .session, target: .app, exposure: .ui)) { json, _ in
+            recorder.calls.append(("view.scrollBy", json))
+            return .null
+        }
+        let attachment = PointerCanvasAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+
+        // Several scroll steps arrive while the first zoom runs; the gesture ends before the last one is applied.
+        attachment.zoomBegan(at: CGPoint(x: 200, y: 300))
+        attachment.zoomChanged(scroll: 40)
+        attachment.zoomChanged(scroll: 80)
+        attachment.zoomChanged(scroll: ScrollZoom.pointsPerDoubling)
+        attachment.zoomEnded()
+        for _ in 0..<500 where !attachment.isZoomIdle {
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertTrue(attachment.isZoomIdle)
+
+        let calls = recorder.calls
+        let zooms = calls.filter { $0.command == "view.zoom" }.compactMap { $0.params["scale"]?.doubleValue }
+        XCTAssertEqual(zooms.count, 2, "the first step, then only the latest one")
+        XCTAssertEqual(zooms.last ?? 0, 2, accuracy: 1e-9)
+        XCTAssertEqual(calls.last?.command, "view.scrollBy", "the last zoom still brings the page back under the pointer")
+        XCTAssertEqual(calls.map { $0.command }, ["view.zoom", "view.scrollBy", "view.zoom", "view.scrollBy"])
+        // At 2× the page point that was under (200, 300) sits at (400, 600): pan it back by (100, 150) page points.
+        XCTAssertEqual(calls.last?.params["dx"]?.doubleValue ?? 0, 100, accuracy: 1e-9)
+        XCTAssertEqual(calls.last?.params["dy"]?.doubleValue ?? 0, 150, accuracy: 1e-9)
     }
 
     func testRightClickOpensThePageMenuUnlessTheCanvasHasItsOwn() async throws {
@@ -463,6 +562,21 @@ final class FeatKeyboardTests: XCTestCase {
         HoverEffects.install(in: toggle)
         XCTAssertEqual(toggle.interactions.count, interactions, "UIKit's own controls already hover")
 
+        // Text inputs keep their I-beam; the canvas's own views are never walked.
+        let field = TestField(frame: CGRect(x: 0, y: 200, width: 200, height: 44))
+        let canvas = UIView(frame: CGRect(x: 0, y: 250, width: 600, height: 150))
+        let pageControl = TestControl(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
+        canvas.addSubview(pageControl)
+        root.addSubview(field)
+        root.addSubview(canvas)
+        HoverEffects.excludeSubtree(canvas)
+        XCTAssertEqual(HoverEffects.install(in: root), 0)
+        XCTAssertFalse(HoverEffects.hasPointerInteraction(field))
+        XCTAssertFalse(HoverEffects.hasPointerInteraction(pageControl))
+        HoverEffects.includeSubtree(canvas)
+        XCTAssertEqual(HoverEffects.install(in: root), 1)
+        XCTAssertTrue(HoverEffects.hasPointerInteraction(pageControl))
+
         XCTAssertEqual(PointerShapes.cornerRadius(for: CGSize(width: 44, height: 44), layerRadius: 0), 22)
         XCTAssertEqual(PointerShapes.cornerRadius(for: CGSize(width: 200, height: 44), layerRadius: 0), 22)
         XCTAssertEqual(PointerShapes.cornerRadius(for: CGSize(width: 300, height: 200), layerRadius: 0), NibRadius.field)
@@ -484,11 +598,29 @@ final class FeatKeyboardTests: XCTestCase {
         let h = await started()
         let pen = descriptor("toolbar.key.p", "p", scope: .canvas, owner: "toolbar")
         let sections = ShortcutDirectory.sections(active: h.app.content.keyCommands.all, off: [pen], query: "")
-        XCTAssertEqual(sections.map { $0.scope }, [.global, .library, .document, .canvas])
+        XCTAssertEqual(sections.map { $0.group }, [.scope(.global), .scope(.library), .scope(.document), .scope(.canvas),
+                                                   .textEditing])
         XCTAssertFalse(sections.flatMap { $0.entries }.contains { $0.id == "keyboard.zoomInEquals" })
-        XCTAssertEqual(sections.last?.entries.first { $0.id == "toolbar.key.p" }?.isOff, true)
+        XCTAssertEqual(sections.first { $0.scope == .canvas }?.entries.first { $0.id == "toolbar.key.p" }?.isOff, true)
         let everywhere = try XCTUnwrap(sections.first?.entries.map { $0.title })
         XCTAssertEqual(everywhere, everywhere.sorted { $0.localizedStandardCompare($1) == .orderedAscending })
+
+        // P-055: the text views' own formatting keys are listed, never registered.
+        let editing = try XCTUnwrap(sections.last)
+        XCTAssertEqual(ShortcutDirectory.title(editing.group), "While Editing Text")
+        let formatting = Dictionary(uniqueKeysWithValues: editing.entries.map { ($0.title, $0.keys) })
+        XCTAssertEqual(formatting["Bold"], "⌘B")
+        XCTAssertEqual(formatting["Italic"], "⌘I")
+        XCTAssertEqual(formatting["Underline"], "⌘U")
+        XCTAssertEqual(formatting["Strikethrough"], "⇧⌘X")
+        XCTAssertTrue(editing.entries.allSatisfy { $0.status == .active })
+        for k in ShortcutDirectory.textEditingKeys {
+            XCTAssertNil(h.app.content.keyCommands.get(k.id), "\(k.title) belongs to the text view")
+            XCTAssertFalse(h.app.content.keyCommands.all.contains { $0.shortcut == k.shortcut && $0.scope == .global },
+                           "\(k.title): no key everywhere takes it from the text view")
+        }
+        let bold = ShortcutDirectory.sections(active: h.app.content.keyCommands.all, query: "bold")
+        XCTAssertEqual(bold.map { $0.group }, [.textEditing])
 
         let zoom = ShortcutDirectory.sections(active: h.app.content.keyCommands.all, off: [], query: "zoom")
         XCTAssertEqual(zoom.map { $0.scope }, [.document])
@@ -522,8 +654,6 @@ final class FeatKeyboardTests: XCTestCase {
         let menu = h.app.ui.menus.get("keyboard.appMenu.shortcuts")
         XCTAssertEqual(menu?.command, "settings.open")
         XCTAssertEqual(menu.map { $0.params(MenuContext(app: h.app)) }, ["page": "keyboard.settings"])
-        XCTAssertEqual(h.app.bus.hooks.get(GlobalShortcuts.hookID)?.commands.sorted(),
-                       ["commands.batch", "export.present", "print.present"])
         XCTAssertTrue(h.app.commands.all().filter { $0.owner == FeatKeyboardFeature.id }.isEmpty,
                       "the feature maps other features' commands and owns none")
         let problems = await CommandConformance.check(features: [FeatKeyboardFeature.self])

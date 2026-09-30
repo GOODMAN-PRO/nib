@@ -9,7 +9,7 @@ import NibDesign
 //   click never opens two menus);
 // - scrolling with ⌘ held zooms the canvas towards the pointer through `view.zoom` and `view.scrollBy`;
 // - UIKit buttons and controls in the chrome get the system hover highlight in their own shape (SwiftUI controls get
-//   it from NibDesign's press style).
+//   it from NibDesign's press style); canvases and text inputs are left alone.
 
 // MARK: - Scroll-wheel zoom (pure)
 
@@ -82,12 +82,17 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
     private var secondaryClick: UITapGestureRecognizer?
     private var scrollZoom: UIPanGestureRecognizer?
     private var gesture: ZoomGesture?
-    private var pendingScale: Double?
+    /// The latest zoom asked for while one is in flight, with the gesture it belongs to (its pointer anchor).
+    private var pending: (scale: Double, gesture: ZoomGesture?)?
     private var zoomInFlight = false
     private let log = Logger(subsystem: "app.nib", category: "keyboard")
 
+    /// No zoom running or waiting.
+    var isZoomIdle: Bool { !zoomInFlight && pending == nil }
+
     func attach(to host: CanvasHost) {
         self.host = host
+        HoverEffects.excludeSubtree(host.canvasView)
         let click = UITapGestureRecognizer(target: self, action: #selector(secondaryClicked(_:)))
         click.buttonMaskRequired = .secondary
         click.cancelsTouchesInView = false
@@ -109,10 +114,11 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
     func detach(from host: CanvasHost) {
         if let click = secondaryClick { host.canvasView.removeGestureRecognizer(click) }
         if let scroll = scrollZoom { host.canvasView.removeGestureRecognizer(scroll) }
+        HoverEffects.includeSubtree(host.canvasView)
         secondaryClick = nil
         scrollZoom = nil
         gesture = nil
-        pendingScale = nil
+        pending = nil
         self.host = nil
     }
 
@@ -129,37 +135,50 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
 
     @objc private func scrolled(_ recognizer: UIPanGestureRecognizer) {
         guard let host else { return }
-        let view = host.canvasView
         switch recognizer.state {
         case .began:
-            let location = recognizer.location(in: view)
-            let pointer = CGPoint(x: location.x - view.bounds.minX, y: location.y - view.bounds.minY)
-            let anchor = host.pagePoint(location).map { (page: $0.page, point: $0.point) }
-            gesture = ZoomGesture(base: host.zoomScale, pointer: pointer, anchor: anchor)
+            zoomBegan(at: recognizer.location(in: host.canvasView))
         case .changed:
-            guard let g = gesture else { return }
-            let dy = Double(recognizer.translation(in: nil).y)
-            request(ScrollZoom.target(base: g.base, scroll: dy))
+            zoomChanged(scroll: Double(recognizer.translation(in: nil).y))
         default:
-            gesture = nil
+            zoomEnded()
         }
     }
 
-    /// One `view.zoom` at a time; scroll events that arrive meanwhile keep only the latest target.
+    /// A ⌘-scroll starts at `location` (canvas view coordinates): the page point there stays under the pointer.
+    func zoomBegan(at location: CGPoint) {
+        guard let host else { return }
+        let view = host.canvasView
+        let pointer = CGPoint(x: location.x - view.bounds.minX, y: location.y - view.bounds.minY)
+        let anchor = host.pagePoint(location).map { (page: $0.page, point: $0.point) }
+        gesture = ZoomGesture(base: host.zoomScale, pointer: pointer, anchor: anchor)
+    }
+
+    /// The scroll has moved `dy` points since it began.
+    func zoomChanged(scroll dy: Double) {
+        guard let g = gesture else { return }
+        request(ScrollZoom.target(base: g.base, scroll: dy))
+    }
+
+    func zoomEnded() {
+        gesture = nil
+    }
+
+    /// One `view.zoom` at a time; scroll events that arrive meanwhile keep only the latest target. Each target keeps
+    /// the gesture it was asked for in, so a zoom applied after the gesture ended still corrects towards its pointer.
     private func request(_ scale: Double) {
         if zoomInFlight {
-            pendingScale = scale
+            pending = (scale, gesture)
             return
         }
-        apply(scale)
+        apply(scale: scale, snapshot: gesture)
     }
 
-    private func apply(_ scale: Double) {
+    private func apply(scale: Double, snapshot: ZoomGesture?) {
         guard let host else { return }
         zoomInFlight = true
         let app = host.app
         let session = host.session
-        let snapshot = gesture
         Task { @MainActor [weak self] in
             do {
                 _ = try await app.bus.execute(CommandIDs.viewZoom, ["scale": .number(scale)], session: session)
@@ -179,9 +198,9 @@ final class PointerCanvasAttachment: NSObject, CanvasAttachment, UIGestureRecogn
             }
             guard let self else { return }
             self.zoomInFlight = false
-            if let next = self.pendingScale {
-                self.pendingScale = nil
-                self.apply(next)
+            if let next = self.pending {
+                self.pending = nil
+                self.apply(scale: next.scale, snapshot: next.gesture)
             }
         }
     }
@@ -250,12 +269,22 @@ final class HoverHighlight: NSObject, UIPointerInteractionDelegate {
 
 @MainActor
 enum HoverEffects {
-    /// Bound on the views visited per pass (a window is a few thousand views).
-    static let maxViews = 8_000
+    /// Bound on the views visited per pass: with the canvases left out, a window's chrome is a few hundred views.
+    static let maxViews = 600
 
-    /// Gives every UIKit button and custom control under `root` the hover highlight, once. System bars already have
-    /// it, and SwiftUI content gets it from NibDesign (`NibPressStyle`), so both are skipped. Returns how many views
-    /// were changed.
+    /// Canvas views (`PointerCanvasAttachment` adds them): their page views and live item views are the canvas's own,
+    /// so passes never walk into them.
+    private static let excluded = NSHashTable<UIView>.weakObjects()
+
+    static func excludeSubtree(_ view: UIView) { excluded.add(view) }
+
+    static func includeSubtree(_ view: UIView) { excluded.remove(view) }
+
+    static func isExcluded(_ view: UIView) -> Bool { excluded.contains(view) }
+
+    /// Gives every UIKit button and custom control in the chrome under `root` the hover highlight, once. System bars
+    /// already have it, and SwiftUI content gets it from NibDesign (`NibPressStyle`), so both are skipped, as are
+    /// canvases and text inputs (a text field keeps its I-beam). Returns how many views were changed.
     @discardableResult
     static func install(in root: UIView) -> Int {
         var changed = 0
@@ -264,6 +293,7 @@ enum HoverEffects {
         while let view = stack.popLast(), visited < maxViews {
             visited += 1
             if view is UINavigationBar || view is UIToolbar || view is UITabBar { continue }
+            if isExcluded(view) || view is UITextInput { continue }
             if let button = view as? UIButton {
                 // UIKit may hand out a private subclass (UIButton(type: .system)); its subviews are its own.
                 if enable(button) { changed += 1 }
