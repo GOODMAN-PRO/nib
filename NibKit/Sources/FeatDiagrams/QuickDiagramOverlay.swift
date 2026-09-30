@@ -5,8 +5,8 @@ import NibDesign
 /// Quick Diagramming (Goodnotes' blue dots): while one box shape is selected, a rigid dot sits outside each of its
 /// sides. Tap a dot → `diagram.addConnected` adds a matching shape on that side, joined by a connector, and selects
 /// it so you can keep going. Drag a dot → a dashed preview follows the finger; release on (or near) another item →
-/// `connector.create` joins them; release on empty paper → a connector with a free end. Dots never deform or animate
-/// and draw no glass (they are precision affordances on the page, DESIGN.md §10.15).
+/// `connector.create` joins them; release on empty paper → a connector with a free end. Dots are NibDesign's tinted
+/// handle beads: they never deform or animate and draw no glass (precision affordances on the page, DESIGN.md §10.15).
 @MainActor
 final class QuickDiagramOverlay: CanvasAttachment {
     /// How far each dot sits outside its side (view points): clear of the selection's own resize handles and of the
@@ -52,7 +52,6 @@ final class QuickDiagramOverlay: CanvasAttachment {
 
     func attach(to host: CanvasHost) {
         kit.attach(host)
-        kit.onHover = { [weak self] p in self?.hover(p) }
         kit.onTraitChange = { [weak self] in self?.render() }
         refresh()
     }
@@ -70,6 +69,15 @@ final class QuickDiagramOverlay: CanvasAttachment {
     func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
         target != nil && drag == nil && dot(near: viewPoint) != nil
     }
+
+    /// The pointer or a hovering Pencil over a dot rings its hit area.
+    func hover(_ sample: CanvasSample?, host: CanvasHost) {
+        hover(kit.hoverPoint(sample))
+    }
+
+    /// A tap on a dot added a connected shape and selects it: it never reaches tap handlers or the active tool, which
+    /// could drop that selection.
+    func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool { true }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
         guard let t = target, let p = kit.point(sample, on: t.page), let d = dot(near: p.view) else { return }
@@ -96,10 +104,10 @@ final class QuickDiagramOverlay: CanvasAttachment {
             addConnected(d.side, t)
         } else if let snap = d.snap {
             let call: JSONValue = ["page": page, "from": source, "to": EndParam.attached(snap.id)]
-            Task { [kit] in await kit.perform("connector.create", call) }
+            Task { [kit] in await kit.perform(CommandIDs.connectorCreate, call) }
         } else if OverlayKit.distance(d.view, d.startView) >= QuickDiagramOverlay.minFreeDrag {
             let call: JSONValue = ["page": page, "from": source, "to": EndParam.free(d.page)]
-            Task { [kit] in await kit.perform("connector.create", call) }
+            Task { [kit] in await kit.perform(CommandIDs.connectorCreate, call) }
         }
     }
 
@@ -126,7 +134,7 @@ final class QuickDiagramOverlay: CanvasAttachment {
     private func addConnected(_ side: ConnectorSide, _ t: Target) {
         let call: JSONValue = ["ref": .string(NodeRef.item(t.doc, t.page, t.item.id).description), "side": .string(side.name)]
         Task { [kit] in
-            guard let value = await kit.perform("diagram.addConnected", call), let ref = value["ref"]?.stringValue else { return }
+            guard let value = await kit.perform(CommandIDs.diagramAddConnected, call), let ref = value["ref"]?.stringValue else { return }
             await kit.select(ref)
         }
     }
@@ -211,8 +219,7 @@ final class QuickDiagramOverlay: CanvasAttachment {
         if let side = hoveredSide, drag == nil, let dot = dots.first(where: { $0.side == side }) {
             layers.append(kit.hoverRing(at: dot.view))
         }
-        for dot in dots { layers.append(kit.bead(.dot, at: dot.view)) }
-        kit.show(layers)
+        kit.show(layers, beads: dots.map { (kind: OverlayKit.Bead.anchored, at: $0.view) })
         kit.view.accessibilityElements = dots.map { element(for: $0, t) }
     }
 
@@ -227,6 +234,12 @@ final class QuickDiagramOverlay: CanvasAttachment {
         e.onActivate = { [weak self] in self?.addConnected(dot.side, t) }
         return e
     }
+
+    /// The dots on screen, for tests.
+    var shownHandles: [(tinted: Bool, center: CGPoint)] { kit.shownHandles }
+
+    /// Guides drawn under the dots (the hover ring, a drag's preview), for tests.
+    var guideCount: Int { kit.guideCount }
 
     static func label(_ side: ConnectorSide) -> String {
         switch side {

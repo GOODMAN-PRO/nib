@@ -195,7 +195,7 @@ struct ConnectorGeometry {
     var controlBox: Rect? { Rect.bounding(segments.flatMap { $0.points }) }
 
     /// A CGPath in page coordinates, optionally shortened at either end so a stroke never pokes through an arrowhead.
-    /// Trimmed ends stay inside the untrimmed route's control box, so the stroke never leaves `Item.bounds`.
+    /// Trimmed ends stay inside the untrimmed route's control box, so the stroke never leaves the drawer's `paintBounds`.
     func path(trimStart: Double = 0, trimEnd: Double = 0) -> CGPath {
         var segs = segments
         let box = controlBox
@@ -241,10 +241,11 @@ struct ConnectorGeometry {
 // MARK: - Routing
 
 enum ConnectorRouter {
-    /// How far an elbow leaves an anchored side before it turns, and how far a curve's control points may reach past
-    /// the anchors and bends. Kept inside the padding `Item.bounds` gives connectors (half the width + 6 pt), so tile
-    /// invalidation and lasso hit tests always cover the route.
-    static let stub = 6.0
+    /// How far an elbow leaves an anchored side before it turns: long enough that an arrowhead sits on a straight piece.
+    /// The drawer reports the whole route in `paintBounds` / `hitBounds`, so the route may leave `Item.bounds`.
+    static let stub = 16.0
+    /// The shortest stub, for ends closer together than two stubs (`stubLength`).
+    static let minStub = 6.0
     static let epsilon = 0.01
     /// Most bends a connector may have (`connector.setPath` refuses more; `diagram.create` never routes more).
     static let maxBends = 64
@@ -283,8 +284,9 @@ enum ConnectorRouter {
     static func elbowFrame(from a: Point, side sa: Int?, to b: Point, side sb: Int?, bends: [Point]) -> [Point] {
         let dA = direction(side: sa, at: a, toward: bends.first ?? b)
         let dB = direction(side: sb, at: b, toward: bends.last ?? a)
-        let q0 = sa == nil ? a : a + dA * stub
-        let q1 = sb == nil ? b : b + dB * stub
+        let waypoint = !bends.isEmpty
+        let q0 = sa == nil ? a : a + dA * stubLength(from: a, along: dA, toward: bends.first ?? b, waypoint: waypoint)
+        let q1 = sb == nil ? b : b + dB * stubLength(from: b, along: dB, toward: bends.last ?? a, waypoint: waypoint)
         var pts = [q0]
         if bends.isEmpty {
             pts += corners(q0, dA, q1, dB)
@@ -311,6 +313,15 @@ enum ConnectorRouter {
 
     static func elbow(from a: Point, side sa: Int?, to b: Point, side sb: Int?, bends: [Point]) -> [Point] {
         simplified([a] + elbowFrame(from: a, side: sa, to: b, side: sb, bends: bends) + [b])
+    }
+
+    /// How far an anchored end at `p` leaves along `d` before it turns toward `target`: `stub`, unless the target lies
+    /// ahead closer than that. The other end (which stubs toward this one too) is met half way; a bend is met exactly,
+    /// so the elbow turns at it and a dragged segment round-trips through its bends. Never below `minStub`.
+    static func stubLength(from p: Point, along d: Point, toward target: Point, waypoint: Bool) -> Double {
+        let ahead = vecDot(target - p, d)
+        guard ahead > epsilon else { return stub }
+        return min(stub, max(minStub, waypoint ? ahead : ahead / 2))
     }
 
     /// The corner that joins `p` to an unaligned `q`, turning first (so a bend point is always a visible corner).
@@ -379,16 +390,12 @@ enum ConnectorRouter {
 
     // MARK: Curved
 
-    /// A smooth curve through the bends (Catmull-Rom), leaving and arriving along the anchored sides.
-    ///
-    /// Every tangent is shortened (never turned) until its control points sit inside the anchors' and bends' bounding
-    /// box grown by `stub`. A cubic never leaves its control hull, so the whole curve stays inside `Item.bounds` and
-    /// tile invalidation (`Changeset.dirtyRect`) and lasso hit tests always cover it. A curve between two sides that
-    /// face away from each other therefore arches only `stub` past them; bends shape a wider arch.
+    /// A smooth curve through the bends (Catmull-Rom), leaving and arriving along the anchored sides. The end tangents
+    /// reach 1.2 × the distance to the next point, so a curve between sides that face away from each other arches
+    /// clear of its items. The drawer reports the whole control hull in `paintBounds` (a cubic never leaves it).
     static func curve(from a: Point, side sa: Int?, to b: Point, side sb: Int?, bends: [Point]) -> ConnectorGeometry {
         let p = [a] + bends + [b]
         let n = p.count
-        let box = hull(p)
         var t = [Point](repeating: .zero, count: n)
         for i in 0..<n {
             if i == 0 {
@@ -398,37 +405,11 @@ enum ConnectorRouter {
             } else {
                 t[i] = (p[i + 1] - p[i - 1]) * 0.5
             }
-            // Point i's outgoing control is p[i] + t/3 (all but the last point), its incoming one p[i] - t/3 (all
-            // but the first). Scaling both by the same factor keeps interior bends smooth.
-            let third = t[i] * (1.0 / 3)
-            var k = 1.0
-            if i < n - 1 { k = min(k, reach(from: p[i], along: third, in: box)) }
-            if i > 0 { k = min(k, reach(from: p[i], along: third * -1, in: box)) }
-            t[i] = t[i] * k
         }
         let segs: [ConnectorGeometry.Segment] = (1..<n).map { i in
             ConnectorGeometry.Segment.cubic(p[i - 1], p[i - 1] + t[i - 1] * (1.0 / 3), p[i] - t[i] * (1.0 / 3), p[i])
         }
         return ConnectorGeometry(segments: segs)
-    }
-
-    /// The box a routed connector stays in: its anchors and bends, grown by `stub`.
-    static func hull(_ points: [Point]) -> Rect { (Rect.bounding(points) ?? .zero).insetBy(-stub) }
-
-    /// The largest k in 0…1 that keeps `p + v * k` inside `box` (`p` itself is inside).
-    static func reach(from p: Point, along v: Point, in box: Rect) -> Double {
-        var k = 1.0
-        if v.x > 1e-12 {
-            k = min(k, (box.maxX - p.x) / v.x)
-        } else if v.x < -1e-12 {
-            k = min(k, (box.minX - p.x) / v.x)
-        }
-        if v.y > 1e-12 {
-            k = min(k, (box.maxY - p.y) / v.y)
-        } else if v.y < -1e-12 {
-            k = min(k, (box.minY - p.y) / v.y)
-        }
-        return max(0, k)
     }
 }
 
@@ -545,6 +526,20 @@ final class ConnectorDrawer: ItemDrawer {
         guard let c = item.connector else { return }
         ConnectorPainter.draw(c, in: context.cg, darkPaper: context.darkPaper)
     }
+
+    /// Taps and lasso hits: the route as drawn (a curve's bulge included), its arrowheads and its label, with the same
+    /// slop `Item.bounds` gives a connector's ends.
+    func hitBounds(_ item: Item) -> Rect? {
+        guard let c = item.connector else { return nil }
+        return ConnectorPainter.extent(c, pad: c.style.strokeWidth / 2 + ConnectorPainter.hitSlop, controls: false)
+    }
+
+    /// Everything painted: the route's control hull (a cubic never leaves it), the arrowheads and the label with its
+    /// knockout, grown by half the stroke width. The renderer culls and invalidates tiles with it.
+    func paintBounds(_ item: Item) -> Rect? {
+        guard let c = item.connector else { return nil }
+        return ConnectorPainter.extent(c, pad: c.style.strokeWidth / 2 + 1, controls: true).union(item.bounds)
+    }
 }
 
 enum ConnectorPainter {
@@ -552,8 +547,28 @@ enum ConnectorPainter {
     static let labelMaxWidth = 240.0
     /// Clear paper left around a label where the line is knocked out.
     static let labelGap = 3.0
+    /// How far from its drawn path a connector still takes a tap (page points).
+    static let hitSlop = 6.0
 
     static func arrowSize(_ width: Double) -> Double { 6 + width * 2.5 }
+
+    /// The box a connector covers (page coordinates): its route (the control hull when `controls`, else the drawn
+    /// path), the arrowheads, grown by `pad`, and the label's knockout box.
+    static func extent(_ c: ConnectorItem, pad: Double, controls: Bool) -> Rect {
+        let g = ConnectorRouter.geometry(c)
+        let route = controls ? g.controlBox : Rect.bounding(g.flattened())
+        var box = route ?? Rect.bounding([c.from.point, c.to.point] + c.bends) ?? .zero
+        let s = arrowSize(max(c.style.strokeWidth, 0.25))
+        func head(_ tip: Point) -> Rect { Rect(x: tip.x - s, y: tip.y - s, width: 2 * s, height: 2 * s) }
+        if c.style.arrowEnd, !g.segments.isEmpty { box = box.union(head(g.end)) }
+        if c.style.arrowStart, !g.segments.isEmpty { box = box.union(head(g.start)) }
+        box = box.insetBy(-pad)
+        if let text = c.label, !text.isEmpty {
+            let k = layout(text, ink: .black, geometry: g).knockout
+            box = box.union(Rect(x: Double(k.minX), y: Double(k.minY), width: Double(k.width), height: Double(k.height)))
+        }
+        return box
+    }
 
     /// A laid-out label: the text and the box it is drawn in.
     struct LabelBox {
@@ -625,15 +640,8 @@ enum ConnectorPainter {
         cg.fillPath()
     }
 
-    /// Where a label sits: centred on the middle of the path, straddling the line (which is knocked out under it).
-    ///
-    /// ponytail: `Item.bounds` for a connector pads only its anchors and bends (half the width + 6 pt), so the parts
-    /// of a label wider or taller than that pad (and a thick connector's arrowheads) can leave stale tile pixels when
-    /// the connector changes. Contract request F032-connector-bounds (filed with F032's contract gaps: F032 does not
-    /// own docs/contract-requests/) asks for connector bounds that include the label box (13 pt text, at most 240 pt
-    /// wide, centred on the path midpoint, plus the 3 pt knockout), the arrowheads (6 + 2.5 × width long) and the
-    /// curve's control hull. Until it lands the label sits on the line, as close to the covered route as it can be,
-    /// instead of beside it.
+    /// Where a label sits: centred on the middle of the path, straddling the line, which is knocked out under it (the
+    /// stroke is clipped, so the paper and its template show through). `ConnectorDrawer.paintBounds` covers it.
     static func labelRect(size: CGSize, geometry g: ConnectorGeometry) -> CGRect {
         let mid = g.midpoint().point
         let w = Double(size.width), h = Double(size.height)

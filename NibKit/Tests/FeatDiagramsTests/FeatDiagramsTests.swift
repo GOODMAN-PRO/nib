@@ -146,6 +146,17 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
     }
 
+    func testSetPathThatChangesNothingAddsNoUndoStep() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let ref = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECON01"
+        // The route the menu shows checked, and a side the end already has.
+        try await h.run("connector.setPath", ["ref": .string(ref), "route": "straight"])
+        try await h.run("connector.setPath", ["ref": .string(ref), "to": ["side": "left"]])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        try await h.run("connector.setPath", ["ref": .string(ref), "route": "curved"])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+    }
+
     func testLabelsHaveALengthCap() async throws {
         let h = Harness(features: [FeatDiagramsFeature.self])
         let long = JSONValue.string(String(repeating: "a", count: DiagramSchemas.maxLabel + 1))
@@ -366,11 +377,31 @@ final class FeatDiagramsTests: XCTestCase {
 
     func testDraggingAnElbowSegmentBecomesBendsTheRouterFollows() {
         let a = Point(0, 0), b = Point(100, 0)
+        let s = ConnectorRouter.stub
         let frame = ConnectorRouter.elbowFrame(from: a, side: 1, to: b, side: 3, bends: [])
         let bends = ConnectorEditor.movedSegment(frame, index: 0, delta: Point(40, 30))
-        XCTAssertEqual(bends, [Point(6, 30), Point(94, 30)])
+        XCTAssertEqual(bends, [Point(s, 30), Point(100 - s, 30)])
         let pts = ConnectorRouter.elbow(from: a, side: 1, to: b, side: 3, bends: bends)
-        XCTAssertEqual(pts, [a, Point(6, 0), Point(6, 30), Point(94, 30), Point(94, 0), b])
+        XCTAssertEqual(pts, [a, Point(s, 0), Point(s, 30), Point(100 - s, 30), Point(100 - s, 0), b])
+    }
+
+    func testElbowStubsLeaveRoomForArrowheadsAndMeetCloseItemsHalfWay() {
+        // Far apart: the full stub, longer than a default arrowhead, so the head sits on a straight piece.
+        XCTAssertGreaterThan(ConnectorRouter.stub, ConnectorPainter.arrowSize(ShapeItemStyle().strokeWidth))
+        let far = ConnectorRouter.elbow(from: Point(0, 0), side: 1, to: Point(200, 60), side: 3, bends: [])
+        XCTAssertEqual(far, [Point(0, 0), Point(100, 0), Point(100, 60), Point(200, 60)])
+        let down = ConnectorRouter.elbow(from: Point(0, 0), side: 2, to: Point(80, 200), side: 0, bends: [])
+        XCTAssertEqual(down[1], Point(0, 100))
+        // Facing sides 20 pt apart: each stub is 10 pt, so the route jogs once in the middle instead of doubling back.
+        let close = ConnectorRouter.elbow(from: Point(0, 0), side: 1, to: Point(20, 40), side: 3, bends: [])
+        XCTAssertEqual(close, [Point(0, 0), Point(10, 0), Point(10, 40), Point(20, 40)])
+        // An end whose side faces a nearby corner keeps at least the shortest stub.
+        let tight = ConnectorRouter.elbowFrame(from: Point(0, 0), side: 1, to: Point(8, 40), side: 0, bends: [])
+        XCTAssertEqual(tight.first, Point(ConnectorRouter.minStub, 0))
+        // With bends, a stub ends exactly at the first bend's line when that is nearer than a full stub.
+        let bent = ConnectorRouter.elbow(from: Point(0, 0), side: 1, to: Point(100, 0), side: 3,
+                                         bends: [Point(10, 30), Point(90, 30)])
+        XCTAssertEqual(bent, [Point(0, 0), Point(10, 0), Point(10, 30), Point(90, 30), Point(90, 0), Point(100, 0)])
     }
 
     func testCurvesLeaveAndArriveAlongTheirSides() {
@@ -405,9 +436,11 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertEqual(alpha(plain, 83, 51), 0)
     }
 
-    func testConnectorsStayInsideTheirBounds() {
-        // Tile invalidation (Changeset.dirtyRect) and lasso hit tests use Item.bounds: every route, and the stroke
-        // actually drawn (trimmed for arrowheads), must stay inside it.
+    func testConnectorsStayInsideTheirPaintAndHitBounds() {
+        // The renderer culls and invalidates tiles with the drawer's paintBounds, and taps and the lasso use its
+        // hitBounds: every route, the stroke actually drawn (trimmed for arrowheads), the arrowheads and the label must
+        // lie inside them.
+        let drawer = ConnectorDrawer()
         var rng = DiagramLayoutTests.SeededGenerator(state: 2024)
         func point() -> Point { Point(Double.random(in: 0...400, using: &rng), Double.random(in: 0...400, using: &rng)) }
         let sides: [Int?] = [nil, 0, 1, 2, 3]
@@ -420,27 +453,55 @@ final class FeatDiagramsTests: XCTestCase {
                             let to = ConnectorEnd(point: point(), item: sb == nil ? nil : "B", side: sb, t: 0.5)
                             let bends = (0..<bendCount).map { _ in point() }
                             let style = ShapeItemStyle(arrowStart: Bool.random(using: &rng), arrowEnd: true)
-                            let c = ConnectorItem(from: from, to: to, route: route, bends: bends, style: style)
-                            let bounds = Item.makeConnector(c).bounds.insetBy(-1e-6)
+                            let label = Bool.random(using: &rng) ? RichText(plain: "because") : nil
+                            let c = ConnectorItem(from: from, to: to, route: route, bends: bends, style: style, label: label)
+                            let item = Item.makeConnector(c)
+                            guard let paint = drawer.paintBounds(item)?.insetBy(-1e-6),
+                                  let hit = drawer.hitBounds(item)?.insetBy(-1e-6) else { return XCTFail("no bounds") }
                             let g = ConnectorRouter.geometry(c)
                             let what = "\(route) from side \(String(describing: sa)) to side \(String(describing: sb))"
+                            XCTAssertTrue(paint.contains(item.bounds), "\(what): paint bounds cover Item.bounds")
                             for p in g.flattened() {
-                                XCTAssertTrue(bounds.contains(p), "\(what): \(p) outside \(bounds)")
+                                XCTAssertTrue(paint.contains(p), "\(what): \(p) outside \(paint)")
+                                XCTAssertTrue(hit.contains(p), "\(what): \(p) outside the hit bounds \(hit)")
                             }
-                            let s = ConnectorPainter.arrowSize(style.strokeWidth) * 0.8
-                            let drawn = g.path(trimStart: s, trimEnd: s).boundingBoxOfPath
-                            XCTAssertTrue(bounds.cg.insetBy(dx: -1e-6, dy: -1e-6).contains(drawn), "\(what): stroke \(drawn)")
+                            let s = ConnectorPainter.arrowSize(style.strokeWidth)
+                            let drawn = g.path(trimStart: s * 0.8, trimEnd: s * 0.8).boundingBoxOfPath
+                            XCTAssertTrue(paint.cg.contains(drawn), "\(what): stroke \(drawn)")
+                            XCTAssertTrue(paint.contains(Rect(x: g.end.x - s, y: g.end.y - s, width: 2 * s, height: 2 * s)),
+                                          "\(what): arrowhead")
+                            if let text = label {
+                                let k = ConnectorPainter.layout(text, ink: .black, geometry: g).knockout
+                                XCTAssertTrue(paint.cg.contains(k), "\(what): label \(k)")
+                                XCTAssertTrue(hit.cg.contains(k), "\(what): the label takes taps")
+                            }
                         }
                     }
                 }
             }
         }
-        // The reviewer's case: top to top, 300 pt apart, used to arch about 83 pt above both anchors.
+        // Top to top, 300 pt apart: the curve arches well clear of its items (it is no longer held inside Item.bounds),
+        // and the paint bounds follow it.
         let arch = ConnectorItem(from: ConnectorEnd(point: Point(0, 100), item: "A", side: 0, t: 0.5),
                                  to: ConnectorEnd(point: Point(300, 100), item: "B", side: 0, t: 0.5), route: .curved)
+        let item = Item.makeConnector(arch)
         let top = ConnectorRouter.geometry(arch).flattened().map { $0.y }.min() ?? 0
-        XCTAssertGreaterThanOrEqual(top, Item.makeConnector(arch).bounds.minY)
-        XCTAssertLessThan(top, 100, "it still leaves upward, along the top sides")
+        XCTAssertLessThan(top, item.bounds.minY - 40, "it arches clear of the items")
+        XCTAssertGreaterThanOrEqual(top, drawer.paintBounds(item)?.minY ?? .infinity)
+        XCTAssertGreaterThanOrEqual(top, drawer.hitBounds(item)?.minY ?? .infinity)
+    }
+
+    func testTheRendererAndHitTestsUseTheConnectorBounds() {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let c = ConnectorItem(from: ConnectorEnd(point: Point(10, 50)), to: ConnectorEnd(point: Point(190, 50)),
+                              label: RichText(plain: "a label taller than the line's padding"))
+        let item = Item.makeConnector(c)
+        let paint = h.app.content.paintBounds(for: item)
+        XCTAssertEqual(paint, ConnectorDrawer().paintBounds(item))
+        XCTAssertEqual(h.app.content.hitBounds(for: item), ConnectorDrawer().hitBounds(item))
+        let label = ConnectorPainter.layout(c.label!, ink: .black, geometry: ConnectorRouter.geometry(c))
+        XCTAssertGreaterThan(label.rect.height / 2, 6, "the label reaches past Item.bounds")
+        XCTAssertTrue(paint.cg.contains(label.knockout))
     }
 
     func testLabelsSitOnTheMiddleOfTheLineOverAKnockout() throws {
@@ -482,6 +543,7 @@ final class FeatDiagramsTests: XCTestCase {
         let sample = CanvasSample(page: Fixtures.page1, location: Point(Double(dot.x), Double(dot.y)))
         overlay.touchesBegan(sample, host: host)
         overlay.touchesEnded(sample, host: host)
+        XCTAssertTrue(overlay.gesture(.tap, at: sample, host: host), "the tap is not passed on to the active tool")
         await settle { h.session.selection.items.first != Fixtures.shapeID }
         let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
         XCTAssertEqual(items.count, before + 2)
@@ -517,6 +579,7 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
         await settle { host.hidden[Fixtures.page1] == nil }
         XCTAssertNil(host.hidden[Fixtures.page1])
+        XCTAssertEqual(host.renderWaits, [Fixtures.page1], "the preview goes once the tiles show the edited connector")
         editor.canvasDidChange(host)
         XCTAssertTrue(editor.hitTest(CGPoint(x: 260, y: 245), host: host), "handles take touches again")
     }
@@ -591,6 +654,175 @@ final class FeatDiagramsTests: XCTestCase {
         XCTAssertFalse(DiagramMenus.connectable(MenuContext(app: h.app, session: h.session, selection: many)))
     }
 
+    func testConnectorStyleMenuChecksTheCurrentRoute() {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let one = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.connectorID])
+        let ctx = MenuContext(app: h.app, session: h.session, selection: one)
+        let entries = h.app.ui.menuItems(.objectMenu, ctx).filter { $0.id.hasPrefix("diagrams.route.") }
+        XCTAssertEqual(entries.map { $0.id }, ["diagrams.route.straight", "diagrams.route.elbow", "diagrams.route.curved"],
+                       "every route is offered, the current one too")
+        XCTAssertEqual(entries.map { $0.isChecked?(ctx) ?? false }, [true, false, false])
+        XCTAssertEqual(entries.map { $0.shortcut }, ConnectorRoute.allCases.map { Optional(DiagramKeys.route($0)) })
+        XCTAssertEqual(h.app.ui.menus.get("diagrams.connect")?.shortcut, DiagramKeys.connect)
+        XCTAssertEqual(h.app.ui.menus.get("diagrams.addConnected.right")?.shortcut, KeyShortcut("right", [.command, .option]))
+        // Nothing for a read-only session.
+        h.session.readOnly = true
+        XCTAssertTrue(h.app.ui.menuItems(.objectMenu, ctx).filter { $0.owner == "diagrams" }.isEmpty)
+    }
+
+    // MARK: Keyboard
+
+    /// The calls a key's session params would batch in the harness's window.
+    func keyCalls(_ h: Harness, _ id: String) throws -> [JSONValue] {
+        let d = try XCTUnwrap(h.app.content.keyCommands.get(id), id)
+        XCTAssertEqual(d.command, CommandIDs.batch)
+        return d.resolvedParams(for: h.session)["calls"]?.arrayValue ?? []
+    }
+
+    func testKeysAreCanvasKeysOnNotebooksAndBoards() {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let keys = h.app.content.keyCommands.all.filter { $0.owner == "diagrams" }
+        XCTAssertEqual(Set(keys.map { $0.id }), Set(["diagrams.key.connect",
+                                                     "diagrams.key.addConnected.top", "diagrams.key.addConnected.right",
+                                                     "diagrams.key.addConnected.bottom", "diagrams.key.addConnected.left",
+                                                     "diagrams.key.route.straight", "diagrams.key.route.elbow",
+                                                     "diagrams.key.route.curved"]))
+        XCTAssertEqual(Set(keys.map { $0.shortcut }).count, keys.count, "one shortcut each")
+        for d in keys {
+            XCTAssertEqual(d.scope, .canvas, d.id)
+            XCTAssertEqual(d.docKinds, [.notebook, .whiteboard], d.id)
+            XCTAssertNotNil(d.sessionParams, d.id)
+            XCTAssertFalse(d.shortcut.modifiers.isEmpty, "\(d.id) needs modifiers")
+            XCTAssertTrue(d.isActive(in: KeyCommandContext(docKind: .whiteboard)))
+            XCTAssertFalse(d.isActive(in: KeyCommandContext(docKind: .whiteboard, isEditingText: true)))
+            XCTAssertFalse(d.isActive(in: KeyCommandContext(docKind: .textDocument)))
+        }
+    }
+
+    func testKeysDoNothingWhenTheSelectionDoesNotFit() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        for d in h.app.content.keyCommands.all where d.owner == "diagrams" {
+            XCTAssertEqual(try keyCalls(h, d.id), [], "\(d.id) with nothing selected")
+            // The shell runs the key's params: an empty batch changes nothing and reports no error.
+            try await h.run(d.command, d.resolvedParams(for: h.session))
+        }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.strokeID])
+        XCTAssertEqual(try keyCalls(h, "diagrams.key.addConnected.right"), [], "ink is not a box shape")
+        XCTAssertEqual(try keyCalls(h, "diagrams.key.connect"), [], "one item cannot be connected")
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.connectorID])
+        XCTAssertEqual(try keyCalls(h, "diagrams.key.route.straight"), [], "already straight")
+        h.session.readOnly = true
+        XCTAssertEqual(try keyCalls(h, "diagrams.key.route.elbow"), [], "read only")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+    }
+
+    func testConnectKeyJoinsTheTwoSelectedItems() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID, Fixtures.textID])
+        let d = try XCTUnwrap(h.app.content.keyCommands.get("diagrams.key.connect"))
+        XCTAssertEqual(try keyCalls(h, d.id).first?["command"]?.stringValue, CommandIDs.connectorCreate)
+        let before = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).count
+        try await h.run(d.command, d.resolvedParams(for: h.session))
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        XCTAssertEqual(items.count, before + 1)
+        let link = try XCTUnwrap(items.compactMap { $0.connector }.first { $0.to.item == Fixtures.textID })
+        XCTAssertEqual(link.from.item, Fixtures.shapeID)
+        XCTAssertEqual(link.from.side, ConnectorSide.bottom.rawValue)
+        XCTAssertEqual(link.to.side, ConnectorSide.top.rawValue)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+    }
+
+    func testAddConnectedKeyAddsAShapeOnThatSide() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        h.session.selection = Selection(doc: Fixtures.whiteboardID, page: Fixtures.boardID, items: [Fixtures.boardShapeID])
+        let d = try XCTUnwrap(h.app.content.keyCommands.get("diagrams.key.addConnected.bottom"))
+        XCTAssertEqual(d.shortcut, KeyShortcut("down", [.command, .option]))
+        let params = d.resolvedParams(for: h.session)
+        let call = try XCTUnwrap(params["calls"]?[0])
+        XCTAssertEqual(call["command"]?.stringValue, CommandIDs.diagramAddConnected)
+        let id = try XCTUnwrap(call["params"]?["id"]?.stringValue, "a fresh id, so the new shape can be selected")
+        XCTAssertNotEqual(d.resolvedParams(for: h.session)["calls"]?[0]?["params"]?["id"]?.stringValue, id,
+                          "every press mints its own id")
+        try await h.run(d.command, params)
+        let shape = try h.app.workspace.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: NibID(id))
+        let source = try XCTUnwrap(h.app.workspace.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: Fixtures.boardShapeID).frame)
+        XCTAssertGreaterThan(try XCTUnwrap(shape.frame).y, source.y + source.h)
+        XCTAssertEqual(h.undoDepth(Fixtures.whiteboardID), 1)
+    }
+
+    func testAddConnectedKeySelectsTheNewShapeWhenSelectionSetExists() throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        h.app.commands.register(StandInSelectionSet.self)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        let calls = try keyCalls(h, "diagrams.key.addConnected.left")
+        XCTAssertEqual(calls.count, 2)
+        let id = try XCTUnwrap(calls[0]["params"]?["id"]?.stringValue)
+        XCTAssertEqual(calls[1]["command"]?.stringValue, CommandIDs.selectionSet)
+        XCTAssertEqual(calls[1]["params"]?["refs"], .array([.string("item:FIXTUREDOC01/FIXTUREPG001/" + id)]))
+    }
+
+    func testRouteKeysSwitchTheSelectedConnector() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.connectorID])
+        let d = try XCTUnwrap(h.app.content.keyCommands.get("diagrams.key.route.elbow"))
+        XCTAssertEqual(d.shortcut, KeyShortcut("2", [.command, .control]))
+        try await h.run(d.command, d.resolvedParams(for: h.session))
+        XCTAssertEqual(try connector(h, Fixtures.connectorID).route, .elbow)
+        XCTAssertEqual(try keyCalls(h, d.id), [], "pressing it again does nothing")
+        let curved = try XCTUnwrap(h.app.content.keyCommands.get("diagrams.key.route.curved"))
+        try await h.run(curved.command, curved.resolvedParams(for: h.session))
+        XCTAssertEqual(try connector(h, Fixtures.connectorID).route, .curved)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 2)
+    }
+
+    // MARK: Handles and hover
+
+    func testHandlesAreNibDesignBeadsTintedWhenAttached() async throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let host = FakeCanvasHost(h)
+        let editor = ConnectorEditor(host: host)
+        editor.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.connectorID])
+        editor.canvasDidChange(host)
+        // Both ends of the fixture connector are attached; its straight piece is long enough for an "add bend" wash,
+        // which is not a handle view.
+        XCTAssertEqual(editor.shownHandles.map { $0.tinted }, [true, true])
+        XCTAssertEqual(editor.shownHandles.first?.center, CGPoint(x: 260, y: 245))
+        try await h.run("connector.setPath", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECON01", "to": ["point": [500, 500]]])
+        editor.canvasDidChange(host)
+        XCTAssertEqual(editor.shownHandles.map { $0.tinted }, [true, false], "a free end is a clear bead")
+        h.session.selection = Selection()
+        editor.canvasDidChange(host)
+        XCTAssertTrue(editor.shownHandles.isEmpty)
+
+        let overlay = QuickDiagramOverlay(host: host)
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        overlay.canvasDidChange(host)
+        XCTAssertEqual(overlay.shownHandles.map { $0.tinted }, [true, true, true, true])
+        XCTAssertTrue(overlay.shownHandles.contains { $0.center == CGPoint(x: 260 + QuickDiagramOverlay.dotOffset, y: 245) })
+    }
+
+    func testHoverOverAHandleRingsIt() {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let host = FakeCanvasHost(h)
+        let overlay = QuickDiagramOverlay(host: host)
+        overlay.attach(to: host)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        overlay.canvasDidChange(host)
+        let resting = overlay.guideCount
+        let dot = Point(260 + Double(QuickDiagramOverlay.dotOffset), 245)
+        overlay.hover(CanvasSample(page: Fixtures.page1, location: dot, isPencil: false), host: host)
+        XCTAssertEqual(overlay.guideCount, resting + 1, "the pointer rings the dot's hit area")
+        overlay.hover(CanvasSample(page: Fixtures.page1, location: Point(20, 20), isPencil: false), host: host)
+        XCTAssertEqual(overlay.guideCount, resting)
+        overlay.hover(CanvasSample(page: Fixtures.page1, location: dot), host: host)
+        overlay.hover(nil, host: host)
+        XCTAssertEqual(overlay.guideCount, resting, "hover ended")
+    }
+
     func testEditorOffersBendHandlesPerRoute() {
         let straight = ConnectorItem(from: ConnectorEnd(point: Point(0, 0)), to: ConnectorEnd(point: Point(200, 0)),
                                      bends: [Point(100, 50)])
@@ -601,4 +833,17 @@ final class FeatDiagramsTests: XCTestCase {
         elbow.bends = []
         XCTAssertTrue(ConnectorEditor.handles(for: elbow).contains { $0.handle == .segment(0) })
     }
+}
+
+/// `selection.set` as the lasso feature (F011) registers it, for the key that selects the shape it adds.
+private struct StandInSelectionSet: NibCommand {
+    struct Params: Codable {
+        var refs: [String]
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: CommandIDs.selectionSet, title: "Select", summary: "Select items (test stand-in).",
+        params: .obj(["refs": .arr(.ref)], required: ["refs"]), examples: [["refs": []]], effect: .session)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult { NoResult() }
 }

@@ -3,31 +3,38 @@ import NibContracts
 import NibDesign
 
 // The bend/anchor editor for a selected connector (a CanvasAttachment), plus the plumbing it shares with the Quick
-// Diagramming dots. Handles are page-resident precision affordances: rigid 12 pt beads with 44 pt hit areas that
-// never deform, never animate and draw no glass (DESIGN.md §10.15, §14.3). Every edit commits through
+// Diagramming dots. Handles are page-resident precision affordances: NibDesign's rigid 12 pt handle beads with 44 pt
+// hit areas that never deform, never animate and draw no glass (DESIGN.md §10.15, §14.3). Every edit commits through
 // `connector.setPath`, so one drag is one undo step and the AI and plugins can make the same edit.
 
 // MARK: - Shared overlay plumbing
 
-/// An overlay view above the pages that never takes touches itself (the canvas routes them through `hitTest`),
-/// token-coloured handle beads, page ↔ view mapping, hover for the iPad pointer and a hovering Pencil, and command
-/// calls as the user in this canvas's session.
+/// An overlay view above the pages that never takes touches itself (the canvas routes them through `hitTest`), handle
+/// beads (`NibHandleView`) over token-coloured guides, page ↔ view mapping (`CanvasHost.pageTransform`), and command
+/// calls as the user in this canvas's session. Hover (the iPad pointer, a hovering Pencil) arrives through
+/// `CanvasAttachment.hover`.
 @MainActor
 final class OverlayKit {
-    enum Bead { case anchored, open, ghost, dot }
+    enum Bead {
+        /// An end attached to an item, and the Quick Diagramming dots: a tinted (accent) handle.
+        case anchored
+        /// A free end, a bend or an elbow segment: a clear handle.
+        case open
+        /// "Add bend" in the middle of a piece: a small accent wash, lighter than a handle.
+        case ghost
+    }
 
-    /// Handle beads are 12 pt (ghost "add bend" beads 8 pt); every one has a 44 pt hit area.
-    static let beadDiameter: CGFloat = 12
+    /// "Add bend" beads are smaller than handles (`NibMetrics.handleBead`); every bead has a 44 pt hit area.
     static let ghostDiameter: CGFloat = 8
     static let hitRadius: CGFloat = NibMetrics.hitTarget / 2
 
     let view: UIView
     private(set) weak var host: CanvasHost?
-    private let hoverRelay = HoverRelay()
-    private var hoverRecognizer: UIHoverGestureRecognizer?
-    /// The hover location in canvas-view coordinates; nil when the pointer leaves.
-    var onHover: ((CGPoint?) -> Void)?
-    /// Light/dark or contrast changed: token colours must be resolved again.
+    /// Paths, rings, outlines and ghost beads, under the handles.
+    private let guides = CALayer()
+    /// Handle views, reused from one render to the next (only as many as are shown stay visible).
+    private var handles: [NibHandleView] = []
+    /// Light/dark or contrast changed: token colours of the guides must be resolved again (handles do it themselves).
     var onTraitChange: (() -> Void)?
 
     init() {
@@ -36,6 +43,7 @@ final class OverlayKit {
         view.isAccessibilityElement = false
         view.layer.zPosition = 900
         view.isHidden = true
+        view.layer.addSublayer(guides)
         _ = view.registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) {
             [weak self] (_: UIView, _: UITraitCollection) in
             self?.onTraitChange?()
@@ -45,29 +53,12 @@ final class OverlayKit {
     func attach(_ host: CanvasHost) {
         self.host = host
         host.canvasView.addSubview(view)
-        hoverRelay.onChange = { [weak self] g in self?.hovered(g) }
-        let hover = UIHoverGestureRecognizer(target: hoverRelay, action: #selector(HoverRelay.changed(_:)))
-        hover.cancelsTouchesInView = false
-        hover.delegate = hoverRelay
-        host.canvasView.addGestureRecognizer(hover)
-        hoverRecognizer = hover
         fit()
     }
 
     func detach() {
-        if let g = hoverRecognizer { g.view?.removeGestureRecognizer(g) }
-        hoverRecognizer = nil
-        hoverRelay.onChange = nil
         view.removeFromSuperview()
         host = nil
-    }
-
-    private func hovered(_ g: UIHoverGestureRecognizer) {
-        guard let host = host else { return }
-        switch g.state {
-        case .began, .changed: onHover?(g.location(in: host.canvasView))
-        default: onHover?(nil)
-        }
     }
 
     /// Keeps the overlay over the canvas content, so VoiceOver finds its elements wherever the page scrolls.
@@ -84,14 +75,8 @@ final class OverlayKit {
 
     // MARK: Mapping
 
-    /// Page → canvas-view transform for `page` (scroll, zoom and page rotation), taken from the host's own mapping.
-    func transform(page: PageID) -> CGAffineTransform? {
-        guard let host = host, host.pageFrame(page) != nil else { return nil }
-        let o = host.viewPoint(.zero, page: page)
-        let x = host.viewPoint(Point(1, 0), page: page)
-        let y = host.viewPoint(Point(0, 1), page: page)
-        return CGAffineTransform(a: x.x - o.x, b: x.y - o.y, c: y.x - o.x, d: y.y - o.y, tx: o.x, ty: o.y)
-    }
+    /// Page → canvas-view transform for `page` (scroll, zoom and page rotation).
+    func transform(page: PageID) -> CGAffineTransform? { host?.pageTransform(page) }
 
     static func page(_ v: CGPoint, _ t: CGAffineTransform) -> Point { Point(v.applying(t.inverted())) }
 
@@ -104,35 +89,25 @@ final class OverlayKit {
         return (OverlayKit.page(v, t), v)
     }
 
+    /// A hover sample in canvas-view coordinates (nil when the hover ended).
+    func hoverPoint(_ sample: CanvasSample?) -> CGPoint? {
+        guard let s = sample, let host = host else { return nil }
+        return host.viewPoint(s.location, page: s.page)
+    }
+
     // MARK: Drawing
 
     private func tone(_ c: UIColor) -> CGColor { c.resolvedColor(with: view.traitCollection).cgColor }
 
-    /// A rigid handle bead: accent when attached (and for Quick Diagramming dots), open when free, a small wash for
-    /// "add bend".
-    func bead(_ kind: Bead, at c: CGPoint) -> CALayer {
-        let d = kind == .ghost ? OverlayKit.ghostDiameter : OverlayKit.beadDiameter
+    /// The small "add bend" bead: an accent wash with a thin accent outline.
+    func ghost(at c: CGPoint) -> CALayer {
+        let d = OverlayKit.ghostDiameter
         let layer = CAShapeLayer()
         layer.frame = CGRect(x: c.x - d / 2, y: c.y - d / 2, width: d, height: d)
-        let path = CGPath(ellipseIn: layer.bounds, transform: nil)
-        layer.path = path
-        switch kind {
-        case .anchored, .dot:
-            layer.fillColor = tone(NibUIColor.accent)
-            layer.strokeColor = tone(NibUIColor.onAccent)
-            layer.lineWidth = 1.5
-        case .open:
-            layer.fillColor = tone(NibUIColor.onAccent)
-            layer.strokeColor = tone(NibUIColor.accent)
-            layer.lineWidth = 1.5
-        case .ghost:
-            layer.fillColor = tone(NibUIColor.accentWash)
-            layer.strokeColor = tone(NibUIColor.accent)
-            layer.lineWidth = 1
-        }
-        if kind != .ghost {
-            layer.nibElevation(.rest, path: path, dark: view.traitCollection.userInterfaceStyle == .dark)
-        }
+        layer.path = CGPath(ellipseIn: layer.bounds, transform: nil)
+        layer.fillColor = tone(NibUIColor.accentWash)
+        layer.strokeColor = tone(NibUIColor.accent)
+        layer.lineWidth = NibStroke.thin
         return layer
     }
 
@@ -152,10 +127,10 @@ final class OverlayKit {
         layer.path = path
         layer.fillColor = nil
         layer.strokeColor = tone(NibUIColor.accent)
-        layer.lineWidth = dashed ? 1 : 1.5
+        layer.lineWidth = dashed ? NibStroke.thin : NibStroke.emphasis
         layer.lineCap = .round
         layer.lineJoin = .round
-        if dashed { layer.lineDashPattern = [4, 4] }
+        if dashed { layer.lineDashPattern = NibStroke.layerDash }
         return layer
     }
 
@@ -167,19 +142,51 @@ final class OverlayKit {
         layer.path = path
         layer.fillColor = tone(NibUIColor.accentWash)
         layer.strokeColor = tone(NibUIColor.accent)
-        layer.lineWidth = 1
+        layer.lineWidth = NibStroke.thin
         return layer
     }
 
     /// Replaces everything drawn, with implicit animations off: handles move with the content, never on their own.
-    func show(_ layers: [CALayer]) {
+    /// `beads` are drawn over `layers`, ghosts as small washes, the rest as `NibHandleView`s.
+    func show(_ layers: [CALayer], beads: [(kind: Bead, at: CGPoint)] = []) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        view.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        layers.forEach { view.layer.addSublayer($0) }
-        view.isHidden = layers.isEmpty
+        var under = layers
+        var shown = 0
+        for bead in beads {
+            let style: NibHandleView.Style
+            switch bead.kind {
+            case .ghost:
+                under.append(ghost(at: bead.at))
+                continue
+            case .anchored: style = .tinted
+            case .open: style = .clear
+            }
+            if shown == handles.count {
+                let handle = NibHandleView(style: style)
+                view.addSubview(handle)
+                handles.append(handle)
+            }
+            let handle = handles[shown]
+            if handle.style != style { handle.style = style }
+            handle.center = bead.at
+            handle.isHidden = false
+            shown += 1
+        }
+        for handle in handles[shown...] { handle.isHidden = true }
+        guides.sublayers?.forEach { $0.removeFromSuperlayer() }
+        under.forEach { guides.addSublayer($0) }
+        view.isHidden = under.isEmpty && shown == 0
         CATransaction.commit()
     }
+
+    /// The handle views on screen, for tests: whether each is tinted, and its centre (view coordinates, draw order).
+    var shownHandles: [(tinted: Bool, center: CGPoint)] {
+        handles.filter { !$0.isHidden }.map { (tinted: $0.style == .tinted, center: $0.center) }
+    }
+
+    /// How many guides (paths, rings, outlines, "add bend" washes) are drawn under the handles, for tests.
+    var guideCount: Int { guides.sublayers?.count ?? 0 }
 
     // MARK: Commands
 
@@ -200,9 +207,9 @@ final class OverlayKit {
     /// Selects `ref`: through `selection.set` when the lasso feature is installed, else directly on the session.
     func select(_ ref: String) async {
         guard let host = host else { return }
-        if host.app.commands.entry("selection.set") != nil {
-            let inv = Invocation(command: "selection.set", params: ["refs": .array([.string(ref)])], principal: .user,
-                                 session: host.session)
+        if host.app.commands.entry(CommandIDs.selectionSet) != nil {
+            let inv = Invocation(command: CommandIDs.selectionSet, params: ["refs": .array([.string(ref)])],
+                                 principal: .user, session: host.session)
             _ = try? await host.app.bus.execute(inv)
             return
         }
@@ -210,19 +217,6 @@ final class OverlayKit {
             return
         }
         host.session.selection = Selection(doc: doc, page: page, items: [id], bounds: item.bounds)
-    }
-}
-
-/// The Objective-C target UIKit needs for the hover recognizer (pointer and hovering Pencil); it never blocks the
-/// canvas's own recognizers.
-final class HoverRelay: NSObject, UIGestureRecognizerDelegate {
-    var onChange: ((UIHoverGestureRecognizer) -> Void)?
-
-    @objc func changed(_ g: UIHoverGestureRecognizer) { onChange?(g) }
-
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
-                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-        true
     }
 }
 
@@ -302,7 +296,6 @@ final class ConnectorEditor: CanvasAttachment {
 
     func attach(to host: CanvasHost) {
         kit.attach(host)
-        kit.onHover = { [weak self] p in self?.hover(p) }
         kit.onTraitChange = { [weak self] in self?.render() }
         refresh()
     }
@@ -321,6 +314,15 @@ final class ConnectorEditor: CanvasAttachment {
     func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
         target != nil && drag == nil && spot(at: viewPoint) != nil
     }
+
+    /// The pointer or a hovering Pencil over a handle rings its hit area.
+    func hover(_ sample: CanvasSample?, host: CanvasHost) {
+        hover(kit.hoverPoint(sample))
+    }
+
+    /// A tap on a handle (remove a bend, or nothing) was handled by the touch methods: it never reaches tap handlers or
+    /// the active tool, which could drop the selection.
+    func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool { true }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
         guard let t = target, let p = kit.point(sample, on: t.page), let s = spot(at: p.view) else { return }
@@ -376,8 +378,9 @@ final class ConnectorEditor: CanvasAttachment {
     }
 
     /// Commits the drag (or tap) that just ended as one `connector.setPath`: one undo step. The drag (its preview path
-    /// and handles, with the real connector still hidden) stays until the command has run, so the end of a drag never
-    /// flashes the old geometry; `hitTest` ignores new touches meanwhile.
+    /// and handles, with the real connector still hidden) stays until the command has run; then the connector shows
+    /// again and the preview goes once the tiles have been redrawn with it (`CanvasHost.afterNextRender`), so the end of
+    /// a drag never flashes the old geometry or an empty gap. `hitTest` ignores new touches meanwhile.
     private func commit(host: CanvasHost) {
         guard let d = drag, let t = target else {
             drag = nil
@@ -412,12 +415,16 @@ final class ConnectorEditor: CanvasAttachment {
         let page = t.page
         let call = JSONValue.object(params)
         Task { [weak self, kit] in
-            await kit.perform("connector.setPath", call)
-            // The edited connector (or, if the edit failed, the old one) shows again as the preview goes.
-            kit.host?.setHidden([], page: page)
-            guard let self = self else { return }
-            self.drag = nil
-            self.refresh()
+            await kit.perform(CommandIDs.connectorSetPath, call)
+            // The edited connector (or, if the edit failed, the old one) goes back into the tiles now; the preview stays
+            // over it until they are redrawn.
+            guard let host = kit.host else { return }
+            host.setHidden([], page: page)
+            host.afterNextRender(page: page) { [weak self] in
+                guard let self = self else { return }
+                self.drag = nil
+                self.refresh()
+            }
         }
     }
 
@@ -531,19 +538,27 @@ final class ConnectorEditor: CanvasAttachment {
             if let snap = d.snap { layers.insert(kit.targetOutline(snap.bounds, tf), at: 0) }
         }
         if let h = hovered, drag == nil, let s = spots.first(where: { $0.handle == h }) { layers.append(kit.hoverRing(at: s.view)) }
+        var beads: [(kind: OverlayKit.Bead, at: CGPoint)] = []
         for s in spots {
-            let kind: OverlayKit.Bead
-            switch s.handle {
-            case .end(let start): kind = (start ? c.from.item : c.to.item) != nil ? .anchored : .open
-            case .bend, .segment: kind = .open
-            case .insert: kind = .ghost
-            }
             if let d = drag, d.moved, d.handle != s.handle, case .insert = s.handle { continue }
-            layers.append(kit.bead(kind, at: s.view))
+            beads.append((kind: ConnectorEditor.bead(for: s.handle, of: c), at: s.view))
         }
-        kit.show(layers)
+        kit.show(layers, beads: beads)
         updateAccessibility(t, c)
     }
+
+    /// How a handle looks: an end attached to an item is tinted, a free end, a bend or a segment is clear, "add bend"
+    /// is a small wash.
+    static func bead(for handle: Handle, of c: ConnectorItem) -> OverlayKit.Bead {
+        switch handle {
+        case .end(let start): return (start ? c.from.item : c.to.item) != nil ? .anchored : .open
+        case .bend, .segment: return .open
+        case .insert: return .ghost
+        }
+    }
+
+    /// The handles on screen, for tests.
+    var shownHandles: [(tinted: Bool, center: CGPoint)] { kit.shownHandles }
 
     // MARK: Accessibility
 
@@ -611,7 +626,7 @@ final class ConnectorEditor: CanvasAttachment {
         var params: [String: JSONValue] = ["ref": .string(NodeRef.item(t.doc, t.page, t.item.id).description)]
         params[start ? "from" : "to"] = .object(["side": .string(side.name)])
         let call = JSONValue.object(params)
-        Task { [kit] in await kit.perform("connector.setPath", call) }
+        Task { [kit] in await kit.perform(CommandIDs.connectorSetPath, call) }
     }
 
     private func removeBend(_ i: Int, _ t: Target) {
@@ -620,6 +635,6 @@ final class ConnectorEditor: CanvasAttachment {
         bends.remove(at: i)
         let params: JSONValue = ["ref": .string(NodeRef.item(t.doc, t.page, t.item.id).description),
                                  "bends": ConnectorEditor.json(bends)]
-        Task { [kit] in await kit.perform("connector.setPath", params) }
+        Task { [kit] in await kit.perform(CommandIDs.connectorSetPath, params) }
     }
 }

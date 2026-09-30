@@ -287,6 +287,7 @@ struct ConnectorSetPath: NibCommand {
         guard !item.locked else {
             throw NibError(.invalidParams, "connector \(id) is locked", path: "$.ref", hint: "unlock it with item.setLocked first")
         }
+        let original = c
         if let r = p.route, r != c.route {
             c.route = r
             if p.bends == nil { c.bends = [] }
@@ -301,6 +302,8 @@ struct ConnectorSetPath: NibCommand {
         let from = try DiagramRefs.edited(p.from, current: c.from, doc: doc, page: page, in: ws, path: "$.from")
         let to = try DiagramRefs.edited(p.to, current: c.to, doc: doc, page: page, in: ws, path: "$.to")
         (c.from, c.to) = Anchoring.ends(from, to)
+        // Nothing to change (the route the menu shows checked, a tap that moved nothing): no write, no undo step.
+        guard c != original else { return NoResult() }
         item.connector = c
         try ctx.mutate { (tx: DocTransaction) -> Void in _ = try tx.put(item, doc: doc, page: page) }
         return NoResult()
@@ -728,10 +731,8 @@ struct DiagramCreate: NibCommand {
                                           label: label)
             connectors.append(Item.makeConnector(connector, layer: layer))
         }
-        try ctx.mutate { (tx: DocTransaction) -> Void in
-            for item in shapes { try tx.put(item, doc: doc, page: page) }
-            for item in connectors { try tx.put(item, doc: doc, page: page) }
-        }
+        // One batch write (linear in the items), shapes first so they sit under their connectors.
+        try ctx.mutate { (tx: DocTransaction) -> Void in _ = try tx.put(shapes + connectors, doc: doc, page: page) }
         return Output(refs: shapes.map { NodeRef.item(doc, page, $0.id).description },
                       connectors: connectors.map { NodeRef.item(doc, page, $0.id).description })
     }
