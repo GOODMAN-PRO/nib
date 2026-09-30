@@ -82,24 +82,55 @@ final class DiagramLayoutTests: XCTestCase {
         }
     }
 
+    /// A random flow of `n` nodes and `m` edges (after a chain through every node when `chained`).
+    func randomFlow(_ n: Int, edges m: Int, seed: UInt64, chained: Bool) -> (boxes: [NodeBox], edges: [(Int, Int)]) {
+        var rng = SeededGenerator(state: seed)
+        var edges: [(Int, Int)] = chained ? (1..<n).map { ($0 - 1, $0) } : []
+        while edges.count < m {
+            let u = Int.random(in: 0..<n, using: &rng), v = Int.random(in: 0..<n, using: &rng)
+            if u != v { edges.append((u, v)) }
+        }
+        return ((0..<n).map { i in DiagramLayout.nodeBox(label: "Step \(i)", fontSize: 15) }, edges)
+    }
+
+    /// Seconds this machine takes, right now, for a fixed piece of value-type work of the kind the layout does
+    /// (sorting and walking arrays of doubles): the quickest of three runs, so one hiccup does not count.
+    func machineUnit() -> Double {
+        var rng = SeededGenerator(state: 1)
+        let values = (0..<5_000).map { _ in Double.random(in: 0...1, using: &rng) }
+        var best = Double.infinity
+        var total = 0.0
+        for _ in 0..<3 {
+            let start = Date()
+            for k in 0..<4 { total += values.sorted()[k * 100] + values.reduce(0, +) }
+            best = min(best, Date().timeIntervalSince(start))
+        }
+        XCTAssertTrue(total.isFinite)
+        return best
+    }
+
     func testFlowAtTheCapsStaysFastAndEditable() {
         // diagram.create's caps are 200 nodes and 600 edges. A random graph that size layers 100–200 deep with
         // 15k–28k dummy slots; the sweep budget and the Fenwick crossing count keep the layout quick.
-        let budget = 0.5
+        //
+        // The time limit follows the machine: a fixed piece of work timed just before and just after the layout
+        // (`machineUnit`) stands for how fast this machine is right now, so a slow or loaded CI runner stretches the
+        // limit as much as it slows the layout. The caps may take `ratio` units; a blowup like the 300-million-pair
+        // crossing count this layout replaced is far past that on any machine. On a quick machine `budget` (seconds)
+        // is the limit, as before.
+        let budget = 2.0
+        let ratio = 50.0
         for (seed, chained) in [(UInt64(7), false), (UInt64(8), true)] {
-            var rng = SeededGenerator(state: seed)
-            let n = 200
-            var edges: [(Int, Int)] = chained ? (1..<n).map { ($0 - 1, $0) } : []
-            while edges.count < 600 {
-                let u = Int.random(in: 0..<n, using: &rng), v = Int.random(in: 0..<n, using: &rng)
-                if u != v { edges.append((u, v)) }
-            }
-            let boxes = (0..<n).map { i in DiagramLayout.nodeBox(label: "Step \(i)", fontSize: 15) }
+            let graph = randomFlow(200, edges: 600, seed: seed, chained: chained)
+            let before = machineUnit()
             let start = Date()
-            let r = DiagramLayout.layout(boxes, edges: edges, kind: .flow)
+            let r = DiagramLayout.layout(graph.boxes, edges: graph.edges, kind: .flow)
             let elapsed = Date().timeIntervalSince(start)
-            XCTAssertLessThan(elapsed, budget * 4, "a flow at the caps took \(elapsed) s")
-            XCTAssertEqual(r.frames.count, n)
+            let unit = max(before, machineUnit())
+            print("flow at the caps: \(elapsed) s; machine unit: \(unit) s; \(elapsed / unit) units")
+            XCTAssertLessThan(elapsed, max(budget, unit * ratio),
+                              "a flow at the caps took \(elapsed) s (\(elapsed / unit) units of \(unit) s)")
+            XCTAssertEqual(r.frames.count, 200)
             XCTAssertTrue(overlapping(r.frames).isEmpty)
             for route in r.edges {
                 XCTAssertLessThanOrEqual(route.bends.count, ConnectorRouter.maxBends)
