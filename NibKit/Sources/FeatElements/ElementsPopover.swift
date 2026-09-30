@@ -146,7 +146,7 @@ final class ElementsModel: ObservableObject {
         self.app = app
         self.session = session
         current = app.settings.get(ElementSettings.lastCollection)
-        catalog = ElementCatalog(services: app.services, clock: app.clock)
+        catalog = ElementCatalog(app: app)
         gifState = GiphyKey.load() == nil ? .needsKey : .idle
         hasSelection = ElementsModel.selectable(session.selection, doc: session.document)
         session.$selection
@@ -170,13 +170,13 @@ final class ElementsModel: ObservableObject {
         if subscription == nil {
             // Another device, a plugin or the AI changed the library: show it.
             subscription = app.events.subscribe { [weak self] event in
-                guard event.type == ElementEvents.changed else { return }
+                guard event.type == NibEventType.elementsChanged else { return }
                 Task { @MainActor in await self?.reload() }
             }
         }
         // A library opened after launch gets its starter collections here, as `FeatElementsFeature.start` does for
         // the launch library (read commands never write them). Once per library and device, so usually a no-op.
-        let catalog = ElementCatalog(services: app.services, clock: app.clock)
+        let catalog = ElementCatalog(app: app)
         _ = try? await ElementIO.run { catalog.prepare() }
         await reload()
     }
@@ -186,7 +186,11 @@ final class ElementsModel: ObservableObject {
         subscription = nil
     }
 
-    var canInsert: Bool { session.document != nil && session.page != nil && !session.readOnly }
+    /// A page is open in an editable view of a document Nib can write (not saved by a newer Nib, contracts-v2 G2).
+    var canInsert: Bool {
+        guard let doc = session.document, session.page != nil, !session.readOnly else { return false }
+        return !app.isReadOnly(doc)
+    }
     var currentCollection: ElementCollectionInfo? { collections.first { $0.id == current } }
     var currentIsWritable: Bool { currentCollection.map { !$0.readOnly } ?? false }
 
@@ -197,7 +201,7 @@ final class ElementsModel: ObservableObject {
     // MARK: Loading (through the query commands)
 
     func reload() async {
-        catalog = ElementCatalog(services: app.services, clock: app.clock)
+        catalog = ElementCatalog(app: app)
         guard let list = await call(ElementCollectionList.self, ElementCollectionList.Params()) else { return }
         collections = list.collections
         lists = [:]
@@ -281,12 +285,12 @@ final class ElementsModel: ObservableObject {
         return true
     }
 
-    /// Back to the tool that was active before Elements (`tool.select`), when Elements is still the active tool.
+    /// One use of the non-sticky Elements tool is over (contracts-v2 G15 `finishToolUse`): back to a temporary return
+    /// tool, else to the tool used before Elements, and `tool.finished` for the palette. Only while Elements is still the
+    /// active tool (the user may have switched while the insert ran).
     func handBack() async {
-        guard session.tool == ElementsTool.toolID, let previous = session.previousTool, previous != ElementsTool.toolID else {
-            return
-        }
-        await execute(CommandIDs.toolSelect, ["tool": .string(previous)])
+        guard session.tool == ElementsTool.toolID else { return }
+        session.finishToolUse(sticky: false)
     }
 
     func createFromSelection() async {
@@ -309,7 +313,7 @@ final class ElementsModel: ObservableObject {
         if let at = insertionPoint(page) { params["at"] = .array(at.map { .number($0) }) }
         let json = JSONValue.object(params)
         Task {
-            guard await execute("image.insert", json) else { return }
+            guard await execute(CommandIDs.imageInsert, json) else { return }
             await handBack()
         }
     }
@@ -342,7 +346,7 @@ final class ElementsModel: ObservableObject {
             await reload()
         case .gifLink:
             guard let url = URL(string: text), let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
-                report("image.insert", NibError.invalid("that is not a web address", path: "$.url"))
+                report(CommandIDs.imageInsert, NibError.invalid("that is not a web address", path: "$.url"))
                 return
             }
             insertGIF(url: url.absoluteString)
@@ -407,7 +411,7 @@ final class ElementsModel: ObservableObject {
         do {
             local = try ElementFiles.copyToTemporary(url)
         } catch {
-            report(picker == .gif ? "image.insert" : ElementImport.descriptor.id, error)
+            report(picker == .gif ? CommandIDs.imageInsert : ElementImport.descriptor.id, error)
             return
         }
         switch picker {
@@ -477,19 +481,28 @@ final class ElementsModel: ObservableObject {
 
     // MARK: Elsewhere
 
-    /// The plugin gallery's library tab (F080), where content packs of elements are installed. Only decides whether
-    /// the Marketplace button shows; opening goes through `panel.open`, like every other caller.
-    var galleryPanel: PanelDescriptor? {
-        app.ui.panels.all.first { $0.owner == "pluginmanager" && $0.placement == .libraryTab }
-    }
+    /// The plugin gallery (F080, `PanelIDs.gallery`, contracts-v2 G18), where content packs of elements are
+    /// installed. The Marketplace button shows only while it is registered.
+    var galleryPanel: PanelDescriptor? { app.ui.panels.get(PanelIDs.gallery) }
 
-    func openGallery() {
+    /// Get More Elements: the Gallery is a library tab, which has no place in a document, so the window goes back to
+    /// the library first (`window.showLibrary`), then `panel.open` hands the tab to the library (spec pass 2).
+    func openGallery() async {
         guard let panel = galleryPanel else { return }
-        app.perform(CommandIDs.panelOpen, ["id": .string(panel.id)], session: session)
+        if panel.placement == .libraryTab, session.document != nil {
+            guard await execute(CommandIDs.windowShowLibrary, .object([:])) else { return }
+        }
+        await execute(CommandIDs.panelOpen, ["id": .string(panel.id)])
     }
 
+    /// Settings › Elements and GIFs through `settings.open {page}` (F027), which opens Settings at that page; the
+    /// window's navigator when Settings is not installed.
     func openSettings() {
-        app.ui.activeNavigator?.showSettings(page: ElementsSettingsPage.id)
+        if app.commands.entry(CommandIDs.settingsOpen) != nil {
+            app.perform(CommandIDs.settingsOpen, ["page": .string(ElementsSettingsPage.id)], session: session)
+        } else {
+            app.ui.activeNavigator?.showSettings(page: ElementsSettingsPage.id)
+        }
     }
 
     // MARK: Dragging
@@ -499,10 +512,10 @@ final class ElementsModel: ObservableObject {
     func dragProvider(_ element: ElementInfo) -> NSItemProvider {
         let provider = NSItemProvider()
         let catalog = self.catalog
-        provider.registerDataRepresentation(forTypeIdentifier: ElementFragment.typeIdentifier, visibility: .ownProcess) { completion in
+        provider.registerDataRepresentation(forTypeIdentifier: NibFragment.typeIdentifier, visibility: .ownProcess) { completion in
             ElementIO.queue.async {
                 do {
-                    completion(try catalog.fragment(element.collection, element.id).fragment.encoded(), nil)
+                    completion(try ElementFragments.encoded(catalog.fragment(element.collection, element.id).fragment), nil)
                 } catch {
                     completion(nil, error)
                 }
@@ -662,7 +675,7 @@ struct ElementsStickersPane: View {
             ElementsCollectionBar(model: model)
             if model.galleryPanel != nil {
                 NibButton(String(localized: "Get More Elements"), symbol: .gallery, kind: .plain, size: .compact) {
-                    model.openGallery()
+                    Task { await model.openGallery() }
                 }
             }
         }
@@ -774,7 +787,7 @@ struct ElementsCollectionBar: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: NibSpacing.s) {
                     ForEach(model.collections) { c in
-                        NibChip(c.title, style: .filter(isSelected: c.id == model.current)) { model.select(c.id) }
+                        NibChip(c.title, style: .filter(isSelected: c.id == model.current), action: { model.select(c.id) })
                             .accessibilityAddTraits(c.id == model.current ? .isSelected : [])
                             .accessibilityValue(ElementCopy.count(c.count))
                     }
@@ -859,7 +872,8 @@ struct ElementsGIFPane: View {
                 }
                 HStack(spacing: NibSpacing.s) {
                     ForEach(GiphyKind.allCases, id: \.self) { kind in
-                        NibChip(kind.title, style: .filter(isSelected: model.gifKind == kind)) { model.setGIFKind(kind) }
+                        NibChip(kind.title, style: .filter(isSelected: model.gifKind == kind),
+                                action: { model.setGIFKind(kind) })
                             .accessibilityAddTraits(model.gifKind == kind ? .isSelected : [])
                     }
                 }
@@ -1009,8 +1023,8 @@ final class ElementThumbnails {
 /// Draws a fragment into a square preview: strokes as their outlines, shapes, text boxes, images, sticky notes, maths
 /// and custom display lists. Thread-safe (runs on `ElementIO.queue`); page content, so page colours, not chrome.
 enum ElementRenderer {
-    static func image(_ f: ElementFragment, side: CGFloat, scale: CGFloat) -> UIImage? {
-        let b = ElementFragment.union(f.items)
+    static func image(_ f: NibFragment, side: CGFloat, scale: CGFloat) -> UIImage? {
+        let b = NibFragment.union(f.items)
         guard !f.items.isEmpty, b.width > 0 || b.height > 0 else { return nil }
         let inset: CGFloat = 2
         let k = min((side - 2 * inset) / CGFloat(max(b.width, 1)), (side - 2 * inset) / CGFloat(max(b.height, 1)))
@@ -1320,12 +1334,7 @@ struct ElementsSettingsView: View {
                         .font(NibFont.body)
                     }
                 } else {
-                    SecureField(String(localized: "Paste your GIPHY API key"), text: $draftKey)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(NibFont.body)
-                        .frame(minHeight: NibMetrics.hitTarget)
-                        .onSubmit(saveKey)
+                    NibSecureField(text: $draftKey, prompt: String(localized: "Paste your GIPHY API key"), onSubmit: saveKey)
                     Button(String(localized: "Save Key"), action: saveKey)
                         .font(NibFont.body)
                         .frame(minHeight: NibMetrics.hitTarget)

@@ -5,238 +5,47 @@ import ZIPFoundation
 
 // MARK: - Fragment (the element format)
 
-/// An element's content in the clipboard fragment format (UTI `app.nib.fragment`, shared with F014):
-/// `{"format": "nib-fragment/1", "items": [Item], "assets": {name: base64}, "bounds": [x, y, w, h]}`.
-/// Stored elements start at the origin; `instantiated` lands them on a page with fresh ids.
-struct ElementFragment: Equatable {
-    static let format = "nib-fragment/1"
-    static let typeIdentifier = "app.nib.fragment"
+/// An element's content is a `NibFragment` ("nib-fragment/1", UTI `app.nib.fragment`, the clipboard's format, contracts-v2
+/// G23). What elements add on top of it: stored elements start at the origin, every asset an item names must travel
+/// with it, comments are never part of an element, and an element lands on a page placed and scaled
+/// (`ElementPlacement`), not only moved.
+enum ElementFragments {
+    /// `items` moved so their bounds start at the origin, with provenance and revisions stripped (`NibFragment.make`),
+    /// carrying the bytes of every asset they reference (`assetData` throws for a missing asset).
+    static func make(items: [Item], assetData: (AssetRef) throws -> Data) rethrows -> NibFragment {
+        let b = NibFragment.union(items)
+        let move = Affine.translation(-b.minX, -b.minY)
+        let moved = items.map { $0.transformed(by: move) }
+        var bytes: [String: Data] = [:]
+        for ref in moved.flatMap(NibFragment.assetRefs) where bytes[ref.name] == nil {
+            bytes[ref.name] = try assetData(ref)
+        }
+        return NibFragment.make(items: moved) { bytes[$0.name] }
+    }
 
-    var items: [Item]
-    /// Asset bytes keyed by the asset name the items reference.
-    var assets: [String: Data]
-    var bounds: Rect
+    /// The live items `ids` (in that order), then everything attached to them (`NibFragment.expand`). Comments are
+    /// left out even when named: they discuss an object, they are not part of it.
+    static func expand(_ ids: [ElementID], in pageItems: [Item]) -> [Item] {
+        NibFragment.expand(ids, in: pageItems.filter { $0.kind != .comment })
+    }
 
-    init(items: [Item], assets: [String: Data] = [:], bounds: Rect? = nil) {
-        self.items = items
-        self.assets = assets
-        self.bounds = bounds ?? ElementFragment.union(items)
+    /// The items ready to write (`NibFragment.instantiated`: fresh ids, z above `zAfter`, references and assets
+    /// remapped, `layer` applied) after `transform` places and scales them.
+    static func instantiate(_ f: NibFragment, transform t: Affine, ids: [NibID] = [], zAfter: String?, layer: Int?,
+                            assets assetMap: [String: AssetRef] = [:]) -> [Item] {
+        let placed = t == .identity ? f : NibFragment(items: f.items.map { $0.transformed(by: t) }, assets: f.assets)
+        return placed.instantiated(translate: .zero, ids: ids, zAfter: zAfter, layer: layer, assets: assetMap)
     }
 
     /// Item kinds in the fragment, sorted ("image", "shape", …).
-    var kinds: [String] { Array(Set(items.map { $0.kind.rawValue })).sorted() }
+    static func kinds(_ f: NibFragment) -> [String] { Array(Set(f.items.map { $0.kind.rawValue })).sorted() }
 
-    // MARK: Building
-
-    /// `items` moved so their bounds start at the origin, with provenance and revisions stripped, carrying the bytes
-    /// of every asset they reference (`assetData` throws for a missing asset).
-    static func make(items: [Item], assetData: (AssetRef) throws -> Data) rethrows -> ElementFragment {
-        let b = union(items)
-        let move = Affine.translation(-b.minX, -b.minY)
-        var assets: [String: Data] = [:]
-        var clean: [Item] = []
-        clean.reserveCapacity(items.count)
-        for item in items {
-            var n = item.transformed(by: move)
-            n.rev = .zero
-            n.createdBy = nil
-            n.deleted = false
-            for ref in assetRefs(n) where assets[ref.name] == nil {
-                assets[ref.name] = try assetData(ref)
-            }
-            clean.append(n)
+    /// The fragment's JSON (`NibFragment.encoded`), as a throwing call for the file writers.
+    static func encoded(_ f: NibFragment) throws -> Data {
+        guard let data = f.encoded() else {
+            throw NibError(.internalError, "the element could not be written as a Nib fragment")
         }
-        return ElementFragment(items: clean, assets: assets)
-    }
-
-    /// The live items `ids` (in that order), then everything attached to them, so a container carries its contents.
-    /// Comments are left out: they discuss an object, they are not part of it.
-    static func expand(_ ids: [ElementID], in pageItems: [Item]) -> [Item] {
-        let live = pageItems.filter { !$0.deleted && $0.kind != .comment }
-        var byID: [ElementID: Item] = [:]
-        for item in live where byID[item.id] == nil { byID[item.id] = item }
-        var chosen = Set<ElementID>()
-        var out: [Item] = []
-        for id in ids {
-            if let item = byID[id], chosen.insert(id).inserted { out.append(item) }
-        }
-        var grew = !out.isEmpty
-        while grew {
-            grew = false
-            for item in live where !chosen.contains(item.id) {
-                if let parent = item.attachedTo, chosen.contains(parent) {
-                    chosen.insert(item.id)
-                    out.append(item)
-                    grew = true
-                }
-            }
-        }
-        return out
-    }
-
-    // MARK: Landing on a page
-
-    /// The items ready to write: new ids (`ids` in creation order, the rest minted), z keys above `zAfter` in the
-    /// fragment's own z order, geometry moved by `transform`, references remapped (`attachedTo` and connector anchors
-    /// that point outside the fragment are dropped, the connector end stays where it is), asset names mapped through
-    /// `assets`, and `layer` applied when given.
-    func instantiated(transform t: Affine, ids: [NibID] = [], zAfter: String?, layer: Int?,
-                      assets assetMap: [String: AssetRef] = [:]) -> [Item] {
-        var newIDs: [ElementID] = []
-        var map: [ElementID: ElementID] = [:]
-        for (i, item) in items.enumerated() {
-            let fresh = i < ids.count ? ids[i] : NibID.make()
-            newIDs.append(fresh)
-            if map[item.id] == nil { map[item.id] = fresh }
-        }
-        let order = items.indices.sorted { a, b in
-            (items[a].z, items[a].id.raw, a) < (items[b].z, items[b].id.raw, b)
-        }
-        let keys = FractionalIndex.sequence(after: zAfter, count: items.count)
-        var z = [String](repeating: "", count: items.count)
-        for (k, i) in order.enumerated() { z[i] = keys[k] }
-        let identity = t == .identity
-
-        var out: [Item] = []
-        out.reserveCapacity(items.count)
-        for i in items.indices {
-            let source = items[i]
-            var n = identity ? source : source.transformed(by: t)
-            n.id = newIDs[i]
-            n.rev = .zero
-            n.deleted = false
-            n.createdBy = nil
-            n.z = z[i]
-            n.attachedTo = source.attachedTo.flatMap { map[$0] }
-            if var c = n.connector {
-                c.from = ElementFragment.remap(c.from, map)
-                c.to = ElementFragment.remap(c.to, map)
-                n.connector = c
-            }
-            if var s = n.stroke {
-                InkModel.prepare(&s)                  // synthetic (plugin / pack) ink gets nib sizes; captured ink is untouched
-                n.stroke = s
-            }
-            if !assetMap.isEmpty { ElementFragment.mapAssets(&n) { assetMap[$0.name] ?? $0 } }
-            n.layer = min(max(layer ?? n.layer, 0), NibLimits.layerCount - 1)
-            out.append(n)
-        }
-        return out
-    }
-
-    private static func remap(_ end: ConnectorEnd, _ map: [ElementID: ElementID]) -> ConnectorEnd {
-        guard let target = end.item else { return end }
-        guard let mapped = map[target] else { return ConnectorEnd(point: end.point) }
-        var e = end
-        e.item = mapped
-        return e
-    }
-
-    // MARK: Assets
-
-    /// Rewrites every asset reference an item holds: image, tape pattern, custom display ops and inline text glyphs.
-    static func mapAssets(_ item: inout Item, _ f: (AssetRef) -> AssetRef) {
-        if var image = item.image {
-            image.asset = f(image.asset)
-            item.image = image
-        }
-        if var stroke = item.stroke, let pattern = stroke.style.tapePattern {
-            stroke.style.tapePattern = f(pattern)
-            item.stroke = stroke
-        }
-        if var custom = item.custom {
-            for i in custom.display.ops.indices {
-                if let a = custom.display.ops[i].asset { custom.display.ops[i].asset = f(a) }
-            }
-            item.custom = custom
-        }
-        if var text = item.text {
-            mapRich(&text.text, f)
-            item.text = text
-        }
-        if var sticky = item.sticky {
-            mapRich(&sticky.text, f)
-            item.sticky = sticky
-        }
-        if var shape = item.shape, var label = shape.text {
-            mapRich(&label, f)
-            shape.text = label
-            item.shape = shape
-        }
-        if var connector = item.connector, var label = connector.label {
-            mapRich(&label, f)
-            connector.label = label
-            item.connector = connector
-        }
-    }
-
-    private static func mapRich(_ t: inout RichText, _ f: (AssetRef) -> AssetRef) {
-        for p in t.paragraphs.indices {
-            for r in t.paragraphs[p].runs.indices {
-                if let a = t.paragraphs[p].runs[r].attrs.attachment { t.paragraphs[p].runs[r].attrs.attachment = f(a) }
-            }
-        }
-    }
-
-    static func assetRefs(_ item: Item) -> [AssetRef] {
-        var out: [AssetRef] = []
-        var probe = item
-        mapAssets(&probe) { ref in
-            if !out.contains(ref) { out.append(ref) }
-            return ref
-        }
-        return out
-    }
-
-    // MARK: Helpers
-
-    static func union(_ items: [Item]) -> Rect {
-        guard let first = items.first else { return .zero }
-        return items.dropFirst().reduce(first.bounds) { $0.union($1.bounds) }
-    }
-
-    static func decode(_ data: Data) throws -> ElementFragment {
-        do {
-            return try JSONDecoder().decode(ElementFragment.self, from: data)
-        } catch {
-            throw NibError(.invalidParams, "the element could not be read (\(error.localizedDescription))",
-                           hint: "elements are nib-fragment/1 JSON, as the clipboard writes it")
-        }
-    }
-
-    func encoded() throws -> Data { try JSONEncoder().encode(self) }
-}
-
-extension ElementFragment: Codable {
-    enum CodingKeys: String, CodingKey { case format, items, assets, bounds }
-
-    /// Lenient: `format` may be left out (content packs, AI JSON); `assets` defaults to none and `bounds` to the union
-    /// of the items. A different format version is refused.
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        if let f = try c.decodeIfPresent(String.self, forKey: .format), f != ElementFragment.format {
-            throw DecodingError.dataCorruptedError(forKey: .format, in: c,
-                                                   debugDescription: "unsupported fragment format '\(f)'; expected \(ElementFragment.format)")
-        }
-        let items = try c.decodeIfPresent([Item].self, forKey: .items) ?? []
-        var assets: [String: Data] = [:]
-        for (name, b64) in try c.decodeIfPresent([String: String].self, forKey: .assets) ?? [:] {
-            guard let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters) else {
-                throw DecodingError.dataCorruptedError(forKey: .assets, in: c, debugDescription: "asset '\(name)' is not base64")
-            }
-            assets[name] = data
-        }
-        self.items = items
-        self.assets = assets
-        self.bounds = try c.decodeIfPresent(Rect.self, forKey: .bounds) ?? ElementFragment.union(items)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(ElementFragment.format, forKey: .format)
-        try c.encode(items, forKey: .items)
-        try c.encode(assets.mapValues { $0.base64EncodedString() }, forKey: .assets)
-        try c.encode(bounds, forKey: .bounds)
+        return data
     }
 }
 
@@ -394,7 +203,7 @@ struct StarterCollection {
 struct StarterElement {
     let id: String
     let title: String
-    let fragment: ElementFragment
+    let fragment: NibFragment
 }
 
 /// The user's element collections on disk. One folder per collection holding the element fragments
@@ -407,7 +216,7 @@ final class ElementStore {
     static let maxTitleLength = 120
 
     let root: URL
-    /// This device's file suffix (8 hex digits of the app clock's device id, like `DeviceIdentity.hex`).
+    /// This device's file suffix (`HLCClock.deviceHex`: 8 lowercase hex digits of the device id).
     let device: String
     private let tick: () -> Rev
     /// Advances the app clock past revisions read from other devices' files (`HLCClock.observe`), so an edit made
@@ -416,16 +225,21 @@ final class ElementStore {
     private var fm: FileManager { FileManager.default }
     private static let log = Logger(subsystem: "app.nib", category: "elements")
 
-    init(metadataURL: URL, device: UInt32, tick: @escaping () -> Rev, observe: @escaping (Rev) -> Void = { _ in }) {
+    init(metadataURL: URL, deviceHex: String, tick: @escaping () -> Rev, observe: @escaping (Rev) -> Void = { _ in }) {
         root = metadataURL.appendingPathComponent(ElementStore.folderName, isDirectory: true)
-        self.device = String(format: "%08x", device)
+        device = deviceHex
         self.tick = tick
         self.observe = observe
     }
 
-    /// The store of a library on this app's clock.
+    /// A store for the device `device` (tests and tools; the app uses its clock).
+    convenience init(metadataURL: URL, device: UInt32, tick: @escaping () -> Rev, observe: @escaping (Rev) -> Void = { _ in }) {
+        self.init(metadataURL: metadataURL, deviceHex: HLCClock(device: device).deviceHex, tick: tick, observe: observe)
+    }
+
+    /// The store of a library on this app's clock (`HLCClock.deviceHex` names this device's files).
     convenience init(metadataURL: URL, clock: HLCClock) {
-        self.init(metadataURL: metadataURL, device: clock.device, tick: { clock.tick() }, observe: { clock.observe($0) })
+        self.init(metadataURL: metadataURL, deviceHex: clock.deviceHex, tick: { clock.tick() }, observe: { clock.observe($0) })
     }
 
     func folder(_ c: String) -> URL { root.appendingPathComponent(c, isDirectory: true) }
@@ -537,11 +351,11 @@ final class ElementStore {
         }
     }
 
-    private func writeFragment(_ fragment: ElementFragment, id: String, in c: String) throws -> String {
+    private func writeFragment(_ fragment: NibFragment, id: String, in c: String) throws -> String {
         let dir = folder(c)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = "\(id).\(device).json"
-        try fragment.encoded().write(to: dir.appendingPathComponent(file), options: .atomic)
+        try ElementFragments.encoded(fragment).write(to: dir.appendingPathComponent(file), options: .atomic)
         return file
     }
 
@@ -622,7 +436,7 @@ final class ElementStore {
     }
 
     func addElement(_ c: String, id: String, title: String?, defaultTitle: (Int) -> String,
-                    fragment: ElementFragment) throws -> ElementRecord {
+                    fragment: NibFragment) throws -> ElementRecord {
         let loaded = try requireLiveLoad(c)
         var idx = loaded.index
         let lower = id.lowercased()
@@ -637,7 +451,7 @@ final class ElementStore {
         let file = try writeFragment(fragment, id: id, in: c)
         let record = ElementRecord(id: NibID(id), rev: tick(), title: title ?? defaultTitle(live.count + 1),
                                    order: FractionalIndex.between(live.last?.order, nil), file: file,
-                                   kinds: fragment.kinds, count: fragment.items.count,
+                                   kinds: ElementFragments.kinds(fragment), count: fragment.items.count,
                                    size: [fragment.bounds.width, fragment.bounds.height])
         idx.elements = LWW.merge(idx.elements, [record])
         try write(idx, to: c, merged: loaded.copies)
@@ -691,7 +505,7 @@ final class ElementStore {
             let name = element.title.trimmingCharacters(in: .whitespacesAndNewlines)
             idx.elements.append(ElementRecord(id: NibID(eid), rev: tick(),
                                               title: String((name.isEmpty ? "\(i + 1)" : name).prefix(ElementStore.maxTitleLength)),
-                                              order: keys[i], file: file, kinds: element.fragment.kinds,
+                                              order: keys[i], file: file, kinds: ElementFragments.kinds(element.fragment),
                                               count: element.fragment.items.count,
                                               size: [element.fragment.bounds.width, element.fragment.bounds.height]))
         }
@@ -736,7 +550,7 @@ final class ElementStore {
         for (i, element) in starter.elements.enumerated() {
             let file = try writeFragment(element.fragment, id: element.id, in: starter.id)
             let record = ElementRecord(id: NibID(element.id), rev: ElementStore.starterRev(i + 1), title: element.title,
-                                       order: keys[i], file: file, kinds: element.fragment.kinds,
+                                       order: keys[i], file: file, kinds: ElementFragments.kinds(element.fragment),
                                        count: element.fragment.items.count,
                                        size: [element.fragment.bounds.width, element.fragment.bounds.height])
             idx.elements = LWW.merge(idx.elements, [record])
@@ -851,19 +665,26 @@ struct ElementCatalog {
     /// Lives as long as this snapshot: the popover makes a new catalog on every reload and registry change.
     let packs = ElementPackCache()
 
+    /// `content` is where content packs register their read-only collections (`content.elementCollections`).
     @MainActor
-    init(services: NibServices, clock: HLCClock) {
+    init(services: NibServices, content: ContentRegistries, clock: HLCClock) {
         if let library = services.library {
             store = ElementStore(metadataURL: library.metadataURL, clock: clock)
         } else {
             store = nil
         }
-        plugins = services.get(ElementsRuntime.key, as: ElementsRuntime.self)?.content.elementCollections.all ?? []
+        plugins = content.elementCollections.all
     }
 
     @MainActor
+    init(app: NibApp) {
+        self.init(services: app.services, content: app.content, clock: app.clock)
+    }
+
+    /// A command's catalog: the registries through `ctx.content` (contracts-v2 G1).
+    @MainActor
     init(_ ctx: CommandContext) {
-        self.init(services: ctx.services, clock: ctx.workspace.clock)
+        self.init(services: ctx.services, content: ctx.content, clock: ctx.workspace.clock)
     }
 
     func requireStore() throws -> ElementStore {
@@ -910,8 +731,8 @@ struct ElementCatalog {
         if let d = plugin(c) {
             let entries = try loadPlugin(d)
             let elements = entries.compactMap { entry -> ElementInfo? in
-                guard let f = try? entry.fragment.decode(ElementFragment.self) else { return nil }
-                return ElementInfo(id: entry.id, collection: c, title: entry.title, kinds: f.kinds,
+                guard let f = try? entry.fragment.decode(NibFragment.self) else { return nil }
+                return ElementInfo(id: entry.id, collection: c, title: entry.title, kinds: ElementFragments.kinds(f),
                                    itemCount: f.items.count, size: [f.bounds.width, f.bounds.height])
             }
             return (ElementCollectionInfo(id: c, title: d.title, count: elements.count, readOnly: true, source: .plugin,
@@ -920,20 +741,20 @@ struct ElementCatalog {
         throw ElementStore.collectionNotFound(c)
     }
 
-    func fragment(_ c: String, _ e: String) throws -> (title: String, fragment: ElementFragment) {
+    func fragment(_ c: String, _ e: String) throws -> (title: String, fragment: NibFragment) {
         if let store = store, NibID.isValid(c) {
             let idx = store.index(c)
             if idx.isLive {
                 guard let record = idx.liveElements.first(where: { $0.id.raw == e }) else {
                     throw ElementStore.elementNotFound(e, in: c)
                 }
-                return (record.title, try ElementFragment.decode(try store.fragmentData(c, record)))
+                return (record.title, try NibFragment.decode(try store.fragmentData(c, record)))
             }
         }
         if let d = plugin(c) {
             guard let entry = try loadPluginEntry(d, e) else { throw ElementStore.elementNotFound(e, in: c) }
             do {
-                return (entry.title, try entry.fragment.decode(ElementFragment.self))
+                return (entry.title, try entry.fragment.decode(NibFragment.self))
             } catch {
                 throw NibError(.invalidParams, "element '\(e)' of '\(c)' is not a Nib fragment",
                                hint: "the content pack that provides it needs an update")
@@ -948,7 +769,7 @@ struct ElementCatalog {
         var out: [(id: String, title: String, data: Data)] = []
         for e in listed.elements {
             let loaded = try fragment(c, e.id)
-            out.append((id: e.id, title: loaded.title, data: try loaded.fragment.encoded()))
+            out.append((id: e.id, title: loaded.title, data: try ElementFragments.encoded(loaded.fragment)))
         }
         return (listed.info.title, out)
     }
@@ -980,7 +801,7 @@ struct ElementCatalog {
 struct ImportedElement {
     var id: String?
     var title: String
-    var fragment: ElementFragment
+    var fragment: NibFragment
 }
 
 struct ImportedCollection {
@@ -1105,7 +926,7 @@ enum ElementArchive {
             var elements: [ImportedElement] = []
             for e in manifest.elements ?? [] {
                 guard let file = e.file, let data = files[file] else { continue }
-                let fragment = try ElementFragment.decode(data)
+                let fragment = try NibFragment.decode(data)
                 guard !fragment.items.isEmpty else { continue }
                 elements.append(ImportedElement(id: e.id, title: e.title ?? "", fragment: fragment))
             }
@@ -1115,11 +936,11 @@ enum ElementArchive {
             for (path, data) in files.sorted(by: { $0.key < $1.key }) where path != manifestName {
                 if let list = try? JSONDecoder().decode([ElementEntry].self, from: data) {
                     for entry in list {
-                        if let f = try? entry.fragment.decode(ElementFragment.self), !f.items.isEmpty {
+                        if let f = try? entry.fragment.decode(NibFragment.self), !f.items.isEmpty {
                             elements.append(ImportedElement(id: entry.id, title: entry.title, fragment: f))
                         }
                     }
-                } else if let f = try? ElementFragment.decode(data), !f.items.isEmpty {
+                } else if let f = try? NibFragment.decode(data), !f.items.isEmpty {
                     let name = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
                     elements.append(ImportedElement(id: nil, title: name, fragment: f))
                 }

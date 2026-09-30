@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatElements
@@ -18,6 +19,29 @@ final class FakeGiphyTransport: GiphyTransport {
         }
         return (body, response)
     }
+}
+
+/// A window for `window.showLibrary` and the settings fallback: records the calls and, like the shell, leaves the
+/// document when the library shows.
+@MainActor
+final class ElementsTestNavigator: SceneNavigator {
+    let session: EditorSession
+    private(set) var librariesShown = 0
+    private(set) var settingsPages: [String?] = []
+
+    init(session: EditorSession) { self.session = session }
+
+    var openDocuments: [DocumentID] { session.document.map { [$0] } ?? [] }
+    var activeDocument: DocumentID? { session.document }
+    var rootViewController: UIViewController? { nil }
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) { session.document = doc }
+    func closeDocument(_ doc: DocumentID) {}
+    func showLibrary(folder: FolderID?) {
+        librariesShown += 1
+        session.document = nil
+    }
+    func showSettings(page: String?) { settingsPages.append(page) }
+    func presentModal(_ viewController: UIViewController) {}
 }
 
 @MainActor
@@ -42,7 +66,7 @@ final class FeatElementsTests: XCTestCase {
         }
     }
 
-    private func union(_ items: [Item]) -> Rect { ElementFragment.union(items) }
+    private func union(_ items: [Item]) -> Rect { NibFragment.union(items) }
 
     private func collectionIDs(_ value: JSONValue) -> [String] {
         value["collections"]?.arrayValue?.compactMap { $0["id"]?.stringValue } ?? []
@@ -69,8 +93,8 @@ final class FeatElementsTests: XCTestCase {
         }
     }
 
-    private static let box = ElementFragment(items: [Item.makeShape(ShapeItem(shape: .rectangle,
-                                                                              frame: Frame(x: 0, y: 0, w: 30, h: 30)))])
+    private static let box = NibFragment(items: [Item.makeShape(ShapeItem(shape: .rectangle,
+                                                                          frame: Frame(x: 0, y: 0, w: 30, h: 30)))])
 
     // MARK: Registration
 
@@ -168,7 +192,7 @@ final class FeatElementsTests: XCTestCase {
         XCTAssertEqual(imported["title"], "Revision")
         XCTAssertEqual(imported["count"], 2)
 
-        let catalog = ElementCatalog(services: h.app.services, clock: h.app.clock)
+        let catalog = ElementCatalog(app: h.app)
         let original = try catalog.list("revision").elements
         let copied = try catalog.list(copy).elements
         XCTAssertEqual(copied.map { $0.id }, ["pair", "hello"])
@@ -193,7 +217,7 @@ final class FeatElementsTests: XCTestCase {
         }
         let a = ElementStore(metadataURL: rootA, device: 0xA, tick: clock(0xA))
         let b = ElementStore(metadataURL: rootB, device: 0xB, tick: clock(0xB))
-        let shape = ElementFragment(items: [Item.makeShape(ShapeItem(shape: .ellipse, frame: Frame(x: 0, y: 0, w: 40, h: 20)))])
+        let shape = NibFragment(items: [Item.makeShape(ShapeItem(shape: .ellipse, frame: Frame(x: 0, y: 0, w: 40, h: 20)))])
         let name: (Int) -> String = { "Element \($0)" }
 
         /// A folder sync: copies one device's files into the other library.
@@ -228,7 +252,7 @@ final class FeatElementsTests: XCTestCase {
             XCTAssertEqual(merged.liveElements.first { $0.id.raw == "one" }?.title, "One (B)", "the later rename wins")
             XCTAssertTrue(merged.elements.contains { $0.id.raw == "two" && $0.deleted })
             let three = try XCTUnwrap(merged.liveElements.first { $0.id.raw == "three" })
-            XCTAssertEqual(try ElementFragment.decode(try store.fragmentData("shared", three)), shape)
+            XCTAssertEqual(try NibFragment.decode(try store.fragmentData("shared", three)), shape)
         }
         XCTAssertEqual(a.index("shared"), b.index("shared"))
 
@@ -473,7 +497,7 @@ final class FeatElementsTests: XCTestCase {
             loads += 1
             return [ElementEntry(id: "box", title: "Box", fragment: fragment)]
         })
-        let catalog = ElementCatalog(services: h.app.services, clock: h.app.clock)
+        let catalog = ElementCatalog(app: h.app)
         _ = try catalog.collections()
         _ = try catalog.list("dev.pack.boxes")
         _ = try catalog.fragment("dev.pack.boxes", "box")
@@ -500,8 +524,8 @@ final class FeatElementsTests: XCTestCase {
     func testInsertRefusesAFragmentMissingItsAssets() async throws {
         let h = harness()
         let image = Item.makeImage(ImageItem(frame: Frame(x: 0, y: 0, w: 20, h: 20), asset: AssetRef("ghost.png")))
-        let ghost = try JSONValue.from(ElementFragment(items: [image]))
-        let carried = try JSONValue.from(ElementFragment(items: [image], assets: ["ghost.png": Fixtures.pngData]))
+        let ghost = try JSONValue.from(NibFragment(items: [image]))
+        let carried = try JSONValue.from(NibFragment(items: [image], assets: ["ghost.png": Fixtures.pngData]))
         h.app.content.elementCollections.register(ElementCollectionDescriptor(id: "dev.pack.pictures", title: "Pictures",
                                                                               owner: "dev.pack") {
             [ElementEntry(id: "ghost", title: "Ghost", fragment: ghost),
@@ -551,8 +575,8 @@ final class FeatElementsTests: XCTestCase {
     }
 
     func testArchiveParsingTakesPackListsAndBareFragments() throws {
-        let fragment = ElementFragment(items: [Item.makeShape(ShapeItem(shape: .ellipse, frame: Frame(x: 0, y: 0, w: 10, h: 10)))])
-        let data = try fragment.encoded()
+        let fragment = NibFragment(items: [Item.makeShape(ShapeItem(shape: .ellipse, frame: Frame(x: 0, y: 0, w: 10, h: 10)))])
+        let data = try ElementFragments.encoded(fragment)
         let entry = ElementEntry(id: "a", title: "Alpha", fragment: try JSONDecoder().decode(JSONValue.self, from: data))
         let files: [String: Data] = ["pack.json": try JSONEncoder().encode([entry]), "loose/Beta.json": data,
                                      "junk.json": Data("{}".utf8)]
@@ -569,7 +593,7 @@ final class FeatElementsTests: XCTestCase {
     /// Untrusted .nibcollection zips: one entry too large, all together too large, or too many elements is refused
     /// as invalid params (small limits stand in for the real 32 MB / 256 MB / 5,000).
     func testArchiveReadEnforcesLimits() throws {
-        let data = try FeatElementsTests.box.encoded()
+        let data = try ElementFragments.encoded(FeatElementsTests.box)
         let url = fm.temporaryDirectory.appendingPathComponent("elements-limits-\(UUID().uuidString).\(ElementArchive.fileExtension)")
         let elements: [(id: String, title: String, data: Data)] = [(id: "a", title: "A", data: data),
                                                                    (id: "b", title: "B", data: data),
@@ -593,10 +617,16 @@ final class FeatElementsTests: XCTestCase {
 
     // MARK: Popover behaviour
 
-    /// Non-sticky: after one successful insert the palette goes back to the tool used before Elements; a failed
-    /// insert leaves Elements active.
+    /// Non-sticky: after one successful insert the palette goes back to the tool used before Elements (contracts-v2
+    /// `finishToolUse`, which announces `tool.finished`); a failed insert leaves Elements active; a temporary switch into
+    /// Elements returns where it came from.
     func testInsertHandsBackToThePreviousTool() async throws {
         let h = harness()
+        var finished: [JSONValue?] = []
+        let subscription = h.app.events.subscribe { event in
+            if event.type == NibEventType.toolFinished { finished.append(event.payload?["tool"]) }
+        }
+        defer { subscription.cancel() }
         try await h.run("element.collection.create", ["title": "Mine", "id": "mine"])
         try await h.run("element.create", ["refs": refs(["FIXTURESHP01"]), "collection": "mine", "id": "box"])
         h.session.tool = "lasso"
@@ -608,12 +638,163 @@ final class FeatElementsTests: XCTestCase {
         XCTAssertTrue(inserted)
         XCTAssertEqual(h.session.tool, "lasso")
         XCTAssertEqual(h.session.selection.items.count, 1, "the inserted element arrives selected")
+        XCTAssertEqual(finished, [.string(ElementsTool.toolID)], "the palette hears that Elements finished")
 
         h.session.tool = ElementsTool.toolID
         let missing = ElementInfo(id: "gone", collection: "mine", title: "Gone", kinds: [], itemCount: 1, size: [1, 1])
         let failed = await model.insertElement(missing)
         XCTAssertFalse(failed)
         XCTAssertEqual(h.session.tool, ElementsTool.toolID, "a failed insert keeps the Elements tool")
+        XCTAssertEqual(finished.count, 1)
+
+        h.session.tool = "highlighter"
+        h.session.selectTemporarily(ElementsTool.toolID)
+        let temporary = await model.insertElement(box)
+        XCTAssertTrue(temporary)
+        XCTAssertEqual(h.session.tool, "highlighter", "a temporary Elements returns to the tool it interrupted")
+        XCTAssertNil(h.session.temporaryReturnTool)
+
+        // The user switched tools while the insert ran: nothing is handed back.
+        h.session.tool = ElementsTool.toolID
+        h.session.tool = "pen"
+        await model.handBack()
+        XCTAssertEqual(h.session.tool, "pen")
+    }
+
+    /// A tap on the page with the Elements tool hands back too, through the canvas host's `finishToolUse`.
+    func testTappingThePageHandsBack() {
+        let h = harness()
+        var finished: [JSONValue?] = []
+        let subscription = h.app.events.subscribe { event in
+            if event.type == NibEventType.toolFinished { finished.append(event.payload?["tool"]) }
+        }
+        defer { subscription.cancel() }
+        let host = FakeCanvasHost(h)
+        let tool = ElementsTool()
+        XCTAssertFalse(tool.isSticky)
+        h.session.tool = "pen"
+        h.session.tool = ElementsTool.toolID
+        tool.tap(CanvasSample(page: Fixtures.page1, location: Point(40, 40)), host: host)
+        XCTAssertEqual(h.session.tool, "pen")
+        XCTAssertEqual(finished, [.string(ElementsTool.toolID)])
+    }
+
+    /// Commands that change the library announce it with `NibEventType.elementsChanged` and the collection they
+    /// changed; reads announce nothing.
+    func testLibraryChangesAnnounceTheCollection() async throws {
+        let h = harness()
+        var changed: [JSONValue?] = []
+        let subscription = h.app.events.subscribe { event in
+            if event.type == NibEventType.elementsChanged { changed.append(event.payload?["collection"]) }
+        }
+        defer { subscription.cancel() }
+        try await h.run("element.collection.create", ["title": "Mine", "id": "mine"])
+        try await h.run("element.create", ["refs": refs(["FIXTURESHP01"]), "collection": "mine", "id": "box"])
+        try await h.run("element.rename", ["collection": "mine", "element": "box", "title": "Box"])
+        _ = try await h.run("element.list", ["collection": "mine"])
+        _ = try await h.run("element.collection.list")
+        try await h.run("element.delete", ["collection": "mine", "element": "box"])
+        try await h.run("element.collection.delete", ["collection": "mine"])
+        XCTAssertEqual(changed, Array(repeating: .string("mine"), count: 5))
+    }
+
+    /// An element is a `NibFragment` (nib-fragment/1, the clipboard's format): stored at the origin with provenance
+    /// stripped, never with a comment, even one named directly.
+    func testElementsAreNibFragments() async throws {
+        let h = harness()
+        let created = try await h.run("element.create", ["refs": refs(["FIXTURESHP01", "FIXTURECMT01"]),
+                                                         "collection": "my-elements", "id": "shape"])
+        XCTAssertEqual(created["itemCount"], 1, "the comment stays on the page")
+        let catalog = ElementCatalog(app: h.app)
+        let stored = try catalog.fragment("my-elements", "shape").fragment
+        XCTAssertEqual(stored.items.map { $0.kind }, [.shape])
+        XCTAssertEqual(stored.bounds.minX, 0, accuracy: 1e-9)
+        XCTAssertEqual(stored.bounds.minY, 0, accuracy: 1e-9)
+        XCTAssertNil(stored.items.first?.createdBy)
+        XCTAssertEqual(stored.items.first?.rev, .zero)
+        let folder = h.library.metadataURL.appendingPathComponent("elements/my-elements", isDirectory: true)
+        let file = try Data(contentsOf: folder.appendingPathComponent("shape.\(h.app.deviceHex).json"))
+        XCTAssertEqual(try NibFragment.decode(file), stored, "the file is nib-fragment/1 JSON named with the device hex")
+        XCTAssertEqual((try JSONSerialization.jsonObject(with: file) as? [String: Any])?["format"] as? String,
+                       NibFragment.format)
+
+        do {
+            _ = try await h.run("element.create", ["refs": refs(["FIXTURECMT01"]), "collection": "my-elements"])
+            XCTFail("a comment alone is not an element")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+        }
+    }
+
+    /// A document Nib cannot write (saved by a newer Nib) takes no elements: the popover cannot insert and
+    /// `element.insert` refuses it.
+    func testInsertRefusesAReadOnlyDocument() async throws {
+        let h = harness()
+        try await h.run("element.create", ["refs": refs(["FIXTURESHP01"]), "collection": "my-elements", "id": "box"])
+        let model = ElementsModel(app: h.app, session: h.session)
+        XCTAssertTrue(model.canInsert)
+        h.app.services.set(NSSet(array: [Fixtures.docID.raw]), for: ServiceKeys.storeReadOnly)
+        XCTAssertFalse(model.canInsert)
+        do {
+            _ = try await h.run("element.insert", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "collection": "my-elements",
+                                                   "element": "box"])
+            XCTFail("a read-only document must be refused")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .unsupported)
+        }
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2), [])
+    }
+
+    /// Get More Elements finds the Gallery by `PanelIDs.gallery`; it is a library tab, so the window shows the library
+    /// first and `panel.open` hands the tab to it.
+    func testGetMoreElementsOpensTheGalleryInTheLibrary() async throws {
+        let h = harness()
+        let navigator = ElementsTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        let model = ElementsModel(app: h.app, session: h.session)
+        XCTAssertNil(model.galleryPanel, "no Gallery installed: no Marketplace button")
+
+        var opened: [(id: JSONValue?, document: DocumentID?)] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open Panel", summary: "Stand-in.",
+                                                  params: .obj(["id": .str("panel id")], required: ["id"]),
+                                                  effect: .session, target: .app)) { json, ctx in
+            opened.append((json["id"], ctx.activeSession?.document))
+            return ["id": json["id"] ?? .null, "placement": "libraryTab"]
+        }
+        h.app.ui.panels.register(PanelDescriptor(id: PanelIDs.gallery, title: "Gallery", icon: "sparkles",
+                                                 placement: .libraryTab, order: 0, owner: "pluginmanager") { _ in
+            AnyView(EmptyView())
+        })
+        XCTAssertEqual(model.galleryPanel?.id, PanelIDs.gallery)
+
+        await model.openGallery()
+        XCTAssertEqual(navigator.librariesShown, 1)
+        XCTAssertEqual(opened.count, 1)
+        XCTAssertEqual(opened.first?.id, .string(PanelIDs.gallery))
+        XCTAssertNil(opened.first?.document, "the library shows before the Gallery tab opens")
+    }
+
+    /// Open Settings (GIF tab, no key) goes to the Elements page through `settings.open {page}`; without Settings
+    /// installed, through the window's navigator.
+    func testOpenSettingsGoesToTheElementsPage() async throws {
+        let h = harness()
+        let navigator = ElementsTestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator
+        let model = ElementsModel(app: h.app, session: h.session)
+        model.openSettings()
+        XCTAssertEqual(navigator.settingsPages, [ElementsSettingsPage.id])
+
+        var pages: [JSONValue?] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.settingsOpen, title: "Open Settings", summary: "Stand-in.",
+                                                  params: .obj(["page": .str("page id")]), effect: .session,
+                                                  target: .app)) { json, _ in
+            pages.append(json["page"])
+            return [:]
+        }
+        model.openSettings()
+        for _ in 0..<100 where pages.isEmpty { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(pages, [.string(ElementsSettingsPage.id)])
+        XCTAssertEqual(navigator.settingsPages.count, 1, "Settings opened once, through the command")
     }
 
     /// GIPHY pages can overlap: a GIF already in the grid is not added twice (the grid needs unique ids).
@@ -724,7 +905,7 @@ final class FeatElementsTests: XCTestCase {
         let (content, pages) = Fixtures.sampleContent()
         XCTAssertEqual(content.meta.id, Fixtures.docID)
         let items = (pages[Fixtures.page1] ?? []).filter { $0.kind != .comment }
-        let fragment = ElementFragment.make(items: items) { _ in Fixtures.pngData }
+        let fragment = ElementFragments.make(items: items) { _ in Fixtures.pngData }
         let image = try XCTUnwrap(ElementRenderer.image(fragment, side: 64, scale: 2))
         XCTAssertEqual(image.size.width, 64)
         XCTAssertEqual(image.scale, 2)

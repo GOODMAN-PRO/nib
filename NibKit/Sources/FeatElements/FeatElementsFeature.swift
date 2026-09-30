@@ -11,7 +11,7 @@ public enum FeatElementsFeature: NibFeature {
 
     public static func register(_ app: NibApp) {
         ElementSettings.declare(app.settings, owner: id)
-        app.services.set(ElementsRuntime(content: app.content), for: ElementsRuntime.key)
+        app.services.set(ElementsRuntime(), for: ElementsRuntime.key)
         ElementCommandSet.register(app.commands)
 
         app.ui.canvasTools.register(CanvasToolDescriptor(id: ElementsTool.toolID, title: String(localized: "Elements"),
@@ -22,7 +22,7 @@ public enum FeatElementsFeature: NibFeature {
             settings: { session in AnyView(ElementsPopover(app: app, session: session)) }))
         app.ui.menus.register(MenuItemDescriptor(
             id: "elements.createElement", title: String(localized: "Create Element"), icon: NibSymbol.elements.name,
-            location: .objectMenu, order: 760, owner: id, command: "element.create",
+            location: .objectMenu, order: 760, owner: id, command: CommandIDs.elementCreate,
             params: { ctx in ElementMenu.createParams(ctx) }, isVisible: { ctx in ElementMenu.canCreate(ctx) }))
         app.ui.settingsPages.register(SettingsPageDescriptor(
             id: ElementsSettingsPage.id, title: String(localized: "Elements and GIFs"), icon: NibSymbol.elements.name,
@@ -40,7 +40,7 @@ public enum FeatElementsFeature: NibFeature {
     /// popover opens on ready content.
     public static func start(_ app: NibApp) async {
         guard app.services.library != nil else { return }
-        let catalog = ElementCatalog(services: app.services, clock: app.clock)
+        let catalog = ElementCatalog(app: app)
         _ = try? await ElementIO.run { catalog.prepare() }
     }
 }
@@ -48,7 +48,8 @@ public enum FeatElementsFeature: NibFeature {
 // MARK: - Tool
 
 /// The Elements canvas tool: its popover (the toolbar item's `settings`, budded from the palette) does the work. It is
-/// non-sticky: an insert hands the palette back to the previous tool, and so does a tap on the page.
+/// non-sticky: an insert hands the palette back to the previous tool, and so does a tap on the page. Both go through
+/// `finishToolUse` (contracts-v2 G15), which also honours a temporary return tool and emits `tool.finished`.
 @MainActor
 final class ElementsTool: CanvasTool {
     static let toolID = "elements"
@@ -58,9 +59,7 @@ final class ElementsTool: CanvasTool {
     var isSticky: Bool { false }
 
     func tap(_ sample: CanvasSample, host: CanvasHost) {
-        let session = host.session
-        guard let previous = session.previousTool, previous != id else { return }
-        host.app.perform(CommandIDs.toolSelect, ["tool": .string(previous)], session: session)
+        host.finishToolUse(self)
     }
 }
 
@@ -195,7 +194,7 @@ enum StarterElements {
         let name = "starter-\(s.id).png"
         let frame = Frame(x: 0, y: 0, w: Double(size.width) * k, h: Double(size.height) * k)
         let item = Item.makeImage(ImageItem(frame: frame, asset: AssetRef(name), altText: s.title))
-        return StarterElement(id: s.id, title: s.title, fragment: ElementFragment(items: [item], assets: [name: png]))
+        return StarterElement(id: s.id, title: s.title, fragment: NibFragment(items: [item], assets: [name: png]))
     }
 
     struct LabelSpec {
@@ -235,7 +234,7 @@ enum StarterElements {
         let style = TextBoxStyle(background: colour.withAlpha(0.14), borderColor: colour, borderWidth: 1.2,
                                  cornerRadius: h / 2, padding: pad, autoGrow: false)
         let item = Item.makeText(TextBoxItem(frame: Frame(x: 0, y: 0, w: w, h: h), text: text, style: style))
-        return StarterElement(id: s.id, title: s.title, fragment: ElementFragment(items: [item]))
+        return StarterElement(id: s.id, title: s.title, fragment: NibFragment(items: [item]))
     }
 
     /// Editable shape arrows (lines, curves and elbows with arrowheads) in Carbon.
@@ -246,7 +245,7 @@ enum StarterElements {
                                        pattern: pattern, arrowStart: start, arrowEnd: true)
             let frame = Frame(Rect.bounding(points) ?? .zero)
             let item = Item.makeShape(ShapeItem(shape: kind, frame: frame, points: points, style: style))
-            return StarterElement(id: id, title: title, fragment: ElementFragment(items: [item]))
+            return StarterElement(id: id, title: title, fragment: NibFragment(items: [item]))
         }
         return [
             arrow("arrow-right", String(localized: "Arrow Right"), .line, [Point(0, 0), Point(120, 0)]),

@@ -5,24 +5,17 @@ import NibContracts
 // the AI and the bridge all do the same thing. Library commands write `.nib-library/elements/`; `element.insert` is
 // the only `.edit` (undoable) one.
 
-/// Shared state the commands reach through `services` (key `elements.runtime`), set in `register`.
+/// The GIPHY client `gif.search` uses, one per app (feature-internal state under `services`, key `elements.runtime`,
+/// set in `register`), so tests can swap in canned replies. Content packs are read through `ctx.content`.
 @MainActor
 final class ElementsRuntime {
     static let key = "elements.runtime"
 
-    /// Where content packs register their read-only collections (`content.elementCollections`).
-    let content: ContentRegistries
     var giphy: GiphyClient
 
-    init(content: ContentRegistries, giphy: GiphyClient = GiphyClient()) {
-        self.content = content
+    init(giphy: GiphyClient = GiphyClient()) {
         self.giphy = giphy
     }
-}
-
-enum ElementEvents {
-    /// Emitted after any change to the element library (no payload: query `element.collection.list`).
-    static let changed = "elements.changed"
 }
 
 enum ElementSettings {
@@ -85,9 +78,12 @@ enum ElementParams {
         }
     }
 
+    /// `NibEventType.elementsChanged` after a library change, naming the collection when one changed (payload
+    /// `{"collection"?: id}`); subscribers query `element.collection.list` / `element.list` for the details.
     @MainActor
-    static func changed(_ ctx: CommandContext) {
-        ctx.events.emit(ElementEvents.changed, principal: ctx.principal)
+    static func changed(_ ctx: CommandContext, collection: String? = nil) {
+        ctx.events.emit(NibEventType.elementsChanged, principal: ctx.principal,
+                        payload: collection.map { ["collection": .string($0)] })
     }
 }
 
@@ -147,7 +143,7 @@ struct ElementCreate: NibCommand {
         for (i, id) in ids.enumerated() where !present.contains(id) {
             throw NibError(.notFound, "item \(id) not found on page \(pg)", path: "$.refs[\(i)]")
         }
-        let items = ElementFragment.expand(ids, in: pageItems)
+        let items = ElementFragments.expand(ids, in: pageItems)
         guard !items.isEmpty else {
             throw NibError.invalid("comments cannot be saved as elements", path: "$.refs")
         }
@@ -157,7 +153,7 @@ struct ElementCreate: NibCommand {
         if !fallback { try ElementParams.writable(p.collection, catalog) }
         let assets = ctx.services.assets
         let fragment = try await ElementIO.run {
-            try ElementFragment.make(items: items) { ref in
+            try ElementFragments.make(items: items) { ref in
                 guard let assets = assets else { throw NibError.unavailable("the asset store") }
                 return try assets.data(ref, doc: d)
             }
@@ -182,7 +178,7 @@ struct ElementCreate: NibCommand {
                                               defaultTitle: { n in String(localized: "Element \(n)") }, fragment: fragment)
             return (collection, record)
         }
-        ElementParams.changed(ctx)
+        ElementParams.changed(ctx, collection: saved.collection)
         return Output(collection: saved.collection, element: saved.record.id.raw, title: saved.record.title,
                       itemCount: saved.record.count)
     }
@@ -235,6 +231,10 @@ struct ElementInsert: NibCommand {
         guard let record = try ctx.workspace.content(doc).page(page), !record.deleted else {
             throw NibError.notFound("page \(page) in document \(doc)")
         }
+        if ctx.isReadOnly(doc) {
+            throw NibError(.unsupported, "document \(doc.raw) is read-only", path: "$.page",
+                           hint: "the document was saved by a newer version of Nib or its files cannot be written")
+        }
         let taken = Set(try ctx.workspace.items(doc, page: page).map { $0.id })
         if let clash = ids.first(where: { taken.contains($0) }) {
             throw NibError.invalid("id \(clash.raw) is already used on this page", path: "$.ids")
@@ -244,7 +244,7 @@ struct ElementInsert: NibCommand {
         let collection = p.collection
         let element = p.element
         let dryRun = ctx.dryRun
-        let fragment = try await ElementIO.run { () -> ElementFragment in
+        let fragment = try await ElementIO.run { () -> NibFragment in
             // `start` prepares the launch library; one opened later gets its starters on first real use.
             if !dryRun { catalog.prepare() }
             return try catalog.fragment(collection, element).fragment
@@ -255,7 +255,7 @@ struct ElementInsert: NibCommand {
         // it, or the new items would point at nothing, or at an unrelated asset of the same name in this document.
         var payload: [(name: String, data: Data)] = []
         var seen = Set<String>()
-        for ref in fragment.items.flatMap(ElementFragment.assetRefs) where seen.insert(ref.name).inserted {
+        for ref in fragment.items.flatMap(NibFragment.assetRefs) where seen.insert(ref.name).inserted {
             guard let data = fragment.assets[ref.name] else {
                 throw NibError.invalid("the element references asset '\(ref.name)' it does not carry", path: "$.element")
             }
@@ -278,18 +278,19 @@ struct ElementInsert: NibCommand {
 
         let session = ctx.activeSession
         let onPage = session?.document == doc && session?.page == page
-        let transform = ElementPlacement.transform(bounds: ElementFragment.union(fragment.items), at: at,
+        let transform = ElementPlacement.transform(bounds: NibFragment.union(fragment.items), at: at,
                                                    visible: onPage ? session?.visibleRect : nil, page: record.size)
         let layer = session?.activeLayer ?? 0
         let written = try ctx.mutate { tx -> [Item] in
             let z = try tx.topZ(doc, page: page)
-            let items = fragment.instantiated(transform: transform, ids: ids, zAfter: z, layer: layer, assets: assetMap)
-            return try items.map { try tx.put($0, doc: doc, page: page) }
+            let items = ElementFragments.instantiate(fragment, transform: transform, ids: ids, zAfter: z, layer: layer,
+                                                     assets: assetMap)
+            return try tx.put(items, doc: doc, page: page)
         }
         // The inserted element arrives selected, ready to move or resize as one.
         if !ctx.dryRun, let s = session, s.document == doc {
             s.selection = Selection(doc: doc, page: page, items: written.map { $0.id },
-                                    bounds: ElementFragment.union(written))
+                                    bounds: NibFragment.union(written))
         }
         return Output(refs: written.map { NodeRef.item(doc, page, $0.id).description })
     }
@@ -333,7 +334,7 @@ struct ElementRename: NibCommand {
             catalog.prepare()
             return try store.renameElement(collection, element, title: title)
         }
-        ElementParams.changed(ctx)
+        ElementParams.changed(ctx, collection: collection)
         return Output(collection: collection, element: record.id.raw, title: record.title)
     }
 }
@@ -361,7 +362,7 @@ struct ElementDelete: NibCommand {
             catalog.prepare()
             try store.deleteElement(collection, element)
         }
-        ElementParams.changed(ctx)
+        ElementParams.changed(ctx, collection: collection)
         return NoResult()
     }
 }
@@ -457,7 +458,7 @@ struct ElementCollectionCreate: NibCommand {
             catalog.prepare()
             return try store.createCollection(id: id, title: title)
         }
-        ElementParams.changed(ctx)
+        ElementParams.changed(ctx, collection: record.id.raw)
         return Output(collection: record.id.raw, title: record.title)
     }
 }
@@ -501,7 +502,7 @@ struct ElementCollectionUpdate: NibCommand {
             let position = store.liveCollections().firstIndex { $0.record.id == record.id } ?? 0
             return (record, position)
         }
-        ElementParams.changed(ctx)
+        ElementParams.changed(ctx, collection: collection)
         return Output(collection: collection, title: result.0.title, position: result.1)
     }
 }
@@ -528,7 +529,7 @@ struct ElementCollectionDelete: NibCommand {
             catalog.prepare()
             try store.deleteCollection(collection)
         }
-        ElementParams.changed(ctx)
+        ElementParams.changed(ctx, collection: collection)
         return NoResult()
     }
 }
@@ -572,7 +573,7 @@ struct ElementImport: NibCommand {
             catalog.prepare()
             return try store.importCollection(imported, fallbackTitle: fallback)
         }
-        ElementParams.changed(ctx)
+        ElementParams.changed(ctx, collection: result.record.id.raw)
         return Output(collection: result.record.id.raw, title: result.record.title, count: result.count)
     }
 }
