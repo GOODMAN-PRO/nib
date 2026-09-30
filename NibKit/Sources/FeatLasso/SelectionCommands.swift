@@ -31,37 +31,92 @@ enum LassoCategory: String, CaseIterable, Codable {
 
 // MARK: - Geometry (pure, unit-tested)
 
-/// A closed lasso polygon prepared for many hit tests: flat coordinate arrays plus bounds.
-/// ponytail: a per-call edge prefilter instead of a spatial index; add a grid if lassos over 50k items matter.
+/// A closed lasso polygon prepared for many hit tests: flat coordinate arrays, bounds, and its edges bucketed into
+/// horizontal bands, so a containment or crossing test looks only at the few edges at that height instead of all of
+/// them (a lasso over 5k strokes stays inside its 16 ms budget, ARCHITECTURE §20).
 struct LassoPolygon {
     let xs: [Double]
     let ys: [Double]
     let bounds: Rect
+    /// Edge e runs from vertex e to vertex e + 1 (the last one back to vertex 0). `bands[b]` lists, ascending, the
+    /// edges whose y range meets band b.
+    private let bands: [[Int]]
+    /// The first band of each edge (so an edge spanning several bands is reported once).
+    private let firstBand: [Int]
+    private let bandHeight: Double
 
     init?(_ points: [Point]) {
         guard points.count >= 3, points.allSatisfy({ $0.x.isFinite && $0.y.isFinite }),
               let b = Rect.bounding(points) else { return nil }
-        xs = points.map { $0.x }
-        ys = points.map { $0.y }
+        let xs = points.map { $0.x }, ys = points.map { $0.y }
+        self.xs = xs
+        self.ys = ys
         bounds = b
+        let n = points.count
+        let count = min(n, 256)
+        let height = b.height / Double(count)
+        bandHeight = height
+        var bands = [[Int]](repeating: [], count: count)
+        var firstBand = [Int](repeating: 0, count: n)
+        for e in 0..<n {
+            let k = e + 1 == n ? 0 : e + 1
+            let lo = LassoPolygon.band(min(ys[e], ys[k]), minY: b.minY, height: height, count: count)
+            let hi = LassoPolygon.band(max(ys[e], ys[k]), minY: b.minY, height: height, count: count)
+            firstBand[e] = lo
+            for band in lo...hi { bands[band].append(e) }
+        }
+        self.bands = bands
+        self.firstBand = firstBand
     }
 
     var first: Point { Point(xs[0], ys[0]) }
 
-    /// Even-odd point-in-polygon, the same test as `Geo.polygonContains`.
+    /// The band holding height `y`, clamped to the polygon (monotonic in `y`).
+    private static func band(_ y: Double, minY: Double, height: Double, count: Int) -> Int {
+        let v = height > 0 ? (y - minY) / height : 0
+        if !(v > 0) { return 0 }
+        if v >= Double(count - 1) { return count - 1 }
+        return Int(v)
+    }
+
+    private func band(_ y: Double) -> Int {
+        LassoPolygon.band(y, minY: bounds.minY, height: bandHeight, count: bands.count)
+    }
+
+    /// Even-odd point-in-polygon, the same test (and arithmetic) as `Geo.polygonContains`. Only edges that straddle `y`
+    /// flip the answer, and every one of them lies in `y`'s band.
     func contains(_ x: Double, _ y: Double) -> Bool {
         guard x >= bounds.minX, x <= bounds.maxX, y >= bounds.minY, y <= bounds.maxY else { return false }
+        let xs = self.xs, ys = self.ys
+        let n = xs.count
         var inside = false
-        var j = xs.count - 1
-        for i in 0..<xs.count {
+        for j in bands[band(y)] {
+            let i = j + 1 == n ? 0 : j + 1
             let yi = ys[i], yj = ys[j]
             if (yi > y) != (yj > y) {
                 let xCross = (xs[j] - xs[i]) * (y - yi) / (yj - yi) + xs[i]
                 if x < xCross { inside.toggle() }
             }
-            j = i
         }
         return inside
+    }
+
+    /// The edges whose bounds overlap the box, each once.
+    func edges(near minX: Double, _ minY: Double, _ maxX: Double, _ maxY: Double) -> [Int] {
+        guard maxX >= bounds.minX, minX <= bounds.maxX, maxY >= bounds.minY, minY <= bounds.maxY else { return [] }
+        let xs = self.xs, ys = self.ys
+        let n = xs.count
+        let lo = band(minY), hi = band(maxY)
+        var out: [Int] = []
+        for b in lo...hi {
+            for j in bands[b] where max(lo, firstBand[j]) == b {
+                let k = j + 1 == n ? 0 : j + 1
+                let ax = xs[j], ay = ys[j], bx = xs[k], by = ys[k]
+                if max(ax, bx) < minX || min(ax, bx) > maxX || max(ay, by) < minY || min(ay, by) > maxY { continue }
+                out.append(j)
+            }
+        }
+        return out
     }
 }
 
@@ -81,14 +136,15 @@ enum LassoGeometry {
             maxX = max(maxX, p.x)
             maxY = max(maxY, p.y)
         }
-        let m = poly.xs.count
-        let edges = nearEdges(poly, minX, minY, maxX, maxY)
+        let edges = poly.edges(near: minX, minY, maxX, maxY)
         guard !edges.isEmpty else { return false }
+        let xs = poly.xs, ys = poly.ys
+        let m = xs.count
         for i in 1..<line.count {
             let p1 = line[i - 1], p2 = line[i]
             for j in edges {
                 let k = j + 1 == m ? 0 : j + 1
-                if crosses(p1.x, p1.y, p2.x, p2.y, poly.xs[j], poly.ys[j], poly.xs[k], poly.ys[k]) { return true }
+                if crosses(p1.x, p1.y, p2.x, p2.y, xs[j], ys[j], xs[k], ys[k]) { return true }
             }
         }
         return false
@@ -112,33 +168,21 @@ enum LassoGeometry {
             return true
         }
         guard n >= 2 else { return false }
-        let m = poly.xs.count
-        let edges = nearEdges(poly, minX, minY, maxX, maxY)
+        let edges = poly.edges(near: minX, minY, maxX, maxY)
         guard !edges.isEmpty else { return false }
+        let xs = poly.xs, ys = poly.ys
+        let m = xs.count
         var px = Double(pts[0].x), py = Double(pts[0].y)
         for i in 1..<n {
             let qx = Double(pts[i].x), qy = Double(pts[i].y)
             for j in edges {
                 let k = j + 1 == m ? 0 : j + 1
-                if crosses(px, py, qx, qy, poly.xs[j], poly.ys[j], poly.xs[k], poly.ys[k]) { return true }
+                if crosses(px, py, qx, qy, xs[j], ys[j], xs[k], ys[k]) { return true }
             }
             px = qx
             py = qy
         }
         return false
-    }
-
-    /// Indices of the polygon edges whose bounds overlap the box (edge j runs from vertex j to j + 1).
-    static func nearEdges(_ poly: LassoPolygon, _ minX: Double, _ minY: Double, _ maxX: Double, _ maxY: Double) -> [Int] {
-        let m = poly.xs.count
-        var edges: [Int] = []
-        for j in 0..<m {
-            let k = j + 1 == m ? 0 : j + 1
-            let ax = poly.xs[j], ay = poly.ys[j], bx = poly.xs[k], by = poly.ys[k]
-            if max(ax, bx) < minX || min(ax, bx) > maxX || max(ay, by) < minY || min(ay, by) > maxY { continue }
-            edges.append(j)
-        }
-        return edges
     }
 
     /// `Geo.segmentsIntersect` on raw coordinates (segment p1–p2 against edge q1–q2).

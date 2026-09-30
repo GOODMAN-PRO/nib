@@ -399,8 +399,9 @@ final class FeatLassoTests: XCTestCase {
 
     func testLineTouchesAgreesWithGeoPolylineTouchesPolygon() {
         var rng = SeededGenerator(seed: 0x5EED)
-        for _ in 0..<3000 {
-            let n = Int.random(in: 3...12, using: &rng)
+        for round in 0..<3000 {
+            // Mostly small lassos; every 100th has 300 vertices (more edges than the 256 bands of the edge index).
+            let n = round % 100 == 99 ? 300 : Int.random(in: 3...12, using: &rng)
             let cx = Double.random(in: 100...300, using: &rng), cy = Double.random(in: 100...300, using: &rng)
             let poly = (0..<n).map { (k: Int) -> Point in
                 let a = Double(k) / Double(n) * 2 * Double.pi
@@ -415,6 +416,10 @@ final class FeatLassoTests: XCTestCase {
             guard let prepared = prepared else { return }
             let expected = Geo.polylineTouchesPolygon(line, poly)
             XCTAssertEqual(LassoGeometry.lineTouches(line, prepared), expected, "line \(line) polygon \(poly)")
+            for _ in 0..<8 {
+                let q = Point(Double.random(in: 0...400, using: &rng), Double.random(in: 0...400, using: &rng))
+                XCTAssertEqual(prepared.contains(q.x, q.y), Geo.polygonContains(poly, q), "point \(q) polygon \(poly)")
+            }
             // The stroke fast path answers the same for the same points.
             let points = line.map { StrokePoint(x: Float($0.x), y: Float($0.y)) }
             XCTAssertEqual(LassoGeometry.strokeTouches(points, prepared),
