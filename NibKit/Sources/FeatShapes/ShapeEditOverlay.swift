@@ -481,10 +481,10 @@ final class ShapeEditOverlay: NSObject, CanvasAttachment, UITextViewDelegate, UI
         let params: JSONValue
         switch edit {
         case .points(let pts):
-            command = "shape.setPoints"
+            command = CommandIDs.shapeSetPoints
             params = ["ref": .string(ref), "points": ShapeJSON.points(pts)]
         case .cornerRadius(let r):
-            command = "shape.setStyle"
+            command = CommandIDs.shapeSetStyle
             params = ["refs": [.string(ref)], "style": ["cornerRadius": .number(r)]]
         }
         committing = true

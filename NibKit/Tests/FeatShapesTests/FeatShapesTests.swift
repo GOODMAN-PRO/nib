@@ -32,9 +32,18 @@ final class FeatShapesTests: XCTestCase {
         let shape = Item.makeShape(ShapeItem(shape: .ellipse, frame: Frame(x: 0, y: 0, w: 10, h: 10)))
         XCTAssertTrue(h.app.content.drawer(for: shape) is ShapeDrawer)
         XCTAssertEqual(h.app.content.paintBounds(for: shape), shape.bounds.insetBy(-NibLimits.drawerMargin))
-        let taps = h.app.content.tapHandlers.all.filter { $0.command == "shape.tapAt" }
+        let taps = h.app.content.tapHandlers.all.filter { $0.command == CommandIDs.shapeTapAt }
         XCTAssertEqual(Set(taps.map(\.gesture)), [.tap, .doubleTap])
         XCTAssertTrue(taps.allSatisfy { $0.order < 400 && $0.itemKinds == [.shape] })
+        // Every §6.5 id F031 owns is registered under its contracts-v2.1 constant, with the catalogue's effect.
+        let owned: [(String, Effect)] = [(CommandIDs.shapeCreate, .edit), (CommandIDs.shapeSetStyle, .edit),
+                                                (CommandIDs.shapeSetKind, .edit), (CommandIDs.shapeSetPoints, .edit),
+                                                (CommandIDs.shapeTapAt, .session)]
+        for (id, effect) in owned {
+            XCTAssertEqual(h.app.commands.entry(id)?.descriptor.effect, effect, id)
+        }
+        XCTAssertEqual([ShapeCreate.descriptor.id, ShapeSetStyle.descriptor.id, ShapeSetKind.descriptor.id,
+                        ShapeSetPoints.descriptor.id, ShapeTapAt.descriptor.id], owned.map(\.0))
     }
 
     func testShapeLabelsPublishTheirTextLayout() throws {
@@ -508,7 +517,7 @@ final class FeatShapesTests: XCTestCase {
         await FeatShapesFeature.start(h.app)
         let watcher = try XCTUnwrap(h.app.services.get(ShapeContainerWatcher.serviceKey, as: ShapeContainerWatcher.self))
         // The maths item (72, 480, 120 × 40) moves inside the fixture rectangle (100, 200, 160 × 90).
-        try await h.run("item.transform", ["refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01"], "translate": [48, -260]])
+        try await h.run(CommandIDs.itemTransform, ["refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01"], "translate": [48, -260]])
         await watcher.pending?.value
         let math = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.mathID)
         XCTAssertEqual(math.attachedTo, Fixtures.shapeID)
@@ -739,7 +748,7 @@ final class FeatShapesTests: XCTestCase {
 
     func testLibraryAndInspectorFitThePopoverInEveryAppearance() throws {
         let h = Harness(features: [FeatShapesFeature.self])
-        h.app.commands.register(CommandDescriptor(id: "preset.select", title: "Preset", summary: "Test stand-in.",
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.presetSelect, title: "Preset", summary: "Test stand-in.",
                                                   params: .anything(), effect: .session)) { _, _ in .null }
         let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
         let context = InspectorContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1, items: [item])
@@ -778,6 +787,18 @@ final class FeatShapesTests: XCTestCase {
         s = ShapeToolStyle.current(h.app, entry: .arrow)
         XCTAssertEqual(s.strokeColor, presets.color, "lines always have an outline and never a fill")
         XCTAssertNil(s.fillColor)
+    }
+
+    func testDrawAndHoldHintFollowsTheSharedSettingAndShapeRecognition() {
+        let h = Harness(features: [FeatShapesFeature.self])
+        let model = ShapeToolMenuModel(app: h.app, session: h.session)
+        XCTAssertTrue(h.app.settings.get(NibSettings.drawAndHold))
+        XCTAssertFalse(model.showsDrawAndHoldHint, "no hint while nothing recognises shapes")
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeRecognize, title: "Recognise", summary: "Test stand-in.",
+                                                  params: .anything(), effect: .read)) { _, _ in .null }
+        XCTAssertTrue(model.showsDrawAndHoldHint)
+        h.app.settings.set(NibSettings.drawAndHold, false)
+        XCTAssertFalse(model.showsDrawAndHoldHint, "no hint once Draw and Hold is off")
     }
 
     func testLibraryFollowsTheDesignGridAndConnectsShapes() async throws {
@@ -944,7 +965,7 @@ final class FeatShapesTests: XCTestCase {
 
     /// F026's `text.setText`, reduced to what shapes need.
     static func registerTextStandIn(_ app: NibApp) {
-        app.commands.register(CommandDescriptor(id: "text.setText", title: "Set Text", summary: "Test stand-in.",
+        app.commands.register(CommandDescriptor(id: CommandIDs.textSetText, title: "Set Text", summary: "Test stand-in.",
                                                 params: .obj(["ref": .ref, "text": .anything()], required: ["ref", "text"]),
                                                 effect: .edit)) { json, ctx in
             guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }

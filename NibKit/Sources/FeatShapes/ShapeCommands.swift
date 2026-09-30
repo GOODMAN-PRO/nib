@@ -533,7 +533,7 @@ struct ShapeTapAt: NibCommand {
 enum ShapeContainers {
     static let containerKinds: Set<ShapeKind> = [.rectangle, .roundedRectangle, .ellipse, .triangle, .diamond, .polygon]
     /// Commands that land items on a page without moving an existing record (drops from elsewhere).
-    static let dropCommands: Set<String> = [CommandIDs.itemMoveToPage, CommandIDs.clipboardPaste, "element.insert"]
+    static let dropCommands: Set<String> = [CommandIDs.itemMoveToPage, CommandIDs.clipboardPaste, CommandIDs.elementInsert]
     static let ignoredCommands: Set<String> = [CommandIDs.undo, CommandIDs.redo, CommandIDs.revertGroup]
 
     /// Items a user changeset moved (bounds changed) or dropped onto a page, per document and page.
@@ -622,7 +622,7 @@ enum ShapeContainers {
     }
 
     /// Sticky notes attach what is dropped on them while the Sticky Notes feature (F036) and `item.update` are there.
-    static let stickyCommand = "sticky.create"
+    static let stickyCommand = CommandIDs.stickyCreate
 
     @MainActor
     static func notesClaimDrops(_ app: NibApp) -> Bool {

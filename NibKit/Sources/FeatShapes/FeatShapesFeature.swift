@@ -51,7 +51,7 @@ public enum FeatShapesFeature: NibFeature {
         // Before selection.tapAt (400): a tap on the selected shape types into it instead of re-selecting it.
         for (suffix, gesture) in [("tap", CanvasGesture.tap), ("doubleTap", CanvasGesture.doubleTap)] {
             app.content.tapHandlers.register(TapHandlerDescriptor(
-                id: "shapes.editText." + suffix, owner: id, gesture: gesture, command: ShapeTapAt.descriptor.id,
+                id: "shapes.editText." + suffix, owner: id, gesture: gesture, command: CommandIDs.shapeTapAt,
                 order: 390, itemKinds: [.shape]))
         }
     }

@@ -230,7 +230,12 @@ final class ShapeToolMenuModel: ObservableObject {
     var fillOpacity: Double { app.settings.get(ShapeSettings.fillOpacity) }
     var cornerRadius: Double { app.settings.get(ShapeSettings.cornerRadius) }
     var outline: Bool { app.settings.get(ShapeSettings.outline) }
-    var canEditPresets: Bool { ShapesUI.has(app, "preset.select") }
+    var canEditPresets: Bool { ShapesUI.has(app, CommandIDs.presetSelect) }
+    /// The Draw-and-Hold hint shows only while holding a stroke snaps it to a shape: the shared
+    /// `NibSettings.drawAndHold` is on and shape recognition (`shape.recognize`) is installed.
+    var showsDrawAndHoldHint: Bool {
+        app.settings.get(NibSettings.drawAndHold) && ShapesUI.has(app, CommandIDs.shapeRecognize)
+    }
 
     func choose(_ e: ShapeLibraryEntry) {
         set(ShapeSettings.kind.name, .string(e.rawValue))
@@ -269,11 +274,11 @@ final class ShapeToolMenuModel: ObservableObject {
     }
 
     func selectSwatch(_ i: Int) {
-        app.perform("preset.select", ["tool": .string(ShapeTool.toolID), "swatch": .number(Double(i))], session: session)
+        app.perform(CommandIDs.presetSelect, ["tool": .string(ShapeTool.toolID), "swatch": .number(Double(i))], session: session)
     }
 
     func selectWidth(_ i: Int) {
-        app.perform("preset.select", ["tool": .string(ShapeTool.toolID), "width": .number(Double(i))], session: session)
+        app.perform(CommandIDs.presetSelect, ["tool": .string(ShapeTool.toolID), "width": .number(Double(i))], session: session)
     }
 
     private func set(_ name: String, _ value: JSONValue) {
@@ -322,10 +327,12 @@ struct ShapeLibraryMenu: View {
                 NibSegmentedControl(selection: Binding(get: { model.cornerRadius > 0 }, set: { model.setRounded($0) }),
                                     options: [false, true]) { $0 ? String(localized: "Rounded") : String(localized: "Sharp") }
             }
-            Text(String(localized: "Hold at the end of a stroke to snap it to a shape."))
-                .font(NibFont.footnote)
-                .foregroundStyle(NibColor.labelSecondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if model.showsDrawAndHoldHint {
+                Text(String(localized: "Hold at the end of a stroke to snap it to a shape."))
+                    .font(NibFont.footnote)
+                    .foregroundStyle(NibColor.labelSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -450,11 +457,11 @@ final class ShapeInspectorModel: ObservableObject {
     func apply(group: String, _ change: (inout ShapeStylePatch) -> Void) {
         var patch = ShapeStylePatch()
         change(&patch)
-        run([("shape.setStyle", ["refs": .array(refs.map { JSONValue.string($0) }), "style": patch.json])], group: group)
+        run([(CommandIDs.shapeSetStyle, ["refs": .array(refs.map { JSONValue.string($0) }), "style": patch.json])], group: group)
     }
 
     func setKind(_ kind: ShapeKind) {
-        let calls: [(String, JSONValue)] = refs.map { ("shape.setKind", ["ref": .string($0), "shape": .string(kind.rawValue)]) }
+        let calls: [(String, JSONValue)] = refs.map { (CommandIDs.shapeSetKind, ["ref": .string($0), "shape": .string(kind.rawValue)]) }
         run(calls, group: grouper.group(for: "kind." + kind.rawValue))
     }
 
@@ -496,8 +503,8 @@ final class ShapeInspectorModel: ObservableObject {
         for item in items {
             guard let s = item.shape else { continue }
             let ref = NodeRef.item(doc, page, item.id).description
-            if !on && s.shape == .arrow { calls.append(("shape.setKind", ["ref": .string(ref), "shape": "line"])) }
-            calls.append(("shape.setStyle", ["refs": [.string(ref)], "style": ["arrowEnd": .bool(on)]]))
+            if !on && s.shape == .arrow { calls.append((CommandIDs.shapeSetKind, ["ref": .string(ref), "shape": "line"])) }
+            calls.append((CommandIDs.shapeSetStyle, ["refs": [.string(ref)], "style": ["arrowEnd": .bool(on)]]))
         }
         run(calls, group: grouper.group(for: "arrowEnd"))
     }

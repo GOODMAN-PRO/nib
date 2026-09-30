@@ -12,7 +12,7 @@ enum ShapeLibraryEntry: String, CaseIterable, Identifiable {
     case line, arrow, rectangle, ellipse, triangle, star, polygon, connector
     case doubleArrow, curve, roundedRectangle, diamond, pentagon
 
-    static let connectorCommand = "connector.create"
+    static let connectorCommand = CommandIDs.connectorCreate
 
     var id: String { rawValue }
 
