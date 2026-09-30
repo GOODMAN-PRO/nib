@@ -53,6 +53,11 @@ final class FeatTextDocTests: XCTestCase {
         }
     }
 
+    /// Lets the main queue run what is already on it (registry notifications the editor receives on main).
+    private func mainQueueTurn() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in DispatchQueue.main.async { c.resume() } }
+    }
+
     /// The Library Store's library.rename (F002), for tests that only register this feature.
     private func registerRename(_ h: Harness) {
         let library = h.library
@@ -90,7 +95,7 @@ final class FeatTextDocTests: XCTestCase {
         XCTAssertEqual(problems, [])
     }
 
-    func testRegistersCommandsEditorBlockKindsAndMenus() {
+    func testRegistersCommandsEditorBlockKindsAndMenus() throws {
         let h = harness()
         XCTAssertEqual(FeatTextDocFeature.id, "textdoc")
         for id in ["block.insert", "block.update", "block.delete", "block.move"] {
@@ -108,25 +113,59 @@ final class FeatTextDocTests: XCTestCase {
             XCTAssertFalse(k.aliases.isEmpty, k.id)
         }
         let new = h.app.ui.menuItems(.libraryNew, MenuContext(app: h.app))
-        XCTAssertTrue(new.contains { $0.id == "textdoc.new" && $0.command == CommandIDs.batch })
+        let entry = try XCTUnwrap(new.first { $0.id == "textdoc.new" })
+        XCTAssertEqual(entry.command, CommandIDs.batch)
+        XCTAssertEqual(entry.shortcut, KeyShortcut("t", [.command, .shift]), "the menu shows ⇧⌘T")
     }
 
-    func testShiftCommandTMakesATextDocumentOnlyOnce() async throws {
+    /// The doc.create + doc.open calls of a new-document batch: (create params, open params).
+    private func newDocumentCalls(_ params: JSONValue, file: StaticString = #filePath,
+                                  line: UInt = #line) throws -> (create: JSONValue, open: JSONValue) {
+        let calls = try XCTUnwrap(params["calls"]?.arrayValue, file: file, line: line)
+        XCTAssertEqual(calls.map { $0["command"]?.stringValue }, [CommandIDs.docCreate, CommandIDs.docOpen],
+                       file: file, line: line)
+        let create = try XCTUnwrap(calls.first?["params"], file: file, line: line)
+        let open = try XCTUnwrap(calls.last?["params"], file: file, line: line)
+        XCTAssertEqual(create["kind"]?.stringValue, DocumentKind.textDocument.rawValue, file: file, line: line)
+        let id = try XCTUnwrap(create["id"]?.stringValue, file: file, line: line)
+        XCTAssertTrue(NibID.isValid(id), file: file, line: line)
+        XCTAssertEqual(open["doc"]?.stringValue, "doc:" + id, "the new document opens", file: file, line: line)
+        return (create, open)
+    }
+
+    func testTheNewMenuEntryMakesTheDocumentInTheFolderItWasOpenedIn() throws {
+        let h = harness()
+        let folder: FolderID = "FOLDERPHYS1"
+        let inFolder = try newDocumentCalls(TextDocMenus.newDocumentParams(MenuContext(app: h.app, folder: folder)))
+        XCTAssertEqual(inFolder.create["folder"]?.stringValue, "folder:FOLDERPHYS1")
+        let older = try newDocumentCalls(TextDocMenus.newDocumentParams(MenuContext(app: h.app, ref: "folder:FOLDERPHYS1")))
+        XCTAssertEqual(older.create["folder"]?.stringValue, "folder:FOLDERPHYS1", "hosts that pass the folder as the ref")
+        let top = try newDocumentCalls(TextDocMenus.newDocumentParams(MenuContext(app: h.app)))
+        XCTAssertNil(top.create["folder"])
+    }
+
+    func testShiftCommandTMakesAFreshTextDocumentAndIsRegisteredOnlyOnce() async throws {
         let h = harness()
         await FeatTextDocFeature.start(h.app)
         let d = try XCTUnwrap(h.app.content.keyCommands.get("textdoc.new"))
         XCTAssertEqual(d.shortcut, KeyShortcut("t", [.command, .shift]))
-        XCTAssertEqual(d.command, CommandIDs.appOpenURL)
-        XCTAssertEqual(d.params["url"]?.stringValue, "nib://new?kind=textDocument")
+        XCTAssertEqual(d.command, CommandIDs.batch)
         XCTAssertEqual(d.scope, .library)
+        XCTAssertTrue(d.isActive(in: KeyCommandContext(docKind: nil)), "live in the library")
+        XCTAssertFalse(d.isActive(in: KeyCommandContext(docKind: .notebook)))
+        // The shell resolves the params on every press: each press makes a document of its own.
+        let first = try newDocumentCalls(d.resolvedParams(for: h.session))
+        let second = try newDocumentCalls(d.resolvedParams(for: h.session))
+        XCTAssertNotEqual(first.create["id"], second.create["id"])
+        XCTAssertNil(first.create["folder"], "the library's top level")
         await FeatTextDocFeature.start(h.app)
         XCTAssertEqual(h.app.content.keyCommands.all.filter { $0.shortcut == d.shortcut }.count, 1)
 
-        // The keyboard feature got there first: no second ⇧⌘T.
+        // The keyboard feature (F073) got there first: no second ⇧⌘T.
         let other = harness()
         other.app.content.keyCommands.register(KeyCommandDescriptor(
             id: "keyboard.newTextDocument", title: "New Text Document", shortcut: KeyShortcut("T", [.shift, .command]),
-            command: CommandIDs.appOpenURL, params: ["url": "nib://new?kind=textDocument"], scope: .global, owner: "keyboard"))
+            command: CommandIDs.batch, scope: .global, owner: "keyboard"))
         await FeatTextDocFeature.start(other.app)
         XCTAssertNil(other.app.content.keyCommands.get("textdoc.new"))
     }
@@ -505,6 +544,24 @@ final class FeatTextDocTests: XCTestCase {
         XCTAssertTrue(titles(editor.blockMenu(for: video)).contains("Open Video"))
     }
 
+    func testDeletingSeveralBlocksIsOneUndoStepAndAMissingRefDeletesNothing() async throws {
+        let h = harness()
+        let before = try h.snapshot(doc)
+        let depth = h.undoDepth(doc)
+        let out = try await h.run("block.delete", ["refs": [.string(heading), .string(table), .string(heading)]])
+        XCTAssertEqual(out["deleted"]?.intValue, 2, "a ref named twice is deleted once")
+        XCTAssertEqual(try ids(h), ["FIXTUREBLK02"])
+        XCTAssertEqual(h.undoDepth(doc), depth + 1)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(doc), before)
+
+        await assertError(.notFound) {
+            _ = try await h.run("block.delete", ["refs": [.string(paragraph), "block:FIXTUREDOC02/NOSUCHBLOCK"]])
+        }
+        XCTAssertEqual(try ids(h), ["FIXTUREBLK01", "FIXTUREBLK02", "FIXTUREBLK03"])
+        XCTAssertEqual(h.undoDepth(doc), depth)
+    }
+
     func testMoveMenuStepsOneBlockAndStaysPutAtTheEdges() async throws {
         let h = harness()
         func params(_ ref: String, up: Bool) -> JSONValue {
@@ -595,6 +652,35 @@ final class FeatTextDocTests: XCTestCase {
         edited.table?.rows[0][0].text = RichText(plain: "Z1")
         XCTAssertTrue(editor.embeddedView(for: edited) === tableView)
         XCTAssertEqual(tables, 1)
+    }
+
+    func testARegistryChangeRemakesOnlyTheViewsOfTheEntriesThatChanged() async throws {
+        let h = harness()
+        var tables = 0
+        h.app.ui.blockViews.register(BlockViewDescriptor(kind: .table, owner: "tables") { _ in
+            tables += 1
+            return UIView()
+        })
+        let editor = openEditor(h)
+        let tableBlock = try XCTUnwrap(editor.block(Fixtures.tableBlockID))
+        let tableView = try XCTUnwrap(editor.embeddedView(for: tableBlock))
+
+        // A plugin's block view arrives: the table keeps its view.
+        h.app.ui.blockViews.register(BlockViewDescriptor(customType: "dev.nib.charts.bar", owner: "dev.nib.charts") { _ in
+            UIView()
+        })
+        await mainQueueTurn()
+        XCTAssertTrue(editor.embeddedView(for: tableBlock) === tableView)
+        XCTAssertEqual(tables, 1)
+
+        // The tables feature's own entry changes: the table's view is made again from it.
+        h.app.ui.blockViews.register(BlockViewDescriptor(kind: .table, owner: "tables") { _ in
+            tables += 1
+            return UIView()
+        })
+        await mainQueueTurn()
+        XCTAssertFalse(editor.embeddedView(for: tableBlock) === tableView)
+        XCTAssertEqual(tables, 2)
     }
 
     func testTextSelectionMenuEntriesAppearOverSelectedBlockText() throws {
@@ -706,6 +792,13 @@ final class FeatTextDocTests: XCTestCase {
         editor.resolveProposal(for: id, .insertBelow)
         await editor.flushEdits()
         XCTAssertEqual(try live(h).map { $0.text.plainText }, ["Fixture Text", "Hello blocks", "An answer", ""])
+    }
+
+    func testAssistantAnswersAreReadFromTheAIResponse() throws {
+        let response = try JSONValue.from(AIResponse(text: "Shorter text.", group: "G1"))
+        XCTAssertEqual(BlockAssistant.answer(response), "Shorter text.")
+        XCTAssertNil(BlockAssistant.answer(["answer": "Shorter text."]))
+        XCTAssertNil(BlockAssistant.answer(nil))
     }
 
     func testAssistantAnswersBecomeCleanParagraphs() {

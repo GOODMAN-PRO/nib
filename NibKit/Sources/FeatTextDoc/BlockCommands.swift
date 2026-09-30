@@ -178,11 +178,20 @@ struct BlockDelete: NibCommand {
             if seen.insert(NodeRef.block(t.0, t.1).description).inserted { targets.append((t.0, t.1, "$.refs[\(i)]")) }
         }
         try ctx.mutate { (tx: DocTransaction) -> Void in
+            // One batch write per document (contracts-v2 G5), so deleting a long selection stays linear.
+            var live: [DocumentID: [NibID: TextBlock]] = [:]
+            var gone: [DocumentID: [TextBlock]] = [:]
+            var docs: [DocumentID] = []
             for t in targets {
-                var b = try BlockRules.liveBlock(t.id, doc: t.doc, in: tx.content(t.doc), path: t.path)
+                if live[t.doc] == nil {
+                    live[t.doc] = BlockRules.liveBlocksByID(try tx.content(t.doc))
+                    docs.append(t.doc)
+                }
+                guard var b = live[t.doc]?[t.id] else { throw BlockRules.missing(t.id, doc: t.doc, path: t.path) }
                 b.deleted = true
-                try tx.put(b, doc: t.doc)
+                gone[t.doc, default: []].append(b)
             }
+            for doc in docs { try tx.put(gone[doc] ?? [], doc: doc) }
         }
         return Output(deleted: targets.count)
     }
@@ -302,10 +311,21 @@ enum BlockRules {
 
     static func liveBlock(_ id: NibID, doc: DocumentID, in content: DocumentContent, path: String) throws -> TextBlock {
         guard let b = content.blocks.first(where: { $0.id == id && !$0.deleted }) else {
-            throw NibError(.notFound, "block \(id.raw) not found in doc:\(doc.raw)", path: path,
-                           hint: "call query.get {ref: \"doc:\(doc.raw)\"} to list the document's blocks")
+            throw missing(id, doc: doc, path: path)
         }
         return b
+    }
+
+    /// The document's live blocks by id (the first record wins, as in `liveBlock`).
+    static func liveBlocksByID(_ content: DocumentContent) -> [NibID: TextBlock] {
+        var out: [NibID: TextBlock] = [:]
+        for b in content.blocks where !b.deleted && out[b.id] == nil { out[b.id] = b }
+        return out
+    }
+
+    static func missing(_ id: NibID, doc: DocumentID, path: String) -> NibError {
+        NibError(.notFound, "block \(id.raw) not found in doc:\(doc.raw)", path: path,
+                 hint: "call query.get {ref: \"doc:\(doc.raw)\"} to list the document's blocks")
     }
 
     // MARK: Order

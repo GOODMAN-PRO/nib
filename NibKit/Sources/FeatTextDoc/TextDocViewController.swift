@@ -209,7 +209,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
 
         NotificationCenter.default.publisher(for: .nibRegistryDidChange)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] note in self?.registryChanged(note.object as AnyObject?) }
+            .sink { [weak self] note in self?.registryChanged(note) }
             .store(in: &cancellables)
 
         NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)
@@ -274,11 +274,19 @@ final class TextDocViewController: UIViewController, DocumentEditing {
         }
     }
 
-    private func registryChanged(_ registry: AnyObject?) {
+    private func registryChanged(_ note: Notification) {
+        let registry = note.object as AnyObject?
         if registry === app.ui.blockViews {
-            embedded.removeAll()
-            embeddedHeights.removeAll()
-            reconfigureAll()
+            // Only blocks drawn by the entries that changed (`RegistryChange.ids`) get their view made again, so a
+            // plugin's block view arriving leaves the tables alone. A post without the ids stands for any change.
+            let named = note.userInfo?[RegistryChange.idsKey] != nil
+            let ids = Set(RegistryChange.ids(note))
+            let affected = blocks.compactMap { b -> NibID? in
+                guard let key = TextDocViewController.embeddedKey(b), !named || ids.contains(key) else { return nil }
+                return b.id
+            }
+            for id in affected { dropEmbedded(id) }
+            reconfigure(affected)
         } else if registry === app.content.aiActions {
             reconfigureAll()
         }
@@ -848,7 +856,7 @@ final class TextDocViewController: UIViewController, DocumentEditing {
             let value = await self.execute(CommandIDs.aiAsk, params, group: NibID.make().raw)
             self.aiRunning.remove(id)
             self.cell(for: id)?.setAIRunning(false)
-            guard self.byID[id] != nil, let raw = value?["text"]?.stringValue else { return }
+            guard self.byID[id] != nil, let raw = BlockAssistant.answer(value) else { return }
             let answer = BlockAssistant.clean(raw)
             guard !answer.isEmpty else { return }
             self.showProposal(BlockProposal(title: action.title, text: answer, replaces: replaces), for: id)
@@ -1136,17 +1144,17 @@ extension TextDocViewController: BlockCellHost {
         return nil
     }
 
-    func embeddedView(for block: TextBlock) -> UIView? {
-        let key: String
+    /// The `ui.blockViews` id that draws a block: "table", or "custom.<owner>.<type>"; nil for kinds the editor draws.
+    static func embeddedKey(_ block: TextBlock) -> String? {
         switch block.kind {
-        case .custom:
-            guard let c = block.custom else { return dropEmbedded(block.id) }
-            key = "custom.\(c.owner).\(c.type)"
-        case .table:
-            key = BlockKind.table.rawValue
-        default:
-            return dropEmbedded(block.id)
+        case .custom: return block.custom.map { "custom.\($0.owner).\($0.type)" }
+        case .table: return BlockKind.table.rawValue
+        default: return nil
         }
+    }
+
+    func embeddedView(for block: TextBlock) -> UIView? {
+        guard let key = TextDocViewController.embeddedKey(block) else { return dropEmbedded(block.id) }
         if let cached = embedded[block.id] {
             // Tables observe commits themselves. A custom block's view shows the payload it was made from, so it is
             // made again once `custom` changes (undo, sync, a plugin's update); another kind drops the old view.
@@ -1766,6 +1774,12 @@ enum BlockAssistant {
     /// Appended to a block edit action's prompt: the assistant answers with the new text, which the editor previews.
     static let previewInstruction = "Reply with only the new text of this block: no quotes, labels or commentary. "
         + "Do not change the document yourself; the user reviews your text before it replaces the block."
+
+    /// The answer's text in an `ai.ask` result (`AIResponse` JSON, ARCHITECTURE §6.1); nil for anything else.
+    static func answer(_ value: JSONValue?) -> String? {
+        guard let value = value, let response = try? value.decode(AIResponse.self) else { return nil }
+        return response.text
+    }
 
     /// Trims the answer and unwraps a fenced code block the model may put around it.
     static func clean(_ answer: String) -> String {
