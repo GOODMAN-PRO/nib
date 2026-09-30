@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/NibStore/PackageCodec.swift:68 (decodeItems) / NibKit/Tests/NibStoreTests/PackageMergeTests.swift:169 (testDecodeAndMergeOf1kStrokePageWithinBudget)",
+      "problem": "The 1k-stroke decode+merge budget is not met, and the green CI is a flake. CI run 36103458672 (commit 14f4997) failed with 0.4918 s against the 0.2 s limit. Commit 436c2b0 then added only diagnostics and passed, yet its own NIBSTORE-DIAG line shows full=325 ms (the best of 3 JSONDecoder decodes of the page) against the 200 ms limit, with nopts=26 ms and inflate/merge at about 1 ms. So nearly all the time is point unpacking inside Stroke.init(from:), which calls the string-keyed StrokePoint.set once per float. Once this lands on main, the main suite will fail intermittently, and the acceptance criterion is not met.",
+      "fix": "Make decodeItems reliably fast inside F001's files. In PackageCodec.decodeItems, after inflating, scan the JSON bytes once to find the top-level array element boundaries (track depth, whether you are inside a string, and escapes). Split into ProcessInfo.activeProcessorCount chunks, wrap each as [...], and decode them with DispatchQueue.concurrentPerform (the diag measured par3=49 ms). Fall back to a single decode for small inputs. Also file a contract request for a fullFormat fast path in Stroke.unpack that builds StrokePoint(x:y:t:force:azimuth:altitude:roll:width:height:opacity:) directly from each group of 10 floats. Then re-run CI at least 3 times and confirm the assertion passes with margin."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibStore/PackagePersistence.swift:160-167 (loadItems) and :107-114 (loadHead reads disk before io.sync)",
+      "problem": "Data loss in crash recovery: disk is read without first draining a write that is already in flight. write(synchronously:false) removes the job from `pending` on main and then runs it on `io`. If loadItems(page) runs in that window, it reads the old own file, finds `pending` empty, and returns items without the in-flight changes. Scenario: loadHead replays the WAL, which puts recovered strokes for page 2 into `pending` and schedules a write. At 1.5 s the write job starts, and the user scrolls to page 2 at that moment. loadItems returns disk only, and the job truncates the WAL. The user's next edit on page 2 overwrites the own .nibpage with the workspace copy, and the recovered strokes are gone for good. loadHead has the same ordering bug: it reads disk files and only then calls io.sync, so the WAL comes back already truncated.",
+      "fix": "Drain the queue before reading disk. In loadHead, move `let logged = io.sync { wal.read(doc) }` above `files.read(...)`. In loadItems, call `io.sync {}` before `mergedPage(...)`. Another option is to keep `inFlight[doc]` (the job) until the io block finishes and merge it the same way as `pending`. Add a test: replay a WAL entry for a page, let the async write start (debounce 0 plus a Task.yield), call loadItems on that page immediately, and assert the recovered stroke is there."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibStore/PackagePersistence.swift:189-218 (didChange WAL entry)",
+      "problem": "Performance on large notebooks: every commit appends the whole item array of each changed page to the WAL. For the 1k-stroke page that is about 1.5 MB of JSON per stroke (json=1475676B, encode about 62 ms on CI). Real strokes have 5-10 times more points. At handwriting speed the serial `io` queue builds a backlog of full-page encodes, and each queued block keeps its own page snapshot in memory. The WAL grows by megabytes per second. flush() (page leave via evictPages, close) and loadHead (io.sync for the WAL) block the main thread until that backlog drains, which means visible hangs of hundreds of ms or more.",
+      "fix": "Log only the delta. In didChange, before updating `known[doc].itemRevs[page]`, compute `let delta = items.filter { knownRevs[$0.id] != $0.rev }` and put `delta` in the Entry. The head is small and can stay whole. Replay already merges WAL entries over disk with LWW.merge, and truncation happens only after a write of the full pending state, so the recovered state is the same. Extend testWriteAheadLogReplaysAfterSimulatedCrash to assert that the logged entry holds only the changed stroke."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/NibStoreTests/PackageMergeTests.swift:168-227 (diagnoseDecode, fastPoints)",
+      "problem": "Temporary diagnostic code was committed: it is marked 'TEMP diagnostics (removed once the budget holds)' and contains try!, as! and print(\"NIBSTORE-DIAG ...\"). It also roughly triples the runtime of the perf test.",
+      "fix": "Delete diagnoseDecode, fastPoints and their call once the budget fix lands."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibStore/PackageCodec.swift:275 (PackageFiles.write), PackagePersistence.fileURL, PackageAssetStore.put",
+      "problem": "A missing package root is silently recreated (createDirectory(at: pkg, withIntermediateDirectories: true)). If the package was moved, trashed or deleted while the locator still holds the old URL (a race between F002's main-actor move and a debounced io write), a ghost package with the same DocumentID appears at the old path. F002 would then list it as a duplicate document.",
+      "fix": "Throw NibError.notFound when the package directory does not exist, and create only subdirectories (pages/<p>, assets, audio). Creating the package is F002's job. Update TestLibrary.package to create the directory."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibStore/PackagePersistence.swift:279-290 (failed)",
+      "problem": "After a failed write, the job goes back into `pending`, but no new write is scheduled. The changes stay unsaved until the next edit, flush or background event. The WAL still holds them.",
+      "fix": "Call scheduleWrite(doc) at the end of failed() (except for .notFound), optionally with a growing delay."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibStore/WriteAheadLog.swift:34-48 (append)",
+      "problem": "If the app dies mid-append, the WAL ends in a torn line with no newline. The next append is concatenated onto those bytes, so the new, valid entry also fails to decode. It is lost if the app dies again before the rescheduled write.",
+      "fix": "In append, when the file is non-empty and its last byte is not 0x0A, write 0x0A before the new line."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibStore/PackagePersistence.swift:88-92 (known / seen)",
+      "problem": "`known` (full head plus item revs for every loaded page) and `seen` are never released when a document closes. Memory grows with every document opened in a session, and remoteChanges keeps diffing against stale state for closed documents.",
+      "fix": "In NibStoreFeature.start, subscribe to NibEventType.docClosed and call a `forget(doc)` that removes known[doc] and seen[doc]. Workspace.close has already flushed at that point."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibStore/NibStoreFeature.swift:26-29",
+      "problem": "The background flush is deferred through a Task and runs synchronous coordinated I/O for every pending document without a background-task assertion, so it can be cut off when the app is suspended.",
+      "fix": "In the observer (already on queue .main), call `MainActor.assumeIsolated { store.flushAll() }` inside UIApplication.shared.beginBackgroundTask / endBackgroundTask, and skip this when NibApp.isHostlessTest is set."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/NibStoreTests",
+      "problem": "Several risky paths have no tests: the conflict-copy path of remoteChanges, a newer-format file arriving via remoteChanges, keeping pending changes after a write failure, and the 10 s maxDelay cap on the debounce.",
+      "fix": "Add a focused test for each: (1) a copy appearing after load is merged, deleted and reported once; (2) a newer-format remote file sets the gate; (3) a write to a removed package keeps the job in pending and the WAL untouched; (4) repeated didChange calls with debounce 0.05 and maxDelay 0.1 still produce a write."
+    }
+  ]
+}

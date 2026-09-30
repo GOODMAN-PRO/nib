@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLayers/FeatLayersFeature.swift:64 (syncChrome), NibKit/Sources/FeatLayers/LayerCommands.swift:189 (LayerView.apply), :383 (LayerExportOptions)",
+      "problem": "Turning `layers.show` off removes the panel, the Cmd-Opt-1..5 shortcuts and Move to Layer, but sessions keep their stored view. `syncChrome` only unregisters chrome, and `LayerView.apply` (start and every document switch) applies `layers.view.<doc>` whatever the setting is. Example: a user hides Layer 1 and makes Layer 4 active, then turns Layers off. Their Layer 1 ink stays invisible and is left out of every export (the hook still injects `visibleLayers`). New ink goes to Layer 4. The eraser and lasso are scoped to the active layer (F010/F011), so they can no longer reach the Layer 1 ink. No UI exists to undo any of this. The same thing happens when the AI or a plugin calls `layer.setVisible` or `layer.setActive` while Layers is off (the default).",
+      "fix": "In `LayerView.apply`, when `!settings.get(LayerSettings.show)`, set `session.hiddenLayers = []` and `session.activeLayer = 0`, and leave the stored `layers.view.<doc>` alone. In `LayersRuntime.syncChrome`, call `LayerView.apply(app.settings, to:)` for every session after `LayersChrome.sync`. Turning Layers off then shows everything, and turning it on restores each document's view. In `LayerExportOptions.run`, return `[:]` when `layers.show` is false. In `LayerSetActive` and `LayerSetVisible`, when `layers.show` is false, first run `ctx.execute(CommandIDs.settingsSet, [\"name\": \"layers.show\", \"value\": true])`, so an AI or plugin change is never invisible to the user. Add a test: hide layer 2, set active 3, `settings.set layers.show false`. Then `hiddenLayers == []`, `activeLayer == 0` and the export echo has no `visibleLayers`. Set it back to true, and the view is [2] / 3 again."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLayers/LayerCommands.swift:112 (LayerModel.editedLayers), used by FeatLayersFeature.swift:77 (didCommit)",
+      "problem": "Auto-unhide counts every live item written on a hidden layer as an edit of that layer. Bulk page operations therefore reveal hidden layers the user never touched, and show the alert 'You changed something on a layer that was hidden on this device'. Affected: `page.duplicate` (copies items with their layer), `page.paste`, `page.moveTo` into the open document, `doc.merge` and `doc.convertToWhiteboard`. Duplicating a page in a notebook with a hidden layer undoes the per-device hide and shows a false alert. No test covers this.",
+      "fix": "In `editedLayers`, first collect the page ids the changeset creates: `.page(d, before, after)` where `d == doc`, `!after.deleted` and `(before == nil || before!.deleted)`. Then skip `.item` mutations on those pages, so copied or moved pages never count as an edit. If `page.rotate` rewrites item geometry, add it to `LayerModel.passiveCommands`. Add a test: hide layer 0, then run a stand-in edit command that `tx.put`s a new PageRecord plus a copy of FIXTURESTK01 (layer 0) on it. `session.hiddenLayers` must stay [0]. Keep the existing `test.touch` case, which must still unhide."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLayers/LayerCommands.swift:383 (LayerExportOptions), FeatLayersFeature.swift:15",
+      "problem": "F041 registers `layer.exportOptions`, which ARCHITECTURE §6.5 does not list. `python Scripts/lint.py --feature F041` warns: 'F041 registers layer.exportOptions, which ARCHITECTURE §6.5 does not list for it'. §15.3 says to register exactly the listed ids. It also invents an export option shape, `options.visibleLayersOnly` + `options.visibleLayers {docID: [layer]}`, that no contract or exporter reads. F066 is still a stub, and `ExportRequest.options` is exporter-specific. So 'exports include only visible layers' holds only if F066 happens to use the same keys.",
+      "fix": "Keep the hook, since a hook must be a `read` command. In the F041 final summary, report a contract request, without adding a docs file on this branch because docs are outside F041's file list. It should (1) add `layer.exportOptions {command, params} (read, export.run hook)` to F041's Commands owned in forge-spec.json and §6.5, and (2) add `options.visibleLayersOnly: Bool` and `options.visibleLayers: {docRaw: [Int]}` to F066's export.run option list, so the PDF and image exporters skip items whose `layer` is not listed for their document."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatLayersTests/FeatLayersTests.swift:148",
+      "problem": "The acceptance check 'hidden layers excluded from RenderRequest' is tautological. The test builds `RenderRequest(layers: visible)` itself and asserts that the initializer stored what it was given. Nothing checks a real render path. Also, `render.page` from the AI or bridge for a document that is not in the active window falls back to all layers (F004 reads only `sessions.active`), so device-hidden layers leak into AI renders.",
+      "fix": "Add `CommandIDs.renderPage` to the hook's `commands`. In `LayerExportOptions.run`, when the command is `render.page` and `params.layers` is absent, set `layers` to the sorted `LayerView.visibleLayers(NodeRef(page).documentID, ...)`, only when fewer than 5. Replace the RenderRequest assertion with an echo stand-in for `render.page`, like the export test, and assert `layers == [0,1,3,4]` after hiding layer 2."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLayers/FeatLayersFeature.swift:77 (didCommit)",
+      "problem": "Auto-unhide only looks at open sessions. When the AI, a plugin or the bridge edits a hidden layer of a document that no window shows, the stored `layers.view.<doc>` keeps that layer hidden. The new content is invisible when the document is next opened, and exports leave it out.",
+      "fix": "In `didCommit`, for each `doc` in `cs.documents` that no session shows, read `settings.get(LayerSettings.view(doc))`. Remove `LayerModel.editedLayers(cs, doc:)` from `hidden`, and if anything changed, `settings.set` the view. Extend `testEditingAHiddenLayerShowsItAgain` with the session switched to another document."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLayers/LayerCommands.swift:182 (LayerView.store)",
+      "problem": "Every `layer.setActive` or `layer.setVisible` writes a `layers.view.<docID>` key, including the default state (nothing hidden, layer 0). Keys are never removed when documents are purged, so device settings grow by one key for every document ever touched.",
+      "fix": "In `store`, when `hiddenLayers.isEmpty && activeLayer == 0`, call `settings.setJSON(LayerSettings.viewPrefix + doc.raw, nil)` instead of writing the default. `get` already returns `LayerViewState()` for a missing key."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLayers/LayerCommands.swift:85 (cleanName)",
+      "problem": "`layer.rename` accepts internal newlines, tabs and control characters from the AI, plugins and the bridge. Only the ends are trimmed. The names then appear in Move to Layer menu titles, the alert title and the panel rows.",
+      "fix": "In `cleanName`, map every character in `.newlines` and `.controlCharacters` to a space, and collapse runs of whitespace before the length check. Add a test case: 'A\\nB\\u{0007}' gives 'A B'."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLayers/LayersPanel.swift:8, :212, :266, :268; FeatLayersFeature.swift:106",
+      "problem": "Design and copy nits (Slop checklist, 'only tokens'): `VStack(spacing: 1)` is off the 4 pt scale, and `.frame(width: 24)` is a literal. The selection Menu label is a hand-rolled `fill3` Capsule. The glyph `square.3.layers.3d` is not in the NibSymbol catalogue. The auto-unhide alert says 'You changed something...', which is wrong when the AI or a plugin made the edit.",
+      "fix": "Use `spacing: NibSpacing.xxs` and `.frame(width: NibSpacing.xxl)`. Mark the capsule menu label with a `ponytail:` comment, or wrap it in a NibDesign component if one fits. List a `NibSymbol.layers` catalogue addition in the contract request. Change the alert message to 'Something changed on a layer that was hidden on this device, so it is shown again.'"
+    }
+  ]
+}
