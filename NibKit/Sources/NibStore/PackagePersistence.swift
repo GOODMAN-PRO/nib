@@ -3,9 +3,10 @@ import os
 import NibContracts
 
 /// Documents whose head was saved by a newer Nib (`meta.format > NibFormat.version`, ARCHITECTURE §4.2): they open
-/// read-only and nothing is written to them. Thread-safe (the asset store asks off-main). `published` is the flag other
-/// features read with `services.get("store.readOnly", as: NSSet.self)`: the raw ids of read-only documents, updated on
-/// the main actor whenever a head is loaded.
+/// read-only and nothing is written to them. Thread-safe (the asset store asks off-main). Features ask
+/// `PackagePersistence.isReadOnly` through `ctx.isReadOnly(doc)` / `app.isReadOnly(doc)`; `published` is the legacy
+/// `ServiceKeys.storeReadOnly` set (the raw ids of read-only documents), updated on the main actor whenever a head is
+/// loaded.
 final class ReadOnlyGate {
     let published = NSMutableSet()
     private var ids = Set<DocumentID>()
@@ -35,15 +36,16 @@ final class ReadOnlyGate {
     }
 }
 
-/// `sync.status` payloads posted by the store: {state: "warning" | "error", source: "store", reason, message, files?}.
+/// `sync.status` payloads posted by the store (`SyncStatusPayload`, source "store", state "warning" or "error").
 /// Reasons: newerFormat (opened read-only), futureRevision (a device clock > 24 h ahead), unreadable, writeFailed,
-/// walFailed.
+/// walFailed. `files` (package-relative paths) is left out when no file is named.
 enum StoreStatus {
-    static func payload(_ state: String, _ reason: String, _ message: String, files: [String] = []) -> JSONValue {
-        var o: [String: JSONValue] = ["state": .string(state), "source": "store", "reason": .string(reason),
-                                      "message": .string(message)]
-        if !files.isEmpty { o["files"] = .array(files.map { .string($0) }) }
-        return .object(o)
+    static let source = "store"
+
+    static func payload(_ state: String, _ reason: String, _ message: String,
+                        files: [String] = []) -> SyncStatusPayload {
+        SyncStatusPayload(state: state, source: source, reason: reason, message: message,
+                          files: files.isEmpty ? nil : files)
     }
 
     static let newerFormat = payload("warning", "newerFormat",
@@ -109,8 +111,16 @@ final class UnsavedWrites {
 ///   is always either in the package files or still in the log.
 /// - `remoteChanges` re-reads other devices' files whose stamp changed and returns the records newer than the copy
 ///   this device has in memory.
+/// - `contentRevision` reads only the ids and revisions of a page's files (no items are built) and remembers the
+///   answer until one of those files changes.
 @MainActor
 final class PackagePersistence: DocumentPersistence {
+    /// The highest item revision of a page as its files hold it, and the stamps of those files by name.
+    private struct FileRevision {
+        var stamps: [String: PackageFiles.Stamp]
+        var rev: Rev
+    }
+
     /// What this device has in memory: the merged head and the item revs of pages loaded or written through it.
     private struct Known {
         var head: DocumentContent
@@ -133,6 +143,8 @@ final class PackagePersistence: DocumentPersistence {
     private var timers: [DocumentID: Task<Void, Never>] = [:]
     /// Stamps of other devices' files as last read, keyed by package-relative path.
     private var seen: [DocumentID: [String: PackageFiles.Stamp]] = [:]
+    /// `contentRevision` of pages as their files hold them, with the stamps of those files (keyed by file name).
+    private var fileRevisions: [DocumentID: [PageID: FileRevision]] = [:]
 
     /// `device` is this device's 8 lowercase hex characters (`DeviceIdentity.hex`); package URLs come from `locator`.
     init(device: String, locator: PackageLocator, events: EventBus?, gate: ReadOnlyGate,
@@ -273,7 +285,7 @@ final class PackagePersistence: DocumentPersistence {
                 log.error("write-ahead log of \(doc.raw, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 let payload = StoreStatus.payload("error", "walFailed",
                                                   "Recent changes could not be logged: \(error.localizedDescription)")
-                DispatchQueue.main.async { events?.emit(NibEventType.syncStatus, doc: doc, payload: payload) }
+                DispatchQueue.main.async { events?.emit(payload, doc: doc) }
             }
         }
         scheduleWrite(doc)
@@ -356,10 +368,46 @@ final class PackagePersistence: DocumentPersistence {
         if e.code != .notFound { scheduleWrite(doc) }
     }
 
-    /// Drops what this device remembers of a closed document (the workspace flushed it before closing).
+    /// Drops what this device remembers of a closed document (the workspace flushed it before closing). The page
+    /// revisions stay: they are checked against the files on every use.
     func forget(_ doc: DocumentID) {
         known[doc] = nil
         seen[doc] = nil
+    }
+
+    // MARK: Read-only, content revision
+
+    /// True for a document saved by a newer Nib (format gate): commits apply in memory, nothing is written.
+    func isReadOnly(_ doc: DocumentID) -> Bool {
+        gate.contains(doc)
+    }
+
+    /// The highest revision among the items `loadItems` would return (tombstones included), without building them:
+    /// every device file (and conflict copy) of the page contributes the ids and revisions of its items, merged
+    /// last-writer-wins, then what is not on disk yet (the log, failed writes, pending snapshots) is merged over them
+    /// the same way. A page without files is `.zero`, like an empty page in the workspace. The files' answer is kept
+    /// until one of them changes (stamps), so a library of thumbnails costs one folder listing per page. nil when the
+    /// document has no package.
+    func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
+        guard NibID.isValid(page.raw), let pkg = try? files.package(doc),
+              FileManager.default.fileExists(atPath: pkg.path) else { return nil }
+        // As in `mergedPage`: drain queued log appends and writes, so the files hold a write that was in flight.
+        let wal = self.wal, unsaved = self.unsaved
+        let (logged, failedItems) = io.sync { (wal.read(doc), unsaved.job(doc)?.pages[page]) }
+        var unwritten = logged.compactMap { $0.pages[page.raw] }
+        if let kept = failedItems { unwritten.append(kept) }
+        if let items = pending[doc]?.pages[page] { unwritten.append(items) }
+
+        let sources = files.pageSources(pkg, page: page)
+        let stamps = Dictionary(sources.map { ($0.name, $0.stamp) }, uniquingKeysWith: { first, _ in first })
+        if unwritten.isEmpty, let cached = fileRevisions[doc]?[page], cached.stamps == stamps { return cached.rev }
+        let now = PackageCodec.ms(Date())
+        var revs = files.revisions(sources, now: now)
+        fileRevisions[doc, default: [:]][page] = FileRevision(stamps: stamps, rev: revs.values.max() ?? .zero)
+        for items in unwritten {
+            PackageCodec.merge(items.map { ($0.id, $0.rev) }, into: &revs, now: now)
+        }
+        return revs.values.max() ?? .zero
     }
 
     // MARK: Package files, remote changes
@@ -444,8 +492,8 @@ final class PackagePersistence: DocumentPersistence {
 
     // MARK: Status
 
-    private func emit(_ doc: DocumentID, _ payload: JSONValue) {
-        events?.emit(NibEventType.syncStatus, doc: doc, payload: payload)
+    private func emit(_ doc: DocumentID, _ payload: SyncStatusPayload) {
+        events?.emit(payload, doc: doc)
     }
 
     private func report<T>(_ doc: DocumentID, _ read: PackageFiles.ReadResult<T>) {

@@ -311,18 +311,22 @@ final class NibStoreTests: XCTestCase {
         try PackageCodec.encodeHead(content).write(to: pkg.appendingPathComponent("doc.0000000b.json"))
 
         let events = EventBus()
-        var reasons: [String] = []
+        var statuses: [SyncStatusPayload] = []
         let subscription = events.subscribe { e in
-            if e.type == NibEventType.syncStatus, let reason = e.payload?["reason"]?.stringValue { reasons.append(reason) }
+            if let status = e.decode(SyncStatusPayload.self) { statuses.append(status) }
         }
         defer { subscription.cancel() }
         let gate = ReadOnlyGate()
         let store = lib.store("0000000a", events: events, gate: gate)
+        XCTAssertFalse(store.isReadOnly(doc))
         let head = try store.loadHead(doc)
         XCTAssertEqual(head.meta.format, NibFormat.version + 1)
-        XCTAssertTrue(gate.contains(doc))
-        XCTAssertTrue(gate.published.contains(doc.raw))
-        XCTAssertEqual(reasons, ["newerFormat"])
+        XCTAssertTrue(store.isReadOnly(doc))
+        XCTAssertTrue(gate.published.contains(doc.raw), "the legacy set is still published")
+        XCTAssertEqual(statuses, [StoreStatus.newerFormat])
+        XCTAssertEqual(statuses.first?.source, "store")
+        XCTAssertEqual(statuses.first?.state, "warning")
+        XCTAssertNil(statuses.first?.files)
 
         var edited = head
         edited.meta.favorite = true
@@ -367,16 +371,88 @@ final class NibStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testFileURLStaysInsideThePackage() throws {
+        let lib = TestLibrary()
+        let doc = Fixtures.docID
+        let pkg = lib.package(doc)
+        let store = lib.store("0000000a")
+        let url = try store.fileURL(doc, relativePath: "audio/clip.caf")
+        XCTAssertEqual(url.standardizedFileURL.path, pkg.appendingPathComponent("audio/clip.caf").standardizedFileURL.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: pkg.appendingPathComponent("audio").path),
+                      "parent folders are created")
+        for path in ["../escape.caf", "audio/../../escape.caf", "/etc/hosts", "./audio/clip.caf", "", "/"] {
+            XCTAssertThrowsError(try store.fileURL(doc, relativePath: path), path) { error in
+                XCTAssertEqual((error as? NibError)?.code, .invalidParams, path)
+            }
+        }
+        XCTAssertThrowsError(try store.fileURL("NOSUCHDOC001", relativePath: "audio/clip.caf")) { error in
+            XCTAssertEqual((error as? NibError)?.code, .notFound)
+        }
+    }
+
     func testRegisterInstallsPersistenceAssetsAndReadOnlyFlag() async throws {
-        NibApp.isHostlessTest = true
-        let defaults = UserDefaults(suiteName: "nib.tests.store." + UUID().uuidString)
-        let app = NibApp(defaults: try XCTUnwrap(defaults), deviceID: 0x1a2b3c4d, makeShared: false)
-        app.register([NibStoreFeature.self])
-        let store = try XCTUnwrap(app.workspace.persistence as? PackagePersistence)
-        XCTAssertEqual(store.files.device, "1a2b3c4d")
-        XCTAssertTrue(app.services.assets is PackageAssetStore)
-        XCTAssertNotNil(app.services.get("store.readOnly", as: NSSet.self))
+        let h = Harness(features: [NibStoreFeature.self], deviceID: 0x1a2b3c4d, keepFeatureServices: true)
+        let store = try XCTUnwrap(h.app.workspace.persistence as? PackagePersistence)
+        XCTAssertEqual(h.app.deviceHex, "1a2b3c4d")
+        XCTAssertEqual(store.files.device, h.app.deviceHex)
+        XCTAssertTrue(h.app.services.assets is PackageAssetStore)
+        XCTAssertNotNil(h.app.services.get(ServiceKeys.storeReadOnly, as: NSSet.self))
         let problems = await CommandConformance.check(features: [NibStoreFeature.self])
         XCTAssertEqual(problems, [])
+    }
+
+    /// The real store behind the workspace (Harness keeps it): an edit reaches this device's page file, the page's
+    /// content revision is the same from memory and from the files, and a document saved by a newer Nib is read-only
+    /// for everyone who asks the app.
+    func testWorkspaceOverTheRealStore() async throws {
+        let h = Harness(features: [NibStoreFeature.self], deviceID: 0x1a2b3c4d, keepFeatureServices: true)
+        let store = try XCTUnwrap(h.app.workspace.persistence as? PackagePersistence)
+        let fixtures = Dictionary(uniqueKeysWithValues: Fixtures.documents().map { ($0.content.meta.id, $0) })
+        let doc = Fixtures.docID
+        let pkg = try XCTUnwrap(h.app.services.packages.url(doc))
+        try FileManager.default.createDirectory(at: pkg, withIntermediateDirectories: true)
+        store.wal.truncate(doc) // the default log folder outlives test runs
+        let notebook = try XCTUnwrap(fixtures[doc])
+        store.didChange(doc, head: notebook.content, pages: notebook.items)
+        store.flush(doc)
+
+        var stroke = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 2), StrokePoint(x: 3, y: 4)]))
+        stroke.id = "HARNESSSTRK1"
+        let written = try await h.insert([stroke], page: Fixtures.page1, doc: doc)
+        let rev = try XCTUnwrap(written.first?.rev)
+        XCTAssertTrue(h.app.workspace.isPageCached(doc, page: Fixtures.page1))
+        XCTAssertEqual(h.app.workspace.contentRevision(doc, page: Fixtures.page1), rev)
+        h.app.workspace.close(doc)
+        XCTAssertFalse(h.app.workspace.isPageCached(doc, page: Fixtures.page1))
+        XCTAssertEqual(h.app.workspace.contentRevision(doc, page: Fixtures.page1), rev,
+                       "the files give the revision the cached page gave")
+        let file = pkg.appendingPathComponent("pages/\(Fixtures.page1.raw)/1a2b3c4d.nibpage")
+        XCTAssertTrue(try PackageCodec.decodeItems(Data(contentsOf: file)).contains { $0.id == "HARNESSSTRK1" })
+        XCTAssertTrue(store.wal.read(doc).isEmpty)
+
+        // Another device saved the whiteboard with a newer format.
+        let board = Fixtures.whiteboardID
+        let boardPkg = try XCTUnwrap(h.app.services.packages.url(board))
+        try FileManager.default.createDirectory(at: boardPkg, withIntermediateDirectories: true)
+        store.wal.truncate(board)
+        var newer = try XCTUnwrap(fixtures[board]).content
+        newer.meta.format = NibFormat.version + 1
+        try PackageCodec.encodeHead(newer).write(to: boardPkg.appendingPathComponent("doc.0000000b.json"))
+        var statuses: [(DocumentID?, SyncStatusPayload)] = []
+        let subscription = h.app.events.subscribe { e in
+            if let status = e.decode(SyncStatusPayload.self) { statuses.append((e.doc, status)) }
+        }
+        defer { subscription.cancel() }
+        XCTAssertFalse(h.app.isReadOnly(board))
+        _ = try h.app.workspace.content(board)
+        // Asked through the persistence, not the legacy set.
+        h.app.services.set(NSMutableSet(), for: ServiceKeys.storeReadOnly)
+        XCTAssertTrue(h.app.workspace.isReadOnly(board))
+        XCTAssertTrue(h.app.isReadOnly(board))
+        XCTAssertFalse(h.app.isReadOnly(doc))
+        XCTAssertEqual(statuses.map { $0.0 }, [board])
+        XCTAssertEqual(statuses.map { $0.1.reason }, ["newerFormat"])
+        h.app.workspace.close(board)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: boardPkg.appendingPathComponent("doc.1a2b3c4d.json").path))
     }
 }

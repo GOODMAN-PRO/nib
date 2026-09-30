@@ -154,6 +154,9 @@ final class PackageMergeTests: XCTestCase {
         let data = try PackageCodec.encodeItems(remote)
         let json = try (data as NSData).decompressed(using: .lzfse) as Data
         XCTAssertEqual(PageReader.read(json)?.decodedElements, 0, "every stroke is read directly")
+        let revisions = try XCTUnwrap(PageReader.revisions(json), "revisions are read without building the items")
+        XCTAssertEqual(revisions.map { $0.id }, remote.map(\.id))
+        XCTAssertEqual(revisions.map { $0.rev }, remote.map(\.rev))
 
         // Budget (ARCHITECTURE §20): decode and merge a 1k-stroke page < 50 ms, asserted ×4. Best of five runs (the
         // simulator shares its machine), so the first one also warms the decoder up.
@@ -204,7 +207,8 @@ final class PackageMergeTests: XCTestCase {
         direct += 4
         // JSONDecoder reads these: plugin data, an escaped z key, non-ASCII provenance, strokes nested in a math item.
         var withExt = stroke("EXTSTROKE001")
-        withExt.ext = ["plugin.x": ["ptsB64": "not points", "stroke": ["ptsB64": "AAAA"]]]
+        withExt.ext = ["plugin.x": ["ptsB64": "not points", "stroke": ["ptsB64": "AAAA"], "id": "NOTANITEM001",
+                                    "rev": "ffffffffffff.0.0"]]
         items.append(withExt)
         var escaped = stroke("ESCAPEDZ0001")
         escaped.z = "a/b\"c"
@@ -226,6 +230,10 @@ final class PackageMergeTests: XCTestCase {
         XCTAssertEqual(page.decodedElements, items.count - direct)
         XCTAssertEqual(try JSONDecoder().decode([Item].self, from: json), items)
         XCTAssertEqual(try PackageCodec.decodeItems(data), items)
+        // Only each item's own id and rev count, not keys nested in its data.
+        let revisions = try XCTUnwrap(PageReader.revisions(json))
+        XCTAssertEqual(revisions.map { $0.id }, items.map(\.id))
+        XCTAssertEqual(revisions.map { $0.rev }, items.map(\.rev))
     }
 
     func testPageReaderLeavesUnusualSpellingsToJSONDecoder() throws {
@@ -272,17 +280,23 @@ final class PackageMergeTests: XCTestCase {
             let json = canonical.replacingOccurrences(of: target, with: replacement)
             XCTAssertNotEqual(json, canonical, replacement)
             let expected = Result { try JSONDecoder().decode([Item].self, from: Data(json.utf8)) }
-            let actual = Result { try PackageCodec.decodeItems(try (Data(json.utf8) as NSData).compressed(using: .lzfse) as Data) }
+            let file = try (Data(json.utf8) as NSData).compressed(using: .lzfse) as Data
+            let actual = Result { try PackageCodec.decodeItems(file) }
             switch (expected, actual) {
-            case (.success(let e), .success(let a)): XCTAssertEqual(a, e, replacement)
+            case (.success(let e), .success(let a)):
+                XCTAssertEqual(a, e, replacement)
+                let revisions = try PackageCodec.itemRevisions(file)
+                XCTAssertEqual(revisions.map { $0.id }, e.map(\.id), replacement)
+                XCTAssertEqual(revisions.map { $0.rev }, e.map(\.rev), replacement)
             case (.failure, .failure): break
             default: XCTFail("\(replacement): JSONDecoder gave \(expected), the page reader \(actual)")
             }
         }
         for json in ["[]", "[ ]", "[1]", "[null]", "[,]", "]", "[", #"[{"id":"A","kind":"shape"}]"#] {
             let expected = try? JSONDecoder().decode([Item].self, from: Data(json.utf8))
-            let actual = try? PackageCodec.decodeItems(try (Data(json.utf8) as NSData).compressed(using: .lzfse) as Data)
-            XCTAssertEqual(actual, expected, json)
+            let file = try (Data(json.utf8) as NSData).compressed(using: .lzfse) as Data
+            XCTAssertEqual(try? PackageCodec.decodeItems(file), expected, json)
+            XCTAssertEqual((try? PackageCodec.itemRevisions(file))?.map { $0.id }, expected?.map(\.id), json)
         }
     }
 
@@ -333,9 +347,9 @@ final class PackageMergeTests: XCTestCase {
         let doc = content.meta.id
         let pkg = lib.package(doc)
         let events = EventBus()
-        var reasons: [String] = []
+        var reasons: [String?] = []
         let subscription = events.subscribe { e in
-            if e.type == NibEventType.syncStatus, let reason = e.payload?["reason"]?.stringValue { reasons.append(reason) }
+            if let status = e.decode(SyncStatusPayload.self) { reasons.append(status.reason) }
         }
         defer { subscription.cancel() }
         let gate = ReadOnlyGate()
@@ -343,14 +357,14 @@ final class PackageMergeTests: XCTestCase {
         store.didChange(doc, head: content, pages: items)
         store.flush(doc)
         _ = try store.loadHead(doc)
-        XCTAssertFalse(gate.contains(doc))
+        XCTAssertFalse(store.isReadOnly(doc))
 
         var newer = content
         newer.meta.format = NibFormat.version + 1
         newer.meta.rev = HLCClock(device: 11).tick()
         try PackageCodec.encodeHead(newer).write(to: pkg.appendingPathComponent("doc.0000000b.json"))
         XCTAssertNotNil(try store.remoteChanges(doc))
-        XCTAssertTrue(gate.contains(doc))
+        XCTAssertTrue(store.isReadOnly(doc))
         XCTAssertTrue(gate.published.contains(doc.raw))
         XCTAssertEqual(reasons, ["newerFormat"])
     }
@@ -392,17 +406,71 @@ final class PackageMergeTests: XCTestCase {
         try PackageCodec.encodeHead(skewed).write(to: pkg.appendingPathComponent("doc.0000000b.json"))
 
         let events = EventBus()
-        var warnings: [JSONValue] = []
+        var warnings: [SyncStatusPayload] = []
         let subscription = events.subscribe { e in
-            if e.type == NibEventType.syncStatus, let payload = e.payload,
-               payload["reason"]?.stringValue == "futureRevision" { warnings.append(payload) }
+            if let status = e.decode(SyncStatusPayload.self), status.reason == "futureRevision" { warnings.append(status) }
         }
         defer { subscription.cancel() }
         let head = try lib.store("0000000a", events: events).loadHead(doc)
         XCTAssertEqual(head.meta.language, "en-GB")
         XCTAssertEqual(warnings.count, 1)
-        XCTAssertEqual(warnings.first?["state"]?.stringValue, "warning")
-        XCTAssertEqual(warnings.first?["files"]?.arrayValue?.compactMap { $0.stringValue }, ["doc.0000000b.json"])
+        XCTAssertEqual(warnings.first?.state, "warning")
+        XCTAssertEqual(warnings.first?.source, "store")
+        XCTAssertEqual(warnings.first?.files, ["doc.0000000b.json"])
+    }
+
+    func testContentRevisionIsTheLoadedPagesWithoutLoadingIt() throws {
+        let lib = TestLibrary()
+        let (content, items) = Fixtures.sampleContent()
+        let doc = content.meta.id
+        let page = Fixtures.page1
+        let dir = lib.package(doc).appendingPathComponent("pages/\(page.raw)", isDirectory: true)
+        let writer = lib.store("00000007")
+        writer.didChange(doc, head: content, pages: items)
+        writer.flush(doc)
+        // What another device gets by loading the page: the workspace's answer once the page is cached.
+        func loaded() throws -> Rev {
+            try lib.store("0000000c").loadItems(doc, page: page).map(\.rev).max() ?? .zero
+        }
+
+        let store = lib.store("00000007")
+        XCTAssertNil(store.contentRevision("NOSUCHDOC001", page: page))
+        XCTAssertNil(store.contentRevision(doc, page: "../../escape"))
+        XCTAssertEqual(store.contentRevision(doc, page: "NEVERWRITTEN"), .zero, "a page without files is empty")
+        XCTAssertEqual(store.contentRevision(doc, page: page), Rev(wallMs: 1, counter: 0, device: 0))
+        XCTAssertEqual(store.contentRevision(doc, page: page), try loaded())
+
+        // Another device adds a stroke: its file is new, so the page is read again.
+        let clock = HLCClock(device: 8)
+        var stroke = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 1, y: 1), StrokePoint(x: 2, y: 2)]))
+        stroke.id = "REVSTROKE001"
+        stroke.rev = clock.tick()
+        try PackageCodec.encodeItems(try XCTUnwrap(items[page]) + [stroke])
+            .write(to: dir.appendingPathComponent("00000008.nibpage"))
+        XCTAssertEqual(store.contentRevision(doc, page: page), stroke.rev)
+        XCTAssertEqual(store.contentRevision(doc, page: page), try loaded())
+
+        // A conflict copy deletes it with a revision two days ahead: that revision loses the merge, as in loadItems.
+        var skewed = stroke
+        skewed.deleted = true
+        skewed.rev = Rev(wallMs: PackageCodec.ms(Date()) + 2 * 86_400_000, counter: 0, device: 9)
+        try PackageCodec.encodeItems([skewed]).write(to: dir.appendingPathComponent("00000008 2.nibpage"))
+        XCTAssertEqual(store.contentRevision(doc, page: page), stroke.rev)
+        XCTAssertEqual(store.contentRevision(doc, page: page), try loaded())
+
+        // Changes not on disk yet count: a pending snapshot, and after a crash the write-ahead log.
+        var pending = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 3, y: 3)]))
+        pending.id = "REVSTROKE002"
+        pending.rev = clock.tick()
+        store.didChange(doc, head: nil, pages: [page: try store.loadItems(doc, page: page) + [pending]])
+        XCTAssertEqual(store.contentRevision(doc, page: page), pending.rev)
+        store.waitForIO()
+        let relaunched = lib.store("00000007")
+        XCTAssertEqual(relaunched.contentRevision(doc, page: page), pending.rev, "replayed from the log")
+        store.flush(doc)
+        XCTAssertTrue(store.wal.read(doc).isEmpty)
+        XCTAssertEqual(relaunched.contentRevision(doc, page: page), pending.rev, "now from the files")
+        XCTAssertEqual(relaunched.contentRevision(doc, page: page), try loaded())
     }
 
     func testExpiredTombstonesAreDroppedOnWrite() {

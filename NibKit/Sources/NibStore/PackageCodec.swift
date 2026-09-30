@@ -65,14 +65,22 @@ enum PackageCodec {
         return try (json as NSData).compressed(using: .lzfse) as Data
     }
 
-    // ponytail: `JSONDecoder` is slow for big pages, most of all in Debug builds: `Stroke.init(from:)` unpacks every
-    // point float through a string-keyed setter and `Item.init(from:)` probes 19 keys per item. `PageReader` builds the
-    // stroke items this encoder writes directly and hands everything else to `JSONDecoder`. A fullFormat fast path in
-    // `Stroke.unpack` (NibContracts) would make the points part of it unnecessary.
+    // ponytail: `JSONDecoder` is slow for big pages, most of all in Debug builds: `Item.init(from:)` probes 19 keys per
+    // item and every string of a stroke goes through the keyed container. `PageReader` builds the stroke items this
+    // encoder writes directly (points through `Stroke.unpackCompact`, like `Stroke.init(from:)`) and hands everything
+    // else to `JSONDecoder`.
     static func decodeItems(_ data: Data) throws -> [Item] {
         let json = try (data as NSData).decompressed(using: .lzfse) as Data
         if let page = PageReader.read(json) { return page.items }
         return try JSONDecoder().decode([Item].self, from: json)
+    }
+
+    /// Id and revision of every item of a page file, in file order, without building the items
+    /// (`PageReader.revisions`); a file it is not sure about is decoded in full. Throws when the file does not decode.
+    static func itemRevisions(_ data: Data) throws -> [(id: NibID, rev: Rev)] {
+        let json = try (data as NSData).decompressed(using: .lzfse) as Data
+        if let revisions = PageReader.revisions(json) { return revisions }
+        return try JSONDecoder().decode([Item].self, from: json).map { ($0.id, $0.rev) }
     }
 
     // MARK: Merge
@@ -97,6 +105,15 @@ enum PackageCodec {
     static func mergeItems(_ lists: [[Item]]) -> [Item] {
         guard let first = lists.first else { return [] }
         return lists.dropFirst().reduce(first) { LWW.merge($0, $1) }
+    }
+
+    /// `LWW.merge` over ids and revisions only: a revision replaces the one known for its id when it is higher
+    /// (effective, so far-future revisions lose); ties keep the one merged first.
+    static func merge(_ revisions: [(id: NibID, rev: Rev)], into known: inout [NibID: Rev], now: UInt64) {
+        for (id, rev) in revisions {
+            if let old = known[id], !(rev.effective(now: now) > old.effective(now: now)) { continue }
+            known[id] = rev
+        }
     }
 
     static func revs<T: LWWRecord>(_ records: [T]) -> [NibID: Rev] {
@@ -192,63 +209,17 @@ struct PageReader {
         }
     }
 
-    /// True when `StrokePoint` is ten `Float`s in `fullFormat` order on a little-endian host, i.e. laid out exactly
-    /// like `ptsB64` bytes, so points are copied instead of assembled one by one.
-    static let pointsAreRawFloats: Bool = {
-        let fields: [PartialKeyPath<StrokePoint>] = [\.x, \.y, \.t, \.force, \.azimuth, \.altitude, \.roll, \.width,
-                                                     \.height, \.opacity]
-        let order = ["x", "y", "t", "force", "azimuth", "altitude", "roll", "width", "height", "opacity"]
-        return StrokePoint.fullFormat == order && StrokePoint.fullStride == order.count
-            && MemoryLayout<StrokePoint>.size == 40 && MemoryLayout<StrokePoint>.stride == 40 && 1.littleEndian == 1
-            && fields.indices.allSatisfy { MemoryLayout<StrokePoint>.offset(of: fields[$0]) == $0 * 4 }
-    }()
-
-    /// Exactly what `Stroke.init(from:)` makes of decoded `ptsB64` bytes: little-endian Float32s in
-    /// `StrokePoint.fullFormat` order, a trailing partial point dropped.
-    static func points(_ data: Data) -> [StrokePoint] {
-        let count = data.count / (StrokePoint.fullStride * MemoryLayout<Float>.size)
-        guard pointsAreRawFloats else { return assembledPoints(data) }
-        return [StrokePoint](unsafeUninitializedCapacity: count) { buffer, initialized in
-            data.withUnsafeBytes { raw in
-                if count > 0, let from = raw.baseAddress, let to = buffer.baseAddress {
-                    UnsafeMutableRawPointer(to).copyMemory(from: from, byteCount: count * MemoryLayout<StrokePoint>.stride)
-                }
-            }
-            initialized = count
+    /// The id and revision of every element of a page file's `[Item]` JSON, in order, without building the items: the
+    /// "id" and "rev" keys of each element object itself (values nested in item data are skipped whole, whatever keys
+    /// they hold). nil when the JSON is not a plain array of objects, or an element's "id" or "rev" is missing,
+    /// repeated or not in the plain form `encodeItems` writes: the caller then decodes the page.
+    static func revisions(_ json: Data) -> [(id: NibID, rev: Rev)]? {
+        json.withUnsafeBytes { raw -> [(id: NibID, rev: Rev)]? in
+            guard raw.count >= 2, let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            let scratch = UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1) // no points are read
+            defer { scratch.deallocate() }
+            return PageReader(p: base, n: raw.count, scratch: scratch).revisionList()
         }
-    }
-
-    /// `points` for a `StrokePoint` layout that does not match the bytes: `Stroke.unpack` over `fullFormat`, spelled out.
-    static func assembledPoints(_ data: Data) -> [StrokePoint] {
-        let fields = StrokePoint.fullFormat
-        let stride = fields.count
-        var floats = [Float](repeating: 0, count: data.count / MemoryLayout<Float>.size)
-        _ = floats.withUnsafeMutableBufferPointer { data.copyBytes(to: $0) }
-        var out: [StrokePoint] = []
-        guard stride > 0 else { return out }
-        out.reserveCapacity(floats.count / stride)
-        var i = 0
-        while i + stride <= floats.count {
-            var point = StrokePoint(x: 0, y: 0, t: Float(out.count) * 0.008)
-            for (k, field) in fields.enumerated() {
-                switch field {
-                case "x": point.x = floats[i + k]
-                case "y": point.y = floats[i + k]
-                case "t": point.t = floats[i + k]
-                case "force": point.force = floats[i + k]
-                case "azimuth": point.azimuth = floats[i + k]
-                case "altitude": point.altitude = floats[i + k]
-                case "roll": point.roll = floats[i + k]
-                case "width": point.width = floats[i + k]
-                case "height": point.height = floats[i + k]
-                case "opacity": point.opacity = floats[i + k]
-                default: break
-                }
-            }
-            out.append(point)
-            i += stride
-        }
-        return out
     }
 
     private let p: UnsafePointer<UInt8>
@@ -441,7 +412,7 @@ struct PageReader {
             return nil
         }
         i = end + 1
-        return PageReader.points(data)
+        return Stroke.unpackCompact(data)
     }
 
     private mutating func style(_ i: inout Int) -> InkStyle? {
@@ -457,6 +428,38 @@ struct PageReader {
         if styles.count < 64 { styles.append((i, end - i, style)) }
         i = end
         return style
+    }
+
+    // MARK: Revisions
+
+    private func revisionList() -> [(id: NibID, rev: Rev)]? {
+        guard p[0] == 0x5B, p[n - 1] == 0x5D else { return nil } // [ … ]
+        var out: [(id: NibID, rev: Rev)] = []
+        var i = 1
+        guard i < n - 1 else { return out } // []
+        while true {
+            guard lit(&i, "{") else { return nil }
+            var id: String?
+            var revision: Rev?
+            repeat {
+                guard let key = plainString(&i), lit(&i, ":") else { return nil }
+                switch key {
+                case "id":
+                    guard id == nil, let s = plainString(&i) else { return nil }
+                    id = s
+                case "rev":
+                    guard revision == nil, let r = rev(&i) else { return nil }
+                    revision = r
+                default:
+                    guard let end = valueEnd(i), end > i else { return nil }
+                    i = end
+                }
+            } while lit(&i, ",")
+            guard lit(&i, "}"), let id = id, let revision = revision else { return nil }
+            out.append((NibID(id), revision))
+            if i == n - 1 { return out }
+            guard lit(&i, ","), i < n - 1 else { return nil } // a comma, then another element
+        }
     }
 
     // MARK: Structure
@@ -603,6 +606,18 @@ struct PackageFiles {
             }
         }
         return r
+    }
+
+    /// Id → revision of the items in `sources`, merged last-writer-wins in source order like `PackageCodec.mergeItems`
+    /// over the decoded files, without building the items. Files that do not decode are left out, as `read` does.
+    func revisions(_ sources: [Source], now: UInt64) -> [NibID: Rev] {
+        var out: [NibID: Rev] = [:]
+        for s in sources {
+            guard let data = try? Data(contentsOf: s.url),
+                  let revisions = try? PackageCodec.itemRevisions(data) else { continue }
+            PackageCodec.merge(revisions, into: &out, now: now)
+        }
+        return out
     }
 
     /// The package folder of `doc`, which must exist: creating packages is the library's job (F002), and a write that
