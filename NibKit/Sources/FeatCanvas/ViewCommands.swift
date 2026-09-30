@@ -81,7 +81,7 @@ struct ViewGoToPage: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "view.goToPage", title: "Go to Page",
+        id: CommandIDs.viewGoToPage, title: "Go to Page",
         summary: "Scroll the window to a page: pass page (a page ref) or index (0-based in the window's document; -1 = last).",
         params: .obj(["page": .ref,
                       "index": .int("0-based page number in the window's document (-1 = last page)", min: -1_000_000),
@@ -154,7 +154,7 @@ struct ViewZoom: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "view.zoom", title: "Zoom",
+        id: CommandIDs.viewZoom, title: "Zoom",
         summary: "Zoom the window's page: scale (1 = 100 %, notebooks 0.5–8, boards 0.05–4), fit: true, actual: true, or step in/out.",
         params: .obj(["scale": .num("zoom factor, 1 = 100 %", min: 0.01, max: 16),
                       "fit": .bool("fit the page width (a board: all of its content)"),
@@ -230,7 +230,7 @@ struct ViewScrollBy: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "view.scrollBy", title: "Scroll",
+        id: CommandIDs.viewScrollBy, title: "Scroll",
         summary: "Pan the window by dx, dy page points (positive = right, down); unit \"window\" takes fractions of the visible area.",
         params: .obj(["dx": .num("page points (or window fractions)"), "dy": .num("page points (or window fractions)"),
                       "unit": .str("points (default) or window", choices: ["points", "window"]),
@@ -267,7 +267,7 @@ struct ViewReveal: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "view.reveal", title: "Show on Page",
+        id: CommandIDs.viewReveal, title: "Show on Page",
         summary: "Scroll an item into view and flash it (also a page, an outline entry or a text-document block); opens the document if needed.",
         params: .obj(["ref": .ref, "flash": .bool("flash the item (default true)"), "animated": .bool("animate (default false)")],
                      required: ["ref"]),

@@ -290,7 +290,7 @@ struct CanvasDecorate: NibCommand {
     ], required: ["op"])
 
     static let descriptor = CommandDescriptor(
-        id: "canvas.decorate", title: "Decorate Page",
+        id: CommandIDs.canvasDecorate, title: "Decorate Page",
         summary: "Show a transient DisplayList overlay (page coordinates) on a page for ttl seconds (default 5); reusing an id replaces it.",
         params: .obj(["page": .ref,
                       "id": .str("your id for this overlay ([A-Za-z0-9_.:-], ≤ 64); reusing it replaces the overlay"),
@@ -342,7 +342,7 @@ struct CanvasClearDecorations: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "canvas.clearDecorations", title: "Clear Page Decorations",
+        id: CommandIDs.canvasClearDecorations, title: "Clear Page Decorations",
         summary: "Remove canvas decorations: all of yours, or one id (optionally only on one page).",
         params: .obj(["id": .str("decoration id; omit to clear all of yours"), "page": .ref]),
         examples: [[:], ["id": "hint"]],

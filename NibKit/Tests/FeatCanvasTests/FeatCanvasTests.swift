@@ -105,6 +105,11 @@ final class FeatCanvasTests: XCTestCase {
             XCTAssertEqual(h.app.ui.editors.get(kind.rawValue)?.owner, "canvas", "\(kind)")
         }
         XCTAssertNil(h.app.ui.editors.get(DocumentKind.textDocument.rawValue))
+        // contracts-v2.1: every command registers under its catalogue constant.
+        XCTAssertEqual([ViewGoToPage.descriptor.id, ViewZoom.descriptor.id, ViewScrollBy.descriptor.id,
+                        ViewReveal.descriptor.id, CanvasDecorate.descriptor.id, CanvasClearDecorations.descriptor.id],
+                       [CommandIDs.viewGoToPage, CommandIDs.viewZoom, CommandIDs.viewScrollBy, CommandIDs.viewReveal,
+                        CommandIDs.canvasDecorate, CommandIDs.canvasClearDecorations])
         for id in ["view.goToPage", "view.zoom", "view.scrollBy", "view.reveal", "canvas.decorate", "canvas.clearDecorations"] {
             let d = h.app.commands.descriptor(id)
             XCTAssertEqual(d?.owner, "canvas", id)
@@ -132,6 +137,31 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(down?.scope, .canvas)
         for id in ["canvas.pan.up", "canvas.pan.left", "canvas.pan.right"] {
             XCTAssertEqual(h.app.content.keyCommands.get(id)?.command, "view.scrollBy", id)
+        }
+    }
+
+    /// Shell v2 (contracts-v2.2 key routing): the ⌥-arrow pans are live only in a notebook or whiteboard while no text
+    /// is being edited, win their shortcuts there, take priority over the system's ⌥-arrow, and reach `view.scrollBy`
+    /// with their own params (the command finds the window from the session the shell passes).
+    func testPanKeysAreLiveOnlyOnTheCanvasOfNotebooksAndWhiteboards() {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let pans = CanvasKeys.pans.compactMap { h.app.content.keyCommands.get($0.id) }
+        XCTAssertEqual(pans.count, 4)
+        let all = h.app.content.keyCommands.all
+        for kind in [DocumentKind.notebook, .whiteboard] {
+            let context = KeyCommandContext(docKind: kind, hasTabs: true)
+            let live = Set(KeyCommandRouting.active(all, in: context).map { $0.id })
+            for pan in pans {
+                XCTAssertTrue(live.contains(pan.id), "\(pan.id) in \(kind)")
+                XCTAssertTrue(KeyCommandRouting.overridesSystemKeys(pan, in: context), pan.id)
+                XCTAssertEqual(pan.resolvedParams(for: h.session), pan.params, pan.id)
+            }
+            let editing = KeyCommandContext(docKind: kind, isEditingText: true, hasTabs: true)
+            XCTAssertTrue(pans.allSatisfy { !$0.isActive(in: editing) }, "text being edited keeps ⌥-arrow in \(kind)")
+        }
+        for context in [KeyCommandContext(docKind: .textDocument), KeyCommandContext(docKind: .studySet),
+                        KeyCommandContext(docKind: nil, hasTabs: true)] {
+            XCTAssertTrue(pans.allSatisfy { !$0.isActive(in: context) }, "\(context)")
         }
     }
 
