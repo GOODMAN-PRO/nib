@@ -3,6 +3,7 @@ import SwiftUI
 import UIKit
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatInkSynth
 
 /// A dictionary of a few English words: everything else is misspelled; "teh" has guesses.
@@ -20,6 +21,32 @@ private final class FakeChecker: SpellingChecker {
     }
 
     func guesses(for word: String, language: String) -> [String] { guessTable[word.lowercased()] ?? [] }
+}
+
+/// Recognition with transient errors and an optional suspension to exercise edits during a run.
+@MainActor
+private final class RetryRecognizer: TextRecognizer {
+    let base: FakeRecognizer
+    var errors: [Error] = []
+    var requests: [[Item]] = []
+    var suspended = false
+    var continuation: CheckedContinuation<Void, Never>?
+
+    init(_ script: [TextRecognition], errors: [Error] = []) {
+        base = FakeRecognizer(script)
+        self.errors = errors
+    }
+
+    func recognize(strokes: [Item], language: String) async throws -> [TextRecognition] {
+        requests.append(strokes)
+        if !errors.isEmpty { throw errors.removeFirst() }
+        if suspended { await withCheckedContinuation { continuation = $0 } }
+        return try await base.recognize(strokes: strokes, language: language)
+    }
+
+    func recognize(image: CGImage, language: String) async throws -> [TextRecognition] {
+        try await base.recognize(image: image, language: language)
+    }
 }
 
 /// Records what spellcheck asks of the window's floating host.
@@ -128,6 +155,11 @@ final class SpellcheckerTests: XCTestCase {
         return line
     }
 
+    private func settleDictionaryChanges() async {
+        // Drain the coalesced main-actor update and any notification delivery.
+        for _ in 0..<3 { await Task.yield() }
+    }
+
     // MARK: Words and suggestions (pure rules)
 
     func testTokensKeepApostrophesAndHyphensAndDropSurroundingPunctuation() {
@@ -159,7 +191,7 @@ final class SpellcheckerTests: XCTestCase {
     func testSuggestionsPutOtherReadingsFirstMatchCaseAndKeepPunctuation() {
         let checker = FakeChecker()
         let m = Misspelling(written: "Teh,", word: "Teh", prefix: "", suffix: ",", bbox: .zero, itemIDs: ["A"],
-                            alternatives: ["tea"], layer: 0)
+                            alternatives: ["tea"], layers: [0])
         let suggestions = Spellchecker.suggestions(for: m, language: "en_US", dictionary: [], checker: checker)
         XCTAssertEqual(suggestions, ["Tea", "The", "Ten"])
         XCTAssertEqual(Spellchecker.replacement(suggestions[1], for: m), "The,")
@@ -182,11 +214,14 @@ final class SpellcheckerTests: XCTestCase {
         XCTAssertEqual(Spellchecker.resolveLanguage("fr", available: available), "fr_FR")
         XCTAssertEqual(Spellchecker.resolveLanguage("zh-Hant-TW", available: available), "zh_Hant")
         XCTAssertNil(Spellchecker.resolveLanguage("ja-JP", available: available))
+        for tag in ["", "-", "_", "--", "__", " -_ "] {
+            XCTAssertNil(Spellchecker.resolveLanguage(tag, available: available), tag)
+        }
     }
 
     func testTapTargetsGrowToAComfortableSize() {
         let small = Misspelling(written: "teh", word: "teh", prefix: "", suffix: "", bbox: Rect(x: 100, y: 100, width: 20, height: 10),
-                                itemIDs: ["A"], alternatives: [], layer: 0)
+                                itemIDs: ["A"], alternatives: [], layers: [0])
         XCTAssertEqual(Spellchecker.hit(Point(92, 124), ref: nil, in: [small], minimumSize: 44), small)
         XCTAssertNil(Spellchecker.hit(Point(160, 104), ref: nil, in: [small], minimumSize: 44))
         XCTAssertEqual(Spellchecker.hit(Point(400, 400), ref: "A", in: [small], minimumSize: 44), small,
@@ -211,7 +246,7 @@ final class SpellcheckerTests: XCTestCase {
         XCTAssertFalse(checker.isMisspelled("the", language: language))
         XCTAssertTrue(checker.guesses(for: "teh", language: language).map { $0.lowercased() }.contains("the"))
         let m = Misspelling(written: "teh", word: "teh", prefix: "", suffix: "", bbox: .zero, itemIDs: ["A"],
-                            alternatives: [], layer: 0)
+                            alternatives: [], layers: [0])
         XCTAssertTrue(Spellchecker.suggestions(for: m, language: language, dictionary: [], checker: checker).contains("the"))
         XCTAssertFalse(Spellchecker.isMisspelled("teh", language: language, dictionary: ["teh"], checker: checker),
                        "the personal dictionary wins over the system's")
@@ -242,6 +277,174 @@ final class SpellcheckerTests: XCTestCase {
         XCTAssertFalse(engine.needsCheck(Fixtures.docID, Fixtures.page2))
     }
 
+    func testTransientFailureRetriesAfterTogglingSpellcheck() async throws {
+        let h = try await makeHarness()
+        let strokes = try await seedWords(h, ["WORDTEH00001"])
+        let recognizer = RetryRecognizer([reading(["teh"], strokes)], errors: [NibError.unavailable("temporary")])
+        h.app.services.recognizer = recognizer
+        let engine = SpellcheckEngine.shared(h.app)
+        do {
+            try await engine.check(Fixtures.docID, Fixtures.page2)
+            XCTFail("expected the transient failure")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .unavailable) }
+        XCTAssertFalse(engine.needsCheck(Fixtures.docID, Fixtures.page2))
+        try await h.run(CommandIDs.docSetWritingAids, ["doc": "doc:FIXTUREDOC01", "spellcheck": false])
+        try await h.run(CommandIDs.docSetWritingAids, ["doc": "doc:FIXTUREDOC01", "spellcheck": true])
+        XCTAssertTrue(engine.needsCheck(Fixtures.docID, Fixtures.page2))
+        let host = FakeCanvasHost(h)
+        host.pages = [Fixtures.page2]
+        let underlines = SpellcheckUnderlines()
+        underlines.attach(to: host)
+        defer { underlines.detach(from: host) }
+        await underlines.checkVisiblePages()
+        XCTAssertNotNil(underlines.drawnPages[Fixtures.page2])
+        XCTAssertEqual(recognizer.requests.count, 2)
+    }
+
+    func testFailureBackoffDoublesIsCappedAndReopeningClearsIt() async throws {
+        let h = try await makeHarness()
+        let strokes = try await seedWords(h, ["WORDTEH00001"])
+        let errors = Array(repeating: NibError.unavailable("temporary"), count: 6)
+        let recognizer = RetryRecognizer([reading(["teh"], strokes)], errors: errors)
+        h.app.services.recognizer = recognizer
+        let engine = SpellcheckEngine.shared(h.app)
+        var time: TimeInterval = 100
+        engine.now = { time }
+        for delay: TimeInterval in [30, 60, 120, 240, 300, 300] {
+            do {
+                try await engine.check(Fixtures.docID, Fixtures.page2)
+                XCTFail("expected failure")
+            } catch { XCTAssertEqual((error as? NibError)?.code, .unavailable) }
+            XCTAssertEqual(engine.retryDelay(Fixtures.docID, Fixtures.page2), delay)
+            XCTAssertFalse(engine.needsCheck(Fixtures.docID, Fixtures.page2))
+            time += delay
+            XCTAssertTrue(engine.needsCheck(Fixtures.docID, Fixtures.page2))
+        }
+        let checked = try await engine.check(Fixtures.docID, Fixtures.page2)
+        XCTAssertEqual(checked.misspellings.map { $0.word }, ["teh"])
+
+        let other = try await seedWords(h, ["WORDANS00001"])
+        recognizer.errors = [NibError.unavailable("temporary")]
+        do {
+            try await engine.check(Fixtures.docID, Fixtures.page2)
+            XCTFail("expected failure")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .unavailable) }
+        XCTAssertFalse(engine.needsCheck(Fixtures.docID, Fixtures.page2))
+        let host = FakeCanvasHost(h)
+        host.pages = [Fixtures.page2]
+        let underlines = SpellcheckUnderlines()
+        underlines.attach(to: host)
+        defer { underlines.detach(from: host) }
+        XCTAssertTrue(engine.needsCheck(Fixtures.docID, Fixtures.page2), "reopening clears document failures")
+        XCTAssertFalse(other.isEmpty)
+    }
+
+    func testPermissionDenialCancellationAndOtherPrincipalsNeverLatchFailures() async throws {
+        let h = try await makeHarness()
+        let strokes = try await seedWords(h, ["WORDTEH00001"])
+        let engine = SpellcheckEngine.shared(h.app)
+        let recognizer = RetryRecognizer([reading(["teh"], strokes)], errors: [
+            NibError(.permissionDenied, "missing read"), NibError(.userDenied, "declined"),
+            NibError(.locked, "locked"), CancellationError()
+        ])
+        h.app.services.recognizer = recognizer
+        for _ in 0..<4 {
+            do {
+                try await engine.check(Fixtures.docID, Fixtures.page2)
+                XCTFail("expected rejection")
+            } catch { }
+            XCTAssertTrue(engine.needsCheck(Fixtures.docID, Fixtures.page2))
+        }
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise", summary: "Test recognition command.", effect: .read)) { _, _ in
+            throw NibError.unavailable("test")
+        }
+        do {
+            try await engine.check(Fixtures.docID, Fixtures.page2) { _ in throw NibError(.internalError, "plugin failure") }
+            XCTFail("expected runner failure")
+        } catch { XCTAssertEqual((error as? NibError)?.code, .internalError) }
+        XCTAssertTrue(engine.needsCheck(Fixtures.docID, Fixtures.page2))
+        let result = try await engine.check(Fixtures.docID, Fixtures.page2)
+        XCTAssertEqual(result.misspellings.map { $0.word }, ["teh"])
+    }
+
+    func testDictionaryNotificationsCoalesceIntoOneRefilter() async throws {
+        let h = try await makeHarness()
+        let strokes = try await seedWords(h, ["WORDTEH00001"])
+        let recognizer = FakeRecognizer([reading(["teh"], strokes)])
+        h.app.services.recognizer = recognizer
+        let engine = SpellcheckEngine.shared(h.app)
+        try await engine.check(Fixtures.docID, Fixtures.page2)
+        let generation = engine.dictionaryGeneration
+        var notifications = 0
+        let observation = engine.observe { change in
+            if change.doc == nil { notifications += 1 }
+        }
+        defer { observation.cancel() }
+        for word in ["teh", "nibnote", "zettel"] { h.app.settings.set(NibSettings.dictionaryWord(word), true) }
+        await settleDictionaryChanges()
+        XCTAssertEqual(engine.dictionaryGeneration, generation + 1)
+        XCTAssertEqual(notifications, 1)
+        XCTAssertEqual(engine.displayed(Fixtures.docID, Fixtures.page2)?.misspellings, [])
+        XCTAssertEqual(recognizer.strokeCalls, 1)
+    }
+
+    func testWhiteboardChecksOnlyVisibleInkAndChecksNewRegionsAfterScrolling() async throws {
+        let h = try await makeHarness()
+        h.app.commands.register(CommandDescriptor(id: "test.board", title: "Board", summary: "Test document kind.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var meta = try tx.content(Fixtures.docID).meta
+                meta.kind = .whiteboard
+                try tx.putMeta(meta)
+            }
+            return .null
+        }
+        try await h.run("test.board")
+        let strokes = try await seedWords(h, ["WORDTEH00001", "WORDANS00001"])
+        let recognizer = RetryRecognizer([reading(["teh", "anser"], strokes)])
+        h.app.services.recognizer = recognizer
+        let engine = SpellcheckEngine.shared(h.app)
+        let firstRect = strokes[0].bounds.insetBy(-10)
+        let secondRect = strokes[1].bounds.insetBy(-10)
+        let first = try await engine.check(Fixtures.docID, Fixtures.page2, visibleRect: firstRect)
+        XCTAssertEqual(recognizer.requests.first?.map { $0.id }, [strokes[0].id])
+        XCTAssertEqual(first.misspellings.map { $0.word }, ["teh"])
+        XCTAssertFalse(engine.needsCheck(Fixtures.docID, Fixtures.page2, visibleRect: firstRect))
+        XCTAssertTrue(engine.needsCheck(Fixtures.docID, Fixtures.page2, visibleRect: secondRect))
+        let second = try await engine.check(Fixtures.docID, Fixtures.page2, visibleRect: secondRect)
+        XCTAssertEqual(recognizer.requests.last?.map { $0.id }, [strokes[1].id])
+        XCTAssertEqual(Set(second.misspellings.map { $0.word }), ["teh", "anser"])
+        XCTAssertFalse(engine.isFresh(Fixtures.docID, Fixtures.page2), "a partial check cannot satisfy a full-page request")
+    }
+
+    func testAutomaticChecksWaitForInkingAndDoNotDuplicateAnInflightRun() async throws {
+        let h = try await makeHarness()
+        let strokes = try await seedWords(h, ["WORDTEH00001"])
+        let recognizer = RetryRecognizer([reading(["teh"], strokes)])
+        recognizer.suspended = true
+        h.app.services.recognizer = recognizer
+        let host = FakeCanvasHost(h)
+        host.pages = [Fixtures.page2]
+        let underlines = SpellcheckUnderlines()
+        underlines.attach(to: host)
+        defer { underlines.detach(from: host) }
+        h.session.inking.begin()
+        await underlines.checkVisiblePages()
+        XCTAssertTrue(recognizer.requests.isEmpty)
+        h.session.inking.end()
+        let running = Task { @MainActor in await underlines.checkVisiblePages() }
+        while recognizer.continuation == nil { await Task.yield() }
+        await underlines.checkVisiblePages()
+        XCTAssertEqual(recognizer.requests.count, 1)
+        h.session.inking.begin()
+        await underlines.checkVisiblePages()
+        XCTAssertEqual(recognizer.requests.count, 1)
+        recognizer.continuation?.resume()
+        recognizer.continuation = nil
+        await running.value
+        h.session.inking.end()
+        XCTAssertNotNil(underlines.drawnPages[Fixtures.page2])
+    }
+
     func testAPersonalDictionaryWordIsSkipped() async throws {
         let checker = FakeChecker()
         let h = try await makeHarness(checker: checker)
@@ -255,12 +458,14 @@ final class SpellcheckerTests: XCTestCase {
         let added = try await h.run(CommandIDs.dictionaryAdd, ["word": " Nibnote, "])
         XCTAssertEqual(added["word"]?.stringValue, "nibnote")
         XCTAssertEqual(added["added"]?.boolValue, true)
+        await settleDictionaryChanges()
         let filtered = try await engine.check(Fixtures.docID, Fixtures.page2)
         XCTAssertEqual(filtered.misspellings.map { $0.word }, ["teh"],
                        "dictionary words are skipped, whatever their case or possessive")
         XCTAssertEqual(recognizer.strokeCalls, 1, "a dictionary change re-filters without recognising again")
 
         try await h.run(CommandIDs.dictionaryRemove, ["word": "NIBNOTE"])
+        await settleDictionaryChanges()
         XCTAssertEqual(engine.displayed(Fixtures.docID, Fixtures.page2)?.misspellings.map { $0.word }, ["Nibnote's", "teh"])
     }
 
@@ -339,6 +544,53 @@ final class SpellcheckerTests: XCTestCase {
         XCTAssertEqual(off["handled"]?.boolValue, false, "spellcheck off: taps go on to selection")
     }
 
+    func testAppOnlyPluginCannotReadCachedOrUncheckedHandwriting() async throws {
+        let h = try await makeHarness()
+        let strokes = try await seedWords(h, ["WORDTEH00001"])
+        let recognizer = FakeRecognizer([reading(["teh"], strokes)])
+        h.app.services.recognizer = recognizer
+        h.app.gateway.grants = { _ in [.app] }
+        let engine = SpellcheckEngine.shared(h.app)
+        let params: JSONValue = ["page": .string(page2), "point": [100, 108]]
+        for cached in [false, true] {
+            if cached { try await engine.check(Fixtures.docID, Fixtures.page2) }
+            do {
+                try await h.run(CommandIDs.spellcheckTapAt, params, as: .plugin("test.app-only"))
+                XCTFail("a plugin without document:read must not see handwriting")
+            } catch let error as NibError { XCTAssertEqual(error.code, .permissionDenied) }
+            if !cached { XCTAssertTrue(engine.needsCheck(Fixtures.docID, Fixtures.page2)) }
+        }
+        XCTAssertEqual(engine.displayed(Fixtures.docID, Fixtures.page2)?.misspellings.map { $0.word }, ["teh"])
+        XCTAssertEqual(recognizer.strokeCalls, 1)
+    }
+
+    func testAWordSpanningVisibleAndHiddenLayersCannotBeUnderlinedOrTapped() async throws {
+        let h = try await makeHarness()
+        var strokes = try await seedWords(h, ["WORDTEH00001", "WORDTEH00002"])
+        strokes[1].layer = 1
+        strokes = try await h.insert(strokes, page: Fixtures.page2)
+        let box = strokes[0].bounds.union(strokes[1].bounds)
+        var line = reading(["teh"], strokes)
+        line.words = [TextRecognitionWord(text: "teh", bbox: box, itemIDs: strokes.map { $0.id })]
+        h.app.services.recognizer = FakeRecognizer([line])
+        let checked = try await SpellcheckEngine.shared(h.app).check(Fixtures.docID, Fixtures.page2)
+        XCTAssertEqual(checked.misspellings.first?.layers, [0, 1])
+        let host = FakeCanvasHost(h)
+        host.pages = [Fixtures.page2]
+        let underlines = SpellcheckUnderlines()
+        underlines.attach(to: host)
+        defer { underlines.detach(from: host) }
+        XCTAssertNotNil(underlines.drawnPages[Fixtures.page2])
+        let params: JSONValue = ["page": .string(page2), "point": [.number(box.midX), .number(box.midY)]]
+        let visible = try await h.run(CommandIDs.spellcheckTapAt, params)
+        XCTAssertEqual(visible["handled"]?.boolValue, true)
+        h.session.hiddenLayers = [1]
+        underlines.redraw(force: false)
+        XCTAssertNil(underlines.drawnPages[Fixtures.page2])
+        let hidden = try await h.run(CommandIDs.spellcheckTapAt, params)
+        XCTAssertEqual(hidden["handled"]?.boolValue, false)
+    }
+
     func testTheAssistantGetsSuggestionsForAPageNobodyChecked() async throws {
         let h = try await makeHarness()
         let strokes = try await seedWords(h, ["WORDTEH00001"])
@@ -401,12 +653,27 @@ final class SpellcheckerTests: XCTestCase {
             try await h.run(CommandIDs.dictionaryList)["words"]?.arrayValue?.compactMap { $0.stringValue } ?? []
         }
 
+        let engine = SpellcheckEngine.shared(a.app)
+        engine.checker = FakeChecker()
+        try await a.run(CommandIDs.docSetWritingAids, ["doc": "doc:FIXTUREDOC01", "spellcheck": true])
+        let strokes = try await seedWords(a, ["WORDZET00001"])
+        let recognizer = FakeRecognizer([reading(["Zettel"], strokes)])
+        a.app.services.recognizer = recognizer
+        let checked = try await engine.check(Fixtures.docID, Fixtures.page2)
+        XCTAssertEqual(checked.misspellings.map { $0.word }, ["Zettel"])
+
         // Both devices add a word while apart: neither overwrites the other.
         try await a.run(CommandIDs.dictionaryAdd, ["word": "Nibnote"])
         try await b.run(CommandIDs.dictionaryAdd, ["word": "Zettel"])
         let wa1 = try await words(a)
         XCTAssertEqual(wa1, ["nibnote"])
+        await settleDictionaryChanges()
         prefsA.sync()
+        NotificationCenter.default.post(name: SettingsStore.didChange, object: a.app.settings,
+                                        userInfo: ["name": NibSettings.dictionaryWord("zettel").name])
+        await settleDictionaryChanges()
+        XCTAssertEqual(engine.displayed(Fixtures.docID, Fixtures.page2)?.misspellings, [])
+        XCTAssertEqual(recognizer.strokeCalls, 1, "sync refilters the checked ink without recognising again")
         prefsB.sync()
         let wa2 = try await words(a)
         XCTAssertEqual(wa2, ["nibnote", "zettel"])
@@ -483,6 +750,8 @@ final class SpellcheckerTests: XCTestCase {
             XCTAssertFalse(d.examples.isEmpty, id)
         }
         XCTAssertTrue(try XCTUnwrap(h.app.commands.descriptor(CommandIDs.dictionaryRemove)).destructive)
+        XCTAssertEqual(try XCTUnwrap(h.app.commands.descriptor(CommandIDs.spellcheckTapAt)).scopes,
+                       [.app, .documentRead])
         let tap = try XCTUnwrap(h.app.content.tapHandlers.get("spellcheck.tapAt"))
         XCTAssertEqual(tap.command, CommandIDs.spellcheckTapAt)
         XCTAssertEqual(tap.gesture, .tap)
@@ -508,6 +777,7 @@ final class SpellcheckerTests: XCTestCase {
         let floating = FakeFloatingHost()
         h.session.floatingHost = floating
         let host = FakeCanvasHost(h)
+        host.pages = [Fixtures.page2]
         let underlines = SpellcheckUnderlines()
         underlines.attach(to: host)
         defer { underlines.detach(from: host) }
@@ -521,6 +791,14 @@ final class SpellcheckerTests: XCTestCase {
         XCTAssertGreaterThan(path.boundingBoxOfPath.minY, wordRect.maxY)
         XCTAssertEqual(underlines.accessibilityWords.count, 1)
         XCTAssertEqual(underlines.accessibilityWords.first?.accessibilityLabel, "Misspelled: teh")
+
+        host.canvasView.traitOverrides.userInterfaceStyle = .dark
+        host.canvasView.traitOverrides.accessibilityContrast = .high
+        underlines.redraw(force: false)
+        let shape = try XCTUnwrap(host.canvasView.subviews.flatMap { $0.layer.sublayers ?? [] }
+            .compactMap { $0 as? CAShapeLayer }.first)
+        XCTAssertEqual(shape.strokeColor,
+                       NibUIColor.destructive.resolvedColor(with: host.canvasView.traitCollection).cgColor)
 
         // A finger tap on the word runs the tap handler, which buds the popover from the word.
         let word = strokes[0].bounds

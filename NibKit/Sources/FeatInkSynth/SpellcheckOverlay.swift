@@ -142,6 +142,7 @@ final class SpellcheckUnderlines: CanvasAttachment {
         host.canvasView.addSubview(container)
         SpellcheckUI.register(self, session: host.session)
         let doc = host.documentID
+        SpellcheckEngine.shared(host.app).clearFailures(doc)
         engineObservation = SpellcheckEngine.shared(host.app).observe { [weak self] change in
             guard change.doc == nil || change.doc == doc else { return }
             self?.resultsChanged(change)
@@ -156,12 +157,20 @@ final class SpellcheckUnderlines: CanvasAttachment {
         })
         subscriptions.append(host.session.inking.observe { [weak self] signal in
             // Nothing is recognised while the Pencil is down; the pause after it lifts starts the next check.
-            if !signal.isInking { self?.scheduleCheck() }
+            if signal.isInking {
+                self?.pendingCheck?.cancel()
+                self?.pendingCheck = nil
+            } else {
+                self?.scheduleCheck()
+            }
         })
         let sessionID = host.session.id.raw
         subscriptions.append(host.app.events.subscribe { [weak self] event in
             guard event.type == NibEventType.layersChanged, event.payload?["session"]?.stringValue == sessionID else { return }
-            Task { @MainActor in self?.redraw(force: true) }
+            Task { @MainActor in
+                self?.redraw(force: true)
+                self?.followAnchor()
+            }
         })
         host.session.$readOnly.dropFirst().sink { [weak self] _ in
             Task { @MainActor in self?.redraw(force: true) }
@@ -239,14 +248,29 @@ final class SpellcheckUnderlines: CanvasAttachment {
     func checkVisiblePages() async {
         guard let host = host, let engine = engine, isShowing else { return }
         let doc = host.documentID
-        for page in visiblePages() where engine.needsCheck(doc, page) || engine.isChecking(doc, page) {
+        for page in visiblePages() where engine.needsCheck(doc, page, visibleRect: visibleRect(page, host: host)) {
             if Task.isCancelled || host.session.inking.isInking { return }
             do {
-                try await engine.check(doc, page)
+                try await engine.check(doc, page, visibleRect: visibleRect(page, host: host))
             } catch {
                 SpellcheckUnderlines.log.error("spellcheck of page \(page.raw, privacy: .public) failed: \(NibError.wrap(error).description, privacy: .public)")
             }
         }
+        // Retry transient failures even if the user leaves the canvas still; edits during a run also need a pass.
+        let stale = visiblePages().filter { !engine.isFresh(doc, $0, visibleRect: visibleRect($0, host: host)) && !engine.isChecking(doc, $0) }
+        if let delay = stale.map({ max(SpellcheckUnderlines.checkDelay, engine.retryDelay(doc, $0)) }).min() {
+            scheduleCheck(after: delay)
+        }
+    }
+
+    private func visibleRect(_ page: PageID, host: CanvasHost) -> Rect? {
+        guard let frame = host.pageFrame(page) else { return nil }
+        let visible = frame.intersection(host.canvasView.bounds)
+        guard !visible.isNull else { return nil }
+        let zoom = max(host.zoomScale, 0.05)
+        return Rect(x: Double(visible.minX - frame.minX) / zoom,
+                    y: Double(visible.minY - frame.minY) / zoom,
+                    width: Double(visible.width) / zoom, height: Double(visible.height) / zoom)
     }
 
     private func livePages() -> [PageID] {
@@ -282,9 +306,11 @@ final class SpellcheckUnderlines: CanvasAttachment {
         hasher.combine(resultsVersion)
         hasher.combine(host.zoomScale)
         hasher.combine(hidden)
+        hasher.combine(host.canvasView.traitCollection.userInterfaceStyle.rawValue)
+        hasher.combine(host.canvasView.traitCollection.accessibilityContrast.rawValue)
         for page in engine.checkedPages(doc) {
             guard let frame = host.pageFrame(page), let spelling = engine.displayed(doc, page) else { continue }
-            let words = spelling.misspellings.filter { !hidden.contains($0.layer) }
+            let words = spelling.misspellings.filter { $0.layers.isDisjoint(with: hidden) }
             guard !words.isEmpty else { continue }
             pages.append((page, words))
             hasher.combine(page)
@@ -433,7 +459,8 @@ final class SpellcheckUnderlines: CanvasAttachment {
     private func followAnchor() {
         guard let host = host, let current = shown, current.state.isPresented else { return }
         let still = engine?.displayed(host.documentID, current.page)?.misspellings.first { $0.key == current.key }
-        guard isShowing, let m = still, let floating = host.session.floatingHost else {
+        guard isShowing, let m = still, m.layers.isDisjoint(with: host.session.hiddenLayers),
+              let floating = host.session.floatingHost else {
             current.state.isPresented = false
             return
         }

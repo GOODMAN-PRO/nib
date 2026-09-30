@@ -28,8 +28,8 @@ struct RecognizedWord: Equatable {
     var itemIDs: [ElementID]
     /// The same word in the line's alternative readings (only when an alternative has as many words).
     var alternatives: [String] = []
-    /// Lowest layer of its strokes (words on hidden layers are not underlined).
-    var layer: Int = 0
+    /// Every layer containing one of its strokes. Any hidden layer hides the whole word.
+    var layers: Set<Int> = [0]
 }
 
 /// A recognised word split into what is checked and the punctuation around it ("(teh," → "(", "teh", ",").
@@ -50,7 +50,7 @@ struct Misspelling: Equatable {
     var bbox: Rect
     var itemIDs: [ElementID]
     var alternatives: [String]
-    var layer: Int
+    var layers: Set<Int>
 
     /// Stable identity on its page (the strokes it covers).
     var key: String { itemIDs.map { $0.raw }.sorted().joined(separator: ",") }
@@ -212,7 +212,7 @@ enum Spellchecker {
             guard let t = token(w.text),
                   isMisspelled(t.core, language: language, dictionary: dictionary, checker: checker) else { return nil }
             return Misspelling(written: w.text, word: t.core, prefix: t.prefix, suffix: t.suffix, bbox: w.bbox,
-                               itemIDs: w.itemIDs, alternatives: w.alternatives, layer: w.layer)
+                               itemIDs: w.itemIDs, alternatives: w.alternatives, layers: w.layers)
         }
     }
 
@@ -304,10 +304,11 @@ enum Spellchecker {
         guard !tag.isEmpty else { return nil }
         if let exact = available.first(where: { $0.caseInsensitiveCompare(tag) == .orderedSame }) { return exact }
         let parts = tag.split(separator: "_").map(String.init)
-        let language = parts[0].lowercased()
+        guard let first = parts.first else { return nil }
+        let language = first.lowercased()
         // "zh_Hant_TW" style: language plus script.
         if parts.count > 2, let scripted = available.first(where: {
-            $0.caseInsensitiveCompare(parts[0] + "_" + parts[1]) == .orderedSame }) {
+            $0.caseInsensitiveCompare(first + "_" + parts[1]) == .orderedSame }) {
             return scripted
         }
         if let bare = available.first(where: { $0.lowercased() == language }) { return bare }
@@ -450,6 +451,8 @@ final class SpellcheckEngine {
 
     private final class PageState {
         var words: [RecognizedWord] = []
+        /// Nil for a full-page check, otherwise the checked portion of an infinite board.
+        var recognitionRect: Rect?
         var documentLanguage = ""
         var language: String?
         var misspellings: [Misspelling] = []
@@ -464,9 +467,18 @@ final class SpellcheckEngine {
     private var pages: [PageKey: PageState] = [:]
     private var order: [PageKey] = []
     private var generations: [PageKey: Int] = [:]
-    private var failed: [PageKey: Int] = [:]
+    private struct Failure {
+        var generation: Int
+        var time: TimeInterval
+        var delay: TimeInterval
+    }
+    /// Monotonic clock, injectable so retry tests do not sleep.
+    var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    private var failed: [PageKey: Failure] = [:]
     private var inFlight: [PageKey: Task<PageSpelling, Error>] = [:]
     private var dictionaryCache: Set<String>?
+    private var dictionaryDirty = false
+    private var dictionaryUpdate: Task<Void, Never>?
     private(set) var dictionaryGeneration = 0
     private var observers: [UUID: @MainActor (Change) -> Void] = [:]
     private var subscription: EventSubscription?
@@ -491,9 +503,9 @@ final class SpellcheckEngine {
         self.checker = checker ?? SystemSpellingChecker()
         subscription = app.bus.observeCommits { [weak self] cs in self?.committed(cs) }
         settingsToken = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
-                                                               queue: nil) { [weak self] note in
+                                                               queue: .main) { [weak self] note in
             guard let name = note.userInfo?["name"] as? String, name.hasPrefix(NibSettings.dictionaryPrefix) else { return }
-            Task { @MainActor in self?.dictionaryDidChange() }
+            MainActor.assumeIsolated { self?.dictionaryDidChange() }
         }
     }
 
@@ -543,17 +555,33 @@ final class SpellcheckEngine {
     }
 
     /// True when the page was checked since its ink and its document's language last changed.
-    func isFresh(_ doc: DocumentID, _ page: PageID) -> Bool {
+    func isFresh(_ doc: DocumentID, _ page: PageID, visibleRect: Rect? = nil) -> Bool {
         let key = PageKey(doc: doc, page: page)
         guard let state = pages[key] else { return false }
+        if let checked = state.recognitionRect {
+            guard let visible = visibleRect, checked.minX <= visible.minX, checked.minY <= visible.minY,
+                  checked.maxX >= visible.maxX, checked.maxY >= visible.maxY else { return false }
+        }
         return state.generation == generations[key, default: 0] && state.documentLanguage == documentLanguage(doc)
     }
 
     /// True when the page should be (re)checked: stale, not being checked, and it did not just fail.
-    func needsCheck(_ doc: DocumentID, _ page: PageID) -> Bool {
+    func needsCheck(_ doc: DocumentID, _ page: PageID, visibleRect: Rect? = nil) -> Bool {
         let key = PageKey(doc: doc, page: page)
-        guard inFlight[key] == nil, !isFresh(doc, page) else { return false }
-        return failed[key] != generations[key, default: 0]
+        guard inFlight[key] == nil, !isFresh(doc, page, visibleRect: visibleRect) else { return false }
+        return retryDelay(doc, page) == 0
+    }
+
+    /// Remaining backoff for a failure of the current ink; edits bypass it immediately.
+    func retryDelay(_ doc: DocumentID, _ page: PageID) -> TimeInterval {
+        let key = PageKey(doc: doc, page: page)
+        guard let failure = failed[key], failure.generation == generations[key, default: 0] else { return 0 }
+        return max(0, failure.time + failure.delay - now())
+    }
+
+    /// Reopening a canvas, or toggling spellcheck, gives transient failures a fresh chance.
+    func clearFailures(_ doc: DocumentID) {
+        failed = failed.filter { $0.key.doc != doc }
     }
 
     /// Pages of a document that have results (the underlines only look at these, not at every page).
@@ -586,23 +614,28 @@ final class SpellcheckEngine {
     /// Checks a page (recognising its handwriting when its ink changed) and returns the result. Concurrent calls
     /// for one page share one run.
     @discardableResult
-    func check(_ doc: DocumentID, _ page: PageID, runner: RecognitionRunner? = nil) async throws -> PageSpelling {
+    func check(_ doc: DocumentID, _ page: PageID, visibleRect: Rect? = nil, runner: RecognitionRunner? = nil) async throws -> PageSpelling {
         let key = PageKey(doc: doc, page: page)
-        if isFresh(doc, page), let state = pages[key] {
+        if isFresh(doc, page, visibleRect: visibleRect), let state = pages[key] {
             if state.dictionaryGeneration != dictionaryGeneration { refilter(state) }
             return spelling(key, state)
         }
         if let running = inFlight[key] { return try await running.value }
-        // A failure is remembered for the ink it read, so an edit meanwhile (a stroke erased while recognition ran)
-        // makes the page checkable again.
+        // Only the user run owns automatic retry state; another principal cannot suppress its checks.
         let generation = generations[key, default: 0]
         let task = Task { @MainActor [weak self] () throws -> PageSpelling in
             guard let self = self else { throw CancellationError() }
             defer { self.inFlight[key] = nil }
             do {
-                return try await self.run(key, runner: runner)
+                return try await self.run(key, visibleRect: visibleRect, runner: runner)
             } catch {
-                self.failed[key] = generation
+                let code = (error as? NibError)?.code
+                if runner == nil, !(error is CancellationError),
+                   code != .permissionDenied, code != .userDenied, code != .locked {
+                    let previous = self.failed[key]
+                    let delay = previous?.generation == generation ? min((previous?.delay ?? 30) * 2, 300) : 30
+                    self.failed[key] = Failure(generation: generation, time: self.now(), delay: delay)
+                }
                 throw error
             }
         }
@@ -610,14 +643,18 @@ final class SpellcheckEngine {
         return try await task.value
     }
 
-    private func run(_ key: PageKey, runner: RecognitionRunner?) async throws -> PageSpelling {
+    private func run(_ key: PageKey, visibleRect: Rect?, runner: RecognitionRunner?) async throws -> PageSpelling {
         guard let app = app else { throw NibError.unavailable("the app") }
         let generation = generations[key, default: 0]
         let content = try app.workspace.content(key.doc)
         guard let record = content.page(key.page), !record.deleted else {
             throw NibError.notFound("page \(key.page.raw) in document \(key.doc.raw)")
         }
-        let strokes = try SpellcheckEngine.handwriting(app.workspace.items(key.doc, page: key.page))
+        var strokes = try SpellcheckEngine.handwriting(app.workspace.items(key.doc, page: key.page))
+        // Infinite boards can be much larger than the screen. Never recognise offscreen ink for automatic checks.
+        if content.meta.kind == .whiteboard, let visibleRect = visibleRect {
+            strokes = strokes.filter { $0.bounds.intersects(visibleRect) }
+        }
         let revs = Dictionary(strokes.map { ($0.id, $0.rev) }, uniquingKeysWith: { a, _ in a })
         let layers = Dictionary(strokes.map { ($0.id, $0.layer) }, uniquingKeysWith: { a, _ in a })
         let lines = strokes.isEmpty ? [] : try await recognise(strokes, key: key, language: content.meta.language,
@@ -629,8 +666,15 @@ final class SpellcheckEngine {
         state.words = Spellchecker.words(from: lines).compactMap { word -> RecognizedWord? in
             guard word.itemIDs.allSatisfy({ revs[$0] != nil && now[$0] == revs[$0] }) else { return nil }
             var w = word
-            w.layer = word.itemIDs.compactMap { layers[$0] }.min() ?? 0
+            w.layers = Set(word.itemIDs.compactMap { layers[$0] })
             return w
+        }
+        if content.meta.kind == .whiteboard, let visibleRect = visibleRect {
+            state.recognitionRect = visibleRect
+            let selected = Set(strokes.map { $0.id })
+            if let previous = pages[key], previous.documentLanguage == content.meta.language {
+                state.words += previous.words.filter { Set($0.itemIDs).isDisjoint(with: selected) }
+            }
         }
         state.generation = generation
         state.documentLanguage = content.meta.language
@@ -663,7 +707,7 @@ final class SpellcheckEngine {
                                                       ["refs": .array(refs.map { JSONValue.string($0) })])
                 }
                 return try Spellchecker.lines(fromRecognizeItems: value)
-            } catch let e as NibError where e.code == .unavailable {
+            } catch let e as NibError where e.code == .unavailable && runner == nil {
                 // The index is not ready: ask the recogniser directly below.
                 SpellcheckEngine.log.debug("recognize.items unavailable, using the recogniser: \(e.message, privacy: .public)")
             }
@@ -686,7 +730,7 @@ final class SpellcheckEngine {
 
     private func spelling(_ key: PageKey, _ state: PageState) -> PageSpelling {
         PageSpelling(doc: key.doc, page: key.page, documentLanguage: state.documentLanguage, language: state.language,
-                     misspellings: state.misspellings, isFresh: isFresh(key.doc, key.page))
+                     misspellings: state.misspellings, isFresh: isFresh(key.doc, key.page, visibleRect: state.recognitionRect))
     }
 
     private func store(_ key: PageKey, _ state: PageState) {
@@ -709,9 +753,17 @@ final class SpellcheckEngine {
     /// The personal dictionary changed (this device, a command, or another device through sync): refilter every
     /// checked page without recognising anything again.
     func dictionaryDidChange() {
-        dictionaryCache = nil
-        dictionaryGeneration += 1
-        notify(Change(doc: nil, page: nil))
+        dictionaryDirty = true
+        guard dictionaryUpdate == nil else { return }
+        dictionaryUpdate = Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            self.dictionaryUpdate = nil
+            guard self.dictionaryDirty else { return }
+            self.dictionaryDirty = false
+            self.dictionaryCache = nil
+            self.dictionaryGeneration += 1
+            self.notify(Change(doc: nil, page: nil))
+        }
     }
 
     private func committed(_ cs: Changeset) {
@@ -725,6 +777,7 @@ final class SpellcheckEngine {
                 guard ink else { continue }
                 changedPages[PageKey(doc: doc, page: page), default: []].insert(after.id)
             case let .meta(doc, before, after):
+                if before.spellcheck != after.spellcheck { clearFailures(doc) }
                 if before.language != after.language {
                     // Recognition itself depends on the language: every checked page of the document is read again.
                     for key in order where key.doc == doc { generations[key, default: 0] += 1 }

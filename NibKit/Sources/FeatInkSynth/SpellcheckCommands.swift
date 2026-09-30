@@ -32,7 +32,6 @@ struct DictionaryAdd: NibCommand {
         let key = NibSettings.dictionaryWord(word)
         let had = settings.get(key)
         if !had { settings.set(key, true) }
-        SpellcheckEngine.existing(ctx.app)?.dictionaryDidChange()
         return Output(word: word, added: !had)
     }
 }
@@ -64,7 +63,6 @@ struct DictionaryRemove: NibCommand {
         let name = NibSettings.dictionaryWord(word).name
         let had = PersonalDictionary.contains(word, settings)
         if settings.json(name) != nil { settings.setJSON(name, nil) }
-        SpellcheckEngine.existing(ctx.app)?.dictionaryDidChange()
         return Output(word: word, removed: had)
     }
 }
@@ -248,7 +246,7 @@ struct SpellcheckTapAt: NibCommand {
             "gesture": .str("canvas gesture (only tap is handled)", choices: CanvasGesture.allCases.map { $0.rawValue })
         ], required: ["page", "point"]),
         examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [110, 122]]],
-        effect: .session)
+        effect: .session, extraScopes: [.documentRead])
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let (doc, page) = try ctx.pageOrSession(p.page)
@@ -273,7 +271,7 @@ struct SpellcheckTapAt: NibCommand {
         }
         guard let result = spelling else { return .unhandled }
         let hidden = session?.document == doc ? (session?.hiddenLayers ?? []) : []
-        let shown = result.misspellings.filter { !hidden.contains($0.layer) }
+        let shown = result.misspellings.filter { $0.layers.isDisjoint(with: hidden) }
         let zoom = max(session?.zoom ?? 1, 0.05)
         var tapped: ElementID?
         if let r = p.ref, case let .item(d, pg, id)? = NodeRef(r), d == doc, pg == page { tapped = id }
