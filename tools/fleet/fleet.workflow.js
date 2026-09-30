@@ -277,8 +277,15 @@ ${prelude(f, dir)}
 const MAX_IMPL = A.maxImpl || 5
 let implActive = 0
 const implQueue = []
-const acquireImpl = () => { if (implActive < MAX_IMPL) { implActive++; return Promise.resolve() } return new Promise((r) => implQueue.push(r)) }
-const releaseImpl = () => { const next = implQueue.shift(); if (next) next(); else implActive-- }
+// Critical path first: a waiting implementer with more transitive dependents gets the next slot.
+const dependents = {}
+FEATURES.forEach((f) => { dependents[f.id] = 0 })
+FEATURES.forEach((f) => { for (const d of depClosure(f)) dependents[d] = (dependents[d] || 0) + 1 })
+const acquireImpl = (id) => {
+  if (implActive < MAX_IMPL) { implActive++; return Promise.resolve() }
+  return new Promise((r) => { implQueue.push({ r, rank: dependents[id] || 0 }); implQueue.sort((a, b) => b.rank - a.rank) })
+}
+const releaseImpl = () => { const next = implQueue.shift(); if (next) next.r(); else implActive-- }
 
 const done = async (r) => {
   finished++
@@ -300,7 +307,7 @@ const buildOne = async (f) => {
   try {
     if (!impl) {
       if (!builtBefore) await specReady // unbuilt features wait for spec pass 2
-      await acquireImpl()
+      await acquireImpl(f.id)
       try { impl = await run(implementPrompt(f, depInfo, forceImpl || st.wip), { label: `impl:${f.id}`, phase: 'Build', model: M, schema: IMPL_RESULT }) } finally { releaseImpl() }
     }
     if (impl && !ci) {
@@ -346,7 +353,7 @@ const buildOne = async (f) => {
 const todo = FEATURES.filter((f) => !ONLY || ONLY.has(f.id))
 const results = (await parallel(todo.map((f) => () => buildOne(f)))).map((r, i) => r || { id: todo[i].id, final: 'crashed' })
 const mainside = { contracts2: await c2Promise, spec2: await specPromise, shell: await shellPromise }
-if (!halted) await commitState('batch complete')
+if (!halted && commitEvery) await commitState('batch complete')
 
 const summary = {
   total: todo.length,

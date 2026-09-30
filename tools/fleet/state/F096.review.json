@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibWidgets/QuickNoteWidget.swift:421-428, 575-605 (FavouritesMessageView, compact)",
+      "problem": "The Favourites empty and unavailable states truncate on systemSmall at the default text size. I rendered FavouritesMessageView in the iOS 26 simulator at the widget content size (widget minus 16 pt margins). On a 158 pt small widget (iPhone 13-16 and 16e) the empty message reads 'Star a notebook in N...'. The unavailable state reads 'Favourites unav...' and 'Touch and hold the...'. On a 141/148 pt widget (iPhone SE, 9.7/10.2 in. iPads, iPad mini) the title also truncates ('No favourites...'). The header row, the 4 pt stack gaps, the spacer and the title3 glyph use up the height, so the only instructive text gets cut. The empty state is the first thing a user sees after adding the widget (Slop checklist: nothing truncates badly).",
+      "fix": "In compact mode, drop the FavouritesHeaderView and the glyph. Give the message .fixedSize(horizontal: false, vertical: true) with lineLimit(4). Or wrap the body in ViewThatFits(in: .vertical) with a fallback of title plus message only. Shorten the copy for small ('No favourites' / 'Star a notebook in Nib.'). Re-check at 141, 148, 158 and 170 pt."
+    },
+    {
+      "severity": "major",
+      "where": "NibWidgets/QuickNoteWidget.swift:395-403, 506-531, 564 (FavouritesLayout.of(.systemMedium), FavouritesGridView, FavouriteTileView minHeight)",
+      "problem": "The medium Favourites widget overflows its content area on short medium widgets: iPhone SE at 321x148, and 9.7/10.2 in. iPads and iPad mini at 306x141. The header (about 18 pt), 8 pt spacing, and two rows with .frame(minHeight: 44) plus an 8 pt gap need about 122 pt, but the content area is only 109-116 pt. In the simulator render, the header sits above the top content margin and the bottom row runs past the bottom margin. On 338x158 it just fits.",
+      "fix": "Do not show the header in .systemMedium (keep it for large and extra large). Then 2x44+8 = 96 pt fits in every medium height. Or size the rows from the available height (GeometryReader: rowHeight = max(44, (h - header - gaps) / rows)), and drop the folder line with ViewThatFits when the row is under about 56 pt. Keep the 44 pt minimum."
+    },
+    {
+      "severity": "minor",
+      "where": "NibWidgets/QuickNoteWidget.swift:549-557 (FavouriteTileView Link label)",
+      "problem": "The title and folder inside the Link use hierarchical .foregroundStyle(.primary) and .secondary. These resolve against the Link's tint, and in the render every tile title and folder line came out in the accent blue. That uses the accent as decoration on 4-16 tiles (Slop checklist: one accent, used for meaning).",
+      "fix": "Use .foregroundStyle(Color.primary) on the title and Color.secondary on the folder, or add .tint(Color.primary) on the Link. Keep palette.accent only on the kind glyph."
+    },
+    {
+      "severity": "minor",
+      "where": "NibWidgets/QuickNoteWidget.swift:549-552 (large and extra large tiles)",
+      "problem": "In the large and extra large grids, titles stay on one line and truncate ('Organic Ch...') even though each tile has room for the second line that lineLimit(2) allows. The Grid cell is laid out at its one-line ideal height.",
+      "fix": "Add .fixedSize(horizontal: false, vertical: true) to the title Text, or put the tile content in a .frame(maxHeight: .infinity, alignment: .topLeading) before the padding, so the title wraps to two lines when the row is tall enough."
+    },
+    {
+      "severity": "minor",
+      "where": "NibWidgets/QuickNoteWidget.swift:61 (QuickNoteTileView disc)",
+      "problem": "At the xxxLarge cap on a 141/148 pt small widget, the 44 pt @ScaledMetric disc grows to about 58 pt. That pushes 'Start writing' past the bottom content margin (seen in the render).",
+      "fix": "Clamp the disc to min(disc, 52), or put the subtitle behind ViewThatFits so it is dropped when it does not fit."
+    },
+    {
+      "severity": "minor",
+      "where": "NibWidgets/QuickNoteWidget.swift:537",
+      "problem": "`@ScaledMetric(relativeTo: .footnote) private var glyphWidth: CGFloat = 20` is a raw layout literal. Every other metric in the widget comes from the mirrored WidgetMetrics.",
+      "fix": "Add `static let xl: CGFloat = 20` (NibSpacing.xl) to WidgetMetrics and use it here."
+    },
+    {
+      "severity": "minor",
+      "where": "NibWidgets/QuickNoteWidget.swift:377-379 (FavouritesProvider.getSnapshot)",
+      "problem": "The widget-gallery snapshot returns the real state. Before the app has written any favourites, the gallery preview is the truncated 'No favourites yet' card, which does not show what the widget does.",
+      "fix": "When context.isPreview is true and the loaded list is empty, return the sample items from FavouritesWidgetView.placeholderItems without redaction, with a neutral title such as 'Biology' so it does not read as a placeholder."
+    },
+    {
+      "severity": "minor",
+      "where": "docs/forge-spec.json F096 tests[] (spec gap, not implementer-owned)",
+      "problem": "FavouritesFile.decode (lossy entries, size cap, id and link validation, dedupe), NibWidgetLinks.favouriteLink and WidgetAppGroup.orderedGroupIDs are the feature's only trust-boundary parsing, and they have no tests. The spec gives F096 no test target, and NibWidgets links no testable module.",
+      "fix": "Have the architect add a NibWidgetsTests unit-test target (project.yml plus a spec tests[] entry) with cases for: a malformed entry among good ones, an oversize file, an invalid id or url, nib://open/<doc>/<page> passthrough, duplicate ids, and ALTAppGroups before NibAppGroups ordering across the extension and host Info.plists."
+    }
+  ]
+}

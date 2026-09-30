@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatKeyboard/GlobalShortcuts.swift:286-289, 303-304, 386-407; FeatKeyboardFeature.swift:25",
+      "problem": "Obsolete workaround that contracts-v2.2 now covers. Every session-dependent key carries a private `keyboardShortcut` marker in its static params, and a before-command hook (`keyboard.sessionParams`, order -1000) on `commands.batch`, `export.present` and `print.present` swaps that marker for the resolved `sessionParams`. The code says this is needed \"until the shell passes resolvedParams(for:)\". contracts-v2.2 says the shell does exactly that when a key runs (CONTRACTS.md line 26), and Nib/App/ShellViewController.swift:246 does it. The effects: every closure runs twice per press. The marker leaks into the registered descriptors that plugins and the AI read. A hook sits on every app-wide `commands.batch`, `export.present` and `print.present`, which pushes them off the typed fast path. And any caller can add the marker to have its params rewritten from the active window. F032 uses the same `commands.batch` plus `sessionParams` pattern with no hook.",
+      "fix": "Delete `GlobalShortcuts.marker`, `hookID`, `sessionHook` and `resolveMarker`, the marker merge in `key(...)`, and the `app.bus.hooks.register(...)` call in `register`. Keep the `sessionParams` closures as they are. In the tests, make `press()` run `Invocation(command: d.command, params: d.resolvedParams(for: h.session), ...)` as the shell does. Drop the hook assertions from `testRegistrationAndConformance` and `testShortcutContextAndActions`."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatKeyboard/GlobalShortcuts.swift:118-147 (ShortcutArbiter.shadowing), 530-545 (KeyboardRuntime.reconcile); FeatKeyboardFeature.swift:124-125, 206-207, 280",
+      "problem": "KeyboardRuntime unregisters other features' and plugins' key commands app-wide whenever two other owners share a shortcut. contracts-v2.2 `KeyCommandRouting.active(_:in:)` already settles this in the shell, one command per shortcut in each window, so this is a workaround the changelog covers. It is also wrong in two ways. First, its ranking (\"the owner also owns the command\", then order, then id) contradicts the contract's ranking (fewer docKinds, then narrower scope, then order, then id). `testClashesBetweenOtherOwnersAreSettled` asserts the opposite winner from the one the shell picks for the same two descriptors (order -5 beats 0 under `precedes`). Second, the loser is removed in every context, including those with no clash. Example: a plugin's `.document` ⌘D for every kind disappears in text documents and study sets because F014's ⌘D is live in notebooks. It also breaks ARCHITECTURE.md §15.4 (\"register, don't reach\").",
+      "fix": "Remove `ShortcutArbiter.shadowing`, `ShadowPlan`, `KeyboardRuntime.shadowed` and `shadowedDescriptors`, plus the `.keysTaken` status and its UI note, and leave other owners' registrations to the shell's `KeyCommandRouting`. Keep only `ShortcutArbiter.plan`, which yields F073's own catalogue keys to another owner (that is what the acceptance check needs). If the list must still mark hidden keys, compute them read-only from `KeyCommandRouting.active` over `ShortcutRules.allSituations`. Update the tests to match."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatKeyboard/GlobalShortcuts.swift:290-291, 321-326",
+      "problem": "⇧⌘T and ⌥⌘N run `app.openURL nib://new?kind=...` at `.global`. The spec lets F073 map F047's ⇧⌘T only \"with the same command and params\": `commands.batch` [doc.create {kind: textDocument, fresh id}, doc.open] through `sessionParams`, at `.library`. The contracts-v2 changelog names the `nib://new` deep link as the workaround `sessionParams` replaces (CONTRACTS.md lines 33 and 462). F073 registers these keys in `register`, so F047's and F021's `start` see the shortcuts as taken and never register their own. The result: ⌥⌘N no longer opens the New Notebook sheet that + New › Notebook shows beside its ⌥⌘N label (F021: `panel.open create.newNotebook`, in the shown document's folder). Instead it silently creates a default notebook at the library root. And without F074, both keys fail with 'unknown command'.",
+      "fix": "Map ⇧⌘T exactly as F047 does: command `CommandIDs.batch`, scope `.library`, and a `sessionParams` closure that returns `{calls: [{command: doc.create, params: {kind: textDocument, id: NibID.make().raw}}, {command: doc.open, params: {doc: <that id's doc ref>}}]}`. Map ⌥⌘N as F021 does: `panel.open {id: \"create.newNotebook\", kind: \"notebook\"}`, with `sessionParams` adding `folder` (the shown document's folder from `services.library`). Alternatively, drop ⌥⌘N from the catalogue so F021 registers it. Remove `newNotebookURL` and `newTextDocumentURL`, and update `testTheShortcutsMapToTheirCommands`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatKeyboard/GlobalShortcuts.swift:491-528 (registryChanged / reconcile withholding)",
+      "problem": "The single-key switch takes other owners' descriptors out of the registry. That loses or resurrects keys in two cases. (a) `registryChanged` forgets every withheld key of an owner as soon as that owner has nothing left in the registry. An owner that unregisters its last ⌘ key while its single keys are withheld therefore never gets them back when the switch is turned on. (b) Owners that clean up stale keys against the registry, such as F016 `syncKeyCommands`, cannot see withheld keys. A tool removed while the switch is off (for example an uninstalled plugin tool) comes back as a ghost `tool.select` key on switch-on, and can outrank the item that took over its letter.",
+      "fix": "Keep withheld keys registered but inert instead of unregistering them. Re-register the same id with `scope = .library` and `docKinds = [.notebook]`, which `isActive(in:)` never admits. Store the original scope and docKinds by id, and restore them on switch-on only for ids that are still registered. Owners then still see, replace and unregister their own keys. Drop the owner-level forget heuristic. Also note the missing contract (a single-key flag in `KeyCommandContext` that `KeyCommandRouting` filters on) in the feature summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatKeyboard/PointerSupport.swift:143-186 (scrolled / request / apply)",
+      "problem": "`apply` reads the pointer anchor from `self.gesture` when it runs, not when the scale was requested. The pending target queued while a zoom is in flight is usually the last and largest step. It gets applied after `.ended` has set `gesture = nil`, so it skips the `view.scrollBy` anchor correction and the page slides out from under the pointer at the end of every ⌘-scroll. A pending scale from one gesture can also be applied with the next gesture's anchor.",
+      "fix": "Store the snapshot with the request: `pending: (scale: Double, gesture: ZoomGesture?)`, set in `request(_:)` from the current `gesture`, and pass it into `apply(scale:snapshot:)`. Add a test with `FakeCanvasHost` and stand-in `view.zoom` / `view.scrollBy` commands. It should drive `.began`, several `.changed`, then `.ended`, and assert that the last zoom is followed by an anchor `view.scrollBy`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatKeyboard/GlobalShortcuts.swift:353-367",
+      "problem": "Zoom to Fit, Actual Size and Go to Page are wrapped in `commands.batch {calls: []}` plus `sessionParams`, although `docKinds` already limits them to canvases and their params do not depend on the session. Plugins and the AI that list key commands see an opaque empty batch instead of `view.zoom` or `panel.open`.",
+      "fix": "Register them directly with `docKinds: ShortcutContext.canvasKinds`: `view.zoom {fit: true}`, `view.zoom {actual: true}` and `panel.open {id: keyboard.goToPage}`. Keep the batch wrapper only for keys whose call can be empty (Delete, Escape, ⌘A, ⌘+/⌘−)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatKeyboard/PointerSupport.swift:259-303, 330-339 (HoverEffects / PointerHoverInstaller)",
+      "problem": "The spec asks for a hover helper for toolbar buttons. Instead, every `.nibChromeNeedsUpdate`, toolbar-registry or session event walks each window's whole view tree, up to 8,000 views, and that includes the canvas scroll view's page views on large notebooks. The walk turns on pointer interaction for every UIButton and adds a highlight `UIPointerInteraction` to any feature-defined UIControl. That overrides an owner that deliberately left hover off, and a custom UITextField subclass would lose its I-beam pointer.",
+      "fix": "Keep a weak set of canvas views, filled in `PointerCanvasAttachment.attach(to:)` from `host.canvasView`, and have `HoverEffects.install` skip those subtrees. Skip any control that conforms to `UITextInput`. With the canvas excluded, the pass only visits chrome, so lower `maxViews` to a few hundred."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatKeyboard/FeatKeyboardFeature.swift:143-189 (ShortcutDirectory), P-055",
+      "problem": "F073 contributes nothing to P-055 (text formatting). The Settings shortcut list, which is F073's P-057 surface, shows only registry descriptors. It therefore omits ⌘B, ⌘I and ⌘U, which text boxes handle natively and which are never registered.",
+      "fix": "Add a display-only \"While Editing Text\" section to `ShortcutDirectory` (Bold ⌘B, Italic ⌘I, Underline ⌘U, plus any F026 formatting keys not in the registry), built from a static table and never registered. Cover it in `testShortcutTextAndTheSearchableList`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatKeyboard/FeatKeyboardFeature.swift:296-311 (KeyboardSettingToggle)",
+      "problem": "Flipping the switch sends `settings.set` fire-and-forget. If the call fails, the switch stays in its new position while the stored value is unchanged, and nothing tells the user.",
+      "fix": "Run `try await app.bus.execute(CommandIDs.settingsSet, ...)` in a Task and set `isOn = stored` in the catch."
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatOnboarding/FeatOnboardingFeature.swift:227-237 (SampleNotebook.tips) and :258 / finish(openQuickNote:)",
+      "problem": "The sample notebook always writes the tip 'Every notebook is a file in your library folder, so it stays safe when Nib is reinstalled.', whatever the library placement. A user who picked 'Keep Notes in Nib' (the warned opt-out) or skipped with the library inside the container gets a note in their own library saying their notes survive a reinstall. For a sideloaded build that is false: a reinstall with another signer deletes the container. The screen's own warnings, P-014 and F070's banner all say the opposite.",
+      "fix": "Pass the placement to the sample: change `tips(stylusMode:)` to `tips(stylusMode:libraryOutside:)` (and thread it through `boxes(...)`, `handwritingOrigin(...)` and `SampleNotebook.create(...)`). Call it with `placement.isOutside` from `finish`. When the library is inside, replace the tip with something like 'Your notes are inside Nib, so reinstalling the app deletes them. Move them to a folder from Cloud & Backup.' Add a test that creates the sample with the library inside and checks that the tour text does not contain the reinstall-safe tip."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOnboarding/FeatOnboardingFeature.swift:388-391 (aiSettingsPage)",
+      "problem": "The AI step opens the first settings page in the `.ai` section in (order, id) order. Several features may register pages there, so the page that opens might not be F086's provider settings.",
+      "fix": "Prefer F086's page: `pages.first { $0.section == .ai && $0.owner == \"aisettings\" } ?? pages.first { $0.section == .ai }`, and cover it in `testAIStepListsProvidersAndOpensTheAISettingsPage` by registering a second `.ai` page with a lower order."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOnboarding/FeatOnboardingFeature.swift:192-205 (ProviderPreset.all), OnboardingView.swift providerRow",
+      "problem": "Six provider rows (Anthropic, OpenAI, OpenRouter, Ollama, LM Studio, Other Server) all run the same `settings.open {page}`, and none of them carries the preset. They look like separate choices but do the same thing. The hard-coded list can also drift from F086's presets: it already leaves out Nib HTTP.",
+      "fix": "Show the preset names as one non-interactive list, or as the body text, and add a single primary 'Set Up AI' row or button that opens the page. Or keep the rows but make them plain rows that cannot be tapped. Either way, don't imply that a preset is chosen."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOnboarding/FeatOnboardingFeature.swift:528-536 (watchSettingsReturns)",
+      "problem": "While the AI step shows, a 400 ms polling loop checks `presentedViewController` to detect that Settings closed. Any other presentation also counts, for example the Skip Setup alert, which triggers an extra `ai.provider.list`. No contract names this workaround.",
+      "fix": "Reload providers on `SettingsStore.didChange` for AI-owned names and on `UIScene.didActivateNotification`/`.onAppear`. Keep the poll only as a fallback, with a comment that names the missing contract (an `ai.providers` change event). Report the gap in the feature summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOnboarding/FeatOnboardingFeature.swift:465 (setStylusMode) / pencil step",
+      "problem": "On iPhone, `stylus.mode` defaults to pencilOnly, and onboarding leaves it there unless the user taps Any Input. A user who taps Continue or Skip Setup on iPhone reaches a QuickNote they cannot write in with a finger. Only a banner explains this.",
+      "fix": "On iPhone (`!isPad`), when the pencil step first shows and the user has not chosen, run `settings.set {name: stylus.mode, value: anyInput}`. Do the same in `completeSkip` and `finish` when the step was never visited. Add a test with an idiom override."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOnboarding/OnboardingView.swift:514-519 (keepInApp alert)",
+      "problem": "The 'Keep your notes inside Nib?' alert has no Cancel. The only way out is to open the folder picker or accept the destructive opt-out.",
+      "fix": "Add `Button(String(localized: \"Cancel\"), role: .cancel) { model.confirmation = nil }` to the `.keepInApp` case."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOnboarding/FeatOnboardingFeature.swift:566-574 (finish)",
+      "problem": "When `text.createBox` or `ink.writeText` fails inside `SampleNotebook.create`, the failure is logged and posted as a `doc.create` failure, so the log names the wrong command.",
+      "fix": "Have `SampleNotebook.create` wrap errors with the failing command id (for example, throw a small struct carrying `command` and the `NibError`). Or catch per call and report each with its own id."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatOnboarding/FeatOnboardingFeature.swift:248-282 (SampleNotebook.boxes) + testSampleNotebookLayoutStaysOnThePage",
+      "problem": "The tour box height comes from a 0.52 em glyph estimate, but F026's default `TextBoxStyle.autoGrow = true` grows the box to its real text height. On small pages, where 13 pt still does not fit and `bodyHeight` is clamped to `available`, the tour can run past the page bottom and over the handwriting line. The test checks only the requested frames.",
+      "fix": "When even 13 pt does not fit, drop tips from the end until the estimate fits. Also pass `style: {autoGrow: false}`, or raise the handwriting line to below the box's reported bounds by reading `item` bounds after `text.createBox`. Extend the test to assert `needed <= available` for every size."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatOnboardingTests/FeatOnboardingTests.swift",
+      "problem": "Some risky branches have no tests: `leave()` when this window is not `ui.activeNavigator` (it must call `nav.showLibrary` directly), `markDone` failing (busy and finishing reset, message set, screen stays), and a `doc.quickNote` failure falling back to the library.",
+      "fix": "Add three tests. (1) Set `h.app.ui.activeNavigator` to a second FakeNavigator, call `skip()`, and assert that `nav.libraryShows == 1` and the other window's count is 0. (2) Make the `settings.set` hook throw for onboarding.done, for example with a command hook, then assert `busy == nil`, `message != nil` and `!isDone`. (3) Make a fake `doc.quickNote` throw and assert `nav.libraryShows == 1`."
+    }
+  ]
+}
