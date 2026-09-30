@@ -72,7 +72,7 @@ G:\Projects\Nib\
 │   ├── App/ShellViewController.swift   SceneNavigator, tabs model, key commands, fallbacks
 │   ├── App/FeatureList.swift           generated list of every feature entry type
 │   ├── Intents/NibAppIntents.swift     App Intents (F074; must live in the app target)
-│   ├── Nib.entitlements                app group (used only for CI ad-hoc signing; progressive enhancement)
+│   ├── Nib.entitlements                app group + user fonts (app-usage); CI ad-hoc signing only; progressive enhancement
 │   └── Resources/                      Assets.xcassets, Localizable.xcstrings, parity.json
 ├── NibWidgets/                         widget extension (F096)
 ├── NibShare/                           optional share extension (F064; App Group inbox or pasteboard hand-off)
@@ -361,7 +361,7 @@ struct PageRotate: NibCommand {                         // conformers are @MainA
   - **Session defaults** (contracts-v2). Key commands, toolbar buttons and menus run with static params. So `doc`, `page` and `refs` may be omitted by the user principal where the command documents a session default. Resolve them with `ctx.documentOrSession(p.doc)`, `ctx.pageOrSession(p.page)` and `ctx.refsOrSelection(p.refs)`: the invoking window's document, current page or selection. Schemas still list the params, and AI, plugin and bridge callers pass them (`edit.undo {}` from a key command undoes the window's document).
   - **Places in a document** (contracts-v2). `doc` is a document ref `doc:D` (a bare id is accepted). `position` is `before | after | start | end` (`PagePosition`). `anchor` is a page ref `page:D/P`, required for `before`/`after`. `page.add`, `page.paste` and `import.files` all use this shape.
   - **Geometry** (contracts-v2). Every point, size, delta and radius is in **page points** (top-left origin), never view points. That includes `view.scrollBy {dx, dy}`, `item.transform` and `ink.erase {path: [[x,y],…], radius}`. Sizes are `[width, height]` (`template.choose {size}`, `page.add {size}`). A frame is `[x, y, w, h]` or `[x, y, w, h, rotation]`, with rotation in radians about the centre (`Frame(array:)` / `Frame.array`). Angles in params are degrees unless the name says radians. `ShapeItem.points` are control points (see `ShapeItem` in CONTRACTS.md).
-  - **Other value types** (contracts-v2). A `template` param that has no sibling `params?` is `TemplateRef` JSON `{id, params?}` (`doc.create`, `page.add`), and a plain id string is accepted as `{id}`. `page.setTemplate` keeps its `template` id plus `params?`. Media time is in seconds as a number (`audio.play {clip: "audio:D/A", t}`). `panel.open` is `{id, params?}`: the other params reach the panel as `PanelContext.params`. `ai.ask` returns `AIResponse` JSON `{text, changes, group?, usage, chatID?}`.
+  - **Other value types** (contracts-v2). A `template` param that has no sibling `params?` is `TemplateRef` JSON `{id, params?}` (`doc.create`, `page.add`), and a plain id string is accepted as `{id}`. `page.setTemplate` keeps its `template` id plus `params?`. Media time is in seconds as a number (`audio.play {clip: "audio:D/A", t}`). `panel.open` is `{id, params?}`, and `PanelContext.params` is one flat object: every key of the call except `id` and `edge`, with the keys of a nested `params` object merged over them. So `{id, pages}` and `{id, params: {pages}}` both reach the panel as `{pages}`; a call that names nothing gives `[:]`, and a panel that is already open keeps what it was opened with. In a window with no open document (the library), `panel.open` and `panel.close` forward to `library.setView {panel, params?, close?}`: the library (F019) presents `.sheet`, `.fullScreen` and `.floating` panels over itself (a floating panel as a sheet) and selects `.libraryTab` panels in its sidebar. `ai.ask` returns `AIResponse` JSON `{text, changes, group?, usage, chatID?}`.
 - **Creating commands** (every `edit`/`library` command that creates records):
   - Default `layer` to `ctx.activeSession?.activeLayer ?? 0`.
   - Declare an optional caller-chosen `id` (one record) or `ids` (several, in creation order) param and honour it (`NibID.isValid`, else `invalid_params`). The AI links records in one batch this way (`page.add {id: "NEWPAGE00001"}` then `diagram.create {page: "page:D/NEWPAGE00001"}`); conformance checks both.
@@ -491,9 +491,9 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `audio.record` | edit (user presence), sensitive, not undoable | doc, page?, action, id? | F052 | Start or stop recording in a document (mic). |
-| `audio.play` | session | clip, t? | F052 | Play a clip from `t` seconds after its start (default: where it was paused); the document's later clips follow. Every playback command returns the status → {clip, t, duration, playing, speed, skipSilence, noiseReduction}. |
-| `audio.pause` | session |  | F052 | Pause playback. |
+| `audio.record` | edit (user presence), sensitive, not undoable | doc, page?, action, id? | F052 | Start, pause, resume or stop the app-wide recording in a document (mic); `action` is start \| stop \| pause \| resume \| toggle → {ref, doc, state, duration}. |
+| `audio.play` | session | clip, t?, toggle? | F052 | Play a clip from `t` seconds after its start (default: where it was paused); the document's later clips follow. The user may omit `clip` (the loaded clip, else the first clip of the window's document); `toggle: true` pauses instead when that clip is playing. Every playback command returns the status → {clip, t, duration, playing, speed, skipSilence, noiseReduction, recording} (`recording`: {clip, doc, state, duration} while Nib records, else null). |
+| `audio.pause` | session | close? | F052 | Pause playback; `close: true` also unloads the clip (hides the playback bar). |
 | `audio.seek` | session | t | F052 | Seek within the playing clip. |
 | `audio.setPlayback` | session | speed?, skipSilence?, noiseReduction? | F052 | Playback speed (0.5–2×), skip silence, noise reduction. |
 | `audio.rename` | edit | clip, name | F052 | Rename a clip. |
@@ -644,7 +644,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `doc.setWritingAids` | edit | doc, spellcheck?, mathAssist? | F104 | Turn handwriting spellcheck and Math Assist on or off for a document. |
 | `doc.setLocked` | edit (user presence) | doc, locked | F071 | Add or remove the lock (removing asks for the password). |
 | `doc.unlock` | session (user presence) | doc | F071 | Unlock a locked document for this session. |
-| `doc.suggestTitle` | read | doc | F087 | Suggest a title from content (AI, else first recognised line). |
+| `doc.suggestTitle` | read | doc | F087 | Suggest a title from content (AI, else first recognised line) → {title} (one line, at most 60 characters; null when nothing is readable). |
 
 ### `element.*`
 
@@ -789,7 +789,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | `library.move` | library | refs, folder? | F002 | Move documents/folders; moving a notebook onto a notebook merges it. |
 | `library.duplicate` | library | refs, ids? | F002 | Duplicate documents or folders. |
 | `library.trash` | library | refs | F002 | Move to Trash (recoverable). |
-| `library.setView` | session | folder?, layout?, sort?, filter? | F019 | Set the library window's current folder, grid/list layout, sort and filter. |
+| `library.setView` | session | folder?, layout?, sort?, filter?, panel?, params?, close? | F019 | Set the library window's current folder, grid/list layout, sort and filter; `panel` shows a registered panel in the library window (a `.libraryTab` selects its tab; a sheet, full-screen or floating panel is presented over the library with `params` as its `PanelContext.params`; `close: true` closes it) → {panel, placement} or {panel, closed}. `panel.open` forwards here when no document is open. |
 | `library.reorder` | library | refs, folder?, after? \| before? | F019 | Put documents or folders in a folder's manual order after or before a sibling (sets its sort to Manual); returns the previous order for Undo. |
 | `library.chooseFolder` | library (user presence) |  | F025 | Pick a folder (iCloud Drive, OneDrive, Dropbox, On My iPad…) as the library. |
 | `library.relocate` | library (user presence) | copy | F025 | Copy the library to another folder and switch to it (e.g. On My iPad → iCloud Drive). |
@@ -892,8 +892,8 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `panel.open` | session | id, params?, edge? | F017 | Open a registered panel (sidebar tab, floating, sheet). |
-| `panel.close` | session | id | F017 | Close a panel. |
+| `panel.open` | session | id, params?, edge? | F017 | Open a registered panel (sidebar tab, floating, sheet); every key but `id` and `edge` reaches it as flat `PanelContext.params`, with a nested `params` object merged over them (§6.1); with no open document it forwards to `library.setView {panel, params}` → {id, placement}. |
+| `panel.close` | session | id | F017 | Close a panel (with no open document: `library.setView {panel, close: true}`) → {closed}. |
 
 ### `pdf.*`
 
@@ -997,7 +997,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
-| `scan.documents` | library (user presence) | doc?, position?, folder?, ids? | F065 | Scan paper (document camera + OCR) into a new or the current document. |
+| `scan.documents` | library (user presence) | doc?, position?, anchor?, folder?, ids? | F065 | Scan paper (document camera + OCR) into a new notebook in `folder`, or into `doc` at `position`/`anchor`. |
 | `scan.qr` | session (user presence) |  | F065 | Scan a QR code and open its link. |
 
 ### `search.*`
@@ -1118,7 +1118,7 @@ All commands below exist at the end of the build. Each row gives the owning feat
 | Command | Effect | Params | Owner | Summary |
 |---|---|---|---|---|
 | `template.list` | read | category?, covers? | F005 | List registered templates with params and defaults. |
-| `template.choose` | read (user presence) | kind, size?, color? | F045 | Show the template picker and return {background, size} (used by create flows). |
+| `template.choose` | read (user presence) | kind, size?, color?, doc? | F045 | Show the template picker (`kind` paper \| cover; `size` [width, height] and `color` RGBA hex preselect it) → {background, size}: `background` is Background JSON (a custom paper names an asset stored in `doc`, else a `tmp:` asset), `size` is the chosen [width, height]; cancelling throws user_denied. |
 | `template.import` | library | url, group?, kind, id? | F045 | Import a PDF (first page) or image as a custom paper/cover. |
 | `template.listCustom` | read | group? | F045 | List custom templates and groups. |
 | `template.group.create` | library | title, id? | F045 | Create a custom template group. |
@@ -1386,7 +1386,7 @@ nib://quicknote                    new QuickNote
 nib://new?kind=notebook|whiteboard|textDocument|studySet
 nib://search?q=<text>
 nib://plugin/install?url=<https url>   (always confirmed)
-nib://bridge/pair?host=…&token=…   (shows the pairing sheet; never auto-enables)
+nib://bridge/pair?host=…&port=…&token=…   (port optional, default 7331; shows the pairing sheet; never auto-enables)
 nib://import?from=pasteboard       (share-extension hand-off when no App Group exists)
 ```
 
@@ -1435,10 +1435,10 @@ nib://import?from=pasteboard       (share-extension hand-off when no App Group e
 - Toolbar items have `isEnabled`, `isOn`, `sessionParams`, `sessionTitle`, `sessionIcon` and `showsInCompactWidth`.
 - Menu items have `isChecked`, `contextTitle` and a display-only `shortcut`. `MenuContext` carries `folder` and `textRange`.
 - Key commands have `docKinds` and `sessionParams`.
-- Panels get `PanelContext.params` (the `panel.open` params minus `id`) and `presentation`, and declare `providesHeader`.
+- Panels get `PanelContext.params` (the `panel.open` params minus `id` and `edge`, flat, with a nested `params` object merged in: §6.1) and `presentation`, and declare `providesHeader`. In a library window the library (F019) presents them.
 - Settings pages declare `keywords`.
 
-Hosts call `resolvedParams`, `resolvedTitle` and `resolvedIcon`. Well-known panel ids are in `PanelIDs`: the owner registers its panel under exactly that id and other features open it with `panel.open {id}`. They are `aichat.panel` (assistant, F085), `organize.trash` and `organize.favourites` (F020), `templateui.manage` (F045), `syncui.panel` (cloudBackup, F070), `about.panel` (F098), `pluginmanager.gallery` (F080), `studysession.practice` (studyPractice, F050) and `studysession.smartLearn` (Smart Learn, F050). F049 opens the study panels by these two ids; `PanelIDs.studyLearn` still reads "studysession.learn" until NibContracts aligns it with them.
+Hosts call `resolvedParams`, `resolvedTitle` and `resolvedIcon`. Well-known panel ids are in `PanelIDs`: the owner registers its panel under exactly that id and other features open it with `panel.open {id}`. They are `aichat.panel` (assistant, F085), `organize.trash` and `organize.favourites` (F020), `templateui.manage` (F045), `syncui.panel` (cloudBackup, F070), `about.panel` (F098), `pluginmanager.gallery` (F080), `studysession.practice` (studyPractice, F050), `studysession.smartLearn` (studySmartLearn, F050) and `pages.movePages` (movePages, F022). F049 opens the study panels by these two ids; `PanelIDs.studyLearn` is a superseded alias that holds the Smart Learn id. The Move Pages sheet moves the page refs in `PanelContext.params["pages"]`, or the open page when there are none; F023 opens it with `panel.open {id, pages}` for the selected thumbnails.
 
 **Signals** (contracts-v2):
 - A `Registry` counts changes in `generation` and posts `.nibRegistryDidChange` with `RegistryChange` userInfo (ids, owner, kind).
@@ -1564,7 +1564,7 @@ Errors travel to JS as rejected Promises (`err.code`, `err.message`, `err.path`,
 On `main`, on pull requests and on `workflow_dispatch`, two parallel jobs run:
 
 - **test:** `brew install xcodegen` → `Scripts/make_icons.swift` → `Scripts/lint.py` (code rules + docs lint) → `xcodegen generate` → relay self-test when `tools/relay/relay.mjs` exists → pick a simulator whose runtime is not newer than the selected SDK → `xcodebuild test -scheme NibKit-Package -parallel-testing-enabled NO` in `NibKit/` → upload logs and the xcresult.
-- **ipa** (independent, so an IPA is produced even when tests fail): xcodegen → `xcodebuild archive` (Release, `generic/platform=iOS`, `CODE_SIGNING_ALLOWED=NO`; the archive compiles the app, so there is no separate simulator build) → ad-hoc sign with the entitlements files (App Group, for sideloading tools that honour it) → `Nib-unsigned.ipa` (checks `Payload/Nib.app/PlugIns/NibWidgets.appex` exists) and `Nib-unsigned-noextensions.ipa` (widget and share extensions removed) → upload.
+- **ipa** (independent, so an IPA is produced even when tests fail): xcodegen → `xcodebuild archive` (Release, `generic/platform=iOS`, `CODE_SIGNING_ALLOWED=NO`; the archive compiles the app, so there is no separate simulator build) → ad-hoc sign with the entitlements files (the App Group, and for the app the user-fonts entitlement `app-usage`: progressive enhancement, for sideloading tools that honour them) → `Nib-unsigned.ipa` (checks `Payload/Nib.app/PlugIns/NibWidgets.appex` exists) and `Nib-unsigned-noextensions.ipa` (widget and share extensions removed) → upload.
 
 **Feature branches.** Each feature agent pushes `feat/<FeatureID>` (for example `feat/F012`). Those pushes run only the quick **feature** job, which gives a compile-and-test result for that one feature in minutes:
 
