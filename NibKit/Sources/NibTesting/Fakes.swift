@@ -153,6 +153,8 @@ public final class FakePDFService: PDFService {
     public var texts: [String: String] = [:]
     public var linkMap: [String: [PDFLinkInfo]] = [:]
     public var outlines: [String: [PDFOutlineNode]] = [:]
+    /// contracts-v2: words per file name for `word(_:page:at:)` (the first whose rect contains the point).
+    public var words: [String: [(text: String, rect: Rect)]] = [:]
 
     public init() {}
 
@@ -166,6 +168,9 @@ public final class FakePDFService: PDFService {
     public func outline(_ url: URL) -> [PDFOutlineNode] { outlines[url.lastPathComponent] ?? [] }
     public func selection(_ url: URL, page: Int, from: Point, to: Point) -> (text: String, rects: [Rect]) {
         (texts[url.lastPathComponent] ?? "", [Rect(x: from.x, y: from.y, width: max(1, to.x - from.x), height: 18)])
+    }
+    public func word(_ url: URL, page: Int, at point: Point) -> (text: String, rect: Rect)? {
+        words[url.lastPathComponent]?.first { $0.rect.contains(point) }
     }
 }
 
@@ -213,6 +218,8 @@ public final class FakeCanvasHost: CanvasHost {
     public private(set) var committed: [(stroke: Stroke, page: PageID)] = []
     public private(set) var wetStrokeCancels = 0
     public private(set) var liveViews: [ElementID: UIView] = [:]
+    /// contracts-v2: pages passed to `afterNextRender` (the fake runs the body at once).
+    public private(set) var renderWaits: [PageID] = []
 
     public init(app: NibApp, session: EditorSession, doc: DocumentID = Fixtures.docID,
                 pages: [PageID] = [Fixtures.page1, Fixtures.page2]) {
@@ -252,6 +259,12 @@ public final class FakeCanvasHost: CanvasHost {
     public func commitStroke(_ stroke: Stroke, page: PageID) { committed.append((stroke, page)) }
     public func cancelWetStroke() { wetStrokeCancels += 1 }
     public func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { liveViews[item] = view }
+
+    /// Runs `body` immediately (tests need no render delay) and records the page.
+    public func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) {
+        renderWaits.append(page)
+        body()
+    }
 }
 
 /// Collaboration transport inside one process: transports sharing a `Hub` that host/join the same code exchange

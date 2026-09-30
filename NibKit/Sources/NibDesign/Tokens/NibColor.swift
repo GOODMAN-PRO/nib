@@ -50,21 +50,26 @@ public enum NibUIColor {
     public static let success = UIColor.systemGreen
     public static let warning = UIColor.systemOrange
 
-    // Water: what the droplet material is made of (DESIGN.md §3.3). Deep dark body is #1C1C1E @ 86 % (fix 3).
+    // Water: what the droplet material is made of (DESIGN.md §3.3). Deep dark body is #1C1C1E @ 86 % (fix 3). On iOS 26
+    // the system glass is the material and only the bodies (as the frozen tint while the Pencil is down) are used; the
+    // optics tokens below draw Nib's own water on iOS 17–25 (DESIGN.md §10.9).
     public static let clearBody = UIColor.nib(0xFFFFFF, 0.46, dark: 0x161618, 0.62, contrastLight: 0.72, contrastDark: 0.72)
     /// Clear over light paper: dark mode thickens to 80 % so a droplet over white paper is not a grey blob.
     public static let clearBodyOnPaper = UIColor.nib(0xFFFFFF, 0.46, dark: 0x161618, 0.80, contrastLight: 0.72, contrastDark: 0.86)
     public static let deepBody = UIColor.nib(0xF9F9FB, 0.72, dark: 0x1C1C1E, 0.86, contrastLight: 0.90, contrastDark: 0.92)
-    public static let deepGlassTint = UIColor.nib(0xFFFFFF, 0.35, dark: 0x1C1C1E, 0.45)
     public static let waterBody = UIColor.nib(0xFFFFFF, 0.08, dark: 0xFFFFFF, 0.03)
-    /// Edge and caustic are drawn over light paper only (DESIGN.md §3.3); over a flat desk they read as a pillow.
-    public static let waterEdge = UIColor.nib(0x141C28, 0.07, dark: 0xFFFFFF, 0.08)
-    public static let waterCaustic = UIColor.nib(0xFFFFFF, 0.12, dark: 0xFFFFFF, 0.10)
-    public static let waterRim = UIColor.nib(0xFFFFFF, 0.85, dark: 0xFFFFFF, 0.42)
-    /// A Tinted droplet's only optic.
+    /// The rim at full strength: a 0.8 pt line lit by the top-left key light, half as bright on the counter side, and
+    /// 22 % of it as the sheen inside the lit edge. Never a uniform stroke.
+    public static let waterRim = UIColor.nib(0xFFFFFF, 0.85, dark: 0xFFFFFF, 0.50)
+    /// A Tinted droplet's only optic (key and counter rim, no sheen).
     public static let tintRim = UIColor.nib(0xFFFFFF, 0.30, dark: 0xFFFFFF, 0.30)
     public static let waterLine = UIColor.nib(0x000000, 0.075, dark: 0xFFFFFF, 0.12, contrastLight: 0.25, contrastDark: 0.40)
     public static let waterLineBud = UIColor.nib(0x000000, 0.12, dark: 0xFFFFFF, 0.16, contrastLight: 0.25, contrastDark: 0.40)
+    /// The water's own shadow over a flat backdrop (desk, library, sheets), and over light paper. Light mode: deeper over
+    /// paper, where there is ink to separate from (the system glass's shadow grows over text). Dark mode: lighter over
+    /// paper, where the dark water already stands off the white page and a deep halo reads as a smudge.
+    public static let waterShadow = UIColor.nib(0x000000, 0.08, dark: 0x000000, 0.28)
+    public static let waterShadowOnPaper = UIColor.nib(0x000000, 0.13, dark: 0x000000, 0.18)
     public static let beadBody = UIColor.nib(0xFFFFFF, 0.70, dark: 0xFFFFFF, 0.22)
     /// Slider thumbs only; the selection bead has no shadow.
     public static let beadShadow = UIColor.nib(0x000000, 0.16, dark: 0x000000, 0.45)
@@ -101,14 +106,13 @@ public enum NibColor {
     public static let clearBody = Color(uiColor: NibUIColor.clearBody)
     public static let clearBodyOnPaper = Color(uiColor: NibUIColor.clearBodyOnPaper)
     public static let deepBody = Color(uiColor: NibUIColor.deepBody)
-    public static let deepGlassTint = Color(uiColor: NibUIColor.deepGlassTint)
     public static let waterBody = Color(uiColor: NibUIColor.waterBody)
-    public static let waterEdge = Color(uiColor: NibUIColor.waterEdge)
-    public static let waterCaustic = Color(uiColor: NibUIColor.waterCaustic)
     public static let waterRim = Color(uiColor: NibUIColor.waterRim)
     public static let tintRim = Color(uiColor: NibUIColor.tintRim)
     public static let waterLine = Color(uiColor: NibUIColor.waterLine)
     public static let waterLineBud = Color(uiColor: NibUIColor.waterLineBud)
+    public static let waterShadow = Color(uiColor: NibUIColor.waterShadow)
+    public static let waterShadowOnPaper = Color(uiColor: NibUIColor.waterShadowOnPaper)
     public static let beadBody = Color(uiColor: NibUIColor.beadBody)
     public static let beadShadow = Color(uiColor: NibUIColor.beadShadow)
     public static let swatchHairline = Color(uiColor: NibUIColor.swatchHairline)
