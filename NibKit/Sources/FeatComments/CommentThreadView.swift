@@ -30,12 +30,6 @@ enum CommentLink {
         guard parts.count == 2, parts.allSatisfy(NibID.isValid) else { return nil }
         return (NibID(parts[0]), NibID(parts[1]), NibID(id))
     }
-
-    @MainActor
-    static func copy(_ url: URL) {
-        UIPasteboard.general.setItems([["public.url": url, "public.utf8-plain-text": url.absoluteString]])
-        UIAccessibility.post(notification: .announcement, argument: String(localized: "Link copied"))
-    }
 }
 
 enum CommentText {
@@ -123,19 +117,36 @@ enum CommentUI {
     static func follow(_ url: URL, app: NibApp, session: EditorSession?) {
         Task { @MainActor in
             guard let link = CommentLink.parse(url) else {
-                await run(app, session, "app.openURL", ["url": .string(url.absoluteString)])
+                await run(app, session, CommandIDs.appOpenURL, ["url": .string(url.absoluteString)])
                 return
             }
             let ref = NodeRef.item(link.doc, link.page, link.comment).description
             if (session ?? app.services.sessions.active)?.document == link.doc {
-                await run(app, session, "view.reveal", ["ref": .string(ref)], quietIfMissing: true)
+                await run(app, session, CommandIDs.viewReveal, ["ref": .string(ref)], quietIfMissing: true)
             } else {
-                await run(app, session, "app.openURL", ["url": .string(url.absoluteString)])
+                await run(app, session, CommandIDs.appOpenURL, ["url": .string(url.absoluteString)])
             }
-            await run(app, session, CommentTapAt.descriptor.id,
+            await run(app, session, CommandIDs.commentTapAt,
                       ["page": .string(NodeRef.page(link.doc, link.page).description), "point": [0, 0],
                        "ref": .string(ref)])
         }
+    }
+
+    /// Copy Link: the thread's `nib://` link on the clipboard through `clipboard.copyText` (F014), announced to
+    /// VoiceOver once it is there.
+    @discardableResult
+    static func copy(link: URL, app: NibApp, session: EditorSession?) async -> Bool {
+        guard await run(app, session, CommandIDs.clipboardCopyText, ["url": .string(link.absoluteString)]) != nil else {
+            return false
+        }
+        UIAccessibility.post(notification: .announcement, argument: String(localized: "Link copied"))
+        return true
+    }
+
+    /// Copy Text of one message, through `clipboard.copyText` (F014).
+    @discardableResult
+    static func copy(text: String, app: NibApp, session: EditorSession?) async -> Bool {
+        await run(app, session, CommandIDs.clipboardCopyText, ["text": .string(text)]) != nil
     }
 }
 
@@ -168,7 +179,11 @@ struct CommentMenuContent: View {
             }
         }
         if let link = CommentLink.url(ref: ref) {
-            Button(String(localized: "Copy Link")) { CommentLink.copy(link) }
+            Button {
+                Task { await CommentUI.copy(link: link, app: app, session: session) }
+            } label: {
+                Label { Text(String(localized: "Copy Link")) } icon: { Image(nib: .link) }
+            }
         }
     }
 
@@ -192,32 +207,35 @@ final class CommentThreadModel: ObservableObject {
     enum Content: Equatable {
         case empty
         case missing
-        case draft(CommentsState.Draft)
+        case draft(CommentPanelTarget.Draft)
         case thread(doc: DocumentID, page: PageID, item: Item)
     }
 
     @Published private(set) var content: Content = .empty
     @Published private(set) var pageTitle = ""
     @Published private(set) var readOnly = false
+    /// What the panel shows: what `panel.open` asked for (`PanelContext.params`), then the thread a draft became or a
+    /// moved thread's new page.
+    private(set) var target: CommentPanelTarget?
     let app: NibApp
     let session: EditorSession?
-    private let state: CommentsState?
     private var watch: CommitWatch?
     private var bag = Set<AnyCancellable>()
 
-    init(app: NibApp, session: EditorSession?) {
+    init(app: NibApp, session: EditorSession?, target: CommentPanelTarget?) {
         self.app = app
         self.session = session
-        state = CommentsState.of(app.services)
+        self.target = target
         readOnly = session?.readOnly ?? false
         watch = CommitWatch(app.bus.observeCommits { [weak self] cs in self?.committed(cs) })
-        // @Published fires before the change: use the value handed over.
-        state?.$targets.sink { [weak self] targets in
-            guard let self = self else { return }
-            self.reload(targets[CommentsState.slot(self.session)])
-        }.store(in: &bag)
         session?.$readOnly.sink { [weak self] value in self?.readOnly = value }.store(in: &bag)
-        reload(state?.target(for: session))
+        reload()
+    }
+
+    /// Shows another thread or draft (the panel was opened again with other params, or a draft was sent).
+    func focus(_ target: CommentPanelTarget?) {
+        self.target = target
+        reload()
     }
 
     /// The thread's ref while one is shown.
@@ -231,7 +249,7 @@ final class CommentThreadModel: ObservableObject {
         switch content {
         case .empty: return "empty"
         case .missing: return "missing"
-        case .draft(let d): return "draft:\(d.doc.raw)/\(d.page.raw)/\(d.at.x),\(d.at.y)"
+        case .draft(let d): return "draft:" + d.key
         case let .thread(doc, page, item): return NodeRef.item(doc, page, item.id).description
         }
     }
@@ -239,12 +257,8 @@ final class CommentThreadModel: ObservableObject {
     /// Ink commits are frequent: only writes to the shown thread (the changeset's own values) or to the page table
     /// touch the panel, and nothing here ever scans the document.
     private func committed(_ cs: Changeset) {
-        guard let state = state, let target = state.target(for: session) else { return }
-        let doc: DocumentID
-        switch target {
-        case let .thread(d, _, _): doc = d
-        case let .draft(draft): doc = draft.doc
-        }
+        guard let target = target else { return }
+        let doc = target.doc
         guard cs.documents.contains(doc) else { return }
         var pagesChanged = false
         var writes: [PageID: Item] = [:]   // the thread's last write per page
@@ -259,20 +273,20 @@ final class CommentThreadModel: ObservableObject {
             }
         }
         guard case let .thread(_, page, id) = target else {
-            if pagesChanged { reload(target) }   // the draft's page title
+            if pagesChanged { reload() }   // the draft's page title
             return
         }
         if let moved = writes.first(where: { $0.key != page && !$0.value.deleted })?.key {
-            // item.moveToPage keeps ids: follow the thread (the targets sink reloads).
-            state.focus(.thread(doc: doc, page: moved, id: id), in: session)
+            // item.moveToPage keeps ids: follow the thread.
+            focus(.thread(doc: doc, page: moved, id: id))
         } else if pagesChanged {
-            reload(target)
+            reload()
         } else if let item = writes[page] {
             show(item.deleted || item.comment == nil ? .missing : .thread(doc: doc, page: page, item: item))
         }
     }
 
-    private func reload(_ target: CommentsState.Target?) {
+    private func reload() {
         switch target {
         case nil:
             show(.empty, title: "")
@@ -311,13 +325,13 @@ final class CommentThreadModel: ObservableObject {
             var p: [String: JSONValue] = ["page": .string(NodeRef.page(d.doc, d.page).description),
                                           "at": [.number(d.at.x), .number(d.at.y)], "text": .string(text)]
             if let parent = d.parent { p["ref"] = .string(NodeRef.item(d.doc, d.page, parent).description) }
-            guard let result = await CommentUI.run(app, session, CommentAdd.descriptor.id, .object(p)),
+            guard let result = await CommentUI.run(app, session, CommandIDs.commentAdd, .object(p)),
                   let ref = result["ref"]?.stringValue, case let .item(doc, page, id)? = NodeRef(ref) else { return false }
-            state?.focus(.thread(doc: doc, page: page, id: id), in: session)
+            focus(.thread(doc: doc, page: page, id: id))
             return true
         case .thread:
             guard let ref = ref else { return false }
-            return await CommentUI.run(app, session, CommentReply.descriptor.id,
+            return await CommentUI.run(app, session, CommandIDs.commentReply,
                                        ["ref": .string(ref), "text": .string(text)]) != nil
         case .empty, .missing:
             return false
@@ -326,19 +340,19 @@ final class CommentThreadModel: ObservableObject {
 
     func edit(_ message: NibID, text: String) async -> Bool {
         guard let ref = ref else { return false }
-        return await CommentUI.run(app, session, CommentEdit.descriptor.id,
+        return await CommentUI.run(app, session, CommandIDs.commentEdit,
                                    ["ref": .string(ref), "message": .string(message.raw), "text": .string(text)]) != nil
     }
 
     func delete(_ message: NibID) {
         guard let ref = ref else { return }
-        app.perform(CommentDeleteMessage.descriptor.id, ["ref": .string(ref), "message": .string(message.raw)],
+        app.perform(CommandIDs.commentDeleteMessage, ["ref": .string(ref), "message": .string(message.raw)],
                     session: session)
     }
 
     func setResolved(_ resolved: Bool) {
         guard let ref = ref else { return }
-        app.perform(CommentResolve.descriptor.id, ["ref": .string(ref), "resolved": .bool(resolved)], session: session)
+        app.perform(CommandIDs.commentResolve, ["ref": .string(ref), "resolved": .bool(resolved)], session: session)
     }
 
     func open(_ url: URL) -> OpenURLAction.Result {
@@ -355,6 +369,9 @@ final class CommentThreadModel: ObservableObject {
 /// composer where ⌘⏎ sends.
 struct CommentThreadView: View {
     @StateObject private var model: CommentThreadModel
+    /// What this window's `panel.open` asked for; a new request (another pin, another Add Comment) replaces what the
+    /// panel shows.
+    private let requested: CommentPanelTarget?
     private let dismiss: @MainActor () -> Void
     @State private var reply = ""
     @State private var sending = false
@@ -364,8 +381,10 @@ struct CommentThreadView: View {
     @FocusState private var composerFocused: Bool
 
     init(context: PanelContext) {
-        _model = StateObject(wrappedValue: CommentThreadModel(app: context.app,
-                                                              session: context.session ?? context.app.services.sessions.active))
+        let requested = CommentPanelTarget(params: context.params)
+        _model = StateObject(wrappedValue: CommentThreadModel(
+            app: context.app, session: context.session ?? context.app.services.sessions.active, target: requested))
+        self.requested = requested
         dismiss = context.dismiss
     }
 
@@ -399,6 +418,7 @@ struct CommentThreadView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .environment(\.openURL, OpenURLAction { url in model.open(url) })
         .onAppear { focusComposerForDraft() }
+        .onChange(of: requested) { _, target in model.focus(target) }
         .onChange(of: model.targetKey) {
             editing = nil
             reply = ""
@@ -423,7 +443,7 @@ struct CommentThreadView: View {
     private var hairline: some View {
         Rectangle()
             .fill(NibColor.separatorSoft)
-            .frame(height: 0.5)
+            .frame(height: NibStroke.hairline)
             .accessibilityHidden(true)
     }
 
@@ -555,7 +575,11 @@ struct CommentThreadView: View {
                 Label { Text(String(localized: "Edit Message")) } icon: { Image(nib: .pencil) }
             }
         }
-        Button(String(localized: "Copy Text")) { UIPasteboard.general.string = message.text }
+        Button {
+            Task { await CommentUI.copy(text: message.text, app: model.app, session: model.session) }
+        } label: {
+            Label { Text(String(localized: "Copy Text")) } icon: { Image(nib: .copy) }
+        }
         if !model.readOnly {
             Button(role: .destructive) {
                 if isOnly { lastMessagePendingDelete = message.id } else { model.delete(message.id) }

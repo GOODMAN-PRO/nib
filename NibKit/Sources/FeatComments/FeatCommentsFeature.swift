@@ -12,7 +12,6 @@ public enum FeatCommentsFeature: NibFeature {
         app.settings.declare(CommentSettings.showResolved,
                              summary: "Show resolved comment threads on pages and in the Comments list (this device).",
                              owner: id, schema: .bool())
-        app.services.set(CommentsState(), for: CommentsState.key)
 
         app.commands.register(CommentAdd.self)
         app.commands.register(CommentReply.self)
@@ -24,7 +23,7 @@ public enum FeatCommentsFeature: NibFeature {
         app.content.drawers.register(ItemDrawerEntry(key: ItemKind.comment.rawValue, owner: id,
                                                      drawer: CommentPinDrawer(settings: app.settings)))
         app.content.tapHandlers.register(TapHandlerDescriptor(
-            id: CommentTapAt.descriptor.id, owner: id, gesture: .tap, command: CommentTapAt.descriptor.id,
+            id: CommandIDs.commentTapAt, owner: id, gesture: .tap, command: CommandIDs.commentTapAt,
             order: 200, worksInReadOnly: true))
         CommentMenus.register(in: app, owner: id)
 
@@ -34,67 +33,107 @@ public enum FeatCommentsFeature: NibFeature {
             placement: .sidebarTab, order: 450, owner: id, docKinds: kinds) { context in
                 AnyView(CommentsPanel(context: context))
             })
-        app.ui.panels.register(PanelDescriptor(
+        // The thread shows what `panel.open {id, params}` names (contracts-v2 `PanelContext.params`) and draws its own
+        // `NibPanelHeader` with Resolve, the thread menu and Close (`providesHeader`).
+        var thread = PanelDescriptor(
             id: CommentPanels.thread, title: String(localized: "Comment"), icon: NibSymbol.comment.name,
             placement: .floating, order: 451, owner: id, docKinds: kinds) { context in
                 AnyView(CommentThreadView(context: context))
-            })
+            }
+        thread.providesHeader = true
+        app.ui.panels.register(thread)
     }
 
     public static func start(_ app: NibApp) async {
-        CommentsState.of(app.services)?.watchSettings(app)
+        CommentPinRefresh.watch(app)
     }
 }
 
 enum CommentPanels {
     /// Sidebar tab listing every thread of the document.
     static let list = "comments"
-    /// Floating Deep panel with one thread (a sheet in compact windows).
+    /// Floating Deep panel with one thread (a sheet in compact windows); `CommentPanelTarget` is its params.
     static let thread = "comments.thread"
 }
 
-/// Per-app UI state: which thread (or new-thread draft) each window's thread panel shows.
-@MainActor
-final class CommentsState: ObservableObject {
-    static let key = "comments.state"
-
+/// What the thread panel shows, carried by `panel.open {id: "comments.thread", params}` and read back from
+/// `PanelContext.params` (contracts-v2), so every window's panel shows what that window opened.
+enum CommentPanelTarget: Equatable {
+    /// A new thread that is written only when its first message is sent.
     struct Draft: Equatable {
         var doc: DocumentID
         var page: PageID
         var at: Point
         var parent: ElementID?
+        /// Fresh for every Add Comment, so adding a second comment at the same spot opens a new draft.
+        var key: String
     }
 
-    enum Target: Equatable {
-        case thread(doc: DocumentID, page: PageID, id: ElementID)
-        case draft(Draft)
-    }
+    case thread(doc: DocumentID, page: PageID, id: ElementID)
+    case draft(Draft)
 
-    @Published private(set) var targets: [NibID: Target] = [:]
-    private weak var app: NibApp?
-    private var settingsObserver: NSObjectProtocol?
-
-    static func of(_ services: NibServices) -> CommentsState? { services.get(key, as: CommentsState.self) }
-
-    func target(for session: EditorSession?) -> Target? { targets[Self.slot(session)] }
-
-    func focus(_ target: Target?, in session: EditorSession?) { targets[Self.slot(session)] = target }
-
-    static func slot(_ session: EditorSession?) -> NibID { session?.id ?? NibID("nosession") }
-
-    /// Tiles cache drawn pins, so flipping Show Resolved Comments re-renders the open canvases.
-    func watchSettings(_ app: NibApp) {
-        self.app = app
-        guard settingsObserver == nil else { return }
-        settingsObserver = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
-                                                                  queue: nil) { [weak self] note in
-            guard (note.userInfo?["name"] as? String) == CommentSettings.showResolved.name, let state = self else { return }
-            Task { @MainActor in state.invalidateCanvases() }
+    /// `{ref: item:D/P/I}` for a thread; `{draft, page: page:D/P, at: [x, y], ref?: item:D/P/I}` for a draft pinned to
+    /// a spot or to the object `ref`.
+    var params: JSONValue {
+        switch self {
+        case let .thread(doc, page, id):
+            return ["ref": .string(NodeRef.item(doc, page, id).description)]
+        case .draft(let d):
+            var o: [String: JSONValue] = ["draft": .string(d.key),
+                                          "page": .string(NodeRef.page(d.doc, d.page).description),
+                                          "at": [.number(d.at.x), .number(d.at.y)]]
+            if let parent = d.parent { o["ref"] = .string(NodeRef.item(d.doc, d.page, parent).description) }
+            return .object(o)
         }
     }
 
-    func invalidateCanvases() {
-        guard let app = app else { return }
+    /// nil for anything else (a panel opened without params shows "No comment open").
+    init?(params: JSONValue) {
+        if let key = params["draft"]?.stringValue {
+            guard case let .page(doc, page)? = params["page"]?.stringValue.flatMap({ NodeRef($0) }),
+                  case let .array(xy)? = params["at"], xy.count == 2,
+                  let x = xy[0].doubleValue, let y = xy[1].doubleValue else { return nil }
+            var parent: ElementID?
+            if let ref = params["ref"]?.stringValue {
+                guard case let .item(refDoc, refPage, id)? = NodeRef(ref), refDoc == doc, refPage == page else { return nil }
+                parent = id
+            }
+            self = .draft(Draft(doc: doc, page: page, at: Point(x, y), parent: parent, key: key))
+            return
+        }
+        guard case let .item(doc, page, id)? = params["ref"]?.stringValue.flatMap({ NodeRef($0) }) else { return nil }
+        self = .thread(doc: doc, page: page, id: id)
+    }
+
+    var doc: DocumentID {
+        switch self {
+        case .thread(let doc, _, _): return doc
+        case .draft(let d): return d.doc
+        }
+    }
+
+    /// Opens the thread panel of the invoking window on `self`; throws when there is no panel host.
+    @MainActor
+    func open(_ ctx: CommandContext) async throws {
+        _ = try await ctx.execute(CommandIDs.panelOpen, ["id": .string(CommentPanels.thread), "params": params])
+    }
+}
+
+/// Tiles cache drawn pins, so flipping Show Resolved Comments re-renders the open canvases.
+@MainActor
+enum CommentPinRefresh {
+    static func watch(_ app: NibApp) {
+        // A block observer lives as long as the notification centre; it holds the app weakly.
+        NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
+                                               queue: nil) { [weak app] note in
+            guard (note.userInfo?["name"] as? String) == CommentSettings.showResolved.name else { return }
+            Task { @MainActor in
+                if let app = app { invalidateCanvases(app) }
+            }
+        }
+    }
+
+    static func invalidateCanvases(_ app: NibApp) {
         var seen = Set<ObjectIdentifier>()
         for session in app.services.sessions.sessions {
             guard let host = session.editor?.canvasHost, seen.insert(ObjectIdentifier(host)).inserted,
@@ -111,48 +150,52 @@ final class CommentsState: ObservableObject {
 enum CommentMenus {
     static let resolveID = "comments.thread.resolve"
     static let reopenID = "comments.thread.reopen"
+    static let revealID = "comments.thread.reveal"
+    static let deleteID = "comments.thread.delete"
+    static let showResolvedID = "comments.showResolved"
 
     static func register(in app: NibApp, owner: String) {
         let menus = app.ui.menus
         menus.register(MenuItemDescriptor(
             id: "comments.add.page", title: String(localized: "Add Comment"), icon: NibSymbol.comment.name,
-            location: .pageLongPress, order: 600, owner: owner, command: CommentAdd.descriptor.id,
+            location: .pageLongPress, order: 600, owner: owner, command: CommandIDs.commentAdd,
             params: { pageParams($0) }, isVisible: { canAddOnPage($0) }))
         menus.register(MenuItemDescriptor(
             id: "comments.add.object", title: String(localized: "Add Comment"), icon: NibSymbol.comment.name,
-            location: .objectMenu, order: 600, owner: owner, command: CommentAdd.descriptor.id,
+            location: .objectMenu, order: 600, owner: owner, command: CommandIDs.commentAdd,
             params: { objectParams($0) }, isVisible: { canAddOnSelection($0) }))
 
         menus.register(MenuItemDescriptor(
             id: resolveID, title: String(localized: "Resolve Thread"), icon: NibSymbol.checkCircle.name,
-            location: .comment, order: 100, owner: owner, command: CommentResolve.descriptor.id,
+            location: .comment, order: 100, owner: owner, command: CommandIDs.commentResolve,
             params: { ["ref": .string($0.ref ?? ""), "resolved": true] },
             isVisible: { ctx in canEdit(ctx) && thread(ctx).map { !$0.resolved } == true }))
         menus.register(MenuItemDescriptor(
             id: reopenID, title: String(localized: "Reopen Thread"), icon: NibSymbol.undo.name,
-            location: .comment, order: 100, owner: owner, command: CommentResolve.descriptor.id,
+            location: .comment, order: 100, owner: owner, command: CommandIDs.commentResolve,
             params: { ["ref": .string($0.ref ?? ""), "resolved": false] },
             isVisible: { ctx in canEdit(ctx) && thread(ctx).map { $0.resolved } == true }))
         menus.register(MenuItemDescriptor(
-            id: "comments.thread.reveal", title: String(localized: "Show on Page"), icon: NibSymbol.eye.name,
-            location: .comment, order: 200, owner: owner, command: "view.reveal",
+            id: revealID, title: String(localized: "Show on Page"), icon: NibSymbol.eye.name,
+            location: .comment, order: 200, owner: owner, command: CommandIDs.viewReveal,
             params: { ["ref": .string($0.ref ?? "")] }, isVisible: { thread($0) != nil }))
         menus.register(MenuItemDescriptor(
-            id: "comments.thread.delete", title: String(localized: "Delete Thread"), icon: NibSymbol.trash.name,
-            location: .comment, order: 900, owner: owner, command: "item.delete",
+            id: deleteID, title: String(localized: "Delete Thread"), icon: NibSymbol.trash.name,
+            location: .comment, order: 900, owner: owner, command: CommandIDs.itemDelete,
             params: { ["refs": [.string($0.ref ?? "")]] },
             isVisible: { ctx in canEdit(ctx) && thread(ctx) != nil }, destructive: true))
 
-        menus.register(MenuItemDescriptor(
-            id: "comments.showResolved", title: String(localized: "Show Resolved Comments"), icon: NibSymbol.eye.name,
-            location: .documentMore, order: 700, owner: owner, command: "settings.set",
-            params: { _ in ["name": .string(CommentSettings.showResolved.name), "value": true] },
-            isVisible: { ctx in hasPages(ctx) && !ctx.app.settings.get(CommentSettings.showResolved) }))
-        menus.register(MenuItemDescriptor(
-            id: "comments.hideResolved", title: String(localized: "Hide Resolved Comments"),
-            icon: NibSymbol.eyeSlash.name, location: .documentMore, order: 700, owner: owner, command: "settings.set",
-            params: { _ in ["name": .string(CommentSettings.showResolved.name), "value": false] },
-            isVisible: { ctx in hasPages(ctx) && ctx.app.settings.get(CommentSettings.showResolved) }))
+        // One entry with a checkmark (contracts-v2 `isChecked`) that flips the per-device setting.
+        var showResolved = MenuItemDescriptor(
+            id: showResolvedID, title: String(localized: "Show Resolved Comments"), icon: NibSymbol.eye.name,
+            location: .documentMore, order: 700, owner: owner, command: CommandIDs.settingsSet,
+            params: { ctx in
+                ["name": .string(CommentSettings.showResolved.name),
+                 "value": .bool(!ctx.app.settings.get(CommentSettings.showResolved))]
+            },
+            isVisible: { hasPages($0) })
+        showResolved.isChecked = { $0.app.settings.get(CommentSettings.showResolved) }
+        menus.register(showResolved)
     }
 
     /// The menu context of one thread (for `MenuLocation.comment`).

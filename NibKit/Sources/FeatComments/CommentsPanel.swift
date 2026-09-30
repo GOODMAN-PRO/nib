@@ -206,7 +206,7 @@ final class CommentsListModel: ObservableObject {
     }
 
     func setShowResolved(_ on: Bool) {
-        app.perform("settings.set", ["name": .string(CommentSettings.showResolved.name), "value": .bool(on)],
+        app.perform(CommandIDs.settingsSet, ["name": .string(CommentSettings.showResolved.name), "value": .bool(on)],
                     session: session)
     }
 
@@ -215,8 +215,8 @@ final class CommentsListModel: ObservableObject {
         let app = self.app
         let session = self.session
         Task { @MainActor in
-            await CommentUI.run(app, session, "view.reveal", ["ref": .string(row.id)], quietIfMissing: true)
-            await CommentUI.run(app, session, CommentTapAt.descriptor.id,
+            await CommentUI.run(app, session, CommandIDs.viewReveal, ["ref": .string(row.id)], quietIfMissing: true)
+            await CommentUI.run(app, session, CommandIDs.commentTapAt,
                                 ["page": .string(NodeRef.page(row.doc, row.page).description),
                                  "point": [.number(row.anchor.x), .number(row.anchor.y)], "ref": .string(row.id)])
         }
@@ -240,7 +240,7 @@ struct CommentsPanel: View {
                 .padding(.horizontal, NibSpacing.l)
             Rectangle()
                 .fill(NibColor.separatorSoft)
-                .frame(height: 0.5)
+                .frame(height: NibStroke.hairline)
                 .accessibilityHidden(true)
             if model.sections.isEmpty {
                 // A long document still being read shows nothing rather than a premature "No comments yet".

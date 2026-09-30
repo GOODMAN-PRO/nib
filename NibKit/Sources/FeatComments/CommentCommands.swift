@@ -209,12 +209,13 @@ struct CommentAdd: NibCommand {
         }
         let place = try CommentPlacement.resolve(page: p.page, at: p.at, ref: p.ref, workspace: ctx.workspace,
                                                  session: ctx.activeSession)
-        if p.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           ctx.principal.isUser, let session = ctx.activeSession, let state = CommentsState.of(ctx.services) {
-            // Add Comment from a menu: nothing is written until the first message is sent from the composer.
-            state.focus(.draft(CommentsState.Draft(doc: place.doc, page: place.page, at: place.anchor,
-                                                   parent: place.parent)), in: session)
-            _ = try? await ctx.execute("panel.open", ["id": .string(CommentPanels.thread)])
+        if p.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, ctx.principal.isUser,
+           ctx.activeSession != nil {
+            // Add Comment from a menu: nothing is written until the first message is sent from the composer, which
+            // this window's thread panel shows (the draft travels in `panel.open`'s params).
+            let draft = CommentPanelTarget.Draft(doc: place.doc, page: place.page, at: place.anchor,
+                                                 parent: place.parent, key: NibID.make().raw)
+            try? await CommentPanelTarget.draft(draft).open(ctx)
             return Output(draft: true)
         }
         let text = try CommentRules.text(p.text, path: "$.text")
@@ -358,7 +359,7 @@ struct CommentResolve: NibCommand {
     }
 }
 
-/// Tap chain (order 200): opens the thread whose pin is under a finger tap in the thread panel.
+/// Tap chain (order 200): opens the thread whose pin is under a finger tap in the window's thread panel.
 struct CommentTapAt: NibCommand {
     struct Params: Codable {
         var page: String
@@ -404,12 +405,9 @@ struct CommentTapAt: NibCommand {
         }
         guard let found = thread else { return Output(handled: false, ref: nil) }
         let ref = NodeRef.item(doc, page, found.id).description
-        guard let session = ctx.activeSession, let state = CommentsState.of(ctx.services) else {
-            return Output(handled: false, ref: ref)
-        }
-        state.focus(.thread(doc: doc, page: page, id: found.id), in: session)
+        guard ctx.activeSession != nil else { return Output(handled: false, ref: ref) }
         do {
-            _ = try await ctx.execute("panel.open", ["id": .string(CommentPanels.thread)])
+            try await CommentPanelTarget.thread(doc: doc, page: page, id: found.id).open(ctx)
         } catch {
             // No panel host (document chrome disabled): the rest of the tap chain gets the tap.
             return Output(handled: false, ref: ref)
