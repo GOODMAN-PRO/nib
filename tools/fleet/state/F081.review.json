@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPluginPanels/PanelBridgeScript.swift:975-1041 (PanelFetcher.fetch)",
+      "problem": "nib.net.fetch from a panel does not enforce its documented limits of 30 s and 10 MB. `session.data(for:delegate:)` reads the whole response into Nib's own process, and only then is `data.count <= maxBytes` checked. `URLRequest.timeoutInterval` is an idle timeout; the resource timeout of `URLSessionConfiguration.ephemeral` stays at its 7-day default. An allowed host that returns a multi-GB body, or trickles bytes, can therefore grow Nib's memory without bound (jetsam kills the whole app, not only the panel's web process) or hold the call open indefinitely. F077's PluginFetcher streams the body and cancels the download once it is too large. This panel copy diverges from it, and it also drops OPTIONS from the allowed methods.",
+      "fix": "Make PanelFetcher a URLSessionDataDelegate that works like F077's PluginFetcher. In didReceive(response:), reject when expectedContentLength > maxBytes. In didReceive(data:), append the bytes and cancel the task as soon as received.count > maxBytes, throwing NibError(.unsupported, \"larger than 10 MB\"). Build the session from a config with timeoutIntervalForRequest = timeoutIntervalForResource = 30, urlCache = nil, httpCookieStorage = nil and httpShouldSetCookies = false. Add OPTIONS to `methods`. Add a test that registers a stub URLProtocol: a 10 MB + 1 byte body must fail with `unsupported` without the full body being buffered, and a redirect to a host outside network.hosts must be refused."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPluginPanels/PluginWebPanel.swift:212 (load), :285-296 (reloadPage), :394-418 (decidePolicyFor)",
+      "problem": "The panel reads the network allowance once, when it first loads: `allowedHosts` and the compiled WKContentRuleList come from `app.gateway.grants` at that moment. Suppose the user revokes \"network\" in Settings › Plugins (DESIGN.md §14.10 gives each permission its own toggle). Page fetch/XHR/WebSocket requests, sub-frames and link-outs to the manifest hosts keep working until the panel is closed. Reload does not help: reloadPage() reuses the web view, its rule list and the stale `allowedHosts`. Granting \"network\" later likewise has no effect until the panel is reopened. This breaks the acceptance guarantee \"no network without the network permission\" at the plugin trust boundary. Only nib.net.fetch rechecks live grants.",
+      "fix": "Add refreshNetworkRules(), which recomputes `PanelContentRules.allowedHosts(manifest:granted: app.gateway.grants(bridge.principal))`. When the result differs from `allowedHosts`, it fails closed and then swaps: install the no-host rule list immediately (`userContentController.removeAllContentRuleLists()` + add), compile the new list through `factory.ruleLists`, add it, and update `allowedHosts`. Call it from reloadPage() before `web.load`, on every `hello`, when the scene becomes active, and at the top of decidePolicyFor. decidePolicyFor should also check the live grant before returning .allow or .openExternally for http(s). Test the pure part: a function that takes the previous hosts plus the current manifest and grants and decides \"rebuild with X\". List a grants-changed event (none exists in NibEventType) as a contract request in the feature summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginPanels/PluginWebPanel.swift:638-647 (stopped/failed states), :455 (navigationFailed)",
+      "problem": "DESIGN.md §14.18 defines the crashed-panel body as \"This plugin stopped.\" · Reload · Report, but the stopped state offers only Reload. A failed navigation passes \"This panel could not open.\" as the message, and the failed state also uses it as the title, so the same sentence appears twice. The copy also misses the §14.18 rule that every message says what to do next.",
+      "fix": "Add `secondary: NibAction(String(localized: \"Report a Problem\")) { panel.reportProblem() }` to the .stopped (and .failed) NibEmptyState. In navigationFailed, pass a next-step message such as \"Check the plugin's files, then reload it.\" instead of repeating the title."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginPanels/PluginWebPanel.swift:442-448 (webViewWebContentProcessDidTerminate) and :266-283 (reload)",
+      "problem": "iOS routinely ends a WKWebView content process while the app is in the background. The panel then comes back as \"This plugin stopped.\", and the only recovery is Reload, which also runs plugin.reload. That restarts main.js and discards its state, even though only the panel's page died.",
+      "fix": "On the first termination (or whenever the panel is not visible), reload just the page automatically with web.load(entry URL), as Safari does. Show the stopped state only after a second termination within a short window. Keep plugin.reload for the explicit menu or ⌘R action."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginPanels/PluginWebPanel.swift:470-495 (runJavaScript*Panel) / PanelBridgeScript.swift PanelDialogs",
+      "problem": "Page dialogs have no limit. A panel that calls alert() or confirm() in a loop presents one window-modal UIAlertController after another. The user can never reach the panel's Close button and has to force-quit the app. Browsers stop this with a \"prevent additional dialogs\" option.",
+      "fix": "Count page-initiated dialogs per document. After 3 within 10 s, answer further alert/confirm/prompt calls immediately (confirm → false, prompt → nil) for the rest of that document. Optionally add a \"Block Dialogs From This Panel\" action to the third alert. Reset the count on hello/reload."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginPanels/PanelBridgeScript.swift:704-719 (handleNow log/toast)",
+      "problem": "The page's console.warn/error text and toast text go to os_log with `privacy: .public`. Plugin pages often log document text. diagnostics.export (F076) promises \"no note content\", and public log text reaches system logs and sysdiagnoses. Separately, panel console output never reaches the plugin log ring that the developer console tails (PLUGIN_API §11: console → plugin logs), and console.log is not forwarded at all.",
+      "fix": "Log the text with `privacy: .private` and keep only the plugin and panel ids public. File a contract request for a way to append panel lines to the plugin's log ring (for example PluginRuntimeHandle.appendLog), or note the gap in the feature summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginPanels/PluginSchemeHandler.swift:215-235 (PluginResourceLoader.response)",
+      "problem": "Every response holds the whole file. An open-ended range (`bytes=0-`, which WebKit's media loader sends) is copied in full with `data.subdata`, and a full response hands WebKit the entire file in one didReceive call. A plugin with a few hundred MB of media spikes memory in Nib's process (the scheme handler runs in the app, not in the web process).",
+      "fix": "Read only the requested slice with FileHandle (seek + read(upToCount:)). Cap open-ended ranges at a fixed chunk (for example 4 MB) and answer 206 with the matching Content-Range. For full responses, stream the body to the task in chunks rather than one Data."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginPanels/PluginWebPanel.swift:259",
+      "problem": "`web.isInspectable = true` is set unconditionally, so shipping builds let Safari Web Inspector attach to every plugin page. The inspector gets full use of window.nib with the plugin's grants.",
+      "fix": "Enable it only in DEBUG builds or when the plugin developer setting (Settings › Plugins › Developer, F080) is on."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginPanels/PluginWebPanel.swift:608-619, :634 (PluginPanelView), :567-575 (PanelContainerView.keyCommands)",
+      "problem": "Three smaller design/UI issues. (1) The flexible-width path copies NibPluginPanelChrome's header, More menu and hairline by hand, because the component hard-codes the 344 pt width. That is a NibDesign gap the feature works around silently. (2) DESIGN.md §14.18 calls for \"a small activity indicator\", but the loader uses `.controlSize(.regular)`. (3) ⌘R Reload Panel is a view-local UIKeyCommand: it is not registered through the key-command registry and has no KeyHint (Slop checklist: every shortcut shows its KeyHint; ARCHITECTURE §15.4).",
+      "fix": "Use `.controlSize(.small)`. Record the missing flexible-width option on NibPluginPanelChrome as a design-system gap in the summary so the hand copy can be dropped later. Either register Reload Panel as a KeyCommandDescriptor that runs plugin.reload (so it shows in the shortcut overlay), or drop the ⌘R binding and leave Reload in the More menu."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginPanels/PluginWebPanel.swift:358-366 (receive) / NibKit/Tests/FeatPluginPanelsTests",
+      "problem": "The check that stops sub-frames (such as iframes from allowed hosts) and other origins from calling window.nib is written inline in receive(), and no test covers it. It is the main gate between third-party frames and the plugin's grants.",
+      "fix": "Extract it into a pure `PanelCallGate.allows(frameURL:isMainFrame:pluginID:)` and test it: main frame on its own origin → allowed; sub-frame on its own origin, main frame on another plugin, https frame, about:blank and nil URL → denied."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginPanels/PluginSchemeHandler.swift:386-429 (PanelRuleListCache)",
+      "problem": "Compiled rule lists are stored in WKContentRuleListStore.default() under hash-suffixed identifiers and never removed. Every change to a plugin's hosts, and every uninstalled plugin, leaves another compiled list on disk.",
+      "fix": "After a list compiles, call getAvailableContentRuleListIdentifiers and remove any other identifier with the same `nib.panel.<id>.` prefix (removeContentRuleList)."
+    }
+  ]
+}

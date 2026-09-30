@@ -1,0 +1,23 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatManagedConfig/FeatManagedConfigFeature.swift:76-107 (ManagedConfigParser.walk) and 234-261 (ManagedConfigReader.apply)",
+      "problem": "Every managed key is copied verbatim into a 'managed.*' setting. settings.get / settings.list are open to AI, plugin and bridge principals for anything outside 'security.*'. MDM AppConfig payloads often carry credentials (a WebDAV or proxy password, an API token). Those would reach models, plugins and MCP clients, and would also sit in plain UserDefaults under nib.setting.managed.*. ARCHITECTURE §13/Keychain rule: secrets are never exposed to plugins or AI.",
+      "fix": "In the parser, skip any name whose last segment (case-insensitive) matches password|passwd|secret|token|apikey|api_key|privatekey, add it to Output.skipped, and log it by count only. Or store those values with Keychain.setString(service: \"app.nib.managed\", account: name) and leave them out of settings. Add a parser test with 'webdav.password' checking that it is absent from values and present in skipped."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatManagedConfig/FeatManagedConfigFeature.swift:128-131 (ManagedConfigParser.convert, NSNumber case)",
+      "problem": "Integer NSNumbers become .number(Double), so an integer above 2^53 (a numeric tenant or account id, for example) silently loses precision. Nothing reports it, and the corrupted value is treated as authoritative configuration.",
+      "fix": "When the NSNumber is an integer type (CFNumberIsFloatType(n) == false) and its magnitude exceeds 9_007_199_254_740_992, return .string(n.stringValue), or skip the value so it lands in Output.skipped. Add a convert test for Int64.max."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatManagedConfig/FeatManagedConfigFeature.swift:218-221 (refresh early exit) and 277-286 (willEnterForeground observer)",
+      "problem": "Read-only is enforced only by the settings.set command. Code in the same process can still call SettingsStore.setJSON(\"managed.x\", ...) directly. refresh() returns early whenever the raw managed dictionary is unchanged, so a mirrored value that was overwritten or removed that way stays wrong until the MDM configuration changes or the app relaunches. The foreground refresh never repairs it.",
+      "fix": "On UIApplication.willEnterForegroundNotification, call refresh(force: true). apply() already writes only the values that differ, so an unchanged mirror costs reads only. Keep the cheap unforced path for UserDefaults.didChangeNotification. Extend testRefreshesWhenReturningToForeground: overwrite a managed value with setJSON, post the foreground notification, and assert the value is restored."
+    }
+  ]
+}
