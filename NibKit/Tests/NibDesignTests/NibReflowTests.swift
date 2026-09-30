@@ -105,6 +105,66 @@ final class NibReflowTests: XCTestCase {
         XCTAssertNil(model(dragging: "b").combineCandidate(at: centre(3)))
     }
 
+    /// The gap switches as the finger reaches a neighbour's outer edge, before its combine zone. The dwell holds the
+    /// neighbour there for 180 ms, so a finger heading for its middle arms a combine instead of chasing it.
+    func testAFingerEnteringANeighboursCombineZoneWithinTheDwellFindsItStill() {
+        var m = model(dragging: "b", combines: true)
+        let c = layout.slot(2)                                                        // x 328…468, next to b
+        let edge = CGPoint(x: c.minX + 4, y: 91)
+        XCTAssertEqual(m.candidate(at: edge), 2)                                      // the gap would move to c…
+        XCTAssertNil(m.combineCandidate(at: edge))
+        XCTAssertFalse(m.update(finger: edge, now: 10))                               // …but c is under the finger
+        XCTAssertEqual(m.pending, NibReflowModel<String>.Pending(index: 2, since: 10))
+        XCTAssertFalse(m.update(finger: CGPoint(x: c.minX + 15, y: 91), now: 10.1))
+        XCTAssertEqual(m.insertion, 1)
+        let core = CGPoint(x: c.minX + 30, y: 91)                                     // inside c's inner 70 %
+        XCTAssertEqual(m.combineCandidate(at: core), "c")
+        XCTAssertFalse(m.update(finger: core, now: 10.17))
+        XCTAssertFalse(m.update(finger: core, now: 11))                               // held there: a combine arms
+        XCTAssertEqual(m.insertion, 1)
+        XCTAssertEqual(m.offset(of: "c"), .zero)
+        XCTAssertEqual(m.targetSlot(of: "c"), c)
+    }
+
+    func testAFingerRestingOnACoverGetsTheGapAfterTheDwell() {
+        XCTAssertEqual(NibReflowMetrics.dwell, 0.18, accuracy: 1e-12)
+        let band = CGPoint(x: layout.slot(2).minX + 8, y: 91)
+        var m = model(dragging: "b", combines: true)
+        XCTAssertFalse(m.update(finger: band, now: 0))
+        XCTAssertFalse(m.update(finger: band, now: 0.17))
+        XCTAssertTrue(m.update(finger: band, now: 0.18))                              // a reorder is still one rest away
+        XCTAssertEqual(m.insertion, 2)
+        XCTAssertNil(m.pending)
+        XCTAssertEqual(m.offset(of: "c"), CGSize(width: -164, height: 0))
+        // Leaving the cover starts the dwell again: back over the gap, then onto d.
+        XCTAssertFalse(m.update(finger: centre(2), now: 6))
+        XCTAssertNil(m.pending)
+        let d = CGPoint(x: layout.slot(3).minX + 8, y: 91)
+        XCTAssertFalse(m.update(finger: d, now: 6.1))
+        XCTAssertFalse(m.update(finger: centre(2), now: 6.2))
+        XCTAssertFalse(m.update(finger: d, now: 6.3))
+        XCTAssertFalse(m.update(finger: d, now: 6.45))
+        XCTAssertTrue(m.update(finger: d, now: 6.5))
+        XCTAssertEqual(m.insertion, 3)
+    }
+
+    func testNoDwellInAGutterForThumbnailsOrWithoutAClock() {
+        // Between rows nothing is under the finger: the gap moves at once.
+        var m = model(dragging: "b", combines: true)
+        let gutter = CGPoint(x: centre(2).x, y: 200)                                  // rows end at 182 and start at 206
+        XCTAssertEqual(m.candidate(at: gutter), 6)
+        XCTAssertTrue(m.update(finger: gutter, now: 1))
+        XCTAssertEqual(m.insertion, 6)
+        // Page thumbnails never combine, so nothing waits for them.
+        let band = CGPoint(x: layout.slot(2).minX + 8, y: 91)
+        var t = model(dragging: "b")
+        XCTAssertTrue(t.update(finger: band, now: 1))
+        // No clock: the geometry alone, as if the finger had rested.
+        var g = model(dragging: "b", combines: true)
+        XCTAssertTrue(g.update(finger: band))
+        XCTAssertEqual(g.insertion, 2)
+    }
+
     func testDropReportsFromToAndNeighbours() {
         var m = model(dragging: "b")
         XCTAssertNil(m.move)
@@ -183,5 +243,18 @@ final class NibReflowTests: XCTestCase {
         XCTAssertEqual(reflow.armedFrame, layout.slot(3))          // …which stays until the card is in
         reflow.landed()
         XCTAssertNil(reflow.armed)
+    }
+
+    func testAFingerRestingOnACoverGetsItsGapWithoutMoving() {
+        let reflow = NibReflow<String>(layout: layout, combines: true)
+        reflow.begin("b", order: ids, at: centre(1))
+        reflow.move(to: CGPoint(x: layout.slot(2).minX + 8, y: 91))  // on c's outer edge
+        XCTAssertEqual(reflow.offset(for: "c"), .zero)                // c waits out the dwell…
+        let rested = expectation(description: "rested past the dwell")
+        DispatchQueue.main.asyncAfter(deadline: .now() + NibReflowMetrics.dwell + 0.15) { rested.fulfill() }
+        wait(for: [rested], timeout: 2)
+        XCTAssertEqual(reflow.offset(for: "c"), CGSize(width: -164, height: 0))   // …then makes room
+        XCTAssertNil(reflow.armed)
+        XCTAssertEqual(reflow.end(), .reorder(NibReflowMove(id: "b", from: 1, to: 2, in: ids)))
     }
 }
