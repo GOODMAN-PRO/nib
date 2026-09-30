@@ -1,0 +1,83 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTeacher/FeatTeacherFeature.swift L37-42 (hint TapHandlerDescriptors with itemKinds [.custom] + drawKeys [AnswerZone.drawKey]); AnswerZoneCommands.swift L176-178 (zone created at tx.bottomZ) and L393-403 (tapped trusts ref)",
+      "problem": "The contract routes a tap to a handler only when the TOPMOST live item under the point matches its drawKeys (Registries.swift L713-722). Every zone is created at the bottom of the page, and its hint widget sits over the zone's top-right corner. So any item under the widget blocks the hint button: a text box, image, shape or student ink there makes the topmost item that item, not the zone. The handler is never offered, and the tap goes to selection.tapAt or the tool. 'Make Answer Zone' builds the zone from the selection's bounds plus 8 pt, so the selected question nearly always lies under the widget, and the hint button is dead from the start. The same applies to small zones, and at low zoom: the fixed 72x32 pt widget and its 44 pt hit area stick out past the zone, where no zone is under the point at all. VoiceOver still works, which hides the bug. The test (FeatTeacherTests L315-344) passes the zone's own ref, so it never exercises the router's topmost-item rule.",
+      "fix": "Keep the TapHandlerDescriptor route, but register the two hint handlers without itemKinds/drawKeys (nil = offered for every tap). In AnswerZoneRevealHint.tapped, resolve the zone from `page` + `point`: take AnswerZoneScope.zones(doc:page:) (skip zones on session.hiddenLayers) and find the first zone whose AnswerZoneLayout.hitRect(slots(...).hint) contains the point. Use `ref` only as a shortcut when it is itself a zone. Return {handled:false} when no widget is hit. Use the canvas zoom (session.editor?.canvasHost?.zoomScale ?? session.zoom) so the hit area matches the placed widget. Add a test that puts a text box or stroke over the hint widget, invokes the handler with ref = that item, and expects handled:true and one reveal. Add a second test at zoom 0.5 on a minimum-size zone."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L198-199 (outlineRadius 6, outlineDash [5,3]), L250-251 (outline width 1), L256/L267 (box width 0.75), L258/L262/L268 (font sizes 13/13/10); widget L1044 (0.96), L1058 (withSize(17)), L194 (widgetWidth 72)",
+      "problem": "The zone's page drawing, which is also what prints and exports, uses literal styling. DESIGN.md §5.1 says nothing strokes at a width off the NibStroke list, but the score and hint boxes use 0.75 pt. §5.1 also has one dash (4/4 at thin), and the zone outline uses its own [5,3]. The 6 pt radius is written as a literal and is not the §6 row it copies. The page text uses literal font sizes. This fails the Slop checklist line 'Only tokens', and the review gate rejects on any failed line. NibDesign v2 added NibStroke.dash/thin/hairline/outline precisely to replace such literals (the F026 focus outline row). Lint does not catch numbers passed to DisplayOp.",
+      "fix": "In AnswerZoneLayout.displayList use `width: Double(NibStroke.thin)` and `dash: NibStroke.dash.map(Double.init)` for the outline. Use `Double(NibStroke.hairline)` (or `.outline`) for the score and hint boxes. Use a named radius from NibRadius (e.g. `Double(NibRadius.badge)`, or `NibRadius.pageWash` for an on-page wash) instead of the literal 6. Drop outlineDash/outlineRadius as local constants. Replace the literal text sizes with named constants derived from a NibFont role's default point size (hud 13, caption2), declared once and documented. In the widget, derive the Dynamic Type cap from the token (e.g. `NibUIFont.hud` at its default size) instead of withSize(17). Update testDisplayListShowsTheScoreAndHintUseOnlyWherePrinted to assert the token values."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L129-137 (AnswerZone.write replaces custom.data wholesale)",
+      "problem": "Every score, setHints or reveal rewrites custom.data from the Codable struct, so any key AnswerZone does not know is silently dropped. That includes fields a plugin or the assistant added with item.update, and fields a newer build (F109/F110 in the same module) writes that an older sideloaded device then erases on its next score and syncs back.",
+      "fix": "Merge instead of replacing: start from `custom.data.objectValue ?? [:]`, overwrite the known keys from `JSONValue.from(self)`, and remove known keys that are now nil (score, scoredAt, scoredBy, points, label). Add a test: item.update adds data.extra, then answerZone.score keeps it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L32-54 (HintUse stores only an index); AnswerZoneCommands.swift L311-321 (setHints keeps revealed/usage)",
+      "problem": "Usage records point at hints by index only. When the teacher removes or reorders hints without resetUsage, the log attributes opens to the wrong hint. `revealed` also stays the same, so a hint the student never opened now shows as revealed (remove hint 1 of 3 with 2 revealed, and old hint 3 becomes 'shown').",
+      "fix": "Store the hint text (or a stable hint id) in HintUse. In setHints, recompute `revealed` as the count of the leading new hints whose text appears among the previously revealed texts, rather than min(revealed, count). Show the stored text in the inspector's usage rows. Add a test that removes the first hint after two reveals."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L83-101 (lenient decoder)",
+      "problem": "Decoding untrusted file or plugin data clamps revealed and score, but not hints.count (max 10), hint length (1000), label length (120), points (<= 1000) or usage count. The inspector builds a non-lazy row per usage entry and a field per hint, so a hostile or corrupt file with 100k entries hangs the main thread when the zone is selected.",
+      "fix": "In init(from:), clamp: hints to the first maxHints entries, each prefix(maxHintLength); label prefix(maxLabelLength); points to <= maxPoints; usage to the last N entries (e.g. 500). Extend testLenientDecoding."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L612-653 (layout on every canvasDidChange); AnswerZoneCommands.swift L53-58 (document scope)",
+      "problem": "layout() runs on every scroll and zoom frame. Each run calls workspace.content(doc).livePages, which filters and sorts every page record, then calls pageFrame for each page. On a 1000-page PDF notebook that is an O(n log n) string sort per frame on main, eating into the 3 ms chrome budget. answerZone.score/setHints/revealHint with a doc: ref load every page's items into the workspace cache, and nothing evicts them.",
+      "fix": "Cache the live page id list in the attachment and drop it in committed() on .page mutations (already handled there). Better, iterate only the pages whose frames intersect the visible rect, by bisecting the cached ordered list. For doc scope, record workspace.cachedPages(doc) before the scan and evict the pages that were not cached before once done (as G10 prescribes for F005)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L329-364 (AnswerZoneUI static registry); AnswerZoneCommands.swift L412-414",
+      "problem": "The command reaches the canvas attachment through a process-wide static session->attachment table and calls UI directly from inside the command handler. That is a local side channel beside the contract's event bus, and the attachment already subscribes to app.events.",
+      "fix": "After a handled tap, emit a typed event (e.g. \"teacher.answerZone.hintsShown\" with {session, ref, announce}) via ctx.app?.events, and let AnswerZoneAttachment subscribe (filtered on host.session.id) and call presentHints. Delete AnswerZoneUI's static table (keep only the popover ids). Keep the !ctx.dryRun guard."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L689-698, L874-888 (hint widget VoiceOver activate), L678-687 (score adjustable); FeatTeacherFeature.swift L37-42",
+      "problem": "Read-only handling is inconsistent. In a read-only window (session.readOnly), finger taps on either widget do nothing. But a VoiceOver double-tap on the hint widget still runs answerZone.revealHint (the ref path checks only ctx.isReadOnly(doc)), and the hints card's Show Next Hint does too, so the document changes. The score widget still advertises .adjustable and 'Swipe up or down to change it'. Sighted users also cannot even peek at the hints already revealed in read-only, because the long-press handler lacks worksInReadOnly.",
+      "fix": "In configureHint/configureScore, when !canScore(host): set activate to peekHints, drop the adjustable trait and the hint text, and hide Show Next Hint in the card (pass a canReveal flag into AnswerZoneHintsCard). Register the longPress handler with worksInReadOnly: true, and in tapped allow the longPress gesture in read-only (it does not write)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L717-719 (score hitTest claims Pencil), FeatTeacherFeature.swift L37 (hint widget via finger-only tap handlers)",
+      "problem": "The two widgets that look the same react differently to the Pencil. A Pencil tap on the score widget opens the score, but on the hint widget it inks a dot into the student's answer. A Pencil stroke that starts inside the score widget's 44 pt area is swallowed.",
+      "fix": "Make both behave the same. Either claim Pencil taps on the hint widget in hitTest(_:isPencil:host:) and forward them to answerZone.revealHint {page, point, ref, gesture:\"tap\"} via the bus, or do not claim Pencil touches on the score widget (return !isPencil && ...)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L942-1115 (AnswerZoneWidgetView), L196-197 (widgetGap = NibSpacing.xs)",
+      "problem": "The widget is a hand-rolled canvas droplet: it copies NibHandleView's body, water line and elevation code but leaves out the waterRim, so it does not match the canvas handles. DESIGN.md §15.6 says to file a contract request, not hand-roll. The two resting capsules sit 4 pt apart, which breaks §2.4: resting droplets are either fused (1 pt overlap) or at least 16 pt apart.",
+      "fix": "Add the rim (NibWaterPaths.rim + waterRim, as NibHandleView does). Stack the two widgets fused (-1 pt gap) or at least 16 pt apart. Note a NibDesign contract request for a labelled rigid canvas capsule (a NibHandleView .capsule style) in the feature's final summary, so the local view can be swapped later."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZones.swift L1329-1340, L1359-1378 (inspector), AnswerZoneCommands.swift L282-334",
+      "problem": "The 'revealed one at a time, usage recorded' guarantee is easy to bypass. Selecting a zone and opening Style shows every hint in full, and one tap on Reset (or the assistant's answerZone.setHints {ref: doc:..., resetUsage: true}) erases the usage record with no confirmation.",
+      "fix": "In AnswerZoneEditor, show hints past `revealed` collapsed behind an explicit 'Edit Hints' disclosure. Split resetUsage into its own action that NibDesign confirms inline (or mark the descriptor destructive when resetUsage is true, so non-user callers are confirmed). Rename the bare 'Reset' section action to 'Reset Hint Usage' (verb + object)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTeacher/AnswerZoneCommands.swift L160",
+      "problem": "answerZone.create takes the layer from ctx.activeSession, not the invoking session. A call from a background window, or on a document other than the active window's, lands on another window's active layer, which may not exist in this document.",
+      "fix": "Use `(ctx.session ?? ctx.activeSession).flatMap { $0.document == doc ? $0.activeLayer : nil } ?? 0`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTeacherTests/FeatTeacherTests.swift",
+      "problem": "No test covers: a read-only document (ctx.isReadOnly -> unsupported) for score, setHints and revealHint; dryRun of the tap path (no UI, no write); unknown-key preservation; or the router's topmost-item case (major #1).",
+      "fix": "Add tests for each. For read-only, use the harness's read-only persistence or the legacy ServiceKeys.storeReadOnly set. For dry run, run with Invocation(dryRun: true) and assert that the zone is unchanged and FakeFloatingHost presented nothing."
+    }
+  ]
+}
