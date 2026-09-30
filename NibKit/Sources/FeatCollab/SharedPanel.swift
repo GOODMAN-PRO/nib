@@ -40,7 +40,7 @@ struct PageUnseen: Equatable {
 enum UnseenComputation {
     static func isUnseen(_ rev: Rev, lastSeen: Rev?, me: UInt32) -> Bool {
         guard let seen = lastSeen else { return false }
-        return rev.device != me && rev > seen
+        return rev.device != me && rev.effective() > seen.effective()
     }
 
     /// One page's unseen changes from its record and items (tombstones count: a deletion is a change).
@@ -59,8 +59,11 @@ enum UnseenComputation {
 
     /// The newest revision among a page's record and items: what marking the page seen covers.
     static func newest(_ record: PageRecord?, items: [Item]) -> Rev? {
-        var best = record?.rev
-        for item in items where best.map({ item.rev > $0 }) ?? true { best = item.rev }
+        var best = record?.rev.effective()
+        for item in items {
+            let rev = item.rev.effective()
+            if best.map({ rev > $0 }) ?? true { best = rev }
+        }
         return best
     }
 
@@ -113,7 +116,7 @@ final class UnseenTracker {
     func lastSeen(_ doc: DocumentID, page: PageID) -> Rev? {
         guard let base = baseline(doc) else { return nil }
         guard let own = mark(UnseenTracker.pageKey(doc, page)) else { return base }
-        return max(base, own)
+        return max(base.effective(), own.effective())
     }
 
     /// Documents with a baseline.
@@ -308,14 +311,37 @@ enum SharedList {
     }
 }
 
+/// Shared-tab updates do not publish on PresenceHub: cursor beads and the Follow HUD only observe presence state.
+/// Decoded shared records are cached until the session or library changes. Disk scans run from the panel's task.
+@MainActor
+final class SharedPanelModel: ObservableObject {
+    private unowned let hub: PresenceHub
+    private var records: [CollabSharedDocument]?
+    @Published private(set) var revision = 0
+    @Published private(set) var entries: [SharedEntry] = []
+
+    init(hub: PresenceHub) { self.hub = hub }
+
+    func changed(recordsChanged: Bool = false) {
+        if recordsChanged { records = nil }
+        revision &+= 1
+    }
+
+    func refresh(scan: Bool) {
+        let records = self.records ?? hub.hooks?.sharedDocuments ?? []
+        self.records = records
+        if scan { for record in records { hub.unseen.scanIfNeeded(record.local) } }
+        let library = hub.app.services.library
+        let next = SharedList.make(records, node: { library?.node($0) }, liveDoc: hub.hooks?.session?.doc,
+                                   unseen: { [unseen = hub.unseen] in unseen.count($0) })
+        if next != entries { entries = next }
+    }
+}
+
 extension PresenceHub {
-    /// The Shared tab's documents (tracked ones are scanned for unseen changes the first time).
     func sharedEntries() -> [SharedEntry] {
-        let records = hooks?.sharedDocuments ?? []
-        let library = app.services.library
-        for r in records { unseen.scanIfNeeded(r.local) }
-        return SharedList.make(records, node: { library?.node($0) }, liveDoc: hooks?.session?.doc,
-                               unseen: { [unseen] in unseen.count($0) })
+        sharedModel.refresh(scan: false)
+        return sharedModel.entries
     }
 }
 
@@ -325,8 +351,15 @@ extension PresenceHub {
 /// with its live state and unseen changes. Open, join or share again, mark as seen, leave, or move a copy to the
 /// Trash; every action is a command. Content, not chrome: opaque surfaces on the library background.
 struct SharedPanel: View {
-    @ObservedObject var hub: PresenceHub
+    let hub: PresenceHub
+    @ObservedObject private var model: SharedPanelModel
     let context: PanelContext
+
+    init(hub: PresenceHub, context: PanelContext) {
+        self.hub = hub
+        self.context = context
+        _model = ObservedObject(wrappedValue: hub.sharedModel)
+    }
     @State private var filter: SharedFilter = .all
     @State private var trashing: SharedEntry?
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -337,8 +370,7 @@ struct SharedPanel: View {
     private var coverSize: CGSize { isCompact ? NibMetrics.coverSizeCompact : NibMetrics.coverSize }
 
     var body: some View {
-        _ = hub.sharedRevision
-        let all = hub.sharedEntries()
+        let all = model.entries
         let shown = all.filter { filter.accepts($0) }
         return ScrollView {
             VStack(alignment: .leading, spacing: NibSpacing.xxl) {
@@ -371,6 +403,7 @@ struct SharedPanel: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(NibColor.background)
+        .task(id: model.revision) { model.refresh(scan: true) }
         .confirmationDialog(String(localized: "Move to Trash?"),
                             isPresented: Binding(get: { trashing != nil }, set: { if !$0 { trashing = nil } }),
                             titleVisibility: .visible, presenting: trashing) { e in
@@ -430,7 +463,7 @@ struct SharedPanel: View {
                 Button(e.isHost ? String(localized: "End Live Session") : String(localized: "Leave Live Session")) { leave() }
             }
             if e.unseen > 0 { Button(String(localized: "Mark as Seen")) { markSeen(e) } }
-            Button(String(localized: "Move to Trash")) { trashing = e }
+            if !(e.isLive && e.isHost) { Button(String(localized: "Move to Trash")) { trashing = e } }
         }
     }
 
@@ -455,14 +488,21 @@ struct SharedPanel: View {
                 } icon: { Image(nib: .xmark) }
             }
         }
-        if e.unseen > 0 {
-            Button { markSeen(e) } label: {
-                Label { Text(String(localized: "Mark as Seen")) } icon: { Image(nib: .checkCircle) }
+        let ctx = MenuContext(app: app, session: context.session, doc: e.local)
+        ForEach(app.ui.menuItems(.libraryItem, ctx).filter {
+            !(e.isLive && e.isHost && $0.command == CommandIDs.libraryTrash)
+        }, id: \.id) { item in
+            Button(role: item.destructive ? .destructive : nil) {
+                hub.run(item.command, item.params(ctx), session: context.session)
+            } label: {
+                Label(item.resolvedTitle(for: ctx), systemImage: item.icon ?? NibSymbol.notebook.name)
             }
         }
-        Divider()
-        Button(role: .destructive) { trashing = e } label: {
-            Label { Text(String(localized: "Move to Trash")) } icon: { Image(nib: .trash) }
+        if !(e.isLive && e.isHost) {
+            Divider()
+            Button(role: .destructive) { trashing = e } label: {
+                Label { Text(String(localized: "Move to Trash")) } icon: { Image(nib: .trash) }
+            }
         }
     }
 
@@ -550,6 +590,7 @@ struct SharedPanel: View {
     }
 
     func trash(_ e: SharedEntry) {
+        guard !(hub.hooks?.session?.isHost == true && hub.hooks?.session?.doc == e.local) else { return }
         hub.run(CommandIDs.libraryTrash, ["refs": [.string(NodeRef.document(e.local).description)]],
                 session: context.session)
     }

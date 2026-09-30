@@ -39,8 +39,6 @@ final class PresencePair {
             t.seenDwell = 60
             t.returnSummaryDelay = 0
             hub.timing = t
-            // Seen marks are made a little in the past, so a change made the same millisecond still counts.
-            hub.clock = { Date().timeIntervalSince1970 - 30 }
         }
     }
 
@@ -132,6 +130,11 @@ final class PresenceTests: XCTestCase {
         XCTAssertEqual(thin.count, PresenceMessage.maxOutlinePoints)
         XCTAssertEqual(thin.first, long.first)
         XCTAssertEqual(thin.last, long.last)
+        let inbound = PresenceMessage.lasso(page: page1Ref, outline: long, bounds: nil)
+        guard case let .lasso(_, decoded, _)? = PresenceMessage(json: inbound.json) else {
+            return XCTFail("a valid large lasso should decode")
+        }
+        XCTAssertEqual(decoded, thin, "inbound peers cannot bypass the outline budget")
     }
 
     func testPresenceStateExpiresCursorsTrimsLaserTrailsAndClears() {
@@ -272,6 +275,41 @@ final class PresenceTests: XCTestCase {
         XCTAssertTrue(UnseenComputation.page(record, items: items, lastSeen: nil, me: me, at: 1).isEmpty,
                       "an untracked document has nothing unseen")
         XCTAssertEqual(UnseenComputation.newest(record, items: items), Rev(wallMs: 5_000, counter: 0, device: 7))
+    }
+
+    func testSeenMarksUseLoadedContentRevisionsAndIgnoreFutureClocks() async throws {
+        let h = Harness(features: PresencePair.features, deviceID: 8)
+        let hub = try XCTUnwrap(PresenceHub.of(h.app))
+        var item = PresencePair.stroke("SLOWCLOCK001", x: 100)
+        item.rev = Rev(wallMs: 1_700_000_000_001, counter: 0, device: 7)
+        let content = try h.app.workspace.peekContent(doc)
+        let persistence = try XCTUnwrap(h.app.workspace.persistence as? InMemoryPersistence)
+        persistence.didChange(doc, head: content, pages: [Fixtures.page2: [item]])
+        h.app.workspace.evictPages(doc, keeping: [])
+        XCTAssertNil(h.app.workspace.contentRevision(doc, page: Fixtures.page2))
+        try await h.run("collab.markSeen", ["pages": ["doc:FIXTUREDOC01"]])
+        let expected = max(content.pages.map { $0.rev.effective() }.max() ?? .zero, item.rev)
+        XCTAssertEqual(hub.unseen.baseline(doc), expected)
+        XCTAssertTrue(UnseenComputation.isUnseen(Rev(wallMs: expected.wallMs, counter: expected.counter + 1, device: 7),
+                                                lastSeen: expected, me: 8), "an HLC successor badges without a clock delay")
+
+        let future = Rev(wallMs: UInt64(Date().timeIntervalSince1970 * 1000) + 172_800_000, counter: 1, device: 7)
+        XCTAssertFalse(UnseenComputation.isUnseen(future, lastSeen: expected, me: 8))
+        item.rev = future
+        persistence.didChange(doc, head: content, pages: [Fixtures.page2: [item]])
+        h.app.workspace.evictPages(doc, keeping: [])
+        try await h.run("collab.markSeen", ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"]])
+        XCTAssertLessThan(try XCTUnwrap(hub.unseen.lastSeen(doc, page: Fixtures.page2)).wallMs, future.wallMs)
+        XCTAssertEqual(UnseenComputation.newest(nil, items: [item]), future.effective())
+    }
+
+    func testEnablingNotificationsRequestsAuthorizationThroughTheHeadlessSeam() throws {
+        let h = Harness(features: PresencePair.features)
+        let notifier = try XCTUnwrap(PresenceHub.of(h.app)?.notifier as? RecordingPresenceNotifier)
+        h.app.settings.set(PresenceSettings.notifications, false)
+        XCTAssertEqual(notifier.authorizationRequests, 0)
+        h.app.settings.set(PresenceSettings.notifications, true)
+        XCTAssertEqual(notifier.authorizationRequests, 1)
     }
 
     func testRemoteChangesBadgeThePageAndMarkSeenClearsIt() async throws {
@@ -526,6 +564,71 @@ final class PresenceTests: XCTestCase {
         pair.host.session.page = Fixtures.page1
         try await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(pair.guest.session.page, Fixtures.page2)
+    }
+
+    func testRejoinClearsMissedFollowMeAndLassoState() async throws {
+        let pair = PresencePair()
+        try await pair.start()
+        pair.host.session.selection = Selection(doc: doc, page: Fixtures.page1, items: [Fixtures.strokeID],
+                                                bounds: Rect(x: 10, y: 10, width: 100, height: 100))
+        try await pair.host.run("collab.followMe", ["on": true])
+        try await presenceWait("guest follows and sees the lasso") {
+            pair.guestHub.state.following == PresencePair.hostID &&
+                pair.guestHub.presence.people[PresencePair.hostID]?.lasso != nil
+        }
+        let service = try XCTUnwrap(CollabService.of(pair.guest.app))
+        service.timing.retryDelays = [60]
+        service.session?.markReconnecting()
+        let transport = try XCTUnwrap(pair.guest.app.services.get(ServiceKeys.collabMultipeer,
+                                                                  as: InMemoryCollabTransport.self))
+        transport.leave()
+        try await pair.host.run("collab.followMe", ["on": false])
+        pair.host.session.selection = Selection()
+        XCTAssertNotNil(pair.guestHub.presence.people[PresencePair.hostID]?.lasso, "the clearing message was missed")
+        await service.resumeAfterSuspend()
+        try await presenceWait("guest rejoins and receives the current viewport") {
+            pair.guestHub.state.live && pair.guestHub.presence.people[PresencePair.hostID]?.viewport != nil
+        }
+        XCTAssertNil(pair.guestHub.state.following)
+        XCTAssertNil(pair.guestHub.presence.people[PresencePair.hostID]?.lasso)
+    }
+
+    func testRejoiningFormerLeaderDoesNotTakeLeadershipBack() async throws {
+        let pair = PresencePair()
+        try await pair.start()
+        try await pair.guest.run("collab.followMe", ["on": true])
+        try await presenceWait("host follows guest") { pair.hostHub.state.following == PresencePair.guestID }
+        let service = try XCTUnwrap(CollabService.of(pair.guest.app))
+        service.timing.retryDelays = [60]
+        service.session?.markReconnecting()
+        let transport = try XCTUnwrap(pair.guest.app.services.get(ServiceKeys.collabMultipeer,
+                                                                  as: InMemoryCollabTransport.self))
+        transport.leave()
+        try await pair.host.run("collab.followMe", ["on": true])
+        await service.resumeAfterSuspend()
+        try await presenceWait("returning guest follows the new leader") {
+            pair.guestHub.state.following == PresencePair.hostID
+        }
+        XCTAssertFalse(pair.guestHub.state.leading)
+        XCTAssertTrue(pair.hostHub.state.leading)
+        XCTAssertNil(pair.hostHub.state.following)
+    }
+
+    func testCompetingFollowMeLeadersConvergeAndViewersCannotLead() async throws {
+        let pair = PresencePair()
+        try await pair.start()
+        pair.hostHub.follow.setLeading(true)
+        pair.guestHub.follow.setLeading(true)
+        try await presenceWait("host wins the simultaneous leadership tie") {
+            pair.hostHub.state.leading && !pair.guestHub.state.leading &&
+                pair.guestHub.state.following == PresencePair.hostID
+        }
+        XCTAssertNil(pair.hostHub.state.following)
+        try await pair.host.run("collab.followMe", ["on": false])
+        try await pair.host.run("collab.setRole", ["participant": .string(PresencePair.guestID), "role": "view"])
+        await assertThrows(.permissionDenied) { _ = try await pair.guest.run("collab.followMe", ["on": true]) }
+        pair.hostHub.follow.remoteFollowMe(on: true, from: PresencePair.guestID)
+        XCTAssertNil(pair.hostHub.state.following, "inbound viewer messages cannot lead either")
     }
 
     // MARK: Shared tab, UI and registration

@@ -111,10 +111,35 @@ final class FollowController {
         return sent
     }
 
-    /// Someone turned Follow Me on (everyone follows them; the latest leader wins) or off.
+    /// Rejoining preserves a manual follow, but drops stale automatic leadership without broadcasting it.
+    func rejoined() {
+        isLeading = false
+        if leader != nil { follow(nil) }
+    }
+
+    /// Host leadership wins a tie; otherwise the lower participant id wins on every device.
+    private func wins(_ candidate: CollabParticipant, over id: String) -> Bool {
+        let incumbentIsHost = hub.hooks?.participants.first { $0.id == id }?.isHost ?? false
+        if candidate.isHost != incumbentIsHost { return candidate.isHost }
+        return candidate.id < id
+    }
+
+    /// Someone turned Follow Me on or off. Resolve competing leaders before moving anyone's view.
     func remoteFollowMe(on: Bool, from pid: String) {
         if on {
-            isLeading = false
+            guard let candidate = hub.state.others.first(where: { $0.id == pid }), candidate.canEdit else { return }
+            if isLeading, let me = hub.state.me {
+                guard wins(candidate, over: me) else {
+                    // The other device may have enabled Follow Me just after receiving ours. Reassert the winning
+                    // state so both devices converge even when deliveries do not overlap.
+                    _ = hub.broadcaster.sendNow(.followMe(on: true), to: pid)
+                    return
+                }
+                isLeading = false
+                _ = hub.broadcaster.sendNow(.followMe(on: false), to: nil)
+            } else if let current = leader, current != pid, !wins(candidate, over: current) {
+                return
+            }
             leader = pid
             following = pid
             applied = nil

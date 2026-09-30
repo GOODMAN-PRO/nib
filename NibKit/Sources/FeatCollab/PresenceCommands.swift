@@ -101,6 +101,10 @@ struct CollabFollowMeCommand: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let hub = try PresenceHub.require(ctx)
         let state = try PresenceCommands.requireLive(hub)
+        if p.on, hub.hooks?.session?.isHost != true, hub.hooks?.session?.myRole != .edit {
+            throw NibError(.permissionDenied, String(localized: "Only editors can lead a live session."),
+                           hint: "ask the host for the edit role with collab.setRole")
+        }
         if !ctx.dryRun { hub.follow.setLeading(p.on) }
         return Output(on: p.on, participants: state.others.count)
     }
@@ -171,7 +175,7 @@ struct CollabMarkSeenCommand: NibCommand {
                 ?? Array(before.filter { !$0.value.isEmpty }.keys)
             cleared += hit.map { NodeRef.page(doc, $0).description }
             changes += hit.reduce(0) { $0 + (before[$1]?.count ?? 0) }
-            if !ctx.dryRun { tracker.markSeen(doc, pages: pages, now: hub.now()) }
+            if !ctx.dryRun { try tracker.markSeen(doc, pages: pages) }
         }
         if !ctx.dryRun, !order.isEmpty { hub.unseenChanged() }
         let remaining = order.reduce(0) { $0 + tracker.count($1) } - (ctx.dryRun ? changes : 0)
@@ -182,31 +186,28 @@ struct CollabMarkSeenCommand: NibCommand {
 // MARK: - Seen marks (written only from collab.markSeen)
 
 extension UnseenTracker {
-    /// Stores "seen up to here" for pages of `doc` (nil = the whole document, which also starts tracking it) and
-    /// drops their badges. A page's mark is the newest revision on it (its record and, when in memory, its items);
-    /// the document's is the newest it knows, and never earlier than now. A page mark in a document that is not
-    /// tracked is kept but has no effect until it is.
-    func markSeen(_ doc: DocumentID, pages: [PageID]?, now: TimeInterval) {
-        let content = try? app.workspace.peekContent(doc)
-        let nowRev = Rev(wallMs: UInt64(max(0, now) * 1000), counter: 0, device: me)
-        if let pages = pages {
-            for page in pages {
-                var mark = lastSeen(doc, page: page) ?? .zero
-                if let record = content?.page(page) { mark = max(mark, record.rev) }
-                if let newest = app.workspace.contentRevision(doc, page: page) {
-                    mark = max(mark, newest)
-                } else {
-                    // The page's items are not in memory: what is there now is covered by the clock.
-                    mark = max(mark, nowRev)
-                }
+    /// Stores revisions actually present in the document. G9's content revision falls back to loading the page
+    /// when persistence cannot supply it; a local wall clock must never hide a collaborator's next edit.
+    func markSeen(_ doc: DocumentID, pages: [PageID]?) throws {
+        let content = try app.workspace.peekContent(doc)
+        let records = pages.map { wanted in content.pages.filter { wanted.contains($0.id) } } ?? content.pages
+        var pageMarks: [PageID: Rev] = [:]
+        for record in records {
+            let newest: Rev
+            if let rev = app.workspace.contentRevision(doc, page: record.id) {
+                newest = max(record.rev.effective(), rev.effective())
+            } else {
+                let items = try app.workspace.allItems(doc, page: record.id)
+                newest = UnseenComputation.newest(record, items: items) ?? .zero
+            }
+            pageMarks[record.id] = max(newest, lastSeen(doc, page: record.id)?.effective() ?? .zero)
+        }
+        if pages != nil {
+            for (page, mark) in pageMarks {
                 app.settings.setJSON(UnseenTracker.pageKey(doc, page), .string(mark.description))
             }
         } else {
-            var mark = max(nowRev, baseline(doc) ?? .zero)
-            for record in content?.pages ?? [] {
-                mark = max(mark, record.rev)
-                if let newest = app.workspace.contentRevision(doc, page: record.id) { mark = max(mark, newest) }
-            }
+            let mark = max(baseline(doc)?.effective() ?? .zero, pageMarks.values.max() ?? .zero)
             app.settings.setJSON(UnseenTracker.docKey(doc), .string(mark.description))
             for name in app.settings.names(prefix: UnseenTracker.docKey(doc) + ".") { app.settings.setJSON(name, nil) }
         }

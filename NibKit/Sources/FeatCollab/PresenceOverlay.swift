@@ -78,7 +78,8 @@ enum PresenceMessage: Equatable {
             let zoom = json["zoom"]?.doubleValue.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
             self = .viewport(page: page, rect: json["rect"].flatMap(PresenceMessage.rect), zoom: zoom)
         case "lasso":
-            let outline = json["outline"]?.arrayValue?.compactMap(PresenceMessage.point)
+            let outline = (json["outline"]?.arrayValue?.compactMap(PresenceMessage.point))
+                .map { PresenceMessage.downsample($0) }
             let bounds = json["rect"].flatMap(PresenceMessage.rect)
             guard let page = page, (outline?.count ?? 0) >= 3 || bounds != nil else {
                 self = .lasso(page: nil, outline: nil, bounds: nil)
@@ -524,7 +525,7 @@ final class PresenceAttachment: CanvasAttachment {
             }
         }
 
-        // Unseen changes: a 6 pt accent dot at the top-trailing corner of every page others changed.
+        // Until thumbnails support decoration providers, show the 6 pt dot in the gutter outside the page.
         var keepDots = Set<PageID>()
         for page in hub.unseen.unseenPages(host.documentID) {
             guard let frame = host.pageFrame(page) else { continue }
@@ -535,7 +536,7 @@ final class PresenceAttachment: CanvasAttachment {
                 return l
             }()
             let inset = NibSpacing.m
-            let centre = CGPoint(x: frame.maxX - inset, y: frame.minY + inset)
+            let centre = CGPoint(x: frame.maxX + inset, y: frame.minY + inset)
             layer.path = UIBezierPath(ovalIn: square(centre, NibMetrics.statusDot)).cgPath
             layer.fillColor = NibUIColor.accent.cgColor
             keepDots.insert(page)

@@ -55,8 +55,8 @@ enum PresenceIDs {
     static let markPageSeenMenu = "collabpresence.markSeen.page"
     static let markSelectionSeenMenu = "collabpresence.markSeen.selection"
     static let markLibrarySeenMenu = "collabpresence.markSeen.library"
-    /// How many collaborators the title menu's Follow submenu lists (a Nearby session's cap minus you).
-    static let followMenuSlots = 7
+    /// Slots for the largest supported session (50 over the relay, including this device).
+    static let followMenuSlots = 49
 }
 
 enum PresenceSettings {
@@ -126,12 +126,29 @@ final class HeadlessPresenceEnvironment: PresenceEnvironment {
 protocol PresenceNotifier: AnyObject {
     func collaboratorChanges(doc: DocumentID, title: String, names: [String], count: Int)
     func clearChanges(doc: DocumentID)
+    func enableNotifications()
 }
 
-/// Posts through `UNUserNotificationCenter` only when notifications are already allowed; never asks for permission.
+/// Uses provisional authorization to enable quiet notifications without showing a permission prompt.
 @MainActor
 final class SystemPresenceNotifier: PresenceNotifier {
     static func identifier(_ doc: DocumentID) -> String { "collabpresence.changes." + doc.raw }
+
+    private static func authorized(_ center: UNUserNotificationCenter) async -> Bool {
+        var settings = await center.notificationSettings()
+        if settings.authorizationStatus == .notDetermined {
+            _ = try? await center.requestAuthorization(options: [.alert, .sound, .provisional])
+            settings = await center.notificationSettings()
+        }
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral: return true
+        default: return false
+        }
+    }
+
+    func enableNotifications() {
+        Task { _ = await Self.authorized(UNUserNotificationCenter.current()) }
+    }
 
     func collaboratorChanges(doc: DocumentID, title: String, names: [String], count: Int) {
         let content = UNMutableNotificationContent()
@@ -141,13 +158,8 @@ final class SystemPresenceNotifier: PresenceNotifier {
         let request = UNNotificationRequest(identifier: Self.identifier(doc), content: content, trigger: nil)
         let center = UNUserNotificationCenter.current()
         Task {
-            let settings = await center.notificationSettings()
-            switch settings.authorizationStatus {
-            case .authorized, .provisional, .ephemeral:
-                try? await center.add(request)
-            default:
-                return
-            }
+            guard await Self.authorized(center) else { return }
+            try? await center.add(request)
         }
     }
 
@@ -170,6 +182,9 @@ final class RecordingPresenceNotifier: PresenceNotifier {
     }
 
     private(set) var posts: [Post] = []
+    private(set) var authorizationRequests = 0
+
+    func enableNotifications() { authorizationRequests += 1 }
 
     func collaboratorChanges(doc: DocumentID, title: String, names: [String], count: Int) {
         posts.removeAll { $0.doc == doc }
@@ -240,8 +255,8 @@ final class PresenceHub: ObservableObject {
     var clock: () -> TimeInterval = { Date().timeIntervalSince1970 }
 
     @Published private(set) var state = PresenceUIState()
-    /// Bumps when the Shared tab's content may have changed (shared documents, unseen changes, the library).
-    @Published private(set) var sharedRevision = 0
+    /// Only the Shared tab observes document-list and unseen-change updates.
+    private(set) lazy var sharedModel = SharedPanelModel(hub: self)
 
     private(set) var presence = PresenceState()
     private(set) lazy var follow = FollowController(hub: self)
@@ -311,10 +326,18 @@ final class PresenceHub: ObservableObject {
         })
         settingsObserver = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
                                                                   queue: nil) { [weak self] note in
-            guard (note.userInfo?["name"] as? String) == PresenceSettings.cursors.name else { return }
+            guard let name = note.userInfo?["name"] as? String else { return }
             CollabSession.onMain {
-                self?.cursorsSetting = nil
-                self?.renderAll(animated: false)
+                guard let self = self else { return }
+                if name == PresenceSettings.cursors.name {
+                    self.cursorsSetting = nil
+                    self.renderAll(animated: false)
+                } else if name == PresenceSettings.notifications.name,
+                          self.app.settings.get(PresenceSettings.notifications) {
+                    self.notifier.enableNotifications()
+                } else if name.hasPrefix(CollabSharedStore.prefix) {
+                    self.sharedModel.changed(recordsChanged: true)
+                }
             }
         }
         refreshState()
@@ -383,7 +406,13 @@ final class PresenceHub: ObservableObject {
             lastLassoSent = false
             lastCursorPage = nil
         }
+        if live && !wasLive {
+            presence.reset()
+            broadcaster.reset()
+            follow.rejoined()
+        }
         refreshState()
+        sharedModel.changed(recordsChanged: true)
         if live, let doc = info?.doc {
             if !unseen.isTracked(doc) { establishBaseline(doc) }
             if !wasLive {
@@ -457,7 +486,7 @@ final class PresenceHub: ObservableObject {
         case NibEventType.audioRecording:
             if let rec = e.decode(AudioRecordingPayload.self) { isRecording = rec.state == "recording" }
         case NibEventType.libraryChanged:
-            sharedRevision &+= 1
+            sharedModel.changed(recordsChanged: true)
         default:
             return
         }
@@ -556,16 +585,19 @@ final class PresenceHub: ObservableObject {
     /// viewport, its lasso, and Follow Me.
     private func sendState(to pid: String?) {
         guard state.live else { return }
+        var lasso = PresenceMessage.lasso(page: nil, outline: nil, bounds: nil)
         if let s = presenceSession() {
             if let v = viewportMessage(s) { _ = broadcaster.sendNow(v, to: pid) }
             let sel = s.selection
             if sel.doc == state.doc, let page = sel.page, !sel.isEmpty, let ref = hooks?.remotePageRef(page) {
-                _ = broadcaster.sendNow(.lasso(page: ref, outline: sel.outline.map { PresenceMessage.downsample($0) },
-                                               bounds: sel.bounds), to: pid)
+                lasso = .lasso(page: ref, outline: sel.outline.map { PresenceMessage.downsample($0) }, bounds: sel.bounds)
                 lastLassoSent = true
+            } else {
+                lastLassoSent = false
             }
         }
-        if follow.isLeading { _ = broadcaster.sendNow(.followMe(on: true), to: pid) }
+        _ = broadcaster.sendNow(lasso, to: pid)
+        _ = broadcaster.sendNow(.followMe(on: follow.isLeading), to: pid)
     }
 
     // MARK: Follow support
@@ -610,7 +642,7 @@ final class PresenceHub: ObservableObject {
     private func committed(_ cs: Changeset) {
         let changed = unseen.observe(cs, now: now())
         guard !changed.isEmpty else { return }
-        sharedRevision &+= 1
+        sharedModel.changed()
         renderAll(animated: false)
         scheduleSeenCheck()
     }
@@ -622,7 +654,7 @@ final class PresenceHub: ObservableObject {
         unseen.scan(doc)
         let after = unseen.count(doc)
         guard after != before else { return }
-        sharedRevision &+= 1
+        sharedModel.changed()
         // Only what changed while it was closed is news; badges already shown were announced before.
         if after > before { announceUnseen(doc, count: after - before) }
         renderAll(animated: false)
@@ -704,7 +736,7 @@ final class PresenceHub: ObservableObject {
     }
 
     func unseenChanged() {
-        sharedRevision &+= 1
+        sharedModel.changed()
         renderAll(animated: false)
     }
 
@@ -725,7 +757,7 @@ final class PresenceHub: ObservableObject {
         next.leading = follow.isLeading
         guard next != state else { return }
         state = next
-        sharedRevision &+= 1
+        sharedModel.changed()
         app.ui.setNeedsChromeUpdate()
     }
 
@@ -870,7 +902,7 @@ enum PresenceUI {
         }
         var followMe = MenuItemDescriptor(
             id: PresenceIDs.followMeMenu, title: String(localized: "Follow Me"), icon: NibSymbol.present.name,
-            location: .documentTitle, order: 420, owner: owner, command: CommandIDs.collabFollowMe,
+            location: .documentTitle, order: 410 + PresenceIDs.followMenuSlots, owner: owner, command: CommandIDs.collabFollowMe,
             params: { _ in ["on": .bool(!hub.state.leading)] },
             isVisible: { ctx in isLiveCanvas(ctx) && !hub.state.others.isEmpty })
         followMe.isChecked = { _ in hub.state.leading }
@@ -904,10 +936,7 @@ enum PresenceUI {
             command: CommandIDs.collabMarkSeen, params: pagesParams, isVisible: pagesVisible))
         let libraryDocs: @MainActor (MenuContext) -> [DocumentID] = { ctx in
             let ids = ctx.nodes.isEmpty ? (ctx.doc.map { [$0] } ?? []) : ctx.nodes
-            return ids.filter { doc in
-                hub.unseen.scanIfNeeded(doc)
-                return hub.unseen.count(doc) > 0
-            }
+            return ids.filter { hub.unseen.count($0) > 0 }
         }
         app.ui.menus.register(MenuItemDescriptor(
             id: PresenceIDs.markLibrarySeenMenu, title: String(localized: "Mark as Seen"),
