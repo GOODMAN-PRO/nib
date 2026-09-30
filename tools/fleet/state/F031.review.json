@@ -1,0 +1,83 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatShapes/ShapeStyleInspector.swift ShapeKindCell (L85-104), NoneSwatch (L107-135), ShapeColourRow (L138-156), ThicknessPreset (L159-180), ShapeUILayout.swatchColumns (L10), ShapeGlyph .frame(32, 26) (L79), inline ColorPicker rows (L525-530, L552-558); used by ShapeLibraryMenu and ShapeStyleInspector",
+      "problem": "The library and inspector grids are hand-rolled copies of NibDesign v2 components. DESIGN_SYSTEM.md 'NibDesign v2 additions' §2 names F031 explicitly ('Unbuilt F007, F013, F031, F033, F036, F040 colour and choice grids -> NibSwatchGrid, NibOptionTile'). ThicknessPreset is a line-for-line copy of NibWidthPresetButton, but its dot sizes (width*2.5 clamped 4...14) differ from NibMetrics.widthPresetDots and it has no tooltip. The DESIGN.md §14.3 'Custom…' section link is replaced by inline ColorPicker rows. Literal sizes (52, 32x26, 26, 33, 40, path coordinates 21/5) bypass the tokens, which fails the Slop checklist 'Only tokens'. The kind cells have no caption label (DESIGN §13.3 NibOptionTile is a glyph over a caption2 label), use .help instead of nibTooltip, and do not dim themselves under .disabled(model.isLocked). Per the REVIEW rules, a workaround that v2 now covers is a major.",
+      "fix": "Replace ShapeKindCell with NibOptionTile(title, isSelected:, action:) { ShapeGlyph(shape: …) }, using NibMetrics.optionTileHeight. Replace NoneSwatch and ShapeColourRow with NibSwatchGrid(swatches: NibInk.allCases.map { NibSwatch(ink: $0) }, selection: Binding<String?> (map the ink id to and from RGBA; nil = none), noneLabel: allowsNone ? label : nil). Replace ThicknessPreset with NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index), isSelected:, label: ShapeUILayout.points(width)). Move each custom colour to the section's link, NibInspectorSection(\"Outline\"/\"Fill\", action: NibAction(\"Custom…\") { … }), which presents the system colour picker, and drop the inline ColorPicker rows. Take ShapeGlyph's size from a token or NibOptionGlyph's 22 pt size. Delete ShapeUILayout.swatchColumns."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatShapes/ShapeCommands.swift ShapeContainers.plan (L485-503) and movedItems (L462-476); ShapeDrawer.swift ShapeGeometry.contains (L635-640)",
+      "problem": "Attachments get dropped by mistake. item.transform (F012) moves, scales and rotates a container's attached children with it, so those children appear in movedItems and are planned again. The plan tests the child's axis-aligned Item.bounds against the container outline. After rotating a rectangle about 45° with a text box inside, the text box's AABB corners stick out of the rotated outline. The child is then detached (item.update attachedTo: null), and the next move of the rectangle leaves it behind. The same happens to any child a container carries while it lies partly outside: attached by another feature or the AI, or left over after the container shrank through shape.setPoints, which movedItems ignores.",
+      "fix": "In handle/plan, skip an item whose current attachedTo parent was moved in the same changeset, because the parent carried it. Only re-plan items the user moved themselves. For the containment test, use the item's rotated frame corners (Item.frame.corners when frame exists, else bounds) instead of the AABB. Add a test: attach a text box to a rectangle, apply item.transform rotate 45 to both through the stand-in, then assert attachedTo is unchanged."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatShapes/FeatShapesFeature.swift ShapeContainerWatcher.handle (L123-143); ShapeCommands.swift ShapeContainers.plan (L485-503)",
+      "problem": "Large moves are slow on the main actor. A lasso drag of N items on a page with C closed shapes runs N×C ShapeGeometry.contains calls, and each one rebuilds and flattens the container's CGPath (outline(s)). It also isDescendant-walks every candidate. When the moved ink lands inside a shape, the watcher sends one item.update bus execution per item, awaited one after another. Each execution does its own validation, commit, commit observers (this watcher and every inspector reload), tile invalidation and persistence. A realistic case: draw a box around 2,000 handwriting strokes, then nudge them with the lasso. That is thousands of sequential commands and seconds of main-thread work. Other edits can also slip between the move and its attach, which breaks the one-undo-step guarantee.",
+      "fix": "In plan, compute each container's outline polygon and bounding Rect once. Reject a container cheaply when its rect does not contain the item's box, before the polygon test. Send all changes of one changeset as ONE invocation: commands.batch (CommandIDs.batch) with the item.update entries and group: cs.group. Chain it after the previous `pending` task instead of overwriting it. Add a test that moves ~2,000 stroke items into a rectangle and asserts one undo step and elapsed < budget×4."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatShapes/ShapeDrawer.swift ShapeRenderer.drawInk (L868-903), ShapeGeometry.dashed (L587-619), ShapeGeometry.validate (L269-293)",
+      "problem": "The ink look ignores the tile clip. For every tile, drawInk builds synthetic Strokes for the WHOLE outline, and dotted/dashed patterns first split it into one stroke per dash. PKBridge.drawing -> InkModel.prepare then densifies every stroke to 1.5 pt spacing. Only after that is the image cut to the clip rect. validate allows coordinates up to 1e7. A shape from the AI, a plugin, item.create/node.set or sync such as {rectangle, frame [0,0,5e6,5e6], drawnWith: pencil} therefore densifies to about 13M points per tile render, on several render workers at once. The app is killed for memory every time that page draws, so the notebook page cannot be opened. With a dotted pattern (off = 2 pt) a large whiteboard shape already makes tens of thousands of PK strokes per tile.",
+      "fix": "In drawInk, clip each polyline to cg.boundingBoxOfClipPath grown by strokeWidth + head size before dashing and building Strokes. Split at the clip edges, and when dashing keep the dash phase by measuring the distance along the full path. Cap the total dash or stroke count (for example 4,000). Past the cap, fall back to drawVector with CG dashes. Also tighten ShapeGeometry.validate to a sane coordinate and size cap (for example |x|,|y|,w,h ≤ 100_000, the page-size cap DocTransaction uses) with an invalid_params hint. Add a test that draws a 1e6-sized pencil + dotted shape into a small context and returns quickly."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatShapes/ShapeStyleInspector.swift ShapeInspectorModel.init / ids (L333-353), ShapeStyleInspector @StateObject (L460-464); FeatShapesFeature.swift inspector makeView (L42-44)",
+      "problem": "The inspector's model keeps the selection it was created with. The ids come from the first InspectorContext and are kept in a @StateObject, and the StateObject autoclosure runs only once per view identity. When the user selects another shape while the inspector stays up, the host calls makeView again with a new context. It returns the same view type in the same place, so SwiftUI keeps the old model. The inspector then shows the old shape's style, and every change (type, outline, fill, corners, Edit Text) goes to the previously selected shapes. The contract does not require the host to reset view identity per selection.",
+      "fix": "Key the view on the selection. In register, use makeView: { ctx in AnyView(ShapeStyleInspector(context: ctx).id(ctx.items.map(\\.id))) }. Alternatively, have the model follow session.selection (observe it and re-read ids in reload) instead of freezing ids at init. Add a test that builds the inspector model for shape A, changes the context or selection to shape B, applies a style, and asserts B changed and A did not."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatShapes/ShapeEditOverlay.swift beginTextEditing (L575, L583), renderBackdrop (L693); ShapeDrawer.swift ShapeTextStyle.typingAttributes (L774); ShapeTool.swift ShapePreviewLayer.show (L175-198)",
+      "problem": "The shape text editor always uses light-paper colours (darkPaper: false). The drawer turns near-black outlines and label text to chalk on dark paper (slate, night and board papers, and the whiteboards' dark boards). While editing a shape label on those pages, the typed text is black on dark paper, which is effectively invisible. The backdrop also redraws the outline black, so the shape visibly changes colour when editing starts. ShapePreviewLayer (tool drag and knob reshape previews) uses the raw stroke colour too, so it shows black and then flips to chalk on commit.",
+      "fix": "Work out darkPaper for the page the same way the renderer does. Read the page record's background, the template's TemplateParamNames.paper param or the colour background, and test it with NibPaper(rawValue:)?.isDark or luminance. Pass it to ShapeTextStyle.attributed, typingAttributes and renderBackdrop, and in richText strip both the light and the dark base colour. Pass the colour through ShapeRenderer.onPaper in ShapePreviewLayer.show. Add a test that edits text on a page with a dark paper and asserts the text view's colour is chalk."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapes/ShapeEditOverlay.swift knob layers (L132-135, L365-395, L399)",
+      "problem": "The control-point knobs are hand-built CAShapeLayer beads. Spacing tokens are used as diameters (NibSpacing.m, NibSpacing.s + xxs, NibSpacing.xl), and line widths are literals (2, 1, 1/displayScale). DESIGN.md §13.3 names NibHandleView (clear or tinted rigid 12 pt bead) for canvas-attachment handles, and v2 replaced F012's CALayer beads with it. Shape knobs will not match the selection handles next to them.",
+      "fix": "Use NibHandleView(style: .clear) for vertices and .tinted for control and corner knobs (a view per knob, centred on the knob, with user interaction off), or at least NibMetrics.handleBead and NibStroke.ring/.thin/.hairline tokens. Keep the corner inset as a named metric rather than NibSpacing.xl."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapes/ShapeEditOverlay.swift hitTest (L242-259)",
+      "problem": "Knobs claim Pencil touches as well as finger touches. The Shapes tool is non-sticky: it selects the new shape and hands back to the pen. A pen stroke that starts within 22 pt of that shape's vertex or corner knob therefore reshapes the shape instead of inking. Also, `swallowing` is reset only in touchesEnded/touchesCancelled. If the canvas routes a claimed touch as a gesture only, the next knob drag is ignored.",
+      "fix": "Implement hitTest(_:isPencil:host:). For Pencil touches, claim only when the active tool is the lasso or shape tool, or use a much smaller reach. Set `swallowing = false` in the non-text branch of hitTest."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapes/ShapeTool.swift openMenu/closeMenu (L333-345); ShapeCommands.swift ShapeTapAt.textCommand (L406), ShapeContainers.dropCommands (L458); ShapeStyleInspector.swift (L224, L239, L243)",
+      "problem": "Command ids are string literals where contracts-v2 constants exist: \"panel.open\", \"panel.close\" and \"text.setText\" (CommandIDs.panelOpen, .panelClose, .textSetText, G18). closeMenu also closes the Shapes panel even when the user opened or docked it, and openMenu reopens it on every activation after the user closed it.",
+      "fix": "Use CommandIDs.panelOpen / panelClose / textSetText. Open only when !session.openPanels.contains(ShapeLibraryMenu.panelID), and close only a panel this tool opened that is still in session.openPanels."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapes/ShapeDrawer.swift ShapeTextStyle.layout (L727-731), attributed (L760-770), richText (L783-799)",
+      "problem": "Shape labels store centred paragraphs as .natural, and the drawer and editor centre .natural text themselves. TextLayoutInfo has no alignment field, so link hit-testing (F029), spellcheck (F104) and search highlights (F056) will lay the label out left-aligned and miss the drawn glyphs.",
+      "fix": "Store an explicit .center alignment, so richText keeps .center and shape.create/text.setText text without alignment is normalised to .center. Alternatively, report the missing default-alignment field in TextLayoutInfo as a contract gap."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapes/ShapeCommands.swift ShapeCreate.run (L255-258)",
+      "problem": "ShapeItemStyle's contract default cornerRadius is 6. So shape.create {shape: \"rectangle\"} without a style draws 6 pt rounded corners, and so do triangles, diamonds and polygons. An AI that asks for a rectangle gets a rounded one, and 'rectangle' and 'roundedRectangle' differ only in their default radius.",
+      "fix": "When style.cornerRadius is not given, set cornerRadius = 0 for .rectangle, .triangle, .diamond, .polygon and .polyline, mirroring the roundedRectangle default. Keep the tool's own Corners setting."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatShapesTests/FeatShapesTests.swift",
+      "problem": "DESIGN.md §15.7 requires snapshots for new screens, and there are none for the Shapes library popover/panel or the style inspector (NibSnapshot is available since v2 G20). There are also no tests for ShapeToolStyle (outline off with no fill falls back to an outline), ShapeInspectorModel.setArrowEnd (arrow -> line), or shape.tapAt double-tap selecting an unselected shape.",
+      "fix": "Add NibSnapshot.images for ShapeLibraryMenu and ShapeStyleInspector at 312 pt width (light, dark, largeText) and assert the fitting size (no clipping at AX3). Add unit tests for the three paths above."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatShapes/ShapeTool.swift ShapeLibraryEntry (L9-111)",
+      "problem": "DESIGN.md §14.3 specifies the Shapes kind grid as 4 × 2: Line, Arrow, Rectangle, Ellipse, Triangle, Star, Polygon, Connector. The library has 12 entries with no Connector.",
+      "fix": "Match the §14.3 grid order. Add a Connector tile that runs tool.select for F032's connector tool when it is registered (hidden otherwise), and keep the extra kinds after the specified eight."
+    }
+  ]
+}

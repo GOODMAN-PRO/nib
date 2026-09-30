@@ -1,0 +1,47 @@
+{
+ "verdict": "needs-fix",
+ "issues": [
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatCanvas/CanvasViewController.swift:827-831 (committed, else branch) with NibKit/Sources/FeatCanvas/PageTileView.swift:166-188 (configure/reset)",
+   "problem": "A commit that changes only a visible page's background or rotation (template.apply / page.setBackground / page.rotate, or undoing one) blanks the page until the user scrolls or zooms. The page ids, sizes and direction are unchanged, so committed() takes the else branch: refreshConfiguredPages() -> PageTileView.configure sees old.background != record.background (or rotation) and calls reset(), which drops every slot and the preview, sets covered = nil and contentView.alpha = 0. Nothing calls updateTiles/updateCoverage afterwards (dirtyRects has no item mutations, canvasDidChange only notifies attachments), so the page shows bare paper colour with all ink and template lines hidden. To the user it looks like the page's content was lost.",
+   "fix": "In the else branch of committed(), call scrollView.updateTiles() after refreshConfiguredPages(), or call finishViewChange(bake: true). Alternatively, have PageTileView.configure keep the last covered region and level when `changed` and re-request them itself. Add a test: open the canvas with RecordingRenderer and wait for it to settle, then commit a PageRecord with a new background through a test .edit command. Assert that new region requests arrive for that page and that the page view's tileKeys is non-empty and contentAlpha == 1 without any scroll."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatCanvas/DecorationCommands.swift:214-237 (CanvasDecorate.run) and NibKit/Sources/FeatCanvas/CanvasAttachmentHost.swift:245-250 (DecorationLayer.draw)",
+   "problem": "canvas.decorate is a trust boundary: plugins reach it as nib.canvas.decorate, and the AI and the bridge can call it too. It limits only the op count (2000), not what one op costs to draw. DisplayList.draw loops over an op's whole rect for dots, hlines and vlines, whatever the clip. So {\"op\":\"dots\",\"rect\":[0,0,1000000,1000000],\"spacing\":1} passes the schema (spacing min 1, rect unbounded) and runs about 1e12 fillEllipse calls in DecorationLayer.draw on the main thread. That happens in every window showing the page, again on every zoom change, and for up to an hour (ttl), so the app freezes and the plugin watchdog cannot stop it. Polylines and polygons also accept any number of points, and text any length.",
+   "fix": "Validate the per-op cost in CanvasDecorate.run before store.add. Throw invalidParams with path `$.display.ops[i]` and a hint. Suggested limits: every number finite and |v| <= 1e7; dots (w/spacing)*(h/spacing) <= 20_000; hlines/vlines extent/spacing <= 2_000; total points across ops <= 50_000; text <= 2_000 characters. As defence in depth, have DecorationLayer.draw intersect pattern ops' rect with drawnRect, snapped outward to the spacing grid so the pattern stays anchored, before calling DisplayList.draw. Add tests that an oversized dots op and a huge polyline are rejected."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/CanvasViewController.swift:862-871 (layersChanged / lastVisibleLayers)",
+   "problem": "The baseline for detecting a visibility change is `lastVisibleLayers ?? all layers`, not what the tiles were actually rendered with. The window's session may already hide a layer when the canvas opens (per-device layer visibility restored before the editor is made, or a window that switched documents). The tiles are then rendered without that layer. When the user shows it again, visible == all == the nil baseline, so the guard returns and the layer stays missing from every tile at the current zoom level until they are re-baked.",
+   "fix": "Set `lastVisibleLayers = host.visibleLayers` in open(), or whenever tiles are first requested, and compare against that. Add a test: set session.hiddenLayers = [1] before makeCanvas, then clear it, and assert that tile requests with all layers arrive."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/CanvasViewController.swift:838-840 and 900-925 (board content for fit)",
+   "problem": "On a board, committed() only unions the dirty rects into boardContent, so the content bounds never shrink. After content is deleted or moved away, `view.zoom {fit}` (documented as 'all of a board's content as it is now') and the initial centring still include the old positions, so fit zooms out to empty space. Separately, recomputeBoardContent computes paintBounds for every item on the main actor, which is O(total stroke points). It runs at open, relayout and fit, and on large boards it can exceed the 16 ms main-thread budget.",
+   "fix": "Mark boardContentStale = true on any board item commit that deletes or moves an item (or on every commit), and recompute lazily in currentBoardContent(). Compute the union off-main, from a snapshot of the items taken on main, or cache bounds per item id. Add a test: delete a far-away board item, run view.zoom {fit}, and assert that the scale matches the remaining content."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/PageTileView.swift:321-344 (request) and NibKit/Sources/FeatCanvas/CanvasHostImpl.swift:273-278",
+   "problem": "Tile render failures are silently swallowed (`try?`). Only a failed low-resolution preview reports pageTileView(_:didFailWith:). Boards have no preview, so a board whose renders fail never shows DESIGN.md §14.18's 'Couldn't show this page.' state. Any failed tile stays blank with no retry until something invalidates it.",
+   "fix": "In request(), catch the error. When it is not a CancellationError or .unavailable, report it once per configure through source?.pageTileView(self, didFailWith:), and keep the key so retry() re-requests it. Add a test with a renderer that throws for region requests on a board, and assert that failedPages contains the board and the error view shows."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/CanvasViewController.swift:1738-1812 (PageErrorView)",
+   "problem": "The render-failure state is a hand-rolled UIKit copy of an existing NibDesign component. NibEmptyState(symbol:title:message:primary:secondary:) is exactly DESIGN.md §14.18's 'Couldn't show this page. · Try Again · Restore from Backup', and this file already hosts it for the empty notebook. The copy drifts from the spec: its glyph uses NibUIFont.glyph(.sidebar) instead of the 44 pt empty-state glyph, its title uses callout instead of emptyTitle, and its buttons are system UIButtons (DESIGN.md §15.6: do not hand-roll components).",
+   "fix": "Host NibEmptyState(symbol: .warningTriangle, title: String(localized: \"Couldn't show this page.\"), primary: NibAction(Try Again), secondary: showsRestore ? NibAction(Restore from Backup) : nil) in a UIHostingController, positioned the way updateEmptyState() does it. Keep actionTitles for the test by reading the actions passed in."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatCanvas/CanvasAttachmentHost.swift:219-243 (DecorationLayer.update)",
+   "problem": "Every scrollViewDidZoom frame changes transform.a, so every decorated page's layer is redrawn synchronously on the main thread at 60-120 Hz during a pinch, while the page tiles only scale. This adds per-frame main-thread cost to the pinch, and it compounds the unbounded-op problem above.",
+   "fix": "While the scroll view is zooming (DocumentScrollView.isZoomingNow), only reposition and scale the existing bitmap (set frame from drawnRect.applying(transform)). Redraw when the zoom ends: canvasDidChange fires from endZoom. The existing test already asserts one redraw per new zoom."
+  }
+ ]
+}

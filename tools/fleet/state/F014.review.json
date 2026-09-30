@@ -1,0 +1,83 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatClipboard/ClipboardCommands.swift:349 (ClipboardCut.run), :418 (ClipboardPaste.run), :486 (ItemDuplicate.run); key commands registered in FeatClipboardFeature.swift:25-30",
+      "problem": "Read-only mode is bypassed from the keyboard. The feature gates its own UI on session.readOnly (the Paste and Match Style menu isVisible, the drop interaction's canHandle), but the command handlers never check it. ShellViewController dispatches .canvas-scope key commands whatever session.readOnly is, so in read-only mode (F042: no edits) Cmd-X deletes the selection, Cmd-V / Opt-Shift-Cmd-V paste, and Cmd-D duplicates.",
+      "fix": "Add a helper `ClipboardCore.isReadOnly(ctx) -> Bool { ctx.principal.isUser && ctx.session?.readOnly == true }`. Use ctx.session, not activeSession, so an AI or bridge call is not blocked by some other window's mode. At the top of ClipboardCut.run, ClipboardPaste.run and ItemDuplicate.run, return the empty Output when it is true: count 0 with removed [] for cut, refs [] with source \"empty\" for paste, refs [] for duplicate. Throwing .permissionDenied with hint \"turn off read-only mode (view.setReadOnly)\" also works if an error toast is wanted. Add a FeatClipboardTests case: set h.session.readOnly = true with a selection, run clipboard.cut, clipboard.paste and item.duplicate with [:] params, and assert h.snapshot() is unchanged."
+    },
+    {
+      "severity": "minor",
+      "where": "ClipboardCommands.swift:433-441 (ClipboardPaste reads Clipboard.board), :322 and :358 (copy/cut write the system board)",
+      "problem": "When a non-user principal (AI, plugin or bridge) calls clipboard.paste without `fragment`, the command reads UIPasteboard.general. That can raise the system Allow Paste prompt with nobody at the device (ARCHITECTURE 15.13), and it pulls another app's clipboard (possibly secrets) into a document the caller can then read. clipboard.copy is `read`, so an AI in Ask mode or any plugin can also silently overwrite the user's clipboard.",
+      "fix": "In ClipboardPaste.run, when !ctx.principal.isUser and p.fragment == nil, read only a Nib fragment (Clipboard.board.contains([Fragment.typeIdentifier])) and otherwise return source \"empty\". AI copy then paste still works, because copy writes a fragment. Separately, decide between skipping the system-board write in copy/cut for non-user principals (return the fragment JSON in Output instead) and documenting the overwrite in the summary. Add a test that runs paste as .ai with only plain text on a MemoryBoard and expects \"empty\"."
+    },
+    {
+      "severity": "minor",
+      "where": "ClipboardCommands.swift:357-378 (ClipboardCut.run) with ClipboardExport.representations:112 / Fragment.encoded():219",
+      "problem": "Fragment.encoded() swallows encoder errors with try?. For example, JSONEncoder throws on a non-finite Double in any item. When that happens the pasteboard gets only the PNG and text, but cut still deletes the items, so the user cannot paste them back as items. Undo is the only way to recover them.",
+      "fix": "In ClipboardCut.run, before ctx.mutate, `guard export.representations[Fragment.typeIdentifier] != nil else { throw NibError(.internal, \"the items could not be copied, so nothing was cut\") }`. Better still, make encoded() throwing and let the error propagate."
+    },
+    {
+      "severity": "minor",
+      "where": "ClipboardCommands.swift:357 and :321 (ClipboardCore.export awaited before the board write and before deletion)",
+      "problem": "Every Cmd-C and Cmd-X awaits a full PNG render and recognize.items over all the handwriting before it writes the pasteboard. Cut also waits for that before it removes the items. On a large ink selection the shortcut stalls for the whole recognition time. A slow or hung recognizer delays the cut indefinitely.",
+      "fix": "For the user path, write the fragment right away. Supply the PNG and text lazily through UIPasteboard.general.setItemProviders with the existing DragFlavours.later providers, the same mechanism the drag uses. Keep the eager export only when a non-user caller needs `text` in Output."
+    },
+    {
+      "severity": "minor",
+      "where": "ClipboardCommands.swift:443-446 (layer: session?.activeLayer ?? 0)",
+      "problem": "The paste layer comes from ctx.activeSession even when that window shows another document or page. An AI or bridge paste into document B lands on whatever layer the frontmost window of document A has active.",
+      "fix": "Use `layer: (session?.document == doc ? session?.activeLayer : nil) ?? 0`, or nil to keep the fragment's own layers."
+    },
+    {
+      "severity": "minor",
+      "where": "ClipboardCommands.swift:64-67 (PasteboardReader.read)",
+      "problem": "Any app can put a malformed `app.nib.fragment` on the general pasteboard. Fragment.decode then throws and Cmd-V fails, even when the same item also offers usable rich text, image or plain-text flavours.",
+      "fix": "`if board.contains([Fragment.typeIdentifier]), let data = board.data(Fragment.typeIdentifier).first, let fragment = try? Fragment.decode(data) { ... }`, then fall through to the other flavours. Log the decode error with os.Logger(category: \"clipboard\")."
+    },
+    {
+      "severity": "minor",
+      "where": "Fragment.swift:94-136 (instantiated, attachedTo remap)",
+      "problem": "A fragment from AI, a plugin or the pasteboard is untrusted, and one with self or cyclic `attachedTo` (A->A, or A->B->A) is accepted. DocTransaction.validate only checks that the parent exists, so the attachment cycle is committed. Transform, expand and move code that follows attachedTo chains can then loop.",
+      "fix": "After building `map`, clear n.attachedTo when it equals n.id, or when following the mapped parents returns to n.id (use a visited set). Add a FragmentTests case with a self-attached and a two-item cycle."
+    },
+    {
+      "severity": "minor",
+      "where": "ClipboardCommands.swift:37-41 (Clipboard.board default)",
+      "problem": "In hostless test runs the default board is the real UIPasteboard. On main, ConformanceTests and IntegrationTests (AllFeatures) run the clipboard.cut and clipboard.paste examples against the simulator's pasteboard, so results depend on its state and may hit the paste prompt. ARCHITECTURE 15.13 asks for an in-memory fake behind the protocol.",
+      "fix": "Move MemoryBoard into the module as an internal `InMemoryClipboardBoard`. Declare `static var board: ClipboardBoard = NibApp.isHostlessTest ? InMemoryClipboardBoard() : SystemClipboardBoard()`, and have the tests use it rather than their own copy."
+    },
+    {
+      "severity": "minor",
+      "where": "CanvasDragDrop.swift:241 (`view.layer.borderWidth = 2`), FeatClipboardFeature.swift:33 (`icon: \"doc.on.clipboard\"`)",
+      "problem": "This is hard-coded styling. The border width is a literal, and the menu icon is a raw SF Symbol string, which DESIGN.md 15 and ARCHITECTURE 22 forbid. NibSymbol has no paste glyph.",
+      "fix": "Use `NibSpacing.xxs` (or the proper stroke token) for the border. File docs/contract-requests/F014-paste-symbol.md for a `NibSymbol.pasteAndMatchStyle` (or `.paste`). Until then, pass `icon: nil`."
+    },
+    {
+      "severity": "minor",
+      "where": "ClipboardCommands.swift:97 (ClipboardRender.png scale)",
+      "problem": "`max(0.1, ...)` breaks the documented cap that the long edge is at most 2048 px. A board selection wider than 20,480 pt renders at 0.1x, which exceeds 2048 px and allocates a very large image on the main actor.",
+      "fix": "Use `let scale = min(2, maxPixels / max(region.width, region.height))`, or keep a floor but skip the PNG flavour (return nil) when region x scale exceeds maxPixels."
+    },
+    {
+      "severity": "minor",
+      "where": "ClipboardCommands.swift:178-191 (ClipboardCore.target) with the .canvas-scope Cmd-V key",
+      "problem": "Cmd-V and Opt-Shift-Cmd-V are live in every open document, including text documents and study sets, which have no session.page. There, paste throws invalidParams \"missing 'page'\", which the user sees as an error, while Cmd-C and Cmd-D with nothing selected are quiet no-ops.",
+      "fix": "In ClipboardPaste.run, for the user principal with p.page == nil and no session page, return Output(refs: [], source: \"empty\"). Keep the error for non-user callers."
+    },
+    {
+      "severity": "minor",
+      "where": "CanvasDragDrop.swift:138-157 (prepareText)",
+      "problem": "Every change to an ink-only selection starts a background recognize.items over the whole selection, whether or not a drag follows. Big lasso selections that are only moved pay full recognition CPU each time.",
+      "fix": "Pre-recognise only small selections (for example up to 300 strokes, with the limit named in a ponytail comment). Otherwise order PNG first as now."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatClipboardTests/FeatClipboardTests.swift",
+      "problem": "The risky paths have no tests: read-only gating, own-drag drop routing (same page to item.transform, other page to item.moveToPage), paste as a non-user principal (the schema validation `required: [page]` plus the `fragment` path), and a malformed pasteboard fragment.",
+      "fix": "Add tests for each. Extract the move decision in CanvasDragDrop.move into a pure static function that returns (command, params) so it can be asserted without UIKit sessions. Run h.app.bus.execute(Invocation(command: \"clipboard.paste\", params: ClipboardPaste.fragmentExample, principal: .ai(...))) and assert the refs."
+    }
+  ]
+}
