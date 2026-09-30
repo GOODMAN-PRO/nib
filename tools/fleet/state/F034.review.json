@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatImages/ImageDrawer.swift:54 (ImageDecoder.frames) and :343-366 (AnimatedImageAttachment.canvasDidChange)",
+      "problem": "Memory: every visible animated image decodes all of its frames up front, up to 300 frames at up to 1024 px on the long edge, into one UIImage.animatedImage. There is no byte budget per view or across views. A 10 s screen-recording GIF (1080p, 300 frames) comes to 300 x 1024 x 576 x 4 bytes, about 700 MB, for a single item. Two or three ordinary 480 px GIFs of 150 frames on one page come to several hundred MB. That gets the app killed by jetsam on iPhone and can on iPad. Frames beyond 300 are also dropped, and every frame gets the same delay (total / count).",
+      "fix": "Stream the frames instead of holding them all. Use ImageIO's CGAnimateImageDataWithBlock (iOS 13+) in AnimatedImageAttachment: for each frame CGImage, crop it with ImageDecoder.pixelRect and set view.imageView.image, and set the stop flag when the Task is cancelled or the view is detached. This also gives the real per-frame delays. If you keep UIImage.animatedImage instead, cap the decoded bytes per view (for example 32 MB): choose maxPixel so that frameCount x w x h x 4 <= budget, and sample frames evenly past that. Either way, add a test that decoding a 300-frame 1024 px GIF stays under the budget."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImages/ImageDrawer.swift:373-390 (visibleAnimatedItems)",
+      "problem": "Performance on large notebooks: every canvasDidChange (each scroll or zoom frame) re-sorts content.livePages, which is a filter plus a sort on every call. It then calls pageFrame for every page and copies and scans every item on the visible pages. This happens for every document, including the ones that contain no GIFs.",
+      "fix": "Keep a per-document map from page to animated item ids. Rebuild it only when a commit touches image items (app.bus.observeCommits, or on attach), and return early when the map is empty. Then map only the cached ids to view rects on each scroll."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImages/ImageCommands.swift:428 (ImagePick), FeatImagesFeature.swift:22",
+      "problem": "F034 registers image.pick, which is not in its 'Commands owned' list. ARCHITECTURE section 6.5 and section 15.3 say a feature registers exactly its listed ids, and `python Scripts/lint.py --feature F034` warns about it. The command itself is needed, because menu items must name a command and no listed command presents the pickers (the F027 settings.open case was the same).",
+      "fix": "Ask the spec owner to add `image.pick {source, page? | doc? | ref? | refs?, point?, position?, anchor?, ids?} (edit (user presence), sensitive)` to F034's Commands owned in forge-spec.json and to regenerate section 6.5. Do not rename the command in this branch."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImages/ImageDrawer.swift:17 (Info.isAnimated), ImageCommands.swift:198 and :339",
+      "problem": "'Animated' is frameCount > 1 for any type, so multi-page TIFFs and HEIF sequences get a live view that flips through their pages every 0.1 s. image.insert also trusts `animated: true` on a still image and attaches a pointless one-frame live view.",
+      "fix": "Make isAnimated require frameCount > 1 and a type that conforms to .gif, .png (APNG) or .webP. In image.insert use `(p.animated ?? true) && info.isAnimated`, so the parameter can only turn animation off. image.replace already uses info.isAnimated."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImages/ImageCommands.swift:45 (ImageAssets.put), ImageDrawer.swift:252-268 (ImageRendition.cgImage), ImageCommands.swift:382",
+      "problem": "Trust boundary: image bytes from the AI, plugins, https URLs and files are checked only for a readable header, with no pixel-count cap. In ImageRendition, `need` has no upper bound when the crop is small, so Save to Photos of a small crop of a very large image decodes the whole image at full size. That decode runs synchronously on the main actor.",
+      "fix": "In ImageAssets.put, throw invalidParams for images over about 256 MP (hint: 'downscale before inserting'). Clamp `need` in ImageRendition.cgImage to 16384. In ImageSaveToPhotos, run the pure rendition in `Task.detached` and await it, so the main thread never decodes an 8K image."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImages/ImageCropView.swift:300 (ImageCropPresenter.ask), ImageCommands.swift:484 (ImagePick.target .replace)",
+      "problem": "The crop sheet and the Replace Image picker open before anything checks that the image is unlocked. The person crops or picks a photo and only then gets 'image is locked', so the work in the sheet is lost.",
+      "fix": "Before presenting, run the same check as ImageRefs.image: throw invalidParams 'image is locked' (with the item.setLocked hint) in ImageCropPresenter.ask. In ImagePick.target's .replace branch, read the item and throw if it is not an image or is locked."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImages/ImageDrawer.swift:241-243, ImageCropView.swift:183",
+      "problem": "Slop checklist 'Only tokens': the missing-asset placeholder uses literal RGBA colours, and the crop handle bead is a literal 12 x 12.",
+      "fix": "Import NibDesign in ImageDrawer.swift. For the placeholder, use NibUIColor.fill3 and NibUIColor.separator resolved with `UITraitCollection(userInterfaceStyle: .light)`, since the placeholder is page content on render threads. Use NibSpacing.m for the 12 pt handle."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatImagesTests/FeatImagesTests.swift",
+      "problem": "Several pieces of risky logic have no tests: freehand mask clipping in the drawer, the display-to-image-space mirror conversion the crop sheet uses for flipped images, and GIF frame decoding (count, crop, delays). The GIF test only checks that a live view gets attached.",
+      "fix": "Add three tests. (a) Render the halves fixture with a triangle mask and assert that pixels outside the triangle are transparent. (b) For ImageFlip(x: true, y: true), assert that mirror(mirror(r)) == r and that mirror maps [0, 0, 0.5, 1] to [0.5, 0, 0.5, 1], and likewise for points. (c) Run ImageDecoder.frames on the 2-frame GIF fixture and assert 2 frames, duration 0.2 and the cropped size."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibContracts/Core/DocTransaction.swift:192 (outside F034's files); worked around at FeatImagesTests.swift:35",
+      "problem": "This is a contract gap, not an F034 defect. Undo re-stamps an item with a fresh rev. The next older undo entry for the same item then fails `cur.rev == a.rev` and is silently skipped. So after insert, crop and flip, pressing undo three times only undoes the flip. F034's test checks each step on its own for this reason.",
+      "fix": "Do not change this in F034. Escalate to the NibContracts owner: when undo or redo re-stamps a record, rebase the remaining history entries' `after.rev` for that record, or compare content rather than rev for the entries this device recorded. Then add an insert, crop, flip, undo x3 test to FeatImagesTests."
+    }
+  ]
+}

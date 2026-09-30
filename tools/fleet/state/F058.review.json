@@ -1,0 +1,77 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSmartInk/InkLayout.swift:309-328 (markParagraphs, the `fits` rule at :321)",
+      "problem": "A line is marked as a paragraph start whenever the next line's first word would fit before the block's widest right edge (`right: box.maxX`). On real ragged-right handwriting, lines end 20-60 pt apart, so any line followed by a short word ('a', 'to', 'the') becomes a hard break and reflow never joins the lines again. The mode's own edits cause the same break. Take the synthetic paragraph and delete or cut the last word of line 1 (removeWord): line 1 now ends at 174, line 2's 18 pt first word fits before 226, and startsParagraph becomes true. handwriting.reflow then moves nothing, the hole stays, and every later handle reflow keeps the false break because the rule is recomputed on each analysis. A paste that runs past the right edge raises box.maxX and splits later lines the same way. This breaks the spec's 'lists/paragraphs kept' reflow on real input and after word delete/cut/paste.",
+      "fix": "Remove `fits` as a paragraph signal, keeping blank line, list marker and indent. If a short-line signal is wanted, restrict it to lines shorter than about half the median line width (measured from box.minX), never compared with the maximum right edge. Add InkLayoutTests: (1) a ragged paragraph (line right edges 226/190/220/180, short first words) is one paragraph and reflows as one; (2) deleting the last word of line 1 and re-analysing, then reflowing at the same width, pulls line 2's first word up onto line 1."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSmartInk/EditHandwritingMode.swift:440-481 (EditHandwritingModel.paste)",
+      "problem": "Paste places the pasted strokes' minX at anchor.maxX + max(wordGap, xHeight). The next word on the anchor's line already starts there, so the pasted ink lands on top of it. InkLayout.makeLine merges overlapping strokes (gap < 0) into one word, so the following handwriting.reflow moves the pasted ink and the next word as one unit and they stay superimposed. Only a paste after a line's last word works. Multi-line clipboard content is centred on the anchor line, spreads over the lines above and below, and its strokes get clustered into those lines. 'Paste After Word' (S-036) therefore corrupts the text layout in the common case.",
+      "fix": "In the same undo group, before the final reflow: (1) flatten the pasted strokes to one line with `handwriting.reflow {refs: pasted, width: 100000}`; (2) measure the pasted bounds and place them after the anchor as now; (3) move the words that follow the anchor on its line (layout.lines[a.line].words[(a.word+1)...]) right by pastedWidth + gap with one `item.transform {refs, translate}`, so no strokes overlap; then reflow the whole target at the old width and left. Add a model test in FeatSmartInkTests (stand-in clipboard.paste/item.transform commands, as the auto-straighten test does for ink.addStrokes) that pastes after a mid-line word and asserts reading order anchor, pasted, next, with no overlapping word boxes."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSmartInk/InkLayout.swift:195-225 (analyze: fragments sorted into one line list), :355-423 (reflow), :445-459 (alignment); EditHandwritingMode.swift:322 (selectAllOnPage)",
+      "problem": "Side-by-side fragments (split at gaps over 8 x size) and separate blocks are sorted into a single line list by centre and treated as one column. For two columns at the same y the order is left1, right1, left2, right2..., and markParagraphs makes [right1, left2] one paragraph, so reflow interleaves and scrambles the words of both columns. Alignment moves every fragment to the union's left or right edge, which stacks the right column on top of the left one. The mode offers this as a first-class button ('Edit All Handwriting on This Page'), and it also happens with a lasso over two columns or margin notes, or when an AI passes a page's strokes to handwriting.reflow, handwriting.align or handwriting.words.",
+      "fix": "Partition lines into blocks before paragraph marking, reflow, alignment and words output. Make blocks() return line indices; it already separates non-overlapping columns. Run markParagraphs, reflow (each block keeps its own left edge, the width applies per block, and `left` shifts all blocks by the same delta) and alignment (against each block's own box) per block, and emit handwriting.words lines block by block in reading order. Add an InkLayoutTests case with two side-by-side columns: reflow keeps each column's word order and never mixes ids across columns, and align(.left) leaves the right column in place."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSmartInk/SmartInkCommands.swift:243,250 (handwriting.reflow `left`) and InkLayout.swift:556-590 (estimateSkew, `Int(...)` at :581)",
+      "problem": "Trust boundary: `left` has no schema bounds, and run() only checks isFinite. An AI, plugin or bridge call such as `handwriting.reflow {refs, width: 100, left: 1e22}` writes coordinates around 1e22 into the strokes. Later, any analysis that mixes them with other strokes (handwriting.words over the page, Edit All Handwriting, auto-straighten, the mode's reload) computes `Int(((c * p.y - s * p.x) / bin).rounded(.down))`, which is beyond Int.max and traps, crashing the app. A synced or imported file with huge coordinates crashes the same way. Values above Float.max become infinity inside the stroke points.",
+      "fix": "Bound `left` to ±100000 in the schema (.num(..., min: -100_000, max: 100_000), matching the ink coordinate limit F003 enforces) and reject values outside it in run() with NibError.invalid(path: \"$.left\"). Harden estimateSkew: skip samples with |x| or |y| > 1e6, or clamp the bin value before converting it with Int(exactly:) or a guarded min/max. Make InkGlyph(item:) return nil for strokes whose bounds are not finite. Add a test showing analyze() survives a glyph at x = 1e20 next to normal ones."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSmartInk/EditHandwritingMode.swift:189-212 (reload) and InkLayout.swift:170-193, :593-596",
+      "problem": "reload() runs InkLayout.analyze synchronously on the main actor after every commit on the document, and twice for the mode's own commands (commit observer plus the explicit reload()). For 'Edit All Handwriting on This Page' on a dense page (1-3k strokes), analyze takes tens to over 100 ms. The costs are the 81-angle skew histogram, centre(of:near:) sorting a whole line group per candidate, and the small-mark loop recomputing every group's union for each mark. The result is a visible hitch after each edit.",
+      "fix": "Lay out through Handwriting.layout (detached) with the existing generation guard, and drop the explicit reload() after run() since the commit observer already schedules one. In analyze, compute each group's bounds once before the small-mark loop and keep them updated, and in centre() pick the five nearest without a full sort."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSmartInk/SmartInkCommands.swift:294 and :335 (straighten/align call Handwriting.layout(target, ctx:)); FeatSmartInkFeature.swift:155-160",
+      "problem": "handwriting.straighten and handwriting.align run recognition (recognize.items / Vision) before laying out, but they only use line geometry, which word hints do not affect. With auto-straighten on, every writing pause therefore runs Vision on the burst, which wastes CPU and battery and slows each command.",
+      "fix": "For straighten and align, call Handwriting.layout(target.glyphs, hints: []). Keep recognition for words and reflow."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSmartInk/FeatSmartInkFeature.swift:107-161 (AutoStraightener) and InkLayout.swift:426-442 (straightening pivot)",
+      "problem": "Each burst is levelled about its own centre. A line written in two bursts (a pause mid-line) ends up stepped: the second half lands tan(angle) x width/2 away from the first, about 8 pt for 6 degrees over 150 pt. Also, flush() called from observe() on a page change straightens the previous burst while the Pencil is down on the new page (NibHaptics.isInking is only checked in fire()), and it uses the active session rather than the one that wrote the burst.",
+      "fix": "Add an optional `pivot: \"left\"|\"centre\"` param to handwriting.straighten (default centre) that shears or rotates about each line's left end, and use \"left\" from AutoStraightener so a continued line meets the previous burst. Check NibHaptics.isInking in flush() as well (reschedule instead of running), and remember the session with the burst."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSmartInk/EditHandwritingMode.swift:783-799 (render, preview ink)",
+      "problem": "While a side handle is dragged, render() rebuilds CGPaths from every point of every target stroke on each move. On whole-page targets that is 100k+ points per frame on the main thread, well over the 3 ms chrome budget in DESIGN.md §10.16.",
+      "fix": "Build each word's path once when the preview starts, one CAShapeLayer per word, and on each move only set that layer's position or affine transform from preview.moves."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSmartInk/InkLayout.swift:619-659 (SpaceInsertion.moved) / SmartInkCommands.swift:365-378",
+      "problem": "Insert Space pushes items past the page bottom without notice, where they are no longer visible or reachable on the page. A negative height moves the items below y up onto whatever lies between y+height and y.",
+      "fix": "Clamp a negative height to the free gap above y (y minus the lowest bottom of unmoved items above y), and return `offPage: n` (items whose top moves beyond the page height) so the UI can toast it and the AI can see it. Add a test for each."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSmartInk/InkLayout.swift:276-285 (makeLine word merge)",
+      "problem": "The `gap < 0` overlap rule is checked before the recognition hints, so strokes that Vision assigns to different words still merge when they overlap horizontally, for example cursive joins or a t-bar reaching into the next word. This contradicts the InkHint doc ('strokes of different hints never share a word') and weakens the Vision refinement the spec asks for.",
+      "fix": "Evaluate the hint rules first. When the stroke has a hint and the current group has different, non-empty hints, split even if the gap is negative. Apply the overlap rule only when hints do not decide. Extend testRecognisedWordsRefineStrokeGaps with overlapping strokes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSmartInk/SmartInkCommands.swift:94-109, :253-259, :293-299, :334-337",
+      "problem": "Multi-page refs commit one ctx.mutate per page after awaiting that page's recognition. If a later page throws, the earlier pages stay changed (same undo group, but the command reports failure). Stroke snapshots are also taken before long awaits.",
+      "fix": "Compute every target's layout and transforms first, then write all pages in a single ctx.mutate."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatSmartInkTests/InkLayoutTests.swift, FeatSmartInkTests.swift",
+      "problem": "The risky paths have no tests: reflow of a skewed block (skew != 0, layoutLeft/pageLeft conversion, the `left` param, including the command-level page-x round trip the mode relies on), the mode's delete, cut and paste flows, and multi-block input. The majors above would have been caught.",
+      "fix": "Add a skewed-paragraph reflow test (tilt 6 degrees, reflow with an explicit left: word order kept and the column's page-left equals the requested left within 0.5 pt), plus the tests listed with the majors."
+    }
+  ]
+}

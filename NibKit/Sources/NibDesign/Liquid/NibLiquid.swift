@@ -114,7 +114,7 @@ public extension View {
     func nibLiquidMode(_ mode: NibLiquidMode) -> some View { environment(\.nibLiquidMode, mode) }
 
     /// The frames of light paper (luminance > 0.6) under the container, in its coordinates: the editor passes its
-    /// visible pages, never dark papers. Droplets over them get edge and caustic (DESIGN.md §3.3), dark-mode Clear
-    /// thickens to 80 %, and they recede while the Pencil is down.
+    /// visible pages, never dark papers. Droplets over them get the edge lens and a deeper shadow on iOS 17–25
+    /// (DESIGN.md §3.3), dark-mode Clear thickens to 80 %, and they recede while the Pencil is down.
     func nibBackdrop(_ pages: [CGRect]) -> some View { environment(\.nibBackdrop, pages) }
 }
