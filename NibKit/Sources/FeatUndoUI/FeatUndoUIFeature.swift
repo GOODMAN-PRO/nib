@@ -5,7 +5,8 @@ import NibDesign
 /// Undo/redo UI (F015): toolbar buttons, ⌘Z / ⇧⌘Z, two- and three-finger double-tap on the canvas, and the History
 /// sidebar tab with selective revert. It owns no commands: every action runs a contract command (`edit.undo`,
 /// `edit.redo`, `history.list`, `history.revertGroup`, `settings.set`), so plugins, the AI and the bridge can do
-/// exactly what the buttons do.
+/// exactly what the buttons do. When the document has nothing to undo, the shell's ⌘Z handler falls back to the
+/// window's UndoManager (F016's "Move Palette"); the ⌘Z / ⇧⌘Z titles name that step.
 public enum FeatUndoUIFeature: NibFeature {
     public static let id = "undo"
 
@@ -13,8 +14,10 @@ public enum FeatUndoUIFeature: NibFeature {
         app.settings.declare(UndoSettings.gestures,
                              summary: "Two-finger double-tap undoes and three-finger double-tap redoes on the canvas.",
                              owner: id, schema: .bool())
-        // Defaults until `start` knows the document, the step labels and the side (register never reads settings).
-        UndoButtons.install(UndoChromeState(), in: app)
+        // The leading side and plain key titles until `start` reads the side setting and the key window's steps
+        // (register never reads settings). The buttons' title, state and `doc` are live per window already.
+        UndoButtons.installToolbar(onRight: false, in: app)
+        UndoButtons.installKeys(.plain, in: app)
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "undo.gestures", owner: id, order: 900) { host in
             UndoGestureAttachment(host: host)
         })
