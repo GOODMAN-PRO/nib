@@ -64,7 +64,8 @@ struct DeleteAllDataCommand: NibCommand {
         summary: "Erase everything Nib keeps on this device (settings, caches, keys, grants); includeLibrary also deletes the library's documents. The person confirms twice.",
         params: .obj(["includeLibrary": .bool("also delete every document, folder, the trash and .nib-library in the library folder Nib uses (default false)")]),
         examples: [[:], ["includeLibrary": true]],
-        effect: .irreversible, target: .app, userPresence: true)
+        // `includeLibrary` deletes the whole library, so a caller needs `library:write` as well as `app`.
+        effect: .irreversible, target: .app, extraScopes: [.libraryWrite], userPresence: true)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         guard let service = DataDeletionService.resolve(ctx.services) else {
@@ -264,6 +265,10 @@ struct DeletionPlan: Equatable {
     var clear: [URL]
     /// Files or folders removed whole, unless kept.
     var remove: [URL]
+    /// Folders that hold Temporary Diagnostic Mode's copies but can also be library folders (to the library's
+    /// catalogue a `diagnostics` folder at its root is an ordinary folder): only the copies (`.zip` files directly
+    /// inside) go, and the folder only when they were all it held.
+    var diagnosticFolders: [URL]
     /// Library folders where only Nib's own content goes (packages, folder markers, `.nib-library`).
     var libraryRoots: [URL]
     /// Never removed. An ancestor of a kept path is emptied around it instead of removed.
@@ -275,14 +280,19 @@ struct DeletionPlan: Equatable {
 enum DeletionPlanner {
     /// Subfolders of the container's Library with web, cookie and restoration data.
     static let librarySubfolders = ["WebKit", "Cookies", "HTTPStorages", "Saved Application State"]
-    /// Documents subfolders that are app data, not library: the Open In inbox and Temporary Diagnostic Mode copies.
-    static let documentSubfolders = ["Inbox", "diagnostics"]
+    /// The Open In inbox (Documents/Inbox): app data wherever the library is, since the library's catalogue skips the
+    /// root `Inbox` of a library in Documents, and a library elsewhere does not contain it.
+    static let inboxFolder = "Inbox"
+    /// Where Temporary Diagnostic Mode puts its zipped library copies (Documents/diagnostics). With the library in
+    /// Documents this is also an ordinary library folder, so it is never removed whole.
+    static let diagnosticsFolder = "diagnostics"
 
     static func plan(includeLibrary: Bool, libraryRoot: URL?, locations l: AppDataLocations) -> DeletionPlan {
         let clear = [l.caches, l.applicationSupport, l.temporary]
             + librarySubfolders.map { l.library.appendingPathComponent($0, isDirectory: true) }
             + l.appGroups
-        let remove = documentSubfolders.map { l.documents.appendingPathComponent($0, isDirectory: true) }
+        let remove = [l.documents.appendingPathComponent(inboxFolder, isDirectory: true)]
+        let diagnostics = [l.documents.appendingPathComponent(diagnosticsFolder, isDirectory: true)]
         var keep: [URL] = []
         if let root = libraryRoot { keep.append(root) }
         if !includeLibrary { keep.append(l.deviceIDFile) }
@@ -296,7 +306,8 @@ enum DeletionPlanner {
                 roots.append(candidate)
             }
         }
-        return DeletionPlan(includeLibrary: includeLibrary, clear: clear, remove: remove, libraryRoots: roots, keep: keep)
+        return DeletionPlan(includeLibrary: includeLibrary, clear: clear, remove: remove, diagnosticFolders: diagnostics,
+                            libraryRoots: roots, keep: keep)
     }
 }
 
@@ -386,6 +397,9 @@ struct DataEraser {
                 remove(url, coordinated: false, quiet: false, report: &report)
             }
         }
+        for dir in plan.diagnosticFolders {
+            removeDiagnosticCopies(in: dir, keep: keep, report: &report)
+        }
         for root in plan.libraryRoots {
             removeNibContent(in: root, keep: keep, report: &report)
         }
@@ -405,6 +419,21 @@ struct DataEraser {
             let name = child.lastPathComponent
             remove(child, coordinated: false, quiet: quiet.contains { name.hasPrefix($0) }, report: &report)
         }
+    }
+
+    /// Temporary Diagnostic Mode's `.zip` copies directly in `dir`. Nothing else there is touched: the folder can be
+    /// one the person keeps notebooks and files in (with the library going, `removeNibContent` takes Nib's content
+    /// from it like from any library folder). The folder goes only when the copies were all it held.
+    private func removeDiagnosticCopies(in dir: URL, keep: Set<String>, report: inout DeletionReport) {
+        var removedAny = false
+        for child in children(of: dir)
+        where !isDirectory(child) && child.pathExtension.lowercased() == "zip" && !keep.contains(AboutPaths.canonical(child)) {
+            if remove(child, coordinated: true, quiet: false, report: &report) { removedAny = true }
+        }
+        let path = AboutPaths.canonical(dir)
+        guard removedAny, !keep.contains(path), !keep.contains(where: { $0.hasPrefix(path + "/") }),
+              children(of: dir).allSatisfy({ NibOwnership.isIgnorable($0.lastPathComponent) }) else { return }
+        remove(dir, coordinated: true, quiet: false, report: &report)
     }
 
     // MARK: Library
@@ -512,7 +541,7 @@ final class SystemDataWiper: SystemDataWiping {
         var failures = wipeKeychain()
         wipeDefaults(appGroupIDs: appGroupIDs)
         wipeURLLoading()
-        await wipeWebData()
+        failures += await wipeWebData()
         failures += await wipeSystemIndexes()
         wipeNotifications()
         WidgetCenter.shared.reloadAllTimelines()
@@ -559,8 +588,9 @@ final class SystemDataWiper: SystemDataWiping {
         }
     }
 
-    /// Plugin panels' local storage, IndexedDB and caches: the default store and every identified one.
-    private func wipeWebData() async {
+    /// Plugin panels' local storage, IndexedDB and caches: the default store and every identified one. A store an
+    /// open plugin panel still uses cannot be removed; that is reported.
+    private func wipeWebData() async -> [String] {
         let types = WKWebsiteDataStore.allWebsiteDataTypes()
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             WKWebsiteDataStore.default().removeData(ofTypes: types, modifiedSince: .distantPast) { done.resume() }
@@ -568,11 +598,14 @@ final class SystemDataWiper: SystemDataWiping {
         let ids: [UUID] = await withCheckedContinuation { (done: CheckedContinuation<[UUID], Never>) in
             WKWebsiteDataStore.fetchAllDataStoreIdentifiers { done.resume(returning: $0) }
         }
+        var failures: [String] = []
         for id in ids {
-            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-                WKWebsiteDataStore.remove(forIdentifier: id) { _ in done.resume() }
+            let error: Error? = await withCheckedContinuation { (done: CheckedContinuation<Error?, Never>) in
+                WKWebsiteDataStore.remove(forIdentifier: id) { done.resume(returning: $0) }
             }
+            if let error { failures.append("Plugin web data: " + error.localizedDescription) }
         }
+        return failures
     }
 
     /// Spotlight items, Siri donations and activities that could still name documents.
@@ -584,9 +617,10 @@ final class SystemDataWiper: SystemDataWiping {
             }
             if let error { failures.append("Spotlight: " + error.localizedDescription) }
         }
-        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-            INInteraction.deleteAll { _ in done.resume() }
+        let siri: Error? = await withCheckedContinuation { (done: CheckedContinuation<Error?, Never>) in
+            INInteraction.deleteAll { done.resume(returning: $0) }
         }
+        if let siri { failures.append("Siri donations: " + siri.localizedDescription) }
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             NSUserActivity.deleteAllSavedUserActivities { done.resume() }
         }
@@ -745,7 +779,7 @@ final class AlertDeletionPrompter: DeletionPrompting {
 
     func confirm(_ prompt: DeletionPrompt) async -> DeletionAnswer {
         if prompt.isDestructive { NibHaptics.play(.warning) }
-        let alert = UIAlertController(title: prompt.title, message: prompt.message, preferredStyle: .alert)
+        let alert = DeletionAlertController(title: prompt.title, message: prompt.message, preferredStyle: .alert)
         return await withCheckedContinuation { (answer: CheckedContinuation<DeletionAnswer, Never>) in
             let once = AnswerOnce(answer)
             alert.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel) { _ in once.resume(.declined) })
@@ -755,6 +789,17 @@ final class AlertDeletionPrompter: DeletionPrompting {
             alert.addAction(confirm)
             // Return confirms the first step only; the irreversible one needs a deliberate tap.
             if !prompt.isDestructive { alert.preferredAction = confirm }
+            // The alert can go away unanswered (its window or scene closes, or something dismisses it): nothing is
+            // deleted then, and the command returns instead of waiting forever. A tap's handler runs as the alert
+            // finishes going away, so it gets the first word.
+            alert.onDisappear = {
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    if once.isWaiting { AboutLog.logger.notice("a deletion confirmation went away unanswered") }
+                    once.resume(.notShown)
+                }
+            }
+            once.watch(navigator?.rootViewController?.viewIfLoaded?.window?.windowScene)
             Task { @MainActor in
                 if await !self.present(alert) {
                     AboutLog.logger.error("a deletion confirmation could not be shown")
@@ -793,18 +838,51 @@ final class AlertDeletionPrompter: DeletionPrompting {
     }
 }
 
-/// Resumes a continuation at most once (a failed presentation and a tap cannot both answer).
+/// A confirmation that reports when it leaves the screen, answered or not.
+private final class DeletionAlertController: UIAlertController {
+    var onDisappear: (@MainActor () -> Void)?
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        let handler = onDisappear
+        onDisappear = nil
+        handler?()
+    }
+}
+
+/// Resumes a continuation at most once (a failed presentation, a closed scene and a tap cannot all answer).
 @MainActor
 private final class AnswerOnce {
     private var continuation: CheckedContinuation<DeletionAnswer, Never>?
+    private var sceneObserver: NSObjectProtocol?
 
     init(_ continuation: CheckedContinuation<DeletionAnswer, Never>) {
         self.continuation = continuation
     }
 
+    var isWaiting: Bool { continuation != nil }
+
+    /// Answers `.notShown` if the window's scene disconnects (the person closes that window) before an answer.
+    func watch(_ scene: UIScene?) {
+        guard let scene, continuation != nil else { return }
+        sceneObserver = NotificationCenter.default.addObserver(forName: UIScene.didDisconnectNotification, object: scene,
+                                                               queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.sceneClosed() }
+        }
+    }
+
+    private func sceneClosed() {
+        guard isWaiting else { return }
+        AboutLog.logger.notice("a deletion confirmation's window closed unanswered")
+        resume(.notShown)
+    }
+
     func resume(_ value: DeletionAnswer) {
-        continuation?.resume(returning: value)
-        continuation = nil
+        guard let continuation else { return }
+        self.continuation = nil
+        if let sceneObserver { NotificationCenter.default.removeObserver(sceneObserver) }
+        sceneObserver = nil
+        continuation.resume(returning: value)
     }
 }
 
@@ -981,6 +1059,11 @@ struct PrivacyPage: View {
 
     init(app: NibApp) {
         _model = StateObject(wrappedValue: PrivacyModel(app: app))
+    }
+
+    /// A page around a model set up beforehand (snapshots with "Also delete my library" on).
+    init(model: @autoclosure @escaping () -> PrivacyModel) {
+        _model = StateObject(wrappedValue: model())
     }
 
     var body: some View {

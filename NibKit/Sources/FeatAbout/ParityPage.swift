@@ -11,8 +11,8 @@ import NibDesign
 
 // MARK: - Catalogue
 
-struct ParityCatalog: Decodable, Equatable {
-    struct Totals: Decodable, Equatable {
+struct ParityCatalog: Decodable, Equatable, Sendable {
+    struct Totals: Decodable, Equatable, Sendable {
         var parity: Int
         var parityPlus: Int
         var partial: Int
@@ -32,14 +32,14 @@ struct ParityCatalog: Decodable, Equatable {
         var differing: Int { partial + substitute + notAvailable }
     }
 
-    struct Area: Decodable, Equatable, Identifiable {
+    struct Area: Decodable, Equatable, Identifiable, Sendable {
         /// "T", "D", "S" or "P".
         var prefix: String
         var title: String
         var id: String { prefix }
     }
 
-    struct Item: Decodable, Equatable, Identifiable {
+    struct Item: Decodable, Equatable, Identifiable, Sendable {
         var id: String
         var area: String
         /// The Goodnotes feature, as the inventory names it.
@@ -50,7 +50,7 @@ struct ParityCatalog: Decodable, Equatable {
         var note: String
     }
 
-    struct Exception: Decodable, Equatable, Identifiable {
+    struct Exception: Decodable, Equatable, Identifiable, Sendable {
         /// The class of commands or data ("User presence").
         var name: String
         var covers: String
@@ -89,6 +89,9 @@ struct ParityCatalog: Decodable, Equatable {
     static func load(from data: Data) throws -> ParityCatalog {
         try JSONDecoder().decode(ParityCatalog.self, from: data)
     }
+
+    /// The app's copy, read and decoded once (the file does not change while Nib runs).
+    static let bundledShared: ParityCatalog? = bundled()
 
     /// The copy the app target ships (Nib/Resources/parity.json).
     static func bundled(_ bundle: Bundle = .main) -> ParityCatalog? {
@@ -129,7 +132,7 @@ extension ParityCatalog.Item {
     }
 }
 
-enum ParityStatus: Equatable, Decodable {
+enum ParityStatus: Equatable, Decodable, Sendable {
     case partial
     case substitute
     case notAvailable
@@ -209,7 +212,7 @@ final class ParityModel: ObservableObject {
     @Published var filter: ParityFilter = .all
     @Published var query = ""
 
-    init(catalog: ParityCatalog? = ParityCatalog.bundled()) {
+    init(catalog: ParityCatalog? = ParityCatalog.bundledShared) {
         self.catalog = catalog
     }
 
@@ -223,7 +226,8 @@ struct ParityPage: View {
     @FocusState private var searchFocused: Bool
     @Environment(\.dynamicTypeSize) private var typeSize
 
-    init(catalog: ParityCatalog? = ParityCatalog.bundled()) {
+    /// The default is the app's copy, read once: a NavigationLink builds this page on every pass of its parent's body.
+    init(catalog: ParityCatalog? = ParityCatalog.bundledShared) {
         _model = StateObject(wrappedValue: ParityModel(catalog: catalog))
     }
 

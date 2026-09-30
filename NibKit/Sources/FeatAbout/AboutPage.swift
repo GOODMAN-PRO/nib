@@ -271,13 +271,12 @@ final class AboutModel: ObservableObject {
         }
     }
 
-    /// Copies through `clipboard.copyText` when it is installed, else straight to the pasteboard.
+    /// Copies through `clipboard.copyText` when it is installed, else straight to the pasteboard. When the command
+    /// fails or is declined, its notice stays and nothing is copied behind its back.
     func copy(_ text: String) async {
-        var copiedByCommand = false
         if app.commands.entry(CommandIDs.clipboardCopyText) != nil {
-            copiedByCommand = await run(CommandIDs.clipboardCopyText, ["text": .string(text)])
-        }
-        if !copiedByCommand {
+            guard await run(CommandIDs.clipboardCopyText, ["text": .string(text)]) else { return }
+        } else {
             UIPasteboard.general.string = text
             notice = nil
         }

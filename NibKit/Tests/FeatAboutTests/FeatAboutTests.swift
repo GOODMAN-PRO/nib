@@ -174,6 +174,8 @@ final class FeatAboutTests: XCTestCase {
         XCTAssertEqual(d?.userPresence, true)
         XCTAssertEqual(d?.destructive, true)
         XCTAssertEqual(d?.target, .app)
+        XCTAssertTrue(d?.scopes.contains(.libraryWrite) ?? false, "includeLibrary deletes the library")
+        XCTAssertTrue(d?.scopes.contains(.app) ?? false)
         XCTAssertEqual(d?.owner, "about")
         XCTAssertNotNil(DataDeletionService.resolve(h.app.services))
     }
@@ -384,7 +386,8 @@ final class FeatAboutTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(report.removed, 9)
         for gone in ["Library/Caches/index.sqlite", "Library/Application Support/Nib/providers.json",
                      "Library/Application Support/grants.json", "Library/WebKit/WebsiteData", "Library/Cookies/Cookies.binarycookies",
-                     "tmp/upload.bin", "Documents/Inbox", "Documents/diagnostics", "Group/widget-snapshot.json"] {
+                     "tmp/upload.bin", "Documents/Inbox", "Documents/diagnostics/library-copy.zip",
+                     "Group/widget-snapshot.json"] {
             XCTAssertFalse(c.exists(gone), gone)
         }
         for kept in ["Library/Application Support/Nib/device-id", "Library/Preferences/app.nib.Nib.plist",
@@ -392,6 +395,54 @@ final class FeatAboutTests: XCTestCase {
                      "Library/Caches", "Library/WebKit", "Group"] {
             XCTAssertTrue(c.exists(kept), kept)
         }
+    }
+
+    /// With the library in Documents, `diagnostics` is also an ordinary library folder: only Temporary Diagnostic
+    /// Mode's copies go from it, and with the library going, Nib's content too, never the person's other files.
+    func testDiagnosticsFolderInsideTheLibraryLosesOnlyNibsCopies() throws {
+        for includeLibrary in [false, true] {
+            let c = try TempContainer()
+            for file in ["Documents/diagnostics/Lab.nibnote/doc.00000007.json", "Documents/diagnostics/.nibfolder.00000007.json",
+                         "Documents/diagnostics/notes.pdf", "Documents/diagnostics/library-copy.zip",
+                         "Documents/Inbox/scan.pdf"] {
+                c.write(file)
+            }
+            let plan = DeletionPlanner.plan(includeLibrary: includeLibrary, libraryRoot: c.locations.documents,
+                                            locations: c.locations)
+            XCTAssertFalse(plan.remove.contains { $0.lastPathComponent == "diagnostics" }, "never removed whole")
+
+            let report = DataEraser(fileManager: .default, coordinatesFiles: true).erase(plan)
+
+            XCTAssertEqual(report.failures, [])
+            XCTAssertFalse(c.exists("Documents/diagnostics/library-copy.zip"), "diagnostic copies are app data")
+            XCTAssertFalse(c.exists("Documents/Inbox"), "the Open In inbox is not part of the library")
+            XCTAssertTrue(c.exists("Documents/diagnostics/notes.pdf"), "files Nib did not make stay (library: \(includeLibrary))")
+            if includeLibrary {
+                XCTAssertFalse(c.exists("Documents/diagnostics/Lab.nibnote"))
+                XCTAssertFalse(c.exists("Documents/diagnostics/.nibfolder.00000007.json"))
+            } else {
+                XCTAssertTrue(c.exists("Documents/diagnostics/Lab.nibnote/doc.00000007.json"), "a kept library keeps its notebooks")
+                XCTAssertTrue(c.exists("Documents/diagnostics/.nibfolder.00000007.json"))
+            }
+        }
+    }
+
+    func testADiagnosticsFolderHoldingOnlyCopiesGoes() throws {
+        let c = try TempContainer()
+        c.write("Documents/diagnostics/library-copy.zip")
+        c.write("Documents/diagnostics/.DS_Store")
+        c.makeDirectory("Documents/diagnostics/Empty")
+        let plan = DeletionPlanner.plan(includeLibrary: false, libraryRoot: c.locations.documents, locations: c.locations)
+        _ = DataEraser(fileManager: .default, coordinatesFiles: true).erase(plan)
+        XCTAssertFalse(c.exists("Documents/diagnostics/library-copy.zip"))
+        XCTAssertTrue(c.exists("Documents/diagnostics/Empty"), "a folder the person made keeps its parent")
+
+        let only = try TempContainer()
+        only.write("Documents/diagnostics/library-copy.zip")
+        only.write("Documents/diagnostics/.DS_Store")
+        _ = DataEraser(fileManager: .default, coordinatesFiles: true)
+            .erase(DeletionPlanner.plan(includeLibrary: false, libraryRoot: only.locations.documents, locations: only.locations))
+        XCTAssertFalse(only.exists("Documents/diagnostics"), "a folder that held only copies goes with them")
     }
 
     func testEraseWithLibraryRemovesOnlyWhatNibMade() throws {
@@ -617,6 +668,18 @@ final class FeatAboutTests: XCTestCase {
         XCTAssertNil(model.notice)
     }
 
+    func testAFailedCopyCommandKeepsItsNoticeAndCopiesNothing() async {
+        let h = Harness(features: [FeatAboutFeature.self])
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.clipboardCopyText, title: "Copy Text", summary: "test",
+                                                  effect: .read, target: .app)) { _, _ in
+            throw NibError(.unavailable, "the clipboard is busy")
+        }
+        let model = AboutModel(app: h.app)
+        await model.copy("0a1b2c3d")
+        XCTAssertNil(model.copied, "no check mark for a copy that did not happen")
+        XCTAssertTrue(model.notice?.contains("the clipboard is busy") ?? false, model.notice ?? "no notice")
+    }
+
     func testSymbolicLinksAreNeverFollowed() throws {
         let c = try TempContainer()
         c.write("Outside/Precious.nibnote/doc.00000007.json")
@@ -738,11 +801,20 @@ final class FeatAboutTests: XCTestCase {
                                       libraryInApp: true, deviceModel: "iPad")
         XCTAssertNotNil(NibSnapshot.image(DeletionFinishedView(finish: DeletionFinish(subject: subject, failures: 1), close: {}),
                                           size: CGSize(width: 390, height: 844), variant: .largeText))
+        let phone = CGSize(width: 390, height: 844)
+        let every = Set(NibSnapshot.Variant.allCases)
+        // The About sheet and Settings page at iPad settings width and at iPhone width.
         XCTAssertEqual(Set(NibSnapshot.images(NavigationStack { AboutPage(app: h.app) }, size: CGSize(width: 760, height: 706)).keys),
-                       Set(NibSnapshot.Variant.allCases))
-        XCTAssertNotNil(NibSnapshot.image(NavigationStack { PrivacyPage(app: h.app) }, size: CGSize(width: 390, height: 844)))
-        XCTAssertNotNil(NibSnapshot.image(NavigationStack { ParityPage(catalog: catalog) }, size: CGSize(width: 390, height: 844)))
-        XCTAssertNotNil(NibSnapshot.image(NavigationStack { ParityPage(catalog: nil) }, size: CGSize(width: 390, height: 844)))
+                       every)
+        XCTAssertEqual(Set(NibSnapshot.images(NavigationStack { AboutPage(app: h.app) }, size: phone).keys), every)
+        // Privacy & Data with "Also delete my library" on, so the warning row shows.
+        let privacy = PrivacyModel(app: h.app)
+        privacy.includeLibrary = true
+        XCTAssertTrue(privacy.canDelete)
+        XCTAssertEqual(Set(NibSnapshot.images(NavigationStack { PrivacyPage(model: privacy) }, size: phone).keys), every)
+        XCTAssertEqual(Set(NibSnapshot.images(NavigationStack { ParityPage(catalog: catalog) }, size: phone).keys), every)
+        XCTAssertEqual(Set(NibSnapshot.images(NavigationStack { ParityPage(catalog: nil) }, size: phone).keys), every,
+                       "the missing-catalogue state")
     }
 
     // MARK: Repository files
