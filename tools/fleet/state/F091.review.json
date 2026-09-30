@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatBridgeUI/FeatBridgeUIFeature.swift BridgeUISettings.hostName (\"bridgeui.hostName\", lines 72-79); used by BridgeSettingsModel.addresses/pairing in BridgeSettingsPage.swift (lines 481-495); asserted non-user-only in FeatBridgeUITests.testRegistersSettingsPageStatusPillKeyCommandAndSettings (lines 155-160)",
+      "problem": "The host name decides where the pairing snippets and the QR code send the real bearer token (claude mcp add ... http://<hostName>:<port>/mcp --header \"Authorization: Bearer <token>\", the JSON config, the smoke env and nib://bridge/pair). It is declared as an ordinary setting (not security.*), so any non-user principal can change it silently through settings.set: the in-app AI in Edit mode (e.g. prompt-injected by an imported document), a plugin, or a bridge client. settings.set is not destructive, so the default confirmation policy never asks. The attacker's host then becomes the page's first, preselected address, and the next time the user copies the command or scans the QR, the token goes to the attacker. That is credential exfiltration across the AI/plugin trust boundary. The test even pins userOnly == false for this key.",
+      "fix": "Rename the key to a security.* name so SettingDescriptor.userOnly applies, e.g. SettingKey(\"security.bridgeui.hostName\", default: \"\"). Keep keepScreenAwake as it is. affectsBridge already matches on hostName.name, so it keeps working. In testRegistersSettingsPageStatusPillKeyCommandAndSettings, expect userOnly == true for the host name (keepScreenAwake stays false). Add a test showing that settings.set of the host name as .ai(\"chat\"), .bridge(\"claude-code\") and a plugin principal throws permissionDenied, while BridgeSettingsModel.applyHostName (running as the user) still stores it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBridgeUI/FeatBridgeUIFeature.swift register, KeyCommandDescriptor bridgeui.openSettings (lines 36-39)",
+      "problem": "Cmd+Option+B is already taken: origin/feat/F046 (FeatOutline/FeatOutlineFeature.swift:28) registers KeyShortcut(\"b\", [.command, .option]) for page.setBookmarked in document scope. Once both features ship, the chord is ambiguous in every open document, and UIKit keeps only one of the duplicate UIKeyCommands.",
+      "fix": "Give Bridge Settings a chord that no other feature registers. Check first with `for b in $(git branch -r | grep feat/); do git grep -n 'KeyShortcut(\"<key>\"' $b -- NibKit; done`, then update the key assertion in the test to the new chord."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBridgeUI/BridgeSettingsPage.swift BridgePairing.pairingURL (lines 336-346)",
+      "problem": "The extra port query item is the right call: without it, a bridge on a non-default port cannot be paired from the QR code. But ARCHITECTURE.md section 12 documents only nib://bridge/pair?host=...&token=..., and F074's spec just says 'nib://bridge/pair'. F074's router is still a scaffold, so it will probably be written without port and fall back to 7331. Nothing records this cross-feature change.",
+      "fix": "Keep the code. List it under contractGaps in the FIX return so the spec owner adds '&port=<n>' (optional, default 7331) to ARCHITECTURE.md section 12 and to F074's description and router tests."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBridgeUI/FeatBridgeUIFeature.swift BridgeMonitor.refresh / ensurePolling (lines 391-440)",
+      "problem": "Polling every 3 s is justified: F090's BridgeController.note(.call) updates lastCall and the call counts without emitting bridge.status. But every poll also reads the Keychain synchronously on the main actor (BridgeToken.read, which is SecItemCopyMatching). The pill is on screen in every open document while the bridge is on, so that is a Keychain round trip every 3 s for the whole session. The token only changes through bridge.setEnabled, which emits bridge.status. The missing per-call event is also not recorded as a gap.",
+      "fix": "Read the token only on refreshes caused by an event, a setting change, watch(), or a model action, and skip it on poll ticks: for example refresh(readToken: Bool = true), with the poll loop passing false. Record the F090 gap under contractGaps: bridge.status should also be emitted, throttled, on calls, which would make the poll unnecessary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBridgeUI/FeatBridgeUIFeature.swift BridgeKeepAwake.update (lines 470-489)",
+      "problem": "The doc comment promises the bridge 'only ever releases the lock it took', but update(false) always writes isIdleTimerDisabled = false. So if the screen was already kept awake (say by presentation mode) when the bridge took the lock, turning the bridge off unlocks the screen anyway. testNeverReleasesAScreenLockItDidNotTake only covers the case where the bridge never held the lock.",
+      "fix": "When taking the lock, record whether isIdleTimerDisabled was already true (e.g. `private var wasAlreadyDisabled`). On release, write false only if it was not. Add a test: timer true beforehand, bridge on, bridge off, timer still true."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBridgeUI/BridgeSettingsPage.swift pairingSections (lines 958-967)",
+      "problem": "NibQRCode renders its CGImage in init (CIFilter plus CIContext.createCGImage), so the QR is regenerated every time the page body is evaluated: on every keystroke in the port, host, network and origin fields (they are @Published on the model) and on every poll that changes the snapshot. The 200 x 200 frame is also a literal rather than a token.",
+      "fix": "Move the QR into a small Equatable subview keyed by the payload (struct BridgeQRCode: View, Equatable { let payload: String; ... }, used with .equatable()) so it re-renders only when the URL changes. Size it from a NibMetrics/NibSpacing token (or its aspect ratio with a max width) instead of the literal 200."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBridgeUI/BridgeSettingsPage.swift BridgeStatusRow (line 1191) and BridgeListEntryRow (line 1221)",
+      "problem": "VStack(spacing: 2) uses a literal spacing value (Slop checklist: tokens only).",
+      "fix": "Use NibSpacing.xxs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBridgeUI/BridgeSettingsPage.swift BridgeSettingsModel.addNetwork (lines 590-598) / networksSection",
+      "problem": "A network outside the private ranges (0.0.0.0/0, ::/0, a public /24) is stored as soon as the user taps Add. The warning appears only after the change is already live. This widens who can try tokens against the bridge, a security change with the same weight as 'Never Ask', which does get a confirmation.",
+      "fix": "When BridgeNetworkRules.isPublic(entry) is true, show a confirmationDialog (\"Allow connections from outside private networks?\" with a destructive Allow and a Cancel) before calling settings.set, like confirmsNeverAsk. Cover the model path with a test (e.g. addNetwork returns a pending-confirmation state for public entries)."
+    }
+  ]
+}
