@@ -24,18 +24,19 @@ final class FeatInkSynthTests: XCTestCase {
         Rect.bounding(items.flatMap { $0.stroke?.polyline ?? [] })
     }
 
-    /// A handwritten-looking word on the (still unloaded) page 2: synthesised, then stored as ordinary ink with the
-    /// ids OLD0, OLD1, …
-    private func seedWord(_ h: Harness, _ text: String, style: InkStyle, layer: Int = 1) -> [Item] {
+    /// A handwritten-looking word on page 2: synthesised, then stored as ordinary ink with the ids OLD0, OLD1, …
+    /// (one undo step of its own).
+    private func seedWord(_ h: Harness, _ text: String, style: InkStyle, layer: Int = 1) async throws -> [Item] {
         let layout = InkTypesetter.layout(text, at: Point(80, 200), options: .init(size: 24, shear: 0.2, style: style))
-        let z = FractionalIndex.sequence(after: nil, count: layout.strokes.count)
-        let seeded = layout.strokes.enumerated().map { k, stroke -> Item in
-            var s = stroke
-            InkModel.prepare(&s)
-            return Item(id: NibID("OLD\(k)"), kind: .stroke, z: z[k], layer: layer, stroke: s)
+        let seeded = layout.prepared().strokes.enumerated().map { k, stroke -> Item in
+            Item(id: NibID("OLD\(k)"), kind: .stroke, layer: layer, stroke: stroke)
         }
-        h.persistence.pageItems[Fixtures.docID, default: [:]][Fixtures.page2] = seeded
-        return seeded
+        return try await h.insert(seeded, page: Fixtures.page2)
+    }
+
+    /// Marks the fixture document read-only the way the store does (`CommandContext.isReadOnly`).
+    private func makeReadOnly(_ h: Harness) {
+        h.app.services.set(NSMutableSet(array: [Fixtures.docID.raw]), for: ServiceKeys.storeReadOnly)
     }
 
     private func assertError(_ h: Harness, _ command: String, _ params: JSONValue, _ code: NibError.Code,
@@ -59,7 +60,7 @@ final class FeatInkSynthTests: XCTestCase {
 
     func testRegistersItsCommandsAndTheDeviceFontSetting() throws {
         let h = Harness(features: [FeatInkSynthFeature.self])
-        for id in [CommandIDs.inkWriteText, "handwriting.replaceWord"] {
+        for id in [CommandIDs.inkWriteText, CommandIDs.handwritingReplaceWord] {
             let d = try XCTUnwrap(h.app.commands.descriptor(id), id)
             XCTAssertEqual(d.owner, FeatInkSynthFeature.id)
             XCTAssertEqual(d.effect, .edit)
@@ -73,7 +74,7 @@ final class FeatInkSynthTests: XCTestCase {
 
     func testTheDeviceFontSettingPicksTheHandwriting() async throws {
         let h = Harness(features: [FeatInkSynthFeature.self])
-        try await h.run("settings.set", ["name": "inksynth.font", "value": "Marker Felt"])
+        try await h.run(CommandIDs.settingsSet, ["name": "inksynth.font", "value": "Marker Felt"])
         XCTAssertEqual(h.app.settings.get(InkSynthSettings.font), .markerFelt)
         XCTAssertEqual(try InkSynthParams.font(nil, settings: h.app.settings), .markerFelt)
         XCTAssertEqual(try InkSynthParams.font("bradley-hand", settings: h.app.settings), .bradleyHand, "a param wins")
@@ -177,17 +178,61 @@ final class FeatInkSynthTests: XCTestCase {
         XCTAssertTrue(try items(h).isEmpty)
     }
 
+    func testWriteTextDefaultsToTheCurrentPageForTheUserOnly() async throws {
+        let h = Harness(features: [FeatInkSynthFeature.self])
+        let fixtureTop = try XCTUnwrap(try items(h, Fixtures.page1).map { $0.z }.max())
+        // Session default (§6.1): the user may omit page; the invoking window shows page 1.
+        let r = try await h.run(CommandIDs.inkWriteText, ["text": "Hi there", "at": [72, 600]])
+        let refs = strings(r["refs"])
+        XCTAssertFalse(refs.isEmpty)
+        let byID = Dictionary(uniqueKeysWithValues: try items(h, Fixtures.page1).map { ($0.id, $0) })
+        let written = try refs.map { ref -> Item in
+            guard case let .item(doc, page, id)? = NodeRef(ref), doc == Fixtures.docID, page == Fixtures.page1 else {
+                throw NibError.invalid("\(ref) is not on page 1")
+            }
+            return try XCTUnwrap(byID[id], ref)
+        }
+        // One batch write: the strokes go on top of the page's ink, in writing order.
+        let z = written.map { $0.z }
+        XCTAssertTrue(z.allSatisfy { $0 > fixtureTop }, "on top of the page")
+        XCTAssertEqual(z, z.sorted(), "in writing order")
+        XCTAssertEqual(Set(z).count, z.count, "distinct z keys")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+
+        // The AI, plugins and the bridge must name the page (the schema requires it).
+        do {
+            _ = try await h.run(CommandIDs.inkWriteText, ["text": "Hi", "at": [72, 96]], as: .ai("chat"))
+            XCTFail("the AI wrote without naming a page")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+        }
+        // With no page open the user must name one too.
+        h.session.page = nil
+        await assertError(h, CommandIDs.inkWriteText, ["text": "Hi", "at": [72, 96]], .invalidParams)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+    }
+
+    func testWriteTextRefusesAReadOnlyDocument() async throws {
+        let h = Harness(features: [FeatInkSynthFeature.self])
+        makeReadOnly(h)
+        await assertError(h, CommandIDs.inkWriteText, ["page": .string(page2), "text": "Hi", "at": [72, 96]], .unsupported)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+        XCTAssertTrue(try items(h).isEmpty)
+    }
+
     // MARK: handwriting.replaceWord
 
     func testReplaceWordMatchesPenColourLayerAndPlacementAsOneUndoStep() async throws {
         let h = Harness(features: [FeatInkSynthFeature.self])
         let style = InkStyle(tool: .pen, pen: .ball, color: RGBA(0xD1, 0x3B, 0x2F), width: 1.6)
-        let old = seedWord(h, "hello", style: style)
+        let old = try await seedWord(h, "hello", style: style)
         let before = try h.snapshot()
+        let depth = h.undoDepth(Fixtures.docID)
         let oldBox = try XCTUnwrap(inkBox(old))
         let oldRefs = old.map { JSONValue.string(ref(Fixtures.page2, $0.id)) }
 
-        let r = try await h.run("handwriting.replaceWord", ["refs": .array(oldRefs), "text": "halls", "ids": ["NEWWORD1"]])
+        let r = try await h.run(CommandIDs.handwritingReplaceWord,
+                                ["refs": .array(oldRefs), "text": "halls", "ids": ["NEWWORD1"]])
         let refs = strings(r["refs"])
         XCTAssertEqual(refs.first, ref(Fixtures.page2, "NEWWORD1"))
         let now = try items(h)
@@ -201,7 +246,7 @@ final class FeatInkSynthTests: XCTestCase {
         XCTAssertEqual(box.height, oldBox.height, accuracy: oldBox.height * 0.2, "same size")
         XCTAssertEqual(box.maxY, oldBox.maxY, accuracy: oldBox.height * 0.1, "same baseline")
 
-        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(try h.snapshot(), before)
         XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
@@ -214,11 +259,11 @@ final class FeatInkSynthTests: XCTestCase {
         // keeps hello's size and baseline and its "p" hangs below the old word.
         h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizeItems, title: "Recognise",
                                                   summary: "Test recogniser.", effect: .read)) { _, _ in ["text": "hello"] }
-        let old = seedWord(h, "hello", style: InkStyle())
+        let old = try await seedWord(h, "hello", style: InkStyle())
         let oldBox = try XCTUnwrap(inkBox(old))
         let oldRefs = old.map { JSONValue.string(ref(Fixtures.page2, $0.id)) }
 
-        try await h.run("handwriting.replaceWord", ["refs": .array(oldRefs), "text": "help"])
+        try await h.run(CommandIDs.handwritingReplaceWord, ["refs": .array(oldRefs), "text": "help"])
         let box = try XCTUnwrap(inkBox(try items(h)))
         XCTAssertEqual(box.minY, oldBox.minY, accuracy: oldBox.height * 0.12, "same ascender height")
         XCTAssertGreaterThan(box.maxY, oldBox.maxY + oldBox.height * 0.1, "the descender hangs below the old baseline")
@@ -236,7 +281,7 @@ final class FeatInkSynthTests: XCTestCase {
 
     func testReplaceWordRechecksCallerIDsWhenItWrites() async throws {
         let h = Harness(features: [FeatInkSynthFeature.self])
-        let old = seedWord(h, "hello", style: InkStyle())
+        let old = try await seedWord(h, "hello", style: InkStyle())
         let oldRefs = old.map { JSONValue.string(ref(Fixtures.page2, $0.id)) }
         // Someone takes the caller's id while the word is recognised and typeset.
         var squatter = Item.makeStroke(InkTypesetter.layout("x", at: Point(300, 400), options: .init()).prepared().strokes[0])
@@ -244,7 +289,7 @@ final class FeatInkSynthTests: XCTestCase {
         let taken = squatter
         recogniser(h) { tx in _ = try tx.put(taken, doc: Fixtures.docID, page: Fixtures.page2) }
 
-        await assertError(h, "handwriting.replaceWord", ["refs": .array(oldRefs), "text": "halls", "ids": ["NEWWORD1"]],
+        await assertError(h, CommandIDs.handwritingReplaceWord, ["refs": .array(oldRefs), "text": "halls", "ids": ["NEWWORD1"]],
                           .invalidParams)
         let now = try items(h)
         XCTAssertEqual(now.first(where: { $0.id == squatter.id })?.stroke, squatter.stroke, "the other item is not overwritten")
@@ -253,7 +298,7 @@ final class FeatInkSynthTests: XCTestCase {
 
     func testReplaceWordRechecksThePageWhenItWrites() async throws {
         let h = Harness(features: [FeatInkSynthFeature.self])
-        let old = seedWord(h, "hello", style: InkStyle())
+        let old = try await seedWord(h, "hello", style: InkStyle())
         let oldRefs = old.map { JSONValue.string(ref(Fixtures.page2, $0.id)) }
         // The page is deleted while the word is recognised and typeset.
         recogniser(h) { tx in
@@ -262,13 +307,41 @@ final class FeatInkSynthTests: XCTestCase {
             _ = try tx.put(record, doc: Fixtures.docID)
         }
 
-        await assertError(h, "handwriting.replaceWord", ["refs": .array(oldRefs), "text": "halls"], .notFound)
+        await assertError(h, CommandIDs.handwritingReplaceWord, ["refs": .array(oldRefs), "text": "halls"], .notFound)
         XCTAssertEqual(Set(try items(h).map { $0.id }), Set(old.map { $0.id }), "no ink written to the deleted page")
+    }
+
+    func testReplaceWordDefaultsToTheSelectionForTheUser() async throws {
+        let h = Harness(features: [FeatInkSynthFeature.self])
+        let old = try await seedWord(h, "hello", style: InkStyle())
+        let depth = h.undoDepth(Fixtures.docID)
+        // Session default (§6.1): a menu or key command replaces the selected word.
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page2, items: old.map { $0.id })
+        let r = try await h.run(CommandIDs.handwritingReplaceWord, ["text": "halls"])
+        let refs = strings(r["refs"])
+        XCTAssertFalse(refs.isEmpty)
+        XCTAssertEqual(Set(try items(h).map { ref(Fixtures.page2, $0.id) }), Set(refs), "the selected word was replaced")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
+
+        h.session.selection = Selection()
+        await assertError(h, CommandIDs.handwritingReplaceWord, ["text": "halls"], .invalidParams)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
+    }
+
+    func testReplaceWordRefusesAReadOnlyDocument() async throws {
+        let h = Harness(features: [FeatInkSynthFeature.self])
+        let old = try await seedWord(h, "hello", style: InkStyle())
+        let depth = h.undoDepth(Fixtures.docID)
+        makeReadOnly(h)
+        await assertError(h, CommandIDs.handwritingReplaceWord,
+                          ["refs": .array(old.map { .string(ref(Fixtures.page2, $0.id)) }), "text": "halls"], .unsupported)
+        XCTAssertEqual(Set(try items(h).map { $0.id }), Set(old.map { $0.id }), "the word is untouched")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
     }
 
     func testReplaceWordRejectsWhatIsNotHandwriting() async {
         let h = Harness(features: [FeatInkSynthFeature.self])
-        let command = "handwriting.replaceWord"
+        let command = CommandIDs.handwritingReplaceWord
         let stroke = JSONValue.string(ref(Fixtures.page1, Fixtures.strokeID))
         await assertError(h, command, ["refs": [], "text": "word"], .invalidParams)
         await assertError(h, command, ["refs": [.string(ref(Fixtures.page1, Fixtures.textID))], "text": "word"], .invalidParams)

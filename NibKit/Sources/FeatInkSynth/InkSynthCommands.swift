@@ -28,12 +28,13 @@ enum InkSynthParams {
     /// Right margin kept free when `ink.writeText` wraps at the page edge by default.
     static let pageMargin = 36.0
 
-    static func page(_ ref: String, path: String) throws -> (DocumentID, PageID) {
-        guard case let .page(doc, page)? = NodeRef(ref) else {
-            throw NibError(.invalidParams, "expected a page ref like page:D/P", path: path,
-                           hint: "get the current page from query.context")
+    /// Refuses a document the store must not write (saved by a newer Nib, or its files cannot be written) before any
+    /// typesetting runs.
+    static func writable(_ doc: DocumentID, _ ctx: CommandContext, path: String) throws {
+        if ctx.isReadOnly(doc) {
+            throw NibError(.unsupported, "document \(doc.raw) is read-only", path: path,
+                           hint: "the document was saved by a newer version of Nib or its files cannot be written")
         }
-        return (doc, page)
     }
 
     static func font(_ name: String?, settings: SettingsStore) throws -> InkSynthFont {
@@ -72,18 +73,17 @@ enum InkSynthParams {
         return record
     }
 
-    /// Stores synthesised strokes in writing order, with the caller's ids first. The strokes come already normalised
+    /// Stores synthesised strokes in writing order, with the caller's ids first, in one batch write (linear in the
+    /// strokes, and they get short z keys on top of the page). The strokes come already normalised
     /// (`InkTypesetter.Layout.prepared()`, run off the main actor), so this only builds and puts the items.
     static func write(_ strokes: [Stroke], ids: [ElementID], layer: Int, doc: DocumentID, page: PageID,
                       tx: DocTransaction) throws -> [Item] {
-        var written: [Item] = []
-        written.reserveCapacity(strokes.count)
-        for (k, stroke) in strokes.enumerated() {
+        let items = strokes.enumerated().map { k, stroke -> Item in
             var item = Item.makeStroke(stroke, layer: layer)
             if k < ids.count { item.id = ids[k] }
-            written.append(try tx.put(item, doc: doc, page: page))
+            return item
         }
-        return written
+        return try tx.put(items, doc: doc, page: page)
     }
 
     static func refs(_ items: [Item], doc: DocumentID, page: PageID) -> [String] {
@@ -99,10 +99,12 @@ enum InkSynthParams {
 // MARK: - ink.writeText
 
 /// Writes text as handwriting-style ink (the AI's handwriting tool, Math Assist answers, plugins such as
-/// word-complete). One undo step.
+/// word-complete). One undo step. Session default (§6.1): a user call may omit `page` to write on the invoking
+/// window's current page.
 struct InkWriteText: NibCommand {
     struct Params: Codable {
-        var page: String
+        /// Required in the schema; the user principal may omit it (the invoking window's current page).
+        var page: String?
         var text: String
         var at: [Double]
         var size: Double?
@@ -127,7 +129,7 @@ struct InkWriteText: NibCommand {
         ##"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "text": "v = u + at\nx = 12", "at": [72, 560], "size": 24, "font": "Bradley Hand", "color": "#1F5FD1", "width": 1.6, "maxWidth": 220, "slant": 8, "ids": ["SUVATLINE001"]}"##)
 
     static let descriptor = CommandDescriptor(
-        id: "ink.writeText", title: "Write Handwriting",
+        id: CommandIDs.inkWriteText, title: "Write Handwriting",
         summary: "Write text as handwriting-style ink strokes from a top-left point (size = font size in points), wrapping at maxWidth; returns the stroke refs.",
         params: .obj([
             "page": .ref,
@@ -147,7 +149,8 @@ struct InkWriteText: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let (doc, page) = try InkSynthParams.page(p.page, path: "$.page")
+        let (doc, page) = try ctx.pageOrSession(p.page)
+        try InkSynthParams.writable(doc, ctx, path: "$.page")
         guard !p.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NibError.invalid("text is empty", path: "$.text")
         }
@@ -212,10 +215,12 @@ struct InkWriteText: NibCommand {
 // MARK: - handwriting.replaceWord
 
 /// Replaces a handwritten word with synthesised ink of new text in the same pen, colour, layer, size, baseline and
-/// slant (spelling corrections, word completion). One undo step.
+/// slant (spelling corrections, word completion). One undo step. Session default (§6.1): a user call may omit `refs`
+/// to replace the invoking window's selection.
 struct HandwritingReplaceWord: NibCommand {
     struct Params: Codable {
-        var refs: [String]
+        /// Required in the schema; the user principal may omit it (the invoking window's selection).
+        var refs: [String]?
         var text: String
         var ids: [String]?
     }
@@ -230,7 +235,7 @@ struct HandwritingReplaceWord: NibCommand {
         #"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"], "text": "hello"}"#)
 
     static let descriptor = CommandDescriptor(
-        id: "handwriting.replaceWord", title: "Replace Word",
+        id: CommandIDs.handwritingReplaceWord, title: "Replace Word",
         summary: "Replace a handwritten word's strokes with synthesised ink of new text matching their size, slant, colour and pen; returns the new stroke refs.",
         params: .obj([
             "refs": .arr(.ref, "the word's pen or pencil strokes (item:D/P/I), all on one page"),
@@ -241,10 +246,11 @@ struct HandwritingReplaceWord: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        guard !p.refs.isEmpty else { throw NibError.invalid("refs is empty", path: "$.refs") }
+        let refs = ctx.refsOrSelection(p.refs)
+        guard !refs.isEmpty else { throw NibError.invalid("refs is empty and nothing is selected", path: "$.refs") }
         var location: (doc: DocumentID, page: PageID)?
         var items: [Item] = []
-        for (k, ref) in p.refs.enumerated() {
+        for (k, ref) in refs.enumerated() {
             let path = "$.refs[\(k)]"
             guard case let .item(doc, page, id)? = NodeRef(ref) else {
                 throw NibError(.invalidParams, "expected an item ref like item:D/P/I", path: path,
@@ -264,6 +270,7 @@ struct HandwritingReplaceWord: NibCommand {
         }
         guard let here = location else { throw NibError.invalid("refs is empty", path: "$.refs") }
         let doc = here.doc, page = here.page
+        try InkSynthParams.writable(doc, ctx, path: "$.refs")
         let text = p.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw NibError.invalid("text is empty", path: "$.text") }
         guard text.count <= 500 else { throw NibError.invalid("text is longer than 500 characters", path: "$.text") }
@@ -278,7 +285,7 @@ struct HandwritingReplaceWord: NibCommand {
         let polylines = strokes.map { $0.polyline }
         guard let box = Rect.bounding(polylines.flatMap { $0 }) else { throw NibError.invalid("the word has no ink", path: "$.refs") }
         let lean = InkTypesetter.lean(of: polylines, step: InkTypesetter.leanStep(forHeight: box.height))
-        let oldText = await recognisedText(p.refs, ctx)
+        let oldText = await recognisedText(refs, ctx)
         let options = InkTypesetter.Options(font: ctx.services.settings.get(InkSynthSettings.font),
                                             style: strokes[0].style,
                                             t0: strokes.map { $0.t0 }.min() ?? Date().timeIntervalSince1970)
@@ -302,8 +309,8 @@ struct HandwritingReplaceWord: NibCommand {
                 guard !current.locked else {
                     throw NibError.invalid("\(NodeRef.item(doc, page, item.id).description) is locked", path: "$.refs")
                 }
-                try tx.delete(item: item.id, doc: doc, page: page)
             }
+            try tx.delete(items: items.map { $0.id }, doc: doc, page: page)
             return try InkSynthParams.write(layout.strokes, ids: ids, layer: layer, doc: doc, page: page, tx: tx)
         }
         return Output(refs: InkSynthParams.refs(written, doc: doc, page: page), bounds: InkSynthParams.bounds(written))
