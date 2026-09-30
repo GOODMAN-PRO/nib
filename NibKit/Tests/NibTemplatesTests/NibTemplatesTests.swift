@@ -32,6 +32,16 @@ final class NibTemplatesTests: XCTestCase {
         switch op.op {
         case .line, .polyline, .polygon:
             return Rect.bounding(op.points ?? [])
+        case .hlines:
+            guard let r = op.rect, let s = op.spacing else { return nil }
+            let n = (r.height / s).rounded(.down)
+            guard n >= 1 else { return nil }
+            return Rect(x: r.minX, y: r.minY + s, width: r.width, height: (n - 1) * s)
+        case .vlines:
+            guard let r = op.rect, let s = op.spacing else { return nil }
+            let n = (r.width / s).rounded(.down)
+            guard n >= 1 else { return nil }
+            return Rect(x: r.minX + s, y: r.minY, width: (n - 1) * s, height: r.height)
         case .dots:
             guard let r = op.rect, let s = op.spacing, let radius = op.radius else { return nil }
             let nx = (r.width / s).rounded(.down), ny = (r.height / s).rounded(.down)
@@ -133,6 +143,139 @@ final class NibTemplatesTests: XCTestCase {
         XCTAssertEqual(after?.fill?.a, 255)
     }
 
+    func testWhiteboardRegionsMatchThePageRenderAndStayInsideTheRegion() {
+        let page = Rect(x: 0, y: 0, width: PageSize.a4.width, height: PageSize.a4.height)
+        let tile = Rect(x: 128, y: 256, width: 256, height: 256)
+        for t in WhiteboardGrids.all {
+            XCTAssertNotNil(t.renderRegion, t.id)
+            XCTAssertNotNil(t.metricsProvider, t.id)
+            for scale in [0.25, 1, 2, 3, 2 * 2.0.squareRoot(), 12] {
+                // The whole page as the region is exactly the page render.
+                XCTAssertEqual(t.renderOps(t.defaults, size: .a4, scale: scale, region: page).display,
+                               t.render(t.defaults, .a4, scale).display, "\(t.id) × \(scale)")
+                // A tile inside the page draws only around the tile (lines and dots on its edges included).
+                let ops = t.renderOps(t.defaults, size: .a4, scale: scale, region: tile).display.ops
+                XCTAssertFalse(ops.isEmpty, "\(t.id) × \(scale) draws nothing in the tile")
+                let bounds = tile.insetBy(-2 * TemplateCanvas.seam(scale: scale))
+                for op in ops {
+                    guard let e = Self.extent(op) else { continue }
+                    XCTAssertTrue(bounds.contains(e), "\(t.id) × \(scale): \(op.op) \(e) leaves the tile")
+                    XCTAssertTrue(page.insetBy(-0.01).contains(e), "\(t.id) × \(scale): \(op.op) \(e) leaves the page")
+                }
+            }
+        }
+    }
+
+    func testWhiteboardBoardTilesAreAnchoredAtTheOriginAndShareTheirSeams() throws {
+        // Board tiles in world coordinates (outside [0, size]): the lattice runs edge to edge and both tiles of a seam
+        // draw the lines and dots that sit on it (each tile clips its own half).
+        let left = Rect(x: -480, y: -240, width: 240, height: 240)
+        let right = Rect(x: -240, y: -240, width: 240, height: 240)
+        for t in WhiteboardGrids.all {
+            for scale in [1.0, 2, 3, 6] {
+                for region in [left, right] {
+                    let ops = t.renderOps(t.defaults, size: .a4, scale: scale, region: region).display.ops
+                    XCTAssertFalse(ops.isEmpty, "\(t.id) × \(scale) draws nothing on the board")
+                    for op in ops {
+                        let r = try XCTUnwrap(op.rect), s = try XCTUnwrap(op.spacing)
+                        // Lines and dots sit at r.min + k·s: r.min on the lattice means they do too.
+                        if op.op != .vlines {
+                            XCTAssertEqual((r.minY / s).rounded(), r.minY / s, accuracy: 1e-9, "\(t.id) \(op.op) off the lattice")
+                        }
+                        if op.op != .hlines {
+                            XCTAssertEqual((r.minX / s).rounded(), r.minX / s, accuracy: 1e-9, "\(t.id) \(op.op) off the lattice")
+                        }
+                        XCTAssertTrue(region.insetBy(-2 * TemplateCanvas.seam(scale: scale)).contains(Self.extent(op) ?? r))
+                    }
+                }
+            }
+        }
+        // x = -240 is a grid line at 100 % (20 pt spacing): both tiles draw it.
+        func seamLines(_ region: Rect) -> [DisplayOp] {
+            WhiteboardGrids.grid.renderOps([:], size: .a4, scale: 2, region: region).display.ops.filter { op in
+                guard op.op == .vlines, let e = Self.extent(op) else { return false }
+                return e.minX <= -240 && -240 <= e.maxX
+            }
+        }
+        XCTAssertFalse(seamLines(left).isEmpty)
+        XCTAssertFalse(seamLines(right).isEmpty)
+    }
+
+    func testDeepZoomKeepsTheFineWhiteboardLayer() throws {
+        // A3 at 12 px/pt: the half-spacing layer (2.5 pt) is 160,000 dots over the whole page, which the page render
+        // used to drop; a tile draws only its own few dots of it.
+        let (s, f) = WhiteboardGrids.level(base: WhiteboardGrids.baseSpacing, scale: 12)
+        XCTAssertGreaterThan(f, WhiteboardGrids.invisible)
+        XCTAssertNotNil(WhiteboardGrids.dots.render([:], .a3, 12).display.ops.first { $0.spacing == s / 2 })
+        let tile = Rect(x: 400, y: 600, width: 256.0 / 12, height: 256.0 / 12)
+        let ops = WhiteboardGrids.dots.renderOps([:], size: .a3, scale: 12, region: tile).display.ops
+        let fine = try XCTUnwrap(ops.first { $0.spacing == s / 2 })
+        let r = try XCTUnwrap(fine.rect)
+        XCTAssertLessThan((r.width / (s / 2)).rounded(.down) * (r.height / (s / 2)).rounded(.down), 200)
+    }
+
+    func testTemplatesPublishTheirMetrics() throws {
+        let h = Harness(features: [NibTemplatesFeature.self], fixtures: false)
+        func metrics(_ id: String, _ params: [String: JSONValue] = [:], size: PageSize? = .a4) throws -> TemplateMetrics {
+            try XCTUnwrap(h.app.content.templates.get(id), id).metrics(for: params, size: size)
+        }
+        // Lattices repeat every cell (graph paper every fifth); spacing is clamped like the render.
+        XCTAssertEqual(try metrics(TemplateIDs.grid).spacing ?? 0, 5 * mm, accuracy: 1e-9)
+        XCTAssertEqual(try metrics(TemplateIDs.dots, [TemplateParamNames.spacing: 12]).repeatPeriod, PageSize(12, 12))
+        XCTAssertEqual(try metrics(TemplateIDs.grid, [TemplateParamNames.spacing: 500]).spacing, 60)
+        XCTAssertEqual(try metrics(TemplateIDs.graph, [TemplateParamNames.spacing: 4]).repeatPeriod, PageSize(20, 20))
+        let iso = try metrics(TemplateIDs.isometric, [TemplateParamNames.spacing: 20])
+        XCTAssertNil(iso.spacing)
+        XCTAssertEqual(iso.repeatPeriod?.width ?? 0, 20 * 3.0.squareRoot(), accuracy: 1e-9)
+        XCTAssertEqual(iso.repeatPeriod?.height, 20)
+
+        // College ruled: the writing area starts one line above the first rule, right of the 25 mm margin line, and
+        // ends at the last rule the render draws.
+        let college = try metrics(TemplateIDs.ruled)
+        XCTAssertEqual(college.spacing, 24.7)
+        XCTAssertNil(college.repeatPeriod)
+        let margins = try XCTUnwrap(college.margins)
+        XCTAssertEqual(margins.left, 25 * mm, accuracy: 1e-9)
+        XCTAssertEqual(margins.top, 3 * 24.7 - 24.7, accuracy: 1e-9)
+        XCTAssertEqual(margins.right, 0)
+        let rules = try XCTUnwrap(PaperTemplates.ruledCollege.render([:], .a4, 2).display.ops.first { $0.op == .hlines })
+        let drawn = try XCTUnwrap(Self.extent(rules))
+        XCTAssertEqual(drawn.minY, margins.top + 24.7, accuracy: 1e-6)
+        XCTAssertEqual(drawn.maxY, PageSize.a4.height - margins.bottom, accuracy: 1e-6)
+        XCTAssertEqual(try metrics(TemplateIDs.ruledNarrow).margins?.left, 0)
+        XCTAssertEqual(try metrics(TemplateIDs.ruledWide, [TemplateParamNames.margin: 40]).margins?.left, 40)
+        let legal = try XCTUnwrap(try metrics(TemplateIDs.legalPad).margins)
+        XCTAssertEqual(legal.left, 91)
+        XCTAssertEqual(legal.top, 4 * 24.7, accuracy: 1e-9)
+        let legalRules = try XCTUnwrap(PaperTemplates.legalPad.render([:], .a4, 2).display.ops.first { $0.op == .hlines })
+        XCTAssertEqual(try XCTUnwrap(Self.extent(legalRules)).maxY, PageSize.a4.height - legal.bottom, accuracy: 1e-6)
+        XCTAssertEqual(try metrics("builtin.handwriting").spacing, 54)
+        XCTAssertEqual(try metrics("builtin.todo", [TemplateParamNames.spacing: 30]), TemplateMetrics(spacing: 30))
+
+        // Whiteboards: the main layer at 100 % for snapping, no fixed period (the layers change with zoom).
+        XCTAssertEqual(try metrics(TemplateIDs.whiteboardDots, size: nil), TemplateMetrics(spacing: 20))
+        XCTAssertEqual(try metrics(TemplateIDs.whiteboardGrid, [TemplateParamNames.spacing: 40], size: nil).spacing, 40)
+        XCTAssertEqual(try metrics(TemplateIDs.whiteboardLines, size: nil).spacing, 30)
+        // No grid, margins or period.
+        for id in [TemplateIDs.blank, "builtin.plannerMonthly", "builtin.storyboard", "builtin.music", "cover.solid"] {
+            XCTAssertEqual(try metrics(id), TemplateMetrics(), id)
+        }
+    }
+
+    func testPlannerLabelsAreAlignedAndWeighted() {
+        let ops = PlannerTemplates.monthly.render(["month": 2, "year": 2024], .a4, 2).display.ops.filter { $0.op == .text }
+        XCTAssertEqual(ops.first { $0.text?.hasSuffix("2024") == true }?.weight, .semibold)
+        let days = ops.filter { Int($0.text ?? "") != nil }
+        XCTAssertEqual(days.count, 29)
+        XCTAssertTrue(days.allSatisfy { $0.align == .right })
+        let weekdays = Set(PlannerCalendar.weekdays(.short, startMonday: true))
+        let names = ops.filter { weekdays.contains($0.text ?? "") }
+        XCTAssertEqual(names.count, 7)
+        XCTAssertTrue(names.allSatisfy { $0.align == .center && $0.weight == .medium })
+        let weekly = PlannerTemplates.weekly.render([:], .a4, 2).display.ops.filter { $0.op == .text && $0.weight == .semibold }
+        XCTAssertEqual(weekly.count, 8)   // seven days and Notes
+    }
+
     func testMonthlyPlannerLaysOutTheMonth() {
         XCTAssertEqual(PlannerCalendar.layout(month: 2, year: 2024, startMonday: true)?.days, 29)
         XCTAssertEqual(PlannerCalendar.layout(month: 2, year: 2024, startMonday: true)?.offset, 3)   // Thursday
@@ -208,8 +351,16 @@ final class NibTemplatesTests: XCTestCase {
         XCTAssertEqual(try page(h, Fixtures.page2).size, PageSize.standard)
         _ = try await h.run("page.setTemplate", json(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "builtin.dots", "size": [500, 300]}"#))
         XCTAssertEqual(try page(h, Fixtures.page2).size, PageSize(500, 300))
-        // Page 2 is not on screen: the shrink check drops it from the item cache again; it reloads unchanged.
-        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2), items)
+        // Page 2 was cached before the shrink check, so it stays cached.
+        XCTAssertTrue(h.app.workspace.isPageCached(Fixtures.docID, page: Fixtures.page2))
+        // A page the check has to load is dropped from the item cache again; pages cached before stay.
+        _ = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        h.app.workspace.evictPages(Fixtures.docID, keeping: [Fixtures.page1])
+        XCTAssertFalse(h.app.workspace.isPageCached(Fixtures.docID, page: Fixtures.page2))
+        _ = try await h.run("page.setTemplate", json(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "builtin.dots", "size": [400, 250]}"#))
+        XCTAssertFalse(h.app.workspace.isPageCached(Fixtures.docID, page: Fixtures.page2))
+        XCTAssertTrue(h.app.workspace.isPageCached(Fixtures.docID, page: Fixtures.page1))
+        XCTAssertEqual(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2), items)   // reloads unchanged
 
         XCTAssertEqual(TemplateCommands.oriented(.a4, landscape: true), PageSize.a4.rotated)
         XCTAssertEqual(TemplateCommands.oriented(.square, landscape: true), PageSize.square)
@@ -253,6 +404,38 @@ final class NibTemplatesTests: XCTestCase {
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         _ = try await h.run("page.setBackground", json(##"{"pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "background": {"kind": "color", "color": "#FDF6DC"}}"##))
         XCTAssertTrue(try h.app.workspace.content(Fixtures.docID).meta.coverEnabled)
+    }
+
+    func testOneUndoRevertsBothMetaWritesOfACommand() async throws {
+        let h = harness()
+        _ = try await h.run("page.setTemplate", json(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG001"], "template": "cover.solid"}"#))
+        let before = try h.snapshot()
+        let metaBefore = try h.app.workspace.content(Fixtures.docID).meta
+        XCTAssertTrue(metaBefore.coverEnabled)
+        // Every page plus the cover itself: page 1 turns into paper (cover flag off), then the paper becomes the
+        // document's default template, so the command writes the document meta twice.
+        _ = try await h.run("page.setTemplate", json(
+            #"{"pages": ["doc:FIXTUREDOC01", "page:FIXTUREDOC01/FIXTUREPG001"], "template": "builtin.dots"}"#))
+        let meta = try h.app.workspace.content(Fixtures.docID).meta
+        XCTAssertFalse(meta.coverEnabled)
+        XCTAssertEqual(meta.defaultTemplate?.id, TemplateIDs.dots)
+        XCTAssertEqual(try page(h, Fixtures.page1).background.template?.id, TemplateIDs.dots)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        XCTAssertFalse(try h.app.workspace.content(Fixtures.docID).meta.coverEnabled)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).meta.defaultTemplate?.id, TemplateIDs.dots)
+    }
+
+    func testCommandsUseTheAppTemplateRegistry() async throws {
+        let h = harness()
+        // A plugin template registered with the app is listed and applied like a built-in.
+        h.app.content.templates.register(TemplateDefinition(id: "plugin.stripes", title: "Stripes", category: "Plugin",
+                                                            owner: "plugin.test") { _, _, _ in TemplateRender(paper: .white) })
+        let list = try await h.run("template.list", ["category": "Plugin"])
+        XCTAssertEqual(list["templates"]?.arrayValue?.compactMap { $0["id"]?.stringValue }, ["plugin.stripes"])
+        _ = try await h.run("page.setTemplate", json(#"{"pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "template": "plugin.stripes"}"#))
+        XCTAssertEqual(try page(h, Fixtures.page2).background.template?.id, "plugin.stripes")
     }
 
     func testParamsCarryOverAndDatedTemplatesAreStamped() async throws {

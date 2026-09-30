@@ -1,23 +1,12 @@
 import Foundation
 import NibContracts
 
-// template.list (read), page.setTemplate and page.setBackground (edit). Page records change only through
-// `DocTransaction.put(PageRecord)` inside `ctx.mutate`, so both edits are one undo step and sync like any other write.
+// template.list (read), page.setTemplate and page.setBackground (edit). Templates come from `ctx.content.templates`
+// (built-ins and plugins). Page records change only through `DocTransaction.put(PageRecord)` inside `ctx.mutate`, so
+// both edits are one undo step and sync like any other write.
 
 /// Shared lookups and validation for the template commands.
 enum TemplateCommands {
-    /// `app.services` key under which the feature publishes `app.content.templates`: commands cannot reach the
-    /// content registries through `CommandContext` otherwise.
-    static let registryKey = "templates.registry"
-
-    @MainActor
-    static func registry(_ ctx: CommandContext) throws -> Registry<TemplateDefinition> {
-        guard let r = ctx.services.get(registryKey, as: Registry<TemplateDefinition>.self) else {
-            throw NibError.unavailable("the template registry")
-        }
-        return r
-    }
-
     static func definition(_ id: String, in registry: Registry<TemplateDefinition>, path: String) throws -> TemplateDefinition {
         guard let d = registry.get(id) else {
             throw NibError(.notFound, "template '\(id)' not found", path: path, hint: "call template.list for the template ids")
@@ -137,7 +126,7 @@ enum TemplateCommands {
         if ref.id == def.id { return ref.params }
         guard !def.isCover, let oldDef = registry.get(ref.id), !oldDef.isCover else { return [:] }
         var out: [String: JSONValue] = [:]
-        for name in ["paper", "line"] where def.params.contains(where: { $0.name == name }) {
+        for name in [TemplateParamNames.paper, TemplateParamNames.line] where def.params.contains(where: { $0.name == name }) {
             out[name] = ref.params[name]
         }
         return out
@@ -145,8 +134,8 @@ enum TemplateCommands {
 
     /// Zoom Window return height for a ruled template whose spacing differs from its default (nil = template default).
     static func returnHeight(_ def: TemplateDefinition, params: [String: JSONValue]) -> Double? {
-        guard let base = def.zoomReturnHeight, let s = params["spacing"]?.doubleValue,
-              let d = def.defaults["spacing"]?.doubleValue, d > 0, abs(s - d) > 1e-9 else { return nil }
+        guard let base = def.zoomReturnHeight, let s = params[TemplateParamNames.spacing]?.doubleValue,
+              let d = def.defaults[TemplateParamNames.spacing]?.doubleValue, d > 0, abs(s - d) > 1e-9 else { return nil }
         return base * s / d
     }
 
@@ -204,14 +193,6 @@ enum TemplateCommands {
         return out
     }
 
-    /// Document-level consequences of a template change, written with ONE `putMeta` per document (undo reverts a
-    /// record only while it carries the revision the entry wrote, so a record written twice in a group would not undo).
-    struct MetaChange {
-        var coverEnabled: Bool?
-        /// "Add Page › Current template": follows a paper template applied to every page (doc:D).
-        var defaultTemplate: TemplateRef?
-    }
-
     /// `meta.coverEnabled` follows page 1: a cover template turns it on; replacing a cover template with a paper
     /// template turns it off (`allowDisable`; page.setBackground cannot tell a custom PDF/image cover from paper).
     static func coverFlag(wasCover: Bool, nowCover: Bool, allowDisable: Bool) -> Bool? {
@@ -227,15 +208,14 @@ enum TemplateCommands {
         })
     }
 
+    /// Changes the document's meta inside the command's transaction (written only when it changes). A command may
+    /// write it more than once (cover flag, then default template): one undo reverts both.
     @MainActor
-    static func apply(_ changes: [DocumentID: MetaChange], tx: DocTransaction) throws {
-        for (doc, change) in changes {
-            var meta = try tx.content(doc).meta
-            let before = meta
-            if let flag = change.coverEnabled { meta.coverEnabled = flag }
-            if let template = change.defaultTemplate { meta.defaultTemplate = template }
-            if meta != before { try tx.putMeta(meta) }
-        }
+    static func updateMeta(_ doc: DocumentID, tx: DocTransaction, _ change: (inout DocumentMeta) -> Void) throws {
+        var meta = try tx.content(doc).meta
+        let before = meta
+        change(&meta)
+        if meta != before { try tx.putMeta(meta) }
     }
 
     /// Result ref lists stop here (`count` / `outsideCount` give the totals): an edit's result must stay far below
@@ -243,26 +223,22 @@ enum TemplateCommands {
     static let refLimit = 100
 
     /// Items that no longer fit on pages that SHRINK (they are kept where they are): the first `refLimit` refs and
-    /// the total. Runs before `ctx.mutate` because it may load every page of a notebook (mutate must stay short),
-    /// and drops each checked page from the item cache again unless a window shows it.
+    /// the total. Runs before `ctx.mutate` because it may load every page of a notebook (mutate must stay short).
+    /// A page this check had to load is dropped from the item cache again; pages that were already cached stay.
     @MainActor
     static func itemsOutside(_ targets: [Target], newSizes: [PageSize?], ctx: CommandContext) throws -> (refs: [String], count: Int) {
         var refs: [String] = []
         var count = 0
-        var pageIDs: [DocumentID: Set<PageID>] = [:]
+        let workspace = ctx.workspace
         for (t, new) in zip(targets, newSizes) {
             guard let old = t.page.size, let new = new, new.width < old.width || new.height < old.height else { continue }
+            let wasCached = workspace.isPageCached(t.doc, page: t.page.id)
             let bounds = Rect(x: 0, y: 0, width: new.width, height: new.height).insetBy(-0.5)
-            for item in try ctx.workspace.items(t.doc, page: t.page.id) where !bounds.contains(item.bounds) {
+            for item in try workspace.items(t.doc, page: t.page.id) where !bounds.contains(item.bounds) {
                 count += 1
                 if refs.count < refLimit { refs.append(NodeRef.item(t.doc, t.page.id, item.id).description) }
             }
-            // ponytail: Workspace does not expose which pages were cached before the check, so every checked page
-            // no window shows is dropped (it reloads on demand); keep pre-cached pages once Workspace says which.
-            if !ctx.services.sessions.sessions.contains(where: { $0.document == t.doc && $0.page == t.page.id }) {
-                if pageIDs[t.doc] == nil { pageIDs[t.doc] = try Set(ctx.workspace.content(t.doc).pages.map { $0.id }) }
-                ctx.workspace.evictPages(t.doc, keeping: (pageIDs[t.doc] ?? []).subtracting([t.page.id]))
-            }
+            if !wasCached { workspace.evictPages(t.doc, keeping: workspace.cachedPages(t.doc).subtracting([t.page.id])) }
         }
         return (refs, count)
     }
@@ -338,7 +314,7 @@ struct TemplateList: NibCommand {
         effect: .read, target: .library)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let all = try TemplateCommands.registry(ctx).all
+        let all = ctx.content.templates.all
         var categories: [String] = []
         for t in all where !categories.contains(t.category) { categories.append(t.category) }
         let picked = all.filter { t in
@@ -402,7 +378,7 @@ struct PageSetTemplate: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let registry = try TemplateCommands.registry(ctx)
+        let registry = ctx.content.templates
         let def = try TemplateCommands.definition(p.template, in: registry, path: "$.template")
         let given = try TemplateCommands.normalize(p.params ?? [:], for: def, path: "$.params")
         let requested = try TemplateCommands.pageSize(p.size)
@@ -423,7 +399,8 @@ struct PageSetTemplate: NibCommand {
         }
         let outside = try TemplateCommands.itemsOutside(targets, newSizes: sizes, ctx: ctx)
         return try ctx.mutate { tx in
-            var metaChanges: [DocumentID: TemplateCommands.MetaChange] = [:]
+            // "Add Page › Current template" follows a paper template applied to every page (doc:D): the last page's.
+            var newDefaults: [DocumentID: TemplateRef] = [:]
             for (t, size) in zip(targets, sizes) {
                 var page = t.page
                 page.size = size
@@ -432,19 +409,17 @@ struct PageSetTemplate: NibCommand {
                 for (k, v) in given { params[k] = v == .null ? nil : v }
                 TemplateCommands.stampDates(&params, def: def, now: now)
                 page.background = .ofTemplate(def.id, params: params)
-                if old.template?.id != def.id || given["spacing"] != nil {
+                if old.template?.id != def.id || given[TemplateParamNames.spacing] != nil {
                     page.zoomReturnHeight = TemplateCommands.returnHeight(def, params: params)
                 }
                 try tx.put(page, doc: t.doc)
                 if t.isFirst, let flag = TemplateCommands.coverFlag(wasCover: TemplateCommands.isCover(old, registry),
                                                                     nowCover: def.isCover, allowDisable: true) {
-                    metaChanges[t.doc, default: TemplateCommands.MetaChange()].coverEnabled = flag
+                    try TemplateCommands.updateMeta(t.doc, tx: tx) { $0.coverEnabled = flag }
                 }
-                if !def.isCover, wholeDocuments.contains(t.doc) {
-                    metaChanges[t.doc, default: TemplateCommands.MetaChange()].defaultTemplate = TemplateRef(def.id, params: params)
-                }
+                if !def.isCover, wholeDocuments.contains(t.doc) { newDefaults[t.doc] = TemplateRef(def.id, params: params) }
             }
-            try TemplateCommands.apply(metaChanges, tx: tx)
+            for (doc, template) in newDefaults { try TemplateCommands.updateMeta(doc, tx: tx) { $0.defaultTemplate = template } }
             let limit = TemplateCommands.refLimit
             let refs = targets.prefix(limit).map { NodeRef.page($0.doc, $0.page.id).description }
             let warning = outside.count == 0 ? nil
@@ -494,7 +469,7 @@ struct PageSetBackground: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let registry = try TemplateCommands.registry(ctx)
+        let registry = ctx.content.templates
         var cover = false
         let background: Background
         switch p.background.kind {
@@ -536,7 +511,7 @@ struct PageSetBackground: NibCommand {
         let wholeDocuments = TemplateCommands.wholeDocuments(p.pages)
         let targets = try TemplateCommands.targets(p.pages, workspace: ctx.workspace, cover: cover, registry: registry)
         return try ctx.mutate { tx in
-            var metaChanges: [DocumentID: TemplateCommands.MetaChange] = [:]
+            var newDefaults: Set<DocumentID> = []
             for t in targets {
                 var page = t.page
                 let old = page.background
@@ -545,13 +520,13 @@ struct PageSetBackground: NibCommand {
                 // A non-cover template is known paper; a PDF/image/colour may be a custom cover, so it keeps the flag.
                 if t.isFirst, let flag = TemplateCommands.coverFlag(wasCover: TemplateCommands.isCover(old, registry), nowCover: cover,
                                                                     allowDisable: p.background.kind == .template) {
-                    metaChanges[t.doc, default: TemplateCommands.MetaChange()].coverEnabled = flag
+                    try TemplateCommands.updateMeta(t.doc, tx: tx) { $0.coverEnabled = flag }
                 }
-                if !cover, wholeDocuments.contains(t.doc), let template = background.template {
-                    metaChanges[t.doc, default: TemplateCommands.MetaChange()].defaultTemplate = template
-                }
+                if !cover, wholeDocuments.contains(t.doc), background.template != nil { newDefaults.insert(t.doc) }
             }
-            try TemplateCommands.apply(metaChanges, tx: tx)
+            if let template = background.template {
+                for doc in newDefaults { try TemplateCommands.updateMeta(doc, tx: tx) { $0.defaultTemplate = template } }
+            }
             let limit = TemplateCommands.refLimit
             return Output(pages: targets.prefix(limit).map { NodeRef.page($0.doc, $0.page.id).description },
                           count: targets.count, truncated: targets.count > limit ? true : nil)

@@ -52,7 +52,8 @@ enum PlannerTemplates {
                                                params: colours) { c in
         let m = Layout.margin(c), x0 = m, x1 = c.width - m
         let s = min(24, max(14, c.height / 32))
-        c.text(String(localized: "Meeting Notes"), Rect(x: x0, y: m - 6, width: x1 - x0, height: 28), size: 20)
+        c.text(String(localized: "Meeting Notes"), Rect(x: x0, y: m - 6, width: x1 - x0, height: 28), size: 20,
+               weight: .semibold)
         var y = m + 26
         for label in [String(localized: "Meeting"), String(localized: "Date"), String(localized: "Attendees")] {
             Layout.field(&c, label, x: x0, y: y, to: x1)
@@ -66,7 +67,8 @@ enum PlannerTemplates {
         c.hlines(Rect(x: x0, y: y - s * 0.6, width: x1 - x0, height: actionTop - s * 0.5 - (y - s * 0.6)), spacing: s)
         let rowsTop = Layout.section(&c, String(localized: "Action items"), x: x0, y: actionTop, width: x1 - x0)
         let ownerX = x1 - (x1 - x0) * 0.25
-        c.text(String(localized: "Owner"), Rect(x: ownerX + 6, y: actionTop, width: x1 - ownerX - 6, height: 14), size: 10)
+        c.text(String(localized: "Owner"), Rect(x: ownerX + 6, y: actionTop, width: x1 - ownerX - 6, height: 14), size: 10,
+               weight: .medium)
         Layout.checkRows(&c, Rect(x: x0, y: rowsTop - s * 0.4, width: ownerX - x0 - 6, height: s * 5.25), spacing: s)
         c.hlines(Rect(x: ownerX + 6, y: rowsTop - s * 0.4, width: x1 - ownerX - 6, height: s * 5.25), spacing: s)
         c.line(ownerX, actionTop, ownerX, c.height - m, color: c.style.strong)
@@ -82,7 +84,8 @@ enum PlannerTemplates {
         for (i, d) in initials.enumerated() {
             let x = x1 - Double(initials.count - i) * cell
             c.box(Rect(x: x + 1, y: m, width: cell - 2, height: cell - 2), stroke: c.style.line, radius: (cell - 2) / 2)
-            c.text(d, Rect(x: x + cell * 0.3, y: m + cell * 0.12, width: cell * 0.6, height: cell * 0.8), size: cell * 0.5)
+            c.text(d, Rect(x: x + 1, y: m + cell * 0.12, width: cell - 2, height: cell * 0.8), size: cell * 0.5,
+                   align: .center, weight: .medium)
         }
         let top = m + max(cell, 16) + 14
         let gap = m * 0.6
@@ -133,7 +136,8 @@ enum PlannerTemplates {
             let r = Rect(x: m + Double(i % cols) * (cellW + gap), y: top + Double(i / cols) * (cellH + gap), width: cellW, height: cellH)
             c.box(r, stroke: c.style.strong, radius: 4)
             let fs = min(11, cellH * 0.12)
-            c.text(name, Rect(x: r.minX + 6, y: r.minY + 4, width: r.width - 12, height: fs * 1.4), size: fs)
+            c.text(name, Rect(x: r.minX + 6, y: r.minY + 4, width: r.width - 12, height: fs * 1.4), size: fs,
+                   weight: .semibold)
             let linesTop = r.minY + fs * 1.4 + 6
             let s = min(22, max(12, (r.maxY - linesTop) / 6))
             c.hlines(Rect(x: r.minX + 6, y: linesTop, width: r.width - 12, height: r.maxY - linesTop - 4), spacing: s)
@@ -156,14 +160,16 @@ enum PlannerTemplates {
         let startMonday = c.flag("startMonday", true)
         let layout = PlannerCalendar.layout(month: month, year: year, startMonday: startMonday)
         if layout != nil {
-            c.text("\(PlannerCalendar.monthName(month)) \(year)", Rect(x: m, y: m - 6, width: c.width - 2 * m, height: 30), size: 22)
+            c.text("\(PlannerCalendar.monthName(month)) \(year)", Rect(x: m, y: m - 6, width: c.width - 2 * m, height: 30),
+                   size: 22, weight: .semibold)
         } else {
             Layout.field(&c, String(localized: "Month"), x: m, y: m, to: c.width * 0.6, size: 14)
         }
         let colW = (c.width - 2 * m) / 7
         let namesTop = m + 32
         for (i, name) in PlannerCalendar.weekdays(.short, startMonday: startMonday).enumerated() {
-            c.text(name, Rect(x: m + Double(i) * colW + 4, y: namesTop, width: colW - 8, height: 14), size: 9)
+            c.text(name, Rect(x: m + Double(i) * colW + 4, y: namesTop, width: colW - 8, height: 14), size: 9,
+                   align: .center, weight: .medium)
         }
         let gridTop = namesTop + 18
         let notesH = c.height * 0.16
@@ -183,7 +189,7 @@ enum PlannerTemplates {
             for day in 1...l.days {
                 let index = l.offset + day - 1
                 c.text("\(day)", Rect(x: m + Double(index % 7) * colW + 4, y: gridTop + Double(index / 7) * rowH + 3,
-                                      width: colW - 8, height: 12), size: min(9, rowH * 0.4))
+                                      width: colW - 8, height: 12), size: min(9, rowH * 0.4), align: .right, weight: .medium)
             }
         }
         let notesTop = Layout.section(&c, String(localized: "Notes"), x: m, y: gridBottom + 8, width: c.width - 2 * m)
@@ -205,7 +211,8 @@ enum PlannerTemplates {
         guard rows > 0, colW > 3 else { return }
         let size = min(7, colW * 0.55)
         for d in 1...31 {
-            c.text("\(d)", Rect(x: m + nameW + Double(d - 1) * colW + 1, y: top, width: colW - 1, height: headH), size: size)
+            c.text("\(d)", Rect(x: m + nameW + Double(d - 1) * colW, y: top, width: colW, height: headH), size: size,
+                   align: .center)
         }
         let bottom = top + headH + Double(rows) * rowH
         for i in 0...rows {

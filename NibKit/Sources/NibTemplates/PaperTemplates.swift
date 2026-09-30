@@ -95,10 +95,10 @@ struct PaperStyle {
     let label: RGBA
 
     init(_ params: [String: JSONValue]) {
-        let paper = TemplatePalette.parse(params["paper"]) ?? .white
+        let paper = TemplatePalette.parse(params[TemplateParamNames.paper]) ?? .white
         let preset = TemplatePalette.preset(matching: paper)
         let contrast = TemplatePalette.isDark(paper) ? RGBA(0xF4, 0xF4, 0xF1) : RGBA(0x1A, 0x1A, 0x1A)
-        let line = TemplatePalette.parse(params["line"]) ?? preset?.line ?? TemplatePalette.ruleColor(for: paper)
+        let line = TemplatePalette.parse(params[TemplateParamNames.line]) ?? preset?.line ?? TemplatePalette.ruleColor(for: paper)
         self.paper = paper
         self.line = line
         margin = preset.map { $0.margin ?? $0.line } ?? TemplatePalette.marginColor(for: paper)
@@ -110,7 +110,8 @@ struct PaperStyle {
 // MARK: - Op builder
 
 /// Collects page-coordinate `DisplayOp`s for one render. Every op is clipped to the page, so no template (built-in
-/// or with extreme params) ever draws outside it.
+/// or with extreme params) ever draws outside it. A region render (`TemplateDefinition.renderRegion`) draws its
+/// lattice ops (`latticeH`, `latticeV`, `latticeDots`) only inside `window`.
 struct TemplateCanvas {
     let width: Double
     let height: Double
@@ -118,14 +119,45 @@ struct TemplateCanvas {
     let scale: Double
     let params: [String: JSONValue]
     let style: PaperStyle
+    /// Where lattice ops go: the page for a whole-page render; for a region render the region, widened by `seam` on
+    /// every side so a line or dot on a tile edge is drawn by both tiles (each tile clips its own half).
+    let window: Rect
+    /// true: `window` is (part of) the page, so the page edges apply as in a whole-page render (no lattice line on the
+    /// page's top or left edge, no dot poking out of the page). false: a region that is not inside [0, size], i.e. a
+    /// tile of an infinite board in world coordinates: the lattice runs edge to edge, anchored at the origin.
+    let paged: Bool
     private(set) var ops: [DisplayOp] = []
 
-    init(params: [String: JSONValue], size: PageSize, scale: Double) {
+    /// Widening of a region render's window: more than half the widest lattice line and the largest dot radius.
+    static func seam(scale: Double) -> Double { 3 / scale }
+
+    init(params: [String: JSONValue], size: PageSize, scale: Double, region: Rect? = nil) {
         width = size.width.isFinite ? max(size.width, 1) : 1
         height = size.height.isFinite ? max(size.height, 1) : 1
         self.scale = scale.isFinite && scale > 0 ? scale : 1
         self.params = params
         style = PaperStyle(params)
+        let page = Rect(x: 0, y: 0, width: width, height: height)
+        guard let region = region else {
+            window = page
+            paged = true
+            return
+        }
+        guard [region.minX, region.minY, region.width, region.height].allSatisfy({ $0.isFinite }),
+              region.width > 0, region.height > 0 else {
+            window = Rect(x: 0, y: 0, width: 0, height: 0)
+            paged = true
+            return
+        }
+        let wide = region.insetBy(-TemplateCanvas.seam(scale: self.scale))
+        if page.insetBy(-1e-6).contains(region) {
+            let x0 = max(wide.minX, 0), y0 = max(wide.minY, 0)
+            window = Rect(x: x0, y: y0, width: min(wide.maxX, width) - x0, height: min(wide.maxY, height) - y0)
+            paged = true
+        } else {
+            window = wide
+            paged = false
+        }
     }
 
     var page: Rect { Rect(x: 0, y: 0, width: width, height: height) }
@@ -133,9 +165,15 @@ struct TemplateCanvas {
     /// Rules are 0.5 pt at zoom 1 and never thicker than 1 px on screen (DESIGN.md §3.6).
     var hairline: Double { min(0.5, 1 / scale) }
 
-    func number(_ name: String, _ fallback: Double, in range: ClosedRange<Double>) -> Double {
+    /// A numeric param clamped to `range` (render closures and metrics providers read params the same way).
+    static func number(_ params: [String: JSONValue], _ name: String, _ fallback: Double,
+                       in range: ClosedRange<Double>) -> Double {
         guard let v = params[name]?.doubleValue, v.isFinite else { return fallback }
         return min(max(v, range.lowerBound), range.upperBound)
+    }
+
+    func number(_ name: String, _ fallback: Double, in range: ClosedRange<Double>) -> Double {
+        TemplateCanvas.number(params, name, fallback, in: range)
     }
 
     func flag(_ name: String, _ fallback: Bool) -> Bool { params[name]?.boolValue ?? fallback }
@@ -176,27 +214,72 @@ struct TemplateCanvas {
         ops.append(DisplayOp(op: .dots, rect: inner, fill: color, spacing: spacing, radius: radius))
     }
 
+    /// The multiple of `spacing` at or below `v`: lattice ops start there, so their lines and dots sit at multiples of
+    /// the spacing from the page (or world) origin wherever the window is.
+    private static func floorToLattice(_ v: Double, _ spacing: Double) -> Double {
+        (v / spacing).rounded(.down) * spacing
+    }
+
+    /// Horizontal lines at every multiple of `spacing` from the origin inside `window` (window.minY < y ≤ window.maxY).
+    /// For a whole-page render this is `hlines(page, …)`.
+    mutating func latticeH(spacing: Double, color: RGBA? = nil, width w: Double? = nil) {
+        guard spacing >= 1, window.width > 0 else { return }
+        let y0 = TemplateCanvas.floorToLattice(window.minY, spacing)
+        guard y0 + spacing <= window.maxY else { return }
+        ops.append(DisplayOp(op: .hlines, rect: Rect(x: window.minX, y: y0, width: window.width, height: window.maxY - y0),
+                             stroke: color ?? style.line, width: w ?? hairline, spacing: spacing))
+    }
+
+    /// Vertical lines at every multiple of `spacing` from the origin inside `window` (window.minX < x ≤ window.maxX).
+    mutating func latticeV(spacing: Double, color: RGBA? = nil, width w: Double? = nil) {
+        guard spacing >= 1, window.height > 0 else { return }
+        let x0 = TemplateCanvas.floorToLattice(window.minX, spacing)
+        guard x0 + spacing <= window.maxX else { return }
+        ops.append(DisplayOp(op: .vlines, rect: Rect(x: x0, y: window.minY, width: window.maxX - x0, height: window.height),
+                             stroke: color ?? style.line, width: w ?? hairline, spacing: spacing))
+    }
+
+    /// Dots at every multiple of `spacing` from the origin inside `window`; on a page none pokes out of the page.
+    /// For a whole-page render this is `dots(page, …)`.
+    mutating func latticeDots(spacing: Double, radius: Double, color: RGBA) {
+        guard spacing >= 1, radius > 0, color.a > 0 else { return }
+        var maxX = window.maxX, maxY = window.maxY
+        if paged {
+            maxX = min(maxX, width - radius)
+            maxY = min(maxY, height - radius)
+        }
+        let x0 = TemplateCanvas.floorToLattice(window.minX, spacing)
+        let y0 = TemplateCanvas.floorToLattice(window.minY, spacing)
+        guard x0 + spacing <= maxX, y0 + spacing <= maxY else { return }
+        ops.append(DisplayOp(op: .dots, rect: Rect(x: x0, y: y0, width: maxX - x0, height: maxY - y0),
+                             fill: color, spacing: spacing, radius: radius))
+    }
+
     mutating func box(_ r: Rect, stroke: RGBA? = nil, fill: RGBA? = nil, width w: Double? = nil, radius: Double? = nil) {
         guard stroke != nil || fill != nil, let c = clip(r) else { return }
         ops.append(DisplayOp(op: .rect, rect: c, stroke: stroke, fill: fill, width: w ?? hairline, radius: radius))
     }
 
-    mutating func text(_ s: String, _ r: Rect, size: Double, color: RGBA? = nil) {
+    /// Printed text in `r`; `align` and `weight` default to natural alignment and the regular system weight.
+    mutating func text(_ s: String, _ r: Rect, size: Double, color: RGBA? = nil, align: ParagraphAlignment? = nil,
+                       weight: DisplayFontWeight? = nil) {
         guard !s.isEmpty, size > 0, let c = clip(r) else { return }
-        ops.append(DisplayOp(op: .text, rect: c, stroke: color ?? style.label, text: s, fontSize: size))
+        ops.append(DisplayOp(op: .text, rect: c, stroke: color ?? style.label, text: s, fontSize: size,
+                             align: align, weight: weight))
     }
 }
 
 // MARK: - Definitions and parameters
 
 enum ParamSpec {
-    static let paper = TemplateParam(name: "paper", title: "Paper colour", kind: "color")
-    static let line = TemplateParam(name: "line", title: "Line colour", kind: "color")
-    static let margin = TemplateParam(name: "margin", title: "Margin", kind: "number", minimum: 0, maximum: 300)
+    static let paper = TemplateParam(name: TemplateParamNames.paper, title: "Paper colour", kind: "color")
+    static let line = TemplateParam(name: TemplateParamNames.line, title: "Line colour", kind: "color")
+    static let margin = TemplateParam(name: TemplateParamNames.margin, title: "Margin", kind: "number",
+                                      minimum: 0, maximum: 300)
     static let startMonday = TemplateParam(name: "startMonday", title: "Week starts Monday", kind: "bool")
 
     static func spacing(_ min: Double, _ max: Double) -> TemplateParam {
-        TemplateParam(name: "spacing", title: "Spacing", kind: "number", minimum: min, maximum: max)
+        TemplateParam(name: TemplateParamNames.spacing, title: "Spacing", kind: "number", minimum: min, maximum: max)
     }
 
     static func staves(_ max: Double) -> TemplateParam {
@@ -204,20 +287,74 @@ enum ParamSpec {
     }
 }
 
+/// `TemplateDefinition.metricsProvider`: params arrive merged over the template's defaults.
+typealias MetricsProvider = (_ params: [String: JSONValue], _ size: PageSize?) -> TemplateMetrics
+
 enum TemplateFactory {
     /// A paper template: `defaults` always include `paper` (white); `line` has no default because it follows the paper.
+    /// `regional` templates also get `renderRegion` (the same drawing, limited to the region: see `TemplateCanvas`);
+    /// `metrics` is the template's `metricsProvider` (nil = derived from its spacing / margin params).
     static func paper(_ id: String, _ title: String, category: String, order: Int, params: [TemplateParam],
-                      defaults: [String: JSONValue] = [:], zoomReturnHeight: Double? = nil,
+                      defaults: [String: JSONValue] = [:], zoomReturnHeight: Double? = nil, regional: Bool = false,
+                      metrics: MetricsProvider? = nil,
                       draw: @escaping (inout TemplateCanvas) -> Void) -> TemplateDefinition {
-        var base: [String: JSONValue] = ["paper": .string(RGBA.white.hex)]
+        var base: [String: JSONValue] = [TemplateParamNames.paper: .string(RGBA.white.hex)]
         for (k, v) in defaults { base[k] = v }
         let resolved = base
-        return TemplateDefinition(id: id, title: title, category: category, isCover: false, order: order,
-                                  owner: templatesOwner, params: params, defaults: resolved,
-                                  zoomReturnHeight: zoomReturnHeight) { given, size, scale in
-            var canvas = TemplateCanvas(params: resolved.merging(given) { _, new in new }, size: size, scale: scale)
+        let run: (_ given: [String: JSONValue], _ size: PageSize, _ scale: Double, _ region: Rect?) -> TemplateRender = {
+            given, size, scale, region in
+            var canvas = TemplateCanvas(params: resolved.merging(given) { _, new in new }, size: size, scale: scale,
+                                        region: region)
             draw(&canvas)
             return TemplateRender(paper: canvas.style.paper, display: DisplayList(ops: canvas.ops))
+        }
+        var def = TemplateDefinition(id: id, title: title, category: category, isCover: false, order: order,
+                                     owner: templatesOwner, params: params, defaults: resolved,
+                                     zoomReturnHeight: zoomReturnHeight) { given, size, scale in
+            run(given, size, scale, nil)
+        }
+        if regional { def.renderRegion = { given, size, scale, region in run(given, size, scale, region) } }
+        def.metricsProvider = metrics
+        return def
+    }
+}
+
+// MARK: - Metrics
+
+/// `TemplateMetrics` of the built-in papers whose layout the spacing / margin params alone do not describe.
+enum PaperMetrics {
+    /// A square lattice (dots, grid lines) anchored at the page origin; `period` cells per repeat (graph paper's
+    /// heavier line every fifth cell repeats every 5 cells).
+    static func lattice(_ fallback: Double, in range: ClosedRange<Double>, period: Double = 1) -> MetricsProvider {
+        { p, _ in
+            let s = TemplateCanvas.number(p, TemplateParamNames.spacing, fallback, in: range)
+            return TemplateMetrics(spacing: s, repeatPeriod: PageSize(s * period, s * period))
+        }
+    }
+
+    /// Rows of writing lines (`spacing` apart) under a header or beside columns: a pitch, but no page-wide period.
+    static func rows(_ fallback: Double, in range: ClosedRange<Double>, pitch: Double = 1) -> MetricsProvider {
+        { p, _ in TemplateMetrics(spacing: TemplateCanvas.number(p, TemplateParamNames.spacing, fallback, in: range) * pitch) }
+    }
+
+    /// Ruled paper (`Layout.ruled`, legal pad): the rule pitch and the writing area, from the top of the first
+    /// writing line to the last rule and right of the margin line (0 = none). Not periodic: the header band and the
+    /// margin line appear once.
+    /// `firstRule(spacing)` is the y of the first rule; `marginWidth` is added right of a margin line (legal pad: 3).
+    static func ruled(spacing fallback: Double, margin fallbackMargin: Double, marginWidth: Double = 0,
+                      firstRule: @escaping (Double) -> Double) -> MetricsProvider {
+        { p, size in
+            let s = TemplateCanvas.number(p, TemplateParamNames.spacing, fallback, in: 12...60)
+            let m = TemplateCanvas.number(p, TemplateParamNames.margin, fallbackMargin, in: 0...300)
+            let firstRule = firstRule(s)
+            var bottom = s * 0.5
+            if let h = size?.height, h.isFinite, h > firstRule {
+                // Rules sit at firstRule + k·s up to h - s/2 (see `Layout.ruled`).
+                let last = firstRule + ((h - s * 0.5 - firstRule) / s).rounded(.down) * s
+                bottom = max(h - last, 0)
+            }
+            let left = m > 0 && m < (size?.width ?? .infinity) ? m + marginWidth : 0
+            return TemplateMetrics(spacing: s, margins: PageInsets(top: max(firstRule - s, 0), left: left, bottom: bottom, right: 0))
         }
     }
 }
@@ -240,7 +377,7 @@ enum Layout {
 
     /// A small section label; returns the y below it.
     static func section(_ c: inout TemplateCanvas, _ label: String, x: Double, y: Double, width: Double) -> Double {
-        c.text(label, Rect(x: x, y: y, width: width, height: 14), size: 10)
+        c.text(label, Rect(x: x, y: y, width: width, height: 14), size: 10, weight: .medium)
         return y + 16
     }
 
@@ -287,40 +424,48 @@ enum PaperTemplates {
 
     // Essentials
 
-    static let blank = TemplateFactory.paper("builtin.blank", "Blank", category: "Essentials", order: 100,
+    static let blank = TemplateFactory.paper(TemplateIDs.blank, "Blank", category: "Essentials", order: 100,
                                              params: [ParamSpec.paper]) { _ in }
 
-    static let dots = TemplateFactory.paper("builtin.dots", "Dot Grid", category: "Essentials", order: 110,
+    static let dots = TemplateFactory.paper(TemplateIDs.dots, "Dot Grid", category: "Essentials", order: 110,
                                             params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(4, 60)],
-                                            defaults: ["spacing": .number(5 * mm)]) { c in
-        let s = c.number("spacing", 5 * mm, in: 4...60)
+                                            defaults: [TemplateParamNames.spacing: .number(5 * mm)],
+                                            metrics: PaperMetrics.lattice(5 * mm, in: 4...60)) { c in
+        let s = c.number(TemplateParamNames.spacing, 5 * mm, in: 4...60)
         c.dots(c.page, spacing: s, radius: min(0.9, 1.8 / c.scale), color: c.style.strong)
     }
 
-    static let grid = TemplateFactory.paper("builtin.grid", "Grid", category: "Essentials", order: 120,
+    static let grid = TemplateFactory.paper(TemplateIDs.grid, "Grid", category: "Essentials", order: 120,
                                             params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(4, 60)],
-                                            defaults: ["spacing": .number(5 * mm)]) { c in
-        let s = c.number("spacing", 5 * mm, in: 4...60)
+                                            defaults: [TemplateParamNames.spacing: .number(5 * mm)],
+                                            metrics: PaperMetrics.lattice(5 * mm, in: 4...60)) { c in
+        let s = c.number(TemplateParamNames.spacing, 5 * mm, in: 4...60)
         c.hlines(c.page, spacing: s)
         c.vlines(c.page, spacing: s)
     }
 
     /// Engineering graph paper: a minor grid with a heavier line every fifth cell.
-    static let graph = TemplateFactory.paper("builtin.graph", "Graph Paper", category: "Essentials", order: 130,
+    static let graph = TemplateFactory.paper(TemplateIDs.graph, "Graph Paper", category: "Essentials", order: 130,
                                              params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(2, 30)],
-                                             defaults: ["spacing": .number(5 * mm)]) { c in
-        let s = c.number("spacing", 5 * mm, in: 2...30)
+                                             defaults: [TemplateParamNames.spacing: .number(5 * mm)],
+                                             metrics: PaperMetrics.lattice(5 * mm, in: 2...30, period: 5)) { c in
+        let s = c.number(TemplateParamNames.spacing, 5 * mm, in: 2...30)
         c.hlines(c.page, spacing: s)
         c.vlines(c.page, spacing: s)
         c.hlines(c.page, spacing: s * 5, color: c.style.strong, width: c.hairline * 1.5)
         c.vlines(c.page, spacing: s * 5, color: c.style.strong, width: c.hairline * 1.5)
     }
 
-    /// Triangular lattice: vertical lines plus two families at ±30°, sharing intersections.
-    static let isometric = TemplateFactory.paper("builtin.isometric", "Isometric", category: "Essentials", order: 140,
+    /// Triangular lattice: vertical lines plus two families at ±30°, sharing intersections. It repeats every
+    /// spacing·√3 across and every spacing down, and has no square grid to snap to.
+    static let isometric = TemplateFactory.paper(TemplateIDs.isometric, "Isometric", category: "Essentials", order: 140,
                                                  params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(8, 60)],
-                                                 defaults: ["spacing": .number(7 * mm)]) { c in
-        let a = c.number("spacing", 7 * mm, in: 8...60)
+                                                 defaults: [TemplateParamNames.spacing: .number(7 * mm)],
+                                                 metrics: { p, _ in
+        let a = TemplateCanvas.number(p, TemplateParamNames.spacing, 7 * mm, in: 8...60)
+        return TemplateMetrics(repeatPeriod: PageSize(a * 3.0.squareRoot(), a))
+    }) { c in
+        let a = c.number(TemplateParamNames.spacing, 7 * mm, in: 8...60)
         let t = tan(Double.pi / 6)
         let w = c.width, h = c.height
         c.vlines(c.page, spacing: a * 3.0.squareRoot() / 2)
@@ -360,31 +505,43 @@ enum PaperTemplates {
 
     // Writing
 
-    static let ruledNarrow = TemplateFactory.paper("builtin.ruledNarrow", "Narrow Ruled", category: "Writing", order: 200,
-                                                   params: lined, defaults: ["spacing": 20, "margin": 0],
-                                                   zoomReturnHeight: 20) { c in
-        Layout.ruled(&c, spacing: c.number("spacing", 20, in: 12...60), margin: c.number("margin", 0, in: 0...300))
+    /// First rule of `Layout.ruled`: below a header band of three lines.
+    static func ruledFirstRule(_ s: Double) -> Double { max(s * 3, 36) }
+
+    static let ruledNarrow = TemplateFactory.paper(
+        TemplateIDs.ruledNarrow, "Narrow Ruled", category: "Writing", order: 200, params: lined,
+        defaults: [TemplateParamNames.spacing: 20, TemplateParamNames.margin: 0], zoomReturnHeight: 20,
+        metrics: PaperMetrics.ruled(spacing: 20, margin: 0, firstRule: ruledFirstRule)) { c in
+        Layout.ruled(&c, spacing: c.number(TemplateParamNames.spacing, 20, in: 12...60),
+                     margin: c.number(TemplateParamNames.margin, 0, in: 0...300))
     }
 
     /// The default paper (`NibSettings.defaultPaper`).
-    static let ruledCollege = TemplateFactory.paper("builtin.ruled", "College Ruled", category: "Writing", order: 210,
-                                                    params: lined, defaults: ["spacing": 24.7, "margin": .number(25 * mm)],
-                                                    zoomReturnHeight: 24.7) { c in
-        Layout.ruled(&c, spacing: c.number("spacing", 24.7, in: 12...60), margin: c.number("margin", 25 * mm, in: 0...300))
+    static let ruledCollege = TemplateFactory.paper(
+        TemplateIDs.ruled, "College Ruled", category: "Writing", order: 210, params: lined,
+        defaults: [TemplateParamNames.spacing: 24.7, TemplateParamNames.margin: .number(25 * mm)], zoomReturnHeight: 24.7,
+        metrics: PaperMetrics.ruled(spacing: 24.7, margin: 25 * mm, firstRule: ruledFirstRule)) { c in
+        Layout.ruled(&c, spacing: c.number(TemplateParamNames.spacing, 24.7, in: 12...60),
+                     margin: c.number(TemplateParamNames.margin, 25 * mm, in: 0...300))
     }
 
-    static let ruledWide = TemplateFactory.paper("builtin.ruledWide", "Wide Ruled", category: "Writing", order: 220,
-                                                 params: lined, defaults: ["spacing": .number(10 * mm), "margin": 0],
-                                                 zoomReturnHeight: 10 * mm) { c in
-        Layout.ruled(&c, spacing: c.number("spacing", 10 * mm, in: 12...60), margin: c.number("margin", 0, in: 0...300))
+    static let ruledWide = TemplateFactory.paper(
+        TemplateIDs.ruledWide, "Wide Ruled", category: "Writing", order: 220, params: lined,
+        defaults: [TemplateParamNames.spacing: .number(10 * mm), TemplateParamNames.margin: 0], zoomReturnHeight: 10 * mm,
+        metrics: PaperMetrics.ruled(spacing: 10 * mm, margin: 0, firstRule: ruledFirstRule)) { c in
+        Layout.ruled(&c, spacing: c.number(TemplateParamNames.spacing, 10 * mm, in: 12...60),
+                     margin: c.number(TemplateParamNames.margin, 0, in: 0...300))
     }
 
-    /// Yellow legal pad: rules, a double header rule and a double margin line.
-    static let legalPad = TemplateFactory.paper("builtin.legalPad", "Legal Pad", category: "Writing", order: 230,
-                                                params: lined,
-                                                defaults: ["paper": .string(RGBA.paperYellow.hex), "spacing": 24.7, "margin": 88],
-                                                zoomReturnHeight: 24.7) { c in
-        let s = c.number("spacing", 24.7, in: 12...60), m = c.number("margin", 88, in: 0...300)
+    /// Yellow legal pad: rules, a double header rule and a double margin line (3 pt apart).
+    static let legalPad = TemplateFactory.paper(
+        TemplateIDs.legalPad, "Legal Pad", category: "Writing", order: 230, params: lined,
+        defaults: [TemplateParamNames.paper: .string(RGBA.paperYellow.hex), TemplateParamNames.spacing: 24.7,
+                   TemplateParamNames.margin: 88],
+        zoomReturnHeight: 24.7,
+        metrics: PaperMetrics.ruled(spacing: 24.7, margin: 88, marginWidth: 3) { $0 * 5 }) { c in
+        let s = c.number(TemplateParamNames.spacing, 24.7, in: 12...60)
+        let m = c.number(TemplateParamNames.margin, 88, in: 0...300)
         let top = s * 4
         c.hlines(Rect(x: 0, y: top, width: c.width, height: c.height - top - s * 0.5), spacing: s)
         c.line(0, top - s * 0.4, c.width, top - s * 0.4, color: c.style.strong)
@@ -396,10 +553,12 @@ enum PaperTemplates {
     }
 
     /// Handwriting practice: top line, dashed midline and baseline per row (row pitch 1.5 × spacing).
-    static let handwriting = TemplateFactory.paper("builtin.handwriting", "Handwriting Practice", category: "Writing",
-                                                   order: 240, params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(18, 80)],
-                                                   defaults: ["spacing": 36], zoomReturnHeight: 54) { c in
-        let s = c.number("spacing", 36, in: 18...80)
+    static let handwriting = TemplateFactory.paper(
+        "builtin.handwriting", "Handwriting Practice", category: "Writing", order: 240,
+        params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(18, 80)],
+        defaults: [TemplateParamNames.spacing: 36], zoomReturnHeight: 54,
+        metrics: PaperMetrics.rows(36, in: 18...80, pitch: 1.5)) { c in
+        let s = c.number(TemplateParamNames.spacing, 36, in: 18...80)
         let side = Layout.margin(c) * 0.6
         var y = Layout.margin(c) + s * 0.5
         while y + s <= c.height - side {
@@ -411,10 +570,12 @@ enum PaperTemplates {
     }
 
     /// Cornell notes: header, cue column, notes and a summary band.
-    static let cornell = TemplateFactory.paper("builtin.cornell", "Cornell Notes", category: "Writing", order: 250,
-                                               params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(12, 60)],
-                                               defaults: ["spacing": 24.7], zoomReturnHeight: 24.7) { c in
-        let s = c.number("spacing", 24.7, in: 12...60)
+    static let cornell = TemplateFactory.paper(
+        TemplateIDs.cornell, "Cornell Notes", category: "Writing", order: 250,
+        params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(12, 60)],
+        defaults: [TemplateParamNames.spacing: 24.7], zoomReturnHeight: 24.7,
+        metrics: PaperMetrics.rows(24.7, in: 12...60)) { c in
+        let s = c.number(TemplateParamNames.spacing, 24.7, in: 12...60)
         let header = max(s * 3, 36), summary = c.height * 0.2
         let cue = c.width * 0.3
         let bold = c.hairline * 2
@@ -423,30 +584,38 @@ enum PaperTemplates {
         c.line(0, header, c.width, header, color: c.style.strong, width: bold)
         c.line(cue, header, cue, c.height - summary, color: c.style.strong, width: bold)
         c.line(0, c.height - summary, c.width, c.height - summary, color: c.style.strong, width: bold)
-        c.text(String(localized: "Cues"), Rect(x: 8, y: header + 3, width: cue - 16, height: 12), size: 8)
-        c.text(String(localized: "Notes"), Rect(x: cue + 8, y: header + 3, width: c.width - cue - 16, height: 12), size: 8)
-        c.text(String(localized: "Summary"), Rect(x: 8, y: c.height - summary + 3, width: c.width - 16, height: 12), size: 8)
+        c.text(String(localized: "Cues"), Rect(x: 8, y: header + 3, width: cue - 16, height: 12), size: 8, weight: .medium)
+        c.text(String(localized: "Notes"), Rect(x: cue + 8, y: header + 3, width: c.width - cue - 16, height: 12), size: 8,
+               weight: .medium)
+        c.text(String(localized: "Summary"), Rect(x: 8, y: c.height - summary + 3, width: c.width - 16, height: 12), size: 8,
+               weight: .medium)
     }
 
-    static let checklist = TemplateFactory.paper("builtin.checklist", "Checklist", category: "Writing", order: 260,
-                                                 params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(18, 60)],
-                                                 defaults: ["spacing": 28], zoomReturnHeight: 28) { c in
-        let s = c.number("spacing", 28, in: 18...60)
+    static let checklist = TemplateFactory.paper(
+        "builtin.checklist", "Checklist", category: "Writing", order: 260,
+        params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(18, 60)],
+        defaults: [TemplateParamNames.spacing: 28], zoomReturnHeight: 28,
+        metrics: PaperMetrics.rows(28, in: 18...60)) { c in
+        let s = c.number(TemplateParamNames.spacing, 28, in: 18...60)
         let m = Layout.margin(c)
         Layout.checkRows(&c, Rect(x: m, y: s * 1.5, width: c.width - 2 * m, height: c.height - s * 2), spacing: s)
     }
 
     /// To-do list: title and date, a task column with checkboxes and a Due column.
-    static let todo = TemplateFactory.paper("builtin.todo", "To-Do List", category: "Writing", order: 270,
-                                            params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(18, 60)],
-                                            defaults: ["spacing": 28], zoomReturnHeight: 28) { c in
-        let s = c.number("spacing", 28, in: 18...60)
+    static let todo = TemplateFactory.paper(
+        "builtin.todo", "To-Do List", category: "Writing", order: 270,
+        params: [ParamSpec.paper, ParamSpec.line, ParamSpec.spacing(18, 60)],
+        defaults: [TemplateParamNames.spacing: 28], zoomReturnHeight: 28,
+        metrics: PaperMetrics.rows(28, in: 18...60)) { c in
+        let s = c.number(TemplateParamNames.spacing, 28, in: 18...60)
         let m = Layout.margin(c)
-        c.text(String(localized: "To do"), Rect(x: m, y: m - 6, width: c.width * 0.5 - m, height: 30), size: 22)
+        c.text(String(localized: "To do"), Rect(x: m, y: m - 6, width: c.width * 0.5 - m, height: 30), size: 22,
+               weight: .semibold)
         Layout.field(&c, String(localized: "Date"), x: c.width * 0.55, y: m + 4, to: c.width - m)
         let top = m + 40
         let dueX = c.width - m - (c.width - 2 * m) * 0.2
-        c.text(String(localized: "Due"), Rect(x: dueX + 6, y: top, width: c.width - m - dueX - 6, height: 14), size: 9)
+        c.text(String(localized: "Due"), Rect(x: dueX + 6, y: top, width: c.width - m - dueX - 6, height: 14), size: 9,
+               weight: .medium)
         c.line(m, top + 18, c.width - m, top + 18, color: c.style.strong, width: c.hairline * 2)
         let rows = Rect(x: m, y: top + 18, width: dueX - m - 6, height: c.height - m - top - 18)
         Layout.checkRows(&c, rows, spacing: s)

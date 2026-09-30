@@ -7,7 +7,7 @@ import NibContracts
 enum CoverTemplates {
     static let all: [TemplateDefinition] = [solid, band, stripes, dots, kraft, grid, frame, split]
 
-    static let colorParam = TemplateParam(name: "color", title: "Cover colour", kind: "color")
+    static let colorParam = TemplateParam(name: TemplateParamNames.color, title: "Cover colour", kind: "color")
 
     static func cloth(_ name: String) -> RGBA {
         TemplatePalette.cloths.first { $0.name == name }?.color ?? TemplatePalette.kraft
@@ -20,11 +20,11 @@ enum CoverTemplates {
 
     static func cover(_ id: String, _ title: String, order: Int, cloth: RGBA,
                       draw: @escaping (inout TemplateCanvas, RGBA) -> Void) -> TemplateDefinition {
-        let base: [String: JSONValue] = ["color": .string(cloth.hex)]
+        let base: [String: JSONValue] = [TemplateParamNames.color: .string(cloth.hex)]
         return TemplateDefinition(id: id, title: title, category: "Covers", isCover: true, order: order,
                                   owner: templatesOwner, params: [colorParam], defaults: base) { given, size, scale in
             let merged = base.merging(given) { _, new in new }
-            let color = TemplatePalette.parse(merged["color"]) ?? cloth
+            let color = TemplatePalette.parse(merged[TemplateParamNames.color]) ?? cloth
             var c = TemplateCanvas(params: merged, size: size, scale: scale)
             draw(&c, color)
             // The spine goes on last so no decoration ever covers it.

@@ -8,7 +8,6 @@ public enum NibTemplatesFeature: NibFeature {
 
     public static func register(_ app: NibApp) {
         for t in BuiltinTemplates.all { app.content.templates.register(t) }
-        app.services.set(app.content.templates, for: TemplateCommands.registryKey)
         app.commands.register(TemplateList.self)
         app.commands.register(PageSetTemplate.self)
         app.commands.register(PageSetBackground.self)
