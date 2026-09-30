@@ -3,29 +3,19 @@ import os
 import NibContracts
 import NibDesign
 
-/// Events this feature emits on `app.events`.
-enum ShapeRecognitionEvents {
-    /// A stroke snapped to a shape (on lift or with Draw and Hold). Payload `{page, shape, point}`, `point` being
-    /// `[x, y]` in page points where the Pencil was. The Apple Pencil hardware feature can answer it with the Pencil
-    /// Pro snap haptic at that point (T-117); `UICanvasFeedbackGenerator` belongs there.
-    static let snapped = "shape.snapped"
-}
-
 /// The "drawShape" canvas tool (T-046, key D), AutoShape: it captures pen ink with PencilKit, and when the Pencil
 /// lifts the stroke is recognised and replaced by a clean shape made with `shape.create`, drawn with the pen look
 /// (`drawnWith`). A stroke that is not a shape stays as ink. Holding still at the end snaps at once and lets the
 /// Pencil scale and turn the shape until it lifts (Draw and Hold, T-013 / T-101); with Require Hold to Snap only held
 /// strokes convert. Line ends near other shapes join or snap to them (T-014). A snap plays the snap haptic, emits
-/// `shape.snapped` (T-117) and is announced to VoiceOver.
+/// `shape.snapped` (`ShapeSnappedPayload`, which the Pencil Hardware feature answers with the Pencil Pro haptic,
+/// T-117) and is announced to VoiceOver.
 @MainActor
 final class DrawShapeTool: CanvasTool {
     static let toolID = "drawShape"
     /// The D shortcut (canvas scope) that selects the tool.
     static let keyCommandID = "shaperec.drawShape"
     static let log = Logger(subsystem: "app.nib", category: "shaperec")
-    /// How long the clean preview outlives its commit, so the dry tile lands before the preview goes.
-    /// ponytail: a fixed hand-off; a "tile landed" callback on CanvasHost would make it exact.
-    static let previewHandOff: UInt64 = 300_000_000
 
     let id = DrawShapeTool.toolID
     let inputMode = CanvasInputMode.pencilKit
@@ -70,7 +60,7 @@ final class DrawShapeTool: CanvasTool {
             return
         }
         let settings = host.app.settings
-        let holdOnly = settings.get(ShapeSettings.drawAndHold) && settings.get(ShapeSettings.requireHoldToSnap)
+        let holdOnly = settings.get(NibSettings.drawAndHold) && settings.get(ShapeSettings.requireHoldToSnap)
         guard !holdOnly, let shape = recognise(stroke) else {
             host.commitStroke(stroke, page: page)
             return
@@ -85,7 +75,7 @@ final class DrawShapeTool: CanvasTool {
     // MARK: Draw and Hold
 
     func strokeHeld(_ stroke: Stroke, page: PageID, host: CanvasHost) -> Bool {
-        guard hold == nil, host.app.settings.get(ShapeSettings.drawAndHold), let shape = recognise(stroke) else {
+        guard hold == nil, host.app.settings.get(NibSettings.drawAndHold), let shape = recognise(stroke) else {
             return false
         }
         let grab = stroke.points.last?.location ?? shape.frame.center
@@ -141,19 +131,19 @@ final class DrawShapeTool: CanvasTool {
         return ShapeSnapper.snap(shape, to: neighbours)
     }
 
-    /// The snap haptic (heard once the Pencil is up; see `Hold.hapticPending`), the `shape.snapped` event with the page
-    /// point where the Pencil was, for the Pencil Pro haptic.
+    /// The snap haptic (heard once the Pencil is up; see `Hold.hapticPending`), and `shape.snapped` with the page point
+    /// where the Pencil was, so the Pencil Hardware feature plays the Pencil Pro haptic there while the Pencil is down.
     private func didSnap(_ shape: ShapeItem, at point: Point, page: PageID, host: CanvasHost) {
         NibHaptics.play(.snap)
-        host.app.events.emit(ShapeRecognitionEvents.snapped, doc: host.documentID,
-                             payload: ["page": .string(NodeRef.page(host.documentID, page).description),
-                                       "shape": .string(shape.shape.rawValue),
-                                       "point": [.number(point.x), .number(point.y)]])
+        host.app.events.emit(ShapeSnappedPayload(page: NodeRef.page(host.documentID, page).description,
+                                                 shape: shape.shape.rawValue, point: point,
+                                                 session: host.session.id.raw),
+                             doc: host.documentID)
     }
 
-    /// Creates the shape as one undo step, then retires the preview. When nothing could be created the stroke is
-    /// committed as ink (through the canvas, or straight through `ink.addStrokes` when the canvas has closed meanwhile),
-    /// so a drawing is never lost.
+    /// Creates the shape as one undo step, then retires the preview once the page's dry tiles show what was committed
+    /// (`afterNextRender`), so nothing flickers. When nothing could be created the stroke is committed as ink (through
+    /// the canvas, or straight through `ink.addStrokes` when the canvas has closed meanwhile), so a drawing is never lost.
     private func commit(_ result: SnapResult, plain: ShapeItem, page: PageID, stroke: Stroke, host: CanvasHost) {
         let layer = preview
         preview = nil
@@ -166,8 +156,11 @@ final class DrawShapeTool: CanvasTool {
             } else {
                 await ShapeCommit.keepInk(stroke, doc: doc, page: page, app: app, session: session)
             }
-            try? await Task.sleep(nanoseconds: DrawShapeTool.previewHandOff)
-            layer?.removeFromSuperlayer()
+            guard let host else {
+                layer?.removeFromSuperlayer()
+                return
+            }
+            host.afterNextRender(page: page) { layer?.removeFromSuperlayer() }
         }
     }
 
@@ -210,7 +203,7 @@ final class DrawShapeTool: CanvasTool {
 }
 
 /// How a recognised shape becomes document content: the tool's look, the `shape.create` call, and the undo step that
-/// also turns a tilted box and removes merged neighbours.
+/// also removes merged neighbours.
 enum ShapeCommit {
     /// The shape in the look of the ink that drew it: its colour, width and pattern, no fill, sharp corners.
     static func styled(_ s: ShapeItem, ink: InkStyle) -> ShapeItem {
@@ -220,23 +213,23 @@ enum ShapeCommit {
         return out
     }
 
-    /// `shape.create {page, shape, frame | points, style}`. Frames go as an upright `[x, y, w, h]` (ARCHITECTURE §6.1);
-    /// a tilted box is turned afterwards with `item.transform`.
+    /// `shape.create {page, shape, frame | points, style}`. A box goes as its frame, `[x, y, w, h]` plus the rotation
+    /// in radians about the centre when it is tilted (`Frame.array`, ARCHITECTURE §6.1); other shapes go as their
+    /// control points.
     static func createParams(_ s: ShapeItem, page: String) -> JSONValue {
         var o: [String: JSONValue] = ["page": .string(page), "shape": .string(s.shape.rawValue)]
         o["style"] = (try? JSONValue.from(s.style)) ?? .null
         if ShapeGeometry.isBox(s) {
-            let f = s.frame
-            o["frame"] = .array([.number(f.x), .number(f.y), .number(f.w), .number(f.h)])
+            o["frame"] = .array(s.frame.array.map { JSONValue.number($0) })
         } else {
             o["points"] = .array(s.points.map { JSONValue.array([.number($0.x), .number($0.y)]) })
         }
         return .object(o)
     }
 
-    /// Creates the shape, turns a tilted box, then deletes the merged neighbours, all in one undo group. Creating comes
-    /// first so that nothing has been removed when it fails: the caller then keeps the stroke as ink. A failed delete
-    /// leaves the neighbours beside the new shape (nothing is lost). Returns the shape made, or nil when none was.
+    /// Creates the shape, then deletes the merged neighbours, in one undo group. Creating comes first so that nothing
+    /// has been removed when it fails: the caller then keeps the stroke as ink. A failed delete leaves the neighbours
+    /// beside the new shape (nothing is lost). Returns the shape made, or nil when none was.
     @MainActor
     static func create(_ result: SnapResult, plain: ShapeItem, doc: DocumentID, page: PageID, app: NibApp,
                        session: EditorSession) async -> ShapeItem? {
@@ -252,23 +245,11 @@ enum ShapeCommit {
         // Without item.delete the neighbours cannot be merged away, so the shape is made as drawn.
         let merging = !result.mergeWith.isEmpty && app.commands.entry(CommandIDs.itemDelete) != nil
         let shape = result.mergeWith.isEmpty || merging ? result.shape : plain
-        let value: JSONValue
         do {
-            value = try await call(CommandIDs.shapeCreate, createParams(shape, page: NodeRef.page(doc, page).description))
+            _ = try await call(CommandIDs.shapeCreate, createParams(shape, page: NodeRef.page(doc, page).description))
         } catch {
             DrawShapeTool.log.error("shape.create failed, keeping the stroke: \(String(describing: error), privacy: .public)")
             return nil
-        }
-        if ShapeGeometry.isBox(shape), shape.frame.rotation != 0, let ref = value["ref"]?.stringValue,
-           app.commands.entry(CommandIDs.itemTransform) != nil {
-            let c = shape.frame.center
-            do {
-                _ = try await call(CommandIDs.itemTransform, ["refs": [.string(ref)],
-                                                               "rotate": .number(shape.frame.rotation * 180 / Double.pi),
-                                                               "origin": [.number(c.x), .number(c.y)]])
-            } catch {
-                DrawShapeTool.log.error("turning the shape failed: \(String(describing: error), privacy: .public)")
-            }
         }
         if merging {
             do {

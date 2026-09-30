@@ -1,16 +1,14 @@
 import Foundation
 import NibContracts
 
-/// Shape-recognition settings (P-040, T-014). Synced: they are preferences that follow the library. The pen and
-/// pencil (F007) read `shapes.drawAndHold` for their own Draw and Hold.
+/// Shape-recognition settings (P-040, T-014). Synced: they are preferences that follow the library. Draw and Hold is
+/// `NibSettings.drawAndHold` ("shapes.drawAndHold"): the contracts declare it, since the pen, pencil and highlighter
+/// read it too; this feature owns the behaviour and declares only the two Draw Shape settings below.
 enum ShapeSettings {
-    static let drawAndHold = SettingKey("shapes.drawAndHold", default: true, synced: true)
     static let snapToOtherShapes = SettingKey("shapes.snapToOtherShapes", default: true, synced: true)
     static let requireHoldToSnap = SettingKey("shapes.requireHoldToSnap", default: false, synced: true)
 
     static func declare(in settings: SettingsStore, owner: String) {
-        settings.declare(drawAndHold, summary: "Draw and Hold: pause at the end of a stroke to snap it to a shape (pen, pencil, Draw Shape).",
-                         owner: owner, schema: .bool())
         settings.declare(snapToOtherShapes, summary: "Snap to Other Shapes: join line ends that land within 12 pt of another shape.",
                          owner: owner, schema: .bool())
         settings.declare(requireHoldToSnap, summary: "Require Hold to Snap: Draw Shape converts only strokes held at the end, not on lift.",
@@ -19,33 +17,58 @@ enum ShapeSettings {
 }
 
 /// `shape.recognize {points, neighbors?}` (read): the recogniser behind Draw and Hold, AutoShape and the AI.
-/// Returns the ShapeItem fields (so the value decodes as a `ShapeItem`) plus `confidence` and `mergeWith`, or null
-/// when the stroke is not a shape. With neighbours and Snap to Other Shapes on, line ends join or snap to them.
+/// Returns `{shape: ShapeItem?, confidence?, mergeWith?: [ref]}` (ARCHITECTURE §6.5): `shape` is the whole ShapeItem
+/// (control points, frame, style) or null when the stroke is not a shape. With neighbours and Snap to Other Shapes on,
+/// line ends join or snap to them, and `mergeWith` lists the neighbours joined in, which the caller deletes in the
+/// same undo group as its `shape.create`.
 struct ShapeRecognizeCommand: NibCommand {
-    typealias Output = Recognized?
-
     struct Params: Codable {
         var points: [Point]
         /// A page ref (every shape on it), or an array of item refs and/or ShapeItem objects carrying an `id`.
         var neighbors: JSONValue?
     }
 
-    struct Recognized: Codable, Equatable {
-        var shape: ShapeKind
-        var frame: Frame
-        var points: [Point]
-        var style: ShapeItemStyle
-        /// 0…1, how comfortably the stroke passed its shape's error threshold.
-        var confidence: Double
-        /// Neighbours joined into this shape (refs, or the ids given with inline shapes); delete them when you create it.
-        var mergeWith: [String]
+    struct Output: Codable, Equatable {
+        /// The clean shape, or nil (encoded as `null`) when nothing matched.
+        var shape: ShapeItem?
+        /// 0…1, how comfortably the stroke passed its shape's error threshold. Present with a shape.
+        var confidence: Double?
+        /// Neighbours joined into this shape (refs, or the ids given with inline shapes); delete them when you create
+        /// it. Present with a shape (empty when nothing was joined).
+        var mergeWith: [String]?
+
+        static var noShape: Output { Output(shape: nil, confidence: nil, mergeWith: nil) }
+
+        enum CodingKeys: String, CodingKey { case shape, confidence, mergeWith }
+
+        init(shape: ShapeItem?, confidence: Double?, mergeWith: [String]?) {
+            self.shape = shape
+            self.confidence = confidence
+            self.mergeWith = mergeWith
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            shape = try c.decodeIfPresent(ShapeItem.self, forKey: .shape)
+            confidence = try c.decodeIfPresent(Double.self, forKey: .confidence)
+            mergeWith = try c.decodeIfPresent([String].self, forKey: .mergeWith)
+        }
+
+        /// `shape` is always written, as `null` when nothing matched, so callers can tell "no shape" from a malformed
+        /// answer.
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(shape, forKey: .shape)
+            try c.encodeIfPresent(confidence, forKey: .confidence)
+            try c.encodeIfPresent(mergeWith, forKey: .mergeWith)
+        }
     }
 
     static let maxPoints = 50_000
 
     static let descriptor = CommandDescriptor(
         id: "shape.recognize", title: String(localized: "Recognise Shape"),
-        summary: "Recognise a rough stroke (page points) as a line, arrow, arc, curve, polyline, ellipse, rectangle, triangle or polygon: ShapeItem JSON + mergeWith, or null.",
+        summary: "Recognise a rough stroke (page points) as a line, arrow, arc, curve, polyline, ellipse, rectangle, triangle or polygon: {shape: ShapeItem or null, confidence, mergeWith}.",
         params: .obj([
             "points": .arr(.point, "the stroke as [[x, y], …] in page points, at least 2"),
             "neighbors": .anything("shapes to snap to: a page ref (its shapes on visible layers; when a window shows the document only unlocked shapes on its active layer are merged, as when drawing), or an array of item refs / ShapeItem objects with an id")
@@ -56,7 +79,7 @@ struct ShapeRecognizeCommand: NibCommand {
         ],
         effect: .read)
 
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Recognized? {
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         guard p.points.count >= 2 else {
             throw NibError(.invalidParams, "a stroke needs at least 2 points", path: "$.points",
                            hint: "pass points as [[x, y], …] in page points")
@@ -65,14 +88,13 @@ struct ShapeRecognizeCommand: NibCommand {
             throw NibError.invalid("at most \(maxPoints) points", path: "$.points")
         }
         let targets = try neighbours(p.neighbors, ctx)
-        guard let found = ShapeRecognizer.recognize(p.points) else { return nil }
+        guard let found = ShapeRecognizer.recognize(p.points) else { return .noShape }
         var result = SnapResult(shape: found.shape, mergeWith: [])
         if !targets.isEmpty, ctx.services.settings.get(ShapeSettings.snapToOtherShapes) {
             result = ShapeSnapper.snap(found.shape, to: targets)
         }
-        let s = result.shape
-        return Recognized(shape: s.shape, frame: s.frame, points: s.points, style: s.style,
-                          confidence: (found.confidence * 100).rounded() / 100, mergeWith: result.mergeWith)
+        return Output(shape: result.shape, confidence: (found.confidence * 100).rounded() / 100,
+                      mergeWith: result.mergeWith)
     }
 
     /// Resolves `neighbors`: a page ref gives the page's shapes the Draw Shape tool would see (none on hidden layers;

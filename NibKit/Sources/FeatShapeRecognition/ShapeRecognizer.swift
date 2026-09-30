@@ -436,7 +436,8 @@ enum ShapeRecognizer {
     }
 
     /// Parabola y = a·t² + b·t + c across the chord (t = 0…1 from the first to the last point) as a quadratic Bézier:
-    /// start, control, end (the control is 2 × middle − (start + end) / 2, so the curve passes through the middle).
+    /// start, control, end, the control put so the curve passes through the parabola's middle
+    /// (`ShapeItem.quadraticControl(through:_:_:)`).
     private static func fitParabola(_ r: [Point], size s: Double) -> (points: [Point], error: Double)? {
         let a = r[0], z = r[r.count - 1]
         let length = a.distance(to: z)
@@ -468,8 +469,7 @@ enum ShapeRecognizer {
             let y = q[0] * t * t + q[1] * t + q[2]
             return Point(a.x + t * length * ux - y * uy, a.y + t * length * uy + y * ux)
         }
-        let start = at(0), end = at(1)
-        return ([start, at(0.5) * 2 - (start + end) * 0.5, end], err / Double(xs.count) / s)
+        return (ShapeItem.quadraticControl(through: at(0), at(0.5), at(1)), err / Double(xs.count) / s)
     }
 
     // MARK: Corners (Douglas–Peucker, cleaned)

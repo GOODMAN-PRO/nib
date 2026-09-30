@@ -80,17 +80,35 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertNotNil(h.app.ui.canvasTools.get("drawShape"))
         let item = h.app.ui.toolbar.get("drawShape")
         XCTAssertEqual(item?.toolID, "drawShape")
+        XCTAssertEqual(item?.icon, "pencil.and.outline", "NibSymbol.drawShape")
         XCTAssertEqual(item?.shortcut, KeyShortcut("d"))
         XCTAssertNotNil(item?.settings)
         let key = h.app.content.keyCommands.all.first { $0.shortcut == KeyShortcut("d") }
         XCTAssertEqual(key?.command, CommandIDs.toolSelect)
         XCTAssertEqual(key?.params, ["tool": "drawShape"])
         XCTAssertEqual(key?.scope, .canvas)
-        for name in ["shapes.drawAndHold", "shapes.snapToOtherShapes", "shapes.requireHoldToSnap"] {
+        XCTAssertEqual(key?.docKinds, [.notebook, .whiteboard])
+        for name in ["shapes.snapToOtherShapes", "shapes.requireHoldToSnap"] {
             XCTAssertEqual(h.app.settings.descriptor(name)?.owner, "shaperec", name)
             XCTAssertEqual(h.app.settings.descriptor(name)?.synced, true, name)
         }
+        // Draw and Hold is the contracts' shared key: read, not re-declared.
+        XCTAssertEqual(h.app.settings.descriptor(NibSettings.drawAndHold.name)?.owner, "builtin")
+        XCTAssertEqual(NibSettings.drawAndHold.name, "shapes.drawAndHold")
         XCTAssertEqual(h.app.ui.settingsPages.get("shaperec.settings")?.section, .writing)
+    }
+
+    /// Under the shell's key routing, D selects the tool in notebooks and whiteboards while no text is edited, and
+    /// nowhere else.
+    func testDrawShapeKeyIsLiveOnlyOnCanvasDocuments() throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        let key = try XCTUnwrap(h.app.content.keyCommands.get(DrawShapeTool.keyCommandID))
+        XCTAssertTrue(key.isActive(in: KeyCommandContext(docKind: .notebook)))
+        XCTAssertTrue(key.isActive(in: KeyCommandContext(docKind: .whiteboard)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: .notebook, isEditingText: true)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: .studySet)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: .textDocument)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: nil, hasTabs: true)))
     }
 
     func testCommandConformance() async {
@@ -100,24 +118,50 @@ final class FeatShapeRecognitionTests: XCTestCase {
 
     // MARK: shape.recognize
 
-    func testRecognizeReturnsShapeItemJSONForTheAssistant() async throws {
+    /// The wrapped result (ARCHITECTURE §6.5): `{shape: ShapeItem, confidence, mergeWith}`.
+    func testRecognizeReturnsTheWrappedShapeItemForTheAssistant() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         let points: JSONValue = [[100, 100], [260, 102], [259, 190], [101, 188], [100, 101]]
         let value = try await h.run("shape.recognize", ["points": points], as: .ai("chat"))
-        XCTAssertEqual(value["shape"], "rectangle")
+        XCTAssertEqual(Set(value.objectValue?.keys.map { $0 } ?? []), ["shape", "confidence", "mergeWith"])
+        XCTAssertEqual(value["shape"]?["shape"], "rectangle")
         XCTAssertEqual(value["mergeWith"], [])
         XCTAssertGreaterThan(value["confidence"]?.doubleValue ?? 0, 0.5)
-        let shape = try value.decode(ShapeItem.self)
+        XCTAssertLessThanOrEqual(value["confidence"]?.doubleValue ?? 2, 1)
+        let shape = try XCTUnwrap(value["shape"]).decode(ShapeItem.self)
         XCTAssertEqual(shape.shape, .rectangle)
         XCTAssertEqual(shape.frame.w, 159, accuracy: 3)
         XCTAssertEqual(shape.frame.h, 88, accuracy: 3)
+        XCTAssertEqual(shape.style.cornerRadius, 0)
+        let output = try value.decode(ShapeRecognizeCommand.Output.self)
+        XCTAssertEqual(output.shape, shape)
+        XCTAssertEqual(output.mergeWith, [])
     }
 
-    func testRecognizeReturnsNullForAScribbleAndRejectsBadInput() async throws {
+    /// Curves come back as control points (contracts-v2 ShapeItem.points): a parabola's quadratic control lies off the
+    /// stroke, where `ShapeItem.quadraticControl(through:_:_:)` puts it.
+    func testRecognizeReturnsCurveControlPoints() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        let points = JSONValue.array((0...60).map { i -> JSONValue in
+            let t = Double(i) / 60
+            return [.number(100 + 240 * t), .number(300 - 240 * t * (1 - t))]
+        })
+        let value = try await h.run("shape.recognize", ["points": points])
+        let shape = try XCTUnwrap(value["shape"]).decode(ShapeItem.self)
+        XCTAssertEqual(shape.shape, .curve)
+        let expected = ShapeItem.quadraticControl(through: Point(100, 300), Point(220, 240), Point(340, 300))
+        XCTAssertEqual(shape.points.count, 3)
+        for (got, want) in zip(shape.points, expected) {
+            XCTAssertLessThan(got.distance(to: want), 1, "\(shape.points)")
+        }
+    }
+
+    func testRecognizeReturnsANullShapeForAScribbleAndRejectsBadInput() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         let zigzag: JSONValue = [[100, 100], [200, 110], [105, 125], [205, 135], [100, 150], [210, 160], [98, 172], [200, 185]]
         let value = try await h.run("shape.recognize", ["points": zigzag])
-        XCTAssertEqual(value, .null)
+        XCTAssertEqual(value, ["shape": .null])
+        XCTAssertNil(try value.decode(ShapeRecognizeCommand.Output.self).shape)
         do {
             _ = try await h.run("shape.recognize", ["points": [[1, 2]]], as: .ai("chat"))
             XCTFail("one point is not a stroke")
@@ -140,13 +184,13 @@ final class FeatShapeRecognitionTests: XCTestCase {
             "neighbors": [["id": "N1", "shape": "line", "points": [[300, 300], [400, 300]]]]
         ]
         let joined = try await h.run("shape.recognize", params)
-        XCTAssertEqual(joined["shape"], "polyline")
+        XCTAssertEqual(joined["shape"]?["shape"], "polyline")
         XCTAssertEqual(joined["mergeWith"], ["N1"])
-        assertPoints(joined["points"], [Point(300, 300), Point(400, 300), Point(402, 400)])
+        assertPoints(joined["shape"]?["points"], [Point(300, 300), Point(400, 300), Point(402, 400)])
 
         _ = try await h.run(CommandIDs.settingsSet, ["name": "shapes.snapToOtherShapes", "value": false])
         let alone = try await h.run("shape.recognize", params)
-        XCTAssertEqual(alone["shape"], "line")
+        XCTAssertEqual(alone["shape"]?["shape"], "line")
         XCTAssertEqual(alone["mergeWith"], [])
     }
 
@@ -154,8 +198,8 @@ final class FeatShapeRecognitionTests: XCTestCase {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         // The fixture page's rectangle has its top-left corner at (100, 200).
         let value = try await h.run("shape.recognize", ["points": [[104, 203], [180, 320]], "neighbors": .string(pageRef)])
-        XCTAssertEqual(value["shape"], "line")
-        XCTAssertEqual(value["points"]?[0], [100, 200])
+        XCTAssertEqual(value["shape"]?["shape"], "line")
+        XCTAssertEqual(value["shape"]?["points"]?[0], [100, 200])
         XCTAssertEqual(value["mergeWith"], [])
     }
 
@@ -167,20 +211,20 @@ final class FeatShapeRecognitionTests: XCTestCase {
         let params: JSONValue = ["points": [[402, 605], [402, 700]], "neighbors": .string(pageRef)]
         h.session.activeLayer = 0
         let other = try await h.run("shape.recognize", params)
-        XCTAssertEqual(other["shape"], "line")
+        XCTAssertEqual(other["shape"]?["shape"], "line")
         XCTAssertEqual(other["mergeWith"], [])
-        XCTAssertEqual(other["points"]?[0], [400, 600])
+        XCTAssertEqual(other["shape"]?["points"]?[0], [400, 600])
 
         h.session.activeLayer = 1
         let active = try await h.run("shape.recognize", params)
-        XCTAssertEqual(active["shape"], "polyline")
+        XCTAssertEqual(active["shape"]?["shape"], "polyline")
         XCTAssertEqual(active["mergeWith"], [.string(itemRef("LAYERLINE001"))])
 
         h.session.activeLayer = 0
         h.session.hiddenLayers = [1]
         let hidden = try await h.run("shape.recognize", params)
         XCTAssertEqual(hidden["mergeWith"], [])
-        assertPoints(hidden["points"], [Point(402, 605), Point(402, 700)])
+        assertPoints(hidden["shape"]?["points"], [Point(402, 605), Point(402, 700)])
     }
 
     // MARK: Draw Shape tool
@@ -211,6 +255,20 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertEqual(p["style"]?["cornerRadius"], 0)
         XCTAssertTrue(host.committed.isEmpty)
         XCTAssertEqual(host.wetStrokeCancels, 1)
+    }
+
+    /// The clean preview stays until the page's dry tiles show the committed shape (`afterNextRender`), then goes.
+    func testPreviewIsRetiredAfterTheNextRender() async throws {
+        let h = Harness(features: [FeatShapeRecognitionFeature.self])
+        let calls = Calls()
+        standIn(CommandIDs.shapeCreate, h, calls, result: ["ref": "item:FIXTUREDOC01/FIXTUREPG001/NEWSHAPE0001"])
+        let host = FakeCanvasHost(h)
+        DrawShapeTool().strokeFinished(rectangleStroke(h), page: page, host: host)
+        XCTAssertEqual(host.overlayLayer.sublayers?.count ?? 0, 1, "the clean shape shows at once")
+        await settle { !host.renderWaits.isEmpty }
+        XCTAssertNotNil(calls.params[CommandIDs.shapeCreate])
+        XCTAssertEqual(host.renderWaits, [page])
+        XCTAssertEqual(host.overlayLayer.sublayers?.count ?? 0, 0)
     }
 
     func testRequireHoldToSnapKeepsLiftedStrokesAsInk() async throws {
@@ -328,36 +386,32 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertTrue(host.committed.isEmpty)
     }
 
-    /// shape.create takes an upright frame, so a tilted box is turned with item.transform (degrees, about its centre)
-    /// in the same undo step.
-    func testTiltedBoxIsTurnedAboutItsCentreInTheSameUndoStep() async throws {
+    /// A tilted box goes to shape.create as one frame with its rotation (`[x, y, w, h, radians]`, `Frame.array`): one
+    /// command, no follow-up turn.
+    func testTiltedBoxSendsItsRotationInTheFrame() async throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         let calls = Calls()
-        let turned = expectation(description: "item.transform")
-        let newRef = itemRef("NEWSHAPE0001")
-        standIn(CommandIDs.shapeCreate, h, calls, result: ["ref": .string(newRef)])
-        standIn(CommandIDs.itemTransform, h, calls, turned)
+        let created = expectation(description: "shape.create")
+        standIn(CommandIDs.shapeCreate, h, calls, created, result: ["ref": .string(itemRef("NEWSHAPE0001"))])
+        standIn(CommandIDs.itemTransform, h, calls)
         let host = FakeCanvasHost(h)
         let c = Point(300, 600), tilt = 20 * Double.pi / 180
         let corners = [Point(200, 550), Point(400, 550), Point(400, 650), Point(200, 650)]
             .map { SeededStrokes.rotate($0, tilt, about: c) }
         DrawShapeTool().strokeFinished(stroke(Geo.resample(corners + [corners[0]], count: 120), h), page: page, host: host)
-        await fulfillment(of: [turned], timeout: 5)
+        await fulfillment(of: [created], timeout: 5)
+        await settle { !host.renderWaits.isEmpty }
         let create = try XCTUnwrap(calls.params[CommandIDs.shapeCreate])
         XCTAssertEqual(create["shape"], "rectangle")
-        let frame = (create["frame"]?.arrayValue ?? []).compactMap(\.doubleValue)
-        XCTAssertEqual(frame.count, 4)
-        XCTAssertEqual(frame.count == 4 ? frame[2] : 0, 200, accuracy: 2)
-        XCTAssertEqual(frame.count == 4 ? frame[3] : 0, 100, accuracy: 2)
-        XCTAssertEqual(frame.count == 4 ? frame[0] + frame[2] / 2 : 0, c.x, accuracy: 1)
-        XCTAssertEqual(frame.count == 4 ? frame[1] + frame[3] / 2 : 0, c.y, accuracy: 1)
-        let transform = try XCTUnwrap(calls.params[CommandIDs.itemTransform])
-        XCTAssertEqual(transform["refs"], [.string(newRef)])
-        XCTAssertEqual(transform["rotate"]?.doubleValue ?? 0, 20, accuracy: 1)
-        XCTAssertEqual(transform["origin"]?[0]?.doubleValue ?? 0, c.x, accuracy: 1)
-        XCTAssertEqual(transform["origin"]?[1]?.doubleValue ?? 0, c.y, accuracy: 1)
-        XCTAssertNotNil(calls.groups[CommandIDs.itemTransform])
-        XCTAssertEqual(calls.groups[CommandIDs.shapeCreate], calls.groups[CommandIDs.itemTransform])
+        let values = (create["frame"]?.arrayValue ?? []).compactMap(\.doubleValue)
+        let frame = try XCTUnwrap(Frame(array: values), "\(values)")
+        XCTAssertEqual(values.count, 5)
+        XCTAssertEqual(frame.w, 200, accuracy: 2)
+        XCTAssertEqual(frame.h, 100, accuracy: 2)
+        XCTAssertEqual(frame.center.x, c.x, accuracy: 1)
+        XCTAssertEqual(frame.center.y, c.y, accuracy: 1)
+        XCTAssertEqual(frame.rotation, tilt, accuracy: 1 * Double.pi / 180)
+        XCTAssertNil(calls.params[CommandIDs.itemTransform], "the rotation travels with the frame")
     }
 
     /// shape.create runs before anything is deleted: when it fails, the neighbours stay and the stroke stays as ink.
@@ -400,25 +454,33 @@ final class FeatShapeRecognitionTests: XCTestCase {
         XCTAssertEqual(try strokes[0].decode(Stroke.self).points.count, drawn.points.count)
     }
 
-    func testSnappingEmitsAnEventWhereThePencilIs() {
+    /// `shape.snapped` (NibEventType.shapeSnapped) carries a `ShapeSnappedPayload` with the page point where the Pencil
+    /// is, for F043's Pencil Pro haptic.
+    func testSnappingEmitsAShapeSnappedPayloadWhereThePencilIs() throws {
         let h = Harness(features: [FeatShapeRecognitionFeature.self])
         let before = h.app.events.lastSeq
         let host = FakeCanvasHost(h)
         XCTAssertTrue(DrawShapeTool().strokeHeld(rectangleStroke(h), page: page, host: host))
-        let snapped = h.app.events.events(since: before).filter { $0.type == ShapeRecognitionEvents.snapped }
+        let snapped = h.app.events.events(since: before).filter { $0.type == NibEventType.shapeSnapped }
         XCTAssertEqual(snapped.count, 1)
-        XCTAssertEqual(snapped.first?.payload?["shape"], "rectangle")
-        XCTAssertEqual(snapped.first?.payload?["page"], .string(pageRef))
+        XCTAssertEqual(snapped.first?.doc, Fixtures.docID)
+        let payload = try XCTUnwrap(snapped.first?.decode(ShapeSnappedPayload.self))
+        XCTAssertEqual(payload.shape, "rectangle")
+        XCTAssertEqual(payload.page, pageRef)
+        XCTAssertEqual(payload.session, h.session.id.raw)
         // The rectangle stroke ends back at its first corner, where the Pencil is held.
-        XCTAssertEqual(snapped.first?.payload?["point"]?[0]?.doubleValue ?? 0, 100, accuracy: 0.01)
-        XCTAssertEqual(snapped.first?.payload?["point"]?[1]?.doubleValue ?? 0, 100, accuracy: 0.01)
+        let point = try XCTUnwrap(payload.point)
+        XCTAssertEqual(point.x, 100, accuracy: 0.01)
+        XCTAssertEqual(point.y, 100, accuracy: 0.01)
     }
 
-    func testCreateParamsSendUprightFramesAndPoints() {
+    func testCreateParamsSendFramesWithTheirRotationAndPoints() {
         let box = ShapeItem(shape: .ellipse, frame: Frame(x: 10, y: 20, w: 30, h: 40, rotation: 0.4))
         let boxParams = ShapeCommit.createParams(box, page: pageRef)
-        XCTAssertEqual(boxParams["frame"], [10, 20, 30, 40])
+        XCTAssertEqual(boxParams["frame"], [10, 20, 30, 40, 0.4])
         XCTAssertNil(boxParams["points"])
+        let upright = ShapeItem(shape: .rectangle, frame: Frame(x: 10, y: 20, w: 30, h: 40))
+        XCTAssertEqual(ShapeCommit.createParams(upright, page: pageRef)["frame"], [10, 20, 30, 40])
         let arrow = ShapeRecognizer.pointShape(.arrow, [Point(1, 2), Point(3, 4)])
         let arrowParams = ShapeCommit.createParams(arrow, page: pageRef)
         XCTAssertEqual(arrowParams["points"], [[1, 2], [3, 4]])

@@ -8,8 +8,9 @@ import NibDesign
 ///   Draw Shape tool and the AI; Snap to Other Shapes joins it to neighbouring shapes (`mergeWith`).
 /// - Canvas tool "drawShape" (key D) in the writing tools, with its settings popover: AutoShape on lift, Draw and Hold
 ///   with live scale and rotation, snapping, `shape.create` with `drawnWith`, ink kept when a stroke is not a shape.
-/// - Settings `shapes.drawAndHold`, `shapes.snapToOtherShapes`, `shapes.requireHoldToSnap` (synced), changed through
-///   `settings.set` from the popover and Settings › Writing › Shape Recognition.
+/// - Settings `shapes.drawAndHold` (`NibSettings.drawAndHold`, declared by the contracts), `shapes.snapToOtherShapes`
+///   and `shapes.requireHoldToSnap` (synced), changed through `settings.set` from the popover and Settings › Writing ›
+///   Shape Recognition.
 public enum FeatShapeRecognitionFeature: NibFeature {
     public static let id = "shaperec"
 
@@ -21,18 +22,20 @@ public enum FeatShapeRecognitionFeature: NibFeature {
         let tool = DrawShapeTool.toolID
         app.ui.canvasTools.register(CanvasToolDescriptor(id: tool, title: title, order: 55, owner: id,
                                                          make: { DrawShapeTool() }))
-        // ponytail: DESIGN.md §8.1 has no Draw Shape glyph; "pencil.and.outline" (NibSymbol.documentWrite) reads as
-        // drawing an outline and stays distinct from the Shapes tool's square.on.circle.
-        app.ui.toolbar.register(ToolbarItemDescriptor(
-            id: tool, title: title, icon: NibSymbol.documentWrite.name, group: .tools, order: 55, owner: id,
+        let item = ToolbarItemDescriptor(
+            id: tool, title: title, icon: NibSymbol.drawShape.name, group: .tools, order: 55, owner: id,
             toolID: tool, shortcut: KeyShortcut("d"),
             settings: { [weak app] _ in
                 guard let app else { return AnyView(EmptyView()) }
                 return AnyView(ShapeRecognitionSettingsView(app: app, placement: .popover))
-            }))
-        app.content.keyCommands.register(KeyCommandDescriptor(
+            })
+        app.ui.toolbar.register(item)
+        // D selects the tool (T-046) in the documents that have it; the shell drops it while text is being edited.
+        var key = KeyCommandDescriptor(
             id: DrawShapeTool.keyCommandID, title: title, shortcut: KeyShortcut("d"), command: CommandIDs.toolSelect,
-            params: ["tool": .string(tool)], scope: .canvas, owner: id))
+            params: ["tool": .string(tool)], scope: .canvas, owner: id)
+        key.docKinds = item.docKinds
+        app.content.keyCommands.register(key)
         app.ui.settingsPages.register(SettingsPageDescriptor(
             id: "shaperec.settings", title: String(localized: "Shape Recognition"), icon: NibSymbol.shapes.name,
             section: .writing, order: 300, owner: id,
@@ -57,7 +60,7 @@ struct ShapeRecognitionSettingsView: View {
     init(app: NibApp, placement: Placement) {
         self.app = app
         self.placement = placement
-        _drawAndHold = State(initialValue: app.settings.get(ShapeSettings.drawAndHold))
+        _drawAndHold = State(initialValue: app.settings.get(NibSettings.drawAndHold))
         _snapToOtherShapes = State(initialValue: app.settings.get(ShapeSettings.snapToOtherShapes))
         _requireHoldToSnap = State(initialValue: app.settings.get(ShapeSettings.requireHoldToSnap))
     }
@@ -72,7 +75,7 @@ struct ShapeRecognitionSettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)) { note in
             reload(note.userInfo?["name"] as? String)
         }
-        .onChange(of: drawAndHold) { _, on in commit(ShapeSettings.drawAndHold, on) }
+        .onChange(of: drawAndHold) { _, on in commit(NibSettings.drawAndHold, on) }
         .onChange(of: snapToOtherShapes) { _, on in commit(ShapeSettings.snapToOtherShapes, on) }
         .onChange(of: requireHoldToSnap) { _, on in commit(ShapeSettings.requireHoldToSnap, on) }
     }
@@ -132,7 +135,7 @@ struct ShapeRecognitionSettingsView: View {
     private func reload(_ name: String?) {
         let s = app.settings
         switch name {
-        case ShapeSettings.drawAndHold.name: drawAndHold = s.get(ShapeSettings.drawAndHold)
+        case NibSettings.drawAndHold.name: drawAndHold = s.get(NibSettings.drawAndHold)
         case ShapeSettings.snapToOtherShapes.name: snapToOtherShapes = s.get(ShapeSettings.snapToOtherShapes)
         case ShapeSettings.requireHoldToSnap.name: requireHoldToSnap = s.get(ShapeSettings.requireHoldToSnap)
         default: break
