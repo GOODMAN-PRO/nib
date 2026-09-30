@@ -1,6 +1,7 @@
 import XCTest
 import SwiftUI
 import UIKit
+import Combine
 import PDFKit
 import UniformTypeIdentifiers
 import NibContracts
@@ -60,6 +61,37 @@ final class FeatSidebarTests: XCTestCase {
 
     private func entry(_ id: PageID, order: String) -> PagesPayload.Entry {
         PagesPayload.Entry(page: PageRecord(id: id, order: order, size: .a4), items: [])
+    }
+
+    /// A PDF whose page i is 200 + 20·i points wide, so every page can be told apart after cutting and combining.
+    private func lecturePDF(pages: Int) -> Data {
+        UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 200, height: 300)).pdfData { ctx in
+            for i in 0..<pages {
+                ctx.beginPage(withBounds: CGRect(x: 0, y: 0, width: 200 + 20 * i, height: 300), pageInfo: [:])
+            }
+        }
+    }
+
+    private func pageWidths(_ data: Data?) -> [Double] {
+        guard let data = data, let pdf = PDFDocument(data: data) else { return [] }
+        return (0..<pdf.pageCount).compactMap { pdf.page(at: $0).map { Double($0.bounds(for: .mediaBox).width) } }
+    }
+
+    /// The drag item of one page as the grid builds it: the payload is captured only when a receiver asks.
+    private func provider(_ h: Harness, _ page: PageID, renderer: PageRenderer? = nil) -> NSItemProvider {
+        let workspace = h.app.workspace
+        let source = doc
+        return PageDragProvider.make(doc: source, page: page, store: h.assets, renderer: renderer, name: "Page") {
+            try PagesSnapshot.make([page], doc: source, workspace: workspace)
+        }
+    }
+
+    /// A window showing `document`, for dropping into.
+    private func window(_ h: Harness, _ document: DocumentID) -> EditorSession {
+        let window = EditorSession()
+        h.app.services.sessions.add(window)
+        window.document = document
+        return window
     }
 
     // MARK: Registration
@@ -276,15 +308,30 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertNil(PDFSubset.pages([5], of: url))
     }
 
-    func testMergeKeepsDocumentOrderAndEachAssetOnce() {
+    func testMergeKeepsDocumentOrderAndCombinesCutDownPDFs() throws {
+        let lecture = try XCTUnwrap(PDFDocument(data: lecturePDF(pages: 4)))
         let x = PagesPayload.Asset(name: "x.png", data: Data([1]))
-        let y = PagesPayload.Asset(name: "y.pdf", data: Data([2]), pdfPages: [3])
-        let a = PagesPayload(source: "doc:D", pages: [entry("B", order: "b")], assets: [x])
-        let b = PagesPayload(source: "doc:D", pages: [entry("A", order: "a")], assets: [x, y])
-        let merged = PagesPayload.merge([a, b])
-        XCTAssertEqual(merged?.pages.map { $0.page.id }, ["A", "B"])
-        XCTAssertEqual(merged?.assets, [x, y])
-        XCTAssertEqual(merged?.source, "doc:D")
+        // Each dragged page carries only its own PDF page: 3 and 1 of one four-page lecture PDF.
+        let y3 = PagesPayload.Asset(name: "y.pdf", data: PDFSubset.pages([3], of: lecture), pdfPages: [3])
+        let y1 = PagesPayload.Asset(name: "y.pdf", data: PDFSubset.pages([1], of: lecture), pdfPages: [1])
+        let a = PagesPayload(source: "doc:D", pages: [entry("B", order: "b")], assets: [x, y3])
+        let b = PagesPayload(source: "doc:D", pages: [entry("A", order: "a")], assets: [x, y1])
+        let merged = try XCTUnwrap(PagesPayload.merge([a, b]))
+        XCTAssertEqual(merged.pages.map { $0.page.id }, ["A", "B"])
+        XCTAssertEqual(merged.source, "doc:D")
+        XCTAssertEqual(merged.assets.map { $0.name }, ["x.png", "y.pdf"], "each asset once")
+        XCTAssertEqual(merged.assets.first, x)
+        let y = try XCTUnwrap(merged.assets.last)
+        XCTAssertEqual(y.pdfPages, [1, 3], "every PDF page any dragged page shows, in source order")
+        XCTAssertEqual(pageWidths(y.data), [220, 260], "the combined PDF holds source pages 1 and 3")
+
+        // A copy of the whole file wins over cut-downs; equal cut-downs stay as they are.
+        let whole = PagesPayload.Asset(name: "y.pdf", data: lecturePDF(pages: 4))
+        let withWhole = PagesPayload.merge([a, PagesPayload(source: "doc:D", pages: [entry("C", order: "c")], assets: [whole])])
+        XCTAssertEqual(withWhole?.assets.last, whole)
+        let same = PagesPayload.merge([a, PagesPayload(source: "doc:D", pages: [entry("C", order: "c")], assets: [y3])])
+        XCTAssertEqual(same?.assets.last, y3)
+
         let mixed = PagesPayload.merge([a, PagesPayload(source: "doc:E", pages: [entry("C", order: "a")], assets: [])])
         XCTAssertEqual(mixed?.pages.map { $0.page.id }, ["B", "C"])
         XCTAssertNil(mixed?.source)
@@ -349,10 +396,7 @@ final class FeatSidebarTests: XCTestCase {
         let before = try h.snapshot(target)
         let depth = h.undoDepth(target)
 
-        let providers = try [p1, p3].map { page -> NSItemProvider in
-            let snapshot = try PagesSnapshot.make([page], doc: doc, workspace: h.app.workspace)
-            return PageDragProvider.make(snapshot, store: h.assets, renderer: h.app.services.renderer, name: "Page")
-        }
+        let providers = [p1, p3].map { provider(h, $0, renderer: h.app.services.renderer) }
         for provider in providers {
             XCTAssertTrue(provider.registeredTypeIdentifiers.contains(PagesPayload.typeIdentifier))
             XCTAssertTrue(provider.registeredTypeIdentifiers.contains(UTType.png.identifier))
@@ -361,10 +405,7 @@ final class FeatSidebarTests: XCTestCase {
         let png = await loadData(providers[0], UTType.png.identifier)
         XCTAssertNotNil(png.flatMap { UIImage(data: $0) })
 
-        let window = EditorSession()
-        h.app.services.sessions.add(window)
-        window.document = target
-        let model = PagesPanelModel(app: h.app, session: window)
+        let model = PagesPanelModel(app: h.app, session: window(h, target))
         await model.pastePages(providers, into: target, at: .end)
 
         XCTAssertEqual(log.calls.count, 1, "one drop is one page.paste")
@@ -408,13 +449,109 @@ final class FeatSidebarTests: XCTestCase {
         let h = harness()
         let log = CallLog()
         stub(h, [SidebarIDs.pagePaste], log)
-        let snapshot = try PagesSnapshot.make([p2], doc: doc, workspace: h.app.workspace)
-        let provider = PageDragProvider.make(snapshot, store: h.assets, renderer: nil, name: "Page 2")
-        XCTAssertFalse(provider.registeredTypeIdentifiers.contains(UTType.png.identifier), "no renderer, no picture")
+        let item = provider(h, p2)
+        XCTAssertFalse(item.registeredTypeIdentifiers.contains(UTType.png.identifier), "no renderer, no picture")
         h.session.readOnly = true
         let model = PagesPanelModel(app: h.app, session: h.session)
-        await model.pastePages([provider], into: doc, at: .end)
+        await model.pastePages([item], into: doc, at: .end)
         XCTAssertTrue(log.calls.isEmpty)
+    }
+
+    /// A stack of pages showing different pages of one lecture PDF: each dragged page carries its own one-page cut, and
+    /// the drop combines them so every pasted page still shows its own PDF page.
+    func testAMultiPageDragOfOnePDFKeepsEveryPagesBackground() async throws {
+        let h = harness()
+        let log = CallLog()
+        installPasteStandIn(h, log)
+        let lecture = AssetRef("lecture.pdf")
+        h.assets.install(lecturePDF(pages: 3), as: lecture, doc: doc)
+        h.app.commands.register(CommandDescriptor(id: "test.pdfBackgrounds", title: "PDF Backgrounds", summary: "Test helper.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                let content = try tx.content(Fixtures.docID)
+                for (page, number) in [(Fixtures.page1, 0), (Fixtures.page2, 2)] {
+                    guard var record = content.page(page) else { continue }
+                    record.background = .ofPDF(lecture, page: number)
+                    try tx.put(record, doc: Fixtures.docID)
+                }
+            }
+            return .null
+        }
+        try await h.run("test.pdfBackgrounds")
+
+        let target = Fixtures.whiteboardID
+        let model = PagesPanelModel(app: h.app, session: window(h, target))
+        await model.pastePages([p2, p1].map { provider(h, $0) }, into: target, at: .end)
+
+        XCTAssertEqual(log.calls.count, 1, "one drop is one page.paste")
+        let assets = try XCTUnwrap(log.calls.first?.params["payload"]?["assets"]?.arrayValue)
+        let carried = try XCTUnwrap(assets.first { $0["name"]?.stringValue == lecture.name })
+        XCTAssertEqual(carried["pdfPages"], [0, 2])
+        let pasted = try h.app.workspace.content(target).livePages.suffix(2)
+        XCTAssertEqual(pasted.map { $0.background.pdfPage }, [0, 1], "document order; renumbered into the combined PDF")
+        let asset = try XCTUnwrap(pasted.first?.background.asset)
+        XCTAssertEqual(pasted.last?.background.asset, asset)
+        XCTAssertEqual(pageWidths(try h.assets.data(asset, doc: target)), [200, 240],
+                       "a two-page PDF holding source pages 0 and 2")
+    }
+
+    /// Lifting a thumbnail reads nothing; the items are captured once, only when another window asks for the pages.
+    func testLiftingAThumbnailReadsNoItemsUntilAnotherWindowAsks() async throws {
+        let h = harness()
+        let workspace = h.app.workspace
+        let source = doc
+        let page = p2
+        var builds = 0
+        let lazy = PageDragProvider.make(doc: source, page: page, store: h.assets, renderer: nil, name: "Page 2") {
+            builds += 1
+            return try PagesSnapshot.make([page], doc: source, workspace: workspace)
+        }
+        XCTAssertEqual(builds, 0, "making the drag item builds nothing")
+        let loaded = await loadData(lazy, PagesPayload.typeIdentifier)
+        let data = try XCTUnwrap(loaded)
+        XCTAssertEqual(builds, 1)
+        XCTAssertEqual(try PagesPayload.decode(data).pages.map { $0.page.id }, [p2])
+
+        // The grid's drag item: a reorder inside the document never loads the dragged page.
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let grid = ThumbnailGridController(model: model)
+        grid.loadViewIfNeeded()
+        grid.update()
+        XCTAssertFalse(workspace.isPageCached(doc, page: p3))
+        let item = try XCTUnwrap(grid.dragItem(p3, doc: doc))
+        XCTAssertEqual(item.localObject as? PageDragItem, PageDragItem(doc: doc, page: p3))
+        XCTAssertEqual(item.itemProvider.suggestedName, String(localized: "Page \(3)"))
+        XCTAssertFalse(workspace.isPageCached(doc, page: p3), "lifting reads no items")
+        let asked = await loadData(item.itemProvider, PagesPayload.typeIdentifier)
+        let payload = try XCTUnwrap(asked)
+        XCTAssertEqual(try PagesPayload.decode(payload).pages.map { $0.page.id }, [p3])
+    }
+
+    func testDropsThatCannotBeReadSayWhyAndDroppedCopiesAreDeleted() async throws {
+        let h = harness()
+        let log = CallLog()
+        stub(h, [SidebarIDs.pagePaste, CommandIDs.importFiles], log)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        var failed: [String] = []
+        let observer = NotificationCenter.default.publisher(for: .nibCommandFailed, object: h.app)
+            .sink { note in failed.append(note.userInfo?["command"] as? String ?? "") }
+        defer { observer.cancel() }
+        let text = NSItemProvider(item: "not pages" as NSString, typeIdentifier: UTType.plainText.identifier)
+        await model.pastePages([text], into: doc, at: .end)
+        await model.importFiles([text], into: doc, at: .end)
+        XCTAssertEqual(failed, [SidebarIDs.pagePaste, CommandIDs.importFiles], "a drop never fails silently")
+        XCTAssertTrue(log.calls.isEmpty)
+
+        let folder = DroppedFiles.root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("scan.pdf")
+        try Data("%PDF".utf8).write(to: file)
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent("sidebar-keep-\(UUID().uuidString).pdf")
+        try Data("%PDF".utf8).write(to: outside)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        DroppedFiles.cleanUp([file, outside])
+        try await waitUntil { !FileManager.default.fileExists(atPath: folder.path) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outside.path), "only the sidebar's own copies are deleted")
     }
 
     // MARK: One command per gesture
@@ -533,6 +670,88 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertTrue(ids.contains(SidebarMenus.selectionMenuID("copy")))
     }
 
+    /// A multi-page Trash asks first from every entry point: the bottom row, the context menu and VoiceOver (all through
+    /// `perform`) and ⌫. One page, or a thumbnail's own menu, runs at once.
+    func testTrashingSeveralPagesAsksFirstFromEveryEntryPoint() async throws {
+        let h = harness()
+        let log = CallLog()
+        stub(h, [SidebarIDs.pageTrash], log)
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        let trash = try XCTUnwrap(h.app.ui.menus.get(SidebarMenus.selectionMenuID("trash")))
+        model.setSelecting(true)
+        model.setSelection([p1, p2])
+
+        model.perform(trash, model.selectionMenuContext())
+        XCTAssertEqual(model.pendingTrash?.count, 2)
+        XCTAssertTrue(log.calls.isEmpty, "nothing is trashed before the user confirms")
+        model.cancelPendingTrash()
+        XCTAssertNil(model.pendingTrash)
+
+        let grid = ThumbnailGridController(model: model)
+        grid.loadViewIfNeeded()
+        grid.update()
+        let delete = try XCTUnwrap(grid.keyCommands?.first { $0.input == UIKeyCommand.inputDelete }?.action)
+        _ = grid.perform(delete)
+        let pending = try XCTUnwrap(model.pendingTrash, "⌫ asks too")
+        XCTAssertTrue(log.calls.isEmpty)
+        await model.confirm(pending)
+        XCTAssertNil(model.pendingTrash)
+        XCTAssertEqual(log.calls.count, 1, "one page.trash for the whole selection")
+        XCTAssertEqual(log.calls.first?.params["pages"], .array([.string(ref(p1)), .string(ref(p2))]))
+
+        log.calls = []
+        model.setSelecting(true)
+        model.setSelection([p3])
+        model.perform(trash, model.selectionMenuContext())
+        XCTAssertNil(model.pendingTrash, "one page runs at once")
+        try await waitUntil { log.calls.count == 1 }
+        let thumbnailTrash = try XCTUnwrap(h.app.ui.menus.get(SidebarMenus.pageMenuID("trash")))
+        XCTAssertFalse(PagesPanelModel.needsConfirmation(thumbnailTrash, model.pageMenuContext(p2)))
+    }
+
+    /// DESIGN.md §10.16: at most 3 ms of main-thread chrome work per frame. VoiceOver evaluates a thumbnail's menu for
+    /// every thumbnail it describes, and the bottom row the selection's menu on every selection change; on a
+    /// 1,000-page notebook neither may sort the document.
+    func testMenusStayWithinTheChromeBudgetOnALargeNotebook() async throws {
+        let h = harness()
+        h.app.commands.register(CommandDescriptor(id: "test.manyPages", title: "Add Pages", summary: "Test helper.",
+                                                  effect: .edit)) { _, ctx in
+            let pages = (0..<997).map { i in PageRecord(id: PageID(String(format: "BUDGET%06d", i)), order: "", size: .a4) }
+            try ctx.mutate { tx in _ = try tx.put(pages, doc: Fixtures.docID) }
+            return .null
+        }
+        try await h.run("test.manyPages")
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        XCTAssertEqual(model.order.count, 1000)
+        let budget = 0.003
+        func fastest(_ body: () -> Void) -> TimeInterval {
+            body()
+            var best = TimeInterval.infinity
+            for _ in 0..<3 {
+                let start = CFAbsoluteTimeGetCurrent()
+                body()
+                best = min(best, CFAbsoluteTimeGetCurrent() - start)
+            }
+            return best
+        }
+        let thumbnail = model.pageMenuContext(model.order[700])
+        var shown: [MenuItemDescriptor] = []
+        let one = fastest { shown = h.app.ui.menuItems(.sidebarPage, thumbnail) }
+        XCTAssertTrue(shown.contains { $0.id == SidebarMenus.pageMenuID("trash") })
+        XCTAssertLessThan(one, budget * 4, "thumbnail menu: \(one * 1000) ms")
+
+        model.setSelecting(true)
+        model.setSelection(Set(model.order.prefix(500)))
+        let many = fastest { shown = h.app.ui.menuItems(.sidebarSelection, model.selectionMenuContext()) }
+        XCTAssertTrue(shown.contains { $0.id == SidebarMenus.selectionMenuID("trash") })
+        XCTAssertLessThan(many, budget * 4, "selection menu for 500 pages: \(many * 1000) ms")
+
+        // Running an entry still puts the chosen pages in document order.
+        let copy = try XCTUnwrap(h.app.ui.menus.get(SidebarMenus.selectionMenuID("copy")))
+        let refs = copy.params(model.selectionMenuContext())["pages"]?.arrayValue?.compactMap { $0.stringValue }
+        XCTAssertEqual(refs, model.order.prefix(500).map { ref($0) })
+    }
+
     // MARK: Model
 
     func testSelectModeSelectAllAndLeavingClearsTheSelection() {
@@ -592,7 +811,94 @@ final class FeatSidebarTests: XCTestCase {
         try await waitUntil { !model.hasDocument }
     }
 
+    /// A stroke on a page refreshes that page's thumbnail only: the model hands the grid the changed pages once.
+    func testAnEditMarksOnlyItsPagesThumbnailChanged() async throws {
+        let h = harness()
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        var signals = 0
+        let observer = model.thumbnailsChanged.sink { signals += 1 }
+        defer { observer.cancel() }
+        let shape = Item(kind: .shape, shape: ShapeItem(shape: .rectangle, frame: Frame(x: 20, y: 20, w: 30, h: 30)))
+        try await h.insert([shape], page: p2)
+        try await h.insert([shape], page: p2)
+        XCTAssertEqual(signals, 1, "one signal until the grid takes the pages")
+        XCTAssertEqual(model.takeChangedThumbnails(), [p2])
+        XCTAssertEqual(model.takeChangedThumbnails(), [])
+        XCTAssertTrue(model.thumbnails.needsRender(p2, pixelSize: 1), "the old image is out of date")
+    }
+
+    /// The thumbnail cache's races: a render that lands after its page changed is dropped and redone, renders in
+    /// flight when the document changes never land, a cancelled request never renders, and a small image is redrawn.
+    func testThumbnailStoreKeepsOnlyCurrentRenders() async throws {
+        let renderer = GatedRenderer()
+        let store = ThumbnailStore()
+        store.coalescingDelay = 0
+        var loaded: [PageID] = []
+        store.onLoad = { loaded.append($0) }
+        let d = doc
+
+        store.request(doc: d, page: p1, pixelSize: 100, renderer: renderer)
+        store.request(doc: d, page: p1, pixelSize: 100, renderer: renderer)
+        try await waitUntil { renderer.calls.count == 1 }
+        XCTAssertTrue(store.isLoading(p1))
+        store.invalidate([p1])
+        renderer.finish(size: 50)
+        try await waitUntil { renderer.calls.count == 2 }
+        XCTAssertNil(store.image(p1), "the render that finished after its page changed is dropped")
+        XCTAssertTrue(loaded.isEmpty)
+        renderer.finish(size: 100)
+        try await waitUntil { loaded == [self.p1] }
+        XCTAssertEqual(store.image(p1)?.size.width, 100, "only the redone render is kept")
+        XCTAssertFalse(store.isLoading(p1))
+
+        // needsRender: a fresh image is kept unless it is under 80% of the size asked for.
+        XCTAssertFalse(store.needsRender(p1, pixelSize: 125))
+        XCTAssertTrue(store.needsRender(p1, pixelSize: 126))
+        XCTAssertTrue(store.needsRender(p2, pixelSize: 10), "no image yet")
+
+        store.request(doc: d, page: p2, pixelSize: 100, renderer: renderer)
+        try await waitUntil { renderer.calls.count == 3 }
+        store.removeAll()
+        XCTAssertFalse(store.isLoading(p2))
+        renderer.finish(size: 100)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertNil(store.image(p2), "renders in flight when the document changed never land")
+        XCTAssertNil(store.image(p1))
+        XCTAssertEqual(loaded, [p1])
+
+        // Coalescing: a request cancelled before its delay (a fling past the page) never renders.
+        store.coalescingDelay = 40_000_000
+        store.request(doc: d, page: p3, pixelSize: 100, renderer: renderer)
+        store.cancel(p3)
+        XCTAssertFalse(store.isLoading(p3))
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(renderer.calls.count, 3, "a cancelled request never renders")
+        store.request(doc: d, page: p3, pixelSize: 100, renderer: renderer)
+        try await waitUntil { renderer.calls.count == 4 }
+        renderer.finish(size: 100)
+        try await waitUntil { store.image(self.p3) != nil }
+    }
+
     // MARK: Unseen changes
+
+    func testMarkingSeenIgnoresPreviewsAndDefaultsToTheOpenPage() async throws {
+        let h = harness()
+        let log = CallLog()
+        stub(h, [SidebarIDs.markSeen], log)
+        let tracker = try XCTUnwrap(UnseenPages.of(h.app))
+        tracker.note(remoteChange(on: p1), showing: [])
+        tracker.note(remoteChange(on: p2), showing: [])
+        XCTAssertTrue(tracker.isUnseen(doc, p1))
+
+        _ = try await h.app.bus.execute(Invocation(command: SidebarIDs.markSeen, params: ["pages": [.string(ref(p2))]],
+                                                   session: h.session, dryRun: true))
+        XCTAssertTrue(tracker.isUnseen(doc, p2), "a dry run (an AI preview) clears nothing")
+        try await h.run(SidebarIDs.markSeen)
+        XCTAssertFalse(tracker.isUnseen(doc, p1), "no pages: the window's open page")
+        XCTAssertTrue(tracker.isUnseen(doc, p2))
+        try await h.run(SidebarIDs.markSeen, ["pages": [.string(ref(p2))]])
+        XCTAssertFalse(tracker.isUnseen(doc, p2))
+    }
 
     func testRemoteChangesMarkPagesUnseenUntilTheyAreShown() async throws {
         let h = harness()
@@ -669,4 +975,42 @@ final class FeatSidebarTests: XCTestCase {
         let rotate = groups.first { $0.title == String(localized: "Rotate") }
         XCTAssertEqual(rotate?.items.count, 2)
     }
+}
+
+/// A renderer whose thumbnails finish only when the test says so (oldest first), counting every call.
+final class GatedRenderer: PageRenderer {
+    private let lock = NSLock()
+    private var requested: [PageID] = []
+    private var waiting: [CheckedContinuation<CGImage?, Never>] = []
+
+    /// Pages asked for, in order.
+    var calls: [PageID] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requested
+    }
+
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        throw NibError(.unavailable, "GatedRenderer draws thumbnails only")
+    }
+
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<CGImage?, Never>) in
+            lock.lock()
+            requested.append(page)
+            waiting.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    /// Finishes the oldest render in flight with a blank image `size` pixels square.
+    func finish(size: Int) {
+        lock.lock()
+        let next = waiting.isEmpty ? nil : waiting.removeFirst()
+        lock.unlock()
+        next?.resume(returning: FakeRenderer.blank(CGSize(width: size, height: size)))
+    }
+
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
+    func purgeCaches() {}
 }

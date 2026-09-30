@@ -108,16 +108,12 @@ struct PagesPayload: Codable, Equatable {
 
     /// Several dragged items (one page each) as one payload, so the drop is ONE `page.paste`. Pages from one document
     /// keep that document's order (the touched page leads the drag, not the list); otherwise drag order. Each asset
-    /// comes once (the first copy of a name wins; names are content hashes, so equal names are equal bytes).
+    /// comes once (`mergeAssets`). Opens PDFs to combine cut-downs: run it off the main actor.
     static func merge(_ payloads: [PagesPayload]) -> PagesPayload? {
         let usable = payloads.filter { $0.isUsable }
         guard let first = usable.first else { return nil }
         guard usable.count > 1 else { return first }
-        var seen = Set<String>()
-        var assets: [Asset] = []
-        for payload in usable {
-            for asset in payload.assets where seen.insert(asset.name).inserted { assets.append(asset) }
-        }
+        let assets = mergeAssets(usable.flatMap { $0.assets })
         let sources = Set(usable.map { $0.source ?? "" })
         let oneSource = sources.count == 1 && first.source != nil
         var pages = usable.flatMap { $0.pages }
@@ -125,6 +121,35 @@ struct PagesPayload: Codable, Equatable {
             pages.sort { ($0.page.order, $0.page.id.raw) < ($1.page.order, $1.page.id.raw) }
         }
         return PagesPayload(source: oneSource ? first.source : nil, pages: pages, assets: assets)
+    }
+
+    /// One asset per name, in first-seen order. Copies of a name are the same file, except that a PDF used only as
+    /// page backgrounds travels cut down to the PDF pages each dragged page shows: pages 1, 4 and 7 of one lecture
+    /// PDF arrive as three one-page PDFs. Those are combined into one PDF holding every page any copy carries (so
+    /// `page.paste` can renumber each pasted page's `pdfPage`); a copy of the whole file wins over cut-downs.
+    static func mergeAssets(_ copies: [Asset]) -> [Asset] {
+        var names: [String] = []
+        var byName: [String: [Asset]] = [:]
+        for asset in copies {
+            if byName[asset.name] == nil { names.append(asset.name) }
+            byName[asset.name, default: []].append(asset)
+        }
+        return names.compactMap { name in byName[name].flatMap { merged($0) } }
+    }
+
+    private static func merged(_ copies: [Asset]) -> Asset? {
+        let readable = copies.filter { $0.data != nil }
+        guard let first = readable.first ?? copies.first else { return nil }
+        guard readable.count > 1 else { return first }
+        if let whole = readable.first(where: { $0.pdfPages == nil }) { return whole }
+        let wanted = Set(readable.flatMap { $0.pdfPages ?? [] })
+        if let covering = readable.first(where: { Set($0.pdfPages ?? []) == wanted }) { return covering }
+        let cuts = readable.compactMap { copy -> PDFSubset.Cut? in
+            guard let data = copy.data, let pages = copy.pdfPages else { return nil }
+            return PDFSubset.Cut(data: data, pages: pages)
+        }
+        guard let combined = PDFSubset.combine(cuts) else { return first }
+        return Asset(name: first.name, data: combined.data, pdfPages: combined.pages)
     }
 }
 
@@ -168,12 +193,22 @@ enum PageAssets {
 
 /// A new PDF holding some pages of another, so dragging one page of a 400-page lecture PDF stays small.
 enum PDFSubset {
+    /// A cut-down PDF: `data` holds the source PDF pages `pages`, in this order.
+    struct Cut {
+        let data: Data
+        let pages: [Int]
+    }
+
     /// `pages` (0-based, in this order) of the PDF at `url`; nil when it cannot be read, a page is missing, or every
     /// page is in use (the file then travels as it is).
     static func pages(_ pages: [Int], of url: URL) -> Data? {
-        guard !pages.isEmpty, let source = PDFDocument(url: url), !source.isLocked, pages.count < source.pageCount else {
-            return nil
-        }
+        guard let source = PDFDocument(url: url) else { return nil }
+        return self.pages(pages, of: source)
+    }
+
+    /// `pages` (0-based, in this order) of `source`; nil as above.
+    static func pages(_ pages: [Int], of source: PDFDocument) -> Data? {
+        guard !pages.isEmpty, !source.isLocked, pages.count < source.pageCount else { return nil }
         let out = PDFDocument()
         for (i, index) in pages.enumerated() {
             guard index >= 0, index < source.pageCount, let page = source.page(at: index)?.copy() as? PDFPage else { return nil }
@@ -181,10 +216,36 @@ enum PDFSubset {
         }
         return out.dataRepresentation()
     }
+
+    /// One PDF with every source page the cuts carry (each once), in source page order, and those page numbers. A cut
+    /// that cannot be read, or whose page count does not match its `pages`, adds nothing; nil when none can be read.
+    static func combine(_ cuts: [Cut]) -> (data: Data, pages: [Int])? {
+        var sources: [PDFDocument] = []
+        var chosen: [Int: PDFPage] = [:]
+        for cut in cuts {
+            guard let doc = PDFDocument(data: cut.data), !doc.isLocked, doc.pageCount == cut.pages.count else { continue }
+            sources.append(doc)
+            for (i, number) in cut.pages.enumerated() where chosen[number] == nil {
+                if let page = doc.page(at: i)?.copy() as? PDFPage { chosen[number] = page }
+            }
+        }
+        let numbers = chosen.keys.sorted()
+        guard !numbers.isEmpty else { return nil }
+        let out = PDFDocument()
+        for (i, number) in numbers.enumerated() {
+            guard let page = chosen[number] else { return nil }
+            out.insert(page, at: i)
+        }
+        // The copied pages draw from their source documents until the combined PDF is written.
+        let data = withExtendedLifetime(sources) { out.dataRepresentation() }
+        guard let bytes = data else { return nil }
+        return (bytes, numbers)
+    }
 }
 
-/// What a drag of some pages carries, captured on the main actor when the drag starts (records, live items, asset
-/// names). The bytes are read and encoded only when a receiver asks for them, off the main actor.
+/// What a drag of some pages carries (records, live items, asset names), captured on the main actor only when a
+/// receiver asks for the `app.nib.pages` bytes (see `PageDragProvider`); the bytes are then read and encoded off the
+/// main actor.
 struct PagesSnapshot {
     let doc: DocumentID
     let entries: [PagesPayload.Entry]
@@ -248,19 +309,33 @@ enum PageDragProvider {
     /// Long edge of the dragged picture: the render cap every Nib picture of a page uses.
     static let imagePixels = 1568
 
-    static func make(_ snapshot: PagesSnapshot, store: AssetStore?, renderer: PageRenderer?, name: String) -> NSItemProvider {
+    /// Lifting a thumbnail reads nothing: `build` (which loads the page's items) runs on the main actor only when a
+    /// receiver asks for the `app.nib.pages` bytes, and the bytes are then encoded off it. A reorder inside one
+    /// document never asks, so it never loads or decodes a page, and a lifted stack of 300 pages lifts at once.
+    static func make(doc: DocumentID, page: PageID, store: AssetStore?, renderer: PageRenderer?, name: String,
+                     build: @escaping @MainActor () throws -> PagesSnapshot) -> NSItemProvider {
         let provider = NSItemProvider()
         provider.registerDataRepresentation(forTypeIdentifier: PagesPayload.typeIdentifier, visibility: .ownProcess) { done in
-            do {
-                done(try snapshot.payload(store: store).encoded(), nil)
-            } catch {
-                done(nil, error)
+            // The receiver awaits the load off the main actor, so hopping onto it here cannot deadlock.
+            Task { @MainActor in
+                let snapshot: PagesSnapshot
+                do {
+                    snapshot = try build()
+                } catch {
+                    done(nil, error)
+                    return
+                }
+                Task.detached(priority: .userInitiated) {
+                    do {
+                        done(try snapshot.payload(store: store).encoded(), nil)
+                    } catch {
+                        done(nil, error)
+                    }
+                }
             }
             return nil
         }
-        if let renderer = renderer, let first = snapshot.entries.first {
-            let doc = snapshot.doc
-            let page = first.page.id
+        if let renderer = renderer {
             provider.registerDataRepresentation(forTypeIdentifier: UTType.png.identifier, visibility: .all) { done in
                 Task {
                     let png = await PageDragProvider.png(renderer, doc: doc, page: page)
@@ -292,9 +367,27 @@ enum PageDragProvider {
 // MARK: - Dropped files
 
 /// PDF and image files dropped on the sidebar (from Files or another app), copied to a temporary folder because the
-/// system deletes its copy when the load handler returns; `import.files` turns them into pages here.
+/// system deletes its copy when the load handler returns; `import.files` turns them into pages here, and the copies
+/// are deleted as soon as it returns (`cleanUp`), so dropped PDFs never pile up in tmp.
 enum DroppedFiles {
     static let types: [UTType] = [.pdf, .image]
+
+    /// Every drop's copies live in their own folder under this one.
+    static var root: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("nib-sidebar-drops", isDirectory: true)
+    }
+
+    /// Deletes the per-drop folders of `urls` (copies `load` made), off the main actor. Anything outside `root` is
+    /// left alone.
+    static func cleanUp(_ urls: [URL]) {
+        let rootPath = root.standardizedFileURL.path
+        let folders = Set(urls.map { $0.deletingLastPathComponent().standardizedFileURL })
+            .filter { $0.deletingLastPathComponent().path == rootPath }
+        guard !folders.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            for folder in folders { try? FileManager.default.removeItem(at: folder) }
+        }
+    }
 
     static func isImportable(_ identifier: String) -> Bool {
         guard let type = UTType(identifier) else { return false }
@@ -318,8 +411,7 @@ enum DroppedFiles {
                     return
                 }
                 let fm = FileManager.default
-                let folder = fm.temporaryDirectory.appendingPathComponent("nib-sidebar-drops", isDirectory: true)
-                    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+                let folder = DroppedFiles.root.appendingPathComponent(UUID().uuidString, isDirectory: true)
                 do {
                     try fm.createDirectory(at: folder, withIntermediateDirectories: true)
                     let destination = folder.appendingPathComponent(url.lastPathComponent)

@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Combine
 import NibContracts
 import NibDesign
 
@@ -235,6 +236,12 @@ struct ThumbnailGridView: UIViewControllerRepresentable {
 
 // MARK: - The grid
 
+/// A thumbnail cell; remembers its page, so ending display cancels the render of the page it showed (index paths are
+/// stale while a snapshot is being applied).
+final class ThumbnailCell: UICollectionViewCell {
+    var page: PageID?
+}
+
 @MainActor
 final class ThumbnailGridController: UIViewController, UICollectionViewDelegate, UICollectionViewDataSourcePrefetching,
     UICollectionViewDragDelegate, UICollectionViewDropDelegate, UIGestureRecognizerDelegate {
@@ -245,13 +252,13 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         case add
     }
 
-    /// What the visible cells last showed, so model changes reconfigure only what changed.
+    /// What the cells last showed, so model changes reconfigure only the thumbnails that changed.
     struct Shown: Equatable {
         var selecting = false
         var selection: Set<PageID> = []
         var current: PageID?
-        var revision = -1
         var canEdit = false
+        var loaded = false
     }
 
     let model: PagesPanelModel
@@ -277,10 +284,18 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     private var swipe: SwipeSelection?
     private var swipeLocation: CGPoint?
     private var autoScroll: CADisplayLink?
+    private var updateScheduled = false
+    private var subscriptions = Set<AnyCancellable>()
 
     init(model: PagesPanelModel) {
         self.model = model
         super.init(nibName: nil, bundle: nil)
+    }
+
+    /// VoiceOver or Switch Control is on: only then do thumbnails carry their accessibility actions (every menu entry),
+    /// which are otherwise never read and cost a menu evaluation per thumbnail.
+    static var assistiveTechRunning: Bool {
+        UIAccessibility.isVoiceOverRunning || UIAccessibility.isSwitchControlRunning
     }
 
     required init?(coder: NSCoder) {
@@ -309,7 +324,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     override func viewDidLoad() {
         super.viewDidLoad()
         guard let collectionView = collectionView else { return }
-        let pageCell = UICollectionView.CellRegistration<UICollectionViewCell, String> { [weak self] cell, _, raw in
+        let pageCell = UICollectionView.CellRegistration<ThumbnailCell, String> { [weak self] cell, _, raw in
             self?.configure(cell, raw: raw)
         }
         let addCell = UICollectionView.CellRegistration<UICollectionViewCell, Entry> { cell, _, _ in
@@ -329,6 +344,15 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         collectionView.addGestureRecognizer(swipePan)
         // Scrolling waits for the swipe to decline (it does at once unless selecting and moving across the list).
         collectionView.panGestureRecognizer.require(toFail: swipePan)
+        model.thumbnailsChanged
+            .sink { [weak self] in self?.scheduleUpdate() }
+            .store(in: &subscriptions)
+        let center = NotificationCenter.default
+        for name in [UIAccessibility.voiceOverStatusDidChangeNotification, UIAccessibility.switchControlStatusDidChangeNotification] {
+            center.publisher(for: name)
+                .sink { [weak self] _ in self?.reconfigure(visibleOnly: false) }
+                .store(in: &subscriptions)
+        }
         update()
     }
 
@@ -350,24 +374,31 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     // MARK: Updates
 
     /// Brings the list up to date with the model: a new snapshot when pages came, went or moved (deferred while a drag
-    /// or drop is under way), and reconfigured cells where a row, the selection, the current page or a thumbnail changed.
+    /// or drop is under way), and reconfigured cells only for the thumbnails that changed: a changed row, a new image
+    /// or an edit (`takeChangedThumbnails`), a selection check that flipped, the old and new current page. Only a
+    /// change every thumbnail shows (entering select mode, edit rights, VoiceOver with a new selection) touches them all.
     func update(force: Bool = false) {
         guard let collectionView = collectionView, let dataSource = dataSource else { return }
         let nextRows = model.rows
         let nextAdd = model.hasDocument && model.filter == .all && model.canEdit
-        let identityChanged = nextRows.map { $0.id } != rows.map { $0.id } || nextAdd != showsAdd
+        // The model keeps the same array until its rows change, so this is O(1) on a stroke or a selection step.
+        let rowsChanged = nextRows != rows
+        let identityChanged = nextAdd != showsAdd || (rowsChanged && nextRows.map { $0.id } != rows.map { $0.id })
         if identityChanged && !force && (collectionView.hasActiveDrag || collectionView.hasActiveDrop) {
             needsUpdate = true
             return
         }
-        let before = Set(dataSource.snapshot().itemIdentifiers)
-        let changedRows = nextRows.filter { rowByID[$0.id.raw] != $0 }.map { Entry.page($0.id.raw) }
-        rows = nextRows
-        rowByID = Dictionary(nextRows.map { ($0.id.raw, $0) }, uniquingKeysWith: { first, _ in first })
+        let old = dataSource.snapshot()
+        var refresh = Set<Entry>()
+        if rowsChanged {
+            for row in nextRows where rowByID[row.id.raw] != row { refresh.insert(.page(row.id.raw)) }
+            rows = nextRows
+            rowByID = Dictionary(nextRows.map { ($0.id.raw, $0) }, uniquingKeysWith: { first, _ in first })
+        }
         showsAdd = nextAdd
         let state = Shown(selecting: model.isSelecting, selection: model.selection, current: model.current,
-                          revision: model.thumbnailRevision, canEdit: model.canEdit)
-        let firstLoad = shown.revision < 0
+                          canEdit: model.canEdit, loaded: true)
+        let firstLoad = !shown.loaded
 
         var snapshot: NSDiffableDataSourceSnapshot<Section, Entry>
         if identityChanged {
@@ -379,11 +410,21 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
                 snapshot.appendItems([.add], toSection: .add)
             }
         } else {
-            snapshot = dataSource.snapshot()
+            snapshot = old
         }
-        var refresh = Set(changedRows)
-        if state != shown { refresh.formUnion(visibleEntries()) }
-        let kept = refresh.filter { before.contains($0) && snapshot.indexOfItem($0) != nil }
+        for page in model.takeChangedThumbnails() { refresh.insert(.page(page.raw)) }
+        let everyThumbnail = state.selecting != shown.selecting || state.canEdit != shown.canEdit
+            || (ThumbnailGridController.assistiveTechRunning && (state.selection != shown.selection || identityChanged))
+        if everyThumbnail {
+            refresh.formUnion(snapshot.itemIdentifiers.filter { $0 != .add })
+        } else {
+            for page in state.selection.symmetricDifference(shown.selection) { refresh.insert(.page(page.raw)) }
+            if state.current != shown.current {
+                for page in [shown.current, state.current].compactMap({ $0 }) { refresh.insert(.page(page.raw)) }
+            }
+        }
+        // Only items the list already showed can be reconfigured; new ones are configured as they are inserted.
+        let kept = refresh.filter { old.indexOfItem($0) != nil && snapshot.indexOfItem($0) != nil }
         if !kept.isEmpty { snapshot.reconfigureItems(Array(kept)) }
         if identityChanged || !kept.isEmpty {
             let animate = identityChanged && !firstLoad && !UIAccessibility.isReduceMotionEnabled && !NibMotion.forcesReduced
@@ -400,6 +441,17 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         let currentChanged = state.current != shown.current || firstLoad
         shown = state
         if currentChanged, !state.selecting, let current = state.current { reveal(current) }
+    }
+
+    /// Coalesces thumbnail changes (a burst of renders landing, a stroke's commit) into one update on the next turn.
+    private func scheduleUpdate() {
+        guard !updateScheduled else { return }
+        updateScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            self.updateScheduled = false
+            self.update()
+        }
     }
 
     private func flushDeferredUpdate() {
@@ -464,22 +516,30 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     // MARK: Cells
 
-    private func configure(_ cell: UICollectionViewCell, raw: String) {
+    private func configure(_ cell: ThumbnailCell, raw: String) {
         guard let row = rowByID[raw] else {
+            cell.page = nil
             cell.contentConfiguration = nil
             return
         }
         let page = row.id
-        model.requestThumbnail(page, pixelSize: metrics.pixelSize(aspect: row.aspect, scale: traitCollection.displayScale))
+        cell.page = page
+        requestThumbnail(row)
         let state = ThumbnailCellState(row: row, image: model.thumbnail(page), width: metrics.thumbnailWidth,
                                        isCurrent: model.current == page,
                                        isSelected: model.isSelecting ? model.selection.contains(page) : nil)
-        let actions = accessibilityActions(for: row)
+        let actions = ThumbnailGridController.assistiveTechRunning ? accessibilityActions(for: row) : []
         cell.contentConfiguration = UIHostingConfiguration { ThumbnailCellView(state: state, actions: actions) }
             .margins(.all, 0)
     }
 
-    private func accessibilityActions(for row: PageRow) -> [ThumbnailAction] {
+    private func requestThumbnail(_ row: PageRow) {
+        model.requestThumbnail(row.id, pixelSize: metrics.pixelSize(aspect: row.aspect, scale: traitCollection.displayScale))
+    }
+
+    /// Built only while VoiceOver or Switch Control runs (see `assistiveTechRunning`). Each menu action resolves its
+    /// entry and context again when it runs, so it acts on the selection as it is then.
+    func accessibilityActions(for row: PageRow) -> [ThumbnailAction] {
         let model = self.model
         let page = row.id
         var out: [ThumbnailAction] = []
@@ -503,11 +563,19 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         }
         let (location, context) = menuTarget(page)
         for item in model.app.ui.menuItems(location, context) {
-            out.append(ThumbnailAction(id: item.id, name: item.resolvedTitle(for: context)) {
-                Task { await model.run(item, context) }
+            let id = item.id
+            out.append(ThumbnailAction(id: id, name: item.resolvedTitle(for: context)) { [weak self] in
+                self?.performMenuItem(id, on: page)
             })
         }
         return out
+    }
+
+    /// Runs menu entry `id` for `page` with the menu context as it is now (through the model, so a multi-page Trash asks).
+    private func performMenuItem(_ id: String, on page: PageID) {
+        let (location, context) = menuTarget(page)
+        guard let item = model.app.ui.menus.get(id), item.location == location, item.isVisible(context) else { return }
+        model.perform(item, context)
     }
 
     /// The thumbnail menu, or the selection's menu on a selected thumbnail in select mode.
@@ -550,8 +618,31 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
         for indexPath in indexPaths {
             guard let page = pageID(at: indexPath), let row = rowByID[page.raw] else { continue }
-            model.requestThumbnail(page, pixelSize: metrics.pixelSize(aspect: row.aspect, scale: traitCollection.displayScale))
+            requestThumbnail(row)
         }
+    }
+
+    /// A fling past thumbnails drops their renders (unless they already landed).
+    func collectionView(_ collectionView: UICollectionView, cancelPrefetchingForItemsAt indexPaths: [IndexPath]) {
+        let visible = Set(collectionView.indexPathsForVisibleItems)
+        for indexPath in indexPaths where !visible.contains(indexPath) {
+            if let page = pageID(at: indexPath) { model.cancelThumbnail(page) }
+        }
+    }
+
+    /// A prepared cell whose render was cancelled asks again when it comes on screen.
+    func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell,
+                        forItemAt indexPath: IndexPath) {
+        guard let page = (cell as? ThumbnailCell)?.page, let row = rowByID[page.raw] else { return }
+        requestThumbnail(row)
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didEndDisplaying cell: UICollectionViewCell,
+                        forItemAt indexPath: IndexPath) {
+        guard let page = (cell as? ThumbnailCell)?.page else { return }
+        // After a reorder another cell may show the page now.
+        let stillShown = collectionView.visibleCells.contains { $0 !== cell && ($0 as? ThumbnailCell)?.page == page }
+        if !stillShown { model.cancelThumbnail(page) }
     }
 
     // MARK: Context menu (MenuLocation.sidebarPage / .sidebarSelection)
@@ -586,7 +677,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
                 let image = item.icon.flatMap { NibSymbol(systemName: $0) }.flatMap { UIImage(nib: $0) }
                 let action = UIAction(title: item.resolvedTitle(for: context), image: image,
                                       attributes: item.destructive ? .destructive : []) { _ in
-                    Task { await model.run(item, context) }
+                    Task { @MainActor in model.perform(item, context) }
                 }
                 if item.isChecked?(context) == true { action.state = .on }
                 return action
@@ -644,12 +735,15 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         return [item]
     }
 
-    private func dragItem(_ page: PageID, doc: DocumentID) -> UIDragItem? {
+    /// One dragged thumbnail. Reads no items: the `app.nib.pages` payload is captured only if another window asks.
+    func dragItem(_ page: PageID, doc: DocumentID) -> UIDragItem? {
+        guard let row = rowByID[page.raw] else { return nil }
         let app = model.app
-        guard let snapshot = try? PagesSnapshot.make([page], doc: doc, workspace: app.workspace) else { return nil }
-        let number = (model.order.firstIndex(of: page) ?? 0) + 1
-        let provider = PageDragProvider.make(snapshot, store: app.services.assets, renderer: app.services.renderer,
-                                             name: String(localized: "Page \(number)"))
+        let workspace = app.workspace
+        let provider = PageDragProvider.make(doc: doc, page: page, store: app.services.assets, renderer: app.services.renderer,
+                                             name: String(localized: "Page \(row.number)")) {
+            try PagesSnapshot.make([page], doc: doc, workspace: workspace)
+        }
         let item = UIDragItem(itemProvider: provider)
         item.localObject = PageDragItem(doc: doc, page: page)
         return item
@@ -843,11 +937,11 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
 
     @objc private func endSelecting() { model.setSelecting(false) }
 
-    /// The keyboard runs the same `sidebarSelection` entry the bottom row shows (when it is available).
+    /// The keyboard runs the same `sidebarSelection` entry the bottom row shows (when it is available); a multi-page
+    /// Trash asks first, as it does there.
     private func runSelectionAction(_ key: String) {
         let context = model.selectionMenuContext()
         guard let item = model.app.ui.menus.get(SidebarMenus.selectionMenuID(key)), item.isVisible(context) else { return }
-        let model = self.model
-        Task { await model.run(item, context) }
+        model.perform(item, context)
     }
 }

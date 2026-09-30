@@ -28,35 +28,49 @@ public enum FeatSidebarFeature: NibFeature {
     }
 }
 
-/// Ids this feature registers or calls across modules.
+/// Ids this feature registers or calls across modules (the contracts-v2.1 constants where the catalogue has them).
 enum SidebarIDs {
     /// The Pages sidebar tab. `panel.open {id: "sidebar.pages", filter?: "all" | "bookmarks"}`.
     static let pagesPanel = "sidebar.pages"
     /// FeatPages' Move Pages sheet; `panel.open` hands it the pages as `PanelContext.params["pages"]`.
-    static let movePagesPanel = "pages.movePages"
-    static let pageCopy = "page.copy"
-    static let pagePaste = "page.paste"
-    static let pageDuplicate = "page.duplicate"
-    static let pageReorder = "page.reorder"
-    static let pageRotate = "page.rotate"
-    static let pageTrash = "page.trash"
-    static let exportPresent = "export.present"
-    static let markSeen = "collab.markSeen"
-    static let sidebarToggle = "sidebar.toggle"
+    static let movePagesPanel = PanelIDs.movePages
+    static let pageCopy = CommandIDs.pageCopy
+    static let pagePaste = CommandIDs.pagePaste
+    static let pageDuplicate = CommandIDs.pageDuplicate
+    static let pageReorder = CommandIDs.pageReorder
+    static let pageRotate = CommandIDs.pageRotate
+    static let pageTrash = CommandIDs.pageTrash
+    static let exportPresent = CommandIDs.exportPresent
+    static let markSeen = CommandIDs.collabMarkSeen
+    static let sidebarToggle = CommandIDs.sidebarToggle
 }
 
 // MARK: - Thumbnail and selection menus
 
 /// The pages a sidebar menu acts on, resolved from a `MenuContext`: `page` for the thumbnail menu, `nodes` (every
 /// selected page) for the selection. Only live pages of a notebook count.
+///
+/// Menus are evaluated for every thumbnail VoiceOver describes and for the selection bar on every selection change,
+/// so showing a menu never sorts the document: resolving a target costs a lookup of its first page, and the chosen
+/// pages are put in document order (sorting only those) when an entry runs.
 @MainActor
 struct SidebarMenuTarget {
     let app: NibApp
     let session: EditorSession?
     let doc: DocumentID
-    /// In document order.
-    let pages: [PageID]
-    let livePageCount: Int
+    /// The document head the target was resolved against.
+    let content: DocumentContent
+    /// The pages the menu was opened for, as given; at least one of them is live.
+    let ids: [PageID]
+
+    /// The live pages among `ids`, in document order.
+    var pages: [PageID] {
+        if ids.count == 1 { return ids }
+        let wanted = Set(ids)
+        return content.pages.filter { !$0.deleted && wanted.contains($0.id) }
+            .sorted { ($0.order, $0.id.raw) < ($1.order, $1.id.raw) }
+            .map { $0.id }
+    }
 
     var refs: JSONValue { PageDropTarget.refs(pages, doc: doc) }
     var docRef: JSONValue { .string(NodeRef.document(doc).description) }
@@ -64,9 +78,27 @@ struct SidebarMenuTarget {
     /// Writes allowed: not read-only mode, not a read-only document, not locked.
     var canEdit: Bool { SidebarMenuTarget.canEdit(app: app, session: session, doc: doc) }
 
+    /// Some live page is not among these (`page.trash` refuses to empty a notebook). Stops at the first such page.
+    var leavesAPage: Bool {
+        if ids.count == 1 {
+            let only = ids[0]
+            return content.pages.contains { !$0.deleted && $0.id != only }
+        }
+        let chosen = Set(ids)
+        return content.pages.contains { !$0.deleted && !chosen.contains($0.id) }
+    }
+
+    /// Any of these carries the unseen-change badge (no work when the document has none).
+    var hasUnseen: Bool {
+        let marked = UnseenPages.of(app)?.pages(in: doc) ?? []
+        return !marked.isEmpty && ids.contains { marked.contains($0) }
+    }
+
+    /// The badged pages among these, in document order.
     var unseen: [PageID] {
-        guard let tracker = UnseenPages.of(app) else { return [] }
-        return pages.filter { tracker.isUnseen(doc, $0) }
+        let marked = UnseenPages.of(app)?.pages(in: doc) ?? []
+        guard !marked.isEmpty else { return [] }
+        return pages.filter { marked.contains($0) }
     }
 
     static func canEdit(app: NibApp, session: EditorSession?, doc: DocumentID) -> Bool {
@@ -83,12 +115,15 @@ struct SidebarMenuTarget {
     }
 
     private static func make(_ ctx: MenuContext, _ ids: [PageID]) -> SidebarMenuTarget? {
-        guard let doc = ctx.doc ?? ctx.session?.document, !ids.isEmpty,
+        guard let doc = ctx.doc ?? ctx.session?.document, let first = ids.first,
               let content = try? ctx.app.workspace.content(doc), content.meta.kind == .notebook else { return nil }
-        let live = content.livePages.map { $0.id }
-        let pages = ReorderPlan.stack(ids, in: live)
-        guard !pages.isEmpty else { return nil }
-        return SidebarMenuTarget(app: ctx.app, session: ctx.session, doc: doc, pages: pages, livePageCount: live.count)
+        // Usually the first page is live (one scan up to it); otherwise one pass over the document.
+        let firstLive = content.page(first).map { !$0.deleted } ?? false
+        if !firstLive {
+            let wanted = Set(ids)
+            guard content.pages.contains(where: { !$0.deleted && wanted.contains($0.id) }) else { return nil }
+        }
+        return SidebarMenuTarget(app: ctx.app, session: ctx.session, doc: doc, content: content, ids: ids)
     }
 }
 
@@ -143,7 +178,8 @@ enum SidebarMenus {
 
     /// `{doc, position: after, anchor}` after the thumbnail's page.
     static func afterParams(_ t: SidebarMenuTarget, source: String? = nil) -> JSONValue {
-        var o = PageDropTarget.after(t.pages[t.pages.count - 1]).placement(doc: t.doc)
+        guard let last = t.pages.last else { return .object([:]) }
+        var o = PageDropTarget.after(last).placement(doc: t.doc)
         if let source = source { o["source"] = .string(source) }
         return .object(o)
     }
@@ -181,7 +217,7 @@ enum SidebarMenus {
         list.append(SidebarAction(key: "markSeen", title: String(localized: "Mark as Seen"), symbol: .checkmark,
                                   command: SidebarIDs.markSeen, order: 350, edits: false,
                                   params: { t in SidebarMenus.markSeenParams(t) },
-                                  isVisible: { t in SidebarMenus.hasCommand(t, SidebarIDs.markSeen) && !t.unseen.isEmpty }))
+                                  isVisible: { t in SidebarMenus.hasCommand(t, SidebarIDs.markSeen) && t.hasUnseen }))
         list.append(SidebarAction(key: "move", title: String(localized: "Move to Another Notebook…"), symbol: .notebook,
                                   command: CommandIDs.panelOpen, order: 400, quick: true,
                                   params: { t in SidebarMenus.moveParams(t) },
@@ -193,7 +229,7 @@ enum SidebarMenus {
         list.append(SidebarAction(key: "trash", title: String(localized: "Move to Trash"), symbol: .trash,
                                   command: SidebarIDs.pageTrash, order: 950, quick: true, destructive: true,
                                   params: { t in SidebarMenus.pagesParams(t) },
-                                  isVisible: { t in t.pages.count < t.livePageCount }))
+                                  isVisible: { t in t.leavesAPage }))
         return list
     }
 
@@ -233,13 +269,21 @@ enum SidebarMenus {
     }
 }
 
-/// Whether the system pasteboard holds copied pages, without reading it (no paste prompt). FeatPages keeps the page
-/// clipboard in memory only in hostless tests, so the probe says no there.
+/// Whether the system pasteboard holds copied pages, without reading it (no paste prompt). The answer is kept until
+/// the pasteboard changes (`changeCount`), so evaluating many menus asks the pasteboard server once. FeatPages keeps
+/// the page clipboard in memory only in hostless tests, so the probe says no there.
 @MainActor
 enum PageClipboardProbe {
+    private static var cached: (changeCount: Int, hasPages: Bool)?
+
     static var hasPages: Bool {
         guard !NibApp.isHostlessTest else { return false }
-        return UIPasteboard.general.contains(pasteboardTypes: [PagesPayload.typeIdentifier])
+        let board = UIPasteboard.general
+        let count = board.changeCount
+        if let cached = cached, cached.changeCount == count { return cached.hasPages }
+        let has = board.contains(pasteboardTypes: [PagesPayload.typeIdentifier])
+        cached = (changeCount: count, hasPages: has)
+        return has
     }
 }
 
@@ -264,13 +308,20 @@ final class UnseenPages {
     private var subscriptions: [EventSubscription] = []
     private weak var app: NibApp?
 
-    /// Creates the tracker and hooks `collab.markSeen` (register time: fills services and registries only).
+    /// Creates the tracker and hooks `collab.markSeen` (register time: fills services and registries only). A dry run
+    /// (an AI preview) clears nothing; a call without `pages` marks the caller's open page, as the command does.
     static func install(_ app: NibApp) {
         let tracker = UnseenPages()
         app.services.set(tracker, for: serviceKey)
-        app.bus.hooks.register(CommandHookDescriptor(id: "sidebar.unseen.markSeen", owner: FeatSidebarFeature.id,
-                                                     commands: [SidebarIDs.markSeen]) { [weak tracker] _, params in
-            tracker?.markSeen(refs: params["pages"]?.arrayValue?.compactMap { $0.stringValue } ?? [])
+        app.bus.hooks.register(CommandHookDescriptor.guarding(id: "sidebar.unseen.markSeen", owner: FeatSidebarFeature.id,
+                                                              commands: [SidebarIDs.markSeen]) { [weak tracker] _, params, ctx in
+            guard let tracker = tracker, !ctx.dryRun else { return nil }
+            let refs = params["pages"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+            if !refs.isEmpty {
+                tracker.markSeen(refs: refs)
+            } else if let open = try? ctx.pageOrSession(nil) {
+                tracker.markSeen(open.doc, [open.page])
+            }
             return nil
         })
     }

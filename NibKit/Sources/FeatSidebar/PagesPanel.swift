@@ -66,13 +66,24 @@ enum PageRows {
 /// Page thumbnails rendered by `services.renderer` off the main actor. A page that changes keeps its old image on
 /// screen until the new render lands; a render that finishes after its page changed again is dropped and redone. The
 /// cache is bounded (a 1,000-page notebook never holds every thumbnail) and NSCache empties itself under memory pressure.
+///
+/// A request waits `coalescingDelay` before it renders, and the grid cancels the requests of thumbnails that scroll
+/// away before their image arrives, so a fling through a long notebook renders only the pages it stops on.
 @MainActor
 final class ThumbnailStore {
+    /// One render in flight; `token` tells a finishing render whether it is still the page's current one.
+    private struct Load {
+        let token: Int
+        let task: Task<Void, Never>
+    }
+
     private let images = NSCache<NSString, UIImage>()
-    private var loading: Set<PageID> = []
+    private var loads: [PageID: Load] = [:]
     private var stale: Set<PageID> = []
     private var generations: [PageID: Int] = [:]
-    private var epoch = 0
+    private var nextToken = 0
+    /// How long a request waits before rendering (40 ms: about three frames of a fling).
+    var coalescingDelay: UInt64 = 40_000_000
     /// A page's image arrived.
     var onLoad: (@MainActor (PageID) -> Void)?
 
@@ -83,7 +94,10 @@ final class ThumbnailStore {
 
     func image(_ page: PageID) -> UIImage? { images.object(forKey: page.raw as NSString) }
 
-    /// True when `page` has no image, an out-of-date one, or one much smaller than `pixelSize` (a wider layout).
+    /// A render of `page` is waiting or running.
+    func isLoading(_ page: PageID) -> Bool { loads[page] != nil }
+
+    /// True when `page` has no image, an out-of-date one, or one under 80% of `pixelSize` (a wider layout).
     func needsRender(_ page: PageID, pixelSize: Int) -> Bool {
         if stale.contains(page) { return true }
         guard let image = image(page) else { return true }
@@ -98,25 +112,35 @@ final class ThumbnailStore {
         }
     }
 
+    /// Forgets every image and drops every render in flight (another document): nothing already requested lands.
     func removeAll() {
+        for load in loads.values { load.task.cancel() }
+        loads.removeAll()
         images.removeAllObjects()
-        loading.removeAll()
         stale.removeAll()
         generations.removeAll()
-        epoch += 1
+    }
+
+    /// Drops the render of `page` if it has not landed yet (its thumbnail scrolled away); the next request starts over.
+    func cancel(_ page: PageID) {
+        guard let load = loads.removeValue(forKey: page) else { return }
+        load.task.cancel()
     }
 
     func request(doc: DocumentID, page: PageID, pixelSize: Int, renderer: PageRenderer?) {
-        guard pixelSize > 0, needsRender(page, pixelSize: pixelSize), !loading.contains(page), let renderer = renderer else {
+        guard pixelSize > 0, loads[page] == nil, needsRender(page, pixelSize: pixelSize), let renderer = renderer else {
             return
         }
-        loading.insert(page)
-        let epochAtStart = epoch
+        nextToken += 1
+        let token = nextToken
         let generation = generations[page] ?? 0
-        Task { @MainActor [weak self] in
+        let delay = coalescingDelay
+        let task = Task { @MainActor [weak self] in
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            guard !Task.isCancelled else { return }
             let cgImage = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: pixelSize)
-            guard let self = self, self.epoch == epochAtStart else { return }
-            self.loading.remove(page)
+            guard let self = self, self.loads[page]?.token == token else { return }
+            self.loads[page] = nil
             guard (self.generations[page] ?? 0) == generation else {
                 self.request(doc: doc, page: page, pixelSize: pixelSize, renderer: renderer)
                 return
@@ -127,6 +151,7 @@ final class ThumbnailStore {
                                   cost: cgImage.bytesPerRow * cgImage.height)
             self.onLoad?(page)
         }
+        loads[page] = Load(token: token, task: task)
     }
 }
 
@@ -154,7 +179,22 @@ final class PagesPanelModel: ObservableObject {
     @Published private(set) var isSelecting = false
     @Published private(set) var selection: Set<PageID> = []
     @Published private(set) var canEdit = false
-    @Published private(set) var thumbnailRevision = 0
+    /// A destructive batch action waiting for the user to confirm it (the selection bar asks).
+    @Published private(set) var pendingTrash: PendingTrash?
+
+    /// A destructive action on several pages, waiting for confirmation.
+    struct PendingTrash: Identifiable {
+        let id = UUID()
+        let item: MenuItemDescriptor
+        let context: MenuContext
+        var count: Int { context.nodes.count }
+    }
+
+    /// Fires (at most once until `takeChangedThumbnails`) when a page's thumbnail changed: its image arrived or the
+    /// page was edited. Not @Published: only the grid listens, and it refreshes just those thumbnails, so a render
+    /// landing or a stroke on the page never re-renders the header, the bar or every visible thumbnail.
+    let thumbnailsChanged = PassthroughSubject<Void, Never>()
+    private var changedThumbnails: Set<PageID> = []
 
     /// Every live page in document order (not only the shown ones).
     private(set) var order: [PageID] = []
@@ -165,7 +205,7 @@ final class PagesPanelModel: ObservableObject {
     init(app: NibApp, session: EditorSession?) {
         self.app = app
         self.session = session
-        thumbnails.onLoad = { [weak self] _ in self?.thumbnailRevision += 1 }
+        thumbnails.onLoad = { [weak self] page in self?.noteThumbnails([page]) }
         session?.$document.dropFirst().sink { [weak self] _ in self?.schedule() }.store(in: &cancellables)
         session?.$page.dropFirst().sink { [weak self] _ in self?.schedule() }.store(in: &cancellables)
         session?.$readOnly.dropFirst().sink { [weak self] _ in self?.schedule() }.store(in: &cancellables)
@@ -213,6 +253,8 @@ final class PagesPanelModel: ObservableObject {
         if next != doc {
             doc = next
             thumbnails.removeAll()
+            changedThumbnails = []
+            if pendingTrash != nil { pendingTrash = nil }
             if !selection.isEmpty { selection = [] }
             if isSelecting { isSelecting = false }
         }
@@ -245,9 +287,23 @@ final class PagesPanelModel: ObservableObject {
         }
         if !pages.isEmpty {
             thumbnails.invalidate(pages)
-            thumbnailRevision += 1
+            noteThumbnails(pages)
         }
         if changeset.headChanged(doc) { schedule() }
+    }
+
+    private func noteThumbnails(_ pages: Set<PageID>) {
+        guard !pages.isEmpty else { return }
+        let wasEmpty = changedThumbnails.isEmpty
+        changedThumbnails.formUnion(pages)
+        if wasEmpty { thumbnailsChanged.send() }
+    }
+
+    /// The pages whose thumbnails changed since the last call.
+    func takeChangedThumbnails() -> Set<PageID> {
+        let changed = changedThumbnails
+        changedThumbnails = []
+        return changed
     }
 
     func thumbnail(_ page: PageID) -> UIImage? { thumbnails.image(page) }
@@ -255,6 +311,11 @@ final class PagesPanelModel: ObservableObject {
     func requestThumbnail(_ page: PageID, pixelSize: Int) {
         guard let doc = doc else { return }
         thumbnails.request(doc: doc, page: page, pixelSize: pixelSize, renderer: app.services.renderer)
+    }
+
+    /// The thumbnail scrolled away: drop its render unless it has landed.
+    func cancelThumbnail(_ page: PageID) {
+        thumbnails.cancel(page)
     }
 
     // MARK: Selection
@@ -308,6 +369,42 @@ final class PagesPanelModel: ObservableObject {
         MenuContext(app: app, session: session, doc: doc, nodes: orderedSelection)
     }
 
+    /// A destructive batch entry on more than one page asks first (the pages stay recoverable from the page Trash).
+    static func needsConfirmation(_ item: MenuItemDescriptor, _ context: MenuContext) -> Bool {
+        item.destructive && item.location == .sidebarSelection && context.nodes.count > 1
+    }
+
+    /// Every way to run a menu entry (the bottom row, the context menu, ⌫, VoiceOver actions) comes through here, so a
+    /// multi-page Trash always asks: it waits in `pendingTrash`; everything else runs.
+    func perform(_ item: MenuItemDescriptor, _ context: MenuContext) {
+        if PagesPanelModel.needsConfirmation(item, context) {
+            requestTrash(item, context)
+        } else {
+            Task { @MainActor in await self.run(item, context) }
+        }
+    }
+
+    /// Asks before running `item` on the selection.
+    func requestTrash(_ item: MenuItemDescriptor, _ context: MenuContext) {
+        pendingTrash = PendingTrash(item: item, context: context)
+    }
+
+    /// The user confirmed: runs the waiting action (one command).
+    func confirmPendingTrash() async {
+        guard let pending = pendingTrash else { return }
+        await confirm(pending)
+    }
+
+    /// Runs a confirmed action (the dialog may already have cleared `pendingTrash` while closing).
+    func confirm(_ pending: PendingTrash) async {
+        if pendingTrash?.id == pending.id { pendingTrash = nil }
+        await run(pending.item, pending.context)
+    }
+
+    func cancelPendingTrash() {
+        if pendingTrash != nil { pendingTrash = nil }
+    }
+
     /// Runs a menu entry (one command). Trash and Move end select mode: their pages leave this list.
     @discardableResult
     func run(_ item: MenuItemDescriptor, _ context: MenuContext) async -> Bool {
@@ -324,12 +421,17 @@ final class PagesPanelModel: ObservableObject {
         do {
             return try await app.bus.execute(command, params, session: session)
         } catch {
-            let wrapped = NibError.wrap(error)
-            sidebarLog.error("\(command, privacy: .public) failed: \(wrapped.description, privacy: .public)")
-            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                            userInfo: ["command": command, "error": wrapped])
+            fail(command, error)
             return nil
         }
+    }
+
+    /// Shows a failure in the shell's toast (a drop that could not be read never fails silently).
+    private func fail(_ command: String, _ error: Error) {
+        let wrapped = NibError.wrap(error)
+        sidebarLog.error("\(command, privacy: .public) failed: \(wrapped.description, privacy: .public)")
+        NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                        userInfo: ["command": command, "error": wrapped])
     }
 
     // MARK: Actions
@@ -408,7 +510,10 @@ final class PagesPanelModel: ObservableObject {
         for provider in providers {
             if let d = await PageDragProvider.loadPayload(provider) { loaded.append(d) }
         }
-        guard !loaded.isEmpty else { return }
+        guard !loaded.isEmpty else {
+            fail(SidebarIDs.pagePaste, NibError(.unavailable, "the dropped pages could not be read", hint: "drag them again"))
+            return
+        }
         let blobs = loaded
         let payload: JSONValue
         do {
@@ -421,8 +526,7 @@ final class PagesPanelModel: ObservableObject {
                 return try merged.json()
             }.value
         } catch {
-            NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                            userInfo: ["command": SidebarIDs.pagePaste, "error": NibError.wrap(error)])
+            fail(SidebarIDs.pagePaste, error)
             return
         }
         var params = place.placement(doc: target)
@@ -437,10 +541,15 @@ final class PagesPanelModel: ObservableObject {
     func importFiles(_ providers: [NSItemProvider], into target: DocumentID, at place: PageDropTarget) async {
         guard SidebarMenuTarget.canEdit(app: app, session: session, doc: target) else { return }
         let urls = await DroppedFiles.load(providers)
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty else {
+            fail(CommandIDs.importFiles, NibError(.unavailable, "the dropped files could not be read", hint: "drag them again"))
+            return
+        }
         var params = place.placement(doc: target)
         params["urls"] = .array(urls.map { .string($0.absoluteString) })
         await run(CommandIDs.importFiles, .object(params))
+        // The pages hold their own copies now (or the import failed): the dropped copies go either way.
+        DroppedFiles.cleanUp(urls)
     }
 
     /// Shows `next` (document order) right away, before the command's commit arrives.
@@ -600,16 +709,10 @@ struct PagesPanelHeader: View {
 }
 
 /// Select mode's bottom row: the selection's quick actions as icons, the rest (plugins too) in More. Every entry is a
-/// `MenuLocation.sidebarSelection` item, so it runs one command for the whole selection.
+/// `MenuLocation.sidebarSelection` item, so it runs one command for the whole selection. It also asks to confirm a
+/// multi-page Trash from anywhere (the model's `pendingTrash`: this row, the context menu, ⌫, VoiceOver).
 struct PagesSelectionBar: View {
     @ObservedObject var model: PagesPanelModel
-    @State private var pendingTrash: PendingAction?
-
-    struct PendingAction: Identifiable {
-        let id = UUID()
-        let item: MenuItemDescriptor
-        let context: MenuContext
-    }
 
     var body: some View {
         let context = model.selectionMenuContext()
@@ -625,7 +728,7 @@ struct PagesSelectionBar: View {
             HStack(spacing: 0) {
                 ForEach(quick, id: \.id) { item in
                     NibIconButton(PagesSelectionBar.symbol(item) ?? .more, label: item.resolvedTitle(for: context),
-                                  size: .panel) { perform(item, context) }
+                                  size: .panel) { model.perform(item, context) }
                         .frame(maxWidth: .infinity)
                 }
                 if !more.isEmpty {
@@ -637,11 +740,14 @@ struct PagesSelectionBar: View {
             .padding(.horizontal, NibSpacing.xs)
             .padding(.vertical, NibSpacing.xxs)
         }
-        .confirmationDialog(trashTitle, isPresented: trashShown, titleVisibility: .visible, presenting: pendingTrash) { pending in
+        .confirmationDialog(trashTitle, isPresented: trashShown, titleVisibility: .visible,
+                            presenting: model.pendingTrash) { pending in
             Button(pending.item.resolvedTitle(for: pending.context), role: .destructive) {
-                run(pending.item, pending.context)
+                // The dialog clears `pendingTrash` as it closes, so the confirmed action travels with the tap.
+                let model = self.model
+                Task { @MainActor in await model.confirm(pending) }
             }
-            Button(String(localized: "Cancel"), role: .cancel) {}
+            Button(String(localized: "Cancel"), role: .cancel) { model.cancelPendingTrash() }
         } message: { _ in
             Text(String(localized: "You can restore them from the notebook's Trash."))
         }
@@ -677,7 +783,7 @@ struct PagesSelectionBar: View {
 
     private func button(_ item: MenuItemDescriptor, _ context: MenuContext) -> some View {
         Button(role: item.destructive ? .destructive : nil) {
-            perform(item, context)
+            model.perform(item, context)
         } label: {
             Label {
                 Text(item.resolvedTitle(for: context))
@@ -688,24 +794,12 @@ struct PagesSelectionBar: View {
     }
 
     private var trashTitle: String {
-        String(localized: "Move \(model.selection.count) pages to the Trash?")
+        String(localized: "Move \(model.pendingTrash?.count ?? model.selection.count) pages to the Trash?")
     }
 
     private var trashShown: Binding<Bool> {
-        Binding(get: { pendingTrash != nil }, set: { shown in if !shown { pendingTrash = nil } })
-    }
-
-    /// Destructive batch actions on more than one page ask first (they stay recoverable from the page Trash).
-    private func perform(_ item: MenuItemDescriptor, _ context: MenuContext) {
-        if item.destructive && context.nodes.count > 1 {
-            pendingTrash = PendingAction(item: item, context: context)
-        } else {
-            run(item, context)
-        }
-    }
-
-    private func run(_ item: MenuItemDescriptor, _ context: MenuContext) {
-        Task { @MainActor in await model.run(item, context) }
+        let model = self.model
+        return Binding(get: { model.pendingTrash != nil }, set: { shown in if !shown { model.cancelPendingTrash() } })
     }
 }
 
