@@ -1,0 +1,41 @@
+{
+ "verdict": "needs-fix",
+ "issues": [
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/NibRender/ThumbnailCache.swift:9,62-76 and NibKit/Sources/NibRender/TileRenderer.swift:254-277 (thumbnail / invalidate)",
+   "problem": "The disk thumbnail can stay stale for good. The class comment claims that any edit, undo or synced change produces a new key, but that is false. Workspace.merge keeps the remote rev, so a remote or collaboration patch can add an item or tombstone whose rev is lower than the page's current max rev. Example: device A adds strokes offline at 10:00; device B edits the page at 10:05 and writes 10:05-160.png; A's patch then merges on B. The commit observer only drops the memory entry, thumbnail() recomputes the same maxRev, and the old disk file is served without A's strokes (across relaunches) until someone edits the page locally. The same race happens during live collaboration, where patches routinely arrive a few ms 'older' than the last local edit.",
+   "fix": "Make the disk key content-exact. In snapshot(needsRev:), compute a stable digest over every item's (id, rev), for example FNV-1a 64 over `id.raw + rev.description` (not Hasher). Put it in the key (fileName `<maxRev>-<digest>-<px>.png`; the prefix used to remove older files becomes `<maxRev>-<digest>-`). Alternative: in invalidate(doc:page:rect:), enqueue deletion of `<dir>/<doc>/<page>/` on `queue`, and in thumbnail() write to disk only if `tiles.generation(job.pageKey) == job.generation`, so a render that started before the commit cannot re-persist stale pixels. Add a test: merge an item with an older Rev through the harness, then assert that the thumbnail changes."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/NibRender/TileRenderer.swift:347-358 (run) and 430-451 (renderTiles)",
+   "problem": "Renders ignore Swift Task cancellation (a gap for P-091, large-PDF and large-library performance). Every request goes into a FIFO OperationQueue with 3 workers and always runs to completion. When the canvas flings through a 1,000-page PDF, or the library grid scrolls past thousands of cells, their `.task`s get cancelled, but every stale tile or thumbnail request still renders first. Visible tiles queue behind seconds of dead work, which breaks the 'page open to first paint' budget. Callers cannot fix this themselves because the queue and its operations are private.",
+   "fix": "Wrap both continuations in `withTaskCancellationHandler`. Keep the BlockOperation(s) you add. In onCancel, call `op.cancel()` (or set a locked flag). At the start of each operation, `if op.isCancelled { continuation.resume(throwing: CancellationError()); return }`. In renderTiles, skip cancelled tiles (still `group.leave()`). In produce/composeFromTiles, throw CancellationError when `Task.isCancelled` after renderTiles. Add a test that cancels a render Task behind a blocked queue and asserts CancellationError, or asserts that no tile was cached."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibRender/TileRenderer.swift:228-235 and 254-271",
+   "problem": "When a drawer or template is registered later (plugin templates, plugin custom drawers, content packs loaded after launch), only the tile cache and the memory thumbnails are cleared. A thumbnail already rendered without the template (white fallback) or without the plugin's drawer stays on disk under the same rev and is served indefinitely.",
+   "fix": "In thumbnail(), don't write to disk when `job.background.kind == .template && job.template == nil`. In the `.nibRegistryDidChange` handler, also enqueue removal of the previews directory contents on `queue`; the files are only a cache."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibRender/PageCompositor.swift:279 (and RenderJob.visibleItems, :43-46)",
+   "problem": "Every tile re-filters the page's whole item array (visibleItems allocates a new array on each access) and recomputes `item.bounds`, which scans every point of every stroke (Stroke.bounds). Per-tile cost therefore grows with the page's total ink, not the tile's. A large whiteboard (tens of thousands of strokes) exceeds the 8 ms per-tile budget before any drawing starts.",
+   "fix": "Compute `[(Item, Rect)]` for the visible items once per RenderJob, lazily and off-main (for example in a small final class box captured by the job, built on first use under a lock or in the first worker). Cull tiles and number marks from that array."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibRender/NibRenderFeature.swift:76-78",
+   "problem": "For a board with no region, render.page computes the content bounds on the main actor over every item's points (Stroke.bounds is O(points)). On large boards this can block main for more than 16 ms (ARCHITECTURE §14), even though the renderer already computes the same region off-main in region(for:).",
+   "fix": "Compute the default region off-main, e.g. `let items = try ctx.workspace.items(...)` (a cheap COW copy on main) followed by `await Task.detached { RenderGeometry.defaultRegion(size: nil, items: items.filter{...}) }.value`, or add an internal renderer entry point that applies the 1568 px cap after it resolves the region."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Tests/NibRenderTests/NibRenderTests.swift",
+   "problem": "The riskiest cache logic has no tests: TileCache.insert refusing a tile rendered from a snapshot older than an invalidate/removeAll (the stale-tile guard), a thumbnail re-rendering after a commit or merge (memory forget plus the new disk key), and pixel-level checks for the dotted pattern and spotlight fading (the tests only check band flags).",
+   "fix": "Add (1) a pure TileCache test: take `generation(page)`, call `invalidate(page:rect:nil)`, then assert that `insert(..., generation: old)` returns false and `count(page:) == 0`, and do the same after `removeAll()`. (2) A thumbnail test: render, run test.putStroke, render again, and assert a different rev file or different pixels. (3) A dotted stroke pixel test (dot present, gap open) and a spotlight test (a stroke with t0 > time renders at about 25% ink)."
+  }
+ ]
+}

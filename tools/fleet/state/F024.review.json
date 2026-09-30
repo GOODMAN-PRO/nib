@@ -1,0 +1,47 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPDF/PDFImporter.swift PDFImportPreparation.prepare / burnInAnnotations",
+      "problem": "Spec says the importer 'never splits/rewrites the PDF', but any PDF with an annotation other than Link/Popup (highlights, notes, stamps, widgets) is rewritten through PDFKit burn-in. D-088 justifies it for form fields, but the deviation is not reported, and nothing checks that text and outline survive the rewrite.",
+      "fix": "Keep the burn-in. In testFormFieldsAreFlattenedAtImportAndLinksSurvive, also assert that pdf.text still returns the page text and that services.pdf.outline(url) is kept on the flattened asset (use TestPDF.withOutline). Report the rewrite-on-annotations deviation in the F024 summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPDF/PDFImporter.swift importPDF / prepare",
+      "problem": "A dry run still runs prepare() in full. For a locked PDF it shows the password alert (a UI side effect during a preview), and for an annotated PDF it does a full flatten, even on the new-notebook path whose result is thrown away.",
+      "fix": "In importPDF, return [] before prepare() when ctx.dryRun && target.document == nil. In prepare(), when ctx.dryRun, rethrow PasswordFailure as NibError(.userDenied, ...) (or return a size-only preview) instead of asking the PDFPasswordProvider."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPDF/PDFImporter.swift createNotebook",
+      "problem": "The notebook is created with no pages and the pages are added by a second, non-undoable write. LibraryService.createDocument's contract says the content includes the first page(s). A crash or kill between the two writes leaves an empty notebook in the library, and sync can pick it up.",
+      "fix": "Compute the content-addressed ref up front (AssetRef(SHA256(data).hex + \".pdf\") with CryptoKit, as AssetStore.put documents). Pass DocumentContent(meta:, pages: pageRecords(...)) to createDocument, then call assets.put and check the returned ref equals the one computed. Keep the deletePermanently cleanup on any failure."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/NibPDFTests/NibPDFTests.swift",
+      "problem": "The riskiest cleanup path has no test: createNotebook's catch block (workspace.close plus library.deletePermanently when the asset store or mutate throws). There is also no test for the PDFKitService cache stamp (a changed file must be re-read).",
+      "fix": "Add a test that swaps h.app.services.assets for an AssetStore whose put throws, imports a PDF as a new notebook, expects the error, and asserts h.library.allNodes().count is unchanged. Add a service test that rewrites the file (different size) and asserts the new text is returned."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPDF/PDFImporter.swift decryptedCopy (fallback branch)",
+      "problem": "When dataRepresentation() of the unlocked document is still encrypted, the fallback copies the pages into a fresh PDFDocument. The outline is lost (the spec says the outline is kept), and internal link destinations still point at pages of the old document.",
+      "fix": "In the fallback, rebuild fresh.outlineRoot by walking pdf.outlineRoot and remapping each destination to fresh.page(at: pdf.index(for: destination.page)). Remap internal link destinations on the copied pages the same way."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPDF/PDFCommands.swift PDFPageSource.resolve, PDFResultPaging.start",
+      "problem": "The invalid_params errors (bad page ref, bad cursor) carry a path but no hint. ARCHITECTURE section 15.6 requires a hint on parameter errors.",
+      "fix": "Add hints such as hint: \"get page refs from query.context or query.find\" and hint: \"omit cursor to start from the beginning\"."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPDF/PDFImporter.swift AlertPasswordProvider / prepare",
+      "problem": "The prompt shows url.lastPathComponent, which includes the '<UUID>-' prefix that downloaded files get. The continuation is resumed only by the two alert actions, so if the alert goes away without one (scene disconnect), the import awaits forever. User-presence waits elsewhere are bounded (the bridge waits 120 s).",
+      "fix": "Pass PDFImporter.title(of: url) as the displayed name. Resume the continuation with nil when the alert is dismissed without an action, for example from a viewDidDisappear hook on a small UIAlertController subclass, guarded so it resumes only once."
+    }
+  ]
+}
