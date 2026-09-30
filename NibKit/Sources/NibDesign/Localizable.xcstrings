@@ -1,7 +1,261 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
-
+    "%.0f points" : {
+      "comment" : "VoiceOver label of a width preset in points"
+    },
+    "%.0f pt" : {
+      "comment" : "A width in points, shown beside a slider (for example 12 pt)"
+    },
+    "%.1f millimetres" : {
+      "comment" : "VoiceOver label of a width preset in millimetres"
+    },
+    "%.2f mm" : {
+      "comment" : "A width in millimetres, shown beside a slider"
+    },
+    "%@ plugin" : {},
+    "%@, %@" : {
+      "comment" : "VoiceOver: a colour and its tape pattern, or a button and its detail (Good, 3 days)"
+    },
+    "%@, plugin" : {},
+    "%lld changes" : {},
+    "9 notebooks" : {},
+    "A switch" : {},
+    "Accept %@" : {},
+    "Accept %lld" : {},
+    "Added: %@" : {
+      "comment" : "VoiceOver: a permission a plugin update adds"
+    },
+    "Allow for this turn" : {},
+    "Allow once" : {},
+    "And me" : {},
+    "Apple Pencil" : {},
+    "Applied %lld changes" : {},
+    "Apricot" : {
+      "comment" : "Highlighter colour name"
+    },
+    "Assistant" : {
+      "comment" : "Who made a change (history, provenance badge)"
+    },
+    "Blush" : {
+      "comment" : "Highlighter colour name"
+    },
+    "Board" : {
+      "comment" : "Paper colour name"
+    },
+    "Bookmark" : {},
+    "Bridge" : {
+      "comment" : "Who made a change (history, provenance badge)"
+    },
+    "Buttons and badges" : {},
+    "Cancel" : {},
+    "Carbon" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Chalk" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Clear search" : {},
+    "Close" : {},
+    "Close %@" : {},
+    "Cobalt" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Collaborator" : {
+      "comment" : "Who made a change (history, provenance badge)"
+    },
+    "Collapse %@" : {
+      "comment" : "VoiceOver: folds an outline entry"
+    },
+    "Colour" : {},
+    "Components" : {},
+    "Controls" : {},
+    "Copy" : {
+      "comment" : "Copies a code block (bridge configuration, tool call)"
+    },
+    "Create" : {},
+    "Crimson" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Custom…" : {},
+    "Dark" : {},
+    "Delete" : {},
+    "Delete 1 page" : {},
+    "Delete 4 items" : {},
+    "Deny" : {},
+    "Design Gallery" : {},
+    "Developer" : {},
+    "Disabled" : {},
+    "Discard" : {},
+    "Discard %@" : {},
+    "Documents" : {},
+    "Done" : {},
+    "Drag me" : {},
+    "Edited today" : {},
+    "Elevation and glass" : {},
+    "Eraser" : {},
+    "Expand %@" : {
+      "comment" : "VoiceOver: unfolds an outline entry"
+    },
+    "Favourite" : {},
+    "Fix period" : {},
+    "Glyphs" : {},
+    "Graphite" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Grey" : {
+      "comment" : "Paper colour name"
+    },
+    "Grouped row" : {},
+    "Haptics (tap to feel)" : {},
+    "Hide text" : {
+      "comment" : "VoiceOver: hides the characters of a password or API key field"
+    },
+    "Highlighter" : {},
+    "Import" : {},
+    "In progress" : {
+      "comment" : "VoiceOver value of an assistant tool-trace row that is still running"
+    },
+    "Include change %lld" : {},
+    "Ink" : {},
+    "Ink and highlighters" : {},
+    "Ivory" : {
+      "comment" : "Paper colour name"
+    },
+    "Lagoon" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Laser" : {},
+    "Lasso" : {},
+    "Legal" : {
+      "comment" : "Paper colour name"
+    },
+    "Lemon" : {
+      "comment" : "Highlighter colour name"
+    },
+    "Library" : {},
+    "Light" : {},
+    "Lilac" : {
+      "comment" : "Highlighter colour name"
+    },
+    "Line 5" : {},
+    "Liquid" : {},
+    "Midnight" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Mint" : {
+      "comment" : "Highlighter colour name"
+    },
+    "More" : {},
+    "More tools" : {},
+    "Moss" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Move palette to the bottom" : {},
+    "Move palette to the left edge" : {},
+    "Move palette to the right edge" : {},
+    "Move palette to the top" : {},
+    "Moved to Chemistry." : {},
+    "Navy" : {
+      "comment" : "Notebook cover cloth name"
+    },
+    "New Notebook" : {},
+    "Night" : {
+      "comment" : "Paper colour name"
+    },
+    "No notebooks yet" : {},
+    "Ochre" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "On page" : {},
+    "Opacity" : {},
+    "Open a sheet" : {},
+    "Oxblood" : {
+      "comment" : "Notebook cover cloth name"
+    },
+    "Page %lld" : {},
+    "Page 3" : {},
+    "Page 3 · Handwriting" : {},
+    "Pages" : {},
+    "Panels and sheets" : {},
+    "Paper" : {
+      "comment" : "Notebook cover cloth name"
+    },
+    "Paper, covers, folders, presence" : {},
+    "Pen" : {},
+    "Pencil down" : {},
+    "Permissions" : {},
+    "Physics 9702" : {},
+    "Plugin" : {
+      "comment" : "Provenance badge: made by a plugin"
+    },
+    "Plugins" : {},
+    "Plum" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Pressure" : {},
+    "Pressure sensitivity" : {},
+    "Previewing on the page. Nothing changes until you accept." : {},
+    "Proposed edit" : {},
+    "Reads documents" : {},
+    "Redo" : {},
+    "Reload" : {},
+    "Remove %@" : {},
+    "Removed: %@" : {
+      "comment" : "VoiceOver: a permission a plugin update removes"
+    },
+    "Report a Problem" : {},
+    "Review %lld changes" : {},
+    "Sand" : {
+      "comment" : "Notebook cover cloth name"
+    },
+    "Search" : {},
+    "Search this notebook" : {},
+    "Send" : {},
+    "Settings" : {},
+    "Sheet" : {},
+    "Show" : {},
+    "Show text" : {
+      "comment" : "VoiceOver: shows the characters of a password or API key field"
+    },
+    "Sienna" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "Sky" : {
+      "comment" : "Highlighter colour name"
+    },
+    "Slate" : {
+      "comment" : "Paper colour name"
+    },
+    "Space" : {},
+    "Spacing, radii, metrics" : {},
+    "Springs (tap to run)" : {},
+    "Step %lld of %lld" : {},
+    "Stone" : {
+      "comment" : "Notebook cover cloth name"
+    },
+    "Tell Nib what to change…" : {},
+    "Terracotta" : {
+      "comment" : "Notebook cover cloth name"
+    },
+    "Thickness" : {},
+    "Toast" : {},
+    "Tokens" : {},
+    "Tools" : {},
+    "Type" : {},
+    "Undo" : {},
+    "Vermilion" : {
+      "comment" : "Ink colour name (also a cover cloth or folder colour)"
+    },
+    "White" : {
+      "comment" : "Paper colour name"
+    },
+    "Word Count" : {},
+    "Write something, or bring in a PDF." : {},
+    "You" : {
+      "comment" : "Who made a change (history, provenance badge)"
+    },
+    "Your model · your API key" : {}
   },
   "version" : "1.0"
 }
