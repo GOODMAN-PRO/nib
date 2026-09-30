@@ -24,7 +24,12 @@ struct WebDAVConfiguration: Equatable {
     var folderComponents: [String] { folder.split(separator: "/").map(String.init) }
 
     /// The library folder as a collection URL (trailing slash).
-    var libraryURL: URL { WebDAVPaths.collectionURL(serverURL, components: folderComponents) }
+    var libraryURL: URL {
+        get throws { try WebDAVPaths.collectionURL(serverURL, components: folderComponents) }
+    }
+
+    /// Plain http: Basic credentials may go out unencrypted because the user chose an http address.
+    var isPlainHTTP: Bool { serverURL.scheme?.lowercased() == "http" }
 
     /// True when the server asks for credentials we do not have (a user name without a saved password).
     var credentialsMissing: Bool { !user.isEmpty && (password ?? "").isEmpty }
@@ -199,35 +204,70 @@ enum WebDAVError: Error, Equatable {
 
 /// Percent-encoding and href decoding shared by the client and the mirror.
 enum WebDAVPaths {
-    /// RFC 3986 unreserved characters plus sub-delims that no server treats specially inside a segment.
+    /// RFC 3986 unreserved characters plus the sub-delims no server treats specially inside a segment. ':' is not
+    /// among them: a first segment such as "Lecture 10:30" would otherwise read as a URL scheme.
     static let segmentAllowed: CharacterSet = {
         var set = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
-        set.insert(charactersIn: "!$&'()*,=:@")
+        set.insert(charactersIn: "!$&'()*,=@")
         return set
     }()
 
-    static func encode(_ segment: String) -> String {
-        segment.addingPercentEncoding(withAllowedCharacters: segmentAllowed) ?? segment
+    static func encode(_ segment: String) -> String? {
+        segment.addingPercentEncoding(withAllowedCharacters: segmentAllowed)
     }
 
-    /// `base` must end in "/". Returns `base` + the encoded components + "/".
-    static func collectionURL(_ base: URL, components: [String]) -> URL {
-        guard !components.isEmpty else { return base }
-        let tail = components.map(encode).joined(separator: "/") + "/"
-        return URL(string: tail, relativeTo: base)?.absoluteURL ?? base
+    /// `base` + the encoded `segments` (+ "/" for a collection), built on the base's percent-encoded path so a
+    /// segment is never parsed as a scheme, host or query. Empty, "." and ".." segments are refused (a server would
+    /// resolve them to another resource); the result is always strictly below `base`.
+    static func url(_ base: URL, segments: [String], collection: Bool) throws -> URL {
+        guard !segments.isEmpty else { return base }
+        let path = segments.joined(separator: "/")
+        guard var components = URLComponents(url: base, resolvingAgainstBaseURL: true) else {
+            throw WebDAVError.local(String(localized: "invalid path \(path)"))
+        }
+        var encoded: [String] = []
+        for segment in segments {
+            guard !segment.isEmpty, segment != ".", segment != "..", let e = encode(segment) else {
+                throw WebDAVError.local(String(localized: "invalid path \(path)"))
+            }
+            encoded.append(e)
+        }
+        var basePath = components.percentEncodedPath
+        if !basePath.hasSuffix("/") { basePath += "/" }
+        components.percentEncodedPath = basePath + encoded.joined(separator: "/") + (collection ? "/" : "")
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url, url.scheme == base.scheme, url.host == base.host else {
+            throw WebDAVError.local(String(localized: "invalid path \(path)"))
+        }
+        return url
     }
 
-    /// `base` must end in "/". Returns `base` + the encoded "/"-separated relative file path.
-    static func fileURL(_ base: URL, path: String) -> URL {
-        let tail = path.split(separator: "/").map { encode(String($0)) }.joined(separator: "/")
-        return URL(string: tail, relativeTo: base)?.absoluteURL ?? base
+    /// `base` + the encoded components + "/".
+    static func collectionURL(_ base: URL, components: [String]) throws -> URL {
+        try url(base, segments: components, collection: true)
+    }
+
+    /// `base` + the encoded "/"-separated relative file path.
+    static func fileURL(_ base: URL, path: String) throws -> URL {
+        guard !path.isEmpty else { throw WebDAVError.local(String(localized: "invalid path \(path)")) }
+        let segments = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        return try url(base, segments: segments, collection: false)
+    }
+
+    /// True when `url` is strictly below `base` (both compared by decoded path components).
+    static func isStrictlyInside(_ url: URL, _ base: URL) -> Bool {
+        guard url.scheme?.lowercased() == base.scheme?.lowercased(), url.host?.lowercased() == base.host?.lowercased()
+        else { return false }
+        let inner = components(of: url), outer = components(of: base)
+        return inner.count > outer.count && sameComponents(inner.prefix(outer.count), outer[...])
     }
 
     /// Decoded path components of an href, which may be an absolute URL or an absolute path. Tolerates servers that
     /// leave spaces unencoded (no URL parsing).
     static func components(ofHref href: String) -> [String] {
         var s = Substring(href.trimmingCharacters(in: .whitespacesAndNewlines))
-        if let r = s.range(of: "://") {
+        if !s.hasPrefix("/"), let r = s.range(of: "://") {
             let rest = s[r.upperBound...]
             s = rest.firstIndex(of: "/").map { rest[$0...] } ?? "/"
         }
@@ -266,6 +306,9 @@ struct DAVResource: Equatable {
     var etag: String?
     var contentLength: Int64?
     var lastModified: Date?
+    /// Listed, but every property failed (403, 423, 5xx): it exists and nothing about it is known. The mirror
+    /// leaves such paths alone instead of reading them as deleted.
+    var isUnknown = false
 
     /// What the mirror compares between syncs: the normalised ETag, else modification date and size.
     var version: String {
@@ -278,8 +321,8 @@ struct DAVResource: Equatable {
 }
 
 /// Parses a 207 Multi-Status body. Namespace prefixes are ignored (servers use `D:`, `d:`, `lp1:` or a default
-/// namespace), properties inside a non-2xx `<propstat>` are dropped, and `<response>`s whose own status is an error
-/// are skipped.
+/// namespace) and properties inside a non-2xx `<propstat>` are dropped. A `<response>` whose own status is 404/410
+/// is skipped (gone); one with no successful property at all is kept as `isUnknown`.
 final class WebDAVMultistatusParser: NSObject, XMLParserDelegate {
     private struct Props {
         var status = 200
@@ -393,10 +436,15 @@ final class WebDAVMultistatusParser: NSObject, XMLParserDelegate {
     private func finishResponse() {
         guard let href = href else { return }
         let ok = propstats.filter { (200..<300).contains($0.status) }
-        if let s = responseStatus, !(200..<300).contains(s), ok.isEmpty { return }
-        if !propstats.isEmpty, ok.isEmpty { return }
         var resource = DAVResource(href: href, components: WebDAVPaths.components(ofHref: href),
                                    isCollection: href.hasSuffix("/"), etag: nil, contentLength: nil, lastModified: nil)
+        let failedResponse = responseStatus.map { !(200..<300).contains($0) } ?? false
+        if ok.isEmpty, failedResponse || !propstats.isEmpty {
+            if let s = responseStatus, s == 404 || s == 410 { return }
+            resource.isUnknown = true
+            resources.append(resource)
+            return
+        }
         for p in ok {
             if p.isCollection { resource.isCollection = true }
             if let e = p.etag { resource.etag = e }
@@ -406,19 +454,29 @@ final class WebDAVMultistatusParser: NSObject, XMLParserDelegate {
         resources.append(resource)
     }
 
-    /// The direct members of the collection a Depth 1 PROPFIND was sent to. The collection's own entry is found by
-    /// its path (or, behind a rewriting proxy, as the shortest href every other href extends), so members are named
-    /// relative to it rather than to the request URL.
-    static func members(of resources: [DAVResource], requestComponents: [String]) -> [DAVResource] {
-        var base = requestComponents
+    /// The path of the collection a PROPFIND was sent to, as the server names it: the request path, or (behind a
+    /// rewriting proxy that answers with another prefix) the shortest href, which is the collection itself.
+    static func base(of resources: [DAVResource], requestComponents: [String]) -> [String] {
         let underRequest = resources.contains { r in
             r.components.count >= requestComponents.count
                 && WebDAVPaths.sameComponents(r.components.prefix(requestComponents.count), requestComponents[...])
         }
         if !underRequest, let shortest = resources.min(by: { $0.components.count < $1.components.count }) {
-            // A rewriting proxy answered with another path prefix: the shortest href is the collection itself.
-            base = shortest.components
+            return shortest.components
         }
+        return requestComponents
+    }
+
+    /// The entry of the collection (or file) the PROPFIND was sent to.
+    static func selfEntry(of resources: [DAVResource], requestComponents: [String]) -> DAVResource? {
+        let base = base(of: resources, requestComponents: requestComponents)
+        return resources.first { WebDAVPaths.sameComponents($0.components[...], base[...]) }
+    }
+
+    /// The direct members of the collection a Depth 1 PROPFIND was sent to, named relative to the collection's own
+    /// entry rather than to the request URL.
+    static func members(of resources: [DAVResource], requestComponents: [String]) -> [DAVResource] {
+        let base = base(of: resources, requestComponents: requestComponents)
         var seen = Set<String>()
         return resources.filter { r in
             guard r.components.count == base.count + 1,
@@ -430,22 +488,28 @@ final class WebDAVMultistatusParser: NSObject, XMLParserDelegate {
 
 // MARK: - Session delegate
 
-/// Answers Basic/Digest/NTLM challenges with the configured credentials (once per request: a second challenge means
-/// the password is wrong and the 401 is passed through), and trusts the server's certificate only when the user
-/// allowed untrusted certificates for this host.
+/// Answers Basic/Digest/NTLM challenges of the configured host with the configured credentials (once per request:
+/// a second challenge means the password is wrong and the 401 is passed through), and trusts the server's
+/// certificate only when the user allowed untrusted certificates for this host. Another host (after a redirect)
+/// never gets the password, and Basic is only answered over an encrypted connection unless the user configured an
+/// http address.
 final class WebDAVSessionDelegate: NSObject, URLSessionTaskDelegate {
     let user: String
     let password: String?
     let host: String
     let allowUntrustedCertificates: Bool
+    /// The configured address is http: the user accepted that credentials travel unencrypted.
+    let allowsInsecureBasic: Bool
     private let lock = NSLock()
     private var basicSeen = false
 
-    init(user: String, password: String?, host: String, allowUntrustedCertificates: Bool) {
+    init(user: String, password: String?, host: String, allowUntrustedCertificates: Bool,
+         allowsInsecureBasic: Bool = false) {
         self.user = user
         self.password = password
         self.host = host.lowercased()
         self.allowUntrustedCertificates = allowUntrustedCertificates
+        self.allowsInsecureBasic = allowsInsecureBasic
     }
 
     /// True once the server asked for Basic authentication: later requests send it up front (one round trip).
@@ -468,16 +532,22 @@ final class WebDAVSessionDelegate: NSObject, URLSessionTaskDelegate {
     }
 
     /// Redirects keep the WebDAV method, headers and body (URLSession would turn a redirected PROPFIND into a GET);
-    /// credentials are only forwarded to the same host.
+    /// the explicit Basic header only follows a redirect to the same host that stays encrypted.
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
         guard let original = task.originalRequest, let target = request.url else { return completionHandler(request) }
         var redirected = original
         redirected.url = target
-        if target.host?.lowercased() != original.url?.host?.lowercased() {
+        if WebDAVSessionDelegate.dropsAuthorization(from: original.url, to: target) {
             redirected.setValue(nil, forHTTPHeaderField: "Authorization")
         }
         completionHandler(redirected)
+    }
+
+    /// A redirect to another host, or from https to http, must not carry the Authorization header.
+    static func dropsAuthorization(from source: URL?, to target: URL) -> Bool {
+        if target.host?.lowercased() != source?.host?.lowercased() { return true }
+        return target.scheme?.lowercased() == "http" && source?.scheme?.lowercased() != "http"
     }
 
     func respond(to challenge: URLAuthenticationChallenge) -> (URLSession.AuthChallengeDisposition, URLCredential?) {
@@ -490,6 +560,11 @@ final class WebDAVSessionDelegate: NSObject, URLSessionTaskDelegate {
             return (.useCredential, URLCredential(trust: trust))
         case NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodHTTPDigest, NSURLAuthenticationMethodNTLM,
              NSURLAuthenticationMethodDefault:
+            let isBasic = space.authenticationMethod == NSURLAuthenticationMethodHTTPBasic
+                || space.authenticationMethod == NSURLAuthenticationMethodDefault
+            // Only the configured host gets the password, and Basic only over TLS (unless the user chose http).
+            guard space.host.lowercased() == host, !isBasic || space.receivesCredentialSecurely || allowsInsecureBasic
+            else { return (.performDefaultHandling, nil) }
             if space.authenticationMethod == NSURLAuthenticationMethodHTTPBasic {
                 lock.lock()
                 basicSeen = true
@@ -512,6 +587,44 @@ final class WebDAVSessionDelegate: NSObject, URLSessionTaskDelegate {
 struct RemoteTree {
     var files: [String: RemoteEntry] = [:]
     var collections: Set<String> = [""]
+    /// Keys the listing could not read (members whose properties all failed, collections that vanished between
+    /// being listed by their parent and being listed themselves). The mirror leaves everything at or below them
+    /// alone: an unreadable path is never a deletion.
+    var unknown: Set<String> = []
+    /// Each fully read collection's own ETag and direct members, by key ("" = the library folder), for the next pass.
+    var snapshot: [String: RemoteCollection] = [:]
+    /// Collections taken from the previous pass's listing because their ETag had not changed.
+    var reused = 0
+}
+
+/// One collection of a listing: its own ETag and its direct members. A server that propagates changes to the
+/// ETags of every parent collection (Nextcloud, ownCloud) lets an unchanged ETag stand for an unchanged subtree.
+struct RemoteCollection: Codable, Equatable {
+    /// Normalised ETag of the collection itself.
+    var etag: String
+    var files: [RemoteEntry] = []
+    /// Names of the direct subcollections.
+    var subcollections: [String] = []
+    /// This device changed something at or below it since it was listed: list it again next time.
+    var dirty: Bool?
+
+    init(etag: String, files: [RemoteEntry] = [], subcollections: [String] = [], dirty: Bool? = nil) {
+        self.etag = etag
+        self.files = files
+        self.subcollections = subcollections
+        self.dirty = dirty
+    }
+}
+
+/// What a PUT or DELETE requires of the file currently on the server.
+enum WebDAVPrecondition: Equatable {
+    /// Nothing (`webdav.put` with `overwrite: true`).
+    case none
+    /// The file must not exist (`If-None-Match: *`).
+    case absent
+    /// The file must still be the listed version: `If-Match` with its strong ETag, else a Depth 0 PROPFIND right
+    /// before the request. A mismatch is `changedDuringSync` (412), so the next pass sees the newer file.
+    case unchanged(RemoteEntry)
 }
 
 /// Thread-safe set of collections known to exist (server-relative paths), so MKCOL runs once per collection.
@@ -552,7 +665,8 @@ final class WebDAVClient {
         self.configuration = configuration
         let host = configuration.serverURL.host ?? ""
         delegate = WebDAVSessionDelegate(user: configuration.user, password: configuration.password, host: host,
-                                         allowUntrustedCertificates: configuration.allowUntrustedCertificates)
+                                         allowUntrustedCertificates: configuration.allowUntrustedCertificates,
+                                         allowsInsecureBasic: configuration.isPlainHTTP)
         let c = sessionConfiguration
         c.urlCredentialStorage = nil
         c.urlCache = nil
@@ -701,17 +815,55 @@ final class WebDAVClient {
         return (tmp, http)
     }
 
-    /// Uploads a file. `createOnly` sends `If-None-Match: *`, so a file that appeared on the server since the
-    /// listing is never overwritten (412 → `changedDuringSync`). Returns the response's ETag, if any.
+    /// Throws `changedDuringSync` unless the file at `url` is still `expected` (Depth 0 PROPFIND, compared like the
+    /// listing). Returns false when the file is gone.
+    func verifyUnchanged(_ url: URL, _ expected: RemoteEntry) async throws -> Bool {
+        guard let listing = try await propfind(url, depth: 0) else { return false }
+        let own = WebDAVMultistatusParser.selfEntry(of: listing, requestComponents: WebDAVPaths.components(of: url))
+            ?? listing.first
+        guard let current = own, !current.isCollection, !current.isUnknown, current.version == expected.version else {
+            throw WebDAVError.changedDuringSync(label(url))
+        }
+        return true
+    }
+
+    /// Uploads a file under `precondition`. Returns the response's ETag, if any.
     @discardableResult
-    func put(file: URL, to url: URL, createOnly: Bool = false) async throws -> String? {
+    func put(file: URL, to url: URL, precondition: WebDAVPrecondition) async throws -> String? {
         var r = request(url, method: "PUT")
         r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        if createOnly { r.setValue("*", forHTTPHeaderField: "If-None-Match") }
-        var http = try await uploadOnce(r, file: file)
-        if let retry = retryWithoutBasic(r, http) { http = try await uploadOnce(retry, file: file) }
+        var ifMatch: String?
+        switch precondition {
+        case .none:
+            break
+        case .absent:
+            r.setValue("*", forHTTPHeaderField: "If-None-Match")
+        case .unchanged(let expected):
+            if let tag = expected.ifMatch {
+                ifMatch = tag
+                r.setValue(tag, forHTTPHeaderField: "If-Match")
+            } else {
+                let exists = try await verifyUnchanged(url, expected)
+                // Deleted on the server since the listing: the next pass decides (an edit beats a deletion).
+                if !exists { throw WebDAVError.changedDuringSync(label(url)) }
+            }
+        }
+        var http = try await sendUpload(r, file: file)
+        if http.statusCode == 412, ifMatch != nil, case .unchanged(let expected) = precondition {
+            // A server whose If-Match disagrees with its own PROPFIND ETags: trust the PROPFIND, once.
+            let exists = try await verifyUnchanged(url, expected)
+            if !exists { throw WebDAVError.changedDuringSync(label(url)) }
+            r.setValue(nil, forHTTPHeaderField: "If-Match")
+            http = try await sendUpload(r, file: file)
+        }
         try check(http, "PUT", url) { (200..<300).contains($0) }
         return http.value(forHTTPHeaderField: "ETag")
+    }
+
+    private func sendUpload(_ request: URLRequest, file: URL) async throws -> HTTPURLResponse {
+        let http = try await uploadOnce(request, file: file)
+        if let retry = retryWithoutBasic(request, http) { return try await uploadOnce(retry, file: file) }
+        return http
     }
 
     private func uploadOnce(_ request: URLRequest, file: URL) async throws -> HTTPURLResponse {
@@ -725,9 +877,30 @@ final class WebDAVClient {
         return http
     }
 
-    /// Deletes a file or collection; already gone counts as success.
-    func delete(_ url: URL) async throws {
-        let (_, response) = try await send(request(url, method: "DELETE"))
+    /// Deletes a file or collection strictly inside the library folder; already gone counts as success. With
+    /// `.unchanged`, a file that changed on the server since the listing is kept (`changedDuringSync`).
+    func delete(_ url: URL, precondition: WebDAVPrecondition = .none) async throws {
+        guard WebDAVPaths.isStrictlyInside(url, try configuration.libraryURL) else {
+            throw WebDAVError.local(String(localized: "Refusing to delete \(label(url)), which is not inside the library folder"))
+        }
+        var r = request(url, method: "DELETE")
+        var ifMatch: String?
+        if case .unchanged(let expected) = precondition {
+            if let tag = expected.ifMatch {
+                ifMatch = tag
+                r.setValue(tag, forHTTPHeaderField: "If-Match")
+            } else {
+                let exists = try await verifyUnchanged(url, expected)
+                if !exists { return }
+            }
+        }
+        var response = try await send(r).1
+        if response.statusCode == 412, ifMatch != nil, case .unchanged(let expected) = precondition {
+            let exists = try await verifyUnchanged(url, expected)
+            if !exists { return }
+            r.setValue(nil, forHTTPHeaderField: "If-Match")
+            response = try await send(r).1
+        }
         try check(response, "DELETE", url) { (200..<300).contains($0) || $0 == 404 || $0 == 410 }
     }
 
@@ -744,7 +917,7 @@ final class WebDAVClient {
             let prefix = Array(components.prefix(i))
             let path = prefix.joined(separator: "/")
             if known.contains(path) { continue }
-            try await mkcol(WebDAVPaths.collectionURL(configuration.serverURL, components: prefix))
+            try await mkcol(try WebDAVPaths.collectionURL(configuration.serverURL, components: prefix))
             known.insert(path)
         }
     }
@@ -754,54 +927,127 @@ final class WebDAVClient {
         configuration.folderComponents + path.split(separator: "/").map(String.init)
     }
 
-    func libraryFileURL(_ path: String) -> URL {
-        WebDAVPaths.fileURL(configuration.libraryURL, path: path)
+    func libraryFileURL(_ path: String) throws -> URL {
+        try WebDAVPaths.fileURL(try configuration.libraryURL, path: path)
+    }
+
+    func libraryCollectionURL(_ path: String) throws -> URL {
+        let components = path.split(separator: "/").map(String.init)
+        return try WebDAVPaths.collectionURL(try configuration.libraryURL, components: components)
     }
 
     /// The version token of one file, read with a Depth 0 PROPFIND (same format as the listing).
     func version(ofLibraryFile path: String) async throws -> String? {
-        try await propfind(libraryFileURL(path), depth: 0)?.first(where: { !$0.isCollection })?.version
+        try await propfind(try libraryFileURL(path), depth: 0)?.first(where: { !$0.isCollection && !$0.isUnknown })?.version
+    }
+
+    /// The normalised ETag of a library collection ("" = the folder itself), read with a Depth 0 PROPFIND.
+    func etag(ofLibraryCollection path: String) async throws -> String? {
+        let url = try libraryCollectionURL(path)
+        guard let listing = try await propfind(url, depth: 0),
+              let own = WebDAVMultistatusParser.selfEntry(of: listing, requestComponents: WebDAVPaths.components(of: url)),
+              let raw = own.etag else { return nil }
+        let e = WebDAVPaths.normalizeETag(raw)
+        return e.isEmpty ? nil : e
     }
 
     /// Lists the library folder recursively with Depth 1 PROPFINDs (level by level, several at a time).
-    /// nil = the folder does not exist yet.
-    func listLibrary(isExcluded: (String) -> Bool = { _ in false }) async throws -> RemoteTree? {
-        let base = configuration.libraryURL
+    /// With `cache` (the previous pass's snapshot, used only for servers seen to propagate ETags), a subcollection
+    /// whose ETag is unchanged is taken from it instead of being listed again. nil = the folder does not exist yet.
+    func listLibrary(isExcluded: (String) -> Bool = { _ in false },
+                     cache: [String: RemoteCollection]? = nil) async throws -> RemoteTree? {
+        let base = try configuration.libraryURL
         guard let top = try await propfind(base, depth: 1) else { return nil }
         known.insert(configuration.folder)
         var tree = RemoteTree()
-        var level: [([String], [DAVResource])] = [([], top)]
+        var level: [([String], [DAVResource]?)] = [([], top)]
         while !level.isEmpty {
             var next: [[String]] = []
-            for (parent, resources) in level {
-                let requestComponents = WebDAVPaths.components(of: WebDAVPaths.collectionURL(base, components: parent))
+            for (parent, listing) in level {
+                let parentPath = parent.joined(separator: "/")
+                guard let resources = listing else {
+                    // Listed by its parent a moment ago, missing now: unknown for this pass, never "deleted".
+                    tree.unknown.insert(WebDAVPaths.key(parentPath))
+                    continue
+                }
+                let requestComponents = WebDAVPaths.components(of: try WebDAVPaths.collectionURL(base, components: parent))
+                let own = WebDAVMultistatusParser.selfEntry(of: resources, requestComponents: requestComponents)
+                var snapshot = RemoteCollection(etag: own?.etag.map(WebDAVPaths.normalizeETag) ?? "")
+                var complete = true
                 for member in WebDAVMultistatusParser.members(of: resources, requestComponents: requestComponents) {
                     let name = member.name
                     let rel = parent + [name]
                     let path = rel.joined(separator: "/")
                     if WebDAVMirrorFilter.isExcludedName(name) || isExcluded(path) { continue }
+                    if member.isUnknown {
+                        tree.unknown.insert(WebDAVPaths.key(path))
+                        complete = false
+                        continue
+                    }
                     if member.isCollection {
                         tree.collections.insert(path)
                         known.insert(configuration.folder + "/" + path)
+                        snapshot.subcollections.append(name)
+                        if let cache = cache,
+                           reuse(path, etag: member.etag, cache: cache, isExcluded: isExcluded, into: &tree) {
+                            continue
+                        }
                         next.append(rel)
                     } else {
-                        tree.files[WebDAVPaths.key(path)] = RemoteEntry(path: path, version: member.version,
-                                                                      size: member.contentLength)
+                        let entry = RemoteEntry(path: path, version: member.version, size: member.contentLength,
+                                                etag: member.etag)
+                        tree.files[WebDAVPaths.key(path)] = entry
+                        snapshot.files.append(entry)
                     }
                 }
+                if complete, !snapshot.etag.isEmpty { tree.snapshot[WebDAVPaths.key(parentPath)] = snapshot }
             }
-            let listed = try await WebDAVClient.concurrentMap(next, limit: listingConcurrency) { rel -> ([String], [DAVResource]) in
-                (rel, try await self.propfind(WebDAVPaths.collectionURL(base, components: rel), depth: 1) ?? [])
+            level = try await WebDAVClient.concurrentMap(next, limit: listingConcurrency) { rel -> ([String], [DAVResource]?) in
+                (rel, try await self.propfind(try WebDAVPaths.collectionURL(base, components: rel), depth: 1))
             }
-            level = listed
         }
         return tree
+    }
+
+    /// Adds the cached subtree of the collection `path` when the server reports the ETag it had when it was
+    /// cached; false (and nothing added) when the ETag differs or any part of the subtree is not cached or dirty.
+    private func reuse(_ path: String, etag: String?, cache: [String: RemoteCollection],
+                       isExcluded: (String) -> Bool, into tree: inout RemoteTree) -> Bool {
+        guard let raw = etag, !WebDAVPaths.normalizeETag(raw).isEmpty,
+              let top = cache[WebDAVPaths.key(path)], top.etag == WebDAVPaths.normalizeETag(raw) else { return false }
+        var files: [RemoteEntry] = []
+        var collections: [String] = []
+        var snapshots: [(String, RemoteCollection)] = []
+        var stack = [path]
+        while let current = stack.popLast() {
+            guard let cached = cache[WebDAVPaths.key(current)], cached.dirty != true else { return false }
+            snapshots.append((current, cached))
+            for file in cached.files {
+                let name = file.path.split(separator: "/").last.map(String.init) ?? file.path
+                if WebDAVMirrorFilter.isExcludedName(name) || isExcluded(file.path) { continue }
+                files.append(file)
+            }
+            for name in cached.subcollections {
+                let sub = current + "/" + name
+                if WebDAVMirrorFilter.isExcludedName(name) || isExcluded(sub) { continue }
+                collections.append(sub)
+                stack.append(sub)
+            }
+        }
+        for file in files { tree.files[WebDAVPaths.key(file.path)] = file }
+        for sub in collections {
+            tree.collections.insert(sub)
+            known.insert(configuration.folder + "/" + sub)
+        }
+        for (p, c) in snapshots { tree.snapshot[WebDAVPaths.key(p)] = c }
+        tree.reused += snapshots.count
+        return true
     }
 
     /// Checks the server and the library folder (Settings › WebDAV "Test Connection").
     func checkConnection() async throws -> (serverOK: Bool, folderExists: Bool) {
         guard try await propfind(configuration.serverURL, depth: 0) != nil else { throw WebDAVError.notWebDAV }
-        let folder = try await propfind(configuration.libraryURL, depth: 0)
+        let folder = try await propfind(try configuration.libraryURL, depth: 0)
         return (true, folder != nil)
     }
 

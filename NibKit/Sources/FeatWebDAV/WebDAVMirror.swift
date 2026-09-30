@@ -16,11 +16,29 @@ struct LocalEntry: Equatable {
 }
 
 /// A file in the library folder on the server. `path` is the decoded relative path the server uses.
-struct RemoteEntry: Equatable {
+struct RemoteEntry: Codable, Equatable, Hashable {
     var path: String
     /// `DAVResource.version`: normalised ETag, else modification date and size.
     var version: String
     var size: Int64?
+    /// The ETag exactly as listed (for `If-Match`).
+    var etag: String?
+
+    init(path: String, version: String, size: Int64?, etag: String? = nil) {
+        self.path = path
+        self.version = version
+        self.size = size
+        self.etag = etag
+    }
+
+    /// The `If-Match` value naming exactly this version: the listed strong ETag, quoted. nil for a weak or missing
+    /// ETag (If-Match compares strongly), which is checked with a PROPFIND instead.
+    var ifMatch: String? {
+        guard version.hasPrefix("e:"), let raw = etag?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+              !raw.hasPrefix("W/"), !raw.hasPrefix("w/") else { return nil }
+        if raw.count >= 2, raw.hasPrefix("\""), raw.hasSuffix("\"") { return raw }
+        return "\"" + raw + "\""
+    }
 }
 
 /// The last-synced state of one path: the local fingerprint and the server version both sides had then.
@@ -487,16 +505,46 @@ struct MirrorState: Codable, Equatable {
     /// Unix seconds of the last run that finished without a fatal error.
     var lastSync: Double?
     var lastReport: WebDAVSyncReport?
+    /// The server listing of the last pass, so an unchanged subtree is not listed again.
+    var remote: RemoteListingState?
 
     init() {}
 
-    enum CodingKeys: String, CodingKey { case entries, lastSync, lastReport }
+    enum CodingKeys: String, CodingKey { case entries, lastSync, lastReport, remote }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         entries = try c.decodeIfPresent([String: SyncedEntry].self, forKey: .entries) ?? [:]
         lastSync = try c.decodeIfPresent(Double.self, forKey: .lastSync)
         lastReport = try? c.decodeIfPresent(WebDAVSyncReport.self, forKey: .lastReport)
+        remote = try? c.decodeIfPresent(RemoteListingState.self, forKey: .remote)
+    }
+}
+
+/// The last listing of the server and what it taught about the server's collection ETags.
+struct RemoteListingState: Codable, Equatable {
+    /// `RemoteTree.snapshot` of the last pass, with the collections this device changed since marked dirty.
+    var collections: [String: RemoteCollection] = [:]
+    /// Whether a change below a collection changes the ETag of every collection above it: true = seen to (listings
+    /// may reuse unchanged subtrees), false = seen not to (Apache and most NAS servers: always list everything),
+    /// nil = not known yet (list everything).
+    var propagates: Bool?
+    /// Unix seconds of the last full listing (one runs at least every `WebDAVMirrorRun.fullListingInterval`).
+    var lastFullListing: Double?
+
+    init() {}
+
+    /// Marks the collections above each library-relative path (and the library folder) to be listed again.
+    mutating func markDirty(above paths: [String]) {
+        for path in paths {
+            var parts = path.split(separator: "/").map(String.init)
+            while true {
+                if !parts.isEmpty { parts.removeLast() }
+                let key = WebDAVPaths.key(parts.joined(separator: "/"))
+                collections[key]?.dirty = true
+                if parts.isEmpty { break }
+            }
+        }
     }
 }
 
@@ -515,9 +563,36 @@ final class MirrorStateStore {
         return support.appendingPathComponent("Nib/webdav", isDirectory: true)
     }
 
+    /// The state file of a server, user, folder and library root. The root is named by `rootIdentity`, so the
+    /// state survives the app container moving (updates and reinstalls change its UUID).
     static func key(server: URL, user: String, folder: String, root: URL) -> String {
-        let text = [server.absoluteString, user, folder, root.standardizedFileURL.path].joined(separator: "\n")
-        return SHA256.hash(data: Data(text.utf8)).prefix(10).map { String(format: "%02x", $0) }.joined()
+        hash([server.absoluteString, user, folder, rootIdentity(root)])
+    }
+
+    /// The key earlier builds used (absolute root path), adopted once by `adoptLegacy`.
+    static func legacyKey(server: URL, user: String, folder: String, root: URL) -> String {
+        hash([server.absoluteString, user, folder, root.standardizedFileURL.path])
+    }
+
+    private static func hash(_ parts: [String]) -> String {
+        SHA256.hash(data: Data(parts.joined(separator: "\n").utf8)).prefix(10).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// "~/Documents" for a folder inside the app's home (container) directory, else the absolute path (iCloud
+    /// Drive, a folder picked in Files).
+    static func rootIdentity(_ root: URL, home: String = NSHomeDirectory()) -> String {
+        let path = root.standardizedFileURL.resolvingSymlinksInPath().path
+        let base = URL(fileURLWithPath: home, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath().path
+        if path == base { return "~" }
+        if path.hasPrefix(base + "/") { return "~" + path.dropFirst(base.count) }
+        return path
+    }
+
+    /// Moves the state file of `legacy` to this store's name when this store has none yet.
+    func adoptLegacy(_ legacy: MirrorStateStore) {
+        let fm = FileManager.default
+        guard legacy.url != url, !fm.fileExists(atPath: url.path), fm.fileExists(atPath: legacy.url.path) else { return }
+        try? fm.moveItem(at: legacy.url, to: url)
     }
 
     func load() -> MirrorState {
@@ -579,6 +654,10 @@ final class WebDAVMirrorRun {
     var concurrency = 3
     /// Saves the state after this many finished actions, so an interrupted run loses little.
     var checkpointEvery = 50
+    /// Even on a server that propagates collection ETags, the whole tree is listed at least this often.
+    var fullListingInterval: TimeInterval = 3600
+    /// Whether this pass reused cached subtrees (set when `run()` returns).
+    private(set) var usedListingCache = false
     private let lock = NSLock()
     private var cancelled = false
 
@@ -607,6 +686,13 @@ final class WebDAVMirrorRun {
 
     func isLocked(_ key: String) -> Bool {
         lockedPackages.contains { key == $0 || key.hasPrefix($0 + "/") }
+    }
+
+    /// Top-level names that stay local (the system Inbox and diagnostics when the library is Documents), on both
+    /// sides: the server's copies of them are ignored too.
+    func isExcludedTopLevel(_ path: String) -> Bool {
+        guard !excludedTopLevel.isEmpty, let first = path.split(separator: "/").first else { return false }
+        return excludedTopLevel.contains(String(first))
     }
 
     enum Counter {
@@ -639,20 +725,17 @@ final class WebDAVMirrorRun {
             try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
             let scan = try LocalLibraryScanner.scan(root: root, excludedTopLevel: excludedTopLevel)
             if isCancelled { throw WebDAVError.cancelled }
-            var tree: RemoteTree
-            if let listed = try await client.listLibrary() {
-                tree = listed
-            } else {
-                try await client.ensureCollections(client.configuration.folderComponents)
-                tree = RemoteTree()
-            }
-            // An evicted iCloud file or package is not "deleted locally": leave everything under it alone.
+            let tree = try await list(&state)
+            // An evicted iCloud file or package, or a server path the listing could not read, is not "deleted":
+            // leave everything under it alone.
             let notDownloaded = scan.notDownloaded
+            let unknown = tree.unknown
             let plan = MirrorPlanner.plan(local: scan.files, remote: tree.files, state: state.entries,
                                           deviceHex: deviceHex,
                                           skip: { key in
                                               self.isLocked(key)
                                                   || notDownloaded.contains { key == $0 || key.hasPrefix($0 + "/") }
+                                                  || unknown.contains { key == $0 || key.hasPrefix($0 + "/") }
                                           })
             report.unchanged = plan.unchanged
             report.skippedLocked = plan.skipped.filter { self.isLocked($0) }.count
@@ -662,6 +745,12 @@ final class WebDAVMirrorRun {
                 // Rebuilt from the copy step's results; skipped (locked) paths keep what they had.
                 let kept = Set(plan.skipped)
                 state.entries = state.entries.filter { kept.contains($0.key) }
+            }
+            // Everything this pass may change on the server is listed again next time, whatever happens below.
+            let touched = serverPaths(of: plan, scan: scan, tree: tree)
+            if !touched.isEmpty {
+                state.remote?.markDirty(above: touched)
+                try? store.save(state)
             }
             progress.begin(plan.actions.count)
             let copies = plan.actions.filter { [.resolve, .download, .upload, .forget].contains($0.kind) }
@@ -706,8 +795,87 @@ final class WebDAVMirrorRun {
         return report
     }
 
+    /// Lists the server (creating the library folder when it is missing) and stores the new snapshot in `state`.
+    /// Unchanged subtrees come from the last listing only on a server seen to propagate collection ETags, and only
+    /// between full listings; every full listing checks that the server still behaves that way.
+    func list(_ state: inout MirrorState) async throws -> RemoteTree {
+        var listing = state.remote ?? RemoteListingState()
+        let now = Date().timeIntervalSince1970
+        let useCache = listing.propagates == true && !listing.collections.isEmpty
+            && (listing.lastFullListing.map { now - $0 < fullListingInterval && now >= $0 } ?? false)
+        guard let tree = try await client.listLibrary(isExcluded: isExcludedTopLevel,
+                                                      cache: useCache ? listing.collections : nil) else {
+            try await client.ensureCollections(client.configuration.folderComponents)
+            listing.collections = [:]
+            state.remote = listing
+            return RemoteTree()
+        }
+        usedListingCache = useCache
+        if !useCache {
+            if let verdict = await propagationVerdict(previous: listing.collections, current: tree.snapshot) {
+                listing.propagates = verdict
+            }
+            listing.lastFullListing = now
+        }
+        listing.collections = tree.snapshot
+        state.remote = listing
+        return tree
+    }
+
+    /// Compares two full listings. A collection whose ETag changed while an ancestor's did not (re-read now, so a
+    /// change that landed during the walk is not mistaken for it) shows that the server does not propagate ETags;
+    /// a change two or more levels down that changed every ancestor shows that it does. nil = no evidence.
+    func propagationVerdict(previous: [String: RemoteCollection], current: [String: RemoteCollection]) async -> Bool? {
+        guard !previous.isEmpty else { return nil }
+        var positive = false
+        var suspects: [String: String] = [:]
+        for (path, now) in current where !path.isEmpty {
+            guard let before = previous[path], !before.etag.isEmpty, before.etag != now.etag else { continue }
+            let parts = path.split(separator: "/").map(String.init)
+            let ancestors = (0..<parts.count).map { parts.prefix($0).joined(separator: "/") }
+            var all = true
+            for a in ancestors {
+                guard let was = previous[a], let is_ = current[a], !was.etag.isEmpty else {
+                    all = false
+                    continue
+                }
+                if was.etag == is_.etag {
+                    all = false
+                    suspects[a] = was.etag
+                }
+            }
+            if all, ancestors.count >= 2 { positive = true }
+        }
+        for (ancestor, old) in suspects.sorted(by: { $0.key < $1.key }).prefix(3) {
+            if isCancelled { return nil }
+            guard let e = try? await client.etag(ofLibraryCollection: ancestor) else { continue }
+            if e == old { return false }
+        }
+        return positive ? true : nil
+    }
+
+    /// Library-relative server paths the plan may create, replace or delete.
+    func serverPaths(of plan: MirrorPlan, scan: LocalScan, tree: RemoteTree) -> [String] {
+        var paths: [String] = []
+        for action in plan.actions {
+            switch action.kind {
+            case .upload:
+                if let p = tree.files[action.key]?.path ?? scan.files[action.key]?.path { paths.append(p) }
+            case .deleteRemote:
+                if let p = tree.files[action.key]?.path { paths.append(p) }
+            case .resolve:
+                if let p = tree.files[action.key]?.path { paths.append(p) }
+                if let c = action.conflictPath { paths.append(c) }
+            case .download, .deleteLocal, .forget:
+                break
+            }
+        }
+        return paths
+    }
+
     /// Runs `actions` with at most `concurrency` at a time; `apply` sees every outcome on this task, in completion
-    /// order. A fatal error (authentication, network, cancellation) stops the phase and is rethrown.
+    /// order. A fatal error (authentication, network, cancellation) stops the phase and is rethrown; what the
+    /// failed action already did (a conflict copy installed before the network dropped) is still applied.
     func execute(_ actions: [MirrorAction], scan: LocalScan, tree: RemoteTree, scratch: URL,
                  apply: (Outcome) -> Void) async throws {
         guard !actions.isEmpty else { return }
@@ -726,6 +894,10 @@ final class WebDAVMirrorRun {
                 if let e = outcome.error, e.isFatal {
                     if fatal == nil { fatal = e }
                     group.cancelAll()
+                    var partial = outcome
+                    partial.counter = nil
+                    partial.error = nil
+                    apply(partial)
                     continue
                 }
                 apply(outcome)
@@ -748,12 +920,13 @@ final class WebDAVMirrorRun {
             case .upload:
                 guard let l = local else { return Outcome() }
                 let remotePath = remote?.path ?? l.path
-                let entry = try await upload(l.path, to: remotePath, createOnly: remote == nil, scratch: scratch)
+                let precondition: WebDAVPrecondition = remote.map { .unchanged($0) } ?? .absent
+                let entry = try await upload(l.path, to: remotePath, precondition: precondition, scratch: scratch)
                 return Outcome(updates: [(key, entry)], counter: .uploaded, uploadedPaths: [remotePath])
             case .download:
                 guard let r = remote else { return Outcome() }
                 let temp = scratch.appendingPathComponent(UUID().uuidString)
-                try await client.get(client.libraryFileURL(r.path), to: temp)
+                try await client.get(try client.libraryFileURL(r.path), to: temp)
                 let installed = try LocalFiles.install(temp, root: root, path: local?.path ?? r.path, expected: local)
                 return Outcome(updates: [(key, SyncedEntry(local: installed.fingerprint, remote: r.version))],
                                counter: .downloaded)
@@ -766,7 +939,9 @@ final class WebDAVMirrorRun {
                 guard LocalFiles.isConfirmedAbsent(root: root, path: r.path) else {
                     return Outcome(error: .changedDuringSync(r.path))
                 }
-                try await client.delete(client.libraryFileURL(r.path))
+                // Only the version this pass listed is deleted: a newer one written meanwhile by another device
+                // survives (412) and is downloaded by the next pass.
+                try await client.delete(try client.libraryFileURL(r.path), precondition: .unchanged(r))
                 return Outcome(updates: [(key, nil)], counter: .deletedRemote, deletedRemotePath: r.path)
             case .resolve:
                 guard let l = local, let r = remote else { return Outcome() }
@@ -778,12 +953,14 @@ final class WebDAVMirrorRun {
     }
 
     /// Uploads `root/path` to the library-relative `remotePath` and reads back the server's version.
-    func upload(_ path: String, to remotePath: String, createOnly: Bool, scratch: URL) async throws -> SyncedEntry {
+    func upload(_ path: String, to remotePath: String, precondition: WebDAVPrecondition,
+                scratch: URL) async throws -> SyncedEntry {
         let (copy, entry) = try LocalFiles.snapshot(root: root, path: path, into: scratch)
         defer { try? FileManager.default.removeItem(at: copy) }
+        let target = try client.libraryFileURL(remotePath)
         let parent = remotePath.split(separator: "/").dropLast().joined(separator: "/")
         try await client.ensureCollections(client.serverComponents(libraryPath: parent))
-        let etag = try await client.put(file: copy, to: client.libraryFileURL(remotePath), createOnly: createOnly)
+        let etag = try await client.put(file: copy, to: target, precondition: precondition)
         let version = (try? await client.version(ofLibraryFile: remotePath))
             ?? etag.map { "e:" + WebDAVPaths.normalizeETag($0) }
         // An unknown version reads as "changed on the server" next time: one harmless re-download, then stable.
@@ -796,7 +973,7 @@ final class WebDAVMirrorRun {
     func resolve(_ key: String, local: LocalEntry, remote: RemoteEntry, conflictPath: String?,
                  scratch: URL) async throws -> Outcome {
         let temp = scratch.appendingPathComponent(UUID().uuidString)
-        try await client.get(client.libraryFileURL(remote.path), to: temp)
+        try await client.get(try client.libraryFileURL(remote.path), to: temp)
         if LocalFiles.sameContents(temp, root.appendingPathComponent(local.path)) {
             try? FileManager.default.removeItem(at: temp)
             guard let current = LocalFiles.stat(root.appendingPathComponent(local.path), path: local.path),
@@ -806,22 +983,22 @@ final class WebDAVMirrorRun {
         }
         let copyPath = conflictPath ?? ConflictNaming.name(for: local.path, device: deviceHex, taken: [])
         let copyKey = WebDAVPaths.key(copyPath)
-        let copy = try LocalFiles.install(temp, root: root, path: copyPath, expected: nil)
+        _ = try LocalFiles.install(temp, root: root, path: copyPath, expected: nil)
         var outcome = Outcome(counter: .conflicts, conflictFile: copyPath)
         // From here the server's version is safe locally: if a push fails, the next run pushes the local file
-        // ("" = local changed) instead of resolving the same divergence again.
-        outcome.updates = [(key, SyncedEntry(local: "", remote: remote.version)),
-                           (copyKey, SyncedEntry(local: copy.fingerprint, remote: ""))]
+        // ("" = local changed) instead of resolving the same divergence again, and uploads the copy as a new file.
+        outcome.updates = [(key, SyncedEntry(local: "", remote: remote.version)), (copyKey, nil)]
         do {
-            let pushed = try await upload(local.path, to: remote.path, createOnly: false, scratch: scratch)
+            // Only over the version that was just saved as the conflict copy.
+            let pushed = try await upload(local.path, to: remote.path, precondition: .unchanged(remote),
+                                          scratch: scratch)
             outcome.updates[0] = (key, pushed)
             outcome.uploadedPaths.append(remote.path)
-            let pushedCopy = try await upload(copyPath, to: copyPath, createOnly: true, scratch: scratch)
+            let pushedCopy = try await upload(copyPath, to: copyPath, precondition: .absent, scratch: scratch)
             outcome.updates[1] = (copyKey, pushedCopy)
             outcome.uploadedPaths.append(copyPath)
         } catch {
             outcome.error = WebDAVError.from(error, host: client.host)
-            if outcome.updates[1].1?.remote == "" { outcome.updates[1] = (copyKey, nil) }
         }
         return outcome
     }
@@ -846,11 +1023,10 @@ final class WebDAVMirrorRun {
             let busy = remaining.contains { $0.hasPrefix(prefix) }
                 || collections.contains { $0.hasPrefix(prefix) && !pruned.contains($0) }
             if busy { continue }
-            let url = WebDAVPaths.collectionURL(client.configuration.libraryURL,
-                                                components: folder.split(separator: "/").map(String.init))
-            guard let listing = try? await client.propfind(url, depth: 1) else { continue }
+            guard let url = try? client.libraryCollectionURL(folder),
+                  let listing = try? await client.propfind(url, depth: 1) else { continue }
             let members = WebDAVMultistatusParser.members(of: listing, requestComponents: WebDAVPaths.components(of: url))
-            guard members.allSatisfy({ WebDAVMirrorFilter.isExcludedName($0.name) }) else { continue }
+            guard members.allSatisfy({ !$0.isUnknown && WebDAVMirrorFilter.isExcludedName($0.name) }) else { continue }
             if (try? await client.delete(url)) != nil { pruned.insert(folder) }
         }
     }

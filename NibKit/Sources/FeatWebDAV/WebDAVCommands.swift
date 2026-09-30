@@ -79,6 +79,9 @@ struct WebDAVStatusInfo: Codable, Equatable {
     var allowUntrustedCertificates: Bool
     /// A user name is set but its password is not in the Keychain (e.g. after re-signing): re-enter it.
     var credentialsMissing: Bool
+    /// The server rejected the saved password: automatic syncs are paused until it is re-entered (or a manual sync
+    /// succeeds).
+    var authFailed: Bool
     /// "unconfigured" | "idle" | "syncing" | "ok" | "warning" | "error"
     var state: String
     var running: Bool
@@ -195,12 +198,15 @@ struct WebDAVConfigureCommand: NibCommand {
     }
 }
 
-/// `webdav.put {path, file}`: uploads one file (auto backup, F068) to a path relative to the server address.
+/// `webdav.put {path, file, overwrite?}`: uploads one file (auto backup, F068) to a path relative to the server
+/// address. The account root is usually the user's whole cloud drive, so an existing file is only replaced with
+/// `overwrite: true`, and the command is destructive and sensitive (always confirmed for the AI and plugins).
 /// Paths inside the mirrored library folder are refused, because the next sync would copy them into the library.
 struct WebDAVPutCommand: NibCommand {
     struct Params: Codable {
         var path: String
         var file: String
+        var overwrite: Bool?
     }
 
     struct Output: Codable, Equatable {
@@ -212,15 +218,17 @@ struct WebDAVPutCommand: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "webdav.put", title: String(localized: "Upload to WebDAV"),
-        summary: "Upload one file to the WebDAV server at path (relative to the server address, outside the library folder); file is a tmp: ref or https URL. Used by auto backup.",
+        summary: "Upload one file (tmp: ref or https URL) to path on the WebDAV server, relative to the server address and outside the library folder; overwrite: true replaces an existing file. Used by auto backup.",
         params: .obj([
             "path": .str("destination path relative to the server address, e.g. Nib Backups/Physics.zip"),
-            "file": .str("the file: a tmp: ref (asset.upload, export) or an https URL")
+            "file": .str("the file: a tmp: ref (asset.upload, export) or an https URL"),
+            "overwrite": .bool("replace a file already at path (default false: an existing file is a conflict error)")
         ], required: ["path", "file"]),
         examples: [["path": "Nib Backups/Kinematics.zip", "file": "tmp:backup.zip"]],
-        effect: .session)
+        effect: .session, destructive: true, sensitive: true)
 
-    /// Validates `path`: relative, no "." or "..", not inside the library folder.
+    /// Validates `path`: relative, no "." or "..", not inside the library folder (compared without regard to
+    /// case or Unicode normalisation: many servers treat "nib" and "Nib" as the same folder).
     static func components(_ path: String, libraryFolder: [String]) throws -> [String] {
         let parts = path.replacingOccurrences(of: "\\", with: "/").split(separator: "/").map(String.init)
             .filter { !$0.isEmpty }
@@ -228,8 +236,11 @@ struct WebDAVPutCommand: NibCommand {
         if parts.contains(where: { $0 == "." || $0 == ".." }) {
             throw NibError(.invalidParams, "'.' and '..' are not allowed in path", path: "$.path")
         }
+        func fold(_ s: String) -> String {
+            WebDAVPaths.key(s).folding(options: [.caseInsensitive, .widthInsensitive], locale: nil)
+        }
         if !libraryFolder.isEmpty, parts.count >= libraryFolder.count,
-           WebDAVPaths.sameComponents(parts.prefix(libraryFolder.count), libraryFolder[...]) {
+           zip(parts.prefix(libraryFolder.count), libraryFolder).allSatisfy({ fold($0) == fold($1) }) {
             throw NibError(.invalidParams, "path is inside the synced library folder '\(libraryFolder.joined(separator: "/"))'",
                            path: "$.path", hint: "upload backups to another folder, e.g. \"Nib Backups/…\"")
         }
@@ -240,7 +251,12 @@ struct WebDAVPutCommand: NibCommand {
         let engine = try WebDAVSyncEngine.resolve(ctx.services)
         let config = try engine.configuration()
         let parts = try components(p.path, libraryFolder: config.folderComponents)
-        let target = WebDAVPaths.fileURL(config.serverURL, path: parts.joined(separator: "/"))
+        let target: URL
+        do {
+            target = try WebDAVPaths.fileURL(config.serverURL, path: parts.joined(separator: "/"))
+        } catch {
+            throw NibError(.invalidParams, "path cannot be used on the server", path: "$.path")
+        }
         if ctx.dryRun {
             return Output(path: parts.joined(separator: "/"), url: target.absoluteString, size: 0, etag: nil)
         }
@@ -251,7 +267,7 @@ struct WebDAVPutCommand: NibCommand {
                            hint: "zip folders first (backup.manual) and pass the tmp: ref")
         }
         let size = ((try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? NSNumber)?.int64Value ?? 0
-        let etag = try await engine.put(file, components: parts, configuration: config)
+        let etag = try await engine.put(file, components: parts, configuration: config, overwrite: p.overwrite ?? false)
         return Output(path: parts.joined(separator: "/"), url: target.absoluteString, size: size, etag: etag)
     }
 }

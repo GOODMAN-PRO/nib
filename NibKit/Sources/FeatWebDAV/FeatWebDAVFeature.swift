@@ -70,7 +70,13 @@ final class WebDAVSyncEngine {
     private(set) var lastSync: Double?
     /// The failure of the last pass that stopped early (typed, for command errors).
     private(set) var lastFailure: WebDAVError?
+    /// The server rejected the password: automatic passes stop (each would be more failed logins, and Nextcloud's
+    /// brute-force protection then throttles the user's whole IP) until `webdav.configure` runs (the settings page
+    /// saving a new password runs it too) or the user syncs by hand.
+    private(set) var authSuspended = false
     private var lastRunEnded: Date?
+    private var lastRunStarted: Date?
+    private var lastRunDuration: TimeInterval?
     private var running: Task<WebDAVSyncReport, Never>?
     private var queued: Task<WebDAVSyncReport, Never>?
     private var currentRun: WebDAVMirrorRun?
@@ -136,6 +142,7 @@ final class WebDAVSyncEngine {
         lastReport = nil
         lastSync = nil
         lastFailure = nil
+        authSuspended = false
         summaryKey = nil
         lastEmitted = nil
         loadSummary()
@@ -193,7 +200,7 @@ final class WebDAVSyncEngine {
     /// Leaving the foreground: schedule the background refresh and use the few seconds iOS grants to push the last
     /// edits (the pass is stopped cleanly if that time runs out).
     func enteredBackground() {
-        guard isConfigured, !credentialsMissing, let app = app else { return }
+        guard isConfigured, !credentialsMissing, !authSuspended, let app = app else { return }
         app.scheduleBackgroundTask(FeatWebDAVFeature.backgroundTaskID, earliestIn: backgroundInterval)
         guard !NibApp.isHostlessTest, finishingTask == .invalid else { return }
         finishingTask = UIApplication.shared.beginBackgroundTask(withName: "WebDAV sync") { [weak self] in
@@ -215,7 +222,7 @@ final class WebDAVSyncEngine {
     /// The `app.nib.webdav` refresh task: one pass, stopped cleanly when iOS expires the task.
     func runBackgroundTask() async -> Bool {
         app?.scheduleBackgroundTask(FeatWebDAVFeature.backgroundTaskID, earliestIn: backgroundInterval)
-        guard isConfigured, !credentialsMissing else { return true }
+        guard isConfigured, !credentialsMissing, !authSuspended else { return true }
         let report = await withTaskCancellationHandler {
             await self.sync(.backgroundTask)
         } onCancel: {
@@ -224,16 +231,31 @@ final class WebDAVSyncEngine {
         return report.failure == nil
     }
 
-    /// An automatic pass: skipped while one runs, when WebDAV is off, or when the password is missing (reported once).
-    /// Returning to the foreground right after a pass (Control Center, a notification) does not start another.
-    func trigger(_ trigger: Trigger) {
-        guard isConfigured, running == nil else { return }
-        if trigger == .foreground, let ended = lastRunEnded, Date().timeIntervalSince(ended) < 15 { return }
+    /// An automatic pass: skipped while one runs, when WebDAV is off, when the password is missing (reported once)
+    /// or was rejected. Returning to the foreground right after a pass (Control Center, a notification) does not
+    /// start another, and passes that take long are spaced at twice their duration. Returns whether one started.
+    @discardableResult
+    func trigger(_ trigger: Trigger) -> Bool {
+        guard isConfigured, running == nil else { return false }
+        if trigger == .foreground, let ended = lastRunEnded, Date().timeIntervalSince(ended) < 15 { return false }
+        if WebDAVSyncEngine.tooSoon(now: Date(), lastStarted: lastRunStarted, lastDuration: lastRunDuration,
+                                    interval: interval) {
+            return false
+        }
         if credentialsMissing {
             emitCredentialsMissing()
-            return
+            return false
         }
+        if authSuspended { return false }
         Task { _ = await self.sync(trigger) }
+        return true
+    }
+
+    /// Automatic passes start at most every max(interval, 2 × the last pass's duration), so a large library on a
+    /// slow server leaves the radio and the server idle between passes.
+    static func tooSoon(now: Date, lastStarted: Date?, lastDuration: TimeInterval?, interval: TimeInterval) -> Bool {
+        guard let started = lastStarted, let duration = lastDuration, 2 * duration > interval else { return false }
+        return now.timeIntervalSince(started) < 2 * duration
     }
 
     // MARK: Syncing
@@ -260,10 +282,13 @@ final class WebDAVSyncEngine {
     private func launch(_ trigger: Trigger) -> Task<WebDAVSyncReport, Never> {
         let task = Task { @MainActor [weak self] () -> WebDAVSyncReport in
             guard let self = self else { return WebDAVSyncReport(started: Date().timeIntervalSince1970) }
+            let started = Date()
             let report = await self.perform(trigger)
             self.running = nil
             self.currentRun = nil
             self.lastRunEnded = Date()
+            self.lastRunStarted = started
+            self.lastRunDuration = Date().timeIntervalSince(started)
             return report
         }
         running = task
@@ -282,8 +307,11 @@ final class WebDAVSyncEngine {
         }
         let root = library.rootURL
         let key = MirrorStateStore.key(server: config.serverURL, user: config.user, folder: config.folder, root: root)
-        let run = WebDAVMirrorRun(client: makeClient(config), root: root,
-                                  store: MirrorStateStore(directory: stateDirectory, key: key),
+        let store = MirrorStateStore(directory: stateDirectory, key: key)
+        store.adoptLegacy(MirrorStateStore(directory: stateDirectory,
+                                           key: MirrorStateStore.legacyKey(server: config.serverURL, user: config.user,
+                                                                           folder: config.folder, root: root)))
+        let run = WebDAVMirrorRun(client: makeClient(config), root: root, store: store,
                                   deviceHex: app.deviceHex, lockedPackages: lockedPackages(library),
                                   excludedTopLevel: WebDAVSyncEngine.excludedTopLevel(root: root))
         currentRun = run
@@ -295,8 +323,10 @@ final class WebDAVSyncEngine {
         if report.failure == nil {
             lastSync = report.finished
             lastFailure = nil
+            authSuspended = false
         } else {
             lastFailure = run.failure ?? .local(report.errors.last ?? "")
+            if run.failure == .authenticationFailed { authSuspended = true }
         }
         WebDAVSyncEngine.log.info("webdav \(trigger.rawValue, privacy: .public): +\(report.uploaded) ↓\(report.downloaded) -\(report.deletedLocal)/\(report.deletedRemote) conflicts \(report.conflicts) failure \(report.failure ?? "none", privacy: .public)")
         if report.changedLocalFiles {
@@ -353,15 +383,23 @@ final class WebDAVSyncEngine {
         return ["Inbox", "diagnostics"]
     }
 
-    /// Uploads one file (webdav.put) to server-relative `components`.
-    func put(_ file: URL, components: [String], configuration config: WebDAVConfiguration) async throws -> String? {
+    /// Uploads one file (webdav.put) to server-relative `components`; an existing file is only replaced with
+    /// `overwrite`.
+    func put(_ file: URL, components: [String], configuration config: WebDAVConfiguration,
+             overwrite: Bool) async throws -> String? {
         let client = makeClient(config)
+        let path = components.joined(separator: "/")
         do {
+            let target = try WebDAVPaths.fileURL(config.serverURL, path: path)
             try await client.ensureCollections(Array(components.dropLast()))
-            let target = WebDAVPaths.fileURL(config.serverURL, path: components.joined(separator: "/"))
-            return try await client.put(file: file, to: target)
+            return try await client.put(file: file, to: target, precondition: overwrite ? .none : .absent)
         } catch {
-            throw WebDAVError.from(error, host: client.host).nibError
+            let e = WebDAVError.from(error, host: client.host)
+            if case .changedDuringSync = e {
+                throw NibError(.conflict, "\(path) already exists on the WebDAV server", path: "$.path",
+                               hint: "pass overwrite: true to replace it, or choose another path")
+            }
+            throw e.nibError
         }
     }
 
@@ -375,7 +413,8 @@ final class WebDAVSyncEngine {
         var info = WebDAVStatusInfo(configured: configured, url: configured ? v.url : nil,
                                     user: configured ? v.user : nil, folder: configured ? v.folder : nil,
                                     allowUntrustedCertificates: v.allowUntrustedCertificates,
-                                    credentialsMissing: missing, state: "idle", running: isRunning,
+                                    credentialsMissing: missing, authFailed: configured && authSuspended,
+                                    state: "idle", running: isRunning,
                                     lastSync: lastSync, pending: 0, errors: Array((report?.errors ?? []).prefix(20)),
                                     message: nil, lastResult: report, connection: nil)
         if let run = currentRun {
@@ -392,6 +431,9 @@ final class WebDAVSyncEngine {
         } else if isRunning {
             info.state = "syncing"
             info.message = String(localized: "Syncing…")
+        } else if authSuspended {
+            info.state = "error"
+            info.message = WebDAVError.authenticationFailed.message
         } else if let r = report {
             let payload = WebDAVSyncEngine.payload(for: r)
             info.state = payload.state

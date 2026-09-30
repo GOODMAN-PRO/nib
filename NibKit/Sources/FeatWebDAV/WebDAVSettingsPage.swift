@@ -22,6 +22,13 @@ struct WebDAVSettingsPage: View {
                         .foregroundStyle(.orange)
                         .accessibilityAddTraits(.isStaticText)
                 }
+            } else if model.status?.authFailed == true {
+                Section {
+                    Label(String(localized: "The server rejected the password. Automatic sync is paused until you re-enter it below."),
+                          systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                        .accessibilityAddTraits(.isStaticText)
+                }
             }
             serverSection
             actionSection
