@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatTextDoc
@@ -45,6 +46,11 @@ final class SlashMenuTests: XCTestCase {
         var commands: [String] { calls.map { $0.command } }
     }
 
+    /// What a hook or an observer saw (a box, so escaping closures can append).
+    private final class Seen: @unchecked Sendable {
+        var items: [String] = []
+    }
+
     private func record(_ h: Harness) -> Recorder {
         let recorder = Recorder()
         h.app.bus.hooks.register(CommandHookDescriptor.guarding(
@@ -86,11 +92,12 @@ final class SlashMenuTests: XCTestCase {
         XCTAssertEqual(shortcut(.italic), KeyShortcut("i", [.command]))
         XCTAssertEqual(shortcut(.underline), KeyShortcut("u", [.command]))
         XCTAssertEqual(shortcut(.strikethrough), KeyShortcut("x", [.command, .shift]))
+        XCTAssertEqual(shortcut(.duplicate), KeyShortcut("d", [.command]), "contracts-v2.2: ⌘D, text documents only")
         // No shortcut is registered twice (F047's ⇧⌘T included).
         let all = h.app.content.keyCommands.all.map { "\($0.shortcut.key.lowercased())/\($0.shortcut.modifiers.rawValue)" }
         XCTAssertEqual(all.count, Set(all).count, "duplicate shortcut")
         XCTAssertEqual(TextDocShortcut.heading1.display, "\u{2303}\u{2318}1")
-        XCTAssertEqual(TextDocShortcut.toggleDone.display, "\u{21E7}\u{2318}\u{21A9}")
+        XCTAssertEqual(TextDocShortcut.toggleDone.display, "\u{21E7}\u{2318}\u{23CE}", "NibDesign's KeyHint glyphs")
         XCTAssertEqual(TextDocShortcut(descriptorID: "textdocedit.key.bold"), .bold)
         XCTAssertNil(TextDocShortcut(descriptorID: "keyboard.bold"))
 
@@ -116,6 +123,201 @@ final class SlashMenuTests: XCTestCase {
         let controller = TextDocEditingController.controller(for: editor)
         XCTAssertTrue(controller === TextDocEditingController.controller(for: editor), "one controller per editor")
         XCTAssertTrue(controller.calls(for: .deleteBlock).isEmpty)
+    }
+
+    // MARK: Key commands under the shell's routing (contracts-v2.2)
+
+    func testKeysAreLiveOnlyInTextDocumentsAndWinASharedShortcutThere() {
+        let h = harness()
+        // F014's item duplicate, as it registers it: ⌘D at .canvas for any kind.
+        h.app.content.keyCommands.register(KeyCommandDescriptor(
+            id: "clipboard.key.duplicate", title: "Duplicate", shortcut: KeyShortcut("d", [.command]),
+            command: CommandIDs.itemDuplicate, scope: .canvas, order: 304, owner: "clipboard"))
+        let all = h.app.content.keyCommands.all
+        func live(_ context: KeyCommandContext) -> [String] { KeyCommandRouting.active(all, in: context).map { $0.id } }
+        let mine = Set(TextDocShortcut.allCases.map { $0.id })
+
+        let textDocument = live(KeyCommandContext(docKind: .textDocument))
+        XCTAssertTrue(mine.isSubset(of: Set(textDocument)), "every key is live in a text document")
+        XCTAssertTrue(textDocument.contains(TextDocShortcut.duplicate.id))
+        XCTAssertFalse(textDocument.contains("clipboard.key.duplicate"), "⌘D duplicates the block in text documents")
+
+        let notebook = live(KeyCommandContext(docKind: .notebook))
+        XCTAssertTrue(notebook.contains("clipboard.key.duplicate"), "and the item everywhere else")
+        XCTAssertTrue(mine.isDisjoint(with: Set(notebook)))
+        XCTAssertTrue(mine.isDisjoint(with: Set(live(KeyCommandContext(docKind: .studySet)))))
+        XCTAssertTrue(mine.isDisjoint(with: Set(live(KeyCommandContext(docKind: nil, hasTabs: true)))), "never in the library")
+
+        // While a block is edited the shell stands back: the editor serves the keys itself, so each exists once.
+        XCTAssertTrue(mine.isDisjoint(with: Set(live(KeyCommandContext(docKind: .textDocument, isEditingText: true)))))
+        for d in all where mine.contains(d.id) {
+            XCTAssertFalse(d.shortcut.modifiers.isDisjoint(with: [.command, .control]), "\(d.id) never takes a typing key")
+            XCTAssertTrue(KeyCommandRouting.overridesSystemKeys(d, in: KeyCommandContext(docKind: .textDocument)), d.id)
+        }
+    }
+
+    func testTheEditorServesItsKeysWhileABlockIsEdited() async throws {
+        let h = harness()
+        let editor = TextDocViewController(doc: doc, session: h.session, app: h.app)
+        editor.loadViewIfNeeded()
+        let controller = TextDocEditingController.controller(for: editor)
+        let tv = focus(editor, Fixtures.paragraphBlockID, selection: NSRange(location: 0, length: 5))
+        XCTAssertEqual(editor.focusedBlockID, Fixtures.paragraphBlockID)
+
+        let keys = controller.keyCommands()
+        XCTAssertEqual(Set(keys.map { $0.id }), Set(TextDocShortcut.allCases.map { $0.id }), "no menu open: the shortcuts")
+        let duplicate = try XCTUnwrap(keys.first { $0.id == TextDocShortcut.duplicate.id })
+        XCTAssertEqual(duplicate.input, "d")
+        XCTAssertEqual(duplicate.modifiers, .command)
+
+        // A remapped key is served as remapped; a descriptor limited to other kinds is not served here.
+        var remapped = try XCTUnwrap(h.app.content.keyCommands.get(TextDocShortcut.moveUp.id))
+        remapped.shortcut = KeyShortcut("k", [.command, .option])
+        h.app.content.keyCommands.register(remapped)
+        var elsewhere = try XCTUnwrap(h.app.content.keyCommands.get(TextDocShortcut.moveDown.id))
+        elsewhere.docKinds = [.notebook]
+        h.app.content.keyCommands.register(elsewhere)
+        let served = controller.keyCommands()
+        XCTAssertEqual(served.first { $0.id == TextDocShortcut.moveUp.id }?.input, "k")
+        XCTAssertNil(served.first { $0.id == TextDocShortcut.moveDown.id })
+        XCTAssertEqual(TextDocEditingController.servedDescriptors([KeyCommandDescriptor(
+            id: TextDocShortcut.bold.id, title: "Bold", shortcut: KeyShortcut("b", [.command]), command: CommandIDs.batch,
+            scope: .canvas, owner: "textdocedit")]).count, 1, "no docKinds: any kind, text documents included")
+
+        // What each key does to the focused block: the descriptor's params come from the window.
+        let ref = paragraph
+        XCTAssertEqual(controller.calls(for: .heading2),
+                       [CommandCall(command: "block.update", params: ["ref": .string(ref), "kind": "heading2"])])
+        XCTAssertEqual(controller.calls(for: .moveDown),
+                       [CommandCall(command: "block.move", params: ["ref": .string(ref), "after": "block:FIXTUREDOC02/FIXTUREBLK03"])])
+        XCTAssertEqual(controller.calls(for: .deleteBlock),
+                       [CommandCall(command: "block.delete", params: ["refs": [.string(ref)]])])
+        XCTAssertEqual(controller.calls(for: .duplicate).map { $0.command }, ["block.insert"])
+        XCTAssertTrue(controller.calls(for: .toggleDone).isEmpty, "only to-dos have a done state")
+        let bold = try XCTUnwrap(controller.calls(for: .bold).first)
+        XCTAssertEqual(bold.command, "block.update")
+        XCTAssertNotNil(bold.params["text"], "the selection is formatted in the block's text")
+        let params = try XCTUnwrap(h.app.content.keyCommands.get(TextDocShortcut.heading2.id)).resolvedParams(for: h.session)
+        XCTAssertEqual(params["calls"]?.arrayValue?.count, 1, "the shell would get the same calls")
+
+        // ⌘D: one undo step, the copy right below.
+        let depth = h.undoDepth(doc)
+        let duplicated = await controller.execute(controller.calls(for: .duplicate))
+        let results = try XCTUnwrap(duplicated)
+        let copy = try XCTUnwrap(results.first?["ref"]?.stringValue)
+        XCTAssertEqual(try live(h).map { NodeRef.block(doc, $0.id).description }[2], copy)
+        XCTAssertEqual(h.undoDepth(doc), depth + 1)
+        withExtendedLifetime(tv) {}
+    }
+
+    func testMenuKeysOnlyTakeWhatTheMenuCanUse() throws {
+        let h = harness()
+        let editor = TextDocViewController(doc: doc, session: h.session, app: h.app)
+        editor.loadViewIfNeeded()
+        let controller = TextDocEditingController.controller(for: editor)
+        let tv = focus(editor, Fixtures.paragraphBlockID, selection: NSRange(location: 12, length: 0))
+        let state = BlockKindMenuState(title: "Blocks", emptyText: "No matching blocks")
+        controller.slashMenu = BlockKindMenuPresenter(editor: editor, id: "test.slash", state: state)
+        func menuKeys() -> Set<String> {
+            Set(controller.keyCommands().map { $0.id }.filter { $0.hasPrefix("textdocedit.menu.") })
+        }
+        XCTAssertEqual(menuKeys(), ["textdocedit.menu.escape"], "no choice: Return splits the line, arrows move the caret")
+        state.choices = SlashMenuFilter.matches("", in: h.app.content.blockKinds.all).map { BlockKindChoice.make($0) }
+        XCTAssertEqual(menuKeys(), ["textdocedit.menu.up", "textdocedit.menu.down", "textdocedit.menu.return",
+                                    "textdocedit.menu.tab", "textdocedit.menu.escape"])
+        tv.setMarkedText("\u{3042}", selectedRange: NSRange(location: 1, length: 0))
+        if tv.markedTextRange != nil {
+            XCTAssertEqual(menuKeys(), [], "an input method composing keeps its keys")
+        }
+        tv.unmarkText()
+        controller.slashMenu = nil
+        XCTAssertEqual(menuKeys(), [])
+    }
+
+    func testTurnIntoShowsTheLiveShortcutsAsKeyHints() throws {
+        let h = harness()
+        let editor = TextDocViewController(doc: doc, session: h.session, app: h.app)
+        editor.loadViewIfNeeded()
+        let controller = TextDocEditingController.controller(for: editor)
+        let tv = focus(editor, Fixtures.paragraphBlockID, selection: NSRange(location: 3, length: 0))
+        controller.perform(.turnInto, descriptorID: TextDocShortcut.turnInto.id)
+        let state = try XCTUnwrap(controller.turnIntoMenu?.state)
+        let h1 = try XCTUnwrap(state.choices.first { $0.title == "Heading 1" })
+        XCTAssertEqual(h1.shortcut, KeyboardShortcut("1", modifiers: [.command, .control]))
+        XCTAssertTrue(state.choices.first { $0.isCurrent }?.title == "Text", "the paragraph is checked")
+        controller.perform(.turnInto, descriptorID: TextDocShortcut.turnInto.id)
+        XCTAssertNil(controller.turnIntoMenu, "⌘T again closes it")
+        withExtendedLifetime(tv) {}
+    }
+
+    func testMultiCallActionsRunAsOneBatchAndReportAFailedCall() async throws {
+        let h = harness()
+        let editor = TextDocViewController(doc: doc, session: h.session, app: h.app)
+        editor.loadViewIfNeeded()
+        let controller = TextDocEditingController.controller(for: editor)
+        let seen = Seen()
+        h.app.bus.hooks.register(CommandHookDescriptor.guarding(
+            id: "test.batches", owner: "test", commands: [CommandIDs.batch]) { command, _, _ in
+            seen.items.append(command)
+            return nil
+        })
+        let depth = h.undoDepth(doc)
+        let ran = await controller.execute([
+            CommandCall(command: "block.update", params: ["ref": .string(paragraph), "text": ""]),
+            TurnInto.call(ref: paragraph, to: .heading3)
+        ])
+        let results = try XCTUnwrap(ran)
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(seen.items, [CommandIDs.batch], "one queued batch")
+        XCTAssertEqual(try block(h, "FIXTUREBLK02").kind, .heading3)
+        XCTAssertEqual(h.undoDepth(doc), depth + 1, "one undo step")
+
+        let failures = Seen()
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { note in
+            if let command = note.userInfo?["command"] as? String, note.userInfo?["error"] is NibError {
+                failures.items.append(command)
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        let failed = await controller.execute([
+            TurnInto.call(ref: paragraph, to: .quote),
+            CommandCall(command: "block.update", params: ["ref": "block:FIXTUREDOC02/NOSUCHBLOCK", "kind": "quote"])
+        ])
+        XCTAssertNil(failed)
+        XCTAssertEqual(failures.items, ["block.update"], "the failed call reaches the shell's toast")
+    }
+
+    func testDragMetricsAndBarTooltips() {
+        let visible = CGRect(x: 0, y: 100, width: 600, height: 500)
+        XCTAssertEqual(DragMetrics.autoscrollStep(fingerY: 350, visible: visible), 0)
+        XCTAssertEqual(DragMetrics.autoscrollStep(fingerY: 100, visible: visible), -DragMetrics.autoscrollSpeed, accuracy: 0.001)
+        XCTAssertEqual(DragMetrics.autoscrollStep(fingerY: 600, visible: visible), DragMetrics.autoscrollSpeed, accuracy: 0.001)
+        let halfway = DragMetrics.autoscrollStep(fingerY: 100 + DragMetrics.autoscrollEdge / 2, visible: visible)
+        XCTAssertEqual(halfway, -DragMetrics.autoscrollSpeed / 2, accuracy: 0.001, "linear across the band")
+        XCTAssertGreaterThan(DragMetrics.liftScale, 1)
+
+        XCTAssertEqual(FormattingBar.tooltip(.style(.bold), keys: KeyShortcut("b", [.command])), "Bold  \u{2318}B")
+        XCTAssertEqual(FormattingBar.shortcut(.style(.code)), .inlineCode)
+        XCTAssertEqual(FormattingBar.shortcut(.turnInto), .turnInto)
+        XCTAssertNil(FormattingBar.shortcut(.indent))
+        XCTAssertEqual(FormattingBar.tooltip(.indent, keys: nil), "Increase Indent")
+        for style in InlineStyle.toggles { XCTAssertNotNil(TextDocShortcut.forStyle(style), style.title) }
+        XCTAssertEqual(KeyShortcut("return", [.command, .shift]).keyboardShortcut,
+                       KeyboardShortcut(.return, modifiers: [.command, .shift]))
+        XCTAssertNil(KeyShortcut("f12").keyboardShortcut)
+    }
+
+    /// Focuses a block the way UIKit does when its text view begins editing (no window needed).
+    private func focus(_ editor: TextDocViewController, _ id: NibID, selection: NSRange) -> BlockTextView {
+        let tv = BlockTextView()
+        tv.blockID = id
+        let kind = editor.block(id)?.kind ?? .paragraph
+        let style = BlockStyle.make(kind: kind)
+        tv.style = style
+        tv.attributedText = style.attributed(editor.block(id)?.text ?? .empty)
+        editor.textViewDidBeginEditing(tv)
+        tv.selectedRange = selection
+        return tv
     }
 
     // MARK: Acceptance: slash-menu filtering and aliases
@@ -253,17 +455,38 @@ final class SlashMenuTests: XCTestCase {
         line = try block(h, "CHARTLINE01")
         recorder.calls.removeAll()
         let plugin = SlashPlanner.calls(for: chart, block: line, remaining: .empty, doc: doc, newID: "UNUSED00002")
-        XCTAssertEqual(plugin.calls.map { $0.command }, ["block.update", "dev.nib.charts.insert", "block.delete"])
-        XCTAssertNil(plugin.calls[1].params["id"], "a plugin command chooses its own id")
-        XCTAssertEqual(plugin.calls[1].params["after"]?.stringValue, "block:FIXTUREDOC02/CHARTLINE01")
-        XCTAssertEqual(plugin.focusResultOf, 1)
+        XCTAssertEqual(plugin.calls.map { $0.command }, ["dev.nib.charts.insert", "block.delete"],
+                       "the insert goes first; the line that held only the query goes without an update")
+        XCTAssertNil(plugin.calls[0].params["id"], "a plugin command chooses its own id")
+        XCTAssertEqual(plugin.calls[0].params["after"]?.stringValue, "block:FIXTUREDOC02/CHARTLINE01")
+        XCTAssertEqual(plugin.focusResultOf, 0)
         let result = try await h.run(CommandIDs.batch, ["calls": .array(plugin.calls.map { $0.json })])
-        XCTAssertEqual(result["results"]?[1]?["value"]?["ref"]?.stringValue, "block:FIXTUREDOC02/CHARTBLOCK1")
+        XCTAssertEqual(result["results"]?[0]?["value"]?["ref"]?.stringValue, "block:FIXTUREDOC02/CHARTBLOCK1")
         let ids = try live(h).map { $0.id.raw }
         XCTAssertFalse(ids.contains("CHARTLINE01"), "the empty line was replaced")
         XCTAssertEqual(ids, ["FIXTUREBLK01", "FIXTUREBLK02", "NEWHEADING1", "CHARTBLOCK1", "FIXTUREBLK03"])
         XCTAssertEqual(try block(h, "CHARTBLOCK1").custom?.owner, "dev.nib.charts")
-        XCTAssertEqual(recorder.commands, ["block.update", "dev.nib.charts.insert", "block.insert", "block.delete"])
+        XCTAssertEqual(recorder.commands, ["dev.nib.charts.insert", "block.insert", "block.delete"])
+    }
+
+    func testAPluginInsertThatFailsLeavesTheLineAsItWas() async throws {
+        let h = harness()
+        h.app.content.blockKinds.register(BlockKindDescriptor(
+            id: "dev.nib.broken.widget", title: "Widget", icon: "square", kind: .custom, owner: "dev.nib.broken",
+            order: 900, customType: "dev.nib.broken.widget", command: "dev.nib.broken.insert"))
+        h.app.commands.register(CommandDescriptor(id: "dev.nib.broken.insert", title: "Insert Widget",
+                                                  summary: "Test plugin insert that fails.", effect: .edit, exposure: .ui)) { _, _ in
+            throw NibError(.unavailable, "the widget service is down")
+        }
+        let widget = try XCTUnwrap(h.app.content.blockKinds.all.first { $0.id == "dev.nib.broken.widget" })
+        try await h.run("block.update", ["ref": .string(paragraph), "text": "Hello blocks /wid"])
+        let before = try h.snapshot(doc)
+        let plan = SlashPlanner.calls(for: widget, block: try block(h, "FIXTUREBLK02"),
+                                      remaining: RichText(plain: "Hello blocks "), doc: doc, newID: "UNUSED00003")
+        XCTAssertEqual(plan.calls.map { $0.command }, ["dev.nib.broken.insert", "block.update"])
+        let result = try await h.run(CommandIDs.batch, ["calls": .array(plan.calls.map { $0.json })])
+        XCTAssertEqual(result["results"]?.arrayValue?.count, 1, "the batch stops at the failed insert")
+        XCTAssertEqual(try h.snapshot(doc), before, "the query stays in the line, nothing was inserted")
     }
 
     func testSlashDividerOnAnEmptyLineLeavesALineBelowForTheCaret() async throws {

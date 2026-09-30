@@ -395,10 +395,37 @@ final class FormattingBar: UIView {
         CGSize(width: UIView.noIntrinsicMetric, height: NibMetrics.hitTarget + 2 * NibSpacing.xs)
     }
 
-    /// Shown above a keyboard: mirror the block that has it.
+    /// Shown above a keyboard: mirror the block that has it, with the shortcuts as registered now.
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        if window != nil { controller?.refreshFormattingState() }
+        guard window != nil else { return }
+        refreshTooltips()
+        controller?.refreshFormattingState()
+    }
+
+    /// Each button's pointer tooltip: its title and, when it shares a text-document shortcut, that shortcut's keys
+    /// (every shortcut shows its hint; a remapped key shows as remapped).
+    func refreshTooltips() {
+        for (item, button) in buttons {
+            let keys = FormattingBar.shortcut(item).flatMap { controller?.liveShortcut($0) }
+            button.toolTip = FormattingBar.tooltip(item, keys: keys)
+        }
+    }
+
+    /// The text-document shortcut that does what a bar item does.
+    static func shortcut(_ item: Item) -> TextDocShortcut? {
+        switch item {
+        case .turnInto: return .turnInto
+        case .style(let style): return TextDocShortcut.forStyle(style)
+        case .highlight: return .highlight
+        default: return nil
+        }
+    }
+
+    /// "Bold  ⌘B", or the title alone for an item without a shortcut.
+    static func tooltip(_ item: Item, keys: KeyShortcut?) -> String {
+        guard let keys = keys else { return title(item) }
+        return title(item) + "  " + TextDocShortcut.display(keys)
     }
 
     private func build() {
@@ -457,7 +484,7 @@ final class FormattingBar: UIView {
         let b = UIButton(configuration: c)
         b.isPointerInteractionEnabled = true
         b.accessibilityLabel = FormattingBar.title(item)
-        b.toolTip = FormattingBar.title(item)
+        b.toolTip = FormattingBar.tooltip(item, keys: FormattingBar.shortcut(item).map { $0.shortcut })
         b.configurationUpdateHandler = { button in
             var config = button.configuration
             config?.background.backgroundColor = button.isSelected ? NibUIColor.fill3 : .clear

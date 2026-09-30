@@ -24,10 +24,14 @@ public enum FeatTextDocEditingFeature: NibFeature {
 /// and plugins see them) and served by the editor while a block is edited.
 ///
 /// Each runs `commands.batch` with the calls `sessionParams` computes from the window (one undo step); its static
-/// params are an empty batch. Scope is `.canvas`, F014's convention for keys that belong to a text view while it
-/// edits: the shell never takes them from a text view (a notebook's text box keeps its own ⌘B), and the text-document
-/// editor serves them itself through `TextDocHooks.keyCommandSets`, closer to the first responder. `docKinds` keeps
-/// them to text documents once the shell honours it.
+/// params are an empty batch. The shell (contracts-v2.2) honours both halves of the scoping:
+/// - `docKinds: [.textDocument]`: the keys are never live in notebooks, whiteboards, study sets or the library, and in
+///   a text document they win a shared shortcut over any-kind keys (`KeyCommandRouting`: fewer kinds first), so the
+///   block duplicate can sit on ⌘D beside F014's item duplicate.
+/// - Scope `.canvas`, F014's convention for keys that belong to a text view while it edits: the shell drops `.canvas`
+///   keys while text has the keyboard, and the text-document editor serves these itself through
+///   `TextDocHooks.keyCommandSets`, closer to the first responder, with what the shell cannot do (the ⌘T popover,
+///   typing styles, waiting for queued keystrokes, handing the caret on). So each key exists once in the window.
 enum TextDocShortcut: String, CaseIterable {
     case bold, italic, underline, strikethrough, inlineCode, highlight, superscript, subscriptText
     case turnInto
@@ -66,7 +70,8 @@ enum TextDocShortcut: String, CaseIterable {
         case .toggleDone: return KeyShortcut("return", [.command, .shift])
         case .moveUp: return KeyShortcut("up", [.command, .option])
         case .moveDown: return KeyShortcut("down", [.command, .option])
-        case .duplicate: return KeyShortcut("d", [.command, .shift])
+        // contracts-v2.2: limited to text documents, ⌘D wins over F014's any-kind item duplicate there.
+        case .duplicate: return KeyShortcut("d", [.command])
         case .deleteBlock: return KeyShortcut("delete", [.command, .shift])
         }
     }
@@ -113,7 +118,23 @@ enum TextDocShortcut: String, CaseIterable {
         }
     }
 
-    /// "⌃⌘1": how the shortcut reads in menus (`KeyHint`).
+    /// The key of an inline style's shortcut (the formatting bar's tooltips).
+    static func forStyle(_ style: InlineStyle) -> TextDocShortcut? {
+        switch style {
+        case .bold: return .bold
+        case .italic: return .italic
+        case .underline: return .underline
+        case .strikethrough: return .strikethrough
+        case .code: return .inlineCode
+        case .superscriptText: return .superscript
+        case .subscriptText: return .subscriptText
+        case .highlight: return .highlight
+        case .color, .clear: return nil
+        }
+    }
+
+    /// "⌃⌘1": how the shortcut reads in UIKit text (tooltips). SwiftUI rows show NibDesign's `KeyHint` instead
+    /// (`KeyShortcut.keyboardShortcut`); these are its glyphs, since its formatter is internal to NibDesign.
     var display: String {
         TextDocShortcut.display(shortcut)
     }
@@ -125,7 +146,7 @@ enum TextDocShortcut: String, CaseIterable {
         if s.modifiers.contains(.shift) { out += "\u{21E7}" }
         if s.modifiers.contains(.command) { out += "\u{2318}" }
         switch s.key {
-        case "return": out += "\u{21A9}"
+        case "return": out += "\u{23CE}"
         case "up": out += "\u{2191}"
         case "down": out += "\u{2193}"
         case "left": out += "\u{2190}"
@@ -133,7 +154,7 @@ enum TextDocShortcut: String, CaseIterable {
         case "delete": out += "\u{232B}"
         case "escape": out += "\u{238B}"
         case "tab": out += "\u{21E5}"
-        case "space": out += "\u{2423}"
+        case "space": out += String(localized: "Space")
         default: out += s.key.uppercased()
         }
         return out
@@ -328,25 +349,12 @@ final class TextDocEditingController {
 
     // MARK: Keys
 
+    /// The editor's keys while a block is edited: the open popover's navigation, then every text-document shortcut.
+    /// These are the keys the shell stands back from while text has the keyboard (`.canvas`, contracts-v2.2).
     func keyCommands() -> [TextDocKeyCommand] {
         guard let editor = editor, !editor.isReadOnly else { return [] }
-        var out: [TextDocKeyCommand] = []
-        if let state = openMenuState {
-            let nav: [(String, String, UIKeyModifierFlags, @MainActor (BlockKindMenuState) -> Void)] = [
-                ("up", UIKeyCommand.inputUpArrow, [], { $0.moveHighlight(by: -1) }),
-                ("down", UIKeyCommand.inputDownArrow, [], { $0.moveHighlight(by: 1) }),
-                ("return", "\r", [], { $0.pick($0.highlighted) }),
-                ("tab", "\t", [], { $0.pick($0.highlighted) }),
-                ("escape", UIKeyCommand.inputEscape, [], { $0.dismiss() })
-            ]
-            for (name, input, modifiers, action) in nav {
-                out.append(TextDocKeyCommand(id: TextDocEditingHooks.prefix + "menu." + name, title: "", input: input,
-                                             modifiers: modifiers) { _ in action(state) })
-            }
-        }
-        for d in editor.app.content.keyCommands.all {
-            guard let shortcut = TextDocShortcut(descriptorID: d.id) else { continue }
-            if let kinds = d.docKinds, !kinds.contains(.textDocument) { continue }
+        var out = menuKeyCommands()
+        for (shortcut, d) in TextDocEditingController.servedDescriptors(editor.app.content.keyCommands.all) {
             let id = d.id
             out.append(TextDocKeyCommand(id: id, title: d.title, input: TextDocShortcut.keyInput(d.shortcut.key),
                                          modifiers: TextDocShortcut.flags(d.shortcut.modifiers)) { [weak self] _ in
@@ -354,6 +362,43 @@ final class TextDocEditingController {
             })
         }
         return out
+    }
+
+    /// While a popover is open: ↑ and ↓ move the highlight, Return and Tab pick it, Escape closes it. Never while an
+    /// input method composes (its candidates need those keys). With no choice to pick, Return, Tab and the arrows keep
+    /// their meaning: Return splits the line, which closes the slash menu.
+    func menuKeyCommands() -> [TextDocKeyCommand] {
+        guard let state = openMenuState, editor?.focusedTextView?.markedTextRange == nil else { return [] }
+        var nav: [(String, String, @MainActor (BlockKindMenuState) -> Void)] = []
+        if !state.choices.isEmpty {
+            nav += [("up", UIKeyCommand.inputUpArrow, { $0.moveHighlight(by: -1) }),
+                    ("down", UIKeyCommand.inputDownArrow, { $0.moveHighlight(by: 1) }),
+                    ("return", "\r", { $0.pick($0.highlighted) }),
+                    ("tab", "\t", { $0.pick($0.highlighted) })]
+        }
+        nav.append(("escape", UIKeyCommand.inputEscape, { $0.dismiss() }))
+        return nav.map { name, input, action in
+            TextDocKeyCommand(id: TextDocEditingHooks.prefix + "menu." + name, title: "", input: input, modifiers: []) { _ in
+                action(state)
+            }
+        }
+    }
+
+    /// The text-document keys the editor serves: this feature's descriptors (a remapped shortcut included) whose
+    /// `docKinds` admit text documents, read as the shell reads them (nil or empty = any kind).
+    static func servedDescriptors(_ all: [KeyCommandDescriptor]) -> [(TextDocShortcut, KeyCommandDescriptor)] {
+        all.compactMap { d in
+            guard let shortcut = TextDocShortcut(descriptorID: d.id) else { return nil }
+            if let kinds = d.docKinds, !kinds.isEmpty, !kinds.contains(.textDocument) { return nil }
+            return (shortcut, d)
+        }
+    }
+
+    /// A shortcut's keys as registered now (the keyboard settings may remap them), for hints and tooltips; nil once
+    /// its descriptor is gone.
+    func liveShortcut(_ s: TextDocShortcut) -> KeyShortcut? {
+        guard let editor = editor else { return s.shortcut }
+        return editor.app.content.keyCommands.get(s.id)?.shortcut
     }
 
     /// A text-document key: menus and typing styles act at once; everything else runs the descriptor's command with
@@ -452,18 +497,39 @@ final class TextDocEditingController {
         await editor?.flushEdits()
     }
 
-    /// Runs calls in order as the user, as ONE undo step; stops at the first failure (which the shell shows as a
-    /// toast). Returns each call's value, nil on failure.
+    /// Runs calls in order as the user, as ONE undo step and ONE step of the editor's queue: several calls go as one
+    /// `commands.batch`, so a keystroke committed meanwhile never lands between them and splits the undo step. Stops
+    /// at the first failure, which the shell shows as a toast. Returns each call's value, nil on failure.
     @discardableResult
     func execute(_ calls: [CommandCall]) async -> [JSONValue]? {
         guard !calls.isEmpty else { return [] }
+        guard let editor = editor else { return nil }
         let group = NibID.make().raw
-        var results: [JSONValue] = []
-        for call in calls {
-            guard let editor = editor, let value = await editor.run(call.command, call.params, group: group) else { return nil }
-            results.append(value)
+        if calls.count == 1 {
+            return await editor.run(calls[0].command, calls[0].params, group: group).map { [$0] }
         }
-        return results
+        let batch: JSONValue = ["calls": .array(calls.map { $0.json })]
+        guard let value = await editor.run(CommandIDs.batch, batch, group: group) else { return nil }
+        return TextDocEditingController.batchResults(value, calls: calls, app: editor.app)
+    }
+
+    /// Each call's value from a `commands.batch` result, or nil when a call failed. A failure inside the batch is not
+    /// a failure of the batch, so it is reported here the way `NibApp.perform` reports one (the shell's toast).
+    static func batchResults(_ value: JSONValue, calls: [CommandCall], app: NibApp) -> [JSONValue]? {
+        guard case .array(let outcomes)? = value["results"] else { return nil }
+        var results: [JSONValue] = []
+        for (i, outcome) in outcomes.enumerated() {
+            guard outcome["ok"]?.boolValue == true else {
+                let error = (try? outcome["error"]?.decode(NibError.self))
+                    ?? NibError(.unavailable, "the command did not finish")
+                let command = calls.indices.contains(i) ? calls[i].command : CommandIDs.batch
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                                userInfo: ["command": command, "error": error])
+                return nil
+            }
+            results.append(outcome["value"] ?? .null)
+        }
+        return results.count == calls.count ? results : nil
     }
 
     /// A descriptor's command: a batch runs its calls as one undo step, anything else as one call.

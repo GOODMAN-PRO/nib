@@ -150,17 +150,20 @@ enum SlashPlanner {
         return CommandCall(command: d.command ?? BlockInsert.descriptor.id, params: .object(params))
     }
 
-    /// The commands one pick runs, in order and as one undo step: the "/query" leaves the block's text, then the
-    /// block turns into the kind or the kind is inserted below (an empty paragraph it replaces goes).
+    /// The commands one pick runs, in order and as one undo step (one `commands.batch` that stops at the first
+    /// failure). Turning the line into the kind: the "/query" leaves the block's text, then the kind changes.
+    /// Inserting below: the insert goes FIRST, so a plugin command that throws leaves the line as it was; then the
+    /// "/query" leaves the text, or the empty paragraph the new block replaces goes.
     static func calls(for d: BlockKindDescriptor, block: TextBlock, remaining: RichText, doc: DocumentID,
                       newID: NibID) -> Result {
         let ref = NodeRef.block(doc, block.id).description
-        var calls: [CommandCall] = []
+        var textUpdate: CommandCall?
         if remaining != block.text, let json = try? JSONValue.from(remaining) {
-            calls.append(CommandCall(command: BlockUpdate.descriptor.id, params: ["ref": .string(ref), "text": json]))
+            textUpdate = CommandCall(command: BlockUpdate.descriptor.id, params: ["ref": .string(ref), "text": json])
         }
         switch plan(for: d, block: block, remainingIsEmpty: remaining.isEmpty) {
         case .turnInto(let kind):
+            var calls = textUpdate.map { [$0] } ?? []
             if kind != block.kind { calls.append(TurnInto.call(ref: ref, to: kind)) }
             if kind == .divider {
                 // A line after the rule keeps the caret in the text.
@@ -172,14 +175,16 @@ enum SlashPlanner {
             let keepsCaret = BlockRules.isText(kind) || BlockRules.hasCaption(kind)
             return Result(calls: calls, focus: keepsCaret ? block.id : nil, focusResultOf: nil)
         case .insertBelow:
-            calls.append(insertCall(d, after: block.id, doc: doc, newID: newID))
-            let insertIndex = calls.count - 1
+            var calls = [insertCall(d, after: block.id, doc: doc, newID: newID)]
             if remaining.isEmpty, block.kind == .paragraph, (block.indent ?? 0) == 0 {
+                // The line held only the query: it goes, so its text needs no update.
                 calls.append(CommandCall(command: BlockDelete.descriptor.id, params: ["refs": [.string(ref)]]))
+            } else if let update = textUpdate {
+                calls.append(update)
             }
             return d.command == nil
                 ? Result(calls: calls, focus: newID, focusResultOf: nil)
-                : Result(calls: calls, focus: nil, focusResultOf: insertIndex)
+                : Result(calls: calls, focus: nil, focusResultOf: 0)
         }
     }
 }
@@ -244,18 +249,46 @@ struct BlockKindChoice: Identifiable, Equatable {
     let title: String
     let symbol: NibSymbol
     let isCurrent: Bool
-    /// The Turn Into shortcut, shown as a `KeyHint`.
-    let shortcut: String?
+    /// The Turn Into shortcut, shown as NibDesign's `KeyHint`.
+    let shortcut: KeyboardShortcut?
     /// Contributed by a plugin (shown as such).
     let isPlugin: Bool
 
-    static func make(_ d: BlockKindDescriptor, current: BlockKind? = nil, shortcut: String? = nil) -> BlockKindChoice {
+    static func make(_ d: BlockKindDescriptor, current: BlockKind? = nil, shortcut: KeyShortcut? = nil) -> BlockKindChoice {
         BlockKindChoice(id: d.id, title: d.title, symbol: symbol(d), isCurrent: current == d.kind && d.kind != .custom,
-                        shortcut: shortcut, isPlugin: d.kind == .custom)
+                        shortcut: shortcut?.keyboardShortcut, isPlugin: d.kind == .custom)
     }
 
     static func symbol(_ d: BlockKindDescriptor) -> NibSymbol {
         NibSymbol(systemName: d.icon) ?? NibSymbol.plugin(d.icon)
+    }
+}
+
+extension KeyShortcut {
+    /// The same keys as SwiftUI's `KeyboardShortcut`, so `KeyHint` draws them like every other hint in Nib (nil for a
+    /// key SwiftUI cannot name).
+    var keyboardShortcut: KeyboardShortcut? {
+        let equivalent: KeyEquivalent
+        switch key {
+        case "up": equivalent = .upArrow
+        case "down": equivalent = .downArrow
+        case "left": equivalent = .leftArrow
+        case "right": equivalent = .rightArrow
+        case "escape": equivalent = .escape
+        case "delete": equivalent = .delete
+        case "tab": equivalent = .tab
+        case "return": equivalent = .return
+        case "space": equivalent = .space
+        default:
+            guard key.count == 1, let character = key.first else { return nil }
+            equivalent = KeyEquivalent(character)
+        }
+        var flags: EventModifiers = []
+        if modifiers.contains(.command) { flags.insert(.command) }
+        if modifiers.contains(.shift) { flags.insert(.shift) }
+        if modifiers.contains(.option) { flags.insert(.option) }
+        if modifiers.contains(.control) { flags.insert(.control) }
+        return KeyboardShortcut(equivalent, modifiers: flags)
     }
 }
 

@@ -43,6 +43,34 @@ enum BlockReorder {
     }
 }
 
+// MARK: - Drag metrics (pure, tested)
+
+/// The drag's own measures. NibDesign has no public token for them yet (contract gap: a UIKit lift scale in
+/// `NibMotion`, DropletStyle's 1.02 is internal, and an autoscroll edge and speed), so they live here, in one place.
+enum DragMetrics {
+    /// The lifted copy grows by 2 %, as a lifted droplet does.
+    static let liftScale: CGFloat = 1.02
+    /// Autoscroll starts this close to the top or bottom of the visible column…
+    static let autoscrollEdge: CGFloat = NibMetrics.hitTarget * 1.5
+    /// …and scrolls up to this far per frame with the finger at the very edge.
+    static let autoscrollSpeed: CGFloat = NibSpacing.m
+
+    /// Reduce Motion (or Liquid Off): the copy lifts without growing.
+    @MainActor static var reducesMotion: Bool { NibMotion.forcesReduced || UIAccessibility.isReduceMotionEnabled }
+
+    /// How far to scroll this frame for a finger at `fingerY` (content coordinates): negative up, positive down,
+    /// growing linearly across the edge band; 0 in the middle.
+    static func autoscrollStep(fingerY y: CGFloat, visible: CGRect) -> CGFloat {
+        if y < visible.minY + autoscrollEdge {
+            return -autoscrollSpeed * min(1, (visible.minY + autoscrollEdge - y) / autoscrollEdge)
+        }
+        if y > visible.maxY - autoscrollEdge {
+            return autoscrollSpeed * min(1, (y - (visible.maxY - autoscrollEdge)) / autoscrollEdge)
+        }
+        return 0
+    }
+}
+
 // MARK: - The handle
 
 /// A 44 pt handle with the drag glyph, plain `labelTertiary` (no droplet: text documents carry no liquid).
@@ -289,9 +317,11 @@ final class BlockHandleOverlay: NSObject, UIGestureRecognizerDelegate {
         let fingerInContent = editor.view.convert(finger, to: cv)
         drag = DragState(block: id, ghost: ghost, line: line, grabOffset: fingerInContent.y - frame.midY,
                          fingerInEditor: finger, gap: nil)
-        NibMotion.animateUIKit(NibMotion.lift, animations: {
-            ghost.transform = CGAffineTransform(scaleX: 1.02, y: 1.02)
-        })
+        if !DragMetrics.reducesMotion {
+            NibMotion.animateUIKit(NibMotion.lift, animations: {
+                ghost.transform = CGAffineTransform(scaleX: DragMetrics.liftScale, y: DragMetrics.liftScale)
+            })
+        }
         let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
         link.add(to: .main, forMode: .common)
         displayLink = link
@@ -350,13 +380,7 @@ final class BlockHandleOverlay: NSObject, UIGestureRecognizerDelegate {
         guard let editor = editor, let cv = editor.collectionView, let state = drag else { return }
         let visible = BlockKindMenuPresenter.visibleRect(cv)
         let p = editor.view.convert(state.fingerInEditor, to: cv)
-        let edge = NibMetrics.hitTarget * 1.5
-        var dy: CGFloat = 0
-        if p.y < visible.minY + edge {
-            dy = -NibSpacing.m * min(1, (visible.minY + edge - p.y) / edge)
-        } else if p.y > visible.maxY - edge {
-            dy = NibSpacing.m * min(1, (p.y - (visible.maxY - edge)) / edge)
-        }
+        let dy = DragMetrics.autoscrollStep(fingerY: p.y, visible: visible)
         guard dy != 0 else { return }
         let inset = cv.adjustedContentInset
         let minY = -inset.top

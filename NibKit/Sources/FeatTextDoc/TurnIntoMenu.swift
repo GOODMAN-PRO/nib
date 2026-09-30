@@ -93,7 +93,9 @@ extension TextDocEditingController {
         closeSlash()
         let targets = TurnInto.targets(blockKinds)
         let state = BlockKindMenuState(title: String(localized: "Turn Into"), emptyText: String(localized: "No block kinds"))
-        state.choices = targets.map { BlockKindChoice.make($0, current: block.kind, shortcut: TextDocShortcut.forKind($0.kind)?.display) }
+        state.choices = targets.map { d in
+            BlockKindChoice.make(d, current: block.kind, shortcut: TextDocShortcut.forKind(d.kind).flatMap { liveShortcut($0) })
+        }
         state.highlighted = targets.firstIndex { $0.kind == block.kind } ?? 0
         state.onPick = { [weak self] index in
             guard let self = self, targets.indices.contains(index) else { return }
