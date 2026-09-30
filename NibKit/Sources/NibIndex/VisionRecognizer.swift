@@ -11,17 +11,21 @@ struct InkLine: Equatable {
     var bbox: Rect
     var itemIDs: [ElementID]
     var confidence: Double
-    var words: [IndexWord]
+    var words: [TextRecognitionWord]
 
+    /// The line as the `TextRecognizer` contract returns it (contracts-v2: word boxes and their strokes in `words`).
     var recognition: TextRecognition {
-        TextRecognition(text: text, alternatives: alternatives, bbox: bbox, itemIDs: itemIDs, source: IndexSource.ink,
-                        confidence: confidence)
+        var r = TextRecognition(text: text, alternatives: alternatives, bbox: bbox, itemIDs: itemIDs, source: IndexSource.ink,
+                                confidence: confidence)
+        r.words = words
+        return r
     }
 }
 
 /// `TextRecognizer` on Vision: handwriting is rendered ink-only (black on white, scaled so the x-height is ~32 px) and
 /// read with `VNRecognizeTextRequest` (.accurate) in the document's language; each line keeps its top candidate plus
-/// two alternates, and word boxes are mapped back to the strokes they cover. Stateless and thread-safe.
+/// two alternates, and word boxes are mapped back to the strokes they cover (`TextRecognition.words`). Stateless and
+/// thread-safe.
 final class VisionRecognizer: TextRecognizer {
     private static let log = Logger(subsystem: "app.nib", category: "index")
 
@@ -29,19 +33,22 @@ final class VisionRecognizer: TextRecognizer {
         try await recognizeInk(strokes, language: language).map { $0.recognition }
     }
 
-    /// Text in an image; boxes are in image pixels (top-left origin).
+    /// Text in an image; boxes (line and words) are in image pixels (top-left origin).
     func recognize(image: CGImage, language: String) async throws -> [TextRecognition] {
         let observations = try VisionRecognizer.perform(image, languages: VisionRecognizer.languages(for: language),
                                                         minimumTextPixels: 8)
         let w = Double(image.width), h = Double(image.height)
+        func pixels(_ b: CGRect) -> Rect {
+            Rect(x: Double(b.minX) * w, y: (1 - Double(b.maxY)) * h, width: Double(b.width) * w, height: Double(b.height) * h)
+        }
         return observations.compactMap { o -> TextRecognition? in
             let candidates = o.topCandidates(3)
             guard let top = candidates.first, !top.string.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
-            let b = o.boundingBox
-            let rect = Rect(x: Double(b.minX) * w, y: (1 - Double(b.maxY)) * h, width: Double(b.width) * w,
-                            height: Double(b.height) * h)
-            return TextRecognition(text: top.string, alternatives: candidates.dropFirst().map { $0.string }, bbox: rect,
-                                   source: IndexSource.image, confidence: Double(top.confidence))
+            let rect = pixels(o.boundingBox)
+            var r = TextRecognition(text: top.string, alternatives: candidates.dropFirst().map { $0.string }, bbox: rect,
+                                    source: IndexSource.image, confidence: Double(top.confidence))
+            r.words = VisionRecognizer.wordBoxes(top, line: rect, map: pixels)?.map { TextRecognitionWord(text: $0.text, bbox: $0.bbox) }
+            return r
         }
     }
 
@@ -71,17 +78,25 @@ final class VisionRecognizer: TextRecognizer {
             let text = top.string
             guard !text.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
             let lineRect = render.pageRect(o.boundingBox)
-            var words: [(text: String, bbox: Rect)] = []
-            text.enumerateSubstrings(in: text.startIndex..<text.endIndex, options: .byWords) { word, range, _, _ in
-                guard let word = word, let box = (try? top.boundingBox(for: range)) ?? nil else { return }
-                words.append((word, render.pageRect(box.boundingBox)))
-            }
-            // Some model revisions return the whole line box for every word: split proportionally instead.
-            let degenerate = words.count > 1 && words.allSatisfy { InkLayout.overlap($0.bbox, lineRect) >= 0.9 * lineRect.width * lineRect.height }
-            if words.isEmpty || degenerate { words = InkLayout.splitWords(text, in: lineRect) }
+            // Without real word boxes, words are split proportionally.
+            let words = wordBoxes(top, line: lineRect, map: render.pageRect) ?? InkLayout.splitWords(text, in: lineRect)
             return InkLayout.assemble(text: text, alternatives: candidates.dropFirst().map { $0.string }, bbox: lineRect,
                                       confidence: Double(top.confidence), words: words, strokes: strokes)
         }
+    }
+
+    /// Vision's word boxes of a candidate, mapped by `map`. nil when there are none, or when the model returned the
+    /// whole line box for every word (some model revisions do).
+    static func wordBoxes(_ top: VNRecognizedText, line: Rect, map: (CGRect) -> Rect) -> [(text: String, bbox: Rect)]? {
+        let text = top.string
+        var boxes: [(text: String, box: CGRect)] = []
+        text.enumerateSubstrings(in: text.startIndex..<text.endIndex, options: .byWords) { word, range, _, _ in
+            guard let word = word, let box = (try? top.boundingBox(for: range)) ?? nil else { return }
+            boxes.append((word, box.boundingBox))
+        }
+        let words = boxes.map { (text: $0.text, bbox: map($0.box)) }
+        let degenerate = words.count > 1 && words.allSatisfy { InkLayout.overlap($0.bbox, line) >= 0.9 * line.width * line.height }
+        return words.isEmpty || degenerate ? nil : words
     }
 
     // MARK: Vision
@@ -361,16 +376,28 @@ enum InkLayout {
                 lineIDs.append(item.id)
             }
         }
-        let indexWords = words.enumerated().map { IndexWord(text: $0.element.text, bbox: $0.element.bbox, itemIDs: wordIDs[$0.offset]) }
+        let lineWords = words.enumerated().map {
+            TextRecognitionWord(text: $0.element.text, bbox: $0.element.bbox, itemIDs: wordIDs[$0.offset])
+        }
         return InkLine(text: text, alternatives: alternatives, bbox: bbox, itemIDs: lineIDs, confidence: confidence,
-                       words: indexWords)
+                       words: lineWords)
     }
 
-    /// A line from another `TextRecognizer` (no word boxes): words are laid out proportionally.
+    /// A line from any `TextRecognizer`. Words that already name their strokes (Vision, contracts-v2
+    /// `TextRecognition.words`) are kept as they are; word boxes without strokes get the strokes they cover; a line
+    /// without word boxes is split into words proportionally.
     static func line(from r: TextRecognition, strokes: [Item]) -> InkLine {
+        let known = r.words ?? []
+        if !known.isEmpty && known.contains(where: { !$0.itemIDs.isEmpty }) {
+            var ids = r.itemIDs
+            for id in known.flatMap({ $0.itemIDs }) where !ids.contains(id) { ids.append(id) }
+            return InkLine(text: r.text, alternatives: r.alternatives, bbox: r.bbox, itemIDs: ids, confidence: r.confidence,
+                           words: known)
+        }
         let candidates = r.itemIDs.isEmpty ? strokes : strokes.filter { r.itemIDs.contains($0.id) }
+        let boxes = known.isEmpty ? splitWords(r.text, in: r.bbox) : known.map { (text: $0.text, bbox: $0.bbox) }
         var line = assemble(text: r.text, alternatives: r.alternatives, bbox: r.bbox, confidence: r.confidence,
-                            words: splitWords(r.text, in: r.bbox), strokes: candidates)
+                            words: boxes, strokes: candidates)
         for id in r.itemIDs where !line.itemIDs.contains(id) { line.itemIDs.append(id) }
         return line
     }
@@ -379,13 +406,13 @@ enum InkLayout {
     static func typedLine(_ text: String, item: Item) -> InkLine {
         let flat = text.replacingOccurrences(of: "\n", with: " ")
         let b = item.bounds
-        let words = splitWords(flat, in: b).map { IndexWord(text: $0.text, bbox: $0.bbox, itemIDs: [item.id]) }
+        let words = splitWords(flat, in: b).map { TextRecognitionWord(text: $0.text, bbox: $0.bbox, itemIDs: [item.id]) }
         return InkLine(text: flat, alternatives: [], bbox: b, itemIDs: [item.id], confidence: 1, words: words)
     }
 
-    /// Recognises strokes through any `TextRecognizer`; Vision gives real word boxes.
+    /// Recognises strokes through any `TextRecognizer` (`services.recognizer`); real word boxes come through
+    /// `TextRecognition.words` (Vision fills them).
     static func recognize(_ strokes: [Item], language: String, recognizer: TextRecognizer) async throws -> [InkLine] {
-        if let vision = recognizer as? VisionRecognizer { return try await vision.recognizeInk(strokes, language: language) }
         let lines = try await recognizer.recognize(strokes: strokes, language: language)
         return lines.map { line(from: $0, strokes: strokes) }
     }

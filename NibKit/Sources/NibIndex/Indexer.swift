@@ -11,14 +11,10 @@ enum IndexKeys {
     static let docUnit = "#doc"
     /// Unit key of a document's title.
     static let titleUnit = "#title"
-    /// Event emitted while indexing: payload {running, done, total, pending} (documents or pages).
-    static let progressEvent = "index.progress"
     /// Background processing task identifier (listed in project.yml, registered by the app shell).
     static let backgroundTask = "app.nib.index"
     /// `NibServices` extras key of the shared `Indexer`.
     static let service = "index.indexer"
-    /// Page ext written by document scanning (F065): recognised text blocks.
-    static let scanText = "nib.scanText"
     /// Device setting: OCR inserted images and text-less PDF pages for search.
     static let ocrImages = SettingKey("search.ocrImages", default: false)
     static let schema = 1
@@ -46,8 +42,7 @@ struct DocReader {
     let workspace: Workspace
 
     func head(_ doc: DocumentID) throws -> DocumentContent {
-        if workspace.isLoaded(doc) { return try workspace.content(doc) }
-        return try workspace.persistence.loadHead(doc)
+        try workspace.peekContent(doc)
     }
 
     /// All items of a page, tombstones included.
@@ -215,7 +210,8 @@ enum PageExtractor {
             var blocks = pdf.textBlocks(url, page: index).compactMap { r -> IndexBlock? in
                 let t = r.text.trimmed
                 return t.isEmpty ? nil : IndexBlock(source: IndexSource.pdf, ref: pageRef, text: t, alternatives: r.alternatives,
-                                                    bbox: r.bbox, confidence: r.confidence)
+                                                    bbox: r.bbox, confidence: r.confidence,
+                                                    words: r.words.flatMap { $0.isEmpty ? nil : $0 })
             }
             if blocks.isEmpty, let t = pdf.text(url, page: index)?.trimmed, !t.isEmpty {
                 blocks = [IndexBlock(source: IndexSource.pdf, ref: pageRef, text: t, bbox: pageRect(s))]
@@ -233,39 +229,48 @@ enum PageExtractor {
         guard let ocr = result, ocr.width > 0, ocr.height > 0 else { return [] }
         let size = s.page.size ?? PageSize(ocr.width, ocr.height)
         let sx = size.width / ocr.width, sy = size.height / ocr.height
+        func scaled(_ b: Rect) -> Rect { Rect(x: b.x * sx, y: b.y * sy, width: b.width * sx, height: b.height * sy) }
         return ocr.blocks.compactMap { rec -> IndexBlock? in
             let t = rec.text.trimmed
             guard !t.isEmpty else { return nil }
-            let b = rec.bbox
             return IndexBlock(source: IndexSource.pdf, ref: pageRef, text: t, alternatives: rec.alternatives,
-                              bbox: Rect(x: b.x * sx, y: b.y * sy, width: b.width * sx, height: b.height * sy),
-                              confidence: rec.confidence)
+                              bbox: scaled(rec.bbox), confidence: rec.confidence,
+                              words: mappedWords(rec.words) { scaled($0) })
         }
+    }
+
+    /// Word boxes of an OCR line mapped into page coordinates (words cropped away are dropped; nil = none left).
+    static func mappedWords(_ words: [TextRecognitionWord]?, _ map: (Rect) -> Rect?) -> [TextRecognitionWord]? {
+        let mapped = (words ?? []).compactMap { w in map(w.bbox).map { TextRecognitionWord(text: w.text, bbox: $0, itemIDs: w.itemIDs) } }
+        return mapped.isEmpty ? nil : mapped
     }
 
     static func scanBlocks(_ s: PageSnapshot) -> [IndexBlock] {
         let pageRef = NodeRef.page(s.doc, s.page.id).description
-        return scanRecognitions(s.page.ext?[IndexKeys.scanText]).compactMap { r -> IndexBlock? in
+        return scanRecognitions(s.page.ext?[PageRecord.scanTextExtKey]).compactMap { r -> IndexBlock? in
             let t = r.text.trimmed
             guard !t.isEmpty else { return nil }
             return IndexBlock(source: IndexSource.scan, ref: pageRef, text: t, alternatives: r.alternatives,
-                              bbox: r.bbox.isEmpty ? pageRect(s) : r.bbox, itemIDs: r.itemIDs, confidence: r.confidence)
+                              bbox: r.bbox.isEmpty ? pageRect(s) : r.bbox, itemIDs: r.itemIDs, confidence: r.confidence,
+                              words: r.words.flatMap { $0.isEmpty ? nil : $0 })
         }
     }
 
-    /// Page ext "nib.scanText": `[TextRecognition]`, a list of {text, bbox?, alternatives?}, {blocks: […]} or a string.
+    /// Page ext `PageRecord.scanTextExtKey`: `[TextRecognition]` (F065; decoding is lenient, only `text` is required).
+    /// A plain string, a list of strings and a `{blocks: […]}` wrapper are still read.
     static func scanRecognitions(_ value: JSONValue?) -> [TextRecognition] {
         guard let value = value else { return [] }
         if let s = value.stringValue { return [TextRecognition(text: s, bbox: .zero, source: IndexSource.scan)] }
         let list = value.arrayValue ?? value["blocks"]?.arrayValue ?? []
         return list.compactMap { e -> TextRecognition? in
             if let s = e.stringValue { return TextRecognition(text: s, bbox: .zero, source: IndexSource.scan) }
+            if var r = try? e.decode(TextRecognition.self) {
+                r.source = IndexSource.scan
+                return r
+            }
+            // A malformed optional field (bbox, words…) keeps the line's text searchable.
             guard let text = e["text"]?.stringValue else { return nil }
-            let bbox = e["bbox"].flatMap { try? $0.decode(Rect.self) } ?? .zero
-            let alternatives = e["alternatives"]?.arrayValue?.compactMap { $0.stringValue } ?? []
-            let ids = e["itemIDs"]?.arrayValue?.compactMap { $0.stringValue }.map { NibID($0) } ?? []
-            return TextRecognition(text: text, alternatives: alternatives, bbox: bbox, itemIDs: ids, source: IndexSource.scan,
-                                   confidence: e["confidence"]?.doubleValue ?? 1)
+            return TextRecognition(text: text, bbox: .zero, source: IndexSource.scan)
         }
     }
 
@@ -283,12 +288,15 @@ enum PageExtractor {
             }
             guard let ocr = result else { continue }
             let ref = NodeRef.item(s.doc, s.page.id, item.id).description
+            func toPage(_ box: Rect) -> Rect? {
+                ImageGeometry.pageRect(box, imageWidth: ocr.width, imageHeight: ocr.height, frame: img.frame, crop: img.crop)
+            }
             for rec in ocr.blocks {
                 let t = rec.text.trimmed
-                guard !t.isEmpty, let rect = ImageGeometry.pageRect(rec.bbox, imageWidth: ocr.width, imageHeight: ocr.height,
-                                                                   frame: img.frame, crop: img.crop) else { continue }
+                guard !t.isEmpty, let rect = toPage(rec.bbox) else { continue }
+                let words = mappedWords(rec.words) { toPage($0) }?.map { TextRecognitionWord(text: $0.text, bbox: $0.bbox, itemIDs: [item.id]) }
                 out.append(IndexBlock(source: IndexSource.image, ref: ref, text: t, alternatives: rec.alternatives, bbox: rect,
-                                      itemIDs: [item.id], confidence: rec.confidence))
+                                      itemIDs: [item.id], confidence: rec.confidence, words: words))
             }
         }
         return out
@@ -475,7 +483,7 @@ struct DocumentPass {
     var completed = true
 }
 
-/// `index.progress` for a walk over many documents: nothing is announced until a unit is actually re-indexed, updates
+/// `IndexProgressPayload` for a walk over many documents: nothing is announced until a unit is actually re-indexed, updates
 /// then go out at most once a second (`Indexer.emitProgress`), and the final event follows only an announcement, so a
 /// sweep that finds nothing to do emits nothing.
 @MainActor
@@ -1197,14 +1205,13 @@ final class Indexer {
         return completed
     }
 
-    /// Emits `index.progress`. Start events (`force`) and final events (`running == false`) always go out; updates in
-    /// between at most once a second, so a large sweep never floods the event ring (5,000 entries).
+    /// Emits `NibEventType.indexProgress` (`IndexProgressPayload`). Start events (`force`) and final events
+    /// (`running == false`) always go out; updates in between at most once a second, so a large sweep never floods the
+    /// event ring (5,000 entries).
     func emitProgress(running: Bool, done: Int, total: Int, force: Bool = false) {
         let now = Date()
         if running && !force && now.timeIntervalSince(lastProgress) < 1 { return }
         lastProgress = now
-        app.events.emit(IndexKeys.progressEvent, payload: ["running": .bool(running), "done": .number(Double(done)),
-                                                           "total": .number(Double(total)),
-                                                           "pending": .number(Double(max(0, total - done)))])
+        app.events.emit(IndexProgressPayload(running: running, done: done, total: total))
     }
 }

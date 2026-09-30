@@ -21,10 +21,14 @@ public enum NibIndexFeature: NibFeature {
         app.content.backgroundTasks.register(BackgroundTaskDescriptor(id: IndexKeys.backgroundTask, kind: .processing, owner: id) { [weak indexer] _ in
             await indexer?.runBackgroundTask() ?? true
         })
-        app.ui.settingsPages.register(SettingsPageDescriptor(
+        var settings = SettingsPageDescriptor(
             id: "index.settings", title: String(localized: "Handwriting Recognition"), icon: "magnifyingglass",
             section: .writing, order: 300, owner: id,
-            makeView: { app in AnyView(IndexSettingsView(app: app)) }))
+            makeView: { app in AnyView(IndexSettingsView(app: app)) })
+        // Settings search (contracts-v2 `SettingsPageDescriptor.keywords`).
+        settings.keywords = [String(localized: "Search"), String(localized: "Search Index"), String(localized: "OCR"),
+                             String(localized: "Images"), String(localized: "Scanned PDFs")]
+        app.ui.settingsPages.register(settings)
     }
 
     public static func start(_ app: NibApp) async {
@@ -48,12 +52,11 @@ final class IndexSettingsModel: ObservableObject {
         ocrImages = app.settings.get(IndexKeys.ocrImages)
         status = IndexSettingsModel.idleStatus(app)
         observers.subscription = app.events.subscribe { [weak self] event in
-            guard event.type == IndexKeys.progressEvent, let model = self else { return }
-            let running = event.payload?["running"]?.boolValue ?? false
-            let done = event.payload?["done"]?.intValue ?? 0
-            let total = event.payload?["total"]?.intValue ?? 0
+            // `decode` is nil for every other event type.
+            guard let model = self, let progress = event.decode(IndexProgressPayload.self) else { return }
             Task { @MainActor in
-                model.status = running ? String(localized: "Indexing \(done) of \(total)…") : IndexSettingsModel.idleStatus(model.app)
+                model.status = progress.running ? String(localized: "Indexing \(progress.done) of \(progress.total)…")
+                    : IndexSettingsModel.idleStatus(model.app)
             }
         }
         observers.token = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
@@ -77,7 +80,7 @@ final class IndexSettingsModel: ObservableObject {
     }
 
     func rebuild() {
-        app.perform("index.rebuild")
+        app.perform(CommandIDs.indexRebuild)
     }
 }
 

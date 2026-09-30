@@ -82,6 +82,7 @@ final class NibIndexTests: XCTestCase {
             XCTAssertEqual(h.app.commands.descriptor(id)?.owner, "index", id)
         }
         XCTAssertNotNil(h.app.settings.descriptor("search.ocrImages"))
+        XCTAssertFalse(h.app.ui.settingsPages.get("index.settings")?.keywords.isEmpty ?? true, "found by settings search")
     }
 
     func testPageTextReturnsTypedTextOfFixturePage() async throws {
@@ -198,6 +199,52 @@ final class NibIndexTests: XCTestCase {
         XCTAssertEqual(lines.last?["refs"], [.string(textRef)])
     }
 
+    func testRecognizeItemsKeepsWordBoxesAndStrokesTheRecognizerReports() async throws {
+        // A recognizer that names each word's strokes (contracts-v2 TextRecognition.words): kept verbatim, although a
+        // proportional split of "big cat" would give the stroke (x 72…148) to "big".
+        var named = TextRecognition(text: "big cat", bbox: Rect(x: 70, y: 110, width: 90, height: 20), source: "ink")
+        named.words = [TextRecognitionWord(text: "big", bbox: Rect(x: 70, y: 110, width: 10, height: 20)),
+                       TextRecognitionWord(text: "cat", bbox: Rect(x: 80, y: 110, width: 80, height: 20), itemIDs: [Fixtures.strokeID])]
+        let (h, _) = harness([named])
+        let r = try await h.run("recognize.items", ["refs": [.string(strokeRef)]])
+        let line = r["lines"]?[0]
+        XCTAssertEqual(line?["refs"], [.string(strokeRef)])
+        let words = line?["words"]?.arrayValue ?? []
+        XCTAssertEqual(words.map { $0["text"]?.stringValue }, ["big", "cat"])
+        XCTAssertEqual(words.map { $0["refs"] }, [[], [.string(strokeRef)]])
+        XCTAssertEqual(words.last?["bbox"], [80, 110, 80, 20])
+    }
+
+    func testRecognizeItemsAssignsStrokesToWordBoxesWithoutStrokes() async throws {
+        // Word boxes without stroke ids: each stroke joins the word box it covers most.
+        var boxed = TextRecognition(text: "big cat", bbox: Rect(x: 70, y: 110, width: 90, height: 20), source: "ink")
+        boxed.words = [TextRecognitionWord(text: "big", bbox: Rect(x: 70, y: 110, width: 10, height: 20)),
+                       TextRecognitionWord(text: "cat", bbox: Rect(x: 80, y: 110, width: 80, height: 20))]
+        let (h, _) = harness([boxed])
+        let r = try await h.run("recognize.items", ["refs": [.string(strokeRef)]])
+        let words = r["lines"]?[0]?["words"]?.arrayValue ?? []
+        XCTAssertEqual(words.map { $0["refs"] }, [[], [.string(strokeRef)]])
+        XCTAssertEqual(words.first?["bbox"], [70, 110, 10, 20])
+    }
+
+    func testVisionLinesTravelThroughTheRecognizerContractUnchanged() throws {
+        let c = stroke("LETTERCCCCCC", [(10, 10), (14, 20)])
+        let d = stroke("LETTERDDDDDD", [(60, 10), (66, 20)])
+        let between = stroke("BETWEENWORDS", [(34, 12), (57, 18)])
+        let line = InkLayout.assemble(text: "cat dog", alternatives: ["cot dog"], bbox: Rect(x: 8, y: 8, width: 67, height: 14),
+                                      confidence: 0.7, words: [("cat", Rect(x: 8, y: 8, width: 30, height: 14)),
+                                                               ("dog", Rect(x: 55, y: 8, width: 20, height: 14))],
+                                      strokes: [c, between, d])
+        // What VisionRecognizer.recognize(strokes:) returns carries the words and their strokes …
+        let recognition = line.recognition
+        XCTAssertEqual(recognition.source, "ink")
+        XCTAssertEqual(recognition.words?.map { $0.itemIDs }, [[c.id], [d.id]])
+        // … through JSON (plugins, the bridge) and back into the same line, whichever recognizer produced it.
+        let decoded = try JSONDecoder().decode(TextRecognition.self, from: JSONEncoder().encode(recognition))
+        XCTAssertEqual(decoded, recognition)
+        XCTAssertEqual(InkLayout.line(from: decoded, strokes: [c, between, d]), line)
+    }
+
     func testRecognizeItemsRejectsNonItemRefs() async {
         let (h, _) = harness()
         do {
@@ -216,8 +263,12 @@ final class NibIndexTests: XCTestCase {
         h.app.commands.register(PutTestText.self)
         indexer.debounce = 0.05
         indexer.start()
-        var progress = 0
-        let sub = h.app.events.subscribe { e in if e.type == "index.progress" { progress += 1 } }
+        var progress: [IndexProgressPayload] = []
+        var undecodable = 0
+        let sub = h.app.events.subscribe { e in
+            guard e.type == NibEventType.indexProgress else { return }
+            if let p = e.decode(IndexProgressPayload.self) { progress.append(p) } else { undecodable += 1 }
+        }
         defer { sub.cancel() }
         try await h.run("test.putText", ["text": "Quokka crossing"])
         var found: [JSONValue] = []
@@ -228,7 +279,23 @@ final class NibIndexTests: XCTestCase {
             if !found.isEmpty { break }
         }
         XCTAssertEqual(found.first?["page"]?.stringValue, NodeRef.page(Fixtures.docID, Fixtures.page2).description)
-        XCTAssertGreaterThan(progress, 0)
+        for _ in 0..<100 where progress.last?.running != false { try await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertEqual(undecodable, 0)
+        XCTAssertEqual(progress.first?.running, true)
+        XCTAssertEqual(progress.last?.running, false)
+        XCTAssertEqual(progress.last?.pending, 0)
+        XCTAssertEqual(progress.last?.done, progress.last?.total)
+    }
+
+    func testSettingsStatusFollowsIndexProgress() async throws {
+        let h = Harness(features: [NibIndexFeature.self])
+        let model = IndexSettingsModel(app: h.app)
+        h.app.events.emit(IndexProgressPayload(running: true, done: 2, total: 5))
+        for _ in 0..<100 where !model.status.hasPrefix("Indexing") { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(model.status, "Indexing 2 of 5…")
+        h.app.events.emit(IndexProgressPayload(running: false, done: 5, total: 5))
+        for _ in 0..<100 where model.status.hasPrefix("Indexing") { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(model.status, IndexSettingsModel.idleStatus(h.app))
     }
 
     func testRebuildDocument() async throws {
@@ -242,13 +309,40 @@ final class NibIndexTests: XCTestCase {
         XCTAssertTrue(blocks.isEmpty, "only the rebuilt document is indexed")
     }
 
-    func testScanTextPageExtIsIndexed() {
-        let value: JSONValue = [["text": "Scanned receipt", "bbox": [10, 20, 100, 12]], "Loose line"]
+    func testScanTextPageExtIsRead() {
+        let value: JSONValue = [["text": "Scanned receipt", "bbox": [10, 20, 100, 12]], "Loose line", ["text": "Odd", "bbox": "x"]]
         let recs = PageExtractor.scanRecognitions(value)
-        XCTAssertEqual(recs.map { $0.text }, ["Scanned receipt", "Loose line"])
+        XCTAssertEqual(recs.map { $0.text }, ["Scanned receipt", "Loose line", "Odd"])
         XCTAssertEqual(recs.first?.bbox, Rect(x: 10, y: 20, width: 100, height: 12))
-        let full = try! JSONValue.from([TextRecognition(text: "Full", alternatives: ["Fall"], bbox: Rect(x: 1, y: 2, width: 3, height: 4), source: "scan")])
-        XCTAssertEqual(PageExtractor.scanRecognitions(full).first?.alternatives, ["Fall"])
+        XCTAssertEqual(recs.map { $0.source }, ["scan", "scan", "scan"])
+        var line = TextRecognition(text: "Full", alternatives: ["Fall"], bbox: Rect(x: 1, y: 2, width: 3, height: 4), source: "scan")
+        line.words = [TextRecognitionWord(text: "Full", bbox: Rect(x: 1, y: 2, width: 3, height: 4))]
+        let full = try! JSONValue.from([line])
+        XCTAssertEqual(PageExtractor.scanRecognitions(full), [line])
+        XCTAssertEqual(PageExtractor.scanRecognitions(["blocks": ["Wrapped"]]).map { $0.text }, ["Wrapped"])
+        XCTAssertEqual(PageExtractor.scanRecognitions("Whole page").map { $0.text }, ["Whole page"])
+    }
+
+    func testScannedPageTextIsSearchableThroughTheScanTextExtKey() async throws {
+        let (h, indexer) = harness()
+        var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+        let i = try XCTUnwrap(head.pages.firstIndex { $0.id == Fixtures.page2 })
+        var receipt = TextRecognition(text: "Scanned receipt", bbox: Rect(x: 10, y: 20, width: 100, height: 12), source: "scan")
+        receipt.words = [TextRecognitionWord(text: "Scanned", bbox: Rect(x: 10, y: 20, width: 50, height: 12)),
+                         TextRecognitionWord(text: "receipt", bbox: Rect(x: 65, y: 20, width: 45, height: 12))]
+        let loose = TextRecognition(text: "Loose line", bbox: .zero, source: "scan")
+        head.pages[i].ext = [PageRecord.scanTextExtKey: try JSONValue.from([receipt, loose])]
+        h.persistence.heads[Fixtures.docID] = head
+        await indexer.indexDocument(Fixtures.docID)
+        let hit = results(try await h.run("search.text", ["query": "receipt", "kinds": ["scan"]])).first
+        XCTAssertEqual(hit?["kind"]?.stringValue, "scan")
+        XCTAssertEqual(hit?["page"]?.stringValue, NodeRef.page(Fixtures.docID, Fixtures.page2).description)
+        XCTAssertEqual(hit?["rect"], [65, 20, 45, 12], "the matched word, not the whole line")
+        let whole = results(try await h.run("search.text", ["query": "loose", "kinds": ["scan"]])).first
+        let size = try XCTUnwrap(head.pages[i].size)
+        XCTAssertEqual(whole?["rect"], .array([0, 0, .number(size.width), .number(size.height)]), "no box: the whole page")
+        let text = try await h.run("recognize.pageText", ["page": .string(NodeRef.page(Fixtures.docID, Fixtures.page2).description)])
+        XCTAssertEqual(text["blocks"]?.arrayValue?.compactMap { $0["text"]?.stringValue }, ["Scanned receipt", "Loose line"])
     }
 
     func testCustomItemTextPaths() {
@@ -315,6 +409,12 @@ final class NibIndexTests: XCTestCase {
         let hit = results(try await h.run("search.text", ["query": "quantum", "kinds": ["image"]])).first
         XCTAssertEqual(hit?["kind"]?.stringValue, "image")
         XCTAssertEqual(hit?["page"]?.stringValue, NodeRef.page(Fixtures.docID, Fixtures.page2).description)
+        // With Vision's word boxes (TextRecognition.words) the match rectangle is the word, not the whole line.
+        if let line = direct.first(where: { $0.text.lowercased().contains("quantum") }), let words = line.words, words.count > 1 {
+            XCTAssertTrue(words.contains { $0.text.lowercased() == "quantum" }, "\(words)")
+            let rect = try XCTUnwrap(hit?["rect"]?.decode(Rect.self))
+            XCTAssertLessThan(rect.width, line.bbox.width * 450 / 900 * 0.8, "\(rect) vs line \(line.bbox)")
+        }
     }
 
     // MARK: Handwriting geometry
@@ -513,7 +613,7 @@ final class NibIndexTests: XCTestCase {
         let note = Item.makeText(TextBoxItem(frame: Frame(x: 72, y: 300, w: 200, h: 30), text: RichText(plain: "Wombat burrow")))
         h.persistence.pageItems[Fixtures.docID, default: [:]][Fixtures.page2] = [note]
         var progress = 0
-        let sub = h.app.events.subscribe { e in if e.type == "index.progress" { progress += 1 } }
+        let sub = h.app.events.subscribe { e in if e.decode(IndexProgressPayload.self) != nil { progress += 1 } }
         defer { sub.cancel() }
         let second = await indexer.sweep(foreground: false)
         XCTAssertTrue(second)

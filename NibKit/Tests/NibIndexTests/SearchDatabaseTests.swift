@@ -100,8 +100,8 @@ final class SearchDatabaseTests: XCTestCase {
         XCTAssertTrue(s?.hasSuffix("…") ?? false)
         XCTAssertTrue(s?.contains("Photosynthesis") ?? false)
         var ink = block("big cat", source: "ink")
-        ink.words = [IndexWord(text: "big", bbox: Rect(x: 0, y: 0, width: 30, height: 20), itemIDs: []),
-                     IndexWord(text: "cat", bbox: Rect(x: 40, y: 0, width: 30, height: 20), itemIDs: [])]
+        ink.words = [TextRecognitionWord(text: "big", bbox: Rect(x: 0, y: 0, width: 30, height: 20)),
+                     TextRecognitionWord(text: "cat", bbox: Rect(x: 40, y: 0, width: 30, height: 20))]
         XCTAssertEqual(SearchFormatting.match(ink, terms: ["cat"]).rect, Rect(x: 40, y: 0, width: 30, height: 20))
     }
 

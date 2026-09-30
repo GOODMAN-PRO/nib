@@ -29,16 +29,10 @@ struct IndexBlock: Codable, Equatable {
     var bbox: Rect? = nil
     var itemIDs: [ElementID] = []
     var confidence: Double = 1
-    /// Handwriting only: recognised words with their boxes and strokes.
-    var words: [IndexWord]? = nil
+    /// Recognised words with their boxes (handwriting: and their strokes; OCR and PDF lines when the source has them).
+    var words: [TextRecognitionWord]? = nil
     /// Transcript lines: seconds from the clip start.
     var time: Double? = nil
-}
-
-struct IndexWord: Codable, Equatable {
-    var text: String
-    var bbox: Rect
-    var itemIDs: [ElementID]
 }
 
 /// An indexed unit: one page (key = page id), the document-level text (`IndexKeys.docUnit`) or the title
