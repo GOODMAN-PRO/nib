@@ -6,37 +6,37 @@ import os
 import NibContracts
 import NibDesign
 
-/// The writing pane of one canvas (DESIGN.md §14.3): a Deep panel docked at the bottom, full width − 32 and nominally
-/// 240 tall, with the zoom bead slider, New Line and the options menu (return height, margins, auto-advance) over its
-/// own PKCanvasView. The canvas shows the zoom box at magnification = writing width / box width over a render of that
-/// region; finished strokes are converted with `PKBridge` and committed through `CanvasHost.commitStroke` (stroke
-/// processors, then `ink.addStrokes`). Every action is a command, so plugins, the AI and the bridge can do the same.
+/// The writing pane of one canvas (DESIGN.md §14.3): a Deep panel the document chrome docks at the bottom of the window
+/// (a contracts-v2 chrome overlay, `.bottom` `.panel`, inside the window's droplet container), full width − 32 and
+/// nominally `NibMetrics.zoomPaneHeight` tall, with the zoom bead slider, New Line and the options menu (return height,
+/// margins, auto-advance) over its own PKCanvasView. The canvas shows the zoom box at magnification = writing width /
+/// box width over a render of that region; finished strokes are converted with `PKBridge` and committed through
+/// `CanvasHost.commitStroke(_:page:completion:)` (stroke processors, then `ink.addStrokes`). Every action is a command,
+/// so plugins, the AI and the bridge can do the same.
 ///
 /// Wet ink (ARCHITECTURE.md §8.1): a pane stroke stays on the pane's PKCanvasView until a render that includes its dry
 /// ink is on screen. Its content coordinates are page points, so wet strokes stay aligned when the box moves or zooms
-/// (auto-advance, New Line, drags, the slider); only a change of page, or hiding the pane, drops them at once.
+/// (auto-advance, New Line, drags, the slider); only a change of page, or hiding the pane, drops them at once. A stroke
+/// whose commit fails leaves the pane at once, and the user is told.
 @MainActor
 final class ZoomWindowController: ObservableObject {
     /// Pane layout: 8 pt padding, a 44 pt control row, a 4 pt gap, then the writing area.
     static let padding = NibSpacing.s
     static let rowGap = NibSpacing.xs
-    /// Writing height of a new box: with the row and the padding the pane is its nominal 240 pt (DESIGN.md §14.3).
-    /// ponytail: 240 is DESIGN.md's pane height; NibMetrics has no token for it (contract gap reported for F038).
-    static let nominalWritingHeight: CGFloat = 240 - 2 * NibSpacing.s - NibMetrics.hitTarget - NibSpacing.xs
+    /// What the pane adds around its writing area: the padding, the control row and the gap.
+    static let paneChrome: CGFloat = 2 * padding + NibMetrics.hitTarget + rowGap
+    /// Writing height of a new box: with the row and the padding the pane is its nominal `NibMetrics.zoomPaneHeight`.
+    static let nominalWritingHeight: CGFloat = NibMetrics.zoomPaneHeight - paneChrome
     static let writingRadius = NibRadius.concentric(NibRadius.panel, inset: NibSpacing.s)
     /// The highest zoom the slider offers: a box about one word wide.
     private static let narrowestBox = 40.0
-    /// ponytail: `ink.erase` takes at most 20 000 path points (F010's schema, not a contract); longer scrubs go in parts.
-    private static let maxErasePathPoints = 20_000
     private static let log = Logger(subsystem: "app.nib", category: "zoomwindow")
 
     let app: NibApp
     let session: EditorSession
     let state: ZoomState
-    let store: ZoomStore
     private(set) weak var host: CanvasHost?
 
-    @Published private(set) var paneSize = CGSize(width: 616, height: 240)
     /// 176 = `nominalWritingHeight` (a literal: stored-property defaults cannot read main-actor statics).
     @Published private(set) var writingSize = CGSize(width: 600, height: 176)
     @Published private(set) var autoAdvanceOn = true
@@ -46,31 +46,38 @@ final class ZoomWindowController: ObservableObject {
     private(set) var pending: Task<Void, Never>?
     /// Wet pane strokes whose commits have landed; the next render that includes them removes them from the pane.
     private(set) var landed = 0
-    /// Pane strokes handed to `commitStroke` whose changeset has not arrived yet. Only these can land, so ink written
-    /// on the main canvas (or by anyone else) on the same page never removes a pane stroke before its dry render.
+    /// Pane strokes handed to `commitStroke` whose completion has not come back yet.
     private(set) var inFlight = 0
+    /// Bumped whenever the wet ink is dropped at once (another page, the pane hidden), so a commit that finishes later
+    /// is not counted against newer strokes.
+    private var wetGeneration = 0
 
-    private var hosting: UIHostingController<ZoomPane>?
     private var writing: ZoomWritingView?
     private var renderTask: Task<Void, Never>?
     private var shownDoc: DocumentID?
     private var shownPage: PageID?
     private var shownRect: Rect?
     private var maxWritingHeight: CGFloat = 320
+    /// The writing width the chrome laid the pane out at; until it has, an estimate from the canvas's width.
+    private var measuredWritingWidth: CGFloat?
+    private var estimatedWritingWidth: CGFloat = 600
+    /// How many copies of the pane's view are on screen (a re-created view can appear before the old one goes).
+    private var paneAppearances = 0
+    private var wasActive = false
     private var subscriptions: [AnyCancellable] = []
     private var commits: EventSubscription?
 
-    init(app: NibApp, session: EditorSession, state: ZoomState, store: ZoomStore) {
+    init(app: NibApp, session: EditorSession, state: ZoomState) {
         self.app = app
         self.session = session
         self.state = state
-        self.store = store
     }
 
-    // MARK: Lifecycle (driven by ZoomBoxOverlay)
+    // MARK: Lifecycle (driven by ZoomBoxOverlay and the chrome overlay)
 
     func attach(to host: CanvasHost) {
         self.host = host
+        state.pane = self
         autoAdvanceOn = app.settings.get(NibSettings.zoomAutoAdvance)
         commits = app.bus.observeCommits { [weak self] cs in self?.committed(cs) }
         NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
@@ -80,6 +87,8 @@ final class ZoomWindowController: ObservableObject {
         session.$tool.removeDuplicates().receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.configureWriting() }
             .store(in: &subscriptions)
+        canvasResized(host.canvasView.bounds.size)
+        updateActive()
     }
 
     func detach() {
@@ -87,51 +96,83 @@ final class ZoomWindowController: ObservableObject {
         commits = nil
         subscriptions.removeAll()
         renderTask?.cancel()
-        if let h = hosting {
-            h.willMove(toParent: nil)
-            h.view.removeFromSuperview()
-            h.removeFromParent()
-        }
-        hosting = nil
-        writing = nil
-        landed = 0
-        inFlight = 0
+        clearWet()
+        if state.pane === self { state.pane = nil }
         host = nil
+        updateActive()
+        writing = nil
     }
 
-    /// Sizes the pane from the canvas's visible bounds and docks it at the bottom (above the iPhone palette).
-    func layout(visible: Bool) {
-        guard let host else { return }
-        let canvas = host.canvasView
-        let container = canvas.superview ?? canvas
-        let bounds = container.convert(canvas.bounds, from: canvas)
-        let inset = NibMetrics.chromeInset
-        let width = max(bounds.width - 2 * inset, 4 * NibMetrics.hitTarget)
-        let writingWidth = width - 2 * Self.padding
-        state.paneWidth = Double(writingWidth)
-        state.paneAspect = Double(Self.nominalWritingHeight / writingWidth)
-        maxWritingHeight = max(Self.nominalWritingHeight / 2, bounds.height * 0.4)
-        let aspect = CGFloat(state.rect.height / max(state.rect.width, 1))
-        let writingHeight = min(max(aspect * writingWidth, NibMetrics.hitTarget), maxWritingHeight)
-        let writingChanged = CGSize(width: writingWidth, height: writingHeight) != writingSize
-        if writingChanged { writingSize = CGSize(width: writingWidth, height: writingHeight) }
-        let pane = CGSize(width: width, height: writingHeight + 2 * Self.padding + NibMetrics.hitTarget + Self.rowGap)
-        if pane != paneSize { paneSize = pane }
+    /// Whether this canvas's pane has something to show: the window is open on a live page of this canvas's
+    /// document, and the document is not read-only. The chrome overlay shows the pane exactly then, and the zoom box
+    /// draws exactly then, so nothing can be written into a page that is not there.
+    var isActive: Bool {
+        guard let host, state.pane === self else { return false }
+        return state.isOn && state.doc == host.documentID && state.page != nil && !session.readOnly && pageRecord != nil
+    }
 
-        guard visible, canvas.window != nil else {
-            hidePane()
-            return
+    /// Re-evaluates `isActive` after anything it depends on changed; when it flips, the chrome re-evaluates the pane
+    /// overlay (and the toolbar item's live state) and a hidden pane drops its wet ink.
+    func updateActive() {
+        let active = isActive
+        guard active != wasActive else { return }
+        wasActive = active
+        if active {
+            configureWriting()
+            scheduleRender()
+        } else {
+            renderTask?.cancel()
+            // A hidden pane renders nothing, so its wet ink would go stale; its commits land on the page regardless,
+            // and the render when the pane shows again draws them.
+            clearWet()
         }
-        let h = ensurePane(in: container, above: canvas)
-        let wasHidden = h.view.isHidden
-        h.view.isHidden = false
-        // The iPhone palette sits along the bottom in either orientation (and so does the compact layout's below
-        // 600 pt): dock above it. On a regular-width iPad the palette docks on an edge, so the pane takes the inset.
-        let compact = canvas.traitCollection.userInterfaceIdiom == .phone || bounds.width < NibMetrics.compactBreakpoint
-        let bottom = canvas.safeAreaInsets.bottom + (compact ? NibMetrics.canvasBottomInsetCompact : inset)
-        let frame = CGRect(x: bounds.minX + inset, y: bounds.maxY - bottom - pane.height, width: pane.width, height: pane.height)
-        if h.view.frame != frame { h.view.frame = frame }
-        if wasHidden || writingChanged { scheduleRender() }
+        app.ui.setNeedsChromeUpdate(session)
+    }
+
+    /// The canvas's size changed: the pane's estimated width (the chrome docks it full width − 32) and the tallest
+    /// writing area that keeps it on screen.
+    func canvasResized(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        estimatedWritingWidth = max(size.width - 2 * NibMetrics.chromeInset, 4 * NibMetrics.hitTarget) - 2 * Self.padding
+        maxWritingHeight = max(Self.nominalWritingHeight / 2, size.height * 0.4)
+        updateLayout()
+    }
+
+    /// The chrome laid the pane out: its writing area is `width` wide.
+    func paneLaidOut(writingWidth width: CGFloat) {
+        guard width > 0, width.isFinite, width != measuredWritingWidth else { return }
+        measuredWritingWidth = width
+        updateLayout()
+    }
+
+    func paneAppeared() {
+        paneAppearances += 1
+        configureWriting()
+        scheduleRender()
+    }
+
+    func paneDisappeared() {
+        paneAppearances = max(0, paneAppearances - 1)
+        guard paneAppearances == 0 else { return }
+        renderTask?.cancel()
+        clearWet()
+    }
+
+    /// The writing area's size for the box's aspect ratio at the pane's width, kept between one hit target and
+    /// `maxHeight`.
+    static func writingHeight(width: CGFloat, box: Rect, maxHeight: CGFloat) -> CGFloat {
+        let aspect = CGFloat(box.height / max(box.width, 1))
+        return min(max(aspect * width, NibMetrics.hitTarget), max(maxHeight, NibMetrics.hitTarget))
+    }
+
+    private func updateLayout() {
+        let width = measuredWritingWidth ?? estimatedWritingWidth
+        state.paneWidth = Double(width)
+        state.paneAspect = Double(Self.nominalWritingHeight / width)
+        let size = CGSize(width: width, height: Self.writingHeight(width: width, box: state.rect, maxHeight: maxWritingHeight))
+        guard size != writingSize else { return }
+        writingSize = size
+        scheduleRender()
     }
 
     /// The box moved or the window opened: follow it with the canvas and a fresh render.
@@ -147,28 +188,33 @@ final class ZoomWindowController: ObservableObject {
             shownDoc = state.doc
             shownPage = state.page
             shownRect = state.rect
+            updateLayout()
             scheduleRender()
         }
+        updateActive()
         configureWriting()
     }
 
-    /// The pane's frame in `view`'s coordinates, when it is showing.
+    /// The pane's frame in `view`'s coordinates while it is on screen in `view`'s window: the writing area grown by the
+    /// padding and the control row above it.
     func paneFrame(in view: UIView) -> CGRect? {
-        guard let h = hosting, !h.view.isHidden, let superview = h.view.superview else { return nil }
-        return superview.convert(h.view.frame, to: view)
+        guard isPaneShowing, let w = writing, let window = w.window, window === view.window else { return nil }
+        let r = w.convert(w.bounds, to: view)
+        let above = Self.padding + NibMetrics.hitTarget + Self.rowGap
+        return CGRect(x: r.minX - Self.padding, y: r.minY - above, width: r.width + 2 * Self.padding,
+                      height: r.height + above + Self.padding)
     }
 
     /// Whether the pane is on screen (so renders are worth making).
     var isPaneShowing: Bool {
-        guard state.isOn, let h = hosting else { return false }
-        return !h.view.isHidden && h.view.superview != nil
+        isActive && paneAppearances > 0 && writing?.window != nil
     }
 
     /// Pane strokes still shown as wet ink.
     var wetCount: Int { writing?.wetCount ?? 0 }
 
-    /// The pane's writing surface, made with the pane (once per canvas) and kept by the controller, so SwiftUI updates
-    /// never recreate the PKCanvasView.
+    /// The pane's writing surface, made once per canvas and kept by the controller, so SwiftUI updates (and the chrome
+    /// re-creating the overlay) never recreate the PKCanvasView.
     func writingView() -> ZoomWritingView {
         if let w = writing { return w }
         let w = ZoomWritingView(frame: .zero)
@@ -179,56 +225,11 @@ final class ZoomWindowController: ObservableObject {
         return w
     }
 
-    private func ensurePane(in container: UIView, above canvas: UIView) -> UIHostingController<ZoomPane> {
-        let h: UIHostingController<ZoomPane>
-        if let existing = hosting {
-            h = existing
-        } else {
-            h = UIHostingController(rootView: ZoomPane(controller: self, state: state, writing: writingView()))
-            h.view.backgroundColor = .clear
-            h.safeAreaRegions = []
-            h.view.isHidden = true                        // `layout` shows it and renders once it is placed
-            hosting = h
-        }
-        if h.view.superview !== container {
-            h.willMove(toParent: nil)
-            h.view.removeFromSuperview()
-            h.removeFromParent()
-            let parent = Self.viewController(of: container)
-            if let parent { parent.addChild(h) }
-            // Right above the canvas: the window's chrome (palette, bars, HUDs) and its popovers stay above the pane.
-            if canvas.superview === container {
-                container.insertSubview(h.view, aboveSubview: canvas)
-            } else {
-                container.addSubview(h.view)
-            }
-            if let parent { h.didMove(toParent: parent) }
-        }
-        return h
-    }
-
-    private func hidePane() {
-        guard let h = hosting, !h.view.isHidden else { return }
-        h.view.isHidden = true
-        renderTask?.cancel()
-        // A hidden pane renders nothing, so its wet ink would go stale; its commits land on the page regardless, and
-        // the render when the pane shows again draws them.
-        clearWet()
-    }
-
     private func clearWet() {
         writing?.dropWet(Int.max)
         landed = 0
         inFlight = 0
-    }
-
-    private static func viewController(of view: UIView) -> UIViewController? {
-        var responder: UIResponder? = view
-        while let r = responder {
-            if let vc = r as? UIViewController { return vc }
-            responder = r.next
-        }
-        return nil
+        wetGeneration += 1
     }
 
     // MARK: Page, zoom and style
@@ -258,7 +259,7 @@ final class ZoomWindowController: ObservableObject {
 
     /// The effective return height: the page's override, the template's default, or one box height.
     var returnHeight: Double {
-        pageRecord.map { store.returnHeight(page: $0, box: state.rect) } ?? state.rect.height
+        pageRecord.map { ZoomStore.returnHeight(page: $0, box: state.rect, templates: app.content.templates) } ?? state.rect.height
     }
 
     /// The part of the page the pane shows (the box, cut or extended to the writing area's height).
@@ -278,21 +279,26 @@ final class ZoomWindowController: ObservableObject {
         case "highlighter":
             return InkStyle(tool: .highlighter, pen: nil, color: presets.color, width: presets.width)
         default:
-            // Untyped read: the pen style key belongs to the pen feature.
+            // The pen feature (F007) owns and declares `pen.style`; its spec pins the value to a `PenStyle` raw value.
             let pen = app.settings.json("pen.style")?.stringValue.flatMap(PenStyle.init(rawValue:)) ?? .fountain
             return InkStyle(tool: .pen, pen: pen, color: presets.color, width: presets.width, pattern: presets.pattern)
         }
     }
 
-    /// The eraser tool's settings, read untyped like the pen style (F010 owns the `eraser.*` keys): its on-screen
-    /// diameter, its mode and the ink tools its Erase Filter lets it erase.
+    /// The eraser tool's settings (contracts-v2 keys; F010 owns them): its on-screen diameter, its mode and the ink
+    /// tools its Erase Filter lets it erase.
     func eraserOptions() -> (diameter: Double, mode: String, filter: [String]) {
         let s = app.settings
-        let size = s.json("eraser.size")?.doubleValue ?? 14
-        let mode = s.json("eraser.mode")?.stringValue.flatMap { ["precision", "standard", "stroke"].contains($0) ? $0 : nil }
-        let filter = InkTool.allCases.filter { s.json("eraser.filter." + $0.rawValue)?.boolValue ?? true }.map { $0.rawValue }
-        return (min(max(size.isFinite ? size : 14, 2), 60), mode ?? "standard", filter)
+        let fallback = NibSettings.eraserSize.defaultValue
+        let size = s.get(NibSettings.eraserSize)
+        let mode = s.get(NibSettings.eraserMode)
+        let filter = InkTool.allCases.filter { s.get(NibSettings.eraserFilter($0)) }.map { $0.rawValue }
+        return (min(max(size.isFinite ? size : fallback, 2), 60),
+                Self.eraserModes.contains(mode) ? mode : NibSettings.eraserMode.defaultValue, filter)
     }
+
+    /// `NibSettings.eraserMode`'s values.
+    private static let eraserModes: Set<String> = ["precision", "standard", "stroke"]
 
     private func configureWriting() {
         guard let w = writing, let size = pageSize else { return }
@@ -321,26 +327,67 @@ final class ZoomWindowController: ObservableObject {
     }
 
     /// A stroke finished in the pane (page coordinates): commit it, then let auto-advance move the box. Returns false,
-    /// and tells the user, when there is no live page to commit it to (it was deleted meanwhile).
+    /// and tells the user, when it was not saved: there is no live page to commit it to (it was deleted meanwhile), or
+    /// the commit failed at once (read-only). A commit that fails later removes its wet stroke then.
     @discardableResult
     func strokeFinished(_ stroke: Stroke) -> Bool {
         guard let host, state.doc == host.documentID, let page = pageRecord, let size = page.size else {
-            NotificationCenter.default.post(name: .nibCommandFailed, object: app, userInfo: [
-                "command": CommandIDs.inkAddStrokes,
-                "error": NibError(.unavailable, "the stroke was not saved: the Zoom Window's page is no longer available",
-                                  hint: "open the Zoom Window again on a page of this notebook")])
+            report(NibError(.unavailable, "the stroke was not saved: the Zoom Window's page is no longer available",
+                            hint: "open the Zoom Window again on a page of this notebook"))
             return false
         }
-        host.commitStroke(stroke, page: page.id)
+        let generation = wetGeneration
+        var inCall = true
+        var immediate: Result<ElementID?, NibError>?
         inFlight += 1
+        host.commitStroke(stroke, page: page.id) { [weak self] result in
+            if inCall {
+                immediate = result
+            } else {
+                self?.commitFinished(result, generation: generation)
+            }
+        }
+        inCall = false
+        if let result = immediate {
+            if case let .failure(error) = result {
+                // Still inside the pane's stroke callback: returning false removes the wet stroke there.
+                inFlight = max(0, inFlight - 1)
+                report(error)
+                return false
+            }
+            commitFinished(result, generation: generation)
+        }
         guard app.settings.get(NibSettings.zoomAutoAdvance), let doc = state.doc,
               let bounds = Rect.bounding(stroke.polyline) else { return true }
         let box = state.rect
+        let returnHeight = ZoomStore.returnHeight(page: page, box: box, templates: app.content.templates)
         if let next = state.autoAdvance.strokeFinished(bounds, box: box, margins: state.effectiveMargins(pageWidth: size.width),
-                                                       returnHeight: store.returnHeight(page: page, box: box), pageSize: size) {
+                                                       returnHeight: returnHeight, pageSize: size) {
             perform(ZoomSetBox.descriptor.id, ZoomSetBox.params(doc: doc, page: page.id, rect: next))
         }
         return true
+    }
+
+    /// The outcome of a pane stroke's commit (contracts-v2 `commitStroke(_:page:completion:)`). Commits finish in the
+    /// order they were made, so the stroke is the oldest wet one not yet counted as landed. Saved (or dropped by a
+    /// stroke processor): it leaves with the next render, which includes its dry ink. Failed: it leaves now.
+    func commitFinished(_ result: Result<ElementID?, NibError>, generation: Int) {
+        guard generation == wetGeneration else { return }     // its wet ink was already dropped
+        inFlight = max(0, inFlight - 1)
+        switch result {
+        case .success:
+            landed = min(wetCount, landed + 1)
+            scheduleRender()
+        case let .failure(error):
+            writing?.removeWet(at: landed)
+            report(error)
+        }
+    }
+
+    /// Tells the user a pane stroke was not saved (the shell's command-failed toast).
+    private func report(_ error: NibError) {
+        NotificationCenter.default.post(name: .nibCommandFailed, object: app, userInfo: [
+            "command": CommandIDs.inkAddStrokes, "error": error])
     }
 
     /// The eraser in the pane: one `ink.erase` per gesture along the path (pane points → page points), with the eraser
@@ -357,7 +404,7 @@ final class ZoomWindowController: ObservableObject {
             "mode": .string(options.mode),
             "filter": .array(options.filter.map { JSONValue.string($0) })
         ]
-        let calls = ZoomGeometry.parts(pagePath, limit: Self.maxErasePathPoints).map { part -> JSONValue in
+        let calls = ZoomGeometry.parts(pagePath, limit: NibLimits.maxErasePathPoints).map { part -> JSONValue in
             var params = base
             params["path"] = .array(part.map { JSONValue.array([.number($0.x), .number($0.y)]) })
             return .object(params)
@@ -370,23 +417,16 @@ final class ZoomWindowController: ObservableObject {
         if cs.headChanged(doc) {
             pageRevision += 1
             if state.isOn, pageRecord == nil {
-                // The box's page was deleted (navigator, undo, sync, a collaborator, the AI): close the window rather
-                // than write into nothing. zoom.toggle re-homes the box on a live page when it opens again.
+                // The box's page was deleted (navigator, undo, sync, a collaborator, the AI): hide the pane and close
+                // the window rather than write into nothing. zoom.toggle re-homes the box on a live page when it
+                // opens again.
+                updateActive()
                 close()
                 return
             }
             scheduleRender()
         }
         guard cs.itemPages[doc]?.contains(pid) == true else { return }
-        if inFlight > 0, cs.principal.isUser {
-            let created = cs.mutations.reduce(0) { n, m in
-                guard case let .item(d, p, _, _) = m, d == doc, p == pid, m.change.created else { return n }
-                return n + 1
-            }
-            let n = min(inFlight, created)
-            inFlight -= n
-            landed = min(wetCount, landed + n)
-        }
         if let dirty = cs.dirtyRect(doc: doc, page: pid), !dirty.intersects(visibleRegion) { return }
         scheduleRender()
     }
@@ -518,12 +558,11 @@ final class ZoomWindowController: ObservableObject {
 
 // MARK: - Pane
 
-/// The pane's SwiftUI content on Deep glass. It is not in the window's droplet container (a canvas attachment cannot
-/// reach it), so it is a static `nibGlass` surface, which handles Reduce Transparency and Liquid Off itself.
+/// The pane's SwiftUI content, the view of the Zoom Window's chrome overlay. The document chrome gives it its Deep
+/// panel droplet in the window's container (so it merges, and recedes while the Pencil writes on the page), docks it
+/// at the bottom and offers it the full width − 32; the pane takes that width and is as tall as its writing area needs
+/// (the box's aspect ratio at that width). It reports the width it got, which sets the magnification.
 struct ZoomPane: View {
-    /// ponytail: the zoom slider's longest length; NibMetrics has no slider-width token (contract gap reported for F038).
-    private static let sliderMaxWidth: CGFloat = 280
-
     @ObservedObject var controller: ZoomWindowController
     @ObservedObject var state: ZoomState
     let writing: ZoomWritingView
@@ -532,12 +571,21 @@ struct ZoomPane: View {
         VStack(spacing: ZoomWindowController.rowGap) {
             controls
             ZoomWritingSurface(view: writing)
-                .frame(width: controller.writingSize.width, height: controller.writingSize.height)
+                .frame(maxWidth: .infinity)
+                .frame(height: controller.writingSize.height)
+                .background {
+                    GeometryReader { g in
+                        Color.clear
+                            .onAppear { controller.paneLaidOut(writingWidth: g.size.width) }
+                            .onChange(of: g.size.width) { _, width in controller.paneLaidOut(writingWidth: width) }
+                    }
+                }
                 .clipShape(RoundedRectangle(cornerRadius: ZoomWindowController.writingRadius, style: .continuous))
         }
         .padding(ZoomWindowController.padding)
-        .frame(width: controller.paneSize.width, height: controller.paneSize.height)
-        .nibGlass(.deep, cornerRadius: NibRadius.panel)
+        .frame(minWidth: 4 * NibMetrics.hitTarget, maxWidth: .infinity)
+        .onAppear { controller.paneAppeared() }
+        .onDisappear { controller.paneDisappeared() }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Zoom Window"))
     }
@@ -550,7 +598,7 @@ struct ZoomPane: View {
                 .foregroundStyle(NibColor.label)
                 .accessibilityHidden(true)
             NibSlider(value: zoom, in: controller.magnificationRange, label: String(localized: "Zoom"))
-                .frame(maxWidth: Self.sliderMaxWidth)
+                .frame(maxWidth: NibMetrics.popoverContentWidth)
                 .accessibilityValue(zoomText)
             Spacer(minLength: 0)
             NibButton(String(localized: "New Line"), kind: .secondary, size: .compact) { controller.newLine() }
@@ -666,8 +714,8 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         ring.strokeColor = NibUIColor.label.resolvedColor(with: paperTraits).cgColor
         ring.fillColor = NibUIColor.fill4.resolvedColor(with: paperTraits).cgColor
         halo.fillColor = nil
-        halo.lineWidth = 3
-        ring.lineWidth = 1
+        halo.lineWidth = NibStroke.thick
+        ring.lineWidth = NibStroke.thin
         for cursor in [halo, ring] {
             cursor.isHidden = true
             layer.addSublayer(cursor)
@@ -715,6 +763,14 @@ final class ZoomWritingView: UIView, PKCanvasViewDelegate {
         let k = min(max(n, 0), strokes.count)
         guard k > 0 else { return }
         replaceWet(Array(strokes.dropFirst(k)))
+    }
+
+    /// Removes the wet stroke at `index` (oldest first): its commit failed, so it must not look saved.
+    func removeWet(at index: Int) {
+        var strokes = canvas.drawing.strokes
+        guard strokes.indices.contains(index) else { return }
+        strokes.remove(at: index)
+        replaceWet(strokes)
     }
 
     private func replaceWet(_ strokes: [PKStroke]) {

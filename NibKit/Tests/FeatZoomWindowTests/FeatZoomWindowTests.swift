@@ -55,6 +55,50 @@ final class FeatZoomWindowTests: XCTestCase {
         }
     }
 
+    /// A canvas host whose commits finish when the test says (or at once with `outcome`), like the real canvas's
+    /// `commitStroke(_:page:completion:)`.
+    @MainActor
+    private final class ScriptedCanvasHost: CanvasHost {
+        let base: FakeCanvasHost
+        /// Set: every commit finishes at once with it. nil: commits wait for `finish`.
+        var outcome: Result<ElementID?, NibError>?
+        private(set) var committed = 0
+        private var waiting: [(Result<ElementID?, NibError>) -> Void] = []
+
+        init(_ h: Harness) { base = FakeCanvasHost(h) }
+
+        /// Finishes the oldest waiting commit.
+        func finish(_ result: Result<ElementID?, NibError>) {
+            guard !waiting.isEmpty else { return XCTFail("no commit is waiting") }
+            waiting.removeFirst()(result)
+        }
+
+        var app: NibApp { base.app }
+        var session: EditorSession { base.session }
+        var documentID: DocumentID { base.documentID }
+        var zoomScale: Double { base.zoomScale }
+        var canvasView: UIView { base.canvasView }
+        var overlayLayer: CALayer { base.overlayLayer }
+        func viewPoint(_ p: Point, page: PageID) -> CGPoint { base.viewPoint(p, page: page) }
+        func pagePoint(_ v: CGPoint) -> (page: PageID, point: Point)? { base.pagePoint(v) }
+        func pageFrame(_ page: PageID) -> CGRect? { base.pageFrame(page) }
+        func setHidden(_ ids: Set<ElementID>, page: PageID) { base.setHidden(ids, page: page) }
+        func invalidate(page: PageID, rect: Rect?) { base.invalidate(page: page, rect: rect) }
+        func commitStroke(_ stroke: Stroke, page: PageID) { committed += 1 }
+        func cancelWetStroke() { base.cancelWetStroke() }
+        func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { base.attachLiveView(view, item: item, page: page) }
+
+        func commitStroke(_ stroke: Stroke, page: PageID,
+                          completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void) {
+            committed += 1
+            if let outcome {
+                completion(outcome)
+            } else {
+                waiting.append(completion)
+            }
+        }
+    }
+
     private func registerRuled(_ h: Harness, returnHeight: Double) {
         h.app.content.templates.register(TemplateDefinition(
             id: "builtin.ruled", title: "Ruled", category: "Writing", owner: "test",
@@ -80,6 +124,19 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertEqual(item?.docKinds, Set([DocumentKind.notebook]))
         XCTAssertNotNil(h.app.ui.canvasAttachments.get("zoomwindow.box"))
         XCTAssertEqual(h.app.content.keyCommands.get("zoomwindow.newLine")?.command, "zoom.newLine")
+        // Keys live only in notebooks (contracts-v2 docKinds, honoured by the shell).
+        XCTAssertEqual(h.app.content.keyCommands.get("zoomwindow.toggle")?.docKinds, Set([DocumentKind.notebook]))
+        XCTAssertEqual(h.app.content.keyCommands.get("zoomwindow.newLine")?.docKinds, Set([DocumentKind.notebook]))
+        XCTAssertNotNil(item?.isOn)
+        XCTAssertNotNil(item?.isEnabled)
+
+        // The pane is a chrome overlay: a Deep panel docked at the bottom, in notebooks.
+        let pane = h.app.ui.chromeOverlays.get(FeatZoomWindowFeature.paneOverlayID)
+        XCTAssertEqual(pane?.owner, FeatZoomWindowFeature.id)
+        XCTAssertEqual(pane?.placement, .bottom)
+        XCTAssertEqual(pane?.surface, .panel)
+        XCTAssertEqual(pane?.docKinds, Set([DocumentKind.notebook]))
+        XCTAssertEqual(pane?.isInteractive, true)
 
         let ctx = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1, point: Point(120, 300))
         let menu = h.app.ui.menuItems(.pageLongPress, ctx).first { $0.id == "zoomwindow.here" }
@@ -290,24 +347,159 @@ final class FeatZoomWindowTests: XCTestCase {
         overlay.detach(from: host)
     }
 
-    func testOnlyThePanesOwnCommitsCountAsLanded() async throws {
+    func testCommitOutcomesDecideWhenWetInkLeaves() async throws {
         let h = harness()
         registerAddStrokes(h)
+        try await h.run("zoom.setBox", ["page": .string(page1), "rect": [100, 200, 200, 50], "margins": [100, 500]])
+        try await h.run("zoom.toggle", ["on": true])
+        let host = ScriptedCanvasHost(h)
+        let overlay = ZoomBoxOverlay(host: host)
+        overlay.attach(to: host)
+        let c = overlay.controller
+        showWet(c, [stroke(120, 150), stroke(160, 190), stroke(200, 230)])
+
+        // Two commits still running: nothing has landed.
+        XCTAssertTrue(c.strokeFinished(stroke(120, 150)))
+        XCTAssertTrue(c.strokeFinished(stroke(160, 190)))
+        XCTAssertEqual(host.committed, 2)
+        XCTAssertEqual(c.inFlight, 2)
+        XCTAssertEqual(c.landed, 0)
+
+        // The first is saved: it leaves with the next render, which includes its dry ink.
+        host.finish(.success(nil))
+        XCTAssertEqual(c.inFlight, 1)
+        XCTAssertEqual(c.landed, 1)
+        XCTAssertEqual(c.wetCount, 3, "wet strokes leave only with the render that includes their dry ink")
+
+        // The second fails: it must not look saved, so it leaves at once, and the user is told.
+        let failed = expectation(forNotification: .nibCommandFailed, object: h.app) { note in
+            (note.userInfo?["command"] as? String) == CommandIDs.inkAddStrokes
+        }
+        host.finish(.failure(NibError(.internalError, "the disk is full")))
+        await fulfillment(of: [failed], timeout: 1)
+        XCTAssertEqual(c.inFlight, 0)
+        XCTAssertEqual(c.landed, 1)
+        XCTAssertEqual(c.wetCount, 2)
+
+        // A stroke written on the main canvas on the same page is not the pane's.
+        try await h.run(CommandIDs.inkAddStrokes)
+        XCTAssertEqual(c.landed, 1)
+
+        // A commit refused at once (read-only) is not saved either: the pane drops it in its stroke callback.
+        host.outcome = .failure(NibError(.permissionDenied, "This document is read-only."))
+        XCTAssertFalse(c.strokeFinished(stroke(200, 230)))
+        XCTAssertEqual(c.inFlight, 0)
+        XCTAssertEqual(c.landed, 1)
+
+        // A commit that finishes after the box moved to another page does not count against that page's strokes.
+        host.outcome = nil
+        XCTAssertTrue(c.strokeFinished(stroke(120, 150)))
+        try await h.run("zoom.setBox", ["page": .string(page2), "rect": [100, 200, 200, 50]])
+        c.stateChanged()
+        XCTAssertEqual(c.wetCount, 0)
+        showWet(c, [stroke(120, 150)])
+        host.finish(.success(nil))
+        XCTAssertEqual(c.landed, 0)
+        XCTAssertEqual(c.wetCount, 1)
+        overlay.detach(from: host)
+    }
+
+    func testTheFakeHostsCommitsLandAtOnce() async throws {
+        let h = harness()
         let (host, overlay) = try await openWindow(h)
         let c = overlay.controller
-        showWet(c, [stroke(120, 150), stroke(160, 190)])
+        showWet(c, [stroke(120, 150)])
         XCTAssertTrue(c.strokeFinished(stroke(120, 150)))
-        XCTAssertEqual(c.inFlight, 1)
-
-        // The pane's commit lands (as the real host commits it: ink.addStrokes as the user).
-        try await h.run(CommandIDs.inkAddStrokes)
-        XCTAssertEqual(c.landed, 1)
+        XCTAssertEqual(host.committed.count, 1)
         XCTAssertEqual(c.inFlight, 0)
-
-        // A stroke written on the main canvas on the same page is not the pane's: the second wet stroke stays wet.
-        try await h.run(CommandIDs.inkAddStrokes)
         XCTAssertEqual(c.landed, 1)
-        XCTAssertEqual(c.wetCount, 2, "wet strokes leave only with the render that includes their dry ink")
+        overlay.detach(from: host)
+    }
+
+    func testPaneIsShownWhileTheCanvasShowsALivePage() async throws {
+        let h = harness()
+        let ctx = ChromeContext(app: h.app, session: h.session, kind: .notebook)
+        func shown(_ context: ChromeContext) -> Bool {
+            h.app.ui.visibleChromeOverlays(context).contains { $0.id == FeatZoomWindowFeature.paneOverlayID }
+        }
+        XCTAssertFalse(shown(ctx))
+        try await h.run("zoom.setBox", ["page": .string(page1), "rect": [100, 200, 200, 50]])
+        try await h.run("zoom.toggle", ["on": true])
+        XCTAssertFalse(shown(ctx), "no canvas, no pane")
+
+        let host = FakeCanvasHost(h)
+        let overlay = ZoomBoxOverlay(host: host)
+        overlay.attach(to: host)
+        XCTAssertTrue(shown(ctx))
+        XCTAssertFalse(shown(ChromeContext(app: h.app, session: h.session, kind: .whiteboard)))
+
+        h.session.readOnly = true
+        XCTAssertFalse(shown(ctx), "the pane writes ink, so it hides in read-only mode")
+        h.session.readOnly = false
+        XCTAssertTrue(shown(ctx))
+
+        try await h.run("zoom.toggle", ["on": false])
+        XCTAssertFalse(shown(ctx))
+        try await h.run("zoom.toggle", ["on": true])
+        XCTAssertTrue(shown(ctx))
+        overlay.detach(from: host)
+        XCTAssertFalse(shown(ctx), "its canvas went away")
+    }
+
+    func testToolbarItemFollowsTheWindowAndAsksTheChromeToUpdate() async throws {
+        let h = harness()
+        let item = try XCTUnwrap(h.app.ui.toolbar.get("zoomwindow"))
+        XCTAssertEqual(item.isOn?(h.session), false)
+        XCTAssertEqual(item.isEnabled?(h.session), true)
+
+        let sessionID = h.session.id.raw
+        let update = expectation(forNotification: .nibChromeNeedsUpdate, object: h.app.ui) { note in
+            (note.userInfo?["session"] as? String) == sessionID
+        }
+        try await h.run("zoom.toggle", ["on": true])
+        await fulfillment(of: [update], timeout: 1)
+        XCTAssertEqual(item.isOn?(h.session), true)
+
+        h.session.readOnly = true
+        XCTAssertEqual(item.isEnabled?(h.session), true, "an open window can still be closed")
+        try await h.run("zoom.toggle", ["on": false])
+        XCTAssertEqual(item.isOn?(h.session), false)
+        XCTAssertEqual(item.isEnabled?(h.session), false, "read-only: it cannot open")
+        h.session.readOnly = false
+
+        try await h.run("zoom.toggle", ["on": true])
+        h.session.document = Fixtures.whiteboardID
+        XCTAssertEqual(item.isOn?(h.session), false, "open on another document than the one the window shows")
+    }
+
+    func testPaneTakesTheChromesWidthAndSizesItsWritingAreaFromTheBox() async throws {
+        let h = harness()
+        let (host, overlay) = try await openWindow(h)          // box 200 × 50
+        let c = overlay.controller
+        // Until the chrome lays it out: the canvas's width less the chrome insets (2 × 16) and the padding (2 × 8).
+        XCTAssertEqual(c.writingSize.width, 976, accuracy: 1e-9)
+        XCTAssertEqual(c.writingSize.height, 244, accuracy: 1e-9)
+
+        c.paneLaidOut(writingWidth: 784)
+        XCTAssertEqual(c.writingSize.width, 784, accuracy: 1e-9)
+        XCTAssertEqual(c.writingSize.height, 196, accuracy: 1e-9)
+        XCTAssertEqual(c.magnification, 784.0 / 200, accuracy: 1e-9)
+
+        // A new box shows the page at 3× in that width, and the pane is its nominal height.
+        let out = try await h.run("zoom.toggle", ["on": true, "page": .string(page1), "at": [300, 400]])
+        XCTAssertEqual(rect(out)[2], 784.0 / 3, accuracy: 1e-9)
+        c.stateChanged()
+        XCTAssertEqual(c.writingSize.height, ZoomWindowController.nominalWritingHeight, accuracy: 1e-6)
+        XCTAssertEqual(c.writingSize.height + ZoomWindowController.paneChrome, 240, accuracy: 1e-6)
+
+        // The overlay's view takes the width the chrome offers and is as tall as the row and the writing area.
+        let ctx = ChromeContext(app: h.app, session: h.session, kind: .notebook)
+        let pane = try XCTUnwrap(h.app.ui.chromeOverlays.get(FeatZoomWindowFeature.paneOverlayID))
+        let size = NibSnapshot.fittingSize(pane.makeView(ctx), width: 800)
+        XCTAssertEqual(size.width, 800, accuracy: 0.5)
+        XCTAssertEqual(size.height, c.writingSize.height + ZoomWindowController.paneChrome, accuracy: 0.5)
+        XCTAssertEqual(ZoomWindowController.writingHeight(width: 800, box: Rect(x: 0, y: 0, width: 100, height: 400),
+                                                          maxHeight: 300), 300, "never taller than the screen allows")
         overlay.detach(from: host)
     }
 
@@ -354,9 +546,9 @@ final class FeatZoomWindowTests: XCTestCase {
             erased.params.append(params)
             return [:]
         }
-        h.app.settings.setJSON("eraser.mode", .string("precision"))
-        h.app.settings.setJSON("eraser.size", .number(30))
-        h.app.settings.setJSON("eraser.filter.pencil", .bool(false))
+        h.app.settings.set(NibSettings.eraserMode, "precision")
+        h.app.settings.set(NibSettings.eraserSize, 30)
+        h.app.settings.set(NibSettings.eraserFilter(.pencil), false)
         let (host, overlay) = try await openWindow(h)
         let c = overlay.controller
         let m = c.magnification
@@ -377,7 +569,7 @@ final class FeatZoomWindowTests: XCTestCase {
         XCTAssertEqual(path.last?.last ?? 0, 200 + 30 / m, accuracy: 1e-9)
 
         // An Erase Filter that lets nothing be erased sends nothing.
-        for tool in InkTool.allCases { h.app.settings.setJSON("eraser.filter." + tool.rawValue, .bool(false)) }
+        for tool in InkTool.allCases { h.app.settings.set(NibSettings.eraserFilter(tool), false) }
         c.erase([CGPoint(x: 30, y: 15)])
         await c.pending?.value
         XCTAssertEqual(erased.params.count, 1)

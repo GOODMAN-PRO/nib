@@ -21,24 +21,24 @@ final class ZoomState: ObservableObject {
     /// makes the pane its nominal 240 pt.
     var paneWidth = 600.0
     var paneAspect = 0.3
+    /// The pane of the canvas this window shows now (set while its zoom box attachment is attached). The chrome
+    /// overlay shows it; nil = no canvas, so no pane.
+    weak var pane: ZoomWindowController?
 
     func effectiveMargins(pageWidth: Double) -> ZoomMargins {
         margins.map { ZoomGeometry.clampMargins($0, pageWidth: pageWidth) } ?? ZoomGeometry.defaultMargins(pageWidth: pageWidth)
     }
+
+    /// Open on `doc` (what the toolbar item shows as on).
+    func isOn(in doc: DocumentID?) -> Bool { isOn && doc != nil && self.doc == doc }
 }
 
 /// Zoom Window state per window, kept in `app.services` (key `zoomwindow.store`) so every `NibApp` has its own.
 @MainActor
 final class ZoomStore {
     static let key = "zoomwindow.store"
-    /// Captured at registration: `CommandContext` has no way to reach `app.content`, and return heights need templates.
-    let templates: Registry<TemplateDefinition>
     // ponytail: one small state per window ever opened in this run; prune by live sessions if that ever matters.
     private var states: [NibID: ZoomState] = [:]
-
-    init(templates: Registry<TemplateDefinition>) {
-        self.templates = templates
-    }
 
     func state(for session: EditorSession) -> ZoomState {
         if let s = states[session.id] { return s }
@@ -50,26 +50,37 @@ final class ZoomStore {
     /// The store the feature registered (made on demand when an attachment outlives an unregistered feature).
     static func resolve(_ app: NibApp) -> ZoomStore {
         if let s = app.services.get(key, as: ZoomStore.self) { return s }
-        let s = ZoomStore(templates: app.content.templates)
+        let s = ZoomStore()
         app.services.set(s, for: key)
         return s
     }
 
-    func returnHeight(page: PageRecord, box: Rect) -> Double {
+    /// The toolbar item's on state: this window's Zoom Window is open on the document it shows.
+    func isOn(in session: EditorSession) -> Bool {
+        states[session.id]?.isOn(in: session.document) ?? false
+    }
+
+    /// The pane the chrome overlay shows in this window, while it has something to show.
+    func activePane(for session: EditorSession) -> ZoomWindowController? {
+        guard let pane = states[session.id]?.pane, pane.isActive else { return nil }
+        return pane
+    }
+
+    static func returnHeight(page: PageRecord, box: Rect, templates: Registry<TemplateDefinition>) -> Double {
         let ref = page.background.kind == .template ? page.background.template : nil
         return ZoomGeometry.returnHeight(page: page, template: ref.flatMap { templates.get($0.id) }, box: box)
     }
 
-    func output(_ state: ZoomState, doc: DocumentID, workspace: Workspace) -> ZoomStateOutput {
+    static func output(_ state: ZoomState, doc: DocumentID, _ ctx: CommandContext) -> ZoomStateOutput {
         guard state.doc == doc, let pid = state.page,
-              let page = try? workspace.content(doc).page(pid), !page.deleted, let size = page.size else {
+              let page = try? ctx.workspace.content(doc).page(pid), !page.deleted, let size = page.size else {
             return ZoomStateOutput(on: state.isOn && state.doc == doc)
         }
         let r = state.rect
         let m = state.effectiveMargins(pageWidth: size.width)
         return ZoomStateOutput(on: state.isOn, page: NodeRef.page(doc, pid).description,
                                rect: [r.x, r.y, r.width, r.height], margins: [m.left, m.right],
-                               returnHeight: returnHeight(page: page, box: r))
+                               returnHeight: returnHeight(page: page, box: r, templates: ctx.content.templates))
     }
 }
 
@@ -88,7 +99,7 @@ struct ZoomStateOutput: Codable, Equatable {
 /// Resolves the invoking window and the notebook it shows.
 @MainActor
 enum ZoomTarget {
-    static func resolve(_ ctx: CommandContext) throws -> (session: EditorSession, state: ZoomState, store: ZoomStore, doc: DocumentID) {
+    static func resolve(_ ctx: CommandContext) throws -> (session: EditorSession, state: ZoomState, doc: DocumentID) {
         guard let store = ctx.services.get(ZoomStore.key, as: ZoomStore.self) else {
             throw NibError.unavailable("the Zoom Window")
         }
@@ -99,7 +110,7 @@ enum ZoomTarget {
         guard try ctx.workspace.content(doc).meta.kind == .notebook else {
             throw NibError.unsupported("the Zoom Window outside notebooks")
         }
-        return (session, store.state(for: session), store, doc)
+        return (session, store.state(for: session), doc)
     }
 
     /// A live, fixed-size page of `doc` from a page ref.
@@ -151,7 +162,9 @@ struct ZoomToggle: NibCommand {
         let show = p.on ?? !(state.isOn && state.doc == t.doc)
         guard show else {
             state.isOn = false
-            return t.store.output(state, doc: t.doc, workspace: ctx.workspace)
+            // The toolbar item's on state and the chrome's pane overlay follow it (contracts-v2 live state).
+            ctx.ui?.setNeedsChromeUpdate(t.session)
+            return ZoomStore.output(state, doc: t.doc, ctx)
         }
         if t.session.readOnly {
             throw NibError(.unavailable, "the Zoom Window is not available in read-only mode",
@@ -181,7 +194,8 @@ struct ZoomToggle: NibCommand {
             state.autoAdvance.reset()
         }
         state.isOn = true
-        return t.store.output(state, doc: t.doc, workspace: ctx.workspace)
+        ctx.ui?.setNeedsChromeUpdate(t.session)
+        return ZoomStore.output(state, doc: t.doc, ctx)
     }
 }
 
@@ -219,7 +233,7 @@ struct ZoomSetBox: NibCommand {
         t.state.page = page.id
         t.state.rect = ZoomGeometry.clamp(Rect(x: p.rect[0], y: p.rect[1], width: p.rect[2], height: p.rect[3]), to: size)
         t.state.autoAdvance.reset()
-        return t.store.output(t.state, doc: t.doc, workspace: ctx.workspace)
+        return ZoomStore.output(t.state, doc: t.doc, ctx)
     }
 
     /// Params for UI callers.
@@ -251,11 +265,11 @@ struct ZoomNewLine: NibCommand {
                            hint: "call zoom.toggle {\"on\": true} first")
         }
         let (page, size) = try ZoomTarget.page(pid, doc: t.doc, ctx)
-        let rh = t.store.returnHeight(page: page, box: t.state.rect)
+        let rh = ZoomStore.returnHeight(page: page, box: t.state.rect, templates: ctx.content.templates)
         t.state.rect = ZoomGeometry.newLine(t.state.rect, margins: t.state.effectiveMargins(pageWidth: size.width),
                                             returnHeight: rh, pageSize: size)
         t.state.autoAdvance.reset()
-        return t.store.output(t.state, doc: t.doc, workspace: ctx.workspace)
+        return ZoomStore.output(t.state, doc: t.doc, ctx)
     }
 }
 

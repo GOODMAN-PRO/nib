@@ -3,15 +3,16 @@ import Combine
 import NibContracts
 import NibDesign
 
-/// The zoom box on the page, a `CanvasAttachment` (ARCHITECTURE.md §8.5): the accent frame (radius 18) around the
-/// region the pane writes into. Drag it to move it; the corner handle scales it keeping the aspect ratio (that is the
-/// zoom), the bottom handle sets its height; the tabs above the left and right margin markers set where auto-advance
-/// wraps. Handles are rigid 12 pt beads with 44 pt hit areas (DESIGN.md §10.15), and every drag ends in one
-/// `zoom.setBox`. The overlay also docks the writing pane (`ZoomWindowController`).
+/// The zoom box on the page, a `CanvasAttachment` (ARCHITECTURE.md §8.5): the frame (`NibFrameView`, radius 18, with
+/// the accent outline) around the region the pane writes into. Drag it to move it; the corner handle scales it keeping
+/// the aspect ratio (that is the zoom), the bottom handle sets its height; the beads above the left and right margin
+/// markers set where auto-advance wraps. Handles are NibDesign's rigid 12 pt beads with 44 pt hit areas
+/// (`NibHandleView`, DESIGN.md §10.15), and every drag ends in one `zoom.setBox`. The overlay owns this canvas's
+/// writing pane (`ZoomWindowController`), which the document chrome shows as a chrome overlay.
 @MainActor
 final class ZoomBoxOverlay: CanvasAttachment {
     enum Part: Equatable {
-        case box, corner, bottom, leftMargin, rightMargin, pane
+        case box, corner, bottom, leftMargin, rightMargin
     }
 
     private struct Drag {
@@ -33,9 +34,8 @@ final class ZoomBoxOverlay: CanvasAttachment {
     private var subscriptions: [AnyCancellable] = []
 
     init(host: CanvasHost) {
-        let store = ZoomStore.resolve(host.app)
-        state = store.state(for: host.session)
-        controller = ZoomWindowController(app: host.app, session: host.session, state: state, store: store)
+        state = ZoomStore.resolve(host.app).state(for: host.session)
+        controller = ZoomWindowController(app: host.app, session: host.session, state: state)
     }
 
     // MARK: CanvasAttachment
@@ -65,11 +65,9 @@ final class ZoomBoxOverlay: CanvasAttachment {
 
     func canvasDidChange(_ host: CanvasHost) { refresh() }
 
+    /// The pane is a chrome overlay above the canvas, so its touches never reach here.
     func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
         claimed = part(at: view.convert(viewPoint, from: host.canvasView))
-        if claimed == nil, let pane = controller.paneFrame(in: host.canvasView), pane.contains(viewPoint) {
-            claimed = .pane                           // the pane's own controls and canvas take it
-        }
         return claimed != nil
     }
 
@@ -77,7 +75,7 @@ final class ZoomBoxOverlay: CanvasAttachment {
         let viewPoint = view.convert(host.viewPoint(sample.location, page: sample.page), from: host.canvasView)
         let hit = claimed ?? part(at: viewPoint)
         claimed = nil
-        guard let grabbed = hit, grabbed != .pane, let page = state.page, let size = controller.pageSize else {
+        guard let grabbed = hit, let page = state.page, let size = controller.pageSize else {
             drag = nil
             return
         }
@@ -138,8 +136,6 @@ final class ZoomBoxOverlay: CanvasAttachment {
             margins.left = min(max(d.margins.left + dx, 0), d.margins.right - ZoomGeometry.minSize)
         case .rightMargin:
             margins.right = max(min(d.margins.right + dx, size.width), d.margins.left + ZoomGeometry.minSize)
-        case .pane:
-            return
         }
         preview = (rect, margins)
         refresh()
@@ -168,17 +164,13 @@ final class ZoomBoxOverlay: CanvasAttachment {
 
     /// Off when the box's page is gone (deleted from the navigator, by undo, sync, a collaborator or the AI): neither
     /// the box nor the pane shows, so nothing can be written into a page that is not there.
-    private var isVisible: Bool {
-        guard let host else { return false }
-        return state.isOn && state.doc == host.documentID && state.page != nil && !host.session.readOnly
-            && controller.pageRecord != nil
-    }
+    private var isVisible: Bool { host != nil && controller.isActive }
 
     private func refresh() {
         guard let host else { return }
-        let visible = isVisible
-        controller.layout(visible: visible)
-        guard visible, let page = state.page, let frame = host.pageFrame(page), let size = controller.pageSize else {
+        controller.canvasResized(host.canvasView.bounds.size)
+        controller.updateActive()
+        guard isVisible, let page = state.page, let frame = host.pageFrame(page), let size = controller.pageSize else {
             view.isHidden = true
             return
         }
@@ -250,30 +242,27 @@ final class ZoomBoxOverlay: CanvasAttachment {
 
 /// Draws the zoom box, its corner and bottom handles and the margin markers, in the page's frame. It takes a touch
 /// only on those parts, so ink and the wet-ink canvas everywhere else on the page are untouched. The box is DESIGN.md's
-/// `frame`: outline only, no body, so nothing tints the ink being written.
+/// `frame` (`NibFrameView`: rim and water line, no body, so nothing tints the ink being written) with the Zoom Window
+/// box's accent outline (`NibStroke.emphasis`); the margin lines are `NibStroke.thin` accent rules.
 final class ZoomOverlayView: UIView {
-    let box = UIView()
-    let corner = ZoomHandleView()
-    let bottom = ZoomHandleView()
-    let leftTab = ZoomHandleView()
-    let rightTab = ZoomHandleView()
+    let box = NibFrameView(frame: .zero)
+    /// Clear bead on the corner (it scales the box), Tinted beads on the edge and the margin markers (DESIGN.md §14.3).
+    let corner = ZoomHandle(style: .clear)
+    let bottom = ZoomHandle(style: .tinted)
+    let leftTab = ZoomHandle(style: .tinted)
+    let rightTab = ZoomHandle(style: .tinted)
     let leftLine = UIView()
     let rightLine = UIView()
     /// Which part (if any) a point in this view's coordinates hits.
     var hitPart: ((CGPoint) -> ZoomBoxOverlay.Part?)?
-    /// The margin tabs sit this far above the box, clear of its hit area.
+    /// The margin beads sit this far above the box, clear of its hit area.
     static let tabRise = NibSpacing.x3
-    /// ponytail: the box outline, and the margin lines below, are literal widths: NibDesign has no outline-width token
-    /// and no UIKit `frame`/`handle` droplet a canvas attachment could use (contract gap reported for F038).
-    static let lineWidth: CGFloat = 1.5
-    static let marginLineWidth: CGFloat = 1
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         box.isUserInteractionEnabled = false
-        box.backgroundColor = .clear
-        box.layer.borderWidth = Self.lineWidth
+        box.layer.borderWidth = NibStroke.emphasis
         box.layer.cornerCurve = .continuous
         for line in [leftLine, rightLine] {
             line.isUserInteractionEnabled = false
@@ -306,22 +295,21 @@ final class ZoomOverlayView: UIView {
         hitPart?(point) != nil
     }
 
-    /// Layer colours do not follow the trait collection on their own.
+    /// Layer colours do not follow the trait collection on their own (the beads and the frame's water do).
     func applyColours() {
-        let accent = NibUIColor.accent.resolvedColor(with: traitCollection).cgColor
-        box.layer.borderColor = accent
-        for handle in [corner, bottom, leftTab, rightTab] { handle.layer.borderColor = accent }
+        box.layer.borderColor = NibUIColor.accent.resolvedColor(with: traitCollection).cgColor
     }
 
     /// `box` and the margin x positions are in this view's coordinates.
     func layout(box r: CGRect, left: CGFloat, right: CGFloat) {
         box.frame = r
+        // `NibFrameView` rounds its water to `NibRadius.zoomFrame`, capped at half the box, as this outline is.
         box.layer.cornerRadius = min(NibRadius.zoomFrame, r.height / 2, r.width / 2)
         corner.center = CGPoint(x: r.maxX, y: r.maxY)
         bottom.center = CGPoint(x: r.midX, y: r.maxY)
         let top = r.minY - Self.tabRise
         let lineBottom = r.maxY + NibSpacing.s
-        let w = Self.marginLineWidth
+        let w = NibStroke.thin
         leftLine.frame = CGRect(x: left - w / 2, y: top, width: w, height: lineBottom - top)
         rightLine.frame = CGRect(x: right - w / 2, y: top, width: w, height: lineBottom - top)
         leftTab.center = CGPoint(x: left, y: top)
@@ -329,20 +317,23 @@ final class ZoomOverlayView: UIView {
     }
 }
 
-/// A rigid 12 pt bead with a 44 pt hit area and the pointer's lift effect. Precision affordances never deform
-/// (DESIGN.md §10.15), so there is no stretch, wobble or poke. Adjustable for VoiceOver where it has an action.
-final class ZoomHandleView: UIView, UIPointerInteractionDelegate {
-    /// ponytail: DESIGN.md §14.3's 12 pt handle bead; NibMetrics has no handle token and the `handle` droplet is
-    /// SwiftUI-only (contract gap reported for F038).
-    static let diameter: CGFloat = 12
+/// One handle of the zoom box: NibDesign's rigid 12 pt bead (`NibHandleView`) centred in its 44 pt hit area, with the
+/// pointer's lift effect. Precision affordances never deform (DESIGN.md §10.15), so there is no stretch, wobble or
+/// poke. Adjustable for VoiceOver where it has an action (the margin markers); `NibHandleView` itself is not an
+/// accessibility element.
+final class ZoomHandle: UIView, UIPointerInteractionDelegate {
+    let bead: NibHandleView
     var onIncrement: (() -> Void)?
     var onDecrement: (() -> Void)?
 
-    init() {
-        super.init(frame: CGRect(x: 0, y: 0, width: Self.diameter, height: Self.diameter))
-        backgroundColor = NibUIColor.beadBody
-        layer.cornerRadius = NibRadius.capsule(Self.diameter)
-        layer.borderWidth = ZoomOverlayView.lineWidth
+    init(style: NibHandleView.Style) {
+        bead = NibHandleView(style: style)
+        super.init(frame: CGRect(x: 0, y: 0, width: NibMetrics.hitTarget, height: NibMetrics.hitTarget))
+        backgroundColor = .clear
+        bead.frame = bounds
+        bead.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        bead.isUserInteractionEnabled = false
+        addSubview(bead)
         addInteraction(UIPointerInteraction(delegate: self))
     }
 
@@ -350,7 +341,7 @@ final class ZoomHandleView: UIView, UIPointerInteractionDelegate {
         return nil
     }
 
-    /// The 44 pt target around the 12 pt bead.
+    /// The 44 pt circle around the bead.
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
         hypot(point.x - bounds.midX, point.y - bounds.midY) <= NibMetrics.hitTarget / 2
     }
@@ -360,11 +351,10 @@ final class ZoomHandleView: UIView, UIPointerInteractionDelegate {
 
     func pointerInteraction(_ interaction: UIPointerInteraction, regionFor request: UIPointerRegionRequest,
                             defaultRegion: UIPointerRegion) -> UIPointerRegion? {
-        let grow = (NibMetrics.hitTarget - Self.diameter) / 2
-        return UIPointerRegion(rect: bounds.insetBy(dx: -grow, dy: -grow))
+        UIPointerRegion(rect: bounds)
     }
 
     func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
-        UIPointerStyle(effect: .lift(UITargetedPreview(view: self)))
+        UIPointerStyle(effect: .lift(UITargetedPreview(view: bead)))
     }
 }
