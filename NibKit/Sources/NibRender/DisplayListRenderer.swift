@@ -2,9 +2,9 @@ import Foundation
 import CoreGraphics
 import NibContracts
 
-/// A page's resolved template: the registered render closure (pure, thread-safe) and the merged params.
+/// A page's resolved template (its render closures are pure and thread-safe) and the params merged over its defaults.
 struct TemplateSource {
-    let render: (_ params: [String: JSONValue], _ size: PageSize, _ scale: Double) -> TemplateRender
+    let definition: TemplateDefinition
     let params: [String: JSONValue]
 }
 
@@ -21,11 +21,8 @@ final class CustomItemDrawer: ItemDrawer {
 /// Everything drawn from a `DisplayList` (custom items and templates), through the shared
 /// `DisplayList.draw(in:origin:assets:doc:)` in NibContracts.
 enum DisplayListRenderer {
-    /// Board templates are laid out on a grid anchored to multiples of this many points, so any repeating template
-    /// whose spacing divides it (24, 20, 30, 40, 48, 60, 80, 120 …) lines up across tiles of an infinite board.
-    /// ponytail: a template with a spacing that does not divide 240 shifts at those seams; give TemplateDefinition a
-    /// period if one ever does.
-    static let boardPeriod = 240.0
+    /// Repeat period of a board template that publishes none (`TemplateDefinition` contract).
+    static let defaultBoardPeriod = PageSize(240, 240)
 
     /// Draws `display` with the frame's top-left as origin, rotated about the frame centre (clockwise on screen).
     static func draw(_ display: DisplayList, in frame: Frame, context: DrawContext) {
@@ -41,28 +38,48 @@ enum DisplayListRenderer {
         display.draw(in: cg, origin: Point(frame.x, frame.y), assets: context.assets, doc: context.doc)
     }
 
-    /// Where a template is laid out: the page itself, or on a board a period-aligned block covering `region`.
-    static func templateFrame(size: PageSize?, region: Rect) -> (origin: Point, size: PageSize) {
-        if let s = size { return (.zero, s) }
-        let p = boardPeriod
-        let ox = (region.minX / p).rounded(.down) * p, oy = (region.minY / p).rounded(.down) * p
-        let w = max(p, ((region.maxX - ox) / p).rounded(.up) * p), h = max(p, ((region.maxY - oy) / p).rounded(.up) * p)
+    /// How often a board template's pattern repeats: `TemplateMetrics.repeatPeriod`, else 240 pt.
+    static func boardPeriod(_ template: TemplateSource) -> PageSize {
+        guard let p = template.definition.metrics(for: template.params, size: nil).repeatPeriod,
+              p.width.isFinite, p.height.isFinite, p.width >= 1, p.height >= 1 else { return defaultBoardPeriod }
+        return p
+    }
+
+    /// Where a `render`-only template is laid out on a board: a block covering `region` whose origin is a multiple of
+    /// the repeat period, so the pattern (anchored at the origin) lines up across tiles.
+    static func boardFrame(region: Rect, period: PageSize) -> (origin: Point, size: PageSize) {
+        let pw = period.width, ph = period.height
+        let ox = (region.minX / pw).rounded(.down) * pw, oy = (region.minY / ph).rounded(.down) * ph
+        let w = max(pw, ((region.maxX - ox) / pw).rounded(.up) * pw), h = max(ph, ((region.maxY - oy) / ph).rounded(.up) * ph)
         return (Point(ox, oy), PageSize(w, h))
+    }
+
+    /// The template's ops for `region` and the origin they are drawn at (contracts-v2 G7). Pages: `renderOps` with
+    /// the page size and the region, so a template with `renderRegion` builds ops for that region only. Boards:
+    /// `renderRegion` with the region's world rect when the template has one, else `render` over a period-aligned block.
+    static func ops(_ template: TemplateSource, size: PageSize?, region: Rect, scale: Double) -> (render: TemplateRender, origin: Point) {
+        let def = template.definition
+        if let s = size { return (def.renderOps(template.params, size: s, scale: scale, region: region), .zero) }
+        if def.renderRegion != nil {
+            let tile = PageSize(region.width, region.height)
+            return (def.renderOps(template.params, size: tile, scale: scale, region: region), .zero)
+        }
+        let frame = boardFrame(region: region, period: boardPeriod(template))
+        return (def.render(template.params, frame.size, scale), frame.origin)
     }
 
     /// Fills the paper and draws the template ops (when `draw`); returns the paper colour either way.
     @discardableResult
     static func drawTemplate(_ template: TemplateSource, size: PageSize?, region: Rect, scale: Double, draw: Bool,
                              cg: CGContext, assets: AssetStore?, doc: DocumentID) -> RGBA {
-        let frame = templateFrame(size: size, region: region)
-        let rendered = template.render(template.params, frame.size, scale)
+        let (rendered, origin) = ops(template, size: size, region: region, scale: scale)
         guard draw else { return rendered.paper }
         let paperRect = size.map { Rect(x: 0, y: 0, width: $0.width, height: $0.height) } ?? region
         cg.saveGState()
         cg.setFillColor(rendered.paper.cgColor)
         cg.fill(paperRect.cg)
         cg.restoreGState()
-        rendered.display.draw(in: cg, origin: frame.origin, assets: assets, doc: doc)
+        rendered.display.draw(in: cg, origin: origin, assets: assets, doc: doc)
         return rendered.paper
     }
 }

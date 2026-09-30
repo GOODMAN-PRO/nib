@@ -9,6 +9,14 @@ import NibContracts
 /// A value snapshot of one page for off-main compositing (taken by `NibPageRenderer.snapshot` on the main actor).
 /// Holds only values plus thread-safe objects: the asset store, the content registries and the background sources.
 struct RenderJob {
+    /// A visible item with its bounds (`Stroke.bounds` scans every point) and its paint bounds (contracts-v2
+    /// `ContentRegistries.paintBounds(for:)`: what its drawer can touch, used for culling).
+    struct Visible {
+        let item: Item
+        let bounds: Rect
+        let paint: Rect
+    }
+
     let doc: DocumentID
     let page: PageID
     /// nil = infinite whiteboard board.
@@ -22,36 +30,52 @@ struct RenderJob {
     let allItems: [Item]
     let layers: Set<Int>
     let hidden: Set<ElementID>
+    /// `DrawContext.annotations`: false leaves comment pins and link marks out (their drawers honour it).
     let annotations: Bool
     let replay: ReplayState?
+    let purpose: DrawPurpose
     let requestedRegion: Rect?
     let assets: AssetStore?
     let registries: ContentRegistries
     let pdf: PDFRenderPool
     let rasters: RasterBackgroundCache
-    /// Tile-cache variant (layers, background, annotations); nil = not cacheable (hidden items, replay animation).
+    /// Tile-cache variant (layers, background, annotations, purpose); nil = not cacheable (hidden items, replay).
     let variant: String?
     /// Tile-cache generation of the page when the snapshot was taken.
     let generation: TileCache.Generation
-    /// Highest revision of the page record and its items (thumbnail cache key); page rev unless requested.
-    let maxRev: Rev
-    /// FNV-1a digest of every (id, rev) of the page record and its items (thumbnail cache key); 0 unless requested.
-    let contentDigest: UInt64
-    /// Visible items with their bounds, computed once per job by the first worker that needs them.
-    let culled = CulledItems()
+    /// Visible items, computed once per job by the first worker that needs them.
+    let culled = Lazy<[Visible]>()
+    /// `PageLooks` keys of the page, computed at most once per job.
+    let dependencies = Lazy<Set<String>>()
 
     var pageKey: String { TileCache.pageKey(doc, page) }
     var pageRect: Rect? { size.map { Rect(x: 0, y: 0, width: $0.width, height: $0.height) } }
 
     /// Live items on the requested layers, minus hidden ones, in z order.
     var visibleItems: [Item] {
-        guard annotations else { return [] }
-        return allItems.filter { !$0.deleted && layers.contains($0.layer) && !hidden.contains($0.id) }
+        allItems.filter { !$0.deleted && layers.contains($0.layer) && !hidden.contains($0.id) }
     }
 
-    /// `visibleItems` with their bounds (`Stroke.bounds` scans every point), shared by all tiles of the job.
-    var visibleBounds: [(item: Item, bounds: Rect)] {
-        culled.get { visibleItems.map { (item: $0, bounds: $0.bounds) } }
+    /// `visibleItems` with their bounds and paint bounds, shared by all tiles of the job.
+    var visible: [Visible] {
+        culled.get {
+            visibleItems.map { Visible(item: $0, bounds: $0.bounds, paint: registries.paintBounds(for: $0)) }
+        }
+    }
+
+    /// The registry entries this page's look depends on: its background template and the drawers (by draw key and
+    /// by kind, the two lookups of `ContentRegistries.drawer(for:)`) of every live item the renderer does not draw
+    /// itself, on any layer.
+    var looks: Set<String> {
+        dependencies.get {
+            var keys: Set<String> = []
+            if background.kind == .template, let id = background.template?.id { keys.insert(PageLooks.template(id)) }
+            for item in allItems where !item.deleted && InkBands.kind(of: item) == .item {
+                keys.insert(PageLooks.drawer(item.drawKey))
+                keys.insert(PageLooks.drawer(item.kind.rawValue))
+            }
+            return keys
+        }
     }
 
     /// False when the render lacks a template or an item drawer that may be registered later (plugins, content
@@ -62,12 +86,12 @@ struct RenderJob {
     }
 }
 
-/// Lazily computed, lock-protected visible-item bounds of one `RenderJob` (workers render its tiles concurrently).
-final class CulledItems {
+/// A lazily computed, lock-protected value of one `RenderJob` (workers render its tiles concurrently).
+final class Lazy<Value> {
     private let lock = NSLock()
-    private var value: [(item: Item, bounds: Rect)]?
+    private var value: Value?
 
-    func get(_ make: () -> [(item: Item, bounds: Rect)]) -> [(item: Item, bounds: Rect)] {
+    func get(_ make: () -> Value) -> Value {
         lock.lock()
         defer { lock.unlock() }
         if let v = value { return v }
@@ -230,7 +254,7 @@ enum SetOfMarks {
     /// Label text height in output pixels.
     static let labelPixels = 13.0
 
-    static func number(_ items: [(item: Item, bounds: Rect)], doc: DocumentID, page: PageID, region: Rect) -> [Mark] {
+    static func number(_ items: [RenderJob.Visible], doc: DocumentID, page: PageID, region: Rect) -> [Mark] {
         let boxed = items.filter { $0.bounds.intersects(region) }
         let sorted = boxed.sorted { ($0.bounds.minY, $0.bounds.minX) < ($1.bounds.minY, $1.bounds.minX) }
         return sorted.enumerated().map { i, e in
@@ -268,6 +292,13 @@ enum SetOfMarks {
 
 // MARK: - Compositing
 
+/// The paper under the items: its colour when known (template paper or background colour; nil under a PDF or image
+/// background) and whether it is dark (D-078).
+struct Paper {
+    var colour: RGBA?
+    var isDark: Bool { RenderGeometry.isDark(colour ?? .white) }
+}
+
 /// Draws one region of a page: background (template DisplayList, PDF page, image or colour), then the items in z
 /// order as `InkBand`s, then optional Set-of-Mark boxes. Pure and thread-safe; always under a light trait collection
 /// so PencilKit and dynamic colours never invert ink in dark mode (paper is never inverted, D-078).
@@ -301,55 +332,55 @@ enum PageCompositor {
         cg.saveGState()
         defer { cg.restoreGState() }
         if let page = job.pageRect { cg.clip(to: page.cg) }
-        let dark = RenderGeometry.isDark(drawBackground(job, region: region, scale: scale, cg: cg))
-        let cull = region.insetBy(-RenderGeometry.drawerMargin)
-        let items = job.visibleBounds.compactMap { $0.bounds.intersects(cull) ? $0.item : nil }
+        let paper = drawBackground(job, region: region, scale: scale, cg: cg)
+        let items = job.visible.compactMap { $0.paint.intersects(region) ? $0.item : nil }
         for band in InkBands.make(items, replay: job.replay) {
-            drawBand(band, job: job, region: region, scale: scale, width: width, height: height, dark: dark, cg: cg)
+            drawBand(band, job: job, region: region, scale: scale, width: width, height: height, paper: paper, cg: cg)
         }
     }
 
-    /// Draws the page background (when requested) and returns the paper colour, which decides `darkPaper`.
-    static func drawBackground(_ job: RenderJob, region: Rect, scale: Double, cg: CGContext) -> RGBA {
+    /// Draws the page background (when requested) and returns the paper, which decides dark-paper blending.
+    static func drawBackground(_ job: RenderJob, region: Rect, scale: Double, cg: CGContext) -> Paper {
         let bg = job.background
         let area = (job.pageRect ?? region).cg
         switch bg.kind {
         case .template:
             guard let t = job.template else {
                 if job.drawBackground { fill(area, .white, cg) }
-                return .white
+                return Paper(colour: .white)
             }
-            return DisplayListRenderer.drawTemplate(t, size: job.size, region: region, scale: scale,
-                                                    draw: job.drawBackground, cg: cg, assets: job.assets, doc: job.doc)
+            return Paper(colour: DisplayListRenderer.drawTemplate(t, size: job.size, region: region, scale: scale,
+                                                                  draw: job.drawBackground, cg: cg, assets: job.assets,
+                                                                  doc: job.doc))
         case .color:
-            let paper = bg.color ?? .white
-            if job.drawBackground { fill(area, paper, cg) }
-            return paper
+            let colour = bg.color ?? .white
+            if job.drawBackground { fill(area, colour, cg) }
+            return Paper(colour: colour)
         case .pdf:
-            guard job.drawBackground else { return .white }
+            guard job.drawBackground else { return Paper() }
             fill(area, .white, cg)
             if let url = job.pdfURL {
-                job.pdf.draw(url: url, pageIndex: bg.pdfPage ?? 0, rotation: job.rotation, in: area, cg: cg)
+                job.pdf.draw(url: url, pageIndex: bg.pdfPage ?? 0, rotation: job.rotation, pageSize: job.size, cg: cg)
             }
-            return .white
+            return Paper()
         case .image:
-            guard job.drawBackground else { return .white }
+            guard job.drawBackground else { return Paper() }
             fill(area, .white, cg)
-            if let ref = bg.asset, let image = job.rasters.image(ref, doc: job.doc, assets: job.assets) {
-                drawRotated(image, rotation: job.rotation, in: area, cg: cg)
+            if let ref = bg.asset, let raster = job.rasters.image(ref, doc: job.doc, assets: job.assets) {
+                raster.draw(rotation: job.rotation, pageSize: job.size, cg: cg)
             }
-            return .white
+            return Paper()
         }
     }
 
     static func drawBand(_ band: InkBand, job: RenderJob, region: Rect, scale: Double, width: Int, height: Int,
-                         dark: Bool, cg: CGContext) {
+                         paper: Paper, cg: CGContext) {
         let fade: CGFloat = band.faded ? 0.25 : 1
         switch band.kind {
         case .ink:
             composite(inkImage(band.strokes, region: region, scale: scale), region: region, alpha: fade, blend: .normal, cg: cg)
         case .highlighter:
-            let (alpha, blend) = highlighterBlend(band.alpha, dark: dark)
+            let (alpha, blend) = highlighterBlend(band.alpha, dark: paper.isDark)
             let opaque = band.strokes.map { s -> Stroke in
                 var s = s
                 s.style.color = s.style.color.withAlpha(1)
@@ -360,15 +391,16 @@ enum PageCompositor {
             let image = patternImage(band.strokes, opaque: false, region: region, width: width, height: height)
             composite(image, region: region, alpha: fade, blend: .normal, cg: cg)
         case .patternHighlighter:
-            let (alpha, blend) = highlighterBlend(band.alpha, dark: dark)
+            let (alpha, blend) = highlighterBlend(band.alpha, dark: paper.isDark)
             let image = patternImage(band.strokes, opaque: true, region: region, width: width, height: height)
             composite(image, region: region, alpha: alpha * fade, blend: blend, cg: cg)
         case .item:
             for item in band.items {
                 guard let drawer = job.registries.drawer(for: item) else { continue }
                 cg.saveGState()
-                drawer.draw(item, in: DrawContext(cg: cg, scale: scale, doc: job.doc, page: job.page, darkPaper: dark,
-                                                  assets: job.assets, replay: job.replay))
+                drawer.draw(item, in: DrawContext(cg: cg, scale: scale, doc: job.doc, page: job.page, darkPaper: paper.isDark,
+                                                  assets: job.assets, replay: job.replay, purpose: job.purpose,
+                                                  annotations: job.annotations, paper: paper.colour))
                 cg.restoreGState()
             }
         }
@@ -428,20 +460,6 @@ enum PageCompositor {
         cg.translateBy(x: rect.minX, y: rect.maxY)
         cg.scaleBy(x: 1, y: -1)
         cg.draw(image, in: CGRect(origin: .zero, size: rect.size))
-        cg.restoreGState()
-    }
-
-    /// Aspect-fits an image into `target`, turned clockwise by the page rotation (0/90/180/270).
-    static func drawRotated(_ image: CGImage, rotation: Int, in target: CGRect, cg: CGContext) {
-        let quarter = (((rotation % 360) + 360) % 360) / 90
-        let raw = CGSize(width: image.width, height: image.height)
-        let turned = quarter % 2 == 0 ? raw : CGSize(width: raw.height, height: raw.width)
-        let fit = RenderGeometry.aspectFit(turned, in: target)
-        let drawn = quarter % 2 == 0 ? fit.size : CGSize(width: fit.height, height: fit.width)
-        cg.saveGState()
-        cg.translateBy(x: fit.midX, y: fit.midY)
-        cg.rotate(by: CGFloat(quarter) * .pi / 2)
-        drawImage(image, in: CGRect(x: -drawn.width / 2, y: -drawn.height / 2, width: drawn.width, height: drawn.height), cg: cg)
         cg.restoreGState()
     }
 

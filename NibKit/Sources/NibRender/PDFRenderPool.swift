@@ -16,33 +16,41 @@ final class PDFRenderPool {
     private let lock = NSLock()
     private var idle: [Slot] = []
 
-    /// Draws page `pageIndex` (0-based) of the PDF at `url` aspect-fitted into `target` (page points, y down), turned
-    /// clockwise by the page `rotation` on top of the PDF page's own /Rotate. False when the PDF cannot be read.
+    /// Draws page `pageIndex` (0-based) of the PDF at `url` into page points (y down) where
+    /// `PageRecord.backgroundTransform` puts it: turned by the page `rotation`, aspect-fitted and centred into
+    /// `pageSize` (boards: unscaled at the origin). False when the PDF cannot be read.
     @discardableResult
-    func draw(url: URL, pageIndex: Int, rotation: Int, in target: CGRect, cg: CGContext) -> Bool {
+    func draw(url: URL, pageIndex: Int, rotation: Int, pageSize: PageSize?, cg: CGContext) -> Bool {
         let slot = checkout()
         defer { checkin(slot) }
         guard let page = document(url, in: slot)?.page(at: pageIndex + 1) else { return false }
-        PDFRenderPool.draw(page, rotation: rotation, in: target, cg: cg)
+        PDFRenderPool.draw(page, rotation: rotation, pageSize: pageSize, cg: cg)
         return true
     }
 
-    static func draw(_ page: CGPDFPage, rotation: Int, in target: CGRect, cg: CGContext) {
+    /// The PDF page as displayed (crop box turned by its own /Rotate), in PDF points: the `sourceSize` of
+    /// `PageRecord.backgroundTransform`.
+    static func displayedSize(_ page: CGPDFPage) -> CGSize {
         let box = page.getBoxRect(.cropBox)
-        guard box.width > 0, box.height > 0, target.width > 0, target.height > 0 else { return }
-        let extra = ((rotation % 360) + 360) % 360
-        let total = (Int(page.rotationAngle) + extra) % 360
-        let turned = total % 180 == 0 ? box.size : CGSize(width: box.height, height: box.width)
-        let fit = RenderGeometry.aspectFit(turned, in: target)
+        let own = ((Int(page.rotationAngle) % 360) + 360) % 360
+        return own % 180 == 0 ? box.size : CGSize(width: box.height, height: box.width)
+    }
+
+    static func draw(_ page: CGPDFPage, rotation: Int, pageSize: PageSize?, cg: CGContext) {
+        let shown = displayedSize(page)
+        guard shown.width > 0, shown.height > 0 else { return }
+        let placement = PageRecord.backgroundTransform(sourceSize: PageSize(Double(shown.width), Double(shown.height)),
+                                                       rotation: rotation, pageSize: pageSize)
+        let source = CGRect(origin: .zero, size: shown)
         cg.saveGState()
         defer { cg.restoreGState() }
-        cg.clip(to: fit)
-        // PDF space is y up: flip into the y-down page, then let CoreGraphics place the (rotated) crop box 1:1 in a
-        // rect of its own size and scale that onto the fitted target (getDrawingTransform never scales up).
-        cg.translateBy(x: fit.minX, y: fit.maxY)
-        cg.scaleBy(x: fit.width / turned.width, y: -fit.height / turned.height)
-        cg.concatenate(page.getDrawingTransform(.cropBox, rect: CGRect(origin: .zero, size: turned), rotate: Int32(extra),
-                                                preserveAspectRatio: true))
+        // Page points → the displayed PDF page (top-left origin, y down), then flipped to PDF space (y up), where
+        // CoreGraphics places the crop box and its /Rotate 1:1 in a rect of its own size.
+        cg.concatenate(placement.cg)
+        cg.clip(to: source)
+        cg.translateBy(x: 0, y: shown.height)
+        cg.scaleBy(x: 1, y: -1)
+        cg.concatenate(page.getDrawingTransform(.cropBox, rect: source, rotate: 0, preserveAspectRatio: true))
         cg.interpolationQuality = .high
         cg.drawPDFPage(page)
     }
@@ -80,19 +88,41 @@ final class PDFRenderPool {
     }
 }
 
+/// A decoded page-background image and the size of the source image it stands for.
+final class RasterBackground {
+    let image: CGImage
+    /// Pixel size of the original image, upright (EXIF orientation applied): the `sourceSize` of
+    /// `PageRecord.backgroundTransform`, so a downsampled image lands exactly where the original would.
+    let sourceSize: PageSize
+
+    init(image: CGImage, sourceSize: PageSize) {
+        self.image = image
+        self.sourceSize = sourceSize
+    }
+
+    /// Draws the image into page points (y down) where `PageRecord.backgroundTransform` puts it.
+    func draw(rotation: Int, pageSize: PageSize?, cg: CGContext) {
+        let placement = PageRecord.backgroundTransform(sourceSize: sourceSize, rotation: rotation, pageSize: pageSize)
+        cg.saveGState()
+        cg.concatenate(placement.cg)
+        PageCompositor.drawImage(image, in: CGRect(x: 0, y: 0, width: sourceSize.width, height: sourceSize.height), cg: cg)
+        cg.restoreGState()
+    }
+}
+
 /// Decoded page-background images (scans, imported pictures), downsampled to at most 4096 px on the long edge so a
 /// camera-sized image never costs its full decoded size in every tile.
 final class RasterBackgroundCache {
     static let maxPixelSize = 4096
-    private let cache = NSCache<NSString, CGImage>()
+    private let cache = NSCache<NSString, RasterBackground>()
 
     init() {
         cache.totalCostLimit = 96 << 20
     }
 
-    func image(_ ref: AssetRef, doc: DocumentID, assets: AssetStore?) -> CGImage? {
+    func image(_ ref: AssetRef, doc: DocumentID, assets: AssetStore?) -> RasterBackground? {
         let key = (doc.raw + "/" + ref.name) as NSString
-        if let image = cache.object(forKey: key) { return image }
+        if let raster = cache.object(forKey: key) { return raster }
         guard let data = try? assets?.data(ref, doc: doc),
               let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -100,8 +130,20 @@ final class RasterBackgroundCache {
                                         kCGImageSourceShouldCacheImmediately: true,
                                         kCGImageSourceThumbnailMaxPixelSize: RasterBackgroundCache.maxPixelSize]
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
-        cache.setObject(image, forKey: key, cost: image.bytesPerRow * image.height)
-        return image
+        let raster = RasterBackground(image: image, sourceSize: RasterBackgroundCache.sourceSize(source, decoded: image))
+        cache.setObject(raster, forKey: key, cost: image.bytesPerRow * image.height)
+        return raster
+    }
+
+    /// The original pixel size, upright; the decoded image's size when the file does not say.
+    static func sourceSize(_ source: CGImageSource, decoded: CGImage) -> PageSize {
+        let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        var w = (props?[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue ?? 0
+        var h = (props?[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue ?? 0
+        guard w > 0, h > 0 else { return PageSize(Double(decoded.width), Double(decoded.height)) }
+        // EXIF orientations 5–8 turn the image a quarter.
+        if let o = (props?[kCGImagePropertyOrientation] as? NSNumber)?.intValue, (5...8).contains(o) { swap(&w, &h) }
+        return PageSize(w, h)
     }
 
     func purge() {

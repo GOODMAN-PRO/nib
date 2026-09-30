@@ -4,24 +4,35 @@ import ImageIO
 import NibContracts
 
 /// Page thumbnails and previews (library grid, page sidebar): an in-memory `NSCache` in front of PNG files in
-/// `Caches/Nib/previews/<doc>/<page>/<maxRev>-<digest>-<px>.png`. Keys are made of the ids, the page's highest
-/// revision and an FNV-1a digest of every (id, rev) of the page record and its items (tombstones included), never
-/// Swift `Hasher` values, so a file stays valid across launches and any change produces a new key — including a
-/// merged remote record whose rev is older than the page's newest one. Writing a key removes the page's other files.
+/// `Caches/Nib/previews/<doc>/<page>/<rev>_<px>.png`. `rev` is the page's content revision: the newest of the page
+/// record's rev and `Workspace.contentRevision` (contracts-v2 G9), so a disk hit never loads the page's items when
+/// persistence knows that revision. Ids and revisions only, never Swift `Hasher` values, so a file stays valid across
+/// launches. Writing a key removes the page's other files. Next to them, `looks.txt` lists the registry entries the
+/// render used (`PageLooks` keys), so a template or drawer change after launch drops exactly the pages it affects.
+///
+/// A merged record older than the page's newest one does not move the content revision. The renderer drops the
+/// page's files when such a merge is committed (see `NibPageRenderer.invalidate(after:)`).
 final class ThumbnailCache {
     struct Key {
         let doc: DocumentID
         let page: PageID
         let rev: Rev
-        let digest: UInt64
         let size: Int
 
         var pageKey: String { TileCache.pageKey(doc, page) }
-        /// "<maxRev>-<digest>-": every file of this page content, whatever its size.
-        var contentPrefix: String { rev.description + "-" + String(format: "%016llx", digest) + "-" }
+        /// "<rev>_": every file of this page content, whatever its size.
+        var contentPrefix: String { rev.description + "_" }
         var memoryKey: String { pageKey + "|" + contentPrefix + String(size) }
         var fileName: String { contentPrefix + String(size) + ".png" }
     }
+
+    /// A thumbnail read back from disk, with the registry entries it was drawn with.
+    struct DiskHit {
+        let image: CGImage
+        let looks: Set<String>
+    }
+
+    static let looksFileName = "looks.txt"
 
     static var defaultDirectory: URL? {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
@@ -40,12 +51,14 @@ final class ThumbnailCache {
         memory.totalCostLimit = 48 << 20
     }
 
-    /// nil when there is no cache folder or an id is not a plain NibID (never a path outside the folder).
+    /// The page's folder; nil when there is no cache folder or an id is not a plain NibID (never a path outside it).
+    func folderURL(doc: DocumentID, page: PageID) -> URL? {
+        guard let dir = directory, NibID.isValid(doc.raw), NibID.isValid(page.raw) else { return nil }
+        return dir.appendingPathComponent(doc.raw, isDirectory: true).appendingPathComponent(page.raw, isDirectory: true)
+    }
+
     func fileURL(_ key: Key) -> URL? {
-        guard let dir = directory, NibID.isValid(key.doc.raw), NibID.isValid(key.page.raw) else { return nil }
-        return dir.appendingPathComponent(key.doc.raw, isDirectory: true)
-            .appendingPathComponent(key.page.raw, isDirectory: true)
-            .appendingPathComponent(key.fileName)
+        folderURL(doc: key.doc, page: key.page)?.appendingPathComponent(key.fileName)
     }
 
     func memoryImage(_ key: Key) -> CGImage? { memory.object(forKey: key.memoryKey as NSString) }
@@ -58,25 +71,53 @@ final class ThumbnailCache {
     }
 
     /// Disk read (render workers only).
-    func diskImage(_ key: Key) -> CGImage? {
-        fileURL(key).flatMap { PNGCodec.decode(url: $0) }
+    func diskImage(_ key: Key) -> DiskHit? {
+        guard let url = fileURL(key), let image = PNGCodec.decode(url: url) else { return nil }
+        return DiskHit(image: image, looks: ThumbnailCache.readLooks(url.deletingLastPathComponent()))
     }
 
-    /// Disk write (render workers only); older revisions of the page are removed.
-    func write(_ image: CGImage, _ key: Key) {
+    /// Disk write (the renderer's serial disk queue only); older revisions of the page are removed.
+    func write(_ image: CGImage, _ key: Key, looks: Set<String>) {
         guard let url = fileURL(key), let png = PNGCodec.encode(image) else { return }
         let fm = FileManager.default
         let folder = url.deletingLastPathComponent()
         do {
             try fm.createDirectory(at: folder, withIntermediateDirectories: true)
             try png.write(to: url, options: .atomic)
+            let list = looks.sorted().joined(separator: "\n")
+            try Data(list.utf8).write(to: folder.appendingPathComponent(ThumbnailCache.looksFileName), options: .atomic)
         } catch {
             return
         }
         let current = key.contentPrefix
-        for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] where !name.hasPrefix(current) {
+        for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
+        where !name.hasPrefix(current) && name != ThumbnailCache.looksFileName {
             try? fm.removeItem(at: folder.appendingPathComponent(name))
         }
+    }
+
+    /// Deletes every disk thumbnail of a page (the serial disk queue only).
+    func removeFiles(doc: DocumentID, page: PageID) {
+        guard let folder = folderURL(doc: doc, page: page) else { return }
+        try? FileManager.default.removeItem(at: folder)
+    }
+
+    /// Deletes the disk thumbnails of every page whose `looks.txt` names one of `keys` (the serial disk queue only).
+    /// Runs after a template or drawer changes once the app has started: a plugin or content pack, rare.
+    func removeFiles(dependingOn keys: Set<String>) {
+        guard let dir = directory, !keys.isEmpty else { return }
+        let fm = FileManager.default
+        for doc in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [] {
+            for page in (try? fm.contentsOfDirectory(at: doc, includingPropertiesForKeys: nil)) ?? []
+            where !ThumbnailCache.readLooks(page).isDisjoint(with: keys) {
+                try? fm.removeItem(at: page)
+            }
+        }
+    }
+
+    static func readLooks(_ folder: URL) -> Set<String> {
+        guard let data = try? Data(contentsOf: folder.appendingPathComponent(looksFileName)) else { return [] }
+        return Set(String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init))
     }
 
     func forget(pageKey: String) {
@@ -94,24 +135,46 @@ final class ThumbnailCache {
     }
 }
 
-/// FNV-1a 64: a content digest that is stable across launches and devices (Swift `Hasher` is seeded per process).
-struct FNV1a {
-    private(set) var value: UInt64 = 0xcbf2_9ce4_8422_2325
+/// The registry entries each page's renders depend on: its background template and the drawers of its items. A
+/// template or drawer registered, replaced or removed later (`RegistryChange.ids`, contracts-v2 G11) drops only the
+/// pages that use it. Keys are namespaced so a template id never matches a drawer key.
+final class PageLooks {
+    static func template(_ id: String) -> String { "t:" + id }
+    static func drawer(_ key: String) -> String { "d:" + key }
 
-    mutating func add(_ byte: UInt8) { value = (value ^ UInt64(byte)) &* 0x0000_0100_0000_01b3 }
-
-    mutating func add(_ s: String) {
-        for b in s.utf8 { add(b) }
-        add(UInt8(0))
+    private struct Entry {
+        var generation: TileCache.Generation
+        var keys: Set<String>
     }
 
-    mutating func add(_ n: UInt64) {
-        for shift in stride(from: 0, to: 64, by: 8) { add(UInt8(truncatingIfNeeded: n >> UInt64(shift))) }
+    private let lock = NSLock()
+    private var pages: [String: Entry] = [:]
+
+    /// Adds the keys of a render of `page` made at `generation`. `keys` is evaluated only when the page changed since
+    /// the last recorded render, so repeated tile requests do not rescan the page's items.
+    func record(_ page: String, generation: TileCache.Generation, _ keys: () -> Set<String>) {
+        lock.lock()
+        let known = pages[page]
+        lock.unlock()
+        guard known?.generation != generation else { return }
+        let fresh = keys()
+        lock.lock()
+        let merged = fresh.union(pages[page]?.keys ?? [])
+        pages[page] = Entry(generation: generation, keys: merged)
+        lock.unlock()
     }
 
-    mutating func add(_ r: Rev) {
-        add(r.wallMs)
-        add(UInt64(r.counter) << 32 | UInt64(r.device))
+    /// Pages known to use any of `keys`.
+    func pages(using keys: Set<String>) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return pages.compactMap { $0.value.keys.isDisjoint(with: keys) ? nil : $0.key }
+    }
+
+    func removeAll() {
+        lock.lock()
+        pages.removeAll()
+        lock.unlock()
     }
 }
 

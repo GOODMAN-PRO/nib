@@ -121,6 +121,13 @@ final class TileCache {
         index[page] = kept.isEmpty ? nil : kept
     }
 
+    /// Outdates every render already running (they cannot cache their tiles) without dropping cached tiles.
+    func outdate() {
+        lock.lock()
+        epoch += 1
+        lock.unlock()
+    }
+
     /// Drops every tile; renders already running cannot cache theirs.
     func removeAll() {
         lock.lock()
@@ -141,8 +148,6 @@ final class TileCache {
 // MARK: - Geometry
 
 enum RenderGeometry {
-    /// Room drawers may paint outside an item's bounds (shadows, labels): added to dirty rects and to culling.
-    static let drawerMargin = 12.0
     /// Largest bitmap one render may allocate (≈ 200 MB).
     static let maxPixels = 50_000_000.0
     /// Region of an empty infinite board.
@@ -183,13 +188,6 @@ enum RenderGeometry {
     static func isDark(_ paper: RGBA) -> Bool {
         (0.2126 * Double(paper.r) + 0.7152 * Double(paper.g) + 0.0722 * Double(paper.b)) / 255 < 0.5
     }
-
-    static func aspectFit(_ size: CGSize, in rect: CGRect) -> CGRect {
-        guard size.width > 0, size.height > 0 else { return rect }
-        let k = min(rect.width / size.width, rect.height / size.height)
-        let w = size.width * k, h = size.height * k
-        return CGRect(x: rect.midX - w / 2, y: rect.midY - h / 2, width: w, height: h)
-    }
 }
 
 // MARK: - Renderer
@@ -197,15 +195,20 @@ enum RenderGeometry {
 /// `PageRenderer` (ARCHITECTURE §9, §14). Model data is snapshotted on the main actor; compositing runs on an
 /// `OperationQueue` of at most three workers that touch only the snapshot, the captured `AssetStore` and the
 /// thread-safe content registries — never `NibApp` or `NibServices`. Cacheable requests are assembled from 512 px
-/// tiles; commits invalidate only the tiles under `Changeset.dirtyRect`; memory warnings purge every cache.
+/// tiles; commits invalidate only the tiles under the changed items' paint bounds; a template or drawer change drops
+/// only the pages that use it; memory warnings purge every cache. Thumbnail files are written and deleted on one
+/// serial queue, so a deletion never races a write of the same page.
 final class NibPageRenderer: PageRenderer {
     static let maxWorkers = 3
 
     private weak var app: NibApp?
     private let registries: ContentRegistries
     let queue = OperationQueue()
+    /// Thumbnail file writes and deletions, in order.
+    let disk = OperationQueue()
     let tiles = TileCache(costLimit: TileCache.defaultCostLimit)
     let thumbnails: ThumbnailCache
+    let looks = PageLooks()
     let pdf = PDFRenderPool()
     let rasters = RasterBackgroundCache()
     private var commitSubscription: EventSubscription?
@@ -219,18 +222,20 @@ final class NibPageRenderer: PageRenderer {
         queue.name = "app.nib.render"
         queue.maxConcurrentOperationCount = NibPageRenderer.maxWorkers
         queue.qualityOfService = .userInitiated
+        disk.name = "app.nib.render.previews"
+        disk.maxConcurrentOperationCount = 1
+        disk.qualityOfService = .utility
         commitSubscription = app.bus.observeCommits { [weak self] cs in self?.invalidate(after: cs) }
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil,
                                             queue: nil) { [weak self] _ in self?.purgeCaches() })
         // A drawer or template registered, replaced or removed later (plugins, content packs) changes how pages look.
-        let looks: [AnyObject] = [registries.drawers, registries.templates]
-        for registry in looks {
-            observers.append(center.addObserver(forName: .nibRegistryDidChange, object: registry, queue: nil) { [weak self] _ in
-                self?.tiles.removeAll()
-                self?.thumbnails.purgeMemory()
-            })
-        }
+        observers.append(center.addObserver(forName: .nibRegistryDidChange, object: registries.templates, queue: nil) {
+            [weak self] note in self?.registryChanged(note, key: PageLooks.template)
+        })
+        observers.append(center.addObserver(forName: .nibRegistryDidChange, object: registries.drawers, queue: nil) {
+            [weak self] note in self?.registryChanged(note, key: PageLooks.drawer)
+        })
     }
 
     deinit {
@@ -250,25 +255,30 @@ final class NibPageRenderer: PageRenderer {
     }
 
     func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? {
-        guard maxPixelSize > 0 else { return nil }
-        let request = RenderRequest(doc: doc, page: page, scale: 1, layers: Set(0..<NibLimits.layerCount))
-        guard let job = try? await snapshot(request, needsRev: true) else { return nil }
-        let key = ThumbnailCache.Key(doc: doc, page: page, rev: job.maxRev, digest: job.contentDigest, size: maxPixelSize)
+        guard maxPixelSize > 0, let probe = try? await thumbnailProbe(doc: doc, page: page) else { return nil }
+        let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: maxPixelSize)
         if let image = thumbnails.memoryImage(key) { return image }
-        if let image = try? await run({ self.thumbnails.diskImage(key) }) {
-            thumbnails.remember(image, key)
-            return image
+        // A disk hit counts only if nothing outdated the page (a commit, a template or drawer change) meanwhile.
+        if let hit = try? await run({ self.thumbnails.diskImage(key) }), tiles.generation(key.pageKey) == probe.generation {
+            looks.record(key.pageKey, generation: probe.generation) { hit.looks }
+            thumbnails.remember(hit.image, key)
+            return hit.image
         }
-        guard let region = try? await self.region(for: job),
+        var request = RenderRequest(doc: doc, page: page, scale: 1, layers: Set(0..<NibLimits.layerCount))
+        request.purpose = .thumbnail
+        guard let job = try? await snapshot(request),
+              let region = try? await self.region(for: job),
               let result = try? await produce(job, region: region, scale: Double(maxPixelSize) / max(region.width, region.height),
                                               marks: false) else { return nil }
         let image = result.image
+        // Shown either way; cached only when the page did not change while it rendered.
+        guard tiles.generation(key.pageKey) == probe.generation else { return image }
         thumbnails.remember(image, key)
-        queue.addOperation {
-            // Not persisted: a render the page changed under (or that a registry change outdated), or one missing
-            // a template or drawer that may be registered later.
-            guard self.tiles.generation(job.pageKey) == job.generation, job.isComplete else { return }
-            self.thumbnails.write(image, key)
+        disk.addOperation {
+            // Not persisted: a render the page changed under, or one missing a template or drawer that may be
+            // registered later.
+            guard self.tiles.generation(key.pageKey) == probe.generation, job.isComplete else { return }
+            self.thumbnails.write(image, key, looks: job.looks)
         }
         return image
     }
@@ -282,33 +292,96 @@ final class NibPageRenderer: PageRenderer {
     func purgeCaches() {
         tiles.removeAll()
         thumbnails.purgeMemory()
+        looks.removeAll()
         pdf.purge()
         rasters.purge()
     }
 
-    /// Commit observer: page records whose background, size or rotation changed are redrawn whole; item changes
-    /// drop only the tiles under their before/after bounds.
+    // MARK: Invalidation
+
+    private struct PageRef: Hashable {
+        let doc: DocumentID
+        let page: PageID
+    }
+
+    /// Commit observer: page records whose background, size or rotation changed are redrawn whole; item changes drop
+    /// only the tiles under the before and after paint bounds of each changed item (`ContentRegistries.paintBounds`).
+    /// A merged remote change also deletes the page's thumbnail files: a record another device wrote before this
+    /// device's newest edit does not move the page's content revision, so its key alone would not change.
     func invalidate(after cs: Changeset) {
+        var whole = Set<PageRef>()
+        var dirty: [PageRef: Rect] = [:]
         for m in cs.mutations {
-            guard case let .page(doc, before, after) = m else { continue }
-            if let b = before, b.background == after.background, b.size == after.size, b.rotation == after.rotation { continue }
-            invalidate(doc: doc, page: after.id, rect: nil)
-        }
-        for (doc, pages) in cs.itemPages {
-            for page in pages {
-                guard let dirty = cs.dirtyRect(doc: doc, page: page) else { continue }
-                invalidate(doc: doc, page: page, rect: dirty.insetBy(-RenderGeometry.drawerMargin))
+            switch m {
+            case let .page(doc, before, after):
+                if let b = before, b.background == after.background, b.size == after.size, b.rotation == after.rotation { continue }
+                whole.insert(PageRef(doc: doc, page: after.id))
+            case let .item(doc, page, before, after):
+                var r = registries.paintBounds(for: after)
+                if let b = before { r = r.union(registries.paintBounds(for: b)) }
+                let ref = PageRef(doc: doc, page: page)
+                dirty[ref] = dirty[ref].map { $0.union(r) } ?? r
+            default:
+                continue
             }
+        }
+        for ref in whole { invalidate(doc: ref.doc, page: ref.page, rect: nil) }
+        for (ref, rect) in dirty where !whole.contains(ref) { invalidate(doc: ref.doc, page: ref.page, rect: rect) }
+        guard case .sync = cs.principal else { return }
+        let touched = whole.union(dirty.keys)
+        disk.addOperation {
+            for ref in touched { self.thumbnails.removeFiles(doc: ref.doc, page: ref.page) }
+        }
+    }
+
+    /// A template or drawer was registered, replaced or removed (contracts-v2 G11). Renders already running are
+    /// outdated; the tiles and thumbnails of the pages known to use the changed ids are dropped. Once the app has
+    /// started (plugins, content packs, not launch registration) the thumbnail files of those pages go too, found
+    /// through the `looks.txt` written with each file.
+    private func registryChanged(_ note: Notification, key: (String) -> String) {
+        let keys = Set(RegistryChange.ids(note).map(key))
+        guard !keys.isEmpty else { return }
+        tiles.outdate()
+        for page in looks.pages(using: keys) {
+            tiles.invalidate(page: page, rect: nil)
+            thumbnails.forget(pageKey: page)
+        }
+        onMain { [weak self] in
+            guard let self = self, self.app?.isStarted == true else { return }
+            self.disk.addOperation { self.thumbnails.removeFiles(dependingOn: keys) }
+        }
+    }
+
+    /// Runs `body` on the main actor: at once when called there, else soon after.
+    private func onMain(_ body: @escaping @MainActor () -> Void) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { body() }
+        } else {
+            DispatchQueue.main.async { MainActor.assumeIsolated { body() } }
         }
     }
 
     // MARK: Snapshot (main actor)
 
+    /// The thumbnail key's revision (the newest of the page record's rev and the page's content revision) and the
+    /// page's tile-cache generation. The page's items are loaded only when persistence cannot say their revision.
+    @MainActor
+    func thumbnailProbe(doc: DocumentID, page: PageID) throws -> (rev: Rev, generation: TileCache.Generation) {
+        guard let app = app else { throw NibError.unavailable("page renderer") }
+        guard let record = try app.workspace.content(doc).page(page) else {
+            throw NibError.notFound("page \(page.raw) in document \(doc.raw)")
+        }
+        let generation = tiles.generation(TileCache.pageKey(doc, page))
+        let itemsRev = try app.workspace.contentRevision(doc, page: page)
+            ?? app.workspace.allItems(doc, page: page).map { $0.rev }.max() ?? .zero
+        return (max(record.rev, itemsRev), generation)
+    }
+
     /// Everything a worker needs, captured on the main actor: the page record, its z-ordered items (the workspace's
     /// own array, shared copy-on-write — filtering and culling happen off-main), the resolved template, the PDF URL
     /// and the asset store.
     @MainActor
-    func snapshot(_ request: RenderRequest, needsRev: Bool = false) throws -> RenderJob {
+    func snapshot(_ request: RenderRequest) throws -> RenderJob {
         guard let app = app else { throw NibError.unavailable("page renderer") }
         let content = try app.workspace.content(request.doc)
         guard let page = content.page(request.page) else {
@@ -318,37 +391,26 @@ final class NibPageRenderer: PageRenderer {
         let layers = request.layers ?? RenderGeometry.visibleLayers(app.services.sessions.active, doc: request.doc)
         var template: TemplateSource?
         if page.background.kind == .template, let ref = page.background.template, let def = registries.template(ref) {
-            template = TemplateSource(render: def.render, params: def.defaults.merging(ref.params) { $1 })
+            template = TemplateSource(definition: def, params: def.defaults.merging(ref.params) { $1 })
         }
         let assets = app.services.assets
         var pdfURL: URL?
         if page.background.kind == .pdf, let ref = page.background.asset { pdfURL = assets?.url(ref, doc: request.doc) }
-        var maxRev = page.rev
-        var digest = FNV1a()
-        if needsRev {
-            digest.add(page.id.raw)
-            digest.add(page.rev)
-            for item in items {
-                if item.rev > maxRev { maxRev = item.rev }
-                digest.add(item.id.raw)
-                digest.add(item.rev)
-            }
-        }
         let animating = request.replay.map { $0.mode != .showAll } ?? false
         var variant: String?
         if request.hidden.isEmpty && !animating {
-            var parts = ["L" + layers.sorted().map { String($0) }.joined(separator: ",")]
+            var parts = ["L" + layers.sorted().map { String($0) }.joined(separator: ","), request.purpose.rawValue]
             if request.background { parts.append("bg") }
-            if request.annotations { parts.append("ink") }
+            if request.annotations { parts.append("ann") }
             variant = parts.joined(separator: "+")
         }
         let pageKey = TileCache.pageKey(request.doc, request.page)
         return RenderJob(doc: request.doc, page: request.page, size: page.size, rotation: page.rotation,
                          background: page.background, drawBackground: request.background, template: template,
                          pdfURL: pdfURL, allItems: items, layers: layers, hidden: request.hidden,
-                         annotations: request.annotations, replay: request.replay, requestedRegion: request.region,
-                         assets: assets, registries: registries, pdf: pdf, rasters: rasters, variant: variant,
-                         generation: tiles.generation(pageKey), maxRev: maxRev, contentDigest: needsRev ? digest.value : 0)
+                         annotations: request.annotations, replay: request.replay, purpose: request.purpose,
+                         requestedRegion: request.region, assets: assets, registries: registries, pdf: pdf,
+                         rasters: rasters, variant: variant, generation: tiles.generation(pageKey))
     }
 
     // MARK: Workers
@@ -376,7 +438,7 @@ final class NibPageRenderer: PageRenderer {
 
     private func region(for job: RenderJob) async throws -> Rect {
         if let r = job.requestedRegion ?? job.pageRect { return r }
-        return try await run { RenderGeometry.defaultRegion(size: nil, bounds: job.visibleBounds.map { $0.bounds }) }
+        return try await run { RenderGeometry.defaultRegion(size: nil, bounds: job.visible.map { $0.bounds }) }
     }
 
     private struct Composite {
@@ -392,11 +454,12 @@ final class NibPageRenderer: PageRenderer {
             throw NibError(.invalidParams, "a render of this region at \(scale) px/pt would be too large", path: "$.scale",
                            hint: "lower the scale or pass a smaller region")
         }
+        looks.record(job.pageKey, generation: job.generation) { job.looks }
         var composite = try await composeFromTiles(job, region: region, scale: scale, width: px.width, height: px.height,
                                                    wantMarks: wantMarks)
         if composite == nil {
             composite = try await run {
-                let marks = wantMarks ? SetOfMarks.number(job.visibleBounds, doc: job.doc, page: job.page, region: region) : []
+                let marks = wantMarks ? SetOfMarks.number(job.visible, doc: job.doc, page: job.page, region: region) : []
                 return Composite(image: PageCompositor.image(job, region: region, scale: scale, width: px.width,
                                                              height: px.height, marks: marks),
                                  marks: marks)
@@ -437,7 +500,7 @@ final class NibPageRenderer: PageRenderer {
         }
         let placed = coords.compactMap { c in images[c].map { (rect: TileGrid.rect(c, level: level), image: $0) } }
         return try await run {
-            let marks = wantMarks ? SetOfMarks.number(job.visibleBounds, doc: job.doc, page: job.page, region: region) : []
+            let marks = wantMarks ? SetOfMarks.number(job.visible, doc: job.doc, page: job.page, region: region) : []
             return Composite(image: PageCompositor.assemble(placed, region: region, scale: scale, width: width,
                                                             height: height, marks: marks),
                              marks: marks)

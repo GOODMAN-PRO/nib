@@ -82,9 +82,10 @@ struct RenderPage: NibCommand {
                 RenderGeometry.defaultRegion(size: nil, bounds: items.compactMap { layers.contains($0.layer) ? $0.bounds : nil })
             }.value
         }
-        let result = try await renderer.render(RenderRequest(
-            doc: doc, page: pageID, region: region, scale: cappedScale(requested, region: region), layers: layers,
-            background: p.background ?? true, marks: p.marks ?? false))
+        var request = RenderRequest(doc: doc, page: pageID, region: region, scale: cappedScale(requested, region: region),
+                                    layers: layers, background: p.background ?? true, marks: p.marks ?? false)
+        request.purpose = .query
+        let result = try await renderer.render(request)
         let image = result.image
         // PNG encoding and the temporary file write stay off the main actor.
         let name = try await Task.detached(priority: .userInitiated) { () throws -> String in

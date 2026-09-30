@@ -243,14 +243,13 @@ final class NibRenderTests: XCTestCase {
 
     func testCommitInvalidatesOnlyTheDirtyTiles() async throws {
         let h = Harness(features: [NibRenderFeature.self])
-        h.app.commands.register(PutStroke.self)
         let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
         let key = TileCache.pageKey(Fixtures.docID, Fixtures.page2)
 
         _ = try await renderer.render(RenderRequest(doc: Fixtures.docID, page: Fixtures.page2, scale: 1))
         XCTAssertEqual(renderer.tiles.count(page: key), 4, "an A4 page at 1 px/pt is 2 × 2 tiles of 512 pt")
 
-        try await h.run("test.putStroke", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
+        try await h.insert([shortStroke()], page: Fixtures.page2)
         XCTAssertEqual(renderer.tiles.count(page: key), 3, "only the top-left tile holds the new stroke")
 
         renderer.invalidate(doc: Fixtures.docID, page: Fixtures.page2, rect: nil)
@@ -259,11 +258,36 @@ final class NibRenderTests: XCTestCase {
         _ = try await renderer.render(RenderRequest(doc: Fixtures.docID, page: Fixtures.page2, scale: 1))
         XCTAssertEqual(renderer.tiles.count(page: key), 4)
         h.app.content.drawers.register(ItemDrawerEntry(key: ItemKind.sticky.rawValue, owner: "test", drawer: SolidBoxDrawer()))
-        XCTAssertEqual(renderer.tiles.count(page: key), 0, "a new drawer changes how pages look")
+        XCTAssertEqual(renderer.tiles.count(page: key), 4, "page 2 holds no sticky note, so a sticky drawer leaves it")
+        h.app.content.templates.register(paperTemplate("builtin.ruled", paper: .paperYellow))
+        XCTAssertEqual(renderer.tiles.count(page: key), 0, "page 2's own template changed how it looks")
 
         _ = try await renderer.render(RenderRequest(doc: Fixtures.docID, page: Fixtures.page2, scale: 1))
         renderer.purgeCaches()
         XCTAssertEqual(renderer.tiles.count(page: key), 0)
+    }
+
+    func testPaintBoundsDecideCullingAndInvalidation() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        h.app.content.drawers.register(ItemDrawerEntry(key: "custom.test.far", owner: "test", drawer: FarDrawer()))
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        let far = Item.makeCustom(CustomItem(owner: "test", type: "far", frame: Frame(x: 20, y: 20, w: 40, h: 40)))
+        let (doc, page) = try makePage(h, items: [far], size: PageSize(600, 200))
+
+        // 600 pt at 2 px/pt is three 256 pt tiles; the paint bounds (20…260) reach into the second one.
+        let key = TileCache.pageKey(doc, page)
+        _ = try await renderer.render(RenderRequest(doc: doc, page: page, scale: 2))
+        XCTAssertEqual(renderer.tiles.count(page: key), 3)
+        var moved = try h.app.workspace.allItems(doc, page: page)[0]
+        moved.custom?.frame.y = 22
+        try await h.insert([moved], page: page, doc: doc)
+        XCTAssertEqual(renderer.tiles.count(page: key), 1, "tiles under the old and new paint bounds are dropped")
+
+        // The drawer paints at x 160…200, far outside the item's bounds (20…60) and their 12 pt margin but inside its
+        // paint bounds; at 4 px/pt that region is the tile at x 128…256, which the item's bounds never reach.
+        let r = try await renderer.render(RenderRequest(doc: doc, page: page, region: Rect(x: 140, y: 0, width: 100, height: 100),
+                                                        scale: 4))
+        XCTAssertLessThan(rgb(bitmap(r.image), 160, 170).r, 60, "an item is drawn wherever its paint bounds reach")
     }
 
     func testTileCacheRefusesTilesRenderedBeforeAnInvalidation() throws {
@@ -326,51 +350,222 @@ final class NibRenderTests: XCTestCase {
 
         let file = try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 160))
         XCTAssertTrue(file.path.contains("Nib/previews/\(doc.raw)/\(page.raw)/"))
-        try await waitForFile(file)
+        await diskSettled(renderer)
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: file.deletingLastPathComponent().appendingPathComponent(ThumbnailCache.looksFileName).path))
 
         renderer.purgeCaches()
         let reloaded = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 160)
         XCTAssertEqual(reloaded?.height, 133)
-        XCTAssertNil(renderer.thumbnails.fileURL(ThumbnailCache.Key(doc: "../x", page: page, rev: .zero, digest: 0, size: 1)))
+        XCTAssertNil(renderer.thumbnails.fileURL(ThumbnailCache.Key(doc: "../x", page: page, rev: .zero, size: 1)))
 
         // Fixture page 1 lacks its template and most item drawers in this harness: shown, but never persisted.
         let partialFile = try XCTUnwrap(thumbnailFile(renderer, Fixtures.docID, Fixtures.page1, size: 160))
         try? FileManager.default.removeItem(at: partialFile)
         let partial = await renderer.thumbnail(doc: Fixtures.docID, page: Fixtures.page1, maxPixelSize: 160)
         XCTAssertEqual(partial?.height, 160)
-        try await Task.sleep(nanoseconds: 300_000_000)
+        await diskSettled(renderer)
         XCTAssertFalse(FileManager.default.fileExists(atPath: partialFile.path))
+    }
+
+    func testThumbnailDiskHitDoesNotLoadThePageWhenPersistenceKnowsItsRevision() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        let ink = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 20, y: 20), StrokePoint(x: 200, y: 180)]))
+        let (doc, page) = try makePage(h, items: [ink])
+        let firstThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
+        let first = try XCTUnwrap(firstThumb)
+        await diskSettled(renderer)
+
+        let counting = CountingPersistence(base: h.persistence)
+        h.app.workspace.close(doc)
+        h.app.workspace.persistence = counting
+        renderer.purgeCaches()
+        let fromDiskThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
+        let fromDisk = try XCTUnwrap(fromDiskThumb)
+        XCTAssertEqual(counting.itemLoads, 0, "the content revision came from persistence")
+        XCTAssertFalse(h.app.workspace.isPageCached(doc, page: page))
+        XCTAssertEqual(bitmap(fromDisk).bytes, bitmap(first).bytes)
+
+        // Without a revision from persistence the page is loaded to find it (and the disk file still serves).
+        counting.knowsRevisions = false
+        h.app.workspace.close(doc)
+        renderer.purgeCaches()
+        let loadedThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 100)
+        XCTAssertNotNil(loadedThumb)
+        XCTAssertEqual(counting.itemLoads, 1)
     }
 
     func testThumbnailFollowsCommitsAndMergesOfOlderRevisions() async throws {
         let h = Harness(features: [NibRenderFeature.self])
-        h.app.commands.register(PutStroke.self)
         let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
         let (doc, page) = try makePage(h, items: [])
         let blankThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 120)
         let blank = try XCTUnwrap(blankThumb)
 
-        try await h.run("test.putStroke", ["page": .string(NodeRef.page(doc, page).description)])
+        try await h.insert([shortStroke()], page: page, doc: doc)
         let editedThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 120)
         let edited = try XCTUnwrap(editedThumb)
         XCTAssertNotEqual(bitmap(edited).bytes, bitmap(blank).bytes, "a commit re-renders the thumbnail")
         let editedFile = try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 120))
-        try await waitForFile(editedFile)
-        let newest = try renderer.snapshot(RenderRequest(doc: doc, page: page, scale: 1), needsRev: true).maxRev
+        await diskSettled(renderer)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: editedFile.path))
+        let newest = try renderer.thumbnailProbe(doc: doc, page: page).rev
 
         // Ink another device wrote offline before the local edit: merged, yet the page's newest rev does not move.
         var remote = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 20, y: 150), StrokePoint(x: 220, y: 150)]))
         remote.rev = Rev(wallMs: 5, counter: 0, device: 8)
         let merged = h.app.bus.applyRemote(DocumentPatch(doc: doc, items: [page.raw: [remote]]), origin: "device-8")
         XCTAssertFalse(merged.isEmpty)
-        XCTAssertEqual(try renderer.snapshot(RenderRequest(doc: doc, page: page, scale: 1), needsRev: true).maxRev, newest)
+        XCTAssertEqual(try renderer.thumbnailProbe(doc: doc, page: page).rev, newest)
+        await diskSettled(renderer)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: editedFile.path), "the merge deleted the stale file")
 
-        renderer.purgeCaches()
         let syncedThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 120)
         let synced = try XCTUnwrap(syncedThumb)
-        XCTAssertNotEqual(bitmap(synced).bytes, bitmap(edited).bytes, "the merged ink shows, not the stale disk file")
-        XCTAssertNotEqual(try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 120)), editedFile)
+        XCTAssertNotEqual(bitmap(synced).bytes, bitmap(edited).bytes, "the merged ink shows, not the stale file")
+        await diskSettled(renderer)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: editedFile.path), "rewritten with the merged ink")
+    }
+
+    func testTemplateChangeDropsOnlyThePagesUsingItAndTheirFilesOnceStarted() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
+        h.app.content.templates.register(paperTemplate("test.paper", paper: .white))
+        let ink = Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 20, y: 20), StrokePoint(x: 200, y: 180)]))
+        let (doc, page) = try makePage(h, items: [ink], background: .ofTemplate("test.paper"))
+        let (otherDoc, otherPage) = try makePage(h, items: [ink])
+        let whiteThumb = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 120)
+        XCTAssertGreaterThan(rgb(bitmap(try XCTUnwrap(whiteThumb)), 110, 10).b, 240)
+        _ = await renderer.thumbnail(doc: otherDoc, page: otherPage, maxPixelSize: 120)
+        await diskSettled(renderer)
+        let file = try XCTUnwrap(thumbnailFile(renderer, doc, page, size: 120))
+        let otherFile = try XCTUnwrap(thumbnailFile(renderer, otherDoc, otherPage, size: 120))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertEqual(ThumbnailCache.readLooks(file.deletingLastPathComponent()), [PageLooks.template("test.paper")])
+        let key = TileCache.pageKey(doc, page), otherKey = TileCache.pageKey(otherDoc, otherPage)
+        XCTAssertGreaterThan(renderer.tiles.count(page: key), 0)
+        XCTAssertGreaterThan(renderer.tiles.count(page: otherKey), 0)
+
+        // Launch registration (before the app started) redraws the page but leaves the files alone.
+        h.app.content.templates.register(paperTemplate("test.paper", paper: .paperYellow))
+        XCTAssertEqual(renderer.tiles.count(page: key), 0)
+        XCTAssertGreaterThan(renderer.tiles.count(page: otherKey), 0, "a page on colour paper does not use the template")
+        await diskSettled(renderer)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+        let yellow = try await renderer.render(RenderRequest(doc: doc, page: page, scale: 0.5))
+        XCTAssertLessThan(rgb(bitmap(yellow.image), 110, 10).b, 240, "tiles re-rendered on the new paper")
+
+        // Once started (a plugin or content pack), the files of the pages using a changed template go too.
+        await h.app.start([NibRenderFeature.self])
+        h.app.content.drawers.register(ItemDrawerEntry(key: "test.unused", owner: "test", drawer: SolidBoxDrawer()))
+        await diskSettled(renderer)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "an unrelated drawer changes nothing")
+        h.app.content.templates.unregister(id: "test.paper")
+        await diskSettled(renderer)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: otherFile.path))
+        XCTAssertGreaterThan(renderer.tiles.count(page: otherKey), 0)
+    }
+
+    // MARK: Drawers and templates (contracts-v2)
+
+    func testDrawersGetThePurposeAnnotationsAndPaper() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let recorder = RecordingDrawer()
+        h.app.content.drawers.register(ItemDrawerEntry(key: "custom.test.rec", owner: "test", drawer: recorder))
+        let renderer = try XCTUnwrap(h.app.services.renderer)
+        let item = Item.makeCustom(CustomItem(owner: "test", type: "rec", frame: Frame(x: 20, y: 20, w: 40, h: 40)))
+        let (doc, page) = try makePage(h, items: [item], background: .ofColor(.paperYellow))
+
+        _ = try await renderer.render(RenderRequest(doc: doc, page: page, scale: 1, annotations: false))
+        let screen = try XCTUnwrap(recorder.last, "annotations: false still draws the items")
+        XCTAssertEqual(screen.purpose, .screen)
+        XCTAssertFalse(screen.annotations)
+        XCTAssertEqual(screen.paper, .paperYellow)
+
+        try await h.run("render.page", ["page": .string(NodeRef.page(doc, page).description)])
+        XCTAssertEqual(recorder.last?.purpose, .query)
+        XCTAssertEqual(recorder.last?.annotations, true)
+
+        _ = await renderer.thumbnail(doc: doc, page: page, maxPixelSize: 64)
+        XCTAssertEqual(recorder.last?.purpose, .thumbnail)
+    }
+
+    func testBoardTemplatesRepeatAtTheirPeriodOrRenderTheirRegion() async throws {
+        XCTAssertEqual(DisplayListRenderer.boardFrame(region: Rect(x: 260, y: -30, width: 80, height: 40),
+                                                      period: PageSize(50, 50)).origin, Point(250, -50))
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer)
+
+        // A render-only template that repeats every 50 pt: vertical lines at x = 50, 100, … of its frame.
+        var lines = TemplateDefinition(id: "test.lines", title: "Lines", category: "Test", owner: "test") { _, size, _ in
+            TemplateRender(paper: .white, display: DisplayList(ops: [
+                DisplayOp(op: .vlines, rect: Rect(x: 0, y: 0, width: size.width, height: size.height), stroke: .black,
+                          width: 2, spacing: 50)]))
+        }
+        lines.metricsProvider = { _, _ in TemplateMetrics(spacing: 50, repeatPeriod: PageSize(50, 50)) }
+        h.app.content.templates.register(lines)
+        let (board, boardPage) = try makePage(h, items: [], size: nil, background: .ofTemplate("test.lines"))
+        // The tile at x 512…1024 lays the template out from x = 500 (a multiple of 50), so its lines fall at 550, 600 …
+        // A 240 pt block would start at 480 and put them at 530, 580 …, off the board's 50 pt grid.
+        let r = try await renderer.render(RenderRequest(doc: board, page: boardPage,
+                                                        region: Rect(x: 520, y: 0, width: 80, height: 40), scale: 1))
+        let bmp = bitmap(r.image)
+        XCTAssertLessThan(rgb(bmp, 30, 20).r, 128, "the line at x = 550 lies on the grid anchored at the board origin")
+        XCTAssertGreaterThan(rgb(bmp, 10, 20).r, 200, "no line at x = 530")
+        XCTAssertGreaterThan(rgb(bmp, 60, 20).r, 200, "no line at x = 580")
+
+        // A template with renderRegion gets each tile's own rect: world rects on boards, page rects on pages.
+        let log = RegionLog()
+        var regional = TemplateDefinition(id: "test.regional", title: "Regional", category: "Test", owner: "test") { _, _, _ in
+            log.add(nil, PageSize(0, 0))
+            return TemplateRender(paper: .white)
+        }
+        regional.renderRegion = { _, size, _, region in
+            log.add(region, size)
+            return TemplateRender(paper: .white)
+        }
+        h.app.content.templates.register(regional)
+        let tile = TileGrid.rect(TileCoord(col: 1, row: -1), level: 0)
+        let (regionBoard, regionBoardPage) = try makePage(h, items: [], size: nil, background: .ofTemplate("test.regional"))
+        _ = try await renderer.render(RenderRequest(doc: regionBoard, page: regionBoardPage, region: tile, scale: 1))
+        XCTAssertEqual(log.calls.map { $0.region }, [tile])
+        XCTAssertEqual(log.calls.first?.size, PageSize(512, 512))
+
+        log.reset()
+        let (doc, page) = try makePage(h, items: [], background: .ofTemplate("test.regional"))
+        let pageTile = TileGrid.rect(TileCoord(col: 0, row: 0), level: 1)
+        _ = try await renderer.render(RenderRequest(doc: doc, page: page, region: pageTile, scale: 2))
+        XCTAssertEqual(log.calls.map { $0.region }, [pageTile])
+        XCTAssertEqual(log.calls.first?.size, PageSize(240, 200), "pages pass their own size")
+    }
+
+    func testRotatedBackgroundsFollowPageRecordBackgroundTransform() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer)
+
+        // The fixture PDF (A4 portrait, text at (72, 72)) on a landscape page turned 90° clockwise: the text now runs
+        // down the right-hand side near the top.
+        let (pdfDoc, pdfPage) = try makePage(h, items: [], size: PageSize(841.89, 595.28),
+                                             background: .ofPDF(Fixtures.pdfAsset, page: 0), rotation: 90)
+        h.assets.install(Fixtures.pdfData(), as: Fixtures.pdfAsset, doc: pdfDoc)
+        let pdf = bitmap(try await renderer.render(RenderRequest(doc: pdfDoc, page: pdfPage, scale: 1)).image)
+        XCTAssertGreaterThan(darkPixels(pdf, x: 740..<780, y: 66..<220), 0, "text turned to the right edge")
+        XCTAssertEqual(darkPixels(pdf, x: 66..<260, y: 66..<100), 0, "nothing where the unturned text was")
+
+        // A 20 × 10 image, red left and blue right, turned 90° clockwise onto a 100 × 200 page: red on top.
+        let png = try XCTUnwrap(twoColourPNG())
+        let ref = AssetRef("two-colour.png")
+        let (imageDoc, imagePage) = try makePage(h, items: [], size: PageSize(100, 200), background: .ofImage(ref),
+                                                 rotation: 90)
+        h.assets.install(png, as: ref, doc: imageDoc)
+        let turned = bitmap(try await renderer.render(RenderRequest(doc: imageDoc, page: imagePage, scale: 1)).image)
+        XCTAssertGreaterThan(rgb(turned, 50, 50).r, 200)
+        XCTAssertLessThan(rgb(turned, 50, 50).b, 60)
+        XCTAssertGreaterThan(rgb(turned, 50, 150).b, 200)
+        XCTAssertLessThan(rgb(turned, 50, 150).r, 60)
     }
 
     // MARK: Performance
@@ -404,12 +599,14 @@ final class NibRenderTests: XCTestCase {
 
     // MARK: Helpers
 
-    /// A new one-page notebook holding `items` (z in array order) on a colour background (no template needed).
-    private func makePage(_ h: Harness, items: [Item], size: PageSize = PageSize(240, 200),
-                          background: Background = .ofColor(.white)) throws -> (DocumentID, PageID) {
+    /// A new one-page notebook holding `items` (z in array order), written straight to persistence so the page is not
+    /// in memory until something reads it. Colour background by default (no template needed); `size` nil = a board.
+    private func makePage(_ h: Harness, items: [Item], size: PageSize? = PageSize(240, 200),
+                          background: Background = .ofColor(.white), rotation: Int = 0) throws -> (DocumentID, PageID) {
         let doc = NibID.make(), page = NibID.make()
-        let content = DocumentContent(meta: DocumentMeta(id: doc, kind: .notebook),
-                                      pages: [PageRecord(id: page, order: "V", size: size, background: background)])
+        let content = DocumentContent(meta: DocumentMeta(id: doc, kind: size == nil ? .whiteboard : .notebook),
+                                      pages: [PageRecord(id: page, order: "V", size: size, background: background,
+                                                         rotation: rotation)])
         _ = try h.library.createDocument(content, title: "Render " + doc.raw, in: nil)
         let z = FractionalIndex.sequence(after: nil, count: items.count)
         var ordered: [Item] = []
@@ -424,17 +621,35 @@ final class NibRenderTests: XCTestCase {
 
     /// Where the page's current thumbnail of `size` px lives on disk.
     private func thumbnailFile(_ renderer: NibPageRenderer, _ doc: DocumentID, _ page: PageID, size: Int) throws -> URL? {
-        let job = try renderer.snapshot(RenderRequest(doc: doc, page: page, scale: 1), needsRev: true)
-        let key = ThumbnailCache.Key(doc: doc, page: page, rev: job.maxRev, digest: job.contentDigest, size: size)
-        XCTAssertTrue(key.fileName.hasPrefix(job.maxRev.description + "-"))
+        let probe = try renderer.thumbnailProbe(doc: doc, page: page)
+        let key = ThumbnailCache.Key(doc: doc, page: page, rev: probe.rev, size: size)
+        XCTAssertTrue(key.fileName.hasPrefix(probe.rev.description + "_"))
         return renderer.thumbnails.fileURL(key)
     }
 
-    /// Thumbnail files are written by a render worker after `thumbnail` returns.
-    private func waitForFile(_ url: URL) async throws {
-        for _ in 0..<60 where !FileManager.default.fileExists(atPath: url.path) {
-            try await Task.sleep(nanoseconds: 50_000_000)
+    /// Waits for the thumbnail file writes and deletions queued so far (the renderer's disk queue is serial).
+    private func diskSettled(_ renderer: NibPageRenderer) async {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            renderer.disk.addBarrierBlock { done.resume() }
         }
+    }
+
+    private func shortStroke() -> Item {
+        Item.makeStroke(Stroke(style: .defaultPen, points: [StrokePoint(x: 20, y: 15), StrokePoint(x: 40, y: 15)]))
+    }
+
+    private func paperTemplate(_ id: String, paper: RGBA) -> TemplateDefinition {
+        TemplateDefinition(id: id, title: "Test Paper", category: "Test", owner: "test") { _, _, _ in TemplateRender(paper: paper) }
+    }
+
+    /// A 20 × 10 px PNG: red on the left half, blue on the right.
+    private func twoColourPNG() -> Data? {
+        guard let cg = PageCompositor.makeContext(width: 20, height: 10) else { return nil }
+        cg.setFillColor(UIColor.red.cgColor)
+        cg.fill(CGRect(x: 0, y: 0, width: 10, height: 10))
+        cg.setFillColor(UIColor.blue.cgColor)
+        cg.fill(CGRect(x: 10, y: 0, width: 10, height: 10))
+        return cg.makeImage().flatMap { PNGCodec.encode($0) }
     }
 
     private func png(_ h: Harness, _ out: JSONValue) -> CGImage? {
@@ -484,16 +699,100 @@ private final class SolidBoxDrawer: ItemDrawer {
     }
 }
 
-/// Test-only edit command: commits one short pen stroke near the page's top-left corner.
-private struct PutStroke: NibCommand {
-    struct Params: Codable { var page: String }
-    static let descriptor = CommandDescriptor(id: "test.putStroke", title: "Put Stroke", summary: "Test helper.",
-                                              params: .obj(["page": .ref], required: ["page"]), effect: .edit)
+/// Paints a black box 100 pt to the right of its item, and says so through `paintBounds`.
+private final class FarDrawer: ItemDrawer {
+    func draw(_ item: Item, in context: DrawContext) {
+        guard let f = item.frame else { return }
+        context.cg.setFillColor(UIColor.black.cgColor)
+        context.cg.fill(CGRect(x: f.x + f.w + 100, y: f.y, width: 40, height: f.h))
+    }
 
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
-        guard case let .page(doc, page)? = NodeRef(p.page) else { throw NibError.invalid("expected a page ref", path: "$.page") }
-        let stroke = Stroke(style: .defaultPen, points: [StrokePoint(x: 20, y: 15), StrokePoint(x: 40, y: 15)])
-        try ctx.mutate { tx in _ = try tx.put(Item.makeStroke(stroke), doc: doc, page: page) }
-        return NoResult()
+    func paintBounds(_ item: Item) -> Rect? {
+        item.frame.map { Rect(x: $0.x, y: $0.y, width: $0.w + 200, height: $0.h) }
+    }
+}
+
+/// Records the context of every draw (render workers call it concurrently).
+private final class RecordingDrawer: ItemDrawer {
+    struct Seen {
+        var purpose: DrawPurpose
+        var annotations: Bool
+        var paper: RGBA?
+    }
+
+    private let lock = NSLock()
+    private var seen: [Seen] = []
+
+    var last: Seen? {
+        lock.lock()
+        defer { lock.unlock() }
+        return seen.last
+    }
+
+    func draw(_ item: Item, in context: DrawContext) {
+        lock.lock()
+        seen.append(Seen(purpose: context.purpose, annotations: context.annotations, paper: context.paper))
+        lock.unlock()
+    }
+}
+
+/// Calls of a template's `render` (region nil) and `renderRegion`, from render workers.
+private final class RegionLog: @unchecked Sendable {
+    struct Call {
+        var region: Rect?
+        var size: PageSize
+    }
+
+    private let lock = NSLock()
+    private var list: [Call] = []
+
+    var calls: [Call] {
+        lock.lock()
+        defer { lock.unlock() }
+        return list
+    }
+
+    func add(_ region: Rect?, _ size: PageSize) {
+        lock.lock()
+        list.append(Call(region: region, size: size))
+        lock.unlock()
+    }
+
+    func reset() {
+        lock.lock()
+        list.removeAll()
+        lock.unlock()
+    }
+}
+
+/// `InMemoryPersistence` that can report page content revisions without loading items, and counts item loads.
+@MainActor
+private final class CountingPersistence: DocumentPersistence {
+    let base: InMemoryPersistence
+    var knowsRevisions = true
+    private(set) var itemLoads = 0
+
+    init(base: InMemoryPersistence) {
+        self.base = base
+    }
+
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent { try base.loadHead(doc) }
+
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] {
+        itemLoads += 1
+        return try base.loadItems(doc, page: page)
+    }
+
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        base.didChange(doc, head: head, pages: pages)
+    }
+
+    func flush(_ doc: DocumentID) { base.flush(doc) }
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { try base.remoteChanges(doc) }
+
+    func contentRevision(_ doc: DocumentID, page: PageID) -> Rev? {
+        guard knowsRevisions, let items = base.pageItems[doc]?[page] else { return nil }
+        return items.map { $0.rev }.max() ?? .zero
     }
 }
