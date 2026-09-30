@@ -52,7 +52,7 @@ struct DropletModifier: ViewModifier {
                             bondsWith: bondsWith, onDrag: onDrag, field: field, node: field.node(id),
                             namespace: namespace, bud: bud)
         } else {
-            content.nibGlass(style.glassKind, cornerRadius: style.cornerRadius)
+            content.nibGlass(style.glassKind, cornerRadius: style.cornerRadius, interactive: style.isInteractive)
         }
     }
 }
@@ -165,15 +165,12 @@ struct FrameRim: View {
     let presentation: DropletPresentation
 
     var body: some View {
-        let shape = NibDropletShape(cornerRadius: presentation.cornerRadius)
-        ZStack {
-            shape.stroke(NibColor.waterLine, lineWidth: 0.8)
-            NibWaterRimLayer(cornerRadius: presentation.cornerRadius, rimOnly: true)
-        }
-        .frame(width: max(0, presentation.bodySize.width), height: max(0, presentation.bodySize.height))
-        .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
+        // The rim layer draws the 0.8 pt outline itself: no second stroke (DESIGN.md §10.9).
+        NibWaterRimLayer(cornerRadius: presentation.cornerRadius, rimOnly: true, strength: presentation.rim)
+            .frame(width: max(0, presentation.bodySize.width), height: max(0, presentation.bodySize.height))
+            .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
 
@@ -213,8 +210,11 @@ struct GlassBody: View {
             .glassEffect(frozen ? .identity : style.systemGlass, in: shape)
             .modifier(GlassIDModifier(id: id, namespace: namespace))
             .overlay {
-                if presentation.budLine {
-                    shape.stroke(NibColor.waterLineBud, lineWidth: 0.8)
+                // Nothing is painted on system glass at rest: its own rim, shadow and lensing are the droplet (a bud's
+                // outline is for the iOS 17–25 water only). Held, the rim brightens (DESIGN.md §10.9).
+                if presentation.rim > 1.001 {
+                    NibLiftRim(cornerRadius: style.cornerRadius == nil ? nil : presentation.cornerRadius,
+                               boost: presentation.rim - 1)
                 }
             }
             .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
