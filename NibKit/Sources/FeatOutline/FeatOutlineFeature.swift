@@ -2,8 +2,8 @@ import SwiftUI
 import NibContracts
 import NibDesign
 
-/// F046 Outline & bookmarks: the custom outline merged with the PDF outline (Outline tab), page bookmarks (Bookmarks
-/// tab, sidebar thumbnail menus, the nav-bar button the chrome builds for `page.setBookmarked`, ⌥⌘B) and their commands.
+/// F046 Outline & bookmarks: the custom outline merged with the PDF outline (Outline tab, `outline.list`), page
+/// bookmarks (Bookmarks tab, sidebar thumbnail menus, the nav-bar bookmark button, ⌥⌘B) and their commands.
 public enum FeatOutlineFeature: NibFeature {
     public static let id = "outline"
 
@@ -21,11 +21,41 @@ public enum FeatOutlineFeature: NibFeature {
                 AnyView(BookmarksPanel(context: context))
             })
         OutlineMenus.register(app.ui.menus, owner: id)
-        // The native bookmark shortcut: `{}` toggles the window's current notebook page and does nothing in other
-        // document kinds (see PageSetBookmarked.run).
-        app.content.keyCommands.register(KeyCommandDescriptor(
-            id: OutlinePanels.bookmarkShortcut, title: String(localized: "Bookmark Page"),
-            shortcut: KeyShortcut("b", [.command, .option]), command: "page.setBookmarked", scope: .document, owner: id))
+        app.ui.toolbar.register(bookmarkNavItem(workspace: app.workspace))
+        app.content.keyCommands.register(bookmarkKey(workspace: app.workspace))
+    }
+
+    static let bookmarkShortcut = KeyShortcut("b", [.command, .option])
+
+    /// The nav-bar bookmark button (D-066): toggles the window's current page, drawn filled and on while that page is
+    /// bookmarked (contracts-v2 live state, evaluated per window by the chrome). Notebooks only.
+    @MainActor
+    static func bookmarkNavItem(workspace: Workspace) -> ToolbarItemDescriptor {
+        var item = ToolbarItemDescriptor(
+            id: OutlinePanels.bookmarkNavItem, title: String(localized: "Bookmark Page"), icon: NibSymbol.bookmark.name,
+            group: .navLeading, order: OutlinePanels.bookmarkNavOrder, owner: id, command: CommandIDs.pageSetBookmarked,
+            shortcut: bookmarkShortcut, docKinds: [.notebook])
+        item.isOn = { BookmarkToggle.isOn($0, in: workspace) }
+        item.isEnabled = { BookmarkToggle.currentPage($0, in: workspace) != nil }
+        item.sessionParams = { BookmarkToggle.params($0, in: workspace) }
+        item.sessionTitle = { session in
+            BookmarkToggle.isOn(session, in: workspace) ? String(localized: "Remove Bookmark") : String(localized: "Bookmark Page")
+        }
+        item.sessionIcon = { session in
+            (BookmarkToggle.isOn(session, in: workspace) ? NibSymbol.bookmarkFill : NibSymbol.bookmark).name
+        }
+        return item
+    }
+
+    /// ⌥⌘B: the same toggle for the key window's current page, live only while it shows a notebook.
+    @MainActor
+    static func bookmarkKey(workspace: Workspace) -> KeyCommandDescriptor {
+        var key = KeyCommandDescriptor(
+            id: OutlinePanels.bookmarkShortcut, title: String(localized: "Bookmark Page"), shortcut: bookmarkShortcut,
+            command: CommandIDs.pageSetBookmarked, scope: .document, owner: id)
+        key.docKinds = [.notebook]
+        key.sessionParams = { BookmarkToggle.params($0, in: workspace) }
+        return key
     }
 }
 
@@ -38,6 +68,10 @@ enum OutlinePanels {
     static let bookmarksOrder = 210
     /// Key command id (not a command): ⌥⌘B runs page.setBookmarked for the current page.
     static let bookmarkShortcut = "outline.bookmarkPage"
+    /// Nav-bar item id; it takes the place of the chrome's built-in bookmark button (F017 shows one only while no
+    /// feature registers an item for page.setBookmarked), in the same slot.
+    static let bookmarkNavItem = "outline.nav.bookmark"
+    static let bookmarkNavOrder = 500
 }
 
 /// Menu entries (D-128 "Add Page to Outline" from More and the thumbnail menu; bookmarks from the thumbnail and
@@ -47,32 +81,32 @@ enum OutlineMenus {
     static func register(_ menus: Registry<MenuItemDescriptor>, owner: String) {
         menus.register(MenuItemDescriptor(
             id: "outline.more.addPage", title: String(localized: "Add Page to Outline"), icon: NibSymbol.outline.name,
-            location: .documentMore, order: 450, owner: owner, command: "outline.add",
+            location: .documentMore, order: 450, owner: owner, command: CommandIDs.outlineAdd,
             params: { addParams(currentPage($0)) }, isVisible: { currentPage($0) != nil }))
 
         menus.register(MenuItemDescriptor(
             id: "outline.page.add", title: String(localized: "Add to Outline"), icon: NibSymbol.outline.name,
-            location: .sidebarPage, order: 450, owner: owner, command: "outline.add",
+            location: .sidebarPage, order: 450, owner: owner, command: CommandIDs.outlineAdd,
             params: { addParams(thumbnailPage($0)) }, isVisible: { thumbnailPage($0) != nil }))
         menus.register(MenuItemDescriptor(
             id: "outline.page.bookmark", title: String(localized: "Bookmark"), icon: NibSymbol.bookmark.name,
-            location: .sidebarPage, order: 460, owner: owner, command: "page.setBookmarked",
+            location: .sidebarPage, order: 460, owner: owner, command: CommandIDs.pageSetBookmarked,
             params: { bookmarkParams(thumbnailPage($0).map { [$0] } ?? [], on: true) },
             isVisible: { thumbnailPage($0).map { !$0.page.bookmarked } ?? false }))
         menus.register(MenuItemDescriptor(
             id: "outline.page.unbookmark", title: String(localized: "Remove Bookmark"), icon: NibSymbol.bookmarkFill.name,
-            location: .sidebarPage, order: 460, owner: owner, command: "page.setBookmarked",
+            location: .sidebarPage, order: 460, owner: owner, command: CommandIDs.pageSetBookmarked,
             params: { bookmarkParams(thumbnailPage($0).map { [$0] } ?? [], on: false) },
             isVisible: { thumbnailPage($0)?.page.bookmarked ?? false }))
 
         menus.register(MenuItemDescriptor(
             id: "outline.selection.bookmark", title: String(localized: "Bookmark"), icon: NibSymbol.bookmark.name,
-            location: .sidebarSelection, order: 460, owner: owner, command: "page.setBookmarked",
+            location: .sidebarSelection, order: 460, owner: owner, command: CommandIDs.pageSetBookmarked,
             params: { bookmarkParams(selectedPages($0), on: true) },
             isVisible: { selectedPages($0).contains { !$0.page.bookmarked } }))
         menus.register(MenuItemDescriptor(
             id: "outline.selection.unbookmark", title: String(localized: "Remove Bookmarks"), icon: NibSymbol.bookmarkFill.name,
-            location: .sidebarSelection, order: 461, owner: owner, command: "page.setBookmarked",
+            location: .sidebarSelection, order: 461, owner: owner, command: CommandIDs.pageSetBookmarked,
             params: { bookmarkParams(selectedPages($0), on: false) },
             isVisible: { selectedPages($0).contains { $0.page.bookmarked } }))
 
@@ -86,7 +120,7 @@ enum OutlineMenus {
             let placement = move.placement
             menus.register(MenuItemDescriptor(
                 id: move.id, title: move.title, location: .outlineEntry, order: move.order, owner: owner,
-                command: "outline.move",
+                command: CommandIDs.outlineMove,
                 params: { ctx in
                     guard let e = entry(ctx), let p = placement(e.tree, e.id) else { return [:] }
                     return OutlineParams.move(doc: e.doc, entry: e.id, p)
@@ -96,7 +130,7 @@ enum OutlineMenus {
         }
         menus.register(MenuItemDescriptor(
             id: "outline.entry.delete", title: String(localized: "Delete"), icon: NibSymbol.trash.name,
-            location: .outlineEntry, order: 900, owner: owner, command: "outline.delete",
+            location: .outlineEntry, order: 900, owner: owner, command: CommandIDs.outlineDelete,
             params: { ctx in
                 guard let e = entry(ctx) else { return [:] }
                 return ["entry": .string(NodeRef.outline(e.doc, e.id).description)]
@@ -128,9 +162,9 @@ enum OutlineMenus {
         page(doc: ctx.doc ?? ctx.session?.document, id: ctx.page ?? ctx.session?.page, app: ctx.app)
     }
 
-    /// The thumbnail the sidebar menu is for.
+    /// The thumbnail the sidebar menu is for (`sidebarPage` menus carry it in `page`; `nodes` is the selection).
     static func thumbnailPage(_ ctx: MenuContext) -> PageContext? {
-        page(doc: ctx.doc ?? ctx.session?.document, id: ctx.page ?? ctx.nodes.first, app: ctx.app)
+        page(doc: ctx.doc ?? ctx.session?.document, id: ctx.page, app: ctx.app)
     }
 
     static func selectedPages(_ ctx: MenuContext) -> [PageContext] {

@@ -5,7 +5,7 @@ import NibTesting
 @testable import FeatOutline
 
 /// Outline and bookmark commands against the fixture notebook (Harness), the tree logic behind drag and drop, the
-/// merged PDF + custom rows, the menus, and the panel model's live refresh.
+/// merged PDF + custom rows and `outline.list`, the menus, the nav-bar item and key, and the panel model's live refresh.
 @MainActor
 final class FeatOutlineTests: XCTestCase {
     private let doc = Fixtures.docID
@@ -55,10 +55,20 @@ final class FeatOutlineTests: XCTestCase {
         for key in [OutlineSettings.showThumbnails, OutlineSettings.showPDFOutline, OutlineSettings.showCustomOutline] {
             XCTAssertNotNil(h.app.settings.descriptor(key.name), key.name)
         }
-        XCTAssertEqual(h.app.content.keyCommands.get("outline.bookmarkPage")?.command, "page.setBookmarked")
+        XCTAssertEqual(h.app.content.keyCommands.get("outline.bookmarkPage")?.command, CommandIDs.pageSetBookmarked)
+        XCTAssertNotNil(h.app.commands.descriptor(CommandIDs.outlineList))
+        XCTAssertEqual(h.app.commands.descriptor(CommandIDs.outlineList)?.effect, .read)
         // DESIGN.md §14.4: Pages · Outline · Bookmarks, ahead of Audio (300) and the other sidebar tabs.
         XCTAssertEqual(h.app.ui.panels.get(OutlinePanels.outline)?.order, 200)
         XCTAssertEqual(h.app.ui.panels.get(OutlinePanels.bookmarks)?.order, 210)
+
+        // The nav-bar bookmark button, in notebooks only (the chrome drops its own button for page.setBookmarked).
+        let nav = h.app.ui.toolbar.get(OutlinePanels.bookmarkNavItem)
+        XCTAssertEqual(nav?.group, .navLeading)
+        XCTAssertEqual(nav?.command, CommandIDs.pageSetBookmarked)
+        XCTAssertEqual(nav?.docKinds, [.notebook])
+        XCTAssertTrue(h.app.ui.toolbarItems(for: .notebook).contains { $0.id == OutlinePanels.bookmarkNavItem })
+        XCTAssertFalse(h.app.ui.toolbarItems(for: .whiteboard).contains { $0.id == OutlinePanels.bookmarkNavItem })
     }
 
     // MARK: Nesting (max 3 levels)
@@ -178,11 +188,20 @@ final class FeatOutlineTests: XCTestCase {
         XCTAssertTrue(h.app.bus.undo(doc))
         XCTAssertEqual(try bookmarked(), [])
 
-        // The native shortcut sends {}: the window's current page (FIXTUREPG001), toggled.
+        // ⌥⌘B: the shell passes the key window's params (contracts-v2 sessionParams): its current page, toggled.
         let shortcut = try XCTUnwrap(h.app.content.keyCommands.get("outline.bookmarkPage"))
-        try await h.run(shortcut.command, shortcut.params)
+        XCTAssertEqual(shortcut.resolvedParams(for: h.session),
+                       ["pages": [pageRef(Fixtures.page1)], "on": true])
+        try await h.run(shortcut.command, shortcut.resolvedParams(for: h.session))
         XCTAssertEqual(try bookmarked(), [Fixtures.page1])
-        try await h.run(shortcut.command, shortcut.params)
+        XCTAssertEqual(shortcut.resolvedParams(for: h.session)["on"], JSONValue.bool(false))
+        try await h.run(shortcut.command, shortcut.resolvedParams(for: h.session))
+        XCTAssertEqual(try bookmarked(), [])
+
+        // The user principal may omit both (session defaults): the window's current page, toggled.
+        try await h.run("page.setBookmarked", [:])
+        XCTAssertEqual(try bookmarked(), [Fixtures.page1])
+        try await h.run("page.setBookmarked", ["on": false])
         XCTAssertEqual(try bookmarked(), [])
 
         await assertFails("page.setBookmarked", ["pages": [pageRef(Fixtures.page1)]], code: .invalidParams, as: .ai("chat"), in: h)
@@ -191,27 +210,64 @@ final class FeatOutlineTests: XCTestCase {
         await assertFails("page.setBookmarked", ["pages": [], "on": true], code: .invalidParams, in: h)
     }
 
-    func testBookmarkShortcutDoesNothingOutsideNotebooks() async throws {
+    func testNavButtonFollowsTheWindowsPage() async throws {
+        let h = harness()
+        let nav = try XCTUnwrap(h.app.ui.toolbar.get(OutlinePanels.bookmarkNavItem))
+        func isOn() -> Bool { nav.isOn?(h.session) ?? false }
+        XCTAssertFalse(isOn())
+        XCTAssertEqual(nav.resolvedIcon(for: h.session), "bookmark")
+        XCTAssertEqual(nav.resolvedTitle(for: h.session), "Bookmark Page")
+        XCTAssertEqual(nav.isEnabled?(h.session), true)
+
+        // A tap runs what the chrome resolves for this window.
+        let command = try XCTUnwrap(nav.command)
+        try await h.run(command, nav.resolvedParams(for: h.session))
+        XCTAssertTrue(try h.app.workspace.content(doc).page(Fixtures.page1)?.bookmarked ?? false)
+        XCTAssertTrue(isOn())
+        XCTAssertEqual(nav.resolvedIcon(for: h.session), "bookmark.fill")
+        XCTAssertEqual(nav.resolvedTitle(for: h.session), "Remove Bookmark")
+
+        // Another page of the window: its own state.
+        h.session.page = Fixtures.page2
+        XCTAssertFalse(isOn())
+        XCTAssertEqual(nav.resolvedParams(for: h.session), ["pages": [pageRef(Fixtures.page2)], "on": true])
+
+        // Undo takes the bookmark back and the button with it.
+        h.session.page = Fixtures.page1
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertFalse(isOn())
+
+        // No page: greyed out, and nothing to toggle.
+        h.session.page = nil
+        XCTAssertEqual(nav.isEnabled?(h.session), false)
+        XCTAssertEqual(nav.resolvedParams(for: h.session), [:])
+    }
+
+    func testBookmarkShortcutIsLiveOnlyInNotebooks() async throws {
         let h = harness()
         let shortcut = try XCTUnwrap(h.app.content.keyCommands.get("outline.bookmarkPage"))
-        let depth = h.undoDepths()
+        // contracts-v2.2: the shell offers the key only where it applies, so it never runs in other kinds.
+        XCTAssertTrue(shortcut.isActive(in: KeyCommandContext(docKind: .notebook)))
+        XCTAssertTrue(shortcut.isActive(in: KeyCommandContext(docKind: .notebook, isEditingText: true)))
+        for kind in DocumentKind.allCases where kind != .notebook {
+            XCTAssertFalse(shortcut.isActive(in: KeyCommandContext(docKind: kind)), kind.rawValue)
+        }
+        XCTAssertFalse(shortcut.isActive(in: KeyCommandContext(docKind: nil, hasTabs: true)), "never in the library")
 
-        // A whiteboard board is a page record, but no bookmark UI shows it: the shortcut leaves it alone.
+        // A whiteboard board is a page record, but no bookmark UI shows it: the session default leaves it alone.
+        let depth = h.undoDepths()
         h.session.document = Fixtures.whiteboardID
         h.session.page = Fixtures.boardID
-        var r = try await h.run(shortcut.command, shortcut.params)
-        XCTAssertEqual(r["pages"]?.arrayValue?.count, 0)
+        XCTAssertEqual(shortcut.resolvedParams(for: h.session), [:])
+        await assertFails(shortcut.command, shortcut.resolvedParams(for: h.session), code: .invalidParams, in: h)
         XCTAssertFalse(try h.app.workspace.content(Fixtures.whiteboardID).page(Fixtures.boardID)?.bookmarked ?? false)
 
-        // A text document has no pages: no error toast, no change.
+        // A text document has no pages; no document at all.
         h.session.document = Fixtures.textDocID
         h.session.page = nil
-        r = try await h.run(shortcut.command, shortcut.params)
-        XCTAssertEqual(r["pages"]?.arrayValue?.count, 0)
-
+        await assertFails(shortcut.command, [:], code: .invalidParams, in: h)
         h.session.document = nil
-        r = try await h.run(shortcut.command, shortcut.params)
-        XCTAssertEqual(r["pages"]?.arrayValue?.count, 0)
+        await assertFails(shortcut.command, [:], code: .invalidParams, in: h)
         XCTAssertEqual(h.undoDepths(), depth, "nothing was recorded")
     }
 
@@ -346,6 +402,98 @@ final class FeatOutlineTests: XCTestCase {
         XCTAssertEqual(build(custom: false).map { $0.kind }, [.pdf])
     }
 
+    // MARK: outline.list
+
+    func testOutlineListMergesThePDFOutlineWithYoursInDisplayOrder() async throws {
+        let h = harness()
+        let pdf = FakePDFService()
+        pdf.outlines[Fixtures.pdfAsset.name] = [
+            PDFOutlineNode(title: "Chapter 1", pageIndex: 0, children: [PDFOutlineNode(title: "1.1", pageIndex: 0)]),
+            PDFOutlineNode(title: "Appendix", pageIndex: 7)
+        ]
+        h.app.services.pdf = pdf
+        try await h.run("outline.add", ["page": pageRef(Fixtures.page2), "title": "Momentum", "parent": entryRef(Fixtures.outlineID),
+                                        "id": "KID"])
+        let page3: JSONValue = "page:FIXTUREDOC01/FIXTUREPG003"
+        let expected: [JSONValue] = [
+            ["title": "Chapter 1", "page": page3, "level": 1, "source": "pdf"],
+            ["title": "1.1", "page": page3, "level": 2, "source": "pdf"],
+            ["title": "Appendix", "level": 1, "source": "pdf"],
+            ["title": "Fixture section", "page": pageRef(Fixtures.page1), "level": 1, "source": "custom",
+             "ref": entryRef(Fixtures.outlineID)],
+            ["title": "Momentum", "page": pageRef(Fixtures.page2), "level": 2, "source": "custom", "ref": entryRef("KID")]
+        ]
+        for principal in [Principal.user, .ai("chat")] {
+            let all = try await h.run("outline.list", ["doc": "doc:FIXTUREDOC01"], as: principal)
+            XCTAssertEqual(all["entries"]?.arrayValue, expected)
+            XCTAssertNil(all["cursor"])
+            XCTAssertNil(all["truncated"])
+        }
+        let custom = try await h.run("outline.list", ["doc": "doc:FIXTUREDOC01", "source": "custom"])
+        XCTAssertEqual(custom["entries"]?.arrayValue, Array(expected[3...]))
+        let pdfOnly = try await h.run("outline.list", ["doc": "doc:FIXTUREDOC01", "source": "pdf"])
+        XCTAssertEqual(pdfOnly["entries"]?.arrayValue, Array(expected[..<3]))
+
+        // The view options of the Outline tab do not filter it; the user may omit doc (the window's document).
+        try await h.run("settings.set", ["name": .string(OutlineSettings.showPDFOutline.name), "value": false])
+        let fromSession = try await h.run("outline.list", [:])
+        XCTAssertEqual(fromSession["entries"]?.arrayValue, expected)
+
+        // A trashed page is no longer a destination; the entry stays.
+        var trashed = try XCTUnwrap(h.app.workspace.content(doc).page(Fixtures.page2))
+        trashed.deleted = true
+        trashed.rev = Rev(wallMs: UInt64(Date().timeIntervalSince1970 * 1000) + 60_000, counter: 0, device: 99)
+        _ = h.app.bus.applyRemote(DocumentPatch(doc: doc, pages: [trashed]), origin: "test")
+        let afterTrash = try await h.run("outline.list", ["doc": "doc:FIXTUREDOC01", "source": "custom"])
+        XCTAssertEqual(afterTrash["entries"]?.arrayValue?.last,
+                       ["title": "Momentum", "level": 2, "source": "custom", "ref": entryRef("KID")])
+
+        await assertFails("outline.list", ["doc": "doc:FIXTUREDOC01", "source": "bookmarks"], code: .invalidParams,
+                          as: .ai("chat"), in: h)
+        await assertFails("outline.list", ["doc": "doc:FIXTUREDOC01", "source": "bookmarks"], code: .invalidParams, in: h)
+        await assertFails("outline.list", ["doc": "doc:FIXTUREDOC01", "cursor": "x"], code: .invalidParams, in: h)
+        await assertFails("outline.list", [:], code: .invalidParams, as: .ai("chat"), in: h)
+        await assertFails("outline.list", ["doc": "page:FIXTUREDOC01/FIXTUREPG001"], code: .invalidParams, in: h)
+    }
+
+    func testOutlineListPagesLongOutlinesWithACursor() async throws {
+        let h = harness()
+        // 260 entries of about 120 bytes each: more than one 20 KB result.
+        var pdfNodes: [PDFOutlineNode] = []
+        for i in 0..<260 {
+            pdfNodes.append(PDFOutlineNode(title: "Section \(i) " + String(repeating: "x", count: 60), pageIndex: 0))
+        }
+        let pdf = FakePDFService()
+        pdf.outlines[Fixtures.pdfAsset.name] = pdfNodes
+        h.app.services.pdf = pdf
+
+        var titles: [String] = []
+        var cursor: JSONValue?
+        var pages = 0
+        repeat {
+            var params: [String: JSONValue] = ["doc": "doc:FIXTUREDOC01"]
+            if let c = cursor { params["cursor"] = c }
+            let r = try await h.run("outline.list", .object(params), as: .ai("chat"))
+            XCTAssertLessThanOrEqual(r.jsonString().utf8.count, NibLimits.aiToolResultBytes)
+            titles += r["entries"]?.arrayValue?.compactMap { $0["title"]?.stringValue } ?? []
+            cursor = r["cursor"]
+            XCTAssertEqual(r["truncated"]?.boolValue, cursor == nil ? nil : true)
+            pages += 1
+        } while cursor != nil && pages < 20
+        XCTAssertGreaterThan(pages, 1)
+        XCTAssertEqual(titles, pdfNodes.map { $0.title } + ["Fixture section"], "every entry once, in order")
+
+        // A page always moves on, even when one entry alone is over the budget.
+        let big = OutlineList.Entry(title: String(repeating: "y", count: 300), page: nil, level: 1, source: "pdf", ref: nil)
+        let first = OutlineList.page([big, big], from: 0, limit: 200)
+        XCTAssertEqual(first.entries.count, 1)
+        XCTAssertEqual(first.cursor, "1")
+        let last = OutlineList.page([big, big], from: 1, limit: 200)
+        XCTAssertEqual(last.entries.count, 1)
+        XCTAssertNil(last.cursor)
+        XCTAssertEqual(OutlineList.page([big], from: 5).entries, [], "a cursor past the end reads nothing")
+    }
+
     // MARK: Menus
 
     func testMenusRunCommandsForTheirContext() async throws {
@@ -356,14 +504,20 @@ final class FeatOutlineTests: XCTestCase {
         guard case let .outline(_, id)? = NodeRef(r["ref"]?.stringValue ?? "") else { return XCTFail("no entry ref") }
         XCTAssertEqual(try tree(h).entries[id]?.title, "Page 2")
 
-        let thumbnail = MenuContext(app: h.app, session: h.session, doc: doc, page: Fixtures.page2)
+        // sidebarPage menus: `page` is the thumbnail, `nodes` the selection (which may hold other pages).
+        let thumbnail = MenuContext(app: h.app, session: h.session, doc: doc, page: Fixtures.page2,
+                                    nodes: [Fixtures.page1, Fixtures.page2])
         func sidebarIDs() -> [String] { h.app.ui.menuItems(.sidebarPage, thumbnail).map { $0.id } }
         XCTAssertTrue(sidebarIDs().contains("outline.page.bookmark"))
         XCTAssertFalse(sidebarIDs().contains("outline.page.unbookmark"))
         let bookmark = try XCTUnwrap(h.app.ui.menuItems(.sidebarPage, thumbnail).first { $0.id == "outline.page.bookmark" })
+        XCTAssertEqual(bookmark.params(thumbnail), ["pages": [pageRef(Fixtures.page2)], "on": true])
         try await h.run(bookmark.command, bookmark.params(thumbnail))
         XCTAssertTrue(sidebarIDs().contains("outline.page.unbookmark"))
         XCTAssertFalse(sidebarIDs().contains("outline.page.bookmark"))
+        let selectionOnly = MenuContext(app: h.app, session: h.session, doc: doc, nodes: [Fixtures.page2])
+        XCTAssertFalse(h.app.ui.menuItems(.sidebarPage, selectionOnly).contains { $0.id.hasPrefix("outline.page.") },
+                       "no thumbnail page, no thumbnail entries")
 
         let entry = MenuContext(app: h.app, session: h.session, doc: doc, ref: NodeRef.outline(doc, id).description)
         let entryItems = h.app.ui.menuItems(.outlineEntry, entry).map { $0.id }

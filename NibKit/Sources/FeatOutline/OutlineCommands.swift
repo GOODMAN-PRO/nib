@@ -1,9 +1,8 @@
 import Foundation
 import NibContracts
 
-// Custom outline (D-067, D-128) and page bookmarks (D-066). Every change is a command, so the panel, menus, plugins,
-// the AI and the bridge share one path and the document's undo. Each command writes every record at most once
-// (undo reverts a record only while it still carries the revision the command wrote).
+// Custom outline (D-067, D-128), the merged outline read (outline.list, D-069) and page bookmarks (D-066). Every
+// change is a command, so the panel, menus, plugins, the AI and the bridge share one path and the document's undo.
 
 enum OutlineCommands {
     @MainActor
@@ -13,11 +12,12 @@ enum OutlineCommands {
         r.register(OutlineMove.self)
         r.register(OutlineDelete.self)
         r.register(OutlineSortByPage.self)
+        r.register(OutlineList.self)
         r.register(PageSetBookmarked.self)
     }
 
     static let entryRef = JSONSchema.str("outline entry ref outline:D/O")
-    static let hint = "call query.get {\"ref\": \"doc:D\"} for the outline entries and their refs"
+    static let hint = "call outline.list {\"doc\": \"doc:D\", \"source\": \"custom\"} for the outline entries and their refs"
 }
 
 // MARK: - Tree
@@ -300,6 +300,13 @@ enum OutlineArgs {
         return NibID(ref)
     }
 
+    /// `ref` as a document; when it is omitted (the user principal: menus, keys, the command bar), the invoking
+    /// window's document (contracts-v2 session defaults).
+    static func documentOrSession(_ ref: String?, path: String, _ ctx: CommandContext) throws -> DocumentID {
+        if let ref = ref, !ref.isEmpty { return try document(ref, path: path) }
+        return try ctx.documentOrSession(nil, field: String(path.dropFirst(2)))
+    }
+
     /// A live (not trashed) page.
     static func livePage(_ ref: String, path: String, _ ctx: CommandContext) throws -> (DocumentID, PageRecord) {
         guard case let .page(doc, pageID)? = NodeRef(ref) else {
@@ -566,8 +573,9 @@ struct OutlineDelete: NibCommand {
 // MARK: - outline.sortByPage
 
 struct OutlineSortByPage: NibCommand {
+    /// `doc` may be omitted by the user principal: the invoking window's document.
     struct Params: Codable {
-        var doc: String
+        var doc: String?
     }
 
     static let descriptor = CommandDescriptor(
@@ -578,7 +586,7 @@ struct OutlineSortByPage: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
-        let doc = try OutlineArgs.document(p.doc, path: "$.doc")
+        let doc = try OutlineArgs.documentOrSession(p.doc, path: "$.doc", ctx)
         try ctx.mutate { (tx: DocTransaction) throws -> Void in
             let content = try tx.content(doc)
             let tree = OutlineTree(content.outline)
@@ -602,11 +610,125 @@ struct OutlineSortByPage: NibCommand {
     }
 }
 
+// MARK: - outline.list
+
+/// The outline as the Outline tab shows it, for the AI, plugins and the bridge: the PDF's own outline (mapped to the
+/// notebook pages that show its pages), then the custom entries, each nested in display order. View options and
+/// collapsed rows do not apply: `source` picks what to list.
+struct OutlineList: NibCommand {
+    enum Source: String, CaseIterable {
+        case all, custom, pdf
+    }
+
+    /// `doc` may be omitted by the user principal: the invoking window's document.
+    struct Params: Codable {
+        var doc: String?
+        var source: String?
+        var cursor: String?
+    }
+
+    struct Entry: Codable, Equatable {
+        var title: String
+        /// The live page it opens (page:D/P); absent when the page is gone or the PDF page is not in the notebook.
+        var page: String?
+        /// 1 = top level.
+        var level: Int
+        /// "pdf" or "custom".
+        var source: String
+        /// outline:D/O for custom entries (for outline.rename / move / delete).
+        var ref: String?
+    }
+
+    struct Output: Codable {
+        var entries: [Entry]
+        /// Pass it back to read the next page (only when `truncated`).
+        var cursor: String?
+        var truncated: Bool?
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "outline.list", title: "Outline",
+        summary: "The document outline as the Outline tab shows it: the PDF's own outline, then the custom entries (refs outline:D/O), nested by level. Paged with cursor.",
+        params: .obj([
+            "doc": .str("document ref doc:D"),
+            "source": .str("all (default), custom (your entries) or pdf (the imported PDF's outline)",
+                           choices: Source.allCases.map { $0.rawValue }),
+            "cursor": .str("the cursor of the previous result when it was truncated")
+        ], required: ["doc"]),
+        examples: [["doc": "doc:FIXTUREDOC01"], ["doc": "doc:FIXTUREDOC01", "source": "custom"]],
+        effect: .read)
+
+    /// Room left for `{"entries": [...], "cursor": "...", "truncated": true}` under the 20 KB result cap.
+    static let envelopeBytes = 128
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        let doc = try OutlineArgs.documentOrSession(p.doc, path: "$.doc", ctx)
+        let source: Source
+        if let raw = p.source {
+            guard let s = Source(rawValue: raw) else {
+                throw NibError(.invalidParams, "source must be all, custom or pdf", path: "$.source")
+            }
+            source = s
+        } else {
+            source = .all
+        }
+        var start = 0
+        if let raw = p.cursor {
+            guard let n = Int(raw), n >= 0 else {
+                throw NibError(.invalidParams, "cursor must come from a previous outline.list result", path: "$.cursor",
+                               hint: "call outline.list without a cursor for the first page")
+            }
+            start = n
+        }
+        let content = try ctx.workspace.content(doc)
+        var pdfOutlines: [String: [PDFOutlineNode]] = [:]
+        if source != .custom, let pdf = ctx.services.pdf {
+            for file in PDFOutlineMapper.files(content.livePages, doc: doc, services: ctx.services) {
+                pdfOutlines[file.asset] = await PDFOutlineMapper.read(pdf, file.url)
+            }
+        }
+        let entries = entries(doc: doc, content: content, pdfOutlines: pdfOutlines, source: source)
+        return page(entries, from: start)
+    }
+
+    /// Every row of the Outline tab, fully expanded.
+    static func entries(doc: DocumentID, content: DocumentContent, pdfOutlines: [String: [PDFOutlineNode]],
+                        source: Source) -> [Entry] {
+        let sections = OutlineRowBuilder.sections(
+            content: content, tree: OutlineTree(content.outline), pdfOutlines: pdfOutlines,
+            showPDF: source != .custom, showCustom: source != .pdf, collapsed: [], currentPage: nil)
+        return sections.flatMap { section in
+            section.rows.map { row in
+                Entry(title: row.title, page: row.page.map { NodeRef.page(doc, $0).description }, level: row.depth,
+                      source: row.kind.rawValue, ref: row.entry.map { NodeRef.outline(doc, $0).description })
+            }
+        }
+    }
+
+    /// The entries from `start` that fit the result cap (at least one per page, so paging always moves on).
+    static func page(_ all: [Entry], from start: Int, limit: Int = NibLimits.aiToolResultBytes) -> Output {
+        let start = min(max(start, 0), all.count)
+        let encoder = JSONEncoder()
+        var budget = limit - envelopeBytes
+        var end = start
+        while end < all.count {
+            let size = ((try? encoder.encode(all[end]))?.count ?? 0) + 1
+            if end > start && size > budget { break }
+            budget -= size
+            end += 1
+        }
+        let truncated = end < all.count
+        return Output(entries: Array(all[start..<end]), cursor: truncated ? String(end) : nil,
+                      truncated: truncated ? true : nil)
+    }
+}
+
 // MARK: - page.setBookmarked
 
 struct PageSetBookmarked: NibCommand {
-    /// Both are required for plugins, the AI and the bridge (schema). The native bookmark shortcut sends `{}`:
-    /// the window's current page, toggled.
+    /// Both are required for plugins, the AI and the bridge (schema). The user principal may omit them (contracts-v2
+    /// session defaults): `pages` = the window's current notebook page, `on` = the opposite of that page's bookmark.
+    /// The nav-bar button and ⌥⌘B send both, computed from their window (`BookmarkToggle.params`).
     struct Params: Codable {
         var pages: [String]?
         var on: Bool?
@@ -636,11 +758,11 @@ struct PageSetBookmarked: NibCommand {
             }
             refs = pages
         } else {
-            // The shortcut (⌥⌘B) is document-wide: only a notebook's current page is bookmarkable. Anywhere else
-            // (a text document, a whiteboard board, no page) it does nothing rather than raising an error.
-            guard let session = ctx.activeSession, let doc = session.document, let page = session.page,
-                  (try? ctx.workspace.content(doc))?.meta.kind == .notebook else {
-                return Output(pages: [], on: false)
+            // Session default: only a notebook page is bookmarkable (no bookmark UI shows whiteboard boards).
+            let (doc, page) = try ctx.pageOrSession(nil, field: "pages")
+            guard (try? ctx.workspace.content(doc))?.meta.kind == .notebook else {
+                throw NibError(.invalidParams, "the window shows no notebook page to bookmark", path: "$.pages",
+                               hint: "pass pages: [\"page:D/P\"]")
             }
             refs = [NodeRef.page(doc, page).description]
         }
@@ -675,5 +797,27 @@ struct PageSetBookmarked: NibCommand {
             return out
         }
         return Output(pages: changed, on: on)
+    }
+}
+
+/// The nav-bar bookmark button and ⌥⌘B act on the page of the window they run in (contracts-v2 live state).
+@MainActor
+enum BookmarkToggle {
+    /// The window's current page when it is a live page of a notebook.
+    static func currentPage(_ session: EditorSession, in workspace: Workspace) -> (doc: DocumentID, page: PageRecord)? {
+        guard let doc = session.document, let id = session.page, let content = try? workspace.content(doc),
+              content.meta.kind == .notebook, let page = content.page(id), !page.deleted else { return nil }
+        return (doc, page)
+    }
+
+    static func isOn(_ session: EditorSession, in workspace: Workspace) -> Bool {
+        currentPage(session, in: workspace)?.page.bookmarked ?? false
+    }
+
+    /// `{pages: [current page], on: !bookmarked}`; `{}` when the window shows no notebook page (the command then
+    /// explains why nothing can be bookmarked).
+    static func params(_ session: EditorSession, in workspace: Workspace) -> JSONValue {
+        guard let current = currentPage(session, in: workspace) else { return [:] }
+        return OutlineParams.bookmark(doc: current.doc, pages: [current.page.id], on: !current.page.bookmarked)
     }
 }

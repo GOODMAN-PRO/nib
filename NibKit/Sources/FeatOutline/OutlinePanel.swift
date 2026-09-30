@@ -24,26 +24,23 @@ enum OutlineSettings {
     }
 }
 
+/// Row geometry on the NibDesign outline tokens (`NibMetrics.outlineIndent`, `.outlineMaxDepth`,
+/// `.rowThumbnailWidth`), plus the thumbnail cache sizes.
 enum OutlineMetrics {
-    /// DESIGN.md §14.4: bookmark rows carry a 40 pt thumbnail; outline rows use the same one when thumbnails are on.
-    /// ponytail: NibMetrics has only the 176 pt navigator thumbnail; move this to a NibMetrics row-thumbnail token
-    /// once one lands (contract gap reported by F046).
-    static let rowThumbnailWidth: CGFloat = 40
-    /// Deeper PDF outlines stop indenting here so titles keep their width in the 240 pt panel.
-    static let maxIndentLevels = 4
-    /// Thumbnails are drawn at 40 pt; 160 px covers 3× screens with room to spare.
+    /// Thumbnails are drawn at `NibMetrics.rowThumbnailWidth` (40 pt); 160 px covers 3× screens with room to spare.
     static let thumbnailPixels = 160
     /// Rendered thumbnails a panel keeps (about 100 KB each); older ones are evicted and rendered again on demand.
     static let thumbnailCacheLimit = 100
 
-    /// The leading inset of an outline row at `depth` (1 = top level).
+    /// The leading inset of an outline row at `depth` (1 = top level). Deeper levels stop indenting at
+    /// `NibMetrics.outlineMaxDepth`, so titles keep their width in the 240 pt navigator (as `NibOutlineRow` does).
     static func indent(_ depth: Int) -> CGFloat {
-        NibSpacing.xs + CGFloat(min(max(depth, 1), maxIndentLevels) - 1) * NibSpacing.l
+        NibSpacing.xs + CGFloat(min(max(depth, 1), NibMetrics.outlineMaxDepth) - 1) * NibMetrics.outlineIndent
     }
 
     /// The outline level whose indent is closest to `x`.
     static func depth(atIndent x: CGFloat) -> Int {
-        max(1, Int(((x - NibSpacing.xs) / NibSpacing.l).rounded()) + 1)
+        max(1, Int(((x - NibSpacing.xs) / NibMetrics.outlineIndent).rounded()) + 1)
     }
 }
 
@@ -80,6 +77,18 @@ enum PDFOutlineMapper {
             if map[asset.name]?[index] == nil { map[asset.name, default: [:]][index] = page.id }
         }
         return map
+    }
+
+    /// The file behind each PDF asset `pages` show, in page order (an asset without a file is skipped).
+    @MainActor
+    static func files(_ pages: [PageRecord], doc: DocumentID, services: NibServices) -> [(asset: String, url: URL)] {
+        guard let store = services.assets else { return [] }
+        return assets(pages).compactMap { asset in store.url(asset, doc: doc).map { (asset: asset.name, url: $0) } }
+    }
+
+    /// PDFKit work runs off the main actor (`PDFService` is thread-safe).
+    nonisolated static func read(_ pdf: PDFService, _ url: URL) async -> [PDFOutlineNode] {
+        pdf.outline(url)
     }
 }
 
@@ -388,22 +397,18 @@ final class OutlinePanelModel: ObservableObject {
     }
 
     private func loadPDFOutlines(_ content: DocumentContent) {
-        guard let doc = doc, let pdf = tracker.app.services.pdf, let assets = tracker.app.services.assets else { return }
-        for asset in PDFOutlineMapper.assets(content.livePages) where !pdfRequested.contains(asset.name) {
-            pdfRequested.insert(asset.name)
-            guard let url = assets.url(asset, doc: doc) else { continue }
+        let services = tracker.app.services
+        guard let doc = doc, let pdf = services.pdf else { return }
+        for file in PDFOutlineMapper.files(content.livePages, doc: doc, services: services)
+        where !pdfRequested.contains(file.asset) {
+            pdfRequested.insert(file.asset)
             Task { @MainActor [weak self] in
-                let nodes = await OutlinePanelModel.readOutline(pdf, url)
+                let nodes = await PDFOutlineMapper.read(pdf, file.url)
                 guard let self = self, self.doc == doc, !nodes.isEmpty else { return }
-                self.pdfOutlines[asset.name] = nodes
+                self.pdfOutlines[file.asset] = nodes
                 self.tracker.schedule()
             }
         }
-    }
-
-    /// PDFKit work runs off the main actor (`PDFService` is thread-safe).
-    nonisolated static func readOutline(_ pdf: PDFService, _ url: URL) async -> [PDFOutlineNode] {
-        pdf.outline(url)
     }
 
     // MARK: Reads for the list
@@ -424,7 +429,7 @@ final class OutlinePanelModel: ObservableObject {
 
     func open(_ row: OutlineRow) {
         guard let doc = doc, let page = row.page else { return }
-        tracker.perform("view.goToPage", ["page": .string(NodeRef.page(doc, page).description)])
+        tracker.perform(CommandIDs.viewGoToPage, ["page": .string(NodeRef.page(doc, page).description)])
     }
 
     func toggle(_ row: OutlineRow) {
@@ -460,9 +465,10 @@ final class OutlinePanelModel: ObservableObject {
         guard let doc = doc, let pending = pending, !title.isEmpty else { return }
         switch pending {
         case .add(let page):
-            tracker.perform("outline.add", ["page": .string(NodeRef.page(doc, page).description), "title": .string(title)])
+            tracker.perform(CommandIDs.outlineAdd, ["page": .string(NodeRef.page(doc, page).description), "title": .string(title)])
         case .rename(let entry):
-            tracker.perform("outline.rename", ["entry": .string(NodeRef.outline(doc, entry).description), "title": .string(title)])
+            tracker.perform(CommandIDs.outlineRename,
+                            ["entry": .string(NodeRef.outline(doc, entry).description), "title": .string(title)])
         }
     }
 
@@ -473,21 +479,21 @@ final class OutlinePanelModel: ObservableObject {
 
     func delete(_ entry: NibID) {
         guard let doc = doc else { return }
-        tracker.perform("outline.delete", ["entry": .string(NodeRef.outline(doc, entry).description)])
+        tracker.perform(CommandIDs.outlineDelete, ["entry": .string(NodeRef.outline(doc, entry).description)])
     }
 
     func move(_ entry: NibID, _ placement: OutlinePlacement) {
         guard let doc = doc else { return }
-        tracker.perform("outline.move", OutlineParams.move(doc: doc, entry: entry, placement))
+        tracker.perform(CommandIDs.outlineMove, OutlineParams.move(doc: doc, entry: entry, placement))
     }
 
     func sortByPage() {
         guard let doc = doc else { return }
-        tracker.perform("outline.sortByPage", ["doc": .string(NodeRef.document(doc).description)])
+        tracker.perform(CommandIDs.outlineSortByPage, ["doc": .string(NodeRef.document(doc).description)])
     }
 
     func setOption(_ key: SettingKey<Bool>, _ on: Bool) {
-        tracker.perform("settings.set", ["name": .string(key.name), "value": .bool(on)])
+        tracker.perform(CommandIDs.settingsSet, ["name": .string(key.name), "value": .bool(on)])
     }
 
     func run(_ item: MenuItemDescriptor, _ context: MenuContext) {
@@ -723,7 +729,7 @@ final class OutlineTableController: NSObject, UITableViewDataSource, UITableView
         guard sections.count > 1 else { return nil }
         let label = UILabel()
         label.text = sections[section].kind == .pdf ? String(localized: "From the PDF") : String(localized: "Yours")
-        label.font = NibUIFont.font(.footnote, weight: .semibold)
+        label.font = NibUIFont.footnoteEmphasis
         label.textColor = NibUIColor.labelSecondary
         label.adjustsFontForContentSizeCategory = true
         label.numberOfLines = 0
@@ -945,8 +951,10 @@ struct OutlineDragItem {
     let grabOffset: CGFloat
 }
 
-/// One outline row: disclosure, optional thumbnail, title (your entries bold), page number in `hud`. The current
-/// page's rows sit on the row highlight as well as carrying the accent number, so the state is never colour alone.
+/// One outline row: disclosure, optional thumbnail (`NibPageThumbnailView`, `NibMetrics.rowThumbnailWidth`), title
+/// (your entries in `bodyEmphasis`), page number in `hud`, indented `NibMetrics.outlineIndent` per level. It stays a
+/// UIKit cell for the drag table (`NibOutlineRow` is its SwiftUI twin). The current page's rows sit on the row
+/// highlight, carry the accent number and ring their thumbnail, so the state is never colour alone.
 final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
     static let reuseID = "outline.row"
 
@@ -969,13 +977,14 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
     }
 
     private let disclosure = UIButton(type: .system)
-    private let thumbnail = UIImageView()
+    private let thumbnail = NibPageThumbnailView(width: NibMetrics.rowThumbnailWidth)
     private let titleLabel = UILabel()
     private let pageLabel = UILabel()
     private let stack = UIStackView()
     private let currentFill = OutlineCell.rowFill()
     private var leading: NSLayoutConstraint?
-    private var thumbnailHeight: NSLayoutConstraint?
+    private var top: NSLayoutConstraint?
+    private var bottom: NSLayoutConstraint?
     var onToggle: (() -> Void)?
     private(set) var page: PageID?
 
@@ -1000,11 +1009,8 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
         disclosure.isAccessibilityElement = false
         disclosure.addAction(UIAction { [weak self] _ in self?.onToggle?() }, for: .primaryActionTriggered)
 
-        thumbnail.contentMode = .scaleAspectFit
-        thumbnail.clipsToBounds = true
-        thumbnail.layer.cornerRadius = NibRadius.thumbnail
-        thumbnail.layer.cornerCurve = .continuous
-        thumbnail.backgroundColor = NibUIColor.backgroundTertiary
+        thumbnail.setContentHuggingPriority(.required, for: .horizontal)
+        thumbnail.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         titleLabel.adjustsFontForContentSizeCategory = true
         titleLabel.textColor = NibUIColor.label
@@ -1024,23 +1030,20 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
         contentView.addSubview(stack)
 
         let leading = stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: NibSpacing.xs)
-        let thumbnailWidth = thumbnail.widthAnchor.constraint(equalToConstant: OutlineMetrics.rowThumbnailWidth)
-        let thumbnailHeight = thumbnail.heightAnchor.constraint(equalToConstant: OutlineMetrics.rowThumbnailWidth)
-        // Below required, so the stack view's own constraints win while the thumbnail is hidden.
-        thumbnailWidth.priority = .defaultHigh
-        thumbnailHeight.priority = .defaultHigh
+        // Rows with thumbnails keep room for the current page's ring (3 pt outside the page) above and below.
+        let top = stack.topAnchor.constraint(equalTo: contentView.topAnchor)
+        let bottom = stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
         NSLayoutConstraint.activate([
             leading,
+            top,
+            bottom,
             stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -NibSpacing.l),
-            stack.topAnchor.constraint(equalTo: contentView.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
             disclosure.widthAnchor.constraint(equalToConstant: NibMetrics.hitTarget),
-            disclosure.heightAnchor.constraint(equalToConstant: NibMetrics.hitTarget),
-            thumbnailWidth,
-            thumbnailHeight
+            disclosure.heightAnchor.constraint(equalToConstant: NibMetrics.hitTarget)
         ])
         self.leading = leading
-        self.thumbnailHeight = thumbnailHeight
+        self.top = top
+        self.bottom = bottom
 
         addInteraction(UIPointerInteraction(delegate: self))
         isAccessibilityElement = true
@@ -1054,14 +1057,18 @@ final class OutlineCell: UITableViewCell, UIPointerInteractionDelegate {
         disclosure.isUserInteractionEnabled = row.hasChildren
 
         titleLabel.text = row.title
-        titleLabel.font = row.kind == .custom ? NibUIFont.font(.body, weight: .semibold) : NibUIFont.body
+        titleLabel.font = row.kind == .custom ? NibUIFont.bodyEmphasis : NibUIFont.body
         titleLabel.numberOfLines = traitCollection.preferredContentSizeCategory.isAccessibilityCategory ? 0 : 2
         pageLabel.text = row.pageNumber.map { String($0) }
         pageLabel.textColor = row.isCurrent ? NibUIColor.accent : NibUIColor.labelSecondary
 
         thumbnail.isHidden = !showsThumbnail
-        thumbnailHeight?.constant = OutlineMetrics.rowThumbnailWidth / max(aspect, 0.1)
+        thumbnail.aspectRatio = max(aspect, 0.1)
+        thumbnail.isCurrent = row.isCurrent
         thumbnail.image = image
+        let inset = showsThumbnail ? NibSpacing.xs : 0
+        top?.constant = inset
+        bottom?.constant = -inset
 
         accessibilityLabel = row.title
         var value: [String] = []
@@ -1145,17 +1152,17 @@ final class BookmarksPanelModel: ObservableObject {
 
     func open(_ row: BookmarkRow) {
         guard let doc = tracker.doc else { return }
-        tracker.perform("view.goToPage", ["page": .string(NodeRef.page(doc, row.page).description)])
+        tracker.perform(CommandIDs.viewGoToPage, ["page": .string(NodeRef.page(doc, row.page).description)])
     }
 
     func remove(_ row: BookmarkRow) {
         guard let doc = tracker.doc else { return }
-        tracker.perform("page.setBookmarked", OutlineParams.bookmark(doc: doc, pages: [row.page], on: false))
+        tracker.perform(CommandIDs.pageSetBookmarked, OutlineParams.bookmark(doc: doc, pages: [row.page], on: false))
     }
 
     func addToOutline(_ row: BookmarkRow) {
         guard let doc = tracker.doc, let content = content, let page = content.page(row.page) else { return }
-        tracker.perform("outline.add", OutlineParams.add(doc: doc, page: page, content: content))
+        tracker.perform(CommandIDs.outlineAdd, OutlineParams.add(doc: doc, page: page, content: content))
     }
 }
 
@@ -1227,17 +1234,19 @@ struct BookmarksPanel: View {
     }
 }
 
-/// A bookmark: the page thumbnail with its number under it (NibPageThumbnail), then the page's title. The current
-/// page carries the accent ring, the row highlight and an emphasised title, so the state is never colour alone.
+/// A bookmark: `NibOutlineRow` with the page's 40 pt thumbnail (`NibPageThumbnail`, no number) leading, then the
+/// page's title and its number in `hud` type (or "Page N"). The current page carries the row highlight, an emphasised title and the accent
+/// ring on its thumbnail, so the state is never colour alone.
 struct BookmarkRowView: View {
     let row: BookmarkRow
     let image: UIImage?
-    @Environment(\.dynamicTypeSize) private var typeSize
 
     var body: some View {
-        HStack(spacing: NibSpacing.m) {
+        // An untitled page is called "Page N" already; a titled one shows its number on the trailing edge.
+        NibOutlineRow(row.title ?? String(localized: "Page \(row.number)"), pageLabel: row.title.map { _ in String(row.number) },
+                      isSelected: row.isCurrent, reservesDisclosure: false) {
             NibPageThumbnail(number: row.number, isCurrent: row.isCurrent, aspectRatio: max(row.aspect, 0.1),
-                             width: OutlineMetrics.rowThumbnailWidth) {
+                             width: NibMetrics.rowThumbnailWidth, showsNumber: false) {
                 ZStack {
                     NibColor.backgroundTertiary
                     if let image = image {
@@ -1247,18 +1256,9 @@ struct BookmarkRowView: View {
                     }
                 }
             }
-            Text(row.title ?? String(localized: "Page \(row.number)"))
-                .font(row.isCurrent ? NibFont.bodyEmphasis : NibFont.body)
-                .foregroundStyle(NibColor.label)
-                .lineLimit(typeSize.isAccessibilitySize ? nil : 2)
-            Spacer(minLength: 0)
+            // Room for the current page's ring (3 pt outside the page) inside the row highlight.
+            .padding(.vertical, NibSpacing.s)
         }
-        .padding(.horizontal, NibSpacing.m)
-        .padding(.vertical, NibSpacing.s)
-        .frame(minHeight: NibMetrics.hitTarget)
-        .background(row.isCurrent ? NibColor.fill3 : Color.clear,
-                    in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
-        .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityTitle)
         .accessibilityValue(row.isCurrent ? String(localized: "Current page") : "")
