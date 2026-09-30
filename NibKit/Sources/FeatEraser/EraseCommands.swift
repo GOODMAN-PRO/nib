@@ -30,27 +30,24 @@ enum EraseSupport {
 
     /// Rejects paths too long to run in one call (each point scans the page's candidates on the main actor).
     static func checkLength(_ points: [Point], _ path: String) throws {
-        guard points.count <= EraserGeometry.maxPathPoints else {
-            throw NibError(.invalidParams, "\(path.dropFirst(2)) has more than \(EraserGeometry.maxPathPoints) points", path: path,
-                           hint: "split it into several calls of at most \(EraserGeometry.maxPathPoints) points")
+        let limit = NibLimits.maxErasePathPoints
+        guard points.count <= limit else {
+            throw NibError(.invalidParams, "\(path.dropFirst(2)) has more than \(limit) points", path: path,
+                           hint: "split it into several calls of at most \(limit) points")
         }
     }
 
     /// The layer the eraser works on: the invoking window's active layer.
     static func layer(_ ctx: CommandContext) -> Int { ctx.activeSession?.activeLayer ?? 0 }
 
-    /// Tombstones `ids`. Live children lose their `attachedTo` and connector ends anchored to a removed item are
-    /// released (the end point stays), so nothing is left pointing at a removed item.
-    /// Tombstones the already-fetched items (`tx.delete` would look each one up again with a scan of the page).
-    /// ponytail: `put` still scans the page per item, so clearing a 100k-item board is quadratic; needs a bulk
-    /// tombstone on DocTransaction.
+    /// Tombstones `ids` (live items of the page, from `items`). Live children lose their `attachedTo` and connector
+    /// ends anchored to a removed item are released (the end point stays), so nothing is left pointing at a removed
+    /// item. Both are batch writes (one pass over the page each), so clearing a board near
+    /// `NibLimits.boardItemLimit` stays linear.
     static func remove(_ ids: Set<ElementID>, among items: [Item], tx: DocTransaction, doc: DocumentID, page: PageID) throws {
         guard !ids.isEmpty else { return }
-        for item in items where ids.contains(item.id) {
-            var gone = item
-            gone.deleted = true
-            try tx.put(gone, doc: doc, page: page)
-        }
+        try tx.delete(items: items.filter { ids.contains($0.id) }.map { $0.id }, doc: doc, page: page)
+        var released: [Item] = []
         for item in items where !ids.contains(item.id) {
             var next = item
             if let parent = item.attachedTo, ids.contains(parent) { next.attachedTo = nil }
@@ -59,20 +56,22 @@ enum EraseSupport {
                 if let target = c.to.item, ids.contains(target) { c.to = ConnectorEnd(point: c.to.point) }
                 next.connector = c
             }
-            if next != item { try tx.put(next, doc: doc, page: page) }
+            if next != item { released.append(next) }
         }
+        try tx.put(released, doc: doc, page: page)
     }
 
     /// Applies an eraser gesture: removes what it erased and inserts the cut pieces with fresh ids in the original's
     /// place (layer, attachment, style and provenance). Each piece gets its own z key between the original's and the
-    /// next item's, so pieces keep the stroke's place in the z-order and no two items share a key.
+    /// next item's, so pieces keep the stroke's place in the z-order and no two items share a key. `items` are the
+    /// page's live items in z order; the pieces go in with one batch write.
     static func commit(_ session: EraseSession, items: [Item], tx: DocTransaction, doc: DocumentID, page: PageID) throws -> EraseCounts {
         let plan = session.plan
         try remove(plan.remove, among: items, tx: tx, doc: doc, page: page)
-        var created = 0
+        var pieces: [Item] = []
         var top = ""                                   // the highest key handed out so far (splits come in z-order)
         for split in plan.splits {
-            let next = items.first { $0.z > split.original.z }?.z
+            let next = nextZ(above: split.original.z, in: items)
             var last = max(split.original.z, top)
             for stroke in split.strokes {
                 var piece = split.original
@@ -82,12 +81,22 @@ enum EraseSupport {
                 piece.stroke = stroke
                 piece.z = FractionalIndex.between(last, next)
                 last = piece.z
-                try tx.put(piece, doc: doc, page: page)
-                created += 1
+                pieces.append(piece)
             }
             top = last
         }
-        return EraseCounts(removed: plan.remove.count, created: created)
+        try tx.put(pieces, doc: doc, page: page)
+        return EraseCounts(removed: plan.remove.count, created: pieces.count)
+    }
+
+    /// The z key of the first item above `z` (binary search: `items` are in z order).
+    static func nextZ(above z: String, in items: [Item]) -> String? {
+        var lo = 0, hi = items.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if items[mid].z > z { hi = mid } else { lo = mid + 1 }
+        }
+        return lo < items.count ? items[lo].z : nil
     }
 }
 
@@ -107,7 +116,7 @@ struct InkErase: NibCommand {
         id: "ink.erase", title: "Erase",
         summary: "Erase along a path on a page: precision cuts at the eraser's edge, standard removes touched segments, stroke removes whole strokes. Returns counts.",
         params: .obj(["page": .ref,
-                      "path": .arr(.point, "eraser centre line [[x,y],…] in page points (at most \(EraserGeometry.maxPathPoints) points)"),
+                      "path": .arr(.point, "eraser centre line [[x,y],…] in page points (at most \(NibLimits.maxErasePathPoints) points)"),
                       "radius": .num("eraser radius in page points", min: 0.1, max: EraserGeometry.maxRadius),
                       "mode": .str("precision | standard | stroke", choices: EraserMode.allCases.map { $0.rawValue }),
                       "filter": .arr(.str(choices: InkTool.allCases.map { $0.rawValue }),
@@ -154,7 +163,7 @@ struct InkScribbleErase: NibCommand {
         id: "ink.scribbleErase", title: "Scribble to Erase",
         summary: "Erase the pen and pencil strokes a scribble covers (points = the scribble's path in page points; the scribble is not kept). Returns counts.",
         params: .obj(["page": .ref,
-                      "points": .arr(.point, "the scribble's path [[x,y],…] in page points (at most \(EraserGeometry.maxPathPoints) points)")],
+                      "points": .arr(.point, "the scribble's path [[x,y],…] in page points (at most \(NibLimits.maxErasePathPoints) points)")],
                      required: ["page", "points"]),
         examples: [try! JSONValue.parse(#"{"page":"page:FIXTUREDOC01/FIXTUREPG001","points":[[70,116],[150,118],[70,121],[150,124],[70,127]]}"#)],
         effect: .edit, destructive: true)

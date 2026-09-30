@@ -4,15 +4,19 @@ import NibDesign
 
 /// The "eraser" canvas tool (`.samples` input). While the eraser moves it hides what it touches (`setHidden`) and
 /// draws what will be left of cut strokes into the tool overlay, with a circle showing its size; on lift it commits
-/// ONE `ink.erase` for the whole gesture (one undo step), then returns to the previous tool when Auto-deselect is on.
+/// ONE `ink.erase` for the whole gesture (one undo step) and reports one use (`host.finishToolUse`), which returns to
+/// the previous tool when Auto-deselect is on (or to the tool it was picked temporarily from). The preview stays until
+/// the canvas has drawn the committed ink (`host.afterNextRender`). A gesture belongs to the page it started on:
+/// samples over other pages are converted into that page's coordinates (`host.convert`), so the path follows the pen.
 /// The overlay is plain vector drawing: nothing animates and no shader or glass passes over the ink.
 @MainActor
 final class EraserTool: CanvasTool {
     let id = "eraser"
     var inputMode: CanvasInputMode { .samples }
-    /// Auto-deselect is handled here, on lift, so the tool always reports itself sticky: a second, generic
-    /// "return to the previous tool" would bounce straight back to the eraser.
-    var isSticky: Bool { true }
+    /// Sticky unless Auto-deselect is on: `finishToolUse` then returns to the previous tool after each erase.
+    var isSticky: Bool { !(settings?.get(EraserSettings.autoDeselect) ?? false) }
+    /// A canvas that never redraws the page (closed meanwhile) still gets its hidden ink back after this long.
+    static let renderTimeout: UInt64 = 1_000_000_000
 
     private struct Gesture {
         let page: PageID
@@ -23,9 +27,14 @@ final class EraserTool: CanvasTool {
 
     private var gesture: Gesture?
     private var isActive = false
+    /// The app's settings, known once the tool is on a canvas (`isSticky` reads Auto-deselect from it).
+    private weak var settings: SettingsStore?
     /// Bumped per gesture, so a finished gesture's late clean-up never touches the next one's preview.
     private var generation = 0
     private var commitsInFlight = 0
+    /// Commits waiting for the canvas to draw their ink, by gesture: each clean-up runs once, from whichever of
+    /// `afterNextRender` and the timeout comes first.
+    private var awaitingRender: [Int: CheckedContinuation<Void, Never>] = [:]
     /// The gesture whose hidden set each page shows, so a commit's clean-up shows its own page again even when the
     /// next gesture already started (on another page, or on the same page without touching anything yet).
     private var hiddenBy: [PageID: Int] = [:]
@@ -73,13 +82,13 @@ final class EraserTool: CanvasTool {
         let session = host.session
         guard !session.readOnly, !session.hiddenLayers.contains(session.activeLayer) else { return }
         let settings = host.app.settings
-        let size = EraserSettings.clamped(settings.get(EraserSettings.size))
+        let size = EraserSettings.size(settings)
         // Zoomed far out a large eraser would exceed what `ink.erase` takes: it erases at most maxRadius.
         let radius = min(size / 2 / max(host.zoomScale, 0.01), EraserGeometry.maxRadius)
         let items = (try? host.app.workspace.items(host.documentID, page: sample.page)) ?? []
         // The eraser only reaches what is on screen: on the current page, skip everything outside the visible part.
         let visible = sample.page == session.page ? session.visibleRect?.insetBy(-2 * radius) : nil
-        var erase = EraseSession(items: items, radius: radius, mode: settings.get(EraserSettings.mode),
+        var erase = EraseSession(items: items, radius: radius, mode: EraserSettings.mode(settings),
                                  filter: EraserSettings.filter(settings), layer: session.activeLayer, region: visible)
         let changed = erase.extend(to: sample.location)
         gesture = Gesture(page: sample.page, session: erase, step: max(0.25, radius * 0.15))
@@ -90,24 +99,32 @@ final class EraserTool: CanvasTool {
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {
         guard var g = gesture else { return }
         var changed = Set<ElementID>()
-        for sample in samples where !sample.isPredicted && sample.page == g.page {
-            if let last = g.session.path.last, last.distance(to: sample.location) < g.step { continue }
-            changed.formUnion(g.session.extend(to: sample.location))
+        var cursor: Point?
+        for sample in samples where !sample.isPredicted {
+            guard let p = location(sample, on: g.page, host: host) else { continue }
+            cursor = p
+            if let last = g.session.path.last, last.distance(to: p) < g.step { continue }
+            changed.formUnion(g.session.extend(to: p))
         }
         gesture = g
-        if let last = samples.last(where: { $0.page == g.page }) { moveCursor(to: last.location, page: g.page, host: host) }
+        if let p = cursor { moveCursor(to: p, page: g.page, host: host) }
         refresh(changed, g.session, page: g.page, host: host)
     }
 
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
         guard var g = gesture else { return }
         gesture = nil
-        if sample.page == g.page, g.session.path.last != sample.location {
-            let changed = g.session.extend(to: sample.location)
+        if let p = location(sample, on: g.page, host: host), g.session.path.last != p {
+            let changed = g.session.extend(to: p)
             refresh(changed, g.session, page: g.page, host: host)
         }
         hideCursor()
         commit(g, host: host)
+    }
+
+    /// A sample in the coordinates of the gesture's page; nil when a page it crosses is not laid out.
+    private func location(_ sample: CanvasSample, on page: PageID, host: CanvasHost) -> Point? {
+        sample.page == page ? sample.location : host.convert(sample.location, from: sample.page, to: page)
     }
 
     func touchesCancelled(host: CanvasHost) {
@@ -131,8 +148,7 @@ final class EraserTool: CanvasTool {
             return
         }
         install(in: host)
-        showCursor(at: sample.location, page: sample.page,
-                   diameter: EraserSettings.clamped(host.app.settings.get(EraserSettings.size)), host: host)
+        showCursor(at: sample.location, page: sample.page, diameter: EraserSettings.size(host.app.settings), host: host)
     }
 
     // MARK: Commit
@@ -141,16 +157,16 @@ final class EraserTool: CanvasTool {
         let app = host.app
         let session = host.session
         let token = generation
-        let autoDeselect = app.settings.get(EraserSettings.autoDeselect)
         let erase = g.session
         let page = JSONValue.string(NodeRef.page(host.documentID, g.page).description)
         let filter = JSONValue.array(InkTool.allCases.filter { erase.filter.contains($0) }.map { JSONValue.string($0.rawValue) })
-        // `ink.erase` takes at most maxPathPoints points: a longer scrub goes in consecutive parts (each starting where
-        // the last ended) that share one undo group, so it is still one undo step.
+        // `ink.erase` takes at most NibLimits.maxErasePathPoints points: a longer scrub goes in consecutive parts (each
+        // starting where the last ended) that share one undo group, so it is still one undo step.
+        let limit = NibLimits.maxErasePathPoints
         var parts: [ArraySlice<Point>] = []
         var start = 0
         repeat {
-            let end = min(start + EraserGeometry.maxPathPoints, erase.path.count)
+            let end = min(start + limit, erase.path.count)
             parts.append(erase.path[start..<end])
             start = end - 1
         } while start < erase.path.count - 1
@@ -160,7 +176,7 @@ final class EraserTool: CanvasTool {
         }
         let group = NibID.make().raw
         commitsInFlight += 1
-        // Holds the tool until the clean-up ran (at most ~150 ms), so its layers never outlive it in the overlay.
+        // Holds the tool until the clean-up ran, so its layers never outlive it in the overlay.
         pendingCommit = Task { @MainActor in
             if !erase.affected.isEmpty {
                 do {
@@ -173,15 +189,29 @@ final class EraserTool: CanvasTool {
                                                     userInfo: ["command": CommandIDs.inkErase, "error": NibError.wrap(error)])
                 }
             }
-            if autoDeselect, session.tool == self.id, let previous = session.previousTool, previous != self.id {
-                _ = try? await app.bus.execute(CommandIDs.toolSelect, ["tool": .string(previous)], session: session)
+            // One lift is one use of the eraser (unless the user already picked another tool meanwhile).
+            if session.tool == self.id { host.finishToolUse(self) }
+            guard !erase.affected.isEmpty else {
+                self.finishCommit(token: token, page: g.page, host: host)
+                return
             }
-            if !erase.affected.isEmpty {
-                // Keep the preview until the renderer has drawn the committed pieces, so nothing flickers.
-                try? await Task.sleep(nanoseconds: 150_000_000)
+            // Keep the preview until the canvas has drawn the committed pieces, so nothing flickers.
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                self.awaitingRender[token] = done
+                host.afterNextRender(page: g.page) { self.rendered(token: token, page: g.page, host: host) }
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: EraserTool.renderTimeout)
+                    self.rendered(token: token, page: g.page, host: host)
+                }
             }
-            self.finishCommit(token: token, page: g.page, host: host)
         }
+    }
+
+    /// The committed ink of gesture `token` is on screen (or the timeout passed): clean up once.
+    private func rendered(token: Int, page: PageID, host: CanvasHost) {
+        guard let done = awaitingRender.removeValue(forKey: token) else { return }
+        finishCommit(token: token, page: page, host: host)
+        done.resume()
     }
 
     private func finishCommit(token: Int, page: PageID, host: CanvasHost) {
@@ -209,6 +239,7 @@ final class EraserTool: CanvasTool {
     // MARK: Drawing
 
     private func install(in host: CanvasHost) {
+        settings = host.app.settings
         guard root.superlayer !== host.overlayLayer else { return }
         // The ring sits on paper, which is never inverted: a dark line inside a light halo reads on any paper.
         let paper = UITraitCollection(userInterfaceStyle: .light)

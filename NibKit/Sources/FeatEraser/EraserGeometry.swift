@@ -19,10 +19,8 @@ enum EraserGeometry {
     /// Pieces shorter than this (page points) are dropped: they would render as specks.
     static let minPieceLength = 0.3
     /// The largest eraser radius `ink.erase` takes (page points); the tool clamps to it when zoomed far out.
+    /// (The most points one path or scribble may have is `NibLimits.maxErasePathPoints`.)
     static let maxRadius = 500.0
-    /// The most points one `ink.erase` path or `ink.scribbleErase` scribble may have, so no caller can hold the main
-    /// actor for long. The tool sends longer gestures in several calls that share one undo group.
-    static let maxPathPoints = 20_000
 
     // MARK: Primitives
 

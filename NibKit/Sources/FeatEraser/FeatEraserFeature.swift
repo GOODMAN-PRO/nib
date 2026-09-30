@@ -34,21 +34,24 @@ public enum FeatEraserFeature: NibFeature {
 
         app.ui.menus.register(MenuItemDescriptor(
             id: "eraser.clearPage", title: String(localized: "Clear Page"), icon: NibSymbol.eraser.name,
-            location: .documentMore, order: 700, owner: id, command: "page.clear",
+            location: .documentMore, order: 700, owner: id, command: CommandIDs.pageClear,
             params: { ctx in pageParams(ctx) }, isVisible: { ctx in canEdit(ctx) }, destructive: true))
         app.ui.menus.register(MenuItemDescriptor(
             id: "eraser.deleteItems", title: String(localized: "Delete Specific Items…"), icon: NibSymbol.trash.name,
-            location: .documentMore, order: 710, owner: id, command: "panel.open",
+            location: .documentMore, order: 710, owner: id, command: CommandIDs.panelOpen,
             params: { _ in ["id": .string(deleteItemsPanel)] }, isVisible: { ctx in canEdit(ctx) }))
         app.ui.menus.register(MenuItemDescriptor(
             id: "eraser.clearPage.thumbnail", title: String(localized: "Clear Page"), icon: NibSymbol.eraser.name,
-            location: .sidebarPage, order: 700, owner: id, command: "page.clear",
+            location: .sidebarPage, order: 700, owner: id, command: CommandIDs.pageClear,
             params: { ctx in pageParams(ctx) }, isVisible: { ctx in canEdit(ctx) }, destructive: true))
 
-        app.ui.panels.register(PanelDescriptor(
+        var sheet = PanelDescriptor(
             id: deleteItemsPanel, title: String(localized: "Delete Specific Items"), icon: NibSymbol.trash.name,
             placement: .sheet, order: 900, owner: id, docKinds: [.notebook, .whiteboard],
-            makeView: { context in AnyView(DeleteItemsSheet(context: context)) }))
+            makeView: { context in AnyView(DeleteItemsSheet(context: context)) })
+        // The sheet draws its own NibSheetHeader (Cancel, title, "Delete n Items"), so the chrome adds none.
+        sheet.providesHeader = true
+        app.ui.panels.register(sheet)
     }
 
     /// The page a menu acts on: the long-pressed thumbnail, else the window's current page.
@@ -67,36 +70,42 @@ public enum FeatEraserFeature: NibFeature {
     }
 }
 
-/// The eraser's settings (synced, so they follow the library). The UI changes them through `settings.set`, like
-/// plugins and the AI can.
+/// The eraser's settings (synced, so they follow the library). Mode, size and the Erase Filter are the shared
+/// `NibSettings` keys (contracts-v2 G13), which the Zoom Window (F038) and the Pencil hover preview (F043) read too;
+/// F010 owns them and re-declares them under its own id. The UI changes them through `settings.set`, like plugins and
+/// the AI can.
 enum EraserSettings {
-    static let mode = SettingKey("eraser.mode", default: EraserMode.standard, synced: true)
-    /// On-screen diameter in points: zooming in erases a smaller area of the page, as in Goodnotes.
-    static let size = SettingKey("eraser.size", default: 14.0, synced: true)
-    /// Return to the previous tool when the eraser lifts (T-021).
+    /// Return to the previous tool when the eraser lifts (T-021). Only the eraser reads it.
     static let autoDeselect = SettingKey("eraser.autoDeselect", default: false, synced: true)
-    /// Size presets (T-093); the slider sets anything in `sizeRange`.
+    /// Size presets in screen points (T-093); the slider sets anything in `sizeRange`.
     static let presets: [Double] = [6, 14, 28]
     static let sizeRange: ClosedRange<Double> = 2...60
 
-    /// Erase Filter (T-019): one key per ink tool, all on by default.
-    static func filterKey(_ tool: InkTool) -> SettingKey<Bool> {
-        SettingKey("eraser.filter." + tool.rawValue, default: true, synced: true)
-    }
-
     static func declare(_ s: SettingsStore, owner: String) {
-        s.declare(mode, summary: "Eraser mode: precision (cuts at the edge), standard (touched segments) or stroke (whole strokes).",
+        s.declare(NibSettings.eraserMode,
+                  summary: "Eraser mode: precision (cuts at the edge), standard (touched segments) or stroke (whole strokes).",
                   owner: owner, schema: .str(choices: EraserMode.allCases.map { $0.rawValue }))
-        s.declare(size, summary: "Eraser diameter in screen points (presets 6, 14 and 28).", owner: owner,
+        s.declare(NibSettings.eraserSize, summary: "Eraser diameter in screen points (presets 6, 14 and 28).", owner: owner,
                   schema: .num(min: sizeRange.lowerBound, max: sizeRange.upperBound))
         s.declare(autoDeselect, summary: "Return to the previous tool after each erase.", owner: owner, schema: .bool())
         for tool in InkTool.allCases {
-            s.declare(filterKey(tool), summary: "The eraser erases \(tool.rawValue) strokes.", owner: owner, schema: .bool())
+            s.declare(NibSettings.eraserFilter(tool), summary: "The eraser erases \(tool.rawValue) strokes.", owner: owner,
+                      schema: .bool())
         }
     }
 
+    /// The stored mode; an unknown value (a newer app, a hand-edited file) erases like the default.
+    static func mode(_ s: SettingsStore) -> EraserMode {
+        EraserMode(rawValue: s.get(NibSettings.eraserMode)) ?? .standard
+    }
+
+    /// The eraser's on-screen diameter, clamped to what the slider offers.
+    static func size(_ s: SettingsStore) -> Double {
+        clamped(s.get(NibSettings.eraserSize))
+    }
+
     static func filter(_ s: SettingsStore) -> Set<InkTool> {
-        Set(InkTool.allCases.filter { s.get(filterKey($0)) })
+        Set(InkTool.allCases.filter { s.get(NibSettings.eraserFilter($0)) })
     }
 
     static func clamped(_ size: Double) -> Double {

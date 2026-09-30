@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 import Combine
 import NibContracts
 import NibTesting
@@ -69,6 +70,8 @@ final class FeatEraserTests: XCTestCase {
         XCTAssertNotNil(item?.settings)
         XCTAssertNotNil(item?.activeToolMenu)
         XCTAssertEqual(h.app.ui.panels.get(FeatEraserFeature.deleteItemsPanel)?.placement, .sheet)
+        XCTAssertEqual(h.app.ui.panels.get(FeatEraserFeature.deleteItemsPanel)?.providesHeader, true,
+                       "the sheet draws its own header")
 
         let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1)
         let more = h.app.ui.menuItems(.documentMore, context)
@@ -80,9 +83,27 @@ final class FeatEraserTests: XCTestCase {
         XCTAssertTrue(h.app.ui.menuItems(.documentMore, context).filter { $0.owner == FeatEraserFeature.id }.isEmpty)
 
         for name in ["eraser.mode", "eraser.size", "eraser.autoDeselect", "eraser.filter.pen", "eraser.filter.tape"] {
-            XCTAssertNotNil(h.app.settings.descriptor(name), name)
+            XCTAssertEqual(h.app.settings.descriptor(name)?.owner, FeatEraserFeature.id, "F010 owns \(name)")
         }
         XCTAssertEqual(EraserSettings.filter(h.app.settings), Set(InkTool.allCases))
+    }
+
+    func testTheSharedEraserKeysAreTheOnesOtherFeaturesRead() {
+        let h = Harness(features: [FeatEraserFeature.self])
+        XCTAssertEqual(EraserSettings.mode(h.app.settings), .standard)
+        XCTAssertEqual(EraserSettings.size(h.app.settings), 14)
+        // The Zoom Window (F038) and the Pencil hover preview (F043) write and read the NibSettings keys.
+        h.app.settings.set(NibSettings.eraserMode, "precision")
+        h.app.settings.set(NibSettings.eraserSize, 28)
+        h.app.settings.set(NibSettings.eraserFilter(.tape), false)
+        XCTAssertEqual(EraserSettings.mode(h.app.settings), .precision)
+        XCTAssertEqual(EraserSettings.size(h.app.settings), 28)
+        XCTAssertEqual(EraserSettings.filter(h.app.settings), [.pen, .pencil, .highlighter])
+        h.app.settings.set(NibSettings.eraserMode, "pixel")
+        h.app.settings.set(NibSettings.eraserSize, 500)
+        XCTAssertEqual(EraserSettings.mode(h.app.settings), .standard, "an unknown mode erases like the default")
+        XCTAssertEqual(EraserSettings.size(h.app.settings), EraserSettings.sizeRange.upperBound)
+        XCTAssertEqual(h.app.settings.undeclaredNames.filter { $0.hasPrefix("eraser.") }, [])
     }
 
     // MARK: ink.erase
@@ -116,6 +137,15 @@ final class FeatEraserTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(), before)
         XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
         XCTAssertEqual(try items(h).filter { $0.stroke?.style.tool == .pen }.count, 2)
+    }
+
+    func testNextZFindsTheFirstItemAboveAKey() {
+        let items = ["B", "D", "F"].map { Item(id: NibID($0), kind: .stroke, z: $0, stroke: Stroke(style: InkStyle(tool: .pen), points: [])) }
+        XCTAssertEqual(EraseSupport.nextZ(above: "A", in: items), "B")
+        XCTAssertEqual(EraseSupport.nextZ(above: "B", in: items), "D")
+        XCTAssertEqual(EraseSupport.nextZ(above: "C", in: items), "D")
+        XCTAssertNil(EraseSupport.nextZ(above: "F", in: items))
+        XCTAssertNil(EraseSupport.nextZ(above: "A", in: []))
     }
 
     func testPrecisionEraseKeepsWidthsAndIsScopedToTheActiveLayerAndUnlockedInk() async throws {
@@ -186,7 +216,7 @@ final class FeatEraserTests: XCTestCase {
         await assertInvalid(h, "ink.erase", ["page": .string(page1), "path": path([(1, 1)]), "radius": 3, "mode": "pixel"])
         await assertInvalid(h, "ink.erase", ["page": .string(page1), "path": path([(1, 1)]), "radius": 501, "mode": "standard"])
         // Over-long paths are refused before any geometry runs.
-        let long = path((0...EraserGeometry.maxPathPoints).map { (Double($0 % 500), 10.0) })
+        let long = path((0...NibLimits.maxErasePathPoints).map { (Double($0 % 500), 10.0) })
         await assertInvalid(h, "ink.erase", ["page": .string(page1), "path": long, "radius": 3, "mode": "standard"])
         await assertInvalid(h, "ink.scribbleErase", ["page": .string(page1), "points": long])
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
@@ -236,6 +266,48 @@ final class FeatEraserTests: XCTestCase {
         let empty = try await h.run("page.clear", ["page": .string(page2)])
         XCTAssertEqual(empty, ["removed": 0, "created": 0])
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0, "clearing an empty page records nothing")
+    }
+
+    func testClearingALargePageIsOneBatchAndOneUndoStep() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        let count = 5_000
+        var seeded = (0..<count).map { i -> Item in
+            let x = Float(i % 500), y = Float(i / 500) * 20
+            let points = [StrokePoint(x: x, y: y, t: 0, width: 1, height: 1), StrokePoint(x: x + 1, y: y, t: 0.01, width: 1, height: 1)]
+            return Item(id: NibID(String(format: "S%05d", i)), kind: .stroke, z: String(format: "V%05d", i),
+                        stroke: Stroke(style: InkStyle(tool: .pen, width: 1), points: points))
+        }
+        // A connector anchored to one of them lets go when it goes.
+        seeded.append(Item(id: "LINK", kind: .connector, z: "W",
+                          connector: ConnectorItem(from: ConnectorEnd(point: Point(0, 0), item: "S00000"),
+                                                   to: ConnectorEnd(point: Point(40, 40)))))
+        seedPage2(h, seeded)
+        // Page 2 without revisions (undo writes fresh ones); cheaper than a whole-document snapshot at this size.
+        func page2Items() throws -> [Item] {
+            try items(h, Fixtures.page2).map { item -> Item in
+                var bare = item
+                bare.rev = .zero
+                return bare
+            }
+        }
+        let before = try page2Items()
+        XCTAssertEqual(before.count, count + 1)
+        let r = try await h.run("page.deleteItems", ["page": .string(page2), "kinds": ["pen"], "scope": "page"])
+        XCTAssertEqual(r, ["removed": .number(Double(count)), "created": 0])
+        let left = try items(h, Fixtures.page2)
+        XCTAssertEqual(left.map { $0.id }, ["LINK"])
+        XCTAssertNil(left.first?.connector?.from.item)
+        XCTAssertEqual(left.first?.connector?.from.point, Point(0, 0))
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try page2Items(), before)
+
+        let cleared = try await h.run("page.clear", ["page": .string(page2)])
+        XCTAssertEqual(cleared, ["removed": .number(Double(count + 1)), "created": 0])
+        XCTAssertTrue(try items(h, Fixtures.page2).isEmpty)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "one step each: the delete was undone, the clear is new")
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try page2Items(), before)
     }
 
     // MARK: page.deleteItems
@@ -294,8 +366,8 @@ final class FeatEraserTests: XCTestCase {
 
     func testEraserToolHidesWhileDraggingThenCommitsOneEraseAndAutoDeselects() async throws {
         let h = Harness(features: [FeatEraserFeature.self])
-        h.app.settings.set(EraserSettings.mode, .standard)
-        h.app.settings.set(EraserSettings.size, 6)
+        h.app.settings.set(NibSettings.eraserMode, EraserMode.standard.rawValue)
+        h.app.settings.set(NibSettings.eraserSize, 6)
         h.app.settings.set(EraserSettings.autoDeselect, true)
         h.session.tool = "pen"
         h.session.tool = "eraser"
@@ -311,17 +383,101 @@ final class FeatEraserTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 0, "nothing is committed before the lift")
         XCTAssertFalse(try items(h).isEmpty)
 
+        XCTAssertFalse(tool.isSticky, "Auto-deselect makes the eraser a one-use tool")
+        var finished: [JSONValue] = []
+        let sub = h.app.events.subscribe { if $0.type == NibEventType.toolFinished { finished.append($0.payload ?? .null) } }
+        defer { sub.cancel() }
         tool.touchesEnded(sample(100, 140), host: host)
         await tool.pendingCommit?.value
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "one ink.erase per gesture")
         XCTAssertEqual(try items(h).filter { $0.stroke?.style.tool == .pen }.count, 2)
+        XCTAssertEqual(host.renderWaits, [Fixtures.page1], "the preview stays until the canvas drew the committed ink")
         XCTAssertNil(host.hidden[Fixtures.page1], "hidden items are shown again once the erase is committed")
         XCTAssertEqual(h.session.tool, "pen", "Auto-deselect returns to the previous tool")
+        XCTAssertEqual(finished.map { $0["tool"] ?? .null }, [JSONValue.string("eraser")], "the lift is reported as one use")
+    }
+
+    func testWithoutAutoDeselectTheEraserStaysUnlessItWasPickedTemporarily() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        h.app.settings.set(NibSettings.eraserSize, 6)
+        let host = FakeCanvasHost(h)
+        let tool = EraserTool()
+        tool.activate(host)
+        XCTAssertTrue(tool.isSticky)
+        func erase(at y: Double) async {
+            tool.tap(CanvasSample(page: Fixtures.page1, location: Point(100, y)), host: host)
+            await tool.pendingCommit?.value
+        }
+        h.session.tool = "pen"
+        h.session.tool = "eraser"
+        await erase(at: 122)
+        XCTAssertEqual(h.session.tool, "eraser", "a sticky eraser stays after an erase")
+
+        h.session.tool = "lasso"
+        try await h.run(CommandIDs.toolSelect, ["tool": "eraser", "temporary": true])
+        XCTAssertEqual(h.session.temporaryReturnTool, "lasso")
+        await erase(at: 780)                                    // a miss is still one use
+        XCTAssertEqual(h.session.tool, "lasso", "a temporary eraser hands back after one use")
+        XCTAssertNil(h.session.temporaryReturnTool)
+        XCTAssertEqual(host.renderWaits, [Fixtures.page1], "only a gesture that erased something waits for the render")
+
+        // A tool picked while the erase ran is left alone.
+        h.session.tool = "eraser"
+        tool.tap(CanvasSample(page: Fixtures.page1, location: Point(100, 124)), host: host)
+        h.session.tool = "highlighter"
+        await tool.pendingCommit?.value
+        XCTAssertEqual(h.session.tool, "highlighter")
+    }
+
+    func testAGestureFollowsThePenOverAnotherPageInsteadOfCuttingStraightAcross() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        h.app.settings.set(NibSettings.eraserMode, EraserMode.standard.rawValue)
+        h.app.settings.set(NibSettings.eraserSize, 6)
+        // A 40 pt vertical line at x = 50 near the top of page 2 (below page 1 on the fake canvas).
+        let points = (0...40).map { StrokePoint(x: 50, y: Float($0), t: Float($0) * 0.01, width: 2, height: 2) }
+        seedPage2(h, [Item(id: "VERT", kind: .stroke, z: "V",
+                           stroke: Stroke(style: InkStyle(tool: .pen, pen: .ball, width: 2), points: points))])
+        let page1Before = try items(h)
+        let host = FakeCanvasHost(h)
+        let tool = EraserTool()
+        tool.activate(host)
+        // Starts left of the line on page 2, goes up over the bottom of page 1, comes back down right of the line.
+        tool.touchesBegan(CanvasSample(page: Fixtures.page2, location: Point(20, 20)), host: host)
+        tool.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(20, 830)),
+                           CanvasSample(page: Fixtures.page1, location: Point(80, 830))], host: host)
+        tool.touchesEnded(CanvasSample(page: Fixtures.page2, location: Point(80, 20)), host: host)
+        await tool.pendingCommit?.value
+        XCTAssertEqual(try items(h, Fixtures.page2).map { $0.id }, ["VERT"], "the eraser went around the line")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 0)
+
+        // The same detour ending on the line erases it there, on the page the gesture started on.
+        tool.touchesBegan(CanvasSample(page: Fixtures.page2, location: Point(20, 20)), host: host)
+        tool.touchesMoved([CanvasSample(page: Fixtures.page1, location: Point(20, 830)),
+                           CanvasSample(page: Fixtures.page1, location: Point(50, 830))], host: host)
+        tool.touchesEnded(CanvasSample(page: Fixtures.page2, location: Point(50, 20)), host: host)
+        await tool.pendingCommit?.value
+        XCTAssertFalse(try items(h, Fixtures.page2).contains { $0.id == "VERT" })
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertEqual(try items(h), page1Before, "nothing on the page the pen passed over is erased")
+    }
+
+    func testTheHiddenInkComesBackEvenWhenTheCanvasNeverRendersAgain() async throws {
+        let h = Harness(features: [FeatEraserFeature.self])
+        h.app.settings.set(NibSettings.eraserSize, 6)
+        let host = SilentCanvasHost(FakeCanvasHost(h))
+        let tool = EraserTool()
+        tool.activate(host)
+        tool.tap(CanvasSample(page: Fixtures.page1, location: Point(100, 122)), host: host)
+        XCTAssertEqual(host.base.hidden[Fixtures.page1] ?? [], [Fixtures.strokeID])
+        await tool.pendingCommit?.value
+        XCTAssertEqual(host.renderRequests, 1)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertNil(host.base.hidden[Fixtures.page1], "the render timeout shows the page again")
     }
 
     func testInkHiddenOnOnePageIsShownAgainWhenTheNextGestureIsOnAnotherPage() async throws {
         let h = Harness(features: [FeatEraserFeature.self])
-        h.app.settings.set(EraserSettings.size, 6)
+        h.app.settings.set(NibSettings.eraserSize, 6)
         let host = FakeCanvasHost(h)
         let tool = EraserTool()
         tool.activate(host)
@@ -344,8 +500,8 @@ final class FeatEraserTests: XCTestCase {
 
     func testTapErasesWhereTheEraserLands() async throws {
         let h = Harness(features: [FeatEraserFeature.self])
-        h.app.settings.set(EraserSettings.mode, .standard)
-        h.app.settings.set(EraserSettings.size, 6)
+        h.app.settings.set(NibSettings.eraserMode, EraserMode.standard.rawValue)
+        h.app.settings.set(NibSettings.eraserSize, 6)
         let host = FakeCanvasHost(h)
         let tool = EraserTool()
         tool.activate(host)
@@ -358,7 +514,7 @@ final class FeatEraserTests: XCTestCase {
 
     func testZoomedFarOutALargeEraserStaysWithinWhatInkEraseTakes() async throws {
         let h = Harness(features: [FeatEraserFeature.self])
-        h.app.settings.set(EraserSettings.size, 60)
+        h.app.settings.set(NibSettings.eraserSize, 60)
         let host = FakeCanvasHost(h)
         host.zoomScale = 0.05                                  // 60 pt on screen = a 600 pt radius on the page
         let tool = EraserTool()
@@ -372,8 +528,8 @@ final class FeatEraserTests: XCTestCase {
 
     func testAScrubLongerThanOneInkEraseCallIsStillOneUndoStep() async throws {
         let h = Harness(features: [FeatEraserFeature.self])
-        h.app.settings.set(EraserSettings.mode, .standard)
-        h.app.settings.set(EraserSettings.size, 6)
+        h.app.settings.set(NibSettings.eraserMode, EraserMode.standard.rawValue)
+        h.app.settings.set(NibSettings.eraserSize, 6)
         let before = try h.snapshot()
         let host = FakeCanvasHost(h)
         let tool = EraserTool()
@@ -383,7 +539,7 @@ final class FeatEraserTests: XCTestCase {
         // the path goes out in two ink.erase calls and each of them erases something.
         tool.touchesBegan(sample(100, 100), host: host)
         var moves = [sample(100, 140)]
-        moves += (0..<EraserGeometry.maxPathPoints).map { sample(300, $0 % 2 == 0 ? 300 : 301) }
+        moves += (0..<NibLimits.maxErasePathPoints).map { sample(300, $0 % 2 == 0 ? 300 : 301) }
         moves += [sample(170, 580), sample(170, 620)]
         tool.touchesMoved(moves, host: host)
         tool.touchesEnded(sample(170, 620), host: host)
@@ -398,7 +554,7 @@ final class FeatEraserTests: XCTestCase {
 
     func testEraserToolCancelShowsEverythingAndErasesNothing() throws {
         let h = Harness(features: [FeatEraserFeature.self])
-        h.app.settings.set(EraserSettings.size, 6)
+        h.app.settings.set(NibSettings.eraserSize, 6)
         let host = FakeCanvasHost(h)
         let tool = EraserTool()
         tool.activate(host)
@@ -422,8 +578,8 @@ final class FeatEraserTests: XCTestCase {
         defer { observer.cancel() }
 
         model.toggle(.pen)
-        await eventually { !h.app.settings.get(EraserSettings.filterKey(.pen)) }
-        XCTAssertFalse(h.app.settings.get(EraserSettings.filterKey(.pen)), "a chip writes eraser.filter.pen")
+        await eventually { !h.app.settings.get(NibSettings.eraserFilter(.pen)) }
+        XCTAssertFalse(h.app.settings.get(NibSettings.eraserFilter(.pen)), "a chip writes eraser.filter.pen")
 
         model.only(.highlighter)
         await eventually { EraserSettings.filter(h.app.settings) == [.highlighter] }
@@ -437,16 +593,41 @@ final class FeatEraserTests: XCTestCase {
         model.size = 20
         model.size = 21
         model.size = 22
-        await eventually { h.app.settings.get(EraserSettings.size) == 22 }
+        await eventually { h.app.settings.get(NibSettings.eraserSize) == 22 }
         await settle()
-        XCTAssertEqual(h.app.settings.get(EraserSettings.size), 22)
+        XCTAssertEqual(h.app.settings.get(NibSettings.eraserSize), 22)
         XCTAssertEqual(writes.filter { $0 == "eraser.size" }.count, 1, "a slider drag writes once, after it rests")
 
         writes = []
-        h.app.settings.set(EraserSettings.mode, .precision)
+        h.app.settings.set(NibSettings.eraserMode, EraserMode.precision.rawValue)
         await eventually { model.mode == .precision }
         await settle()
         XCTAssertEqual(model.mode, .precision, "the model follows the store")
         XCTAssertEqual(writes, ["eraser.mode"], "reading values back never writes them")
     }
+}
+
+/// A canvas that never reports a render (`afterNextRender` bodies are dropped); everything else is the fake's.
+@MainActor
+private final class SilentCanvasHost: CanvasHost {
+    let base: FakeCanvasHost
+    private(set) var renderRequests = 0
+
+    init(_ base: FakeCanvasHost) { self.base = base }
+
+    var app: NibApp { base.app }
+    var session: EditorSession { base.session }
+    var documentID: DocumentID { base.documentID }
+    var zoomScale: Double { base.zoomScale }
+    var canvasView: UIView { base.canvasView }
+    var overlayLayer: CALayer { base.overlayLayer }
+    func viewPoint(_ p: Point, page: PageID) -> CGPoint { base.viewPoint(p, page: page) }
+    func pagePoint(_ v: CGPoint) -> (page: PageID, point: Point)? { base.pagePoint(v) }
+    func pageFrame(_ page: PageID) -> CGRect? { base.pageFrame(page) }
+    func setHidden(_ ids: Set<ElementID>, page: PageID) { base.setHidden(ids, page: page) }
+    func invalidate(page: PageID, rect: Rect?) { base.invalidate(page: page, rect: rect) }
+    func commitStroke(_ stroke: Stroke, page: PageID) { base.commitStroke(stroke, page: page) }
+    func cancelWetStroke() { base.cancelWetStroke() }
+    func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { base.attachLiveView(view, item: item, page: page) }
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) { renderRequests += 1 }
 }

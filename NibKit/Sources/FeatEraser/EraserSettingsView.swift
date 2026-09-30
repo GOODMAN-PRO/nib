@@ -36,10 +36,7 @@ extension InkTool {
 }
 
 enum EraserSizeFormat {
-    static func label(_ size: Double) -> String {
-        String(localized: "\(Int(size.rounded())) pt")
-    }
-
+    /// The options bar's preset names (VoiceOver and the pointer tooltip).
     static func presetName(_ index: Int, _ size: Double) -> String {
         let points = Int(size.rounded())
         switch index {
@@ -64,7 +61,7 @@ final class EraserOptions: ObservableObject {
     private var subscription: AnyCancellable?
 
     @Published var mode = EraserMode.standard {
-        didSet { if !isReloading && mode != oldValue { write(EraserSettings.mode.name, .string(mode.rawValue)) } }
+        didSet { if !isReloading && mode != oldValue { write(NibSettings.eraserMode.name, .string(mode.rawValue)) } }
     }
     @Published var size = 14.0 {
         didSet { if !isReloading && size != oldValue { scheduleSizeWrite() } }
@@ -76,7 +73,7 @@ final class EraserOptions: ObservableObject {
         didSet {
             guard !isReloading else { return }
             for tool in InkTool.allCases where filter.contains(tool) != oldValue.contains(tool) {
-                write(EraserSettings.filterKey(tool).name, .bool(filter.contains(tool)))
+                write(NibSettings.eraserFilter(tool).name, .bool(filter.contains(tool)))
             }
         }
     }
@@ -95,8 +92,8 @@ final class EraserOptions: ObservableObject {
     func reload() {
         let s = app.settings
         isReloading = true
-        mode = s.get(EraserSettings.mode)
-        if sizeWrite == nil { size = EraserSettings.clamped(s.get(EraserSettings.size)) }
+        mode = EraserSettings.mode(s)
+        if sizeWrite == nil { size = EraserSettings.size(s) }
         filter = EraserSettings.filter(s)
         autoDeselect = s.get(EraserSettings.autoDeselect)
         isReloading = false
@@ -124,7 +121,7 @@ final class EraserOptions: ObservableObject {
             try? await Task.sleep(nanoseconds: 120_000_000)
             guard !Task.isCancelled else { return }
             self.sizeWrite = nil
-            self.write(EraserSettings.size.name, .number(EraserSettings.clamped(self.size)))
+            self.write(NibSettings.eraserSize.name, .number(EraserSettings.clamped(self.size)))
         }
     }
 
@@ -136,7 +133,8 @@ final class EraserOptions: ObservableObject {
 // MARK: - Tool popover
 
 /// The eraser's settings popover (DESIGN.md §14.3): mode, size presets and slider, Erase Filter, Auto-deselect and
-/// Clear Page. The palette wraps it in a Deep `NibPopoverPanel` budded from the tool.
+/// Clear Page. The palette wraps it in a Deep `NibPopoverPanel` budded from the tool. The size is NibDesign's width
+/// slider in screen points, so it looks like every other tool's thickness.
 struct EraserSettingsView: View {
     private let app: NibApp
     @ObservedObject private var session: EditorSession
@@ -158,13 +156,8 @@ struct EraserSettingsView: View {
                     .foregroundStyle(NibColor.labelSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            NibInspectorSection(String(localized: "Size"), value: EraserSizeFormat.label(model.size)) {
-                HStack(spacing: NibSpacing.s) {
-                    EraserSizePresets(model: model)
-                }
-                NibSlider(value: $model.size, in: EraserSettings.sizeRange,
-                          label: String(localized: "Eraser size"), detents: EraserSettings.presets)
-            }
+            NibStrokeWidthSlider(width: $model.size, range: EraserSettings.sizeRange, presets: EraserSettings.presets,
+                                 title: String(localized: "Size"), unit: .points)
             NibInspectorSection(String(localized: "Erase filter"),
                                 action: NibAction(String(localized: "Erase Highlighter Only")) { model.only(.highlighter) }) {
                 EraserFilterChips(model: model)
@@ -176,7 +169,8 @@ struct EraserSettingsView: View {
                     .foregroundStyle(NibColor.labelSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            NibButton(String(localized: "Clear Page"), symbol: .trash, kind: .destructive, expands: true) {
+            // Destructive text without a fill: it is not the popover's button row, and a confirmation follows.
+            NibButton(String(localized: "Clear Page"), symbol: .trash, kind: .destructivePlain, expands: true) {
                 confirmingClear = true
             }
             .disabled(session.document == nil || session.page == nil || session.readOnly)
@@ -192,38 +186,21 @@ struct EraserSettingsView: View {
 
     private func clearPage() {
         guard let doc = session.document, let page = session.page else { return }
-        app.perform("page.clear", ["page": .string(NodeRef.page(doc, page).description)], session: session)
+        app.perform(CommandIDs.pageClear, ["page": .string(NodeRef.page(doc, page).description)], session: session)
     }
 }
 
-/// Three size presets drawn as dots of growing size (T-093); the slider covers everything in between.
+/// The three size presets of the options bar (T-093), as NibDesign's width preset dots (the same dots as the popover's
+/// size slider); the popover's slider covers everything in between.
 struct EraserSizePresets: View {
     @ObservedObject var model: EraserOptions
 
     var body: some View {
         ForEach(Array(EraserSettings.presets.enumerated()), id: \.offset) { index, preset in
-            let selected = abs(model.size - preset) < 0.5
-            Button {
+            NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index), isSelected: abs(model.size - preset) < 0.5,
+                                 label: EraserSizeFormat.presetName(index, preset)) {
                 model.size = preset
-            } label: {
-                Circle()
-                    .fill(NibColor.label)
-                    .frame(width: dot(index), height: dot(index))
-                    .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-                    .background(selected ? NibColor.fill3 : Color.clear, in: Circle())
-                    .contentShape(Circle())
             }
-            .buttonStyle(NibPressStyle(shape: Circle()))
-            .accessibilityLabel(EraserSizeFormat.presetName(index, preset))
-            .accessibilityAddTraits(selected ? .isSelected : [])
-        }
-    }
-
-    private func dot(_ index: Int) -> CGFloat {
-        switch index {
-        case 0: return 6
-        case 1: return 11
-        default: return 17
         }
     }
 }
@@ -420,14 +397,14 @@ struct DeleteItemsSheet: View {
         Task { @MainActor in
             // Announce what was actually removed, once it has been.
             do {
-                let r = try await app.bus.execute(Invocation(command: "page.deleteItems", params: params, session: session))
+                let r = try await app.bus.execute(Invocation(command: CommandIDs.pageDeleteItems, params: params, session: session))
                 let n = r.value["removed"]?.intValue ?? 0
                 UIAccessibility.post(notification: .announcement,
                                      argument: n == 1 ? String(localized: "Deleted 1 item. Undo is available.")
                                                       : String(localized: "Deleted \(n) items. Undo is available."))
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                                userInfo: ["command": "page.deleteItems", "error": NibError.wrap(error)])
+                                                userInfo: ["command": CommandIDs.pageDeleteItems, "error": NibError.wrap(error)])
             }
         }
         context.dismiss()
