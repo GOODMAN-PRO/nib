@@ -10,7 +10,8 @@ import NibDesign
 ///
 /// Every change goes through a command (block.comment, block.editComment, block.deleteComment, block.resolveComment,
 /// and F047's block.update for links and headings), so plugins, the assistant and the bridge can do what the editor
-/// does, and undo covers all of it.
+/// does, and undo covers all of it. ⇧⌘M is a registered key command limited to text documents (contracts-v2.2
+/// `docKinds` and `sessionParams`) that the editor also serves while a block is edited.
 public enum FeatTextDocExtrasFeature: NibFeature {
     public static let id = "textdocextras"
 
@@ -23,6 +24,7 @@ public enum FeatTextDocExtrasFeature: NibFeature {
         app.content.exporters.register(TextDocExporter.descriptor(owner: id))
         app.ui.panels.register(TextDocOutlinePanel.descriptor(owner: id))
         app.ui.panels.register(TextDocCommentsPanel.descriptor(owner: id))
+        app.content.keyCommands.register(BlockCommentsEditor.keyDescriptor(owner: id))
 
         BlockCommentsEditor.install()
         AutoLinkEditor.install()
@@ -36,9 +38,10 @@ public enum FeatTextDocExtrasFeature: NibFeature {
     }
 }
 
-/// Prefix of every `TextDocHooks` id this feature registers (`TextDocHooks.removeAll(prefix:)` takes them all out).
+/// Prefix of every `TextDocHooks` id this feature registers (`TextDocHooks.removeAll(prefix:)` takes them all out),
+/// of its panel and key command ids: the feature id and a dot.
 enum TextDocExtrasHookIDs {
-    static let prefix = FeatTextDocExtrasFeature.id + "."
+    static let prefix = "textdocextras."
 }
 
 /// Runs this feature's edits as the user. When the window's editor shows the document, the call joins the editor's
@@ -102,6 +105,12 @@ struct TextDocCommandRunner {
     }
 }
 
+/// Selected words of one block: a UTF-16 range of its plain text.
+struct TextDocSelection: Equatable {
+    var block: NibID
+    var range: NSRange
+}
+
 /// Per-editor state of this feature, kept on the editor itself (it lives and goes with the editor).
 @MainActor
 final class TextDocExtrasState {
@@ -116,6 +125,9 @@ final class TextDocExtrasState {
 
     /// The block that had the caret at the last selection change (auto-linking runs when the caret leaves it).
     var lastFocusedBlock: NibID?
+    /// The words last selected in a block's text, kept after the keyboard goes (a caret in a block forgets them): the
+    /// ⇧⌘M key command offers a comment on them while no text is being edited.
+    var lastSelection: TextDocSelection?
     /// Pending auto-link passes, per block (debounced while typing).
     var autoLinkTasks: [NibID: Task<Void, Never>] = [:]
     /// Addresses the user unlinked by hand, per block: auto-linking leaves them alone for the rest of the session.

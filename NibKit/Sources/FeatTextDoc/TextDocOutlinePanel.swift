@@ -189,8 +189,9 @@ final class TextDocOutlineModel: ObservableObject {
     private func attachEditor(_ editor: TextDocViewController?) {
         guard editor !== observedEditor else { return }
         observedEditor = editor
+        // UIKit changes the offset on the main thread, where KVO calls back.
         scroll = editor?.collectionView?.observe(\.contentOffset, options: [.new]) { [weak self] _, _ in
-            self?.updateCurrent()
+            MainActor.assumeIsolated { self?.updateCurrent() }
         }
     }
 

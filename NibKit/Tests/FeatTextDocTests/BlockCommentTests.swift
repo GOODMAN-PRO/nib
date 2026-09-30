@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import PDFKit
 import NibContracts
 import NibTesting
@@ -307,6 +308,123 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertEqual(try block(h, "FIXTUREBLK02").comments, kept)
     }
 
+    func testACommentMovesToAnotherBlockKeepingWhoWroteItAndWhen() async throws {
+        let h = harness()
+        let before = try comment(try block(h, "FIXTUREBLK02"), "FIXTURECMB01")
+        let snapshot = try h.snapshot(doc)
+        try await h.run("block.editComment", ["ref": .string(paragraph), "comment": "FIXTURECMB01", "text": "Nice title",
+                                              "block": .string(heading), "range": [0, 7]])
+        XCTAssertNil(try block(h, "FIXTUREBLK02").comments, "it left the paragraph")
+        let moved = try comment(try block(h, "FIXTUREBLK01"), "FIXTURECMB01")
+        XCTAssertEqual([moved.rangeStart, moved.rangeLength], [0, 7])
+        XCTAssertEqual(moved.text, "Nice title")
+        XCTAssertEqual(moved.author, before.author)
+        XCTAssertEqual(moved.at, before.at)
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertEqual(try h.snapshot(doc), snapshot, "one undo step")
+
+        let other = "block:FIXTUREDOC02/NOSUCHBLOCK"
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.editComment", ["ref": .string(paragraph), "comment": "FIXTURECMB01", "text": "x",
+                                                      "block": .string(heading)])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.editComment", ["ref": .string(paragraph), "comment": "FIXTURECMB01", "text": "x",
+                                                      "block": .string(table), "range": [0, 0]])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.editComment", ["ref": .string(paragraph), "comment": "FIXTURECMB01", "text": "x",
+                                                      "block": "block:FIXTUREDOC01/FIXTUREBLK01", "range": [0, 0]])
+        }
+        await assertError(.notFound) {
+            _ = try await h.run("block.editComment", ["ref": .string(paragraph), "comment": "FIXTURECMB01", "text": "x",
+                                                      "block": .string(other), "range": [0, 0]])
+        }
+        await assertError(.invalidParams) {
+            _ = try await h.run("block.editComment", ["ref": .string(paragraph), "comment": "FIXTURECMB01", "text": "x",
+                                                      "block": .string(heading), "range": [0, 40]])
+        }
+        XCTAssertEqual(try h.snapshot(doc), snapshot, "refused moves change nothing")
+
+        // Out of a block deleted in the same change: the delete stays, the comment lives on.
+        try await h.run("block.delete", ["refs": [.string(paragraph)]])
+        try await h.run("block.editComment", ["ref": .string(paragraph), "comment": "FIXTURECMB01", "text": "Nice",
+                                              "block": .string(heading), "range": [8, 4]])
+        XCTAssertEqual(try comment(try block(h, "FIXTUREBLK01"), "FIXTURECMB01").rangeStart, 8)
+        let tombstone = try h.app.workspace.content(doc).blocks.first { $0.id == Fixtures.paragraphBlockID }
+        XCTAssertEqual(tombstone?.deleted, true)
+        XCTAssertNil(tombstone?.comments, "no comment is left twice")
+    }
+
+    func testSplitsAndJoinsAreRecognisedFromTheTextThatMoved() {
+        let c = [BlockComment(id: "HEAD", author: "", text: "h", rangeStart: 0, rangeLength: 5),
+                 BlockComment(id: "ACROSS", author: "", text: "a", rangeStart: 3, rangeLength: 6),
+                 BlockComment(id: "TAIL", author: "", text: "t", rangeStart: 6, rangeLength: 6),
+                 BlockComment(id: "GONE", author: "", text: "g", rangeStart: 6, rangeLength: 0)]
+        let cut = CommentAnchors.TextEdit(block: "A", old: "Hello blocks", new: "Hello ", comments: c)
+        let moved = CommentAnchors.split([cut], inserted: "blocks")
+        XCTAssertEqual(moved.map { $0.comment }, ["TAIL"], "only comments wholly on the rest go with it")
+        XCTAssertEqual(moved.first?.range, NSRange(location: 0, length: 6))
+        XCTAssertEqual(moved.first?.block, "A")
+        XCTAssertTrue(CommentAnchors.split([cut], inserted: "other").isEmpty, "a new block with other text is no split")
+        XCTAssertTrue(CommentAnchors.split([cut], inserted: "").isEmpty)
+        // Return over a selection: "lo b" (3..<7) replaced, "Hel" stays, "locks" moves on.
+        let overSelection = CommentAnchors.TextEdit(block: "A", old: "Hello blocks", new: "Hel", comments: c)
+        XCTAssertEqual(CommentAnchors.split([overSelection], inserted: "locks").map { $0.comment }, [])
+        let late = [BlockComment(id: "END", author: "", text: "e", rangeStart: 8, rangeLength: 4)]
+        let selectionCut = CommentAnchors.TextEdit(block: "A", old: "Hello blocks", new: "Hel", comments: late)
+        XCTAssertEqual(CommentAnchors.split([selectionCut], inserted: "ocks").first?.range, NSRange(location: 0, length: 4))
+
+        let append = CommentAnchors.TextEdit(block: "A", old: "Fixture Text", new: "Fixture TextHello blocks", comments: [])
+        let joined = CommentAnchors.join([append], deleted: "Hello blocks", comments: Array(c.prefix(3)))
+        XCTAssertEqual(joined?.block, "A")
+        XCTAssertEqual(joined?.comments.map { $0.range.location }, [12, 15, 18])
+        XCTAssertNil(CommentAnchors.join([append], deleted: "Other", comments: c), "text the deleted block never had")
+        XCTAssertNil(CommentAnchors.join([cut], deleted: "blocks", comments: c), "a cut is no join")
+        // UTF-16: an emoji is two units.
+        let emoji = CommentAnchors.TextEdit(block: "A", old: "a\u{1F600}", new: "a\u{1F600}bc", comments: [])
+        XCTAssertEqual(CommentAnchors.join([emoji], deleted: "bc", comments: [c[0]])?.comments.first?.range,
+                       NSRange(location: 3, length: 2), "cut to the deleted block's text, then after the text there")
+    }
+
+    func testReturnAndJoiningBlocksTakeTheirCommentsAlongInOneUndoStep() async throws {
+        let h = harness()
+        await FeatTextDocExtrasFeature.start(h.app)
+        let keeper = try XCTUnwrap(h.app.services.get(CommentAnchorKeeper.serviceKey, as: CommentAnchorKeeper.self))
+        try await h.run("block.comment", ["ref": .string(paragraph), "range": [6, 6], "text": "Plural?", "id": "SPLITC01"])
+        let before = try h.snapshot(doc)
+        let depth = h.undoDepth(doc)
+
+        // Return between the words (the editor's split: one group, cut the block, then insert the rest after it).
+        let tailRef = "block:FIXTUREDOC02/SPLITTAIL01"
+        try await h.run(CommandIDs.batch, ["calls": [
+            ["command": "block.update", "params": ["ref": .string(paragraph), "text": "Hello "]],
+            ["command": "block.insert", "params": ["doc": "doc:FIXTUREDOC02", "after": .string(paragraph),
+                                                    "kind": "paragraph", "text": "blocks", "id": "SPLITTAIL01"]]]])
+        await keeper.idle()
+        var head = try block(h, "FIXTUREBLK02")
+        XCTAssertEqual(head.comments?.map { $0.id.raw }, ["FIXTURECMB01"], "the comment on the first word stays")
+        let carried = try comment(try block(h, "SPLITTAIL01"), "SPLITC01")
+        XCTAssertEqual([carried.rangeStart, carried.rangeLength], [0, 6], "the comment went with its word")
+        XCTAssertEqual(h.undoDepth(doc), depth + 1, "Return and the moved comment are one undo step")
+
+        // Delete at the start of the new block joins it back, with its comment.
+        try await h.run(CommandIDs.batch, ["calls": [
+            ["command": "block.update", "params": ["ref": .string(paragraph), "text": "Hello blocks"]],
+            ["command": "block.delete", "params": ["refs": [.string(tailRef)]]]]])
+        await keeper.idle()
+        head = try block(h, "FIXTUREBLK02")
+        let back = try comment(head, "SPLITC01")
+        XCTAssertEqual([back.rangeStart, back.rangeLength], [6, 6])
+        XCTAssertEqual(CommentThreads.excerpt(NSRange(location: 6, length: 6), in: head), "blocks")
+        XCTAssertEqual(h.undoDepth(doc), depth + 2)
+
+        XCTAssertTrue(h.app.bus.undo(doc))
+        XCTAssertTrue(h.app.bus.undo(doc))
+        await keeper.idle()
+        XCTAssertEqual(try h.snapshot(doc), before, "two undos restore the text, the blocks and the comments")
+    }
+
     // MARK: Threads
 
     func testThreadsGroupRepliesAndFindTheCommentsUnderASelection() {
@@ -381,6 +499,123 @@ final class BlockCommentTests: XCTestCase {
         XCTAssertFalse(keys.contains { $0.input == "m" }, "⇧⌘M needs a block with the caret")
         let comment = TextDocHooks.keyCommandSets.first { $0.id == TextDocExtrasHookIDs.prefix + "comments.keys" }
         XCTAssertNotNil(comment)
+    }
+
+    // MARK: ⇧⌘M as a scoped key command (contracts-v2.2)
+
+    func testTheCommentKeyIsLiveOnlyInTextDocumentsWhileNoTextIsEdited() throws {
+        let h = harness()
+        let key = try XCTUnwrap(h.app.content.keyCommands.get(BlockCommentsEditor.keyID))
+        XCTAssertEqual(key.owner, "textdocextras")
+        XCTAssertEqual(key.shortcut, KeyShortcut("m", [.command, .shift]))
+        XCTAssertEqual(key.docKinds, [.textDocument])
+        XCTAssertEqual(key.scope, .canvas)
+        XCTAssertEqual(key.command, CommandIDs.panelOpen)
+        XCTAssertEqual(key.params["id"]?.stringValue, TextDocCommentsPanel.panelID)
+
+        let all = h.app.content.keyCommands.all
+        func live(_ context: KeyCommandContext) -> Bool {
+            KeyCommandRouting.active(all, in: context).contains { $0.id == key.id }
+        }
+        XCTAssertTrue(live(KeyCommandContext(docKind: .textDocument)))
+        XCTAssertFalse(live(KeyCommandContext(docKind: .textDocument, isEditingText: true)),
+                       "while a block is edited the editor serves ⇧⌘M itself, at the selected words")
+        XCTAssertFalse(live(KeyCommandContext(docKind: .notebook)))
+        XCTAssertFalse(live(KeyCommandContext(docKind: nil)), "never in the library")
+
+        // An any-kind ⇧⌘M (a plugin, another feature) does not take the key in text documents.
+        var other = KeyCommandDescriptor(id: "dev.plugin.m", title: "Other", shortcut: key.shortcut, command: "dev.other",
+                                         scope: .document, owner: "dev.plugin")
+        other.docKinds = nil
+        let winners = KeyCommandRouting.active(all + [other], in: KeyCommandContext(docKind: .textDocument))
+        XCTAssertTrue(winners.contains { $0.id == key.id })
+        XCTAssertFalse(winners.contains { $0.id == other.id })
+    }
+
+    func testTheCommentKeyComposesOnTheWordsSelectedLast() throws {
+        let h = harness()
+        let editor = openEditor(h)
+        h.session.editor = editor
+        let key = try XCTUnwrap(h.app.content.keyCommands.get(BlockCommentsEditor.keyID))
+        XCTAssertEqual(key.resolvedParams(for: h.session), ["id": .string(TextDocCommentsPanel.panelID)],
+                       "nothing selected: the Comments tab opens on its list")
+
+        TextDocExtrasState.of(editor).lastSelection = TextDocSelection(block: Fixtures.paragraphBlockID,
+                                                                      range: NSRange(location: 6, length: 6))
+        let params = key.resolvedParams(for: h.session)
+        XCTAssertEqual(params["id"]?.stringValue, TextDocCommentsPanel.panelID)
+        XCTAssertEqual(params["block"]?.stringValue, paragraph)
+        XCTAssertEqual(params["range"], [6, 6])
+        XCTAssertEqual(params["compose"]?.boolValue, true)
+
+        // Words past the end of the block's text now (it changed since) are cut to it; none left, no composer.
+        TextDocExtrasState.of(editor).lastSelection = TextDocSelection(block: Fixtures.paragraphBlockID,
+                                                                      range: NSRange(location: 40, length: 3))
+        XCTAssertNil(key.resolvedParams(for: h.session)["compose"])
+        TextDocExtrasState.of(editor).lastSelection = TextDocSelection(block: Fixtures.tableBlockID,
+                                                                      range: NSRange(location: 0, length: 1))
+        XCTAssertNil(key.resolvedParams(for: h.session)["compose"], "a table has no text to comment on")
+
+        TextDocExtrasState.of(editor).lastSelection = TextDocSelection(block: Fixtures.paragraphBlockID,
+                                                                      range: NSRange(location: 0, length: 5))
+        h.session.readOnly = true
+        XCTAssertNil(key.resolvedParams(for: h.session)["compose"], "reading only: nothing to write")
+    }
+
+    func testTheCommentsTabComposesAPostsAndOpensTheNewThread() async throws {
+        let h = harness()
+        h.session.document = doc
+        let model = CommentsPanelModel(app: h.app, session: h.session,
+                                       params: ["block": .string(paragraph), "range": [6, 6], "compose": true])
+        let draft = try XCTUnwrap(model.draft)
+        XCTAssertEqual(draft.excerpt, "blocks")
+        XCTAssertEqual(draft.range, NSRange(location: 6, length: 6))
+        XCTAssertNil(model.expandedID, "composing opens no existing thread")
+
+        let depth = h.undoDepth(doc)
+        model.postDraft("Plural?")
+        try await waitUntil("the new comment") { model.draft == nil && model.rows.count == 2 }
+        XCTAssertEqual(h.undoDepth(doc), depth + 1)
+        let b = try block(h, "FIXTUREBLK02")
+        let added = try XCTUnwrap(b.comments?.first { $0.text == "Plural?" })
+        XCTAssertEqual([added.rangeStart, added.rangeLength], [6, 6])
+        let open = try XCTUnwrap(model.rows.first { $0.id == model.expandedID })
+        XCTAssertTrue(open.thread.contains(added.id), "the new thread opens in the list")
+
+        // panel.open again on the tab on screen, and a request the window cannot write.
+        model.apply(["block": .string(paragraph), "range": [0, 5], "compose": true])
+        XCTAssertEqual(model.draft?.excerpt, "Hello")
+        model.cancelDraft()
+        XCTAssertNil(model.draft)
+        model.apply(["block": .string(table), "range": [0, 1], "compose": true])
+        XCTAssertNil(model.draft, "a table has no text to comment on")
+        h.session.readOnly = true
+        model.apply(["block": .string(paragraph), "range": [0, 5], "compose": true])
+        XCTAssertNil(model.draft, "reading only: no composer")
+    }
+
+    func testCommentViewsRenderInLightDarkAndAtAX3() throws {
+        let h = harness()
+        h.session.document = doc
+        let runner = TextDocCommandRunner(app: h.app, session: h.session, doc: doc)
+        var b = try block(h, "FIXTUREBLK02")
+        b.comments?.append(BlockComment(id: "SNAPREPLY01", author: "Ben", text: "Agreed, and a longer reply that wraps",
+                                        at: 20, rangeStart: 0, rangeLength: 5))
+        let thread = try XCTUnwrap(CommentThreads.threads(in: b).first)
+        let model = CommentThreadModel(runner: runner, block: b.id, thread: thread)
+        let width: CGFloat = 280   // a popover's content width
+        let card = CommentThreadView(model: model, chrome: .popover, showsQuote: true) {}
+            .frame(width: width)
+        let composer = CommentComposerView(excerpt: "Hello", chrome: .panel, onCancel: {}) { _ in }
+            .frame(width: width)
+        for view in [AnyView(card), AnyView(composer)] {
+            let images = NibSnapshot.images(view, size: CGSize(width: width, height: 360))
+            XCTAssertEqual(Set(images.keys), Set(NibSnapshot.Variant.allCases))
+            let regular = NibSnapshot.fittingSize(view, width: width)
+            let large = NibSnapshot.fittingSize(view, width: width, variant: .largeText)
+            XCTAssertGreaterThan(regular.height, 0)
+            XCTAssertGreaterThan(large.height, regular.height, "text grows with Dynamic Type")
+        }
     }
 
     func testHighlightsAreDrawnNotWrittenIntoTheText() throws {
