@@ -717,6 +717,8 @@ final class CollabSession {
     /// Ends the session. `notify` tells the others (host: `ended` to everyone; guest: `bye`).
     func end(reason: String?, notify: Bool, error: Error? = nil) {
         guard !isClosed else { return }
+        // Closed first, so nothing the others do while they hear about it (leaving, answering) reaches this session.
+        isClosed = true
         if notify {
             switch side {
             case .host:
@@ -727,7 +729,6 @@ final class CollabSession {
                 _ = sendToHost(CollabMessage(kind: .bye, session: id, from: me))
             }
         }
-        isClosed = true
         phase = .ended
         endReason = reason
         transport.onMessage = nil
@@ -1779,8 +1780,28 @@ final class CollabService: ObservableObject {
 
     func joinRequested(_ p: CollabParticipant, title: String) {
         notifier.joinRequest(participant: p.id, name: p.name, title: title)
+        // Document windows show the request HUD; a library window gets a toast with Approve.
+        if let navigator = app.ui.activeNavigator, navigator.activeDocument == nil {
+            let pid = p.id
+            navigator.floatingHost?.postToast(String(localized: "\(p.name) wants to join “\(title)”."),
+                                              actionTitle: String(localized: "Approve"),
+                                              action: { [weak self] in self?.approveFromToast(pid) })
+        }
         app.events.emit(CollabIDs.event, doc: session?.localDoc,
                         payload: ["event": "request", "participant": .string(p.id), "name": .string(p.name)])
+    }
+
+    private func approveFromToast(_ participant: String) {
+        let app = self.app
+        Task { @MainActor [weak self] in
+            do {
+                _ = try await app.bus.execute(Invocation(command: CommandIDs.collabApprove,
+                                                         params: ["participant": .string(participant), "allow": true],
+                                                         principal: .user, session: app.services.sessions.active))
+            } catch {
+                self?.notice(NibError.wrap(error).message)
+            }
+        }
     }
 
     func didBecomeActive(_ s: CollabSession) {

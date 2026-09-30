@@ -317,8 +317,7 @@ struct ShareLivePanel: View {
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
             NibButton(String(localized: "Copy Code"), symbol: .copy, kind: .plain, size: .compact) {
-                UIPasteboard.general.string = info.code
-                service.notice(String(localized: "Join code copied."))
+                copy(info.code)
             }
         }
         .frame(maxWidth: .infinity)
@@ -460,6 +459,23 @@ struct ShareLivePanel: View {
     private func setRole(_ p: CollabParticipant, _ role: CollabRole) {
         guard role != p.role else { return }
         perform(CommandIDs.collabSetRole, ["participant": .string(p.id), "role": .string(role.rawValue)])
+    }
+
+    /// F014's `clipboard.copyText` when installed (so the copy is a command like everything else), else the pasteboard.
+    private func copy(_ code: String) {
+        guard app.commands.entry(CommandIDs.clipboardCopyText) != nil else {
+            UIPasteboard.general.string = code
+            service.notice(String(localized: "Join code copied."))
+            return
+        }
+        Task { @MainActor in
+            do {
+                try await CollabText.runs(app, CommandIDs.clipboardCopyText, ["text": .string(code)], session: context.session)
+                service.notice(String(localized: "Join code copied."))
+            } catch {
+                failure = NibError.wrap(error).message
+            }
+        }
     }
 
     private func revoke(_ p: CollabParticipant) {

@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatCollab
@@ -453,6 +454,35 @@ final class FeatCollabTests: XCTestCase {
         }
         XCTAssertEqual(pair.host.confirmer.requests.last?.command.id, "collab.host")
         XCTAssertNil(pair.hostService.session)
+    }
+
+    // MARK: Screens (DESIGN.md §14.14): Light, Dark and AX3
+
+    func testShareLivePanelJoinSheetAndRequestHUDRender() async throws {
+        let pair = CollabPair()
+        let panel = CGSize(width: 344, height: 560)
+        let hostContext = PanelContext(app: pair.host.app, session: pair.host.session, navigator: nil, dismiss: {})
+        XCTAssertEqual(NibSnapshot.images(ShareLivePanel(service: pair.hostService, context: hostContext), size: panel).count, 3)
+
+        let code = try await pair.share()
+        let join = pair.startJoin(code)
+        try await pair.waitForRequest()
+        XCTAssertEqual(NibSnapshot.images(ShareLivePanel(service: pair.hostService, context: hostContext), size: panel).count, 3)
+        let hud = JoinRequestHUD(service: pair.hostService, context: ChromeContext(app: pair.host.app, session: pair.host.session))
+        XCTAssertEqual(NibSnapshot.images(hud, size: CGSize(width: 360, height: 40)).count, 3)
+        // At AX3 the panel keeps to the wide panel width (420 pt) and grows downwards.
+        let fit = NibSnapshot.fittingSize(ShareLivePanel(service: pair.hostService, context: hostContext), width: 420,
+                                          variant: .largeText)
+        XCTAssertLessThanOrEqual(fit.width, 420.5)
+
+        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        _ = try await join.value
+        let guestContext = PanelContext(app: pair.guest.app, session: pair.guest.session, navigator: nil, dismiss: {})
+        XCTAssertEqual(NibSnapshot.images(ShareLivePanel(service: pair.guestService, context: guestContext), size: panel).count, 3)
+        var sheetContext = PanelContext(app: pair.guest.app, session: nil, navigator: nil, dismiss: {})
+        sheetContext.params = ["code": "k7m 2qx"]
+        XCTAssertEqual(NibSnapshot.images(JoinLiveSheet(service: pair.guestService, context: sheetContext),
+                                          size: CGSize(width: 540, height: 620)).count, 3)
     }
 
     func testConformance() async {
