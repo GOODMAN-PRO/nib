@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCollab/FeatCollabPresenceFeature.swift:376-398 (sessionChanged), :557-569 (sendState); FollowController.swift:115-134",
+      "problem": "Presence and Follow Me state is not reconciled after a guest re-joins, which F072 says happens routinely about 30 s after backgrounding. While the guest is reconnecting, the host's broadcast skips it (CollabSession.broadcast only sends to .active participants and does not queue presence). So a followMe(off) or a cleared lasso sent in that window never arrives. On re-join, sessionChanged keeps `presence` and `follow` (it only resets on idle, ended or nil). The hello replies from sendState send followMe only when the sender is leading, and a lasso only when the sender has a selection. Results: (1) the guest stays stuck following the former leader (the HUD says 'Following Ada' and the view keeps being dragged). (2) The former leader's old dashed lasso outline stays drawn with no end. (3) A guest that was leading when it dropped sends followMe(on: true) on return and takes leadership back from whoever took over while it was away.",
+      "fix": "In sessionChanged's `if !wasLive` branch, call `presence.reset()` before `sendState(to: nil)` and the hello. Also drop a follow that came from Follow Me (`if follow.leader != nil { follow.follow(nil) }`) and clear the device's own `isLeading` without broadcasting. In sendState(to:), always send the explicit state: `.followMe(on: follow.isLeading)` (receivers already ignore an off from a non-leader), and `.lasso(page: nil, outline: nil, bounds: nil)` when there is no selection. Add a PresenceTests case: the guest calls CollabService.markReconnecting, the host turns Follow Me off and clears its selection, the guest re-joins. Assert guestHub.state.following == nil and presence.people[host]?.lasso == nil."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCollab/FeatCollabPresenceFeature.swift:133-152 (SystemPresenceNotifier.collaboratorChanges)",
+      "problem": "S-102 notifications are posted only when the authorization status is already .authorized, .provisional or .ephemeral, and nothing in F108 ever requests authorization. On a device where no other feature (F062 timer, F075 calendar) has asked, the status stays .notDetermined. The 'Change Notifications' switch is on by default and promises notifications, but nothing is ever delivered. Nib also never shows up in iOS Settings › Notifications, so the user has no way to turn them on. The parity item is dead in the common case.",
+      "fix": "When the status is .notDetermined, request provisional authorization first: `try? await center.requestAuthorization(options: [.alert, .sound, .provisional])`. Provisional authorization shows no prompt, so this still follows ARCHITECTURE §15.13. Then add the request. Also do this when the Collaboration settings switch is turned on. Keep RecordingPresenceNotifier for hostless tests."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/PresenceCommands.swift:191,200,205 (markSeen nowRev); SharedPanel.swift:41-44 (UnseenComputation.isUnseen); PresenceTests.swift:43",
+      "problem": "Seen marks mix clock domains. The document baseline, and page marks for pages that are not cached, use a Rev built from this device's wall clock (`hub.now()`), while the revisions they are compared with come from collaborators' HLCs. A collaborator whose clock runs N seconds slow has every change made in the N seconds after a baseline or Mark All as Seen hidden. The tests hide this by moving the hub clock back 30 s. Comparisons also ignore `Rev.effective()`. One edit from a device whose clock is more than 24 h ahead therefore badges forever, and once it is marked seen it puts the mark in the future, so later changes by correctly-clocked collaborators never badge.",
+      "fix": "Build marks only from revisions actually present in the document: the newest of `record.rev` and `workspace.contentRevision` over the pages. When contentRevision is nil, load the page, following the G9 convention. Do not use a wall-clock Rev. Compare and store `rev.effective()` in UnseenComputation.isUnseen, UnseenComputation.newest and markSeen. Then remove the `hub.clock = now - 30` workaround from PresencePair.prepare."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/PresenceOverlay.swift:80-87 (PresenceMessage.init lasso)",
+      "problem": "Inbound presence payloads are a trust boundary, but a received lasso outline has no length limit. `maxOutlinePoints` (256) is applied only when sending, so a buggy or hostile peer can send an outline as large as a frame and it is stored and drawn as a CGPath on every render.",
+      "fix": "When decoding, pass the outline through `PresenceMessage.downsample(_:)` or drop it if it has more than `maxOutlinePoints` points."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/PresenceOverlay.swift:527-542 (unseen dots on the canvas page)",
+      "problem": "DESIGN.md §14.14 puts the 6 pt unseen dot on changed page thumbnails. The feature draws it inside the page on the canvas, at the top-trailing corner, where it can sit over ink ('Nothing page-resident sits over ink'). The sidebar thumbnails show no unseen state because no contract exists for decorating thumbnails. That gap is not reported anywhere.",
+      "fix": "Report the gap in the final summary for a contract request: a thumbnail decoration or badge provider that F023 renders. Until that exists, place the canvas dot outside the page frame (in the gutter at the page's top-trailing corner) so it never covers ink."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/SharedPanel.swift:437-467 (actions context menu)",
+      "problem": "Shared tab cards use a hand-built context menu, so `.libraryItem` menu items that plugins and other features register (including F108's own Mark as Seen library item) never appear on Shared documents.",
+      "fix": "After the built-in actions, append `app.ui.menuItems(.libraryItem, MenuContext(app: app, session: context.session, doc: e.local))`, each as a Button that runs `item.command` with `item.params(ctx)`. Drop the duplicate hand-written Mark as Seen."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/FollowController.swift:115-134; PresenceCommands.swift:101-106",
+      "problem": "Follow Me has no rule for two leaders. If two participants turn it on at nearly the same time, each receives the other's on message, drops its own leadership and follows the other. The two end up following each other, and their reveals can bounce back and forth. Any participant, including a view-only guest, can also take over everyone's view.",
+      "fix": "Break ties when an on message arrives while this device is leading: the host wins, otherwise the lower participant id wins. The device that loses sends followMe(on: false). Decide whether collab.followMe needs the host or an edit role, and if so throw permissionDenied with a hint."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/SharedPanel.swift:433,463-466",
+      "problem": "Move to Trash is offered for a document this device is hosting live right now, without ending the session first. The session then keeps hosting a document that is in the Trash.",
+      "fix": "Hide Move to Trash while `e.isLive && e.isHost`, or run collab.leave before library.trash in `trash(_:)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/FeatCollabPresenceFeature.swift:613,728 (sharedRevision bumps); SharedPanel.swift:340-342; FeatCollabPresenceFeature.swift:905-911",
+      "problem": "`sharedRevision` changes on every remote commit that changes unseen state, and every @ObservedObject view of the hub re-renders when it does (the beads, the follow HUD and the Shared tab). SharedPanel.body re-decodes every shared record from settings and may run the disk-reading `scanIfNeeded` inside body. The libraryItem menu's isVisible also scans on the main thread while the menu is built.",
+      "fix": "Move the Shared-tab revision to its own small ObservableObject that only SharedPanel observes. Compute entries in a model that caches the decoded records and scans once in a `.task`, not in body. In the menu, check only `unseen.count(doc)` and leave scanning to the Shared tab and doc.opened."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/FeatCollabPresenceFeature.swift:59 (followMenuSlots = 7)",
+      "problem": "The title menu's Follow submenu lists at most 7 collaborators, but a relay session carries up to 50 (S-101), so everyone after the seventh can only be followed from the beads menu.",
+      "fix": "Size the slots from the session cap (`CollabSessionInfo.cap - 1`), or add an overflow item that opens the beads menu or the Share Live panel."
+    }
+  ]
+}
