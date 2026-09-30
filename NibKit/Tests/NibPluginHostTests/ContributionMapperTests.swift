@@ -277,6 +277,31 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertEqual(ManifestValidator.problems(hookWithoutScope, folder: nil).map { $0.path },
                        ["$.contributes.commandHooks[0].command"], "a hook reading documents needs document:read")
 
+        // Contributions the host runs on the user's behalf must name the plugin's own commands (built-in ones would run
+        // as the user, outside the plugin's grants); the ones the user invokes explicitly may name any command.
+        let borrowed = try JSONValue.parse(#"""
+        {"id": "dev.x.z", "name": "Z", "version": "1.0.0", "api": 1, "entry": "main.js", "permissions": [],
+         "contributes": {
+          "commands": [{"id": "dev.x.z.own", "title": "Own", "summary": "Own."}],
+          "tools": [{"id": "dev.x.z.t", "title": "T", "input": "tap", "command": "item.delete"}],
+          "strokeProcessors": [{"id": "dev.x.z.s", "command": "page.delete"}],
+          "tapHandlers": [{"gesture": "tap", "command": "settings.set"}],
+          "itemTypes": [{"type": "card", "title": "Card", "edit": "document.delete"}],
+          "blocks": [{"type": "b", "title": "B", "command": "block.delete"}],
+          "importers": [{"extensions": ["x"], "command": "library.import"}],
+          "exporters": [{"extensions": ["x"], "command": "dev.x.z.undeclared"}],
+          "menus": [{"location": "objectMenu", "command": "item.delete"}],
+          "keybindings": [{"key": "cmd+k", "command": "page.add"}],
+          "pencilActions": [{"gesture": "squeeze", "command": "tool.select", "title": "Pen"}],
+          "toolbar": [{"id": "dev.x.z.b", "title": "B", "icon": "star", "command": "page.add"}]
+         }}
+        """#).decode(PluginManifest.self)
+        XCTAssertEqual(Set(ManifestValidator.problems(borrowed, folder: nil).compactMap { $0.path }),
+                       ["$.contributes.tools[0].command", "$.contributes.strokeProcessors[0].command",
+                        "$.contributes.tapHandlers[0].command", "$.contributes.itemTypes[0].edit",
+                        "$.contributes.blocks[0].command", "$.contributes.importers[0].command",
+                        "$.contributes.exporters[0].command"])
+
         let good = try Self.fixture().decode(PluginManifest.self)
         XCTAssertEqual(ManifestValidator.problems(good, folder: nil).map { $0.description }, [])
         // With the folder, missing files are reported.
@@ -367,6 +392,40 @@ final class ContributionMapperTests: XCTestCase {
         XCTAssertEqual(PDFTemplateConverter.axisAlignedRect([Point(0, 0), Point(4, 0), Point(4, 2), Point(0, 2), Point(0, 0)]),
                        Rect(x: 0, y: 0, width: 4, height: 2))
         XCTAssertNil(PDFTemplateConverter.axisAlignedRect([Point(0, 0), Point(4, 1), Point(4, 2), Point(0, 2)]))
+    }
+
+    /// A plugin's PDF template is converted (off the main actor) when it loads; an unreadable one fails the load
+    /// before anything starts or is mapped.
+    func testPDFTemplatesConvertWhenThePluginLoads() async throws {
+        let kit = PluginTestKit()
+        let data = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 300, height: 400)).pdfData { ctx in
+            ctx.beginPage()
+            ctx.cgContext.setFillColor(UIColor.green.cgColor)
+            ctx.cgContext.fill(CGRect(x: 30, y: 40, width: 100, height: 50))
+        }
+        let pid = "dev.test.pdf"
+        let template: JSONValue = ["id": "dev.test.pdf.week", "title": "Week", "kind": "pdf", "file": "week.pdf"]
+        try await kit.installAndLoad(kit.manifest(pid, permissions: [], contributes: ["templates": [template]]),
+                                     files: ["week.pdf": data])
+        XCTAssertEqual(kit.host.state(pid), .running)
+        let week = try XCTUnwrap(kit.h.app.content.templates.get("dev.test.pdf.week"))
+        XCTAssertEqual(week.preferredSize, PageSize(300, 400))
+        let drawn = week.render([:], PageSize(300, 400), 1)
+        XCTAssertEqual(drawn.display.ops.first { $0.op == .rect }?.fill, RGBA(0, 255, 0))
+
+        let broken = "dev.test.brokenpdf"
+        let bad: JSONValue = ["id": "dev.test.brokenpdf.week", "title": "Week", "kind": "pdf", "file": "week.pdf"]
+        do {
+            try await kit.installAndLoad(kit.manifest(broken, permissions: [], contributes: ["templates": [bad]]),
+                                         files: ["week.pdf": Data("not a pdf".utf8)])
+            XCTFail("an unreadable PDF template fails the load")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+            XCTAssertEqual(e.path, "$.contributes.templates[0].file")
+        }
+        XCTAssertEqual(kit.host.state(broken), .failed)
+        XCTAssertFalse(kit.runtime.started.contains(broken), "nothing starts")
+        XCTAssertEqual(Self.owned(kit.h.app, broken), [:])
     }
 
     func testKeyBindings() {
@@ -610,7 +669,11 @@ final class ContributionMapperTests: XCTestCase {
         kit.standIn(CommandIDs.itemUpdate, effect: .edit, recorder: updates)
         let item = try kit.h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.customID)
         let context = InspectorContext(app: kit.h.app, session: kit.h.session, doc: Fixtures.docID, page: Fixtures.page1, items: [item])
-        CustomItemInspector.write("title", "Sales", context)
+        // Another plugin's inspector leaves this item alone, even when it is part of the selection.
+        CustomItemInspector.write("title", "Other", context, drawKey: "custom.dev.test.other.chart")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(updates.calls.isEmpty, "only items of the inspector's own type are written")
+        CustomItemInspector.write("title", "Sales", context, drawKey: item.drawKey)
         let wrote = await eventually { updates.calls.count == 1 }
         XCTAssertTrue(wrote)
         let call = try XCTUnwrap(updates.calls.first)

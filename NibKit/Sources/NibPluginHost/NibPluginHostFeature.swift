@@ -14,9 +14,11 @@ public enum NibPluginHostFeature: NibFeature {
         app.services.set(host, for: ServiceKeys.pluginHost)
         host.installGrants(on: app.gateway)
         PluginCommands.register(app)
+        // Read-only for settings.set (every principal): plugin.enable, which needs plugins:manage and a confirmation
+        // for the AI and the bridge, is the only writer (PluginEnablement.set writes the store directly).
         app.settings.declarePrefix(PluginEnablement.prefix, synced: false,
                                    summary: "Plugins switched off on this device (true = off); change with plugin.enable.",
-                                   owner: id, schema: .bool(), readOnly: false)
+                                   owner: id, schema: .bool(), readOnly: true)
     }
 
     /// Loads the approved plugins and keeps watching the library for plugins that arrive, change or leave.

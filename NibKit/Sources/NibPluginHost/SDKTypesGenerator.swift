@@ -315,6 +315,10 @@ enum PluginDocs {
 
         ## Contribution points
 
+        Menus, toolbar buttons, key bindings and Pencil actions may name any command (the user invokes them). Tools,
+        stroke processors, tap handlers, item type `edit`, blocks, importers and exporters must name one of the plugin's
+        own commands: the host runs them on the user's behalf, and the handler's calls run as the plugin, with its grants.
+
         ### commands
         `{id, title, summary, params?, examples?, effect?, target?, destructive?, ai?, bridge?, aiDirect?, longRunning?}`.
         `effect` is read | session | edit | library | irreversible (default edit), `target` document | library | app
@@ -405,7 +409,10 @@ enum PluginDocs {
         ### commandHooks
         `{commands: ["page.add", "export.*"], command}`: before each matching call (from anyone) the hook command, which
         must be declared `read`, gets `{command, params}` and returns `{}` to let it pass, `{params}` to change the params,
-        or throws to veto it. Hooks never see plugin management or security calls.
+        or throws to veto it. Hooks never see plugin management or security calls, nor the way to the plugin manager
+        (settings.open, its panels). Replacement params cannot turn a call into one of those, point a settings call at
+        another setting, or change the calls of commands.batch (a veto is fine). A hook that is not running or does not
+        answer in time lets the call pass.
 
         ### Content packs
         `elements: [{id, title, files}]` (each file a clipboard fragment `{format: "nib-fragment/1", items, assets,
