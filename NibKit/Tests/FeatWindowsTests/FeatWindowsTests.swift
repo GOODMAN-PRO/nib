@@ -4,14 +4,17 @@ import NibContracts
 import NibTesting
 @testable import FeatWindows
 
-/// A window without UIKit: the shell's tab rules (ShellViewController.openDocument / performOpen / closeDocument) over a
-/// real session. Like the shell, an open behind `ui.openGate` runs later, in a Task, and only if the gate lets it.
+/// A window without UIKit: the shell's tab rules (ShellViewController.openDocument / performOpen / addTab /
+/// closeDocument) over a real session. Like the shell, an open behind `ui.openGate` runs later, in a Task, and only if
+/// the gate lets it.
 @MainActor
 final class FakeNavigator: SceneNavigator {
     let app: NibApp
     let session: EditorSession
     private(set) var openDocuments: [DocumentID] = []
     private(set) var activeDocument: DocumentID?
+    /// Editors built: one per open that lands (the shell builds the editor of every document it shows).
+    private(set) var editorsBuilt = 0
     var rootViewController: UIViewController? { nil }
 
     init(app: NibApp) {
@@ -43,6 +46,13 @@ final class FakeNavigator: SceneNavigator {
         activeDocument = doc
         session.document = doc
         session.page = page ?? content.livePages.first?.id
+        editorsBuilt += 1
+    }
+
+    /// contracts-v2.2: the tab joins the strip without being shown or building its editor.
+    func addTab(_ doc: DocumentID) {
+        guard !openDocuments.contains(doc) else { return }
+        openDocuments.append(doc)
     }
 
     func closeDocument(_ doc: DocumentID) {
@@ -59,6 +69,22 @@ final class FakeNavigator: SceneNavigator {
     func showLibrary(folder: FolderID?) { session.document = nil }
     func showSettings(page: String?) {}
     func presentModal(_ viewController: UIViewController) {}
+}
+
+/// Commands the app reported as failed (`Notification.Name.nibCommandFailed`, posted on the main thread).
+final class FailedCommands: @unchecked Sendable {
+    private let lock = NSLock()
+    private var list: [String] = []
+
+    var commands: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return list
+    }
+
+    func append(_ command: String) {
+        lock.lock(); defer { lock.unlock() }
+        list.append(command)
+    }
 }
 
 /// A document edit made in one window, to see it from another.
@@ -118,6 +144,16 @@ final class FeatWindowsTests: XCTestCase {
         }
     }
 
+    /// `count` more documents (copies of the whiteboard) that the library knows.
+    private func extraDocuments(_ h: Harness, _ count: Int) throws -> [DocumentID] {
+        try (0..<count).map { n in
+            var copy = try h.app.workspace.content(board)
+            copy.meta.id = NibID.make()
+            _ = try h.library.createDocument(copy, title: "Board \(n)", in: nil)
+            return copy.meta.id
+        }
+    }
+
     // MARK: Restoration
 
     func testRestorationRoundTripsThroughTheActivityUserInfo() throws {
@@ -169,6 +205,43 @@ final class FeatWindowsTests: XCTestCase {
         try await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(libraryWindow.openDocuments, [notebook, text])
         XCTAssertNil(libraryWindow.session.document)
+        XCTAssertEqual(libraryWindow.activeDocument, text)      // a current tab, so the shell shows the strip
+        XCTAssertEqual(libraryWindow.editorsBuilt, 1)
+    }
+
+    func testRestoringAddsEveryTabAndBuildsOnlyTheShownOne() async throws {
+        let (h, scenes, hooks) = try windows()
+        let extra = try extraDocuments(h, 10)
+        let tabs = [notebook] + extra + [board]
+        let active = extra[4]
+        let state = WindowState(tabs: tabs, active: active, page: nil)
+
+        // Every tab comes back, in order (no cap), and only the one on screen builds its editor.
+        let navigator = window(h, scenes)
+        hooks.connect(navigator, requested: nil, restored: state, external: false)
+        XCTAssertEqual(navigator.openDocuments, tabs)
+        XCTAssertEqual(navigator.session.document, active)
+        XCTAssertEqual(navigator.activeDocument, active)
+        XCTAssertEqual(navigator.editorsBuilt, 1)
+
+        // A background tab opens when it is selected.
+        try await run(h, CommandIDs.tabSelect, ["index": 0], in: navigator)
+        XCTAssertEqual(navigator.session.document, notebook)
+        XCTAssertEqual(navigator.session.page, Fixtures.page1)
+        XCTAssertEqual(navigator.editorsBuilt, 2)
+
+        // Behind the lock gate the shown tab lands later, and the tab order still holds.
+        h.app.ui.openGate = { _ in
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            return true
+        }
+        let gated = window(h, scenes)
+        hooks.connect(gated, requested: nil, restored: state, external: false)
+        XCTAssertEqual(gated.openDocuments, tabs)                // the strip is whole while the gate decides
+        XCTAssertNil(gated.session.document)
+        try await waitUntil { gated.session.document == active }
+        XCTAssertEqual(gated.openDocuments, tabs)
+        XCTAssertEqual(gated.editorsBuilt, 1)
     }
 
     func testColdLaunchReopensTheLastDocumentInTheFirstWindowOnly() throws {
@@ -356,6 +429,24 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertNil(navigator.session.document)
     }
 
+    func testClosingTheCurrentTabFromTheLibraryKeepsTheLibrary() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        navigator.showLibrary(folder: nil)
+
+        // ⌘W in the library (a `whileTabsOpen` key) closes the current tab; the shell's pick does not replace the library.
+        try await run(h, CommandIDs.tabClose, in: navigator)
+        try await waitUntil { navigator.openDocuments == [notebook] && navigator.session.document == nil }
+        XCTAssertEqual(navigator.openDocuments, [notebook])
+        XCTAssertNil(navigator.session.document)
+
+        // ⌘1 from the library shows the remaining tab.
+        try await run(h, CommandIDs.tabSelect, ["index": 0], in: navigator)
+        XCTAssertEqual(navigator.session.document, notebook)
+    }
+
     func testCloseOtherTabsBehindTheLockGateKeepsOnlyTheChosenTab() async throws {
         let (h, scenes, _) = try windows()
         let navigator = window(h, scenes)
@@ -478,6 +569,24 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertEqual(Set(all.map { $0.shortcut }).count, all.count)   // no key combination twice
     }
 
+    func testTabKeysStayLiveInTheLibraryWhileTheWindowHasTabs() async throws {
+        let (h, _, _) = try windows()
+        await FeatWindowsFeature.start(h.app)
+        let keys = h.app.content.keyCommands.all.filter { $0.owner == FeatWindowsFeature.id }
+        let tabKeys = ["closeTab", "closeAllTabs"] + (1...9).map { "tab\($0)" }
+        XCTAssertEqual(Set(keys.filter { $0.whileTabsOpen }.map { $0.id }),
+                       Set(tabKeys.map { WindowShortcuts.idPrefix + $0 }))
+        XCTAssertTrue(keys.filter { $0.whileTabsOpen }.allSatisfy { $0.scope == .document })
+
+        let libraryWithTabs = KeyCommandContext(docKind: nil, hasTabs: true)
+        let live = Set(KeyCommandRouting.active(keys, in: libraryWithTabs).map { $0.id })
+        XCTAssertEqual(live, Set((["newWindow"] + tabKeys).map { WindowShortcuts.idPrefix + $0 }))
+        let bareLibrary = KeyCommandContext(docKind: nil, hasTabs: false)
+        XCTAssertEqual(KeyCommandRouting.active(keys, in: bareLibrary).map { $0.id }, [WindowShortcuts.idPrefix + "newWindow"])
+        let notebookWindow = KeyCommandContext(docKind: .notebook, hasTabs: true)
+        XCTAssertEqual(KeyCommandRouting.active(keys, in: notebookWindow).count, keys.count)
+    }
+
     // MARK: Strip layout
 
     func testStripKeepsTheCurrentTabVisibleAndOverflowsTheRest() {
@@ -522,6 +631,32 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertTrue(model.showsLibrary)
         XCTAssertNil(model.selectedIndex)
         XCTAssertEqual(model.activeIndex, 1)
+    }
+
+    func testLibraryButtonRunsWindowShowLibrary() async throws {
+        let (h, scenes, _) = try windows()
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        let model = TabStripModel(app: h.app, navigator: navigator, scenes: scenes)
+        let failures = FailedCommands()
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { note in
+            if let command = note.userInfo?["command"] as? String { failures.append(command) }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        // It is the catalogue command: with no active window it has nothing to act on.
+        model.showLibrary()
+        try await waitUntil { !failures.commands.isEmpty }
+        XCTAssertEqual(failures.commands, [CommandIDs.windowShowLibrary])
+        XCTAssertEqual(navigator.session.document, notebook)
+
+        // The shell makes the window of the tap the active one.
+        h.app.ui.activeNavigator = navigator
+        model.showLibrary()
+        try await waitUntil { navigator.session.document == nil }
+        XCTAssertNil(navigator.session.document)
+        XCTAssertEqual(navigator.openDocuments, [notebook])
+        XCTAssertEqual(failures.commands.count, 1)
     }
 
     // MARK: Conformance

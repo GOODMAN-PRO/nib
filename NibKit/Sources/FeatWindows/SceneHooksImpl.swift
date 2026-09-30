@@ -1,5 +1,4 @@
 import UIKit
-import os
 import NibContracts
 
 /// `app.ui.sceneHooks`: what a window opens with (a requested document, its restored tabs, or on a cold launch the
@@ -18,10 +17,6 @@ final class SceneHooksImpl: SceneHooks {
     /// While the library catalog loads at launch a document cannot be opened yet; restoration retries after these
     /// delays (ms), then opens what it can.
     static let retryDelays: [UInt64] = [250, 500, 1_000, 2_000, 4_000]
-    /// ponytail: the shell has no "add a tab without showing it", so every restored tab builds its editor once; the
-    /// cap bounds that at launch and the tabs past it are logged. A `SceneNavigator.addTab(_:)` that only appends to
-    /// `openDocuments` (requested from the contract owner) would remove the cap.
-    static let maxRestoredTabs = 8
 
     private weak var app: NibApp?
     let scenes: WindowScenes
@@ -83,12 +78,7 @@ final class SceneHooksImpl: SceneHooks {
 
     func restore(_ state: WindowState, into navigator: SceneNavigator, reason: Reason, attempt: Int = 0) {
         guard let app else { return }
-        var wanted = Array(state.tabs.prefix(SceneHooksImpl.maxRestoredTabs))
-        if let active = state.active, !wanted.contains(active) { wanted.append(active) }
-        let total = state.tabs.count, dropped = total - wanted.count
-        if attempt == 0, dropped > 0 {
-            logger.notice("Restoring a window: \(dropped, privacy: .public) of \(total, privacy: .public) tabs left out")
-        }
+        var wanted = state.tabs
         if reason != .request {
             // Restoring never asks for a password; a locked document is opened by the person, not by a relaunch.
             let lock = app.services.lock
@@ -108,7 +98,7 @@ final class SceneHooksImpl: SceneHooks {
             return
         }
         let active = target.flatMap { ready.contains($0) ? $0 : nil }
-        apply(WindowState(tabs: ready, active: active, page: state.page), to: navigator)
+        apply(WindowState(tabs: ready, active: active, page: state.page), to: navigator, reason: reason)
         if reason == .request, let source = state.source, let doc = active,
            let origin = scenes.navigator(sessionID: source), origin !== navigator {
             // A dragged-out tab moves: it leaves its old window once it is on screen here (behind the lock gate that
@@ -118,17 +108,23 @@ final class SceneHooksImpl: SceneHooks {
         scenes.updateSceneTitle(navigator)
     }
 
-    /// Opens the tabs in order, then shows the active one (or the library).
-    private func apply(_ state: WindowState, to navigator: SceneNavigator) {
-        for doc in state.tabs {
-            navigator.openDocument(doc, page: doc == state.active ? state.page : nil, mode: .newTab)
+    /// Puts the tabs in the strip in order without building their editors (`SceneNavigator.addTab`), then opens the
+    /// active one, or brings the library back over the tabs. A tab that was not on screen opens (through the lock gate)
+    /// only when it is selected.
+    private func apply(_ state: WindowState, to navigator: SceneNavigator, reason: Reason) {
+        // A requested document may ask for its password: it joins this window only once it opens, so a dismissed
+        // prompt leaves no tab behind (a dragged-out tab then stays in its old window).
+        let joinsOnOpen = reason == .request ? state.active : nil
+        for doc in state.tabs where doc != joinsOnOpen {
+            navigator.addTab(doc)
         }
         if let active = state.active {
-            if state.tabs.last != active {
-                navigator.openDocument(active, page: state.page, mode: .newTab)
-            }
-        } else if !state.tabs.isEmpty {
-            // The library was on screen. Queued behind the opens, which the lock gate may defer.
+            navigator.openDocument(active, page: state.page, mode: .newTab)
+        } else if let last = state.tabs.last {
+            // The library was on screen. The shell shows the tab strip once a tab is current, so the last tab opens
+            // (the only editor built) and the library comes back over it, queued behind that open. This window, not
+            // `window.showLibrary`: that acts on the active window, and windows restore side by side.
+            navigator.openDocument(last, page: nil, mode: .newTab)
             Task { @MainActor [weak navigator] in navigator?.showLibrary(folder: nil) }
         }
     }

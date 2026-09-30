@@ -260,7 +260,9 @@ final class WindowScenes {
         let wasCurrent = navigator.activeDocument == doc
         navigator.closeDocument(doc)
         if shown == nil, wasCurrent, next != nil {
-            // The shell opens another tab when the current one closes; the library stays on screen instead.
+            // The shell opens another tab when the current one closes; the library stays on screen instead. This
+            // window's navigator, not `window.showLibrary`, which acts on the active window: a tab dragged out of a
+            // window closes here while the new window is the active one.
             Task { @MainActor [weak navigator] in navigator?.showLibrary(folder: nil) }
         }
     }
@@ -352,7 +354,7 @@ enum WindowTargets {
         }
     }
 
-    /// "open tabs: doc:A, doc:B" for error messages (no read command lists a window's tabs).
+    /// "open tabs: doc:A, doc:B" for error messages, so a caller can correct itself without another read.
     static func describe(_ tabs: [DocumentID]) -> String {
         tabs.isEmpty ? "no tabs are open" : "open tabs: " + tabs.map { NodeRef.document($0).description }.joined(separator: ", ")
     }
@@ -368,7 +370,7 @@ struct DocOpen: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "doc.open", title: "Open Document",
+        id: CommandIDs.docOpen, title: "Open Document",
         summary: "Open a document, optionally at a page, in the active window: mode replace (default; a new tab when tabs are on), newTab or newWindow.",
         params: .obj(["doc": .ref, "page": .ref,
                       "mode": .str("replace (default) | newTab | newWindow", choices: ["replace", "newTab", "newWindow"])],
@@ -409,7 +411,7 @@ struct WindowOpen: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "window.open", title: "New Window",
+        id: CommandIDs.windowOpen, title: "New Window",
         summary: "Open a document (optionally at a page; a page ref alone is enough) or, with no doc, the library in a new window beside this one (iPad).",
         params: .obj(["doc": .ref, "page": .ref]),
         examples: [["doc": "doc:FIXTUREDOC01", "page": "page:FIXTUREDOC01/FIXTUREPG002"], [:]],
@@ -436,7 +438,7 @@ struct TabClose: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "tab.close", title: "Close Tab",
+        id: CommandIDs.tabClose, title: "Close Tab",
         summary: "Close a document's tab in the active window (default: the current tab); the next tab opens, or the library when none is left.",
         params: .obj(["doc": .ref]),
         examples: [["doc": "doc:FIXTUREDOC01"], [:]],
@@ -461,7 +463,7 @@ struct TabCloseOthers: NibCommand {
     struct Params: Codable {}
 
     static let descriptor = CommandDescriptor(
-        id: "tab.closeOthers", title: "Close Other Tabs",
+        id: CommandIDs.tabCloseOthers, title: "Close Other Tabs",
         summary: "Close every tab in the active window except the current one.",
         params: .empty,
         examples: [[:]],
@@ -483,7 +485,7 @@ struct TabSelect: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "tab.select", title: "Switch Tab",
+        id: CommandIDs.tabSelect, title: "Switch Tab",
         summary: "Show a tab of the active window by position: 0 is the first tab (⌘1), -1 the last (⌘9). The tab reopens at the page it showed.",
         params: .obj(["index": .int("0-based tab position; -1 = the last tab", min: -1)], required: ["index"]),
         examples: [["index": 0], ["index": -1]],

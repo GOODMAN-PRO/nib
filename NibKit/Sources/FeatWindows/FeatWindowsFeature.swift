@@ -1,5 +1,6 @@
 import Foundation
 import NibContracts
+import NibDesign
 
 /// Tabs, windows and session restore (F018): the scene hooks (tab strip, new windows, restoration), `doc.open`,
 /// `window.open`, `tab.close`, `tab.closeOthers` and `tab.select`, their menu entries and shortcuts.
@@ -38,31 +39,34 @@ public enum FeatWindowsFeature: NibFeature {
 /// Entries for the tab menu, library items and page thumbnails. Each runs a command.
 @MainActor
 enum WindowMenus {
-    /// There is no "new window" glyph among `NibSymbol`s; menu icons are symbol names by contract.
-    static let newWindowIcon = "macwindow.badge.plus"
+    /// Menu icons are symbol names by contract: the design system's tokens, by name.
+    static let newWindowIcon = NibSymbol.newWindow.name
+    static let closeIcon = NibSymbol.xmark.name
+    /// No `NibSymbol` stands for "close the other tabs", so this entry names its SF Symbol itself.
+    static let closeOthersIcon = "xmark.square"
 
     static func register(_ app: NibApp, owner: String) {
         let menus = app.ui.menus
         menus.register(MenuItemDescriptor(
             id: "windows.tab.newWindow", title: String(localized: "Open in New Window"), icon: newWindowIcon,
-            location: .tab, order: 100, owner: owner, command: "window.open",
+            location: .tab, order: 100, owner: owner, command: CommandIDs.windowOpen,
             params: { ctx in openParams(ctx) }, isVisible: { ctx in canOpenWindow(ctx) }))
         menus.register(MenuItemDescriptor(
-            id: "windows.tab.close", title: String(localized: "Close Tab"), icon: "xmark",
-            location: .tab, order: 200, owner: owner, command: "tab.close",
+            id: "windows.tab.close", title: String(localized: "Close Tab"), icon: closeIcon,
+            location: .tab, order: 200, owner: owner, command: CommandIDs.tabClose,
             params: { ctx in docParams(ctx) }, isVisible: { ctx in menuDocument(ctx) != nil }))
         menus.register(MenuItemDescriptor(
-            id: "windows.tab.closeOthers", title: String(localized: "Close Other Tabs"), icon: "xmark.square",
+            id: "windows.tab.closeOthers", title: String(localized: "Close Other Tabs"), icon: closeOthersIcon,
             location: .tab, order: 300, owner: owner, command: CommandIDs.batch,
             params: { ctx in closeOthersParams(ctx) },
             isVisible: { ctx in ctx.index != nil && tabCount(ctx) > 1 }))
         menus.register(MenuItemDescriptor(
             id: "windows.library.newWindow", title: String(localized: "Open in New Window"), icon: newWindowIcon,
-            location: .libraryItem, order: 150, owner: owner, command: "window.open",
+            location: .libraryItem, order: 150, owner: owner, command: CommandIDs.windowOpen,
             params: { ctx in openParams(ctx) }, isVisible: { ctx in canOpenWindow(ctx) }))
         menus.register(MenuItemDescriptor(
             id: "windows.page.newWindow", title: String(localized: "Open in New Window"), icon: newWindowIcon,
-            location: .sidebarPage, order: 900, owner: owner, command: "window.open",
+            location: .sidebarPage, order: 900, owner: owner, command: CommandIDs.windowOpen,
             params: { ctx in openParams(ctx) }, isVisible: { ctx in menuPage(ctx) != nil && canOpenWindow(ctx) }))
     }
 
@@ -111,7 +115,7 @@ enum WindowMenus {
         let others = navigator.openDocuments.filter { $0 != keep && $0 != current }
             + [current].compactMap { $0 }.filter { $0 != keep }
         let calls = others.map { doc -> JSONValue in
-            ["command": "tab.close", "params": ["doc": .string(NodeRef.document(doc).description)]]
+            ["command": .string(CommandIDs.tabClose), "params": ["doc": .string(NodeRef.document(doc).description)]]
         }
         return ["calls": .array(calls)]
     }
@@ -121,7 +125,9 @@ enum WindowMenus {
 
 /// ⌘N new window, ⌘W close tab, ⌥⌘W close all tabs, ⌘1–8 tabs and ⌘9 the last tab. Registered in `start`, after every
 /// feature has registered, and only for key combinations nobody else maps (the Keyboard feature also binds ⌘N and
-/// ⌘1–9 to these commands), so a combination is never registered twice.
+/// ⌘1–9 to these commands), so a combination is never registered twice. The tab keys are `.document` keys marked
+/// `whileTabsOpen`: they also switch and close tabs while the window shows the library with its tab strip, and stay
+/// with the system in a window without tabs.
 @MainActor
 enum WindowShortcuts {
     static let idPrefix = "windows.key."
@@ -129,21 +135,25 @@ enum WindowShortcuts {
     static func descriptors(owner: String) -> [KeyCommandDescriptor] {
         func key(_ name: String, _ title: String, _ shortcut: KeyShortcut, _ command: String, _ params: JSONValue = [:],
                  scope: KeyScope = .document, order: Int) -> KeyCommandDescriptor {
-            KeyCommandDescriptor(id: idPrefix + name, title: title, shortcut: shortcut, command: command, params: params,
-                                 scope: scope, order: order, owner: owner)
+            var descriptor = KeyCommandDescriptor(id: idPrefix + name, title: title, shortcut: shortcut, command: command,
+                                                  params: params, scope: scope, order: order, owner: owner)
+            descriptor.whileTabsOpen = scope == .document
+            return descriptor
         }
-        let closeAll: JSONValue = ["calls": [["command": "tab.closeOthers"], ["command": "tab.close"]]]
+        let closeAll: JSONValue = ["calls": [["command": .string(CommandIDs.tabCloseOthers)],
+                                             ["command": .string(CommandIDs.tabClose)]]]
         var list: [KeyCommandDescriptor] = [
-            key("newWindow", String(localized: "New Window"), KeyShortcut("n", .command), "window.open",
+            key("newWindow", String(localized: "New Window"), KeyShortcut("n", .command), CommandIDs.windowOpen,
                 scope: .global, order: 100),
-            key("closeTab", String(localized: "Close Tab"), KeyShortcut("w", .command), "tab.close", order: 110),
+            key("closeTab", String(localized: "Close Tab"), KeyShortcut("w", .command), CommandIDs.tabClose, order: 110),
             key("closeAllTabs", String(localized: "Close All Tabs"), KeyShortcut("w", [.command, .option]),
                 CommandIDs.batch, closeAll, order: 120),
         ]
         for n in 1...9 {
             let index: JSONValue = ["index": .number(Double(n == 9 ? -1 : n - 1))]
             let title = n == 9 ? String(localized: "Last Tab") : String(localized: "Tab \(n)")
-            list.append(key("tab\(n)", title, KeyShortcut(String(n), .command), "tab.select", index, order: 130 + n))
+            list.append(key("tab\(n)", title, KeyShortcut(String(n), .command), CommandIDs.tabSelect, index,
+                            order: 130 + n))
         }
         return list
     }

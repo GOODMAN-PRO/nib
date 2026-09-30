@@ -11,17 +11,17 @@ import NibDesign
 enum TabStripLayout {
     /// The shell gives the strip this height.
     static let stripHeight: CGFloat = 36
-    static let tabHeight: CGFloat = 32
+    static let tabHeight = NibMetrics.tabCapsuleHeight
     /// Tab capsules sit concentric inside the droplet.
     static let inset: CGFloat = (stripHeight - tabHeight) / 2
     /// Capsule hit areas reach this far above and below the capsule (44 pt targets).
     static let hitOutset: CGFloat = (NibMetrics.hitTarget - tabHeight) / 2
     /// The strip's hit area reaches this far above and below the shell's 36 pt band, under the droplet only.
     static let overhang: CGFloat = (NibMetrics.hitTarget - stripHeight) / 2
-    static let maxTabs = 5
+    static let maxTabs = NibMetrics.maxVisibleTabs
     static let libraryWidth = NibMetrics.hitTarget
-    /// `NibBarSeparator`: a 0.5 pt hairline with 6 pt either side.
-    static let separatorWidth: CGFloat = 12.5
+    /// `NibBarSeparator`: a hairline with 6 pt either side.
+    static let separatorWidth: CGFloat = NibStroke.hairline + 2 * 6
     static let overflowWidth: CGFloat = 72
     static let closeWidth: CGFloat = 36
 
@@ -121,19 +121,19 @@ final class TabStripModel: ObservableObject {
     }
 
     func select(_ index: Int) {
-        app.perform("tab.select", ["index": .number(Double(index))], session: navigator?.session)
+        app.perform(CommandIDs.tabSelect, ["index": .number(Double(index))], session: navigator?.session)
     }
 
     func close(_ tab: Tab) {
-        app.perform("tab.close", ["doc": .string(NodeRef.document(tab.id).description)], session: navigator?.session)
+        app.perform(CommandIDs.tabClose, ["doc": .string(NodeRef.document(tab.id).description)],
+                    session: navigator?.session)
     }
 
-    /// ponytail: no catalogue command shows the library in a window, so the Library button asks the navigator
-    /// directly, as the shell's own fallbacks do. `window.showLibrary {folder?}` is requested as a contract change;
-    /// the button runs it through `app.perform` once it exists.
+    /// The Library button runs `window.showLibrary`, like the document chrome's Back button, the AI and plugins. It
+    /// acts on the active window, which the shell makes the window of the tap.
     func showLibrary() {
         guard let navigator, navigator.session.document != nil else { return }
-        navigator.showLibrary(folder: nil)
+        app.perform(CommandIDs.windowShowLibrary, session: navigator.session)
     }
 
     func menuContext(_ tab: Tab) -> MenuContext {
