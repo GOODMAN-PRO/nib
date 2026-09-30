@@ -555,6 +555,10 @@ public struct KeyCommandDescriptor: Registrable {
     /// contracts-v2: params computed from the key window's session when the key is pressed (selection, page, a fresh
     /// id); merged over `params`. Use `resolvedParams(for:)`.
     public var sessionParams: (@MainActor (EditorSession) -> JSONValue)? = nil
+    /// contracts-v2.2: a `.document` key that is also live while the window shows the library with tabs open (its tab
+    /// strip is on screen, `KeyCommandContext.hasTabs`): the tab switching and closing keys (⌘1–9, ⌘W, ⌥⌘W). Without
+    /// tabs it stays off, so the system keeps the keys. Other scopes ignore it.
+    public var whileTabsOpen: Bool = false
 
     /// contracts-v2: `params` with `sessionParams(session)` merged over them (what the shell passes to the command).
     @MainActor
@@ -573,6 +577,102 @@ public struct KeyCommandDescriptor: Registrable {
         self.scope = scope
         self.order = order
         self.owner = owner
+    }
+}
+
+/// contracts-v2.2: the state of one window that decides which key commands are live there. The shell builds it for
+/// the window that receives the key (the key window) each time UIKit asks for key commands and again when one runs.
+public struct KeyCommandContext: Equatable {
+    /// The window shows a document (false while it shows the library, or onboarding).
+    public var inDocument: Bool
+    /// The kind of that document (nil while none is shown).
+    public var docKind: DocumentKind?
+    /// Text has the keyboard in the window (`EditorSession.isEditingText`, or any text field or text view with focus),
+    /// so `.canvas` keys stand back and plain keys leave typing alone (`KeyCommandRouting.overridesSystemKeys`).
+    public var isEditingText: Bool
+    /// The window has open tabs (`SceneNavigator.openDocuments`), also while it shows the library with its tab strip:
+    /// `.document` keys marked `whileTabsOpen` stay live there.
+    public var hasTabs: Bool
+
+    public init(inDocument: Bool, docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false) {
+        self.inDocument = inDocument
+        self.docKind = docKind
+        self.isEditingText = isEditingText
+        self.hasTabs = hasTabs
+    }
+
+    /// A window showing a document of `docKind` (nil: the library).
+    public init(docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false) {
+        self.init(inDocument: docKind != nil, docKind: docKind, isEditingText: isEditingText, hasTabs: hasTabs)
+    }
+}
+
+public extension KeyCommandDescriptor {
+    /// contracts-v2.2: true when this key command is live in a window in `context`. Its `scope` must admit the window
+    /// (`.global` always, `.library` without a document, `.document` with one, `.canvas` with one while no text is
+    /// being edited; a `.document` key marked `whileTabsOpen` also in the library while the window has tabs) and its
+    /// `docKinds` (nil or empty = any kind) must contain the kind of the document shown, so a command limited to kinds
+    /// is never live in the library.
+    func isActive(in context: KeyCommandContext) -> Bool {
+        switch scope {
+        case .global: break
+        case .library: if context.inDocument { return false }
+        case .document: if !context.inDocument && !(whileTabsOpen && context.hasTabs) { return false }
+        case .canvas: if !context.inDocument || context.isEditingText { return false }
+        }
+        guard let kinds = docKinds, !kinds.isEmpty else { return true }
+        guard context.inDocument, let kind = context.docKind else { return false }
+        return kinds.contains(kind)
+    }
+}
+
+/// contracts-v2.2: which key commands a window offers, and which one wins when several share a shortcut (the shell
+/// hands UIKit one command per shortcut, so two features mapping the same keys never race).
+public enum KeyCommandRouting {
+    /// True when `a` wins over `b` for the same shortcut, most specific first: the command limited to fewer document
+    /// kinds (`docKinds`; nil, empty and every kind all count as every kind, so they tie); then the narrower scope
+    /// (`.canvas`, then `.document` or `.library`, then `.global`); then the lower `order`; then the id.
+    public static func precedes(_ a: KeyCommandDescriptor, _ b: KeyCommandDescriptor) -> Bool {
+        let ak = kindCount(a), bk = kindCount(b)
+        if ak != bk { return ak < bk }
+        let ar = rank(a.scope), br = rank(b.scope)
+        if ar != br { return ar < br }
+        if a.order != b.order { return a.order < b.order }
+        return a.id < b.id
+    }
+
+    /// The key commands live in a window in `context` (`KeyCommandDescriptor.isActive(in:)`), one per shortcut (the
+    /// winner by `precedes`), in the order of `descriptors` (pass `content.keyCommands.all`).
+    public static func active(_ descriptors: [KeyCommandDescriptor], in context: KeyCommandContext) -> [KeyCommandDescriptor] {
+        let live = descriptors.filter { $0.isActive(in: context) }
+        var winners: [KeyShortcut: KeyCommandDescriptor] = [:]
+        for d in live {
+            if let current = winners[d.shortcut], !precedes(d, current) { continue }
+            winners[d.shortcut] = d
+        }
+        return live.filter { winners[$0.shortcut]?.id == $0.id }
+    }
+
+    /// True when the key command should take priority over what the system does with the same keys (the shell sets
+    /// `UIKeyCommand.wantsPriorityOverSystemBehavior`): always, except for a key without ⌘, ⌥ or ⌃ (a letter, an
+    /// arrow, Space, Return, Tab, Delete or Escape, with or without ⇧) while text has the keyboard, where typing,
+    /// cursor movement and the text view's own Escape win.
+    public static func overridesSystemKeys(_ d: KeyCommandDescriptor, in context: KeyCommandContext) -> Bool {
+        !context.isEditingText || !d.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
+    }
+
+    /// How many document kinds a command is live in: its `docKinds`, or every kind when they are nil or empty.
+    private static func kindCount(_ d: KeyCommandDescriptor) -> Int {
+        guard let kinds = d.docKinds, !kinds.isEmpty else { return DocumentKind.allCases.count }
+        return kinds.count
+    }
+
+    private static func rank(_ scope: KeyScope) -> Int {
+        switch scope {
+        case .canvas: return 0
+        case .document, .library: return 1
+        case .global: return 2
+        }
     }
 }
 

@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibLibrary/LibraryCommands.swift:87-98 (LibraryRefs.item bare-id branch) and :134-140 (LibraryRefs.node); used by LibraryRename, LibraryMove, LibraryDuplicate, LibraryTrash, TrashRecover, TrashDeletePermanently",
+      "problem": "Locked documents can be changed by AI, plugins and the bridge when they pass a bare id. Gateway.referencedDocuments only recognises NodeRef strings (\"doc:D\") and bare ids under doc/document/docId keys. The library commands also accept a bare id in `ref` / `refs` (NodeRef(\"FIXTUREDOC01\") is nil, and the keys are ref/refs). So library.trash {refs:[\"FIXTUREDOC01\"]} as .ai succeeds on a password-locked document, while {refs:[\"doc:FIXTUREDOC01\"]} is refused with `locked`. The same applies to rename, move, duplicate, recover and deletePermanently. This breaks ARCHITECTURE §6.3: locked documents are refused with `locked` for non-user principals. The ids are easy to get, because library.list shows locked documents to the AI as {ref, locked}. No test covers it.",
+      "fix": "Give LibraryRefs.node a CommandContext. After resolving the node, throw NibError(.locked, \"'<ref>' is locked\", path: path, hint: \"ask the user to unlock it first\") when n.kind == .document && !ctx.principal.isUser && ctx.bus.gateway.isLocked(n.id). Apply the same check to LibraryMove.mergeTarget's bare-id branch (DocumentMerger already checks services.lock). Add a test: set gateway.isLocked = { $0 == d }; library.trash / library.rename with the bare id as .ai(\"chat\") must throw .locked, and the package must still be at its path."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibLibrary/FolderLibrary.swift:863-906 (setRoot -> refresh()), :260-268 (ensureLoaded -> refresh()), :797-806 (refresh)",
+      "problem": "A library with no cached catalog is scanned synchronously on the main actor. Every package head is read and JSON-decoded there. With a 5,000-document (iCloud) library that is seconds of main-thread blocking inside F025's library.chooseFolder command (ARCHITECTURE §14: commands must not block main for more than 16 ms). The same happens when any feature calls allNodes()/node() during the `await` in start(): ensureLoaded() finds loaded == false and runs the full scan on main, so the launch scan is not off-main after all.",
+      "fix": "In setRoot, install CatalogCache.load(...) when it exists and call refreshInBackground() (already generation-guarded) instead of refresh(). With no cache, run scanner(previous: [:]).scan() in a detached task, as start() does, apply it when it returns, and emit library.changed. In ensureLoaded(), when start() has a scan in flight, return the (empty) catalog instead of scanning synchronously. Keep the synchronous refresh() path for the incremental case (cache present). Update testSetRootSwitchesLibrariesAndRemembersTheFolder to await the scan."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibLibrary/FolderLibrary.swift:987-996 (moveItem, case-only rename)",
+      "problem": "A case-only rename moves the package to '.nib-rename-<UUID>' and then to the new name. If the second FileOps.move throws (a coordination or provider error) or the app dies between the two moves, the package is left under a dot-name. CatalogScanner.visit skips dot-names, so the document disappears from the library without being in the Trash.",
+      "fix": "Wrap the second move in do/catch. On error, call try? FileOps.move(temp, to: old) before rethrowing. Also, in CatalogScanner.visit (or at refresh), move a '.nib-rename-*' directory that holds head files or a .nibfolder record back to a visible unique name."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibLibrary/LibraryCommands.swift:927-944 (FolderSetStyle.run) + FolderLibrary.swift:505-518 (setStyle)",
+      "problem": "FolderSetStyle builds the full style from the catalog node, which reflects the last scan. setStyle then writes color, icon and favorite at a fresh revision. If another device changed the icon after the last scan, a colour-only edit here writes the stale icon at a higher revision. The other device's change is lost, which contradicts the descriptor's promise that omitted fields stay as they are.",
+      "fix": "Add an internal FolderLibrary.updateStyle(folder:color: RGBA??, icon: String??, favorite: Bool?) that changes only the given fields inside updateFolderRecord, which starts from the merged on-disk record. Call it from FolderSetStyle when the library is a FolderLibrary; keep setStyle(_:folder:) for the protocol."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibLibrary/FolderLibrary.swift:999-1024 (relocate) and LibraryCatalog.swift CatalogScanner.document/folder (trashedAt only for trashTop)",
+      "problem": "Items inside a trashed folder look live through LibraryService.node(_:). Only the top trashed item gets node.trashedAt, and LibraryNode has no other trash flag. Other features (doc.open, search, sync UI) that test node(id)?.trashedAt treat these items as live. Even F002's own LibraryRefs.isTrashed needs a FolderLibrary downcast to get it right.",
+      "fix": "When relocating into the Trash, set node.trashedAt on the subtree entries to the top item's time. In the scanner, do the same for inTrash && !trashTop (inherit it from the trashTop ancestor in resolve()). Clear it on restore. trashTopNodes() keeps filtering on trashTop."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibLibrary/FolderLibrary.swift:757-790 (prepareImport / finishImport)",
+      "problem": "importPackage accepts any directory and copies all of it into the library before checking for Nib packages. When it holds none, finishImport throws 'holds no Nib documents' but leaves the copied tree, its catalog entries and a library.changed event behind.",
+      "fix": "In prepareImport, walk the source (FileManager.enumerator) for a .nibnote directory or a .nib directory with PackageIO.hasHeadFile, and throw invalidParams before copying when there is none. Alternatively, in finishImport, FileOps.remove(job.destination) and catalog.removeSubtree(path:) before throwing."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibLibrary/LibraryCommands.swift:1391-1421 (TrashEmpty), :1321-1325 (TrashRecover pages), :1371-1375 (TrashDeletePermanently pages)",
+      "problem": "Three problems with the nested page calls. (1) trash.empty purges trashed pages of every live document through nested page.purge calls. For a non-user caller, a locked document with trashed pages makes the nested call throw `locked`, which is not caught (only `unavailable` is), so trash.empty aborts after purging some documents' pages. (2) Each nested irreversible page.purge asks for confirmation again unless the user picked 'allow rest of group'. (3) trash.recover and trash.deletePermanently do not catch `unavailable` when F022 is missing, so they throw after the documents have already been recovered or deleted.",
+      "fix": "In TrashEmpty, skip documents where !ctx.principal.isUser && ctx.bus.gateway.isLocked(doc), and return how many were skipped. Purge pages with as few nested calls as page.purge allows (one call with every page ref if it accepts several documents). In TrashRecover and TrashDeletePermanently, check page refs up front: fail before any library change when CommandIDs.pageRestore / pagePurge is not registered (ctx.bus registry), or catch `unavailable` and report those refs as skipped."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibLibrary/FolderLibrary.swift:797-816 (refresh with no cache file, rebuild)",
+      "problem": "rebuild(), and refresh() when the catalog cache file is missing (every refresh in the first second of a new library, or after a repair), re-read heads from disk. Open documents may still have debounced writes pending in F001. Their catalog nodes then show the pre-edit favorite, pageCount and kind, and library.changed reports the regression, until the next commit.",
+      "fix": "Before a reuse == false scan, call workspace.persistence.flush(doc) for every workspace.loadedDocuments. Alternatively, after scanning, overlay HeadSummary(workspace.content(doc)) onto the entries of loaded documents, as didCommit does."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibLibrary/LibraryPrefs.swift:215-239 (writeNow), :156-168 (setDirectory)",
+      "problem": "Two problems. (1) When writeNow fails it sets dirty = true but schedules nothing, so the synced settings reach disk only after another setValue, a reload that finds conflict copies, or the flush when the app goes to the background. (2) setDirectory calls flush() and only then takes the lock. A setValue that lands in between is marked dirty for the old library, then discarded by `dirty = false`, so that change never reaches the old library's prefs file.",
+      "fix": "In the catch branch, take the lock and call scheduleLocked() (with a small backoff). In setDirectory, take the lock once: snapshot merged, dirty, copies and the old directory, then switch. After unlocking, write the snapshot to the old directory synchronously on `queue` when it was dirty."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/NibLibraryTests/NibLibraryTests.swift",
+      "problem": "Some risky paths have no tests: the locked-document rule with bare ids; refreshInBackground being discarded or re-run when a catalog change races it (generation / rescanRequested); evicted iCloud packages ('.X.nibnote.icloud') listed as downloading with a stable id; and provider conflict copies of .nibfolder records and heads being merged and then deleted by setStyle / trash (updateFolderRecord / PackageIO.updateHead non-collapse path).",
+      "fix": "Add tests for each case: an .ai call with a bare locked id throws .locked; a background scan started, then createDocument, then the scan finishes: the new node survives and a rescan follows; a '.Doc.nibnote.icloud' file lists a .downloading node whose id survives refresh(); '.nibfolder.<dev> 2.json' and 'doc.<dev> 2.json' with newer revisions are merged by setStyle / library.trash and removed afterwards."
+    }
+  ]
+}
