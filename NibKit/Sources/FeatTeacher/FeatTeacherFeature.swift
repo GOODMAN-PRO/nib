@@ -8,9 +8,9 @@ import NibDesign
 ///   and the assistant by a `CustomItemTypeDescriptor` (their label is their text) and drawn by `AnswerZoneDrawer`.
 /// - Commands: `answerZone.create`, `answerZone.score`, `answerZone.setHints`, `answerZone.revealHint` (the last one
 ///   records usage without an undo step).
-/// - Canvas: `AnswerZoneAttachment` draws the score and hint widgets; taps on a hint widget reach
+/// - Canvas: `AnswerZoneAttachment` draws the score and hint widgets; finger taps on a hint widget reach
 ///   `answerZone.revealHint` through two `TapHandlerDescriptor`s (tap reveals the next hint, long-press shows the
-///   revealed ones).
+///   revealed ones), which emits `teacher.answerZone.hintsShown` for the window's attachment.
 /// - Menus: Add Answer Zone (page long-press), Make Answer Zone (object menu, around a selection). Editing is the
 ///   Answer Zone inspector behind the object menu's Style entry.
 ///
@@ -34,11 +34,14 @@ public enum FeatTeacherFeature: NibFeature {
         app.content.customItemTypes.register(type)
         app.content.drawers.register(ItemDrawerEntry(key: AnswerZone.drawKey, owner: id, drawer: AnswerZoneDrawer()))
 
+        // Offered every tap and long-press (no item filter): the hint widget floats over the page, so the item under
+        // it may be anything (the question the zone was made around, a student's ink) or nothing (a widget sticking
+        // out past a small zone at low zoom). The command answers handled only on a widget. In read-only it only
+        // shows the hints already revealed.
         for (gesture, suffix) in [(CanvasGesture.tap, "tap"), (CanvasGesture.longPress, "longPress")] {
             app.content.tapHandlers.register(TapHandlerDescriptor(
                 id: TeacherIDs.hintTapHandler + "." + suffix, owner: id, gesture: gesture,
-                command: CommandIDs.answerZoneRevealHint, order: TeacherIDs.hintTapOrder,
-                itemKinds: [.custom], drawKeys: [AnswerZone.drawKey]))
+                command: CommandIDs.answerZoneRevealHint, order: TeacherIDs.hintTapOrder, worksInReadOnly: true))
         }
 
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(
@@ -57,9 +60,9 @@ public enum FeatTeacherFeature: NibFeature {
 
 enum TeacherIDs {
     static let hintTapHandler = "teacher.answerZone.hint"
-    /// After tape (100) and comments (200), before links (300) and selection (400): a tap on a hint widget is the
-    /// widget's, while any other tap on a zone still selects it.
-    static let hintTapOrder = 250
+    /// Before the page's own handlers (tape 100, comments 200, links 300, selection 400): the hint widget sits above
+    /// the page, so a tap on it is the widget's whatever lies under it, while every other tap goes on unchanged.
+    static let hintTapOrder = 50
     /// After the selection handles (F012, 500): a selected zone moves and resizes; an unselected one takes score taps.
     static let attachmentOrder = 520
     static let inspector = "teacher.answerZone.inspector"

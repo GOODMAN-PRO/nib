@@ -86,7 +86,9 @@ final class FeatTeacherTests: XCTestCase {
 
         let taps = h.app.content.tapHandlers.all.filter { $0.command == CommandIDs.answerZoneRevealHint }
         XCTAssertEqual(Set(taps.map(\.gesture)), [.tap, .longPress])
-        XCTAssertTrue(taps.allSatisfy { $0.drawKeys == [AnswerZone.drawKey] && $0.owner == FeatTeacherFeature.id })
+        // Offered every tap (the widget floats over whatever item is under it) and in read-only (peek only).
+        XCTAssertTrue(taps.allSatisfy { $0.drawKeys == nil && $0.itemKinds == nil && $0.worksInReadOnly })
+        XCTAssertTrue(taps.allSatisfy { $0.owner == FeatTeacherFeature.id && $0.order < 100 })
 
         XCTAssertEqual(h.app.ui.canvasAttachments.get(AnswerZoneAttachment.id)?.docKinds, [.notebook, .whiteboard])
         XCTAssertEqual(h.app.ui.inspectors.get(TeacherIDs.inspector)?.drawKeys, [AnswerZone.drawKey])
@@ -288,6 +290,7 @@ final class FeatTeacherTests: XCTestCase {
         let z = try zone(h, zoneID)
         XCTAssertEqual(z.revealed, 2)
         XCTAssertEqual(z.usage.map(\.hint), [0, 1])
+        XCTAssertEqual(z.usage.map(\.text), ["First", "Second"])
         XCTAssertEqual(z.usage.map(\.by), ["user", "ai:chat1"])
         XCTAssertTrue(z.usage.allSatisfy { $0.at > 1_700_000_000 })
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth, "revealing a hint adds no undo step")
@@ -337,10 +340,225 @@ final class FeatTeacherTests: XCTestCase {
         let near = try await h.run(CommandIDs.answerZoneRevealHint,
                                    ["page": .string(page2), "point": edge, "ref": .string(ref), "gesture": "tap"])
         XCTAssertEqual(near["hint"]?.stringValue, "Second")
+        // A read-only window only shows what is revealed.
         h.session.readOnly = true
         let readOnly = try await h.run(CommandIDs.answerZoneRevealHint,
                                        ["page": .string(page2), "point": onWidget, "ref": .string(ref), "gesture": "tap"])
-        XCTAssertEqual(readOnly["handled"]?.boolValue, false)
+        XCTAssertEqual(readOnly["handled"]?.boolValue, true)
+        XCTAssertNil(readOnly["hint"]?.stringValue)
+        XCTAssertEqual(try zone(h, zoneID).revealed, 2)
+        XCTAssertEqual(try zone(h, zoneID).usage.count, 2)
+    }
+
+    func testTapOnAHintWidgetCoveredByAnotherItemStillReveals() async throws {
+        let h = harness()
+        try await create(h)
+        let it = try item(h, zoneID)
+        let slot = try XCTUnwrap(AnswerZoneLayout.slots(zoneBounds: it.bounds, zoom: 1, hasScore: true, hasHints: true).hint)
+        // The question the zone was made around (or a student's ink) lies over the widget and is the topmost item.
+        let box = Item.makeText(TextBoxItem(frame: Frame(x: slot.minX - 20, y: slot.minY - 10, w: slot.width + 40,
+                                                         h: slot.height + 20), text: .empty))
+        let written = try await h.insert([box], page: Fixtures.page2)
+        let topmost = NodeRef.item(Fixtures.docID, Fixtures.page2, try XCTUnwrap(written.first?.id)).description
+        let r = try await h.run(CommandIDs.answerZoneRevealHint,
+                                ["page": .string(page2), "point": [.number(slot.midX), .number(slot.midY)],
+                                 "ref": .string(topmost), "gesture": "tap"])
+        XCTAssertEqual(r["handled"]?.boolValue, true)
+        XCTAssertEqual(r["hint"]?.stringValue, "First")
+        XCTAssertEqual(r["ref"]?.stringValue, "item:FIXTUREDOC01/FIXTUREPG002/ZONE00000001")
+        XCTAssertEqual(try zone(h, zoneID).revealed, 1)
+        XCTAssertEqual(try zone(h, zoneID).usage.count, 1)
+        // A tap on that item away from the widget is not the handler's.
+        let away = try await h.run(CommandIDs.answerZoneRevealHint,
+                                   ["page": .string(page2), "point": [.number(slot.minX - 40), .number(slot.midY)],
+                                    "ref": .string(topmost), "gesture": "tap"])
+        XCTAssertEqual(away["handled"]?.boolValue, false)
+        XCTAssertEqual(try zone(h, zoneID).revealed, 1)
+        // Zones on a hidden layer have no widget.
+        h.session.hiddenLayers = [0]
+        let hidden = try await h.run(CommandIDs.answerZoneRevealHint,
+                                     ["page": .string(page2), "point": [.number(slot.midX), .number(slot.midY)], "gesture": "tap"])
+        XCTAssertEqual(hidden["handled"]?.boolValue, false)
+    }
+
+    func testTapAtLowZoomOnAMinimumSizeZoneHitsTheWidgetOutsideTheZone() async throws {
+        let h = harness()
+        try await create(h, rect: [100, 100, 24, 24], points: nil, hints: ["Only"])
+        let it = try item(h, zoneID)
+        h.session.zoom = 0.5
+        let slot = try XCTUnwrap(AnswerZoneLayout.slots(zoneBounds: it.bounds, zoom: 0.5, hasScore: false, hasHints: true).hint)
+        XCTAssertFalse(it.bounds.contains(Point(slot.midX, slot.midY)), "the widget sticks out past the zone")
+        let point: JSONValue = [.number(slot.midX), .number(slot.midY)]
+        // Nothing lies under the point, so the router passes no ref.
+        let r = try await h.run(CommandIDs.answerZoneRevealHint, ["page": .string(page2), "point": point, "gesture": "tap"])
+        XCTAssertEqual(r["handled"]?.boolValue, true)
+        XCTAssertEqual(r["hint"]?.stringValue, "Only")
+        // At 100 % the widget is half as large in page points and the same point misses it.
+        h.session.zoom = 1
+        let miss = try await h.run(CommandIDs.answerZoneRevealHint, ["page": .string(page2), "point": point, "gesture": "longPress"])
+        XCTAssertEqual(miss["handled"]?.boolValue, false)
+    }
+
+    func testDryRunOfATapWritesNothingAndShowsNothing() async throws {
+        let h = harness()
+        try await create(h)
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = AnswerZoneAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let hint = try XCTUnwrap(attachment.hintViews[zoneID])
+        let point: JSONValue = [.number(Double(hint.center.x)), .number(Double(hint.center.y) - (PageSize.a4.height + 20))]
+        let before = try item(h, zoneID)
+        let depth = h.undoDepth(Fixtures.docID)
+        let r = try await h.app.bus.execute(Invocation(command: CommandIDs.answerZoneRevealHint,
+                                                       params: ["page": .string(page2), "point": point, "gesture": "tap"],
+                                                       session: h.session, dryRun: true))
+        XCTAssertEqual(r.value["handled"]?.boolValue, true)
+        XCTAssertEqual(try item(h, zoneID), before)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth)
+        XCTAssertTrue(floating.presented.isEmpty, "a dry run shows no card")
+        XCTAssertEqual(attachment.hintViews[zoneID]?.text, "0/2")
+    }
+
+    func testReadOnlyDocumentsRefuseChangesAndOnlyShowHints() async throws {
+        let h = harness()
+        let ref = try await create(h)
+        try await h.run(CommandIDs.answerZoneRevealHint, ["ref": .string(ref)])
+        h.app.services.set(NSMutableSet(array: [Fixtures.docID.raw]), for: ServiceKeys.storeReadOnly)
+        let before = try item(h, zoneID)
+        await expectError(.unsupported) {
+            try await h.run(CommandIDs.answerZoneScore, ["ref": .string(ref), "score": 2])
+        }
+        await expectError(.unsupported) {
+            try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["x"]])
+        }
+        await expectError(.unsupported) {
+            try await h.run(CommandIDs.answerZoneRevealHint, ["ref": .string(ref)])
+        }
+        await expectError(.unsupported) {
+            try await h.run(CommandIDs.answerZoneCreate, ["page": .string(self.page2), "rect": [10, 10, 100, 100]])
+        }
+        // The canvas tap peeks at what is revealed.
+        let it = try item(h, zoneID)
+        let slot = try XCTUnwrap(AnswerZoneLayout.slots(zoneBounds: it.bounds, zoom: 1, hasScore: true, hasHints: true).hint)
+        let peek = try await h.run(CommandIDs.answerZoneRevealHint,
+                                   ["page": .string(page2), "point": [.number(slot.midX), .number(slot.midY)], "gesture": "tap"])
+        XCTAssertEqual(peek["handled"]?.boolValue, true)
+        XCTAssertEqual(peek["revealed"]?.intValue, 1)
+        XCTAssertNil(peek["hint"]?.stringValue)
+        XCTAssertEqual(try item(h, zoneID), before)
+    }
+
+    func testReadOnlyWindowWidgetsOnlyShowTheRevealedHints() async throws {
+        let h = harness()
+        let ref = try await create(h)
+        try await h.run(CommandIDs.answerZoneRevealHint, ["ref": .string(ref)])
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = AnswerZoneAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        h.session.readOnly = true
+        attachment.canvasDidChange(host)
+        let hint = try XCTUnwrap(attachment.hintViews[zoneID])
+        XCTAssertNil(hint.accessibilityHint, "no promise of a reveal")
+        XCTAssertTrue(hint.accessibilityActivate())
+        XCTAssertTrue(floating.isPresenting(AnswerZoneUI.hintsPopoverID), "VoiceOver peeks, like a finger")
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(try zone(h, zoneID).revealed, 1)
+        XCTAssertEqual(try zone(h, zoneID).usage.count, 1)
+    }
+
+    // MARK: Record hygiene
+
+    func testWritingARecordKeepsKeysItDoesNotKnow() async throws {
+        let h = harness()
+        let ref = try await create(h)
+        // A plugin (item.update) or a newer build adds its own field.
+        var it = try item(h, zoneID)
+        var data = try XCTUnwrap(it.custom?.data.objectValue)
+        data["extra"] = ["kept": true]
+        it.custom?.data = .object(data)
+        try await h.insert([it], page: Fixtures.page2)
+        try await h.run(CommandIDs.answerZoneScore, ["ref": .string(ref), "score": 3])
+        try await h.run(CommandIDs.answerZoneRevealHint, ["ref": .string(ref)])
+        var stored = try XCTUnwrap(item(h, zoneID).custom?.data)
+        XCTAssertEqual(stored["extra"], ["kept": true])
+        XCTAssertEqual(stored["score"]?.doubleValue, 3)
+        // Unset fields leave the record: clearing the score removes score, scoredAt and scoredBy.
+        try await h.run(CommandIDs.answerZoneScore, ["ref": .string(ref), "score": 0, "clear": true])
+        stored = try XCTUnwrap(item(h, zoneID).custom?.data)
+        XCTAssertNil(stored["score"])
+        XCTAssertNil(stored["scoredAt"])
+        XCTAssertNil(stored["scoredBy"])
+        XCTAssertEqual(stored["extra"], ["kept": true])
+    }
+
+    func testRemovingTheFirstHintAfterTwoRevealsShowsOnlyWhatWasOpened() async throws {
+        let h = harness()
+        let ref = try await create(h, hints: ["A", "B", "C"])
+        try await h.run(CommandIDs.answerZoneRevealHint, ["ref": .string(ref)])
+        try await h.run(CommandIDs.answerZoneRevealHint, ["ref": .string(ref)])
+        try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["B", "C"]])
+        var z = try zone(h, zoneID)
+        XCTAssertEqual(z.revealedHints, ["B"], "C was never opened, so it is not shown")
+        XCTAssertEqual(z.usage.map(\.text), ["A", "B"], "the log still names the hints that were opened")
+        XCTAssertEqual(AnswerZoneFormat.usedHint(z.usage[0]), "Hint 1: A")
+        // Reordering never shows an unopened hint; rewording a shown one in place keeps it shown.
+        try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["C", "B"]])
+        XCTAssertEqual(try zone(h, zoneID).revealed, 0)
+        try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["B", "C"]])
+        try await h.run(CommandIDs.answerZoneRevealHint, ["ref": .string(ref)])
+        try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["B.", "C"]])
+        z = try zone(h, zoneID)
+        XCTAssertEqual(z.revealed, 1)
+        XCTAssertEqual(AnswerZone.revealedAfterEditing(z, to: ["X", "B.", "C"]), 0, "an inserted hint is not shown")
+    }
+
+    func testTheAssistantIsAskedBeforeResettingHintUsage() async throws {
+        let h = harness()
+        let ref = try await create(h)
+        try await h.run(CommandIDs.answerZoneRevealHint, ["ref": .string(ref)])
+        let asked = h.confirmer
+        asked.decision = .deny
+        // Editing hints is not destructive: no question.
+        try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["First", "Second", "Third"]],
+                        as: .ai("chat1"))
+        XCTAssertEqual(asked.requests.count, 0)
+        await expectError(.userDenied) {
+            try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["First"], "resetUsage": true],
+                            as: .ai("chat1"))
+        }
+        XCTAssertEqual(asked.requests.count, 1)
+        XCTAssertEqual(asked.requests.first?.command.destructive, true)
+        XCTAssertEqual(try zone(h, zoneID).usage.count, 1, "declined: the record stays")
+        asked.decision = .allow
+        try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["First"], "resetUsage": true],
+                        as: .ai("chat1"))
+        XCTAssertEqual(try zone(h, zoneID).usage, [])
+        // The user's own reset (the inspector confirms it inline) is not asked again.
+        try await h.run(CommandIDs.answerZoneSetHints, ["ref": .string(ref), "hints": ["First"], "resetUsage": true])
+        XCTAssertEqual(asked.requests.count, 2)
+    }
+
+    func testADocumentScopeEvictsOnlyThePagesItLoaded() async throws {
+        let h = harness()
+        try await create(h, id: "ZONEA0000001", rect: [72, 100, 200, 100], points: 5)
+        let before = try h.snapshot()
+        h.app.workspace.evictPages(Fixtures.docID, keeping: [Fixtures.page1])
+        XCTAssertEqual(h.app.workspace.cachedPages(Fixtures.docID), [Fixtures.page1])
+        let r = try await h.run(CommandIDs.answerZoneScore, ["ref": "doc:FIXTUREDOC01", "score": 3])
+        XCTAssertEqual(r["refs"]?.arrayValue?.count, 1)
+        XCTAssertEqual(h.app.workspace.cachedPages(Fixtures.docID), [Fixtures.page1], "the scan left no pages cached")
+        XCTAssertEqual(try zone(h, "ZONEA0000001").score, 3)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertNil(try zone(h, "ZONEA0000001").score)
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        XCTAssertEqual(try zone(h, "ZONEA0000001").score, 3)
     }
 
     // MARK: Model, layout and drawing
@@ -357,16 +575,32 @@ final class FeatTeacherTests: XCTestCase {
         XCTAssertNil(AnswerZone.decode(data: ["score": 3]).score, "no score without a score box")
         let use = AnswerZone.decode(data: ["hints": ["a"], "revealed": 1, "usage": [["hint": 0]]]).usage
         XCTAssertEqual(use, [AnswerZone.HintUse(hint: 0, at: 0, by: "user")])
+        // Bounded like the commands, whatever a file or plugin wrote.
+        let many: [JSONValue] = (1...25).map { .string("Hint \($0) " + String(repeating: "x", count: 2000)) }
+        let usage: [JSONValue] = (0..<5000).map { i -> JSONValue in ["hint": .number(Double(i % 3)), "at": .number(Double(i))] }
+        let big = AnswerZone.decode(data: ["hints": .array(many), "label": .string(String(repeating: "L", count: 500)),
+                                           "points": 1e9, "score": 1e9, "revealed": 99, "usage": .array(usage)])
+        XCTAssertEqual(big.hints.count, AnswerZone.maxHints)
+        XCTAssertTrue(big.hints.allSatisfy { $0.count == AnswerZone.maxHintLength })
+        XCTAssertEqual(big.label?.count, AnswerZone.maxLabelLength)
+        XCTAssertEqual(big.points, AnswerZone.maxPoints)
+        XCTAssertEqual(big.score, AnswerZone.maxPoints)
+        XCTAssertEqual(big.revealed, AnswerZone.maxHints)
+        XCTAssertEqual(big.usage.count, AnswerZone.maxUsage)
+        XCTAssertEqual(big.usage.last?.at, 4999, "the most recent entries are kept")
     }
 
-    func testSlotsHitRectsReadingOrderAndClamp() {
+    func testSlotsHitRectsReadingOrderAndClamp() throws {
         let tall = AnswerZoneLayout.slots(zoneBounds: Rect(x: 0, y: 0, width: 300, height: 140), zoom: 1,
                                           hasScore: true, hasHints: true)
         XCTAssertEqual(tall.score, Rect(x: 224, y: 4, width: 72, height: 32))
-        XCTAssertEqual(tall.hint, Rect(x: 224, y: 40, width: 72, height: 32))
+        XCTAssertEqual(tall.hint, Rect(x: 224, y: 52, width: 72, height: 32), "resting droplets sit 16 pt apart")
         let short = AnswerZoneLayout.slots(zoneBounds: Rect(x: 0, y: 0, width: 300, height: 50), zoom: 1,
                                            hasScore: true, hasHints: true)
-        XCTAssertEqual(short.hint, Rect(x: 148, y: 4, width: 72, height: 32))
+        XCTAssertEqual(short.hint, Rect(x: 136, y: 4, width: 72, height: 32))
+        // The two 44 pt touch areas never overlap.
+        let tallScoreHit = AnswerZoneLayout.hitRect(try XCTUnwrap(tall.score), zoom: 1)
+        XCTAssertFalse(tallScoreHit.intersects(AnswerZoneLayout.hitRect(try XCTUnwrap(tall.hint), zoom: 1)))
         let hintsOnly = AnswerZoneLayout.slots(zoneBounds: Rect(x: 10, y: 10, width: 300, height: 140), zoom: 2,
                                                hasScore: false, hasHints: true)
         XCTAssertNil(hintsOnly.score)
@@ -384,20 +618,32 @@ final class FeatTeacherTests: XCTestCase {
         XCTAssertEqual(clamped.y, PageSize.a4.height - 100, accuracy: 0.001)
     }
 
-    func testDisplayListShowsTheScoreAndHintUseOnlyWherePrinted() {
+    func testDisplayListShowsTheScoreAndHintUseOnlyWherePrinted() throws {
         var z = AnswerZone(points: 5, hints: ["h1", "h2"])
         z.score = 2.5
         let size = PageSize(300, 140)
         let screen = AnswerZoneLayout.displayList(z, size: size, style: .outline, darkPaper: false)
         XCTAssertEqual(screen.ops.count, 1)
-        XCTAssertEqual(screen.ops.first?.dash, AnswerZoneLayout.outlineDash)
+        // Only NibDesign tokens: the one dash (4/4) at thin (1 pt), the on-page radius (4), the water line (0.8) for
+        // the printed boxes, and the hud (13) and caption2 (11) sizes.
+        let outline = try XCTUnwrap(screen.ops.first)
+        XCTAssertEqual(outline.dash, [4, 4])
+        XCTAssertEqual(outline.width, 1)
+        XCTAssertEqual(outline.radius, 4)
+        XCTAssertEqual(AnswerZoneLayout.boxWidth, 0.8, accuracy: 0.0001)
+        XCTAssertEqual(AnswerZoneLayout.scoreTextSize, 13)
+        XCTAssertEqual(AnswerZoneLayout.hintTextSize, 11)
         var full = AnswerZoneLayout.displayList(z, size: size, style: .full, darkPaper: false)
         XCTAssertEqual(full.ops.compactMap(\.text), [AnswerZoneFormat.number(2.5) + "/5"])
         XCTAssertEqual(full.ops.last?.stroke, AnswerZoneInk(darkPaper: false).mark)
+        XCTAssertEqual(full.ops.last?.fontSize, AnswerZoneLayout.scoreTextSize)
+        XCTAssertEqual(full.ops[1].width, AnswerZoneLayout.boxWidth)
         z.revealed = 1
         full = AnswerZoneLayout.displayList(z, size: size, style: .full, darkPaper: false)
         XCTAssertEqual(full.ops.compactMap(\.text).count, 2)
         XCTAssertTrue(full.ops.compactMap(\.text).last?.contains("1/2") ?? false)
+        XCTAssertEqual(full.ops.last?.fontSize, AnswerZoneLayout.hintTextSize)
+        XCTAssertTrue(full.ops.filter { $0.op == .rect }.dropFirst().allSatisfy { $0.width == AnswerZoneLayout.boxWidth })
         z.score = nil
         full = AnswerZoneLayout.displayList(z, size: size, style: .full, darkPaper: false)
         XCTAssertEqual(full.ops.compactMap(\.text).first, "/5", "an unscored box leaves room for a handwritten score")
@@ -448,15 +694,17 @@ final class FeatTeacherTests: XCTestCase {
         let pageTop = (PageSize.a4.height + 20)
         XCTAssertEqual(score.restingFrame.maxX, 72 + 320 - 4, accuracy: 0.01)
         XCTAssertEqual(score.restingFrame.minY, pageTop + 120 + 4, accuracy: 0.01)
-        XCTAssertEqual(hint.restingFrame.minY, score.restingFrame.maxY + 4, accuracy: 0.01)
+        XCTAssertEqual(hint.restingFrame.minY, score.restingFrame.maxY + 16, accuracy: 0.01)
         XCTAssertEqual(score.accessibilityLabel, "Score, Answer Zone 1")
         XCTAssertEqual(score.accessibilityValue, "Not scored, out of 5")
         XCTAssertTrue(score.accessibilityTraits.contains(.adjustable))
 
         let onScore = CGPoint(x: score.center.x, y: score.center.y)
         XCTAssertTrue(attachment.hitTest(onScore, isPencil: false, host: host))
-        XCTAssertTrue(attachment.hitTest(CGPoint(x: onScore.x, y: score.restingFrame.minY - 5), isPencil: true, host: host),
+        XCTAssertTrue(attachment.hitTest(CGPoint(x: onScore.x, y: score.restingFrame.minY - 5), isPencil: false, host: host),
                       "44 pt target")
+        XCTAssertFalse(attachment.hitTest(onScore, isPencil: true, host: host),
+                       "the Pencil writes over both widgets alike (tap handlers are finger taps)")
         XCTAssertFalse(attachment.hitTest(CGPoint(x: hint.center.x, y: hint.center.y), isPencil: false, host: host),
                        "hint taps go to content.tapHandlers")
         XCTAssertFalse(attachment.hitTest(CGPoint(x: 10, y: 10), isPencil: false, host: host))
@@ -481,10 +729,18 @@ final class FeatTeacherTests: XCTestCase {
         attachment.canvasDidChange(host)
         XCTAssertNotNil(attachment.scoreViews[zoneID])
 
-        // Read-only windows show the score but do not take the touch.
+        // Read-only windows show the score but do not take the touch, and VoiceOver reads it without offering it.
         h.session.readOnly = true
         XCTAssertFalse(attachment.hitTest(onScore, isPencil: false, host: host))
+        attachment.canvasDidChange(host)
+        let readOnlyScore = try XCTUnwrap(attachment.scoreViews[zoneID])
+        XCTAssertFalse(readOnlyScore.accessibilityTraits.contains(.adjustable))
+        XCTAssertFalse(readOnlyScore.accessibilityTraits.contains(.button))
+        XCTAssertNil(readOnlyScore.accessibilityHint)
+        readOnlyScore.accessibilityIncrement()
         h.session.readOnly = false
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.scoreViews[zoneID]?.accessibilityTraits.contains(.adjustable) ?? false)
 
         // While the Pencil is down the widgets step back.
         h.session.inking.begin()
@@ -513,7 +769,12 @@ final class FeatTeacherTests: XCTestCase {
         let views = Array(attachment.scoreViews.values) + Array(attachment.hintViews.values)
         attachment.detach(from: host)
         XCTAssertTrue(views.allSatisfy { $0.superview == nil })
-        XCTAssertNil(AnswerZoneUI.attachment(for: h.session))
+        // Detached: a handled tap in this window presents nothing.
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        h.app.events.emit(AnswerZoneHintsShownPayload(session: h.session.id.raw,
+                                                      ref: "item:FIXTUREDOC01/FIXTUREPG002/ZONE00000001", announce: false))
+        XCTAssertTrue(floating.presented.isEmpty)
     }
 
     func testWidgetsBudTheScorePopoverAndATappedHintShowsTheHintsCard() async throws {

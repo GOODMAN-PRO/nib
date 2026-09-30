@@ -30,8 +30,19 @@ enum AnswerZoneScope {
         let kind: Kind
         let doc: DocumentID
         let targets: [AnswerZoneTarget]
+        /// Pages a document scan loaded that were not in memory before.
+        var loaded: Set<PageID> = []
+
+        /// Drops the pages this scan loaded (after the command wrote to them), keeping every page that was in memory
+        /// before it (CONTRACTS.md G10), so a `doc:` ref on a long document does not leave all its pages cached.
+        @MainActor
+        func release(_ workspace: Workspace) {
+            guard !loaded.isEmpty else { return }
+            workspace.evictPages(doc, keeping: workspace.cachedPages(doc).subtracting(loaded))
+        }
     }
 
+    /// Resolves `ref`; callers `release` the result once they are done with it.
     static func resolve(_ ref: String, _ workspace: Workspace, path: String = "$.ref") throws -> Resolved {
         guard let node = NodeRef(ref) else {
             throw NibError(.invalidParams, "'\(ref)' is not a ref", path: path,
@@ -51,11 +62,20 @@ enum AnswerZoneScope {
             }
             return Resolved(kind: .page, doc: doc, targets: try zones(doc: doc, page: page, workspace))
         case let .document(doc):
+            let pages = try workspace.content(doc).livePages
+            let cached = workspace.cachedPages(doc)
             var targets: [AnswerZoneTarget] = []
-            for record in try workspace.content(doc).livePages {
-                targets += try zones(doc: doc, page: record.id, workspace)
+            var loaded = Set<PageID>()
+            for record in pages {
+                if !cached.contains(record.id) { loaded.insert(record.id) }
+                do {
+                    targets += try zones(doc: doc, page: record.id, workspace)
+                } catch {
+                    Resolved(kind: .document, doc: doc, targets: [], loaded: loaded).release(workspace)
+                    throw error
+                }
             }
-            return Resolved(kind: .document, doc: doc, targets: targets)
+            return Resolved(kind: .document, doc: doc, targets: targets, loaded: loaded)
         default:
             throw NibError(.invalidParams, "\(ref) cannot hold answer zones", path: path,
                            hint: "pass an answer zone (item:D/P/I), a page (page:D/P) or a document (doc:D)")
@@ -157,7 +177,9 @@ struct AnswerZoneCreate: NibCommand {
             throw NibError.invalid("label is longer than \(AnswerZone.maxLabelLength) characters", path: "$.label")
         }
         try AnswerZoneRules.checkWritable(doc, ctx)
-        let layer = ctx.activeSession?.activeLayer ?? 0
+        // The invoking window's active layer when it shows this document (a background window or another document
+        // must not pick a layer this document may not have).
+        let layer = (ctx.session ?? ctx.activeSession).flatMap { $0.document == doc ? $0.activeLayer : nil } ?? 0
         let zone = AnswerZone(label: (label?.isEmpty ?? true) ? nil : label,
                               points: p.points.map(AnswerZoneRules.rounded), hints: hints)
         let item = try ctx.mutate { tx -> Item in
@@ -218,6 +240,7 @@ struct AnswerZoneScore: NibCommand {
             throw NibError.invalid("points must be between 0 and \(Int(AnswerZone.maxPoints))", path: "$.points")
         }
         let scope = try AnswerZoneScope.resolve(p.ref, ctx.workspace)
+        defer { scope.release(ctx.workspace) }
         try AnswerZoneRules.checkWritable(scope.doc, ctx)
         let score = AnswerZoneRules.rounded(p.score)
         let newPoints = p.points.map(AnswerZoneRules.rounded)
@@ -294,29 +317,45 @@ struct AnswerZoneSetHints: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "answerZone.setHints", title: String(localized: "Set Answer Zone Hints"),
-        summary: "Set the teacher-approved hints of an answer zone (a page or doc ref sets them on all its zones); resetUsage? forgets which hints were shown.",
+        summary: "Set the teacher-approved hints of an answer zone (a page or doc ref: all its zones); resetUsage? erases the record of hints shown (asks the user first).",
         params: .obj(["ref": .ref,
                       "hints": .arr(.str("a teacher-approved hint"), "hints in reveal order, at most 10; [] removes them"),
-                      "resetUsage": .bool("true also clears the record of hints already shown")],
+                      "resetUsage": .bool("true also erases the record of hints already shown; the user confirms it")],
                      required: ["ref", "hints"]),
         examples: [["ref": "page:FIXTUREDOC01/FIXTUREPG001", "hints": ["Which formula links v, u, a and t?"]],
                    ["ref": "doc:FIXTUREDOC04", "hints": [], "resetUsage": true]],
         effect: .edit)
 
+    /// The descriptor a reset is authorized with: destructive, so the gateway asks the user (and plugins need the
+    /// destructive permission) before the assistant, a plugin or the bridge erases the record of hints shown.
+    static var resetDescriptor: CommandDescriptor {
+        var d = descriptor
+        d.destructive = true
+        d.scopes.insert(.destructive)
+        return d
+    }
+
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let hints = try AnswerZoneRules.hints(p.hints, path: "$.hints")
+        let reset = p.resetUsage == true
+        if reset, !ctx.principal.isUser, !ctx.dryRun {
+            try await ctx.bus.gateway.authorize(resetDescriptor, params: try JSONValue.from(p), principal: ctx.principal,
+                                                group: ctx.group, inheritedPolicy: ctx.inheritedPolicy)
+        }
         let scope = try AnswerZoneScope.resolve(p.ref, ctx.workspace)
+        defer { scope.release(ctx.workspace) }
         try AnswerZoneRules.checkWritable(scope.doc, ctx)
         var changes: [(AnswerZoneTarget, AnswerZone)] = []
         for target in scope.targets {
             var zone = target.zone
             zone.hints = hints
-            if p.resetUsage == true {
+            if reset {
                 zone.revealed = 0
                 zone.usage = []
             } else {
-                // Edited wording keeps what was shown; a shorter list cannot have shown more than it holds.
-                zone.revealed = min(zone.revealed, hints.count)
+                // Shown hints stay shown by text (or reworded in place); removing, inserting or reordering hints never
+                // shows one a student has not opened. The usage log keeps each opened hint's text.
+                zone.revealed = AnswerZone.revealedAfterEditing(target.zone, to: hints)
             }
             if zone != target.zone { changes.append((target, zone)) }
         }
@@ -338,9 +377,12 @@ struct AnswerZoneSetHints: NibCommand {
 /// Reveals the next hint of a zone and records who opened it when (`AnswerZone.usage`). The record persists without an
 /// undo step (`undoable: false`, like tape reveal), so undo never erases the fact that a hint was used.
 ///
-/// Also the canvas tap handler for the hint widget (`content.tapHandlers`): with `point` the call comes from a finger
-/// on the canvas, and only a touch on the zone's hint widget counts (`{"handled": false}` otherwise). A tap reveals the
-/// next hint; a long-press only shows the hints already revealed. Either way the window shows the hints card.
+/// Also the canvas tap handler for the hint widget (`content.tapHandlers`, offered every finger tap and long-press):
+/// with `point` the call comes from a finger on the canvas, and only a touch on a zone's hint widget counts
+/// (`{"handled": false}` otherwise). The widget floats over the page, so the zone is found from `page` and `point`,
+/// whatever item is topmost there (`ref` is only a shortcut when it is the zone itself). A tap reveals the next hint;
+/// a long-press, or any touch where the document cannot change (a read-only window or document), only shows the hints
+/// already revealed. Either way the call emits `teacher.answerZone.hintsShown` and the window shows the hints card.
 struct AnswerZoneRevealHint: NibCommand {
     struct Params: Codable {
         var ref: String?
@@ -377,6 +419,7 @@ struct AnswerZoneRevealHint: NibCommand {
         if let point = p.point { return try await tapped(p, point: point, ctx) }
         guard let ref = p.ref, !ref.isEmpty else { throw NibError.invalid("missing 'ref'", path: "$.ref") }
         let scope = try AnswerZoneScope.resolve(ref, ctx.workspace)
+        defer { scope.release(ctx.workspace) }
         let target: AnswerZoneTarget?
         switch scope.kind {
         case .zone:
@@ -389,30 +432,47 @@ struct AnswerZoneRevealHint: NibCommand {
         return try reveal(target, ctx)
     }
 
-    /// The canvas tap-handler path: `ref` is the topmost item under `point` (the router offers only zones).
+    /// The canvas tap-handler path.
     private static func tapped(_ p: Params, point: Point, _ ctx: CommandContext) async throws -> Output {
-        let notHandled = Output(handled: false, revealed: 0, total: 0)
-        guard let ref = p.ref, case let .item(doc, page, id)? = NodeRef(ref),
-              let item = try? ctx.workspace.item(doc, page: page, id: id), let zone = AnswerZone.decode(item),
-              !zone.hints.isEmpty else { return notHandled }
         let session = ctx.session ?? ctx.activeSession
-        if session?.readOnly == true { return notHandled }
-        let zoom = session?.zoom ?? 1
-        guard let slot = AnswerZoneLayout.slots(zoneBounds: item.bounds, zoom: zoom, hasScore: zone.points != nil,
-                                                hasHints: true).hint,
-              AnswerZoneLayout.hitRect(slot, zoom: zoom).contains(point) else { return notHandled }
-        let target = AnswerZoneTarget(doc: doc, page: page, item: item, zone: zone)
-        var out: Output
-        if p.gesture == CanvasGesture.longPress.rawValue {
-            out = Output(handled: true, ref: target.ref, revealed: zone.revealed, total: zone.hints.count)
+        guard let target = hintWidgetTarget(page: p.page, ref: p.ref, point: point, session: session, ctx.workspace) else {
+            return Output(handled: false, revealed: 0, total: 0)
+        }
+        let readOnly = session?.readOnly == true || ctx.isReadOnly(target.doc)
+        let out: Output
+        if readOnly || p.gesture == CanvasGesture.longPress.rawValue {
+            out = Output(handled: true, ref: target.ref, revealed: target.zone.revealed, total: target.zone.hints.count)
         } else {
-            try AnswerZoneRules.checkWritable(doc, ctx)
             out = try reveal(target, ctx)
         }
-        if !ctx.dryRun {
-            AnswerZoneUI.showHints(session: session, doc: doc, page: page, zone: id, announce: out.hint != nil)
+        if !ctx.dryRun, let session {
+            ctx.events.emit(AnswerZoneHintsShownPayload(session: session.id.raw, ref: target.ref, announce: out.hint != nil),
+                            principal: ctx.principal, doc: target.doc)
         }
         return out
+    }
+
+    /// The zone whose hint widget is under `point` (page points), with the widget laid out as the canvas lays it out
+    /// (the canvas zoom, zones on hidden layers skipped).
+    static func hintWidgetTarget(page: String?, ref: String?, point: Point, session: EditorSession?,
+                                 _ workspace: Workspace) -> AnswerZoneTarget? {
+        let zoom = session?.editor?.canvasHost?.zoomScale ?? session?.zoom ?? 1
+        let hidden = session?.hiddenLayers ?? []
+        func hit(_ t: AnswerZoneTarget) -> Bool {
+            guard !t.zone.hints.isEmpty, !hidden.contains(t.item.layer),
+                  let slot = AnswerZoneLayout.slots(zoneBounds: t.item.bounds, zoom: zoom, hasScore: t.zone.points != nil,
+                                                    hasHints: true).hint else { return false }
+            return AnswerZoneLayout.hitRect(slot, zoom: zoom).contains(point)
+        }
+        // Shortcut: the topmost item under the point is the zone itself.
+        if let ref, case let .item(doc, pageID, id)? = NodeRef(ref),
+           let item = try? workspace.item(doc, page: pageID, id: id), let zone = AnswerZone.decode(item) {
+            let target = AnswerZoneTarget(doc: doc, page: pageID, item: item, zone: zone)
+            if hit(target) { return target }
+        }
+        guard let page, case let .page(doc, pageID)? = NodeRef(page),
+              let zones = try? AnswerZoneScope.zones(doc: doc, page: pageID, workspace) else { return nil }
+        return zones.first(where: hit)
     }
 
     /// Reveals the next hint of `target` (nothing when every hint is showing).
@@ -433,7 +493,8 @@ struct AnswerZoneRevealHint: NibCommand {
             }
             let index = current.revealed
             current.revealed += 1
-            current.usage.append(AnswerZone.HintUse(hint: index, at: AnswerZoneRules.now, by: by))
+            current.usage.append(AnswerZone.HintUse(hint: index, text: current.hints[index], at: AnswerZoneRules.now, by: by))
+            current.usage = Array(current.usage.suffix(AnswerZone.maxUsage))
             try current.write(to: &item)
             try tx.put(item, doc: target.doc, page: target.page)
             zone = current
