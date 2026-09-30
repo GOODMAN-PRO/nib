@@ -1,5 +1,36 @@
 # Nib: handoff to the Mac
 
+## 0. Read first: cloud session results (26–30 Sept 2026)
+
+A cloud session continued the build after this handoff was written, then stopped on the weekly usage limit. This section supersedes the state in §3; the rest of the file still applies.
+
+**Done on `main`** (full CI green: package tests + unsigned IPA):
+- **Design v2** (`marker/design-v2` = 0bce516, plus v2.1 d319c8c): Liquid Glass redo (thin light-directional rim, no double rim on iOS 26), the water dock engine for the palette (`.dropletDockable`, snap, fling, meniscus, held bead), `NibReflow` for library drag reorder (with a 180 ms combine dwell), and ~20 new components and 72 symbols.
+- **Contracts v2** (`marker/contracts-v2` = 1741651): 368 gaps triaged (220 resolved, 67 rejected, 81 deferred). This fixes `DocTransaction.revert` and adds the chrome overlay extension point, floating host and inking signal. See `docs/CONTRACTS.md` › "contracts-v2 changelog" and the `[v2: …]` notes in `contract-gaps.md`.
+- **Spec v2** (f7da15b): the command catalogue matches what features register; unbuilt features' specs point at v2 APIs.
+- **Mockup v2**, republished at https://claude.ai/artifact/XQKSP4QSMTHuwFZRPxTLMm.
+- **Tags:** the cloud proxy blocked tag pushes. Create the real tags locally:
+  `git tag design-v2 0bce516 && git tag contracts-v2 1741651 && git push origin design-v2 contracts-v2` (then delete the `marker/*` branches).
+
+**Fleet state:**
+- 58 of 111 features written, 52 CI-green, 45 fully done (green + reviewed + fixed).
+- CI red: F006 and F064, both interrupted mid-implementation.
+
+**Interrupted by the usage limit.** Each job's worktree state is pushed as a `WIP …` commit or was already on its branch; relaunch the same job and it continues from there.
+- **IMPLEMENT:** F002, F006, F048, F050, F064, F066, F103.
+- **FIX:** F021, F023, F031, F091. Their reviews are in `tools/fleet/state/*.review.json`.
+- **V2ADOPT:** F015 (⌘Z window-undo fallback) and F022 (Move Pages reads `params["pages"]`, multi-page PDF cut merge).
+- **REVIEW:** F013, F065 and F102 still need an independent review.
+- **Main-side branches** (not merged):
+  - `v2/contracts2`: PanelIDs for the study panels and Move Pages, plus CommandIDs constants for new ids.
+  - `v2/shell`: app shell; key commands honour `docKinds`, ⌘Z fallback, key-window tracking, status-bar forwarding, user-fonts entitlement. It had not started coding.
+
+**Open follow-ups** are listed in `tools/fleet/cloud/ledger.md` under "Follow-ups" and the later bullets: spec pass 2 items, V2ADOPT for the remaining built features, and NibDesign and contract gaps.
+
+**How the cloud session ran the fleet.** A Linux container allows only 2 concurrent Workflow agents, so the cloud session used background agents with per-feature job prompts. Those prompts are in `tools/fleet/cloud/FEATURE.md` (jobs IMPLEMENT, CI, REVIEW, FIX, V2ADOPT) and `COMMON.md`. `fleet.workflow.js` still works locally: run `collect-state.js` with local paths first. `collect-state.js` now pages GitHub runs through the owner/repo API path, which works everywhere.
+
+**Commit trailer:** now two lines, as one paragraph: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` then `Claude-Session: https://claude.ai/code/session_01GpZ3Q12FGHi43JsYU8aD5F`.
+
 This file is for the Claude Code session that continues the build on the user's Mac. The previous session ran on Windows, which has no Swift toolchain, so every compile went through GitHub Actions. On a Mac with Xcode 26.x you can compile and run locally. That makes each fix loop much faster, and you can install straight onto the user's iPad.
 
 ## What Nib is

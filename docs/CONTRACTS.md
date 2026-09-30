@@ -9,16 +9,37 @@ This file holds the **exact** source that the scaffold agent creates **verbatim,
 | **C** | App shell (`AppDelegate.swift`, `ShellViewController.swift`) | Architect only |
 | **D** | `project.yml`, CI workflow, `pick_sim.py`, `lint.py` | Architect only |
 
-15,549 lines across 54 files. Every file starts with its repository path as a heading.
+17,137 lines across 56 files. Every file starts with its repository path as a heading.
 
 ## How to use this file
 
 - **Scaffold agent.** Create every file below at the given path, exactly as written. Then create the module stubs listed in `forge-spec.json` → `scaffold[2]` (one per feature entry type, including the second entry types of split features). Push, and do not start features until CI is green — including `NameLookupCanaryTests`, which proves no contract name clashes with an SDK type.
 - **Feature agents.** Import `NibContracts` (and `NibTesting` in tests: Harness, Fixtures, fakes) and use only the API below. If something is missing, file `docs/contract-requests/<Fxxx>-<slug>.md`; do not edit these files.
 - **Concurrency.** Everything marked `@MainActor` must be used from the main actor. Test classes that use `Harness` or `NibApp` are `@MainActor`.
-- **contracts-v2.** The sources below are contracts-v2, an additive revision over contracts-v1. The "contracts-v2 changelog" section lists every new API by gap group, with the workaround in each feature that it replaces.
+- **contracts-v2.** The sources below are contracts-v2 (plus the additive contracts-v2.1 and contracts-v2.2 follow-ups), an additive revision over contracts-v1. The "contracts-v2 changelog" section lists every new API by gap group, with the workaround in each feature that it replaces.
 
 ## contracts-v2 changelog
+
+**contracts-v2.1** (branch `v2/contracts2`, additive). `CommandIDs` gains a constant for each of the 313 ARCHITECTURE.md §6.5 catalogue ids that had none (among them `settingsOpen`, `shapeTapAt`, `imagePick`, `pdfTapAt`, `pencilGesture`, `pencilPalette`, `pencilActions`, `layerExportOptions`, `outlineList`, `clipboardCopyText`, `toolbarDock` and `libraryReorder`). Each name is the id in camel case: `ai.chat.delete` → `aiChatDelete`. `PanelIDs` now matches the §13 panel id list: it gains `studySmartLearn = "studysession.smartLearn"`, which is the id F049 opens. `studyLearn` is superseded by it. It shipped as "studysession.learn", which no feature registers, and now holds the Smart Learn id. `PanelIDs` also gains `movePages = "pages.movePages"`, F022's Move Pages sheet. F023 opens it with `panel.open {id, pages}`. Adopt: F022's `MovePagesSheet` moves the refs in `PanelContext.params["pages"]` and falls back to the open page when there are none. The new `NibContractsTests/CommandCatalogueTests.swift` reads docs/ARCHITECTURE.md and fails when a §6.5 row has no `CommandIDs` constant, when a constant names an id that is not in the catalogue, or when `PanelIDs` differs from the §13 list. A spec change that adds a catalogue row or a panel id must add the constant in the same change.
+
+**contracts-v2.2** (branch `v2/shell`, additive: new types and helpers only, nothing renamed or re-signed). The app shell (Part C) adopts the contracts-v2 descriptor state and settles most of the shell items the v2 triage deferred to it. The routing rules are pure helpers in `NibContracts`, so they are unit-tested (`NibContractsTests/ShellRoutingTests.swift`) and the shell only wires them to UIKit.
+- **Key commands.** `KeyCommandContext` is the state of one window that decides which key commands are live there: whether it shows a document, the document's kind, whether text has the keyboard, and whether the window has open tabs. `KeyCommandDescriptor.isActive(in:)` applies `scope` and `docKinds` (nil or empty = any kind; a command limited to kinds is never live in the library). The rule for `.document` changes: a `.document` key is live only while the window shows a document, and no longer while it shows the library with tabs open (on main it was live whenever the window had a selected tab, so it ran with no document in the library). The exception is a `.document` key with the new `whileTabsOpen` flag, which is for tab switching and closing: it stays live in the library while the window has tabs (`KeyCommandContext.hasTabs`, so the tab strip is on screen) and is off in a window without tabs, so the system keeps the keys there. `KeyCommandRouting.active(_:in:)` gives the shell one command per shortcut. The command limited to fewer document kinds wins (nil, empty and every kind count the same), then the narrower scope (`.canvas`, then `.document` or `.library`, then `.global`), then the lower `order`, then the id. So F014's ⌘D (`item.duplicate`, any kind) and a text-document ⌘D no longer race. Among the built features the rule settles one clash differently from main, where UIKit took the first registered key: ⌥⌘P is F043's Show Pencil Palette (any kind) and F052's Play or Pause Audio (notebooks, whiteboards, text documents), and F052 now wins in its kinds, so the palette key works only in study sets. The ⌘K clash (F029's Add Link at `.document`, the DESIGN.md §14.16 command bar at `.global`; contract-gaps F029) is not settled here and stays open for the spec owner. Under this rule a `.document` ⌘K would hide the command bar in every document. The consistent resolution: F029 serves ⌘K only while text is being edited, from the text editors' own key sets (as F102 does), and the command bar keeps ⌘K at `.global`. `KeyCommandRouting.overridesSystemKeys(_:in:)` sets `UIKeyCommand.wantsPriorityOverSystemBehavior`: while text has the keyboard, keys without ⌘, ⌥ or ⌃ leave typing, cursor movement and Escape to the text view. When a key runs, the shell passes `resolvedParams(for:)` (the key window session's `sessionParams` merged over `params`). Any focused text field or text view (a settings search field, a rename alert) counts as editing text, not only `EditorSession.isEditingText`.
+- **⌘Z / ⇧⌘Z.** `UndoRoute.forCommand(_:params:session:history:window:)` decides where a key command that runs `edit.undo` / `edit.redo` acts: the document's history while it has a step, else the window's UndoManager (window-level steps such as F016's "Move Palette"), else nothing. The shell runs the window's undo itself. It validates the key with the same route: `canPerformAction` enables ⌘Z exactly when one of the two can act, so a disabled ⌘Z falls through to the system, and a window step is titled with `UndoManager.undoMenuItemTitle`.
+- **Key window.** The shell makes the key window the active one: `ui.activeNavigator` (what `ctx.navigator` returns) and `services.sessions.activate` (which emits `session.activated`). It does this when a window becomes key, when a scene becomes active while no other window is key, and before every key command it runs. A closing window hands over before its session is removed: to the key window, else to the foreground window activated most recently, so `sessions.remove` never makes the newest session active on its own. As a result `window.showLibrary`, `doc.open`, `panel.open` and confirmation alerts act on the window the user works in, and command-failure toasts show only there.
+- **Presentation.** The shell forwards `childForStatusBarHidden`, `childForStatusBarStyle`, `childForHomeIndicatorAutoHidden`, `childForScreenEdgesDeferringSystemGestures` and `childViewControllerForPointerLock` to the shown screen. The document chrome's `prefersStatusBarHidden` (P-106, `editing.hideStatusBar`) and full-screen modes now take effect.
+- **Tabs.** `SceneNavigator.addTab(_:)` is implemented: a restored tab joins the tab strip without being shown or building its editor.
+- **Fonts.** The app target has the `com.apple.developer.user-fonts` entitlement (`app-usage`), for fonts installed from font provider apps (F026 T-059, P-083).
+
+Adopt: F015's ⌘Z / ⇧⌘Z keys work unchanged (their `sessionParams` name the window's document; the shell falls back to the window's UndoManager). F102 may register its block duplicate on ⌘D with `docKinds: [.textDocument]`: it then wins over F014's ⌘D in text documents only. F014 sets `docKinds: [.notebook, .whiteboard]` on its ⌘X, ⌘C, ⌘V, ⌥⇧⌘V and ⌘D keys, so they no longer run the canvas clipboard commands in study sets and text documents. F049 keeps ⇥, ⇧⇥ and ⎋ as `StudySetViewController`'s own UIKeyCommands. They must work while a card field is being edited, and they depend on the editor's read-only and focus state. As descriptors they would lose: a `.canvas` key is dropped while text is edited, and at `.document` a key without ⌘, ⌥ or ⌃ leaves Tab and Escape to the text view. Only ⌘⏎ New Card may move to a descriptor (`.document`, `docKinds: [.studySet]`, `sessionParams` naming the set), and only once its command finds the card from the session. F047 gives its new-document key a fresh id through `sessionParams`. F018 restores tabs with `addTab` and drops `SceneHooksImpl.maxRestoredTabs`. It also sets `whileTabsOpen` on its ⌘W, ⌥⌘W and ⌘1–9 keys (still `.document`), so they switch and close tabs from the library while the strip shows. F073 does the same for the ⌘1–9 keys it registers. F017 drops the `ui.activeNavigator` assignment in `DocumentContainerViewController.goToLibrary`, because the shell already made the window of the tap the active one, together with the session. It also drops the stale comment on `prefersStatusBarHidden`, because the shell now forwards it. F043 moves Show Pencil Palette off ⌥⌘P, which F052's audio key takes in notebooks, whiteboards and text documents, to a free shortcut (⌃⌘P is unused). Still deferred for the shell: the paste responder, forwarding the settings page to `settingsRoot`, the tab band layout, the open-gate result, and per-tab page memory (the shell opens a switched-to or closed-to tab at its first page; F018 keeps its page-memory workaround, contract-gaps F018).
+
+**Spec pass 2** (docs only: no API, constant or source change). It pins conventions the sources leave open, matching what the built features already do. `PanelContext.params` is one flat object: every key of the `panel.open` call except `id` and `edge`, with the keys of a nested `params` object merged over them. So `{id, pages}` and `{id, params: {pages}}` both reach the panel as `{pages}`, and a call that names nothing gives `[:]` (the source comment's "params minus id"). In a window with no open document, `panel.open` / `panel.close` (F017) forward to `library.setView {panel, params?, close?}` (F019, additive params). The library then presents `.sheet`, `.fullScreen` and `.floating` panels over itself with a `PanelContext` for that window, and selects `.libraryTab` panels in its sidebar; this settles the deferred F019 library-tab routing. Library menus fill `MenuContext.folder`. The pinned results (ARCHITECTURE.md §6.5) are:
+- `template.choose` → `{background, size}`, with `kind` paper | cover and an additive `doc?`;
+- `doc.suggestTitle` → `{title}`;
+- `panel.open` → `{id, placement}`;
+- the audio playback status gains `recording`, and `audio.play` / `audio.pause` gain `toggle?` / `close?`;
+- `scan.documents` gains `anchor?`.
+
+The deep link `nib://bridge/pair` takes an optional `port` (ARCHITECTURE.md §12). F055 and F065 read the scan text through `PageRecord.scanTextExtKey` (G22).
 
 contracts-v2 (branch `v2/contracts`) resolves the contract gaps the first 48 features reported (`tools/fleet/contract-gaps.md`, where every gap line now ends with `[v2: G<n> …]`, `[v2: rejected - …]` or `[v2: deferred - …]`). It is **additive over contracts-v1**: no public API was renamed, removed or re-signed; every new protocol requirement has a default implementation; new stored fields are optional or defaulted and decode leniently; superseded APIs keep working and carry a "Superseded in contracts-v2 by X" doc comment. Two behaviour changes are bug fixes: `DocTransaction.revert` (G4) and `CommandContext.inputFile` (G6); plus `Frame.applying` for rotated frames under non-uniform scale (G24). The sources in Part A below are the v2 sources; `NibContractsTests/ContractsV2Tests.swift` covers every fix and every new API.
 
@@ -463,7 +484,9 @@ public static let windowShowLibrary = "window.showLibrary"      // NEW contracts
 // PanelIDs
 public static let assistant = "aichat.panel", trash = "organize.trash", favourites = "organize.favourites"
 public static let templates = "templateui.manage", cloudBackup = "syncui.panel", about = "about.panel"
-public static let gallery = "pluginmanager.gallery", studyPractice = "studysession.practice", studyLearn = "studysession.learn"
+public static let gallery = "pluginmanager.gallery", studyPractice = "studysession.practice"
+public static let studySmartLearn = "studysession.smartLearn"   // v2.1; v2's studyLearn now holds this id too
+public static let movePages = "pages.movePages"                 // v2.1; F022 sheet, panel.open {id, pages?}
 ```
 Replaces: F014 `FeatClipboard/ClipboardCommands.swift` `"selection.clear"`, F028 `PageTextEditor.setTextCommand`, F047 `TextDocViewController.swift` `"library.rename"`, F058 `FeatSmartInk/EditHandwritingMode.swift` `"item.recolor"` / `"clipboard.cut"` literals → the constants; F017 `DocumentContainerViewController.swift` Back button and F018 `FeatWindows/TabStripView.swift` `showLibrary()` / `WindowCommands.swift` direct `navigator.showLibrary` → `app.perform(CommandIDs.windowShowLibrary, …)`; F017 assistant found by owner "aichat", F027 app-menu places guessed by owner, F035 gallery by owner "pluginmanager", F049 `FeatStudyEditor/CardEditorView.swift` practice/learn by owner → `PanelIDs`. Adopt: F085, F045, F070, F098, F080, F050 register their panels under these ids.
 
@@ -574,8 +597,8 @@ Replaces: F090 `NibBridge/NibBridgeFeature.swift` wrapping `gateway.presenter` (
 
 - **NibDesign (33 lines, deferred):** NibSymbol glyphs, tokens (metrics, radii, motion), NibBadge principal kind, NibToolPalette bindings and popover API, NibPenSwatch pattern, progress bar tint, canvas-anchored droplets. The design-system passes own them.
 - **Catalogue rows (12, deferred):** extra ids already registered by F027 (settings.open), F031 (shape.tapAt), F034 (image.pick), F041 (layer.exportOptions, superseded by G26), F042 (pdf.tapAt), F043 (pencil.gesture, pencil.palette, pencil.actions), pdf.outline; the spec owner adds the rows to docs/forge-spec.json.
-- **App shell (11, deferred):** status-bar forwarding, tab model and band layout, openGate result, settings page forwarding, paste responder, editing-interaction configuration, key routing while editing text; plus shell adoption of `KeyCommandDescriptor.docKinds`/`sessionParams` and `SceneNavigator.addTab`.
-- **Other deferred (25):** later owners or design: F007 stabiliser rule, F045 covers, F054 transcripts, F055 recognition inputs, F073 shortcuts, F074 deep links, F019 library tabs, F101 spatial index and stroke preview, F004 hiding items attached to a collapsed note, per-message comment merge (F025/F108), item groups, system font designs, pen type in shapes, connector normals.
+- **App shell (11, deferred):** status-bar forwarding, tab model and band layout, openGate result, settings page forwarding, paste responder, editing-interaction configuration, key routing while editing text; plus shell adoption of `KeyCommandDescriptor.docKinds`/`sessionParams` and `SceneNavigator.addTab`. contracts-v2.2 settled status-bar forwarding, key routing while editing text, the `docKinds`/`sessionParams` adoption and `addTab`.
+- **Other deferred (25):** later owners or design: F007 stabiliser rule, F045 covers, F054 transcripts, F055 recognition inputs, F073 shortcuts, F074 deep links, F019 library tabs (both settled in spec pass 2), F101 spatial index and stroke preview, F004 hiding items attached to a collapsed note, per-message comment merge (F025/F108), item groups, system font designs, pen type in shapes, connector normals.
 - **Rejected (67):** by design (optional dependencies, provenance, non-undoable writes, locked codes, feature-internal seams), already in the contract, additive params the catalogue allows, platform or language limits, and observations. Recorded conventions: F025's NSFilePresenters use a background `presentedItemOperationQueue`; `tab.select` is 0-based with -1 = last tab (F018, F073 follows); `shape.recognize` returns `{shape: ShapeItem?, mergeWith?: [ref]}`; deep links `nib://open/<doc>/<page>?comment=<itemID>` route to `comment.tapAt`.
 
 ## Quick reference: a complete feature module (example, do not create)
@@ -4510,6 +4533,7 @@ import Foundation
 
 /// Well-known command ids that features call across module boundaries (owners: ARCHITECTURE.md §6).
 /// Calling a command by id is the ONLY way one feature uses another feature's behaviour.
+/// Since contracts-v2.1 every id in the §6.5 catalogue has a constant here.
 public enum CommandIDs {
     // Contracts (always present)
     public static let undo = "edit.undo"
@@ -4596,6 +4620,400 @@ public enum CommandIDs {
     public static let audioPlay = "audio.play"
     /// Contracts (always present): shows the library in the invoking window {folder?} (session).
     public static let windowShowLibrary = "window.showLibrary"
+
+    // contracts-v2.1: a constant for every other id in the ARCHITECTURE.md §6.5 catalogue, by namespace in catalogue
+    // order, with the owning feature. NibContractsTests/CommandCatalogueTests checks that every catalogue row has one.
+
+    public static let a11yDescribePage = "a11y.describePage"  // F095
+
+    public static let aiChatList = "ai.chat.list"  // F084
+    public static let aiChatRename = "ai.chat.rename"  // F084
+    public static let aiChatDelete = "ai.chat.delete"  // F084
+    public static let aiChatFeedback = "ai.chat.feedback"  // F084
+    public static let aiProviderList = "ai.provider.list"  // F086
+    public static let aiProviderSave = "ai.provider.save"  // F086
+    public static let aiProviderActivate = "ai.provider.activate"  // F086
+    public static let aiProviderDelete = "ai.provider.delete"  // F086
+    public static let aiProviderTest = "ai.provider.test"  // F086
+    public static let aiQuiz = "ai.quiz"  // F087
+
+    public static let answerZoneCreate = "answerZone.create"  // F099
+    public static let answerZoneScore = "answerZone.score"  // F099
+    public static let answerZoneSetHints = "answerZone.setHints"  // F099
+    public static let answerZoneRevealHint = "answerZone.revealHint"  // F099
+
+    public static let appDeleteAllData = "app.deleteAllData"  // F098
+
+    public static let assetGet = "asset.get"  // F003
+
+    public static let audioRecord = "audio.record"  // F052
+    public static let audioPause = "audio.pause"  // F052
+    public static let audioSeek = "audio.seek"  // F052
+    public static let audioSetPlayback = "audio.setPlayback"  // F052
+    public static let audioRename = "audio.rename"  // F052
+    public static let audioDelete = "audio.delete"  // F052
+    public static let audioExport = "audio.export"  // F052
+    public static let audioQuickRecord = "audio.quickRecord"  // F052
+
+    public static let backupNow = "backup.now"  // F068
+    public static let backupManual = "backup.manual"  // F068
+    public static let backupConfigure = "backup.configure"  // F068
+    public static let backupChooseFolder = "backup.chooseFolder"  // F068
+    public static let backupStatus = "backup.status"  // F068
+    public static let backupClearQueue = "backup.clearQueue"  // F068
+
+    public static let blockInsert = "block.insert"  // F047
+    public static let blockUpdate = "block.update"  // F047
+    public static let blockDelete = "block.delete"  // F047
+    public static let blockMove = "block.move"  // F047
+    public static let blockComment = "block.comment"  // F103
+    public static let blockEditComment = "block.editComment"  // F103
+    public static let blockDeleteComment = "block.deleteComment"  // F103
+    public static let blockResolveComment = "block.resolveComment"  // F103
+
+    public static let boardAdd = "board.add"  // F044
+    public static let boardRename = "board.rename"  // F044
+    public static let boardInsertTemplate = "board.insertTemplate"  // F044
+
+    public static let bridgeSetEnabled = "bridge.setEnabled"  // F090
+    public static let bridgeStatus = "bridge.status"  // F090
+
+    public static let calendarEvents = "calendar.events"  // F075
+    public static let calendarCreateNote = "calendar.createNote"  // F075
+    public static let calendarOpenNote = "calendar.openNote"  // F075
+
+    public static let canvasClearDecorations = "canvas.clearDecorations"  // F006
+
+    public static let cardAdd = "card.add"  // F049
+    public static let cardUpdate = "card.update"  // F049
+    public static let cardDelete = "card.delete"  // F049
+    public static let cardMove = "card.move"  // F049
+    public static let cardMoveTo = "card.moveTo"  // F049
+
+    public static let clipboardCopyText = "clipboard.copyText"  // F014
+
+    public static let collabHost = "collab.host"  // F072
+    public static let collabJoin = "collab.join"  // F072
+    public static let collabLeave = "collab.leave"  // F072
+    public static let collabParticipants = "collab.participants"  // F072
+    public static let collabApprove = "collab.approve"  // F072
+    public static let collabSetRole = "collab.setRole"  // F072
+    public static let collabRevoke = "collab.revoke"  // F072
+    public static let collabFollow = "collab.follow"  // F108
+    public static let collabFollowMe = "collab.followMe"  // F108
+    public static let collabMarkSeen = "collab.markSeen"  // F108
+
+    public static let commentAdd = "comment.add"  // F037
+    public static let commentReply = "comment.reply"  // F037
+    public static let commentEdit = "comment.edit"  // F037
+    public static let commentDeleteMessage = "comment.deleteMessage"  // F037
+    public static let commentResolve = "comment.resolve"  // F037
+    public static let commentTapAt = "comment.tapAt"  // F037
+
+    public static let connectorCreate = "connector.create"  // F032
+    public static let connectorSetPath = "connector.setPath"  // F032
+
+    public static let diagnosticsExport = "diagnostics.export"  // F076
+    public static let diagnosticsSetFeatureEnabled = "diagnostics.setFeatureEnabled"  // F076
+
+    public static let diagramAddConnected = "diagram.addConnected"  // F032
+
+    public static let dictionaryAdd = "dictionary.add"  // F104
+    public static let dictionaryRemove = "dictionary.remove"  // F104
+    public static let dictionaryList = "dictionary.list"  // F104
+
+    public static let docSetFavorite = "doc.setFavorite"  // F002
+    public static let docMerge = "doc.merge"  // F002
+    public static let docSetScrollDirection = "doc.setScrollDirection"  // F017
+    public static let docQuickNote = "doc.quickNote"  // F021
+    public static let docConvertToWhiteboard = "doc.convertToWhiteboard"  // F044
+    public static let docSetLanguage = "doc.setLanguage"  // F057
+    public static let docSetWritingAids = "doc.setWritingAids"  // F104
+    public static let docSetLocked = "doc.setLocked"  // F071
+    public static let docUnlock = "doc.unlock"  // F071
+    public static let docSuggestTitle = "doc.suggestTitle"  // F087
+
+    public static let elementCreate = "element.create"  // F035
+    public static let elementInsert = "element.insert"  // F035
+    public static let elementCollectionCreate = "element.collection.create"  // F035
+    public static let elementCollectionUpdate = "element.collection.update"  // F035
+    public static let elementCollectionDelete = "element.collection.delete"  // F035
+    public static let elementCollectionList = "element.collection.list"  // F035
+    public static let elementList = "element.list"  // F035
+    public static let elementRename = "element.rename"  // F035
+    public static let elementDelete = "element.delete"  // F035
+    public static let elementImport = "element.import"  // F035
+    public static let elementExport = "element.export"  // F035
+
+    public static let exportPresent = "export.present"  // F067
+    public static let exportSaveToSource = "export.saveToSource"  // F067
+
+    public static let folderCreate = "folder.create"  // F002
+    public static let folderSetStyle = "folder.setStyle"  // F002
+
+    public static let galleryList = "gallery.list"  // F080
+
+    public static let gifSearch = "gif.search"  // F035
+
+    public static let handwritingToText = "handwriting.toText"  // F057
+    public static let handwritingToTextPages = "handwriting.toTextPages"  // F057
+    public static let handwritingWords = "handwriting.words"  // F058
+    public static let handwritingReflow = "handwriting.reflow"  // F058
+    public static let handwritingStraighten = "handwriting.straighten"  // F058
+    public static let handwritingAlign = "handwriting.align"  // F058
+    public static let handwritingInsertSpace = "handwriting.insertSpace"  // F058
+    public static let handwritingReplaceWord = "handwriting.replaceWord"  // F059
+    public static let handwritingRestyle = "handwriting.restyle"  // F105
+
+    public static let imageInsert = "image.insert"  // F034
+    public static let imageCrop = "image.crop"  // F034
+    public static let imageFlip = "image.flip"  // F034
+    public static let imageReplace = "image.replace"  // F034
+    public static let imageSaveToPhotos = "image.saveToPhotos"  // F034
+    public static let imagePick = "image.pick"  // F034
+
+    public static let importPick = "import.pick"  // F064
+
+    public static let indexRebuild = "index.rebuild"  // F055
+
+    public static let inkSetStyle = "ink.setStyle"  // F007
+
+    public static let itemArrange = "item.arrange"  // F013
+    public static let itemSetLocked = "item.setLocked"  // F013
+
+    public static let laserSetMode = "laser.setMode"  // F040
+    public static let laserPoint = "laser.point"  // F040
+
+    public static let layerSetActive = "layer.setActive"  // F041
+    public static let layerSetVisible = "layer.setVisible"  // F041
+    public static let layerRename = "layer.rename"  // F041
+    public static let layerMoveItems = "layer.moveItems"  // F041
+    public static let layerExportOptions = "layer.exportOptions"  // F041
+
+    public static let lessonCreate = "lesson.create"  // F109
+    public static let lessonSetState = "lesson.setState"  // F109
+    public static let lessonImportRoster = "lesson.importRoster"  // F109
+    public static let lessonCollect = "lesson.collect"  // F110
+    public static let lessonCluster = "lesson.cluster"  // F110
+    public static let lessonSetClusters = "lesson.setClusters"  // F110
+
+    public static let libraryList = "library.list"  // F002
+    public static let libraryMove = "library.move"  // F002
+    public static let libraryDuplicate = "library.duplicate"  // F002
+    public static let libraryTrash = "library.trash"  // F002
+    public static let librarySetView = "library.setView"  // F019
+    public static let libraryReorder = "library.reorder"  // F019
+    public static let libraryChooseFolder = "library.chooseFolder"  // F025
+    public static let libraryRelocate = "library.relocate"  // F025
+    public static let libraryLocations = "library.locations"  // F025
+    public static let librarySwitch = "library.switch"  // F025
+    public static let libraryRepair = "library.repair"  // F070
+
+    public static let linkSet = "link.set"  // F029
+    public static let linkRemove = "link.remove"  // F029
+    public static let linkFollow = "link.follow"  // F029
+    public static let linkBack = "link.back"  // F029
+    public static let linkAutodetect = "link.autodetect"  // F029
+    public static let linkTapAt = "link.tapAt"  // F029
+
+    public static let lockSetup = "lock.setup"  // F071
+
+    public static let mathRecognize = "math.recognize"  // F060
+    public static let mathConvert = "math.convert"  // F060
+    public static let mathSetLatex = "math.setLatex"  // F060
+    public static let mathCopy = "math.copy"  // F060
+    public static let mathEvaluate = "math.evaluate"  // F061
+    public static let mathAssist = "math.assist"  // F106
+    public static let mathGraphCreate = "math.graph.create"  // F107
+    public static let mathGraphSetViewport = "math.graph.setViewport"  // F107
+    public static let mathSolve = "math.solve"  // F088
+
+    public static let mathassistTapAt = "mathassist.tapAt"  // F106
+
+    public static let meetingSummarize = "meeting.summarize"  // F089
+    public static let meetingGenerateNotes = "meeting.generateNotes"  // F089
+
+    public static let menuShowAt = "menu.showAt"  // F013
+
+    public static let nodeInsert = "node.insert"  // F003
+    public static let nodeSet = "node.set"  // F003
+    public static let nodeRemove = "node.remove"  // F003
+    public static let nodeMove = "node.move"  // F003
+
+    public static let outlineAdd = "outline.add"  // F046
+    public static let outlineRename = "outline.rename"  // F046
+    public static let outlineMove = "outline.move"  // F046
+    public static let outlineDelete = "outline.delete"  // F046
+    public static let outlineSortByPage = "outline.sortByPage"  // F046
+    public static let outlineList = "outline.list"  // F046
+    public static let outlineGenerate = "outline.generate"  // F087
+
+    public static let pageSetBackground = "page.setBackground"  // F005
+    public static let pageClear = "page.clear"  // F010
+    public static let pageDeleteItems = "page.deleteItems"  // F010
+    public static let pageDuplicate = "page.duplicate"  // F022
+    public static let pageCopy = "page.copy"  // F022
+    public static let pagePaste = "page.paste"  // F022
+    public static let pageMoveTo = "page.moveTo"  // F022
+    public static let pageReorder = "page.reorder"  // F022
+    public static let pageRotate = "page.rotate"  // F022
+    public static let pageTrash = "page.trash"  // F022
+    public static let pageRestore = "page.restore"  // F022
+    public static let pagePurge = "page.purge"  // F022
+    public static let pageSetBookmarked = "page.setBookmarked"  // F046
+
+    public static let pdfText = "pdf.text"  // F024
+    public static let pdfLinks = "pdf.links"  // F024
+    public static let pdfMarkSelection = "pdf.markSelection"  // F042
+    public static let pdfCopyText = "pdf.copyText"  // F042
+    public static let pdfTapAt = "pdf.tapAt"  // F042
+
+    public static let pencilGesture = "pencil.gesture"  // F043
+    public static let pencilPalette = "pencil.palette"  // F043
+    public static let pencilActions = "pencil.actions"  // F043
+
+    public static let pluginList = "plugin.list"  // F078
+    public static let pluginEnable = "plugin.enable"  // F078
+    public static let pluginReload = "plugin.reload"  // F078
+    public static let pluginLogs = "plugin.logs"  // F078
+    public static let pluginSdkTypes = "plugin.sdkTypes"  // F078
+    public static let pluginDocs = "plugin.docs"  // F078
+    public static let pluginUninstall = "plugin.uninstall"  // F079
+    public static let pluginReview = "plugin.review"  // F079
+
+    public static let presentSetMode = "present.setMode"  // F063
+
+    public static let presetSelect = "preset.select"  // F008
+    public static let presetSetSwatch = "preset.setSwatch"  // F008
+    public static let presetAddSwatch = "preset.addSwatch"  // F008
+    public static let presetRemoveSwatch = "preset.removeSwatch"  // F008
+    public static let presetMoveSwatch = "preset.moveSwatch"  // F008
+    public static let presetSetWidth = "preset.setWidth"  // F008
+    public static let presetReset = "preset.reset"  // F008
+
+    public static let printPresent = "print.present"  // F067
+
+    public static let relayConfigure = "relay.configure"  // F092
+
+    public static let replaySetMode = "replay.setMode"  // F053
+    public static let replaySeekToItem = "replay.seekToItem"  // F053
+    public static let replayTapAt = "replay.tapAt"  // F053
+
+    public static let rulerSet = "ruler.set"  // F039
+
+    public static let scanDocuments = "scan.documents"  // F065
+    public static let scanQr = "scan.qr"  // F065
+
+    public static let searchOpen = "search.open"  // F056
+    public static let searchStep = "search.step"  // F056
+
+    public static let selectionFromRect = "selection.fromRect"  // F011
+    public static let selectionFromLoop = "selection.fromLoop"  // F011
+    public static let selectionSelectAll = "selection.selectAll"  // F011
+    public static let selectionTapAt = "selection.tapAt"  // F011
+    public static let selectionScreenshot = "selection.screenshot"  // F013
+
+    public static let settingsOpen = "settings.open"  // F027
+
+    public static let shapeSetStyle = "shape.setStyle"  // F031
+    public static let shapeSetKind = "shape.setKind"  // F031
+    public static let shapeSetPoints = "shape.setPoints"  // F031
+    public static let shapeTapAt = "shape.tapAt"  // F031
+
+    public static let sidebarToggle = "sidebar.toggle"  // F017
+
+    public static let spellcheckTapAt = "spellcheck.tapAt"  // F104
+
+    public static let stickyCreate = "sticky.create"  // F036
+    public static let stickySetCollapsed = "sticky.setCollapsed"  // F036
+    public static let stickyResolve = "sticky.resolve"  // F036
+    public static let stickySetColor = "sticky.setColor"  // F036
+    public static let stickyTapAt = "sticky.tapAt"  // F036
+
+    public static let stopwatchStart = "stopwatch.start"  // F062
+    public static let stopwatchLap = "stopwatch.lap"  // F062
+
+    public static let studyGrade = "study.grade"  // F050
+    public static let studyResetProgress = "study.resetProgress"  // F050
+    public static let studySetReminders = "study.setReminders"  // F050
+    public static let studySetTheme = "study.setTheme"  // F050
+    public static let studyImportText = "study.importText"  // F051
+    public static let studyExportCSV = "study.exportCSV"  // F051
+
+    public static let syncNow = "sync.now"  // F025
+
+    public static let tabClose = "tab.close"  // F018
+    public static let tabCloseOthers = "tab.closeOthers"  // F018
+    public static let tabSelect = "tab.select"  // F018
+
+    public static let tableEdit = "table.edit"  // F048
+    public static let tableExportCSV = "table.exportCSV"  // F048
+
+    public static let tapeTapAt = "tape.tapAt"  // F033
+    public static let tapeSetRevealed = "tape.setRevealed"  // F033
+    public static let tapeRemoveAll = "tape.removeAll"  // F033
+    public static let tapeImportPattern = "tape.importPattern"  // F033
+    public static let tapePatterns = "tape.patterns"  // F033
+    public static let tapeDeletePattern = "tape.deletePattern"  // F033
+    public static let tapeClearHistory = "tape.clearHistory"  // F033
+
+    public static let templateList = "template.list"  // F005
+    public static let templateChoose = "template.choose"  // F045
+    public static let templateImport = "template.import"  // F045
+    public static let templateListCustom = "template.listCustom"  // F045
+    public static let templateGroupCreate = "template.group.create"  // F045
+    public static let templateGroupRename = "template.group.rename"  // F045
+    public static let templateGroupDelete = "template.group.delete"  // F045
+    public static let templateDelete = "template.delete"  // F045
+    public static let templateSetHidden = "template.setHidden"  // F045
+    public static let templateFromPage = "template.fromPage"  // F045
+
+    public static let textFormat = "text.format"  // F026
+    public static let textSetParagraph = "text.setParagraph"  // F026
+    public static let textSetBoxStyle = "text.setBoxStyle"  // F026
+    public static let textSaveDefaultStyle = "text.saveDefaultStyle"  // F026
+    public static let textTapAt = "text.tapAt"  // F026
+    public static let textStartPageText = "text.startPageText"  // F028
+
+    public static let timerStart = "timer.start"  // F062
+    public static let timerControl = "timer.control"  // F062
+    public static let timerHistory = "timer.history"  // F062
+    public static let timerSaveMode = "timer.saveMode"  // F062
+    public static let timerDeleteMode = "timer.deleteMode"  // F062
+
+    public static let toolbarSetLayout = "toolbar.setLayout"  // F016
+    public static let toolbarReset = "toolbar.reset"  // F016
+    public static let toolbarSetVisible = "toolbar.setVisible"  // F016
+    public static let toolbarLayouts = "toolbar.layouts"  // F016
+    public static let toolbarSaveLayout = "toolbar.saveLayout"  // F016
+    public static let toolbarApplyLayout = "toolbar.applyLayout"  // F016
+    public static let toolbarDeleteLayout = "toolbar.deleteLayout"  // F016
+    public static let toolbarDock = "toolbar.dock"  // F016
+
+    public static let transcriptGet = "transcript.get"  // F054
+    public static let transcriptRegenerate = "transcript.regenerate"  // F054
+    public static let transcriptEditSegment = "transcript.editSegment"  // F054
+    public static let transcriptInsert = "transcript.insert"  // F054
+
+    public static let trashList = "trash.list"  // F002
+    public static let trashRecover = "trash.recover"  // F002
+    public static let trashDeletePermanently = "trash.deletePermanently"  // F002
+    public static let trashEmpty = "trash.empty"  // F002
+
+    public static let viewZoom = "view.zoom"  // F006
+    public static let viewScrollBy = "view.scrollBy"  // F006
+
+    public static let webdavSyncNow = "webdav.syncNow"  // F069
+    public static let webdavConfigure = "webdav.configure"  // F069
+    public static let webdavPut = "webdav.put"  // F069
+    public static let webdavStatus = "webdav.status"  // F069
+
+    public static let windowOpen = "window.open"  // F018
+
+    public static let zoomToggle = "zoom.toggle"  // F038
+    public static let zoomSetBox = "zoom.setBox"  // F038
+    public static let zoomNewLine = "zoom.newLine"  // F038
+    public static let zoomSetReturnHeight = "zoom.setReturnHeight"  // F038
 }
 
 /// contracts-v2: well-known panel ids, so a feature can open another feature's panel with `panel.open {id}` without
@@ -4615,9 +5033,16 @@ public enum PanelIDs {
     public static let about = "about.panel"
     /// Plugin and content Gallery library tab (F080).
     public static let gallery = "pluginmanager.gallery"
-    /// Study set Practice and Smart Learn panels (F050).
+    /// Study set Practice panel (F050).
     public static let studyPractice = "studysession.practice"
-    public static let studyLearn = "studysession.learn"
+    /// Study set Smart Learn panel (F050). contracts-v2.1: the id F049 opens and ARCHITECTURE.md §13 lists.
+    public static let studySmartLearn = "studysession.smartLearn"
+    /// Superseded in contracts-v2.1 by `studySmartLearn`. contracts-v2 shipped "studysession.learn", which no feature
+    /// registers; this now holds the Smart Learn id so existing callers open the right panel.
+    public static let studyLearn = "studysession.smartLearn"
+    /// Move Pages sheet (F022). contracts-v2.1. Open it with `panel.open {id, pages?}`: the sheet moves the page refs
+    /// in `PanelContext.params["pages"]`, or the open page when there are none (F023 passes the selected thumbnails).
+    public static let movePages = "pages.movePages"
 }
 ```
 
@@ -5971,6 +6396,43 @@ public final class UndoHistory {
     func removeEntry(group: String, doc: DocumentID) -> UndoEntry? {
         guard let i = undoStacks[doc]?.lastIndex(where: { $0.group == group }) else { return nil }
         return undoStacks[doc]?.remove(at: i)
+    }
+}
+
+/// contracts-v2.2: where ⌘Z / ⇧⌘Z acts in one window. A key command that runs `edit.undo` / `edit.redo` undoes the
+/// document's history while it has a step; when it has none, or no document is open, the shell falls back to the
+/// window's UndoManager, where window-level steps live (the toolbar's "Move Palette"). The shell also validates the
+/// key (menu, ⌘-hold overlay) with it, so ⌘Z is enabled exactly when one of the two can act.
+public enum UndoRoute: Equatable {
+    /// Run the command on this document's history.
+    case document(DocumentID)
+    /// Undo (redo) the window's UndoManager.
+    case window
+    /// Nothing to undo (redo) in either (not named `none`, so it never reads as `Optional.none`).
+    case nothing
+
+    /// The document's history while it has a step, else the window's UndoManager while it has one, else `.nothing`.
+    /// `doc` nil = no document is open; `window` nil = the window has no UndoManager.
+    @MainActor
+    public static func resolve(redo: Bool, doc: DocumentID?, history: UndoHistory, window: UndoManager?) -> UndoRoute {
+        if let doc, redo ? history.canRedo(doc) : history.canUndo(doc) { return .document(doc) }
+        if let window, redo ? window.canRedo : window.canUndo { return .window }
+        return .nothing
+    }
+
+    /// The route of a key command about to run `command` with its resolved `params`: nil unless the command is
+    /// `edit.undo` or `edit.redo`. The document is the one `params` name in `doc`, else the session's document.
+    @MainActor
+    public static func forCommand(_ command: String, params: JSONValue, session: EditorSession?, history: UndoHistory,
+                                  window: UndoManager?) -> UndoRoute? {
+        let redo: Bool
+        switch command {
+        case CommandIDs.undo: redo = false
+        case CommandIDs.redo: redo = true
+        default: return nil
+        }
+        let named = params["doc"]?.stringValue.flatMap { $0.isEmpty ? nil : NodeRef.documentID(from: $0) }
+        return resolve(redo: redo, doc: named ?? session?.document, history: history, window: window)
     }
 }
 ```
@@ -9349,6 +9811,10 @@ public struct KeyCommandDescriptor: Registrable {
     /// contracts-v2: params computed from the key window's session when the key is pressed (selection, page, a fresh
     /// id); merged over `params`. Use `resolvedParams(for:)`.
     public var sessionParams: (@MainActor (EditorSession) -> JSONValue)? = nil
+    /// contracts-v2.2: a `.document` key that is also live while the window shows the library with tabs open (its tab
+    /// strip is on screen, `KeyCommandContext.hasTabs`): the tab switching and closing keys (⌘1–9, ⌘W, ⌥⌘W). Without
+    /// tabs it stays off, so the system keeps the keys. Other scopes ignore it.
+    public var whileTabsOpen: Bool = false
 
     /// contracts-v2: `params` with `sessionParams(session)` merged over them (what the shell passes to the command).
     @MainActor
@@ -9367,6 +9833,102 @@ public struct KeyCommandDescriptor: Registrable {
         self.scope = scope
         self.order = order
         self.owner = owner
+    }
+}
+
+/// contracts-v2.2: the state of one window that decides which key commands are live there. The shell builds it for
+/// the window that receives the key (the key window) each time UIKit asks for key commands and again when one runs.
+public struct KeyCommandContext: Equatable {
+    /// The window shows a document (false while it shows the library, or onboarding).
+    public var inDocument: Bool
+    /// The kind of that document (nil while none is shown).
+    public var docKind: DocumentKind?
+    /// Text has the keyboard in the window (`EditorSession.isEditingText`, or any text field or text view with focus),
+    /// so `.canvas` keys stand back and plain keys leave typing alone (`KeyCommandRouting.overridesSystemKeys`).
+    public var isEditingText: Bool
+    /// The window has open tabs (`SceneNavigator.openDocuments`), also while it shows the library with its tab strip:
+    /// `.document` keys marked `whileTabsOpen` stay live there.
+    public var hasTabs: Bool
+
+    public init(inDocument: Bool, docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false) {
+        self.inDocument = inDocument
+        self.docKind = docKind
+        self.isEditingText = isEditingText
+        self.hasTabs = hasTabs
+    }
+
+    /// A window showing a document of `docKind` (nil: the library).
+    public init(docKind: DocumentKind?, isEditingText: Bool = false, hasTabs: Bool = false) {
+        self.init(inDocument: docKind != nil, docKind: docKind, isEditingText: isEditingText, hasTabs: hasTabs)
+    }
+}
+
+public extension KeyCommandDescriptor {
+    /// contracts-v2.2: true when this key command is live in a window in `context`. Its `scope` must admit the window
+    /// (`.global` always, `.library` without a document, `.document` with one, `.canvas` with one while no text is
+    /// being edited; a `.document` key marked `whileTabsOpen` also in the library while the window has tabs) and its
+    /// `docKinds` (nil or empty = any kind) must contain the kind of the document shown, so a command limited to kinds
+    /// is never live in the library.
+    func isActive(in context: KeyCommandContext) -> Bool {
+        switch scope {
+        case .global: break
+        case .library: if context.inDocument { return false }
+        case .document: if !context.inDocument && !(whileTabsOpen && context.hasTabs) { return false }
+        case .canvas: if !context.inDocument || context.isEditingText { return false }
+        }
+        guard let kinds = docKinds, !kinds.isEmpty else { return true }
+        guard context.inDocument, let kind = context.docKind else { return false }
+        return kinds.contains(kind)
+    }
+}
+
+/// contracts-v2.2: which key commands a window offers, and which one wins when several share a shortcut (the shell
+/// hands UIKit one command per shortcut, so two features mapping the same keys never race).
+public enum KeyCommandRouting {
+    /// True when `a` wins over `b` for the same shortcut, most specific first: the command limited to fewer document
+    /// kinds (`docKinds`; nil, empty and every kind all count as every kind, so they tie); then the narrower scope
+    /// (`.canvas`, then `.document` or `.library`, then `.global`); then the lower `order`; then the id.
+    public static func precedes(_ a: KeyCommandDescriptor, _ b: KeyCommandDescriptor) -> Bool {
+        let ak = kindCount(a), bk = kindCount(b)
+        if ak != bk { return ak < bk }
+        let ar = rank(a.scope), br = rank(b.scope)
+        if ar != br { return ar < br }
+        if a.order != b.order { return a.order < b.order }
+        return a.id < b.id
+    }
+
+    /// The key commands live in a window in `context` (`KeyCommandDescriptor.isActive(in:)`), one per shortcut (the
+    /// winner by `precedes`), in the order of `descriptors` (pass `content.keyCommands.all`).
+    public static func active(_ descriptors: [KeyCommandDescriptor], in context: KeyCommandContext) -> [KeyCommandDescriptor] {
+        let live = descriptors.filter { $0.isActive(in: context) }
+        var winners: [KeyShortcut: KeyCommandDescriptor] = [:]
+        for d in live {
+            if let current = winners[d.shortcut], !precedes(d, current) { continue }
+            winners[d.shortcut] = d
+        }
+        return live.filter { winners[$0.shortcut]?.id == $0.id }
+    }
+
+    /// True when the key command should take priority over what the system does with the same keys (the shell sets
+    /// `UIKeyCommand.wantsPriorityOverSystemBehavior`): always, except for a key without ⌘, ⌥ or ⌃ (a letter, an
+    /// arrow, Space, Return, Tab, Delete or Escape, with or without ⇧) while text has the keyboard, where typing,
+    /// cursor movement and the text view's own Escape win.
+    public static func overridesSystemKeys(_ d: KeyCommandDescriptor, in context: KeyCommandContext) -> Bool {
+        !context.isEditingText || !d.shortcut.modifiers.isDisjoint(with: [.command, .option, .control])
+    }
+
+    /// How many document kinds a command is live in: its `docKinds`, or every kind when they are nil or empty.
+    private static func kindCount(_ d: KeyCommandDescriptor) -> Int {
+        guard let kinds = d.docKinds, !kinds.isEmpty else { return DocumentKind.allCases.count }
+        return kinds.count
+    }
+
+    private static func rank(_ scope: KeyScope) -> Int {
+        switch scope {
+        case .canvas: return 0
+        case .document, .library: return 1
+        case .global: return 2
+        }
     }
 }
 
@@ -13343,7 +13905,9 @@ enum NameLookupCanary {
         DrawPurpose.self, ExportOptionKeys.self, TextLayoutInfo.self, TextLayoutDescriptor.self, PanelPresentation.self,
         ChromePlacement.self, ChromeSurface.self, ChromeAnchor.self, ChromeContext.self, ChromeOverlayDescriptor.self,
         DisplayFontWeight.self, NibFragment.self, BridgeNames.self, PanelIDs.self, ToolbarLayoutSetting.self,
-        TemplateIDs.self, TemplateParamNames.self, FloatingHosting.self, ToolMenuPopover.self, NibSnapshot.self
+        TemplateIDs.self, TemplateParamNames.self, FloatingHosting.self, ToolMenuPopover.self, NibSnapshot.self,
+        // contracts-v2.2 (app shell)
+        KeyCommandContext.self, KeyCommandRouting.self, UndoRoute.self
     ]
 
     /// Protocols with associated types / Self requirements are checked as generic constraints.
@@ -14475,6 +15039,818 @@ private final class RecordingNavigator: SceneNavigator {
 }
 ```
 
+### `NibKit/Tests/NibContractsTests/CommandCatalogueTests.swift`
+
+```swift
+import XCTest
+import NibContracts
+
+/// contracts-v2.1: every command id in the ARCHITECTURE.md §6.5 catalogue has a `CommandIDs` constant, and `PanelIDs`
+/// matches the well-known panel ids that ARCHITECTURE.md §13 lists. The tables below name every constant, so a missing
+/// one fails to compile; the doc checks read docs/ARCHITECTURE.md from the repository checkout this file lives in.
+final class CommandCatalogueTests: XCTestCase {
+    /// Every `CommandIDs` constant with the id it holds, in §6.5 catalogue order.
+    static let commandIDs: [(String, String)] = [
+        ("edit.undo", CommandIDs.undo),
+        ("edit.redo", CommandIDs.redo),
+        ("history.list", CommandIDs.historyList),
+        ("history.revertGroup", CommandIDs.revertGroup),
+        ("commands.list", CommandIDs.commandsList),
+        ("commands.describe", CommandIDs.commandsDescribe),
+        ("commands.batch", CommandIDs.batch),
+        ("tool.select", CommandIDs.toolSelect),
+        ("settings.get", CommandIDs.settingsGet),
+        ("settings.set", CommandIDs.settingsSet),
+        ("settings.list", CommandIDs.settingsList),
+        ("settings.describe", CommandIDs.settingsDescribe),
+        ("window.showLibrary", CommandIDs.windowShowLibrary),
+
+        ("a11y.describePage", CommandIDs.a11yDescribePage),
+
+        ("ai.ask", CommandIDs.aiAsk),
+        ("ai.chat.list", CommandIDs.aiChatList),
+        ("ai.chat.rename", CommandIDs.aiChatRename),
+        ("ai.chat.delete", CommandIDs.aiChatDelete),
+        ("ai.chat.feedback", CommandIDs.aiChatFeedback),
+        ("ai.provider.list", CommandIDs.aiProviderList),
+        ("ai.provider.save", CommandIDs.aiProviderSave),
+        ("ai.provider.activate", CommandIDs.aiProviderActivate),
+        ("ai.provider.delete", CommandIDs.aiProviderDelete),
+        ("ai.provider.test", CommandIDs.aiProviderTest),
+        ("ai.quiz", CommandIDs.aiQuiz),
+
+        ("answerZone.create", CommandIDs.answerZoneCreate),
+        ("answerZone.score", CommandIDs.answerZoneScore),
+        ("answerZone.setHints", CommandIDs.answerZoneSetHints),
+        ("answerZone.revealHint", CommandIDs.answerZoneRevealHint),
+
+        ("app.openURL", CommandIDs.appOpenURL),
+        ("app.quickAction", CommandIDs.appQuickAction),
+        ("app.deleteAllData", CommandIDs.appDeleteAllData),
+
+        ("asset.put", CommandIDs.assetPut),
+        ("asset.get", CommandIDs.assetGet),
+        ("asset.upload", CommandIDs.assetUpload),
+
+        ("audio.record", CommandIDs.audioRecord),
+        ("audio.play", CommandIDs.audioPlay),
+        ("audio.pause", CommandIDs.audioPause),
+        ("audio.seek", CommandIDs.audioSeek),
+        ("audio.setPlayback", CommandIDs.audioSetPlayback),
+        ("audio.rename", CommandIDs.audioRename),
+        ("audio.delete", CommandIDs.audioDelete),
+        ("audio.export", CommandIDs.audioExport),
+        ("audio.quickRecord", CommandIDs.audioQuickRecord),
+
+        ("backup.now", CommandIDs.backupNow),
+        ("backup.manual", CommandIDs.backupManual),
+        ("backup.configure", CommandIDs.backupConfigure),
+        ("backup.chooseFolder", CommandIDs.backupChooseFolder),
+        ("backup.status", CommandIDs.backupStatus),
+        ("backup.clearQueue", CommandIDs.backupClearQueue),
+
+        ("block.insert", CommandIDs.blockInsert),
+        ("block.update", CommandIDs.blockUpdate),
+        ("block.delete", CommandIDs.blockDelete),
+        ("block.move", CommandIDs.blockMove),
+        ("block.comment", CommandIDs.blockComment),
+        ("block.editComment", CommandIDs.blockEditComment),
+        ("block.deleteComment", CommandIDs.blockDeleteComment),
+        ("block.resolveComment", CommandIDs.blockResolveComment),
+
+        ("board.add", CommandIDs.boardAdd),
+        ("board.rename", CommandIDs.boardRename),
+        ("board.insertTemplate", CommandIDs.boardInsertTemplate),
+
+        ("bridge.setEnabled", CommandIDs.bridgeSetEnabled),
+        ("bridge.status", CommandIDs.bridgeStatus),
+
+        ("calendar.events", CommandIDs.calendarEvents),
+        ("calendar.createNote", CommandIDs.calendarCreateNote),
+        ("calendar.openNote", CommandIDs.calendarOpenNote),
+
+        ("canvas.decorate", CommandIDs.canvasDecorate),
+        ("canvas.clearDecorations", CommandIDs.canvasClearDecorations),
+
+        ("card.add", CommandIDs.cardAdd),
+        ("card.update", CommandIDs.cardUpdate),
+        ("card.delete", CommandIDs.cardDelete),
+        ("card.move", CommandIDs.cardMove),
+        ("card.moveTo", CommandIDs.cardMoveTo),
+
+        ("clipboard.copy", CommandIDs.clipboardCopy),
+        ("clipboard.cut", CommandIDs.clipboardCut),
+        ("clipboard.paste", CommandIDs.clipboardPaste),
+        ("clipboard.copyText", CommandIDs.clipboardCopyText),
+
+        ("collab.host", CommandIDs.collabHost),
+        ("collab.join", CommandIDs.collabJoin),
+        ("collab.leave", CommandIDs.collabLeave),
+        ("collab.participants", CommandIDs.collabParticipants),
+        ("collab.approve", CommandIDs.collabApprove),
+        ("collab.setRole", CommandIDs.collabSetRole),
+        ("collab.revoke", CommandIDs.collabRevoke),
+        ("collab.follow", CommandIDs.collabFollow),
+        ("collab.followMe", CommandIDs.collabFollowMe),
+        ("collab.markSeen", CommandIDs.collabMarkSeen),
+
+        ("comment.add", CommandIDs.commentAdd),
+        ("comment.reply", CommandIDs.commentReply),
+        ("comment.edit", CommandIDs.commentEdit),
+        ("comment.deleteMessage", CommandIDs.commentDeleteMessage),
+        ("comment.resolve", CommandIDs.commentResolve),
+        ("comment.tapAt", CommandIDs.commentTapAt),
+
+        ("connector.create", CommandIDs.connectorCreate),
+        ("connector.setPath", CommandIDs.connectorSetPath),
+
+        ("diagnostics.export", CommandIDs.diagnosticsExport),
+        ("diagnostics.setFeatureEnabled", CommandIDs.diagnosticsSetFeatureEnabled),
+
+        ("diagram.addConnected", CommandIDs.diagramAddConnected),
+        ("diagram.create", CommandIDs.diagramCreate),
+
+        ("dictionary.add", CommandIDs.dictionaryAdd),
+        ("dictionary.remove", CommandIDs.dictionaryRemove),
+        ("dictionary.list", CommandIDs.dictionaryList),
+
+        ("doc.create", CommandIDs.docCreate),
+        ("doc.setFavorite", CommandIDs.docSetFavorite),
+        ("doc.merge", CommandIDs.docMerge),
+        ("doc.setScrollDirection", CommandIDs.docSetScrollDirection),
+        ("doc.open", CommandIDs.docOpen),
+        ("doc.quickNote", CommandIDs.docQuickNote),
+        ("doc.convertToWhiteboard", CommandIDs.docConvertToWhiteboard),
+        ("doc.setLanguage", CommandIDs.docSetLanguage),
+        ("doc.setWritingAids", CommandIDs.docSetWritingAids),
+        ("doc.setLocked", CommandIDs.docSetLocked),
+        ("doc.unlock", CommandIDs.docUnlock),
+        ("doc.suggestTitle", CommandIDs.docSuggestTitle),
+
+        ("element.create", CommandIDs.elementCreate),
+        ("element.insert", CommandIDs.elementInsert),
+        ("element.collection.create", CommandIDs.elementCollectionCreate),
+        ("element.collection.update", CommandIDs.elementCollectionUpdate),
+        ("element.collection.delete", CommandIDs.elementCollectionDelete),
+        ("element.collection.list", CommandIDs.elementCollectionList),
+        ("element.list", CommandIDs.elementList),
+        ("element.rename", CommandIDs.elementRename),
+        ("element.delete", CommandIDs.elementDelete),
+        ("element.import", CommandIDs.elementImport),
+        ("element.export", CommandIDs.elementExport),
+
+        ("export.run", CommandIDs.exportRun),
+        ("export.present", CommandIDs.exportPresent),
+        ("export.saveToSource", CommandIDs.exportSaveToSource),
+
+        ("folder.create", CommandIDs.folderCreate),
+        ("folder.setStyle", CommandIDs.folderSetStyle),
+
+        ("gallery.list", CommandIDs.galleryList),
+
+        ("gif.search", CommandIDs.gifSearch),
+
+        ("handwriting.toText", CommandIDs.handwritingToText),
+        ("handwriting.toTextPages", CommandIDs.handwritingToTextPages),
+        ("handwriting.words", CommandIDs.handwritingWords),
+        ("handwriting.reflow", CommandIDs.handwritingReflow),
+        ("handwriting.straighten", CommandIDs.handwritingStraighten),
+        ("handwriting.align", CommandIDs.handwritingAlign),
+        ("handwriting.insertSpace", CommandIDs.handwritingInsertSpace),
+        ("handwriting.replaceWord", CommandIDs.handwritingReplaceWord),
+        ("handwriting.restyle", CommandIDs.handwritingRestyle),
+
+        ("image.insert", CommandIDs.imageInsert),
+        ("image.crop", CommandIDs.imageCrop),
+        ("image.flip", CommandIDs.imageFlip),
+        ("image.replace", CommandIDs.imageReplace),
+        ("image.saveToPhotos", CommandIDs.imageSaveToPhotos),
+        ("image.pick", CommandIDs.imagePick),
+
+        ("import.files", CommandIDs.importFiles),
+        ("import.pick", CommandIDs.importPick),
+
+        ("index.rebuild", CommandIDs.indexRebuild),
+
+        ("ink.addStrokes", CommandIDs.inkAddStrokes),
+        ("ink.setStyle", CommandIDs.inkSetStyle),
+        ("ink.setPoints", CommandIDs.inkSetPoints),
+        ("ink.erase", CommandIDs.inkErase),
+        ("ink.scribbleErase", CommandIDs.inkScribbleErase),
+        ("ink.writeText", CommandIDs.inkWriteText),
+
+        ("item.create", CommandIDs.itemCreate),
+        ("item.update", CommandIDs.itemUpdate),
+        ("item.transform", CommandIDs.itemTransform),
+        ("item.moveToPage", CommandIDs.itemMoveToPage),
+        ("item.delete", CommandIDs.itemDelete),
+        ("item.arrange", CommandIDs.itemArrange),
+        ("item.recolor", CommandIDs.itemRecolor),
+        ("item.setLocked", CommandIDs.itemSetLocked),
+        ("item.duplicate", CommandIDs.itemDuplicate),
+
+        ("laser.setMode", CommandIDs.laserSetMode),
+        ("laser.point", CommandIDs.laserPoint),
+
+        ("layer.setActive", CommandIDs.layerSetActive),
+        ("layer.setVisible", CommandIDs.layerSetVisible),
+        ("layer.rename", CommandIDs.layerRename),
+        ("layer.moveItems", CommandIDs.layerMoveItems),
+        ("layer.exportOptions", CommandIDs.layerExportOptions),
+
+        ("lesson.create", CommandIDs.lessonCreate),
+        ("lesson.setState", CommandIDs.lessonSetState),
+        ("lesson.importRoster", CommandIDs.lessonImportRoster),
+        ("lesson.collect", CommandIDs.lessonCollect),
+        ("lesson.cluster", CommandIDs.lessonCluster),
+        ("lesson.setClusters", CommandIDs.lessonSetClusters),
+
+        ("library.list", CommandIDs.libraryList),
+        ("library.rename", CommandIDs.libraryRename),
+        ("library.move", CommandIDs.libraryMove),
+        ("library.duplicate", CommandIDs.libraryDuplicate),
+        ("library.trash", CommandIDs.libraryTrash),
+        ("library.setView", CommandIDs.librarySetView),
+        ("library.reorder", CommandIDs.libraryReorder),
+        ("library.chooseFolder", CommandIDs.libraryChooseFolder),
+        ("library.relocate", CommandIDs.libraryRelocate),
+        ("library.locations", CommandIDs.libraryLocations),
+        ("library.switch", CommandIDs.librarySwitch),
+        ("library.repair", CommandIDs.libraryRepair),
+
+        ("link.set", CommandIDs.linkSet),
+        ("link.remove", CommandIDs.linkRemove),
+        ("link.follow", CommandIDs.linkFollow),
+        ("link.back", CommandIDs.linkBack),
+        ("link.autodetect", CommandIDs.linkAutodetect),
+        ("link.tapAt", CommandIDs.linkTapAt),
+
+        ("lock.setup", CommandIDs.lockSetup),
+
+        ("math.recognize", CommandIDs.mathRecognize),
+        ("math.convert", CommandIDs.mathConvert),
+        ("math.setLatex", CommandIDs.mathSetLatex),
+        ("math.copy", CommandIDs.mathCopy),
+        ("math.evaluate", CommandIDs.mathEvaluate),
+        ("math.assist", CommandIDs.mathAssist),
+        ("math.graph.create", CommandIDs.mathGraphCreate),
+        ("math.graph.setViewport", CommandIDs.mathGraphSetViewport),
+        ("math.solve", CommandIDs.mathSolve),
+
+        ("mathassist.tapAt", CommandIDs.mathassistTapAt),
+
+        ("meeting.summarize", CommandIDs.meetingSummarize),
+        ("meeting.generateNotes", CommandIDs.meetingGenerateNotes),
+
+        ("menu.showAt", CommandIDs.menuShowAt),
+
+        ("node.insert", CommandIDs.nodeInsert),
+        ("node.set", CommandIDs.nodeSet),
+        ("node.remove", CommandIDs.nodeRemove),
+        ("node.move", CommandIDs.nodeMove),
+
+        ("outline.add", CommandIDs.outlineAdd),
+        ("outline.rename", CommandIDs.outlineRename),
+        ("outline.move", CommandIDs.outlineMove),
+        ("outline.delete", CommandIDs.outlineDelete),
+        ("outline.sortByPage", CommandIDs.outlineSortByPage),
+        ("outline.list", CommandIDs.outlineList),
+        ("outline.generate", CommandIDs.outlineGenerate),
+
+        ("page.setTemplate", CommandIDs.pageSetTemplate),
+        ("page.setBackground", CommandIDs.pageSetBackground),
+        ("page.clear", CommandIDs.pageClear),
+        ("page.deleteItems", CommandIDs.pageDeleteItems),
+        ("page.add", CommandIDs.pageAdd),
+        ("page.duplicate", CommandIDs.pageDuplicate),
+        ("page.copy", CommandIDs.pageCopy),
+        ("page.paste", CommandIDs.pagePaste),
+        ("page.moveTo", CommandIDs.pageMoveTo),
+        ("page.reorder", CommandIDs.pageReorder),
+        ("page.rotate", CommandIDs.pageRotate),
+        ("page.trash", CommandIDs.pageTrash),
+        ("page.restore", CommandIDs.pageRestore),
+        ("page.purge", CommandIDs.pagePurge),
+        ("page.setBookmarked", CommandIDs.pageSetBookmarked),
+
+        ("panel.open", CommandIDs.panelOpen),
+        ("panel.close", CommandIDs.panelClose),
+
+        ("pdf.text", CommandIDs.pdfText),
+        ("pdf.links", CommandIDs.pdfLinks),
+        ("pdf.markSelection", CommandIDs.pdfMarkSelection),
+        ("pdf.copyText", CommandIDs.pdfCopyText),
+        ("pdf.tapAt", CommandIDs.pdfTapAt),
+
+        ("pencil.gesture", CommandIDs.pencilGesture),
+        ("pencil.palette", CommandIDs.pencilPalette),
+        ("pencil.actions", CommandIDs.pencilActions),
+
+        ("plugin.list", CommandIDs.pluginList),
+        ("plugin.enable", CommandIDs.pluginEnable),
+        ("plugin.reload", CommandIDs.pluginReload),
+        ("plugin.logs", CommandIDs.pluginLogs),
+        ("plugin.sdkTypes", CommandIDs.pluginSdkTypes),
+        ("plugin.docs", CommandIDs.pluginDocs),
+        ("plugin.install", CommandIDs.pluginInstall),
+        ("plugin.uninstall", CommandIDs.pluginUninstall),
+        ("plugin.review", CommandIDs.pluginReview),
+
+        ("present.setMode", CommandIDs.presentSetMode),
+
+        ("preset.select", CommandIDs.presetSelect),
+        ("preset.setSwatch", CommandIDs.presetSetSwatch),
+        ("preset.addSwatch", CommandIDs.presetAddSwatch),
+        ("preset.removeSwatch", CommandIDs.presetRemoveSwatch),
+        ("preset.moveSwatch", CommandIDs.presetMoveSwatch),
+        ("preset.setWidth", CommandIDs.presetSetWidth),
+        ("preset.reset", CommandIDs.presetReset),
+
+        ("print.present", CommandIDs.printPresent),
+
+        ("query.context", CommandIDs.queryContext),
+        ("query.tree", CommandIDs.queryTree),
+        ("query.get", CommandIDs.queryGet),
+        ("query.find", CommandIDs.queryFind),
+
+        ("recognize.pageText", CommandIDs.recognizePageText),
+        ("recognize.items", CommandIDs.recognizeItems),
+
+        ("relay.configure", CommandIDs.relayConfigure),
+
+        ("render.page", CommandIDs.renderPage),
+
+        ("replay.setMode", CommandIDs.replaySetMode),
+        ("replay.seekToItem", CommandIDs.replaySeekToItem),
+        ("replay.tapAt", CommandIDs.replayTapAt),
+
+        ("ruler.set", CommandIDs.rulerSet),
+
+        ("scan.documents", CommandIDs.scanDocuments),
+        ("scan.qr", CommandIDs.scanQr),
+
+        ("search.text", CommandIDs.searchText),
+        ("search.open", CommandIDs.searchOpen),
+        ("search.step", CommandIDs.searchStep),
+
+        ("selection.set", CommandIDs.selectionSet),
+        ("selection.clear", CommandIDs.selectionClear),
+        ("selection.fromPolygon", CommandIDs.selectionFromPolygon),
+        ("selection.fromRect", CommandIDs.selectionFromRect),
+        ("selection.fromLoop", CommandIDs.selectionFromLoop),
+        ("selection.selectAll", CommandIDs.selectionSelectAll),
+        ("selection.tapAt", CommandIDs.selectionTapAt),
+        ("selection.screenshot", CommandIDs.selectionScreenshot),
+
+        ("settings.open", CommandIDs.settingsOpen),
+
+        ("shape.recognize", CommandIDs.shapeRecognize),
+        ("shape.create", CommandIDs.shapeCreate),
+        ("shape.setStyle", CommandIDs.shapeSetStyle),
+        ("shape.setKind", CommandIDs.shapeSetKind),
+        ("shape.setPoints", CommandIDs.shapeSetPoints),
+        ("shape.tapAt", CommandIDs.shapeTapAt),
+
+        ("sidebar.toggle", CommandIDs.sidebarToggle),
+
+        ("spellcheck.tapAt", CommandIDs.spellcheckTapAt),
+
+        ("sticky.create", CommandIDs.stickyCreate),
+        ("sticky.setCollapsed", CommandIDs.stickySetCollapsed),
+        ("sticky.resolve", CommandIDs.stickyResolve),
+        ("sticky.setColor", CommandIDs.stickySetColor),
+        ("sticky.tapAt", CommandIDs.stickyTapAt),
+
+        ("stopwatch.start", CommandIDs.stopwatchStart),
+        ("stopwatch.lap", CommandIDs.stopwatchLap),
+
+        ("study.grade", CommandIDs.studyGrade),
+        ("study.resetProgress", CommandIDs.studyResetProgress),
+        ("study.setReminders", CommandIDs.studySetReminders),
+        ("study.setTheme", CommandIDs.studySetTheme),
+        ("study.importText", CommandIDs.studyImportText),
+        ("study.exportCSV", CommandIDs.studyExportCSV),
+
+        ("sync.now", CommandIDs.syncNow),
+
+        ("tab.close", CommandIDs.tabClose),
+        ("tab.closeOthers", CommandIDs.tabCloseOthers),
+        ("tab.select", CommandIDs.tabSelect),
+
+        ("table.edit", CommandIDs.tableEdit),
+        ("table.exportCSV", CommandIDs.tableExportCSV),
+
+        ("tape.tapAt", CommandIDs.tapeTapAt),
+        ("tape.setRevealed", CommandIDs.tapeSetRevealed),
+        ("tape.removeAll", CommandIDs.tapeRemoveAll),
+        ("tape.importPattern", CommandIDs.tapeImportPattern),
+        ("tape.patterns", CommandIDs.tapePatterns),
+        ("tape.deletePattern", CommandIDs.tapeDeletePattern),
+        ("tape.clearHistory", CommandIDs.tapeClearHistory),
+
+        ("template.list", CommandIDs.templateList),
+        ("template.choose", CommandIDs.templateChoose),
+        ("template.import", CommandIDs.templateImport),
+        ("template.listCustom", CommandIDs.templateListCustom),
+        ("template.group.create", CommandIDs.templateGroupCreate),
+        ("template.group.rename", CommandIDs.templateGroupRename),
+        ("template.group.delete", CommandIDs.templateGroupDelete),
+        ("template.delete", CommandIDs.templateDelete),
+        ("template.setHidden", CommandIDs.templateSetHidden),
+        ("template.fromPage", CommandIDs.templateFromPage),
+
+        ("text.createBox", CommandIDs.textCreateBox),
+        ("text.setText", CommandIDs.textSetText),
+        ("text.format", CommandIDs.textFormat),
+        ("text.setParagraph", CommandIDs.textSetParagraph),
+        ("text.setBoxStyle", CommandIDs.textSetBoxStyle),
+        ("text.saveDefaultStyle", CommandIDs.textSaveDefaultStyle),
+        ("text.tapAt", CommandIDs.textTapAt),
+        ("text.startPageText", CommandIDs.textStartPageText),
+
+        ("timer.start", CommandIDs.timerStart),
+        ("timer.control", CommandIDs.timerControl),
+        ("timer.history", CommandIDs.timerHistory),
+        ("timer.saveMode", CommandIDs.timerSaveMode),
+        ("timer.deleteMode", CommandIDs.timerDeleteMode),
+
+        ("toolbar.setLayout", CommandIDs.toolbarSetLayout),
+        ("toolbar.reset", CommandIDs.toolbarReset),
+        ("toolbar.setVisible", CommandIDs.toolbarSetVisible),
+        ("toolbar.layouts", CommandIDs.toolbarLayouts),
+        ("toolbar.saveLayout", CommandIDs.toolbarSaveLayout),
+        ("toolbar.applyLayout", CommandIDs.toolbarApplyLayout),
+        ("toolbar.deleteLayout", CommandIDs.toolbarDeleteLayout),
+        ("toolbar.dock", CommandIDs.toolbarDock),
+
+        ("transcript.get", CommandIDs.transcriptGet),
+        ("transcript.regenerate", CommandIDs.transcriptRegenerate),
+        ("transcript.editSegment", CommandIDs.transcriptEditSegment),
+        ("transcript.insert", CommandIDs.transcriptInsert),
+
+        ("trash.list", CommandIDs.trashList),
+        ("trash.recover", CommandIDs.trashRecover),
+        ("trash.deletePermanently", CommandIDs.trashDeletePermanently),
+        ("trash.empty", CommandIDs.trashEmpty),
+
+        ("view.goToPage", CommandIDs.viewGoToPage),
+        ("view.zoom", CommandIDs.viewZoom),
+        ("view.scrollBy", CommandIDs.viewScrollBy),
+        ("view.reveal", CommandIDs.viewReveal),
+        ("view.setReadOnly", CommandIDs.viewSetReadOnly),
+
+        ("webdav.syncNow", CommandIDs.webdavSyncNow),
+        ("webdav.configure", CommandIDs.webdavConfigure),
+        ("webdav.put", CommandIDs.webdavPut),
+        ("webdav.status", CommandIDs.webdavStatus),
+
+        ("window.open", CommandIDs.windowOpen),
+
+        ("zoom.toggle", CommandIDs.zoomToggle),
+        ("zoom.setBox", CommandIDs.zoomSetBox),
+        ("zoom.newLine", CommandIDs.zoomNewLine),
+        ("zoom.setReturnHeight", CommandIDs.zoomSetReturnHeight),
+    ]
+
+    /// Every `PanelIDs` constant with the id it holds (`studyLearn` is the superseded alias of `studySmartLearn`).
+    static let panelIDs: [(String, String)] = [
+        ("aichat.panel", PanelIDs.assistant),
+        ("organize.trash", PanelIDs.trash),
+        ("organize.favourites", PanelIDs.favourites),
+        ("templateui.manage", PanelIDs.templates),
+        ("syncui.panel", PanelIDs.cloudBackup),
+        ("about.panel", PanelIDs.about),
+        ("pluginmanager.gallery", PanelIDs.gallery),
+        ("studysession.practice", PanelIDs.studyPractice),
+        ("studysession.smartLearn", PanelIDs.studySmartLearn),
+        ("studysession.smartLearn", PanelIDs.studyLearn),
+        ("pages.movePages", PanelIDs.movePages),
+    ]
+
+    func testEveryCommandConstantHoldsItsID() {
+        for (id, constant) in Self.commandIDs {
+            XCTAssertEqual(constant, id)
+        }
+        XCTAssertEqual(Set(Self.commandIDs.map { $0.0 }).count, Self.commandIDs.count, "an id is listed twice")
+    }
+
+    func testEveryCatalogueIDHasACommandConstant() throws {
+        let catalogue = try Self.catalogueIDs()
+        XCTAssertGreaterThan(catalogue.count, 300, "the §6.5 parser found too few rows")
+        let constants = Set(Self.commandIDs.map { $0.0 })
+        let missing = catalogue.filter { !constants.contains($0) }
+        XCTAssertEqual(missing, [], "§6.5 ids without a CommandIDs constant (add each to CommandIDs.swift and here)")
+        let listed = Set(catalogue)
+        let stale = Self.commandIDs.map { $0.0 }.filter { !listed.contains($0) }
+        XCTAssertEqual(stale, [], "CommandIDs constants whose id is not in the §6.5 catalogue")
+    }
+
+    func testPanelIDsMatchTheArchitecturePanelList() throws {
+        for (id, constant) in Self.panelIDs {
+            XCTAssertEqual(constant, id)
+        }
+        let listed = try Self.architecturePanelIDs()
+        XCTAssertEqual(listed, Set(Self.panelIDs.map { $0.0 }), "PanelIDs differs from the ARCHITECTURE.md §13 list")
+    }
+
+    // MARK: docs/ARCHITECTURE.md
+
+    private static func architecture() throws -> [Substring] {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // NibContractsTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // NibKit
+            .deletingLastPathComponent() // repository root
+        let text = try String(contentsOf: root.appendingPathComponent("docs/ARCHITECTURE.md"), encoding: .utf8)
+        return text.split(separator: "\n", omittingEmptySubsequences: false)
+    }
+
+    /// The first-column id of every table row in §6.5, in document order.
+    private static func catalogueIDs() throws -> [String] {
+        let lines = try architecture()
+        guard let start = lines.firstIndex(where: { $0.hasPrefix("### 6.5 ") }) else {
+            XCTFail("ARCHITECTURE.md has no §6.5 heading")
+            return []
+        }
+        let end = lines[(start + 1)...].firstIndex(where: { $0.hasPrefix("## ") }) ?? lines.endIndex
+        return lines[start..<end].compactMap { line -> String? in
+            guard line.hasPrefix("| `") else { return nil }
+            let cell = line.dropFirst(3)
+            guard let close = cell.firstIndex(of: "`") else { return nil }
+            return String(cell[..<close])
+        }
+    }
+
+    /// The backticked dotted ids after "Well-known panel ids are in `PanelIDs`" in §13.
+    private static func architecturePanelIDs() throws -> Set<String> {
+        let marker = "Well-known panel ids are in `PanelIDs`"
+        guard let line = try architecture().first(where: { $0.contains(marker) }),
+              let range = line.range(of: marker) else {
+            XCTFail("ARCHITECTURE.md no longer says: \(marker)")
+            return []
+        }
+        let spans = line[range.upperBound...].split(separator: "`", omittingEmptySubsequences: false)
+        var ids = Set<String>()
+        for (index, span) in spans.enumerated() where index % 2 == 1 {
+            let parts = span.split(separator: ".", omittingEmptySubsequences: false)
+            let isID = parts.count == 2 && parts.allSatisfy { part in
+                !part.isEmpty && part.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) }
+            }
+            if isID, let first = span.first, first.isLowercase { ids.insert(String(span)) }
+        }
+        return ids
+    }
+}
+```
+
+### `NibKit/Tests/NibContractsTests/ShellRoutingTests.swift`
+
+```swift
+import XCTest
+import NibContracts
+import NibTesting
+
+/// contracts-v2.2: the app shell's key-command routing (`KeyCommandDescriptor.isActive(in:)`, `KeyCommandRouting`)
+/// and its ⌘Z / ⇧⌘Z fallback to the window's UndoManager (`UndoRoute`).
+@MainActor
+final class ShellRoutingTests: XCTestCase {
+    private let library = KeyCommandContext(docKind: nil)
+    private let notebook = KeyCommandContext(docKind: .notebook)
+    private let textDocument = KeyCommandContext(docKind: .textDocument)
+    private let editingNotebookText = KeyCommandContext(docKind: .notebook, isEditingText: true)
+    private let libraryWithTabs = KeyCommandContext(docKind: nil, hasTabs: true)
+
+    private func key(_ id: String, _ shortcut: KeyShortcut = KeyShortcut("k", [.command]), scope: KeyScope,
+                     order: Int = 0, docKinds: Set<DocumentKind>? = nil) -> KeyCommandDescriptor {
+        var d = KeyCommandDescriptor(id: id, title: id, shortcut: shortcut, command: "test." + id, scope: scope,
+                                     order: order, owner: "test")
+        d.docKinds = docKinds
+        return d
+    }
+
+    // MARK: Scope and document kinds
+
+    func testScopeAdmitsTheWindow() {
+        let global = key("g", scope: .global), lib = key("l", scope: .library)
+        let document = key("d", scope: .document), canvas = key("c", scope: .canvas)
+        XCTAssertEqual([global, lib, document, canvas].map { $0.isActive(in: library) }, [true, true, false, false])
+        XCTAssertEqual([global, lib, document, canvas].map { $0.isActive(in: notebook) }, [true, false, true, true])
+        XCTAssertEqual([global, lib, document, canvas].map { $0.isActive(in: editingNotebookText) },
+                       [true, false, true, false], "canvas keys stand back while text is edited")
+        let unknownKind = KeyCommandContext(inDocument: true, docKind: nil)
+        XCTAssertTrue(document.isActive(in: unknownKind))
+    }
+
+    func testDocKindsLimitAKeyToTheShownDocument() {
+        let textOnly = key("t", scope: .canvas, docKinds: [.textDocument])
+        XCTAssertTrue(textOnly.isActive(in: textDocument))
+        XCTAssertFalse(textOnly.isActive(in: notebook))
+        XCTAssertFalse(textOnly.isActive(in: library))
+
+        let globalStudy = key("s", scope: .global, docKinds: [.studySet])
+        XCTAssertTrue(globalStudy.isActive(in: KeyCommandContext(docKind: .studySet)))
+        XCTAssertFalse(globalStudy.isActive(in: library), "a key limited to kinds is never live without a document")
+        XCTAssertFalse(globalStudy.isActive(in: KeyCommandContext(inDocument: true, docKind: nil)))
+
+        XCTAssertTrue(key("n", scope: .document, docKinds: nil).isActive(in: textDocument), "nil = any kind")
+        XCTAssertTrue(key("e", scope: .document, docKinds: []).isActive(in: textDocument), "empty = any kind")
+    }
+
+    func testTabKeysStayLiveInTheLibraryWhileTheWindowHasTabs() {
+        // F018's ⌘1 (tab.select) and ⌘W (tab.close), with the library shown and the tab strip on screen.
+        var tab1 = key("windows.key.tab1", KeyShortcut("1", [.command]), scope: .document, order: 131)
+        tab1.whileTabsOpen = true
+        var closeTab = key("windows.key.closeTab", KeyShortcut("w", [.command]), scope: .document, order: 110)
+        closeTab.whileTabsOpen = true
+        let find = key("find", KeyShortcut("f", [.command]), scope: .document)
+        XCTAssertTrue(tab1.isActive(in: libraryWithTabs), "⌘1 switches tabs from the library while the strip shows")
+        XCTAssertEqual(KeyCommandRouting.active([tab1, closeTab, find], in: libraryWithTabs).map(\.id),
+                       ["windows.key.tab1", "windows.key.closeTab"], "other document keys wait for a document")
+        XCTAssertEqual(KeyCommandRouting.active([tab1, closeTab, find], in: library).map(\.id), [],
+                       "no tabs: ⌘1 and ⌘W stay with the system")
+        XCTAssertEqual(KeyCommandRouting.active([tab1, closeTab, find], in: notebook).map(\.id),
+                       ["windows.key.tab1", "windows.key.closeTab", "find"])
+
+        XCTAssertFalse(find.isActive(in: libraryWithTabs))
+        var limited = tab1
+        limited.docKinds = [.notebook]
+        XCTAssertFalse(limited.isActive(in: libraryWithTabs), "a key limited to kinds still needs its document")
+        var canvas = key("c", KeyShortcut("2", [.command]), scope: .canvas)
+        canvas.whileTabsOpen = true
+        XCTAssertFalse(canvas.isActive(in: libraryWithTabs), "only .document keys take whileTabsOpen")
+        XCTAssertTrue(key("l", scope: .library).isActive(in: libraryWithTabs))
+    }
+
+    // MARK: One command per shortcut
+
+    func testTheMostSpecificCommandWinsASharedShortcut() {
+        let cmdD = KeyShortcut("d", [.command])
+        // F014's item.duplicate (any kind) and F102's block duplicate (text documents only), both .canvas.
+        let duplicateItem = key("clipboard.key.duplicate", cmdD, scope: .canvas, order: 304)
+        let duplicateBlock = key("textdocedit.key.duplicate", cmdD, scope: .canvas, order: 621, docKinds: [.textDocument])
+        let all = [duplicateItem, duplicateBlock]
+        XCTAssertEqual(KeyCommandRouting.active(all, in: textDocument).map(\.id), ["textdocedit.key.duplicate"])
+        XCTAssertEqual(KeyCommandRouting.active(all, in: notebook).map(\.id), ["clipboard.key.duplicate"])
+        XCTAssertEqual(KeyCommandRouting.active(all, in: library).map(\.id), [])
+
+        // A global key and a document key on the same shortcut: the document one inside a document, the global one
+        // in the library.
+        let global = key("global", scope: .global), document = key("document", scope: .document, order: 900)
+        XCTAssertEqual(KeyCommandRouting.active([global, document], in: notebook).map(\.id), ["document"])
+        XCTAssertEqual(KeyCommandRouting.active([global, document], in: library).map(\.id), ["global"])
+    }
+
+    func testFewerDocumentKindsWinAndEveryKindTiesWithAnyKind() {
+        let cmdP = KeyShortcut("p", [.command, .option])
+        // F043's Show Pencil Palette (any kind) and F052's Play or Pause Audio (three kinds), both .document.
+        let palette = key("pencilhw.palette", cmdP, scope: .document)
+        let audio = key("audio.playPause", cmdP, scope: .document, order: 10,
+                        docKinds: [.notebook, .whiteboard, .textDocument])
+        XCTAssertEqual(KeyCommandRouting.active([palette, audio], in: notebook).map(\.id), ["audio.playPause"])
+        XCTAssertEqual(KeyCommandRouting.active([palette, audio], in: KeyCommandContext(docKind: .studySet)).map(\.id),
+                       ["pencilhw.palette"])
+
+        let two = key("two", scope: .canvas, docKinds: [.notebook, .whiteboard])
+        let one = key("one", scope: .document, order: 9, docKinds: [.notebook])
+        XCTAssertTrue(KeyCommandRouting.precedes(one, two), "fewer kinds first, before the scope")
+        XCTAssertFalse(KeyCommandRouting.precedes(two, one))
+
+        // Every kind is the same as nil or empty: the scope, then the order, then the id decide.
+        let every = key("every", scope: .document, order: 5, docKinds: Set(DocumentKind.allCases))
+        let anyCanvas = key("anyCanvas", scope: .canvas, order: 7)
+        let anyDocument = key("anyDocument", scope: .document, order: 1, docKinds: [])
+        XCTAssertTrue(KeyCommandRouting.precedes(anyCanvas, every), "the narrower scope wins over every kind")
+        XCTAssertFalse(KeyCommandRouting.precedes(every, anyCanvas))
+        XCTAssertTrue(KeyCommandRouting.precedes(anyDocument, every), "same scope: the lower order")
+        let sameOrder = key("aSame", scope: .document, order: 5)
+        XCTAssertTrue(KeyCommandRouting.precedes(sameOrder, every), "then the id")
+        XCTAssertEqual(KeyCommandRouting.active([every, anyCanvas], in: textDocument).map(\.id), ["anyCanvas"])
+    }
+
+    func testOrderThenIdBreakTiesAndRegistryOrderIsKept() {
+        let a = key("a", scope: .document, order: 5), b = key("b", scope: .document, order: 1)
+        let c = key("c", scope: .document, order: 1)
+        XCTAssertTrue(KeyCommandRouting.precedes(b, a))
+        XCTAssertTrue(KeyCommandRouting.precedes(b, c))
+        XCTAssertFalse(KeyCommandRouting.precedes(c, b))
+        XCTAssertEqual(KeyCommandRouting.active([a, c, b], in: notebook).map(\.id), ["b"])
+
+        let other = key("z", KeyShortcut("z", [.command]), scope: .canvas, order: 9)
+        let shiftZ = key("y", KeyShortcut("z", [.command, .shift]), scope: .canvas, order: 1)
+        XCTAssertEqual(KeyCommandRouting.active([other, a, shiftZ], in: notebook).map(\.id), ["z", "a", "y"],
+                       "different modifiers are different shortcuts; winners keep the registry order")
+        XCTAssertEqual(KeyCommandRouting.active([other, a, shiftZ], in: editingNotebookText).map(\.id), ["a"])
+    }
+
+    func testPlainKeysLeaveTypingAloneWhileTextHasTheKeyboard() {
+        let pen = key("pen", KeyShortcut("p"), scope: .canvas)
+        let nudge = key("nudge", KeyShortcut("up", [.shift]), scope: .document)
+        let bold = key("bold", KeyShortcut("b", [.command]), scope: .document)
+        let option = key("option", KeyShortcut("l", [.option]), scope: .global)
+        let control = key("control", KeyShortcut("tab", [.control]), scope: .global)
+        let keys = [pen, nudge, bold, option, control]
+        XCTAssertEqual(keys.map { KeyCommandRouting.overridesSystemKeys($0, in: notebook) }, [true, true, true, true, true])
+        XCTAssertEqual(keys.map { KeyCommandRouting.overridesSystemKeys($0, in: library) }, [true, true, true, true, true])
+        let typing = KeyCommandContext(docKind: .textDocument, isEditingText: true)
+        XCTAssertEqual(keys.map { KeyCommandRouting.overridesSystemKeys($0, in: typing) }, [false, false, true, true, true],
+                       "letters and arrows (with or without shift) go to the text; modified keys still run commands")
+        XCTAssertEqual(KeyCommandRouting.active(keys, in: typing).map(\.id), ["nudge", "bold", "option", "control"],
+                       "the canvas key is not live at all while typing")
+    }
+
+    func testTheLibraryContext() {
+        XCTAssertEqual(KeyCommandContext(docKind: nil), KeyCommandContext(inDocument: false, docKind: nil))
+        XCTAssertEqual(KeyCommandContext(docKind: .whiteboard, isEditingText: true),
+                       KeyCommandContext(inDocument: true, docKind: .whiteboard, isEditingText: true))
+        XCTAssertEqual(libraryWithTabs, KeyCommandContext(inDocument: false, docKind: nil, hasTabs: true))
+        XCTAssertNotEqual(notebook, editingNotebookText)
+        XCTAssertNotEqual(library, libraryWithTabs, "opening or closing the last tab rebuilds the window's keys")
+    }
+
+    func testSessionParamsMergeOverStaticParamsWhenTheKeyRuns() {
+        let h = Harness()
+        var d = KeyCommandDescriptor(id: "k", title: "K", shortcut: KeyShortcut("b", [.command]), command: CommandIDs.batch,
+                                     params: ["calls": [], "label": "Bold"], owner: "test")
+        d.sessionParams = { session in ["calls": [["command": "x.y", "params": ["doc": .string(session.document?.raw ?? "")]]]] }
+        XCTAssertEqual(d.resolvedParams(for: h.session),
+                       ["calls": [["command": "x.y", "params": ["doc": "FIXTUREDOC01"]]], "label": "Bold"])
+        XCTAssertEqual(d.resolvedParams(for: nil), ["calls": [], "label": "Bold"])
+    }
+
+    // MARK: ⌘Z / ⇧⌘Z fallback
+
+    func testUndoPrefersTheDocumentThenTheWindowsUndoManager() async throws {
+        let h = Harness()
+        let history = h.app.bus.history
+        let window = UndoManager()
+        window.groupsByEvent = false
+        let palette = DockStandIn()
+
+        XCTAssertEqual(UndoRoute.resolve(redo: false, doc: nil, history: history, window: nil), .nothing)
+        XCTAssertEqual(UndoRoute.resolve(redo: false, doc: Fixtures.docID, history: history, window: window), .nothing)
+
+        palette.move(to: 2, undoManager: window)   // "Move Palette"
+        XCTAssertEqual(UndoRoute.resolve(redo: false, doc: nil, history: history, window: window), .window,
+                       "no document: the window's step")
+        XCTAssertEqual(UndoRoute.resolve(redo: false, doc: Fixtures.docID, history: history, window: window), .window,
+                       "the document's history is empty: the window's step")
+
+        _ = try await h.insert([Item.makeSticky(StickyItem(frame: Frame(x: 1, y: 1, w: 50, h: 50)))])
+        XCTAssertEqual(UndoRoute.resolve(redo: false, doc: Fixtures.docID, history: history, window: window),
+                       .document(Fixtures.docID), "the document's step comes first")
+        XCTAssertEqual(UndoRoute.resolve(redo: true, doc: Fixtures.docID, history: history, window: window), .nothing)
+
+        window.undo()
+        XCTAssertEqual(palette.dock, 0)
+        XCTAssertEqual(UndoRoute.resolve(redo: true, doc: Fixtures.docID, history: history, window: window), .window,
+                       "nothing to redo in the document: the window's redo")
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(UndoRoute.resolve(redo: true, doc: Fixtures.docID, history: history, window: window),
+                       .document(Fixtures.docID))
+        XCTAssertEqual(UndoRoute.resolve(redo: false, doc: Fixtures.docID, history: history, window: window), .nothing)
+    }
+
+    func testUndoRouteForAKeyCommand() async throws {
+        let h = Harness()
+        let history = h.app.bus.history
+        _ = try await h.insert([Item.makeSticky(StickyItem(frame: Frame(x: 1, y: 1, w: 50, h: 50)))])
+        let window = UndoManager()
+
+        XCTAssertNil(UndoRoute.forCommand(CommandIDs.batch, params: [:], session: h.session, history: history, window: window))
+        XCTAssertEqual(UndoRoute.forCommand(CommandIDs.undo, params: [:], session: h.session, history: history, window: window),
+                       .document(Fixtures.docID), "no doc param: the session's document")
+        XCTAssertEqual(UndoRoute.forCommand(CommandIDs.undo, params: ["doc": ""], session: h.session, history: history,
+                                            window: window), .document(Fixtures.docID))
+        XCTAssertEqual(UndoRoute.forCommand(CommandIDs.undo, params: ["doc": "doc:FIXTUREDOC02"], session: h.session,
+                                            history: history, window: window), .nothing,
+                       "the named document has no step and the window none")
+        XCTAssertEqual(UndoRoute.forCommand(CommandIDs.redo, params: [:], session: h.session, history: history, window: window),
+                       .nothing)
+        h.session.document = nil
+        XCTAssertEqual(UndoRoute.forCommand(CommandIDs.undo, params: [:], session: h.session, history: history, window: window),
+                       .nothing, "no document and an empty window")
+        XCTAssertEqual(UndoRoute.forCommand(CommandIDs.undo, params: ["doc": "doc:FIXTUREDOC01"], session: nil,
+                                            history: history, window: window), .document(Fixtures.docID))
+    }
+}
+
+/// A window-level undoable setting, registered the way F016 registers "Move Palette" on the window's UndoManager.
+private final class DockStandIn: NSObject {
+    private(set) var dock = 0
+
+    func move(to next: Int, undoManager: UndoManager) {
+        let previous = dock
+        dock = next
+        // An undo or redo already runs inside the manager's own group (which records the inverse step).
+        let grouped = !undoManager.isUndoing && !undoManager.isRedoing
+        if grouped { undoManager.beginUndoGrouping() }
+        undoManager.registerUndo(withTarget: self) { target in target.move(to: previous, undoManager: undoManager) }
+        undoManager.setActionName("Move Palette")
+        if grouped { undoManager.endUndoGrouping() }
+    }
+}
+```
+
 ## Part B — Package manifest and generated lists
 
 These files are generated from `forge-spec.json` by the architect's generator (module order = registration order). The scaffold writes them verbatim. To add or remove a module, update the spec and regenerate; never hand-edit these files.
@@ -15102,7 +16478,7 @@ final class ConformanceTests: XCTestCase {
 ```
 ## Part C — App shell (app target)
 
-The shell is intentionally thin. It creates `NibApp`, registers the features, hosts one `ShellViewController` per window scene, turns `KeyCommandDescriptor`s into `UIKeyCommand`s, routes URLs and quick actions to commands, awaits `ui.openGate`, and shows fallback screens when a provider feature is missing.
+The shell is intentionally thin. It creates `NibApp`, registers the features, hosts one `ShellViewController` per window scene, turns `KeyCommandDescriptor`s into `UIKeyCommand`s (one per shortcut, by scope, `docKinds` and text focus; `sessionParams` resolved when a key runs; ⌘Z / ⇧⌘Z fall back to the window's UndoManager), makes the key window the active one, forwards the status bar and home indicator to the shown screen, routes URLs and quick actions to commands, awaits `ui.openGate`, and shows fallback screens when a provider feature is missing.
 
 ### `Nib/App/AppDelegate.swift`
 
@@ -15169,16 +16545,24 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
-    private var shell: ShellViewController?
+    private(set) var shell: ShellViewController?
+    private var keyObserver: NSObjectProtocol?
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         guard let windowScene = scene as? UIWindowScene, let app = NibApp.shared else { return }
         let shell = ShellViewController(app: app)
         let window = UIWindow(windowScene: windowScene)
         window.rootViewController = shell
-        window.makeKeyAndVisible()
         self.window = window
         self.shell = shell
+        // Commands target the window the user works in: follow the key window across scenes (Split View, Stage
+        // Manager, external keyboard focus), not only scene activation, which several windows share.
+        keyObserver = NotificationCenter.default.addObserver(forName: UIWindow.didBecomeKeyNotification, object: window,
+                                                             queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.shell?.windowDidBecomeKey() }
+        }
+        window.makeKeyAndVisible()
+        shell.activateWindow()
         app.ui.sceneHooks?.sceneDidConnect(windowScene, options: connectionOptions, navigator: shell)
         for context in connectionOptions.urlContexts { shell.handle(url: context.url) }
         if let item = connectionOptions.shortcutItem {
@@ -15188,28 +16572,55 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     func windowScene(_ windowScene: UIWindowScene, performActionFor shortcutItem: UIApplicationShortcutItem,
                      completionHandler: @escaping (Bool) -> Void) {
+        shell?.activateWindow()
         NibApp.shared?.perform(CommandIDs.appQuickAction, ["type": .string(shortcutItem.type)], session: shell?.session)
         completionHandler(true)
     }
 
     func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+        shell?.activateWindow()
         for context in URLContexts { shell?.handle(url: context.url) }
     }
 
     func sceneDidBecomeActive(_ scene: UIScene) {
         guard let shell = shell, let app = NibApp.shared else { return }
-        app.ui.activeNavigator = shell
-        app.services.sessions.activate(shell.session)
+        // Several windows become active together; the key one wins, and any active one beats a window that is not key.
+        let current = app.ui.activeNavigator
+        if shell.isKeyWindow || current == nil || (current as? ShellViewController)?.isKeyWindow != true {
+            shell.activateWindow()
+        }
     }
 
     func sceneDidDisconnect(_ scene: UIScene) {
-        guard let shell = shell else { return }
-        NibApp.shared?.services.sessions.remove(shell.session)
+        if let observer = keyObserver { NotificationCenter.default.removeObserver(observer) }
+        keyObserver = nil
+        guard let shell = shell, let app = NibApp.shared else { return }
+        // Hand over before the session goes, so `sessions.remove` never makes the newest session active on its own
+        // (with a `session.activated` for a window the user did not pick). A closing window that is not the active one
+        // leaves the active window as it is, and re-syncs its session when the two had drifted apart.
+        if app.ui.activeNavigator === shell || app.services.sessions.active === shell.session {
+            let current = app.ui.activeNavigator as? ShellViewController
+            let successor = current.flatMap { $0 === shell ? nil : $0 } ?? SceneDelegate.nextWindow(after: scene)
+            if current === shell { app.ui.activeNavigator = nil }
+            successor?.activateWindow()
+        }
+        app.services.sessions.remove(shell.session)
+        ShellViewController.windowDidClose(shell)
     }
 
     func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
         guard let shell = shell else { return nil }
         return NibApp.shared?.ui.sceneHooks?.restorationActivity(shell)
+    }
+
+    /// The window that takes over when `closed` goes away: the key window, else the foreground window the user
+    /// activated most recently, else any foreground window (nil when no other window is in the foreground).
+    private static func nextWindow(after closed: UIScene) -> ShellViewController? {
+        let shells = UIApplication.shared.connectedScenes
+            .filter { $0 !== closed && $0.activationState != .unattached && $0.activationState != .background }
+            .compactMap { ($0.delegate as? SceneDelegate)?.shell }
+        if let key = shells.first(where: { $0.isKeyWindow }) { return key }
+        return ShellViewController.mostRecentlyActivated(among: shells) ?? shells.first
     }
 }
 
@@ -15272,6 +16683,12 @@ final class ShellViewController: UIViewController, SceneNavigator {
     private var content: UIViewController?
     private var tabBar: UIView?
     private var failureObserver: NSObjectProtocol?
+    /// What the window shows right now, for key commands (`KeyCommandContext`): a document of `shownKind`, or the
+    /// library / onboarding. `activeDocument` stays the selected tab while the library shows.
+    private var showsDocument = false
+    private var shownKind: DocumentKind?
+    /// The UIKeyCommands last handed to UIKit, rebuilt when the registry or the window's context changes.
+    private var keyCommandCache: (generation: UInt64, context: KeyCommandContext, commands: [UIKeyCommand])?
 
     init(app: NibApp) {
         self.app = app
@@ -15289,7 +16706,7 @@ final class ShellViewController: UIViewController, SceneNavigator {
         view.backgroundColor = .systemBackground
         failureObserver = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: nil, queue: .main) { [weak self] note in
             let message = (note.userInfo?["error"] as? NibError)?.message ?? "Something went wrong"
-            Task { @MainActor in self?.toast(message) }
+            Task { @MainActor in self?.toastIfActive(message) }
         }
         if let onboarding = app.ui.screens.onboarding?(app, self) {
             display(onboarding)
@@ -15300,7 +16717,7 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        becomeFirstResponder()
+        reclaimKeyFocusIfNeeded()
     }
 
     override func viewDidLayoutSubviews() {
@@ -15314,10 +16731,74 @@ final class ShellViewController: UIViewController, SceneNavigator {
         }
     }
 
+    // MARK: Window activation (key-window tracking)
+
+    /// Makes this window the one that app-level commands target: `ui.activeNavigator` (what `ctx.navigator` returns to
+    /// `window.showLibrary`, `doc.open`, `panel.open`…) and the active session (`ctx.activeSession`, `session.activated`).
+    /// The scene delegate calls it when the window becomes key or its scene becomes active, and the key-command bridge
+    /// before every command it runs.
+    func activateWindow() {
+        ShellViewController.noteActivation(self)
+        if app.ui.activeNavigator !== self { app.ui.activeNavigator = self }
+        app.services.sessions.activate(session)   // emits `session.activated` only when it changes
+    }
+
+    /// Every window, most recently activated first: which one takes over when the active window closes.
+    private static var activationOrder: [WeakShell] = []
+
+    private struct WeakShell {
+        weak var shell: ShellViewController?
+    }
+
+    private static func noteActivation(_ shell: ShellViewController) {
+        guard activationOrder.first?.shell !== shell else { return }
+        activationOrder.removeAll { $0.shell == nil || $0.shell === shell }
+        activationOrder.insert(WeakShell(shell: shell), at: 0)
+    }
+
+    /// The window among `candidates` that was activated most recently (nil when none of them ever was).
+    static func mostRecentlyActivated(among candidates: [ShellViewController]) -> ShellViewController? {
+        activationOrder.lazy.compactMap { $0.shell }.first { shell in candidates.contains { $0 === shell } }
+    }
+
+    /// Forgets a window whose scene went away.
+    static func windowDidClose(_ shell: ShellViewController) {
+        activationOrder.removeAll { $0.shell == nil || $0.shell === shell }
+    }
+
+    /// The window became key (the scene delegate observes `UIWindow.didBecomeKeyNotification`): commands now target it,
+    /// and it takes keyboard focus when nothing inside it has it, so its key commands work at once.
+    func windowDidBecomeKey() {
+        activateWindow()
+        reclaimKeyFocusIfNeeded()
+    }
+
+    /// True when this window is the key window, i.e. the one that receives hardware keys.
+    var isKeyWindow: Bool { viewIfLoaded?.window?.isKeyWindow ?? false }
+
+    // MARK: Presentation state of the content (status bar, home indicator, system edge gestures)
+
+    // The shown screen decides (the document chrome hides the status bar for P-106 / `editing.hideStatusBar`,
+    // presentation and full-screen modes hide the home indicator and defer edge gestures).
+    override var childForStatusBarHidden: UIViewController? { content }
+    override var childForStatusBarStyle: UIViewController? { content }
+    override var childForHomeIndicatorAutoHidden: UIViewController? { content }
+    override var childForScreenEdgesDeferringSystemGestures: UIViewController? { content }
+    override var childViewControllerForPointerLock: UIViewController? { content }
+
+    private func contentPresentationDidChange() {
+        setNeedsStatusBarAppearanceUpdate()
+        setNeedsUpdateOfHomeIndicatorAutoHidden()
+        setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+        setNeedsUpdateOfPrefersPointerLocked()
+    }
+
     // MARK: SceneNavigator
 
     func showLibrary(folder: FolderID?) {
         session.document = nil
+        showsDocument = false
+        shownKind = nil
         display(app.ui.screens.libraryRoot?(app, self) ?? FallbackLibraryViewController(app: app, navigator: self))
     }
 
@@ -15356,10 +16837,20 @@ final class ShellViewController: UIViewController, SceneNavigator {
         session.selection = Selection()
         session.page = page ?? docContent.livePages.first?.id
         let kind = docContent.meta.kind
+        showsDocument = true
+        shownKind = kind
         let editor = app.ui.editors.get(kind.rawValue)?.make(doc, session, app)
             ?? FallbackEditorViewController(message: "No editor is installed for \(kind.rawValue) documents.")
         display(app.ui.screens.documentContainer?(editor, doc, app, self) ?? editor)
         if let p = page { session.editor?.reveal(page: p, rect: nil, animated: false) }
+    }
+
+    /// contracts-v2 (G1): a restored tab joins the tab strip without being shown and without building its editor;
+    /// selecting it later opens it (through `ui.openGate`) like any other tab.
+    func addTab(_ doc: DocumentID) {
+        guard !openDocuments.contains(doc) else { return }
+        openDocuments.append(doc)
+        refreshTabBar()
     }
 
     func closeDocument(_ doc: DocumentID) {
@@ -15391,27 +16882,101 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override var canBecomeFirstResponder: Bool { true }
 
+    /// What decides which key commands are live in this window: the document kind it shows, whether text has the
+    /// keyboard (a Nib text editor sets `session.isEditingText`; any other text field or view in the window counts too,
+    /// so typing in a search field or a rename alert never switches tools), and whether it has tabs (the tab keys stay
+    /// live in the library while the tab strip shows).
+    var keyCommandContext: KeyCommandContext {
+        let typing = session.isEditingText || ShellFocus.isEditingText(in: viewIfLoaded?.window)
+        return KeyCommandContext(inDocument: showsDocument, docKind: shownKind, isEditingText: typing,
+                                 hasTabs: !openDocuments.isEmpty)
+    }
+
+    /// One UIKeyCommand per shortcut: the registered descriptors live in this window (`KeyScope`, `docKinds`), the most
+    /// specific winning a shared shortcut (`KeyCommandRouting`), in registry order.
     override var keyCommands: [UIKeyCommand]? {
-        let inDocument = activeDocument != nil
-        return app.content.keyCommands.all.compactMap { d -> UIKeyCommand? in
-            switch d.scope {
-            case .global: break
-            case .library: if inDocument { return nil }
-            case .document: if !inDocument { return nil }
-            case .canvas: if !inDocument || session.isEditingText { return nil }
-            }
+        let context = keyCommandContext
+        let generation = app.content.keyCommands.generation
+        if let cache = keyCommandCache, cache.generation == generation, cache.context == context { return cache.commands }
+        let commands = KeyCommandRouting.active(app.content.keyCommands.all, in: context).map { d -> UIKeyCommand in
             let command = UIKeyCommand(title: d.title, action: #selector(runKeyCommand(_:)),
                                        input: ShellViewController.keyInput(d.shortcut.key),
                                        modifierFlags: ShellViewController.modifierFlags(d.shortcut.modifiers),
                                        propertyList: d.id)
-            command.wantsPriorityOverSystemBehavior = true
+            command.wantsPriorityOverSystemBehavior = KeyCommandRouting.overridesSystemKeys(d, in: context)
             return command
         }
+        keyCommandCache = (generation, context, commands)
+        return commands
     }
 
     @objc private func runKeyCommand(_ sender: UIKeyCommand) {
-        guard let id = sender.propertyList as? String, let d = app.content.keyCommands.get(id) else { return }
-        app.perform(d.command, d.params, session: session)
+        guard let d = liveKeyCommand(sender) else { return }
+        activateWindow()
+        let params = d.resolvedParams(for: session)
+        switch undoRoute(d, params: params) {
+        case .window?:
+            undoWindow(redo: d.command == CommandIDs.redo)
+        case .nothing?:
+            return
+        case .document?, nil:
+            app.perform(d.command, params, session: session)
+        }
+    }
+
+    /// Menu and discoverability validation: a key command is enabled while it is live in this window, and ⌘Z / ⇧⌘Z
+    /// while the document's history or the window's UndoManager has a step. A disabled key falls through to the system.
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        guard action == #selector(runKeyCommand(_:)) else { return super.canPerformAction(action, withSender: sender) }
+        guard let command = sender as? UIKeyCommand, let d = liveKeyCommand(command) else { return false }
+        return undoRoute(d, params: d.resolvedParams(for: session)) != .nothing
+    }
+
+    /// Titles follow the registry; ⌘Z / ⇧⌘Z falling back to the window's UndoManager name its step ("Undo Move Palette").
+    override func validate(_ command: UICommand) {
+        super.validate(command)
+        guard command.action == #selector(runKeyCommand(_:)), let id = command.propertyList as? String,
+              let d = app.content.keyCommands.get(id) else { return }
+        command.title = d.title
+        if case .window? = undoRoute(d, params: d.resolvedParams(for: session)), let manager = windowUndoManager {
+            command.title = d.command == CommandIDs.redo ? manager.redoMenuItemTitle : manager.undoMenuItemTitle
+        }
+    }
+
+    /// The descriptor behind a UIKeyCommand this shell built, when it is still registered and live in this window.
+    private func liveKeyCommand(_ command: UIKeyCommand) -> KeyCommandDescriptor? {
+        guard let id = command.propertyList as? String, let d = app.content.keyCommands.get(id),
+              d.isActive(in: keyCommandContext) else { return nil }
+        return d
+    }
+
+    /// The window's UndoManager: window-level steps that are not in any document ("Move Palette", F016).
+    private var windowUndoManager: UndoManager? { viewIfLoaded?.window?.undoManager }
+
+    /// Where `edit.undo` / `edit.redo` act (nil for any other command): the document's history while it has a step,
+    /// else the window's UndoManager.
+    private func undoRoute(_ d: KeyCommandDescriptor, params: JSONValue) -> UndoRoute? {
+        UndoRoute.forCommand(d.command, params: params, session: session, history: app.bus.history,
+                             window: windowUndoManager)
+    }
+
+    private func undoWindow(redo: Bool) {
+        // NSUndoManager closes one open top-level group itself; undoing inside a nested group or a replay would throw.
+        guard let manager = windowUndoManager, manager.groupingLevel <= 1,
+              !manager.isUndoing, !manager.isRedoing else { return }
+        if redo {
+            if manager.canRedo { manager.redo() }
+        } else if manager.canUndo {
+            manager.undo()
+        }
+    }
+
+    /// Takes keyboard focus back when nothing in this window has it (the responder that had it left with the screen it
+    /// belonged to), so the key commands keep working. Never takes it from a responder in this window.
+    private func reclaimKeyFocusIfNeeded() {
+        guard let window = viewIfLoaded?.window, window.isKeyWindow, !isFirstResponder,
+              !ShellFocus.hasFocus(in: window) else { return }
+        becomeFirstResponder()
     }
 
     private static func keyInput(_ key: String) -> String {
@@ -15461,7 +17026,11 @@ final class ShellViewController: UIViewController, SceneNavigator {
         view.addSubview(vc.view)
         vc.didMove(toParent: self)
         content = vc
+        keyCommandCache = nil
         refreshTabBar()
+        contentPresentationDidChange()
+        // The new screen may take focus as it appears; only when nothing did does the shell take it.
+        Task { @MainActor [weak self] in self?.reclaimKeyFocusIfNeeded() }
     }
 
     private func refreshTabBar() {
@@ -15472,6 +17041,12 @@ final class ShellViewController: UIViewController, SceneNavigator {
             tabBar = bar
         }
         view.setNeedsLayout()
+    }
+
+    /// Command failures are posted app-wide; only the window the user is working in shows them.
+    private func toastIfActive(_ message: String) {
+        guard app.ui.activeNavigator === self || app.ui.activeNavigator == nil else { return }
+        toast(message)
     }
 
     private func toast(_ message: String) {
@@ -15495,6 +17070,49 @@ final class ShellViewController: UIViewController, SceneNavigator {
         } completion: { _ in
             label.removeFromSuperview()
         }
+    }
+}
+
+// MARK: - Keyboard focus
+
+/// Which responder has the keyboard in the key window. UIKit has no public accessor, so a nil-targeted action asks
+/// the first responder to identify itself (it reaches the window, scene or application when nothing has focus).
+@MainActor
+enum ShellFocus {
+    fileprivate static weak var captured: UIResponder?
+
+    static func firstResponder() -> UIResponder? {
+        captured = nil
+        defer { captured = nil }
+        UIApplication.shared.sendAction(#selector(UIResponder.nibShellCaptureFirstResponder(_:)), to: nil, from: nil, for: nil)
+        return captured
+    }
+
+    /// True when a view or view controller inside `window` has the keyboard.
+    static func hasFocus(in window: UIWindow) -> Bool {
+        guard let responder = firstResponder() else { return false }
+        return self.window(of: responder) === window
+    }
+
+    /// True when an editable text field or text view (or another text input) in `window` has the keyboard.
+    static func isEditingText(in window: UIWindow?) -> Bool {
+        guard let window, let responder = firstResponder(), self.window(of: responder) === window else { return false }
+        if let textView = responder as? UITextView { return textView.isEditable }
+        if let field = responder as? UITextField { return field.isEnabled }
+        return responder is UIKeyInput
+    }
+
+    private static func window(of responder: UIResponder) -> UIWindow? {
+        if responder is UIWindow { return nil }   // the window itself: nothing inside it has focus
+        if let view = responder as? UIView { return view.window }
+        if let controller = responder as? UIViewController { return controller.viewIfLoaded?.window }
+        return nil
+    }
+}
+
+extension UIResponder {
+    @objc fileprivate func nibShellCaptureFirstResponder(_ sender: Any?) {
+        ShellFocus.captured = self
     }
 }
 
@@ -15598,7 +17216,7 @@ final class FallbackSettingsViewController: UITableViewController {
 ```
 ## Part D — Project and CI
 
-`project.yml` (XcodeGen), the GitHub Actions workflow (macos-26 with Xcode 26.6 pinned: a fast `feature` job on `feat/**` branches, the `test` ∥ `ipa` jobs everywhere else) and the three Python helpers. Unsigned build (ad-hoc signed in CI only to carry the optional App Group entitlement); see ARCHITECTURE.md §19 for sideloading.
+`project.yml` (XcodeGen), the GitHub Actions workflow (macos-26 with Xcode 26.6 pinned: a fast `feature` job on `feat/**` branches, the `test` ∥ `ipa` jobs everywhere else) and the three Python helpers. Unsigned build (ad-hoc signed in CI only to carry the optional App Group and user-fonts entitlements); see ARCHITECTURE.md §19 for sideloading.
 
 ### `project.yml`
 
@@ -15641,6 +17259,9 @@ targets:
       path: Nib/Nib.entitlements
       properties:
         com.apple.security.application-groups: [group.app.nib.Nib]
+        # Fonts the user installed from a font provider app (Settings › General › Fonts) show in the text font
+        # pickers and render in text boxes (F026 T-059, P-083).
+        com.apple.developer.user-fonts: [app-usage]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.nib.Nib
