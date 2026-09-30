@@ -171,7 +171,8 @@ final class FolderLibrary: LibraryService {
     private let log = Logger(subsystem: "app.nib", category: "library")
 
     private(set) var rootURL: URL
-    /// The root whose security scope this library opened (stopped when switching).
+    /// The URL object whose security scope this library opened for the root (stopped when switching). It is the URL
+    /// the caller or the bookmark handed over, not `rootURL`: a standardized copy does not carry the scope.
     private var scopedRoot: URL?
     /// The saved bookmark could not be resolved at launch (reinstall, re-signed build): the library fell back to the
     /// app's Documents folder until the user picks the folder again (F025).
@@ -203,7 +204,7 @@ final class FolderLibrary: LibraryService {
         self.device = clock.deviceHex
         let resolved = LibrarySettings.resolveRoot(settings, defaultRoot: defaultRoot.standardizedFileURL)
         rootURL = resolved.url
-        scopedRoot = resolved.scoped ? resolved.url : nil
+        scopedRoot = resolved.scope
         rootUnavailable = resolved.failed
         prefs = LibraryPrefs(device: clock.deviceHex, clock: clock,
                              directory: resolved.url.appendingPathComponent(NibFormat.libraryDirectory, isDirectory: true))
@@ -228,7 +229,8 @@ final class FolderLibrary: LibraryService {
         return p == h || p.hasPrefix(h + "/")
     }
 
-    private var cacheURL: URL {
+    /// The cached catalog of this library root in Application Support.
+    var cacheURL: URL {
         cacheDirectory.appendingPathComponent("catalog-" + LibraryIDs.key(rootURL.standardizedFileURL.path) + ".json")
     }
 
@@ -299,11 +301,9 @@ final class FolderLibrary: LibraryService {
         }
         subscriptions.append(events.subscribe { [weak self] e in
             guard e.type == NibEventType.docOpened, let doc = e.doc else { return }
-            if Thread.isMainThread {
-                MainActor.assumeIsolated { self?.migrateLegacy(doc) }
-            } else {
-                Task { @MainActor in self?.migrateLegacy(doc) }
-            }
+            // `doc.opened` is emitted while the workspace loads the head, possibly inside a transaction: rename the
+            // package on the next turn of the main actor, not in the middle of that load.
+            Task { @MainActor in self?.migrateLegacy(doc) }
         })
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil,
@@ -458,6 +458,11 @@ final class FolderLibrary: LibraryService {
     func renameItem(_ id: NibID, to title: String) throws -> String {
         ensureLoaded()
         guard let e = catalog.entry(id: id) else { throw NibError.notFound("library item \(id.raw)") }
+        guard !e.inTrash else {
+            // Items in the Trash keep the name they are recovered under (Goodnotes offers no rename there either).
+            throw NibError(.invalidParams, "'\(e.node.title)' is in the Trash", path: "$.ref",
+                           hint: "recover it first with trash.recover")
+        }
         let old = url(of: e)
         let base = FileNames.sanitize(title, fallback: e.node.title)
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
@@ -477,11 +482,8 @@ final class FolderLibrary: LibraryService {
         ensureLoaded()
         guard let e = catalog.entry(id: id) else { throw NibError.notFound("library item \(id.raw)") }
         if e.inTrash {
-            guard e.trashTop else {
-                throw NibError(.invalidParams, "'\(e.node.title)' is inside a trashed folder",
-                               hint: "recover the folder with trash.recover")
-            }
-            try restore(id, to: folder)
+            // Moving out of the Trash recovers into the folder asked for; no folder is the library root.
+            try restore(id, target: .folder(folder))
             return
         }
         let destination = try directory(of: folder)
@@ -578,31 +580,36 @@ final class FolderLibrary: LibraryService {
         closeDocuments(under: e)
         try FileOps.createDirectory(trashURL)
         let old = url(of: e)
+        let title = e.node.title
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
-        let name = FileNames.unique(e.node.title, ext: ext, in: trashURL)
+        let name = FileNames.unique(title, ext: ext, in: trashURL)
         let new = trashURL.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
         try moveItem(old, to: new)
         do {
-            try recordTrash(e, at: new, from: from, folder: fromFolder, at: now)
+            try recordTrash(e, at: new, from: from, folder: fromFolder, title: title, at: now)
         } catch {
-            log.error("could not record where \(e.node.title, privacy: .private) came from: \(error.localizedDescription, privacy: .public)")
+            log.error("could not record where \(title, privacy: .private) came from: \(error.localizedDescription, privacy: .public)")
         }
         relocate(e, to: new, inTrash: true, trashTop: true, parent: fromFolder) { entry in
             entry.trashedFrom = from
             entry.trashedFromFolder = fromFolder
+            entry.trashedTitle = title
+            entry.node.title = title
             entry.node.trashedAt = now
         }
         changed([e.ref])
     }
 
-    /// Writes where a trashed item came from into its head (`meta.trashedFrom`) or folder record.
-    private func recordTrash(_ e: CatalogEntry, at url: URL, from: String, folder: FolderID?, at time: Double) throws {
+    /// Writes where a trashed item came from and its name into its head (`meta.trashedFrom`) or folder record.
+    private func recordTrash(_ e: CatalogEntry, at url: URL, from: String, folder: FolderID?, title: String,
+                             at time: Double) throws {
         if e.isDocument {
             try PackageIO.updateHead(url, device: device, clock: clock) { head in
                 head.meta.trashedFrom = from
                 var ext = head.meta.ext ?? [:]
                 ext[LibraryLayout.trashedAtKey] = .number(time)
                 ext[LibraryLayout.trashedFromFolderKey] = folder.map { .string($0.raw) }
+                ext[LibraryLayout.trashedTitleKey] = .string(title)
                 head.meta.ext = ext
             }
         } else {
@@ -610,6 +617,7 @@ final class FolderLibrary: LibraryService {
                 r.trashedFrom = from
                 r.trashedFromFolder = folder
                 r.trashedAt = time
+                r.trashedTitle = title
             }
         }
     }
@@ -621,6 +629,7 @@ final class FolderLibrary: LibraryService {
                 head.meta.trashedFrom = nil
                 head.meta.ext?[LibraryLayout.trashedAtKey] = nil
                 head.meta.ext?[LibraryLayout.trashedFromFolderKey] = nil
+                head.meta.ext?[LibraryLayout.trashedTitleKey] = nil
                 if head.meta.ext?.isEmpty == true { head.meta.ext = nil }
             }
         } else {
@@ -628,44 +637,63 @@ final class FolderLibrary: LibraryService {
                 r.trashedFrom = nil
                 r.trashedFromFolder = nil
                 r.trashedAt = nil
+                r.trashedTitle = nil
             }
         }
     }
 
+    /// Where `restore` puts an item: where it came from, or a folder the caller names (nil = the library root).
+    enum RestoreTarget: Equatable {
+        case original
+        case folder(FolderID?)
+    }
+
+    /// `LibraryService.restore`: nil = where the item came from.
     func restore(_ id: NibID, to folder: FolderID?) throws {
+        try restore(id, target: folder.map { .folder($0) } ?? .original)
+    }
+
+    /// Recovers a trashed item under the name it had before, back where it came from (or into the target folder).
+    /// An item inside a trashed folder can be taken out on its own: it goes to the target folder, else the root.
+    /// A live item is moved into an explicit target folder.
+    func restore(_ id: NibID, target: RestoreTarget) throws {
         ensureLoaded()
         guard let e = catalog.entry(id: id) else { throw NibError.notFound("library item \(id.raw)") }
         guard e.inTrash else {
-            if let f = folder, f != e.node.parent { try move(id, to: f) }
+            if case .folder(let f) = target, f != e.node.parent { try move(id, to: f) }
             return
         }
-        guard e.trashTop else {
-            throw NibError(.invalidParams, "'\(e.node.title)' is inside a trashed folder", hint: "recover the folder instead")
-        }
-        let (destination, parent) = try restoreDestination(e, requested: folder)
+        let (destination, parent) = try restoreDestination(e, target: target)
         closeDocuments(under: e)
         let old = url(of: e)
         let ext: String? = e.isDocument ? NibFormat.packageExtension : nil
-        let name = FileNames.unique(e.node.title, ext: ext, in: destination)
+        let title = e.trashTop ? e.originalTitle : e.node.title
+        let name = FileNames.unique(title, ext: ext, in: destination)
         let new = destination.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
+        try pinFolderIDs(under: e)
         try moveItem(old, to: new)
-        do {
-            try clearTrash(e, at: new)
-        } catch {
-            log.error("could not clear the trash record of \(e.node.title, privacy: .private): \(error.localizedDescription, privacy: .public)")
+        if e.trashTop {
+            do {
+                try clearTrash(e, at: new)
+            } catch {
+                log.error("could not clear the trash record of \(title, privacy: .private): \(error.localizedDescription, privacy: .public)")
+            }
         }
         relocate(e, to: new, inTrash: false, trashTop: false, parent: parent) { entry in
             entry.trashedFrom = nil
             entry.trashedFromFolder = nil
+            entry.trashedTitle = nil
             entry.node.trashedAt = nil
         }
         changed([e.ref])
     }
 
-    /// Where a recovered item goes: the requested folder, else the live folder it was trashed from (by id, so a renamed
-    /// or moved folder still gets it back), else the folder at its old path, else the library root.
-    private func restoreDestination(_ e: CatalogEntry, requested: FolderID?) throws -> (URL, FolderID?) {
-        if let f = requested { return (try directory(of: f), f) }
+    /// Where a recovered item goes: the target folder, else the live folder it was trashed from (by id, so a renamed
+    /// or moved folder still gets it back), else the folder at its old path, else the library root. An item inside a
+    /// trashed folder has no place of its own to go back to: the root.
+    private func restoreDestination(_ e: CatalogEntry, target: RestoreTarget) throws -> (URL, FolderID?) {
+        if case .folder(let f) = target { return (try directory(of: f), f) }
+        guard e.trashTop else { return (rootURL, nil) }
         if let original = e.trashedFromFolder, let f = catalog.entry(id: original), f.isFolder, !f.inTrash {
             return (url(of: f), f.node.id)
         }
@@ -763,12 +791,28 @@ final class FolderLibrary: LibraryService {
 
     // MARK: LibraryService — refresh and root
 
+    /// A synchronous rescan (after sync, import or repair). Incremental while the cached catalog file exists; when it
+    /// is gone (deleted by a repair, never written) every head and folder record is read again and the file is
+    /// written anew. Either way ids stay with the paths that held them.
     func refresh() {
+        let rebuild = !FileManager.default.fileExists(atPath: cacheURL.path)
         loaded = true
-        let entries = scanner(previous: catalog.byPath).scan()
-        apply(entries)
+        var job = scanner(previous: catalog.byPath)
+        job.reuse = !rebuild
+        apply(job.scan())
+        scheduleCacheSave()
         let changedNames = prefs.reload()
         postSettingsChanges(changedNames)
+    }
+
+    /// Reads every package head and folder record again (library repair), keeping ids with the paths that held them.
+    func rebuild() {
+        loaded = true
+        var job = scanner(previous: catalog.byPath)
+        job.reuse = false
+        apply(job.scan())
+        saveCacheNow()
+        postSettingsChanges(prefs.reload())
     }
 
     /// An incremental rescan off the main actor (launch, foreground). Applied only when no change happened meanwhile.
@@ -817,11 +861,13 @@ final class FolderLibrary: LibraryService {
     }
 
     func setRoot(_ url: URL) throws {
+        // The scope is opened on the URL object handed over (a picker's or a resolved bookmark's URL carries it; a
+        // standardized copy does not); paths are compared and built on the standardized URL.
         let target = url.standardizedFileURL
-        let scoped = target.startAccessingSecurityScopedResource()
+        let scoped = url.startAccessingSecurityScopedResource()
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            if scoped { target.stopAccessingSecurityScopedResource() }
+            if scoped { url.stopAccessingSecurityScopedResource() }
             throw NibError(.notFound, "the folder '\(target.lastPathComponent)' is not reachable",
                            hint: "choose the folder again with library.chooseFolder")
         }
@@ -829,9 +875,9 @@ final class FolderLibrary: LibraryService {
         var bookmark: Data?
         if !isDefault {
             do {
-                bookmark = try target.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+                bookmark = try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
             } catch {
-                if scoped { target.stopAccessingSecurityScopedResource() }
+                if scoped { url.stopAccessingSecurityScopedResource() }
                 throw NibError(.unavailable, "Nib cannot remember the folder '\(target.lastPathComponent)' (\(error.localizedDescription))",
                                hint: "choose another folder")
             }
@@ -840,25 +886,32 @@ final class FolderLibrary: LibraryService {
         for doc in workspace.loadedDocuments { workspace.close(doc) }
         prefs.flush()
         saveCacheNow()
-        if let old = scopedRoot, old != target { old.stopAccessingSecurityScopedResource() }
-        scopedRoot = scoped ? target : nil
+        // Every start is balanced by one stop, also when the same folder is chosen again.
+        scopedRoot?.stopAccessingSecurityScopedResource()
+        scopedRoot = scoped ? url : nil
         rootURL = target
         rootUnavailable = false
         LibrarySettings.saveRoot(bookmark, settings)
         try? FileOps.createDirectory(metadataURL)
         catalog.replaceAll(CatalogCache.load(cacheURL, root: rootURL.standardizedFileURL.path) ?? [])
+        locator.replaceAll(catalog.locations(root: rootURL))
         loaded = true
         generation &+= 1
         postSettingsChanges(prefs.setDirectory(metadataURL))
-        refresh()
         publishLocation()
+        refresh()
+        // Everything listed before belongs to another folder now, even when the new library's cached catalog matched
+        // the disk (then `refresh` found nothing to report).
+        events.emit(NibEventType.libraryChanged, payload: ["root": true, "refs": []])
     }
 
     // MARK: Legacy packages
 
-    /// A legacy `*.nib` package becomes a `.nibnote` package the first time it is opened.
+    /// A legacy `*.nib` package becomes a `.nibnote` package the first time it is opened (a coordinated move, after
+    /// the document's pending writes reached the old package).
     func migrateLegacy(_ doc: DocumentID) {
         guard let e = catalog.entry(id: doc), e.isDocument, e.legacy else { return }
+        if workspace.isLoaded(doc) { workspace.persistence.flush(doc) }
         let old = url(of: e)
         let dir = old.deletingLastPathComponent()
         let name = FileNames.unique(e.node.title, ext: NibFormat.packageExtension, in: dir)
@@ -1112,8 +1165,9 @@ struct CopyJob {
     }
 
     private func identifyDocument(_ pkg: URL, isTop: Bool, used: inout Set<NibID>) throws {
-        let current = PackageIO.readMergedHead(pkg, device: device)?.meta.id
-        if !collapseHeads, let id = current, NibID.isValid(id.raw), used.insert(id).inserted { return }
+        // A head without an id (hand-written, damaged) gets one written, like a copy of a document the library has.
+        let current = PackageIO.readSummary(PackageIO.headFiles(in: pkg, device: device))?.documentID
+        if !collapseHeads, let id = current, used.insert(id).inserted { return }
         var fresh = isTop ? (topID ?? NibID.make()) : NibID.make()
         while used.contains(fresh) { fresh = NibID.make() }
         used.insert(fresh)
@@ -1128,6 +1182,8 @@ struct CopyJob {
             head.meta.trashedFrom = nil
             head.meta.ext?[LibraryLayout.trashedAtKey] = nil
             head.meta.ext?[LibraryLayout.trashedFromFolderKey] = nil
+            head.meta.ext?[LibraryLayout.trashedTitleKey] = nil
+            if head.meta.ext?.isEmpty == true { head.meta.ext = nil }
         }
     }
 
@@ -1144,6 +1200,7 @@ struct CopyJob {
         record.trashedFrom = nil
         record.trashedFromFolder = nil
         record.trashedAt = nil
+        record.trashedTitle = nil
         record.rev = clock.tick()
         try FileOps.write(try FolderRecords.encode(record), to: dir.appendingPathComponent(LibraryLayout.folderFileName(device)))
         let own = LibraryLayout.folderFileName(device)

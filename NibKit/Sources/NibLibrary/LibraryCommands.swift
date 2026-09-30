@@ -14,25 +14,27 @@ enum LibrarySettings {
                          owner: owner, schema: .str("base64 bookmark data"), readOnly: true)
     }
 
-    /// The saved library folder with its security scope opened, else `defaultRoot`. `failed` = a bookmark exists but
-    /// no longer resolves (reinstall, re-signed build, provider gone): the user has to pick the folder again.
-    static func resolveRoot(_ settings: SettingsStore, defaultRoot: URL) -> (url: URL, scoped: Bool, failed: Bool) {
+    /// The saved library folder, else `defaultRoot`. `scope` is the URL object whose security scope was opened (the
+    /// one the bookmark resolved to: a standardized copy does not carry the scope, so it is kept to stop it later).
+    /// `failed` = a bookmark exists but no longer resolves (reinstall, re-signed build, provider gone): the user has
+    /// to pick the folder again.
+    static func resolveRoot(_ settings: SettingsStore, defaultRoot: URL) -> (url: URL, scope: URL?, failed: Bool) {
         let saved = settings.get(rootBookmark)
-        guard !saved.isEmpty, let data = Data(base64Encoded: saved) else { return (defaultRoot, false, false) }
+        guard !saved.isEmpty, let data = Data(base64Encoded: saved) else { return (defaultRoot, nil, false) }
         var stale = false
         guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) else {
-            return (defaultRoot, false, true)
+            return (defaultRoot, nil, true)
         }
         let scoped = url.startAccessingSecurityScopedResource()
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             if scoped { url.stopAccessingSecurityScopedResource() }
-            return (defaultRoot, false, true)
+            return (defaultRoot, nil, true)
         }
         if stale, let fresh = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
             saveRoot(fresh, settings)
         }
-        return (url.standardizedFileURL, scoped, false)
+        return (url.standardizedFileURL, scoped ? url : nil, false)
     }
 
     /// nil = the default folder (the app's Documents).
@@ -108,6 +110,12 @@ enum LibraryRefs {
             throw NibError(.invalidParams, "'\(s)' is not a folder ref", path: path, hint: "use folder:<id> from library.list")
         }
         return NibID(s)
+    }
+
+    /// The caller named the library root explicitly ("lib" or "library"), as opposed to leaving the folder out.
+    static func namesRoot(_ ref: String?) -> Bool {
+        guard let s = ref?.trimmingCharacters(in: .whitespaces) else { return false }
+        return s == "lib" || s == "library"
     }
 
     static func ref(_ node: LibraryNode) -> String {
@@ -398,6 +406,8 @@ struct DocCreate: NibCommand {
         var title: String
         var folder: String?
         var pages: [String]
+        /// Text documents: the first block (the heading), so a caller can fill it in.
+        var blocks: [String]?
     }
 
     static let examples: [JSONValue] = [
@@ -453,14 +463,18 @@ struct DocCreate: NibCommand {
         let folderRef = folder.map { NodeRef.folder($0).description }
         if ctx.dryRun {
             // A preview (AI, plugin.run) creates nothing.
-            return Output(ref: NodeRef.document(id).description, title: title, folder: folderRef,
-                          pages: content.livePages.map { NodeRef.page(id, $0.id).description })
+            return output(content, id: id, title: title, folder: folderRef)
         }
         let created = try library.createDocument(content, title: title, in: folder)
-        let ref = NodeRef.document(created).description
-        LibraryEvents.changed(ctx, library, [ref])
-        return Output(ref: ref, title: library.node(created)?.title ?? title, folder: folderRef,
-                      pages: content.livePages.map { NodeRef.page(created, $0.id).description })
+        LibraryEvents.changed(ctx, library, [NodeRef.document(created).description])
+        return output(content, id: created, title: library.node(created)?.title ?? title, folder: folderRef)
+    }
+
+    static func output(_ content: DocumentContent, id: DocumentID, title: String, folder: String?) -> Output {
+        let blocks = content.liveBlocks.map { NodeRef.block(id, $0.id).description }
+        return Output(ref: NodeRef.document(id).description, title: title, folder: folder,
+                      pages: content.livePages.map { NodeRef.page(id, $0.id).description },
+                      blocks: blocks.isEmpty ? nil : blocks)
     }
 
     /// A zoom-adaptive whiteboard background when the templates are installed, else the paper, else blank (TemplateIDs).
@@ -1078,7 +1092,15 @@ struct LibraryMove: NibCommand {
         var moved: [String] = []
         for (i, ref) in p.refs.enumerated() {
             let node = try LibraryRefs.node(ref, library, path: "$.refs[\(i)]")
-            if !ctx.dryRun { try library.move(node.id, to: folder) }
+            if !ctx.dryRun {
+                if !(library is FolderLibrary), LibraryRefs.isTrashed(node.id, library) {
+                    // Moving out of the Trash recovers into the folder (the folder library does this in `move`).
+                    try library.restore(node.id, to: folder)
+                    if folder == nil { try library.move(node.id, to: nil) }
+                } else {
+                    try library.move(node.id, to: folder)
+                }
+            }
             moved.append(LibraryRefs.ref(node))
         }
         LibraryEvents.changed(ctx, library, moved)
@@ -1259,15 +1281,17 @@ struct TrashRecover: NibCommand {
         id: "trash.recover", title: "Recover",
         summary: "Restore trashed documents and folders to where they were (or into folder), and trashed pages to their document.",
         params: .obj(["refs": .arr(.str("doc:<id>, folder:<id> or page:<doc>/<page> from trash.list")),
-                      "folder": .str("folder:<id> to recover documents and folders into; omit for their original place")],
+                      "folder": .str("folder:<id> (or \"lib\" for the library root) to recover documents and folders into; omit for their original place")],
                      required: ["refs"]),
-        examples: [["refs": ["doc:FIXTUREDOC03"]], ["refs": ["doc:FIXTUREDOC03"], "folder": "folder:FIXTUREFLD01"]],
+        examples: [["refs": ["doc:FIXTUREDOC03"]], ["refs": ["doc:FIXTUREDOC03"], "folder": "folder:FIXTUREFLD01"],
+                   ["refs": ["doc:FIXTUREDOC03"], "folder": "lib"]],
         effect: .library, target: .library)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let library = try ctx.services.require(ctx.services.library, "the library")
         guard !p.refs.isEmpty else { throw NibError.invalid("refs must name at least one trashed item", path: "$.refs") }
         let folder = try LibraryRefs.folder(p.folder, path: "$.folder")
+        let intoRoot = folder == nil && LibraryRefs.namesRoot(p.folder)
         var recovered: [String] = []
         var skipped: [String] = []
         var pages: [DocumentID: [String]] = [:]
@@ -1283,13 +1307,20 @@ struct TrashRecover: NibCommand {
                 skipped.append(LibraryRefs.ref(node))
                 continue
             }
-            if !ctx.dryRun { try library.restore(node.id, to: folder) }
+            if !ctx.dryRun {
+                if let folders = library as? FolderLibrary {
+                    try folders.restore(node.id, target: folder != nil || intoRoot ? .folder(folder) : .original)
+                } else {
+                    try library.restore(node.id, to: folder)
+                    if intoRoot { try library.move(node.id, to: nil) }
+                }
+            }
             recovered.append(LibraryRefs.ref(node))
         }
         LibraryEvents.changed(ctx, library, recovered)
         for doc in pageOrder {
             let refs = pages[doc] ?? []
-            _ = try await ctx.execute("page.restore", ["pages": .array(refs.map { .string($0) })])
+            _ = try await ctx.execute(CommandIDs.pageRestore, ["pages": .array(refs.map { .string($0) })])
             recovered += refs
         }
         return Output(recovered: recovered, skipped: skipped)
@@ -1324,8 +1355,8 @@ struct TrashDeletePermanently: NibCommand {
                 continue
             }
             let node = try LibraryRefs.node(ref, library, path: "$.refs[\(i)]")
-            let top = (library as? FolderLibrary)?.entry(node.id)?.trashTop ?? (node.trashedAt != nil)
-            guard top else {
+            // Anything in the Trash, also an item inside a trashed folder.
+            guard LibraryRefs.isTrashed(node.id, library) else {
                 throw NibError(.invalidParams, "'\(node.title)' is not in the Trash", path: "$.refs[\(i)]",
                                hint: "move it to the Trash first with library.trash")
             }
@@ -1339,7 +1370,7 @@ struct TrashDeletePermanently: NibCommand {
         LibraryEvents.changed(ctx, library, deleted)
         for doc in pageOrder {
             let refs = pages[doc] ?? []
-            _ = try await ctx.execute("page.purge", ["pages": .array(refs.map { .string($0) })])
+            _ = try await ctx.execute(CommandIDs.pagePurge, ["pages": .array(refs.map { .string($0) })])
             deleted += refs
         }
         return Output(deleted: deleted)
@@ -1369,7 +1400,7 @@ struct TrashEmpty: NibCommand {
         for doc in order {
             let refs = byDoc[doc] ?? []
             do {
-                _ = try await ctx.execute("page.purge", ["pages": .array(refs.map { .string($0) })])
+                _ = try await ctx.execute(CommandIDs.pagePurge, ["pages": .array(refs.map { .string($0) })])
                 pages += refs.count
             } catch let e as NibError where e.code == .unavailable {
                 break

@@ -766,6 +766,12 @@ final class NibLibraryTests: XCTestCase {
                        "a *.nib folder without heads is just a folder")
         await lib.library.start()
         _ = try lib.h.app.workspace.content("LEGACYDOC001")
+        // The rename runs on the main actor's next turn, not inside the workspace load that emitted doc.opened.
+        var waited = 0
+        while !lib.exists("Old Notes.nibnote") && waited < 100 {
+            try await Task.sleep(nanoseconds: 20_000_000)
+            waited += 1
+        }
         XCTAssertTrue(lib.exists("Old Notes.nibnote"))
         XCTAssertFalse(lib.exists("Old Notes.nib"))
         XCTAssertEqual(lib.library.entry("LEGACYDOC001")?.legacy, false)
@@ -960,5 +966,158 @@ final class NibLibraryTests: XCTestCase {
         try await lib.run("trash.deletePermanently", ["refs": [.string("doc:\(d.raw)")]])
         XCTAssertEqual(events.count, 10)
         XCTAssertTrue(events.allSatisfy { $0.payload?["refs"]?.arrayValue?.isEmpty == false })
+    }
+
+    // MARK: Trash names, explicit destinations, nested items
+
+    func testRecoverRestoresTheOriginalNameAfterAClashInTheTrash() async throws {
+        let lib = try makeLibrary()
+        let a = folderID(try await lib.run("folder.create", ["title": "Maths"]))
+        let b = folderID(try await lib.run("folder.create", ["title": "Physics"]))
+        let first = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Notes", "folder": .string("folder:\(a.raw)")]))
+        let second = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Notes", "folder": .string("folder:\(b.raw)")]))
+        try await lib.run("library.trash", ["refs": [.string("doc:\(first.raw)")]])
+        try await lib.run("library.trash", ["refs": [.string("doc:\(second.raw)")]])
+        XCTAssertTrue(lib.exists(".nib-library/trash/Notes.nibnote"))
+        XCTAssertTrue(lib.exists(".nib-library/trash/Notes 2.nibnote"), "the Trash folder needs two file names")
+        XCTAssertEqual(Set(lib.library.trashedNodes().map { $0.title }), ["Notes"], "both are listed under their own name")
+        lib.library.refresh()
+        XCTAssertEqual(lib.library.node(second)?.title, "Notes", "a rescan of the disk lists the original name too")
+        do {
+            try await lib.run("library.rename", ["ref": .string("doc:\(second.raw)"), "title": "Other"])
+            XCTFail("items in the Trash are recovered, not renamed")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+        }
+        try await lib.run("trash.recover", ["refs": [.string("doc:\(second.raw)"), .string("doc:\(first.raw)")]])
+        XCTAssertTrue(lib.exists("Physics/Notes.nibnote"), "recovered under its own name, not the Trash's")
+        XCTAssertTrue(lib.exists("Maths/Notes.nibnote"))
+        XCTAssertEqual(lib.library.node(second)?.title, "Notes")
+        XCTAssertNil(lib.head(second)?.meta.ext?[LibraryLayout.trashedTitleKey], "the trash record is cleared")
+    }
+
+    func testMovingOutOfTheTrashAndRecoveringIntoTheRoot() async throws {
+        let lib = try makeLibrary()
+        let f = folderID(try await lib.run("folder.create", ["title": "Chemistry"]))
+        let a = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Acids", "folder": .string("folder:\(f.raw)")]))
+        let b = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Bases", "folder": .string("folder:\(f.raw)")]))
+        try await lib.run("library.trash", ["refs": [.string("doc:\(a.raw)"), .string("doc:\(b.raw)")]])
+        try await lib.run("library.move", ["refs": [.string("doc:\(a.raw)")]])
+        XCTAssertTrue(lib.exists("Acids.nibnote"), "library.move without a folder takes an item out of the Trash into the root")
+        XCTAssertNil(lib.library.node(a)?.parent)
+        XCTAssertNil(lib.library.node(a)?.trashedAt)
+        try await lib.run("trash.recover", ["refs": [.string("doc:\(b.raw)")], "folder": "lib"])
+        XCTAssertTrue(lib.exists("Bases.nibnote"), "\"lib\" recovers into the root, not the original folder")
+        XCTAssertNil(lib.head(b)?.meta.trashedFrom)
+    }
+
+    func testAnItemInsideATrashedFolderCanBeRecoveredOnItsOwn() async throws {
+        let lib = try makeLibrary()
+        let f = folderID(try await lib.run("folder.create", ["title": "Old Term"]))
+        let target = folderID(try await lib.run("folder.create", ["title": "Keep"]))
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Essay", "folder": .string("folder:\(f.raw)")]))
+        let e = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Draft", "folder": .string("folder:\(f.raw)")]))
+        let scrap = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Scrap", "folder": .string("folder:\(f.raw)")]))
+        try await lib.run("library.trash", ["refs": [.string("folder:\(f.raw)")]])
+        try await lib.run("trash.deletePermanently", ["refs": [.string("doc:\(scrap.raw)")]])
+        XCTAssertFalse(lib.exists(".nib-library/trash/Old Term/Scrap.nibnote"), "an item inside a trashed folder can be deleted")
+        XCTAssertNil(lib.library.node(scrap))
+        try await lib.run("trash.recover", ["refs": [.string("doc:\(d.raw)")]])
+        XCTAssertTrue(lib.exists("Essay.nibnote"), "its folder is in the Trash, so it goes to the root")
+        XCTAssertTrue(lib.exists(".nib-library/trash/Old Term/Draft.nibnote"), "the rest of the folder stays in the Trash")
+        try await lib.run("trash.recover", ["refs": [.string("doc:\(e.raw)")], "folder": .string("folder:\(target.raw)")])
+        XCTAssertTrue(lib.exists("Keep/Draft.nibnote"))
+        XCTAssertEqual(lib.library.node(e)?.parent, target)
+        XCTAssertEqual(lib.library.trashedNodes().map { $0.id }, [f])
+        lib.library.refresh()
+        XCTAssertEqual(lib.library.node(e)?.path, "Keep/Draft.nibnote")
+    }
+
+    // MARK: Ids, repair and switching
+
+    func testAHeadWithoutAnIDGetsAStableIDAndAnImportWritesOne() async throws {
+        let lib = try makeLibrary()
+        let pkg = lib.root.appendingPathComponent("Handmade.nibnote", isDirectory: true)
+        try FileManager.default.createDirectory(at: pkg, withIntermediateDirectories: true)
+        try Data(#"{"meta":{"kind":"studySet"}}"#.utf8)
+            .write(to: pkg.appendingPathComponent("doc.0000000b.json"))
+        lib.library.refresh()
+        let first = try XCTUnwrap(lib.library.allNodes().first { $0.title == "Handmade" })
+        XCTAssertEqual(first.documentKind, .studySet)
+        lib.library.rebuild()
+        lib.library.refresh()
+        XCTAssertEqual(lib.library.allNodes().first { $0.title == "Handmade" }?.id, first.id,
+                       "a head that names no id is not given a random one on every scan")
+
+        let outside = FileManager.default.temporaryDirectory.appendingPathComponent("nibimport-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let external = outside.appendingPathComponent("Loose.nibnote", isDirectory: true)
+        try FileManager.default.copyItem(at: pkg, to: external)
+        let imported = try lib.library.importPackage(at: external, into: nil)
+        XCTAssertEqual(lib.head(imported)?.meta.id, imported, "the imported copy gets an id written into its head")
+    }
+
+    func testRefreshRebuildsADeletedCatalog() async throws {
+        let lib = try makeLibrary()
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Rebuilt"]))
+        lib.library.saveCacheNow()
+        lib.library.waitForIO()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: lib.library.cacheURL.path))
+        try FileManager.default.removeItem(at: lib.library.cacheURL)
+        // Another device changed the head without the package folder's date changing (an incremental scan keeps its
+        // cached entry); the rebuild after the catalog was deleted reads it again.
+        let pkg = try XCTUnwrap(lib.url(d))
+        let stamp = try pkg.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        var theirs = try XCTUnwrap(lib.head(d))
+        theirs.meta.favorite = true
+        theirs.meta.rev = Rev(wallMs: theirs.meta.rev.wallMs + 1, counter: 0, device: 11)
+        try PackageIO.encoder().encode(theirs).write(to: pkg.appendingPathComponent("doc.0000000b.json"))
+        if let stamp = stamp { try FileManager.default.setAttributes([.modificationDate: stamp], ofItemAtPath: pkg.path) }
+        lib.library.refresh()
+        XCTAssertEqual(lib.library.node(d)?.favorite, true)
+        XCTAssertEqual(lib.library.node(d)?.id, d)
+        lib.library.saveCacheNow()
+        lib.library.waitForIO()
+        XCTAssertNotNil(CatalogCache.load(lib.library.cacheURL, root: lib.root.standardizedFileURL.path),
+                        "the catalog is written again")
+    }
+
+    func testSwitchingLibrariesAlwaysAnnouncesTheChange() async throws {
+        let lib = try makeLibrary()
+        try await lib.run("doc.create", ["kind": "notebook", "title": "Here"])
+        lib.library.saveCacheNow()
+        lib.library.waitForIO()
+        var events: [NibEvent] = []
+        let sub = lib.h.app.events.subscribe { e in if e.type == NibEventType.libraryChanged { events.append(e) } }
+        defer { sub.cancel() }
+        try lib.library.setRoot(lib.root)
+        XCTAssertFalse(events.isEmpty, "choosing a library folder, even the same one, is a catalog change")
+        XCTAssertEqual(lib.library.allNodes().map { $0.title }, ["Here"])
+        XCTAssertNotNil(lib.h.app.services.packages.url(lib.library.allNodes()[0].id))
+    }
+
+    /// A cached entry read back through JSON, as `CatalogCache.load` reads it.
+    private func throughJSON(_ entry: CatalogEntry) throws -> CatalogEntry? {
+        let data = try JSONSerialization.data(withJSONObject: CatalogCache.row(entry))
+        return (try JSONSerialization.jsonObject(with: data) as? [Any]).flatMap { CatalogCache.entry($0) }
+    }
+
+    func testCacheRowsRoundTrip() throws {
+        var node = LibraryNode(id: "ROUNDTRIP001", kind: .document, title: "Notes", path: ".nib-library/trash/Notes 2.nibnote",
+                               parent: "PARENTFOLDR1", documentKind: .whiteboard, modified: 5, created: 4, favorite: true,
+                               locked: true, pageCount: 3, sync: .downloading, trashedAt: 9)
+        node.style = nil
+        let entry = CatalogEntry(node: node, parentPath: ".nib-library/trash", inTrash: true, trashTop: true, stamp: 2,
+                                 signature: "doc.00000007.json:1:2", legacy: true, derivedID: false, trashedFrom: "Maths",
+                                 trashedFromFolder: "PARENTFOLDR1",
+                                 trashedPages: [TrashedPage(page: "PAGE00000001", trashedAt: 7)],
+                                 headID: "ROUNDTRIP001", trashedTitle: "Notes")
+        XCTAssertEqual(try throughJSON(entry), entry)
+        var folder = CatalogEntry(node: LibraryNode(id: "FOLDERROW001", kind: .folder, title: "F", path: "F",
+                                                    style: FolderStyle(color: RGBA(hex: "#FF9500"), icon: "atom", favorite: true)),
+                                  parentPath: "", hasRecord: true)
+        folder.node.favorite = true
+        XCTAssertEqual(try throughJSON(folder), folder)
     }
 }

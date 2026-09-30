@@ -20,6 +20,8 @@ enum LibraryLayout {
     /// `DocumentMeta.ext` keys the library keeps on a trashed document next to `meta.trashedFrom`.
     static let trashedAtKey = "library.trashedAt"
     static let trashedFromFolderKey = "library.trashedFromFolder"
+    /// The name a document had before it went to the Trash (its package there may carry a number after a clash).
+    static let trashedTitleKey = "library.trashedTitle"
 
     static func headFileName(_ device: String) -> String { headPrefix + device + jsonSuffix }
     static func folderFileName(_ device: String) -> String { folderPrefix + device + jsonSuffix }
@@ -99,6 +101,8 @@ struct FolderRecord: Codable, Equatable {
     var trashedFromFolder: FolderID?
     /// Unix seconds.
     var trashedAt: Double?
+    /// The name it had before it went to the Trash (restored under this name).
+    var trashedTitle: String?
 
     init(id: FolderID, rev: Rev, style: FolderStyle = FolderStyle()) {
         self.id = id
@@ -109,11 +113,14 @@ struct FolderRecord: Codable, Equatable {
         self.trashedFrom = nil
         self.trashedFromFolder = nil
         self.trashedAt = nil
+        self.trashedTitle = nil
     }
 
     var style: FolderStyle { FolderStyle(color: color, icon: icon, favorite: favorite) }
 
-    enum CodingKeys: String, CodingKey { case id, rev, color, icon, favorite, trashedFrom, trashedFromFolder, trashedAt }
+    enum CodingKeys: String, CodingKey {
+        case id, rev, color, icon, favorite, trashedFrom, trashedFromFolder, trashedAt, trashedTitle
+    }
 
     /// Lenient: only `id` is required (a colour that does not parse is dropped, not fatal).
     init(from decoder: Decoder) throws {
@@ -126,6 +133,7 @@ struct FolderRecord: Codable, Equatable {
         trashedFrom = try c.decodeIfPresent(String.self, forKey: .trashedFrom)
         trashedFromFolder = try c.decodeIfPresent(FolderID.self, forKey: .trashedFromFolder)
         trashedAt = try c.decodeIfPresent(Double.self, forKey: .trashedAt)
+        trashedTitle = try? c.decodeIfPresent(String.self, forKey: .trashedTitle)
     }
 
     /// The record with the highest (effective) revision; the first one wins ties.
@@ -169,10 +177,14 @@ enum FolderRecords {
 struct HeadSummary: Decodable {
     var meta: DocumentMeta
     var pages: [PageRecord]
+    /// The head names a usable document id. `DocumentMeta` decodes a missing id as a fresh random one, which must not
+    /// become the catalog id (it would change with every scan).
+    var hasID: Bool
 
-    init(meta: DocumentMeta, pages: [PageRecord]) {
+    init(meta: DocumentMeta, pages: [PageRecord], hasID: Bool = true) {
         self.meta = meta
         self.pages = pages
+        self.hasID = hasID
     }
 
     init(_ content: DocumentContent) {
@@ -180,19 +192,28 @@ struct HeadSummary: Decodable {
     }
 
     enum CodingKeys: String, CodingKey { case meta, pages }
+    private enum MetaKeys: String, CodingKey { case id }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         meta = try c.decode(DocumentMeta.self, forKey: .meta)
         pages = try c.decodeIfPresent([PageRecord].self, forKey: .pages) ?? []
+        let raw = try? c.nestedContainer(keyedBy: MetaKeys.self, forKey: .meta).decodeIfPresent(String.self, forKey: .id)
+        hasID = raw.map { NibID.isValid($0) } ?? false
     }
+
+    /// The document id the head names, when it names a usable one.
+    var documentID: DocumentID? { hasID ? meta.id : nil }
 
     /// Last-writer-wins merge of device heads (meta: highest effective rev, first wins ties; pages by id and rev).
     static func merged(_ heads: [HeadSummary]) -> HeadSummary? {
         guard var out = heads.first else { return nil }
         let now = UInt64(Date().timeIntervalSince1970 * 1000)
         for h in heads.dropFirst() {
-            if h.meta.rev.effective(now: now) > out.meta.rev.effective(now: now) { out.meta = h.meta }
+            if h.meta.rev.effective(now: now) > out.meta.rev.effective(now: now) {
+                out.meta = h.meta
+                out.hasID = h.hasID
+            }
             out.pages = LWW.merge(out.pages, h.pages)
         }
         return out
@@ -393,11 +414,13 @@ struct CatalogEntry: Codable, Equatable {
     var trashedPages: [TrashedPage]
     /// Documents: the id in the merged head (differs from `node.id` for a second copy of a document).
     var headID: NibID?
+    /// A trashed item's name before it went to the Trash (its file there may carry a number after a name clash).
+    var trashedTitle: String?
 
     init(node: LibraryNode, parentPath: String, inTrash: Bool = false, trashTop: Bool = false, stamp: Double? = nil,
          signature: String? = nil, hasRecord: Bool = false, legacy: Bool = false, derivedID: Bool = false,
          trashedFrom: String? = nil, trashedFromFolder: FolderID? = nil, trashedPages: [TrashedPage] = [],
-         headID: NibID? = nil) {
+         headID: NibID? = nil, trashedTitle: String? = nil) {
         self.node = node
         self.parentPath = parentPath
         self.inTrash = inTrash
@@ -411,6 +434,7 @@ struct CatalogEntry: Codable, Equatable {
         self.trashedFromFolder = trashedFromFolder
         self.trashedPages = trashedPages
         self.headID = headID
+        self.trashedTitle = trashedTitle
     }
 
     var isDocument: Bool { node.kind == .document }
@@ -428,8 +452,12 @@ struct CatalogEntry: Codable, Equatable {
         trashedFrom = head.meta.trashedFrom
         trashedFromFolder = head.meta.ext?[LibraryLayout.trashedFromFolderKey]?.stringValue.map { NibID($0) }
         if let at = head.meta.ext?[LibraryLayout.trashedAtKey]?.doubleValue { node.trashedAt = at }
-        headID = head.meta.id
+        trashedTitle = head.meta.ext?[LibraryLayout.trashedTitleKey]?.stringValue
+        headID = head.documentID
     }
+
+    /// The title a trashed item is listed and recovered under: its name before the Trash, else its file name.
+    var originalTitle: String { trashedTitle.flatMap { $0.isEmpty ? nil : $0 } ?? node.title }
 
     static func isPaged(_ kind: DocumentKind) -> Bool { kind == .notebook || kind == .whiteboard }
 }
@@ -557,7 +585,7 @@ final class LibraryCatalog {
 /// every entry is a flat JSON array of primitives (see `row` / `entry`). Parsed with `JSONSerialization`, so loading
 /// 5,000 documents takes tens of milliseconds instead of a keyed `Codable` pass over every field.
 struct CatalogCache {
-    static let currentVersion = 2
+    static let currentVersion = 3
     var version: Int
     var root: String
     var entries: [CatalogEntry]
@@ -596,11 +624,12 @@ struct CatalogCache {
                 n.modified, n.created, n.favorite, n.locked, opt(n.pageCount), opt(n.style?.color?.hex),
                 opt(n.style?.icon), n.style != nil, opt(n.style?.favorite), n.sync.rawValue, opt(n.trashedAt),
                 e.parentPath, e.inTrash, e.trashTop, opt(e.stamp), opt(e.signature), e.hasRecord, e.legacy,
-                e.derivedID, opt(e.trashedFrom), opt(e.trashedFromFolder?.raw), pages, opt(e.headID?.raw)]
+                e.derivedID, opt(e.trashedFrom), opt(e.trashedFromFolder?.raw), pages, opt(e.headID?.raw),
+                opt(e.trashedTitle)]
     }
 
     static func entry(_ r: [Any]) -> CatalogEntry? {
-        guard r.count == 29, let id = r[0] as? String, let kindRaw = r[1] as? String,
+        guard r.count == 30, let id = r[0] as? String, let kindRaw = r[1] as? String,
               let kind = LibraryNodeKind(rawValue: kindRaw), let title = r[2] as? String, let path = r[3] as? String,
               let parentPath = r[17] as? String else { return nil }
         func string(_ i: Int) -> String? { r[i] as? String }
@@ -623,7 +652,7 @@ struct CatalogCache {
         var e = CatalogEntry(node: node, parentPath: parentPath, inTrash: bool(18), trashTop: bool(19),
                              stamp: double(20), signature: string(21), hasRecord: bool(22), legacy: bool(23),
                              derivedID: bool(24), trashedFrom: string(25), trashedFromFolder: string(26).map { NibID($0) },
-                             headID: string(28).map { NibID($0) })
+                             headID: string(28).map { NibID($0) }, trashedTitle: string(29))
         if let flat = r[27] as? [Any] {
             var i = 0
             while i + 1 < flat.count {
@@ -650,6 +679,16 @@ struct CatalogScanner {
     let previous: [String: CatalogEntry]
     /// Skip the root's `Inbox` (the library lives in the app's Documents folder).
     let skipInbox: Bool
+    /// Keep the previous entry of a package or folder whose files are unchanged (false = read everything again, as a
+    /// repair does; `previous` still decides which path keeps an id claimed twice).
+    var reuse = true
+
+    init(root: URL, device: String, previous: [String: CatalogEntry], skipInbox: Bool) {
+        self.root = root
+        self.device = device
+        self.previous = previous
+        self.skipInbox = skipInbox
+    }
 
     static let keys: [URLResourceKey] = [.isDirectoryKey, .contentModificationDateKey, .creationDateKey, .fileSizeKey]
         + UbiquityState.resourceKeys
@@ -729,7 +768,7 @@ struct CatalogScanner {
         let signature = CatalogScanner.signature(styleFiles)
         let prev = previous[path].flatMap { $0.isFolder ? $0 : nil }
         var entry: CatalogEntry
-        if let p = prev, p.signature == signature {
+        if reuse, let p = prev, p.signature == signature {
             entry = p
         } else {
             let own = LibraryLayout.folderFileName(device)
@@ -749,8 +788,10 @@ struct CatalogScanner {
             entry.trashedFrom = record?.trashedFrom
             entry.trashedFromFolder = record?.trashedFromFolder
             entry.node.trashedAt = record?.trashedAt
+            entry.trashedTitle = record?.trashedTitle
         }
-        entry.node.title = url.lastPathComponent
+        entry.node.title = trashTop ? CatalogScanner.listedTitle(entry.trashedTitle, file: url.lastPathComponent)
+            : url.lastPathComponent
         entry.node.path = path
         entry.parentPath = parent
         entry.inTrash = inTrash
@@ -772,7 +813,7 @@ struct CatalogScanner {
         let ubiquity = UbiquityState(values)
         let stamp = values?.contentModificationDate?.timeIntervalSinceReferenceDate
         var entry: CatalogEntry
-        if var p = previous[path], p.isDocument, stamp != nil, p.stamp == stamp, p.legacy == legacy, !p.derivedID {
+        if reuse, var p = previous[path], p.isDocument, stamp != nil, p.stamp == stamp, p.legacy == legacy, !p.derivedID {
             p.node.sync = ubiquity.badge
             entry = p
         } else {
@@ -788,10 +829,11 @@ struct CatalogScanner {
             let summary = PackageIO.readSummary(files)
             let modified = files.compactMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
                 .max()?.timeIntervalSince1970
-            let node = LibraryNode(id: summary?.meta.id ?? prev?.node.id ?? LibraryIDs.derived("doc:" + path),
+            let headID = summary?.documentID
+            let node = LibraryNode(id: headID ?? prev?.node.id ?? LibraryIDs.derived("doc:" + path),
                                    kind: .document, title: title, path: path)
             entry = CatalogEntry(node: node, parentPath: parent, stamp: stamp, signature: CatalogScanner.signature(files),
-                                 legacy: legacy, derivedID: summary == nil && prev == nil)
+                                 legacy: legacy, derivedID: headID == nil && (prev == nil || prev?.derivedID == true))
             if let s = summary {
                 entry.apply(s)
             } else if let p = prev {
@@ -810,7 +852,7 @@ struct CatalogScanner {
                 entry.node.sync = summary == nil ? .downloading : ubiquity.badge
             }
         }
-        entry.node.title = title
+        entry.node.title = trashTop ? CatalogScanner.listedTitle(entry.trashedTitle, file: title) : title
         entry.node.path = path
         entry.parentPath = parent
         entry.inTrash = inTrash
@@ -840,6 +882,12 @@ struct CatalogScanner {
         var node = LibraryNode(id: LibraryIDs.derived("doc:" + path), kind: .document, title: title, path: path)
         node.sync = .downloading
         return CatalogEntry(node: node, parentPath: parent, inTrash: inTrash, trashTop: trashTop, derivedID: true)
+    }
+
+    /// What the Trash lists a trashed item as: the name it had before (its file there may carry a number).
+    static func listedTitle(_ trashed: String?, file: String) -> String {
+        guard let t = trashed, !t.isEmpty else { return file }
+        return t
     }
 
     static func signature(_ files: [URL]) -> String {
