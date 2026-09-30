@@ -283,7 +283,7 @@ enum ShareFiles {
 /// Reads one shared item into a file. Runs off the main thread (NSItemProvider calls back on its own queues).
 enum SharedItemLoader {
     static func load(_ provider: NSItemProvider, into dir: URL) async -> URL? {
-        if let typeID = fileTypeID(provider.registeredTypeIdentifiers),
+        if let typeID = fileTypeID(provider.registeredTypeIdentifiers, isFile: isFile(provider)),
            let url = await loadFile(provider, typeID: typeID, into: dir) {
             return url
         }
@@ -305,13 +305,28 @@ enum SharedItemLoader {
         return nil
     }
 
-    /// The best file type on offer: documents, images, archives and folders. Web addresses and plain or rich text
-    /// are handled on their own (a web page imports from its address, text as a page).
-    static func fileTypeID(_ ids: [String]) -> String? {
+    /// Generic text types: a selection shared from Notes, Mail or Safari, not a file (unless it comes with a name).
+    static let snippetTypes: Set<String> = [
+        UTType.text.identifier, UTType.plainText.identifier, UTType.utf8PlainText.identifier,
+        UTType.utf16PlainText.identifier, UTType.utf16ExternalPlainText.identifier, UTType.rtf.identifier,
+        UTType.flatRTFD.identifier,
+    ]
+
+    /// True for an item that is a file (shared from Files, Mail attachments): it has a file URL or a named file.
+    static func isFile(_ provider: NSItemProvider) -> Bool {
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) { return true }
+        guard let name = provider.suggestedName else { return false }
+        return !(name as NSString).pathExtension.isEmpty
+    }
+
+    /// The best file type on offer: documents, images, archives, folders and text files (CSV, TSV and TXT study-set
+    /// exports go to Nib as they are). Web addresses and text selections are handled on their own (a web page
+    /// imports from its address, a text selection as a page).
+    static func fileTypeID(_ ids: [String], isFile: Bool) -> String? {
         ids.first { id in
             guard let type = UTType(id) else { return false }
             if type.conforms(to: .url) { return false }
-            if type.conforms(to: .text) && !type.conforms(to: .html) { return false }
+            if snippetTypes.contains(id) && !isFile { return false }
             return type.conforms(to: .data) || type.conforms(to: .directory)
         }
     }

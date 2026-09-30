@@ -44,10 +44,12 @@ enum ImportFormats {
 
 // MARK: - Results and destinations
 
+/// A file that was not imported, with the error's code, message and what to do next.
 struct ImportFailure: Codable, Equatable {
     var url: String
     var code: String
     var message: String
+    var hint: String?
 }
 
 /// Result of `import.files` and `import.pick`.
@@ -151,6 +153,65 @@ struct ImportDestination: Equatable {
         }
         if dest.position == .start || dest.position == .end { dest.anchor = nil }
         return chosen ? dest : nil
+    }
+}
+
+/// What the window shows once an import finishes. Pure.
+enum ImportReveal: Equatable {
+    /// Scroll the open notebook to its first new page ("page:D/P").
+    case goToPage(String)
+    /// Open a document, at a page ("page:D/P") when pages went into it.
+    case open(DocumentID, page: String?)
+    /// Show a library folder (nil = the library root).
+    case showFolder(FolderID?)
+
+    /// Pages into a notebook: that notebook at its first new page. One new document: that document. One folder made
+    /// at the destination (a dropped folder, a zip holding one folder): that folder. Several: the destination folder.
+    static func plan(pages: [String], created: [DocumentID], topFolders: [FolderID], destination: ImportDestination,
+                     openDocument: DocumentID?) -> ImportReveal? {
+        if let doc = destination.doc {
+            guard let first = pages.first else { return nil }
+            return openDocument == doc ? .goToPage(first) : .open(doc, page: first)
+        }
+        if created.count == 1, topFolders.isEmpty { return .open(created[0], page: nil) }
+        if topFolders.count == 1 { return .showFolder(topFolders[0]) }
+        if !created.isEmpty || !topFolders.isEmpty { return .showFolder(destination.folder) }
+        return nil
+    }
+}
+
+/// User imports that arrive together and need the dialog: Open In delivers several files one `import.files` call
+/// each, so the first call waits briefly, the others join it, and one dialog asks about all of them. Every call
+/// returns the batch's result.
+@MainActor
+final class ImportBatch {
+    /// The batch still gathering files, per window.
+    static var gathering: [ObjectIdentifier: ImportBatch] = [:]
+    /// How long the first call waits for the others.
+    static let gatherNanoseconds: UInt64 = 350_000_000
+
+    private(set) var sources: [ImportSource]
+    private var waiters: [CheckedContinuation<ImportResult, Error>] = []
+
+    init(_ sources: [ImportSource]) {
+        self.sources = sources
+    }
+
+    var waiting: Int { waiters.count }
+
+    /// Adds `more` to the batch and waits until the call that owns it has imported everything.
+    func join(_ more: [ImportSource]) async throws -> ImportResult {
+        sources += more
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<ImportResult, Error>) in
+            waiters.append(continuation)
+        }
+    }
+
+    /// Hands the batch's outcome to every call that joined it.
+    func finish(_ outcome: Result<ImportResult, Error>) {
+        let pending = waiters
+        waiters = []
+        for w in pending { w.resume(with: outcome) }
     }
 }
 
@@ -260,6 +321,14 @@ enum StagingIO {
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
     }
 
+    /// `ctx.inputFile` downloads into `<tmp>/nib-downloads/<UUID>/<name>`; once the file is moved out, its folder goes.
+    static func removeDownloadFolder(of download: URL) {
+        let folder = download.deletingLastPathComponent()
+        guard folder.deletingLastPathComponent().lastPathComponent == "nib-downloads",
+              ImportLocations.isInside(folder, FileManager.default.temporaryDirectory) else { return }
+        try? FileManager.default.removeItem(at: folder)
+    }
+
     /// Moves (downloads Nib owns) or copies `source` into `dir` as `name`. File URLs are read through
     /// `NSFileCoordinator`, so Files providers (iCloud Drive, OneDrive…) download them first. No size limit: files are
     /// copied on disk, never read into memory here. Returns the copy and, when asked, a bookmark of the source.
@@ -338,6 +407,7 @@ final class ImportStaging {
         let staged = try await Task.detached(priority: .userInitiated) { () throws -> (url: URL, bookmark: Data?) in
             try StagingIO.copy(resolved, to: dir, name: name, move: downloaded, coordinated: isFile, bookmark: external)
         }.value
+        if downloaded { StagingIO.removeDownloadFolder(of: resolved) }
         var url = staged.url
         let isDirectory = StagingIO.isDirectory(url)
         let content = ctx.content
@@ -474,39 +544,88 @@ enum ImportEngine {
                         hint: "supported: \(known), folders and zipped folders")
     }
 
-    /// The whole of `import.files`: expand the share hand-off, ask where (user, no destination), stage, dispatch,
-    /// advance the insertion point file by file, keep import-in-place bookmarks and consume inbox copies.
+    /// The whole of `import.files`: expand the share hand-off, claim the inputs, ask where (user, no destination),
+    /// stage, dispatch, advance the insertion point file by file, keep import-in-place bookmarks and consume inbox
+    /// copies.
     static func perform(_ sources: [ImportSource], destination: ImportDestination?, ids: [String]?, ctx: CommandContext,
                         dialog: ImportDialogSession? = nil, reveal: Bool = false) async throws -> ImportResult {
-        var idQueue = try validatedIDs(ids)
+        let idQueue = try validatedIDs(ids)
         let library = try ctx.services.require(ctx.services.library, "the library")
+        if !ctx.principal.isUser, let i = sources.firstIndex(where: { ShareHandoff.isHandoffLink($0.original) }) {
+            throw NibError(.permissionDenied, "only the user can import what another app shared through the pasteboard",
+                           path: "$.urls[\(i)]")
+        }
+        if ctx.dryRun {
+            // Nothing is read, asked or written: library writes (new documents, folders) can't be rolled back.
+            var dest = destination ?? .libraryRoot
+            try validate(&dest, library: library, ctx: ctx)
+            return ImportResult(refs: [], pages: dest.doc == nil ? nil : [])
+        }
         let staging = try ImportStaging()
         defer { staging.cleanUp() }
 
-        var sources = try expandHandoff(sources, staging: staging, ctx: ctx)
-        guard !sources.isEmpty else { return ImportResult(refs: []) }            // the hand-off was already taken
-        var destination = destination
-        var session = dialog
-        if destination == nil, session == nil, ctx.principal.isUser, !ctx.dryRun,
-           sources.contains(where: { ImportFormats.needsDestination($0.name) }), let nav = await ImportUI.navigator(ctx) {
-            let ask = ImportDialogSession(navigator: nav, library: ctx.services.library, workspace: ctx.workspace,
-                                          session: ctx.activeSession, sources: sources, preset: nil)
-            guard let choice = await ask.choose() else {
-                for s in sources { consumeInboxCopy(s.original) }                  // a declined Open In leaves nothing behind
-                return .cancelledResult
-            }
-            destination = choice.destination
-            sources = choice.order.map { sources[$0] }
-            session = ask
-        }
-        defer { session?.close() }
-        var dest = destination ?? .libraryRoot
-        try validate(&dest, library: library, ctx: ctx)
-        if ctx.dryRun { return ImportResult(refs: [], pages: dest.doc == nil ? nil : []) }  // library writes can't roll back
+        let expanded = try expandHandoff(sources, staging: staging, ctx: ctx)
+        // One Open In copy can reach Nib twice (the shell's openURL and the inbox scan on activation): the first call
+        // takes it, the other leaves it alone.
+        let claimed = claim(expanded)
+        defer { release(claimed.paths) }
+        let sources = claimed.sources
+        guard !sources.isEmpty else { return ImportResult(refs: []) }            // taken already, or by another import
 
-        let paths = sources.compactMap { URL(string: $0.original) }.filter { $0.isFileURL }.map { $0.standardizedFileURL.path }
-        inFlight.formUnion(paths)
-        defer { inFlight.subtract(paths) }
+        if destination == nil, dialog == nil, ctx.principal.isUser,
+           sources.contains(where: { ImportFormats.needsDestination($0.name) }), let nav = await ImportUI.navigator(ctx) {
+            // Open In hands several files over one call each: the calls that arrive together share one dialog.
+            let key = ObjectIdentifier(nav)
+            if let gathering = ImportBatch.gathering[key] {
+                return try await gathering.join(sources)
+            }
+            let batch = ImportBatch(sources)
+            ImportBatch.gathering[key] = batch
+            try? await Task.sleep(nanoseconds: ImportBatch.gatherNanoseconds)
+            ImportBatch.gathering[key] = nil
+            do {
+                let result = try await askAndImport(batch.sources, navigator: nav, idQueue: idQueue, library: library,
+                                                    staging: staging, ctx: ctx)
+                batch.finish(.success(result))
+                return result
+            } catch {
+                batch.finish(.failure(error))
+                throw error
+            }
+        }
+        return try await importSources(sources, destination: destination ?? .libraryRoot, idQueue: idQueue,
+                                       library: library, staging: staging, ctx: ctx, dialog: dialog, reveal: reveal)
+    }
+
+    /// Asks where the files go, then imports them while the dialog shows progress.
+    private static func askAndImport(_ sources: [ImportSource], navigator: SceneNavigator, idQueue: [NibID],
+                                     library: LibraryService, staging: ImportStaging,
+                                     ctx: CommandContext) async throws -> ImportResult {
+        // "Current Document" is the notebook open in the window that shows the dialog.
+        let ask = ImportDialogSession(navigator: navigator, library: library, workspace: ctx.workspace,
+                                      session: navigator.session, sources: sources, preset: nil)
+        switch await ask.choose() {
+        case .chosen(let choice):
+            return try await importSources(choice.order.map { sources[$0] }, destination: choice.destination,
+                                           idQueue: idQueue, library: library, staging: staging, ctx: ctx, dialog: ask,
+                                           reveal: true)
+        case .cancelled:
+            for s in sources { consumeInboxCopy(s.original) }                      // a declined Open In leaves nothing behind
+            return .cancelledResult
+        case .notShown:
+            throw NibError(.unavailable, "Nib couldn't show the import dialog",
+                           hint: "open the files again, or call import.files with folder or doc")
+        }
+    }
+
+    /// Stages, dispatches and places `sources` at `destination`, in order.
+    private static func importSources(_ sources: [ImportSource], destination: ImportDestination, idQueue: [NibID],
+                                      library: LibraryService, staging: ImportStaging, ctx: CommandContext,
+                                      dialog session: ImportDialogSession?, reveal: Bool) async throws -> ImportResult {
+        defer { session?.close() }
+        var idQueue = idQueue
+        var dest = destination
+        try validate(&dest, library: library, ctx: ctx)
 
         let total = Double(max(sources.count, 1) * 2)
         var failures: [(ImportFailure, NibError)] = []
@@ -560,9 +679,11 @@ enum ImportEngine {
             done += files.count
         }
         let newFolders = folderIDs(library).subtracting(foldersBefore)
-        let folderRefs = library.allNodes().filter { newFolders.contains($0.id) }
+        let newFolderNodes = library.allNodes().filter { newFolders.contains($0.id) }
             .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-            .map { NodeRef.folder($0.id).description }
+        let folderRefs = newFolderNodes.map { NodeRef.folder($0.id).description }
+        // The folders made right at the destination (a dropped folder, the top level of a zip).
+        let topFolders = newFolderNodes.filter { $0.parent == dest.folder }.map { $0.id }
 
         let failed = failures.map { $0.0 }
         if importedFiles == 0, session == nil, let first = failures.first {
@@ -573,12 +694,14 @@ enum ImportEngine {
         let result = ImportResult(refs: refs, pages: dest.doc == nil ? nil : pageRefs,
                                   folders: folderRefs.isEmpty ? nil : folderRefs, failed: failed.isEmpty ? nil : failed)
         if let session = session {
-            session.finish(imported: importedFiles, failures: failed)
+            session.finish(imported: importedFiles, failures: failed, stopped: session.isCancelled)
+            // The person has seen what failed; Open In and share copies are not offered again.
+            for f in failed { consumeInboxCopy(f.url) }
         } else if ctx.principal.isUser, !failed.isEmpty {
             ImportUI.reportPartialFailure(failed, ctx: ctx)
         }
         if reveal || session != nil {
-            await revealResult(result, created: created, destination: dest, ctx: ctx)
+            await revealResult(result, created: created, topFolders: topFolders, destination: dest, ctx: ctx)
         }
         return result
     }
@@ -683,27 +806,53 @@ enum ImportEngine {
         try? FileManager.default.removeItem(at: url)
     }
 
-    /// Shows what arrived: the first new page, the one new document, or the folder that holds several.
-    private static func revealResult(_ result: ImportResult, created: [DocumentID], destination: ImportDestination,
-                                     ctx: CommandContext) async {
-        if let doc = destination.doc, let first = result.pages?.first {
-            if ctx.activeSession?.document == doc {
-                _ = try? await ctx.execute(CommandIDs.viewGoToPage, ["page": .string(first)])
-            } else {
-                _ = try? await ctx.execute(CommandIDs.docOpen, ["doc": .string(NodeRef.document(doc).description),
-                                                                "page": .string(first)])
-            }
-        } else if created.count == 1, result.folders == nil {
-            _ = try? await ctx.execute(CommandIDs.docOpen, ["doc": .string(NodeRef.document(created[0]).description)])
-        } else if !created.isEmpty || result.folders != nil {
-            let folder = result.folders?.first ?? destination.folder.map { NodeRef.folder($0).description } ?? "lib"
-            _ = try? await ctx.execute(CommandIDs.windowShowLibrary, ["folder": .string(folder)])
+    /// Shows what arrived (`ImportReveal.plan`).
+    private static func revealResult(_ result: ImportResult, created: [DocumentID], topFolders: [FolderID],
+                                     destination: ImportDestination, ctx: CommandContext) async {
+        switch ImportReveal.plan(pages: result.pages ?? [], created: created, topFolders: topFolders,
+                                 destination: destination, openDocument: ctx.activeSession?.document) {
+        case .goToPage(let page)?:
+            _ = try? await ctx.execute(CommandIDs.viewGoToPage, ["page": .string(page)])
+        case .open(let doc, let page)?:
+            var params: [String: JSONValue] = ["doc": .string(NodeRef.document(doc).description)]
+            if let page = page { params["page"] = .string(page) }
+            _ = try? await ctx.execute(CommandIDs.docOpen, .object(params))
+        case .showFolder(let folder)?:
+            let ref = folder.map { NodeRef.folder($0).description } ?? NodeRef.library.description
+            _ = try? await ctx.execute(CommandIDs.windowShowLibrary, ["folder": .string(ref)])
+        case nil:
+            break
         }
+    }
+
+    // MARK: In-flight inputs
+
+    /// The sources this call may import: file inputs another import is working on right now are left out (so the
+    /// shell's Open In and the inbox scan never import one copy twice). Returns the claimed paths for `release`.
+    static func claim(_ sources: [ImportSource]) -> (sources: [ImportSource], paths: [String]) {
+        var kept: [ImportSource] = []
+        var paths: [String] = []
+        for s in sources {
+            guard s.local == nil, let url = URL(string: s.original), url.isFileURL else {
+                kept.append(s)
+                continue
+            }
+            let path = url.standardizedFileURL.path
+            guard !inFlight.contains(path) else { continue }
+            if !paths.contains(path) { paths.append(path) }
+            kept.append(s)
+        }
+        inFlight.formUnion(paths)
+        return (kept, paths)
+    }
+
+    static func release(_ paths: [String]) {
+        inFlight.subtract(paths)
     }
 
     private static func failure(_ original: String, _ error: Error) -> (ImportFailure, NibError) {
         let e = NibError.wrap(error)
-        return (ImportFailure(url: original, code: e.code.rawValue, message: e.message), e)
+        return (ImportFailure(url: original, code: e.code.rawValue, message: e.message, hint: e.hint), e)
     }
 }
 
@@ -785,10 +934,13 @@ struct ImportPick: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> ImportResult {
         let preset = try parseTarget(p.target)
+        if ctx.dryRun { return ImportResult(refs: []) }                           // nothing is shown or written
         guard !NibApp.isHostlessTest, let nav = await ImportUI.navigator(ctx) else {
             throw NibError(.unavailable, "the Files picker needs a window", hint: "call import.files with urls instead")
         }
-        let picked = await DocumentPicker.pick(types: ImportUI.pickerTypes(ctx.content), navigator: nav)
+        // Pages go into a notebook, so a notebook target offers only formats that become pages.
+        let types = ImportUI.pickerTypes(ctx.content, pagesOnly: preset?.doc != nil)
+        let picked = await DocumentPicker.pick(types: types, navigator: nav)
         guard !picked.isEmpty else { return .cancelledResult }
         // Picked files stay readable while the import runs (the engine opens them again from their paths).
         let access = picked.map { ($0, $0.startAccessingSecurityScopedResource()) }
@@ -799,11 +951,22 @@ struct ImportPick: NibCommand {
         let asksWhere = preset == nil && sources.contains { ImportFormats.needsDestination($0.name) }
         if asksWhere || (preset?.doc != nil && picked.count > 1) {
             let ask = ImportDialogSession(navigator: nav, library: ctx.services.library, workspace: ctx.workspace,
-                                          session: ctx.activeSession, sources: sources, preset: preset)
-            guard let choice = await ask.choose() else { return .cancelledResult }
-            destination = choice.destination
-            sources = choice.order.map { sources[$0] }
-            dialog = ask
+                                          session: nav.session, sources: sources, preset: preset)
+            switch await ask.choose() {
+            case .chosen(let choice):
+                destination = choice.destination
+                sources = choice.order.map { sources[$0] }
+                dialog = ask
+            case .cancelled:
+                return .cancelledResult
+            case .notShown:
+                throw NibError(.unavailable, "Nib couldn't show the import dialog", hint: "choose Import Files again")
+            }
+        } else if ImportUI.isLong(picked) {
+            // Nothing to ask, but the import takes a moment: the sheet shows its progress where it was started.
+            let progress = ImportDialogSession(navigator: nav, library: ctx.services.library, workspace: ctx.workspace,
+                                               session: nav.session, sources: sources, preset: destination)
+            if await progress.showProgress() { dialog = progress }
         }
         return try await ImportEngine.perform(sources, destination: destination ?? .libraryRoot, ids: nil, ctx: ctx,
                                               dialog: dialog, reveal: true)

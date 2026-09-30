@@ -13,6 +13,16 @@ struct ImportChoice: Equatable {
     var order: [Int]
 }
 
+/// How the import dialog ended.
+enum ImportDialogOutcome: Equatable {
+    case chosen(ImportChoice)
+    /// The person closed it: Open In and share copies are removed, loose files are left alone.
+    case cancelled
+    /// It could not be shown (no window, another presentation in the way): nothing is removed, so the inbox scan
+    /// offers the files again.
+    case notShown
+}
+
 /// One row of the dialog's folder picker (nil folder = the library root).
 struct ImportFolderOption: Identifiable, Hashable {
     var folder: FolderID?
@@ -90,6 +100,10 @@ enum ImportDialogLogic {
         names.count == 1 ? String(localized: "Import “\(names[0])”?") : String(localized: "Import \(names.count) files?")
     }
 
+    static func importingTitle(names: [String]) -> String {
+        names.count == 1 ? String(localized: "Importing “\(names[0])”") : String(localized: "Importing \(names.count) files")
+    }
+
     /// Pages can go into the open notebook only when every file is a page format (PDF, image, Office, web page).
     static func allowsCurrentDocument(names: [String]) -> Bool {
         !names.isEmpty && names.allSatisfy { ImportFormats.isPageFormat($0) }
@@ -128,6 +142,7 @@ final class ImportDialogModel: ObservableObject {
     @Published var progressLabel = ""
     @Published var cancelRequested = false
     @Published private(set) var failures: [ImportFailure] = []
+    @Published private(set) var importedCount = 0
 
     var onChoose: ((ImportChoice?) -> Void)?
     var onClose: (() -> Void)?
@@ -173,9 +188,11 @@ final class ImportDialogModel: ObservableObject {
     var positions: [PagePosition] { ImportDialogLogic.positions(hasPage: current?.page != nil) }
 
     var title: String {
-        guard phase == .finished else { return ImportDialogLogic.title(names: names) }
-        let imported = max(names.count - failures.count, 0)
-        return String(localized: "\(imported) of \(names.count) imported")
+        switch phase {
+        case .choosing: return ImportDialogLogic.title(names: names)
+        case .importing: return ImportDialogLogic.importingTitle(names: names)
+        case .finished: return String(localized: "\(importedCount) of \(names.count) imported")
+        }
     }
 
     var primaryTitle: String? {
@@ -210,7 +227,9 @@ final class ImportDialogModel: ObservableObject {
         order = ImportDialogLogic.moved(order, index, by: step)
     }
 
-    func showResult(_ failures: [ImportFailure]) {
+    /// `imported` counts files, so it can be less than the files minus the failures when the import was stopped.
+    func showResult(imported: Int, failures: [ImportFailure]) {
+        importedCount = min(max(imported, 0), names.count)
         self.failures = failures
         phase = .finished
     }
@@ -233,7 +252,7 @@ struct ImportDialogView: View {
             case .finished: finished
             }
         }
-        .background(NibColor.groupedBackground)
+        .modifier(ImportSheetSurface())
         .interactiveDismissDisabled(true)
     }
 
@@ -394,6 +413,18 @@ struct ImportDialogView: View {
     }
 }
 
+/// The sheet's surface: the opaque grouped background below iOS 26; iOS 26 keeps the system sheet material, as
+/// `.nibSheet` does.
+private struct ImportSheetSurface: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content
+        } else {
+            content.background(NibColor.groupedBackground)
+        }
+    }
+}
+
 // MARK: - Dialog session
 
 /// Presents the import dialog for Open In, the share sheet, the inbox scan, drops and the Files picker, returns the
@@ -403,7 +434,7 @@ final class ImportDialogSession {
     let model: ImportDialogModel
     private weak var navigator: SceneNavigator?
     private var controller: UIViewController?
-    private var pending: CheckedContinuation<ImportChoice?, Never>?
+    private var pending: CheckedContinuation<ImportDialogOutcome, Never>?
 
     init(navigator: SceneNavigator, library: LibraryService?, workspace: Workspace, session: EditorSession?,
          sources: [ImportSource], preset: ImportDestination?) {
@@ -414,13 +445,29 @@ final class ImportDialogSession {
 
     var isCancelled: Bool { model.cancelRequested }
 
-    /// nil when the user cancels (or the dialog could not be shown).
-    func choose() async -> ImportChoice? {
-        guard let navigator = navigator else { return nil }
+    /// Shows the sheet straight at its progress (nothing to ask: the destination is known). False when it could not
+    /// be shown; the import then runs without it.
+    func showProgress() async -> Bool {
+        guard let navigator = navigator, navigator.rootViewController?.view.window != nil else { return false }
         await ImportUI.waitUntilPresentable(navigator)
-        return await withCheckedContinuation { (continuation: CheckedContinuation<ImportChoice?, Never>) in
+        model.phase = .importing
+        model.onClose = { [weak self] in self?.dismiss() }
+        let host = UIHostingController(rootView: ImportDialogView(model: model))
+        host.modalPresentationStyle = .formSheet
+        host.isModalInPresentation = true
+        ImportUI.applySheetChrome(host)
+        navigator.presentModal(host)
+        guard host.presentingViewController != nil else { return false }
+        controller = host
+        return true
+    }
+
+    func choose() async -> ImportDialogOutcome {
+        guard let navigator = navigator, navigator.rootViewController?.view.window != nil else { return .notShown }
+        await ImportUI.waitUntilPresentable(navigator)
+        return await withCheckedContinuation { (continuation: CheckedContinuation<ImportDialogOutcome, Never>) in
             pending = continuation
-            model.onChoose = { [weak self] choice in self?.resolve(choice) }
+            model.onChoose = { [weak self] choice in self?.resolve(choice.map { .chosen($0) } ?? .cancelled) }
             model.onClose = { [weak self] in self?.dismiss() }
             let host = UIHostingController(rootView: ImportDialogView(model: model))
             host.modalPresentationStyle = .formSheet
@@ -428,7 +475,10 @@ final class ImportDialogSession {
             ImportUI.applySheetChrome(host)
             navigator.presentModal(host)
             controller = host
-            if host.presentingViewController == nil { resolve(nil) }
+            if host.presentingViewController == nil {
+                controller = nil
+                resolve(.notShown)
+            }
         }
     }
 
@@ -438,30 +488,35 @@ final class ImportDialogSession {
     }
 
     /// Closes the dialog after a clean import; keeps it open with the list of failures otherwise.
-    func finish(imported: Int, failures: [ImportFailure]) {
-        let message = failures.isEmpty
-            ? String(localized: "Import finished.")
-            : String(localized: "\(failures.count) of \(model.names.count) files were not imported.")
+    func finish(imported: Int, failures: [ImportFailure], stopped: Bool) {
+        let message: String
+        if !failures.isEmpty {
+            message = String(localized: "\(failures.count) of \(model.names.count) files were not imported.")
+        } else if stopped {
+            message = String(localized: "Import stopped. \(imported) of \(model.names.count) files imported.")
+        } else {
+            message = String(localized: "Import finished.")
+        }
         UIAccessibility.post(notification: .announcement, argument: message)
         guard !failures.isEmpty else {
             if imported > 0 { NibHaptics.play(.success) }
             dismiss()
             return
         }
-        model.showResult(failures)
+        model.showResult(imported: imported, failures: failures)
     }
 
-    /// Dismisses the dialog unless it is showing failures for the user to read.
+    /// Dismisses the dialog unless it is showing failures for the person to read.
     func close() {
         if model.phase == .finished && !model.failures.isEmpty { return }
         dismiss()
     }
 
-    private func resolve(_ choice: ImportChoice?) {
+    private func resolve(_ outcome: ImportDialogOutcome) {
         guard let continuation = pending else { return }
         pending = nil
-        if choice == nil { dismiss() } else { model.phase = .importing }
-        continuation.resume(returning: choice)
+        if case .chosen = outcome { model.phase = .importing } else { dismiss() }
+        continuation.resume(returning: outcome)
     }
 
     private func dismiss() {
@@ -469,7 +524,7 @@ final class ImportDialogSession {
         controller = nil
         if let continuation = pending {
             pending = nil
-            continuation.resume(returning: nil)
+            continuation.resume(returning: .cancelled)
         }
     }
 }
@@ -520,11 +575,25 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
 @MainActor
 enum ImportUI {
     /// The window that asks the user, waiting briefly for it: an Open In at launch arrives before the window is active.
+    /// The calling window's own navigator when there are several (Split View, Stage Manager), else the active one.
     static func navigator(_ ctx: CommandContext) async -> SceneNavigator? {
         guard !NibApp.isHostlessTest, ctx.app != nil else { return nil }
         for _ in 0..<40 {
-            if let nav = ctx.navigator, nav.rootViewController?.view.window != nil { return nav }
+            if let nav = navigator(showing: ctx.session) ?? ctx.navigator, nav.rootViewController?.view.window != nil {
+                return nav
+            }
             try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return nil
+    }
+
+    /// The navigator whose window runs `session`.
+    static func navigator(showing session: EditorSession?) -> SceneNavigator? {
+        guard let session = session else { return nil }
+        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+            for window in scene.windows {
+                if let nav = window.rootViewController as? SceneNavigator, nav.session === session { return nav }
+            }
         }
         return nil
     }
@@ -548,10 +617,25 @@ enum ImportUI {
         }
     }
 
+    /// The line above the progress bar: which file, and how far through the list.
     static func progressLabel(_ name: String, index: Int, count: Int) -> String {
-        count > 1 ? String(localized: "Importing “\(name)” (\(index + 1) of \(count))")
-                  : String(localized: "Importing “\(name)”")
+        count > 1 ? String(localized: "\(index + 1) of \(count): “\(name)”") : String(localized: "“\(name)”")
     }
+
+    /// Imports that take a moment (several files, folders, archives, conversions, big files) show the sheet's
+    /// progress even when nothing needs asking. Reads file sizes.
+    nonisolated static func isLong(_ urls: [URL]) -> Bool {
+        if urls.count > 1 { return true }
+        let slow = Set(["zip"] + ImportFormats.officeExtensions + ImportFormats.webExtensions)
+        var bytes = 0
+        for url in urls {
+            if StagingIO.isDirectory(url) || slow.contains(url.pathExtension.lowercased()) { return true }
+            bytes += (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        }
+        return bytes > longImportBytes
+    }
+
+    nonisolated static let longImportBytes = 20 * 1_048_576
 
     /// Files that failed while others were imported, as a toast in the invoking window.
     static func reportPartialFailure(_ failures: [ImportFailure], ctx: CommandContext) {
@@ -575,13 +659,25 @@ enum ImportUI {
                                         userInfo: ["command": CommandIDs.importFiles, "error": error])
     }
 
-    /// Everything the picker may choose: registered importers' types and extensions, folders and Nib packages.
-    static func pickerTypes(_ content: ContentRegistries) -> [UTType] {
-        var types: [UTType] = [.pdf, .image, .folder, .zip]
-        if let package = UTType(NibFormat.packageUTType) { types.append(package) }
-        for d in content.importers.all {
-            types += d.utTypes.compactMap { UTType($0) }
-            types += d.fileExtensions.compactMap { UTType(filenameExtension: $0) }
+    /// Everything the picker may choose: registered importers' types and extensions, folders and Nib packages. With
+    /// `pagesOnly` (a notebook target), the formats that become pages: images, and PDF, Word, PowerPoint and web
+    /// pages when a PDF importer is there to take them.
+    static func pickerTypes(_ content: ContentRegistries, pagesOnly: Bool = false) -> [UTType] {
+        var types: [UTType]
+        if pagesOnly {
+            types = [.image]
+            if content.importer(forExtension: "pdf") != nil {
+                types.append(.pdf)
+                let converted = ImportFormats.officeExtensions + ImportFormats.webExtensions
+                types += converted.compactMap { UTType(filenameExtension: $0) }
+            }
+        } else {
+            types = [.pdf, .image, .folder, .zip]
+            if let package = UTType(NibFormat.packageUTType) { types.append(package) }
+            for d in content.importers.all {
+                types += d.utTypes.compactMap { UTType($0) }
+                types += d.fileExtensions.compactMap { UTType(filenameExtension: $0) }
+            }
         }
         var seen = Set<String>()
         return types.filter { !$0.isDynamic && seen.insert($0.identifier).inserted }

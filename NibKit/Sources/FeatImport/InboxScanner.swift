@@ -120,29 +120,40 @@ enum InboxFiles {
         var key: String
     }
 
-    /// Everything in the inboxes, plus loose files (never folders: the library may live here) in Documents.
-    static func entries(inboxes: [URL], documents: URL) -> [Entry] {
+    /// Everything in the inboxes, plus loose files in Documents (never plain folders: the library, or its folders,
+    /// may live there). Nib documents put into Documents with Finder count too, unless Documents is the library
+    /// itself (`packagesFromDocuments` false), where they already are library documents.
+    static func entries(inboxes: [URL], documents: URL, packagesFromDocuments: Bool = false) -> [Entry] {
         var out: [Entry] = []
         for inbox in inboxes {
             for e in ArchiveIO.visibleEntries(of: inbox) {
                 out.append(Entry(url: e.url, isDirectory: e.isDirectory, fromInbox: true, key: key(e.url)))
             }
         }
-        for e in ArchiveIO.visibleEntries(of: documents) where !e.isDirectory {
-            out.append(Entry(url: e.url, isDirectory: false, fromInbox: false, key: key(e.url)))
+        for e in ArchiveIO.visibleEntries(of: documents) {
+            guard !e.isDirectory || (packagesFromDocuments && PackageImporter.isPackage(e.url)) else { continue }
+            out.append(Entry(url: e.url, isDirectory: e.isDirectory, fromInbox: false, key: key(e.url)))
         }
         return out
     }
 
+    /// Read from the file system every time: a `URL` caches its resource values, so a file changed since the scan
+    /// would otherwise keep its old key.
     static func key(_ url: URL) -> String {
-        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        let size = values?.fileSize ?? 0
-        let modified = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
-        return "\(url.standardizedFileURL.path)|\(size)|\(Int(modified))"
+        let path = url.standardizedFileURL.path
+        let attributes = (try? FileManager.default.attributesOfItem(atPath: path)) ?? [:]
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(path)|\(size)|\(Int(modified))"
+    }
+
+    /// Keys of the offered entries still on disk after the import: the ones to leave alone from now on.
+    static func remaining(_ offered: [Entry]) -> Set<String> {
+        Set(offered.filter { FileManager.default.fileExists(atPath: $0.url.path) }.map { key($0.url) })
     }
 
     /// What the scan offers: inbox folders (someone shared a folder), packages and files an importer takes; never
-    /// what is being imported right now or a loose file the person already declined in this state.
+    /// what is being imported right now or a file the person already declined in this state.
     static func offered(_ entries: [Entry], inFlight: Set<String>, declined: Set<String>,
                         canImport: (URL, Bool) -> Bool) -> [Entry] {
         entries.filter { entry in
@@ -182,7 +193,7 @@ enum InboxScanner {
     }
 
     static func scan(_ app: NibApp) async {
-        guard !busy, app.services.library != nil, let nav = app.ui.activeNavigator,
+        guard !busy, let library = app.services.library, let nav = app.ui.activeNavigator,
               let root = nav.rootViewController, root.view.window != nil, root.presentedViewController == nil else { return }
         busy = true
         defer { busy = false }
@@ -192,7 +203,10 @@ enum InboxScanner {
         }
         let inboxes = [ImportLocations.openInInbox] + [ImportLocations.appGroupInbox].compactMap { $0 }
         let documents = ImportLocations.documents
-        let found = await Task.detached(priority: .utility) { InboxFiles.entries(inboxes: inboxes, documents: documents) }.value
+        let packages = ImportLocations.canonical(library.rootURL) != ImportLocations.canonical(documents)
+        let found = await Task.detached(priority: .utility) {
+            InboxFiles.entries(inboxes: inboxes, documents: documents, packagesFromDocuments: packages)
+        }.value
         let content = app.content
         let offered = InboxFiles.offered(found, inFlight: ImportEngine.inFlight, declined: declined) { url, isDirectory in
             ImportEngine.canImport(url, isDirectory: isDirectory, content: content)
@@ -201,22 +215,27 @@ enum InboxScanner {
         let loose = offered.filter { !$0.fromInbox }
         let paths = loose.map { $0.url.standardizedFileURL.path }
         ImportEngine.consumableFiles.formUnion(paths)
-        let result = await runImport(offered.map { $0.url.absoluteString }, app: app, navigator: nav)
-        if result == nil || result?["cancelled"]?.boolValue == true {
-            declined.formUnion(loose.map { $0.key })
-        }
+        let error = await runImport(offered.map { $0.url.absoluteString }, app: app, navigator: nav)
         ImportEngine.consumableFiles.subtract(paths)
+        // The dialog could not be shown: everything is offered again on the next activation.
+        if error?.code == .unavailable { return }
+        // Imported files are gone. What is still there (cancelled, failed, stopped) is not offered again until it
+        // changes or Nib relaunches, so a file Nib can't read never asks on every return to the app.
+        declined.formUnion(InboxFiles.remaining(offered))
     }
 
+    /// Runs `import.files` as the person; returns the error it ended with (already shown as a toast), if any.
     @discardableResult
-    private static func runImport(_ urls: [String], app: NibApp, navigator: SceneNavigator) async -> JSONValue? {
+    private static func runImport(_ urls: [String], app: NibApp, navigator: SceneNavigator) async -> NibError? {
         do {
             let params: JSONValue = ["urls": .array(urls.map { .string($0) })]
-            return try await app.bus.execute(Invocation(command: CommandIDs.importFiles, params: params,
-                                                        principal: .user, session: navigator.session)).value
-        } catch {
-            ImportUI.report(NibError.wrap(error), navigator: navigator, app: app)
+            _ = try await app.bus.execute(Invocation(command: CommandIDs.importFiles, params: params,
+                                                     principal: .user, session: navigator.session))
             return nil
+        } catch {
+            let e = NibError.wrap(error)
+            ImportUI.report(e, navigator: navigator, app: app)
+            return e
         }
     }
 }

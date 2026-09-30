@@ -80,7 +80,8 @@ enum PackageImporter {
     static func importFolder(_ url: URL, into parent: FolderID?, ctx: CommandContext) async throws -> [DocumentID] {
         if ctx.dryRun { return [] }
         let library = try ctx.services.require(ctx.services.library, "the library")
-        let folder = try folderNamed(url.lastPathComponent, in: parent, library: library)
+        let folder = try folderNamed(url.lastPathComponent, in: parent, library: library,
+                                     style: FolderStyleFiles.style(in: url))
         return try await importContents(of: url, into: folder, ctx: ctx, library: library)
     }
 
@@ -99,7 +100,8 @@ enum PackageImporter {
                 if entry.isDirectory && isPackage(entry.url) {
                     docs.append(try library.importPackage(at: entry.url, into: folder))
                 } else if entry.isDirectory {
-                    let child = try folderNamed(entry.url.lastPathComponent, in: folder, library: library)
+                    let child = try folderNamed(entry.url.lastPathComponent, in: folder, library: library,
+                                                style: FolderStyleFiles.style(in: entry.url))
                     foundFolder = true
                     docs += try await importContents(of: entry.url, into: child, ctx: ctx, library: library, depth: depth + 1)
                 } else {
@@ -129,15 +131,17 @@ enum PackageImporter {
         return docs
     }
 
-    /// The folder called `name` in `parent` (case-insensitive), created when missing.
-    static func folderNamed(_ name: String, in parent: FolderID?, library: LibraryService) throws -> FolderID {
+    /// The folder called `name` in `parent` (case-insensitive), created with `style` when missing (an existing
+    /// folder keeps its own style).
+    static func folderNamed(_ name: String, in parent: FolderID?, library: LibraryService,
+                            style: FolderStyle? = nil) throws -> FolderID {
         let title = ImportNaming.sanitize(name)
         if let existing = library.children(of: parent).first(where: {
             $0.kind == .folder && $0.title.compare(title, options: .caseInsensitive) == .orderedSame
         }) {
             return existing.id
         }
-        return try library.createFolder(title: title, in: parent, style: nil)
+        return try library.createFolder(title: title, in: parent, style: style)
     }
 
     /// The root of a whole-library backup (it holds `.nib-library`), at the top of the archive or one folder down.
@@ -149,6 +153,47 @@ enum PackageImporter {
         let entries = ArchiveIO.visibleEntries(of: root)
         if entries.count == 1, entries[0].isDirectory, holdsLibrary(entries[0].url) { return entries[0].url }
         return nil
+    }
+}
+
+/// A library folder's colour, icon and favourite, from the `.nibfolder.<dev>.json` files a Nib library (and so its
+/// backups and zipped folders) keeps in every folder (ARCHITECTURE.md §4.1): the highest rev wins. Pure.
+enum FolderStyleFiles {
+    /// One device's file; every field is optional so a file from another version never stops an import.
+    struct Entry: Decodable {
+        var rev: Rev?
+        var color: RGBA?
+        var icon: String?
+        var favorite: Bool?
+
+        enum CodingKeys: String, CodingKey { case rev, color, icon, favorite }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            rev = try? c.decodeIfPresent(Rev.self, forKey: .rev)
+            color = try? c.decodeIfPresent(RGBA.self, forKey: .color)
+            icon = try? c.decodeIfPresent(String.self, forKey: .icon)
+            favorite = try? c.decodeIfPresent(Bool.self, forKey: .favorite)
+        }
+    }
+
+    static func isStyleFile(_ name: String) -> Bool { name.hasPrefix(".nibfolder.") && name.hasSuffix(".json") }
+
+    /// nil for a folder without style files, or whose style is the default one.
+    static func style(in dir: URL) -> FolderStyle? {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        var best: (rev: Rev, style: FolderStyle)?
+        for name in names.sorted() where isStyleFile(name) {
+            guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
+                  let entry = try? JSONDecoder().decode(Entry.self, from: data) else { continue }
+            let rev = (entry.rev ?? .zero).effective()
+            let style = FolderStyle(color: entry.color, icon: entry.icon?.isEmpty == true ? nil : entry.icon,
+                                    favorite: entry.favorite ?? false)
+            if let current = best, !(current.rev < rev) { continue }
+            best = (rev, style)
+        }
+        guard let style = best?.style, style != FolderStyle() else { return nil }
+        return style
     }
 }
 

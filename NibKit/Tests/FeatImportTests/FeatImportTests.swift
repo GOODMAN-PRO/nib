@@ -226,6 +226,68 @@ final class FeatImportTests: XCTestCase {
         XCTAssertEqual(folders, ["folder:" + physics.id.raw, "folder:" + chemistry.id.raw])
     }
 
+    func testZippedLibraryFoldersKeepTheirStyle() async throws {
+        let h = harness()
+        let root = try tempDir()
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try writePNG("Physics/Waves.png", in: source)
+        let style = FolderStyle(color: RGBA(0x20, 0x60, 0xC0), icon: "atom", favorite: true)
+        let file: [String: JSONValue] = ["id": "PHYSICS", "rev": .string(Rev(wallMs: 5, counter: 0, device: 1).description),
+                                         "color": .string(RGBA(0x20, 0x60, 0xC0).hex), "icon": "atom", "favorite": true]
+        try JSONEncoder().encode(JSONValue.object(file))
+            .write(to: source.appendingPathComponent("Physics/.nibfolder.00000001.json"))
+        let zip = root.appendingPathComponent("Physics.zip")
+        try ArchiveIO.archive(contentsOf: source, to: zip)
+
+        _ = try await h.run("import.files", ["urls": urls([zip]), "folder": "lib"])
+        let physics = try XCTUnwrap(h.library.children(of: nil).first { $0.kind == .folder && $0.title == "Physics" })
+        XCTAssertEqual(physics.style, style)
+        XCTAssertEqual(h.library.children(of: physics.id).map { $0.title }, ["Waves"], "the style file is not a document")
+    }
+
+    func testWholeLibraryBackupsRestoreLibraryDataAndFolders() async throws {
+        let h = harness()
+        let root = try tempDir()
+        let backup = root.appendingPathComponent("backup", isDirectory: true)
+        let data = backup.appendingPathComponent(NibFormat.libraryDirectory, isDirectory: true)
+        let template = "Planner-" + UUID().uuidString + ".pdf"
+        let trashed = "Old-" + UUID().uuidString + ".png"
+        try FileManager.default.createDirectory(at: data.appendingPathComponent("templates/Imported", isDirectory: true),
+                                                withIntermediateDirectories: true)
+        try Data("%PDF-1.4".utf8).write(to: data.appendingPathComponent("templates/Imported/" + template))
+        try writePNG("trash/" + trashed, in: data)
+        try writePNG("Physics/Waves.png", in: backup)
+        let zip = root.appendingPathComponent("Nib Backup.zip")
+        try ArchiveIO.archive(contentsOf: backup, to: zip)
+        let restored = h.library.metadataURL.appendingPathComponent("templates/Imported/" + template)
+        let notRestored = h.library.metadataURL.appendingPathComponent("trash/" + trashed)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: restored)
+            try? FileManager.default.removeItem(at: notRestored)
+        }
+
+        let result = try await h.run("import.files", ["urls": urls([zip]), "folder": "lib"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: restored.path), "library data joins this library")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: notRestored.path), "the backup's trash stays out")
+        let physics = try XCTUnwrap(h.library.children(of: nil).first { $0.kind == .folder && $0.title == "Physics" })
+        XCTAssertEqual(h.library.children(of: physics.id).map { $0.title }, ["Waves"])
+        XCTAssertFalse(h.library.allNodes().contains { $0.title == NibFormat.libraryDirectory })
+        XCTAssertEqual(result["refs"]?.arrayValue?.count, 1)
+    }
+
+    func testFilesAnotherImportIsWorkingOnAreLeftAlone() async throws {
+        let h = harness()
+        let image = try writePNG("scan.png", in: try tempDir())
+        let path = image.standardizedFileURL.path
+        ImportEngine.inFlight.insert(path)
+        defer { ImportEngine.inFlight.remove(path) }
+        let nodes = h.library.allNodes().count
+        let result = try await h.run("import.files", ["urls": urls([image]), "folder": "lib"])
+        XCTAssertEqual(result["refs"], [] as JSONValue)
+        XCTAssertEqual(h.library.allNodes().count, nodes)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: image.path))
+    }
+
     func testFolderImportKeepsItsTree() async throws {
         let h = harness()
         let root = try tempDir()
@@ -290,6 +352,110 @@ final class FeatImportTests: XCTestCase {
         let result = try await h.run("import.files", ["urls": [.string("tmp:" + ref.name)], "folder": "lib"])
         XCTAssertEqual(result["refs"], [] as JSONValue)
         XCTAssertEqual(names, [(ref.name as NSString).deletingPathExtension])
+    }
+
+    // MARK: Word, PowerPoint and web pages
+
+    /// Stands in for WebKit: writes a one-page PDF at the paper size it was asked for.
+    private final class FakeConverter: PDFConverting {
+        var calls: [(source: WebSource, layout: PDFLayout, paper: CGSize)] = []
+        var pageTitle: String?
+
+        func convert(_ source: WebSource, layout: PDFLayout, paper: CGSize, into dir: URL,
+                     ctx: CommandContext) async throws -> (pdf: URL, title: String?) {
+            calls.append((source, layout, paper))
+            let url = dir.appendingPathComponent("fake.pdf")
+            try UIGraphicsPDFRenderer(bounds: CGRect(origin: .zero, size: paper)).writePDF(to: url) { r in r.beginPage() }
+            return (url, pageTitle)
+        }
+    }
+
+    /// A PDF importer that records what it was handed and creates a one-page notebook.
+    private func registerRecordingPDFImporter(_ h: Harness) -> () -> [(name: String, target: ImportTarget, pages: Int)] {
+        var seen: [(name: String, target: ImportTarget, pages: Int)] = []
+        h.app.content.importers.register(ImporterDescriptor(id: "pdf", title: "PDF", fileExtensions: ["pdf"],
+                                                            utTypes: ["com.adobe.pdf"], owner: "test") { url, target, ctx in
+            seen.append((url.lastPathComponent, target, CGPDFDocument(url as CFURL)?.numberOfPages ?? 0))
+            let library = try ctx.services.require(ctx.services.library, "the library")
+            let meta = DocumentMeta(id: target.ids?.first ?? NibID.make(), kind: .notebook)
+            return [try library.createDocument(DocumentContent(meta: meta, pages: [PageRecord()]),
+                                               title: target.displayName ?? "?", in: target.folder)]
+        })
+        return { seen }
+    }
+
+    func testPresentationsBecomeLandscapePDFsForThePDFImporter() async throws {
+        let h = harness()
+        let fake = FakeConverter()
+        OfficeConverter.converter = fake
+        defer { OfficeConverter.converter = WebKitPDFConverter() }
+        let seen = registerRecordingPDFImporter(h)
+        let deck = try tempDir().appendingPathComponent("Lecture 5.pptx")
+        try Data("PK".utf8).write(to: deck)
+
+        let result = try await h.run("import.files", ["urls": urls([deck]), "folder": "folder:FIXTUREFLD01",
+                                                      "ids": ["DECKDOC00001"]])
+        XCTAssertEqual(result["refs"], ["doc:DECKDOC00001"] as JSONValue)
+        XCTAssertEqual(fake.calls.count, 1)
+        XCTAssertEqual(fake.calls.first?.layout, .office(landscape: true))
+        guard case .file(let staged)? = fake.calls.first?.source else { return XCTFail("a local file is converted") }
+        XCTAssertEqual(staged.lastPathComponent, "Lecture 5.pptx")
+        XCTAssertEqual(fake.calls.first?.paper.width ?? 0, 841.89, accuracy: 0.01)
+        XCTAssertEqual(fake.calls.first?.paper.height ?? 0, 595.28, accuracy: 0.01)
+        let handed = try XCTUnwrap(seen().first)
+        XCTAssertEqual(handed.name, "Lecture 5.pdf")
+        XCTAssertEqual(handed.target.displayName, "Lecture 5")
+        XCTAssertEqual(handed.target.folder, Fixtures.folderID)
+        XCTAssertEqual(handed.target.ids, ["DECKDOC00001"])
+        XCTAssertEqual(handed.pages, 1)
+        XCTAssertEqual(h.library.node("DECKDOC00001")?.title, "Lecture 5")
+    }
+
+    func testWebPagesAreNamedAfterTheirTitle() async throws {
+        let h = harness()
+        let fake = FakeConverter()
+        fake.pageTitle = "Photosynthesis: Overview"
+        OfficeConverter.converter = fake
+        defer { OfficeConverter.converter = WebKitPDFConverter() }
+        let seen = registerRecordingPDFImporter(h)
+        let page = try XCTUnwrap(URL(string: "https://example.com/biology/photosynthesis"))
+        let link = try WebLocation.write(page, title: "photosynthesis", in: try tempDir())
+
+        _ = try await h.run("import.files", ["urls": urls([link]), "folder": "lib"])
+        XCTAssertEqual(fake.calls.first?.source, .remote(page))
+        XCTAssertEqual(fake.calls.first?.layout, .webPage)
+        XCTAssertEqual(fake.calls.first?.paper.width ?? 0, 595.28, accuracy: 0.01)
+        XCTAssertEqual(seen().first?.name, "Photosynthesis- Overview.pdf")
+        XCTAssertEqual(seen().first?.target.displayName, "Photosynthesis- Overview")
+        XCTAssertEqual(OfficeConverter.documentTitle("Report", pageTitle: "Ignored", layout: .office(landscape: false)), "Report")
+        XCTAssertEqual(OfficeConverter.documentTitle("Saved page", pageTitle: "  ", layout: .webPage), "Saved page")
+    }
+
+    func testOtherCallersLoadOnlyHttpsPages() async throws {
+        let h = harness()
+        let fake = FakeConverter()
+        OfficeConverter.converter = fake
+        defer { OfficeConverter.converter = WebKitPDFConverter() }
+        _ = registerRecordingPDFImporter(h)
+        let plain = try PropertyListSerialization.data(fromPropertyList: ["URL": "http://example.com/a"], format: .xml, options: 0)
+        let ref = try h.assets.putTemporary(plain, ext: "webloc")
+        await expectError(.permissionDenied) {
+            _ = try await h.run("import.files", ["urls": [.string("tmp:" + ref.name)], "folder": "lib"], as: .ai("chat"))
+        }
+        XCTAssertTrue(fake.calls.isEmpty, "nothing is loaded before the check")
+    }
+
+    func testConvertingNeedsThePDFImporter() async throws {
+        let h = harness()
+        let fake = FakeConverter()
+        OfficeConverter.converter = fake
+        defer { OfficeConverter.converter = WebKitPDFConverter() }
+        let report = try tempDir().appendingPathComponent("Report.docx")
+        try Data("PK".utf8).write(to: report)
+        await expectError(.unavailable) {
+            _ = try await h.run("import.files", ["urls": urls([report]), "folder": "lib"])
+        }
+        XCTAssertTrue(fake.calls.isEmpty)
     }
 
     // MARK: Failures and permissions

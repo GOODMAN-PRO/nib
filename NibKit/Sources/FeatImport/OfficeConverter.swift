@@ -39,8 +39,11 @@ enum OfficeConverter {
         }
     }
 
-    /// Lays `source` out in an off-screen web view, writes a paginated PDF named after the page (or `title`) and hands
-    /// it to the registered PDF importer with the same target.
+    /// Lays documents and pages out as PDFs: WebKit in the app; tests put a fake here (ARCHITECTURE.md §15.13).
+    static var converter: PDFConverting = WebKitPDFConverter()
+
+    /// Lays `source` out as a paginated PDF (`converter`), names it after the page (or `title`) and hands it to the
+    /// registered PDF importer with the same target.
     static func convertAndImport(_ source: WebSource, title: String, layout: PDFLayout, target: ImportTarget,
                                  ctx: CommandContext) async throws -> [DocumentID] {
         guard let pdfImporter = ctx.content.importer(forExtension: "pdf") else {
@@ -48,30 +51,27 @@ enum OfficeConverter {
                            hint: "enable the PDF feature and import again")
         }
         if case .remote(let page) = source { try authorizeWebPage(page, ctx: ctx) }
-        guard !NibApp.isHostlessTest, let window = await ImportUI.navigator(ctx)?.rootViewController?.view.window else {
-            throw NibError(.unavailable, "converting documents needs an open Nib window",
-                           hint: "open Nib on the device and import again")
-        }
         if ctx.dryRun { return target.document.map { [$0] } ?? [] }
         let dir = ImportLocations.scratch.appendingPathComponent("convert-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let paper = layout.paper(base: ctx.services.settings.get(NibSettings.defaultPageSize))
-        // Office files and saved pages render without scripts; a live page may need them for its layout.
-        let isRemote: Bool
-        if case .remote = source { isRemote = true } else { isRemote = false }
-        let renderer = WebPDFRenderer(host: window, width: paper.width, javaScript: isRemote)
-        defer { renderer.tearDown() }
-        try await renderer.load(source, settle: layout.settleSeconds)
-        var name = title
-        if layout == .webPage, let pageTitle = renderer.pageTitle, !pageTitle.isEmpty { name = pageTitle }
-        name = ImportNaming.sanitize(name)
-        let pdf = dir.appendingPathComponent(name + ".pdf")
-        try await renderer.writePDF(paper: paper, margin: layout.margin, to: pdf)
-        var converted = target
-        converted.displayName = name
-        return try await pdfImporter.handler(pdf, converted, ctx)
+        let converted = try await converter.convert(source, layout: layout, paper: paper, into: dir, ctx: ctx)
+        let name = ImportNaming.sanitize(documentTitle(title, pageTitle: converted.title, layout: layout))
+        // The PDF importer titles the document from the file too.
+        let pdf = ImportNaming.unique(name + ".pdf", in: dir)
+        try FileManager.default.moveItem(at: converted.pdf, to: pdf)
+        var target = target
+        target.displayName = name
+        return try await pdfImporter.handler(pdf, target, ctx)
+    }
+
+    /// A web page is named after its title when it has one; a document keeps its file name.
+    static func documentTitle(_ title: String, pageTitle: String?, layout: PDFLayout) -> String {
+        guard layout == .webPage, let page = pageTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !page.isEmpty else { return title }
+        return page
     }
 
     /// Loading a live page reaches the network: the AI and the bridge need the `network` scope and https, and a plugin
@@ -94,6 +94,36 @@ enum OfficeConverter {
                                hint: "add the host to manifest network.hosts")
             }
         }
+    }
+}
+
+/// Lays a document or a web page out as a paginated PDF.
+@MainActor
+protocol PDFConverting: AnyObject {
+    /// Writes the PDF into `dir`; returns it and the page's own title when it has one.
+    func convert(_ source: WebSource, layout: PDFLayout, paper: CGSize, into dir: URL,
+                 ctx: CommandContext) async throws -> (pdf: URL, title: String?)
+}
+
+/// WebKit lays the source out in an off-screen web view inside the calling window (Office files through its built-in
+/// viewer), `UIPrintPageRenderer` paginates it.
+@MainActor
+final class WebKitPDFConverter: PDFConverting {
+    func convert(_ source: WebSource, layout: PDFLayout, paper: CGSize, into dir: URL,
+                 ctx: CommandContext) async throws -> (pdf: URL, title: String?) {
+        guard !NibApp.isHostlessTest, let window = await ImportUI.navigator(ctx)?.rootViewController?.view.window else {
+            throw NibError(.unavailable, "converting documents needs an open Nib window",
+                           hint: "open Nib on the device and import again")
+        }
+        // Office files and saved pages render without scripts; a live page may need them for its layout.
+        let isRemote: Bool
+        if case .remote = source { isRemote = true } else { isRemote = false }
+        let renderer = WebPDFRenderer(host: window, width: paper.width, javaScript: isRemote)
+        defer { renderer.tearDown() }
+        try await renderer.load(source, settle: layout.settleSeconds)
+        let pdf = dir.appendingPathComponent("converted-" + UUID().uuidString + ".pdf")
+        try await renderer.writePDF(paper: paper, margin: layout.margin, to: pdf)
+        return (pdf, renderer.pageTitle)
     }
 }
 

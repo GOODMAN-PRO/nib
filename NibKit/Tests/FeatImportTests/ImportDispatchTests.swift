@@ -389,13 +389,169 @@ final class ImportDispatchTests: XCTestCase {
                                             order: [1, 0]))
         model.phase = .importing
         XCTAssertNil(model.primaryTitle)
+        XCTAssertEqual(model.title, "Importing 2 files")
+        XCTAssertEqual(model.cancelTitle, "Stop")
         model.confirm()
         XCTAssertEqual(calls, 1)
         model.cancel()
         XCTAssertTrue(model.cancelRequested)
-        model.showResult([ImportFailure(url: "tmp:b.png", code: "unsupported", message: "no")])
+        model.showResult(imported: 1, failures: [ImportFailure(url: "tmp:b.png", code: "unsupported", message: "no")])
         XCTAssertEqual(model.phase, .finished)
         XCTAssertEqual(model.title, "1 of 2 imported")
+        XCTAssertEqual(model.cancelTitle, "Close")
+        // A stopped import counts what arrived, not the files minus the failures.
+        model.showResult(imported: 0, failures: [ImportFailure(url: "tmp:b.png", code: "unsupported", message: "no")])
+        XCTAssertEqual(model.title, "0 of 2 imported")
+    }
+
+    // MARK: After the import
+
+    func testRevealShowsWhatArrived() {
+        let intoNotebook = ImportDestination(doc: "DOC", position: .end)
+        XCTAssertEqual(ImportReveal.plan(pages: ["page:DOC/P1", "page:DOC/P2"], created: ["DOC"], topFolders: [],
+                                         destination: intoNotebook, openDocument: "DOC"), .goToPage("page:DOC/P1"))
+        XCTAssertEqual(ImportReveal.plan(pages: ["page:DOC/P1"], created: ["DOC"], topFolders: [],
+                                         destination: intoNotebook, openDocument: "OTHER"), .open("DOC", page: "page:DOC/P1"))
+        XCTAssertNil(ImportReveal.plan(pages: [], created: [], topFolders: [], destination: intoNotebook, openDocument: nil))
+
+        let inFolder = ImportDestination(folder: "PHYSICS")
+        XCTAssertEqual(ImportReveal.plan(pages: [], created: ["NEW"], topFolders: [], destination: inFolder, openDocument: nil),
+                       .open("NEW", page: nil))
+        // A dropped folder, or a zip holding one folder: that folder.
+        XCTAssertEqual(ImportReveal.plan(pages: [], created: ["A", "B"], topFolders: ["TRIP"], destination: inFolder,
+                                         openDocument: nil), .showFolder("TRIP"))
+        // Several documents or folders: where they went.
+        XCTAssertEqual(ImportReveal.plan(pages: [], created: ["A", "B"], topFolders: [], destination: inFolder,
+                                         openDocument: nil), .showFolder("PHYSICS"))
+        XCTAssertEqual(ImportReveal.plan(pages: [], created: ["A"], topFolders: ["X", "Y"], destination: .libraryRoot,
+                                         openDocument: nil), .showFolder(nil))
+        XCTAssertNil(ImportReveal.plan(pages: [], created: [], topFolders: [], destination: .libraryRoot, openDocument: nil))
+    }
+
+    func testCallsThatArriveTogetherShareOneResult() async throws {
+        let batch = ImportBatch([ImportSource(original: "tmp:a.pdf")])
+        let joined = Task { @MainActor in try await batch.join([ImportSource(original: "tmp:b.png")]) }
+        for _ in 0..<1_000 where batch.waiting == 0 { await Task.yield() }
+        XCTAssertEqual(batch.waiting, 1)
+        XCTAssertEqual(batch.sources.map { $0.name }, ["a.pdf", "b.png"])
+        let result = ImportResult(refs: ["doc:A", "doc:B"])
+        batch.finish(.success(result))
+        let value = try await joined.value
+        XCTAssertEqual(value, result)
+        XCTAssertEqual(batch.waiting, 0)
+
+        let failing = ImportBatch([ImportSource(original: "tmp:c.pdf")])
+        let other = Task { @MainActor in try await failing.join([ImportSource(original: "tmp:d.pdf")]) }
+        for _ in 0..<1_000 where failing.waiting == 0 { await Task.yield() }
+        failing.finish(.failure(NibError(.unavailable, "no window")))
+        do {
+            _ = try await other.value
+            XCTFail("the joined call should see the batch's error")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .unavailable)
+        }
+    }
+
+    func testAFileIsImportedByOneCallAtATime() {
+        let inbox = ImportLocations.openInInbox.appendingPathComponent("Lecture.pdf")
+        let other = URL(fileURLWithPath: "/tmp/nib-import-tests/Other.pdf")
+        let first = ImportEngine.claim([ImportSource(original: inbox.absoluteString), ImportSource(original: "tmp:x.png"),
+                                        ImportSource(original: "https://example.com/a.pdf")])
+        XCTAssertEqual(first.sources.count, 3)
+        XCTAssertEqual(first.paths, [inbox.standardizedFileURL.path])
+        // The inbox scan (or a second Open In) finds it taken; its other files go ahead.
+        let second = ImportEngine.claim([ImportSource(original: inbox.absoluteString),
+                                         ImportSource(original: other.absoluteString)])
+        XCTAssertEqual(second.sources.map { $0.name }, ["Other.pdf"])
+        ImportEngine.release(first.paths)
+        ImportEngine.release(second.paths)
+        XCTAssertFalse(ImportEngine.inFlight.contains(inbox.standardizedFileURL.path))
+        // Hand-off files already live in this import's staging folder: never claimed.
+        let local = ImportSource(original: other.absoluteString, name: "Other.pdf", local: other)
+        XCTAssertEqual(ImportEngine.claim([local]).paths, [])
+    }
+
+    func testDownloadFoldersAreRemovedOnceEmptied() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appendingPathComponent("nib-downloads", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        StagingIO.removeDownloadFolder(of: folder.appendingPathComponent("Lecture.pdf"))
+        XCTAssertFalse(fm.fileExists(atPath: folder.path))
+        // Anything that is not a download folder stays.
+        let dir = try tempDir()
+        StagingIO.removeDownloadFolder(of: dir.appendingPathComponent("Lecture.pdf"))
+        XCTAssertTrue(fm.fileExists(atPath: dir.path))
+    }
+
+    func testNotebookTargetsPickOnlyPageFormats() {
+        let content = registries()
+        let pages = Set(ImportUI.pickerTypes(content, pagesOnly: true).map { $0.identifier })
+        XCTAssertTrue(pages.contains(UTType.pdf.identifier))
+        XCTAssertTrue(pages.contains(UTType.image.identifier))
+        XCTAssertTrue(pages.contains(UTType(filenameExtension: "docx")?.identifier ?? "?"))
+        XCTAssertFalse(pages.contains(UTType.folder.identifier))
+        XCTAssertFalse(pages.contains(UTType.zip.identifier))
+        let all = Set(ImportUI.pickerTypes(content).map { $0.identifier })
+        XCTAssertTrue(all.isSuperset(of: [UTType.folder.identifier, UTType.zip.identifier, UTType.pdf.identifier]))
+        // Without a PDF importer nothing can be converted into pages: images only.
+        let bare = ContentRegistries()
+        bare.importers.register(ImageImporter.descriptor(owner: FeatImportFeature.id))
+        XCTAssertEqual(ImportUI.pickerTypes(bare, pagesOnly: true).map { $0.identifier }, [UTType.image.identifier])
+    }
+
+    func testLongImportsShowTheirProgress() throws {
+        let dir = try tempDir()
+        let small = dir.appendingPathComponent("a.pdf")
+        try Data("%PDF-1.4".utf8).write(to: small)
+        XCTAssertFalse(ImportUI.isLong([small]))
+        XCTAssertTrue(ImportUI.isLong([small, small]))
+        XCTAssertTrue(ImportUI.isLong([dir]), "a folder")
+        XCTAssertTrue(ImportUI.isLong([dir.appendingPathComponent("Deck.pptx")]), "a conversion")
+        XCTAssertTrue(ImportUI.isLong([dir.appendingPathComponent("Library.zip")]), "an archive")
+        let big = dir.appendingPathComponent("Scans.pdf")
+        XCTAssertTrue(FileManager.default.createFile(atPath: big.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: big)
+        try handle.truncate(atOffset: UInt64(ImportUI.longImportBytes + 1))
+        try handle.close()
+        XCTAssertTrue(ImportUI.isLong([big]), "a big file")
+        XCTAssertEqual(ImportUI.progressLabel("a.pdf", index: 1, count: 3), "2 of 3: “a.pdf”")
+        XCTAssertEqual(ImportUI.progressLabel("a.pdf", index: 0, count: 1), "“a.pdf”")
+        XCTAssertEqual(ImportDialogLogic.importingTitle(names: ["a.pdf"]), "Importing “a.pdf”")
+    }
+
+    // MARK: Folder styles
+
+    private struct StyleFile: Encodable {
+        var id: String
+        var rev: Rev
+        var color: RGBA?
+        var icon: String?
+        var favorite: Bool
+    }
+
+    private func writeStyle(_ file: StyleFile, device: String, in dir: URL) throws {
+        try JSONEncoder().encode(file).write(to: dir.appendingPathComponent(".nibfolder.\(device).json"))
+    }
+
+    func testFolderStylesComeFromTheNewestStyleFile() throws {
+        let dir = try tempDir()
+        XCTAssertNil(FolderStyleFiles.style(in: dir))
+        try writeStyle(StyleFile(id: "PHYSICS", rev: Rev(wallMs: 1_000, counter: 0, device: 1), color: RGBA(0x20, 0x60, 0xC0),
+                                 icon: "atom", favorite: false), device: "00000001", in: dir)
+        XCTAssertEqual(FolderStyleFiles.style(in: dir), FolderStyle(color: RGBA(0x20, 0x60, 0xC0), icon: "atom"))
+        try writeStyle(StyleFile(id: "PHYSICS", rev: Rev(wallMs: 2_000, counter: 0, device: 2), color: RGBA(0xC0, 0x30, 0x30),
+                                 icon: nil, favorite: true), device: "00000002", in: dir)
+        XCTAssertEqual(FolderStyleFiles.style(in: dir), FolderStyle(color: RGBA(0xC0, 0x30, 0x30), favorite: true))
+        // A file from another version (bad colour, missing fields) never stops an import.
+        try Data(#"{"rev": "not a rev", "color": 12}"#.utf8).write(to: dir.appendingPathComponent(".nibfolder.00000003.json"))
+        XCTAssertEqual(FolderStyleFiles.style(in: dir)?.favorite, true)
+        try Data("garbage".utf8).write(to: dir.appendingPathComponent(".nibfolder.00000004.json"))
+        XCTAssertEqual(FolderStyleFiles.style(in: dir)?.color, RGBA(0xC0, 0x30, 0x30))
+        // A default style is no style.
+        let plain = try tempDir()
+        try writeStyle(StyleFile(id: "X", rev: .zero, color: nil, icon: nil, favorite: false), device: "00000001", in: plain)
+        XCTAssertNil(FolderStyleFiles.style(in: plain))
     }
 
     // MARK: Share hand-off, web locations, inboxes and drops
@@ -446,8 +602,14 @@ final class ImportDispatchTests: XCTestCase {
         try Data().write(to: documents.appendingPathComponent("notes.xyz"))
         try Data().write(to: documents.appendingPathComponent(".hidden.pdf"))
 
+        try fm.createDirectory(at: documents.appendingPathComponent("Kinematics.nibnote", isDirectory: true),
+                               withIntermediateDirectories: true)
         let entries = InboxFiles.entries(inboxes: [inbox], documents: documents)
         XCTAssertEqual(Set(entries.map { $0.url.lastPathComponent }), ["shared.pdf", "Trip", "loose.pdf", "notes.xyz"])
+        // A Nib document copied into Documents with Finder, when the library lives somewhere else.
+        let withPackages = InboxFiles.entries(inboxes: [inbox], documents: documents, packagesFromDocuments: true)
+        XCTAssertEqual(Set(withPackages.map { $0.url.lastPathComponent }),
+                       ["shared.pdf", "Trip", "loose.pdf", "notes.xyz", "Kinematics.nibnote"])
         XCTAssertEqual(entries.first { $0.url.lastPathComponent == "Trip" }?.isDirectory, true)
         XCTAssertEqual(entries.first { $0.url.lastPathComponent == "loose.pdf" }?.fromInbox, false)
 
@@ -462,6 +624,15 @@ final class ImportDispatchTests: XCTestCase {
         // A declined file changes: it is offered again.
         try Data("%PDF-1.7 changed".utf8).write(to: loose.url)
         XCTAssertNotEqual(InboxFiles.key(loose.url), loose.key)
+        let rescanned = InboxFiles.entries(inboxes: [inbox], documents: documents)
+        XCTAssertTrue(InboxFiles.offered(rescanned, inFlight: [], declined: [loose.key], canImport: pdfOnly)
+            .contains { $0.url.lastPathComponent == "loose.pdf" })
+
+        // After an import, what is still on disk is left alone; what was imported (removed) is not remembered.
+        try fm.removeItem(at: shared.url)
+        let remaining = InboxFiles.remaining(offered)
+        XCTAssertTrue(remaining.contains(InboxFiles.key(loose.url)))
+        XCTAssertFalse(remaining.contains { $0.hasPrefix(shared.url.standardizedFileURL.path + "|") })
     }
 
     func testLocationsTellInsideFromOutside() {
