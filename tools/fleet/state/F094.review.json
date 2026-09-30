@@ -1,0 +1,29 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAppearance/AppearanceStyles.swift AppearanceSettingsModel.select/commit",
+      "problem": "Each tap starts its own Task running settings.set. Nothing serializes them. CommandBus.execute awaits hooks and gateway.authorize. If a plugin hook on settings.set suspends, a tap on Calm and then Off can land in the reverse order. The stored value then ends up Calm, which is not what the user picked last. The pending-token logic only hides this until both writes finish.",
+      "fix": "Chain the writes. Keep `private var lastWrite: Task<NibError?, Never>?`, and have commit await `lastWrite?.value` before calling bus.execute. Alternatively, skip a commit whose token is no longer `pending?.token` before executing. Add a test that fires two selections back to back and asserts the stored value is the last one."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAppearance/AppearanceStyles.swift LiquidChoice",
+      "problem": "LiquidChoice duplicates NibDesign's NibLiquidMode (full, calm, off). The test only claims they match and never checks it. LiquidChoice(setting:) also trims and lowercases the stored value. The consumers on feat/F016 (ToolbarView) and feat/F017 (DocumentContainerViewController) use the strict `NibLiquidMode(rawValue:) ?? .full`. So a stored \" Calm\" or \"OFF\" shows as Calm/Off on this page while the droplets run Full.",
+      "fix": "Build the control on NibLiquidMode itself, with an internal `extension NibLiquidMode { var title: String }` and `NibLiquidMode(rawValue:) ?? .full`. Or at minimum drop the trim and lowercase so the page reads the value the way the chrome does. Add `XCTAssertEqual(LiquidChoice.allCases.map(\\.rawValue), NibLiquidMode.allCases.map(\\.rawValue))`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatAppearanceTests/FeatAppearanceTests.swift",
+      "problem": "Three things in the failure path of the only user action have no test: clearing the pending choice, the control reverting, and posting .nibCommandFailed for the shell toast.",
+      "fix": "Register a Harness command hook for settings.set that throws, or pass an app whose settings.set is rejected. Call `await model.set(.off)` and assert the returned error is non-nil and `model.liquid` is back to the stored value. Also assert a .nibCommandFailed notification was posted with command == CommandIDs.settingsSet."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAppearance/AppearanceStyles.swift DarkModeAudit.overrides(in:)",
+      "problem": "The run-time 'UI follows system' check looks only at each window and its root view controller. A presented controller, such as a settings sheet, a panel or a full-screen presentation, or a child controller that pins overrideUserInterfaceStyle, is never reported.",
+      "fix": "Walk each root's presentedViewController chain and its children recursively, and collect every controller's overrideUserInterfaceStyle. Add a windowFindings case for a presented controller in the tests."
+    }
+  ]
+}
