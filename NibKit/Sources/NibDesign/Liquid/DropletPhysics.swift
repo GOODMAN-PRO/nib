@@ -129,6 +129,16 @@ enum DropletPhysics {
     static let carefulReleaseStill: Double = 0.070
     static let maxReleaseSpeed: CGFloat = 5000
     static let maxSlotSpeed: CGFloat = 1200
+    /// Settle lead (DESIGN.md §10.3): when the stretch target falls back towards zero (the droplet slows down), the
+    /// surface reacts as if it had fallen 33 ms earlier, so it overshoots zero once by about 6 % of its peak for every
+    /// droplet size (water landing: half a visible cycle, never a second bounce). Without it the settle is a dead stop.
+    static let settleLead: CGFloat = 0.033
+
+    /// How far a held droplet trails the finger at `speed` with a critically damped follow spring: v·ζ·response/π
+    /// (27 pt at 1000 pt/s with `follow`). The slight lag is the water's weight (DESIGN.md §10.1).
+    static func followLag(speed: CGFloat, spring: NibSpring = NibMotion.follow) -> CGFloat {
+        speed * CGFloat(spring.dampingRatio * spring.response) / .pi
+    }
 
     /// UIScrollView-style resistance past [lo, hi]: edge + D·(1 − 1/(0.55·e/D + 1)).
     static func rubberBand(_ v: CGFloat, lo: CGFloat, hi: CGFloat, dimension d: CGFloat = rubberDimension) -> CGFloat {
@@ -401,8 +411,15 @@ struct DropletDynamics: Equatable, Sendable {
         if reduceMotion || cap == 0 {
             stretch.snap(to: 0)
         } else {
+            let wobble = NibMotion.wobble(minor: min(w, h))
+            if abs(target) < abs(stretch.target) {
+                // Settle lead: a target falling back towards zero kicks the surface by the spring force it would have
+                // felt had it fallen `settleLead` earlier. Rising targets (speeding up) get no lead.
+                let omega = 2 * CGFloat.pi / CGFloat(wobble.response)
+                stretch.velocity += omega * omega * DropletPhysics.settleLead * (target - stretch.target)
+            }
             stretch.target = target
-            stretch.step(dt, spring: NibMotion.wobble(minor: min(w, h)))
+            stretch.step(dt, spring: wobble)
         }
         return !(offset.isResting && size.isResting && corner.isResting && stretch.isResting
                  && lift.isResting && anchor.isResting)

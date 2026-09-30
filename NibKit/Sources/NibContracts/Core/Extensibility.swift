@@ -13,6 +13,27 @@ public enum ServiceKeys {
     /// `CollabTransport` implementations.
     public static let collabMultipeer = "collab.transport.multipeer"
     public static let collabRelay = "collab.transport.relay"
+    /// contracts-v2: NSSet of `DocumentID.raw` the store refuses to write (F001's interim publication). Prefer
+    /// `CommandContext.isReadOnly(_:)` / `NibApp.isReadOnly(_:)`, which also ask `DocumentPersistence.isReadOnly`.
+    public static let storeReadOnly = "store.readOnly"
+}
+
+/// contracts-v2: names shared by the MCP/HTTP bridge (F090) and its settings page (F091), which cannot import each other.
+/// Every setting is `security.*` (user only) and device-local; F091 reads and writes them through settings.get/set.
+public enum BridgeNames {
+    /// Bool, default false. Change it with `bridge.setEnabled {enabled, rotateToken?}`.
+    public static let enabledSetting = "security.bridge.enabled"
+    /// Int, default 7331.
+    public static let portSetting = "security.bridge.port"
+    /// [CIDR string]; unset = the bridge's default networks (see `settings.describe`).
+    public static let networksSetting = "security.bridge.networks"
+    /// [origin string], default [].
+    public static let originsSetting = "security.bridge.origins"
+    /// Keychain location of the bridge token (generic password, this device only).
+    public static let tokenService = "app.nib.bridge"
+    public static let tokenAccount = "token"
+    /// Event emitted when the bridge state changes (`NibEventType.bridgeStatus`).
+    public static let statusEvent = NibEventType.bridgeStatus
 }
 
 // MARK: - Plugin manifest (see docs/PLUGIN_API.md)
