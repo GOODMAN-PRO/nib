@@ -22,6 +22,9 @@ enum LibraryLayout {
     static let trashedFromFolderKey = "library.trashedFromFolder"
     /// The name a document had before it went to the Trash (its package there may carry a number after a clash).
     static let trashedTitleKey = "library.trashedTitle"
+    /// Temporary name of an item during a case-only rename: `.nib-rename-<8 hex>-<new name>`. The scan never lists it;
+    /// one left behind (the app stopped between the two moves) is moved back to a visible name.
+    static let renamePrefix = ".nib-rename-"
 
     static func headFileName(_ device: String) -> String { headPrefix + device + jsonSuffix }
     static func folderFileName(_ device: String) -> String { folderPrefix + device + jsonSuffix }
@@ -54,6 +57,26 @@ enum LibraryLayout {
     /// `child` is `path` itself or lies inside it.
     static func isWithin(_ child: String, _ path: String) -> Bool {
         child == path || child.hasPrefix(path + "/")
+    }
+
+    /// The path of the item directly in the Trash that holds `path` (itself when it is directly in the Trash); nil
+    /// outside the Trash.
+    static func trashTopPath(of path: String) -> String? {
+        let prefix = trashPath + "/"
+        guard path.hasPrefix(prefix) else { return nil }
+        let rest = path.dropFirst(prefix.count)
+        guard let name = rest.split(separator: "/", omittingEmptySubsequences: false).first, !name.isEmpty else { return nil }
+        return prefix + String(name)
+    }
+
+    /// The name a case-only rename's temporary item was going to get (nil for a temporary name without one).
+    static func intendedName(ofTemporary name: String) -> String? {
+        guard name.hasPrefix(renamePrefix) else { return nil }
+        let rest = name.dropFirst(renamePrefix.count)
+        guard rest.count > 9, rest.dropFirst(8).first == "-",
+              rest.prefix(8).allSatisfy({ ("0"..."9").contains($0) || ("a"..."f").contains($0) }) else { return nil }
+        let intended = String(rest.dropFirst(9))
+        return intended.isEmpty ? nil : intended
     }
 }
 
@@ -307,9 +330,12 @@ enum PackageIO {
     static func updateHead(_ pkg: URL, device: String, clock: HLCClock, collapse: Bool = false,
                            _ change: (inout DocumentContent) -> Void) throws -> DocumentContent {
         let files = headFiles(in: pkg, device: device)
+        var merged: [URL] = []
         let heads = files.compactMap { url -> DocumentContent? in
-            guard let data = try? Data(contentsOf: url) else { return nil }
-            return try? JSONDecoder().decode(DocumentContent.self, from: data)
+            guard let data = try? Data(contentsOf: url),
+                  let head = try? JSONDecoder().decode(DocumentContent.self, from: data) else { return nil }
+            merged.append(url)
+            return head
         }
         guard var head = merge(heads) else {
             throw NibError(.notFound, "the document '\(pkg.deletingPathExtension().lastPathComponent)' has no readable head",
@@ -328,8 +354,9 @@ enum PackageIO {
             let own = LibraryLayout.headFileName(device)
             for url in files where url.lastPathComponent != own { try? FileOps.remove(url) }
         } else {
-            // Conflict copies are merged into this device's file now, so they can go (ARCHITECTURE §4.3).
-            for url in files where LibraryLayout.device(of: url.lastPathComponent, prefix: LibraryLayout.headPrefix)?.exact == false {
+            // Conflict copies are merged into this device's file now, so they can go (ARCHITECTURE §4.3); one that did
+            // not decode (still downloading, damaged) was not merged and stays.
+            for url in merged where LibraryLayout.device(of: url.lastPathComponent, prefix: LibraryLayout.headPrefix)?.exact == false {
                 try? FileOps.remove(url)
             }
         }
@@ -702,13 +729,26 @@ struct CatalogScanner {
     static let keys: [URLResourceKey] = [.isDirectoryKey, .contentModificationDateKey, .creationDateKey, .fileSizeKey]
         + UbiquityState.resourceKeys
 
+    /// What a scan found: the catalog entries, and items a case-only rename left under its temporary name (the library
+    /// moves those back on the main actor, where no rename can be half done).
+    struct Result {
+        var entries: [CatalogEntry] = []
+        var stranded: [URL] = []
+    }
+
     /// The whole library: the tree under the root, then the Trash.
     func scan() -> [CatalogEntry] {
-        var out: [CatalogEntry] = []
+        scanAll().entries
+    }
+
+    /// `scan`, with the items stranded by an interrupted rename.
+    func scanAll() -> Result {
+        var out = Result()
         visit(list(root), in: "", inTrash: false, trashTop: false, isRoot: true, into: &out)
         let trash = root.appendingPathComponent(LibraryLayout.trashPath, isDirectory: true)
         visit(list(trash), in: LibraryLayout.trashPath, inTrash: true, trashTop: true, isRoot: false, into: &out)
-        return CatalogScanner.resolve(out, previous: previous, existing: [:])
+        out.entries = CatalogScanner.resolve(out.entries, previous: previous, existing: [:])
+        return out
     }
 
     /// One item and everything inside it (a new copy or import at `url`), resolved against `existing` entries so
@@ -716,16 +756,16 @@ struct CatalogScanner {
     func scanItem(at url: URL, inTrash: Bool, trashTop: Bool, existing: [String: CatalogEntry]) -> [CatalogEntry] {
         let path = relativePath(url)
         let parent = LibraryLayout.parentPath(of: path)
-        var out: [CatalogEntry] = []
+        var out = Result()
         let values = try? url.resourceValues(forKeys: Set(CatalogScanner.keys))
         let ext = url.pathExtension.lowercased()
         if ext == NibFormat.packageExtension || (ext == NibFormat.legacyPackageExtension && PackageIO.hasHeadFile(url)) {
-            out.append(document(url, path: path, parent: parent, values: values, legacy: ext != NibFormat.packageExtension,
-                                inTrash: inTrash, trashTop: trashTop))
+            out.entries.append(document(url, path: path, parent: parent, values: values,
+                                        legacy: ext != NibFormat.packageExtension, inTrash: inTrash, trashTop: trashTop))
         } else {
             folder(url, path: path, parent: parent, values: values, inTrash: inTrash, trashTop: trashTop, into: &out)
         }
-        return CatalogScanner.resolve(out, previous: previous, existing: existing)
+        return CatalogScanner.resolve(out.entries, previous: previous, existing: existing)
     }
 
     func relativePath(_ url: URL) -> String {
@@ -741,7 +781,7 @@ struct CatalogScanner {
     }
 
     private func visit(_ urls: [URL], in parent: String, inTrash: Bool, trashTop: Bool, isRoot: Bool,
-                       into out: inout [CatalogEntry]) {
+                       into out: inout Result) {
         for url in urls {
             let name = url.lastPathComponent
             let path = parent.isEmpty ? name : parent + "/" + name
@@ -749,8 +789,10 @@ struct CatalogScanner {
                 if name.hasSuffix(LibraryLayout.placeholderSuffix), name.count > 1 + LibraryLayout.placeholderSuffix.count {
                     let real = String(name.dropFirst().dropLast(LibraryLayout.placeholderSuffix.count))
                     if (real as NSString).pathExtension.lowercased() == NibFormat.packageExtension {
-                        out.append(placeholder(named: real, parent: parent, inTrash: inTrash, trashTop: trashTop))
+                        out.entries.append(placeholder(named: real, parent: parent, inTrash: inTrash, trashTop: trashTop))
                     }
+                } else if name.hasPrefix(LibraryLayout.renamePrefix), CatalogScanner.isStranded(url) {
+                    out.stranded.append(url)
                 }
                 continue
             }
@@ -759,19 +801,26 @@ struct CatalogScanner {
             if isRoot && skipInbox && name == LibraryLayout.inboxName { continue }
             let ext = url.pathExtension.lowercased()
             if ext == NibFormat.packageExtension {
-                out.append(document(url, path: path, parent: parent, values: values, legacy: false, inTrash: inTrash,
-                                    trashTop: trashTop))
+                out.entries.append(document(url, path: path, parent: parent, values: values, legacy: false,
+                                            inTrash: inTrash, trashTop: trashTop))
             } else if ext == NibFormat.legacyPackageExtension && PackageIO.hasHeadFile(url) {
-                out.append(document(url, path: path, parent: parent, values: values, legacy: true, inTrash: inTrash,
-                                    trashTop: trashTop))
+                out.entries.append(document(url, path: path, parent: parent, values: values, legacy: true,
+                                            inTrash: inTrash, trashTop: trashTop))
             } else {
                 folder(url, path: path, parent: parent, values: values, inTrash: inTrash, trashTop: trashTop, into: &out)
             }
         }
     }
 
+    /// A temporary rename directory holding a document's heads or a folder record (not an empty leftover).
+    static func isStranded(_ url: URL) -> Bool {
+        guard (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { return false }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
+        return names.contains { LibraryLayout.isHeadFile($0) || LibraryLayout.isFolderFile($0) }
+    }
+
     private func folder(_ url: URL, path: String, parent: String, values: URLResourceValues?, inTrash: Bool,
-                        trashTop: Bool, into out: inout [CatalogEntry]) {
+                        trashTop: Bool, into out: inout Result) {
         let children = list(url)
         let styleFiles = children.filter { LibraryLayout.isFolderFile($0.lastPathComponent) }
         let signature = CatalogScanner.signature(styleFiles)
@@ -812,7 +861,7 @@ struct CatalogScanner {
         entry.node.modified = values?.contentModificationDate?.timeIntervalSince1970 ?? entry.node.modified
         entry.node.created = values?.creationDate?.timeIntervalSince1970 ?? entry.node.created
         entry.node.sync = UbiquityState(values).badge
-        out.append(entry)
+        out.entries.append(entry)
         visit(children, in: path, inTrash: inTrash, trashTop: false, isRoot: false, into: &out)
     }
 
@@ -910,7 +959,8 @@ struct CatalogScanner {
     /// Makes ids unique and links parents. An id claimed twice (a package or folder copied in the Files app, or a
     /// provider showing an item at two places during a move) stays with the path that held it before (or the first
     /// path), and the other copy gets an id derived from its path, so the scan never writes to disk. Parents come
-    /// from the containing folder; a trashed item's parent is the live folder it was trashed from.
+    /// from the containing folder; a trashed item's parent is the live folder it was trashed from. Everything inside a
+    /// trashed folder carries the folder's `trashedAt`, so `node(_:)` tells it from a live item.
     static func resolve(_ scanned: [CatalogEntry], previous: [String: CatalogEntry],
                         existing: [String: CatalogEntry]) -> [CatalogEntry] {
         var formerOwner: [NibID: String] = [:]
@@ -944,6 +994,9 @@ struct CatalogScanner {
         var liveFolders = Set<FolderID>()
         for e in existing.values where e.isFolder && !e.inTrash { liveFolders.insert(e.node.id) }
         for e in out where e.isFolder && !e.inTrash { liveFolders.insert(e.node.id) }
+        var topTrashedAt: [String: Double] = [:]
+        for e in existing.values where e.trashTop { topTrashedAt[e.node.path] = e.node.trashedAt }
+        for e in out where e.trashTop { topTrashedAt[e.node.path] = e.node.trashedAt }
         for i in out.indices {
             if out[i].trashTop {
                 let from = out[i].trashedFromFolder
@@ -951,6 +1004,9 @@ struct CatalogScanner {
             } else {
                 let p = out[i].parentPath
                 out[i].node.parent = p.isEmpty ? nil : folderIDs[p]
+                if out[i].inTrash {
+                    out[i].node.trashedAt = LibraryLayout.trashTopPath(of: out[i].node.path).flatMap { topTrashedAt[$0] }
+                }
             }
         }
         return out

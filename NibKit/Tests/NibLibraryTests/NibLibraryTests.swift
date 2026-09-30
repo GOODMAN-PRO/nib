@@ -99,9 +99,11 @@ final class TempLibrary {
 
 @MainActor
 final class NibLibraryTests: XCTestCase {
-    private func makeLibrary(deviceID: UInt32 = 7) throws -> TempLibrary {
+    /// A library on a fresh folder, after the scan that choosing the folder started has landed.
+    private func makeLibrary(deviceID: UInt32 = 7) async throws -> TempLibrary {
         let lib = try TempLibrary(deviceID: deviceID)
         addTeardownBlock { [root = lib.root] in try? FileManager.default.removeItem(at: root) }
+        await lib.library.waitForScans()
         return lib
     }
 
@@ -153,7 +155,7 @@ final class NibLibraryTests: XCTestCase {
     // MARK: Creating
 
     func testDocCreateBuildsTheFirstContentOfEveryKind() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let notebook = try await lib.run("doc.create", ["kind": "notebook", "title": "Physics"])
         let nid = docID(notebook)
         XCTAssertEqual(notebook["title"]?.stringValue, "Physics")
@@ -218,7 +220,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testCallerChosenIDsAndUniqueNames() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let folder = try await lib.run("folder.create", ["title": "Maths", "color": "#FF9500", "icon": "function", "id": "MYFOLDER0001"])
         XCTAssertEqual(folder["ref"]?.stringValue, "folder:MYFOLDER0001")
         let a = try await lib.run("doc.create", ["kind": "notebook", "title": "Algebra", "folder": "folder:MYFOLDER0001",
@@ -248,7 +250,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testDryRunChangesNothing() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let r = try await lib.h.app.bus.execute(Invocation(command: "doc.create", params: ["kind": "notebook", "title": "Preview"],
                                                            dryRun: true))
         XCTAssertNotNil(r.value["ref"]?.stringValue)
@@ -259,7 +261,7 @@ final class NibLibraryTests: XCTestCase {
     // MARK: Folders
 
     func testFolderStyleAndFavourite() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let f = folderID(try await lib.run("folder.create", ["title": "Chemistry"]))
         let styled = try await lib.run("folder.setStyle", ["folder": .string("folder:\(f.raw)"), "color": "#34C759", "favorite": true])
         XCTAssertEqual(styled["favorite"]?.boolValue, true)
@@ -275,8 +277,8 @@ final class NibLibraryTests: XCTestCase {
         XCTAssertEqual(lib.library.node(f)?.favorite, true)
     }
 
-    func testFolderStyleEditsFromTwoDevicesMergeByRevision() throws {
-        let lib = try makeLibrary()
+    func testFolderStyleEditsFromTwoDevicesMergeByRevision() async throws {
+        let lib = try await makeLibrary()
         let f = try lib.library.createFolder(title: "Shared", in: nil, style: FolderStyle(color: RGBA(hex: "#FF0000")), id: "SHAREDFOLDR1")
         let dir = lib.root.appendingPathComponent("Shared", isDirectory: true)
         // Another device (0000000b) restyled it later: its own file, a higher revision.
@@ -299,7 +301,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testFoldersWithoutRecordsKeepTheirIDWhenMoved() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         try FileManager.default.createDirectory(at: lib.root.appendingPathComponent("Made in Files/Inner"),
                                                 withIntermediateDirectories: true)
         lib.library.refresh()
@@ -317,7 +319,7 @@ final class NibLibraryTests: XCTestCase {
     // MARK: Rename and move
 
     func testRenameAndMoveKeepPackageLocationsInSync() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Draft"]))
         let f = folderID(try await lib.run("folder.create", ["title": "Biology"]))
         let renamed = try await lib.run("library.rename", ["ref": .string("doc:\(d.raw)"), "title": "Cells: an overview"])
@@ -344,7 +346,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testAFolderCannotMoveIntoItself() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let outer = folderID(try await lib.run("folder.create", ["title": "Outer"]))
         let inner = folderID(try await lib.run("folder.create", ["title": "Inner", "parent": .string("folder:\(outer.raw)")]))
         for target in [outer, inner] {
@@ -360,7 +362,7 @@ final class NibLibraryTests: XCTestCase {
     // MARK: Trash
 
     func testTrashThenRecoverRestoresTheOriginalFolder() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let f = folderID(try await lib.run("folder.create", ["title": "Physics"]))
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Kinematics", "folder": .string("folder:\(f.raw)")]))
         let trashed = try await lib.run("library.trash", ["refs": [.string("doc:\(d.raw)")]])
@@ -395,7 +397,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testRecoverFallsBackToTheRootWhenTheFolderIsGone() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let f = folderID(try await lib.run("folder.create", ["title": "Temporary"]))
         let d = docID(try await lib.run("doc.create", ["kind": "whiteboard", "title": "Sketch", "folder": .string("folder:\(f.raw)")]))
         try await lib.run("library.trash", ["refs": [.string("doc:\(d.raw)")]])
@@ -408,7 +410,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testTrashedFolderComesBackWithItsContents() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let parent = folderID(try await lib.run("folder.create", ["title": "School"]))
         let f = folderID(try await lib.run("folder.create", ["title": "Year 9", "parent": .string("folder:\(parent.raw)")]))
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "History", "folder": .string("folder:\(f.raw)")]))
@@ -427,7 +429,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testDeletePermanentlyOnlyTakesTrashedItemsAndEmptyTrashClearsIt() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let a = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "A"]))
         let b = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "B"]))
         let c = folderID(try await lib.run("folder.create", ["title": "C"]))
@@ -449,7 +451,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testTrashListIncludesTrashedPages() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Pages", "cover": false, "pages": 2]))
         let page = try XCTUnwrap(lib.head(d)?.livePages.last)
         // Trash one page through the workspace, the way page.trash (F022) does.
@@ -477,7 +479,7 @@ final class NibLibraryTests: XCTestCase {
     // MARK: Duplicate
 
     func testDuplicateGetsANewIDAndOnlyThisDevicesHead() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Lab Report"]))
         let pkg = try XCTUnwrap(lib.url(d))
         var other = try XCTUnwrap(lib.head(d))
@@ -510,7 +512,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testDuplicateFolderGivesEverythingInsideNewIDs() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let f = folderID(try await lib.run("folder.create", ["title": "Term 1", "color": "#AF52DE"]))
         let sub = folderID(try await lib.run("folder.create", ["title": "Week 1", "parent": .string("folder:\(f.raw)")]))
         let d = docID(try await lib.run("doc.create", ["kind": "textDocument", "title": "Notes", "folder": .string("folder:\(sub.raw)")]))
@@ -528,7 +530,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testDuplicateRefusesDocumentsFromANewerNib() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         var meta = DocumentMeta(id: "NEWERFORMAT1", kind: .notebook, createdAt: 1_700_000_000)
         meta.format = NibFormat.version + 1
         meta.rev = Rev(wallMs: 1_700_000_000_000, counter: 0, device: 11)
@@ -546,8 +548,8 @@ final class NibLibraryTests: XCTestCase {
 
     // MARK: Import
 
-    func testImportPackagesAndFoldersOfPackages() throws {
-        let lib = try makeLibrary()
+    func testImportPackagesAndFoldersOfPackages() async throws {
+        let lib = try await makeLibrary()
         let outside = FileManager.default.temporaryDirectory.appendingPathComponent("nibimport-" + UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: outside) }
         var meta = DocumentMeta(id: "IMPORTED0001", kind: .studySet, createdAt: 1_700_000_000)
@@ -574,12 +576,23 @@ final class NibLibraryTests: XCTestCase {
         XCTAssertEqual(lib.library.node(fromFolder)?.path, "Course/Week 1/Old.nibnote", "legacy packages come in as .nibnote")
         XCTAssertEqual(lib.library.allNodes().filter { $0.kind == .folder }.map { $0.title }.sorted(), ["Course", "Week 1"])
         XCTAssertThrowsError(try lib.library.importPackage(at: outside.appendingPathComponent("missing"), into: nil))
+
+        // A folder without Nib documents is refused before anything is copied.
+        let photos = outside.appendingPathComponent("Photos/Summer", isDirectory: true)
+        try FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
+        try Data("jpeg".utf8).write(to: photos.appendingPathComponent("beach.jpg"))
+        let before = lib.library.allNodes().count
+        XCTAssertThrowsError(try lib.library.importPackage(at: outside.appendingPathComponent("Photos"), into: nil)) { e in
+            XCTAssertEqual((e as? NibError)?.code, .invalidParams)
+        }
+        XCTAssertFalse(lib.exists("Photos"))
+        XCTAssertEqual(lib.library.allNodes().count, before)
     }
 
     // MARK: Favourites and commits
 
     func testSetFavoriteIsUndoableAndRefreshesTheCatalog() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Star me"]))
         var changes = 0
         let sub = lib.h.app.events.subscribe { e in if e.type == NibEventType.libraryChanged { changes += 1 } }
@@ -597,7 +610,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testLockedDocumentsShowOnlyTheirRefToOtherCallers() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Diary"]))
         lib.h.app.gateway.isLocked = { $0 == d }
         let asAI = try await lib.run("library.list", as: .ai("chat"))
@@ -669,7 +682,7 @@ final class NibLibraryTests: XCTestCase {
     // MARK: Listing
 
     func testLibraryListSortsFiltersRecursesAndPages() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let f = folderID(try await lib.run("folder.create", ["title": "Zoology"]))
         try await lib.run("doc.create", ["kind": "notebook", "title": "b notebook"])
         try await lib.run("doc.create", ["kind": "whiteboard", "title": "A board"])
@@ -712,7 +725,7 @@ final class NibLibraryTests: XCTestCase {
     // MARK: Disk scan and catalog
 
     func testRefreshPicksUpChangesMadeByOtherDevices() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         var meta = DocumentMeta(id: "FOREIGNDOC01", kind: .whiteboard, createdAt: 1_700_000_000)
         meta.rev = Rev(wallMs: 1_700_000_000_000, counter: 0, device: 11)
         var content = DocumentContent(meta: meta, pages: [PageRecord(order: "V", size: nil)])
@@ -737,7 +750,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testACopiedPackageGetsItsOwnID() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Original"]))
         try FileManager.default.copyItem(at: lib.root.appendingPathComponent("Original.nibnote"),
                                          to: lib.root.appendingPathComponent("Original 2.nibnote"))
@@ -752,7 +765,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testLegacyNibPackagesAreListedAndRenamedOnFirstOpen() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         var meta = DocumentMeta(id: "LEGACYDOC001", kind: .notebook, createdAt: 1_600_000_000)
         meta.rev = Rev(wallMs: 1_600_000_000_000, counter: 0, device: 11)
         try lib.writeForeignPackage("Old Notes.nib", content: DocumentContent(meta: meta, pages: [PageRecord(order: "V")]),
@@ -815,8 +828,8 @@ final class NibLibraryTests: XCTestCase {
         XCTAssertNil(CatalogCache.load(url, root: "/another"), "a cache belongs to one library root")
     }
 
-    func testIncrementalScanReusesUnchangedPackages() throws {
-        let lib = try makeLibrary()
+    func testIncrementalScanReusesUnchangedPackages() async throws {
+        let lib = try await makeLibrary()
         for i in 0..<30 {
             var meta = DocumentMeta(id: NibID(String(format: "SCANDOC%05d", i)), kind: .notebook, createdAt: 1_700_000_000)
             meta.rev = Rev(wallMs: 1_700_000_000_000, counter: UInt32(i), device: 11)
@@ -834,7 +847,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testSetRootSwitchesLibrariesAndRemembersTheFolder() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         try await lib.run("doc.create", ["kind": "notebook", "title": "In A"])
         let other = FileManager.default.temporaryDirectory.appendingPathComponent("niblibrary-b-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
@@ -844,10 +857,32 @@ final class NibLibraryTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: other.appendingPathComponent(".nib-library").path),
                       "the library folder gets its marker")
         XCTAssertFalse(lib.h.app.settings.get(LibrarySettings.rootBookmark).isEmpty, "the folder is remembered as a bookmark")
+        // The new folder is scanned off the main actor.
+        await lib.library.waitForScans()
+        XCTAssertTrue(lib.library.allNodes().isEmpty)
         try await lib.run("doc.create", ["kind": "notebook", "title": "In B"])
         try lib.library.setRoot(lib.root)
+        await lib.library.waitForScans()
         XCTAssertEqual(lib.library.allNodes().map { $0.title }, ["In A"])
         XCTAssertEqual(lib.library.rootURL.standardizedFileURL.path, lib.root.standardizedFileURL.path)
+
+        // A folder without a cached catalog lists nothing until its scan lands, then everything in it.
+        let third = FileManager.default.temporaryDirectory.appendingPathComponent("niblibrary-c-" + UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: third) }
+        var meta = DocumentMeta(id: "THIRDLIBDOC1", kind: .notebook, createdAt: 1_700_000_000)
+        meta.rev = Rev(wallMs: 1_700_000_000_000, counter: 0, device: 11)
+        let pkg = third.appendingPathComponent("Elsewhere.nibnote", isDirectory: true)
+        try FileManager.default.createDirectory(at: pkg, withIntermediateDirectories: true)
+        try PackageIO.encoder().encode(DocumentContent(meta: meta)).write(to: pkg.appendingPathComponent("doc.0000000b.json"))
+        var changes = 0
+        let sub = lib.h.app.events.subscribe { e in if e.type == NibEventType.libraryChanged { changes += 1 } }
+        defer { sub.cancel() }
+        try lib.library.setRoot(third)
+        XCTAssertEqual(changes, 1, "the switch is announced at once")
+        await lib.library.waitForScans()
+        XCTAssertEqual(lib.library.allNodes().map { $0.title }, ["Elsewhere"])
+        XCTAssertEqual(lib.h.app.services.packages.url("THIRDLIBDOC1")?.lastPathComponent, "Elsewhere.nibnote")
+        XCTAssertEqual(changes, 2, "and again when the scan lands")
     }
 
     func testInContainer() {
@@ -940,7 +975,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testSyncedSettingsGoToTheLibraryFolder() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         lib.h.app.settings.set(NibSettings.snapToGrid, true)
         lib.library.prefs.flush()
         let file = lib.root.appendingPathComponent(".nib-library/prefs.\(lib.device).json")
@@ -955,7 +990,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testLibraryChangedAfterEveryCatalogChange() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         var events: [NibEvent] = []
         let sub = lib.h.app.events.subscribe { e in if e.type == NibEventType.libraryChanged { events.append(e) } }
         defer { sub.cancel() }
@@ -976,7 +1011,7 @@ final class NibLibraryTests: XCTestCase {
     // MARK: Trash names, explicit destinations, nested items
 
     func testRecoverRestoresTheOriginalNameAfterAClashInTheTrash() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let a = folderID(try await lib.run("folder.create", ["title": "Maths"]))
         let b = folderID(try await lib.run("folder.create", ["title": "Physics"]))
         let first = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Notes", "folder": .string("folder:\(a.raw)")]))
@@ -1002,7 +1037,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testMovingOutOfTheTrashAndRecoveringIntoTheRoot() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let f = folderID(try await lib.run("folder.create", ["title": "Chemistry"]))
         let a = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Acids", "folder": .string("folder:\(f.raw)")]))
         let b = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Bases", "folder": .string("folder:\(f.raw)")]))
@@ -1017,7 +1052,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testAnItemInsideATrashedFolderCanBeRecoveredOnItsOwn() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let f = folderID(try await lib.run("folder.create", ["title": "Old Term"]))
         let target = folderID(try await lib.run("folder.create", ["title": "Keep"]))
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Essay", "folder": .string("folder:\(f.raw)")]))
@@ -1041,7 +1076,7 @@ final class NibLibraryTests: XCTestCase {
     // MARK: Ids, repair and switching
 
     func testAHeadWithoutAnIDGetsAStableIDAndAnImportWritesOne() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let pkg = lib.root.appendingPathComponent("Handmade.nibnote", isDirectory: true)
         try FileManager.default.createDirectory(at: pkg, withIntermediateDirectories: true)
         try Data(#"{"meta":{"kind":"studySet"}}"#.utf8)
@@ -1064,7 +1099,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testRefreshRebuildsADeletedCatalog() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Rebuilt"]))
         lib.library.saveCacheNow()
         lib.library.waitForIO()
@@ -1089,7 +1124,7 @@ final class NibLibraryTests: XCTestCase {
     }
 
     func testSwitchingLibrariesAlwaysAnnouncesTheChange() async throws {
-        let lib = try makeLibrary()
+        let lib = try await makeLibrary()
         try await lib.run("doc.create", ["kind": "notebook", "title": "Here"])
         lib.library.saveCacheNow()
         lib.library.waitForIO()
@@ -1124,5 +1159,265 @@ final class NibLibraryTests: XCTestCase {
                                   parentPath: "", hasRecord: true)
         folder.node.favorite = true
         XCTAssertEqual(try throughJSON(folder), folder)
+    }
+
+    // MARK: Review fixes: locks, scans, renames, trash state, conflict copies, nested page calls
+
+    func testLockedDocumentsAreRefusedHoweverTheyAreNamed() async throws {
+        let lib = try await makeLibrary()
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Diary"]))
+        let other = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Loose", "cover": false]))
+        let f = folderID(try await lib.run("folder.create", ["title": "Private"]))
+        let inside = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Secret", "folder": .string("folder:\(f.raw)")]))
+        lib.h.app.gateway.isLocked = { $0 == d || $0 == inside }
+        let calls: [(String, JSONValue)] = [
+            ("library.trash", ["refs": [.string(d.raw)]]),
+            ("library.rename", ["ref": .string(d.raw), "title": "Renamed"]),
+            ("library.move", ["refs": [.string(d.raw)], "folder": .string("folder:\(f.raw)")]),
+            ("library.duplicate", ["refs": [.string(d.raw)]]),
+            ("library.move", ["refs": [.string("doc:\(other.raw)")], "folder": .string(d.raw)]),
+            ("library.trash", ["refs": [.string("folder:\(f.raw)")]]),
+            ("library.duplicate", ["refs": [.string("folder:\(f.raw)")]])
+        ]
+        for (command, params) in calls {
+            do {
+                try await lib.run(command, params, as: .ai("chat"))
+                XCTFail("\(command) \(params.jsonString()) must be refused")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .locked, "\(command) \(params.jsonString())")
+            }
+        }
+        XCTAssertTrue(lib.exists("Diary.nibnote"), "the locked package did not move")
+        XCTAssertTrue(lib.exists("Private/Secret.nibnote"))
+        XCTAssertTrue(lib.exists("Loose.nibnote"), "nothing was merged into the locked document")
+        XCTAssertNil(lib.library.node(other)?.trashedAt)
+
+        // The user is not refused; the Trash refuses the other callers too.
+        try await lib.run("library.trash", ["refs": [.string(d.raw)]])
+        for command in ["trash.recover", "trash.deletePermanently"] {
+            do {
+                try await lib.run(command, ["refs": [.string(d.raw)]], as: .ai("chat"))
+                XCTFail("\(command) must be refused")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .locked, command)
+            }
+        }
+        let emptied = try await lib.run("trash.empty", as: .ai("chat"))
+        XCTAssertEqual(emptied["skippedLocked"]?.intValue, 1)
+        XCTAssertTrue(lib.exists(".nib-library/trash/Diary.nibnote"), "emptying the Trash keeps the locked document")
+        XCTAssertEqual(lib.library.trashedNodes().map { $0.id }, [d])
+    }
+
+    func testABackgroundScanThatRacedAChangeIsThrownAwayAndRedone() async throws {
+        let lib = try await makeLibrary()
+        let discarded = lib.library.discardedScans
+        lib.library.refreshInBackground()
+        var meta = DocumentMeta(id: "RACEDOC00001", kind: .notebook, createdAt: 1_700_000_000)
+        meta.rev = Rev(wallMs: 1_700_000_000_000, counter: 0, device: 7)
+        let d = try lib.library.createDocument(DocumentContent(meta: meta), title: "Raced", in: nil)
+        await lib.library.waitForScans()
+        XCTAssertEqual(lib.library.discardedScans, discarded + 1, "the scan that raced the change is not applied")
+        XCTAssertEqual(lib.library.node(d)?.title, "Raced", "the new document survives")
+        XCTAssertNotNil(lib.library.entry(d)?.stamp, "a rescan followed and read the package from disk")
+        XCTAssertEqual(lib.h.app.services.packages.url(d)?.lastPathComponent, "Raced.nibnote")
+    }
+
+    func testReadsDuringTheLaunchLoadDoNotScanOnTheMainActor() async throws {
+        let lib = try await makeLibrary()
+        try await lib.run("doc.create", ["kind": "notebook", "title": "Launch"])
+        // A second app on the same folder with no cached catalog yet: `start` scans it off the main actor.
+        let h = Harness(fixtures: false)
+        let cacheDir = FileManager.default.temporaryDirectory.appendingPathComponent("niblibrary-cache-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: cacheDir) }
+        let second = FolderLibrary(settings: h.app.settings, clock: h.app.clock, events: h.app.events,
+                                   locator: h.app.services.packages, workspace: h.app.workspace, bus: h.app.bus,
+                                   services: nil, cacheDirectory: cacheDir, defaultRoot: lib.root)
+        let launch = Task { await second.start() }
+        var spins = 0
+        while !second.isLoading && spins < 10_000 {
+            await Task.yield()
+            spins += 1
+        }
+        XCTAssertTrue(second.isLoading, "start loads off the main actor")
+        XCTAssertTrue(second.allNodes().isEmpty, "a read during the load sees the empty catalog instead of scanning")
+        XCTAssertNil(second.node(lib.library.allNodes()[0].id))
+        await launch.value
+        XCTAssertFalse(second.isLoading)
+        XCTAssertEqual(second.allNodes().map { $0.title }, ["Launch"])
+        XCTAssertNotNil(h.app.services.packages.url(lib.library.allNodes()[0].id))
+        await second.waitForScans()
+    }
+
+    func testEvictedICloudPackagesAreListedAsDownloadingWithAStableID() async throws {
+        let lib = try await makeLibrary()
+        try Data().write(to: lib.root.appendingPathComponent(".Evicted.nibnote.icloud"))
+        lib.library.refresh()
+        let node = try XCTUnwrap(lib.library.allNodes().first { $0.title == "Evicted" })
+        XCTAssertEqual(node.kind, .document)
+        XCTAssertEqual(node.sync, .downloading)
+        lib.library.refresh()
+        lib.library.rebuild()
+        XCTAssertEqual(lib.library.allNodes().first { $0.title == "Evicted" }?.id, node.id, "the id does not change between scans")
+        XCTAssertEqual(lib.library.node(node.id)?.sync, .downloading)
+
+        // A document the catalog knew keeps its id (and its kind) when it is evicted.
+        let d = docID(try await lib.run("doc.create", ["kind": "whiteboard", "title": "Known"]))
+        try FileManager.default.removeItem(at: lib.root.appendingPathComponent("Known.nibnote"))
+        try Data().write(to: lib.root.appendingPathComponent(".Known.nibnote.icloud"))
+        lib.library.refresh()
+        XCTAssertEqual(lib.library.node(d)?.sync, .downloading)
+        XCTAssertEqual(lib.library.node(d)?.title, "Known")
+        XCTAssertEqual(lib.library.node(d)?.documentKind, .whiteboard)
+    }
+
+    func testConflictCopiesAreMergedThenRemovedByLibraryWrites() async throws {
+        let lib = try await makeLibrary()
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+        // A folder record: another device changed the icon after the last scan, and its provider made a conflict copy.
+        let f = folderID(try await lib.run("folder.create", ["title": "Synced", "color": "#FF0000"]))
+        let dir = lib.root.appendingPathComponent("Synced", isDirectory: true)
+        var theirs = FolderRecord(id: f, rev: .zero, style: FolderStyle(color: RGBA(hex: "#FF0000"), icon: "star", favorite: true))
+        theirs.rev = Rev(wallMs: now + 60_000, counter: 0, device: 11)
+        let recordCopy = dir.appendingPathComponent(".nibfolder.0000000b 2.json")
+        try FolderRecords.encode(theirs).write(to: recordCopy)
+        XCTAssertNil(lib.library.node(f)?.style?.icon, "the catalog has not seen it")
+        try await lib.run("folder.setStyle", ["folder": .string("folder:\(f.raw)"), "color": "#00FF00"])
+        XCTAssertEqual(lib.library.node(f)?.style?.icon, "star", "a colour-only edit keeps the newer icon from disk")
+        XCTAssertEqual(lib.library.node(f)?.favorite, true)
+        XCTAssertEqual(lib.library.node(f)?.style?.color, RGBA(hex: "#00FF00"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recordCopy.path), "the merged conflict copy is removed")
+        let mine = try XCTUnwrap(FolderRecords.read(dir.appendingPathComponent(".nibfolder.\(lib.device).json")))
+        XCTAssertEqual(mine.icon, "star")
+        XCTAssertGreaterThan(mine.rev, theirs.rev)
+
+        // A head: the conflict copy's newer meta is merged into this device's head when the document goes to the Trash.
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Conflicted"]))
+        let pkg = try XCTUnwrap(lib.url(d))
+        var other = try XCTUnwrap(lib.head(d))
+        other.meta.favorite = true
+        // Later than the folder record above, which this device's clock has observed.
+        other.meta.rev = Rev(wallMs: now + 120_000, counter: 0, device: 11)
+        try PackageIO.encoder().encode(other).write(to: pkg.appendingPathComponent("doc.\(lib.device) 2.json"))
+        try Data("{\"meta\":".utf8).write(to: pkg.appendingPathComponent("doc.\(lib.device) 3.json"))
+        try await lib.run("library.trash", ["refs": [.string("doc:\(d.raw)")]])
+        let trashed = try XCTUnwrap(lib.url(d))
+        XCTAssertEqual(PackageIO.headFiles(in: trashed, device: lib.device).map { $0.lastPathComponent },
+                       ["doc.\(lib.device).json", "doc.\(lib.device) 3.json"],
+                       "the merged conflict copy is removed; one that did not decode (still arriving) is kept")
+        let head = try XCTUnwrap(PackageIO.readMergedHead(trashed, device: lib.device))
+        XCTAssertTrue(head.meta.favorite)
+        XCTAssertEqual(head.meta.trashedFrom, "")
+        XCTAssertGreaterThan(head.meta.rev, other.meta.rev)
+    }
+
+    func testEverythingInsideATrashedFolderCarriesItsTrashDate() async throws {
+        let lib = try await makeLibrary()
+        let f = folderID(try await lib.run("folder.create", ["title": "Old"]))
+        let sub = folderID(try await lib.run("folder.create", ["title": "Inner", "parent": .string("folder:\(f.raw)")]))
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Page", "folder": .string("folder:\(sub.raw)")]))
+        try await lib.run("library.trash", ["refs": [.string("folder:\(f.raw)")]])
+        let at = try XCTUnwrap(lib.library.node(f)?.trashedAt)
+        XCTAssertEqual(lib.library.node(sub)?.trashedAt, at)
+        XCTAssertEqual(lib.library.node(d)?.trashedAt, at, "node(_:) tells an item inside a trashed folder from a live one")
+        XCTAssertEqual(lib.library.trashedNodes().map { $0.id }, [f], "the Trash still lists only the folder")
+        lib.library.rebuild()
+        XCTAssertEqual(lib.library.node(d)?.trashedAt, lib.library.node(f)?.trashedAt, "a scan of the disk agrees")
+        XCTAssertNotNil(lib.library.node(d)?.trashedAt)
+        try await lib.run("trash.recover", ["refs": [.string("folder:\(f.raw)")]])
+        XCTAssertNil(lib.library.node(d)?.trashedAt)
+        XCTAssertNil(lib.library.node(sub)?.trashedAt)
+        lib.library.rebuild()
+        XCTAssertNil(lib.library.node(d)?.trashedAt)
+    }
+
+    func testCaseOnlyRenamesAndRenamesLeftHalfDone() async throws {
+        let lib = try await makeLibrary()
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Draft"]))
+        try await lib.run("library.rename", ["ref": .string("doc:\(d.raw)"), "title": "DRAFT"])
+        let names = try FileManager.default.contentsOfDirectory(atPath: lib.root.path).filter { !$0.hasPrefix(".") }
+        XCTAssertEqual(names, ["DRAFT.nibnote"], "only the case changed, and no temporary name is left")
+        XCTAssertEqual(lib.library.node(d)?.title, "DRAFT")
+
+        // The app stopped between the two moves of a case-only rename: a scan finishes it.
+        let temp = lib.root.appendingPathComponent(LibraryLayout.renamePrefix + "0a1b2c3d-Final.nibnote", isDirectory: true)
+        try FileManager.default.moveItem(at: lib.root.appendingPathComponent("DRAFT.nibnote"), to: temp)
+        lib.library.refresh()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temp.path))
+        XCTAssertTrue(lib.exists("Final.nibnote"))
+        XCTAssertEqual(lib.library.node(d)?.title, "Final", "the document keeps its id and is listed again")
+        XCTAssertEqual(lib.h.app.services.packages.url(d)?.lastPathComponent, "Final.nibnote")
+    }
+
+    func testRescansFollowTheLoadedHeadOfOpenDocuments() async throws {
+        let lib = try await makeLibrary()
+        let d = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Open"]))
+        try await lib.run("doc.setFavorite", ["doc": .string("doc:\(d.raw)"), "favorite": true])
+        XCTAssertTrue(lib.h.app.workspace.isLoaded(d))
+        // The Document Store has not written the change yet (its writes are debounced): the package still says false.
+        let pkg = try XCTUnwrap(lib.url(d))
+        var stale = try XCTUnwrap(lib.head(d))
+        stale.meta.favorite = false
+        try PackageIO.writeHead(stale, to: pkg, device: lib.device)
+        lib.library.rebuild()
+        XCTAssertEqual(lib.library.node(d)?.favorite, true, "the catalog does not step back to the package on disk")
+        // A refresh without a cached catalog file reads every head again too.
+        try? FileManager.default.removeItem(at: lib.library.cacheURL)
+        lib.library.refresh()
+        XCTAssertEqual(lib.library.node(d)?.favorite, true)
+    }
+
+    func testTrashedPagesGoThroughOneNestedCall() async throws {
+        let lib = try await makeLibrary()
+        let a = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "A", "cover": false, "pages": 2]))
+        let b = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "B", "cover": false, "pages": 2]))
+        let loose = docID(try await lib.run("doc.create", ["kind": "notebook", "title": "Loose"]))
+        var pageRefs: [String] = []
+        for doc in [a, b] {
+            let page = try XCTUnwrap(lib.head(doc)?.livePages.last)
+            lib.h.app.commands.register(CommandDescriptor(id: "test.trashPage", title: "Trash Page", summary: "Test helper.",
+                                                          effect: .edit, exposure: .ui)) { _, ctx in
+                try ctx.mutate { tx in
+                    var p = try XCTUnwrap(try tx.content(doc).page(page.id))
+                    p.deleted = true
+                    p.trashedAt = 1_700_000_500
+                    try tx.put(p, doc: doc)
+                }
+                return .null
+            }
+            try await lib.run("test.trashPage")
+            pageRefs.append(NodeRef.page(doc, page.id).description)
+        }
+        try await lib.run("library.trash", ["refs": [.string("doc:\(loose.raw)")]])
+
+        // Without the Pages feature: recovering reports the pages as skipped; deleting refuses before changing anything.
+        let recovered = try await lib.run("trash.recover", ["refs": [.string(pageRefs[0])]])
+        XCTAssertEqual(recovered["skipped"]?.arrayValue?.compactMap { $0.stringValue }, [pageRefs[0]])
+        do {
+            try await lib.run("trash.deletePermanently", ["refs": [.string("doc:\(loose.raw)"), .string(pageRefs[0])]])
+            XCTFail("pages cannot be deleted without the Pages feature")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .unavailable)
+        }
+        XCTAssertNotNil(lib.library.node(loose), "the document was not deleted either")
+
+        // With it, every page goes in one call (one confirmation), minus the pages of locked documents.
+        var calls: [[String]] = []
+        lib.h.app.commands.register(CommandDescriptor(id: CommandIDs.pagePurge, title: "Delete Permanently",
+                                                      summary: "Test stand-in for F022.", effect: .irreversible)) { params, _ in
+            calls.append(params["pages"]?.arrayValue?.compactMap { $0.stringValue } ?? [])
+            return ["purged": .number(Double(calls.last?.count ?? 0))]
+        }
+        let everything = try await lib.run("trash.empty", as: .ai("chat"))
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(Set(calls.first ?? []), Set(pageRefs))
+        XCTAssertEqual(everything["pages"]?.intValue, 2)
+        XCTAssertEqual(everything["deleted"]?.intValue, 1)
+        XCTAssertNil(everything["skippedLocked"])
+
+        calls = []
+        lib.h.app.gateway.isLocked = { $0 == a }
+        let unlockedOnly = try await lib.run("trash.empty", as: .ai("chat"))
+        XCTAssertEqual(calls, [[pageRefs[1]]], "a locked document's pages are left alone")
+        XCTAssertEqual(unlockedOnly["skippedLocked"]?.intValue, 1)
     }
 }

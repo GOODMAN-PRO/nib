@@ -129,14 +129,50 @@ enum LibraryRefs {
         return NibID(s)
     }
 
-    /// The node of a document or folder ref, or `not_found`.
+    /// The node of a document or folder ref, or `not_found`. A document locked for the caller is refused with `locked`
+    /// however it is named: the gateway only sees `doc:` refs and ids under doc keys, not a bare id in `ref` / `refs`.
     @MainActor
-    static func node(_ ref: String, _ library: LibraryService, path: String) throws -> LibraryNode {
+    static func node(_ ref: String, _ library: LibraryService, _ ctx: CommandContext, path: String) throws -> LibraryNode {
         let id = try item(ref, path: path)
         guard let n = library.node(id) else {
             throw NibError(.notFound, "'\(ref)' is not in the library", path: path, hint: "call library.list to see what is there")
         }
+        if n.kind == .document { try unlocked(n.id, ref, ctx, path: path) }
         return n
+    }
+
+    /// Throws `locked` when the document is locked for the caller (every principal but the user, §6.4).
+    @MainActor
+    static func unlocked(_ doc: DocumentID, _ ref: String, _ ctx: CommandContext, path: String) throws {
+        guard !ctx.principal.isUser, ctx.bus.gateway.isLocked(doc) else { return }
+        throw NibError(.locked, "'\(ref)' is locked", path: path, hint: "ask the user to unlock it first")
+    }
+
+    /// A document locked for the caller at or under `node` (a folder being trashed, deleted or copied).
+    @MainActor
+    static func lockedDocument(in node: LibraryNode, _ library: LibraryService, _ ctx: CommandContext) -> DocumentID? {
+        guard !ctx.principal.isUser else { return nil }
+        let gateway = ctx.bus.gateway
+        if node.kind == .document { return gateway.isLocked(node.id) ? node.id : nil }
+        if let folders = library as? FolderLibrary { return folders.documents(under: node.id).first { gateway.isLocked($0) } }
+        var stack: [FolderID] = [node.id]
+        while let folder = stack.popLast() {
+            for child in library.children(of: folder) {
+                if child.kind == .folder {
+                    stack.append(child.id)
+                } else if gateway.isLocked(child.id) {
+                    return child.id
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Throws `locked` when a folder holds a document locked for the caller.
+    @MainActor
+    static func unlockedContents(_ node: LibraryNode, _ library: LibraryService, _ ctx: CommandContext, path: String) throws {
+        guard node.kind == .folder, lockedDocument(in: node, library, ctx) != nil else { return }
+        throw NibError(.locked, "'\(ref(node))' holds a locked document", path: path, hint: "ask the user to unlock it first")
     }
 
     /// In the Trash (directly, or inside a trashed folder).
@@ -588,6 +624,7 @@ enum DocumentMerger {
             if ctx.services.lock?.isLocked(doc) == true {
                 throw NibError(.locked, "'\(n.title)' is locked", path: path, hint: "unlock it first (doc.unlock)")
             }
+            try LibraryRefs.unlocked(doc, NodeRef.document(doc).description, ctx, path: path)
         }
         if ctx.isReadOnly(target) {
             throw NibError(.unsupported, "the document was saved by a newer version of Nib and is read-only", path: paths.into)
@@ -926,20 +963,29 @@ struct FolderSetStyle: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let library = try ctx.services.require(ctx.services.library, "the library")
-        let node = try LibraryRefs.node(p.folder, library, path: "$.folder")
+        let node = try LibraryRefs.node(p.folder, library, ctx, path: "$.folder")
         guard node.kind == .folder else {
             throw NibError(.invalidParams, "'\(p.folder)' is a document", path: "$.folder",
                            hint: "star documents with doc.setFavorite")
         }
+        let color = try LibraryParams.color(p.color, path: "$.color")
+        let icon = try LibraryParams.icon(p.icon, path: "$.icon")
         var style = node.style ?? FolderStyle(favorite: node.favorite)
-        if let c = try LibraryParams.color(p.color, path: "$.color") { style.color = c }
-        if let i = try LibraryParams.icon(p.icon, path: "$.icon") { style.icon = i }
+        if let c = color { style.color = c }
+        if let i = icon { style.icon = i }
         if let f = p.favorite { style.favorite = f }
         let ref = NodeRef.folder(node.id).description
         if ctx.dryRun { return Output(ref: ref, color: style.color?.hex, icon: style.icon, favorite: style.favorite) }
-        try library.setStyle(style, folder: node.id)
+        let now: FolderStyle
+        if let folders = library as? FolderLibrary {
+            // Only the fields given are written, over the record as it is on disk now (another device's newer icon
+            // survives a colour-only edit here).
+            now = try folders.updateStyle(folder: node.id, color: color, icon: icon, favorite: p.favorite)
+        } else {
+            try library.setStyle(style, folder: node.id)
+            now = library.node(node.id)?.style ?? style
+        }
         LibraryEvents.changed(ctx, library, [ref])
-        let now = library.node(node.id)?.style ?? style
         return Output(ref: ref, color: now.color?.hex, icon: now.icon, favorite: now.favorite)
     }
 }
@@ -1037,7 +1083,7 @@ struct LibraryRename: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let library = try ctx.services.require(ctx.services.library, "the library")
-        let node = try LibraryRefs.node(p.ref, library, path: "$.ref")
+        let node = try LibraryRefs.node(p.ref, library, ctx, path: "$.ref")
         let title = p.title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { throw NibError.invalid("title must not be empty", path: "$.title") }
         if ctx.dryRun { return Output(ref: LibraryRefs.ref(node), title: title) }
@@ -1076,10 +1122,10 @@ struct LibraryMove: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let library = try ctx.services.require(ctx.services.library, "the library")
         guard !p.refs.isEmpty else { throw NibError.invalid("refs must name at least one document or folder", path: "$.refs") }
-        if let dest = p.folder, let target = mergeTarget(dest, library) {
+        if let dest = p.folder, let target = try mergeTarget(dest, library, ctx) {
             var merged: [String] = []
             for (i, ref) in p.refs.enumerated() {
-                let node = try LibraryRefs.node(ref, library, path: "$.refs[\(i)]")
+                let node = try LibraryRefs.node(ref, library, ctx, path: "$.refs[\(i)]")
                 guard node.kind == .document else {
                     throw NibError(.invalidParams, "only documents can be dropped on a document", path: "$.refs[\(i)]")
                 }
@@ -1091,7 +1137,7 @@ struct LibraryMove: NibCommand {
         let folder = try LibraryRefs.folder(p.folder, path: "$.folder")
         var moved: [String] = []
         for (i, ref) in p.refs.enumerated() {
-            let node = try LibraryRefs.node(ref, library, path: "$.refs[\(i)]")
+            let node = try LibraryRefs.node(ref, library, ctx, path: "$.refs[\(i)]")
             if !ctx.dryRun {
                 if !(library is FolderLibrary), LibraryRefs.isTrashed(node.id, library) {
                     // Moving out of the Trash recovers into the folder (the folder library does this in `move`).
@@ -1107,12 +1153,17 @@ struct LibraryMove: NibCommand {
         return Output(moved: moved, merged: [], folder: folder.map { NodeRef.folder($0).description } ?? "lib")
     }
 
-    /// The document a `folder` param names ("doc:D", or a bare id of a document).
+    /// The document a `folder` param names ("doc:D", or a bare id of a document); `locked` when it is locked for the
+    /// caller (the gateway does not see a bare id under `folder`).
     @MainActor
-    static func mergeTarget(_ ref: String, _ library: LibraryService) -> DocumentID? {
+    static func mergeTarget(_ ref: String, _ library: LibraryService, _ ctx: CommandContext) throws -> DocumentID? {
         let s = ref.trimmingCharacters(in: .whitespaces)
-        if case .document(let d)? = NodeRef(s) { return d }
+        if case .document(let d)? = NodeRef(s) {
+            try LibraryRefs.unlocked(d, s, ctx, path: "$.folder")
+            return d
+        }
         guard NodeRef(s) == nil, NibID.isValid(s), let n = library.node(NibID(s)), n.kind == .document else { return nil }
+        try LibraryRefs.unlocked(n.id, s, ctx, path: "$.folder")
         return n.id
     }
 }
@@ -1144,7 +1195,9 @@ struct LibraryDuplicate: NibCommand {
         guard ids.count <= p.refs.count else { throw NibError.invalid("more ids than refs", path: "$.ids") }
         var out: [String] = []
         for (i, ref) in p.refs.enumerated() {
-            let node = try LibraryRefs.node(ref, library, path: "$.refs[\(i)]")
+            let node = try LibraryRefs.node(ref, library, ctx, path: "$.refs[\(i)]")
+            // A copy of a locked document would not be locked: a folder holding one is copied only by the user.
+            try LibraryRefs.unlockedContents(node, library, ctx, path: "$.refs[\(i)]")
             let chosen = i < ids.count ? ids[i] : nil
             let copy: NibID
             if ctx.dryRun {
@@ -1183,12 +1236,18 @@ struct LibraryTrash: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let library = try ctx.services.require(ctx.services.library, "the library")
         guard !p.refs.isEmpty else { throw NibError.invalid("refs must name at least one document or folder", path: "$.refs") }
-        var out: [String] = []
+        // Every ref is checked before anything moves.
+        var nodes: [LibraryNode] = []
         for (i, ref) in p.refs.enumerated() {
             if case .page? = NodeRef(ref) {
                 throw NibError(.invalidParams, "'\(ref)' is a page", path: "$.refs[\(i)]", hint: "trash pages with page.trash")
             }
-            let node = try LibraryRefs.node(ref, library, path: "$.refs[\(i)]")
+            let node = try LibraryRefs.node(ref, library, ctx, path: "$.refs[\(i)]")
+            try LibraryRefs.unlockedContents(node, library, ctx, path: "$.refs[\(i)]")
+            nodes.append(node)
+        }
+        var out: [String] = []
+        for node in nodes {
             if !ctx.dryRun { try library.trash(node.id) }
             out.append(LibraryRefs.ref(node))
         }
@@ -1302,7 +1361,7 @@ struct TrashRecover: NibCommand {
                 pages[doc, default: []].append(ref)
                 continue
             }
-            let node = try LibraryRefs.node(ref, library, path: "$.refs[\(i)]")
+            let node = try LibraryRefs.node(ref, library, ctx, path: "$.refs[\(i)]")
             guard LibraryRefs.isTrashed(node.id, library) else {
                 skipped.append(LibraryRefs.ref(node))
                 continue
@@ -1318,10 +1377,19 @@ struct TrashRecover: NibCommand {
             recovered.append(LibraryRefs.ref(node))
         }
         LibraryEvents.changed(ctx, library, recovered)
-        for doc in pageOrder {
-            let refs = pages[doc] ?? []
-            _ = try await ctx.execute(CommandIDs.pageRestore, ["pages": .array(refs.map { .string($0) })])
-            recovered += refs
+        // Pages go back through the Pages feature (F022), in one call; without it they are reported as skipped.
+        let pageRefs = pageOrder.flatMap { pages[$0] ?? [] }
+        if !pageRefs.isEmpty {
+            if ctx.bus.registry.descriptor(CommandIDs.pageRestore) == nil {
+                skipped += pageRefs
+            } else {
+                do {
+                    _ = try await ctx.execute(CommandIDs.pageRestore, ["pages": .array(pageRefs.map { .string($0) })])
+                    recovered += pageRefs
+                } catch let e as NibError where e.code == .unavailable {
+                    skipped += pageRefs
+                }
+            }
         }
         return Output(recovered: recovered, skipped: skipped)
     }
@@ -1354,13 +1422,24 @@ struct TrashDeletePermanently: NibCommand {
                 pages[doc, default: []].append(ref)
                 continue
             }
-            let node = try LibraryRefs.node(ref, library, path: "$.refs[\(i)]")
+            let node = try LibraryRefs.node(ref, library, ctx, path: "$.refs[\(i)]")
             // Anything in the Trash, also an item inside a trashed folder.
             guard LibraryRefs.isTrashed(node.id, library) else {
                 throw NibError(.invalidParams, "'\(node.title)' is not in the Trash", path: "$.refs[\(i)]",
                                hint: "move it to the Trash first with library.trash")
             }
+            try LibraryRefs.unlockedContents(node, library, ctx, path: "$.refs[\(i)]")
             nodes.append(node)
+        }
+        // Pages are purged first, in one call to the Pages feature (F022): it checks every page before it deletes any,
+        // so a refused page leaves the documents and folders alone too.
+        let pageRefs = pageOrder.flatMap { pages[$0] ?? [] }
+        if !pageRefs.isEmpty {
+            guard ctx.bus.registry.descriptor(CommandIDs.pagePurge) != nil else {
+                throw NibError(.unavailable, "trashed pages cannot be deleted without the Pages feature", path: "$.refs",
+                               hint: "delete only documents and folders")
+            }
+            _ = try await ctx.execute(CommandIDs.pagePurge, ["pages": .array(pageRefs.map { .string($0) })])
         }
         var deleted: [String] = []
         for node in nodes {
@@ -1368,12 +1447,7 @@ struct TrashDeletePermanently: NibCommand {
             deleted.append(LibraryRefs.ref(node))
         }
         LibraryEvents.changed(ctx, library, deleted)
-        for doc in pageOrder {
-            let refs = pages[doc] ?? []
-            _ = try await ctx.execute(CommandIDs.pagePurge, ["pages": .array(refs.map { .string($0) })])
-            deleted += refs
-        }
-        return Output(deleted: deleted)
+        return Output(deleted: deleted + pageRefs)
     }
 }
 
@@ -1381,6 +1455,8 @@ struct TrashEmpty: NibCommand {
     struct Output: Codable {
         var deleted: Int
         var pages: Int
+        /// Trashed items and pages left in the Trash because their document is locked for the caller (not the user).
+        var skippedLocked: Int?
     }
 
     static let descriptor = CommandDescriptor(
@@ -1390,33 +1466,47 @@ struct TrashEmpty: NibCommand {
 
     static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> Output {
         let library = try ctx.services.require(ctx.services.library, "the library")
-        var pages = 0
-        var byDoc: [DocumentID: [String]] = [:]
-        var order: [DocumentID] = []
+        let gateway = ctx.bus.gateway
+        var skipped = 0
+        // Pages of documents locked for the caller stay (the gateway cannot see them: trash.empty names no document).
+        var pageRefs: [String] = []
         for t in TrashList.trashedPages(library, ctx) {
-            if byDoc[t.doc] == nil { order.append(t.doc) }
-            byDoc[t.doc, default: []].append(NodeRef.page(t.doc, t.page).description)
-        }
-        for doc in order {
-            let refs = byDoc[doc] ?? []
-            do {
-                _ = try await ctx.execute(CommandIDs.pagePurge, ["pages": .array(refs.map { .string($0) })])
-                pages += refs.count
-            } catch let e as NibError where e.code == .unavailable {
-                break
+            if !ctx.principal.isUser && gateway.isLocked(t.doc) {
+                skipped += 1
+            } else {
+                pageRefs.append(NodeRef.page(t.doc, t.page).description)
             }
         }
-        let nodes = library.trashedNodes()
+        // One call to the Pages feature (F022) for every page (one confirmation); without it the pages stay.
+        var pages = 0
+        if !pageRefs.isEmpty, ctx.bus.registry.descriptor(CommandIDs.pagePurge) != nil {
+            do {
+                _ = try await ctx.execute(CommandIDs.pagePurge, ["pages": .array(pageRefs.map { .string($0) })])
+                pages = pageRefs.count
+            } catch let e as NibError where e.code == .unavailable {
+                pages = 0
+            }
+        }
+        var nodes: [LibraryNode] = []
+        var kept = Set<NibID>()
+        for n in library.trashedNodes() {
+            if LibraryRefs.lockedDocument(in: n, library, ctx) != nil {
+                kept.insert(n.id)
+                skipped += 1
+            } else {
+                nodes.append(n)
+            }
+        }
         let deleted: Int
         if ctx.dryRun {
             deleted = nodes.count
         } else if let folders = library as? FolderLibrary {
-            deleted = try folders.emptyTrash()
+            deleted = try folders.emptyTrash(keeping: kept)
         } else {
             for n in nodes { try library.deletePermanently(n.id) }
             deleted = nodes.count
         }
         LibraryEvents.changed(ctx, library, nodes.map { LibraryRefs.ref($0) })
-        return Output(deleted: deleted, pages: pages)
+        return Output(deleted: deleted, pages: pages, skippedLocked: skipped == 0 ? nil : skipped)
     }
 }

@@ -80,6 +80,9 @@ final class LibraryPrefs: SyncedSettingsBackend {
     private var writeScheduled = false
     /// Conflict copies whose entries are merged in: deleted once this device's file holds them.
     private var copies: [URL] = []
+    /// Writes that failed in a row; each retry waits twice as long, up to `maxRetries`.
+    private var failures = 0
+    static let maxRetries = 8
     /// Coalescing delay of writes.
     var writeDelay: TimeInterval = 0.5
 
@@ -151,20 +154,35 @@ final class LibraryPrefs: SyncedSettingsBackend {
     }
 
     /// Switches to another library's `.nib-library` (after writing pending changes to the old one); returns the names
-    /// whose value differs between the two libraries.
+    /// whose value differs between the two libraries. The old library's state is taken and the switch made under one
+    /// lock, so a change that lands meanwhile is written to the library it was made in.
     @discardableResult
     func setDirectory(_ url: URL?) -> [String] {
-        flush()
         lock.lock()
-        defer { lock.unlock() }
         let before = merged
+        let old = directory
+        let pending = dirty ? merged : nil
+        let oldCopies = copies
         directory = url
         loaded = false
         merged = [:]
         copies = []
         dirty = false
+        failures = 0
         loadIfNeeded()
-        return PrefsMerge.changedNames(before, merged)
+        let changed = PrefsMerge.changedNames(before, merged)
+        lock.unlock()
+        if let snapshot = pending, let dir = old {
+            let device = self.device, log = self.log
+            queue.sync {
+                do {
+                    try LibraryPrefs.write(snapshot, device: device, to: dir, removing: oldCopies)
+                } catch {
+                    log.error("could not save the settings of the previous library: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        }
+        return changed
     }
 
     /// Writes pending changes now (app backgrounding, switching libraries, tests).
@@ -205,10 +223,17 @@ final class LibraryPrefs: SyncedSettingsBackend {
     }
 
     /// Must hold `lock`.
-    private func scheduleLocked() {
+    private func scheduleLocked(after delay: TimeInterval? = nil) {
         guard !writeScheduled else { return }
         writeScheduled = true
-        queue.asyncAfter(deadline: .now() + writeDelay) { [weak self] in self?.writeNow() }
+        queue.asyncAfter(deadline: .now() + (delay ?? writeDelay)) { [weak self] in self?.writeNow() }
+    }
+
+    /// This device's prefs file holding `entries`, then the merged conflict copies removed.
+    private static func write(_ entries: [String: PrefEntry], device: String, to dir: URL, removing copies: [URL]) throws {
+        let data = try PrefsMerge.encode(entries)
+        try FileOps.write(data, to: dir.appendingPathComponent(LibraryLayout.prefsFileName(device)))
+        for url in copies { try? FileOps.remove(url) }
     }
 
     /// Runs on `queue`.
@@ -224,16 +249,22 @@ final class LibraryPrefs: SyncedSettingsBackend {
         dirty = false
         lock.unlock()
         do {
-            let data = try PrefsMerge.encode(snapshot)
-            try FileOps.write(data, to: dir.appendingPathComponent(LibraryLayout.prefsFileName(device)))
-            for url in toDelete { try? FileOps.remove(url) }
+            try LibraryPrefs.write(snapshot, device: device, to: dir, removing: toDelete)
             lock.lock()
             copies.removeAll { toDelete.contains($0) }
+            failures = 0
             lock.unlock()
         } catch {
             log.error("could not save library settings: \(error.localizedDescription, privacy: .public)")
             lock.lock()
-            dirty = true
+            // Still this library: try again later (backing off), not only at the next change or backgrounding.
+            if directory == dir {
+                dirty = true
+                failures += 1
+                if failures <= LibraryPrefs.maxRetries {
+                    scheduleLocked(after: min(60, writeDelay * pow(2, Double(failures))))
+                }
+            }
             lock.unlock()
         }
     }

@@ -179,11 +179,18 @@ final class FolderLibrary: LibraryService {
     private(set) var rootUnavailable = false
     private let catalog = LibraryCatalog()
     private var loaded = false
+    /// `start` is reading the cached catalog or scanning the folder off the main actor: reads meanwhile return the
+    /// (empty) catalog instead of scanning on the main actor.
+    private var loading = false
     private var started = false
     /// Bumped by every catalog change, so a background scan that raced a change is not applied over it.
     private var generation: UInt64 = 0
     private var scanning = false
     private var rescanRequested = false
+    /// Background scans thrown away because the catalog changed while they ran (each is followed by a rescan).
+    private(set) var discardedScans = 0
+    /// `start` is loading the catalog off the main actor.
+    var isLoading: Bool { loading }
     private var saveTask: Task<Void, Never>?
     private var quietChangeTask: Task<Void, Never>?
     private var subscriptions: [EventSubscription] = []
@@ -256,14 +263,15 @@ final class FolderLibrary: LibraryService {
 
     // MARK: Loading
 
-    /// Loads the cached catalog, or scans the folder when there is none (first use before `start`).
+    /// Loads the cached catalog on first use before `start`; without one the folder is scanned off the main actor and
+    /// the catalog stays empty until that scan lands (`library.changed`). While `start` loads, nothing is read here.
     private func ensureLoaded() {
-        guard !loaded else { return }
+        guard !loaded, !loading else { return }
         loaded = true
         if let cached = CatalogCache.load(cacheURL, root: rootURL.standardizedFileURL.path) {
             install(cached)
         } else {
-            refresh()
+            refreshInBackground(priority: .userInitiated)
         }
     }
 
@@ -278,21 +286,29 @@ final class FolderLibrary: LibraryService {
         guard !started else { return }
         started = true
         if !loaded {
+            // Reads during the load see an empty catalog; a change made meanwhile (the catalog's generation moved)
+            // wins over the loaded state, and the rescan below brings in the rest.
+            loading = true
+            let gen = generation
             let url = cacheURL, root = rootURL.standardizedFileURL.path
             let cached = await Task.detached(priority: .userInitiated) { CatalogCache.load(url, root: root) }.value
-            if !loaded, let c = cached {
-                loaded = true
-                install(c)
-            } else if !loaded {
-                // No cache for this library yet: scan it once before any feature opens a document (session restore
-                // runs after this start), so every package is in `NibServices.packages`.
-                let job = scanner(previous: [:])
-                let entries = await Task.detached(priority: .userInitiated) { job.scan() }.value
-                if !loaded {
+            if !loaded && generation == gen {
+                if let c = cached {
                     loaded = true
-                    apply(entries)
+                    install(c)
+                } else {
+                    // No cache for this library yet: scan it once before any feature opens a document (session
+                    // restore runs after this start), so every package is in `NibServices.packages`.
+                    let job = scanner(previous: [:])
+                    let result = await Task.detached(priority: .userInitiated) { job.scanAll() }.value
+                    if !loaded && generation == gen {
+                        loaded = true
+                        apply(result)
+                    }
                 }
             }
+            loading = false
+            loaded = true
         }
         try? FileOps.createDirectory(metadataURL)
         if rootUnavailable {
@@ -503,18 +519,34 @@ final class FolderLibrary: LibraryService {
     }
 
     func setStyle(_ style: FolderStyle, folder: FolderID) throws {
+        try updateStyle(folder: folder, color: .some(style.color), icon: .some(style.icon), favorite: style.favorite)
+    }
+
+    /// Changes only the given style fields (nil = keep; `.some(nil)` clears the colour or icon) on the folder's merged
+    /// record as it is on disk now, so a field another device changed since the last scan is kept. Returns the style.
+    @discardableResult
+    func updateStyle(folder: FolderID, color: RGBA?? = nil, icon: String?? = nil, favorite: Bool? = nil) throws -> FolderStyle {
         ensureLoaded()
         guard var e = catalog.entry(id: folder), e.isFolder else { throw NibError.notFound("folder \(folder.raw)") }
         let record = try updateFolderRecord(in: url(of: e), id: e.node.id) { r in
-            r.color = style.color
-            r.icon = style.icon
-            r.favorite = style.favorite
+            if let c = color { r.color = c }
+            if let i = icon { r.icon = i }
+            if let f = favorite { r.favorite = f }
         }
         e.node.style = record.style
         e.node.favorite = record.favorite
         e.hasRecord = true
+        e.derivedID = false
         catalog.upsert(e)
         changed([e.ref])
+        return record.style
+    }
+
+    /// Every document at or under a folder (live or trashed).
+    func documents(under id: NibID) -> [DocumentID] {
+        ensureLoaded()
+        guard let e = catalog.entry(id: id) else { return [] }
+        return catalog.subtree(path: e.node.path).filter { $0.isDocument }.map { $0.node.id }
     }
 
     // MARK: LibraryService — duplicating
@@ -715,17 +747,24 @@ final class FolderLibrary: LibraryService {
         changed([e.ref])
     }
 
-    /// Deletes everything in the Trash (including files Nib does not know); returns how many items were deleted.
+    /// Deletes everything in the Trash (including files Nib does not know) except the trashed items in `kept` (with
+    /// what is inside them); returns how many items were deleted.
     @discardableResult
-    func emptyTrash() throws -> Int {
+    func emptyTrash(keeping kept: Set<NibID> = []) throws -> Int {
         ensureLoaded()
-        let top = catalog.entries.filter { $0.trashTop }
+        let tops = catalog.entries.filter { $0.trashTop }
+        let top = tops.filter { !kept.contains($0.node.id) }
+        let keptNames = Set(tops.filter { kept.contains($0.node.id) }.map { ($0.node.path as NSString).lastPathComponent })
         for e in top { closeDocuments(under: e) }
         var removed = 0
         var failure: Error?
         let items = (try? FileManager.default.contentsOfDirectory(at: trashURL, includingPropertiesForKeys: nil,
                                                                    options: [])) ?? []
         for item in items {
+            let name = item.lastPathComponent
+            if keptNames.contains(name) || keptNames.contains(where: { "." + $0 + LibraryLayout.placeholderSuffix == name }) {
+                continue
+            }
             do {
                 try FileOps.remove(item)
                 removed += 1
@@ -737,10 +776,11 @@ final class FolderLibrary: LibraryService {
             refresh()
             throw failure
         }
-        let gone = catalog.entries.filter { $0.inTrash }
-        catalog.removeSubtree(path: LibraryLayout.trashPath)
+        let keptPaths = keptNames.map { LibraryLayout.trashPath + "/" + $0 }
+        let gone = catalog.entries.filter { e in e.inTrash && !keptPaths.contains { LibraryLayout.isWithin(e.node.path, $0) } }
+        for e in gone { catalog.removeSubtree(path: e.node.path) }
         for r in gone where r.isDocument { locator.set(nil, for: r.node.id) }
-        changed(top.map { $0.ref })
+        if !top.isEmpty || removed > 0 { changed(top.map { $0.ref }) }
         return removed
     }
 
@@ -766,6 +806,11 @@ final class FolderLibrary: LibraryService {
         let dir = try directory(of: folder)
         let ext = url.pathExtension.lowercased()
         let isPackage = ext == NibFormat.packageExtension || (ext == NibFormat.legacyPackageExtension && PackageIO.hasHeadFile(url))
+        // A folder is copied in only when it holds a Nib document somewhere (nothing else is left behind).
+        guard isPackage || FolderLibrary.holdsPackages(url) else {
+            throw NibError(.invalidParams, "'\(url.lastPathComponent)' holds no Nib documents",
+                           hint: "import PDFs, images and other files with import.files")
+        }
         let base = FileNames.sanitize(url.deletingPathExtension().lastPathComponent, fallback: String(localized: "Imported"))
         let targetExt: String? = isPackage ? NibFormat.packageExtension : nil
         let name = FileNames.unique(base, ext: targetExt, in: dir)
@@ -777,16 +822,31 @@ final class FolderLibrary: LibraryService {
     private func finishImport(_ job: CopyJob) throws -> DocumentID {
         let added = scanner(previous: [:]).scanItem(at: job.destination, inTrash: false, trashTop: false,
                                                     existing: catalog.byPath)
+        guard let first = added.first(where: { $0.isDocument }) else {
+            // Nothing to list (the source changed while it was copied): the copy goes again.
+            try? FileOps.remove(job.destination)
+            throw NibError(.invalidParams, "'\(job.source.lastPathComponent)' holds no Nib documents",
+                           hint: "import PDFs, images and other files with import.files")
+        }
         for entry in added {
             catalog.upsert(entry)
             if entry.isDocument { locator.set(url(of: entry), for: entry.node.id) }
         }
         changed(added.map { $0.ref })
-        guard let first = added.first(where: { $0.isDocument }) else {
-            throw NibError(.invalidParams, "'\(job.source.lastPathComponent)' holds no Nib documents",
-                           hint: "import PDFs, images and other files with import.files")
-        }
         return first.node.id
+    }
+
+    /// A directory holding a `.nibnote` package, or a legacy `*.nib` package with a head, at any depth.
+    nonisolated static func holdsPackages(_ dir: URL) -> Bool {
+        guard let walker = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isDirectoryKey],
+                                                          options: [.skipsHiddenFiles]) else { return false }
+        for case let url as URL in walker {
+            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
+            let ext = url.pathExtension.lowercased()
+            if ext == NibFormat.packageExtension { return true }
+            if ext == NibFormat.legacyPackageExtension && PackageIO.hasHeadFile(url) { return true }
+        }
+        return false
     }
 
     // MARK: LibraryService — refresh and root
@@ -799,7 +859,7 @@ final class FolderLibrary: LibraryService {
         loaded = true
         var job = scanner(previous: catalog.byPath)
         job.reuse = !rebuild
-        apply(job.scan())
+        apply(job.scanAll())
         scheduleCacheSave()
         let changedNames = prefs.reload()
         postSettingsChanges(changedNames)
@@ -810,13 +870,14 @@ final class FolderLibrary: LibraryService {
         loaded = true
         var job = scanner(previous: catalog.byPath)
         job.reuse = false
-        apply(job.scan())
+        apply(job.scanAll())
         saveCacheNow()
         postSettingsChanges(prefs.reload())
     }
 
-    /// An incremental rescan off the main actor (launch, foreground). Applied only when no change happened meanwhile.
-    func refreshInBackground() {
+    /// An incremental rescan off the main actor (launch, foreground, a newly chosen folder). Applied only when no
+    /// change happened meanwhile; otherwise it is thrown away and the folder is scanned again.
+    func refreshInBackground(priority: TaskPriority = .utility) {
         guard !scanning else {
             rescanRequested = true
             return
@@ -825,18 +886,20 @@ final class FolderLibrary: LibraryService {
         let gen = generation
         let job = scanner(previous: catalog.byPath)
         let prefs = self.prefs
-        Task.detached(priority: .utility) { [weak self] in
-            let entries = job.scan()
+        Task.detached(priority: priority) { [weak self] in
+            let result = job.scanAll()
             let changedNames = prefs.reload()
-            await self?.finishBackgroundScan(entries, generation: gen, root: job.root, settings: changedNames)
+            await self?.finishBackgroundScan(result, generation: gen, root: job.root, settings: changedNames)
         }
     }
 
-    private func finishBackgroundScan(_ entries: [CatalogEntry], generation gen: UInt64, root: URL, settings names: [String]) {
+    private func finishBackgroundScan(_ result: CatalogScanner.Result, generation gen: UInt64, root: URL,
+                                      settings names: [String]) {
         scanning = false
         if generation == gen && root == rootURL {
-            apply(entries)
+            apply(result)
         } else {
+            discardedScans += 1
             rescanRequested = true
         }
         postSettingsChanges(names)
@@ -846,7 +909,18 @@ final class FolderLibrary: LibraryService {
         }
     }
 
-    private func apply(_ entries: [CatalogEntry]) {
+    /// Waits until the launch load and background scans (with the rescans they asked for) have landed (tests).
+    func waitForScans() async {
+        var waited = 0
+        while (scanning || loading) && waited < 2_000 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+            waited += 1
+        }
+    }
+
+    private func apply(_ result: CatalogScanner.Result) {
+        var entries = result.entries
+        overlayLoadedDocuments(&entries)
         let before = catalog.byPath
         install(entries)
         var refs: [String] = []
@@ -858,6 +932,58 @@ final class FolderLibrary: LibraryService {
             scheduleCacheSave()
             events.emit(NibEventType.libraryChanged, payload: ["refresh": true, "refs": .array(refs.prefix(500).map { .string($0) })])
         }
+        recoverStranded(result.stranded)
+    }
+
+    /// Open documents can hold edits the Document Store has not written yet (its writes are debounced): their nodes
+    /// follow the loaded head, as `didCommit` keeps them, not the package a scan read.
+    private func overlayLoadedDocuments(_ entries: inout [CatalogEntry]) {
+        let open = Set(workspace.loadedDocuments)
+        guard !open.isEmpty else { return }
+        for i in entries.indices where entries[i].isDocument && open.contains(entries[i].node.id) {
+            guard let head = try? workspace.content(entries[i].node.id) else { continue }
+            let trashedAt = entries[i].node.trashedAt
+            let headID = entries[i].headID
+            entries[i].apply(HeadSummary(head))
+            entries[i].node.trashedAt = trashedAt
+            entries[i].headID = headID
+        }
+    }
+
+    /// Moves items a case-only rename left under its temporary name (the app stopped between the two moves) back to
+    /// a visible name next to it, and lists them. Runs on the main actor, where no rename is half done.
+    private func recoverStranded(_ urls: [URL]) {
+        var refs: [String] = []
+        for temp in urls where FileManager.default.fileExists(atPath: temp.path) {
+            let isDocument = PackageIO.hasHeadFile(temp)
+            let ext: String? = isDocument ? NibFormat.packageExtension : nil
+            var intended = LibraryLayout.intendedName(ofTemporary: temp.lastPathComponent) ?? ""
+            if isDocument {
+                let e = (intended as NSString).pathExtension.lowercased()
+                if e == NibFormat.packageExtension || e == NibFormat.legacyPackageExtension {
+                    intended = (intended as NSString).deletingPathExtension
+                }
+            }
+            let dir = temp.deletingLastPathComponent()
+            let name = FileNames.unique(FileNames.sanitize(intended, fallback: String(localized: "Recovered")), ext: ext, in: dir)
+            let target = dir.appendingPathComponent(FileNames.fileName(name, ext: ext), isDirectory: true)
+            do {
+                try FileOps.move(temp, to: target)
+            } catch {
+                log.error("could not recover \(temp.lastPathComponent, privacy: .private): \(error.localizedDescription, privacy: .public)")
+                continue
+            }
+            let path = relativePath(target)
+            let inTrash = LibraryLayout.trashTopPath(of: path) != nil
+            let trashTop = inTrash && LibraryLayout.parentPath(of: path) == LibraryLayout.trashPath
+            for entry in scanner(previous: [:]).scanItem(at: target, inTrash: inTrash, trashTop: trashTop,
+                                                         existing: catalog.byPath) {
+                catalog.upsert(entry)
+                if entry.isDocument { locator.set(url(of: entry), for: entry.node.id) }
+                refs.append(entry.ref)
+            }
+        }
+        if !refs.isEmpty { changed(refs) }
     }
 
     func setRoot(_ url: URL) throws {
@@ -893,15 +1019,17 @@ final class FolderLibrary: LibraryService {
         rootUnavailable = false
         LibrarySettings.saveRoot(bookmark, settings)
         try? FileOps.createDirectory(metadataURL)
+        // The new folder's cached catalog lists it at once; the folder itself is scanned off the main actor (a library
+        // without a cache lists nothing until that scan lands with its own `library.changed`).
         catalog.replaceAll(CatalogCache.load(cacheURL, root: rootURL.standardizedFileURL.path) ?? [])
         locator.replaceAll(catalog.locations(root: rootURL))
         loaded = true
         generation &+= 1
         postSettingsChanges(prefs.setDirectory(metadataURL))
         publishLocation()
-        refresh()
-        // Everything listed before belongs to another folder now, even when the new library's cached catalog matched
-        // the disk (then `refresh` found nothing to report).
+        refreshInBackground(priority: .userInitiated)
+        // Everything listed before belongs to another folder now, even when the new library's cached catalog matches
+        // the disk (then the scan finds nothing to report).
         events.emit(NibEventType.libraryChanged, payload: ["root": true, "refs": []])
     }
 
@@ -939,7 +1067,7 @@ final class FolderLibrary: LibraryService {
                 let trashedAt = e.node.trashedAt
                 let headID = e.headID
                 e.apply(HeadSummary(head))
-                e.node.trashedAt = e.trashTop ? trashedAt : nil
+                e.node.trashedAt = e.inTrash ? trashedAt : nil
                 e.headID = headID
             }
             catalog.upsert(e)
@@ -983,13 +1111,22 @@ final class FolderLibrary: LibraryService {
         return url(of: e)
     }
 
-    /// Moves an item, going through a temporary name when only the case of the name changes.
+    /// Moves an item, going through a temporary name when only the case of the name changes. The temporary name
+    /// carries the new one, so a scan can finish the rename if the app stops in between (`recoverStranded`); when
+    /// the second move fails the item goes back to its old name.
     private func moveItem(_ old: URL, to new: URL) throws {
         if old.standardizedFileURL.path == new.standardizedFileURL.path { return }
         if old.standardizedFileURL.path.lowercased() == new.standardizedFileURL.path.lowercased() {
-            let temp = old.deletingLastPathComponent().appendingPathComponent(".nib-rename-" + UUID().uuidString)
+            let tag = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased()
+            let temp = old.deletingLastPathComponent()
+                .appendingPathComponent(LibraryLayout.renamePrefix + tag + "-" + new.lastPathComponent, isDirectory: true)
             try FileOps.move(old, to: temp)
-            try FileOps.move(temp, to: new)
+            do {
+                try FileOps.move(temp, to: new)
+            } catch {
+                try? FileOps.move(temp, to: old)
+                throw error
+            }
         } else {
             try FileOps.move(old, to: new)
         }
@@ -1002,6 +1139,8 @@ final class FolderLibrary: LibraryService {
         let newPath = relativePath(new)
         let subtree = catalog.subtree(path: oldPath)
         catalog.removeSubtree(path: oldPath)
+        // Everything inside a trashed item carries its `trashedAt` (and loses it when it comes back).
+        var topTrashedAt: Double?
         for var e in subtree {
             let suffix = String(e.node.path.dropFirst(oldPath.count))
             e.node.path = newPath + suffix
@@ -1014,9 +1153,12 @@ final class FolderLibrary: LibraryService {
                 if e.isDocument { e.legacy = new.pathExtension.lowercased() != NibFormat.packageExtension }
                 e.stamp = nil
                 update(&e)
+                if !inTrash { e.node.trashedAt = nil }
+                topTrashedAt = e.node.trashedAt
             } else {
                 e.parentPath = newPath + String(e.parentPath.dropFirst(oldPath.count))
                 e.trashTop = false
+                e.node.trashedAt = inTrash ? topTrashedAt : nil
             }
             catalog.upsert(e)
             if e.isDocument { locator.set(rootURL.appendingPathComponent(e.node.path, isDirectory: true), for: e.node.id) }
@@ -1043,13 +1185,14 @@ final class FolderLibrary: LibraryService {
     /// device's, then removes merged conflict copies.
     @discardableResult
     private func updateFolderRecord(in dir: URL, id: FolderID, _ change: (inout FolderRecord) -> Void) throws -> FolderRecord {
-        let files = FolderRecords.files(in: dir, device: device)
-        var record = FolderRecord.merged(files.compactMap { FolderRecords.read($0) }) ?? FolderRecord(id: id, rev: .zero)
+        // Only copies that were read (and so merged) are removed afterwards.
+        let read = FolderRecords.files(in: dir, device: device).compactMap { url in FolderRecords.read(url).map { (url, $0) } }
+        var record = FolderRecord.merged(read.map { $0.1 }) ?? FolderRecord(id: id, rev: .zero)
         clock.observe(record.rev)
         change(&record)
         record.rev = clock.tick()
         try FileOps.write(try FolderRecords.encode(record), to: dir.appendingPathComponent(LibraryLayout.folderFileName(device)))
-        for file in files where LibraryLayout.device(of: file.lastPathComponent, prefix: LibraryLayout.folderPrefix)?.exact == false {
+        for (file, _) in read where LibraryLayout.device(of: file.lastPathComponent, prefix: LibraryLayout.folderPrefix)?.exact == false {
             try? FileOps.remove(file)
         }
         return record
