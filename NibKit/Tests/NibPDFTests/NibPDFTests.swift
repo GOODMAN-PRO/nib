@@ -108,6 +108,53 @@ final class NibPDFTests: XCTestCase {
         XCTAssertEqual(try h.snapshot(), before)
     }
 
+    func testImportHonoursTheDisplayNameCallerIDsAndNewDocumentDefaults() async throws {
+        let h = Harness(features: [NibPDFFeature.self])
+        h.app.services.settings.set(NibSettings.scrollDirection, .horizontal)
+        h.app.services.settings.set(NibSettings.defaultLanguage, "de-DE")
+        // import.files hands over the original name and the caller's ids (contracts-v2 G6).
+        let url = try TestPDF.file(TestPDF.make(pages: 2), name: "download")
+        let docs = try await importPDF(h, url, ImportTarget(displayName: "Lecture 3", ids: ["PDFNOTEBOOK1"]))
+        XCTAssertEqual(docs, ["PDFNOTEBOOK1"])
+        XCTAssertEqual(h.library.node("PDFNOTEBOOK1")?.title, "Lecture 3")
+        let meta = try h.app.workspace.content("PDFNOTEBOOK1").meta
+        XCTAssertEqual(meta.scrollDirection, .horizontal)
+        XCTAssertEqual(meta.language, "de-DE")
+
+        // A taken document id is a conflict, before anything is created.
+        let nodes = h.library.allNodes().count
+        do {
+            _ = try await importPDF(h, url, ImportTarget(ids: [Fixtures.docID]))
+            XCTFail("expected conflict")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .conflict)
+            XCTAssertEqual(error.path, "$.ids")
+        }
+        XCTAssertEqual(h.library.allNodes().count, nodes)
+    }
+
+    func testImportIntoANotebookNamesTheNewPagesWithCallerIDs() async throws {
+        let h = Harness(features: [NibPDFFeature.self])
+        let url = try TestPDF.file(TestPDF.make(pages: 3))
+        _ = try await importPDF(h, url, ImportTarget(document: Fixtures.docID, position: .start,
+                                                     ids: ["PDFPAGEA", "PDFPAGEB"]))
+        let pages = try h.app.workspace.content(Fixtures.docID).livePages
+        XCTAssertEqual(pages.count, 6)
+        XCTAssertEqual(pages[0].id, "PDFPAGEA")
+        XCTAssertEqual(pages[1].id, "PDFPAGEB")
+        XCTAssertEqual(pages[2].background.pdfPage, 2, "pages past the listed ids get fresh ids")
+        XCTAssertFalse(["PDFPAGEA", "PDFPAGEB", Fixtures.page1].contains(pages[2].id))
+
+        let before = try h.snapshot()
+        do {
+            _ = try await importPDF(h, url, ImportTarget(document: Fixtures.docID, ids: ["PDFPAGEC", Fixtures.page1]))
+            XCTFail("expected conflict")
+        } catch let error as NibError {
+            XCTAssertEqual(error.code, .conflict)
+        }
+        XCTAssertEqual(try h.snapshot(), before, "a taken page id adds nothing")
+    }
+
     func testDryRunChangesNothing() async throws {
         let h = Harness(features: [NibPDFFeature.self])
         let before = try h.snapshot()
@@ -248,5 +295,34 @@ final class NibPDFTests: XCTestCase {
 
         let none = try await h.run("pdf.links", ["page": "page:FIXTUREDOC01/FIXTUREPG003"])
         XCTAssertEqual(none["links"]?.arrayValue?.count, 0)
+    }
+
+    func testLinkRectsFollowTheBackgroundTransformOfARotatedPage() async throws {
+        let h = Harness(features: [NibPDFFeature.self])
+        _ = try await importPDF(h, try TestPDF.file(TestPDF.make(link: true)), ImportTarget(document: Fixtures.docID))
+        let page = try XCTUnwrap(try h.app.workspace.content(Fixtures.docID).livePages.last)
+        let source = try XCTUnwrap(page.size)
+        let ref = pageRef(Fixtures.docID, page.id)
+        let upright = try await h.run("pdf.links", ["page": ref]).decode(PDFLinksCommand.Output.self)
+        let r = try XCTUnwrap(upright.links.first).rect
+
+        // PageRecord.rotation turns the PDF background clockwise into the (swapped) page size (contracts-v2 G22).
+        h.app.commands.register(CommandDescriptor(id: "test.turnPage", title: "Turn Page", summary: "Rotates a page.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var record = try XCTUnwrap(try tx.content(Fixtures.docID).page(page.id))
+                record.rotation = 90
+                record.size = PageSize(source.height, source.width)
+                _ = try tx.put(record, doc: Fixtures.docID)
+            }
+            return .null
+        }
+        try await h.run("test.turnPage")
+        let turned = try await h.run("pdf.links", ["page": ref]).decode(PDFLinksCommand.Output.self)
+        let t = try XCTUnwrap(turned.links.first).rect
+        XCTAssertEqual(t.x, source.height - r.maxY, accuracy: 0.02)
+        XCTAssertEqual(t.y, r.x, accuracy: 0.02)
+        XCTAssertEqual(t.width, r.height, accuracy: 0.02)
+        XCTAssertEqual(t.height, r.width, accuracy: 0.02)
     }
 }

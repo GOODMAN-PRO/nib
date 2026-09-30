@@ -59,12 +59,13 @@ struct PDFPageGeometry: Equatable {
     }
 }
 
-/// `PDFService` over PDFKit: text, line blocks, links, outline and drag selections, all in page points.
+/// `PDFService` over PDFKit: text, line blocks, links, outline, drag selections and the word at a point, all in page
+/// points.
 /// Thread-safe: every call runs under one lock (PDFKit objects are not thread-safe) against a small LRU of open
 /// documents keyed by path + size + modification date. Assets are immutable, so repeated reads are cache hits; the
 /// cache is dropped on memory warnings so a 1,000-page PDF stays inside the memory budget (P-091).
 /// ponytail: one global lock; per-document locks if concurrent PDF reads ever show up in traces.
-final class PDFKitService: PDFService {
+final class PDFKitService: PDFService, @unchecked Sendable {   // every mutable field is behind `lock`
     static let cacheLimit = 4
 
     private let lock = NSLock()
@@ -146,6 +147,27 @@ final class PDFKitService: PDFService {
             }
             let rects = selection.selectionsByLine().map { geometry.pageRect($0.bounds(for: pdfPage)) }.filter { !$0.isEmpty }
             return (text: selection.string ?? "", rects: rects)
+        }
+    }
+
+    /// Slack around a word's box that still counts as "under the finger" (page points).
+    static let wordSlop = 4.0
+
+    /// The word under a page point (read-only long-press selection, contracts-v2 G22): its text without surrounding
+    /// whitespace and its box in page points. nil on blank space, between lines, or off the page. PDFKit snaps to the
+    /// nearest word even far away, so the point must fall within `wordSlop` of the word's box.
+    func word(_ url: URL, page: Int, at point: Point) -> (text: String, rect: Rect)? {
+        withPage(url, page, nil as (text: String, rect: Rect)?) { (pdfPage, geometry, _) -> (text: String, rect: Rect)? in
+            let size = geometry.size
+            guard point.x >= 0, point.y >= 0, point.x <= size.width, point.y <= size.height,
+                  let selection = pdfPage.selectionForWord(at: geometry.pdfPoint(point)) else { return nil }
+            let text = (selection.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let rect = geometry.pageRect(selection.bounds(for: pdfPage))
+            let slop = PDFKitService.wordSlop
+            guard !text.isEmpty, !rect.isEmpty,
+                  point.x >= rect.minX - slop, point.x <= rect.maxX + slop,
+                  point.y >= rect.minY - slop, point.y <= rect.maxY + slop else { return nil }
+            return (text: text, rect: rect)
         }
     }
 

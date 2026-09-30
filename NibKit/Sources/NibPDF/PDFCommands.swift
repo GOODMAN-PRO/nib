@@ -35,26 +35,21 @@ struct PDFPageSource {
     }
 }
 
-/// Where a PDF page sits on its Nib page: the page as the PDF displays it (`pdfSize`, the service's coordinates)
-/// aspect-fitted and centred in the Nib page. The identity for an imported page (same size). `PageRecord.rotation`
-/// turns the whole page (background and items together) on screen, so it moves nothing in page points.
-struct PDFPagePlacement {
-    let pdfSize: PageSize
-    let pageSize: PageSize
-
-    func point(_ p: Point) -> Point {
-        let w = pdfSize.width, h = pdfSize.height
-        guard w > 0, h > 0 else { return p }
-        let k = min(pageSize.width / w, pageSize.height / h)
-        return Point((pageSize.width - w * k) / 2 + p.x * k, (pageSize.height - h * k) / 2 + p.y * k)
-    }
-
-    /// Normalised and rounded to 0.01 pt for readable results.
-    func rect(_ r: Rect) -> Rect {
-        let a = point(Point(r.minX, r.minY)), b = point(Point(r.maxX, r.maxY))
+/// Where the PDF page sits on its Nib page: `PageRecord.backgroundTransform(sourceSize:)` (contracts-v2 G22), the
+/// transform the renderer and hit-testing share. `sourceSize` is the page as the PDF displays it (the service's
+/// coordinates); the record's `rotation` turns it clockwise, then it is aspect-fitted and centred into the page. The
+/// identity for an imported page (same size, no rotation).
+enum PDFPagePlacement {
+    /// A PDF-page rect in page points: its four corners through `transform`, normalised and rounded to 0.01 pt for
+    /// readable results.
+    static func rect(_ r: Rect, _ transform: Affine) -> Rect {
+        let corners = [Point(r.minX, r.minY), Point(r.maxX, r.minY), Point(r.minX, r.maxY), Point(r.maxX, r.maxY)]
+            .map { transform.apply($0) }
+        let xs = corners.map { $0.x }, ys = corners.map { $0.y }
         func round2(_ v: Double) -> Double { (v * 100).rounded() / 100 }
-        return Rect(x: round2(min(a.x, b.x)), y: round2(min(a.y, b.y)),
-                    width: round2(abs(a.x - b.x)), height: round2(abs(a.y - b.y)))
+        let minX = xs.min() ?? 0, minY = ys.min() ?? 0
+        return Rect(x: round2(minX), y: round2(minY),
+                    width: round2((xs.max() ?? 0) - minX), height: round2((ys.max() ?? 0) - minY))
     }
 }
 
@@ -182,10 +177,10 @@ struct PDFLinksCommand: NibCommand {
         guard let pdf = found else {
             throw NibError.notFound("page \(index + 1) of PDF asset \(source.asset.name)")
         }
-        let placement = PDFPagePlacement(pdfSize: pdf.size, pageSize: source.record.size ?? pdf.size)
+        let transform = source.record.backgroundTransform(sourceSize: pdf.size)
         let pages = try targets(source, ctx)
         let links = pdf.links.map { info in
-            Link(rect: placement.rect(info.rect), url: info.url, pdfPage: info.pageIndex,
+            Link(rect: PDFPagePlacement.rect(info.rect, transform), url: info.url, pdfPage: info.pageIndex,
                  target: info.pageIndex.flatMap { pages[$0] }.map { NodeRef.page(source.doc, $0).description })
         }
         let slice = PDFResultPaging.items(links, from: start)

@@ -130,6 +130,46 @@ final class PDFServiceTests: XCTestCase {
         XCTAssertEqual(service.selection(url, page: 5, from: .zero, to: Point(10, 10)).text, "")
     }
 
+    func testWordAtAPointReturnsThatWordAndItsBox() throws {
+        let url = try TestPDF.file(TestPDF.make(text: { _ in "Hello World" }))
+        let service = PDFKitService()
+        let font = UIFont.systemFont(ofSize: 18)
+        let lead = Double(("Hello " as NSString).size(withAttributes: [.font: font]).width)
+        let wordWidth = Double(("World" as NSString).size(withAttributes: [.font: font]).width)
+        let lineMid = Double(TestPDF.textOrigin.y) + Double(font.lineHeight) / 2
+        let inWorld = Point(Double(TestPDF.textOrigin.x) + lead + wordWidth / 2, lineMid)
+
+        let word = try XCTUnwrap(service.word(url, page: 0, at: inWorld))
+        XCTAssertEqual(word.text, "World")
+        XCTAssertTrue(word.rect.contains(inWorld), "\(word.rect) should contain \(inWorld)")
+        XCTAssertEqual(word.rect.minX, Double(TestPDF.textOrigin.x) + lead, accuracy: 4)
+        XCTAssertEqual(word.rect.width, wordWidth, accuracy: 6)
+        XCTAssertEqual(word.rect.midY, lineMid, accuracy: 8)
+
+        let hello = try XCTUnwrap(service.word(url, page: 0, at: Point(Double(TestPDF.textOrigin.x) + 10, lineMid)))
+        XCTAssertEqual(hello.text, "Hello")
+
+        XCTAssertNil(service.word(url, page: 0, at: Point(300, 600)), "blank space has no word")
+        XCTAssertNil(service.word(url, page: 0, at: Point(inWorld.x, lineMid + 80)), "a line below the text")
+        XCTAssertNil(service.word(url, page: 0, at: Point(-20, lineMid)), "off the page")
+        XCTAssertNil(service.word(url, page: 3, at: inWorld), "no such page")
+    }
+
+    func testWordOnARotatedPageIsInDisplayedPagePoints() throws {
+        let rotated = try TestPDF.edited(TestPDF.make(text: { _ in "Rotated line of text" })) { document in
+            try XCTUnwrap(document.page(at: 0)).rotation = 90
+        }
+        let url = try TestPDF.file(rotated)
+        let service = PDFKitService()
+        let block = try XCTUnwrap(service.textBlocks(url, page: 0).first { $0.text.contains("Rotated") })
+        // The line runs down the right-hand edge: its first word sits at the top of the block.
+        let point = Point(block.bbox.midX, block.bbox.minY + 12)
+        let word = try XCTUnwrap(service.word(url, page: 0, at: point))
+        XCTAssertEqual(word.text, "Rotated")
+        XCTAssertTrue(word.rect.contains(point), "\(word.rect) should contain \(point)")
+        XCTAssertGreaterThan(word.rect.height, word.rect.width, "a quarter turn stands the word upright")
+    }
+
     func testRotatedPagesSwapTheirSizeAndTurnCoordinatesClockwise() throws {
         let rotated = try TestPDF.edited(TestPDF.make(text: { _ in "Rotated line of text" })) { document in
             try XCTUnwrap(document.page(at: 0)).rotation = 90
@@ -191,21 +231,38 @@ final class PDFServiceTests: XCTestCase {
                        Rect(x: 0, y: 0, width: 50, height: 100))
     }
 
-    func testPlacementIsIdentityForImportedPagesAndAspectFitsOtherSizes() {
+    func testPlacementFollowsTheBackgroundTransform() {
         let rect = Rect(x: 10, y: 20, width: 30, height: 40)
-        XCTAssertEqual(PDFPagePlacement(pdfSize: PageSize(600, 800), pageSize: PageSize(600, 800)).rect(rect), rect)
+        let pdf = PageSize(600, 800)
+        func placed(_ page: PageSize?, rotation: Int = 0) -> Rect {
+            PDFPagePlacement.rect(rect, PageRecord.backgroundTransform(sourceSize: pdf, rotation: rotation, pageSize: page))
+        }
+        // An imported page (same size, unrotated) is the identity; so is a board, which draws the PDF unscaled.
+        XCTAssertEqual(placed(PageSize(600, 800)), rect)
+        XCTAssertEqual(placed(nil), rect)
         // A half-size page scales by 0.5; a wider page centres the PDF horizontally.
-        let half = PDFPagePlacement(pdfSize: PageSize(600, 800), pageSize: PageSize(300, 400))
-        XCTAssertEqual(half.point(Point(600, 800)), Point(300, 400))
-        XCTAssertEqual(half.rect(rect), Rect(x: 5, y: 10, width: 15, height: 20))
-        let wide = PDFPagePlacement(pdfSize: PageSize(600, 800), pageSize: PageSize(800, 800))
-        XCTAssertEqual(wide.point(Point(0, 0)), Point(100, 0))
+        XCTAssertEqual(placed(PageSize(300, 400)), Rect(x: 5, y: 10, width: 15, height: 20))
+        XCTAssertEqual(placed(PageSize(800, 800)), Rect(x: 110, y: 20, width: 30, height: 40))
+        // PageRecord.rotation turns the background clockwise (contracts-v2 G22): a quarter turn onto the swapped page
+        // moves the rect's top-left corner to the top-right and swaps its extent.
+        XCTAssertEqual(placed(PageSize(800, 600), rotation: 90), Rect(x: 800 - 60, y: 10, width: 40, height: 30))
+        XCTAssertEqual(placed(PageSize(600, 800), rotation: 180), Rect(x: 600 - 40, y: 800 - 60, width: 30, height: 40))
+        XCTAssertEqual(placed(PageSize(800, 600), rotation: 270), Rect(x: 20, y: 600 - 40, width: 40, height: 30))
+        // Rounded to 0.01 pt.
+        let third = PDFPagePlacement.rect(Rect(x: 1, y: 1, width: 1, height: 1), Affine(a: 1.0 / 3, b: 0, c: 0, d: 1.0 / 3, tx: 0, ty: 0))
+        XCTAssertEqual(third, Rect(x: 0.33, y: 0.33, width: 0.33, height: 0.33))
     }
 
-    func testTitlesComeFromTheFileNameWithoutTheDownloadPrefix() {
+    func testTitlesComeFromTheDisplayNameElseTheFileName() {
         XCTAssertEqual(PDFImporter.title(of: URL(fileURLWithPath: "/tmp/Mechanics.pdf")), "Mechanics")
-        let downloaded = URL(fileURLWithPath: "/tmp/" + UUID().uuidString + "-Lecture 3.pdf")
-        XCTAssertEqual(PDFImporter.title(of: downloaded), "Lecture 3")
+        // import.files passes the original name: a tmp: asset or a download keeps a generated or original local name.
+        let local = URL(fileURLWithPath: "/tmp/nib-downloads/\(UUID().uuidString)/lecture3.pdf")
+        XCTAssertEqual(PDFImporter.title(of: local, displayName: "Lecture 3"), "Lecture 3")
+        XCTAssertEqual(PDFImporter.title(of: local, displayName: "  "), "lecture3")
+        XCTAssertEqual(PDFImporter.title(of: local), "lecture3")
+        // A file that happens to start with a UUID keeps it: nothing is stripped any more.
+        let uuidName = UUID().uuidString + "-Notes"
+        XCTAssertEqual(PDFImporter.title(of: URL(fileURLWithPath: "/tmp/\(uuidName).pdf")), uuidName)
     }
 
     func testOrderKeysAreSortedUniqueBoundedAndShort() {

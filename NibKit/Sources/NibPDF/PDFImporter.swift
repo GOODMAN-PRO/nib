@@ -24,9 +24,18 @@ enum PDFImporter {
         }
     }
 
+    /// `target.displayName` titles a new notebook (and names the file in the password prompt); `target.ids` (in
+    /// order) name the new notebook, or the new pages when `target.document` is set (contracts-v2 G6).
     static func importPDF(_ url: URL, into target: ImportTarget, _ ctx: CommandContext) async throws -> [DocumentID] {
         let assets = try ctx.services.require(ctx.services.assets, "asset store")
-        let prepared = try await prepare(url, ctx)
+        let title = title(of: url, displayName: target.displayName)
+        let ids = target.ids ?? []
+        if let doc = target.document {
+            try checkNotebook(doc, ctx)
+        } else if let id = ids.first {
+            try checkNewDocumentID(id, ctx)
+        }
+        let prepared = try await prepare(url, name: title, ctx)
         if prepared.decrypted { log.info("stored a decrypted copy of a password-protected PDF") }
         if prepared.flattened { log.info("flattened form fields and annotations of an imported PDF") }
         if let doc = target.document {
@@ -35,21 +44,21 @@ enum PDFImporter {
         }
         // A dry run previews edits by rolling them back; a new library document cannot be rolled back.
         if ctx.dryRun { return [] }
-        return [try await createNotebook(prepared, title: title(of: url), folder: target.folder, assets: assets, ctx)]
+        return [try await createNotebook(prepared, title: title, id: ids.first, folder: target.folder, assets: assets, ctx)]
     }
 
     // MARK: Steps
 
-    /// Reads, unlocks and measures the PDF off the main actor, asking for the password while it is locked.
-    static func prepare(_ url: URL, _ ctx: CommandContext) async throws -> PDFImportPreparation.Prepared {
-        let name = url.lastPathComponent
+    /// Reads, unlocks and measures the PDF off the main actor, asking for the password while it is locked. `name` is
+    /// what the user knows the file as (the prompt and errors show it).
+    static func prepare(_ url: URL, name: String, _ ctx: CommandContext) async throws -> PDFImportPreparation.Prepared {
         var password: String?
         var attempts = 0
         while true {
             let candidate = password
             do {
                 return try await Task.detached(priority: .userInitiated) {
-                    try PDFImportPreparation.prepare(url, password: candidate)
+                    try PDFImportPreparation.prepare(url, name: name, password: candidate)
                 }.value
             } catch let failure as PDFImportPreparation.PasswordFailure {
                 attempts += 1
@@ -64,10 +73,14 @@ enum PDFImporter {
         }
     }
 
-    static func createNotebook(_ prepared: PDFImportPreparation.Prepared, title: String, folder: FolderID?,
-                               assets: AssetStore, _ ctx: CommandContext) async throws -> DocumentID {
+    static func createNotebook(_ prepared: PDFImportPreparation.Prepared, title: String, id: DocumentID? = nil,
+                               folder: FolderID?, assets: AssetStore, _ ctx: CommandContext) async throws -> DocumentID {
         let library = try ctx.services.require(ctx.services.library, "library")
-        var meta = DocumentMeta(kind: .notebook)
+        let settings = ctx.services.settings
+        if let id = id { try checkNewDocumentID(id, ctx) }   // the library may have changed during the await
+        var meta = DocumentMeta(id: id ?? NibID.make(), kind: .notebook,
+                                language: settings.get(NibSettings.defaultLanguage),
+                                scrollDirection: settings.get(NibSettings.scrollDirection))
         meta.coverEnabled = false                      // the PDF's first page is page 1, as in Goodnotes
         let doc = try library.createDocument(DocumentContent(meta: meta), title: title, in: folder)
         do {
@@ -88,19 +101,46 @@ enum PDFImporter {
 
     static func insert(_ prepared: PDFImportPreparation.Prepared, into doc: DocumentID, target: ImportTarget,
                        assets: AssetStore, _ ctx: CommandContext) async throws {
+        try checkNotebook(doc, ctx)
+        let chosen = target.ids ?? [], count = prepared.sizes.count
+        _ = try pageIDs(chosen, count: min(chosen.count, count), in: ctx.workspace.content(doc))  // before storing
+        let asset = try await store(prepared.data, doc: doc, assets: assets, dryRun: ctx.dryRun)
+        // Read the neighbours and check the ids after the await: other commands may have changed the page list.
+        let content = try ctx.workspace.content(doc)
+        let ids = try pageIDs(chosen, count: count, in: content)
+        let (lower, upper) = neighbours(content.livePages, target.position, anchor: target.anchorPage)
+        let pages = pageRecords(prepared.sizes, asset: asset,
+                                orders: orderKeys(between: lower, upper, count: count), ids: ids)
+        try ctx.mutate { tx in
+            for page in pages { try tx.put(page, doc: doc) }
+        }
+    }
+
+    static func checkNotebook(_ doc: DocumentID, _ ctx: CommandContext) throws {
         guard try ctx.workspace.content(doc).meta.kind == .notebook else {
             throw NibError(.invalidParams, "PDF pages can only be added to notebooks", path: "$.doc",
                            hint: "import the PDF as a new notebook instead")
         }
-        let asset = try await store(prepared.data, doc: doc, assets: assets, dryRun: ctx.dryRun)
-        // Read the neighbours after the await: other commands may have changed the page list meanwhile.
-        let live = try ctx.workspace.content(doc).livePages
-        let (lower, upper) = neighbours(live, target.position, anchor: target.anchorPage)
-        let pages = pageRecords(prepared.sizes, asset: asset,
-                                orders: orderKeys(between: lower, upper, count: prepared.sizes.count))
-        try ctx.mutate { tx in
-            for page in pages { try tx.put(page, doc: doc) }
+    }
+
+    /// A caller-chosen id for the new notebook must be free.
+    static func checkNewDocumentID(_ id: DocumentID, _ ctx: CommandContext) throws {
+        let library = try ctx.services.require(ctx.services.library, "library")
+        guard library.node(id) == nil else {
+            throw NibError(.conflict, "a document with id \(id.raw) already exists", path: "$.ids",
+                           hint: "choose another id, or leave ids out")
         }
+    }
+
+    /// Ids of the new pages: the caller's in order, then fresh ones. Each chosen id must be new to the document.
+    static func pageIDs(_ chosen: [NibID], count: Int, in content: DocumentContent) throws -> [PageID] {
+        let used = Set(content.pages.map { $0.id })
+        var seen = Set<PageID>()
+        for id in chosen.prefix(count) where used.contains(id) || !seen.insert(id).inserted {
+            throw NibError(.conflict, "page \(id.raw) already exists in document \(content.meta.id.raw)",
+                           path: "$.ids", hint: "choose other ids, or leave ids out")
+        }
+        return (0..<count).map { $0 < chosen.count ? chosen[$0] : NibID.make() }
     }
 
     /// Copies the bytes into the document's assets once (content-addressed), off the main actor.
@@ -113,21 +153,22 @@ enum PDFImporter {
 
     // MARK: Pure helpers
 
-    /// The file name without extension, minus the "<UUID>-" prefix `CommandContext.inputFile` gives downloads.
-    static func title(of url: URL) -> String {
-        var name = url.deletingPathExtension().lastPathComponent
-        if name.count > 37, name.dropFirst(36).first == "-", UUID(uuidString: String(name.prefix(36))) != nil {
-            name = String(name.dropFirst(37))
-        }
+    /// The caller's display name (`import.files` passes the original name), else the file name without extension.
+    /// Downloads and `tmp:` files keep their original name (contracts-v2 G6), so nothing is stripped.
+    static func title(of url: URL, displayName: String? = nil) -> String {
+        if let given = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !given.isEmpty { return given }
+        let name = url.deletingPathExtension().lastPathComponent
         return name.isEmpty ? "PDF" : name
     }
 
-    static func pageRecords(_ sizes: [PageSize], asset: AssetRef, orders: [String]) -> [PageRecord] {
+    /// One record per PDF page; `ids` (when given, one per page) name them.
+    static func pageRecords(_ sizes: [PageSize], asset: AssetRef, orders: [String], ids: [PageID]? = nil) -> [PageRecord] {
         (0..<min(sizes.count, orders.count)).map { index -> PageRecord in
             let s = sizes[index]
             // Page records accept 1…100,000 pt; real PDF pages are far inside that.
             let size = PageSize(min(max(s.width, 1), 100_000), min(max(s.height, 1), 100_000))
-            return PageRecord(order: orders[index], size: size, background: .ofPDF(asset, page: index))
+            let id = ids.flatMap { index < $0.count ? $0[index] : nil } ?? NibID.make()
+            return PageRecord(id: id, order: orders[index], size: size, background: .ofPDF(asset, page: index))
         }
     }
 
@@ -178,8 +219,9 @@ enum PDFImportPreparation {
     /// Annotation subtypes the importer keeps as annotations: links (read by `links`) and popups (never drawn).
     static let keptAnnotations: Set<String> = ["Link", "Popup"]
 
-    static func prepare(_ url: URL, password: String?) throws -> Prepared {
-        let name = url.lastPathComponent
+    /// `name` = what the user knows the file as, for error messages (default: the file name).
+    static func prepare(_ url: URL, name: String? = nil, password: String?) throws -> Prepared {
+        let name = name ?? url.lastPathComponent
         var data: Data
         do {
             data = try Data(contentsOf: url, options: .mappedIfSafe)
