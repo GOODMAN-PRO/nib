@@ -39,6 +39,7 @@ struct RenderJob {
     let registries: ContentRegistries
     let pdf: PDFRenderPool
     let rasters: RasterBackgroundCache
+    let inks: PKStrokeCache
     /// Tile-cache variant (layers, background, annotations, purpose); nil = not cacheable (hidden items, replay).
     let variant: String?
     /// Tile-cache generation of the page when the snapshot was taken.
@@ -115,6 +116,8 @@ struct InkBand {
     /// Highlighter bands: the colour alpha their strokes share (the band is composited once at that opacity).
     var alpha: UInt8 = 255
     var strokes: [Stroke] = []
+    /// `PKStrokeCache` keys of `strokes`, index for index.
+    var keys: [String] = []
     var items: [Item] = []
 }
 
@@ -159,6 +162,7 @@ enum InkBands {
             var kind: InkBand.Kind
             var faded: Bool
             var stroke: Stroke?
+            var key = ""
             var item: Item
         }
         var ordered: [Entry] = []
@@ -175,7 +179,8 @@ enum InkBands {
                 continue
             }
             guard let r = replayed(s, replay) else { continue }
-            run.append(Entry(kind: k, faded: r.faded, stroke: r.stroke, item: item))
+            run.append(Entry(kind: k, faded: r.faded, stroke: r.stroke, key: PKStrokeCache.key(item, points: r.stroke.points.count),
+                             item: item))
         }
         flush()
 
@@ -188,11 +193,52 @@ enum InkBands {
             let alpha = isHighlighter(e.kind) ? stroke.style.color.a : 255
             if let last = bands.last, last.kind == e.kind, last.faded == e.faded, last.alpha == alpha {
                 bands[bands.count - 1].strokes.append(stroke)
+                bands[bands.count - 1].keys.append(e.key)
             } else {
-                bands.append(InkBand(kind: e.kind, faded: e.faded, alpha: alpha, strokes: [stroke]))
+                bands.append(InkBand(kind: e.kind, faded: e.faded, alpha: alpha, strokes: [stroke], keys: [e.key]))
             }
         }
         return bands
+    }
+}
+
+// MARK: - PencilKit strokes
+
+/// Model strokes converted to `PKStroke`s, shared by every job and tile of the renderer. PencilKit keeps a stroke's
+/// render data on the `PKStroke` itself, so a tile drawn again (after an edit nearby, a zoom bucket change or an
+/// eviction) converts and prepares only the strokes it has not drawn at their current revision: roughly a third of
+/// a 150-stroke tile's composite. Keyed by document, item id, revision and point count (Note Replay's reveal draws a
+/// prefix of the points); an edit gives the item a new revision, so entries never go stale, they just age out.
+final class PKStrokeCache {
+    private final class Entry {
+        let stroke: PKStroke
+        init(_ stroke: PKStroke) { self.stroke = stroke }
+    }
+
+    /// Rough bytes one stroke point costs PencilKit (control point, interpolated path, render data).
+    static let bytesPerPoint = 160
+    private let cache = NSCache<NSString, Entry>()
+
+    init(costLimit: Int = 48 << 20) {
+        cache.totalCostLimit = costLimit
+    }
+
+    static func key(_ item: Item, points: Int) -> String {
+        "\(item.id.raw)|\(item.rev.wallMs).\(item.rev.counter).\(item.rev.device)|\(points)"
+    }
+
+    /// The PencilKit stroke for `stroke`; `key` (from `key(_:points:)`, plus the document and any colour change) names
+    /// its content, and nil skips the cache.
+    func stroke(_ stroke: Stroke, key: String?) -> PKStroke {
+        guard let key = key else { return PKBridge.pkStroke(stroke) }
+        if let hit = cache.object(forKey: key as NSString) { return hit.stroke }
+        let pk = PKBridge.pkStroke(stroke)
+        cache.setObject(Entry(pk), forKey: key as NSString, cost: max(1, stroke.points.count) * PKStrokeCache.bytesPerPoint)
+        return pk
+    }
+
+    func purge() {
+        cache.removeAllObjects()
     }
 }
 
@@ -378,15 +424,12 @@ enum PageCompositor {
         let fade: CGFloat = band.faded ? 0.25 : 1
         switch band.kind {
         case .ink:
-            composite(inkImage(band.strokes, region: region, scale: scale), region: region, alpha: fade, blend: .normal, cg: cg)
+            composite(inkImage(band, opaque: false, job: job, region: region, scale: scale), region: region, alpha: fade,
+                      blend: .normal, cg: cg)
         case .highlighter:
             let (alpha, blend) = highlighterBlend(band.alpha, dark: paper.isDark)
-            let opaque = band.strokes.map { s -> Stroke in
-                var s = s
-                s.style.color = s.style.color.withAlpha(1)
-                return s
-            }
-            composite(inkImage(opaque, region: region, scale: scale), region: region, alpha: alpha * fade, blend: blend, cg: cg)
+            composite(inkImage(band, opaque: true, job: job, region: region, scale: scale), region: region,
+                      alpha: alpha * fade, blend: blend, cg: cg)
         case .patternInk:
             let image = patternImage(band.strokes, opaque: false, region: region, width: width, height: height)
             composite(image, region: region, alpha: fade, blend: .normal, cg: cg)
@@ -413,11 +456,20 @@ enum PageCompositor {
         return (CGFloat(colourAlpha) / 255, CGBlendMode.multiply)
     }
 
-    /// One PencilKit image of solid pen/pencil (or highlighter) strokes: PencilKit's own ink look, so dry tiles
-    /// match the wet ink the canvas captured.
-    static func inkImage(_ strokes: [Stroke], region: Rect, scale: Double) -> CGImage? {
-        guard !strokes.isEmpty else { return nil }
-        return PKBridge.drawing(strokes).image(from: region.cg, scale: CGFloat(scale)).cgImage
+    /// One PencilKit image of a band's solid pen/pencil (or highlighter) strokes: PencilKit's own ink look, so dry
+    /// tiles match the wet ink the canvas captured. `opaque` draws the colours at full opacity (highlighter bands are
+    /// composited once at the band's alpha). Strokes come from the renderer's `PKStrokeCache`.
+    static func inkImage(_ band: InkBand, opaque: Bool, job: RenderJob, region: Rect, scale: Double) -> CGImage? {
+        guard !band.strokes.isEmpty else { return nil }
+        let prefix = job.doc.raw + (opaque ? "|o|" : "|")
+        var strokes: [PKStroke] = []
+        strokes.reserveCapacity(band.strokes.count)
+        for (i, stroke) in band.strokes.enumerated() {
+            var s = stroke
+            if opaque { s.style.color = s.style.color.withAlpha(1) }
+            strokes.append(job.inks.stroke(s, key: i < band.keys.count ? prefix + band.keys[i] : nil))
+        }
+        return PKDrawing(strokes: strokes).image(from: region.cg, scale: CGFloat(scale)).cgImage
     }
 
     static func patternImage(_ strokes: [Stroke], opaque: Bool, region: Rect, width: Int, height: Int) -> CGImage? {

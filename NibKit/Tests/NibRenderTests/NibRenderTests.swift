@@ -156,11 +156,32 @@ final class NibRenderTests: XCTestCase {
         XCTAssertEqual(reveal[1].strokes[0].points.count, pts.count)
 
         XCTAssertEqual(InkBands.make(items, replay: ReplayState(time: 0, mode: .showAll)).count, 4)
+        XCTAssertEqual(reveal[0].keys, [PKStrokeCache.key(highlighter, points: 3)], "a revealed prefix has its own key")
+        var edited = pen
+        edited.rev = Rev(wallMs: 9, counter: 0, device: 7)
+        XCTAssertNotEqual(PKStrokeCache.key(edited, points: pts.count), PKStrokeCache.key(pen, points: pts.count))
 
         var dashedStyle = InkStyle.defaultPen
         dashedStyle.pattern = .dotted
         XCTAssertEqual(InkBands.kind(of: Item.makeStroke(Stroke(style: dashedStyle, points: pts))), .patternInk)
         XCTAssertEqual(InkBands.kind(of: Item.makeStroke(Stroke(style: .defaultTape, points: pts))), .item)
+    }
+
+    func testEditedStrokeIsDrawnFromItsNewRevision() async throws {
+        let h = Harness(features: [NibRenderFeature.self])
+        let renderer = try XCTUnwrap(h.app.services.renderer)
+        let style = InkStyle(tool: .pen, pen: .ball, color: RGBA(0, 0, 0), width: 6)
+        let line = Item.makeStroke(Stroke(style: style, points: [StrokePoint(x: 20, y: 40), StrokePoint(x: 220, y: 40)]))
+        let (doc, page) = try makePage(h, items: [line])
+        let before = bitmap(try await renderer.render(RenderRequest(doc: doc, page: page, scale: 1)).image)
+        XCTAssertLessThan(rgb(before, 120, 40).r, 80)
+
+        var moved = try h.app.workspace.allItems(doc, page: page)[0]
+        moved.stroke?.points = [StrokePoint(x: 20, y: 150), StrokePoint(x: 220, y: 150)]
+        try await h.insert([moved], page: page, doc: doc)
+        let after = bitmap(try await renderer.render(RenderRequest(doc: doc, page: page, scale: 1)).image)
+        XCTAssertGreaterThan(rgb(after, 120, 40).r, 200, "the cached PencilKit stroke of the old revision is not reused")
+        XCTAssertLessThan(rgb(after, 120, 150).r, 80)
     }
 
     func testPDFBackgroundIsDrawnUpright() async throws {
@@ -587,8 +608,10 @@ final class NibRenderTests: XCTestCase {
         let warm = try renderer.snapshot(request)
         XCTAssertEqual(warm.visibleItems.count, 150)
         XCTAssertNotNil(PageCompositor.image(warm, region: tile, scale: 2, width: 512, height: 512, marks: []))   // warm-up
-        // The fastest of ten composites, each from a fresh snapshot (nothing carried over between samples): shared CI
-        // runners and a busy build Mac add noise that only ever makes a sample slower.
+        // The fastest of ten composites, each from a fresh snapshot: shared CI runners and a busy build Mac add noise
+        // that only ever makes a sample slower. The warm-up converted the strokes into the renderer's PKStrokeCache, so
+        // the samples are the canvas's steady state: a tile drawn again after an edit nearby, a zoom bucket change or
+        // an eviction.
         var best = Double.infinity
         for _ in 0..<10 {
             let job = try renderer.snapshot(request)

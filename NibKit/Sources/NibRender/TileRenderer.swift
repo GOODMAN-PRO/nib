@@ -211,6 +211,7 @@ final class NibPageRenderer: PageRenderer {
     let looks = PageLooks()
     let pdf = PDFRenderPool()
     let rasters = RasterBackgroundCache()
+    let inks = PKStrokeCache()
     private var commitSubscription: EventSubscription?
     private var observers: [NSObjectProtocol] = []
 
@@ -295,6 +296,7 @@ final class NibPageRenderer: PageRenderer {
         looks.removeAll()
         pdf.purge()
         rasters.purge()
+        inks.purge()
     }
 
     // MARK: Invalidation
@@ -410,7 +412,7 @@ final class NibPageRenderer: PageRenderer {
                          pdfURL: pdfURL, allItems: items, layers: layers, hidden: request.hidden,
                          annotations: request.annotations, replay: request.replay, purpose: request.purpose,
                          requestedRegion: request.region, assets: assets, registries: registries, pdf: pdf,
-                         rasters: rasters, variant: variant, generation: tiles.generation(pageKey))
+                         rasters: rasters, inks: inks, variant: variant, generation: tiles.generation(pageKey))
     }
 
     // MARK: Workers
