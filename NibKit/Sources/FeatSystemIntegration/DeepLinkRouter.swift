@@ -289,13 +289,25 @@ struct BridgePairing: Equatable {
     let port: Int
     let token: String
 
+    /// Characters of a host name or IPv4 address (IPv6 literals are checked with `inet_pton` instead).
+    static let hostCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._"))
+
     init(host: String?, port: String?, token: String?) throws {
         let h = (host ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let bare = h.hasPrefix("[") && h.hasSuffix("]") ? String(h.dropFirst().dropLast()) : h
-        guard !bare.isEmpty, bare.count <= 253,
-              bare.unicodeScalars.allSatisfy({ !CharacterSet.whitespacesAndNewlines.contains($0) }),
-              !bare.contains("/"), !bare.contains("@"), !bare.contains("?"), !bare.contains("#") else {
+        guard !bare.isEmpty, bare.count <= 253 else {
             throw DeepLinkParser.invalid("the pairing link needs the bridge's host, e.g. host=100.101.102.103")
+        }
+        // A ':' makes the host an IPv6 literal in the URL ("http://[…]:port"), so it must be one: "evil.com:80" is not.
+        // Zone ids ("fe80::1%en0") name an interface of this device, and would need escaping in the URL: refused.
+        if bare.contains(":") {
+            guard !bare.contains("%"), BridgePairing.ipv6Bytes(bare) != nil else {
+                throw DeepLinkParser.invalid("'\(String(bare.prefix(80)))' is not an IPv6 address; put the port in port=")
+            }
+        } else {
+            guard bare.unicodeScalars.allSatisfy({ BridgePairing.hostCharacters.contains($0) }) else {
+                throw DeepLinkParser.invalid("the pairing link needs the bridge's host, e.g. host=100.101.102.103")
+            }
         }
         var number = BridgePairing.defaultPort
         if let p = port?.trimmingCharacters(in: .whitespaces), !p.isEmpty {
@@ -314,16 +326,44 @@ struct BridgePairing: Equatable {
         self.token = t
     }
 
-    /// From `panel.open` params (`PanelContext.params`: flat, or under `params`); nil when incomplete.
-    init?(params: JSONValue) {
-        func value(_ key: String) -> String? {
-            let v = params[key] ?? params["params"]?[key]
-            if let s = v?.stringValue { return s }
-            if let n = v?.intValue { return String(n) }
-            return nil
+    /// True for addresses a bridge serves (ARCHITECTURE.md §12: the local network and Tailscale): RFC 1918,
+    /// 100.64.0.0/10 (Tailscale), link-local, loopback, fd00::/8 (Tailscale's IPv6), *.ts.net, *.local and single-label
+    /// names. Anything else is still shown, with a warning.
+    var isPrivateNetwork: Bool {
+        var name = host.lowercased()
+        while name.hasSuffix(".") { name.removeLast() }
+        if let b = BridgePairing.ipv4Bytes(name) { return BridgePairing.isPrivate(ipv4: b) }
+        if let b = BridgePairing.ipv6Bytes(name) {
+            if b[0] == 0xfd { return true }                                    // fd00::/8
+            if b[0] == 0xfe, b[1] & 0xc0 == 0x80 { return true }               // fe80::/10
+            if b[0..<15].allSatisfy({ $0 == 0 }), b[15] == 1 { return true }   // ::1
+            if b[0..<10].allSatisfy({ $0 == 0 }), b[10] == 0xff, b[11] == 0xff {  // ::ffff:a.b.c.d
+                return BridgePairing.isPrivate(ipv4: Array(b[12..<16]))
+            }
+            return false
         }
-        guard let p = try? BridgePairing(host: value("host"), port: value("port"), token: value("token")) else { return nil }
-        self = p
+        if !name.contains(".") { return true }
+        return name.hasSuffix(".ts.net") || name.hasSuffix(".local")
+    }
+
+    static func isPrivate(ipv4 b: [UInt8]) -> Bool {
+        guard b.count == 4 else { return false }
+        return b[0] == 10 || (b[0] == 172 && (16...31).contains(b[1])) || (b[0] == 192 && b[1] == 168)
+            || (b[0] == 100 && (64...127).contains(b[1])) || (b[0] == 169 && b[1] == 254) || b[0] == 127
+    }
+
+    /// The four bytes of a dotted-quad IPv4 address; nil for anything else.
+    static func ipv4Bytes(_ s: String) -> [UInt8]? {
+        var addr = in_addr()
+        guard s.withCString({ inet_pton(AF_INET, $0, &addr) }) == 1 else { return nil }
+        return withUnsafeBytes(of: &addr) { Array($0) }
+    }
+
+    /// The sixteen bytes of an IPv6 literal (no brackets, no zone); nil for anything else.
+    static func ipv6Bytes(_ s: String) -> [UInt8]? {
+        var addr = in6_addr()
+        guard s.withCString({ inet_pton(AF_INET6, $0, &addr) }) == 1 else { return nil }
+        return withUnsafeBytes(of: &addr) { Array($0) }
     }
 
     /// `[fd7a::1]` for IPv6 addresses inside a URL.
@@ -406,8 +446,18 @@ struct RouteResult: Codable, Equatable {
 enum DeepLinkRouter {
     static func perform(_ link: DeepLink, ctx: CommandContext) async throws -> RouteResult {
         switch link {
-        case let .open(doc, page, comment):
+        case let .open(doc, linkedPage, linkedComment):
             try requireDocument(doc, ctx)
+            // A link can outlive its page (Copy Link to Page, text links): land in the document instead, and drop the
+            // comment thread that lived on that page.
+            var page = linkedPage
+            if let p = linkedPage, let content = try? ctx.workspace.peekContent(doc),
+               content.page(p).map({ $0.deleted }) ?? true {
+                let thread = linkedComment == nil ? "" : " (its comment thread is skipped)"
+                SystemLog.log.info("link to missing page \(p.raw, privacy: .public): opening its document\(thread, privacy: .public)")
+                page = nil
+            }
+            let comment = page == nil ? nil : linkedComment
             let ref = comment.flatMap { c in page.map { NodeRef.item(doc, $0, c).description } }
                 ?? page.map { NodeRef.page(doc, $0).description } ?? NodeRef.document(doc).description
             guard !ctx.dryRun else { return RouteResult(route: link.route, ref: ref) }
@@ -542,16 +592,23 @@ enum DeepLinkRouter {
     }
 
     /// The pairing sheet: a registered `.sheet` panel (`panel.open`: the document chrome or the library presents it),
-    /// else presented straight on the window when no panel host is installed.
+    /// else presented straight on the window when no panel host is installed. `panel.open` carries only a nonce for the
+    /// pairing this link parsed (held in `SystemRuntime`): the sheet never reads an address or a token from panel params,
+    /// so no other caller of `panel.open` (the AI, the bridge, a plugin) can make it show one, and the token never
+    /// travels through command params.
     static func showPairing(_ pairing: BridgePairing, ctx: CommandContext) async throws {
-        let params: JSONValue = ["id": .string(SystemIDs.pairingPanel), "host": .string(pairing.host),
-                                 "port": .number(Double(pairing.port)), "token": .string(pairing.token)]
-        if ctx.bus.registry.entry(SystemIDs.panelOpen) != nil {
+        if ctx.bus.registry.entry(SystemIDs.panelOpen) != nil, let runtime = SystemRuntime.shared(ctx.services) {
+            let nonce = runtime.holdPairing(pairing)
             do {
-                _ = try await ctx.execute(SystemIDs.panelOpen, params)
+                _ = try await ctx.execute(SystemIDs.panelOpen, ["id": .string(SystemIDs.pairingPanel),
+                                                                "pairing": .string(nonce)])
                 return
             } catch let e as NibError where e.code == .unavailable {
+                runtime.releasePairing(nonce)
                 SystemLog.log.info("panel.open could not show the pairing sheet (\(e.message, privacy: .public)); presenting it directly")
+            } catch {
+                runtime.releasePairing(nonce)
+                throw error
             }
         }
         guard let navigator = ctx.navigator else { throw NibError.unavailable("a window to show the pairing sheet in") }
@@ -576,19 +633,40 @@ final class AlertLinkConfirmer: LinkConfirming {
         guard !NibApp.isHostlessTest, let navigator, navigator.rootViewController != nil else { return false }
         let host = url.host ?? url.absoluteString
         return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let answer = Answer(continuation)
             let alert = UIAlertController(
                 title: String(localized: "Install a plugin from \(host)?"),
                 message: String(localized: "A link asked Nib to install the plugin at \(url.absoluteString). You'll see what it can do before anything runs."),
                 preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: String(localized: "Cancel"), style: .cancel) { _ in
-                continuation.resume(returning: false)
+                answer.resume(false)
             })
             let review = UIAlertAction(title: String(localized: "Review Plugin"), style: .default) { _ in
-                continuation.resume(returning: true)
+                answer.resume(true)
             }
             alert.addAction(review)
             alert.preferredAction = review
             navigator.presentModal(alert)
+            // UIKit may refuse to present (the top controller is being dismissed, the scene went away): then nobody
+            // can answer, and the link must not wait forever.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard alert.presentingViewController == nil else { return }
+                    SystemLog.log.info("the plugin install question could not be shown; the link was cancelled")
+                    answer.resume(false)
+                }
+            }
+        }
+    }
+
+    /// Resumes the continuation once: the first of an alert button and the presentation check wins.
+    @MainActor
+    private final class Answer {
+        private var continuation: CheckedContinuation<Bool, Never>?
+        init(_ continuation: CheckedContinuation<Bool, Never>) { self.continuation = continuation }
+        func resume(_ value: Bool) {
+            continuation?.resume(returning: value)
+            continuation = nil
         }
     }
 }
@@ -609,10 +687,31 @@ struct BridgePairingSheet: View {
     static func panel(owner: String) -> PanelDescriptor {
         var d = PanelDescriptor(id: SystemIDs.pairingPanel, title: String(localized: "Pair an Agent"),
                                 icon: NibSymbol.bridge.name, placement: .sheet, order: 0, owner: owner) { ctx in
-            AnyView(BridgePairingSheet(pairing: BridgePairing(params: ctx.params), onDone: { ctx.dismiss() }))
+            let nonce = BridgePairingSheet.pairingNonce(ctx.params)
+            let runtime = SystemRuntime.shared(ctx.app.services)
+            let pairing = BridgePairingSheet.pairing(for: ctx.params, services: ctx.app.services)
+            return AnyView(BridgePairingSheet(pairing: pairing, onDone: {
+                if let nonce { runtime?.releasePairing(nonce) }
+                ctx.dismiss()
+            }))
         }
         d.providesHeader = true
         return d
+    }
+
+    /// The pairing a `panel.open` names: only the nonce a pairing link (the person's) stored in `SystemRuntime`, never
+    /// an address or token in the params themselves; nil (the "incomplete" state) for anything else. The entry stays
+    /// until Close or `SystemRuntime.pairingLifetime`, so the chrome may build the view more than once.
+    @MainActor
+    static func pairing(for params: JSONValue, services: NibServices) -> BridgePairing? {
+        guard let nonce = pairingNonce(params) else { return nil }
+        return SystemRuntime.shared(services)?.pairing(nonce)
+    }
+
+    /// `pairing` from `PanelContext.params` (flat, or under `params`).
+    static func pairingNonce(_ params: JSONValue) -> String? {
+        guard let nonce = (params["pairing"] ?? params["params"]?["pairing"])?.stringValue, !nonce.isEmpty else { return nil }
+        return nonce
     }
 
     /// Straight on the window, for when no panel host (document chrome, library) is installed.
@@ -669,9 +768,23 @@ struct BridgePairingSheet: View {
                         .hoverEffect(.highlight)
                         .accessibilityLabel(revealed ? String(localized: "Hide token") : String(localized: "Show token"))
                 }
+                .accessibilityValue(revealed ? pairing.token : String(localized: "Hidden"))
                 .privacySensitive()
             } footer: {
-                footer(String(localized: "This link describes the bridge on another device. Opening it never turns on the bridge here."))
+                VStack(alignment: .leading, spacing: NibSpacing.s) {
+                    if !pairing.isPrivateNetwork {
+                        Label {
+                            Text(String(localized: "This address isn't on your local network or Tailscale. Only pair with a bridge you set up."))
+                                .foregroundStyle(NibColor.label)
+                        } icon: {
+                            Image(nib: .warningTriangle)
+                                .foregroundStyle(NibColor.warning)
+                                .accessibilityHidden(true)
+                        }
+                        .font(NibFont.footnote)
+                    }
+                    footer(String(localized: "This link describes the bridge on another device. Opening it never turns on the bridge here."))
+                }
             }
             Section {
                 NibCodeBlock(pairing.claudeCommand(masked: !revealed)) { copy(pairing.claudeCommand(masked: false), .command) }

@@ -213,11 +213,20 @@ enum IntentActions {
         if app.services.lock?.isLocked(doc) == true {
             throw NibError(.locked, "\(title) is locked", hint: "unlock it in Nib, then run the shortcut again")
         }
+        // The intent runs in the background: a document it loads only for this is written now and unloaded after,
+        // because iOS may suspend Nib as soon as perform() returns (before the store's debounced save).
+        let wasLoaded = app.workspace.isLoaded(doc)
+        defer {
+            if !wasLoaded, !app.services.sessions.sessions.contains(where: { $0.document == doc }) {
+                app.workspace.close(doc)     // flushes too
+            }
+        }
+        let content = try app.workspace.content(doc)
+        // After the load: the store learns that a newer Nib saved the document only while reading its head.
         if app.isReadOnly(doc) {
             throw NibError(.unsupported, "\(title) was saved by a newer version of Nib and opens read-only",
                            hint: "update Nib to add to it")
         }
-        let content = try app.workspace.content(doc)
         let last = try content.livePages.last.map { try app.workspace.items(doc, page: $0.id) } ?? []
         let plan = try AppendPlanner.plan(content, lastPageItems: last)
         let group = NibID.make().raw
@@ -241,6 +250,7 @@ enum IntentActions {
             result = try await run(SystemIDs.textCreateBox, ["page": .string(NodeRef.page(doc, page).description),
                                                              "at": [.number(at.x), .number(at.y)], "text": .string(body)])
         }
+        app.workspace.persistence.flush(doc)
         return result["ref"]?.stringValue ?? docRef
     }
 }

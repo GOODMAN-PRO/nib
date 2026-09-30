@@ -299,8 +299,8 @@ struct AppendTextIntent: AppIntent {
 
 // MARK: - Siri phrases
 
-/// Symbols are string literals because the App Shortcuts metadata is extracted at build time; they match
-/// `NibSymbol.quickNote`, `.notebook`, `.folder`, `.search` and `.textDocument`.
+/// Symbols are string literals because the App Shortcuts metadata is extracted at build time; each is the literal name
+/// of a NibSymbol token: `.quickNote`, `.notebook`, `.folder` (Open and Create Folder), `.search` and `.textDocument`.
 struct NibAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(intent: CreateQuickNoteIntent(),
@@ -319,7 +319,7 @@ struct NibAppShortcuts: AppShortcutsProvider {
         AppShortcut(intent: CreateFolderIntent(),
                     phrases: ["Create a folder in \(.applicationName)",
                               "New \(.applicationName) folder"],
-                    shortTitle: "Create Folder", systemImageName: "folder.badge.plus")
+                    shortTitle: "Create Folder", systemImageName: "folder")
         AppShortcut(intent: SearchNotesIntent(),
                     phrases: ["Search \(.applicationName)",
                               "Search my notes in \(.applicationName)"],
@@ -327,6 +327,6 @@ struct NibAppShortcuts: AppShortcutsProvider {
         AppShortcut(intent: AppendTextIntent(),
                     phrases: ["Append text to a note in \(.applicationName)",
                               "Add text to a \(.applicationName) note"],
-                    shortTitle: "Append Text", systemImageName: "text.append")
+                    shortTitle: "Append Text", systemImageName: "doc.text")
     }
 }

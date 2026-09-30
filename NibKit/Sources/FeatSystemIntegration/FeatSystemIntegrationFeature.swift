@@ -78,9 +78,17 @@ public enum FeatSystemIntegrationFeature: NibFeature {
 final class SystemRuntime {
     static let serviceKey = "system.runtime"
 
+    /// How long a pairing the person opened stays available to its sheet when nobody taps Close.
+    static let pairingLifetime: TimeInterval = 600
+
     let quickActions: QuickActionPublisher
     /// Asks the person before a link installs a plugin (tests swap it).
     var confirmer: LinkConfirming = AlertLinkConfirmer()
+    /// The clock for pairing expiry (tests move it).
+    var now: () -> Date = { Date() }
+    /// Pairing links the person opened, by a fresh nonce: `panel.open` carries only the nonce, so the pairing sheet
+    /// shows nothing another caller of `panel.open` made up (see `DeepLinkRouter.showPairing`).
+    private var pairings: [String: (pairing: BridgePairing, expires: Date)] = [:]
 
     init(app: NibApp) {
         quickActions = QuickActionPublisher(app: app)
@@ -88,6 +96,30 @@ final class SystemRuntime {
 
     static func shared(_ services: NibServices) -> SystemRuntime? {
         services.get(serviceKey, as: SystemRuntime.self)
+    }
+
+    /// Keeps `pairing` for its sheet; returns the nonce `panel.open` names it by.
+    func holdPairing(_ pairing: BridgePairing) -> String {
+        let t = now()
+        pairings = pairings.filter { $0.value.expires > t }
+        let nonce = NibID.make().raw
+        pairings[nonce] = (pairing, t.addingTimeInterval(SystemRuntime.pairingLifetime))
+        return nonce
+    }
+
+    /// The pairing held under `nonce` (not consumed: the chrome may build the sheet again); nil when unknown or expired.
+    func pairing(_ nonce: String) -> BridgePairing? {
+        guard let entry = pairings[nonce] else { return nil }
+        guard entry.expires > now() else {
+            pairings[nonce] = nil
+            return nil
+        }
+        return entry.pairing
+    }
+
+    /// The sheet closed (or never showed): forget the pairing.
+    func releasePairing(_ nonce: String) {
+        pairings[nonce] = nil
     }
 }
 

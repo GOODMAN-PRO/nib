@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import UIKit
 import NibContracts
 import NibTesting
@@ -134,6 +135,23 @@ final class FeatSystemIntegrationTests: XCTestCase {
         XCTAssertEqual(applied.last?.map { $0.type }, ["app.nib.open.FIXTUREDOC04"])
     }
 
+    /// Saving a favourite moves only `modified`: favourites.json is not rewritten and widgets are not reloaded for that.
+    func testFavouritesListingIgnoresModifiedTimes() {
+        let a = FavouritesFile.Entry(id: "DOCA", title: "Kinematics", kind: "notebook", folder: "Physics", modified: 1,
+                                     url: "nib://open/DOCA")
+        let b = FavouritesFile.Entry(id: "DOCB", title: "Board", kind: "whiteboard", folder: nil, modified: 2,
+                                     url: "nib://open/DOCB")
+        var saved = a
+        saved.modified = 99
+        XCTAssertTrue(FavouritesFile.sameListing([a, b], [saved, b]))
+        XCTAssertFalse(FavouritesFile.sameListing(nil, [a, b]))
+        XCTAssertFalse(FavouritesFile.sameListing([a, b], [b, a]))          // the order changed
+        XCTAssertFalse(FavouritesFile.sameListing([a, b], [a]))             // one fewer
+        var renamed = a
+        renamed.title = "Dynamics"
+        XCTAssertFalse(FavouritesFile.sameListing([a, b], [renamed, b]))
+    }
+
     // MARK: Append Text to Note
 
     func testAppendPlanner() throws {
@@ -229,6 +247,82 @@ final class FeatSystemIntegrationTests: XCTestCase {
         XCTAssertTrue(stubs.calls.isEmpty)
     }
 
+    /// The store learns that a newer Nib saved a document only while loading its head: the check must come after the
+    /// load, or Siri reports "Added" for text that is never saved.
+    func testAppendTextRefusesADocumentThatTurnsOutReadOnlyWhenLoaded() async throws {
+        let h = Harness(features: [FeatSystemIntegrationFeature.self])
+        let stubs = CommandStubs()
+        stubs.stub(h.app, CommandIDs.textCreateBox, effect: .edit)
+        stubs.stub(h.app, CommandIDs.blockInsert, effect: .edit)
+        stubs.stub(h.app, CommandIDs.pageAdd, effect: .edit)
+        let store = NewerFormatPersistence(base: h.persistence, newer: [Fixtures.textDocID, Fixtures.whiteboardID])
+        h.app.workspace.persistence = store
+        for doc in [Fixtures.textDocID, Fixtures.whiteboardID] {
+            XCTAssertFalse(h.app.workspace.isLoaded(doc))
+            XCTAssertFalse(h.app.isReadOnly(doc))        // unknown until the head is read
+            do {
+                _ = try await FeatSystemIntegrationFeature.appendText("x", to: doc, app: h.app)
+                XCTFail("expected unsupported for \(doc)")
+            } catch {
+                XCTAssertEqual(NibError.wrap(error).code, .unsupported, "\(doc): \(error)")
+            }
+            // Loaded only for the intent: unloaded again.
+            XCTAssertFalse(h.app.workspace.isLoaded(doc))
+        }
+        XCTAssertTrue(stubs.calls.isEmpty)
+    }
+
+    /// A background intent writes what it added before perform() returns, and unloads a document it loaded only for this.
+    func testAppendTextFlushesAndUnloadsADocumentItLoaded() async throws {
+        let h = Harness(features: [FeatSystemIntegrationFeature.self])
+        let stubs = CommandStubs()
+        stubs.stub(h.app, CommandIDs.blockInsert, effect: .edit, result: ["ref": "block:FIXTUREDOC02/NEWBLOCK0001"])
+        stubs.stub(h.app, CommandIDs.textCreateBox, effect: .edit, result: ["ref": "item:FIXTUREDOC04/FIXTUREBRD01/NEWTEXT00001"])
+        let store = NewerFormatPersistence(base: h.persistence, newer: [])
+        h.app.workspace.persistence = store
+
+        XCTAssertFalse(h.app.workspace.isLoaded(Fixtures.textDocID))
+        _ = try await FeatSystemIntegrationFeature.appendText("Summary", to: Fixtures.textDocID, app: h.app)
+        XCTAssertTrue(store.flushed.contains(Fixtures.textDocID))
+        XCTAssertFalse(h.app.workspace.isLoaded(Fixtures.textDocID))
+
+        // Already open (in memory): flushed, and left loaded.
+        _ = try h.app.workspace.content(Fixtures.whiteboardID)
+        store.flushed.removeAll()
+        _ = try await FeatSystemIntegrationFeature.appendText("Idea", to: Fixtures.whiteboardID, app: h.app)
+        XCTAssertEqual(store.flushed.first, Fixtures.whiteboardID)
+        XCTAssertTrue(h.app.workspace.isLoaded(Fixtures.whiteboardID))
+        XCTAssertEqual(stubs.ids, [CommandIDs.blockInsert, CommandIDs.textCreateBox])
+    }
+
+    // MARK: Pairing sheet
+
+    /// DESIGN.md §15.7: Light, Dark and AX3 renders of the new screen, complete and incomplete, and it still lays out
+    /// at AX3 on a phone.
+    func testPairingSheetRendersInEveryVariantAndFitsAtAX3() throws {
+        let complete = BridgePairingSheet(pairing: try BridgePairing(host: "100.101.102.103", port: nil, token: "nib_4qVx9SECRET"),
+                                          onDone: {})
+        let outside = BridgePairingSheet(pairing: try BridgePairing(host: "attacker.example", port: nil, token: "nib_x"),
+                                         onDone: {})
+        let incomplete = BridgePairingSheet(pairing: nil, onDone: {})
+        let size = CGSize(width: 375, height: 812)
+        for (name, images) in [("complete", NibSnapshot.images(complete, size: size, scale: 1)),
+                               ("outside", NibSnapshot.images(outside, size: size, scale: 1)),
+                               ("incomplete", NibSnapshot.images(incomplete, size: size, scale: 1))] {
+            XCTAssertEqual(Set(images.keys), Set(NibSnapshot.Variant.allCases), name)
+            for (variant, image) in images {
+                XCTAssertGreaterThan(image.size.width * image.size.height, 0, "\(name) \(variant.rawValue)")
+            }
+        }
+        for (name, fitting) in [("complete", NibSnapshot.fittingSize(complete, width: 375, variant: .largeText)),
+                                ("incomplete", NibSnapshot.fittingSize(incomplete, width: 375, variant: .largeText))] {
+            XCTAssertTrue(fitting.width.isFinite && fitting.height.isFinite, "\(name): \(fitting)")
+            XCTAssertLessThan(fitting.height, CGFloat.greatestFiniteMagnitude / 2, name)
+            XCTAssertGreaterThan(fitting.width, 0, name)
+            XCTAssertGreaterThan(fitting.height, 0, name)
+        }
+    }
+
     // MARK: Library lists for Siri and Shortcuts
 
     func testLibrarySearchRanking() {
@@ -291,4 +385,40 @@ final class FeatSystemIntegrationTests: XCTestCase {
         publisher.writer.flush()
         for _ in 0..<20 { await Task.yield() }
     }
+}
+
+/// A store that, like NibStore, learns a document was saved by a newer Nib only while reading its head (`newer`), and
+/// records flushes.
+@MainActor
+final class NewerFormatPersistence: DocumentPersistence {
+    let base: InMemoryPersistence
+    let newer: Set<DocumentID>
+    private var readOnly: Set<DocumentID> = []
+    var flushed: [DocumentID] = []
+
+    init(base: InMemoryPersistence, newer: Set<DocumentID>) {
+        self.base = base
+        self.newer = newer
+    }
+
+    func loadHead(_ doc: DocumentID) throws -> DocumentContent {
+        let head = try base.loadHead(doc)
+        if newer.contains(doc) { readOnly.insert(doc) }
+        return head
+    }
+
+    func loadItems(_ doc: DocumentID, page: PageID) throws -> [Item] { try base.loadItems(doc, page: page) }
+
+    func didChange(_ doc: DocumentID, head: DocumentContent?, pages: [PageID: [Item]]) {
+        guard !readOnly.contains(doc) else { return }
+        base.didChange(doc, head: head, pages: pages)
+    }
+
+    func flush(_ doc: DocumentID) { flushed.append(doc) }
+
+    func fileURL(_ doc: DocumentID, relativePath: String) throws -> URL { try base.fileURL(doc, relativePath: relativePath) }
+
+    func remoteChanges(_ doc: DocumentID) throws -> DocumentPatch? { nil }
+
+    func isReadOnly(_ doc: DocumentID) -> Bool { readOnly.contains(doc) }
 }

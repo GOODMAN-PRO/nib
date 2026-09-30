@@ -200,10 +200,31 @@ final class DeepLinkRouterTests: XCTestCase {
         XCTAssertEqual(json["mcpServers"]?["nib"]?["url"], "http://100.101.102.103:7331/mcp")
         XCTAssertEqual(json["mcpServers"]?["nib"]?["headers"]?["Authorization"], "Bearer nib_4qVx9SECRET")
         XCTAssertFalse(p.jsonConfig(masked: true).contains("SECRET"))
-        // The sheet reads its panel params flat or nested (PanelContext.params), with or without a port.
-        XCTAssertEqual(BridgePairing(params: ["host": "10.0.0.2", "port": 9000, "token": "t0k"])?.port, 9000)
-        XCTAssertEqual(BridgePairing(params: ["params": ["host": "10.0.0.2", "token": "t0k"]])?.port, 7331)
-        XCTAssertNil(BridgePairing(params: ["host": "10.0.0.2"]))
+    }
+
+    func testPairingHostMustBeAHostOrAnIPv6Literal() throws {
+        // A ':' is only allowed in an IPv6 literal: "evil.com:80" would otherwise become http://[evil.com:80]:7331.
+        assertInvalid("nib://bridge/pair?host=evil.com%3A80&token=t")
+        assertInvalid("nib://bridge/pair?host=%5Bevil.com%3A80%5D&token=t")
+        assertInvalid("nib://bridge/pair?host=10.0.0.2%3A8080&token=t")
+        assertInvalid("nib://bridge/pair?host=a%5Bb&token=t")
+        assertInvalid("nib://bridge/pair?host=fe80%3A%3A1%25en0&token=t")
+        XCTAssertEqual(try BridgePairing(host: "[fd7a:115c:a1e0::1]", port: nil, token: "t").mcpURL,
+                       "http://[fd7a:115c:a1e0::1]:7331/mcp")
+        XCTAssertEqual(try BridgePairing(host: "my-ipad", port: "8080", token: "t").mcpURL, "http://my-ipad:8080/mcp")
+    }
+
+    func testPairingHostPrivateNetworkCheck() throws {
+        func isPrivate(_ host: String) throws -> Bool { try BridgePairing(host: host, port: nil, token: "t").isPrivateNetwork }
+        for host in ["10.1.2.3", "172.16.0.9", "172.31.255.1", "192.168.1.20", "100.101.102.103", "100.64.0.1",
+                     "169.254.3.4", "127.0.0.1", "fd7a:115c:a1e0::1", "fe80::1", "::1", "::ffff:192.168.0.2",
+                     "ipad.tail1234.ts.net", "IPAD.TAIL1234.TS.NET.", "studio.local", "my-ipad"] {
+            XCTAssertTrue(try isPrivate(host), host)
+        }
+        for host in ["8.8.8.8", "172.32.0.1", "100.128.0.1", "192.169.0.1", "attacker.example", "2001:db8::1",
+                     "::ffff:8.8.8.8", "ts.net.evil.com"] {
+            XCTAssertFalse(try isPrivate(host), host)
+        }
     }
 
     // MARK: Routing
@@ -242,6 +263,30 @@ final class DeepLinkRouterTests: XCTestCase {
         XCTAssertEqual(navigator.opened.count, 1)
         XCTAssertEqual(navigator.opened.first?.0, Fixtures.whiteboardID)
         XCTAssertEqual(navigator.opened.first?.1, Fixtures.boardID)
+    }
+
+    /// A link can outlive its page: it lands in the document instead, without the comment thread.
+    func testLinkToADeletedPageOpensTheDocument() async throws {
+        let h = Harness(features: [FeatSystemIntegrationFeature.self])
+        var head = try XCTUnwrap(h.persistence.heads[Fixtures.docID])
+        let index = try XCTUnwrap(head.pages.firstIndex { $0.id == Fixtures.page2 })
+        head.pages[index].deleted = true
+        h.persistence.heads[Fixtures.docID] = head
+        XCTAssertFalse(h.app.workspace.isLoaded(Fixtures.docID))
+        let stubs = CommandStubs()
+        stubs.stub(h.app, CommandIDs.docOpen)
+        stubs.stub(h.app, CommandIDs.commentTapAt, result: ["handled": true])
+
+        var r = try await h.run(CommandIDs.appOpenURL, ["url": "nib://open/FIXTUREDOC01/FIXTUREPG002?comment=FIXTURECMT01"])
+        XCTAssertEqual(r["route"], "open")
+        XCTAssertEqual(r["ref"], "doc:FIXTUREDOC01")
+        r = try await h.run(CommandIDs.appOpenURL, ["url": "nib://open/FIXTUREDOC01/NOSUCHPAGE01"])
+        XCTAssertEqual(r["ref"], "doc:FIXTUREDOC01")
+        XCTAssertEqual(stubs.ids, [CommandIDs.docOpen, CommandIDs.docOpen])
+        XCTAssertEqual(stubs.params(CommandIDs.docOpen), [["doc": "doc:FIXTUREDOC01"], ["doc": "doc:FIXTUREDOC01"]])
+        // A page that is still there is opened as linked.
+        _ = try await h.run(CommandIDs.appOpenURL, ["url": "nib://open/FIXTUREDOC01/FIXTUREPG001"])
+        XCTAssertEqual(stubs.params(CommandIDs.docOpen).last, ["doc": "doc:FIXTUREDOC01", "page": "page:FIXTUREDOC01/FIXTUREPG001"])
     }
 
     func testLinksToMissingOrTrashedDocumentsAreNotFound() async throws {
@@ -332,9 +377,22 @@ final class DeepLinkRouterTests: XCTestCase {
         _ = try await h.run(CommandIDs.appOpenURL, ["url": "nib://bridge/pair?host=10.0.0.2&token=nib_tok"])
         _ = try await h.run(CommandIDs.appOpenURL, ["url": "nib://bridge/pair?token=nib_tok&port=8080&host=10.0.0.2"])
 
-        XCTAssertEqual(stubs.params(CommandIDs.panelOpen),
-                       [["id": .string(SystemIDs.pairingPanel), "host": "10.0.0.2", "port": 7331, "token": "nib_tok"],
-                        ["id": .string(SystemIDs.pairingPanel), "host": "10.0.0.2", "port": 8080, "token": "nib_tok"]])
+        // panel.open carries only a nonce: never the address or the token.
+        let opened = stubs.params(CommandIDs.panelOpen)
+        XCTAssertEqual(opened.count, 2)
+        for params in opened {
+            XCTAssertEqual(params["id"], .string(SystemIDs.pairingPanel))
+            XCTAssertEqual(params.objectValue.map { Set($0.keys) }, ["id", "pairing"])
+            XCTAssertFalse("\(params)".contains("nib_tok"))
+        }
+        // The nonces the person's links wrote resolve to their pairings, flat or nested, as often as the chrome asks.
+        let first = try XCTUnwrap(BridgePairingSheet.pairing(for: ["pairing": opened[0]["pairing"] ?? .null],
+                                                             services: h.app.services))
+        XCTAssertEqual(first, try BridgePairing(host: "10.0.0.2", port: nil, token: "nib_tok"))
+        XCTAssertEqual(BridgePairingSheet.pairing(for: ["params": ["pairing": opened[0]["pairing"] ?? .null]],
+                                                  services: h.app.services), first)
+        XCTAssertEqual(BridgePairingSheet.pairing(for: ["pairing": opened[1]["pairing"] ?? .null],
+                                                  services: h.app.services)?.port, 8080)
         XCTAssertTrue(stubs.params("bridge.setEnabled").isEmpty)
         XCTAssertEqual(h.app.settings.json(BridgeNames.enabledSetting), enabledBefore)
         // Only the person opens a pairing sheet.
@@ -346,6 +404,45 @@ final class DeepLinkRouterTests: XCTestCase {
         let panel = try XCTUnwrap(h.app.ui.panels.get(SystemIDs.pairingPanel))
         XCTAssertEqual(panel.placement, .sheet)
         XCTAssertEqual(panel.owner, FeatSystemIntegrationFeature.id)
+    }
+
+    /// Another caller of panel.open (the AI, the bridge, a plugin) cannot make the pairing sheet show its own address.
+    func testPanelOpenWithRawHostAndTokenShowsNoPairing() async throws {
+        let h = Harness(features: [FeatSystemIntegrationFeature.self])
+        let stubs = CommandStubs()
+        stubs.stub(h.app, CommandIDs.panelOpen, result: ["id": .string(SystemIDs.pairingPanel), "placement": "sheet"])
+        _ = try await h.run(CommandIDs.panelOpen, ["id": .string(SystemIDs.pairingPanel), "host": "attacker.example",
+                                                   "port": 7331, "token": "x"], as: .ai("chat"))
+        _ = try await h.run(CommandIDs.panelOpen, ["id": .string(SystemIDs.pairingPanel),
+                                                   "params": ["host": "attacker.example", "token": "x"]], as: .bridge("pc"))
+        _ = try await h.run(CommandIDs.panelOpen, ["id": .string(SystemIDs.pairingPanel), "pairing": "GUESSEDNONCE1"],
+                            as: .ai("chat"))
+        XCTAssertEqual(stubs.params(CommandIDs.panelOpen).count, 3)
+        for params in stubs.params(CommandIDs.panelOpen) {
+            XCTAssertNil(BridgePairingSheet.pairing(for: params, services: h.app.services), "\(params)")
+        }
+    }
+
+    func testHeldPairingsExpireAndRelease() throws {
+        let h = Harness(features: [FeatSystemIntegrationFeature.self])
+        let runtime = try XCTUnwrap(SystemRuntime.shared(h.app.services))
+        var clock = Date(timeIntervalSince1970: 1_800_000_000)
+        runtime.now = { clock }
+        let pairing = try BridgePairing(host: "10.0.0.2", port: nil, token: "nib_tok")
+        let kept = runtime.holdPairing(pairing)
+        let closed = runtime.holdPairing(pairing)
+        XCTAssertNotEqual(kept, closed)
+        // Not consumed by a read.
+        XCTAssertEqual(runtime.pairing(kept), pairing)
+        XCTAssertEqual(runtime.pairing(kept), pairing)
+        // Close forgets it.
+        runtime.releasePairing(closed)
+        XCTAssertNil(runtime.pairing(closed))
+        // Ten minutes later nothing is left.
+        clock = clock.addingTimeInterval(SystemRuntime.pairingLifetime - 1)
+        XCTAssertEqual(runtime.pairing(kept), pairing)
+        clock = clock.addingTimeInterval(2)
+        XCTAssertNil(runtime.pairing(kept))
     }
 
     func testPasteboardHandOffIsTheUsersOnly() async throws {

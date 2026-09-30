@@ -107,6 +107,18 @@ enum FavouritesFile {
         var folder: String?
         var modified: Double
         var url: String
+
+        /// What a widget shows of the entry: everything but `modified`, which changes on every save.
+        func sameListing(as other: Entry) -> Bool {
+            id == other.id && title == other.title && kind == other.kind && folder == other.folder && url == other.url
+        }
+    }
+
+    /// True when `new` lists the same favourites as `old` in the same order with the same titles, kinds, folders and
+    /// links: saving a favourite (only `modified` moves) is then not worth a write and a widget reload.
+    static func sameListing(_ old: [Entry]?, _ new: [Entry]) -> Bool {
+        guard let old, old.count == new.count else { return false }
+        return zip(old, new).allSatisfy { $0.sameListing(as: $1) }
     }
 
     struct Snapshot: Codable, Equatable {
@@ -245,7 +257,7 @@ final class QuickActionPublisher {
         guard let container = containerURL() else { return }
         let newEntries = FavouritesFile.entries(QuickActions.favourites(nodes, limit: FavouritesFile.limit),
                                                 folderTitle: folderTitle)
-        guard newEntries != entries else { return }
+        guard !FavouritesFile.sameListing(entries, newEntries) else { return }
         let snapshot = FavouritesFile.Snapshot(version: FavouritesFile.version, updated: Date().timeIntervalSince1970,
                                                favourites: newEntries)
         guard let data = try? FavouritesFile.encode(snapshot) else { return }
