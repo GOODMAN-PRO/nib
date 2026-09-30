@@ -22,10 +22,13 @@ public struct CanvasSample {
     public var isPencil: Bool
     public var isPredicted: Bool
     public var modifiers: KeyModifiers
+    /// contracts-v2: stable id of the touch this sample belongs to (multi-finger gestures: two-finger ruler rotation,
+    /// two-finger duplicate). 0 when unknown.
+    public var touchID: Int
 
     public init(page: PageID, location: Point, force: Double = 0.5, azimuth: Double = 0, altitude: Double = .pi / 2,
                 roll: Double = 0, timestamp: TimeInterval = 0, isPencil: Bool = true, isPredicted: Bool = false,
-                modifiers: KeyModifiers = []) {
+                modifiers: KeyModifiers = [], touchID: Int = 0) {
         self.page = page
         self.location = location
         self.force = force
@@ -36,6 +39,7 @@ public struct CanvasSample {
         self.isPencil = isPencil
         self.isPredicted = isPredicted
         self.modifiers = modifiers
+        self.touchID = touchID
     }
 }
 
@@ -48,7 +52,9 @@ public protocol CanvasHost: AnyObject {
     /// Current zoom (view points per page point).
     var zoomScale: Double { get }
     /// The scrolling canvas view (for presenting menus, loupes, pencil palettes). Named `canvasView` so a
-    /// UIViewController (whose `view` is `UIView!`) can conform.
+    /// UIViewController (whose `view` is `UIView!`) can conform. It is the scroll view itself: `viewPoint`, `pagePoint`
+    /// and `pageFrame` use its bounds coordinates, which move with scrolling and zoom; subviews added to it scroll with
+    /// the pages. Things that must stay put on screen go in `fixedOverlayView` (or are chrome overlays).
     var canvasView: UIView { get }
     /// Transient drawing layer of the ACTIVE TOOL in `canvasView` coordinates (previews, lasso path). Cleared by tools.
     /// Anything persistent (selection handles, underlines, presence cursors, minimap…) is a `CanvasAttachment`.
@@ -63,10 +69,66 @@ public protocol CanvasHost: AnyObject {
     func invalidate(page: PageID, rect: Rect?)
     /// Commits a finished stroke through `ink.addStrokes` (applies stroke processors first).
     func commitStroke(_ stroke: Stroke, page: PageID)
-    /// Cancels the in-progress PencilKit stroke (Draw-and-Hold takes over).
+    /// Cancels the in-progress PencilKit stroke (Draw-and-Hold takes over). Idempotent: after `strokeHeld` returns true
+    /// the canvas has already cancelled it, and a second call is harmless. Called from `strokeFinished`, it discards
+    /// the finished wet stroke (the tool commits something else instead, e.g. a recognised shape).
     func cancelWetStroke()
     /// Keeps a live view (animated GIF, video, plugin view) positioned over an item's frame; nil removes it.
     func attachLiveView(_ view: UIView?, item: ElementID, page: PageID)
+
+    // contracts-v2 (all have default implementations below; the canvas F006/F101 overrides them)
+
+    /// Runs `body` once the dry tiles of `page` have been redrawn after the latest commit, so a tool can drop its
+    /// preview without a flicker. Default: after 150 ms.
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void)
+    /// Page → `canvasView` affine (zoom, page layout and page rotation included); nil when the page is not laid out.
+    func pageTransform(_ page: PageID) -> CGAffineTransform?
+    /// A point on `source` expressed in the coordinates of `target` (a gesture that crosses pages); nil when either
+    /// page is not laid out.
+    func convert(_ point: Point, from source: PageID, to target: PageID) -> Point?
+    /// A view above the canvas that does NOT scroll or zoom (HUD-like attachments, panes). Default: the canvas view's
+    /// superview.
+    var fixedOverlayView: UIView { get }
+    /// A tool finished one use: returns to the previous (or temporary-return) tool when appropriate, see
+    /// `EditorSession.finishToolUse(sticky:)`.
+    func finishToolUse(_ tool: CanvasTool)
+    /// `commitStroke` with its outcome: the created item's id, or the error `ink.addStrokes` threw (a stroke dropped by
+    /// a processor succeeds with nil). Default: commits and reports success with nil.
+    func commitStroke(_ stroke: Stroke, page: PageID, completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void)
+}
+
+@MainActor
+public extension CanvasHost {
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            body()
+        }
+    }
+
+    func pageTransform(_ page: PageID) -> CGAffineTransform? {
+        guard pageFrame(page) != nil else { return nil }
+        let o = viewPoint(.zero, page: page)
+        let x = viewPoint(Point(100, 0), page: page)
+        let y = viewPoint(Point(0, 100), page: page)
+        return CGAffineTransform(a: (x.x - o.x) / 100, b: (x.y - o.y) / 100, c: (y.x - o.x) / 100, d: (y.y - o.y) / 100,
+                                 tx: o.x, ty: o.y)
+    }
+
+    func convert(_ point: Point, from source: PageID, to target: PageID) -> Point? {
+        if source == target { return point }
+        guard pageFrame(source) != nil, let t = pageTransform(target) else { return nil }
+        return Point(viewPoint(point, page: source).applying(t.inverted()))
+    }
+
+    var fixedOverlayView: UIView { canvasView.superview ?? canvasView }
+
+    func finishToolUse(_ tool: CanvasTool) { session.finishToolUse(sticky: tool.isSticky) }
+
+    func commitStroke(_ stroke: Stroke, page: PageID, completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void) {
+        commitStroke(stroke, page: page)
+        completion(.success(nil))
+    }
 }
 
 /// A canvas tool. Registered via `UIRegistries.canvasTools`; activated by `tool.select`.
@@ -125,12 +187,23 @@ public protocol CanvasAttachment: AnyObject {
     /// Scroll, zoom, page layout, selection or a commit changed: reposition what you draw.
     func canvasDidChange(_ host: CanvasHost)
     /// True = this attachment takes the touch that starts at `viewPoint` (asked before tap handlers and the active
-    /// tool, in registry order); the touch's samples then go to the touch methods below.
+    /// tool, in registry order); the touch's samples then go to the touch methods below. A claimed touch never pans,
+    /// zooms or inks the canvas.
     func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost)
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost)
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost)
     func touchesCancelled(host: CanvasHost)
+
+    // contracts-v2 (default implementations below)
+
+    /// `hitTest` with the input kind: the canvas calls this one. Default: `hitTest(viewPoint, host:)` for both.
+    func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool
+    /// Pointer or Pencil hover over the canvas (nil = hover ended). Default: nothing.
+    func hover(_ sample: CanvasSample?, host: CanvasHost)
+    /// A claimed touch turned out to be a tap, double-tap or long-press: return true to consume it, false to pass it on
+    /// to `content.tapHandlers` and then the active tool (e.g. double-tap text inside a selected shape). Default: false.
+    func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool
 }
 
 @MainActor
@@ -142,6 +215,9 @@ public extension CanvasAttachment {
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {}
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {}
     func touchesCancelled(host: CanvasHost) {}
+    func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool { hitTest(viewPoint, host: host) }
+    func hover(_ sample: CanvasSample?, host: CanvasHost) {}
+    func gesture(_ gesture: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool { false }
 }
 
 public struct CanvasAttachmentDescriptor: Registrable {
@@ -161,10 +237,13 @@ public struct CanvasAttachmentDescriptor: Registrable {
     }
 }
 
-/// Apple Pencil hardware events forwarded by the canvas (Pencil Hardware feature).
+/// Apple Pencil hardware events forwarded by the canvas (Pencil Hardware feature). The canvas (F006/F101) owns the one
+/// `UIPencilInteraction` and the Pencil hover recogniser per canvas and forwards through `ui.pencilHandler`; a handler
+/// that also installs its own (F043 before F101 lands) must drop duplicates.
 @MainActor
 public protocol PencilEventHandler: AnyObject {
     func pencilDoubleTap(session: EditorSession, host: CanvasHost)
+    /// `location` is in `host.canvasView` coordinates (like `CanvasHost.viewPoint`).
     func pencilSqueeze(began: Bool, location: CGPoint?, session: EditorSession, host: CanvasHost)
     func pencilHover(_ sample: CanvasSample?, session: EditorSession, host: CanvasHost)
 }
@@ -178,4 +257,11 @@ public protocol DocumentEditing: AnyObject {
     var canvasHost: CanvasHost? { get }
     func reveal(page: PageID, rect: Rect?, animated: Bool)
     func reloadAll()
+    /// contracts-v2: scrolls a text document to a block (outline, search, links). Default: `reveal(page: block, …)`.
+    func reveal(block: NibID, animated: Bool)
+}
+
+@MainActor
+public extension DocumentEditing {
+    func reveal(block: NibID, animated: Bool) { reveal(page: block, rect: nil, animated: animated) }
 }
