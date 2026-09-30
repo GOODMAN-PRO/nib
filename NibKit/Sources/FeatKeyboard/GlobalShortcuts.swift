@@ -15,41 +15,39 @@ import NibContracts
 
 /// A state of a window in which the shell offers key commands.
 enum ShortcutSituation: Hashable {
-    case library
+    /// The library; `tabs`: its tab strip shows (open documents), so `.document` keys marked `whileTabsOpen` are live.
+    case library(tabs: Bool)
     case document(DocumentKind, editingText: Bool)
+
+    /// The window state the shell routes key commands for (contracts-v2.2).
+    var context: KeyCommandContext {
+        switch self {
+        case .library(let tabs):
+            return KeyCommandContext(docKind: nil, hasTabs: tabs)
+        case .document(let kind, let editing):
+            return KeyCommandContext(docKind: kind, isEditingText: editing, hasTabs: true)
+        }
+    }
 }
 
 /// Pure rules over descriptors: equal keys, overlapping situations, single-key shortcuts.
 enum ShortcutRules {
-    static let allSituations: [ShortcutSituation] = [.library] + DocumentKind.allCases.flatMap {
-        [ShortcutSituation.document($0, editingText: false), .document($0, editingText: true)]
-    }
+    static let allSituations: [ShortcutSituation] = [.library(tabs: false), .library(tabs: true)]
+        + DocumentKind.allCases.flatMap {
+            [ShortcutSituation.document($0, editingText: false), .document($0, editingText: true)]
+        }
 
     /// The combination as UIKit matches it: single characters and key names compare without case.
     static func normalized(_ shortcut: KeyShortcut) -> KeyShortcut {
         KeyShortcut(shortcut.key.lowercased(), shortcut.modifiers)
     }
 
-    /// Where the shell offers `d` once it honours `docKinds` (contracts-v2): global everywhere (a global key limited
-    /// to some document kinds never fires in the library), library only in the library, document in every document
-    /// of its kinds, canvas in those documents while no text is being edited.
+    /// Where the shell offers `d` (`KeyCommandDescriptor.isActive(in:)`, contracts-v2.2): global everywhere (a key
+    /// limited to some document kinds never fires in the library), library only in the library, document in every
+    /// document of its kinds (and in the library while tabs are open when it is marked `whileTabsOpen`), canvas in
+    /// those documents while no text is being edited.
     static func situations(of d: KeyCommandDescriptor) -> Set<ShortcutSituation> {
-        var out = Set<ShortcutSituation>()
-        for situation in allSituations {
-            switch (d.scope, situation) {
-            case (.global, .library):
-                if d.docKinds == nil { out.insert(situation) }
-            case (.library, .library):
-                out.insert(situation)
-            case (.global, .document(let kind, _)), (.document, .document(let kind, _)):
-                if d.docKinds?.contains(kind) ?? true { out.insert(situation) }
-            case (.canvas, .document(let kind, let editing)):
-                if !editing, d.docKinds?.contains(kind) ?? true { out.insert(situation) }
-            default:
-                break
-            }
-        }
-        return out
+        Set(allSituations.filter { d.isActive(in: $0.context) })
     }
 
     /// True when both descriptors would claim the same keys in at least one situation.
@@ -298,7 +296,7 @@ enum GlobalShortcuts {
         var order = 0
 
         func key(_ name: String, _ title: String, _ shortcut: KeyShortcut, _ command: String, _ params: JSONValue = [:],
-                 scope: KeyScope, kinds: Set<DocumentKind>? = nil,
+                 scope: KeyScope, kinds: Set<DocumentKind>? = nil, whileTabsOpen: Bool = false,
                  session resolve: ((ShortcutContext) -> JSONValue)? = nil) {
             let id = prefix + name
             order += 1
@@ -307,6 +305,7 @@ enum GlobalShortcuts {
             var d = KeyCommandDescriptor(id: id, title: title, shortcut: shortcut, command: command, params: staticParams,
                                          scope: scope, order: order, owner: owner)
             d.docKinds = kinds
+            d.whileTabsOpen = whileTabsOpen
             if let resolve {
                 d.sessionParams = { [weak app] session in resolve(ShortcutContext(session: session, app: app)) }
             }
@@ -371,7 +370,7 @@ enum GlobalShortcuts {
         for n in 1...9 {
             let title = n == 9 ? String(localized: "Last Tab") : String(localized: "Tab \(n)")
             key("tab\(n)", title, KeyShortcut(String(n), .command), CommandIDs.tabSelect,
-                ["index": .number(Double(n == 9 ? -1 : n - 1))], scope: .document)
+                ["index": .number(Double(n == 9 ? -1 : n - 1))], scope: .document, whileTabsOpen: true)
         }
 
         // Object keys on the page (T-111, P-052): never while text is being edited.

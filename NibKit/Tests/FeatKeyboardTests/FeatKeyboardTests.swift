@@ -134,6 +134,10 @@ final class FeatKeyboardTests: XCTestCase {
         for n in 1...9 {
             try check("tab\(n)", String(n), .command, "tab.select", scope: .document,
                       ["index": .number(Double(n == 9 ? -1 : n - 1))])
+            let tab = try key(h, "tab\(n)")
+            XCTAssertTrue(tab.whileTabsOpen, "⌘\(n) switches tabs from the library while the strip shows")
+            XCTAssertTrue(tab.isActive(in: KeyCommandContext(docKind: nil, hasTabs: true)))
+            XCTAssertFalse(tab.isActive(in: KeyCommandContext(docKind: nil, hasTabs: false)))
         }
         try check("deselect", "escape", [], "commands.batch", scope: .canvas)
         try check("delete", "delete", [], "commands.batch", scope: .canvas)
@@ -284,6 +288,13 @@ final class FeatKeyboardTests: XCTestCase {
         XCTAssertFalse(ShortcutRules.overlap(libraryF, globalKinds), "a key limited to notebooks never fires in the library")
         XCTAssertTrue(ShortcutRules.overlap(documentF, globalKinds))
         XCTAssertEqual(ShortcutRules.situations(of: canvasA), [.document(.notebook, editingText: false)])
+        var tabKey = descriptor("g", "1", .command, scope: .document, owner: "y")
+        let libraryOne = descriptor("h", "1", .command, scope: .library, owner: "x")
+        XCTAssertFalse(ShortcutRules.overlap(tabKey, libraryOne))
+        tabKey.whileTabsOpen = true
+        XCTAssertTrue(ShortcutRules.situations(of: tabKey).contains(.library(tabs: true)))
+        XCTAssertFalse(ShortcutRules.situations(of: tabKey).contains(.library(tabs: false)))
+        XCTAssertTrue(ShortcutRules.overlap(tabKey, libraryOne), "a tab key is live in the library while tabs are open")
         XCTAssertEqual(ShortcutRules.conflicts(in: [libraryF, documentF, globalKinds]).map { "\($0.0)|\($0.1)" }, ["b|f"])
     }
 
