@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import UIKit
 import AVFoundation
 import CoreML
@@ -6,10 +7,11 @@ import Vision
 import VisionKit
 import os
 import NibContracts
+import NibDesign
 
-// scan.documents and scan.qr, plus everything they need that is not UI: where scanned pages go, OCR at capture,
-// the page's `PageRecord.scanTextExtKey` ("nib.scanText") blocks, page sizes, QR payload classification and the
-// (injectable) camera.
+// scan.documents and scan.qr, plus everything they need besides the QR reader's screen: where scanned pages go, OCR at
+// capture, the page's `PageRecord.scanTextExtKey` ("nib.scanText") blocks and how they follow a turned page, the
+// progress HUD while a scan is read, page sizes, QR payload classification and the (injectable) camera.
 
 let scanLog = Logger(subsystem: "app.nib", category: "scan")
 
@@ -62,48 +64,69 @@ struct ScanDocuments: NibCommand {
         guard !ctx.dryRun else { throw NibError.unsupported("a dry run of scan.documents (it needs the camera)") }
         let target = try ScanTarget.resolve(p, ctx: ctx)
         let store = try ctx.services.require(ctx.services.assets, "the asset store")
-        guard let sheets = try await ScanDevices.current.captureDocuments(on: ScanStage(ctx)), sheets.count > 0 else {
+        let stage = ScanStage(ctx)
+        guard let sheets = try await ScanDevices.current.captureDocuments(on: stage), sheets.count > 0 else {
             return Output(doc: nil, refs: [], created: false, textBlocks: 0, cancelled: true)
         }
-        let pages = await ScanPipeline.prepare(sheets, language: target.language, recognizer: ctx.services.recognizer)
-        guard !pages.isEmpty else { throw NibError(.internalError, "the scanned pages could not be read") }
-        let ids = target.pageIDs(count: pages.count)
+        // The camera has closed and reading the sheets takes seconds: show how far it got until the pages are in.
+        let progress = ScanProgress(host: stage.floatingHost, total: sheets.count)
+        progress.start()
+        defer { progress.finish() }
 
         let created = target.doc == nil
-        let doc: DocumentID
-        if let existing = target.doc {
-            doc = existing
-        } else {
-            doc = try ScanTarget.createNotebook(in: target.folder, language: target.language, firstPage: ids[0],
-                                                size: pages[0].pageSize, ctx: ctx)
-        }
+        var doc = target.doc
+        var ids: [PageID] = []
+        let into: DocumentID
         let inserted: [PageRecord]
         do {
-            let assets = try await ScanPipeline.store(pages, in: store, doc: doc)
+            // One sheet at a time: its JPEG is stored as soon as it is read, so only the asset ref, the size and the
+            // text of earlier sheets stay in memory. A new notebook is made with the first readable sheet.
+            let stored = try await ScanPipeline.prepare(
+                sheets, language: target.language, recognizer: ctx.services.recognizer,
+                progress: { done, _ in progress.update(done: done) },
+                keep: { page in
+                    let id = target.pageID(at: ids.count)
+                    let owner: DocumentID
+                    if let doc {
+                        owner = doc
+                    } else {
+                        owner = try ScanTarget.createNotebook(in: target.folder, language: target.language, firstPage: id,
+                                                              size: page.pageSize, ctx: ctx)
+                        doc = owner
+                    }
+                    ids.append(id)
+                    return try await ScanPipeline.store(page.jpeg, in: store, doc: owner)
+                })
+            guard let written = doc, !stored.isEmpty else {
+                throw NibError(.internalError, "the scanned pages could not be read")
+            }
+            into = written
             // A new notebook starts with these pages, so there is nothing to undo to; pages added to an existing
             // notebook are one undo step.
             inserted = try ctx.mutate(undoable: !created) { tx in
-                try ScanPipeline.insert(pages, assets: assets, ids: ids, doc: doc, placement: target.placement, tx: tx)
+                try ScanPipeline.insert(stored, ids: ids, doc: written, placement: target.placement,
+                                        standIn: created ? ids.first : nil, tx: tx)
             }
         } catch {
             // Never leave a half-made notebook behind.
-            if created {
+            if created, let doc {
                 ctx.workspace.close(doc)
                 try? ctx.services.library?.deletePermanently(doc)
             }
             throw error
         }
 
-        let docRef = NodeRef.document(doc).description
-        let refs = inserted.map { NodeRef.page(doc, $0.id).description }
+        let docRef = NodeRef.document(into).description
+        let refs = inserted.map { NodeRef.page(into, $0.id).description }
+        progress.finish()
         // Show the result. Both are optional features, so a missing one is not an error.
         if created {
             _ = try? await ctx.execute(CommandIDs.docOpen, ["doc": .string(docRef)])
         } else {
-            if let first = refs.first, ctx.activeSession?.document == doc {
+            if let first = refs.first, ctx.activeSession?.document == into {
                 _ = try? await ctx.execute(CommandIDs.viewGoToPage, ["page": .string(first)])
             }
-            ScanFeedback.added(inserted.count, doc: doc, ctx: ctx)
+            ScanFeedback.added(inserted.count, doc: into, ctx: ctx)
         }
         return Output(doc: docRef, refs: refs, created: created,
                       textBlocks: inserted.reduce(0) { $0 + ScanText.blocks(of: $1).count }, cancelled: false)
@@ -121,9 +144,9 @@ struct ScanTarget {
     /// OCR language: the notebook's, or the default for new documents.
     var language: String
 
-    /// One id per scanned page: the caller's, then fresh ones.
-    func pageIDs(count: Int) -> [PageID] {
-        (0..<count).map { $0 < ids.count ? ids[$0] : NibID.make() }
+    /// The id of the `index`th page kept from the scan: the caller's, then fresh ones.
+    func pageID(at index: Int) -> PageID {
+        index < ids.count ? ids[index] : NibID.make()
     }
 
     @MainActor
@@ -285,9 +308,20 @@ protocol ScanSheets: AnyObject {
     func image(at index: Int) -> UIImage?
 }
 
-/// One scanned sheet, ready to become a page.
+/// One scanned sheet, read and recognised, before its image is stored.
 struct ScannedPage {
     var jpeg: Data
+    var pixelWidth: Double
+    var pixelHeight: Double
+    /// Recognised lines, bbox in image pixels (top-left origin).
+    var blocks: [TextRecognition]
+
+    var pageSize: PageSize { ScanLayout.pageSize(pixelWidth: pixelWidth, pixelHeight: pixelHeight) }
+}
+
+/// One scanned sheet once its image is in the asset store: all a page needs, without the image bytes.
+struct StoredSheet {
+    var asset: AssetRef
     var pixelWidth: Double
     var pixelHeight: Double
     /// Recognised lines, bbox in image pixels (top-left origin).
@@ -299,22 +333,34 @@ struct ScannedPage {
 enum ScanPipeline {
     static let jpegQuality: CGFloat = 0.85
 
-    /// Sheet by sheet, off the main actor: an upright JPEG and OCR through the app's recognizer when one is installed,
-    /// else Vision directly. A sheet whose OCR fails keeps its image; a sheet that cannot be read is left out.
+    /// Sheet by sheet: an upright JPEG and OCR (off the main actor, through the app's recognizer when one is
+    /// installed, else Vision directly), then `keep` stores the JPEG and returns its asset, so a long scan never holds
+    /// more than one full-size sheet. A sheet whose OCR fails keeps its image; a sheet that cannot be read is left
+    /// out. `progress(done, total)` runs on the main actor after every sheet, read or not.
     @MainActor
-    static func prepare(_ sheets: ScanSheets, language: String, recognizer: TextRecognizer?) async -> [ScannedPage] {
-        var pages: [ScannedPage] = []
-        for index in 0..<sheets.count {
-            guard let image = sheets.image(at: index) else {
+    static func prepare(_ sheets: ScanSheets, language: String, recognizer: TextRecognizer?,
+                        progress: (_ done: Int, _ total: Int) -> Void,
+                        keep: (ScannedPage) async throws -> AssetRef) async throws -> [StoredSheet] {
+        let total = sheets.count
+        var stored: [StoredSheet] = []
+        for index in 0..<total {
+            if let image = sheets.image(at: index) {
+                let page = await Task.detached(priority: .userInitiated) { () async -> ScannedPage? in
+                    await ScanPipeline.process(image, language: language, recognizer: recognizer)
+                }.value
+                if let page {
+                    let asset = try await keep(page)
+                    stored.append(StoredSheet(asset: asset, pixelWidth: page.pixelWidth, pixelHeight: page.pixelHeight,
+                                              blocks: page.blocks))
+                } else {
+                    scanLog.error("scanned sheet \(index, privacy: .public) could not be encoded")
+                }
+            } else {
                 scanLog.error("scanned sheet \(index, privacy: .public) could not be read")
-                continue
             }
-            let page = await Task.detached(priority: .userInitiated) { () async -> ScannedPage? in
-                await ScanPipeline.process(image, language: language, recognizer: recognizer)
-            }.value
-            if let page { pages.append(page) }
+            progress(index + 1, total)
         }
-        return pages
+        return stored
     }
 
     static func process(_ image: UIImage, language: String, recognizer: TextRecognizer?) async -> ScannedPage? {
@@ -344,34 +390,42 @@ enum ScanPipeline {
         }
     }
 
-    /// Off the main actor (the asset store is thread-safe): one immutable, deduplicated asset per sheet.
-    static func store(_ pages: [ScannedPage], in store: AssetStore, doc: DocumentID) async throws -> [AssetRef] {
+    /// Off the main actor (the asset store is thread-safe): one immutable, deduplicated asset.
+    static func store(_ jpeg: Data, in store: AssetStore, doc: DocumentID) async throws -> AssetRef {
         try await Task.detached(priority: .userInitiated) {
-            try pages.map { try store.put($0.jpeg, ext: "jpg", doc: doc) }
+            try store.put(jpeg, ext: "jpg", doc: doc)
         }.value
     }
 
-    /// Inside `mutate`: one page per sheet, in scan order, at the placement, written in one batch.
+    /// Inside `mutate`: one page per sheet, in scan order, at the placement, written in one batch. Only `standIn`, a
+    /// new notebook's blank first page, is replaced; a page that took one of `ids` while the camera was open (an AI
+    /// batch, a plugin, sync) is never overwritten: the scan fails and the transaction rolls back.
     @MainActor
-    static func insert(_ pages: [ScannedPage], assets: [AssetRef], ids: [PageID], doc: DocumentID,
-                       placement: ScanPlacement, tx: DocTransaction) throws -> [PageRecord] {
+    static func insert(_ sheets: [StoredSheet], ids: [PageID], doc: DocumentID, placement: ScanPlacement,
+                       standIn: PageID?, tx: DocTransaction) throws -> [PageRecord] {
         let content = try tx.content(doc)
-        // A new notebook's stand-in first page is replaced, so it is not a neighbour.
+        for id in ids where id != standIn && content.page(id) != nil {
+            throw NibError(.invalidParams, "page id \(id.raw) was used in \(NodeRef.document(doc)) while scanning",
+                           path: "$.ids", hint: "scan again with other ids, or without ids")
+        }
+        // The stand-in is replaced, so it is not a neighbour.
         var others = content
-        others.pages.removeAll { page in ids.contains(page.id) }
-        let orders = placement.orders(count: pages.count, in: others)
+        if let standIn { others.pages.removeAll { $0.id == standIn } }
+        let orders = placement.orders(count: sheets.count, in: others)
         var records: [PageRecord] = []
-        records.reserveCapacity(pages.count)
-        for (i, (sheet, asset)) in zip(pages, assets).enumerated() {
+        records.reserveCapacity(sheets.count)
+        for (i, (sheet, id)) in zip(sheets, ids).enumerated() {
             let size = sheet.pageSize
-            var record = content.page(ids[i]) ?? PageRecord(id: ids[i])
+            var record = (id == standIn ? content.page(id) : nil) ?? PageRecord(id: id)
             record.order = orders[i]
             record.size = size
             record.rotation = 0
-            record.background = .ofImage(asset)
+            record.background = .ofImage(sheet.asset)
+            let basis = ScanTextBasis(source: PageSize(sheet.pixelWidth, sheet.pixelHeight), rotation: 0, size: size)
             let blocks = ScanText.blocks(sheet.blocks, imageWidth: sheet.pixelWidth, imageHeight: sheet.pixelHeight, in: size)
             var ext = record.ext ?? [:]
             ext[PageRecord.scanTextExtKey] = try ScanText.json(blocks)
+            ext[ScanText.basisExtKey] = try JSONValue.from(basis)
             record.ext = ext
             records.append(record)
         }
@@ -471,11 +525,15 @@ enum ScanOCR {
 // MARK: - "nib.scanText"
 
 /// Page ext `PageRecord.scanTextExtKey` ("nib.scanText"): the scan's recognised text as `[TextRecognition]` JSON, one
-/// block per line, bbox in page points (top-left origin), `source: "scan"`. The search index (F055) reads it like any
-/// other recognised text; `[]` means the sheet was scanned and holds no text. Word boxes are left out: page records
-/// live in the document head, which is rewritten on every change, so line boxes keep it small.
+/// block per line, bbox in page points (top-left origin) for the page's current rotation and size, `source: "scan"`.
+/// The search index (F055) reads it like any other recognised text; `[]` means the sheet was scanned and holds no text.
+/// Word boxes are left out: page records live in the document head, which is rewritten on every change, so line boxes
+/// keep it small. Beside it, `basisExtKey` records what the boxes were computed for, so they follow the page when it
+/// is turned or resized (`ScanTextFollow`).
 enum ScanText {
     static let source = "scan"
+    /// Page ext "nib.scanTextBasis": a `ScanTextBasis`.
+    static let basisExtKey = "nib.scanTextBasis"
 
     /// Image-pixel blocks → page-point blocks, through the transform the renderer draws the image background with
     /// (`PageRecord.backgroundTransform`: aspect-fitted and centred), so each box stays on its words.
@@ -486,12 +544,22 @@ enum ScanText {
         return recognized.compactMap { r -> TextRecognition? in
             let text = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
-            let a = t.apply(Point(r.bbox.x, r.bbox.y))
-            let b = t.apply(Point(r.bbox.x + r.bbox.width, r.bbox.y + r.bbox.height))
-            let bbox = Rect(x: rounded(min(a.x, b.x)), y: rounded(min(a.y, b.y)),
-                            width: rounded(abs(b.x - a.x)), height: rounded(abs(b.y - a.y)))
-            return TextRecognition(text: text, alternatives: r.alternatives, bbox: bbox, source: source,
+            return TextRecognition(text: text, alternatives: r.alternatives, bbox: map(r.bbox, t), source: source,
                                    confidence: rounded(r.confidence))
+        }
+    }
+
+    /// Page-point blocks computed for `old` → the same words on the page turned to `rotation` and sized `size`: back
+    /// into image pixels through the old background transform, then out through the new one.
+    static func remap(_ blocks: [TextRecognition], from old: ScanTextBasis, rotation: Int, size: PageSize) -> [TextRecognition] {
+        guard let back = PageRecord.backgroundTransform(sourceSize: old.source, rotation: old.rotation,
+                                                        pageSize: old.size).inverted else { return blocks }
+        let forward = PageRecord.backgroundTransform(sourceSize: old.source, rotation: rotation, pageSize: size)
+        let t = back.concatenating(forward)
+        return blocks.map { block in
+            var b = block
+            b.bbox = map(block.bbox, t)
+            return b
         }
     }
 
@@ -502,7 +570,126 @@ enum ScanText {
         (try? page.ext?[PageRecord.scanTextExtKey]?.decode([TextRecognition].self)) ?? []
     }
 
+    /// What a page's blocks were computed for (nil when it is not a scan).
+    static func basis(of page: PageRecord) -> ScanTextBasis? {
+        try? page.ext?[basisExtKey]?.decode(ScanTextBasis.self)
+    }
+
+    /// True when the page's blocks no longer match its rotation or size (it was turned or resized since).
+    static func isStale(_ page: PageRecord) -> Bool {
+        guard !page.deleted, let size = page.size, let basis = basis(of: page),
+              page.ext?[PageRecord.scanTextExtKey] != nil else { return false }
+        return basis.rotation != normalized(page.rotation) || basis.size != size
+    }
+
+    /// Scanned pages in `changeset` whose blocks no longer match their rotation or size, each page once (its latest
+    /// write). Cheap: it runs inside every commit.
+    static func stalePages(in changeset: Changeset) -> [String] {
+        var latest: [String: PageRecord] = [:]
+        var order: [String] = []
+        for m in changeset.mutations {
+            guard case let .page(doc, _, after) = m else { continue }
+            let ref = NodeRef.page(doc, after.id).description
+            if latest.updateValue(after, forKey: ref) == nil { order.append(ref) }
+        }
+        return order.filter { latest[$0].map(isStale) ?? false }
+    }
+
+    static func normalized(_ rotation: Int) -> Int { ((rotation % 360) + 360) % 360 }
+
+    /// The axis-aligned box around `rect` mapped through `t` (a quarter turn swaps its sides), rounded to 0.01 pt.
+    static func map(_ rect: Rect, _ t: Affine) -> Rect {
+        let corners = [Point(rect.x, rect.y), Point(rect.x + rect.width, rect.y), Point(rect.x, rect.y + rect.height),
+                       Point(rect.x + rect.width, rect.y + rect.height)].map { t.apply($0) }
+        let xs = corners.map { $0.x }, ys = corners.map { $0.y }
+        let minX = xs.min() ?? 0, minY = ys.min() ?? 0
+        return Rect(x: rounded(minX), y: rounded(minY), width: rounded((xs.max() ?? 0) - minX),
+                    height: rounded((ys.max() ?? 0) - minY))
+    }
+
     private static func rounded(_ v: Double) -> Double { (v * 100).rounded() / 100 }
+}
+
+/// What a scanned page's "nib.scanText" boxes were computed for: the scanned image's pixel size and the page's
+/// rotation and size at the time.
+struct ScanTextBasis: Codable, Equatable {
+    /// The scanned image, in pixels.
+    var source: PageSize
+    var rotation: Int
+    var size: PageSize
+}
+
+/// Keeps "nib.scanText" boxes on their words after a scanned page is turned (page.rotate) or resized, whoever changed
+/// it: a commit observer finds scanned pages whose rotation or size no longer matches their `ScanTextBasis` and runs
+/// this in the undo group of that change, so one undo puts both back. Undo and redo restore the whole page record,
+/// boxes included, so they leave nothing to do; a merge from another device is left alone, because the device that
+/// turned the page moved the boxes and syncs them too. Internal: never registered, so it is in no catalogue and no
+/// caller can reach it; `bus.run` runs it directly.
+struct ScanTextFollow: NibCommand {
+    struct Params: Codable {
+        /// "page:D/P" refs.
+        var pages: [String]
+    }
+
+    struct Output: Codable {
+        var updated: Int
+    }
+
+    static let commandID = "scan.textFollowsPage"
+    static let descriptor = CommandDescriptor(
+        id: commandID, title: "Move Scanned Text with the Page",
+        summary: "Internal: maps a scanned page's recognised-text boxes to its new rotation or size.",
+        params: .obj(["pages": .arr(.str(), "page:D/P refs")], required: ["pages"]), effect: .edit, exposure: .ui)
+
+    /// Installs the observer (once per app, from `FeatScanFeature.register`).
+    static func observe(_ app: NibApp) {
+        _ = app.bus.observeCommits { [weak app] changeset in
+            if case .sync = changeset.principal { return }
+            let pages = ScanText.stalePages(in: changeset)
+            guard !pages.isEmpty else { return }
+            let group = changeset.group
+            Task { @MainActor in
+                guard let app else { return }
+                do {
+                    _ = try await app.bus.run(ScanTextFollow.self, Params(pages: pages), group: group)
+                } catch {
+                    scanLog.error("scanned text did not follow its page: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        }
+    }
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        var byDoc: [DocumentID: [PageID]] = [:]
+        var docs: [DocumentID] = []
+        for ref in p.pages {
+            guard case let .page(doc, page)? = NodeRef(ref) else { continue }
+            if byDoc[doc] == nil { docs.append(doc) }
+            byDoc[doc, default: []].append(page)
+        }
+        return try ctx.mutate { tx in
+            var updated = 0
+            for doc in docs {
+                let content = try tx.content(doc)
+                var records: [PageRecord] = []
+                for id in byDoc[doc] ?? [] {
+                    // Read again: the page may have changed since the commit that asked for this.
+                    guard var page = content.page(id), ScanText.isStale(page), let size = page.size,
+                          let basis = ScanText.basis(of: page) else { continue }
+                    let rotation = ScanText.normalized(page.rotation)
+                    let blocks = ScanText.remap(ScanText.blocks(of: page), from: basis, rotation: rotation, size: size)
+                    var ext = page.ext ?? [:]
+                    ext[PageRecord.scanTextExtKey] = try ScanText.json(blocks)
+                    ext[ScanText.basisExtKey] = try JSONValue.from(ScanTextBasis(source: basis.source, rotation: rotation,
+                                                                                size: size))
+                    page.ext = ext
+                    records.append(page)
+                }
+                if !records.isEmpty { updated += try tx.put(records, doc: doc).count }
+            }
+            return Output(updated: updated)
+        }
+    }
 }
 
 // MARK: - Page layout
@@ -542,6 +729,66 @@ enum ScanFeedback {
         host.postToast(message(count), actionTitle: String(localized: "Undo")) { [weak app = ctx.app] in
             app?.perform(CommandIDs.revertGroup, params)
         }
+    }
+}
+
+/// The HUD while a scan is read (DESIGN.md §14.18, import-like work: a determinate 3 pt bar where it was started):
+/// "Reading scanned pages · 2 of 12" at the top centre of the invoking window, updated after every sheet, announced to
+/// VoiceOver when it starts, gone once the pages are in (or the scan failed).
+@MainActor
+final class ScanProgress {
+    static let id = "scan.progress"
+
+    private weak var host: FloatingHosting?
+    let total: Int
+    private(set) var done = 0
+
+    init(host: FloatingHosting?, total: Int) {
+        self.host = host
+        self.total = total
+    }
+
+    func start() {
+        AccessibilityNotification.Announcement(ScanProgress.announcement(total)).post()
+        show()
+    }
+
+    func update(done: Int) {
+        self.done = min(max(done, 0), total)
+        show()
+    }
+
+    func finish() {
+        host?.dismiss(ScanProgress.id)
+    }
+
+    private func show() {
+        let done = done, total = total
+        host?.present(ScanProgress.id) { ScanProgressHUD(done: done, total: total) }
+    }
+
+    static func announcement(_ total: Int) -> String {
+        total == 1 ? String(localized: "Reading 1 scanned page") : String(localized: "Reading \(total) scanned pages")
+    }
+}
+
+/// "Reading scanned pages", "2 of 12" and the bar, in one 40 pt HUD below the top bars.
+struct ScanProgressHUD: View {
+    let done: Int
+    let total: Int
+
+    var fraction: Double { total > 0 ? Double(done) / Double(total) : 0 }
+
+    var body: some View {
+        NibHUDGroup(id: ScanProgress.id) {
+            NibHUDText(String(localized: "Reading scanned pages"), secondary: String(localized: "\(done) of \(total)"))
+            NibProgressBar(value: fraction)
+                .frame(width: NibSpacing.x6)
+                .padding(.trailing, NibSpacing.s)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.top, NibMetrics.barTopGap * 2 + NibMetrics.barHeight)
+        .padding(.horizontal, NibMetrics.chromeInset)
     }
 }
 
@@ -635,35 +882,50 @@ struct QRPayload: Equatable {
 
 // MARK: - Camera, browser and clipboard (system UI behind a protocol, so tests use a fake)
 
-/// Where a scan shows system UI: the invoking window (its editor's window, else the most recently active one) and
-/// the Liquid setting the reader's chrome follows.
+/// Where a scan shows system UI: the invoking window (its editor's window, else the most recently active one), the
+/// Liquid setting the reader's chrome follows, and who asked (a camera problem is a toast for the person, an error for
+/// other callers).
 @MainActor
 struct ScanStage {
     var session: EditorSession?
     var navigator: SceneNavigator?
     /// `NibSettings.liquidMode`: full, calm or off.
     var liquidMode: String
+    var principal: Principal
 
-    init(session: EditorSession?, navigator: SceneNavigator?, liquidMode: String) {
+    init(session: EditorSession?, navigator: SceneNavigator?, liquidMode: String, principal: Principal = .user) {
         self.session = session
         self.navigator = navigator
         self.liquidMode = liquidMode
+        self.principal = principal
     }
 
     init(_ ctx: CommandContext) {
         self.init(session: ctx.activeSession, navigator: ctx.navigator,
-                  liquidMode: ctx.services.settings.get(NibSettings.liquidMode))
+                  liquidMode: ctx.services.settings.get(NibSettings.liquidMode), principal: ctx.principal)
     }
 
-    /// The topmost view controller of the window.
+    /// The invoking window's floating host (toasts, the progress HUD).
+    var floatingHost: FloatingHosting? { session?.floatingHost ?? navigator?.floatingHost }
+
+    /// The topmost view controller of the window, free to present. UIKit silently refuses to present over a controller
+    /// that is still on its way out, or from a window that is gone, and the command would then wait for a camera that
+    /// never shows: those throw instead.
     func presenter() throws -> UIViewController {
         guard var top = (session?.editor as? UIViewController)?.view.window?.rootViewController
                 ?? navigator?.rootViewController else {
             throw NibError.unavailable("an open window to show the camera in")
         }
         while let next = top.presentedViewController, !next.isBeingDismissed { top = next }
+        guard top.presentedViewController == nil, top.view.window != nil else {
+            throw ScanStage.notShown
+        }
         return top
     }
+
+    /// The camera could not be put on screen.
+    static let notShown = NibError(.unavailable, "the camera could not be shown in this window",
+                                   hint: "close what is open over the window, then scan again")
 }
 
 @MainActor
@@ -693,7 +955,7 @@ final class SystemScanDevice: ScanDevice {
     func captureDocuments(on stage: ScanStage) async throws -> ScanSheets? {
         guard !NibApp.isHostlessTest else { throw NibError.unavailable("the document camera (hostless test)") }
         guard VNDocumentCameraViewController.isSupported else { throw NibError.unsupported("document scanning on this device") }
-        guard await CameraAccess.request() else { throw CameraAccess.deniedError }
+        guard await CameraAccess.request() else { return try CameraAccess.refuse(on: stage) }
         let scan = try await DocumentCamera.capture(from: try stage.presenter())
         return scan.map { DocumentCameraSheets($0) }
     }
@@ -720,6 +982,19 @@ final class SystemScanDevice: ScanDevice {
 enum CameraAccess {
     static let deniedError = NibError(.unavailable, "Camera access is off for Nib",
                                       hint: "allow it in Settings › Privacy & Security › Camera, then scan again")
+
+    /// Camera access is off: a toast in the invoking window says so and offers Open Settings. For the person that is
+    /// the answer, so the scan just ends (nil, cancelled); other callers, and a window with no host to show the toast
+    /// in, get the error.
+    @MainActor
+    static func refuse(on stage: ScanStage) throws -> ScanSheets? {
+        let host = stage.floatingHost
+        host?.postToast(String(localized: "Camera access is off for Nib"), actionTitle: String(localized: "Open Settings")) {
+            CameraAccess.openSettings()
+        }
+        guard host != nil, stage.principal.isUser else { throw deniedError }
+        return nil
+    }
 
     /// Asks the first time; true when the camera may be used.
     static func request() async -> Bool {
@@ -749,7 +1024,10 @@ enum DocumentCamera {
         defer { camera.dismiss(animated: true) }
         return try await withCheckedThrowingContinuation { continuation in
             delegate.wait(continuation)
-            presenter.present(camera, animated: true)
+            presenter.present(camera, animated: true) { [weak camera] in
+                // Not on screen after all: nothing will ever call the delegate, so stop waiting.
+                if camera?.presentingViewController == nil { delegate.finish(.failure(ScanStage.notShown)) }
+            }
         }
     }
 }
@@ -776,7 +1054,8 @@ final class DocumentCameraDelegate: NSObject, VNDocumentCameraViewControllerDele
         finish(.failure(error))
     }
 
-    private func finish(_ result: Result<VNDocumentCameraScan?, Error>) {
+    /// Resumes the waiting scan once; later calls do nothing.
+    func finish(_ result: Result<VNDocumentCameraScan?, Error>) {
         continuation?.resume(with: result)
         continuation = nil
         keepAlive = nil

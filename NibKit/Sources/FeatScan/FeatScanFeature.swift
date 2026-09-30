@@ -9,6 +9,8 @@ public enum FeatScanFeature: NibFeature {
     public static func register(_ app: NibApp) {
         app.commands.register(ScanDocuments.self)
         app.commands.register(ScanQR.self)
+        // Recognised text on a scanned page follows the page when it is turned or resized.
+        ScanTextFollow.observe(app)
 
         let menus = app.ui.menus
         // + New: after Import Files (F064, 600).

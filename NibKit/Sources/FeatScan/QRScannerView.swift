@@ -7,7 +7,8 @@ import NibDesign
 
 // The QR reader: DataScannerViewController full screen (the camera is this screen's page), with Nib's chrome floating
 // over it in the screen's one droplet container: a Clear bar (Close, title) and, once a code is read, a Deep panel
-// that shows the code in full and asks before anything opens. Nothing opens by itself.
+// that shows the code in full and asks before anything opens. Nothing opens by itself, and the code on the panel
+// never changes under the person: another code coming into view waits until they close the panel or tap it.
 
 enum QRCameraProblem: Equatable {
     /// Camera access is off (or restricted) for Nib.
@@ -35,7 +36,10 @@ enum QRScannerSession {
                 }
                 host.dismiss(animated: true) { continuation.resume(returning: result) }
             }
-            presenter.present(host, animated: true)
+            presenter.present(host, animated: true) { [weak host] in
+                // Not on screen after all (UIKit refused it): nothing will ever finish the reader, so stop waiting.
+                if host?.presentingViewController == nil { model.finish(nil) }
+            }
         }
     }
 }
@@ -43,21 +47,41 @@ enum QRScannerSession {
 /// The reader's state: the code on screen, what the camera can do, and the one-shot result.
 @MainActor
 final class QRScannerModel: ObservableObject {
+    /// How long Open does nothing after the code on the panel was swapped for another (a tap on a code in the camera
+    /// view), so a tap meant for the old code never opens the new one.
+    static let settleTime: TimeInterval = 0.5
+
     @Published private(set) var code: QRPayload?
     @Published var problem: QRCameraProblem?
     /// Called exactly once, with the code to open or nil.
     var onFinish: ((String?) -> Void)?
+    /// The clock (tests move it).
+    var now: () -> Date = { Date() }
+    private var replacedAt: Date?
 
     init(problem: QRCameraProblem?) {
         self.problem = problem
     }
 
-    /// A code came into view (or was tapped): it replaces the one on screen. True when the panel changed.
+    /// A code came into view. It shows only while the panel is empty: a second code (a sticker beside the real one)
+    /// never replaces the code the person is reading. True when the panel changed.
     @discardableResult
     func found(_ raw: String?) -> Bool {
+        guard code == nil else { return false }
+        return show(raw)
+    }
+
+    /// The person tapped a code in the camera view: it replaces the one on the panel. True when the panel changed.
+    @discardableResult
+    func tapped(_ raw: String?) -> Bool {
+        show(raw)
+    }
+
+    private func show(_ raw: String?) -> Bool {
         guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         let payload = QRPayload(raw)
         guard payload != code else { return false }
+        replacedAt = code == nil ? nil : now()
         code = payload
         return true
     }
@@ -65,11 +89,18 @@ final class QRScannerModel: ObservableObject {
     /// Puts the code away and keeps reading (the panel's Close).
     func dismissCode() {
         code = nil
+        replacedAt = nil
+    }
+
+    /// True while Open would do nothing because the code was just swapped.
+    var isSettling: Bool {
+        guard let replacedAt else { return false }
+        return now().timeIntervalSince(replacedAt) < QRScannerModel.settleTime
     }
 
     /// Opens (or copies) the code on screen.
     func confirm() {
-        guard let code else { return }
+        guard let code, !isSettling else { return }
         finish(code.raw)
     }
 
@@ -124,8 +155,12 @@ struct QRScannerScreen: View {
     }
 }
 
-/// The code, in full, and the one action it gets. Deep, because it carries body text.
+/// The code, in full, and the one action it gets. Deep, because it carries body text. A link shows its host on its own
+/// line first (the part that says where it goes, never cut), then the whole link, wrapped.
 struct QRResultPanel: View {
+    /// About ten lines of link; longer links scroll.
+    static let linkMaxHeight: CGFloat = 200
+
     let payload: QRPayload
     let onClose: () -> Void
     let action: () -> Void
@@ -135,14 +170,27 @@ struct QRResultPanel: View {
         VStack(alignment: .leading, spacing: 0) {
             NibPanelHeader(title: QRResultPanel.kindTitle(payload.kind), symbol: QRResultPanel.symbol(payload.kind),
                            onClose: onClose)
-            Text(payload.display)
-                .font(NibFont.callout)
-                .foregroundStyle(NibColor.labelSecondary)
-                .lineLimit(typeSize.isAccessibilitySize ? 8 : 4)
-                .truncationMode(.middle)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, NibSpacing.l)
+            if let host = QRResultPanel.host(payload) {
+                Text(host)
+                    .font(NibFont.bodyEmphasis)
+                    .foregroundStyle(NibColor.label)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, NibSpacing.l)
+                    .padding(.bottom, NibSpacing.xs)
+                    .accessibilityLabel(String(localized: "Goes to \(host)"))
+            }
+            if payload.url != nil {
+                // The whole link, wrapped; a very long one scrolls instead of pushing the button off screen.
+                ViewThatFits(in: .vertical) {
+                    link
+                    ScrollView { link }
+                        .frame(maxHeight: QRResultPanel.linkMaxHeight)
+                }
+            } else {
+                link
+                    .lineLimit(typeSize.isAccessibilitySize ? 8 : 4)
+                    .truncationMode(.middle)
+            }
             NibButton(QRResultPanel.actionTitle(payload.kind), kind: .primary, expands: true, shortcut: .defaultAction,
                       action: action)
                 .padding(NibSpacing.l)
@@ -150,6 +198,22 @@ struct QRResultPanel: View {
         .frame(maxWidth: NibMetrics.panelWidth(typeSize))
         .droplet("scan.qr.result", style: .panel)
         .accessibilityElement(children: .contain)
+    }
+
+    private var link: some View {
+        Text(payload.display)
+            .font(NibFont.callout)
+            .foregroundStyle(NibColor.labelSecondary)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, NibSpacing.l)
+    }
+
+    /// The host a web link goes to (nil for nib:// links and text).
+    static func host(_ payload: QRPayload) -> String? {
+        guard payload.kind == .web, let host = payload.url?.host(), !host.isEmpty else { return nil }
+        return host
     }
 
     static func symbol(_ kind: QRPayloadKind) -> NibSymbol {
@@ -257,7 +321,7 @@ final class QRCameraController: UIViewController, DataScannerViewControllerDeleg
     }
 
     func dataScanner(_ dataScanner: DataScannerViewController, didTapOn item: RecognizedItem) {
-        model.found(QRCameraController.payload(item))
+        model.tapped(QRCameraController.payload(item))
     }
 
     func dataScanner(_ dataScanner: DataScannerViewController,

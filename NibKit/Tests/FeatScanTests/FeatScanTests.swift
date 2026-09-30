@@ -5,18 +5,41 @@ import NibContracts
 import NibTesting
 @testable import FeatScan
 
+/// What happened, in order, across threads (sheet reads on the main actor, asset writes off it).
+final class EventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String] = []
+
+    func append(_ entry: String) {
+        lock.lock()
+        entries.append(entry)
+        lock.unlock()
+    }
+
+    var all: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
+}
+
 /// A scan's sheets; nil entries are sheets that cannot be read. Records the order they are read in.
 @MainActor
 final class FakeSheets: ScanSheets {
     let images: [UIImage?]
+    let log: EventLog?
     private(set) var reads: [Int] = []
 
-    init(_ images: [UIImage?]) { self.images = images }
+    init(_ images: [UIImage?], log: EventLog? = nil) {
+        self.images = images
+        self.log = log
+    }
 
     var count: Int { images.count }
 
     func image(at index: Int) -> UIImage? {
         reads.append(index)
+        log?.append("read \(index)")
         return images[index]
     }
 }
@@ -26,6 +49,10 @@ final class FakeSheets: ScanSheets {
 final class FakeScanDevice: ScanDevice {
     var sheets: [UIImage?]?
     var code: String?
+    /// Shared with the sheets of every capture.
+    var log: EventLog?
+    /// Runs while the camera is "open", before the sheets come back.
+    var onCapture: (@MainActor () async throws -> Void)?
     private(set) var captures = 0
     private(set) var stages: [ScanStage] = []
     private(set) var lastSheets: FakeSheets?
@@ -40,8 +67,9 @@ final class FakeScanDevice: ScanDevice {
     func captureDocuments(on stage: ScanStage) async throws -> ScanSheets? {
         captures += 1
         stages.append(stage)
+        try await onCapture?()
         guard let sheets else { return nil }
-        let fake = FakeSheets(sheets)
+        let fake = FakeSheets(sheets, log: log)
         lastSheets = fake
         return fake
     }
@@ -68,15 +96,47 @@ final class FullAssetStore: AssetStore {
     func temporaryURL(_ ref: AssetRef) -> URL? { nil }
 }
 
-/// The window's floating host: records toasts.
+/// An asset store that writes through to memory and logs every put: the sheet's pixel width, in call order.
+final class RecordingAssetStore: AssetStore {
+    let base: InMemoryAssetStore
+    let log: EventLog
+
+    init(_ base: InMemoryAssetStore, log: EventLog) {
+        self.base = base
+        self.log = log
+    }
+
+    func put(_ data: Data, ext: String, doc: DocumentID) throws -> AssetRef {
+        log.append("put \(UIImage(data: data)?.cgImage?.width ?? 0)")
+        return try base.put(data, ext: ext, doc: doc)
+    }
+
+    func url(_ ref: AssetRef, doc: DocumentID) -> URL? { base.url(ref, doc: doc) }
+    func data(_ ref: AssetRef, doc: DocumentID) throws -> Data { try base.data(ref, doc: doc) }
+    func putTemporary(_ data: Data, ext: String) throws -> AssetRef { try base.putTemporary(data, ext: ext) }
+    func temporaryURL(_ ref: AssetRef) -> URL? { base.temporaryURL(ref) }
+}
+
+/// The window's floating host: records toasts and what was presented and dismissed, in order.
 @MainActor
 final class FakeFloatingHost: FloatingHosting {
     private(set) var toasts: [(message: String, actionTitle: String?)] = []
     private(set) var lastAction: (@MainActor () -> Void)?
+    /// "present <id>" / "dismiss <id>".
+    private(set) var events: [String] = []
+    private var shown: Set<String> = []
 
-    func present(_ id: String, content: AnyView) {}
-    func dismiss(_ id: String) {}
-    func isPresenting(_ id: String) -> Bool { false }
+    func present(_ id: String, content: AnyView) {
+        events.append("present " + id)
+        shown.insert(id)
+    }
+
+    func dismiss(_ id: String) {
+        events.append("dismiss " + id)
+        shown.remove(id)
+    }
+
+    func isPresenting(_ id: String) -> Bool { shown.contains(id) }
     func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { false }
     func removeAnchor(_ id: String) {}
     func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { nil }
@@ -85,6 +145,24 @@ final class FakeFloatingHost: FloatingHosting {
         toasts.append((message, actionTitle))
         lastAction = action
     }
+}
+
+/// A window whose root view controller is not in a window (or is still presenting something).
+@MainActor
+final class FakeNavigator: SceneNavigator {
+    let session = EditorSession()
+    let root: UIViewController?
+
+    init(root: UIViewController?) { self.root = root }
+
+    var openDocuments: [DocumentID] { [] }
+    var activeDocument: DocumentID? { nil }
+    var rootViewController: UIViewController? { root }
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {}
+    func closeDocument(_ doc: DocumentID) {}
+    func showLibrary(folder: FolderID?) {}
+    func showSettings(page: String?) {}
+    func presentModal(_ viewController: UIViewController) {}
 }
 
 @MainActor
@@ -548,6 +626,11 @@ final class FeatScanTests: XCTestCase {
         // No window to show the camera in (a headless caller).
         let stage = ScanStage(session: nil, navigator: nil, liquidMode: "full")
         XCTAssertThrowsError(try stage.presenter()) { XCTAssertEqual(NibError.wrap($0).code, .unavailable) }
+        // A window whose root is not on screen: UIKit would refuse to present, so the command never waits for it.
+        let detached = FakeNavigator(root: UIViewController())
+        let offscreen = ScanStage(session: nil, navigator: detached, liquidMode: "full")
+        XCTAssertThrowsError(try offscreen.presenter()) { XCTAssertEqual(NibError.wrap($0).code, .unavailable) }
+        XCTAssertTrue(device.stages.allSatisfy { $0.principal == .user })
         // Hostless tests have no camera: the system device says so instead of prompting.
         ScanDevices.current = SystemScanDevice()
         let code = await errorCode(h, "scan.documents", [:])
@@ -605,6 +688,206 @@ final class FeatScanTests: XCTestCase {
         XCTAssertEqual(ScanText.blocks(of: PageRecord()), [])
         XCTAssertEqual(ScanText.blocks([TextRecognition(text: "x", bbox: Rect(x: 0, y: 0, width: 1, height: 1), source: "image")],
                                        imageWidth: 0, imageHeight: 10, in: .a4), [])
+    }
+
+    // MARK: scan.documents: progress, streaming, late id clashes, camera access
+
+    func testAProgressHUDShowsWhileTheSheetsAreRead() async throws {
+        let h = Harness(features: [FeatScanFeature.self])
+        h.app.services.recognizer = FakeRecognizer([])
+        let host = FakeFloatingHost()
+        h.session.floatingHost = host
+        install(FakeScanDevice(sheets: [sheet(), sheet(), sheet()]))
+
+        _ = try await h.run("scan.documents", ["doc": "doc:FIXTUREDOC01", "position": "end"])
+        let presents = host.events.filter { $0 == "present scan.progress" }
+        XCTAssertEqual(presents.count, 4, "shown at the start, then after each of the 3 sheets")
+        XCTAssertEqual(host.events.first, "present scan.progress")
+        XCTAssertEqual(host.events.last, "dismiss scan.progress")
+        XCTAssertFalse(host.isPresenting(ScanProgress.id))
+        XCTAssertEqual(host.toasts.count, 1, "the result toast follows")
+
+        // A scan that fails part-way still takes the HUD away: into a notebook, and into a new one.
+        h.app.services.assets = FullAssetStore()
+        for params: JSONValue in [["doc": "doc:FIXTUREDOC01"], ["folder": "folder:FIXTUREFLD01"]] {
+            let before = host.events.count
+            let code = await errorCode(h, "scan.documents", params)
+            XCTAssertEqual(code, .internalError)
+            let events = Array(host.events[before...])
+            XCTAssertEqual(events.first, "present scan.progress")
+            XCTAssertEqual(events.last, "dismiss scan.progress")
+            XCTAssertFalse(host.isPresenting(ScanProgress.id))
+        }
+
+        let hud = ScanProgressHUD(done: 1, total: 3)
+        XCTAssertEqual(hud.fraction, 1.0 / 3, accuracy: 0.0001)
+        XCTAssertEqual(ScanProgressHUD(done: 0, total: 0).fraction, 0)
+        XCTAssertNotEqual(ScanProgress.announcement(1), ScanProgress.announcement(3))
+    }
+
+    func testEachSheetIsStoredAsSoonAsItIsRead() async throws {
+        let h = Harness(features: [FeatScanFeature.self])
+        h.app.services.recognizer = FakeRecognizer([])
+        let log = EventLog()
+        h.app.services.assets = RecordingAssetStore(h.assets, log: log)
+        let device = install(FakeScanDevice(sheets: [sheet(), nil, sheet(size: CGSize(width: 1754, height: 1240)),
+                                                     sheet(size: CGSize(width: 1000, height: 1400))]))
+        device.log = log
+
+        let out = try await h.run("scan.documents", ["folder": "folder:FIXTUREFLD01", "ids": ["FIRSTSHEET01"]])
+        XCTAssertEqual(log.all, ["read 0", "put 1240", "read 1", "read 2", "put 1754", "read 3", "put 1000"],
+                       "one put per readable sheet, in order, before the next sheet is read")
+        guard let ref = out["doc"]?.stringValue, case let .document(doc)? = NodeRef(ref) else {
+            return XCTFail("no doc in \(out)")
+        }
+        let pages = try h.app.workspace.content(doc).livePages
+        XCTAssertEqual(pages.map { $0.id }.first, NibID("FIRSTSHEET01"))
+        XCTAssertEqual(pages.count, 3)
+        XCTAssertEqual(pages.compactMap { $0.background.asset }.count, 3)
+        XCTAssertTrue(pages.allSatisfy { ScanText.basis(of: $0)?.rotation == 0 })
+        XCTAssertEqual(pages.compactMap { ScanText.basis(of: $0)?.source.width }, [1240, 1754, 1000])
+    }
+
+    func testAnIDTakenWhileTheCameraWasOpenFailsTheScanAndKeepsThatPage() async throws {
+        let h = Harness(features: [FeatScanFeature.self])
+        h.app.services.recognizer = FakeRecognizer([])
+        let taken: PageID = "TAKEN0000001"
+        h.app.commands.register(CommandDescriptor(id: "test.addPage", title: "Add Page", summary: "Test stand-in.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                _ = try tx.put(PageRecord(id: taken, order: "", size: .a4), doc: Fixtures.docID)
+            }
+            return .null
+        }
+        let device = install(FakeScanDevice(sheets: [sheet(), sheet()]))
+        // Something else (an AI batch, a plugin, sync) makes the page while the person is scanning.
+        device.onCapture = { [h] in _ = try await h.run("test.addPage") }
+
+        let code = await errorCode(h, "scan.documents", ["doc": "doc:FIXTUREDOC01", "position": "end",
+                                                         "ids": ["TAKEN0000001", "SCANNED00002"]])
+        XCTAssertEqual(code, .invalidParams)
+        let page = try XCTUnwrap(try h.app.workspace.content(Fixtures.docID).page(taken))
+        XCTAssertEqual(page.background.kind, PageRecord(id: taken).background.kind, "the page was not overwritten")
+        XCTAssertNil(page.ext?[PageRecord.scanTextExtKey])
+        XCTAssertEqual(page.size, .a4)
+        XCTAssertEqual(try livePageIDs(h), [Fixtures.page1, Fixtures.page2, Fixtures.pdfPage, taken])
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "only the other page's own step")
+    }
+
+    func testCameraAccessOffOffersSettingsToThePerson() throws {
+        let host = FakeFloatingHost()
+        let session = EditorSession()
+        session.floatingHost = host
+        let person = ScanStage(session: session, navigator: nil, liquidMode: "full")
+        XCTAssertNil(try CameraAccess.refuse(on: person), "for the person the scan just ends")
+        XCTAssertEqual(host.toasts.first?.message, "Camera access is off for Nib")
+        XCTAssertEqual(host.toasts.first?.actionTitle, "Open Settings")
+        XCTAssertNotNil(host.lastAction)
+
+        let assistant = ScanStage(session: session, navigator: nil, liquidMode: "full", principal: .ai("chat"))
+        XCTAssertThrowsError(try CameraAccess.refuse(on: assistant)) { XCTAssertEqual(NibError.wrap($0).code, .unavailable) }
+        XCTAssertEqual(host.toasts.count, 2, "the person still sees what to do")
+
+        let nowhere = ScanStage(session: nil, navigator: nil, liquidMode: "full")
+        XCTAssertThrowsError(try CameraAccess.refuse(on: nowhere)) { XCTAssertEqual(NibError.wrap($0).code, .unavailable) }
+    }
+
+    // MARK: scan.documents: recognised text follows the page
+
+    func testScannedTextFollowsATurnedPageAndUndoesWithIt() async throws {
+        let h = Harness(features: [FeatScanFeature.self])
+        let pixels = Rect(x: 124, y: 175.4, width: 620, height: 87.7)
+        h.app.services.recognizer = FakeRecognizer([TextRecognition(text: "Mitochondria", bbox: pixels, source: "image")])
+        // page.rotate (F022) turns the background and swaps the page's sides.
+        h.app.commands.register(CommandDescriptor(id: "page.rotate", title: "Rotate Page", summary: "Test stand-in.",
+                                                  params: .obj(["page": .str()], required: ["page"]),
+                                                  effect: .edit)) { params, ctx in
+            guard let ref = params["page"]?.stringValue, case let .page(doc, id)? = NodeRef(ref) else {
+                throw NibError.invalid("page")
+            }
+            try ctx.mutate { tx in
+                guard var page = try tx.content(doc).page(id) else { throw NibError.notFound(ref) }
+                page.rotation = (page.rotation + 90) % 360
+                page.size = page.size?.rotated
+                _ = try tx.put(page, doc: doc)
+            }
+            return .null
+        }
+        install(FakeScanDevice(sheets: [sheet()]))
+        _ = try await h.run("scan.documents", ["doc": "doc:FIXTUREDOC01", "position": "end", "ids": ["TURNED000001"]])
+        let ref = "page:FIXTUREDOC01/TURNED000001"
+        let scanned = try page(h, ref)
+        let depth = h.undoDepth(Fixtures.docID)
+
+        try await h.run("page.rotate", ["page": .string(ref)])
+        var turned = try page(h, ref)
+        var waits = 0
+        while ScanText.basis(of: turned)?.rotation != 90, waits < 200 {
+            waits += 1
+            try await Task.sleep(nanoseconds: 5_000_000)
+            turned = try page(h, ref)
+        }
+        XCTAssertEqual(turned.rotation, 90)
+        let size = try XCTUnwrap(turned.size)
+        XCTAssertEqual(ScanText.basis(of: turned), ScanTextBasis(source: PageSize(1240, 1754), rotation: 90, size: size))
+        // The box still covers the same part of the image: where the renderer now draws those pixels.
+        let expected = ScanText.map(pixels, PageRecord.backgroundTransform(sourceSize: PageSize(1240, 1754), rotation: 90,
+                                                                          pageSize: size))
+        let box = try XCTUnwrap(ScanText.blocks(of: turned).first).bbox
+        XCTAssertEqual(box.x, expected.x, accuracy: 0.05)
+        XCTAssertEqual(box.y, expected.y, accuracy: 0.05)
+        XCTAssertEqual(box.width, expected.width, accuracy: 0.05)
+        XCTAssertEqual(box.height, expected.height, accuracy: 0.05)
+        XCTAssertGreaterThan(box.height, box.width, "a quarter turn stands the line on its end")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1, "the turn and the boxes are one undo step")
+
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        try await Task.sleep(nanoseconds: 20_000_000)
+        let back = try page(h, ref)
+        XCTAssertEqual(back.rotation, 0)
+        XCTAssertEqual(ScanText.blocks(of: back), ScanText.blocks(of: scanned))
+        XCTAssertEqual(ScanText.basis(of: back), ScanText.basis(of: scanned))
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth, "undo leaves nothing to move")
+
+        // Four quarter turns bring the boxes back where they started.
+        for _ in 0..<4 { try await h.run("page.rotate", ["page": .string(ref)]) }
+        var full = try page(h, ref)
+        waits = 0
+        while ScanText.isStale(full), waits < 200 {
+            waits += 1
+            try await Task.sleep(nanoseconds: 5_000_000)
+            full = try page(h, ref)
+        }
+        XCTAssertEqual(full.rotation, 0)
+        let start = try XCTUnwrap(ScanText.blocks(of: scanned).first).bbox
+        let end = try XCTUnwrap(ScanText.blocks(of: full).first).bbox
+        XCTAssertEqual(end.x, start.x, accuracy: 0.1)
+        XCTAssertEqual(end.y, start.y, accuracy: 0.1)
+        XCTAssertEqual(end.width, start.width, accuracy: 0.1)
+        XCTAssertEqual(end.height, start.height, accuracy: 0.1)
+    }
+
+    func testStalePagesAreFoundOncePerChangeset() {
+        let size = ScanLayout.pageSize(pixelWidth: 1240, pixelHeight: 1754)
+        var page = PageRecord(id: "SCANNED00001", order: "V", size: size)
+        page.ext = [PageRecord.scanTextExtKey: .array([]),
+                    ScanText.basisExtKey: try! JSONValue.from(ScanTextBasis(source: PageSize(1240, 1754), rotation: 0,
+                                                                            size: size))]
+        XCTAssertFalse(ScanText.isStale(page))
+        var turned = page
+        turned.rotation = 90
+        turned.size = size.rotated
+        XCTAssertTrue(ScanText.isStale(turned))
+        let plain = PageRecord(id: "PLAINPAGE001", order: "W", size: .a4)
+        let cs = Changeset(seq: 1, principal: .user, group: "G", label: "Rotate", command: "page.rotate", mutations: [
+            .page(Fixtures.docID, before: page, after: turned),
+            .page(Fixtures.docID, before: turned, after: turned),
+            .page(Fixtures.docID, before: nil, after: plain)
+        ])
+        XCTAssertEqual(ScanText.stalePages(in: cs), ["page:FIXTUREDOC01/SCANNED00001"])
+        var deleted = turned
+        deleted.deleted = true
+        XCTAssertFalse(ScanText.isStale(deleted))
     }
 
     // MARK: scan.qr
@@ -675,21 +958,69 @@ final class FeatScanTests: XCTestCase {
 
     func testScannerModelShowsTheLatestCodeAndFinishesOnce() {
         let model = QRScannerModel(problem: nil)
+        var clock = Date(timeIntervalSince1970: 1_000)
+        model.now = { clock }
         var results: [String?] = []
         model.onFinish = { results.append($0) }
         XCTAssertFalse(model.found(nil))
         XCTAssertFalse(model.found("   "))
         XCTAssertTrue(model.found("https://a.example"))
         XCTAssertFalse(model.found("https://a.example"), "the same code does not refresh the panel")
+        // A second code coming into view (a sticker beside the real one) never replaces the code being read.
+        XCTAssertFalse(model.found("https://evil.example"))
+        XCTAssertEqual(model.code?.raw, "https://a.example")
         model.dismissCode()
         XCTAssertNil(model.code)
         XCTAssertTrue(model.found("https://a.example"), "a code put away shows again when it is read again")
-        XCTAssertTrue(model.found("hello"))
+        XCTAssertFalse(model.isSettling, "the first code can be opened at once")
+
+        // Tapping another code replaces it; Open does nothing for 0.5 s after the swap.
+        XCTAssertTrue(model.tapped("hello"))
         XCTAssertEqual(model.code?.kind, .text)
+        XCTAssertTrue(model.isSettling)
+        model.confirm()
+        XCTAssertEqual(results, [], "a tap meant for the old code does not open the new one")
+        clock.addTimeInterval(QRScannerModel.settleTime)
+        XCTAssertFalse(model.isSettling)
         model.confirm()
         model.finish(nil)
         XCTAssertEqual(results, ["hello"])
         XCTAssertEqual(QRResultPanel.actionTitle(.web), "Open Link")
         XCTAssertEqual(QRResultPanel.actionTitle(.text), "Copy Text")
+
+        // The panel names the host on its own line (web links only).
+        XCTAssertEqual(QRResultPanel.host(QRPayload("https://login.example.com.attacker.test/very/long/path?x=1")),
+                       "login.example.com.attacker.test")
+        XCTAssertEqual(QRResultPanel.host(QRPayload("www.example.com/a")), "www.example.com")
+        XCTAssertNil(QRResultPanel.host(QRPayload("nib://open/FIXTUREDOC01")))
+        XCTAssertNil(QRResultPanel.host(QRPayload("plain words")))
+    }
+
+    // MARK: Snapshots (DESIGN.md §15.7)
+
+    func testQRScreensRenderInEveryVariantAndFitAPhone() {
+        let long = "https://login.example.com.attacker.test/" + String(repeating: "segment/", count: 40) + "?ref=qr"
+        let panels: [(String, QRResultPanel)] = [
+            ("web", QRResultPanel(payload: QRPayload(long), onClose: {}, action: {})),
+            ("nib", QRResultPanel(payload: QRPayload("nib://open/FIXTUREDOC01/FIXTUREPG002"), onClose: {}, action: {})),
+            ("text", QRResultPanel(payload: QRPayload(String(repeating: "WIFI:S:Lab;T:WPA;P:secret;; ", count: 20)),
+                                   onClose: {}, action: {}))
+        ]
+        let size = CGSize(width: 375, height: 520)
+        for (name, panel) in panels {
+            XCTAssertEqual(NibSnapshot.images(panel, size: size).count, NibSnapshot.Variant.allCases.count, name)
+            let fitting = NibSnapshot.fittingSize(panel, width: 375, variant: .largeText)
+            XCTAssertLessThanOrEqual(fitting.width, 375, name)
+            XCTAssertGreaterThan(fitting.height, 0, name)
+        }
+        for problem in [QRCameraProblem.denied, .unavailable] {
+            let view = QRProblemView(problem: problem, retry: {})
+            XCTAssertEqual(NibSnapshot.images(view, size: CGSize(width: 375, height: 667)).count,
+                           NibSnapshot.Variant.allCases.count, "\(problem)")
+            XCTAssertLessThanOrEqual(NibSnapshot.fittingSize(view, width: 375, variant: .largeText).width, 375, "\(problem)")
+        }
+        let hud = ScanProgressHUD(done: 2, total: 12)
+        XCTAssertEqual(NibSnapshot.images(hud, size: CGSize(width: 375, height: 140)).count,
+                       NibSnapshot.Variant.allCases.count)
     }
 }
