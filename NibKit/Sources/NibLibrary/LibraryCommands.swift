@@ -455,7 +455,7 @@ struct DocCreate: NibCommand {
     ]
 
     static let descriptor = CommandDescriptor(
-        id: "doc.create", title: "New Document",
+        id: CommandIDs.docCreate, title: "New Document",
         summary: "Create a notebook (cover + paper pages), whiteboard (one board), text document (one heading) or study set; returns its ref.",
         params: .obj([
             "kind": .str("notebook | whiteboard | textDocument | studySet", choices: DocumentKind.allCases.map { $0.rawValue }),
@@ -538,7 +538,7 @@ struct DocSetFavorite: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "doc.setFavorite", title: "Favourite",
+        id: CommandIDs.docSetFavorite, title: "Favourite",
         summary: "Star or unstar a document (Favourites in the library); undoable.",
         params: .obj(["doc": .ref, "favorite": .bool("true = starred")], required: ["doc", "favorite"]),
         examples: [["doc": "doc:FIXTUREDOC01", "favorite": true], ["doc": "doc:FIXTUREDOC02", "favorite": false]],
@@ -576,7 +576,7 @@ struct DocMerge: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "doc.merge", title: "Merge Documents",
+        id: CommandIDs.docMerge, title: "Merge Documents",
         summary: "Append all pages (or blocks / cards) of one document to the end of another, then move the source to the Trash.",
         params: .obj(["source": .str("doc:<id> whose content is appended (then trashed)"),
                       "into": .str("doc:<id> that receives it")], required: ["source", "into"]),
@@ -903,7 +903,7 @@ struct FolderCreate: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "folder.create", title: "New Folder",
+        id: CommandIDs.folderCreate, title: "New Folder",
         summary: "Create a folder in the library root or inside another folder, with an optional colour and icon; returns its ref.",
         params: .obj(["title": .str("folder name"), "parent": LibraryCommands.folderSchema,
                       "color": .color, "icon": .str("SF Symbol name or one emoji"),
@@ -953,7 +953,7 @@ struct FolderSetStyle: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "folder.setStyle", title: "Folder Style",
+        id: CommandIDs.folderSetStyle, title: "Folder Style",
         summary: "Set a folder's colour, icon (SF Symbol or emoji; \"\" clears) and favourite star; omitted fields stay as they are.",
         params: .obj(["folder": .str("folder:<id>"), "color": .color, "icon": .str("SF Symbol name or one emoji; \"\" = none"),
                       "favorite": .bool()], required: ["folder"]),
@@ -1014,7 +1014,7 @@ struct LibraryList: NibCommand {
     static let kindChoices = ["folder", "document"] + DocumentKind.allCases.map { $0.rawValue }
 
     static let descriptor = CommandDescriptor(
-        id: "library.list", title: "List Library",
+        id: CommandIDs.libraryList, title: "List Library",
         summary: "List the folders and documents in a folder (default the library root), folders first; sort, filter by kind, recurse.",
         params: .obj(["folder": LibraryCommands.folderSchema,
                       "sort": .str("name | modified | created | type (default name)", choices: LibrarySort.allCases.map { $0.rawValue }),
@@ -1075,7 +1075,7 @@ struct LibraryRename: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "library.rename", title: "Rename",
+        id: CommandIDs.libraryRename, title: "Rename",
         summary: "Rename a document or folder (the title is its file name; a clash in the folder gets a number).",
         params: .obj(["ref": .str("doc:<id> or folder:<id>"), "title": .str("new name")], required: ["ref", "title"]),
         examples: [["ref": "doc:FIXTUREDOC01", "title": "Physics notes"], ["ref": "folder:FIXTUREFLD01", "title": "Coursework"]],
@@ -1111,7 +1111,7 @@ struct LibraryMove: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "library.move", title: "Move",
+        id: CommandIDs.libraryMove, title: "Move",
         summary: "Move documents and folders into a folder (omit folder for the library root); a document dropped on a document (folder: doc:<id>) merges into it.",
         params: .obj(["refs": LibraryCommands.refsSchema,
                       "folder": .str("folder:<id>, omit for the root, or doc:<id> to merge the documents into it")],
@@ -1178,7 +1178,7 @@ struct LibraryDuplicate: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "library.duplicate", title: "Duplicate",
+        id: CommandIDs.libraryDuplicate, title: "Duplicate",
         summary: "Duplicate documents or folders next to the originals (every copy gets new ids); returns the copies' refs in order.",
         params: .obj(["refs": LibraryCommands.refsSchema,
                       "ids": .arr(.str(), "your own ids for the copies, in the order of refs")], required: ["refs"]),
@@ -1227,7 +1227,7 @@ struct LibraryTrash: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "library.trash", title: "Move to Trash",
+        id: CommandIDs.libraryTrash, title: "Move to Trash",
         summary: "Move documents or folders to the Trash (recoverable with trash.recover, back to where they were).",
         params: .obj(["refs": LibraryCommands.refsSchema], required: ["refs"]),
         examples: [["refs": ["doc:FIXTUREDOC03"]]],
@@ -1271,7 +1271,7 @@ struct TrashList: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "trash.list", title: "Trash",
+        id: CommandIDs.trashList, title: "Trash",
         summary: "List trashed documents, folders and pages (kind 'page', with their document), most recently trashed first.",
         params: .obj(["cursor": .str("from a truncated result"), "limit": .int(min: 1, max: 1000)]),
         examples: [[:]], effect: .read, target: .library)
@@ -1337,7 +1337,7 @@ struct TrashRecover: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "trash.recover", title: "Recover",
+        id: CommandIDs.trashRecover, title: "Recover",
         summary: "Restore trashed documents and folders to where they were (or into folder), and trashed pages to their document.",
         params: .obj(["refs": .arr(.str("doc:<id>, folder:<id> or page:<doc>/<page> from trash.list")),
                       "folder": .str("folder:<id> (or \"lib\" for the library root) to recover documents and folders into; omit for their original place")],
@@ -1404,7 +1404,7 @@ struct TrashDeletePermanently: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "trash.deletePermanently", title: "Delete Permanently",
+        id: CommandIDs.trashDeletePermanently, title: "Delete Permanently",
         summary: "Permanently delete trashed documents, folders or pages (only items already in the Trash). Cannot be undone.",
         params: .obj(["refs": .arr(.str("doc:<id>, folder:<id> or page:<doc>/<page> from trash.list"))], required: ["refs"]),
         examples: [["refs": ["doc:FIXTUREDOC03"]]],
@@ -1460,7 +1460,7 @@ struct TrashEmpty: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "trash.empty", title: "Empty Trash",
+        id: CommandIDs.trashEmpty, title: "Empty Trash",
         summary: "Permanently delete everything in the Trash: documents, folders and trashed pages. Cannot be undone.",
         params: .empty, examples: [[:]], effect: .irreversible, target: .library)
 
