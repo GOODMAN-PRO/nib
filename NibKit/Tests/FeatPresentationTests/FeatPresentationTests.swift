@@ -16,6 +16,7 @@ final class FakePageSource: PresentationPageSource {
     private(set) var snapshots = 0
     let mirrorImage = FakeRenderer.blank(CGSize(width: 4, height: 3))
     var holdsRenders = false
+    var isInking = false
     private var held: [CheckedContinuation<Void, Never>] = []
 
     init(page: PresentedPage?) {
@@ -212,16 +213,16 @@ final class FeatPresentationTests: XCTestCase {
         let camera = PresentationCamera.transform(showing: Self.bounds, in: model.canvasSize)
         let ref = "page:\(Fixtures.docID.raw)/\(Fixtures.page1.raw)"
 
-        let first: JSONValue = ["page": .string(ref), "point": [300, 400], "mode": "trail"]
-        source.onLaser?(LaserEvent(payload: first))
+        let first = LaserMovedPayload(page: ref, point: Point(300, 400), mode: "trail")
+        source.onLaser?(LaserEvent(first))
         XCTAssertEqual(model.laser.dot, CGPoint(x: 300, y: 400).applying(camera))
 
-        let second: JSONValue = ["page": .string(ref), "point": [320, 410], "mode": "trail"]
-        source.onLaser?(LaserEvent(payload: second))
+        let second = LaserMovedPayload(page: ref, point: Point(320, 410), mode: "trail")
+        source.onLaser?(LaserEvent(second))
         XCTAssertEqual(model.laser.segments.count, 1, "a trail leaves a fading segment behind the dot")
 
-        let lifted: JSONValue = ["page": .string(ref), "mode": "trail"]
-        source.onLaser?(LaserEvent(payload: lifted))
+        let lifted = LaserMovedPayload(page: ref, point: nil, mode: "trail")
+        source.onLaser?(LaserEvent(lifted))
         XCTAssertNil(model.laser.dot, "no point means the laser was lifted")
 
         source.onLaser?(LaserEvent(page: Fixtures.page2, point: Point(10, 10)))
@@ -229,20 +230,35 @@ final class FeatPresentationTests: XCTestCase {
 
         model.mode = .mirror
         await model.update(detailDelay: 0)
-        source.onLaser?(LaserEvent(payload: first))
+        source.onLaser?(LaserEvent(first))
         XCTAssertNil(model.laser.dot, "the mirrored window already shows the laser")
         model.stop()
     }
 
-    func testLaserPayloadParsing() {
-        let payload: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "point": [1.5, 2], "mode": "dot", "color": "#FF0000"]
-        let event = LaserEvent(payload: payload)
+    func testLaserPayloadDecoding() {
+        let bus = EventBus()
+        // F040's JSON, as the bus carries it (`LaserMovedPayload`: page ref, [x, y], colour hex, window).
+        let json: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "point": [1.5, 2], "mode": "dot",
+                               "color": "#FF0000", "session": "S1"]
+        let event = LaserEvent(event: bus.emit(NibEventType.laserMoved, payload: json))
         XCTAssertEqual(event.page, Fixtures.page2)
         XCTAssertEqual(event.point, Point(1.5, 2))
         XCTAssertFalse(event.trail)
         XCTAssertEqual(event.color, RGBA(255, 0, 0))
-        XCTAssertEqual(LaserEvent(payload: ["page": "FIXTUREPG001"]).page, Fixtures.page1)
-        XCTAssertNil(LaserEvent(payload: nil).point)
+
+        let typed = LaserEvent(event: bus.emit(LaserMovedPayload(page: "FIXTUREPG001", point: Point(3, 4), mode: "trail",
+                                                                 color: RGBA(0, 0, 255))))
+        XCTAssertEqual(typed, LaserEvent(page: Fixtures.page1, point: Point(3, 4), trail: true, color: RGBA(0, 0, 255)),
+                       "a bare page id is accepted too")
+
+        let lifted = LaserEvent(event: bus.emit(LaserMovedPayload(page: "page:FIXTUREDOC01/FIXTUREPG001", point: nil,
+                                                                  mode: "dot")))
+        XCTAssertEqual(lifted.page, Fixtures.page1)
+        XCTAssertNil(lifted.point, "no point: lifted")
+
+        let garbage = LaserEvent(event: bus.emit(NibEventType.laserMoved, payload: ["point": "nowhere"]))
+        XCTAssertNil(garbage.point, "a payload that does not decode lifts the laser")
+        XCTAssertNil(garbage.page)
     }
 
     // MARK: Command and live source
@@ -308,9 +324,33 @@ final class FeatPresentationTests: XCTestCase {
 
         var lasers: [LaserEvent] = []
         source.onLaser = { lasers.append($0) }
-        let payload: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [10, 20], "mode": "dot"]
-        h.app.events.emit(NibEventType.laserMoved, payload: payload)
+        h.app.events.emit(LaserMovedPayload(page: "page:FIXTUREDOC01/FIXTUREPG001", point: Point(10, 20), mode: "dot",
+                                            session: h.session.id.raw))
         XCTAssertEqual(lasers.last?.point, Point(10, 20))
+        XCTAssertEqual(lasers.last?.page, Fixtures.page1)
+
+        XCTAssertFalse(source.isInking)
+        h.session.inking.begin()
+        XCTAssertTrue(source.isInking, "the active window's Pencil is down")
+        h.session.inking.end()
+        XCTAssertFalse(source.isInking)
+
+        // Another window becomes active (the shell activates the key window's session): the source follows it.
+        let other = EditorSession()
+        other.document = Fixtures.whiteboardID
+        other.page = Fixtures.boardID
+        changes = 0
+        h.app.services.sessions.add(other)
+        XCTAssertGreaterThanOrEqual(changes, 1, "session.activated re-reads the active page")
+        XCTAssertEqual(source.current?.page, Fixtures.boardID)
+        other.inking.begin()
+        XCTAssertTrue(source.isInking, "inking is read from the active window")
+        other.inking.end()
+        changes = 0
+        h.app.services.sessions.activate(h.session)
+        XCTAssertGreaterThanOrEqual(changes, 1)
+        XCTAssertEqual(source.current?.page, Fixtures.page1)
+        h.app.services.sessions.remove(other)
 
         h.session.page = nil
         XCTAssertNil(source.current, "no page (library, text documents) shows nothing")
@@ -384,7 +424,8 @@ final class FeatPresentationTests: XCTestCase {
         _ = controller.connect(id: ObjectIdentifier(token), name: "Test TV", source: FakePageSource(page: nil))
         defer { controller.disconnect(ObjectIdentifier(token)) }
         XCTAssertEqual(entries(Fixtures.docID),
-                       ["presentation.mode.fullPage", "presentation.mode.mirror", "presentation.mode.presenter.current"])
+                       ["presentation.mode.fullPage", "presentation.mode.mirror", "presentation.mode.presenter"],
+                       "one entry per mode")
         XCTAssertEqual(entries(Fixtures.whiteboardID).count, 3)
         XCTAssertEqual(entries(Fixtures.textDocID), ["presentation.mode.mirror"], "a text document has no page to present")
         XCTAssertEqual(entries(Fixtures.studySetID), ["presentation.mode.mirror"])
@@ -392,6 +433,17 @@ final class FeatPresentationTests: XCTestCase {
         let entry = try XCTUnwrap(h.app.ui.menus.get("presentation.mode.fullPage"))
         XCTAssertEqual(entry.params(MenuContext(app: h.app))["blank"]?.boolValue, false,
                        "choosing a mode in the menu shows a blanked screen again")
+
+        func checked() -> [String] {
+            let ctx = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID)
+            return h.app.ui.menuItems(.shareExport, ctx).filter { $0.owner == FeatPresentationFeature.id }
+                .filter { $0.isChecked?(ctx) == true }.map { $0.id }
+        }
+        XCTAssertEqual(checked(), ["presentation.mode.presenter"], "the mode in use carries the checkmark")
+        _ = try await h.run("present.setMode", ["mode": "fullPage"])
+        XCTAssertEqual(checked(), ["presentation.mode.fullPage"])
+        XCTAssertTrue(h.app.ui.menus.all.filter { $0.owner == FeatPresentationFeature.id }.allSatisfy { $0.icon == nil },
+                      "the host draws the checkmark, not an icon")
     }
 
     func testRenderScaleIsCappedLast() {
@@ -531,5 +583,132 @@ final class FeatPresentationTests: XCTestCase {
 
         XCTAssertTrue(h.app.bus.undo(Fixtures.whiteboardID))
         XCTAssertEqual(try XCTUnwrap(source.current).bounds, before.bounds, "the far item gone, the board shrinks back")
+    }
+
+    // MARK: contracts-v2: presenter HUD overlay, inking, session activation
+
+    func testPresenterHUDIsAChromeOverlayOfTheActiveWindow() async throws {
+        let h = Harness(features: [FeatPresentationFeature.self])
+        let controller = try XCTUnwrap(h.app.services.get(PresentationController.serviceKey, as: PresentationController.self))
+        func shown(_ session: EditorSession, compact: Bool = false, kind: DocumentKind = .notebook) -> [String] {
+            h.app.ui.visibleChromeOverlays(ChromeContext(app: h.app, session: session, kind: kind, isCompact: compact))
+                .filter { $0.owner == FeatPresentationFeature.id }.map { $0.id }
+        }
+        let top = try XCTUnwrap(h.app.ui.chromeOverlays.get(PresentationController.hudID))
+        XCTAssertEqual(top.placement, .top, "iPad: top centre")
+        XCTAssertEqual(top.surface, .hud)
+        XCTAssertTrue(top.recedesWhileWriting, "it recedes with the chrome while the Pencil is down")
+        XCTAssertTrue(top.isInteractive)
+        XCTAssertEqual(try XCTUnwrap(h.app.ui.chromeOverlays.get(PresentationController.compactHUDID)).placement, .bottom,
+                       "iPhone: bottom centre, above the palette")
+        XCTAssertNil(h.app.ui.canvasAttachments.get("presentation.hud"), "no canvas-hosted HUD any more")
+
+        XCTAssertEqual(shown(h.session), [], "no display, no HUD")
+        var updates = 0
+        let watch = NotificationCenter.default.addObserver(forName: .nibChromeNeedsUpdate, object: h.app.ui,
+                                                           queue: nil) { _ in updates += 1 }
+        defer { NotificationCenter.default.removeObserver(watch) }
+
+        let token = NSObject()
+        _ = controller.connect(id: ObjectIdentifier(token), name: "Test TV", source: FakePageSource(page: nil))
+        XCTAssertGreaterThanOrEqual(updates, 1, "a display connecting asks the chrome to show the HUD")
+        XCTAssertEqual(shown(h.session), [PresentationController.hudID])
+        XCTAssertEqual(shown(h.session, compact: true), [PresentationController.compactHUDID])
+        XCTAssertEqual(shown(h.session, kind: .textDocument), [PresentationController.hudID],
+                       "Stop stays reachable from any document window")
+
+        updates = 0
+        _ = try await h.run("present.setMode", ["mode": "mirror"])
+        XCTAssertGreaterThanOrEqual(updates, 1)
+        XCTAssertEqual(shown(h.session), [], "mirroring shows the window itself: no HUD")
+        _ = try await h.run("present.setMode", ["mode": "mirror", "blank": true])
+        XCTAssertEqual(shown(h.session), [PresentationController.hudID], "a blanked display keeps the HUD to undo it")
+        _ = try await h.run("present.setMode", ["mode": "presenter", "blank": false])
+
+        // Another window becomes active: the HUD moves there.
+        let other = EditorSession()
+        other.document = Fixtures.docID
+        other.page = Fixtures.page2
+        updates = 0
+        h.app.services.sessions.add(other)
+        XCTAssertGreaterThanOrEqual(updates, 1, "session.activated re-evaluates every window")
+        XCTAssertEqual(shown(h.session), [])
+        XCTAssertEqual(shown(other), [PresentationController.hudID])
+        h.app.services.sessions.remove(other)
+        h.app.services.sessions.activate(h.session)
+
+        updates = 0
+        controller.disconnect(ObjectIdentifier(token))
+        XCTAssertGreaterThanOrEqual(updates, 1)
+        XCTAssertEqual(shown(h.session), [])
+    }
+
+    func testPresenterHUDFollowsTheWindowAndActsThroughCommands() async throws {
+        let h = Harness(features: [FeatPresentationFeature.self])
+        h.app.commands.register(TouchPage.self)
+        let controller = try XCTUnwrap(h.app.services.get(PresentationController.serviceKey, as: PresentationController.self))
+        let token = NSObject()
+        _ = controller.connect(id: ObjectIdentifier(token), name: "Test TV", source: FakePageSource(page: nil))
+        defer { controller.disconnect(ObjectIdentifier(token)) }
+        let model = PresenterHUDModel(app: h.app, session: h.session, controller: controller)
+        let pages = try h.app.workspace.content(Fixtures.docID).livePages
+
+        XCTAssertEqual(model.displayName, "Test TV")
+        XCTAssertEqual(model.modeTitle, ExternalDisplayMode.presenter.title)
+        XCTAssertTrue(model.hasPages)
+        XCTAssertEqual(model.page, 1)
+        XCTAssertEqual(model.pageCount, pages.count)
+        XCTAssertFalse(model.blank)
+        XCTAssertFalse(model.laserAvailable, "no laser tool registered")
+
+        h.session.page = Fixtures.page2
+        await waitUntil { model.page == 2 }
+        XCTAssertEqual(model.page, 2, "the page count follows the window's page")
+
+        model.toggleBlank()
+        await waitUntil { controller.blank && model.blank }
+        XCTAssertTrue(controller.blank, "Blank Screen goes through present.setMode")
+        XCTAssertTrue(model.blank)
+        model.toggleBlank()
+        await waitUntil { !controller.blank && !model.blank }
+        XCTAssertFalse(controller.blank)
+
+        model.stop()
+        await waitUntil { controller.mode == .mirror }
+        XCTAssertEqual(controller.mode, .mirror, "Stop goes back to mirroring")
+        await waitUntil { model.modeTitle == ExternalDisplayMode.mirror.title }
+        XCTAssertEqual(model.modeTitle, ExternalDisplayMode.mirror.title)
+
+        h.session.document = Fixtures.textDocID
+        h.session.page = nil
+        await waitUntil { !model.hasPages }
+        XCTAssertFalse(model.hasPages, "a text document has no page count")
+        XCTAssertEqual(model.pageCount, 0)
+    }
+
+    func testMirrorSnapshotsWaitWhileThePencilIsDown() async {
+        let source = FakePageSource(page: Self.page())
+        let model = PresentationViewModel(source: source, mode: .mirror)
+        model.mirrorInterval = 600                           // the test drives the ticks
+        await model.update(detailDelay: 0)
+        let entered = source.snapshots
+        XCTAssertGreaterThanOrEqual(entered, 1, "entering Mirror shows the window at once")
+
+        source.current?.visibleRect = Self.scrolled          // the presenter scrolls: the ticks snapshot, not the scroll
+        await model.update(detailDelay: 0)
+        XCTAssertEqual(source.snapshots, entered, "scrolling adds no snapshots of its own")
+
+        source.isInking = true
+        XCTAssertEqual(model.mirrorTick(), 0)
+        XCTAssertEqual(source.snapshots, entered, "no snapshot while the Pencil is down")
+
+        source.isInking = false
+        XCTAssertNotNil(model.mirrorTick())
+        XCTAssertEqual(source.snapshots, entered + 1, "the tick after it lifts catches up")
+        guard case .mirror = model.display else { return XCTFail("expected the mirror, got \(model.display)") }
+
+        model.mode = .fullPage
+        XCTAssertNil(model.mirrorTick(), "the ticks stop once Mirror is off")
+        model.stop()
     }
 }

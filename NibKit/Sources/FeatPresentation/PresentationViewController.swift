@@ -38,10 +38,13 @@ protocol PresentationPageSource: AnyObject {
     func render(doc: DocumentID, page: PageID, region: Rect, scale: Double, hiddenLayers: Set<Int>) async throws -> CGImage
     /// A picture of the main window, at most `maxPixelWidth` pixels wide (nil when there is no window).
     func snapshot(maxPixelWidth: CGFloat) -> CGImage?
+    /// The Pencil (or a drawing finger) is down in the active window (`EditorSession.inking`): mirror snapshots wait,
+    /// so they never cost ink latency.
+    var isInking: Bool { get }
     func stop()
 }
 
-/// One `laser.moved` event (F040). Payload {page, point: [x, y], mode: "dot" | "trail", color?}; no point = lifted.
+/// One `laser.moved` event (F040, `LaserMovedPayload`); no point = lifted.
 struct LaserEvent: Equatable {
     var page: PageID?
     var point: Point?
@@ -55,16 +58,20 @@ struct LaserEvent: Equatable {
         self.color = color
     }
 
-    init(payload: JSONValue?) {
-        let ref = payload?["page"]?.stringValue ?? ""
-        page = ref.isEmpty ? nil : (NodeRef(ref)?.pageID ?? NibID(ref))
-        if let xy = payload?["point"]?.arrayValue, xy.count >= 2, let x = xy[0].doubleValue, let y = xy[1].doubleValue {
-            point = Point(x, y)
+    /// `page` is a page ref ("page:D/P"); a bare page id is accepted too.
+    init(_ payload: LaserMovedPayload) {
+        let ref = payload.page
+        self.init(page: ref.isEmpty ? nil : (NodeRef(ref)?.pageID ?? NibID(ref)), point: payload.point,
+                  trail: payload.mode == "trail", color: payload.color)
+    }
+
+    /// A `laser.moved` event; one whose payload does not decode lifts the laser.
+    init(event: NibEvent) {
+        if let payload = event.decode(LaserMovedPayload.self) {
+            self.init(payload)
         } else {
-            point = nil
+            self.init(page: nil, point: nil)
         }
-        trail = payload?["mode"]?.stringValue == "trail"
-        color = payload?["color"]?.stringValue.flatMap { RGBA(hex: $0) }
     }
 }
 
@@ -127,9 +134,9 @@ enum PresentationDisplay {
 final class PresentationViewModel: ObservableObject {
     /// The viewport has to rest this long before its sharp render is made (scrolling re-renders nothing).
     static let defaultDetailDelay: Double = 0.15
-    /// Mirror snapshots: at most every 100 ms, and never more than a fifth of the main thread.
-    /// ponytail: drawHierarchy on main; move to a render-server snapshot if mirroring ever costs ink latency.
-    static let mirrorInterval: Double = 0.1
+    /// Mirror snapshots: at most every 100 ms, never more than a fifth of the main thread, and none while the Pencil is
+    /// down (`EditorSession.inking`), so drawHierarchy on main never costs ink latency.
+    static let defaultMirrorInterval: Double = 0.1
     static let mirrorCostFactor: Double = 5
     /// Longest edge of any render, in pixels.
     static let maxPixels: Double = 4096
@@ -141,6 +148,8 @@ final class PresentationViewModel: ObservableObject {
     var blank: Bool
     /// How long the viewport rests before its sharp render (tests lengthen it to watch a pending one get cancelled).
     var detailDelay = PresentationViewModel.defaultDetailDelay
+    /// The shortest wait between mirror snapshots (tests lengthen it to drive the ticks themselves).
+    var mirrorInterval = PresentationViewModel.defaultMirrorInterval
     /// The display's size in points and its pixels per point (set by the view controller on layout).
     private(set) var canvasSize = CGSize(width: 1920, height: 1080)
     private(set) var pixelScale: CGFloat = 1
@@ -226,8 +235,12 @@ final class PresentationViewModel: ObservableObject {
         if mode == .mirror {
             lastFrame = nil
             laser.clear()
-            _ = captureMirror()
-            startMirroring()
+            // Entering Mirror shows the window at once; after that only the budgeted ticks snapshot it, so scrolling
+            // and commits never add snapshots of their own.
+            if mirrorTask == nil {
+                _ = captureMirror()
+                startMirroring()
+            }
             return
         }
         stopMirroring()
@@ -352,21 +365,25 @@ final class PresentationViewModel: ObservableObject {
 
     private func startMirroring() {
         guard mirrorTask == nil else { return }
+        let interval = mirrorInterval
         mirrorTask = Task { [weak self] in
-            var wait = PresentationViewModel.mirrorInterval
+            var wait = interval
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
                 guard !Task.isCancelled, let cost = self?.mirrorTick() else { return }
-                wait = max(PresentationViewModel.mirrorInterval, cost * PresentationViewModel.mirrorCostFactor)
+                wait = max(interval, cost * PresentationViewModel.mirrorCostFactor)
             }
         }
     }
 
-    private func mirrorTick() -> Double? {
+    /// One mirror tick: a snapshot and how long it took, 0 while the Pencil is down (the tick after it lifts catches
+    /// up), nil once Mirror is off.
+    func mirrorTick() -> Double? {
         guard mode == .mirror, !blank else {
             mirrorTask = nil
             return nil
         }
+        if source.isInking { return 0 }
         return captureMirror()
     }
 
@@ -459,14 +476,6 @@ final class LaserModel: ObservableObject {
     }
 }
 
-/// DESIGN.md §14.12: a 12 pt dot with a 45 % 12 pt glow; the trail is a 4 pt line fading linearly over 600 ms.
-enum LaserStyle {
-    static let dot: CGFloat = 12
-    static let glow: CGFloat = 12
-    static let glowOpacity: Double = 0.45
-    static let trailWidth: CGFloat = 4
-}
-
 /// The camera as SwiftUI animates it: `PresentationCamera` only scales uniformly and translates, so three numbers
 /// interpolate exactly like the stage's `transform` does in UIKit.
 struct LaserCamera: Equatable {
@@ -490,7 +499,11 @@ struct LaserCamera: Equatable {
     }
 
     func apply(_ p: Point) -> CGPoint {
-        CGPoint(x: CGFloat(p.x) * scale + tx, y: CGFloat(p.y) * scale + ty)
+        apply(p.cg)
+    }
+
+    func apply(_ p: CGPoint) -> CGPoint {
+        CGPoint(x: p.x * scale + tx, y: p.y * scale + ty)
     }
 }
 
@@ -512,9 +525,10 @@ struct LaserPlacement: GeometryEffect {
 }
 
 /// One trail segment between two page points, stroked in display points (the line keeps its 4 pt width at any zoom).
+/// The points are kept as CGPoint (page points): shapes are Sendable.
 struct LaserSegmentShape: Shape {
-    var from: Point
-    var to: Point
+    var from: CGPoint
+    var to: CGPoint
     var camera: LaserCamera
 
     var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>> {
@@ -551,22 +565,25 @@ struct LaserOverlayView: View {
     }
 }
 
+/// DESIGN.md §14.12: a 12 pt dot with a 45 % 12 pt glow.
 struct LaserDot: View {
     let color: Color
 
     var body: some View {
         ZStack {
             Circle()
-                .fill(color.opacity(LaserStyle.glowOpacity))
-                .frame(width: LaserStyle.dot + 2 * LaserStyle.glow, height: LaserStyle.dot + 2 * LaserStyle.glow)
-                .blur(radius: LaserStyle.glow / 2)
+                .fill(color.opacity(NibOpacity.laserGlow))
+                .frame(width: NibMetrics.laserDot + 2 * NibMetrics.laserGlow,
+                       height: NibMetrics.laserDot + 2 * NibMetrics.laserGlow)
+                .blur(radius: NibMetrics.laserGlow / 2)
             Circle()
                 .fill(color)
-                .frame(width: LaserStyle.dot, height: LaserStyle.dot)
+                .frame(width: NibMetrics.laserDot, height: NibMetrics.laserDot)
         }
     }
 }
 
+/// The trail: a 4 pt line fading linearly over 600 ms.
 struct LaserTrailSegment: View {
     let segment: LaserModel.Segment
     let camera: LaserCamera
@@ -574,8 +591,8 @@ struct LaserTrailSegment: View {
     @State private var faded = false
 
     var body: some View {
-        LaserSegmentShape(from: segment.from, to: segment.to, camera: camera)
-            .stroke(Color(uiColor: segment.color), style: StrokeStyle(lineWidth: LaserStyle.trailWidth, lineCap: .round))
+        LaserSegmentShape(from: segment.from.cg, to: segment.to.cg, camera: camera)
+            .stroke(Color(uiColor: segment.color), style: StrokeStyle(lineWidth: NibMetrics.laserTrail, lineCap: .round))
             .opacity(faded ? 0 : 1)
             .onAppear {
                 withAnimation(NibMotion.laserFade) { faded = true } completion: { onFaded() }
@@ -747,7 +764,8 @@ struct BoardExtent {
     }
 }
 
-/// The active window's session, the workspace, the renderer and the main window.
+/// The active window's session (the shell activates the key window's; `session.activated` says when), the workspace,
+/// the renderer and the main window.
 @MainActor
 final class LivePageSource: PresentationPageSource {
     /// Margin around a board's content in Full Page.
@@ -758,7 +776,6 @@ final class LivePageSource: PresentationPageSource {
     private unowned let app: NibApp
     private weak var session: EditorSession?
     private var sessionWatches = Set<AnyCancellable>()
-    private var watches = Set<AnyCancellable>()
     private var subscriptions: [EventSubscription] = []
     private var version = 0
     /// The current page's position among the live pages (sorting them is O(n log n), and `current` runs on every
@@ -770,15 +787,6 @@ final class LivePageSource: PresentationPageSource {
         self.app = app
         subscriptions.append(app.bus.observeCommits { [weak self] changeset in self?.committed(changeset) })
         subscriptions.append(app.events.subscribe { [weak self] event in self?.received(event) })
-        // The shell activates a window's session when the window becomes active, or (Split View, Stage Manager: both
-        // scenes stay active) when the other window becomes key; re-read then.
-        let center = NotificationCenter.default
-        center.publisher(for: UIScene.didActivateNotification)
-            .sink { [weak self] _ in self?.onChange?() }
-            .store(in: &watches)
-        center.publisher(for: UIWindow.didBecomeKeyNotification)
-            .sink { [weak self] _ in self?.onChange?() }
-            .store(in: &watches)
     }
 
     var current: PresentedPage? {
@@ -816,10 +824,11 @@ final class LivePageSource: PresentationPageSource {
         return image.cgImage
     }
 
+    var isInking: Bool { app.services.sessions.active?.inking.isInking ?? false }
+
     func stop() {
         subscriptions.forEach { $0.cancel() }
         subscriptions.removeAll()
-        watches.removeAll()
         sessionWatches.removeAll()
         onChange = nil
         onLaser = nil
@@ -868,7 +877,7 @@ final class LivePageSource: PresentationPageSource {
     private func received(_ event: NibEvent) {
         switch event.type {
         case NibEventType.laserMoved:
-            onLaser?(LaserEvent(payload: event.payload))
+            onLaser?(LaserEvent(event: event))
         case NibEventType.docClosed:
             // A document merges from disk when it opens again: its cached numbers may be stale.
             if let doc = event.doc {
@@ -876,7 +885,8 @@ final class LivePageSource: PresentationPageSource {
                 if board?.doc == doc { board = nil }
             }
             onChange?()
-        case NibEventType.sessionDocument, NibEventType.pageChanged:
+        case NibEventType.sessionActivated, NibEventType.sessionDocument, NibEventType.pageChanged:
+            // `session.activated`: the shell made another window active (it became key); follow it.
             onChange?()
         default:
             break
