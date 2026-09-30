@@ -252,9 +252,8 @@ final class NibSyncTests: XCTestCase {
         h.app.services.library = library
         h.app.services.packages.set(pkg, for: Fixtures.docID)
         _ = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
-        guard let watcher = h.app.services.get(FolderWatcher.serviceKey, as: FolderWatcher.self) else {
-            throw XCTSkip("the sync feature did not install its watcher")
-        }
+        let watcher = try XCTUnwrap(h.app.services.get(FolderWatcher.serviceKey, as: FolderWatcher.self),
+                                    "the sync feature did not install its watcher")
         addTeardownBlock { await watcher.stop() }
         return Device(harness: h, persistence: persistence, library: library, watcher: watcher)
     }
