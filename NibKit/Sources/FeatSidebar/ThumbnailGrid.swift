@@ -20,15 +20,15 @@ enum ThumbnailLayoutMode: Equatable {
     /// iPhone (a sheet): two columns filling the width (160 pt on a 393 pt phone).
     case compact
 
-    /// From the chrome's `PanelContext.presentation` (contracts-v2 G16): `.window` is the full-window grid. A chrome that
-    /// passes no presentation gets the grid only when the panel is at least twice the sidebar's width.
-    static func resolve(presentation: PanelPresentation?, compact: Bool, width: CGFloat) -> ThumbnailLayoutMode {
-        if compact || presentation == .sheet { return .compact }
-        switch presentation {
-        case .window?, .fullScreen?: return .grid
-        case .sidebar?, .floating?, .libraryTab?: return .column
-        case .sheet?: return .compact
-        case nil: return width >= 2 * NibMetrics.navigatorWidth ? .grid : .column
+    /// From the chrome's `PanelContext.presentation` (contracts-v2 G16), never from the width the panel is given:
+    /// `.window` (and `.fullScreen`) is the full-window grid, a sheet or a compact width the two-column phone layout.
+    /// A host that says nothing shows the panel where it is registered, a sidebar tab: one column.
+    static func resolve(presentation: PanelPresentation?, compact: Bool) -> ThumbnailLayoutMode {
+        if compact { return .compact }
+        switch presentation ?? .sidebar {
+        case .window, .fullScreen: return .grid
+        case .sheet: return .compact
+        case .sidebar, .floating, .libraryTab: return .column
         }
     }
 }
@@ -78,6 +78,13 @@ struct ThumbnailLayoutMetrics: Equatable {
         let w = min(thumbnailWidth, bounds.width)
         let h = w / CGFloat(max(aspect, 0.05))
         return CGRect(x: bounds.midX - w / 2, y: bounds.minY + ThumbnailCellView.topPadding, width: w, height: h)
+    }
+
+    /// The lifted thumbnail's outline: the page grown by the thumbnail droplet's water envelope
+    /// (`DropletStyle.thumbnail.envelope`, 3 pt), concentric with it at `NibRadius.thumbnailEnvelope` (4 + 3).
+    func liftedPath(in bounds: CGRect, aspect: Double) -> (frame: CGRect, cornerRadius: CGFloat) {
+        let spread = DropletStyle.thumbnail.envelope
+        return (thumbnailFrame(in: bounds, aspect: aspect).insetBy(dx: -spread, dy: -spread), NibRadius.thumbnailEnvelope)
     }
 }
 
@@ -258,6 +265,8 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         var selection: Set<PageID> = []
         var current: PageID?
         var canEdit = false
+        /// `PagesPanelModel.menuRevision`: the menu entries VoiceOver's actions list.
+        var menus: UInt64 = 0
         var loaded = false
     }
 
@@ -277,7 +286,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
     private var rows: [PageRow] = []
     private var rowByID: [String: PageRow] = [:]
     private var showsAdd = false
-    private var metrics = ThumbnailLayoutMetrics(width: NibMetrics.navigatorWidth, mode: .column)
+    private(set) var metrics = ThumbnailLayoutMetrics(width: NibMetrics.navigatorWidth, mode: .column)
     private var shown = Shown()
     private var needsUpdate = false
     private let swipePan = UIPanGestureRecognizer()
@@ -360,15 +369,15 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         super.viewDidLayoutSubviews()
         guard let collectionView = collectionView else { return }
         let width = collectionView.bounds.width
-        let next = ThumbnailLayoutMetrics(width: width, mode: layoutMode(width: width, traits: traitCollection))
+        let next = ThumbnailLayoutMetrics(width: width, mode: layoutMode(traits: traitCollection))
         guard next != metrics else { return }
         metrics = next
         // Cells take the new thumbnail width after this layout pass, not during it.
         Task { @MainActor [weak self] in self?.reconfigure(visibleOnly: false) }
     }
 
-    private func layoutMode(width: CGFloat, traits: UITraitCollection) -> ThumbnailLayoutMode {
-        ThumbnailLayoutMode.resolve(presentation: presentation, compact: traits.horizontalSizeClass == .compact, width: width)
+    private func layoutMode(traits: UITraitCollection) -> ThumbnailLayoutMode {
+        ThumbnailLayoutMode.resolve(presentation: presentation, compact: traits.horizontalSizeClass == .compact)
     }
 
     // MARK: Updates
@@ -397,7 +406,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         }
         showsAdd = nextAdd
         let state = Shown(selecting: model.isSelecting, selection: model.selection, current: model.current,
-                          canEdit: model.canEdit, loaded: true)
+                          canEdit: model.canEdit, menus: model.menuRevision, loaded: true)
         let firstLoad = !shown.loaded
 
         var snapshot: NSDiffableDataSourceSnapshot<Section, Entry>
@@ -414,7 +423,8 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         }
         for page in model.takeChangedThumbnails() { refresh.insert(.page(page.raw)) }
         let everyThumbnail = state.selecting != shown.selecting || state.canEdit != shown.canEdit
-            || (ThumbnailGridController.assistiveTechRunning && (state.selection != shown.selection || identityChanged))
+            || (ThumbnailGridController.assistiveTechRunning
+                && (state.selection != shown.selection || identityChanged || state.menus != shown.menus))
         if everyThumbnail {
             refresh.formUnion(snapshot.itemIdentifiers.filter { $0 != .add })
         } else {
@@ -489,7 +499,7 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         let sections = dataSource?.snapshot().sectionIdentifiers ?? []
         let kind = sections.indices.contains(index) ? sections[index] : .pages
         let width = environment.container.effectiveContentSize.width
-        let m = ThumbnailLayoutMetrics(width: width, mode: layoutMode(width: width, traits: environment.traitCollection))
+        let m = ThumbnailLayoutMetrics(width: width, mode: layoutMode(traits: environment.traitCollection))
         switch kind {
         case .add:
             let size = NSCollectionLayoutSize(widthDimension: .fractionalWidth(1),
@@ -698,14 +708,13 @@ final class ThumbnailGridController: UIViewController, UICollectionViewDelegate,
         return UITargetedPreview(view: cell, parameters: parameters)
     }
 
-    /// The lifted thumbnail: the page plus a 3 pt Clear water envelope, concentric (radius 4 + 3 = 7).
+    /// The lifted thumbnail: the page in the thumbnail droplet's Clear water envelope (`liftedPath`).
     private func envelope(_ indexPath: IndexPath) -> UIDragPreviewParameters? {
         guard let cell = collectionView?.cellForItem(at: indexPath), let page = pageID(at: indexPath),
               let row = rowByID[page.raw] else { return nil }
-        let spread = NibRadius.thumbnailEnvelope - NibRadius.thumbnail
-        let frame = metrics.thumbnailFrame(in: cell.bounds, aspect: row.aspect).insetBy(dx: -spread, dy: -spread)
+        let lifted = metrics.liftedPath(in: cell.bounds, aspect: row.aspect)
         let parameters = UIDragPreviewParameters()
-        parameters.visiblePath = UIBezierPath(roundedRect: frame, cornerRadius: NibRadius.thumbnailEnvelope)
+        parameters.visiblePath = UIBezierPath(roundedRect: lifted.frame, cornerRadius: lifted.cornerRadius)
         parameters.backgroundColor = NibUIColor.clearBodyOnPaper
         return parameters
     }

@@ -181,6 +181,9 @@ final class PagesPanelModel: ObservableObject {
     @Published private(set) var canEdit = false
     /// A destructive batch action waiting for the user to confirm it (the selection bar asks).
     @Published private(set) var pendingTrash: PendingTrash?
+    /// Counts changes of the registries the menus read (menu entries, panels, commands; contracts-v2 G11), so the
+    /// bottom row and the VoiceOver actions show an entry a plugin adds or removes while the tab is open.
+    @Published private(set) var menuRevision: UInt64 = 0
 
     /// A destructive action on several pages, waiting for confirmation.
     struct PendingTrash: Identifiable {
@@ -201,6 +204,7 @@ final class PagesPanelModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var commits: EventSubscription?
     private var scheduled = false
+    private var registriesChangeScheduled = false
 
     init(app: NibApp, session: EditorSession?) {
         self.app = app
@@ -212,6 +216,14 @@ final class PagesPanelModel: ObservableObject {
         NotificationCenter.default.publisher(for: UnseenPages.didChange)
             .sink { [weak self] _ in self?.schedule() }
             .store(in: &cancellables)
+        // A registry posts on the thread that changed it.
+        let registries: [AnyObject] = [app.ui.menus, app.ui.panels, app.commands]
+        for registry in registries {
+            NotificationCenter.default.publisher(for: .nibRegistryDidChange, object: registry)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.registriesChanged() }
+                .store(in: &cancellables)
+        }
         commits = app.bus.observeCommits { [weak self] changeset in self?.handle(changeset) }
         refreshNow()
     }
@@ -276,6 +288,17 @@ final class PagesPanelModel: ObservableObject {
         if editable != canEdit { canEdit = editable }
         let present = Set(order)
         if !selection.isSubset(of: present) { selection = selection.intersection(present) }
+    }
+
+    /// A plugin registering its menu entries (and commands) posts once per entry: one revision for the burst.
+    private func registriesChanged() {
+        guard !registriesChangeScheduled else { return }
+        registriesChangeScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            self.registriesChangeScheduled = false
+            self.menuRevision &+= 1
+        }
     }
 
     /// Head changes (pages, bookmarks, order) rebuild the rows; item changes only mark their thumbnails out of date.
@@ -727,8 +750,10 @@ struct PagesSelectionBar: View {
                 .accessibilityHidden(true)
             HStack(spacing: 0) {
                 ForEach(quick, id: \.id) { item in
+                    // The entry's shortcut is display only: the grid's own key command runs it.
                     NibIconButton(PagesSelectionBar.symbol(item) ?? .more, label: item.resolvedTitle(for: context),
-                                  size: .panel) { model.perform(item, context) }
+                                  size: .panel, isOn: item.isChecked?(context) ?? false) { model.perform(item, context) }
+                        .nibShortcutHint(SidebarShortcut.keyboard(item.shortcut))
                         .frame(maxWidth: .infinity)
                 }
                 if !more.isEmpty {
@@ -771,25 +796,35 @@ struct PagesSelectionBar: View {
                 }
             }
         } label: {
-            Image(nib: .more)
-                .font(NibFont.glyph(.panel))
-                .foregroundStyle(NibColor.label)
-                .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-                .contentShape(Rectangle())
+            SelectionMoreLabel()
         }
         .hoverEffect(.highlight)
+        .nibTooltip(String(localized: "More Actions"))
         .accessibilityLabel(String(localized: "More Actions"))
     }
 
+    /// One entry of the More menu; an entry with `isChecked` (contracts-v2 G16) shows its checkmark.
+    @ViewBuilder
     private func button(_ item: MenuItemDescriptor, _ context: MenuContext) -> some View {
-        Button(role: item.destructive ? .destructive : nil) {
-            model.perform(item, context)
-        } label: {
-            Label {
-                Text(item.resolvedTitle(for: context))
-            } icon: {
-                if let symbol = PagesSelectionBar.symbol(item) { Image(nib: symbol) }
+        let model = self.model
+        if let isOn = item.isChecked?(context) {
+            Toggle(isOn: Binding(get: { isOn }, set: { _ in model.perform(item, context) })) {
+                PagesSelectionBar.label(item, context)
             }
+        } else {
+            Button(role: item.destructive ? .destructive : nil) {
+                model.perform(item, context)
+            } label: {
+                PagesSelectionBar.label(item, context)
+            }
+        }
+    }
+
+    private static func label(_ item: MenuItemDescriptor, _ context: MenuContext) -> some View {
+        Label {
+            Text(item.resolvedTitle(for: context))
+        } icon: {
+            if let symbol = PagesSelectionBar.symbol(item) { Image(nib: symbol) }
         }
     }
 
@@ -800,6 +835,52 @@ struct PagesSelectionBar: View {
     private var trashShown: Binding<Bool> {
         let model = self.model
         return Binding(get: { model.pendingTrash != nil }, set: { shown in if !shown { model.cancelPendingTrash() } })
+    }
+}
+
+/// The bottom row's More button: the panel glyph in a 44 pt target that dims with the row like the `NibIconButton`s
+/// beside it (a `Menu` label is not a NibDesign button, so it does not dim itself).
+struct SelectionMoreLabel: View {
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        Image(nib: .more)
+            .font(NibFont.glyph(.panel))
+            .foregroundStyle(NibColor.label)
+            .opacity(isEnabled ? 1 : NibOpacity.disabled)
+            .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+            .contentShape(Rectangle())
+    }
+}
+
+/// A menu entry's `shortcut` (contracts-v2 G16, display only) as the SwiftUI shortcut `nibShortcutHint` shows.
+enum SidebarShortcut {
+    static func keyboard(_ shortcut: KeyShortcut?) -> KeyboardShortcut? {
+        guard let shortcut = shortcut, let key = key(shortcut.key) else { return nil }
+        var modifiers: EventModifiers = []
+        if shortcut.modifiers.contains(.command) { modifiers.insert(.command) }
+        if shortcut.modifiers.contains(.shift) { modifiers.insert(.shift) }
+        if shortcut.modifiers.contains(.option) { modifiers.insert(.option) }
+        if shortcut.modifiers.contains(.control) { modifiers.insert(.control) }
+        return KeyboardShortcut(key, modifiers: modifiers)
+    }
+
+    /// `KeyShortcut.key`: one character, or a named key.
+    private static func key(_ name: String) -> KeyEquivalent? {
+        switch name {
+        case "up": return .upArrow
+        case "down": return .downArrow
+        case "left": return .leftArrow
+        case "right": return .rightArrow
+        case "escape": return .escape
+        case "delete": return .delete
+        case "tab": return .tab
+        case "return": return .return
+        case "space": return .space
+        default:
+            guard name.count == 1, let character = name.first else { return nil }
+            return KeyEquivalent(character)
+        }
     }
 }
 

@@ -124,14 +124,44 @@ final class FeatSidebarTests: XCTestCase {
 
     // MARK: Layout
 
+    /// The chrome's `PanelContext.presentation` alone picks the layout (contracts-v2 G16), whatever width it gives.
     func testWindowPresentationIsTheFullWindowGrid() {
-        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .window, compact: false, width: 300), .grid)
-        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .sidebar, compact: false, width: 1194), .column)
-        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .sheet, compact: false, width: 700), .compact)
-        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .window, compact: true, width: 393), .compact)
-        // A chrome that passes no presentation: the panel's width decides.
-        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: nil, compact: false, width: NibMetrics.navigatorWidth), .column)
-        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: nil, compact: false, width: 1194), .grid)
+        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .window, compact: false), .grid)
+        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .fullScreen, compact: false), .grid)
+        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .sidebar, compact: false), .column)
+        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .floating, compact: false), .column)
+        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .sheet, compact: false), .compact)
+        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: .window, compact: true), .compact)
+        // A host that says nothing shows the tab where it is registered: the sidebar.
+        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: nil, compact: false), .column)
+        XCTAssertEqual(ThumbnailLayoutMode.resolve(presentation: nil, compact: true), .compact)
+
+        let h = harness()
+        let grid = ThumbnailGridController(model: PagesPanelModel(app: h.app, session: h.session))
+        grid.traitOverrides.horizontalSizeClass = .regular   // an iPad window, whatever the test device
+        grid.presentation = .window
+        grid.loadViewIfNeeded()
+        grid.view.frame = CGRect(x: 0, y: 0, width: NibMetrics.navigatorWidth, height: 800)
+        grid.view.setNeedsLayout()
+        grid.view.layoutIfNeeded()
+        XCTAssertEqual(grid.metrics.mode, .grid, "a window-mode panel is the grid even at the sidebar's width")
+        XCTAssertTrue(grid.metrics.isFullWindow)
+        grid.presentation = .sidebar
+        grid.view.setNeedsLayout()
+        grid.view.layoutIfNeeded()
+        XCTAssertEqual(grid.metrics.mode, .column)
+    }
+
+    /// A lifted thumbnail is the page in the thumbnail droplet's 3 pt water envelope, concentric with it.
+    func testTheLiftedThumbnailTakesTheThumbnailDropletsEnvelope() {
+        let sidebar = ThumbnailLayoutMetrics(width: NibMetrics.navigatorWidth, mode: .column)
+        let bounds = CGRect(x: 0, y: 0, width: 208, height: 300)
+        let page = sidebar.thumbnailFrame(in: bounds, aspect: PageRows.defaultAspect)
+        let lifted = sidebar.liftedPath(in: bounds, aspect: PageRows.defaultAspect)
+        XCTAssertEqual(DropletStyle.thumbnail.envelope, 3)
+        XCTAssertEqual(lifted.frame, page.insetBy(dx: -DropletStyle.thumbnail.envelope, dy: -DropletStyle.thumbnail.envelope))
+        XCTAssertEqual(lifted.cornerRadius, NibRadius.thumbnailEnvelope)
+        XCTAssertEqual(lifted.cornerRadius, NibRadius.thumbnail + DropletStyle.thumbnail.envelope, "concentric")
     }
 
     func testLayoutIsOneColumnInTheSidebarAGridInWindowModeAndTwoColumnsOnIPhone() {
@@ -974,6 +1004,46 @@ final class FeatSidebarTests: XCTestCase {
         XCTAssertEqual(groups.last?.items.map { $0.id }, [SidebarMenus.pageMenuID("trash")])
         let rotate = groups.first { $0.title == String(localized: "Rotate") }
         XCTAssertEqual(rotate?.items.count, 2)
+    }
+
+    /// The selection's entries show their shortcuts (display only, contracts-v2 G16); the grid's keys run them.
+    func testSelectionEntriesShowTheirShortcuts() throws {
+        let h = harness()
+        let copy = try XCTUnwrap(h.app.ui.menus.get(SidebarMenus.selectionMenuID("copy")))
+        XCTAssertEqual(SidebarShortcut.keyboard(copy.shortcut), KeyboardShortcut("c", modifiers: .command))
+        let trash = try XCTUnwrap(h.app.ui.menus.get(SidebarMenus.selectionMenuID("trash")))
+        XCTAssertEqual(SidebarShortcut.keyboard(trash.shortcut), KeyboardShortcut(.delete, modifiers: []))
+        XCTAssertEqual(SidebarShortcut.keyboard(KeyShortcut("p", [.option, .command, .shift, .control])),
+                       KeyboardShortcut("p", modifiers: [.option, .command, .shift, .control]))
+        XCTAssertEqual(SidebarShortcut.keyboard(KeyShortcut("escape")), KeyboardShortcut(.escape, modifiers: []))
+        XCTAssertNil(SidebarShortcut.keyboard(nil))
+        XCTAssertNil(SidebarShortcut.keyboard(KeyShortcut("pageDown")), "not a key the contract names")
+    }
+
+    /// An entry a plugin registers while the tab is open reaches the bottom row (contracts-v2 G11 registry signals),
+    /// once per burst; a checked entry renders with its checkmark.
+    func testEntriesRegisteredWhileTheTabIsOpenReachTheSelection() async throws {
+        let h = harness()
+        let model = PagesPanelModel(app: h.app, session: h.session)
+        model.setSelecting(true)
+        model.setSelection([p1])
+        let before = model.menuRevision
+        for key in ["a", "b"] {
+            var item = MenuItemDescriptor(id: "plugin.pages." + key, title: "Plugin " + key, location: .sidebarSelection,
+                                          order: 500, owner: "plugin.test", command: SidebarIDs.pageCopy)
+            item.isChecked = { _ in key == "a" }
+            h.app.ui.menus.register(item)
+        }
+        try await waitUntil { model.menuRevision != before }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(model.menuRevision, before + 1, "one revision for the burst")
+        let ids = h.app.ui.menuItems(.sidebarSelection, model.selectionMenuContext()).map { $0.id }
+        XCTAssertTrue(ids.contains("plugin.pages.a") && ids.contains("plugin.pages.b"))
+        XCTAssertNotNil(NibSnapshot.image(PagesSelectionBar(model: model), size: CGSize(width: NibMetrics.navigatorWidth, height: 60)))
+
+        let revision = model.menuRevision
+        h.app.commands.unregister(id: SidebarIDs.exportPresent)
+        try await waitUntil { model.menuRevision != revision }
     }
 }
 
