@@ -79,6 +79,8 @@ struct FolderDraft: Equatable {
 enum FolderColour {
     static let presets = NibFolderColor.allCases
     static let standard = NibFolderColor.cobalt
+    /// The presets as NibDesign swatches (id = the colour's raw value).
+    static let swatches = presets.map { NibSwatch(folder: $0) }
 
     static func rgba(_ colour: NibFolderColor) -> RGBA { rgba(hex: colour.ink.hex) }
 
@@ -103,7 +105,7 @@ enum FolderColour {
         return RGBA(byte(r), byte(g), byte(b), byte(a))
     }
 
-    static func name(_ value: RGBA) -> String { preset(value)?.ink.name ?? FolderDraft.hex(value) }
+    static func name(_ value: RGBA) -> String { preset(value)?.name ?? FolderDraft.hex(value) }
 }
 
 struct FolderIconChoice: Hashable {
@@ -143,6 +145,12 @@ enum FolderIcons {
         name.flatMap { NibSymbol(systemName: $0) } ?? .folderFill
     }
 
+    /// A stored icon as NibDesign's folder glyph: one emoji as itself, anything else as a symbol.
+    static func glyph(_ icon: String?) -> NibFolderGlyph {
+        if let icon, FolderDraft.isSingleEmoji(icon) { return .emoji(icon) }
+        return .symbol(symbol(icon))
+    }
+
     static func label(_ icon: String?) -> String {
         guard let icon else { return String(localized: "Folder") }
         if FolderDraft.isSingleEmoji(icon) { return icon }
@@ -167,11 +175,16 @@ struct FolderStyleSheet: View {
 
         var title: String { isCreate ? String(localized: "New Folder") : String(localized: "Customise Folder") }
 
-        var panelID: String {
-            switch self {
-            case .create(let parent): return parent.map { OrganizePanel.newFolder + "." + $0.raw } ?? OrganizePanel.newFolder
-            case .edit(let folder): return OrganizePanel.folderStyle + "." + folder.raw
-            }
+        /// The mode a sheet panel opens in. `folder` in the panel's params (a `folder:F` ref or a bare id) is where a
+        /// new folder goes (`organize.folder.new`) or the folder to customise (`organize.folder.style`). A folder that
+        /// is unknown or in the Trash opens New Folder at the library root.
+        @MainActor
+        static func resolve(panel: String, params: JSONValue, library: LibraryService?) -> Mode {
+            let folder = Organize.folder(params["folder"])
+                .flatMap { library?.node($0) }
+                .flatMap { $0.kind == .folder && $0.trashedAt == nil ? $0.id : nil }
+            if panel == OrganizePanel.folderStyle, let folder { return .edit(folder) }
+            return .create(parent: panel == OrganizePanel.newFolder ? folder : nil)
         }
     }
 
@@ -181,7 +194,7 @@ struct FolderStyleSheet: View {
         var title: String { self == .symbol ? String(localized: "Symbol") : String(localized: "Emoji") }
     }
 
-    let app: NibApp
+    let window: OrganizeWindow
     let mode: Mode
     let onDone: () -> Void
     private let original: FolderDraft
@@ -192,12 +205,13 @@ struct FolderStyleSheet: View {
     @State private var isSaving = false
     @State private var choosingLocation = false
     @FocusState private var nameFocused: Bool
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
-    init(app: NibApp, mode: Mode, onDone: @escaping () -> Void) {
-        self.app = app
+    init(window: OrganizeWindow, mode: Mode, onDone: @escaping () -> Void) {
+        self.window = window
         self.mode = mode
         self.onDone = onDone
-        let start = FolderStyleSheet.initialDraft(app, mode)
+        let start = FolderStyleSheet.initialDraft(window.app, mode)
         let emoji = start.icon.map { FolderDraft.isSingleEmoji($0) } ?? false
         original = start
         _draft = State(initialValue: start)
@@ -206,21 +220,23 @@ struct FolderStyleSheet: View {
         _emojiText = State(initialValue: emoji ? (start.icon ?? "") : "")
     }
 
-    /// Registers (once) the sheet panel for `mode` and returns its id, so a menu entry or a key command can open it
-    /// with `panel.open {id}` (the command carries no arguments, so the target folder is part of the id).
-    /// ponytail: one panel per customised folder; a `panel.open` argument would make this a single descriptor.
-    static func panel(_ app: NibApp, _ mode: Mode) -> String {
-        if app.ui.panels.get(mode.panelID) == nil { register(app, mode) }
-        return mode.panelID
-    }
-
-    /// Registers the sheet panel for `mode` (at launch for the root New Folder sheet, which reads no registry).
-    static func register(_ app: NibApp, _ mode: Mode) {
-        app.ui.panels.register(PanelDescriptor(
-            id: mode.panelID, title: mode.title, icon: NibSymbol.folder.name, placement: .sheet, order: 0,
-            owner: FeatLibraryOrganizeFeature.id) { ctx in
-                AnyView(FolderStyleSheet(app: ctx.app, mode: mode, onDone: { ctx.dismiss() }))
-            })
+    /// Registers the two sheet panels. The folder comes in `PanelContext.params` (contracts-v2 G16), so menus, key
+    /// commands, plugins and the AI open them with `panel.open {id, folder?}`. The sheet draws its own header.
+    static func register(_ app: NibApp) {
+        let panels: [(id: String, title: String)] = [
+            (OrganizePanel.newFolder, String(localized: "New Folder")),
+            (OrganizePanel.folderStyle, String(localized: "Customise Folder")),
+        ]
+        for panel in panels {
+            var descriptor = PanelDescriptor(
+                id: panel.id, title: panel.title, icon: NibSymbol.folder.name, placement: .sheet, order: 0,
+                owner: FeatLibraryOrganizeFeature.id) { ctx in
+                    let mode = Mode.resolve(panel: panel.id, params: ctx.params, library: ctx.app.services.library)
+                    return AnyView(FolderStyleSheet(window: OrganizeWindow(ctx), mode: mode, onDone: { ctx.dismiss() }))
+                }
+            descriptor.providesHeader = true
+            app.ui.panels.register(descriptor)
+        }
     }
 
     static func initialDraft(_ app: NibApp, _ mode: Mode) -> FolderDraft {
@@ -238,26 +254,27 @@ struct FolderStyleSheet: View {
 
     /// Runs the commands for a finished sheet as one undo group. Returns false when a command failed (the shell
     /// shows the error).
-    static func commit(_ app: NibApp, mode: Mode, draft: FolderDraft, original: FolderDraft) async -> Bool {
+    static func commit(_ window: OrganizeWindow, mode: Mode, draft: FolderDraft, original: FolderDraft) async -> Bool {
         let group = NibID.make().raw
         switch mode {
         case .create:
             let id = NibID.make()
-            guard let result = await Organize.run(app, "folder.create", draft.createParams(id: id), group: group) else {
+            guard let result = await Organize.run(window, CommandIDs.folderCreate, draft.createParams(id: id),
+                                                  group: group) else {
                 return false
             }
             guard draft.favorite else { return true }
             let ref = result["ref"]?.stringValue ?? NodeRef.folder(id).description
             let star: JSONValue = ["folder": .string(ref), "favorite": true]
-            return await Organize.run(app, "folder.setStyle", star, group: group) != nil
+            return await Organize.run(window, CommandIDs.folderSetStyle, star, group: group) != nil
         case .edit(let folder):
             if draft.trimmedTitle != original.trimmedTitle {
                 let rename: JSONValue = ["ref": .string(NodeRef.folder(folder).description),
                                          "title": .string(draft.trimmedTitle)]
-                guard await Organize.run(app, "library.rename", rename, group: group) != nil else { return false }
+                guard await Organize.run(window, CommandIDs.libraryRename, rename, group: group) != nil else { return false }
             }
             guard let style = draft.styleParams(folder: folder, since: original) else { return true }
-            return await Organize.run(app, "folder.setStyle", style, group: group) != nil
+            return await Organize.run(window, CommandIDs.folderSetStyle, style, group: group) != nil
         }
     }
 
@@ -312,7 +329,7 @@ struct FolderStyleSheet: View {
         .nibSheet(isPresented: $choosingLocation) {
             DestinationPickerSheet(
                 title: String(localized: "Choose Location"), actionTitle: String(localized: "Choose Folder"),
-                rows: DestinationPickerSheet.folderRows(app.services.library?.allNodes() ?? []),
+                rows: DestinationPickerSheet.folderRows(window.app.services.library?.allNodes() ?? []),
                 initial: draft.parent.map { NodeRef.folder($0).description } ?? DestinationPickerSheet.root,
                 onCancel: { choosingLocation = false },
                 onChoose: { key in
@@ -326,7 +343,7 @@ struct FolderStyleSheet: View {
 
     private var preview: some View {
         VStack(spacing: NibSpacing.s) {
-            FolderGlyph(style: FolderStyle(color: draft.color, icon: draft.icon), size: 56)
+            NibFolderGlyphView(folder: FolderStyle(color: draft.color, icon: draft.icon), size: 56)
             Text(draft.trimmedTitle.isEmpty ? String(localized: "Untitled Folder") : draft.trimmedTitle)
                 .font(NibFont.headline)
                 .foregroundStyle(NibColor.label)
@@ -365,13 +382,9 @@ struct FolderStyleSheet: View {
     }
 
     @ViewBuilder private var colourSection: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: NibMetrics.hitTarget), spacing: NibSpacing.xs)],
-                  alignment: .leading, spacing: NibSpacing.xs) {
-            ForEach(FolderColour.presets, id: \.self) { preset in
-                NibPenSwatch(NibSwatch(ink: preset.ink), isSelected: FolderColour.preset(draft.color) == preset,
-                             size: .compact) { setColour(FolderColour.rgba(preset)) }
-            }
-        }
+        // The eight folder inks: one row on regular width, two rows of four on compact width.
+        NibSwatchGrid(swatches: FolderColour.swatches, selection: presetSelection,
+                      columns: sizeClass == .compact ? 4 : FolderColour.presets.count, size: .compact)
         VStack(alignment: .leading, spacing: NibSpacing.xxs) {
             HStack(spacing: NibSpacing.m) {
                 Text(String(localized: "Hex"))
@@ -400,6 +413,14 @@ struct FolderStyleSheet: View {
         ColorPicker(String(localized: "Custom colour"), selection: customColour, supportsOpacity: false)
             .font(NibFont.body)
             .frame(minHeight: NibMetrics.hitTarget)
+    }
+
+    /// The preset swatch matching the colour (by id); nil for a custom colour.
+    private var presetSelection: Binding<String?> {
+        Binding(get: { FolderColour.preset(draft.color)?.rawValue },
+                set: { id in
+                    if let preset = id.flatMap(NibFolderColor.init(rawValue:)) { setColour(FolderColour.rgba(preset)) }
+                })
     }
 
     private var customColour: Binding<Color> {
@@ -481,12 +502,12 @@ struct FolderStyleSheet: View {
     }
 
     private var locationRow: some View {
-        let parent = draft.parent.flatMap { app.services.library?.node($0) }
+        let parent = draft.parent.flatMap { window.app.services.library?.node($0) }
         let title = parent?.title ?? String(localized: "Library")
         return Button { choosingLocation = true } label: {
             HStack(spacing: NibSpacing.m) {
                 if let parent {
-                    FolderGlyph(style: parent.style, size: 20)
+                    NibFolderGlyphView(folder: parent.style, size: 20)
                 } else {
                     Image(nib: .library)
                         .font(NibFont.body)
@@ -519,14 +540,14 @@ struct FolderStyleSheet: View {
         let draft = self.draft
         let original = self.original
         let mode = self.mode
-        let app = self.app
+        let window = self.window
         Task {
-            let ok = await FolderStyleSheet.commit(app, mode: mode, draft: draft, original: original)
+            let ok = await FolderStyleSheet.commit(window, mode: mode, draft: draft, original: original)
             isSaving = false
             guard ok else { return }
             NibHaptics.play(.success)
-            Organize.announce(mode.isCreate ? String(localized: "Created \(draft.trimmedTitle).")
-                                            : String(localized: "Saved \(draft.trimmedTitle)."))
+            window.toast(mode.isCreate ? String(localized: "Created \(draft.trimmedTitle).")
+                                       : String(localized: "Saved \(draft.trimmedTitle)."))
             onDone()
         }
     }
@@ -635,7 +656,7 @@ struct DestinationPickerSheet: View {
                 Group {
                     switch row.glyph {
                     case .folder(let style):
-                        FolderGlyph(style: style, size: 22)
+                        NibFolderGlyphView(folder: style, size: 22)
                     case .symbol(let symbol):
                         Image(nib: symbol)
                             .font(NibFont.glyph(.sidebar))

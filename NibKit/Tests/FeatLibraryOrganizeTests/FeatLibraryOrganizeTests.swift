@@ -1,5 +1,8 @@
 import XCTest
+import SwiftUI
+import UIKit
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatLibraryOrganize
 
@@ -29,12 +32,27 @@ private final class Recorder {
         let command: String
         let params: JSONValue
         let group: String
+        let session: NibID?
     }
 
     var calls: [Call] = []
     var commands: [String] { calls.map { $0.command } }
     var groups: Set<String> { Set(calls.map { $0.group }) }
     func params(_ command: String) -> [JSONValue] { calls.filter { $0.command == command }.map { $0.params } }
+}
+
+/// A window's floating host (the library container F019 installs), recording the toasts posted to it.
+@MainActor
+private final class ToastHost: FloatingHosting {
+    var toasts: [String] = []
+
+    func present(_ id: String, content: AnyView) {}
+    func dismiss(_ id: String) {}
+    func isPresenting(_ id: String) -> Bool { false }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { false }
+    func removeAnchor(_ id: String) {}
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { nil }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) { toasts.append(message) }
 }
 
 @MainActor
@@ -44,7 +62,8 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         for id in ids {
             h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "Test stand-in.", effect: .library,
                                                       target: .library)) { params, ctx in
-                recorder.calls.append(Recorder.Call(command: id, params: params, group: ctx.group))
+                recorder.calls.append(Recorder.Call(command: id, params: params, group: ctx.group,
+                                                    session: ctx.session?.id))
                 return result
             }
         }
@@ -56,11 +75,25 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         XCTAssertEqual(problems, [])
     }
 
-    func testRegistersTabsSheetMenusShortcutAndSetting() {
+    /// Polls (on the main actor) until `condition` holds or about a second has passed.
+    private func eventually(_ condition: () -> Bool) async {
+        var tries = 0
+        while !condition(), tries < 200 {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+            tries += 1
+        }
+    }
+
+    func testRegistersTabsSheetMenusShortcutAndSetting() throws {
         let h = Harness(features: [FeatLibraryOrganizeFeature.self])
         let tabs = h.app.ui.panels.all.filter { $0.placement == .libraryTab }.map { $0.id }
-        XCTAssertEqual(tabs, ["organize.favourites", "organize.trash"])
-        XCTAssertEqual(h.app.ui.panels.get("organize.folder.new")?.placement, .sheet)
+        XCTAssertEqual(tabs, [PanelIDs.favourites, PanelIDs.trash])
+        // Two fixed sheet panels; the folder they act on comes in PanelContext.params. They draw their own header.
+        let sheets = h.app.ui.panels.all.filter { $0.owner == FeatLibraryOrganizeFeature.id && $0.placement == .sheet }
+        XCTAssertEqual(Set(sheets.map { $0.id }), ["organize.folder.new", "organize.folder.style"])
+        XCTAssertTrue(sheets.allSatisfy { $0.providesHeader })
+        let ctx = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+        for panel in h.app.ui.panels.all where panel.owner == FeatLibraryOrganizeFeature.id { _ = panel.makeView(ctx) }
         XCTAssertNotNil(h.app.settings.descriptor("organize.trashSort"))
         let menus = h.app.ui.menus.all.filter { $0.owner == FeatLibraryOrganizeFeature.id }
         XCTAssertTrue(Set(menus.map { $0.id }).isSuperset(of: [
@@ -69,25 +102,32 @@ final class FeatLibraryOrganizeTests: XCTestCase {
             "organize.unfavourite.librarySelection",
         ]))
         // Every entry runs a command, so plugins, the AI and the bridge can do the same.
-        for menu in menus { XCTAssertTrue(["panel.open", CommandIDs.batch].contains(menu.command), menu.id) }
-        XCTAssertEqual(h.app.content.keyCommands.get("organize.newFolder")?.command, "panel.open")
-        XCTAssertEqual(h.app.content.keyCommands.get("organize.newFolder")?.scope, .library)
+        for menu in menus { XCTAssertTrue([CommandIDs.panelOpen, CommandIDs.batch].contains(menu.command), menu.id) }
+        let key = try XCTUnwrap(h.app.content.keyCommands.get("organize.newFolder"))
+        XCTAssertEqual(key.command, CommandIDs.panelOpen)
+        XCTAssertEqual(key.params, ["id": "organize.folder.new"])
+        XCTAssertEqual(key.scope, .library)
+        // The New Folder menu entry shows the key's shortcut.
+        XCTAssertEqual(h.app.ui.menus.get("organize.newFolder")?.shortcut, key.shortcut)
     }
 
-    func testFolderMenusTargetTheFolderAndRegisterItsSheet() throws {
+    func testFolderMenusPassTheFolderAsPanelParams() throws {
         let h = Harness(features: [FeatLibraryOrganizeFeature.self])
         let folderMenu = MenuContext(app: h.app, nodes: [Fixtures.folderID])
         let docMenu = MenuContext(app: h.app, nodes: [Fixtures.docID])
         let customise = try XCTUnwrap(h.app.ui.menus.get("organize.customiseFolder"))
         XCTAssertTrue(customise.isVisible(folderMenu))
         XCTAssertFalse(customise.isVisible(docMenu))
-        let sheet = try XCTUnwrap(customise.params(folderMenu)["id"]?.stringValue)
-        XCTAssertEqual(sheet, "organize.folder.style.FIXTUREFLD01")
-        XCTAssertEqual(h.app.ui.panels.get(sheet)?.placement, .sheet)
+        XCTAssertEqual(customise.params(folderMenu), ["id": "organize.folder.style", "folder": "folder:FIXTUREFLD01"])
 
+        // New Folder goes into the folder the library shows (MenuContext.folder), else the root.
         let newFolder = try XCTUnwrap(h.app.ui.menus.get("organize.newFolder"))
-        XCTAssertEqual(newFolder.params(folderMenu)["id"]?.stringValue, "organize.folder.new.FIXTUREFLD01")
-        XCTAssertEqual(newFolder.params(MenuContext(app: h.app))["id"]?.stringValue, "organize.folder.new")
+        XCTAssertEqual(newFolder.params(MenuContext(app: h.app, folder: Fixtures.folderID)),
+                       ["id": "organize.folder.new", "folder": "folder:FIXTUREFLD01"])
+        XCTAssertEqual(newFolder.params(MenuContext(app: h.app)), ["id": "organize.folder.new"])
+        XCTAssertEqual(newFolder.params(folderMenu), ["id": "organize.folder.new"])
+        // No sheet is registered per folder any more.
+        XCTAssertEqual(h.app.ui.panels.all.filter { $0.id.hasPrefix("organize.folder") }.count, 2)
 
         let add = try XCTUnwrap(h.app.ui.menus.get("organize.favourite.libraryItem"))
         let remove = try XCTUnwrap(h.app.ui.menus.get("organize.unfavourite.libraryItem"))
@@ -96,6 +136,36 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         let call = try XCTUnwrap(add.params(docMenu)["calls"]?.arrayValue?.first)
         XCTAssertEqual(call["command"]?.stringValue, "doc.setFavorite")
         XCTAssertEqual(call["params"], ["doc": "doc:FIXTUREDOC01", "favorite": true])
+    }
+
+    func testSheetModeComesFromPanelParams() throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        func mode(_ panel: String, _ params: JSONValue) -> FolderStyleSheet.Mode {
+            FolderStyleSheet.Mode.resolve(panel: panel, params: params, library: h.app.services.library)
+        }
+        let new = OrganizePanel.newFolder, style = OrganizePanel.folderStyle
+        XCTAssertEqual(mode(new, ["folder": "folder:FIXTUREFLD01"]), .create(parent: Fixtures.folderID))
+        XCTAssertEqual(mode(new, ["folder": "FIXTUREFLD01"]), .create(parent: Fixtures.folderID))
+        XCTAssertEqual(mode(new, [:]), .create(parent: nil))
+        XCTAssertEqual(mode(new, ["folder": "lib"]), .create(parent: nil))
+        XCTAssertEqual(mode(new, ["folder": "folder:GONE"]), .create(parent: nil))
+        XCTAssertEqual(mode(new, ["folder": "doc:FIXTUREDOC01"]), .create(parent: nil))
+        XCTAssertEqual(mode(style, ["folder": "folder:FIXTUREFLD01"]), .edit(Fixtures.folderID))
+        XCTAssertEqual(mode(style, [:]), .create(parent: nil))
+        try h.library.trash(Fixtures.folderID)
+        XCTAssertEqual(mode(style, ["folder": "folder:FIXTUREFLD01"]), .create(parent: nil))
+        XCTAssertEqual(mode(new, ["folder": "folder:FIXTUREFLD01"]), .create(parent: nil))
+    }
+
+    func testFolderGlyphsAndSwatchesComeFromNibDesign() {
+        XCTAssertEqual(FolderIcons.glyph("\u{1F4DA}"), .emoji("\u{1F4DA}"))
+        XCTAssertEqual(FolderIcons.glyph("atom"), .symbol(FolderIcons.symbol("atom")))
+        XCTAssertNotEqual(FolderIcons.symbol("atom"), .folderFill)
+        XCTAssertEqual(FolderIcons.glyph(nil), .symbol(.folderFill))
+        XCTAssertEqual(FolderIcons.glyph("no.such.symbol.anywhere"), .symbol(.folderFill))
+        XCTAssertEqual(FolderColour.swatches.map { $0.id }, NibFolderColor.allCases.map { $0.rawValue })
+        XCTAssertEqual(FolderColour.name(FolderColour.rgba(NibFolderColor.moss)), NibFolderColor.moss.name)
+        XCTAssertEqual(FolderColour.name(RGBA(1, 2, 3)), "#010203")
     }
 
     func testFavouriteBatchStarsOnlyWhatChanges() async throws {
@@ -189,19 +259,76 @@ final class FeatLibraryOrganizeTests: XCTestCase {
     func testPageIndexFollowsCommitsAndUndo() async throws {
         let h = Harness(features: [FeatLibraryOrganizeFeature.self])
         h.app.commands.register(BookmarkStandIn.self)
-        let index = PageIndex.shared(h.app)
+        let index = PageIndex(app: h.app)
+        index.attach()
+        await index.sync()
         XCTAssertTrue(index.bookmarked.isEmpty)
         try await h.run("test.bookmark", ["page": "page:FIXTUREDOC01/FIXTUREPG002"])
         XCTAssertEqual(index.bookmarked.map { $0.ref }, ["page:FIXTUREDOC01/FIXTUREPG002"])
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertTrue(index.bookmarked.isEmpty)
-        XCTAssertTrue(PageIndex.shared(h.app) === index)
+    }
 
-        index.update(Fixtures.textDocID, DocumentPages(bookmarked: [
-            PageEntry(doc: Fixtures.textDocID, page: "P1", number: 1, title: nil, aspect: nil, trashedAt: nil),
-        ]))
-        index.prune(keeping: [Fixtures.docID])
-        XCTAssertNil(index.documents[Fixtures.textDocID])
+    func testPageIndexReadsDocumentsNeverOpenedAndFollowsTheLibrary() async throws {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        var (content, _) = Fixtures.sampleContent()
+        let unopened: DocumentID = "UNOPENED0001"
+        content.meta.id = unopened
+        for i in content.pages.indices {
+            if content.pages[i].id == Fixtures.page1 {
+                content.pages[i].deleted = true
+                content.pages[i].trashedAt = 1_700_000_500
+            }
+            if content.pages[i].id == Fixtures.page2 { content.pages[i].bookmarked = true }
+        }
+        let index = PageIndex(app: h.app)
+        index.attach()
+        await index.sync()
+        XCTAssertNil(index.documents[unopened])
+
+        // A document added to the library is read when the library reports the change, without opening it.
+        _ = try h.library.createDocument(content, title: "Unopened", in: nil)
+        h.app.events.emit(NibEventType.libraryChanged)
+        await eventually { index.documents[unopened] != nil }
+        XCTAssertEqual(index.documents[unopened]?.bookmarked.map { $0.page }, [Fixtures.page2])
+        XCTAssertEqual(index.documents[unopened]?.trashed.map { $0.page }, [Fixtures.page1])
+        XCTAssertEqual(index.documents[unopened]?.trashed.first?.number, 1)
+        XCTAssertFalse(h.app.workspace.isLoaded(unopened))
+
+        // Trashed with its document: gone from the index; recovered: read again.
+        try h.library.trash(unopened)
+        await index.sync()
+        XCTAssertNil(index.documents[unopened])
+        try h.library.restore(unopened, to: nil)
+        await index.sync()
+        XCTAssertEqual(index.documents[unopened]?.bookmarked.map { $0.page }, [Fixtures.page2])
+        try h.library.deletePermanently(unopened)
+        await index.sync()
+        XCTAssertNil(index.documents[unopened])
+    }
+
+    func testToastsAndCommandsGoToTheWindowTheTabIsIn() async {
+        let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let recorder = stub(h, ["trash.recover"])
+        let host = ToastHost()
+        let libraryWindow = EditorSession()
+        libraryWindow.floatingHost = host
+        let window = OrganizeWindow(PanelContext(app: h.app, session: libraryWindow, navigator: nil, dismiss: {}))
+        XCTAssertTrue(window.session === libraryWindow)
+        window.toast("Recovered 1 item.")
+        XCTAssertEqual(host.toasts, ["Recovered 1 item."])
+
+        let doc = TrashEntry(ref: "doc:D2", title: "Algebra", kind: .document(.notebook), trashedAt: 1, style: nil,
+                             documentTitle: nil)
+        let recovered = await TrashActions.recover(window, [doc])
+        XCTAssertTrue(recovered)
+        XCTAssertEqual(recorder.calls.map { $0.session }, [libraryWindow.id])
+
+        // Without a panel session: the active window, which has no floating host here (announced only).
+        let fallback = OrganizeWindow(app: h.app)
+        XCTAssertTrue(fallback.session === h.app.services.sessions.active)
+        fallback.toast("Emptied the Trash.")
+        XCTAssertEqual(host.toasts, ["Recovered 1 item."])
     }
 
     func testFavouritesListStarredItemsAndBookmarksOfLiveDocuments() {
@@ -252,6 +379,7 @@ final class FeatLibraryOrganizeTests: XCTestCase {
 
     func testTrashActionsRecoverToTheOriginMoveDeleteAndEmpty() async {
         let h = Harness(features: [FeatLibraryOrganizeFeature.self])
+        let window = OrganizeWindow(app: h.app)
         let recorder = stub(h, ["trash.recover", "library.move", "trash.deletePermanently", "trash.empty",
                                 "page.restore", "page.purge", "page.moveTo"])
         func page(_ ref: String) -> TrashEntry {
@@ -261,7 +389,7 @@ final class FeatLibraryOrganizeTests: XCTestCase {
                              documentTitle: nil)
         let entries = [doc, page("page:D1/P9"), page("page:D1/P8"), page("page:D3/P1")]
 
-        let recovered = await TrashActions.recover(h.app, entries)
+        let recovered = await TrashActions.recover(window, entries)
         XCTAssertTrue(recovered)
         // No destination: documents return to their folder and pages to their document.
         XCTAssertEqual(recorder.params("trash.recover"), [["refs": ["doc:D2"]]])
@@ -270,26 +398,26 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         XCTAssertEqual(recorder.groups.count, 1)
 
         recorder.calls.removeAll()
-        _ = await TrashActions.move(h.app, [doc], toFolder: "F7")
+        _ = await TrashActions.move(window, [doc], toFolder: "F7")
         XCTAssertEqual(recorder.params("trash.recover"), [["refs": ["doc:D2"], "folder": "folder:F7"]])
 
         recorder.calls.removeAll()
-        _ = await TrashActions.move(h.app, [doc], toFolder: nil)
+        _ = await TrashActions.move(window, [doc], toFolder: nil)
         XCTAssertEqual(recorder.commands, ["trash.recover", "library.move"])
         XCTAssertEqual(recorder.params("library.move"), [["refs": ["doc:D2"]]])
 
         recorder.calls.removeAll()
-        _ = await TrashActions.move(h.app, [page("page:D1/P9")], toDocument: "D4")
+        _ = await TrashActions.move(window, [page("page:D1/P9")], toDocument: "D4")
         XCTAssertEqual(recorder.commands, ["page.restore", "page.moveTo"])
         XCTAssertEqual(recorder.params("page.moveTo"), [["pages": ["page:D1/P9"], "doc": "doc:D4"]])
         XCTAssertEqual(recorder.groups.count, 1)
 
         recorder.calls.removeAll()
-        _ = await TrashActions.deletePermanently(h.app, entries)
+        _ = await TrashActions.deletePermanently(window, entries)
         XCTAssertEqual(recorder.commands, ["trash.deletePermanently", "page.purge", "page.purge"])
 
         recorder.calls.removeAll()
-        let emptied = await TrashActions.empty(h.app, entries)
+        let emptied = await TrashActions.empty(window, entries)
         XCTAssertTrue(emptied)
         XCTAssertEqual(recorder.commands, ["page.purge", "page.purge", "trash.empty"])
     }
@@ -297,12 +425,13 @@ final class FeatLibraryOrganizeTests: XCTestCase {
     func testFolderSheetCreatesAndRestylesThroughCommands() async throws {
         let h = Harness(features: [FeatLibraryOrganizeFeature.self])
         let recorder = stub(h, ["folder.create", "folder.setStyle", "library.rename"], result: ["ref": "folder:NEW"])
+        let window = OrganizeWindow(app: h.app)
         let mode = FolderStyleSheet.Mode.create(parent: Fixtures.folderID)
         var draft = FolderStyleSheet.initialDraft(h.app, mode)
         draft.title = "Chemistry"
         draft.icon = "flask.fill"
         draft.favorite = true
-        let created = await FolderStyleSheet.commit(h.app, mode: mode, draft: draft, original: draft)
+        let created = await FolderStyleSheet.commit(window, mode: mode, draft: draft, original: draft)
         XCTAssertTrue(created)
         let create = try XCTUnwrap(recorder.params("folder.create").first)
         XCTAssertEqual(create["title"], "Chemistry")
@@ -323,7 +452,7 @@ final class FeatLibraryOrganizeTests: XCTestCase {
         var changed = original
         changed.title = "Lab"
         changed.icon = nil
-        let saved = await FolderStyleSheet.commit(h.app, mode: edit, draft: changed, original: original)
+        let saved = await FolderStyleSheet.commit(window, mode: edit, draft: changed, original: original)
         XCTAssertTrue(saved)
         XCTAssertEqual(recorder.params("library.rename"), [["ref": "folder:FIXTUREFLD01", "title": "Lab"]])
         XCTAssertEqual(recorder.params("folder.setStyle"), [["folder": "folder:FIXTUREFLD01", "icon": "folder.fill"]])

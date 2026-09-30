@@ -51,17 +51,19 @@ struct Favourites: Equatable {
 /// The Favourites library tab: starred folders (tiles), starred documents (covers) and bookmarked pages
 /// (thumbnails). Content, not chrome: opaque surfaces on the library background, no droplets.
 struct FavoritesPanel: View {
-    let app: NibApp
+    let window: OrganizeWindow
     @StateObject private var library: LibraryWatch
     @ObservedObject private var index: PageIndex
     @State private var customising: FolderID? = nil
     @Environment(\.horizontalSizeClass) private var sizeClass
 
-    init(app: NibApp) {
-        self.app = app
-        _library = StateObject(wrappedValue: LibraryWatch(app: app))
-        _index = ObservedObject(wrappedValue: PageIndex.shared(app))
+    init(window: OrganizeWindow, index: PageIndex) {
+        self.window = window
+        _library = StateObject(wrappedValue: LibraryWatch(app: window.app))
+        _index = ObservedObject(wrappedValue: index)
     }
+
+    private var app: NibApp { window.app }
 
     private var isCompact: Bool { sizeClass == .compact }
     /// Every library measure sits on the 24 pt gutter (16 pt on iPhone).
@@ -94,7 +96,7 @@ struct FavoritesPanel: View {
         .onAppear { library.reload() }
         .nibSheet(isPresented: Binding(get: { customising != nil }, set: { if !$0 { customising = nil } })) {
             if let folder = customising {
-                FolderStyleSheet(app: app, mode: .edit(folder), onDone: { customising = nil })
+                FolderStyleSheet(window: window, mode: .edit(folder), onDone: { customising = nil })
             }
         }
     }
@@ -154,30 +156,13 @@ struct FavoritesPanel: View {
 
     // MARK: Cells
 
-    /// A folder tile (DESIGN.md §13.5 anatomy: glyph in the folder colour, full name on one line, count, 78 pt,
-    /// radius 14 on backgroundSecondary) that also shows the folder's own symbol or emoji.
+    /// A folder tile (DESIGN.md §13.5) with the folder's own symbol or emoji in its colour.
     private func folderTile(_ folder: LibraryNode, count: Int) -> some View {
         let shape = RoundedRectangle(cornerRadius: NibRadius.tile, style: .continuous)
         return Button { open(folder) } label: {
-            HStack(spacing: NibSpacing.m) {
-                FolderGlyph(style: folder.style, size: 30)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(folder.title)
-                        .font(NibFont.button)
-                        .foregroundStyle(NibColor.label)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Text(Organize.itemCount(count))
-                        .font(NibFont.footnote)
-                        .foregroundStyle(NibColor.labelSecondary)
-                        .lineLimit(1)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, NibSpacing.m)
-            .frame(maxWidth: .infinity, minHeight: NibMetrics.folderTileHeight)
-            .background(NibColor.backgroundSecondary, in: shape)
-            .contentShape(shape)
+            NibFolderTile(name: folder.title, count: Organize.itemCount(count),
+                          color: FolderColour.color(folder.style?.color), glyph: FolderIcons.glyph(folder.style?.icon))
+                .contentShape(shape)
         }
         .buttonStyle(NibPressStyle(shape: shape))
         .contextMenu {
@@ -271,41 +256,41 @@ struct FavoritesPanel: View {
     // MARK: Actions (all commands)
 
     private func open(_ node: LibraryNode) {
-        let app = self.app
+        let window = self.window
         Task {
             if node.kind == .folder {
-                await Organize.run(app, "library.setView", ["folder": .string(node.ref)])
+                await Organize.run(window, CommandIDs.librarySetView, ["folder": .string(node.ref)])
             } else {
-                await Organize.run(app, CommandIDs.docOpen, ["doc": .string(node.ref)])
+                await Organize.run(window, CommandIDs.docOpen, ["doc": .string(node.ref)])
             }
         }
     }
 
     private func open(_ page: FavouritePage) {
-        let app = self.app
+        let window = self.window
         let params: JSONValue = ["doc": .string(NodeRef.document(page.entry.doc).description),
                                  "page": .string(page.entry.ref)]
-        Task { await Organize.run(app, CommandIDs.docOpen, params) }
+        Task { await Organize.run(window, CommandIDs.docOpen, params) }
     }
 
     private func unfavourite(_ node: LibraryNode) {
-        let app = self.app
+        let window = self.window
         let library = self.library
         guard let call = Favouriting.calls([node], favourite: false).first,
               let command = call["command"]?.stringValue, let params = call["params"] else { return }
         Task {
-            guard await Organize.run(app, command, params) != nil else { return }
+            guard await Organize.run(window, command, params) != nil else { return }
             library.reload()
-            Organize.announce(String(localized: "Removed \(node.title) from Favourites."))
+            window.toast(String(localized: "Removed \(node.title) from Favourites."))
         }
     }
 
     private func unbookmark(_ page: FavouritePage) {
-        let app = self.app
+        let window = self.window
         let params: JSONValue = ["pages": Organize.refs([page.entry.ref]), "on": false]
         Task {
-            guard await Organize.run(app, "page.setBookmarked", params) != nil else { return }
-            Organize.announce(String(localized: "Removed the bookmark."))
+            guard await Organize.run(window, CommandIDs.pageSetBookmarked, params) != nil else { return }
+            window.toast(String(localized: "Removed the bookmark."))
         }
     }
 }

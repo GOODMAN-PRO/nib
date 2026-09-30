@@ -128,75 +128,79 @@ enum Trash {
 /// no destination, so items return to their original folder and pages to their document. Each action is one group.
 @MainActor
 enum TrashActions {
-    static func recover(_ app: NibApp, _ entries: [TrashEntry]) async -> Bool {
+    static func recover(_ window: OrganizeWindow, _ entries: [TrashEntry]) async -> Bool {
         let plan = Trash.plan(entries)
         let group = NibID.make().raw
         var ok = true
-        if !plan.nodes.isEmpty, await Organize.run(app, "trash.recover", ["refs": Organize.refs(plan.nodes)], group: group) == nil {
+        if !plan.nodes.isEmpty,
+           await Organize.run(window, CommandIDs.trashRecover, ["refs": Organize.refs(plan.nodes)], group: group) == nil {
             ok = false
         }
         for doc in plan.documents {
             let pages = Organize.refs(plan.pages[doc] ?? [])
-            if await Organize.run(app, "page.restore", ["pages": pages], group: group) == nil { ok = false }
+            if await Organize.run(window, CommandIDs.pageRestore, ["pages": pages], group: group) == nil { ok = false }
         }
         return ok
     }
 
     /// Recovers documents and folders into `folder` (nil = the library root).
-    static func move(_ app: NibApp, _ entries: [TrashEntry], toFolder folder: FolderID?) async -> Bool {
+    static func move(_ window: OrganizeWindow, _ entries: [TrashEntry], toFolder folder: FolderID?) async -> Bool {
         let refs = Organize.refs(Trash.plan(entries).nodes)
         let group = NibID.make().raw
         guard let folder else {
-            guard await Organize.run(app, "trash.recover", ["refs": refs], group: group) != nil else { return false }
-            return await Organize.run(app, "library.move", ["refs": refs], group: group) != nil
+            guard await Organize.run(window, CommandIDs.trashRecover, ["refs": refs], group: group) != nil else {
+                return false
+            }
+            return await Organize.run(window, CommandIDs.libraryMove, ["refs": refs], group: group) != nil
         }
         let params: JSONValue = ["refs": refs, "folder": .string(NodeRef.folder(folder).description)]
-        return await Organize.run(app, "trash.recover", params, group: group) != nil
+        return await Organize.run(window, CommandIDs.trashRecover, params, group: group) != nil
     }
 
     /// Recovers pages and moves them to the end of `target` (one undo step).
-    static func move(_ app: NibApp, _ entries: [TrashEntry], toDocument target: DocumentID) async -> Bool {
+    static func move(_ window: OrganizeWindow, _ entries: [TrashEntry], toDocument target: DocumentID) async -> Bool {
         let plan = Trash.plan(entries)
         let group = NibID.make().raw
         var ok = true
         for doc in plan.documents {
             let pages = Organize.refs(plan.pages[doc] ?? [])
-            guard await Organize.run(app, "page.restore", ["pages": pages], group: group) != nil else {
+            guard await Organize.run(window, CommandIDs.pageRestore, ["pages": pages], group: group) != nil else {
                 ok = false
                 continue
             }
             guard doc != target else { continue }
             let params: JSONValue = ["pages": pages, "doc": .string(NodeRef.document(target).description)]
-            if await Organize.run(app, "page.moveTo", params, group: group) == nil { ok = false }
+            if await Organize.run(window, CommandIDs.pageMoveTo, params, group: group) == nil { ok = false }
         }
         return ok
     }
 
-    static func deletePermanently(_ app: NibApp, _ entries: [TrashEntry]) async -> Bool {
+    static func deletePermanently(_ window: OrganizeWindow, _ entries: [TrashEntry]) async -> Bool {
         let plan = Trash.plan(entries)
         let group = NibID.make().raw
         var ok = true
         if !plan.nodes.isEmpty,
-           await Organize.run(app, "trash.deletePermanently", ["refs": Organize.refs(plan.nodes)], group: group) == nil {
+           await Organize.run(window, CommandIDs.trashDeletePermanently, ["refs": Organize.refs(plan.nodes)],
+                              group: group) == nil {
             ok = false
         }
         for doc in plan.documents {
             let pages = Organize.refs(plan.pages[doc] ?? [])
-            if await Organize.run(app, "page.purge", ["pages": pages], group: group) == nil { ok = false }
+            if await Organize.run(window, CommandIDs.pagePurge, ["pages": pages], group: group) == nil { ok = false }
         }
         return ok
     }
 
     /// Trashed pages are purged per document, then `trash.empty` clears the library trash.
-    static func empty(_ app: NibApp, _ entries: [TrashEntry]) async -> Bool {
+    static func empty(_ window: OrganizeWindow, _ entries: [TrashEntry]) async -> Bool {
         let plan = Trash.plan(entries.filter { $0.kind == .page })
         let group = NibID.make().raw
         var ok = true
         for doc in plan.documents {
             let pages = Organize.refs(plan.pages[doc] ?? [])
-            if await Organize.run(app, "page.purge", ["pages": pages], group: group) == nil { ok = false }
+            if await Organize.run(window, CommandIDs.pagePurge, ["pages": pages], group: group) == nil { ok = false }
         }
-        if await Organize.run(app, "trash.empty", [:], group: group) == nil { ok = false }
+        if await Organize.run(window, CommandIDs.trashEmpty, [:], group: group) == nil { ok = false }
         return ok
     }
 }
@@ -207,7 +211,7 @@ enum TrashActions {
 /// sorted by date, name or type. Tap an item for Recover, Move or Delete Permanently; Select for several at once
 /// (a Deep action bar buds up at the bottom); Empty Trash asks first. A plain list: no liquid on content.
 struct TrashPanel: View {
-    let app: NibApp
+    let window: OrganizeWindow
     @StateObject private var library: LibraryWatch
     @ObservedObject private var index: PageIndex
     @State private var sort: TrashSort
@@ -219,11 +223,11 @@ struct TrashPanel: View {
     @State private var isWorking = false
     @Environment(\.horizontalSizeClass) private var sizeClass
 
-    init(app: NibApp) {
-        self.app = app
-        _library = StateObject(wrappedValue: LibraryWatch(app: app))
-        _index = ObservedObject(wrappedValue: PageIndex.shared(app))
-        _sort = State(initialValue: app.settings.get(OrganizeSettings.trashSort))
+    init(window: OrganizeWindow, index: PageIndex) {
+        self.window = window
+        _library = StateObject(wrappedValue: LibraryWatch(app: window.app))
+        _index = ObservedObject(wrappedValue: index)
+        _sort = State(initialValue: window.app.settings.get(OrganizeSettings.trashSort))
     }
 
     private var isCompact: Bool { sizeClass == .compact }
@@ -418,7 +422,7 @@ struct TrashPanel: View {
     @ViewBuilder private func glyph(_ entry: TrashEntry) -> some View {
         switch entry.kind {
         case .folder:
-            FolderGlyph(style: entry.style, size: 22)
+            NibFolderGlyphView(folder: entry.style, size: 22)
         case .document(let kind):
             Image(nib: symbol(kind))
                 .font(NibFont.glyph(.sidebar))
@@ -511,8 +515,8 @@ struct TrashPanel: View {
                 onCancel: { moving = nil },
                 onChoose: { key in
                     moving = nil
-                    perform(String(localized: "Moved \(Organize.itemCount(entries.count)).")) { app in
-                        await TrashActions.move(app, entries, toFolder: DestinationPickerSheet.folder(key))
+                    perform(String(localized: "Moved \(Organize.itemCount(entries.count)).")) { window in
+                        await TrashActions.move(window, entries, toFolder: DestinationPickerSheet.folder(key))
                     }
                 })
         case .notebooks?:
@@ -523,8 +527,8 @@ struct TrashPanel: View {
                 onChoose: { key in
                     moving = nil
                     guard case .document(let doc)? = NodeRef(key) else { return }
-                    perform(String(localized: "Moved \(Organize.itemCount(entries.count)).")) { app in
-                        await TrashActions.move(app, entries, toDocument: doc)
+                    perform(String(localized: "Moved \(Organize.itemCount(entries.count)).")) { window in
+                        await TrashActions.move(window, entries, toDocument: doc)
                     }
                 })
         case nil:
@@ -535,40 +539,40 @@ struct TrashPanel: View {
     // MARK: Actions
 
     private func recover(_ entries: [TrashEntry]) {
-        perform(String(localized: "Recovered \(Organize.itemCount(entries.count)).")) { app in
-            await TrashActions.recover(app, entries)
+        perform(String(localized: "Recovered \(Organize.itemCount(entries.count)).")) { window in
+            await TrashActions.recover(window, entries)
         }
     }
 
     private func deletePermanently(_ entries: [TrashEntry]) {
-        perform(String(localized: "Deleted \(Organize.itemCount(entries.count)) permanently.")) { app in
-            await TrashActions.deletePermanently(app, entries)
+        perform(String(localized: "Deleted \(Organize.itemCount(entries.count)) permanently.")) { window in
+            await TrashActions.deletePermanently(window, entries)
         }
     }
 
     private func empty(_ entries: [TrashEntry]) {
-        perform(String(localized: "Emptied the Trash.")) { app in
-            await TrashActions.empty(app, entries)
+        perform(String(localized: "Emptied the Trash.")) { window in
+            await TrashActions.empty(window, entries)
         }
     }
 
-    /// Runs one action, then refreshes, clears the selection and announces the outcome.
-    private func perform(_ announcement: String, _ work: @escaping (NibApp) async -> Bool) {
-        let app = self.app
+    /// Runs one action, then refreshes, clears the selection and toasts the outcome in this window.
+    private func perform(_ outcome: String, _ work: @escaping (OrganizeWindow) async -> Bool) {
+        let window = self.window
         let library = self.library
         isWorking = true
         Task {
-            let ok = await work(app)
+            let ok = await work(window)
             isWorking = false
             selection.removeAll()
             library.reload()
-            if ok { Organize.announce(announcement) }
+            if ok { window.toast(outcome) }
         }
     }
 
     private func persist(_ value: TrashSort) {
-        let app = self.app
+        let window = self.window
         let params: JSONValue = ["name": .string(OrganizeSettings.trashSort.name), "value": .string(value.rawValue)]
-        Task { await Organize.run(app, CommandIDs.settingsSet, params) }
+        Task { await Organize.run(window, CommandIDs.settingsSet, params) }
     }
 }
