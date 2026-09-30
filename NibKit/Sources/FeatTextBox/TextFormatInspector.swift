@@ -6,6 +6,29 @@ import NibDesign
 
 // MARK: - State
 
+/// The emphasis toggles' glyphs (NibDesign v2 text-formatting tokens) and names.
+extension TextBoxEditor.Toggle {
+    var symbol: NibSymbol {
+        switch self {
+        case .bold: return .bold
+        case .italic: return .italic
+        case .underline: return .underline
+        case .strikethrough: return .strikethrough
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .bold: return String(localized: "Bold")
+        case .italic: return String(localized: "Italic")
+        case .underline: return String(localized: "Underline")
+        case .strikethrough: return String(localized: "Strikethrough")
+        }
+    }
+
+    static let all: [TextBoxEditor.Toggle] = [.bold, .italic, .underline, .strikethrough]
+}
+
 /// What the format controls show: resolved character attributes plus paragraph and box settings.
 struct TextFormatState: Equatable {
     var attrs = TextLayout.resolved(TextAttributes())
@@ -83,10 +106,10 @@ enum TextFormatOptions {
 
     static func alignmentSymbol(_ a: ParagraphAlignment) -> NibSymbol {
         switch a {
-        case .center: return symbol("text.aligncenter")
-        case .right: return symbol("text.alignright")
-        case .justified: return symbol("text.justify")
-        case .left, .natural: return symbol("text.alignleft")
+        case .center: return .alignCentre
+        case .right: return .alignRight
+        case .justified: return .justify
+        case .left, .natural: return .alignLeft
         }
     }
 
@@ -102,25 +125,9 @@ enum TextFormatOptions {
 
     static func listSymbol(_ l: ListKind) -> NibSymbol {
         switch l {
-        case .number, .numberParen: return symbol("list.number")
-        case .todo: return symbol("checklist")
-        case .bullet, .plain: return symbol("list.bullet")
-        }
-    }
-
-    /// A formatting glyph by SF Symbol name (NibSymbol has no text-formatting tokens), falling back to the text glyph.
-    static func symbol(_ name: String, fallback: NibSymbol = .text) -> NibSymbol {
-        NibSymbol(systemName: name) ?? fallback
-    }
-
-    static func highlighterName(_ h: NibHighlighter) -> String {
-        switch h {
-        case .lemon: return String(localized: "Lemon")
-        case .apricot: return String(localized: "Apricot")
-        case .mint: return String(localized: "Mint")
-        case .sky: return String(localized: "Sky")
-        case .lilac: return String(localized: "Lilac")
-        case .blush: return String(localized: "Blush")
+        case .number, .numberParen: return .listNumbered
+        case .todo: return .checklist
+        case .bullet, .plain: return .listBulleted
         }
     }
 
@@ -137,21 +144,21 @@ enum TextFormatOptions {
 
     /// Box fills: the papers, then the highlighter hues washed out.
     static let fills: [Fill] = [NibPaper.white, .ivory, .legal, .grey].map { p in
-        Fill(id: p.rawValue, name: TextFormatOptions.paperName(p), value: RGBA(nibHex: p.hex))
+        Fill(id: p.rawValue, name: p.name, value: RGBA(nibHex: p.hex))
     } + NibHighlighter.allCases.map { h in
-        Fill(id: "wash." + h.rawValue, name: TextFormatOptions.highlighterName(h), value: RGBA(nibHex: h.hex, alpha: 0.35))
+        Fill(id: "wash." + h.rawValue, name: h.name, value: RGBA(nibHex: h.hex, alpha: 0.35))
     }
 
-    static func paperName(_ p: NibPaper) -> String {
-        switch p {
-        case .white: return String(localized: "White")
-        case .ivory: return String(localized: "Ivory")
-        case .legal: return String(localized: "Legal Pad")
-        case .grey: return String(localized: "Grey")
-        case .slate: return String(localized: "Slate")
-        case .night: return String(localized: "Night")
-        case .board: return String(localized: "Board")
-        }
+    /// A box fill as a swatch (papers ringed where they vanish against the chrome).
+    static func swatch(_ fill: Fill) -> NibSwatch {
+        if let paper = NibPaper(rawValue: fill.id) { return NibSwatch(paper: paper) }
+        return NibSwatch(id: fill.id, color: Color(uiColor: fill.value.uiColor), name: fill.name)
+    }
+
+    /// The text colour as a swatch: its ink, else a custom colour.
+    static func swatch(colour: RGBA) -> NibSwatch {
+        if let ink = NibInk.allCases.first(where: { $0.hex == colour.rgbHex }) { return NibSwatch(ink: ink) }
+        return NibSwatch(id: "text.colour", hex: colour.rgbHex, name: String(localized: "Custom Colour"))
     }
 
     enum Border: CaseIterable, Hashable {
@@ -367,7 +374,7 @@ final class TextFormatModel: ObservableObject {
         case let .items(doc, page, ids):
             let attrs = (try? JSONValue.from(a)) ?? [:]
             run(refs(doc, page, textItems(doc, page, ids)).map { ref -> (String, JSONValue) in
-                ("text.format", ["ref": ref, "attrs": attrs])
+                (CommandIDs.textFormat, ["ref": ref, "attrs": attrs])
             })
         }
     }
@@ -398,7 +405,7 @@ final class TextFormatModel: ObservableObject {
             run(refs(doc, page, textItems(doc, page, ids)).map { ref -> (String, JSONValue) in
                 var f = fields
                 f["ref"] = ref
-                return ("text.setParagraph", .object(f))
+                return (CommandIDs.textSetParagraph, .object(f))
             })
         }
     }
@@ -417,7 +424,7 @@ final class TextFormatModel: ObservableObject {
         case let .items(doc, page, ids):
             let boxes = refs(doc, page, textItems(doc, page, ids).filter { $0.kind == .text })
             guard !boxes.isEmpty else { return }
-            run([("text.setBoxStyle", ["refs": .array(boxes), "style": .object(fields)])])
+            run([(CommandIDs.textSetBoxStyle, ["refs": .array(boxes), "style": .object(fields)])])
         }
     }
 
@@ -467,10 +474,10 @@ final class TextFormatModel: ObservableObject {
         let found = textItems(doc, page, ids)
         var calls: [(String, JSONValue)] = []
         let boxes = refs(doc, page, found.filter { $0.kind == .text })
-        if !boxes.isEmpty { calls.append(("text.setBoxStyle", ["refs": .array(boxes), "style": .object(boxFields)])) }
+        if !boxes.isEmpty { calls.append((CommandIDs.textSetBoxStyle, ["refs": .array(boxes), "style": .object(boxFields)])) }
         for item in found where item.kind != .text {
             guard let text = TextItems.richText(item), let styled = try? JSONValue.from(s.styling(text)) else { continue }
-            calls.append(("text.setText", ["ref": .string(NodeRef.item(doc, page, item.id).description), "text": styled]))
+            calls.append((CommandIDs.textSetText, ["ref": .string(NodeRef.item(doc, page, item.id).description), "text": styled]))
         }
         run(calls)
     }
@@ -499,7 +506,7 @@ final class TextFormatModel: ObservableObject {
     func saveStyle(named raw: String) {
         let name = raw.trimmingCharacters(in: .whitespaces)
         guard TextSettings.isValidName(name) else { return }
-        run([("text.saveDefaultStyle", ["name": .string(name), "style": currentStyle().json])])
+        run([(CommandIDs.textSaveDefaultStyle, ["name": .string(name), "style": currentStyle().json])])
     }
 
     func deleteStyle(named name: String) {
@@ -511,7 +518,7 @@ final class TextFormatModel: ObservableObject {
     }
 
     private func saveDefault(_ s: SavedTextStyle) {
-        run([("text.saveDefaultStyle", ["style": s.json])])
+        run([(CommandIDs.textSaveDefaultStyle, ["style": s.json])])
     }
 
     /// Changes the style of new boxes. `change` runs when the batch does, on the default saved by then, so quick
@@ -521,7 +528,7 @@ final class TextFormatModel: ObservableObject {
             guard let self = self else { return }
             var s = TextStyles.defaultStyle(self.app.settings)
             change(&s)
-            await self.execute([("text.saveDefaultStyle", ["style": s.json])])
+            await self.execute([(CommandIDs.textSaveDefaultStyle, ["style": s.json])])
         }
     }
 
@@ -657,6 +664,48 @@ struct TextToolSettingsView: View {
     }
 }
 
+/// Ids of the keyboard bar's More popover in the window's droplet container.
+enum TextPopoverIDs {
+    static let popover = "text.format.popover"
+    /// The bud source: the More button's rect.
+    static let source = "text.format.more"
+}
+
+/// The More popover's open state. The floating host keeps the popover while a box is edited; this opens it, and a tap
+/// outside or Escape closes it (`onClose` gives the text view the keyboard back).
+@MainActor
+final class TextPopoverState: ObservableObject {
+    @Published var isPresented = false {
+        didSet { if oldValue && !isPresented { onClose?() } }
+    }
+    /// Height of the scrolling inspector, fitted above the keyboard.
+    @Published var contentHeight: CGFloat = NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight
+    var onClose: (() -> Void)?
+}
+
+/// The format inspector as a Deep popover budded from the keyboard bar's More button (DESIGN.md §14.3: tool popovers
+/// are Deep `NibPopoverPanel`s budded from their control), shown through the window's floating host.
+struct TextFormatPopover: View {
+    @ObservedObject var state: TextPopoverState
+    let model: TextFormatModel
+
+    /// The popover's title row and the padding around the inspector.
+    static let chromeHeight: CGFloat = 2 * NibSpacing.l + NibSpacing.m + NibMetrics.hitTarget
+    /// With less room than this above the keyboard, a system popover shows the inspector instead.
+    static let minimumHeight: CGFloat = NibMetrics.popoverMaxHeight / 2
+
+    var body: some View {
+        NibBudPopover(id: TextPopoverIDs.popover, source: TextPopoverIDs.source, isPresented: $state.isPresented,
+                      title: String(localized: "Format"), placement: .above) {
+            ScrollView {
+                TextFormatInspector(model: model)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: state.contentHeight)
+        }
+    }
+}
+
 private struct TextStylesSection: View {
     @ObservedObject var model: TextFormatModel
     @Binding var naming: Bool
@@ -737,39 +786,12 @@ private struct TextEmphasisSection: View {
     var body: some View {
         NibInspectorSection(String(localized: "Emphasis")) {
             HStack(spacing: NibSpacing.s) {
-                FormatToggleButton(label: Text(verbatim: "B").font(NibFont.bodyEmphasis), name: String(localized: "Bold"),
-                                   isOn: model.state.isOn(.bold)) { model.toggle(.bold) }
-                FormatToggleButton(label: Text(verbatim: "I").font(NibFont.body.italic()), name: String(localized: "Italic"),
-                                   isOn: model.state.isOn(.italic)) { model.toggle(.italic) }
-                FormatToggleButton(label: Text(verbatim: "U").font(NibFont.body).underline(), name: String(localized: "Underline"),
-                                   isOn: model.state.isOn(.underline)) { model.toggle(.underline) }
-                FormatToggleButton(label: Text(verbatim: "S").font(NibFont.body).strikethrough(),
-                                   name: String(localized: "Strikethrough"),
-                                   isOn: model.state.isOn(.strikethrough)) { model.toggle(.strikethrough) }
+                ForEach(TextBoxEditor.Toggle.all, id: \.self) { t in
+                    NibIconButton(t.symbol, label: t.title, size: .panel, isOn: model.state.isOn(t)) { model.toggle(t) }
+                }
                 Spacer(minLength: 0)
             }
         }
-    }
-}
-
-private struct FormatToggleButton: View {
-    let label: Text
-    let name: String
-    let isOn: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            label
-                .foregroundStyle(NibColor.label)
-                .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-                .background(isOn ? NibColor.fill3 : Color.clear,
-                            in: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous))
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)))
-        .accessibilityLabel(name)
-        .accessibilityAddTraits(isOn ? .isSelected : [])
     }
 }
 
@@ -817,11 +839,9 @@ private struct TextParagraphSection: View {
                         }
                         .accessibilityLabel(String(localized: "List"))
                         .accessibilityValue(TextFormatOptions.listTitle(model.state.list))
-                        NibIconButton(TextFormatOptions.symbol("decrease.indent", fallback: .back),
-                                      label: String(localized: "Decrease Indent"), size: .panel) { model.indent(-1) }
+                        NibIconButton(.outdent, label: String(localized: "Decrease Indent"), size: .panel) { model.indent(-1) }
                             .disabled(model.state.indent == 0)
-                        NibIconButton(TextFormatOptions.symbol("increase.indent", fallback: .forward),
-                                      label: String(localized: "Increase Indent"), size: .panel) { model.indent(1) }
+                        NibIconButton(.indent, label: String(localized: "Increase Indent"), size: .panel) { model.indent(1) }
                             .disabled(model.state.indent >= AutoList.maxIndent)
                     }
                 }
@@ -856,8 +876,7 @@ private struct TextColourSection: View {
                                 action: NibAction(String(localized: "Remove Highlight")) { model.setHighlight(nil) }) {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
                     ForEach(NibHighlighter.allCases, id: \.self) { h in
-                        NibPenSwatch(NibSwatch(id: h.rawValue, color: h.color, name: TextFormatOptions.highlighterName(h)),
-                                     isSelected: model.state.highlight?.rgbHex == h.hex) {
+                        NibPenSwatch(NibSwatch(highlighter: h), isSelected: model.state.highlight?.rgbHex == h.hex) {
                             model.setHighlight(TextFormatOptions.highlight(h))
                         }
                     }
@@ -878,8 +897,7 @@ private struct TextBoxStyleSection: View {
             VStack(alignment: .leading, spacing: NibSpacing.s) {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 0) {
                     ForEach(TextFormatOptions.fills) { fill in
-                        NibPenSwatch(NibSwatch(id: fill.id, color: Color(uiColor: fill.value.uiColor), name: fill.name),
-                                     isSelected: box.background == fill.value) {
+                        NibPenSwatch(TextFormatOptions.swatch(fill), isSelected: box.background == fill.value) {
                             model.setBox(["background": .string(fill.value.hex)])
                         }
                     }
@@ -1007,13 +1025,7 @@ final class TextKeyboardBar: UIInputView {
         // VoiceOver hears the size as the value of Smaller Text and Larger Text.
         sizeLabel.isAccessibilityElement = false
 
-        let bold = toggleButton(.bold, title: "B", font: NibUIFont.font(.body, weight: .bold), label: String(localized: "Bold"))
-        let italicFont = NibUIFont.body.fontDescriptor.withSymbolicTraits(.traitItalic).map { UIFont(descriptor: $0, size: 0) } ?? NibUIFont.body
-        let italic = toggleButton(.italic, title: "I", font: italicFont, label: String(localized: "Italic"))
-        let underline = toggleButton(.underline, title: "U", font: NibUIFont.body, label: String(localized: "Underline"),
-                                     extra: [.underlineStyle: NSUnderlineStyle.single.rawValue])
-        let strike = toggleButton(.strikethrough, title: "S", font: NibUIFont.body, label: String(localized: "Strikethrough"),
-                                  extra: [.strikethroughStyle: NSUnderlineStyle.single.rawValue])
+        let emphasis = TextBoxEditor.Toggle.all.map { toggleButton($0) }
 
         let colour = button(symbol: nil, label: String(localized: "Text Colour"))
         colour.showsMenuAsPrimaryAction = true
@@ -1027,12 +1039,9 @@ final class TextKeyboardBar: UIInputView {
         let list = button(symbol: TextFormatOptions.listSymbol(.bullet), label: String(localized: "List"))
         list.showsMenuAsPrimaryAction = true
         listButton = list
-        let outdent = button(symbol: TextFormatOptions.symbol("decrease.indent", fallback: .back),
-                             label: String(localized: "Decrease Indent")) { [weak self] in self?.model.indent(-1) }
-        let indent = button(symbol: TextFormatOptions.symbol("increase.indent", fallback: .forward),
-                            label: String(localized: "Increase Indent")) { [weak self] in self?.model.indent(1) }
-        let spacing = button(symbol: TextFormatOptions.symbol("arrow.up.and.down.text.horizontal", fallback: .sort),
-                             label: String(localized: "Line Spacing"))
+        let outdent = button(symbol: .outdent, label: String(localized: "Decrease Indent")) { [weak self] in self?.model.indent(-1) }
+        let indent = button(symbol: .indent, label: String(localized: "Increase Indent")) { [weak self] in self?.model.indent(1) }
+        let spacing = button(symbol: .lineSpacing, label: String(localized: "Line Spacing"))
         spacing.showsMenuAsPrimaryAction = true
         spacingButton = spacing
         let more = button(symbol: .moreCircle, label: String(localized: "More Formatting"))
@@ -1040,8 +1049,10 @@ final class TextKeyboardBar: UIInputView {
             if let self = self, let more = more { self.onMore?(more) }
         }, for: .primaryActionTriggered)
 
-        for view in [style, font, smaller, sizeLabel, larger, separator(), bold, italic, underline, strike, separator(),
-                     colour, highlight, separator(), align, list, outdent, indent, spacing, separator(), more] as [UIView] {
+        var views: [UIView] = [style, font, smaller, sizeLabel, larger, separator()]
+        views += emphasis as [UIView]
+        views += [separator(), colour, highlight, separator(), align, list, outdent, indent, spacing, separator(), more]
+        for view in views {
             stack.addArrangedSubview(view)
         }
 
@@ -1091,12 +1102,8 @@ final class TextKeyboardBar: UIInputView {
         return b
     }
 
-    private func toggleButton(_ t: TextBoxEditor.Toggle, title: String, font: UIFont, label: String,
-                              extra: [NSAttributedString.Key: Any] = [:]) -> UIButton {
-        let b = button(label: label) { [weak self] in self?.model.toggle(t) }
-        var attrs = extra
-        attrs[.font] = font
-        b.configuration?.attributedTitle = AttributedString(title, attributes: AttributeContainer(attrs))
+    private func toggleButton(_ t: TextBoxEditor.Toggle) -> UIButton {
+        let b = button(symbol: t.symbol, label: t.title) { [weak self] in self?.model.toggle(t) }
         toggles[t] = b
         return b
     }
@@ -1111,19 +1118,6 @@ final class TextKeyboardBar: UIInputView {
         return v
     }
 
-    private static func swatchImage(_ colour: UIColor) -> UIImage {
-        let d: CGFloat = 22
-        return UIGraphicsImageRenderer(size: CGSize(width: d, height: d)).image { _ in
-            let rect = CGRect(x: 0.5, y: 0.5, width: d - 1, height: d - 1)
-            colour.setFill()
-            UIBezierPath(ovalIn: rect).fill()
-            NibUIColor.swatchHairline.setStroke()
-            let ring = UIBezierPath(ovalIn: rect)
-            ring.lineWidth = 0.5
-            ring.stroke()
-        }.withRenderingMode(.alwaysOriginal)
-    }
-
     private func update(_ s: TextFormatState) {
         for (t, b) in toggles {
             let on = s.isOn(t)
@@ -1136,7 +1130,7 @@ final class TextKeyboardBar: UIInputView {
         sizeLabel.text = size
         smallerButton?.accessibilityValue = size
         largerButton?.accessibilityValue = size
-        colourButton?.configuration?.image = TextKeyboardBar.swatchImage(s.colour.uiColor)
+        colourButton?.configuration?.image = UIImage.nibSwatch(TextFormatOptions.swatch(colour: s.colour))
         colourButton?.accessibilityValue = NibInk.allCases.first { $0.hex == s.colour.rgbHex }?.name
         alignButton?.configuration?.image = UIImage(nib: TextFormatOptions.alignmentSymbol(s.align))
         alignButton?.accessibilityValue = TextFormatOptions.alignmentTitle(s.align)
@@ -1153,7 +1147,7 @@ final class TextKeyboardBar: UIInputView {
             }
         ])])
         colourButton?.menu = UIMenu(children: NibInk.allCases.map { ink in
-            UIAction(title: ink.name, image: TextKeyboardBar.swatchImage(ink.uiColor),
+            UIAction(title: ink.name, image: UIImage.nibSwatch(NibSwatch(ink: ink)),
                      state: ink.hex == s.colour.rgbHex ? .on : .off) { [weak self] _ in
                 self?.model.setColour(RGBA(nibHex: ink.hex))
             }
@@ -1162,7 +1156,7 @@ final class TextKeyboardBar: UIInputView {
                                                            state: s.highlight == nil ? .on : .off) { [weak self] _ in
             self?.model.setHighlight(nil)
         }] + NibHighlighter.allCases.map { h in
-            UIAction(title: TextFormatOptions.highlighterName(h), image: TextKeyboardBar.swatchImage(h.uiColor),
+            UIAction(title: h.name, image: UIImage.nibSwatch(NibSwatch(highlighter: h)),
                      state: s.highlight?.rgbHex == h.hex ? .on : .off) { [weak self] _ in
                 self?.model.setHighlight(TextFormatOptions.highlight(h))
             }

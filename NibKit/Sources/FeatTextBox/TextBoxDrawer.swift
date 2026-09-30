@@ -9,6 +9,13 @@ final class TextBoxDrawer: ItemDrawer {
         guard !item.deleted, let box = item.text else { return }
         TextLayout.draw(box, in: context.cg, darkPaper: context.darkPaper, assets: context.assets, doc: context.doc)
     }
+
+    /// A full-page box (F028's page text) takes taps and lasso hits only where its text is, so the page-sized box
+    /// never catches the whole page (contracts-v2 `ItemDrawer.hitBounds`). Other boxes use their bounds.
+    func hitBounds(_ item: Item) -> Rect? {
+        guard let box = item.text, box.style.fullPage else { return nil }
+        return TextLayout.textBounds(box)
+    }
 }
 
 /// `RichText` ⇄ attributed text for text boxes, measurement and drawing. Built on `RichTextBridge`, plus what text
@@ -21,14 +28,13 @@ enum TextLayout {
     static let assetKey = NSAttributedString.Key("nib.text.asset")
     /// Paragraph-level keys copied onto replacement characters and typing attributes.
     static let paragraphKeys: [NSAttributedString.Key] = [.paragraphStyle, .nibList, .nibIndent, .nibChecked, .nibParagraphStyle]
-    /// The run's font family and bold / italic as the model has them, on every character of the run (and on its
-    /// paragraph's marker and newline). The rendered `UIFont` cannot always say: a family that is not installed on this
-    /// device renders in a system fallback, and a family without an italic or bold face renders upright or regular.
-    /// `relativeAttributes` reads these back, so editing never rewrites what the device cannot show.
-    static let modelFontKey = NSAttributedString.Key("nib.text.modelFont")
-    /// Bit 1 = bold, bit 2 = italic.
-    static let modelTraitsKey = NSAttributedString.Key("nib.text.modelTraits")
-    static let modelKeys: [NSAttributedString.Key] = [modelFontKey, modelTraitsKey]
+    /// The run's font family and bold / italic as the model has them: the bridge's keys (contracts-v2
+    /// `.nibModelFont`, `.nibModelTraits`: bit 1 bold, bit 2 italic). Text boxes put both on every character of a run
+    /// (and on its paragraph's marker and newline), the default family and no traits included, so their presence says
+    /// the characters came from the model. The rendered `UIFont` cannot always say: a family that is not installed on
+    /// this device renders in a system fallback, and a family without an italic or bold face renders upright or
+    /// regular. `relativeAttributes` reads these back, so editing never rewrites what the device cannot show.
+    static let modelKeys: [NSAttributedString.Key] = [.nibModelFont, .nibModelTraits]
     /// An empty last paragraph has no character to carry its settings: they ride on the newline before it (JSON).
     static let trailingParagraphKey = NSAttributedString.Key("nib.text.trailingParagraph")
     static let linkColour = RGBA(nibHex: NibInk.cobalt.hex)
@@ -58,7 +64,7 @@ enum TextLayout {
         var traits = 0
         if a.bold ?? base.bold ?? false { traits |= 1 }
         if a.italic ?? base.italic ?? false { traits |= 2 }
-        return [modelFontKey: a.font ?? base.font ?? RichTextBridge.defaultFontFamily, modelTraitsKey: traits]
+        return [.nibModelFont: a.font ?? base.font ?? RichTextBridge.defaultFontFamily, .nibModelTraits: traits]
     }
 
     /// Attributes for typing in run style `a` over `base`: the bridge's rendering plus the model font keys.
@@ -373,7 +379,7 @@ enum TextLayout {
             var family: String? = font.familyName.hasPrefix(".") ? nil : font.familyName
             var bold = traits.contains(.traitBold)
             var italic = traits.contains(.traitItalic)
-            if !isCode, let model = a[modelFontKey] as? String, let flags = a[modelTraitsKey] as? Int {
+            if !isCode, let model = a[.nibModelFont] as? String, let flags = a[.nibModelTraits] as? Int {
                 let modelBold = flags & 1 != 0, modelItalic = flags & 2 != 0
                 if rendersAs(font, family: model, bold: modelBold, italic: modelItalic) {
                     // The face is exactly what the model renders to here (a fallback, or a family without the
@@ -468,12 +474,13 @@ enum TextLayout {
         let container: NSTextContainer
     }
 
-    /// TextKit 1 layout at a fixed width, no line-fragment padding (the box padding is the inset).
+    /// TextKit 1 layout at a fixed width. The box padding is the inset and the line-fragment padding is the shared
+    /// `TextLayoutInfo.lineFragmentPadding` (0), as `layoutInfo` publishes for link hit-testing.
     static func layout(_ s: NSAttributedString, width: CGFloat) -> Laid {
         let storage = NSTextStorage(attributedString: s)
         let manager = NSLayoutManager()
         let container = NSTextContainer(size: CGSize(width: max(width, 1), height: CGFloat.greatestFiniteMagnitude))
-        container.lineFragmentPadding = 0
+        container.lineFragmentPadding = CGFloat(TextLayoutInfo.lineFragmentPadding)
         manager.addTextContainer(container)
         storage.addLayoutManager(manager)
         manager.ensureLayout(for: container)
@@ -499,6 +506,44 @@ enum TextLayout {
         let pad = max(0, box.style.padding)
         let laid = layout(s, width: CGFloat(max(1, box.frame.w - 2 * pad)))
         return Double(textHeight(laid, base: base)) + 2 * pad
+    }
+
+    /// Where a text box's text is laid out (contracts-v2 `TextLayoutDescriptor` for "text"): the frame inset by the
+    /// padding, rotated with it, over the box's default attributes. Links (F029) and editors hit-test text with it.
+    static func layoutInfo(_ item: Item) -> TextLayoutInfo? {
+        guard item.kind == .text, let box = item.text else { return nil }
+        let pad = max(0, box.style.padding)
+        let f = box.frame
+        return TextLayoutInfo(container: Frame(x: f.x + pad, y: f.y + pad, w: max(0, f.w - 2 * pad),
+                                               h: max(0, f.h - 2 * pad), rotation: f.rotation),
+                              base: box.style.defaults)
+    }
+
+    /// The page rect the laid-out text covers (inline images measured as squares), turned with the box: what a
+    /// full-page box answers to taps and the lasso. An empty box covers a zero-size rect at its first line.
+    static func textBounds(_ box: TextBoxItem) -> Rect {
+        let base = self.base(box.style, darkPaper: false)
+        let s = attributed(box.text, base: base) { _, font in placeholderGlyph(font) }
+        let pad = max(0, box.style.padding)
+        let origin = Point(box.frame.x + pad, box.frame.y + pad)
+        var local = Rect(x: origin.x, y: origin.y, width: 0, height: 0)
+        if s.length > 0 {
+            let laid = layout(s, width: CGFloat(max(1, box.frame.w - 2 * pad)))
+            let used = laid.manager.usedRect(for: laid.container)
+            if used.width > 0, used.height > 0 {
+                local = Rect(x: origin.x + Double(used.minX), y: origin.y + Double(used.minY),
+                             width: Double(used.width), height: Double(used.height))
+            }
+        }
+        guard box.frame.rotation != 0 else { return local }
+        let c = box.frame.center
+        let cs = cos(box.frame.rotation), sn = sin(box.frame.rotation)
+        let corners = [Point(local.minX, local.minY), Point(local.maxX, local.minY),
+                       Point(local.maxX, local.maxY), Point(local.minX, local.maxY)].map { p -> Point in
+            let dx = p.x - c.x, dy = p.y - c.y
+            return Point(c.x + dx * cs - dy * sn, c.y + dx * sn + dy * cs)
+        }
+        return Rect.bounding(corners) ?? local
     }
 
     // MARK: Drawing

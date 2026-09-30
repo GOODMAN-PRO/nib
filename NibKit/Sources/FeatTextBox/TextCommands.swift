@@ -4,13 +4,13 @@ import NibContracts
 
 // MARK: - Settings and saved styles
 
-/// The text feature's settings. Named styles are one synced key per style ("text.styles.<name>", null removes one),
-/// so two devices adding styles never overwrite each other.
+/// The text feature's settings. The style of new boxes is the shared `NibSettings.defaultTextStyle` (contracts-v2: a
+/// `TextBoxStyle`, whose `align` and `lineSpacing` are the paragraph defaults), which paste-and-match-style (F014) and
+/// page text (F028) read too. Named styles are one synced key per style ("text.styles.<name>", null removes one), so
+/// two devices adding styles never overwrite each other.
 enum TextSettings {
     /// Pin Text Tool (T-035): the text tool stays selected after a box is added.
     static let pinned = SettingKey("text.pinned", default: false, synced: true)
-    /// Style of new text boxes ("Save as Default", T-096).
-    static let defaultStyle = SettingKey("text.defaultStyle", default: JSONValue.null, synced: true)
     static let stylesPrefix = "text.styles."
 
     static func named(_ name: String) -> SettingKey<JSONValue> {
@@ -20,11 +20,12 @@ enum TextSettings {
     static func declare(_ s: SettingsStore, owner: String) {
         s.declare(pinned, summary: "Keep the text tool selected after adding a text box (Pin Text Tool).", owner: owner,
                   schema: .bool())
-        s.declare(defaultStyle, summary: "Style of new text boxes: TextBoxStyle fields plus optional align and lineSpacing.",
-                  owner: owner, schema: .anything("TextBoxStyle object, optionally with align and lineSpacing"))
+        s.declare(NibSettings.defaultTextStyle,
+                  summary: "Style of new text boxes (Save as Default): TextBoxStyle fields; align and lineSpacing are the paragraph defaults.",
+                  owner: owner, schema: .anything("TextBoxStyle object"))
         s.declarePrefix(stylesPrefix, synced: true,
                         summary: "Named text styles, one key per style (text.styles.<name>); null removes a style.",
-                        owner: owner, schema: .anything("TextBoxStyle object, optionally with align and lineSpacing"))
+                        owner: owner, schema: .anything("TextBoxStyle object"))
     }
 
     /// Saved named styles, sorted by name.
@@ -45,48 +46,87 @@ enum TextSettings {
     }
 }
 
-/// A saved text style: the box style (with its default character attributes) plus the paragraph settings a
-/// `TextBoxStyle` cannot hold. Stored as one JSON object: TextBoxStyle fields plus "align" and "lineSpacing".
+/// A saved text style: a `TextBoxStyle` whose `align` and `lineSpacing` (contracts-v2) are the paragraph defaults new
+/// paragraphs take. A text box keeps its paragraph settings in its paragraphs, so `box` (what a box made in the style
+/// stores) leaves them out.
 struct SavedTextStyle: Equatable {
-    var box: TextBoxStyle
-    /// nil = natural.
-    var align: ParagraphAlignment?
-    /// Extra points between lines; nil = automatic.
-    var lineSpacing: Double?
+    /// The whole style, as `NibSettings.defaultTextStyle` stores it.
+    private(set) var style: TextBoxStyle
 
     /// The `TextAttributes` JSON keys (a saved style writes every one of them, see `json`).
     static let attributeKeys = ["font", "size", "color", "highlight", "bold", "italic", "underline", "strikethrough",
                                 "code", "baseline", "link", "attachment"]
 
-    init(box: TextBoxStyle = TextBoxStyle(), align: ParagraphAlignment? = nil, lineSpacing: Double? = nil) {
-        var b = box
-        b.fullPage = false
-        self.box = b
-        self.align = align == .natural ? nil : align
-        self.lineSpacing = lineSpacing.flatMap { $0 > 0 ? min($0, 100) : nil }
+    init(_ style: TextBoxStyle = TextBoxStyle()) {
+        self.style = SavedTextStyle.normalized(style)
     }
 
+    init(box: TextBoxStyle, align: ParagraphAlignment? = nil, lineSpacing: Double? = nil) {
+        var s = box
+        s.align = align
+        s.lineSpacing = lineSpacing
+        self.init(s)
+    }
+
+    /// A `style` object from a caller: TextBoxStyle fields, `align` and `lineSpacing` included.
     init(json: JSONValue, path: String = "$.style") throws {
         guard case .object(var o) = json else { throw NibError.invalid("a text style must be an object", path: path) }
-        if let raw = o["align"]?.stringValue {
-            guard let a = ParagraphAlignment(rawValue: raw) else {
-                throw NibError.invalid("align must be one of \(ParagraphAlignment.allCases.map { $0.rawValue })", path: path + ".align")
-            }
-            align = a == .natural ? nil : a
+        if let raw = o["align"]?.stringValue, ParagraphAlignment(rawValue: raw) == nil {
+            throw NibError.invalid("align must be one of \(ParagraphAlignment.allCases.map { $0.rawValue })", path: path + ".align")
         }
-        if let ls = o["lineSpacing"]?.doubleValue { lineSpacing = ls > 0 ? min(ls, 100) : nil }
-        o["align"] = nil
-        o["lineSpacing"] = nil
         // A style never turns boxes into full-page text.
         o["fullPage"] = nil
+        let decoded: TextBoxStyle
         do {
-            box = try CommandRegistry.decode(TextBoxStyle.self, from: .object(o))
+            decoded = try CommandRegistry.decode(TextBoxStyle.self, from: .object(o))
         } catch let e as NibError {
-            throw NibError(.invalidParams, e.message, path: path, hint: "a TextBoxStyle: background, borderColor, borderWidth, cornerRadius, padding, shadow, autoGrow, defaults")
+            throw NibError(.invalidParams, e.message, path: path, hint: "a TextBoxStyle: background, borderColor, borderWidth, cornerRadius, padding, shadow, autoGrow, defaults, align, lineSpacing")
         }
-        box = TextStyles.clamped(box)
-        box.defaults.link = nil
-        box.defaults.attachment = nil
+        self.init(decoded)
+    }
+
+    /// The box part: what a text box made in this style stores (no paragraph defaults).
+    var box: TextBoxStyle {
+        get {
+            var b = style
+            b.align = nil
+            b.lineSpacing = nil
+            return b
+        }
+        set {
+            var s = newValue
+            s.align = style.align
+            s.lineSpacing = style.lineSpacing
+            style = SavedTextStyle.normalized(s)
+        }
+    }
+
+    /// nil = natural.
+    var align: ParagraphAlignment? {
+        get { style.align }
+        set { style.align = newValue == .natural ? nil : newValue }
+    }
+
+    /// Extra points between lines; nil = automatic.
+    var lineSpacing: Double? {
+        get { style.lineSpacing }
+        set { style.lineSpacing = SavedTextStyle.spacing(newValue) }
+    }
+
+    /// Numeric fields in range, no full-page text, links or images in the defaults, natural alignment and automatic
+    /// spacing as nil.
+    static func normalized(_ style: TextBoxStyle) -> TextBoxStyle {
+        var s = TextStyles.clamped(style)
+        s.fullPage = false
+        s.defaults.link = nil
+        s.defaults.attachment = nil
+        if s.align == .natural { s.align = nil }
+        s.lineSpacing = spacing(s.lineSpacing)
+        return s
+    }
+
+    private static func spacing(_ v: Double?) -> Double? {
+        v.flatMap { $0 > 0 && $0.isFinite ? min($0, 100) : nil }
     }
 
     /// Every field written out, the unset ones as null (align "natural", lineSpacing 0). Styles are merged over
@@ -94,11 +134,7 @@ struct SavedTextStyle: Equatable {
     /// over the default or the box), so a field left out would keep the old value: No Fill, Auto spacing or the
     /// default font would never stick.
     var json: JSONValue {
-        var b = box
-        b.fullPage = false
-        b.defaults.link = nil
-        b.defaults.attachment = nil
-        guard case .object(var o) = (try? JSONValue.from(b)) ?? .null else { return .object([:]) }
+        guard case .object(var o) = (try? JSONValue.from(style)) ?? .null else { return .object([:]) }
         o["fullPage"] = nil
         o["background"] = o["background"] ?? JSONValue.null
         o["borderColor"] = o["borderColor"] ?? JSONValue.null
@@ -119,7 +155,7 @@ struct SavedTextStyle: Equatable {
     /// The style's character and paragraph settings on the whole of `text`, for items without a box style (sticky
     /// notes, shape and connector labels).
     func styling(_ text: RichText) -> RichText {
-        var attrs = box.defaults
+        var attrs = style.defaults
         attrs.link = nil
         attrs.attachment = nil
         var t = RichTextEdit.normalized(text)
@@ -139,6 +175,50 @@ struct SavedTextStyle: Equatable {
             if let l = lineSpacing, t.paragraphs[i].lineSpacing == nil { t.paragraphs[i].lineSpacing = l }
         }
         return t
+    }
+}
+
+/// A box style patch (`text.setBoxStyle`, the editor's box controls): the fields a text box stores, merged over its
+/// style, and the paragraph defaults `align` / `lineSpacing` (contracts-v2 `TextBoxStyle` fields), which a box keeps in
+/// its paragraphs, so they apply to every paragraph.
+struct BoxStylePatch {
+    let fields: [String: JSONValue]
+    let align: ParagraphAlignment?
+    /// 0 = automatic.
+    let lineSpacing: Double?
+    /// New default character attributes: runs stop overriding the fields they set.
+    let defaults: TextAttributes?
+
+    init(_ patch: [String: JSONValue]) throws {
+        let paragraph = try CommandRegistry.decode(TextBoxStyle.self,
+                                                   from: .object(patch.filter { $0.key == "align" || $0.key == "lineSpacing" }))
+        align = paragraph.align
+        lineSpacing = paragraph.lineSpacing
+        var f = patch
+        f["align"] = nil
+        f["lineSpacing"] = nil
+        fields = f
+        defaults = try patch["defaults"].flatMap { v -> TextAttributes? in
+            v == .null ? nil : try CommandRegistry.decode(TextAttributes.self, from: v)
+        }
+    }
+
+    /// `style` with the fields merged over it (fields left out stay, null clears a colour), and `text` with the new
+    /// defaults showing and the paragraph settings on every paragraph.
+    func apply(to style: TextBoxStyle, text: RichText) throws -> (style: TextBoxStyle, text: RichText) {
+        let merged = try JSONValue.from(style).merging(.object(fields))
+        let s: TextBoxStyle
+        do {
+            s = TextStyles.clamped(try CommandRegistry.decode(TextBoxStyle.self, from: merged))
+        } catch let e as NibError {
+            throw NibError(.invalidParams, e.message, path: "$.style")
+        }
+        var t = text
+        if let d = defaults { t = RichTextEdit.clearing(t, fieldsOf: d) }
+        if align != nil || lineSpacing != nil {
+            t = RichTextEdit.setParagraphs(t, indices: Array(t.paragraphs.indices), align: align, lineSpacing: lineSpacing)
+        }
+        return (s, t)
     }
 }
 
@@ -182,7 +262,12 @@ enum TextPresets {
 enum TextStyles {
     /// The style new boxes get (the saved default, else the built-in one).
     static func defaultStyle(_ s: SettingsStore) -> SavedTextStyle {
-        (try? SavedTextStyle(json: s.get(TextSettings.defaultStyle))) ?? SavedTextStyle()
+        SavedTextStyle(s.get(NibSettings.defaultTextStyle))
+    }
+
+    /// Makes `style` the style of new boxes.
+    static func setDefault(_ style: SavedTextStyle, _ s: SettingsStore) {
+        s.set(NibSettings.defaultTextStyle, style.style)
     }
 
     static func named(_ name: String, _ s: SettingsStore) -> SavedTextStyle? {
@@ -383,9 +468,10 @@ enum TextItems {
         return Target(doc: doc, page: page, item: item)
     }
 
-    /// Changes the text items `refs` (one write each, so the undo step stays whole). The change and the TextKit refit
-    /// run before `mutate`, which stays short (ARCHITECTURE §14); the transaction writes each result if the item is
-    /// still the one it was computed from, and recomputes it otherwise.
+    /// Changes the text items `refs` in one transaction (one undo step: contracts-v2 G4 reverts an item written more
+    /// than once in a group all the way). The change and the TextKit refit run before `mutate`, which stays short
+    /// (ARCHITECTURE §14); the transaction writes each result if the item is still the one it was computed from, and
+    /// recomputes it otherwise (an earlier ref of the same call, or someone else, changed it meanwhile).
     @MainActor static func edit(_ ctx: CommandContext, refs: [String], path: (Int) -> String,
                                 _ change: (inout Target) throws -> Void) throws {
         let assets = ctx.services.assets
@@ -452,10 +538,17 @@ enum TextRefs {
 
 /// Finding text boxes under a point (taps).
 enum TextHitTest {
-    /// Topmost live text box whose (rotated) frame contains `point`, within `slop` points.
+    /// Topmost live text box whose (rotated) frame contains `point`, within `slop` points. A full-page box (F028's
+    /// page text) counts only where its text is (`TextBoxDrawer.hitBounds`), so a tap on the rest of the page is
+    /// a tap on the page.
     static func textItem(at point: Point, in items: [Item], slop: Double = 6) -> Item? {
         for item in items.reversed() where item.kind == .text && !item.deleted {
-            if let box = item.text, contains(box, point, slop: slop) { return item }
+            guard let box = item.text else { continue }
+            if box.style.fullPage {
+                if TextLayout.textBounds(box).insetBy(-slop).contains(point) { return item }
+            } else if contains(box, point, slop: slop) {
+                return item
+            }
         }
         return nil
     }
@@ -689,7 +782,7 @@ struct TextSetBoxStyle: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "text.setBoxStyle", title: "Text Box Style",
-        summary: "Set text box style fields: background, borderColor, borderWidth, cornerRadius, padding, shadow, autoGrow, defaults (character style), align, lineSpacing.",
+        summary: "Set text box style fields: background, borderColor, borderWidth, cornerRadius, padding, shadow, autoGrow, defaults (character style); align and lineSpacing set every paragraph.",
         params: .obj(["refs": .arr(.ref),
                       "style": .obj(["background": .color, "borderColor": .color, "borderWidth": .num(min: 0, max: 20),
                                      "cornerRadius": .num(min: 0, max: 200), "padding": .num(min: 0, max: 100),
@@ -703,47 +796,24 @@ struct TextSetBoxStyle: NibCommand {
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
-        guard case .object(var patch) = p.style else {
+        guard case .object(let fields) = p.style else {
             throw NibError.invalid("style must be an object", path: "$.style")
         }
         guard !p.refs.isEmpty else { throw NibError.invalid("refs is empty", path: "$.refs") }
-        var align: ParagraphAlignment?
-        if let raw = patch["align"]?.stringValue {
-            guard let a = ParagraphAlignment(rawValue: raw) else { throw NibError.invalid("unknown alignment '\(raw)'", path: "$.style.align") }
-            align = a
-        }
-        let lineSpacing = patch["lineSpacing"]?.doubleValue
-        patch["align"] = nil
-        patch["lineSpacing"] = nil
-        let newDefaults = try patch["defaults"].flatMap { v -> TextAttributes? in
-            v == .null ? nil : try CommandRegistry.decode(TextAttributes.self, from: v)
-        }
-        var seen = Set<String>()
-        let refs = p.refs.filter { seen.insert($0).inserted }   // one write per item keeps the undo step whole
-        let paths = refs.map { ref in p.refs.firstIndex(of: ref).map { "$.refs[\($0)]" } ?? "$.refs" }
-        for (i, ref) in refs.enumerated() {
-            let target = try TextItems.editable(ctx.workspace, ref, path: paths[i])
+        let patch = try BoxStylePatch(fields)
+        for (i, ref) in p.refs.enumerated() {
+            let target = try TextItems.editable(ctx.workspace, ref, path: "$.refs[\(i)]")
             guard target.item.kind == .text else {
-                throw NibError(.invalidParams, "\(ref) is not a text box", path: paths[i],
+                throw NibError(.invalidParams, "\(ref) is not a text box", path: "$.refs[\(i)]",
                                hint: "box styles apply to text boxes only; sticky notes take text.format and text.setParagraph")
             }
         }
-        try TextItems.edit(ctx, refs: refs, path: { paths[$0] }) { t in
+        try TextItems.edit(ctx, refs: p.refs, path: { "$.refs[\($0)]" }) { t in
             guard var box = t.item.text else {
                 throw NibError(.invalidParams, "item \(t.item.id) is not a text box", path: "$.refs",
                                hint: "box styles apply to text boxes only")
             }
-            let merged = try JSONValue.from(box.style).merging(.object(patch))
-            do {
-                box.style = TextStyles.clamped(try CommandRegistry.decode(TextBoxStyle.self, from: merged))
-            } catch let e as NibError {
-                throw NibError(.invalidParams, e.message, path: "$.style")
-            }
-            if let d = newDefaults { box.text = RichTextEdit.clearing(box.text, fieldsOf: d) }
-            if align != nil || lineSpacing != nil {
-                box.text = RichTextEdit.setParagraphs(box.text, indices: Array(box.text.paragraphs.indices),
-                                                      align: align, lineSpacing: lineSpacing)
-            }
+            (box.style, box.text) = try patch.apply(to: box.style, text: box.text)
             t.item.text = box
         }
         return NoResult()
@@ -781,8 +851,8 @@ struct TextSaveDefaultStyle: NibCommand {
             settings.set(TextSettings.named(name), style.json)
             return Output(name: name, setting: TextSettings.stylesPrefix + name)
         }
-        settings.set(TextSettings.defaultStyle, style.json)
-        return Output(name: nil, setting: TextSettings.defaultStyle.name)
+        TextStyles.setDefault(style, settings)
+        return Output(name: nil, setting: NibSettings.defaultTextStyle.name)
     }
 }
 
@@ -799,7 +869,7 @@ struct TextTapAt: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "text.tapAt", title: "Edit Text Box",
-        summary: "Tap handler: start editing the text box under a point when the text tool is active, the box is selected, or on double-tap.",
+        summary: "Tap handler: start editing the text box under a point when the text tool is active, the box is selected, or on double-tap; on a page's full-page text it starts page typing (text.startPageText).",
         params: .obj(["page": .ref, "point": .point, "ref": .ref,
                       "gesture": .str("tap, doubleTap or longPress", choices: CanvasGesture.allCases.map { $0.rawValue })],
                      required: ["page", "point"]),
@@ -817,16 +887,25 @@ struct TextTapAt: NibCommand {
             target = items.first { $0.id == id && $0.kind == .text }
         }
         if target == nil { target = TextHitTest.textItem(at: point, in: items) }
-        guard let item = target, !item.locked, item.layer == session.activeLayer,
-              !session.hiddenLayers.contains(item.layer) else {
+        guard let item = target, item.layer == session.activeLayer, !session.hiddenLayers.contains(item.layer) else {
             return Output(handled: false, ref: nil)
         }
         let editor = TextBoxEditor.editor(for: session)
         let wants = p.gesture == CanvasGesture.doubleTap.rawValue || session.tool == TextTool.toolID
             || session.selection.items.contains(item.id) || (editor?.isEditing ?? false)
-        guard wants, let e = editor, e.beginEditing(doc: doc, page: page, item: item, caretAt: point) else {
+        guard wants else { return Output(handled: false, ref: nil) }
+        let ref = NodeRef.item(doc, page, item.id).description
+        if item.text?.style.fullPage == true {
+            // Page text belongs to its own editor (F028): typing on it starts full-page typing there.
+            guard ctx.principal.isUser, let app = ctx.app,
+                  app.commands.descriptor(CommandIDs.textStartPageText) != nil else { return Output(handled: false, ref: nil) }
+            editor?.endEditing()
+            app.perform(CommandIDs.textStartPageText, ["page": .string(NodeRef.page(doc, page).description)], session: session)
+            return Output(handled: true, ref: ref)
+        }
+        guard !item.locked, let e = editor, e.beginEditing(doc: doc, page: page, item: item, caretAt: point) else {
             return Output(handled: false, ref: nil)
         }
-        return Output(handled: true, ref: NodeRef.item(doc, page, item.id).description)
+        return Output(handled: true, ref: ref)
     }
 }

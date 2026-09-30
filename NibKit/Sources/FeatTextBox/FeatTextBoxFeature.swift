@@ -18,11 +18,15 @@ public enum FeatTextBoxFeature: NibFeature {
         TextSettings.declare(app.settings, owner: id)
 
         app.content.drawers.register(ItemDrawerEntry(key: ItemKind.text.rawValue, owner: id, drawer: TextBoxDrawer()))
+        // Where a box's text sits (links and other editors hit-test text with it).
+        app.content.textLayouts.register(TextLayoutDescriptor(key: ItemKind.text.rawValue, owner: id) { item in
+            TextLayout.layoutInfo(item)
+        })
 
         // Select a box, then tap it (or double-tap it with any tool) to type; before selection.tapAt (400).
         for gesture in [CanvasGesture.tap, CanvasGesture.doubleTap] {
             app.content.tapHandlers.register(TapHandlerDescriptor(
-                id: "text.tapAt." + gesture.rawValue, owner: id, gesture: gesture, command: "text.tapAt",
+                id: CommandIDs.textTapAt + "." + gesture.rawValue, owner: id, gesture: gesture, command: CommandIDs.textTapAt,
                 order: 350, itemKinds: [.text]))
         }
 
@@ -56,7 +60,7 @@ public enum FeatTextBoxFeature: NibFeature {
         // The action equivalent of double-tapping a text box (VoiceOver, pointer, keyboard users).
         app.ui.menus.register(MenuItemDescriptor(
             id: "text.edit", title: String(localized: "Edit Text"), icon: NibSymbol.text.name, location: .objectMenu,
-            order: 150, owner: id, command: "text.tapAt",
+            order: 150, owner: id, command: CommandIDs.textTapAt,
             params: { ctx in
                 guard let doc = ctx.selection.doc ?? ctx.doc, let page = ctx.selection.page ?? ctx.page,
                       let item = ctx.selection.items.first else { return [:] }

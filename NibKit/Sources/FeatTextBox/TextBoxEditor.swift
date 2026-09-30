@@ -15,7 +15,11 @@ private let textLog = Logger(subsystem: "app.nib", category: "text")
 /// Text flows through `RichTextBridge` (via `TextLayout`) both ways. Typing is committed with `text.setText` after
 /// 500 ms without changes and when editing ends; a box added with the text tool is created by `text.createBox` on its
 /// first commit, so an abandoned empty box leaves nothing behind. Formatting while editing changes the text view and
-/// commits at once. Scribble, Writing Tools and adaptive image glyphs come from `UITextView` (T-078, P-049, P-116).
+/// commits at once. Every write of one editing session joins one undo group, so one undo takes the whole session back
+/// (a new box goes with its text; contracts-v2 G4 reverts an item written several times in a group all the way).
+/// While editing, the session's `editingTextRef` and `editingTextRange` follow the text view, and selected text offers
+/// the `MenuLocation.textSelection` entries (links, plugins) in its edit menu. Scribble, Writing Tools and adaptive
+/// image glyphs come from `UITextView` (T-078, P-049, P-116).
 @MainActor
 final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGestureRecognizerDelegate,
                            UIFontPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
@@ -52,6 +56,10 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         /// The plain text when editing started: typed URLs are linked only when the text changed, so a link the user
         /// removed on purpose stays removed.
         let openedText: String
+        /// The undo group every write of this editing session joins.
+        let group: String
+        /// The More popover's open state when the window's floating host shows it.
+        let popover: TextPopoverState
         let container: UIView
         let chrome: TextBoxChromeView
         let outline: CAShapeLayer
@@ -60,7 +68,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
         init(doc: DocumentID, page: PageID, id: ElementID, exists: Bool, createdByTool: Bool, box: TextBoxItem,
              darkPaper: Bool, container: UIView, chrome: TextBoxChromeView, outline: CAShapeLayer,
-             textView: TextBoxTextView, model: TextFormatModel) {
+             textView: TextBoxTextView, model: TextFormatModel, popover: TextPopoverState) {
             self.doc = doc
             self.page = page
             self.id = id
@@ -70,17 +78,18 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             self.base = TextLayout.base(box.style, darkPaper: darkPaper)
             self.darkPaper = darkPaper
             self.openedText = exists ? box.text.plainText : ""
+            self.group = NibID.make().raw
             self.container = container
             self.chrome = chrome
             self.outline = outline
             self.textView = textView
             self.model = model
+            self.popover = popover
         }
 
         var ref: String { NodeRef.item(doc, page, id).description }
     }
 
-    enum Outcome { case ok, missing, failed }
     enum Toggle { case bold, italic, underline, strikethrough }
 
     let app: NibApp
@@ -99,6 +108,8 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
     private var pendingInsert: NSRange?
     private var lastCaret: Int?
     private var outsideTouch: CGPoint?
+    /// The window's floating host while it shows this editor's More popover.
+    private weak var floating: FloatingHosting?
     /// Fires whenever the text, selection or style changes (the keyboard bar and inspector refresh on it).
     let changes = PassthroughSubject<Void, Never>()
 
@@ -214,8 +225,8 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         container.addSubview(chrome)
         let outline = CAShapeLayer()
         outline.fillColor = nil
-        outline.lineWidth = 1
-        outline.lineDashPattern = [NSNumber(value: Double(NibSpacing.xs)), NSNumber(value: Double(NibSpacing.xs))]
+        outline.lineWidth = NibStroke.thin
+        outline.lineDashPattern = NibStroke.layerDash
         container.layer.addSublayer(outline)
 
         let tv = TextBoxTextView()
@@ -223,7 +234,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         tv.delegate = self
         tv.backgroundColor = .clear
         tv.isScrollEnabled = false
-        tv.textContainer.lineFragmentPadding = 0
+        tv.textContainer.lineFragmentPadding = CGFloat(TextLayoutInfo.lineFragmentPadding)
         tv.allowsEditingTextAttributes = true
         tv.linkTextAttributes = [.foregroundColor: TextLayout.linkColour.uiColor,
                                  .underlineStyle: NSUnderlineStyle.single.rawValue]
@@ -251,8 +262,9 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
 
         let st = EditState(doc: doc, page: page, id: id, exists: exists, createdByTool: createdByTool, box: box,
                            darkPaper: paperIsDark(doc: doc, page: page), container: container, chrome: chrome,
-                           outline: outline, textView: tv, model: model)
+                           outline: outline, textView: tv, model: model, popover: TextPopoverState())
         state = st
+        remember(st.group)
         applyInsets(st)
         render(box.text, selection: nil)
         st.lastCommitted = exists ? currentRichText() : nil
@@ -261,6 +273,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         host.session.isEditingText = true
         tv.becomeFirstResponder()
         if let p = caret { placeCaret(at: p) }
+        publishFocus()
         changes.send()
     }
 
@@ -273,8 +286,15 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         let text = currentRichText()
         state = nil
         st.textView.delegate = nil
+        dismissFloatingInspector(st)
         if st.textView.isFirstResponder { st.textView.resignFirstResponder() }
-        host?.session.isEditingText = false
+        if let session = host?.session {
+            session.isEditingText = false
+            if session.editingTextRef == st.ref {
+                session.editingTextRef = nil
+                session.editingTextRange = nil
+            }
+        }
         removeKeyboardInset()
         if commit {
             if st.exists {
@@ -282,11 +302,11 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
                     deleteEmptyBox(st)
                 } else {
                     if text != st.lastCommitted { submit(text, for: st) }
-                    if text.plainText != st.openedText { autodetectLinks(text, ref: st.ref) }
+                    if text.plainText != st.openedText { autodetectLinks(text, for: st) }
                 }
             } else if !text.isEmpty {
                 submit(text, for: st)
-                autodetectLinks(text, ref: st.ref)
+                autodetectLinks(text, for: st)
             }
         }
         enqueue { [weak self] in
@@ -337,7 +357,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         let textJSON = (try? JSONValue.from(text)) ?? .string(text.plainText)
         if st.exists {
             let params: JSONValue = ["ref": .string(st.ref), "text": textJSON]
-            enqueue { [weak self] in await self?.execute("text.setText", params) }
+            enqueue { [weak self] in await self?.execute(CommandIDs.textSetText, params, group: st.group) }
             return
         }
         st.exists = true
@@ -353,8 +373,11 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         ]
         enqueue { [weak self] in
             guard let self = self else { return }
-            if await self.execute("text.createBox", params) == .ok {
-                if self.state === st { self.hide(st.id, page: st.page) }
+            if await self.execute(CommandIDs.textCreateBox, params, group: st.group) {
+                if self.state === st {
+                    self.hide(st.id, page: st.page)
+                    self.publishFocus()
+                }
             } else {
                 st.exists = false
                 st.lastCommitted = nil
@@ -362,22 +385,27 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         }
     }
 
+    /// A box left empty goes, in the session's undo step. `item.delete` belongs to the object menu feature (an optional
+    /// dependency): without it the box is kept, emptied.
     private func deleteEmptyBox(_ st: EditState) {
         let ref = st.ref
+        let canDelete = app.commands.descriptor(CommandIDs.itemDelete) != nil
         enqueue { [weak self] in
             guard let self = self else { return }
-            // item.delete belongs to the object menu feature; without it the box is kept, emptied.
-            if await self.execute("item.delete", ["refs": [.string(ref)]], quietIfMissing: true) == .missing {
-                await self.execute("text.setText", ["ref": .string(ref), "text": ""])
+            if canDelete {
+                await self.execute(CommandIDs.itemDelete, ["refs": [.string(ref)]], group: st.group)
+            } else {
+                await self.execute(CommandIDs.textSetText, ["ref": .string(ref), "text": ""], group: st.group)
             }
         }
     }
 
-    /// Typed URLs become links (F029's `link.autodetect`) once editing ends.
-    private func autodetectLinks(_ text: RichText, ref: String) {
-        guard TextBoxEditor.hasUnlinkedURL(text) else { return }
+    /// Typed URLs become links (F029's `link.autodetect`, when installed) once editing ends, in the session's undo step.
+    private func autodetectLinks(_ text: RichText, for st: EditState) {
+        guard TextBoxEditor.hasUnlinkedURL(text), app.commands.descriptor(CommandIDs.linkAutodetect) != nil else { return }
+        let ref = st.ref
         enqueue { [weak self] in
-            await self?.execute("link.autodetect", ["ref": .string(ref)], quietIfMissing: true)
+            await self?.execute(CommandIDs.linkAutodetect, ["ref": .string(ref)], group: st.group)
         }
     }
 
@@ -407,24 +435,36 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         }
     }
 
+    /// Runs `command` as the user. `group` nil = a group of its own. The editor ignores the commits of its own groups
+    /// (`own`), and follows every other change of the box, so a command that edits the text for it (an edit-menu
+    /// entry) passes `own: false`. False when it failed (logged and toasted by the shell).
     @discardableResult
-    private func execute(_ command: String, _ params: JSONValue, quietIfMissing: Bool = false) async -> Outcome {
-        let group = NibID.make().raw
-        if ownGroups.count > 500 { ownGroups.removeAll() }
-        ownGroups.insert(group)
+    private func execute(_ command: String, _ params: JSONValue, group: String? = nil, own: Bool = true) async -> Bool {
+        let group = group ?? NibID.make().raw
+        if own { remember(group) }
         do {
             _ = try await app.bus.execute(Invocation(command: command, params: params, principal: .user,
                                                      session: host?.session, group: group))
-            return .ok
-        } catch let e as NibError where quietIfMissing && (e.code == .notFound || e.code == .unavailable)
-                    && e.message.contains(command) {
-            return .missing
+            return true
         } catch {
             textLog.error("\(command, privacy: .public) failed: \(String(describing: error), privacy: .public)")
             NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                             userInfo: ["command": command, "error": NibError.wrap(error)])
-            return .failed
+            return false
         }
+    }
+
+    private func remember(_ group: String) {
+        if ownGroups.count > 500 { ownGroups.removeAll() }
+        ownGroups.insert(group)
+    }
+
+    /// The session's text focus (contracts-v2): the box and the selection in plain-text units, once the box exists.
+    private func publishFocus() {
+        guard let st = state, st.exists, let session = host?.session else { return }
+        let r = modelSelection()
+        session.editingTextRef = st.ref
+        session.editingTextRange = [r.location, r.length]
     }
 
     /// Someone else changed the box (undo, sync, a collaborator, another command): follow it.
@@ -644,14 +684,16 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         }
     }
 
-    /// Box style fields (background, border, corners, padding, shadow, auto-grow, defaults, align, lineSpacing).
+    /// Box style fields (background, border, corners, padding, shadow, auto-grow, defaults), plus `align` and
+    /// `lineSpacing` for every paragraph.
     func applyBoxStyle(_ patch: JSONValue) {
-        guard let st = state, case .object(var fields) = patch else { return }
+        guard let st = state, case .object(let fields) = patch else { return }
         if st.exists {
             commitNow()
             enqueue { [weak self] in
                 guard let self = self,
-                      await self.execute("text.setBoxStyle", ["refs": [.string(st.ref)], "style": patch]) == .ok,
+                      await self.execute(CommandIDs.textSetBoxStyle, ["refs": [.string(st.ref)], "style": patch],
+                                         group: st.group),
                       self.state === st,
                       let box = (try? self.app.workspace.item(st.doc, page: st.page, id: st.id))?.text else { return }
                 self.reload(box)
@@ -659,24 +701,12 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
             return
         }
         // Not created yet: style it here; text.createBox carries the style.
-        let align = fields["align"]?.stringValue.flatMap { ParagraphAlignment(rawValue: $0) }
-        let lineSpacing = fields["lineSpacing"]?.doubleValue
-        fields["align"] = nil
-        fields["lineSpacing"] = nil
-        guard let merged = try? JSONValue.from(st.box.style).merging(.object(fields)),
-              let style = try? CommandRegistry.decode(TextBoxStyle.self, from: merged) else { return }
         let selection = modelSelection()
-        var text = currentRichText()
-        if let d = fields["defaults"], d != .null, let defaults = try? CommandRegistry.decode(TextAttributes.self, from: d) {
-            text = RichTextEdit.clearing(text, fieldsOf: defaults)
-        }
-        if align != nil || lineSpacing != nil {
-            text = RichTextEdit.setParagraphs(text, indices: Array(text.paragraphs.indices), align: align, lineSpacing: lineSpacing)
-        }
-        st.box.style = TextStyles.clamped(style)
+        guard let changed = try? BoxStylePatch(fields).apply(to: st.box.style, text: currentRichText()) else { return }
+        st.box.style = changed.style
         st.base = TextLayout.base(st.box.style, darkPaper: st.darkPaper)
         applyInsets(st)
-        render(text, selection: selection)
+        render(changed.text, selection: selection)
     }
 
     // MARK: Layout
@@ -833,8 +863,13 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         return top
     }
 
+    /// The keyboard bar's More: the whole format inspector as a Deep popover budded from the button, in the window's
+    /// droplet container (contracts-v2 `FloatingHosting`). Without a floating host (a container that predates it,
+    /// headless runs), or without room above the keyboard for it, a system popover shows it instead.
     func presentInspector(from source: UIView) {
-        guard let st = state, let presenter = topPresenter() else { return }
+        guard let st = state else { return }
+        if presentFloatingInspector(st, from: source) { return }
+        guard let presenter = topPresenter() else { return }
         let vc = UIHostingController(rootView: ScrollView {
             TextFormatInspector(model: st.model).padding(NibSpacing.l)
         })
@@ -846,6 +881,68 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         }
         vc.presentationController?.delegate = self
         presenter.present(vc, animated: true)
+    }
+
+    /// True when the floating host took the More popover.
+    private func presentFloatingInspector(_ st: EditState, from source: UIView) -> Bool {
+        guard let host = host, let floating = host.session.floatingHost,
+              let anchor = floatingAnchor(source, floating: floating, canvas: host.canvasView) else { return false }
+        // The popover rests above the button, so it needs the room between the button and the top of the window.
+        let room = anchor.minY - NibMetrics.chromeInset - NibMetrics.popoverGap - TextFormatPopover.chromeHeight
+        let height = min(room, NibMetrics.popoverMaxHeight - TextFormatPopover.chromeHeight)
+        guard height >= TextFormatPopover.minimumHeight else {
+            floating.removeAnchor(TextPopoverIDs.source)
+            return false
+        }
+        st.popover.contentHeight = height
+        st.popover.onClose = { [weak self, weak st] in
+            // Back to typing (the popover's own fields may have had the keyboard).
+            guard let self = self, let st = st, self.state === st, !st.textView.isFirstResponder else { return }
+            st.textView.becomeFirstResponder()
+        }
+        if !floating.isPresenting(TextPopoverIDs.popover) {
+            floating.present(TextPopoverIDs.popover, content: AnyView(TextFormatPopover(state: st.popover, model: st.model)))
+        }
+        self.floating = floating
+        st.popover.isPresented = true
+        return true
+    }
+
+    /// The button's rect as the popover's bud source, and where that is in the container. The keyboard bar lives in the
+    /// keyboard's window, so its rect goes through the screen into the canvas's window, where the floating host is.
+    private func floatingAnchor(_ source: UIView, floating: FloatingHosting, canvas: UIView) -> CGRect? {
+        var view = source
+        var rect = source.bounds
+        if source.window !== canvas.window {
+            guard let space = source.window?.windowScene?.screen.coordinateSpace else { return nil }
+            rect = canvas.convert(source.convert(source.bounds, to: space), from: space)
+            view = canvas
+        }
+        guard floating.setAnchor(TextPopoverIDs.source, rect: rect, in: view) else { return nil }
+        return floating.containerRect(rect, from: view)
+    }
+
+    private func dismissFloatingInspector(_ st: EditState) {
+        st.popover.onClose = nil
+        st.popover.isPresented = false
+        guard let floating = floating else { return }
+        floating.dismiss(TextPopoverIDs.popover)
+        floating.removeAnchor(TextPopoverIDs.source)
+        self.floating = nil
+    }
+
+    /// Something presented over the canvas (the inspector, the font picker, a style-name prompt) or the More popover
+    /// has the keyboard for now: editing goes on.
+    private func keepsEditingWithoutKeyboard(_ st: EditState) -> Bool {
+        if st.popover.isPresented || owningViewController()?.presentedViewController != nil { return true }
+        // A SwiftUI alert or sheet from the floating popover is presented by the window's own chain: anything in it
+        // above the controller that shows the canvas covers the canvas.
+        guard let canvas = host?.canvasView, var vc = canvas.window?.rootViewController else { return false }
+        while let presented = vc.presentedViewController {
+            guard canvas.isDescendant(of: presented.view) else { return true }
+            vc = presented
+        }
+        return false
     }
 
     func presentFontPicker(from source: UIView) {
@@ -888,7 +985,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         guard let st = state, textView === st.textView else { return }
         host?.session.isEditingText = false
         // The inspector, font picker or a style-name prompt took the keyboard: keep the box open.
-        if owningViewController()?.presentedViewController != nil {
+        if keepsEditingWithoutKeyboard(st) {
             commitNow()
             return
         }
@@ -930,6 +1027,7 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         }
         layoutEditing()
         scheduleCommit()
+        publishFocus()
         changes.send()   // the format model refreshes on it
     }
 
@@ -938,7 +1036,52 @@ final class TextBoxEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGes
         keepCaretOutOfMarkers(textView)
         cleanTypingAttributes(textView)
         ensureCaretVisible()
+        publishFocus()
         changes.send()
+    }
+
+    /// The edit menu over selected text: the system's actions, then the `MenuLocation.textSelection` entries (links,
+    /// plugins) for this box, with the selection as `textRange` in plain-text units (contracts-v2).
+    func textView(_ textView: UITextView, editMenuForTextIn range: NSRange,
+                  suggestedActions: [UIMenuElement]) -> UIMenu? {
+        guard let st = state, textView === st.textView, let host = host else { return nil }
+        let selection = TextLayout.modelRange(textView.textStorage, view: range)
+        guard selection.length > 0 else { return nil }
+        let context = MenuContext(app: app, session: host.session, doc: st.doc, page: st.page, itemKinds: [.text],
+                                  ref: st.ref, textRange: [selection.location, selection.length])
+        let entries = app.ui.menuItems(.textSelection, context)
+        guard !entries.isEmpty else { return nil }
+        return UIMenu(children: suggestedActions + menuElements(entries, context))
+    }
+
+    /// Edit-menu entries, grouped under their submenus. An entry first commits the typing (its range is into the stored
+    /// text), then runs outside the editor's own groups, so what it changes shows in the text view.
+    func menuElements(_ entries: [MenuItemDescriptor], _ context: MenuContext) -> [UIMenuElement] {
+        var top: [UIMenuElement] = []
+        var groups: [String: [UIMenuElement]] = [:]
+        var order: [String] = []
+        for d in entries {
+            let image = d.icon.flatMap { NibSymbol(systemName: $0) }.flatMap { UIImage(nib: $0) }
+            let action = UIAction(title: d.resolvedTitle(for: context), image: image,
+                                  attributes: d.destructive ? [.destructive] : [],
+                                  state: d.isChecked?(context) == true ? .on : .off) { [weak self] _ in
+                self?.runMenuEntry(d, context)
+            }
+            if let title = d.submenu {
+                if groups[title] == nil { order.append(title) }
+                groups[title, default: []].append(action)
+            } else {
+                top.append(action)
+            }
+        }
+        for title in order { top.append(UIMenu(title: title, children: groups[title] ?? [])) }
+        return top
+    }
+
+    func runMenuEntry(_ d: MenuItemDescriptor, _ context: MenuContext) {
+        commitNow()
+        let params = d.params(context)
+        enqueue { [weak self] in await self?.execute(d.command, params, own: false) }
     }
 
     @available(iOS 18.0, *)

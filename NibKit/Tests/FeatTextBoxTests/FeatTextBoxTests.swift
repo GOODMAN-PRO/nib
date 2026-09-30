@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatTextBox
@@ -7,6 +8,31 @@ import NibTesting
 /// Refs `link.autodetect` (F029's) was called with, from a test double.
 private final class AutodetectCalls {
     var refs: [String] = []
+}
+
+/// Params a test double command was called with.
+private final class Calls {
+    var params: [JSONValue] = []
+}
+
+/// The window's floating host (contracts-v2 `FloatingHosting`) without a window: records what is presented and anchored.
+/// `offset` moves every rect into the container, as the window's layout would.
+@MainActor
+private final class FakeFloatingHost: FloatingHosting {
+    var presented: [String] = []
+    var anchors: [String: CGRect] = [:]
+    var offset: CGFloat = 900
+
+    func present(_ id: String, content: AnyView) { if !presented.contains(id) { presented.append(id) } }
+    func dismiss(_ id: String) { presented.removeAll { $0 == id } }
+    func isPresenting(_ id: String) -> Bool { presented.contains(id) }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool {
+        anchors[id] = rect
+        return true
+    }
+    func removeAnchor(_ id: String) { anchors[id] = nil }
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { rect.offsetBy(dx: 0, dy: offset) }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
 }
 
 @MainActor
@@ -131,6 +157,21 @@ final class FeatTextBoxTests: XCTestCase {
         XCTAssertEqual(paragraphs.map { $0.indent }, [0, 1, 0])
     }
 
+    func testARefGivenTwiceIsStyledOnceAndUndoesInOneStep() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let before = try h.snapshot()
+        try await h.run(CommandIDs.textSetBoxStyle, ["refs": [.string(textRef), .string(textRef)],
+                                                     "style": ["padding": 12, "defaults": ["size": 30], "lineSpacing": 6]])
+        let b = try box(h)
+        XCTAssertEqual(b.style.padding, 12)
+        XCTAssertEqual(b.style.defaults.size, 30)
+        XCTAssertEqual(b.text.paragraphs[0].lineSpacing, 6)
+        XCTAssertNil(b.style.lineSpacing, "paragraph settings live in the paragraphs, not in the box style")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before, "a box written twice in one step reverts all the way")
+    }
+
     func testSetBoxStyleMergesAndClearsFields() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
         try await h.run("text.setBoxStyle", ["refs": [.string(textRef)],
@@ -225,9 +266,54 @@ final class FeatTextBoxTests: XCTestCase {
         await editor.flush()
         XCTAssertFalse(editor.isEditing)
         XCTAssertEqual(try box(h, id, page: page).text.plainText, "Hello there")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "the editing session is one undo step")
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
-        XCTAssertEqual(try box(h, id, page: page).text.plainText, "Hello")
+        XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: page, id: id),
+                             "one undo removes the new box with everything typed in it")
+        XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
+        XCTAssertEqual(try box(h, id, page: page).text.plainText, "Hello there")
         editor.detach(from: host)
+    }
+
+    func testAnEditingSessionIsOneUndoStep() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let before = try h.snapshot()
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        tv.attributedText = NSAttributedString(string: "One", attributes: tv.typingAttributes)
+        editor.commitNow()
+        await editor.flush()
+        tv.attributedText = NSAttributedString(string: "One two", attributes: tv.typingAttributes)
+        editor.commitNow()
+        await editor.flush()
+        editor.applyParagraph(align: .center)
+        editor.applyBoxStyle(["cornerRadius": 8])
+        await editor.flush()
+        tv.attributedText = NSAttributedString(string: "One two three", attributes: tv.typingAttributes)
+        editor.endEditing()
+        await editor.flush()
+        XCTAssertEqual(try box(h).text.plainText, "One two three")
+        XCTAssertEqual(try box(h).style.cornerRadius, 8)
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), 1, "every write of the session joins one undo step")
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before, "and one undo takes all of it back")
+        editor.detach(from: host)
+    }
+
+    func testConsecutiveEditsOfOneBoxUndoOneByOne() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "first"])
+        try await h.run(CommandIDs.textFormat, ["ref": .string(textRef), "attrs": ["bold": true], "range": [0, 5]])
+        try await h.run(CommandIDs.textSetText, ["ref": .string(textRef), "text": "second"])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try box(h).text.plainText, "first")
+        XCTAssertEqual(try box(h).text.paragraphs[0].runs.first?.attrs.bold, true)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertNil(try box(h).text.paragraphs[0].runs.first?.attrs.bold, "the older step on the same box undoes too")
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try box(h).text.plainText, "Hello Nib")
     }
 
     func testAnAbandonedNewBoxLeavesNothing() async throws {
@@ -316,6 +402,32 @@ final class FeatTextBoxTests: XCTestCase {
     }
 
     // MARK: Saved styles
+
+    func testTheDefaultStyleIsTheSharedTextBoxStyleSetting() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        XCTAssertEqual(h.app.settings.descriptor(NibSettings.defaultTextStyle.name)?.owner, "text")
+        let out = try await h.run(CommandIDs.textSaveDefaultStyle,
+                                  ["style": ["padding": 10, "align": "right", "lineSpacing": 4, "defaults": ["size": 24]]])
+        XCTAssertEqual(out["setting"]?.stringValue, NibSettings.defaultTextStyle.name)
+        // Paste and Match Style (F014) and page text (F028) read the typed key.
+        let shared = h.app.settings.get(NibSettings.defaultTextStyle)
+        XCTAssertEqual(shared.padding, 10)
+        XCTAssertEqual(shared.align, .right)
+        XCTAssertEqual(shared.lineSpacing, 4)
+        XCTAssertEqual(shared.defaults.size, 24)
+        XCTAssertEqual(TextStyles.defaultStyle(h.app.settings).align, .right)
+
+        // A style saved before contracts-v2 (explicit nulls, "natural" and 0 for unset) reads back the same way.
+        h.app.settings.setJSON(NibSettings.defaultTextStyle.name, try JSONValue.parse(
+            #"{"background": null, "borderColor": null, "padding": 6, "align": "natural", "lineSpacing": 0, "defaults": {"font": "Georgia", "size": null}}"#))
+        let legacy = TextStyles.defaultStyle(h.app.settings)
+        XCTAssertNil(legacy.align)
+        XCTAssertNil(legacy.lineSpacing)
+        XCTAssertNil(legacy.box.background)
+        XCTAssertEqual(legacy.box.padding, 6)
+        XCTAssertEqual(legacy.box.defaults.font, "Georgia")
+        XCTAssertEqual(try SavedTextStyle(json: legacy.json), legacy)
+    }
 
     func testSavedStylesClearOptionalFields() async throws {
         let h = Harness(features: [FeatTextBoxFeature.self])
@@ -539,6 +651,128 @@ final class FeatTextBoxTests: XCTestCase {
         editor.detach(from: host)
     }
 
+    func testTheSessionFollowsTheTextBeingEdited() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let (host, editor) = self.editor(h)
+        try await h.run(CommandIDs.textSetParagraph, ["ref": .string(textRef), "list": "bullet"])
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        XCTAssertEqual(h.session.editingTextRef, textRef)
+        XCTAssertEqual(tv.text, "\u{2022} Hello Nib")
+        tv.selectedRange = NSRange(location: 2, length: 5)
+        editor.textViewDidChangeSelection(tv)
+        XCTAssertEqual(h.session.editingTextRange, [0, 5], "plain-text units, list marker excluded")
+        editor.endEditing()
+        await editor.flush()
+        XCTAssertNil(h.session.editingTextRef)
+        XCTAssertNil(h.session.editingTextRange)
+
+        // A box started with the tool has no ref to publish until it exists.
+        editor.beginNewBox(page: Fixtures.page2, at: Point(100, 100))
+        XCTAssertNil(h.session.editingTextRef)
+        let newTV = try XCTUnwrap(editor.editingTextView)
+        newTV.attributedText = NSAttributedString(string: "New", attributes: newTV.typingAttributes)
+        editor.commitNow()
+        await editor.flush()
+        XCTAssertEqual(h.session.editingTextRef, editor.editingRef)
+        editor.endEditing()
+        await editor.flush()
+        editor.detach(from: host)
+    }
+
+    func testSelectedTextOffersTextSelectionMenuEntries() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let calls = Calls()
+        h.app.commands.register(CommandDescriptor(
+            id: "test.shout", title: "Shout", summary: "Test double: upper-cases a text box.",
+            params: .obj(["ref": .ref, "range": .arr(.int())], required: ["ref"]), effect: .edit)) { json, ctx in
+            calls.params.append(json)
+            guard case let .item(doc, page, id)? = NodeRef(json["ref"]?.stringValue ?? "") else { return .object([:]) }
+            try ctx.mutate { tx in
+                var it = try tx.item(doc, page: page, id: id)
+                guard var text = it.text?.text else { return }
+                for i in text.paragraphs.indices {
+                    for j in text.paragraphs[i].runs.indices {
+                        text.paragraphs[i].runs[j].text = text.paragraphs[i].runs[j].text.uppercased()
+                    }
+                }
+                it.text?.text = text
+                _ = try tx.put(it, doc: doc, page: page)
+            }
+            return .object([:])
+        }
+        var offered: (ref: String?, range: [Int]?)?
+        h.app.ui.menus.register(MenuItemDescriptor(
+            id: "test.shout", title: "Shout", location: .textSelection, order: 1, owner: "test", command: "test.shout",
+            params: { ctx in
+                ["ref": .string(ctx.ref ?? ""), "range": .array((ctx.textRange ?? []).map { .number(Double($0)) })]
+            },
+            isVisible: { ctx in
+                offered = (ctx.ref, ctx.textRange)
+                return ctx.itemKinds == [.text] && ctx.textRange != nil
+            }))
+        try await h.run(CommandIDs.textSetParagraph, ["ref": .string(textRef), "list": "bullet"])
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let tv = try XCTUnwrap(editor.editingTextView)
+        XCTAssertNil(editor.textView(tv, editMenuForTextIn: NSRange(location: 4, length: 0), suggestedActions: []),
+                     "a caret keeps the system menu")
+        let menu = try XCTUnwrap(editor.textView(tv, editMenuForTextIn: NSRange(location: 2, length: 5), suggestedActions: []))
+        XCTAssertEqual(menu.children.map { $0.title }, ["Shout"])
+        XCTAssertEqual(offered?.ref, textRef)
+        XCTAssertEqual(offered?.range, [0, 5], "the selection in plain-text units, list marker excluded")
+
+        // Typing not saved yet is saved before the entry runs; the entry's change shows in the text view.
+        tv.textStorage.append(NSAttributedString(string: "!", attributes: tv.typingAttributes))
+        let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page1,
+                                  itemKinds: [.text], ref: textRef, textRange: [0, 5])
+        let entry = try XCTUnwrap(h.app.ui.menus.get("test.shout"))
+        editor.runMenuEntry(entry, context)
+        await editor.flush()
+        XCTAssertEqual(calls.params.first?["ref"]?.stringValue, textRef)
+        XCTAssertEqual(calls.params.first?["range"], [0, 5])
+        XCTAssertEqual(try box(h).text.plainText, "HELLO NIB!")
+        XCTAssertEqual(tv.text, "\u{2022} HELLO NIB!", "the editor follows a change made for it")
+        editor.endEditing()
+        await editor.flush()
+        editor.detach(from: host)
+    }
+
+    func testMoreBudsTheInspectorFromTheWindowsFloatingHost() throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let (host, editor) = self.editor(h)
+        let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        let st = try XCTUnwrap(editor.editingState)
+        let more = UIButton(frame: CGRect(x: 900, y: 0, width: 44, height: 44))
+        editor.presentInspector(from: more)
+        XCTAssertEqual(floating.presented, [TextPopoverIDs.popover])
+        XCTAssertEqual(floating.anchors[TextPopoverIDs.source], more.bounds)
+        XCTAssertTrue(st.popover.isPresented)
+        XCTAssertGreaterThanOrEqual(st.popover.contentHeight, TextFormatPopover.minimumHeight)
+        st.popover.isPresented = false   // a tap outside
+        editor.presentInspector(from: more)
+        XCTAssertEqual(floating.presented, [TextPopoverIDs.popover], "the popover is presented once per editing session")
+        XCTAssertTrue(st.popover.isPresented)
+        editor.endEditing()
+        XCTAssertEqual(floating.presented, [], "finishing takes the popover away")
+        XCTAssertNil(floating.anchors[TextPopoverIDs.source])
+
+        // No room above the keyboard: the system popover takes over.
+        floating.offset = 100
+        XCTAssertTrue(editor.beginEditing(doc: Fixtures.docID, page: Fixtures.page1, item: item, caretAt: nil))
+        editor.presentInspector(from: more)
+        XCTAssertEqual(floating.presented, [])
+        XCTAssertEqual(editor.editingState?.popover.isPresented, false)
+        editor.endEditing()
+        editor.detach(from: host)
+        withExtendedLifetime(floating) {}
+    }
+
     func testInspectorIdentityFollowsTheSelection() {
         let a = TextItemsInspector.identity(doc: Fixtures.docID, page: Fixtures.page1, ids: [Fixtures.textID])
         let b = TextItemsInspector.identity(doc: Fixtures.docID, page: Fixtures.page1, ids: [Fixtures.stickyID])
@@ -586,6 +820,8 @@ final class FeatTextBoxTests: XCTestCase {
         ])
         let base = TextAttributes()
         let s = TextLayout.attributed(text, base: base) { _, _ in nil }
+        XCTAssertEqual(s.attribute(.nibModelFont, at: 0, effectiveRange: nil) as? String, "NoSuchFont",
+                       "the model font rides on the bridge's key")
         XCTAssertEqual(TextLayout.richText(from: s, base: base) { _ in nil }, text,
                        "an uninstalled family and a family without italics keep their formatting")
 
@@ -602,6 +838,60 @@ final class FeatTextBoxTests: XCTestCase {
         let run = try XCTUnwrap(TextLayout.richText(from: serif, base: base) { _ in nil }.paragraphs.first?.runs.first)
         XCTAssertEqual(run.attrs.font, "Georgia")
         XCTAssertEqual(run.attrs.bold, true)
+    }
+
+    func testTextLayoutIsPublishedForLinksAndEditors() throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        XCTAssertEqual(h.app.content.textLayouts.get(ItemKind.text.rawValue)?.owner, "text")
+        var item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        item.text?.frame.rotation = 0.5
+        let box = try XCTUnwrap(item.text)
+        let info = try XCTUnwrap(h.app.content.textLayout(for: item))
+        let p = box.style.padding
+        XCTAssertEqual(info.container, Frame(x: box.frame.x + p, y: box.frame.y + p, w: box.frame.w - 2 * p,
+                                             h: box.frame.h - 2 * p, rotation: 0.5))
+        XCTAssertEqual(info.base, box.style.defaults)
+        XCTAssertFalse(info.centredVertically)
+        XCTAssertEqual(TextLayout.layout(NSAttributedString(string: "x"), width: 100).container.lineFragmentPadding,
+                       CGFloat(TextLayoutInfo.lineFragmentPadding))
+    }
+
+    func testFullPageTextIsHitOnlyWhereItsTextIs() async throws {
+        let h = Harness(features: [FeatTextBoxFeature.self])
+        var page = Item.makeText(TextBoxItem(frame: Frame(x: 0, y: 0, w: 595, h: 842), text: RichText(plain: "Title"),
+                                             style: TextBoxStyle(padding: 0, autoGrow: false, fullPage: true)))
+        page.locked = true
+        let inserted = try await h.insert([page], page: Fixtures.page2)
+        let item = try XCTUnwrap(inserted.first)
+        let hit = try XCTUnwrap(TextBoxDrawer().hitBounds(item))
+        XCTAssertLessThan(hit.width, 200)
+        XCTAssertLessThan(hit.height, 40)
+        XCTAssertEqual(h.app.content.hitBounds(for: item), hit, "the lasso and taps use the laid-out text")
+        XCTAssertNil(TextBoxDrawer().hitBounds(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1,
+                                                                        id: Fixtures.textID)))
+        let items = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        XCTAssertNil(TextHitTest.textItem(at: Point(300, 600), in: items), "the rest of the page is page")
+        XCTAssertEqual(TextHitTest.textItem(at: Point(10, 10), in: items)?.id, item.id)
+
+        // A double-tap on page text starts page typing (F028) when it is installed; F026 never edits it itself.
+        let (host, editor) = self.editor(h)
+        let params: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "point": [10, 10], "gesture": "doubleTap"]
+        var out = try await h.run(CommandIDs.textTapAt, params)
+        XCTAssertEqual(out["handled"]?.boolValue, false)
+        XCTAssertFalse(editor.isEditing)
+        let calls = Calls()
+        h.app.commands.register(CommandDescriptor(
+            id: CommandIDs.textStartPageText, title: "Start Typing", summary: "Test double for page text.",
+            params: .obj(["page": .ref, "id": .str()]), effect: .edit)) { json, _ in
+            calls.params.append(json)
+            return .object([:])
+        }
+        out = try await h.run(CommandIDs.textTapAt, params)
+        XCTAssertEqual(out["handled"]?.boolValue, true)
+        XCTAssertFalse(editor.isEditing)
+        for _ in 0..<100 where calls.params.isEmpty { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(calls.params.first?["page"]?.stringValue, "page:FIXTUREDOC01/FIXTUREPG002")
+        editor.detach(from: host)
     }
 
     func testDrawerRendersTheFixtureTextBox() throws {
