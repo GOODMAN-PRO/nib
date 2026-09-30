@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPresentation/PresentationViewController.swift:310-315 (PresentationViewModel.fitScale)",
+      "problem": "The 0.05 floor is applied after the maxPixels cap (min(fit, fit, 4096/maxEdge) then max(s, 0.05)), so any region whose longest edge is over ~82k pt asks for a render larger than 4096 px, with no limit on area. A whiteboard's Full Page/base region is its content bounds, and the AI, plugins or a user panning far away can put items at any coordinate (the model has no coordinate limit). One stray item at (1e6, 1e6) asks for a ~47k x 47k px bitmap (about 8.8 GB) on every commit while presenting, which will run the app out of memory. Rounding to 1/64 steps can also push the scale past the cap, and a sub-1/128 scale would round to 0.",
+      "fix": "Floor first, cap last, and never round up past the cap: `let fit = min(px / rect.width, py / rect.height); let cap = Self.maxPixels / max(rect.width, rect.height); let s = min(max(fit, 0.05), cap); let q = (s * 64).rounded(.down) / 64; return q > 0 ? q : s`. Add a test: `XCTAssertLessThanOrEqual(model.fitScale(for: Rect(x: 0, y: 0, width: 1e6, height: 1e6)) * 1e6, PresentationViewModel.maxPixels)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresentation/FeatPresentationFeature.swift:312-315 (PresenterHUDAttachment.refresh); PresentationViewController.swift:662-670 (LivePageSource.current)",
+      "problem": "`DocumentContent.livePages` is a filter plus sort over every page, and `pageIndex` calls it again. The HUD runs both on every canvasDidChange (every scroll or zoom frame) while presenting. LivePageSource.current runs both on every coalesced visibleRect change. That is four O(n log n) sorts per scroll frame on main: about 3-4 ms on a 1,000-page PDF, over the 3 ms per-frame chrome budget.",
+      "fix": "Call `livePages` once and derive both index and count from that one array. In the HUD, recompute page and count only on `session.$page`, a commit or a controller change; canvasDidChange should only reposition. In LivePageSource, cache (index, count) keyed on (doc, page, version) (`version` already bumps on headChanged)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresentation/PresentationViewController.swift:735-744 (LivePageSource.boardBounds)",
+      "problem": "After every commit on a presented whiteboard, the board bounds are recomputed on main by calling `Item.bounds` on every item. `Stroke.bounds` walks every point, so each stroke commit costs O(total points on the board), for boards of up to 100k items.",
+      "fix": "Grow the cached union from the changeset's changed items and only rebuild it fully on deletes. Or compute the union off main from a value snapshot of the items (`Task.detached`) and call onChange when it is done."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresentation/PresentationViewController.swift:242 (performUpdate `if dirty { return }`)",
+      "problem": "When a base render finishes after another change has arrived, its image is stored in `base` but never shown, and the loop renders again. While commits keep arriving faster than one render (collaboration or AI edit streams, fast writing on a 4K display), the external display stays frozen on an old frame.",
+      "fix": "Only skip publishing when the page itself changed (`source.current?.page != page.page || source.current?.doc != page.doc`). Otherwise publish the frame with the fresh base, then loop to render the newer version."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresentation/FeatPresentationFeature.swift:81-85, 88-99; PresentationCommands.swift:63",
+      "problem": "`present.setMode {blank: true}` with no display connected leaves `controller.blank` set, so the next display starts black. Blank in mirror mode also hides the HUD (isPresenting is false), so the Blank toggle cannot undo it. And because a missing `blank` means false, an AI or plugin that calls present.setMode with the current mode, which is the only way to read connection and blank state, un-blanks the screen as a side effect.",
+      "fix": "In `setBlank`, keep `blank` false while `connections.isEmpty` (and reset it in `makeViewController` when this is the first connection). Treat a missing `blank` as 'keep current' and have the menu entries pass `\"blank\": false` explicitly. Show the HUD while `blank` is on, whatever the mode."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresentation/PresentationViewController.swift:652-655, 703-713; FeatPresentationFeature.swift:262",
+      "problem": "The active session is re-read only on UIScene.didActivateNotification or on page and document events. In Split View or Stage Manager, both scenes are already foreground-active, so switching focus to the other window posts no activation. The display (and the HUD's visibility) keeps following the old window's scroll and zoom until a page change.",
+      "fix": "Also observe `UIWindow.didBecomeKeyNotification` in LivePageSource (call `onChange`) and in PresenterHUDAttachment (call `scheduleRefresh`)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresentation/PresentationViewController.swift:397-419, 611-612",
+      "problem": "The laser dot is reprojected straight to the new camera while `stage` glides there over the 0.2 s spring, so it drifts off its spot on the page during a Presenter Page scroll. Trail segments are stored in display points and are never reprojected, so on scroll they break away from the page.",
+      "fix": "Store segment endpoints in page points and reproject them in `reproject`, applying the same NibMotion.glide transform to the overlay. Or host the laser layer inside `stage`, sized by 1/scale, so it moves with the camera."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresentation/FeatPresentationFeature.swift:26-35, 199-205",
+      "problem": "The current mode is shown only by a checkmark icon on the Share & Export entry, and VoiceOver does not read menu icons. The HUD does not say which mode is on either, so a VoiceOver user cannot tell which mode is active.",
+      "fix": "Put the mode in the HUD's accessibility label (for example \"Presenting Full Page on Living Room TV\"). In a follow-up, file a contract request for a checked state on MenuItemDescriptor to replace the plain/checked twin entries."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresentation/FeatPresentationFeature.swift:173, 225-228, 255",
+      "problem": "The presenter HUD is `nibGlass(.clear)` added inside the scrolling canvas view, outside any NibDropletContainer. It never gets `nibIsInking`, so it does not recede to 22 % and keeps sampling the backdrop while the Pencil is down (DESIGN.md §10.8, §15.2). The ponytail comment notes the gap, but no contract request is tracked.",
+      "fix": "Track a contract request (a feature-HUD slot in the chrome's droplet container, or a public inking signal for nibGlass) and move the HUD there when it lands. That work is outside this branch's owned files."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresentation/FeatPresentationFeature.swift:33",
+      "problem": "Presenter Page and Full Page are offered in the Share & Export menu of text documents and study sets, where LivePageSource has no page, so picking one turns the external display into an empty desk.",
+      "fix": "For the page-mode entries, also require the menu context's document to be a notebook or whiteboard (`ctx.doc` -> `workspace.content(doc).meta.kind`). Keep Mirror Entire Screen visible everywhere."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatPresentationTests/FeatPresentationTests.swift",
+      "problem": "The tests drive PresentationViewModel directly (`model.mode = ...`). Nothing tests the real path, where `present.setMode` or `settings.set` goes through PresentationController and switches an already-connected model and view controller. The in-flight-render supersede path, detail cancellation and the fitScale cap are also untested.",
+      "fix": "Split `makeViewController(for:)` into a `connect(id:name:source:)` that accepts a page source, connect a FakePageSource in a Harness test, run `present.setMode`, and assert that the same model and VC switched mode and blank. Add a fake whose render suspends on a continuation, to test a change that arrives during a render, and add the fitScale cap test from the major issue."
+    }
+  ]
+}
