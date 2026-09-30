@@ -254,14 +254,39 @@ final class FeatAppearanceTests: XCTestCase {
         XCTAssertEqual((catalog["info"] as? [String: Any])?["author"] as? String, "xcode")
     }
 
-    /// The PNGs are build products of Scripts/make_icons.swift (CI runs it before building the app).
-    func testGeneratedIconsAreFullSizeWithTheRightAlpha() throws {
-        let folder = try Self.repositoryRoot().appendingPathComponent("Nib/Resources/Assets.xcassets/AppIcon.appiconset")
+    /// Scripts/make_icons.swift writes exactly the files, appearances and opacity `AppIconVariant` describes, and gates
+    /// the build on them (`--check`, and a check after every write).
+    func testMakeIconsDrawsTheVariantsTheCatalogNames() throws {
+        let script = try String(contentsOf: Self.repositoryRoot().appendingPathComponent("Scripts/make_icons.swift"),
+                                encoding: .utf8)
         for variant in AppIconVariant.allCases {
-            let url = folder.appendingPathComponent(variant.fileName)
-            guard FileManager.default.fileExists(atPath: url.path) else {
-                throw XCTSkip("run `swift Scripts/make_icons.swift` to generate \(variant.fileName)")
+            XCTAssertTrue(script.contains("\(variant.rawValue): \"\(variant.fileName)\""), variant.fileName)
+            XCTAssertTrue(script.contains("render(\(variant.rawValue)Palette, opaque: \(variant.isOpaque))"),
+                          "\(variant.rawValue) is drawn \(variant.isOpaque ? "opaque" : "transparent")")
+            if let luminosity = variant.luminosity {
+                XCTAssertTrue(script.contains("iconEntry(iconFiles.\(variant.rawValue), luminosity: \"\(luminosity)\")"),
+                              "\(variant.rawValue) is the \(luminosity) appearance")
+            } else {
+                XCTAssertTrue(script.contains("iconEntry(iconFiles.\(variant.rawValue), luminosity: nil)"),
+                              "\(variant.rawValue) is the default appearance")
             }
+        }
+        XCTAssertTrue(script.contains("let side = 1024"))
+        XCTAssertTrue(script.contains("\"--check\""), "CI can re-check the icons without redrawing them")
+        XCTAssertTrue(script.contains("isGreyscale"), "the tinted icon is checked for greyscale")
+    }
+
+    /// The PNGs are build products of Scripts/make_icons.swift (CI draws them in the app-build step, after this test
+    /// target runs), so they are checked whenever a run finds them on disk.
+    func testGeneratedIconsOnDiskAreFullSizeWithTheRightAlpha() throws {
+        let folder = try Self.repositoryRoot().appendingPathComponent("Nib/Resources/Assets.xcassets/AppIcon.appiconset")
+        let present = AppIconVariant.allCases.filter {
+            FileManager.default.fileExists(atPath: folder.appendingPathComponent($0.fileName).path)
+        }
+        XCTAssertTrue(present.isEmpty || present.count == AppIconVariant.allCases.count,
+                      "make_icons.swift writes every variant or none: found only \(present.map { $0.fileName })")
+        for variant in present {
+            let url = folder.appendingPathComponent(variant.fileName)
             let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
             let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
             XCTAssertEqual(image.width, 1024, variant.fileName)
