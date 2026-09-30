@@ -165,7 +165,7 @@ struct WritingPosture: Hashable, Identifiable {
 
 /// Two rows of four drawings (right hand, then left hand). The selected one sits on `fill3` with a check.
 struct PosturePicker: View {
-    /// ponytail: local until NibMetrics has a posture-cell height (contract request).
+    /// This screen's own layout, not a system measure (DESIGN_SYSTEM.md "NibDesign v2 additions" keeps it local).
     static let cellHeight: CGFloat = 56
 
     @Binding var selection: Int
@@ -224,10 +224,6 @@ struct PosturePicker: View {
 
 /// A writing line, the pen on it and the resting palm, drawn from the posture's angles.
 struct PostureIllustration: View {
-    /// ponytail: illustration strokes, local until the design system has stroke-width tokens (contract request).
-    static let hairline: CGFloat = 1
-    static let penWidth: CGFloat = 3
-
     let posture: WritingPosture
     let isSelected: Bool
 
@@ -239,7 +235,7 @@ struct PostureIllustration: View {
             var line = Path()
             line.move(to: CGPoint(x: NibSpacing.s, y: tip.y))
             line.addLine(to: CGPoint(x: size.width - NibSpacing.s, y: tip.y))
-            context.stroke(line, with: .color(NibColor.separator), lineWidth: Self.hairline)
+            context.stroke(line, with: .color(NibColor.separator), lineWidth: NibStroke.thin)
 
             let palm = posture.palmAngle * .pi / 180
             var hand = context
@@ -247,14 +243,14 @@ struct PostureIllustration: View {
             hand.rotate(by: .radians(palm))
             let palmShape = Path(ellipseIn: CGRect(x: -reach * 0.55, y: -reach * 0.4, width: reach * 1.1, height: reach * 0.8))
             hand.fill(palmShape, with: .color(NibColor.fill1))
-            hand.stroke(palmShape, with: .color(NibColor.labelSecondary), lineWidth: Self.hairline)
+            hand.stroke(palmShape, with: .color(NibColor.labelSecondary), lineWidth: NibStroke.thin)
 
             let lean = posture.penAngle * .pi / 180
             var pen = Path()
             pen.move(to: tip)
             pen.addLine(to: CGPoint(x: tip.x + CGFloat(cos(lean)) * reach * 1.3, y: tip.y + CGFloat(sin(lean)) * reach * 1.3))
             context.stroke(pen, with: .color(isSelected ? NibColor.accent : NibColor.label),
-                           style: StrokeStyle(lineWidth: Self.penWidth, lineCap: .round))
+                           style: StrokeStyle(lineWidth: NibStroke.thick, lineCap: .round))
         }
         .accessibilityHidden(true)
     }

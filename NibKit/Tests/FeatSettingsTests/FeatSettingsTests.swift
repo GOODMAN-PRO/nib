@@ -101,7 +101,17 @@ final class FeatSettingsTests: XCTestCase {
 
     func testSearchFindsPagesByTitleSectionAndKeyword() {
         let h = Harness(features: [FeatSettingsFeature.self])
+        XCTAssertTrue(h.app.ui.settingsPages.get(CoreSettingsPages.stylus)?.keywords.contains("palm") == true,
+                      "the core pages carry their search words on the descriptor")
+        for page in h.app.ui.settingsPages.all {
+            XCTAssertFalse(page.keywords.isEmpty, page.id)
+            XCTAssertFalse(page.keywords.contains { $0.isEmpty || $0 != $0.trimmingCharacters(in: .whitespaces) }, page.id)
+        }
+        var backup = page("sync.icloud", "Backup", .sync, owner: "sync")
+        backup.keywords = ["iCloud", "WebDAV"]
+        h.app.ui.settingsPages.register(backup)
         let catalog = SettingsCatalog(pages: h.app.ui.settingsPages.all)
+        XCTAssertEqual(catalog.search("icloud").map(\.id), ["sync.icloud"], "other features' keywords match too")
         XCTAssertEqual(catalog.search("palm").map(\.id), ["settings.stylus"])
         XCTAssertEqual(catalog.search("status bar").map(\.id), ["settings.editing"])
         XCTAssertEqual(catalog.search("LANGUAGE").map(\.id), ["settings.language"])
@@ -132,10 +142,10 @@ final class FeatSettingsTests: XCTestCase {
 
     func testSettingsOpenShowsTheRequestedPage() async throws {
         let h = Harness(features: [FeatSettingsFeature.self])
-        let navigator = RecordingNavigator(app: h.app)
+        let navigator = RecordingNavigator(h)
         h.app.ui.activeNavigator = navigator
 
-        let out = try await h.run(SettingsOpen.id, ["page": "settings.stylus"])
+        let out = try await h.run(CommandIDs.settingsOpen, ["page": "settings.stylus"])
         XCTAssertEqual(out["opened"]?.stringValue, "settings")
         XCTAssertEqual(out["page"]?.stringValue, "settings.stylus")
         let root = try XCTUnwrap(navigator.presented as? SettingsRootViewController)
@@ -143,93 +153,119 @@ final class FeatSettingsTests: XCTestCase {
         XCTAssertTrue(root.state.detailPath.isEmpty, "a section's only page is its detail")
         XCTAssertEqual(root.state.compactPath.count, 1)
 
-        try await h.run(SettingsOpen.id)
+        try await h.run(CommandIDs.settingsOpen)
         XCTAssertEqual(navigator.requestedPages, ["settings.stylus", nil])
         let second = try XCTUnwrap(navigator.presented as? SettingsRootViewController)
         XCTAssertNil(second.state.section)
 
-        h.app.ui.settingsPages.register(page("about.main", "About Nib", .about, owner: "about"))
-        let about = try await h.run(SettingsOpen.id, ["place": "about"])
-        XCTAssertEqual(about["page"]?.stringValue, "about.main")
-        XCTAssertEqual(navigator.requestedPages.last ?? nil, "about.main")
+        let place = try await h.run(CommandIDs.settingsOpen, ["place": "settings", "page": "settings.editing"])
+        XCTAssertEqual(place["opened"]?.stringValue, "settings")
+        XCTAssertEqual(place["page"]?.stringValue, "settings.editing")
+        XCTAssertEqual(navigator.requestedPages.last ?? nil, "settings.editing")
+        XCTAssertEqual(navigator.libraryShown, 0)
     }
 
     func testSettingsOpenMovesSettingsAlreadyOnScreen() async throws {
         let h = Harness(features: [FeatSettingsFeature.self])
-        let navigator = RecordingNavigator(app: h.app)
+        let navigator = RecordingNavigator(h)
         h.app.ui.activeNavigator = navigator
-        try await h.run(SettingsOpen.id)
+        try await h.run(CommandIDs.settingsOpen)
         let root = try XCTUnwrap(navigator.presented as? SettingsRootViewController)
-        let window = UIWindow(frame: CGRect(origin: .zero, size: SettingsRootViewController.formSheetSize))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 760, height: 706))
         window.addSubview(root.view)
 
-        let out = try await h.run(SettingsOpen.id, ["page": "settings.language"])
+        let out = try await h.run(CommandIDs.settingsOpen, ["page": "settings.language"])
         XCTAssertEqual(out["page"]?.stringValue, "settings.language")
         XCTAssertEqual(navigator.requestedPages, [nil], "the Settings on screen moves; no second one opens")
         XCTAssertEqual(root.state.section, .general)
         XCTAssertEqual(root.state.detailPath.count, 1)
     }
 
-    func testAppMenuPanelsOpenAsSheetsFromTheLibrary() async throws {
+    func testAppMenuPanelsOpenThroughPanelOpenFromTheLibrary() async throws {
         let h = Harness(features: [FeatSettingsFeature.self])
-        let navigator = RecordingNavigator(app: h.app)
+        let navigator = RecordingNavigator(h)
         h.app.ui.activeNavigator = navigator
-        var built: [String] = []
-        let panels: [(String, String, PanelPlacement)] = [("organize.trash", "organize", .libraryTab),
-                                                          ("templates.manage", "templateui", .sheet)]
-        for (id, owner, placement) in panels {
-            h.app.ui.panels.register(PanelDescriptor(id: id, title: id, icon: "square", placement: placement, order: 10,
-                                                     owner: owner, docKinds: nil) { ctx in
-                built.append(id)
-                XCTAssertNotNil(ctx.navigator)
-                return AnyView(EmptyView())
-            })
-        }
-        XCTAssertNil(navigator.session.document, "the app menu lives in the library, with no document open")
+        let panelOpen = PanelOpenStandIn(h)
+        registerPlacePanels(h)
+        h.session.document = nil  // the app menu lives in the library
 
-        for (place, id) in [("trash", "organize.trash"), ("templates", "templates.manage")] {
-            let out = try await h.run(SettingsOpen.id, ["place": .string(place)])
+        for (place, id) in placePanels {
+            let out = try await h.run(CommandIDs.settingsOpen, ["place": .string(place)])
             XCTAssertEqual(out["opened"]?.stringValue, "panel", place)
             XCTAssertEqual(out["panel"]?.stringValue, id, place)
-            XCTAssertTrue(navigator.presented is UIHostingController<AnyView>, place)
+            XCTAssertNil(out["page"]?.stringValue, place)
         }
-        XCTAssertEqual(built, ["organize.trash", "templates.manage"])
+        XCTAssertEqual(panelOpen.calls, placePanels.map { PanelOpenStandIn.Call(id: $0.1, inDocument: false) },
+                       "every place goes through panel.open, which hands it to the library")
+        XCTAssertNil(navigator.presented, "settings.open presents nothing itself")
         XCTAssertTrue(navigator.requestedPages.isEmpty)
+        XCTAssertEqual(navigator.libraryShown, 0)
+    }
+
+    func testAppMenuPanelsFromADocumentGoToTheLibraryOnlyForLibraryTabs() async throws {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let navigator = RecordingNavigator(h)
+        h.app.ui.activeNavigator = navigator
+        let panelOpen = PanelOpenStandIn(h)
+        registerPlacePanels(h)
+        XCTAssertNotNil(h.session.document)
+
+        try await h.run(CommandIDs.settingsOpen, ["place": "templates"], as: .ai("chat"))
+        XCTAssertEqual(panelOpen.calls, [.init(id: PanelIDs.templates, inDocument: true)],
+                       "a sheet opens over the document")
+        XCTAssertEqual(navigator.libraryShown, 0)
+
+        let trash = try await h.run(CommandIDs.settingsOpen, ["place": "trash"])
+        XCTAssertEqual(trash["panel"]?.stringValue, PanelIDs.trash)
+        XCTAssertEqual(navigator.libraryShown, 1, "Trash is a library tab: the window shows the library first")
+        XCTAssertEqual(panelOpen.calls.last, .init(id: PanelIDs.trash, inDocument: false))
+        XCTAssertNil(navigator.presented)
+    }
+
+    func testAppMenuPanelErrorsComeFromPanelOpen() async {
+        let h = Harness(features: [FeatSettingsFeature.self])
+        let navigator = RecordingNavigator(h)
+        h.app.ui.activeNavigator = navigator
+        registerPlacePanels(h)
+        await assertError(.unavailable, "without panel.open (F017 not installed) nothing can show the panel") {
+            try await h.run(CommandIDs.settingsOpen, ["place": "about"])
+        }
+        XCTAssertNil(navigator.presented, "and settings.open does not present it instead")
     }
 
     func testSettingsOpenRejectsUnknownPagesAndPlaces() async {
         let h = Harness(features: [FeatSettingsFeature.self])
-        let navigator = RecordingNavigator(app: h.app)
+        let navigator = RecordingNavigator(h)
         h.app.ui.activeNavigator = navigator
-        await assertError(.notFound) { try await h.run(SettingsOpen.id, ["page": "nope.page"]) }
-        await assertError(.invalidParams) { try await h.run(SettingsOpen.id, ["place": "attic"]) }
-        await assertError(.invalidParams) { try await h.run(SettingsOpen.id, ["place": "attic"], as: .ai("chat")) }
-        await assertError(.unavailable) { try await h.run(SettingsOpen.id, ["place": "templates"]) }
+        await assertError(.notFound) { try await h.run(CommandIDs.settingsOpen, ["page": "nope.page"]) }
+        await assertError(.invalidParams) { try await h.run(CommandIDs.settingsOpen, ["place": "attic"]) }
+        await assertError(.invalidParams) { try await h.run(CommandIDs.settingsOpen, ["place": "attic"], as: .ai("chat")) }
+        _ = PanelOpenStandIn(h)
+        await assertError(.unavailable) { try await h.run(CommandIDs.settingsOpen, ["place": "templates"]) }
         XCTAssertTrue(navigator.requestedPages.isEmpty)
 
         h.app.ui.activeNavigator = nil
-        await assertError(.unavailable) { try await h.run(SettingsOpen.id) }
+        await assertError(.unavailable) { try await h.run(CommandIDs.settingsOpen) }
     }
 
-    func testAppMenuPlacesFindTheScreensOfTheirOwners() {
-        let panels = [
-            panel("templates.change", owner: "templateui", placement: .sheet, docKinds: [.notebook]),
-            panel("templates.manage", owner: "templateui", placement: .sheet),
-            panel("sync.status", owner: "syncui", placement: .floating),
-            panel("library.trash", owner: "organize", placement: .libraryTab, icon: "trash"),
-        ]
-        let pages = [page("about.main", "About Nib", .about, owner: "about")]
-        XCTAssertEqual(AppMenuPlace.settings.resolve(panels: [], pages: []), .settings(nil))
-        XCTAssertEqual(AppMenuPlace.systemNotifications.resolve(panels: [], pages: []), .systemNotifications)
-        XCTAssertEqual(AppMenuPlace.templates.resolve(panels: panels, pages: pages), .panel("templates.manage"))
-        XCTAssertEqual(AppMenuPlace.cloudBackup.resolve(panels: panels, pages: pages), .panel("sync.status"))
-        XCTAssertEqual(AppMenuPlace.trash.resolve(panels: panels, pages: pages), .panel("library.trash"))
-        XCTAssertEqual(AppMenuPlace.about.resolve(panels: panels, pages: pages), .settings("about.main"))
-        XCTAssertEqual(AppMenuPlace.cloudBackup.resolve(panels: [], pages: [page("backup.main", "Backup", .sync, owner: "backup")]),
-                       .settings("backup.main"), "without a sync panel, Cloud & Backup opens the Sync section")
-        for place in [AppMenuPlace.templates, .cloudBackup, .trash, .about] {
-            XCTAssertNil(place.resolve(panels: [], pages: []), place.rawValue)
+    func testAppMenuPlacesOpenTheWellKnownPanels() {
+        XCTAssertEqual(AppMenuPlace.settings.target, .settings)
+        XCTAssertEqual(AppMenuPlace.systemNotifications.target, .systemNotifications)
+        XCTAssertEqual(AppMenuPlace.templates.target, .panel(PanelIDs.templates))
+        XCTAssertEqual(AppMenuPlace.cloudBackup.target, .panel(PanelIDs.cloudBackup))
+        XCTAssertEqual(AppMenuPlace.trash.target, .panel(PanelIDs.trash))
+        XCTAssertEqual(AppMenuPlace.about.target, .panel(PanelIDs.about))
+
+        let h = Harness(features: [FeatSettingsFeature.self])
+        registerPlacePanels(h)
+        XCTAssertFalse(AppMenuPlace.about.isAvailable(in: h.app), "no panel.open, no way to show it")
+        _ = PanelOpenStandIn(h)
+        for place in AppMenuPlace.allCases {
+            XCTAssertTrue(place.isAvailable(in: h.app), place.rawValue)
         }
+        h.app.ui.panels.unregister(id: PanelIDs.about)
+        XCTAssertFalse(AppMenuPlace.about.isAvailable(in: h.app))
+        XCTAssertTrue(AppMenuPlace.settings.isAvailable(in: h.app))
     }
 
     func testAppMenuEntriesRunSettingsOpenWithValidParams() throws {
@@ -237,17 +273,23 @@ final class FeatSettingsTests: XCTestCase {
         let items = h.app.ui.menus.all.filter { $0.location == .appMenu }
         XCTAssertEqual(items.map(\.id), ["settings.menu.settings", "settings.menu.templates", "settings.menu.cloudBackup",
                                          "settings.menu.trash", "settings.menu.about"])
-        let descriptor = try XCTUnwrap(h.app.commands.descriptor(SettingsOpen.id))
+        XCTAssertEqual(SettingsOpen.descriptor.id, CommandIDs.settingsOpen)
+        let descriptor = try XCTUnwrap(h.app.commands.descriptor(CommandIDs.settingsOpen))
         let context = MenuContext(app: h.app)
         for item in items {
-            XCTAssertEqual(item.command, SettingsOpen.id)
+            XCTAssertEqual(item.command, CommandIDs.settingsOpen)
             XCTAssertEqual(descriptor.params.validate(item.params(context)), [], item.id)
         }
         XCTAssertEqual(h.app.ui.menuItems(.appMenu, context).map(\.id), ["settings.menu.settings"],
                        "places whose screens are not installed stay hidden")
-        h.app.ui.settingsPages.register(page("about.main", "About Nib", .about, owner: "about"))
+        _ = PanelOpenStandIn(h)
+        h.app.ui.panels.register(panel(PanelIDs.about, owner: "about", placement: .sheet))
         XCTAssertEqual(h.app.ui.menuItems(.appMenu, context).map(\.id), ["settings.menu.settings", "settings.menu.about"])
-        XCTAssertEqual(h.app.content.keyCommands.get("settings.open")?.command, SettingsOpen.id)
+        XCTAssertEqual(items.first?.shortcut, KeyShortcut(",", [.command]), "⌘, shows beside Settings")
+        let key = try XCTUnwrap(h.app.content.keyCommands.get(CommandIDs.settingsOpen))
+        XCTAssertEqual(key.command, CommandIDs.settingsOpen)
+        XCTAssertEqual(key.shortcut, KeyShortcut(",", [.command]))
+        XCTAssertEqual(key.scope, .global)
     }
 
     // MARK: Stylus and language
@@ -304,13 +346,13 @@ final class FeatSettingsTests: XCTestCase {
 
     // MARK: Helpers
 
-    private func assertError(_ code: NibError.Code, file: StaticString = #filePath, line: UInt = #line,
-                             _ body: () async throws -> JSONValue) async {
+    private func assertError(_ code: NibError.Code, _ message: String = "", file: StaticString = #filePath,
+                             line: UInt = #line, _ body: () async throws -> JSONValue) async {
         do {
             _ = try await body()
-            XCTFail("expected \(code.rawValue)", file: file, line: line)
+            XCTFail("expected \(code.rawValue) \(message)", file: file, line: line)
         } catch let error as NibError {
-            XCTAssertEqual(error.code, code, error.message, file: file, line: line)
+            XCTAssertEqual(error.code, code, "\(message) \(error.message)", file: file, line: line)
         } catch {
             XCTFail("\(error)", file: file, line: line)
         }
@@ -331,24 +373,65 @@ private func panel(_ id: String, owner: String, placement: PanelPlacement, icon:
     }
 }
 
-/// Stands in for the shell's window: records `showSettings` and builds the screen the way the shell does.
+/// The app menu's places and the panel ids their owners register (contracts-v2 G18).
+private let placePanels: [(String, String)] = [("templates", PanelIDs.templates), ("cloudBackup", PanelIDs.cloudBackup),
+                                               ("trash", PanelIDs.trash), ("about", PanelIDs.about)]
+
+/// Stand-ins for F045's Manage Templates sheet, F070's Cloud & Backup panel, F020's Trash tab and F098's About page.
+@MainActor
+private func registerPlacePanels(_ h: Harness) {
+    h.app.ui.panels.register(panel(PanelIDs.templates, owner: "templateui", placement: .sheet))
+    h.app.ui.panels.register(panel(PanelIDs.cloudBackup, owner: "syncui", placement: .floating))
+    h.app.ui.panels.register(panel(PanelIDs.trash, owner: "organize", placement: .libraryTab, icon: "trash"))
+    h.app.ui.panels.register(panel(PanelIDs.about, owner: "about", placement: .sheet))
+}
+
+/// Stands in for F017's `panel.open`: records which panel was asked for and whether the window showed a document.
+@MainActor
+private final class PanelOpenStandIn {
+    struct Call: Equatable {
+        let id: String
+        let inDocument: Bool
+    }
+
+    private(set) var calls: [Call] = []
+
+    init(_ h: Harness) {
+        h.app.commands.register(CommandDescriptor(
+            id: CommandIDs.panelOpen, title: "Open Panel", summary: "Stand-in for F017's panel.open.",
+            params: .obj(["id": .str()], required: ["id"]), effect: .session, target: .app)) { [weak self] json, ctx in
+            let id = json["id"]?.stringValue ?? ""
+            self?.calls.append(Call(id: id, inDocument: ctx.activeSession?.document != nil))
+            return ["id": .string(id), "placement": "sheet"]
+        }
+    }
+}
+
+/// Stands in for the shell's window: records `showSettings` and builds the screen the way the shell does, and leaves
+/// its document for the library on `showLibrary`, as the shell does.
 @MainActor
 private final class RecordingNavigator: SceneNavigator {
     let app: NibApp
-    let session = EditorSession()
+    let session: EditorSession
     var openDocuments: [DocumentID] = []
     var activeDocument: DocumentID?
     var rootViewController: UIViewController? { nil }
     private(set) var requestedPages: [String?] = []
     private(set) var presented: UIViewController?
+    private(set) var libraryShown = 0
 
-    init(app: NibApp) {
-        self.app = app
+    init(_ h: Harness) {
+        self.app = h.app
+        self.session = h.session
     }
 
     func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {}
     func closeDocument(_ doc: DocumentID) {}
-    func showLibrary(folder: FolderID?) {}
+
+    func showLibrary(folder: FolderID?) {
+        libraryShown += 1
+        session.document = nil
+    }
 
     func showSettings(page: String?) {
         requestedPages.append(page)

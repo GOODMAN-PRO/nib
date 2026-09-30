@@ -180,14 +180,12 @@ struct NotificationsPage: View {
     var body: some View {
         List {
             Section {
-                // ponytail: bell and external-link glyphs are not in NibSymbol yet (contract request).
-                NibRow(String(localized: "Notifications"), subtitle: Self.statusText(status),
-                       icon: NibSymbol(systemName: "bell.badge") ?? .settings)
+                NibRow(String(localized: "Notifications"), subtitle: Self.statusText(status), icon: .notifications)
                 Button {
-                    app.perform(SettingsOpen.id, ["place": .string(AppMenuPlace.systemNotifications.rawValue)])
+                    app.perform(CommandIDs.settingsOpen, ["place": .string(AppMenuPlace.systemNotifications.rawValue)])
                 } label: {
                     NibRow(String(localized: "Open Notification Settings"), icon: .settings) {
-                        Image(nib: NibSymbol(systemName: "arrow.up.forward.app") ?? .forward)
+                        Image(nib: .externalLink)
                             .font(NibFont.body)
                             .foregroundStyle(NibColor.labelTertiary)
                             .accessibilityHidden(true)

@@ -10,7 +10,7 @@ public enum FeatSettingsFeature: NibFeature {
     public static let id = "settings"
 
     public static func register(_ app: NibApp) {
-        let router = SettingsRouter(app: app)
+        let router = SettingsRouter()
         app.commands.register(SettingsOpen.descriptor) { json, ctx in
             let params = try CommandRegistry.decode(SettingsOpen.Params.self, from: json)
             let output = try await router.open(params, ctx)
@@ -24,8 +24,8 @@ public enum FeatSettingsFeature: NibFeature {
             app.ui.menus.register(item)
         }
         app.content.keyCommands.register(KeyCommandDescriptor(
-            id: "settings.open", title: String(localized: "Settings"), shortcut: KeyShortcut(",", [.command]),
-            command: SettingsOpen.id, scope: .global, order: 100, owner: id))
+            id: CommandIDs.settingsOpen, title: String(localized: "Settings"), shortcut: AppMenu.settingsShortcut,
+            command: CommandIDs.settingsOpen, scope: .global, order: 100, owner: id))
     }
 }
 
@@ -39,62 +39,47 @@ enum CoreSettingsPages {
     static let editing = "settings.editing"
     static let stylus = "settings.stylus"
 
+    /// Each page carries the extra words settings search matches (`SettingsPageDescriptor.keywords`, contracts-v2),
+    /// so a search for "palm" finds Stylus & Palm Rejection the way another feature's "iCloud" finds its page.
     static func descriptors(owner: String) -> [SettingsPageDescriptor] {
-        // ponytail: "person.crop.circle", "globe" and "bell.badge" are not in NibSymbol yet (contract request).
         [
-            SettingsPageDescriptor(id: profile, title: String(localized: "Profile"), icon: "person.crop.circle",
-                                   section: .general, order: 10, owner: owner) { app in
-                AnyView(ProfilePage(app: app))
+            page(profile, String(localized: "Profile"), .profile, .general, order: 10, owner: owner,
+                 keywords: String(localized: "author, name")) { AnyView(ProfilePage(app: $0)) },
+            page(language, String(localized: "Language"), .language, .general, order: 300, owner: owner,
+                 keywords: String(localized: "handwriting, recognition, search, convert")) { AnyView(LanguagePage(app: $0)) },
+            page(notifications, String(localized: "Notifications"), .notifications, .general, order: 800, owner: owner,
+                 keywords: String(localized: "alerts, reminders, badges")) { AnyView(NotificationsPage(app: $0)) },
+            page(editing, String(localized: "Document Editing"), .textDocument, .editing, order: 10, owner: owner,
+                 keywords: String(localized: "scroll, scrolling direction, vertical, horizontal, tabs, undo, redo, toolbar, layout, left, right, select, selection, tap, align, alignment, guides, snap, grid, status bar, zoom window, auto advance, sidebar")) {
+                AnyView(DocumentEditingPage(app: $0))
             },
-            SettingsPageDescriptor(id: language, title: String(localized: "Language"), icon: "globe",
-                                   section: .general, order: 300, owner: owner) { app in
-                AnyView(LanguagePage(app: app))
-            },
-            SettingsPageDescriptor(id: notifications, title: String(localized: "Notifications"), icon: "bell.badge",
-                                   section: .general, order: 800, owner: owner) { app in
-                AnyView(NotificationsPage(app: app))
-            },
-            SettingsPageDescriptor(id: editing, title: String(localized: "Document Editing"), icon: NibSymbol.textDocument.name,
-                                   section: .editing, order: 10, owner: owner) { app in
-                AnyView(DocumentEditingPage(app: app))
-            },
-            SettingsPageDescriptor(id: stylus, title: String(localized: "Stylus & Palm Rejection"), icon: NibSymbol.pen.name,
-                                   section: .stylus, order: 10, owner: owner) { app in
-                AnyView(StylusPage(app: app))
+            page(stylus, String(localized: "Stylus & Palm Rejection"), .pen, .stylus, order: 10, owner: owner,
+                 keywords: String(localized: "Apple Pencil, pencil, stylus, any input, mouse, finger, fingers, finger drawing, palm, palm rejection, posture, writing position, hand, left-handed, right-handed, sensitivity")) {
+                AnyView(StylusPage(app: $0))
             },
         ]
     }
 
-    /// Extra words the settings search matches for the core pages (a page descriptor carries only its title).
-    /// ponytail: other features' pages match on title and section only; a `keywords` field on
-    /// `SettingsPageDescriptor` would let them join in (contract gap).
-    static func keywords(_ id: String) -> [String] {
-        let list: String
-        switch id {
-        case editing:
-            list = String(localized: "scroll, scrolling direction, vertical, horizontal, tabs, undo, redo, toolbar, layout, left, right, select, selection, tap, align, alignment, guides, snap, grid, status bar, zoom window, auto advance, sidebar")
-        case stylus:
-            list = String(localized: "Apple Pencil, pencil, stylus, any input, mouse, finger, fingers, finger drawing, palm, palm rejection, posture, writing position, hand, left-handed, right-handed, sensitivity")
-        case language:
-            list = String(localized: "handwriting, recognition, search, convert")
-        case profile:
-            list = String(localized: "author, name")
-        case notifications:
-            list = String(localized: "alerts, reminders, badges")
-        default:
-            return []
-        }
-        return list.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    /// Search words from one translated, comma-separated string (one string, so translators see them together).
+    static func keywordList(_ list: String) -> [String] {
+        list.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    private static func page(_ id: String, _ title: String, _ symbol: NibSymbol, _ section: SettingsSection, order: Int,
+                             owner: String, keywords: String,
+                             view: @escaping @MainActor (NibApp) -> AnyView) -> SettingsPageDescriptor {
+        var page = SettingsPageDescriptor(id: id, title: title, icon: symbol.name, section: section, order: order,
+                                          owner: owner, makeView: view)
+        page.keywords = keywordList(keywords)
+        return page
     }
 }
 
 // MARK: - settings.open
 
-/// `settings.open {page?, place?}`: opens Settings (at a page) or one of the app menu's places, so the menu, the
-/// ⌘, shortcut, other features' "settings" links, plugins and the AI all take the same path.
+/// `settings.open {page?, place?}` (`CommandIDs.settingsOpen`): opens Settings (at a page) or one of the app menu's
+/// places, so the menu, the ⌘, shortcut, other features' "settings" links, plugins and the AI all take the same path.
 enum SettingsOpen {
-    static let id = "settings.open"
-
     struct Params: Codable {
         var page: String?
         var place: String?
@@ -107,9 +92,10 @@ enum SettingsOpen {
         var panel: String?
     }
 
+    /// The id is spelled out (it equals `CommandIDs.settingsOpen`) so `Scripts/lint.py` sees the owned command.
     static let descriptor = CommandDescriptor(
         id: "settings.open", title: "Open Settings",
-        summary: "Open Settings, optionally at a page id such as 'settings.editing', or an app-menu place: templates, cloudBackup, trash, about, systemNotifications.",
+        summary: "Open Settings, optionally at a page id such as 'settings.editing', or an app-menu place: templates, cloudBackup, trash, about (their panels open with panel.open), systemNotifications.",
         params: .obj(["page": .str("settings page id, e.g. 'settings.editing', 'settings.stylus', 'settings.language'"),
                       "place": .str("app-menu place", choices: AppMenuPlace.allCases.map { $0.rawValue })]),
         examples: [[:], ["page": "settings.editing"], ["place": "about"]],
@@ -119,15 +105,11 @@ enum SettingsOpen {
 /// One per app: builds the settings root and runs `settings.open`.
 @MainActor
 final class SettingsRouter {
-    private weak var app: NibApp?
     /// The page the next root opens at. The shell's `showSettings(page:)` does not hand the page to the
-    /// `settingsRoot` factory, so `settings.open` parks it here for `makeRoot` (contract gap).
+    /// `settingsRoot` factory (still deferred for the shell in contracts-v2.2), so `settings.open` parks it here
+    /// for `makeRoot`.
     private var pendingPage: String?
     private weak var visibleRoot: SettingsRootViewController?
-
-    init(app: NibApp) {
-        self.app = app
-    }
 
     func makeRoot(_ app: NibApp) -> UIViewController {
         let root = SettingsRootViewController(app: app, initialPage: pendingPage)
@@ -137,55 +119,51 @@ final class SettingsRouter {
     }
 
     func open(_ p: SettingsOpen.Params, _ ctx: CommandContext) async throws -> SettingsOpen.Output {
-        guard let app else { throw NibError.unavailable("Settings") }
-        var page = p.page
+        guard let ui = ctx.ui else { throw NibError.unavailable("Settings") }
         if let raw = p.place {
             guard let place = AppMenuPlace(rawValue: raw) else {
                 throw NibError(.invalidParams, "unknown place '\(raw)'", path: "$.place",
                                hint: "one of: " + AppMenuPlace.allCases.map { $0.rawValue }.joined(separator: ", "))
             }
-            switch place.resolve(panels: app.ui.panels.all, pages: app.ui.settingsPages.all) {
-            case .panel(let id)?:
-                try await openPanel(id, app: app, ctx)
-                return SettingsOpen.Output(opened: "panel", page: nil, panel: id)
-            case .systemNotifications?:
+            switch place.target {
+            case .settings:
+                break
+            case .systemNotifications:
                 try openSystemNotificationSettings()
                 return SettingsOpen.Output(opened: "systemNotifications", page: nil, panel: nil)
-            case .settings(let target)?:
-                page = page ?? target
-            case nil:
-                throw NibError(.unavailable, "nothing in this build provides '\(raw)'",
-                               hint: "the feature that provides it is disabled or not installed")
+            case .panel(let id):
+                guard let panel = ui.panels.get(id) else {
+                    throw NibError(.unavailable, "nothing in this build provides '\(raw)'",
+                                   hint: "the feature that registers panel '\(id)' is disabled or not installed")
+                }
+                try await openPanel(panel, ctx)
+                return SettingsOpen.Output(opened: "panel", page: nil, panel: id)
             }
         }
-        if let id = page, app.ui.settingsPages.get(id) == nil {
-            let known = app.ui.settingsPages.all.map { $0.id }.joined(separator: ", ")
+        let page = p.page
+        if let id = page, ui.settingsPages.get(id) == nil {
+            let known = ui.settingsPages.all.map { $0.id }.joined(separator: ", ")
             throw NibError(.notFound, "settings page '\(id)' not found", path: "$.page", hint: "known pages: \(known)")
         }
         if let root = visibleRoot, root.viewIfLoaded?.window != nil {
             if let id = page { root.show(page: id) }
             return SettingsOpen.Output(opened: "settings", page: page, panel: nil)
         }
-        guard let navigator = app.ui.activeNavigator else { throw NibError.unavailable("an open Nib window") }
+        guard let navigator = ctx.navigator else { throw NibError.unavailable("an open Nib window") }
         pendingPage = page
         navigator.showSettings(page: page)
         pendingPage = nil
         return SettingsOpen.Output(opened: "settings", page: page, panel: nil)
     }
 
-    /// `panel.open` works only inside an open document and never for library tabs, but the app menu lives in the
-    /// library: there the panel is presented here, as a sheet over the window.
-    private func openPanel(_ id: String, app: NibApp, _ ctx: CommandContext) async throws {
-        guard let panel = app.ui.panels.get(id) else { throw NibError(.notFound, "panel '\(id)' not found") }
-        guard let navigator = app.ui.activeNavigator else { throw NibError.unavailable("an open Nib window") }
-        if panel.placement != .libraryTab, navigator.session.document != nil {
-            _ = try await ctx.execute(CommandIDs.panelOpen, ["id": .string(id)])
-            return
+    /// Spec pass 2: a place's panel opens through `panel.open` (F017), which in a window without a document hands it to
+    /// the library (F019 presents it over itself, or selects the Trash tab in its sidebar). Nothing is presented here.
+    /// A library tab has no place in a document, so from one the window goes back to the library first.
+    private func openPanel(_ panel: PanelDescriptor, _ ctx: CommandContext) async throws {
+        if panel.placement == .libraryTab, ctx.activeSession?.document != nil {
+            _ = try await ctx.execute(CommandIDs.windowShowLibrary)
         }
-        let host = UIHostingController(rootView: AnyView(EmptyView()))
-        host.rootView = panel.makeView(PanelContext(app: app, session: navigator.session, navigator: navigator,
-                                                    dismiss: { [weak host] in host?.dismiss(animated: true) }))
-        navigator.presentModal(host)
+        _ = try await ctx.execute(CommandIDs.panelOpen, ["id": .string(panel.id)])
     }
 
     private func openSystemNotificationSettings() throws {
@@ -200,76 +178,64 @@ final class SettingsRouter {
 
 /// Where `settings.open {place}` goes.
 enum SettingsTarget: Equatable {
-    /// Settings, at a page when given.
-    case settings(String?)
-    /// A panel another feature registered, opened with `panel.open`.
+    /// Settings itself.
+    case settings
+    /// A panel another feature registers under a well-known id, opened with `panel.open`.
     case panel(String)
     /// The system Settings app's notification page for Nib.
     case systemNotifications
 }
 
-/// The app menu's places. Their screens belong to other features, found by the stable owner ids of
-/// ARCHITECTURE.md §3 when the menu is shown, so a disabled feature simply hides its entry.
+/// The app menu's places. Their screens belong to other features, which register them under the well-known
+/// `PanelIDs` (contracts-v2 G18): Manage Templates (F045), Cloud & Backup (F070), Trash (F020) and About (F098).
 enum AppMenuPlace: String, CaseIterable {
     case settings, templates, cloudBackup, trash, about, systemNotifications
 
-    func resolve(panels: [PanelDescriptor], pages: [SettingsPageDescriptor]) -> SettingsTarget? {
+    var target: SettingsTarget {
         switch self {
-        case .settings:
-            return .settings(nil)
-        case .systemNotifications:
-            return .systemNotifications
-        case .templates:
-            return Self.appPanel(owner: "templateui", panels)
-                ?? Self.page(pages, where: { $0.owner == "templateui" })
-        case .cloudBackup:
-            return Self.appPanel(owner: "syncui", panels)
-                ?? Self.page(pages, where: { $0.owner == "syncui" })
-                ?? Self.page(pages, where: { $0.section == .sync })
-        case .trash:
-            let trash = panels.filter { $0.id.localizedCaseInsensitiveContains("trash") || $0.icon.hasPrefix("trash") }
-            return (trash.first { $0.owner == "organize" } ?? trash.first).map { .panel($0.id) }
-        case .about:
-            return Self.page(pages, where: { $0.owner == "about" })
-                ?? Self.page(pages, where: { $0.section == .about })
-                ?? Self.appPanel(owner: "about", panels)
+        case .settings: return .settings
+        case .systemNotifications: return .systemNotifications
+        case .templates: return .panel(PanelIDs.templates)
+        case .cloudBackup: return .panel(PanelIDs.cloudBackup)
+        case .trash: return .panel(PanelIDs.trash)
+        case .about: return .panel(PanelIDs.about)
         }
     }
 
-    /// A panel of `owner` that needs no open document (Change Template, for example, is per document).
-    private static func appPanel(owner: String, _ panels: [PanelDescriptor]) -> SettingsTarget? {
-        panels.first { $0.owner == owner && $0.docKinds == nil && $0.placement != .sidebarTab }.map { .panel($0.id) }
-    }
-
-    private static func page(_ pages: [SettingsPageDescriptor],
-                             where match: (SettingsPageDescriptor) -> Bool) -> SettingsTarget? {
-        pages.first(where: match).map { .settings($0.id) }
+    /// Whether this build can open the place: its owner registered the panel and `panel.open` is installed. A place
+    /// whose feature is disabled simply hides its menu entry.
+    @MainActor
+    func isAvailable(in app: NibApp) -> Bool {
+        guard case .panel(let id) = target else { return true }
+        return app.ui.panels.get(id) != nil && app.commands.entry(CommandIDs.panelOpen) != nil
     }
 }
 
 enum AppMenu {
+    /// ⌘, opens Settings (the key command) and is shown beside the menu entry.
+    static var settingsShortcut: KeyShortcut { KeyShortcut(",", [.command]) }
+
     static func items(owner: String) -> [MenuItemDescriptor] {
-        [
-            item(.settings, String(localized: "Settings"), icon: NibSymbol.settings.name, order: 100, owner: owner),
-            // ponytail: "doc.on.doc" and "info.circle" are not in NibSymbol yet (contract request).
-            item(.templates, String(localized: "Manage Templates"), icon: "doc.on.doc", order: 200, owner: owner),
-            item(.cloudBackup, String(localized: "Cloud & Backup"), icon: NibSymbol.syncDone.name, order: 300, owner: owner),
-            item(.trash, String(localized: "Trash"), icon: NibSymbol.trash.name, order: 400, owner: owner),
-            item(.about, String(localized: "About Nib"), icon: "info.circle", order: 900, owner: owner),
+        var settings = item(.settings, String(localized: "Settings"), symbol: .settings, order: 100, owner: owner)
+        settings.shortcut = settingsShortcut
+        return [
+            settings,
+            item(.templates, String(localized: "Manage Templates"), symbol: .templates, order: 200, owner: owner),
+            item(.cloudBackup, String(localized: "Cloud & Backup"), symbol: .syncDone, order: 300, owner: owner),
+            item(.trash, String(localized: "Trash"), symbol: .trash, order: 400, owner: owner),
+            item(.about, String(localized: "About Nib"), symbol: .info, order: 900, owner: owner),
         ]
     }
 
-    private static func item(_ place: AppMenuPlace, _ title: String, icon: String, order: Int,
+    private static func item(_ place: AppMenuPlace, _ title: String, symbol: NibSymbol, order: Int,
                              owner: String) -> MenuItemDescriptor {
         MenuItemDescriptor(
-            id: "settings.menu." + place.rawValue, title: title, icon: icon, location: .appMenu, order: order,
-            owner: owner, command: SettingsOpen.id,
+            id: "settings.menu." + place.rawValue, title: title, icon: symbol.name, location: .appMenu, order: order,
+            owner: owner, command: CommandIDs.settingsOpen,
             params: { _ -> JSONValue in
                 if place == .settings { return [:] }
                 return ["place": .string(place.rawValue)]
             },
-            isVisible: { ctx in
-                place.resolve(panels: ctx.app.ui.panels.all, pages: ctx.app.ui.settingsPages.all) != nil
-            })
+            isVisible: { ctx in place.isAvailable(in: ctx.app) })
     }
 }

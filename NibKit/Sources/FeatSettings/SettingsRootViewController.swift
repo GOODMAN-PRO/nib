@@ -7,13 +7,11 @@ import NibDesign
 // MARK: - Screen
 
 /// `ui.screens.settingsRoot` (DESIGN.md §14.8). The shell wraps it in a navigation controller and presents it; on
-/// iPad it asks for the 760 × 706 form sheet. The SwiftUI root brings its own navigation: a 220 pt section list
-/// beside an inset grouped list when there is room (≥ 600 pt, not at accessibility sizes), a stack otherwise.
+/// iPad it asks for the form sheet (`NibMetrics.settingsSheetSize`). The SwiftUI root brings its own navigation: the
+/// section list (`NibMetrics.settingsSectionListWidth`) beside an inset grouped list when there is room (≥ 600 pt,
+/// not at accessibility sizes), a stack otherwise.
 @MainActor
 final class SettingsRootViewController: UIViewController {
-    /// DESIGN.md §14.8. ponytail: local until NibMetrics has a settings-sheet size (contract request).
-    static let formSheetSize = CGSize(width: 760, height: 706)
-
     let app: NibApp
     let state = SettingsNavigationState()
 
@@ -47,7 +45,7 @@ final class SettingsRootViewController: UIViewController {
         guard let nav = parent as? UINavigationController, nav.presentingViewController == nil,
               UIDevice.current.userInterfaceIdiom == .pad else { return }
         nav.modalPresentationStyle = .formSheet
-        nav.preferredContentSize = Self.formSheetSize
+        nav.preferredContentSize = NibMetrics.settingsSheetSize
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -98,12 +96,13 @@ struct SettingsCatalog {
     /// The section to show for a selection: the selected one while it still has pages, else the first.
     func selected(_ section: SettingsSection?) -> SectionGroup? { section.flatMap { group($0) } ?? groups.first }
 
-    /// Pages whose title, section or keywords contain every word of `query` (case and diacritics ignored).
+    /// Pages whose title, section or `keywords` contain every word of `query` (case and diacritics ignored), for the
+    /// core pages and every other feature's or plugin's alike.
     func search(_ query: String) -> [SettingsPageDescriptor] {
         let words = query.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         guard !words.isEmpty else { return [] }
         return pages.filter { page in
-            let haystack = [page.title, page.section.title] + CoreSettingsPages.keywords(page.id)
+            let haystack = [page.title, page.section.title] + page.keywords
             return words.allSatisfy { word in haystack.contains { $0.localizedStandardContains(word) } }
         }
     }
@@ -166,9 +165,8 @@ extension SettingsSection {
         case .sync: return .syncing
         case .plugins: return .puzzle
         case .bridge: return .bridge
-        // ponytail: wrench and info glyphs are not in NibSymbol yet (contract request).
-        case .advanced: return NibSymbol(systemName: "wrench.and.screwdriver") ?? .settings
-        case .about: return NibSymbol(systemName: "info.circle") ?? .settings
+        case .advanced: return .advanced
+        case .about: return .info
         }
     }
 }
@@ -274,9 +272,6 @@ final class SettingsModel: ObservableObject {
 
 @MainActor
 struct SettingsRootView: View {
-    /// DESIGN.md §14.8: the iPad section list. ponytail: local until NibMetrics has it (contract request).
-    static let sidebarWidth: CGFloat = 220
-
     let app: NibApp
     @ObservedObject var state: SettingsNavigationState
     let onDone: () -> Void
@@ -310,7 +305,7 @@ struct SettingsRootView: View {
     private var regular: some View {
         HStack(spacing: 0) {
             SettingsSidebar(catalog: catalog, state: state)
-                .frame(width: Self.sidebarWidth)
+                .frame(width: NibMetrics.settingsSectionListWidth)
                 .background(NibColor.backgroundSecondary)
             Divider()
             NavigationStack(path: $state.detailPath) {
