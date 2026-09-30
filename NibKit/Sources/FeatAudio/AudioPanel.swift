@@ -101,7 +101,7 @@ struct AudioPanelView: View {
             RecordingRow(audio: audio, recording: r, elsewhere: r.doc == model.doc ? nil : title(of: r.doc),
                          show: { execute(CommandIDs.docOpen, ["doc": .string(NodeRef.document(r.doc).description)]) },
                          stop: {
-                             execute("audio.record", ["doc": .string(NodeRef.document(r.doc).description), "action": "stop"])
+                             execute(CommandIDs.audioRecord, ["doc": .string(NodeRef.document(r.doc).description), "action": "stop"])
                          })
         } else if model.doc != nil && !model.clips.isEmpty {
             NibButton(String(localized: "Record Audio"), symbol: .record, kind: .primary, expands: true) { startRecording() }
@@ -139,9 +139,9 @@ struct AudioPanelView: View {
                             isCurrent: current, isPlaying: playing, isRecording: recordingThis) {
             guard let doc, !recordingThis, !saving else { return }
             if playing {
-                execute("audio.pause", [:])
+                execute(CommandIDs.audioPause, [:])
             } else {
-                execute("audio.play", ["clip": .string(NodeRef.audio(doc, clip.id).description)])
+                execute(CommandIDs.audioPlay, ["clip": .string(NodeRef.audio(doc, clip.id).description)])
             }
         }
         .contextMenu {
@@ -198,7 +198,7 @@ struct AudioPanelView: View {
 
     private func startRecording() {
         guard let doc = model.doc else { return }
-        execute("audio.record", ["doc": .string(NodeRef.document(doc).description), "action": "start"])
+        execute(CommandIDs.audioRecord, ["doc": .string(NodeRef.document(doc).description), "action": "start"])
     }
 
     private func run(_ item: MenuItemDescriptor, _ clip: AudioClip) {
@@ -207,7 +207,7 @@ struct AudioPanelView: View {
             execute(item.command, params)
             return
         }
-        let deleting = item.command == "audio.delete"
+        let deleting = item.command == CommandIDs.audioDelete
         let title = item.resolvedTitle(for: menuContext(clip))
         confirming = PendingAction(
             title: deleting ? String(localized: "Delete \u{201C}\(clip.name)\u{201D}?") : title,
@@ -226,7 +226,7 @@ struct AudioPanelView: View {
     private func commitRename() {
         guard let clip = renaming, let doc = model.doc else { return }
         renaming = nil
-        execute("audio.rename", ["clip": .string(NodeRef.audio(doc, clip.id).description), "name": .string(renameText)])
+        execute(CommandIDs.audioRename, ["clip": .string(NodeRef.audio(doc, clip.id).description), "name": .string(renameText)])
     }
 
     /// Runs a command as the user; a `tmp:` url in the result (audio.export) opens the share sheet.
@@ -244,7 +244,7 @@ struct AudioPanelView: View {
                 }
             } catch {
                 // Microphone off has its own notice with Open Settings; don't repeat it.
-                failure = command == "audio.record" && audio.microphoneDenied ? nil : NibError.wrap(error).message
+                failure = command == CommandIDs.audioRecord && audio.microphoneDenied ? nil : NibError.wrap(error).message
             }
         }
     }
@@ -336,7 +336,7 @@ final class AudioPanelModel: ObservableObject {
     private func repairIfNeeded() {
         guard let doc, let audio = AudioController.of(app.services), audio.recording == nil,
               clips.contains(where: { $0.duration <= 0 && !audio.isFinalising(doc, $0.id) }) else { return }
-        app.perform("audio.record", ["doc": .string(NodeRef.document(doc).description), "action": "stop"],
+        app.perform(CommandIDs.audioRecord, ["doc": .string(NodeRef.document(doc).description), "action": "stop"],
                     session: session)
     }
 }
@@ -547,7 +547,7 @@ struct RecorderHUD: View {
     }
 
     private func run(_ r: AudioController.Recording, _ action: String) {
-        AudioChromeActions.perform(app, "audio.record",
+        AudioChromeActions.perform(app, CommandIDs.audioRecord,
                                    ["doc": .string(NodeRef.document(r.doc).description), "action": .string(action)],
                                    session: session, host: host, audio: audio)
     }
@@ -620,7 +620,7 @@ struct AudioPlaybackBar: View {
                              loaded: AudioController.Playback?) -> some View {
         Menu {
             Picker(String(localized: "Speed"), selection: Binding(get: { settings.speed }, set: { value in
-                perform("audio.setPlayback", ["speed": .number(value)])
+                perform(CommandIDs.audioSetPlayback, ["speed": .number(value)])
             })) {
                 ForEach(AudioSettings.speeds, id: \.self) { s in
                     Text(AudioText.speed(s)).tag(s)
@@ -642,15 +642,15 @@ struct AudioPlaybackBar: View {
             }
             Section {
                 Toggle(String(localized: "Skip Silence"), isOn: Binding(get: { settings.skipSilence }, set: { on in
-                    perform("audio.setPlayback", ["skipSilence": .bool(on)])
+                    perform(CommandIDs.audioSetPlayback, ["skipSilence": .bool(on)])
                 }))
                 Toggle(String(localized: "Reduce Noise"), isOn: Binding(get: { settings.noiseReduction }, set: { on in
-                    perform("audio.setPlayback", ["noiseReduction": .bool(on)])
+                    perform(CommandIDs.audioSetPlayback, ["noiseReduction": .bool(on)])
                 }))
             }
             Section {
                 Button {
-                    perform("audio.pause", ["close": true])
+                    perform(CommandIDs.audioPause, ["close": true])
                 } label: {
                     Label { Text(String(localized: "Close Player")) } icon: { Image(nib: .xmark) }
                 }
@@ -699,9 +699,9 @@ struct AudioPlaybackBar: View {
     private func go(to position: Double, _ timeline: AudioTimeline, loaded: AudioController.Playback?) {
         guard let doc, let target = timeline.locate(position) else { return }
         if let p = loaded, p.clip == target.clip {
-            perform("audio.seek", ["t": .number(target.t)])
+            perform(CommandIDs.audioSeek, ["t": .number(target.t)])
         } else {
-            perform("audio.play", ["clip": .string(NodeRef.audio(doc, target.clip).description), "t": .number(target.t)])
+            perform(CommandIDs.audioPlay, ["clip": .string(NodeRef.audio(doc, target.clip).description), "t": .number(target.t)])
         }
     }
 
@@ -713,12 +713,12 @@ struct AudioPlaybackBar: View {
         guard let doc else { return }
         if let p = loaded {
             if p.isPlaying {
-                perform("audio.pause", [:])
+                perform(CommandIDs.audioPause, [:])
             } else {
-                perform("audio.play", ["clip": .string(NodeRef.audio(doc, p.clip).description)])
+                perform(CommandIDs.audioPlay, ["clip": .string(NodeRef.audio(doc, p.clip).description)])
             }
         } else if let first = clips.first(where: { $0.duration > 0 }) {
-            perform("audio.play", ["clip": .string(NodeRef.audio(doc, first.id).description), "t": 0])
+            perform(CommandIDs.audioPlay, ["clip": .string(NodeRef.audio(doc, first.id).description), "t": 0])
         }
     }
 

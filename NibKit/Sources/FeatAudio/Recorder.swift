@@ -517,7 +517,7 @@ extension AudioController {
         Self.log.error("recording failed: \(error.localizedDescription, privacy: .public)")
         lastError = String(localized: "Recording stopped because the audio could not be saved. Free up some space and try again.")
         guard let r = recording else { return }
-        app?.perform("audio.record", ["doc": .string(NodeRef.document(r.doc).description), "action": "stop"])
+        app?.perform(CommandIDs.audioRecord, ["doc": .string(NodeRef.document(r.doc).description), "action": "stop"])
     }
 
     /// A headset came or went: restart the tap on the new input (the recorder converts its rate).
@@ -556,7 +556,7 @@ extension AudioController {
             let params: JSONValue = ["doc": .string(NodeRef.document(r.doc).description), "action": "resume"]
             Task { @MainActor [weak self] in
                 do {
-                    _ = try await app.bus.execute("audio.record", params)
+                    _ = try await app.bus.execute(CommandIDs.audioRecord, params)
                 } catch {
                     Self.log.error("resume failed: \(NibError.wrap(error).message, privacy: .public)")
                     self?.lastError = paused

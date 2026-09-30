@@ -46,30 +46,36 @@ public enum FeatAudioFeature: NibFeature {
     }
 
     private static func registerMenus(_ app: NibApp) {
-        app.ui.menus.register(MenuItemDescriptor(
+        // More › Record Audio, or Stop Recording while anything records; both show ⌘⇧R (display only, the key is a
+        // KeyCommandDescriptor).
+        var record = MenuItemDescriptor(
             id: "audio.more.record", title: String(localized: "Record Audio"), icon: NibSymbol.record.name,
-            location: .documentMore, order: 400, owner: id, command: "audio.record",
+            location: .documentMore, order: 400, owner: id, command: CommandIDs.audioRecord,
             params: { ctx in
                 ["doc": .string(ctx.doc.map { NodeRef.document($0).description } ?? ""), "action": "start"]
             },
-            isVisible: { ctx in AudioIndicators.canRecord(ctx) && AudioController.of(ctx.app.services)?.recording == nil }))
-        app.ui.menus.register(MenuItemDescriptor(
+            isVisible: { ctx in AudioIndicators.canRecord(ctx) && AudioController.of(ctx.app.services)?.recording == nil })
+        record.shortcut = AudioIndicators.recordShortcut
+        app.ui.menus.register(record)
+        var stop = MenuItemDescriptor(
             id: "audio.more.stop", title: String(localized: "Stop Recording"), icon: NibSymbol.stop.name,
-            location: .documentMore, order: 400, owner: id, command: "audio.record",
+            location: .documentMore, order: 400, owner: id, command: CommandIDs.audioRecord,
             params: { ctx in
                 guard let r = AudioController.of(ctx.app.services)?.recording else { return ["action": "stop"] }
                 return ["doc": .string(NodeRef.document(r.doc).description), "action": "stop"]
             },
-            isVisible: { ctx in AudioController.of(ctx.app.services)?.recording != nil }))
+            isVisible: { ctx in AudioController.of(ctx.app.services)?.recording != nil })
+        stop.shortcut = AudioIndicators.recordShortcut
+        app.ui.menus.register(stop)
         app.ui.menus.register(MenuItemDescriptor(
             id: "audio.new.quickRecord", title: String(localized: "Quick Record"), icon: NibSymbol.microphone.name,
-            location: .libraryNew, order: 450, owner: id, command: "audio.quickRecord"))
+            location: .libraryNew, order: 450, owner: id, command: CommandIDs.audioQuickRecord))
 
         // Clip rows (the Audio tab builds each row's menu from MenuLocation.audioClip, so other features and
         // plugins add theirs). Rename needs a name, so the row asks for it itself.
         app.ui.menus.register(MenuItemDescriptor(
             id: "audio.clip.play", title: String(localized: "Play"), icon: NibSymbol.play.name,
-            location: .audioClip, order: 100, owner: id, command: "audio.play",
+            location: .audioClip, order: 100, owner: id, command: CommandIDs.audioPlay,
             params: { ctx in ["clip": .string(ctx.ref ?? "")] },
             isVisible: { ctx in ctx.ref != nil }, quick: true))
         app.ui.menus.register(MenuItemDescriptor(
@@ -84,12 +90,12 @@ public enum FeatAudioFeature: NibFeature {
             }))
         app.ui.menus.register(MenuItemDescriptor(
             id: "audio.clip.export", title: String(localized: "Share Audio File"), icon: NibSymbol.share.name,
-            location: .audioClip, order: 300, owner: id, command: "audio.export",
+            location: .audioClip, order: 300, owner: id, command: CommandIDs.audioExport,
             params: { ctx in ["clip": .string(ctx.ref ?? ""), "format": "m4a"] },
             isVisible: { ctx in ctx.ref != nil }))
         app.ui.menus.register(MenuItemDescriptor(
             id: "audio.clip.delete", title: String(localized: "Delete Recording"), icon: NibSymbol.trash.name,
-            location: .audioClip, order: 900, owner: id, command: "audio.delete",
+            location: .audioClip, order: 900, owner: id, command: CommandIDs.audioDelete,
             params: { ctx in ["clip": .string(ctx.ref ?? "")] },
             isVisible: { ctx in ctx.ref != nil }, destructive: true))
     }
@@ -98,8 +104,8 @@ public enum FeatAudioFeature: NibFeature {
     /// or the Audio tab is on screen. Their params come from the window when the key is pressed.
     private static func registerKeys(_ app: NibApp, audio: AudioController) {
         var record = KeyCommandDescriptor(
-            id: "audio.record", title: String(localized: "Start or Stop Recording"),
-            shortcut: KeyShortcut("r", [.command, .shift]), command: "audio.record",
+            id: AudioIndicators.recordKey, title: String(localized: "Start or Stop Recording"),
+            shortcut: AudioIndicators.recordShortcut, command: CommandIDs.audioRecord,
             params: ["action": "toggle"], scope: .document, owner: id)
         record.docKinds = AudioIndicators.docKinds
         record.sessionParams = { [weak audio] session in AudioIndicators.recordParams(session, audio) }
@@ -107,7 +113,7 @@ public enum FeatAudioFeature: NibFeature {
 
         var playPause = KeyCommandDescriptor(
             id: AudioIndicators.playPauseKey, title: String(localized: "Play or Pause Audio"),
-            shortcut: KeyShortcut("p", [.command, .option]), command: "audio.play",
+            shortcut: KeyShortcut("p", [.command, .option]), command: CommandIDs.audioPlay,
             params: ["toggle": true], scope: .document, order: 10, owner: id)
         playPause.docKinds = AudioIndicators.docKinds
         playPause.sessionParams = { [weak audio] session in
@@ -121,7 +127,7 @@ public enum FeatAudioFeature: NibFeature {
             ("audio.forward10", String(localized: "Forward 10 Seconds"), "right", 10.0),
         ] {
             var skip = KeyCommandDescriptor(
-                id: keyID, title: title, shortcut: KeyShortcut(key, [.command, .option]), command: "audio.seek",
+                id: keyID, title: title, shortcut: KeyShortcut(key, [.command, .option]), command: CommandIDs.audioSeek,
                 params: ["t": 0], scope: .document, order: 20, owner: id)
             skip.docKinds = AudioIndicators.docKinds
             skip.sessionParams = { [weak audio] _ in
@@ -143,6 +149,9 @@ enum AudioIndicators {
     static let toolbarID = "audio.record"
     static let recorderOverlayID = "audio.recorder"
     static let playerOverlayID = "audio.player"
+    /// ⌘⇧R (the key command's id; it runs `audio.record` with `action: toggle`).
+    static let recordKey = "audio.record"
+    static let recordShortcut = KeyShortcut("r", [.command, .shift])
     /// ⌘⌥P (a key command, not a command id).
     static let playPauseKey = "audio.playPause"
     /// Study sets have no audio (Goodnotes has none on flashcards either).
@@ -152,7 +161,7 @@ enum AudioIndicators {
         let owner = FeatAudioFeature.id
         var item = ToolbarItemDescriptor(
             id: toolbarID, title: String(localized: "Record Audio"), icon: NibSymbol.record.name,
-            group: .accessories, order: 300, owner: owner, command: "audio.record", params: ["action": "toggle"],
+            group: .accessories, order: 300, owner: owner, command: CommandIDs.audioRecord, params: ["action": "toggle"],
             docKinds: docKinds)
         item.isOn = { [weak audio] _ in audio?.recording != nil }
         item.sessionIcon = { [weak audio] _ in audio?.recording != nil ? NibSymbol.stop.name : NibSymbol.record.name }

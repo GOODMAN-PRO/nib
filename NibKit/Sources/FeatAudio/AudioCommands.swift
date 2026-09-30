@@ -86,16 +86,25 @@ struct AudioRecord: NibCommand {
         var id: String?
     }
 
+    /// {ref, doc, state, duration}; `ref` and `doc` are null when a stop found nothing to stop.
     struct Output: Codable {
         var ref: String?
         var doc: String?
         /// "recording", "paused" or "stopped".
         var state: String
         var duration: Double
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(ref, forKey: .ref)
+            try c.encode(doc, forKey: .doc)
+            try c.encode(state, forKey: .state)
+            try c.encode(duration, forKey: .duration)
+        }
     }
 
     static let descriptor = CommandDescriptor(
-        id: "audio.record", title: "Record Audio",
+        id: CommandIDs.audioRecord, title: "Record Audio",
         summary: "Start, pause, resume or stop the app-wide microphone recording into a document ('toggle' starts or stops); returns the clip ref.",
         params: .obj(["doc": .ref,
                       "page": .str("page:D/P where the recording starts (default: the page on screen)"),
@@ -115,7 +124,8 @@ struct AudioRecord: NibCommand {
         if let raw = p.doc, !raw.isEmpty { doc = try AudioRefs.document(raw, ctx) }
         switch action {
         case .start:
-            return try await start(p, doc: doc ?? ctx.activeSession?.document, ctx, audio)
+            // A user call may leave `doc` out (§6.1 session default): the window's document.
+            return try await start(p, doc: doc ?? ctx.documentOrSession(nil), ctx, audio)
         case .stop:
             return try await stop(doc, ctx, audio)
         case .toggle:
@@ -123,7 +133,7 @@ struct AudioRecord: NibCommand {
                 try requireSame(doc, r)
                 return try await stop(r.doc, ctx, audio)
             }
-            return try await start(p, doc: doc ?? ctx.activeSession?.document, ctx, audio)
+            return try await start(p, doc: doc ?? ctx.documentOrSession(nil), ctx, audio)
         case .pause:
             guard let r = audio.recording else { throw AudioController.notRecording }
             try requireSame(doc, r)
@@ -154,12 +164,8 @@ struct AudioRecord: NibCommand {
     /// Opens the microphone, then creates the clip record (not undoable: a recording is captured media, and Delete is
     /// the way to remove it). While recording the audio goes to `audio/<clip>.aac`; stop turns it into the record's
     /// file, `audio/<clip>.caf`.
-    private static func start(_ p: Params, doc: DocumentID?, _ ctx: CommandContext,
+    private static func start(_ p: Params, doc: DocumentID, _ ctx: CommandContext,
                               _ audio: AudioController) async throws -> Output {
-        guard let doc else {
-            throw NibError(.invalidParams, "no document to record into", path: "$.doc",
-                           hint: "pass {\"doc\": \"doc:D\", \"action\": \"start\"}")
-        }
         if let r = audio.recording {
             if r.doc == doc { return status(audio) }
             throw NibError(.conflict, "Nib is already recording in another document", hint: audio.stopHint())
@@ -290,7 +296,7 @@ struct AudioPlay: NibCommand {
     typealias Output = PlaybackStatus
 
     static let descriptor = CommandDescriptor(
-        id: "audio.play", title: "Play Audio",
+        id: CommandIDs.audioPlay, title: "Play Audio",
         summary: "Play an audio clip from t seconds (default: where it was paused); the document's later clips follow. toggle: pause it if it is playing.",
         params: .obj(["clip": .ref, "t": .num("seconds from the clip start", min: 0),
                       "toggle": .bool("pause instead when this clip is already playing")], required: ["clip"]),
@@ -346,7 +352,7 @@ struct AudioPause: NibCommand {
     typealias Output = PlaybackStatus
 
     static let descriptor = CommandDescriptor(
-        id: "audio.pause", title: "Pause Audio",
+        id: CommandIDs.audioPause, title: "Pause Audio",
         summary: "Pause audio playback; audio.play on the same clip without t carries on from here. close: also unload the clip (hides the playback bar).",
         params: .obj(["close": .bool("also unload the clip, which hides the playback bar")]),
         examples: [[:], ["close": true]], effect: .session, target: .app)
@@ -372,7 +378,7 @@ struct AudioSeek: NibCommand {
     typealias Output = PlaybackStatus
 
     static let descriptor = CommandDescriptor(
-        id: "audio.seek", title: "Seek Audio",
+        id: CommandIDs.audioSeek, title: "Seek Audio",
         summary: "Move the loaded clip's playhead to t seconds from its start; it keeps playing if it was.",
         params: .obj(["t": .num("seconds from the clip start", min: 0)], required: ["t"]),
         examples: [["t": 30]], effect: .session, target: .app)
@@ -396,7 +402,7 @@ struct AudioSetPlayback: NibCommand {
     typealias Output = PlaybackStatus
 
     static let descriptor = CommandDescriptor(
-        id: "audio.setPlayback", title: "Playback Options",
+        id: CommandIDs.audioSetPlayback, title: "Playback Options",
         summary: "Set audio playback speed (0.5–2×), skip silence and noise reduction; with no params it reads the playback state and the recording, if any.",
         params: .obj(["speed": .num("playback rate, 0.5 to 2", min: AudioSettings.minimumSpeed, max: AudioSettings.maximumSpeed),
                       "skipSilence": .bool("skip silent stretches"),
@@ -433,7 +439,7 @@ struct AudioRename: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "audio.rename", title: "Rename Recording",
+        id: CommandIDs.audioRename, title: "Rename Recording",
         summary: "Rename an audio clip.",
         params: .obj(["clip": .ref, "name": .str("the new name, 1–200 characters")], required: ["clip", "name"]),
         examples: [["clip": "audio:FIXTUREDOC01/FIXTUREAUD01", "name": "Lecture 3: Kinematics"]],
@@ -467,7 +473,7 @@ struct AudioDelete: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "audio.delete", title: "Delete Recording",
+        id: CommandIDs.audioDelete, title: "Delete Recording",
         summary: "Permanently delete an audio clip and its audio file (cannot be undone).",
         params: .obj(["clip": .ref], required: ["clip"]),
         examples: [["clip": "audio:FIXTUREDOC01/FIXTUREAUD01"]],
@@ -533,7 +539,7 @@ struct AudioExport: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "audio.export", title: "Export Audio",
+        id: CommandIDs.audioExport, title: "Export Audio",
         summary: "Export an audio clip as an audio file (m4a by default, or the original caf); returns a temporary tmp: url.",
         params: .obj(["clip": .ref,
                       "format": .str("m4a (default) or caf", choices: AudioExportFormat.allCases.map { $0.rawValue })],
@@ -590,13 +596,10 @@ struct AudioQuickRecord: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "audio.quickRecord", title: "Quick Record",
+        id: CommandIDs.audioQuickRecord, title: "Quick Record",
         summary: "Create a new text document, open it and start recording into it straight away; returns the document ref.",
         params: .obj(["id": .str("your own id for the new document, [A-Za-z0-9_-]{1,64}")]),
         examples: [[:]], effect: .library, target: .library)
-
-    /// The library command that moves a document to the Trash (F002).
-    static let libraryTrash = "library.trash"
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         if let id = p.id, !NibID.isValid(id) {
@@ -615,11 +618,11 @@ struct AudioQuickRecord: NibCommand {
         _ = try? await ctx.execute(CommandIDs.docOpen, ["doc": .string(ref)])
         let recording: JSONValue
         do {
-            recording = try await ctx.execute("audio.record", ["doc": .string(ref), "action": "start"])
+            recording = try await ctx.execute(CommandIDs.audioRecord, ["doc": .string(ref), "action": "start"])
         } catch {
             // The microphone was busy or refused: the new document goes to the Trash (recoverable) rather than
             // staying in the library empty.
-            _ = try? await ctx.execute(libraryTrash, ["refs": [.string(ref)]])
+            _ = try? await ctx.execute(CommandIDs.libraryTrash, ["refs": [.string(ref)]])
             throw error
         }
         return Output(ref: ref, clip: recording["ref"]?.stringValue)

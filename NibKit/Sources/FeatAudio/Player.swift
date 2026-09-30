@@ -709,7 +709,8 @@ struct RecordingStatus: Codable, Equatable {
     var duration: Double
 }
 
-/// What every playback command returns (`audio.setPlayback {}` reads it without changing anything).
+/// What every playback command returns (`audio.setPlayback {}` reads it without changing anything). `clip` is null
+/// while nothing is loaded and `recording` is null while Nib does not record: both keys are always there.
 struct PlaybackStatus: Codable, Equatable {
     var clip: String?
     var t: Double
@@ -720,6 +721,18 @@ struct PlaybackStatus: Codable, Equatable {
     var noiseReduction: Bool
     /// Whether, and into which clip, Nib is recording (nil = not recording).
     var recording: RecordingStatus?
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(clip, forKey: .clip)
+        try c.encode(t, forKey: .t)
+        try c.encode(duration, forKey: .duration)
+        try c.encode(playing, forKey: .playing)
+        try c.encode(speed, forKey: .speed)
+        try c.encode(skipSilence, forKey: .skipSilence)
+        try c.encode(noiseReduction, forKey: .noiseReduction)
+        try c.encode(recording, forKey: .recording)
+    }
 }
 
 extension AudioController {

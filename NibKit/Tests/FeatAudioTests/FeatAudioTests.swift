@@ -158,8 +158,10 @@ final class FeatAudioTests: XCTestCase {
 
     func testRegistersCommandsMenusPanelShortcutsAndOverlays() throws {
         let (h, _) = try harness()
-        for id in ["audio.record", "audio.play", "audio.pause", "audio.seek", "audio.setPlayback", "audio.rename",
-                   "audio.delete", "audio.export", "audio.quickRecord"] {
+        // Every id is the contracts' catalogue constant (contracts-v2.1).
+        for id in [CommandIDs.audioRecord, CommandIDs.audioPlay, CommandIDs.audioPause, CommandIDs.audioSeek,
+                   CommandIDs.audioSetPlayback, CommandIDs.audioRename, CommandIDs.audioDelete, CommandIDs.audioExport,
+                   CommandIDs.audioQuickRecord] {
             XCTAssertEqual(h.app.commands.descriptor(id)?.owner, FeatAudioFeature.id, id)
         }
         let record = try XCTUnwrap(h.app.commands.descriptor("audio.record"))
@@ -180,6 +182,9 @@ final class FeatAudioTests: XCTestCase {
                        ["audio.more.record"])
         XCTAssertEqual(h.app.ui.menuItems(.documentMore, MenuContext(app: h.app, doc: Fixtures.studySetID)).map { $0.id },
                        [])
+        // The menu entries show the key that does the same (display only).
+        XCTAssertEqual(h.app.ui.menus.get("audio.more.record")?.shortcut, KeyShortcut("r", [.command, .shift]))
+        XCTAssertEqual(h.app.ui.menus.get("audio.more.stop")?.shortcut, KeyShortcut("r", [.command, .shift]))
 
         // The toolbar accessory is registered once and read live.
         let item = try XCTUnwrap(h.app.ui.toolbar.get("audio.record"))
@@ -250,7 +255,7 @@ final class FeatAudioTests: XCTestCase {
         XCTAssertEqual(item.resolvedIcon(for: h.session), "waveform")
         XCTAssertEqual(overlays(h), [])
         let after = try await h.run("audio.setPlayback")
-        XCTAssertTrue(after["recording"] == nil || after["recording"] == .null, "not recording any more")
+        XCTAssertEqual(after["recording"], .null, "not recording any more")
 
         // AAC in CAF, readable back at the same length (the encoder's priming is in the packet table); the live
         // file is gone.
@@ -358,6 +363,46 @@ final class FeatAudioTests: XCTestCase {
         let stopped = try await h.run("audio.record", ["action": "toggle"])
         XCTAssertEqual(stopped["state"]?.stringValue, "stopped")
         XCTAssertNil(audio.recording)
+    }
+
+    /// A user call (the toolbar, a key, More › Record Audio) may leave `doc` out and records into the window's
+    /// document; the AI, plugins and the bridge must name it (§6.1 session defaults).
+    func testStartRecordsIntoTheWindowsDocumentWhenTheUserLeavesDocOut() async throws {
+        let (h, audio) = try harness()
+        let source = SyntheticSource()
+        audio.makeSource = { source }
+        await assertThrows(.invalidParams) {
+            try await h.run(CommandIDs.audioRecord, ["action": "start"], as: .ai("chat"))
+        }
+        XCTAssertNil(audio.recording)
+
+        let started = try await h.run(CommandIDs.audioRecord, ["action": "start"])
+        XCTAssertEqual(started["doc"]?.stringValue, fixtureDoc)
+        XCTAssertEqual(audio.recording?.doc, Fixtures.docID)
+        source.feed(seconds: 1)
+        let stopped = try await h.run(CommandIDs.audioRecord, ["action": "stop"])
+        XCTAssertEqual(stopped["doc"]?.stringValue, fixtureDoc)
+        XCTAssertNil(audio.recording)
+
+        // No document in the window and none named: nothing to record into.
+        h.session.document = nil
+        await assertThrows(.invalidParams) { try await h.run(CommandIDs.audioRecord, ["action": "start"]) }
+        XCTAssertNil(audio.recording)
+    }
+
+    /// The results always carry every key (ARCHITECTURE §6.5): null where nothing is loaded or recording.
+    func testResultsSayNullWhenNothingIsLoadedOrRecording() async throws {
+        let (h, _) = try harness()
+        let status = try await h.run(CommandIDs.audioSetPlayback)
+        XCTAssertEqual(status["clip"], .null)
+        XCTAssertEqual(status["recording"], .null)
+        XCTAssertEqual(status["playing"]?.boolValue, false)
+        XCTAssertEqual(status["duration"]?.doubleValue, 0)
+        let stopped = try await h.run(CommandIDs.audioRecord, ["action": "stop"])
+        XCTAssertEqual(stopped["ref"], .null)
+        XCTAssertEqual(stopped["doc"], .null)
+        XCTAssertEqual(stopped["state"]?.stringValue, "stopped")
+        XCTAssertEqual(stopped["duration"]?.doubleValue, 0)
     }
 
     func testWithoutASampleSourceHostlessTestsHaveNoMicrophone() async throws {
