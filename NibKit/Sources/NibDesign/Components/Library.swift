@@ -121,13 +121,22 @@ public struct NibFolderTile: View {
     let name: String
     let count: String
     let color: Color
+    let glyph: NibFolderGlyph
     let isTargeted: Bool
     let isFused: Bool
 
     public init(name: String, count: String, color: Color, isTargeted: Bool = false, isFused: Bool = false) {
+        self.init(name: name, count: count, color: color, glyph: .symbol(.folderFill), isTargeted: isTargeted,
+                  isFused: isFused)
+    }
+
+    /// v2: a folder with its own glyph (a symbol in the folder colour, or the emoji the person picked).
+    public init(name: String, count: String, color: Color, glyph: NibFolderGlyph, isTargeted: Bool = false,
+                isFused: Bool = false) {
         self.name = name
         self.count = count
         self.color = color
+        self.glyph = glyph
         self.isTargeted = isTargeted
         self.isFused = isFused
     }
@@ -135,10 +144,7 @@ public struct NibFolderTile: View {
     public var body: some View {
         let shape = RoundedRectangle(cornerRadius: NibRadius.tile, style: .continuous)
         HStack(spacing: NibSpacing.m) {
-            Image(nib: .folderFill)
-                .font(.system(size: 30))
-                .foregroundStyle(color)
-                .accessibilityHidden(true)
+            NibFolderGlyphView(glyph: glyph, color: color, size: 30)
             VStack(alignment: .leading, spacing: 1) {
                 Text(name)
                     .font(NibFont.button)
@@ -169,6 +175,41 @@ public struct NibFolderTile: View {
         .animation(NibMotion.reflow.animation, value: isTargeted)
         .animation(NibMotion.lift.animation, value: isFused)
         .accessibilityElement(children: .combine)
+    }
+}
+
+/// A folder's glyph (v2): the folder symbol, another symbol the person chose, or their emoji. Folder emoji are the
+/// person's content, not Nib's iconography, so they are shown as they are.
+public enum NibFolderGlyph: Hashable, Sendable {
+    case symbol(NibSymbol)
+    case emoji(String)
+}
+
+/// A folder's glyph at a size: tiles (30), sidebar rows (22), menus. Symbols take the folder colour.
+public struct NibFolderGlyphView: View {
+    let glyph: NibFolderGlyph
+    let color: Color
+    let size: CGFloat
+
+    public init(glyph: NibFolderGlyph, color: Color, size: CGFloat) {
+        self.glyph = glyph
+        self.color = color
+        self.size = size
+    }
+
+    public var body: some View {
+        Group {
+            switch glyph {
+            case .symbol(let symbol):
+                Image(nib: symbol)
+                    .font(.system(size: size))
+                    .foregroundStyle(color)
+            case .emoji(let emoji):
+                Text(emoji)
+                    .font(.system(size: size))
+            }
+        }
+        .accessibilityHidden(true)
     }
 }
 
@@ -227,15 +268,25 @@ public struct NibPageThumbnail<Content: View>: View {
     let isSelected: Bool?
     let aspectRatio: CGFloat
     let width: CGFloat
+    let showsNumber: Bool
     let content: Content
 
     public init(number: Int, isCurrent: Bool, isSelected: Bool? = nil, aspectRatio: CGFloat = 595.0 / 842.0,
                 width: CGFloat = NibMetrics.thumbnailWidth, @ViewBuilder content: () -> Content) {
+        self.init(number: number, isCurrent: isCurrent, isSelected: isSelected, aspectRatio: aspectRatio, width: width,
+                  showsNumber: true, content: content)
+    }
+
+    /// v2: `showsNumber: false` for rows that say the page themselves (outline and bookmark rows use
+    /// `width: NibMetrics.rowThumbnailWidth`); VoiceOver still reads "Page N".
+    public init(number: Int, isCurrent: Bool, isSelected: Bool? = nil, aspectRatio: CGFloat = 595.0 / 842.0,
+                width: CGFloat = NibMetrics.thumbnailWidth, showsNumber: Bool, @ViewBuilder content: () -> Content) {
         self.number = number
         self.isCurrent = isCurrent
         self.isSelected = isSelected
         self.aspectRatio = aspectRatio
         self.width = width
+        self.showsNumber = showsNumber
         self.content = content()
     }
 
@@ -257,10 +308,12 @@ public struct NibPageThumbnail<Content: View>: View {
                         NibCheckBead(isOn: isSelected).padding(6)
                     }
                 }
-            Text("\(number)")
-                .font(NibFont.caption1)
-                .monospacedDigit()
-                .foregroundStyle(isCurrent ? NibColor.accent : NibColor.labelSecondary)
+            if showsNumber {
+                Text("\(number)")
+                    .font(NibFont.caption1)
+                    .monospacedDigit()
+                    .foregroundStyle(isCurrent ? NibColor.accent : NibColor.labelSecondary)
+            }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(String(localized: "Page \(number)", bundle: .module))
