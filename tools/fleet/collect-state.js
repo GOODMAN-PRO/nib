@@ -24,7 +24,14 @@ const sh = (cmd, cwd) => { try { return execSync(cmd, { cwd, encoding: 'utf8', s
 
 sh('git fetch origin --quiet', ROOT)
 const spec = JSON.parse(fs.readFileSync(path.join(ROOT, 'docs', 'forge-spec.json'), 'utf8'))
-const runs = JSON.parse(sh(`gh run list --repo ${REPO} --limit 1000 --json headSha,status,conclusion`) || '[]')
+// Page through the runs API by owner/repo path: `gh run list --limit >100` follows next-links that use numeric
+// repository ids, which the cloud egress proxy rejects.
+const runs = []
+for (let page = 1; page <= 10; page++) {
+  const batch = JSON.parse(sh(`gh api "repos/${REPO}/actions/runs?per_page=100&page=${page}" --jq "[.workflow_runs[] | {headSha: .head_sha, status, conclusion}]"`) || '[]')
+  runs.push(...batch)
+  if (batch.length < 100) break
+}
 const bySha = {}
 for (const r of runs) if (!bySha[r.headSha] || r.status === 'completed') bySha[r.headSha] = r
 const marker = (id, kind) => { try { return JSON.parse(fs.readFileSync(path.join(STATE, `${id}.${kind}.json`), 'utf8')) } catch { return null } }
@@ -47,6 +54,8 @@ for (const f of spec.features) {
   if (ci) { s.ci = ci; if (ci === 'green') report.ciGreen++; else report.ciRed.push(f.id) }
   if (review && review.verdict) { s.review = review.verdict; report.reviewed++ }
   if (fixed && fixed.status) { s.fixed = fixed.status; report.fixed++ }
+  if (fixed && fixed.v2adopt) s.v2 = 1
+  if (/^WIP /.test(sh('git log -1 --format=%s', wt))) s.wip = 1
   if (s.ci === 'green' && (s.review === 'pass' || s.fixed === 'green')) report.fullyDone.push(f.id)
   if (Object.keys(s).length) state[f.id] = s
 }
