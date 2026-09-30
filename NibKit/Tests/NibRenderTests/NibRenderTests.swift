@@ -583,12 +583,15 @@ final class NibRenderTests: XCTestCase {
         let (doc, page) = try makePage(h, items: strokes, size: PageSize(595.28, 841.89))
         let renderer = try XCTUnwrap(h.app.services.renderer as? NibPageRenderer)
         let tile = TileGrid.rect(TileCoord(col: 0, row: 0), level: 1)
-        let job = try renderer.snapshot(RenderRequest(doc: doc, page: page, region: tile, scale: 2,
-                                                      layers: Set(0..<NibLimits.layerCount)))
-        XCTAssertEqual(job.visibleItems.count, 150)
-        XCTAssertNotNil(PageCompositor.image(job, region: tile, scale: 2, width: 512, height: 512, marks: []))   // warm-up
+        let request = RenderRequest(doc: doc, page: page, region: tile, scale: 2, layers: Set(0..<NibLimits.layerCount))
+        let warm = try renderer.snapshot(request)
+        XCTAssertEqual(warm.visibleItems.count, 150)
+        XCTAssertNotNil(PageCompositor.image(warm, region: tile, scale: 2, width: 512, height: 512, marks: []))   // warm-up
+        // The fastest of ten composites, each from a fresh snapshot (nothing carried over between samples): shared CI
+        // runners and a busy build Mac add noise that only ever makes a sample slower.
         var best = Double.infinity
-        for _ in 0..<3 {
+        for _ in 0..<10 {
+            let job = try renderer.snapshot(request)
             let t0 = CFAbsoluteTimeGetCurrent()
             let image = PageCompositor.image(job, region: tile, scale: 2, width: 512, height: 512, marks: [])
             best = min(best, CFAbsoluteTimeGetCurrent() - t0)
