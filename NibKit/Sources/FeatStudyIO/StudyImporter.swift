@@ -6,8 +6,9 @@ struct StudyRow: Equatable {
     var front: String
     var back: String
 
-    func card(order: String) -> StudyCard {
-        StudyCard(front: CardFace(kind: .text, text: RichText(plain: front)),
+    /// Empty `order` = appended by `tx.put(_ cards:doc:)` after the set's last card.
+    func card(id: NibID = NibID.make(), order: String = "") -> StudyCard {
+        StudyCard(id: id, front: CardFace(kind: .text, text: RichText(plain: front)),
                   back: CardFace(kind: .text, text: RichText(plain: back)), order: order)
     }
 }
@@ -78,31 +79,11 @@ enum StudyImport {
         }.value
     }
 
-    /// Title for a set imported from a file: its name without extension (and without the "<UUID>-" prefix that
-    /// `CommandContext.inputFile` gives https downloads).
+    /// Title for a set imported from a file: its name without extension (`CommandContext.inputFile` keeps a download's
+    /// original name), else `defaultTitle`.
     static func title(forFile url: URL) -> String {
-        var name = url.deletingPathExtension().lastPathComponent
-        let uuidPrefix = "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}-"
-        if let r = name.range(of: uuidPrefix, options: .regularExpression) { name.removeSubrange(r) }
-        name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = url.deletingPathExtension().lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty || name == "/" ? defaultTitle : name
-    }
-
-    /// `count` increasing card order keys after `last`, chosen by bisection so they stay a few characters long
-    /// (`FractionalIndex.sequence` grows one character every ~6 keys: far too long for a large deck).
-    static func orderKeys(after last: String?, count: Int) -> [String] {
-        var keys: [String] = []
-        keys.reserveCapacity(max(0, count))
-        func fill(_ lo: String?, _ hi: String?, _ n: Int) {
-            guard n > 0 else { return }
-            let mid = FractionalIndex.between(lo, hi)
-            let left = (n - 1) / 2
-            fill(lo, mid, left)
-            keys.append(mid)
-            fill(mid, hi, n - 1 - left)
-        }
-        fill(last, nil, count)
-        return keys
     }
 
     // MARK: Rows → documents
@@ -125,6 +106,7 @@ enum StudyImport {
     }
 
     /// Writes a new study set package holding one card per row (not on the undo stack: recoverable through Trash).
+    /// Card order keys are balanced, so a 10,000-card deck gets keys a few characters long.
     @MainActor
     @discardableResult
     static func createSet(_ rows: [StudyRow], id: DocumentID, title: String, folder: FolderID?,
@@ -133,7 +115,7 @@ enum StudyImport {
         let clock = ctx.workspace.clock
         var meta = DocumentMeta(id: id, kind: .studySet)
         meta.rev = clock.tick()
-        let cards = zip(rows, orderKeys(after: nil, count: rows.count)).map { pair -> StudyCard in
+        let cards = zip(rows, FractionalIndex.balanced(count: rows.count)).map { pair -> StudyCard in
             var card = pair.0.card(order: pair.1)
             card.rev = clock.tick()
             return card
@@ -141,53 +123,69 @@ enum StudyImport {
         return try library.createDocument(DocumentContent(meta: meta, cards: cards), title: title, in: folder)
     }
 
-    /// Appending costs about rows × (cards already in the set + rows) card copies on the main actor, and undo costs the
-    /// same again. Each `tx.put` copies the set's card array, and the contracts have no batch put. Past this budget
-    /// (5,000 rows into an empty set), `importFile` puts the rows in a new set instead of freezing the UI.
-    static let appendBudget = 25_000_000
-
-    static func appendsInPlace(rows: Int, existingCards: Int) -> Bool {
-        rows * (existingCards + rows) <= appendBudget
+    /// The id for a new set: the caller's (`study.importText {id}`, `import.files {ids}`), which must be well formed and
+    /// unused, else a fresh one.
+    @MainActor
+    static func newSetID(_ requested: NibID?, path: String, _ library: LibraryService) throws -> DocumentID {
+        guard let id = requested else { return NibID.make() }
+        guard NibID.isValid(id.raw) else { throw NibError.invalid("id must be 1–64 of [A-Za-z0-9_-]", path: path) }
+        if library.node(id) != nil {
+            throw NibError(.conflict, "id \(id) is already used in the library", path: path,
+                           hint: "choose another id or leave it out")
+        }
+        return id
     }
 
-    /// Appends the rows to an existing study set as one undo step (callers keep within `appendBudget`).
+    /// Appends the rows to an existing study set as one undo step, in one batch write (`tx.put(_ cards:doc:)` gives the
+    /// new cards balanced order keys after the set's last card). `ids` (from `import.files {ids}`) name the new cards
+    /// in row order; each must be well formed and not used by a card of the set.
     @MainActor
-    static func append(_ rows: [StudyRow], to doc: DocumentID, _ ctx: CommandContext) throws {
+    static func append(_ rows: [StudyRow], to doc: DocumentID, ids: [NibID]? = nil, _ ctx: CommandContext) throws {
         if ctx.services.lock?.isLocked(doc) == true {
             throw NibError(.locked, "doc:\(doc) is locked", hint: "unlock it first (doc.unlock)")
         }
-        try ctx.mutate(String(localized: "Import Cards")) { tx in
-            let last = try tx.content(doc).liveCards.last?.order
-            for (row, order) in zip(rows, orderKeys(after: last, count: rows.count)) {
-                try tx.put(row.card(order: order), doc: doc)
+        let ids = Array((ids ?? []).prefix(rows.count))
+        if !ids.isEmpty {
+            let used = Set(try ctx.workspace.content(doc).cards.map(\.id))
+            var seen = Set<NibID>()
+            for (i, id) in ids.enumerated() {
+                guard NibID.isValid(id.raw) else {
+                    throw NibError.invalid("id must be 1–64 of [A-Za-z0-9_-]", path: "$.ids[\(i)]")
+                }
+                guard !used.contains(id), seen.insert(id).inserted else {
+                    throw NibError(.conflict, "card id \(id) is already used in doc:\(doc)", path: "$.ids[\(i)]",
+                                   hint: "choose other ids or leave them out")
+                }
             }
+        }
+        let cards = rows.enumerated().map { i, row in i < ids.count ? row.card(id: ids[i]) : row.card() }
+        try ctx.mutate(String(localized: "Import Cards")) { tx in
+            try tx.put(cards, doc: doc)
         }
     }
 
-    /// `import.files` entry point: appends to the target document when it is a study set, else creates a new set named
-    /// after the file in the target folder. A file too large to append (`appendBudget`) becomes a new set next to the
-    /// target set.
+    /// `import.files` entry point: appends to the target document when it is a study set, else creates a new set in the
+    /// target folder, titled `target.displayName` (the original file name) or after the local file, with id
+    /// `target.ids[0]` when given.
     @MainActor
     static func importFile(_ url: URL, format: StudyTextFormat, target: ImportTarget,
                            _ ctx: CommandContext) async throws -> [DocumentID] {
         let rows = try await StudyImport.rows(fromFile: url, format: format)
         guard !rows.isEmpty else {
-            throw NibError(.invalidParams, "no cards found in \(url.lastPathComponent)",
+            throw NibError(.invalidParams, "no cards found in \(target.displayName ?? url.lastPathComponent)",
                            hint: "one card per line: question, then a tab or comma, then the answer")
         }
-        var folder = target.folder
         if let doc = target.document {
-            let content = try ctx.workspace.content(doc)
-            if content.meta.kind == .studySet {
-                if appendsInPlace(rows: rows.count, existingCards: content.cards.count) {
-                    try append(rows, to: doc, ctx)
-                    return [doc]
-                }
-                if folder == nil { folder = ctx.services.library?.node(doc)?.parent }
+            if try ctx.workspace.content(doc).meta.kind == .studySet {
+                try append(rows, to: doc, ids: target.ids, ctx)
+                return [doc]
             }
         }
-        let id = NibID.make()
-        if !ctx.dryRun { try createSet(rows, id: id, title: title(forFile: url), folder: folder, ctx) }
+        let library = try ctx.services.require(ctx.services.library, "the library")
+        let id = try newSetID(target.ids?.first, path: "$.ids[0]", library)
+        let display = target.displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let title = display.isEmpty ? StudyImport.title(forFile: url) : display
+        if !ctx.dryRun { try createSet(rows, id: id, title: title, folder: target.folder, ctx) }
         return [id]
     }
 
@@ -222,7 +220,7 @@ struct StudyImportText: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "study.importText", title: "Import Study Set",
+        id: CommandIDs.studyImportText, title: "Import Study Set",
         summary: "Create a study set from CSV/TSV/TXT text or a file url (column A = question, B = answer; Anki plain-text "
             + "and Quizlet exports work); returns the new doc ref.",
         params: .obj([
@@ -252,14 +250,9 @@ struct StudyImportText: NibCommand {
             }
             format = parsed
         }
-        if let id = p.id, !NibID.isValid(id) { throw NibError.invalid("id must be 1–64 of [A-Za-z0-9_-]", path: "$.id") }
         let library = try ctx.services.require(ctx.services.library, "the library")
+        let docID = try StudyImport.newSetID(p.id.map { NibID($0) }, path: "$.id", library)
         let folder = try StudyImport.folder(p.folder, library)
-        let docID = p.id.map { NibID($0) } ?? NibID.make()
-        if library.node(docID) != nil {
-            throw NibError(.conflict, "id \(docID) is already used in the library", path: "$.id",
-                           hint: "choose another id or leave it out")
-        }
 
         let rows: [StudyRow]
         var title = StudyImport.defaultTitle

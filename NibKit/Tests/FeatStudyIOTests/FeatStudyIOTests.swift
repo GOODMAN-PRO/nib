@@ -60,6 +60,9 @@ final class FeatStudyIOTests: XCTestCase {
         let exporter = h.app.content.exporters.get("study.csv")
         XCTAssertEqual(exporter?.fileExtension, "csv")
         XCTAssertEqual(exporter?.owner, "studyio")
+        XCTAssertEqual(exporter?.docKinds, [.studySet])
+        XCTAssertEqual(StudyImportText.descriptor.id, CommandIDs.studyImportText)
+        XCTAssertEqual(StudyExportCSV.descriptor.id, CommandIDs.studyExportCSV)
     }
 
     func testCommandConformance() async {
@@ -135,8 +138,9 @@ final class FeatStudyIOTests: XCTestCase {
         XCTAssertEqual(try cards(h, "DRYRUNSET001").count, 2)
     }
 
-    func testTitleForFileDropsDownloadPrefixAndFallsBack() throws {
-        let download = URL(fileURLWithPath: "/tmp/0F8FAD5B-D9CB-469F-A165-70867728950E-Spanish.csv")
+    func testTitleForFileUsesTheFileNameAndFallsBack() throws {
+        // contracts-v2 downloads keep their original name: <tmp>/nib-downloads/<UUID>/<name>.
+        let download = URL(fileURLWithPath: "/tmp/nib-downloads/0F8FAD5B-D9CB-469F-A165-70867728950E/Spanish.csv")
         XCTAssertEqual(StudyImport.title(forFile: download), "Spanish")
         XCTAssertEqual(StudyImport.title(forFile: URL(fileURLWithPath: "/tmp/Chem 101.tsv")), "Chem 101")
         let https = try XCTUnwrap(URL(string: "https://example.com/dl/My%20Deck.csv"))
@@ -145,6 +149,20 @@ final class FeatStudyIOTests: XCTestCase {
         XCTAssertEqual(StudyImport.title(forFile: rootOnly), StudyImport.defaultTitle)
         let noPath = try XCTUnwrap(URL(string: "https://example.com"))
         XCTAssertEqual(StudyImport.title(forFile: noPath), StudyImport.defaultTitle)
+    }
+
+    func testNewSetsGetShortIncreasingOrderKeys() async throws {
+        let h = harness()
+        let text = (0..<10_000).map { "Q\($0)\tA\($0)" }.joined(separator: "\n")
+        let r = try await h.run("study.importText", ["text": .string(text), "format": "tsv", "id": "BIGDECK00001"])
+        XCTAssertEqual(r["cards"]?.intValue, 10_000)
+        let cards = try h.app.workspace.content("BIGDECK00001").liveCards
+        XCTAssertEqual(cards.count, 10_000)
+        XCTAssertEqual(cards.first?.front.text?.plainText, "Q0")
+        XCTAssertEqual(cards.last?.front.text?.plainText, "Q9999")
+        let keys = cards.map(\.order)
+        XCTAssertTrue(zip(keys, keys.dropFirst()).allSatisfy { $0.0 < $0.1 })
+        XCTAssertLessThanOrEqual(keys.map(\.count).max() ?? 0, 3)
     }
 
     // MARK: study.exportCSV
@@ -227,29 +245,91 @@ final class FeatStudyIOTests: XCTestCase {
         XCTAssertEqual(h.undoDepth(Fixtures.studySetID), depth)
     }
 
-    func testImporterPutsAnOversizedAppendIntoANewSetBesideTheTarget() async throws {
-        XCTAssertTrue(StudyImport.appendsInPlace(rows: 5_000, existingCards: 0))
-        XCTAssertFalse(StudyImport.appendsInPlace(rows: 5_001, existingCards: 0))
-        XCTAssertTrue(StudyImport.appendsInPlace(rows: 100, existingCards: 20_000))
-        XCTAssertFalse(StudyImport.appendsInPlace(rows: 1_000, existingCards: 30_000))
-
+    func testImporterAppendsALargeDeckInPlaceAsOneUndoStep() async throws {
         let h = harness()
-        let text = (0..<5_001).map { "Q\($0)\tA\($0)" }.joined(separator: "\n")
+        let text = (0..<10_000).map { "Q\($0)\tA\($0)" }.joined(separator: "\n")
         let url = try temporaryFile("Huge Deck.tsv", text)
         let importer = try XCTUnwrap(h.app.content.importer(forExtension: "tsv"))
+        let depth = h.undoDepth(Fixtures.studySetID)
         var imported: [DocumentID] = []
         try await inCommand(h) { ctx in
             imported = try await importer.handler(url, ImportTarget(document: Fixtures.studySetID), ctx)
         }
-        let doc = try XCTUnwrap(imported.first)
-        XCTAssertNotEqual(doc, Fixtures.studySetID)
+        XCTAssertEqual(imported, [Fixtures.studySetID])
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), depth + 1)
+        let live = try h.app.workspace.content(Fixtures.studySetID).liveCards
+        XCTAssertEqual(live.count, 10_002)
+        XCTAssertEqual(live.prefix(2).map { $0.front.text?.plainText }, ["Term", "Picture"])
+        XCTAssertEqual(live.last?.front.text?.plainText, "Q9999")
+        let keys = live.map(\.order)
+        XCTAssertTrue(zip(keys, keys.dropFirst()).allSatisfy { $0.0 < $0.1 })
+        XCTAssertLessThanOrEqual(keys.dropFirst(2).map(\.count).max() ?? 0, 4)
+        XCTAssertTrue(live.allSatisfy { $0.rev != .zero })
+
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
         XCTAssertEqual(try cards(h, Fixtures.studySetID).map(\.front), ["Term", "Picture"])
-        let added = try cards(h, doc)
-        XCTAssertEqual(added.count, 5_001)
-        XCTAssertEqual(added.last, StudyRow(front: "Q5000", back: "A5000"))
-        XCTAssertEqual(h.library.node(doc)?.title, "Huge Deck")
-        XCTAssertEqual(h.library.node(doc)?.parent, h.library.node(Fixtures.studySetID)?.parent)
-        XCTAssertEqual(h.library.node(doc)?.parent, Fixtures.folderID)
+        XCTAssertTrue(h.app.bus.redo(Fixtures.studySetID))
+        XCTAssertEqual(try cards(h, Fixtures.studySetID).count, 10_002)
+    }
+
+    func testImporterTitlesAndNamesNewSetsFromTheTarget() async throws {
+        let h = harness()
+        // A tmp: asset or download has a generated local name; import.files passes the original one.
+        let url = try temporaryFile("3F9A0C2E7B41.csv", "mitosis,cell division\nmeiosis,gamete formation\n")
+        let importer = try XCTUnwrap(h.app.content.importer(forExtension: "csv"))
+        var imported: [DocumentID] = []
+        try await inCommand(h) { ctx in
+            imported = try await importer.handler(url, ImportTarget(folder: Fixtures.folderID, displayName: " Biology 3 ",
+                                                                    ids: ["CALLERSET001"]), ctx)
+        }
+        XCTAssertEqual(imported, ["CALLERSET001"])
+        XCTAssertEqual(h.library.node("CALLERSET001")?.title, "Biology 3")
+        XCTAssertEqual(h.library.node("CALLERSET001")?.parent, Fixtures.folderID)
+        XCTAssertEqual(try cards(h, "CALLERSET001"), [StudyRow(front: "mitosis", back: "cell division"),
+                                                      StudyRow(front: "meiosis", back: "gamete formation")])
+
+        // A blank display name falls back to the file name; a used or malformed id is refused.
+        try await inCommand(h) { ctx in
+            imported = try await importer.handler(url, ImportTarget(displayName: "  "), ctx)
+        }
+        XCTAssertEqual(h.library.node(try XCTUnwrap(imported.first))?.title, "3F9A0C2E7B41")
+        for (ids, code) in [(["CALLERSET001"], NibError.Code.conflict), (["not ok!"], .invalidParams)] {
+            do {
+                try await inCommand(h) { ctx in
+                    _ = try await importer.handler(url, ImportTarget(ids: ids.map { NibID($0) }), ctx)
+                }
+                XCTFail("ids \(ids) should fail with \(code.rawValue)")
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, code, e.description)
+            }
+        }
+    }
+
+    func testImporterAppendNamesCardsFromTargetIDs() async throws {
+        let h = harness()
+        let url = try temporaryFile("more.tsv", "Q3\tA3\nQ4\tA4\n")
+        let importer = try XCTUnwrap(h.app.content.importer(forExtension: "tsv"))
+        try await inCommand(h) { ctx in
+            _ = try await importer.handler(url, ImportTarget(document: Fixtures.studySetID, ids: ["NEWCARD00003"]), ctx)
+        }
+        let live = try h.app.workspace.content(Fixtures.studySetID).liveCards
+        XCTAssertEqual(live.map { $0.front.text?.plainText }, ["Term", "Picture", "Q3", "Q4"])
+        XCTAssertEqual(live[2].id, "NEWCARD00003")
+        XCTAssertNotEqual(live[3].id, "NEWCARD00003")
+
+        let depth = h.undoDepth(Fixtures.studySetID)
+        for ids: [NibID] in [[Fixtures.card1], ["DUPCARD00001", "DUPCARD00001"], ["bad id"]] {
+            do {
+                try await inCommand(h) { ctx in
+                    _ = try await importer.handler(url, ImportTarget(document: Fixtures.studySetID, ids: ids), ctx)
+                }
+                XCTFail("ids \(ids) should be refused")
+            } catch let e as NibError {
+                XCTAssertTrue([NibError.Code.conflict, .invalidParams].contains(e.code), e.description)
+            }
+        }
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), depth)
+        XCTAssertEqual(try cards(h, Fixtures.studySetID).count, 4)
     }
 
     func testImporterCreatesSetNamedAfterFileAndExporterWritesCSV() async throws {
@@ -287,18 +367,5 @@ final class FeatStudyIOTests: XCTestCase {
         } catch let e as NibError {
             XCTAssertEqual(e.code, .invalidParams)
         }
-    }
-
-    // MARK: Order keys
-
-    func testOrderKeysStayShortAndIncreasing() {
-        let keys = StudyImport.orderKeys(after: nil, count: 10_000)
-        XCTAssertEqual(keys.count, 10_000)
-        XCTAssertTrue(zip(keys, keys.dropFirst()).allSatisfy { $0.0 < $0.1 })
-        XCTAssertLessThanOrEqual(keys.map(\.count).max() ?? 0, 3)
-        let after = StudyImport.orderKeys(after: "k", count: 3)
-        XCTAssertEqual(after.count, 3)
-        XCTAssertTrue(after.allSatisfy { $0 > "k" })
-        XCTAssertEqual(StudyImport.orderKeys(after: nil, count: 0), [])
     }
 }

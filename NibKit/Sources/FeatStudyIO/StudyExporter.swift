@@ -75,12 +75,16 @@ enum StudyExport {
         return urls
     }
 
+    /// Listed by Share & Export for study sets only (`docKinds`); `export.run` with another kind still fails with
+    /// invalid_params from `file(_:_:)`.
     @MainActor
     static func exporter(owner: String) -> ExporterDescriptor {
-        ExporterDescriptor(id: "study.csv", title: String(localized: "CSV"), fileExtension: "csv",
-                           utType: StudyTextFormat.csv.utType, owner: owner) { request, ctx in
+        var exporter = ExporterDescriptor(id: "study.csv", title: String(localized: "CSV"), fileExtension: "csv",
+                                          utType: StudyTextFormat.csv.utType, owner: owner) { request, ctx in
             try StudyExport.write(request, ctx)
         }
+        exporter.docKinds = [.studySet]
+        return exporter
     }
 }
 
@@ -103,7 +107,7 @@ struct StudyExportCSV: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "study.exportCSV", title: "Export as CSV",
+        id: CommandIDs.studyExportCSV, title: "Export as CSV",
         summary: "Export a study set as CSV (question, answer per row); returns a tmp: asset plus the CSV text when it "
             + "fits in the result.",
         params: .obj(["doc": .ref], required: ["doc"]),
