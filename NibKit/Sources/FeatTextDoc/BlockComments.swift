@@ -8,7 +8,8 @@ import NibDesign
 // Inline comments on selected text of text-document blocks (D-131). A comment is a `BlockComment` stored on its block
 // with a UTF-16 range of the block's plain text; a reply is a new comment on the same range, so a thread is every
 // comment of one block that shares a range. The four commands below own every change; the editor adds ⇧⌘M, the
-// edit-menu and block-menu entries, the highlight on commented text, the comment card and the Comments tab.
+// edit-menu and block-menu entries, the highlight on commented text, the comment card and the Comments tab, and
+// `CommentAnchorKeeper` keeps comments on their words while text is typed, split by Return or joined to another block.
 
 // MARK: - block.comment
 
@@ -1472,8 +1473,11 @@ struct TextDocCommentsPanel: View {
 
     init(context: PanelContext) {
         params = context.params
+        // A tab shown as a sheet (compact width) covers the document: Show in Document closes it.
+        let covers = context.presentation == .sheet || context.presentation == .fullScreen
         _model = StateObject(wrappedValue: CommentsPanelModel(app: context.app, session: context.session,
-                                                              params: context.params))
+                                                              params: context.params,
+                                                              leave: covers ? context.dismiss : nil))
     }
 
     var body: some View {
@@ -1486,7 +1490,7 @@ struct TextDocCommentsPanel: View {
                                     onCancel: { model.cancelDraft() }) { text in
                     model.postDraft(text)
                 }
-                .id(draft)
+                .id(draft.token)
                 .padding(NibSpacing.m)
                 .background(NibColor.fill3, in: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous))
                 .padding(.horizontal, NibSpacing.s)
@@ -1539,7 +1543,7 @@ struct CommentsPanelRow: View {
                 CommentQuoteView(excerpt: row.excerpt)
                 CommentThreadView(model: expanded, chrome: .panel, showsQuote: false) { model.collapse() }
                 NibButton(String(localized: "Show in Document"), symbol: .forward, kind: .plain, size: .compact) {
-                    model.reveal(row)
+                    model.showInDocument(row)
                 }
             } else {
                 Button {
@@ -1593,7 +1597,7 @@ struct CommentsPanelRow: View {
     @ViewBuilder
     private var menu: some View {
         Button {
-            model.reveal(row)
+            model.showInDocument(row)
         } label: {
             Label { Text(String(localized: "Show in Document")) } icon: { Image(nib: .forward) }
         }
@@ -1653,10 +1657,13 @@ final class CommentsPanelModel: ObservableObject {
         var id: String { thread.id }
     }
 
-    /// A new comment being written in the tab: the words it will be on.
-    struct Draft: Hashable {
+    /// A new comment being written in the tab: the words it will be on. `text` is the block's plain text `range`
+    /// points into; the range follows the block's text while the comment is written (`token` stays).
+    struct Draft: Equatable {
+        let token: String
         var block: NibID
         var range: NSRange
+        var text: String
         var excerpt: String
     }
 
@@ -1673,6 +1680,8 @@ final class CommentsPanelModel: ObservableObject {
 
     let app: NibApp
     let session: EditorSession?
+    /// Closes the tab when it covers the document (a sheet), so the words it shows can be seen.
+    private let leave: (@MainActor () -> Void)?
     private var doc: DocumentID?
     private var commits: EventSubscription?
     private var cancellables = Set<AnyCancellable>()
@@ -1682,9 +1691,10 @@ final class CommentsPanelModel: ObservableObject {
     /// Words `panel.open {block, range, compose: true}` asked to comment on: a draft once the document is known.
     private var requestedDraft: (block: NibID, range: [Int])?
 
-    init(app: NibApp, session: EditorSession?, params: JSONValue) {
+    init(app: NibApp, session: EditorSession?, params: JSONValue, leave: (@MainActor () -> Void)? = nil) {
         self.app = app
         self.session = session
+        self.leave = leave
         read(params)
         commits = app.bus.observeCommits { [weak self] changeset in
             guard let self = self, let doc = self.doc, changeset.headChanged(doc) else { return }
@@ -1784,14 +1794,26 @@ final class CommentsPanelModel: ObservableObject {
                 let range = CommentAnchors.clamp(NSRange(location: request.range[0], length: max(0, request.range[1])),
                                                  length: BlockCommentRules.length(of: b))
                 if range.length > 0 {
-                    draft = Draft(block: b.id, range: range, excerpt: CommentThreads.excerpt(range, in: b))
+                    draft = Draft(token: NibID.make().raw, block: b.id, range: range, text: b.text.plainText,
+                                  excerpt: CommentThreads.excerpt(range, in: b))
                     if filter != .open { filter = .open }
                 }
             }
         }
-        if let d = draft, isReadOnly || runner.liveBlock(d.block).map({ BlockRules.isText($0.kind) }) != true {
+        guard var d = draft else { return }
+        guard !isReadOnly, let b = runner.liveBlock(d.block), BlockRules.isText(b.kind) else {
             draft = nil
+            return
         }
+        // The block's text changed while the comment is written: its words are followed, and when they are gone
+        // there is nothing left to comment on.
+        let text = b.text.plainText
+        guard text != d.text else { return }
+        let range = CommentAnchors.edit(from: d.text, to: text).map { CommentAnchors.map(d.range, through: $0) } ?? d.range
+        d.range = CommentAnchors.clamp(range, length: BlockCommentRules.length(of: b))
+        d.text = text
+        d.excerpt = CommentThreads.excerpt(d.range, in: b)
+        draft = d.range.length > 0 ? d : nil
     }
 
     func cancelDraft() {
@@ -1810,7 +1832,7 @@ final class CommentsPanelModel: ObservableObject {
             let ok = await runner.run(BlockCommentAdd.descriptor.id, params) != nil
             isPosting = false
             guard ok else { return }
-            if draft == d { draft = nil }
+            if draft?.token == d.token { draft = nil }
             UIAccessibility.post(notification: .announcement, argument: String(localized: "Comment added"))
             if filter != .open { filter = .open }
             requested = (d.block, id)
@@ -1833,11 +1855,17 @@ final class CommentsPanelModel: ObservableObject {
         expandedID = nil
     }
 
+    /// Show in Document: the words in the editor, with the tab out of the way when it covers them.
+    func showInDocument(_ row: Row) {
+        reveal(row)
+        leave?()
+    }
+
     /// Scrolls the editor to the commented words and selects them (read-only windows only scroll).
     func reveal(_ row: Row) {
         guard let editor = runner?.editor else { return }
         let id = row.thread.block
-        editor.reveal(block: id, animated: true)
+        editor.reveal(block: id, animated: !UIAccessibility.isReduceMotionEnabled)
         guard !editor.isReadOnly else { return }
         editor.focus(id, at: row.thread.range.location)
         if let tv = editor.cell(for: id)?.textView, tv.isFirstResponder {

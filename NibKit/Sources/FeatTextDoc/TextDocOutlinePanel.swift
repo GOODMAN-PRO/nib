@@ -208,7 +208,7 @@ final class TextDocOutlineModel: ObservableObject {
     /// Scrolls the editor to the heading.
     func reveal(_ entry: TextDocOutlineEntry) {
         guard let editor = runner?.editor else { return }
-        editor.reveal(block: entry.id, animated: true)
+        editor.reveal(block: entry.id, animated: !UIAccessibility.isReduceMotionEnabled)
         if current != entry.id { current = entry.id }
     }
 
@@ -228,7 +228,7 @@ final class TextDocOutlineModel: ObservableObject {
                                  "id": .string(id.raw)]
         Task { @MainActor in
             guard await runner.run(BlockInsert.descriptor.id, params) != nil, let editor = runner.editor else { return }
-            editor.reveal(block: id, animated: true)
+            editor.reveal(block: id, animated: !UIAccessibility.isReduceMotionEnabled)
             editor.focus(id, at: 0)
         }
     }

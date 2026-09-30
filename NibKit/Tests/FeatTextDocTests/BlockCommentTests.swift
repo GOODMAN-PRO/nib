@@ -585,6 +585,16 @@ final class BlockCommentTests: XCTestCase {
         // panel.open again on the tab on screen, and a request the window cannot write.
         model.apply(["block": .string(paragraph), "range": [0, 5], "compose": true])
         XCTAssertEqual(model.draft?.excerpt, "Hello")
+        let token = model.draft?.token
+        // Text typed before the words while the comment is written: the draft follows them.
+        try await h.run("block.update", ["ref": .string(paragraph), "text": "Oh, Hello blocks"])
+        try await waitUntil("the draft follows its words") { model.draft?.range == NSRange(location: 4, length: 5) }
+        XCTAssertEqual(model.draft?.excerpt, "Hello")
+        XCTAssertEqual(model.draft?.token, token, "the composer and its text stay")
+        try await h.run("block.update", ["ref": .string(paragraph), "text": "Oh, blocks"])
+        try await waitUntil("the words are gone") { model.draft == nil }
+        model.apply(["block": .string(paragraph), "range": [0, 3], "compose": true])
+        XCTAssertEqual(model.draft?.excerpt, "Oh,")
         model.cancelDraft()
         XCTAssertNil(model.draft)
         model.apply(["block": .string(table), "range": [0, 1], "compose": true])
