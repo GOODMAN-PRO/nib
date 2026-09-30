@@ -226,14 +226,16 @@ enum TitleSuggester {
 
 @MainActor
 enum TitleSuggestion {
-    /// Pages read for the first recognised line.
+    /// Pages read for the first recognised line (and looked at for content).
     static let pagesToRead = 3
 
     /// `doc.suggestTitle` (the AI, when the AI actions are installed and a provider is configured), else the first
-    /// recognised line of the first pages (`recognize.pageText`: handwriting, typed text, PDF text). Callers check
-    /// `QuickNoteTracker.hasContent` first, so an empty notebook never costs an AI call. The document has usually been
-    /// left, so its head is peeked (`peekContent`), never opened into the workspace.
-    static func load(_ doc: DocumentID, runner: CommandRunner, workspace: Workspace) async -> String? {
+    /// recognised line of the first pages (`recognize.pageText`: handwriting, typed text, PDF text). An empty notebook
+    /// gets nil without a single call, so it never costs an AI request. The document has usually been left, so it is
+    /// peeked (`peekContent`), never opened into the workspace.
+    static func load(_ doc: DocumentID, runner: CommandRunner, workspace: Workspace,
+                     knownToHaveContent: Bool = false) async -> String? {
+        guard knownToHaveContent || hasContent(doc, workspace) else { return nil }
         if runner.has(CreateIDs.docSuggestTitle),
            let value = try? await runner.run(CreateIDs.docSuggestTitle, ["doc": .string(NodeRef.document(doc).description)]),
            let title = TitleSuggester.parse(value) {
@@ -249,12 +251,27 @@ enum TitleSuggestion {
         }
         return nil
     }
+
+    /// Anything on the first pages. Reads without opening the document: the head is peeked, and a page's items come
+    /// from memory when they are cached, else straight from persistence (nothing is cached, no `doc.opened`).
+    static func hasContent(_ doc: DocumentID, _ workspace: Workspace) -> Bool {
+        guard let content = try? workspace.peekContent(doc) else { return false }
+        return content.livePages.prefix(pagesToRead).contains { page in
+            let items: [Item]?
+            if workspace.isPageCached(doc, page: page.id) {
+                items = try? workspace.items(doc, page: page.id)
+            } else {
+                items = (try? workspace.persistence.loadItems(doc, page: page.id))?.filter { !$0.deleted }
+            }
+            return !(items?.isEmpty ?? true)
+        }
+    }
 }
 
 // MARK: - Leaving a QuickNote
 
 enum LeaveDecision: Equatable {
-    /// Nothing to do now (not pending, being handled, or still shown in a window or tab).
+    /// Nothing to do now (not pending, being handled, still shown in a window or tab, or no window left it).
     case none
     /// The document is gone (trashed, merged, deleted): forget the mark.
     case clear
@@ -267,8 +284,8 @@ enum LeaveDecision: Equatable {
 /// When leaving a document gets the QuickNote prompt or a title suggestion. Pure.
 ///
 /// `left`: a window that can be asked now left the document (it showed it, moved on, and is the active window whose
-/// tabs `isShown` sees). Without one, nothing is asked: the document may still be a background tab of another window
-/// (restored tabs, `addTab`), and a prompt there could trash a document that is still open.
+/// tabs `isShown` sees; or it has closed). Without one, nothing is asked: the document may still be a background tab
+/// of another window (restored tabs, `addTab`), and a prompt there could trash a document that is still open.
 enum QuickNoteExitRule {
     static func decide(_ pending: PendingCreation?, isShown: Bool, left: Bool, node: LibraryNode?,
                        busy: Bool) -> LeaveDecision {
@@ -289,21 +306,35 @@ enum QuickNoteExitRule {
 enum QuickNoteEvents {
     static let watched: Set<String> = [NibEventType.sessionDocument, NibEventType.sessionActivated,
                                        NibEventType.docClosed]
+    /// Tab commands that change a window's tabs without a watched event (a background tab closed, "close others"):
+    /// a closure hook looks at the windows again once they have run.
+    static let tabCommands = [CommandIDs.tabClose, CommandIDs.tabCloseOthers]
 }
 
-/// Watches the windows: when no window or tab shows a pending QuickNote any more, the window that left it gets the
-/// exit prompt (once that window is active); an untitled notebook left behind gets a title suggestion toast.
+/// Watches the windows: when no window shows a pending QuickNote any more, the window that left it gets the exit
+/// prompt (once that window is the active one); an untitled notebook left behind gets a title suggestion toast.
+///
+/// "Shown" is: some window's document is it, or (documents open as tabs) the active window shows a document and has
+/// it as a tab. So switching tabs does not ask, but going back to the library, closing its tab, or closing the other
+/// tabs does. Tabs change without a watched event (F018 switches to the neighbour, then removes the closed tab), so
+/// every watched event and every tab command is followed by a deferred look (`scheduleRecheck`).
 @MainActor
 final class QuickNoteTracker {
     static let serviceKey = "create.quickNoteTracker"
+    /// The closure hook on `QuickNoteEvents.tabCommands`.
+    static let tabHookID = "create.tabWatch"
     /// Marks older than this are dropped at launch (a QuickNote never left again stays as it is).
     static let staleAfter: TimeInterval = 30 * 24 * 3600
+    /// After the first deferred look (once the current main-actor work is done), the windows are looked at again after
+    /// these delays, for a tab command whose body is still running when its hook fires.
+    static let recheckDelays: [UInt64] = [150_000_000, 600_000_000]
     static func shared(_ app: NibApp) -> QuickNoteTracker? {
         app.services.get(serviceKey, as: QuickNoteTracker.self)
     }
 
     private weak var app: NibApp?
     private var subscription: EventSubscription?
+    private var recheck: Task<Void, Never>?
     /// Window (session id) → the document it showed last.
     private var lastShown: [NibID: DocumentID] = [:]
     /// Pending document → the window that left it last.
@@ -312,6 +343,9 @@ final class QuickNoteTracker {
     private(set) var watched: Set<DocumentID> = []
     /// Documents whose prompt or suggestion is showing or being prepared.
     private(set) var busy: Set<DocumentID> = []
+    /// Title suggestions found but not shown yet (no window could show them): offered again later without asking the
+    /// AI again.
+    private(set) var suggestions: [DocumentID: String] = [:]
 
     /// Shows the exit prompt in the window of `session`; false when that window cannot show it now (tried again when a
     /// window becomes active). Tests replace it.
@@ -342,6 +376,8 @@ final class QuickNoteTracker {
     func stop() {
         subscription?.cancel()
         subscription = nil
+        recheck?.cancel()
+        recheck = nil
     }
 
     func handle(_ event: NibEvent) {
@@ -352,6 +388,7 @@ final class QuickNoteTracker {
         } else {
             evaluate()
         }
+        scheduleRecheck()
     }
 
     func sessionChanged(_ session: EditorSession) {
@@ -364,14 +401,35 @@ final class QuickNoteTracker {
     }
 
     func evaluate() {
+        noteClosedWindows()
         for doc in Array(watched) { consider(doc) }
     }
 
-    /// Shown as some window's document, or as a tab of the active window.
+    /// Looks at the windows again once the current work is done, then twice more shortly after (replacing any look
+    /// already scheduled). Called after every watched event and by the tab-command hook.
+    func scheduleRecheck() {
+        recheck?.cancel()
+        recheck = Task { @MainActor [weak self] in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            self?.evaluate()
+            for delay in QuickNoteTracker.recheckDelays {
+                try? await Task.sleep(nanoseconds: delay)
+                guard !Task.isCancelled else { return }
+                self?.evaluate()
+            }
+        }
+    }
+
+    /// Shown as some window's document, or, when documents open as tabs, as a tab of the active window while that
+    /// window shows a document. The library in front of a tab (`showLibrary` keeps the tab listed) is not showing it,
+    /// and with tabs off the window's single "tab" is invisible.
     func isShown(_ doc: DocumentID) -> Bool {
         guard let app else { return false }
         if app.services.sessions.sessions.contains(where: { $0.document == doc }) { return true }
-        return app.ui.activeNavigator?.openDocuments.contains(doc) ?? false
+        guard app.settings.get(NibSettings.openAsTabs), let navigator = app.ui.activeNavigator,
+              navigator.session.document != nil else { return false }
+        return navigator.openDocuments.contains(doc)
     }
 
     /// Drops marks older than `staleAfter` that no window shows.
@@ -389,27 +447,60 @@ final class QuickNoteTracker {
         watched.insert(doc)
     }
 
-    private func leavingSession(_ doc: DocumentID) -> EditorSession? {
-        guard let app else { return nil }
-        if let id = leftBy[doc], let session = app.services.sessions.session(id) { return session }
-        return app.ui.activeNavigator?.session ?? app.services.sessions.active
+    /// A window that closed left what it showed.
+    private func noteClosedWindows() {
+        guard let app else { return }
+        for (id, doc) in Array(lastShown) where app.services.sessions.session(id) == nil {
+            lastShown[id] = nil
+            if watched.contains(doc) { leftBy[doc] = id }
+        }
+    }
+
+    /// Who is asked about a left document.
+    private enum Asker {
+        /// No window can be asked now: none left it, or the one that did is not the active window.
+        case nobody
+        case window(EditorSession?)
+
+        var asks: Bool {
+            if case .window = self { return true }
+            return false
+        }
+
+        var session: EditorSession? {
+            if case .window(let session) = self { return session }
+            return nil
+        }
+    }
+
+    /// The window that left `doc` last, once it is the active window (headless: always); the active window when the
+    /// one that left it has closed.
+    private func asker(_ doc: DocumentID) -> Asker {
+        guard let app, let id = leftBy[doc] else { return .nobody }
+        guard let session = app.services.sessions.session(id) else {
+            return .window(app.ui.activeNavigator?.session ?? app.services.sessions.active)
+        }
+        if let navigator = app.ui.activeNavigator, navigator.session !== session { return .nobody }
+        return .window(session)
     }
 
     private func consider(_ doc: DocumentID) {
         guard let app else { return }
         let pending = PendingCreations.get(doc, app.settings)
-        let decision = QuickNoteExitRule.decide(pending, isShown: isShown(doc),
+        let asker = asker(doc)
+        let decision = QuickNoteExitRule.decide(pending, isShown: isShown(doc), left: asker.asks,
                                                 node: app.services.library?.node(doc), busy: busy.contains(doc))
         switch decision {
         case .none:
             if pending == nil { forget(doc) }
         case .clear:
             forget(doc)
+            suggestions[doc] = nil
             Task { @MainActor in await PendingCreations.clear(doc, runner: .user(app, session: nil)) }
         case .prompt:
-            prompt(doc)
+            prompt(doc, session: asker.session)
         case .offerTitle:
-            offer(doc, pending: pending)
+            offer(doc, pending: pending, session: asker.session)
         }
     }
 
@@ -418,13 +509,17 @@ final class QuickNoteTracker {
         leftBy[doc] = nil
     }
 
-    private func prompt(_ doc: DocumentID) {
+    private func prompt(_ doc: DocumentID, session: EditorSession?) {
         guard let app else { return }
-        let session = leavingSession(doc)
         let model = QuickNoteExitModel(doc: doc, app: app, session: session)
         model.onFinish = { [weak self] _ in
             self?.busy.remove(doc)
             self?.forget(doc)
+        }
+        // The sheet went away without a choice (UIKit refused it, or it was taken down with its window): the mark
+        // stays, and the next watched event asks again.
+        model.onAbandon = { [weak self] in
+            self?.busy.remove(doc)
         }
         busy.insert(doc)
         let shown: Bool
@@ -446,21 +541,27 @@ final class QuickNoteTracker {
         return true
     }
 
-    private func offer(_ doc: DocumentID, pending: PendingCreation?) {
+    /// One attempt per leave: the notebook is forgotten right away and watched again when a window shows it. An empty
+    /// notebook costs no call and keeps its mark (asked again once it has content); a written one with nothing
+    /// readable keeps its title; a suggestion no window could show is kept for the next leave.
+    private func offer(_ doc: DocumentID, pending: PendingCreation?, session: EditorSession?) {
         guard let app else { return }
-        let session = leavingSession(doc)
+        forget(doc)
         busy.insert(doc)
         Task { @MainActor [weak self] in
             defer { self?.busy.remove(doc) }
+            guard TitleSuggestion.hasContent(doc, app.workspace) else { return }
             let runner = CommandRunner.user(app, session: session)
-            let suggestion = await TitleSuggestion.load(doc, runner: runner, workspace: app.workspace)
+            let found: String?
+            if let cached = self?.suggestions[doc] {
+                found = cached
+            } else {
+                found = await TitleSuggestion.load(doc, runner: runner, workspace: app.workspace, knownToHaveContent: true)
+            }
             guard let self else { return }
-            guard let suggestion, suggestion != pending?.title else {
-                // Nothing readable yet: an empty notebook is asked again next time; a written one keeps its title.
-                if QuickNoteTracker.hasContent(doc, app.workspace) {
-                    self.forget(doc)
-                    await PendingCreations.clear(doc, runner: runner)
-                }
+            guard let suggestion = found, suggestion != pending?.title else {
+                self.suggestions[doc] = nil
+                await PendingCreations.clear(doc, runner: runner)
                 return
             }
             let shown: Bool
@@ -469,10 +570,12 @@ final class QuickNoteTracker {
             } else {
                 shown = self.defaultOffer(doc, suggestion, session)
             }
-            if shown {
-                self.forget(doc)
-                await PendingCreations.clear(doc, runner: runner)
+            guard shown else {
+                self.suggestions[doc] = suggestion
+                return
             }
+            self.suggestions[doc] = nil
+            await PendingCreations.clear(doc, runner: runner)
         }
     }
 
@@ -488,21 +591,14 @@ final class QuickNoteTracker {
                        })
         return true
     }
-
-    /// Anything on the first pages (a notebook left empty gets asked again later).
-    static func hasContent(_ doc: DocumentID, _ workspace: Workspace) -> Bool {
-        guard let content = try? workspace.content(doc) else { return false }
-        return content.livePages.prefix(TitleSuggestion.pagesToRead).contains { page in
-            !((try? workspace.items(doc, page: page.id))?.isEmpty ?? true)
-        }
-    }
 }
 
 // MARK: - The exit prompt
 
 /// What the QuickNote exit prompt offers (D-119), each a command: Save (`library.rename` to the typed or suggested
 /// title), Save as Untitled, Combine to a Document (`doc.merge`, the QuickNote goes to Trash), Delete
-/// (`library.trash`, with Undo). Every path clears the pending mark (`settings.set`).
+/// (`library.trash`, with Undo). Combine and Delete first close the QuickNote's tab (`tab.close`, when installed), so
+/// no tab keeps a document in Trash. Every path clears the pending mark (`settings.set`).
 @MainActor
 final class QuickNoteExitModel: ObservableObject {
     enum Outcome: Equatable {
@@ -521,6 +617,8 @@ final class QuickNoteExitModel: ObservableObject {
     let session: EditorSession?
     /// The QuickNote's title in the library now.
     let currentTitle: String
+    /// The title it was created with ("Untitled 2" when the folder already had an "Untitled").
+    let createdTitle: String?
     @Published private(set) var title = ""
     @Published private(set) var suggestion: String?
     @Published private(set) var isSuggesting = false
@@ -533,6 +631,11 @@ final class QuickNoteExitModel: ObservableObject {
     private var edited = false
     /// Called once a choice is done (the tracker forgets the QuickNote).
     var onFinish: (@MainActor (Outcome) -> Void)?
+    /// Called once when the sheet goes away without a choice and without being swiped down: UIKit refused to present
+    /// it, or it was taken down with its window. The tracker then asks again on the next change.
+    var onAbandon: (@MainActor () -> Void)?
+    /// Swiped down: the QuickNote is being kept (not abandoned).
+    private var isClosingWithoutChoice = false
     /// Closes the sheet (set by the presenter).
     var dismiss: (@MainActor () -> Void)?
     /// Keeps the sheet's presentation delegate alive.
@@ -543,10 +646,12 @@ final class QuickNoteExitModel: ObservableObject {
         self.app = app
         self.session = session
         currentTitle = app.services.library?.node(doc)?.title ?? NewDocumentKind.notebook.untitled
+        createdTitle = PendingCreations.get(doc, app.settings)?.title
     }
 
     private var ref: String { NodeRef.document(doc).description }
-    private var isUntitled: Bool { currentTitle == NewDocumentKind.notebook.untitled }
+    /// Still the name it was made with (the Library Store makes names unique: "Untitled 2").
+    private var isUntitled: Bool { currentTitle == NewDocumentKind.notebook.untitled || currentTitle == createdTitle }
 
     /// The typed title when it renames the QuickNote.
     var proposedTitle: String? {
@@ -614,6 +719,7 @@ final class QuickNoteExitModel: ObservableObject {
         guard target != doc else { return }
         await perform(.combined(target), failure: String(localized: "Couldn't combine the QuickNote")) { runner in
             guard runner.has(CreateIDs.docMerge) else { throw NibError.unavailable("Combining notebooks") }
+            await self.closeTab(runner)
             _ = try await runner.run(CreateIDs.docMerge, ["source": .string(self.ref),
                                                           "into": .string(NodeRef.document(target).description)])
         }
@@ -621,14 +727,48 @@ final class QuickNoteExitModel: ObservableObject {
 
     func delete() async {
         await perform(.deleted, failure: String(localized: "Couldn't move the QuickNote to Trash")) { runner in
+            await self.closeTab(runner)
             _ = try await runner.run(CreateIDs.libraryTrash, ["refs": [.string(self.ref)]])
+        }
+    }
+
+    /// The QuickNote's tab (the library in front of it keeps it listed) is closed before it goes to Trash, when the
+    /// Tabs & Windows feature is installed. A failure leaves the tab: the document is still handled.
+    private func closeTab(_ runner: CommandRunner) async {
+        guard runner.has(CommandIDs.tabClose),
+              app.ui.activeNavigator?.openDocuments.contains(doc) ?? false else { return }
+        do {
+            _ = try await runner.run(CommandIDs.tabClose, ["doc": .string(ref)])
+        } catch {
+            CreateLog.log.error("tab.close: \(NibError.wrap(error).message, privacy: .public)")
         }
     }
 
     /// Swiped away or closed without a choice: nothing is lost, it stays as it is.
     func dismissedWithoutChoice() {
         guard outcome == nil, !isWorking else { return }
+        isClosingWithoutChoice = true
         Task { @MainActor in await keep() }
+    }
+
+    /// The sheet is gone without a choice and was not swiped down (see `onAbandon`). Once only.
+    func abandon() {
+        guard outcome == nil, !isWorking, !isClosingWithoutChoice, let onAbandon else { return }
+        self.onAbandon = nil
+        onAbandon()
+    }
+
+    /// How long a disappeared sheet waits for UIKit's did-dismiss call (a swipe-down keeps the QuickNote) before it
+    /// counts as abandoned.
+    static let abandonDelay: UInt64 = 400_000_000
+
+    /// The sheet left the screen. A swipe-down reports itself (`dismissedWithoutChoice`); anything else without a
+    /// choice (the window closed, the sheet was taken down with its presenter) is abandoned a moment later.
+    func sheetDisappeared() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: QuickNoteExitModel.abandonDelay)
+            self.abandon()
+        }
     }
 
     func showCombine() {
@@ -724,8 +864,12 @@ enum QuickNotePresenter {
         model.presentationDelegate = delegate
         controller.presentationController?.delegate = delegate
         model.dismiss = { [weak controller] in controller?.dismiss(animated: true) }
-        // After the navigation that left the QuickNote has finished.
-        Task { @MainActor in navigator.presentModal(controller) }
+        // After the navigation that left the QuickNote has finished. UIKit refuses (and only logs) a presentation from
+        // a sheet that is being dismissed; the tracker then asks again on the next change.
+        Task { @MainActor in
+            navigator.presentModal(controller)
+            if controller.presentingViewController == nil { model.abandon() }
+        }
     }
 }
 
@@ -761,6 +905,7 @@ struct QuickNoteExitSheet: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(NibColor.backgroundSecondary)
         .task { await model.loadSuggestion() }
+        .onDisappear { model.sheetDisappeared() }
         .interactiveDismissDisabled(model.isWorking)
     }
 

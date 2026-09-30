@@ -48,7 +48,9 @@ enum CreateMenus {
         if !taken(newNotebookShortcut, except: CreateIDs.newNotebookKey) {
             app.content.keyCommands.register(newNotebookKey)
         }
-        // doc.quickNote resolves the window's folder itself when `folder` is left out.
+        // doc.quickNote resolves the window's folder itself when `folder` is left out: the shown document's folder. In
+        // the library window it is the root, because no contract says which folder the library shows (neither
+        // EditorSession nor SceneNavigator has it; reported as a contract gap). The New menu passes its folder.
         if !taken(quickNoteShortcut, except: CreateIDs.quickNoteKey) {
             app.content.keyCommands.register(KeyCommandDescriptor(
                 id: CreateIDs.quickNoteKey, title: String(localized: "New QuickNote"), shortcut: quickNoteShortcut,

@@ -149,7 +149,15 @@ enum TemplateColours {
 
 /// What the New sheet collects, and the settings and `doc.create` params it turns into. Pure, so it is unit-tested.
 struct NotebookDraft: Equatable {
-    var kind: NewDocumentKind = .notebook
+    /// Switching kind drops a paper colour the new kind does not offer (a notebook's Legal on a whiteboard), so a
+    /// colour is never applied while no swatch shows it selected.
+    var kind: NewDocumentKind = .notebook {
+        didSet {
+            guard kind != oldValue, let colour = paperColour, let offered = NotebookDraft.colours(for: kind),
+                  !offered.contains(colour) else { return }
+            paperColour = nil
+        }
+    }
     var title = ""
     /// The paper template with any params the user did not choose here (spacing, margins).
     var paper: TemplateRef
@@ -168,6 +176,15 @@ struct NotebookDraft: Equatable {
 
     static let paperColours: [NibPaper] = [.white, .ivory, .legal, .grey, .slate, .night]
     static let boardColours: [NibPaper] = [.white, .ivory, .grey, .board, .slate, .night]
+
+    /// The colour swatches a kind shows (nil = none: text documents and study sets keep the choice for later).
+    static func colours(for kind: NewDocumentKind) -> [NibPaper]? {
+        switch kind {
+        case .notebook: return paperColours
+        case .whiteboard: return boardColours
+        case .textDocument, .studySet: return nil
+        }
+    }
 
     var pageSize: PageSize { size.pageSize(orientation) }
 
@@ -243,6 +260,29 @@ struct NotebookDraft: Equatable {
         return out
     }
 
+    /// The remembered choices that differ from the settings now (unchanged ones are not written again: they are
+    /// synced settings). `names` limits them (nil = all).
+    func changedSettings(templates: Registry<TemplateDefinition>, settings: SettingsStore,
+                         only names: Set<String>? = nil) -> [(name: String, value: JSONValue)] {
+        rememberedSettings(templates: templates).filter { entry in
+            (names?.contains(entry.name) ?? true) && NotebookDraft.current(entry.name, settings) != entry.value
+        }
+    }
+
+    /// The cover choice, which the Library Store follows when `doc.create` is sent without `cover`.
+    static let coverSettingNames: Set<String> = [NibSettings.defaultCover.name, NibSettings.coverByDefault.name]
+
+    /// A remembered default as it is now (its declared default when never set), in the shape `rememberedSettings` uses.
+    static func current(_ name: String, _ settings: SettingsStore) -> JSONValue? {
+        switch name {
+        case NibSettings.defaultPaper.name: return try? JSONValue.from(settings.get(NibSettings.defaultPaper))
+        case NibSettings.defaultCover.name: return try? JSONValue.from(settings.get(NibSettings.defaultCover))
+        case NibSettings.defaultPageSize.name: return try? JSONValue.from(settings.get(NibSettings.defaultPageSize))
+        case NibSettings.coverByDefault.name: return .bool(settings.get(NibSettings.coverByDefault))
+        default: return settings.json(name)
+        }
+    }
+
     /// The last choices (the `NibSettings` defaults), for a new sheet.
     static func initial(settings: SettingsStore, kind: NewDocumentKind = .notebook) -> NotebookDraft {
         let paper = settings.get(NibSettings.defaultPaper)
@@ -295,7 +335,7 @@ struct CreationRequest: Equatable {
 
     /// How `cover` is sent. The catalogue does not pin its shape, so creation tries a cover template (or `false`),
     /// then a flag, then leaves it out (the Library Store then follows `NibSettings.coverByDefault`/`defaultCover`,
-    /// which the sheet has just written).
+    /// which the New sheet writes just before that last try: `DocumentCreator.create(beforeOmittedCover:)`).
     enum CoverStyle: CaseIterable, Equatable {
         case template, flag, omitted
     }
@@ -364,12 +404,15 @@ enum DocumentBlueprint {
 @MainActor
 enum DocumentCreator {
     /// Returns warnings for follow-ups that failed after the document exists (it is never left half-made silently).
+    /// `beforeOmittedCover` runs just before `doc.create` is tried without `cover` (the Library Store then follows the
+    /// cover settings, so the New sheet writes its cover choice there first).
     @discardableResult
     static func create(_ r: CreationRequest, runner: CommandRunner, app: NibApp?, library: LibraryService?,
-                       workspace: Workspace, settings: SettingsStore) async throws -> [String] {
+                       workspace: Workspace, settings: SettingsStore,
+                       beforeOmittedCover: (@MainActor () async -> Void)? = nil) async throws -> [String] {
         var warnings: [String] = []
         if runner.has(CommandIDs.docCreate) {
-            let style = try await createWithCommand(r, runner)
+            let style = try await createWithCommand(r, runner, beforeOmittedCover: beforeOmittedCover)
             if style == .omitted, r.kind == .notebook, r.cover == nil,
                let warning = await removeUnwantedCover(r, runner, workspace, templates: app?.content.templates) {
                 warnings.append(warning)
@@ -391,9 +434,11 @@ enum DocumentCreator {
     }
 
     /// `doc.create`, retrying the unpinned `cover` param in its other shapes when it is refused.
-    private static func createWithCommand(_ r: CreationRequest, _ runner: CommandRunner) async throws -> CreationRequest.CoverStyle {
+    private static func createWithCommand(_ r: CreationRequest, _ runner: CommandRunner,
+                                          beforeOmittedCover: (@MainActor () async -> Void)?) async throws -> CreationRequest.CoverStyle {
         let styles = r.coverStyles
         for (i, style) in styles.enumerated() {
+            if style == .omitted, r.kind == .notebook { await beforeOmittedCover?() }
             do {
                 _ = try await runner.run(CommandIDs.docCreate, r.docCreateParams(style))
                 return style
@@ -634,22 +679,21 @@ final class NewNotebookModel: ObservableObject {
         defer { isWorking = false }
         let runner = CommandRunner.user(app, session: session)
         let id = NibID.make()
-        for (name, value) in draft.rememberedSettings(templates: app.content.templates) {
-            do {
-                _ = try await runner.run(CommandIDs.settingsSet, ["name": .string(name), "value": value])
-            } catch {
-                CreateLog.log.error("remembering \(name, privacy: .public) failed: \(NibError.wrap(error).message, privacy: .public)")
-            }
-        }
         let request = draft.request(id: id, folder: folder, templates: app.content.templates)
         let warnings: [String]
         do {
             warnings = try await DocumentCreator.create(request, runner: runner, app: app, library: app.services.library,
-                                                        workspace: app.workspace, settings: app.settings)
+                                                        workspace: app.workspace, settings: app.settings,
+                                                        beforeOmittedCover: { [weak self] in
+                                                            await self?.remember(only: NotebookDraft.coverSettingNames,
+                                                                                 runner: runner)
+                                                        })
         } catch {
             message = String(localized: "Couldn't create the \(draft.kind.title.lowercased()): \(NibError.wrap(error).message)")
             return false
         }
+        // Once the notebook exists: a failed creation changes no defaults.
+        await remember(only: nil, runner: runner)
         if draft.kind == .notebook && draft.isUntitled {
             let title = app.services.library?.node(id)?.title ?? request.title
             await PendingCreations.mark(id, PendingCreation(kind: .untitled, title: title), runner: runner)
@@ -662,6 +706,17 @@ final class NewNotebookModel: ObservableObject {
         }
         NibHaptics.play(.success)
         return true
+    }
+
+    /// Writes the remembered notebook choices that changed (`settings.set`, so it is a command like everything else).
+    private func remember(only names: Set<String>?, runner: CommandRunner) async {
+        for (name, value) in draft.changedSettings(templates: app.content.templates, settings: app.settings, only: names) {
+            do {
+                _ = try await runner.run(CommandIDs.settingsSet, ["name": .string(name), "value": value])
+            } catch {
+                CreateLog.log.error("remembering \(name, privacy: .public) failed: \(NibError.wrap(error).message, privacy: .public)")
+            }
+        }
     }
 }
 
@@ -802,6 +857,8 @@ struct NewNotebookSheet: View {
             .font(NibFont.body)
             .frame(minHeight: NibMetrics.hitTarget)
         }
+        // Names the group; each segment keeps its own title (a label on a plain container would replace them all).
+        .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Document type"))
     }
 

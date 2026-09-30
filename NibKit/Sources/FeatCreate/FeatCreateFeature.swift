@@ -27,6 +27,12 @@ public enum FeatCreateFeature: NibFeature {
         app.ui.panels.register(NewNotebookSheet.panel(owner: id))
         CreateMenus.register(app, owner: id)
         app.services.set(QuickNoteTracker(app: app), for: QuickNoteTracker.serviceKey)
+        // Closing a background tab or the other tabs emits no window event: look again once the command has run.
+        app.bus.hooks.register(CommandHookDescriptor(id: QuickNoteTracker.tabHookID, owner: id,
+                                                     commands: QuickNoteEvents.tabCommands) { [weak app] _, _ in
+            if let app { QuickNoteTracker.shared(app)?.scheduleRecheck() }
+            return nil
+        })
     }
 
     /// ⌥⌘N and ⇧⌘N (unless another feature maps them), then starts watching windows for a QuickNote (or an untitled
@@ -69,7 +75,7 @@ struct CommandRunner {
 
 /// Well-known ids this feature uses. Only `doc.quickNote` is its own (ARCHITECTURE.md §6.5).
 enum CreateIDs {
-    static let quickNote = "doc.quickNote"
+    static let quickNote = CommandIDs.docQuickNote
     static let newNotebookPanel = "create.newNotebook"
     static let notebookMenu = "create.new.notebook"
     static let quickNoteMenu = "create.new.quickNote"
@@ -77,11 +83,11 @@ enum CreateIDs {
     static let quickNoteKey = "create.key.quickNote"
 
     // Other features' commands (optional dependencies: checked with `CommandRunner.has` before use).
-    static let docMerge = "doc.merge"
-    static let docSuggestTitle = "doc.suggestTitle"
-    static let libraryTrash = "library.trash"
-    static let trashRecover = "trash.recover"
-    static let templateChoose = "template.choose"
-    static let pageSetBackground = "page.setBackground"
-    static let nodeRemove = "node.remove"
+    static let docMerge = CommandIDs.docMerge
+    static let docSuggestTitle = CommandIDs.docSuggestTitle
+    static let libraryTrash = CommandIDs.libraryTrash
+    static let trashRecover = CommandIDs.trashRecover
+    static let templateChoose = CommandIDs.templateChoose
+    static let pageSetBackground = CommandIDs.pageSetBackground
+    static let nodeRemove = CommandIDs.nodeRemove
 }

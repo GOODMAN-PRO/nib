@@ -14,6 +14,35 @@ private final class CallLog {
     func count(_ command: String) -> Int { params(command).count }
 }
 
+/// A window as the shell and Tabs & Windows run it: tabs in `openDocuments`, the shown one in `session.document`.
+/// `showLibrary` keeps the tabs listed (the shell does).
+@MainActor
+private final class FakeNavigator: SceneNavigator {
+    let session: EditorSession
+    var openDocuments: [DocumentID] = []
+    var activeDocument: DocumentID?
+    private(set) var presented: [UIViewController] = []
+
+    init(session: EditorSession, tabs: [DocumentID] = []) {
+        self.session = session
+        openDocuments = tabs
+    }
+
+    var rootViewController: UIViewController? { nil }
+
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {
+        if !openDocuments.contains(doc) { openDocuments.append(doc) }
+        activeDocument = doc
+        session.document = doc
+    }
+
+    /// Removes the tab without any event (F018 has already switched to the neighbour).
+    func closeDocument(_ doc: DocumentID) { openDocuments.removeAll { $0 == doc } }
+    func showLibrary(folder: FolderID?) { session.document = nil }
+    func showSettings(page: String?) {}
+    func presentModal(_ viewController: UIViewController) { presented.append(viewController) }
+}
+
 @MainActor
 final class FeatCreateTests: XCTestCase {
     private func harness() -> Harness { Harness(features: [FeatCreateFeature.self]) }
@@ -29,7 +58,9 @@ final class FeatCreateTests: XCTestCase {
     }
 
     /// A `doc.create` stand-in that builds the document with the library, as the Library Store does.
+    /// `titled` stands for the Library Store's unique names ("Untitled 2").
     private func stubDocCreate(_ h: Harness, log: CallLog, cover: Bool = false,
+                               titled: @escaping (String) -> String = { $0 },
                                refuse: @escaping (JSONValue) -> Bool = { _ in false }) {
         stub(h, "doc.create", log: log) { p in
             if refuse(p) { throw NibError(.invalidParams, "cover must be a boolean", path: "$.cover") }
@@ -44,7 +75,7 @@ final class FeatCreateTests: XCTestCase {
             if cover { pages.append(PageRecord(order: "a", size: .a4, background: .ofTemplate("cover.solid"))) }
             pages.append(PageRecord(order: "b", size: .a4, background: .ofTemplate("builtin.ruled")))
             _ = try h.library.createDocument(DocumentContent(meta: meta, pages: pages),
-                                             title: p["title"]?.stringValue ?? "", in: folder)
+                                             title: titled(p["title"]?.stringValue ?? ""), in: folder)
             return ["ref": .string(NodeRef.document(id).description)]
         }
     }
@@ -65,6 +96,14 @@ final class FeatCreateTests: XCTestCase {
         let out = try await h.run("doc.quickNote", params)
         let ref = try XCTUnwrap(out["ref"]?.stringValue)
         return NodeRef.documentID(from: ref)
+    }
+
+    /// Writes something on the document's last page, straight into persistence (as a saved document has it), so the
+    /// document is not opened in the workspace.
+    private func addInk(_ h: Harness, to doc: DocumentID) throws {
+        let page = try XCTUnwrap(h.persistence.heads[doc]?.livePages.last)
+        let item = try XCTUnwrap(h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).first)
+        h.persistence.pageItems[doc, default: [:]][page.id] = [item]
     }
 
     private static func ruled(owner: String = "test") -> TemplateDefinition {
@@ -544,6 +583,7 @@ final class FeatCreateTests: XCTestCase {
         recognizeStub(h, log: log, text: "Wave optics\nlecture 3")
         renameStub(h, log: log)
         let id = try await quickNote(h)
+        try addInk(h, to: id)
         let model = QuickNoteExitModel(doc: id, app: h.app, session: h.session)
         var finished: [QuickNoteExitModel.Outcome] = []
         model.onFinish = { finished.append($0) }
@@ -570,6 +610,7 @@ final class FeatCreateTests: XCTestCase {
         stub(h, "doc.suggestTitle", effect: .read, log: log) { _ in ["title": "Lecture: Optics"] }
         renameStub(h, log: log)
         let id = try await quickNote(h)
+        try addInk(h, to: id)
         let model = QuickNoteExitModel(doc: id, app: h.app, session: h.session)
         model.setTitle("My own")
         await model.loadSuggestion()
@@ -589,7 +630,7 @@ final class FeatCreateTests: XCTestCase {
         let id = try await quickNote(h)
         let model = QuickNoteExitModel(doc: id, app: h.app, session: h.session)
         await model.loadSuggestion()
-        XCTAssertNil(model.suggestion, "nothing recognised")
+        XCTAssertNil(model.suggestion, "nothing written")
         model.setTitle("Draft")
         model.setTitle("   ")
         await model.save()
@@ -669,8 +710,9 @@ final class FeatCreateTests: XCTestCase {
 
     // MARK: - Leaving
 
-    private func settle(_ condition: () -> Bool) async {
-        for _ in 0..<200 where !condition() {
+    private func settle(timeout: TimeInterval = 3, _ condition: () -> Bool) async {
+        let end = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < end {
             await Task.yield()
             try? await Task.sleep(nanoseconds: 2_000_000)
         }
@@ -682,16 +724,18 @@ final class FeatCreateTests: XCTestCase {
         trashed.trashedAt = 1
         let quick = PendingCreation(kind: .quickNote, title: "Untitled")
         let untitled = PendingCreation(kind: .untitled, title: "Untitled")
-        XCTAssertEqual(QuickNoteExitRule.decide(nil, isShown: false, node: node, busy: false), .none)
-        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: false, node: node, busy: false), .prompt)
-        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: true, node: node, busy: false), .none)
-        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: false, node: node, busy: true), .none)
-        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: false, node: trashed, busy: false), .clear)
-        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: false, node: nil, busy: false), .clear)
-        XCTAssertEqual(QuickNoteExitRule.decide(untitled, isShown: false, node: node, busy: false), .offerTitle)
+        XCTAssertEqual(QuickNoteExitRule.decide(nil, isShown: false, left: true, node: node, busy: false), .none)
+        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: false, left: true, node: node, busy: false), .prompt)
+        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: true, left: true, node: node, busy: false), .none)
+        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: false, left: false, node: node, busy: false), .none,
+                       "no window left it (a background tab of another window): nobody is asked")
+        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: false, left: true, node: node, busy: true), .none)
+        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: false, left: false, node: trashed, busy: false), .clear)
+        XCTAssertEqual(QuickNoteExitRule.decide(quick, isShown: true, left: true, node: nil, busy: false), .clear)
+        XCTAssertEqual(QuickNoteExitRule.decide(untitled, isShown: false, left: true, node: node, busy: false), .offerTitle)
         var renamed = node
         renamed.title = "Waves"
-        XCTAssertEqual(QuickNoteExitRule.decide(untitled, isShown: false, node: renamed, busy: false), .clear)
+        XCTAssertEqual(QuickNoteExitRule.decide(untitled, isShown: false, left: true, node: renamed, busy: false), .clear)
     }
 
     func testLeavingAQuickNotePromptsOnceAndOnlyWhenNoWindowShowsIt() async throws {
@@ -775,6 +819,7 @@ final class FeatCreateTests: XCTestCase {
         let created = await model.create()
         XCTAssertTrue(created)
         let node = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Untitled" })
+        try addInk(h, to: node.id)
         let tracker = try XCTUnwrap(QuickNoteTracker.shared(h.app))
         var offers: [(DocumentID, String)] = []
         tracker.offerTitle = { doc, title, _ in
@@ -799,6 +844,441 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertNotNil(PendingCreations.get(id, h.app.settings), "fresh marks stay")
         await tracker.pruneStale(now: Date().timeIntervalSince1970 + QuickNoteTracker.staleAfter + 60)
         XCTAssertNil(PendingCreations.get(id, h.app.settings))
+    }
+
+    // MARK: - Leaving in a window with tabs
+
+    /// Starts the tracker with a window (`FakeNavigator`) as the active one; every prompt is recorded.
+    private func trackTabs(_ h: Harness, tabs: [DocumentID] = [])
+        -> (QuickNoteTracker, FakeNavigator, () -> [(DocumentID, EditorSession?)]) {
+        let navigator = FakeNavigator(session: h.session, tabs: tabs)
+        h.app.ui.activeNavigator = navigator
+        let tracker = QuickNoteTracker.shared(h.app)!
+        var prompts: [(DocumentID, EditorSession?)] = []
+        tracker.presentPrompt = { model, session in
+            prompts.append((model.doc, session))
+            return true
+        }
+        tracker.start()
+        return (tracker, navigator, { prompts })
+    }
+
+    /// D-119 in the real shell: switching tabs keeps the QuickNote open; showing the library in that window leaves it
+    /// (the shell keeps the tab listed behind the library).
+    func testSwitchingTabsKeepsAQuickNoteAndShowingTheLibraryLeavesIt() async throws {
+        let h = harness()
+        let id = try await quickNote(h)
+        let (tracker, navigator, prompts) = trackTabs(h, tabs: [Fixtures.docID])
+        defer { tracker.stop() }
+
+        navigator.openDocument(id, page: nil, mode: .newTab)
+        navigator.openDocument(Fixtures.docID, page: nil, mode: .replace)
+        tracker.evaluate()
+        await settle(timeout: 0.05) { !prompts().isEmpty }
+        XCTAssertTrue(prompts().isEmpty, "a tab switch is not leaving")
+
+        navigator.showLibrary(folder: nil)
+        XCTAssertEqual(prompts().map(\.0), [id])
+        XCTAssertTrue(prompts().first?.1 === h.session, "the window that left it")
+        XCTAssertEqual(navigator.openDocuments, [Fixtures.docID, id], "the tab is still listed")
+    }
+
+    func testWithTabsOffSwitchingDocumentsLeavesAQuickNote() async throws {
+        let h = harness()
+        h.app.settings.set(NibSettings.openAsTabs, false)
+        let id = try await quickNote(h)
+        let (tracker, navigator, prompts) = trackTabs(h)
+        defer { tracker.stop() }
+        navigator.openDocument(id, page: nil, mode: .replace)
+        navigator.openDocument(Fixtures.docID, page: nil, mode: .replace)
+        XCTAssertEqual(prompts().map(\.0), [id], "with tabs off the window's list is invisible")
+    }
+
+    /// F018 closes the shown tab by switching to its neighbour first (the QuickNote is still listed then) and removing
+    /// it afterwards with no event: the deferred look finds it gone.
+    func testClosingTheQuickNotesTabNeighbourFirstPrompts() async throws {
+        let h = harness()
+        let id = try await quickNote(h)
+        let (tracker, navigator, prompts) = trackTabs(h, tabs: [Fixtures.docID])
+        defer { tracker.stop() }
+        navigator.openDocument(id, page: nil, mode: .newTab)
+
+        navigator.openDocument(Fixtures.docID, page: nil, mode: .replace)
+        XCTAssertTrue(prompts().isEmpty, "still listed while the neighbour shows")
+        navigator.closeDocument(id)
+        await settle { !prompts().isEmpty }
+        XCTAssertEqual(prompts().map(\.0), [id])
+    }
+
+    /// `tab.closeOthers` (and closing a background tab) emits no window event; the closure hook looks again.
+    func testClosingOtherTabsPromptsThroughTheTabHook() async throws {
+        let h = harness()
+        let log = CallLog()
+        let id = try await quickNote(h)
+        let hook = try XCTUnwrap(h.app.bus.hooks.get(QuickNoteTracker.tabHookID))
+        XCTAssertEqual(Set(hook.commands), [CommandIDs.tabClose, CommandIDs.tabCloseOthers])
+        XCTAssertNotNil(hook.handler)
+
+        let (tracker, navigator, prompts) = trackTabs(h, tabs: [Fixtures.docID])
+        defer { tracker.stop() }
+        stub(h, CommandIDs.tabCloseOthers, effect: .session, log: log) { _ in
+            navigator.openDocuments = navigator.session.document.map { [$0] } ?? []
+            return [:]
+        }
+        navigator.openDocument(id, page: nil, mode: .newTab)
+        navigator.openDocument(Fixtures.docID, page: nil, mode: .replace)
+        tracker.evaluate()
+        XCTAssertTrue(prompts().isEmpty)
+
+        try await h.run(CommandIDs.tabCloseOthers)
+        XCTAssertEqual(log.count(CommandIDs.tabCloseOthers), 1, "the hook lets the call through")
+        await settle { !prompts().isEmpty }
+        XCTAssertEqual(prompts().map(\.0), [id])
+    }
+
+    /// A QuickNote that stays a background tab of another window is never asked about from the active window (a
+    /// Delete there would trash a document that is still open); its own window is asked once it leaves it.
+    func testOnlyTheWindowThatLeftAQuickNoteIsAsked() async throws {
+        let h = harness()
+        let id = try await quickNote(h)
+        let (tracker, window, prompts) = trackTabs(h)
+        defer { tracker.stop() }
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+        let otherWindow = FakeNavigator(session: other)
+        otherWindow.openDocument(id, page: nil, mode: .newTab)
+        otherWindow.openDocument(Fixtures.docID, page: nil, mode: .newTab)
+        tracker.evaluate()
+        XCTAssertTrue(prompts().isEmpty, "the active window does not list it, but it did not leave it either")
+
+        h.app.ui.activeNavigator = otherWindow
+        h.app.services.sessions.activate(other)
+        tracker.evaluate()
+        XCTAssertTrue(prompts().isEmpty, "still a tab of the window now active")
+        otherWindow.showLibrary(folder: nil)
+        XCTAssertEqual(prompts().map(\.0), [id])
+        XCTAssertTrue(prompts().first?.1 === other)
+        withExtendedLifetime(window) {}   // `activeNavigator` is weak
+    }
+
+    /// A window closed while it showed the QuickNote left it: the active window asks.
+    func testClosingTheWindowThatShowedAQuickNoteAsksTheActiveOne() async throws {
+        let h = harness()
+        let id = try await quickNote(h)
+        let tracker = try XCTUnwrap(QuickNoteTracker.shared(h.app))
+        var prompts: [(DocumentID, EditorSession?)] = []
+        tracker.presentPrompt = { model, session in
+            prompts.append((model.doc, session))
+            return true
+        }
+        tracker.start()
+        defer { tracker.stop() }
+        let other = EditorSession()
+        h.app.services.sessions.add(other)
+        other.document = id
+        XCTAssertTrue(prompts.isEmpty)
+        h.app.services.sessions.remove(other)
+        tracker.evaluate()
+        XCTAssertEqual(prompts.map(\.0), [id])
+        XCTAssertTrue(prompts.first?.1 === h.app.services.sessions.active)
+    }
+
+    /// A prompt UIKit refused, or one taken down with its window, is asked again; a swiped-down one is kept.
+    func testAnAbandonedPromptIsAskedAgainAndASwipedOneIsKept() async throws {
+        let h = harness()
+        let id = try await quickNote(h)
+        let tracker = try XCTUnwrap(QuickNoteTracker.shared(h.app))
+        var models: [QuickNoteExitModel] = []
+        tracker.presentPrompt = { model, _ in
+            models.append(model)
+            return true
+        }
+        tracker.start()
+        defer { tracker.stop() }
+        h.session.document = id
+        h.session.document = nil
+        XCTAssertEqual(models.count, 1)
+        XCTAssertTrue(tracker.busy.contains(id))
+
+        models[0].sheetDisappeared()
+        await settle { !tracker.busy.contains(id) }
+        XCTAssertFalse(tracker.busy.contains(id), "abandoned without a choice")
+        XCTAssertNotNil(PendingCreations.get(id, h.app.settings), "the mark stays")
+        XCTAssertTrue(tracker.watched.contains(id))
+        tracker.evaluate()
+        XCTAssertEqual(models.count, 2, "asked again on the next change")
+        models[0].abandon()
+        XCTAssertTrue(tracker.busy.contains(id), "an abandoned prompt is reported once")
+
+        models[1].dismissedWithoutChoice()
+        models[1].abandon()
+        XCTAssertTrue(tracker.busy.contains(id), "a swipe-down keeps it: not abandoned")
+        await settle { models[1].outcome != nil && !tracker.busy.contains(id) }
+        XCTAssertEqual(models[1].outcome, .kept)
+        XCTAssertFalse(tracker.watched.contains(id))
+        XCTAssertNil(PendingCreations.get(id, h.app.settings))
+    }
+
+    func testDeleteAndCombineCloseTheQuickNotesTabFirst() async throws {
+        let h = harness()
+        let log = CallLog()
+        let navigator = FakeNavigator(session: h.session, tabs: [Fixtures.docID])
+        h.app.ui.activeNavigator = navigator
+        stub(h, CommandIDs.tabClose, effect: .session, log: log) { p in
+            navigator.closeDocument(NodeRef.documentID(from: p["doc"]?.stringValue ?? ""))
+            return [:]
+        }
+        stub(h, CreateIDs.libraryTrash, log: log) { p in
+            for ref in p["refs"]?.arrayValue ?? [] { try h.library.trash(NodeRef.documentID(from: ref.stringValue ?? "")) }
+            return [:]
+        }
+        stub(h, "doc.merge", log: log) { p in
+            try h.library.trash(NodeRef.documentID(from: p["source"]?.stringValue ?? ""))
+            return [:]
+        }
+
+        let deleted = try await quickNote(h)
+        XCTAssertEqual(navigator.openDocuments, [Fixtures.docID, deleted], "doc.quickNote opens it in the window")
+        await QuickNoteExitModel(doc: deleted, app: h.app, session: h.session).delete()
+        XCTAssertEqual(log.calls.map(\.command), [CommandIDs.tabClose, CreateIDs.libraryTrash])
+        XCTAssertEqual(log.params(CommandIDs.tabClose).first?["doc"]?.stringValue, NodeRef.document(deleted).description)
+        XCTAssertEqual(navigator.openDocuments, [Fixtures.docID], "no tab keeps a document in Trash")
+
+        log.calls.removeAll()
+        let combined = try await quickNote(h)
+        XCTAssertTrue(navigator.openDocuments.contains(combined))
+        await QuickNoteExitModel(doc: combined, app: h.app, session: h.session).combine(into: Fixtures.docID)
+        XCTAssertEqual(log.calls.map(\.command), [CommandIDs.tabClose, "doc.merge"])
+        XCTAssertEqual(navigator.openDocuments, [Fixtures.docID])
+
+        // Not a tab: nothing to close.
+        log.calls.removeAll()
+        let untabbed = try await quickNote(h)
+        navigator.closeDocument(untabbed)
+        await QuickNoteExitModel(doc: untabbed, app: h.app, session: h.session).delete()
+        XCTAssertEqual(log.calls.map(\.command), [CreateIDs.libraryTrash])
+    }
+
+    /// The Library Store makes names unique: the second QuickNote in a folder is "Untitled 2", still untitled.
+    func testAUniquelyNamedQuickNoteIsStillSavedAsUntitled() async throws {
+        let h = harness()
+        let log = CallLog()
+        stubDocCreate(h, log: log, titled: { $0 + " 2" })
+        let id = try await quickNote(h)
+        XCTAssertEqual(h.library.node(id)?.title, "Untitled 2")
+        XCTAssertEqual(PendingCreations.get(id, h.app.settings)?.title, "Untitled 2")
+        let model = QuickNoteExitModel(doc: id, app: h.app, session: h.session)
+        XCTAssertEqual(model.saveTitle, String(localized: "Save as Untitled"))
+        XCTAssertEqual(model.keepTitle, String(localized: "Save as Untitled"))
+
+        try h.library.rename(id, to: "Waves")
+        let renamed = QuickNoteExitModel(doc: id, app: h.app, session: h.session)
+        XCTAssertEqual(renamed.keepTitle, String(localized: "Keep “Waves”"))
+    }
+
+    /// One title attempt per leave, and none for an empty notebook: the AI is asked once, and a suggestion no window
+    /// could show is kept for the next leave. Nothing is opened in the workspace to find out.
+    func testAnUntitledNotebookIsOfferedATitleOncePerLeaveAndOnlyWithContent() async throws {
+        let h = harness()
+        let log = CallLog()
+        stub(h, "doc.suggestTitle", effect: .read, log: log) { _ in ["title": "Thermodynamics"] }
+        recognizeStub(h, log: log, text: "never asked")
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        let created = await model.create()
+        XCTAssertTrue(created)
+        let node = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Untitled" })
+        let tracker = try XCTUnwrap(QuickNoteTracker.shared(h.app))
+        var canShow = false
+        var offers: [String] = []
+        tracker.offerTitle = { _, title, _ in
+            guard canShow else { return false }
+            offers.append(title)
+            return true
+        }
+        tracker.start()
+        defer { tracker.stop() }
+
+        // Left empty: no call, the mark stays, and it is not watched again until a window shows it.
+        h.session.document = node.id
+        h.session.document = nil
+        await settle { !tracker.busy.contains(node.id) }
+        XCTAssertEqual(log.calls.count, 0)
+        XCTAssertNotNil(PendingCreations.get(node.id, h.app.settings))
+        XCTAssertFalse(tracker.watched.contains(node.id))
+        h.session.document = Fixtures.docID
+        tracker.evaluate()
+        XCTAssertEqual(log.calls.count, 0, "other windows' changes do not ask again")
+
+        // Written in and left: one AI call; no window can show the toast, so the suggestion waits.
+        try addInk(h, to: node.id)
+        h.session.document = node.id
+        h.session.document = nil
+        await settle { log.count("doc.suggestTitle") == 1 && !tracker.busy.contains(node.id) }
+        XCTAssertEqual(log.count("doc.suggestTitle"), 1)
+        XCTAssertEqual(tracker.suggestions[node.id], "Thermodynamics")
+        XCTAssertFalse(tracker.watched.contains(node.id), "forgotten after the attempt")
+        h.session.document = Fixtures.docID
+        tracker.evaluate()
+        XCTAssertEqual(log.count("doc.suggestTitle"), 1)
+
+        // Next leave: offered from the kept suggestion, without asking the AI again.
+        canShow = true
+        h.session.document = node.id
+        h.session.document = nil
+        await settle { !offers.isEmpty && PendingCreations.get(node.id, h.app.settings) == nil }
+        XCTAssertEqual(offers, ["Thermodynamics"])
+        XCTAssertEqual(log.count("doc.suggestTitle"), 1)
+        XCTAssertEqual(log.count("recognize.pageText"), 0)
+        XCTAssertNil(tracker.suggestions[node.id])
+        XCTAssertNil(PendingCreations.get(node.id, h.app.settings))
+        XCTAssertFalse(h.app.workspace.isLoaded(node.id), "read without opening it")
+    }
+
+    // MARK: - New Notebook: custom paper, the template picker, failures, defaults
+
+    func testCustomPaperGoesOnEveryPaperPageAndWarnsWithoutTheTemplatesFeature() async throws {
+        let h = harness()
+        let log = CallLog()
+        stubDocCreate(h, log: log, cover: true)
+        stub(h, CreateIDs.pageSetBackground, effect: .edit, log: log)
+        h.app.content.templates.register(Self.solidCover())
+        let custom = Background.ofImage(AssetRef("planner.png"))
+        let request = CreationRequest(id: "CUSTOMPAPER1", kind: .notebook, title: "Planner",
+                                      template: TemplateRef(TemplateIDs.ruled), size: .a4,
+                                      cover: TemplateRef("cover.solid"), background: custom)
+        let warnings = try await DocumentCreator.create(request, runner: .user(h.app, session: h.session), app: h.app,
+                                                        library: h.library, workspace: h.app.workspace,
+                                                        settings: h.app.settings)
+        XCTAssertEqual(warnings, [])
+        let call = try XCTUnwrap(log.params(CreateIDs.pageSetBackground).first)
+        let pages = try h.app.workspace.content("CUSTOMPAPER1").livePages
+        XCTAssertEqual(pages.count, 2)
+        XCTAssertEqual(call["pages"], [.string(NodeRef.page("CUSTOMPAPER1", pages[1].id).description)],
+                       "every paper page, never the cover")
+        XCTAssertEqual(try call["background"]?.decode(Background.self), custom)
+
+        // Without the Templates feature the notebook still exists, on the default paper, and says why.
+        let h2 = harness()
+        let log2 = CallLog()
+        stubDocCreate(h2, log: log2)
+        var plain = request
+        plain.id = "CUSTOMPAPER2"
+        plain.cover = nil
+        let warnings2 = try await DocumentCreator.create(plain, runner: .user(h2.app, session: h2.session), app: h2.app,
+                                                         library: h2.library, workspace: h2.app.workspace,
+                                                         settings: h2.app.settings)
+        XCTAssertEqual(warnings2.count, 1)
+        XCTAssertTrue(warnings2.first?.contains("Templates feature") ?? false, warnings2.first ?? "")
+        XCTAssertNotNil(h2.library.node("CUSTOMPAPER2"))
+    }
+
+    func testMoreTemplatesAsksTheTemplatePickerAndIgnoresACancel() async throws {
+        let h = harness()
+        let log = CallLog()
+        var reply: Result<JSONValue, NibError> = .success(
+            ["background": ["kind": "template", "template": ["id": "builtin.grid", "params": [:]]], "size": [612, 792]])
+        stub(h, CreateIDs.templateChoose, effect: .read, log: log) { _ in try reply.get() }
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        XCTAssertTrue(model.canChooseMore)
+        model.draft.paperColour = .ivory
+        let size = model.draft.pageSize
+        await model.chooseMore()
+        let params = try XCTUnwrap(log.params(CreateIDs.templateChoose).first)
+        XCTAssertEqual(params["kind"], "paper")
+        XCTAssertEqual(params["size"], [.number(size.width), .number(size.height)])
+        XCTAssertEqual(params["color"], TemplateColours.param(NibPaper.ivory))
+        XCTAssertEqual(model.draft.paper.id, TemplateIDs.grid)
+        XCTAssertEqual(model.draft.size.name, "Letter")
+        XCTAssertNil(model.message)
+
+        reply = .failure(NibError(.userDenied, "cancelled"))
+        let before = model.draft
+        await model.chooseMore()
+        XCTAssertEqual(model.draft, before, "a cancelled picker changes nothing")
+        XCTAssertNil(model.message, "and says nothing")
+
+        reply = .failure(NibError(.internalError, "picker broke"))
+        await model.chooseMore()
+        XCTAssertTrue(model.message?.contains("picker broke") ?? false, model.message ?? "")
+        XCTAssertEqual(log.count(CreateIDs.templateChoose), 3)
+    }
+
+    /// Remembered defaults are synced: only changed ones are written, and only once the document exists.
+    func testNewNotebookDefaultsAreWrittenOnlyWhenChangedAndAfterCreating() async throws {
+        func recordSettingsWrites(_ h: Harness) -> () -> [String] {
+            var written: [String] = []
+            h.app.bus.hooks.register(CommandHookDescriptor(id: "test.settingsWrites", owner: "test",
+                                                           commands: [CommandIDs.settingsSet]) { _, p in
+                if let name = p["name"]?.stringValue, !name.hasPrefix(PendingCreations.prefix) { written.append(name) }
+                return nil
+            })
+            return { written }
+        }
+        let h = harness()
+        let log = CallLog()
+        let written = recordSettingsWrites(h)
+        stub(h, "doc.create", log: log) { _ in throw NibError(.internalError, "disk full") }
+        let failing = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        failing.draft.orientation = .landscape
+        failing.draft.hasCover = false
+        let failed = await failing.create()
+        XCTAssertFalse(failed, "the sheet stays open")
+        XCTAssertFalse(failing.isWorking)
+        XCTAssertTrue(failing.message?.contains("disk full") ?? false, failing.message ?? "")
+        XCTAssertTrue(failing.message?.contains(NewDocumentKind.notebook.title.lowercased()) ?? false)
+        XCTAssertEqual(written(), [], "a failed creation changes no defaults")
+        XCTAssertEqual(h.app.settings.get(NibSettings.defaultPageSize), .a4)
+
+        let h2 = harness()
+        let written2 = recordSettingsWrites(h2)
+        let same = NewNotebookModel(app: h2.app, folder: nil, kind: .notebook, session: h2.session, navigator: nil)
+        same.draft.title = "Same as before"
+        let sameDone = await same.create()
+        XCTAssertTrue(sameDone)
+        XCTAssertEqual(written2(), [], "unchanged defaults are not written again")
+        let changed = NewNotebookModel(app: h2.app, folder: nil, kind: .notebook, session: h2.session, navigator: nil)
+        changed.draft.title = "No cover"
+        changed.draft.hasCover = false
+        let changedDone = await changed.create()
+        XCTAssertTrue(changedDone)
+        XCTAssertEqual(written2(), [NibSettings.coverByDefault.name])
+        XCTAssertFalse(h2.app.settings.get(NibSettings.coverByDefault))
+    }
+
+    /// When `doc.create` only takes a notebook without `cover`, the cover choice is written just before that call
+    /// (the Library Store follows it), and the rest once the notebook exists.
+    func testTheCoverChoiceIsWrittenBeforeACoverlessDocCreate() async throws {
+        let h = harness()
+        let log = CallLog()
+        var coverSettingAtCreate: Bool?
+        stubDocCreate(h, log: log, refuse: { p in
+            if p["cover"] == nil { coverSettingAtCreate = h.app.settings.get(NibSettings.coverByDefault) }
+            return p["cover"] != nil
+        })
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Coverless"
+        model.draft.hasCover = false
+        model.draft.orientation = .landscape
+        let done = await model.create()
+        XCTAssertTrue(done, model.message ?? "")
+        XCTAssertEqual(log.count("doc.create"), 3)
+        XCTAssertEqual(coverSettingAtCreate, false, "written before the call without cover")
+        XCTAssertEqual(h.app.settings.get(NibSettings.defaultPageSize), PageSize.a4.rotated)
+    }
+
+    func testSwitchingKindDropsAColourTheKindDoesNotOffer() {
+        var draft = NotebookDraft.initial(settings: harness().app.settings)
+        draft.paperColour = .legal
+        draft.kind = .whiteboard
+        XCTAssertNil(draft.paperColour, "Legal is not a board colour")
+        draft.paperColour = .board
+        draft.kind = .textDocument
+        XCTAssertEqual(draft.paperColour, .board, "no swatches there: nothing contradicts it")
+        draft.kind = .notebook
+        XCTAssertNil(draft.paperColour, "the board colour is not a notebook paper")
+        draft.paperColour = .slate
+        draft.kind = .whiteboard
+        XCTAssertEqual(draft.paperColour, .slate, "offered by both")
     }
 
     // MARK: - Screens render (Light, Dark, AX3)
