@@ -61,6 +61,7 @@ final class ZoomWindowController: ObservableObject {
     /// The writing width the chrome laid the pane out at; until it has, an estimate from the canvas's width.
     private var measuredWritingWidth: CGFloat?
     private var estimatedWritingWidth: CGFloat = 600
+    private var canvasSize: CGSize?
     /// How many copies of the pane's view are on screen (a re-created view can appear before the old one goes).
     private var paneAppearances = 0
     private var wasActive = false
@@ -132,7 +133,11 @@ final class ZoomWindowController: ObservableObject {
     /// The canvas's size changed: the pane's estimated width (the chrome docks it full width − 32) and the tallest
     /// writing area that keeps it on screen.
     func canvasResized(_ size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
+        guard size.width > 0, size.height > 0, size != canvasSize else { return }
+        // A hidden pane's last width is stale once the window changes size (rotation, Split View): estimate again
+        // until the chrome lays it out.
+        if canvasSize != nil, !isPaneShowing { measuredWritingWidth = nil }
+        canvasSize = size
         estimatedWritingWidth = max(size.width - 2 * NibMetrics.chromeInset, 4 * NibMetrics.hitTarget) - 2 * Self.padding
         maxWritingHeight = max(Self.nominalWritingHeight / 2, size.height * 0.4)
         updateLayout()
