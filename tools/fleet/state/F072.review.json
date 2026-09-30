@@ -1,0 +1,89 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: CollabSession.committed (1252-1278), applyRemote (1280-1292), answerSync/sendDelta (1112, 1200)",
+      "problem": "Live sync only carries records. Asset bytes never travel after the first package snapshot. An image, a PDF or image background, an audio clip, a card-face image or a text attachment added during a session reaches the other devices as a record whose AssetRef has no file in their package. The snapshot-diff digest has the same gap because it lists records only, so a re-join never repairs it. On a copy received into the Shared folder, which is not folder-synced with the host, the image or audio stays missing for good. That breaks S-076 real-time parity for any edit that adds media.",
+      "fix": "Add an `asset` message kind {doc, ref, ext, data}. In committed(), collect the AssetRefs that the patch's records reference (ImageItem.asset, Background.asset, AudioClip.asset, CardFace.asset, TextAttributes.attachment, DisplayOp.asset). Send each one the peers may lack via app.services.assets.data(ref, doc:), framed like snapshots, before the patch. The host relays assets the same way it relays patches, with the same role check. On receipt, write with assets.put(data, ext:, doc: localDoc) and check that the stored name equals the ref's sha256 name, dropping mismatches. Make the digest carry the set of asset names, so answerSync/sendDelta also send missing assets after a re-join. Test: a guest inserts an image item with a FakeAssetStore asset, and the host ends up with both the record and the bytes."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: CollabSession.welcome (1031-1038), CollabService.localDocument(for:) (1845-1856), becomeActive/sendDelta (1043-1055, 1200-1208)",
+      "problem": "The guest never checks whether its own copy is locked. Scenario: Ben receives 'Physics', then locks his copy. Per 747cba8 that takes him out of the session. The next day Ada hosts Physics again and Ben joins with the new code. localDocument(for:) returns his locked copy, because exists() checks only kind and trash. becomeActive then sends a digest, and sendDelta sends every record of the locked document that is newer than the host's. Host patches are also merged into the locked document. The spec says locked documents are never hosted or sent. The host is also the one that picks w.doc, so a malicious host that knows a document id makes the guest upload any matching local document.",
+      "fix": "In welcome(), before becomeActive, check the local copy. If content.meta.locked, or app.services.lock?.isLocked(local), is true, do not use that copy. Either end the session with NibError(.locked, \"Your copy of this document is locked, so it can't join a live session.\") and send bye, or treat it as missing and import a fresh snapshot into Shared. Apply the same check in CollabService.join, and in committed() also cover an already-locked document, not only the before/after transition. Add a test: the guest's copy is locked and joining sends no patch."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: hostHello (947-951), secret handling (936, 1102-1105); CollabCommands.swift rememberShared (358-363)",
+      "problem": "A guest whose app iOS terminates while it is suspended can never get back into the session. This is common on iPad with large notebooks. The admission secret lives only in memory. After a relaunch Ben joins with the same code from the same device id. The host still lists him as .away, and a hello without a valid secret is denied with .identity ('A device with the same identity is already in this session'). If the host then removes the stale row, revoke adds him to `removed`, and every later attempt is denied as removed. The only way out is to end the session for everyone. That contradicts the spec's auto-rejoin after a suspend.",
+      "fix": "Persist the secret with the device-local shared record: add `secret` to CollabSharedDocument, write it in didBecomeActive, and have join() load it into `secret` when the code matches the record's code, so helloMessage presents it. In hostHello, handle a participant in state .away that presents no valid secret by moving it back to .pending: rebind, send pending, call joinRequested so the host re-approves. Deny with .identity only when the participant is .active and still connected. Add a test: the guest service is torn down and recreated with the same device id, and the rejoin works."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: sendSnapshot/makeSnapshot (1120-1151), transmit -> CollabFrames.frames (288-321, 1334-1342), Assembler.feed/decode (331-406), documentState (1320-1325)",
+      "problem": "On large notebooks the snapshot path runs on the main actor and multiplies memory. Only the zip itself is detached. For a 300 MB package the main actor then does all of this: (1) JSONEncoder encodes the whole zip as a base64 Data field (1.33x), (2) LZFSE-compresses the whole body, which is already deflated, and (3) copies it into about 5,000 frames. The receiver repeats this in reverse on main: it reassembles, joins the body, LZFSE-decompresses, JSON-decodes base64 and writes it out. Peak memory is about 4x the package on each side, which is enough for jetsam on an 8 GB iPad, and the UI freezes for seconds. answerSync and sendDelta also load every page's items with allItems for the whole document on main at every join and re-join, and never evict them.",
+      "fix": "Send the package bytes outside the JSON. Add a `snapshotData` message whose header frame carries {doc, title, kind, bytes, sha256}, followed by raw binary part frames with the compressed flag off, because a zip does not shrink. Build frames and reassemble in a detached task, and hop to main only to call transport.send in batches. For Multipeer, prefer MCSession.sendResource(at:) of the zip file. Build digests off main from `peekContent` plus per-page readers, or at least call workspace.evictPages for pages that were loaded only for the digest. Add a test that a 20 MB package snapshot never materialises more than about 2x its size, for example by measuring Data allocations in the Assembler."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: CollabFrames.Assembler (343-416), CollabFrames.decode (331-340), CollabSession.handleFrame (858-868)",
+      "problem": "The reassembly buffers on the network trust boundary have no overall bound. handleFrame feeds every frame from every transport peer into the Assembler before it checks blockedPeers or admission. That includes peers still waiting for approval, declined peers, and on the relay anyone with the room token and code. Each message id may buffer up to 512 MB. The number of ids per peer is unlimited, and partials only expire after 2 minutes. decode() also LZFSE-decompresses with no output cap, so a small compressed frame can expand to hundreds of MB. For Multipeer, the join proof keeps strangers out only in theory: the advertised 64-bit discoveryHash of a code space of about 8.9e8 can be brute-forced offline in seconds. So a nearby device can connect and push the host app into jetsam while a session is live.",
+      "fix": "Cap pending bytes per peer (for example 64 MB) and across all peers (for example 1.1x maxExpandedBytes). Keep at most 2 partial message ids per peer, and drop that peer's partials when a cap is exceeded. On the host, accept part frames only from peers bound to an admitted participant (participantOf[peer] with state .active). Pre-admission peers may send single frames only, of 8 KB or less. Decompress with compression_stream into a buffer capped at the expected size, which should be carried in the frame header, and reject anything larger. Derive the discovery value from a salted, slow hash, or advertise a random session token that the host maps to the code. Add tests for over-cap and pre-admission multipart frames."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: CollabGate.canEdit / hostHello (76, 960-962), CollabSession.documentFormat (551, 605); FeatCollabFeature.swift hostView banner (343-346)",
+      "problem": "S-100 gating is not actually enforced. sessionFormat is computed and displayed, but nothing turns newer features off. The banner claim 'newer features stay off in this document until everyone updates' is not backed by any code. canEdit compares the joiner's format with documentFormat, the stored format captured once at host time. It does not compare with the host's own NibFormat.version or with the other participants' formats. A participant on an older build whose version is at least the document's stored format may therefore edit. Records it round-trips then drop fields it cannot decode, because decoding is lenient, and LWW spreads that loss to everyone. Gating exists precisely to prevent this data loss.",
+      "fix": "When deciding editability, compare against the newest format in the session, max(NibFormat.version on the host, the admitted participants' formats), not the stored document format. Recompute needsUpdate and demote to view when a newer participant is admitted, and re-promote when the older one re-joins with an updated hello.format (hostHello currently updates format but never needsUpdate). Change the banner to state what is enforced ('Someone here uses an older Nib, so they can view but not edit until they update'). Report the missing per-document effective-format contract to the contract-gaps file, so features can later turn off what the oldest participant cannot read. Add a Harness test with a guest at hello.format = NibFormat.version - 1 on a document at the current format."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/CollabCommands.swift: CollabService.importSnapshot .package branch (389-396)",
+      "problem": "Only the .content snapshot path applies CollabSession.receivedMeta. The production .package path imports the host's package unchanged, so the host's favourite flag, trashedFrom and a sourceBookmark created on another device land in the guest's copy. That is inconsistent with 747cba8, which keeps these fields device-local.",
+      "fix": "After library.importPackage, load the content and, if receivedMeta(meta) != meta, write the cleaned meta with a non-undoable, non-sent write. Either applyRemote from a local origin that committed() skips, or a ctx-less DocTransaction with undoable false. Cover this with a test through a library that keeps packages on disk."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: hostHello pending branch (947-954), guestHandle pre-host branch (971-990)",
+      "problem": "Participant identity rests on self-reported ids. A second peer that sends a hello with the pid of someone still pending is re-bound to that pid. When the host then approves 'Ben', the welcome and its secret go to the new peer. On the guest side, before a host is known, the first pending or welcome from any peer in the room is accepted as the host. In a relay room or a Multipeer mesh, another participant can answer first and feed the joiner a fake welcome that names a document id.",
+      "fix": "In hostHello, when participants[pid] is .pending and bound to a different peer, deny the new peer with .identity instead of calling bind. On the guest, accept pending, welcome or denied only from the peer the transport joined through: expose the join target, for example via the first peer in transport.peers after join on Multipeer, or a relay `host` flag. Alternatively, have the host sign welcome with an HMAC keyed by the join code, and have the guest verify it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: CollabService.join catch (1681-1685); MultipeerTransport.swift .notConnected handling (161-163)",
+      "problem": "The folder-sync fallback for a full session depends on matching the English substring 'full' in the error message. A Multipeer host that is already full declines the invitation with 'The host's device didn't accept the connection.', so the joiner never sees the S-101 fallback message. Any localised transport message breaks the match as well.",
+      "fix": "Map by error code and denial rather than by text. Have the transports throw NibError(.unavailable, ..., path: \"$.full\") or a dedicated code when they refuse for capacity. The InMemory transport can be matched on its known message in one place, or better, the host should never refuse at the transport level: accept the invitation and let hostHello send `denied .full`. For Multipeer, remove the connectedPeers.count check in the invitation handler, or keep a small margin, so CollabGate produces the message."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: CollabCode.joinURL (53); FeatCollabFeature.swift JoinLiveSheet footer (532)",
+      "problem": "The QR code carries nib://collab/join?code=..., and the join sheet tells people to 'scan their QR code with the Camera'. However, F074's deep-link list (ARCHITECTURE §12, F074 spec) has no collab/join route, and FeatSystemIntegration on main is still a scaffold. Scanning therefore opens Nib to an unknown link and never reaches the join sheet.",
+      "fix": "Report the gap so F074 routes nib://collab/join?code=X to panel.open {id: \"collab.join\", code: X}. JoinLiveSheet already reads params[\"code\"]. Until that route exists, drop the Camera instruction from the footer copy."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/FeatCollabFeature.swift: CollabParticipantRow (165), requester (378), JoinRequestHUD (611-620)",
+      "problem": "`VStack(spacing: 1)` is a literal spacing off the 4 pt scale, which fails the Slop checklist 'Only tokens' line. JoinRequestHUD rebuilds NibHUDGroup's 40 pt row but omits `.nibChromeTypeCap()`. At AX3 the uncapped hud text in a fixed 40 pt frame truncates, whereas DESIGN.md §4.2 caps HUD chrome at xxxLarge.",
+      "fix": "Use NibSpacing.xxs for both stacks. Add `.nibChromeTypeCap()` to JoinRequestHUD's HStack, and pass size .bar explicitly on its NibIconButtons as NibHUDGroup's guidance says. Snapshot the HUD at AX3 with two pending requests."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: CollabService.refresh / joinRequested app.events.emit (1817-1818, 1871-1873)",
+      "problem": "The 'collab.session' event carries a hand-built JSON payload. contracts-v2 G3 provides `NibEventPayload` so that plugins and the bridge decode events through a typed schema instead of string keys.",
+      "fix": "Declare `struct CollabSessionEventPayload: NibEventPayload { static let eventType = CollabIDs.event; var event: String; var phase: String?; var participants: Int?; var participant: String?; var name: String? }` and emit it with events.emit(payload, doc:)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCollab/CollabSession.swift: runRejoin fallback message (1768)",
+      "problem": "When re-joining fails, the guest is told 'changes arrive through folder sync'. For a copy received into the Shared folder, which lives in another library and is not folder-synced with the host, that is false. Its offline edits reach the host only through a later live session.",
+      "fix": "Choose the copy by whether localDoc == remoteDoc. When they are the same document, it is the same library and folder sync applies. For a received copy, say 'Your copy stays in the Shared folder. Join again when the host is back to send your changes.'"
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatCollabTests/FeatCollabTests.swift",
+      "problem": "The riskiest paths have no tests. Missing: host-side suspend and rehost; a guest locking its copy (747cba8); the production .package snapshot through library.importPackage (the Harness library has no package on disk, so only the .content path runs); Assembler limits and pre-admission frames; asset transfer; re-join after the guest app is recreated.",
+      "fix": "Add Harness tests for each: hostService.didEnterBackground, then hostTransport.leave, then resumeAfterSuspend, and the guest re-joins. Guest meta.locked set to true ends only the guest's session. A temp-dir package with a stub LibraryService whose packageURL exists runs through the .package import. Assembler over-cap throws and holds no partials. Once the fixes above land, add tests for asset bytes arriving and for a recreated guest service re-joining."
+    }
+  ]
+}
