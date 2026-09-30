@@ -82,13 +82,7 @@ enum LassoGeometry {
             maxY = max(maxY, p.y)
         }
         let m = poly.xs.count
-        var edges: [Int] = []
-        for j in 0..<m {
-            let k = j + 1 == m ? 0 : j + 1
-            let ax = poly.xs[j], ay = poly.ys[j], bx = poly.xs[k], by = poly.ys[k]
-            if max(ax, bx) < minX || min(ax, bx) > maxX || max(ay, by) < minY || min(ay, by) > maxY { continue }
-            edges.append(j)
-        }
+        let edges = nearEdges(poly, minX, minY, maxX, maxY)
         guard !edges.isEmpty else { return false }
         for i in 1..<line.count {
             let p1 = line[i - 1], p2 = line[i]
@@ -98,6 +92,53 @@ enum LassoGeometry {
             }
         }
         return false
+    }
+
+    /// `lineTouches` over a stroke's points, without building its polyline and with the line's own bounds as the first
+    /// test (not `Item.bounds`, which walks the points again for the nib width): the hot path of a lasso over thousands
+    /// of strokes.
+    static func strokeTouches(_ pts: [StrokePoint], _ poly: LassoPolygon) -> Bool {
+        let n = pts.count
+        guard n > 0 else { return false }
+        var minX = Double(pts[0].x), minY = Double(pts[0].y), maxX = minX, maxY = minY
+        for i in 1..<n {
+            let x = Double(pts[i].x), y = Double(pts[i].y)
+            if x < minX { minX = x } else if x > maxX { maxX = x }
+            if y < minY { minY = y } else if y > maxY { maxY = y }
+        }
+        let b = poly.bounds
+        if maxX < b.minX || minX > b.maxX || maxY < b.minY || minY > b.maxY { return false }
+        if poly.contains(Double(pts[0].x), Double(pts[0].y)) || poly.contains(Double(pts[n - 1].x), Double(pts[n - 1].y)) {
+            return true
+        }
+        guard n >= 2 else { return false }
+        let m = poly.xs.count
+        let edges = nearEdges(poly, minX, minY, maxX, maxY)
+        guard !edges.isEmpty else { return false }
+        var px = Double(pts[0].x), py = Double(pts[0].y)
+        for i in 1..<n {
+            let qx = Double(pts[i].x), qy = Double(pts[i].y)
+            for j in edges {
+                let k = j + 1 == m ? 0 : j + 1
+                if crosses(px, py, qx, qy, poly.xs[j], poly.ys[j], poly.xs[k], poly.ys[k]) { return true }
+            }
+            px = qx
+            py = qy
+        }
+        return false
+    }
+
+    /// Indices of the polygon edges whose bounds overlap the box (edge j runs from vertex j to j + 1).
+    static func nearEdges(_ poly: LassoPolygon, _ minX: Double, _ minY: Double, _ maxX: Double, _ maxY: Double) -> [Int] {
+        let m = poly.xs.count
+        var edges: [Int] = []
+        for j in 0..<m {
+            let k = j + 1 == m ? 0 : j + 1
+            let ax = poly.xs[j], ay = poly.ys[j], bx = poly.xs[k], by = poly.ys[k]
+            if max(ax, bx) < minX || min(ax, bx) > maxX || max(ay, by) < minY || min(ay, by) > maxY { continue }
+            edges.append(j)
+        }
+        return edges
     }
 
     /// `Geo.segmentsIntersect` on raw coordinates (segment p1–p2 against edge q1–q2).
@@ -121,10 +162,14 @@ enum LassoGeometry {
     /// drawer says it takes lasso hits when that differs from `Item.bounds` (`ItemDrawer.hitBounds`: a collapsed sticky
     /// note's icon, a full-page text box's laid-out text); boxed items then touch through that rect.
     static func touches(_ item: Item, _ poly: LassoPolygon, hitArea: Rect? = nil) -> Bool {
+        if item.kind == .stroke {
+            guard let stroke = item.stroke else { return false }
+            return strokeTouches(stroke.points, poly)
+        }
         guard reach(item, hitArea).intersects(poly.bounds) else { return false }
         switch item.kind {
         case .stroke:
-            return lineTouches(item.stroke?.polyline ?? [], poly)
+            return false                                    // handled above
         case .connector:
             guard let c = item.connector else { return false }
             return lineTouches([c.from.point] + c.bends + [c.to.point], poly)
@@ -226,8 +271,9 @@ enum SelectionEngine {
     static func select(_ items: [Item], polygon: [Point], include: Set<LassoCategory>, layer: Int,
                        excluding: Set<ElementID> = [], hitArea: HitArea = { _ in nil }) -> [Item] {
         guard let poly = LassoPolygon(polygon) else { return [] }
+        let excludes = !excluding.isEmpty
         return items.filter { item in
-            guard !item.deleted, item.layer == layer, !excluding.contains(item.id),
+            guard !item.deleted, item.layer == layer, !(excludes && excluding.contains(item.id)),
                   include.contains(LassoCategory.of(item)) else { return false }
             // Ink is hit-tested along its path; only other kinds ask their drawer.
             return LassoGeometry.touches(item, poly, hitArea: item.kind == .stroke ? nil : hitArea(item))

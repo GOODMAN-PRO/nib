@@ -413,8 +413,12 @@ final class FeatLassoTests: XCTestCase {
             let prepared = LassoPolygon(poly)
             XCTAssertNotNil(prepared)
             guard let prepared = prepared else { return }
-            XCTAssertEqual(LassoGeometry.lineTouches(line, prepared), Geo.polylineTouchesPolygon(line, poly),
-                           "line \(line) polygon \(poly)")
+            let expected = Geo.polylineTouchesPolygon(line, poly)
+            XCTAssertEqual(LassoGeometry.lineTouches(line, prepared), expected, "line \(line) polygon \(poly)")
+            // The stroke fast path answers the same for the same points.
+            let points = line.map { StrokePoint(x: Float($0.x), y: Float($0.y)) }
+            XCTAssertEqual(LassoGeometry.strokeTouches(points, prepared),
+                           Geo.polylineTouchesPolygon(points.map { $0.location }, poly), "stroke \(line) polygon \(poly)")
         }
     }
 
