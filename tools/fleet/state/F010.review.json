@@ -1,0 +1,77 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatEraser/EraserTool.swift:164-170 (finishCommit), with touchesBegan:67-70 and deactivate:54-57",
+      "problem": "A page's hidden set can go stale, and ink restored by undo then stays invisible. finishCommit only clears the hidden set when `generation == token`. touchesBegan bumps `generation` for every new touch, so if the next eraser touch lands on another page before the previous commit's clean-up runs (the ink.erase await plus the 150 ms sleep), the old page is never un-hidden. Repro: erase the fixture stroke on page 1 (began/moved/ended), then right away call touchesBegan and touchesEnded on page 2, and await both commits. `host.hidden[page1]` still holds Fixtures.strokeID, because gesture 2 only clears page 2. After `bus.undo(doc)` the original stroke comes back in the model but is still hidden on the canvas. It stays hidden until another erase on page 1 touches something or the document is reopened, since deactivate only clears the page of a gesture still in progress. Quick scrubbing across a page boundary in continuous scroll reaches this.",
+      "fix": "Track which gesture owns each page's hidden set, e.g. `private var hiddenBy: [PageID: Int] = [:]`, set to `generation` in refresh whenever setHidden is called. In finishCommit, call `if hiddenBy[page] == token { host.setHidden([], page: page); hiddenBy[page] = nil }` whatever `generation` is, and keep only `clearPieces()` gated on `generation == token`. In deactivate, clear every page still in `hiddenBy` once `commitsInFlight == 0`. Add a FeatEraserTests case for the page-1 then page-2 sequence above: assert `host.hidden[page1] == nil` after both commits, and after `bus.undo`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraserTool.swift:75 vs EraseCommands.swift:196",
+      "problem": "The tool can send a radius the command's schema rejects. The tool computes `size / 2 / zoomScale`, but ink.erase declares `radius` max 500. Boards zoom out to 5 % (F006), so a custom size of 51 to 60 pt at 5 % gives a radius of 510 to 600. The preview hides the ink, then the command fails `invalid_params`, the ink reappears and an error toast shows.",
+      "fix": "Either raise the schema max (e.g. `max: 5000`) or clamp in the tool with `let radius = min(size / 2 / max(host.zoomScale, 0.01), 500)`. Add a test with a FakeCanvasHost at zoomScale 0.05 and size 60."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraserSettingsView.swift:400-411 (DeleteItemsSheet.recount)",
+      "problem": "The Delete Specific Items count is slow on large documents. Every change of scope or kind runs a full dry-run `page.deleteItems`, which tombstones every matching item and then rolls back, synchronously on the main actor. With 'Whole document' on a large notebook (hundreds of pages, 100k+ strokes, 'Handwriting' on), each switch flip freezes the UI for a noticeable time. The `.task(id:)` cancellation cannot interrupt the synchronous mutate.",
+      "fix": "Count without mutating. Move target resolution into a static helper on PageDeleteItems, e.g. `static func work(_ p: Params, _ ctx|workspace) throws -> [(doc, page, items, ids)]`, that both `run` and the sheet use. The sheet then sums `ids.count` from `context.app.workspace` reads (reads are public; no DocTransaction). Or keep the dry run but debounce it (~250 ms) and run it only for the page scope."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraseCommands.swift:143-145, 284",
+      "problem": "Page-wide deletes are quadratic in the number of items on the page. `tx.delete(item:)` looks the item up again with a linear `first(where:)` scan, then `put` scans the page list twice more (`currentItem` and `writeItem`). page.clear, page.deleteItems and remove(), run on a whiteboard near `NibLimits.boardItemLimit` (100k items), block the main actor for a very long time.",
+      "fix": "Tombstone from the already-fetched items (`var it = item; it.deleted = true; try tx.put(it, doc: doc, page: page)`), which drops one of the three linear scans per item. File `docs/contract-requests/F010-bulk-tombstone.md` for an indexed or bulk tombstone API on DocTransaction."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraseCommands.swift:209-222 (ink.erase), 243-250 (ink.scribbleErase)",
+      "problem": "`path` and `points` have no upper bound, so a plugin, AI or bridge caller can freeze the app. A path of 10^6 points runs 10^6 `extend` calls, each scanning every candidate, synchronously inside a main-actor command that plugin timeouts cannot interrupt.",
+      "fix": "Reject over-long input with `NibError.invalid(\"path has more than 20000 points\", path: \"$.path\")` and a hint to split the path into several calls. Apply the same cap to `$.points` in ink.scribbleErase, and add a test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraseCommands.swift:164-173 (EraseSupport.commit)",
+      "problem": "Every split piece reuses the original's `z` key, so a page ends up with several items sharing one FractionalIndex key. Their relative order is decided by random ids. Any later reorder that computes `FractionalIndex.between(prev.z, next.z)` across two pieces breaks its documented precondition a < b: `between(a, a)` returns a key above both.",
+      "fix": "Give pieces distinct keys between the original and its successor. Find `nextZ`, the first live item on the page with `z > original.z`, then assign `z = FractionalIndex.between(last, nextZ)` piece by piece, starting from `last = original.z`. Assert in a test that pieces have distinct z values that sort below the next item."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraserTool.swift (no tap(_:host:))",
+      "problem": "Tapping with the eraser erases nothing. Per ARCHITECTURE §8.5, a finger tap that no tap handler claims goes to the active tool's `tap`, and EraserTool keeps the empty default. Tapping a stroke or a dot erases in Goodnotes (T-018).",
+      "fix": "Implement `func tap(_ sample: CanvasSample, host: CanvasHost) { touchesBegan(sample, host: host); touchesEnded(sample, host: host) }`, which gives a single-point erase and one ink.erase, and add a tool test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraserSettingsView.swift:249 (EraserFilterChips)",
+      "problem": "On and off Erase Filter chips look almost the same. NibChip's filter style only shifts fill2/fill3 and label/labelSecondary, so on a multi-select filter the state is carried by shade alone. That fails the Slop checklist line 'state is never colour alone'; the `.isSelected` trait helps VoiceOver only.",
+      "fix": "`NibChip(tool.eraserFilterTitle, symbol: on ? .checkmark : nil, style: .filter(isSelected: on), action: { model.toggle(tool) })`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraserSettingsView.swift:169",
+      "problem": "The section action 'Highlighter only' is not verb + object (Slop checklist: 'Buttons are verb + object').",
+      "fix": "Use `String(localized: \"Erase Highlighter Only\")`, which matches the Goodnotes name for T-019."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraserSettingsView.swift:413-421 (DeleteItemsSheet.delete)",
+      "problem": "The sheet announces success before the delete has happened. It posts 'Deleted N items. Undo is available.' using the dry-run count and dismisses before the asynchronous `app.perform` has run. If the command fails (for example the page was trashed from another window), VoiceOver still announces success, and N can differ from what was actually removed.",
+      "fix": "`Task { do { let r = try await context.app.bus.execute(\"page.deleteItems\", params, session: context.session); announce(r.value[\"removed\"]?.intValue ?? 0) } catch { post .nibCommandFailed }; context.dismiss() }`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatEraser/EraserTool.swift:76-78, EraserGeometry.swift:379-384",
+      "problem": "The eraser does too much per-touch work on large pages. At touch-down, EraseSession is built from every item on the page, which computes the bounds of every stroke point by point. `EraseSession.stroke(_:)` then scans all candidates linearly for each changed id on every move. On 100k-item boards this causes hitches at pen-down and while dragging.",
+      "fix": "In the tool, pass `region: host.session.visibleRect?.insetBy(-radius)` (the eraser can only touch what is on screen), or build the session from `workspace.items(doc, page:, in: visibleRect)`. Keep `candidates` in a `[ElementID: Candidate]` index for `stroke(_:)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatEraserTests/FeatEraserTests.swift",
+      "problem": "EraserOptions, the model behind the popover and options bar, has no tests. Uncovered: writes going through `settings.set`, the last Erase Filter chip staying on, `only(.highlighter)`, the size debounce, and reload not writing back. The hidden-set clean-up across pages and the radius cap are not tested either.",
+      "fix": "Add @MainActor tests. Check that toggle and only change the `eraser.filter.*` settings via the store and refuse to empty the filter. Check that setting `size` writes `eraser.size` once after the debounce. Add the two tool regressions from the issues above."
+    }
+  ]
+}

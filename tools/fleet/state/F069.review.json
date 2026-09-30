@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/FeatWebDAV/WebDAVClient.swift:203-224 (WebDAVPaths.segmentAllowed, collectionURL, fileURL); used by listLibrary, libraryFileURL, put/get/delete, pruneRemoteFolders, WebDAVPutCommand",
+      "problem": "URLs are built with URL(string: tail, relativeTo: base) while ':' is left unencoded, and the code falls back to `base` when parsing fails. With the RFC 3986 parser (iOS 17+ SDK), a first segment that contains ':' breaks. This covers any root-level document or folder such as \"Chapter 1: Motion\", \"Lecture 10:30\" or \"Physics: Mechanics\", and a server folder setting like \"Nib: Notes\". I checked this with the same code on Foundation. collectionURL(libraryURL, [\"Chapter 1: Motion.nibnote\"]) returns libraryURL itself. fileURL(libraryURL, \"Physics: Mechanics.nibnote/doc.x.json\") returns a URL with scheme \"Physics\". Consequences: (a) A scheme-like prefix gives URLError.unsupportedURL, which maps to fatal `unreachable`, so every pass fails. (b) Otherwise, the requests go to the library folder itself. MKCOL still creates the package collection, because its first segment is the folder. But each PUT hits the collection, gets 412 and is counted as a silent changedDuringSync, so the document never syncs and no error is shown. On the next pass, listLibrary PROPFINDs \"Chapter 1: Motion.nibnote/\", gets the root listing back, and appends every root collection under the phantom path. Each level resolves to the root again, so the walk grows exponentially and never ends. A download would store the collection's GET response as the file, and a deleteRemote would DELETE the whole library folder on the server.",
+      "fix": "Remove ':' from segmentAllowed. Build URLs by appending the encoded segments to URLComponents(url: base, resolvingAgainstBaseURL: true).percentEncodedPath (or at least prefix the relative reference with \"./\"). Never fall back to `base`: throw WebDAVError.local(\"invalid path …\"), which is non-fatal for that file. Add tests: fileURL/collectionURL with \"Chapter 1: Motion.nibnote\", \"Math:Calculus\" and \"Lecture 10:30\" must stay under base. Also add an end-to-end two-device sync of a root-level \"Lecture 10:30.nibnote\" against FakeDAVServer that must finish and upload the files."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWebDAV/WebDAVMirror.swift:764-770 (perform .deleteRemote), :748-752 (.upload over an existing remote), :816 (resolve push, createOnly: false); WebDAVClient.swift:707-732 (put/delete send no If-Match)",
+      "problem": "The server is listed once, at the start of the pass, and deletions run last, after every copy. For a large move that can be minutes later. DELETE and overwriting PUTs are sent without If-Match. Data-loss race: device B moves \"Physics/K.nibnote\" to the root. While B's pass uploads the moved package, device A, which is editing K, PUTs a newer doc.<A>.json at the old path. B's deleteRemote then deletes A's new file unconditionally. On A's next pass that path is (local unchanged, remote missing, state present), which plans deleteLocal. A's latest edits then survive only in the older copy that B carried to the new path. The `.upload` and `resolve` pushes can overwrite a version that landed after the listing in the same way.",
+      "fix": "Pass the listed version to the client. When RemoteEntry.version is \"e:<tag>\", send `If-Match: \"<tag>\"` on DELETE and on overwriting PUT. Map 412 to changedDuringSync (already the mapping), so the next pass sees the new version and downloads it instead. When the server gives no ETag, re-read the version with a Depth 0 PROPFIND right before the DELETE and skip if it differs. Make FakeDAVServer honour If-Match. Add a test that changes the file between the listing and the delete phase (a hook in the fake server or in WebDAVMirrorRun) and asserts the file survives on the server and on the other device."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWebDAV/WebDAVCommands.swift:213-221 (webdav.put descriptor), :224-237 (components), :254 (engine.put); FeatWebDAVFeature.swift:357-366",
+      "problem": "webdav.put overwrites any existing file anywhere in the WebDAV account outside the library folder, with no If-None-Match. The account root is typically the user's whole Nextcloud. The command is plain `.session` (scope `app`) with no `destructive` flag. So an AI chat, for example one prompt-injected by a document, or a plugin with the app scope can replace e.g. \"Documents/thesis.docx\" with a tmp: file and no confirmation. This contradicts ARCHITECTURE §6: \"Mark destructive: true for anything that deletes or overwrites\" (and `sensitive` when data leaves the device). The library-folder guard is also case-sensitive, so on a case-insensitive server (IIS, many NAS) a backup to \"nib/x.zip\" lands in the mirrored folder and is then copied into the library.",
+      "fix": "Make the upload create-only by default: client.put(..., createOnly: true), with 412 mapped to NibError(.conflict, hint: \"pass overwrite: true to replace it\"). Add an additive `overwrite?: Bool` param and mark the descriptor destructive: true (plus sensitive: true), so non-user principals are always confirmed. Compare the library-folder prefix case-insensitively. Tests: a second put to the same path without overwrite fails with conflict; with overwrite it succeeds; as .ai(\"chat\") the confirmer is asked."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatWebDAV/WebDAVClient.swift:766-799 (listLibrary) with FeatWebDAVFeature.swift:175-185 (60 s timer) and :229-237 (trigger)",
+      "problem": "Performance on large notebooks. Every automatic pass, every 60 s while the app is active, re-lists the whole server tree with one Depth 1 PROPFIND per collection, and it also stats every local file. The package layout has one collection per page (pages/<pageId>/). A library of 20 notebooks with 300 pages each therefore costs about 6,000 PROPFINDs per pass. At 6 concurrent requests one pass takes longer than the interval, and the timer re-fires right after it ends. The app then keeps the radio and CPU busy continuously and loads the server even when nothing changed.",
+      "fix": "Remember each collection's getetag (already requested in propfindBody) in MirrorState, together with the file entries below it. Skip re-listing a subtree whose collection ETag is unchanged and reuse the remembered entries. Nextcloud, ownCloud and SabreDAV propagate child changes to parent ETags. Fall back to the full walk when collections carry no ETag (Apache mod_dav). Also space automatic passes at max(interval, 2 × last pass duration). Test: a second pass over an unchanged fake tree of 200 collections (with collection ETags in FakeDAVServer) issues only the root PROPFIND."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWebDAV/WebDAVMirror.swift:518-521 (MirrorStateStore.key)",
+      "problem": "The state key hashes root.standardizedFileURL.path. When the library is the app's Documents folder (the warned opt-out), that path contains the data-container UUID, which iOS changes on app updates and reinstalls, and sideloaded builds are re-signed often. The last-synced state is then orphaned. The next pass downloads every file present on both sides to compare it. It also writes conflict copies for everything that changed since the last pass, and pushes this device's older copies over other devices' files.",
+      "fix": "Key the state on a stable library identity. Use the root path relative to NSHomeDirectory() (strip the container prefix) when the root is inside the container, or an id kept in the library's .nib-library marker."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWebDAV/WebDAVClient.swift:472-481 (redirect), :491-502 (respond)",
+      "problem": "Basic, Digest and NTLM challenges are answered with the password for any protection-space host. A redirect to another host that challenges therefore receives the credentials, even though the comment says credentials are only forwarded to the same host. A same-host https→http redirect keeps the explicit Basic Authorization header, which sends the password in plain text.",
+      "fix": "In respond(to:), answer an auth challenge only when space.host.lowercased() == host. For Basic, also require space.receivesCredentialSecurely unless the configured URL is itself http. In the redirect handler, also drop Authorization when the scheme changes from https to http."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWebDAV/FeatWebDAVFeature.swift:229-237 (trigger), :273-312 (perform)",
+      "problem": "After an authFailed pass, the 60 s timer and every foreground trigger keep retrying with the rejected password. That is 2 failed logins per pass (up-front Basic plus the challenge answer), about 120 per hour. Nextcloud's brute-force protection then throttles the whole IP, including the user's web UI and other clients.",
+      "fix": "After WebDAVError.authenticationFailed, suspend automatic triggers (timer, foreground, background task) until webdav.configure runs, the settings page saves a password, or the user runs webdav.syncNow manually. Report the state the same way as credentialsMissing."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWebDAV/WebDAVMirror.swift:643 (client.listLibrary() without isExcluded)",
+      "problem": "excludedTopLevel (\"Inbox\", \"diagnostics\" when the library is Documents) is applied only to the local scan. Server entries under those names can come from another device whose library has a user folder named Inbox. They are planned as downloads into the system-managed Documents/Inbox on every pass, then fail or stay pending forever. If the download succeeds, the state and the scan disagree on every later pass.",
+      "fix": "Call client.listLibrary(isExcluded: { path in excludedTopLevel.contains(String(path.split(separator: \"/\").first ?? \"\")) }) so excluded top-level names are ignored on both sides."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWebDAV/WebDAVMirror.swift:724-731 (execute) with :796-827 (resolve)",
+      "problem": "An outcome that carries a fatal error (cancelled, unreachable) is dropped without applying its updates. A resolve that already installed the local conflict copy, and possibly pushed the local file, loses its state entries when the pass is cancelled or the network drops. The next pass resolves the same path again and writes a second \"(WebDAV conflict <dev> 2)\" copy.",
+      "fix": "Apply outcome.updates and conflictFile before the fatal handling (skip only the counter), or apply every outcome and record the fatal error separately. Add a test that cancels the run after the conflict copy is installed and checks that the next pass writes no second copy."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatWebDAV/WebDAVClient.swift:393-397 (finishResponse), :794 (`?? []` for a listed subcollection)",
+      "problem": "The server listing can make existing files look deleted in two ways. A member whose propstats all fail (403, 423 or 500 from a locked file or an unavailable external storage) is dropped from the listing. A subcollection that answers 404 right after being listed is treated as empty. Unchanged local copies of those files are then deleted (deleteLocal), even though the files still exist on the server. The reset guard only covers a completely empty server.",
+      "fix": "Keep failed members as \"unknown\" paths and have the planner skip keys equal to or under them, the same way as notDownloaded. Treat a 404 on a collection that was just listed as a listing failure for that subtree: skip its keys this pass instead of returning []."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatWebDAVTests/FeatWebDAVTests.swift, WebDAVMirrorTests.swift",
+      "problem": "The parser, decision-table and two-device tests are good. Nothing covers the riskiest paths found above: special characters in root-level and folder names, a server change between listing and delete, cancellation in the middle of a pass, partial or failed listings, webdav.put overwrite, and the automatic trigger and background-task scheduling (for example no re-trigger after authFailed).",
+      "fix": "Add the tests named in the fixes above: colon names end to end, If-Match race, resolve cancelled after installing the copy, 404 subcollection or failed propstat member not deleting local files, put conflict/overwrite, and trigger suppression after authFailed."
+    }
+  ]
+}
