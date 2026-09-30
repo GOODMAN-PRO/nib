@@ -81,6 +81,18 @@ struct LaserAppearance: Equatable {
     static let defaultColor = RGBA(ink: .vermilion)
     static let palette: [NibInk] = [.vermilion, .ochre, .moss, .lagoon, .cobalt, .plum]
 
+    /// The palette swatch (`NibSwatch` id, the ink's raw value) showing `color`, alpha ignored; nil for a colour set
+    /// outside the palette (by `laser.setMode` or the settings store), so no swatch is ticked.
+    static func swatchID(for color: RGBA) -> String? {
+        palette.first { RGBA(ink: $0).sameHue(as: color) }?.rawValue
+    }
+
+    /// The colour a tap on palette swatch `id` picks (nil for an id outside the palette).
+    static func color(forSwatch id: String) -> RGBA? {
+        guard let ink = NibInk(rawValue: id), palette.contains(ink) else { return nil }
+        return RGBA(ink: ink)
+    }
+
     /// How long a trail point lives; a dot only needs its fade.
     var lifetime: TimeInterval { mode == .trail ? trailLength.lifetime : LaserStyle.fade }
 
@@ -105,15 +117,12 @@ extension RGBA {
     func sameHue(as other: RGBA) -> Bool { r == other.r && g == other.g && b == other.b }
 }
 
-/// The laser's look from DESIGN.md §14.12: a 12 pt dot with a 45 % glow 12 pt wide; the trail is a 4 pt line fading
-/// linearly over 600 ms (`NibMotion.laserFade`, the only linear motion in Nib). ponytail: the numbers mirror
-/// DESIGN.md because NibDesign has no laser metrics and `laserFade` is a SwiftUI Animation whose duration a CALayer
-/// cannot read.
+/// The laser's look from DESIGN.md §14.12. Sizes and the glow come from NibDesign (`NibMetrics.laserDot`,
+/// `.laserGlow`, `.laserTrail`, `NibOpacity.laserGlow`); the trail fades linearly over 600 ms (`NibMotion.laserFade`,
+/// the only linear motion in Nib). ponytail: `fade` mirrors `laserFade`, a SwiftUI Animation whose duration a CALayer
+/// fade cannot read; use `NibMotion.laserFadeDuration` once NibDesign adds it (DESIGN_SYSTEM.md "What still needs
+/// another owner").
 enum LaserStyle {
-    static let dotDiameter: CGFloat = 12
-    static let glowWidth: CGFloat = 12
-    static let glowOpacity: Double = 0.45
-    static let trailWidth: CGFloat = 4
     static let fade: TimeInterval = 0.6
     /// Above the page tiles and every other canvas overlay.
     static let canvasZ: CGFloat = 1_000
@@ -251,14 +260,11 @@ struct LaserSignal: Equatable {
     var session: String?
     var principal: Principal
 
-    /// {page: "page:D/P", point?: [x, y], mode, color, session?}. `page` is a ref, so the payload can be passed
-    /// straight back to `laser.point`; a payload without `point` means the laser was lifted.
-    var payload: JSONValue {
-        var o: [String: JSONValue] = ["page": .string(NodeRef.page(doc, page).description),
-                                      "mode": .string(mode.rawValue), "color": .string(color.hex)]
-        if let point { o["point"] = .array([.number(point.x), .number(point.y)]) }
-        if let session { o["session"] = .string(session) }
-        return .object(o)
+    /// The typed `laser.moved` payload: {page: "page:D/P", point?: [x, y], mode, color: "#RRGGBBAA", session?}.
+    /// `page` is a ref, so the payload can be passed straight back to `laser.point`; no `point` = lifted or hidden.
+    var payload: LaserMovedPayload {
+        LaserMovedPayload(page: NodeRef.page(doc, page).description, point: point, mode: mode.rawValue, color: color,
+                          session: session)
     }
 }
 
@@ -358,6 +364,6 @@ final class LaserHub {
     }
 
     private func emit(_ s: LaserSignal, _ events: EventBus) {
-        events.emit(NibEventType.laserMoved, principal: s.principal, doc: s.doc, payload: s.payload)
+        events.emit(s.payload, principal: s.principal, doc: s.doc)
     }
 }

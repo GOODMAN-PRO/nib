@@ -260,14 +260,14 @@ final class LaserRenderer {
         bands = (0..<LaserStyle.bands).map { band in
             let layer = CAShapeLayer()
             layer.fillColor = nil
-            layer.lineWidth = LaserStyle.trailWidth
+            layer.lineWidth = NibMetrics.laserTrail
             layer.lineCap = .round
             layer.lineJoin = .round
             layer.opacity = Float(LaserStyle.bandOpacity(band))
             return layer
         }
-        let d = LaserStyle.dotDiameter
-        let g = d + 2 * LaserStyle.glowWidth
+        let d = NibMetrics.laserDot
+        let g = d + 2 * NibMetrics.laserGlow
         withoutActions {
             dot.path = CGPath(ellipseIn: CGRect(x: -d / 2, y: -d / 2, width: d, height: d), transform: nil)
             glow.type = .radial
@@ -382,7 +382,7 @@ final class LaserRenderer {
 
     private func applyColours() {
         let c = appearance.color
-        let halo = c.withAlpha(c.alpha * LaserStyle.glowOpacity).cgColor
+        let halo = c.withAlpha(c.alpha * NibOpacity.laserGlow).cgColor
         withoutActions {
             dot.fillColor = c.cgColor
             glow.colors = [halo, halo, c.withAlpha(0).cgColor]
@@ -495,24 +495,25 @@ struct LaserOptionsView: View {
             .accessibilityLabel(String(localized: "Laser mode"))
     }
 
+    /// Vermilion plus five inks in one row; a colour set outside the palette ticks no swatch.
     private var swatches: some View {
-        HStack(spacing: 0) {
-            ForEach(LaserAppearance.palette, id: \.self) { ink in
-                let inkColour = RGBA(ink: ink)
-                NibPenSwatch(NibSwatch(ink: ink), isSelected: colour.sameHue(as: inkColour)) {
-                    colour = inkColour
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(String(localized: "Laser colour"))
+        NibSwatchGrid(swatches: LaserAppearance.palette.map { NibSwatch(ink: $0) }, selection: swatchSelection,
+                      columns: LaserAppearance.palette.count)
+            .accessibilityLabel(String(localized: "Laser colour"))
+    }
+
+    private var swatchSelection: Binding<String?> {
+        Binding(get: { LaserAppearance.swatchID(for: colour) },
+                set: { id in
+                    guard let id, let picked = LaserAppearance.color(forSwatch: id) else { return }
+                    colour = picked
+                })
     }
 
     /// Runs `laser.setMode` when the choice differs from what is stored (a reload from the store never re-sends).
     private func commit() {
         let next = LaserAppearance(mode: mode, color: colour, trailLength: trailLength)
         guard next != LaserAppearance(settings: app.settings) else { return }
-        app.perform("laser.setMode", next.commandParams, session: session)
+        app.perform(CommandIDs.laserSetMode, next.commandParams, session: session)
     }
 }

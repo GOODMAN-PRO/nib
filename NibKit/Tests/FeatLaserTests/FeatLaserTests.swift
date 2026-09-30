@@ -47,7 +47,7 @@ final class FeatLaserTests: XCTestCase {
         XCTAssertNotNil(h.app.ui.canvasAttachments.get(LaserPointerAttachment.attachmentID))
 
         let owned = h.app.commands.all().filter { $0.owner == FeatLaserFeature.id }
-        XCTAssertEqual(Set(owned.map(\.id)), ["laser.setMode", "laser.point"])
+        XCTAssertEqual(Set(owned.map(\.id)), [CommandIDs.laserSetMode, CommandIDs.laserPoint])
         XCTAssertTrue(owned.allSatisfy { $0.effect == .session }, "the laser never edits a document")
     }
 
@@ -93,11 +93,13 @@ final class FeatLaserTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(moved.count, 2)
         XCTAssertLessThan(moved.count, 11, "calls closer than 1/30 s are coalesced")
         XCTAssertEqual(moved.first?.doc, Fixtures.docID)
-        XCTAssertEqual(moved.first?.payload?["page"], JSONValue.string(pageRef))
-        XCTAssertEqual(moved.first?.payload?["point"], JSONValue.array([100, 50]))
-        XCTAssertEqual(moved.first?.payload?["mode"], JSONValue.string("dot"))
-        XCTAssertEqual(moved.first?.payload?["session"], JSONValue.string(h.session.id.raw))
+        let first = try XCTUnwrap(moved.first?.decode(LaserMovedPayload.self), "a typed LaserMovedPayload")
+        XCTAssertEqual(first, LaserMovedPayload(page: pageRef, point: Point(100, 50), mode: "dot",
+                                                color: LaserAppearance.defaultColor, session: h.session.id.raw))
+        XCTAssertEqual(moved.first?.payload?["point"], JSONValue.array([100, 50]), "point is [x, y] on the wire")
+        XCTAssertEqual(moved.first?.payload?["color"], JSONValue.string("#D9432BFF"))
         XCTAssertNil(moved.last?.payload?["point"], "the last state (hidden) always goes out")
+        XCTAssertNil(moved.last?.decode(LaserMovedPayload.self)?.point)
         for (a, b) in zip(moved, moved.dropFirst()) {
             XCTAssertGreaterThanOrEqual(b.at - a.at, LaserThrottle.interval - 0.002)
         }
@@ -117,6 +119,28 @@ final class FeatLaserTests: XCTestCase {
         }
     }
 
+    func testAMovedPayloadCanBePassedStraightBackToPoint() async throws {
+        let h = Harness(features: [FeatLaserFeature.self])
+        try await h.run("laser.setMode", ["mode": "trail", "color": "#0B8793"])
+        var since = h.app.events.lastSeq
+        try await h.run("laser.point", ["page": .string(pageRef), "point": [30, 40]], as: .bridge("pc"))
+        let sent = try XCTUnwrap(laserEvents(h, since: since).last?.decode(LaserMovedPayload.self))
+        XCTAssertEqual(sent.mode, "trail")
+        XCTAssertEqual(sent.color, RGBA(ink: .lagoon))
+
+        // A presenter or collaborator relays the payload unchanged: page and point are laser.point params.
+        let relayed = try JSONValue.from(sent)
+        let page = try XCTUnwrap(relayed["page"])
+        let point = try XCTUnwrap(relayed["point"])
+        try await Task.sleep(nanoseconds: 50_000_000)
+        since = h.app.events.lastSeq
+        try await h.run("laser.point", ["page": page, "point": point], as: .bridge("pc"))
+        let echoed = try XCTUnwrap(laserEvents(h, since: since).last)
+        XCTAssertEqual(echoed.principal, .bridge("pc"))
+        XCTAssertEqual(echoed.decode(LaserMovedPayload.self)?.page, pageRef)
+        XCTAssertEqual(echoed.decode(LaserMovedPayload.self)?.point, Point(30, 40))
+    }
+
     func testPointShowsOnTheCanvasesOfThatDocumentOnly() async throws {
         let h = Harness(features: [FeatLaserFeature.self])
         let descriptor = try XCTUnwrap(h.app.ui.canvasAttachments.get(LaserPointerAttachment.attachmentID))
@@ -127,6 +151,7 @@ final class FeatLaserTests: XCTestCase {
         onNotebook.attach(to: notebook)
         onBoard.attach(to: board)
         XCTAssertFalse(onNotebook.hitTest(CGPoint(x: 120, y: 240), host: notebook), "the pointer never takes a touch")
+        XCTAssertFalse(onNotebook.hitTest(CGPoint(x: 120, y: 240), isPencil: true, host: notebook))
 
         try await h.run("laser.point", ["page": .string(pageRef), "point": [120, 240]])
         XCTAssertEqual(onNotebook.renderer?.visibleDot, CGPoint(x: 120, y: 240))
@@ -169,6 +194,29 @@ final class FeatLaserTests: XCTestCase {
     }
 
     // MARK: Pure logic
+
+    func testSwatchGridSelectionFollowsTheColourIgnoringAlpha() {
+        XCTAssertEqual(LaserAppearance.palette.first, .vermilion, "Vermilion leads the grid")
+        XCTAssertEqual(LaserAppearance.swatchID(for: LaserAppearance.defaultColor), NibInk.vermilion.rawValue)
+        XCTAssertEqual(LaserAppearance.swatchID(for: RGBA(ink: .cobalt).withAlpha(0.5)), NibInk.cobalt.rawValue)
+        XCTAssertNil(LaserAppearance.swatchID(for: RGBA(1, 2, 3)), "a custom colour ticks no swatch")
+        XCTAssertNil(LaserAppearance.swatchID(for: RGBA(ink: .carbon)), "Carbon is not in the laser palette")
+        for ink in LaserAppearance.palette {
+            XCTAssertEqual(LaserAppearance.color(forSwatch: ink.rawValue), RGBA(ink: ink))
+        }
+        XCTAssertNil(LaserAppearance.color(forSwatch: NibInk.chalk.rawValue))
+        XCTAssertNil(LaserAppearance.color(forSwatch: "nope"))
+    }
+
+    func testLiftedSignalsLeaveThePointOut() throws {
+        let lifted = LaserSignal(doc: Fixtures.docID, page: Fixtures.page1, point: nil, mode: .dot,
+                                 color: LaserAppearance.defaultColor, session: nil, principal: .user)
+        let json = try JSONValue.from(lifted.payload)
+        XCTAssertNil(json["point"])
+        XCTAssertNil(json["session"])
+        XCTAssertEqual(json["page"], JSONValue.string(NodeRef.page(Fixtures.docID, Fixtures.page1).description))
+        XCTAssertEqual(json["mode"], JSONValue.string("dot"))
+    }
 
     func testThrottleKeepsEventsAt30HzAndDeliversTheLastState() {
         var throttle = LaserThrottle()
