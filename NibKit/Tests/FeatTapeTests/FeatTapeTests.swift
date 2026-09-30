@@ -126,7 +126,7 @@ final class FeatTapeTests: XCTestCase {
         let h = harness()
         let host = FakeCanvasHost(h)
         var presets = ToolPresets.defaults(for: "tape")
-        presets.swatches[0].pattern = TapePatternRef.asset(for: TapePattern.dots.id)
+        presets.swatches[0].pattern = PresetSwatch.tapePatternRef(id: TapePattern.dots.id)
         h.app.settings.set(NibSettings.presets("tape"), presets)
 
         let tool = TapeTool()
@@ -145,6 +145,44 @@ final class FeatTapeTests: XCTestCase {
         let asset = try XCTUnwrap(stroke.style.tapePattern, "the pattern tile is copied into the document")
         XCTAssertNotNil(try? h.assets.data(asset, doc: Fixtures.docID))
         XCTAssertEqual(TapeHistory.live(try store(h).history).first?.pattern, TapePattern.dots.id)
+        XCTAssertEqual(host.renderWaits, [Fixtures.page2], "the preview waits for the dry strip")
+        XCTAssertFalse(previewShown(host.overlayLayer), "the preview is gone once the strip has rendered")
+    }
+
+    private func previewShown(_ layer: CALayer) -> Bool {
+        layer.sublayers?.contains { $0.name == TapeTool.previewLayerName } ?? false
+    }
+
+    func testFailedCommitDropsThePreviewAndLeavesTheHistoryAlone() throws {
+        let h = harness()
+        let host = FailingCanvasHost(FakeCanvasHost(h))
+        let tool = TapeTool()
+        tool.touchesBegan(sample(100, 300, 0), host: host)
+        tool.touchesMoved([sample(150, 302, 0.02)], host: host)
+        XCTAssertTrue(previewShown(host.overlayLayer), "the live preview is up while drawing")
+        tool.touchesEnded(sample(250, 300, 0.06), host: host)
+
+        XCTAssertEqual(host.attempts, 1)
+        XCTAssertFalse(previewShown(host.overlayLayer), "nothing landed, so the preview goes at once")
+        XCTAssertEqual(host.renderWaits, [], "no dry strip to wait for")
+        XCTAssertTrue(TapeHistory.live(try store(h).history).isEmpty, "tape that was not added is not recent tape")
+    }
+
+    func testABarePatternIDInThePresetsStillResolves() throws {
+        let h = harness()
+        let host = FakeCanvasHost(h)
+        var presets = ToolPresets.defaults(for: "tape")
+        presets.swatches[0].pattern = AssetRef(TapePattern.hearts.id)          // "tape.hearts", no ".png"
+        h.app.settings.set(NibSettings.presets("tape"), presets)
+
+        let tool = TapeTool()
+        tool.touchesBegan(sample(100, 300, 0), host: host)
+        tool.touchesEnded(sample(250, 300, 0.06), host: host)
+        let stroke = try XCTUnwrap(host.committed.first?.stroke)
+        let asset = try XCTUnwrap(stroke.style.tapePattern)
+        let tile = try XCTUnwrap(TapeTile.decode(try h.assets.data(asset, doc: Fixtures.docID)))
+        XCTAssertEqual(tile.width, TapeTile.pixels, "the built-in tile, copied into the document")
+        XCTAssertEqual(TapeHistory.live(try store(h).history).first?.pattern, TapePattern.hearts.id)
     }
 
     func testStraightTapeAndShortTouches() throws {
@@ -212,10 +250,13 @@ final class FeatTapeTests: XCTestCase {
         XCTAssertGreaterThan(Set(row.map { $0[0] << 16 | $0[1] << 8 | $0[2] }).count, 1, "the pattern is drawn")
         XCTAssertFalse(row.contains([255, 0, 0, 255]), "the tiles cover the base colour")
 
-        style.tapeFollowsDirection = true
         let diagonal = [StrokePoint(x: 5, y: 5, width: 20, height: 20), StrokePoint(x: 55, y: 55, width: 20, height: 20)]
+        let level = try render(Stroke(style: style, points: diagonal), assets: assets)
+        style.tapeFollowsDirection = true
         let following = try render(Stroke(style: style, points: diagonal), assets: assets)
         XCTAssertEqual(try pixel(following, 30, 30)[3], 255)
+        let band = try (15...45).map { try pixel(following, $0, $0) }
+        XCTAssertNotEqual(band, try (15...45).map { try pixel(level, $0, $0) }, "a following pattern turns with the strip")
     }
 
     // MARK: Patterns
@@ -229,7 +270,8 @@ final class FeatTapeTests: XCTestCase {
             XCTAssertNotEqual(data, TapeTile.png(pattern, color: .black), "\(pattern) ignores the tape colour")
             XCTAssertEqual(TapePattern(id: pattern.id), pattern)
         }
-        XCTAssertEqual(TapePatternRef.id(from: TapePatternRef.asset(for: "tape.hearts")), "tape.hearts")
+        XCTAssertEqual(PresetSwatch.tapePatternID(PresetSwatch.tapePatternRef(id: "tape.hearts")), "tape.hearts")
+        XCTAssertEqual(PresetSwatch.tapePatternRef(id: "MYWASHI01").name, "MYWASHI01.png", "custom ids are file names too")
     }
 
     func testImportListAndDeleteCustomPattern() async throws {
@@ -265,9 +307,98 @@ final class FeatTapeTests: XCTestCase {
         } catch let e as NibError {
             XCTAssertEqual(e.code, .invalidParams)
         }
+        // A strip in MYWASHI01 is recent tape until the pattern is deleted.
+        let tape = try store(h)
+        tape.recordUse(pattern: "MYWASHI01", color: .black)
+        let firstCopy = tape.documentAsset(for: PresetSwatch.tapePatternRef(id: "MYWASHI01"), color: .black,
+                                           doc: Fixtures.docID, in: h.app.content.tapePatterns)
+        XCTAssertNotNil(firstCopy)
+
         try await h.run("tape.deletePattern", ["id": "MYWASHI01"])
         XCTAssertNil(h.app.content.tapePatterns.get("MYWASHI01"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: stored.path))
+        XCTAssertFalse(TapeHistory.live(tape.history).contains { $0.pattern == "MYWASHI01" }, "deleting tombstones its uses")
+
+        // The same id again, a different image: strips get the new tile, not a cached copy of the old one.
+        let red = try solidPNG(RGBA(217, 67, 43), width: 120, height: 120)
+        let redFile = FileManager.default.temporaryDirectory.appendingPathComponent("tape-import-\(UUID().uuidString).png")
+        try red.write(to: redFile)
+        try await h.run("tape.importPattern", ["url": .string(redFile.absoluteString), "id": "MYWASHI01"])
+        let secondCopy = tape.documentAsset(for: PresetSwatch.tapePatternRef(id: "MYWASHI01"), color: .black,
+                                            doc: Fixtures.docID, in: h.app.content.tapePatterns)
+        XCTAssertNotNil(secondCopy)
+        XCTAssertNotEqual(secondCopy, firstCopy)
+
+        do {
+            try await h.run("tape.importPattern", ["url": .string(redFile.absoluteString), "id": "MYWASHI01"])
+            XCTFail("the id is taken")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .conflict)
+            XCTAssertEqual(e.path, "$.id")
+        }
+    }
+
+    private func solidPNG(_ colour: RGBA, width: Int, height: Int) throws -> Data {
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        let cg = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                         space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        cg.setFillColor(colour.cgColor)
+        cg.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        return try XCTUnwrap(TapeTile.png(try XCTUnwrap(cg.makeImage())))
+    }
+
+    func testImportFromAnAssetOfTheOpenDocument() async throws {
+        let h = harness()
+        let asset = try h.assets.put(try solidPNG(RGBA(47, 122, 60), width: 50, height: 50), ext: "png", doc: Fixtures.docID)
+
+        // No doc: the asset is looked up in the invoking window's document (contracts-v2 session defaults).
+        let imported = try await h.run("tape.importPattern", ["asset": .string(asset.name), "id": "FROMDOC01"])
+        XCTAssertEqual(imported["id"]?.stringValue, "FROMDOC01")
+        XCTAssertNotNil(h.app.content.tapePatterns.get("FROMDOC01"))
+
+        h.session.document = nil
+        do {
+            try await h.run("tape.importPattern", ["asset": .string(asset.name)])
+            XCTFail("no document to take the asset from")
+        } catch let e as NibError {
+            XCTAssertEqual(e.path, "$.doc")
+        }
+        let named = try await h.run("tape.importPattern",
+                                    ["asset": .string(asset.name), "doc": .string("doc:" + Fixtures.docID.raw)])
+        XCTAssertNotNil(named["id"]?.stringValue)
+    }
+
+    func testReloadFollowsPatternFilesAddedAndRemovedOnDisk() throws {
+        let h = harness()
+        let tape = try store(h)
+        tape.reload()
+        let folder = h.library.metadataURL.appendingPathComponent("tape", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("SYNCED01.png")
+        try solidPNG(RGBA(123, 63, 160), width: 100, height: 100).write(to: file)
+
+        tape.reload()           // what library.changed (another device's file arriving) triggers
+        XCTAssertNotNil(h.app.content.tapePatterns.get("SYNCED01"))
+        XCTAssertEqual(tape.source(of: "SYNCED01"), "custom")
+        XCTAssertEqual(tape.descriptors(in: h.app.content.tapePatterns).last?.id, "SYNCED01")
+
+        try FileManager.default.removeItem(at: file)
+        tape.reload()
+        XCTAssertNil(h.app.content.tapePatterns.get("SYNCED01"))
+    }
+
+    func testClearHistoryCommand() async throws {
+        let h = harness()
+        let tape = try store(h)
+        tape.recordUse(pattern: TapePattern.stars.id, color: .black)
+        tape.recordUse(pattern: nil, color: RGBA(217, 67, 43))
+        let cleared = try await h.run("tape.clearHistory")
+        XCTAssertEqual(cleared["cleared"]?.intValue, 2)
+        XCTAssertTrue(TapeHistory.live(tape.history).isEmpty)
+        let list = try await h.run("tape.patterns")
+        XCTAssertEqual(list["history"]?.arrayValue?.count, 0)
+        let again = try await h.run("tape.clearHistory")
+        XCTAssertEqual(again["cleared"]?.intValue, 0)
     }
 
     // MARK: History
@@ -293,10 +424,15 @@ final class FeatTapeTests: XCTestCase {
         let merged = TapeHistory.live(TapeHistory.load(folder: folder))
         XCTAssertEqual(merged.map { $0.pattern }, ["tape.stars", nil, "tape.dots"])
 
+        // A copy the provider is still downloading does not decode yet.
+        let partial = folder.appendingPathComponent("history.00000008 2.json")
+        try Data("[{\"id\":".utf8).write(to: partial)
+
         let saved = try TapeHistory.save(TapeHistory.load(folder: folder), folder: folder, device: "00000007", now: now)
         XCTAssertEqual(TapeHistory.live(saved).count, 3)
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("history.00000007 2.json").path),
                        "merged conflict copies are removed")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: partial.path), "a copy that was not merged is kept")
 
         // Clearing on the iPad is a set of tombstones that beats the phone's older, still-live file.
         try TapeHistory.save(TapeHistory.cleared(TapeHistory.load(folder: folder), clock: ipad), folder: folder,
@@ -318,5 +454,40 @@ final class FeatTapeTests: XCTestCase {
         XCTAssertEqual(live.first?.usedAt, Double(TapeHistory.maxLive + 4))
         entries = TapeHistory.recording(entries, pattern: "tape.grid", color: RGBA(10, 0, 0), at: 1_000, clock: clock)
         XCTAssertEqual(TapeHistory.live(entries).first?.color, RGBA(10, 0, 0), "using a tape again moves it to the front")
+    }
+}
+
+/// A canvas whose `ink.addStrokes` fails (a read-only document, a full disk): everything else is the fake canvas.
+@MainActor
+private final class FailingCanvasHost: CanvasHost {
+    let base: FakeCanvasHost
+    private(set) var attempts = 0
+    private(set) var renderWaits: [PageID] = []
+
+    init(_ base: FakeCanvasHost) { self.base = base }
+
+    var app: NibApp { base.app }
+    var session: EditorSession { base.session }
+    var documentID: DocumentID { base.documentID }
+    var zoomScale: Double { base.zoomScale }
+    var canvasView: UIView { base.canvasView }
+    var overlayLayer: CALayer { base.overlayLayer }
+    func viewPoint(_ p: Point, page: PageID) -> CGPoint { base.viewPoint(p, page: page) }
+    func pagePoint(_ v: CGPoint) -> (page: PageID, point: Point)? { base.pagePoint(v) }
+    func pageFrame(_ page: PageID) -> CGRect? { base.pageFrame(page) }
+    func setHidden(_ ids: Set<ElementID>, page: PageID) { base.setHidden(ids, page: page) }
+    func invalidate(page: PageID, rect: Rect?) { base.invalidate(page: page, rect: rect) }
+    func commitStroke(_ stroke: Stroke, page: PageID) { base.commitStroke(stroke, page: page) }
+    func cancelWetStroke() { base.cancelWetStroke() }
+    func attachLiveView(_ view: UIView?, item: ElementID, page: PageID) { base.attachLiveView(view, item: item, page: page) }
+
+    func afterNextRender(page: PageID, _ body: @escaping @MainActor () -> Void) {
+        renderWaits.append(page)
+        body()
+    }
+
+    func commitStroke(_ stroke: Stroke, page: PageID, completion: @escaping @MainActor (Result<ElementID?, NibError>) -> Void) {
+        attempts += 1
+        completion(.failure(NibError(.permissionDenied, "This document is read-only.")))
     }
 }

@@ -37,12 +37,18 @@ public enum FeatTapeFeature: NibFeature {
     }
 
     /// Loads custom patterns and the history, and reloads them whenever the library changes (another folder, sync).
+    /// A pattern a content pack re-registers or removes drops its cached tiles (`RegistryChange.ids`).
     public static func start(_ app: NibApp) async {
         guard let store = app.services.get(TapeStore.serviceKey, as: TapeStore.self) else { return }
         store.reload()
         store.librarySubscription = app.events.subscribe { [weak store] event in
             guard event.type == NibEventType.libraryChanged, let store else { return }
             Task { @MainActor in store.scheduleReload() }
+        }
+        store.registryObserver = NotificationCenter.default.addObserver(
+            forName: .nibRegistryDidChange, object: app.content.tapePatterns, queue: .main) { [weak store] note in
+            let ids = RegistryChange.ids(note)
+            Task { @MainActor in store?.forget(patterns: ids) }
         }
     }
 }

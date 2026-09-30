@@ -4,8 +4,8 @@ import ImageIO
 import UniformTypeIdentifiers
 import NibContracts
 
-// Tape patterns: the 12 procedurally generated built-ins, tile encoding, custom-image tiles, the pattern reference
-// format presets use, and the per-device pattern history (pure logic; file I/O goes through `TapeStore`).
+// Tape patterns: the 12 procedurally generated built-ins, tile encoding, custom-image tiles and the per-device pattern
+// history (pure logic; file I/O goes through `TapeStore`).
 
 // MARK: - Built-in patterns
 
@@ -246,18 +246,10 @@ enum TapeTile {
     }
 }
 
-// MARK: - Pattern references
-
-/// How presets point at a library pattern: `PresetSwatch.pattern` = "<pattern id>.png" (a custom pattern's id is also
-/// its file name in the library's tape folder). Documents never store these: the tool copies the tile into the
-/// document's assets and the stroke points at that asset.
-enum TapePatternRef {
-    static func asset(for id: String) -> AssetRef { AssetRef(id + ".png") }
-
-    static func id(from ref: AssetRef) -> String {
-        ref.name.lowercased().hasSuffix(".png") ? String(ref.name.dropLast(4)) : ref.name
-    }
-}
+// Presets point at a library pattern with the contracts-v2 format `PresetSwatch.tapePatternRef(id:)` ("<id>.png"; a
+// custom pattern's id is also its file name in the library's tape folder) and read it back with
+// `PresetSwatch.tapePatternID(_:)`. Documents never store these: the tool copies the tile into the document's assets
+// and the stroke points at that asset.
 
 // MARK: - History
 
@@ -359,30 +351,35 @@ enum TapeHistory {
     }
 
     /// Every history file in `folder` (this device's, other devices', conflict copies), merged.
-    static func load(folder: URL) -> [TapeHistoryEntry] {
+    static func load(folder: URL) -> [TapeHistoryEntry] { read(folder: folder).entries }
+
+    /// The merged entries plus the names of the files that decoded (a file still downloading does not).
+    private static func read(folder: URL) -> (entries: [TapeHistoryEntry], decoded: Set<String>) {
         let fm = FileManager.default
         let names = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
         var merged: [TapeHistoryEntry] = []
+        var decoded = Set<String>()
         for name in names.sorted() where name.hasPrefix(filePrefix) && name.hasSuffix(".json") {
             guard let data = fm.contents(atPath: folder.appendingPathComponent(name).path),
                   let list = try? JSONDecoder().decode([TapeHistoryEntry].self, from: data) else { continue }
             merged = LWW.merge(merged, list)
+            decoded.insert(name)
         }
-        return merged
+        return (merged, decoded)
     }
 
-    /// Merges `entries` with what is on disk, writes this device's file and removes the merged conflict copies.
-    /// Returns the merged state.
+    /// Merges `entries` with what is on disk, writes this device's file and removes the conflict copies it merged
+    /// (a copy that did not decode stays until it does). Returns the merged state.
     @discardableResult
     static func save(_ entries: [TapeHistoryEntry], folder: URL, device: String, now: Double) throws -> [TapeHistoryEntry] {
         let fm = FileManager.default
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
-        let merged = pruned(LWW.merge(load(folder: folder), entries), now: now)
+        let onDisk = read(folder: folder)
+        let merged = pruned(LWW.merge(onDisk.entries, entries), now: now)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         try encoder.encode(merged).write(to: folder.appendingPathComponent(fileName(device: device)), options: .atomic)
-        for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
-        where name.hasPrefix(filePrefix) && name.hasSuffix(".json") && !isDeviceFile(name) {
+        for name in onDisk.decoded where !isDeviceFile(name) {
             try? fm.removeItem(at: folder.appendingPathComponent(name))
         }
         return merged

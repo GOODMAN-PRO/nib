@@ -46,16 +46,15 @@ enum TapeStrokeBuilder {
 // MARK: - Tool
 
 /// Tape is drawn with the stylus: raw samples, a live preview in the tool's overlay layer (never animated), then one
-/// `ink.addStrokes` through `CanvasHost.commitStroke` with the tape style and the pattern tile copied into the
-/// document. A short touch toggles the tape under it instead.
+/// `ink.addStrokes` through `CanvasHost.commitStroke(_:page:completion:)` with the tape style and the pattern tile copied
+/// into the document. The preview stays until the canvas has drawn the dry strip (`afterNextRender`); the history
+/// records the tape only when the commit succeeded. A short touch toggles the tape under it instead.
 @MainActor
 final class TapeTool: CanvasTool {
     let id = "tape"
     let inputMode: CanvasInputMode = .samples
 
     static let previewLayerName = "tape.preview"
-    /// How long a finished strip's preview stays up while its dry tile renders (no tile-landed callback exists).
-    static let dryHandoff: TimeInterval = 0.25
     /// A tap delivered right after a touch that already toggled tape is the same gesture.
     static let tapDebounce: CFTimeInterval = 0.3
 
@@ -113,13 +112,23 @@ final class TapeTool: CanvasTool {
                              tapeFollowsDirection: current.followsDirection)
         let store = TapeTool.store(host)
         if let ref = current.patternRef {
-            style.tapePattern = store?.documentAsset(for: ref, color: current.color, doc: host.documentID)
+            style.tapePattern = store?.documentAsset(for: ref, color: current.color, doc: host.documentID,
+                                                     in: host.app.content.tapePatterns)
         }
-        host.commitStroke(Stroke(style: style, points: points, t0: startedAt), page: page)
-        store?.recordUse(pattern: style.tapePattern == nil ? nil : current.pattern, color: current.color)
-        if let layer {
-            DispatchQueue.main.asyncAfter(deadline: .now() + TapeTool.dryHandoff) { [weak layer] in
-                layer?.removeFromSuperlayer()
+        let used = style.tapePattern == nil ? nil : current.pattern
+        let colour = current.color
+        host.commitStroke(Stroke(style: style, points: points, t0: startedAt), page: page) { [weak host, weak store] result in
+            switch result {
+            case .success:
+                store?.recordUse(pattern: used, color: colour)
+                guard let layer else { return }
+                if let host {
+                    host.afterNextRender(page: page) { [weak layer] in layer?.removeFromSuperlayer() }
+                } else {
+                    layer.removeFromSuperlayer()
+                }
+            case .failure:
+                layer?.removeFromSuperlayer()     // nothing landed: drop the preview now, and leave the history alone
             }
         }
     }
@@ -210,10 +219,10 @@ final class TapeSettingsModel: ObservableObject {
     }
 
     var settingsStore: SettingsStore? { app?.settings }
-    var patternRegistry: AnyObject? { app?.content.tapePatterns }
+    var patternRegistry: Registry<TapePatternDescriptor>? { app?.content.tapePatterns }
     private var store: TapeStore? { app?.services.get(TapeStore.serviceKey, as: TapeStore.self) }
 
-    var selectedPattern: String? { presets.tapePattern.map { TapePatternRef.id(from: $0) } }
+    var selectedPattern: String? { presets.tapePattern.map(PresetSwatch.tapePatternID) }
     var canRemoveAll: Bool { session.document != nil && session.page != nil }
 
     func load() {
@@ -226,41 +235,77 @@ final class TapeSettingsModel: ObservableObject {
         presets = app.settings.get(NibSettings.presets("tape"))
         straight = app.settings.get(TapeSettings.straight)
         followsDirection = app.settings.get(TapeSettings.followsDirection)
-        cells = store.descriptors().map { Cell(id: $0.id, title: $0.title, isCustom: store.source(of: $0.id) == "custom") }
+        cells = store.descriptors(in: app.content.tapePatterns)
+            .map { Cell(id: $0.id, title: $0.title, isCustom: store.source(of: $0.id) == "custom") }
         recent = TapeHistory.live(store.history)
+    }
+
+    /// Patterns were added, removed or replaced: previews are drawn again.
+    func patternsChanged() {
+        previews.removeAll()
+        refresh()
     }
 
     /// A tile image sized so one tile is one strip tall (built-ins in `color`).
     func preview(_ id: String, color: RGBA) -> UIImage? {
         let key = id + "|" + color.hex
         if let image = previews[key] { return image }
-        guard let data = store?.tile(pattern: id, color: color), let tile = TapeTile.decode(data) else { return nil }
+        guard let app, let data = store?.tile(pattern: id, color: color, in: app.content.tapePatterns),
+              let tile = TapeTile.decode(data) else { return nil }
         let image = UIImage(cgImage: tile, scale: max(1, CGFloat(tile.height) / TapeSettingsView.stripHeight), orientation: .up)
         previews[key] = image
         return image
     }
 
+    /// A pattern's name in the 4-column grid, the history and the swatch labels, short enough for a tile: your own
+    /// images are numbered ("Image 2"), so VoiceOver can tell them apart.
     func title(of pattern: String?) -> String {
-        guard let pattern else { return String(localized: "Plain colour") }
-        return cells.first { $0.id == pattern }?.title ?? String(localized: "Custom pattern")
+        guard let pattern else { return String(localized: "Plain") }
+        if let i = cells.filter(\.isCustom).firstIndex(where: { $0.id == pattern }) {
+            return String(localized: "Image \(i + 1)")
+        }
+        return cells.first { $0.id == pattern }?.title ?? String(localized: "Image")
     }
 
-    func swatchName(_ index: Int, _ swatch: PresetSwatch) -> String {
-        let colour = String(localized: "Colour \(index + 1)")
-        guard let pattern = swatch.pattern else { return colour }
-        return colour + ", " + title(of: TapePatternRef.id(from: pattern))
+    /// 0xRRGGBB of a tape colour (tape is always opaque).
+    static func rgb(_ color: RGBA) -> UInt32 { UInt32(color.r) << 16 | UInt32(color.g) << 8 | UInt32(color.b) }
+
+    /// What VoiceOver calls a colour: the ink's name when it is one of the inks, else the slot, else its hex.
+    static func colourName(_ color: RGBA, slot: Int? = nil) -> String {
+        if let ink = NibInk.allCases.first(where: { $0.hex == rgb(color) }) { return ink.name }
+        if let slot { return String(localized: "Colour \(slot + 1)") }
+        return String(color.hex.prefix(7))
+    }
+
+    static func slotID(_ index: Int) -> String { "slot.\(index)" }
+
+    static func slotIndex(_ id: String?) -> Int? {
+        guard let id, id.hasPrefix("slot.") else { return nil }
+        return Int(id.dropFirst("slot.".count))
+    }
+
+    /// The colour slots as swatches; a slot with a pattern shows it tiled over its colour ("Colour 1, Polka dots").
+    var swatches: [NibSwatch] {
+        presets.swatches.enumerated().map { index, swatch in
+            let pattern = swatch.pattern.map(PresetSwatch.tapePatternID).flatMap { id in
+                preview(id, color: swatch.color).map { NibSwatchPattern(id: id, image: $0, name: title(of: id)) }
+            }
+            return NibSwatch(id: TapeSettingsModel.slotID(index), hex: TapeSettingsModel.rgb(swatch.color),
+                             name: TapeSettingsModel.colourName(swatch.color, slot: index), pattern: pattern)
+        }
     }
 
     // MARK: Actions
 
     func choose(pattern: String?, color: RGBA? = nil) {
         let colour = color ?? presets.color
+        let ref = pattern.map { PresetSwatch.tapePatternRef(id: $0) }
         var params: [String: JSONValue] = ["tool": "tape", "index": .number(Double(presets.selectedSwatch)),
                                            "color": .string(colour.hex)]
-        if let pattern { params["pattern"] = .string(TapePatternRef.asset(for: pattern).name) }
+        if let ref { params["pattern"] = .string(ref.name) }
         updatePresets(command: "preset.setSwatch", params: .object(params)) { p in
             guard p.swatches.indices.contains(p.selectedSwatch) else { return }
-            p.swatches[p.selectedSwatch] = PresetSwatch(color: colour, pattern: pattern.map { TapePatternRef.asset(for: $0) })
+            p.swatches[p.selectedSwatch] = PresetSwatch(color: colour, pattern: ref)
         }
     }
 
@@ -295,13 +340,23 @@ final class TapeSettingsModel: ObservableObject {
 
     func delete(_ id: String) { app?.perform("tape.deletePattern", ["id": .string(id)], session: session) }
 
+    /// Imports a file picked in Files: read off the main actor, inside its security scope.
+    func importFile(_ url: URL) async {
+        let data = await Task.detached { () -> Data? in
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            return try? Data(contentsOf: url)
+        }.value
+        if let data { await importImage(data) }
+    }
+
     /// Imports picked image bytes as a custom pattern, then puts it on the selected slot.
     func importImage(_ data: Data) async {
         guard let app else { return }
         let file = FileManager.default.temporaryDirectory.appendingPathComponent("tape-import-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: file) }
         do {
-            try data.write(to: file)
+            try await Task.detached { try data.write(to: file) }.value
             let result = try await app.bus.execute("tape.importPattern", ["url": .string(file.absoluteString)], session: session)
             if let id = result["id"]?.stringValue { choose(pattern: id) }
         } catch {
@@ -329,10 +384,12 @@ final class TapeSettingsModel: ObservableObject {
     }
 }
 
-/// The tape tool's popover content (the palette wraps it in a Deep `NibPopoverPanel` titled "Tape"): pattern grid
-/// (Patterns / History), colours, widths, pattern direction, straight tape and Remove All Tape (DESIGN.md §14.3).
+/// The tape tool's popover content (the palette wraps it in a Deep `NibPopoverPanel` titled "Tape", DESIGN.md §14.3):
+/// the pattern grid (Patterns / History, `NibOptionTile`s), colours (`NibSwatchGrid`, patterns tiled over their
+/// colour), width presets (`NibWidthPresetButton`), pattern direction, straight tape and Remove All Tape.
 struct TapeSettingsView: View {
-    static let stripHeight: CGFloat = 24
+    /// A strip preview's height; one pattern tile is one strip tall.
+    static let stripHeight: CGFloat = NibSpacing.xl
 
     enum Tab: Hashable {
         case patterns, history
@@ -344,6 +401,7 @@ struct TapeSettingsView: View {
     @State private var choosingPhoto = false
     @State private var photo: PhotosPickerItem?
     @State private var choosingFile = false
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     init(app: NibApp, session: EditorSession) {
         _model = StateObject(wrappedValue: TapeSettingsModel(app: app, session: session))
@@ -353,7 +411,11 @@ struct TapeSettingsView: View {
         String(format: String(localized: "%.1f mm"), points * 25.4 / 72)
     }
 
-    private var columns: [GridItem] { Array(repeating: GridItem(.flexible(), spacing: NibSpacing.s), count: 4) }
+    /// Four option tiles a row, 6 pt apart (DESIGN.md §14.3).
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: NibSpacing.xs + NibSpacing.xxs), count: 4)
+    }
+
     private var colour: Color { Color(uiColor: model.presets.color.uiColor) }
 
     var body: some View {
@@ -364,11 +426,7 @@ struct TapeSettingsView: View {
             if tab == .patterns { patterns } else { history }
             colours
             widths
-            NibInspectorSection(String(localized: "Pattern direction")) {
-                NibSegmentedControl(selection: followsBinding, options: [false, true]) {
-                    $0 ? String(localized: "Follow stroke") : String(localized: "Horizontal")
-                }
-            }
+            direction
             NibToggle(String(localized: "Straight tape"), isOn: straightBinding)
             removeAll
             Text(String(localized: "Tap tape on the page to hide or reveal it."))
@@ -381,9 +439,9 @@ struct TapeSettingsView: View {
             model.refresh()
         }
         .onReceive(NotificationCenter.default.publisher(for: .nibRegistryDidChange, object: model.patternRegistry)) { _ in
-            model.refresh()
+            model.patternsChanged()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .tapeStoreDidChange)) { _ in model.refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: .tapeStoreDidChange)) { _ in model.patternsChanged() }
         .photosPicker(isPresented: $choosingPhoto, selection: $photo, matching: .images)
         .onChange(of: photo) { _, item in
             guard let item else { return }
@@ -394,10 +452,7 @@ struct TapeSettingsView: View {
         }
         .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.image]) { result in
             guard case let .success(url) = result else { return }
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            guard let data = try? Data(contentsOf: url) else { return }
-            Task { await model.importImage(data) }
+            Task { await model.importFile(url) }
         }
     }
 
@@ -405,11 +460,13 @@ struct TapeSettingsView: View {
 
     private var patterns: some View {
         NibInspectorSection(String(localized: "Pattern")) {
-            LazyVGrid(columns: columns, spacing: NibSpacing.s) {
-                TapeStripCell(title: String(localized: "Plain colour"), colour: colour, image: nil,
-                              isSelected: model.selectedPattern == nil) { model.choose(pattern: nil) }
+            LazyVGrid(columns: columns, spacing: NibSpacing.xs + NibSpacing.xxs) {
+                NibOptionTile(model.title(of: nil), isSelected: model.selectedPattern == nil,
+                              action: { model.choose(pattern: nil) }) {
+                    TapeStripPreview(colour: colour, image: nil)
+                }
                 ForEach(model.cells) { cell in
-                    patternCell(cell)
+                    patternTile(cell)
                 }
                 addPattern
             }
@@ -417,11 +474,13 @@ struct TapeSettingsView: View {
     }
 
     @ViewBuilder
-    private func patternCell(_ cell: TapeSettingsModel.Cell) -> some View {
-        let strip = TapeStripCell(title: cell.title, colour: colour, image: model.preview(cell.id, color: model.presets.color),
-                                  isSelected: model.selectedPattern == cell.id) { model.choose(pattern: cell.id) }
+    private func patternTile(_ cell: TapeSettingsModel.Cell) -> some View {
+        let tile = NibOptionTile(model.title(of: cell.id), isSelected: model.selectedPattern == cell.id,
+                                 action: { model.choose(pattern: cell.id) }) {
+            TapeStripPreview(colour: colour, image: model.preview(cell.id, color: model.presets.color))
+        }
         if cell.isCustom {
-            strip
+            tile
                 .contextMenu {
                     Button(role: .destructive) { model.delete(cell.id) } label: {
                         Label { Text(String(localized: "Delete Pattern")) } icon: { Image(nib: .trash) }
@@ -429,7 +488,7 @@ struct TapeSettingsView: View {
                 }
                 .accessibilityAction(named: Text(String(localized: "Delete Pattern"))) { model.delete(cell.id) }
         } else {
-            strip
+            tile
         }
     }
 
@@ -442,15 +501,16 @@ struct TapeSettingsView: View {
                 Label { Text(String(localized: "Files")) } icon: { Image(nib: .importFile) }
             }
         } label: {
-            Image(nib: .plus)
-                .font(NibFont.glyph(.panel))
-                .foregroundStyle(NibColor.label)
-                .frame(maxWidth: .infinity)
-                .frame(height: TapeSettingsView.stripHeight)
-                .background(NibColor.fill3, in: RoundedRectangle(cornerRadius: NibRadius.badge, style: .continuous))
-                .padding(3)
-                .frame(minHeight: NibMetrics.hitTarget)
-                .contentShape(Rectangle())
+            // Laid out like a symbol `NibOptionTile` (a Menu cannot host the tile's Button).
+            VStack(spacing: NibSpacing.xxs) {
+                NibOptionGlyph(.plus)
+                Text(String(localized: "Add"))
+                    .font(NibFont.caption2)
+                    .lineLimit(1)
+            }
+            .foregroundStyle(NibColor.labelSecondary)
+            .frame(maxWidth: .infinity, minHeight: NibMetrics.optionTileHeight)
+            .contentShape(Rectangle())
         }
         .accessibilityLabel(String(localized: "Add a pattern from an image"))
     }
@@ -464,13 +524,16 @@ struct TapeSettingsView: View {
                     .foregroundStyle(NibColor.labelSecondary)
                     .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
             } else {
-                LazyVGrid(columns: columns, spacing: NibSpacing.s) {
+                LazyVGrid(columns: columns, spacing: NibSpacing.xs + NibSpacing.xxs) {
                     ForEach(model.recent, id: \.id) { entry in
-                        TapeStripCell(title: model.title(of: entry.pattern), colour: Color(uiColor: entry.color.uiColor),
-                                      image: entry.pattern.flatMap { model.preview($0, color: entry.color) },
-                                      isSelected: entry.pattern == model.selectedPattern && entry.color == model.presets.color) {
-                            model.choose(pattern: entry.pattern, color: entry.color)
+                        NibOptionTile(model.title(of: entry.pattern),
+                                      isSelected: entry.pattern == model.selectedPattern && entry.color == model.presets.color,
+                                      action: { model.choose(pattern: entry.pattern, color: entry.color) }) {
+                            TapeStripPreview(colour: Color(uiColor: entry.color.uiColor),
+                                             image: entry.pattern.flatMap { model.preview($0, color: entry.color) })
                         }
+                        // Entries of one pattern differ only by colour: VoiceOver says which.
+                        .accessibilityValue(Text(TapeSettingsModel.colourName(entry.color)))
                     }
                 }
             }
@@ -479,14 +542,7 @@ struct TapeSettingsView: View {
 
     private var colours: some View {
         NibInspectorSection(String(localized: "Colour")) {
-            LazyVGrid(columns: Array(repeating: GridItem(.fixed(NibMetrics.hitTarget), spacing: 0), count: 6),
-                      alignment: .leading, spacing: 0) {
-                ForEach(Array(model.presets.swatches.enumerated()), id: \.offset) { index, swatch in
-                    NibPenSwatch(NibSwatch(id: "tape.\(index)", color: Color(uiColor: swatch.color.uiColor),
-                                           name: model.swatchName(index, swatch)),
-                                 isSelected: index == model.presets.selectedSwatch) { model.selectSwatch(index) }
-                }
-            }
+            NibSwatchGrid(swatches: model.swatches, selection: swatchSelection)
         }
     }
 
@@ -494,27 +550,26 @@ struct TapeSettingsView: View {
         NibInspectorSection(String(localized: "Width"), value: TapeSettingsView.millimetres(model.presets.width)) {
             HStack(spacing: NibSpacing.s) {
                 ForEach(Array(model.presets.widths.enumerated()), id: \.offset) { index, width in
-                    widthButton(index, width)
+                    NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index),
+                                         isSelected: index == model.presets.selectedWidth,
+                                         label: TapeSettingsView.millimetres(width)) { model.selectWidth(index) }
                 }
             }
         }
     }
 
-    private func widthButton(_ index: Int, _ width: Double) -> some View {
-        let selected = index == model.presets.selectedWidth
-        let shape = RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)
-        return Button { model.selectWidth(index) } label: {
-            Rectangle()
-                .fill(NibColor.label)
-                .frame(width: 28, height: max(3, CGFloat(width) * 0.5))
-                .frame(maxWidth: .infinity, minHeight: 40)
-                .background(selected ? NibColor.fill3 : Color.clear, in: shape)
-                .frame(minHeight: NibMetrics.hitTarget)
-                .contentShape(Rectangle())
+    /// Segmented at standard sizes; at accessibility sizes the two labels would truncate, so it becomes a toggle.
+    @ViewBuilder
+    private var direction: some View {
+        if typeSize.isAccessibilitySize {
+            NibToggle(String(localized: "Pattern follows stroke"), isOn: followsBinding)
+        } else {
+            NibInspectorSection(String(localized: "Pattern direction")) {
+                NibSegmentedControl(selection: followsBinding, options: [false, true]) {
+                    $0 ? String(localized: "Follow stroke") : String(localized: "Horizontal")
+                }
+            }
         }
-        .buttonStyle(NibPressStyle(shape: shape))
-        .accessibilityLabel(TapeSettingsView.millimetres(width))
-        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private var removeAll: some View {
@@ -530,6 +585,11 @@ struct TapeSettingsView: View {
 
     // MARK: Bindings
 
+    private var swatchSelection: Binding<String?> {
+        Binding(get: { TapeSettingsModel.slotID(model.presets.selectedSwatch) },
+                set: { id in if let index = TapeSettingsModel.slotIndex(id) { model.selectSwatch(index) } })
+    }
+
     private var straightBinding: Binding<Bool> {
         Binding(get: { model.straight }, set: { model.setStraight($0) })
     }
@@ -539,34 +599,19 @@ struct TapeSettingsView: View {
     }
 }
 
-/// One pattern choice: a strip of the tile (or the plain colour), selected with a 2 pt label ring outside it.
-struct TapeStripCell: View {
-    let title: String
+/// A pattern tile's preview: one strip of the pattern (or the plain colour), with the swatch hairline.
+struct TapeStripPreview: View {
     let colour: Color
     let image: UIImage?
-    let isSelected: Bool
-    let action: () -> Void
 
     var body: some View {
-        let inner = RoundedRectangle(cornerRadius: NibRadius.badge, style: .continuous)
-        let ring = RoundedRectangle(cornerRadius: NibRadius.segment, style: .continuous)   // concentric: 6 + 3 pt inset
-        return Button(action: action) {
-            strip
-                .frame(maxWidth: .infinity)
-                .frame(height: TapeSettingsView.stripHeight)
-                .clipShape(inner)
-                .overlay { inner.strokeBorder(NibColor.swatchHairline, lineWidth: 0.5) }
-                .padding(3)
-                .overlay {
-                    if isSelected { ring.stroke(NibColor.label, lineWidth: 2) }
-                }
-                .animation(NibMotion.colorChange, value: isSelected)
-                .frame(minHeight: NibMetrics.hitTarget)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(NibPressStyle(shape: ring))
-        .accessibilityLabel(title)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
+        let shape = RoundedRectangle(cornerRadius: NibRadius.badge, style: .continuous)
+        strip
+            .frame(maxWidth: .infinity)
+            .frame(height: TapeSettingsView.stripHeight)
+            .clipShape(shape)
+            .overlay { shape.strokeBorder(NibColor.swatchHairline, lineWidth: NibStroke.hairline) }
+            .accessibilityHidden(true)
     }
 
     @ViewBuilder

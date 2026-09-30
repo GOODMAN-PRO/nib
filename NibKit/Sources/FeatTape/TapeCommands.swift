@@ -14,22 +14,32 @@ extension Notification.Name {
 struct TapeCurrent {
     var color: RGBA
     var width: Double
-    /// The selected slot's pattern (a `TapePatternRef`); nil = plain colour.
+    /// The selected slot's pattern (`PresetSwatch.tapePatternRef(id:)`); nil = plain colour.
     var patternRef: AssetRef?
     var followsDirection: Bool
     var straight: Bool
 
-    var pattern: String? { patternRef.map { TapePatternRef.id(from: $0) } }
+    var pattern: String? { patternRef.map(PresetSwatch.tapePatternID) }
 }
 
 // MARK: - Store
 
-/// Custom patterns (`<library>/.nib-library/tape/<id>.png`, one `TapePatternDescriptor` each) and the pattern
-/// history (`history.<dev>.json`, merged). One per app, shared through `NibServices` under `serviceKey`.
+/// The library side of tape: custom patterns (`<library>/.nib-library/tape/<id>.png`, one `TapePatternDescriptor`
+/// each, registered when the library loads) and the pattern history (`history.<dev>.json`, merged). One per app,
+/// under `serviceKey`. It holds feature state only: pattern lookups go to the `content.tapePatterns` registry the
+/// caller passes (`ctx.content.tapePatterns` in commands, the canvas app's in the tool and popover).
 @MainActor
 final class TapeStore {
     static let serviceKey = "tape.store"
     private static let cacheLimit = 128
+
+    /// The document copy of a pattern tile in one colour.
+    private struct AssetKey: Hashable {
+        var doc: String
+        var ref: String
+        var pattern: String
+        var color: String
+    }
 
     private weak var app: NibApp?
     private let log = Logger(subsystem: "app.nib", category: "tape")
@@ -39,9 +49,11 @@ final class TapeStore {
     private var loadedFolder: URL?
     private var reloadQueued = false
     private var tiles: [String: Data] = [:]
-    private var documentAssets: [String: AssetRef] = [:]
+    private var documentAssets: [AssetKey: AssetRef] = [:]
     /// Keeps the `library.changed` subscription alive (set in `start`).
     var librarySubscription: EventSubscription?
+    /// Keeps the `content.tapePatterns` change observer alive (set in `start`).
+    var registryObserver: NSObjectProtocol?
 
     init(app: NibApp) { self.app = app }
 
@@ -53,8 +65,8 @@ final class TapeStore {
     /// The library's tape folder; nil while no library is configured.
     var folder: URL? { app?.services.library?.metadataURL.appendingPathComponent("tape", isDirectory: true) }
 
-    /// This device's file suffix: the HLC device id, which is `DeviceIdentity.hex` in the app.
-    var device: String { String(format: "%08x", app?.clock.device ?? DeviceIdentity.current) }
+    /// This device's file suffix (`NibApp.deviceHex`).
+    var device: String { app?.deviceHex ?? String(format: "%08x", DeviceIdentity.current) }
 
     // MARK: Loading
 
@@ -73,22 +85,24 @@ final class TapeStore {
         }
     }
 
-    /// Rescans custom patterns (registering and unregistering their descriptors) and re-merges the history files.
+    /// Rescans custom patterns (registering and unregistering their descriptors in the app's `content.tapePatterns`)
+    /// and re-merges the history files.
     /// ponytail: synchronous reads of a handful of small files on main; move to a queue if libraries grow huge folders.
     func reload() {
         loaded = true
         let folder = self.folder
         loadedFolder = folder
         let ids = folder.map { TapeStore.customPatternIDs(in: $0) } ?? []
-        if ids != customIDs, let app {
-            for gone in customIDs where !ids.contains(gone) { app.content.tapePatterns.unregister(id: gone) }
+        if ids != customIDs, let patterns = app?.content.tapePatterns {
+            for gone in customIDs where !ids.contains(gone) { patterns.unregister(id: gone) }
             if let folder {
-                for (i, id) in ids.enumerated() { app.content.tapePatterns.register(customDescriptor(id, order: 1000 + i, folder: folder)) }
+                for (i, id) in ids.enumerated() { patterns.register(TapeStore.customDescriptor(id, order: 1000 + i, folder: folder)) }
             }
         }
         customIDs = ids
         history = folder.map { TapeHistory.load(folder: $0) } ?? []
         tiles.removeAll()
+        documentAssets.removeAll()
         NotificationCenter.default.post(name: .tapeStoreDidChange, object: self)
     }
 
@@ -107,11 +121,14 @@ final class TapeStore {
     }
 
     /// Built off the main actor's isolation: render threads and the presets bar may call `load`.
-    nonisolated private func customDescriptor(_ id: String, order: Int, folder: URL) -> TapePatternDescriptor {
+    nonisolated static func customDescriptor(_ id: String, order: Int, folder: URL) -> TapePatternDescriptor {
         let url = folder.appendingPathComponent(id + ".png")
-        return TapePatternDescriptor(id: id, title: String(localized: "Custom pattern"), order: order,
-                                     owner: TapeCommands.owner) { try Data(contentsOf: url) }
+        return TapePatternDescriptor(id: id, title: customTitle, order: order, owner: TapeCommands.owner) {
+            try Data(contentsOf: url)
+        }
     }
+
+    nonisolated static var customTitle: String { String(localized: "Custom pattern") }
 
     // MARK: Patterns
 
@@ -121,7 +138,7 @@ final class TapeStore {
     }
 
     /// Every pattern for pickers: built-ins, then content packs, then your own images.
-    func descriptors() -> [TapePatternDescriptor] {
+    func descriptors(in patterns: Registry<TapePatternDescriptor>) -> [TapePatternDescriptor] {
         ensureLoaded()
         func rank(_ id: String) -> Int {
             switch source(of: id) {
@@ -130,14 +147,13 @@ final class TapeStore {
             default: return 2
             }
         }
-        let all = app?.content.tapePatterns.all ?? []
-        return all.enumerated()
+        return patterns.all.enumerated()
             .sorted { (rank($0.element.id), $0.offset) < (rank($1.element.id), $1.offset) }
             .map { $0.element }
     }
 
     /// PNG tile of a pattern in `color`: built-ins are recoloured, custom and content-pack tiles are used as they are.
-    func tile(pattern id: String, color: RGBA) -> Data? {
+    func tile(pattern id: String, color: RGBA, in patterns: Registry<TapePatternDescriptor>) -> Data? {
         let key = id + "|" + color.hex
         if let data = tiles[key] { return data }
         let data: Data?
@@ -145,7 +161,7 @@ final class TapeStore {
             data = TapeTile.png(builtin, color: color)
         } else {
             ensureLoaded()
-            data = try? app?.content.tapePatterns.get(id)?.load()
+            data = try? patterns.get(id)?.load()
         }
         if let data {
             if tiles.count >= TapeStore.cacheLimit { tiles.removeAll() }
@@ -156,13 +172,17 @@ final class TapeStore {
 
     /// The asset a strip in `doc` points at for the swatch pattern `ref`: the tile copied into the document
     /// (content-addressed, so every strip with the same look shares one file). nil = plain colour.
-    func documentAsset(for ref: AssetRef, color: RGBA, doc: DocumentID) -> AssetRef? {
+    func documentAsset(for ref: AssetRef, color: RGBA, doc: DocumentID,
+                       in patterns: Registry<TapePatternDescriptor>) -> AssetRef? {
         guard let assets = app?.services.assets else { return nil }
-        let key = doc.raw + "|" + ref.name + "|" + color.hex
+        let id = PresetSwatch.tapePatternID(ref)
+        let key = AssetKey(doc: doc.raw, ref: ref.name, pattern: id, color: color.hex)
         if let known = documentAssets[key] { return known }
         var result: AssetRef?
-        if let data = tile(pattern: TapePatternRef.id(from: ref), color: color) {
-            result = try? assets.put(data, ext: "png", doc: doc)
+        if let data = tile(pattern: id, color: color, in: patterns) {
+            // Content-pack tiles come in at any size: normalise them like custom imports before they reach a document.
+            let tile = source(of: id) == "pack" ? (TapeTile.customTile(from: data) ?? data) : data
+            result = try? assets.put(tile, ext: "png", doc: doc)
         } else if (try? assets.data(ref, doc: doc)) != nil {
             result = ref            // the swatch already points at an asset of this document (plugin or AI)
         }
@@ -171,6 +191,14 @@ final class TapeStore {
             documentAssets[key] = result
         }
         return result
+    }
+
+    /// Drops cached tiles of patterns that changed (re-registered by a content pack, deleted, re-imported).
+    func forget(patterns ids: [String]) {
+        guard !ids.isEmpty else { return }
+        let gone = Set(ids)
+        tiles = tiles.filter { !gone.contains(String($0.key[..<($0.key.lastIndex(of: "|") ?? $0.key.endIndex)])) }
+        documentAssets = documentAssets.filter { !gone.contains($0.key.pattern) }
     }
 
     func current() -> TapeCurrent {
@@ -184,36 +212,41 @@ final class TapeStore {
                            straight: app.settings.get(TapeSettings.straight))
     }
 
-    /// Stores an image as a custom pattern tile and registers it. Returns the pattern id.
-    func importPattern(data: Data, id requested: String?) throws -> String {
-        guard let folder else { throw NibError.unavailable("the library folder") }
+    /// The id a new custom pattern gets: `requested` when it is valid and free, else a fresh one.
+    func newPatternID(_ requested: String?, in patterns: Registry<TapePatternDescriptor>) throws -> String {
+        guard folder != nil else { throw NibError.unavailable("the library folder") }
         ensureLoaded()
         if let requested, !NibID.isValid(requested) {
             throw NibError.invalid("id must be 1–64 of [A-Za-z0-9_-]", path: "$.id")
         }
         let id = requested ?? NibID.make().raw
-        guard !customIDs.contains(id), app?.content.tapePatterns.get(id) == nil else {
+        guard !customIDs.contains(id), patterns.get(id) == nil else {
             throw NibError(.conflict, "a tape pattern with id '\(id)' already exists", path: "$.id",
                            hint: "omit id, or call tape.patterns to see the ids in use")
         }
-        guard let tile = TapeTile.customTile(from: data) else {
-            throw NibError(.invalidParams, "the file is not an image Nib can read", hint: "use a PNG, JPEG, HEIC or GIF")
-        }
+        return id
+    }
+
+    /// Stores a finished tile (`TapeTile.customTile`) as the custom pattern `id` and registers it. Returns the id.
+    func importPattern(tile: Data, id requested: String?, in patterns: Registry<TapePatternDescriptor>) throws -> String {
+        let id = try newPatternID(requested, in: patterns)
+        guard let folder else { throw NibError.unavailable("the library folder") }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try tile.write(to: folder.appendingPathComponent(id + ".png"), options: .atomic)
         customIDs.append(id)
-        app?.content.tapePatterns.register(customDescriptor(id, order: 1000 + customIDs.count, folder: folder))
+        forget(patterns: [id])
+        patterns.register(TapeStore.customDescriptor(id, order: 1000 + customIDs.count, folder: folder))
         NotificationCenter.default.post(name: .tapeStoreDidChange, object: self)
         return id
     }
 
-    func deletePattern(_ id: String) throws {
+    func deletePattern(_ id: String, in patterns: Registry<TapePatternDescriptor>) throws {
         ensureLoaded()
         if TapePattern(id: id) != nil {
             throw NibError.invalid("built-in tape patterns cannot be deleted", path: "$.id")
         }
         guard let folder, customIDs.contains(id) else {
-            if app?.content.tapePatterns.get(id) != nil {
+            if patterns.get(id) != nil {
                 throw NibError(.invalidParams, "'\(id)' comes from a content pack", path: "$.id",
                                hint: "remove the content pack's plugin to remove its patterns")
             }
@@ -222,8 +255,8 @@ final class TapeStore {
         let file = folder.appendingPathComponent(id + ".png")
         if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
         customIDs.removeAll { $0 == id }
-        app?.content.tapePatterns.unregister(id: id)
-        tiles = tiles.filter { !$0.key.hasPrefix(id + "|") }
+        patterns.unregister(id: id)
+        forget(patterns: [id])
         if let clock = app?.clock, history.contains(where: { $0.pattern == id && !$0.deleted }) {
             history = try TapeHistory.save(TapeHistory.cleared(history, pattern: id, clock: clock), folder: folder,
                                            device: device, now: Date().timeIntervalSince1970)
@@ -233,7 +266,10 @@ final class TapeStore {
 
     // MARK: History
 
-    /// Called by the tape tool after a strip is committed. Writes only when the most recent entry changes.
+    /// Called by the tape tool once `ink.addStrokes` committed a strip (`CanvasHost.commitStroke` completion). Writes
+    /// only when the most recent entry changes.
+    /// ponytail: a library-file write outside a command handler (no `tape.recordUse` command in §6.5), so tape the AI
+    /// or a plugin adds with ink.addStrokes does not reach the history.
     func recordUse(pattern: String?, color: RGBA) {
         guard let folder, let clock = app?.clock else { return }
         ensureLoaded()
@@ -438,7 +474,7 @@ struct TapeImportPattern: NibCommand {
     static let example: JSONValue = ["url": "tmp:washi-pattern.png"]
     static let descriptor = CommandDescriptor(
         id: "tape.importPattern", title: String(localized: "Add Tape Pattern"),
-        summary: "Add a custom tape pattern image (url: https or tmp: ref from asset.upload; or asset: an asset name in doc), scaled to a ~100 px tile. Returns {id}.",
+        summary: "Add a custom tape pattern image (url: https or tmp: ref from asset.upload; or asset: an asset name in doc, default the open document), scaled to a ~100 px tile. Returns {id, title}.",
         params: .obj(["asset": .str("tmp:<name> from asset.upload, or the name of an asset in doc"),
                       "url": .str("https URL or tmp:<name> ref of a PNG, JPEG, HEIC or GIF"),
                       "doc": .ref,
@@ -447,22 +483,26 @@ struct TapeImportPattern: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let store = try TapeStore.of(ctx.services)
+        let patterns = ctx.content.tapePatterns
+        _ = try store.newPatternID(p.id, in: patterns)          // a taken or malformed id fails before any work
         let data: Data
         if let url = p.url ?? p.asset.flatMap({ $0.hasPrefix("tmp:") ? $0 : nil }) {
             let file = try await ctx.inputFile(url)
-            data = try Data(contentsOf: file)
+            data = try await Task.detached { try Data(contentsOf: file) }.value
         } else if let asset = p.asset {
-            guard let doc = p.doc.map({ NodeRef.documentID(from: $0) }) ?? ctx.activeSession?.document else {
-                throw NibError.invalid("name the document that holds the asset", path: "$.doc")
-            }
+            let doc = try ctx.documentOrSession(p.doc)
             let assets = try ctx.services.require(ctx.services.assets, "the asset store")
             data = try assets.data(AssetRef(asset), doc: doc)
         } else {
             throw NibError(.invalidParams, "pass url or asset", path: "$.url",
                            hint: "upload the image with asset.upload and pass the returned tmp: ref as url")
         }
-        let id = try store.importPattern(data: data, id: p.id)
-        return Output(id: id, title: String(localized: "Custom pattern"))
+        // Decoding and scaling a large photo takes longer than a frame: off the main actor.
+        guard let tile = await Task.detached(operation: { TapeTile.customTile(from: data) }).value else {
+            throw NibError(.invalidParams, "the file is not an image Nib can read", hint: "use a PNG, JPEG, HEIC or GIF")
+        }
+        let id = try store.importPattern(tile: tile, id: p.id, in: patterns)
+        return Output(id: id, title: TapeStore.customTitle)
     }
 }
 
@@ -506,11 +546,12 @@ struct TapePatternsList: NibCommand {
 
     static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> Output {
         let store = try TapeStore.of(ctx.services)
+        let registry = ctx.content.tapePatterns
         let current = store.current()
         let temporary = ctx.services.assets
-        let patterns = store.descriptors().map { d -> Pattern in
+        let patterns = store.descriptors(in: registry).map { d -> Pattern in
             let source = store.source(of: d.id)
-            let data = source == "builtin" ? store.tile(pattern: d.id, color: current.color) : (try? d.load())
+            let data = source == "builtin" ? store.tile(pattern: d.id, color: current.color, in: registry) : (try? d.load())
             let asset = data.flatMap { try? temporary?.putTemporary($0, ext: "png") }.map { "tmp:" + $0.name }
             return Pattern(id: d.id, source: source, title: d.title, recolorable: source == "builtin", asset: asset)
         }
@@ -534,7 +575,7 @@ struct TapeDeletePattern: NibCommand {
         examples: [example], effect: .session, target: .app, destructive: true)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
-        try TapeStore.of(ctx.services).deletePattern(p.id)
+        try TapeStore.of(ctx.services).deletePattern(p.id, in: ctx.content.tapePatterns)
         return NoResult()
     }
 }
