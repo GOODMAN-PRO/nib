@@ -16,11 +16,14 @@ enum CoreCommands {
         r.register(SettingsSet.self)
         r.register(SettingsList.self)
         r.register(SettingsDescribe.self)
+        r.register(WindowShowLibrary.self)
     }
 }
 
 struct DocParams: Codable {
-    var doc: String
+    /// contracts-v2: optional for the user (key commands, toolbar buttons): nil = the invoking window's document.
+    /// The schema still requires it, so the AI, plugins and the bridge always name the document.
+    var doc: String?
 }
 
 struct EditUndo: NibCommand {
@@ -35,7 +38,7 @@ struct EditUndo: NibCommand {
         examples: [["doc": "doc:FIXTUREDOC01"]], effect: .edit)
 
     static func run(_ p: DocParams, _ ctx: CommandContext) async throws -> Output {
-        let doc = NodeRef.documentID(from: p.doc)
+        let doc = try ctx.documentOrSession(p.doc)
         let label = ctx.bus.history.undoLabel(doc)
         return Output(done: ctx.bus.undo(doc), label: label)
     }
@@ -53,7 +56,7 @@ struct EditRedo: NibCommand {
         examples: [["doc": "doc:FIXTUREDOC01"]], effect: .edit)
 
     static func run(_ p: DocParams, _ ctx: CommandContext) async throws -> Output {
-        let doc = NodeRef.documentID(from: p.doc)
+        let doc = try ctx.documentOrSession(p.doc)
         let label = ctx.bus.history.redoLabel(doc)
         return Output(done: ctx.bus.redo(doc), label: label)
     }
@@ -222,16 +225,52 @@ struct CommandsBatch: NibCommand {
 struct ToolSelect: NibCommand {
     struct Params: Codable {
         var tool: String
+        /// contracts-v2: true = until the tool finishes one use or `EditorSession.endTemporaryTool()`, then back.
+        var temporary: Bool?
     }
     static let descriptor = CommandDescriptor(
         id: CommandIDs.toolSelect, title: "Select Tool",
         summary: "Activate a canvas tool in the current window: pen, pencil, highlighter, eraser, lasso, shape, text, tape, laser, or a plugin tool id.",
-        params: .obj(["tool": .str("tool id")], required: ["tool"]),
-        examples: [["tool": "pen"]], effect: .session, target: .app)
+        params: .obj(["tool": .str("tool id"),
+                      "temporary": .bool("true = return to the current tool after one use")], required: ["tool"]),
+        examples: [["tool": "pen"], ["tool": "lasso", "temporary": true]], effect: .session, target: .app)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
         guard let session = ctx.activeSession else { throw NibError.unavailable("an open editor window") }
-        session.tool = p.tool
+        if p.temporary == true {
+            session.selectTemporarily(p.tool)
+        } else {
+            session.selectTool(p.tool)
+        }
+        return NoResult()
+    }
+}
+
+/// contracts-v2: shows the library in the invoking window (the document chrome's Back button, the tab strip's Library
+/// button, the AI and plugins).
+struct WindowShowLibrary: NibCommand {
+    struct Params: Codable {
+        var folder: String?
+    }
+    static let descriptor = CommandDescriptor(
+        id: CommandIDs.windowShowLibrary, title: "Show Library",
+        summary: "Show the library in the current window, optionally opened at a folder ('folder:F' or a folder id).",
+        params: .obj(["folder": .str("folder ref folder:F or folder id; omit for the library root")]),
+        examples: [[:], ["folder": "folder:FIXTUREFLD01"]], effect: .session, target: .app)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
+        guard let navigator = ctx.navigator else { throw NibError.unavailable("a window") }
+        var folder: FolderID?
+        if let f = p.folder, !f.isEmpty, f != "lib" {
+            if case let .folder(id)? = NodeRef(f) {
+                folder = id
+            } else if NibID.isValid(f) {
+                folder = NibID(f)
+            } else {
+                throw NibError.invalid("'folder' must be a folder ref like folder:F", path: "$.folder")
+            }
+        }
+        navigator.showLibrary(folder: folder)
         return NoResult()
     }
 }
