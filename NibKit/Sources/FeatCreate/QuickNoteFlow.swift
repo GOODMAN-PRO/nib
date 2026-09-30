@@ -230,14 +230,16 @@ enum TitleSuggestion {
     static let pagesToRead = 3
 
     /// `doc.suggestTitle` (the AI, when the AI actions are installed and a provider is configured), else the first
-    /// recognised line of the first pages (`recognize.pageText`: handwriting, typed text, PDF text).
+    /// recognised line of the first pages (`recognize.pageText`: handwriting, typed text, PDF text). Callers check
+    /// `QuickNoteTracker.hasContent` first, so an empty notebook never costs an AI call. The document has usually been
+    /// left, so its head is peeked (`peekContent`), never opened into the workspace.
     static func load(_ doc: DocumentID, runner: CommandRunner, workspace: Workspace) async -> String? {
         if runner.has(CreateIDs.docSuggestTitle),
            let value = try? await runner.run(CreateIDs.docSuggestTitle, ["doc": .string(NodeRef.document(doc).description)]),
            let title = TitleSuggester.parse(value) {
             return title
         }
-        guard runner.has(CommandIDs.recognizePageText), let content = try? workspace.content(doc) else { return nil }
+        guard runner.has(CommandIDs.recognizePageText), let content = try? workspace.peekContent(doc) else { return nil }
         for page in content.livePages.prefix(pagesToRead) {
             if Task.isCancelled { return nil }
             let params: JSONValue = ["page": .string(NodeRef.page(doc, page.id).description)]
@@ -263,11 +265,16 @@ enum LeaveDecision: Equatable {
 }
 
 /// When leaving a document gets the QuickNote prompt or a title suggestion. Pure.
+///
+/// `left`: a window that can be asked now left the document (it showed it, moved on, and is the active window whose
+/// tabs `isShown` sees). Without one, nothing is asked: the document may still be a background tab of another window
+/// (restored tabs, `addTab`), and a prompt there could trash a document that is still open.
 enum QuickNoteExitRule {
-    static func decide(_ pending: PendingCreation?, isShown: Bool, node: LibraryNode?, busy: Bool) -> LeaveDecision {
+    static func decide(_ pending: PendingCreation?, isShown: Bool, left: Bool, node: LibraryNode?,
+                       busy: Bool) -> LeaveDecision {
         guard let pending, !busy else { return .none }
         guard let node, node.kind == .document, node.trashedAt == nil else { return .clear }
-        guard !isShown else { return .none }
+        guard !isShown, left else { return .none }
         switch pending.kind {
         case .quickNote:
             return .prompt
