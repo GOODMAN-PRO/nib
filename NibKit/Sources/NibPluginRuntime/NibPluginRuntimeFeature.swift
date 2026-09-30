@@ -28,11 +28,19 @@ struct PluginLimits {
     var startTimeout: TimeInterval = 30
     /// `nib.storage`, per plugin (live keys and values as JSON).
     var storageBytes = 5 * 1_048_576
+    /// `nib.storage` changes wait this long before the file is written (one write for a burst of changes).
+    var storageWriteDelay: TimeInterval = 0.25
+    /// `nib.storage` lists its (synced) folder for other devices' changes at most this often.
+    var storageRefreshInterval: TimeInterval = 1
     /// The entry bundle.
     var bundleBytes = 20 * 1_048_576
     /// Event deliveries: at most one per type (and document) in this interval.
     var coalesceInterval: TimeInterval = 0.1
+    /// Refs one delivery's `changes` carries at most; past it the event says `truncated: true` (re-query instead).
+    var coalescedRefs = 2_000
     var logCapacity = 1_000
+    /// Longest console line kept (longer lines are cut and marked).
+    var logLineBytes = 8_192
     var maxTimers = 1_000
     /// `nib.net.fetch` response bodies.
     var fetchBytes = 20 * 1_048_576
@@ -47,7 +55,17 @@ struct PluginLimits {
 /// outside the hashed plugin folder so writes never invalidate the grant. Like every library store, each device
 /// writes only its own file with the full merged state it knows; readers merge every device's file per key by
 /// revision (`Rev`, far-future revisions distrusted), removals are tombstones (dropped after 30 days), and provider
-/// conflict copies are merged and then deleted. All work runs on `queue`.
+/// conflict copies are merged and then deleted. All work runs on `queue`; the runtime keeps one instance per plugin
+/// (across reloads), so that one queue orders every write.
+///
+/// Files are only ever merged INTO what is already known (last writer wins per key, tombstones included), so a file
+/// that cannot be read right now never makes a key disappear. When this device's own file exists but cannot be read
+/// (a file provider evicted it, an iCloud placeholder is still downloading) writes are refused with `unavailable`
+/// until it can be, since rewriting it from partial state would lose its keys on every device. An own file that
+/// reads but does not decode is moved aside to `storage.<device>.corrupt-<ms>.json` before it is rewritten.
+///
+/// Cost: the folder is listed at most every `refreshInterval`, and changes are written at most every `writeDelay`
+/// (0 = at once); `flush()` writes a pending change now.
 final class PluginStorage {
     struct Entry: Codable, Equatable {
         var rev: Rev
@@ -98,18 +116,32 @@ final class PluginStorage {
     let folder: URL
     let deviceHex: String
     let limitBytes: Int
+    /// How long a change waits before it is written (changes in between share one write); 0 writes at once.
+    let writeDelay: TimeInterval
+    /// The folder is listed at most this often (0 = on every call).
+    let refreshInterval: TimeInterval
     let queue: DispatchQueue
     private let clock: HLCClock
+    // Queue-confined.
     private var merged: [String: Entry] = [:]
     private var sizes: [String: Int] = [:]
+    private var total = 0
     private var signature: [String: String]?
+    private var lastRefresh: DispatchTime?
+    /// Why this device's own file cannot be rewritten right now (nil = it can).
+    private var ownFileProblem: String?
+    private var writePending = false
+    private var writeScheduled = false
 
-    init(pluginID: String, folder: URL, deviceHex: String, clock: HLCClock, limitBytes: Int) {
+    init(pluginID: String, folder: URL, deviceHex: String, clock: HLCClock, limitBytes: Int,
+         writeDelay: TimeInterval = 0, refreshInterval: TimeInterval = 0) {
         self.pluginID = pluginID
         self.folder = folder
         self.deviceHex = deviceHex
         self.clock = clock
         self.limitBytes = limitBytes
+        self.writeDelay = max(0, writeDelay)
+        self.refreshInterval = max(0, refreshInterval)
         self.queue = DispatchQueue(label: "app.nib.plugin.storage." + pluginID)
     }
 
@@ -120,18 +152,41 @@ final class PluginStorage {
 
     var fileURL: URL { folder.appendingPathComponent("storage.\(deviceHex).json") }
 
-    /// "storage.<8 hex>.json" (a device's file) or a provider conflict copy of one ("storage.<8 hex> 2.json").
+    /// "storage.<8 hex>.json" (a device's file) or a provider conflict copy of one ("storage.<8 hex> 2.json"); never
+    /// a file moved aside as corrupt.
     static func isStorageFile(_ name: String) -> Bool {
-        name.range(of: "^storage\\.[0-9a-f]{8}.*\\.json$", options: .regularExpression) != nil
+        name.range(of: "^storage\\.[0-9a-f]{8}.*\\.json$", options: .regularExpression) != nil && !isCorruptCopy(name)
     }
 
     static func isConflictCopy(_ name: String) -> Bool {
         isStorageFile(name) && name.range(of: "^storage\\.[0-9a-f]{8}\\.json$", options: .regularExpression) == nil
     }
 
+    /// "storage.<8 hex>.corrupt-<ms>.json": an own file that did not decode, kept for recovery and never read again.
+    static func isCorruptCopy(_ name: String) -> Bool {
+        name.hasPrefix("storage.") && name.contains(".corrupt-")
+    }
+
+    /// The name of the file an iCloud placeholder (".storage.<8 hex>.json.icloud") stands for, else nil.
+    static func placeholderTarget(_ name: String) -> String? {
+        guard name.hasPrefix("."), name.hasSuffix(".icloud") else { return nil }
+        let target = String(name.dropFirst().dropLast(".icloud".count))
+        return isStorageFile(target) ? target : nil
+    }
+
     /// Runs `body` on the storage queue and hands its result to `done` there.
     func async<T>(_ body: @escaping (PluginStorage) throws -> T, done: @escaping (Result<T, Error>) -> Void) {
         queue.async { done(Result { try body(self) }) }
+    }
+
+    /// Writes a pending change now, on the queue (returns at once).
+    func flush() {
+        queue.async { self.writePendingChange() }
+    }
+
+    /// `flush`, waiting for the write.
+    func flushAndWait() {
+        queue.sync { self.writePendingChange() }
     }
 
     // MARK: Operations (on `queue`)
@@ -146,20 +201,23 @@ final class PluginStorage {
     func set(_ key: String, _ value: JSONValue) throws {
         try PluginStorage.check(key)
         try refresh()
+        try checkWritable()
         let size = key.utf8.count + value.jsonString().utf8.count
-        let total = liveBytes - (sizes[key] ?? 0) + size
-        guard total <= limitBytes else {
-            throw NibError(.invalidParams, "nib.storage holds at most \(limitBytes / 1_048_576) MB per plugin; this write would make it \(total) bytes",
+        let after = total - (sizes[key] ?? 0) + size
+        guard after <= limitBytes else {
+            throw NibError(.invalidParams, "nib.storage holds at most \(limitBytes / 1_048_576) MB per plugin; this write would make it \(after) bytes",
                            path: "$.value", hint: "remove keys the plugin no longer needs")
         }
-        try change { $0.merged[key] = Entry(rev: $0.clock.tick(), value: value); $0.sizes[key] = size }
+        try change { $0.merged[key] = Entry(rev: $0.clock.tick(), value: value); $0.setSize(key, size) }
     }
 
     func remove(_ key: String) throws {
         try PluginStorage.check(key)
         try refresh()
+        // Refused too while the own file is unreadable: the key may well be in it.
+        try checkWritable()
         guard let e = merged[key], !e.deleted else { return }
-        try change { $0.merged[key] = Entry(rev: $0.clock.tick(), value: nil, deleted: true); $0.sizes[key] = nil }
+        try change { $0.merged[key] = Entry(rev: $0.clock.tick(), value: nil, deleted: true); $0.setSize(key, nil) }
     }
 
     func keys() throws -> [String] {
@@ -168,7 +226,7 @@ final class PluginStorage {
     }
 
     /// Bytes counted against the limit: every live key and its JSON value.
-    var liveBytes: Int { sizes.values.reduce(0, +) }
+    var liveBytes: Int { total }
 
     // MARK: Merge and files
 
@@ -186,48 +244,148 @@ final class PluginStorage {
         }
     }
 
-    /// Applies a change to the merged state and writes this device's file; restores the state when writing fails.
-    private func change(_ body: (PluginStorage) -> Void) throws {
-        let saved = (merged, sizes)
-        body(self)
-        do {
-            try write()
-        } catch {
-            (merged, sizes) = saved
-            throw error
+    private func checkWritable() throws {
+        if let problem = ownFileProblem {
+            throw NibError(.unavailable, problem, hint: "try again in a moment; nothing was changed")
         }
     }
 
-    /// Re-reads every device's file when the folder changed since the last read (sync brought a new file).
+    private func setSize(_ key: String, _ size: Int?) {
+        total -= sizes[key] ?? 0
+        sizes[key] = size
+        total += size ?? 0
+    }
+
+    private func recomputeSizes() {
+        sizes = [:]
+        total = 0
+        for (key, e) in merged where !e.deleted { setSize(key, key.utf8.count + (e.value ?? .null).jsonString().utf8.count) }
+    }
+
+    /// Applies a change to the merged state and writes (or schedules writing) this device's file. A write that fails
+    /// at once restores the state.
+    private func change(_ body: (PluginStorage) -> Void) throws {
+        guard writeDelay > 0 else {
+            let saved = (merged, sizes, total)
+            body(self)
+            do {
+                try write()
+            } catch {
+                (merged, sizes, total) = saved
+                throw error
+            }
+            return
+        }
+        body(self)
+        writePending = true
+        scheduleWrite()
+    }
+
+    private func scheduleWrite() {
+        guard !writeScheduled else { return }
+        writeScheduled = true
+        queue.asyncAfter(deadline: .now() + writeDelay) {
+            self.writeScheduled = false
+            self.writePendingChange()
+        }
+    }
+
+    private func writePendingChange() {
+        guard writePending else { return }
+        do {
+            try write()
+        } catch {
+            // Kept pending: the next change or flush tries again.
+            runtimeLog.error("plugin \(self.pluginID, privacy: .public) storage: \(NibError.wrap(error).message, privacy: .public)")
+        }
+    }
+
+    /// Merges every device's file into the known state when the folder changed since the last read (sync brought a
+    /// new file), at most every `refreshInterval`.
     func refresh() throws {
+        let now = DispatchTime.now()
+        if let last = lastRefresh, refreshInterval > 0,
+           Double(now.uptimeNanoseconds &- last.uptimeNanoseconds) / 1_000_000_000 < refreshInterval {
+            return
+        }
+        lastRefresh = now
         let fm = FileManager.default
         let listing = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])) ?? []
         let files = listing.filter { PluginStorage.isStorageFile($0.lastPathComponent) }
-        let current = PluginStorage.signature(of: files)
-        if current == signature { return }
-        let now = UInt64(Date().timeIntervalSince1970 * 1000)
-        var result: [String: Entry] = [:]
+        let placeholders = listing.filter { PluginStorage.placeholderTarget($0.lastPathComponent) != nil }
+        let current = PluginStorage.signature(of: files + placeholders)
+        // While the own file cannot be read, every refresh tries again.
+        if current == signature, ownFileProblem == nil { return }
+        let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+        let ownName = fileURL.lastPathComponent
+        var problem: String?
+        var movedAside = false
+        var conflicts: [URL] = []
+        for url in placeholders {
+            // iCloud lists a file that is not downloaded yet as a hidden ".<name>.icloud" placeholder.
+            guard let target = PluginStorage.placeholderTarget(url.lastPathComponent) else { continue }
+            let real = folder.appendingPathComponent(target)
+            try? fm.startDownloadingUbiquitousItem(at: real)
+            if target == ownName, !fm.fileExists(atPath: real.path) {
+                problem = "the plugin's storage is still downloading"
+            }
+        }
         for url in files {
-            guard let data = try? Data(contentsOf: url), let body = try? JSONDecoder().decode(FileBody.self, from: data) else {
-                runtimeLog.error("skipping unreadable plugin storage file \(url.lastPathComponent, privacy: .public)")
+            let name = url.lastPathComponent
+            let data: Data
+            do {
+                data = try Data(contentsOf: url)
+            } catch {
+                // Evicted by a file provider, dataless while offline, not readable: ask for it, never rewrite without it.
+                try? fm.startDownloadingUbiquitousItem(at: url)
+                runtimeLog.error("plugin storage file \(name, privacy: .public) is not readable yet: \(error.localizedDescription, privacy: .public)")
+                if name == ownName { problem = "the plugin's storage is still downloading" }
                 continue
             }
-            PluginStorage.merge(body.entries, into: &result, now: now)
+            guard let body = try? JSONDecoder().decode(FileBody.self, from: data) else {
+                runtimeLog.error("plugin storage file \(name, privacy: .public) does not decode")
+                if name == ownName {
+                    if moveAside(url) {
+                        movedAside = true
+                    } else {
+                        problem = "the plugin's storage file is damaged and could not be moved aside"
+                    }
+                }
+                continue
+            }
+            for e in body.entries.values { clock.observe(e.rev) }
+            PluginStorage.merge(body.entries, into: &merged, now: nowMs)
+            if PluginStorage.isConflictCopy(name) { conflicts.append(url) }
         }
-        for e in result.values { clock.observe(e.rev) }
-        merged = result
-        sizes = [:]
-        for (key, e) in result where !e.deleted { sizes[key] = key.utf8.count + (e.value ?? .null).jsonString().utf8.count }
-        signature = current
-        let conflicts = files.filter { PluginStorage.isConflictCopy($0.lastPathComponent) }
+        ownFileProblem = problem
+        recomputeSizes()
+        signature = movedAside ? PluginStorage.signature(of: currentFiles()) : current
+        guard problem == nil else { return }
         if !conflicts.isEmpty {
+            // Only copies that were read are deleted, after the merged state is safely written.
             try write()
             for url in conflicts { try? fm.removeItem(at: url) }
             signature = PluginStorage.signature(of: currentFiles())
+        } else if writePending, !writeScheduled {
+            scheduleWrite()
+        }
+    }
+
+    /// Moves an own file that does not decode to "storage.<device>.corrupt-<ms>.json" (kept for recovery).
+    private func moveAside(_ url: URL) -> Bool {
+        let ms = UInt64(Date().timeIntervalSince1970 * 1000)
+        let target = folder.appendingPathComponent("storage.\(deviceHex).corrupt-\(ms).json")
+        do {
+            try FileManager.default.moveItem(at: url, to: target)
+            return true
+        } catch {
+            runtimeLog.error("could not move aside \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
     private func write() throws {
+        try checkWritable()
         let fm = FileManager.default
         let now = UInt64(Date().timeIntervalSince1970 * 1000)
         let cutoff = now > PluginStorage.tombstoneLifetimeMs ? now - PluginStorage.tombstoneLifetimeMs : 0
@@ -240,12 +398,15 @@ final class PluginStorage {
         } catch {
             throw NibError(.internalError, "could not save the plugin's storage: \(error.localizedDescription)")
         }
+        writePending = false
         signature = PluginStorage.signature(of: currentFiles())
     }
 
     private func currentFiles() -> [URL] {
         let listing = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])) ?? []
-        return listing.filter { PluginStorage.isStorageFile($0.lastPathComponent) }
+        return listing.filter {
+            PluginStorage.isStorageFile($0.lastPathComponent) || PluginStorage.placeholderTarget($0.lastPathComponent) != nil
+        }
     }
 
     private static func signature(of files: [URL]) -> [String: String] {
@@ -261,8 +422,9 @@ final class PluginStorage {
 // MARK: - nib.net.fetch
 
 /// `nib.net.fetch`: https only, only to the hosts in the manifest's `network.hosts` (redirects included), no cookies
-/// or cache, bounded time and size.
-final class PluginFetcher: NSObject, URLSessionTaskDelegate {
+/// or cache, bounded time and size. The body is collected as it arrives and the request is cancelled as soon as the
+/// announced length or the bytes received pass `maxBytes`, so the cap bounds memory too. One instance per request.
+final class PluginFetcher: NSObject, URLSessionDataDelegate {
     /// Prepended to the session's protocol classes (tests register a stub `URLProtocol`).
     static var protocolClasses: [AnyClass] = []
     static let methods: Set<String> = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
@@ -270,6 +432,13 @@ final class PluginFetcher: NSObject, URLSessionTaskDelegate {
     let hosts: Set<String>
     let maxBytes: Int
     let timeout: TimeInterval
+
+    // Guarded by `lock` (delegate callbacks arrive on the session's queue).
+    private let lock = NSLock()
+    private var received = Data()
+    private var response: URLResponse?
+    private var tooLarge = false
+    private var continuation: CheckedContinuation<(Data, URLResponse?), Error>?
 
     init(hosts: Set<String>, maxBytes: Int, timeout: TimeInterval) {
         self.hosts = Set(hosts.map { $0.lowercased() })
@@ -305,21 +474,84 @@ final class PluginFetcher: NSObject, URLSessionTaskDelegate {
         let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         let data: Data
-        let response: URLResponse
+        let response: URLResponse?
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await load(request, in: session)
+        } catch let e as NibError {
+            throw e
         } catch let e as URLError where e.code == .timedOut {
             throw NibError(.timeout, "\(url.host ?? "the server") did not answer within \(Int(timeout)) s")
         } catch {
             throw NibError(.unavailable, "the request to \(url.host ?? "the server") failed: \(error.localizedDescription)")
         }
-        guard data.count <= maxBytes else {
-            throw NibError(.invalidParams, "the response is larger than \(maxBytes / 1_048_576) MB")
-        }
         guard let http = response as? HTTPURLResponse else {
             throw NibError(.unavailable, "\(url.host ?? "the server") did not answer over HTTP")
         }
         return PluginFetcher.result(http, data: data)
+    }
+
+    private func load(_ request: URLRequest, in session: URLSession) async throws -> (Data, URLResponse?) {
+        let task = session.dataTask(with: request)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse?), Error>) in
+                lock.lock()
+                self.continuation = continuation
+                lock.unlock()
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private var sizeLimitError: NibError {
+        let limit = maxBytes >= 1_048_576 ? "\(maxBytes / 1_048_576) MB" : "\(maxBytes) bytes"
+        return NibError(.invalidParams, "the response is larger than \(limit)", hint: "request less data (a range, a page, a smaller format)")
+    }
+
+    // MARK: URLSessionDataDelegate
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let announcedTooLarge = response.expectedContentLength > Int64(maxBytes)
+        lock.lock()
+        self.response = response
+        if announcedTooLarge { tooLarge = true }
+        lock.unlock()
+        completionHandler(announcedTooLarge ? .cancel : .allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        var cancel = tooLarge
+        if !tooLarge {
+            if received.count + data.count > maxBytes {
+                tooLarge = true
+                received = Data()
+                cancel = true
+            } else {
+                received.append(data)
+            }
+        }
+        lock.unlock()
+        if cancel { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        let result: Result<(Data, URLResponse?), Error>
+        if tooLarge {
+            result = .failure(sizeLimitError)
+        } else if let error = error {
+            result = .failure(error)
+        } else {
+            result = .success((received, response ?? task.response))
+        }
+        received = Data()
+        lock.unlock()
+        continuation?.resume(with: result)
     }
 
     /// `{status, headers, text, base64?}`: text for textual bodies, base64 (and empty text) for binary ones.

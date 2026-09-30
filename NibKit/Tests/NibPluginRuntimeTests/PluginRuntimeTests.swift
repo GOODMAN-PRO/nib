@@ -56,6 +56,16 @@ final class PluginRuntimeTests: XCTestCase {
         }
     }
 
+    /// A stand-in for a command another feature provides: records every call and answers with `result(params)`.
+    private func fake(_ h: Harness, _ id: String, effect: Effect, target: CommandTarget = .document, recorder: CallRecorder,
+                      result: @escaping (JSONValue) -> JSONValue = { _ in .null }) {
+        h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "Test stand-in.", effect: effect, target: target,
+                                                  owner: "test")) { params, ctx in
+            recorder.calls.append((id, params, ctx.principal))
+            return result(params)
+        }
+    }
+
     /// Maps a plugin command into the registry like the plugin host does.
     private func map(_ s: Setup, _ id: String, effect: Effect = .edit, target: CommandTarget = .document) {
         let plugin = s.plugin
@@ -249,33 +259,48 @@ final class PluginRuntimeTests: XCTestCase {
           readOnly: ctx.readOnly,
           viaCtx: await attempt(() => ctx.execute("test.addText", { text: "x" })),
           viaGlobal: await attempt(() => nib.commands.execute("test.addText", { text: "x" })),
+          panel: await attempt(() => nib.ui.openPanel("dev.test.plugin.panel")),
           read: (await ctx.execute("commands.describe", { id: "test.addText" })).id
         }));
-        """, permissions: ["document:read", "document:write", "app"])
+        """, permissions: ["document:read", "document:write", "app"],
+                                contributes: ["panels": [["id": "dev.test.plugin.panel", "title": "Panel", "entry": "panel.html"]]])
         map(s, "dev.test.plugin.look", effect: .read)
+        let opened = CallRecorder()
+        fake(s.h, CommandIDs.panelOpen, effect: .session, target: .app, recorder: opened)
         let depth = s.h.undoDepth(Fixtures.docID)
         let r = try await run(s, "dev.test.plugin.look")
         XCTAssertEqual(r.value["readOnly"], true)
         XCTAssertEqual(r.value["viaCtx"], "permission_denied", "a command declared read runs read-only")
         XCTAssertEqual(r.value["viaGlobal"], "permission_denied", "calls outside ctx inherit the handler's read-only mode")
+        XCTAssertEqual(r.value["panel"], "permission_denied", "nib.ui.openPanel keeps the handler's read-only mode")
         XCTAssertEqual(r.value["read"], "test.addText")
         XCTAssertEqual(s.h.undoDepth(Fixtures.docID), depth)
 
         // Ask mode (Invocation.readOnly) reaches the handler too.
         let asked = try await run(s, "dev.test.plugin.look", as: .ai("chat"), readOnly: true)
         XCTAssertEqual(asked.value["viaCtx"], "permission_denied")
+        XCTAssertEqual(asked.value["panel"], "permission_denied")
+        XCTAssertTrue(opened.calls.isEmpty, "no panel opened in read-only mode")
     }
 
     func testDryRunsReachNestedCalls() async throws {
         let s = try await start("""
-        nib.commands.register("dev.test.plugin.stamp", (p, ctx) => ctx.execute("test.addText", { text: "dry" }));
-        """)
+        nib.commands.register("dev.test.plugin.stamp", async (p, ctx) => {
+          await nib.ui.openPanel("dev.test.plugin.panel");
+          return ctx.execute("test.addText", { text: "dry" });
+        });
+        """, contributes: ["panels": [["id": "dev.test.plugin.panel", "title": "Panel", "entry": "panel.html"]]])
         map(s, "dev.test.plugin.stamp")
+        let opened = CallRecorder()
+        fake(s.h, CommandIDs.panelOpen, effect: .session, target: .app, recorder: opened)
         let before = try s.h.snapshot()
         let r = try await run(s, "dev.test.plugin.stamp", dryRun: true)
         XCTAssertNotNil(r.value["ref"])
         XCTAssertEqual(try s.h.snapshot(), before, "a dry run rolls the plugin's writes back")
         XCTAssertEqual(s.h.undoDepth(Fixtures.docID), 0)
+        XCTAssertTrue(opened.calls.isEmpty, "a dry run opens no panel")
+        // InvocationResult.changes stays empty for handlers invoked as another principal until CommandContext can
+        // record nested changes (contract request; see the F077 summary).
     }
 
     func testRecursionThroughTheGlobalExecuteHitsTheNestingLimit() async throws {
@@ -435,7 +460,12 @@ final class PluginRuntimeTests: XCTestCase {
         XCTAssertEqual(r.value["full"], "invalid_params")
 
         let file = s.h.library.metadataURL.appendingPathComponent("plugin-data/\(Self.pluginID)/storage.\(s.h.app.deviceHex).json")
+        for _ in 0..<40 where !FileManager.default.fileExists(atPath: file.path) { await sleep(0.05) }   // writes are debounced
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), file.path)
+        s.runtime.storage(for: Self.pluginID)?.flushAndWait()
+        let written = try JSONDecoder().decode(PluginStorage.FileBody.self, from: Data(contentsOf: file))
+        XCTAssertEqual(written.entries["a"]?.value, ["n": 1])
+        XCTAssertEqual(written.entries["b"]?.deleted, true)
         XCTAssertFalse(file.path.hasPrefix(s.plugin.folder.path), "storage lives outside the hashed plugin folder")
     }
 
@@ -467,16 +497,21 @@ final class PluginRuntimeTests: XCTestCase {
           const pick = await nib.ui.choose("Pick", ["a", "b", "c"]);
           let panel = null;
           try { await nib.ui.openPanel("dev.other.panel"); } catch (e) { panel = e.code; }
+          await nib.ui.openPanel("dev.test.plugin.panel");
           return { ok, name, pick, panel };
         });
         """, contributes: ["panels": [["id": "dev.test.plugin.panel", "title": "Panel", "entry": "panel.html"]]],
                                 configure: { $0.ui = ui })
-        map(s, "dev.test.plugin.ask", effect: .read)
+        map(s, "dev.test.plugin.ask", effect: .session, target: .app)
+        let opened = CallRecorder()
+        fake(s.h, CommandIDs.panelOpen, effect: .session, target: .app, recorder: opened)
         let r = try await run(s, "dev.test.plugin.ask")
         XCTAssertEqual(r.value["ok"], true)
         XCTAssertEqual(r.value["name"], "typed initial")
         XCTAssertEqual(r.value["pick"], 2)
         XCTAssertEqual(r.value["panel"], "not_found", "only the plugin's own panels")
+        XCTAssertEqual(opened.calls.map(\.params), [["id": "dev.test.plugin.panel"]], "exactly the plugin's own panel")
+        XCTAssertEqual(opened.calls.first?.principal, .user)
         XCTAssertEqual(ui.toasts, ["Stamped"])
         XCTAssertEqual(ui.titles, ["Delete?", "Name", "Pick"])
     }
@@ -541,9 +576,11 @@ final class PluginRuntimeTests: XCTestCase {
           const r = await nib.net.fetch("https://api.example.com/v1/items?x=1", { method: "POST", headers: { "X-Test": "1" }, body: "{}" });
           return { status: r.status, body: JSON.parse(r.text), type: r.headers["content-type"],
                    other: await code(() => nib.net.fetch("https://other.example.com/")),
-                   plain: await code(() => nib.net.fetch("http://api.example.com/")) };
+                   plain: await code(() => nib.net.fetch("http://api.example.com/")),
+                   streamed: await code(() => nib.net.fetch("https://api.example.com/big")),
+                   announced: await code(() => nib.net.fetch("https://api.example.com/announced")) };
         });
-        """, permissions: ["network"], hosts: ["api.example.com"])
+        """, permissions: ["network"], hosts: ["api.example.com"], configure: { $0.limits.fetchBytes = 1_000 })
         map(s, "dev.test.plugin.net", effect: .read)
         let r = try await run(s, "dev.test.plugin.net")
         XCTAssertEqual(r.value["status"], 200)
@@ -552,6 +589,8 @@ final class PluginRuntimeTests: XCTestCase {
         XCTAssertEqual(r.value["type"], "application/json")
         XCTAssertEqual(r.value["other"], "permission_denied")
         XCTAssertEqual(r.value["plain"], "permission_denied")
+        XCTAssertEqual(r.value["streamed"], "invalid_params", "a body past the cap is cut off while it arrives")
+        XCTAssertEqual(r.value["announced"], "invalid_params", "an announced length past the cap is refused up front")
     }
 
     func testNetFetchNeedsTheNetworkPermission() async throws {
@@ -563,6 +602,128 @@ final class PluginRuntimeTests: XCTestCase {
         map(s, "dev.test.plugin.net", effect: .read)
         let denied = try await run(s, "dev.test.plugin.net").value
         XCTAssertEqual(denied, "permission_denied")
+    }
+
+    // MARK: Undo groups and confirmation
+
+    func testNamedGroupsCannotJoinAnotherPrincipalsUndoStep() async throws {
+        let s = try await start("""
+        nib.commands.register("dev.test.plugin.join", async (p, ctx) => {
+          await nib.commands.execute("test.addText", { text: "joined" }, { group: p.group });
+          await nib.commands.execute("test.addText", { text: "mine 1" }, { group: "mine" });
+          await nib.commands.execute("test.addText", { text: "mine 2" }, { group: "mine" });
+          await nib.commands.execute("test.addText", { text: "same step" }, { group: ctx.group });
+          return ctx.group;
+        });
+        """)
+        map(s, "dev.test.plugin.join")
+        let presenter = ScriptedPresenter { $0.principal.kind == "ai" ? .allowRestOfGroup : .allow }
+        s.h.app.gateway.presenter = presenter
+        s.h.app.gateway.setPolicy(forPrincipalKind: "ai") { _ in .always }
+        s.h.app.gateway.setPolicy(forPrincipalKind: "plugin") { _ in .always }
+        let turn = "AITURN000001"
+        for text in ["ai 1", "ai 2"] {
+            _ = try await s.h.app.bus.execute(Invocation(command: "test.addText", params: ["text": .string(text)],
+                                                         principal: .ai("chat"), session: s.h.session, group: turn))
+        }
+        XCTAssertEqual(presenter.requests.count, 1, "precondition: the user allowed the rest of the AI's group")
+
+        // A plugin that learned the AI's group (ai.turn.finished carries it) names it.
+        let r = try await run(s, "dev.test.plugin.join", ["group": .string(turn)])
+        let asked = presenter.requests.filter { $0.principal == .plugin(Self.pluginID) }.compactMap { $0.params["text"]?.stringValue }
+        XCTAssertEqual(asked, ["joined", "mine 1", "mine 2", "same step"], "every plugin write still asks, in the AI's group too")
+
+        let history = s.h.app.bus.history.entries(Fixtures.docID)
+        XCTAssertEqual(history.first { $0.group == turn }?.mutations.count, 2, "the plugin's write is not part of the AI's undo step")
+        XCTAssertNotNil(history.first { $0.group == "plugin.\(Self.pluginID):\(turn)" })
+        XCTAssertEqual(history.first { $0.group == "plugin.\(Self.pluginID):mine" }?.mutations.count, 2,
+                       "the plugin's own named group is still one undo step")
+        XCTAssertEqual(r.value.stringValue, r.group)
+        XCTAssertEqual(history.last?.group, r.group, "a group the plugin was handed (ctx.group) is joined as it is")
+        XCTAssertEqual(s.plugin.pluginGroup(r.group), r.group)
+    }
+
+    func testTheCallersStricterPolicyReachesCtxExecute() async throws {
+        let s = try await start("""
+        nib.commands.register("dev.test.plugin.stamp", (p, ctx) => ctx.execute("test.addText", { text: "via" }));
+        """)
+        map(s, "dev.test.plugin.stamp")
+        let presenter = ScriptedPresenter { _ in .allow }
+        s.h.app.gateway.setPresenter(presenter, forPrincipalKind: "plugin")
+        s.h.app.gateway.setPolicy(forPrincipalKind: "ai") { _ in .always }
+
+        _ = try await run(s, "dev.test.plugin.stamp")
+        XCTAssertTrue(presenter.requests.isEmpty, "the plugin's own policy (destructive) does not ask for an edit")
+
+        let r = try await run(s, "dev.test.plugin.stamp", as: .ai("chat"))
+        XCTAssertNotNil(r.value["ref"])
+        XCTAssertEqual(presenter.requests.map { $0.command.id }, ["test.addText"], "the AI's 'always' reaches the handler's ctx.execute")
+        XCTAssertEqual(presenter.requests.first?.principal, .plugin(Self.pluginID))
+
+        presenter.decide = { _ in .deny }
+        do {
+            _ = try await run(s, "dev.test.plugin.stamp", as: .ai("chat"))
+            XCTFail("the user declined")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .userDenied)
+        }
+        XCTAssertEqual(presenter.requests.count, 2)
+    }
+
+    // MARK: Prelude sugar
+
+    func testPreludeSugarMapsOntoCommandParams() async throws {
+        let s = try await start("""
+        nib.commands.register("dev.test.plugin.sugar", async () => {
+          const page = "page:FIXTUREDOC01/FIXTUREPG001";
+          const first = await nib.canvas.decorate(page, { kind: "badge", text: "3" });
+          const second = await nib.canvas.decorate(page, { kind: "ring" }, { id: "mine", ttl: 60 });
+          await nib.canvas.clear();
+          return {
+            first, second,
+            got: await nib.query.get("item:FIXTUREDOC01/FIXTUREPG001/X", { depth: 2 }),
+            hits: await nib.query.search("hello", "doc:FIXTUREDOC01"),
+            asset: await nib.assets.put("FIXTUREDOC01", { text: "hé" }, "txt"),
+            tmp: await nib.assets.upload({ base64: "AAAA" }, "png"),
+            url: await nib.assets.url("FIXTUREDOC01", "a.png")
+          };
+        });
+        """, permissions: ["document:read", "document:write", "app"])
+        map(s, "dev.test.plugin.sugar", effect: .session, target: .app)
+        let calls = CallRecorder()
+        fake(s.h, "canvas.decorate", effect: .session, recorder: calls) { ["id": $0["id"] ?? .null] }
+        fake(s.h, "canvas.clearDecorations", effect: .session, recorder: calls)
+        fake(s.h, "query.get", effect: .read, recorder: calls) { _ in ["kind": "item"] }
+        fake(s.h, "search.text", effect: .read, recorder: calls) { _ in ["results": [1, 2]] }
+        fake(s.h, "asset.put", effect: .edit, recorder: calls) { _ in ["asset": "a1.txt"] }
+        fake(s.h, "asset.upload", effect: .session, target: .app, recorder: calls) { _ in ["url": "tmp:u1.png"] }
+        fake(s.h, "asset.get", effect: .read, recorder: calls) { _ in ["url": "https://x.example/a.png"] }
+        let r = try await run(s, "dev.test.plugin.sugar")
+
+        let decorate = calls.params("canvas.decorate")
+        XCTAssertEqual(decorate.first, ["page": "page:FIXTUREDOC01/FIXTUREPG001", "id": "dev.test.plugin.decoration.1",
+                                        "display": ["kind": "badge", "text": "3"], "ttl": 5], "ttl defaults to 5 s")
+        XCTAssertEqual(decorate.last?["id"], "mine")
+        XCTAssertEqual(decorate.last?["ttl"], 60)
+        XCTAssertEqual(r.value["first"], "dev.test.plugin.decoration.1", "decorate resolves to the decoration's id")
+        XCTAssertEqual(r.value["second"], "mine")
+        let cleared = calls.params("canvas.clearDecorations")
+        XCTAssertEqual(cleared.compactMap { $0["id"]?.stringValue }.sorted(), ["dev.test.plugin.decoration.1", "mine"],
+                       "clear() removes only the plugin's own decorations")
+        XCTAssertEqual(cleared.count, 2, "never canvas.clearDecorations {} (everyone's)")
+        XCTAssertTrue(calls.calls.allSatisfy { $0.principal == .plugin(Self.pluginID) })
+
+        XCTAssertEqual(calls.params("query.get"), [["ref": "item:FIXTUREDOC01/FIXTUREPG001/X", "depth": 2]])
+        XCTAssertEqual(r.value["got"], ["kind": "item"])
+        XCTAssertEqual(calls.params("search.text"), [["query": "hello", "scope": "doc:FIXTUREDOC01"]])
+        XCTAssertEqual(r.value["hits"], [1, 2])
+        XCTAssertEqual(calls.params("asset.put"),
+                       [["doc": "FIXTUREDOC01", "ext": "txt", "base64": .string(Data("hé".utf8).base64EncodedString())]])
+        XCTAssertEqual(r.value["asset"], "a1.txt")
+        XCTAssertEqual(calls.params("asset.upload"), [["base64": "AAAA", "ext": "png"]])
+        XCTAssertEqual(r.value["tmp"], "tmp:u1.png")
+        XCTAssertEqual(calls.params("asset.get"), [["doc": "FIXTUREDOC01", "asset": "a.png"]])
+        XCTAssertEqual(r.value["url"], "https://x.example/a.png")
     }
 
     // MARK: Lifecycle
@@ -651,12 +812,49 @@ final class FakePluginUI: PluginUIPresenting {
     }
 }
 
-/// Answers every request to api.example.com with JSON describing the request.
+/// Records the calls stand-in commands receive.
+@MainActor
+final class CallRecorder {
+    var calls: [(command: String, params: JSONValue, principal: Principal)] = []
+
+    func params(_ command: String) -> [JSONValue] {
+        calls.filter { $0.command == command }.map(\.params)
+    }
+}
+
+/// A confirmation presenter that records every request and answers with `decide`.
+@MainActor
+final class ScriptedPresenter: ConfirmationPresenter {
+    var decide: (ConfirmationRequest) -> ConfirmationDecision
+    private(set) var requests: [ConfirmationRequest] = []
+
+    init(_ decide: @escaping (ConfirmationRequest) -> ConfirmationDecision) {
+        self.decide = decide
+    }
+
+    func confirm(_ request: ConfirmationRequest) async -> ConfirmationDecision {
+        requests.append(request)
+        return decide(request)
+    }
+}
+
+/// Answers every request to api.example.com with JSON describing the request; "/big" streams 5,000 bytes without a
+/// length and "/announced" announces 5,000 bytes.
 final class StubHTTP: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "api.example.com" }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        let path = request.url?.path ?? ""
+        if path == "/big" || path == "/announced" {
+            var headers = ["Content-Type": "text/plain"]
+            if path == "/announced" { headers["Content-Length"] = "5000" }
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            for _ in 0..<10 { client?.urlProtocol(self, didLoad: Data(repeating: 0x61, count: 500)) }
+            client?.urlProtocolDidFinishLoading(self)
+            return
+        }
         let body = ["method": request.httpMethod ?? "", "header": request.value(forHTTPHeaderField: "X-Test") ?? ""]
         let data = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",

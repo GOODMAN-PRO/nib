@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import os
 import NibContracts
 
@@ -14,9 +15,45 @@ final class PluginRuntime: PluginRuntimeProviding {
     /// Safe Mode check (tests replace it instead of touching the launch counter).
     var isSafeMode: () -> Bool = { SafeMode.isActive }
     private(set) var running: [String: PluginInstance] = [:]
+    /// One `nib.storage` per plugin, kept across reloads so a single queue orders all of its writes.
+    private var storages: [String: PluginStorage] = [:]
+    nonisolated(unsafe) private var backgroundObserver: NSObjectProtocol?
 
     init(app: NibApp) {
         self.app = app
+        // Debounced storage writes reach the disk before the app can be suspended.
+        backgroundObserver = NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                                                    object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.flushStorage() }
+        }
+    }
+
+    deinit {
+        if let observer = backgroundObserver { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    /// The plugin's `nib.storage` (nil without a library folder): the same instance for every start of the plugin
+    /// while the library and the limits stay the same.
+    func storage(for pluginID: String) -> PluginStorage? {
+        guard let app = app, let metadata = app.services.library?.metadataURL else { return nil }
+        let folder = PluginStorage.folder(metadata: metadata, pluginID: pluginID)
+        if let existing = storages[pluginID], existing.folder == folder, existing.limitBytes == limits.storageBytes,
+           existing.writeDelay == max(0, limits.storageWriteDelay),
+           existing.refreshInterval == max(0, limits.storageRefreshInterval) {
+            return existing
+        }
+        // A different library (or limits): the old instance writes what it still holds before the new one reads.
+        storages[pluginID]?.flushAndWait()
+        let storage = PluginStorage(pluginID: pluginID, folder: folder, deviceHex: app.deviceHex, clock: app.clock,
+                                    limitBytes: limits.storageBytes, writeDelay: limits.storageWriteDelay,
+                                    refreshInterval: limits.storageRefreshInterval)
+        storages[pluginID] = storage
+        return storage
+    }
+
+    /// Writes every plugin's pending storage changes now.
+    func flushStorage() {
+        for storage in storages.values { storage.flush() }
     }
 
     func start(_ manifest: PluginManifest, folder: URL) async throws -> PluginRuntimeHandle {
@@ -34,7 +71,8 @@ final class PluginRuntime: PluginRuntimeProviding {
         let entry = try PluginRuntime.entryURL(manifest, folder: folder)
         let prelude = try PluginRuntime.preludeSource()
         running[manifest.id]?.stop()
-        let instance = PluginInstance(runtime: self, app: app, manifest: manifest, folder: folder, limits: limits)
+        let instance = PluginInstance(runtime: self, app: app, manifest: manifest, folder: folder, limits: limits,
+                                      storage: storage(for: manifest.id))
         running[manifest.id] = instance
         do {
             try await instance.boot(prelude: prelude, entry: entry)
@@ -111,9 +149,11 @@ final class PluginRuntime: PluginRuntimeProviding {
 
 /// The console ring buffer behind `PluginRuntimeHandle.logs`.
 final class LogRing {
+    static let truncationMark = "… (truncated)"
     private let lock = NSLock()
     private var buffer: [String] = []
     private let capacity: Int
+    private let maxLineBytes: Int
     private static let clock: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -121,11 +161,13 @@ final class LogRing {
         return f
     }()
 
-    init(capacity: Int) {
+    init(capacity: Int, maxLineBytes: Int = 8_192) {
         self.capacity = max(1, capacity)
+        self.maxLineBytes = max(64, maxLineBytes)
     }
 
     func append(_ level: String, _ text: String) {
+        let text = LogRing.truncate(text, maxBytes: maxLineBytes)
         let stamp: String
         lock.lock()
         stamp = LogRing.clock.string(from: Date())
@@ -138,6 +180,15 @@ final class LogRing {
         lock.lock()
         defer { lock.unlock() }
         return buffer
+    }
+
+    /// `text` cut to at most `maxBytes` of UTF-8 and marked, so one `console.log(hugeObject)` cannot hold megabytes.
+    static func truncate(_ text: String, maxBytes: Int) -> String {
+        guard text.utf8.count > maxBytes else { return text }
+        var cut = text.utf8.prefix(maxBytes).endIndex
+        // Back up to a character boundary.
+        while cut > text.startIndex, String.Index(cut, within: text) == nil { cut = text.utf8.index(before: cut) }
+        return String(text[..<cut]) + truncationMark
     }
 }
 
@@ -253,25 +304,28 @@ final class PluginInstance: PluginRuntimeHandle {
     private var recentSeqs: [UInt64] = []
     private var recentSeqSet = Set<UInt64>()
     private var windowEnds: [CoalesceKey: Date] = [:]
-    private var pendingEvents: [CoalesceKey: (event: NibEvent, changes: ChangeSummary?)] = [:]
+    private var pendingEvents: [CoalesceKey: PendingDelivery] = [:]
     private var flushTask: Task<Void, Never>?
     private var dialogs = 0
+    /// Undo groups this plugin was handed: the groups of its entries (a handler's `ctx.group`) and the groups its own
+    /// calls returned (`nib.ai.complete`, `nib.commands.execute`). `nib.commands.execute {group}` joins these as they
+    /// are; any other group is namespaced to the plugin (`pluginGroup`), so a plugin can never write into another
+    /// principal's undo step, nor into a group the user allowed "for the rest of the group" there.
+    private var knownGroups: [String] = []
+    private var knownGroupSet = Set<String>()
+    static let knownGroupCapacity = 256
 
-    init(runtime: PluginRuntime, app: NibApp, manifest: PluginManifest, folder: URL, limits: PluginLimits) {
+    init(runtime: PluginRuntime, app: NibApp, manifest: PluginManifest, folder: URL, limits: PluginLimits,
+         storage: PluginStorage?) {
         self.runtime = runtime
         self.app = app
         self.manifest = manifest
         self.folder = folder
         self.limits = limits
         self.principal = .plugin(manifest.id)
-        self.logRing = LogRing(capacity: limits.logCapacity)
+        self.logRing = LogRing(capacity: limits.logCapacity, maxLineBytes: limits.logLineBytes)
         self.bridge = JSBridge(pluginID: manifest.id, maxTimers: limits.maxTimers, defaultLimit: limits.callTimeout)
-        if let metadata = app.services.library?.metadataURL {
-            storage = PluginStorage(pluginID: manifest.id, folder: PluginStorage.folder(metadata: metadata, pluginID: manifest.id),
-                                    deviceHex: app.deviceHex, clock: app.clock, limitBytes: limits.storageBytes)
-        } else {
-            storage = nil
-        }
+        self.storage = storage
     }
 
     // MARK: PluginRuntimeHandle
@@ -334,6 +388,7 @@ final class PluginInstance: PluginRuntimeHandle {
         if !wasUnresponsive {
             shutDown(NibError(.unavailable, "plugin \(manifest.id) was stopped", hint: "enable or reload the plugin"))
         }
+        storage?.flush()
         runtime?.didStop(self)
     }
 
@@ -447,6 +502,7 @@ final class PluginInstance: PluginRuntimeHandle {
 
     private func begin(_ entry: Entry) {
         entries[entry.token] = entry
+        remember(group: entry.group)
         updateBusyLimit()
         entry.timer = Task { @MainActor [weak self, weak entry] in
             while !Task.isCancelled {
@@ -576,26 +632,37 @@ final class PluginInstance: PluginRuntimeHandle {
 
     // MARK: Events
 
+    /// Events of one type (and document) that arrived inside a coalescing window: the latest event and the union of
+    /// their changes. A class, so adding to it never copies what it already collected.
+    private final class PendingDelivery {
+        var event: NibEvent
+        var changes: CoalescedChanges
+
+        init(_ event: NibEvent, limit: Int) {
+            self.event = event
+            self.changes = CoalescedChanges(limit: limit)
+        }
+    }
+
     private func enqueue(_ event: NibEvent, key: CoalesceKey) {
         let now = Date()
         if let end = windowEnds[key], end > now {
-            if var pending = pendingEvents[key] {
-                if var merged = pending.changes {
-                    if let more = event.changes { merged.merge(more) }
-                    pending.changes = merged
-                } else {
-                    pending.changes = event.changes
-                }
+            let pending: PendingDelivery
+            if let existing = pendingEvents[key] {
+                pending = existing
                 pending.event = event
-                pendingEvents[key] = pending
             } else {
-                pendingEvents[key] = (event, event.changes)
+                pending = PendingDelivery(event, limit: limits.coalescedRefs)
+                pendingEvents[key] = pending
             }
+            pending.changes.add(event.changes)
             scheduleFlush()
             return
         }
         windowEnds[key] = now.addingTimeInterval(limits.coalesceInterval)
-        dispatch(event, changes: event.changes)
+        var changes = CoalescedChanges(limit: limits.coalescedRefs)
+        changes.add(event.changes)
+        dispatch(event, changes: changes)
     }
 
     private func scheduleFlush() {
@@ -622,11 +689,14 @@ final class PluginInstance: PluginRuntimeHandle {
         if !pendingEvents.isEmpty { scheduleFlush() }
     }
 
-    private func dispatch(_ event: NibEvent, changes: ChangeSummary?) {
-        guard var json = try? JSONValue.from(event), case .object(var fields) = json else { return }
-        if let changes = changes, let c = try? JSONValue.from(changes) { fields["changes"] = c }
-        json = .object(fields)
-        dispatchEvent(json, type: event.type)
+    /// The event as JavaScript sees it, with the (coalesced, capped) changes in place of the event's own.
+    private func dispatch(_ event: NibEvent, changes: CoalescedChanges) {
+        var fields: [String: JSONValue] = ["seq": .number(Double(event.seq)), "type": .string(event.type), "at": .number(event.at)]
+        if let p = event.principal, let v = try? JSONValue.from(p) { fields["principal"] = v }
+        if let d = event.doc, let v = try? JSONValue.from(d) { fields["doc"] = v }
+        if let c = changes.json { fields["changes"] = c }
+        if let payload = event.payload { fields["payload"] = payload }
+        dispatchEvent(.object(fields), type: event.type)
     }
 
     /// One delivery: a fresh ctx (its own undo group), a done callback, the call timeout.
@@ -708,7 +778,7 @@ final class PluginInstance: PluginRuntimeHandle {
             guard g.count <= 64, g.range(of: "^[A-Za-z0-9_:.-]+$", options: .regularExpression) != nil else {
                 throw NibError.invalid("an undo group is 1 to 64 of [A-Za-z0-9_:.-]", path: "$.group")
             }
-            group = g
+            group = pluginGroup(g)
         }
         return try await executeAmbient(command, params, dryRun: dryRun, group: group)
     }
@@ -718,7 +788,21 @@ final class PluginInstance: PluginRuntimeHandle {
         let a = ambient()
         let inv = Invocation(command: command, params: params, principal: principal, group: group,
                              dryRun: dryRun || a.dryRun, depth: a.depth, readOnly: a.readOnly, inheritedPolicy: a.policy)
-        return try await app.bus.execute(inv).value
+        let result = try await app.bus.execute(inv)
+        remember(group: result.group)
+        return result.value
+    }
+
+    /// The undo group a `nib.commands.execute {group}` call runs in: `requested` itself when this plugin was handed
+    /// it, else "plugin.<id>:<requested>" (the same requested name is still one undo step).
+    func pluginGroup(_ requested: String) -> String {
+        knownGroupSet.contains(requested) ? requested : "plugin.\(manifest.id):\(requested)"
+    }
+
+    private func remember(group: String) {
+        guard !group.isEmpty, knownGroupSet.insert(group).inserted else { return }
+        knownGroups.append(group)
+        if knownGroups.count > PluginInstance.knownGroupCapacity { knownGroupSet.remove(knownGroups.removeFirst()) }
     }
 
     // MARK: Settings
@@ -789,13 +873,17 @@ final class PluginInstance: PluginRuntimeHandle {
     }
 
     /// Opens one of the plugin's own panels in the active window. Showing its own UI needs no permission, so this
-    /// runs `panel.open` for exactly that id as the window's user action (never any other panel).
+    /// runs `panel.open` for exactly that id as the window's user action (never any other panel). It keeps the
+    /// modes of the calls in flight: read-only (ask mode, a `read` command) refuses it, and a dry run opens nothing.
     private func openPanel(_ args: JSONValue) async throws -> JSONValue {
         guard let app = app else { throw NibError.unavailable("the app") }
         let id = try ownPanel(args)
+        let a = ambient()
+        let inv = Invocation(command: CommandIDs.panelOpen, params: ["id": .string(id)], principal: .user,
+                             session: app.services.sessions.active, dryRun: a.dryRun, readOnly: a.readOnly)
+        if a.dryRun && !a.readOnly { return .null }
         do {
-            _ = try await app.bus.execute(Invocation(command: CommandIDs.panelOpen, params: ["id": .string(id)],
-                                                     principal: .user, session: app.services.sessions.active))
+            _ = try await app.bus.execute(inv)
         } catch let e as NibError where e.code == .notFound {
             throw NibError(.unavailable, "panels cannot be opened here: \(e.message)")
         }
@@ -852,7 +940,10 @@ final class PluginInstance: PluginRuntimeHandle {
                                 principal: principal, maxSteps: steps, jsonOutput: args["json"]?.boolValue ?? false)
         let response = try await ai.complete(request)
         var out: [String: JSONValue] = ["text": .string(response.text), "changes": try JSONValue.from(response.changes)]
-        if let g = response.group { out["group"] = .string(g) }
+        if let g = response.group {
+            remember(group: g)
+            out["group"] = .string(g)
+        }
         return .object(out)
     }
 
@@ -927,5 +1018,54 @@ final class PluginInstance: PluginRuntimeHandle {
 
     nonisolated static func seconds(_ t: TimeInterval) -> String {
         t >= 10 ? "\(Int(t.rounded())) s" : String(format: "%.1f s", t)
+    }
+}
+
+// MARK: - Coalesced changes
+
+/// The union of the `changes` of the events one delivery stands for, without duplicates, in arrival order. Adding
+/// costs O(new refs); at most `limit` refs are kept, past that `truncated` is set (the plugin re-queries).
+struct CoalescedChanges {
+    let limit: Int
+    private(set) var created: [String] = []
+    private(set) var updated: [String] = []
+    private(set) var removed: [String] = []
+    private(set) var truncated = false
+    /// True once any event carried changes.
+    private(set) var hasChanges = false
+    private var seen = Set<String>()
+
+    init(limit: Int) {
+        self.limit = max(0, limit)
+    }
+
+    var count: Int { seen.count }
+
+    mutating func add(_ changes: ChangeSummary?) {
+        guard let c = changes else { return }
+        hasChanges = true
+        for r in c.created where admit(r) { created.append(r) }
+        for r in c.updated where admit(r) { updated.append(r) }
+        for r in c.removed where admit(r) { removed.append(r) }
+    }
+
+    private mutating func admit(_ ref: String) -> Bool {
+        if seen.contains(ref) { return false }
+        guard seen.count < limit else {
+            truncated = true
+            return false
+        }
+        seen.insert(ref)
+        return true
+    }
+
+    /// `{created, updated, removed, truncated?}` for JavaScript; nil when no event carried changes.
+    var json: JSONValue? {
+        guard hasChanges else { return nil }
+        var out: [String: JSONValue] = ["created": .array(created.map { .string($0) }),
+                                        "updated": .array(updated.map { .string($0) }),
+                                        "removed": .array(removed.map { .string($0) })]
+        if truncated { out["truncated"] = true }
+        return .object(out)
     }
 }

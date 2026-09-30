@@ -91,6 +91,95 @@ final class NibPluginRuntimeTests: XCTestCase {
         XCTAssertThrowsError(try s.set("", 1))
     }
 
+    /// A damaged own file never costs the keys this device already knows: it is moved aside and the next write
+    /// carries every known key.
+    func testStorageKeepsKnownKeysWhenItsOwnFileDoesNotDecode() throws {
+        let folder = storageFolder()
+        defer { try? FileManager.default.removeItem(at: folder.deletingLastPathComponent().deletingLastPathComponent()) }
+        let s = PluginStorage(pluginID: "dev.test.plugin", folder: folder, deviceHex: "0000000a", clock: HLCClock(device: 10),
+                              limitBytes: 1_000_000)
+        try s.set("a", 1)
+        try s.set("b", 2)
+        try Data("this is not JSON at all".utf8).write(to: s.fileURL)
+        try s.set("c", 3)
+
+        let fresh = PluginStorage(pluginID: "dev.test.plugin", folder: folder, deviceHex: "0000000a", clock: HLCClock(device: 10),
+                                  limitBytes: 1_000_000)
+        XCTAssertEqual(try fresh.keys(), ["a", "b", "c"])
+        let names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        XCTAssertTrue(names.contains { PluginStorage.isCorruptCopy($0) }, "the damaged file is kept aside: \(names)")
+        let aside = folder.appendingPathComponent(try XCTUnwrap(names.first { PluginStorage.isCorruptCopy($0) }))
+        XCTAssertEqual(try Data(contentsOf: aside), Data("this is not JSON at all".utf8))
+    }
+
+    /// An own file that exists but cannot be read (evicted by a file provider, not downloaded, no permission) must
+    /// not be rewritten from partial state: writes are refused until it reads again, and nothing is lost.
+    func testStorageRefusesWritesWhileItsOwnFileCannotBeRead() throws {
+        let folder = storageFolder()
+        defer { try? FileManager.default.removeItem(at: folder.deletingLastPathComponent().deletingLastPathComponent()) }
+        let first = PluginStorage(pluginID: "dev.test.plugin", folder: folder, deviceHex: "0000000a", clock: HLCClock(device: 10),
+                                  limitBytes: 1_000_000)
+        try first.set("a", 1)
+        try first.set("b", 2)
+        let path = first.fileURL.path
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path) }
+
+        // A new launch: nothing known yet, and the own file does not read.
+        let s = PluginStorage(pluginID: "dev.test.plugin", folder: folder, deviceHex: "0000000a", clock: HLCClock(device: 10),
+                              limitBytes: 1_000_000)
+        do {
+            try s.set("c", 3)
+            // Readable after all (a process that ignores permissions): then nothing may be lost either.
+            XCTAssertEqual(try s.keys(), ["a", "b", "c"])
+        } catch {
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+            XCTAssertThrowsError(try s.remove("a")) { XCTAssertEqual(($0 as? NibError)?.code, .unavailable) }
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path)
+        try s.set("d", 4)
+        let fresh = PluginStorage(pluginID: "dev.test.plugin", folder: folder, deviceHex: "0000000a", clock: HLCClock(device: 10),
+                                  limitBytes: 1_000_000)
+        let keys = try fresh.keys()
+        XCTAssertTrue(Set(keys).isSuperset(of: ["a", "b", "d"]), "\(keys)")
+    }
+
+    /// An iCloud placeholder for the own file means it is still downloading: writes wait for it. Another device's
+    /// placeholder does not block anything.
+    func testStorageWaitsForItsOwnICloudPlaceholder() throws {
+        let folder = storageFolder()
+        defer { try? FileManager.default.removeItem(at: folder.deletingLastPathComponent().deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data().write(to: folder.appendingPathComponent(".storage.0000000b.json.icloud"))
+        let s = PluginStorage(pluginID: "dev.test.plugin", folder: folder, deviceHex: "0000000a", clock: HLCClock(device: 10),
+                              limitBytes: 1_000_000)
+        try s.set("a", 1)
+        try Data().write(to: folder.appendingPathComponent(".storage.0000000c.json.icloud"))
+        let other = PluginStorage(pluginID: "dev.test.plugin", folder: folder, deviceHex: "0000000c", clock: HLCClock(device: 12),
+                                  limitBytes: 1_000_000)
+        XCTAssertEqual(try other.get("a"), 1, "reads still work")
+        XCTAssertThrowsError(try other.set("b", 2)) { error in
+            XCTAssertEqual((error as? NibError)?.code, .unavailable)
+            XCTAssertTrue((error as? NibError)?.message.contains("downloading") == true)
+        }
+    }
+
+    /// Debounced writes: a burst of changes is written once, `flushAndWait` writes it now, and the throttled refresh
+    /// still merges into what is known.
+    func testStorageDebouncesWrites() throws {
+        let folder = storageFolder()
+        defer { try? FileManager.default.removeItem(at: folder.deletingLastPathComponent().deletingLastPathComponent()) }
+        let s = PluginStorage(pluginID: "dev.test.plugin", folder: folder, deviceHex: "0000000a", clock: HLCClock(device: 10),
+                              limitBytes: 1_000_000, writeDelay: 30, refreshInterval: 30)
+        for i in 0..<50 { try s.queue.sync { try s.set("k\(i)", .number(Double(i))) } }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: s.fileURL.path), "nothing written before the delay")
+        XCTAssertEqual(try s.queue.sync { try s.get("k49") }, 49)
+        s.flushAndWait()
+        let body = try JSONDecoder().decode(PluginStorage.FileBody.self, from: Data(contentsOf: s.fileURL))
+        XCTAssertEqual(body.entries.count, 50)
+        XCTAssertEqual(s.liveBytes, (0..<50).reduce(0) { $0 + "k\($1)".utf8.count + JSONValue.number(Double($1)).jsonString().utf8.count })
+    }
+
     func testStorageFileNames() {
         XCTAssertTrue(PluginStorage.isStorageFile("storage.1a2b3c4d.json"))
         XCTAssertTrue(PluginStorage.isStorageFile("storage.1a2b3c4d (conflicted copy).json"))
@@ -98,6 +187,11 @@ final class NibPluginRuntimeTests: XCTestCase {
         XCTAssertFalse(PluginStorage.isStorageFile("notes.1a2b3c4d.json"))
         XCTAssertTrue(PluginStorage.isConflictCopy("storage.1a2b3c4d 2.json"))
         XCTAssertFalse(PluginStorage.isConflictCopy("storage.1a2b3c4d.json"))
+        XCTAssertTrue(PluginStorage.isCorruptCopy("storage.1a2b3c4d.corrupt-1700000000000.json"))
+        XCTAssertFalse(PluginStorage.isStorageFile("storage.1a2b3c4d.corrupt-1700000000000.json"), "never merged or deleted")
+        XCTAssertEqual(PluginStorage.placeholderTarget(".storage.1a2b3c4d.json.icloud"), "storage.1a2b3c4d.json")
+        XCTAssertNil(PluginStorage.placeholderTarget(".notes.1a2b3c4d.json.icloud"))
+        XCTAssertNil(PluginStorage.placeholderTarget("storage.1a2b3c4d.json"))
         let folder = PluginStorage.folder(metadata: URL(fileURLWithPath: "/lib/meta"), pluginID: "dev.x")
         XCTAssertEqual(folder.path, "/lib/meta/plugin-data/dev.x")
     }
@@ -132,6 +226,44 @@ final class NibPluginRuntimeTests: XCTestCase {
         timers.cancelAll()
         XCTAssertEqual(timers.count, 0)
         XCTAssertFalse(timers.set(id: 4, milliseconds: 5, repeats: false), "cancelled for good")
+    }
+
+    // MARK: Events and logs
+
+    /// Coalescing is linear in the refs added and bounded per delivery (a sync burst must not block the main actor).
+    func testCoalescedChangesStayLinearAndCapped() {
+        let events = (0..<5_000).map { e in ChangeSummary(updated: (0..<10).map { "item:D/P/\(e)-\($0)" }) }
+        let budget: TimeInterval = 0.25
+        let started = Date()
+        var changes = CoalescedChanges(limit: 2_000)
+        for c in events { changes.add(c) }
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertLessThan(elapsed, budget * 4)
+        XCTAssertEqual(changes.count, 2_000)
+        XCTAssertTrue(changes.truncated)
+        XCTAssertEqual(changes.json?["truncated"], true)
+        XCTAssertEqual(changes.json?["updated"]?.arrayValue?.count, 2_000)
+
+        var small = CoalescedChanges(limit: 2_000)
+        small.add(ChangeSummary(created: ["a"], updated: ["b"]))
+        small.add(ChangeSummary(updated: ["b", "c"], removed: ["a"]))
+        small.add(nil)
+        XCTAssertEqual(small.json, ["created": ["a"], "updated": ["b", "c"], "removed": []], "no duplicates, no truncation flag")
+        XCTAssertNil(CoalescedChanges(limit: 10).json, "no changes at all: no changes field")
+    }
+
+    func testConsoleLinesAreCapped() {
+        let ring = LogRing(capacity: 2, maxLineBytes: 100)
+        ring.append("log", String(repeating: "x", count: 100_000))
+        ring.append("log", String(repeating: "é", count: 80))     // 160 bytes, cut on a character boundary
+        ring.append("log", "short")
+        XCTAssertEqual(ring.lines.count, 2)
+        let cut = ring.lines[0]
+        XCTAssertTrue(cut.hasSuffix(LogRing.truncationMark), cut)
+        XCTAssertTrue(cut.contains(String(repeating: "é", count: 50)))
+        XCTAssertFalse(cut.contains("\u{FFFD}"))
+        XCTAssertLessThan(LogRing.truncate(String(repeating: "x", count: 100_000), maxBytes: 8_192).utf8.count, 8_300)
+        XCTAssertEqual(LogRing.truncate("short", maxBytes: 8_192), "short")
     }
 
     // MARK: Network allowlist

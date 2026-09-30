@@ -75,10 +75,15 @@
     return { code: "internal", message: format(e) };
   }
 
+  // Console lines are cut here already (the runtime cuts at 8 KB of UTF-8 too), so a huge value is not copied
+  // across the bridge only to be dropped.
+  const MAX_LOG_CHARS = 8192;
   function log(level, args) {
     const parts = [];
     for (let i = 0; i < args.length; i++) parts.push(format(args[i]));
-    nativeLog(level, parts.join(" "));
+    let line = parts.join(" ");
+    if (line.length > MAX_LOG_CHARS) line = line.slice(0, MAX_LOG_CHARS) + "\u2026 (truncated)";
+    nativeLog(level, line);
   }
 
   function logError(where, e) {
