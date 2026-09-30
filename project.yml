@@ -36,6 +36,9 @@ targets:
       path: Nib/Nib.entitlements
       properties:
         com.apple.security.application-groups: [group.app.nib.Nib]
+        # Fonts the user installed from a font provider app (Settings › General › Fonts) show in the text font
+        # pickers and render in text boxes (F026 T-059, P-083).
+        com.apple.developer.user-fonts: [app-usage]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.nib.Nib
