@@ -56,11 +56,33 @@ public final class Gateway {
     public var isLocked: (DocumentID) -> Bool
     public weak var presenter: ConfirmationPresenter?
     private var allowedGroups = Set<String>()
+    private var kindPresenters: [String: WeakPresenter] = [:]
+    private var kindPolicies: [String: (Principal) -> ConfirmationPolicy] = [:]
 
     public init() {
         grants = { p in Gateway.defaultGrants(p) }
         policy = { _ in .destructive }
         isLocked = { _ in false }
+        // Default policy: the principal kind's policy (`setPolicy`), else destructive.
+        policy = { [weak self] p in self?.kindPolicies[p.kind]?(p) ?? .destructive }
+    }
+
+    /// contracts-v2: the confirmation UI for one principal kind ("ai" → the AI chat's sheet F085, "bridge" → the bridge's
+    /// deadline-bound presenter F090), consulted before `presenter`. Kept weakly, like `presenter`. nil removes it.
+    /// No feature needs to wrap or replace another feature's presenter any more.
+    public func setPresenter(_ presenter: ConfirmationPresenter?, forPrincipalKind kind: String) {
+        kindPresenters[kind] = presenter.map { WeakPresenter($0) }
+    }
+
+    /// contracts-v2: the confirmation policy for one principal kind (read from that kind's security setting). The
+    /// default `policy` closure consults these; a feature that replaced `policy` wholesale bypasses them.
+    public func setPolicy(forPrincipalKind kind: String, _ policy: ((Principal) -> ConfirmationPolicy)?) {
+        kindPolicies[kind] = policy
+    }
+
+    /// The presenter that confirms for `principal`: its kind's presenter, else `presenter`.
+    public func confirmationPresenter(for principal: Principal) -> ConfirmationPresenter? {
+        kindPresenters[principal.kind]?.value ?? presenter
     }
 
     public nonisolated static func defaultGrants(_ p: Principal) -> Set<Scope> {
@@ -91,7 +113,7 @@ public final class Gateway {
         }
         guard needsConfirmation(d, principal: principal, inheritedPolicy: inheritedPolicy),
               !allowedGroups.contains(group) else { return }
-        guard let presenter = presenter else {
+        guard let presenter = confirmationPresenter(for: principal) else {
             throw NibError(.userDenied, "'\(d.title)' needs confirmation but no confirmation UI is available")
         }
         switch await presenter.confirm(ConfirmationRequest(principal: principal, command: d, params: params)) {
@@ -134,4 +156,10 @@ public final class Gateway {
         walk(params, key: nil)
         return out
     }
+}
+
+/// Weak box for per-kind presenters.
+private final class WeakPresenter {
+    weak var value: ConfirmationPresenter?
+    init(_ value: ConfirmationPresenter) { self.value = value }
 }

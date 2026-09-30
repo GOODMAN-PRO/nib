@@ -34,6 +34,8 @@ public protocol LibraryService: AnyObject {
     /// Copies an external `.nibnote` package (or a legacy `.nib` package, or a folder of them) into the library.
     func importPackage(at url: URL, into folder: FolderID?) throws -> DocumentID
     /// Rescans the disk (after sync, import, repair).
+    /// Implementations emit `library.changed` (`NibEventType.libraryChanged`) after EVERY catalog change: create,
+    /// rename, move, style, trash, restore, delete, import and refresh (title-based indexes and lists rely on it).
     func refresh()
     /// Switches the library to another folder (security-scoped URL chosen by the user).
     func setRoot(_ url: URL) throws
@@ -100,6 +102,8 @@ public struct RenderRequest {
     /// Draw numbered boxes over items (Set-of-Mark prompting for vision models).
     public var marks: Bool
     public var replay: ReplayState?
+    /// contracts-v2: what the render is for; handed to drawers as `DrawContext.purpose`.
+    public var purpose: DrawPurpose = .screen
 
     public init(doc: DocumentID, page: PageID, region: Rect? = nil, scale: Double = 2, layers: Set<Int>? = nil,
                 background: Bool = true, annotations: Bool = true, hidden: Set<ElementID> = [], marks: Bool = false,
@@ -155,6 +159,8 @@ public struct TextRecognition: Codable, Equatable {
     /// "ink", "typed", "pdf", "scan", "image", "transcript".
     public var source: String
     public var confidence: Double
+    /// contracts-v2: word boxes when the recognizer has them (Vision); nil = line only. `recognize.items` needs them.
+    public var words: [TextRecognitionWord]?
 
     public init(text: String, alternatives: [String] = [], bbox: Rect, itemIDs: [ElementID] = [], source: String, confidence: Double = 1) {
         self.text = text
@@ -164,6 +170,43 @@ public struct TextRecognition: Codable, Equatable {
         self.source = source
         self.confidence = confidence
     }
+
+    /// contracts-v2: lenient (only `text` is required), so feature JSON such as a page's "nib.scanText" ext decodes.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        text = try c.decode(String.self, forKey: .text)
+        alternatives = try c.decodeIfPresent([String].self, forKey: .alternatives) ?? []
+        bbox = try c.decodeIfPresent(Rect.self, forKey: .bbox) ?? .zero
+        itemIDs = try c.decodeIfPresent([ElementID].self, forKey: .itemIDs) ?? []
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "unknown"
+        confidence = try c.decodeIfPresent(Double.self, forKey: .confidence) ?? 1
+        words = try c.decodeIfPresent([TextRecognitionWord].self, forKey: .words)
+    }
+
+    enum CodingKeys: String, CodingKey { case text, alternatives, bbox, itemIDs, source, confidence, words }
+}
+
+/// contracts-v2: one recognised word with its box (page coordinates) and the items it came from.
+public struct TextRecognitionWord: Codable, Equatable {
+    public var text: String
+    public var bbox: Rect
+    public var itemIDs: [ElementID]
+
+    public init(text: String, bbox: Rect, itemIDs: [ElementID] = []) {
+        self.text = text
+        self.bbox = bbox
+        self.itemIDs = itemIDs
+    }
+
+    /// Lenient: `itemIDs` may be omitted (image and PDF words have none).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        text = try c.decode(String.self, forKey: .text)
+        bbox = try c.decodeIfPresent(Rect.self, forKey: .bbox) ?? .zero
+        itemIDs = try c.decodeIfPresent([ElementID].self, forKey: .itemIDs) ?? []
+    }
+
+    enum CodingKeys: String, CodingKey { case text, bbox, itemIDs }
 }
 
 public protocol TextRecognizer: AnyObject {
@@ -208,6 +251,13 @@ public protocol PDFService: AnyObject {
     func outline(_ url: URL) -> [PDFOutlineNode]
     /// Text and line rects of a drag selection between two page points.
     func selection(_ url: URL, page: Int, from: Point, to: Point) -> (text: String, rects: [Rect])
+    /// contracts-v2: the word under a page point (long-press selection in read-only mode); nil = none or unsupported.
+    /// Default: nil.
+    func word(_ url: URL, page: Int, at point: Point) -> (text: String, rect: Rect)?
+}
+
+public extension PDFService {
+    func word(_ url: URL, page: Int, at point: Point) -> (text: String, rect: Rect)? { nil }
 }
 
 // MARK: - Password lock (implemented by the Password Lock feature)
