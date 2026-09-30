@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAbout/DataDeletion.swift:279-285 (DeletionPlanner.documentSubfolders / plan: remove) and :380-388 (DataEraser.erase, plan.remove loop); asserted by NibKit/Tests/FeatAboutTests/FeatAboutTests.swift:367 testEraseWithoutLibraryKeepsLibraryDeviceIDAndPreferences",
+      "problem": "Data loss when the person keeps the library. The library root defaults to the app's Documents folder (LibraryService.rootURL doc, F002). F002's catalog skips only the root `Inbox`, so a root folder named `diagnostics` is an ordinary library folder. It can be one the person made (a 'Diagnostics' course folder, say) or the one F076's Temporary Diagnostic Mode creates, with notebooks later moved in. DeletionPlanner still always puts Documents/Inbox and Documents/diagnostics in `plan.remove`. DataEraser only protects a `remove` entry when the entry is kept or has a kept DESCENDANT. The kept library root is an ANCESTOR, so the whole folder is removed without coordination. Scenario: default library, a `diagnostics` folder holding Lab.nibnote, then Privacy & Data > Delete All Nib Data with 'Also delete my library' off. Both confirmations say 'Your library in On My iPad > Nib stays where it is', yet Lab.nibnote is deleted permanently, with no Trash. With includeLibrary on, non-Nib files in that folder (user PDFs) are deleted too, breaking the documented rule 'only what Nib made goes'.",
+      "fix": "In DeletionPlanner.plan, stop removing a documentSubfolders entry whole when it lies inside `libraryRoot` (AboutPaths.contains(libraryRoot, entry)). Instead: (a) without includeLibrary, delete only what isn't Nib's. Add a DataEraser pass that removes the entry's children except NibOwnership .owned items, legacy packages holding doc.*.json, and directories whose walk finds Nib content. Simpler alternative: delete only `diagnostics/*.zip` and plain files directly in `Inbox`. (b) With includeLibrary, leave the entry to removeNibContent (it is already under a library root) and do not remove it whole. Add a test with libraryRoot == documents and Documents/diagnostics/Lab.nibnote/doc.00000007.json, .nibfolder.00000007.json and notes.pdf. Without the library, Lab.nibnote and the marker must survive. With the library, notes.pdf must survive. Update the existing test so it no longer asserts the whole-folder removal inside the library root."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAbout/DataDeletion.swift:62-67 (DeleteAllDataCommand.descriptor)",
+      "problem": "The command's scopes are {app, destructive} (target .app), but `includeLibrary: true` deletes every document, folder, the trash, plugins and templates in the library. A plugin granted only `app` + `destructive` (for example a cache cleaner), with no `library:write`, can therefore ask for the whole library to be deleted. The gateway and the person still confirm, but the permission model under-declares what the command can touch.",
+      "fix": "Pass `extraScopes: [.libraryWrite]` in the descriptor, and assert `d?.scopes.contains(.libraryWrite)` in testRegistersAboutPanelSettingsPagesAndCommand."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAbout/ParityPage.swift:212,226 (default argument `ParityCatalog.bundled()`); NibKit/Sources/FeatAbout/AboutPage.swift:521-523 (NavigationLink { ParityPage() })",
+      "problem": "The default argument runs eagerly each time `ParityPage()` is built, before StateObject's autoclosure. NavigationLink(destination:) builds its destination on every AboutPage body evaluation. In the About sheet, each keystroke in the name field (published `name`), each copy, each `copied` reset and each library.changed event therefore reads and JSON-decodes the 32 KB parity.json on the main thread, then throws the result away.",
+      "fix": "Cache the bundled catalog once (`static let bundledShared = bundled()`, then `init(catalog: ParityCatalog? = ParityCatalog.bundledShared)`). Or take `@autoclosure @escaping () -> ParityCatalog?` and evaluate it only inside `StateObject(wrappedValue:)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatAboutTests/FeatAboutTests.swift:726-747 (testScreensRenderInEveryVariant)",
+      "problem": "DESIGN.md §15 rule 7 says every new screen adds snapshots in Light, Dark, Reduce Transparency, Increase Contrast and AX3. PrivacyPage and ParityPage (including the missing-catalogue state) render only in the default variant. AboutPage renders only at the iPad settings width (760), with no iPhone-width snapshot.",
+      "fix": "Assert `Set(NibSnapshot.images(..., size: 390x844).keys) == Set(NibSnapshot.Variant.allCases)` for PrivacyPage (with includeLibrary on, to show the warning row) and ParityPage. Add AboutPage at 390 wide as well as 760."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAbout/DataDeletion.swift:746-765 (AlertDeletionPrompter.confirm) and :796-809 (AnswerOnce)",
+      "problem": "An alert can go away without an action, for example when the person closes that iPad window or scene while the confirmation is up. The CheckedContinuation is then never resumed. app.deleteAllData hangs forever and leaks its continuation, PrivacyModel.isDeleting stays true, and an assistant or bridge caller waits until its own timeout.",
+      "fix": "Resume `.notShown` (or `.declined`) through AnswerOnce when the alert disappears without an answer. Use a small UIAlertController subclass whose viewDidDisappear calls a closure, or observe UIScene.didDisconnectNotification for the navigator's scene."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAbout/AboutPage.swift:275-288 (AboutModel.copy)",
+      "problem": "When `clipboard.copyText` is registered but fails, the code falls back to writing UIPasteboard.general directly and clears the notice that `run` just set. The error is hidden, and the gateway's decision is bypassed.",
+      "fix": "Fall back to UIPasteboard only when the command is not registered. When it is registered and fails, keep the notice and do not show the check mark."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAbout/DataDeletion.swift:563-594 (SystemDataWiper.wipeWebData / wipeSystemIndexes)",
+      "problem": "Errors from WKWebsiteDataStore.remove(forIdentifier:), which fails while a plugin panel's web view still uses the store, and from INInteraction.deleteAll are discarded. The 'Nib couldn't delete N items' notice therefore reports fewer failures than there were.",
+      "fix": "Collect those callback errors into the returned failures ('Plugin web data: …', 'Siri donations: …'), as is already done for Spotlight."
+    },
+    {
+      "severity": "minor",
+      "where": "worktree /Users/Nice/Projects/Nib-wt/F098 (untracked: Nib.xcodeproj/, Nib/Info.plist, Nib/Nib.entitlements, NibShare/*, NibWidgets/*)",
+      "problem": "The 'interrupted uncommitted work' is only XcodeGen output generated after commit 982d8a0 (project.pbxproj, Info.plists, entitlements). There is no unfinished F098 source to continue: the committed diff holds the whole feature. None of these files belong to F098, so committing them would violate ownership.",
+      "fix": "Do not commit them. Delete them, or leave them untracked, when fixing the items above."
+    }
+  ]
+}

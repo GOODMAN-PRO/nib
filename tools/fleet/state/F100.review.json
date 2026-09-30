@@ -1,0 +1,29 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPerformance/MemoryPressure.swift:320-336 (pageDidChange), MemoryPolicy.trimDelay doc at :53-56",
+      "problem": "The trim delay starts at the first page change and later changes do not push it back (`guard pendingTrim == nil else { return }`). So during a continuous scroll through a large PDF the trim, and with it `Workspace.evictPages` -> `persistence.flush` (a synchronous write on main in NibStore when edits are pending) plus the footprint relief, fires about 1 s after the scroll starts, while the pages are still moving. MemoryPolicy.trimDelay promises the opposite: 'never lands in the page-turn animation'.",
+      "fix": "Make it a trailing debounce: in pageDidChange, cancel `pendingTrim` and reschedule it on every change, with a max-wait of about 5 s so a trim still happens during very long scrolls. Also skip the trim, and reschedule it, while any session's `inking.isInking` is true."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPerformance/MetricsSubscriber.swift:419-440 (MetricsRecorder.record), :149-163 (MetricRecord.key)",
+      "problem": "When the history already holds `limit` (14) records, a record older than all of them is appended, sorted, cut off again by `suffix(limit)`, and still logged with a true result. At every launch `start()` feeds `pastPayloads` / `pastDiagnosticPayloads` back through `record`, so such old payloads are logged again each launch as if new (diagnostics lines at error level, not marked '(earlier)'), and the history file is rewritten each time. Separately, the diagnostics key leaves out `launchSeconds.count` and `diskWriteExceptionMB.count`, so two different payloads that share begin/end and have the same hang, crash and CPU counts collide, and the second one is dropped.",
+      "fix": "In record(_:), when `list.count >= history.limit` and `record.end < list.first!.end`, return false without logging or saving. Better: persist a bounded set of seen keys (for example the last 64) next to the records, and check against it. Add `launchSeconds.count` and `diskWriteExceptionMB.count` (or a digest of all the arrays) to the `.diagnostics` key. Add a test: fill a limit-3 history with newer records, record an older one twice, and assert it is logged at most once."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPerformance/MemoryPressure.swift:246-266 (relieve) and :290-307 (trimWorkingSet)",
+      "problem": "Evicting a document that persistence refuses to write (`app.isReadOnly(doc)`: newer format, unreadable files, the store read-only set) throws away its in-memory-only commits. The contract says such commits 'still apply in memory, but nothing is persisted', and CommandContext.mutate does not block them. After the eviction, the page reloads without those edits while the undo history still refers to them.",
+      "fix": "In relieve(_:) and trimWorkingSet(_:), skip documents where `app.isReadOnly(doc)` is true (or keep all their cached pages). Add a test: Harness with a persistence subclass whose isReadOnly returns true, insert a stroke, relieve(.memoryWarning), and assert the page is still cached and the stroke is still present."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatPerformanceTests/PerformanceTests.swift:30-35 (Budget.strokeDecode / strokeEncode)",
+      "problem": "The budgets split one §20 row inconsistently. 'Decode and merge a 1k-stroke page < 50 ms' gives merge 20% (10 ms per 1k, lwwMerge) but also gives decode the full 50 ms per 1k (500 ms per 10k). Together the shares of that row add up to 60 ms per 1k-stroke page, which is over the §20 budget they come from.",
+      "fix": "Give decode the remaining 80%: `strokeDecode = 400.0` (and `strokeEncode = 400.0`, the same page on save), and update the doc comments to match. CI measured 355 ms of CPU for decode and 408 ms for encode, both well under the ×4 limit of 1,600 ms."
+    }
+  ]
+}
