@@ -28,7 +28,7 @@ say() { echo "$*" | tee -a "$LOG"; }
 SLOT=""
 acquire() {
   local pref=""
-  [ -f "$WTREE/.dd-slot" ] && pref="$(cat "$WTREE/.dd-slot")"
+  [ -f "$LOCKS/affinity-$(basename "$WTREE")" ] && pref="$(cat "$LOCKS/affinity-$(basename "$WTREE")")"
   while :; do
     for s in $pref $(seq 1 "$SLOTS"); do
       local d="$LOCKS/slot$s"
@@ -43,7 +43,7 @@ release() { [ -n "$SLOT" ] && rm -rf "$LOCKS/slot$SLOT"; }
 trap 'release' EXIT INT TERM
 say "== waiting for a build slot ($SLOTS max)"
 acquire
-echo "$SLOT" > "$WTREE/.dd-slot"
+echo "$SLOT" > "$LOCKS/affinity-$NAME"
 say "== slot $SLOT"
 DD="$BASE/Nib-dd/slot$SLOT"; SPM="$BASE/Nib-spm/slot$SLOT"
 mkdir -p "$DD" "$SPM"
