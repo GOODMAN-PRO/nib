@@ -72,7 +72,8 @@ protocol PageTileSource: AnyObject {
     func renderTile(page: PageID, region: Rect?, scale: Double) async throws -> CGImage
     /// The page view finished every render it had in flight (tiles and preview).
     func pageTileViewDidSettle(_ view: PageTileView)
-    /// The low-resolution render of a page failed (not cancelled): the canvas shows "Couldn't show this page."
+    /// A render of the page (a tile or its low-resolution preview) failed, not cancelled: the canvas shows "Couldn't
+    /// show this page." Called at most once per configuration until `retry()`.
     func pageTileView(_ view: PageTileView, didFailWith error: Error)
 }
 
@@ -130,6 +131,8 @@ final class PageTileView: UIView {
     private var previewToken = 0
     private var previewStale = true
     private(set) var previewFailed = false
+    /// A failed render was reported to the source since the page was configured (or since Try Again).
+    private var failureReported = false
     private var tokenCounter = 0
     /// Region of the page the last coverage pass asked for (page coordinates).
     private var covered: Rect?
@@ -161,13 +164,14 @@ final class PageTileView: UIView {
 
     // MARK: Configuration
 
-    /// Shows `record` with its page rect (page coordinates) and paper colour. A different page (or a changed
-    /// background, size or rotation) drops every bitmap; the same page keeps them.
+    /// Shows `record` with its page rect (page coordinates) and paper colour. A different page (or a changed size)
+    /// drops every bitmap. The same page with a new background or rotation redraws every tile in place: what is on
+    /// screen stays until the new bitmaps land (§9.3), so the page never blanks. Otherwise the bitmaps stay.
     func configure(_ record: PageRecord, pageRect: Rect, paper: UIColor) {
-        let changed = self.record.map { old in
-            old.id != record.id || old.background != record.background || old.size != record.size
-                || old.rotation != record.rotation
-        } ?? true
+        let changed = self.record.map { old in old.id != record.id || old.size != record.size } ?? true
+        let redraw = !changed && self.record.map { old in
+            old.background != record.background || old.rotation != record.rotation
+        } ?? false
         self.record = record
         pageID = record.id
         backgroundColor = paper
@@ -184,7 +188,12 @@ final class PageTileView: UIView {
             liveViewContainer.frame = pageRect.cg
             CATransaction.commit()
         }
-        if changed { reset() }
+        if changed {
+            reset()
+        } else if redraw {
+            previewFailed = false
+            invalidate(nil)
+        }
     }
 
     /// Forgets every bitmap and cancels every render (the view is being recycled, or its page changed).
@@ -203,6 +212,7 @@ final class PageTileView: UIView {
         CATransaction.commit()
         previewStale = true
         previewFailed = false
+        failureReported = false
         covered = nil
         for v in liveViewContainer.subviews { v.removeFromSuperview() }
         // Paper only until the first bitmap lands (a new page, or one whose background or size changed).
@@ -313,6 +323,7 @@ final class PageTileView: UIView {
     func retry() {
         previewFailed = false
         previewStale = true
+        failureReported = false
         invalidate(nil)
     }
 
@@ -327,7 +338,13 @@ final class PageTileView: UIView {
         let scale = CanvasTileGrid.scale(level: key.level)
         slot.task = Task { @MainActor [weak self, weak slot] in
             guard let self = self else { return }
-            let image = try? await self.source?.renderTile(page: page, region: rect, scale: scale)
+            var image: CGImage?
+            var failure: Error?
+            do {
+                image = try await self.source?.renderTile(page: page, region: rect, scale: scale)
+            } catch {
+                failure = error
+            }
             guard let slot = slot, slot.token == token, self.pageID == page else { return }
             slot.task = nil
             if let image = image {
@@ -338,9 +355,20 @@ final class PageTileView: UIView {
                 slot.hasImage = true
                 self.dropCoveredFallback()
                 self.contentLanded()
+            } else if let error = failure, !Task.isCancelled {
+                // The slot stays, so Try Again (`retry`) asks for this tile again.
+                self.renderFailed(error)
             }
             self.renderFinished()
         }
+    }
+
+    /// A render failed, not cancelled and not for want of a renderer (a stripped-down build shows paper): the canvas
+    /// shows "Couldn't show this page." (DESIGN.md §14.18). Reported once per configuration, until Try Again.
+    private func renderFailed(_ error: Error) {
+        guard !(error is CancellationError), NibError.wrap(error).code != .unavailable, !failureReported else { return }
+        failureReported = true
+        source?.pageTileView(self, didFailWith: error)
     }
 
     private func requestPreviewIfNeeded(_ page: PageID) {
@@ -368,7 +396,7 @@ final class PageTileView: UIView {
                 self.previewTask = nil
                 if !(error is CancellationError) && !Task.isCancelled {
                     self.previewFailed = true
-                    self.source?.pageTileView(self, didFailWith: error)
+                    self.renderFailed(error)
                 }
                 self.renderFinished()
             }

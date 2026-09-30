@@ -157,6 +157,8 @@ final class DecorationAttachment: CanvasAttachment {
         }
         let visible = canvas.bounds
         let scale = canvas.traitCollection.displayScale > 0 ? canvas.traitCollection.displayScale : 2
+        // During a pinch the bitmaps only scale, like the page tiles; they are drawn again when it ends.
+        let zooming = (canvas as? DocumentScrollView)?.isZoomingNow ?? false
         for page in pages {
             guard let frame = host.pageFrame(page), let t = host.pageTransform(page), t.a > 0 else {
                 layers[page]?.removeFromSuperlayer()
@@ -182,7 +184,8 @@ final class DecorationAttachment: CanvasAttachment {
             l.isHidden = false
             l.update(needed: shown.applying(toPage), page: frame.applying(toPage), transform: t,
                      lists: store.decorations(doc: host.documentID, page: page).map { $0.display },
-                     generation: store.generation, assets: host.app.services.assets, doc: host.documentID)
+                     generation: store.generation, assets: host.app.services.assets, doc: host.documentID,
+                     zooming: zooming)
         }
     }
 }
@@ -215,13 +218,14 @@ final class DecorationLayer: CALayer {
 
     /// Places the layer for `transform` (page → canvas view) and draws again when the decorations or the zoom changed
     /// or `needed` (page coordinates) is no longer inside what was drawn. A redraw covers `needed` plus a quarter of
-    /// it on every side, within `page`, so small scrolls reuse the bitmap.
+    /// it on every side, within `page`, so small scrolls reuse the bitmap. While `zooming` (a pinch) only new
+    /// decorations are drawn: the bitmap otherwise just scales with the page, and is drawn again when the pinch ends.
     func update(needed: CGRect, page: CGRect, transform: CGAffineTransform, lists: [DisplayList], generation: Int,
-                assets: AssetStore?, doc: DocumentID) {
+                assets: AssetStore?, doc: DocumentID, zooming: Bool = false) {
         let zoom = transform.a
         // Half a point of slack: `needed` comes through an inverted transform and carries rounding.
-        let redraw = generation != self.generation || abs(zoom - drawnZoom) > zoom * 1e-9 || drawnRect.isNull
-            || !drawnRect.insetBy(dx: -0.5, dy: -0.5).contains(needed)
+        let moved = abs(zoom - drawnZoom) > zoom * 1e-9 || !drawnRect.insetBy(dx: -0.5, dy: -0.5).contains(needed)
+        let redraw = generation != self.generation || drawnRect.isNull || (moved && !zooming)
         if redraw {
             let grown = needed.insetBy(dx: -needed.width / 4, dy: -needed.height / 4).intersection(page)
             drawnRect = grown.isNull ? needed : grown
@@ -246,6 +250,77 @@ final class DecorationLayer: CALayer {
         // Page coordinates → this layer: the zoom, less what the layer's origin shows.
         ctx.scaleBy(x: drawnZoom, y: drawnZoom)
         ctx.translateBy(x: -drawnRect.minX, y: -drawnRect.minY)
-        for list in lists { list.draw(in: ctx, assets: assets, doc: doc) }
+        for list in lists { DecorationLayer.clipped(list, to: drawnRect).draw(in: ctx, assets: assets, doc: doc) }
+    }
+
+    // MARK: Pattern clipping
+
+    private static let patterns: Set<DisplayOpKind> = [.dots, .hlines, .vlines]
+
+    /// `list` with its pattern ops (dots, hlines, vlines) cut to `area` (page coordinates), so drawing one loops over
+    /// what the layer shows, not the pattern's whole rect (`DisplayList.draw` walks all of it, whatever the clip).
+    static func clipped(_ list: DisplayList, to area: CGRect) -> DisplayList {
+        guard !area.isNull, list.ops.contains(where: { patterns.contains($0.op) }) else { return list }
+        return DisplayList(ops: list.ops.compactMap { clipped($0, to: area) })
+    }
+
+    /// A pattern op cut to `area`, snapped outward to its own grid (and its dash period) so every mark stays exactly
+    /// where the whole op would draw it; nil when none of it reaches `area`. Other ops are returned as they are.
+    static func clipped(_ op: DisplayOp, to area: CGRect) -> DisplayOp? {
+        guard patterns.contains(op.op), let rect = op.rect else { return op }
+        let r = rect.cg.standardized
+        guard [r.minX, r.minY, r.maxX, r.maxY].allSatisfy({ $0.isFinite }) else { return nil }
+        let step = max(op.spacing ?? 24, 1)
+        // How far one mark paints from its grid line or point.
+        let reach = CGFloat(max(op.radius ?? 1, 0) + max(op.width ?? 1, 0))
+        let lo = CGPoint(x: area.minX - reach, y: area.minY - reach)
+        let hi = CGPoint(x: area.maxX + reach, y: area.maxY + reach)
+        var out = op
+        switch op.op {
+        case .dots:
+            guard let x = grid(Double(r.minX), Double(r.maxX), step: step, lo: Double(lo.x), hi: Double(hi.x)),
+                  let y = grid(Double(r.minY), Double(r.maxY), step: step, lo: Double(lo.y), hi: Double(hi.y)) else {
+                return nil
+            }
+            out.rect = Rect(x: x.min, y: y.min, width: x.max - x.min, height: y.max - y.min)
+        case .hlines:
+            guard let y = grid(Double(r.minY), Double(r.maxY), step: step, lo: Double(lo.y), hi: Double(hi.y)),
+                  let x = extent(Double(r.minX), Double(r.maxX), dash: op.dash, lo: Double(lo.x), hi: Double(hi.x)) else {
+                return nil
+            }
+            out.rect = Rect(x: x.min, y: y.min, width: x.max - x.min, height: y.max - y.min)
+        case .vlines:
+            guard let x = grid(Double(r.minX), Double(r.maxX), step: step, lo: Double(lo.x), hi: Double(hi.x)),
+                  let y = extent(Double(r.minY), Double(r.maxY), dash: op.dash, lo: Double(lo.y), hi: Double(hi.y)) else {
+                return nil
+            }
+            out.rect = Rect(x: x.min, y: y.min, width: x.max - x.min, height: y.max - y.min)
+        default:
+            return op
+        }
+        return out
+    }
+
+    /// A pattern axis [a, b] with marks at a + k·step (k ≥ 1, up to b), cut to the marks within [lo, hi] plus one
+    /// each side; nil when it has none there.
+    private static func grid(_ a: Double, _ b: Double, step: Double, lo: Double, hi: Double) -> (min: Double, max: Double)? {
+        let k = max(0, ((lo - a) / step).rounded(.down) - 1)
+        let start = a + k * step
+        let end = min(b, hi + step)
+        guard end >= start + step else { return nil }
+        return (start, end)
+    }
+
+    /// A line's extent [a, b] cut to [lo, hi]; a dashed line starts a whole number of dash periods in, so its dashes
+    /// stay put.
+    private static func extent(_ a: Double, _ b: Double, dash: [Double]?, lo: Double, hi: Double) -> (min: Double, max: Double)? {
+        let period = (dash ?? []).reduce(0, +)
+        var start = a
+        if lo > a {
+            start = period > 0 && period.isFinite ? a + ((lo - a) / period).rounded(.down) * period : lo
+        }
+        let end = min(b, hi)
+        guard end > start else { return nil }
+        return (start, end)
     }
 }

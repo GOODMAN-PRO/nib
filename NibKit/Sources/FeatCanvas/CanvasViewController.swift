@@ -41,6 +41,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private(set) var board: BoardWorld?
     private(set) var boardContent: Rect?
     private var boardContentStale = true
+    /// Per item of the board `boardBoundsPage`, what it paints (page coordinates); `boardContent` is their union.
+    private var boardBounds: [ElementID: Rect] = [:]
+    private var boardBoundsPage: PageID?
 
     // Zoom
     private(set) var fitZoom: Double = 1
@@ -136,7 +139,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         errorView.isHidden = true
         errorView.onRetry = { [weak self] in self?.retryFailedPages() }
         errorView.onRestore = { [weak self] in self?.restoreFromBackup() }
+        addChild(errorView.hosting)
         fixedOverlay.addSubview(errorView)
+        errorView.hosting.didMove(toParent: self)
 
         let tap = host.doubleTapZoomRecognizer
         tap.numberOfTapsRequired = 2
@@ -194,6 +199,8 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     /// Opens (or re-opens) the canvas: observers, tool, attachments, the input half.
     private func open() {
         isClosed = false
+        // Every tile from here on is asked for with these layers (reopening drops the old ones).
+        lastVisibleLayers = host.visibleLayers
         observe()
         host.syncActiveTool()
         attachmentHost.attachAll()
@@ -671,6 +678,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     func reloadAll() {
         loadModel()
         boardContentStale = true
+        boardBoundsPage = nil
         paperCache.removeAll()
         failedPages.removeAll()
         guard isViewLoaded, didInitialLayout else { return }
@@ -807,6 +815,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     private func committed(_ cs: Changeset) {
         guard !isClosed, cs.documents.contains(documentID) else { return }
+        updateBoardBounds(cs)
         if cs.headChanged(documentID) {
             let oldPages = livePages
             let oldDirection = direction
@@ -825,8 +834,18 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
                     relayout(anchor: switched ? nil : anchor, initial: switched)
                 }
             } else {
-                for r in livePages { if shown[r.id] != nil { shown[r.id] = r } }
+                var redrawn: [PageID] = []
+                for r in livePages {
+                    guard let old = shown[r.id] else { continue }
+                    if old.background != r.background || old.rotation != r.rotation { redrawn.append(r.id) }
+                    shown[r.id] = r
+                }
+                // A new background or rotation (a template applied, or undone) redraws the whole page. The renderer
+                // hears about it from its own commit observer too; saying it here does not depend on which runs first.
+                for p in redrawn { app.services.renderer?.invalidate(doc: documentID, page: p, rect: nil) }
                 refreshConfiguredPages()
+                // Whatever a page view dropped is asked for again now, not at the next scroll (a pinch bakes when it ends).
+                if !scrollView.isZooming && !scrollView.isZoomingNow { scrollView.updateTiles() }
                 updateHUD()
             }
         }
@@ -835,9 +854,6 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             scrollView.pageViews[page]?.invalidate(dirty)
             scrollView.pageViews[page]?.invalidateAccessibility()
             host.placeLiveViews(on: page)
-            if case .world(let id) = mode, id == page, !boardContentStale {
-                boardContent = boardContent.map { $0.union(dirty) } ?? dirty
-            }
             host.flushWaitersIfReady(page)
         }
         canvasDidChange()
@@ -859,12 +875,14 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         for v in scrollView.pageViews.values { v.invalidate(nil) }
     }
 
-    private var lastVisibleLayers: Set<Int>?
+    /// The layers the tiles on screen were asked for with: the window's own when the canvas opened (a window can
+    /// already hide a layer then), then whatever it last showed.
+    private var lastVisibleLayers = Set(0..<NibLimits.layerCount)
 
     /// A layer was shown or hidden in this window (the active layer changing needs no redraw).
     private func layersChanged() {
         let visible = host.visibleLayers
-        guard visible != (lastVisibleLayers ?? Set(0..<NibLimits.layerCount)) else { return }
+        guard visible != lastVisibleLayers else { return }
         lastVisibleLayers = visible
         refreshAllTiles()
         for v in scrollView.pageViews.values { v.invalidateAccessibility() }
@@ -896,20 +914,40 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     // MARK: Boards
 
-    /// The union of the board's item bounds (painted area).
+    /// The union of the board's item bounds (painted area), from the per-item cache: walking every stroke point
+    /// happens once per board, not at every relayout or fit.
     private func recomputeBoardContent(_ page: PageID) {
         boardContentStale = false
-        guard let items = try? app.workspace.items(documentID, page: page), !items.isEmpty else {
-            boardContent = nil
-            return
+        if boardBoundsPage != page {
+            boardBoundsPage = page
+            boardBounds.removeAll()
+            for item in (try? app.workspace.items(documentID, page: page)) ?? [] {
+                boardBounds[item.id] = CanvasViewController.contentBounds(item, app.content)
+            }
         }
         var r: Rect?
-        for item in items {
-            let b = app.content.paintBounds(for: item)
-            guard !b.isEmpty, [b.x, b.y, b.width, b.height].allSatisfy({ $0.isFinite }) else { continue }
-            r = r.map { $0.union(b) } ?? b
-        }
+        for b in boardBounds.values { r = r.map { $0.union(b) } ?? b }
         boardContent = r
+    }
+
+    /// What an item paints, when it is a real area (nil for empty or non-finite bounds).
+    static func contentBounds(_ item: Item, _ content: ContentRegistries) -> Rect? {
+        let b = content.paintBounds(for: item)
+        guard !b.isEmpty, [b.x, b.y, b.width, b.height].allSatisfy({ $0.isFinite }) else { return nil }
+        return b
+    }
+
+    /// Keeps the board's per-item bounds current through a commit: added, moved and deleted items (undo included).
+    /// The content bounds are recomputed from them when next needed, so they shrink as well as grow.
+    private func updateBoardBounds(_ cs: Changeset) {
+        guard let board = boardBoundsPage else { return }
+        var touched = false
+        for m in cs.mutations {
+            guard case let .item(d, p, _, after) = m, d == documentID, p == board else { continue }
+            boardBounds[after.id] = after.deleted ? nil : CanvasViewController.contentBounds(after, app.content)
+            touched = true
+        }
+        if touched { boardContentStale = true }
     }
 
     /// The board's content bounds, recomputed if needed (fit).
@@ -1307,10 +1345,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         if let page = displayedPage, failedPages.contains(page), let f = host.pageFrame(page) {
             errorView.showsRestore = canRestoreFromBackup
             let visible = scrollView.convert(f, to: fixedOverlay).intersection(b)
-            let width = max(NibMetrics.hitTarget, min(b.width - 2 * NibSpacing.l, NibMetrics.panelWidth))
-            let size = errorView.systemLayoutSizeFitting(CGSize(width: width, height: 0),
-                                                          withHorizontalFittingPriority: .required,
-                                                          verticalFittingPriority: .fittingSizeLevel)
+            let size = errorView.fittingSize(width: max(NibMetrics.hitTarget, min(b.width, PageErrorView.maxWidth)))
             let centre = visible.isNull ? CGPoint(x: b.midX, y: b.midY) : CGPoint(x: visible.midX, y: visible.midY)
             errorView.frame = CGRect(x: centre.x - size.width / 2, y: centre.y - size.height / 2, width: size.width,
                                      height: size.height)
@@ -1734,81 +1769,53 @@ final class AddPageIndicatorView: UIView {
 // MARK: - Render failure (DESIGN.md §14.18)
 
 /// "Couldn't show this page." with Try Again and, when the Cloud & Backup panel exists, Restore from Backup, over a
-/// page whose render failed.
+/// page whose render failed: the design system's `NibEmptyState` (44 pt warning glyph, empty-state title, capsule
+/// buttons), hosted in a view the canvas places over the failed page. The canvas makes `hosting` its child.
 final class PageErrorView: UIView {
     var onRetry: (() -> Void)?
     var onRestore: (() -> Void)?
     /// Shows Restore from Backup (the canvas sets it when the Cloud & Backup panel is registered).
     var showsRestore = false {
-        didSet { restoreButton.isHidden = !showsRestore }
+        didSet { if showsRestore != oldValue { update() } }
     }
-    private let stack = UIStackView()
-    private let restoreButton = UIButton(type: .system)
+    let hosting: UIHostingController<NibEmptyState>
+    /// The actions the empty state shows, primary first (tests and host inspection).
+    private(set) var actions: [NibAction] = []
+    /// `NibEmptyState` is at most 420 pt wide inside its own padding.
+    static let maxWidth: CGFloat = 420 + 2 * NibSpacing.xxl
 
     override init(frame: CGRect) {
+        hosting = UIHostingController(rootView: NibEmptyState(symbol: .warningTriangle, title: ""))
         super.init(frame: frame)
-        let icon = UIImageView(image: UIImage(nib: .warningTriangle))
-        icon.preferredSymbolConfiguration = NibUIFont.glyph(.sidebar)
-        icon.tintColor = NibUIColor.labelSecondary
-        icon.contentMode = .center
-        icon.isAccessibilityElement = false
-        let label = UILabel()
-        label.text = String(localized: "Couldn't show this page.")
-        label.font = NibUIFont.callout
-        label.adjustsFontForContentSizeCategory = true
-        label.textColor = NibUIColor.label
-        label.numberOfLines = 0
-        label.textAlignment = .center
-        let retryButton = PageErrorView.button(String(localized: "Try Again"))
-        retryButton.addTarget(self, action: #selector(retry), for: .primaryActionTriggered)
-        restoreButton.setTitle(String(localized: "Restore from Backup"), for: .normal)
-        PageErrorView.style(restoreButton)
-        restoreButton.addTarget(self, action: #selector(restore), for: .primaryActionTriggered)
-        restoreButton.isHidden = true
-        stack.axis = .vertical
-        stack.alignment = .center
-        stack.spacing = NibSpacing.s
-        stack.addArrangedSubview(icon)
-        stack.addArrangedSubview(label)
-        stack.addArrangedSubview(retryButton)
-        stack.addArrangedSubview(restoreButton)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: NibSpacing.l),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -NibSpacing.l),
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: NibSpacing.l),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -NibSpacing.l),
-        ])
-        shouldGroupAccessibilityChildren = true
+        backgroundColor = .clear
+        hosting.view.backgroundColor = .clear
+        // Placed by the canvas, clear of the chrome already: no safe-area padding of its own.
+        hosting.safeAreaRegions = []
+        hosting.view.frame = bounds
+        hosting.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        addSubview(hosting.view)
+        update()
     }
 
     required init?(coder: NSCoder) { return nil }
 
-    private static func button(_ title: String) -> UIButton {
-        let b = UIButton(type: .system)
-        b.setTitle(title, for: .normal)
-        style(b)
-        return b
+    private func update() {
+        let retry = NibAction(String(localized: "Try Again")) { [weak self] in self?.onRetry?() }
+        let restore = showsRestore
+            ? NibAction(String(localized: "Restore from Backup")) { [weak self] in self?.onRestore?() } : nil
+        actions = [retry] + (restore.map { [$0] } ?? [])
+        hosting.rootView = NibEmptyState(symbol: .warningTriangle, title: String(localized: "Couldn't show this page."),
+                                         primary: retry, secondary: restore)
     }
 
-    private static func style(_ b: UIButton) {
-        b.titleLabel?.font = NibUIFont.button
-        b.titleLabel?.adjustsFontForContentSizeCategory = true
-        b.titleLabel?.numberOfLines = 0
-        b.titleLabel?.textAlignment = .center
-        b.tintColor = NibUIColor.accent
-        b.heightAnchor.constraint(greaterThanOrEqualToConstant: NibMetrics.hitTarget).isActive = true
-        b.widthAnchor.constraint(greaterThanOrEqualToConstant: NibMetrics.hitTarget).isActive = true
+    /// The size the empty state takes at most `width` wide.
+    func fittingSize(width: CGFloat) -> CGSize {
+        let s = hosting.sizeThatFits(in: CGSize(width: width, height: CGFloat.greatestFiniteMagnitude))
+        return CGSize(width: min(ceil(s.width), width), height: ceil(s.height))
     }
 
-    @objc private func retry() { onRetry?() }
-    @objc private func restore() { onRestore?() }
-
-    /// The buttons' titles, visible ones only (tests and host inspection).
-    var actionTitles: [String] {
-        stack.arrangedSubviews.compactMap { ($0 as? UIButton).flatMap { $0.isHidden ? nil : $0.title(for: .normal) } }
-    }
+    /// The buttons' titles (tests and host inspection).
+    var actionTitles: [String] { actions.map { $0.title } }
 }
 
 // MARK: - Item accessibility

@@ -561,6 +561,45 @@ final class FeatCanvasTests: XCTestCase {
         await assertThrows(.invalidParams) { _ = try await h.run("canvas.decorate", tooMany) }
     }
 
+    func testDecorationsThatWouldBeExpensiveToDrawAreRejected() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        try makeCanvas(h)
+        func decorate(_ ops: [JSONValue]) -> JSONValue {
+            ["page": "page:FIXTUREDOC01/FIXTUREPG001", "id": "big", "display": ["ops": .array(ops)]]
+        }
+        func rejects(_ ops: [JSONValue], at index: Int, line: UInt = #line) async {
+            do {
+                _ = try await h.run("canvas.decorate", decorate(ops))
+                XCTFail("expected invalid_params", line: line)
+            } catch let e as NibError {
+                XCTAssertEqual(e.code, .invalidParams, e.description, line: line)
+                XCTAssertEqual(e.path, "$.display.ops[\(index)]", line: line)
+                XCTAssertNotNil(e.hint, line: line)
+            } catch {
+                XCTFail("unexpected \(error)", line: line)
+            }
+        }
+        let box: JSONValue = ["op": "rect", "rect": [0, 0, 10, 10], "stroke": "#000000FF"]
+        // A million points square of dots one point apart: 10^12 dots.
+        await rejects([box, ["op": "dots", "rect": [0, 0, 1_000_000, 1_000_000], "spacing": 1]], at: 1)
+        await rejects([["op": "hlines", "rect": [0, 0, 100, 100_000], "spacing": 1, "stroke": "#000000FF"]], at: 0)
+        let huge = (0...DecorationRules.maxPoints).map { i -> JSONValue in [.number(Double(i % 500)), .number(Double(i / 500))] }
+        await rejects([box, box, ["op": "polyline", "points": .array(huge), "stroke": "#000000FF"]], at: 2)
+        await rejects([["op": "rect", "rect": [0, 0, 1e9, 10], "stroke": "#000000FF"]], at: 0)
+        await rejects([["op": "text", "rect": [0, 0, 100, 20],
+                        "text": .string(String(repeating: "a", count: DecorationRules.maxTextLength + 1))]], at: 0)
+        await rejects([["op": "line", "points": [[0, 0], [1_000_000, 0]], "stroke": "#000000FF", "dash": [0.01, 0.01]]],
+                      at: 0)
+        await rejects([["op": "dots", "rect": [0, 0, 100, 100], "spacing": 10, "radius": 5_000]], at: 0)
+        XCTAssertEqual(DecorationStore.shared(h.app).liveCount, 0)
+        // A page's worth of pattern is fine.
+        _ = try await h.run("canvas.decorate", decorate([["op": "dots", "rect": [0, 0, 595, 842], "spacing": 24,
+                                                          "radius": 1, "fill": "#000000FF"],
+                                                         ["op": "hlines", "rect": [0, 0, 595, 842], "spacing": 24,
+                                                          "stroke": "#000000FF", "dash": [6, 4]]]))
+        XCTAssertEqual(DecorationStore.shared(h.app).liveCount, 1)
+    }
+
     // MARK: Strokes and the render hooks (contracts-v2 G14)
 
     func testCommitStrokeWritesThroughInkAddStrokesThenRunsAfterNextRender() async throws {
@@ -779,6 +818,66 @@ final class FeatCanvasTests: XCTestCase {
         }
         await waitUntil("the tiles under the shape redrawn") {
             renderer.requests.dropFirst(count).contains { $0.region?.intersects(painted) ?? false }
+        }
+    }
+
+    func testANewBackgroundRedrawsThePageInPlaceWithoutAScroll() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let renderer = RecordingRenderer()
+        h.app.services.renderer = renderer
+        // template.apply / page.setBackground stand-in: a new background, same size.
+        h.app.commands.register(CommandDescriptor(id: "test.setBackground", title: "Set Background",
+                                                  summary: "Test helper.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                guard var page = try tx.content(Fixtures.docID).page(Fixtures.page1) else {
+                    throw NibError.notFound("page")
+                }
+                page.background = .ofColor(RGBA(255, 244, 214))
+                _ = try tx.put(page, doc: Fixtures.docID)
+            }
+            return .null
+        }
+        let vc = try makeCanvas(h)
+        await waitUntil("page 1 to settle") {
+            guard let v = vc.scrollView.pageViews[Fixtures.page1] else { return false }
+            return v.isSettled && v.contentAlpha == 1 && v.hasPreview
+        }
+        let view = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        let keys = view.tileKeys
+        XCTAssertFalse(keys.isEmpty)
+        let count = renderer.requests.count
+
+        _ = try await h.run("test.setBackground")
+        XCTAssertTrue(vc.scrollView.pageViews[Fixtures.page1] === view)
+        XCTAssertEqual(view.tileKeys, keys, "the tiles stay, to be redrawn in place")
+        XCTAssertEqual(view.contentAlpha, 1, "the page never blanks")
+        XCTAssertTrue(renderer.invalidations.contains { $0.page == Fixtures.page1 && $0.rect == nil })
+        await waitUntil("page 1 redrawn with its new background") {
+            renderer.requests.dropFirst(count).contains { $0.page == Fixtures.page1 && $0.region != nil }
+        }
+        await waitUntil("page 1 to settle again") { view.isSettled }
+        XCTAssertFalse(view.tileKeys.isEmpty)
+        XCTAssertEqual(view.contentAlpha, 1)
+        XCTAssertTrue(view.hasPreview)
+        XCTAssertEqual(view.record?.background, .ofColor(RGBA(255, 244, 214)))
+    }
+
+    func testALayerHiddenBeforeTheCanvasOpensComesBackWhenShown() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let renderer = RecordingRenderer()
+        h.app.services.renderer = renderer
+        // The window's layer visibility was restored before its editor was made.
+        h.session.hiddenLayers = [1]
+        let vc = try makeCanvas(h)
+        let all = Set(0..<NibLimits.layerCount)
+        await waitUntil("tiles without layer 1") {
+            renderer.requests.contains { $0.region != nil && $0.layers == all.subtracting([1]) }
+        }
+        await waitUntil("every page to settle") { vc.scrollView.pageViews.values.allSatisfy { $0.isSettled } }
+        let count = renderer.requests.count
+        h.session.hiddenLayers = []
+        await waitUntil("tiles with every layer") {
+            renderer.requests.dropFirst(count).contains { $0.region != nil && $0.layers == all }
         }
     }
 
@@ -1169,6 +1268,36 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertTrue(vc.scrollView.bounds.contains(hit.cg.applying(t)), "the item is on screen")
     }
 
+    func testBoardFitShowsTheContentAsItIsNowAfterADeletion() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
+        let shape = try h.app.workspace.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: Fixtures.boardShapeID)
+        let base = h.app.content.paintBounds(for: shape)
+        let viewport = vc.scrollView.bounds.size
+        let far = Item(kind: .shape, shape: ShapeItem(shape: .rectangle, frame: Frame(x: 20_000, y: 15_000, w: 120, h: 80)))
+        let written = try await h.insert([far], page: Fixtures.boardID, doc: Fixtures.whiteboardID)
+        let farItem = try XCTUnwrap(written.first)
+        let both = base.union(h.app.content.paintBounds(for: farItem))
+        XCTAssertEqual(vc.currentBoardContent(), both)
+        let wide = try await h.run("view.zoom", ["fit": true])
+        XCTAssertEqual(wide["scale"]?.doubleValue ?? 0, ZoomRules.boardFit(content: both, viewport: viewport), accuracy: 1e-9)
+
+        h.app.commands.register(CommandDescriptor(id: "test.deleteFar", title: "Delete", summary: "Test helper.",
+                                                  effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in try tx.delete(items: [farItem.id], doc: Fixtures.whiteboardID, page: Fixtures.boardID) }
+            return .null
+        }
+        _ = try await h.run("test.deleteFar")
+        XCTAssertEqual(vc.currentBoardContent(), base, "the content bounds shrink when an item goes")
+        let fit = try await h.run("view.zoom", ["fit": true])
+        let expected = ZoomRules.boardFit(content: base, viewport: viewport)
+        XCTAssertEqual(fit["scale"]?.doubleValue ?? 0, expected, accuracy: 1e-9)
+        XCTAssertGreaterThan(expected, wide["scale"]?.doubleValue ?? 0)
+        let c = windowPoint(vc, base.center, Fixtures.boardID)
+        XCTAssertEqual(c.x, windowSize.width / 2, accuracy: 0.5)
+        XCTAssertEqual(c.y, windowSize.height / 2, accuracy: 0.5)
+    }
+
     // MARK: Scrubber (D-118)
 
     func testScrubberTakesTouchesOnlyAtItsThumbAndStepsBackWhileWriting() async throws {
@@ -1239,6 +1368,64 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertLessThan(layer.drawnRect.height, PageSize.a4.height)
     }
 
+    func testAPinchOnlyScalesTheDecorationBitmapUntilItEnds() {
+        let l = DecorationLayer()
+        let lists = [DisplayList(ops: [DisplayOp(op: .rect, rect: Rect(x: 10, y: 10, width: 50, height: 20), stroke: .black)])]
+        let page = CGRect(x: 0, y: 0, width: 595, height: 842)
+        l.update(needed: CGRect(x: 0, y: 0, width: 300, height: 400), page: page, transform: .identity, lists: lists,
+                 generation: 1, assets: nil, doc: Fixtures.docID)
+        XCTAssertEqual(l.redraws, 1)
+        let drawn = l.drawnRect
+        let pinch = CGAffineTransform(scaleX: 2, y: 2)
+        l.update(needed: CGRect(x: 0, y: 0, width: 150, height: 200), page: page, transform: pinch, lists: lists,
+                 generation: 1, assets: nil, doc: Fixtures.docID, zooming: true)
+        XCTAssertEqual(l.redraws, 1, "mid-pinch the bitmap only scales")
+        XCTAssertEqual(l.drawnRect, drawn)
+        XCTAssertEqual(l.drawnZoom, 1)
+        XCTAssertEqual(l.frame, drawn.applying(pinch))
+        // A new decoration mid-pinch is drawn at once.
+        l.update(needed: CGRect(x: 0, y: 0, width: 150, height: 200), page: page, transform: pinch, lists: lists,
+                 generation: 2, assets: nil, doc: Fixtures.docID, zooming: true)
+        XCTAssertEqual(l.redraws, 2)
+        XCTAssertEqual(l.drawnZoom, 2)
+        // The pinch ends at a new zoom: drawn again for it.
+        let end = CGAffineTransform(scaleX: 3, y: 3)
+        l.update(needed: CGRect(x: 0, y: 0, width: 100, height: 130), page: page, transform: end, lists: lists,
+                 generation: 2, assets: nil, doc: Fixtures.docID)
+        XCTAssertEqual(l.redraws, 3)
+        XCTAssertEqual(l.drawnZoom, 3)
+    }
+
+    func testPatternDecorationsDrawOnlyAroundTheWindowOnTheirOwnGrid() throws {
+        let area = CGRect(x: 500, y: 300, width: 100, height: 50)
+        let dots = DisplayOp(op: .dots, rect: Rect(x: 10, y: 10, width: 10_000, height: 10_000), fill: .black,
+                             spacing: 7, radius: 1)
+        let d = try XCTUnwrap(DecorationLayer.clipped(dots, to: area)?.rect)
+        // The dots stay where the whole op puts them (10 + k·7), and cover the area and what a dot's reach needs.
+        XCTAssertEqual((d.x - 10) / 7, ((d.x - 10) / 7).rounded(), accuracy: 1e-9)
+        XCTAssertEqual((d.y - 10) / 7, ((d.y - 10) / 7).rounded(), accuracy: 1e-9)
+        XCTAssertLessThanOrEqual(d.x + 7, Double(area.minX) - 2)
+        XCTAssertLessThanOrEqual(d.y + 7, Double(area.minY) - 2)
+        XCTAssertGreaterThanOrEqual(d.maxX, Double(area.maxX) + 2)
+        XCTAssertGreaterThanOrEqual(d.maxY, Double(area.maxY) + 2)
+        XCTAssertLessThan(d.width * d.height, 200 * 200, "not the whole 10,000 pt square")
+
+        let lines = DisplayOp(op: .hlines, rect: Rect(x: 0, y: 0, width: 5_000, height: 5_000), stroke: .black,
+                              dash: [6, 4], spacing: 24)
+        let l = try XCTUnwrap(DecorationLayer.clipped(lines, to: area)?.rect)
+        XCTAssertEqual(l.y / 24, (l.y / 24).rounded(), accuracy: 1e-9)
+        XCTAssertEqual(l.x / 10, (l.x / 10).rounded(), accuracy: 1e-9, "the dashes keep their phase")
+        XCTAssertLessThanOrEqual(l.x, Double(area.minX))
+        XCTAssertGreaterThanOrEqual(l.maxX, Double(area.maxX))
+        XCTAssertLessThan(l.height, 200)
+
+        // Nowhere near the window: nothing to draw. Other ops are left alone.
+        XCTAssertNil(DecorationLayer.clipped(dots, to: CGRect(x: -500, y: -500, width: 10, height: 10)))
+        let box = DisplayOp(op: .rect, rect: Rect(x: 0, y: 0, width: 1e6, height: 1e6), stroke: .black)
+        XCTAssertEqual(DecorationLayer.clipped(box, to: area), box)
+        XCTAssertEqual(DecorationLayer.clipped(DisplayList(ops: [box, dots]), to: area).ops.count, 2)
+    }
+
     // MARK: Render failure (DESIGN.md §14.18)
 
     func testAPageThatFailsToRenderOffersTryAgainAndRestoreFromBackup() async throws {
@@ -1247,6 +1434,9 @@ final class FeatCanvasTests: XCTestCase {
         vc.pageDidFail(Fixtures.page1)
         XCTAssertFalse(vc.errorView.isHidden)
         XCTAssertTrue(vc.errorView.superview === vc.fixedOverlay)
+        // The design system's empty state (DESIGN.md §14.18), hosted as the canvas's child.
+        XCTAssertTrue(vc.children.contains(vc.errorView.hosting))
+        XCTAssertGreaterThan(vc.errorView.frame.height, 0)
         XCTAssertEqual(vc.errorView.actionTitles, ["Try Again"], "no backups without the Cloud & Backup panel")
 
         var opened: [JSONValue] = []
@@ -1259,13 +1449,34 @@ final class FeatCanvasTests: XCTestCase {
                                                  placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
         vc.pageDidFail(Fixtures.page1)
         XCTAssertEqual(vc.errorView.actionTitles, ["Try Again", "Restore from Backup"])
-        vc.errorView.onRestore?()
+        vc.errorView.actions[1].handler()
         await waitUntil("panel.open") { !opened.isEmpty }
         XCTAssertEqual(opened.first?["id"]?.stringValue, PanelIDs.cloudBackup)
 
-        vc.errorView.onRetry?()
+        vc.errorView.actions[0].handler()
         XCTAssertTrue(vc.errorView.isHidden)
         XCTAssertTrue(vc.failedPages.isEmpty)
+    }
+
+    func testABoardWhoseTilesFailToRenderSaysSoAndTriesAgain() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let renderer = FailingRenderer()
+        h.app.services.renderer = renderer
+        // A board has no low-resolution preview: only its tiles can fail.
+        let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
+        await waitUntil("the board to fail") { vc.failedPages.contains(Fixtures.boardID) }
+        XCTAssertFalse(vc.errorView.isHidden)
+        XCTAssertEqual(vc.errorView.actionTitles, ["Try Again"])
+        let view = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
+        XCTAssertFalse(view.tileKeys.isEmpty, "failed tiles keep their place, for Try Again")
+        await waitUntil("every tile to finish") { view.isSettled }
+        let failures = renderer.failures
+
+        vc.errorView.actions[0].handler()
+        XCTAssertTrue(vc.errorView.isHidden)
+        await waitUntil("the tiles asked for again") { renderer.failures >= failures + view.tileKeys.count }
+        await waitUntil("the board to fail again") { vc.failedPages.contains(Fixtures.boardID) }
+        XCTAssertFalse(vc.errorView.isHidden)
     }
 }
 
@@ -1384,5 +1595,36 @@ private final class RecordingRenderer: PageRenderer {
         lock.unlock()
     }
 
+    func purgeCaches() {}
+}
+
+/// Draws previews but fails every tile (a damaged page).
+private final class FailingRenderer: PageRenderer {
+    private let lock = NSLock()
+    private var failed = 0
+    private let image = FakeRenderer.blank(CGSize(width: 4, height: 4))
+
+    var failures: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return failed
+    }
+
+    private func countFailure() {
+        lock.lock()
+        failed += 1
+        lock.unlock()
+    }
+
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        guard request.region == nil else {
+            countFailure()
+            throw NibError(.internalError, "the tile could not be drawn")
+        }
+        return RenderResult(image: image, region: Rect(x: 0, y: 0, width: 1, height: 1), scale: request.scale)
+    }
+
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { image }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
     func purgeCaches() {}
 }

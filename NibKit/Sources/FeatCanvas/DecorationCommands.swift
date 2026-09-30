@@ -153,6 +153,96 @@ enum DecorationRules {
 
     static func isValidID(_ s: String) -> Bool { s.range(of: idPattern, options: .regularExpression) != nil }
 
+    // What one decoration may cost to draw. `canvas.decorate` is a trust boundary (plugins, the AI, the bridge) and
+    // every window showing the page draws it on the main thread, again at every zoom, for up to an hour.
+
+    /// Every number is finite and at most this far from 0 (page points).
+    static let maxMagnitude = 1e7
+    /// Marks one pattern op draws: dots, and lines for hlines / vlines.
+    static let maxDots = 20_000
+    static let maxLines = 2_000
+    /// Points across the decoration's ops, and characters of one text op.
+    static let maxPoints = 50_000
+    static let maxTextLength = 2_000
+    static let maxDashLengths = 16
+    /// Dashes one op's strokes break into.
+    static let maxDashes = 200_000
+    static let maxImages = 64
+
+    /// Rejects a display list that would be expensive to draw, naming the op (`$.display.ops[i]`).
+    static func validate(_ display: DisplayList) throws {
+        var points = 0
+        var images = 0
+        for (i, op) in display.ops.enumerated() {
+            let path = "$.display.ops[\(i)]"
+            func fail(_ message: String, _ hint: String) -> NibError {
+                NibError(.invalidParams, message, path: path, hint: hint)
+            }
+            func ok(_ v: Double?) -> Bool { v.map { $0.isFinite && abs($0) <= maxMagnitude } ?? true }
+            let bound = "numbers must be finite and within ±\(Int(maxMagnitude)) points"
+            let pts = op.points ?? []
+            points += pts.count
+            guard points <= maxPoints else {
+                throw fail("a decoration holds at most \(maxPoints) points", "simplify the polylines or split the decoration")
+            }
+            guard ok(op.rect?.x), ok(op.rect?.y), ok(op.rect?.width), ok(op.rect?.height),
+                  pts.allSatisfy({ ok($0.x) && ok($0.y) }), ok(op.width), ok(op.fontSize), ok(op.spacing),
+                  ok(op.radius) else {
+                throw fail(bound, "use page coordinates near the page")
+            }
+            if let text = op.text, text.count > maxTextLength {
+                throw fail("text is at most \(maxTextLength) characters", "shorten the text or split it across ops")
+            }
+            if op.op == .image {
+                images += 1
+                guard images <= maxImages else {
+                    throw fail("a decoration draws at most \(maxImages) images", "split the decoration")
+                }
+            }
+            // Dashes: a few positive lengths, and not so fine that a long stroke breaks into millions of them.
+            var period = 0.0
+            if let dash = op.dash, !dash.isEmpty {
+                guard dash.count <= maxDashLengths, dash.allSatisfy({ ok($0) && $0 >= 0 }) else {
+                    throw fail("dash is at most \(maxDashLengths) lengths, each ≥ 0", "use a pattern like [6, 4]")
+                }
+                period = dash.reduce(0, +)
+                guard period > 0 else { throw fail("dash lengths must add up to more than 0", "use a pattern like [6, 4]") }
+            }
+            let w = abs(op.rect?.width ?? 0), h = abs(op.rect?.height ?? 0)
+            let step = max(op.spacing ?? 24, 1)
+            var length = 0.0
+            switch op.op {
+            case .dots:
+                guard (w / step).rounded(.down) * (h / step).rounded(.down) <= Double(maxDots) else {
+                    throw fail("a dots op draws at most \(maxDots) dots", "use a larger spacing or a smaller rect")
+                }
+                guard (op.radius ?? 1) <= step else {
+                    throw fail("a dot's radius is at most its spacing", "use a smaller radius")
+                }
+            case .hlines, .vlines:
+                let lines = ((op.op == .hlines ? h : w) / step).rounded(.down)
+                guard lines <= Double(maxLines) else {
+                    throw fail("a lines op draws at most \(maxLines) lines", "use a larger spacing or a smaller rect")
+                }
+                guard (op.width ?? 1) <= step else {
+                    throw fail("a line's width is at most its spacing", "use a thinner line or a fill")
+                }
+                length = lines * (op.op == .hlines ? w : h)
+            case .rect, .ellipse:
+                length = 2 * (w + h)
+            case .line, .polyline, .polygon:
+                for (a, b) in zip(pts, pts.dropFirst()) { length += hypot(b.x - a.x, b.y - a.y) }
+                if op.op == .polygon, let a = pts.last, let b = pts.first { length += hypot(b.x - a.x, b.y - a.y) }
+            case .text, .image:
+                break
+            }
+            if period > 0, length / period > Double(maxDashes) {
+                throw fail("the dashes are too fine for this length (at most \(maxDashes) dashes)",
+                           "use longer dash lengths")
+            }
+        }
+    }
+
     /// The live page `ref` names, or `invalid_params` / `not_found`.
     @MainActor
     static func page(_ ref: String, _ ctx: CommandContext, path: String = "$.page") throws -> (DocumentID, PageID) {
@@ -219,6 +309,7 @@ struct CanvasDecorate: NibCommand {
         guard p.display.ops.count <= DecorationStore.maxOps else {
             throw NibError(.invalidParams, "a decoration holds at most \(DecorationStore.maxOps) ops", path: "$.display.ops")
         }
+        try DecorationRules.validate(p.display)
         let ttl = p.ttl ?? DecorationStore.defaultTTL
         guard ttl.isFinite, ttl >= DecorationStore.minTTL, ttl <= DecorationStore.maxTTL else {
             throw NibError(.invalidParams, "ttl must be between \(DecorationStore.minTTL) and \(DecorationStore.maxTTL) seconds",
