@@ -162,7 +162,7 @@ struct CollabParticipantRow: View {
         HStack(spacing: NibSpacing.m) {
             NibBadge(.presence(initials: participant.initials, colorIndex: participant.colorIndex))
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: NibSpacing.xxs) {
                 Text(isMe ? String(localized: "\(participant.name) (You)") : participant.name)
                     .font(NibFont.body)
                     .foregroundStyle(NibColor.label)
@@ -340,8 +340,8 @@ struct ShareLivePanel: View {
                 }
             }
         }
-        if info.sessionFormat < NibFormat.version {
-            NibBanner(String(localized: "Someone here uses an older Nib, so newer features stay off in this document until everyone updates."),
+        if people.contains(where: \.needsUpdate) {
+            NibBanner(String(localized: "People using an older Nib can view this document but can't edit it until they update."),
                       style: .info)
         }
         if people.count + pending.count >= info.cap {
@@ -375,7 +375,7 @@ struct ShareLivePanel: View {
         HStack(spacing: NibSpacing.m) {
             NibBadge(.presence(initials: p.initials, colorIndex: p.colorIndex))
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: NibSpacing.xxs) {
                 Text(p.name)
                     .font(NibFont.body)
                     .foregroundStyle(NibColor.label)
@@ -420,8 +420,13 @@ struct ShareLivePanel: View {
             NibTraceRow(String(localized: "Receiving the document"), phase: .running)
         }
         if info.myRole == .view {
-            NibBanner(String(localized: "You can view this document. The host can let you edit it."), style: .info,
-                      symbol: .eye)
+            if service.state.participants.first(where: { $0.id == info.me })?.needsUpdate == true {
+                NibBanner(String(localized: "Someone here uses a newer Nib. Update Nib to edit this document; until then you can view it."),
+                          style: .info, symbol: .eye)
+            } else {
+                NibBanner(String(localized: "You can view this document. The host can let you edit it."), style: .info,
+                          symbol: .eye)
+            }
         }
         NibInspectorSection(String(localized: "People")) {
             VStack(spacing: 0) {
@@ -529,7 +534,7 @@ struct JoinLiveSheet: View {
                         .disabled(joining)
                         .frame(minHeight: NibMetrics.hitTarget)
                 } footer: {
-                    Text(String(localized: "Ask the host for the code under Share Live, or scan their QR code with the Camera."))
+                    Text(String(localized: "Ask the host for the join code shown under Share Live."))
                 }
                 if service.relayAvailable {
                     Section(String(localized: "Connection")) {
@@ -614,10 +619,11 @@ struct JoinRequestHUD: View {
                     .accessibilityHidden(true)
                 NibHUDText(p.name, secondary: more > 0 ? String(localized: "wants to join, and \(more) more")
                                                        : String(localized: "wants to join"))
-                NibIconButton(.xmark, label: String(localized: "Decline \(p.name)")) { decide(p, allow: false) }
-                NibIconButton(.checkmark, label: String(localized: "Approve \(p.name)")) { decide(p, allow: true) }
+                NibIconButton(.xmark, label: String(localized: "Decline \(p.name)"), size: .bar) { decide(p, allow: false) }
+                NibIconButton(.checkmark, label: String(localized: "Approve \(p.name)"), size: .bar) { decide(p, allow: true) }
             }
             .frame(height: NibMetrics.hudHeight)
+            .nibChromeTypeCap()
             .accessibilityElement(children: .contain)
             .accessibilityLabel(String(localized: "Join request from \(p.name)"))
         }

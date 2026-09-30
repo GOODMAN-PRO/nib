@@ -1,5 +1,6 @@
 import Foundation
 import MultipeerConnectivity
+import CryptoKit
 import os
 import NibContracts
 
@@ -7,17 +8,20 @@ import NibContracts
 /// `NSBonjourServices` as `_nib-collab._tcp` / `_nib-collab._udp`). Local network or peer-to-peer Wi-Fi and Bluetooth,
 /// no server, at most `kMCSessionMaximumNumberOfPeers` (8) devices per session including the host.
 ///
-/// - The host advertises a *discovery hash* of the join code (never the code itself) and accepts an invitation only
-///   when its context carries the *join proof* (a second hash of the code), so nearby devices that merely see the
-///   advertisement cannot connect. Admission into the live session is still the host's decision (`collab.approve`,
-///   CollabSession); this layer only moves bytes.
-/// - A joiner browses for the discovery hash, invites the first match and waits until it is connected.
+/// - The host advertises a random salt and a *discovery tag*: a MAC under a key derived from the join code and the
+///   salt with a slow hash (`CollabCode.sessionKey`), never the code itself, so what nearby devices overhear can't be
+///   matched against every code quickly. It accepts an invitation only when its context carries the *join proof*, a
+///   MAC of the joiner's own peer name under the same key, so an overheard proof is no use to another device.
+///   Admission into the live session is still the host's decision (`collab.approve`, CollabSession); this layer only
+///   moves bytes.
+/// - A session that is full advertises so ("f" = 1): a joiner then reports the folder-sync fallback without inviting.
+/// - A joiner browses for a matching tag, invites the first match and waits until it is connected.
 /// - Sessions require encryption. Every MultipeerConnectivity callback arrives on a private queue and is handed to the
 ///   main actor in order.
 /// - iOS drops the session about 30 s after the app is backgrounded; CollabService re-joins with the same code when
 ///   the app returns (ARCHITECTURE.md §10).
 @MainActor
-final class MultipeerTransport: CollabTransport {
+final class MultipeerTransport: CollabTransport, CollabJoinedHost {
     static let serviceType = "nib-collab"
     /// Devices per Multipeer session, the host included (8).
     static let cap = kMCSessionMaximumNumberOfPeers
@@ -36,6 +40,12 @@ final class MultipeerTransport: CollabTransport {
     private var advertiser: MCNearbyServiceAdvertiser?
     private var browser: MCNearbyServiceBrowser?
     private var code: String?
+    /// Host: the session's salt and key, and whether the advertisement says it is full.
+    private var salt = ""
+    private var key: SymmetricKey?
+    private var advertisedFull = false
+    /// Joiner: salts already checked against the code (the slow hash runs once per advertiser).
+    private var checkedSalts: [String: SymmetricKey?] = [:]
     /// Transport peers by the Multipeer id they connected with (the display name is a random token, so it is unique).
     private var known: [MCPeerID: CollabPeer] = [:]
     private var joinTarget: MCPeerID?
@@ -52,6 +62,9 @@ final class MultipeerTransport: CollabTransport {
         return s.connectedPeers.map { known[$0] ?? CollabPeer(id: $0.displayName, name: "") }
     }
 
+    /// The host this device invited (CollabJoinedHost).
+    var joinedHostPeerID: String? { joinTarget?.displayName }
+
     // MARK: CollabTransport
 
     func host(code: String, displayName: String) async throws {
@@ -62,12 +75,9 @@ final class MultipeerTransport: CollabTransport {
         s.delegate = link
         session = s
         self.code = code
-        let info = ["c": CollabCode.discoveryHash(code), "v": String(CollabMessage.protocolVersion),
-                    "n": String(displayName.prefix(32))]
-        let a = MCNearbyServiceAdvertiser(peer: me, discoveryInfo: info, serviceType: Self.serviceType)
-        a.delegate = link
-        advertiser = a
-        a.startAdvertisingPeer()
+        salt = CollabCode.makeSalt()
+        key = CollabCode.sessionKey(code, salt: salt)
+        advertise(full: false)
     }
 
     func join(code: String, displayName: String) async throws {
@@ -115,9 +125,18 @@ final class MultipeerTransport: CollabTransport {
         browser = nil
         session = nil
         code = nil
+        salt = ""
+        key = nil
+        advertisedFull = false
+        checkedSalts = [:]
         known = [:]
         joinTarget = nil
         finishJoin(NibError(.userDenied, String(localized: "Stopped looking for the live session.")))
+    }
+
+    /// What a joiner reports for an advertisement that says the session is full (nil when it isn't).
+    static func joinFailure(forAdvertisement info: [String: String]?, cap: Int) -> NibError? {
+        info?["f"] == "1" ? CollabGate.fullError(cap: cap) : nil
     }
 
     // MARK: Internals
@@ -136,6 +155,26 @@ final class MultipeerTransport: CollabTransport {
         return me
     }
 
+    /// (Re)starts advertising; a full session says so, so joiners get the folder-sync fallback instead of a refusal.
+    private func advertise(full: Bool) {
+        guard let me = localPeer, let key = key else { return }
+        advertiser?.stopAdvertisingPeer()
+        advertiser?.delegate = nil
+        let info = ["s": salt, "c": CollabCode.discoveryTag(key: key), "v": String(CollabMessage.protocolVersion),
+                    "n": String(displayName.prefix(32)), "f": full ? "1" : "0"]
+        let a = MCNearbyServiceAdvertiser(peer: me, discoveryInfo: info, serviceType: Self.serviceType)
+        a.delegate = link
+        advertiser = a
+        advertisedFull = full
+        a.startAdvertisingPeer()
+    }
+
+    private func updateFullness() {
+        guard let s = session, advertiser != nil else { return }
+        let full = s.connectedPeers.count >= maxPeers - 1
+        if full != advertisedFull { advertise(full: full) }
+    }
+
     private func finishJoin(_ error: Error?) {
         joinTimer?.cancel()
         joinTimer = nil
@@ -149,6 +188,16 @@ final class MultipeerTransport: CollabTransport {
         }
     }
 
+    /// The session key for an advertiser's salt when its tag matches our code (checked once per salt).
+    private func matchingKey(_ info: [String: String]?) -> SymmetricKey? {
+        guard let code = code, let salt = info?["s"], let tag = info?["c"], !salt.isEmpty, salt.count <= 64 else { return nil }
+        if let checked = checkedSalts[salt] { return checked }
+        let candidate = CollabCode.sessionKey(code, salt: salt)
+        let result: SymmetricKey? = CollabCode.matches(CollabCode.discoveryTag(key: candidate), tag) ? candidate : nil
+        checkedSalts[salt] = .some(result)
+        return result
+    }
+
     private func handle(_ event: MultipeerLink.Event) {
         switch event {
         case let .state(s, peer, state):
@@ -160,35 +209,43 @@ final class MultipeerTransport: CollabTransport {
             case .notConnected:
                 if peer == joinTarget, joinWaiter != nil {
                     finishJoin(NibError(.unavailable, String(localized: "The host's device didn't accept the connection."),
-                                        hint: "check the code; the session may be full"))
+                                        hint: "check the code and try again"))
                 }
             case .connecting:
                 return
             @unknown default:
                 return
             }
+            updateFullness()
             onPeersChanged?(peers)
         case let .data(s, data, peer):
             guard s === session else { return }
             onMessage?(known[peer] ?? CollabPeer(id: peer.displayName, name: ""), data)
         case let .invitation(a, peer, context, respond):
-            guard a === advertiser, let s = session, let code = code else {
+            guard a === advertiser, let s = session, let key = key else {
                 respond(false, nil)
                 return
             }
             let invite = context.flatMap { try? JSONDecoder().decode(Invite.self, from: $0) }
-            guard let i = invite, i.proof == CollabCode.joinProof(code), s.connectedPeers.count < maxPeers - 1 else {
+            // A Multipeer session can't hold more than 8 devices; the advertisement already tells joiners it is full.
+            guard let i = invite, CollabCode.matches(i.proof, CollabCode.joinProof(key: key, peer: peer.displayName)),
+                  s.connectedPeers.count < maxPeers - 1 else {
                 respond(false, nil)
                 return
             }
             known[peer] = CollabPeer(id: peer.displayName, name: String(i.name.prefix(64)))
             respond(true, s)
         case let .found(b, peer, info):
-            guard b === browser, joinTarget == nil, let s = session, let code = code,
-                  info?["c"] == CollabCode.discoveryHash(code) else { return }
+            guard b === browser, joinTarget == nil, joinWaiter != nil, let s = session, let me = localPeer,
+                  let key = matchingKey(info) else { return }
+            if let full = MultipeerTransport.joinFailure(forAdvertisement: info, cap: maxPeers) {
+                finishJoin(full)
+                return
+            }
             joinTarget = peer
             known[peer] = CollabPeer(id: peer.displayName, name: info?["n"] ?? "")
-            let context = try? JSONEncoder().encode(Invite(proof: CollabCode.joinProof(code), name: displayName))
+            let context = try? JSONEncoder().encode(Invite(proof: CollabCode.joinProof(key: key, peer: me.displayName),
+                                                           name: displayName))
             b.invitePeer(peer, to: s, withContext: context, timeout: 15)
         case let .lost(b, peer):
             guard b === browser, peer == joinTarget, joinWaiter != nil else { return }

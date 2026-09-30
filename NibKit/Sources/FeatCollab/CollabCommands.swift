@@ -354,10 +354,11 @@ enum CollabSharedStore {
 
 extension CollabService {
     /// Records a shared or received document (the join flow and F108's Shared tab read it). Written while
-    /// `collab.host` / `collab.join` run.
-    func rememberShared(local: DocumentID, remote: DocumentID, role: String, title: String, code: String?) {
+    /// `collab.host` / `collab.join` run; a guest's record keeps its admission secret (device-local, never synced).
+    func rememberShared(local: DocumentID, remote: DocumentID, role: String, title: String, code: String?,
+                        secret: String? = nil) {
         let record = CollabSharedDocument(local: local, remote: remote, role: role, title: title,
-                                          at: Date().timeIntervalSince1970, code: code)
+                                          at: Date().timeIntervalSince1970, code: code, secret: secret)
         guard let json = try? JSONValue.from(record) else { return }
         app.settings.setJSON(CollabSharedStore.prefix + remote.raw, json)
     }
@@ -382,18 +383,28 @@ extension CollabService {
     }
 
     /// Saves a host's snapshot into the Shared folder and returns the document's id in this library (the host's id
-    /// unless this library already uses it). Runs while `collab.join` waits.
-    func importSnapshot(_ s: CollabMessage.Snapshot, author: String) async throws -> DocumentID {
+    /// unless this library already uses it). Runs while `collab.join` waits. A package arrives as a file (`file`,
+    /// checked against its `blob` header and unpacked off the main actor).
+    func importSnapshot(_ s: CollabMessage.Snapshot, blob: CollabMessage.Blob?, file: URL?,
+                        author: String) async throws -> DocumentID {
         guard let library = app.services.library else { throw NibError.unavailable("the library") }
         let folder = try sharedFolder(library)
         switch s.format {
         case .package:
-            guard let data = s.data else {
+            guard let file = file, let blob = blob else {
                 throw NibError.invalid(String(localized: "The shared document arrived empty."))
             }
-            let package = try await Task.detached(priority: .userInitiated) { try CollabPackageIO.unzip(data) }.value
+            let package = try await Task.detached(priority: .userInitiated) { () throws -> URL in
+                let (bytes, sha) = try CollabBlobIO.digest(of: file)
+                guard bytes == blob.bytes, sha == blob.sha256.lowercased() else {
+                    throw NibError.invalid(String(localized: "The shared document arrived damaged."))
+                }
+                return try CollabPackageIO.unzip(file: file)
+            }.value
             defer { try? FileManager.default.removeItem(at: CollabPackageIO.scratchFolder(of: package)) }
-            return try library.importPackage(at: package, into: folder)
+            let local = try library.importPackage(at: package, into: folder)
+            keepReceivedMetaLocal(local)
+            return local
         case .content:
             guard var snapshot = s.content else {
                 throw NibError.invalid(String(localized: "The shared document arrived empty."))
@@ -407,5 +418,16 @@ extension CollabService {
             app.bus.applyRemote(patch, origin: CollabSession.originPrefix + author)
             return local
         }
+    }
+
+    /// A received package keeps none of the host's device-local meta (favourite, lock, where it was trashed from, its
+    /// source file). Written as bookkeeping from this device: never recorded for undo and never sent.
+    func keepReceivedMetaLocal(_ doc: DocumentID) {
+        guard let meta = try? app.workspace.content(doc).meta else { return }
+        var clean = CollabSession.receivedMeta(meta)
+        clean.id = doc
+        guard clean != meta else { return }
+        clean.rev = app.clock.tick()
+        app.bus.applyRemote(DocumentPatch(doc: doc, meta: clean), origin: CollabSession.localOrigin)
     }
 }

@@ -56,7 +56,7 @@ struct CollabParticipant: Codable, Equatable, Identifiable {
     var page: String?
     /// Unix seconds.
     var joinedAt: Double
-    /// Their Nib is older than the document's format, so they can only view until they update (S-100).
+    /// Their Nib is older than the newest one in the session, so they can only view until they update (S-100).
     var needsUpdate: Bool
 
     init(id: String, name: String, role: CollabRole, state: CollabParticipantState, isHost: Bool, colorIndex: Int,
@@ -137,7 +137,9 @@ struct CollabSessionInfo: Equatable {
     var hostName: String
     var transport: String
     var phase: CollabPhase
-    /// The oldest participant's `NibFormat.version`: features newer than it stay off in this session (S-100).
+    /// The oldest admitted participant's `NibFormat.version` (S-100). What is enforced: participants older than the
+    /// newest Nib in the session can only view (`CollabParticipant.needsUpdate`). Turning newer features off per
+    /// document needs an effective-format contract features can read, which does not exist yet.
     var sessionFormat: Int
     /// Most participants the transport carries (8 nearby, 50 over the relay; S-101).
     var cap: Int
@@ -156,6 +158,20 @@ struct CollabSharedDocument: Codable, Equatable {
     /// Unix seconds of the last session.
     var at: Double
     var code: String?
+    /// A guest's admission secret for the session under `code`: after the app is relaunched it re-joins without a
+    /// second approval. Device-local (the store is never synced).
+    var secret: String?
+
+    init(local: DocumentID, remote: DocumentID, role: String, title: String, at: Double, code: String?,
+         secret: String? = nil) {
+        self.local = local
+        self.remote = remote
+        self.role = role
+        self.title = title
+        self.at = at
+        self.code = code
+        self.secret = secret
+    }
 }
 
 // MARK: - Hooks

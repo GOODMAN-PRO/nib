@@ -73,6 +73,108 @@ final class CollabPair {
     static func hasItem(_ h: Harness, _ id: String, page: PageID = Fixtures.page1, doc: DocumentID = Fixtures.docID) -> Bool {
         (try? h.app.workspace.item(doc, page: page, id: NibID(id))) != nil
     }
+
+    static func image(_ id: String, asset: AssetRef) -> Item {
+        Item(id: NibID(id), kind: .image, z: "", image: ImageItem(frame: Frame(x: 40, y: 40, w: 120, h: 90), asset: asset))
+    }
+
+    /// Another device (id `deviceID`) that joins with `code` and is let in; `format` stands in for its Nib version.
+    func addGuest(_ deviceID: UInt32, name: String, code: String,
+                  format: Int = NibFormat.version) async throws -> (Harness, InMemoryCollabTransport) {
+        let h = Harness(features: [FeatCollabFeature.self], deviceID: deviceID)
+        let transport = InMemoryCollabTransport(hub: hub, peerID: "peer-\(deviceID)")
+        CollabPair.prepare(h, transport: transport, name: name)
+        CollabService.of(h.app)?.formatVersion = format
+        let pending = hostService.state.pending.count
+        let task = startJoin(code, on: h)
+        try await waitForRequest(count: pending + 1)
+        try await host.run("collab.approve", ["participant": .string(String(format: "%08x", deviceID)), "allow": true])
+        _ = try await task.value
+        return (h, transport)
+    }
+
+    /// The kinds of the messages in `frames` (what a transport sent).
+    static func kinds(_ frames: [Data]) throws -> [CollabMessage.Kind] {
+        let assembler = CollabFrames.Assembler()
+        var out: [CollabMessage.Kind] = []
+        for frame in frames {
+            switch try assembler.feed(frame, from: "sent", trusted: true, blobPolicy: { _ in CollabFrames.maxBlobBytes }) {
+            case .message(let m)?: out.append(m.kind)
+            case .blob(let m, let url)?:
+                out.append(m.kind)
+                try? FileManager.default.removeItem(at: url)
+            case nil: break
+            }
+        }
+        return out
+    }
+}
+
+/// A library that keeps packages on disk, so the host sends the zipped package (the production snapshot path): a
+/// package is a folder holding the document as JSON, and `importPackage` reads one back.
+@MainActor
+final class PackageLibrary: LibraryService {
+    struct Stored: Codable {
+        var content: DocumentContent
+        var items: [String: [Item]]
+    }
+
+    let base: InMemoryLibrary
+    let persistence: InMemoryPersistence
+    let packages: URL
+
+    init(_ h: Harness) {
+        base = h.library
+        persistence = h.persistence
+        packages = FileManager.default.temporaryDirectory.appendingPathComponent("collab-packages-" + UUID().uuidString,
+                                                                                 isDirectory: true)
+    }
+
+    /// Writes `doc` as it is now into its package folder.
+    func writePackage(_ doc: DocumentID, app: NibApp) throws {
+        let content = try app.workspace.content(doc)
+        var items: [String: [Item]] = [:]
+        for p in content.pages { items[p.id.raw] = try app.workspace.allItems(doc, page: p.id) }
+        let url = try XCTUnwrap(packageURL(doc))
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try JSONEncoder().encode(Stored(content: content, items: items)).write(to: url.appendingPathComponent("document.json"))
+    }
+
+    var rootURL: URL { base.rootURL }
+    var metadataURL: URL { base.metadataURL }
+    func allNodes() -> [LibraryNode] { base.allNodes() }
+    func node(_ id: NibID) -> LibraryNode? { base.node(id) }
+    func children(of folder: FolderID?) -> [LibraryNode] { base.children(of: folder) }
+
+    func packageURL(_ doc: DocumentID) -> URL? {
+        base.node(doc) == nil ? nil : packages.appendingPathComponent(doc.raw + "." + NibFormat.packageExtension, isDirectory: true)
+    }
+
+    func createDocument(_ content: DocumentContent, title: String, in folder: FolderID?) throws -> DocumentID {
+        try base.createDocument(content, title: title, in: folder)
+    }
+
+    func createFolder(title: String, in parent: FolderID?, style: FolderStyle?) throws -> FolderID {
+        try base.createFolder(title: title, in: parent, style: style)
+    }
+
+    func rename(_ id: NibID, to title: String) throws { try base.rename(id, to: title) }
+    func move(_ id: NibID, to folder: FolderID?) throws { try base.move(id, to: folder) }
+    func duplicate(_ id: NibID) throws -> NibID { try base.duplicate(id) }
+    func setStyle(_ style: FolderStyle, folder: FolderID) throws { try base.setStyle(style, folder: folder) }
+    func trash(_ id: NibID) throws { try base.trash(id) }
+    func trashedNodes() -> [LibraryNode] { base.trashedNodes() }
+    func restore(_ id: NibID, to folder: FolderID?) throws { try base.restore(id, to: folder) }
+    func deletePermanently(_ id: NibID) throws { try base.deletePermanently(id) }
+    func refresh() {}
+    func setRoot(_ url: URL) throws { try base.setRoot(url) }
+
+    func importPackage(at url: URL, into folder: FolderID?) throws -> DocumentID {
+        let stored = try JSONDecoder().decode(Stored.self, from: Data(contentsOf: url.appendingPathComponent("document.json")))
+        let id = try base.createDocument(stored.content, title: "Fixture Notebook", in: folder)
+        for (page, items) in stored.items { persistence.pageItems[id, default: [:]][PageID(page)] = items }
+        return id
+    }
 }
 
 @MainActor
@@ -131,9 +233,9 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(folder.parent, nil)
         XCTAssertEqual(try pair.host.snapshot(), try pair.guest.snapshot(doc))
 
-        // Live edits keep flowing into the received copy.
+        // Live edits keep flowing into the received copy (behind the document's files, which the digest found missing).
         try await pair.host.insert([CollabPair.stroke("AFTERJOIN001", x: 60)])
-        XCTAssertTrue(CollabPair.hasItem(pair.guest, "AFTERJOIN001", doc: doc))
+        try await waitUntil { CollabPair.hasItem(pair.guest, "AFTERJOIN001", doc: doc) }
         // The copy is remembered, so a later session with the same document reuses it.
         XCTAssertEqual(pair.guestService.localDocument(for: Fixtures.docID), doc)
         XCTAssertEqual(pair.guestService.sharedDocuments().first?.role, "guest")
@@ -311,7 +413,9 @@ final class FeatCollabTests: XCTestCase {
             XCTAssertTrue(e.message.contains("folder sync"), e.message)
         }
 
-        // A transport that is already full says the same.
+        // A transport that refuses a full room itself reports that it is unavailable (no text matching on its message);
+        // Multipeer advertises a full session instead, so its joiners get the folder-sync message (see
+        // CollabMergeTests.testDiscoveryNeverRevealsTheCode).
         let fourth = Harness(features: [FeatCollabFeature.self], deviceID: 10)
         let small = InMemoryCollabTransport(hub: pair.hub, peerID: "peer-fourth")
         small.maxPeers = 2
@@ -321,8 +425,9 @@ final class FeatCollabTests: XCTestCase {
             XCTFail("joined a full room")
         } catch let e as NibError {
             XCTAssertEqual(e.code, .unavailable)
-            XCTAssertTrue(e.message.contains("folder sync"), e.message)
         }
+        XCTAssertNil(CollabService.of(fourth.app)?.session)
+        XCTAssertEqual(pair.hostService.state.admitted.count, 2)
     }
 
     func testLockedDocumentsAreNeverHostedOrSent() async throws {
@@ -363,8 +468,13 @@ final class FeatCollabTests: XCTestCase {
                                         format: 1)
         XCTAssertEqual(CollabGate.effectiveFormat([host, old, waiting]), 2)
         XCTAssertEqual(CollabGate.effectiveFormat([]), NibFormat.version)
-        XCTAssertFalse(CollabGate.canEdit(format: 2, documentFormat: 3))
-        XCTAssertTrue(CollabGate.canEdit(format: 3, documentFormat: 3))
+        // Editing follows the newest Nib in the session: the host's own and every admitted participant's.
+        let newer = CollabParticipant(id: "d", name: "Di", role: .edit, state: .away, isHost: false, colorIndex: 3, format: 4)
+        XCTAssertEqual(CollabGate.newestFormat(host: 3, participants: [host, old, waiting]), 3)
+        XCTAssertEqual(CollabGate.newestFormat(host: 3, participants: [host, old, newer]), 4)
+        XCTAssertEqual(CollabGate.newestFormat(host: 3, participants: [host, CollabParticipant(id: "e", name: "Ed", role: .edit, state: .pending, isHost: false, colorIndex: 4, format: 9)]), 3)
+        XCTAssertFalse(CollabGate.canEdit(format: 2, newest: 3))
+        XCTAssertTrue(CollabGate.canEdit(format: 3, newest: 3))
         XCTAssertTrue(CollabGate.isFull(count: 8, cap: 8))
         XCTAssertFalse(CollabGate.isFull(count: 7, cap: 8))
         XCTAssertTrue(CollabGate.fullMessage(cap: 8).contains("folder sync"))
@@ -470,6 +580,16 @@ final class FeatCollabTests: XCTestCase {
         XCTAssertEqual(NibSnapshot.images(ShareLivePanel(service: pair.hostService, context: hostContext), size: panel).count, 3)
         let hud = JoinRequestHUD(service: pair.hostService, context: ChromeContext(app: pair.host.app, session: pair.host.session))
         XCTAssertEqual(NibSnapshot.images(hud, size: CGSize(width: 360, height: 40)).count, 3)
+        // Two people waiting: "Ben wants to join, and 1 more", capped at xxxLarge like every HUD so AX3 stays one row.
+        let cy = Harness(features: [FeatCollabFeature.self], deviceID: 9)
+        CollabPair.prepare(cy, transport: InMemoryCollabTransport(hub: pair.hub, peerID: "peer-cy"), name: "Cy Twombly")
+        let second = pair.startJoin(code, on: cy)
+        try await pair.waitForRequest(count: 2)
+        XCTAssertEqual(NibSnapshot.images(hud, size: CGSize(width: 360, height: 40)).count, 3)
+        XCTAssertNotNil(NibSnapshot.image(hud, size: CGSize(width: 360, height: 40), variant: .largeText))
+        XCTAssertLessThanOrEqual(NibSnapshot.fittingSize(hud, width: 360, variant: .largeText).height, 40.5)
+        try await pair.host.run("collab.approve", ["participant": "00000009", "allow": false])
+        _ = try? await second.value
         // At AX3 the panel keeps to the wide panel width (420 pt) and grows downwards.
         let fit = NibSnapshot.fittingSize(ShareLivePanel(service: pair.hostService, context: hostContext), width: 420,
                                           variant: .largeText)
@@ -488,6 +608,316 @@ final class FeatCollabTests: XCTestCase {
     func testConformance() async {
         let problems = await CommandConformance.check(features: [FeatCollabFeature.self])
         XCTAssertEqual(problems, [])
+    }
+
+    // MARK: Files travel with their records
+
+    func testAssetBytesTravelWithTheRecordsThatNeedThem() async throws {
+        let pair = CollabPair()
+        let code = try await pair.share()
+        try await pair.join(code)
+        let (cy, _) = try await pair.addGuest(9, name: "Cy", code: code)
+
+        // A guest adds an image: the host ends up with the record and the bytes, and relays both to everyone else.
+        let photo = Data("a photo Ben took \(UUID().uuidString)".utf8)
+        let ref = try pair.guest.assets.put(photo, ext: "png", doc: Fixtures.docID)
+        try await pair.guest.insert([CollabPair.image("GUESTIMAGE01", asset: ref)])
+        try await waitUntil {
+            CollabPair.hasItem(pair.host, "GUESTIMAGE01") && (try? pair.host.assets.data(ref, doc: Fixtures.docID)) == photo
+        }
+        try await waitUntil {
+            CollabPair.hasItem(cy, "GUESTIMAGE01") && (try? cy.assets.data(ref, doc: Fixtures.docID)) == photo
+        }
+
+        // The host's own image reaches the guests the same way, bytes ahead of the record.
+        let scan = Data("the host's scan \(UUID().uuidString)".utf8)
+        let scanRef = try pair.host.assets.put(scan, ext: "jpg", doc: Fixtures.docID)
+        try await pair.host.insert([CollabPair.image("HOSTIMAGE001", asset: scanRef)], page: Fixtures.page2)
+        try await waitUntil {
+            CollabPair.hasItem(pair.guest, "HOSTIMAGE001", page: Fixtures.page2)
+                && (try? pair.guest.assets.data(scanRef, doc: Fixtures.docID)) == scan
+        }
+        XCTAssertTrue(CollabPair.hasItem(cy, "HOSTIMAGE001", page: Fixtures.page2))
+        XCTAssertEqual(try? cy.assets.data(scanRef, doc: Fixtures.docID), scan)
+    }
+
+    func testReceivedFilesMustMatchTheirNames() throws {
+        let h = Harness(features: [FeatCollabFeature.self])
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("collab-store-" + UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let bytes = Data("the real image".utf8)
+        let name = try h.assets.putTemporary(bytes, ext: "png").name
+        func received(_ data: Data) throws -> (URL, CollabMessage.Blob) {
+            let url = dir.appendingPathComponent(UUID().uuidString)
+            try data.write(to: url)
+            let d = try CollabBlobIO.digest(of: url)
+            return (url, CollabMessage.Blob(id: CollabCode.hex(CollabBlobIO.newID()), bytes: d.bytes, sha256: d.sha256))
+        }
+        // Other bytes under an existing name are refused (content addressing), and so is a damaged transfer.
+        var (file, blob) = try received(Data("something else".utf8))
+        XCTAssertFalse(CollabSession.store(file: file, blob: blob, name: name, destination: nil, assets: h.assets,
+                                           doc: Fixtures.docID))
+        (file, blob) = try received(bytes)
+        var damaged = blob
+        damaged.sha256 = String(repeating: "0", count: 64)
+        XCTAssertFalse(CollabSession.store(file: file, blob: damaged, name: name, destination: nil, assets: h.assets,
+                                           doc: Fixtures.docID))
+        XCTAssertThrowsError(try h.assets.data(AssetRef(name), doc: Fixtures.docID))
+        // A SHA-256 name must be the hash of the bytes.
+        (file, blob) = try received(bytes)
+        XCTAssertFalse(CollabSession.store(file: file, blob: blob, name: String(repeating: "a", count: 64) + ".png",
+                                           destination: nil, assets: h.assets, doc: Fixtures.docID))
+        // The real thing is stored under its name.
+        (file, blob) = try received(bytes)
+        XCTAssertTrue(CollabSession.store(file: file, blob: blob, name: name, destination: nil, assets: h.assets,
+                                          doc: Fixtures.docID))
+        XCTAssertEqual(try h.assets.data(AssetRef(name), doc: Fixtures.docID), bytes)
+        XCTAssertFalse(fm.fileExists(atPath: file.path))
+    }
+
+    // MARK: Locked copies
+
+    func testJoiningWithALockedCopySendsNothing() async throws {
+        let pair = CollabPair()
+        pair.guest.app.services.lock = FakeLockService(locked: [Fixtures.docID])
+        let code = try await pair.share()
+        let join = pair.startJoin(code)
+        try await pair.waitForRequest()
+        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        do {
+            _ = try await join.value
+            XCTFail("joined with a locked copy")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .locked)
+        }
+        XCTAssertNil(pair.guestService.session)
+        // Only a hello and a bye ever left the guest: no digest, no records.
+        XCTAssertEqual(try CollabPair.kinds(pair.guestTransport.sent), [.hello, .bye])
+        // The host carries on without it, and nothing it sends reaches the locked copy.
+        XCTAssertNotNil(pair.hostService.session)
+        XCTAssertEqual(pair.hostService.state.admitted.count, 1)
+        try await pair.host.insert([CollabPair.stroke("NOTINLOCKED1", x: 70)])
+        XCTAssertFalse(CollabPair.hasItem(pair.guest, "NOTINLOCKED1"))
+    }
+
+    func testAGuestLockingItsCopyLeavesWithoutEndingTheSession() async throws {
+        let pair = CollabPair()
+        let code = try await pair.share()
+        try await pair.join(code)
+        let lockID = "test.lockDocument"
+        pair.guest.app.commands.register(CommandDescriptor(id: lockID, title: "Lock", summary: "Test helper.",
+                                                           effect: .edit, exposure: .ui)) { _, ctx in
+            try ctx.mutate { tx in
+                var meta = try tx.content(Fixtures.docID).meta
+                meta.locked = true
+                try tx.putMeta(meta)
+            }
+            return .null
+        }
+        try await pair.guest.run(lockID)
+        XCTAssertNil(pair.guestService.session)
+        XCTAssertEqual(pair.guestService.state.message, "Your copy is locked, so you left the live session.")
+        // The host's session runs on, and the lock (device-local) never reached it.
+        XCTAssertNotNil(pair.hostService.session)
+        XCTAssertEqual(pair.hostService.state.admitted.count, 1)
+        XCTAssertEqual(try pair.host.app.workspace.content(Fixtures.docID).meta.locked, false)
+        XCTAssertFalse(try CollabPair.kinds(pair.guestTransport.sent).contains(.patch))
+    }
+
+    // MARK: Re-joining
+
+    func testHostSuspendThenGuestsRejoinWithoutApproval() async throws {
+        let pair = CollabPair()
+        pair.guestService.timing.retryDelays = [0.2, 0.4, 0.8, 1.6, 3.2]
+        let code = try await pair.share()
+        try await pair.join(code)
+
+        // iOS drops the host's connection while it is in the background; it keeps editing meanwhile.
+        pair.hostService.didEnterBackground()
+        pair.hostTransport.leave()
+        XCTAssertEqual(pair.guestService.session?.phase, .reconnecting)
+        try await pair.host.insert([CollabPair.stroke("HOSTAWAY0001", x: 90)])
+
+        // Back in the foreground the host advertises again, and the guest re-joins with its secret.
+        await pair.hostService.resumeAfterSuspend()
+        try await waitUntil {
+            pair.guestService.session?.phase == .active
+                && pair.hostService.session?.participants[CollabPair.guestID]?.state == .active
+        }
+        XCTAssertTrue(pair.hostService.state.pending.isEmpty)
+        XCTAssertTrue(CollabPair.hasItem(pair.guest, "HOSTAWAY0001"))
+        try await pair.guest.insert([CollabPair.stroke("GUESTBACK001", x: 110)])
+        XCTAssertTrue(CollabPair.hasItem(pair.host, "GUESTBACK001"))
+    }
+
+    func testARelaunchedGuestRejoinsWithTheSecretItKept() async throws {
+        let pair = CollabPair()
+        let code = try await pair.share()
+        try await pair.join(code)
+        XCTAssertNotNil(pair.guestService.sharedDocuments().first?.secret)
+
+        // iOS terminates the suspended guest: the connection drops and everything in memory is gone.
+        func relaunch() -> CollabService {
+            pair.guestService.session?.end(reason: nil, notify: false)
+            let fresh = CollabService(app: pair.guest.app, hooks: CollabHooks.of(pair.guest.app)!,
+                                      notifier: SilentCollabNotifier())
+            fresh.timing = pair.guestService.timing
+            pair.guest.app.services.set(fresh, for: CollabService.serviceKey)
+            return fresh
+        }
+        _ = relaunch()
+        XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .away)
+
+        // The same code again: back in without a second approval, and editing.
+        let rejoined = try await pair.guest.run("collab.join", ["code": .string(code)])
+        XCTAssertEqual(rejoined["role"]?.stringValue, "edit")
+        XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .active)
+        XCTAssertTrue(pair.hostService.state.pending.isEmpty)
+        try await pair.guest.insert([CollabPair.stroke("RELAUNCHED01", x: 130)])
+        XCTAssertTrue(CollabPair.hasItem(pair.host, "RELAUNCHED01"))
+
+        // Without the secret the host is asked again, instead of the device being refused for good.
+        let fresh = relaunch()
+        fresh.rememberShared(local: Fixtures.docID, remote: Fixtures.docID, role: "guest", title: "Fixture Notebook",
+                             code: code, secret: nil)
+        let join = pair.startJoin(code)
+        try await pair.waitForRequest()
+        XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .pending)
+        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        _ = try await join.value
+        XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.state, .active)
+    }
+
+    // MARK: S-100: older and newer Nibs
+
+    func testAnOlderGuestCanOnlyViewUntilItUpdates() async throws {
+        let pair = CollabPair()
+        pair.guestService.formatVersion = NibFormat.version - 1
+        let code = try await pair.share()
+        let joined = try await pair.join(code)
+        XCTAssertEqual(joined["role"]?.stringValue, "view")
+        XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.needsUpdate, true)
+        let sessionID = try XCTUnwrap(pair.hostService.session?.id)
+
+        // Its edits are refused on its device, and a patch it sends anyway never lands.
+        do {
+            try await pair.guest.insert([CollabPair.stroke("OLDEREDIT001", x: 30)])
+            XCTFail("an older Nib edited the shared document")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .permissionDenied)
+        }
+        try forgePatch(pair, session: sessionID, item: CollabPair.stroke("FORGEDOLD001", x: 20))
+        XCTAssertFalse(CollabPair.hasItem(pair.host, "FORGEDOLD001"))
+        do {
+            _ = try await pair.host.run("collab.setRole", ["participant": .string(CollabPair.guestID), "role": "edit"])
+            XCTFail("an older Nib was made an editor")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .unsupported)
+        }
+
+        // Updated and back: the role the host chose returns.
+        pair.guestService.formatVersion = NibFormat.version
+        pair.guestTransport.leave()
+        await pair.guestService.resumeAfterSuspend()
+        XCTAssertEqual(pair.guestService.session?.myRole, .edit)
+        XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.needsUpdate, false)
+        try await pair.guest.insert([CollabPair.stroke("UPDATEDEDIT1", x: 40)])
+        XCTAssertTrue(CollabPair.hasItem(pair.host, "UPDATEDEDIT1"))
+
+        // Someone with a newer Nib arrives: the others can only view until they update; when it leaves, they edit.
+        let (newer, _) = try await pair.addGuest(9, name: "Cy", code: code, format: NibFormat.version + 1)
+        XCTAssertEqual(pair.hostService.session?.participants["00000009"]?.role, .edit)
+        XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.role, .view)
+        XCTAssertEqual(pair.guestService.session?.myRole, .view)
+        try await newer.run("collab.leave")
+        XCTAssertEqual(pair.guestService.session?.myRole, .edit)
+        XCTAssertEqual(pair.hostService.session?.participants[CollabPair.guestID]?.needsUpdate, false)
+    }
+
+    // MARK: Package snapshots
+
+    func testPackageSnapshotsArriveThroughTheLibraryWithoutTheHostsDeviceFields() async throws {
+        let pair = CollabPair(guestFixtures: false)
+        let hostLibrary = PackageLibrary(pair.host)
+        pair.host.app.services.library = hostLibrary
+        pair.guest.app.services.library = PackageLibrary(pair.guest)
+        defer { try? FileManager.default.removeItem(at: hostLibrary.packages) }
+        // The host's copy is its favourite, kept from a source file: neither is the guest's.
+        let markID = "test.markFavourite"
+        pair.host.app.commands.register(CommandDescriptor(id: markID, title: "Favourite", summary: "Test helper.",
+                                                          effect: .edit, exposure: .ui)) { _, ctx in
+            try ctx.mutate { tx in
+                var meta = try tx.content(Fixtures.docID).meta
+                meta.favorite = true
+                meta.sourceBookmark = Data([1, 2, 3])
+                try tx.putMeta(meta)
+            }
+            return .null
+        }
+        try await pair.host.run(markID)
+        try hostLibrary.writePackage(Fixtures.docID, app: pair.host.app)
+
+        let code = try await pair.share()
+        let joined = try await pair.join(code)
+        XCTAssertEqual(joined["received"]?.boolValue, true)
+        let doc = NodeRef.documentID(from: try XCTUnwrap(joined["doc"]?.stringValue))
+        let meta = try pair.guest.app.workspace.content(doc).meta
+        XCTAssertFalse(meta.favorite)
+        XCTAssertNil(meta.sourceBookmark)
+        XCTAssertEqual(pair.guest.undoDepth(doc), 0)
+        XCTAssertTrue(CollabPair.hasItem(pair.guest, Fixtures.strokeID.raw, doc: doc))
+        XCTAssertEqual(pair.guest.library.node(doc)?.parent.flatMap { pair.guest.library.node($0) }?.title, "Shared")
+        // The cleanup is the guest's own: the host keeps its favourite.
+        try await waitUntil { (try? pair.host.app.workspace.content(Fixtures.docID).meta.favorite) == true }
+        XCTAssertEqual(try pair.host.app.workspace.content(Fixtures.docID).meta.sourceBookmark, Data([1, 2, 3]))
+
+        // Live edits flow into the received copy.
+        try await pair.host.insert([CollabPair.stroke("PACKAGELIVE1", x: 50)])
+        try await waitUntil { CollabPair.hasItem(pair.guest, "PACKAGELIVE1", doc: doc) }
+    }
+
+    // MARK: Admission at the frame level
+
+    func testWaitingJoinersCantSendLargeMessages() async throws {
+        let pair = CollabPair()
+        let code = try await pair.share()
+        let join = pair.startJoin(code)
+        try await pair.waitForRequest()
+        let sessionID = try XCTUnwrap(pair.hostService.session?.id)
+        // A patch too large for one frame, from someone the host hasn't let in: dropped before it is reassembled.
+        var patch = DocumentPatch(doc: Fixtures.docID)
+        patch.items[Fixtures.page1.raw] = (0..<400).map { i -> Item in
+            // Scattered points, so the patch doesn't compress into one frame.
+            let points = (0..<60).map { _ in StrokePoint(x: Float.random(in: 0...500), y: Float.random(in: 0...700),
+                                                         t: Float.random(in: 0...9)) }
+            var item = Item(id: NibID(String(format: "PREADMIT%04d", i)), kind: .stroke, z: "zz",
+                            stroke: Stroke(style: .defaultPen, points: points, t0: 1_700_000_500))
+            item.rev = pair.guest.app.clock.tick()
+            return item
+        }
+        let frames = try CollabFrames.frames(for: CollabMessage(kind: .patch, session: sessionID, from: CollabPair.guestID,
+                                                                patch: patch))
+        XCTAssertGreaterThan(frames.count, 1)
+        for frame in frames { try pair.guestTransport.send(frame, to: nil) }
+        XCTAssertFalse(CollabPair.hasItem(pair.host, "PREADMIT0000"))
+        try await pair.host.run("collab.approve", ["participant": .string(CollabPair.guestID), "allow": true])
+        _ = try await join.value
+        XCTAssertFalse(CollabPair.hasItem(pair.host, "PREADMIT0000"))
+    }
+
+    func testTheSessionEventCarriesATypedPayload() async throws {
+        let pair = CollabPair()
+        var payloads: [CollabSessionEventPayload] = []
+        let token = pair.host.app.events.subscribe { e in
+            if let p = e.decode(CollabSessionEventPayload.self) { payloads.append(p) }
+        }
+        defer { token.cancel() }
+        let code = try await pair.share()
+        try await pair.join(code)
+        XCTAssertTrue(payloads.contains { $0.event == "request" && $0.participant == CollabPair.guestID && $0.name == "Ben" })
+        XCTAssertTrue(payloads.contains { $0.event == "session" && $0.phase == "active" && $0.participants == 2 })
     }
 
     // MARK: Helpers
