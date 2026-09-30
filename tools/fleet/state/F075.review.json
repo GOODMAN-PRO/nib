@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCalendar/CalendarStore.swift: CalendarStore.begin (909-931, router install 921-929); FeatCalendarFeature.swift: start (45-47)",
+      "problem": "The reminder's Take Notes action can be lost when the app is not running. begin() sets UNUserNotificationCenter.current().delegate from FeatCalendarFeature.start. AppDelegate runs app.start(features) in a Task after didFinishLaunching has returned, and it awaits every earlier feature's start first. Apple requires the delegate to be set before the app finishes launching, otherwise incoming notification responses can be missed. The common case is a reminder firing 10 minutes before a meeting while Nib is terminated. The user taps Take Notes, Nib launches, and nothing happens because didReceive was delivered before a delegate existed. The spec's reminder criterion ('N minutes before with a Take notes action') fails on this path.",
+      "fix": "Install the CalendarNotificationRouter synchronously in FeatCalendarFeature.register, which runs inside didFinishLaunching, guarded by !NibApp.isHostlessTest. Keep chaining to the previous delegate. Store the router on the CalendarStore. Its handler appends the event id to a store queue (pendingTakeNotes) while the store has not begun or no session exists. begin() drains the queue, and so does the first NibEventType.sessionActivated if no window exists yet, by calling takeNotes(id, kind: nil, session:). Add a test: call the router's handler before begin(), then begin() with a fake provider holding that event, and assert that calendar.createNote ran (a calendar.notes.<id> link exists)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatCalendar/CalendarStore.swift: CalendarEventCache.prune (497-512), store (436-449), CalendarStore.event(id:principal:) (1041-1057); CalendarCommands.swift: CalendarEvents.run cache path (105-108)",
+      "problem": "The 400-day cache horizon breaks two paths. (1) Paging: prune(now:) drops events older or newer than 400 days, but it only drops ranges that lie entirely outside the horizon. Take calendar.events {from: 2025-06-01, to: 2026-06-01} run on 2026-10-01; results page at 20 KB, so a year of events always pages. Page 1 comes from the provider. For page 2+, lastSync(covering:) is non-nil because the stored range was kept, so the events come from the pruned cache, which lacks everything before 2025-08-27. The offset cursor then skips that many events silently, or throws 'cursor past the end'. The AI gets an incomplete answer with no error. (2) Take Notes: in See Other Events, pick a day more than 400 days away. The events show, because they come from the fetch result, but Take Notes fails with 'calendar event … not found'. event(id:) looks only in the cache, and fetch → store → prune has just removed the event.",
+      "fix": "In prune, clip every SyncedRange to [now - horizon, now + horizon] and drop ranges that become empty, so coverage never claims a span whose events were pruned. Later pages then re-read the provider and get the same sorted list. In event(id:), search the array fetch returns (`if let e = try await fetch(...).first(where: { $0.id == id }) { return e }`) before the cache. Tests: (a) store a range that starts 450 days ago and assert lastSync(covering:) is nil for the part outside the horizon; (b) page calendar.events over a range that starts 450 days ago, with more than one page, and assert every id is returned exactly once; (c) calendar.createNote for an event 450 days ago succeeds."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCalendar/CalendarStore.swift: CalendarEventID.make (110-125), EventKitCalendarProvider.convert (262-267)",
+      "problem": "A timed event's id hashes its start minute (occurrenceDate ?? start, which is the start for a non-recurring event), and the id's prefix is the start day. Moving a one-off meeting therefore gives it a new id, and the calendar.notes.<id> link no longer matches. The tab offers Take Notes again, and the reminder's Take Notes creates a second note beside the prepared one. The event→note map is lost for exactly the meetings that get rescheduled.",
+      "fix": "Add `key` (12 hex of SHA-256 over the external identifier alone, or external|original occurrence for recurring events) to NoteLink and to CalendarEvent. When noteLink(for:) misses, look up a calendar.notes.* entry with the same key through the settings prefix listing. When calendar.createNote or calendar.openNote finds one, rewrite it under the new id inside the command. Test: create a note, move the fake event by a day, and calendar.openNote on the new id opens the same doc."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCalendar/CalendarStore.swift: rescheduleReminders (1174-1189), UserNotificationScheduler.replace/registerCategory (750-788)",
+      "problem": "rescheduleReminders runs from didUpdateCache, backgroundRefresh and settingChanged, often concurrently. UserNotificationScheduler is not main-actor isolated, so replace() runs on the generic executor. Scenario: call A has read minutes = 10, then the user picks Off and call B starts. B reads pending, removes and adds nothing. A then adds its 10-minute plan. A reminder fires after reminders were turned off, until the next activation re-runs the plan. categoryRegistered is also mutated off-main without a lock.",
+      "fix": "Serialise the reschedules. Keep a `reminderTask: Task<Void, Never>?` on the store and have each call await the previous one, or keep a generation counter that is checked again after the awaits and before replace. Mark UserNotificationScheduler @MainActor (its UNUserNotificationCenter calls are async anyway)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCalendar/CalendarStore.swift: backgroundRefresh (967-982), CalendarReminderPlanner.window (674)",
+      "problem": "Reminders are planned only from events cached at the last foreground refresh, and EKEventStoreChanged is observed only while Nib runs. A meeting added in Calendar or Outlook after the last time Nib was opened gets no reminder, and after a week without opening Nib no reminders fire at all. Nothing tells the user.",
+      "fix": "File docs/contract-requests/F075-calendar-refresh.md asking for an `app.nib.calendar` BGTaskSchedulerPermittedIdentifiers entry. Meanwhile, say so in the Reminders footer ('Nib updates reminders when you open it'). Once the id exists, register a BackgroundTaskDescriptor(kind: .appRefresh) that runs backgroundRefresh(force: true), and schedule it from backgroundRefresh."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCalendar/CalendarPanel.swift: CalendarEventList (467)",
+      "problem": "`.id(store.revision)` gives the whole list a new identity on every cache update, which happens on every EKEventStoreChanged and every app activation. VoiceOver focus jumps back to the top, and an open context menu is dismissed. The store is already @ObservedObject and revision is @Published, so the body re-evaluates without it.",
+      "fix": "Remove `.id(store.revision)`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCalendar/CalendarPanel.swift: CalendarEventRow.summary (511, 527, 543)",
+      "problem": "Literal `spacing: 2` in two VStacks and `.frame(width: 4)` for the calendar colour bar. The slop checklist allows only tokens.",
+      "fix": "Use NibSpacing.xxs for the stack spacing and NibSpacing.xs for the bar width."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatCalendar/CalendarStore.swift: CalendarEventCache.loadIfNeeded (514-525)",
+      "problem": "The first cache access decodes calendar-cache.json synchronously while holding the lock. That file holds up to 5,000 events with attendees and 2,000-character notes, several MB. The first access is either the Calendar tab's subtitle and pill on the main actor, or a template render thread that the main actor then blocks on through the lock.",
+      "fix": "Add `func preload()` and call it from begin() in `Task.detached(priority: .utility) { cache.preload() }`, so the decode happens off the main actor before the UI needs it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatCalendarTests/FeatCalendarTests.swift",
+      "problem": "Risky paths have no tests: the notification router (Take Notes, and forwarding other categories to the previous delegate), event(id:) finding an event by fetch after a cache miss, the whiteboard note header, calendar.createNote as a dry run (no folder, doc or link written), and the horizon cases above. The new screens (Calendar tab, Other Events, New Event Planner, sync pill) have no NibSnapshot light, dark or AX3 renders (DESIGN.md §15.7).",
+      "fix": "Add tests for each path named above. Add NibSnapshot.images for CalendarTabBody in the granted, notDetermined and denied states with fake events, and assert a non-nil image at AX3."
+    }
+  ]
+}
