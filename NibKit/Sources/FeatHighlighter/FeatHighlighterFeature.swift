@@ -5,9 +5,9 @@ import NibDesign
 /// F009 Highlighter tool: the "highlighter" canvas tool (key H, PKInk.marker, presets "highlighter") in the writing
 /// tools group, its settings popover, and the stroke processors "highlighter.stabilize" and "highlighter.straight".
 /// It registers no commands of its own: the tool is chosen with `tool.select`, its settings change through
-/// `settings.set` (`highlighter.straightLine`, `highlighter.stabilization`, `highlighter.drawAndHold`), colour and
-/// thickness through `preset.*`, and Draw and Hold runs `shape.recognize` / `shape.create`. The renderer draws the
-/// captured strokes beneath ink (its multiply band).
+/// `settings.set` (`highlighter.straightLine`, `highlighter.stabilization`, and the shared `shapes.drawAndHold`),
+/// colour and thickness through `preset.*`, and Draw and Hold runs `shape.recognize` / `shape.create` and emits
+/// `shape.snapped`. The renderer draws the captured strokes beneath ink (its multiply band).
 public enum FeatHighlighterFeature: NibFeature {
     public static let id = "highlighter"
 

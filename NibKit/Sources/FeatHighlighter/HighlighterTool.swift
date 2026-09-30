@@ -8,15 +8,17 @@ import NibDesign
 // MARK: - Settings
 
 /// The highlighter's own settings (declared in `FeatHighlighterFeature.register`; changed only through `settings.set`).
-/// Colour and thickness live in the shared `presets.highlighter` setting (Tool Presets, `preset.*`).
+/// Colour and thickness live in the shared `presets.highlighter` setting (Tool Presets, `preset.*`). Draw and Hold is
+/// the shared `NibSettings.drawAndHold` ("shapes.drawAndHold", declared by the contracts), so the highlighter, the pen
+/// and Draw Shape follow one switch.
 enum HighlighterSettings {
     static let toolID = "highlighter"
     /// Draw in Straight Line.
     static let straightLine = SettingKey("highlighter.straightLine", default: false, synced: true)
     /// Stroke Stabilization: 0 (off) ... 1 (strongest).
     static let stabilization = SettingKey("highlighter.stabilization", default: 0.0, synced: true)
-    /// Draw and Hold: pausing at the end of a stroke snaps it to a shape.
-    static let drawAndHold = SettingKey("highlighter.drawAndHold", default: true, synced: true)
+    /// Draw and Hold: pausing at the end of a stroke snaps it to a shape. Read, never declared here (G13).
+    static var drawAndHold: SettingKey<Bool> { NibSettings.drawAndHold }
     static var presets: SettingKey<ToolPresets> { NibSettings.presets(toolID) }
 
     static func declare(in settings: SettingsStore, owner: String) {
@@ -24,8 +26,6 @@ enum HighlighterSettings {
                          owner: owner, schema: .bool())
         settings.declare(stabilization, summary: "Highlighter stroke stabilisation, 0 (off) to 1 (strongest).",
                          owner: owner, schema: .num(min: 0, max: 1))
-        settings.declare(drawAndHold, summary: "Highlighter: hold at the end of a stroke to snap it to a shape.",
-                         owner: owner, schema: .bool())
     }
 
     /// What the wet canvas captures with (PKInk.marker via `PKBridge`): the selected colour and thickness slot, solid.
@@ -38,8 +38,9 @@ enum HighlighterSettings {
 
 /// Canvas tool "highlighter": PencilKit wet ink with the marker ink. Finished strokes go through the stroke processors
 /// (stabilisation, straight line) to `ink.addStrokes`; the renderer draws them beneath ink in its multiply band.
-/// Draw and Hold: a stroke that rests at its end is sent to `shape.recognize`; a match follows the pen (scale, and
-/// rotation for point shapes) until lift and is committed with `shape.create` as a highlighter-drawn shape.
+/// Draw and Hold: a stroke that rests at its end is sent to `shape.recognize`; a match emits `shape.snapped` (the Pencil
+/// Pro haptic, F043), follows the pen (scale, and rotation for point shapes) until lift and is committed with
+/// `shape.create` as a highlighter-drawn shape.
 @MainActor
 final class HighlighterTool: CanvasTool {
     let id = HighlighterSettings.toolID
@@ -58,6 +59,8 @@ final class HighlighterTool: CanvasTool {
         /// The recognised shape in the stroke's style, before live adjustment.
         var recognised: ShapeItem?
         var shape: ShapeItem?
+        /// Neighbours the recogniser joined into the shape: deleted in the same undo step as `shape.create`.
+        var mergeWith: [String] = []
         var recognitionDone = false
         var touchEnded = false
     }
@@ -88,18 +91,19 @@ final class HighlighterTool: CanvasTool {
         layer.compositingFilter = "multiplyBlendMode"          // the wet highlighter's look (ARCHITECTURE §8.1)
         host.overlayLayer.addSublayer(layer)
         hold = Hold(generation: g, stroke: stroke, page: page, holdPoint: end, layer: layer, current: end)
-        host.cancelWetStroke()
+        host.cancelWetStroke()                                 // idempotent (G14): the canvas may have cancelled it
         refreshPreview(host)                                   // the ink stays visible while it is recognised
         Task { @MainActor [weak self] in
-            let shape = await HighlighterTool.recognise(stroke, host: host)
-            self?.recognitionFinished(shape, generation: g, host: host)
+            let found = await HighlighterTool.recognise(stroke, host: host)
+            self?.recognitionFinished(found, generation: g, host: host)
         }
         return true
     }
 
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {
         guard var h = hold, let sample = samples.last(where: { !$0.isPredicted }) ?? samples.last else { return }
-        h.current = point(sample, on: h.page, host: host)
+        // The pen may wander onto the next page: follow it in the held stroke's page coordinates.
+        h.current = host.convert(sample.location, from: sample.page, to: h.page) ?? h.current
         if let r = h.recognised { h.shape = HeldShape.adjusted(r, from: h.holdPoint, to: h.current) }
         hold = h
         if h.recognised != nil { refreshPreview(host) }
@@ -118,7 +122,7 @@ final class HighlighterTool: CanvasTool {
 
     // MARK: Draw and Hold
 
-    private static func recognise(_ stroke: Stroke, host: CanvasHost) async -> ShapeItem? {
+    private static func recognise(_ stroke: Stroke, host: CanvasHost) async -> HeldShape.Recognition? {
         let points = JSONValue.array(stroke.points.map { .array([.number(Double($0.x)), .number(Double($0.y))]) })
         do {
             let value = try await host.app.bus.execute(CommandIDs.shapeRecognize, ["points": points], session: host.session)
@@ -129,13 +133,19 @@ final class HighlighterTool: CanvasTool {
         }
     }
 
-    private func recognitionFinished(_ shape: ShapeItem?, generation g: Int, host: CanvasHost) {
+    private func recognitionFinished(_ found: HeldShape.Recognition?, generation g: Int, host: CanvasHost) {
         guard var h = hold, h.generation == g else { return }
         h.recognitionDone = true
-        if let shape {
-            let styled = HeldShape.styled(shape, like: h.stroke.style)
+        if let found {
+            let styled = HeldShape.styled(found.shape, like: h.stroke.style)
             h.recognised = styled
             h.shape = HeldShape.adjusted(styled, from: h.holdPoint, to: h.current)
+            h.mergeWith = found.mergeWith
+            // The snap, while the Pencil is still down: F043 plays the Pencil Pro haptic where it happened.
+            host.app.events.emit(ShapeSnappedPayload(page: NodeRef.page(host.documentID, h.page).description,
+                                                     shape: styled.shape.rawValue, point: h.current,
+                                                     session: host.session.id.raw),
+                                 doc: host.documentID)
         }
         hold = h
         if h.touchEnded { finishHold(host) } else { refreshPreview(host) }
@@ -145,19 +155,31 @@ final class HighlighterTool: CanvasTool {
         guard let h = hold else { return }
         hold = nil
         guard let shape = h.shape else {
-            h.layer.removeFromSuperlayer()
-            host.commitStroke(h.stroke, page: h.page)          // nothing snapped: keep the ink as drawn
+            HighlighterTool.keep(h.stroke, page: h.page, preview: h.layer, host: host)   // nothing snapped: as drawn
             return
         }
+        let app = host.app, session = host.session
         let params = HeldShape.createParams(shape, page: NodeRef.page(host.documentID, h.page).description)
+        let group = NibID.make().raw                           // the shape and the merged neighbours: one undo step
         Task { @MainActor in
             do {
-                try await host.app.bus.execute(CommandIDs.shapeCreate, params, session: host.session)
+                _ = try await app.bus.execute(Invocation(command: CommandIDs.shapeCreate, params: params,
+                                                         principal: .user, session: session, group: group))
             } catch {
                 HighlighterTool.log.error("shape.create failed, keeping the stroke: \(String(describing: error), privacy: .public)")
-                host.commitStroke(h.stroke, page: h.page)      // never lose what was drawn
+                HighlighterTool.keep(h.stroke, page: h.page, preview: h.layer, host: host)   // never lose what was drawn
+                return
             }
-            h.layer.removeFromSuperlayer()
+            if !h.mergeWith.isEmpty, app.commands.entry(CommandIDs.itemDelete) != nil {
+                do {
+                    _ = try await app.bus.execute(Invocation(command: CommandIDs.itemDelete,
+                                                             params: ["refs": .array(h.mergeWith.map { JSONValue.string($0) })],
+                                                             principal: .user, session: session, group: group))
+                } catch {
+                    HighlighterTool.log.error("removing merged shapes failed, keeping them: \(String(describing: error), privacy: .public)")
+                }
+            }
+            host.afterNextRender(page: h.page) { h.layer.removeFromSuperlayer() }   // no flicker before the dry shape
         }
     }
 
@@ -165,17 +187,30 @@ final class HighlighterTool: CanvasTool {
     private func abandonHold(_ host: CanvasHost) {
         guard let h = hold else { return }
         hold = nil
-        h.layer.removeFromSuperlayer()
-        host.commitStroke(h.stroke, page: h.page)
+        HighlighterTool.keep(h.stroke, page: h.page, preview: h.layer, host: host)
+    }
+
+    /// Commits the held stroke as ink; the preview stays until the committed stroke has rendered.
+    private static func keep(_ stroke: Stroke, page: PageID, preview: CALayer, host: CanvasHost) {
+        host.commitStroke(stroke, page: page) { result in
+            if case .failure(let error) = result {
+                HighlighterTool.log.error("keeping the stroke failed: \(String(describing: error), privacy: .public)")
+            }
+            host.afterNextRender(page: page) { preview.removeFromSuperlayer() }
+        }
     }
 
     private func refreshPreview(_ host: CanvasHost) {
         guard let h = hold else { return }
+        let transform = host.pageTransform(h.page)
+        func view(_ p: Point) -> CGPoint {
+            transform.map { CGPoint(x: p.x, y: p.y).applying($0) } ?? host.viewPoint(p, page: h.page)
+        }
         let path = CGMutablePath()
         for sub in h.shape.map(HeldShape.outline) ?? [h.stroke.polyline] {
             guard let first = sub.first else { continue }
-            path.move(to: host.viewPoint(first, page: h.page))
-            for p in sub.dropFirst() { path.addLine(to: host.viewPoint(p, page: h.page)) }
+            path.move(to: view(first))
+            for p in sub.dropFirst() { path.addLine(to: view(p)) }
         }
         CATransaction.begin()
         CATransaction.setDisableActions(true)                  // follows the pen; never animates
@@ -185,28 +220,30 @@ final class HighlighterTool: CanvasTool {
         h.layer.path = path
         CATransaction.commit()
     }
-
-    /// A sample in the held stroke's page coordinates (the pen may wander onto the next page).
-    private func point(_ sample: CanvasSample, on page: PageID, host: CanvasHost) -> Point {
-        guard sample.page != page, let frame = host.pageFrame(page), host.zoomScale > 0 else { return sample.location }
-        let v = host.viewPoint(sample.location, page: sample.page)
-        return Point(Double(v.x - frame.minX) / host.zoomScale, Double(v.y - frame.minY) / host.zoomScale)
-    }
 }
 
 /// Pure geometry of a Draw-and-Hold shape: decoding the recogniser's answer, live adjustment, preview outline and
-/// the `shape.create` call.
+/// the `shape.create` call. Shape points are CONTROL points (contracts-v2, `ShapeItem.points`), drawn the way the
+/// Shapes feature (F031) draws them, so the preview matches the shape that is created.
 enum HeldShape {
+    /// What `shape.recognize` found: the shape and the neighbours joined into it.
+    struct Recognition: Equatable {
+        var shape: ShapeItem
+        var mergeWith: [String] = []
+    }
+
     /// Kinds defined by their frame when they carry no points.
     static let boxKinds: Set<ShapeKind> = [.rectangle, .roundedRectangle, .ellipse, .triangle, .diamond]
     /// Kinds that keep their first point fixed while the pen adjusts them.
     static let openKinds: Set<ShapeKind> = [.line, .polyline, .arrow, .arc, .curve]
 
-    /// `shape.recognize` returns a ShapeItem, `{shape: ShapeItem, …}` or null.
-    static func decode(_ value: JSONValue) -> ShapeItem? {
+    /// `shape.recognize` returns `{shape: ShapeItem?, mergeWith?: [ref], confidence?}` (§6.5), or the ShapeItem fields
+    /// flattened next to `mergeWith` / `confidence` (F030's first build), or null.
+    static func decode(_ value: JSONValue) -> Recognition? {
         let json = value["shape"]?.objectValue != nil ? (value["shape"] ?? .null) : value
-        guard json["shape"]?.stringValue != nil else { return nil }
-        return try? json.decode(ShapeItem.self)
+        guard json["shape"]?.stringValue != nil, let shape = try? json.decode(ShapeItem.self) else { return nil }
+        let merged = value["mergeWith"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        return Recognition(shape: shape, mergeWith: merged)
     }
 
     /// The recognised shape drawn with this highlighter: its colour and width, no fill, solid.
@@ -221,8 +258,8 @@ enum HeldShape {
     }
 
     /// Scales (and, for point shapes, rotates) `shape` so the point that was at `hold` follows the pen to `current`,
-    /// about the shape's first point (open shapes) or its centre (closed shapes). Box shapes only scale: their frame
-    /// stays an upright `[x, y, w, h]`.
+    /// about the shape's first point (open shapes) or its centre (closed shapes). Box shapes only scale and keep their
+    /// frame's rotation. Control points move with the same similarity, so curves and arcs keep their form.
     static func adjusted(_ shape: ShapeItem, from hold: Point, to current: Point) -> ShapeItem {
         let isBox = shape.points.isEmpty
         let anchor = openKinds.contains(shape.shape) ? (shape.points.first ?? Point(shape.frame.x, shape.frame.y))
@@ -245,7 +282,7 @@ enum HeldShape {
             out.frame = Frame(x: c.x - w / 2, y: c.y - h / 2, w: w, h: h, rotation: shape.frame.rotation)
         } else {
             out.points = shape.points.map(moved)
-            if let r = Rect.bounding(out.points) { out.frame = Frame(r) }
+            if let r = Rect.bounding(out.points) { out.frame = Frame(r) }   // control points bound the outline
         }
         return out
     }
@@ -277,16 +314,11 @@ enum HeldShape {
             return [closed(own ?? [box(0, -hh), box(hw, 0), box(0, hh), box(-hw, 0)])]
         case .polygon:
             return [closed(s.points)]
-        case .arc, .curve:
+        case .curve:
+            return [curve(endpoints(s))]
+        case .arc:
             let p = endpoints(s)
-            guard p.count == 3 else { return [p] }
-            // A quadratic through the middle point: control = 2 * mid - (start + end) / 2.
-            let q = Point(2 * p[1].x - (p[0].x + p[2].x) / 2, 2 * p[1].y - (p[0].y + p[2].y) / 2)
-            return [(0...24).map { i -> Point in
-                let t = Double(i) / 24, u = 1 - t
-                return Point(u * u * p[0].x + 2 * u * t * q.x + t * t * p[2].x,
-                             u * u * p[0].y + 2 * u * t * q.y + t * t * p[2].y)
-            }]
+            return [p.count == 3 ? conic(p[0], p[1], p[2]) : p]
         case .arrow:
             let p = endpoints(s)
             guard let tip = p.last else { return [p] }
@@ -300,19 +332,84 @@ enum HeldShape {
         }
     }
 
-    /// `shape.create {page, shape, frame? | points?, style}`. Frames are `[x, y, w, h]` (ARCHITECTURE §6.1) and carry
-    /// no rotation, so a tilted box is sent as the polygon of its outline.
+    /// Samples per curve piece: 12 at least, then one per 6 pt of control polygon, at most 96 (a preview).
+    static func segments(_ controlLength: Double) -> Int {
+        guard controlLength.isFinite else { return 12 }
+        return max(12, min(96, Int((controlLength / 6).rounded(.up))))
+    }
+
+    /// A `.curve` through its control points: 2 a line, 3 a quadratic Bézier (start, control, end), 4 a cubic, more a
+    /// clamped uniform cubic B-spline. Every form stays inside the control points' hull.
+    static func curve(_ p: [Point]) -> [Point] {
+        func length(_ q: [Point]) -> Double { zip(q, q.dropFirst()).reduce(0) { $0 + $1.0.distance(to: $1.1) } }
+        func cubic(_ a: Point, _ b: Point, _ c: Point, _ d: Point, from k0: Int) -> [Point] {
+            let n = segments(length([a, b, c, d]))
+            return (k0...n).map { k in
+                let t = Double(k) / Double(n), u = 1 - t
+                let wa = u * u * u, wb = 3 * u * u * t, wc = 3 * u * t * t, wd = t * t * t
+                return Point(wa * a.x + wb * b.x + wc * c.x + wd * d.x, wa * a.y + wb * b.y + wc * c.y + wd * d.y)
+            }
+        }
+        switch p.count {
+        case 0...2:
+            return p
+        case 3:
+            let n = segments(length(p))
+            return (0...n).map { k in
+                let t = Double(k) / Double(n), u = 1 - t
+                return p[0] * (u * u) + p[1] * (2 * u * t) + p[2] * (t * t)
+            }
+        case 4:
+            return cubic(p[0], p[1], p[2], p[3], from: 0)
+        default:
+            let first = p[0], last = p[p.count - 1]
+            let q = [first, first] + p + [last, last]
+            var out = [first]
+            var start = first
+            for i in 0..<(q.count - 3) {
+                let c1 = (q[i + 1] * 4 + q[i + 2] * 2) * (1.0 / 6)
+                let c2 = (q[i + 1] * 2 + q[i + 2] * 4) * (1.0 / 6)
+                let end = (q[i + 1] + q[i + 2] * 4 + q[i + 3]) * (1.0 / 6)
+                out += cubic(start, c1, c2, end, from: 1)
+                start = end
+            }
+            return out
+        }
+    }
+
+    /// The conic weight that makes an isosceles (start, control, end) triangle a circular arc: the cosine of the angle
+    /// between the chord and the tangents (other triangles give an elliptic arc, still inside the hull).
+    static func conicWeight(_ a: Point, _ c: Point, _ b: Point) -> Double {
+        func angle(_ o: Point, _ p: Point, _ q: Point) -> Double {
+            let u = p - o, v = q - o
+            let lu = hypot(u.x, u.y), lv = hypot(v.x, v.y)
+            guard lu > 1e-9, lv > 1e-9 else { return 0 }
+            return acos(max(-1, min(1, (u.x * v.x + u.y * v.y) / (lu * lv))))
+        }
+        let theta = (angle(a, c, b) + angle(b, c, a)) / 2
+        return min(max(cos(theta), 0.05), 1)
+    }
+
+    /// An `.arc` [start, control, end]: the rational quadratic (conic) from `a` to `b` whose tangents meet at `c`.
+    static func conic(_ a: Point, _ c: Point, _ b: Point) -> [Point] {
+        let w = conicWeight(a, c, b)
+        let n = segments(a.distance(to: c) + c.distance(to: b))
+        return (0...n).map { k in
+            let t = Double(k) / Double(n), u = 1 - t
+            let d = u * u + 2 * u * t * w + t * t
+            return Point((u * u * a.x + 2 * u * t * w * c.x + t * t * b.x) / d,
+                         (u * u * a.y + 2 * u * t * w * c.y + t * t * b.y) / d)
+        }
+    }
+
+    /// `shape.create {page, shape, frame? | points?, style}`. Box shapes send their frame in the array form, with the
+    /// rotation as a 5th value when the pen turned them (`Frame.array`, §6.1); point shapes send their control points.
     static func createParams(_ s: ShapeItem, page: String) -> JSONValue {
         func list(_ points: [Point]) -> JSONValue { .array(points.map { .array([.number($0.x), .number($0.y)]) }) }
         var o: [String: JSONValue] = ["page": .string(page), "shape": .string(s.shape.rawValue)]
         o["style"] = (try? JSONValue.from(s.style)) ?? .null
         if s.points.isEmpty && boxKinds.contains(s.shape) {
-            if s.frame.rotation == 0 {
-                o["frame"] = .array([.number(s.frame.x), .number(s.frame.y), .number(s.frame.w), .number(s.frame.h)])
-            } else {
-                o["shape"] = .string(ShapeKind.polygon.rawValue)
-                o["points"] = list(Array((outline(s).first ?? []).dropLast()))
-            }
+            o["frame"] = .array(s.frame.array.map { JSONValue.number($0) })
         } else {
             o["points"] = list(s.points.isEmpty ? endpoints(s) : s.points)
         }
@@ -331,9 +428,9 @@ enum PresetEdit: Equatable {
 
     var command: String {
         switch self {
-        case .selectWidth: return "preset.select"
-        case .setWidth: return "preset.setWidth"
-        case .setColour: return "preset.setSwatch"
+        case .selectWidth: return CommandIDs.presetSelect
+        case .setWidth: return CommandIDs.presetSetWidth
+        case .setColour: return CommandIDs.presetSetSwatch
         }
     }
 
@@ -380,21 +477,15 @@ enum HighlighterUnits {
 }
 
 extension NibHighlighter {
-    var title: String {
-        switch self {
-        case .lemon: return String(localized: "Lemon")
-        case .apricot: return String(localized: "Apricot")
-        case .mint: return String(localized: "Mint")
-        case .sky: return String(localized: "Sky")
-        case .lilac: return String(localized: "Lilac")
-        case .blush: return String(localized: "Blush")
-        }
-    }
-
-    /// The preset ink: this highlighter at the translucency every highlighter preset carries.
+    /// The preset ink: this highlighter at the translucency every highlighter colour is stored with.
     var rgba: RGBA {
-        RGBA(UInt8((hex >> 16) & 0xFF), UInt8((hex >> 8) & 0xFF), UInt8(hex & 0xFF), RGBA.highlighterYellow.a)
+        RGBA(UInt8((hex >> 16) & 0xFF), UInt8((hex >> 8) & 0xFF), UInt8(hex & 0xFF), RGBA.highlighterAlpha)
     }
+}
+
+extension RGBA {
+    /// This colour as a highlighter ink: the same hue at `RGBA.highlighterAlpha` (custom colours keep the translucency).
+    var asHighlighter: RGBA { RGBA(r, g, b, RGBA.highlighterAlpha) }
 }
 
 // MARK: - Settings popover
@@ -430,7 +521,7 @@ struct HighlighterSettingsView: View {
                                 action: NibAction(String(localized: "Custom…")) { pickingColour = true }) {
                 HStack(spacing: 0) {
                     ForEach(NibHighlighter.allCases, id: \.self) { h in
-                        NibPenSwatch(NibSwatch(id: h.rawValue, color: h.color, name: h.title),
+                        NibPenSwatch(NibSwatch(highlighter: h),
                                      isSelected: sameColour(h.rgba, presets.color)) {
                             edit(.setColour(index: presets.selectedSwatch, color: h.rgba))
                         }
@@ -462,7 +553,7 @@ struct HighlighterSettingsView: View {
         .task(id: widthMM) { await commitWidth() }
         .sheet(isPresented: $pickingColour) {
             SystemColourPicker(initial: presets.color.uiColor, onPick: { picked in
-                edit(.setColour(index: presets.selectedSwatch, color: RGBA(picked).withAlpha(RGBA.highlighterYellow.alpha)))
+                edit(.setColour(index: presets.selectedSwatch, color: RGBA(picked).asHighlighter))
             }, onDone: { pickingColour = false })
             .presentationDetents([.medium, .large])
         }
