@@ -40,7 +40,7 @@ final class FakeBridge {
         s.declare(SettingKey(BridgeNames.originsSetting, default: [String]()), summary: "Origins.", owner: "bridge",
                   schema: .arr(.str()))
         app.commands.register(CommandDescriptor(
-            id: "bridge.setEnabled", title: "MCP Bridge", summary: "Start or stop the bridge (fake).",
+            id: CommandIDs.bridgeSetEnabled, title: "MCP Bridge", summary: "Start or stop the bridge (fake).",
             params: .obj(["enabled": .bool(), "rotateToken": .bool()], required: ["enabled"]),
             examples: [["enabled": false]], effect: .session, target: .app, extraScopes: [.security],
             owner: "bridge")) { [unowned self] json, ctx in
@@ -54,11 +54,11 @@ final class FakeBridge {
                 self.clients = []
             }
             ctx.services.settings.set(FakeBridge.enabledKey, on)
-            ctx.events.emit(BridgeNames.statusEvent, payload: ["state": .string(self.state)])
+            ctx.events.emit(NibEventType.bridgeStatus, payload: ["state": .string(self.state)])
             return ["enabled": .bool(on), "state": .string(self.state), "port": 7331, "tokenIssued": .bool(issued)]
         }
         app.commands.register(CommandDescriptor(
-            id: "bridge.status", title: "Bridge Status", summary: "Bridge state (fake).", examples: [[:]],
+            id: CommandIDs.bridgeStatus, title: "Bridge Status", summary: "Bridge state (fake).", examples: [[:]],
             effect: .read, target: .app, owner: "bridge")) { [unowned self] _, _ in
             self.status()
         }
@@ -90,6 +90,54 @@ final class FakeBridge {
         let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
         return "nib_" + String((0..<43).map { _ in alphabet.randomElement()! })
     }
+}
+
+/// The window's floating host (contracts-v2 G12), recording what the pill presents and dismisses.
+@MainActor
+final class FakeFloatingHost: FloatingHosting {
+    private(set) var presented: [String] = []
+    private(set) var dismissed: [String] = []
+    private var showing: Set<String> = []
+
+    func present(_ id: String, content: AnyView) {
+        presented.append(id)
+        showing.insert(id)
+    }
+
+    func dismiss(_ id: String) {
+        dismissed.append(id)
+        showing.remove(id)
+    }
+
+    func isPresenting(_ id: String) -> Bool { showing.contains(id) }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { true }
+    func removeAnchor(_ id: String) {}
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { rect }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
+}
+
+/// A window, recording the Settings pages it was asked to show.
+@MainActor
+final class FakeNavigator: SceneNavigator {
+    let session: EditorSession
+    var openDocuments: [DocumentID] = []
+    var activeDocument: DocumentID? { nil }
+    var rootViewController: UIViewController? { nil }
+    private(set) var settingsPages: [String?] = []
+
+    init(session: EditorSession) { self.session = session }
+
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {}
+    func closeDocument(_ doc: DocumentID) {}
+    func showLibrary(folder: FolderID?) {}
+    func showSettings(page: String?) { settingsPages.append(page) }
+    func presentModal(_ viewController: UIViewController) {}
+}
+
+/// Params of every call a fake command received.
+@MainActor
+final class CallLog {
+    var params: [JSONValue] = []
 }
 
 @MainActor
@@ -168,6 +216,38 @@ final class FeatBridgeUITests: XCTestCase {
         XCTAssertTrue(h.app.commands.all().filter { $0.owner == "bridgeui" }.isEmpty,
                       "every action runs F090's or the contracts' commands; F091 owns none (ARCHITECTURE §6.5)")
         XCTAssertFalse(monitor.isStarted, "register never subscribes; start does")
+    }
+
+    /// Shell v2 (contracts-v2.2) routes key commands by `KeyCommandRouting`: the Bridge Settings key is live in the
+    /// library (with and without tabs) and in every document kind, also while text is being edited, and nothing takes
+    /// its shortcut from it. F046's ⌥⌘B bookmark key (a `.document` key on the neighbouring chord) keeps its own.
+    func testBridgeSettingsKeyIsLiveInEveryWindowUnderShellRouting() throws {
+        let (h, _, _) = makeHarness(bridge: false)
+        let bookmark = KeyCommandDescriptor(id: "outline.bookmark", title: "Bookmark", shortcut: KeyShortcut("b", [.command, .option]),
+                                            command: CommandIDs.pageSetBookmarked, scope: .document, owner: "outline")
+        h.app.content.keyCommands.register(bookmark)
+        let key = try XCTUnwrap(h.app.content.keyCommands.get(BridgeUIIDs.keyCommand))
+        XCTAssertEqual(key.scope, .global)
+        XCTAssertNil(key.docKinds, "no document kind limits Settings")
+        XCTAssertNil(key.sessionParams)
+        XCTAssertEqual(key.resolvedParams(for: h.session), ["page": .string(BridgeUIIDs.settingsPage)],
+                       "the shell passes the page, whatever window is key")
+
+        var contexts = [KeyCommandContext(docKind: nil), KeyCommandContext(docKind: nil, hasTabs: true)]
+        for kind in DocumentKind.allCases {
+            contexts.append(KeyCommandContext(docKind: kind))
+            contexts.append(KeyCommandContext(docKind: kind, isEditingText: true, hasTabs: true))
+        }
+        for context in contexts {
+            XCTAssertTrue(key.isActive(in: context), "\(context)")
+            let live = KeyCommandRouting.active(h.app.content.keyCommands.all, in: context)
+            XCTAssertEqual(live.filter { $0.shortcut == BridgeUIIDs.keyShortcut }.map { $0.id }, [BridgeUIIDs.keyCommand],
+                           "\(context)")
+            XCTAssertTrue(KeyCommandRouting.overridesSystemKeys(key, in: context), "⇧⌥⌘B carries ⌘: \(context)")
+            if context.inDocument {
+                XCTAssertTrue(live.contains { $0.id == bookmark.id }, "⌥⌘B stays F046's: \(context)")
+            }
+        }
     }
 
     func testCommandsAndSettingsConform() async {
@@ -250,7 +330,8 @@ final class FeatBridgeUITests: XCTestCase {
 
         // A client connects: F090 emits bridge.status on sessions.
         fake?.clients = [["name": "claude-code", "lastSeen": .number(Date().timeIntervalSince1970), "calls": 0, "sessions": 1]]
-        h.app.events.emit(BridgeNames.statusEvent, payload: ["state": "listening"])
+        XCTAssertEqual(BridgeNames.statusEvent, NibEventType.bridgeStatus, "G27 names the G3 event")
+        h.app.events.emit(NibEventType.bridgeStatus, payload: ["state": "listening"])
         let connected = await eventually { monitor.snapshot?.clients.count == 1 }
         XCTAssertTrue(connected)
 
@@ -889,6 +970,62 @@ final class FeatBridgeUITests: XCTestCase {
         let failed = BridgeSnapshot.Call(client: "claude-code", tool: "nib_run", command: "item.delete", at: 999_999, ok: false,
                                          error: "user_denied")
         XCTAssertEqual(BridgeFormat.callText(failed, now: now), "item.delete by claude-code failed (user_denied), just now")
+    }
+
+    func testPillBudsItsDetailsFromTheWindowsFloatingHost() async throws {
+        let (h, _, monitor) = makeHarness()
+        try await h.run(CommandIDs.bridgeSetEnabled, ["enabled": true])
+        await monitor.refresh()
+        let host = FakeFloatingHost()
+        h.session.floatingHost = host
+        let navigator = FakeNavigator(session: h.session)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: navigator, kind: .notebook)
+        XCTAssertTrue(context.floatingHost === host, "the chrome hands the pill its window's floating host")
+        let state = BridgePillState()
+        state.error = "earlier failure"
+
+        BridgePillActions.toggleDetails(monitor: monitor, state: state, context: context)
+        XCTAssertEqual(host.presented, [BridgeUIIDs.detailsPopover])
+        XCTAssertTrue(state.detailsPresented)
+        XCTAssertNil(state.error, "opening the details clears the last failure")
+
+        BridgePillActions.toggleDetails(monitor: monitor, state: state, context: context)
+        XCTAssertFalse(state.detailsPresented, "a second tap closes the popover")
+        XCTAssertEqual(host.presented, [BridgeUIIDs.detailsPopover], "the popover is presented once and toggled")
+
+        BridgePillActions.toggleDetails(monitor: monitor, state: state, context: context)
+        XCTAssertTrue(state.detailsPresented)
+        BridgePillActions.dismissDetails(state: state, context: context)
+        XCTAssertFalse(state.detailsPresented)
+        XCTAssertEqual(host.dismissed, [BridgeUIIDs.detailsPopover], "the popover leaves with the pill")
+        XCTAssertEqual(navigator.settingsPages, [], "with a floating host the pill never leaves the document")
+    }
+
+    func testPillWithoutAFloatingHostOpensBridgeSettings() async throws {
+        let (h, _, monitor) = makeHarness()
+        let navigator = FakeNavigator(session: h.session)
+        let context = ChromeContext(app: h.app, session: h.session, navigator: navigator, kind: .notebook)
+        XCTAssertNil(context.floatingHost)
+        let state = BridgePillState()
+
+        // Without F027 the window's navigator shows the page.
+        BridgePillActions.toggleDetails(monitor: monitor, state: state, context: context)
+        XCTAssertEqual(navigator.settingsPages, [BridgeUIIDs.settingsPage])
+        XCTAssertFalse(state.detailsPresented)
+
+        // With F027, its settings.open {page} does (one path for the key, the pill and plugins).
+        let opened = CallLog()
+        h.app.commands.register(CommandDescriptor(
+            id: CommandIDs.settingsOpen, title: "Settings", summary: "Opens Settings (fake F027).",
+            params: .obj(["page": .str()]), examples: [[:]], effect: .session, target: .app, owner: "settings")) { json, _ in
+            opened.params.append(json)
+            return [:]
+        }
+        BridgePillActions.toggleDetails(monitor: monitor, state: state, context: context)
+        let ran = await eventually { !opened.params.isEmpty }
+        XCTAssertTrue(ran)
+        XCTAssertEqual(opened.params.first?["page"]?.stringValue, BridgeUIIDs.settingsPage)
+        XCTAssertEqual(navigator.settingsPages, [BridgeUIIDs.settingsPage], "settings.open took over from the navigator")
     }
 
     // MARK: Rendering

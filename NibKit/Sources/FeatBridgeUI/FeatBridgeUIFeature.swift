@@ -10,8 +10,9 @@ import NibDesign
 /// in the document chrome and "keep the screen awake while the bridge is on".
 ///
 /// The bridge itself is F090 (NibBridge), which this module cannot import: everything goes through its commands
-/// (`bridge.setEnabled {enabled, rotateToken?}`, `bridge.status`), the shared names in `BridgeNames` (contracts-v2 G27)
-/// and `settings.set`, always as the user, because every `security.*` setting and the token are user only.
+/// (`bridge.setEnabled {enabled, rotateToken?}`, `bridge.status`), the shared names in `BridgeNames` (contracts-v2 G27:
+/// settings, Keychain service and account), the `NibEventType.bridgeStatus` event (G3) and `settings.set`, always as
+/// the user, because every `security.*` setting and the token are user only.
 public enum FeatBridgeUIFeature: NibFeature {
     public static let id = "bridgeui"
 
@@ -33,6 +34,8 @@ public enum FeatBridgeUIFeature: NibFeature {
             isVisible: { _ in monitor.pillVisible },
             makeView: { context in AnyView(BridgeStatusPill(monitor: monitor, context: context)) }))
 
+        // `.global`, no `docKinds`, no `sessionParams` (contracts-v2.2 shell routing): live in the library and in every
+        // document kind, also while text has the keyboard (it carries ⌘), and the only command on its shortcut.
         app.content.keyCommands.register(KeyCommandDescriptor(
             id: BridgeUIIDs.keyCommand, title: String(localized: "Bridge Settings"),
             shortcut: BridgeUIIDs.keyShortcut, command: BridgeCalls.settingsOpenID,
@@ -118,7 +121,8 @@ enum BridgeCalls {
 }
 
 /// Opens Settings at the Bridge page: through F027's `settings.open` (so the key command, the pill and plugins take one
-/// path), or straight through the window's navigator in a build without F027.
+/// path), or straight through the window's navigator in a build without F027. The shell keeps `ui.activeNavigator` on
+/// the key window (contracts-v2.2), so either path opens Settings in the window the person works in.
 @MainActor
 enum BridgeNavigation {
     static func openSettings(_ app: NibApp, navigator: SceneNavigator?) {
@@ -291,7 +295,7 @@ enum BridgeToken {
 
 // MARK: - Monitor
 
-/// One per app: the latest `bridge.status`, refreshed when the bridge reports a change (`BridgeNames.statusEvent`),
+/// One per app: the latest `bridge.status`, refreshed when the bridge reports a change (`NibEventType.bridgeStatus`),
 /// when a bridge setting changes, and every few seconds while a status pill or the Bridge page is on screen (calls do
 /// not emit events, so the last call and client counts need the poll). It also keeps the screen awake while the bridge
 /// runs and asks the chrome to show or hide the pill.
@@ -334,7 +338,7 @@ final class BridgeMonitor: ObservableObject {
     func start() {
         guard subscription == nil, let app = app else { return }
         subscription = app.events.subscribe { [weak self] event in
-            guard event.type == BridgeNames.statusEvent else { return }
+            guard event.type == NibEventType.bridgeStatus else { return }
             Task { @MainActor in self?.scheduleRefresh() }
         }
         observers.append(NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,

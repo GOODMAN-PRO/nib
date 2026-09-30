@@ -130,7 +130,9 @@ struct BridgeStatusPill: View {
 
     var body: some View {
         let presentation = monitor.snapshot.map { BridgePillPresentation.make($0, compact: context.isCompact) }
-        Button(action: toggleDetails) {
+        Button {
+            BridgePillActions.toggleDetails(monitor: monitor, state: state, context: context)
+        } label: {
             HStack(spacing: NibSpacing.xxs) {
                 if let kind = presentation?.dot.statusKind {
                     NibStatusDot(kind)
@@ -150,24 +152,35 @@ struct BridgeStatusPill: View {
         .onAppear { monitor.watch() }
         .onDisappear {
             monitor.unwatch()
-            state.detailsPresented = false
-            context.floatingHost?.dismiss(BridgeUIIDs.detailsPopover)
+            BridgePillActions.dismissDetails(state: state, context: context)
         }
     }
+}
 
-    private func toggleDetails() {
-        let app = context.app
+/// What tapping the pill does. The details popover buds inside the window's droplet container through the window's
+/// floating host (`ChromeContext.floatingHost`, contracts-v2 G12), which the document chrome installs; a window
+/// without one (a chrome that has not installed it) opens Settings › Bridge instead, where the same details live.
+@MainActor
+enum BridgePillActions {
+    static func toggleDetails(monitor: BridgeMonitor, state: BridgePillState, context: ChromeContext) {
         guard let host = context.floatingHost else {
-            // A chrome without a floating host (older shells): the details live in Settings › Bridge.
-            BridgeNavigation.openSettings(app, navigator: context.navigator)
+            BridgeNavigation.openSettings(context.app, navigator: context.navigator)
             return
         }
         if !host.isPresenting(BridgeUIIDs.detailsPopover) {
-            host.present(BridgeUIIDs.detailsPopover,
-                         content: AnyView(BridgeDetailsPopover(monitor: monitor, state: state, app: app)))
+            let app = context.app
+            host.present(BridgeUIIDs.detailsPopover) {
+                BridgeDetailsPopover(monitor: monitor, state: state, app: app)
+            }
         }
         state.error = nil
         state.detailsPresented.toggle()
+    }
+
+    /// The pill left the chrome (bridge off, window closed): its popover goes with it.
+    static func dismissDetails(state: BridgePillState, context: ChromeContext) {
+        state.detailsPresented = false
+        context.floatingHost?.dismiss(BridgeUIIDs.detailsPopover)
     }
 }
 
