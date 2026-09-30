@@ -93,6 +93,13 @@ struct TableEdit: NibCommand {
                            hint: "one of: " + TableEditOp.allCases.map { $0.rawValue }.joined(separator: ", "))
         }
         let (doc, id) = try TableRefs.blockRef(p.ref)
+        guard !ctx.isReadOnly(doc), !(ctx.session?.document == doc && ctx.session?.readOnly == true) else {
+            throw NibError(.permissionDenied, "doc:\(doc.raw) is read-only",
+                           hint: "open an editable copy or leave read-only mode before editing the table")
+        }
+        if ctx.services.lock?.isLocked(doc) == true {
+            throw NibError(.locked, "doc:\(doc.raw) is locked", hint: "unlock it first")
+        }
         let request = TableEditing.Request(op, row: p.row, column: p.column, count: p.count, text: p.text, color: p.color,
                                            width: p.width, toRow: p.toRow, toColumn: p.toColumn, to: p.to, borders: p.borders)
         return try ctx.mutate { (tx: DocTransaction) -> Output in
@@ -143,10 +150,13 @@ struct TableExportCSV: NibCommand {
         let tables = content.liveBlocks.filter { $0.kind == .table }
         let index = tables.firstIndex { $0.id == id } ?? 0
         let table = TableOps.normalized(block.table)
-        let csv = TableOps.csv(table)
         let title = ctx.services.library?.node(doc)?.title ?? ""
         let assets = try ctx.services.require(ctx.services.assets, "the asset store")
-        let asset = try assets.putTemporary(TableExport.fileData(csv), ext: "csv")
+        let (csv, asset) = try await Task.detached(priority: .userInitiated) {
+            let csv = TableOps.csv(table)
+            let asset = try assets.putTemporary(TableExport.fileData(csv), ext: "csv")
+            return (csv, asset)
+        }.value
         var out = Output(name: TableExport.fileName(title, index: index, of: tables.count), asset: "tmp:" + asset.name,
                          rows: table.rows.count, columns: TableOps.columnCount(table), csv: csv, truncated: nil)
         if try JSONEncoder().encode(out).count > NibLimits.aiToolResultBytes {
@@ -192,7 +202,7 @@ enum TableExport {
     static func exporter(owner: String) -> ExporterDescriptor {
         var d = ExporterDescriptor(id: exporterID, title: String(localized: "CSV"), fileExtension: "csv",
                                    utType: UTType.commaSeparatedText.identifier, order: 600, owner: owner) { request, ctx in
-            try TableExport.write(request, ctx)
+            try await TableExport.write(request, ctx)
         }
         d.docKinds = [.textDocument]
         return d
@@ -220,7 +230,7 @@ enum TableExport {
 
     /// Every table of a text document as (file name, CSV), in document order.
     @MainActor
-    static func files(_ doc: DocumentID, _ ctx: CommandContext, title: String? = nil) throws -> [(name: String, csv: String)] {
+    static func files(_ doc: DocumentID, _ ctx: CommandContext, title: String? = nil) async throws -> [(name: String, csv: String)] {
         try checkUnlocked(doc, ctx)
         let content = try ctx.workspace.content(doc)
         guard content.meta.kind == .textDocument else {
@@ -233,22 +243,35 @@ enum TableExport {
                            hint: "add one with block.insert {doc, kind: \"table\"}")
         }
         let name = title ?? ctx.services.library?.node(doc)?.title ?? ""
-        return tables.enumerated().map { i, block in
-            (fileName(name, index: i, of: tables.count), TableOps.csv(TableOps.normalized(block.table)))
-        }
+        return await Task.detached(priority: .userInitiated) {
+            tables.enumerated().map { i, block in
+                (name: fileName(name, index: i, of: tables.count), csv: TableOps.csv(TableOps.normalized(block.table)))
+            }
+        }.value
     }
 
     /// `export.run {format: "tables.csv"}`: the files in a fresh temporary folder, names made unique.
     @MainActor
-    static func write(_ request: ExportRequest, _ ctx: CommandContext) throws -> [URL] {
+    static func write(_ request: ExportRequest, _ ctx: CommandContext) async throws -> [URL] {
+        guard !request.documents.isEmpty else {
+            throw NibError(.invalidParams, "choose a text document to export", path: "$.docs")
+        }
+        var snapshots: [(name: String, csv: String)] = []
+        for doc in request.documents {
+            let title = request.documents.count == 1 ? request.fileName : nil
+            snapshots += try await files(doc, ctx, title: title)
+        }
+        return try await Task.detached(priority: .userInitiated) { try writeFiles(snapshots) }.value
+    }
+
+    private static func writeFiles(_ snapshots: [(name: String, csv: String)]) throws -> [URL] {
         let fm = FileManager.default
         let dir = fm.temporaryDirectory.appendingPathComponent("tables-" + UUID().uuidString, isDirectory: true)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         var used = Set<String>()
         var urls: [URL] = []
-        for doc in request.documents {
-            let title = request.documents.count == 1 ? request.fileName : nil
-            for file in try files(doc, ctx, title: title) {
+        do {
+            for file in snapshots {
                 var name = file.name
                 let base = (name as NSString).deletingPathExtension
                 var n = 2
@@ -261,6 +284,9 @@ enum TableExport {
                 try fileData(file.csv).write(to: url, options: .atomic)
                 urls.append(url)
             }
+        } catch {
+            try? fm.removeItem(at: dir)
+            throw error
         }
         return urls
     }

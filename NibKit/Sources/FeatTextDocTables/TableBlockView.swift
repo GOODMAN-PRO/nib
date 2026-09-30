@@ -16,7 +16,7 @@ import NibDesign
 
 enum TableMetrics {
     /// The strip left of the rows and the band above the columns that hold the row, column and table handles.
-    static let gutter: CGFloat = NibSpacing.l
+    static let gutter: CGFloat = NibMetrics.hitTarget
     /// Room around the grid for the outer border and the 2 pt selection ring.
     static let edge: CGFloat = NibStroke.ring
     /// Text inset inside a cell (the editor's text container uses the same, so text never jumps).
@@ -25,7 +25,7 @@ enum TableMetrics {
     /// An automatic column is never narrower than two hit targets (the table then scrolls sideways).
     static let minAutoWidth: CGFloat = NibMetrics.hitTarget * 2
     /// How close to a column's right edge a drag must start to resize the column.
-    static let dividerSlop: CGFloat = NibSpacing.s
+    static let dividerSlop: CGFloat = NibMetrics.hitTarget / 2
     /// A handle's visible pill (thickness × length) inside its 44 pt hit area.
     static let handleThickness: CGFloat = NibSpacing.m
     static let handleLength: CGFloat = NibSpacing.xxl
@@ -343,6 +343,7 @@ enum TableAction: Equatable {
     case customBackground
     case setBorders(Bool)
     case automaticWidth
+    case resizeColumn(by: Double)
     case addRowAtEnd
     case addColumnAtEnd
     case copy
@@ -483,6 +484,14 @@ enum TableMenus {
                     ]))
                 }
                 let widths = TableOps.widths(t)
+                if c.count == 1 {
+                    out.append(TableMenuSection(id: "resize", title: String(localized: "Column Width"), kind: .buttons, items: [
+                        TableMenuItem(id: "narrower", title: String(localized: "Narrower"), fullTitle: String(localized: "Make Column Narrower"),
+                                      symbol: nil, action: .resizeColumn(by: -Double(NibSpacing.xxl))),
+                        TableMenuItem(id: "wider", title: String(localized: "Wider"), fullTitle: String(localized: "Make Column Wider"),
+                                      symbol: nil, action: .resizeColumn(by: Double(NibSpacing.xxl)))
+                    ]))
+                }
                 if c.contains(where: { widths.indices.contains($0) && widths[$0] > 0 }) {
                     out.append(TableMenuSection(id: "width", title: String(localized: "Width"), kind: .buttons, items: [
                         TableMenuItem(id: "auto", title: String(localized: "Automatic"),
@@ -667,6 +676,7 @@ enum TableSlash {
         let x = min(max(anchor.minX + halfW, b.minX + halfW), max(b.minX + halfW, b.maxX - halfW))
         var y = anchor.maxY + gap + halfH
         if y + halfH > b.maxY, anchor.minY - gap - size.height >= b.minY { y = anchor.minY - gap - halfH }
+        y = min(max(y, b.minY + halfH), max(b.minY + halfH, b.maxY - halfH))
         return CGPoint(x: x, y: y)
     }
 }
@@ -814,7 +824,7 @@ final class TableBlockView: UIView {
         relayout(width: NibMetrics.textColumnWidth, report: false)
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+    required init?(coder: NSCoder) { return nil }
 
     var ref: String { NodeRef.block(doc, blockID).description }
     var docRef: String { NodeRef.document(doc).description }
@@ -861,6 +871,7 @@ final class TableBlockView: UIView {
         columnHandle.layer.zPosition = 5
 
         editor.owner = self
+        undoProxy.owner = self
         editor.delegate = self
         editor.isHidden = true
         grid.addSubview(editor)
@@ -1140,6 +1151,7 @@ final class TableBlockView: UIView {
                       background: table.rows[p.row][p.column].background?.uiColor)
             view.showsText = !(p == editing && !editor.isHidden)
             view.accessibilityLabel = cellText(p).isEmpty ? String(localized: "Empty") : cellText(p).plainText
+            view.accessibilityHint = isReadOnly ? String(localized: "Select cell text") : String(localized: "Edit cell")
         }
         for (p, v) in Array(cellViews) where !seen.contains(p) {
             v.removeFromSuperview()
@@ -1359,6 +1371,16 @@ final class TableBlockView: UIView {
         }
     }
 
+    /// A priority Tab key command keeps Full Keyboard Access from moving focus out of the cell editor.
+    func navigationKey(_ command: UIKeyCommand) {
+        guard !editor.isBusy else { return }
+        if slash.isPresented {
+            if let item = slash.current { pickSlash(item) } else { closeSlash() }
+        } else {
+            moveToNextCell(forward: !command.modifierFlags.contains(.shift))
+        }
+    }
+
     private func move(_ direction: TableDirection, caret: Caret) -> Bool {
         guard let e = editing, let n = TableOps.neighbour(of: e, in: table, direction) else { return false }
         beginEditing(at: n, caret: caret)
@@ -1410,8 +1432,8 @@ final class TableBlockView: UIView {
         let params = TableEdit.Params(ref: ref, op: .setCell, row: pending.cell.row, column: pending.cell.column,
                                       text: pending.text)
         inFlight += 1
-        enqueue { [weak self] in
-            guard let self = self else { return }
+        // Keep the view alive until its last keystrokes reach the command bus, even when its block leaves screen.
+        enqueue { [self] in
             let ok = await self.execute(params, group: group) != nil
             self.inFlight -= 1
             // A refused write (a locked or read-only document, the block went): show the model again.
@@ -1477,7 +1499,7 @@ final class TableBlockView: UIView {
         flushTyping()
         newTypingGroup()
         let group = NibID.make().raw
-        if after == .clearSelection { select(.none) }
+        if after == .clearSelection { select(TableSelection.none) }
         enqueue { [weak self] in
             guard let self = self, let out = await self.execute(params, group: group) else { return }
             self.finish(after, out)
@@ -1516,7 +1538,7 @@ final class TableBlockView: UIView {
         enqueue { [weak self] in await self?.execute(CommandIDs.redo, params) }
     }
 
-    var canUndoDocument: Bool { app.bus.history.canUndo(doc) }
+    var canUndoDocument: Bool { pendingText != nil || inFlight > 0 || app.bus.history.canUndo(doc) }
     var canRedoDocument: Bool { app.bus.history.canRedo(doc) }
     var undoLabel: String { app.bus.history.undoLabel(doc) ?? "" }
     var redoLabel: String { app.bus.history.redoLabel(doc) ?? "" }
@@ -1596,6 +1618,10 @@ final class TableBlockView: UIView {
                     await self?.execute(TableEdit.Params(ref: ref, op: .setColumnWidth, column: c, width: 0), group: group)
                 }
             }
+        case .resizeColumn(let delta):
+            guard range.columnCount == 1, layout.columnWidths.indices.contains(range.left) else { return }
+            let width = min(max(Double(layout.columnWidths[range.left]) + delta, TableOps.minColumnWidth), TableOps.maxColumnWidth)
+            edit(TableEdit.Params(ref: ref, op: .setColumnWidth, column: range.left, width: width))
         case .addRowAtEnd:
             edit(TableEdit.Params(ref: ref, op: .insertRowAfter, column: caretColumn), after: typing ? .editCell : .keep)
         case .addColumnAtEnd:
@@ -1651,7 +1677,7 @@ final class TableBlockView: UIView {
         }
     }
 
-    /// Puts text on the pasteboard through clipboard.copyText (F014), or directly when that feature is missing.
+    /// Puts text on the pasteboard through clipboard.copyText (F014).
     private func copyToPasteboard(_ text: String) {
         let params: JSONValue = ["text": .string(text)]
         let session = self.session
@@ -1660,8 +1686,6 @@ final class TableBlockView: UIView {
             do {
                 _ = try await app.bus.execute(Invocation(command: "clipboard.copyText", params: params, principal: .user,
                                                          session: session))
-            } catch let e as NibError where e.code == .notFound || e.code == .unavailable {
-                UIPasteboard.general.string = text
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                                 userInfo: ["command": "clipboard.copyText", "error": NibError.wrap(error)])
@@ -1757,7 +1781,10 @@ final class TableBlockView: UIView {
 
     @discardableResult
     private func anchorMenu(_ source: UIView, rect: CGRect) -> Bool {
-        session.floatingHost?.setAnchor(menu.anchorID, rect: rect, in: source) ?? false
+        guard let host = session.floatingHost, host.setAnchor(menu.anchorID, rect: rect, in: source),
+              let anchor = host.containerRect(rect, from: source) else { return false }
+        if menu.anchor != anchor { menu.anchor = anchor }
+        return true
     }
 
     /// Keeps an open menu in step with the table (its target may have shrunk or gone).
@@ -1796,7 +1823,7 @@ final class TableBlockView: UIView {
         let current = target.range(in: table).flatMap { table.rows[$0.top][$0.left].background }
         picker.selectedColor = (current ?? TableColours.colour(.lemon)).uiColor
         picker.delegate = self
-        presenter.present(picker, animated: true)
+        presenter.present(picker, animated: !UIAccessibility.isReduceMotionEnabled)
     }
 
     private func nearestViewController() -> UIViewController? {
@@ -1934,7 +1961,7 @@ final class TableBlockView: UIView {
         guard plain else { return false }
         switch key.keyCode {
         case .keyboardEscape:
-            select(.none)
+            select(TableSelection.none)
             return true
         case .keyboardReturnOrEnter:
             if let r = selection.range(in: table) { beginEditing(at: r.origin, caret: .end) }
@@ -2020,6 +2047,8 @@ final class TableBlockView: UIView {
                 }
             }
             if span.columnCount == 1 {
+                list.append((String(localized: "Make Column Narrower"), .resizeColumn(by: -Double(NibSpacing.xxl)), .columns(span.columns)))
+                list.append((String(localized: "Make Column Wider"), .resizeColumn(by: Double(NibSpacing.xxl)), .columns(span.columns)))
                 if span.left > 0, TableOps.canMoveColumn(table, from: span.left, to: span.left - 1) {
                     list.append((String(localized: "Move Column Left"), .moveColumns(by: -1), .columns(span.columns)))
                 }
@@ -2423,7 +2452,7 @@ final class TableGridView: UIView, UIAccessibilityContainerDataTable {
         accessibilityContainerType = .dataTable
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+    required init?(coder: NSCoder) { return nil }
 
     func accessibilityDataTableCellElement(forRow row: Int, column: Int) -> UIAccessibilityContainerDataTableCell? {
         guard let owner = owner else { return nil }
@@ -2438,7 +2467,7 @@ final class TableGridView: UIView, UIAccessibilityContainerDataTable {
 }
 
 /// One visible cell at rest: its background and a top-aligned label.
-final class TableCellView: UIView, UIAccessibilityContainerDataTableCell {
+final class TableCellView: UIButton, UIAccessibilityContainerDataTableCell {
     weak var owner: TableBlockView?
     var position = CellPosition(row: 0, column: 0)
     var span = CellRange(CellPosition(row: 0, column: 0))
@@ -2456,10 +2485,12 @@ final class TableCellView: UIView, UIAccessibilityContainerDataTableCell {
         label.isAccessibilityElement = false
         addSubview(label)
         isAccessibilityElement = true
-        accessibilityTraits = .staticText
+        accessibilityTraits = .button
+        isPointerInteractionEnabled = true
+        addTarget(self, action: #selector(activateCell), for: .primaryActionTriggered)
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+    required init?(coder: NSCoder) { return nil }
 
     func show(_ text: NSAttributedString, textHeight: CGFloat, background: UIColor?) {
         if label.attributedText != text { label.attributedText = text }
@@ -2482,6 +2513,8 @@ final class TableCellView: UIView, UIAccessibilityContainerDataTableCell {
         owner?.beginEditing(at: position, caret: .end)
         return owner != nil
     }
+
+    @objc private func activateCell() { _ = accessibilityActivate() }
 
     override var accessibilityCustomActions: [UIAccessibilityCustomAction]? {
         get { owner?.accessibilityActions(for: position) ?? [] }
@@ -2512,7 +2545,7 @@ final class TableCellEditor: UITextView, UIAccessibilityContainerDataTableCell {
         }
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+    required init?(coder: NSCoder) { return nil }
 
     /// True while an IME composes or Writing Tools rewrites: the model never overwrites the view then.
     var isBusy: Bool {
@@ -2539,8 +2572,19 @@ final class TableCellEditor: UITextView, UIAccessibilityContainerDataTableCell {
     }
 
     override var keyCommands: [UIKeyCommand]? {
-        (super.keyCommands ?? []) + (owner?.tableKeyCommands(forEditor: true) ?? [])
+        var commands = (super.keyCommands ?? []) + (owner?.tableKeyCommands(forEditor: true) ?? [])
+        if !isBusy {
+            for flags: UIKeyModifierFlags in [[], .shift] {
+                let command = UIKeyCommand(title: flags.isEmpty ? String(localized: "Next Cell") : String(localized: "Previous Cell"),
+                                           action: #selector(navigationKey(_:)), input: "\t", modifierFlags: flags)
+                command.wantsPriorityOverSystemBehavior = true
+                commands.append(command)
+            }
+        }
+        return commands
     }
+
+    @objc private func navigationKey(_ sender: UIKeyCommand) { owner?.navigationKey(sender) }
 
     @objc func tableKeyCommand(_ sender: UIKeyCommand) {
         guard let name = sender.propertyList as? String, let a = TableKeyAction(rawValue: name) else { return }
@@ -2642,7 +2686,7 @@ final class TableHandleButton: UIButton {
         refresh()
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+    required init?(coder: NSCoder) { return nil }
 
     private func refresh() {
         pill.backgroundColor = isOn ? NibUIColor.accent : NibUIColor.fill3
@@ -2676,6 +2720,7 @@ final class TableMenuModel: ObservableObject {
     @Published private(set) var background: String?
     @Published private(set) var borders = true
     @Published private(set) var readOnly = false
+    @Published var anchor: CGRect = .zero
     var perform: ((TableAction) -> Void)?
     var onClose: (() -> Void)?
 
@@ -2697,15 +2742,24 @@ final class TableMenuModel: ObservableObject {
 
 struct TableMenuView: View {
     @ObservedObject var model: TableMenuModel
+    @State private var size = CGSize(width: NibMetrics.popoverWidth, height: NibMetrics.hitTarget * 4)
 
     var body: some View {
-        NibBudPopover(id: model.popoverID, source: model.anchorID, isPresented: $model.isPresented, title: model.title,
-                      subtitle: model.subtitle, placement: .below) {
-            VStack(alignment: .leading, spacing: NibSpacing.l) {
-                ForEach(model.sections) { section in
-                    TableMenuSectionView(section: section, model: model)
+        GeometryReader { proxy in
+            NibPopoverPanel(title: model.title, subtitle: model.subtitle,
+                            width: min(NibMetrics.popoverWidth, max(proxy.size.width - 2 * NibMetrics.chromeInset, NibMetrics.hitTarget))) {
+                VStack(alignment: .leading, spacing: NibSpacing.l) {
+                    ForEach(model.sections) { section in
+                        TableMenuSectionView(section: section, model: model)
+                    }
                 }
             }
+            .frame(maxHeight: max(proxy.size.height - 2 * NibMetrics.chromeInset, NibMetrics.hitTarget))
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
+            .droplet(model.popoverID, style: .popover)
+            .budsFrom(model.anchorID, isPresented: $model.isPresented)
+            .position(TableSlash.centre(size: size, near: model.anchor, gap: NibMetrics.popoverGap,
+                                        in: CGRect(origin: .zero, size: proxy.size)))
         }
     }
 }
@@ -2713,6 +2767,7 @@ struct TableMenuView: View {
 struct TableMenuSectionView: View {
     let section: TableMenuSection
     @ObservedObject var model: TableMenuModel
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     private static let columns = [GridItem(.flexible(), spacing: NibSpacing.s), GridItem(.flexible(), spacing: NibSpacing.s)]
 
@@ -2741,7 +2796,8 @@ struct TableMenuSectionView: View {
     }
 
     private var buttons: some View {
-        LazyVGrid(columns: TableMenuSectionView.columns, alignment: .leading, spacing: NibSpacing.s) {
+        LazyVGrid(columns: dynamicTypeSize.isAccessibilitySize ? [GridItem(.flexible())] : TableMenuSectionView.columns,
+                  alignment: .leading, spacing: NibSpacing.s) {
             ForEach(section.items) { item in
                 button(item, kind: .secondary)
             }
@@ -2817,9 +2873,11 @@ struct TableSlashMenuView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            NibPopoverPanel(title: String(localized: "Table"), subtitle: String(localized: "Type to filter")) {
+            NibPopoverPanel(title: String(localized: "Table"), subtitle: String(localized: "Type to filter"),
+                            width: min(NibMetrics.popoverWidth, max(proxy.size.width - 2 * NibMetrics.chromeInset, NibMetrics.hitTarget))) {
                 rows
             }
+            .frame(maxHeight: max(proxy.size.height - 2 * NibMetrics.chromeInset, NibMetrics.hitTarget))
             .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
             .droplet(model.dropletID, style: .popover)
             .budsFrom(model.anchorID, isPresented: $model.isPresented, instant: true)
