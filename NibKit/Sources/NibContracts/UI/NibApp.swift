@@ -40,6 +40,13 @@ public final class NibApp {
     public let content: ContentRegistries
     public let ui: UIRegistries
     public private(set) var featureIDs: [String] = []
+    /// contracts-v2: true once `start(_:)` has run every feature's `start` (registry changes after this point are
+    /// plugins, content packs or settings, not launch registration).
+    public private(set) var isStarted = false
+
+    /// contracts-v2: this app's device id as 8 lowercase hex characters (per-device package file names "doc.<hex>.json").
+    /// Equals `DeviceIdentity.hex` in the app; each `Harness(deviceID:)` gets its own.
+    public var deviceHex: String { clock.deviceHex }
 
     public init(persistence: DocumentPersistence? = nil, defaults: UserDefaults = .standard,
                 deviceID: UInt32 = DeviceIdentity.current, makeShared: Bool = true) {
@@ -51,6 +58,7 @@ public final class NibApp {
         let commands = CommandRegistry()
         let gateway = Gateway()
         let services = NibServices(settings: settings)
+        let content = ContentRegistries()
         self.events = events
         self.clock = clock
         self.settings = settings
@@ -59,8 +67,10 @@ public final class NibApp {
         self.gateway = gateway
         self.services = services
         self.bus = CommandBus(registry: commands, workspace: workspace, gateway: gateway, services: services, events: events)
-        self.content = ContentRegistries()
+        self.content = content
         self.ui = UIRegistries()
+        bus.content = content
+        bus.app = self
         services.sessions.events = events
         CoreCommands.register(commands)
         NibSettings.declareAll(settings)
@@ -92,6 +102,12 @@ public final class NibApp {
 
     public func start(_ features: [NibFeature.Type]) async {
         for f in features { await f.start(self) }
+        isStarted = true
+    }
+
+    /// contracts-v2: true when the document must not be written (see `CommandContext.isReadOnly`).
+    public func isReadOnly(_ doc: DocumentID) -> Bool {
+        workspace.isReadOnly(doc) || (services.get(ServiceKeys.storeReadOnly, as: NSSet.self)?.contains(doc.raw) ?? false)
     }
 
     /// Runs a command as the user from UI code (menus, buttons); errors are reported to the user by the shell.
