@@ -139,16 +139,43 @@ enum LinkPolicy {
     }
 }
 
-// MARK: - Linked text (text items and blocks)
+// MARK: - Linked text (items with laid-out text, and blocks)
 
-/// Where linkable typed text lives: a text box (`item:D/P/I`) or a text-document block (`block:D/B`).
-/// Sticky notes and shapes lay their text out in geometry their own features keep private, so `link.tapAt` could
-/// not follow a link there; they are refused rather than given links that do nothing.
+/// The typed text an item carries: a text box's text, a sticky note's text, a shape's or a connector's label.
+enum ItemText {
+    static func text(of item: Item) -> RichText? {
+        switch item.kind {
+        case .text: return item.text?.text
+        case .sticky: return item.sticky?.text
+        case .shape: return item.shape?.text
+        case .connector: return item.connector?.label
+        default: return nil
+        }
+    }
+
+    /// `item` with its text replaced; nil when the item carries no text.
+    static func replacing(_ text: RichText, in item: Item) -> Item? {
+        var out = item
+        switch item.kind {
+        case .text where item.text != nil: out.text?.text = text
+        case .sticky where item.sticky != nil: out.sticky?.text = text
+        case .shape where item.shape?.text != nil: out.shape?.text = text
+        case .connector where item.connector?.label != nil: out.connector?.label = text
+        default: return nil
+        }
+        return out
+    }
+}
+
+/// Where linkable typed text lives: an item whose feature lays its text out (`ContentRegistries.textLayout(for:)`:
+/// text boxes always, sticky notes, shape and connector labels once their features publish a layout), or a
+/// text-document block (`block:D/B`). Text without a published layout is refused, because `link.tapAt` could not
+/// find its glyphs and the link would do nothing.
 enum LinkedTextRef: Equatable {
     case item(DocumentID, PageID, ElementID)
     case block(DocumentID, NibID)
 
-    static let hint = "links go on text boxes (item:D/P/I) and text-document blocks (block:D/B)"
+    static let hint = "links go on text boxes, sticky notes and shape labels (item:D/P/I) and text-document blocks (block:D/B)"
 
     init(_ string: String) throws {
         switch NodeRef(string) {
@@ -157,7 +184,7 @@ enum LinkedTextRef: Equatable {
         case let .block(d, b)?:
             self = .block(d, b)
         default:
-            throw NibError(.invalidParams, "'\(string)' is not a text box or block ref", path: "$.ref",
+            throw NibError(.invalidParams, "'\(string)' is not an item or block ref", path: "$.ref",
                            hint: LinkedTextRef.hint)
         }
     }
@@ -169,17 +196,19 @@ enum LinkedTextRef: Equatable {
     }
 
     @MainActor
-    func text(in workspace: Workspace) throws -> RichText {
+    func text(in workspace: Workspace, content: ContentRegistries) throws -> RichText {
         switch self {
-        case let .item(d, p, i): return try LinkedTextRef.text(of: workspace.item(d, page: p, id: i))
+        case let .item(d, p, i): return try LinkedTextRef.text(of: workspace.item(d, page: p, id: i), content: content)
         case let .block(d, b): return try LinkedTextRef.block(b, in: workspace.content(d)).text
         }
     }
 
+    /// `requiresLayout: false` reads any item text (removing links never needs to find their glyphs).
     @MainActor
-    func text(in tx: DocTransaction) throws -> RichText {
+    func text(in tx: DocTransaction, content: ContentRegistries, requiresLayout: Bool = true) throws -> RichText {
         switch self {
-        case let .item(d, p, i): return try LinkedTextRef.text(of: tx.item(d, page: p, id: i))
+        case let .item(d, p, i):
+            return try LinkedTextRef.text(of: tx.item(d, page: p, id: i), content: content, requiresLayout: requiresLayout)
         case let .block(d, b): return try LinkedTextRef.block(b, in: tx.content(d)).text
         }
     }
@@ -188,9 +217,7 @@ enum LinkedTextRef: Equatable {
     func write(_ text: RichText, in tx: DocTransaction) throws {
         switch self {
         case let .item(d, p, i):
-            var item = try tx.item(d, page: p, id: i)
-            guard item.kind == .text, item.text != nil else { return }
-            item.text?.text = text
+            guard let item = try ItemText.replacing(text, in: tx.item(d, page: p, id: i)) else { return }
             try tx.put(item, doc: d, page: p)
         case let .block(d, b):
             var block = try LinkedTextRef.block(b, in: tx.content(d))
@@ -199,10 +226,17 @@ enum LinkedTextRef: Equatable {
         }
     }
 
-    static func text(of item: Item) throws -> RichText {
-        if item.kind == .text, let t = item.text?.text { return t }
-        throw NibError(.invalidParams, "item \(item.id) is a \(item.kind.rawValue), not a text box", path: "$.ref",
-                       hint: LinkedTextRef.hint)
+    /// The item's text, when its feature publishes where that text lays out.
+    static func text(of item: Item, content: ContentRegistries, requiresLayout: Bool = true) throws -> RichText {
+        guard let text = ItemText.text(of: item) else {
+            throw NibError(.invalidParams, "item \(item.id) is a \(item.kind.rawValue) without text", path: "$.ref",
+                           hint: LinkedTextRef.hint)
+        }
+        guard !requiresLayout || content.textLayout(for: item) != nil else {
+            throw NibError(.invalidParams, "the text of this \(item.kind.rawValue) cannot carry links: no feature lays it out",
+                           path: "$.ref", hint: LinkedTextRef.hint)
+        }
+        return text
     }
 
     static func block(_ id: NibID, in content: DocumentContent) throws -> TextBlock {
@@ -369,7 +403,7 @@ struct LinkSet: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "link.set", title: "Add Link",
-        summary: "Link a range of typed text (a text box or a text-document block) to a URL, a page of any document or an audio clip time.",
+        summary: "Link a range of typed text (a text box, a sticky note or shape label with a published layout, or a text-document block) to a URL, a page of any document or an audio clip time.",
         params: .obj(["ref": .ref, "range": LinkText.rangeSchema,
                       "link": .obj(LinkTarget.properties, required: [], "exactly one of url, page, clip (+ t) or doc")],
                      required: ["ref", "range", "link"]),
@@ -394,8 +428,9 @@ struct LinkSet: NibCommand {
         guard let rangeValue = p.range else { throw NibError(.invalidParams, "missing required field 'range'", path: "$.range") }
         let ref = try LinkedTextRef(refString)
         let link = try target.resolve(defaultDoc: ref.doc, workspace: ctx.workspace, principal: ctx.principal, path: "$.link.")
+        let content = ctx.content
         return try ctx.mutate { tx in
-            let text = try ref.text(in: tx)
+            let text = try ref.text(in: tx, content: content)
             let range = try LinkText.range(rangeValue, in: text, allowEmpty: false)
             let linked = LinkText.setLink(link, in: text, range: range)
             if linked != text { try ref.write(linked, in: tx) }
@@ -421,8 +456,9 @@ struct LinkRemove: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let ref = try LinkedTextRef(p.ref)
+        let content = ctx.content
         return try ctx.mutate { tx in
-            let text = try ref.text(in: tx)
+            let text = try ref.text(in: tx, content: content, requiresLayout: false)
             var range = try p.range.map { try LinkText.range($0, in: text, allowEmpty: true) }
                 ?? NSRange(location: 0, length: LinkText.length(text))
             if range.length == 0 {
@@ -445,15 +481,16 @@ struct LinkAutodetect: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "link.autodetect", title: "Link Web Addresses",
-        summary: "Turn http(s) and mailto addresses typed or pasted as plain text in a text box or block into links (linked text is kept).",
+        summary: "Turn http(s) and mailto addresses typed or pasted as plain text in an item's text or a block into links (linked text is kept).",
         params: .obj(["ref": .ref], required: ["ref"]),
         examples: [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"]],
         effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let ref = try LinkedTextRef(p.ref)
+        let content = ctx.content
         return try ctx.mutate { tx in
-            let result = try LinkText.autodetect(ref.text(in: tx))
+            let result = try LinkText.autodetect(ref.text(in: tx, content: content))
             if !result.urls.isEmpty { try ref.write(result.text, in: tx) }
             return Output(linked: result.urls)
         }
@@ -499,7 +536,9 @@ struct LinkBack: NibCommand {
     static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> Output {
         let navigator = try LinkNavigator.require(ctx.services)
         // A dry run (AI preview) reports where the window would go without moving it or popping the history.
-        guard let session = ctx.activeSession, let stop = navigator.back(session: session, dryRun: ctx.dryRun) else {
+        guard let session = ctx.activeSession,
+              let stop = navigator.back(session: session, navigator: ctx.navigator, workspace: ctx.workspace,
+                                        dryRun: ctx.dryRun) else {
             return Output(returned: false, page: nil)
         }
         return Output(returned: true, page: stop.ref)
@@ -521,7 +560,8 @@ struct LinkTapAt: NibCommand {
         id: "link.tapAt", title: "Open Link at Point",
         summary: "Tap chain: follow a text or PDF link under a finger tap (one tap in read-only, long-press in edit; PDF links also on a tap on bare paper).",
         params: .obj(["page": .ref, "point": .point, "ref": .ref,
-                      "gesture": .str("canvas gesture", choices: CanvasGesture.allCases.map { $0.rawValue })],
+                      "gesture": .str("canvas gesture (tap by default; doubleTap is never handled)",
+                                      choices: CanvasGesture.allCases.map { $0.rawValue })],
                      required: ["page", "point"]),
         examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [100, 410], "gesture": "longPress"]],
         effect: .session)
@@ -535,7 +575,8 @@ struct LinkTapAt: NibCommand {
         let gesture = CanvasGesture(rawValue: p.gesture ?? CanvasGesture.tap.rawValue) ?? .tap
         guard gesture != .doubleTap else { return Output(handled: false, target: nil) }
         let session = ctx.activeSession
-        let readOnly = session?.readOnly ?? false
+        // A read-only view, or a document the store keeps read-only: a tap cannot edit text, so it follows links.
+        let readOnly = (session?.readOnly ?? false) || ctx.isReadOnly(doc)
         // Edit mode: a tap on typed text edits it, so text links take a long-press there. PDF links (planner tabs)
         // answer a tap on bare paper, never one on an item the selection handler should get.
         let followsText = readOnly || gesture == .longPress
@@ -543,7 +584,7 @@ struct LinkTapAt: NibCommand {
         let navigator = try LinkNavigator.require(ctx.services)
         let from = LinkStop(doc: doc, page: page)
         if followsText, let link = try LinkHitTester.link(at: point, doc: doc, page: page, workspace: ctx.workspace,
-                                                        hiddenLayers: session?.hiddenLayers ?? []) {
+                                                        content: ctx.content, hiddenLayers: session?.hiddenLayers ?? []) {
             let result = try await navigator.follow(link, from: from, ctx: ctx)
             return Output(handled: true, target: result.target)
         }

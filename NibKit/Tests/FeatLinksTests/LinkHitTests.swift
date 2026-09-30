@@ -17,11 +17,21 @@ final class LinkHitTests: XCTestCase {
         Item(kind: .text, text: TextBoxItem(frame: frame, text: text, style: TextBoxStyle(padding: 4)))
     }
 
+    /// Text layouts as the text features publish them; only text boxes have one without help.
+    private let content = ContentRegistries()
+
+    private func firstRect(_ item: Item, file: StaticString = #filePath, line: UInt = #line) throws -> CGRect {
+        try XCTUnwrap(LinkHitTester.regions(of: item, content: content).first?.rects.first, file: file, line: line)
+    }
+
     // MARK: Hit testing
 
     func testLinkRectSitsAfterTheUnlinkedWordsOnAKnownLayout() throws {
         let text = linked("Visit Nib now", NSRange(location: 6, length: 3), site)
-        let regions = LinkHitTester.regions(text: text, style: TextBoxStyle(padding: 4), size: CGSize(width: 300, height: 60))
+        let item = box(text, Frame(x: 0, y: 0, w: 300, h: 60))
+        // The container comes from the contracts (text boxes: the frame inset by the style's padding).
+        XCTAssertEqual(content.textLayout(for: item)?.container, Frame(x: 4, y: 4, w: 292, h: 52))
+        let regions = LinkHitTester.regions(of: item, content: content)
         XCTAssertEqual(regions.count, 1)
         XCTAssertEqual(regions.first?.link, site)
         let rect = try XCTUnwrap(regions.first?.rects.first)
@@ -36,16 +46,15 @@ final class LinkHitTests: XCTestCase {
 
     func testHitFollowsTheLinkAndMissesEverythingElse() throws {
         let item = box(linked("Visit Nib now", NSRange(location: 6, length: 3), site), Frame(x: 100, y: 200, w: 300, h: 60))
-        let rect = try XCTUnwrap(LinkHitTester.regions(text: item.text!.text, style: item.text!.style,
-                                                       size: CGSize(width: 300, height: 60)).first?.rects.first)
-        let centre = Point(100 + Double(rect.midX), 200 + Double(rect.midY))
-        XCTAssertEqual(LinkHitTester.link(at: centre, in: item), site)
+        let rect = try firstRect(item)
+        let centre = Point(Double(rect.midX), Double(rect.midY))
+        XCTAssertEqual(LinkHitTester.link(at: centre, in: item, content: content), site)
         // A fingertip just past the last glyph still counts.
-        XCTAssertEqual(LinkHitTester.link(at: Point(100 + Double(rect.maxX) + 4, centre.y), in: item), site)
+        XCTAssertEqual(LinkHitTester.link(at: Point(Double(rect.maxX) + 4, centre.y), in: item, content: content), site)
         // "Visit", the empty area below the line, and outside the box.
-        XCTAssertNil(LinkHitTester.link(at: Point(100 + 4 + 2, centre.y), in: item))
-        XCTAssertNil(LinkHitTester.link(at: Point(centre.x, 200 + 50), in: item))
-        XCTAssertNil(LinkHitTester.link(at: Point(20, 20), in: item))
+        XCTAssertNil(LinkHitTester.link(at: Point(100 + 4 + 2, centre.y), in: item, content: content))
+        XCTAssertNil(LinkHitTester.link(at: Point(centre.x, 200 + 50), in: item, content: content))
+        XCTAssertNil(LinkHitTester.link(at: Point(20, 20), in: item, content: content))
     }
 
     func testAnAutoGrowingBoxIsHitBelowAStaleFrameHeight() throws {
@@ -54,43 +63,66 @@ final class LinkHitTests: XCTestCase {
                                          Paragraph(runs: [TextRun("Three "), TextRun("link", TextAttributes(link: site))])])
         let frame = Frame(x: 100, y: 200, w: 300, h: 20)
         let grows = box(text, frame)
-        let laid = LinkHitTester.layout(text: text, style: TextBoxStyle(padding: 4), width: 300)
-        XCTAssertGreaterThan(laid.needed, 3 * 15)
-        let rect = try XCTUnwrap(laid.regions.first?.rects.first)
-        XCTAssertGreaterThan(Double(rect.minY), frame.h + Double(LinkHitTester.slop))
-        let point = Point(frame.x + Double(rect.midX), frame.y + Double(rect.midY))
-        XCTAssertTrue(LinkHitTester.mayHit(point, grows))
-        XCTAssertEqual(LinkHitTester.link(at: point, in: grows), site)
+        let laid = LinkHitTester.layout(text: text, base: TextBoxStyle(padding: 4).defaults, width: 292)
+        XCTAssertGreaterThan(laid.textHeight, 3 * 15)
+        let rect = try firstRect(grows)
+        XCTAssertGreaterThan(Double(rect.minY), frame.y + frame.h + Double(LinkHitTester.slop))
+        let point = Point(Double(rect.midX), Double(rect.midY))
+        XCTAssertTrue(LinkHitTester.mayHit(point, grows, content: content))
+        XCTAssertEqual(LinkHitTester.link(at: point, in: grows, content: content), site)
 
         // A fixed-height box clips its text at the frame, so the hidden link is not there to tap.
         let fixed = Item(kind: .text, text: TextBoxItem(frame: frame, text: text, style: TextBoxStyle(padding: 4, autoGrow: false)))
-        XCTAssertFalse(LinkHitTester.mayHit(point, fixed))
-        XCTAssertNil(LinkHitTester.link(at: point, in: fixed))
+        XCTAssertFalse(LinkHitTester.mayHit(point, fixed, content: content))
+        XCTAssertNil(LinkHitTester.link(at: point, in: fixed, content: content))
     }
 
-    func testOnlyTextBoxesAreHitTested() {
+    func testStickyNotesAreHitOnceTheirFeaturePublishesALayout() throws {
         let text = linked("Visit Nib now", NSRange(location: 0, length: 13), site)
         let sticky = Item(kind: .sticky, sticky: StickyItem(frame: Frame(x: 0, y: 0, w: 200, h: 200), text: text))
-        XCTAssertFalse(LinkHitTester.mayHit(Point(20, 20), sticky))
-        XCTAssertNil(LinkHitTester.link(at: Point(20, 20), in: sticky))
+        XCTAssertFalse(LinkHitTester.mayHit(Point(20, 20), sticky, content: content))
+        XCTAssertNil(LinkHitTester.link(at: Point(20, 20), in: sticky, content: content))
+
+        content.textLayouts.register(TextLayoutDescriptor(key: ItemKind.sticky.rawValue, owner: "tests") { item in
+            item.sticky.map { f in TextLayoutInfo(container: Frame(x: f.frame.x + 12, y: f.frame.y + 12, w: f.frame.w - 24, h: f.frame.h - 24)) }
+        })
+        let rect = try firstRect(sticky)
+        XCTAssertEqual(rect.minX, 12, accuracy: 0.5)
+        XCTAssertEqual(rect.minY, 12, accuracy: 0.5)
+        let point = Point(Double(rect.midX), Double(rect.midY))
+        XCTAssertTrue(LinkHitTester.mayHit(point, sticky, content: content))
+        XCTAssertEqual(LinkHitTester.link(at: point, in: sticky, content: content), site)
+    }
+
+    func testShapeLabelsAreHitWhereTheirCentredTextSits() throws {
+        content.textLayouts.register(TextLayoutDescriptor(key: ItemKind.shape.rawValue, owner: "tests") { item in
+            item.shape.map { s in TextLayoutInfo(container: s.frame, base: TextAttributes(size: 24), centredVertically: true) }
+        })
+        let label = linked("Go", NSRange(location: 0, length: 2), site)
+        let shape = Item(kind: .shape, shape: ShapeItem(shape: .ellipse, frame: Frame(x: 50, y: 50, w: 200, h: 120), text: label))
+        let rect = try firstRect(shape)
+        // Centred top to bottom in the container, at the base size the shape feature asks for.
+        XCTAssertEqual(Double(rect.midY), 110, accuracy: 2)
+        XCTAssertGreaterThan(rect.height, 24)
+        XCTAssertEqual(LinkHitTester.link(at: Point(Double(rect.midX), Double(rect.midY)), in: shape, content: content), site)
+        XCTAssertNil(LinkHitTester.link(at: Point(Double(rect.midX), 60), in: shape, content: content))
     }
 
     func testRotatedBoxIsHitInItsOwnFrame() throws {
         let item = box(linked("Visit Nib now", NSRange(location: 6, length: 3), site),
                        Frame(x: 100, y: 100, w: 300, h: 60, rotation: .pi / 2))
         let f = try XCTUnwrap(item.text?.frame)
-        let rect = try XCTUnwrap(LinkHitTester.regions(text: item.text!.text, style: item.text!.style,
-                                                       size: CGSize(width: f.w, height: f.h)).first?.rects.first)
-        let unrotated = Point(f.x + Double(rect.midX), f.y + Double(rect.midY))
+        let rect = try firstRect(item)
+        let unrotated = Point(Double(rect.midX), Double(rect.midY))
         let onPage = Affine.rotation(f.rotation, about: f.center).apply(unrotated)
-        XCTAssertEqual(LinkHitTester.link(at: onPage, in: item), site)
-        XCTAssertNil(LinkHitTester.link(at: unrotated, in: item))
+        XCTAssertEqual(LinkHitTester.link(at: onPage, in: item, content: content), site)
+        XCTAssertNil(LinkHitTester.link(at: unrotated, in: item, content: content))
     }
 
     func testAWrappedLinkHasOneRectPerLine() {
         let url = "https://example.com/a/rather/long/path/that/wraps/over/lines"
         let text = linked(url, NSRange(location: 0, length: (url as NSString).length), TextLink(url: url))
-        let regions = LinkHitTester.regions(text: text, style: TextBoxStyle(padding: 4), size: CGSize(width: 120, height: 200))
+        let regions = LinkHitTester.regions(of: box(text, Frame(x: 0, y: 0, w: 120, h: 200)), content: content)
         XCTAssertEqual(regions.count, 1)
         XCTAssertGreaterThanOrEqual(regions.first?.rects.count ?? 0, 2)
     }
@@ -100,16 +132,6 @@ final class LinkHitTests: XCTestCase {
         let ranges = LinkHitTester.linkRanges(RichTextBridge.attributed(text))
         XCTAssertEqual(ranges.count, 1)
         XCTAssertEqual(ranges.first?.0, NSRange(location: 2, length: 5))
-    }
-
-    func testTextViewSelectionMapsBackToModelText() {
-        let text = RichText(paragraphs: [Paragraph(runs: [TextRun("Alpha")], list: .bullet),
-                                         Paragraph(runs: [TextRun("Beta")], list: .bullet)])
-        let attributed = RichTextBridge.attributed(text)
-        XCTAssertEqual(attributed.string, "• Alpha\n• Beta")
-        let range = LinkSelection.plainRange(NSRange(location: 10, length: 4), in: attributed)
-        XCTAssertEqual(range, NSRange(location: 6, length: 4))
-        XCTAssertEqual((text.plainText as NSString).substring(with: range), "Beta")
     }
 
     // MARK: Rich text ranges
@@ -201,20 +223,29 @@ final class LinkHitTests: XCTestCase {
     // MARK: PDF placement
 
     func testPDFLinksAreAspectFittedAndCentredOnTheNibPage() {
-        // A4 on US Letter: scaled by Letter's height, centred left to right (F024's PDFPagePlacement).
-        let letter = LinkHitTester.PDFPlacement(pdfSize: .a4, pageSize: .letter)
+        // A4 on US Letter: scaled by Letter's height, centred left to right (contracts-v2 `backgroundTransform`).
+        let letter = PageRecord(size: .letter, background: .ofPDF(AssetRef("a4.pdf"), page: 0)).backgroundTransform(sourceSize: .a4)
         let k = min(612 / 595.28, 792 / 841.89)
-        XCTAssertEqual(letter.scale, k, accuracy: 1e-9)
-        XCTAssertEqual(letter.dx, (612 - 595.28 * k) / 2, accuracy: 1e-9)
-        XCTAssertEqual(letter.dy, 0, accuracy: 1e-9)
-        let r = letter.rect(Rect(x: 100, y: 200, width: 50, height: 10))
-        XCTAssertEqual(r.x, letter.dx + 100 * k, accuracy: 1e-9)
+        let dx = (612 - 595.28 * k) / 2
+        let r = LinkHitTester.onPage(Rect(x: 100, y: 200, width: 50, height: 10), letter)
+        XCTAssertEqual(r.x, dx + 100 * k, accuracy: 1e-9)
         XCTAssertEqual(r.y, 200 * k, accuracy: 1e-9)
         XCTAssertEqual(r.width / r.height, 5, accuracy: 1e-9)
         // Same size: identity. Degenerate sizes never divide by zero.
-        XCTAssertEqual(LinkHitTester.PDFPlacement(pdfSize: .a4, pageSize: .a4).rect(Rect(x: 1, y: 2, width: 3, height: 4)),
-                       Rect(x: 1, y: 2, width: 3, height: 4))
-        XCTAssertEqual(LinkHitTester.PDFPlacement(pdfSize: PageSize(0, 0), pageSize: .a4), .identity)
+        let same = PageRecord(size: .a4).backgroundTransform(sourceSize: .a4)
+        XCTAssertEqual(LinkHitTester.onPage(Rect(x: 1, y: 2, width: 3, height: 4), same), Rect(x: 1, y: 2, width: 3, height: 4))
+        let degenerate = PageRecord(size: .a4).backgroundTransform(sourceSize: PageSize(0, 0))
+        XCTAssertEqual(LinkHitTester.onPage(Rect(x: 1, y: 2, width: 3, height: 4), degenerate), Rect(x: 1, y: 2, width: 3, height: 4))
+    }
+
+    func testPDFLinksTurnWithThePage() {
+        // Half a turn on the same size: a rect at the top-left lands at the bottom-right.
+        let turned = PageRecord(size: .a4, rotation: 180).backgroundTransform(sourceSize: .a4)
+        let r = LinkHitTester.onPage(Rect(x: 10, y: 20, width: 30, height: 40), turned)
+        XCTAssertEqual(r.x, PageSize.a4.width - 40, accuracy: 1e-9)
+        XCTAssertEqual(r.y, PageSize.a4.height - 60, accuracy: 1e-9)
+        XCTAssertEqual(r.width, 30, accuracy: 1e-9)
+        XCTAssertEqual(r.height, 40, accuracy: 1e-9)
     }
 
     func testTypedAddressesAreNormalised() {
