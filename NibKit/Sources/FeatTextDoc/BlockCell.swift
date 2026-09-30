@@ -486,7 +486,7 @@ final class BlockCell: UICollectionViewCell {
             line.leadingAnchor.constraint(equalTo: box.leadingAnchor),
             line.trailingAnchor.constraint(equalTo: box.trailingAnchor),
             line.centerYAnchor.constraint(equalTo: box.centerYAnchor),
-            line.heightAnchor.constraint(equalToConstant: 1 / max(traitCollection.displayScale, 1))
+            line.heightAnchor.constraint(equalToConstant: NibStroke.hairline)
         ])
         box.isAccessibilityElement = true
         box.accessibilityLabel = String(localized: "Divider")
@@ -1163,8 +1163,8 @@ final class TableFallbackView: UIView {
             rows.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
         isAccessibilityElement = false
-        // Borders are resolved CGColors and hairlines depend on the scale: rebuild when either changes.
-        _ = registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitDisplayScale.self]) {
+        // Borders are resolved CGColors: rebuild when the appearance changes.
+        _ = registerForTraitChanges([UITraitUserInterfaceStyle.self]) {
             (view: TableFallbackView, _: UITraitCollection) in
             view.rebuild()
         }
@@ -1174,7 +1174,6 @@ final class TableFallbackView: UIView {
 
     private func rebuild() {
         rows.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let hairline = 1 / max(traitCollection.displayScale, 1)
         for row in table?.rows ?? [] {
             let line = UIStackView()
             line.axis = .horizontal
@@ -1188,7 +1187,7 @@ final class TableFallbackView: UIView {
                 label.textColor = NibUIColor.label
                 let box = UIView()
                 box.backgroundColor = cell.background?.uiColor
-                box.layer.borderWidth = (table?.borders ?? true) ? hairline : 0
+                box.layer.borderWidth = (table?.borders ?? true) ? NibStroke.hairline : 0
                 box.layer.borderColor = NibUIColor.separator.resolvedColor(with: traitCollection).cgColor
                 label.translatesAutoresizingMaskIntoConstraints = false
                 box.addSubview(label)
