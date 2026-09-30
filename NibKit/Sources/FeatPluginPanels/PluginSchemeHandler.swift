@@ -162,12 +162,14 @@ enum PluginMIMEType {
 // MARK: - Byte ranges (pure, tested)
 
 /// A single `Range: bytes=…` request (media elements ask for ranges). Several ranges are served as the whole file.
+/// With `openEndedLimit`, an open-ended range (`bytes=N-`, what WebKit's media loader sends) is answered with at most
+/// that many bytes: a valid 206 whose Content-Range says where it stops, and WebKit asks again for the rest.
 enum PluginByteRange: Equatable {
     case full
     case partial(ClosedRange<Int>)
     case unsatisfiable
 
-    static func parse(_ header: String?, length: Int) -> PluginByteRange {
+    static func parse(_ header: String?, length: Int, openEndedLimit: Int? = nil) -> PluginByteRange {
         guard let header = header?.trimmingCharacters(in: .whitespaces), header.lowercased().hasPrefix("bytes=") else {
             return .full
         }
@@ -185,7 +187,10 @@ enum PluginByteRange: Equatable {
         }
         guard let start = Int(parts[0]), start >= 0 else { return .full }
         guard start < length else { return .unsatisfiable }
-        if parts[1].isEmpty { return .partial(start...(length - 1)) }
+        if parts[1].isEmpty {
+            guard let limit = openEndedLimit else { return .partial(start...(length - 1)) }
+            return .partial(start...min(length - 1, start + max(1, limit) - 1))
+        }
         guard let end = Int(parts[1]), end >= start else { return .full }
         return .partial(start...min(end, length - 1))
     }
@@ -194,15 +199,31 @@ enum PluginByteRange: Equatable {
 // MARK: - Responses (pure, tested)
 
 struct PluginResourceResponse {
+    /// Bytes of a file, streamed to WebKit a chunk at a time (never read whole into memory).
+    struct FileSlice: Equatable {
+        var url: URL
+        var offset: UInt64
+        var length: Int
+    }
+
     var status: Int
     var headers: [String: String]
+    /// An in-memory body: the short error texts. Empty for file bodies and HEAD.
     var body: Data
+    /// The file bytes a GET answers with, or nil.
+    var file: FileSlice?
 }
 
 enum PluginResourceLoader {
-    /// Builds the whole response for one request: status, headers and body. Runs off the main thread.
-    static func response(for url: URL, method: String, rangeHeader: String?,
-                         resolver: PluginResourceResolver) -> PluginResourceResponse {
+    /// Bytes read from disk and handed to WebKit at a time.
+    static let chunkSize = 512 * 1024
+    /// The most an open-ended range is answered with (`PluginByteRange`).
+    static let openEndedLimit = 4 * 1024 * 1024
+
+    /// Builds the response for one request: status, headers, and the file slice to stream. Only the file's length is
+    /// read here. Runs off the main thread.
+    static func response(for url: URL, method: String, rangeHeader: String?, resolver: PluginResourceResolver,
+                         openEndedLimit: Int = PluginResourceLoader.openEndedLimit) -> PluginResourceResponse {
         let verb = method.uppercased()
         guard verb == "GET" || verb == "HEAD" else {
             return plain(405, "method \(verb) is not allowed", extra: ["Allow": "GET, HEAD"])
@@ -212,7 +233,7 @@ enum PluginResourceLoader {
         case .success(let f): file = f
         case .failure(let e): return plain(e.status, e.message)
         }
-        guard let data = try? Data(contentsOf: file, options: .mappedIfSafe) else {
+        guard let length = readableLength(file) else {
             return plain(404, "\(file.lastPathComponent) could not be read")
         }
         var headers: [String: String] = [
@@ -222,19 +243,45 @@ enum PluginResourceLoader {
             "X-Content-Type-Options": "nosniff",
         ]
         var status = 200
-        var body = data
-        switch PluginByteRange.parse(rangeHeader, length: data.count) {
+        var slice = PluginResourceResponse.FileSlice(url: file, offset: 0, length: length)
+        switch PluginByteRange.parse(rangeHeader, length: length, openEndedLimit: openEndedLimit) {
         case .full:
             break
         case .partial(let r):
             status = 206
-            body = data.subdata(in: r.lowerBound..<(r.upperBound + 1))
-            headers["Content-Range"] = "bytes \(r.lowerBound)-\(r.upperBound)/\(data.count)"
+            slice = PluginResourceResponse.FileSlice(url: file, offset: UInt64(r.lowerBound), length: r.count)
+            headers["Content-Range"] = "bytes \(r.lowerBound)-\(r.upperBound)/\(length)"
         case .unsatisfiable:
-            return plain(416, "range not satisfiable", extra: ["Content-Range": "bytes */\(data.count)"])
+            return plain(416, "range not satisfiable", extra: ["Content-Range": "bytes */\(length)"])
         }
-        headers["Content-Length"] = String(body.count)
-        return PluginResourceResponse(status: status, headers: headers, body: verb == "HEAD" ? Data() : body)
+        headers["Content-Length"] = String(slice.length)
+        let streams = verb == "GET" && slice.length > 0
+        return PluginResourceResponse(status: status, headers: headers, body: Data(), file: streams ? slice : nil)
+    }
+
+    /// `count` bytes of `slice`, starting `from` bytes into it. Throws when the file cannot be read or is shorter
+    /// than it was (it changed while streaming).
+    static func read(_ slice: PluginResourceResponse.FileSlice, from: Int, count: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: slice.url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: slice.offset + UInt64(from))
+        let data = try handle.read(upToCount: count) ?? Data()
+        guard data.count == count else { throw CocoaError(.fileReadCorruptFile) }
+        return data
+    }
+
+    /// The whole body of `response`: the in-memory text, or every byte of its file slice.
+    static func body(of response: PluginResourceResponse) throws -> Data {
+        guard let slice = response.file else { return response.body }
+        return try read(slice, from: 0, count: slice.length)
+    }
+
+    /// The file's length when it can be opened for reading.
+    private static func readableLength(_ file: URL) -> Int? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd() else { return nil }
+        return Int(end)
     }
 
     private static func plain(_ status: Int, _ text: String, extra: [String: String] = [:]) -> PluginResourceResponse {
@@ -242,14 +289,15 @@ enum PluginResourceLoader {
         var headers = ["Content-Type": "text/plain; charset=utf-8", "Content-Length": String(body.count),
                        "Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"]
         for (k, v) in extra { headers[k] = v }
-        return PluginResourceResponse(status: status, headers: headers, body: body)
+        return PluginResourceResponse(status: status, headers: headers, body: body, file: nil)
     }
 }
 
 // MARK: - Scheme handler
 
-/// Serves one plugin's folder to its panel's WKWebView. Files are read on a utility queue; the task is answered on the
-/// main thread, and never after WebKit stopped it.
+/// Serves one plugin's folder to its panel's WKWebView. Files are read on a background queue one chunk at a time
+/// (the next chunk is read only after the last one reached WebKit, so a large media file never sits in Nib's memory
+/// whole); the task is answered on the main thread, and never after WebKit stopped it.
 @MainActor
 final class PluginSchemeHandler: NSObject, WKURLSchemeHandler {
     let resolver: PluginResourceResolver
@@ -274,7 +322,7 @@ final class PluginSchemeHandler: NSObject, WKURLSchemeHandler {
         PluginSchemeHandler.queue.async { [weak self] in
             let response = PluginResourceLoader.response(for: url, method: method, rangeHeader: range, resolver: resolver)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { self?.finish(key, url: url, response: response) }
+                MainActor.assumeIsolated { self?.begin(key, url: url, response: response) }
             }
         }
     }
@@ -283,16 +331,52 @@ final class PluginSchemeHandler: NSObject, WKURLSchemeHandler {
         running[ObjectIdentifier(urlSchemeTask)] = nil
     }
 
-    private func finish(_ key: ObjectIdentifier, url: URL, response: PluginResourceResponse) {
-        guard let task = running.removeValue(forKey: key) else { return }
+    private func begin(_ key: ObjectIdentifier, url: URL, response: PluginResourceResponse) {
+        guard let task = running[key] else { return }
         guard let http = HTTPURLResponse(url: url, statusCode: response.status, httpVersion: "HTTP/1.1",
                                          headerFields: response.headers) else {
+            running[key] = nil
             task.didFailWithError(URLError(.cannotParseResponse))
             return
         }
         task.didReceive(http)
-        if !response.body.isEmpty { task.didReceive(response.body) }
-        task.didFinish()
+        guard let slice = response.file else {
+            if !response.body.isEmpty { task.didReceive(response.body) }
+            running[key] = nil
+            task.didFinish()
+            return
+        }
+        sendChunk(key, slice: slice, sent: 0)
+    }
+
+    /// Reads the next chunk off the main thread, then hands it to the task (one chunk in flight per task).
+    private func sendChunk(_ key: ObjectIdentifier, slice: PluginResourceResponse.FileSlice, sent: Int) {
+        let count = min(PluginResourceLoader.chunkSize, slice.length - sent)
+        PluginSchemeHandler.queue.async { [weak self] in
+            let chunk = Result { try PluginResourceLoader.read(slice, from: sent, count: count) }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self?.received(key, slice: slice, sent: sent, chunk: chunk) }
+            }
+        }
+    }
+
+    private func received(_ key: ObjectIdentifier, slice: PluginResourceResponse.FileSlice, sent: Int,
+                          chunk: Result<Data, Error>) {
+        guard let task = running[key] else { return }
+        switch chunk {
+        case .failure:
+            running[key] = nil
+            task.didFailWithError(URLError(.cannotOpenFile))
+        case .success(let data):
+            task.didReceive(data)
+            let total = sent + data.count
+            if total >= slice.length {
+                running[key] = nil
+                task.didFinish()
+            } else {
+                sendChunk(key, slice: slice, sent: total)
+            }
+        }
     }
 }
 
@@ -374,11 +458,34 @@ enum PanelContentRules {
         JSONValue.array(rules(pluginID: pluginID, allowedHosts: allowedHosts)).jsonString()
     }
 
-    /// A store identifier that changes whenever the rules do, so a compiled list is never reused for other rules.
+    /// A store identifier that changes whenever the rules do, so a compiled list is never reused for other rules:
+    /// `nib.panel.<plugin id>.<24 hex digits>`.
     static func identifier(pluginID: String, json: String) -> String {
         let digest = SHA256.hash(data: Data(json.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
         let safeID = String(pluginID.lowercased().map { "abcdefghijklmnopqrstuvwxyz0123456789.-".contains($0) ? $0 : "_" })
-        return "nib.panel." + safeID + "." + digest
+        return identifierPrefix + safeID + "." + digest
+    }
+
+    static let identifierPrefix = "nib.panel."
+
+    /// True for a panel rule list identifier (`identifier(pluginID:json:)`).
+    static func isPanelRuleList(_ identifier: String) -> Bool {
+        guard identifier.hasPrefix(identifierPrefix), let dot = identifier.lastIndex(of: "."),
+              identifier.distance(from: identifier.startIndex, to: dot) >= identifierPrefix.count else { return false }
+        return isDigest(identifier[identifier.index(after: dot)...])
+    }
+
+    /// True when `candidate` is another rule list of the same plugin as `identifier` (an older host set): the same
+    /// prefix followed by a digest and nothing else, so the lists of `dev.a` never claim those of `dev.a.b`.
+    static func isSibling(_ candidate: String, of identifier: String) -> Bool {
+        guard isPanelRuleList(identifier), let dot = identifier.lastIndex(of: ".") else { return false }
+        let prefix = identifier[...dot]
+        guard candidate.hasPrefix(prefix) else { return false }
+        return isDigest(candidate.dropFirst(prefix.count))
+    }
+
+    private static func isDigest(_ text: Substring) -> Bool {
+        text.count == 24 && text.allSatisfy { "0123456789abcdef".contains($0) }
     }
 }
 
@@ -394,6 +501,8 @@ final class PanelRuleListCache {
         self.makeStore = store ?? { WKContentRuleListStore.default() }
     }
 
+    /// The compiled list for `identifier` (compiled once per session). After compiling, the plugin's other lists
+    /// in the store (older host sets) are removed.
     func ruleList(identifier: String, json: String, _ done: @escaping (Result<WKContentRuleList, NibError>) -> Void) {
         if let list = compiled[identifier] {
             done(.success(list))
@@ -417,6 +526,7 @@ final class PanelRuleListCache {
                     if let list = list {
                         self.compiled[identifier] = list
                         self.finish(identifier, .success(list))
+                        self.sweep { PanelContentRules.isSibling($0, of: identifier) }
                     } else {
                         let why = message ?? "the rules did not compile"
                         self.finish(identifier, .failure(NibError(.internalError, "the panel's network rules failed: " + why)))
@@ -429,5 +539,43 @@ final class PanelRuleListCache {
     private func finish(_ identifier: String, _ result: Result<WKContentRuleList, NibError>) {
         let callbacks = waiting.removeValue(forKey: identifier) ?? []
         for c in callbacks { c(result) }
+    }
+
+    /// Every panel rule list this session does not use (at start: this drops the lists of uninstalled plugins and of
+    /// host sets that changed since).
+    func sweepUnused(_ done: (() -> Void)? = nil) {
+        sweep(PanelContentRules.isPanelRuleList, done)
+    }
+
+    /// Removes the compiled lists in the store that `matches` selects, except those compiled or compiling in this
+    /// session (panels may be using them).
+    func sweep(_ matches: @escaping (String) -> Bool, _ done: (() -> Void)? = nil) {
+        guard let store = makeStore() else {
+            done?()
+            return
+        }
+        store.getAvailableContentRuleListIdentifiers { [weak self] identifiers in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self = self else {
+                        done?()
+                        return
+                    }
+                    let stale = (identifiers ?? []).filter {
+                        matches($0) && self.compiled[$0] == nil && self.waiting[$0] == nil
+                    }
+                    guard !stale.isEmpty else {
+                        done?()
+                        return
+                    }
+                    let removals = DispatchGroup()
+                    for identifier in stale {
+                        removals.enter()
+                        store.removeContentRuleList(forIdentifier: identifier) { _ in removals.leave() }
+                    }
+                    removals.notify(queue: .main) { done?() }
+                }
+            }
+        }
     }
 }

@@ -570,6 +570,42 @@ struct PanelEventThrottle {
     }
 }
 
+/// At most `limit` dialogs within `window` seconds. A page that asks for more (an alert or confirm in a loop would
+/// otherwise stack window-modal alerts until the app is force-quit) gets every further dialog of that document
+/// answered at once. The recent times carry over to the next document, so reloading itself earns a page nothing.
+struct PanelDialogLimiter: Equatable {
+    let limit: Int
+    let window: TimeInterval
+    private var shown: [TimeInterval] = []
+    private(set) var blocked = false
+
+    init(limit: Int = 3, window: TimeInterval = 10) {
+        self.limit = limit
+        self.window = window
+    }
+
+    mutating func allow(now: TimeInterval) -> Bool {
+        if blocked { return false }
+        shown = shown.filter { now - $0 < window }
+        if shown.count >= limit {
+            blocked = true
+            return false
+        }
+        shown.append(now)
+        return true
+    }
+
+    /// A new document: the block ends, the recent dialogs still count.
+    mutating func newDocument() {
+        blocked = false
+    }
+
+    mutating func reset() {
+        shown = []
+        blocked = false
+    }
+}
+
 /// `nib.storage` has one owner, the plugin runtime (F077), which merges per key across devices. A panel reaches it
 /// through `PluginRuntimeHandle.evaluate`: a fixed expression over the plugin's own `nib.storage` whose only inputs
 /// are JSON literals, answering `{ok, value}` or `{ok: false, error}` as text.
@@ -645,6 +681,7 @@ final class PanelBridge {
     var clock: () -> TimeInterval = { Date().timeIntervalSince1970 }
     private(set) var subscriptions = PanelSubscriptions()
     private var throttle = PanelEventThrottle()
+    private var dialogLimiter = PanelDialogLimiter()
     private let log = Logger(subsystem: "app.nib", category: "pluginpanels")
 
     var principal: Principal { .plugin(manifest.id) }
@@ -682,10 +719,23 @@ final class PanelBridge {
         return .object(out)
     }
 
-    /// A new document started in the panel: its listeners are gone.
+    /// A new document started in the panel: its listeners are gone. The dialog budget carries over (a page that
+    /// reloads itself does not earn new dialogs); only the block on the old document ends.
     func resetPage() {
         subscriptions.reset()
         throttle.reset()
+        dialogLimiter.newDocument()
+    }
+
+    /// The user reloaded the panel: dialogs start afresh.
+    func resetDialogBudget() {
+        dialogLimiter.reset()
+    }
+
+    /// Whether the page may show one more dialog (its own alert/confirm/prompt or a `nib.ui` dialog). False once it
+    /// asked too often: further dialogs are answered at once (cancelled) for the rest of the document.
+    func allowDialog() -> Bool {
+        dialogLimiter.allow(now: clock())
     }
 
     // MARK: Calls
@@ -698,12 +748,14 @@ final class PanelBridge {
             onHello?()
             return .null
         case "log":
+            // The page's own text often quotes note content: it stays private in the system log (only the ids are
+            // public), as diagnostics.export promises no note content.
             let level = args["level"]?.stringValue ?? "log"
             let text = args["text"]?.stringValue ?? ""
             if level == "error" {
-                log.error("\(self.manifest.id, privacy: .public) panel \(self.panelID, privacy: .public): \(text, privacy: .public)")
+                log.error("\(self.manifest.id, privacy: .public) panel \(self.panelID, privacy: .public): \(text, privacy: .private)")
             } else {
-                log.notice("\(self.manifest.id, privacy: .public) panel \(self.panelID, privacy: .public): \(text, privacy: .public)")
+                log.notice("\(self.manifest.id, privacy: .public) panel \(self.panelID, privacy: .public): \(text, privacy: .private)")
             }
             return .null
         case "events.subscribe":
@@ -716,7 +768,7 @@ final class PanelBridge {
         case "ui.toast":
             let message = args["message"]?.stringValue ?? ""
             if !dialogs.toast(message) {
-                log.notice("\(self.manifest.id, privacy: .public) toast with no window: \(message, privacy: .public)")
+                log.notice("\(self.manifest.id, privacy: .public) toast with no window: \(message, privacy: .private)")
             }
             return .null
         case "ui.postToPanel":
@@ -777,6 +829,8 @@ final class PanelBridge {
     // MARK: UI
 
     private func dialog(_ method: String, _ args: JSONValue) async throws -> JSONValue {
+        // Too many dialogs from this document: answer as if cancelled (confirm false, prompt and choose null).
+        guard allowDialog() else { return method == "ui.confirm" ? false : .null }
         let title = args["title"]?.stringValue ?? manifest.name
         switch method {
         case "ui.confirm":
@@ -971,15 +1025,32 @@ final class PanelBridge {
 
 // MARK: - nib.net.fetch
 
-/// `nib.net.fetch` from a panel: https only, exactly the manifest's hosts (redirects included), 30 s, 10 MB.
-final class PanelFetcher: NSObject, URLSessionTaskDelegate {
-    static let methods: Set<String> = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]
+/// `nib.net.fetch` from a panel: https only, exactly the manifest's hosts (redirects included), no cookies or cache,
+/// 30 s in all and 10 MB. The body is collected as it arrives and the request is cancelled as soon as the announced
+/// length or the bytes received pass the cap, so the cap bounds Nib's own memory too (as F077's `PluginFetcher`: the
+/// response is read in Nib's process, not the panel's web process). One instance per request.
+final class PanelFetcher: NSObject, URLSessionDataDelegate {
+    /// Prepended to the session's protocol classes (tests register a stub `URLProtocol`).
+    static var protocolClasses: [AnyClass] = []
+    static let methods: Set<String> = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
     static let maxBytes = 10 * 1024 * 1024
     static let timeout: TimeInterval = 30
-    let hosts: Set<String>
 
-    init(hosts: Set<String>) {
-        self.hosts = hosts
+    let hosts: Set<String>
+    let maxBytes: Int
+    let timeout: TimeInterval
+
+    // Guarded by `lock` (delegate callbacks arrive on the session's queue).
+    private let lock = NSLock()
+    private var received = Data()
+    private var response: URLResponse?
+    private var tooLarge = false
+    private var continuation: CheckedContinuation<(Data, URLResponse?), Error>?
+
+    init(hosts: Set<String>, maxBytes: Int = PanelFetcher.maxBytes, timeout: TimeInterval = PanelFetcher.timeout) {
+        self.hosts = Set(hosts.map { $0.lowercased() })
+        self.maxBytes = maxBytes
+        self.timeout = timeout
     }
 
     /// Throws `permission_denied` unless `url` is https (no credentials) and its host is allowed.
@@ -997,34 +1068,61 @@ final class PanelFetcher: NSObject, URLSessionTaskDelegate {
         }
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
-                    newRequest request: URLRequest) async -> URLRequest? {
-        guard let url = request.url, (try? PanelFetcher.check(url, hosts: hosts)) != nil else { return nil }
-        return request
-    }
-
     func fetch(_ url: URL, method: String, headers: [String: String], body: Data?) async throws -> JSONValue {
-        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: PanelFetcher.timeout)
+        try PanelFetcher.check(url, hosts: hosts)
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         request.httpMethod = method
         for (k, v) in headers { request.setValue(v, forHTTPHeaderField: k) }
         request.httpBody = body
-        let session = URLSession(configuration: .ephemeral)
+        let config = URLSessionConfiguration.ephemeral
+        config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
+        config.urlCache = nil
+        // The request timeout is an idle timeout; the resource timeout bounds the whole call.
+        config.timeoutIntervalForRequest = timeout
+        config.timeoutIntervalForResource = timeout
+        config.protocolClasses = PanelFetcher.protocolClasses + (config.protocolClasses ?? [])
+        let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         let data: Data
-        let response: URLResponse
+        let response: URLResponse?
         do {
-            (data, response) = try await session.data(for: request, delegate: self)
+            (data, response) = try await load(request, in: session)
+        } catch let e as NibError {
+            throw e
         } catch let e as URLError where e.code == .timedOut {
-            throw NibError(.timeout, "\(url.host ?? "the server") did not answer within \(Int(PanelFetcher.timeout)) s")
+            throw NibError(.timeout, "\(url.host ?? "the server") did not answer within \(Int(timeout)) s")
         } catch {
             throw NibError(.unavailable, "the request to \(url.host ?? "the server") failed: \(error.localizedDescription)")
         }
         guard let http = response as? HTTPURLResponse else {
             throw NibError(.unavailable, "\(url.host ?? "the server") did not answer over HTTP")
         }
-        guard data.count <= PanelFetcher.maxBytes else {
-            throw NibError(.unsupported, "the response is larger than \(PanelFetcher.maxBytes / 1_048_576) MB")
+        return PanelFetcher.result(http, data: data)
+    }
+
+    private func load(_ request: URLRequest, in session: URLSession) async throws -> (Data, URLResponse?) {
+        let task = session.dataTask(with: request)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse?), Error>) in
+                lock.lock()
+                self.continuation = continuation
+                lock.unlock()
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
         }
+    }
+
+    private var sizeLimitError: NibError {
+        let limit = maxBytes >= 1_048_576 ? "\(maxBytes / 1_048_576) MB" : "\(maxBytes) bytes"
+        return NibError(.unsupported, "the response is larger than \(limit)",
+                        hint: "request less data (a range, a page, a smaller format)")
+    }
+
+    /// `{status, headers, text, base64?}`: text for UTF-8 bodies, else lossy text plus base64.
+    static func result(_ http: HTTPURLResponse, data: Data) -> JSONValue {
         var headerOut: [String: JSONValue] = [:]
         for (k, v) in http.allHeaderFields {
             headerOut[String(describing: k).lowercased()] = .string(String(describing: v))
@@ -1037,6 +1135,60 @@ final class PanelFetcher: NSObject, URLSessionTaskDelegate {
             out["base64"] = .string(data.base64EncodedString())
         }
         return .object(out)
+    }
+
+    // MARK: URLSessionDataDelegate
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let announcedTooLarge = response.expectedContentLength > Int64(maxBytes)
+        lock.lock()
+        self.response = response
+        if announcedTooLarge { tooLarge = true }
+        lock.unlock()
+        completionHandler(announcedTooLarge ? .cancel : .allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        var cancel = tooLarge
+        if !tooLarge {
+            if received.count + data.count > maxBytes {
+                tooLarge = true
+                received = Data()
+                cancel = true
+            } else {
+                received.append(data)
+            }
+        }
+        lock.unlock()
+        if cancel { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        let result: Result<(Data, URLResponse?), Error>
+        if tooLarge {
+            result = .failure(sizeLimitError)
+        } else if let error = error {
+            result = .failure(error)
+        } else {
+            result = .success((received, response ?? task.response))
+        }
+        received = Data()
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        guard let url = request.url, (try? PanelFetcher.check(url, hosts: hosts)) != nil else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
     }
 }
 

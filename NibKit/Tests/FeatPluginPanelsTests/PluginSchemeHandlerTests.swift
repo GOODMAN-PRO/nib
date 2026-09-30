@@ -120,8 +120,10 @@ final class PluginSchemeHandlerTests: XCTestCase {
         XCTAssertEqual(page.status, 200)
         XCTAssertEqual(page.headers["Content-Type"], "text/html; charset=utf-8")
         XCTAssertEqual(page.headers["X-Content-Type-Options"], "nosniff")
-        XCTAssertEqual(String(decoding: page.body, as: UTF8.self), "<!doctype html><p>stats</p>")
-        XCTAssertEqual(page.headers["Content-Length"], String(page.body.count))
+        let pageBody = try PluginResourceLoader.body(of: page)
+        XCTAssertEqual(String(decoding: pageBody, as: UTF8.self), "<!doctype html><p>stats</p>")
+        XCTAssertEqual(page.headers["Content-Length"], String(pageBody.count))
+        XCTAssertTrue(page.body.isEmpty, "file bodies are streamed, not held")
 
         XCTAssertEqual(load("nib-plugin://dev.test.panel/panels/%2E%2E/%2E%2E/secret.txt").status, 403)
         XCTAssertEqual(load("nib-plugin://dev.test.panel/nothing.js").status, 404)
@@ -130,12 +132,69 @@ final class PluginSchemeHandlerTests: XCTestCase {
         let head = load("nib-plugin://dev.test.panel/panels/stats.html", "HEAD")
         XCTAssertEqual(head.status, 200)
         XCTAssertTrue(head.body.isEmpty)
+        XCTAssertNil(head.file)
+        XCTAssertEqual(head.headers["Content-Length"], String(pageBody.count))
 
         let part = load("nib-plugin://dev.test.panel/digits.txt", range: "bytes=2-4")
         XCTAssertEqual(part.status, 206)
-        XCTAssertEqual(String(decoding: part.body, as: UTF8.self), "234")
+        XCTAssertEqual(String(decoding: try PluginResourceLoader.body(of: part), as: UTF8.self), "234")
         XCTAssertEqual(part.headers["Content-Range"], "bytes 2-4/10")
+        XCTAssertEqual(part.file?.offset, 2)
+        XCTAssertEqual(part.file?.length, 3)
         XCTAssertEqual(load("nib-plugin://dev.test.panel/digits.txt", range: "bytes=40-").status, 416)
+    }
+
+    /// An open-ended range (`bytes=N-`, WebKit's media loader) is answered with at most `openEndedLimit` bytes: a 206
+    /// whose Content-Range says where it stops. Explicit ranges and whole files are not cut.
+    func testOpenEndedRangesAreCappedAndReadAsSlices() throws {
+        let (folder, _) = try makePlugin()
+        let resolver = PluginResourceResolver(pluginID: pluginID, folder: folder)
+        let digits = url("nib-plugin://dev.test.panel/digits.txt")
+        let capped = PluginResourceLoader.response(for: digits, method: "GET", rangeHeader: "bytes=2-", resolver: resolver,
+                                                   openEndedLimit: 4)
+        XCTAssertEqual(capped.status, 206)
+        XCTAssertEqual(capped.headers["Content-Range"], "bytes 2-5/10")
+        XCTAssertEqual(capped.headers["Content-Length"], "4")
+        XCTAssertEqual(String(decoding: try PluginResourceLoader.body(of: capped), as: UTF8.self), "2345")
+        let tail = PluginResourceLoader.response(for: digits, method: "GET", rangeHeader: "bytes=8-", resolver: resolver,
+                                                 openEndedLimit: 4)
+        XCTAssertEqual(tail.headers["Content-Range"], "bytes 8-9/10")
+        let explicit = PluginResourceLoader.response(for: digits, method: "GET", rangeHeader: "bytes=0-9",
+                                                     resolver: resolver, openEndedLimit: 4)
+        XCTAssertEqual(explicit.file?.length, 10)
+        let whole = PluginResourceLoader.response(for: digits, method: "GET", rangeHeader: nil, resolver: resolver,
+                                                  openEndedLimit: 4)
+        XCTAssertEqual(whole.status, 200)
+        XCTAssertEqual(whole.file?.length, 10)
+
+        // Slices are read at an offset, and a file that shrank under the reader fails instead of padding.
+        let slice = try XCTUnwrap(capped.file)
+        XCTAssertEqual(String(decoding: try PluginResourceLoader.read(slice, from: 1, count: 2), as: UTF8.self), "34")
+        XCTAssertThrowsError(try PluginResourceLoader.read(slice, from: 6, count: 4))
+    }
+
+    /// A file larger than one chunk arrives as a sequence of chunks, read one at a time, that add up to the file.
+    func testLargeFilesStreamInChunks() throws {
+        let (folder, _) = try makePlugin()
+        let size = PluginResourceLoader.chunkSize * 2 + 1_234
+        let bytes = Data((0..<size).map { UInt8($0 % 251) })
+        try bytes.write(to: folder.appendingPathComponent("media.bin"))
+        let resolver = PluginResourceResolver(pluginID: pluginID, folder: folder)
+        let response = PluginResourceLoader.response(for: url("nib-plugin://dev.test.panel/media.bin"), method: "GET",
+                                                     rangeHeader: nil, resolver: resolver)
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.headers["Content-Length"], String(size))
+        XCTAssertTrue(response.body.isEmpty)
+        let slice = try XCTUnwrap(response.file)
+        var received = Data()
+        var chunks = 0
+        while received.count < slice.length {
+            let count = min(PluginResourceLoader.chunkSize, slice.length - received.count)
+            received.append(try PluginResourceLoader.read(slice, from: received.count, count: count))
+            chunks += 1
+        }
+        XCTAssertEqual(chunks, 3)
+        XCTAssertEqual(received, bytes)
     }
 
     func testMIMETypes() {
@@ -161,6 +220,10 @@ final class PluginSchemeHandlerTests: XCTestCase {
         XCTAssertEqual(PluginByteRange.parse("bytes=5-2", length: 10), .full)
         XCTAssertEqual(PluginByteRange.parse("items=0-1", length: 10), .full)
         XCTAssertEqual(PluginByteRange.parse("bytes=10-", length: 10), .unsatisfiable)
+        XCTAssertEqual(PluginByteRange.parse("bytes=0-", length: 10, openEndedLimit: 4), .partial(0...3))
+        XCTAssertEqual(PluginByteRange.parse("bytes=7-", length: 10, openEndedLimit: 4), .partial(7...9))
+        XCTAssertEqual(PluginByteRange.parse("bytes=0-8", length: 10, openEndedLimit: 4), .partial(0...8))
+        XCTAssertEqual(PluginByteRange.parse("bytes=-4", length: 10, openEndedLimit: 2), .partial(6...9))
     }
 
     // MARK: Content rules
@@ -272,5 +335,98 @@ final class PluginSchemeHandlerTests: XCTestCase {
                           PanelContentRules.identifier(pluginID: pluginID, json: some))
         XCTAssertTrue(PanelContentRules.identifier(pluginID: pluginID, json: none).hasPrefix("nib.panel.dev.test.panel."))
         XCTAssertEqual(PanelContentRules.escape("a.b-c"), "a\\.b-c")
+
+        // Which stored lists are this plugin's older ones (never another plugin's, even one whose id extends it).
+        let mine = PanelContentRules.identifier(pluginID: pluginID, json: none)
+        let older = PanelContentRules.identifier(pluginID: pluginID, json: some)
+        let longer = PanelContentRules.identifier(pluginID: pluginID + ".x", json: none)
+        let shorter = PanelContentRules.identifier(pluginID: "dev.test", json: none)
+        XCTAssertTrue(PanelContentRules.isPanelRuleList(mine))
+        XCTAssertTrue(PanelContentRules.isSibling(older, of: mine))
+        XCTAssertFalse(PanelContentRules.isSibling(longer, of: mine))
+        XCTAssertFalse(PanelContentRules.isSibling(shorter, of: mine))
+        XCTAssertFalse(PanelContentRules.isSibling(mine, of: longer))
+        XCTAssertFalse(PanelContentRules.isPanelRuleList("nib.panel.test.unsupported"))
+        XCTAssertFalse(PanelContentRules.isPanelRuleList("com.other.rules.0123456789abcdef01234567"))
+        XCTAssertFalse(PanelContentRules.isPanelRuleList("nib.panel.0123456789abcdef01234567"))
+    }
+
+    /// Compiled lists do not pile up in WebKit's store: a compile removes the plugin's older lists that this session
+    /// does not use, and the start-up sweep removes every panel list (uninstalled plugins, changed hosts).
+    @MainActor
+    func testStaleRuleListsAreRemovedFromTheStore() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("nib-rules-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let makeStore: @MainActor () -> WKContentRuleListStore? = { WKContentRuleListStore(url: dir) }
+
+        func compile(_ cache: PanelRuleListCache, plugin: String, hosts: [String]) async throws -> String {
+            let json = PanelContentRules.json(pluginID: plugin, allowedHosts: hosts)
+            let identifier = PanelContentRules.identifier(pluginID: plugin, json: json)
+            let done = expectation(description: "compiled \(identifier)")
+            var failed: NibError?
+            cache.ruleList(identifier: identifier, json: json) { result in
+                if case .failure(let e) = result { failed = e }
+                done.fulfill()
+            }
+            await fulfillment(of: [done], timeout: 30)
+            if let failed = failed { throw failed }
+            return identifier
+        }
+        func stored() async -> Set<String> {
+            let listed = expectation(description: "listed")
+            let box = IdentifierBox()
+            WKContentRuleListStore(url: dir)?.getAvailableContentRuleListIdentifiers { found in
+                box.set(found ?? [])
+                listed.fulfill()
+            }
+            await fulfillment(of: [listed], timeout: 30)
+            return Set(box.ids)
+        }
+        func sweep(_ cache: PanelRuleListCache, _ matches: @escaping (String) -> Bool) async {
+            let swept = expectation(description: "swept")
+            cache.sweep(matches) { swept.fulfill() }
+            await fulfillment(of: [swept], timeout: 30)
+        }
+
+        // An earlier session compiled this plugin's list for one host set, and another plugin's list.
+        let earlier = PanelRuleListCache(store: makeStore)
+        let old = try await compile(earlier, plugin: pluginID, hosts: ["api.example.com"])
+        let other = try await compile(earlier, plugin: pluginID + ".x", hosts: [])
+        let first = await stored()
+        XCTAssertEqual(first, [old, other])
+
+        // This session compiles the plugin's new list: the old one goes, the other plugin's stays.
+        let now = PanelRuleListCache(store: makeStore)
+        let current = try await compile(now, plugin: pluginID, hosts: [])
+        await sweep(now) { PanelContentRules.isSibling($0, of: current) }
+        let second = await stored()
+        XCTAssertEqual(second, [current, other])
+
+        // The start-up sweep of a later session keeps nothing it does not use.
+        let later = PanelRuleListCache(store: makeStore)
+        let swept = expectation(description: "swept all")
+        later.sweepUnused { swept.fulfill() }
+        await fulfillment(of: [swept], timeout: 30)
+        let third = await stored()
+        XCTAssertEqual(third, [])
+    }
+}
+
+/// Holds what the store listed (its completion may arrive on any thread).
+private final class IdentifierBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [String] = []
+
+    var ids: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    func set(_ ids: [String]) {
+        lock.lock()
+        stored = ids
+        lock.unlock()
     }
 }

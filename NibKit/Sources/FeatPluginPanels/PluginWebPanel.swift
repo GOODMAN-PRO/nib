@@ -30,6 +30,60 @@ enum PanelNavigationPolicy {
     }
 }
 
+// MARK: - Live network allowance (pure, tested)
+
+/// The panel's network allowance follows the live grants: the user can turn "network" off (or on) in Settings ›
+/// Plugins while the panel is open. There is no grants-changed event, so the panel re-reads the grants on every
+/// navigation decision, page start, reload, settings change and scene activation, and rebuilds its content rules
+/// when the answer differs from the rules it runs under.
+enum PanelNetworkRefresh {
+    enum Decision: Equatable {
+        /// The installed rules still match the grants.
+        case keep
+        /// Install the no-host rules at once (fail closed), then these hosts' rules.
+        case rebuild([String])
+    }
+
+    static func decide(previous: [String], manifest: PluginManifest, granted: Set<Scope>) -> Decision {
+        let hosts = PanelContentRules.allowedHosts(manifest: manifest, granted: granted)
+        return hosts == previous ? .keep : .rebuild(hosts)
+    }
+}
+
+// MARK: - Who may call window.nib (pure, tested)
+
+/// Only the panel's own document may call Nib: never a sub-frame (an allowed host's iframe, an `about:blank` or
+/// `data:` frame the page made), and never a frame on another origin. This is the gate between third-party frames
+/// and the plugin's grants.
+enum PanelCallGate {
+    static func allows(frameURL: URL?, isMainFrame: Bool, pluginID: String) -> Bool {
+        isMainFrame && PluginPanelURL.isOwn(frameURL, pluginID: pluginID)
+    }
+}
+
+// MARK: - Crash recovery (pure, tested)
+
+/// iOS routinely ends a web content process while the app is in the background. The first time (or while the panel
+/// is not on screen) only the page is reloaded, quietly; main.js keeps its state. A page that ends again within
+/// `window` seconds while on screen (or `hiddenLimit` times while hidden) shows "This plugin stopped."
+enum PanelCrashRecovery {
+    static let window: TimeInterval = 60
+    static let hiddenLimit = 3
+
+    enum Decision: Equatable {
+        case reloadPage
+        case showStopped
+    }
+
+    /// `earlier`: when this panel's page ended before.
+    static func decide(earlier: [Date], now: Date, visible: Bool) -> Decision {
+        let recent = earlier.filter { now.timeIntervalSince($0) < window }.count
+        if recent == 0 { return .reloadPage }
+        if !visible && recent < hiddenLimit { return .reloadPage }
+        return .showStopped
+    }
+}
+
 // MARK: - Panel identity (pure, tested)
 
 enum PanelIdentity {
@@ -128,7 +182,18 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
     private weak var navigator: SceneNavigator?
     private let dismiss: @MainActor () -> Void
     private var webView: WKWebView?
+    private var contentController: WKUserContentController?
+    /// The hosts navigation decisions allow: re-read from the live grants (`refreshNetworkRules`).
     private var allowedHosts: [String] = []
+    /// The hosts of the content rules last installed (or being compiled) in the web view.
+    private var rulesHosts: [String] = []
+    /// The compiled no-host list, installed at once whenever the allowance changes (fail closed while compiling).
+    private var closedRules: WKContentRuleList?
+    /// Bumped for every rules change: only the newest compile installs its list.
+    private var rulesGeneration = 0
+    /// When the page's web content process ended (PanelCrashRecovery).
+    private var terminations: [Date] = []
+    private lazy var ownRuleLists = PanelRuleListCache()
     private var pageReady = false
     private var outbox: [(String, JSONValue)] = []
     private var started = false
@@ -162,7 +227,6 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
         bridge.send = { [weak self] kind, payload in self?.send(kind, payload) }
         bridge.onHello = { [weak self] in self?.pageDidStart() }
         container.onTraitsChange = { [weak self] in self?.pushTokens() }
-        container.onReloadShortcut = { [weak self] in self?.reload() }
     }
 
     // MARK: Lifecycle
@@ -183,11 +247,17 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
         bag.add(observer: NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
                                                                  queue: .main) { [weak self] note in
             let name = note.userInfo?["name"] as? String ?? ""
-            guard name.hasPrefix(prefix) else { return }
             MainActor.assumeIsolated {
                 guard let self = self else { return }
+                // A permission toggle may be what changed (there is no grants-changed event).
+                self.refreshNetworkRules()
+                guard name.hasPrefix(prefix) else { return }
                 self.send("settings", self.bridge.currentSettings())
             }
+        })
+        bag.add(observer: NotificationCenter.default.addObserver(forName: UIScene.didActivateNotification, object: nil,
+                                                                 queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshNetworkRules() }
         })
         if NibApp.isHostlessTest {
             // No live WKWebView in hostless tests (NibApp.isHostlessTest): the bridge and messaging still work.
@@ -209,21 +279,97 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
         phase = .loading
         guard !compiling else { return }
         compiling = true
-        allowedHosts = PanelContentRules.allowedHosts(manifest: manifest, granted: app.gateway.grants(bridge.principal))
-        let json = PanelContentRules.json(pluginID: pluginID, allowedHosts: allowedHosts)
-        let identifier = PanelContentRules.identifier(pluginID: pluginID, json: json)
-        let cache = factory?.ruleLists ?? PanelRuleListCache()
-        cache.ruleList(identifier: identifier, json: json) { [weak self] result in
+        // The no-host list first: it is what the panel falls back to whenever its allowance changes.
+        ruleList(hosts: []) { [weak self] closed in
             guard let self = self else { return }
-            self.compiling = false
-            switch result {
-            case .success(let rules):
-                self.makeWebView(rules: rules)
-                self.webView?.load(URLRequest(url: url))
+            switch closed {
             case .failure(let error):
+                self.compiling = false
                 // Fail closed: without its network rules a panel never loads.
                 self.fail(String(localized: "This panel could not start safely."), detail: error.message)
+            case .success(let closedRules):
+                self.closedRules = closedRules
+                let hosts = self.liveAllowedHosts()
+                self.ruleList(hosts: hosts) { [weak self] result in
+                    guard let self = self else { return }
+                    self.compiling = false
+                    switch result {
+                    case .success(let rules):
+                        self.allowedHosts = hosts
+                        self.rulesHosts = hosts
+                        self.makeWebView(rules: rules)
+                        // The grants may have changed while the rules compiled.
+                        self.refreshNetworkRules { [weak self] in self?.loadEntry() }
+                    case .failure(let error):
+                        self.fail(String(localized: "This panel could not start safely."), detail: error.message)
+                    }
+                }
             }
+        }
+    }
+
+    private func loadEntry() {
+        guard let web = webView, let url = PluginPanelURL.url(pluginID: pluginID, path: entry) else { return }
+        web.load(URLRequest(url: url))
+    }
+
+    // MARK: Network allowance
+
+    private var ruleLists: PanelRuleListCache { factory?.ruleLists ?? ownRuleLists }
+
+    private func ruleList(hosts: [String], _ done: @escaping (Result<WKContentRuleList, NibError>) -> Void) {
+        let json = PanelContentRules.json(pluginID: pluginID, allowedHosts: hosts)
+        ruleLists.ruleList(identifier: PanelContentRules.identifier(pluginID: pluginID, json: json), json: json, done)
+    }
+
+    /// The hosts the live grants allow now (none without the granted "network" permission).
+    private func liveAllowedHosts() -> [String] {
+        guard let app = app else { return [] }
+        return PanelContentRules.allowedHosts(manifest: manifest, granted: app.gateway.grants(bridge.principal))
+    }
+
+    /// Re-reads the network allowance from the live grants. When it differs from the rules the web view runs under,
+    /// it fails closed first (the no-host list, synchronously, and navigation decisions follow the new hosts at
+    /// once), then compiles and installs the new hosts' rules. `done` runs once the rules are in place.
+    func refreshNetworkRules(then done: (() -> Void)? = nil) {
+        guard let app = app, let content = contentController else {
+            done?()
+            return
+        }
+        let granted = app.gateway.grants(bridge.principal)
+        guard case .rebuild(let hosts) = PanelNetworkRefresh.decide(previous: rulesHosts, manifest: manifest,
+                                                                    granted: granted) else {
+            done?()
+            return
+        }
+        allowedHosts = hosts
+        rulesHosts = hosts
+        rulesGeneration += 1
+        let generation = rulesGeneration
+        content.removeAllContentRuleLists()
+        if let closed = closedRules { content.add(closed) }
+        guard !hosts.isEmpty else {
+            done?()
+            return
+        }
+        ruleList(hosts: hosts) { [weak self] result in
+            guard let self = self else { return }
+            // A newer change superseded this one; its own compile installs the rules.
+            guard generation == self.rulesGeneration, let content = self.contentController else {
+                done?()
+                return
+            }
+            switch result {
+            case .success(let rules):
+                content.removeAllContentRuleLists()
+                content.add(rules)
+            case .failure(let error):
+                // Stay closed; the next refresh tries again.
+                self.allowedHosts = []
+                self.rulesHosts = []
+                self.log.error("\(self.pluginID, privacy: .public) panel \(self.panelID, privacy: .public): \(error.message, privacy: .public)")
+            }
+            done?()
         }
     }
 
@@ -255,17 +401,23 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
         web.scrollView.contentInsetAdjustmentBehavior = .never
         web.allowsLinkPreview = false
         web.allowsBackForwardNavigationGestures = false
-        // Plugin authors debug their panels with Safari's Web Inspector (a connected Mac with Develop enabled).
+        #if DEBUG
+        // Plugin authors debug their panels with Safari's Web Inspector (a connected Mac with Develop enabled). Only
+        // in development builds: the inspector has full use of window.nib and the plugin's grants.
         web.isInspectable = true
+        #endif
         web.accessibilityLabel = title
         container.install(web)
         webView = web
+        // The web view's own controller (the same object; rule lists added to it reach the live pages).
+        contentController = web.configuration.userContentController
     }
 
-    /// Reload from the menu, ⌘R or the stopped / failed states: reload the plugin (`plugin.reload`, so main.js picks
-    /// up edits too), then the page.
+    /// Reload from the menu or the stopped / failed states: reload the plugin (`plugin.reload`, so main.js picks up
+    /// edits too), then the page.
     func reload() {
         guard let app = app else { return }
+        bridge.resetDialogBudget()
         let session = self.session ?? app.services.sessions.active
         let id = pluginID
         Task { @MainActor [weak self] in
@@ -282,14 +434,15 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
         }
     }
 
+    /// Reloads only the page (main.js keeps running), under the network rules the live grants allow now.
     private func reloadPage() {
         guard let app = app else { return }
         pageReady = false
         outbox.removeAll()
         bridge.resetPage()
-        if let web = webView, let url = PluginPanelURL.url(pluginID: pluginID, path: entry) {
+        if webView != nil {
             phase = .loading
-            web.load(URLRequest(url: url))
+            refreshNetworkRules { [weak self] in self?.loadEntry() }
         } else if !NibApp.isHostlessTest {
             load(app)
         }
@@ -339,6 +492,7 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
     }
 
     private func pageDidStart() {
+        refreshNetworkRules()
         pageReady = true
         let queued = outbox
         outbox.removeAll()
@@ -358,8 +512,9 @@ final class PluginWebPanel: NSObject, ObservableObject, PanelMessageSink {
     func receive(_ message: WKScriptMessage, reply: @escaping @MainActor (Any?, String?) -> Void) {
         // Only the panel's own document may call: sub-frames (an allowed host's iframe) never, and the main frame
         // cannot leave the plugin's origin (PanelNavigationPolicy).
-        let url = message.frameInfo.request.url ?? message.webView?.url
-        guard message.frameInfo.isMainFrame, PluginPanelURL.isOwn(url, pluginID: pluginID) else {
+        let isMainFrame = message.frameInfo.isMainFrame
+        let url = message.frameInfo.request.url ?? (isMainFrame ? message.webView?.url : nil)
+        guard PanelCallGate.allows(frameURL: url, isMainFrame: isMainFrame, pluginID: pluginID) else {
             reply(nil, PanelBridge.errorText(NibError(.permissionDenied, "only the panel's own page can call Nib")))
             return
         }
@@ -407,6 +562,8 @@ extension PluginWebPanel: WKNavigationDelegate, WKUIDelegate {
             decisionHandler(.cancel)
             return
         }
+        // The live grants decide: a revoked "network" permission stops sub-frames and link-outs at once.
+        refreshNetworkRules()
         let decision = PanelNavigationPolicy.decide(url: navigationAction.request.url,
                                                     isMainFrame: navigationAction.targetFrame?.isMainFrame ?? true,
                                                     userActivated: navigationAction.navigationType == .linkActivated,
@@ -442,8 +599,23 @@ extension PluginWebPanel: WKNavigationDelegate, WKUIDelegate {
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         pageReady = false
         bridge.resetPage()
+        let now = Date()
+        let decision = PanelCrashRecovery.decide(earlier: terminations, now: now, visible: isOnScreen)
+        terminations = (terminations + [now]).filter { now.timeIntervalSince($0) < PanelCrashRecovery.window }
         log.error("\(self.pluginID, privacy: .public) panel \(self.panelID, privacy: .public): web content process ended")
-        phase = .stopped
+        switch decision {
+        case .reloadPage:
+            // Usually the system reclaimed it in the background: bring the page back, main.js untouched.
+            reloadPage()
+        case .showStopped:
+            phase = .stopped
+        }
+    }
+
+    /// The panel is in a window of a scene in the foreground.
+    private var isOnScreen: Bool {
+        guard let window = container.window, !container.isHidden else { return false }
+        return window.windowScene?.activationState == .foregroundActive
     }
 
     private func navigationFailed(_ error: Error) {
@@ -452,12 +624,13 @@ extension PluginWebPanel: WKNavigationDelegate, WKUIDelegate {
         if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
         // WebKitErrorFrameLoadInterruptedByPolicyChange.
         if ns.domain == "WebKitErrorDomain" && ns.code == 102 { return }
-        fail(String(localized: "This panel could not open."), detail: ns.localizedDescription)
+        fail(String(localized: "Check the plugin's files, then reload it."), detail: ns.localizedDescription)
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         // No pop-ups. A tapped target=_blank link to an allowed host opens in the browser.
+        refreshNetworkRules()
         if case .openExternally(let url) = PanelNavigationPolicy.decide(
             url: navigationAction.request.url, isMainFrame: true,
             userActivated: navigationAction.navigationType == .linkActivated, pluginID: pluginID,
@@ -467,8 +640,15 @@ extension PluginWebPanel: WKNavigationDelegate, WKUIDelegate {
         return nil
     }
 
+    // The page's own dialogs share the per-document budget with nib.ui's (PanelDialogLimiter): past it, each is
+    // answered at once, as if cancelled.
+
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping @MainActor () -> Void) {
+        guard bridge.allowDialog() else {
+            completionHandler()
+            return
+        }
         let dialogs = bridge.dialogs
         Task { @MainActor in
             await dialogs.alert(message)
@@ -478,6 +658,10 @@ extension PluginWebPanel: WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping @MainActor (Bool) -> Void) {
+        guard bridge.allowDialog() else {
+            completionHandler(false)
+            return
+        }
         let dialogs = bridge.dialogs
         let name = manifest.name
         Task { @MainActor in
@@ -487,6 +671,10 @@ extension PluginWebPanel: WKNavigationDelegate, WKUIDelegate {
 
     func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping @MainActor (String?) -> Void) {
+        guard bridge.allowDialog() else {
+            completionHandler(nil)
+            return
+        }
         let dialogs = bridge.dialogs
         Task { @MainActor in
             completionHandler((try? await dialogs.prompt(prompt, placeholder: nil, initial: defaultText)) ?? nil)
@@ -532,11 +720,10 @@ private final class WeakNavigator {
 
 // MARK: - UIKit host view
 
-/// Holds the web view, follows the traits Nib's CSS tokens depend on, and offers ⌘R (Reload Panel) while the panel
-/// has keyboard focus.
+/// Holds the web view and follows the traits Nib's CSS tokens depend on. Reload lives in the panel's More menu (no
+/// view-local key command: keys go through the key-command registry).
 final class PanelContainerView: UIView {
     var onTraitsChange: (() -> Void)?
-    var onReloadShortcut: (() -> Void)?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -563,16 +750,6 @@ final class PanelContainerView: UIView {
             web.topAnchor.constraint(equalTo: topAnchor),
             web.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
-    }
-
-    override var keyCommands: [UIKeyCommand]? {
-        let reload = UIKeyCommand(title: String(localized: "Reload Panel"), action: #selector(reloadShortcut),
-                                  input: "r", modifierFlags: .command)
-        return [reload]
-    }
-
-    @objc private func reloadShortcut() {
-        onReloadShortcut?()
     }
 }
 
@@ -631,18 +808,20 @@ struct PluginPanelView: View {
             switch panel.phase {
             case .idle, .loading:
                 ProgressView()
-                    .controlSize(.regular)
+                    .controlSize(.small)
                     .accessibilityLabel(String(localized: "Loading \(panel.title)"))
             case .ready:
                 EmptyView()
             case .stopped:
                 NibEmptyState(symbol: .warningTriangle, title: String(localized: "This plugin stopped."),
                               message: String(localized: "Reload it to try again."),
-                              primary: NibAction(String(localized: "Reload")) { panel.reload() })
+                              primary: NibAction(String(localized: "Reload")) { panel.reload() },
+                              secondary: NibAction(String(localized: "Report a Problem")) { panel.reportProblem() })
             case .failed(let message):
                 NibEmptyState(symbol: .warningTriangle, title: String(localized: "This panel could not open."),
                               message: message,
-                              primary: NibAction(String(localized: "Reload")) { panel.reload() })
+                              primary: NibAction(String(localized: "Reload")) { panel.reload() },
+                              secondary: NibAction(String(localized: "Report a Problem")) { panel.reportProblem() })
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

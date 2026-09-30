@@ -10,11 +10,15 @@ import NibTesting
 private final class FakeDialogs: PanelDialogPresenting {
     var toasts: [String] = []
     var confirmAnswer = true
+    var confirms = 0
     func toast(_ message: String) -> Bool {
         toasts.append(message)
         return true
     }
-    func confirm(_ title: String, message: String?) async throws -> Bool { confirmAnswer }
+    func confirm(_ title: String, message: String?) async throws -> Bool {
+        confirms += 1
+        return confirmAnswer
+    }
     func prompt(_ title: String, placeholder: String?, initial: String?) async throws -> String? { initial }
     func choose(_ title: String, options: [String]) async throws -> Int? { options.isEmpty ? nil : 0 }
     func alert(_ message: String) async {}
@@ -382,6 +386,168 @@ final class FeatPluginPanelsTests: XCTestCase {
         XCTAssertEqual(decide("file:///etc/hosts"), .deny)
     }
 
+    // MARK: nib.net.fetch limits
+
+    private func fetcherResult(_ fetcher: PanelFetcher, _ s: String, method: String = "GET") async -> Result<JSONValue, NibError> {
+        do {
+            return .success(try await fetcher.fetch(URL(string: s)!, method: method, headers: [:], body: nil))
+        } catch {
+            return .failure(NibError.wrap(error))
+        }
+    }
+
+    /// The body is cut off while it arrives (and an announced length past the cap is refused up front), so a large
+    /// response never grows Nib's memory; OPTIONS is allowed as in main.js; a redirect off the manifest's hosts is
+    /// never followed.
+    func testNetFetchStreamsWithinItsLimitsAndStaysOnTheListedHosts() async throws {
+        PanelFetcher.protocolClasses = [PanelStubHTTP.self]
+        PanelStubHTTP.reset()
+        defer { PanelFetcher.protocolClasses = [] }
+        let fetcher = PanelFetcher(hosts: ["api.example.com"], maxBytes: 1_000, timeout: 10)
+
+        let ok = await fetcherResult(fetcher, "https://api.example.com/v1/items")
+        XCTAssertEqual(try ok.get()["status"], 200)
+        XCTAssertEqual(try JSONValue.parse(try ok.get()["text"]?.stringValue ?? "")["method"], "GET")
+        let options = await fetcherResult(PanelFetcher(hosts: ["api.example.com"]), "https://api.example.com/v1", method: "OPTIONS")
+        XCTAssertEqual(try JSONValue.parse(try options.get()["text"]?.stringValue ?? "")["method"], "OPTIONS")
+        XCTAssertTrue(PanelFetcher.methods.contains("OPTIONS"))
+
+        guard case .failure(let streamed) = await fetcherResult(fetcher, "https://api.example.com/big") else {
+            return XCTFail("a body past the cap must fail")
+        }
+        XCTAssertEqual(streamed.code, .unsupported)
+        guard case .failure(let announced) = await fetcherResult(fetcher, "https://api.example.com/announced") else {
+            return XCTFail("an announced length past the cap must fail")
+        }
+        XCTAssertEqual(announced.code, .unsupported)
+
+        // The redirect to another host is refused: the call ends without the other host ever being asked.
+        switch await fetcherResult(fetcher, "https://api.example.com/redirect") {
+        case .success(let r):
+            let status = r["status"]?.intValue ?? 0
+            XCTAssertTrue((300..<400).contains(status), "got \(r)")
+        case .failure:
+            break
+        }
+        XCTAssertFalse(PanelStubHTTP.hosts.contains("evil.example.net"))
+
+        // The redirect decision itself: allowed hosts only, https only.
+        let task = URLSession.shared.dataTask(with: URL(string: "https://api.example.com/")!)
+        let hop = HTTPURLResponse(url: URL(string: "https://api.example.com/")!, statusCode: 302, httpVersion: nil,
+                                  headerFields: nil)!
+        var followed: [URLRequest?] = []
+        for target in ["https://evil.example.net/steal", "http://api.example.com/plain", "https://api.example.com/next"] {
+            fetcher.urlSession(URLSession.shared, task: task, willPerformHTTPRedirection: hop,
+                               newRequest: URLRequest(url: URL(string: target)!)) { followed.append($0) }
+        }
+        XCTAssertEqual(followed.map { $0?.url?.absoluteString }, [nil, nil, "https://api.example.com/next"])
+
+        // Through the bridge: the manifest's hosts and the live "network" grant.
+        let h = Harness(features: [FeatPluginPanelsFeature.self])
+        var m = try manifest(permissions: ["network"])
+        m.network = PluginNetwork(hosts: ["api.example.com"])
+        let b = bridge(h, m)
+        h.app.gateway.grants = { _ in [.network] }
+        let viaBridge = try await b.handle("net.fetch", ["url": "https://api.example.com/v1", "init": ["method": "OPTIONS"]])
+        XCTAssertEqual(viaBridge["status"], 200)
+        h.app.gateway.grants = { _ in [] }
+        let revoked = await code { _ = try await b.handle("net.fetch", ["url": "https://api.example.com/v1"]) }
+        XCTAssertEqual(revoked, .permissionDenied)
+    }
+
+    // MARK: Live network allowance, call gate, crash recovery, dialogs
+
+    func testNetworkRulesFollowTheLiveGrants() throws {
+        var m = try manifest(permissions: ["document:read", "network"])
+        m.network = PluginNetwork(hosts: ["api.example.com"])
+        // Granted and unchanged: keep the rules.
+        XCTAssertEqual(PanelNetworkRefresh.decide(previous: ["api.example.com"], manifest: m, granted: [.network]), .keep)
+        // Revoked in Settings › Plugins while the panel is open: rebuild with no hosts (fail closed).
+        XCTAssertEqual(PanelNetworkRefresh.decide(previous: ["api.example.com"], manifest: m, granted: [.documentRead]),
+                       .rebuild([]))
+        // Granted later: the hosts come back without reopening the panel.
+        XCTAssertEqual(PanelNetworkRefresh.decide(previous: [], manifest: m, granted: [.network]),
+                       .rebuild(["api.example.com"]))
+        XCTAssertEqual(PanelNetworkRefresh.decide(previous: [], manifest: m, granted: []), .keep)
+        // Not declared: never any hosts, whatever the grants.
+        let undeclared = try manifest(permissions: ["document:read"])
+        XCTAssertEqual(PanelNetworkRefresh.decide(previous: [], manifest: undeclared, granted: Set(Scope.allCases)), .keep)
+        XCTAssertEqual(PanelNetworkRefresh.decide(previous: ["api.example.com"], manifest: undeclared,
+                                                  granted: Set(Scope.allCases)), .rebuild([]))
+    }
+
+    func testOnlyThePanelsOwnMainFrameMayCallNib() {
+        func allows(_ s: String?, main: Bool) -> Bool {
+            PanelCallGate.allows(frameURL: s.flatMap { URL(string: $0) }, isMainFrame: main, pluginID: pluginID)
+        }
+        XCTAssertTrue(allows("nib-plugin://dev.test.panel/panels/stats.html", main: true))
+        XCTAssertTrue(allows("nib-plugin://DEV.TEST.PANEL/panels/stats.html", main: true))
+        XCTAssertFalse(allows("nib-plugin://dev.test.panel/panels/stats.html", main: false), "a sub-frame on its own origin")
+        XCTAssertFalse(allows("nib-plugin://dev.other.plugin/panels/stats.html", main: true), "another plugin's origin")
+        XCTAssertFalse(allows("https://api.example.com/", main: true))
+        XCTAssertFalse(allows("https://api.example.com/", main: false), "an allowed host's iframe")
+        XCTAssertFalse(allows("about:blank", main: false))
+        XCTAssertFalse(allows("about:blank", main: true))
+        XCTAssertFalse(allows(nil, main: true))
+        XCTAssertFalse(allows(nil, main: false))
+    }
+
+    func testAReclaimedPageReloadsQuietlyAndOnlyRepeatedCrashesStop() {
+        let t0 = Date(timeIntervalSince1970: 10_000)
+        // First time: reload just the page, visible or not.
+        XCTAssertEqual(PanelCrashRecovery.decide(earlier: [], now: t0, visible: true), .reloadPage)
+        XCTAssertEqual(PanelCrashRecovery.decide(earlier: [], now: t0, visible: false), .reloadPage)
+        // Again within the window while on screen: "This plugin stopped."
+        XCTAssertEqual(PanelCrashRecovery.decide(earlier: [t0], now: t0.addingTimeInterval(5), visible: true), .showStopped)
+        // Long after the last one: quiet again.
+        XCTAssertEqual(PanelCrashRecovery.decide(earlier: [t0], now: t0.addingTimeInterval(PanelCrashRecovery.window + 1),
+                                                 visible: true), .reloadPage)
+        // In the background the system may reclaim it a few times; a crash loop still stops.
+        XCTAssertEqual(PanelCrashRecovery.decide(earlier: [t0], now: t0.addingTimeInterval(5), visible: false), .reloadPage)
+        let loop = (0..<PanelCrashRecovery.hiddenLimit).map { t0.addingTimeInterval(Double($0)) }
+        XCTAssertEqual(PanelCrashRecovery.decide(earlier: loop, now: t0.addingTimeInterval(5), visible: false), .showStopped)
+    }
+
+    func testDialogsInALoopAreAnsweredWithoutShowing() async throws {
+        var limiter = PanelDialogLimiter(limit: 3, window: 10)
+        XCTAssertTrue(limiter.allow(now: 0))
+        XCTAssertTrue(limiter.allow(now: 1))
+        XCTAssertTrue(limiter.allow(now: 2))
+        XCTAssertFalse(limiter.allow(now: 3))
+        XCTAssertFalse(limiter.allow(now: 60), "blocked for the rest of the document")
+        limiter.newDocument()
+        XCTAssertTrue(limiter.allow(now: 61), "a new document, and the earlier dialogs have aged out")
+
+        var reloading = PanelDialogLimiter(limit: 3, window: 10)
+        for t in 0..<3 { XCTAssertTrue(reloading.allow(now: Double(t))) }
+        reloading.newDocument()
+        XCTAssertFalse(reloading.allow(now: 4), "a page that reloads itself earns no new dialogs")
+        reloading.reset()
+        XCTAssertTrue(reloading.allow(now: 5))
+
+        // nib.ui dialogs share the budget: the fourth confirm in a burst answers false without asking.
+        let h = Harness(features: [FeatPluginPanelsFeature.self])
+        let dialogs = FakeDialogs()
+        let b = bridge(h, try manifest(), dialogs: dialogs)
+        var now: TimeInterval = 100
+        b.clock = { now }
+        for _ in 0..<3 {
+            let answer = try await b.handle("ui.confirm", ["title": "Again?"])
+            XCTAssertEqual(answer, true)
+        }
+        let blocked = try await b.handle("ui.confirm", ["title": "Again?"])
+        XCTAssertEqual(blocked, false)
+        let prompt = try await b.handle("ui.prompt", ["title": "Name", "initial": "x"])
+        XCTAssertEqual(prompt, .null)
+        XCTAssertEqual(dialogs.confirms, 3)
+        XCTAssertFalse(b.allowDialog())
+        // The user reloads the panel: dialogs work again.
+        b.resetDialogBudget()
+        now += 1
+        let fresh = try await b.handle("ui.confirm", ["title": "Again?"])
+        XCTAssertEqual(fresh, true)
+    }
+
     /// The panel view in hostless tests: no WKWebView is made (NibApp.isHostlessTest), the chrome and its states
     /// still render in Light, Dark and AX3, floating (the 344 pt Deep panel frame) and full width (sheets, tabs).
     func testPanelViewRendersWithoutAWebViewInEveryVariant() throws {
@@ -481,4 +647,62 @@ final class FeatPluginPanelsTests: XCTestCase {
         XCTAssertEqual(eval("nib.plugin.settings.separator")?.toString(), "|")
         XCTAssertNil(exception)
     }
+}
+
+/// Answers https://api.example.com like a small JSON API ("/big" streams 5,000 bytes without a length, "/announced"
+/// announces 5,000, "/redirect" redirects to evil.example.net) and records which hosts were asked.
+final class PanelStubHTTP: URLProtocol {
+    private static let lock = NSLock()
+    private static var seen: [String] = []
+
+    static var hosts: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return seen
+    }
+
+    static func reset() {
+        lock.lock()
+        seen = []
+        lock.unlock()
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        ["api.example.com", "evil.example.net"].contains(request.url?.host ?? "")
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else { return }
+        PanelStubHTTP.lock.lock()
+        PanelStubHTTP.seen.append(url.host ?? "")
+        PanelStubHTTP.lock.unlock()
+        switch url.path {
+        case "/big", "/announced":
+            var headers = ["Content-Type": "text/plain"]
+            if url.path == "/announced" { headers["Content-Length"] = "5000" }
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            for _ in 0..<10 { client?.urlProtocol(self, didLoad: Data(repeating: 0x61, count: 500)) }
+            client?.urlProtocolDidFinishLoading(self)
+        case "/redirect":
+            let target = URL(string: "https://evil.example.net/steal")!
+            let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1",
+                                           headerFields: ["Location": target.absoluteString, "Content-Length": "0"])!
+            client?.urlProtocol(self, wasRedirectedTo: URLRequest(url: target), redirectResponse: response)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocolDidFinishLoading(self)
+        default:
+            let body = ["method": request.httpMethod ?? "", "host": url.host ?? ""]
+            let data = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1",
+                                           headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    override func stopLoading() {}
 }

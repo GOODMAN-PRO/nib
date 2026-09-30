@@ -95,10 +95,12 @@ final class PluginPanelFactoryService: PluginPanelFactory {
         })
     }
 
-    /// Starts routing `plugin.message` events (from `start`, never from `register`).
+    /// Starts routing `plugin.message` events (from `start`, never from `register`), and drops the compiled rule
+    /// lists earlier sessions left in WebKit's store (uninstalled plugins, changed hosts).
     func startListening() {
         guard !listening, let app = app else { return }
         listening = true
+        if !NibApp.isHostlessTest { ruleLists.sweepUnused() }
         bag.add(app.events.subscribe { [weak self] event in
             guard event.type == NibEventType.pluginMessage else { return }
             PanelMainThread.run { self?.route(event) }
