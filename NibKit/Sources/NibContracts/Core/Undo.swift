@@ -108,3 +108,40 @@ public final class UndoHistory {
         return undoStacks[doc]?.remove(at: i)
     }
 }
+
+/// contracts-v2.2: where ⌘Z / ⇧⌘Z acts in one window. A key command that runs `edit.undo` / `edit.redo` undoes the
+/// document's history while it has a step; when it has none, or no document is open, the shell falls back to the
+/// window's UndoManager, where window-level steps live (the toolbar's "Move Palette"). The shell also validates the
+/// key (menu, ⌘-hold overlay) with it, so ⌘Z is enabled exactly when one of the two can act.
+public enum UndoRoute: Equatable {
+    /// Run the command on this document's history.
+    case document(DocumentID)
+    /// Undo (redo) the window's UndoManager.
+    case window
+    /// Nothing to undo (redo) in either (not named `none`, so it never reads as `Optional.none`).
+    case nothing
+
+    /// The document's history while it has a step, else the window's UndoManager while it has one, else `.nothing`.
+    /// `doc` nil = no document is open; `window` nil = the window has no UndoManager.
+    @MainActor
+    public static func resolve(redo: Bool, doc: DocumentID?, history: UndoHistory, window: UndoManager?) -> UndoRoute {
+        if let doc, redo ? history.canRedo(doc) : history.canUndo(doc) { return .document(doc) }
+        if let window, redo ? window.canRedo : window.canUndo { return .window }
+        return .nothing
+    }
+
+    /// The route of a key command about to run `command` with its resolved `params`: nil unless the command is
+    /// `edit.undo` or `edit.redo`. The document is the one `params` name in `doc`, else the session's document.
+    @MainActor
+    public static func forCommand(_ command: String, params: JSONValue, session: EditorSession?, history: UndoHistory,
+                                  window: UndoManager?) -> UndoRoute? {
+        let redo: Bool
+        switch command {
+        case CommandIDs.undo: redo = false
+        case CommandIDs.redo: redo = true
+        default: return nil
+        }
+        let named = params["doc"]?.stringValue.flatMap { $0.isEmpty ? nil : NodeRef.documentID(from: $0) }
+        return resolve(redo: redo, doc: named ?? session?.document, history: history, window: window)
+    }
+}
