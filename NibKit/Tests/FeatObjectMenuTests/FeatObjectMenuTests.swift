@@ -70,6 +70,24 @@ final class FeatObjectMenuTests: XCTestCase {
                     selection: h.session.selection)
     }
 
+    /// Waits (up to two seconds) for work the menus start in tasks: commands they run, colours they apply.
+    private func waitUntil(_ condition: () -> Bool, _ message: String = "", file: StaticString = #filePath,
+                           line: UInt = #line) async throws {
+        let deadline = Date().addingTimeInterval(2)
+        while !condition() && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertTrue(condition(), message, file: file, line: line)
+    }
+
+    /// A stand-in for a command another feature owns, recording the params it is called with.
+    private func standIn(_ h: Harness, _ id: String, effect: Effect = .session,
+                         _ record: @escaping (JSONValue) -> Void) {
+        h.app.commands.register(CommandDescriptor(id: id, title: id, summary: "Test stand-in.", effect: effect,
+                                                  exposure: .ui)) { params, _ in
+            record(params)
+            return [:]
+        }
+    }
+
     private func withPasteboard(_ hasContent: Bool, _ body: () async throws -> Void) async rethrows {
         let saved = ObjectMenuEntries.pasteboardHasContent
         ObjectMenuEntries.pasteboardHasContent = { hasContent }
@@ -102,6 +120,10 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertEqual(delete?.scope, .canvas)
         XCTAssertEqual(keys.first { $0.shortcut == KeyShortcut("]", [.command, .option, .shift]) }?.params["to"], "front")
         XCTAssertEqual(keys.first { $0.shortcut == KeyShortcut("l", [.command]) }?.params["locked"], true)
+        // Unlock is ⇧⌘L: ⌥⌘L belongs to the Layers panel.
+        XCTAssertEqual(keys.first { $0.shortcut == KeyShortcut("l", [.command, .shift]) }?.params["locked"], false)
+        XCTAssertNil(keys.first { $0.shortcut == KeyShortcut("l", [.command, .option]) })
+        XCTAssertEqual(h.app.ui.menus.get(ObjectMenuIDs.unlock)?.shortcut, KeyShortcut("l", [.command, .shift]))
         let handler = h.app.content.tapHandlers.get("objectmenu.pageLongPress")
         XCTAssertEqual(handler?.gesture, .longPress)
         XCTAssertEqual(handler?.command, "menu.showAt")
@@ -167,6 +189,38 @@ final class FeatObjectMenuTests: XCTestCase {
         let both = DeletePlan.make(targets: ["A", "B"], items: [a, b, child, link])
         XCTAssertEqual(both.deleted, ["A", "B", "C", "L"])
         XCTAssertEqual(both.updated, [])
+    }
+
+    func testLockedContentsStayWhenTheirContainerIsDeletedOrMoved() async throws {
+        let box = Item(id: "A", kind: .shape, shape: ShapeItem(shape: .rectangle, frame: Frame(x: 0, y: 0, w: 100, h: 100)))
+        var pinned = Item(id: "K", kind: .image, image: ImageItem(frame: Frame(x: 10, y: 10, w: 20, h: 20),
+                                                                   asset: AssetRef("a.png")))
+        pinned.attachedTo = "A"
+        pinned.locked = true
+        var ink = Item(id: "I", kind: .stroke, stroke: Stroke(style: .defaultPen, points: []))
+        ink.attachedTo = "K"                                                // on the locked image: stays with it
+        let plan = DeletePlan.make(targets: ["A"], items: [box, pinned, ink])
+        XCTAssertEqual(plan.deleted, ["A"])
+        XCTAssertEqual(plan.updated.map { $0.id }, ["K"])
+        XCTAssertNil(plan.updated.first?.attachedTo)
+        XCTAssertEqual(plan.updated.first?.locked, true)
+        XCTAssertEqual(ArrangePlanner.withAttached(["A"], items: [box, pinned, ink]), ["A"])
+
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        edit(h, Fixtures.imageID) {
+            $0.attachedTo = Fixtures.shapeID
+            $0.locked = true
+        }
+        let start = try order(h)
+        let arranged = try await h.run("item.arrange", ["refs": [ref(Fixtures.shapeID)], "to": "front"])
+        XCTAssertEqual(arranged["moved"], .array([ref(Fixtures.shapeID)]))
+        XCTAssertEqual(try order(h).filter { $0 != Fixtures.shapeID }, start.filter { $0 != Fixtures.shapeID })
+        let out = try await h.run("item.delete", ["refs": [ref(Fixtures.shapeID)]])
+        XCTAssertFalse(out["deleted"]?.arrayValue?.contains(ref(Fixtures.imageID)) ?? true)
+        XCTAssertTrue(out["detached"]?.arrayValue?.contains(ref(Fixtures.imageID)) ?? false)
+        let image = try item(h, Fixtures.imageID)
+        XCTAssertTrue(image.locked)
+        XCTAssertNil(image.attachedTo)
     }
 
     func testLockedItemsAreRefusedAndNothingChanges() async throws {
@@ -342,8 +396,10 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertTrue(h.app.bus.undo(doc))
         XCTAssertEqual(try h.snapshot(), before)
         try await h.run("item.setLocked", ["refs": [ref(Fixtures.imageID)], "locked": true])
+        XCTAssertEqual(h.app.bus.history.undoLabel(doc), "Lock")
         try await h.run("item.setLocked", ["refs": [ref(Fixtures.imageID)], "locked": false])
         XCTAssertFalse(try item(h, Fixtures.imageID).locked)
+        XCTAssertEqual(h.app.bus.history.undoLabel(doc), "Unlock")          // "Undo Unlock", not "Undo Lock"
         do {
             try await h.run("item.setLocked", ["refs": [ref(Fixtures.strokeID)], "locked": true])
             XCTFail("ink was locked")
@@ -448,6 +504,27 @@ final class FeatObjectMenuTests: XCTestCase {
         h.session.readOnly = true
         select(h, [Fixtures.shapeID])
         XCTAssertEqual(visible(h, .objectMenu), [ObjectMenuIDs.copy, ObjectMenuIDs.screenshot])
+    }
+
+    func testReadOnlyWindowKeysChangeNothing() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        h.session.readOnly = true
+        select(h, [Fixtures.shapeID, Fixtures.imageID])                  // selected before the switch
+        let before = try h.snapshot()
+        // Delete, the arrange chords, ⌘L and a colour from the keyboard: the shell sends them whatever the mode.
+        let keys: [(String, JSONValue)] = [("item.delete", [:]), ("item.arrange", ["to": "front"]),
+                                           ("item.setLocked", ["locked": true]), ("item.recolor", ["color": "#2156D9"])]
+        for (command, params) in keys {
+            try await h.run(command, params)
+        }
+        // Named refs from the user in this window: nothing either.
+        try await h.run("item.delete", ["refs": [ref(Fixtures.shapeID)]])
+        XCTAssertEqual(try h.snapshot(), before)
+        XCTAssertEqual(h.undoDepth(doc), 0)
+        XCTAssertEqual(h.session.selection.items, [Fixtures.shapeID, Fixtures.imageID])
+        // The AI and the bridge name their items and are not bound by one window's mode.
+        try await h.run("item.arrange", ["refs": [ref(Fixtures.shapeID)], "to": "front"], as: .ai("chat"))
+        XCTAssertEqual(try order(h).last, Fixtures.shapeID)
     }
 
     func testEntryParamsTargetTheSelection() throws {
@@ -647,6 +724,7 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertTrue(attachment.model.isShown)
         XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.overlay))
         XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.colourPopover))
+        XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.stylePopover))
         XCTAssertEqual(attachment.model.anchor, CGRect(x: 100, y: 200, width: 160, height: 90))
         XCTAssertEqual(floating.anchors[ObjectMenuIDs.overlay], CGRect(x: 100, y: 200, width: 160, height: 0))
         XCTAssertTrue(attachment.model.entries.map { $0.id }.contains(ObjectMenuIDs.delete))
@@ -658,6 +736,135 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertFalse(attachment.model.hasEntries)
         attachment.detach(from: host)
         XCTAssertFalse(floating.isPresenting(ObjectMenuIDs.overlay))
+        XCTAssertFalse(floating.isPresenting(ObjectMenuIDs.stylePopover))
+    }
+
+    func testStyleBudsAPopoverInTheFloatingHost() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        h.app.ui.inspectors.register(InspectorDescriptor(id: "test.box", title: "Box Style", icon: "square",
+                                                         itemKinds: [.shape], order: 1, owner: "test") { _ in
+            AnyView(EmptyView())
+        })
+        var panels: [JSONValue] = []
+        standIn(h, CommandIDs.panelOpen) { panels.append($0) }
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        select(h, [Fixtures.shapeID], bounds: Rect(x: 100, y: 200, width: 160, height: 90))
+        let model = attachment.model
+        let style = try XCTUnwrap(model.entries.first { $0.id == ObjectMenuIDs.style })
+        XCTAssertFalse(model.styleOpen)
+        model.perform(style)                                              // Style in More
+        XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.stylePopover))
+        XCTAssertTrue(model.styleOpen)
+        XCTAssertEqual(model.styleSource, ObjectMenuIDs.moreAnchor)       // buds from More
+        XCTAssertEqual(model.style?.inspector?.id, "test.box")
+        XCTAssertEqual(model.style?.items.map { $0.id }, [Fixtures.shapeID])
+        // Colour and Style bud from the same capsule: one at a time.
+        model.colourOpen = true
+        XCTAssertFalse(model.styleOpen)
+        // The right-click menu's Style opens the same popover.
+        XCTAssertTrue(attachment.presentStyle(style.descriptor.params(context(h))))
+        XCTAssertTrue(model.styleOpen)
+        XCTAssertFalse(model.colourOpen)
+        // Deselecting closes it.
+        h.session.selection = Selection()
+        XCTAssertFalse(model.styleOpen)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(panels, [])                                        // never the floating panel
+
+        // A window without a floating host: the Style panel, on the inspector the entry names.
+        h.session.floatingHost = nil
+        select(h, [Fixtures.shapeID], bounds: Rect(x: 100, y: 200, width: 160, height: 90))
+        let fallback = try XCTUnwrap(model.entries.first { $0.id == ObjectMenuIDs.style })
+        model.perform(fallback)
+        XCTAssertFalse(model.styleOpen)
+        try await waitUntil({ panels.count == 1 }, "Style opened no panel")
+        XCTAssertEqual(panels.first?["id"], .string(ObjectMenuIDs.stylePanel))
+        XCTAssertEqual(panels.first?["inspector"], "test.box")
+    }
+
+    func testCustomColourPicksAreCoalesced() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        select(h, [Fixtures.strokeID])
+        var recolors = 0
+        let watch = h.app.bus.observeCommits { cs in
+            if cs.command == CommandIDs.itemRecolor { recolors += 1 }
+        }
+        defer { watch.cancel() }
+        let model = attachment.model
+        model.colourOpen = true
+        for i in 0..<30 { model.pickCustom(RGBA(UInt8(i), 40, 200)) }   // one drag across the system picker
+        XCTAssertEqual(recolors, 0)                                        // nothing until the interval ends
+        try await waitUntil({ recolors == 1 }, "the drag was not applied once")
+        XCTAssertEqual(try item(h, Fixtures.strokeID).stroke?.style.color, RGBA(29, 40, 200))
+        model.pickCustom(RGBA(1, 2, 3))
+        model.colourOpen = false                                           // closing applies the last colour at once
+        try await waitUntil({ recolors == 2 }, "the last colour was not applied on close")
+        XCTAssertEqual(try item(h, Fixtures.strokeID).stroke?.style.color, RGBA(1, 2, 3))
+        XCTAssertEqual(h.undoDepth(doc), 1)                                // one undo step for the popover
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(recolors, 2)
+    }
+
+    func testCommitsElsewhereLeaveTheMenuAlone() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        select(h, [Fixtures.strokeID])
+        let built = attachment.rebuilds
+        let ink = { Item(kind: .stroke, stroke: Stroke(style: .defaultPen, points: [StrokePoint(x: 5, y: 5)])) }
+        try await h.insert([ink()], page: Fixtures.boardID, doc: Fixtures.whiteboardID)      // another notebook
+        try await h.insert([ink()], page: Fixtures.page2)                                     // another page
+        XCTAssertEqual(attachment.rebuilds, built)
+        try await h.run("item.recolor", ["refs": [ref(Fixtures.strokeID)], "color": "#2156D9"])
+        XCTAssertEqual(attachment.rebuilds, built + 1)
+        XCTAssertEqual(attachment.model.currentColour, RGBA(hex: "#2156D9"))  // the facts follow the page
+    }
+
+    func testTheObjectMenuStaysQuickOnALargePage() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let ink = (0..<20_000).map { i -> Item in
+            let x = Float(i % 200) * 3, y = Float(i / 200) * 8
+            return Item(kind: .stroke, stroke: Stroke(style: .defaultPen,
+                                                      points: [StrokePoint(x: x, y: y), StrokePoint(x: x + 2, y: y + 2)]))
+        }
+        let written = try await h.insert(ink)
+        let host = FakeCanvasHost(h)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let picks = [written[10].id, written[19_990].id]
+        let budget = 0.016                                                 // one frame
+        var best = Double.infinity
+        for i in 0..<4 {
+            // A commit on the page (what the menu knew is stale), then another stroke selected: the cold path.
+            try await h.run("item.recolor", ["refs": [ref(Fixtures.strokeID)],
+                                             "color": .string(i % 2 == 0 ? "#2156D9" : "#D9432B")])
+            let t0 = CFAbsoluteTimeGetCurrent()
+            select(h, [picks[i % 2]])
+            let entries = h.app.ui.menuItems(.objectMenu, context(h))
+            attachment.refresh()
+            best = min(best, CFAbsoluteTimeGetCurrent() - t0)
+            XCTAssertTrue(entries.contains { $0.id == ObjectMenuIDs.delete })
+            XCTAssertTrue(attachment.model.isShown)
+        }
+        XCTAssertLessThan(best, budget * 4, "the cold menu took \(Int(best * 1000)) ms")
     }
 
     func testTheMenuStepsAsideWhileThePageMoves() async throws {
@@ -696,6 +903,28 @@ final class FeatObjectMenuTests: XCTestCase {
             let onImage = try XCTUnwrap(attachment.contextMenu(at: CGPoint(x: 350, y: 510)))
             XCTAssertTrue(onImage.menu.children.map { $0.title }.contains("Lock"))
         }
+    }
+
+    func testRightClickInReadOnlyModeLeavesTheSelectionAlone() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        var selected: [JSONValue] = []
+        standIn(h, CommandIDs.selectionSet) { selected.append($0["refs"] ?? .null) }
+        let host = FakeCanvasHost(h)
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        h.session.readOnly = true
+        let onImage = try XCTUnwrap(attachment.contextMenu(at: CGPoint(x: 350, y: 510)))
+        let titles = onImage.menu.children.map { $0.title }
+        XCTAssertTrue(titles.contains("Copy"))
+        XCTAssertFalse(titles.contains("Lock"))
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(selected, [])
+        XCTAssertTrue(h.session.selection.isEmpty)
+        h.session.readOnly = false
+        _ = try XCTUnwrap(attachment.contextMenu(at: CGPoint(x: 350, y: 510)))
+        try await waitUntil({ selected.count == 1 }, "the item was not selected")
+        XCTAssertEqual(selected.first, [ref(Fixtures.imageID)])
     }
 
     func testUIMenusCarryCheckmarksShortcutsAndColours() throws {

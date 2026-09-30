@@ -34,6 +34,8 @@ public enum FeatObjectMenuFeature: NibFeature {
         app.ui.canvasTools.register(CanvasToolDescriptor(id: ObjectMenuIDs.screenshotTool,
                                                          title: String(localized: "Take Screenshot"), order: 900,
                                                          owner: id) { ScreenshotTool() })
+        // The Style entry opens a popover in the window's floating host; this panel is the fallback for a window
+        // without one (panel.open is the entry's command, so other menu hosts reach it too).
         app.ui.panels.register(PanelDescriptor(
             id: ObjectMenuIDs.stylePanel, title: String(localized: "Style"), icon: NibSymbol.customColour.name,
             placement: .floating, order: 900, owner: id, docKinds: [.notebook, .whiteboard]) { context in
@@ -47,6 +49,7 @@ enum ObjectMenuIDs {
     static let attachment = "objectmenu.menus"
     static let longPressHandler = "objectmenu.pageLongPress"
     static let screenshotTool = "objectmenu.screenshotTool"
+    /// The Style panel: only where the window has no floating host (the Style popover is used everywhere else).
     static let stylePanel = "objectmenu.style"
 
     static let cut = "objectmenu.cut"
@@ -67,30 +70,42 @@ enum ObjectMenuIDs {
     static let bar = "objectmenu.bar"
     static let colourPopover = "objectmenu.colourPopover"
     static let colourAnchor = "objectmenu.colourAnchor"
+    static let stylePopover = "objectmenu.stylePopover"
+    /// The More button: the Style popover buds from it.
+    static let moreAnchor = "objectmenu.moreAnchor"
 }
 
 // MARK: - What is selected
 
 /// The selection a menu context points at, resolved against the page (live items only), with the facts the entries'
-/// visibility depends on.
+/// visibility depends on. Every entry's `isVisible` and `params` asks for it, so the page is read once per selection
+/// state (`SelectionFactsCache`), not once per entry.
 @MainActor
 struct SelectionFacts {
     let doc: DocumentID
     let page: PageID
-    /// Live selected items, bottom first.
-    let items: [Item]
     /// The window is in read-only mode, or the store will not write the document.
     let readOnly: Bool
-    /// Page-coordinate bounds of the selection.
-    let bounds: Rect
+    private let resolved: Resolved
 
-    var kinds: Set<ItemKind> { Set(items.map { $0.kind }) }
-    var anyLocked: Bool { items.contains { $0.locked } }
+    /// Live selected items, bottom first.
+    var items: [Item] { resolved.items }
+    /// Page-coordinate bounds of the selection.
+    var bounds: Rect { resolved.bounds }
+    var kinds: Set<ItemKind> { resolved.kinds }
+    var anyLocked: Bool { resolved.anyLocked }
     /// Cut, Delete, Duplicate, Arrange: something selected, nothing locked, and the document can change.
     var isEditable: Bool { !readOnly && !anyLocked }
-    var recolorable: [Item] { items.filter { !$0.locked && Recolor.canRecolor($0) } }
-    var lockable: [Item] { items.filter { !$0.locked && Locking.canLock($0) } }
-    var locked: [Item] { items.filter { $0.locked } }
+    var recolorable: [Item] { resolved.recolorable }
+    var lockable: [Item] { resolved.lockable }
+    var locked: [Item] { resolved.locked }
+
+    fileprivate init(doc: DocumentID, page: PageID, readOnly: Bool, resolved: Resolved) {
+        self.doc = doc
+        self.page = page
+        self.readOnly = readOnly
+        self.resolved = resolved
+    }
 
     func refs(_ items: [Item]) -> JSONValue {
         .array(items.map { .string(NodeRef.item(doc, page, $0.id).description) })
@@ -103,14 +118,117 @@ struct SelectionFacts {
     static func of(selection sel: Selection, doc: DocumentID?, page: PageID?, app: NibApp,
                    session: EditorSession?) -> SelectionFacts? {
         guard !sel.items.isEmpty, let d = sel.doc ?? doc, let p = sel.page ?? page,
-              let all = try? app.workspace.allItems(d, page: p) else { return nil }
-        let wanted = Set(sel.items)
-        var found: [Item] = []
-        for it in all where !it.deleted && wanted.contains(it.id) { found.append(it) }
-        guard !found.isEmpty else { return nil }
-        let union = found.map { $0.bounds }.reduce(nil as Rect?) { acc, r in acc.map { $0.union(r) } ?? r } ?? .zero
+              let resolved = SelectionFactsCache.resolve(sel, doc: d, page: p, app: app) else { return nil }
         let readOnly = (session?.readOnly ?? false) || app.isReadOnly(d)
-        return SelectionFacts(doc: d, page: p, items: found, readOnly: readOnly, bounds: sel.bounds ?? union)
+        return SelectionFacts(doc: d, page: p, readOnly: readOnly, resolved: resolved)
+    }
+
+    /// The selected items of one selection state and what the entries ask of them, each worked out once.
+    @MainActor
+    final class Resolved {
+        let items: [Item]
+        let bounds: Rect
+        private(set) lazy var kinds: Set<ItemKind> = Set(items.map { $0.kind })
+        private(set) lazy var anyLocked: Bool = items.contains { $0.locked }
+        private(set) lazy var recolorable: [Item] = items.filter { !$0.locked && Recolor.canRecolor($0) }
+        private(set) lazy var lockable: [Item] = items.filter { !$0.locked && Locking.canLock($0) }
+        private(set) lazy var locked: [Item] = items.filter { $0.locked }
+
+        init(items: [Item], bounds: Rect) {
+            self.items = items
+            self.bounds = bounds
+        }
+
+        /// The live items of `page` named by `selected`, bottom first; nil when none is live. A few ids are looked up
+        /// one by one (the scan stops at each); a large selection is matched in one pass over the page.
+        static func make(_ sel: Selection, all: [Item]) -> Resolved? {
+            var found: [Item] = []
+            if sel.items.count <= 8 {
+                var indices: [Int] = []
+                for id in Set(sel.items) {
+                    if let i = all.firstIndex(where: { $0.id == id && !$0.deleted }) { indices.append(i) }
+                }
+                found = indices.sorted().map { all[$0] }
+            } else {
+                let wanted = Set(sel.items)
+                found.reserveCapacity(wanted.count)
+                for it in all where !it.deleted && wanted.contains(it.id) { found.append(it) }
+            }
+            guard !found.isEmpty else { return nil }
+            let union = found.map { $0.bounds }.reduce(nil as Rect?) { acc, r in acc.map { $0.union(r) } ?? r } ?? .zero
+            return Resolved(items: found, bounds: sel.bounds ?? union)
+        }
+    }
+}
+
+/// One slot: the resolved selection of the last (app, document, page, selection) asked about. A commit that writes that
+/// page empties it (one commit observer per app, made on first use; the object menu's own observers also report
+/// commits first, so their rebuild never reads a stale slot whatever order the bus calls observers in).
+@MainActor
+enum SelectionFactsCache {
+    private struct Key: Equatable {
+        let app: ObjectIdentifier
+        let doc: DocumentID
+        let page: PageID
+        let items: [ElementID]
+        let bounds: Rect?
+        /// Records on the page (live and deleted): a cheap guard against a page reloaded without a commit.
+        let count: Int
+    }
+
+    private final class Watch {
+        weak var app: NibApp?
+        var subscription: EventSubscription?
+    }
+
+    private static var slot: (key: Key, app: WeakApp, value: SelectionFacts.Resolved?)?
+    private static var watches: [ObjectIdentifier: Watch] = [:]
+
+    private struct WeakApp {
+        weak var app: NibApp?
+    }
+
+    static func resolve(_ sel: Selection, doc: DocumentID, page: PageID, app: NibApp) -> SelectionFacts.Resolved? {
+        guard let all = try? app.workspace.allItems(doc, page: page) else { return nil }
+        watch(app)
+        let key = Key(app: ObjectIdentifier(app), doc: doc, page: page, items: sel.items, bounds: sel.bounds,
+                      count: all.count)
+        if let cached = slot, cached.key == key, cached.app.app === app { return cached.value }
+        let value = SelectionFacts.Resolved.make(sel, all: all)
+        slot = (key, WeakApp(app: app), value)
+        return value
+    }
+
+    /// Empties the slot when `cs` writes its page (items, or the page record itself).
+    static func noteCommit(_ cs: Changeset, app: NibApp) {
+        guard let cached = slot, cached.app.app === app else { return }
+        if touches(cs, doc: cached.key.doc, page: cached.key.page) { slot = nil }
+    }
+
+    /// True when `cs` writes an item of `page` or the page record.
+    static func touches(_ cs: Changeset, doc: DocumentID, page: PageID) -> Bool {
+        cs.mutations.contains { m in
+            switch m {
+            case let .item(d, p, _, _): return d == doc && p == page
+            case let .page(d, _, after): return d == doc && after.id == page
+            default: return false
+            }
+        }
+    }
+
+    static func clear() { slot = nil }
+
+    private static func watch(_ app: NibApp) {
+        let id = ObjectIdentifier(app)
+        if let w = watches[id], w.app === app { return }
+        watches = watches.filter { $0.value.app != nil }
+        let w = Watch()
+        w.app = app
+        w.subscription = app.bus.observeCommits { [weak app] cs in
+            guard let app else { return }
+            SelectionFactsCache.noteCommit(cs, app: app)
+        }
+        watches[id] = w
     }
 }
 
@@ -128,6 +246,9 @@ enum ObjectMenuEntries {
     /// The colour a generic host applies when it runs the Colour entry directly (the capsule opens its popover
     /// instead): the default pen ink.
     static let defaultInk = NibInk.carbon
+
+    /// Unlock Selection: ⇧⌘L (⌥⌘L is the Layers panel's key).
+    static let unlockShortcut = KeyShortcut("l", [.command, .shift])
 
     static func objectMenu(owner: String) -> [MenuItemDescriptor] {
         var out: [MenuItemDescriptor] = []
@@ -158,7 +279,7 @@ enum ObjectMenuEntries {
               params: { f, _ in ["refs": f.refs(f.items)] }, visible: { f, _ in f.isEditable })
         // The Delete slot turns into the lock when the selection holds locked items (tap to unlock).
         entry(ObjectMenuIDs.unlock, String(localized: "Unlock"), .lock, order: 40, command: ItemSetLocked.descriptor.id,
-              quick: true, shortcut: KeyShortcut("l", [.command, .option]),
+              quick: true, shortcut: ObjectMenuEntries.unlockShortcut,
               params: { f, _ in ["refs": f.refs(f.locked), "locked": false] },
               visible: { f, _ in !f.readOnly && f.anyLocked })
         entry(ObjectMenuIDs.colour, String(localized: "Colour"), .customColour, order: 50, command: CommandIDs.itemRecolor,
@@ -255,8 +376,8 @@ enum ObjectMenuEntries {
                 ItemArrange.descriptor.id, ["to": "back"], order: 404),
             key("lock", String(localized: "Lock Selection"), KeyShortcut("l", [.command]), ItemSetLocked.descriptor.id,
                 ["locked": true], order: 405),
-            key("unlock", String(localized: "Unlock Selection"), KeyShortcut("l", [.command, .option]),
-                ItemSetLocked.descriptor.id, ["locked": false], order: 406)
+            key("unlock", String(localized: "Unlock Selection"), unlockShortcut, ItemSetLocked.descriptor.id,
+                ["locked": false], order: 406)
         ]
     }
 }

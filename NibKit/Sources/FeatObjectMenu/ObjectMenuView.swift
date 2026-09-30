@@ -9,7 +9,7 @@ import NibDesign
 // under their plugin's name, headed "Made by Assistant · 09:41" when the AI made the items. It is floating chrome: the
 // canvas attachment presents it through the window's floating host, so it merges, recedes while the Pencil is down
 // and never sits in the canvas. Colour buds a Deep popover (the 12 inks, or the 6 highlighters for highlighter ink,
-// and Custom…) from its button.
+// and Custom…) from its button; Style buds one with the matching inspector from More.
 
 // MARK: - Entries as the menu shows them
 
@@ -223,8 +223,53 @@ struct ObjectMenuSwatch: Identifiable {
     }
 }
 
+/// Applies a colour the system picker reports while it is dragged at most once per `interval`, always ending on the
+/// last colour picked (`flush` applies it at once: the picker let go, the popover closed).
+@MainActor
+final class ColourCoalescer {
+    /// Seconds between two applied colours while the picker moves.
+    static var interval: TimeInterval = 0.1
+
+    private let apply: (RGBA) -> Void
+    private var pending: RGBA?
+    private var task: Task<Void, Never>?
+
+    init(apply: @escaping (RGBA) -> Void) { self.apply = apply }
+
+    /// A colour picked while the picker moves: applied at the end of the current interval.
+    func submit(_ colour: RGBA) {
+        pending = colour
+        guard task == nil else { return }
+        let nanos = UInt64(max(0, ColourCoalescer.interval) * 1_000_000_000)
+        task = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: nanos)
+            guard !Task.isCancelled, let self else { return }
+            self.task = nil
+            self.flush()
+        }
+    }
+
+    /// Applies the colour waiting for its interval, if any, now.
+    func flush() {
+        task?.cancel()
+        task = nil
+        guard let colour = pending else { return }
+        pending = nil
+        apply(colour)
+    }
+
+    /// Forgets a waiting colour without applying it.
+    func cancel() {
+        task?.cancel()
+        task = nil
+        pending = nil
+    }
+
+    var hasPending: Bool { pending != nil }
+}
+
 /// What one window's object menu shows, and what its buttons do. The canvas attachment feeds it; the capsule, the More
-/// menu, the colour popover and the UIKit fallback menus read it.
+/// menu, the colour and Style popovers and the UIKit fallback menus read it.
 @MainActor
 final class ObjectMenuModel: ObservableObject {
     @Published private(set) var entries: [ObjectMenuEntry] = []
@@ -233,34 +278,68 @@ final class ObjectMenuModel: ObservableObject {
     @Published private(set) var anchor: CGRect = .null
     @Published var isShown = false
     @Published var colourOpen = false {
-        didSet { if colourOpen && !oldValue { colourGroup = NibID.make().raw } }
+        didSet {
+            if colourOpen && !oldValue {
+                colourGroup = NibID.make().raw
+                styleOpen = false
+            }
+            if !colourOpen && oldValue { customColours.flush() }
+        }
+    }
+    /// The Style popover (the inspector that fits the selection), budded from More.
+    @Published var styleOpen = false {
+        didSet {
+            guard styleOpen != oldValue else { return }
+            if styleOpen {
+                colourOpen = false
+                style?.start()
+            } else {
+                style?.stop()
+            }
+        }
     }
     @Published private(set) var swatches: [ObjectMenuSwatch] = []
     @Published private(set) var currentSwatch: String?
     @Published private(set) var currentColour: RGBA?
-    /// Where the capsule sits (the overlay reports it) and so where the colour popover buds.
+    /// Where the capsule sits (the overlay reports it) and so where the colour and Style popovers bud.
     @Published var colourAbove = true
 
     private(set) var context: MenuContext?
     private(set) var facts: SelectionFacts?
+    /// The Style popover's content: follows the window's selection while the popover is open.
+    private(set) var style: StylePanelModel?
     private weak var app: NibApp?
     private weak var session: EditorSession?
     /// One undo step for every colour picked while the popover is open (the custom picker reports as it moves).
     private var colourGroup = NibID.make().raw
     private var lastApplied: RGBA?
+    private lazy var customColours = ColourCoalescer { [weak self] colour in
+        guard let self, self.lastApplied != colour else { return }
+        self.recolor(colour)
+    }
     /// Shares a finished screenshot of the selection (the attachment owns the canvas view).
     var shareScreenshot: ((_ asset: String, _ facts: SelectionFacts) -> Void)?
+    /// Whether the window can show the Style popover (it has a floating host); else Style opens the fallback panel.
+    var canPresentStyle: @MainActor () -> Bool = { false }
 
     var hasEntries: Bool { !entries.isEmpty }
     var colourPlacement: NibBudPlacement { colourAbove ? .above : .below }
+    /// The Style popover buds from More while the capsule shows, else from the selection's top edge.
+    var styleSource: String { isShown && hasEntries ? ObjectMenuIDs.moreAnchor : ObjectMenuIDs.overlay }
 
     func bind(app: NibApp, session: EditorSession) {
         self.app = app
         self.session = session
+        style = StylePanelModel(app: app, session: session, preferred: nil)
     }
 
     /// Shows `descriptors` (already filtered by `isVisible`) for `facts`.
     func show(_ descriptors: [MenuItemDescriptor], context: MenuContext, facts: SelectionFacts, header: String?) {
+        if let old = self.facts, old.doc != facts.doc || old.page != facts.page
+            || old.items.map({ $0.id }) != facts.items.map({ $0.id }) {
+            // A custom colour still waiting for its interval belongs to the selection being left.
+            customColours.flush()
+        }
         self.context = context
         self.facts = facts
         entries = descriptors.map { ObjectMenuEntry($0, context: context) }
@@ -279,12 +358,15 @@ final class ObjectMenuModel: ObservableObject {
     }
 
     func clear() {
+        // A custom colour still waiting for its interval belongs to the selection being left: apply it first.
+        customColours.flush()
         context = nil
         facts = nil
         entries = []
         header = nil
         isShown = false
         colourOpen = false
+        styleOpen = false
         anchor = .null
         lastApplied = nil
     }
@@ -295,8 +377,8 @@ final class ObjectMenuModel: ObservableObject {
 
     func nodes(_ entries: [ObjectMenuEntry]) -> [ObjectMenuNode] { ObjectMenuComposer.group(entries) }
 
-    /// Runs an entry's command with its params for this context, as the user. Colour opens the popover; Take
-    /// Screenshot hands its PNG to the share sheet.
+    /// Runs an entry's command with its params for this context, as the user. Colour opens the colour popover and
+    /// Style the Style popover; Take Screenshot hands its PNG to the share sheet.
     func perform(_ entry: ObjectMenuEntry) {
         if entry.isColour {
             colourOpen.toggle()
@@ -305,6 +387,7 @@ final class ObjectMenuModel: ObservableObject {
         guard let app, let context else { return }
         let d = entry.descriptor
         let params = d.params(context)
+        if d.id == ObjectMenuIDs.style, openStyle(params) { return }
         if d.id == ObjectMenuIDs.screenshot, let facts {
             let session = self.session
             Task { @MainActor [weak self] in
@@ -320,17 +403,29 @@ final class ObjectMenuModel: ObservableObject {
         app.perform(d.command, params, session: session)
     }
 
+    /// Opens the Style popover on the inspector `params` names (the Style entry's params). False when the window has
+    /// no floating host: the caller then runs the entry's command, which opens the Style panel.
+    @discardableResult
+    func openStyle(_ params: JSONValue) -> Bool {
+        guard canPresentStyle(), let style else { return false }
+        style.prefer(params["inspector"]?.stringValue)
+        styleOpen = true
+        return true
+    }
+
     /// A swatch: recolour and close.
     func pick(_ swatch: ObjectMenuSwatch) {
+        customColours.cancel()
         recolor(swatch.rgba)
         colourOpen = false
     }
 
-    /// The system colour picker (it reports continuously while it is dragged; one undo step per popover).
+    /// The system colour picker. It reports continuously while it is dragged: one recolour per
+    /// `ColourCoalescer.interval` at most, the last colour when it closes, one undo step per popover.
     func pickCustom(_ colour: RGBA) {
         let opaque = RGBA(colour.r, colour.g, colour.b)
-        guard lastApplied != opaque else { return }
-        recolor(opaque)
+        guard lastApplied != opaque || customColours.hasPending else { return }
+        customColours.submit(opaque)
     }
 
     /// The custom picker's colour: the selection's own when it shares one.
@@ -360,8 +455,11 @@ final class ObjectMenuModel: ObservableObject {
 
 // MARK: - Capsule
 
-/// The capsule in the floating host: placed in container coordinates, faded in and out (content only; there is no bud,
-/// so the canvas stays live around it: drag the selection, tap away to deselect).
+/// The capsule in the floating host: placed in container coordinates, faded in and out. DESIGN.md §10.6 buds it from
+/// the selection's top edge (the attachment already sets that anchor, `ObjectMenuIDs.overlay`), but an open bud is
+/// modal: NibDesign's dismiss catcher takes every touch outside the droplets, so while the capsule shows (whenever
+/// something is selected) the selection could not be dragged and a tap away would only close it. It fades until
+/// NibDesign offers a non-modal bud; the canvas stays live around it: drag the selection, tap away to deselect.
 struct ObjectMenuOverlay: View {
     @ObservedObject var model: ObjectMenuModel
     @Environment(\.horizontalSizeClass) private var sizeClass
@@ -452,6 +550,7 @@ struct ObjectMenuBar: View {
                 .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
                 .contentShape(Rectangle())
         }
+        .nibBudAnchor(ObjectMenuIDs.moreAnchor)
         .nibTooltip(String(localized: "More"))
         .accessibilityLabel(String(localized: "More"))
     }
@@ -556,16 +655,44 @@ struct ObjectMenuColourPopover: View {
     }
 }
 
-// MARK: - Style panel
+// MARK: - Style
 
-/// Style (panel "objectmenu.style"): the `InspectorDescriptor` that fits the selected kinds, from the text, shape or
-/// plugin feature that registered it. A mixed selection offers each fitting inspector in a segmented control.
+/// Style (T-036): a Deep popover budded from More (from the selection's top edge when the capsule is not showing) with
+/// the `InspectorDescriptor` that fits the selected kinds, from the text, shape or plugin feature that registered it.
+/// A mixed selection offers each fitting inspector in a segmented control. A touch outside only closes it.
+struct ObjectMenuStylePopover: View {
+    @ObservedObject var model: ObjectMenuModel
+
+    var body: some View {
+        if let style = model.style {
+            NibBudPopover(id: ObjectMenuIDs.stylePopover, source: model.styleSource, isPresented: $model.styleOpen,
+                          title: String(localized: "Style"), placement: model.colourPlacement) {
+                ObjectMenuStyleContent(model: style)
+            }
+        }
+    }
+}
+
+/// The Style panel ("objectmenu.style"): the same content in a floating panel, for a window without a floating host.
 struct ObjectMenuStylePanel: View {
     @StateObject private var model: StylePanelModel
 
     init(context: PanelContext) {
         _model = StateObject(wrappedValue: StylePanelModel(context: context))
     }
+
+    var body: some View {
+        ObjectMenuStyleContent(model: model)
+            .padding(NibSpacing.l)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .onAppear { model.start() }
+            .onDisappear { model.stop() }
+    }
+}
+
+/// The inspector for the selection (a segmented control first when several fit), or an empty state.
+struct ObjectMenuStyleContent: View {
+    @ObservedObject var model: StylePanelModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.m) {
@@ -580,10 +707,6 @@ struct ObjectMenuStylePanel: View {
                               message: String(localized: "Select a text box, shape or other object to change how it looks."))
             }
         }
-        .padding(NibSpacing.l)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .onAppear { model.start() }
-        .onDisappear { model.stop() }
     }
 }
 
@@ -597,26 +720,44 @@ final class StylePanelModel: ObservableObject {
     private(set) var page: PageID?
     let app: NibApp
     weak var session: EditorSession?
-    private let preferred: String?
+    private var preferred: String?
     private var selectionWatch: AnyCancellable?
     private var commits: EventSubscription?
 
-    init(context: PanelContext) {
-        app = context.app
-        session = context.session
-        preferred = context.params["inspector"]?.stringValue ?? context.params["params"]?["inspector"]?.stringValue
+    convenience init(context: PanelContext) {
+        self.init(app: context.app, session: context.session,
+                  preferred: context.params["inspector"]?.stringValue ?? context.params["params"]?["inspector"]?.stringValue)
+    }
+
+    init(app: NibApp, session: EditorSession?, preferred: String?) {
+        self.app = app
+        self.session = session
+        self.preferred = preferred
         reload(session?.selection ?? Selection())
     }
 
     var inspector: InspectorDescriptor? { choices.first { $0.id == selected } ?? choices.first }
 
+    /// Shows `id` first (the Style entry names the inspector that fits the whole selection).
+    func prefer(_ id: String?) {
+        preferred = id
+        selected = ""
+        reload(session?.selection ?? Selection())
+    }
+
     func start() {
         guard selectionWatch == nil, let session else { return }
+        reload(session.selection)
         // @Published announces the new value before storing it: use the value it hands over.
         selectionWatch = session.$selection.dropFirst().sink { [weak self] sel in self?.reload(sel) }
-        commits = app.bus.observeCommits { [weak self] _ in
+        commits = app.bus.observeCommits { [weak self] cs in
             guard let self else { return }
-            self.reload(self.session?.selection ?? Selection())
+            SelectionFactsCache.noteCommit(cs, app: self.app)
+            // Only commits that write the selection's page (other notebooks' and collaborators' edits are not ours).
+            let sel = self.session?.selection ?? Selection()
+            guard let doc = sel.doc ?? self.session?.document, let page = sel.page ?? self.session?.page,
+                  SelectionFactsCache.touches(cs, doc: doc, page: page) else { return }
+            self.reload(sel)
         }
     }
 

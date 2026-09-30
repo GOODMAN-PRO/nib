@@ -192,8 +192,14 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     private var pendingMenu: UIMenu?
     private var pendingTarget: CGRect = .null
     private var highlight: CGRect?
+    /// Menus built so far (tests check that commits elsewhere leave a built menu alone).
+    private(set) var rebuilds = 0
     private var pickerFacts: SelectionFacts?
     private var pickerGroup = NibID.make().raw
+    private lazy var pickerColours = ColourCoalescer { [weak self] colour in
+        guard let self, let facts = self.pickerFacts else { return }
+        self.recolor(colour, facts: facts, group: self.pickerGroup)
+    }
 
     /// What a built menu depends on: rebuilt when any of it changes, only repositioned otherwise (scroll, zoom).
     struct BuildKey: Equatable {
@@ -218,6 +224,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         self.host = host
         model.bind(app: host.app, session: host.session)
         model.shareScreenshot = { [weak self] asset, facts in self?.share(asset, facts: facts) }
+        model.canPresentStyle = { [weak self] in self?.host?.session.floatingHost != nil }
         let context = UIContextMenuInteraction(delegate: self)
         host.canvasView.addInteraction(context)
         contextMenu = context
@@ -226,10 +233,12 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         editMenu = edit
         host.canvasView.addGestureRecognizer(probe)
         let sessionID = host.session.id.raw
-        subscriptions.append(host.app.bus.observeCommits { [weak self] _ in
-            guard let self else { return }
+        subscriptions.append(host.app.bus.observeCommits { [weak self] cs in
+            guard let self, let host = self.host else { return }
+            SelectionFactsCache.noteCommit(cs, app: host.app)
+            guard self.isAffected(by: cs, host: host) else { return }
             self.commits += 1
-            if self.model.hasEntries || !(self.host?.session.selection.isEmpty ?? true) { self.refresh() }
+            self.refresh()
         })
         subscriptions.append(host.app.events.subscribe { [weak self] e in
             guard e.type == NibEventType.selectionChanged || e.type == NibEventType.sessionDocument
@@ -259,6 +268,20 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
 
     func canvasDidChange(_ host: CanvasHost) { refresh() }
 
+    /// True when `cs` writes the page of this canvas's selection (items or the page record). Commits elsewhere (other
+    /// notebooks, other pages, a collaborator) leave a built menu as it is.
+    private func isAffected(by cs: Changeset, host: CanvasHost) -> Bool {
+        let session = host.session
+        let selection = session.selection
+        guard !selection.isEmpty || model.hasEntries else { return false }
+        let doc = selection.doc ?? host.documentID
+        guard doc == host.documentID else { return false }
+        guard let page = selection.page ?? model.facts?.page ?? session.page else {
+            return cs.documents.contains(doc)
+        }
+        return SelectionFactsCache.touches(cs, doc: doc, page: page)
+    }
+
     // MARK: Object menu
 
     /// Rebuilds the menu when the selection, the page or the registries changed; repositions it otherwise.
@@ -278,6 +301,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
 
     private func rebuild() {
         guard let host else { return }
+        rebuilds += 1
         let session = host.session, app = host.app
         guard session.document == host.documentID, session.selection.doc == host.documentID,
               let facts = SelectionFacts.of(selection: session.selection, doc: host.documentID, page: nil, app: app,
@@ -331,6 +355,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
             // Scrolling or zooming: out of the way until the page settles (like the system edit menu).
             model.isShown = false
             model.colourOpen = false
+            model.styleOpen = false
             scheduleReshow()
         } else if reshow == nil {
             show()
@@ -366,6 +391,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         dismissFloating()
         target.present(ObjectMenuIDs.overlay, content: AnyView(ObjectMenuOverlay(model: model)))
         target.present(ObjectMenuIDs.colourPopover, content: AnyView(ObjectMenuColourPopover(model: model)))
+        target.present(ObjectMenuIDs.stylePopover, content: AnyView(ObjectMenuStylePopover(model: model)))
         floating = target
     }
 
@@ -373,6 +399,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         guard let floating else { return }
         floating.dismiss(ObjectMenuIDs.overlay)
         floating.dismiss(ObjectMenuIDs.colourPopover)
+        floating.dismiss(ObjectMenuIDs.stylePopover)
         floating.removeAnchor(ObjectMenuIDs.overlay)
         self.floating = nil
     }
@@ -432,7 +459,8 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
     }
 
     /// What a right-click at `location` (canvas view coordinates) opens: the object menu over the selection, the
-    /// object menu of the item under the pointer (which becomes the selection), else the page menu at that point.
+    /// object menu of the item under the pointer (which becomes the selection, except in read-only mode), else the page
+    /// menu at that point.
     func contextMenu(at location: CGPoint) -> (menu: UIMenu, highlight: CGRect)? {
         guard let host, let hit = host.pagePoint(location) else { return nil }
         let session = host.session, app = host.app, doc = host.documentID
@@ -446,9 +474,11 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
             let single = Selection(doc: doc, page: hit.page, items: [item.id], bounds: item.bounds)
             guard let facts = SelectionFacts.of(selection: single, doc: doc, page: hit.page, app: app, session: session),
                   let built = objectMenu(facts, selection: single) else { return nil }
-            let ref = NodeRef.item(doc, hit.page, item.id).description
-            Task { @MainActor in
-                _ = try? await app.bus.execute(CommandIDs.selectionSet, ["refs": [.string(ref)]], session: session)
+            if !session.readOnly {
+                let ref = NodeRef.item(doc, hit.page, item.id).description
+                Task { @MainActor in
+                    _ = try? await app.bus.execute(CommandIDs.selectionSet, ["refs": [.string(ref)]], session: session)
+                }
             }
             return built
         }
@@ -536,6 +566,8 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         let app = host.app, session = host.session
         let d = e.descriptor
         let params = d.params(context)
+        // Style: the popover in the window's floating host (the panel only without one).
+        if d.id == ObjectMenuIDs.style, presentStyle(params) { return }
         guard d.id == ObjectMenuIDs.screenshot, let facts else {
             app.perform(d.command, params, session: session)
             return
@@ -548,6 +580,15 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
                 ObjectMenuModel.report(d.command, error, app: app)
             }
         }
+    }
+
+    /// Opens the Style popover from a system menu (right-click, edit menu): through the floating host, which is
+    /// presented first when the capsule has not put it there yet.
+    @discardableResult
+    func presentStyle(_ params: JSONValue) -> Bool {
+        guard let host, let target = host.session.floatingHost else { return false }
+        present(on: target)
+        return model.openStyle(params)
     }
 
     private func recolor(_ colour: RGBA, facts: SelectionFacts, group: String) {
@@ -569,6 +610,7 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
 
     private func presentColourPicker(_ facts: SelectionFacts) {
         guard let host, let presenter = ScreenshotSharing.topController(for: host.canvasView) else { return }
+        pickerColours.flush()
         pickerFacts = facts
         pickerGroup = NibID.make().raw
         let picker = UIColorPickerViewController()
@@ -585,14 +627,18 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         presenter.present(picker, animated: true)
     }
 
+    /// The picker reports continuously while it is dragged: one recolour per `ColourCoalescer.interval` at most, and
+    /// the final colour at once when it is let go (one undo step per picker).
     func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor,
                                    continuously: Bool) {
-        guard let facts = pickerFacts else { return }
+        guard pickerFacts != nil else { return }
         let c = RGBA(color)
-        recolor(RGBA(c.r, c.g, c.b), facts: facts, group: pickerGroup)
+        pickerColours.submit(RGBA(c.r, c.g, c.b))
+        if !continuously { pickerColours.flush() }
     }
 
     func colorPickerViewControllerDidFinish(_ viewController: UIColorPickerViewController) {
+        pickerColours.flush()
         pickerFacts = nil
     }
 

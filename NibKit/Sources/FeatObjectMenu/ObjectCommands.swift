@@ -24,9 +24,11 @@ enum ItemTargets {
     static let unlockHint = "unlock it first with item.setLocked {refs, locked: false}"
 
     /// `refs`, or the invoking window's selection when the user leaves them out (key commands and menus run with
-    /// static params). nil = the user acted with nothing selected: the command then does nothing. Other callers must
-    /// name the items.
+    /// static params). nil = the user acted with nothing selected, or from a window in read-only mode (its keys still
+    /// reach the canvas): the command then does nothing. Other callers must name the items; another window's mode
+    /// does not stop them.
     static func resolve(_ refs: [String]?, _ ctx: CommandContext) throws -> [ItemTarget]? {
+        if ctx.principal.isUser && ctx.session?.readOnly == true { return nil }
         let given = refs ?? []
         if given.isEmpty && !ctx.principal.isUser {
             throw NibError(.invalidParams, "refs is empty", path: "$.refs", hint: refHint)
@@ -100,12 +102,14 @@ enum ItemTargets {
 
 /// What deleting some items does to a page (pure). The targets go, and so does everything attached to them (a
 /// container's contents, ink on a sticky note); comment threads pinned to them are unpinned instead (a discussion is
-/// not part of the object). Connectors survive a deleted end with that end detached at its last point, and go too
-/// when both of their anchored ends go.
+/// not part of the object), and so are locked items (they stay until they are unlocked, with what is attached to
+/// them). Connectors survive a deleted end with that end detached at its last point, and go too when both of their
+/// anchored ends go.
 struct DeletePlan: Equatable {
     /// Every item to tombstone, targets first.
     var deleted: [ElementID]
-    /// Items rewritten so the page stays valid: connectors with a detached end, unpinned comment threads.
+    /// Items rewritten so the page stays valid: connectors with a detached end, unpinned comment threads and locked
+    /// items.
     var updated: [Item]
 
     static func make(targets: [ElementID], items: [Item]) -> DeletePlan {
@@ -117,6 +121,7 @@ struct DeletePlan: Equatable {
         var gone = Set<ElementID>()
         var order: [ElementID] = []
         var queue: [ElementID] = []
+        var next = 0
         func add(_ id: ElementID) {
             if gone.insert(id).inserted {
                 order.append(id)
@@ -126,10 +131,11 @@ struct DeletePlan: Equatable {
         for t in targets { add(t) }
         var unpinned: Set<ElementID> = []
         while true {
-            while !queue.isEmpty {
-                let id = queue.removeFirst()
-                for child in children[id] ?? [] {
-                    if child.kind == .comment {
+            while next < queue.count {
+                let id = queue[next]
+                next += 1
+                for child in children[id] ?? [] where !gone.contains(child.id) {
+                    if child.kind == .comment || child.locked {
                         unpinned.insert(child.id)
                     } else {
                         add(child.id)
@@ -323,10 +329,11 @@ enum ArrangePlanner {
         return out
     }
 
-    /// `ids` plus everything attached to them, transitively (a container's contents move with it).
+    /// `ids` plus everything attached to them, transitively (a container's contents move with it). Locked items stay
+    /// where they are, with what is attached to them.
     static func withAttached(_ ids: Set<ElementID>, items: [Item]) -> Set<ElementID> {
         var children: [ElementID: [ElementID]] = [:]
-        for it in items {
+        for it in items where !it.locked {
             if let parent = it.attachedTo { children[parent, default: []].append(it.id) }
         }
         var out = ids
@@ -592,7 +599,7 @@ struct ItemSetLocked: NibCommand {
         try ItemTargets.ensureWritable(groups, ctx)
         var changed: [String] = []
         var skipped: [String] = []
-        try ctx.mutate { tx in
+        try ctx.mutate(p.locked ? String(localized: "Lock") : String(localized: "Unlock")) { tx in
             for g in groups {
                 let items = try tx.items(g.doc, page: g.page)
                 let byID = try ItemTargets.check(g.targets, items: items, allowLocked: true)
