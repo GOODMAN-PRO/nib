@@ -23,7 +23,7 @@ public enum FeatImagesFeature: NibFeature {
         app.ui.canvasTools.register(CanvasToolDescriptor(id: ImageTool.toolID, title: String(localized: "Image"),
                                                          order: 700, owner: id, make: { ImageTool() }))
         app.ui.toolbar.register(ToolbarItemDescriptor(
-            id: "images.tool", title: String(localized: "Image"), icon: ImageIcons.tool, group: .tools, order: 700,
+            id: "images.tool", title: String(localized: "Image"), icon: NibSymbol.image.name, group: .tools, order: 700,
             owner: id, toolID: ImageTool.toolID, shortcut: KeyShortcut("i"),
             settings: { [weak app] session in
                 guard let app = app else { return AnyView(EmptyView()) }
@@ -33,7 +33,7 @@ public enum FeatImagesFeature: NibFeature {
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "images.animated", owner: id, order: 900,
                                                                      make: { _ in AnimatedImageAttachment() }))
         app.ui.inspectors.register(InspectorDescriptor(
-            id: "images.inspector", title: String(localized: "Image"), icon: ImageIcons.tool, itemKinds: [.image],
+            id: "images.inspector", title: String(localized: "Image"), icon: NibSymbol.image.name, itemKinds: [.image],
             order: 500, owner: id,
             makeView: { ctx in
                 AnyView(ImageInspector(app: ctx.app, session: ctx.session, doc: ctx.doc, page: ctx.page, items: ctx.items))
@@ -48,41 +48,44 @@ enum ImageMenus {
     static func register(_ app: NibApp, owner: String) {
         let menus = app.ui.menus
         menus.register(MenuItemDescriptor(
-            id: "images.crop", title: String(localized: "Crop"), icon: ImageIcons.crop, location: .objectMenu, order: 300,
+            id: "images.crop", title: String(localized: "Crop"), icon: NibSymbol.crop.name, location: .objectMenu, order: 300,
             owner: owner, command: "image.crop", params: { ["ref": ImageMenus.ref($0)] }, isVisible: { ImageMenus.editableImage($0) }, quick: true))
         menus.register(MenuItemDescriptor(
-            id: "images.flipHorizontal", title: String(localized: "Flip Horizontally"), icon: ImageIcons.flipHorizontal,
+            id: "images.flipHorizontal", title: String(localized: "Flip Horizontally"), icon: NibSymbol.flipHorizontal.name,
             location: .objectMenu, order: 310, owner: owner, command: "image.flip",
             params: { ["ref": ImageMenus.ref($0), "axis": "horizontal"] }, isVisible: { ImageMenus.editableImage($0) },
             submenu: String(localized: "Flip")))
         menus.register(MenuItemDescriptor(
-            id: "images.flipVertical", title: String(localized: "Flip Vertically"), icon: ImageIcons.flipVertical,
+            id: "images.flipVertical", title: String(localized: "Flip Vertically"), icon: NibSymbol.flipVertical.name,
             location: .objectMenu, order: 311, owner: owner, command: "image.flip",
             params: { ["ref": ImageMenus.ref($0), "axis": "vertical"] }, isVisible: { ImageMenus.editableImage($0) },
             submenu: String(localized: "Flip")))
         menus.register(MenuItemDescriptor(
-            id: "images.replace", title: String(localized: "Replace Image"), icon: ImageIcons.replace,
+            id: "images.replace", title: String(localized: "Replace Image"), icon: NibSymbol.replace.name,
             location: .objectMenu, order: 320, owner: owner, command: "image.pick",
             params: { ["source": "photos", "ref": ImageMenus.ref($0)] }, isVisible: { ImageMenus.editableImage($0) }))
         menus.register(MenuItemDescriptor(
-            id: "images.saveToPhotos", title: String(localized: "Save to Photos"), icon: ImageIcons.saveToPhotos,
+            id: "images.saveToPhotos", title: String(localized: "Save to Photos"), icon: NibSymbol.importFile.name,
             location: .objectMenu, order: 330, owner: owner, command: "image.saveToPhotos",
             params: { ["ref": ImageMenus.ref($0)] }, isVisible: { $0.itemKinds == [.image] && $0.selection.items.count == 1 }))
         menus.register(MenuItemDescriptor(
-            id: "images.playground", title: String(localized: "Image Playground"), icon: ImageIcons.playground,
+            id: "images.playground", title: String(localized: "Image Playground"), icon: ImageMenus.playgroundIcon,
             location: .objectMenu, order: 340, owner: owner, command: "image.pick",
             params: { ctx in ["source": "playground", "refs": .array(ctx.selection.refs.map { .string($0) })] },
             isVisible: { ctx in !ctx.selection.isEmpty && ctx.session?.readOnly != true && ImagePlaygroundBridge.isAvailable }))
 
         menus.register(MenuItemDescriptor(
-            id: "images.addPage.image", title: String(localized: "Image"), icon: ImageIcons.tool, location: .addPage,
+            id: "images.addPage.image", title: String(localized: "Image"), icon: NibSymbol.image.name, location: .addPage,
             order: 700, owner: owner, command: "image.pick", params: { ImageMenus.addPage($0, source: .photos) },
             isVisible: { ImageMenus.notebook($0) }))
         menus.register(MenuItemDescriptor(
-            id: "images.addPage.camera", title: String(localized: "Take Photo"), icon: ImageIcons.camera,
+            id: "images.addPage.camera", title: String(localized: "Take Photo"), icon: NibSymbol.camera.name,
             location: .addPage, order: 710, owner: owner, command: "image.pick", params: { ImageMenus.addPage($0, source: .camera) },
             isVisible: { ImageMenus.notebook($0) && UIImagePickerController.isSourceTypeAvailable(.camera) }))
     }
+
+    /// Image Playground's glyph where the OS has it (the entry only shows on iOS 18.1+ Apple Intelligence devices).
+    static var playgroundIcon: String { (NibSymbol.imagePlayground ?? .image).name }
 
     static func ref(_ ctx: MenuContext) -> JSONValue { .string(ctx.selection.refs.first ?? "") }
 

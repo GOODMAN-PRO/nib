@@ -261,10 +261,11 @@ enum ImageGeometry {
     }
 }
 
-/// Mirroring. `ImageItem` has no flip field (contract gap), so the flags live in `Item.ext["images"]`, which only
-/// this feature writes; the drawer, live views and renditions read them.
+/// Mirroring, stored in `ImageItem.flipX` / `flipY` (nil = not flipped). Items flipped before contracts-v2 carry the
+/// flags in `Item.ext["images"]` = {flipX, flipY}; they are still read, and the next write moves them to the fields.
 struct ImageFlip: Equatable {
-    static let extKey = "images"
+    /// The pre-v2 location of the flags (read-only fallback).
+    static let legacyExtKey = "images"
     var x = false
     var y = false
 
@@ -274,24 +275,21 @@ struct ImageFlip: Equatable {
     }
 
     init(_ item: Item) {
-        let o = item.ext?[ImageFlip.extKey]
-        x = o?["flipX"]?.boolValue ?? false
-        y = o?["flipY"]?.boolValue ?? false
+        let legacy = item.ext?[ImageFlip.legacyExtKey]
+        x = item.image?.flipX ?? legacy?["flipX"]?.boolValue ?? false
+        y = item.image?.flipY ?? legacy?["flipY"]?.boolValue ?? false
     }
 
     var isIdentity: Bool { !x && !y }
 
+    /// Writes the flags into the image payload and drops the legacy ext entry.
     func write(to item: inout Item) {
-        var ext = item.ext ?? [:]
-        if isIdentity {
-            ext[ImageFlip.extKey] = nil
-        } else {
-            var o: [String: JSONValue] = [:]
-            if x { o["flipX"] = true }
-            if y { o["flipY"] = true }
-            ext[ImageFlip.extKey] = .object(o)
+        item.image?.flipX = x ? true : nil
+        item.image?.flipY = y ? true : nil
+        if var ext = item.ext, ext[ImageFlip.legacyExtKey] != nil {
+            ext[ImageFlip.legacyExtKey] = nil
+            item.ext = ext.isEmpty ? nil : ext
         }
-        item.ext = ext.isEmpty ? nil : ext
     }
 
     /// Display space (what the crop sheet shows) ⇄ image space. Mirroring is its own inverse.
@@ -348,8 +346,8 @@ enum ImagePainter {
         cg.setFillColor(fill)
         cg.fill(local)
         cg.setStrokeColor(edge)
-        cg.setLineWidth(1)
-        cg.stroke(local.insetBy(dx: 0.5, dy: 0.5))
+        cg.setLineWidth(NibStroke.thin)
+        cg.stroke(local.insetBy(dx: NibStroke.thin / 2, dy: NibStroke.thin / 2))
     }
 }
 

@@ -31,32 +31,139 @@ final class FeatImagesTests: XCTestCase {
 
     func testInsertCropFlipUndoRoundTrip() async throws {
         let h = Harness(features: [FeatImagesFeature.self])
-        // Each step is one undo entry: undo restores the document as it was before the step, redo brings the step back
-        // and the next step builds on it. ponytail: one step at a time, because the contract's revert skips an older
-        // entry once a newer undo has re-stamped the same item's rev (reported as a contract gap).
+        // Each step is one undo entry. The three stack on one item: undo ×3 walks back through every state to the page
+        // as it was, redo ×3 walks forward again (contracts-v2 G4 revert rebasing).
         let steps: [(command: String, params: JSONValue)] = [
             ("image.insert", ["page": "page:FIXTUREDOC01/FIXTUREPG002", "asset": "fixture-image.png",
                               "frame": [100, 100, 200, 100], "id": "IMGTEST00001"]),
             ("image.crop", ["ref": .string(image2), "rect": [0.5, 0, 0.5, 1]]),
             ("image.flip", ["ref": .string(image2), "axis": "horizontal"])
         ]
+        var states = [try h.snapshot()]
         for step in steps {
-            let before = try h.snapshot()
             let depth = h.undoDepth(Fixtures.docID)
             try await h.run(step.command, step.params)
             let after = try h.snapshot()
-            XCTAssertNotEqual(after, before, step.command)
+            XCTAssertNotEqual(after, states.last, step.command)
             XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1, "\(step.command) is one undo step")
-            XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
-            XCTAssertEqual(try h.snapshot(), before, "undo \(step.command)")
-            XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
-            XCTAssertEqual(try h.snapshot(), after, "redo \(step.command)")
+            states.append(after)
         }
 
         let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "IMGTEST00001")
         XCTAssertEqual(item.image?.crop, Rect(x: 0.5, y: 0, width: 0.5, height: 1))
         XCTAssertEqual(item.image?.frame, Frame(x: 200, y: 100, w: 100, h: 100), "the kept half stays where it was")
         XCTAssertEqual(ImageFlip(item), ImageFlip(x: true, y: false))
+        XCTAssertEqual(item.image?.flipX, true, "the flip lives on the image payload")
+
+        for (i, step) in steps.enumerated().reversed() {
+            XCTAssertTrue(h.app.bus.undo(Fixtures.docID), "undo \(step.command)")
+            XCTAssertEqual(try h.snapshot(), states[i], "undo \(step.command)")
+        }
+        XCTAssertNil(try? h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "IMGTEST00001"),
+                     "three undos remove the image")
+        for (i, step) in steps.enumerated() {
+            XCTAssertTrue(h.app.bus.redo(Fixtures.docID), "redo \(step.command)")
+            XCTAssertEqual(try h.snapshot(), states[i + 1], "redo \(step.command)")
+        }
+    }
+
+    func testFlipLivesOnTheImageAndLegacyExtFlagsStillRead() async throws {
+        let h = Harness(features: [FeatImagesFeature.self])
+        let ref = "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREIMG01"
+        try await h.run("image.flip", ["ref": .string(ref), "axis": "vertical"])
+        var item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
+        XCTAssertEqual(item.image?.flipY, true)
+        XCTAssertNil(item.image?.flipX, "an unflipped axis stays nil")
+        XCTAssertNil(item.ext?[ImageFlip.legacyExtKey], "nothing is written to ext any more")
+        try await h.run("image.flip", ["ref": .string(ref), "axis": "vertical"])
+        item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
+        XCTAssertNil(item.image?.flipY, "flipping back clears the field")
+
+        // An image flipped before contracts-v2 keeps its flags in ext["images"]: they still count, and the next write
+        // moves them onto the image payload.
+        item.ext = [ImageFlip.legacyExtKey: ["flipX": true], "other": "kept"]
+        item.rev = h.app.workspace.clock.tick()
+        h.app.bus.applyRemote(DocumentPatch(doc: Fixtures.docID, items: [Fixtures.page1.raw: [item]]), origin: "test")
+        item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
+        XCTAssertEqual(ImageFlip(item), ImageFlip(x: true, y: false))
+        try await h.run("image.flip", ["ref": .string(ref), "axis": "vertical"])
+        item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.imageID)
+        XCTAssertEqual(item.image?.flipX, true, "the legacy horizontal flip carries over")
+        XCTAssertEqual(item.image?.flipY, true)
+        XCTAssertNil(item.ext?[ImageFlip.legacyExtKey])
+        XCTAssertEqual(item.ext?["other"], "kept", "other ext entries are left alone")
+    }
+
+    func testAnInsertFinishesTheImageToolAndSelectsTheNewImage() async throws {
+        let h = Harness(features: [FeatImagesFeature.self])
+        // selection.set belongs to the lasso (F011); a stand-in records what the image UI asks it to select.
+        var selected: [String] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.selectionSet, title: "Select", summary: "Test stand-in.",
+                                                  effect: .session, exposure: .ui)) { params, _ in
+            selected = params["refs"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+            return .null
+        }
+        let target = ImageMenuTarget(doc: Fixtures.docID, page: Fixtures.page2, point: Point(200, 200))
+
+        // From the palette's popover (no canvas): the session finishes the tool.
+        h.session.tool = "lasso"
+        h.session.tool = ImageTool.toolID
+        var refs = await ImageUI.perform(h.app, ImageUI.insertCalls([Fixtures.pngData], target: target, app: h.app,
+                                                                    session: h.session), session: h.session, target: target)
+        XCTAssertEqual(refs.count, 1)
+        XCTAssertEqual(h.session.tool, "lasso", "the non-sticky image tool hands back after one insert")
+        XCTAssertEqual(selected, refs, "the new image is selected")
+
+        // From a tap on the page: the canvas finishes it, and a temporary tool's return tool wins.
+        let host = FakeCanvasHost(h)
+        let tool = ImageTool()
+        h.session.tool = "pen"
+        h.session.selectTemporarily(ImageTool.toolID)
+        let tapped = ImageMenuTarget(doc: Fixtures.docID, page: Fixtures.page2, point: Point(100, 100), host: host, tool: tool)
+        refs = await ImageUI.perform(h.app, ImageUI.insertCalls([Fixtures.pngData], target: tapped, app: h.app,
+                                                                session: h.session), session: h.session, target: tapped)
+        XCTAssertEqual(refs.count, 1)
+        XCTAssertEqual(h.session.tool, "pen")
+        XCTAssertNil(h.session.temporaryReturnTool)
+
+        // Someone switched tools while the picker was up: the insert leaves their choice alone.
+        h.session.tool = "eraser"
+        refs = await ImageUI.perform(h.app, ImageUI.insertCalls([Fixtures.pngData], target: target, app: h.app,
+                                                                session: h.session), session: h.session, target: target)
+        XCTAssertEqual(refs.count, 1)
+        XCTAssertEqual(h.session.tool, "eraser")
+    }
+
+    func testPickWithoutATargetUsesTheCurrentPageForTheUserOnly() async throws {
+        let h = Harness(features: [FeatImagesFeature.self])
+        do {
+            try await h.run("image.pick", ["source": "photos"])
+            XCTFail("hostless tests have no pickers")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .unavailable, "the user's call resolved the current page, then needed a picker")
+        }
+        do {
+            try await h.run("image.pick", ["source": "photos"], as: .ai("chat1"))
+            XCTFail("the AI must name a target")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+        }
+    }
+
+    func testIconsAreNibSymbolGlyphs() {
+        let h = Harness(features: [FeatImagesFeature.self])
+        let expected = ["images.crop": "crop",
+                        "images.flipHorizontal": "arrow.left.and.right.righttriangle.left.righttriangle.right",
+                        "images.flipVertical": "arrow.up.and.down.righttriangle.up.righttriangle.down",
+                        "images.replace": "arrow.2.squarepath", "images.saveToPhotos": "square.and.arrow.down",
+                        "images.addPage.image": "photo", "images.addPage.camera": "camera"]
+        for (id, name) in expected {
+            XCTAssertEqual(h.app.ui.menus.get(id)?.icon, name, id)
+        }
+        XCTAssertEqual(h.app.ui.toolbar.get("images.tool")?.icon, "photo")
+        for menu in h.app.ui.menus.all where menu.owner == FeatImagesFeature.id {
+            XCTAssertNotNil(UIImage(systemName: menu.icon ?? ""), "\(menu.id) shows a real glyph")
+        }
     }
 
     func testURLParamsResolveThroughInputFile() async throws {
@@ -233,12 +340,20 @@ final class FeatImagesTests: XCTestCase {
         XCTAssertTrue(Self.isBlue(px(17, 5)))
 
         ImageFlip(x: true).write(to: &item)
+        XCTAssertEqual(item.image?.flipX, true)
         px = Self.render(item, assets: assets)
         XCTAssertTrue(Self.isBlue(px(3, 5)))
         XCTAssertTrue(Self.isRed(px(17, 5)))
 
+        // A pre-v2 item: the flag in ext["images"] mirrors it too.
+        ImageFlip().write(to: &item)
+        item.ext = [ImageFlip.legacyExtKey: ["flipX": true]]
+        px = Self.render(item, assets: assets)
+        XCTAssertTrue(Self.isBlue(px(3, 5)), "legacy ext flags still draw")
+
         ImageFlip().write(to: &item)
         XCTAssertNil(item.ext)
+        XCTAssertNil(item.image?.flipX)
         item.image?.crop = Rect(x: 0.5, y: 0, width: 0.5, height: 1)
         px = Self.render(item, assets: assets)
         XCTAssertTrue(Self.isBlue(px(3, 5)))

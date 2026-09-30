@@ -445,10 +445,10 @@ enum PickTarget {
     }
 }
 
-/// The menus' way into the system pickers: Add Page › Image / Take Photo, Replace Image, Image Playground and the image
-/// tool's rows. A menu entry must name a command, and ARCHITECTURE §6.5 lists none that presents a picker, so this one
-/// is F034's addition (reported as a contract gap). The picked bytes then go through image.insert, page.add or
-/// image.replace in the same undo group.
+/// The menus' way into the system pickers (ARCHITECTURE §6.5 `image.pick`): Add Page › Image / Take Photo, Replace
+/// Image, Image Playground and the image tool's rows. The picked bytes then go through image.insert, page.add or
+/// image.replace in the same undo group. With no target at all, the user's call inserts on the current page (the
+/// session default, like a key command or toolbar button with static params).
 struct ImagePick: NibCommand {
     struct Params: Codable {
         var source: String
@@ -468,7 +468,7 @@ struct ImagePick: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "image.pick", title: "Choose Image",
-        summary: "Show a picker (photos, camera, scan, files, paste, playground) and insert the result on page at point, add it as pages of doc, or replace ref.",
+        summary: "Show a picker (photos, camera, scan, files, paste, playground) and insert the result on page at point, add it as pages of doc at position/anchor, replace ref, or seed Image Playground with refs; returns {refs}.",
         params: .obj([
             "source": .str("where the image comes from", choices: ImagePickSource.allCases.map { $0.rawValue }),
             "page": .ref,
@@ -496,7 +496,7 @@ struct ImagePick: NibCommand {
         }
         let target = try Self.target(p, ctx: ctx)
         guard !NibApp.isHostlessTest else { throw NibError.unavailable("system pickers (hostless test)") }
-        let presenter = try ImagePresenter.top(ctx.activeSession)
+        let presenter = try ImagePresenter.top(ctx)
         var seed = ImagePlaygroundBridge.Seed()
         if source == .playground { seed = await ImagePlaygroundBridge.seed(for: p.refs ?? [], ctx: ctx) }
         let picked = try await ImagePickers.pick(source, limit: target.isReplace ? 1 : 0, seed: seed, from: presenter)
@@ -530,6 +530,11 @@ struct ImagePick: NibCommand {
                 return (try? ctx.workspace.item(d, page: pg, id: id))?.bounds
             }.reduce(nil as Rect?) { acc, r in acc.map { $0.union(r) } ?? r }
             return .insert(doc, page, p.point ?? bounds.map { Point($0.maxX + 160, $0.midY) })
+        }
+        // Session default: the user's call with no target (a key command, a button with static params).
+        if ctx.principal.isUser, let s = ctx.activeSession, s.document != nil, s.page != nil {
+            let (doc, page) = try ctx.pageOrSession(nil)
+            return .insert(doc, page, p.point)
         }
         throw NibError(.invalidParams, "pass page (insert), doc (new pages), ref (replace) or refs (playground)",
                        path: "$.page")

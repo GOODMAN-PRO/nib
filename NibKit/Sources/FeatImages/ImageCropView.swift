@@ -169,7 +169,7 @@ struct ImageCropSheet: View {
             .fill(NibColor.scrim, style: FillStyle(eoFill: true))
             .allowsHitTesting(false)
             Path(r)
-                .stroke(NibColor.accent, lineWidth: 2)
+                .stroke(NibColor.accent, lineWidth: NibStroke.ring)
                 .allowsHitTesting(false)
             Color.clear
                 .frame(width: r.width, height: r.height)
@@ -179,8 +179,8 @@ struct ImageCropSheet: View {
             ForEach(CropHandle.allCases, id: \.self) { handle in
                 Circle()
                     .fill(NibColor.background)
-                    .overlay(Circle().stroke(NibColor.accent, lineWidth: 1.5))
-                    .frame(width: NibSpacing.m, height: NibSpacing.m)
+                    .overlay(Circle().stroke(NibColor.accent, lineWidth: NibStroke.emphasis))
+                    .frame(width: NibMetrics.handleBead, height: NibMetrics.handleBead)
                     .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
                     .contentShape(Rectangle())
                     .hoverEffect(.highlight)
@@ -234,7 +234,7 @@ struct ImageCropSheet: View {
                     p.addLines(pts)
                     if closed { p.closeSubpath() }
                 }
-                .stroke(NibColor.accent, style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
+                .stroke(NibColor.accent, style: StrokeStyle(lineWidth: NibStroke.ring, lineCap: .round, lineJoin: .round))
                 .allowsHitTesting(false)
             }
             Color.clear
@@ -309,7 +309,7 @@ enum ImageCropPresenter {
             ImageRendition.cgImage(uncropped, flip: flip, data: data, maxPixel: 1600)
         }.value
         guard let whole = rendered else { throw NibError(.internalError, "could not decode the image") }
-        let presenter = try ImagePresenter.top(ctx.activeSession)
+        let presenter = try ImagePresenter.top(ctx)
         let result = await present(UIImage(cgImage: whole), rect: flip.mirror(image.crop ?? ImageGeometry.unit),
                                    mask: image.mask.map { flip.mirror($0) }, from: presenter)
         switch result {
@@ -363,30 +363,30 @@ struct ImageInspector: View {
         NibInspectorSection(refs.count > 1 ? String(localized: "\(refs.count) Images") : String(localized: "Image")) {
             VStack(spacing: 0) {
                 if let ref = single, editable {
-                    row(String(localized: "Crop"), icon: ImageIcons.crop) {
+                    row(String(localized: "Crop"), symbol: .crop) {
                         [(command: "image.crop", params: ["ref": .string(ref)])]
                     }
                 }
                 if editable {
-                    row(String(localized: "Flip Horizontally"), icon: ImageIcons.flipHorizontal) {
+                    row(String(localized: "Flip Horizontally"), symbol: .flipHorizontal) {
                         refs.map { (command: "image.flip", params: ["ref": .string($0), "axis": "horizontal"]) }
                     }
-                    row(String(localized: "Flip Vertically"), icon: ImageIcons.flipVertical) {
+                    row(String(localized: "Flip Vertically"), symbol: .flipVertical) {
                         refs.map { (command: "image.flip", params: ["ref": .string($0), "axis": "vertical"]) }
                     }
                 }
                 if let ref = single {
                     if editable {
-                        row(String(localized: "Replace Image"), icon: ImageIcons.replace) {
+                        row(String(localized: "Replace Image"), symbol: .replace) {
                             [(command: "image.pick", params: ["source": "photos", "ref": .string(ref)])]
                         }
                     }
-                    row(String(localized: "Save to Photos"), icon: ImageIcons.saveToPhotos) {
+                    row(String(localized: "Save to Photos"), symbol: .importFile) {
                         [(command: "image.saveToPhotos", params: ["ref": .string(ref)])]
                     }
                 }
                 if editable && ImagePlaygroundBridge.isAvailable {
-                    row(String(localized: "Image Playground"), icon: ImageIcons.playground) {
+                    row(String(localized: "Image Playground"), symbol: NibSymbol.imagePlayground ?? .image) {
                         [(command: "image.pick", params: ["source": "playground", "refs": .array(refs.map { .string($0) })])]
                     }
                 }
@@ -394,12 +394,12 @@ struct ImageInspector: View {
         }
     }
 
-    private func row(_ title: String, icon: String,
+    private func row(_ title: String, symbol: NibSymbol,
                      calls: @escaping () -> [(command: String, params: JSONValue)]) -> some View {
         Button {
             ImageUI.run(app, calls(), session: session)
         } label: {
-            NibInspectorRow(title, symbol: NibSymbol(systemName: icon) ?? .image)
+            NibInspectorRow(title, symbol: symbol)
                 .contentShape(Rectangle())
         }
         .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.field, style: .continuous)))

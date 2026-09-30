@@ -12,7 +12,7 @@ import NibDesign
 
 /// Canvas tool "image" (key I, taps only, non-sticky): a tap on the page opens the Insert Image menu at that spot
 /// (recent photos, Photos, Camera, Scan Document, Files, Image Playground, Paste; images can also be dropped on it).
-/// The image lands centred where the tap was, then the previous tool comes back.
+/// The image lands centred where the tap was, then the tool is finished (`CanvasHost.finishToolUse`).
 @MainActor
 final class ImageTool: CanvasTool {
     static let toolID = "image"
@@ -22,7 +22,7 @@ final class ImageTool: CanvasTool {
 
     func tap(_ sample: CanvasSample, host: CanvasHost) {
         guard !host.session.readOnly else { return }
-        ImageMenuController.present(from: host, page: sample.page, point: sample.location)
+        ImageMenuController.present(from: host, tool: self, page: sample.page, point: sample.location)
     }
 
     func deactivate(_ host: CanvasHost) {
@@ -31,10 +31,21 @@ final class ImageTool: CanvasTool {
 }
 
 /// Where a menu choice inserts: the tapped spot, or (from the palette's popover) the visible centre of the page.
+/// A menu opened by a tap on the page also knows the canvas and the tool, so the insert finishes the tool there.
 struct ImageMenuTarget {
     var doc: DocumentID
     var page: PageID
     var point: Point?
+    weak var host: CanvasHost?
+    weak var tool: ImageTool?
+
+    init(doc: DocumentID, page: PageID, point: Point?, host: CanvasHost? = nil, tool: ImageTool? = nil) {
+        self.doc = doc
+        self.page = page
+        self.point = point
+        self.host = host
+        self.tool = tool
+    }
 
     var pageRef: String { NodeRef.page(doc, page).description }
 
@@ -50,29 +61,46 @@ struct ImageMenuTarget {
 @MainActor
 enum ImageUI {
     /// Runs commands as the user in one undo group, like `NibApp.perform` (failures reach the shell's toast). When items
-    /// were created, the non-sticky image tool hands back to the previous tool and the new items are selected.
-    static func run(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?) {
+    /// were created, the non-sticky image tool is finished and the new items are selected.
+    static func run(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?,
+                    target: ImageMenuTarget? = nil) {
         guard !calls.isEmpty else { return }
-        Task { @MainActor in
-            let group = NibID.make().raw
-            var created: [String] = []
-            for call in calls {
-                do {
-                    let r = try await app.bus.execute(Invocation(command: call.command, params: call.params, principal: .user,
-                                                                 session: session, group: group))
-                    created += ImagePick.refs(in: r.value).filter { $0.hasPrefix("item:") }
-                } catch {
-                    NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                                    userInfo: ["command": call.command, "error": NibError.wrap(error)])
-                    return
-                }
+        Task { @MainActor in await perform(app, calls, session: session, target: target) }
+    }
+
+    /// `run`, awaited. Returns the created or replaced item refs ([] when a call failed).
+    @discardableResult
+    static func perform(_ app: NibApp, _ calls: [(command: String, params: JSONValue)], session: EditorSession?,
+                        target: ImageMenuTarget? = nil) async -> [String] {
+        let group = NibID.make().raw
+        var created: [String] = []
+        for call in calls {
+            do {
+                let r = try await app.bus.execute(Invocation(command: call.command, params: call.params, principal: .user,
+                                                             session: session, group: group))
+                created += ImagePick.refs(in: r.value).filter { $0.hasPrefix("item:") }
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: app,
+                                                userInfo: ["command": call.command, "error": NibError.wrap(error)])
+                return []
             }
-            guard !created.isEmpty, let session = session else { return }
-            if session.tool == ImageTool.toolID, let previous = session.previousTool, previous != ImageTool.toolID {
-                _ = try? await app.bus.execute(CommandIDs.toolSelect, ["tool": .string(previous)], session: session)
-            }
-            _ = try? await app.bus.execute(CommandIDs.selectionSet, ["refs": .array(created.map { .string($0) })],
-                                           session: session)
+        }
+        guard !created.isEmpty, let session = session else { return created }
+        finishToolUse(session, target: target)
+        _ = try? await app.bus.execute(CommandIDs.selectionSet, ["refs": .array(created.map { .string($0) })],
+                                       session: session)
+        return created
+    }
+
+    /// The image tool is not sticky: after an insert it hands back (to a temporary tool's return tool, else the
+    /// previous tool) through the canvas that opened the menu, or through the session when the palette's popover did.
+    /// Nothing changes once the person has picked another tool meanwhile.
+    static func finishToolUse(_ session: EditorSession, target: ImageMenuTarget?) {
+        guard session.tool == ImageTool.toolID else { return }
+        if let host = target?.host, let tool = target?.tool, host.session === session {
+            host.finishToolUse(tool)
+        } else {
+            session.finishToolUse(sticky: false)
         }
     }
 
@@ -128,8 +156,8 @@ extension ImagePickSource {
         case .camera: return .camera
         case .scan: return .scan
         case .files: return .folder
-        case .paste: return NibSymbol(systemName: ImageIcons.paste) ?? .importFile
-        case .playground: return NibSymbol(systemName: ImageIcons.playground) ?? .image
+        case .paste: return .paste
+        case .playground: return NibSymbol.imagePlayground ?? .image
         }
     }
 
@@ -143,19 +171,6 @@ extension ImagePickSource {
         if ImagePlaygroundBridge.isAvailable { rows.append(.playground) }
         return rows
     }
-}
-
-/// SF Symbol names this feature adds to NibSymbol's set (menu and toolbar descriptors take strings).
-enum ImageIcons {
-    static let tool = "photo"
-    static let crop = "crop"
-    static let flipHorizontal = "arrow.left.and.right.righttriangle.left.righttriangle.right"
-    static let flipVertical = "arrow.up.and.down.righttriangle.up.righttriangle.down"
-    static let replace = "arrow.2.squarepath"
-    static let saveToPhotos = "square.and.arrow.down"
-    static let playground = "apple.image.playground"
-    static let paste = "doc.on.clipboard"
-    static let camera = "camera"
 }
 
 /// The menu body: recent photos, the picker rows and Paste; the whole menu accepts dropped images. Hosted in a popover
@@ -201,7 +216,7 @@ struct ImageSourceMenu: View {
         .overlay {
             if dropTargeted {
                 RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)
-                    .strokeBorder(NibColor.accent, lineWidth: 2)
+                    .strokeBorder(NibColor.accent, lineWidth: NibStroke.ring)
                     .allowsHitTesting(false)
             }
         }
@@ -219,7 +234,7 @@ struct ImageSourceMenu: View {
         var params: [String: JSONValue] = ["source": .string(source.rawValue), "page": .string(t.pageRef)]
         if let p = t.point { params["point"] = .array([.number(p.x), .number(p.y)]) }
         let app = self.app, session = self.session
-        close { ImageUI.run(app, [(command: "image.pick", params: .object(params))], session: session) }
+        close { ImageUI.run(app, [(command: "image.pick", params: .object(params))], session: session, target: t) }
     }
 
     private func insert(_ providers: [NSItemProvider]) {
@@ -228,7 +243,9 @@ struct ImageSourceMenu: View {
         Task { @MainActor in
             let images = await ImageProviders.load(providers)
             guard !images.isEmpty else { return }
-            close { ImageUI.run(app, ImageUI.insertCalls(images, target: t, app: app, session: session), session: session) }
+            close {
+                ImageUI.run(app, ImageUI.insertCalls(images, target: t, app: app, session: session), session: session, target: t)
+            }
         }
     }
 
@@ -237,7 +254,9 @@ struct ImageSourceMenu: View {
         let app = self.app, session = self.session, close = self.close, recent = self.recent
         Task { @MainActor in
             guard let data = await recent.data(for: asset) else { return }
-            close { ImageUI.run(app, ImageUI.insertCalls([data], target: t, app: app, session: session), session: session) }
+            close {
+                ImageUI.run(app, ImageUI.insertCalls([data], target: t, app: app, session: session), session: session, target: t)
+            }
         }
     }
 }
@@ -407,12 +426,12 @@ final class ImageMenuController: UIViewController {
 
     @objc private func closeMenu() { dismiss(animated: true) }
 
-    static func present(from host: CanvasHost, page: PageID, point: Point) {
+    static func present(from host: CanvasHost, tool: ImageTool, page: PageID, point: Point) {
         dismissCurrent()
         guard var presenter = ImagePresenter.owner(of: host.canvasView) else { return }
         while let next = presenter.presentedViewController, !next.isBeingDismissed { presenter = next }
         let app = host.app, session = host.session
-        let target = ImageMenuTarget(doc: host.documentID, page: page, point: point)
+        let target = ImageMenuTarget(doc: host.documentID, page: page, point: point, host: host, tool: tool)
         let box = WeakController()
         let menu = ImageSourceMenu(app: app, session: session, target: { target }, close: { then in
             guard let controller = box.controller, controller.presentingViewController != nil else { return then() }
@@ -448,10 +467,11 @@ final class WeakController {
 
 @MainActor
 enum ImagePresenter {
-    /// The topmost view controller of the invoking window (commands present pickers and sheets from it).
-    static func top(_ session: EditorSession?) throws -> UIViewController {
-        let root = (session?.editor as? UIViewController)?.view.window?.rootViewController
-            ?? NibApp.shared?.ui.activeNavigator?.rootViewController
+    /// The topmost view controller of the invoking window (commands present pickers and sheets from it): the window
+    /// of the session's editor, else the active window (`ctx.navigator`).
+    static func top(_ ctx: CommandContext) throws -> UIViewController {
+        let root = (ctx.activeSession?.editor as? UIViewController)?.view.window?.rootViewController
+            ?? ctx.navigator?.rootViewController
         guard var top = root else { throw NibError.unavailable("an open window to show the picker in") }
         while let next = top.presentedViewController, !next.isBeingDismissed { top = next }
         return top
