@@ -143,45 +143,110 @@ public struct NibSlider: View {
     }
 }
 
-/// Thickness: three preset dots, the value in HUD type, and a bead slider (millimetres).
+/// Thickness: three preset dots, the value in HUD type, and a bead slider (millimetres, or points for tools measured
+/// on screen such as the eraser).
 public struct NibStrokeWidthSlider: View {
+    /// v2: what the width measures. Pens are in millimetres; the eraser's size and other on-screen sizes in points.
+    public enum Unit: Sendable {
+        case millimetres, points
+    }
+
     @Binding var width: Double
     let range: ClosedRange<Double>
     let presets: [Double]
+    let title: String?
+    let unit: Unit
 
     public init(width: Binding<Double>, range: ClosedRange<Double> = 0.1...3.0, presets: [Double] = [0.3, 0.5, 0.8]) {
         self._width = width
         self.range = range
         self.presets = presets
+        self.title = nil
+        self.unit = .millimetres
+    }
+
+    /// v2: a titled slider in either unit ("Size" in points for the eraser, "Thickness" in millimetres for pens).
+    public init(width: Binding<Double>, range: ClosedRange<Double>, presets: [Double], title: String, unit: Unit) {
+        self._width = width
+        self.range = range
+        self.presets = presets
+        self.title = title
+        self.unit = unit
+    }
+
+    /// The value beside the title: "0.50 mm", "12 pt".
+    static func valueText(_ width: Double, unit: Unit) -> String {
+        switch unit {
+        case .millimetres: return String(format: String(localized: "%.2f mm", bundle: .module), width)
+        case .points: return String(format: String(localized: "%.0f pt", bundle: .module), width)
+        }
+    }
+
+    /// A preset dot's VoiceOver label: "0.5 millimetres", "12 points".
+    static func presetLabel(_ preset: Double, unit: Unit) -> String {
+        switch unit {
+        case .millimetres: return String(format: String(localized: "%.1f millimetres", bundle: .module), preset)
+        case .points: return String(format: String(localized: "%.0f points", bundle: .module), preset)
+        }
+    }
+
+    /// Two widths within this of each other are the same preset (a hundredth of a millimetre, half a point).
+    static func matches(_ width: Double, _ preset: Double, unit: Unit) -> Bool {
+        abs(width - preset) < (unit == .points ? 0.5 : 0.005)
     }
 
     public var body: some View {
-        NibInspectorSection(String(localized: "Thickness", bundle: .module),
-                            value: String(format: String(localized: "%.2f mm", bundle: .module), width)) {
+        let heading = title ?? String(localized: "Thickness", bundle: .module)
+        NibInspectorSection(heading, value: Self.valueText(width, unit: unit)) {
             VStack(alignment: .leading, spacing: NibSpacing.s) {
                 HStack(spacing: NibSpacing.s) {
                     ForEach(Array(presets.enumerated()), id: \.offset) { index, preset in
-                        Button {
+                        NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index),
+                                             isSelected: Self.matches(width, preset, unit: unit),
+                                             label: Self.presetLabel(preset, unit: unit)) {
                             withAnimation(NibMotion.tap.animation) { width = preset }
-                        } label: {
-                            Circle()
-                                .fill(NibColor.label)
-                                .frame(width: CGFloat(5 + index * 3 + (index > 1 ? 1 : 0)),
-                                       height: CGFloat(5 + index * 3 + (index > 1 ? 1 : 0)))
-                                .frame(width: 44, height: 40)
-                                .background(abs(width - preset) < 0.005 ? NibColor.fill3 : Color.clear,
-                                            in: RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous))
-                                .frame(minHeight: NibMetrics.hitTarget)
-                                .contentShape(Rectangle())
                         }
-                        .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)))
-                        .accessibilityLabel(String(format: String(localized: "%.1f millimetres", bundle: .module), preset))
-                        .accessibilityAddTraits(abs(width - preset) < 0.005 ? .isSelected : [])
                     }
                 }
-                NibSlider(value: $width, in: range, label: String(localized: "Thickness", bundle: .module), detents: presets)
+                NibSlider(value: $width, in: range, label: heading, detents: presets)
             }
         }
+    }
+}
+
+/// v2: one thickness preset (DESIGN.md §13.3): a `label` dot in a 44 × 40 cell (44 pt hit target), the selected one
+/// on `fill3` (radius 12). The dots of a row are `NibMetrics.widthPresetDot(index)`: 5, 8, 12 pt. Every place that
+/// offers a thickness (a tool's popover, the Pencil palette, the options bar) uses it, so a width looks the same.
+public struct NibWidthPresetButton: View {
+    let diameter: CGFloat
+    let isSelected: Bool
+    let label: String
+    let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
+
+    public init(diameter: CGFloat, isSelected: Bool, label: String, action: @escaping () -> Void) {
+        self.diameter = diameter
+        self.isSelected = isSelected
+        self.label = label
+        self.action = action
+    }
+
+    public var body: some View {
+        let shape = RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)
+        Button(action: action) {
+            Circle()
+                .fill(NibColor.label)
+                .frame(width: diameter, height: diameter)
+                .frame(width: NibMetrics.hitTarget, height: 40)
+                .background(isSelected ? NibColor.fill3 : Color.clear, in: shape)
+                .opacity(isEnabled ? 1 : NibOpacity.disabled)
+                .frame(minHeight: NibMetrics.hitTarget)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(NibPressStyle(shape: shape))
+        .nibTooltip(label)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 

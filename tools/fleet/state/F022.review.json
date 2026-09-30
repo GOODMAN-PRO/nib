@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPages/PageClipboard.swift:86-103,125-132,221-245; PageCommands.swift:186-193,408-417,828-831",
+      "problem": "Asset and PDF I/O runs synchronously on the main actor, and the page clipboard embeds whole source files. page.copy of one page from a PDF-backed notebook reads the entire PDF, base64-encodes it into JSON, and writes it to UIPasteboard.general, all on the main thread. PageClipboard.memory then keeps the payload, bytes included, for as long as the app runs. page.moveTo and page.paste read and SHA-256 store the whole PDF on main (AssetTransfer). page.add with source pdf opens and sizes up to 2000 PDF pages on main. AssetRefs.names turns every item of every page into a JSONValue tree just to find asset keys. On a 100 MB lecture PDF, one page copy freezes the UI for seconds and uses several hundred MB of memory. That breaks ARCHITECTURE.md §14 (PDF work and file I/O off the main actor, no command may block main for more than 16 ms) and the §20 memory budget.",
+      "fix": "(1) Copy and move only the PDF pages that are used: write the referenced pages into a new small PDF (CGContext PDF or PDFKit) and remap Background.pdfPage. (2) Do asset reads, page extraction, hashing (store.put) and JSON/base64 encoding in a detached Task, since AssetStore and PDFService are thread-safe by contract. Capture the names and URLs on main first, await the result, then call ctx.mutate and the pasteboard write on main. (3) Keep only refs (doc + asset name) in PageClipboard.memory for in-process pastes, and serialise bytes only for the system pasteboard. (4) Find asset keys only on item kinds that can hold assets (image, tape stroke style, rich-text attachment, custom display list) and on backgrounds. Do not walk every stroke's JSON. Add an XCTAssertLessThan(elapsed, budget*4) test that copies a page backed by a large generated PDF."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPages/PageClipboard.swift:228-230 (AssetTransfer.copy), used by page.moveTo at PageCommands.swift:416 and 438",
+      "problem": "page.moveTo is destructive (it tombstones the originals), but AssetTransfer.copy skips silently any asset it cannot read (`guard let data = try? store.data(...) else { continue }`). A transient read failure moves the page anyway: an iCloud-evicted or not-yet-downloaded file, a file-coordination error, or low disk. The target page points at a PDF or image the target package does not have, and the source page and its items are tombstoned with trashedAt nil. page.restore cannot bring that tombstone back, so once the per-session undo stack is gone the page background or image is lost.",
+      "fix": "Give AssetTransfer.copy a strict mode for moves. If the asset file exists in the source (store.url(...) plus FileManager.fileExists) but cannot be read, throw NibError(.unavailable, \"asset <name> could not be read; nothing was moved\", hint: \"try again when the file has downloaded\") before any mutation. Keep a reference that is already dangling only when the file is truly absent. Keep today's lenient behaviour for page.copy and page.paste, which do not delete anything. Add a test with a fake AssetStore whose data(...) throws for one existing asset, asserting that page.moveTo fails and both documents are unchanged."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPages/PageCommands.swift:309-310 (PagePaste.example), 622 (PageRestore), 655 (PagePurge)",
+      "problem": "The acceptance criterion says every command's Fixtures example passes the undo round trip. page.paste's only example relies on the page clipboard, which is empty during CommandConformance, so it throws unavailable and conformance skips it. The paste undo round trip is never run through the example. page.restore's example (FIXTUREPG002, which is not trashed) does nothing, so its round trip proves nothing. page.purge's example always fails with invalid_params, so it misleads the AI catalogue.",
+      "fix": "Add a second page.paste example with a small inline `payload` (format nib-pages/1, one page record written to match PageRecord's Codable shape with id FIXTUREPG002, order, size, a builtin.ruled background, items [], assets []) targeting doc:FIXTUREDOC04, so conformance runs paste plus undo. Document in the restore and purge summaries that the page must first be trashed, and add a test that runs trash then restore then undo, and trash then purge, on the fixture."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPages/PageCommands.swift:408-417 and 828-831",
+      "problem": "Dry runs (AI previews) of page.moveTo and page.paste still write asset files into the target package, because AssetTransfer runs before ctx.mutate and does not check ctx.dryRun. That breaks the Invocation.dryRun contract ('Nothing is persisted'). A failed transaction or an undo also leaves orphan copies behind, which can be a whole PDF each time.",
+      "fix": "Skip AssetTransfer.copy/install when ctx.dryRun is true. The preview keeps the original asset names, and the change summary is the same. Check keepsAPage and the id collisions before copying so that failures that can be predicted never copy bytes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPages/AddPageMenu.swift:58-63,152-159; GoToPageDialog.swift:196-206",
+      "problem": "Move to Another Notebook hands its pages to the sheet through a side effect in the menu item's params builder (MovePagesStash.pages = ...). Hosts may evaluate params builders eagerly when they build UIMenus, or for several locations at once (sidebarPage, sidebarSelection, documentMore > This Page). The last evaluation wins, so the sheet can move the open page instead of the selected pages. The sheet filters only by document, and the open page is in the same document, so this goes unnoticed.",
+      "fix": "Stop relying on evaluation order. At minimum, stash a (location, pages, timestamp) tuple and let the sheet ignore stale entries. The better fix is to file a contract request for panel.open {id, params?} surfaced in PanelContext, and then pass the page refs explicitly."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPages/PageCommands.swift:422-440, 669-674",
+      "problem": "The cross-document undo group is recorded in two separate per-document stacks. If the user undoes the move only in the target document, the page vanishes from the target while its original stays tombstoned (trashedAt nil) in the source. The page is then live in neither document, and page.restore cannot recover it. Outline entries and audio clips whose `page` is a moved or purged page are also left pointing at a tombstone.",
+      "fix": "File a contract request for a group-wide undo (undo every document that shares the top group), or have F015 do it. In the same transaction, move the source outline entries of moved pages to the target (or tombstone them) and clear the AudioClip.page links for moved and purged pages. Document the limitation in the page.moveTo summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPages/GoToPageDialog.swift:100-111",
+      "problem": "The Go to Page field is a hand-made TextField (fill4 background, NibRadius.field corners, literal minWidth 96 and maxWidth 160) instead of the catalogue's NibField. DESIGN.md §15.6 says not to hand-roll components, and the Slop checklist allows tokens only. The fixed 160 pt maximum width also clips the title2 text at AX sizes.",
+      "fix": "Use NibField(text: $input, prompt: String(localized: \"Page\")) and apply .keyboardType, .submitLabel, .onSubmit and .focused to it, with no fixed maximum width (or one from NibMetrics). If NibField cannot centre a large numeric entry, file a contract request instead of styling one locally."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPages/PageCommands.swift:798-805",
+      "problem": "PageTemplates.isCover reads the process-global NibApp.shared from inside a command. With several NibApp instances (two-device Harness tests), or before shared is set, it reads another app's template registry or falls back to guessing from the id ('.cover' substring). That guess also matches ids such as 'x.coverless'.",
+      "fix": "At register time, capture the registry (for example a weak static PageCommands.templates = app.content, set in FeatPagesFeature.register) and read it at run time. Narrow the fallback to hasPrefix(\"cover.\")."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPages/AddPageMenu.swift:124-177",
+      "problem": "F022 registers Copy, Duplicate, Rotate, Move and Trash entries in MenuLocation.sidebarPage and sidebarSelection. F023's spec also lists the thumbnail and selection actions (copy, rotate, export, mark as seen, move, trash). When F023 lands, the entries will likely appear twice.",
+      "fix": "Agree ownership with F023 now: either keep these registrations and state in F022's handoff that F023 must not register the same actions, or drop the two sidebar locations here and keep only documentMore > This Page."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPages/PageCommands.swift:908-941",
+      "problem": "Bulk inserts chain FractionalIndex.between one key after another, so key length grows about one character every six pages. A simulation of 2000 pages gives keys of up to 334 characters (about 335 KB of order keys) for a long PDF imported page by page, and livePages sorts on those strings every time it is called.",
+      "fix": "For count > 1, create evenly spaced keys of fixed width between lo and hi (split the gap into count+1 steps over ceil(log62(count+1)) extra digits). Add a test asserting that keys for count 2000 stay short (4 characters or fewer past the common prefix) and remain strictly increasing."
+    }
+  ]
+}
