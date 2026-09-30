@@ -10,6 +10,15 @@ public struct PresetSwatch: Codable, Hashable {
         self.color = color
         self.pattern = pattern
     }
+
+    /// contracts-v2 (pinned): a library tape pattern is referenced as "<TapePatternDescriptor.id>.png"; the tape
+    /// feature (F033) resolves it through `content.tapePatterns` and copies the tile into the document on use.
+    public static func tapePatternRef(id: String) -> AssetRef { AssetRef(id + ".png") }
+
+    /// The `TapePatternDescriptor.id` a pattern ref names (a bare id without ".png" is accepted too).
+    public static func tapePatternID(_ ref: AssetRef) -> String {
+        ref.name.lowercased().hasSuffix(".png") ? String(ref.name.dropLast(4)) : ref.name
+    }
 }
 
 /// Per-tool presets: up to 12 color slots and exactly 3 thickness slots (each with its own line pattern).
@@ -31,6 +40,19 @@ public struct ToolPresets: Codable, Equatable {
         self.patterns = patterns ?? widths.map { _ in StrokePattern.solid }
         self.selectedSwatch = selectedSwatch
         self.selectedWidth = selectedWidth
+    }
+
+    enum CodingKeys: String, CodingKey { case swatches, widths, patterns, selectedSwatch, selectedWidth }
+
+    /// contracts-v2: lenient, so a partial preset written with `settings.set` still decodes: `swatches` and `widths` are
+    /// required; `patterns` defaults to solid for every width, the selections to 0 and 1.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        swatches = try c.decode([PresetSwatch].self, forKey: .swatches)
+        widths = try c.decode([Double].self, forKey: .widths)
+        patterns = try c.decodeIfPresent([StrokePattern].self, forKey: .patterns) ?? widths.map { _ in StrokePattern.solid }
+        selectedSwatch = try c.decodeIfPresent(Int.self, forKey: .selectedSwatch) ?? 0
+        selectedWidth = try c.decodeIfPresent(Int.self, forKey: .selectedWidth) ?? 1
     }
 
     public var color: RGBA { swatches.indices.contains(selectedSwatch) ? swatches[selectedSwatch].color : .black }

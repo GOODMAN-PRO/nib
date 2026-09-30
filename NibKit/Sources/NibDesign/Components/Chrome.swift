@@ -250,20 +250,31 @@ struct NibToastPresenter: ViewModifier {
 
 /// A determinate 3 pt progress bar: export, import, study sessions (DESIGN.md §14.7, §14.11). Never a liquid loader.
 public struct NibProgressBar: View {
-    let value: Double
+    /// v2: `critical` fills in `destructive` (a timer's last seconds); everything else is `standard`.
+    public enum Style: Sendable {
+        case standard, critical
+    }
 
-    public init(value: Double) { self.value = value }
+    let value: Double
+    let style: Style
+
+    public init(value: Double) { self.init(value: value, style: .standard) }
+
+    public init(value: Double, style: Style) {
+        self.value = value
+        self.style = style
+    }
 
     public var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .leading) {
                 Capsule().fill(NibColor.fill1)
                 Capsule()
-                    .fill(NibColor.label)
+                    .fill(style == .critical ? NibColor.destructive : NibColor.label)
                     .frame(width: proxy.size.width * CGFloat(min(max(value, 0), 1)))
             }
         }
-        .frame(height: 3)
+        .frame(height: NibStroke.thick)
         .accessibilityElement()
         .accessibilityValue(Text(value, format: .percent.precision(.fractionLength(0))))
         .accessibilityAddTraits(.updatesFrequently)
