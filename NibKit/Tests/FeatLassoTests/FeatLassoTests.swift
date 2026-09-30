@@ -441,9 +441,10 @@ final class FeatLassoTests: XCTestCase {
             return Point(300 + 200 * cos(a), 420 + 200 * sin(a))
         }
         let everything = Set(LassoCategory.allCases)
+        // Best of several runs: a shared CI simulator stalls now and then, the fastest run is the code's cost.
         var best = Double.infinity
         var count = 0
-        for _ in 0..<3 {
+        for _ in 0..<8 {
             let start = Date()
             count = SelectionEngine.select(items, polygon: lasso, include: everything, layer: 0).count
             best = min(best, Date().timeIntervalSince(start))
