@@ -31,15 +31,31 @@ final class FeatWhiteboardTests: XCTestCase {
         try h.app.workspace.items(Fixtures.whiteboardID, page: Fixtures.boardID)
     }
 
-    /// Writes `items` onto a notebook page through a stand-in command (a real, undoable transaction).
-    private func seed(_ h: Harness, _ items: [Item], page: PageID) async throws {
-        h.app.commands.register(CommandDescriptor(id: "test.seed", title: "Seed", summary: "Stand-in.", effect: .edit)) { _, ctx in
-            try ctx.mutate { tx in
-                for item in items { try tx.put(item, doc: Fixtures.docID, page: page) }
-            }
-            return [:]
+    /// Fills the fixture board up to `count` items (straight into persistence, like a board synced in full).
+    private func fillBoard(_ h: Harness, to count: Int = NibLimits.boardItemLimit) throws {
+        let fixture = h.persistence.pageItems[Fixtures.whiteboardID]?[Fixtures.boardID] ?? []
+        let fillers = (0..<(count - fixture.count)).map { i -> Item in
+            var item = Item.makeShape(ShapeItem(shape: .rectangle,
+                                                frame: Frame(x: Double(i % 400) * 12, y: Double(i / 400) * 12, w: 8, h: 8)))
+            item.id = NibID(String(format: "FILL%06ld", i))
+            item.z = String(format: "W%06ld", i)
+            return item
         }
-        try await h.run("test.seed")
+        h.persistence.pageItems[Fixtures.whiteboardID, default: [:]][Fixtures.boardID] = fixture + fillers
+        XCTAssertEqual(try boardItems(h).count, count)
+    }
+
+    /// A stand-in item-creating command (the real ones are other features'): puts one shape on `page`.
+    private func registerShapeCreate(_ h: Harness) {
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.shapeCreate, title: "Shape", summary: "Stand-in.",
+                                                  effect: .edit)) { params, ctx in
+            let (doc, page) = try ctx.pageOrSession(params["page"]?.stringValue)
+            let item = try ctx.mutate { tx in
+                try tx.put(Item.makeShape(ShapeItem(shape: .rectangle, frame: Frame(x: 0, y: 0, w: 10, h: 10))),
+                           doc: doc, page: page)
+            }
+            return ["ref": .string(NodeRef.item(doc, page, item.id).description)]
+        }
     }
 
     private func expectError(_ code: NibError.Code, _ body: () async throws -> Void, file: StaticString = #filePath,
@@ -172,7 +188,7 @@ final class FeatWhiteboardTests: XCTestCase {
         var link = Item.makeConnector(ConnectorItem(from: ConnectorEnd(point: Point(150, 80), item: twin.id, side: 1, t: 0.5),
                                                     to: ConnectorEnd(point: Point(300, 100), item: note.id, side: 3, t: 0.5)))
         link.id = "P2LINK000001"
-        try await seed(h, [twin, note, link], page: Fixtures.page2)
+        try await h.insert([twin, note, link], page: Fixtures.page2)
         let before = try h.snapshot(Fixtures.docID)
 
         _ = try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"])
@@ -192,6 +208,25 @@ final class FeatWhiteboardTests: XCTestCase {
 
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(try h.snapshot(Fixtures.docID), before)
+    }
+
+    /// The AI converting a notebook moves the user's items onto the board: they stay the user's (the conversion's own
+    /// page cards are the AI's).
+    func testConvertByTheAIKeepsWhoWroteEachItem() async throws {
+        let h = harness()
+        h.app.services.renderer = FakeRenderer()
+        var note = Item.makeSticky(StickyItem(frame: Frame(x: 40, y: 40, w: 100, h: 100), text: RichText(plain: "Mine")))
+        note.id = "MINESTICKY01"
+        try await h.insert([note], page: Fixtures.page2)
+
+        _ = try await h.run("doc.convertToWhiteboard", ["doc": "doc:FIXTUREDOC01"], as: .ai("t"))
+
+        let board = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.first)
+        let items = try h.app.workspace.items(Fixtures.docID, page: board.id)
+        XCTAssertEqual(items.first { $0.id == note.id }?.createdBy, "user")
+        XCTAssertEqual(items.filter(\.locked).map(\.createdBy), ["ai:t", "ai:t", "ai:t"])
+        // Balanced z keys stay short, and the board keeps each page's stacking order.
+        XCTAssertLessThanOrEqual(items.map(\.z.count).max() ?? 0, 4)
     }
 
     func testConvertRefusesWhatIsNotANotebook() async {
@@ -276,6 +311,13 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(params["edges"]?[0]?["to"]?.stringValue, second)
         XCTAssertEqual(params["origin"]?.arrayValue?.count, 2)
         XCTAssertEqual(out["refs"]?.arrayValue?.count, 2)
+        // The stand-in ignores `origin`: the diagram is then moved onto the exact centre, in the same undo step.
+        let created = try boardItems(h).filter { $0.id != Fixtures.boardShapeID }
+        let bounds = try XCTUnwrap(TemplatePlacement.union(created))
+        XCTAssertEqual(bounds.midX, 500, accuracy: 1e-6)
+        XCTAssertEqual(bounds.midY, 500, accuracy: 1e-6)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.whiteboardID))
+        XCTAssertEqual(try boardItems(h).map(\.id), [Fixtures.boardShapeID], "one undo removes the re-centred diagram")
     }
 
     func testBoardAddChecksItsTemplateBeforeAddingTheBoard() async throws {
@@ -331,16 +373,7 @@ final class FeatWhiteboardTests: XCTestCase {
     /// of tools that add items (the eraser and lasso still work).
     func testAFullBoardRefusesTemplatesAndBlocksWriting() async throws {
         let h = harness()
-        let fixture = h.persistence.pageItems[Fixtures.whiteboardID]?[Fixtures.boardID] ?? []
-        let fillers = (0..<(NibLimits.boardItemLimit - fixture.count)).map { i -> Item in
-            var item = Item.makeShape(ShapeItem(shape: .rectangle,
-                                                frame: Frame(x: Double(i % 400) * 12, y: Double(i / 400) * 12, w: 8, h: 8)))
-            item.id = NibID(String(format: "FILL%06ld", i))
-            item.z = String(format: "W%06ld", i)
-            return item
-        }
-        h.persistence.pageItems[Fixtures.whiteboardID, default: [:]][Fixtures.boardID] = fixture + fillers
-        XCTAssertEqual(try boardItems(h).count, NibLimits.boardItemLimit)
+        try fillBoard(h)
 
         await expectError(.unsupported) {
             _ = try await h.run("board.insertTemplate", ["page": .string(boardRef), "template": "whiteboard.swot"])
@@ -356,11 +389,76 @@ final class FeatWhiteboardTests: XCTestCase {
         let model = try XCTUnwrap(minimap.model)
         XCTAssertEqual(model.limit, .full)
         h.session.tool = "pen"
-        XCTAssertTrue(minimap.hitTest(CGPoint(x: 8, y: 8), host: host), "the pen gets no ink on a full board")
+        XCTAssertTrue(minimap.hitTest(CGPoint(x: 8, y: 8), isPencil: true, host: host), "the pen gets no ink on a full board")
+        XCTAssertTrue(minimap.hitTest(CGPoint(x: 8, y: 8), host: host), "a canvas that does not say is treated as the Pencil")
+        XCTAssertFalse(minimap.hitTest(CGPoint(x: 8, y: 8), isPencil: false, host: host), "fingers still pan and zoom")
         minimap.touchesBegan(CanvasSample(page: Fixtures.boardID, location: Point(8, 8)), host: host)
         XCTAssertEqual(model.refusals, 1)
+        minimap.touchesBegan(CanvasSample(page: Fixtures.boardID, location: Point(8, 8), isPencil: false), host: host)
+        XCTAssertEqual(model.refusals, 1, "a panning finger is not a refused write")
+        h.app.settings.set(NibSettings.stylusMode, .anyInput)
+        XCTAssertTrue(minimap.hitTest(CGPoint(x: 8, y: 8), isPencil: false, host: host), "a drawing finger gets no ink either")
         h.session.tool = "eraser"
-        XCTAssertFalse(minimap.hitTest(CGPoint(x: 8, y: 8), host: host), "erasing is a remedy")
+        XCTAssertFalse(minimap.hitTest(CGPoint(x: 8, y: 8), isPencil: true, host: host), "erasing is a remedy")
+    }
+
+    /// The limit holds for every caller of other features' item-creating commands (the guard hook), on boards only.
+    func testTheBoardLimitVetoesItemCreatingCommandsFromEveryPrincipal() async throws {
+        let h = harness()
+        registerShapeCreate(h)
+        try fillBoard(h, to: NibLimits.boardItemLimit - 1)
+
+        _ = try await h.run(CommandIDs.shapeCreate, ["page": .string(boardRef)], as: .ai("t"))
+        XCTAssertEqual(try boardItems(h).count, NibLimits.boardItemLimit, "the last free place is taken")
+        for principal in [Principal.user, .ai("t"), .plugin("dev.test"), .bridge("b")] {
+            await expectError(.unsupported) { _ = try await h.run(CommandIDs.shapeCreate, ["page": .string(boardRef)], as: principal) }
+        }
+        XCTAssertEqual(try boardItems(h).count, NibLimits.boardItemLimit, "nothing was added")
+        // Session defaults: a call without `page` targets the window's page.
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        await expectError(.unsupported) { _ = try await h.run(CommandIDs.shapeCreate, [:]) }
+        // Notebook pages are not boards.
+        _ = try await h.run(CommandIDs.shapeCreate, ["page": "page:FIXTUREDOC01/FIXTUREPG001"])
+    }
+
+    func testTheGuardCountsWhatACallAdds() async throws {
+        let h = harness()
+        try fillBoard(h, to: 10)
+        let item = JSONValue.string("item:FIXTUREDOC04/FIXTUREBRD01/FILL000001")
+        let board = JSONValue.string(boardRef)
+        var allowed = await guardAllows(h, CommandIDs.inkAddStrokes, ["page": board, "strokes": [[:], [:]]], limit: 12)
+        XCTAssertTrue(allowed)
+        allowed = await guardAllows(h, CommandIDs.inkAddStrokes, ["page": board, "strokes": [[:], [:], [:]]], limit: 12)
+        XCTAssertFalse(allowed)
+        allowed = await guardAllows(h, CommandIDs.itemDuplicate, ["refs": [item, item, item]], limit: 12)
+        XCTAssertFalse(allowed, "duplicates land on the board of their refs")
+        allowed = await guardAllows(h, CommandIDs.itemMoveToPage, ["refs": [item], "page": board], limit: 10)
+        XCTAssertTrue(allowed, "moving within the board adds nothing")
+        allowed = await guardAllows(h, CommandIDs.itemMoveToPage, ["refs": [item], "page": board, "copy": true], limit: 10)
+        XCTAssertFalse(allowed)
+        allowed = await guardAllows(h, CommandIDs.diagramCreate, ["page": board, "nodes": [[:], [:]], "edges": [[:]]], limit: 12)
+        XCTAssertFalse(allowed)
+        allowed = await guardAllows(h, CommandIDs.shapeCreate, ["page": "page:FIXTUREDOC01/FIXTUREPG001"], limit: 0)
+        XCTAssertTrue(allowed, "notebook pages have no item limit")
+        XCTAssertEqual(Set(BoardLimitGuard.commands).count, BoardLimitGuard.commands.count)
+        XCTAssertFalse(BoardLimitGuard.commands.contains(CommandIDs.boardInsertTemplate), "F044's own command counts exactly")
+    }
+
+    /// Runs `BoardLimitGuard.check` for `command` inside a probe command (a `CommandContext` comes only from the bus).
+    private func guardAllows(_ h: Harness, _ command: String, _ params: JSONValue, limit: Int) async -> Bool {
+        let probe = "test.boardLimitProbe"
+        h.app.commands.register(CommandDescriptor(id: probe, title: "Probe", summary: "Stand-in.", effect: .read)) { _, ctx in
+            try BoardLimitGuard.check(command, params, ctx, limit: limit)
+            return [:]
+        }
+        defer { h.app.commands.unregister(id: probe) }
+        do {
+            try await h.run(probe)
+            return true
+        } catch {
+            return false
+        }
     }
 
     func testBoardLimitWarnsAtEightyPercentAndBlocksAtTheLimit() {
@@ -527,20 +625,40 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(params["id"], "NEWBOARD0001")
         XCTAssertEqual(params["folder"], "folder:FOLDER1")
         XCTAssertEqual(params["template"]?["id"], "builtin.whiteboardGrid")
+        XCTAssertEqual(params["template"]?["params"]?[TemplateParamNames.paper], JSONValue.string(RGBA(NibPaper.board).hex),
+                       "the background is TemplateRef JSON")
         XCTAssertNil(draft.createParams(id: "X", folder: nil, template: nil)["template"])
 
         draft.pattern = .lined
-        XCTAssertEqual(draft.template(in: templates)?.id, "builtin.ruled", "lined falls back to ruled paper")
+        XCTAssertEqual(draft.template(in: templates)?.id, TemplateIDs.ruled, "lined falls back to ruled paper")
         draft.pattern = .blank
         XCTAssertEqual(draft.template(in: templates)?.params, [:], "only declared colour parameters are sent")
         draft.pattern = .dots
         XCTAssertNil(draft.template(in: templates))
-
-        XCTAssertTrue(WhiteboardDraft.needsBackground(Background.ofTemplate(Whiteboard.dotsTemplate), template: template))
-        XCTAssertFalse(WhiteboardDraft.needsBackground(Background(kind: .template, template: template), template: template))
-        let set = WhiteboardDraft.setTemplateParams(doc: "NEWBOARD0001", boards: ["B1", "B2"], template: template)
-        XCTAssertEqual(set["pages"], ["page:NEWBOARD0001/B1", "page:NEWBOARD0001/B2"], "page refs, not the doc ref")
         XCTAssertEqual(WhiteboardDraft(language: "en-GB").resolvedTitle, "Untitled Whiteboard")
+        XCTAssertEqual(BoardPaper.board.title, "Board", "the palette names the papers")
+    }
+
+    /// New Whiteboard is one sheet: the folder it creates in travels as a `panel.open` param.
+    func testNewWhiteboardOpensOneSheetWithTheFolderAsAParam() throws {
+        let h = harness()
+        let menu = try XCTUnwrap(h.app.ui.menus.get("whiteboard.new"))
+        XCTAssertEqual(menu.shortcut, KeyShortcut("w", [.command, .shift]))
+        let inFolder = menu.params(MenuContext(app: h.app, folder: "FOLDER1"))
+        XCTAssertEqual(inFolder["id"]?.stringValue, Whiteboard.createPanel)
+        XCTAssertEqual(inFolder["folder"]?.stringValue, "folder:FOLDER1")
+        XCTAssertNil(menu.params(MenuContext(app: h.app))["folder"], "the library root")
+        XCTAssertEqual(WhiteboardCreateSheet.folder(in: inFolder), "FOLDER1")
+        XCTAssertEqual(WhiteboardCreateSheet.folder(in: ["params": ["folder": "FOLDER2"]]), "FOLDER2")
+        XCTAssertNil(WhiteboardCreateSheet.folder(in: ["folder": "doc:FIXTUREDOC01"]))
+        XCTAssertNil(WhiteboardCreateSheet.folder(in: [:]))
+        XCTAssertNotNil(h.app.ui.panels.get(Whiteboard.createPanel))
+        XCTAssertEqual(h.app.ui.panels.all.filter { $0.id.hasPrefix(Whiteboard.createPanel) }.count, 1)
+
+        let templates = try XCTUnwrap(h.app.ui.toolbar.get(Whiteboard.templatesPanel))
+        XCTAssertEqual(templates.isOn?(h.session), false)
+        h.session.openPanels.insert(Whiteboard.templatesPanel)
+        XCTAssertEqual(templates.isOn?(h.session), true)
     }
 
     func testBoardCountsArePluralised() {
@@ -550,6 +668,60 @@ final class FeatWhiteboardTests: XCTestCase {
     }
 
     // MARK: Minimap attachment
+
+    /// The minimap recedes while the Pencil is down in its window and comes back after it lifts (DESIGN §10.8).
+    func testMinimapRecedesWhileInking() async throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let host = FakeCanvasHost(app: h.app, session: h.session, doc: Fixtures.whiteboardID, pages: [Fixtures.boardID])
+        let minimap = MinimapAttachment()
+        minimap.attach(to: host)
+        defer { minimap.detach(from: host) }
+        let model = try XCTUnwrap(minimap.model)
+        XCTAssertFalse(model.receding)
+        h.session.inking.begin()
+        XCTAssertTrue(model.receding)
+        h.session.inking.update(strokeBounds: CGRect(x: 0, y: 0, width: 10, height: 10))
+        h.session.inking.end()
+        XCTAssertTrue(model.receding, "it waits before coming back")
+        try await Task.sleep(nanoseconds: UInt64((MinimapModel.returnDelay + 0.3) * 1_000_000_000))
+        XCTAssertFalse(model.receding)
+        // A new stroke before the return keeps it receded.
+        h.session.inking.begin()
+        h.session.inking.end()
+        h.session.inking.begin()
+        try await Task.sleep(nanoseconds: UInt64((MinimapModel.returnDelay + 0.3) * 1_000_000_000))
+        XCTAssertTrue(model.receding)
+        h.session.inking.end()
+    }
+
+    /// Panning from the map is `view.scrollBy` in page points, measured from the middle of the window.
+    func testMinimapPansWithScrollByInPagePoints() async throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        var calls: [JSONValue] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.viewScrollBy, title: "Scroll", summary: "Stand-in.",
+                                                  effect: .session)) { params, _ in
+            calls.append(params)
+            return [:]
+        }
+        let host = FakeCanvasHost(app: h.app, session: h.session, doc: Fixtures.whiteboardID, pages: [Fixtures.boardID])
+        host.zoomScale = 2
+        let minimap = MinimapAttachment()
+        minimap.attach(to: host)
+        defer { minimap.detach(from: host) }
+        let model = try XCTUnwrap(minimap.model)
+        let middle = try XCTUnwrap(MinimapPan.windowCentre(host, board: Fixtures.boardID))
+        XCTAssertEqual(middle.x, Double(host.canvasView.bounds.midX) / 2, accuracy: 1e-6)
+
+        model.centre(on: Point(middle.x + 300, middle.y - 40))
+        for _ in 0..<50 where calls.isEmpty { try await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?["dx"]?.doubleValue ?? 0, 300, accuracy: 1e-6, "page points, not view points")
+        XCTAssertEqual(calls.first?["dy"]?.doubleValue ?? 0, -40, accuracy: 1e-6)
+    }
 
     func testMinimapAttachesToAWhiteboardCanvasAndClaimsOnlyItsParts() throws {
         let h = harness()

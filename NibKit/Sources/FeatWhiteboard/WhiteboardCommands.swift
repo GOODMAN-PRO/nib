@@ -9,13 +9,8 @@ import NibContracts
 /// Names shared by the whiteboard files.
 enum Whiteboard {
     static let log = Logger(subsystem: "app.nib", category: "whiteboard")
-    /// `app.content`, handed to the commands through `NibServices` (a `CommandContext` has no `NibApp`), so each app
-    /// (two-device tests) resolves its own template registries.
-    static let contentKey = "whiteboard.content"
     /// Minimap map shown on this device (the zoom controls always are).
     static let minimapVisible = SettingKey("whiteboard.minimap", default: true)
-    /// Background of new and converted boards (F005's zoom-adaptive dot grid).
-    static let dotsTemplate = "builtin.whiteboardDots"
     /// Gap between notebook pages laid out on a board, and between a template and a board's existing content.
     static let gap = 48.0
     /// `CustomItem.type` of the page cards a converted notebook leaves under each page's content.
@@ -26,6 +21,7 @@ enum Whiteboard {
     static let createPanel = "whiteboard.create"
     /// The New Whiteboard key command (⇧⌘W in the library).
     static let newWhiteboardKey = "whiteboard.new"
+    static let newWhiteboardShortcut = KeyShortcut("w", [.command, .shift])
 }
 
 extension RGBA {
@@ -68,15 +64,107 @@ enum BoardLimit {
     }
 }
 
+/// The board item limit for every caller (D-030): a guard hook on the commands that add items to a page. It counts the
+/// target board's items and vetoes a call that would take it past `NibLimits.boardItemLimit`, whoever makes it (the
+/// user's tools, AI, plugins, the bridge). Pages of notebooks and fixed-size pages are never counted. F044's own
+/// commands check the exact number of items they add before writing anything (board.insertTemplate is not hooked).
+@MainActor
+enum BoardLimitGuard {
+    static let id = "whiteboard.boardLimit"
+
+    /// Commands that add items to a page (ARCHITECTURE.md §6.5).
+    static let commands: [String] = [
+        CommandIDs.inkAddStrokes, CommandIDs.inkWriteText, CommandIDs.itemCreate, CommandIDs.itemDuplicate,
+        CommandIDs.itemMoveToPage, CommandIDs.nodeInsert, CommandIDs.clipboardPaste, CommandIDs.shapeCreate,
+        CommandIDs.textCreateBox, CommandIDs.textStartPageText, CommandIDs.stickyCreate, CommandIDs.connectorCreate,
+        CommandIDs.diagramCreate, CommandIDs.diagramAddConnected, CommandIDs.imageInsert, CommandIDs.imagePick,
+        CommandIDs.elementInsert, CommandIDs.commentAdd, CommandIDs.answerZoneCreate, CommandIDs.mathGraphCreate,
+        CommandIDs.mathAssist, CommandIDs.mathConvert, CommandIDs.handwritingToText, CommandIDs.transcriptInsert
+    ]
+
+    static func hook(owner: String) -> CommandHookDescriptor {
+        .guarding(id: id, owner: owner, commands: commands) { command, params, ctx in
+            try check(command, params, ctx)
+            return nil
+        }
+    }
+
+    /// Throws `unsupported` (with the remedies) when `command` would take a board past the limit.
+    static func check(_ command: String, _ params: JSONValue, _ ctx: CommandContext,
+                      limit: Int = NibLimits.boardItemLimit) throws {
+        guard case let (doc, page)? = target(command, params, ctx),
+              let content = try? ctx.workspace.content(doc), content.meta.kind == .whiteboard,
+              let board = content.page(page), !board.deleted, board.size == nil,
+              let items = try? ctx.workspace.items(doc, page: page) else { return }
+        let adding = added(command, params, ctx, page: page)
+        guard adding > 0 else { return }
+        try BoardLimit.check(adding: adding, to: items.count, limit: limit)
+    }
+
+    /// The page the call adds items to: its `page`, else the page of its first item ref (`refs`, `ref`, a page
+    /// `parent`), else the invoking window's page (session defaults, §6.1).
+    static func target(_ command: String, _ params: JSONValue, _ ctx: CommandContext) -> (DocumentID, PageID)? {
+        if let raw = params["page"]?.stringValue, !raw.isEmpty {
+            guard case let .page(doc, page)? = NodeRef(raw) else { return nil }
+            return (doc, page)
+        }
+        let refs = (params["refs"]?.arrayValue ?? []).compactMap(\.stringValue)
+            + [params["ref"]?.stringValue, params["parent"]?.stringValue].compactMap { $0 }
+        for raw in refs {
+            switch NodeRef(raw) {
+            case let .item(doc, page, _)?: return (doc, page)
+            case let .page(doc, page)?: return (doc, page)
+            default: continue
+            }
+        }
+        if command == CommandIDs.itemDuplicate, let first = ctx.refsOrSelection(nil).first,
+           case let .item(doc, page, _)? = NodeRef(first) {
+            return (doc, page)
+        }
+        guard let current = try? ctx.pageOrSession(nil) else { return nil }
+        return (current.doc, current.page)
+    }
+
+    /// How many items the call adds at least: its strokes, refs, nodes and edges, or fragment items; one otherwise.
+    /// Moving items that are already on the board adds none.
+    static func added(_ command: String, _ params: JSONValue, _ ctx: CommandContext, page: PageID) -> Int {
+        func count(_ key: String) -> Int? { params[key]?.arrayValue?.count }
+        switch command {
+        case CommandIDs.inkAddStrokes:
+            return count("strokes") ?? 1
+        case CommandIDs.itemDuplicate:
+            return max(count("refs") ?? ctx.refsOrSelection(nil).count, 1)
+        case CommandIDs.itemMoveToPage:
+            let refs = (params["refs"]?.arrayValue ?? []).compactMap(\.stringValue)
+            if params["copy"]?.boolValue == true { return max(refs.count, 1) }
+            return refs.filter { ref in
+                if case let .item(_, from, _)? = NodeRef(ref) { return from != page }
+                return true
+            }.count
+        case CommandIDs.diagramCreate:
+            return max((count("nodes") ?? 0) + (count("edges") ?? 0), 1)
+        case CommandIDs.diagramAddConnected:
+            return 2
+        case CommandIDs.clipboardPaste:
+            return max(params["fragment"]?["items"]?.arrayValue?.count ?? 1, 1)
+        default:
+            return 1
+        }
+    }
+}
+
 // MARK: - Placing a template fragment
 
-/// A clipboard-format fragment ({format: "nib-fragment/1", items, assets: {name: base64}, bounds}) as a board template
-/// carries it.
+/// A board template's `nib-fragment/1` (the shared `NibFragment` format of the clipboard, elements, content packs and
+/// plugins), checked for what an untrusted template may carry.
 struct BoardFragment {
-    var items: [Item]
-    var assets: [String: Data]
+    /// The live items only, with their assets.
+    var fragment: NibFragment
     /// Union of the items' bounds (the JSON `bounds` may include margins; the placement centres the content itself).
     var bounds: Rect
+
+    var items: [Item] { fragment.items }
+    var assets: [String: Data] { fragment.assets }
 
     /// Plugin and content-pack fragments are untrusted: each asset and all of them together are capped, and only
     /// image and PDF files are stored.
@@ -89,23 +177,16 @@ struct BoardFragment {
         guard let bounds = TemplatePlacement.union(live) else {
             throw NibError(.invalidParams, "the board template has no items", path: "$.template")
         }
-        self.items = live
-        self.assets = assets
+        fragment = NibFragment(items: live, assets: assets, bounds: bounds)
         self.bounds = bounds
     }
 
+    /// Checks the assets before anything is decoded (names, file types, sizes), then reads the fragment with
+    /// `NibFragment`'s decoder (format version, items, base64 assets).
     init(json: JSONValue) throws {
-        guard let list = json["items"] else {
+        guard json["items"] != nil else {
             throw NibError(.invalidParams, "the board template fragment has no items", path: "$.template")
         }
-        let items: [Item]
-        do {
-            items = try list.decode([Item].self)
-        } catch {
-            throw NibError(.invalidParams, "the board template fragment has malformed items: \(error.localizedDescription)",
-                           path: "$.template")
-        }
-        var assets: [String: Data] = [:]
         var total = 0
         for (name, value) in json["assets"]?.objectValue ?? [:] {
             let ext = Self.assetExtension(name)
@@ -118,19 +199,35 @@ struct BoardFragment {
                 throw NibError(.invalidParams, "asset '\(name)' of the board template is not base64", path: "$.template")
             }
             // Refuse before decoding: base64 is 4 characters per 3 bytes.
-            guard text.utf8.count / 4 * 3 <= Self.maxAssetBytes + 3, let data = Data(base64Encoded: text),
-                  data.count <= Self.maxAssetBytes else {
-                throw NibError(.invalidParams, "asset '\(name)' of the board template is not base64 or is larger than "
-                                   + "\(Self.maxAssetBytes / 1_048_576) MB", path: "$.template")
+            let bytes = text.utf8.count / 4 * 3
+            guard bytes <= Self.maxAssetBytes + 3 else { throw Self.tooLarge(name) }
+            total += bytes
+            guard total <= Self.maxTotalAssetBytes + 3 * (json["assets"]?.objectValue?.count ?? 0) else {
+                throw Self.tooLargeTogether
             }
-            total += data.count
-            guard total <= Self.maxTotalAssetBytes else {
-                throw NibError(.invalidParams, "the board template's assets are larger than "
-                                   + "\(Self.maxTotalAssetBytes / 1_048_576) MB together", path: "$.template")
-            }
-            assets[name] = data
         }
-        try self.init(items: items, assets: assets)
+        let decoded: NibFragment
+        do {
+            decoded = try json.decode(NibFragment.self)
+        } catch {
+            throw NibError(.invalidParams, "the board template fragment is malformed: \(error.localizedDescription)",
+                           path: "$.template", hint: "a fragment is nib-fragment/1 JSON: {items, assets?, bounds?}")
+        }
+        for (name, data) in decoded.assets where data.count > Self.maxAssetBytes { throw Self.tooLarge(name) }
+        guard decoded.assets.values.reduce(0, { $0 + $1.count }) <= Self.maxTotalAssetBytes else {
+            throw Self.tooLargeTogether
+        }
+        try self.init(items: decoded.items, assets: decoded.assets)
+    }
+
+    private static func tooLarge(_ name: String) -> NibError {
+        NibError(.invalidParams, "asset '\(name)' of the board template is larger than \(maxAssetBytes / 1_048_576) MB",
+                 path: "$.template")
+    }
+
+    private static var tooLargeTogether: NibError {
+        NibError(.invalidParams, "the board template's assets are larger than \(maxTotalAssetBytes / 1_048_576) MB together",
+                 path: "$.template")
     }
 
     /// The lower-cased file extension of an asset name ("logo.PNG" → "png").
@@ -146,45 +243,21 @@ enum TemplatePlacement {
         return out
     }
 
-    /// The fragment's items ready to put: caller ids first (then fresh ones) with every internal reference remapped
-    /// (attachments, connector anchors, image assets), moved so their bounds centre on `centre`, on `layer`, stacked
-    /// above `zAbove` in fragment order. References to items outside the fragment are dropped so the page stays valid.
+    /// The fragment's items ready to put (`NibFragment.instantiated`): caller ids first (then fresh ones) with every
+    /// internal reference remapped (attachments, connector anchors, assets), moved so their bounds centre on `centre`,
+    /// on `layer`, stacked above `zAbove` in the fragment's own order. References to items outside the fragment are
+    /// dropped so the page stays valid.
     static func place(_ fragment: BoardFragment, centre: Point, ids: [NibID], layer: Int, zAbove: String?,
                       assets: [String: AssetRef] = [:]) -> [Item] {
-        var map: [ElementID: ElementID] = [:]
-        for (i, item) in fragment.items.enumerated() { map[item.id] = i < ids.count ? ids[i] : NibID.make() }
-        let delta = centre - fragment.bounds.center
-        let move = Affine.translation(delta.x, delta.y)
-        let zs = FractionalIndex.sequence(after: zAbove, count: fragment.items.count)
-        func end(_ e: ConnectorEnd) -> ConnectorEnd {
-            var out = e
-            out.item = e.item.flatMap { map[$0] }
-            if out.item == nil {
-                out.side = nil
-                out.t = nil
-            }
-            return out
-        }
-        return fragment.items.enumerated().map { i, source in
-            var it = source.transformed(by: move)
-            it.id = map[source.id] ?? NibID.make()
-            it.rev = .zero
-            it.deleted = false
-            it.createdBy = nil
-            it.z = zs[i]
-            it.layer = layer
-            it.attachedTo = source.attachedTo.flatMap { map[$0] }
-            if var c = it.connector {
-                c.from = end(c.from)
-                c.to = end(c.to)
-                it.connector = c
-            }
-            if var image = it.image, let ref = assets[image.asset.name] {
-                image.asset = ref
-                it.image = image
-            }
-            return it
-        }
+        fragment.fragment.instantiated(translate: centre - fragment.bounds.center, ids: ids, zAfter: zAbove,
+                                       layer: layer, assets: assets)
+    }
+
+    /// The move that puts the bounds of `items` on `centre`; nil when they are already there (within half a point).
+    static func recentring(_ items: [Item], on centre: Point) -> Point? {
+        guard let bounds = union(items) else { return nil }
+        let delta = centre - bounds.center
+        return abs(delta.x) > 0.5 || abs(delta.y) > 0.5 ? delta : nil
     }
 
     /// Where a template goes when nobody is looking at the board: the origin of an empty board, else to the right of
@@ -194,10 +267,9 @@ enum TemplatePlacement {
         return Point(c.maxX + Whiteboard.gap + templateSize.width / 2, c.midY)
     }
 
-    /// A rough footprint of a `diagram.create` spec, so its origin puts the laid-out diagram near the centre.
-    /// ponytail: diagram.create owns the layout and reports no geometry up front; if its footprint differs, the
-    /// diagram lands off-centre by that difference (re-centring after it ran would write every item twice in one undo
-    /// group, which undo cannot revert). A dry-run geometry answer from diagram.create is the upgrade path.
+    /// A rough footprint of a `diagram.create` spec, so its `origin` (the top-left of the diagram's bounds) puts the
+    /// laid-out diagram near the centre first; on a board the diagram is then moved onto the exact centre in the same
+    /// undo step (see `BoardInsertTemplate.insertDiagram`).
     static func estimatedSize(nodes: Int, layout: String) -> (width: Double, height: Double) {
         let n = Double(max(nodes, 1))
         let node = (w: 180.0, h: 72.0, gap: 48.0)
@@ -274,12 +346,8 @@ enum NotebookLayout {
 
 @MainActor
 enum WhiteboardSupport {
-    static func registries(_ ctx: CommandContext) -> ContentRegistries? {
-        ctx.services.get(Whiteboard.contentKey, as: ContentRegistries.self)
-    }
-
     static func template(_ id: String, _ ctx: CommandContext) throws -> BoardTemplateDescriptor {
-        guard let registry = registries(ctx)?.boardTemplates else { throw NibError.unavailable("board templates") }
+        let registry = ctx.content.boardTemplates
         guard let d = registry.get(id) else {
             let known = registry.all.map(\.id).prefix(30).joined(separator: ", ")
             throw NibError(.notFound, "unknown board template '\(id)'", path: "$.template",
@@ -331,7 +399,7 @@ enum WhiteboardSupport {
     /// Background of a new board: the last board's (pattern and colour carry over), else the document default.
     static func newBoardBackground(_ content: DocumentContent) -> Background {
         if let last = content.livePages.last { return last.background }
-        return .ofTemplate(content.meta.defaultTemplate?.id ?? Whiteboard.dotsTemplate,
+        return .ofTemplate(content.meta.defaultTemplate?.id ?? TemplateIDs.whiteboardDots,
                            params: content.meta.defaultTemplate?.params ?? [:])
     }
 }
@@ -371,14 +439,7 @@ struct BoardAdd: NibCommand {
         examples: examples, effect: .edit)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let doc: DocumentID
-        if let raw = p.doc {
-            doc = NodeRef.documentID(from: raw)
-        } else if let active = ctx.activeSession?.document {
-            doc = active
-        } else {
-            throw NibError(.invalidParams, "missing required field 'doc'", path: "$.doc", hint: "pass doc:D of a whiteboard")
-        }
+        let doc = try ctx.documentOrSession(p.doc)
         if let id = p.id, !NibID.isValid(id) { throw NibError.invalid("id must be 1–64 of [A-Za-z0-9_-]", path: "$.id") }
         let title = p.title?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let template = p.template {
@@ -509,7 +570,7 @@ struct BoardInsertTemplate: NibCommand {
         let insertion = try Self.plan(template, ctx: ctx)
         if isBoard { try BoardLimit.check(adding: insertion.itemCount, to: existing.count) }
         guard case let .fragment(fragment) = insertion else {
-            return try await insertDiagram(template, page: p.page, doc: doc, pageID: pageID, ids: ids,
+            return try await insertDiagram(template, page: p.page, doc: doc, pageID: pageID, isBoard: isBoard, ids: ids,
                                            existing: existing, centre: centre, ctx: ctx)
         }
         var assets: [String: AssetRef] = [:]
@@ -525,8 +586,7 @@ struct BoardInsertTemplate: NibCommand {
             let zAbove = try ctx.workspace.allItems(doc, page: pageID).last?.z
             let placed = TemplatePlacement.place(fragment, centre: target, ids: ids, layer: layer, zAbove: zAbove,
                                                  assets: assets)
-            for item in placed { try tx.put(item, doc: doc, page: pageID) }
-            return placed.map { NodeRef.item(doc, pageID, $0.id).description }
+            return try tx.put(placed, doc: doc, page: pageID).map { NodeRef.item(doc, pageID, $0.id).description }
         }
         return Output(refs: refs, template: template.id)
     }
@@ -564,7 +624,7 @@ struct BoardInsertTemplate: NibCommand {
     /// A `diagram.create` spec (plugins' `diagram` templates): node ids are replaced by the caller's or fresh ones so
     /// inserting a template twice never overwrites the first copy, then F032 lays it out in this command's undo group.
     private static func insertDiagram(_ template: BoardTemplateDescriptor, page: String, doc: DocumentID, pageID: PageID,
-                                      ids: [NibID], existing: [Item],
+                                      isBoard: Bool, ids: [NibID], existing: [Item],
                                       centre: @MainActor ((width: Double, height: Double)) -> Point,
                                       ctx: CommandContext) async throws -> Output {
         guard case .object(var params) = template.spec, let nodes = params["nodes"]?.arrayValue else {
@@ -595,7 +655,14 @@ struct BoardInsertTemplate: NibCommand {
         params["origin"] = .array([.number(target.x - size.width / 2), .number(target.y - size.height / 2)])
         let before = Set(existing.map(\.id))
         _ = try await ctx.execute(CommandIDs.diagramCreate, .object(params))
-        let created = try ctx.workspace.items(doc, page: pageID).filter { !before.contains($0.id) }
+        var created = try ctx.workspace.items(doc, page: pageID).filter { !before.contains($0.id) }
+        // diagram.create lays the diagram out itself, so its real size is known only now: on a board, move it onto the
+        // exact centre in this command's undo step (a fixed-size page keeps diagram.create's on-page placement).
+        if isBoard, let delta = TemplatePlacement.recentring(created, on: target) {
+            created = try ctx.mutate { tx in
+                try tx.put(created.map { $0.transformed(by: .translation(delta.x, delta.y)) }, doc: doc, page: pageID)
+            }
+        }
         return Output(refs: created.map { NodeRef.item(doc, pageID, $0.id).description }, template: template.id)
     }
 }
@@ -641,7 +708,7 @@ struct DocConvertToWhiteboard: NibCommand {
 
         // Slow work before the transaction: each page's paper becomes a card. PDF pages are rendered to images one at a
         // time, off the main actor; a page that cannot be rendered stops the conversion before anything is written.
-        let templates = WhiteboardSupport.registries(ctx)?.templates
+        let templates = ctx.content.templates
         var cards: [PageID: Item] = [:]
         var pdfURLs: [String: URL] = [:]
         for (index, page) in pages.enumerated() {
@@ -664,10 +731,8 @@ struct DocConvertToWhiteboard: NibCommand {
                 throw NibError(.conflict, "the notebook changed while converting, so it was left as it is", path: "$.doc",
                                hint: "run doc.convertToWhiteboard again")
             }
-            // Every record is written once in this command, so undo restores it exactly (a record written twice in one
-            // undo group would only be reverted to its intermediate state).
             for page in pages {
-                for item in items[page.id] ?? [] { try tx.delete(item: item.id, doc: doc, page: page.id) }
+                try tx.delete(items: (items[page.id] ?? []).map(\.id), doc: doc, page: page.id)
                 var retired = page
                 retired.deleted = true
                 retired.trashedAt = nil
@@ -677,13 +742,14 @@ struct DocConvertToWhiteboard: NibCommand {
             var created: [PageID] = []
             var boardOf: [PageID: PageID] = [:]
             for (index, boardSlots) in plan.enumerated() {
-                var record = PageRecord(order: "", size: nil, background: .ofTemplate(Whiteboard.dotsTemplate),
+                var record = PageRecord(order: "", size: nil, background: .ofTemplate(TemplateIDs.whiteboardDots),
                                         title: String(localized: "Board \(index + 1)"))
                 record.bookmarked = boardSlots.contains { bookmarked.contains($0.page) }
                 let board = try tx.put(record, doc: doc)
                 created.append(board.id)
+                // Balanced keys stay a few characters long however many items a board takes.
                 let count = boardSlots.reduce(0) { $0 + 1 + (items[$1.page]?.count ?? 0) }
-                var zs = FractionalIndex.sequence(after: nil, count: count)[...]
+                var zs = FractionalIndex.balanced(count: count)[...]
                 var used = Set<ElementID>()
                 for slot in boardSlots {
                     boardOf[slot.page] = board.id
@@ -692,10 +758,17 @@ struct DocConvertToWhiteboard: NibCommand {
                         used.insert(card.id)
                         try tx.put(card, doc: doc, page: board.id)
                     }
-                    for moved in NotebookLayout.rehome(items[slot.page] ?? [], transform: slot.transform, used: &used) {
+                    let sources = items[slot.page] ?? []
+                    for (source, moved) in zip(sources, NotebookLayout.rehome(sources, transform: slot.transform, used: &used)) {
                         var item = moved
                         item.z = zs.popFirst() ?? ""
-                        try tx.put(item, doc: doc, page: board.id)
+                        if item.id == source.id {
+                            // The same record on its board: whoever wrote it still did (the AI converting a notebook
+                            // does not become the author of the user's handwriting).
+                            try tx.put(item, doc: doc, page: board.id, keepingProvenanceFrom: slot.page)
+                        } else {
+                            try tx.put(item, doc: doc, page: board.id)
+                        }
                     }
                 }
             }
@@ -715,7 +788,7 @@ struct DocConvertToWhiteboard: NibCommand {
             var meta = fresh.meta
             meta.kind = .whiteboard
             meta.coverEnabled = false
-            meta.defaultTemplate = TemplateRef(Whiteboard.dotsTemplate)
+            meta.defaultTemplate = TemplateRef(TemplateIDs.whiteboardDots)
             try tx.putMeta(meta)
             return created
         }
@@ -774,7 +847,7 @@ enum PageCards {
 
     /// `raster` is the rendered page of a `.pdf` background (see `rasterisePDFPage`).
     static func card(for page: PageRecord, number: Int, frame: Frame, raster: AssetRef?,
-                     templates: Registry<TemplateDefinition>?) -> Item {
+                     templates: Registry<TemplateDefinition>) -> Item {
         let title = page.title ?? String(localized: "Page \(number)")
         if let raster {
             return locked(.makeImage(ImageItem(frame: frame, asset: raster, altText: title)))
@@ -790,14 +863,14 @@ enum PageCards {
     }
 
     /// Paper plus the template's own drawing, in the card's (unrotated page) coordinates.
-    static func display(for background: Background, size: PageSize, templates: Registry<TemplateDefinition>?) -> DisplayList {
+    static func display(for background: Background, size: PageSize, templates: Registry<TemplateDefinition>) -> DisplayList {
         var paper = RGBA.white
         var ops: [DisplayOp] = []
         switch background.kind {
         case .color:
             paper = background.color ?? .white
         case .template:
-            if let ref = background.template, let definition = templates?.get(ref.id) {
+            if let ref = background.template, let definition = templates.get(ref.id) {
                 let params = definition.defaults.merging(ref.params) { _, new in new }
                 let render = definition.render(params, size, 2)
                 paper = render.paper

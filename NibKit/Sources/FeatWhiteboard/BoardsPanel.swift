@@ -109,7 +109,7 @@ final class BoardsModel: ObservableObject {
 
     // MARK: Actions
 
-    func open(_ id: PageID) { perform("view.goToPage", ["page": .string(ref(id))]) }
+    func open(_ id: PageID) { perform(CommandIDs.viewGoToPage, ["page": .string(ref(id))]) }
 
     func toggle(_ id: PageID) {
         if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
@@ -119,8 +119,8 @@ final class BoardsModel: ObservableObject {
 
     func add() {
         Task { @MainActor in
-            guard let value = await execute("board.add", ["doc": docRef]), let ref = value["ref"] else { return }
-            perform("view.goToPage", ["page": ref])
+            guard let value = await execute(CommandIDs.boardAdd, ["doc": docRef]), let ref = value["ref"] else { return }
+            perform(CommandIDs.viewGoToPage, ["page": ref])
             AccessibilityNotification.Announcement(String(localized: "Board added")).post()
         }
     }
@@ -137,7 +137,7 @@ final class BoardsModel: ObservableObject {
         renaming = nil
         let title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty, title != boards.first(where: { $0.id == id })?.title else { return }
-        perform("board.rename", ["page": .string(ref(id)), "title": .string(title)])
+        perform(CommandIDs.boardRename, ["page": .string(ref(id)), "title": .string(title)])
     }
 
     func reorder(from source: IndexSet, to destination: Int) {
@@ -145,7 +145,7 @@ final class BoardsModel: ObservableObject {
         var params: [String: JSONValue] = ["pages": refs(r.pages)]
         if let before = r.before { params["before"] = .string(ref(before)) }
         if let after = r.after { params["after"] = .string(ref(after)) }
-        perform("page.reorder", .object(params))
+        perform(CommandIDs.pageReorder, .object(params))
     }
 
     func moveUp(_ id: PageID) {
@@ -175,7 +175,7 @@ final class BoardsModel: ObservableObject {
         let pages = moving
         showsMove = false
         isSelecting = false
-        perform("page.moveTo", ["pages": refs(pages), "doc": .string(NodeRef.document(target).description)])
+        perform(CommandIDs.pageMoveTo, ["pages": refs(pages), "doc": .string(NodeRef.document(target).description)])
     }
 
     /// `doc.create` gives the new whiteboard a first board; once the moved boards are there, that empty board goes to
@@ -189,22 +189,22 @@ final class BoardsModel: ObservableObject {
             let group = NibID.make().raw
             let create: JSONValue = ["kind": .string(DocumentKind.whiteboard.rawValue),
                                      "title": .string(String(localized: "Untitled Whiteboard")), "id": .string(target.raw)]
-            guard await execute("doc.create", create, group: group) != nil else { return }
+            guard await execute(CommandIDs.docCreate, create, group: group) != nil else { return }
             let placeholder = (try? app.workspace.content(target))?.livePages.first?.id
-            guard await execute("page.moveTo", ["pages": refs(pages), "doc": .string(NodeRef.document(target).description)],
+            guard await execute(CommandIDs.pageMoveTo, ["pages": refs(pages), "doc": .string(NodeRef.document(target).description)],
                                 group: group) != nil,
                   let placeholder else { return }
-            await execute("page.trash", ["pages": [.string(NodeRef.page(target, placeholder).description)]], group: group)
+            await execute(CommandIDs.pageTrash, ["pages": [.string(NodeRef.page(target, placeholder).description)]], group: group)
         }
     }
 
-    func export(_ ids: [PageID]) { perform("export.present", ["docs": [docRef], "pages": refs(ids)]) }
-    func markSeen(_ ids: [PageID]) { perform("collab.markSeen", ["pages": refs(ids)]) }
+    func export(_ ids: [PageID]) { perform(CommandIDs.exportPresent, ["docs": [docRef], "pages": refs(ids)]) }
+    func markSeen(_ ids: [PageID]) { perform(CommandIDs.collabMarkSeen, ["pages": refs(ids)]) }
 
     func trash(_ ids: [PageID]) {
         guard canRemove(ids) else { return }
         isSelecting = false
-        perform("page.trash", ["pages": refs(ids)])
+        perform(CommandIDs.pageTrash, ["pages": refs(ids)])
     }
 
     func showTemplates() { perform(CommandIDs.panelOpen, ["id": .string(Whiteboard.templatesPanel)]) }
@@ -261,25 +261,25 @@ enum BoardMenus {
         func docJSON(_ ctx: MenuContext) -> JSONValue { ctx.doc.map { JSONValue.string(NodeRef.document($0).description) } ?? .null }
         let menus = app.ui.menus
         menus.register(MenuItemDescriptor(
-            id: "whiteboard.board.duplicate", title: String(localized: "Duplicate"), icon: "plus.square.on.square",
-            location: .board, order: 100, owner: owner, command: "page.duplicate",
+            id: "whiteboard.board.duplicate", title: String(localized: "Duplicate"), icon: NibSymbol.duplicate.name,
+            location: .board, order: 100, owner: owner, command: CommandIDs.pageDuplicate,
             params: { ctx in ["pages": refsJSON(ctx)] }, isVisible: { ctx in !refs(ctx).isEmpty }))
         menus.register(MenuItemDescriptor(
             id: "whiteboard.board.export", title: String(localized: "Export…"), icon: NibSymbol.share.name,
-            location: .board, order: 200, owner: owner, command: "export.present",
+            location: .board, order: 200, owner: owner, command: CommandIDs.exportPresent,
             params: { ctx in ["docs": [docJSON(ctx)], "pages": refsJSON(ctx)] }, isVisible: { ctx in !refs(ctx).isEmpty }))
         menus.register(MenuItemDescriptor(
-            id: "whiteboard.board.newWindow", title: String(localized: "Open in New Window"), icon: "macwindow.badge.plus",
-            location: .board, order: 300, owner: owner, command: "window.open",
+            id: "whiteboard.board.newWindow", title: String(localized: "Open in New Window"), icon: NibSymbol.newWindow.name,
+            location: .board, order: 300, owner: owner, command: CommandIDs.windowOpen,
             params: { ctx in ["doc": docJSON(ctx), "page": refs(ctx).first.map { JSONValue.string($0) } ?? .null] },
             isVisible: { ctx in refs(ctx).count == 1 }))
         menus.register(MenuItemDescriptor(
             id: "whiteboard.board.markSeen", title: String(localized: "Mark as Seen"), icon: NibSymbol.eye.name,
-            location: .board, order: 400, owner: owner, command: "collab.markSeen",
+            location: .board, order: 400, owner: owner, command: CommandIDs.collabMarkSeen,
             params: { ctx in ["pages": refsJSON(ctx)] }, isVisible: { ctx in !refs(ctx).isEmpty }))
         menus.register(MenuItemDescriptor(
             id: "whiteboard.board.trash", title: String(localized: "Move to Trash"), icon: NibSymbol.trash.name,
-            location: .board, order: 900, owner: owner, command: "page.trash",
+            location: .board, order: 900, owner: owner, command: CommandIDs.pageTrash,
             params: { ctx in ["pages": refsJSON(ctx)] },
             isVisible: { ctx in
                 let n = refs(ctx).count
@@ -352,7 +352,7 @@ struct BoardsList: View {
                     .frame(minHeight: NibMetrics.hitTarget)
             }
             Spacer(minLength: NibSpacing.s)
-            NibIconButton(NibSymbol(systemName: "rectangle.3.group") ?? .whiteboard, label: String(localized: "Templates"),
+            NibIconButton(.templates, label: String(localized: "Templates"),
                           size: .panel) { model.showTemplates() }
             NibIconButton(.plus, label: String(localized: "Add Board"), size: .panel,
                           shortcut: KeyboardShortcut("b", modifiers: [.command, .option])) { model.add() }

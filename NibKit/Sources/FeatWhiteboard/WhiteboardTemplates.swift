@@ -6,7 +6,7 @@ import NibDesign
 // MARK: - Built-in whiteboard frameworks (D-031, S-087)
 
 /// The eight built-in frameworks. Each is a clipboard-format fragment (`BoardTemplateDescriptor.spec.fragment`), so
-/// `board.insertTemplate` places it in one transaction with every item written once, at an exact centre. Plugins and
+/// `board.insertTemplate` places it in one transaction, at an exact centre. Plugins and
 /// content packs add their own descriptors (fragments or `diagram.create` specs) to the same registry.
 enum WhiteboardTemplates {
     static let brainstorm = "whiteboard.brainstorm"
@@ -49,12 +49,9 @@ enum WhiteboardTemplates {
         ]
     }
 
-    /// The fragment JSON a template carries (the clipboard format, F014).
+    /// The fragment JSON a template carries (`NibFragment`, the clipboard's nib-fragment/1).
     static func fragment(_ items: [Item]) -> JSONValue {
-        let bounds = TemplatePlacement.union(items) ?? .zero
-        let encoded = (try? JSONValue.from(items)) ?? .array([])
-        return ["format": "nib-fragment/1", "items": encoded, "assets": [:],
-                "bounds": [.number(bounds.x), .number(bounds.y), .number(bounds.width), .number(bounds.height)]]
+        (try? JSONValue.from(NibFragment(items: items))) ?? ["format": .string(NibFragment.format), "items": []]
     }
 
     // MARK: Colours (inks and highlighters: template content is page content, so it takes the page palette)
@@ -345,14 +342,14 @@ struct BoardTemplatesPanel: View {
             defer { inserting = nil }
             do {
                 _ = try await app.bus.execute(Invocation(
-                    command: "board.insertTemplate",
+                    command: CommandIDs.boardInsertTemplate,
                     params: ["page": .string(NodeRef.page(doc, page).description), "template": .string(template.id)],
                     principal: .user, session: session))
                 AccessibilityNotification.Announcement(String(localized: "Inserted \(template.title)")).post()
                 dismiss()
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                                userInfo: ["command": "board.insertTemplate", "error": NibError.wrap(error)])
+                                                userInfo: ["command": CommandIDs.boardInsertTemplate, "error": NibError.wrap(error)])
             }
         }
     }

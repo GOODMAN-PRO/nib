@@ -60,13 +60,8 @@ struct MinimapGeometry: Equatable {
     }
 
     /// The map's size: 208 × 144, smaller in compact windows (iPhone, Slide Over).
-    /// ponytail: NibMetrics has no minimap size, so it derives from the thumbnail width; NibMetrics.minimapSize and
-    /// minimapSizeCompact are the requested tokens.
     static func mapSize(compact: Bool) -> CGSize {
-        let regular = CGSize(width: NibMetrics.thumbnailWidth + NibSpacing.x3, height: NibMetrics.thumbnailWidth - NibSpacing.x3)
-        guard compact else { return regular }
-        let width = NibMetrics.thumbnailWidth - NibSpacing.s
-        return CGSize(width: width, height: (width * regular.height / regular.width).rounded())
+        compact ? NibMetrics.minimapSizeCompact : NibMetrics.minimapSize
     }
 }
 
@@ -86,6 +81,19 @@ struct MinimapDrag {
     }
 
     mutating func end() { frozen = nil }
+}
+
+/// Panning the window from the minimap.
+enum MinimapPan {
+    /// The board point in the middle of the window now: under the canvas's centre (always current), else the middle of
+    /// the session's visible rect.
+    @MainActor
+    static func windowCentre(_ host: CanvasHost, board: PageID?) -> Point? {
+        let b = host.canvasView.bounds
+        if let hit = host.pagePoint(CGPoint(x: b.midX, y: b.midY)), board == nil || hit.page == board { return hit.point }
+        if let r = host.session.visibleRect, !r.isEmpty { return r.center }
+        return nil
+    }
 }
 
 /// Board zoom steps for the minimap's − / + (boards zoom 5–400 %, D-028).
@@ -140,15 +148,17 @@ struct BoardContentTally: Equatable {
     }
 }
 
-/// D-030 "block at 100 %": on a full board the minimap takes every canvas touch, so tools that add items never get
-/// ink. The remedies keep working: erasing, selecting items to move them to another board, and the laser pointer.
-/// ponytail: other features' commands (ink.addStrokes, paste, stickies, shapes) cannot be vetoed from here, so AI,
-/// plugins and the bridge can still add items; a `board.checkLimit` hook command on them is the contract request.
+/// D-030 "block at 100 %" on the canvas: `BoardLimitGuard` vetoes every item-creating command on a full board, and the
+/// minimap also takes the touches that would ink it, so the pen never draws a stroke that is then refused. Only a
+/// touch that draws is taken: the Pencil, and a finger when fingers draw (`NibSettings.stylusMode` anyInput); other
+/// fingers still pan and zoom. The remedies keep working: erasing, selecting items to move them to another board, and
+/// the laser pointer.
 enum BoardLimitGate {
     static let removalTools: Set<String> = ["eraser", "lasso", "laser"]
 
-    static func blocksWriting(_ limit: BoardLimitStatus, tool: String) -> Bool {
-        limit == .full && !removalTools.contains(tool)
+    static func blocksWriting(_ limit: BoardLimitStatus, tool: String, isPencil: Bool = true,
+                              fingersDraw: Bool = false) -> Bool {
+        limit == .full && !removalTools.contains(tool) && (isPencil || fingersDraw)
     }
 }
 
@@ -162,11 +172,6 @@ enum MinimapLayout {
 
     /// The overlay's coordinate space: the frames of its parts (the only places it takes touches) are reported in it.
     static let space = NamedCoordinateSpace.named("whiteboard.minimap")
-}
-
-enum MinimapSymbols {
-    static let map = NibSymbol(systemName: "map") ?? .pages
-    static let fit = NibSymbol(systemName: "arrow.up.left.and.arrow.down.right") ?? .search
 }
 
 /// The parts of the overlay that take touches; the gaps between them stay canvas.
@@ -185,8 +190,8 @@ final class MinimapHitFrames {
 // MARK: - Model
 
 /// State of one canvas's minimap: the board's content bounds and a small render of it, the viewport, zoom, and the
-/// board's item-limit status. Discrete actions are commands (view.zoom, settings.set, board.add, panel.open); dragging
-/// the viewport is direct manipulation of the canvas, like scrolling it.
+/// board's item-limit status. Every action is a command (view.zoom, view.scrollBy, settings.set, board.add,
+/// panel.open).
 @MainActor
 final class MinimapModel: ObservableObject {
     @Published private(set) var showsMap: Bool
@@ -202,7 +207,8 @@ final class MinimapModel: ObservableObject {
     @Published private(set) var limit: BoardLimitStatus = .ok
     @Published private(set) var itemCount = 0
     @Published private(set) var paper: RGBA = .white
-    /// Faded to 22 % while the user writes on this board, back 450 ms after the last commit (DESIGN §10.8).
+    /// Faded to 22 % while the Pencil (or a drawing finger) is down in this window, back 450 ms after it lifts
+    /// (DESIGN §10.8, `EditorSession.inking`).
     @Published private(set) var receding = false
     /// Bumped each time a touch is refused because the board is full (the banner's glyph answers it).
     @Published private(set) var refusals = 0
@@ -226,6 +232,9 @@ final class MinimapModel: ObservableObject {
     private var renderTask: Task<Void, Never>?
     private var reloadTask: Task<Void, Never>?
     private var recedeTask: Task<Void, Never>?
+    /// The latest point the viewport should centre on while a `view.scrollBy` is on its way (a drag coalesces).
+    private var pendingCentre: Point?
+    private var isScrolling = false
 
     init(app: NibApp, doc: DocumentID, session: EditorSession) {
         self.app = app
@@ -274,7 +283,6 @@ final class MinimapModel: ObservableObject {
         let head = changes.headChanged(doc)
         guard touched || head else { return }
         if head { pendingHead = true }
-        if touched && changes.principal.isUser { recede() }
         reloadTask?.cancel()
         reloadTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 250_000_000)
@@ -302,16 +310,24 @@ final class MinimapModel: ObservableObject {
         if limit != status { limit = status }
     }
 
-    /// The minimap sits over the page: it fades while ink arrives and comes back 450 ms after the last commit.
-    /// ponytail: a CanvasAttachment cannot read NibInkingState, so it follows commits (Pencil up) rather than Pencil
-    /// down; exposing the inking state to attachments is the contract request.
-    private func recede() {
-        if !receding { receding = true }
-        recedeTask?.cancel()
+    /// How long after the Pencil lifts the minimap comes back (DESIGN §10.8).
+    static let returnDelay = NibMotion.recedeDelay
+
+    /// The minimap sits over the board, so it recedes while the Pencil is down in this window and comes back
+    /// `returnDelay` after it lifts (the canvas writes `session.inking`; updates while writing change nothing).
+    func inkingChanged(_ isInking: Bool) {
+        if isInking {
+            recedeTask?.cancel()
+            recedeTask = nil
+            if !receding { receding = true }
+            return
+        }
+        guard receding, recedeTask == nil else { return }
         recedeTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(NibMotion.recedeDelay * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(Self.returnDelay * 1_000_000_000))
             guard let self, !Task.isCancelled else { return }
             self.receding = false
+            self.recedeTask = nil
         }
     }
 
@@ -364,14 +380,14 @@ final class MinimapModel: ObservableObject {
         return stride(from: 0, to: items.count, by: step).map { items[$0].bounds }
     }
 
-    /// The board's paper colour (templates carry it as the "paper" parameter).
+    /// The board's paper colour (templates carry it as the `TemplateParamNames.paper` parameter).
     static func paper(of background: Background?) -> RGBA {
         guard let background else { return .white }
         switch background.kind {
         case .color:
             return background.color ?? .white
         case .template:
-            return background.template?.params["paper"]?.stringValue.flatMap { RGBA(hex: $0) } ?? .white
+            return background.template?.params[TemplateParamNames.paper]?.stringValue.flatMap { RGBA(hex: $0) } ?? .white
         case .pdf, .image:
             return .white
         }
@@ -379,8 +395,13 @@ final class MinimapModel: ObservableObject {
 
     // MARK: Board limit
 
-    /// True when a touch on the canvas must not reach the active tool (the board is full and the tool adds items).
-    var blocksWriting: Bool { BoardLimitGate.blocksWriting(limit, tool: session.tool) }
+    /// True when a touch on the canvas must not reach the active tool: the board is full, the tool adds items, and
+    /// this touch draws (the Pencil, or a finger when fingers draw).
+    func blocksWriting(isPencil: Bool) -> Bool {
+        guard limit == .full else { return false }
+        return BoardLimitGate.blocksWriting(limit, tool: session.tool, isPencil: isPencil,
+                                            fingersDraw: app.settings.get(NibSettings.stylusMode) == .anyInput)
+    }
 
     /// A touch was refused on the full board: the banner's glyph answers, and VoiceOver hears why (once a burst).
     func refusedWrite() {
@@ -394,8 +415,8 @@ final class MinimapModel: ObservableObject {
 
     // MARK: Actions
 
-    func zoomIn() { perform("view.zoom", ["scale": .number(MinimapZoom.step(from: zoom, zoomIn: true))]) }
-    func zoomOut() { perform("view.zoom", ["scale": .number(MinimapZoom.step(from: zoom, zoomIn: false))]) }
+    func zoomIn() { perform(CommandIDs.viewZoom, ["scale": .number(MinimapZoom.step(from: zoom, zoomIn: true))]) }
+    func zoomOut() { perform(CommandIDs.viewZoom, ["scale": .number(MinimapZoom.step(from: zoom, zoomIn: false))]) }
 
     /// Zooms so the whole board fits the window (100 % on an empty one), then centres it.
     func fit() {
@@ -406,11 +427,11 @@ final class MinimapModel: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                _ = try await self.app.bus.execute(Invocation(command: "view.zoom", params: ["scale": .number(scale)],
+                _ = try await self.app.bus.execute(Invocation(command: CommandIDs.viewZoom, params: ["scale": .number(scale)],
                                                               principal: .user, session: self.session))
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: self.app,
-                                                userInfo: ["command": "view.zoom", "error": NibError.wrap(error)])
+                                                userInfo: ["command": CommandIDs.viewZoom, "error": NibError.wrap(error)])
                 return
             }
             self.centre(on: target)
@@ -421,18 +442,18 @@ final class MinimapModel: ObservableObject {
         perform(CommandIDs.settingsSet, ["name": .string(Whiteboard.minimapVisible.name), "value": .bool(!showsMap)])
     }
 
-    func showBoards() { perform("panel.open", ["id": .string(Whiteboard.boardsPanel)]) }
+    func showBoards() { perform(CommandIDs.panelOpen, ["id": .string(Whiteboard.boardsPanel)]) }
 
     func addBoard() {
         Task { @MainActor in
             do {
-                let added = try await app.bus.execute(Invocation(command: "board.add",
+                let added = try await app.bus.execute(Invocation(command: CommandIDs.boardAdd,
                                                                  params: ["doc": .string(NodeRef.document(doc).description)],
                                                                  principal: .user, session: session))
-                if let ref = added.value["ref"] { app.perform("view.goToPage", ["page": ref], session: session) }
+                if let ref = added.value["ref"] { app.perform(CommandIDs.viewGoToPage, ["page": ref], session: session) }
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                                userInfo: ["command": "board.add", "error": NibError.wrap(error)])
+                                                userInfo: ["command": CommandIDs.boardAdd, "error": NibError.wrap(error)])
             }
         }
     }
@@ -455,16 +476,30 @@ final class MinimapModel: ObservableObject {
         centre(on: Point(v.midX + dx * v.width / 2, v.midY + dy * v.height / 2))
     }
 
-    /// Scrolls the canvas so the board point `p` is in the middle of the window.
+    /// Scrolls the canvas so the board point `p` is in the middle of the window, with `view.scrollBy` (page points,
+    /// §6.1; the canvas grows a board ahead of the pan). While one scroll is on its way, newer targets coalesce and
+    /// each delta is measured from where the window is when it runs, so a fast drag never overshoots.
     func centre(on p: Point) {
-        guard let host, let board else { return }
-        let target = host.viewPoint(p, page: board)
-        let bounds = host.canvasView.bounds
-        let dx = target.x - bounds.midX, dy = target.y - bounds.midY
-        if let scroll = host.canvasView as? UIScrollView {
-            scroll.setContentOffset(CGPoint(x: scroll.contentOffset.x + dx, y: scroll.contentOffset.y + dy), animated: false)
-        } else {
-            perform("view.scrollBy", ["dx": .number(Double(dx)), "dy": .number(Double(dy))])
+        pendingCentre = p
+        guard !isScrolling else { return }
+        isScrolling = true
+        Task { @MainActor [weak self] in
+            while let self, let target = self.pendingCentre {
+                self.pendingCentre = nil
+                guard let host = self.host, let middle = MinimapPan.windowCentre(host, board: self.board) else { continue }
+                let delta = target - middle
+                guard abs(delta.x) > 1e-6 || abs(delta.y) > 1e-6 else { continue }
+                do {
+                    _ = try await self.app.bus.execute(Invocation(
+                        command: CommandIDs.viewScrollBy, params: ["dx": .number(delta.x), "dy": .number(delta.y)],
+                        principal: .user, session: self.session))
+                } catch {
+                    self.pendingCentre = nil
+                    NotificationCenter.default.post(name: .nibCommandFailed, object: self.app,
+                                                    userInfo: ["command": CommandIDs.viewScrollBy, "error": NibError.wrap(error)])
+                }
+            }
+            self?.isScrolling = false
         }
     }
 
@@ -478,7 +513,7 @@ final class MinimapModel: ObservableObject {
 /// "whiteboard.minimap" (D-028, D-116): an overview of the board with the viewport, drag or tap to pan, double-tap to
 /// fit all content, zoom % with − / + (5–400 %), a show/hide button, and the board's item-limit warning (D-030).
 /// Pinned to the bottom trailing corner of the visible canvas, above the page HUD; it claims the touches on its parts
-/// so they never reach the active tool, and on a full board every touch that would add items.
+/// so they never reach the active tool, and on a full board every touch that would ink it (`BoardLimitGate`).
 @MainActor
 final class MinimapAttachment: CanvasAttachment {
     static let id = "whiteboard.minimap"
@@ -506,6 +541,7 @@ final class MinimapAttachment: CanvasAttachment {
         self.model = model
         self.hosting = hosting
         subscriptions.append(host.app.bus.observeCommits { [weak model] changes in model?.committed(changes) })
+        subscriptions.append(host.session.inking.observe { [weak model] signal in model?.inkingChanged(signal.isInking) })
         observers.append(NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: host.app.settings,
                                                                 queue: .main) { [weak model] note in
             guard (note.userInfo?["name"] as? String) == Whiteboard.minimapVisible.name else { return }
@@ -535,11 +571,16 @@ final class MinimapAttachment: CanvasAttachment {
         layout()
     }
 
-    func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
+    func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool {
         guard let model, let view = hosting?.view, view.superview != nil, !view.isHidden else { return false }
-        if model.blocksWriting { return true }
+        if model.blocksWriting(isPencil: isPencil) { return true }
         guard view.frame.contains(viewPoint) else { return false }
         return Self.overlayTakes(view.convert(viewPoint, from: host.canvasView), parts: Array(model.hitFrames.frames.values))
+    }
+
+    /// A canvas that does not say which input it is: treated as the Pencil, so a full board never takes ink.
+    func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
+        hitTest(viewPoint, isPencil: true, host: host)
     }
 
     /// Whether a point in the overlay's coordinates lands on one of its parts. Until SwiftUI has reported the parts,
@@ -550,7 +591,7 @@ final class MinimapAttachment: CanvasAttachment {
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
-        guard let model, model.blocksWriting else { return }
+        guard let model, model.blocksWriting(isPencil: sample.isPencil) else { return }
         model.refusedWrite()
     }
 
@@ -599,7 +640,7 @@ struct MinimapOverlay: View {
         }
         .fixedSize()
         .coordinateSpace(MinimapLayout.space)
-        .opacity(model.receding ? NibLiquid.recedeOpacity : 1)
+        .opacity(model.receding ? NibOpacity.recede : 1)
         .animation(model.receding ? NibMotion.recede : NibMotion.enter, value: model.receding)
     }
 }
@@ -685,7 +726,7 @@ struct MinimapControls: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            NibIconButton(MinimapSymbols.map,
+            NibIconButton(.minimap,
                           label: model.showsMap ? String(localized: "Hide Minimap") : String(localized: "Show Minimap"),
                           size: .bar, isOn: model.showsMap, shortcut: KeyboardShortcut("m", modifiers: [.command, .option])) {
                 model.toggleMap()
@@ -702,7 +743,7 @@ struct MinimapControls: View {
                 .accessibilityValue(Text(model.zoom, format: .percent.precision(.fractionLength(0))))
             NibIconButton(.plus, label: String(localized: "Zoom In"), size: .bar) { model.zoomIn() }
                 .disabled(model.zoom >= MinimapZoom.range.upperBound * 0.999)
-            NibIconButton(MinimapSymbols.fit, label: String(localized: "Fit All Content"), size: .bar) { model.fit() }
+            NibIconButton(.fitToContent, label: String(localized: "Fit All Content"), size: .bar) { model.fit() }
         }
         .padding(.horizontal, NibSpacing.xs)
         .frame(height: NibMetrics.hudHeight)

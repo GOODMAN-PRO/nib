@@ -10,16 +10,14 @@ enum BoardPattern: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// Paper templates to try, best first: F005's zoom-adaptive whiteboard backgrounds, then the matching notebook
-    /// paper. The first one registered in `content.templates` is used.
-    /// ponytail: the whiteboard template ids are F005's, not contract constants; pinning them (and the "paper" / "line"
-    /// parameter names) in the contracts is the request.
+    /// Paper templates to try, best first: the zoom-adaptive whiteboard backgrounds, then the matching notebook
+    /// paper. The first one registered in `content.templates` is used (templates are optional, `TemplateIDs`).
     var candidates: [String] {
         switch self {
-        case .dots: return [Whiteboard.dotsTemplate, "builtin.dots"]
-        case .grid: return ["builtin.whiteboardGrid", "builtin.grid"]
-        case .lined: return ["builtin.whiteboardLines", "builtin.ruled"]
-        case .blank: return ["builtin.blank"]
+        case .dots: return [TemplateIDs.whiteboardDots, TemplateIDs.dots]
+        case .grid: return [TemplateIDs.whiteboardGrid, TemplateIDs.grid]
+        case .lined: return [TemplateIDs.whiteboardLines, TemplateIDs.ruled]
+        case .blank: return [TemplateIDs.blank]
         }
     }
 
@@ -48,17 +46,8 @@ enum BoardPaper: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
     var paper: NibPaper { NibPaper(rawValue: rawValue) ?? .white }
-
-    var title: String {
-        switch self {
-        case .white: return String(localized: "White")
-        case .ivory: return String(localized: "Ivory")
-        case .grey: return String(localized: "Grey")
-        case .board: return String(localized: "Board")
-        case .slate: return String(localized: "Slate")
-        case .night: return String(localized: "Night")
-        }
-    }
+    /// The palette's own name for the paper.
+    var title: String { paper.name }
 }
 
 /// What the New Whiteboard sheet collects, and the commands it turns into.
@@ -79,29 +68,22 @@ struct WhiteboardDraft: Equatable {
         guard let definition = pattern.definition(in: templates) else { return nil }
         let declared = Set(definition.params.map(\.name))
         var params: [String: JSONValue] = [:]
-        if declared.contains("paper") { params["paper"] = .string(RGBA(paper.paper).hex) }
-        if declared.contains("line") { params["line"] = .string(RGBA(rgb: paper.paper.ruleHex).hex) }
+        if declared.contains(TemplateParamNames.paper) {
+            params[TemplateParamNames.paper] = .string(RGBA(paper.paper).hex)
+        }
+        if declared.contains(TemplateParamNames.line) {
+            params[TemplateParamNames.line] = .string(RGBA(rgb: paper.paper.ruleHex).hex)
+        }
         return TemplateRef(definition.id, params: params)
     }
 
+    /// `doc.create` params: the board background as TemplateRef JSON `{id, params}` (ARCHITECTURE.md §6.1).
     func createParams(id: DocumentID, folder: FolderID?, template: TemplateRef?) -> JSONValue {
         var p: [String: JSONValue] = ["kind": .string(DocumentKind.whiteboard.rawValue), "title": .string(resolvedTitle),
                                       "id": .string(id.raw)]
         if let folder { p["folder"] = .string(NodeRef.folder(folder).description) }
         if let template { p["template"] = (try? JSONValue.from(template)) ?? .string(template.id) }
         return .object(p)
-    }
-
-    /// True when the new whiteboard's first board does not carry `template` yet (a `doc.create` that ignored or could
-    /// not take it).
-    static func needsBackground(_ background: Background?, template: TemplateRef) -> Bool {
-        background?.template?.id != template.id || background?.template?.params["paper"] != template.params["paper"]
-    }
-
-    /// `page.setTemplate` for the given boards of `doc`.
-    static func setTemplateParams(doc: DocumentID, boards: [PageID], template: TemplateRef) -> JSONValue {
-        ["pages": .array(boards.map { .string(NodeRef.page(doc, $0).description) }), "template": .string(template.id),
-         "params": .object(template.params)]
     }
 }
 
@@ -118,51 +100,33 @@ enum RecognitionLanguages {
     }
 }
 
-/// Creates the whiteboard with `doc.create` (kind whiteboard) and opens it. If `doc.create` cannot take the template
-/// as {id, params}, it is created with the default board and styled with `page.setTemplate`; a non-default language
-/// goes through `doc.setLanguage`. A follow-up that fails is reported like any failed command (the whiteboard exists
-/// by then, with the defaults for what failed).
+/// Creates the whiteboard with `doc.create` (kind whiteboard, the board background as its `template`) and opens it; a
+/// non-default language goes through `doc.setLanguage`. A follow-up that fails is reported like any failed command
+/// (the whiteboard exists by then, in the default language).
 @MainActor
 enum WhiteboardCreator {
     @discardableResult
     static func create(_ draft: WhiteboardDraft, folder: FolderID?, app: NibApp, session: EditorSession?) async throws -> DocumentID {
         let id = NibID.make()
         let template = draft.template(in: app.content.templates)
-        do {
-            try await run(app, "doc.create", draft.createParams(id: id, folder: folder, template: template), session)
-        } catch let error as NibError where error.code == .invalidParams && template != nil {
-            Whiteboard.log.info("doc.create refused the template (\(error.message, privacy: .public)); styling the board afterwards")
-            try await run(app, "doc.create", draft.createParams(id: id, folder: folder, template: nil), session)
+        try await run(app, CommandIDs.docCreate, draft.createParams(id: id, folder: folder, template: template), session)
+        if let current = (try? app.workspace.content(id))?.meta.language, current != draft.language {
+            await follow(app, CommandIDs.docSetLanguage,
+                         ["doc": .string(NodeRef.document(id).description), "language": .string(draft.language)], session)
         }
-        let group = NibID.make().raw
-        let content = try? app.workspace.content(id)
-        let boards = content?.livePages.map(\.id) ?? []
-        if let template, !boards.isEmpty,
-           WhiteboardDraft.needsBackground(content?.livePages.first?.background, template: template) {
-            await follow(app, "page.setTemplate",
-                         WhiteboardDraft.setTemplateParams(doc: id, boards: boards, template: template), session, group)
-        }
-        if let current = content?.meta.language, current != draft.language {
-            await follow(app, "doc.setLanguage",
-                         ["doc": .string(NodeRef.document(id).description), "language": .string(draft.language)],
-                         session, group)
-        }
-        await follow(app, CommandIDs.docOpen, ["doc": .string(NodeRef.document(id).description)], session, nil)
+        await follow(app, CommandIDs.docOpen, ["doc": .string(NodeRef.document(id).description)], session)
         return id
     }
 
     @discardableResult
-    static func run(_ app: NibApp, _ command: String, _ params: JSONValue, _ session: EditorSession?,
-                    group: String? = nil) async throws -> JSONValue {
-        try await app.bus.execute(Invocation(command: command, params: params, principal: .user, session: session,
-                                             group: group)).value
+    static func run(_ app: NibApp, _ command: String, _ params: JSONValue, _ session: EditorSession?) async throws -> JSONValue {
+        try await app.bus.execute(Invocation(command: command, params: params, principal: .user, session: session)).value
     }
 
     /// A step after the whiteboard exists: its failure goes to the shell's error toast instead of failing the create.
-    private static func follow(_ app: NibApp, _ command: String, _ params: JSONValue, _ session: EditorSession?,
-                               _ group: String?) async {
+    private static func follow(_ app: NibApp, _ command: String, _ params: JSONValue, _ session: EditorSession?) async {
         do {
-            try await run(app, command, params, session, group: group)
+            try await run(app, command, params, session)
         } catch {
             NotificationCenter.default.post(name: .nibCommandFailed, object: app,
                                             userInfo: ["command": command, "error": NibError.wrap(error)])
@@ -219,9 +183,9 @@ struct WhiteboardCreateSheet: View {
                         NibInspectorSection(String(localized: "Colour"), value: draft.paper.title) {
                             HStack(spacing: 0) {
                                 ForEach(BoardPaper.allCases) { paper in
-                                    NibPenSwatch(NibSwatch(id: paper.rawValue, color: paper.paper.color, name: paper.title,
-                                                           ringsLight: !paper.paper.isDark, ringsDark: paper.paper.isDark),
-                                                 isSelected: draft.paper == paper) { draft.paper = paper }
+                                    NibPenSwatch(NibSwatch(paper: paper.paper), isSelected: draft.paper == paper) {
+                                        draft.paper = paper
+                                    }
                                 }
                             }
                         }
@@ -274,36 +238,44 @@ struct WhiteboardCreateSheet: View {
             } catch {
                 creating = false
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                                userInfo: ["command": "doc.create", "error": NibError.wrap(error)])
+                                                userInfo: ["command": CommandIDs.docCreate, "error": NibError.wrap(error)])
             }
         }
     }
 }
 
 extension WhiteboardCreateSheet {
-    /// The sheet panel for creating in `folder`, registered on first use so a menu entry or key command can open it
-    /// with `panel.open {id}` (the command takes no other argument, so the folder is part of the id).
-    @MainActor
-    static func panel(_ app: NibApp, folder: FolderID?) -> String {
-        let id = folder.map { Whiteboard.createPanel + "." + $0.raw } ?? Whiteboard.createPanel
-        if app.ui.panels.get(id) == nil { register(app, folder: folder, id: id) }
-        return id
+    /// `panel.open` params for the New Whiteboard sheet in `folder` (nil = the library root): the folder reaches the
+    /// sheet as `PanelContext.params["folder"]`.
+    static func openParams(folder: FolderID?) -> JSONValue {
+        var p: [String: JSONValue] = ["id": .string(Whiteboard.createPanel)]
+        if let folder { p["folder"] = .string(NodeRef.folder(folder).description) }
+        return .object(p)
+    }
+
+    /// The folder a `PanelContext.params` names ("folder:F" or a bare id, flat or under a nested `params`).
+    static func folder(in params: JSONValue) -> FolderID? {
+        guard let text = params["folder"]?.stringValue ?? params["params"]?["folder"]?.stringValue, !text.isEmpty else {
+            return nil
+        }
+        guard let ref = NodeRef(text) else { return FolderID(text) }
+        if case let .folder(folder) = ref { return folder }
+        return nil
     }
 
     @MainActor
-    static func register(_ app: NibApp, folder: FolderID?, id: String = Whiteboard.createPanel) {
+    static func register(_ app: NibApp) {
         app.ui.panels.register(PanelDescriptor(
-            id: id, title: String(localized: "New Whiteboard"), icon: NibSymbol.whiteboard.name, placement: .sheet,
-            order: 0, owner: FeatWhiteboardFeature.id) { ctx in
-                AnyView(WhiteboardCreateSheet(app: ctx.app, folder: folder, session: ctx.session, onDone: { ctx.dismiss() }))
+            id: Whiteboard.createPanel, title: String(localized: "New Whiteboard"), icon: NibSymbol.whiteboard.name,
+            placement: .sheet, order: 0, owner: FeatWhiteboardFeature.id) { ctx in
+                AnyView(WhiteboardCreateSheet(app: ctx.app, folder: folder(in: ctx.params), session: ctx.session,
+                                              onDone: { ctx.dismiss() }))
             })
     }
 }
 
-/// A background choice: the pattern drawn on the chosen paper, with the sheet's one selection language (a 2 pt
-/// accent ring 3 pt outside, concentric with the thumbnail).
-/// ponytail: NibDesign has no selection-ring modifier (NibPageThumbnail draws its own); the ring is built from its
-/// tokens until one exists.
+/// A background choice: the pattern drawn on the chosen paper, with the sheet's one selection language (the accent
+/// selection ring, concentric with the thumbnail).
 struct BoardPatternTile: View {
     let pattern: BoardPattern
     let paper: NibPaper
@@ -317,13 +289,7 @@ struct BoardPatternTile: View {
                     .aspectRatio(4.0 / 3.0, contentMode: .fit)
                     .clipShape(RoundedRectangle(cornerRadius: NibRadius.thumbnail, style: .continuous))
                     .nibElevation(.paper)
-                    .overlay {
-                        if isSelected {
-                            RoundedRectangle(cornerRadius: NibRadius.thumbnailEnvelope, style: .continuous)
-                                .strokeBorder(NibColor.accent, lineWidth: NibSpacing.xxs)
-                                .padding(-(NibRadius.thumbnailEnvelope - NibRadius.thumbnail))
-                        }
-                    }
+                    .nibSelectionRing(isSelected, cornerRadius: NibRadius.thumbnail)
                 Text(pattern.title)
                     .font(NibFont.caption1)
                     .foregroundStyle(isSelected ? NibColor.accent : NibColor.label)

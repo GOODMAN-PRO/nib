@@ -14,8 +14,8 @@ public enum FeatWhiteboardFeature: NibFeature {
         app.commands.register(BoardRename.self)
         app.commands.register(BoardInsertTemplate.self)
         app.commands.register(DocConvertToWhiteboard.self)
-        // Commands have no NibApp: they find this app's registries (board and paper templates) here.
-        app.services.set(app.content, for: Whiteboard.contentKey)
+        // The board item limit holds for every caller of every item-creating command (D-030).
+        app.bus.hooks.register(BoardLimitGuard.hook(owner: id))
         app.settings.declare(Whiteboard.minimapVisible, summary: "Show the whiteboard minimap on this device.",
                              owner: id, schema: .bool())
 
@@ -31,22 +31,24 @@ public enum FeatWhiteboardFeature: NibFeature {
                 AnyView(BoardsPanel(app: ctx.app, session: ctx.session))
             })
         app.ui.panels.register(PanelDescriptor(
-            id: Whiteboard.templatesPanel, title: String(localized: "Templates"), icon: "rectangle.3.group",
+            id: Whiteboard.templatesPanel, title: String(localized: "Templates"), icon: NibSymbol.templates.name,
             placement: .floating, order: 110, owner: id, docKinds: [.whiteboard]) { ctx in
                 guard let session = ctx.session else {
                     return AnyView(NibEmptyState(symbol: .whiteboard, title: String(localized: "No whiteboard open")))
                 }
                 return AnyView(BoardTemplatesPanel(app: ctx.app, session: session, dismiss: { ctx.dismiss() }))
             })
-        WhiteboardCreateSheet.register(app, folder: nil)
-        app.ui.toolbar.register(ToolbarItemDescriptor(
-            id: Whiteboard.templatesPanel, title: String(localized: "Templates"), icon: "rectangle.3.group",
+        WhiteboardCreateSheet.register(app)
+        var templatesItem = ToolbarItemDescriptor(
+            id: Whiteboard.templatesPanel, title: String(localized: "Templates"), icon: NibSymbol.templates.name,
             group: .accessories, order: 700, owner: id, command: CommandIDs.panelOpen,
-            params: ["id": .string(Whiteboard.templatesPanel)], docKinds: [.whiteboard]))
+            params: ["id": .string(Whiteboard.templatesPanel)], docKinds: [.whiteboard])
+        templatesItem.isOn = { session in session.openPanels.contains(Whiteboard.templatesPanel) }
+        app.ui.toolbar.register(templatesItem)
         app.content.keyCommands.register(KeyCommandDescriptor(
             id: Whiteboard.newWhiteboardKey, title: String(localized: "New Whiteboard"),
-            shortcut: KeyShortcut("w", [.command, .shift]), command: CommandIDs.panelOpen,
-            params: ["id": .string(Whiteboard.createPanel)], scope: .library, order: 310, owner: id))
+            shortcut: Whiteboard.newWhiteboardShortcut, command: CommandIDs.panelOpen,
+            params: WhiteboardCreateSheet.openParams(folder: nil), scope: .library, order: 310, owner: id))
 
         registerMenus(app)
         BoardMenus.register(app, owner: id)
@@ -55,22 +57,24 @@ public enum FeatWhiteboardFeature: NibFeature {
     @MainActor
     private static func registerMenus(_ app: NibApp) {
         let menus = app.ui.menus
-        menus.register(MenuItemDescriptor(
+        var newWhiteboard = MenuItemDescriptor(
             id: "whiteboard.new", title: String(localized: "Whiteboard"), icon: NibSymbol.whiteboard.name,
             location: .libraryNew, order: 30, owner: id, command: CommandIDs.panelOpen,
-            params: { ctx in ["id": .string(WhiteboardCreateSheet.panel(ctx.app, folder: currentFolder(ctx)))] }))
+            params: { ctx in WhiteboardCreateSheet.openParams(folder: currentFolder(ctx)) })
+        newWhiteboard.shortcut = Whiteboard.newWhiteboardShortcut
+        menus.register(newWhiteboard)
         menus.register(MenuItemDescriptor(
             id: "whiteboard.convert", title: String(localized: "Convert to Whiteboard"), icon: NibSymbol.whiteboard.name,
-            location: .libraryItem, order: 450, owner: id, command: "doc.convertToWhiteboard",
+            location: .libraryItem, order: 450, owner: id, command: CommandIDs.docConvertToWhiteboard,
             params: { ctx in ["doc": convertible(ctx).map { JSONValue.string(NodeRef.document($0.id).description) } ?? .null] },
             isVisible: { ctx in convertible(ctx) != nil }))
         menus.register(MenuItemDescriptor(
             id: "whiteboard.addBoard", title: String(localized: "Add Board"), icon: NibSymbol.addPage.name,
-            location: .addPage, order: 10, owner: id, command: "board.add",
+            location: .addPage, order: 10, owner: id, command: CommandIDs.boardAdd,
             params: { ctx in ["doc": ctx.doc.map { JSONValue.string(NodeRef.document($0).description) } ?? .null] },
             isVisible: { ctx in isWhiteboard(ctx) }))
         menus.register(MenuItemDescriptor(
-            id: "whiteboard.insertTemplate", title: String(localized: "Insert Template…"), icon: "rectangle.3.group",
+            id: "whiteboard.insertTemplate", title: String(localized: "Insert Template…"), icon: NibSymbol.templates.name,
             location: .addPage, order: 20, owner: id, command: CommandIDs.panelOpen,
             params: { _ in ["id": .string(Whiteboard.templatesPanel)] },
             isVisible: { ctx in isWhiteboard(ctx) }))
@@ -84,10 +88,12 @@ public enum FeatWhiteboardFeature: NibFeature {
         return node
     }
 
-    /// The folder the New menu was opened in, when the library passes it; nil = the root.
+    /// The folder the New menu was opened in (`MenuContext.folder`; a library that only lists the folder in `nodes`
+    /// is honoured too); nil = the root.
     @MainActor
     static func currentFolder(_ ctx: MenuContext) -> FolderID? {
-        ctx.nodes.compactMap { ctx.app.services.library?.node($0) }.first { $0.kind == .folder }?.id
+        if let folder = ctx.folder { return folder }
+        return ctx.nodes.compactMap { ctx.app.services.library?.node($0) }.first { $0.kind == .folder }?.id
     }
 
     @MainActor
