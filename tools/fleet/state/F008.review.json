@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPresets/ColorSlotEditor.swift:386-395 (PresetPresenter.present)",
+      "problem": "The Custom Colour picker (UIColorPickerViewController) is always presented on app.ui.activeNavigator, which is 'the most recently active window' (set only in sceneDidBecomeActive). With two iPad windows open side by side, both stay foreground-active, so tapping Custom Colour in window A shows the picker in window B (or on a navigator showing the library). The session's own window is only used as a fallback when no navigator exists.",
+      "fix": "Use the active navigator only when it belongs to this session: `if let navigator = app.ui.activeNavigator, navigator.session === session { navigator.presentModal(viewController); return }`, otherwise fall through to the existing session.editor / canvasHost window path."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresets/ToolPresetMenu.swift:127",
+      "problem": "SettingsStore is documented as thread-safe and posts didChange on whatever thread wrote the value (a synced-prefs merge can be off main). `.onReceive` without a main hop then mutates @State off the main thread.",
+      "fix": "`.onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange).receive(on: RunLoop.main))`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresets/ColorSlotEditor.swift:252-285 (PatternSwatch), 103-106 (PresetSymbols); ToolPresetMenu.swift:380-384, 426-433",
+      "problem": "DESIGN.md 15.6 says do not hand-roll missing components. PatternSwatch is a line-for-line copy of NibPenSwatch with literal metrics (22, 0.5, 2, +7). The eyedropper and palette glyphs get round the symbol catalogue through NibSymbol(systemName:), which is meant for descriptor icons. LineSampleButton and RemoveBadge use literals (20, 40, 16) where NibSpacing.xl and NibMetrics.hudHeight exist. No contract request was filed.",
+      "fix": "Use NibSpacing.xl / NibMetrics.hudHeight where tokens exist. File docs/contract-requests/F008-pattern-swatch-and-symbols.md (NibPenSwatch pattern overlay, NibSymbol.eyedropper / .customColour), or report the request in the feature summary, and mark the local copies with a `ponytail:` comment pointing at it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresets/PresetCommands.swift:277-281",
+      "problem": "preset.setSwatch checks tape pattern ids through the global NibApp.shared instead of the invoking app. When shared is nil (a process with makeShared: false), the check is skipped and unknown pattern ids are stored.",
+      "fix": "Capture the registry in register (e.g. `static weak var tapePatterns` set from app.content.tapePatterns in FeatPresetsFeature.register) and throw NibError(.unavailable) when it is missing, rather than skipping the check."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresets/ToolPresetMenu.swift:190",
+      "problem": "The swatch strip scrolls to the selected slot only onAppear. On iPhone (3.5 visible slots), a selection made with keys 4-9/0, by the AI or from another window moves to a slot that is scrolled out of view, so the menu does not show which colour is active.",
+      "fix": "Add `.onChange(of: presets.selectedSwatch) { _, s in proxy.scrollTo(s, anchor: .center) }` next to the onAppear."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresets/ColorSlotEditor.swift:322-325 (TapePatternCache)",
+      "problem": "Custom and plugin tape patterns (untrusted image data) are decoded at full size with UIImage(data:) only to draw an 11 pt tile. A large custom photo costs tens of MB per swatch.",
+      "fix": "Decode a thumbnail with CGImageSourceCreateThumbnailAtIndex (kCGImageSourceThumbnailMaxPixelSize about 11 x 3, kCGImageSourceCreateThumbnailFromImageAlways) instead of UIImage(data:)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresets/EyedropperLoupe.swift:267-268",
+      "problem": "The success haptic plays even when preset.setSwatch or preset.addSwatch failed (a toast shows the error, but the device still gives the select feedback).",
+      "fix": "Have PresetActions.run return Task<Bool, Never> (false on failure) and play NibHaptics .select only when it is true."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPresets/ToolPresetMenu.swift:207-213, 440-452",
+      "problem": "`dragged` is set in onDrag but cleared only in performDrop. After a drag is cancelled, a later drop of external plain text onto a slot moves the stale index.",
+      "fix": "In performDrop, only move when the dropped item provider's string equals the dragged index. Otherwise also clear `dragged` in dropExited or when leaving arrange mode."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatPresetsTests/FeatPresetsTests.swift",
+      "problem": "The risky UI-to-command sequencing is untested: the add-pattern path (addSwatch, then setSwatch at the old count), SystemColourPicker commit rules (a slot commits on each settled choice, add commits once on finish, no commit when the colour is unchanged), and the non-slot menu modes rendering.",
+      "fix": "Add a test that calls the SystemColourPicker delegate methods directly with a recording onPick, and one that runs the ColourEditorRow add-pattern call list through PresetActions.run and asserts the new slot carries the pattern. Render ToolPresetMenu in the .width, .colour and .arrange modes as well."
+    }
+  ]
+}
