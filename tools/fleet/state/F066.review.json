@@ -1,0 +1,71 @@
+{
+ "verdict": "needs-fix",
+ "issues": [
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/NibExport/PDFExporter.swift:361-376 (ExportCompositor.draw), 852-859 (PDFWriter.write), 929-960 (PDFAnnotations.collect)",
+   "problem": "Nothing is culled to the sheet. For a tiled board, every tile draws all of the board's items: fillOutline for every stroke, every drawer and fallback image decode, and the whole invisible text layer. The only limit is a clip, and a PDF context still writes each clipped path and image into the page's content stream. The tiled PDF therefore holds tiles x the board's vector data. A 10x10-tile board with 5k strokes writes each stroke's ~200-point outline 100 times, so the file reaches hundreds of MB and takes minutes. Images are re-decoded and re-embedded for every tile. collect() also converts every item to an annotation spec for each tile before it filters by rect, so the work is O(tiles x items).",
+   "fix": "Filter to the sheet before drawing. In ExportCompositor.draw, keep only the items whose paint bounds intersect `region`: compute `env.registries.paintBounds(for:)` in ExportPlan.snapshot on the main actor and carry it in PageSnapshot, or use `item.bounds.insetBy(-NibLimits.drawerMargin)` off-main. Then build the bands from that list. Filter `snap.text` by `bbox.intersects(region)` the same way. Also filter the `annotated` and link items by bounds before PDFAnnotations.editable / ExportText.linkRects. Add a test: insert a shape far from the fixture content on FIXTUREDOC04, export `board: tiled`, and assert that the tiles which do not overlap it contain no path for it. For example, assert that `pdf.page(at: 0)?.dataRepresentation` is much smaller than the tile that shows the shape, or check the content stream length with CGPDFPage."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/NibExport/PDFExporter.swift:834-869 (PDFWriter.write specs) and 1056-1080 (PDFAnnotations.apply)",
+   "problem": "In an editable export, memory and time grow with the number of strokes in the whole document. That defeats the page-by-page autoreleasepool design the spec asks for. `specs` keeps the prepared point arrays of every stroke on every sheet until the end. apply() then adds one PDFAnnotation, with a UIBezierPath, per stroke to every page of a single PDFDocument, and only after that calls document.write, which also builds an appearance stream for each annotation. A handwritten notebook of 200 pages at about 500 strokes per page gives 100k+ PDFAnnotation objects and their paths in memory at once. That is an OOM or jetsam risk on iPad and makes the export very slow. PageCacheGuard keeps the page items bounded, but this path does not.",
+   "fix": "Put each page's ink into one Ink annotation per (colour, width, dash) group. An InkList annotation holds many paths: call `a.add(path)` once per stroke on the shared annotation and union the bounds. This cuts the annotation count by about 100x. In apply(), consume the specs page by page: build that page's annotations inside an autoreleasepool, then set `specs[i] = []` so the point arrays are freed. Store the ink paths as [Float] pairs, not [CGPoint]. Add a test: an editable export of a page with 200 same-style strokes gives at most one 'Ink' annotation per distinct style, and its path count is 200."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/NibExport/ExportCommands.swift:129-140 (ExportScope.resolve), 193 (ExportDispatch.plan); PDFExporter.swift:100; PackageExporter.swift:44,168",
+   "problem": "A folder or `lib` export opens every document it names. It calls `ctx.workspace.content(doc)` synchronously on the main actor, up front, and before the lock check. Each call loads the head and emits doc.opened, and no export ever closes those documents again. So exporting a folder of 300 documents freezes the UI for the length of 300 head loads, and all 300 heads stay in memory. Because of doc.opened, F025's FolderWatcher also attaches an NSFilePresenter and schedules a sync check for each document, and F002's library runs migrateLegacy on each. The open documents never emit doc.closed. contracts-v2 added `Workspace.peekContent` for exactly this kind of library-wide read without opening.",
+   "fix": "In ExportScope.resolve and ExportDispatch.plan, check `services.lock` first. Then validate and read `meta.kind` with `ctx.workspace.peekContent(doc)`, mapping its not_found as today. In ExportPlan.make, PackageSource.make and exportFolderTree, record `let wasLoaded = ctx.workspace.isLoaded(doc)` before the first `content`/`items` call. After that document's export finishes, whether it succeeded or failed, call `ctx.workspace.close(doc)` when `!wasLoaded`, after plan.evict(). Add a test: export `folder:FIXTUREFLD01` as zip and assert that `workspace.loadedDocuments` afterwards equals what it was before."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibExport/PDFExporter.swift:877-903 (EditableSplit.annotated / isConvertible)",
+   "problem": "Only an unrevealed tape strip counts as an occluder. Ink or a text box underneath a later opaque item, such as a sticky note, an image, a filled shape or a text box with a background, still becomes an annotation. PDF annotations always draw above the page content, so in editable PDFs the content the user covered appears on top of the item that hid it. Highlighter strokes also become annotations in z order with a normal blend. They then sit above pen ink and dull it, and they cover PDF text at 50% instead of multiplying as they do on screen and in flattened output.",
+   "fix": "In annotated(), keep an item in the page content when a later item that is not converted has paint bounds intersecting it: extend the `tapes` list to every later non-convertible item except comments. Leave highlighter strokes out of isConvertible (keep them in the content, drawn beneath the ink by ExportBands), or emit them first. Add a test: pen ink under a sticky note stays out of `annotated`."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibExport/PDFExporter.swift:143-146 (boardSheets .single) and 850 (beginPage)",
+   "problem": "The single-page layout of a board uses its raw content bounds as the PDF page size. Boards larger than 14,400 pt (200 in, the PDF page-size limit) give pages that Acrobat and other readers clamp or refuse.",
+   "fix": "When `max(region.width, region.height) > 14_400`, begin the page at `size * k` with `k = 14_400 / longest` and call `cg.scaleBy(x: k, y: k)` before the translate. Apply the same scale to annotation rects and to the ink points in PDFAnnotations.collect. Test with a board whose content spans 20,000 pt."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Tests/NibExportTests/PDFExporterTests.swift, NibExportTests.swift",
+   "problem": "The risky logic has no tests: (a) PDF and image backgrounds on rotated pages (G22 `backgroundTransform`, named in the spec); (b) the main searchable-text path through `recognize.pageText`, since only the FakeRecognizer fallback is exercised because NibIndex is not registered, so the RecognizedPage decoding and cursor loop never run; (c) eviction of the pages an export loaded (PageCacheGuard).",
+   "fix": "(a) Set FIXTUREPG003's rotation to 90 through page.update or h.insert of the head. Export the page as PNG and assert where the fixture PDF's text sits: use `PDFDocument.findString` bounds on a PDF export, or pixels on the PNG. (b) Register a stand-in `recognize.pageText` command in the test that returns a two-page cursor sequence of `ink` blocks. Assert that both texts are in the flattened PDF and that a `typed` block is left out. (c) Assert that `workspace.cachedPages(doc)` after an export equals the set before it."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibExport/ExportCommands.swift:254-269 (ExportDelivery.discard); PackageExporter.swift:182-187 (exportFolderTree moveItem)",
+   "problem": "export.run deletes every URL an exporter returns, and the zip exporter moves each of them. Neither checks where the file is. A native exporter from another feature that returned an existing file, such as a document asset or an imported source file, would have that file deleted or moved out of the library.",
+   "fix": "Only remove or move a URL whose resolved path is under `FileManager.default.temporaryDirectory`. In exportFolderTree, `copyItem` any file outside it instead of moving it, and never delete it."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibExport/PDFExporter.swift:796-819, ImageExporter.swift:32-54, PackageExporter.swift:124-147, 162-192",
+   "problem": "When an export fails, the partial files stay in tmp/nib-export/<uuid>: the partly written PDF or images, and the earlier documents' files of a multi-document export. The zip exporter's scratch folder also stays when an inner exporter throws. Only `staging` is removed.",
+   "fix": "Wrap each exporter's loop in do/catch. On error, remove `folder` (the scratch folder that ExportNames.scratchFolder created), then rethrow."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibExport/NibExportFeature.swift:366-393 (PageCacheGuard)",
+   "problem": "evict() drops every page that was not cached when the export started. That includes pages the canvas loaded while the export ran, for example when the user scrolls through the open document during a long export, so the canvas has to reload them from disk.",
+   "fix": "Record the pages the export itself loaded: in loaded(_:), add the page to a set only when `workspace.isPageCached` was false before the load. Evict only those, by calling `evictPages(doc, keeping: workspace.cachedPages(doc).subtracting(loadedByExport))`."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibExport/NibExportFeature.swift:257-260, 293 (ExportPages.select / parseRange)",
+   "problem": "`options.pageRange` applies to every document in the export. A range that names no page of a shorter document throws, so the whole multi-document export fails. For example, `\"5-\"` over a 12-page and a 3-page notebook aborts the export.",
+   "fix": "In select(), when the range names no page of this document and the request has more than one document, skip the document: return [] and let the exporter leave it out. Throw only when no document produced a sheet. Alternatively, clamp an open range like `\"5-\"` to the last page."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/NibExport/PackageExporter.swift:290-300 (PackageAssets.refs(in item:))",
+   "problem": "It re-implements the contracts-v2 G23 helper `NibFragment.assetRefs(_:)`, which walks the same image, tape, display-op and rich-text attachments. If the contract adds a new asset-bearing field, the helper will cover it but this copy will not.",
+   "fix": "Use `NibFragment.assetRefs(item).map { $0.name }` and keep only the extra `math.sourceInk` tape-pattern walk."
+  }
+ ]
+}

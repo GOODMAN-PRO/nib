@@ -54,6 +54,14 @@ if [ "$(freegb)" -lt 6 ]; then
   say "== low disk ($(freegb) GB): clearing this slot's DerivedData"
   rm -rf "$DD/Build/Intermediates.noindex/ArchiveIntermediates" "$DD/Logs" "$DD/Index.noindex"
 fi
+# Bound this slot's footprint: DerivedData accumulates every worktree's intermediates; the cloned simulator keeps test apps.
+ddgb=$(du -sg "$DD" 2>/dev/null | awk '{print $1}')
+if [ "${ddgb:-0}" -gt 3 ]; then say "== slot DerivedData ${ddgb} GB: wiping"; rm -rf "$DD"; mkdir -p "$DD"; fi
+simid="$(xcrun simctl list devices -j | python3 -c "import json,sys;d=json.load(sys.stdin)['devices'];print(next((x['udid'] for v in d.values() for x in v if x['name']=='Nib-slot$SLOT'),''))")"
+if [ -n "$simid" ]; then
+  simgb=$(du -sg "$HOME/Library/Developer/CoreSimulator/Devices/$simid" 2>/dev/null | awk '{print $1}')
+  if [ "${simgb:-0}" -gt 4 ]; then say "== slot simulator ${simgb} GB: erasing"; xcrun simctl shutdown "$simid" >/dev/null 2>&1; xcrun simctl erase "$simid" >/dev/null 2>&1; fi
+fi
 while [ "$(freegb)" -lt 4 ]; do say "== waiting: only $(freegb) GB free"; sleep 60; done
 
 # ---- per-slot simulator (a clone of the device pick_sim.py chooses) ----------------------------------------------
