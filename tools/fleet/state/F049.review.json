@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatStudyEditor/CardCommands.swift CardFaces.normalized / fittedCanvas (lines 23-41); NibKit/Sources/FeatStudyEditor/StudySetViewController.swift StudySetModel.inkPicture (lines 372-382); CardEditorView.swift CardPaste.imageData (lines 1053-1065)",
+      "problem": "Freeform sides from card.add/card.update are a trust boundary (AI, plugins, bridge), but their geometry is not bounded. An explicit `size` up to 10000 x 10000 is accepted, and without `size` the canvas grows to the largest stroke coordinate with no cap (`fittedCanvas`). Negative coordinates are kept, so that ink is drawn off the card. The list thumbnail then renders the whole canvas 1:1 on the main actor (`PKDrawing.image(from: CGRect(0,0,size.width,size.height), scale: 1)`). An ink side copied from an infinite whiteboard via query.get {points: true} (x around 50,000), or one with size 10000 x 10000, allocates hundreds of MB to GBs every time the set opens and gets the app jetsam-killed. InkModel.prepare runs first and densifies at 1.5 pt, so a single long AI segment also allocates millions of points. The lasso fallback in CardPaste.imageData renders the fragment bounds at scale 2, also uncapped.",
+      "fix": "In CardFaces.normalized, before InkModel.prepare: reject non-finite coordinates (invalid_params, path $.front.ink[i]). When the strokes' union bounds fall outside [0, size] (or [0, 560x360] with no size), translate and scale them into the card the way CardPaste.inkFace does (margin 24, scale down only). Cap the stored size (for example at 4x the default canvas) instead of growing it to the ink. In inkPicture, render at scale = min(1, targetPixels / max(size.width, size.height)) with targetPixels of about 2 x NibMetrics.thumbnailWidth x the screen scale. Cap CardPaste.imageData so the long edge is at most 2048 px. Add tests: card.add with strokes at x=50000 or negative coordinates yields a bounded size with strokes inside it, and non-finite points are rejected."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatStudyEditor/CardEditorView.swift CardImages.normalized (lines 1114-1124), PhotosPicker in CardEditorPane.controls (line 732); StudySetViewController.swift StudySetModel.picture / pictures NSCache (lines 81, 356-367)",
+      "problem": "Photos are stored at full resolution, and anything that is not PNG, JPEG or GIF is re-encoded as lossless PNG. PhotosPicker's loadTransferable(Data) hands over HEIC for camera photos, so every 12 MP photo becomes a 15-30 MB PNG in the package, which is then synced to iCloud, OneDrive or WebDAV and copied again by card.moveTo. Each 72 pt list thumbnail decodes the full-size bitmap (about 48 MB for 12 MP) through preparingForDisplay() into an NSCache that has no totalCostLimit or countLimit. A set of photo cards therefore bloats the library and pushes memory toward jetsam while the list scrolls (the brief's memory/perf on large documents criterion).",
+      "fix": "Downscale on import: use CGImageSourceCreateThumbnailAtIndex with kCGImageSourceThumbnailMaxPixelSize around 2048 and kCGImageSourceCreateThumbnailWithTransform. Encode opaque images as JPEG (quality about 0.85) and keep PNG only for images with alpha. GIFs stay as they are. Pass preferredItemEncoding: .compatible to PhotosPicker. For list thumbnails, load a separate downsampled image sized to the slot (preparingThumbnail(of:) or an ImageIO thumbnail), and keep the full picture only for the pane. Set pictures.totalCostLimit, with the cost set to the bitmap bytes. Add a test showing that a large, non-PNG/JPEG image comes out bounded in pixels and as JPEG."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatStudyEditor/StudySetViewController.swift StudySetViewController.viewDidLoad focusWatch + reclaimKeyboard (lines 559-561, 601-606)",
+      "problem": "Whenever model.focus becomes nil, the editor asynchronously calls becomeFirstResponder(), and the only checks are 'no panel I presented' and 'in a window'. When the user leaves a card field by tapping another text input in the same window, focus is stolen back. Examples: the chrome's search field (⌘F), the title rename field, or a docked panel's composer (AI chat, plugin panel). The card's @FocusState goes to nil, model.focus goes to nil, reclaimKeyboard runs, and the other field resigns and its keyboard closes. The first tap or shortcut into any other text field therefore fails while a card was being edited.",
+      "fix": "Reclaim only when nothing else holds the keyboard. Capture the current first responder, for example with an internal UIResponder extension called through UIApplication.shared.sendAction(#selector(captureFirstResponder), to: nil, from: nil, for: nil), and call becomeFirstResponder() only if there is none or if it is inside self.view. Or reclaim only after this editor's own actions (stopEditing/⎋, dismissing its own panel, viewDidAppear) rather than on every focus-to-nil transition."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyEditor/CardCommands.swift CardMoveTo.run (lines 378-411); StudySetModel.moveCards",
+      "problem": "Moving cards between sets writes to two documents, and UndoHistory keeps a separate stack per document, so each document gets its own undo entry. Undo in the source set (the editor the user is in) restores the cards while the copies stay in the destination, leaving duplicates. Undo in the destination alone removes the copies while the source stays tombstoned, and the cards are lost once the app relaunches.",
+      "fix": "Mirror the undo. StudySetModel remembers the group of each card.moveTo it runs with the documents involved (pass an explicit group to bus.run). In didCommit, when a Changeset's command is CommandIDs.undo or CommandIDs.redo and its group is 'undo:<g>' or 'redo:<g>' for a remembered g, call app.bus.undo/redo on the other document if that document's top UndoHistory entry has group g (history.entries(doc).last?.group). Report cross-document undo as a contract gap."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyEditor/CardCommands.swift CardMoveTo.run asset copy (lines 361-371) and CardFaces.checkAssets (lines 49-59)",
+      "problem": "card.moveTo reads, hashes and writes every copied picture synchronously on the main actor, and checkAssets reads each whole asset file only to test that it exists. With photo cards this blocks the main actor far beyond the 16 ms command budget (ARCHITECTURE §14).",
+      "fix": "Copy the assets in `try await Task.detached { … }.value` before mutate (AssetStore is thread-safe), capturing the store and the (doc, AssetRef) pairs. In checkAssets, test existence with store.url(ref, doc:) plus FileManager.default.fileExists instead of store.data."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyEditor/CardEditorView.swift StudySetHeader.studyActions NibButton(shortcut: ⌘⏎) (lines 163-166); StudySetViewController.keyCommands (lines 588-598)",
+      "problem": "⌘⏎ is registered twice: once as a SwiftUI keyboardShortcut on the New Card button and once as the view controller's UIKeyCommand. The SwiftUI one sits closer to the first responder, so it wins and always calls addCard(after:inPane: false). ⌘⏎ while typing in the iPad card pane therefore jumps focus to the new card's row in the list. Tab and ⇧Tab are also installed with wantsPriorityOverSystemBehavior in read-only mode, where they do nothing and swallow Tab for Full Keyboard Access.",
+      "fix": "Keep one ⌘⏎ path. Either drop the UIKeyCommand while the New Card button is present, or remove the button's shortcut and keep the KeyHint some other way. Either way, pass inPane: model.focus?.inPane ?? model.showsCardSheet. Return the Tab and ⇧Tab commands only when !model.readOnly."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyEditor/StudySetViewController.swift StudySetModel.studyPanel (lines 473-480)",
+      "problem": "The Practice and Smart Learn buttons look for any F050 panel whose id contains 'practice' or 'learn'. F050 has not been built, and its spec does not name its panel ids. If F050 uses one session panel with a mode, or different words, the buttons never appear, and nothing reports it.",
+      "fix": "Match exact ids (for example 'studysession.practice' and 'studysession.smartLearn') in named constants. Record them in the returned contract gaps so F050 registers exactly those ids. Add a test that registers stand-in panels with those ids and checks that practicePanel and smartLearnPanel resolve."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyEditor/CardEditorView.swift CardEditorPane.controls PhotosPicker label (lines 732-743), FaceThumbnail (line 418), ScratchPaperView (lines 951, 966), swipe threshold (line 673); FeatStudyEditorFeature.swift menu icons (lines 35, 40, 45)",
+      "problem": "Slop checklist and DESIGN §15. The Choose Photo control is a hand-rolled capsule button (fill3 Capsule, minHeight 38, which is off the 4 pt grid) rather than a NibDesign button. There are literal metrics: the 72 pt thumbnail height, the 80 pt swipe threshold, and the scratch panel's minWidth 300, minHeight 360 and idealHeight 480. The scratch panel uses the fixed NibMetrics.panelWidth instead of NibMetrics.panelWidth(dynamicTypeSize), which is 420 at AX sizes, and it borrows NibRadius.proposal. The card menu icons are raw SF Symbol strings ('plus.square.on.square', 'arrow.up', 'arrow.down') rather than NibSymbol names.",
+      "fix": "Style the PhotosPicker label with the NibButton secondary/compact look (use a NibDesign button style, or file a contract request if the component can't wrap a PhotosPicker). Use NibSpacing/NibMetrics tokens for the metrics, NibMetrics.panelWidth(dynamicTypeSize) for the panel width, NibSymbol.x.name for menu icons, and file a contract request for any missing symbol or metric."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyEditor/CardEditorView.swift StudySetHeader.body (lines 111-145)",
+      "problem": "On iPhone at AX3, the header puts the title, language menu, Scratch Paper button and Select in one HStack, and Practice, Smart Learn and New Card in another, with no fallback layout. They truncate or squeeze, which fails the Slop line 'nothing wraps or truncates badly at AX3'.",
+      "fix": "Wrap both rows in ViewThatFits, or switch to a VStack/grid when dynamicTypeSize.isAccessibilitySize or sizeClass == .compact. For example, put the study actions on their own full-width row and move the language menu under the title."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatStudyEditor/StudySetViewController.swift StudySetModel.commit (line 174); CardEditorView.swift CardMenu (line 465), CardEditorPane .onChange(of: photo) (lines 594-603)",
+      "problem": "Three smaller problems. Editing a text side rewrites it as RichText(plain:), so bold, italics and links from import or AI are dropped on the first keystroke pause. In read-only mode the card context menu hides every .card item, including other features' read-only ones. A photo that fails to load (try? loadTransferable) is dropped silently with no toast.",
+      "fix": "When the draft differs, keep the existing attributes where possible (for example, reuse the first run's TextAttributes for single-style text) or document that editing makes the side plain text. In read-only mode, filter menu items by their command's effect (keep .read and .session) instead of returning []. On a loadTransferable failure, call report(NibError.unsupported(...), command: card.update)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatStudyEditorTests/FeatStudyEditorTests.swift",
+      "problem": "The tests are good on command semantics and undo, but they miss the riskiest paths: ink geometry and size bounds at the trust boundary, picture downscaling and re-encoding, card.moveTo with `ids` (including a taken id, and cards already in the destination), and the cross-document undo of a move.",
+      "fix": "Add XCTest cases for those paths alongside the fixes above, using the Harness and the pure CardFaces and CardImages helpers."
+    }
+  ]
+}

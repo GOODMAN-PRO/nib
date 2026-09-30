@@ -160,8 +160,8 @@ struct FrostLayer: View {
 
 /// iOS 17–25: each cluster's droplets and necks as one metaball field in a canvas framed to the cluster. The Canvas
 /// blurs the silhouettes (σ 8 pt iPad / 6.5 pt iPhone); the Metal layer effect thresholds it with analytic
-/// anti-aliasing and shades body, edge, caustic, specular, rim and outline. Material kinds and the paper share travel
-/// in the colour channels.
+/// anti-aliasing and shades body, edge lens, sheen, outline, directional rim and the water's shadow (DESIGN.md §10.9).
+/// Material kinds and the paper share travel in the colour channels.
 struct WaterLayer: View {
     let field: DropletField
 
@@ -196,7 +196,7 @@ struct WaterClusterCanvas: View, Equatable {
                 }
             }
         }
-        .layerEffect(NibShaders.waterField(iso: iso), maxSampleOffset: CGSize(width: 6, height: 8))
+        .layerEffect(NibShaders.waterField(cluster, iso: iso), maxSampleOffset: CGSize(width: 6, height: 8))
     }
 }
 
