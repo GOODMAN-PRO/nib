@@ -26,6 +26,16 @@ enum LockCopy {
         String(localized: "Nib can't recover a forgotten password. After three wrong entries it shows your hint.")
     }
 
+    /// A verifier this build cannot check (set by a newer Nib).
+    static var updateToUnlock: String {
+        String(localized: "Update Nib to unlock. This library's password was set up by a newer version of Nib.")
+    }
+
+    /// Create mode while documents already carry a lock (their password has not synced to this device yet).
+    static var waitingForSync: String {
+        String(localized: "Waiting for this library's password to sync. Some documents are already locked with it. A new password here replaces it on every device.")
+    }
+
     static func biometricsFooter(_ kind: BiometryKind) -> String {
         String(localized: "\(kind.name) opens locked documents without typing, on this \(UIDevice.current.localizedModel) only. Removing a lock always asks for the password.")
     }
@@ -56,6 +66,9 @@ final class PasswordSetupModel: ObservableObject {
     @Published var hint: String
     @Published var biometrics: Bool
     @Published var confirmsTurnOff = false
+    /// The "replace the password on every device" question is showing (`request.replacesMissingPassword`).
+    @Published var confirmsReplacement = false
+    private var replacementConfirmed = false
     @Published private(set) var error: String?
     /// The hint for the current password once three wrong entries made it due ("" = none was set).
     @Published private(set) var currentHint: String?
@@ -78,7 +91,10 @@ final class PasswordSetupModel: ObservableObject {
     /// Create mode always sets a password; change mode only when a new one is typed.
     var changesPassword: Bool { mode == .create || !password.isEmpty || !confirmation.isEmpty }
 
-    var trimmedHint: String { hint.trimmingCharacters(in: .whitespacesAndNewlines) }
+    /// The hint as it is stored: one line (the hint field grows vertically, so Return may add a line break).
+    var trimmedHint: String {
+        hint.components(separatedBy: .newlines).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     var problems: [PasswordRules.Problem] {
         if changesPassword {
@@ -120,10 +136,22 @@ final class PasswordSetupModel: ObservableObject {
         if mode == .change {
             guard await verifyCurrent() else { return }
         }
+        // Documents are locked with a password that has not synced here: setting one replaces it everywhere, so ask.
+        if request.replacesMissingPassword && !replacementConfirmed {
+            confirmsReplacement = true
+            return
+        }
         let action: PasswordSetupResult.Action = mode == .create
             ? .create(password: password)
             : .change(newPassword: changesPassword ? password : nil)
-        finish(PasswordSetupResult(action: action, hint: trimmedHint, biometrics: biometrics))
+        finish(PasswordSetupResult(action: action, hint: trimmedHint, biometrics: biometrics,
+                                   confirmedReplacement: replacementConfirmed))
+    }
+
+    /// "Replace Password" in the confirmation: saves the new password for every device.
+    func confirmReplacement() async {
+        replacementConfirmed = true
+        await save()
     }
 
     func turnOff() async {
@@ -157,6 +185,10 @@ final class PasswordSetupModel: ObservableObject {
         case .notConfigured:
             error = String(localized: "The password was turned off on another device. Close this sheet and set it up again.")
             return false
+        case .unsupported:
+            current = ""
+            error = LockCopy.updateToUnlock
+            return false
         }
     }
 
@@ -181,6 +213,13 @@ struct PasswordSetupView: View {
                 if let reason = model.request.reason {
                     Section {
                         NibBanner(reason, style: .info, symbol: .lock)
+                            .listRowInsets(EdgeInsets())
+                            .listRowBackground(Color.clear)
+                    }
+                }
+                if model.request.replacesMissingPassword {
+                    Section {
+                        NibBanner(LockCopy.waitingForSync, style: .warning, symbol: .cloud)
                             .listRowInsets(EdgeInsets())
                             .listRowBackground(Color.clear)
                     }
@@ -227,6 +266,15 @@ struct PasswordSetupView: View {
             Button(String(localized: "Cancel"), role: .cancel) {}
         } message: {
             Text(String(localized: "You can't lock documents again until you set a new password."))
+        }
+        .confirmationDialog(String(localized: "Replace the password on every device?"),
+                            isPresented: $model.confirmsReplacement, titleVisibility: .visible) {
+            Button(String(localized: "Replace Password"), role: .destructive) {
+                Task { await model.confirmReplacement() }
+            }
+            Button(String(localized: "Cancel"), role: .cancel) {}
+        } message: {
+            Text(String(localized: "Documents already locked with the password that is still syncing will open with the new one instead."))
         }
         .onAppear { focus = model.mode == .create ? .password : .current }
         .onDisappear { model.cancel() }
@@ -278,13 +326,14 @@ struct PasswordSetupView: View {
 
     private var hintSection: some View {
         Section {
-            TextField(String(localized: "Hint (optional)"), text: $model.hint)
-                .font(NibFont.body)
+            // The same field treatment as the password rows above it (a filled field on a clear row).
+            NibField(text: $model.hint, prompt: String(localized: "Hint (optional)"))
                 .textInputAutocapitalization(.sentences)
                 .focused($focus, equals: .hint)
                 .submitLabel(.done)
                 .onSubmit { Task { await model.save() } }
-                .frame(minHeight: NibMetrics.hitTarget)
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
         } header: {
             Text(String(localized: "Hint"))
         } footer: {
@@ -314,6 +363,9 @@ struct PasswordSetupView: View {
 
 @MainActor
 final class LockSettingsModel: ObservableObject {
+    /// How long the locked-documents count waits for a burst of library and lock changes to settle.
+    static let recountDelay: DispatchQueue.SchedulerTimeType.Stride = .milliseconds(300)
+
     @Published private(set) var configured = false
     @Published private(set) var biometricsOn = false
     @Published private(set) var biometry: BiometryKind?
@@ -322,28 +374,51 @@ final class LockSettingsModel: ObservableObject {
     @Published private(set) var error: String?
     private weak var app: NibApp?
     private var cancellables = Set<AnyCancellable>()
+    private var events: EventSubscription?
+    private let lockChanges = PassthroughSubject<Void, Never>()
 
     init(app: NibApp) {
         self.app = app
         refresh()
-        let center = NotificationCenter.default
-        center.publisher(for: SettingsStore.didChange)
+        // The lock's settings are cheap to read: at once. The count scans the library: only after a library or lock
+        // change, debounced.
+        NotificationCenter.default.publisher(for: SettingsStore.didChange)
             .filter { note in (note.userInfo?["name"] as? String).map { $0.hasPrefix("security.lock.") } ?? true }
-            .merge(with: center.publisher(for: .nibChromeNeedsUpdate))
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.refresh() }
+            .sink { [weak self] _ in self?.refreshSettings() }
             .store(in: &cancellables)
+        lockChanges
+            .debounce(for: LockSettingsModel.recountDelay, scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in self?.recount() }
+            .store(in: &cancellables)
+        // Events may arrive off the main thread; the debounce delivers on it.
+        let changes = lockChanges
+        events = app.events.subscribe { event in
+            guard event.type == NibEventType.libraryChanged || event.type == LockServiceImpl.changedEvent else { return }
+            changes.send()
+        }
     }
+
+    deinit { events?.cancel() }
 
     private var service: LockServiceImpl? { app?.services.lock as? LockServiceImpl }
 
     var isAvailable: Bool { service != nil }
 
     func refresh() {
+        refreshSettings()
+        recount()
+    }
+
+    func refreshSettings() {
         guard let service = service else { return }
         configured = service.isConfigured
         biometry = service.biometrics?.kind
         biometricsOn = app?.settings.get(LockSettings.biometrics) ?? false
+    }
+
+    func recount() {
+        guard let service = service else { return }
         lockedCount = service.lockedDocuments().count
     }
 
@@ -352,24 +427,22 @@ final class LockSettingsModel: ObservableObject {
         app?.perform(LockIDs.setup)
     }
 
-    /// Face ID for this device: turning it on asks for Face ID once, so it is really the person at the device.
+    /// Face ID for this device (`settings.set` as the user): turning it on asks for the library's password first
+    /// (`LockCommandSupport.settingsGuard`), so a face or finger this device knows cannot bypass the lock.
     func setBiometrics(_ on: Bool) async {
-        guard let app = app, let service = service, !isBusy else { return }
+        guard let app = app, service != nil, !isBusy else { return }
         isBusy = true
         error = nil
         defer {
             isBusy = false
-            refresh()
-        }
-        if on, let kind = service.biometrics?.kind {
-            guard await service.authenticateBiometric(reason: String(localized: "Turn on \(kind.name) for locked documents")) else {
-                return
-            }
+            refreshSettings()
         }
         do {
             try await LockStore.setBiometrics(on, app: app)
         } catch {
-            self.error = NibError.wrap(error).message
+            let e = NibError.wrap(error)
+            // Cancelling the password prompt is not an error.
+            if e.code != .userDenied { self.error = e.message }
         }
     }
 }

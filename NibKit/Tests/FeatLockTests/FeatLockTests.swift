@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatLock
@@ -222,7 +223,7 @@ final class FeatLockTests: XCTestCase {
     }
 }
 
-// MARK: - Screens (models; the views are checked on device)
+// MARK: - Screens: models (snapshots below)
 
 @MainActor
 final class LockScreenModelTests: XCTestCase {
@@ -343,5 +344,114 @@ final class LockScreenModelTests: XCTestCase {
         _ = try? h.app.workspace.content(Fixtures.docID)
         XCTAssertFalse(LockPaper.of(Fixtures.docID, in: h.app).isDark)
         XCTAssertFalse(LockPaper.of(NibID("NOTLOADED001"), in: h.app).isDark)
+    }
+}
+
+// MARK: - Screens: snapshots (DESIGN.md §15.7: Light, Dark and AX3 for every new screen)
+
+@MainActor
+final class LockScreenSnapshotTests: XCTestCase {
+    /// A form sheet on iPad (the system's size: the lock's sheets set none) and an iPhone for the full-screen cover.
+    private let sheet = CGSize(width: 540, height: 620)
+    private let phone = CGSize(width: 390, height: 844)
+
+    private func assertRendersEveryVariant<V: View>(_ view: V, size: CGSize, _ name: String,
+                                                    file: StaticString = #filePath, line: UInt = #line) {
+        let images = NibSnapshot.images(view, size: size)
+        XCTAssertEqual(Set(images.keys), Set(NibSnapshot.Variant.allCases), "\(name) renders in every variant",
+                       file: file, line: line)
+        for (variant, image) in images {
+            XCTAssertEqual(image.size.width, size.width, accuracy: 1, "\(name) \(variant)", file: file, line: line)
+            XCTAssertEqual(image.size.height, size.height, accuracy: 1, "\(name) \(variant)", file: file, line: line)
+        }
+    }
+
+    private func request(_ purpose: UnlockPurpose, requester: Principal = .user, biometry: BiometryKind? = .faceID,
+                         hint: String? = nil) -> UnlockRequest {
+        UnlockRequest(doc: Fixtures.docID, documentTitle: "Kinematics, Unit 4: Projectile Motion", purpose: purpose,
+                      requester: requester, biometry: biometry, hint: hint,
+                      check: { _ in .rejected(failures: 3, hint: "the name of our first dog") },
+                      biometric: { false })
+    }
+
+    func testUnlockPromptSnapshots() async {
+        let dueHint = UnlockPromptModel(request: request(.open, hint: "the name of our first dog"))
+        dueHint.password = "guess"
+        await dueHint.submit()
+        XCTAssertNotNil(dueHint.error)
+        XCTAssertNotNil(dueHint.hintText)
+        let prompts: [(String, UnlockPromptModel)] = [
+            ("open, hint due", dueHint),
+            ("remove lock", UnlockPromptModel(request: request(.removeLock, biometry: nil))),
+            ("assistant asks", UnlockPromptModel(request: request(.open, requester: .ai("chat")))),
+            ("verify", UnlockPromptModel(request: request(
+                .verify(action: "Turn On Face ID", message: "Enter the password to open locked documents with Face ID on this iPad."),
+                biometry: nil))),
+        ]
+        for (name, model) in prompts {
+            assertRendersEveryVariant(UnlockPromptView(model: model), size: sheet, "unlock prompt: \(name)")
+            // The prompt still lays out one card wide at AX3: it grows downwards (the sheet scrolls), never sideways.
+            let width = UnlockPromptContent.cardWidth
+            let regular = NibSnapshot.fittingSize(UnlockPromptContent(model: model), width: width)
+            let large = NibSnapshot.fittingSize(UnlockPromptContent(model: model), width: width, variant: .largeText)
+            XCTAssertLessThanOrEqual(large.width, width + 0.5, "\(name) at AX3")
+            XCTAssertGreaterThan(large.height, regular.height, "\(name): the type grows at AX3")
+            XCTAssertLessThan(large.height, 4_000, "\(name): the content has a finite height at AX3")
+        }
+    }
+
+    func testLockedCoverSnapshotsTakeThePagesPaper() throws {
+        let h = Harness(features: [FeatLockFeature.self])
+        let service = try XCTUnwrap(h.app.services.lock as? LockServiceImpl)
+        let window = FakeNavigator()
+        window.show(Fixtures.docID)
+        let papers: [(String, LockPaper)] = [("light paper", .white),
+                                             ("dark paper", LockPaper.paper(RGBA(0x12, 0x12, 0x12)))]
+        for (name, paper) in papers {
+            let model = LockedCoverModel(app: h.app, service: service, doc: Fixtures.docID, navigator: window, paper: paper)
+            let view = LockedCoverView(model: model)
+            assertRendersEveryVariant(view, size: phone, "locked field: \(name)")
+            assertRendersEveryVariant(view, size: sheet, "locked field in a narrow iPad window: \(name)")
+            let image = try XCTUnwrap(NibSnapshot.image(view, size: phone, variant: .dark))
+            let corner = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 4, y: 4)))
+            if paper.isDark {
+                XCTAssertLessThan(corner.r, 64, "the field is the page's dark paper")
+            } else {
+                XCTAssertGreaterThan(corner.r, 230, "the field is the page's white paper, even in Dark Mode")
+            }
+        }
+    }
+
+    private func setupRequest(_ mode: PasswordSetupMode, reason: String? = nil, locked: Int = 0) -> PasswordSetupRequest {
+        PasswordSetupRequest(mode: mode, reason: reason, hint: mode == .change ? "the stable" : "", biometry: .faceID,
+                             biometricsOn: mode == .change, lockedDocuments: locked,
+                             check: { _ in .accepted })
+    }
+
+    func testPasswordSetupSnapshots() {
+        let sheets: [(String, PasswordSetupRequest)] = [
+            ("create, with a reason", setupRequest(.create, reason: "Set a password to lock “Physics”. It unlocks every locked document in this library.")),
+            ("change, with locked documents", setupRequest(.change, locked: 2)),
+            ("create while the password syncs", setupRequest(.create, locked: 1)),
+        ]
+        for (name, request) in sheets {
+            let model = PasswordSetupModel(request: request)
+            assertRendersEveryVariant(PasswordSetupView(model: model), size: sheet, "password sheet: \(name)")
+        }
+        XCTAssertTrue(sheets[2].1.replacesMissingPassword)
+    }
+
+    func testPasswordSettingsPageSnapshots() async throws {
+        let off = try await LockTesting.make(configured: false)
+        assertRendersEveryVariant(PasswordSettingsPage(app: off.harness.app), size: sheet, "settings page: off")
+
+        let on = try await LockTesting.make()
+        on.service.biometrics = FakeBiometrics()
+        try await LockTesting.lock(Fixtures.textDocID, in: on)
+        let model = LockSettingsModel(app: on.harness.app)
+        XCTAssertTrue(model.configured)
+        XCTAssertEqual(model.biometry, .faceID)
+        XCTAssertEqual(model.lockedCount, 1)
+        assertRendersEveryVariant(PasswordSettingsPage(app: on.harness.app), size: sheet, "settings page: on")
     }
 }

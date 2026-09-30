@@ -31,12 +31,23 @@ final class UnlockPromptModel: ObservableObject {
     }
 
     var title: String {
-        request.purpose == .open ? String(localized: "Locked Document") : String(localized: "Remove Lock")
+        switch request.purpose {
+        case .open: return String(localized: "Locked Document")
+        case .removeLock: return String(localized: "Remove Lock")
+        case .verify: return String(localized: "Enter Password")
+        }
     }
 
     var primaryTitle: String {
-        request.purpose == .open ? String(localized: "Unlock") : String(localized: "Remove Lock")
+        switch request.purpose {
+        case .open: return String(localized: "Unlock")
+        case .removeLock: return String(localized: "Remove Lock")
+        case .verify(let action, _): return action
+        }
     }
+
+    /// The glyph above the title: `lock` to open or prove the password, `unlock` to take the lock off.
+    var symbol: NibSymbol { request.purpose == .removeLock ? .unlock : .lock }
 
     var canSubmit: Bool { !password.isEmpty && !isChecking && outcome == nil }
 
@@ -50,6 +61,8 @@ final class UnlockPromptModel: ObservableObject {
         case .open:
             let who = NibPrincipalKind(request.requester).title
             return String(localized: "\(who) asks to open “\(name)”. Enter the password to allow it until the document locks again.")
+        case .verify(_, let message):
+            return message
         }
     }
 
@@ -74,6 +87,9 @@ final class UnlockPromptModel: ObservableObject {
             UIAccessibility.post(notification: .announcement, argument: [message, hintText].compactMap { $0 }.joined(separator: " "))
         case .notConfigured:
             error = String(localized: "No password is set up for this library.")
+        case .unsupported:
+            password = ""
+            error = LockCopy.updateToUnlock
         }
     }
 
@@ -96,52 +112,65 @@ final class UnlockPromptModel: ObservableObject {
 
 struct UnlockPromptView: View {
     @ObservedObject var model: UnlockPromptModel
-    @FocusState private var fieldFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             NibSheetHeader(model.title, primaryTitle: model.primaryTitle, isPrimaryEnabled: model.canSubmit,
                            onCancel: { model.cancel() }, onPrimary: { Task { await model.submit() } })
             ScrollView {
-                VStack(spacing: NibSpacing.l) {
-                    Image(nib: model.request.purpose == .open ? .lock : .unlock)
-                        .font(NibFont.glyph(.panel, size: NibMetrics.hitTarget))
-                        .foregroundStyle(NibColor.labelTertiary)
-                        .accessibilityHidden(true)
-                    VStack(spacing: NibSpacing.s) {
-                        Text(model.request.documentTitle)
-                            .font(NibFont.emptyTitle)
-                            .foregroundStyle(NibColor.label)
-                            .multilineTextAlignment(.center)
-                            .accessibilityAddTraits(.isHeader)
-                        Text(model.message)
-                            .font(NibFont.callout)
-                            .foregroundStyle(NibColor.labelSecondary)
-                            .multilineTextAlignment(.center)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    NibSecureField(text: $model.password, prompt: String(localized: "Password")) {
-                        Task { await model.submit() }
-                    }
-                    .focused($fieldFocused)
-                    .disabled(model.isChecking)
-                    feedback
-                    if let kind = model.request.biometry {
-                        NibButton(String(localized: "Use \(kind.name)"), symbol: kind.symbol, kind: .secondary) {
-                            Task { await model.useBiometrics() }
-                        }
-                        .disabled(model.isChecking)
-                    }
-                }
-                .frame(maxWidth: NibMetrics.onboardingCardWidth)
-                .padding(.horizontal, NibSpacing.xxl)
-                .padding(.vertical, NibSpacing.xl)
-                .frame(maxWidth: .infinity)
+                UnlockPromptContent(model: model)
             }
         }
         .background(NibColor.backgroundSecondary.ignoresSafeArea())
-        .onAppear { fieldFocused = true }
         .onDisappear { model.cancel() }
+    }
+}
+
+/// The prompt below its header: glyph, title, message, the password, feedback and the Face ID button, one card wide.
+struct UnlockPromptContent: View {
+    /// The width the prompt's content keeps to (its snapshots check that it still lays out there at AX3).
+    static var cardWidth: CGFloat { NibMetrics.onboardingCardWidth }
+
+    @ObservedObject var model: UnlockPromptModel
+    @FocusState private var fieldFocused: Bool
+
+    var body: some View {
+        VStack(spacing: NibSpacing.l) {
+            Image(nib: model.symbol)
+                .font(NibFont.glyph(.panel, size: NibMetrics.hitTarget))
+                .foregroundStyle(NibColor.labelTertiary)
+                .accessibilityHidden(true)
+            VStack(spacing: NibSpacing.s) {
+                Text(model.request.documentTitle)
+                    .font(NibFont.emptyTitle)
+                    .foregroundStyle(NibColor.label)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.isHeader)
+                Text(model.message)
+                    .font(NibFont.callout)
+                    .foregroundStyle(NibColor.labelSecondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            NibSecureField(text: $model.password, prompt: String(localized: "Password")) {
+                Task { await model.submit() }
+            }
+            .focused($fieldFocused)
+            .disabled(model.isChecking)
+            feedback
+            if let kind = model.request.biometry {
+                NibButton(String(localized: "Use \(kind.name)"), symbol: kind.symbol, kind: .secondary) {
+                    Task { await model.useBiometrics() }
+                }
+                .disabled(model.isChecking)
+            }
+        }
+        .frame(maxWidth: UnlockPromptContent.cardWidth)
+        .padding(.horizontal, NibSpacing.xxl)
+        .padding(.vertical, NibSpacing.xl)
+        .frame(maxWidth: .infinity)
+        .onAppear { fieldFocused = true }
     }
 
     @ViewBuilder
@@ -219,12 +248,12 @@ final class LockedCoverModel: ObservableObject {
     private weak var navigator: SceneNavigator?
     private var cancellable: AnyCancellable?
 
-    init(app: NibApp, service: LockServiceImpl, doc: DocumentID, navigator: SceneNavigator) {
+    init(app: NibApp, service: LockServiceImpl, doc: DocumentID, navigator: SceneNavigator, paper: LockPaper? = nil) {
         self.app = app
         self.doc = doc
         self.navigator = navigator
         self.title = service.title(doc)
-        self.paper = LockPaper.of(doc, in: app)
+        self.paper = paper ?? LockPaper.of(doc, in: app)
         self.biometry = service.biometricsEnabled ? service.biometrics?.kind : nil
         // The window moved on to a document that is not locked (a tab switch): the cover goes.
         cancellable = navigator.session.$document.dropFirst().sink { [weak self, weak service] next in
@@ -267,21 +296,28 @@ struct LockedCoverView: View {
                 .ignoresSafeArea()
             VStack(spacing: 0) {
                 NibEmptyState(symbol: .lock, title: String(localized: "Locked"), message: model.title)
-                HStack(spacing: NibSpacing.m) {
-                    NibButton(model.unlockTitle, symbol: model.biometry?.symbol, kind: .primary,
-                              shortcut: .defaultAction) {
-                        Task { await model.unlock() }
-                    }
-                    NibButton(String(localized: "Close"), kind: .secondary, shortcut: .cancelAction) {
-                        model.close()
-                    }
+                // Side by side while they fit; stacked at large text sizes and in narrow windows.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: NibSpacing.m) { buttons }
+                    VStack(spacing: NibSpacing.m) { buttons }
                 }
+                .padding(.horizontal, NibSpacing.l)
                 .disabled(model.isUnlocking)
             }
         }
         .environment(\.colorScheme, model.paper.isDark ? .dark : .light)
         .accessibilityElement(children: .contain)
         .accessibilityAddTraits(.isModal)
+    }
+
+    @ViewBuilder
+    private var buttons: some View {
+        NibButton(model.unlockTitle, symbol: model.biometry?.symbol, kind: .primary, shortcut: .defaultAction) {
+            Task { await model.unlock() }
+        }
+        NibButton(String(localized: "Close"), kind: .secondary, shortcut: .cancelAction) {
+            model.close()
+        }
     }
 }
 
@@ -311,16 +347,23 @@ enum LockPresentation {
         return out
     }
 
-    /// An opaque form sheet (a page sheet on iPhone) of `size` on iPad.
-    static func styleSheet(_ controller: UIViewController, size: CGSize) {
+    /// An opaque form sheet (a page sheet on iPhone) at the system's form sheet size: NibMetrics has no token for the
+    /// lock's sheets yet (contract request filed), so no size is set by hand.
+    static func styleSheet(_ controller: UIViewController) {
         controller.modalPresentationStyle = .formSheet
-        controller.preferredContentSize = size
         controller.view.backgroundColor = NibUIColor.backgroundSecondary
         if #available(iOS 26, *) {
             // The system's own sheet radius on iOS 26.
         } else {
             controller.sheetPresentationController?.preferredCornerRadius = NibRadius.sheet
         }
+    }
+
+    /// The locked document a window shows: its session's document when it is locked for this session. The navigator's
+    /// `activeDocument` is not used: the shell keeps it after Back to the library, where there is nothing to cover.
+    static func lockedDocument(shownBy navigator: SceneNavigator, service: LockServiceImpl) -> DocumentID? {
+        guard let doc = navigator.session.document, service.isLocked(doc) else { return nil }
+        return doc
     }
 
     /// Presents `controller`; `refused` runs when UIKit did not show it (the host left the window meanwhile).
@@ -370,7 +413,7 @@ final class LockUIPresenter: LockPresenting {
         guard let host = host else { return .cancelled }
         let model = UnlockPromptModel(request: request)
         let controller = UIHostingController(rootView: AnyView(UnlockPromptView(model: model)))
-        LockPresentation.styleSheet(controller, size: CGSize(width: NibMetrics.onboardingCardWidth, height: 460))
+        LockPresentation.styleSheet(controller)
         return await withCheckedContinuation { continuation in
             model.onFinish = { [weak controller] outcome in
                 LockPresentation.dismiss(controller) { continuation.resume(returning: outcome) }
@@ -383,8 +426,7 @@ final class LockUIPresenter: LockPresenting {
         guard let host = host else { return nil }
         let model = PasswordSetupModel(request: request)
         let controller = UIHostingController(rootView: AnyView(PasswordSetupView(model: model)))
-        LockPresentation.styleSheet(controller, size: CGSize(width: NibMetrics.onboardingCardWidth + NibSpacing.x6,
-                                                             height: 640))
+        LockPresentation.styleSheet(controller)
         return await withCheckedContinuation { continuation in
             model.onFinish = { [weak controller] result in
                 LockPresentation.dismiss(controller) { continuation.resume(returning: result) }
@@ -397,7 +439,7 @@ final class LockUIPresenter: LockPresenting {
         guard let app = app, let service = service else { return }
         covers = covers.filter { $0.value.controller != nil }
         for navigator in LockPresentation.navigators(app) {
-            guard let doc = navigator.activeDocument, service.isLocked(doc) else { continue }
+            guard let doc = LockPresentation.lockedDocument(shownBy: navigator, service: service) else { continue }
             let key = ObjectIdentifier(navigator)
             if let existing = covers[key], existing.controller != nil {
                 if existing.doc == doc { continue }

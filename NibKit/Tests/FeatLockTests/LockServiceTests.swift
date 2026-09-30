@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 import NibContracts
 import NibTesting
 @testable import FeatLock
@@ -42,6 +43,33 @@ final class ScriptedLockPresenter: LockPresenting {
 
     func coverLockedWindows() { coverCalls += 1 }
     func uncover(_ doc: DocumentID) { uncovered.append(doc) }
+}
+
+/// A window: its own session (what it shows now) and the shell's tab bookkeeping, which outlives Back to the library.
+@MainActor
+final class FakeNavigator: SceneNavigator {
+    let session = EditorSession()
+    var openDocuments: [DocumentID] = []
+    var activeDocument: DocumentID?
+    var rootViewController: UIViewController? { nil }
+    private(set) var libraryShown = 0
+
+    /// Shows `doc` like the shell: a tab, the active document and the session's document.
+    func show(_ doc: DocumentID) {
+        if !openDocuments.contains(doc) { openDocuments.append(doc) }
+        activeDocument = doc
+        session.document = doc
+    }
+
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) { show(doc) }
+    func closeDocument(_ doc: DocumentID) { openDocuments.removeAll { $0 == doc } }
+    /// Like `ShellViewController.showLibrary`: only the session forgets the document.
+    func showLibrary(folder: FolderID?) {
+        session.document = nil
+        libraryShown += 1
+    }
+    func showSettings(page: String?) {}
+    func presentModal(_ viewController: UIViewController) {}
 }
 
 @MainActor
@@ -187,6 +215,27 @@ final class LockVerifierTests: XCTestCase {
         v.iterations = LockVerifier.maximumIterations + 1
         let tooManyRounds = await v.matches("abcd")
         XCTAssertFalse(tooManyRounds, "a synced verifier cannot make the device hash for ever")
+    }
+
+    func testVerifierKeyMaterialIsBounded() async throws {
+        let v = try await LockVerifier.make(password: "abcd", hint: "", iterations: 500)
+        XCTAssertTrue(v.isUsable)
+        var huge = v
+        huge.hash = Data(repeating: 7, count: 1_000_000)
+        XCTAssertFalse(huge.isUsable, "a crafted verifier cannot ask for a megabyte of derived key")
+        let hugeMatches = await huge.matches("abcd")
+        XCTAssertFalse(hugeMatches)
+        var edges = v
+        edges.hash = Data(repeating: 1, count: 64)
+        edges.salt = Data(repeating: 1, count: 8)
+        XCTAssertTrue(edges.isUsable)
+        edges.hash = Data(repeating: 1, count: 15)
+        XCTAssertFalse(edges.isUsable)
+        edges.hash = Data(repeating: 1, count: 32)
+        edges.salt = Data(repeating: 1, count: 65)
+        XCTAssertFalse(edges.isUsable)
+        edges.salt = Data(repeating: 1, count: 7)
+        XCTAssertFalse(edges.isUsable)
     }
 
     func testConstantTimeComparison() {
@@ -391,23 +440,261 @@ final class LockServiceTests: XCTestCase {
         XCTAssertEqual(s.service.lockedDocuments(), [doc])
     }
 
-    func testLockedWithoutAPasswordAsksTheUserToSetOneUp() async throws {
+    func testLockedWithoutThePasswordFailsClosedUntilAReplacementIsConfirmed() async throws {
         let s = try await LockTesting.make(configured: false)
         let doc = Fixtures.textDocID
         s.presenter.setupResult = PasswordSetupResult(action: .create(password: "fresh one"), hint: "", biometrics: false)
         let locked = try await s.harness.run("doc.setLocked", ["doc": "doc:FIXTUREDOC02", "locked": true])
         XCTAssertEqual(locked["changed"]?.boolValue, true, "locking without a password set one up first")
         XCTAssertEqual(s.presenter.setupRequests.count, 1)
-        // Now the lock arrives without the library's password (prefs lost, or not synced to this device yet).
+        XCTAssertFalse(s.presenter.setupRequests[0].replacesMissingPassword, "nothing was locked yet")
+        // Now the lock arrives without the library's password (not synced to this device yet, or prefs lost).
         s.harness.app.settings.set(LockSettings.verifier, nil)
+        XCTAssertFalse(s.service.isConfigured)
         XCTAssertTrue(s.service.isLocked(doc), "still locked: no password never means open")
 
         let byAssistant = await s.service.unlock(doc, purpose: .open, requester: .ai("chat"))
         XCTAssertFalse(byAssistant, "only the person at the device may set a password up")
+        XCTAssertEqual(s.presenter.setupRequests.count, 1)
+
+        // The sheet says it is waiting for the password to sync; a new one needs the explicit confirmation.
+        let unconfirmed = await s.service.unlock(doc)
+        XCTAssertFalse(unconfirmed, "saving without confirming the replacement opens nothing")
+        XCTAssertFalse(s.service.isConfigured)
+        let request = try XCTUnwrap(s.presenter.setupRequests.last)
+        XCTAssertEqual(request.mode, .create)
+        XCTAssertTrue(request.replacesMissingPassword)
+        XCTAssertEqual(request.lockedDocuments, 1)
+        XCTAssertNotNil(request.reason, "the sheet says why it appeared")
+        XCTAssertTrue(s.service.isLocked(doc))
+
+        s.presenter.setupResult = PasswordSetupResult(action: .create(password: "fresh one"), hint: "", biometrics: false,
+                                                      confirmedReplacement: true)
         let byUser = await s.service.unlock(doc)
         XCTAssertTrue(byUser)
         XCTAssertTrue(s.service.isConfigured)
-        XCTAssertEqual(s.presenter.setupRequests.last?.mode, .create)
-        XCTAssertNotNil(s.presenter.setupRequests.last?.reason, "the sheet says why it appeared")
+    }
+
+    func testAPasswordFromANewerNibSaysUpdateInsteadOfCountingWrongEntries() async throws {
+        let s = try await LockTesting.make(configured: false)
+        var newer = try await LockVerifier.make(password: LockTesting.password, hint: LockTesting.hint,
+                                                iterations: LockTesting.rounds)
+        newer.algorithm = "argon2id"
+        s.harness.app.settings.set(LockSettings.verifier, newer)
+        XCTAssertTrue(s.service.isConfigured, "a password is set up, this build just cannot check it")
+        for _ in 0..<4 {
+            let result = await s.service.check(LockTesting.password)
+            XCTAssertEqual(result, .unsupported)
+        }
+        XCTAssertNil(s.service.dueHint, "not wrong entries: the hint never comes due")
+
+        // A verifier this build cannot even decode still counts as set up, so nobody can create one over it here.
+        s.harness.app.settings.setJSON(LockSettings.verifier.name, ["algorithm": "argon2id", "memory": 65_536])
+        XCTAssertNil(s.service.verifier)
+        XCTAssertTrue(s.service.isConfigured)
+        let undecodable = await s.service.check("anything")
+        XCTAssertEqual(undecodable, .unsupported)
+        XCTAssertEqual(s.service.makeSetupRequest().mode, .change)
+        s.presenter.setupResult = PasswordSetupResult(action: .create(password: "fresh one"), hint: "", biometrics: false)
+        let created = await LockTesting.code { try await s.harness.run("lock.setup") }
+        XCTAssertEqual(created, .conflict)
+
+        let prompt = UnlockPromptModel(request: UnlockRequest(
+            doc: Fixtures.docID, documentTitle: "Kinematics", purpose: .open, requester: .user, biometry: nil, hint: nil,
+            check: { _ in .unsupported }, biometric: { false }))
+        prompt.password = "whatever"
+        await prompt.submit()
+        XCTAssertEqual(prompt.error, LockCopy.updateToUnlock)
+        XCTAssertNil(prompt.hintText)
+    }
+
+    // MARK: Face ID and the verifier through settings.set
+
+    func testTurningOnFaceIDAsksForThePassword() async throws {
+        let s = try await LockTesting.make()
+        let biometrics = FakeBiometrics()
+        s.service.biometrics = biometrics
+        let settings = s.harness.app.settings
+        let on: JSONValue = ["name": .string(LockSettings.biometrics.name), "value": true]
+
+        s.presenter.passwords = ["wrong"]
+        let denied = await LockTesting.code { try await s.harness.run("settings.set", on) }
+        XCTAssertEqual(denied, .userDenied)
+        XCTAssertFalse(settings.get(LockSettings.biometrics), "a face or finger alone never turns it on")
+        let request = try XCTUnwrap(s.presenter.unlockRequests.last)
+        if case .verify = request.purpose {} else { XCTFail("the password prompt proves the password: \(request.purpose)") }
+        XCTAssertNil(request.biometry, "the prompt offers no Face ID button")
+        XCTAssertTrue(biometrics.reasons.isEmpty)
+
+        s.presenter.passwords = [LockTesting.password]
+        _ = try await s.harness.run("settings.set", on)
+        XCTAssertTrue(settings.get(LockSettings.biometrics))
+
+        let prompts = s.presenter.unlockRequests.count
+        _ = try await s.harness.run("settings.set", ["name": .string(LockSettings.biometrics.name), "value": false])
+        XCTAssertFalse(settings.get(LockSettings.biometrics))
+        XCTAssertEqual(s.presenter.unlockRequests.count, prompts, "turning it off needs nothing")
+    }
+
+    func testFaceIDNeedsAPasswordFirst() async throws {
+        let s = try await LockTesting.make(configured: false)
+        s.service.biometrics = FakeBiometrics()
+        let code = await LockTesting.code {
+            try await s.harness.run("settings.set", ["name": .string(LockSettings.biometrics.name), "value": true])
+        }
+        XCTAssertEqual(code, .unavailable)
+        XCTAssertFalse(s.harness.app.settings.get(LockSettings.biometrics))
+    }
+
+    func testTheVerifierChangesThroughSettingsOnlyWithThePassword() async throws {
+        let s = try await LockTesting.make()
+        let settings = s.harness.app.settings
+        let original = try XCTUnwrap(settings.get(LockSettings.verifier))
+        let other = try await LockVerifier.make(password: "someone else", hint: "", iterations: LockTesting.rounds)
+        let replace: JSONValue = ["name": .string(LockSettings.verifier.name), "value": try JSONValue.from(other)]
+
+        s.presenter.passwords = ["guess"]
+        let denied = await LockTesting.code { try await s.harness.run("settings.set", replace) }
+        XCTAssertEqual(denied, .userDenied)
+        XCTAssertEqual(settings.get(LockSettings.verifier)?.hash, original.hash)
+
+        try await LockTesting.lock(Fixtures.textDocID, in: s)
+        let off = await LockTesting.code {
+            try await s.harness.run("settings.set", ["name": .string(LockSettings.verifier.name), "value": .null])
+        }
+        XCTAssertEqual(off, .conflict, "not while a document carries a lock")
+        XCTAssertEqual(settings.get(LockSettings.verifier)?.hash, original.hash)
+
+        s.presenter.passwords = [LockTesting.password]
+        _ = try await s.harness.run("settings.set", replace)
+        XCTAssertEqual(settings.get(LockSettings.verifier)?.hash, other.hash)
+    }
+
+    // MARK: Undo, redo and revert never take a lock off for others
+
+    func testAssistantCannotUndoTheLockAway() async throws {
+        let s = try await LockTesting.make()
+        let h = s.harness
+        await FeatLockFeature.start(h.app)
+        let doc = Fixtures.docID
+        XCTAssertEqual(h.session.document, doc)
+        _ = try await h.run("doc.setLocked", ["locked": true])
+        XCTAssertFalse(s.service.isLocked(doc), "the user locked the document in front of them")
+        XCTAssertFalse(h.app.gateway.isLocked(doc))
+
+        for principal in [Principal.ai("chat"), .bridge("laptop")] {
+            let undo = await LockTesting.code { try await h.run("edit.undo", ["doc": "doc:FIXTUREDOC01"], as: principal) }
+            XCTAssertEqual(undo, .permissionDenied, "\(principal)")
+            let group = try XCTUnwrap(h.app.bus.history.entries(doc).last?.group)
+            let revert = await LockTesting.code {
+                try await h.run("history.revertGroup", ["doc": "doc:FIXTUREDOC01", "group": .string(group)], as: principal)
+            }
+            XCTAssertEqual(revert, .permissionDenied, "\(principal)")
+            XCTAssertTrue(try h.app.workspace.content(doc).meta.locked)
+        }
+
+        // The user may undo it, and the assistant may redo the lock back on.
+        _ = try await h.run("edit.undo", ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertFalse(try h.app.workspace.content(doc).meta.locked)
+        _ = try await h.run("edit.redo", ["doc": "doc:FIXTUREDOC01"], as: .ai("chat"))
+        XCTAssertTrue(try h.app.workspace.content(doc).meta.locked)
+
+        // Remove the lock with the password, undo that (the lock is back): a redo from others would take it off again.
+        s.presenter.passwords = [LockTesting.password]
+        _ = try await h.run("doc.setLocked", ["doc": "doc:FIXTUREDOC01", "locked": false])
+        XCTAssertFalse(try h.app.workspace.content(doc).meta.locked)
+        _ = try await h.run("edit.undo", ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertTrue(try h.app.workspace.content(doc).meta.locked)
+        let redo = await LockTesting.code { try await h.run("edit.redo", ["doc": "doc:FIXTUREDOC01"], as: .ai("chat")) }
+        XCTAssertEqual(redo, .permissionDenied)
+        XCTAssertTrue(try h.app.workspace.content(doc).meta.locked)
+        _ = try await h.run("edit.redo", ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertFalse(try h.app.workspace.content(doc).meta.locked, "the user's own redo is theirs to make")
+    }
+
+    // MARK: What a window shows
+
+    func testOnlyTheWindowsSessionCountsAsShowingADocument() async throws {
+        let s = try await LockTesting.make()
+        let h = s.harness
+        let doc = Fixtures.docID
+        let window = FakeNavigator()
+        window.show(doc)
+        window.showLibrary(folder: nil)
+        XCTAssertEqual(window.activeDocument, doc, "the shell keeps its tab bookkeeping after Back")
+        XCTAssertEqual(window.openDocuments, [doc])
+        h.session.document = nil
+        h.app.ui.activeNavigator = window
+
+        _ = try await h.run("doc.setLocked", ["doc": "doc:FIXTUREDOC01", "locked": true])
+        XCTAssertTrue(s.service.isLocked(doc), "a document left for the library locks at once")
+        XCTAssertNil(LockPresentation.lockedDocument(shownBy: window, service: s.service), "a library window gets no cover")
+        XCTAssertEqual(s.presenter.coverCalls, 0)
+
+        window.show(doc)
+        XCTAssertEqual(LockPresentation.lockedDocument(shownBy: window, service: s.service), doc)
+        s.presenter.passwords = [LockTesting.password]
+        _ = await s.service.unlock(doc)
+        XCTAssertNil(LockPresentation.lockedDocument(shownBy: window, service: s.service))
+    }
+
+    func testALockFromElsewhereCoversTheDocumentOnScreen() async throws {
+        let s = try await LockTesting.make()
+        let h = s.harness
+        await FeatLockFeature.start(h.app)
+        let doc = Fixtures.docID
+        XCTAssertEqual(h.session.document, doc)
+
+        // The assistant locks the document the user is looking at: it locks now and the window is covered.
+        _ = try await h.run("doc.setLocked", ["doc": "doc:FIXTUREDOC01", "locked": true], as: .ai("chat"))
+        XCTAssertTrue(s.service.isLocked(doc))
+        XCTAssertEqual(s.presenter.coverCalls, 1)
+
+        // Another device locks a document this window shows (a remote merge).
+        h.session.document = Fixtures.whiteboardID
+        _ = try h.app.workspace.content(Fixtures.whiteboardID)
+        var meta = try h.app.workspace.content(Fixtures.whiteboardID).meta
+        meta.locked = true
+        meta.rev = Rev(wallMs: UInt64(Date().timeIntervalSince1970 * 1000) + 1_000, counter: 0, device: 99)
+        h.app.bus.applyRemote(DocumentPatch(doc: Fixtures.whiteboardID, meta: meta), origin: "test")
+        XCTAssertTrue(s.service.isLocked(Fixtures.whiteboardID))
+        XCTAssertEqual(s.presenter.coverCalls, 2)
+
+        // The user's own lock of the document in front of them keeps it open: no cover.
+        h.session.document = Fixtures.textDocID
+        _ = try await h.run("doc.setLocked", ["doc": "doc:FIXTUREDOC02", "locked": true])
+        XCTAssertFalse(s.service.isLocked(Fixtures.textDocID))
+        XCTAssertEqual(s.presenter.coverCalls, 2)
+    }
+
+    // MARK: Calls that name no document
+
+    func testCallsThatNameNoDocumentNeverReachTheLockedWindowDocument() async throws {
+        let s = try await LockTesting.make()
+        let h = s.harness
+        await FeatLockFeature.start(h.app)
+        XCTAssertTrue(h.app.bus.hooks.all.contains { $0.id == LockIDs.sessionGuard })
+        let doc = Fixtures.docID
+        _ = try await h.run("doc.setLocked", ["locked": true])
+        s.service.relockAll()
+        XCTAssertTrue(s.service.isLocked(doc), "the relock covered the window; its session still has the document")
+
+        let byAssistant = await LockTesting.code { try await h.run("history.list", [:], as: .ai("chat")) }
+        XCTAssertEqual(byAssistant, .locked)
+        let bridge = await LockTesting.code {
+            _ = try await h.app.bus.execute(Invocation(command: "history.list", params: [:], principal: .bridge("laptop")))
+        }
+        XCTAssertEqual(bridge, .locked, "the bridge's calls fall back to the active window")
+        let named = await LockTesting.code {
+            try await h.run("history.list", ["doc": "doc:FIXTUREDOC02"], as: .ai("chat"))
+        }
+        XCTAssertNil(named, "a call that names another document is the gateway's to judge")
+        let commandsList = await LockTesting.code { try await h.run("commands.list", [:], as: .ai("chat")) }
+        XCTAssertNil(commandsList, "app commands are not about the window's document")
+
+        s.presenter.passwords = [LockTesting.password]
+        _ = await s.service.unlock(doc)
+        let afterUnlock = await LockTesting.code { try await h.run("history.list", [:], as: .ai("chat")) }
+        XCTAssertNotEqual(afterUnlock, .locked)
     }
 }

@@ -1,9 +1,15 @@
 import Foundation
+import UIKit
 import NibContracts
 
 // The three commands F071 owns (ARCHITECTURE.md §6.5): `lock.setup {}`, `doc.setLocked {doc, locked}` and
-// `doc.unlock {doc}`, plus the guard hook that lets the assistant, plugins and the bridge ASK the person at the device
-// to unlock a document (the gateway refuses every other call that names a locked document).
+// `doc.unlock {doc}`, plus the guard hooks around them:
+// - `lock.unlockGuard` lets the assistant, plugins and the bridge ASK the person at the device to unlock a document (the
+//   gateway refuses every other call that names a locked document);
+// - `lock.settingsGuard` asks for the password before `settings.set` turns on Face ID or replaces the verifier;
+// - `lock.undoGuard` keeps `edit.undo` / `edit.redo` / `history.revertGroup` from taking a lock off for anyone but the
+//   user (`meta.locked` changes only through `doc.setLocked`);
+// - `lock.sessionGuard` refuses calls that name no document but act on the window's document while it is locked.
 
 @MainActor
 enum LockCommandSupport {
@@ -57,6 +63,94 @@ enum LockCommandSupport {
             return nil
         }
     }
+
+    /// `settings.set` is the other way to reach the lock's settings (the settings page's Face ID switch, the command
+    /// bar). Turning on Face ID lets anyone whose face or finger this device knows open every locked document, and a
+    /// new verifier replaces the password, so both ask for the current password first (never biometrics). Turning
+    /// Face ID off needs nothing. Other principals never get here: `settings.set` refuses them `security.*`.
+    static func settingsGuard(_ service: LockServiceImpl) -> CommandHookDescriptor {
+        CommandHookDescriptor.guarding(id: LockIDs.settingsGuard, owner: FeatLockFeature.id,
+                                       commands: [CommandIDs.settingsSet]) { [weak service] _, params, ctx in
+            guard let service = service, ctx.principal.isUser, !ctx.dryRun,
+                  let name = params["name"]?.stringValue else { return nil }
+            let value = params["value"] ?? .null
+            switch name {
+            case LockSettings.biometrics.name:
+                guard value.boolValue == true, !ctx.services.settings.get(LockSettings.biometrics) else { return nil }
+                guard service.isConfigured else {
+                    throw NibError(.unavailable, "no lock password is set up",
+                                   hint: "set one up first (lock.setup, Settings › General › Password Protection)")
+                }
+                guard service.presenter != nil else { throw noWindow("Turning on Face ID") }
+                let kind = (service.biometrics?.kind ?? .faceID).name
+                guard await service.verifyPassword(
+                    action: String(localized: "Turn On \(kind)"),
+                    message: String(localized: "Enter the password to open locked documents with \(kind) on this \(UIDevice.current.localizedModel).")) else {
+                    throw NibError(.userDenied, "the password was not entered; \(kind) stays off")
+                }
+            case LockSettings.verifier.name:
+                let locked = service.lockedDocuments().count
+                if value == .null && locked > 0 {
+                    throw NibError(.conflict, "\(locked) document(s) still have a lock",
+                                   hint: "remove their locks first (doc.setLocked {locked: false})")
+                }
+                if service.isConfigured {
+                    guard service.presenter != nil else { throw noWindow("Changing the password") }
+                    guard await service.verifyPassword(
+                        action: String(localized: "Change Password"),
+                        message: String(localized: "Enter the current password to change the library's password.")) else {
+                        throw NibError(.userDenied, "the current password was not entered; the password is unchanged")
+                    }
+                } else if locked > 0 {
+                    throw NibError(.conflict, "documents are locked with a password that has not synced to this device yet",
+                                   hint: "wait for it to sync, or replace it in lock.setup")
+                }
+            default:
+                return nil
+            }
+            return nil
+        }
+    }
+
+    /// Undo, redo and selective revert may write `meta.locked` back. For the assistant, a plugin or the bridge, a step
+    /// that would take a lock off is refused: the lock the user just added to the document in front of them keeps it
+    /// unlocked for the session, so the gateway alone would let `edit.undo` remove it without the password.
+    static func undoGuard(_ service: LockServiceImpl) -> CommandHookDescriptor {
+        CommandHookDescriptor.guarding(id: LockIDs.undoGuard, owner: FeatLockFeature.id,
+                                       commands: [CommandIDs.undo, CommandIDs.redo, CommandIDs.revertGroup]) {
+            [weak service] command, params, ctx in
+            guard let service = service, !ctx.principal.isUser else { return nil }
+            if case .sync = ctx.principal { return nil }
+            guard let doc = try? ctx.documentOrSession(params["doc"]?.stringValue) else { return nil }
+            // A document still locked for this session is refused by the gateway (`locked`) before anything runs.
+            if service.isLocked(doc) && Gateway.referencedDocuments(params).contains(doc) { return nil }
+            guard service.historyStepRemovesLock(command: command, doc: doc, group: params["group"]?.stringValue,
+                                                 history: ctx.bus.history) else { return nil }
+            throw NibError(.permissionDenied, "this step would remove a document's lock",
+                           hint: "the user removes locks with doc.setLocked")
+        }
+    }
+
+    /// Calls that name no document but act on the window's (`CommandContext.activeSession`; the bridge's nil session
+    /// means the active window) never reach a document that is locked for this session, e.g. while the locked field
+    /// covers a window after a relock and an assistant turn is still running. The gateway only sees refs in params.
+    /// Registered in `FeatLockFeature.start` over every command namespace registered by then.
+    static func sessionGuard(_ service: LockServiceImpl, namespaces: [String]) -> CommandHookDescriptor {
+        CommandHookDescriptor.guarding(id: LockIDs.sessionGuard, owner: FeatLockFeature.id,
+                                       commands: namespaces.map { $0 + ".*" }) { [weak service] command, params, ctx in
+            guard let service = service, !ctx.principal.isUser, !LockIDs.commands.contains(command) else { return nil }
+            if case .sync = ctx.principal { return nil }
+            guard ctx.bus.registry.descriptor(command)?.target == .document,
+                  Gateway.referencedDocuments(params).isEmpty,
+                  let doc = ctx.activeSession?.document, service.isLocked(doc) else { return nil }
+            throw NibError(.locked, "document \(doc) is locked", hint: "ask the user to unlock it first")
+        }
+    }
+
+    /// The namespaces of every registered command ("page" for page.add, …), for `sessionGuard`.
+    static func namespaces(_ registry: CommandRegistry) -> [String] {
+        Set(registry.all().compactMap { $0.id.split(separator: ".").first.map(String.init) }).sorted()
+    }
 }
 
 // MARK: - lock.setup
@@ -90,8 +184,9 @@ struct LockSetup: NibCommand {
         }
         if ctx.dryRun { return state("unchanged") }
         guard let presenter = service.presenter else { throw LockCommandSupport.noWindow("Password setup") }
-        guard let result = await presenter.presentSetup(service.makeSetupRequest()) else { return state("cancelled") }
-        let outcome = try await LockStore.apply(result, service: service, settings: settings)
+        let request = service.makeSetupRequest()
+        guard let result = await presenter.presentSetup(request) else { return state("cancelled") }
+        let outcome = try await LockStore.apply(result, request: request, service: service, settings: settings)
         return state(outcome)
     }
 }
@@ -99,15 +194,23 @@ struct LockSetup: NibCommand {
 /// The only place that writes the lock's settings (from `lock.setup`, inside the command).
 @MainActor
 enum LockStore {
-    /// Stores what the sheet returned. Returns created | changed | removed | unchanged.
-    static func apply(_ result: PasswordSetupResult, service: LockServiceImpl, settings: SettingsStore) async throws -> String {
+    /// Stores what the sheet returned (`request` is what the sheet was shown with). Returns created | changed |
+    /// removed | unchanged.
+    static func apply(_ result: PasswordSetupResult, request: PasswordSetupRequest? = nil, service: LockServiceImpl,
+                      settings: SettingsStore) async throws -> String {
         let hint = result.hint.trimmingCharacters(in: .whitespacesAndNewlines)
         let current = settings.get(LockSettings.verifier)
         var outcome = "unchanged"
         switch result.action {
         case .create(let password):
-            guard current == nil else {
+            guard !service.isConfigured else {
                 throw NibError(.conflict, "a password is already set up", hint: "run lock.setup again to change it")
+            }
+            // Documents that carry a lock while no password is here: theirs has not synced yet. A new one replaces it
+            // on every device, so only after the sheet's explicit confirmation.
+            if !result.confirmedReplacement, !service.lockedDocuments().isEmpty {
+                throw NibError(.conflict, "documents are locked with a password that has not synced to this device yet",
+                               hint: "wait for it to sync, or confirm replacing it on every device")
             }
             try validate(password, hint: hint)
             let v = try await LockVerifier.make(password: password, hint: hint, iterations: service.iterations)
@@ -130,7 +233,7 @@ enum LockStore {
                 outcome = "changed"
             }
         case .remove:
-            guard current != nil else { return "unchanged" }
+            guard service.isConfigured else { return "unchanged" }
             let locked = service.lockedDocuments()
             guard locked.isEmpty else {
                 throw NibError(.conflict, "\(locked.count) document(s) still have a lock",
@@ -141,9 +244,11 @@ enum LockStore {
             service.passwordDidChange()
             return "removed"
         }
-        let biometrics = result.biometrics && service.biometrics?.kind != nil
-        if settings.get(LockSettings.biometrics) != biometrics {
-            settings.set(LockSettings.biometrics, biometrics)
+        // Only a switch the person moved changes Face ID (a lockout that makes it unavailable for a moment must not
+        // quietly turn it off).
+        let shown = request?.biometricsOn ?? settings.get(LockSettings.biometrics)
+        if result.biometrics != shown, settings.get(LockSettings.biometrics) != result.biometrics {
+            settings.set(LockSettings.biometrics, result.biometrics)
             if outcome == "unchanged" { outcome = "changed" }
         }
         if outcome != "unchanged" { service.passwordDidChange() }
@@ -156,7 +261,8 @@ enum LockStore {
         }
     }
 
-    /// Face ID for this device from the settings page (`settings.set` as the user, so it stays a command).
+    /// Face ID for this device from the settings page (`settings.set` as the user, so it stays a command; turning it
+    /// on asks for the password in `LockCommandSupport.settingsGuard`).
     static func setBiometrics(_ on: Bool, app: NibApp) async throws {
         _ = try await app.bus.execute(Invocation(command: CommandIDs.settingsSet,
                                                  params: ["name": .string(LockSettings.biometrics.name), "value": .bool(on)],
@@ -188,6 +294,10 @@ struct DocSetLocked: NibCommand {
                      required: ["doc", "locked"]),
         examples: [["doc": "doc:FIXTUREDOC01", "locked": true]],
         effect: .edit, userPresence: true)
+
+    /// The undo step's names (the undo guard recognises "Remove Lock" on the redo stack).
+    static var lockTitle: String { String(localized: "Lock Document") }
+    static var removeTitle: String { String(localized: "Remove Lock") }
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let doc = try ctx.documentOrSession(p.doc)
@@ -223,8 +333,7 @@ struct DocSetLocked: NibCommand {
                 keepUnlocked = true
             }
         }
-        let title = p.locked ? String(localized: "Lock Document") : String(localized: "Remove Lock")
-        try ctx.mutate(title) { tx in
+        try ctx.mutate(p.locked ? lockTitle : removeTitle) { tx in
             var m = try tx.content(doc).meta
             m.locked = p.locked
             try tx.putMeta(m)

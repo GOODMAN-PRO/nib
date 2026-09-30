@@ -95,10 +95,16 @@ struct LockVerifier: Codable, Equatable {
                             updatedAt: now.timeIntervalSince1970)
     }
 
-    /// True when the verifier is one this build can check.
+    /// Key and salt lengths a verifier may carry. `matches` derives `hash.count` bytes, so a synced verifier with a huge
+    /// hash could otherwise keep a core busy for minutes on every check.
+    static let hashLengths = 16...64
+    static let saltLengths = 8...64
+
+    /// True when the verifier is one this build can check (a newer build's algorithm, or out-of-range key material, is
+    /// not: the prompt then says to update Nib instead of counting wrong entries).
     var isUsable: Bool {
         algorithm == LockVerifier.algorithmName && (1...LockVerifier.maximumIterations).contains(iterations)
-            && !salt.isEmpty && hash.count >= 16
+            && LockVerifier.saltLengths.contains(salt.count) && LockVerifier.hashLengths.contains(hash.count)
     }
 
     /// Checks a password (off the main actor). An unusable verifier accepts nothing.
@@ -287,6 +293,9 @@ enum UnlockPurpose: Equatable {
     case open
     /// Remove its lock (`doc.setLocked {locked: false}`): always the password.
     case removeLock
+    /// Prove the password before a lock setting changes (turning on Face ID, `settings.set` of the verifier): always
+    /// the password, never biometrics. `action` is the primary button ("Turn On Face ID"), `message` the explanation.
+    case verify(action: String, message: String)
 }
 
 /// One password try, as the prompt shows it.
@@ -296,13 +305,17 @@ enum PasswordCheck: Equatable {
     case rejected(failures: Int, hint: String?)
     /// No password is set up, so there is nothing to check against.
     case notConfigured
+    /// The library's password was set by a newer Nib (or its verifier is damaged): this build cannot check it. Not a
+    /// wrong entry, so it never counts towards the hint.
+    case unsupported
 }
 
 enum UnlockOutcome: Equatable { case unlocked, cancelled }
 
 @MainActor
 struct UnlockRequest {
-    var doc: DocumentID
+    /// The document to open or unlock; nil for `.verify`.
+    var doc: DocumentID?
     var documentTitle: String
     var purpose: UnlockPurpose
     /// Who asked: the user, or the assistant, a plugin or a bridge client (the prompt says so).
@@ -329,6 +342,10 @@ struct PasswordSetupRequest {
     var lockedDocuments: Int
     /// Checks the current password (change mode).
     var check: @MainActor (String) async -> PasswordCheck
+
+    /// Create mode while documents already carry a lock: their password has not synced to this device yet. Setting a
+    /// new one replaces the library's password on every device, so the sheet asks for an explicit confirmation.
+    var replacesMissingPassword: Bool { mode == .create && lockedDocuments > 0 }
 }
 
 struct PasswordSetupResult: Equatable {
@@ -342,6 +359,9 @@ struct PasswordSetupResult: Equatable {
     var action: Action
     var hint: String
     var biometrics: Bool
+    /// The person confirmed that the new password replaces a library password that has not synced yet
+    /// (`PasswordSetupRequest.replacesMissingPassword`); `lock.setup` refuses such a create without it.
+    var confirmedReplacement = false
 }
 
 /// The screens the lock shows. `LockUIPresenter` (UnlockPrompt.swift) in the app; a scripted fake in tests; nil in
@@ -363,7 +383,9 @@ protocol LockPresenting: AnyObject {
 @MainActor
 final class LockServiceImpl: LockService {
     static let serviceKey = "lock.service"
-    /// `lock.changed` {docs, locked, reason: unlock | relock}: the session lock state changed (not a document write).
+    /// `lock.changed` {docs, locked, reason}: which documents are locked changed. reason = unlock | relock | background |
+    /// deviceLocked (this session's unlocks) or lockAdded | lockRemoved (a document's `meta.locked` flipped: a command,
+    /// an undo or a remote merge). `locked` is whether the documents are locked for this session now.
     static let changedEvent = "lock.changed"
 
     private weak var app: NibApp?
@@ -385,6 +407,9 @@ final class LockServiceImpl: LockService {
     /// Set by `doc.setLocked` / the open gate before they run `lock.setup`, so the sheet says why it appeared.
     var pendingSetupReason: String?
     private var inFlight: [String: Task<Bool, Never>] = [:]
+    /// Undo groups whose undo put a document's lock back (from observed undo commits). While the document can redo, a
+    /// redo may remove the lock again, so `edit.redo` from the assistant, a plugin or the bridge is refused (LockCommands).
+    private var relockedByUndo: [DocumentID: Set<String>] = [:]
     private var backgroundRelock: Task<Void, Never>?
     private var commitSubscription: EventSubscription?
     private var eventSubscription: EventSubscription?
@@ -422,7 +447,14 @@ final class LockServiceImpl: LockService {
     }
 
     var verifier: LockVerifier? { settings.get(LockSettings.verifier) }
-    var isConfigured: Bool { verifier != nil }
+
+    /// A password is set up: a verifier is stored, even one this build cannot read (a newer Nib's), so nobody can set
+    /// a new password over it from here.
+    var isConfigured: Bool {
+        if verifier != nil { return true }
+        guard let raw = settings.json(LockSettings.verifier.name) else { return false }
+        return raw != .null
+    }
 
     /// Face ID / Touch ID is on for this device and usable now.
     var biometricsEnabled: Bool {
@@ -452,18 +484,21 @@ final class LockServiceImpl: LockService {
         app?.services.library?.node(doc)?.title ?? String(localized: "this document")
     }
 
-    /// True when a window shows `doc` (locking it there keeps it open for this session).
+    /// True when a window shows `doc` now: its session's document (locking it there keeps it open for this session).
+    /// A window's navigator keeps `activeDocument` and its tabs after Back to the library, so they do not count; a
+    /// background tab locks at once and meets the open gate when it is switched to.
     func isOpenInWindow(_ doc: DocumentID) -> Bool {
         guard let app = app else { return false }
-        if app.services.sessions.sessions.contains(where: { $0.document == doc }) { return true }
-        return app.ui.activeNavigator?.openDocuments.contains(doc) ?? false
+        return app.services.sessions.sessions.contains { $0.document == doc }
     }
 
     // MARK: Password checks
 
-    /// Checks one password try against the library's verifier and counts wrong entries (hint from the third).
+    /// Checks one password try against the library's verifier and counts wrong entries (hint from the third). A
+    /// verifier this build cannot check answers `.unsupported` without counting.
     func check(_ password: String) async -> PasswordCheck {
-        guard let v = verifier else { return .notConfigured }
+        guard let v = verifier else { return isConfigured ? .unsupported : .notConfigured }
+        guard v.isUsable else { return .unsupported }
         if await v.matches(password) {
             attempts.reset()
             return .accepted
@@ -504,8 +539,9 @@ final class LockServiceImpl: LockService {
     private func prompt(_ doc: DocumentID, purpose: UnlockPurpose, requester: Principal) async -> Bool {
         let name = title(doc)
         guard isConfigured else {
-            // A lock without a password (the library's prefs were lost, or have not synced yet): the person at the
-            // device may set one up; creating it proves they are here, so the document opens.
+            // A lock without a password: the library's password has not synced to this device yet (or its prefs were
+            // lost). Fail closed: nothing opens. Only the person at the device may set a new password, and the sheet
+            // asks them to confirm that it replaces the library's password on every device.
             guard requester.isUser, await setUpPasswordToUnlock(doc, title: name) else { return false }
             if purpose == .open { markUnlocked(doc, reason: "unlock") }
             return true
@@ -534,7 +570,7 @@ final class LockServiceImpl: LockService {
     /// Runs `lock.setup` as the user with a reason; true when a password exists afterwards.
     private func setUpPasswordToUnlock(_ doc: DocumentID, title: String) async -> Bool {
         guard let app = app, presenter != nil else { return false }
-        pendingSetupReason = String(localized: "“\(title)” is locked, but this library has no password yet. If you set one on another device, wait for it to sync; otherwise set a password now to unlock it.")
+        pendingSetupReason = String(localized: "“\(title)” is locked, but this library's password hasn't reached this device yet. Wait for it to sync, or set a new password to replace it on every device.")
         defer { pendingSetupReason = nil }
         do {
             _ = try await app.bus.execute(Invocation(command: LockIDs.setup, principal: .user,
@@ -543,6 +579,27 @@ final class LockServiceImpl: LockService {
             log.error("password setup failed: \(NibError.wrap(error).description, privacy: .public)")
         }
         return isConfigured
+    }
+
+    /// Asks the person at the device for the password (never biometrics) before a lock setting changes. False when
+    /// no password is set up, nobody is there to answer, or they cancel.
+    func verifyPassword(action: String, message: String) async -> Bool {
+        guard isConfigured, let presenter = presenter else { return false }
+        let key = "#verify"
+        if let running = inFlight[key] { return await running.value }
+        let task = Task { @MainActor [weak self] () -> Bool in
+            guard let self = self else { return false }
+            let request = UnlockRequest(
+                doc: nil, documentTitle: String(localized: "Password Protection"),
+                purpose: .verify(action: action, message: message), requester: .user, biometry: nil, hint: self.dueHint,
+                check: { [weak self] password in await self?.check(password) ?? .notConfigured },
+                biometric: { false })
+            return await presenter.presentUnlock(request) == .unlocked
+        }
+        inFlight[key] = task
+        let ok = await task.value
+        inFlight[key] = nil
+        return ok
     }
 
     func markUnlocked(_ doc: DocumentID, reason: String) {
@@ -555,7 +612,8 @@ final class LockServiceImpl: LockService {
         app?.ui.setNeedsChromeUpdate()
     }
 
-    /// After `doc.setLocked`: a document shown in a window stays open for this session; any other one locks now.
+    /// After `doc.setLocked`: a document the user locks in front of them stays open for this session; any other one
+    /// locks now, and a window that shows it (the assistant, a plugin or the bridge locked it) gets the locked field.
     func didSetLocked(_ doc: DocumentID, locked: Bool, keepUnlocked: Bool) {
         flags[doc] = locked
         if locked && !keepUnlocked {
@@ -563,7 +621,15 @@ final class LockServiceImpl: LockService {
         } else {
             unlocked.insert(doc)
         }
+        lockDidChange(doc, added: locked)
+        coverIfShown(doc)
         app?.ui.setNeedsChromeUpdate()
+    }
+
+    /// Covers the windows that show `doc` when it is locked for this session (DESIGN.md §14.2).
+    func coverIfShown(_ doc: DocumentID) {
+        guard isLocked(doc), isOpenInWindow(doc) else { return }
+        presenter?.coverLockedWindows()
     }
 
     /// The password changed or was turned off: wrong-entry counting starts again.
@@ -575,7 +641,7 @@ final class LockServiceImpl: LockService {
     func makeSetupRequest() -> PasswordSetupRequest {
         let current = verifier
         return PasswordSetupRequest(
-            mode: current == nil ? .create : .change, reason: pendingSetupReason, hint: current?.hint ?? "",
+            mode: isConfigured ? .change : .create, reason: pendingSetupReason, hint: current?.hint ?? "",
             biometry: biometrics?.kind, biometricsOn: settings.get(LockSettings.biometrics),
             lockedDocuments: lockedDocuments().count,
             check: { [weak self] password in await self?.check(password) ?? .notConfigured })
@@ -647,11 +713,83 @@ final class LockServiceImpl: LockService {
             .store(in: &cancellables)
     }
 
-    /// Commits, undo and remote merges that flip `meta.locked`.
+    /// Commits, undo and remote merges that flip `meta.locked`. A document that becomes locked while a window shows it
+    /// (a remote device locked it, an undo or redo put the lock back) gets the locked field unless this session
+    /// unlocked it; `doc.setLocked` covers in `didSetLocked`, after it decided whether the document stays open.
     func observe(_ changeset: Changeset) {
+        var flipped: [DocumentID: Bool] = [:]
         for mutation in changeset.mutations {
             guard case let .meta(doc, before, after) = mutation, before.locked != after.locked else { continue }
             flags[doc] = after.locked
+            flipped[doc] = after.locked
+            if changeset.command == CommandIDs.undo, after.locked, changeset.group.hasPrefix("undo:") {
+                relockedByUndo[doc, default: []].insert(String(changeset.group.dropFirst("undo:".count)))
+            }
+        }
+        if changeset.command == CommandIDs.redo, changeset.group.hasPrefix("redo:") {
+            let group = String(changeset.group.dropFirst("redo:".count))
+            for doc in changeset.documents { relockedByUndo[doc]?.remove(group) }
+        }
+        // `doc.setLocked` reports and covers in `didSetLocked`, once it knows whether the document stays open.
+        guard !flipped.isEmpty, changeset.command != LockIDs.setLocked else { return }
+        for (doc, locked) in flipped.sorted(by: { $0.key.raw < $1.key.raw }) {
+            lockDidChange(doc, added: locked)
+            if locked { coverIfShown(doc) }
+        }
+        app?.ui.setNeedsChromeUpdate()
+    }
+
+    /// `lock.changed` for a document whose `meta.locked` flipped.
+    private func lockDidChange(_ doc: DocumentID, added: Bool) {
+        app?.events.emit(LockServiceImpl.changedEvent, doc: doc,
+                         payload: ["docs": [.string(NodeRef.document(doc).description)], "locked": .bool(isLocked(doc)),
+                                   "reason": .string(added ? "lockAdded" : "lockRemoved")])
+    }
+
+    // MARK: Undo, redo and revert (LockCommands' guard)
+
+    /// True when reverting `entry` would take `doc`'s lock off: its first write of the document's meta had no lock
+    /// and the document carries one now.
+    func revertRemovesLock(_ entry: UndoEntry, doc: DocumentID) -> Bool {
+        let first = entry.mutations.lazy.compactMap { mutation -> DocumentMeta? in
+            guard case let .meta(d, before, _) = mutation, d == doc else { return nil }
+            return before
+        }.first
+        guard let before = first, !before.locked else { return false }
+        return isFlagged(doc)
+    }
+
+    /// True when `edit.undo` / `edit.redo` / `history.revertGroup` on `doc` could remove a lock (of `doc` or, for a
+    /// group linked across documents, of another document).
+    func historyStepRemovesLock(command: String, doc: DocumentID, group: String?, history: UndoHistory) -> Bool {
+        switch command {
+        case CommandIDs.undo:
+            guard let entry = history.entries(doc).last else { return false }
+            if revertRemovesLock(entry, doc: doc) { return true }
+            guard entry.linked else { return false }
+            return lockedDocuments().contains { other in
+                other != doc && history.entries(other).last.map { $0.group == entry.group && revertRemovesLock($0, doc: other) } ?? false
+            }
+        case CommandIDs.revertGroup:
+            guard let group = group, let entry = history.entries(doc).last(where: { $0.group == group }) else { return false }
+            return revertRemovesLock(entry, doc: doc)
+        case CommandIDs.redo:
+            // Redo entries are not readable, so this errs on the safe side: the step is "Remove Lock", or an undo in
+            // this session put a lock back that a redo could take off again.
+            if history.redoLabel(doc) == DocSetLocked.removeTitle { return true }
+            func mayUnlock(_ d: DocumentID) -> Bool {
+                guard history.canRedo(d) else {
+                    relockedByUndo[d] = nil
+                    return false
+                }
+                return !(relockedByUndo[d] ?? []).isEmpty && isFlagged(d)
+            }
+            if mayUnlock(doc) { return true }
+            return Array(relockedByUndo.keys).contains { other in
+                other != doc && mayUnlock(other) && (relockedByUndo[other] ?? []).contains { history.isLinked($0) }
+            }
+        default:
+            return false
         }
     }
 
@@ -668,6 +806,11 @@ enum LockIDs {
     static let setLocked = "doc.setLocked"
     static let unlock = "doc.unlock"
     static let unlockGuard = "lock.unlockGuard"
+    static let undoGuard = "lock.undoGuard"
+    static let settingsGuard = "lock.settingsGuard"
+    static let sessionGuard = "lock.sessionGuard"
+    /// The commands this feature owns (the session guard leaves them to their own checks).
+    static let commands: Set<String> = [setup, setLocked, unlock]
     static let settingsPage = "lock.settings"
     static let menuLockLibrary = "lock.library.lock"
     static let menuUnlockLibrary = "lock.library.removeLock"

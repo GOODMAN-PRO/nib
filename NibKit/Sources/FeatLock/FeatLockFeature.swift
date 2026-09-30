@@ -39,6 +39,8 @@ public enum FeatLockFeature: NibFeature {
         app.commands.register(DocSetLocked.self)
         app.commands.register(DocUnlock.self)
         app.bus.hooks.register(LockCommandSupport.unlockGuard(service))
+        app.bus.hooks.register(LockCommandSupport.settingsGuard(service))
+        app.bus.hooks.register(LockCommandSupport.undoGuard(service))
 
         LockMenus.register(app, owner: id)
 
@@ -53,7 +55,11 @@ public enum FeatLockFeature: NibFeature {
     }
 
     public static func start(_ app: NibApp) async {
-        (app.services.lock as? LockServiceImpl)?.start()
+        guard let service = app.services.lock as? LockServiceImpl, !service.isStarted else { return }
+        service.start()
+        // Every feature has registered its commands by now, so the guard covers all of their namespaces.
+        app.bus.hooks.register(LockCommandSupport.sessionGuard(service,
+                                                               namespaces: LockCommandSupport.namespaces(app.commands)))
     }
 }
 
