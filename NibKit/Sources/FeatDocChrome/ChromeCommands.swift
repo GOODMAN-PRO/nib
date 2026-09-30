@@ -242,6 +242,9 @@ final class ChromeStateStore {
         self.app = app
     }
 
+    /// The window's state when the chrome has shown in it (nil when it never has), without creating one.
+    func existingState(for session: EditorSession) -> ChromeState? { windows[session.id] }
+
     func state(for session: EditorSession) -> ChromeState {
         if let existing = windows[session.id] { return existing }
         if let app {
@@ -360,13 +363,62 @@ enum ChromeCommandSupport {
         return (store, app)
     }
 
+    /// The calling window's session.
+    static func session(_ ctx: CommandContext) throws -> EditorSession {
+        guard let session = ctx.activeSession else { throw NibError.unavailable("an open editor window") }
+        return session
+    }
+
     /// The calling window's chrome state and the kind of the document it shows.
     static func window(_ ctx: CommandContext, _ store: ChromeStateStore) throws -> (ChromeState, DocumentKind?) {
-        guard let session = ctx.activeSession else { throw NibError.unavailable("an open editor window") }
+        let session = try session(ctx)
         guard let doc = session.document else {
             throw NibError(.unavailable, "no document is open in this window", hint: "open one with doc.open first")
         }
         return (store.state(for: session), try? ctx.workspace.content(doc).meta.kind)
+    }
+}
+
+/// Spec pass 2: in a window with no open document (the library), `panel.open` and `panel.close` hand the panel to the
+/// library with `library.setView {panel, params?}` / `{panel, close: true}` (F019), run through the command registry
+/// like any nested call. The library selects a `.libraryTab` panel in its sidebar and presents the others over itself.
+/// `unavailable` only when that command is not registered (the library feature is disabled or not built).
+@MainActor
+enum LibraryPanels {
+    static func isInstalled(_ app: NibApp) -> Bool { app.commands.entry(CommandIDs.librarySetView) != nil }
+
+    static func requireLibrary(_ app: NibApp, panel id: String) throws {
+        guard isInstalled(app) else {
+            throw NibError(.unavailable, "no document is open in this window, and the library cannot show panel '\(id)'",
+                           hint: "the library's library.setView is not installed; open a document with doc.open first")
+        }
+    }
+
+    /// `panel.open` in the library → `{id, placement}` from the library's `{panel, placement}`.
+    static func open(_ id: String, params: JSONValue?, app: NibApp, _ ctx: CommandContext) async throws -> PanelOpen.Output {
+        try requireLibrary(app, panel: id)
+        var call: [String: JSONValue] = ["panel": .string(id)]
+        if let params { call["params"] = params }
+        let result = try await ctx.execute(CommandIDs.librarySetView, .object(call))
+        return PanelOpen.Output(id: result["panel"]?.stringValue ?? id,
+                                placement: result["placement"]?.stringValue ?? placement(of: app.ui.panels.get(id)))
+    }
+
+    /// `panel.close` in the library → whether the library closed it.
+    static func close(_ id: String, app: NibApp, _ ctx: CommandContext) async throws -> Bool {
+        try requireLibrary(app, panel: id)
+        let result = try await ctx.execute(CommandIDs.librarySetView, ["panel": .string(id), "close": true])
+        return result["closed"]?.boolValue ?? false
+    }
+
+    /// Where the library shows a panel when its result does not say: its sidebar for a library tab, full screen for a
+    /// full-screen panel, else a sheet over the library (floating and sidebar panels included).
+    static func placement(of panel: PanelDescriptor?) -> String {
+        switch panel?.placement {
+        case .libraryTab?: return PanelPlacement.libraryTab.rawValue
+        case .fullScreen?: return PanelSpot.fullScreen.rawValue
+        default: return PanelSpot.sheet.rawValue
+        }
     }
 }
 
@@ -379,7 +431,7 @@ struct PanelOpen: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "panel.open", title: "Open Panel",
-        summary: "Open a registered panel by id where the user's placement settings say; params (and any other keys) reach the panel; edge docks a floating panel.",
+        summary: "Open a registered panel by id where the placement settings say; other keys and params reach the panel; edge docks a floating panel. With no document open the library shows it.",
         params: .obj(["id": .str("panel id, e.g. 'chrome.editingSettings', PanelIDs.assistant or a plugin panel id"),
                       "edge": .str("floating panels only: the side edge it rests on",
                                    choices: SidebarSide.allCases.map { $0.rawValue }),
@@ -420,6 +472,10 @@ struct PanelOpen: NibCommand {
             guard case .object = nested else { throw NibError.invalid("params must be an object", path: "$.params") }
         }
         let (store, app) = try ChromeCommandSupport.store(ctx)
+        guard try ChromeCommandSupport.session(ctx).document != nil else {
+            // The library: it presents the panel (edge only rests floating panels in a document, so it has no use there).
+            return try await LibraryPanels.open(id, params: panelParams(fields), app: app, ctx)
+        }
         let (state, kind) = try ChromeCommandSupport.window(ctx, store)
         guard let panel = app.ui.panels.get(id) else {
             let known = app.ui.panels.all.filter { $0.placement != .libraryTab && PanelResolver.accepts($0, kind: kind) }
@@ -455,12 +511,23 @@ struct PanelClose: NibCommand {
     }
     static let descriptor = CommandDescriptor(
         id: "panel.close", title: "Close Panel",
-        summary: "Close an open panel by id (closing the tab a sidebar shows hides that sidebar); closed=false if it was not open.",
+        summary: "Close an open panel by id (closing a sidebar's tab hides that sidebar); closed=false if it was not open. With no document open the library closes it.",
         params: .obj(["id": .str("panel id")], required: ["id"]),
         examples: [["id": "chrome.editingSettings"]], effect: .session, target: .app)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
-        let (store, _) = try ChromeCommandSupport.store(ctx)
+        let (store, app) = try ChromeCommandSupport.store(ctx)
+        let session = try ChromeCommandSupport.session(ctx)
+        guard session.document != nil else {
+            // The library closes what it shows. A panel the chrome keeps open for this window's next document (it is
+            // still in `session.openPanels`) closes as well, so it no longer comes back with that document.
+            let kept = store.existingState(for: session)?.close(p.id) ?? false
+            guard kept else { return Output(closed: try await LibraryPanels.close(p.id, app: app, ctx)) }
+            guard LibraryPanels.isInstalled(app) else { return Output(closed: true) }
+            // A document panel the library does not know may be refused there; the chrome closed it all the same.
+            _ = try? await LibraryPanels.close(p.id, app: app, ctx)
+            return Output(closed: true)
+        }
         let (state, _) = try ChromeCommandSupport.window(ctx, store)
         return Output(closed: state.close(p.id))
     }

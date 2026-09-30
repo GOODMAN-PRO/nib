@@ -438,6 +438,59 @@ final class FeatDocChromeTests: XCTestCase {
         await assertCode(.invalidParams) { try await h.run("panel.open", ["id": "test.thread", "params": "thread"]) }
     }
 
+    func testWithNoOpenDocumentPanelCommandsForwardToTheLibrary() async throws {
+        let h = Harness(features: [FeatDocChromeFeature.self])
+        h.app.ui.panels.register(panel("test.trash", .libraryTab))
+        h.app.ui.panels.register(panel("test.new", .sheet))
+        h.app.ui.panels.register(panel("test.pages", .sidebarTab))
+        h.app.ui.panels.register(panel("test.chat", .floating))
+        let state = try chromeState(h)
+        try await h.run("panel.open", ["id": "test.pages"])
+        h.session.document = nil   // back in the library: the chrome keeps test.pages for the next document
+
+        // Spec pass 2: without the library's library.setView (F019) there is nowhere to show a panel.
+        await assertCode(.unavailable) { try await h.run("panel.open", ["id": "test.new"]) }
+        await assertCode(.unavailable) { try await h.run("panel.close", ["id": "test.new"]) }
+
+        let log = CallLog()
+        h.app.commands.register(CommandDescriptor(
+            id: CommandIDs.librarySetView, title: "Library", summary: "test double",
+            params: .obj(["panel": .str(), "params": .obj([:]), "close": .bool()]),
+            effect: .session, target: .app)) { params, _ in
+            log.params.append(params)
+            let id = params["panel"] ?? .null
+            if params["close"] == true { return ["panel": id, "closed": .bool(id != "test.pages")] }
+            return id == "test.chat" ? ["panel": id] : ["panel": id, "placement": id == "test.trash" ? "libraryTab" : "sheet"]
+        }
+
+        // panel.open runs library.setView {panel, params} through the registry, for the AI too; the flat params rule
+        // holds, and edge (floating panels in a document only) is not passed on.
+        var r = try await h.run("panel.open", ["id": "test.trash"])
+        XCTAssertEqual(r, ["id": "test.trash", "placement": "libraryTab"])
+        r = try await h.run("panel.open", ["id": "test.new", "folder": "folder:FIXTUREFLD01",
+                                           "params": ["kind": "whiteboard"]], as: .ai("chat1"))
+        XCTAssertEqual(r, ["id": "test.new", "placement": "sheet"])
+        r = try await h.run("panel.open", ["id": "test.chat", "edge": "left"])
+        XCTAssertEqual(r, ["id": "test.chat", "placement": "sheet"], "a floating panel shows as a sheet over the library")
+        r = try await h.run("panel.close", ["id": "test.new"])
+        XCTAssertEqual(r["closed"], true)
+        XCTAssertEqual(log.params, [["panel": "test.trash"],
+                                    ["panel": "test.new", "params": ["folder": "folder:FIXTUREFLD01", "kind": "whiteboard"]],
+                                    ["panel": "test.chat"],
+                                    ["panel": "test.new", "close": true]])
+        XCTAssertEqual(state.openPanels, ["test.pages"], "the library's panels never enter the document chrome")
+        XCTAssertEqual(h.session.openPanels, ["test.pages"])
+
+        // A panel the chrome keeps for the next document closes too, even when the library has no such panel.
+        r = try await h.run("panel.close", ["id": "test.pages"])
+        XCTAssertEqual(r["closed"], true)
+        XCTAssertEqual(state.openPanels, [])
+        XCTAssertEqual(h.session.openPanels, [])
+        XCTAssertEqual(log.params.last, ["panel": "test.pages", "close": true])
+        XCTAssertEqual(LibraryPanels.placement(of: panel("x", .fullScreen)), "fullScreen")
+        XCTAssertEqual(LibraryPanels.placement(of: nil), "sheet")
+    }
+
     func testPanelsDrawTheirOwnHeaderWhenTheySaySo() throws {
         let h = Harness(features: [FeatDocChromeFeature.self])
         let window = try makeWindow(h)
@@ -634,13 +687,15 @@ final class FeatDocChromeTests: XCTestCase {
         h.app.settings.set(NibSettings.hideStatusBar, true)
         XCTAssertTrue(container.prefersStatusBarHidden)
 
-        // Back runs window.showLibrary (contracts-v2) in this window, even when another window was active last.
+        // Back runs window.showLibrary (contracts-v2) in the window of the tap: the shell (v2.2) made it the active one
+        // with its session before the tap reached the chrome, so the chrome no longer sets the active navigator itself.
         let other = TestNavigator(session: EditorSession())
-        h.app.ui.activeNavigator = other
+        h.app.ui.activeNavigator = navigator
         let context = ChromeWindow(app: h.app, doc: Fixtures.docID, session: h.session, state: try chromeState(h),
                                    navigator: navigator)
         context.goToLibrary()
         try await waitUntil { navigator.shownLibrary == [Fixtures.folderID] }
+        XCTAssertEqual(other.shownLibrary, [])
         XCTAssertTrue(h.app.ui.activeNavigator === navigator)
     }
 
@@ -655,6 +710,7 @@ final class FeatDocChromeTests: XCTestCase {
             return .object([:])
         }
         let navigator = TestNavigator(session: h.session)
+        h.app.ui.activeNavigator = navigator   // the shell activates the window of the tap
         let context = ChromeWindow(app: h.app, doc: Fixtures.docID, session: h.session, state: try chromeState(h),
                                    navigator: navigator)
         context.goToLibrary()

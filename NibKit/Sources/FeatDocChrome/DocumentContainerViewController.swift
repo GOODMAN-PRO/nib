@@ -226,21 +226,20 @@ final class ChromeWindow {
     }
 
     /// Back to the library, in the document's folder: `window.showLibrary` (contracts-v2), then `library.setView`
-    /// (F019) when it is installed. The tap happened in this window, so it is the most recently active one, which is
-    /// the window `window.showLibrary` acts on.
+    /// (F019) when it is installed. The tap happened in this window, and the shell makes the window of a tap the active
+    /// one (with its session), so it is the window `window.showLibrary` acts on.
     func goToLibrary() {
         let app = self.app
         let session = self.session
         let folder = app.services.library?.node(doc)?.parent
         let params: JSONValue = folder.map { f -> JSONValue in ["folder": .string(NodeRef.folder(f).description)] } ?? [:]
-        if let navigator, app.ui.activeNavigator !== navigator { app.ui.activeNavigator = navigator }
-        let setsView = has("library.setView")
+        let setsView = has(CommandIDs.librarySetView)
         Task { @MainActor in
             var command = CommandIDs.windowShowLibrary
             do {
                 try await app.bus.execute(command, params, session: session)
                 if setsView {
-                    command = "library.setView"
+                    command = CommandIDs.librarySetView
                     try await app.bus.execute(command, params, session: session)
                 }
             } catch {
@@ -637,8 +636,7 @@ final class DocumentContainerViewController: UIViewController {
         geometry.update(size: view.bounds.size, safeArea: view.safeAreaInsets)
     }
 
-    /// P-106. Takes effect once the window's root forwards `childForStatusBarHidden` to its content (the shell does not
-    /// yet: filed as a contract request).
+    /// P-106 (`NibSettings.hideStatusBar`); the shell forwards `childForStatusBarHidden` to its content.
     override var prefersStatusBarHidden: Bool { chrome.app.settings.get(NibSettings.hideStatusBar) }
 
     override var preferredStatusBarUpdateAnimation: UIStatusBarAnimation { .fade }

@@ -25,7 +25,7 @@ struct NavItem: Identifiable, Equatable {
     enum Action: Equatable {
         case command(String, JSONValue)
         case menu(ChromeMenu)
-        /// Back: `library.setView` (when installed) plus the window's navigator.
+        /// Back: `window.showLibrary` in this window, then `library.setView` (when installed).
         case library
     }
 
