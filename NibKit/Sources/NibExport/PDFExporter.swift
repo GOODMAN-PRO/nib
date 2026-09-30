@@ -23,7 +23,8 @@ struct ExportSheet {
     var row: Int?
     var column: Int?
 
-    var size: CGSize { CGSize(width: region.width, height: region.height) }
+    var pdfScale: Double { min(1, 14_400 / max(region.width, region.height)) }
+    var size: CGSize { CGSize(width: region.width * pdfScale, height: region.height * pdfScale) }
 }
 
 /// A value snapshot of one page for off-main drawing.
@@ -35,6 +36,12 @@ struct PageSnapshot {
     let items: [Item]
     /// Comment threads on the exported layers (PDF text annotations).
     let comments: [Item]
+    /// Resolved on the main actor, before off-main compositing and annotation collection.
+    var paintBounds: [ElementID: Rect] = [:]
+
+    func intersects(_ item: Item, _ region: Rect) -> Bool {
+        (paintBounds[item.id] ?? item.bounds.insetBy(-NibLimits.drawerMargin)).intersects(region)
+    }
     let template: TemplateSource?
     /// The PDF or image file of a PDF / image background.
     let backgroundURL: URL?
@@ -102,12 +109,13 @@ final class ExportPlan {
             throw NibError(.unsupported, "doc:\(doc.raw) is a \(content.meta.kind.rawValue); this format exports notebooks and whiteboards",
                            path: "$.docs", hint: "export it as nibnote, or with the exporter registered for its kind")
         }
-        let pages = try ExportPages.select(content, pages: request.pages, range: options.pageRange)
+        let pages = try ExportPages.select(content, pages: request.pages, range: options.pageRange,
+                                           skipOutOfRange: request.documents.count > 1)
         let plan = ExportPlan(doc: doc, content: content, title: ExportNames.title(doc, kind: content.meta.kind, ctx: ctx),
                               options: options, pages: pages, ctx: ctx)
+        defer { plan.evict() }
         try plan.layOut()
         if recognizeText { await plan.prefetchText(ctx) }
-        plan.evict()
         return plan
     }
 
@@ -122,7 +130,6 @@ final class ExportPlan {
             }
             let bounds = ExportPlan.contentBounds(try visibleItems(record), registries: environment.registries)
             sheets += ExportPlan.boardSheets(bounds, layout: options.board, paper: options.paper, page: i)
-            noteLoaded(record.id)
         }
         self.sheets = sheets
     }
@@ -165,7 +172,7 @@ final class ExportPlan {
     func number(of record: PageRecord) -> Int { numbers[record.id] ?? (pages.firstIndex { $0.id == record.id } ?? 0) + 1 }
 
     func visibleItems(_ record: PageRecord) throws -> [Item] {
-        let all = try workspace.items(doc, page: record.id)
+        let all = try cache.track(record.id) { try workspace.items(doc, page: record.id) }
         guard let layers = layers else { return all }
         return all.filter { layers.contains($0.layer) }
     }
@@ -185,9 +192,10 @@ final class ExportPlan {
             }
         }
         let snapshot = PageSnapshot(record: record, number: numbers[record.id] ?? index + 1, items: drawn,
-                                    comments: comments, template: template(for: record),
+                                    comments: comments, paintBounds: Dictionary(uniqueKeysWithValues: (drawn + comments).map {
+                                        ($0.id, environment.registries.paintBounds(for: $0))
+                                    }), template: template(for: record),
                                     backgroundURL: backgroundURL(record), text: recognized[record.id] ?? [])
-        noteLoaded(record.id)
         return snapshot
     }
 
@@ -250,8 +258,7 @@ final class ExportPlan {
 
     private func prefetchText(_ ctx: CommandContext) async {
         for record in pages {
-            recognized[record.id] = await recognizedText(record, ctx: ctx)
-            noteLoaded(record.id)
+            recognized[record.id] = await cache.track(record.id) { await recognizedText(record, ctx: ctx) }
         }
     }
 
@@ -312,8 +319,6 @@ final class ExportPlan {
 
     // MARK: Memory
 
-    private func noteLoaded(_ page: PageID) { cache.loaded(page) }
-
     /// Drops the pages this export loaded (pages that were in memory before it stay).
     func evict() { cache.evict() }
 }
@@ -365,12 +370,12 @@ enum ExportCompositor {
             defer { cg.restoreGState() }
             cg.clip(to: region.cg)
             let paper = drawBackground(snap, region: region, env: env, target: target, backgrounds: backgrounds, cg: cg)
-            let items = omit.isEmpty ? snap.items : snap.items.filter { !omit.contains($0.id) }
+            let items = snap.items.filter { !omit.contains($0.id) && snap.intersects($0, region) }
             for band in ExportBands.make(items) {
                 drawBand(band, snap: snap, region: region, paper: paper, env: env, target: target, cg: cg)
             }
             if target.isVector, env.options.mode == .flattened, env.options.searchableText {
-                InvisibleText.draw(snap.text, cg: cg)
+                InvisibleText.draw(snap.text.filter { $0.bbox.intersects(region) }, cg: cg)
             }
         }
     }
@@ -794,11 +799,17 @@ enum PDFExporter {
             throw NibError(.invalidParams, "no document to export", path: "$.docs", hint: "pass the documents to export")
         }
         let folder = try ExportNames.scratchFolder()
+        var completed = false
+        defer { if !completed { try? FileManager.default.removeItem(at: folder) } }
         var used = Set<String>()
         var urls: [URL] = []
         for doc in request.documents {
+            let use = ExportDocumentUse(doc, ctx: ctx)
+            defer { use.end() }
             let plan = try await ExportPlan.make(doc, request: request, options: options, ctx: ctx,
                                                  recognizeText: options.mode == .flattened && options.searchableText)
+            defer { plan.evict() }
+            if plan.sheets.isEmpty { continue }
             let requested = request.documents.count == 1 ? request.fileName.map { stripExtension($0, "pdf") } : nil
             let base = requested.map { ExportNames.sanitize($0, fallback: plan.title) } ?? plan.title
             let url = folder.appendingPathComponent(ExportNames.unique(base, ext: "pdf", used: &used))
@@ -807,15 +818,11 @@ enum PDFExporter {
                              pdfFiles: sources.files, pdfSheets: sources.sheets,
                              nibOutline: options.mode == .editable && options.outline ? plan.nibOutline() : [])
             let pull = MainPull<PageSnapshot> { index in try plan.snapshot(index) }
-            do {
-                try await ExportWorker.run { try PDFWriter.write(job, pull: pull, to: url) }
-            } catch {
-                plan.evict()
-                throw error
-            }
-            plan.evict()
+            try await ExportWorker.run { try PDFWriter.write(job, pull: pull, to: url) }
             urls.append(url)
         }
+        guard !urls.isEmpty else { throw ExportPages.nothingInRange(options.pageRange) }
+        completed = true
         return urls
     }
 
@@ -849,8 +856,10 @@ enum PDFWriter {
                         }
                         context.beginPage(withBounds: CGRect(origin: .zero, size: sheet.size), pageInfo: [:])
                         let cg = context.cgContext
-                        let annotated = job.editable ? EditableSplit.annotated(snap.items) : []
+                        let visible = snap.items.filter { snap.intersects($0, sheet.region) }
+                        let annotated = job.editable ? EditableSplit.annotated(visible, bounds: snap.paintBounds) : []
                         cg.saveGState()
+                        cg.scaleBy(x: sheet.pdfScale, y: sheet.pdfScale)
                         cg.translateBy(x: CGFloat(-sheet.region.x), y: CGFloat(-sheet.region.y))
                         ExportCompositor.draw(snap, region: sheet.region, env: job.environment, target: .vector,
                                               omit: Set(annotated.map { $0.id }), backgrounds: backgrounds, cg: cg)
@@ -866,34 +875,34 @@ enum PDFWriter {
         if let failure = failure { throw failure }
         let outline = job.editable && job.environment.options.outline
             ? job.nibOutline + PDFAnnotations.sourceOutline(job, backgrounds: backgrounds) : []
-        try PDFAnnotations.apply(specs, outline: outline, to: url)
+        try PDFAnnotations.apply(&specs, outline: outline, to: url)
     }
 }
 
 // MARK: - Editable split
 
-/// Which items an editable PDF keeps as annotations: pen, pencil and highlighter ink and unrotated text boxes, except
-/// those beneath an unrevealed tape strip (they stay in the page content so the tape still hides them).
+/// Annotations paint above page content. Keep covered items and highlighters in the composited page.
 enum EditableSplit {
-    static func annotated(_ items: [Item]) -> [Item] {
-        var tapes: [(index: Int, bounds: Rect)] = []
-        for (i, item) in items.enumerated() {
-            if let s = item.stroke, s.style.tool == .tape, !s.tapeRevealed { tapes.append((i, item.bounds)) }
-        }
+    static func annotated(_ items: [Item], bounds: [ElementID: Rect] = [:]) -> [Item] {
+        func paint(_ item: Item) -> Rect { bounds[item.id] ?? item.bounds.insetBy(-NibLimits.drawerMargin) }
+        var occluders: [Rect] = []
         var out: [Item] = []
-        for (i, item) in items.enumerated() where isConvertible(item) {
-            let b = item.bounds
-            if tapes.contains(where: { $0.index > i && $0.bounds.intersects(b) }) { continue }
-            out.append(item)
+        for item in items.reversed() {
+            if isConvertible(item), !occluders.contains(where: { $0.intersects(paint(item)) }) {
+                out.append(item)
+            } else if item.kind != .comment, item.stroke?.style.tool != .highlighter,
+                      !(item.stroke?.style.tool == .tape && item.stroke?.tapeRevealed == true) {
+                occluders.append(paint(item))
+            }
         }
-        return out
+        return out.reversed()
     }
 
     static func isConvertible(_ item: Item) -> Bool {
         switch item.kind {
         case .stroke:
             guard let s = item.stroke else { return false }
-            return s.style.tool != .tape && !s.points.isEmpty
+            return s.style.tool != .tape && s.style.tool != .highlighter && !s.points.isEmpty
         case .text:
             guard let t = item.text else { return false }
             return t.frame.rotation == 0 && !t.text.isEmpty
@@ -913,7 +922,7 @@ struct PDFAnnotationSpec {
     }
 
     enum Kind {
-        case ink(paths: [[CGPoint]], width: CGFloat, colour: RGBA, dash: [CGFloat]?)
+        case ink(paths: [[Float]], width: CGFloat, colour: RGBA, dash: [CGFloat]?)
         case freeText(text: String, font: UIFont, colour: RGBA, background: RGBA?, border: CGFloat, alignment: NSTextAlignment)
         case link(Target)
         case note(text: String, author: String?)
@@ -930,11 +939,11 @@ enum PDFAnnotations {
                         backgrounds: BackgroundCache) -> [PDFAnnotationSpec] {
         let options = job.environment.options
         var specs: [PDFAnnotationSpec] = []
-        for item in annotated {
+        for item in annotated where snap.intersects(item, sheet.region) {
             if let spec = editable(item, registries: job.environment.registries) { specs.append(spec) }
         }
         if options.annotations {
-            for item in snap.items {
+            for item in snap.items where snap.intersects(item, sheet.region) {
                 for (link, rect) in ExportText.linkRects(item, registries: job.environment.registries) {
                     if let target = target(link, job: job) { specs.append(PDFAnnotationSpec(rect: rect, kind: .link(target))) }
                 }
@@ -942,21 +951,58 @@ enum PDFAnnotations {
             if job.editable { specs += sourceLinks(snap, job: job, backgrounds: backgrounds) }
         }
         if options.comments {
-            for item in snap.comments {
+            for item in snap.comments where snap.intersects(item, sheet.region) {
                 if let spec = note(item) { specs.append(spec) }
             }
         }
         let region = sheet.region.cg
-        return specs.compactMap { spec in
+        let placed = specs.compactMap { spec -> PDFAnnotationSpec? in
             guard spec.rect.intersects(region) else { return nil }
             var s = spec
-            s.rect = spec.rect.offsetBy(dx: -region.minX, dy: -region.minY)
+            let scale = CGFloat(sheet.pdfScale)
+            s.rect = spec.rect.offsetBy(dx: -region.minX, dy: -region.minY).applying(CGAffineTransform(scaleX: scale, y: scale))
             if case let .ink(paths, width, colour, dash) = spec.kind {
-                s.kind = .ink(paths: paths.map { $0.map { CGPoint(x: $0.x - region.minX, y: $0.y - region.minY) } },
-                              width: width, colour: colour, dash: dash)
+                s.kind = .ink(paths: paths.map { points in
+                    points.enumerated().map { i, value in
+                        (value - Float(i.isMultiple(of: 2) ? region.minX : region.minY)) * Float(scale)
+                    }
+                }, width: width * scale, colour: colour, dash: dash?.map { $0 * scale })
+            } else if case let .freeText(text, font, colour, background, border, alignment) = spec.kind {
+                s.kind = .freeText(text: text, font: font.withSize(font.pointSize * scale), colour: colour,
+                                   background: background, border: border * scale, alignment: alignment)
             }
             return s
         }
+        return grouped(placed)
+    }
+
+    private struct InkKey: Hashable {
+        var width: CGFloat
+        var colour: RGBA
+        var dash: [CGFloat]?
+    }
+
+    /// One InkList per style on a sheet; compact point buffers do not retain UIKit paths while rendering.
+    static func grouped(_ specs: [PDFAnnotationSpec]) -> [PDFAnnotationSpec] {
+        var out: [PDFAnnotationSpec] = []
+        var indices: [InkKey: Int] = [:]
+        var ink: [(key: InkKey, rect: CGRect, paths: [[Float]])] = []
+        for spec in specs {
+            guard case let .ink(paths, width, colour, dash) = spec.kind else { out.append(spec); continue }
+            let key = InkKey(width: width, colour: colour, dash: dash)
+            if let i = indices[key] {
+                ink[i].rect = ink[i].rect.union(spec.rect)
+                ink[i].paths.append(contentsOf: paths)
+            } else {
+                indices[key] = ink.count
+                ink.append((key, spec.rect, paths))
+            }
+        }
+        out += ink.map { group in
+            PDFAnnotationSpec(rect: group.rect, kind: .ink(paths: group.paths, width: group.key.width,
+                                                          colour: group.key.colour, dash: group.key.dash))
+        }
+        return out
     }
 
     static func editable(_ item: Item, registries: ContentRegistries) -> PDFAnnotationSpec? {
@@ -978,7 +1024,7 @@ enum PDFAnnotations {
             var bounds = path.reduce(CGRect.null) { $0.union(CGRect(origin: $1, size: .zero)) }
             bounds = bounds.insetBy(dx: -w, dy: -w)
             let dash = PatternStroke.lengths(for: s.style)
-            return PDFAnnotationSpec(rect: bounds, kind: .ink(paths: [path], width: w, colour: s.style.color,
+            return PDFAnnotationSpec(rect: bounds, kind: .ink(paths: [path.flatMap { [Float($0.x), Float($0.y)] }], width: w, colour: s.style.color,
                                                               dash: dash.isEmpty ? nil : dash))
         case .text:
             guard let t = item.text else { return nil }
@@ -1053,17 +1099,21 @@ enum PDFAnnotations {
     // MARK: Writing
 
     /// Adds the annotations and the outline with PDFKit (only when there is something to add) and rewrites the file.
-    static func apply(_ specs: [[PDFAnnotationSpec]], outline: [OutlineNode], to url: URL) throws {
+    static func apply(_ specs: inout [[PDFAnnotationSpec]], outline: [OutlineNode], to url: URL) throws {
         guard specs.contains(where: { !$0.isEmpty }) || !outline.isEmpty else { return }
         let temp = url.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + ".pdf")
         try autoreleasepool {
             guard let document = PDFDocument(url: url) else {
                 throw NibError(.internalError, "the exported PDF could not be reopened to add annotations")
             }
-            for (i, list) in specs.enumerated() where !list.isEmpty {
-                guard let page = document.page(at: i) else { continue }
-                let height = page.bounds(for: .mediaBox).height
-                for spec in list { page.addAnnotation(annotation(spec, height: height, document: document)) }
+            for i in specs.indices {
+                autoreleasepool {
+                    if let page = document.page(at: i) {
+                        let height = page.bounds(for: .mediaBox).height
+                        for spec in specs[i] { page.addAnnotation(annotation(spec, height: height, document: document)) }
+                    }
+                    specs[i] = []
+                }
             }
             if !outline.isEmpty {
                 let root = PDFOutline()
@@ -1105,8 +1155,8 @@ enum PDFAnnotations {
             for points in paths {
                 // Ink paths are relative to the annotation's origin, in PDF space (y up).
                 let path = UIBezierPath()
-                for (j, p) in points.enumerated() {
-                    let q = CGPoint(x: p.x - bounds.minX, y: height - p.y - bounds.minY)
+                for j in stride(from: 0, to: points.count - 1, by: 2) {
+                    let q = CGPoint(x: CGFloat(points[j]) - bounds.minX, y: height - CGFloat(points[j + 1]) - bounds.minY)
                     if j == 0 { path.move(to: q) } else { path.addLine(to: q) }
                 }
                 a.add(path)

@@ -234,6 +234,7 @@ final class PDFExporterTests: XCTestCase {
         var rotated = text
         rotated.id = "ROTATEDTXT01"
         rotated.text?.frame.rotation = 0.3
+        rotated.text?.frame.x = 400
         let ids = EditableSplit.annotated([under, tape, above, text, rotated]).map { $0.id }
         XCTAssertEqual(ids, ["ABOVEINK0001", "TEXTBOX00001"])
         var revealed = tape
@@ -277,4 +278,141 @@ final class PDFExporterTests: XCTestCase {
         XCTAssertEqual(sheets.map { $0.row ?? -1 }, [0, 0, 0, 1, 1, 1])
         XCTAssertEqual(ExportPlan.boardSheets(bounds, layout: .single, paper: .a4, page: 0).map { $0.region }, [bounds])
     }
+    func testEditableGroupsTwoHundredStrokesIntoOneInkList() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        var strokes: [Item] = []
+        for i in 0..<200 {
+            let y = Float(30 + i * 3)
+            let points = [StrokePoint(x: 40, y: y), StrokePoint(x: 100, y: y)]
+            let stroke = Stroke(style: InkStyle.defaultPen, points: points)
+            strokes.append(Item(kind: .stroke, stroke: stroke))
+        }
+        try await h.insert(strokes, page: Fixtures.page2)
+        let pdf = try await exportPDF(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG002"], "options": ["mode": "editable"]])
+        let ink = (pdf.page(at: 0)?.annotations ?? []).filter { ($0.type ?? "").contains("Ink") }
+        XCTAssertEqual(ink.count, 1)
+        XCTAssertEqual(ink.first?.paths?.count, 200)
+    }
+
+    func testEditableKeepsCoveredInkAndHighlighterInPageContent() {
+        let pen = Item(kind: .stroke, stroke: Stroke(style: .defaultPen,
+                         points: [StrokePoint(x: 50, y: 50), StrokePoint(x: 100, y: 50)]))
+        let note = Item(kind: .sticky, sticky: StickyItem(frame: Frame(x: 40, y: 40, w: 140, h: 140),
+                                                         text: RichText(plain: "Cover")))
+        XCTAssertTrue(EditableSplit.annotated([pen, note]).isEmpty)
+        let highlighter = Item(kind: .stroke, stroke: Stroke(style: .defaultHighlighter,
+                                 points: [StrokePoint(x: 50, y: 50), StrokePoint(x: 100, y: 50)]))
+        XCTAssertFalse(EditableSplit.isConvertible(highlighter))
+        XCTAssertEqual(EditableSplit.annotated([pen, highlighter]).map { $0.id }, [pen.id])
+    }
+
+    func testTiledPDFDoesNotEncodeDistantShapePaths() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        let points = (0..<2000).map { i in Point(1400 + Double(i % 100), 2000 + Double(i % 2) * 100) }
+        try await h.insert([Item(kind: .shape, shape: ShapeItem(shape: .curve,
+                                 frame: Frame(x: 1400, y: 2000, w: 100, h: 100), points: points))],
+                           page: Fixtures.boardID, doc: Fixtures.whiteboardID)
+        let pdf = try await exportPDF(h, ["docs": ["doc:FIXTUREDOC04"], "options": ["board": "tiled", "comments": false]])
+        let empty = try XCTUnwrap(pdf.page(at: 1)?.dataRepresentation)
+        let distant = try XCTUnwrap(pdf.page(at: pdf.pageCount - 1)?.dataRepresentation)
+        XCTAssertGreaterThan(distant.count, empty.count * 3, "distant geometry belongs only to its intersecting tiles")
+    }
+
+    func testOversizedSingleBoardScalesPageAndInkAnnotations() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        var style = InkStyle.defaultPen
+        style.color = RGBA(255, 0, 0)
+        let stroke = Item(kind: .stroke, stroke: Stroke(style: style,
+                            points: [StrokePoint(x: 20_000, y: 100), StrokePoint(x: 20_100, y: 100)]))
+        try await h.insert([stroke], page: Fixtures.boardID, doc: Fixtures.whiteboardID)
+        let items = try h.app.workspace.items(Fixtures.whiteboardID, page: Fixtures.boardID)
+        let bounds = ExportPlan.contentBounds(items, registries: h.app.content)
+        let scale = 14_400 / max(bounds.width, bounds.height)
+        let pdf = try await exportPDF(h, ["docs": ["doc:FIXTUREDOC04"], "options": ["mode": "editable"]])
+        let page = try XCTUnwrap(pdf.page(at: 0))
+        XCTAssertEqual(max(page.bounds(for: .mediaBox).width, page.bounds(for: .mediaBox).height), 14_400, accuracy: 1)
+        let ink = try XCTUnwrap(page.annotations.first { ($0.type ?? "").contains("Ink") && $0.bounds.minX > 10_000 })
+        XCTAssertEqual(ink.bounds.midX, (20_050 - bounds.x) * scale, accuracy: 2)
+    }
+
+    func testRecognizePageTextCursorIncludesInkAndExcludesTypedBlocks() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        var cursors: [String?] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.recognizePageText, title: "Recognize", summary: "Test cursor.",
+                                                  effect: .read, exposure: .ui)) { params, _ in
+            let cursor = params["cursor"]?.stringValue
+            cursors.append(cursor)
+            let block = TextRecognition(text: cursor == nil ? "cursorfirst" : "cursorsecond",
+                                        bbox: Rect(x: 72, y: cursor == nil ? 110 : 150, width: 120, height: 20),
+                                        itemIDs: [Fixtures.strokeID], source: "ink")
+            let typed = TextRecognition(text: "typedexcluded", bbox: Rect(x: 72, y: 190, width: 120, height: 20), source: "typed")
+            var result: [String: JSONValue] = ["blocks": try JSONValue.from([block, typed]), "truncated": .bool(cursor == nil)]
+            if cursor == nil { result["cursor"] = "next" }
+            return .object(result)
+        }
+        let pdf = try await exportPDF(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"]])
+        XCTAssertEqual(cursors.count, 2)
+        XCTAssertNil(cursors[0])
+        XCTAssertEqual(cursors[1], "next")
+        XCTAssertTrue(text(pdf.page(at: 0)).contains("cursorfirst"))
+        XCTAssertTrue(text(pdf.page(at: 0)).contains("cursorsecond"))
+        XCTAssertFalse(text(pdf.page(at: 0)).contains("typedexcluded"))
+    }
+
+    func testRotatedPDFBackgroundUsesPagePlacement() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        let normal = try await exportPDF(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG003"]])
+        let original = try XCTUnwrap(normal.findString("Fixture PDF text", withOptions: []).first)
+        let originalPage = try XCTUnwrap(normal.page(at: 0))
+        let originalBounds = original.bounds(for: originalPage)
+        h.app.commands.register(CommandDescriptor(id: "test.rotate", title: "Rotate", summary: "Test rotation.",
+                                                  effect: .edit, exposure: .ui)) { _, ctx in
+            try ctx.mutate { tx in
+                var page = try XCTUnwrap(tx.content(Fixtures.docID).page(Fixtures.pdfPage))
+                page.rotation = 90
+                try tx.put(page, doc: Fixtures.docID)
+            }
+            return .null
+        }
+        try await h.run("test.rotate")
+        let rotated = try await exportPDF(h, ["pages": ["page:FIXTUREDOC01/FIXTUREPG003"]])
+        let page = try XCTUnwrap(rotated.page(at: 0))
+        let found = try XCTUnwrap(rotated.findString("Fixture PDF text", withOptions: []).first)
+        let actual = found.bounds(for: page)
+        let record = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).page(Fixtures.pdfPage))
+        let height = originalPage.bounds(for: .mediaBox).height
+        let originalTop = PDFAnnotations.pdfRect(originalBounds, height: height)
+        let transformed = originalTop.applying(record.backgroundTransform(sourceSize: .a4).cg)
+        let expected = PDFAnnotations.pdfRect(transformed, height: page.bounds(for: .mediaBox).height)
+        XCTAssertEqual(actual.minX, expected.minX, accuracy: 3)
+        XCTAssertEqual(actual.minY, expected.minY, accuracy: 3)
+        XCTAssertEqual(actual.width, expected.width, accuracy: 3)
+        XCTAssertEqual(actual.height, expected.height, accuracy: 3)
+        let out = try await h.run(CommandIDs.exportRun, ["pages": ["page:FIXTUREDOC01/FIXTUREPG003"],
+                                                         "format": "png", "inline": true])
+        let data = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(out["files"]?[0]?["base64"]?.stringValue)))
+        let image = try XCTUnwrap(UIImage(data: data)?.cgImage)
+        var pixels = [UInt8](repeating: 255, count: image.width * image.height * 4)
+        try pixels.withUnsafeMutableBytes { buffer in
+            let bitmap = try XCTUnwrap(CGContext(data: buffer.baseAddress, width: image.width, height: image.height,
+                                                 bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                                                 space: CGColorSpaceCreateDeviceRGB(),
+                                                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            bitmap.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        }
+        var minX = image.width, maxX = 0
+        for y in 0..<image.height {
+            for x in 0..<image.width {
+                let offset = (y * image.width + x) * 4
+                if pixels[offset] < 180 && pixels[offset + 1] < 180 && pixels[offset + 2] < 180 {
+                    minX = min(minX, x)
+                    maxX = max(maxX, x)
+                }
+            }
+        }
+        XCTAssertLessThan(minX, maxX, "the image contains background text")
+        XCTAssertEqual(Double(minX) / 2, transformed.minX, accuracy: 5)
+        XCTAssertEqual(Double(maxX) / 2, transformed.maxX, accuracy: 5)
+    }
+
 }

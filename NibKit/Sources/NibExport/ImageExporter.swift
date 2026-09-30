@@ -30,10 +30,16 @@ enum ImageExporter {
             throw NibError(.invalidParams, "no document to export", path: "$.docs", hint: "pass the documents to export")
         }
         let folder = try ExportNames.scratchFolder()
+        var completed = false
+        defer { if !completed { try? FileManager.default.removeItem(at: folder) } }
         var used = Set<String>()
         var urls: [URL] = []
         for doc in request.documents {
+            let use = ExportDocumentUse(doc, ctx: ctx)
+            defer { use.end() }
             let plan = try await ExportPlan.make(doc, request: request, options: options, ctx: ctx, recognizeText: false)
+            defer { plan.evict() }
+            if plan.sheets.isEmpty { continue }
             let requested = request.documents.count == 1
                 ? request.fileName.map { PDFExporter.stripExtension(PDFExporter.stripExtension($0, "png"), format.ext) } : nil
             let base = requested.map { ExportNames.sanitize($0, fallback: plan.title) } ?? plan.title
@@ -42,15 +48,11 @@ enum ImageExporter {
             }
             let job = ImageJob(sheets: plan.sheets, environment: plan.environment, format: format)
             let pull = MainPull<PageSnapshot> { index in try plan.snapshot(index) }
-            do {
-                try await ExportWorker.run { try ImageWriter.write(job, pull: pull, to: targets) }
-            } catch {
-                plan.evict()
-                throw error
-            }
-            plan.evict()
+            try await ExportWorker.run { try ImageWriter.write(job, pull: pull, to: targets) }
             urls += targets
         }
+        guard !urls.isEmpty else { throw ExportPages.nothingInRange(options.pageRange) }
+        completed = true
         return urls
     }
 

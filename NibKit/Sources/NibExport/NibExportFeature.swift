@@ -247,15 +247,18 @@ struct ExportOptions {
 
 enum ExportPages {
     /// The live pages of `content` to export, in document order: the ones in `pages` when it names any of them, else
-    /// the 1-based `range`, else all. Throws when nothing is left.
-    static func select(_ content: DocumentContent, pages: [PageID]?, range: String?) throws -> [PageRecord] {
+    /// the 1-based `range`, else all. Throws when nothing is left, except that `skipOutOfRange` (one document of a
+    /// multi-document export) returns no pages when the range names none of this document's pages, so the exporter
+    /// leaves the document out instead of failing the whole export.
+    static func select(_ content: DocumentContent, pages: [PageID]?, range: String?,
+                       skipOutOfRange: Bool = false) throws -> [PageRecord] {
         let live = content.livePages
         if let wanted = pages.map(Set.init) {
             let chosen = live.filter { wanted.contains($0.id) }
             if !chosen.isEmpty { return chosen }
         }
         if let range = range {
-            let indices = try parseRange(range, count: live.count)
+            let indices = try parseRange(range, count: live.count, allowEmpty: skipOutOfRange)
             return indices.map { live[$0] }
         }
         guard !live.isEmpty else {
@@ -265,9 +268,24 @@ enum ExportPages {
         return live
     }
 
+    /// True when `range` is set, `pages` names none of the document's pages and the range names none of them either:
+    /// a multi-document export leaves such a document out. A malformed range throws.
+    static func rangeSkips(_ content: DocumentContent, pages: [PageID]?, range: String?) throws -> Bool {
+        guard let range = range, !content.livePages.isEmpty else { return false }
+        if let wanted = pages.map(Set.init), content.livePages.contains(where: { wanted.contains($0.id) }) { return false }
+        return try parseRange(range, count: content.livePages.count, allowEmpty: true).isEmpty
+    }
+
+    /// The error of a multi-document export whose page range names no page of any document.
+    static func nothingInRange(_ range: String?) -> NibError {
+        NibError(.invalidParams, "invalid page range '\(range ?? "")': no page of any document is in it",
+                 path: "$.options.pageRange", hint: "use 1-based page numbers such as \"1-3, 5, 8-\"")
+    }
+
     /// "1-3, 5, 8-" → 0-based indices in ascending order (duplicates removed). Numbers are 1-based; "-4" means 1-4 and
-    /// "8-" means 8 to the last page; pages past the end are ignored.
-    static func parseRange(_ text: String, count: Int) throws -> [Int] {
+    /// "8-" means 8 to the last page; pages past the end are ignored. A range naming no page throws unless
+    /// `allowEmpty` (then []).
+    static func parseRange(_ text: String, count: Int, allowEmpty: Bool = false) throws -> [Int] {
         func fail(_ why: String) -> NibError {
             NibError(.invalidParams, "invalid page range '\(text)': \(why)", path: "$.options.pageRange",
                      hint: "use 1-based page numbers such as \"1-3, 5, 8-\"")
@@ -283,14 +301,14 @@ enum ExportPages {
                 if n <= count { chosen.insert(n - 1) }
             case 2:
                 let lo = bounds[0].isEmpty ? 1 : Int(bounds[0])
-                let hi = bounds[1].isEmpty ? max(count, 1) : Int(bounds[1])
+                let hi = bounds[1].isEmpty ? max(count, lo ?? 1) : Int(bounds[1])
                 guard let a = lo, let b = hi, a >= 1, b >= a else { throw fail("'\(part)' is not a range") }
                 if a <= count { for n in a...min(b, count) { chosen.insert(n - 1) } }
             default:
                 throw fail("'\(part)' is not a range")
             }
         }
-        guard !chosen.isEmpty else { throw fail("no page of the document is in it") }
+        guard !chosen.isEmpty || allowEmpty else { throw fail("no page of the document is in it") }
         return chosen.sorted()
     }
 }
@@ -363,32 +381,66 @@ enum ExportWorker {
     }
 }
 
-/// Drops the pages an export loaded into the workspace again, every few pages and at the end; pages that were in
-/// memory before the export started stay.
+/// Drops the pages an export loaded into the workspace again, every few pages and at the end. Only pages the export
+/// itself brought into memory are dropped: pages that were cached before it read them (the canvas's pages, including
+/// ones the canvas loads while a long export runs) stay.
 @MainActor
 final class PageCacheGuard {
     static let batch = 8
     private let workspace: Workspace
     private let doc: DocumentID
-    private let cachedAtStart: Set<PageID>
-    private var loadedSinceEviction = 0
+    private var loadedByExport = Set<PageID>()
 
     init(_ workspace: Workspace, doc: DocumentID) {
         self.workspace = workspace
         self.doc = doc
-        self.cachedAtStart = workspace.cachedPages(doc)
     }
 
-    func loaded(_ page: PageID) {
-        guard !cachedAtStart.contains(page) else { return }
-        loadedSinceEviction += 1
-        if loadedSinceEviction >= PageCacheGuard.batch { evict() }
+    /// Runs `load` (which may read `page` into the workspace) and remembers the page when it was not cached before.
+    func track<T>(_ page: PageID, _ load: () throws -> T) rethrows -> T {
+        let wasCached = workspace.isPageCached(doc, page: page)
+        let value = try load()
+        note(page, wasCached: wasCached)
+        return value
+    }
+
+    func track<T>(_ page: PageID, _ load: () async -> T) async -> T {
+        let wasCached = workspace.isPageCached(doc, page: page)
+        let value = await load()
+        note(page, wasCached: wasCached)
+        return value
+    }
+
+    private func note(_ page: PageID, wasCached: Bool) {
+        guard !wasCached, workspace.isPageCached(doc, page: page) else { return }
+        loadedByExport.insert(page)
+        if loadedByExport.count >= PageCacheGuard.batch { evict() }
     }
 
     func evict() {
-        guard loadedSinceEviction > 0 else { return }
-        workspace.evictPages(doc, keeping: cachedAtStart)
-        loadedSinceEviction = 0
+        guard !loadedByExport.isEmpty else { return }
+        workspace.evictPages(doc, keeping: workspace.cachedPages(doc).subtracting(loadedByExport))
+        loadedByExport.removeAll()
+    }
+}
+
+/// A document an export reads: when the export opened it (it was not loaded before), `end()` closes it again, so a
+/// folder or library export never leaves hundreds of heads in memory.
+@MainActor
+final class ExportDocumentUse {
+    let doc: DocumentID
+    private let workspace: Workspace
+    private let wasLoaded: Bool
+
+    init(_ doc: DocumentID, ctx: CommandContext) {
+        self.doc = doc
+        self.workspace = ctx.workspace
+        self.wasLoaded = ctx.workspace.isLoaded(doc)
+    }
+
+    func end() {
+        guard !wasLoaded, workspace.isLoaded(doc) else { return }
+        workspace.close(doc)
     }
 }
 
