@@ -438,8 +438,9 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertEqual(model.draft.paper, TemplateRef(TemplateIDs.grid, params: [TemplateParamNames.spacing: 14]))
         XCTAssertNil(model.draft.custom)
         XCTAssertEqual(model.draft.size.name, "Letter")
-        model.apply(choice: try! JSONValue.parse(#"{"background": {"kind": "pdf", "asset": "planner.pdf", "pdfPage": 0}, "size": {"width": 800, "height": 600}}"#))
+        model.apply(choice: try! JSONValue.parse(#"{"background": {"kind": "pdf", "asset": "tmp:planner.pdf", "pdfPage": 0}, "size": [800, 600]}"#))
         XCTAssertEqual(model.draft.custom?.kind, .pdf)
+        XCTAssertEqual(model.draft.custom?.asset, AssetRef("tmp:planner.pdf"), "stored once the notebook exists")
         XCTAssertTrue(model.draft.size.isCustom)
         XCTAssertEqual(model.draft.orientation, .landscape)
         XCTAssertEqual(model.draft.pageSize, PageSize(800, 600))
@@ -471,7 +472,8 @@ final class FeatCreateTests: XCTestCase {
         let open = notebook.params(context)
         XCTAssertEqual(open["id"]?.stringValue, CreateIDs.newNotebookPanel)
         XCTAssertEqual(open["folder"], "folder:FIXTUREFLD01")
-        XCTAssertEqual(open["params"]?["folder"], "folder:FIXTUREFLD01")
+        XCTAssertEqual(open["kind"], "notebook")
+        XCTAssertNil(open["params"], "panel.open {id, folder?, kind?}: the keys reach the sheet flat")
         XCTAssertEqual(quick.command, "doc.quickNote")
         XCTAssertEqual(quick.shortcut, KeyShortcut("n", [.command, .shift]))
         XCTAssertEqual(notebook.shortcut, KeyShortcut("n", [.command, .option]))
@@ -519,14 +521,21 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertEqual(h.app.content.keyCommands.all.filter { $0.owner == FeatCreateFeature.id }.count, 1)
     }
 
-    func testPanelParamsAreReadFlatOrNested() {
+    /// `PanelContext.params` is the flat `panel.open` call minus `id` (F017's rule, and F019's from the library).
+    func testPanelParamsAreReadFlat() throws {
         let h = harness()
         let flat = NewNotebookSheet.openContext(["folder": "folder:FIXTUREFLD01", "kind": "whiteboard"], app: h.app)
         XCTAssertEqual(flat.0, Fixtures.folderID)
         XCTAssertEqual(flat.1, .whiteboard)
-        let nested = NewNotebookSheet.openContext(["params": ["folder": "FIXTUREFLD01", "kind": "studySet"]], app: h.app)
-        XCTAssertEqual(nested.0, Fixtures.folderID)
-        XCTAssertEqual(nested.1, .studySet)
+        var sent = try XCTUnwrap(NewNotebookSheet.openParams(folder: Fixtures.folderID, kind: .studySet).objectValue)
+        XCTAssertEqual(sent.removeValue(forKey: "id"), .string(CreateIDs.newNotebookPanel))
+        let received = NewNotebookSheet.openContext(.object(sent), app: h.app)
+        XCTAssertEqual(received.0, Fixtures.folderID)
+        XCTAssertEqual(received.1, .studySet)
+        let bare = NewNotebookSheet.openContext(["folder": "FIXTUREFLD01"], app: h.app)
+        XCTAssertEqual(bare.0, Fixtures.folderID, "a bare folder id")
+        XCTAssertEqual(bare.1, .notebook)
+        XCTAssertEqual(NewNotebookSheet.openContext([:], app: h.app).1, .notebook)
         let unknown = NewNotebookSheet.openContext(["folder": "folder:GONE", "kind": "nonsense"], app: h.app)
         XCTAssertNil(unknown.0)
         XCTAssertEqual(unknown.1, .notebook)
@@ -556,10 +565,10 @@ final class FeatCreateTests: XCTestCase {
                       TextRecognition(text: " ", bbox: Rect(x: 10, y: 10, width: 5, height: 5), source: "ink")]
         XCTAssertEqual(TitleSuggester.firstLine(blocks), "Waves")
         XCTAssertNil(TitleSuggester.firstLine([]))
-        XCTAssertEqual(TitleSuggester.parse("Optics"), "Optics")
-        XCTAssertEqual(TitleSuggester.parse(["title": "Lenses."]), "Lenses")
-        XCTAssertEqual(TitleSuggester.parse(["suggestion": "Mirrors"]), "Mirrors")
+        XCTAssertEqual(TitleSuggester.parse(["title": "Lenses."]), "Lenses", "doc.suggestTitle → {title}")
+        XCTAssertNil(TitleSuggester.parse(["title": .null]), "null when nothing is readable")
         XCTAssertNil(TitleSuggester.parse(["title": "…"]))
+        XCTAssertNil(TitleSuggester.parse([:]))
     }
 
     // MARK: - The QuickNote exit prompt (acceptance: every path)
@@ -621,6 +630,31 @@ final class FeatCreateTests: XCTestCase {
         XCTAssertEqual(model.title, "Lecture- Optics")
         await model.save()
         XCTAssertEqual(h.library.node(id)?.title, "Lecture- Optics")
+    }
+
+    /// `doc.suggestTitle` → {title} reads the recognised lines itself: a null title is the answer (no second reading);
+    /// only a failing call falls back to `recognize.pageText`.
+    func testANullSuggestedTitleIsTheAnswer() async throws {
+        let h = harness()
+        let log = CallLog()
+        recognizeStub(h, log: log, text: "first line")
+        stub(h, "doc.suggestTitle", effect: .read, log: log) { _ in ["title": .null] }
+        let id = try await quickNote(h)
+        try addInk(h, to: id)
+        let none = await TitleSuggestion.load(id, runner: .user(h.app, session: h.session), workspace: h.app.workspace)
+        XCTAssertNil(none)
+        XCTAssertEqual(log.count("doc.suggestTitle"), 1)
+        XCTAssertEqual(log.count("recognize.pageText"), 0)
+
+        let h2 = harness()
+        let log2 = CallLog()
+        recognizeStub(h2, log: log2, text: "Momentum")
+        stub(h2, "doc.suggestTitle", effect: .read, log: log2) { _ in throw NibError(.internalError, "provider down") }
+        let id2 = try await quickNote(h2)
+        try addInk(h2, to: id2)
+        let fallback = await TitleSuggestion.load(id2, runner: .user(h2.app, session: h2.session),
+                                                  workspace: h2.app.workspace)
+        XCTAssertEqual(fallback, "Momentum")
     }
 
     func testExitPromptSaveAsUntitledKeepsIt() async throws {
@@ -1146,9 +1180,9 @@ final class FeatCreateTests: XCTestCase {
         let request = CreationRequest(id: "CUSTOMPAPER1", kind: .notebook, title: "Planner",
                                       template: TemplateRef(TemplateIDs.ruled), size: .a4,
                                       cover: TemplateRef("cover.solid"), background: custom)
-        let warnings = try await DocumentCreator.create(request, runner: .user(h.app, session: h.session), app: h.app,
-                                                        library: h.library, workspace: h.app.workspace,
-                                                        settings: h.app.settings)
+        let warnings = try await DocumentCreator.create(request, runner: .user(h.app, session: h.session),
+                                                        templates: h.app.content.templates, library: h.library,
+                                                        workspace: h.app.workspace, settings: h.app.settings)
         XCTAssertEqual(warnings, [])
         let call = try XCTUnwrap(log.params(CreateIDs.pageSetBackground).first)
         let pages = try h.app.workspace.content("CUSTOMPAPER1").livePages
@@ -1164,12 +1198,102 @@ final class FeatCreateTests: XCTestCase {
         var plain = request
         plain.id = "CUSTOMPAPER2"
         plain.cover = nil
-        let warnings2 = try await DocumentCreator.create(plain, runner: .user(h2.app, session: h2.session), app: h2.app,
-                                                         library: h2.library, workspace: h2.app.workspace,
-                                                         settings: h2.app.settings)
+        let warnings2 = try await DocumentCreator.create(plain, runner: .user(h2.app, session: h2.session),
+                                                         templates: h2.app.content.templates, library: h2.library,
+                                                         workspace: h2.app.workspace, settings: h2.app.settings)
         XCTAssertEqual(warnings2.count, 1)
         XCTAssertTrue(warnings2.first?.contains("Templates feature") ?? false, warnings2.first ?? "")
         XCTAssertNotNil(h2.library.node("CUSTOMPAPER2"))
+    }
+
+    /// Spec pass 2: the picker has no `doc` to store a custom paper in (the notebook does not exist yet), so it names a
+    /// `tmp:` asset. The New sheet stores it in the new notebook (`asset.put {doc, url, ext}`) and names the stored
+    /// asset in the Background before `page.setBackground`.
+    func testATemporaryCustomPaperIsStoredInTheNewNotebookBeforeItIsApplied() async throws {
+        let h = harness()
+        let log = CallLog()
+        stubDocCreate(h, log: log)
+        stub(h, CreateIDs.templateChoose, effect: .read, log: log) { _ in
+            ["background": ["kind": "pdf", "asset": "tmp:planner.pdf", "pdfPage": 2], "size": [612, 792]]
+        }
+        stub(h, CreateIDs.assetPut, effect: .edit, log: log) { p in
+            ["asset": "3f2a9c.pdf", "doc": p["doc"] ?? .null, "bytes": 2048]
+        }
+        stub(h, CreateIDs.pageSetBackground, effect: .edit, log: log)
+        let paperBefore = h.app.settings.get(NibSettings.defaultPaper)
+        let model = NewNotebookModel(app: h.app, folder: nil, kind: .notebook, session: h.session, navigator: nil)
+        model.draft.title = "Planner"
+        model.draft.hasCover = false
+        await model.chooseMore()
+        XCTAssertNil(log.params(CreateIDs.templateChoose).first?["doc"], "no notebook to store it in yet")
+        XCTAssertEqual(model.draft.custom, .ofPDF(AssetRef("tmp:planner.pdf"), page: 2))
+
+        let done = await model.create()
+        XCTAssertTrue(done, model.message ?? "")
+        let node = try XCTUnwrap(h.library.children(of: nil).first { $0.title == "Planner" })
+        let put = try XCTUnwrap(log.params(CreateIDs.assetPut).first)
+        XCTAssertEqual(put["doc"]?.stringValue, NodeRef.document(node.id).description, "stored in the new notebook")
+        XCTAssertEqual(put["url"], "tmp:planner.pdf")
+        XCTAssertEqual(put["ext"], "pdf")
+        let set = try XCTUnwrap(log.params(CreateIDs.pageSetBackground).first)
+        XCTAssertEqual(try set["background"]?.decode(Background.self), .ofPDF(AssetRef("3f2a9c.pdf"), page: 2),
+                       "the Background names the stored asset, never the temporary one")
+        let order = log.calls.map(\.command).filter { $0 == CreateIDs.assetPut || $0 == CreateIDs.pageSetBackground }
+        XCTAssertEqual(order, [CreateIDs.assetPut, CreateIDs.pageSetBackground])
+        XCTAssertEqual(h.app.settings.get(NibSettings.defaultPaper), paperBefore, "a custom paper is never a default")
+    }
+
+    /// A temporary paper that cannot be stored is never applied: the notebook stays on its template paper and says why.
+    /// Without `doc.create` the first content is made on the template paper and the stored paper applied after.
+    func testATemporaryCustomPaperThatCannotBeStoredIsNotApplied() async throws {
+        let custom = Background.ofImage(AssetRef("tmp:scan.jpg"))
+        func request(_ id: DocumentID) -> CreationRequest {
+            CreationRequest(id: id, kind: .notebook, title: "Scan", template: TemplateRef(TemplateIDs.ruled), size: .a4,
+                            background: custom)
+        }
+        func create(_ h: Harness, _ r: CreationRequest) async throws -> [String] {
+            try await DocumentCreator.create(r, runner: .user(h.app, session: h.session),
+                                             templates: h.app.content.templates, library: h.library,
+                                             workspace: h.app.workspace, settings: h.app.settings)
+        }
+
+        // No asset store command: nothing is stored or applied.
+        let h = harness()
+        let log = CallLog()
+        stubDocCreate(h, log: log)
+        stub(h, CreateIDs.pageSetBackground, effect: .edit, log: log)
+        let missing = try await create(h, request("TMPPAPER0001"))
+        XCTAssertEqual(missing.count, 1)
+        XCTAssertTrue(missing.first?.contains("could not be stored") ?? false, missing.first ?? "")
+        XCTAssertEqual(log.count(CreateIDs.pageSetBackground), 0)
+        XCTAssertNotNil(h.library.node("TMPPAPER0001"))
+
+        // asset.put fails: the same, with its reason.
+        stub(h, CreateIDs.assetPut, effect: .edit, log: log) { _ in throw NibError(.notFound, "tmp:scan.jpg expired") }
+        let failed = try await create(h, request("TMPPAPER0002"))
+        XCTAssertTrue(failed.first?.contains("tmp:scan.jpg expired") ?? false, failed.first ?? "")
+        XCTAssertEqual(log.count(CreateIDs.pageSetBackground), 0)
+
+        // Without doc.create: the library makes it on the template paper, then the stored paper is applied.
+        let h2 = harness()
+        let log2 = CallLog()
+        stub(h2, CreateIDs.assetPut, effect: .edit, log: log2) { _ in ["asset": "9d1e.jpg"] }
+        stub(h2, CreateIDs.pageSetBackground, effect: .edit, log: log2)
+        let warnings = try await create(h2, request("TMPPAPER0003"))
+        XCTAssertEqual(warnings, [])
+        let page = try XCTUnwrap(h2.app.workspace.content("TMPPAPER0003").livePages.first)
+        XCTAssertEqual(page.background.template?.id, TemplateIDs.ruled, "never a page naming a temporary asset")
+        XCTAssertEqual(log2.params(CreateIDs.assetPut).first?["ext"], "jpg")
+        XCTAssertEqual(try log2.params(CreateIDs.pageSetBackground).first?["background"]?.decode(Background.self),
+                       .ofImage(AssetRef("9d1e.jpg")))
+
+        // A paper already stored (not temporary) goes straight into the library's first content.
+        var stored = request("TMPPAPER0004")
+        stored.background = .ofImage(AssetRef("9d1e.jpg"))
+        _ = try await create(h2, stored)
+        XCTAssertEqual(try h2.app.workspace.content("TMPPAPER0004").livePages.first?.background, stored.background)
+        XCTAssertEqual(log2.count(CreateIDs.assetPut), 1)
+        XCTAssertEqual(log2.count(CreateIDs.pageSetBackground), 1)
     }
 
     func testMoreTemplatesAsksTheTemplatePickerAndIgnoresACancel() async throws {

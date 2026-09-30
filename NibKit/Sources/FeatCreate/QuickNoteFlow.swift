@@ -51,8 +51,8 @@ struct DocQuickNote: NibCommand {
             return Output(ref: NodeRef.document(id).description, title: title, folder: folderRef, opened: false)
         }
         let runner = CommandRunner.context(ctx)
-        let warnings = try await DocumentCreator.create(request, runner: runner, app: ctx.app, library: library,
-                                                        workspace: ctx.workspace, settings: settings)
+        let warnings = try await DocumentCreator.create(request, runner: runner, templates: ctx.content.templates,
+                                                        library: library, workspace: ctx.workspace, settings: settings)
         for warning in warnings { CreateLog.log.error("doc.quickNote: \(warning, privacy: .public)") }
         let created = library.node(id)?.title ?? title
         settings.set(PendingCreations.key(id), PendingCreation(kind: .quickNote, title: created))
@@ -214,13 +214,10 @@ enum TitleSuggester {
     /// Blocks whose tops are this close (points) count as one line.
     static let lineBand: Double = 8
 
-    /// `doc.suggestTitle`'s answer: a string or an object with `title` (or `suggestion` / `text`).
+    /// `doc.suggestTitle`'s answer, {title} (null when nothing is readable; ARCHITECTURE.md §6.5), cleaned like a
+    /// recognised line.
     static func parse(_ value: JSONValue) -> String? {
-        if let s = value.stringValue { return clean(s) }
-        for key in ["title", "suggestion", "text"] {
-            if let s = value[key]?.stringValue, let title = clean(s) { return title }
-        }
-        return nil
+        value["title"]?.stringValue.flatMap { clean($0) }
     }
 }
 
@@ -229,17 +226,22 @@ enum TitleSuggestion {
     /// Pages read for the first recognised line (and looked at for content).
     static let pagesToRead = 3
 
-    /// `doc.suggestTitle` (the AI, when the AI actions are installed and a provider is configured), else the first
-    /// recognised line of the first pages (`recognize.pageText`: handwriting, typed text, PDF text). An empty notebook
-    /// gets nil without a single call, so it never costs an AI request. The document has usually been left, so it is
-    /// peeked (`peekContent`), never opened into the workspace.
+    /// `doc.suggestTitle` when it is installed (the AI with a provider, else the first recognised line; null when
+    /// nothing is readable), else the first recognised line of the first pages (`recognize.pageText`: handwriting,
+    /// typed text, PDF text). An empty notebook gets nil without a single call, so it never costs an AI request. The
+    /// document has usually been left, so it is peeked (`peekContent`), never opened into the workspace.
     static func load(_ doc: DocumentID, runner: CommandRunner, workspace: Workspace,
                      knownToHaveContent: Bool = false) async -> String? {
         guard knownToHaveContent || hasContent(doc, workspace) else { return nil }
-        if runner.has(CreateIDs.docSuggestTitle),
-           let value = try? await runner.run(CreateIDs.docSuggestTitle, ["doc": .string(NodeRef.document(doc).description)]),
-           let title = TitleSuggester.parse(value) {
-            return title
+        if runner.has(CreateIDs.docSuggestTitle) {
+            do {
+                let value = try await runner.run(CreateIDs.docSuggestTitle,
+                                                 ["doc": .string(NodeRef.document(doc).description)])
+                // It reads the recognised lines itself: a null title means there is nothing to suggest.
+                return TitleSuggester.parse(value)
+            } catch {
+                CreateLog.log.error("doc.suggestTitle: \(NibError.wrap(error).message, privacy: .public)")
+            }
         }
         guard runner.has(CommandIDs.recognizePageText), let content = try? workspace.peekContent(doc) else { return nil }
         for page in content.livePages.prefix(pagesToRead) {

@@ -407,27 +407,33 @@ enum DocumentCreator {
     /// `beforeOmittedCover` runs just before `doc.create` is tried without `cover` (the Library Store then follows the
     /// cover settings, so the New sheet writes its cover choice there first).
     @discardableResult
-    static func create(_ r: CreationRequest, runner: CommandRunner, app: NibApp?, library: LibraryService?,
-                       workspace: Workspace, settings: SettingsStore,
+    static func create(_ r: CreationRequest, runner: CommandRunner, templates: Registry<TemplateDefinition>,
+                       library: LibraryService?, workspace: Workspace, settings: SettingsStore,
                        beforeOmittedCover: (@MainActor () async -> Void)? = nil) async throws -> [String] {
         var warnings: [String] = []
+        /// Whether the custom paper still has to be put on the pages once the document exists.
+        let applyCustomPaper: Bool
         if runner.has(CommandIDs.docCreate) {
             let style = try await createWithCommand(r, runner, beforeOmittedCover: beforeOmittedCover)
             if style == .omitted, r.kind == .notebook, r.cover == nil,
-               let warning = await removeUnwantedCover(r, runner, workspace, templates: app?.content.templates) {
+               let warning = await removeUnwantedCover(r, runner, workspace, templates: templates) {
                 warnings.append(warning)
             }
+            applyCustomPaper = r.background != nil
         } else {
             guard let library else { throw NibError.unavailable("the library") }
-            let clock = app?.clock
-            let content = DocumentBlueprint.content(r, stamp: { clock?.tick() ?? .zero },
+            // A `tmp:` paper is stored in the document first (`asset.put`), so it cannot go into the first content.
+            var first = r
+            if CustomPaper.needsStoring(r.background) { first.background = nil }
+            let clock = workspace.clock
+            let content = DocumentBlueprint.content(first, stamp: { clock.tick() },
                                                     language: settings.get(NibSettings.defaultLanguage),
                                                     scrollDirection: settings.get(NibSettings.scrollDirection))
             _ = try library.createDocument(content, title: r.title, in: r.folder)
-            return warnings
+            applyCustomPaper = r.background != nil && first.background == nil
         }
-        if let background = r.background, let warning = await applyBackground(background, r, runner, workspace,
-                                                                                templates: app?.content.templates) {
+        if applyCustomPaper, let background = r.background,
+           let warning = await applyBackground(background, r, runner, workspace, templates: templates) {
             warnings.append(warning)
         }
         return warnings
@@ -452,7 +458,7 @@ enum DocumentCreator {
 
     /// When `doc.create` could not be told "no cover", a QuickNote must still open on paper.
     private static func removeUnwantedCover(_ r: CreationRequest, _ runner: CommandRunner, _ workspace: Workspace,
-                                            templates: Registry<TemplateDefinition>?) async -> String? {
+                                            templates: Registry<TemplateDefinition>) async -> String? {
         guard let content = try? workspace.content(r.id), content.livePages.count > 1,
               let first = content.livePages.first, isCover(first, templates) else { return nil }
         guard runner.has(CreateIDs.nodeRemove) else { return nil }
@@ -464,22 +470,33 @@ enum DocumentCreator {
         }
     }
 
-    private static func isCover(_ page: PageRecord, _ templates: Registry<TemplateDefinition>?) -> Bool {
+    private static func isCover(_ page: PageRecord, _ templates: Registry<TemplateDefinition>) -> Bool {
         guard let id = page.background.template?.id else { return false }
-        if let definition = templates?.get(id) { return definition.isCover }
+        if let definition = templates.get(id) { return definition.isCover }
         return id.hasPrefix("cover.")
     }
 
-    /// Puts a custom paper (PDF page or image from `template.choose`) on every paper page of the new notebook.
+    /// Puts a custom paper (PDF page or image from `template.choose`) on every paper page of the new notebook. The
+    /// picker names a `tmp:` asset when it had no document to store it in (the notebook did not exist yet): it is
+    /// stored in the new notebook first (`asset.put`), and the Background names the stored asset.
     private static func applyBackground(_ background: Background, _ r: CreationRequest, _ runner: CommandRunner,
-                                        _ workspace: Workspace, templates: Registry<TemplateDefinition>?) async -> String? {
+                                        _ workspace: Workspace, templates: Registry<TemplateDefinition>) async -> String? {
         guard let content = try? workspace.content(r.id) else {
             return String(localized: "The notebook was created, but its paper could not be applied.")
         }
         let pages = content.livePages.filter { !isCover($0, templates) }
         guard !pages.isEmpty else { return nil }
-        guard runner.has(CreateIDs.pageSetBackground), let json = try? JSONValue.from(background) else {
+        guard runner.has(CreateIDs.pageSetBackground) else {
             return String(localized: "The notebook was created with the default paper: custom paper needs the Templates feature.")
+        }
+        let stored: Background
+        do {
+            stored = try await CustomPaper.store(background, in: r.id, runner: runner)
+        } catch {
+            return String(localized: "The notebook was created with the default paper, because the custom paper could not be stored: \(NibError.wrap(error).message)")
+        }
+        guard let json = try? JSONValue.from(stored) else {
+            return String(localized: "The notebook was created, but its paper could not be applied.")
         }
         do {
             _ = try await runner.run(CreateIDs.pageSetBackground,
@@ -489,6 +506,39 @@ enum DocumentCreator {
         } catch {
             return String(localized: "The notebook was created, but its paper could not be applied: \(NibError.wrap(error).message)")
         }
+    }
+}
+
+/// A custom paper from `template.choose` (a PDF page or an image). Without a `doc` to store it in, the picker returns
+/// it as a temporary asset (`tmp:<name>`, ARCHITECTURE.md §6.5), which a page cannot keep: it is stored in the new
+/// notebook with `asset.put {doc, url, ext}` and the Background is rewritten to name the stored asset.
+@MainActor
+enum CustomPaper {
+    static let temporaryPrefix = "tmp:"
+
+    static func isTemporary(_ asset: AssetRef?) -> Bool { asset?.name.hasPrefix(temporaryPrefix) ?? false }
+
+    static func needsStoring(_ background: Background?) -> Bool { isTemporary(background?.asset) }
+
+    /// The file extension `asset.put` gets: the temporary asset's own, else the one its kind implies.
+    static func ext(_ background: Background) -> String {
+        if let ext = background.asset?.ext, !ext.isEmpty { return ext }
+        return background.kind == .pdf ? "pdf" : "png"
+    }
+
+    /// `background` with a temporary asset stored in `doc` (unchanged when it names none).
+    static func store(_ background: Background, in doc: DocumentID, runner: CommandRunner) async throws -> Background {
+        guard needsStoring(background), let asset = background.asset else { return background }
+        guard runner.has(CreateIDs.assetPut) else { throw NibError.unavailable("Storing assets") }
+        let out = try await runner.run(CreateIDs.assetPut, ["doc": .string(NodeRef.document(doc).description),
+                                                           "url": .string(asset.name),
+                                                           "ext": .string(ext(background))])
+        guard let name = out["asset"]?.stringValue, !name.isEmpty, !name.hasPrefix(temporaryPrefix) else {
+            throw NibError(.internalError, "asset.put returned no stored asset")
+        }
+        var stored = background
+        stored.asset = AssetRef(name)
+        return stored
     }
 }
 
@@ -633,7 +683,9 @@ final class NewNotebookModel: ObservableObject {
         draft.size = PageSizeChoice(name: nil, size: PageSizeChoice.portrait(PageSize(w, h)))
     }
 
-    /// The full template picker (F045): its choice becomes the paper (a template, or a custom PDF page or image).
+    /// The full template picker (F045, `template.choose {kind: paper, size, color?}` → {background, size}): its choice
+    /// becomes the paper (a template, or a custom PDF page or image). No `doc` is sent (the notebook does not exist
+    /// yet), so a custom paper comes back as a `tmp:` asset, stored in the notebook once it is created (`CustomPaper`).
     func chooseMore() async {
         guard canChooseMore, !isWorking else { return }
         let size = draft.pageSize
@@ -649,7 +701,7 @@ final class NewNotebookModel: ObservableObject {
         }
     }
 
-    /// Reads `template.choose`'s {background, size}.
+    /// Reads `template.choose`'s {background, size} (`size` is the chosen [width, height], orientation applied).
     func apply(choice value: JSONValue) {
         guard value != .null, let raw = value["background"], let background = try? raw.decode(Background.self) else { return }
         if background.kind == .template, let template = background.template {
@@ -682,8 +734,9 @@ final class NewNotebookModel: ObservableObject {
         let request = draft.request(id: id, folder: folder, templates: app.content.templates)
         let warnings: [String]
         do {
-            warnings = try await DocumentCreator.create(request, runner: runner, app: app, library: app.services.library,
-                                                        workspace: app.workspace, settings: app.settings,
+            warnings = try await DocumentCreator.create(request, runner: runner, templates: app.content.templates,
+                                                        library: app.services.library, workspace: app.workspace,
+                                                        settings: app.settings,
                                                         beforeOmittedCover: { [weak self] in
                                                             await self?.remember(only: NotebookDraft.coverSettingNames,
                                                                                  runner: runner)
@@ -720,17 +773,12 @@ final class NewNotebookModel: ObservableObject {
     }
 }
 
-/// `template.choose` results: the size is [w, h] (ARCHITECTURE §6.1) or a {width, height} object.
+/// `template.choose` results: the size is [width, height] in page points (ARCHITECTURE.md §6.1, §6.5).
 enum TemplateChoice {
     static func size(_ value: JSONValue?) -> PageSize? {
-        guard let value else { return nil }
-        if let a = value.arrayValue, a.count == 2, let w = a[0].doubleValue, let h = a[1].doubleValue, w > 0, h > 0 {
-            return PageSize(w, h)
-        }
-        if let w = value["width"]?.doubleValue, let h = value["height"]?.doubleValue, w > 0, h > 0 {
-            return PageSize(w, h)
-        }
-        return nil
+        guard let a = value?.arrayValue, a.count == 2, let w = a[0].doubleValue, let h = a[1].doubleValue,
+              w > 0, h > 0 else { return nil }
+        return PageSize(w, h)
     }
 }
 
@@ -749,23 +797,19 @@ extension NewNotebookSheet {
         return d
     }
 
-    /// `panel.open` params for the sheet. `folder` and `kind` are sent both flat and under `params`, so the sheet reads
-    /// them whichever way the panel host passes `PanelContext.params` (the open params minus `id`, or their `params`).
+    /// `panel.open {id, folder?, kind?}` for the sheet. Every key but `id` reaches the sheet as the flat
+    /// `PanelContext.params` (F017's rule, ARCHITECTURE.md §6.1), also when the library presents it (F019).
     static func openParams(folder: FolderID?, kind: NewDocumentKind) -> JSONValue {
-        var extra: [String: JSONValue] = ["kind": .string(kind.rawValue)]
-        if let folder { extra["folder"] = .string(NodeRef.folder(folder).description) }
-        var p = extra
-        p["id"] = .string(CreateIDs.newNotebookPanel)
-        p["params"] = .object(extra)
+        var p: [String: JSONValue] = ["id": .string(CreateIDs.newNotebookPanel), "kind": .string(kind.rawValue)]
+        if let folder { p["folder"] = .string(NodeRef.folder(folder).description) }
         return .object(p)
     }
 
-    /// The folder (checked against the library) and kind a `PanelContext.params` names.
+    /// The folder (checked against the library) and kind the flat `PanelContext.params` name.
     @MainActor
     static func openContext(_ params: JSONValue, app: NibApp) -> (FolderID?, NewDocumentKind) {
-        func value(_ key: String) -> String? { params[key]?.stringValue ?? params["params"]?[key]?.stringValue }
-        let kind = value("kind").flatMap(NewDocumentKind.init(rawValue:)) ?? .notebook
-        guard let raw = value("folder"), !raw.isEmpty else { return (nil, kind) }
+        let kind = params["kind"]?.stringValue.flatMap(NewDocumentKind.init(rawValue:)) ?? .notebook
+        guard let raw = params["folder"]?.stringValue, !raw.isEmpty else { return (nil, kind) }
         let id: FolderID
         switch NodeRef(raw) {
         case .folder(let f)?: id = f

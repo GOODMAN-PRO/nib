@@ -90,4 +90,5 @@ enum CreateIDs {
     static let templateChoose = CommandIDs.templateChoose
     static let pageSetBackground = CommandIDs.pageSetBackground
     static let nodeRemove = CommandIDs.nodeRemove
+    static let assetPut = CommandIDs.assetPut
 }
