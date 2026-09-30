@@ -1,0 +1,41 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSticky/StickyCommands.swift:360-404 (StickyAttach.commitDidHappen)",
+      "problem": "Undo of any drop onto (or off) a note is broken. The attach/detach follow-up runs item.update on the same item the originating commit (item.transform, paste, duplicate, item.create...) just wrote, in the same undo group. UndoHistory.record appends both changesets to one entry. DocTransaction.revert walks it in reverse with a rev guard: it reverts the item.update (writing the pre-attach value with a fresh rev), then skips the move/create because the rev no longer matches. So one undo of a drag onto a note leaves the item where it was dropped (only attachedTo is cleared). Undoing a paste onto a note leaves the pasted item on the page. history.revertGroup of an AI turn is partial too. The same double-write-in-one-group problem is described in StickyEditor's own doc comment, but StickyAttach does it anyway. No test covers commitDidHappen end to end.",
+      "fix": "Stop writing, inside the originating group, a record that the changeset already wrote. Ask the core owner (contract request, handled outside this branch) to make UndoHistory.record / DocTransaction.revert coalesce repeated writes of one record in an entry (keep the first before and the last after). Until that lands, drop the follow-up for records in `moved`/`created` and keep only the orphan detach, which writes different records. Report the attach criterion as blocked by the contract gap. Either way, add a Harness test: register stand-in `item.transform` and `item.update` commands, move FIXTURESHP01 onto FIXTURESTY01, wait for the follow-up, call bus.undo once, then assert that both the shape's frame and its attachedTo are restored."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSticky/StickyEditor.swift:152-159 (StickyActions.setText)",
+      "problem": "The item.update fallback patches {\"text\": json}. On an Item that key is the TextBoxItem payload, not StickyItem.text. item.update (encode, JSONValue.merging, decode) then tries to decode a TextBoxItem from {paragraphs: [...]}, which throws because `frame` is missing. So when text.setText is not installed (ARCHITECTURE says the app must run with any subset of features), every in-place edit and every inspector formatting change fails and the typed text is lost, because the overlay is already gone. There is also no fallback when text.setText exists but rejects a sticky ref, and F026's spec only covers .text items. None of these paths is tested.",
+      "fix": "Patch `[\"sticky\": [\"text\": json]]`. Call text.setText with `try await app.bus.execute`, and fall back to that item.update when it throws unavailable or invalid_params. Report and toast only if both fail. Add tests: (a) with no text.setText registered and an item.update stand-in that merges and decodes like F003, saving an edit updates sticky.text; (b) with a text.setText stand-in that throws invalid_params, the text is still saved."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSticky/StickyTool.swift:344-358 (StickyInspector.format)",
+      "problem": "Bold, italic, underline, strikethrough, size and alignment are computed from `targets[i].note.text`, a copy cached when the inspector opened. The whole text is then written back with text.setText. Any change to the note's text since then is silently overwritten with the old text: an undo (⌘Z), a collaborator's edit, a sync merge or an AI edit. That is a data-loss risk.",
+      "fix": "When the action runs, parse each ref and read the live note (`app.workspace.item(doc, page: page, id: id).sticky`). Apply `change` to that text, and skip notes that are now locked or deleted. Use the cached `targets` only to show the toggles' state. Add a test: open the inspector's logic on the fixture note, change the text through the stand-in, then apply bold and assert that the new text is kept."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSticky/StickyDrawer.swift:43-47, StickyCommands.swift StickySetCollapsed",
+      "problem": "A collapsed note keeps its full 140-160 pt frame, and Item.bounds still reports that frame. The tap router's 'topmost item under the point', lasso bbox selection and itemKinds filtering all see an invisible square around the 28 pt icon. Taps there go to sticky.tapAt, which declines, so handlers for the item underneath (tape.tapAt, link.tapAt, text.tapAt) are never offered, and a lasso stroke across empty-looking paper selects the collapsed note.",
+      "fix": "Ask for a per-drawer hit shape in a contract request (for example Item.bounds honouring sticky.collapsed, or an ItemDrawer hitBounds hook). Until then, list this as a known limitation in the F036 summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSticky/StickyEditor.swift:165-177 (StickyTextView)",
+      "problem": "VoiceOver has no way to finish editing without a hardware keyboard. The text view does not implement accessibilityPerformEscape, and its hint only mentions pressing Escape.",
+      "fix": "Override `accessibilityPerformEscape() -> Bool { onDone?(); return onDone != nil }` and change the hint to cover both ways, for example \"Scrub or press Escape to finish editing.\""
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSticky/StickyEditor.swift:324 and 328-332 (beginEditing / beginDraft)",
+      "problem": "beginDraft never reveals the new note, so on iPhone a note placed in the lower half of the screen opens under the keyboard. beginEditing always reveals with animated: true, even when Reduce Motion is on.",
+      "fix": "In both functions call `host.session.editor?.reveal(page: page, rect: note.frame.bounds, animated: !UIAccessibility.isReduceMotionEnabled)`."
+    }
+  ]
+}
