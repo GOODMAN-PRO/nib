@@ -1,0 +1,47 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatHighlighter/HighlighterTool.swift:461-462, 496-508 (task(id:) commitWidth / commitStabilization) and 365-372 (PresetEdit.width)",
+      "problem": "Simply opening the settings popover can run commands the user never asked for. `.task(id:)` also runs when the view appears, so commitWidth and commitStabilization fire 300 ms / 250 ms after open. (1) If the selected width is not on the 0.1 pt grid, for example 12.25 set by the AI or a plugin through preset.setWidth, commitWidth rounds it to 12.3 and runs preset.setWidth, and that is a synced write. (2) If two slots share a width, `firstIndex` finds the other slot and runs preset.select, which switches the user's selected thickness. (3) A stabilisation off the 0.01 grid (0.333) is rewritten to 0.33 with settings.set.",
+      "fix": "In PresetEdit.width, return nil first when `abs(p.width - points) < 0.05` (the selected slot already shows this value), before searching the other slots. In commitStabilization, compare the unrounded slider value with the stored value (`guard abs(stabilization - stored) > 1e-9`) before rounding. Or set a `userEdited` flag from the slider bindings and skip both commits until it is true."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatHighlighter/HighlighterTool.swift:553-574 (SystemColourPicker.Coordinator)",
+      "problem": "Closing the colour picker without choosing a colour still calls `pick(viewController.selectedColor)`. `last` starts as nil, so preset.setSwatch runs with the initial colour and forces alpha to 0x80. A slot whose alpha was different (for example set by the AI) is overwritten just by opening and closing Custom….",
+      "fix": "Seed the coordinator with the initial colour and compare RGB, not UIColor identity. For example keep `private var last: RGBA?` set to `RGBA(parent.initial)` in init, and in `pick` do `let c = RGBA(color); guard c.r != last?.r || c.g != last?.g || c.b != last?.b else { return }`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatHighlighter/HighlighterTool.swift:450",
+      "problem": "SettingsStore is documented as thread-safe and posts didChange on the thread that wrote the value (for example a synced-settings merge). `.onReceive` has no hop to the main thread, so reload() can change @State off the main thread.",
+      "fix": "`.onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings).receive(on: RunLoop.main))`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatHighlighterTests/FeatHighlighterTests.swift (Draw and Hold section)",
+      "problem": "The paths that stop drawn ink from being lost are not tested. Nothing covers `shape.create` throwing (the stroke must then be committed), or `touchesCancelled` / `deactivate` during a hold (the stroke must be committed exactly once, and a recognition result that arrives later must be ignored).",
+      "fix": "Add two tests. (a) Register a shape.create stand-in that throws NibError, hold, end the touch, wait, then assert `host.committed.count == 1` with the original stroke. (b) Hold, then call `tool.deactivate(host)` before recognition finishes, wait, then assert committed.count == 1 and that the shape.create stand-in was never called."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatHighlighter/StraightLineProcessor.swift:14-55 and FeatHighlighterTests.swift:19-40",
+      "problem": "The acceptance item 'endpoints preserved' is only checked with fixtures whose first and last samples already lie on the fitted line: the symmetric wobble, and collinear points. The implementation places the two ends at the extremes of the samples projected onto the total-least-squares line. For a real stroke whose ends are off that line, or that overshoots, the ends move, and no test shows or pins that behaviour.",
+      "fix": "Pick the intended meaning and pin it with a test whose first and last samples are off the fitted line. Either keep the extent extremes and assert the ends equal the projections of those extremes, or place the ends at the projections of the first and last samples (`placed(first, at: along(first))`, `placed(last, at: along(last))`) so that 'endpoints preserved' holds along the line."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatHighlighter/StraightLineProcessor.swift:59-78 (HighlighterGeometry.stabilized)",
+      "problem": "The spec says the highlighter uses 'the same EMA rule as pen'. F007 specifies a plain EMA for pen.stabilize. This code averages a forward EMA with a backward EMA, which is a zero-phase filter with a different response. Once F007 lands, the same Stabilisation value will smooth pen and highlighter strokes differently (T-007 parity).",
+      "fix": "Use the single forward EMA F007 will use (weight `1 - 0.85*amount`, last sample pinned), or keep the zero-phase version and flag the rule in the F009 summary so that F007 matches it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibContracts ToolPresets.defaults(for: \"highlighter\") (outside F009's files)",
+      "problem": "The default highlighter slots are #FFE03D, #7CE38B and #FF8FB1, with widths 8/12/18. They do not match DESIGN §3.5 / §14.3: Lemon #FFE45C … Blush, and thickness presets 8/14/20. As a result, no highlighter swatch appears selected the first time the popover opens.",
+      "fix": "No change to F009's files. Report it to the orchestrator for a contract request aligning ToolPresets.defaults(\"highlighter\") with NibHighlighter and the DESIGN widths."
+    }
+  ]
+}

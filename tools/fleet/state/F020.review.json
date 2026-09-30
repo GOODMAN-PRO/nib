@@ -1,0 +1,59 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryOrganize/FeatLibraryOrganizeFeature.swift:189-199 (LibraryWatch.reload -> PageIndex.prune)",
+      "problem": "LibraryWatch.init calls reload(), which prunes the shared PageIndex. That init runs inside a @StateObject autoclosure while SwiftUI is updating the view, and the same view observes PageIndex, so a prune publishes during a view update. The prune also trusts whatever the catalogue returns at that moment. If allNodes() is empty or partial (library root not reachable yet, or a rescan in progress), it wipes the persisted cache, and bookmarked or trashed pages of unopened documents disappear from Favourites and Trash until each document is loaded again.",
+      "fix": "Move pruning into PageIndex.attach as its own libraryChanged subscription and remove it from LibraryWatch.reload. Skip the prune when library.allNodes() is empty."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryOrganize/TrashPanel.swift:222-227, 258",
+      "problem": "The sort order is copied into @State once, in init. When organize.trashSort changes through settings.set (from the AI, a plugin or another window), an open Trash tab does not update.",
+      "fix": "Follow the setting: refresh `sort` from app.settings when a settings-changed event for organize.trashSort arrives, or read the setting in body and keep only a local override."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryOrganize/TrashPanel.swift:398 (glyph column), 399; FavoritesPanel.swift:164; FolderStyleSheet.swift:456-459",
+      "problem": "Several values are hard-coded instead of taken from tokens: .frame(width: 28), VStack spacing 2 and 1, a 40x40 frame and lineWidth 2. The Trash glyph column stays 28 pt wide while FolderGlyph grows to 44 pt at accessibility sizes, so the glyph runs into the title at AX3.",
+      "fix": "Use NibSpacing.xxs for the spacing. Give the glyph column a @ScaledMetric width that uses the same min(scale, 2) cap as FolderGlyph."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryOrganize/TrashPanel.swift:497",
+      "problem": "When Reduce Motion is on, the selection bar still enters with .move(edge: .bottom). Only the spring is shortened.",
+      "fix": "Read @Environment(\\.accessibilityReduceMotion) and use .opacity as the transition when it is on."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryOrganize/FeatLibraryOrganizeFeature.swift:118-121 (Organize.currentFolder)",
+      "problem": "New Folder takes its parent from the first folder in MenuContext.nodes. CONTRACTS documents that field as the library selection, not the folder being viewed. If a folder is selected, or if FeatLibraryUI passes the selection for libraryNew, the new folder is created inside the selected folder instead of the current one.",
+      "fix": "Agree the libraryNew context with F019, for example the current folder as the single node. Until then, use the first node only when ctx.nodes.count == 1."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryOrganize/TrashPanel.swift:427-431",
+      "problem": "Trashed pages show the PDF glyph (`doc`), so a page row looks like a PDF document.",
+      "fix": "Use NibSymbol.pages for .page entries."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryOrganize/FolderStyleSheet.swift:115-139 (FolderIcons.names)",
+      "problem": "The folder icon catalogue is a local list of SF Symbol name strings. ARCHITECTURE §22 says 'no SF Symbol strings' and says a missing token must be requested from NibDesign, not added locally. Lint accepts it because the names pass through NibSymbol(systemName:).",
+      "fix": "Keep the list as a stop-gap and raise a NibDesign request for a folder-icon catalogue (for example NibSymbol.folderIcons) at the next contract window."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatLibraryOrganizeTests/FeatLibraryOrganizeTests.swift",
+      "problem": "No test covers failure paths: a stand-in that throws, TrashActions returning false while the remaining per-document calls still run, or the commit bailing out before folder.setStyle. PageIndex cache pruning against an empty catalogue is also untested.",
+      "fix": "Add one throwing stand-in (for example page.purge on one document) and assert that the result is false and that the other calls still ran. Add a case asserting that a prune with no library nodes leaves the index intact once the prune fix lands."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLibraryOrganize/FeatLibraryOrganizeFeature.swift:226-230 (PageIndex scope)",
+      "problem": "Trash lists trashed pages only for documents whose head has been loaded (or cached) on this device. Empty Trash therefore cannot purge pages trashed on another device in documents not opened here. This is documented as a ponytail, and query.find cannot list pages, so no library-wide page query exists.",
+      "fix": "No change needed now. Record it as the known limit, to be lifted by a library-wide page catalogue (F002/F055)."
+    }
+  ]
+}

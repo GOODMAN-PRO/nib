@@ -1,0 +1,71 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatQuery/NodeCommands.swift Edits.createItem (L64-67), Edits.patchItem (L103-113); QueryShapes.swift checkStrokePoints (L313)",
+      "problem": "Stroke points from AI, plugins or the bridge go into InkModel.prepare -> densify without any range or finiteness check. item.create {kind:'stroke', stroke:{fmt:'xy', pts:[0,0,1e30,0]}} squares to +inf in Float, so Int((d/spacing).rounded(.up)) traps and the app crashes on the main actor. pts:[0,0,1e9,0] asks for about 6.7e8 interpolated points (about 26 GB), which gets the app killed for memory. ptsB64 can also carry NaN, which hits the same trap. The same path is reachable through node.insert, item.update and node.set.",
+      "fix": "Add a shared Shapes.validateInk(_ stroke: Stroke, path:) and call it after decoding and before InkModel.prepare in createItem and patchItem (also for math.sourceInk). Require every x/y/width/height to be finite with |x|,|y| <= 100_000 (the page-size cap DocTransaction enforces) and points.count <= a fixed cap (e.g. 50_000); otherwise throw invalid_params at <path>.stroke.pts. Add a test that sends 1e30 and 1e9 coordinates and expects invalid_params, not a crash."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatQuery/AssetCommands.swift AssetGet.run (L106-121), AssetPut/AssetGet doc parsing, AssetBytes.load (L26-41)",
+      "problem": "asset.get passes the caller's `asset` string straight to AssetStore.data(AssetRef(name), doc:) after removing only an 'assets/' prefix. `doc` is taken as NodeRef.documentID(from:), which accepts any raw string, and the document's existence is never checked. Neither the AssetStore contract nor F001's spec promises to sanitise names, so a plugin with document:read, or the AI, can send asset:'../../LOCKED.nibnote/doc.head.json' against an unlocked doc. requireUnlocked only checks the named doc, so this reads another (locked) package or arbitrary sandbox files and returns them as base64. asset.put's url also accepts 'tmp:../..' names, which are passed to temporaryURL without validation.",
+      "fix": "Validate at the command boundary. `doc` must parse as doc:D (Shapes.ref + documentID, NibID.isValid) and exist (ctx.workspace.content). `asset` must match ^[A-Za-z0-9_-]{1,128}(\\.[A-Za-z0-9]{1,10})?$ with no '/' and no '..'; otherwise throw invalid_params at $.asset. In AssetBytes.load, reject 'tmp:' names that fail the same pattern before calling ctx.inputFile. Add a test that '../x.png' is rejected."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatQuery/NodeCommands.swift Edits.createItem (L58-62), Edits.ensureNew (L22-26), NodeMove cross-page conflict check (L528-531)",
+      "problem": "The id-conflict checks look only at live records. DocTransaction.put treats a tombstone with the same id as the existing record and keeps its createdBy for non-user principals. So an AI can node.remove a user's item and then item.create with that same id, and its new content is stored with createdBy 'user'. That bypasses the 'provenance cannot be forged' guarantee this feature's acceptance criteria test. For pages, node.insert with the id of a page in the page Trash overwrites the trashed record, and the old page's items reappear on the 'new' page.",
+      "fix": "Treat tombstoned ids as taken. In createItem and the node.move target check, test ctx.workspace.allItems(doc, page:) instead of items(...). In ensureNew, drop the `&& !$0.deleted` filter. In all three, throw conflict with the existing 'choose another id' hint. Add a test: AI removes FIXTURETXT01, then item.create with id FIXTURETXT01 must fail (or at least must not be stored as createdBy 'user')."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatQuery/QueryCommands.swift Shapes.documentJSON (L350-355), QueryGet block/card/outline/item branches (L130-160), pageJSON base (ext/background); QueryShapes.swift fill (L350)",
+      "problem": "The acceptance criteria cap every result at NibLimits.aiToolResultBytes and require cursor + truncated, but several paths ignore the cap. query.get doc:D inlines every live outline entry and audio clip without paging (a PDF with about 110 or more outline entries already exceeds 20 KB on every call). Single-record gets (block, card, outline, item at depth 2, math sourceInk with points) return the full record with no limit, and a block also duplicates its text as plainText. The page base includes unbounded ext/background. When the base or one row exceeds the budget, fill still emits the oversized row, and paging then advances one row per >20 KB call.",
+      "fix": "Page outline and audio the same way as pages: move them into fill under their own keys, or return only outlineCount/audioCount and let callers use query.get outline:/audio: refs. When a single row or record is still larger than the budget after fill, replace its large string fields (text/plainText/ext/data) with a clipped value plus 'truncated': true, and never emit more than aiToolResultBytes. Add a test with 300 outline entries and one 30 KB block asserting jsonString().utf8.count <= NibLimits.aiToolResultBytes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatQuery/NodeCommands.swift Edits.patchItem (L96-100); QueryShapes.swift checkStrokePoints (L314)",
+      "problem": "A patch {'stroke': {'pts': null}} or {'stroke': {'ptsB64': null}} passes checkStrokePoints (null is skipped) but is treated as new points. ptsB64 is removed or nulled, the decoder falls back to an empty pts array, and the stroke is silently stored with zero points (bounds .zero).",
+      "fix": "In checkStrokePoints, reject an explicit null for pts or ptsB64 with invalid_params ('pts cannot be null; remove the item with node.remove'). Alternatively, in patchItem, fail when the merged stroke decodes to zero points."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatQuery/QueryShapes.swift protectedMetaFields (L10); NodeCommands.swift Edits.set .document (L130-144)",
+      "problem": "Non-user principals can node.set meta.kind, which reinterprets a notebook as a textDocument and hides all its pages. They can also set meta.sourceBookmark, which query.get deliberately hides, to arbitrary bytes that other features will later resolve as a security-scoped file bookmark.",
+      "fix": "Add 'kind' and 'sourceBookmark' to protectedMetaFields. kind should arguably be rejected for every principal, because no document conversion happens here."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatQuery/QueryCommands.swift QueryFind.run (L205-222)",
+      "problem": "query.find {in: doc:D} loads every page into the Workspace cache and builds a full summary dictionary for every match in the document on every call, including each cursor page, before returning at most one page. On a notebook of about 1000 pages this is O(all items) main-actor work and memory per call.",
+      "fix": "Collect only the matching (page, item) pairs, which is cheap unless `where` needs the row. Build the summary rows lazily inside fill's row closure for the requested window. Consider workspace.evictPages for pages that were not already loaded."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatQuery/AssetCommands.swift AssetBytes.load (L26-41)",
+      "problem": "A url input, including an https download requested by the AI or a plugin, is read fully into memory with Data(contentsOf:) and has no size limit, so a multi-GB URL gets the app killed for memory. Also, a plugin without the `network` permission can make arbitrary https GET requests (a data exfiltration channel) through asset.put {url}.",
+      "fix": "Before reading, check the file size with url.resourceValues(forKeys: [.fileSizeKey]) and reject anything above a fixed cap (e.g. 200 MB) with invalid_params. For a plugin principal with an http(s) url, require ctx.bus.gateway.grants(ctx.principal).contains(.network), else throw permission_denied. Better still, raise the same check as a contract change in CommandContext.inputFile."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatQuery/AssetCommands.swift AssetPut.descriptor (L55-66)",
+      "problem": "asset.put is declared .edit and undoable (the default) but never calls ctx.mutate. It records no undo entry, emits no committed event, and writes the bytes even during dryRun, so the descriptor claims an undo round trip that does not exist.",
+      "fix": "Declare `undoable: false`, which conformance then checks as 'undo stack unchanged', and document that the asset is content-addressed and garbage-collected when unreferenced. Optionally skip the store write when ctx.dryRun."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatQuery/NodeCommands.swift NodeMove item cross-page (L527-540)",
+      "problem": "A cross-page node.move by a non-user principal is a tombstone plus an insert. DocTransaction.put stamps the insert with the AI or plugin principal, so a user's handwriting moved by the AI is re-attributed to 'ai:<chat>'. F003 cannot fix this itself, because put overwrites createdBy on create.",
+      "fix": "Raise a contract change (e.g. DocTransaction.put(_:doc:page:keepingProvenanceOf:) or a move helper) so a move keeps the original createdBy, and add a test. Until then, document the limitation in the node.move summary."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatQueryTests/FeatQueryTests.swift",
+      "problem": "The riskiest logic has no tests: hostile stroke coordinates, asset-name validation, reuse of tombstoned ids, stroke width rescaling on a style.width patch, item.update payload routing ({'text': 'x', 'frame': {'w': 320}} is only run by conformance and its result is never asserted), rejection of meta.format, meta.trashedFrom and id-on-update, colour matching in `where`, and the 20 KB cap on doc and record results.",
+      "fix": "Add focused tests for each case listed above alongside the fixes."
+    }
+  ]
+}
