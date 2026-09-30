@@ -1,0 +1,35 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibTemplates/TemplateCommands.swift: TemplateCommands.itemsOutside + PageSetTemplate.run (the `if let size = page.size, size != t.page.size` block inside ctx.mutate)",
+      "problem": "Any size or orientation change runs itemsOutside for every target page inside the synchronous mutate body. itemsOutside calls tx.items -> Workspace.allItems, which loads each page's items from persistence and caches them in workspace.pageItems. On a whole-document resize ({pages:[doc:D], size:...}, the D-043/D-044 'all pages' case) of a 300-1000 page notebook this decodes and keeps every page in memory on the main actor (budget: 50 ms per 1k-stroke page), which breaks ARCHITECTURE section 14 (mutate must stay short, under 16 ms) and the resident-memory budget. It also runs when the page only grows, where nothing new can end up outside.",
+      "fix": "Collect the outside refs before ctx.mutate, and only for pages whose new size is smaller in some dimension (new.width < old.width || new.height < old.height). Remember which pages were already in workspace.pageItems[doc] before the check, and afterwards call workspace.evictPages(doc, keeping: thatSet + visible) so pages loaded only for the check are dropped. Stop collecting refs after about 100 and return the total as an `outsideCount` field."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibTemplates/TemplateCommands.swift: TemplateCommands.stampDates (`Calendar.current.dateComponents([.year, .month], from: now)`)",
+      "problem": "Dated templates are stamped using the device calendar, but PlannerCalendar renders month/year as Gregorian. With a non-Gregorian calendar the stamped values are wrong: Buddhist (default for th_TH) stamps year 2569, Japanese stamps 8, Persian 1405 with month 7 for September, Hebrew can stamp month 13. The monthly planner then shows the wrong year and day grid. These values skip normalize, so year 2569 is stored even though the declared year maximum is 2200. The test uses Calendar.current as well, so it cannot catch this.",
+      "fix": "Stamp with `var cal = Calendar(identifier: .gregorian); cal.timeZone = .current; let parts = cal.dateComponents([.year, .month], from: now)`. Change the test at NibTemplatesTests.swift:251 to use the same Gregorian calendar. Add one assertion that sets a Buddhist calendar through an injectable calendar parameter on stampDates and checks that the Gregorian year is stored."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibTemplates/TemplateCommands.swift: PageSetTemplate.Output (pages, outside) / PageSetBackground.Output",
+      "problem": "Result arrays have no limit. On a large notebook, doc:D returns one ref per page (about 34 bytes each) plus every outside item ref. That goes past NibLimits.aiToolResultBytes (20 KB), so the AI layer cuts the result of an edit command, and paging with a cursor makes no sense for an edit.",
+      "fix": "Return `count` and at most about 100 refs in `pages` and `outside` (with `truncated: true` when capped), following the ARCHITECTURE section 6 big-result convention."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibTemplates/TemplateCommands.swift: PageSetBackground.run, coverFlag(..., allowDisable: false)",
+      "problem": "page.setBackground {kind: template, template: {id: builtin.ruled}} on a cover page 1 turns the cover into paper but leaves meta.coverEnabled = true. page.setTemplate with the same template turns it off. The comment says setBackground cannot tell a custom cover from paper, but for kind 'template' it can.",
+      "fix": "Pass `allowDisable: p.background.kind == .template` (a non-cover template is known to be paper). Keep false only for pdf/image/color."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibTemplates/TemplateCommands.swift: PageSetBackground.run / TemplateCommands.checkAsset",
+      "problem": "background.asset comes from AI or plugins and is stored with no validation of its name. A name like '../OTHERDOC/assets/x.png' passes the fileExists check whenever the store just appends the name to a path (as InMemoryAssetStore does). The page would then persist a reference to another document's asset, possibly one in a locked document.",
+      "fix": "In checkAsset, reject names that contain '/', '\\' or '..', or that start with '.', using NibError.invalid(path: \"$.background.asset\", hint: \"pass the asset name returned by asset.put\"). Do this before the store lookup and even when services.assets is nil."
+    }
+  ]
+}

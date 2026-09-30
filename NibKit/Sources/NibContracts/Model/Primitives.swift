@@ -24,6 +24,13 @@ public enum NibLimits {
     public static let boardItemLimit = 100_000
     public static let aiToolResultBytes = 20_000
     public static let undoDepth = 200
+    /// contracts-v2: largest file `CommandContext.inputFile` downloads (200 MB).
+    public static let maxDownloadBytes = 200 * 1_048_576
+    /// contracts-v2: how far an `ItemDrawer` may paint outside `Item.bounds` (arrowheads, nib width, connector labels,
+    /// text overflow). The renderer pads culling and tile invalidation by it.
+    public static let drawerMargin: Double = 12
+    /// contracts-v2: most points one `ink.erase` path may carry.
+    public static let maxErasePathPoints = 20_000
 }
 
 // MARK: - Identifiers
@@ -138,6 +145,9 @@ public final class HLCClock {
 
     public init(device: UInt32) { self.device = device }
 
+    /// contracts-v2: `device` as 8 lowercase hex characters (per-device file names).
+    public var deviceHex: String { String(format: "%08x", device) }
+
     public func tick() -> Rev {
         lock.lock()
         defer { lock.unlock() }
@@ -174,6 +184,24 @@ public enum FractionalIndex {
     /// A key strictly between `a` and `b` (nil = unbounded). Precondition: a < b when both are given.
     public static func between(_ a: String?, _ b: String?) -> String {
         String(mid(Array(a ?? ""), b.map { Array($0) }))
+    }
+
+    /// contracts-v2: `count` increasing keys strictly between `a` and `b` (nil = unbounded), built by bisection so they
+    /// stay short: about log62(count) + 1 characters (10,000 keys ≤ 4 characters), where `sequence` grows by one
+    /// character every few keys. For imports and batch inserts. Precondition: a < b when both are given.
+    public static func balanced(count: Int, after a: String? = nil, before b: String? = nil) -> [String] {
+        guard count > 0 else { return [] }
+        var out = [String](repeating: "", count: count)
+        func fill(_ lo: Int, _ hi: Int, _ left: String?, _ right: String?) {
+            guard lo <= hi else { return }
+            let mid = (lo + hi) / 2
+            let key = between(left, right)
+            out[mid] = key
+            fill(lo, mid - 1, left, key)
+            fill(mid + 1, hi, key, right)
+        }
+        fill(0, count - 1, a, b)
+        return out
     }
 
     /// `count` increasing keys after `a`.
@@ -239,6 +267,9 @@ public struct RGBA: Hashable, Codable, CustomStringConvertible {
     public func withAlpha(_ alpha: Double) -> RGBA {
         RGBA(r, g, b, UInt8(max(0, min(255, (alpha * 255).rounded()))))
     }
+
+    /// contracts-v2: alpha a highlighter colour is stored with (the renderer blends it per paper, see `NibHighlighter`).
+    public static let highlighterAlpha: UInt8 = 0x80
 
     public static let black = RGBA(0x1A, 0x1A, 0x1A)
     public static let white = RGBA(0xFF, 0xFF, 0xFF)
