@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatImport/PackageImporter.swift:67-74 (importArchive, whole-library backup branch)",
+      "problem": "Backup library data is merged for every principal. import.files is exposed to AI, plugins and the bridge (library:write). A caller that uploads a zip holding .nib-library/ (asset.upload tmp: ref or an https download) gets ArchiveIO.merge to add new files: prefs.<newdev>.json (synced settings merged by rev, so settings.set validation is skipped, for example plugins.galleries pointing at a hostile gallery), plugin-data/<otherPlugin>/storage.<dev>.json (writes into another plugin's nib.storage), ai/<chat>.<dev>.jsonl (planted chat history), and extra files inside an installed plugin's hashed plugins/<id>/ folder.",
+      "fix": "Merge library data only when ctx.principal.isUser. Other principals should get the folders and documents only, or permission_denied with a hint to ask the user. For every principal, skip plugins/ (reinstall through plugin.install review) and never add files into a plugin folder that already exists. Add a test: an .ai(\"chat\") import of a backup zip leaves h.library.metadataURL unchanged."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatImport/PackageImporter.swift:98-130 (importContents) with ImportCommands.swift:674-675 and 800-807 (consumeImported)",
+      "problem": "Files skipped inside a zip or folder (unsupported types, failed conversions, a bad package) are only logged. importContents returns success, `failed` stays empty, the dialog says \"Import finished.\" and an AI caller gets no signal. The source still counts as imported, so consumeImported deletes the Open In copy, the App Group item or the loose Documents file (a Finder or File Sharing transfer). The skipped files are then gone from the device with no warning. Loose .doc/.docx/.ppt/.pptx/.html originals are also deleted after the lossy PDF conversion.",
+      "fix": "Make importContents return (docs, failures), with each skipped entry's relative path (\"Notes.zip › Chemistry/notes.key\") and its NibError. Append those to ImportResult.failed and to the dialog's Not imported list. Consume a source only when nothing inside it was skipped. Never delete loose Documents originals that went through a conversion: add them to `declined` instead. Test: a zip with one PNG and one .xyz under ImportLocations.openInInbox returns one failed entry, and the inbox copy stays."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatImport/ImportDialog.swift:300-349 (folderSection / choiceRow)",
+      "problem": "The folder picker is a hand-built hierarchical list: NibRow plus .padding(.leading, min(depth, NibMetrics.outlineMaxDepth) * NibMetrics.outlineIndent), with a hand-made checkmark row inside a .plain Button. The NibDesign v2 additions include NibOutlineRow for exactly this (\"a row of an outline or any hierarchical list\": per-level indent capped at outlineMaxDepth, selected state, emphasis title, isSelected trait, 44 pt). DESIGN.md §15.6 forbids hand-rolling a component that exists.",
+      "fix": "Render each ImportFolderOption as Button { model.folder = option.folder } label: { NibOutlineRow(option.title, depth: option.depth + 1, isSelected: model.folder == option.folder, reservesDisclosure: false) { Image(nib: option.folder == nil ? .library : .folder) } }, and drop the manual indent. Keep choiceRow only for the flat mode and position lists."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImport/OfficeConverter.swift:210-308 (WebPDFRenderer)",
+      "problem": "authorizeWebPage checks only the first address. The web view (JavaScript on for live pages) then follows any redirect or navigation. An allowed https page can move the main frame to a host outside a plugin's network.hosts, and that content ends up in a PDF the plugin can read with pdf.text.",
+      "fix": "Pass the caller's policy (principal, allowed hosts) into WebPDFRenderer. Implement webView(_:decidePolicyFor:decisionHandler:) to cancel main-frame navigations that are not https to an allowed host for non-user principals, and fail the load with permission_denied."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImport/ImportDialog.swift:465-483 (ImportDialogSession.choose) and InboxScanner.swift:195-225",
+      "problem": "Closing the window that shows the dialog (app switcher or Stage Manager) disconnects its scene without calling onChoose. The continuation never resumes, so the import.files call hangs, its inFlight claims are never released, and InboxScanner.busy stays true. Nothing is offered again until the app relaunches.",
+      "fix": "While `pending` is set, observe UIScene.didDisconnectNotification for the navigator's scene (or the host's viewDidDisappear when not dismissed by the model) and resolve(.notShown)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImport/InboxScanner.swift:200-203 with ShareHandoff.take (InboxScanner.swift:78-93)",
+      "problem": "When the person denies the paste prompt, take throws user_denied but leaves the items on the pasteboard. For the next hour (the pasteboard expiry), every activation runs the hand-off again, prompts again and posts another toast.",
+      "fix": "After a user_denied result, remember UIPasteboard.general.changeCount and skip the scan's hand-off until the change count differs or the nib://import?from=pasteboard link is opened again."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImport/ImportCommands.swift:669-672",
+      "problem": "Caller ids are used up one per created document even when the importer ignores them (packages, zips, folders, other owners' importers). Later ids land on the wrong files, and ids the AI planned to link to never exist.",
+      "fix": "Consume only the ids that the created documents actually carry (match docs against the head of idQueue). Alternatively, reject ids with invalid_params (path $.ids) when an input is a package, archive or folder."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImport/ImportDialog.swift:157",
+      "problem": "New Document always starts at the library root, even when the drop or the \"Import N files?\" prompt happens while the library shows a folder.",
+      "fix": "When there is no preset, start `folder` at the folder the invoking window's library is showing, and fall back to the root."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatImport/ImportCommands.swift:681-686",
+      "problem": "`folders` and the reveal count only folders this import created. A zip or folder that merges into an existing folder of the same name (folderNamed reuses it) reports no folder and reveals the destination instead of that folder.",
+      "fix": "Have importFolder and importContents return the top-level folder ids they used (created or reused), and build `folders` and `topFolders` from those."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatImportTests",
+      "problem": "No test covers the riskiest logic: deleting Open In and App Group copies and scan-offered loose files (consumeImported/consumeInboxCopy), and keeping them when the import is cancelled or fails.",
+      "fix": "Add Harness tests with a file under ImportLocations.openInInbox and a loose file listed in ImportEngine.consumableFiles. Assert each is removed only after a successful import and kept after a failure or a partial archive import."
+    }
+  ]
+}
