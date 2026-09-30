@@ -27,9 +27,46 @@ final class FeatRulerTests: XCTestCase {
         XCTAssertEqual(key?.scope, .canvas)
         XCTAssertEqual(key?.command, "ruler.set")
 
-        XCTAssertNotNil(h.app.ui.canvasAttachments.get("ruler"))
+        XCTAssertEqual(h.app.ui.canvasAttachments.get("ruler")?.docKinds, [.notebook, .whiteboard])
         XCTAssertNotNil(h.app.settings.descriptor("ruler.units"))
         XCTAssertNotNil(h.app.settings.descriptor("ruler.digits"))
+
+        let hud = h.app.ui.chromeOverlays.get(RulerHUD.overlayID)
+        XCTAssertEqual(hud?.placement, .top)
+        XCTAssertEqual(hud?.surface, .hud)
+        XCTAssertEqual(hud?.isInteractive, false, "display only: touches fall through to the canvas")
+        XCTAssertEqual(hud?.owner, "ruler")
+    }
+
+    /// Key R and the button exist only where the ruler does: documents with pages (shell v2 honours `docKinds`).
+    func testTheKeyAndButtonLiveInNotebooksAndWhiteboardsOnly() throws {
+        let h = Harness(features: [FeatRulerFeature.self])
+        let key = try XCTUnwrap(h.app.content.keyCommands.get("ruler.toggle"))
+        XCTAssertEqual(key.docKinds, [.notebook, .whiteboard])
+        XCTAssertTrue(key.isActive(in: KeyCommandContext(docKind: .notebook)))
+        XCTAssertTrue(key.isActive(in: KeyCommandContext(docKind: .whiteboard)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: .studySet)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: .textDocument)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: .notebook, isEditingText: true)), "R types while text is edited")
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: nil)), "not in the library")
+        XCTAssertTrue(h.app.ui.toolbarItems(for: .notebook).contains { $0.id == "ruler" })
+        XCTAssertFalse(h.app.ui.toolbarItems(for: .studySet).contains { $0.id == "ruler" })
+        XCTAssertFalse(h.app.ui.toolbarItems(for: .textDocument).contains { $0.id == "ruler" })
+    }
+
+    func testTheButtonShowsWhetherTheRulerIsOn() async throws {
+        let h = Harness(features: [FeatRulerFeature.self])
+        let button = try XCTUnwrap(h.app.ui.toolbar.get("ruler"))
+        XCTAssertEqual(button.isOn?(h.session), false)
+        let window = h.session.id.raw
+        let refresh = expectation(forNotification: .nibChromeNeedsUpdate, object: h.app.ui) { note in
+            note.userInfo?["session"] as? String == window
+        }
+        _ = try await h.run("ruler.set", ["toggle": true])
+        await fulfillment(of: [refresh], timeout: 1)
+        XCTAssertEqual(button.isOn?(h.session), true)
+        _ = try await h.run("ruler.set", ["toggle": true])
+        XCTAssertEqual(button.isOn?(h.session), false)
     }
 
     func testCommandConformance() async {
@@ -206,28 +243,28 @@ final class FeatRulerTests: XCTestCase {
 
     func testOneFingerDragsAfterTheTapSlop() {
         var g = RulerGesture(pose: .init(center: Point(300, 400), angle: 20))
-        g.add(Point(100, 100))
-        g.move([Point(103, 101)])
+        g.add(Point(100, 100), id: 1)
+        g.move([(1, Point(103, 101))])
         XCTAssertFalse(g.hasMoved, "3 pt is still a tap")
         XCTAssertEqual(g.pose.center, Point(300, 400))
-        g.move([Point(150, 130)])
+        g.move([(1, Point(150, 130))])
         XCTAssertTrue(g.hasMoved)
         XCTAssertEqual(g.pose, .init(center: Point(350, 430), angle: 20))
-        XCTAssertTrue(g.remove(near: Point(150, 130)))
+        XCTAssertTrue(g.remove(1))
     }
 
-    /// Two fingers turned 90° clockwise about the ruler's centre, in 10° steps.
+    /// Two fingers (touches 1 and 2) turned `degrees` clockwise about `c`, in `steps` steps.
     private func turn(_ g: inout RulerGesture, around c: Point, by degrees: Double, steps: Int) {
         for step in 1...steps {
             let r = degrees * Double(step) / Double(steps) * .pi / 180
-            g.move([Point(c.x - 100 * cos(r), c.y - 100 * sin(r)), Point(c.x + 100 * cos(r), c.y + 100 * sin(r))])
+            g.move([(1, Point(c.x - 100 * cos(r), c.y - 100 * sin(r))), (2, Point(c.x + 100 * cos(r), c.y + 100 * sin(r)))])
         }
     }
 
     func testTwoFingersRotateAboutTheirMidpointAndSnap() {
         var g = RulerGesture(pose: .init(center: Point(300, 400), angle: 0))
-        g.add(Point(200, 400))
-        g.add(Point(400, 400))
+        g.add(Point(200, 400), id: 1)
+        g.add(Point(400, 400), id: 2)
         XCTAssertTrue(g.isRotating)
         turn(&g, around: Point(300, 400), by: 90, steps: 9)     // clockwise on screen
         XCTAssertEqual(g.pose.angle, 270, "angles run anticlockwise")
@@ -236,9 +273,9 @@ final class FeatRulerTests: XCTestCase {
         XCTAssertEqual(g.pose.center.y, 400, accuracy: 1e-6)
 
         // Lift one finger: the other one drags on from where the ruler is now.
-        let left = g.fingers[0], right = g.fingers[1]
-        XCTAssertFalse(g.remove(near: left))
-        g.move([Point(right.x + 10, right.y)])
+        let right = g.fingers[1]
+        XCTAssertFalse(g.remove(1))
+        g.move([(2, Point(right.x + 10, right.y))])
         XCTAssertEqual(g.pose.angle, 270)
         XCTAssertEqual(g.pose.center.x, 310, accuracy: 1e-6)
         XCTAssertEqual(g.pose.center.y, 400, accuracy: 1e-6)
@@ -246,8 +283,8 @@ final class FeatRulerTests: XCTestCase {
 
     func testRotationSnapsTo45AndMovesWithTheMidpoint() {
         var g = RulerGesture(pose: .init(center: Point(300, 420), angle: 0))
-        g.add(Point(200, 400))
-        g.add(Point(400, 400))
+        g.add(Point(200, 400), id: 1)
+        g.add(Point(400, 400), id: 2)
         turn(&g, around: Point(300, 400), by: -44, steps: 4)     // anticlockwise, 1° short of 45
         XCTAssertEqual(g.pose.angle, 45)
         XCTAssertTrue(g.snapped)
@@ -259,18 +296,36 @@ final class FeatRulerTests: XCTestCase {
         XCTAssertEqual(g.pose.angle, 30, accuracy: 1e-6)
     }
 
-    func testAThirdTouchFarAwayIsIgnored() {
+    func testAThirdTouchIsNotTracked() {
         var g = RulerGesture(pose: .init(center: Point(300, 400), angle: 0))
-        g.add(Point(100, 100))
-        g.add(Point(600, 600))
-        g.add(Point(900, 100))                                   // a third finger is not tracked
+        g.add(Point(100, 100), id: 1)
+        g.add(Point(600, 600), id: 2)
+        g.add(Point(620, 600), id: 3)                            // a third finger, even right next to one
+        g.add(Point(100, 100), id: 1)                            // a touch reported twice counts once
         XCTAssertEqual(g.fingers.count, 2)
-        g.move([Point(900, 140)])
+        g.move([(3, Point(640, 600))])
         XCTAssertEqual(g.fingers, [Point(100, 100), Point(600, 600)])
-        XCTAssertFalse(g.remove(near: Point(900, 140)), "the untracked touch lifts")
+        XCTAssertFalse(g.remove(3), "the untracked touch lifts")
         XCTAssertEqual(g.fingers.count, 2)
-        XCTAssertFalse(g.remove(near: Point(100, 100)))
+        XCTAssertFalse(g.remove(1))
         XCTAssertEqual(g.fingers, [Point(600, 600)])
+        XCTAssertEqual(g.ids, [2])
+    }
+
+    /// Fingers are told apart by touch id, not by distance: two that pass each other turn the ruler half a turn.
+    func testFingersThatCrossKeepTheirIdentity() {
+        var g = RulerGesture(pose: .init(center: Point(300, 400), angle: 0))
+        g.add(Point(250, 400), id: 7)
+        g.add(Point(350, 400), id: 9)
+        for x in stride(from: 10.0, through: 100, by: 10) {             // 7 passes above 9
+            let lift = 20 * sin(.pi * x / 100)
+            g.move([(7, Point(250 + x, 400 - lift)), (9, Point(350 - x, 400 + lift))])
+        }
+        XCTAssertEqual(g.fingers[0].x, 350, accuracy: 1e-9)
+        XCTAssertEqual(g.fingers[1].x, 250, accuracy: 1e-9)
+        XCTAssertEqual(g.pose.angle, 180, "half a turn, not a jump back to 0°")
+        XCTAssertEqual(g.pose.center.x, 300, accuracy: 1e-6)
+        XCTAssertEqual(g.pose.center.y, 400, accuracy: 1e-6)
     }
 
     func testDoubleTap() {
@@ -284,26 +339,39 @@ final class FeatRulerTests: XCTestCase {
 
     // MARK: The attachment on a canvas
 
-    private func finger(_ x: Double, _ y: Double, pencil: Bool = false) -> CanvasSample {
-        CanvasSample(page: Fixtures.page1, location: Point(x, y), isPencil: pencil)
+    private func finger(_ x: Double, _ y: Double, id: Int = 1, pencil: Bool = false) -> CanvasSample {
+        CanvasSample(page: Fixtures.page1, location: Point(x, y), isPencil: pencil, touchID: id)
+    }
+
+    /// The attachment the registered descriptor makes (it shares the feature's angle HUD).
+    private func makeRuler(_ h: Harness, _ host: FakeCanvasHost) throws -> RulerAttachment {
+        let descriptor = try XCTUnwrap(h.app.ui.canvasAttachments.get("ruler"))
+        let ruler = try XCTUnwrap(descriptor.make(host) as? RulerAttachment)
+        ruler.attach(to: host)
+        return ruler
     }
 
     func testTheAttachmentClaimsItsTouchesAndCommitsADragThroughTheCommand() async throws {
         let h = Harness(features: [FeatRulerFeature.self])
         let host = FakeCanvasHost(h)
-        let ruler = RulerAttachment()
-        ruler.attach(to: host)
+        let ruler = try makeRuler(h, host)
         XCTAssertTrue(host.canvasView.subviews.contains { $0 === ruler.rulerView })
         XCTAssertTrue(ruler.rulerView.isHidden)
-        XCTAssertFalse(ruler.hitTest(CGPoint(x: 300, y: 400), host: host), "hidden rulers take no touches")
+        XCTAssertFalse(ruler.hitTest(CGPoint(x: 300, y: 400), isPencil: false, host: host), "hidden rulers take no touches")
 
         _ = try await h.run("ruler.set", ["visible": true, "angle": 0, "position": [300, 400]])
         XCTAssertFalse(ruler.rulerView.isHidden)
         XCTAssertEqual(ruler.rulerView.center.y, 400, accuracy: 0.001)
-        XCTAssertTrue(ruler.hitTest(CGPoint(x: 300, y: 400), host: host))
-        XCTAssertTrue(ruler.hitTest(CGPoint(x: 700, y: 420), host: host), "anywhere along its length")
-        XCTAssertFalse(ruler.hitTest(CGPoint(x: 300, y: 429), host: host), "a Pencil on the edge still writes")
-        XCTAssertFalse(ruler.hitTest(CGPoint(x: 300, y: 480), host: host))
+        for (x, y) in [(300.0, 400.0), (700, 420), (300, 431), (300, 369)] {
+            XCTAssertTrue(ruler.hitTest(CGPoint(x: x, y: y), isPencil: false, host: host), "a finger anywhere on it: \(x), \(y)")
+        }
+        XCTAssertFalse(ruler.hitTest(CGPoint(x: 300, y: 480), isPencil: false, host: host))
+        // The Pencil writes wherever its stroke would be laid along an edge (within 20 pt of it); the middle, where it
+        // would draw under the opaque ruler, stays the ruler's.
+        XCTAssertTrue(ruler.hitTest(CGPoint(x: 300, y: 405), isPencil: true, host: host))
+        XCTAssertFalse(ruler.hitTest(CGPoint(x: 300, y: 413), isPencil: true, host: host), "13 pt from the centre: 19 from the edge")
+        XCTAssertFalse(ruler.hitTest(CGPoint(x: 300, y: 429), isPencil: true, host: host), "a Pencil on the edge writes")
+        XCTAssertFalse(ruler.hitTest(CGPoint(x: 300, y: 480), isPencil: true, host: host))
 
         // The Pencil never moves it.
         ruler.touchesBegan(finger(300, 400, pencil: true), host: host)
@@ -327,8 +395,20 @@ final class FeatRulerTests: XCTestCase {
         XCTAssertFalse(host.canvasView.subviews.contains { $0 === ruler.rulerView })
     }
 
-    /// Zoomed out, the ruler keeps a minimum on-screen thickness, so its touch band stays inside the body and the Pencil
-    /// can still start a ruled line on or just outside either edge.
+    /// Taps on the ruler are the ruler's: the canvas never passes them on to tap handlers or the tool below it.
+    func testTapsOnTheRulerNeverReachThePage() async throws {
+        let h = Harness(features: [FeatRulerFeature.self])
+        let host = FakeCanvasHost(h)
+        let ruler = try makeRuler(h, host)
+        _ = try await h.run("ruler.set", ["visible": true, "angle": 0, "position": [300, 400]])
+        for kind in CanvasGesture.allCases {
+            XCTAssertTrue(ruler.gesture(kind, at: finger(300, 400), host: host), "\(kind)")
+        }
+        ruler.detach(from: host)
+    }
+
+    /// Zoomed out, the ruler keeps the 44 pt hit target across, and the Pencil can still start a ruled line on or just
+    /// outside either edge.
     func testZoomedOutTheRulerOnlyClaimsTouchesInsideItsBody() async throws {
         for zoom in [0.5, 0.3] {
             let h = Harness(features: [FeatRulerFeature.self])
@@ -336,55 +416,111 @@ final class FeatRulerTests: XCTestCase {
             host.zoomScale = zoom
             let editor = FakeEditor(host)
             h.session.editor = editor
-            let ruler = RulerAttachment()
-            ruler.attach(to: host)
+            let ruler = try makeRuler(h, host)
             _ = try await h.run("ruler.set", ["visible": true, "angle": 0, "position": [300, 400]])
             let c = CGPoint(x: 300 * zoom, y: 400 * zoom)                  // page 1 starts at the view origin
             let half = RulerMetrics.viewThickness(zoom: zoom) / 2
-            XCTAssertGreaterThanOrEqual(half - 6, 22, "zoom \(zoom): a 44 pt touch band")
-            XCTAssertTrue(ruler.hitTest(c, host: host), "zoom \(zoom): the middle is the ruler's")
-            XCTAssertTrue(ruler.hitTest(CGPoint(x: c.x, y: c.y - 22), host: host), "zoom \(zoom): 44 pt across")
+            XCTAssertEqual(half, 22, "zoom \(zoom): 44 pt across")
+            let pencilBand = half - RulerMetrics.reach * zoom
+            XCTAssertTrue(ruler.hitTest(c, isPencil: false, host: host), "zoom \(zoom): the middle is the ruler's")
+            XCTAssertTrue(ruler.hitTest(c, isPencil: true, host: host), "zoom \(zoom): the Pencil does not draw under it")
             for side in [-1.0, 1.0] {
-                XCTAssertFalse(ruler.hitTest(CGPoint(x: c.x, y: c.y + side * (half + 2)), host: host),
+                XCTAssertTrue(ruler.hitTest(CGPoint(x: c.x, y: c.y + side * (half - 1)), isPencil: false, host: host),
+                              "zoom \(zoom): a finger on the edge holds it")
+                XCTAssertFalse(ruler.hitTest(CGPoint(x: c.x, y: c.y + side * (half + 2)), isPencil: false, host: host),
                                "zoom \(zoom): 2 pt outside the edge is the page's")
-                XCTAssertFalse(ruler.hitTest(CGPoint(x: c.x, y: c.y + side * (half - 3)), host: host),
-                               "zoom \(zoom): a Pencil on the edge still writes")
+                XCTAssertFalse(ruler.hitTest(CGPoint(x: c.x, y: c.y + side * (pencilBand + 1)), isPencil: true, host: host),
+                               "zoom \(zoom): a Pencil near the edge writes")
             }
 
-            // A stroke that starts 5 page pt outside the upper edge is laid along it.
+            // A stroke that starts 5 page pt outside the upper edge is laid along it; so is one that starts just
+            // inside it, where the Pencil was not claimed.
             let edge = 400 - RulerMetrics.pageThickness(zoom: zoom) / 2
-            let original = (0...5).map { StrokePoint(x: Float(200 + $0 * 30), y: Float(edge - 5 - Double($0 % 2) * 3)) }
-            var stroke = Stroke(style: .defaultPen, points: original, t0: 0)
-            XCTAssertTrue(RulerProcessor().process(&stroke, page: Fixtures.page1, session: h.session))
             let line = edge - InkStyle.defaultPen.width / 2
-            XCTAssertTrue(stroke.points.allSatisfy { abs(Double($0.y) - line) < 0.01 }, "zoom \(zoom): projected")
-            for (p, o) in zip(stroke.points, original) { XCTAssertEqual(p.x, o.x, accuracy: 0.01) }
+            for start in [edge - 5, edge + (half - pencilBand - 1) / zoom] {
+                let original = (0...5).map { StrokePoint(x: Float(200 + $0 * 30), y: Float(start - Double($0 % 2) * 3)) }
+                var stroke = Stroke(style: .defaultPen, points: original, t0: 0)
+                XCTAssertTrue(RulerProcessor().process(&stroke, page: Fixtures.page1, session: h.session))
+                XCTAssertTrue(stroke.points.allSatisfy { abs(Double($0.y) - line) < 0.01 }, "zoom \(zoom): projected")
+                for (p, o) in zip(stroke.points, original) { XCTAssertEqual(p.x, o.x, accuracy: 0.01) }
+            }
             ruler.detach(from: host)
             withExtendedLifetime(editor) {}
         }
     }
 
-    func testTheAttachmentRotatesWithTwoFingers() async throws {
+    func testTheAttachmentRotatesWithTwoFingersWithTheAngleInTheChromeHUD() async throws {
         let h = Harness(features: [FeatRulerFeature.self])
         let host = FakeCanvasHost(h)
-        let ruler = RulerAttachment()
-        ruler.attach(to: host)
+        let ruler = try makeRuler(h, host)
         _ = try await h.run("ruler.set", ["visible": true, "angle": 0, "position": [300, 400]])
-        ruler.touchesBegan(finger(200, 400), host: host)
-        ruler.touchesBegan(finger(400, 400), host: host)
+        let window = ChromeContext(app: h.app, session: h.session, kind: .notebook)
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(window).map { $0.id }, [], "no HUD before the ruler turns")
+
+        let since = h.app.events.lastSeq
+        let sessionID = h.session.id.raw
+        let shown = expectation(forNotification: .nibChromeNeedsUpdate, object: h.app.ui) { note in
+            note.userInfo?["session"] as? String == sessionID
+        }
+        ruler.touchesBegan(finger(200, 400, id: 1), host: host)
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(window).map { $0.id }, [], "one finger drags: no HUD")
+        ruler.touchesBegan(finger(400, 400, id: 2), host: host)
+        await fulfillment(of: [shown], timeout: 1)
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(window).map { $0.id }, [RulerHUD.overlayID])
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(ChromeContext(app: h.app, session: h.session, kind: .studySet))
+            .map { $0.id }, [], "only where the ruler lives")
+        let model = ruler.hud.model(for: h.session)
+        XCTAssertEqual(model.text, "0°")
         for step in 1...9 {
             let r = Double(step) * 10 * .pi / 180
-            ruler.touchesMoved([finger(300 - 100 * cos(r), 400 + 100 * sin(r)),
-                                finger(300 + 100 * cos(r), 400 - 100 * sin(r))], host: host)
+            ruler.touchesMoved([finger(300 - 100 * cos(r), 400 + 100 * sin(r), id: 1),
+                                finger(300 + 100 * cos(r), 400 - 100 * sin(r), id: 2)], host: host)
+            if step == 4 { XCTAssertEqual(model.text, "40°", "the HUD follows the turn") }
         }
-        ruler.touchesEnded(finger(300, 500), host: host)
-        ruler.touchesEnded(finger(300, 300), host: host)
+        XCTAssertEqual(model.text, "90°")
+
+        // Snapping to 90° asks the Pencil feature for an alignment haptic, once.
+        let haptics = h.app.events.events(since: since).compactMap { $0.decode(PencilHapticPayload.self) }
+        XCTAssertEqual(haptics.count, 1)
+        XCTAssertEqual(haptics.first?.kind, "alignment")
+        XCTAssertEqual(haptics.first?.page, NodeRef.page(host.documentID, Fixtures.page1).description)
+        XCTAssertEqual(haptics.first?.point?.x ?? 0, 300, accuracy: 0.001)
+        XCTAssertEqual(haptics.first?.point?.y ?? 0, 400, accuracy: 0.001)
+        XCTAssertEqual(haptics.first?.session, h.session.id.raw)
+
+        ruler.touchesEnded(finger(300, 500, id: 1), host: host)
+        ruler.touchesEnded(finger(300, 300, id: 2), host: host)
         await ruler.commit?.value
         let out = try await h.run("ruler.set")
         XCTAssertEqual(out["angle"], 90)
         XCTAssertEqual(out["position"]?[0]?.doubleValue ?? 0, 300, accuracy: 0.001)
         XCTAssertEqual(out["position"]?[1]?.doubleValue ?? 0, 400, accuracy: 0.001)
+
+        // The HUD lingers after the fingers lift, then goes.
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(window).map { $0.id }, [RulerHUD.overlayID])
+        let linger = try XCTUnwrap(ruler.hudHide)
+        await linger.value
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(window).map { $0.id }, [])
         ruler.detach(from: host)
+    }
+
+    func testHidingTheRulerOrClosingTheCanvasDropsTheHUD() async throws {
+        let h = Harness(features: [FeatRulerFeature.self])
+        let host = FakeCanvasHost(h)
+        let ruler = try makeRuler(h, host)
+        _ = try await h.run("ruler.set", ["visible": true, "angle": 0, "position": [300, 400]])
+        ruler.touchesBegan(finger(200, 400, id: 1), host: host)
+        ruler.touchesBegan(finger(400, 400, id: 2), host: host)
+        XCTAssertTrue(ruler.hud.isShown(in: h.session))
+        _ = try await h.run("ruler.set", ["visible": false])
+        XCTAssertFalse(ruler.hud.isShown(in: h.session), "at once, without the linger")
+
+        _ = try await h.run("ruler.set", ["visible": true])
+        ruler.touchesBegan(finger(200, 400, id: 3), host: host)
+        ruler.touchesBegan(finger(400, 400, id: 4), host: host)
+        XCTAssertTrue(ruler.hud.isShown(in: h.session))
+        ruler.detach(from: host)
+        XCTAssertFalse(ruler.hud.isShown(in: h.session))
     }
 
     func testOnlyTheVisiblePartOfALongRulerIsDrawn() {

@@ -104,7 +104,7 @@ enum RulerAngle {
 /// `ruler.set`: the one command behind the ruler button, key R, the ruler's own menu and its gestures, so plugins, the
 /// AI and the bridge can do everything the ruler does. With no fields it changes nothing and returns the state.
 struct RulerSet: NibCommand {
-    static let id = "ruler.set"
+    static let id = CommandIDs.rulerSet
 
     struct Params: Codable {
         var visible: Bool?
@@ -189,7 +189,10 @@ struct RulerSet: NibCommand {
         if !ctx.dryRun {
             if let units { settings.set(RulerSettings.units, units.rawValue) }
             if let digits = p.digits { settings.set(RulerSettings.digits, digits) }
-            if let session, places { state.save(to: session) }
+            if let session, places {
+                state.save(to: session)
+                ctx.ui?.setNeedsChromeUpdate(session)          // the ruler button shows whether it is on
+            }
         }
         return output(state, session: session, units: units ?? RulerSettings.currentUnits(settings),
                       digits: p.digits ?? settings.get(RulerSettings.digits))

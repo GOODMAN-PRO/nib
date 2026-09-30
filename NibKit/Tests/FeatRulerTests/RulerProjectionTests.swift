@@ -148,9 +148,9 @@ final class RulerProjectionTests: XCTestCase {
         XCTAssertTrue(stroke.points.allSatisfy { abs(Double($0.y) - (400 - 16 - 0.6)) < 0.01 })
         XCTAssertEqual(RulerMetrics.viewThickness(zoom: 0.9), 57.6, accuracy: 1e-9, "below 100 % it shrinks with the page")
         XCTAssertEqual(RulerMetrics.pageThickness(zoom: 0.9), 64, accuracy: 1e-9)
-        XCTAssertEqual(RulerMetrics.viewThickness(zoom: 0.5), 56, "but never under 56 view pt")
-        XCTAssertEqual(RulerMetrics.pageThickness(zoom: 0.5), 112)
-        XCTAssertEqual(RulerMetrics.viewThickness(zoom: 0.05), 56)
+        XCTAssertEqual(RulerMetrics.viewThickness(zoom: 0.5), 44, "but never under the 44 pt hit target")
+        XCTAssertEqual(RulerMetrics.pageThickness(zoom: 0.5), 88)
+        XCTAssertEqual(RulerMetrics.viewThickness(zoom: 0.05), 44)
     }
 }
 

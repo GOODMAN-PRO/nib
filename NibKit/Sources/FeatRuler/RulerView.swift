@@ -70,8 +70,8 @@ enum RulerScale {
 // MARK: - Gestures
 
 /// Finger manipulation of the ruler in view coordinates: one finger moves it, two fingers move and rotate it about their
-/// midpoint, snapping to 0/45/90° (DESIGN.md §14.3). `CanvasSample` carries no touch identity, so each sample updates
-/// the tracked finger nearest to it; a sample far from both is another touch and is ignored.
+/// midpoint, snapping to 0/45/90° (DESIGN.md §14.3). Fingers are told apart by `CanvasSample.touchID`; a third touch is
+/// not tracked.
 struct RulerGesture {
     struct Pose: Equatable {
         var center: Point
@@ -81,8 +81,9 @@ struct RulerGesture {
 
     /// Less movement than this is a tap (DESIGN.md §10.1).
     static let slop = 6.0
-    static let maxJump = 120.0
 
+    /// The tracked touches, in the order they came down (at most two).
+    private(set) var ids: [Int] = []
     private(set) var fingers: [Point] = []
     private var starts: [Point] = []
     private var base: Pose
@@ -90,8 +91,6 @@ struct RulerGesture {
     private(set) var hasMoved = false
     private(set) var snapped = false
     private(set) var maxFingers = 0
-    /// Touches beyond the two tracked fingers that are still down.
-    private var extras = 0
 
     init(pose: Pose) {
         base = pose
@@ -100,34 +99,31 @@ struct RulerGesture {
 
     var isRotating: Bool { fingers.count == 2 }
 
-    mutating func add(_ p: Point) {
-        guard fingers.count < 2 else {
-            extras += 1
-            return
-        }
+    /// A touch came down at `p`: tracked unless two fingers already are.
+    mutating func add(_ p: Point, id: Int) {
+        guard fingers.count < 2, !ids.contains(id) else { return }
         rebase()
+        ids.append(id)
         fingers.append(p)
         starts.append(p)
         maxFingers = max(maxFingers, fingers.count)
     }
 
-    mutating func move(_ samples: [Point]) {
-        for p in samples {
-            guard let i = nearest(p), fingers[i].distance(to: p) <= Self.maxJump else { continue }
-            fingers[i] = p
+    /// New positions of touches; untracked ones are ignored.
+    mutating func move(_ samples: [(id: Int, point: Point)]) {
+        for s in samples {
+            guard let i = ids.firstIndex(of: s.id) else { continue }
+            fingers[i] = s.point
         }
         if !hasMoved { hasMoved = zip(fingers, starts).contains { $0.distance(to: $1) > Self.slop } }
         if hasMoved { update() }
     }
 
-    /// Lifts the finger nearest to `p`; true when none is left.
-    mutating func remove(near p: Point) -> Bool {
-        guard let i = nearest(p) else { return true }
-        if extras > 0, fingers[i].distance(to: p) > Self.maxJump {
-            extras -= 1                                      // an untracked touch lifted
-            return false
-        }
+    /// Touch `id` lifted; true when no tracked finger is left.
+    mutating func remove(_ id: Int) -> Bool {
+        guard let i = ids.firstIndex(of: id) else { return fingers.isEmpty }   // an untracked touch lifted
         rebase()
+        ids.remove(at: i)
         fingers.remove(at: i)
         starts.remove(at: i)
         return fingers.isEmpty
@@ -136,10 +132,6 @@ struct RulerGesture {
     private mutating func rebase() {
         base = pose
         starts = fingers
-    }
-
-    private func nearest(_ p: Point) -> Int? {
-        fingers.indices.min { fingers[$0].distance(to: p) < fingers[$1].distance(to: p) }
     }
 
     private mutating func update() {
@@ -201,15 +193,17 @@ enum RulerLayout {
         return lo < hi ? lo...hi : nil
     }
 
-    /// Whether a touch at `p` (view points) is the ruler's: its whole length, and across it everything but a 6 pt band
-    /// inside each edge, so a Pencil set down on (or next to) the edge still writes. The ruler is never thinner than
-    /// `RulerMetrics.minimumThickness`, so this is at least 44 pt across (DESIGN.md §5) and never leaves the body.
-    static func claims(_ p: Point, pose: RulerGesture.Pose, zoom: Double) -> Bool {
+    /// Whether a touch at `p` (view points) is the ruler's. A finger's anywhere on the body (never thinner than the
+    /// 44 pt hit target, `RulerMetrics.minimumThickness`). The Pencil's only in the middle band: where a stroke would
+    /// be laid along an edge (within `RulerMetrics.reach` of it, inside or outside) the Pencil writes, and in the
+    /// middle, where it would draw under the opaque ruler, the ruler keeps the touch and ignores it.
+    static func claims(_ p: Point, isPencil: Bool, pose: RulerGesture.Pose, zoom: Double) -> Bool {
         let thickness = RulerMetrics.viewThickness(zoom: zoom)
         let g = RulerGeometry(center: pose.center, angle: pose.angle, length: RulerMetrics.length * zoom,
                               thickness: thickness)
         let (u, v) = g.local(p)
-        return abs(u) <= g.length / 2 && abs(v) <= thickness / 2 - 6
+        guard abs(u) <= g.length / 2 else { return false }
+        return isPencil ? abs(v) < thickness / 2 - RulerMetrics.reach * zoom : abs(v) <= thickness / 2
     }
 }
 
@@ -288,17 +282,18 @@ final class RulerView: UIView {
         guard let body else { return }
         let visible = body.intersection(bounds)
         guard !visible.isNull, !visible.isEmpty else { return }
-        let path = UIBezierPath(roundedRect: visible, cornerRadius: NibRadius.badge)
+        let path = UIBezierPath(roundedRect: visible, cornerRadius: NibRadius.ruler)
         layer.nibElevation(.rest, path: path.cgPath, dark: traitCollection.userInterfaceStyle == .dark)
     }
 
     override func draw(_ rect: CGRect) {
         guard let d = drawing, let body else { return }
         let thickness = bounds.height
-        let outline = UIBezierPath(roundedRect: body.insetBy(dx: 0.25, dy: 0.25), cornerRadius: NibRadius.badge)
+        let outline = UIBezierPath(roundedRect: body.insetBy(dx: NibStroke.hairline / 2, dy: NibStroke.hairline / 2),
+                                   cornerRadius: NibRadius.ruler)
         NibUIColor.chromeOpaque.setFill()
         outline.fill()
-        outline.lineWidth = 0.5
+        outline.lineWidth = NibStroke.hairline
         NibUIColor.separator.setStroke()
         outline.stroke()
 
@@ -316,7 +311,7 @@ final class RulerView: UIView {
             marks.move(to: CGPoint(x: x, y: thickness))
             marks.addLine(to: CGPoint(x: x, y: thickness - length))
         }
-        marks.lineWidth = 1
+        marks.lineWidth = NibStroke.thin
         ink.setStroke()
         marks.stroke()
 
@@ -324,7 +319,7 @@ final class RulerView: UIView {
         // The digits live in the band between the two rows of whole-unit ticks; a thin ruler gets smaller digits, and
         // none once they would be unreadable.
         let band = thickness * (1 - 2 * RulerScale.majorTick) - 2
-        var font = NibUIFont.font(.caption2, weight: .medium)
+        var font = NibUIFont.caption2
         if font.lineHeight > band { font = font.withSize(font.pointSize * band / font.lineHeight) }
         guard font.pointSize >= 7 else { return }
         let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: ink]
@@ -376,20 +371,68 @@ final class RulerView: UIView {
 
 // MARK: - Angle HUD
 
-final class RulerHUDModel: ObservableObject {
-    @Published var text = ""
-    @Published var shown = false
+/// The angle while the ruler turns (DESIGN.md §14.3): a Clear 40 pt HUD, which the document chrome shows at the top of
+/// the window (a `.top` `.hud` chrome overlay, so it merges and recedes with the bars) while two fingers turn the
+/// ruler and for `NibMotion.hudLinger` after they lift. One per window; the canvas attachment drives it.
+@MainActor
+final class RulerHUD {
+    static let overlayID = "ruler.angle"
+
+    final class Model: ObservableObject {
+        @Published fileprivate(set) var text = ""
+        fileprivate(set) var shown = false
+    }
+
+    /// By `EditorSession` id.
+    private var models: [String: Model] = [:]
+
+    func model(for session: EditorSession) -> Model {
+        if let m = models[session.id.raw] { return m }
+        let m = Model()
+        models[session.id.raw] = m
+        return m
+    }
+
+    func isShown(in session: EditorSession) -> Bool { models[session.id.raw]?.shown ?? false }
+
+    /// Shows `text` in the window's HUD (digits change without animation).
+    func show(_ text: String, session: EditorSession, app: NibApp) {
+        let m = model(for: session)
+        if m.text != text { m.text = text }
+        guard !m.shown else { return }
+        m.shown = true
+        app.ui.setNeedsChromeUpdate(session)
+    }
+
+    /// The chrome fades it out with the exit timing.
+    func hide(session: EditorSession, app: NibApp) {
+        guard let m = models[session.id.raw], m.shown else { return }
+        m.shown = false
+        app.ui.setNeedsChromeUpdate(session)
+    }
+
+    /// The window's canvas closed.
+    func remove(session: EditorSession, app: NibApp) {
+        hide(session: session, app: app)
+        models[session.id.raw] = nil
+    }
+
+    func descriptor(owner: String) -> ChromeOverlayDescriptor {
+        ChromeOverlayDescriptor(
+            id: Self.overlayID, owner: owner, placement: .top, surface: .hud, order: 500, recedesWhileWriting: true,
+            isInteractive: false, docKinds: FeatRulerFeature.docKinds,
+            isVisible: { [self] context in isShown(in: context.session) },
+            makeView: { [self] context in AnyView(RulerAngleHUD(model: model(for: context.session))) })
+    }
 }
 
-/// The angle while the ruler turns: a Clear 40 pt HUD next to it (DESIGN.md §14.3). Digits change without animation;
-/// it fades in and out with the standard reveal.
+/// The HUD's content; the chrome gives it the Clear HUD surface, its height and type cap, and its entrance and exit.
 struct RulerAngleHUD: View {
-    @ObservedObject var model: RulerHUDModel
+    @ObservedObject var model: RulerHUD.Model
 
     var body: some View {
-        NibHUD(id: "ruler.angle", primary: model.text)
-            .opacity(model.shown ? 1 : 0)
-            .animation(model.shown ? NibMotion.enter : NibMotion.exit, value: model.shown)
+        NibHUDText(model.text)
+            .padding(.horizontal, NibSpacing.xs)
             .accessibilityHidden(true)          // the ruler itself reads its angle as its value
     }
 }
@@ -397,34 +440,35 @@ struct RulerAngleHUD: View {
 // MARK: - Canvas attachment
 
 /// The ruler on a canvas (one per canvas host). It claims the touches that start on it (`hitTest`): one finger drags
-/// it, two fingers rotate it, a double tap opens its menu (Set Angle, Set Position, Hide Ruler, Options). Everything it
-/// changes goes through `ruler.set`; while a gesture runs the ruler follows the fingers locally and the final pose is
-/// committed once, when the fingers lift.
+/// it, two fingers rotate it, a double tap opens its menu (Set Angle, Set Position, Hide Ruler, Options); taps on it
+/// never reach the page. Everything it changes goes through `ruler.set`; while a gesture runs the ruler follows the
+/// fingers locally and the final pose is committed once, when the fingers lift.
 @MainActor
 final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDelegate {
-    /// How long the angle HUD stays after the fingers lift (DESIGN.md §14.17: evaporates 0.6 s after).
-    /// Known deviation: NibMotion has no HUD-evaporate token yet (contract gap reported with F039, asking for one shared
-    /// with the pinch-zoom HUD); switch to it once it lands.
-    static let hudLinger: UInt64 = 600_000_000
-
     private weak var host: CanvasHost?
     let rulerView = RulerView()
-    private let hudModel = RulerHUDModel()
-    private var hud: UIHostingController<RulerAngleHUD>?
-    private var hudSize: (text: String, category: UIContentSizeCategory, size: CGSize)?
+    let hud: RulerHUD
     private var menu: UIEditMenuInteraction?
     private var subscriptions: Set<AnyCancellable> = []
     private var state = RulerState()
     private var units = RulerUnits.centimetres
     private var digits = true
-    private var gesture: RulerGesture?
+    private var manipulation: RulerGesture?
     private var touchStart: TimeInterval = 0
     private var taps = RulerTapDetector()
+    /// When the menu last opened: the ruler's own double tap and the canvas's `gesture(.doubleTap)` open it once.
+    private var menuOpened: TimeInterval = -.infinity
     /// The pose shown while a gesture runs and until its `ruler.set` has landed.
     private var live: RulerGesture.Pose?
-    private var hudHide: Task<Void, Never>?
+    /// The HUD's linger after the fingers lift (tests await it).
+    private(set) var hudHide: Task<Void, Never>?
     /// The last commit of a gesture (tests await it).
     private(set) var commit: Task<Void, Never>?
+
+    init(hud: RulerHUD) {
+        self.hud = hud
+        super.init()
+    }
 
     // MARK: Lifecycle
 
@@ -433,14 +477,6 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
         rulerView.attachment = self
         rulerView.isHidden = true
         host.canvasView.addSubview(rulerView)
-
-        let hud = UIHostingController(rootView: RulerAngleHUD(model: hudModel))
-        hud.view.backgroundColor = .clear
-        hud.view.isUserInteractionEnabled = false
-        hud.view.layer.zPosition = RulerView.layerZ + 1
-        hud.safeAreaRegions = []
-        host.canvasView.addSubview(hud.view)
-        self.hud = hud
 
         let menu = UIEditMenuInteraction(delegate: self)
         host.canvasView.addInteraction(menu)
@@ -465,12 +501,11 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
     func detach(from host: CanvasHost) {
         subscriptions.removeAll()
         hudHide?.cancel()
+        hud.remove(session: host.session, app: host.app)
         rulerView.removeFromSuperview()
-        hud?.view.removeFromSuperview()
-        hud = nil
         if let menu { host.canvasView.removeInteraction(menu) }
         menu = nil
-        gesture = nil
+        manipulation = nil
         live = nil
         self.host = nil
     }
@@ -487,10 +522,11 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
         guard let host else { return }
         state = RulerState.load(host.session)
         if !state.visible {
-            gesture = nil
+            manipulation = nil
             live = nil
-            hudModel.shown = false
-        } else if gesture == nil {
+            hudHide?.cancel()
+            hud.hide(session: host.session, app: host.app)
+        } else if manipulation == nil {
             live = nil
         }
         layout()
@@ -501,10 +537,8 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
     /// The saved pose in canvas view coordinates.
     private func savedPose(_ host: CanvasHost) -> RulerGesture.Pose? {
         guard state.visible, let position = state.position, let page = state.anchorPage(in: host.session),
-              let frame = host.pageFrame(page) else { return nil }
-        let zoom = host.zoomScale
-        return RulerGesture.Pose(center: Point(Double(frame.minX) + position.x * zoom, Double(frame.minY) + position.y * zoom),
-                                 angle: state.angle)
+              host.pageFrame(page) != nil else { return nil }
+        return RulerGesture.Pose(center: Point(host.viewPoint(position, page: page)), angle: state.angle)
     }
 
     private func currentPose(_ host: CanvasHost) -> RulerGesture.Pose? {
@@ -520,116 +554,117 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
                                                    thickness: RulerMetrics.viewThickness(zoom: zoom),
                                                    in: host.canvasView.bounds) else {
             rulerView.isHidden = true
-            hudModel.shown = false
+            hudHide?.cancel()
+            hud.hide(session: host.session, app: host.app)
             return
         }
         rulerView.show(pose, range: range, zoom: zoom, units: units, digits: digits)
-        if hudModel.shown { layoutHUD(pose, zoom: zoom, in: host) }
+        if hud.isShown(in: host.session) { hud.show(RulerAngle.label(pose.angle), session: host.session, app: host.app) }
     }
 
-    /// Beside the ruler's middle, on the side facing up (or left when it stands upright), kept inside the canvas.
-    private func layoutHUD(_ pose: RulerGesture.Pose, zoom: Double, in host: CanvasHost) {
-        guard let hud else { return }
-        let text = RulerAngle.label(pose.angle)
-        hudModel.text = text
-        let category = host.canvasView.traitCollection.preferredContentSizeCategory
-        if hudSize?.text != text || hudSize?.category != category {
-            hudSize = (text, category, hud.sizeThatFits(in: CGSize(width: 240, height: NibMetrics.hudHeight)))
-        }
-        let size = hudSize?.size ?? .zero
-        let r = pose.angle * .pi / 180
-        var n = Point(sin(r), cos(r))
-        if n.y > 0 || (n.y == 0 && n.x > 0) { n = n * -1 }
-        let reach = RulerMetrics.viewThickness(zoom: zoom) / 2 + Double(NibSpacing.s) + Double(size.height) / 2
-        let c = pose.center + n * reach
-        let bounds = host.canvasView.bounds.insetBy(dx: NibMetrics.chromeInset + size.width / 2,
-                                                    dy: NibMetrics.chromeInset + size.height / 2)
-        let x = bounds.width > 0 ? min(max(CGFloat(c.x), bounds.minX), bounds.maxX) : CGFloat(c.x)
-        let y = bounds.height > 0 ? min(max(CGFloat(c.y), bounds.minY), bounds.maxY) : CGFloat(c.y)
-        hud.view.bounds = CGRect(origin: .zero, size: size)
-        hud.view.center = CGPoint(x: x, y: y)
-    }
-
-    private func showHUD() {
+    private func showHUD(_ host: CanvasHost) {
         hudHide?.cancel()
-        hudModel.shown = true
+        guard let pose = currentPose(host) else { return }
+        hud.show(RulerAngle.label(pose.angle), session: host.session, app: host.app)
     }
 
+    /// The HUD lingers `NibMotion.hudLinger` after the fingers lift (DESIGN.md §9.2), then the chrome fades it out.
     private func scheduleHUDHide() {
-        guard hudModel.shown else { return }
+        guard let host, hud.isShown(in: host.session) else { return }
         hudHide?.cancel()
-        hudHide = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: RulerAttachment.hudLinger)
+        let session = host.session, app = host.app, hud = self.hud
+        hudHide = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(NibMotion.hudLinger))
             guard !Task.isCancelled else { return }
-            self?.hudModel.shown = false
+            hud.hide(session: session, app: app)
         }
     }
 
     // MARK: Touches (routed by the canvas after `hitTest` claimed them)
 
-    func hitTest(_ viewPoint: CGPoint, host: CanvasHost) -> Bool {
+    func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool {
         guard !rulerView.isHidden, let pose = currentPose(host) else { return false }
-        return RulerLayout.claims(Point(Double(viewPoint.x), Double(viewPoint.y)), pose: pose, zoom: host.zoomScale)
+        return RulerLayout.claims(Point(Double(viewPoint.x), Double(viewPoint.y)), isPencil: isPencil, pose: pose,
+                                  zoom: host.zoomScale)
     }
 
     func touchesBegan(_ sample: CanvasSample, host: CanvasHost) {
         guard !sample.isPencil else { return }               // fingers move the ruler; the Pencil writes
         let p = viewPoint(sample, host)
-        if gesture == nil {
+        if manipulation == nil {
             guard let pose = currentPose(host) else { return }
-            gesture = RulerGesture(pose: pose)
+            manipulation = RulerGesture(pose: pose)
             touchStart = time(sample)
         }
-        gesture?.add(p)
-        if gesture?.isRotating == true {
-            showHUD()
-            layout()
-        }
+        manipulation?.add(p, id: sample.touchID)
+        if manipulation?.isRotating == true { showHUD(host) }
     }
 
     func touchesMoved(_ samples: [CanvasSample], host: CanvasHost) {
-        guard var g = gesture else { return }
-        let points = samples.filter { !$0.isPencil && !$0.isPredicted }.map { viewPoint($0, host) }
-        guard !points.isEmpty else { return }
+        guard var g = manipulation else { return }
+        let moves = samples.filter { !$0.isPencil && !$0.isPredicted }.map { (id: $0.touchID, point: viewPoint($0, host)) }
+        guard !moves.isEmpty else { return }
         let wasSnapped = g.snapped
-        g.move(points)
-        gesture = g
+        g.move(moves)
+        manipulation = g
         guard g.hasMoved else { return }
-        if g.snapped && !wasSnapped { NibHaptics.play(.detent) }
         live = g.pose
         layout()
+        if g.snapped && !wasSnapped { snapped(g.pose, host: host) }
     }
 
     func touchesEnded(_ sample: CanvasSample, host: CanvasHost) {
-        guard !sample.isPencil, var g = gesture else { return }
-        let p = viewPoint(sample, host)
-        let done = g.remove(near: p)
-        gesture = g
+        guard !sample.isPencil, var g = manipulation else { return }
+        let done = g.remove(sample.touchID)
+        manipulation = g
         if !g.isRotating { scheduleHUDHide() }
         guard done else { return }
-        gesture = nil
+        manipulation = nil
+        let p = viewPoint(sample, host)
         if g.hasMoved {
             commitPose(g.pose)
         } else if g.maxFingers == 1, time(sample) - touchStart <= RulerTapDetector.maxDuration,
                   taps.tap(at: p, time: time(sample)) {
-            presentMenu(at: CGPoint(x: p.x, y: p.y))
+            presentMenu(at: p.cg)
         }
     }
 
     func touchesCancelled(host: CanvasHost) {
-        gesture = nil
+        manipulation = nil
         live = nil
         scheduleHUDHide()
         layout()
     }
 
+    /// Taps on the ruler are the ruler's: they never reach the tap handlers or the tool below it. A double tap opens
+    /// its menu (once, whether the canvas or the ruler's own touch handling sees it first).
+    func gesture(_ kind: CanvasGesture, at sample: CanvasSample, host: CanvasHost) -> Bool {
+        if kind == .doubleTap { presentMenu(at: host.viewPoint(sample.location, page: sample.page)) }
+        return true
+    }
+
     private func viewPoint(_ sample: CanvasSample, _ host: CanvasHost) -> Point {
-        let v = host.viewPoint(sample.location, page: sample.page)
-        return Point(Double(v.x), Double(v.y))
+        Point(host.viewPoint(sample.location, page: sample.page))
     }
 
     private func time(_ sample: CanvasSample) -> TimeInterval {
         sample.timestamp > 0 ? sample.timestamp : ProcessInfo.processInfo.systemUptime
+    }
+
+    /// A view point in the coordinates of the window's current page (nil while it is not laid out).
+    private func pagePoint(_ p: Point, _ host: CanvasHost) -> (page: PageID, point: Point)? {
+        guard let page = host.session.page, let t = host.pageTransform(page) else { return nil }
+        return (page, Point(p.cg.applying(t.inverted())))
+    }
+
+    /// The ruler snapped to a multiple of 45°: an Apple Pencil Pro alignment haptic, played by the Pencil feature
+    /// (DESIGN.md §14.3).
+    private func snapped(_ pose: RulerGesture.Pose, host: CanvasHost) {
+        let at = pagePoint(pose.center, host)
+        let page = at.map { NodeRef.page(host.documentID, $0.page).description }
+        host.app.events.emit(PencilHapticPayload(kind: "alignment", page: page, point: at?.point,
+                                                 session: host.session.id.raw),
+                             doc: host.documentID)
     }
 
     // MARK: Commands
@@ -638,10 +673,8 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
     private func commitPose(_ pose: RulerGesture.Pose) {
         guard let host else { return }
         var params: [String: JSONValue] = ["angle": .number(pose.angle)]
-        if let page = host.session.page, let frame = host.pageFrame(page), host.zoomScale > 0 {
-            let zoom = host.zoomScale
-            params["position"] = .array([.number((pose.center.x - Double(frame.minX)) / zoom),
-                                         .number((pose.center.y - Double(frame.minY)) / zoom)])
+        if let at = pagePoint(pose.center, host) {
+            params["position"] = .array([.number(at.point.x), .number(at.point.y)])
         }
         let app = host.app, session = host.session
         commit = Task { @MainActor [weak self] in
@@ -652,7 +685,7 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
                                                 userInfo: ["command": RulerSet.id, "error": NibError.wrap(error)])
             }
             // A new gesture may have started meanwhile: its pose stays.
-            guard let self, self.gesture == nil else { return }
+            guard let self, self.manipulation == nil else { return }
             self.live = nil
             self.layout()
         }
@@ -674,11 +707,14 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
 
     func presentMenuAtCentre() {
         guard let host, let pose = currentPose(host) else { return }
-        presentMenu(at: CGPoint(x: pose.center.x, y: pose.center.y))
+        presentMenu(at: pose.center.cg)
     }
 
     private func presentMenu(at point: CGPoint) {
-        menu?.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
+        let now = ProcessInfo.processInfo.systemUptime
+        guard let menu, menu.view?.window != nil, now - menuOpened > RulerTapDetector.maxInterval else { return }
+        menuOpened = now
+        menu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: point))
     }
 
     func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
@@ -723,12 +759,9 @@ final class RulerAttachment: NSObject, CanvasAttachment, UIEditMenuInteractionDe
     }
 
     private func promptPosition() {
-        guard let host, let pose = currentPose(host), let page = host.session.page, let frame = host.pageFrame(page),
-              host.zoomScale > 0 else { return }
-        let zoom = host.zoomScale
+        guard let host, let pose = currentPose(host), let at = pagePoint(pose.center, host) else { return }
         let units = self.units
-        let x = (pose.center.x - Double(frame.minX)) / zoom / units.points
-        let y = (pose.center.y - Double(frame.minY)) / zoom / units.points
+        let x = at.point.x / units.points, y = at.point.y / units.points
         let unitName = units == .inches ? String(localized: "inches") : String(localized: "centimetres")
         let alert = UIAlertController(
             title: String(localized: "Set Position"),

@@ -1,18 +1,19 @@
 import Foundation
 import NibContracts
+import NibDesign
 
 /// Fixed sizes of the ruler (DESIGN.md §14.3: an opaque on-page object). Its length is page units (a 12-inch rule, so
 /// 30 cm fit too), so its scale always matches the page at any zoom. Its thickness is 64 view points at 100 % zoom and
 /// above, so it stays easy to hold when zoomed in; below 100 % it shrinks with the page but never under
-/// `minimumThickness`, so the 44 pt touch band (`RulerLayout.claims`) always stays inside the drawn body.
+/// `minimumThickness`, the 44 pt hit target, since a finger may grab it anywhere across its body (`RulerLayout.claims`).
 enum RulerMetrics {
     /// Page points: 12 in (864 pt) of scale plus a blank end of `endMargin` on each side.
     static let length: Double = 888
     static let endMargin: Double = 12
     /// View points at zoom ≥ 1.
     static let thickness: Double = 64
-    /// View points: the 44 pt hit target plus the 6 pt band inside each edge where the Pencil writes.
-    static let minimumThickness: Double = 56
+    /// View points: the hit target (DESIGN.md §5).
+    static let minimumThickness = Double(NibMetrics.hitTarget)
     /// Page points: a stroke that starts this close to an edge is projected onto it.
     static let reach: Double = 20
 
@@ -80,8 +81,8 @@ enum RulerPlacement {
         let zoom = host?.zoomScale ?? session.zoom
         var center = position
         if let anchor = state.anchorPage(in: session), anchor != page {
-            guard let host, zoom > 0, let from = host.pageFrame(anchor), let to = host.pageFrame(page) else { return nil }
-            center = Point(position.x + Double(from.minX - to.minX) / zoom, position.y + Double(from.minY - to.minY) / zoom)
+            guard let host, let converted = host.convert(position, from: anchor, to: page) else { return nil }
+            center = converted
         }
         return RulerGeometry(center: center, angle: state.angle, thickness: RulerMetrics.pageThickness(zoom: zoom))
     }
