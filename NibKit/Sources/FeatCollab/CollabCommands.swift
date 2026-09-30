@@ -398,6 +398,7 @@ extension CollabService {
             guard var snapshot = s.content else {
                 throw NibError.invalid(String(localized: "The shared document arrived empty."))
             }
+            snapshot.content.meta = CollabSession.receivedMeta(snapshot.content.meta)
             if library.node(snapshot.content.meta.id) != nil { snapshot.content.meta.id = NibID.make() }
             let local = try library.createDocument(snapshot.content, title: s.title, in: folder)
             _ = try app.workspace.content(local)

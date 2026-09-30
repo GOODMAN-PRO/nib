@@ -1252,11 +1252,14 @@ final class CollabSession {
     private func committed(_ cs: Changeset) {
         guard !isClosed, let doc = localDoc, let remote = remoteDoc, cs.documents.contains(doc) else { return }
         if case let .sync(origin) = cs.principal, origin.hasPrefix(CollabSession.originPrefix) { return }
-        if side == .host, cs.mutations.contains(where: { m in
-            if case let .meta(d, _, after) = m { return d == doc && after.locked }
+        // Locked documents are never sent: locking the shared copy ends the host's session, or takes a guest out.
+        if cs.mutations.contains(where: { m in
+            if case let .meta(d, before, after) = m { return d == doc && after.locked && !before.locked }
             return false
         }) {
-            service.endSession(reason: String(localized: "The document was locked, so the live session ended."))
+            service.endSession(reason: side == .host
+                ? String(localized: "The document was locked, so the live session ended.")
+                : String(localized: "You locked your copy, so you left the live session."))
             return
         }
         guard side == .host || myRole == .edit else { return }
@@ -1278,7 +1281,10 @@ final class CollabSession {
         guard let doc = localDoc else { return }
         // A collaborator's patch must land even when no window shows the document.
         _ = try? app.workspace.content(doc)
-        let local = CollabSession.rewrite(patch, to: doc)
+        var local = CollabSession.rewrite(patch, to: doc)
+        if let meta = local.meta, let current = try? app.workspace.content(doc).meta {
+            local.meta = CollabSession.keepingLocalFields(meta, of: current)
+        }
         let summary = app.bus.applyRemote(local, origin: CollabSession.originPrefix + author)
         guard !summary.isEmpty else { return }
         let pages = Set(local.items.keys.map { PageID($0) })
@@ -1487,6 +1493,27 @@ final class CollabSession {
         p.doc = doc
         p.meta?.id = doc
         return p
+    }
+
+    /// A collaborator's document meta with this library's own settings kept: favourite, the password lock (a lock is
+    /// per device), where it was trashed from and its external source file are not the collaborator's to change.
+    static func keepingLocalFields(_ incoming: DocumentMeta, of current: DocumentMeta) -> DocumentMeta {
+        var m = incoming
+        m.favorite = current.favorite
+        m.locked = current.locked
+        m.trashedFrom = current.trashedFrom
+        m.sourceBookmark = current.sourceBookmark
+        return m
+    }
+
+    /// The same for a document arriving in this library for the first time.
+    static func receivedMeta(_ incoming: DocumentMeta) -> DocumentMeta {
+        var m = incoming
+        m.favorite = false
+        m.locked = false
+        m.trashedFrom = nil
+        m.sourceBookmark = nil
+        return m
     }
 
     static func makeSecret() -> String {

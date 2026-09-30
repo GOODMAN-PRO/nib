@@ -126,6 +126,28 @@ final class CollabMergeTests: XCTestCase {
         XCTAssertEqual(moved.items.keys.sorted(), [Fixtures.page1.raw])
     }
 
+    func testDeviceFieldsOfTheMetaStayLocal() throws {
+        var mine = DocumentMeta(id: "SHAREDDOC001", kind: .notebook)
+        mine.favorite = true
+        mine.trashedFrom = nil
+        var theirs = mine
+        theirs.favorite = false
+        theirs.locked = true
+        theirs.trashedFrom = "Old/Folder"
+        theirs.sourceBookmark = Data([1, 2, 3])
+        theirs.language = "de-DE"
+        let merged = CollabSession.keepingLocalFields(theirs, of: mine)
+        XCTAssertTrue(merged.favorite)
+        XCTAssertFalse(merged.locked)
+        XCTAssertNil(merged.trashedFrom)
+        XCTAssertNil(merged.sourceBookmark)
+        XCTAssertEqual(merged.language, "de-DE", "shared document settings still merge")
+        let received = CollabSession.receivedMeta(theirs)
+        XCTAssertFalse(received.favorite)
+        XCTAssertFalse(received.locked)
+        XCTAssertNil(received.sourceBookmark)
+    }
+
     // MARK: Wire format
 
     func testSmallMessagesAreOneFrame() throws {
