@@ -1,1 +1,831 @@
-// Scaffold placeholder, owned by F069 (WebDAV sync). Replace this file.
+import Foundation
+import NibContracts
+import os
+
+// MARK: - Configuration
+
+/// A WebDAV server plus the library folder on it. `serverURL` is the account root ("https://host/remote.php/dav/
+/// files/alex/"), always with a trailing slash; `folder` is the library folder below it ("Nib", "Apps/Nib").
+struct WebDAVConfiguration: Equatable {
+    var serverURL: URL
+    var user: String
+    var password: String?
+    var folder: String
+    var allowUntrustedCertificates: Bool
+
+    init(serverURL: URL, user: String, password: String?, folder: String, allowUntrustedCertificates: Bool = false) {
+        self.serverURL = serverURL
+        self.user = user
+        self.password = password
+        self.folder = folder
+        self.allowUntrustedCertificates = allowUntrustedCertificates
+    }
+
+    var folderComponents: [String] { folder.split(separator: "/").map(String.init) }
+
+    /// The library folder as a collection URL (trailing slash).
+    var libraryURL: URL { WebDAVPaths.collectionURL(serverURL, components: folderComponents) }
+
+    /// True when the server asks for credentials we do not have (a user name without a saved password).
+    var credentialsMissing: Bool { !user.isEmpty && (password ?? "").isEmpty }
+
+    /// Parses and normalises a server URL: http(s) only, a host, no query or fragment, and a trailing slash.
+    static func normalizeServerURL(_ string: String) throws -> URL {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var components = URLComponents(string: trimmed), let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http" else {
+            throw NibError(.invalidParams, "'\(trimmed)' is not an http or https URL", path: "$.url",
+                           hint: "pass the server's WebDAV address, e.g. https://dav.example.com/remote.php/dav/files/alex/")
+        }
+        guard let host = components.host, !host.isEmpty else {
+            throw NibError(.invalidParams, "the WebDAV URL has no host", path: "$.url")
+        }
+        guard components.user == nil, components.password == nil else {
+            throw NibError(.invalidParams, "put the user name in 'user', not in the URL", path: "$.url",
+                           hint: "the password is entered in Settings › WebDAV and kept in the Keychain")
+        }
+        components.scheme = scheme
+        components.query = nil
+        components.fragment = nil
+        if !components.percentEncodedPath.hasSuffix("/") { components.percentEncodedPath += "/" }
+        guard let url = components.url else { throw NibError(.invalidParams, "invalid WebDAV URL", path: "$.url") }
+        return url
+    }
+
+    /// Normalises a folder path: "/", "\" and empty segments are dropped; "." and ".." are rejected.
+    static func normalizeFolder(_ string: String, field: String = "folder") throws -> String {
+        let parts = string.replacingOccurrences(of: "\\", with: "/").split(separator: "/")
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !parts.isEmpty else {
+            throw NibError(.invalidParams, "choose a folder name for the library on the server", path: "$.\(field)",
+                           hint: "for example \"Nib\"")
+        }
+        if parts.contains(where: { $0 == "." || $0 == ".." }) {
+            throw NibError(.invalidParams, "'.' and '..' are not allowed in \(field)", path: "$.\(field)")
+        }
+        return parts.joined(separator: "/")
+    }
+}
+
+// MARK: - Errors
+
+/// Failures of the WebDAV client and the mirror. `reason` is the stable code reported in `sync.status` and
+/// `webdav.status`; fatal failures stop a sync run (retrying the remaining files cannot succeed).
+enum WebDAVError: Error, Equatable {
+    case notConfigured
+    case credentialsMissing
+    case authenticationFailed
+    case forbidden(String)
+    case untrustedCertificate(String)
+    case unreachable(String)
+    case notFound(String)
+    case changedDuringSync(String)
+    case insufficientStorage
+    case notWebDAV
+    case http(Int, String)
+    case invalidResponse(String)
+    case local(String)
+    case cancelled
+
+    var reason: String {
+        switch self {
+        case .notConfigured: return "notConfigured"
+        case .credentialsMissing: return "credentialsMissing"
+        case .authenticationFailed: return "authFailed"
+        case .forbidden: return "forbidden"
+        case .untrustedCertificate: return "untrustedCertificate"
+        case .unreachable: return "unreachable"
+        case .notFound: return "notFound"
+        case .changedDuringSync: return "changedDuringSync"
+        case .insufficientStorage: return "serverFull"
+        case .notWebDAV: return "notWebDAV"
+        case .http: return "server"
+        case .invalidResponse: return "invalidResponse"
+        case .local: return "localFile"
+        case .cancelled: return "cancelled"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .notConfigured:
+            return String(localized: "WebDAV is not set up")
+        case .credentialsMissing:
+            return String(localized: "Credentials missing — re-enter the WebDAV password")
+        case .authenticationFailed:
+            return String(localized: "The server rejected the user name or password")
+        case .forbidden(let path):
+            return String(localized: "The server does not allow access to \(path)")
+        case .untrustedCertificate(let host):
+            return String(localized: "The certificate of \(host) is not trusted")
+        case .unreachable(let detail):
+            return String(localized: "The server cannot be reached (\(detail))")
+        case .notFound(let path):
+            return String(localized: "\(path) was not found on the server")
+        case .changedDuringSync(let path):
+            return String(localized: "\(path) changed during the sync; it is retried next time")
+        case .insufficientStorage:
+            return String(localized: "The server is out of storage space")
+        case .notWebDAV:
+            return String(localized: "The address does not point to a WebDAV folder")
+        case .http(let status, let what):
+            return String(localized: "The server answered \(status) to \(what)")
+        case .invalidResponse(let detail):
+            return String(localized: "The server sent an unreadable answer (\(detail))")
+        case .local(let detail):
+            return detail
+        case .cancelled:
+            return String(localized: "The sync was stopped")
+        }
+    }
+
+    /// Stops the whole run: nothing else can succeed until the user or the network fixes it.
+    var isFatal: Bool {
+        switch self {
+        case .notConfigured, .credentialsMissing, .authenticationFailed, .untrustedCertificate, .unreachable,
+             .insufficientStorage, .notWebDAV, .cancelled:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var nibError: NibError {
+        switch self {
+        case .notConfigured:
+            return NibError(.unavailable, message, hint: "call webdav.configure {url, user, folder}, then enter the password in Settings › WebDAV")
+        case .credentialsMissing, .authenticationFailed:
+            return NibError(.unavailable, message, hint: "ask the user to re-enter the password in Settings › WebDAV")
+        case .untrustedCertificate:
+            return NibError(.unavailable, message,
+                            hint: "if the server uses a self-signed certificate, call webdav.configure with allowUntrustedCertificates: true")
+        case .notFound:
+            return NibError(.notFound, message)
+        case .changedDuringSync:
+            return NibError(.conflict, message, hint: "call webdav.syncNow again")
+        case .local:
+            return NibError(.unavailable, message)
+        default:
+            return NibError(.unavailable, message)
+        }
+    }
+
+    static func from(_ error: Error, host: String) -> WebDAVError {
+        if let e = error as? WebDAVError { return e }
+        if error is CancellationError { return .cancelled }
+        if let u = error as? URLError {
+            switch u.code {
+            case .cancelled: return .cancelled
+            case .serverCertificateUntrusted, .serverCertificateHasBadDate, .serverCertificateHasUnknownRoot,
+                 .serverCertificateNotYetValid, .clientCertificateRejected, .clientCertificateRequired,
+                 .secureConnectionFailed:
+                return .untrustedCertificate(host)
+            case .userAuthenticationRequired, .userCancelledAuthentication:
+                return .authenticationFailed
+            case .notConnectedToInternet, .networkConnectionLost, .cannotFindHost, .cannotConnectToHost, .timedOut,
+                 .dnsLookupFailed, .internationalRoamingOff, .dataNotAllowed, .callIsActive,
+                 .appTransportSecurityRequiresSecureConnection:
+                return .unreachable(u.localizedDescription)
+            default:
+                return .unreachable(u.localizedDescription)
+            }
+        }
+        if let n = error as? NibError { return .local(n.message) }
+        return .local(error.localizedDescription)
+    }
+}
+
+// MARK: - Paths
+
+/// Percent-encoding and href decoding shared by the client and the mirror.
+enum WebDAVPaths {
+    /// RFC 3986 unreserved characters plus sub-delims that no server treats specially inside a segment.
+    static let segmentAllowed: CharacterSet = {
+        var set = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+        set.insert(charactersIn: "!$&'()*,=:@")
+        return set
+    }()
+
+    static func encode(_ segment: String) -> String {
+        segment.addingPercentEncoding(withAllowedCharacters: segmentAllowed) ?? segment
+    }
+
+    /// `base` must end in "/". Returns `base` + the encoded components + "/".
+    static func collectionURL(_ base: URL, components: [String]) -> URL {
+        guard !components.isEmpty else { return base }
+        let tail = components.map(encode).joined(separator: "/") + "/"
+        return URL(string: tail, relativeTo: base)?.absoluteURL ?? base
+    }
+
+    /// `base` must end in "/". Returns `base` + the encoded "/"-separated relative file path.
+    static func fileURL(_ base: URL, path: String) -> URL {
+        let tail = path.split(separator: "/").map { encode(String($0)) }.joined(separator: "/")
+        return URL(string: tail, relativeTo: base)?.absoluteURL ?? base
+    }
+
+    /// Decoded path components of an href, which may be an absolute URL or an absolute path. Tolerates servers that
+    /// leave spaces unencoded (no URL parsing).
+    static func components(ofHref href: String) -> [String] {
+        var s = Substring(href.trimmingCharacters(in: .whitespacesAndNewlines))
+        if let r = s.range(of: "://") {
+            let rest = s[r.upperBound...]
+            s = rest.firstIndex(of: "/").map { rest[$0...] } ?? "/"
+        }
+        if let cut = s.firstIndex(where: { $0 == "?" || $0 == "#" }) { s = s[..<cut] }
+        return s.split(separator: "/").map { String($0).removingPercentEncoding ?? String($0) }
+    }
+
+    static func components(of url: URL) -> [String] {
+        let path = URLComponents(url: url, resolvingAgainstBaseURL: true)?.percentEncodedPath ?? url.path
+        return components(ofHref: path)
+    }
+
+    /// Unicode-normalised key (servers and file systems disagree on NFC/NFD).
+    static func key(_ path: String) -> String { path.precomposedStringWithCanonicalMapping }
+
+    static func sameComponents(_ a: ArraySlice<String>, _ b: ArraySlice<String>) -> Bool {
+        a.count == b.count && zip(a, b).allSatisfy { key($0) == key($1) }
+    }
+
+    /// ETags compared without the weak marker and quotes (servers differ in quoting between PUT and PROPFIND).
+    static func normalizeETag(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("W/") || s.hasPrefix("w/") { s = String(s.dropFirst(2)) }
+        if s.count >= 2, s.hasPrefix("\""), s.hasSuffix("\"") { s = String(s.dropFirst().dropLast()) }
+        return s
+    }
+}
+
+// MARK: - PROPFIND multistatus
+
+/// One `<response>` of a PROPFIND multistatus, with the properties of its successful `<propstat>`s.
+struct DAVResource: Equatable {
+    var href: String
+    var components: [String]
+    var isCollection: Bool
+    var etag: String?
+    var contentLength: Int64?
+    var lastModified: Date?
+
+    /// What the mirror compares between syncs: the normalised ETag, else modification date and size.
+    var version: String {
+        if let e = etag, !WebDAVPaths.normalizeETag(e).isEmpty { return "e:" + WebDAVPaths.normalizeETag(e) }
+        let modified = lastModified.map { String(Int64($0.timeIntervalSince1970)) } ?? "?"
+        return "m:\(modified):\(contentLength.map(String.init) ?? "?")"
+    }
+
+    var name: String { components.last ?? "" }
+}
+
+/// Parses a 207 Multi-Status body. Namespace prefixes are ignored (servers use `D:`, `d:`, `lp1:` or a default
+/// namespace), properties inside a non-2xx `<propstat>` are dropped, and `<response>`s whose own status is an error
+/// are skipped.
+final class WebDAVMultistatusParser: NSObject, XMLParserDelegate {
+    private struct Props {
+        var status = 200
+        var isCollection = false
+        var etag: String?
+        var length: Int64?
+        var modified: Date?
+    }
+
+    private var resources: [DAVResource] = []
+    private var stack: [String] = []
+    private var text = ""
+    private var href: String?
+    private var responseStatus: Int?
+    private var propstats: [Props] = []
+    private var current: Props?
+
+    static func parse(_ data: Data) throws -> [DAVResource] {
+        let delegate = WebDAVMultistatusParser()
+        let parser = XMLParser(data: data)
+        parser.shouldProcessNamespaces = false
+        parser.shouldResolveExternalEntities = false
+        parser.delegate = delegate
+        guard parser.parse() else {
+            throw WebDAVError.invalidResponse(parser.parserError?.localizedDescription ?? "malformed XML")
+        }
+        return delegate.resources
+    }
+
+    static func localName(_ qualified: String) -> String {
+        guard let colon = qualified.lastIndex(of: ":") else { return qualified.lowercased() }
+        return String(qualified[qualified.index(after: colon)...]).lowercased()
+    }
+
+    static func statusCode(_ line: String) -> Int? {
+        let parts = line.split(separator: " ")
+        guard parts.count >= 2 else { return Int(line.trimmingCharacters(in: .whitespaces)) }
+        return Int(parts[1])
+    }
+
+    static let httpDate: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "GMT")
+        f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return f
+    }()
+
+    static func parseDate(_ string: String) -> Date? {
+        let s = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let d = httpDate.date(from: s) { return d }
+        return ISO8601DateFormatter().date(from: s)
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+                qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+        let name = WebDAVMultistatusParser.localName(elementName)
+        stack.append(name)
+        switch name {
+        case "response":
+            href = nil
+            responseStatus = nil
+            propstats = []
+        case "propstat":
+            current = Props()
+        case "collection":
+            if stack.contains("resourcetype") { current?.isCollection = true }
+        default:
+            break
+        }
+        text = ""
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        text += string
+    }
+
+    func parser(_ parser: XMLParser, foundCDATA CDATABlock: Data) {
+        text += String(decoding: CDATABlock, as: UTF8.self)
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+        let name = WebDAVMultistatusParser.localName(elementName)
+        if !stack.isEmpty { stack.removeLast() }
+        let parent = stack.last
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch name {
+        case "href" where parent == "response":
+            if href == nil { href = value }
+        case "status" where parent == "propstat":
+            current?.status = WebDAVMultistatusParser.statusCode(value) ?? 200
+        case "status" where parent == "response":
+            responseStatus = WebDAVMultistatusParser.statusCode(value)
+        case "getetag":
+            if !value.isEmpty { current?.etag = value }
+        case "getcontentlength":
+            current?.length = Int64(value)
+        case "getlastmodified":
+            current?.modified = WebDAVMultistatusParser.parseDate(value)
+        case "propstat":
+            if let p = current { propstats.append(p) }
+            current = nil
+        case "response":
+            finishResponse()
+        default:
+            break
+        }
+        text = ""
+    }
+
+    private func finishResponse() {
+        guard let href = href else { return }
+        let ok = propstats.filter { (200..<300).contains($0.status) }
+        if let s = responseStatus, !(200..<300).contains(s), ok.isEmpty { return }
+        if !propstats.isEmpty, ok.isEmpty { return }
+        var resource = DAVResource(href: href, components: WebDAVPaths.components(ofHref: href),
+                                   isCollection: href.hasSuffix("/"), etag: nil, contentLength: nil, lastModified: nil)
+        for p in ok {
+            if p.isCollection { resource.isCollection = true }
+            if let e = p.etag { resource.etag = e }
+            if let l = p.length { resource.contentLength = l }
+            if let m = p.modified { resource.lastModified = m }
+        }
+        resources.append(resource)
+    }
+
+    /// The direct members of the collection a Depth 1 PROPFIND was sent to. The collection's own entry is found by
+    /// its path (or, behind a rewriting proxy, as the shortest href every other href extends), so members are named
+    /// relative to it rather than to the request URL.
+    static func members(of resources: [DAVResource], requestComponents: [String]) -> [DAVResource] {
+        var base = requestComponents
+        let underRequest = resources.contains { r in
+            r.components.count >= requestComponents.count
+                && WebDAVPaths.sameComponents(r.components.prefix(requestComponents.count), requestComponents[...])
+        }
+        if !underRequest, let shortest = resources.min(by: { $0.components.count < $1.components.count }) {
+            // A rewriting proxy answered with another path prefix: the shortest href is the collection itself.
+            base = shortest.components
+        }
+        var seen = Set<String>()
+        return resources.filter { r in
+            guard r.components.count == base.count + 1,
+                  WebDAVPaths.sameComponents(r.components.prefix(base.count), base[...]) else { return false }
+            return seen.insert(WebDAVPaths.key(r.name)).inserted
+        }
+    }
+}
+
+// MARK: - Session delegate
+
+/// Answers Basic/Digest/NTLM challenges with the configured credentials (once per request: a second challenge means
+/// the password is wrong and the 401 is passed through), and trusts the server's certificate only when the user
+/// allowed untrusted certificates for this host.
+final class WebDAVSessionDelegate: NSObject, URLSessionTaskDelegate {
+    let user: String
+    let password: String?
+    let host: String
+    let allowUntrustedCertificates: Bool
+    private let lock = NSLock()
+    private var basicSeen = false
+
+    init(user: String, password: String?, host: String, allowUntrustedCertificates: Bool) {
+        self.user = user
+        self.password = password
+        self.host = host.lowercased()
+        self.allowUntrustedCertificates = allowUntrustedCertificates
+    }
+
+    /// True once the server asked for Basic authentication: later requests send it up front (one round trip).
+    var serverUsesBasic: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return basicSeen
+    }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let answer = respond(to: challenge)
+        completionHandler(answer.0, answer.1)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let answer = respond(to: challenge)
+        completionHandler(answer.0, answer.1)
+    }
+
+    /// Redirects keep the WebDAV method, headers and body (URLSession would turn a redirected PROPFIND into a GET);
+    /// credentials are only forwarded to the same host.
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        guard let original = task.originalRequest, let target = request.url else { return completionHandler(request) }
+        var redirected = original
+        redirected.url = target
+        if target.host?.lowercased() != original.url?.host?.lowercased() {
+            redirected.setValue(nil, forHTTPHeaderField: "Authorization")
+        }
+        completionHandler(redirected)
+    }
+
+    func respond(to challenge: URLAuthenticationChallenge) -> (URLSession.AuthChallengeDisposition, URLCredential?) {
+        let space = challenge.protectionSpace
+        switch space.authenticationMethod {
+        case NSURLAuthenticationMethodServerTrust:
+            guard allowUntrustedCertificates, space.host.lowercased() == host, let trust = space.serverTrust else {
+                return (.performDefaultHandling, nil)
+            }
+            return (.useCredential, URLCredential(trust: trust))
+        case NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodHTTPDigest, NSURLAuthenticationMethodNTLM,
+             NSURLAuthenticationMethodDefault:
+            if space.authenticationMethod == NSURLAuthenticationMethodHTTPBasic {
+                lock.lock()
+                basicSeen = true
+                lock.unlock()
+            }
+            guard challenge.previousFailureCount == 0, !user.isEmpty, let password = password, !password.isEmpty else {
+                // No (or wrong) credentials: let the 401 through so the caller reports it.
+                return (.performDefaultHandling, nil)
+            }
+            return (.useCredential, URLCredential(user: user, password: password, persistence: .forSession))
+        default:
+            return (.performDefaultHandling, nil)
+        }
+    }
+}
+
+// MARK: - Client
+
+/// The remote tree below the library folder: files by relative path, plus every collection ("" is the folder).
+struct RemoteTree {
+    var files: [String: RemoteEntry] = [:]
+    var collections: Set<String> = [""]
+}
+
+/// Thread-safe set of collections known to exist (server-relative paths), so MKCOL runs once per collection.
+final class KnownCollections {
+    private let lock = NSLock()
+    private var paths = Set<String>()
+
+    func contains(_ path: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return paths.contains(WebDAVPaths.key(path))
+    }
+
+    func insert(_ path: String) {
+        lock.lock()
+        paths.insert(WebDAVPaths.key(path))
+        lock.unlock()
+    }
+}
+
+/// A small WebDAV client: PROPFIND (Depth 0/1), GET, PUT, DELETE and MKCOL over one URLSession. Thread-safe; its
+/// async methods run off the main actor.
+final class WebDAVClient {
+    static let log = Logger(subsystem: "app.nib", category: "webdav")
+    static let propfindBody = Data("""
+        <?xml version="1.0" encoding="utf-8"?>
+        <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getetag/><d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>
+        """.utf8)
+
+    let configuration: WebDAVConfiguration
+    let session: URLSession
+    let delegate: WebDAVSessionDelegate
+    let known = KnownCollections()
+    /// Concurrent PROPFINDs while listing.
+    var listingConcurrency = 6
+
+    init(configuration: WebDAVConfiguration, sessionConfiguration: URLSessionConfiguration = .ephemeral) {
+        self.configuration = configuration
+        let host = configuration.serverURL.host ?? ""
+        delegate = WebDAVSessionDelegate(user: configuration.user, password: configuration.password, host: host,
+                                         allowUntrustedCertificates: configuration.allowUntrustedCertificates)
+        let c = sessionConfiguration
+        c.urlCredentialStorage = nil
+        c.urlCache = nil
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.httpShouldSetCookies = true
+        c.timeoutIntervalForRequest = 60
+        c.httpMaximumConnectionsPerHost = max(c.httpMaximumConnectionsPerHost, 6)
+        session = URLSession(configuration: c, delegate: delegate, delegateQueue: nil)
+    }
+
+    deinit {
+        session.finishTasksAndInvalidate()
+    }
+
+    /// Stops every request in flight (sync cancelled or the background task expired).
+    func cancelAll() {
+        session.getAllTasks { tasks in tasks.forEach { $0.cancel() } }
+    }
+
+    var host: String { configuration.serverURL.host ?? "" }
+
+    // MARK: Requests
+
+    func request(_ url: URL, method: String) -> URLRequest {
+        var r = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 60)
+        r.httpMethod = method
+        if sendsBasicUpFront, let password = configuration.password {
+            let token = Data("\(configuration.user):\(password)".utf8).base64EncodedString()
+            r.setValue("Basic " + token, forHTTPHeaderField: "Authorization")
+        }
+        return r
+    }
+
+    private let flagLock = NSLock()
+    private var basicRefused = false
+
+    /// Basic is sent up front over https (or once an http server asked for it), saving a 401 round trip per
+    /// request; Digest (and a server that refuses the up-front header) goes through the challenge.
+    var sendsBasicUpFront: Bool {
+        guard !configuration.user.isEmpty, !(configuration.password ?? "").isEmpty else { return false }
+        flagLock.lock()
+        let refused = basicRefused
+        flagLock.unlock()
+        return !refused && (configuration.serverURL.scheme?.lowercased() == "https" || delegate.serverUsesBasic)
+    }
+
+    /// A 401 to an up-front Basic header from a server that does not offer Basic (Digest only): stop sending it and
+    /// retry the request once without it, so URLSession answers the Digest challenge.
+    func retryWithoutBasic(_ request: URLRequest, _ response: HTTPURLResponse) -> URLRequest? {
+        guard response.statusCode == 401, request.value(forHTTPHeaderField: "Authorization") != nil else { return nil }
+        let offered = (response.value(forHTTPHeaderField: "WWW-Authenticate") ?? "").lowercased()
+        guard !offered.contains("basic") else { return nil }
+        flagLock.lock()
+        basicRefused = true
+        flagLock.unlock()
+        var retry = request
+        retry.setValue(nil, forHTTPHeaderField: "Authorization")
+        return retry
+    }
+
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let first = try await sendOnce(request)
+        if let retry = retryWithoutBasic(request, first.1) { return try await sendOnce(retry) }
+        return first
+    }
+
+    private func sendOnce(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw WebDAVError.invalidResponse("not HTTP") }
+            return (data, http)
+        } catch {
+            throw WebDAVError.from(error, host: host)
+        }
+    }
+
+    func label(_ url: URL) -> String {
+        let comps = WebDAVPaths.components(of: url)
+        let base = WebDAVPaths.components(of: configuration.serverURL)
+        let rel = comps.count >= base.count ? Array(comps.dropFirst(base.count)) : comps
+        return rel.isEmpty ? "/" : rel.joined(separator: "/")
+    }
+
+    func check(_ response: HTTPURLResponse, _ method: String, _ url: URL, ok: (Int) -> Bool) throws {
+        let status = response.statusCode
+        if ok(status) { return }
+        switch status {
+        case 401: throw WebDAVError.authenticationFailed
+        case 403: throw WebDAVError.forbidden(label(url))
+        case 404, 410: throw WebDAVError.notFound(label(url))
+        case 412: throw WebDAVError.changedDuringSync(label(url))
+        case 507: throw WebDAVError.insufficientStorage
+        default: throw WebDAVError.http(status, "\(method) \(label(url))")
+        }
+    }
+
+    /// PROPFIND; nil when the resource does not exist.
+    func propfind(_ url: URL, depth: Int) async throws -> [DAVResource]? {
+        var r = request(url, method: "PROPFIND")
+        r.setValue(String(depth), forHTTPHeaderField: "Depth")
+        r.setValue("application/xml; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        r.httpBody = WebDAVClient.propfindBody
+        let (data, response) = try await send(r)
+        if response.statusCode == 404 || response.statusCode == 410 { return nil }
+        if response.statusCode == 405 || response.statusCode == 501 { throw WebDAVError.notWebDAV }
+        try check(response, "PROPFIND", url) { $0 == 207 || $0 == 200 }
+        return try WebDAVMultistatusParser.parse(data)
+    }
+
+    /// Downloads `url` into `destination` (replaced if present).
+    func get(_ url: URL, to destination: URL) async throws {
+        let fm = FileManager.default
+        let first = request(url, method: "GET")
+        var (tmp, http) = try await downloadOnce(first)
+        if let retry = retryWithoutBasic(first, http) {
+            try? fm.removeItem(at: tmp)
+            (tmp, http) = try await downloadOnce(retry)
+        }
+        do {
+            try check(http, "GET", url) { (200..<300).contains($0) }
+        } catch {
+            try? fm.removeItem(at: tmp)
+            throw error
+        }
+        do {
+            try? fm.removeItem(at: destination)
+            try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.moveItem(at: tmp, to: destination)
+        } catch {
+            throw WebDAVError.local(error.localizedDescription)
+        }
+    }
+
+    private func downloadOnce(_ request: URLRequest) async throws -> (URL, HTTPURLResponse) {
+        let tmp: URL
+        let response: URLResponse
+        do {
+            (tmp, response) = try await session.download(for: request)
+        } catch {
+            throw WebDAVError.from(error, host: host)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            try? FileManager.default.removeItem(at: tmp)
+            throw WebDAVError.invalidResponse("not HTTP")
+        }
+        return (tmp, http)
+    }
+
+    /// Uploads a file. `createOnly` sends `If-None-Match: *`, so a file that appeared on the server since the
+    /// listing is never overwritten (412 → `changedDuringSync`). Returns the response's ETag, if any.
+    @discardableResult
+    func put(file: URL, to url: URL, createOnly: Bool = false) async throws -> String? {
+        var r = request(url, method: "PUT")
+        r.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        if createOnly { r.setValue("*", forHTTPHeaderField: "If-None-Match") }
+        var http = try await uploadOnce(r, file: file)
+        if let retry = retryWithoutBasic(r, http) { http = try await uploadOnce(retry, file: file) }
+        try check(http, "PUT", url) { (200..<300).contains($0) }
+        return http.value(forHTTPHeaderField: "ETag")
+    }
+
+    private func uploadOnce(_ request: URLRequest, file: URL) async throws -> HTTPURLResponse {
+        let response: URLResponse
+        do {
+            (_, response) = try await session.upload(for: request, fromFile: file)
+        } catch {
+            throw WebDAVError.from(error, host: host)
+        }
+        guard let http = response as? HTTPURLResponse else { throw WebDAVError.invalidResponse("not HTTP") }
+        return http
+    }
+
+    /// Deletes a file or collection; already gone counts as success.
+    func delete(_ url: URL) async throws {
+        let (_, response) = try await send(request(url, method: "DELETE"))
+        try check(response, "DELETE", url) { (200..<300).contains($0) || $0 == 404 || $0 == 410 }
+    }
+
+    /// Creates one collection; "already exists" (405, or a redirect to it) counts as success.
+    func mkcol(_ url: URL) async throws {
+        let (_, response) = try await send(request(url, method: "MKCOL"))
+        try check(response, "MKCOL", url) { (200..<300).contains($0) || $0 == 405 || $0 == 301 || $0 == 302 }
+    }
+
+    /// Creates the server-relative collections `components` top-down (each once per client).
+    func ensureCollections(_ components: [String]) async throws {
+        guard !components.isEmpty else { return }
+        for i in 1...components.count {
+            let prefix = Array(components.prefix(i))
+            let path = prefix.joined(separator: "/")
+            if known.contains(path) { continue }
+            try await mkcol(WebDAVPaths.collectionURL(configuration.serverURL, components: prefix))
+            known.insert(path)
+        }
+    }
+
+    /// The server-relative components of a library-relative path.
+    func serverComponents(libraryPath path: String) -> [String] {
+        configuration.folderComponents + path.split(separator: "/").map(String.init)
+    }
+
+    func libraryFileURL(_ path: String) -> URL {
+        WebDAVPaths.fileURL(configuration.libraryURL, path: path)
+    }
+
+    /// The version token of one file, read with a Depth 0 PROPFIND (same format as the listing).
+    func version(ofLibraryFile path: String) async throws -> String? {
+        try await propfind(libraryFileURL(path), depth: 0)?.first(where: { !$0.isCollection })?.version
+    }
+
+    /// Lists the library folder recursively with Depth 1 PROPFINDs (level by level, several at a time).
+    /// nil = the folder does not exist yet.
+    func listLibrary(isExcluded: (String) -> Bool = { _ in false }) async throws -> RemoteTree? {
+        let base = configuration.libraryURL
+        guard let top = try await propfind(base, depth: 1) else { return nil }
+        known.insert(configuration.folder)
+        var tree = RemoteTree()
+        var level: [([String], [DAVResource])] = [([], top)]
+        while !level.isEmpty {
+            var next: [[String]] = []
+            for (parent, resources) in level {
+                let requestComponents = WebDAVPaths.components(of: WebDAVPaths.collectionURL(base, components: parent))
+                for member in WebDAVMultistatusParser.members(of: resources, requestComponents: requestComponents) {
+                    let name = member.name
+                    let rel = parent + [name]
+                    let path = rel.joined(separator: "/")
+                    if WebDAVMirrorFilter.isExcludedName(name) || isExcluded(path) { continue }
+                    if member.isCollection {
+                        tree.collections.insert(path)
+                        known.insert(configuration.folder + "/" + path)
+                        next.append(rel)
+                    } else {
+                        tree.files[WebDAVPaths.key(path)] = RemoteEntry(path: path, version: member.version,
+                                                                      size: member.contentLength)
+                    }
+                }
+            }
+            let listed = try await WebDAVClient.concurrentMap(next, limit: listingConcurrency) { rel -> ([String], [DAVResource]) in
+                (rel, try await self.propfind(WebDAVPaths.collectionURL(base, components: rel), depth: 1) ?? [])
+            }
+            level = listed
+        }
+        return tree
+    }
+
+    /// Checks the server and the library folder (Settings › WebDAV "Test Connection").
+    func checkConnection() async throws -> (serverOK: Bool, folderExists: Bool) {
+        guard try await propfind(configuration.serverURL, depth: 0) != nil else { throw WebDAVError.notWebDAV }
+        let folder = try await propfind(configuration.libraryURL, depth: 0)
+        return (true, folder != nil)
+    }
+
+    /// Maps `items` with at most `limit` concurrent calls, keeping the input order.
+    static func concurrentMap<T, R: Sendable>(_ items: [T], limit: Int,
+                                              _ transform: @escaping (T) async throws -> R) async throws -> [R] {
+        guard !items.isEmpty else { return [] }
+        return try await withThrowingTaskGroup(of: (Int, R).self) { group in
+            var results = [R?](repeating: nil, count: items.count)
+            var nextIndex = 0
+            for _ in 0..<min(max(1, limit), items.count) {
+                let i = nextIndex
+                group.addTask { (i, try await transform(items[i])) }
+                nextIndex += 1
+            }
+            while let (i, value) = try await group.next() {
+                results[i] = value
+                if nextIndex < items.count {
+                    let j = nextIndex
+                    group.addTask { (j, try await transform(items[j])) }
+                    nextIndex += 1
+                }
+            }
+            return results.compactMap { $0 }
+        }
+    }
+}
