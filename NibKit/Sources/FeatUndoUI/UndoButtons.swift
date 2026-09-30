@@ -11,7 +11,7 @@ enum UndoAction: CaseIterable {
     /// ⌘Z / ⇧⌘Z.
     var shortcut: KeyShortcut { self == .undo ? KeyShortcut("z", [.command]) : KeyShortcut("z", [.command, .shift]) }
 
-    /// "Undo Add Page" when the step has a name (`bus.history.undoLabel`, an UndoManager action name), else "Undo".
+    /// "Undo Add Page" when the history knows the step (`bus.history.undoLabel` / `redoLabel`), else "Undo".
     func title(_ label: String?) -> String {
         let step = label.flatMap { $0.isEmpty ? nil : $0 }
         switch self {
@@ -26,11 +26,11 @@ enum UndoAction: CaseIterable {
         return ["doc": .string(NodeRef.document(doc).description)]
     }
 
-    // MARK: The document's history (what `edit.undo` / `edit.redo` act on)
-
+    /// The document's own step: what the toolbar buttons show and act on (`edit.undo` / `edit.redo` only reach the
+    /// document's history).
     @MainActor
     func isAvailable(in history: UndoHistory, doc: DocumentID) -> Bool {
-        self == .undo ? history.canUndo(doc) : history.canRedo(doc)
+        UndoRoute.resolve(redo: self == .redo, doc: doc, history: history, window: nil) == .document(doc)
     }
 
     @MainActor
@@ -38,30 +38,30 @@ enum UndoAction: CaseIterable {
         self == .undo ? history.undoLabel(doc) : history.redoLabel(doc)
     }
 
-    // MARK: The window's UndoManager (window-level steps such as F016's "Move Palette")
-
+    /// Where ⌘Z / ⇧⌘Z and the canvas taps act (contracts-v2.2, the shell's own rule): the document's history while it
+    /// has a step, else the window's UndoManager (window-level steps such as the toolbar's "Move Palette"), else nothing.
     @MainActor
-    func isAvailable(in manager: UndoManager) -> Bool {
-        self == .undo ? manager.canUndo : manager.canRedo
+    func route(doc: DocumentID?, history: UndoHistory, window: UndoManager?) -> UndoRoute {
+        UndoRoute.resolve(redo: self == .redo, doc: doc, history: history, window: window)
     }
 
+    /// The title of the step a route acts on, worded exactly as the shell's menu validation words it: "Undo Add Page"
+    /// for the document, the UndoManager's own menu title ("Undo Move Palette") for the window, plain "Undo" otherwise.
     @MainActor
-    func actionName(in manager: UndoManager) -> String {
-        self == .undo ? manager.undoActionName : manager.redoActionName
-    }
-
-    /// What ⌘Z / ⇧⌘Z does in a window right now, as its Edit-menu title. The document's step while its history has
-    /// one ("Undo Add Page"). When the history has none, the shell's key handler falls back to the window's
-    /// UndoManager, so the title names that step ("Undo Move Palette"). With neither, plain "Undo".
-    @MainActor
-    func keyTitle(history: UndoHistory, doc: DocumentID?, window: UndoManager?) -> String {
-        if let doc, isAvailable(in: history, doc: doc) { return title(label(in: history, doc: doc)) }
-        if let window, isAvailable(in: window) { return title(actionName(in: window)) }
-        return title(nil)
+    func title(for route: UndoRoute, history: UndoHistory, window: UndoManager?) -> String {
+        switch route {
+        case .document(let doc):
+            return title(label(in: history, doc: doc))
+        case .window:
+            guard let window else { return title(nil) }
+            return self == .undo ? window.undoMenuItemTitle : window.redoMenuItemTitle
+        case .nothing:
+            return title(nil)
+        }
     }
 }
 
-/// The ⌘Z / ⇧⌘Z titles one window shows (the Edit menu and the ⌘-hold overlay).
+/// The ⌘Z / ⇧⌘Z titles the key window shows (the Edit menu and the ⌘-hold overlay).
 struct UndoKeyTitles: Equatable {
     var undo: String
     var redo: String
@@ -76,22 +76,46 @@ struct UndoKeyTitles: Equatable {
         self.redo = redo
     }
 
+    /// What ⌘Z / ⇧⌘Z do in a window showing `doc` whose UndoManager is `window`, by the same `UndoRoute` the shell runs.
     @MainActor
     init(history: UndoHistory, doc: DocumentID?, window: UndoManager?) {
-        undo = UndoAction.undo.keyTitle(history: history, doc: doc, window: window)
-        redo = UndoAction.redo.keyTitle(history: history, doc: doc, window: window)
+        func title(_ action: UndoAction) -> String {
+            action.title(for: action.route(doc: doc, history: history, window: window), history: history, window: window)
+        }
+        undo = title(.undo)
+        redo = title(.redo)
     }
 }
 
-/// The window's UndoManager behind a session: `UIWindow.undoManager` of the window showing its editor. Window-level
-/// steps live there (F016 registers "Move Palette" through SwiftUI's `\.undoManager`, which resolves to the same
-/// object), and it is what the shell's ⌘Z / ⇧⌘Z fall back to when the document's history is empty.
+/// The window's UndoManager, where window-level steps live (F016 registers "Move Palette" through SwiftUI's
+/// `\.undoManager`, which resolves to the same object) and where ⌘Z / ⇧⌘Z fall back when the document's history is
+/// empty. The shell reads it from its own view's window; the key window's navigator is that view controller.
+@MainActor
 enum UndoWindow {
-    // ponytail: contracts-v2 has no accessor for a window's UndoManager; if the shell publishes one (SceneNavigator or
-    // EditorSession), read it here instead of walking to the editor's window.
-    @MainActor
-    static func manager(for session: EditorSession) -> UndoManager? {
-        (session.editor as? UIViewController)?.viewIfLoaded?.window?.undoManager
+    /// The key window's UndoManager (contracts-v2.2: the shell keeps `ui.activeNavigator` and the active session on the
+    /// key window). `session` nil = the key window's own session, whatever it shows (the library too).
+    static func manager(app: NibApp, session: EditorSession?) -> UndoManager? {
+        if let navigator = app.ui.activeNavigator, session.map({ navigator.session === $0 }) ?? true,
+           let manager = navigator.rootViewController?.viewIfLoaded?.window?.undoManager {
+            return manager
+        }
+        return (session?.editor as? UIViewController)?.viewIfLoaded?.window?.undoManager
+    }
+
+    /// Undoes or redoes one window step, with the shell's guards: NSUndoManager closes one open top-level group itself,
+    /// but undoing inside a nested group or during a replay would throw. Returns whether a step ran.
+    @discardableResult
+    static func perform(_ action: UndoAction, on manager: UndoManager) -> Bool {
+        guard manager.groupingLevel <= 1, !manager.isUndoing, !manager.isRedoing else { return false }
+        switch action {
+        case .undo:
+            guard manager.canUndo else { return false }
+            manager.undo()
+        case .redo:
+            guard manager.canRedo else { return false }
+            manager.redo()
+        }
+        return true
     }
 }
 
@@ -105,8 +129,9 @@ enum UndoButtons {
     /// Leading or trailing nav-bar group per `NibSettings.undoButtonsOnRight` (P-030): first in the trailing bar
     /// (DESIGN.md §14.2: "Undo, Redo | Search, …"), last in the leading bar after the title. Live state (contracts-v2)
     /// comes from the window the bar sits in: the `doc` param, "Undo Add Page", and greyed out with nothing to undo.
-    /// The buttons act on the document only, so their title and enabled state follow its history alone. iPhone's bar
-    /// keeps Undo, the Assistant and More (DESIGN.md §14.2), so Redo is regular-width only.
+    /// A nav item can only run its command, and `edit.undo` reaches the document's history alone, so the buttons
+    /// follow that history: a window-level step ("Move Palette") is ⌘Z's and the canvas taps' (contract-gaps F015).
+    /// iPhone's bar keeps Undo, the Assistant and More (DESIGN.md §14.2), so Redo is regular-width only.
     static func toolbarItems(onRight: Bool, history: UndoHistory) -> [ToolbarItemDescriptor] {
         UndoAction.allCases.enumerated().map { index, action in
             var item = ToolbarItemDescriptor(
@@ -126,10 +151,10 @@ enum UndoButtons {
         }
     }
 
-    /// `.canvas` scope: while a text box or block is being edited, ⌘Z stays the text view's own typing undo. The params
-    /// are `{}` (and `sessionParams` names the window's document once the shell passes `resolvedParams`), so
-    /// `edit.undo` / `edit.redo` act on exactly the invoking window's document and report `done: false` when its
-    /// history is empty: the shell then falls back to the window's UndoManager, and `titles` say which step that is.
+    /// `.canvas` scope: while a text box or block is being edited, ⌘Z stays the text view's own typing undo. The
+    /// params name the key window's document (`sessionParams`, which the shell merges in), and the shell routes the
+    /// key with `UndoRoute`: the document's history while it has a step, else the window's UndoManager. `titles` say
+    /// which step that is.
     static func keyCommands(_ titles: UndoKeyTitles) -> [KeyCommandDescriptor] {
         UndoAction.allCases.enumerated().map { index, action in
             var key = KeyCommandDescriptor(
@@ -149,14 +174,14 @@ enum UndoButtons {
     }
 }
 
-/// Keeps what contracts-v2 cannot compute per window in step. The nav-bar side is a static group, re-registered when
-/// `editing.undoOnRight` changes. The ⌘Z / ⇧⌘Z titles are static strings (KeyCommandDescriptor has no session
-/// title), re-registered when the key window's step changes: a commit, undo or redo; a document opened, closed or
-/// switched; another window activated (`session.activated`); or a step added to, undone in or redone in a window's
-/// UndoManager. Unchanged titles register nothing, so a stroke costs one comparison.
+/// Keeps the two things contracts-v2 cannot compute per window in step. The nav-bar side is a static group,
+/// re-registered when `editing.undoOnRight` changes. The ⌘Z / ⇧⌘Z titles are static strings (KeyCommandDescriptor
+/// has no session title), re-registered when the key window's step changes: a commit, undo or redo; a document
+/// opened, closed or switched; another window made key (`session.activated`); or a step added to, undone in or redone
+/// in a window's UndoManager. Unchanged titles register nothing, so a stroke costs one comparison.
 @MainActor
 final class UndoChrome {
-    typealias WindowUndo = @MainActor (EditorSession) -> UndoManager?
+    typealias WindowUndo = @MainActor (NibApp, EditorSession?) -> UndoManager?
 
     private weak var app: NibApp?
     private let windowUndo: WindowUndo
@@ -166,7 +191,7 @@ final class UndoChrome {
     private var subscriptions: [EventSubscription] = []
     private var observers: [NSObjectProtocol] = []
 
-    init(app: NibApp, windowUndo: @escaping WindowUndo = { UndoWindow.manager(for: $0) }) {
+    init(app: NibApp, windowUndo: @escaping WindowUndo = { UndoWindow.manager(app: $0, session: $1) }) {
         self.app = app
         self.windowUndo = windowUndo
     }
@@ -216,18 +241,11 @@ final class UndoChrome {
             side = onRight
             UndoButtons.installToolbar(onRight: onRight, in: app)
         }
-        let session = targetSession(app)
-        let next = UndoKeyTitles(history: app.bus.history, doc: session?.document,
-                                 window: session.flatMap { windowUndo($0) })
+        // The shell keeps the active session on the key window (contracts-v2.2), which is where ⌘Z lands.
+        let session = app.services.sessions.active
+        let next = UndoKeyTitles(history: app.bus.history, doc: session?.document, window: windowUndo(app, session))
         guard next != titles else { return }
         titles = next
         UndoButtons.installKeys(next, in: app)
-    }
-
-    /// The session whose editor is in the key window, else the most recently activated one.
-    private func targetSession(_ app: NibApp) -> EditorSession? {
-        let sessions = app.services.sessions
-        return sessions.sessions.first { ($0.editor as? UIViewController)?.viewIfLoaded?.window?.isKeyWindow == true }
-            ?? sessions.active
     }
 }

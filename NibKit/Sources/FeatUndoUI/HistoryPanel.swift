@@ -5,55 +5,25 @@ import os
 import NibContracts
 import NibDesign
 
-/// Who made an undo step, from `history.list`'s principal string ("user", "ai:<chat>", "plugin:<id>", …).
+/// Who made an undo step, from `history.list`'s principal string ("user", "ai:<chat>", "plugin:<id>", …): the
+/// NibDesign provenance kind ("You", "Assistant", "Plugin", "Bridge", "Collaborator") plus the row's detail.
 struct HistoryPrincipal: Equatable {
-    enum Kind: Equatable, CaseIterable {
-        case you, ai, plugin, bridge, collaborator
-    }
-
-    let kind: Kind
+    let kind: NibPrincipalKind
     /// Plugin id, bridge client or sync origin. Nil for you and the assistant (a chat id means nothing to people).
     let detail: String?
 
     init(_ principal: String) {
-        switch Principal(string: principal) {
-        case .user:
-            kind = .you
-            detail = nil
-        case .ai:
-            kind = .ai
+        let parsed = Principal(string: principal)
+        kind = NibPrincipalKind(parsed)
+        switch parsed {
+        case .user, .ai:
             detail = nil
         case .plugin(let id):
-            kind = .plugin
             detail = id.isEmpty ? nil : id
         case .bridge(let client):
-            kind = .bridge
             detail = client.isEmpty ? nil : client
         case .sync(let origin):
-            kind = .collaborator
             detail = origin.isEmpty ? nil : origin
-        }
-    }
-}
-
-extension HistoryPrincipal.Kind {
-    var title: String {
-        switch self {
-        case .you: return String(localized: "You")
-        case .ai: return String(localized: "Assistant")
-        case .plugin: return String(localized: "Plugin")
-        case .bridge: return String(localized: "Bridge")
-        case .collaborator: return String(localized: "Collaborator")
-        }
-    }
-
-    var symbol: NibSymbol {
-        switch self {
-        case .you: return .pencil
-        case .ai: return .assistant
-        case .plugin: return .puzzle
-        case .bridge: return .bridge
-        case .collaborator: return .shared
         }
     }
 }
@@ -353,7 +323,7 @@ struct HistoryRowView: View {
                     .foregroundStyle(NibColor.label)
                     .lineLimit(ax ? nil : 3)
                 line {
-                    PrincipalBadge(principal: row.principal)
+                    NibBadge(.principal(row.principal.kind))
                     Text(row.detail())
                         .font(NibFont.caption1)
                         .foregroundStyle(NibColor.labelSecondary)
@@ -370,28 +340,6 @@ struct HistoryRowView: View {
         }
         .padding(.vertical, NibSpacing.s)
         .frame(minHeight: NibMetrics.hitTarget)
-    }
-}
-
-/// "You", "Assistant", "Plugin", "Bridge" or "Collaborator" with its glyph: a caption capsule on `fill3`, like the
-/// "Plugin" badge. The glyph is never the only signal (the word is always there); the assistant's drop is in accent,
-/// as every AI mark is.
-struct PrincipalBadge: View {
-    let principal: HistoryPrincipal
-
-    var body: some View {
-        HStack(spacing: NibSpacing.xxs) {
-            Image(nib: principal.kind.symbol)
-                .foregroundStyle(principal.kind == .ai ? NibColor.accent : NibColor.labelSecondary)
-                .accessibilityHidden(true)
-            Text(principal.kind.title)
-                .foregroundStyle(NibColor.labelSecondary)
-        }
-        .font(NibFont.caption2)
-        .padding(.horizontal, NibSpacing.s)
-        .padding(.vertical, NibSpacing.xxs)
-        .background(NibColor.fill3, in: Capsule())
-        .fixedSize()
     }
 }
 

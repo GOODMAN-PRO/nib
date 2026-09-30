@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatUndoUI
 
@@ -24,6 +25,30 @@ private struct SetPageTitle: NibCommand {
             try tx.put(page, doc: doc)
         }
         return NoResult()
+    }
+}
+
+/// A window-level step like the toolbar's "Move Palette": undoable and redoable on an UndoManager, outside any document.
+private final class WindowStep {
+    var dock = "bottom"
+    let manager: UndoManager
+
+    init() {
+        manager = UndoManager()
+        manager.groupsByEvent = false
+    }
+
+    func move(to dock: String) {
+        manager.beginUndoGrouping()
+        set(dock)
+        manager.endUndoGrouping()
+    }
+
+    private func set(_ next: String) {
+        let previous = dock
+        dock = next
+        manager.registerUndo(withTarget: self) { step in step.set(previous) }
+        manager.setActionName("Move Palette")
     }
 }
 
@@ -69,37 +94,131 @@ final class FeatUndoUITests: XCTestCase {
         XCTAssertTrue(app.settings.get(UndoSettings.gestures))
     }
 
-    /// Titles come from the undo history, the side from `editing.undoOnRight`, and ⌘Z / ⇧⌘Z act on the session's
-    /// document through their descriptors alone.
+    /// contracts-v2: one registration. Each window's buttons name its document (`sessionParams`), title the step
+    /// ("Undo Set Page Title", `sessionTitle`) and grey out with nothing to undo (`isEnabled`); iPhone keeps Undo only.
+    /// The side follows `editing.undoOnRight`, and ⌘Z / ⇧⌘Z act on the key window's document.
     func testButtonsAndShortcutsFollowHistorySideAndDocument() async throws {
         let h = harness()
         let chrome = UndoChrome(app: h.app)
         chrome.refresh()
-        let first = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.undo)))
-        XCTAssertEqual(first.title, "Undo")
-        XCTAssertEqual(first.group, .navLeading)
-        XCTAssertEqual(first.params, ["doc": "doc:FIXTUREDOC01"])
+        let undo = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.undo)))
+        let redo = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.redo)))
+        XCTAssertEqual(undo.group, .navLeading)
+        XCTAssertEqual(undo.resolvedTitle(for: h.session), "Undo")
+        XCTAssertEqual(undo.resolvedParams(for: h.session), ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertEqual(undo.isEnabled?(h.session), false)
+        XCTAssertEqual(redo.isEnabled?(h.session), false)
+        XCTAssertTrue(undo.showsInCompactWidth)
+        XCTAssertFalse(redo.showsInCompactWidth)
+        XCTAssertEqual(chrome.titles, .plain)
 
         let original = try title(h, Fixtures.page1)
         try await setTitle(h, Fixtures.page1, "Kinematics")
+        // The live state needs no re-registration: the same descriptors answer for the new step.
+        XCTAssertEqual(undo.resolvedTitle(for: h.session), "Undo Set Page Title")
+        XCTAssertEqual(undo.isEnabled?(h.session), true)
+        XCTAssertEqual(redo.isEnabled?(h.session), false)
         chrome.refresh()
-        XCTAssertEqual(h.app.ui.toolbar.get(UndoButtons.itemID(.undo))?.title, "Undo Set Page Title")
         XCTAssertEqual(h.app.content.keyCommands.get(UndoButtons.keyID(.undo))?.title, "Undo Set Page Title")
+        XCTAssertEqual(h.app.content.keyCommands.get(UndoButtons.keyID(.redo))?.title, "Redo")
 
         _ = try await h.run(CommandIDs.settingsSet, ["name": .string(NibSettings.undoButtonsOnRight.name), "value": true])
         chrome.refresh()
         XCTAssertEqual(h.app.ui.toolbar.get(UndoButtons.itemID(.undo))?.group, .navTrailing)
         XCTAssertEqual(h.app.ui.toolbar.get(UndoButtons.itemID(.redo))?.group, .navTrailing)
 
+        // ⌘Z as the shell runs it: `resolvedParams` for the key window's session, routed by `UndoRoute`.
         let undoKey = try XCTUnwrap(h.app.content.keyCommands.get(UndoButtons.keyID(.undo)))
-        _ = try await h.app.bus.execute(Invocation(command: undoKey.command, params: undoKey.params, session: h.session))
+        XCTAssertEqual(undoKey.scope, .canvas)
+        let undoParams = undoKey.resolvedParams(for: h.session)
+        XCTAssertEqual(undoParams, ["doc": "doc:FIXTUREDOC01"])
+        XCTAssertEqual(UndoRoute.forCommand(undoKey.command, params: undoParams, session: h.session,
+                                            history: h.app.bus.history, window: nil), .document(Fixtures.docID))
+        _ = try await h.app.bus.execute(Invocation(command: undoKey.command, params: undoParams, session: h.session))
         XCTAssertEqual(try title(h, Fixtures.page1), original)
+        XCTAssertEqual(redo.resolvedTitle(for: h.session), "Redo Set Page Title")
+        XCTAssertEqual(redo.isEnabled?(h.session), true)
         chrome.refresh()
-        XCTAssertEqual(h.app.ui.toolbar.get(UndoButtons.itemID(.redo))?.title, "Redo Set Page Title")
+        XCTAssertEqual(h.app.content.keyCommands.get(UndoButtons.keyID(.redo))?.title, "Redo Set Page Title")
 
+        // `edit.redo {}` from the key's static params alone reaches the invoking session's document (contracts-v2).
         let redoKey = try XCTUnwrap(h.app.content.keyCommands.get(UndoButtons.keyID(.redo)))
+        XCTAssertEqual(redoKey.params, [:])
         _ = try await h.app.bus.execute(Invocation(command: redoKey.command, params: redoKey.params, session: h.session))
         XCTAssertEqual(try title(h, Fixtures.page1), "Kinematics")
+
+        // No document in the window: nothing to name, nothing to undo.
+        let library = EditorSession()
+        XCTAssertEqual(undo.resolvedParams(for: library), [:])
+        XCTAssertEqual(undo.isEnabled?(library), false)
+        XCTAssertEqual(undo.resolvedTitle(for: library), "Undo")
+    }
+
+    /// Shell v2 falls back to the window's UndoManager when the document has nothing to undo. The ⌘Z / ⇧⌘Z titles
+    /// follow the same route and wording as the shell's menu validation; the document's step always comes first.
+    func testKeyTitlesFollowTheShellsWindowUndoFallback() async throws {
+        let h = harness()
+        let step = WindowStep()
+        var windows: [EditorSession?] = []
+        let chrome = UndoChrome(app: h.app) { _, session in
+            windows.append(session)
+            return step.manager
+        }
+        chrome.refresh()
+        XCTAssertEqual(chrome.titles, .plain)
+        XCTAssertTrue(windows.allSatisfy { $0 === h.session })      // the key window's (active) session
+
+        step.move(to: "left")
+        chrome.refresh()
+        let undoKey = try XCTUnwrap(h.app.content.keyCommands.get(UndoButtons.keyID(.undo)))
+        XCTAssertEqual(undoKey.title, step.manager.undoMenuItemTitle)
+        XCTAssertTrue(undoKey.title.hasSuffix("Move Palette"))
+        XCTAssertEqual(UndoRoute.forCommand(undoKey.command, params: undoKey.resolvedParams(for: h.session),
+                                            session: h.session, history: h.app.bus.history, window: step.manager),
+                       .window)
+        // The toolbar buttons only reach the document, so they stay as they were.
+        let undoItem = try XCTUnwrap(h.app.ui.toolbar.get(UndoButtons.itemID(.undo)))
+        XCTAssertEqual(undoItem.isEnabled?(h.session), false)
+        XCTAssertEqual(undoItem.resolvedTitle(for: h.session), "Undo")
+
+        // A document step wins over the window's.
+        try await setTitle(h, Fixtures.page1, "Kinematics")
+        chrome.refresh()
+        XCTAssertEqual(h.app.content.keyCommands.get(UndoButtons.keyID(.undo))?.title, "Undo Set Page Title")
+
+        // The document's step undone: ⌘Z names the window's step again, ⇧⌘Z the document's.
+        _ = try await h.run(CommandIDs.undo, ["doc": "doc:FIXTUREDOC01"])
+        chrome.refresh()
+        XCTAssertEqual(h.app.content.keyCommands.get(UndoButtons.keyID(.undo))?.title, step.manager.undoMenuItemTitle)
+        XCTAssertTrue(UndoWindow.perform(.undo, on: step.manager))
+        XCTAssertEqual(step.dock, "bottom")
+        chrome.refresh()
+        XCTAssertEqual(h.app.content.keyCommands.get(UndoButtons.keyID(.undo))?.title, "Undo")
+        XCTAssertEqual(h.app.content.keyCommands.get(UndoButtons.keyID(.redo))?.title, "Redo Set Page Title")
+        XCTAssertTrue(UndoWindow.perform(.redo, on: step.manager))
+        XCTAssertEqual(step.dock, "left")
+        XCTAssertFalse(UndoWindow.perform(.redo, on: step.manager))
+    }
+
+    /// The titles agree with `UndoRoute` for every combination of document and window steps.
+    func testKeyTitlesMatchTheRoute() async throws {
+        let h = harness()
+        let history = h.app.bus.history
+        let step = WindowStep()
+        XCTAssertEqual(UndoKeyTitles(history: history, doc: Fixtures.docID, window: nil), .plain)
+        XCTAssertEqual(UndoKeyTitles(history: history, doc: nil, window: nil), .plain)
+        XCTAssertEqual(UndoKeyTitles(history: history, doc: nil, window: step.manager), .plain)
+        step.move(to: "top")
+        // No document open: only the window can act (the library, a window showing onboarding).
+        XCTAssertEqual(UndoAction.undo.route(doc: nil, history: history, window: step.manager), .window)
+        XCTAssertEqual(UndoKeyTitles(history: history, doc: nil, window: step.manager).undo,
+                       step.manager.undoMenuItemTitle)
+        try await setTitle(h, Fixtures.page1, "Kinematics")
+        XCTAssertEqual(UndoAction.undo.route(doc: Fixtures.docID, history: history, window: step.manager),
+                       .document(Fixtures.docID))
+        XCTAssertEqual(UndoAction.redo.route(doc: Fixtures.docID, history: history, window: step.manager), .nothing)
+        let titles = UndoKeyTitles(history: history, doc: Fixtures.docID, window: step.manager)
+        XCTAssertEqual(titles, UndoKeyTitles(undo: "Undo Set Page Title", redo: "Redo"))
     }
 
     /// Acceptance: the History view model reverts a group made by `.ai("t")` and keeps later user edits.
@@ -117,7 +236,7 @@ final class FeatUndoUITests: XCTestCase {
         XCTAssertEqual(model.rows.count, 3)
         XCTAssertEqual(model.rows.first?.principal.kind, .you)          // newest first
         let aiRow = try XCTUnwrap(model.rows.first { $0.group == turn })
-        XCTAssertEqual(aiRow.principal.kind, .ai)
+        XCTAssertEqual(aiRow.principal.kind, .assistant)
         XCTAssertEqual(aiRow.changes, 2)
         XCTAssertEqual(aiRow.label, "Set Page Title")
 
@@ -168,14 +287,17 @@ final class FeatUndoUITests: XCTestCase {
 
     func testPrincipalBadgesDetailsAndReceipts() {
         XCTAssertEqual(HistoryPrincipal("user").kind, .you)
-        XCTAssertEqual(HistoryPrincipal("ai:chat1").kind, .ai)
+        XCTAssertEqual(HistoryPrincipal("ai:chat1").kind, .assistant)
         XCTAssertNil(HistoryPrincipal("ai:chat1").detail)
         XCTAssertEqual(HistoryPrincipal("plugin:anki-export").kind, .plugin)
         XCTAssertEqual(HistoryPrincipal("plugin:anki-export").detail, "anki-export")
         XCTAssertEqual(HistoryPrincipal("bridge:claude-code").kind, .bridge)
         XCTAssertEqual(HistoryPrincipal("bridge:claude-code").detail, "claude-code")
         XCTAssertEqual(HistoryPrincipal("sync:1a2b3c4d").kind, .collaborator)
-        for kind in HistoryPrincipal.Kind.allCases { XCTAssertFalse(kind.title.isEmpty) }
+        XCTAssertNil(HistoryPrincipal("sync:").detail)
+        // The badge is NibDesign's provenance kind: the same words and glyphs as every other "made by" mark.
+        XCTAssertEqual(HistoryPrincipal("bridge:claude-code").kind, NibPrincipalKind(.bridge("claude-code")))
+        for kind in NibPrincipalKind.allCases { XCTAssertFalse(kind.title.isEmpty) }
 
         let row = HistoryRow(id: "G#1", group: "G", label: "Add Strokes", principal: HistoryPrincipal("plugin:anki-export"),
                              changes: 3, date: Date())
@@ -252,6 +374,30 @@ final class FeatUndoUITests: XCTestCase {
         let redone = await attachment.perform(.redo)
         XCTAssertTrue(redone)
         XCTAssertEqual(try title(h, Fixtures.page1), "Kinematics")
+
+        // With nothing left in the document, the taps fall back to the window's UndoManager, as ⌘Z does; the
+        // document's step always comes first.
+        let step = WindowStep()
+        attachment.windowUndo = { _ in step.manager }
+        let documentFirst = await attachment.perform(.undo)
+        XCTAssertTrue(documentFirst)
+        XCTAssertEqual(try title(h, Fixtures.page1), original)
+        let nothing = await attachment.perform(.undo)
+        XCTAssertFalse(nothing)
+        step.move(to: "left")
+        let windowUndone = await attachment.perform(.undo)
+        XCTAssertTrue(windowUndone)
+        XCTAssertEqual(step.dock, "bottom")
+        XCTAssertEqual(try title(h, Fixtures.page1), original)
+        let documentRedone = await attachment.perform(.redo)
+        XCTAssertTrue(documentRedone)
+        XCTAssertEqual(try title(h, Fixtures.page1), "Kinematics")
+        XCTAssertEqual(step.dock, "bottom")
+        let windowRedone = await attachment.perform(.redo)
+        XCTAssertTrue(windowRedone)
+        XCTAssertEqual(step.dock, "left")
+        let nothingToRedo = await attachment.perform(.redo)
+        XCTAssertFalse(nothingToRedo)
 
         // Off from Settings (through settings.set, as the AI or a plugin would), in read-only mode and while typing.
         _ = try await h.run(CommandIDs.settingsSet, ["name": .string(UndoSettings.gestures.name), "value": false])
