@@ -34,13 +34,14 @@ html[data-theme="light"]{
   --accent:#0066E0;--on-accent:#FFFFFF;--accent-wash:rgba(0,102,224,.10);
   --red:#FF3B30;--green:#34C759;
   /* water (the SVG filter reads these through flood-color) */
-  --w-body:rgba(255,255,255,.08);--w-edge:rgba(20,28,40,.07);--w-caustic:rgba(255,255,255,.12);
-  --w-rim:rgba(255,255,255,.85);--w-line:rgba(0,0,0,.075);--w-tint-rim:rgba(255,255,255,.30);
-  --b-body:rgba(255,255,255,.70);--b-rim:rgba(255,255,255,1);
+  /* water v2 (§3.3, §10.9): a 0.8 pt rim lit from the top-left, half as bright on the counter side; no caustic, no dark ring */
+  --w-body:rgba(255,255,255,.08);--w-rim:rgba(255,255,255,.85);--w-rim-counter:rgba(255,255,255,.425);
+  --w-line:rgba(0,0,0,.075);--w-tint-rim:rgba(255,255,255,.30);
+  --w-shadow:.08;--w-shadow-paper:.13;   /* waterShadow / waterShadowOnPaper: 0 5 16, held 0 8 16 × 1.6 */
+  --b-body:rgba(255,255,255,.70);
   --lens-clear:rgba(255,255,255,.46);--lens-deep:rgba(249,249,251,.72);--rt-fill:#F4F4F6;
-  --w-line-bud:rgba(0,0,0,.12);--scrim:rgba(0,0,0,.18);--sheet-shadow:0 24px 60px -12px rgba(0,0,0,.28);
-  --shadow-rest:0 .5px 1px rgba(0,0,0,.07),0 6px 16px -3px rgba(0,0,0,.11);
-  --shadow-lift:0 1px 2px rgba(0,0,0,.06),0 18px 36px -8px rgba(0,0,0,.22);
+  --scrim:rgba(0,0,0,.18);--sheet-shadow:0 24px 60px -12px rgba(0,0,0,.28);
+  --shadow-rest:0 5px 16px rgba(0,0,0,.08);
   --cover-shadow:0 .5px 1px rgba(0,0,0,.10),0 3px 8px -2px rgba(0,0,0,.10);
   --paper-shadow:0 0 0 .5px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.05),0 14px 34px -10px rgba(0,0,0,.14);
 }
@@ -53,13 +54,13 @@ html[data-theme="dark"]{
   --bg-1:#000000;--bg-2:#1C1C1E;--bg-3:#2C2C2E;--bg-sidebar:#1C1C1E;--desk:#121214;
   --accent:#3D8BFF;--on-accent:#FFFFFF;--accent-wash:rgba(61,139,255,.16);
   --red:#FF453A;--green:#30D158;
-  --w-body:rgba(255,255,255,.03);--w-edge:rgba(255,255,255,.08);--w-caustic:rgba(255,255,255,.10);
-  --w-rim:rgba(255,255,255,.42);--w-line:rgba(255,255,255,.12);--w-tint-rim:rgba(255,255,255,.30);
-  --b-body:rgba(255,255,255,.22);--b-rim:rgba(255,255,255,.7);
+  --w-body:rgba(255,255,255,.03);--w-rim:rgba(255,255,255,.50);--w-rim-counter:rgba(255,255,255,.25);
+  --w-line:rgba(255,255,255,.12);--w-tint-rim:rgba(255,255,255,.30);
+  --w-shadow:.28;--w-shadow-paper:.18;
+  --b-body:rgba(255,255,255,.22);
   --lens-clear:rgba(22,22,24,.62);--lens-deep:rgba(28,28,30,.86);--rt-fill:#2C2C2E;
-  --w-line-bud:rgba(255,255,255,.16);--scrim:rgba(0,0,0,.45);--sheet-shadow:0 24px 60px -12px rgba(0,0,0,.7);
-  --shadow-rest:0 .5px 1px rgba(0,0,0,.5),0 8px 20px -3px rgba(0,0,0,.55);
-  --shadow-lift:0 1px 2px rgba(0,0,0,.5),0 20px 40px -8px rgba(0,0,0,.7);
+  --scrim:rgba(0,0,0,.45);--sheet-shadow:0 24px 60px -12px rgba(0,0,0,.7);
+  --shadow-rest:0 5px 16px rgba(0,0,0,.28);
   --cover-shadow:0 .5px 1px rgba(0,0,0,.6),0 3px 10px -2px rgba(0,0,0,.6);
   --paper-shadow:0 0 0 .5px rgba(255,255,255,.06),0 18px 40px -12px rgba(0,0,0,.8);
 }
@@ -101,18 +102,25 @@ html[data-theme="dark"] .ctl-group button[aria-pressed="true"]{background:#48484
 svg.water{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
 .content-layer>*{pointer-events:auto}
 /* recede (§10.8): only droplets over the page or within 24 pt of the stroke fade to 22 %; backdrop sampling freezes for all */
-.writing .lens{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+.writing .lens,.writing .lband{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
 .writing .recede{filter:opacity(.22)!important;transition:filter .1s var(--ease-out)!important}
 svg.water,.dclip{transition:filter .22s var(--ease-out)}
+svg.water.held{mix-blend-mode:plus-lighter}
 .dclip{position:absolute;left:0;top:0;transform-origin:0 0;overflow:hidden;pointer-events:none;will-change:transform}
 
-.lens{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform;box-shadow:var(--shadow-rest);transition:opacity .18s var(--ease-out),box-shadow .25s var(--ease-out),filter .22s var(--ease-out),background-color .18s var(--ease-out)}
+/* A droplet's lens and body (§10.9, the mockup's layers): the water's own shadow (0 5 16, held 0 8 16 × 1.6, eased with
+   the lift through --lp; box-shadow paints outside the border box only, so it never shows through the body), then the
+   body tint. On Chromium a Clear droplet also has a .lband under it: the page bent outward in a band at the rim and a
+   blurred core, one SVG filter (bakeLens). Elsewhere the body carries the blur itself. */
+.lens{--sa:var(--w-shadow);--lp:0;position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform;box-shadow:0 calc(5px + 3px * var(--lp)) 16px rgba(0,0,0,calc(var(--sa) * (1 + .6 * var(--lp))));transition:opacity .18s var(--ease-out),filter .22s var(--ease-out),background-color .18s var(--ease-out)}
+.lens.paper{--sa:var(--w-shadow-paper)}
+.lband{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform;pointer-events:none;transition:opacity .18s var(--ease-out),filter .22s var(--ease-out)}
 .lens.clear{background:var(--lens-clear);-webkit-backdrop-filter:saturate(1.7) brightness(1.04) blur(5px);backdrop-filter:saturate(1.7) brightness(1.04) blur(5px)}
 html[data-theme="dark"]:not([data-transparency="reduce"]):not([data-liquid="off"]) .lens.clear.paper{background:rgba(22,22,24,.80)}
 .lens.deep{background:var(--lens-deep);-webkit-backdrop-filter:blur(26px) saturate(1.8);backdrop-filter:blur(26px) saturate(1.8)}
 .lens.tinted{background:var(--accent);-webkit-backdrop-filter:none;backdrop-filter:none}
-.lens.lifted{box-shadow:var(--shadow-lift)}
 html[data-transparency="reduce"] .lens.clear,html[data-transparency="reduce"] .lens.deep,html[data-liquid="off"] .lens.clear,html[data-liquid="off"] .lens.deep{background:var(--rt-fill);-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
+html[data-transparency="reduce"] .lband,html[data-liquid="off"] .lband{display:none}
 .dc{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform;transition:filter .22s var(--ease-out)}
 
 /* ---------- controls that live on water ---------- */
@@ -323,7 +331,6 @@ html[data-theme="dark"] .seg button[aria-selected="true"]{background:#636366}
 
 /* ---------- locked-design additions ---------- */
 code{font:500 13px/1 ui-monospace,"SF Mono",Menlo,monospace;background:var(--present-ctl);padding:2px 5px;border-radius:5px}
-.bud-line{stroke:var(--w-line-bud)}
 .bead-ink{opacity:.15}
 .kh{display:inline-grid;place-items:center;min-width:22px;height:20px;padding:0 5px;border-radius:6px;background:var(--fill-3);color:var(--label-2);font:500 11px/13px var(--font);font-style:normal}
 
@@ -381,13 +388,13 @@ code{font:500 13px/1 ui-monospace,"SF Mono",Menlo,monospace;background:var(--pre
 
 /* library: folder films, sidebar "+1" pill, absorb gulp */
 .lib .ftile{transition:transform .44s cubic-bezier(.3,1.25,.5,1)}
-.lib .ftile .film{position:absolute;inset:-4px;border-radius:18px;pointer-events:none;opacity:0;background:var(--w-body);box-shadow:inset 0 0 0 .8px var(--w-line),inset 1.2px 1.6px 0 -.3px var(--w-rim),inset -3px -4px 8px -4px var(--w-caustic),var(--shadow-rest);transition:opacity .26s var(--ease-out) var(--d,0ms),background-color .2s var(--ease-out)}
+.lib .ftile .film{position:absolute;inset:-4px;border-radius:18px;pointer-events:none;opacity:0;background:var(--w-body);box-shadow:inset .57px .57px 0 0 var(--w-rim),inset -.57px -.57px 0 0 var(--w-rim-counter),inset 0 0 0 .8px var(--w-line),var(--shadow-rest);transition:opacity .26s var(--ease-out) var(--d,0ms),background-color .2s var(--ease-out)}
 .lib.films .ftile .film{opacity:1}
 .lib .ftile.fused{transform:scale(1.03)}
 .lib .ftile.fused .film{background:var(--accent-wash)}
 .lib .ftile.gulp,.lib .srow.gulp{transform:scale(1.03);transition:none}
 .lib .srow{transition:transform .44s cubic-bezier(.3,1.25,.5,1),background-color .2s var(--ease-out)}
-.srow .pill1{position:absolute;right:48px;height:26px;min-width:34px;padding:0 9px;border-radius:13px;display:grid;place-items:center;font:600 13px/1 var(--font-rounded);color:var(--label);background:var(--lens-clear);box-shadow:inset 0 0 0 .8px var(--w-line),inset 1px 1.3px 0 -.2px var(--w-rim),var(--shadow-rest);transform:scale(.25);opacity:0;transform-origin:0 50%;transition:transform .42s cubic-bezier(.3,1.25,.5,1),opacity .18s var(--ease-out)}
+.srow .pill1{position:absolute;right:48px;height:26px;min-width:34px;padding:0 9px;border-radius:13px;display:grid;place-items:center;font:600 13px/1 var(--font-rounded);color:var(--label);background:var(--lens-clear);box-shadow:inset .57px .57px 0 0 var(--w-rim),inset -.57px -.57px 0 0 var(--w-rim-counter),inset 0 0 0 .8px var(--w-line),var(--shadow-rest);transform:scale(.25);opacity:0;transform-origin:0 50%;transition:transform .42s cubic-bezier(.3,1.25,.5,1),opacity .18s var(--ease-out)}
 .srow.target{background:var(--accent-wash)}
 .srow.target .pill1{transform:scale(1);opacity:1}
 .card.static,.static .card{position:absolute}
@@ -495,7 +502,7 @@ html[data-theme="dark"] .nseg .knob{background:#636366}
 .consent.shown{transform:none;opacity:1;pointer-events:auto}
 .consent-scrim{opacity:0;transition:opacity .2s var(--ease-out);pointer-events:none}
 .consent-scrim.shown{opacity:1;pointer-events:auto}
-.ptool{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:22px;background:var(--lens-clear);box-shadow:inset 0 0 0 .8px var(--w-line),var(--shadow-rest);position:relative}
+.ptool{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:22px;background:var(--lens-clear);box-shadow:inset .57px .57px 0 0 var(--w-rim),inset -.57px -.57px 0 0 var(--w-rim-counter),inset 0 0 0 .8px var(--w-line),var(--shadow-rest);position:relative}
 .ptool .i{width:23px;height:23px}
 .ptool::after{content:"";position:absolute;right:9px;top:9px;width:5px;height:5px;border-radius:50%;background:var(--label-2)}
 
@@ -601,7 +608,7 @@ html[data-theme="dark"] .swatch.dk i{box-shadow:inset 0 0 0 1px rgba(255,255,255
   <section class="frame" aria-label="Library, iPad landscape">
     <div class="frame-head">
       <div class="frame-title"><span class="n">01</span> Library <span class="meta">iPad Pro 11″ · landscape · 1194 × 834 pt</span></div>
-      <p class="hint">Drag a notebook. It lifts into a bead of water that stretches with speed and reaches toward its neighbours. Drop it on a folder tile (every tile grows a water film while you drag) or on a folder in the sidebar (the notebook condenses to half size and the folder grows a “+1”). Hold it over the middle of another notebook for a moment to make a folder. Every move has Undo.</p>
+      <p class="hint">Press and hold a notebook for a moment, then drag it. It lifts into a bead of water, and the other notebooks spring aside to open a gap wherever you take it, closing up behind you. Drop it to put it there (the sort becomes Manual, with Undo). Drop it on a folder tile (every tile grows a water film while you drag) or on a folder in the sidebar (the notebook condenses to half size and the folder grows a “+1”). Hold it over the middle of another notebook for a moment to make a folder. <span class="kh">⌥←</span> <span class="kh">⌥→</span> move a focused notebook. Every move has Undo.</p>
     </div>
     <div class="device"><div class="screen" id="s-lib" style="width:1194px;height:834px"></div></div>
   </section>
@@ -609,7 +616,7 @@ html[data-theme="dark"] .swatch.dk i{box-shadow:inset 0 0 0 1px rgba(255,255,255
   <section class="frame" aria-label="Editor with tool palette and pen settings, iPad landscape">
     <div class="frame-head">
       <div class="frame-title"><span class="n">02</span> Editor · tool palette and pen settings <span class="meta">iPad Pro 11″ · landscape</span></div>
-      <p class="hint">Drag the palette by its body and fling it to any edge: it gathers into a bead and spreads into its new shape, and nothing ever draws outside it. Fling it to the bottom right and it fuses with the page counter. Tap tools and the bead glides as one drop; More buds the rest of the tools; press the selected tool and slide to scrub. Tap the selected pen to fold its settings in, and again to bud them out. Write on the page and the chrome steps back.</p>
+      <p class="hint">Drag the palette by its body. While you hold it, it is a bead of water: it lifts, its rim catches more light, it trails your finger a touch, stretches with its speed and dips once as it slows, and it keeps bending the page beneath it. Near an edge its water reaches out and joins the dock. Let go and it snaps to the nearest dock within reach (left, right, bottom, or top below the bars) with one plip, gathering into a bead and spreading when it turns; a flick goes where it points, and a drop in the middle of the page flows home. It remembers where you left it (<span class="kh">⌥</span> + arrow keys move it too). Tap tools and the bead glides as one drop; More buds the rest of the tools; press the selected tool and slide to scrub. Tap the selected pen to fold its settings in, and again to bud them out. Write on the page and the chrome steps back.</p>
     </div>
     <div class="device"><div class="screen" id="s-edit" style="width:1194px;height:834px"></div></div>
   </section>
@@ -625,7 +632,7 @@ html[data-theme="dark"] .swatch.dk i{box-shadow:inset 0 0 0 1px rgba(255,255,255
   <section class="frame" aria-label="Editor, iPhone">
     <div class="frame-head">
       <div class="frame-title"><span class="n">04</span> Editor · iPhone <span class="meta">iPhone 16 · 393 × 852 pt</span></div>
-      <p class="hint">Tap the pen to bud its settings up out of the palette. Press the pen and slide along the palette to scrub the bead, or flick the palette to the top or bottom.</p>
+      <p class="hint">Tap the pen to bud its settings up out of the palette. Press the pen and slide along the palette to scrub the bead, or drag the palette up: within reach of the top dock its water reaches for it, and it snaps there (or back to the bottom).</p>
     </div>
     <div class="device phone"><div class="screen" id="s-phone" style="width:393px;height:852px"></div></div>
   </section>
@@ -688,9 +695,12 @@ const icon = (id, cls = 'i') => `<svg class="${cls}" aria-hidden="true"><use hre
       Here: optional tiny synthesized water plips (off by default).
    ========================================================================== */
 let actx = null;
-const PLIP = { merge:[520,1150,.065,.045], split:[880,1760,.045,.04], snap:[360,640,.06,.045], select:[1500,1850,.022,.022], bud:[700,1300,.05,.035], success:[640,1280,.09,.045] };
+// plip: a dockable droplet lands in its dock, one light crisp drop (NibHaptics.plip, a single transient 0.40 / 0.85)
+const PLIP = { merge:[520,1150,.065,.045], split:[880,1760,.045,.04], snap:[360,640,.06,.045], select:[1500,1850,.022,.022], bud:[700,1300,.05,.035], success:[640,1280,.09,.045], plip:[1250,2300,.024,.04] };
+const hlog = [];   // the last haptics played (test hook: window.__nib.haptics)
 function haptic(kind) {
   if (navigator.userActivation && !navigator.userActivation.hasBeenActive) return;   // nothing plays before a touch
+  hlog.push(kind); if (hlog.length > 40) hlog.shift();
   try { navigator.vibrate && navigator.vibrate(kind === 'success' ? [8, 40, 8] : 6); } catch (e) {}
   if (root.dataset.sound !== 'on') return;
   try {
@@ -757,94 +767,152 @@ const overlap = (A, B) => Math.max(0, Math.min(A.r, B.r) - Math.max(A.l, B.l)) *
 /* =============================================================================
    3. Water: one SVG filter per screen renders every droplet from the UNION
       of their silhouettes (metaball threshold), so merges, necks and splits
-      get one continuous rim, specular and caustic.
+      get one continuous rim. Liquid Glass v2 (§10.9): the rim is a 0.8 pt band
+      lit by one key light at the top-left, L = (−0.7071, −0.7071), never a
+      uniform stroke: key lobe max(λ,0)^1.5 plus a counter lobe 0.5·max(−λ,0)^2,
+      λ = N̂·L. A sheen glows inside the lit edge (0.22·key², gone by 4.5 pt);
+      the 0.8 pt outline sits under the rim. No specular, caustic or dark edge
+      ring; the core (deeper than 4.5 pt) is the body alone.
    ========================================================================== */
-function waterFilter(id, W, H, sg, k) {
-  // sg = goo sigma (merge distance ≈ 1.35·sg), k = optical scale
-  const reg = `filterUnits="userSpaceOnUse" x="-60" y="-60" width="${W + 120}" height="${H + 120}" color-interpolation-filters="sRGB"`;
-  const goo = `<feGaussianBlur in="SourceAlpha" stdDeviation="${sg}" result="bl"/>
-    <feComponentTransfer in="bl" result="m"><feFuncA type="linear" slope="24" intercept="-11.5"/></feComponentTransfer>`;
-  const line = `<feMorphology in="m" operator="erode" radius=".8" result="me"/>
-    <feComposite in="m" in2="me" operator="out" result="olA"/>
-    <feFlood class="fw-line" result="c5"/><feComposite in="c5" in2="olA" operator="in" result="line"/>`;
+const OPT = { ring: .8, keyBlur: 1.2, surface: 4, sheenBlur: 1.5, sheen: .22, liftedRim: 1.5, beadRim: .57 };
+const gooOf = (sg, slope, icpt) => `<feGaussianBlur in="SourceAlpha" stdDeviation="${sg}" result="bl"/>
+    <feComponentTransfer in="bl" result="m0"><feFuncA type="linear" slope="${slope}" intercept="${icpt}"/></feComponentTransfer>
+    <feColorMatrix in="SourceGraphic" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  1 0 0 0 0" result="exR"/>
+    <feComposite in="exR" in2="SourceAlpha" operator="arithmetic" k1="1" result="ex"/>
+    <feComposite in="ex" in2="m0" operator="over" result="m"/>`;
+function waterFilter(id, W, H, sg) {
+  // sg = goo sigma (merge distance ≈ 1.35·sg)
+  // the screen plus the 8 pt a rubber-banded droplet can overhang (shadows are box-shadows, outside the filter)
+  const reg = `filterUnits="userSpaceOnUse" x="-12" y="-12" width="${W + 24}" height="${H + 24}" color-interpolation-filters="sRGB"`;
+  // The union: the metaball (σ, iso 0.479) OR each droplet's exact shape. A lone Gaussian threshold pulls a capsule's
+  // ends in by ~1.5 pt, so the rim would sit inside the body's lens and read as a second rim; bodies are drawn red
+  // (R = 1) and necks black, so only the bodies join the exact part and a neck still pinches at t_min.
+  const goo = gooOf(sg, 24, -11.5);
+  // ring: the 0.8 pt edge band (m minus m eroded 0.8 pt)
+  const ring = `<feMorphology in="m" operator="erode" radius="${OPT.ring}" result="me"/>
+    <feComposite in="m" in2="me" operator="out" result="ring"/>`;
+  // key and counter maps: diffuse light at elevation 0 on m blurred σ 1.2, so only the edge is lit, by N̂·L
+  const lobes = `<feGaussianBlur in="m" stdDeviation="${OPT.keyBlur}" result="mb"/>
+    <feDiffuseLighting in="mb" surfaceScale="${OPT.surface}" diffuseConstant="1" lighting-color="#fff" result="kl"><feDistantLight azimuth="225" elevation="0"/></feDiffuseLighting>
+    <feColorMatrix in="kl" type="luminanceToAlpha" result="kA"/>
+    <feDiffuseLighting in="mb" surfaceScale="${OPT.surface}" diffuseConstant="1" lighting-color="#fff" result="cl"><feDistantLight azimuth="45" elevation="0"/></feDiffuseLighting>
+    <feColorMatrix in="cl" type="luminanceToAlpha" result="cA"/>
+    <feComponentTransfer in="kA" result="key"><feFuncA type="gamma" amplitude="1" exponent="1.5" offset="0"/></feComponentTransfer>
+    <feComponentTransfer in="cA" result="counter"><feFuncA type="gamma" amplitude=".5" exponent="2" offset="0"/></feComponentTransfer>
+    <feComposite in="key" in2="counter" operator="arithmetic" k2="1" k3="1" result="lit"/>
+    <feComposite in="lit" in2="ring" operator="in" result="rimA"/>`;
+  // rim colour (× the held boost s − 1 on the held layer: the rim-s funcs), each alpha capped at 1
+  const rim = (cls, strength) => `<feFlood class="${cls}" result="rc"/><feComposite in="rc" in2="rimA" operator="in" result="rim0"/>
+    <feComponentTransfer in="rim0" result="rim">${strength ? `<feFuncA class="rim-s" type="linear" slope="0"/>` : ''}</feComponentTransfer>`;
+  const line = `<feFlood class="fw-line" result="c5"/><feComposite in="c5" in2="ring" operator="in" result="line"/>`;
   return `
   <filter id="${id}" ${reg}>${goo}
+    <!-- necks, fillets and the meniscus have no lens of their own: fill the union outside the bodies with Clear's body
+         tint, so a bridge is the same water as the droplets it joins -->
+    <feComposite in="m" in2="ex" operator="out" result="gap"/>
+    <feFlood class="fw-fill" result="c0"/><feComposite in="c0" in2="gap" operator="in" result="fill"/>
     <feFlood class="fw-body" result="c1"/><feComposite in="c1" in2="m" operator="in" result="body"/>
-    <feGaussianBlur in="m" stdDeviation="${4.2 * k}" result="bump"/>
-    <feSpecularLighting in="bump" surfaceScale="${6.5 * k}" specularConstant=".55" specularExponent="40" lighting-color="#fff" result="sp">
-      <feDistantLight azimuth="225" elevation="40"/>
-    </feSpecularLighting>
-    <feComposite in="sp" in2="m" operator="in" result="spec"/>
-    <feOffset in="m" dx="${1.1 * k}" dy="${1.5 * k}" result="mr"/>
-    <feComposite in="m" in2="mr" operator="out" result="rimA"/>
-    <feFlood class="fw-rim" result="c4"/><feComposite in="c4" in2="rimA" operator="in" result="rim"/>
+    ${ring}${lobes}${rim('fw-rim', false)}
+    <!-- sheen: the key map squared, blurred σ 1.5, inside m. The key map only lives within ~3 pt of the silhouette
+         (the σ 1.2 edge), so the sheen is gone by 4.5 pt without an erode (the costliest step, dropped for speed) -->
+    <feComponentTransfer in="kA" result="k2"><feFuncA type="gamma" amplitude="1" exponent="3" offset="0"/></feComponentTransfer>
+    <feGaussianBlur in="k2" stdDeviation="${OPT.sheenBlur}" result="sh1"/>
+    <feComposite in="sh1" in2="m" operator="in" result="sh2"/>
+    <feFlood class="fw-sheen" result="c6"/><feComposite in="c6" in2="sh2" operator="in" result="sh3"/>
+    <feComponentTransfer in="sh3" result="sheen"><feFuncA type="linear" slope="1"/></feComponentTransfer>
     ${line}
-    <feMerge><feMergeNode in="body"/><feMergeNode in="spec"/><feMergeNode in="rim"/><feMergeNode in="line"/></feMerge>
+    <feMerge><feMergeNode in="fill"/><feMergeNode in="body"/><feMergeNode in="sheen"/><feMergeNode in="line"/><feMergeNode in="rim"/></feMerge>
   </filter>
-  <!-- edge and caustic only where there is something to lens: drawn from the same union, clipped to the pages (§3.3) -->
-  <filter id="${id}-optics" ${reg}>${goo}
-    <feGaussianBlur in="m" stdDeviation="${2.6 * k}" result="mb"/>
-    <feComposite in="m" in2="mb" operator="out" result="ring"/>
-    <feFlood class="fw-edge" result="c2"/><feComposite in="c2" in2="ring" operator="in" result="edge"/>
-    <feOffset in="m" dx="${-4 * k}" dy="${-6 * k}" result="mo"/>
-    <feComposite in="m" in2="mo" operator="out" result="cr"/>
-    <feGaussianBlur in="cr" stdDeviation="${2.4 * k}" result="crb"/>
-    <feComposite in="crb" in2="m" operator="in" result="cr2"/>
-    <feFlood class="fw-caustic" result="c3"/><feComposite in="c3" in2="cr2" operator="in" result="caustic"/>
-    <feMerge><feMergeNode in="edge"/><feMergeNode in="caustic"/></feMerge>
+  <!-- the held rim (§10.9): the lifted droplet's own rim and sheen once more at (s − 1) = 0.5 · lift progress, added
+       with plus-lighter over the union, so only the droplet in your hand brightens (not every droplet on screen) -->
+  <filter id="${id}-held" ${reg}>
+    <feOffset in="SourceAlpha" dx="0" dy="0" result="m"/>
+    ${ring}${lobes}${rim('fw-rim', true)}
+    <feComponentTransfer in="kA" result="k2"><feFuncA type="gamma" amplitude="1" exponent="3" offset="0"/></feComponentTransfer>
+    <feGaussianBlur in="k2" stdDeviation="${OPT.sheenBlur}" result="sh1"/>
+    <feComposite in="sh1" in2="m" operator="in" result="sh2"/>
+    <feFlood class="fw-sheen" result="c6"/><feComposite in="c6" in2="sh2" operator="in" result="sh3"/>
+    <feComponentTransfer in="sh3" result="sheen"><feFuncA class="rim-s" type="linear" slope="0"/></feComponentTransfer>
+    <feMerge><feMergeNode in="sheen"/><feMergeNode in="rim"/></feMerge>
   </filter>
-  <!-- Tinted: rim (white 30 %) and outline only; no edge, caustic or specular over the accent -->
-  <filter id="${id}-tint" ${reg}>${goo}
-    <feOffset in="m" dx="${1.1 * k}" dy="${1.5 * k}" result="mr"/>
-    <feComposite in="m" in2="mr" operator="out" result="rimA"/>
-    <feFlood class="fw-tint-rim" result="c4"/><feComposite in="c4" in2="rimA" operator="in" result="rim"/>
-    ${line}
-    <feMerge><feMergeNode in="rim"/><feMergeNode in="line"/></feMerge>
+  <!-- Tinted: its rim (tintRim, key and counter) and the outline only; no sheen, no lens -->
+  <filter id="${id}-tint" ${reg}>${goo}${ring}${lobes}${rim('fw-tint-rim', false)}${line}
+    <feMerge><feMergeNode in="line"/><feMergeNode in="rim"/></feMerge>
   </filter>
-  <filter id="${id}-rt" ${reg}>${goo}
+  <filter id="${id}-rt" ${reg}>${goo}${ring}
     <feFlood class="fw-rt" result="c1"/><feComposite in="c1" in2="m" operator="in" result="body"/>
     ${line}
     <feMerge><feMergeNode in="body"/><feMergeNode in="line"/></feMerge>
   </filter>
-  <!-- the selection bead is body plus rim: no shadow, edge ring or specular (it must not read as a button on the palette) -->
+  <!-- the selection bead: body, the ink at 15 % (drawn above) and the key rim alone, as a crescent: the bead minus itself
+       moved 0.8 pt away from the light (0.57, 0.57). No counter-rim, sheen, line or shadow: it must not read as a button -->
   <filter id="${id}-bead" x="-60%" y="-60%" width="220%" height="220%" color-interpolation-filters="sRGB">
-    <feGaussianBlur in="SourceAlpha" stdDeviation="3.2" result="bl"/>
-    <feComponentTransfer in="bl" result="m"><feFuncA type="linear" slope="22" intercept="-10.4"/></feComponentTransfer>
+    ${gooOf(3.2, 22, -10.4)}
     <feFlood class="fb-body" result="c1"/><feComposite in="c1" in2="m" operator="in" result="body"/>
-    <feOffset in="m" dx=".9" dy="1.2" result="mr"/>
+    <feOffset in="m" dx="${OPT.beadRim}" dy="${OPT.beadRim}" result="mr"/>
     <feComposite in="m" in2="mr" operator="out" result="rimA"/>
-    <feFlood class="fb-rim" result="c4"/><feComposite in="c4" in2="rimA" operator="in" result="rim"/>
+    <feFlood class="fw-rim" result="c4"/><feComposite in="c4" in2="rimA" operator="in" result="rim"/>
     <feMerge><feMergeNode in="body"/><feMergeNode in="rim"/></feMerge>
   </filter>`;
 }
 const floodCSS = `
-  .fw-body{flood-color:var(--w-body)} .fw-edge{flood-color:var(--w-edge)} .fw-caustic{flood-color:var(--w-caustic)}
-  .fw-rim{flood-color:var(--w-rim)} .fw-line{flood-color:var(--w-line)} .fw-rt{flood-color:var(--rt-fill)} .fw-tint-rim{flood-color:var(--w-tint-rim)}
-  .fb-body{flood-color:var(--b-body)} .fb-rim{flood-color:var(--b-rim)}`;
+  .fw-fill{flood-color:var(--lens-clear)} .fw-body{flood-color:var(--w-body)} .fw-rim{flood-color:var(--w-rim)} .fw-sheen{flood-color:var(--w-rim);flood-opacity:${OPT.sheen}}
+  .fw-line{flood-color:var(--w-line)} .fw-rt{flood-color:var(--rt-fill)} .fw-tint-rim{flood-color:var(--w-tint-rim)}
+  .fb-body{flood-color:var(--b-body)}`;
 document.head.appendChild(el('style', null, floodCSS));
 
-/* Baked lens (P5): rim-only magnification. R/G encode an inward offset that
-   peaks at the rim and is zero once deeper than the corner radius. */
+/* The Clear lens (§10.9, mockup): the page is bent OUTWARD in a band at the rim, so the band shows what lies just
+   outside, compressed: at depth δ < w the pixel shows p + N̂·A·(1 − δ/w)^2.5, w = clamp(0.22·minor, 6, 12),
+   A = clamp(0.1·minor, 2.5, 6). The band stays sharp; the core is blurred 5 pt, saturation 1.7, brightness +4 %,
+   cross-faded by (1 − δ/w)². One filter on a box padded by LPAD (so the outward samples and the blur read real page),
+   clipped back to the droplet. R, G: the displacement; B: the core's weight. */
+const LPAD = 16;
+const lensBand = minor => ({ w: clamp(.22 * minor, 6, 12), A: clamp(.1 * minor, 2.5, 6) });
 const lensCache = new Map();
 function bakeLens(w, h, r) {
   const key = `${w}x${h}x${r}`; if (lensCache.has(key)) return lensCache.get(key);
-  const c = document.createElement('canvas'); c.width = w; c.height = h;
-  const ctx = c.getContext('2d'), img = ctx.createImageData(w, h), D = img.data;
-  const ramp = Math.min(r, Math.min(w, h) / 2) * .95 + 2;
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const px = x + .5 - w / 2, py = y + .5 - h / 2;
+  const W = w + 2 * LPAD, H = h + 2 * LPAD, { w: bw, A } = lensBand(Math.min(w, h)), scale = 2 * A;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const ctx = c.getContext('2d'), img = ctx.createImageData(W, H), D = img.data;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const px = x + .5 - W / 2, py = y + .5 - H / 2;
     const qx = Math.abs(px) - (w / 2 - r), qy = Math.abs(py) - (h / 2 - r);
     const ox = Math.max(qx, 0), oy = Math.max(qy, 0);
     const sd = Math.hypot(ox, oy) + Math.min(Math.max(qx, qy), 0) - r;
-    let gx, gy;
+    let gx, gy;   // outward unit normal of the rounded rect
     if (qx > 0 && qy > 0) { const L = Math.hypot(ox, oy) || 1; gx = ox / L * Math.sign(px); gy = oy / L * Math.sign(py); }
     else if (qx > qy) { gx = Math.sign(px); gy = 0; } else { gx = 0; gy = Math.sign(py); }
-    const depth = -sd; let R = 128, G = 128;
-    if (depth >= 0 && depth < ramp) { const kk = Math.pow(1 - depth / ramp, 1.8); R = 128 - gx * kk * 127; G = 128 - gy * kk * 127; }
-    const i = (y * w + x) * 4; D[i] = R; D[i + 1] = G; D[i + 2] = 128; D[i + 3] = 255;
+    const depth = -sd; let R = 128, G = 128, B = 255;
+    if (depth < bw) {
+      const u = 1 - Math.max(depth, 0) / bw, k = Math.pow(u, 2.5);
+      R = 128 + gx * k * A / scale * 255; G = 128 + gy * k * A / scale * 255;   // feDisplacementMap: offset = scale·(C − ½)
+      B = 255 * (1 - u * u);
+    }
+    const i = (y * W + x) * 4; D[i] = R; D[i + 1] = G; D[i + 2] = B; D[i + 3] = 255;
   }
   ctx.putImageData(img, 0, 0);
-  const url = c.toDataURL('image/png'); lensCache.set(key, url); return url;
+  const url = c.toDataURL('image/png');
+  // Chromium does not repaint a backdrop filter when its feImage finishes decoding: callers re-apply it once ready
+  const ready = new Promise(res => { const im = new Image(); im.onload = im.onerror = () => res(); im.src = url; });
+  const out = { url, W, H, scale, ready }; lensCache.set(key, out); return out;
+}
+// saturate(1.7) then brightness(1.04), as one colour matrix (the CSS definitions of both)
+const SAT = (() => { const s = 1.7, b = 1.04, r = [.213 + .787 * s, .715 - .715 * s, .072 - .072 * s, .213 - .213 * s, .715 + .285 * s, .072 - .072 * s, .213 - .213 * s, .715 - .715 * s, .072 + .928 * s].map(v => (v * b).toFixed(4));
+  return `${r[0]} ${r[1]} ${r[2]} 0 0  ${r[3]} ${r[4]} ${r[5]} 0 0  ${r[6]} ${r[7]} ${r[8]} 0 0  0 0 0 1 0`; })();
+function lensFilter(defs, id, w, h, r) {
+  const L = bakeLens(Math.round(w), Math.round(h), r);
+  if (document.getElementById(id)) return L.ready;
+  const f = sv('filter', { id, x: 0, y: 0, width: L.W, height: L.H, filterUnits: 'userSpaceOnUse', primitiveUnits: 'userSpaceOnUse', 'color-interpolation-filters': 'sRGB' });
+  f.innerHTML = `<feImage x="0" y="0" width="${L.W}" height="${L.H}" preserveAspectRatio="none" result="map" href="${L.url}"/>
+    <feDisplacementMap in="SourceGraphic" in2="map" scale="${L.scale}" xChannelSelector="R" yChannelSelector="G" result="band"/>
+    <feGaussianBlur in="SourceGraphic" stdDeviation="5" result="bl"/>
+    <feColorMatrix in="bl" type="matrix" values="${SAT}" result="core"/>
+    <feColorMatrix in="map" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 1 0 0" result="cw"/>
+    <feComposite in="core" in2="cw" operator="in" result="coreW"/>
+    <feComposite in="band" in2="cw" operator="out" result="bandW"/>
+    <feComposite in="coreW" in2="bandW" operator="arithmetic" k2="1" k3="1"/>`;
+  defs.appendChild(f);
+  return L.ready;
 }
 
 /* =============================================================================
@@ -861,25 +929,24 @@ function tick(now) {
 }
 
 class Scene {
-  constructor(screen, { W, H, sigma = 8, k = 1, id }) {
+  constructor(screen, { W, H, sigma = 8, id }) {
     this.screen = screen; this.W = W; this.H = H; this.sigma = sigma; this.id = id || screen.id;
-    this.drops = []; this.bonds = []; this.tasks = []; this.renders = []; this.pid = null; this.dragging = 0; this.awake = true;
+    this.drops = []; this.bonds = []; this.tasks = []; this.late = []; this.renders = []; this.pid = null; this.dragging = 0; this.awake = true;
     this.scene = el('div', 'scene'); screen.appendChild(this.scene);
     this.chrome = el('div', 'chrome'); screen.appendChild(this.chrome);
     this.lensLayer = el('div', 'lens-layer'); this.chrome.appendChild(this.lensLayer);
     this.water = sv('svg', { class: 'water', width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true' });
     this.defs = sv('defs'); this.water.appendChild(this.defs);
-    this.defs.innerHTML = waterFilter(`w-${this.id}`, W, H, sigma, k);
+    this.defs.innerHTML = waterFilter(`w-${this.id}`, W, H, sigma);
+    this.rimFuncs = [...this.defs.querySelectorAll('.rim-s')]; this.rimS = 1;   // held rim strength of the lifted droplet
     this.masses = sv('g', { filter: `url(#w-${this.id})` }); this.water.appendChild(this.masses);
     this.inner = sv('g', { id: `m-${this.id}` }); this.masses.appendChild(this.inner);
     this.necks = sv('g'); this.inner.appendChild(this.necks);
     this.tints = sv('g', { filter: `url(#w-${this.id}-tint)` }); this.water.appendChild(this.tints);   // Tinted: rim + line only
-    this.outlines = sv('g'); this.water.appendChild(this.outlines);   // unfiltered: bud outlines
     this.chrome.appendChild(this.water);
-    // edge + caustic: the same union, drawn only over light paper (on a flat desk the rim and line are enough)
-    this.optics = sv('svg', { class: 'water', width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true' });
-    const og = sv('g', { filter: `url(#w-${this.id}-optics)` }); og.appendChild(sv('use', { href: `#m-${this.id}` }));
-    this.optics.appendChild(og); this.optics.style.display = 'none'; this.chrome.appendChild(this.optics);
+    this.heldSvg = sv('svg', { class: 'water held', width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true' });
+    const hg = sv('g', { filter: `url(#w-${this.id}-held)` }); this.heldRect = sv('rect', { fill: '#000' }); hg.appendChild(this.heldRect);
+    this.heldSvg.appendChild(hg); this.heldSvg.style.display = 'none'; this.chrome.appendChild(this.heldSvg);
     this.papers = [];
     this.beadSvg = sv('svg', { class: 'water', width: W, height: H, viewBox: `0 0 ${W} ${H}`, 'aria-hidden': 'true' });
     this.beads = sv('g', { filter: `url(#w-${this.id}-bead)` }); this.beadSvg.appendChild(this.beads);
@@ -891,13 +958,12 @@ class Scene {
     scenes.push(this);
     this.setRT();
   }
-  setRT() { this.masses.setAttribute('filter', `url(#w-${this.id}${RT() ? '-rt' : ''})`); this.optics.style.visibility = RT() ? 'hidden' : ''; }
-  /* Light paper under the chrome (scene coordinates). Optics are clipped to it; dark-mode Clear thickens over it. */
+  setRT() { this.masses.setAttribute('filter', `url(#w-${this.id}${RT() ? '-rt' : ''})`); }
+  /* Light paper under the chrome (scene coordinates): the shadow deepens over it (dark mode: lightens) and dark-mode
+     Clear thickens to 80 % there (§3.3). */
   addPaper(r) {
     const p = { l: Math.max(0, r.x), t: Math.max(0, r.y), r: Math.min(this.W, r.x + r.w), b: Math.min(this.H, r.y + r.h) };
     this.papers.push(p);
-    this.optics.style.display = '';
-    this.optics.style.clipPath = `path('${this.papers.map(q => `M${q.l} ${q.t}H${q.r}V${q.b}H${q.l}Z`).join('')}')`;
   }
   paperShare(B) { const a = Math.max(1, (B.r - B.l) * (B.b - B.t)); return this.papers.reduce((s, p) => s + overlap(B, p), 0) / a; }
   /* §10.8: while ink is going down, droplets over the page or within 24 pt of the stroke recede; the rest stay at 100 %. */
@@ -909,7 +975,7 @@ class Scene {
       d.setRecede(on); any = any || on;
     }
     // ponytail: the union is one filter, so its rim and line fade together; per-droplet water needs one filter per cluster
-    this.water.classList.toggle('recede', any); this.optics.classList.toggle('recede', any);
+    this.water.classList.toggle('recede', any); this.heldSvg.classList.toggle('recede', any);
   }
   toLocal(e) { const r = this.screen.getBoundingClientRect(); return { x: (e.clientX - r.left) * this.W / r.width, y: (e.clientY - r.top) * this.H / r.height }; }
   wake() { this.awake = true; kick(); }
@@ -945,7 +1011,14 @@ class Scene {
     for (const t of this.tasks) busy = t(dt) || busy;
     for (const d of this.drops) busy = d.step(dt) || busy;
     busy = this.stepBonds(dt) || busy;
+    for (const t of this.late) busy = t(dt) || busy;
     for (const d of this.drops) d.render();
+    // held rim (§10.9): s = 1 + 0.5 · lift progress, on the droplet being held (the most lifted one)
+    let lp = 0, held = null; for (const d of this.drops) if (d.visible && d.liftProgress() > lp) { lp = d.liftProgress(); held = d; }
+    const rs = 1 + (OPT.liftedRim - 1) * lp, on = lp > .004 && !RT();
+    if (Math.abs(rs - this.rimS) > .004) { this.rimS = rs; for (const f of this.rimFuncs) f.setAttribute('slope', (rs - 1).toFixed(3)); }
+    this.heldSvg.style.display = on ? '' : 'none';
+    if (on) for (const k of ['width', 'height', 'rx', 'transform']) { const v = held.mass.getAttribute(k); if (v !== this.heldRect.getAttribute(k)) this.heldRect.setAttribute(k, v); }
     for (const r of this.renders) r();
     return busy;
   }
@@ -974,14 +1047,16 @@ class Drop {
     this.theta = o.theta || 0; this.cap = o.cap ?? .1; this.vref = o.vref || 2600; this.rigid = o.rigid ?? .5;
     this.cw = o.cw || o.w; this.ch = o.ch || o.h; this.followSize = !!o.followSize;
     this.visible = o.visible !== false;
-    this.mass = sv('rect', { fill: '#000' });
-    if (o.lens === 'tinted') scene.tints.appendChild(this.mass); else scene.inner.insertBefore(this.mass, scene.necks);
+    this.mass = sv('rect', { fill: '#f00' });   // red: a body (joins the exact union); necks are black
+    // bodies paint over the necks, so a neck never cuts a body out of the exact union (see gooOf)
+    if (o.lens === 'tinted') scene.tints.appendChild(this.mass); else scene.inner.appendChild(this.mass);
     if (!this.visible) this.mass.style.display = 'none';
-    this.outline = null; this.outlineOn = false;
     if (o.lens) {
+      // Clear on Chromium: the refracting band + blurred core under the body (one backdrop filter, bakeLens)
+      if (CHROMIUM && o.lens === 'clear' && !o.noRefract) { this.band = el('div', 'lband'); scene.lensLayer.appendChild(this.band); }
       this.lens = el('div', 'lens ' + o.lens); scene.lensLayer.appendChild(this.lens);
       this.setLensBox(o.lw || o.w, o.lh || o.h, o.lr ?? o.r);
-      if (!this.visible) this.lens.style.opacity = 0;
+      if (!this.visible) this.lensOpacity(0);
     }
     if (o.el) {
       this.el = o.el; this.el.classList.add('dc');
@@ -993,32 +1068,33 @@ class Drop {
     this.lastM = ''; scene.drops.push(this);
     this.render();   // first paint already in place (no lens drawn away from its content before the first tick)
   }
-  setRecede(on) { for (const n of [this.lens, this.clip || this.el, ...(this.extra || [])]) if (n) n.classList.toggle('recede', on); }
+  setRecede(on) { for (const n of [this.lens, this.band, this.clip || this.el, ...(this.extra || [])]) if (n) n.classList.toggle('recede', on); }
+  lensOpacity(v) { for (const n of [this.lens, this.band]) if (n) n.style.opacity = v; }
   setLensBox(w, h, r) {
-    this.lw = w; this.lh = h;
+    this.lw = w; this.lh = h; this.lr = r;
     const L = this.lens; L.style.width = w + 'px'; L.style.height = h + 'px'; L.style.borderRadius = r + 'px';
-    if (CHROMIUM && this.o.lens === 'clear' && !this.o.noRefract) {
+    if (this.band) {
+      w = Math.round(w); h = Math.round(h);
       const id = `lens-${this.scene.id}-${w}x${h}`;
-      if (!document.getElementById(id)) {
-        const url = bakeLens(Math.round(w), Math.round(h), r);
-        const f = sv('filter', { id, x: 0, y: 0, width: w, height: h, filterUnits: 'userSpaceOnUse', primitiveUnits: 'userSpaceOnUse', 'color-interpolation-filters': 'sRGB' });
-        const im = sv('feImage', { x: 0, y: 0, width: w, height: h, preserveAspectRatio: 'none', result: 'map' });
-        im.setAttribute('href', url); im.setAttributeNS('http://www.w3.org/1999/xlink', 'href', url);
-        f.appendChild(im);
-        // rim amplitude A = 0.15·minor + 2, halved on thin droplets (< 60 pt) so ink under a palette never doubles
-        const minor = Math.min(w, h), A = minor < 60 ? .08 * minor + 1 : .15 * minor + 2;
-        f.appendChild(sv('feDisplacementMap', { in: 'SourceGraphic', in2: 'map', scale: Math.round(2 * A), xChannelSelector: 'R', yChannelSelector: 'G' }));
-        this.scene.defs.appendChild(f);
-      }
-      L.dataset.filter = `url(#${id}) saturate(1.7) brightness(1.04) blur(5px)`;
-      applyLensFilter(L);
+      const ready = lensFilter(this.scene.defs, id, w, h, r), band = this.band;
+      ready.then(() => requestAnimationFrame(() => {   // repaint once the map has decoded (two frames: none, then the filter)
+        if (band.dataset.filter !== `url(#${id})`) return;
+        band.style.backdropFilter = band.style.webkitBackdropFilter = 'none';
+        requestAnimationFrame(() => applyLensFilter(band));
+      }));
+      const B = this.band.style; B.width = w + 2 * LPAD + 'px'; B.height = h + 2 * LPAD + 'px'; B.clipPath = `inset(${LPAD}px round ${r}px)`;
+      this.band.dataset.filter = `url(#${id})`; applyLensFilter(this.band);
+      this.band.style.display = this.lensLive ? 'none' : '';
+      L.dataset.filter = this.lensLive ? '' : 'none'; applyLensFilter(L);   // the band already blurs the core
     }
   }
+  /* live: the body resizes every frame (a re-form, a bud), so the baked band is set aside for the plain blurred body */
   live(on) {
     this.lensLive = on; this.lastM = '';
     if (!this.lens) return;
-    if (on) { this.lens.dataset.filter = this.o.lens === 'clear' ? 'saturate(1.7) brightness(1.04) blur(5px)' : ''; applyLensFilter(this.lens); }
+    if (this.band) { this.band.style.display = on ? 'none' : ''; this.lens.dataset.filter = on ? '' : 'none'; applyLensFilter(this.lens); }
   }
+  liftProgress() { return clamp((this.lift.x - 1) / .035, 0, 1); }   // 0 at rest, 1 fully held (palette and bars lift 1.035)
   sizeContent() { this.el.style.width = this.cw + 'px'; this.el.style.height = this.ch + 'px'; }
   box() {
     const L = this.lift.x, w = this.pw.x * L, h = this.ph.x * L;
@@ -1026,10 +1102,6 @@ class Drop {
   }
   grab(p) { const b = this.box(); this.gx.snap(clamp(p.x - b.cx, -b.w / 2, b.w / 2)); this.gy.snap(clamp(p.y - b.cy, -b.h / 2, b.h / 2)); }
   release() { this.gx.to = 0; this.gy.to = 0; }
-  setOutline(on) {   // fix 4: a budding droplet carries the 12 % water line from its first frame
-    if (on && !this.outline) { this.outline = sv('rect', { fill: 'none', class: 'bud-line', 'stroke-width': .8 }); this.scene.outlines.appendChild(this.outline); }
-    this.outlineOn = on; if (this.outline) this.outline.style.display = on ? '' : 'none'; this.lastM = '';
-  }
   // a 2.5 % squash on a 44 pt bar (the impulse is scaled to the droplet's wobble spring; 2.4 ≈ 2.5 % at 0.14 s, ζ 0.68)
   poke(amount = 2.4) { if (!RM()) { this.def.v -= amount; this.scene.wake(); } }
   step(dt) {
@@ -1045,7 +1117,11 @@ class Drop {
     if (sp > 40) tgt *= 1 + (Math.cos(2 * (phi - axis)) - 1) * wl;
     const target = free + wrapHalfTurn(axis - free) * wl;
     this.theta += wrapHalfTurn(target - this.theta) * (1 - Math.exp(-18 * dt));
-    this.def.to = RM() ? 0 : tgt;
+    tgt = RM() ? 0 : tgt;
+    // settle lead (§10.3, DropletPhysics.settleLead): a target falling back toward zero kicks the surface as if it had
+    // fallen 33 ms earlier, so a slowing drop dips once, ~6 % of its peak, and never bounces back up (water, not jelly)
+    if (Math.abs(tgt) < Math.abs(this.def.to)) this.def.v += this.def.k * .033 * (tgt - this.def.to);
+    this.def.to = tgt;
     busy = this.def.step(dt) || busy;
     if (RM()) this.def.snap(0);
     return busy;
@@ -1055,23 +1131,25 @@ class Drop {
     const cap = CALM() ? this.cap / 2 : this.cap;   // caps are caps: the rendered stretch never passes them
     const s = clamp(this.def.x, -.4 * cap, cap), L = this.lift.x, gx = this.gx.x, gy = this.gy.x;
     const M = mat(this.px.x, this.py.x, w, h, s, this.theta, L, gx, gy);
-    const key = M.map(v => v.toFixed(3)).join() + w.toFixed(2) + h.toFixed(2) + (this.outlineOn ? 'o' : '');
+    const key = M.map(v => v.toFixed(3)).join() + w.toFixed(2) + h.toFixed(2);
     if (key === this.lastM) return; this.lastM = key;
     this.M = M;
-    const tr = `matrix(${M.map(v => v.toFixed(4)).join(' ')})`;
-    for (const shape of [this.visible ? this.mass : null, this.outlineOn ? this.outline : null]) {
-      if (!shape) continue;
+    if (this.visible) {
+      const shape = this.mass;
       shape.setAttribute('width', Math.max(0, w).toFixed(2)); shape.setAttribute('height', Math.max(0, h).toFixed(2));
-      shape.setAttribute('rx', r.toFixed(2)); shape.setAttribute('transform', tr);
+      shape.setAttribute('rx', r.toFixed(2)); shape.setAttribute('transform', `matrix(${M.map(v => v.toFixed(4)).join(' ')})`);
     }
     if (this.lens) {
-      if (this.o.lens === 'clear') this.lens.classList.toggle('paper', this.scene.paperShare(this.box()) > .5);
+      this.lens.classList.toggle('paper', this.scene.paperShare(this.box()) > .5);
+      const lp = this.liftProgress();   // the held shadow (0 8 16, × 1.6) eases in with the lift
+      if (Math.abs(lp - (this.lpShown ?? -1)) > .004) { this.lpShown = lp; this.lens.style.setProperty('--lp', lp.toFixed(3)); }
       if (this.lensLive) {
         const st = this.lens.style; st.width = w.toFixed(1) + 'px'; st.height = h.toFixed(1) + 'px'; st.borderRadius = r.toFixed(1) + 'px';
         st.transform = css(M);
       } else {
-        const sx = w / this.lw, sy = h / this.lh;
-        this.lens.style.transform = css([M[0] * sx, M[1] * sx, M[2] * sy, M[3] * sy, M[4], M[5]]);
+        const sx = w / this.lw, sy = h / this.lh, Ml = [M[0] * sx, M[1] * sx, M[2] * sy, M[3] * sy, M[4], M[5]];
+        this.lens.style.transform = css(Ml);
+        if (this.band) this.band.style.transform = css(mul(Ml, [1, 0, 0, 1, -LPAD, -LPAD]));
       }
     }
     if (this.el) {
@@ -1089,8 +1167,7 @@ class Drop {
   }
   show(v) {
     this.visible = v; this.mass.style.display = v ? '' : 'none';
-    if (this.lens && !v) this.lens.style.opacity = 0;
-    if (!v) this.setOutline(false);
+    if (this.lens && !v) this.lensOpacity(0);
     this.lastM = '';
   }
 }
@@ -1267,10 +1344,86 @@ function restRect(m, f, k, axis) {   // axis 'x' | 'y': a docked droplet only sl
   out.r = out.l + w; out.b = out.t + h; return out;
 }
 
+/* ---------- Docks (§10.11): DropletDockModel, DockMeniscus and DockLanding, number for number ----------
+   Docks: left and right (vertical, anywhere along the edge below the bars), bottom, and top below the bars with a
+   40 pt bias so it is picked only on purpose. A release projects the finger (p + v·0.12 s; v = 0 if it rested
+   ≥ 70 ms; ≤ 5000 pt/s) and docks to the nearest dock whose centre line is within the capture radius (200 pt, 160 on
+   iPhone), centred on the projected point along it; anywhere else the palette flows home to the dock it left. */
+const DOCK = { capture: 200, captureCompact: 160, topBias: 40, arrival: 1.5, timeout: 1.5, join: 20, t0: 26, off: 72 };
+const isVert = e => e === 'left' || e === 'right';
+function DockModel(region, length, thick, docks, compact) {
+  const R = region, capture = compact ? DOCK.captureCompact : DOCK.capture;
+  const size = e => isVert(e) ? { w: thick, h: length } : { w: length, h: thick };
+  const frame = (e, along) => {
+    const s = size(e), t = clamp(along, 0, 1), lerp = (a, b) => a + (b - a) * t;
+    const cx = e === 'left' ? R.l + s.w / 2 : e === 'right' ? R.r - s.w / 2 : lerp(R.l + s.w / 2, R.r - s.w / 2);
+    const cy = e === 'top' ? R.t + s.h / 2 : e === 'bottom' ? R.b - s.h / 2 : lerp(R.t + s.h / 2, R.b - s.h / 2);
+    return { l: cx - s.w / 2, r: cx + s.w / 2, t: cy - s.h / 2, b: cy + s.h / 2, w: s.w, h: s.h, cx, cy };
+  };
+  const alongFor = (p, e) => { const s = size(e); return clamp(isVert(e) ? (p.y - (R.t + s.h / 2)) / Math.max(1, R.b - R.t - s.h) : (p.x - (R.l + s.w / 2)) / Math.max(1, R.r - R.l - s.w), 0, 1); };
+  const distance = (p, e) => { const s = size(e);
+    return e === 'left' ? Math.abs(p.x - (R.l + s.w / 2)) : e === 'right' ? Math.abs(p.x - (R.r - s.w / 2))
+         : e === 'top' ? Math.abs(p.y - (R.t + s.h / 2)) + DOCK.topBias : Math.abs(p.y - (R.b - s.h / 2)); };
+  const nearestDock = p => docks.reduce((a, e) => distance(p, e) < distance(p, a) ? e : a, docks[0]);
+  const captured = p => { const e = nearestDock(p); return distance(p, e) <= capture ? e : null; };
+  const validated = d => d && docks.includes(d.edge) ? { edge: d.edge, along: clamp(+d.along || 0, 0, 1) } : { edge: docks.includes('bottom') ? 'bottom' : docks[0], along: .5 };
+  return {
+    docks, capture, size, frame, alongFor, distance, nearestDock, captured, validated,
+    release: (p, current) => { const e = captured(p); return e ? { edge: e, along: alongFor(p, e) } : validated(current); },
+    // while held: the dock the finger is within capture of, slid along its edge to face the body
+    meniscusTarget: (finger, body) => { const e = captured(finger); return e ? frame(e, alongFor({ x: body.cx, y: body.cy }, e)) : null; }
+  };
+}
+/* The meniscus: a tongue of the palette's own water that reaches for the dock at a 72 pt gap, touches and fuses at
+   20 pt (26 pt thick), then holds on like every neck, t = t₀·(1 − gap/off)^0.7, and pinches when t < t_min (≈ 52 pt
+   on iPad, 56 on iPhone). It is drawn as a neck of the union and never plays a haptic: the one plip is the arrival. */
+class Meniscus {
+  constructor(scene) {
+    this.scene = scene; this.target = null; this.last = null; this.phase = 'idle';
+    this.t = new Spring(0, 'neck'); this.ext = new Spring(0, 'neck'); this.t.eps = this.ext.eps = .05;
+    this.line = sv('line', { 'stroke-linecap': 'round', stroke: '#000' }); this.line.style.display = 'none'; scene.necks.appendChild(this.line);
+  }
+  hide() { this.line.style.display = 'none'; }
+  step(dt, body, enabled) {
+    if (this.target) this.last = this.target;
+    const dock = this.last; if (!dock) { this.hide(); return false; }
+    const short = Math.min(body.w, body.h, dock.w, dock.h) / 2;
+    const g = nearest(Object.assign({}, body, { r0: short }), Object.assign({}, dock, { r0: short })), gap = g.gap;
+    const t = gap >= DOCK.off ? 0 : DOCK.t0 * Math.pow(1 - gap / DOCK.off, .7);
+    const inA = Math.min(8, Math.min(body.w, body.h) / 3), inB = Math.min(8, Math.min(dock.w, dock.h) / 3);
+    const letGo = !this.target || !enabled, tMin = this.scene.tMin;
+    if (letGo) { if (this.phase !== 'idle') this.phase = 'retracting'; }
+    else if (this.phase === 'idle' || this.phase === 'reaching') this.phase = gap < DOCK.join ? 'fused' : gap < DOCK.off ? 'reaching' : 'idle';
+    else if (this.phase === 'fused') { if (t < tMin) this.phase = 'retracting'; }
+    else if (gap < DOCK.join) this.phase = 'fused'; else if (gap >= DOCK.off) this.phase = 'idle';   // a pinched one re-arms out of reach
+    if (this.phase === 'reaching') { const u = clamp((DOCK.off - gap) / (DOCK.off - DOCK.join), 0, 1); this.t.to = t; this.ext.to = Math.max(-inA, u * u * (3 - 2 * u) * gap - t / 2); }
+    else if (this.phase === 'fused') { this.t.to = t; this.ext.to = gap + inB; }
+    else { this.t.to = 0; this.ext.to = -inA; }
+    const moving = this.t.step(dt) | this.ext.step(dt);
+    if (letGo && this.t.x < .3) { this.phase = 'idle'; this.last = null; this.hide(); return false; }
+    let dx = g.bx - g.ax, dy = g.by - g.ay, L = Math.hypot(dx, dy);
+    if (L < .5) { dx = dock.cx - body.cx; dy = dock.cy - body.cy; L = Math.hypot(dx, dy); }
+    if (L < .001 || this.t.x <= .8) { this.hide(); return !!moving; }
+    const nx = dx / L, ny = dy / L, reach = Math.max(this.ext.x, -inA + .5);
+    const ln = this.line; ln.style.display = '';
+    ln.setAttribute('x1', (g.ax - nx * inA).toFixed(1)); ln.setAttribute('y1', (g.ay - ny * inA).toFixed(1));
+    ln.setAttribute('x2', (g.ax + nx * reach).toFixed(1)); ln.setAttribute('y2', (g.ay + ny * reach).toFixed(1));
+    ln.setAttribute('stroke-width', this.t.x.toFixed(2));
+    return !!moving;
+  }
+}
+const store = {   // the dock persists across reloads (per screen); private windows and blocked storage just forget it
+  get(k) { try { return JSON.parse(localStorage.getItem(k) || 'null'); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+
 function Palette(scene, o) {
-  const P = { orient: o.orient, sel: 0, color: o.colors[0], dragging: false };
   const pad = o.pad ?? 6, pitch = o.pitch ?? 44, thick = o.thick ?? 56, cp = o.colorPitch ?? 44;
   const tools = o.tools, nC = o.colors.length;
+  const length0 = pad * 2 + tools.length * pitch + (nC ? 17 + nC * cp : 0);
+  const DM = DockModel(o.dock.region, length0, thick, o.dock.docks, o.dock.compact), key = `nib.mockup.dock.${scene.id}`;
+  const dock0 = DM.validated(store.get(key) || o.dock.home), f0 = DM.frame(dock0.edge, dock0.along);
+  const P = { orient: isVert(dock0.edge) ? 'v' : 'h', dock: dock0, sel: 0, color: o.colors[0], dragging: false, fade: 1 };
   const lastTool = tools[tools.length - 1][0] === 'more' ? tools.length - 2 : tools.length - 1;   // More is never selected
   const length = pad * 2 + tools.length * pitch + (nC ? 17 + nC * cp : 0);
   const dims = or => or === 'v' ? { w: thick, h: length } : { w: length, h: thick };
@@ -1298,7 +1451,7 @@ function Palette(scene, o) {
     });
   }
   const d0 = dims(P.orient);
-  const drop = new Drop(scene, { x: o.x, y: o.y, w: d0.w, h: d0.h, r: thick / 2, lens: 'clear', el: box, cap: .09, rigid: .55, followSize: true, theta: P.orient === 'v' ? Math.PI / 2 : 0 });
+  const drop = new Drop(scene, { x: f0.cx, y: f0.cy, w: d0.w, h: d0.h, r: thick / 2, lens: 'clear', el: box, cap: .09, rigid: .55, followSize: true, theta: P.orient === 'v' ? Math.PI / 2 : 0 });
   drop.extra = [scene.beadSvg];   // the bead recedes with its palette
   const other = dims(P.orient === 'v' ? 'h' : 'v'); if (CHROMIUM) { const keep = [drop.lw, drop.lh]; drop.setLensBox(other.w, other.h, thick / 2); drop.setLensBox(keep[0], keep[1], thick / 2); }
   items.forEach(it => { const p = loc(P.orient, it.a); it.lx = new Spring(p.x, 'bud'); it.ly = new Spring(p.y, 'bud'); });
@@ -1308,7 +1461,7 @@ function Palette(scene, o) {
   // of times a minute, so the bead is quick and never overshoots (`glide` ζ 1); the teardrop only shows on long jumps.
   const head = new Spring(along(0), 'glide'), tail = new Spring(along(0), 'trail'); head.eps = tail.eps = .05;
   const bR = o.beadR ?? 20, tR = bR * .78, maxSep = 1.0 * bR, minNeck = 2 * .72 * tR;
-  const cH = sv('circle', { r: bR, fill: '#000' }), cT = sv('circle', { r: tR, fill: '#000' }), neck = sv('line', { stroke: '#000', 'stroke-linecap': 'round' });
+  const cH = sv('circle', { r: bR, fill: '#f00' }), cT = sv('circle', { r: tR, fill: '#f00' }), neck = sv('line', { stroke: '#000', 'stroke-linecap': 'round' });
   scene.beads.append(cT, neck, cH);
   const iH = sv('circle', { r: bR }), iT = sv('circle', { r: tR }), iN = sv('line', { 'stroke-linecap': 'round' });
   scene.beadInk.append(iT, iN, iH);   // the bead takes the current ink at 15 % (B's graft)
@@ -1321,7 +1474,9 @@ function Palette(scene, o) {
   const xfade = p => (p <= .42 || p >= .58) ? 1 : Math.abs(p - .5) / .08;   // content is dark for 0.42–0.58 only
   let alpha = 1;
   function setOrient(or) {
-    if (or === P.orient || R.phase) return;
+    if (R.phase === 'gather') { R.to = or; return; }                 // not switched yet: spread into the newest axis
+    if (or === P.orient) return;
+    if (R.phase === 'spread') R.phase = null;                         // turned again mid-spread: gather from here
     if (RM()) {
       P.orient = or; const d = dims(or); drop.pw.snap(d.w); drop.ph.snap(d.h);
       items.forEach(it => { const q = loc(or, it.a); it.lx.snap(q.x); it.ly.snap(q.y); });
@@ -1353,6 +1508,23 @@ function Palette(scene, o) {
     setColor(j);
   };
   const localAlong = p => { const b = drop.box(); return P.orient === 'v' ? p.y - b.t : p.x - b.l; };
+
+  // held: the meniscus reaches for the dock the finger is within capture of; released: for the dock it lands in (the
+  // body swallows it). Arrival (centre within 1.5 pt, or at rest) lets it go and plays the one plip.
+  const men = new Meniscus(scene);
+  let landing = null;
+  scene.late.push(dt => {
+    let busy = men.step(dt, drop.box(), drop.visible && !RM() && !CALM());
+    if (landing && !P.dragging) {
+      const b = drop.box(), home = Math.hypot(b.cx - landing.x, b.cy - landing.y) <= DOCK.arrival;
+      const still = drop.px.rest && drop.py.rest && !R.phase;
+      landing.age += dt;   // simulated time, so a slow frame rate never expires a landing that is still on its way
+      if (landing.age > DOCK.timeout) { landing = null; men.target = null; }
+      else if (home || still) { landing = null; men.target = null; haptic('plip'); }
+      busy = true;
+    }
+    return busy;
+  });
 
   scene.tasks.push(dt => {
     let busy = false;
@@ -1397,7 +1569,7 @@ function Palette(scene, o) {
     return busy;
   });
   scene.renders.push(() => {
-    box.style.opacity = alpha.toFixed(3);
+    box.style.opacity = (alpha * P.fade).toFixed(3);
     items.forEach(it => {
       if (it.kind === 'div') {
         const v = P.orient === 'v';
@@ -1420,7 +1592,7 @@ function Palette(scene, o) {
       N.setAttribute('x1', hp.x.toFixed(2)); N.setAttribute('y1', hp.y.toFixed(2)); N.setAttribute('x2', tp.x.toFixed(2)); N.setAttribute('y2', tp.y.toFixed(2));
       N.setAttribute('stroke-width', nw);
     }
-    scene.beadSvg.style.opacity = (drop.pw.x < 8 ? 0 : alpha).toFixed(3);
+    scene.beadSvg.style.opacity = (drop.pw.x < 8 ? 0 : alpha * P.fade).toFixed(3);
   });
   function itemAt(a) {
     const f = clamp((a - along(0)) / pitch, 0, tools.length - 1), i0 = Math.floor(f), i1 = Math.min(tools.length - 1, i0 + 1), t = f - i0;
@@ -1439,15 +1611,18 @@ function Palette(scene, o) {
       ctx.mode = 'drag'; ctx.off = { x: p0.x - b.cx, y: p0.y - b.cy };
       if (o.onDragStart) o.onDragStart();
       drop.grab(p0);
+      // held, it is a bead of water: it lifts (1.035) and its rim brightens with the lift, it trails the finger by one
+      // `follow` spring (v·ζ·response/π: 27 pt at 1000 pt/s), stretches with speed about the grab point and dips once
+      // as it slows (settle lead), keeps bending the page, and reaches for the nearest dock with its meniscus
       drop.px.use('follow'); drop.py.use('follow'); drop.lift.to = 1.035; box.classList.add('grabbing');
-      if (drop.lens) drop.lens.classList.add('lifted');
-      P.dragging = true; scene.dragging++;
+      landing = null; P.dragging = true; scene.dragging++;
     },
     move(p, ctx) {
       if (ctx.mode === 'scrub') { head.to = clamp(localAlong(p), along(0), along(lastTool)); arrived = true; return; }
       const b = drop.box(), hw = b.w / 2, hh = b.h / 2;
       drop.px.to = rubber(p.x - ctx.off.x, hw + 8, scene.W - hw - 8);
       drop.py.to = rubber(p.y - ctx.off.y, hh + (o.minTop ?? 8), scene.H - hh - 8);
+      men.target = DM.meniscusTarget(p, b);
     },
     end(p, v, ctx) {
       if (ctx.mode === 'scrub') {
@@ -1455,24 +1630,53 @@ function Palette(scene, o) {
         for (let i = 1; i <= lastTool; i++) if (Math.abs(along(i) - a) < Math.abs(along(best) - a)) best = i;
         arrived = false; select(best); return;
       }
-      P.dragging = false; scene.dragging--; box.classList.remove('grabbing'); if (drop.lens) drop.lens.classList.remove('lifted');
-      drop.release();
-      const proj = { x: p.x + v.x * .12, y: p.y + v.y * .12 };      // UIScrollView .fast projection
-      const z = o.zone(proj, P.orient);
-      const d = dims(z.orient);
-      const c = z.at(d);
-      let rect = { l: c.x - d.w / 2, r: c.x + d.w / 2, t: c.y - d.h / 2, b: c.y + d.h / 2 };
-      for (const nb of (o.neighbours || [])) if (nb.visible) rect = restRect(rect, nb.box(), scene.merge, z.orient === 'h' ? 'x' : 'y');
-      setOrient(z.orient);
-      drop.px.use('snap'); drop.py.use('snap'); drop.px.to = (rect.l + rect.r) / 2; drop.py.to = (rect.t + rect.b) / 2;
-      drop.px.v = v.x; drop.py.v = v.y; drop.lift.to = 1;
-      setTimeout(() => haptic('snap'), 260);
+      P.dragging = false; scene.dragging--; box.classList.remove('grabbing');
+      drop.release(); drop.lift.to = 1;
+      // v is already the careful-release velocity (0 after a 70 ms rest, ≤ 5000 pt/s): project the finger 0.12 s
+      const next = DM.release({ x: p.x + v.x * .12, y: p.y + v.y * .12 }, P.dock);
+      let rect = DM.frame(next.edge, next.along);
+      for (const nb of (o.neighbours || [])) if (nb.visible) rect = restRect(rect, nb.box(), scene.merge, isVert(next.edge) ? 'y' : 'x');
+      next.along = DM.alongFor({ x: (rect.l + rect.r) / 2, y: (rect.t + rect.b) / 2 }, next.edge);
+      dockTo(next, rect, v);
     },
     tap(p, ctx) {
       if (ctx.sw >= 0) { setColor(ctx.sw); drop.poke(1.3); if (o.onColor) o.onColor(P.color); return; }
       if (ctx.tool >= 0 && tools[ctx.tool][0] === 'more') { drop.poke(2.2); if (o.onMore) o.onMore(ctx.tool); return; }   // More buds a grid; the bead stays
       if (ctx.tool >= 0) { drop.poke(2.2); select(ctx.tool); }
     }
+  });
+  /* Docks: `snap` from the full release velocity (one small overshoot, ~4 pt), re-forming if the axis changes; the
+     plip plays on arrival. Reduce Motion and Liquid Off cross-fade instead (§10.10): out in 120 ms, moved while
+     invisible (`reduced`, 0.26 s), in over 220 ms. Accessibility moves are silent (haptics answer touch). */
+  let fadeT = 0;
+  function dockTo(next, rect, v = { x: 0, y: 0 }, silent = false) {
+    P.dock = next; store.set(key, next);
+    const cx = (rect.l + rect.r) / 2, cy = (rect.t + rect.b) / 2, or = isVert(next.edge) ? 'v' : 'h';
+    rect = { l: rect.l, r: rect.r, t: rect.t, b: rect.b, w: rect.r - rect.l, h: rect.b - rect.t, cx, cy };   // restRect keeps only the edges
+    if (RM()) {
+      men.target = null; landing = null; clearTimeout(fadeT);
+      box.style.transition = 'opacity .12s'; P.fade = 0; drop.lensOpacity(0); scene.wake();
+      fadeT = setTimeout(() => {
+        drop.show(false); setOrient(or); drop.px.snap(cx); drop.py.snap(cy); drop.lift.snap(1); scene.wake();
+        fadeT = setTimeout(() => {
+          drop.show(true); drop.lensOpacity(''); box.style.transition = 'opacity .22s'; P.fade = 1; scene.wake();
+          if (!silent) haptic('plip');
+          fadeT = setTimeout(() => { box.style.transition = ''; }, 240);
+        }, SPR.rm[0] * 1000);
+      }, 120);
+      return;
+    }
+    setOrient(or);
+    drop.px.use('snap'); drop.py.use('snap'); drop.px.to = cx; drop.py.to = cy; drop.px.v = v.x; drop.py.v = v.y;
+    men.target = rect; landing = silent ? null : { x: cx, y: cy, age: 0 };
+    if (silent) setTimeout(() => { if (!P.dragging) men.target = null; }, 600);
+    scene.wake();
+  }
+  // Full Keyboard Access: ⌥ + an arrow moves the palette to that edge ("Move palette to the left edge", …)
+  box.addEventListener('keydown', e => {
+    const edge = e.altKey && { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'top', ArrowDown: 'bottom' }[e.key];
+    if (!edge || !DM.docks.includes(edge)) return;
+    e.preventDefault(); P.moveTo(edge);
   });
   box.addEventListener('click', e => {        // keyboard activation (Enter/Space): no pointer, no animation
     if (e.detail !== 0) return;
@@ -1483,7 +1687,14 @@ function Palette(scene, o) {
   });
 
   Object.assign(P, {
-    drop, select, setColor,
+    drop, select, setColor, model: DM,
+    // "Move palette to the left edge / right edge / top / bottom" (VoiceOver, Full Keyboard Access, the test hook)
+    moveTo(edge, silent = true) {
+      const d = DM.validated({ edge, along: .5 }); let rect = DM.frame(d.edge, d.along);
+      for (const nb of (o.neighbours || [])) if (nb.visible) rect = restRect(rect, nb.box(), scene.merge, isVert(d.edge) ? 'y' : 'x');
+      d.along = DM.alongFor({ x: (rect.l + rect.r) / 2, y: (rect.t + rect.b) / 2 }, d.edge);
+      dockTo(d, rect, undefined, silent);
+    },
     toolWorld(i) { const M = drop.Mc || mat(drop.px.x, drop.py.x, drop.pw.x, drop.ph.x, 0, 0, 1); const l = itemAt(along(i)); return apply(M, l.x, l.y); },
     get orientNow() { return P.orient; }
   });
@@ -1498,14 +1709,14 @@ function Popover(scene, pal, o) {
   const S = { open: false, closing: false };
   let fadeT = 0;
   const bond = scene.bond(pal.drop, drop, { on: 11, off: o.neckOff ?? 21, t0: 30, inset: 10, silent: true, onBreak: () => { if (S.open && !content.classList.contains('shown')) { reveal(); haptic('bud'); } }, onJoin: () => { if (S.closing) haptic('merge'); } });
-  function reveal() { clearTimeout(fadeT); content.classList.add('shown'); drop.setOutline(false); scene.wake(); }
+  function reveal() { clearTimeout(fadeT); content.classList.add('shown'); scene.wake(); }
   function target() { return o.place(pal, S.tool); }
   const RETRACT = [.3, .9];
   S.openAt = tool => {
     S.tool = tool; S.open = true; S.closing = false;
     const src = pal.toolWorld(tool), t = target();
     drop.px.snap(src.x); drop.py.snap(src.y); drop.pw.snap(30); drop.ph.snap(30); drop.pr.snap(15);
-    drop.show(true); drop.lens.style.opacity = 0; drop.setOutline(true);
+    drop.show(true); drop.lensOpacity(0);   // v2: nothing is stroked over a bud; the union's rim and line carry it
     content.classList.remove('shown');
     if (RM()) { drop.px.snap(t.x); drop.py.snap(t.y); drop.pw.snap(o.w); drop.ph.snap(o.h); drop.pr.snap(o.r); reveal(); }
     else {
@@ -1516,7 +1727,7 @@ function Popover(scene, pal, o) {
   };
   S.close = () => {
     if (!S.open) return; S.open = false; S.closing = true; clearTimeout(fadeT);
-    content.classList.remove('shown'); drop.setOutline(!RM());
+    content.classList.remove('shown');
     const back = () => {
       const src = pal.toolWorld(S.tool);
       if (RM()) { drop.show(false); S.closing = false; return; }
@@ -1625,7 +1836,7 @@ function editorChrome(scene, cfg) {
 
 function mountEditor(screen, cfg) {
   const W = 1194, H = 834;
-  const scene = new Scene(screen, { W, H, sigma: 8, k: 1 });
+  const scene = new Scene(screen, { W, H, sigma: 8 });
   scene.scene.appendChild(el('div', 'desk'));
   statusBarPad(scene);
   const pg = mountPage(scene, cfg.page, { proposal: cfg.ai });
@@ -1635,17 +1846,10 @@ function mountEditor(screen, cfg) {
   const TOP = 92;                     // the palette is 469 pt long: 7 slots (6 tools + More) × 44 + 17 + 3 inks × 44 + 2 × 6
   const neighbours = [chrome.tl, chrome.tr, chrome.asst, chrome.hud].filter(Boolean);
   const pal = Palette(scene, {
-    x: 44, y: 455, orient: 'v', tools: TOOLS, colors, minTop: 84, neighbours,
-    zone(p) {
-      const maxRight = cfg.ai ? 818 : W - 16;
-      const Z = [
-        { orient: 'v', dist: Math.abs(p.x - 16), at: s => ({ x: 16 + s.w / 2, y: clamp(p.y, TOP + s.h / 2, H - 16 - s.h / 2) }) },
-        { orient: 'h', dist: Math.abs(p.y - H), at: s => ({ x: clamp(p.x, 16 + s.w / 2, maxRight - s.w / 2), y: H - 16 - s.h / 2 }) },
-        { orient: 'h', dist: Math.abs(p.y - TOP) + 40, at: s => ({ x: clamp(p.x, 16 + s.w / 2, maxRight - s.w / 2), y: TOP + s.h / 2 }) }];
-      if (!cfg.ai) Z.push({ orient: 'v', dist: Math.abs(p.x - W), at: s => ({ x: W - 16 - s.w / 2, y: clamp(p.y, TOP + s.h / 2, H - 16 - s.h / 2) }) });
-      else Z.push({ orient: 'v', dist: Math.abs(p.x - 818), at: s => ({ x: 818 - s.w / 2, y: clamp(p.y, TOP + s.h / 2, H - 16 - s.h / 2) }) });
-      return Z.sort((a, b) => a.dist - b.dist)[0];
-    },
+    tools: TOOLS, colors, minTop: 84, neighbours,
+    // the dock region: below the bars (24 + 8 + 44 + 16 = 92), 16 pt in from the sides and the bottom; with the
+    // assistant docked the right dock moves to the panel's leading edge (834 − 16)
+    dock: { region: { l: 16, t: TOP, r: cfg.ai ? 818 : W - 16, b: H - 16 }, docks: ['left', 'right', 'top', 'bottom'], home: { edge: 'left', along: .5 } },
     onSelect(i, same) { if (more) more.close(); if (!pop) return; if (i === 0 && same) pop.toggle(0); else pop.close(); },
     onMore(i) { if (!more) return; if (pop) pop.close(); more.toggle(i); },
     onDragStart() { pop && pop.close(); more && more.close(); },
@@ -1818,10 +2022,10 @@ function mountAssistant(scene, pal, pg, chrome, neighbours) {
         // pulling the chip away shows where it belongs: the anchor bead grows on the change and a stem joins them
         anchor.px.snap(anchorAt.x); anchor.py.snap(anchorAt.y); anchor.pw.snap(8); anchor.ph.snap(8); anchor.pr.snap(4);
         anchor.pw.to = 26; anchor.ph.to = 26; anchor.pr.to = 13; anchor.show(true); tether.enabled = true; page.classList.add('tethering');
-        chip.grab(p0); chip.px.use('follow'); chip.py.use('follow'); chip.lift.to = 1.05; chip.lens.classList.add('lifted'); scene.dragging++;
+        chip.grab(p0); chip.px.use('follow'); chip.py.use('follow'); chip.lift.to = 1.05; scene.dragging++;
       },
       move(p, c) { chip.px.to = rubber(p.x - c.off.x, 110, 1180); chip.py.to = rubber(p.y - c.off.y, 30, 810); },
-      end(p, v) { scene.dragging--; chip.release(); chip.lens.classList.remove('lifted'); chip.lift.to = 1; chip.px.use('tether'); chip.py.use('tether'); chip.px.to = rest.x; chip.py.to = rest.y; chip.px.v = v.x * .6; chip.py.v = v.y * .6; }
+      end(p, v) { scene.dragging--; chip.release(); chip.lift.to = 1; chip.px.use('tether'); chip.py.use('tether'); chip.px.to = rest.x; chip.py.to = rest.y; chip.px.v = v.x * .6; chip.py.v = v.y * .6; }
     });
     chipEl.querySelector('.ok').addEventListener('click', accept);
     chipEl.querySelectorAll('.icon-btn')[1].addEventListener('click', discard);
@@ -1904,7 +2108,7 @@ function mountAssistant(scene, pal, pg, chrome, neighbours) {
 /* ---------- iPhone editor ---------- */
 function mountPhone(screen) {
   const W = 393, H = 852;
-  const scene = new Scene(screen, { W, H, sigma: 6.5, k: .8 });
+  const scene = new Scene(screen, { W, H, sigma: 6.5 });
   scene.scene.appendChild(el('div', 'desk'));
   screen.appendChild(el('div', 'island'));
   const sb = el('div', 'status', `<span>9:41</span><span class="r"><svg viewBox="0 0 18 12" width="18" height="12"><rect x="0" y="8" width="3" height="4" rx=".8" fill="currentColor"/><rect x="5" y="5.5" width="3" height="6.5" rx=".8" fill="currentColor"/><rect x="10" y="3" width="3" height="9" rx=".8" fill="currentColor"/><rect x="15" y="0" width="3" height="12" rx=".8" fill="currentColor"/></svg>${wifi()}${battery()}</span>`);
@@ -1922,12 +2126,9 @@ function mountPhone(screen) {
   const pen = { width: 2.4 };
   let pop, more;
   const pal = Palette(scene, {
-    x: W / 2, y: H - 34 - 8 - 28, orient: 'h', tools, colors: [INK.carbon], pitch: 46, thick: 56, colorPitch: 44, beadR: 20, minTop: 60, neighbours: [tl, tr],
-    zone(p) {
-      const top = { orient: 'h', dist: Math.abs(p.y - 112), at: s => ({ x: W / 2, y: 112 + 8 + s.h / 2 }) };
-      const bot = { orient: 'h', dist: Math.abs(p.y - H), at: s => ({ x: W / 2, y: H - 34 - 8 - s.h / 2 }) };
-      return top.dist < bot.dist ? top : bot;
-    },
+    tools, colors: [INK.carbon], pitch: 46, thick: 56, colorPitch: 44, beadR: 20, minTop: 60, neighbours: [tl, tr],
+    // iPhone: top (below the bars, 104 + 16) and bottom (8 pt above the home indicator) only; capture radius 160 pt
+    dock: { region: { l: 16, t: 120, r: W - 16, b: H - 34 - 8 }, docks: ['top', 'bottom'], compact: true, home: { edge: 'bottom', along: .5 } },
     onSelect(i, same) { more.close(); if (i === 0 && same) pop.toggle(0); else pop.close(); },
     onMore(i) { pop.close(); more.toggle(i); },
     onDragStart() { pop.close(); more.close(); },
@@ -1986,8 +2187,8 @@ const CARDS = [
 function mountLibrary(screen) {
   const W = 1194, H = 834;
   // two water stacks: notebooks (under the covers) and floating chrome (over everything)
-  const scene = new Scene(screen, { W, H, sigma: 8, k: 1, id: 's-lib-grid' });
-  const top = new Scene(screen, { W, H, sigma: 8, k: 1, id: 's-lib-top' });
+  const scene = new Scene(screen, { W, H, sigma: 8, id: 's-lib-grid' });
+  const top = new Scene(screen, { W, H, sigma: 8, id: 's-lib-top' });
   const lib = el('div', 'lib'); scene.scene.appendChild(lib);
   top.scene.style.pointerEvents = 'none';
   const rows = [['books', 'Documents', '23', 1], ['star', 'Favourites', '5'], ['people', 'Shared', '2'], ['clock', 'Recents', ''], ['stack', 'Study Sets', '3'], ['puzzle', 'Gallery', ''], ['trash', 'Trash', '4']];
@@ -2040,61 +2241,152 @@ function mountLibrary(screen) {
   let undoStack = null;
   const gulp = n => { n.classList.add('gulp'); requestAnimationFrame(() => requestAnimationFrame(() => n.classList.remove('gulp'))); };
 
+  /* Live reflow (§10.12, NibReflowModel): while a cover is carried, the gap follows the finger like home-screen icons,
+     with water easing. The gap sits at the slot whose centre is nearest the finger and moves only when the finger is
+     24 pt closer to another slot's centre than to the gap's (12 pt past the midpoint), so it never flickers; the covers
+     between home and the gap move one slot toward home with `reflow`, wrapping rows. More than 24 pt outside every
+     slot the gap closes back at home. While the finger is in another cover's inner 70 % that cover holds still, so a
+     combine can arm (380 ms); armed, or fused with a folder film, the reflow pauses. */
+  // dwell (mockup only): with the gap switching 12 pt past the midpoint, the finger crosses a neighbour's outer 15 %
+  // before its inner 70 %, so the cover would slide away before a combine could start. While the finger is on the
+  // cover (cover + title) that the gap would displace, the switch waits 180 ms; heading for its middle wins.
+  const RF = { hysteresis: 24, core: .70, outside: 24, liftDelay: 300, liftSlop: 10, hold: 380, armed: 1.03, dwell: 180 };
+  const cellAt = i => { const l = X0 + (i % 5) * PITCH, t = Y0 + Math.floor(i / 5) * ROW; return { l, t, r: l + CW, b: t + ROW - GUT }; };   // cover + title
+  const coverAt = i => { const l = X0 + (i % 5) * PITCH, t = Y0 + Math.floor(i / 5) * ROW; return { l, t, r: l + CW, b: t + CH }; };
+  const within = (p, r, m = 0) => p.x >= r.l - m && p.x <= r.r + m && p.y >= r.t - m && p.y <= r.b + m;
+  const centreDist = (p, r) => Math.hypot(p.x - (r.l + r.r) / 2, p.y - (r.t + r.b) / 2);
+  function Reflow(ids, from) {
+    const m = { ids, from, ins: from };
+    m.target = i => i === from ? m.ins : (from < m.ins && i > from && i <= m.ins) ? i - 1 : (m.ins < from && i >= m.ins && i < from) ? i + 1 : i;
+    m.combineCandidate = p => {   // the cover whose SHOWN frame's inner 70 % holds the finger (never the carried one)
+      const k = (1 - RF.core) / 2;
+      for (let i = 0; i < ids.length; i++) if (i !== from) {
+        const r = coverAt(m.target(i)), ix = (r.r - r.l) * k, iy = (r.b - r.t) * k;
+        if (p.x > r.l + ix && p.x < r.r - ix && p.y > r.t + iy && p.y < r.b - iy) return ids[i];
+      }
+      return null;
+    };
+    m.update = (p, paused) => {
+      if (paused || m.combineCandidate(p)) return false;
+      let best = from, bd = Infinity, inside = false;
+      for (let i = 0; i < ids.length; i++) { const r = cellAt(i); if (within(p, r, RF.outside)) inside = true; const dd = centreDist(p, r); if (dd < bd) { bd = dd; best = i; } }
+      if (!inside) best = from;
+      if (best === m.ins) return false;
+      if (inside && !(centreDist(p, cellAt(best)) + RF.hysteresis < centreDist(p, cellAt(m.ins)))) return false;
+      const shown = ids.some((o, i) => i !== from && m.target(i) === best);
+      if (shown && within(p, cellAt(best))) {
+        const now = performance.now();
+        if (!m.pend || m.pend.i !== best) { m.pend = { i: best, t: now }; return false; }
+        if (now - m.pend.t < RF.dwell) return false;
+      }
+      m.pend = null; m.ins = best; return true;
+    };
+    return m;
+  }
+  const lsub = lib.querySelector('.lsub'), lsubText = lsub.textContent;
+  const flow = (R, except) => R.ids.forEach((o, i) => { if (o === except) return; const c = coverAt(R.target(i)); o.px.use('reflow').to = (c.l + c.r) / 2; o.py.use('reflow').to = (c.t + c.b) / 2; });
+
   cards.forEach(d => {
+    const disarm = ctx => {
+      const a = ctx.armed; if (!a) return;
+      envelope(a, false); a.lift.to = 1; pairBond.get(d.card.id + '|' + a.card.id).enabled = false; ctx.armed = null;
+    };
+    // arming (NibReflow.arm): the finger in a cover's inner 70 % for 380 ms arms it; leaving that cover disarms it
+    const arm = (ctx, cand, p) => {
+      if (ctx.armed) { if (within(p, coverAt(ctx.R.target(ctx.R.ids.indexOf(ctx.armed))))) return; disarm(ctx); scene.wake(); }
+      if (cand === ctx.hover) return;
+      ctx.hover = cand; clearTimeout(ctx.hoverT);
+      // armed: the target swells and the water reaches across (the neck is the promise that they will combine)
+      if (cand) ctx.hoverT = setTimeout(() => {
+        if (ctx.hover !== cand || !ctx.lifted) return;
+        ctx.armed = cand; envelope(cand, true); cand.lift.to = RF.armed; pairBond.get(d.card.id + '|' + cand.card.id).enabled = true; haptic('merge'); scene.wake();
+      }, RF.hold);
+    };
+    // the lift: a 0.3 s press, then 6 pt of movement (the grid scrolls on device, so a plain drag is a scroll)
+    const lift = (p0, ctx) => {
+      ctx.lifted = true; ctx.off = { x: p0.x - d.px.x, y: p0.y - d.py.x };
+      d.grab(p0);
+      d.px.use('follow'); d.py.use('follow'); d.lift.to = 1.045; envelope(d, true);
+      d.node.classList.add('lifted'); d.node.style.zIndex = 5;
+      scene.dragging++; ctx.hover = null; ctx.hoverT = 0; ctx.armed = null; ctx.tile = -1; ctx.row = -1;
+      ctx.R = Reflow(order.filter(o => !o.gone), order.indexOf(d));
+      tiles.forEach((t, i) => t.style.setProperty('--d', i * 35 + 'ms'));
+      lib.classList.add('films'); scene.wake();
+    };
     onDrag(d.node, scene, {
-      down() { return {}; },
-      start(p0, p, ctx) {
-        ctx.off = { x: p0.x - d.px.x, y: p0.y - d.py.x };
-        d.grab(p0);
-        d.px.use('follow'); d.py.use('follow'); d.lift.to = 1.045; envelope(d, true);
-        d.node.classList.add('lifted'); d.node.style.zIndex = 5;
-        scene.dragging++; ctx.hover = null; ctx.hoverT = 0; ctx.tile = -1; ctx.row = -1;
-        tiles.forEach((t, i) => t.style.setProperty('--d', i * 35 + 'ms'));
-        lib.classList.add('films');
+      down(p0) {
+        const ctx = { p0, last: p0, ready: false, lifted: false, cancel: false };
+        ctx.readyT = setTimeout(() => { if (!ctx.cancel) { ctx.ready = true; ctx.readyAt = ctx.last; } }, RF.liftDelay);
+        return ctx;
       },
+      start(p0, p, ctx) { ctx.last = p; if (ctx.ready) lift(p0, ctx); else if (Math.hypot(p.x - p0.x, p.y - p0.y) > RF.liftSlop) { ctx.cancel = true; clearTimeout(ctx.readyT); } },
       move(p, ctx) {
+        ctx.last = p;
+        if (ctx.cancel) return;
+        if (!ctx.lifted) {
+          if (!ctx.ready) { if (Math.hypot(p.x - ctx.p0.x, p.y - ctx.p0.y) > RF.liftSlop) { ctx.cancel = true; clearTimeout(ctx.readyT); } return; }
+          if (Math.hypot(p.x - ctx.readyAt.x, p.y - ctx.readyAt.y) < 6) return;
+          lift(ctx.p0, ctx);
+        }
         d.px.to = rubber(p.x - ctx.off.x, 40, W - 40); d.py.to = rubber(p.y - ctx.off.y, 120, H - 40);
         // over the sidebar the notebook condenses to half size around the finger; a folder row grows a "+1" pill
         const overSide = p.x < 320;
         d.lift.to = overSide ? .5 : 1.045;
         const row = overSide ? frows.findIndex((_, i) => { const r = rowRect(i); return p.y >= r.t && p.y < r.b; }) : -1;
         if (row !== ctx.row) { frows.forEach((r, i) => r.classList.toggle('target', i === row)); if (row >= 0) haptic('merge'); ctx.row = row; }
-        // folder tiles: within 13 pt the card fuses with the tile's water film
+        // folder tiles: within 13 pt the card fuses with the tile's water film (and the notebooks' reflow pauses)
         const B = d.box(); let tile = -1;
         if (!overSide) tiles.forEach((t, i) => { if (tile < 0 && nearest(B, tileRect(i)).gap < 13) tile = i; });
         if (tile !== ctx.tile) { tiles.forEach((t, i) => t.classList.toggle('fused', i === tile)); if (tile >= 0) haptic('merge'); ctx.tile = tile; }
-        // notebook → notebook: armed only inside the inner 70 % of the target cover, after 380 ms
-        const over = (overSide || tile >= 0) ? null : order.find(o => o !== d && !o.gone && Math.abs(o.px.x - p.x) < CW * .35 && Math.abs(o.py.x - p.y) < CH * .35) || null;
-        if (over !== ctx.hover) {
-          if (ctx.hover) { envelope(ctx.hover, false); ctx.hover.lift.to = 1; pairBond.get(d.card.id + '|' + ctx.hover.card.id).enabled = false; }
-          ctx.hover = over; ctx.armed = false; clearTimeout(ctx.hoverT);
-          // armed: the target swells and the water reaches across (the neck is the promise that they will combine)
-          if (over) ctx.hoverT = setTimeout(() => { ctx.armed = true; envelope(over, true); over.lift.to = 1.03; pairBond.get(d.card.id + '|' + over.card.id).enabled = true; haptic('merge'); scene.wake(); }, 380);
-        }
+        arm(ctx, (overSide || tile >= 0) ? null : ctx.R.combineCandidate(p), p);
+        const step = () => { clearTimeout(ctx.dwellT); if (!ctx.lifted || ctx.cancel) return;
+          if (ctx.R.update(ctx.last, !!ctx.armed || ctx.tile >= 0)) { flow(ctx.R, d); scene.wake(); }
+          else if (ctx.R.pend) ctx.dwellT = setTimeout(step, RF.dwell + 10); };   // a resting finger still gets its gap
+        step();
       },
       end(p, v, ctx) {
+        clearTimeout(ctx.readyT); clearTimeout(ctx.dwellT); ctx.cancel = true;
+        if (!ctx.lifted) return;
+        const R = ctx.R;
         scene.dragging--; clearTimeout(ctx.hoverT); d.node.classList.remove('lifted'); d.release();
         d.px.use('slot'); d.py.use('slot'); d.lift.to = 1;
         setTimeout(() => lib.classList.remove('films'), 260);
-        if (ctx.row >= 0) { const r = rowRect(ctx.row), row = frows[ctx.row]; row.classList.remove('target'); absorb(d, { x: 40, y: (r.t + r.b) / 2 }, row, folders[ctx.row][0]); return; }
-        if (ctx.tile >= 0) { const r = tileRect(ctx.tile), t = tiles[ctx.tile]; t.classList.remove('fused'); absorb(d, { x: r.l + 31, y: (r.t + r.b) / 2 }, t, folders[ctx.tile][0]); return; }
-        if (ctx.armed && ctx.hover) { combine(d, ctx.hover); return; }
-        if (ctx.hover) { envelope(ctx.hover, false); ctx.hover.lift.to = 1; }
-        const proj = { x: p.x + v.x * .1, y: p.y + v.y * .1 };
-        let best = 0, bd = 1e9; order.forEach((_, i) => { const s = slot(i), dd = Math.hypot(s.x - proj.x, s.y - proj.y); if (dd < bd) { bd = dd; best = i; } });
-        const live = order.filter(o => !o.gone).length; best = Math.min(best, live - 1);
-        order.splice(order.indexOf(d), 1); order.splice(best, 0, d);
-        // `slot` (ζ 1) from only the part of the fling that points at the slot, capped at 1200 pt/s and at ω·distance,
-        // so a grid reorder lands and never overshoots (it stays inside the grid by construction)
-        const s = slot(best), dx = s.x - d.px.x, dy = s.y - d.py.x, L = Math.hypot(dx, dy) || 1;
-        const sp = Math.min(Math.max(0, (v.x * dx + v.y * dy) / L), 1200, TAU / SPR.slot[0] * L);
-        d.px.to = s.x; d.py.to = s.y; d.px.v = dx / L * sp; d.py.v = dy / L * sp;
+        if (ctx.row >= 0) { const r = rowRect(ctx.row), row = frows[ctx.row]; row.classList.remove('target'); disarm(ctx); layout(d); absorb(d, { x: 40, y: (r.t + r.b) / 2 }, row, folders[ctx.row][0]); return; }
+        if (ctx.tile >= 0) { const r = tileRect(ctx.tile), t = tiles[ctx.tile]; t.classList.remove('fused'); disarm(ctx); layout(d); absorb(d, { x: r.l + 31, y: (r.t + r.b) / 2 }, t, folders[ctx.tile][0]); return; }
+        if (ctx.armed) { combine(d, ctx.armed); return; }
+        // a drop in the grid inserts the card at the gap: the neighbours are already where the new order puts them
+        const from = R.from, to = R.ins;
+        if (to !== from) {
+          order.splice(order.indexOf(d), 1); order.splice(to, 0, d);
+          undoStack = { kind: 'reorder', d, from, label: lsub.textContent };
+          lsub.textContent = lsubText.replace(/·.*$/, '· Manual');   // a manual order sets the folder's sort to Manual
+          showToast('Moved');
+        }
+        // it flows into its slot with `slot` (ζ 1) from only the part of the fling that points at the slot, capped at
+        // 1200 pt/s and at ω·distance, so it lands and never overshoots
+        landInSlot(d, to, v);
         layout(d);
-        setTimeout(() => { envelope(d, false); d.node.style.zIndex = ''; d.bonds.forEach(b => b.enabled = false); scene.wake(); }, 260);
         setTimeout(() => haptic('snap'), 240);
       }
     });
+    // Full Keyboard Access / VoiceOver equivalents: ⌥← "Move earlier", ⌥→ "Move later"
+    d.node.addEventListener('keydown', e => {
+      if (!e.altKey || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+      e.preventDefault();
+      const live = order.filter(o => !o.gone), from = live.indexOf(d), to = from + (e.key === 'ArrowLeft' ? -1 : 1);
+      if (to < 0 || to >= live.length) return;
+      order.splice(order.indexOf(d), 1); order.splice(to, 0, d);
+      undoStack = { kind: 'reorder', d, from, label: lsub.textContent };
+      lsub.textContent = lsubText.replace(/·.*$/, '· Manual');
+      layout(); showToast('Moved'); scene.wake();
+    });
   });
+  function landInSlot(d, i, v = { x: 0, y: 0 }) {
+    const s = slot(i), dx = s.x - d.px.x, dy = s.y - d.py.x, L = Math.hypot(dx, dy) || 1;
+    const sp = Math.min(Math.max(0, (v.x * dx + v.y * dy) / L), 1200, TAU / SPR.slot[0] * L);
+    d.px.use('slot').to = s.x; d.py.use('slot').to = s.y; d.px.v = dx / L * sp; d.py.v = dy / L * sp;
+    setTimeout(() => { envelope(d, false); d.node.style.zIndex = ''; d.bonds.forEach(b => b.enabled = false); scene.wake(); }, 260);
+  }
 
   // B's absorb: the card flows into the folder, shrinking to 12 % and fading; the folder takes a small gulp
   function absorb(d, at, target, name) {
@@ -2126,7 +2418,9 @@ function mountLibrary(screen) {
   }
   function undo() {
     if (!undoStack) return; const u = undoStack; undoStack = null;
-    if (u.kind === 'combine') {
+    if (u.kind === 'reorder') {
+      order.splice(order.indexOf(u.d), 1); order.splice(u.from, 0, u.d); lsub.textContent = u.label; layout();
+    } else if (u.kind === 'combine') {
       const { a, b, idx, title, sub } = u;
       b.node.querySelector('.behind').innerHTML = ''; b.node.querySelector('.meta b').innerHTML = title; b.node.querySelector('.meta span').innerHTML = sub;
       restore(a, idx, b.px.x, b.py.x); b.poke(1);
@@ -2174,7 +2468,7 @@ const swHTML = (on, label) => `<button class="sw" role="switch" aria-checked="${
 
 /* A still editor behind a sheet (page + resting chrome), dimmed by the scrim. */
 function editorBackdrop(screen) {
-  const scene = new Scene(screen, { W: 1194, H: 834, sigma: 8, k: 1 });
+  const scene = new Scene(screen, { W: 1194, H: 834, sigma: 8 });
   scene.scene.appendChild(el('div', 'desk'));
   statusBarPad(scene);
   const page = el('div', 'page', pageMarkup(scene.id, false));
@@ -2389,7 +2683,7 @@ function fit() {
 }
 addEventListener('resize', fit); fit();
 /* test hook: advance the simulation deterministically (used when rAF is throttled) */
-window.__nib = { scenes, advance(ms) { for (let t = 0; t < ms; t += 1000 / 60) scenes.forEach(s => s.step(1 / 60)); } };
+window.__nib = { scenes, haptics: hlog, advance(ms) { for (let t = 0; t < ms; t += 1000 / 60) scenes.forEach(s => s.step(1 / 60)); } };
 })();
 </script>
 </body>
