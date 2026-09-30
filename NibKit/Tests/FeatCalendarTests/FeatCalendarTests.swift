@@ -1,4 +1,6 @@
 import XCTest
+import SwiftUI
+import UserNotifications
 import NibContracts
 import NibTesting
 @testable import FeatCalendar
@@ -8,7 +10,7 @@ final class FakeCalendarProvider: CalendarProvider {
     private let lock = NSLock()
     private var current: CalendarAccess
     private let grants: Bool
-    private let stored: [CalendarEvent]
+    private var stored: [CalendarEvent]
     private var prompts = 0
     private var readCount = 0
 
@@ -38,6 +40,13 @@ final class FakeCalendarProvider: CalendarProvider {
 
     func requestAccess() async -> CalendarAccess { grant() }
 
+    /// The calendar changed (an event was moved, added or deleted in another app).
+    func replace(_ events: [CalendarEvent]) {
+        lock.lock()
+        stored = events
+        lock.unlock()
+    }
+
     private func grant() -> CalendarAccess {
         lock.lock()
         defer { lock.unlock() }
@@ -55,12 +64,33 @@ final class FakeCalendarProvider: CalendarProvider {
     }
 
     func calendars() -> [CalendarInfo] {
+        lock.lock()
+        defer { lock.unlock() }
         var out: [CalendarInfo] = []
         for e in stored where !out.contains(e.calendar) { out.append(e.calendar) }
         return out
     }
 
     func observeChanges(_ handler: @escaping () -> Void) -> AnyObject? { nil }
+}
+
+/// Records every reminder rebuild; the first authorisation check is slow, so a second rebuild can start meanwhile.
+@MainActor
+final class FakeNotifier: NotificationScheduling {
+    private(set) var replaced: [[String]] = []
+    private(set) var authorizationCalls = 0
+
+    func authorization() async -> NotificationAuthorization {
+        authorizationCalls += 1
+        if authorizationCalls == 1 { try? await Task.sleep(nanoseconds: 200_000_000) }
+        return .authorized
+    }
+
+    func requestAuthorization() async -> Bool { true }
+
+    func replace(prefix: String, with reminders: [PlannedReminder]) async {
+        replaced.append(reminders.map { $0.eventID })
+    }
 }
 
 @MainActor
@@ -75,7 +105,7 @@ final class FeatCalendarTests: XCTestCase {
 
     func event(_ title: String, _ start: Date, minutes: Int = 60, allDay: Bool = false, rsvp: RSVPStatus = .accepted,
                status: CalendarEventStatus = .confirmed, attendees: [String] = [], location: String? = nil,
-               cal: Calendar = .current) -> CalendarEvent {
+               recurring: Bool = false, cal: Calendar = .current) -> CalendarEvent {
         let end = allDay ? cal.date(byAdding: .day, value: max(1, minutes / 1_440), to: start)!.addingTimeInterval(-1)
                          : start.addingTimeInterval(Double(minutes) * 60)
         return CalendarEvent(
@@ -83,7 +113,25 @@ final class FeatCalendarTests: XCTestCase {
             title: title, start: start, end: end, allDay: allDay, location: location, notes: nil, url: nil,
             calendar: Self.work,
             attendees: attendees.map { CalendarAttendee(name: $0, email: nil, status: .accepted, role: "required", isCurrentUser: false) },
-            organizer: nil, rsvp: rsvp, status: status, recurring: false)
+            organizer: nil, rsvp: rsvp, status: status, recurring: recurring,
+            key: CalendarEventID.key(externalID: "ext-" + title, recurrence: recurring ? start : nil, allDay: allDay,
+                                     calendar: cal))
+    }
+
+    static let day: TimeInterval = 86_400
+
+    /// `hour`:00 on the day `days` from now (negative = in the past), here.
+    func daysFromNow(_ days: Double, hour: Int = 10) -> Date {
+        let d = Date().addingTimeInterval(days * Self.day)
+        return Calendar.current.date(bySettingHour: hour, minute: 0, second: 0, of: d) ?? d
+    }
+
+    /// Waits (on the main actor) until `condition` holds, for at most `seconds`.
+    func eventually(_ seconds: Double = 5, _ condition: @escaping () -> Bool) async {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition() && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
     }
 
     /// A harness with the calendar feature and a fake calendar.
@@ -242,8 +290,9 @@ final class FeatCalendarTests: XCTestCase {
     }
 
     func testTextDocumentNoteReusesFoldersAndCleansTitles() async throws {
-        let first = event("Q3/Q4: Plan *", date(2026, 10, 1, 10), attendees: ["Ana"])
-        let second = event("Q3/Q4: Plan *", date(2026, 10, 8, 10), attendees: ["Ana"])
+        // Two occurrences of one weekly series: one note each.
+        let first = event("Q3/Q4: Plan *", date(2026, 10, 1, 10), attendees: ["Ana"], recurring: true)
+        let second = event("Q3/Q4: Plan *", date(2026, 10, 8, 10), attendees: ["Ana"], recurring: true)
         let (h, _, _) = harness([first, second])
         _ = try await h.run("calendar.events", ["from": "2026-10-01", "to": "2026-10-10"])
 
@@ -502,5 +551,244 @@ final class FeatCalendarTests: XCTestCase {
         let trip = event("Trip", date(2026, 10, 1), minutes: 2 * 1_440, allDay: true)
         let sections = CalendarDaySection.make([b, trip, a], window: window, calendar: .current)
         XCTAssertEqual(sections.map { $0.events.map { $0.title } }, [["A"], ["Trip"], ["Trip", "B"]])
+    }
+
+    // MARK: Reminder actions
+
+    func testTakeNotesFromAReminderBeforeStartIsQueuedAndRunByBegin() async throws {
+        let meeting = event("Planning", date(2026, 9, 30, 11), attendees: ["Ana"])
+        let (h, store, _) = harness([meeting])
+        let router = store.makeNotificationRouter(previous: nil)
+        var completed = 0
+        // Nib was launched by the reminder: the response arrives before FeatCalendarFeature.start.
+        router.receive(category: CalendarReminderNames.category, action: CalendarReminderNames.takeNotesAction,
+                       userInfo: [CalendarReminderNames.eventKey: meeting.id],
+                       forward: { XCTFail("a calendar reminder is never forwarded"); return true },
+                       completion: { completed += 1 })
+        XCTAssertEqual(completed, 1)
+        XCTAssertEqual(store.pendingTakeNotes, [meeting.id])
+        XCTAssertNil(h.app.settings.json("calendar.notes." + meeting.id))
+
+        store.begin()
+        await store.startTask?.value
+        XCTAssertEqual(store.pendingTakeNotes, [])
+        let link = try XCTUnwrap(h.app.settings.json("calendar.notes." + meeting.id))
+        let doc = NodeRef.documentID(from: try XCTUnwrap(link["doc"]?.stringValue))
+        XCTAssertNotNil(h.library.node(doc))
+        XCTAssertEqual(link["key"]?.stringValue, meeting.key)
+
+        // Once started, a Take Notes with a window runs at once (the note exists, so nothing new is created).
+        router.receive(category: CalendarReminderNames.category, action: UNNotificationDefaultActionIdentifier,
+                       userInfo: [CalendarReminderNames.eventKey: meeting.id], forward: { true }, completion: {})
+        XCTAssertEqual(store.pendingTakeNotes, [])
+    }
+
+    func testRouterForwardsOtherNotificationsAndIgnoresDismissals() {
+        let (_, store, _) = harness([])
+        let router = store.makeNotificationRouter(previous: nil)
+        var forwarded = 0
+        var completed = 0
+        router.receive(category: "chat.reply", action: UNNotificationDefaultActionIdentifier, userInfo: [:],
+                       forward: { forwarded += 1; return true }, completion: { completed += 1 })
+        XCTAssertEqual(forwarded, 1)
+        XCTAssertEqual(completed, 0, "the previous delegate calls the completion handler")
+        router.receive(category: "chat.reply", action: UNNotificationDefaultActionIdentifier, userInfo: [:],
+                       forward: { false }, completion: { completed += 1 })
+        XCTAssertEqual(completed, 1, "no previous delegate: the router completes it")
+        router.receive(category: CalendarReminderNames.category, action: UNNotificationDismissActionIdentifier,
+                       userInfo: [CalendarReminderNames.eventKey: "20260930-abcdefabcdef"],
+                       forward: { XCTFail("never forwarded"); return true }, completion: { completed += 1 })
+        XCTAssertEqual(completed, 2)
+        XCTAssertTrue(store.pendingTakeNotes.isEmpty)
+
+        let calendar = CalendarReminderNames.category
+        XCTAssertEqual(CalendarNotificationRouter.route(category: calendar, action: UNNotificationDefaultActionIdentifier,
+                                                        userInfo: [CalendarReminderNames.eventKey: "20260930-abcdefabcdef"]),
+                       .takeNotes("20260930-abcdefabcdef"))
+        XCTAssertEqual(CalendarNotificationRouter.route(category: calendar, action: CalendarReminderNames.takeNotesAction,
+                                                        userInfo: [CalendarReminderNames.eventKey: "../../etc"]), .ignore)
+        XCTAssertEqual(CalendarNotificationRouter.route(category: calendar, action: CalendarReminderNames.takeNotesAction,
+                                                        userInfo: [:]), .ignore)
+        XCTAssertEqual(CalendarNotificationRouter.route(category: "other", action: CalendarReminderNames.takeNotesAction,
+                                                        userInfo: [CalendarReminderNames.eventKey: "20260930-abcdefabcdef"]),
+                       .forward)
+    }
+
+    func testReminderRebuildsRunInOrder() async throws {
+        let soon = event("Soon", Date().addingTimeInterval(3 * 3_600))
+        let (h, store, _) = harness([soon])
+        let notifier = FakeNotifier()
+        store.notifier = notifier
+        store.cache.store([soon], from: Date().addingTimeInterval(-3_600), to: Date().addingTimeInterval(Self.day),
+                          at: Date())
+        h.app.settings.set(CalendarSettings.reminderMinutes, 10)
+
+        // A reads "10 minutes" and waits on the (slow) permission check; meanwhile reminders are turned off and B runs.
+        let a = Task { await store.rescheduleReminders() }
+        await eventually { notifier.authorizationCalls == 1 }
+        h.app.settings.set(CalendarSettings.reminderMinutes, 0)
+        let b = Task { await store.rescheduleReminders() }
+        await a.value
+        await b.value
+        XCTAssertEqual(notifier.replaced, [[soon.id], []], "the later rebuild (off) lands last")
+    }
+
+    // MARK: The cache horizon
+
+    func testSyncedRangesAreClippedToTheHorizon() {
+        let now = Date()
+        let cache = CalendarEventCache(fileURL: nil)
+        let old = event("Old", now.addingTimeInterval(-450 * Self.day))
+        let recent = event("Recent", now.addingTimeInterval(-350 * Self.day))
+        let from = now.addingTimeInterval(-450 * Self.day), to = now.addingTimeInterval(-300 * Self.day)
+        cache.store([old, recent], from: from, to: to, at: now)
+        XCTAssertNil(cache.lastSync(covering: from, to), "the part beyond the horizon is no longer covered")
+        XCTAssertNil(cache.event(old.id))
+        XCTAssertNotNil(cache.lastSync(covering: now.addingTimeInterval(-390 * Self.day), to))
+        XCTAssertEqual(cache.event(recent.id)?.title, "Recent")
+
+        cache.store([], from: now.addingTimeInterval(-500 * Self.day), to: now.addingTimeInterval(-420 * Self.day), at: now)
+        XCTAssertNil(cache.lastSync(covering: now.addingTimeInterval(-500 * Self.day), now.addingTimeInterval(-420 * Self.day)))
+        XCTAssertNotNil(cache.lastSync(covering: now.addingTimeInterval(-390 * Self.day), to), "other ranges stay")
+    }
+
+    func testPagingARangeThatStartsBeyondTheHorizonReturnsEveryEvent() async throws {
+        let start = Calendar.current.startOfDay(for: Date().addingTimeInterval(-450 * Self.day))
+        let people = (0..<12).map { "Participant number \($0) with a fairly long display name" }
+        let many = (0..<60).map { i in
+            event("Review \(i)", start.addingTimeInterval(Double(i) * 6 * Self.day + 9 * 3_600), minutes: 25,
+                  attendees: people)
+        }
+        let (h, _, fake) = harness(many)
+        let to = Calendar.current.date(byAdding: .day, value: 365, to: start) ?? start.addingTimeInterval(365 * Self.day)
+        var cursor: String?
+        var seen: [String] = []
+        var pages = 0
+        repeat {
+            var params: [String: JSONValue] = ["from": .string(CalendarDates.day(start)), "to": .string(CalendarDates.day(to))]
+            if let c = cursor { params["cursor"] = .string(c) }
+            let r = try await h.run("calendar.events", .object(params))
+            seen += (r["events"]?.arrayValue ?? []).compactMap { $0["id"]?.stringValue }
+            cursor = r["cursor"]?.stringValue
+            pages += 1
+        } while cursor != nil && pages < 30
+        XCTAssertGreaterThan(pages, 1)
+        XCTAssertEqual(seen.count, 60)
+        XCTAssertEqual(Set(seen), Set(many.map { $0.id }), "every event exactly once, none skipped")
+        XCTAssertEqual(fake.reads, pages, "the cache no longer covers the range, so every page reads the calendar")
+    }
+
+    func testCreateNoteForAnEventBeyondTheHorizon() async throws {
+        let kickoff = event("Kickoff", daysFromNow(-450), attendees: ["Ana"])
+        let (h, store, fake) = harness([kickoff])
+        let r = try await h.run("calendar.createNote", ["event": .string(kickoff.id), "kind": "notebook"])
+        XCTAssertEqual(r["created"]?.boolValue, true)
+        XCTAssertEqual(fake.reads, 1, "a cache miss reads the event's days")
+        XCTAssertNil(store.cache.event(kickoff.id), "the cache does not keep events beyond its horizon")
+        XCTAssertNotNil(h.app.settings.json("calendar.notes." + kickoff.id))
+        let opened = try await h.run("calendar.openNote", ["event": .string(kickoff.id)])
+        XCTAssertEqual(opened["ref"]?.stringValue, r["ref"]?.stringValue)
+    }
+
+    func testEventByIDReadsTheCalendarOnACacheMiss() async throws {
+        let lunch = event("Lunch", daysFromNow(3, hour: 12))
+        let (_, store, fake) = harness([lunch])
+        XCTAssertNil(store.cache.event(lunch.id))
+        let found = try await store.event(id: lunch.id, principal: .user)
+        XCTAssertEqual(found.title, "Lunch")
+        XCTAssertEqual(fake.reads, 1)
+        _ = try await store.event(id: lunch.id, principal: .user)
+        XCTAssertEqual(fake.reads, 1, "the second lookup comes from the cache")
+    }
+
+    // MARK: Moved events
+
+    func testAMovedEventKeepsItsNote() async throws {
+        let original = event("One to one", date(2026, 9, 30, 14))
+        let moved = event("One to one", date(2026, 10, 1, 15))
+        XCTAssertNotEqual(original.id, moved.id)
+        XCTAssertEqual(original.key, moved.key, "the key ignores the start of a one-off event")
+        let (h, _, fake) = harness([original])
+        let created = try await h.run("calendar.createNote", ["event": .string(original.id), "kind": "notebook"])
+        let ref = try XCTUnwrap(created["ref"]?.stringValue)
+
+        fake.replace([moved])
+        let opened = try await h.run("calendar.openNote", ["event": .string(moved.id)])
+        XCTAssertEqual(opened["ref"]?.stringValue, ref, "the same note opens")
+        XCTAssertEqual(h.app.settings.json("calendar.notes." + moved.id)?["doc"]?.stringValue, ref)
+        XCTAssertNil(h.app.settings.json("calendar.notes." + original.id), "the link moved to the new id")
+
+        let again = try await h.run("calendar.createNote", ["event": .string(moved.id), "kind": "textDocument"])
+        XCTAssertEqual(again["created"]?.boolValue, false)
+        XCTAssertEqual(again["ref"]?.stringValue, ref)
+        let listed = try await h.run("calendar.events", ["from": "2026-10-01", "to": "2026-10-02"])
+        XCTAssertEqual(listed["events"]?[0]?["note"]?.stringValue, ref)
+
+        // Recurring occurrences keep one key per original occurrence.
+        let first = CalendarEventID.key(externalID: "series", recurrence: date(2026, 10, 5, 9), allDay: false, calendar: .current)
+        XCTAssertEqual(first, CalendarEventID.key(externalID: "series", recurrence: date(2026, 10, 5, 9), allDay: false,
+                                                  calendar: .current))
+        XCTAssertNotEqual(first, CalendarEventID.key(externalID: "series", recurrence: date(2026, 10, 12, 9), allDay: false,
+                                                     calendar: .current))
+    }
+
+    // MARK: More note kinds
+
+    func testWhiteboardNoteCarriesTheHeaderOnItsBoard() async throws {
+        let review = event("Sprint Review", date(2026, 9, 30, 15), attendees: ["Ana Lima", "Ben Ode"], location: "Room 2")
+        let (h, _, _) = harness([review])
+        let r = try await h.run("calendar.createNote", ["event": .string(review.id), "kind": "whiteboard"])
+        let doc = NodeRef.documentID(from: try XCTUnwrap(r["ref"]?.stringValue))
+        let content = try h.app.workspace.content(doc)
+        XCTAssertEqual(content.meta.kind, .whiteboard)
+        let board = try XCTUnwrap(content.livePages.first)
+        let boxes = try h.app.workspace.items(doc, page: board.id).compactMap { $0.text }
+        XCTAssertEqual(boxes.count, 1)
+        let header = boxes.map { $0.text.plainText }.joined()
+        for part in ["Sprint Review", "Ana Lima", "Ben Ode", "Room 2"] {
+            XCTAssertTrue(header.contains(part), "\(part) is in the header")
+        }
+        XCTAssertEqual(boxes.first?.text.paragraphs.first?.runs.first?.attrs.bold, true, "the title is bold")
+        XCTAssertEqual(h.undoDepth(doc), 0)
+    }
+
+    func testCreateNoteDryRunWritesNothing() async throws {
+        let standup = event("Standup", date(2026, 9, 30, 9))
+        let (h, _, _) = harness([standup])
+        let before = h.library.children(of: nil).map { $0.id }
+        let result = try await h.app.bus.execute(Invocation(
+            command: "calendar.createNote", params: ["event": .string(standup.id), "kind": "notebook"],
+            session: h.session, dryRun: true))
+        XCTAssertEqual(result.value["created"]?.boolValue, true)
+        XCTAssertNil(result.value["folder"]?.stringValue)
+        let ref = try XCTUnwrap(result.value["ref"]?.stringValue)
+        XCTAssertNil(h.library.node(NodeRef.documentID(from: ref)), "no document")
+        XCTAssertEqual(h.library.children(of: nil).map { $0.id }, before, "no folders")
+        XCTAssertNil(h.app.settings.json("calendar.notes." + standup.id), "no link")
+    }
+
+    // MARK: Snapshots (DESIGN.md 15.7)
+
+    func testCalendarTabRendersInEveryAccessStateLightDarkAndAX3() async throws {
+        let soon = event("Design Review", Date().addingTimeInterval(2 * 3_600), attendees: ["Ana Lima", "Ben Ode"],
+                         location: "Room 4")
+        let later = event("Retro", Date().addingTimeInterval(Self.day + 3_600), rsvp: .tentative)
+        for access in [CalendarAccess.granted, .notDetermined, .denied] {
+            let (h, store, _) = harness([soon, later], access: access)
+            store.refreshAccess()
+            if access == .granted {
+                await store.loadUpcoming(session: h.session, connect: false)
+                XCTAssertEqual(Set(store.upcoming.map { $0.id }), [soon.id, later.id])
+            }
+            let context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+            let view = CalendarTabBody(context: context, store: store, showsOtherEvents: .constant(false),
+                                       busy: .constant(Set<String>()))
+            let images = NibSnapshot.images(view, size: CGSize(width: 640, height: 900))
+            XCTAssertEqual(Set(images.keys), Set(NibSnapshot.Variant.allCases), "\(access): light, dark and AX3 render")
+            XCTAssertNotNil(NibSnapshot.image(view, size: CGSize(width: 640, height: 1_600), variant: .largeText),
+                            "\(access) at AX3")
+            XCTAssertGreaterThan(NibSnapshot.fittingSize(view, width: 640, variant: .largeText).height,
+                                 NibSnapshot.fittingSize(view, width: 640).height, "\(access): AX3 text grows the tab")
+        }
     }
 }

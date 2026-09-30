@@ -67,6 +67,8 @@ struct CalendarEvent: Codable, Equatable, Identifiable {
     var rsvp: RSVPStatus
     var status: CalendarEventStatus
     var recurring: Bool
+    /// `CalendarEventID.key`: the same when the event is moved (its `id` changes), so a note stays linked to it.
+    var key: String? = nil
 
     var colour: RGBA { RGBA(hex: calendar.color) ?? CalendarPalette.fallback }
     var isDeclined: Bool { rsvp == .declined || status == .cancelled }
@@ -105,23 +107,30 @@ enum CalendarPalette {
 /// Event ids that survive relaunches and match across devices (the event→note map is synced with the library):
 /// the occurrence's day ("yyyyMMdd", UTC for timed events, the calendar day for all-day ones), a dash, and 12 hex
 /// characters of SHA-256 over the calendar item's external identifier and the occurrence. Recurring events get one id
-/// per occurrence.
+/// per occurrence. Moving an event changes its id; its `key` stays, so the note link follows it.
 enum CalendarEventID {
     static func make(externalID: String, occurrence: Date, allDay: Bool, calendar: Calendar) -> String {
         var utc = Calendar(identifier: .gregorian)
         utc.timeZone = TimeZone(secondsFromGMT: 0) ?? utc.timeZone
-        let key: String
-        let day: DateComponents
-        if allDay {
-            day = calendar.dateComponents([.year, .month, .day], from: occurrence)
-            key = "d" + stamp(day)
-        } else {
-            day = utc.dateComponents([.year, .month, .day], from: occurrence)
-            key = "t" + String(Int((occurrence.timeIntervalSince1970 / 60).rounded(.down)))
-        }
-        let digest = SHA256.hash(data: Data((externalID + "|" + key).utf8))
-        let hex = digest.prefix(6).map { String(format: "%02x", $0) }.joined()
-        return stamp(day) + "-" + hex
+        let day = (allDay ? calendar : utc).dateComponents([.year, .month, .day], from: occurrence)
+        return stamp(day) + "-" + hex12(externalID + "|" + occurrenceKey(occurrence, allDay: allDay, calendar: calendar))
+    }
+
+    /// 12 hex characters that survive moving the event: SHA-256 over the external identifier alone for a one-off
+    /// event, and over the identifier and the original occurrence (EventKit's `occurrenceDate`, which stays put when
+    /// one occurrence is moved) for an occurrence of a recurring event (`recurrence` nil = one-off).
+    static func key(externalID: String, recurrence occurrence: Date?, allDay: Bool, calendar: Calendar) -> String {
+        guard let o = occurrence else { return hex12("k|" + externalID) }
+        return hex12("k|" + externalID + "|" + occurrenceKey(o, allDay: allDay, calendar: calendar))
+    }
+
+    private static func occurrenceKey(_ occurrence: Date, allDay: Bool, calendar: Calendar) -> String {
+        if allDay { return "d" + stamp(calendar.dateComponents([.year, .month, .day], from: occurrence)) }
+        return "t" + String(Int((occurrence.timeIntervalSince1970 / 60).rounded(.down)))
+    }
+
+    private static func hex12(_ material: String) -> String {
+        SHA256.hash(data: Data(material.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
     }
 
     /// The UTC day the id names (its first 8 characters), as the start of that day in UTC.
@@ -262,9 +271,12 @@ final class EventKitCalendarProvider: CalendarProvider {
         let external: String? = e.calendarItemExternalIdentifier
         let local: String? = e.calendarItemIdentifier
         let occurrenceDate: Date? = e.occurrenceDate
-        let key = (external?.isEmpty == false ? external : nil) ?? local ?? UUID().uuidString
-        let id = CalendarEventID.make(externalID: key, occurrence: occurrenceDate ?? start, allDay: e.isAllDay,
+        let identifier = (external?.isEmpty == false ? external : nil) ?? local ?? UUID().uuidString
+        let occurrence = occurrenceDate ?? start
+        let id = CalendarEventID.make(externalID: identifier, occurrence: occurrence, allDay: e.isAllDay,
                                       calendar: calendar)
+        let key = CalendarEventID.key(externalID: identifier, recurrence: e.hasRecurrenceRules ? occurrence : nil,
+                                      allDay: e.isAllDay, calendar: calendar)
         let people = (e.attendees ?? []).filter { $0.participantType != .room && $0.participantType != .resource }
         let attendees = people.map(attendee)
         let organizer: EKParticipant? = e.organizer
@@ -280,7 +292,7 @@ final class EventKitCalendarProvider: CalendarProvider {
             calendar: cal.map(info) ?? CalendarInfo(id: "", title: "", color: CalendarPalette.fallback.hex, source: "",
                                                     kind: "unknown"),
             attendees: attendees, organizer: organizer.map { nonEmpty($0.name) ?? email($0) ?? "" },
-            rsvp: rsvp, status: status(e.status), recurring: e.hasRecurrenceRules)
+            rsvp: rsvp, status: status(e.status), recurring: e.hasRecurrenceRules, key: key)
     }
 
     static func info(_ c: EKCalendar) -> CalendarInfo {
@@ -395,6 +407,14 @@ final class CalendarEventCache {
         self.fileURL = fileURL
     }
 
+    /// Reads the cache file now (`CalendarStore.begin` calls it off the main actor), so the first read on the main
+    /// actor or a render thread never decodes several megabytes while holding the lock.
+    func preload() {
+        lock.lock()
+        loadIfNeeded()
+        lock.unlock()
+    }
+
     /// Incremented on every store and clear.
     var generation: UInt64 {
         lock.lock()
@@ -494,10 +514,15 @@ final class CalendarEventCache {
 
     // MARK: Private (call with the lock held)
 
+    /// Drops events more than `horizon` from `now` and clips every synced range to the horizon, so coverage never
+    /// claims a span whose events were dropped (a later page of `calendar.events` then reads the calendar again).
     private func prune(now: Date) {
         let oldest = now.addingTimeInterval(-Self.horizon), newest = now.addingTimeInterval(Self.horizon)
         byID = byID.filter { $0.value.end >= oldest && $0.value.start <= newest }
-        ranges.removeAll { $0.to < oldest || $0.from > newest }
+        ranges = ranges.compactMap { r in
+            let from = max(r.from, oldest), to = min(r.to, newest)
+            return from < to ? SyncedRange(from: from, to: to, at: r.at) : nil
+        }
         if byID.count > Self.maxEvents {
             let ranked = byID.values.sorted { abs($0.start.timeIntervalSince(now)) < abs($1.start.timeIntervalSince(now)) }
             let dropped = ranked.dropFirst(Self.maxEvents)
@@ -552,17 +577,20 @@ struct NoteLink: Codable, Equatable {
     var start: String
     /// Unix seconds.
     var created: Double
+    /// The event's `CalendarEventID.key`: finds this link again after the event moved and its id changed.
+    var key: String?
 
     var documentID: DocumentID { NodeRef.documentID(from: doc) }
 
-    enum CodingKeys: String, CodingKey { case doc, title, kind, start, created }
+    enum CodingKeys: String, CodingKey { case doc, title, kind, start, created, key }
 
-    init(doc: String, title: String, kind: String, start: String, created: Double) {
+    init(doc: String, title: String, kind: String, start: String, created: Double, key: String? = nil) {
         self.doc = doc
         self.title = title
         self.kind = kind
         self.start = start
         self.created = created
+        self.key = key
     }
 
     /// Lenient: only `doc` is required.
@@ -573,6 +601,39 @@ struct NoteLink: Codable, Equatable {
         kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? DocumentKind.notebook.rawValue
         start = try c.decodeIfPresent(String.self, forKey: .start) ?? ""
         created = try c.decodeIfPresent(Double.self, forKey: .created) ?? 0
+        key = try c.decodeIfPresent(String.self, forKey: .key)
+    }
+}
+
+/// `calendar.notes.*` names by the `key` their link carries (the newest link wins), rebuilt after any of those
+/// settings changes. Thread-safe: the settings observer invalidates it on the posting thread.
+final class NoteKeyIndex {
+    private let lock = NSLock()
+    private var names: [String: String]?
+    private var generation: UInt64 = 0
+
+    func invalidate() {
+        lock.lock()
+        names = nil
+        generation &+= 1
+        lock.unlock()
+    }
+
+    /// The setting name whose link has `key`; `build` makes the whole map when it is missing (a map built while a
+    /// link changed is used once and not kept).
+    func name(for key: String, build: () -> [String: String]) -> String? {
+        lock.lock()
+        if let map = names {
+            lock.unlock()
+            return map[key]
+        }
+        let started = generation
+        lock.unlock()
+        let map = build()
+        lock.lock()
+        if generation == started { names = map }
+        lock.unlock()
+        return map[key]
     }
 }
 
@@ -594,9 +655,10 @@ enum CalendarSettings {
 
     static func declare(_ s: SettingsStore, owner: String) {
         s.declarePrefix(notesPrefix, synced: true,
-                        summary: "Note linked to a calendar event: {doc, title, kind, start, created} (written by calendar.createNote).",
+                        summary: "Note linked to a calendar event: {doc, title, kind, start, created, key} (written by calendar.createNote).",
                         owner: owner,
-                        schema: .obj(["doc": .ref, "title": .str(), "kind": .str(), "start": .str(), "created": .num()],
+                        schema: .obj(["doc": .ref, "title": .str(), "kind": .str(), "start": .str(), "created": .num(),
+                                      "key": .str()],
                                      required: ["doc"]))
         s.declare(reminderMinutes, summary: "Remind before calendar events, in minutes, with a Take Notes action (0 = off).",
                   owner: owner, schema: .int(min: 0, max: 120))
@@ -724,7 +786,9 @@ final class NoNotifications: NotificationScheduling {
     func replace(prefix: String, with reminders: [PlannedReminder]) async {}
 }
 
-/// `UNUserNotificationCenter`: reminders carry the "Take Notes" action (category `calendar.event`).
+/// `UNUserNotificationCenter`: reminders carry the "Take Notes" action (category `calendar.event`). Main-actor
+/// isolated, so `categoryRegistered` and the remove-then-add in `replace` never run on two threads at once.
+@MainActor
 final class UserNotificationScheduler: NotificationScheduling {
     private var categoryRegistered = false
 
@@ -789,8 +853,19 @@ final class UserNotificationScheduler: NotificationScheduling {
 }
 
 /// Routes the reminder's "Take Notes" action (and a tap on the reminder) to the event's note, and hands every other
-/// notification to the delegate that was installed before it.
+/// notification to the delegate that was installed before it. Installed from `FeatCalendarFeature.register`, inside
+/// `didFinishLaunching`, so the response that launched a terminated app reaches it.
 final class CalendarNotificationRouter: NSObject, UNUserNotificationCenterDelegate {
+    /// What a response to a notification does. Pure, so it is unit-tested.
+    enum Route: Equatable {
+        /// Open (or create) the note of this event.
+        case takeNotes(String)
+        /// A calendar reminder dismissed or without a usable event id: nothing to do.
+        case ignore
+        /// Not a calendar reminder: the previous delegate handles it.
+        case forward
+    }
+
     weak var previous: UNUserNotificationCenterDelegate?
     private let onTakeNotes: @MainActor (String) -> Void
 
@@ -799,14 +874,40 @@ final class CalendarNotificationRouter: NSObject, UNUserNotificationCenterDelega
         self.onTakeNotes = onTakeNotes
     }
 
+    static func route(category: String, action: String, userInfo: [AnyHashable: Any]) -> Route {
+        guard category == CalendarReminderNames.category else { return .forward }
+        guard action == CalendarReminderNames.takeNotesAction || action == UNNotificationDefaultActionIdentifier,
+              let id = userInfo[CalendarReminderNames.eventKey] as? String, CalendarEventID.isValid(id) else { return .ignore }
+        return .takeNotes(id)
+    }
+
+    /// Handles one response. `forward` hands it to the previous delegate and returns false when there is none (that
+    /// delegate then calls the completion handler itself); `completion` runs otherwise, exactly once.
+    func receive(category: String, action: String, userInfo: [AnyHashable: Any], forward: () -> Bool,
+                 completion: @escaping () -> Void) {
+        switch Self.route(category: category, action: action, userInfo: userInfo) {
+        case .forward:
+            if !forward() { completion() }
+        case .ignore:
+            completion()
+        case .takeNotes(let id):
+            let handler = onTakeNotes
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { handler(id) }
+            } else {
+                Task { @MainActor in handler(id) }
+            }
+            completion()
+        }
+    }
+
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         if notification.request.content.categoryIdentifier == CalendarReminderNames.category {
             completionHandler([.banner, .list, .sound])
             return
         }
-        if let previous = previous,
-           previous.userNotificationCenter?(center, willPresent: notification, withCompletionHandler: completionHandler) != nil {
+        if previous?.userNotificationCenter?(center, willPresent: notification, withCompletionHandler: completionHandler) != nil {
             return
         }
         completionHandler([.banner, .list, .sound])
@@ -815,21 +916,13 @@ final class CalendarNotificationRouter: NSObject, UNUserNotificationCenterDelega
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let content = response.notification.request.content
-        guard content.categoryIdentifier == CalendarReminderNames.category else {
-            if let previous = previous,
-               previous.userNotificationCenter?(center, didReceive: response, withCompletionHandler: completionHandler) != nil {
-                return
-            }
-            completionHandler()
-            return
-        }
-        let action = response.actionIdentifier
-        if let id = content.userInfo[CalendarReminderNames.eventKey] as? String,
-           action == CalendarReminderNames.takeNotesAction || action == UNNotificationDefaultActionIdentifier {
-            let handler = onTakeNotes
-            Task { @MainActor in handler(id) }
-        }
-        completionHandler()
+        let previous = self.previous
+        receive(category: content.categoryIdentifier, action: response.actionIdentifier, userInfo: content.userInfo,
+                forward: {
+                    previous?.userNotificationCenter?(center, didReceive: response,
+                                                      withCompletionHandler: completionHandler) != nil
+                },
+                completion: completionHandler)
     }
 }
 
@@ -863,18 +956,37 @@ final class CalendarStore: ObservableObject {
     /// Accounts the calendars belong to ("iCloud", "Google"), for the Calendar tab's footnote.
     @Published private(set) var accounts: [String] = []
 
+    /// Reminder "Take Notes" taps that arrived before `begin()` or before any window existed (Nib was launched by
+    /// the notification); `begin()` and the next `session.activated` run them.
+    private(set) var pendingTakeNotes: [String] = []
+    /// `begin()`'s first work (queued Take Notes, then a refresh); tests await it.
+    private(set) var startTask: Task<Void, Never>?
+
     private var providerStorage: CalendarProvider?
     private var notifierStorage: NotificationScheduling?
     private var observers: [NSObjectProtocol] = []
     private var providerToken: AnyObject?
     private var router: CalendarNotificationRouter?
+    private var sessionSubscription: EventSubscription?
     private var began = false
     private var lastBackgroundRefresh: Date?
     private var refreshTask: Task<Void, Never>?
+    /// The last reminder rebuild: each rebuild waits for the one before it (see `rescheduleReminders`).
+    private var reminderTask: Task<Void, Never>?
+    /// Links by key (`noteEntry`); `refile` in CalendarCommands.swift invalidates it too.
+    let noteKeys = NoteKeyIndex()
+    private var noteKeysToken: NSObjectProtocol?
 
     init(app: NibApp, cache: CalendarEventCache? = nil) {
         self.app = app
         self.cache = cache ?? CalendarEventCache(fileURL: NibApp.isHostlessTest ? nil : CalendarEventCache.defaultURL)
+        // Synchronous (queue nil), so a link written by a command is found by key right after it.
+        let index = noteKeys
+        noteKeysToken = NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: app.settings,
+                                                               queue: nil) { note in
+            let name = note.userInfo?["name"] as? String ?? CalendarSettings.notesPrefix
+            if name.hasPrefix(CalendarSettings.notesPrefix) { index.invalidate() }
+        }
     }
 
     /// EventKit in the app; `unavailable` in hostless package tests. Tests assign a fake.
@@ -903,12 +1015,14 @@ final class CalendarStore: ObservableObject {
 
     // MARK: Start
 
-    /// `FeatCalendarFeature.start`: observes settings, app activation and the calendar database, installs the
-    /// reminder router, refreshes the next seven days (only when access was already granted; never prompts) and
-    /// reschedules reminders.
+    /// `FeatCalendarFeature.start`: reads the cache file off the main actor, observes settings, app activation, window
+    /// activation and the calendar database, runs Take Notes taps that arrived before it, refreshes the next seven
+    /// days (only when access was already granted; never prompts) and reschedules reminders.
     func begin() {
         guard !began, let app = app else { return }
         began = true
+        let cache = self.cache
+        Task.detached(priority: .utility) { cache.preload() }
         refreshAccess()
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: SettingsStore.didChange, object: app.settings, queue: .main) { [weak self] note in
@@ -918,16 +1032,49 @@ final class CalendarStore: ObservableObject {
         observers.append(center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.appBecameActive() }
         })
-        if !NibApp.isHostlessTest {
-            let notifications = UNUserNotificationCenter.current()
-            let router = CalendarNotificationRouter(previous: notifications.delegate) { [weak self] id in
-                guard let self = self else { return }
-                Task { await self.takeNotes(id, kind: nil, session: self.app?.services.sessions.active) }
-            }
-            notifications.delegate = router
-            self.router = router
+        sessionSubscription = app.events.subscribe { [weak self] event in
+            guard event.type == NibEventType.sessionActivated else { return }
+            Task { @MainActor in await self?.runPendingTakeNotes() }
         }
-        Task { await self.backgroundRefresh(force: true) }
+        startTask = Task {
+            await self.runPendingTakeNotes()
+            await self.backgroundRefresh(force: true)
+        }
+    }
+
+    // MARK: Reminder actions
+
+    /// The router bound to this store's Take Notes queue (`installNotificationRouter` installs it; tests call it).
+    func makeNotificationRouter(previous: UNUserNotificationCenterDelegate?) -> CalendarNotificationRouter {
+        CalendarNotificationRouter(previous: previous) { [weak self] id in self?.reminderTakeNotes(id) }
+    }
+
+    /// `FeatCalendarFeature.register`, inside `didFinishLaunching` (Apple requires the delegate before launch
+    /// finishes, else the response that launched the app is dropped). Chains to the delegate installed before it.
+    func installNotificationRouter() {
+        guard router == nil, !NibApp.isHostlessTest else { return }
+        let notifications = UNUserNotificationCenter.current()
+        let router = makeNotificationRouter(previous: notifications.delegate)
+        notifications.delegate = router
+        self.router = router
+    }
+
+    /// A reminder's Take Notes: runs now when the feature has started and a window exists, else waits in
+    /// `pendingTakeNotes`.
+    func reminderTakeNotes(_ event: String) {
+        guard began, let session = app?.services.sessions.active else {
+            if !pendingTakeNotes.contains(event) { pendingTakeNotes.append(event) }
+            return
+        }
+        Task { await self.takeNotes(event, kind: nil, session: session) }
+    }
+
+    /// Runs the queued Take Notes once the feature has started and a window exists.
+    func runPendingTakeNotes() async {
+        guard began, !pendingTakeNotes.isEmpty, let session = app?.services.sessions.active else { return }
+        let events = pendingTakeNotes
+        pendingTakeNotes = []
+        for event in events { await takeNotes(event, kind: nil, session: session) }
     }
 
     func refreshAccess() {
@@ -963,10 +1110,12 @@ final class CalendarStore: ObservableObject {
     }
 
     /// Re-reads the next seven days when access is granted (at most every five minutes unless forced) and
-    /// reschedules reminders. Never prompts.
+    /// reschedules reminders. Never prompts. Also asks iOS for the next background refresh (`CalendarIDs.refreshTask`),
+    /// so reminders cover meetings added while Nib is not open.
     func backgroundRefresh(force: Bool) async {
         refreshAccess()
         if access == .granted {
+            app?.scheduleBackgroundTask(CalendarIDs.refreshTask, earliestIn: CalendarIDs.refreshInterval)
             let now = Date()
             if force || lastBackgroundRefresh.map({ now.timeIntervalSince($0) > 300 }) ?? true {
                 lastBackgroundRefresh = now
@@ -1037,7 +1186,8 @@ final class CalendarStore: ObservableObject {
         return events
     }
 
-    /// The event with `id`: the cache first, else the calendar around the day its id names (never prompts).
+    /// The event with `id`: the cache first, else the calendar around the day its id names (never prompts). The read
+    /// is searched before the cache, because the cache drops events beyond its horizon (a day picked far away).
     func event(id: String, principal: Principal) async throws -> CalendarEvent {
         if let e = cache.event(id) { return e }
         guard provider.access == .granted else {
@@ -1049,7 +1199,9 @@ final class CalendarStore: ObservableObject {
             throw NibError(.invalidParams, "'\(id)' is not a calendar event id", path: "$.event",
                            hint: "use an id returned by calendar.events")
         }
-        _ = try await fetch(from: day.addingTimeInterval(-86_400), to: day.addingTimeInterval(2 * 86_400), principal: principal)
+        let read = try await fetch(from: day.addingTimeInterval(-86_400), to: day.addingTimeInterval(2 * 86_400),
+                                   principal: principal)
+        if let e = read.first(where: { $0.id == id }) { return e }
         guard let e = cache.event(id) else {
             throw NibError(.notFound, "calendar event \(id) not found", hint: "call calendar.events for that day")
         }
@@ -1131,18 +1283,47 @@ final class CalendarStore: ObservableObject {
 
     // MARK: Notes
 
-    func noteLink(for event: String) -> NoteLink? {
-        guard CalendarEventID.isValid(event), let json = app?.settings.json(CalendarSettings.noteName(event)),
-              json != .null else { return nil }
+    /// Where the link of `event` is stored: its own `calendar.notes.<id>`, or, when the event was moved (new id, same
+    /// key), the entry another id of the same event holds. `key` defaults to the cached event's key.
+    func noteEntry(for event: String, key: String? = nil) -> (name: String, link: NoteLink)? {
+        guard CalendarEventID.isValid(event), let settings = app?.settings else { return nil }
+        let own = CalendarSettings.noteName(event)
+        if let link = Self.link(settings.json(own)) { return (own, link) }
+        guard let k = key ?? cache.event(event)?.key,
+              let name = noteKeys.name(for: k, build: { Self.keyIndex(settings) }), name != own,
+              let link = Self.link(settings.json(name)), link.key == k else { return nil }
+        return (name, link)
+    }
+
+    func noteLink(for event: String, key: String? = nil) -> NoteLink? { noteEntry(for: event, key: key)?.link }
+
+    /// The linked note when its document is still in the library (not trashed).
+    func liveNote(for event: String, key: String? = nil) -> (link: NoteLink, doc: DocumentID)? {
+        guard let link = noteLink(for: event, key: key), let doc = liveDocument(link) else { return nil }
+        return (link, doc)
+    }
+
+    /// The link's document when it is still in the library (not trashed).
+    func liveDocument(_ link: NoteLink) -> DocumentID? {
+        let doc = link.documentID
+        guard let library = app?.services.library, let node = library.node(doc), node.trashedAt == nil else { return nil }
+        return doc
+    }
+
+    private static func link(_ json: JSONValue?) -> NoteLink? {
+        guard let json = json, json != .null else { return nil }
         return try? json.decode(NoteLink.self)
     }
 
-    /// The linked note when its document is still in the library (not trashed).
-    func liveNote(for event: String) -> (link: NoteLink, doc: DocumentID)? {
-        guard let link = noteLink(for: event) else { return nil }
-        let doc = link.documentID
-        guard let library = app?.services.library, let node = library.node(doc), node.trashedAt == nil else { return nil }
-        return (link, doc)
+    /// Every stored link's key → its setting name (the newest link wins when two carry one key).
+    private static func keyIndex(_ settings: SettingsStore) -> [String: String] {
+        var best: [String: (name: String, created: Double)] = [:]
+        for name in settings.names(prefix: CalendarSettings.notesPrefix) {
+            guard let link = link(settings.json(name)), let key = link.key else { continue }
+            if let current = best[key], current.created >= link.created { continue }
+            best[key] = (name, link.created)
+        }
+        return best.mapValues { $0.name }
     }
 
     /// Take Notes (the Calendar tab and the reminder action): opens the event's note, creating it first when there is
@@ -1171,7 +1352,19 @@ final class CalendarStore: ObservableObject {
     // MARK: Reminders
 
     /// Rebuilds the reminders for the next week from the cache (none when the setting is 0 or access is missing).
+    /// Rebuilds run one at a time, in call order: each waits for the previous one before it reads the setting, so a
+    /// rebuild that read "10 minutes" can never add its reminders after a later one turned them off.
     func rescheduleReminders() async {
+        let previous = reminderTask
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            await self?.applyReminders()
+        }
+        reminderTask = task
+        await task.value
+    }
+
+    private func applyReminders() async {
         guard let app = app else { return }
         let minutes = app.settings.get(CalendarSettings.reminderMinutes)
         let notifier = self.notifier

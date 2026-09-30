@@ -21,6 +21,15 @@ public enum FeatCalendarFeature: NibFeature {
         let store = CalendarStore(app: app)
         app.services.set(store, for: CalendarStore.serviceKey)
         CalendarSettings.declare(app.settings, owner: id)
+        // Here, not in `start`: `register` runs inside didFinishLaunching, and a notification delegate set later misses
+        // the Take Notes response that launched Nib. No-op in hostless tests.
+        store.installNotificationRouter()
+        app.content.backgroundTasks.register(BackgroundTaskDescriptor(
+            id: CalendarIDs.refreshTask, kind: .refresh, owner: id) { [weak store] _ in
+                guard let store = store else { return false }
+                await store.backgroundRefresh(force: true)
+                return !Task.isCancelled
+            })
 
         app.commands.register(CalendarEvents.self)
         app.commands.register(CalendarCreateNote.self)
@@ -41,7 +50,7 @@ public enum FeatCalendarFeature: NibFeature {
         app.ui.settingsPages.register(page)
     }
 
-    /// Observers, the reminder router and a refresh of the next seven days (only when access was already granted).
+    /// Observers, queued Take Notes and a refresh of the next seven days (only when access was already granted).
     public static func start(_ app: NibApp) async {
         CalendarStore.shared(app)?.begin()
     }

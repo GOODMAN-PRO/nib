@@ -23,6 +23,8 @@ struct EventJSON: Codable, Equatable {
     var rsvp: RSVPStatus
     var status: CalendarEventStatus
     var recurring: Bool
+    /// Stays the same when the event is moved (its id changes): what keeps a note linked to it.
+    var key: String?
     /// The linked note ("doc:D"), when the event has one in the library.
     var note: String?
 
@@ -41,6 +43,7 @@ struct EventJSON: Codable, Equatable {
         rsvp = e.rsvp
         status = e.status
         recurring = e.recurring
+        key = e.key
         self.note = note
     }
 
@@ -49,7 +52,7 @@ struct EventJSON: Codable, Equatable {
         guard let s = CalendarDates.parse(start), let e = CalendarDates.parse(end) else { return nil }
         return CalendarEvent(id: id, title: title, start: s, end: max(e, s), allDay: allDay, location: location,
                              notes: notes, url: url, calendar: calendar, attendees: attendees, organizer: organizer,
-                             rsvp: rsvp, status: status, recurring: recurring)
+                             rsvp: rsvp, status: status, recurring: recurring, key: key)
     }
 }
 
@@ -117,7 +120,7 @@ struct CalendarEvents: NibCommand {
         var index = offset
         while index < events.count && page.count < limit {
             let e = events[index]
-            let json = EventJSON(e, note: store.liveNote(for: e.id).map { NodeRef.document($0.doc).description })
+            let json = EventJSON(e, note: store.liveNote(for: e.id, key: e.key).map { NodeRef.document($0.doc).description })
             let size = (try? encoder.encode(json).count) ?? 0
             if !page.isEmpty && bytes + size > pageBytes { break }
             page.append(json)
@@ -195,9 +198,11 @@ struct CalendarCreateNote: NibCommand {
         let store = try CalendarStore.require(ctx)
         let event = try await store.event(id: p.event, principal: ctx.principal)
         let library = try ctx.services.require(ctx.services.library, "the library")
-        if let existing = store.liveNote(for: event.id) {
-            let node = library.node(existing.doc)
-            return Output(ref: NodeRef.document(existing.doc).description, title: node?.title ?? existing.link.title,
+        if let entry = store.noteEntry(for: event.id, key: event.key), let doc = store.liveDocument(entry.link) {
+            // Moved events find their note through the key; the link then moves to the event's new id.
+            if !ctx.dryRun { try store.refile(entry, to: event.id, start: event.start, settings: ctx.services.settings) }
+            let node = library.node(doc)
+            return Output(ref: NodeRef.document(doc).description, title: node?.title ?? entry.link.title,
                           folder: node?.parent.map { NodeRef.folder($0).description }, event: event.id, created: false,
                           pages: nil, blocks: nil)
         }
@@ -227,7 +232,7 @@ struct CalendarCreateNote: NibCommand {
         }
         let title = library.node(created)?.title ?? path.document
         let link = NoteLink(doc: NodeRef.document(created).description, title: title, kind: kind.rawValue,
-                            start: CalendarDates.iso(event.start), created: Date().timeIntervalSince1970)
+                            start: CalendarDates.iso(event.start), created: Date().timeIntervalSince1970, key: event.key)
         ctx.services.settings.setJSON(CalendarSettings.noteName(event.id), try JSONValue.from(link))
         return output(content, id: created, title: title, folder: NodeRef.folder(eventFolder).description, event: event.id)
     }
@@ -284,24 +289,48 @@ struct CalendarOpenNote: NibCommand {
                            hint: "use an id returned by calendar.events")
         }
         let store = try CalendarStore.require(ctx)
-        guard store.noteLink(for: p.event) != nil else {
+        var entry = store.noteEntry(for: p.event)
+        var event = store.cache.event(p.event)
+        if entry == nil, event == nil, store.access == .granted {
+            // Not cached: read the event for its key (a moved event's note is filed under its old id). Never prompts.
+            event = try? await store.event(id: p.event, principal: ctx.principal)
+            entry = store.noteEntry(for: p.event, key: event?.key)
+        }
+        guard let found = entry else {
             throw NibError(.notFound, "calendar event \(p.event) has no note",
                            hint: "create one with calendar.createNote {event, kind}")
         }
-        guard let live = store.liveNote(for: p.event) else {
+        guard let doc = store.liveDocument(found.link) else {
             throw NibError(.notFound, "the note of calendar event \(p.event) was deleted or moved to Trash",
                            hint: "create a new one with calendar.createNote {event, kind}")
         }
-        let ref = NodeRef.document(live.doc).description
+        if !ctx.dryRun { try store.refile(found, to: p.event, start: event?.start, settings: ctx.services.settings) }
+        let ref = NodeRef.document(doc).description
         do {
             _ = try await ctx.execute(CommandIDs.docOpen, ["doc": .string(ref)])
             return Output(ref: ref, opened: true)
         } catch let e as NibError where e.code == .unavailable {
             // Tabs & Windows (doc.open) is not installed: open it in the invoking window directly.
             guard let navigator = ctx.navigator else { return Output(ref: ref, opened: false) }
-            navigator.openDocument(live.doc, page: nil, mode: .replace)
+            navigator.openDocument(doc, page: nil, mode: .replace)
             return Output(ref: ref, opened: true)
         }
+    }
+}
+
+// MARK: - Moved events
+
+extension CalendarStore {
+    /// A link found through the event's key (the event moved) is re-filed under the event's current id and the old
+    /// name is removed, so the next lookup is direct. `calendar.createNote` and `calendar.openNote` call it.
+    func refile(_ entry: (name: String, link: NoteLink), to event: String, start: Date?, settings: SettingsStore) throws {
+        let name = CalendarSettings.noteName(event)
+        guard entry.name != name else { return }
+        var link = entry.link
+        if let start = start { link.start = CalendarDates.iso(start) }
+        settings.setJSON(name, try JSONValue.from(link))
+        settings.setJSON(entry.name, nil)
+        noteKeys.invalidate()
     }
 }
 

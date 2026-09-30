@@ -17,6 +17,11 @@ enum CalendarIDs {
     /// ⇧⌥⌘R: Sync Calendar Events (⌥⌘R is Read Only, ⇧⌘R recording).
     static let syncShortcut = KeyShortcut("r", [.command, .option, .shift])
     static let swiftUISyncShortcut = KeyboardShortcut("r", modifiers: [.command, .option, .shift])
+    /// Background app refresh: re-reads the next week and reschedules reminders while Nib is not open.
+    /// ponytail: the id is not in project.yml's permitted background task ids yet (contract request
+    /// F075-calendar-refresh), so iOS refuses the request and reminders only cover events read while Nib was open.
+    static let refreshTask = "app.nib.calendar"
+    static let refreshInterval: TimeInterval = 6 * 3_600
 }
 
 // MARK: - Planner pages
@@ -451,7 +456,7 @@ struct CalendarEventList: View {
     var body: some View {
         VStack(spacing: 0) {
             ForEach(Array(events.enumerated()), id: \.element.id) { index, event in
-                let live = store.liveNote(for: event.id)
+                let live = store.liveNote(for: event.id, key: event.key)
                 CalendarEventRow(event: event, noteKind: live.flatMap { DocumentKind(rawValue: $0.link.kind) },
                                  hasNote: live != nil, isBusy: busy.contains(event.id),
                                  onTakeNotes: { kind in run(event.id) { await store.takeNotes(event.id, kind: kind, session: session) } },
@@ -464,7 +469,6 @@ struct CalendarEventList: View {
                 }
             }
         }
-        .id(store.revision)
     }
 
     private func run(_ id: String, _ work: @escaping () async -> Void) {
@@ -508,7 +512,7 @@ struct CalendarEventRow: View {
 
     private var summary: some View {
         HStack(alignment: .top, spacing: NibSpacing.m) {
-            VStack(alignment: .trailing, spacing: 2) {
+            VStack(alignment: .trailing, spacing: NibSpacing.xxs) {
                 if event.allDay {
                     Text(String(localized: "All day"))
                         .font(NibFont.footnoteEmphasis)
@@ -524,7 +528,7 @@ struct CalendarEventRow: View {
             }
             .monospacedDigit()
             .frame(width: typeSize.isAccessibilitySize ? nil : timeWidth, alignment: .trailing)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: NibSpacing.xxs) {
                 Text(title)
                     .font(NibFont.body)
                     .foregroundStyle(event.isDeclined ? NibColor.labelSecondary : NibColor.label)
@@ -537,10 +541,10 @@ struct CalendarEventRow: View {
             }
             .padding(.leading, NibSpacing.m)
             .overlay(alignment: .leading) {
-                // The calendar's colour (the person's own colour, like a folder's): a 4 pt bar as tall as the text.
+                // The calendar's colour (the person's own colour, like a folder's): a thin bar as tall as the text.
                 Capsule()
                     .fill(Color(uiColor: event.colour.withAlpha(1).uiColor))
-                    .frame(width: 4)
+                    .frame(width: NibSpacing.xs)
                     .opacity(event.isDeclined ? NibOpacity.disabled : 1)
                     .accessibilityHidden(true)
             }
@@ -870,7 +874,7 @@ struct CalendarSettingsPage: View {
             } header: {
                 Text(String(localized: "Reminders"))
             } footer: {
-                Text(String(localized: "A notification before each timed event in the next week, with Take Notes to open its note."))
+                Text(String(localized: "A notification before each timed event in the next week, with Take Notes to open its note. Reminders cover the events Nib read when it was last open, so open Nib now and then to pick up new meetings."))
             }
             Section {
                 Picker(String(localized: "Take Notes In"), selection: kindBinding) {
