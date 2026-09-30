@@ -72,8 +72,8 @@ final class StudySetModel: ObservableObject {
     @Published private var drafts: [SideKey: String] = [:]
     /// Presents a panel itself when no panel host (the document chrome) is installed.
     var presentPanel: ((PanelDescriptor) -> Void)?
-    /// Undo groups of this editor's own text commits (each typing pause is its own undo step: `DocTransaction.revert`
-    /// skips a record's earlier writes once a later write in the same group is reverted, so groups are never shared).
+    /// Undo groups of this editor's own text commits, so a commit from anywhere else (undo, sync, the AI) replaces the
+    /// drafts it touches. Each typing pause is its own undo step, as in the other text editors.
     private var ownGroups = Set<String>()
     private var pendingCommit: Task<Void, Never>?
     private var observation: CommitObservation?
@@ -81,16 +81,6 @@ final class StudySetModel: ObservableObject {
     /// Decoded pictures (slot-sized) and rendered freeform sides, bounded by bitmap bytes.
     private let pictures = NSCache<NSString, UIImage>()
     private let inkPictures = NSCache<NSString, UIImage>()
-    /// `card.moveTo` writes two sets and each keeps its own undo stack: the sets of each move this editor made, by
-    /// undo group, so undoing or redoing it in either set does the same in the other.
-    private var moves: [String: [DocumentID]] = [:]
-    /// A set's undo stack right after a move was undone there; its redo is mirrored only while the stack is unchanged.
-    private var undoneMoves: [String: [DocumentID: UndoMark]] = [:]
-
-    struct UndoMark: Equatable {
-        var depth: Int
-        var top: String?
-    }
 
     static let newCardShortcut = KeyboardShortcut(.return, modifiers: .command)
 
@@ -102,7 +92,10 @@ final class StudySetModel: ObservableObject {
         inkPictures.totalCostLimit = 16 << 20
         reload()
         observation = CommitObservation(app.bus.observeCommits { [weak self] cs in self?.didCommit(cs) })
-        readOnlyWatch = session.$readOnly.sink { [weak self] value in self?.readOnly = value }
+        readOnlyWatch = session.$readOnly.sink { [weak self] value in
+            guard let self else { return }
+            self.readOnly = value || self.app.isReadOnly(self.doc)
+        }
     }
 
     var docRef: String { NodeRef.document(doc).description }
@@ -123,6 +116,9 @@ final class StudySetModel: ObservableObject {
         let oldIndex = current.flatMap { index($0) }
         cards = content.liveCards
         language = content.meta.language
+        // A set Nib must not write (saved by a newer Nib, files that cannot be written) is shown read-only (G2).
+        let locked = session.readOnly || app.isReadOnly(doc)
+        if readOnly != locked { readOnly = locked }
         if let c = current, index(c) == nil {
             current = cards.isEmpty ? nil : cards[min(oldIndex ?? 0, cards.count - 1)].id
         }
@@ -136,7 +132,6 @@ final class StudySetModel: ObservableObject {
     /// Any commit touching this set: refresh. A change that is not this editor's own typing (undo, sync, a
     /// collaborator, the AI, a plugin, a picture or stroke) replaces the drafts and input modes of the sides it changed.
     func didCommit(_ cs: Changeset) {
-        mirrorMoveUndo(cs)
         guard cs.documents.contains(doc) else { return }
         if !ownGroups.contains(cs.group) {
             var touched = Set<SideKey>()
@@ -151,36 +146,6 @@ final class StudySetModel: ObservableObject {
             }
         }
         reload()
-    }
-
-    /// Undoing (or redoing) one of this editor's moves in one set does the same in the other set, when that set's
-    /// stack still has the move on top (undo) or is as the mirrored undo left it (redo).
-    private func mirrorMoveUndo(_ cs: Changeset) {
-        let undoing = cs.command == CommandIDs.undo
-        guard undoing || cs.command == CommandIDs.redo else { return }
-        let prefix = undoing ? "undo:" : "redo:"
-        guard cs.group.hasPrefix(prefix) else { return }
-        let group = String(cs.group.dropFirst(prefix.count))
-        guard let docs = moves[group] else { return }
-        let history = app.bus.history
-        let others = docs.filter { !cs.documents.contains($0) }
-        if undoing {
-            for d in cs.documents where docs.contains(d) { undoneMoves[group, default: [:]][d] = mark(d) }
-            for other in others where history.entries(other).last?.group == group {
-                app.bus.undo(other)
-            }
-        } else {
-            for d in cs.documents { undoneMoves[group]?[d] = nil }
-            for other in others {
-                guard let m = undoneMoves[group]?[other], m == mark(other), history.canRedo(other) else { continue }
-                app.bus.redo(other)
-            }
-        }
-    }
-
-    private func mark(_ d: DocumentID) -> UndoMark {
-        let entries = app.bus.history.entries(d)
-        return UndoMark(depth: entries.count, top: entries.last?.group)
     }
 
     // MARK: Text
@@ -231,6 +196,15 @@ final class StudySetModel: ObservableObject {
 
     private func focusMoved(from old: CardField?) {
         session.isEditingText = focus != nil
+        // contracts-v2 G15: which card is being edited, for links, spellcheck and the AI's context. SwiftUI's text
+        // field does not report its selection on iOS 17, so no range is claimed.
+        if let f = focus {
+            session.editingTextRef = ref(f.card)
+            session.editingTextRange = nil
+        } else if let old, session.editingTextRef == ref(old.card) {
+            session.editingTextRef = nil
+            session.editingTextRange = nil
+        }
         if let old = old, old.key != focus?.key {
             let key = old.key
             let draft = drafts[key]
@@ -367,14 +341,9 @@ final class StudySetModel: ObservableObject {
         guard !ids.isEmpty, !readOnly else { return }
         await flush()
         if let f = focus, ids.contains(f.card) { focus = nil }
+        // `card.moveTo` links its undo across both sets, so one undo in either restores both.
         let params = CardMoveTo.Params(refs: ids.map { ref($0) }, doc: NodeRef.document(set).description, ids: nil)
-        let group = NibID.make().raw
-        moves[group] = [doc, set]
-        if await run(CardMoveTo.self, params, group: group) != nil {
-            selecting = false
-        } else {
-            moves[group] = nil
-        }
+        if await run(CardMoveTo.self, params) != nil { selecting = false }
     }
 
     func update(_ id: NibID, _ side: CardSide, _ face: CardFace, group: String? = nil) async {
@@ -522,7 +491,7 @@ final class StudySetModel: ObservableObject {
     /// The set's language (recognition, search and read-aloud) belongs to `doc.setLanguage`.
     func setLanguage(_ code: String) {
         guard code != language, !readOnly else { return }
-        app.perform("doc.setLanguage", ["doc": .string(docRef), "language": .string(code)], session: session)
+        app.perform(CommandIDs.docSetLanguage, ["doc": .string(docRef), "language": .string(code)], session: session)
     }
 
     func menuContext(_ id: NibID) -> MenuContext {
@@ -544,17 +513,15 @@ final class StudySetModel: ObservableObject {
         app.perform(item.command, item.params(menuContext(id)), session: session)
     }
 
-    /// Practice and Smart Learn are the study sessions feature's panels (F050), registered under these ids.
-    static let practicePanelID = "studysession.practice"
-    static let smartLearnPanelID = "studysession.smartLearn"
-
+    /// Practice and Smart Learn are the study sessions feature's panels (F050), registered under the well-known ids
+    /// `PanelIDs.studyPractice` and `PanelIDs.studySmartLearn`; each button shows while its panel is registered.
     func studyPanel(_ id: String) -> PanelDescriptor? {
         guard let d = app.ui.panels.get(id), d.docKinds?.contains(.studySet) ?? true else { return nil }
         return d
     }
 
-    var practicePanel: PanelDescriptor? { studyPanel(StudySetModel.practicePanelID) }
-    var smartLearnPanel: PanelDescriptor? { studyPanel(StudySetModel.smartLearnPanelID) }
+    var practicePanel: PanelDescriptor? { studyPanel(PanelIDs.studyPractice) }
+    var smartLearnPanel: PanelDescriptor? { studyPanel(PanelIDs.studySmartLearn) }
     var scratchPanel: PanelDescriptor? { app.ui.panels.get(ScratchPaper.panelID) }
 
     /// `panel.open` through the document chrome; without it, the editor presents the panel itself.
@@ -680,7 +647,10 @@ final class StudySetViewController: UIViewController, DocumentEditing {
 
     // MARK: Keyboard (S-066, DESIGN.md §12): ⇥ / ⇧⇥ between fields, ⌘⏎ New Card, ⎋ stop editing
 
-    // ponytail: editor-contextual shortcuts live here, not in content.keyCommands (static params, no doc-kind filter).
+    // These stay the editor's own UIKeyCommands (contracts-v2.2 Adopt, F049): they must work while a card field is
+    // being edited and depend on the editor's focus and read-only state. As `KeyCommandDescriptor`s a `.canvas` key
+    // is dropped while text is edited, and at `.document` the shell leaves unmodified Tab and Escape to the text
+    // view. ⌘⏎ stays here too: New Card follows the card shown in the pane, which only the editor knows.
     override var canBecomeFirstResponder: Bool { true }
 
     override var keyCommands: [UIKeyCommand]? {
@@ -741,8 +711,9 @@ final class StudySetViewController: UIViewController, DocumentEditing {
     private func showPanel(_ panel: PanelDescriptor) {
         guard panelController == nil else { return }
         weak var shown: UIViewController?
-        let context = PanelContext(app: model.app, session: session, navigator: model.app.ui.activeNavigator,
+        var context = PanelContext(app: model.app, session: session, navigator: model.app.ui.activeNavigator,
                                    dismiss: { shown?.dismiss(animated: true) })
+        context.presentation = panel.placement == .fullScreen ? .fullScreen : .sheet
         let controller = UIHostingController(rootView: panel.makeView(context))
         shown = controller
         switch panel.placement {

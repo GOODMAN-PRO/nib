@@ -41,7 +41,7 @@ struct StudySetEditorView: View {
                         CardListPane(model: model, compact: false)
                         Rectangle()
                             .fill(NibColor.separatorSoft)
-                            .frame(width: 0.5)
+                            .frame(width: NibStroke.hairline)
                             .accessibilityHidden(true)
                         CardEditorPane(model: model)
                             .frame(width: min(CardLayout.paneWidth, proxy.size.width * 0.55))
@@ -75,7 +75,7 @@ struct CardListPane: View {
             StudySetHeader(model: model, onDelete: { confirmsDelete = true }, onMove: { showsMoveSheet = true })
             Rectangle()
                 .fill(NibColor.separatorSoft)
-                .frame(height: 0.5)
+                .frame(height: NibStroke.hairline)
                 .accessibilityHidden(true)
             if model.cards.isEmpty {
                 NibEmptyState(symbol: .studySets, title: String(localized: "No cards yet"),
@@ -356,7 +356,7 @@ struct CardRow: View {
                 SideCell(model: model, card: card, side: .front, compact: compact, focus: focus)
                 Rectangle()
                     .fill(NibColor.separator)
-                    .frame(width: 0.5)
+                    .frame(width: NibStroke.hairline)
                     .frame(maxHeight: .infinity)
                     .accessibilityHidden(true)
                 SideCell(model: model, card: card, side: .back, compact: compact, focus: focus)
@@ -441,7 +441,7 @@ struct FaceThumbnail: View {
         .aspectRatio(CardLayout.aspect, contentMode: .fit)
         .frame(maxWidth: NibMetrics.thumbnailWidth)
         .background(NibPaper.white.color, in: shape)
-        .overlay { shape.strokeBorder(NibColor.separator, lineWidth: 0.5) }
+        .overlay { shape.strokeBorder(NibColor.separator, lineWidth: NibStroke.hairline) }
         .environment(\.colorScheme, .light)
         .accessibilityElement(children: .combine)
         .accessibilityValue(side.title)
@@ -489,16 +489,17 @@ struct CardMenu: View {
 
     var body: some View {
         let items = model.menuItems(card)
+        let context = model.menuContext(card)
         let groups = items.compactMap { $0.submenu }.reduce(into: [String]()) { list, name in
             if !list.contains(name) { list.append(name) }
         }
         ForEach(items.filter { $0.submenu == nil }, id: \.id) { item in
-            MenuEntry(item: item) { model.perform(item, for: card) }
+            MenuEntry(item: item, context: context) { model.perform(item, for: card) }
         }
         ForEach(groups, id: \.self) { group in
             Menu(group) {
                 ForEach(items.filter { $0.submenu == group }, id: \.id) { item in
-                    MenuEntry(item: item) { model.perform(item, for: card) }
+                    MenuEntry(item: item, context: context) { model.perform(item, for: card) }
                 }
             }
         }
@@ -515,18 +516,42 @@ struct CardMenu: View {
     }
 }
 
+/// One `MenuLocation.card` entry as the menu hosts show them (contracts-v2 G16): its title for this card
+/// (`contextTitle`), a checkmark while `isChecked`, and its shortcut as a label (display only: the key itself belongs
+/// to whoever registered it).
 struct MenuEntry: View {
     let item: MenuItemDescriptor
+    let context: MenuContext
     let action: () -> Void
 
     var body: some View {
+        let title = item.resolvedTitle(for: context)
+        let symbol: NibSymbol? = item.isChecked?(context) == true ? .checkmark : item.icon.flatMap { NibSymbol(systemName: $0) }
         Button(role: item.destructive ? .destructive : nil, action: action) {
-            if let symbol = item.icon.flatMap({ NibSymbol(systemName: $0) }) {
-                Label { Text(item.title) } icon: { Image(nib: symbol) }
+            if let symbol {
+                Label { label(title) } icon: { Image(nib: symbol) }
             } else {
-                Text(item.title)
+                label(title)
             }
         }
+        .accessibilityAddTraits(item.isChecked?(context) == true ? .isSelected : [])
+    }
+
+    @ViewBuilder private func label(_ title: String) -> some View {
+        Text(title)
+        if let shortcut = item.shortcut { Text(verbatim: MenuEntry.display(shortcut)) }
+    }
+
+    /// "⌃⌥⇧⌘K" (the modifiers in Apple's order, then the key).
+    static func display(_ shortcut: KeyShortcut) -> String {
+        var out = ""
+        if shortcut.modifiers.contains(.control) { out += "⌃" }
+        if shortcut.modifiers.contains(.option) { out += "⌥" }
+        if shortcut.modifiers.contains(.shift) { out += "⇧" }
+        if shortcut.modifiers.contains(.command) { out += "⌘" }
+        let keys = ["up": "↑", "down": "↓", "left": "←", "right": "→", "escape": "⎋", "delete": "⌫", "tab": "⇥",
+                    "return": "↩", "space": "Space"]
+        return out + (keys[shortcut.key] ?? shortcut.key.uppercased())
     }
 }
 
@@ -689,7 +714,7 @@ struct CardEditorPane: View {
         .background(NibPaper.white.color, in: shape)
         .clipShape(shape)
         .overlay {
-            if targeted { shape.strokeBorder(NibColor.accent, lineWidth: 2) }
+            if targeted { shape.strokeBorder(NibColor.accent, lineWidth: NibStroke.ring) }
         }
         .nibElevation(.rest)
         .environment(\.colorScheme, .light)                        // paper is never inverted
@@ -785,7 +810,7 @@ struct CardEditorPane: View {
                     }
                 }
                 Spacer(minLength: 0)
-                NibButton(String(localized: "Paste"), kind: .secondary, size: .compact) {
+                NibButton(String(localized: "Paste"), symbol: .paste, kind: .secondary, size: .compact) {
                     Task { await model.paste(into: card.id, side: side) }
                 }
             }
@@ -912,12 +937,15 @@ struct InkCanvas: UIViewRepresentable {
 enum ScratchPaper {
     static let panelID = "studyeditor.scratch"
 
+    /// The sheet draws its own header (with "Not saved"), so the chrome adds none (contracts-v2 `providesHeader`).
     @MainActor
     static func descriptor(owner: String) -> PanelDescriptor {
-        PanelDescriptor(id: panelID, title: String(localized: "Scratch Paper"), icon: NibSymbol.quickNote.name,
-                        placement: .floating, order: 600, owner: owner, docKinds: [.studySet]) { context in
+        var descriptor = PanelDescriptor(id: panelID, title: String(localized: "Scratch Paper"), icon: NibSymbol.quickNote.name,
+                                         placement: .floating, order: 600, owner: owner, docKinds: [.studySet]) { context in
             AnyView(ScratchPaperView(paper: ScratchPaper.paper(context.app), onClose: context.dismiss))
         }
+        descriptor.providesHeader = true
+        return descriptor
     }
 
     /// The default template's paper colour, without its rules.
@@ -999,15 +1027,10 @@ struct ScratchPaperView: View {
 
 // MARK: - Paste and drop
 
-/// A lasso copy (`app.nib.fragment`: {format, items, assets: {name: base64}, bounds}).
-struct CardFragment {
-    var items: [Item]
-    var assets: [String: Data]
-}
-
 /// What a paste or a drop offers: a Nib fragment, picture bytes, plain text (any combination).
 struct PastedContent {
-    var fragment: CardFragment?
+    /// A lasso copy or drag (`NibFragment`, "nib-fragment/1").
+    var fragment: NibFragment?
     var image: Data?
     var text: String?
 
@@ -1027,20 +1050,16 @@ struct PastedContent {
 }
 
 enum CardPaste {
-    static let fragmentType = "app.nib.fragment"
+    static let fragmentType = NibFragment.typeIdentifier
 
     /// The app exports `app.nib.fragment` (project.yml, conforms to public.json).
     static var dropTypes: [UTType] { [UTType(exportedAs: fragmentType, conformingTo: .json), .image, .plainText] }
 
-    static func fragment(from data: Data) -> CardFragment? {
-        guard let json = try? JSONDecoder().decode(JSONValue.self, from: data),
-              json["format"]?.stringValue?.hasPrefix("nib-fragment/") == true,
-              let items = try? (json["items"] ?? .array([])).decode([Item].self) else { return nil }
-        var assets: [String: Data] = [:]
-        for (name, value) in json["assets"]?.objectValue ?? [:] {
-            if let base64 = value.stringValue, let bytes = Data(base64Encoded: base64) { assets[name] = bytes }
-        }
-        return CardFragment(items: items.filter { !$0.deleted }, assets: assets)
+    /// The live items of fragment JSON (`NibFragment.decode`); nil when it cannot be read or carries none.
+    static func fragment(from data: Data) -> NibFragment? {
+        guard var fragment = try? NibFragment.decode(data) else { return nil }
+        fragment.items = fragment.items.filter { !$0.deleted }
+        return fragment.items.isEmpty ? nil : fragment
     }
 
     /// The side's input mode wins when the content can fill it; otherwise the closest thing it carries.
@@ -1074,7 +1093,7 @@ enum CardPaste {
 
     /// A lassoed picture's own bytes, else the lassoed ink rendered on transparent paper: at 2× for a small lasso,
     /// never more than `CardImages.maxPixels` on its long edge (a lasso on a whiteboard can span thousands of points).
-    static func imageData(from fragment: CardFragment) -> Data? {
+    static func imageData(from fragment: NibFragment) -> Data? {
         for item in fragment.items {
             if let name = item.image?.asset.name, let bytes = fragment.assets[name] { return bytes }
         }

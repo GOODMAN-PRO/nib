@@ -253,7 +253,9 @@ struct CardTarget {
 
 @MainActor
 enum CardRefs {
-    /// A study set from "doc:D", any ref inside it, or a bare id.
+    /// A study set from "doc:D", any ref inside it, or a bare id, that Nib may write: every card command changes it.
+    /// A set saved by a newer Nib, or whose files cannot be written (`ctx.isReadOnly`, contracts-v2 G2), is refused
+    /// for every caller.
     static func studySet(_ string: String, _ ctx: CommandContext, path: String) throws -> DocumentID {
         let doc = NodeRef.documentID(from: string)
         guard let content = try? ctx.workspace.content(doc) else {
@@ -261,6 +263,10 @@ enum CardRefs {
         }
         guard content.meta.kind == .studySet else {
             throw NibError.invalid("doc:\(doc.raw) is a \(content.meta.kind.rawValue), not a study set", path: path)
+        }
+        guard !ctx.isReadOnly(doc) else {
+            throw NibError(.unsupported, "doc:\(doc.raw) is read-only", path: path,
+                           hint: "the study set was saved by a newer version of Nib or its files cannot be written")
         }
         return doc
     }
@@ -276,12 +282,42 @@ enum CardRefs {
     static func cards(_ refs: [String], _ ctx: CommandContext) throws -> [CardTarget] {
         guard !refs.isEmpty else { throw NibError.invalid("give at least one card ref", path: "$.refs") }
         var seen = Set<String>()
+        var sets = Set<DocumentID>()
         var out: [CardTarget] = []
         for (n, ref) in refs.enumerated() {
             let t = try card(ref, path: "$.refs[\(n)]")
             guard seen.insert(t.doc.raw + "/" + t.id.raw).inserted else { continue }
-            _ = try studySet(t.doc.raw, ctx, path: t.path)
+            if sets.insert(t.doc).inserted { _ = try studySet(t.doc.raw, ctx, path: t.path) }
             out.append(t)
+        }
+        return out
+    }
+
+    /// The live cards the targets name, in target order, reading each set's cards once (so a command over a large
+    /// selection stays linear).
+    static func live(_ targets: [CardTarget], _ tx: DocTransaction) throws -> [StudyCard] {
+        try live(targets) { try tx.content($0) }
+    }
+
+    /// The same, read outside a transaction (before the asset copy of `card.moveTo`).
+    static func live(_ targets: [CardTarget], _ ctx: CommandContext) throws -> [StudyCard] {
+        try live(targets) { try ctx.workspace.content($0) }
+    }
+
+    private static func live(_ targets: [CardTarget], content: (DocumentID) throws -> DocumentContent) throws -> [StudyCard] {
+        var byDoc: [DocumentID: [NibID: StudyCard]] = [:]
+        var out: [StudyCard] = []
+        out.reserveCapacity(targets.count)
+        for t in targets {
+            if byDoc[t.doc] == nil {
+                let cards = try content(t.doc).liveCards
+                byDoc[t.doc] = Dictionary(cards.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            }
+            guard let card = byDoc[t.doc]?[t.id] else {
+                throw NibError(.notFound, "card \(t.id.raw) not found in doc:\(t.doc.raw)", path: t.path,
+                               hint: "call query.get {\"ref\": \"doc:\(t.doc.raw)\"} to list its cards")
+            }
+            out.append(card)
         }
         return out
     }
@@ -308,9 +344,7 @@ enum CardRefs {
 
     /// The live card a target names.
     static func live(_ t: CardTarget, _ tx: DocTransaction) throws -> StudyCard {
-        let live = try tx.content(t.doc).liveCards
-        let i = try index(of: t.id, in: live, doc: t.doc, path: t.path)
-        return live[i]
+        try live([t], tx)[0]
     }
 }
 
@@ -318,7 +352,8 @@ enum CardRefs {
 enum CardOrder {
     /// The key for a card placed at `index` among `orders` (live cards in display order, without that card), plus new
     /// keys (by index) for existing cards when theirs cannot bracket a new one: empty or out-of-order keys left by raw
-    /// inserts or merges. Then every key comes from one fresh increasing sequence.
+    /// inserts or merges. Then every key comes from one fresh set of balanced keys (`FractionalIndex.balanced`, a few
+    /// characters long even for a large set).
     static func place(at index: Int, among orders: [String]) -> (key: String, rekeyed: [Int: String]) {
         let i = min(max(index, 0), orders.count)
         let prev = i > 0 ? orders[i - 1] : nil
@@ -326,7 +361,7 @@ enum CardOrder {
         var usable = prev?.isEmpty != true && next?.isEmpty != true
         if usable, let p = prev, let n = next { usable = p < n }
         if usable { return (FractionalIndex.between(prev, next), [:]) }
-        let keys = FractionalIndex.sequence(after: nil, count: orders.count + 1)
+        let keys = FractionalIndex.balanced(count: orders.count + 1)
         var rekeyed: [Int: String] = [:]
         for (j, old) in orders.enumerated() {
             let key = keys[j < i ? j : j + 1]
@@ -335,13 +370,16 @@ enum CardOrder {
         return (keys[i], rekeyed)
     }
 
+    /// Writes the new keys in one batch (contracts-v2 G5: linear to write, undo and redo).
     @MainActor
     static func apply(_ rekeyed: [Int: String], to cards: [StudyCard], doc: DocumentID, tx: DocTransaction) throws {
-        for (j, key) in rekeyed.sorted(by: { $0.key < $1.key }) {
+        guard !rekeyed.isEmpty else { return }
+        let changed = rekeyed.sorted(by: { $0.key < $1.key }).map { j, key -> StudyCard in
             var card = cards[j]
             card.order = key
-            try tx.put(card, doc: doc)
+            return card
         }
+        try tx.put(changed, doc: doc)
     }
 }
 
@@ -451,11 +489,17 @@ struct CardDelete: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
         let targets = try CardRefs.cards(p.refs, ctx)
         try ctx.mutate { tx in
-            for t in targets {
-                var card = try CardRefs.live(t, tx)
+            // One batch write per set (contracts-v2 G5), so deleting a large selection stays linear.
+            var gone: [DocumentID: [StudyCard]] = [:]
+            var sets: [DocumentID] = []
+            let cards = try CardRefs.live(targets, tx)
+            for (t, live) in zip(targets, cards) {
+                var card = live
                 card.deleted = true
-                try tx.put(card, doc: t.doc)
+                if gone[t.doc] == nil { sets.append(t.doc) }
+                gone[t.doc, default: []].append(card)
             }
+            for doc in sets { try tx.put(gone[doc] ?? [], doc: doc) }
         }
         return NoResult()
     }
@@ -512,7 +556,7 @@ struct CardMoveTo: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "card.moveTo", title: "Move Cards to Study Set",
-        summary: "Move cards to another study set, appended at its end (images copied, practice progress kept); returns the new card refs.",
+        summary: "Move cards to another study set, appended at its end (images copied, practice progress kept; one undo in either set restores both); returns the new card refs.",
         params: .obj(["refs": .arr(.ref), "doc": .ref,
                       "ids": .arr(.str(), "your own ids for the moved cards, one per ref (cards already in the set keep theirs)")],
                      required: ["refs", "doc"]),
@@ -533,9 +577,9 @@ struct CardMoveTo: NibCommand {
         // deduplicated, so a rollback leaves nothing inconsistent.
         var pending: [(src: DocumentID, asset: AssetRef)] = []
         var queued = Set<String>()
-        for t in targets where t.doc != dest {
-            let live = try ctx.workspace.content(t.doc).liveCards
-            let card = live[try CardRefs.index(of: t.id, in: live, doc: t.doc, path: t.path)]
+        let leaving = targets.filter { $0.doc != dest }
+        let leavingCards = try CardRefs.live(leaving, ctx)
+        for (t, card) in zip(leaving, leavingCards) {
             for asset in [card.front.asset, card.back.asset].compactMap({ $0 }) where queued.insert(t.doc.raw + "/" + asset.name).inserted {
                 pending.append((t.doc, asset))
             }
@@ -548,23 +592,30 @@ struct CardMoveTo: NibCommand {
             if let a = f.asset, let moved = assets[src.raw + "/" + a.name] { f.asset = moved }
             return f
         }
+        // A move between two sets is one undo step in both (contracts-v2 G4): undoing it in either set, from any
+        // window or caller, restores both, and so does redo.
+        if !leaving.isEmpty { ctx.linkUndoAcrossDocuments() }
         let refs = try ctx.mutate { tx -> [String] in
-            var last = try tx.content(dest).liveCards.last?.order
+            let destCards = try tx.content(dest).liveCards
+            var taken = Set(destCards.map { $0.id })
+            let orders = FractionalIndex.balanced(count: targets.count, after: destCards.last?.order)
+            var arriving: [StudyCard] = []
+            var gone: [DocumentID: [StudyCard]] = [:]
+            var sources: [DocumentID] = []
             var out: [String] = []
-            for (n, t) in targets.enumerated() {
-                var card = try CardRefs.live(t, tx)
-                let order = FractionalIndex.between(last, nil)
-                last = order
+            let moving = try CardRefs.live(targets, tx)
+            for (n, (t, card)) in zip(targets, moving).enumerated() {
                 if t.doc == dest {
-                    card.order = order
-                    try tx.put(card, doc: dest)
+                    var kept = card
+                    kept.order = orders[n]
+                    arriving.append(kept)
                     out.append(NodeRef.card(dest, card.id).description)
                     continue
                 }
-                var gone = card
-                gone.deleted = true
-                try tx.put(gone, doc: t.doc)
-                let taken = try Set(tx.content(dest).liveCards.map { $0.id })
+                var tombstone = card
+                tombstone.deleted = true
+                if gone[t.doc] == nil { sources.append(t.doc) }
+                gone[t.doc, default: []].append(tombstone)
                 var id = card.id
                 if let ids = p.ids {
                     id = NibID(ids[n])
@@ -574,12 +625,16 @@ struct CardMoveTo: NibCommand {
                 } else if taken.contains(id) {
                     id = NibID.make()
                 }
+                taken.insert(id)
                 var moved = StudyCard(id: id, front: remap(card.front, from: t.doc), back: remap(card.back, from: t.doc),
-                                      order: order)
+                                      order: orders[n])
                 moved.srs = card.srs
-                try tx.put(moved, doc: dest)
+                arriving.append(moved)
                 out.append(NodeRef.card(dest, id).description)
             }
+            // One batch write per set (contracts-v2 G5): moving a large selection stays linear to write and undo.
+            for source in sources { try tx.put(gone[source] ?? [], doc: source) }
+            try tx.put(arriving, doc: dest)
             return out
         }
         return Output(refs: refs)

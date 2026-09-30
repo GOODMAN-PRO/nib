@@ -31,25 +31,25 @@ enum StudyEditorMenus {
         menus.register(MenuItemDescriptor(
             id: "studyeditor.new", title: String(localized: "Study Set"), icon: NibSymbol.studySets.name,
             location: .libraryNew, order: 500, owner: owner, command: CommandIDs.batch,
-            params: { ctx in StudyEditorMenus.newSet(in: ctx.ref) }))
+            params: { ctx in StudyEditorMenus.newSet(in: StudyEditorMenus.folder(ctx)) }))
         menus.register(MenuItemDescriptor(
             id: "studyeditor.card.duplicate", title: String(localized: "Duplicate"), icon: NibSymbol.duplicate.name,
-            location: .card, order: 100, owner: owner, command: "card.add",
+            location: .card, order: 100, owner: owner, command: CommandIDs.cardAdd,
             params: { ctx in StudyEditorMenus.duplicate(ctx) },
             isVisible: { ctx in StudyEditorMenus.target(ctx) != nil }))
         menus.register(MenuItemDescriptor(
             id: "studyeditor.card.moveUp", title: String(localized: "Move Up"),
-            location: .card, order: 200, owner: owner, command: "card.move",
+            location: .card, order: 200, owner: owner, command: CommandIDs.cardMove,
             params: { ctx in StudyEditorMenus.moveUp(ctx) },
             isVisible: { ctx in (StudyEditorMenus.target(ctx)?.index ?? 0) > 0 }))
         menus.register(MenuItemDescriptor(
             id: "studyeditor.card.moveDown", title: String(localized: "Move Down"),
-            location: .card, order: 210, owner: owner, command: "card.move",
+            location: .card, order: 210, owner: owner, command: CommandIDs.cardMove,
             params: { ctx in StudyEditorMenus.moveDown(ctx) },
             isVisible: { ctx in StudyEditorMenus.target(ctx).map { $0.index + 1 < $0.cards.count } ?? false }))
         menus.register(MenuItemDescriptor(
             id: "studyeditor.card.delete", title: String(localized: "Delete Card"), icon: NibSymbol.trash.name,
-            location: .card, order: 900, owner: owner, command: "card.delete",
+            location: .card, order: 900, owner: owner, command: CommandIDs.cardDelete,
             params: { ctx in StudyEditorMenus.deleteParams(ctx) },
             isVisible: { ctx in StudyEditorMenus.target(ctx) != nil }, destructive: true))
     }
@@ -70,11 +70,19 @@ enum StudyEditorMenus {
         return Target(doc: doc, cards: cards, index: i)
     }
 
+    /// The library folder a `libraryNew` menu was opened in: `MenuContext.folder` (contracts-v2, spec pass 2: library
+    /// menus fill it), else a folder ref from a host that only sets `ref`; nil = the library root.
+    static func folder(_ ctx: MenuContext) -> FolderID? {
+        if let folder = ctx.folder { return folder }
+        guard let r = ctx.ref, case let .folder(id)? = NodeRef(r) else { return nil }
+        return id
+    }
+
     /// New › Study Set: create it (in the folder being shown) and open it, as one batch.
-    static func newSet(in ref: String?) -> JSONValue {
+    static func newSet(in folder: FolderID?) -> JSONValue {
         let id = NibID.make().raw
         var create: [String: JSONValue] = ["kind": "studySet", "id": .string(id)]
-        if let r = ref, case .folder? = NodeRef(r) { create["folder"] = .string(r) }
+        if let folder { create["folder"] = .string(NodeRef.folder(folder).description) }
         let openParams: JSONValue = ["doc": .string("doc:" + id)]
         let createCall: JSONValue = ["command": .string(CommandIDs.docCreate), "params": .object(create)]
         let openCall: JSONValue = ["command": .string(CommandIDs.docOpen), "params": openParams]

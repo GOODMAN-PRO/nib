@@ -41,7 +41,8 @@ final class FeatStudyEditorTests: XCTestCase {
         let editor = h.app.ui.editors.get(DocumentKind.studySet.rawValue)
         XCTAssertEqual(editor?.owner, FeatStudyEditorFeature.id)
         XCTAssertTrue(editor?.make(Fixtures.studySetID, h.session, h.app) is DocumentEditing)
-        XCTAssertNotNil(h.app.ui.panels.get(ScratchPaper.panelID))
+        XCTAssertEqual(h.app.ui.panels.get(ScratchPaper.panelID)?.providesHeader, true,
+                       "the scratch sheet draws its own header, so the chrome adds none")
     }
 
     func testAddBuildsFacesFromStringsAndObjects() async throws {
@@ -107,8 +108,6 @@ final class FeatStudyEditorTests: XCTestCase {
 
     func testReorderAndDeleteUndoStepByStep() async throws {
         let h = harness()
-        // Undo reverts a record only while it still carries the revision its entry wrote (ARCHITECTURE.md §6.3), so
-        // the stacked steps here each write a different card.
         let before = try h.snapshot(Fixtures.studySetID)
         try await h.run("card.move", ["ref": "card:FIXTUREDOC03/FIXTURECRD02"])
         XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card2, Fixtures.card1])
@@ -130,6 +129,66 @@ final class FeatStudyEditorTests: XCTestCase {
         await expectError(.invalidParams) {
             try await h.run("card.move", ["ref": "card:FIXTUREDOC03/FIXTURECRD01", "after": "FIXTURECRD01"])
         }
+    }
+
+    func testStackedStepsOnOneCardAllUndoAndRedo() async throws {
+        // contracts-v2 G4: consecutive undo entries that write the same card each undo (the F049 gap: card2 moved
+        // first, then after card1, then two undos, kept the middle order).
+        let h = harness()
+        let before = try h.snapshot(Fixtures.studySetID)
+        try await h.run("card.move", ["ref": "card:FIXTUREDOC03/FIXTURECRD02"])
+        let first = try h.snapshot(Fixtures.studySetID)
+        try await h.run("card.move", ["ref": "card:FIXTUREDOC03/FIXTURECRD02", "after": "card:FIXTUREDOC03/FIXTURECRD01"])
+        try await h.run("card.update", ["ref": "card:FIXTUREDOC03/FIXTURECRD02", "front": "Pixel"])
+        let last = try h.snapshot(Fixtures.studySetID)
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 3)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertEqual(try h.snapshot(Fixtures.studySetID), first)
+        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card2, Fixtures.card1])
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertEqual(try h.snapshot(Fixtures.studySetID), before)
+        for _ in 0..<3 { XCTAssertTrue(h.app.bus.redo(Fixtures.studySetID)) }
+        XCTAssertEqual(try h.snapshot(Fixtures.studySetID), last)
+    }
+
+    func testDeletingCardsFromTwoSetsIsOneStepPerSet() async throws {
+        let h = harness()
+        let other = DocumentID("SECONDSET001")
+        let cards = (0..<3).map { StudyCard(id: NibID("OTHERCARD00\($0)"), front: CardFace(text: RichText(plain: "\($0)")),
+                                            back: CardFace()) }
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: other, kind: .studySet), cards: cards),
+                                         title: "Second", in: nil)
+        let before = try h.snapshot(Fixtures.studySetID)
+        let otherBefore = try h.snapshot(other)
+        try await h.run("card.delete", ["refs": ["card:SECONDSET001/OTHERCARD000", "card:FIXTUREDOC03/FIXTURECRD01",
+                                                 "card:SECONDSET001/OTHERCARD002"]])
+        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card2])
+        XCTAssertEqual(try liveCards(h, other).map { $0.id.raw }, ["OTHERCARD001"])
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 1)
+        XCTAssertEqual(h.undoDepth(other), 1)
+        XCTAssertTrue(h.app.bus.undo(other))
+        XCTAssertEqual(try h.snapshot(other), otherBefore)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertEqual(try h.snapshot(Fixtures.studySetID), before)
+    }
+
+    func testCardCommandsRefuseASetNibMustNotWrite() async throws {
+        let h = harness()
+        // contracts-v2 G2: a set saved by a newer Nib (here through the legacy read-only set) is refused for every caller.
+        h.app.services.set(NSMutableSet(array: [Fixtures.studySetID.raw]), for: ServiceKeys.storeReadOnly)
+        await expectError(.unsupported) {
+            try await h.run("card.add", ["doc": "doc:FIXTUREDOC03", "front": "a", "back": "b"])
+        }
+        await expectError(.unsupported) {
+            try await h.run("card.delete", ["refs": ["card:FIXTUREDOC03/FIXTURECRD01"]])
+        }
+        XCTAssertEqual(try liveCards(h).count, 2)
+        XCTAssertEqual(h.undoDepth(Fixtures.studySetID), 0)
+        let model = StudySetModel(app: h.app, doc: Fixtures.studySetID, session: h.session)
+        XCTAssertTrue(model.readOnly, "the editor shows it read-only")
+        let added = await model.addCard(after: nil)
+        XCTAssertNil(added)
     }
 
     func testMoveRekeysCardsWhoseOrderKeysCannotBracket() async throws {
@@ -156,8 +215,16 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertEqual(moved.srs?.reps, 1)
         let asset = try XCTUnwrap(moved.back.asset)
         XCTAssertEqual(try h.assets.data(asset, doc: other), Fixtures.pngData)
-        h.app.bus.undo(Fixtures.studySetID)
-        h.app.bus.undo(other)
+        // contracts-v2 G4: the move is one linked step, so one undo from either set restores both.
+        XCTAssertTrue(h.app.bus.history.isLinked(try XCTUnwrap(h.app.bus.history.entries(other).last?.group)))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
+        XCTAssertEqual(try h.snapshot(Fixtures.studySetID), before)
+        XCTAssertTrue(try liveCards(h, other).isEmpty)
+        XCTAssertEqual(h.undoDepth(other), 0)
+        XCTAssertTrue(h.app.bus.redo(other))
+        XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card1])
+        XCTAssertEqual(try liveCards(h, other).map { $0.id }, [Fixtures.card2])
+        XCTAssertTrue(h.app.bus.undo(other))
         XCTAssertEqual(try h.snapshot(Fixtures.studySetID), before)
         XCTAssertTrue(try liveCards(h, other).isEmpty)
         await expectError(.invalidParams) {
@@ -203,7 +270,31 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertEqual(Set(try liveCards(h, other).map { $0.id }).count, 3)
     }
 
+    func testMovingManyCardsKeepsTheirOrderWithShortKeys() async throws {
+        let h = harness()
+        let source = DocumentID("BIGSET000001")
+        let other = DocumentID("SECONDSET001")
+        let keys = FractionalIndex.balanced(count: 400)
+        let cards = keys.enumerated().map { n, key in
+            StudyCard(id: NibID(String(format: "BIGCARD%05d", n)), front: CardFace(text: RichText(plain: "\(n)")),
+                      back: CardFace(), order: key)
+        }
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: source, kind: .studySet), cards: cards),
+                                         title: "Big", in: nil)
+        _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: other, kind: .studySet)), title: "Second", in: nil)
+        let refs: [JSONValue] = cards.map { .string("card:BIGSET000001/" + $0.id.raw) }
+        try await h.run("card.moveTo", ["refs": .array(refs), "doc": "doc:SECONDSET001"])
+        let moved = try liveCards(h, other)
+        XCTAssertEqual(moved.map { $0.id }, cards.map { $0.id }, "moved cards keep their order")
+        XCTAssertLessThanOrEqual(moved.map { $0.order.count }.max() ?? 0, 4, "balanced keys stay short")
+        XCTAssertTrue(try liveCards(h, source).isEmpty)
+        XCTAssertTrue(h.app.bus.undo(other))
+        XCTAssertEqual(try liveCards(h, source).count, 400)
+        XCTAssertTrue(try liveCards(h, other).isEmpty)
+    }
+
     func testMovingCardsFromTheEditorUndoesAndRedoesInBothSets() async throws {
+        // The editor runs card.moveTo, whose undo is linked across both sets (contracts-v2 G4).
         let h = harness()
         let other = DocumentID("SECONDSET001")
         _ = try h.library.createDocument(DocumentContent(meta: DocumentMeta(id: other, kind: .studySet)), title: "Second", in: nil)
@@ -228,7 +319,7 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertTrue(try liveCards(h, other).isEmpty)
         XCTAssertEqual(try liveCards(h).map { $0.id }, [Fixtures.card1, Fixtures.card2])
 
-        // A later edit in the other set stops the mirroring there: its own stack is left alone.
+        // A later edit in the other set keeps its own stack: undo in the source no longer reaches it.
         XCTAssertTrue(h.app.bus.redo(Fixtures.studySetID))
         try await h.run("card.add", ["doc": "doc:SECONDSET001", "front": "New", "back": "b"])
         XCTAssertTrue(h.app.bus.undo(Fixtures.studySetID))
@@ -352,6 +443,8 @@ final class FeatStudyEditorTests: XCTestCase {
         let field = CardField(card: Fixtures.card1, side: .back)
         model.focus = field
         XCTAssertTrue(h.session.isEditingText)
+        XCTAssertEqual(h.session.editingTextRef, "card:FIXTUREDOC03/FIXTURECRD01", "contracts-v2 G15: the card being edited")
+        XCTAssertNil(h.session.editingTextRange)
         model.setText("Def", for: field)
         await model.flush()
         model.setText("Defined", for: field)
@@ -364,6 +457,7 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertEqual(model.text(field.key, in: card), "Def", "undo replaces what the field shows")
         model.focus = nil
         XCTAssertFalse(h.session.isEditingText)
+        XCTAssertNil(h.session.editingTextRef)
     }
 
     func testAddCardFocusesItsTermAndSwitchingModesWaitsForContent() async throws {
@@ -452,7 +546,7 @@ final class FeatStudyEditorTests: XCTestCase {
         // Practice and Smart Learn appear once the study sessions feature registers exactly these panel ids.
         XCTAssertNil(model.practicePanel)
         XCTAssertNil(model.smartLearnPanel)
-        for id in [StudySetModel.practicePanelID, StudySetModel.smartLearnPanelID] {
+        for id in [PanelIDs.studyPractice, PanelIDs.studySmartLearn] {
             h.app.ui.panels.register(PanelDescriptor(id: id, title: id, icon: "rectangle.on.rectangle", placement: .sheet,
                                                      order: 0, owner: "studysession", docKinds: [.studySet]) { _ in
                 AnyView(EmptyView())
@@ -495,12 +589,19 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertLessThanOrEqual(bounds.maxY, CardFaces.canvas.height)
         XCTAssertNotNil(CardPaste.imageData(from: fragment))
         XCTAssertNil(CardPaste.fragment(from: Data("{}".utf8)))
+        XCTAssertNil(CardPaste.fragment(from: Data(#"{"format": "nib-fragment/9", "items": []}"#.utf8)))
+        // What clipboard.copy (F014) writes, NibFragment's own encoding, reads back.
+        let encoded = try XCTUnwrap(NibFragment(items: [Item.makeStroke(big)], assets: ["a.png": Fixtures.pngData]).encoded())
+        let decoded = try XCTUnwrap(CardPaste.fragment(from: encoded))
+        XCTAssertEqual(decoded.items.count, 1)
+        XCTAssertEqual(decoded.assets["a.png"], Fixtures.pngData)
+        XCTAssertEqual(CardPaste.fragmentType, "app.nib.fragment")
     }
 
     func testLassoedInkRendersAsABoundedPicture() throws {
         let wide = Stroke(style: InkStyle(), points: [StrokePoint(x: 0, y: 0, width: 2, height: 2),
                                                       StrokePoint(x: 50_000, y: 800, width: 2, height: 2)])
-        let png = try XCTUnwrap(CardPaste.imageData(from: CardFragment(items: [Item.makeStroke(wide)], assets: [:])))
+        let png = try XCTUnwrap(CardPaste.imageData(from: NibFragment(items: [Item.makeStroke(wide)])))
         let image = try XCTUnwrap(UIImage(data: png)?.cgImage)
         XCTAssertLessThanOrEqual(max(image.width, image.height), CardImages.maxPixels + 1)
     }
@@ -601,10 +702,28 @@ final class FeatStudyEditorTests: XCTestCase {
         XCTAssertEqual(try liveCards(h)[1].id, Fixtures.card1)
 
         let newSet = try XCTUnwrap(h.app.ui.menuItems(.libraryNew, MenuContext(app: h.app)).first(where: { $0.id == "studyeditor.new" }))
-        let calls = newSet.params(MenuContext(app: h.app, ref: "folder:FIXTUREFLD01"))["calls"]
-        XCTAssertEqual(calls?[0]?["command"]?.stringValue, "doc.create")
-        XCTAssertEqual(calls?[0]?["params"]?["kind"]?.stringValue, "studySet")
-        XCTAssertEqual(calls?[0]?["params"]?["folder"]?.stringValue, "folder:FIXTUREFLD01")
-        XCTAssertEqual(calls?[1]?["command"]?.stringValue, "doc.open")
+        // Library menus fill MenuContext.folder (contracts-v2, spec pass 2); a folder ref still works.
+        for context in [MenuContext(app: h.app, folder: NibID("FIXTUREFLD01")), MenuContext(app: h.app, ref: "folder:FIXTUREFLD01")] {
+            let calls = newSet.params(context)["calls"]
+            XCTAssertEqual(calls?[0]?["command"]?.stringValue, "doc.create")
+            XCTAssertEqual(calls?[0]?["params"]?["kind"]?.stringValue, "studySet")
+            XCTAssertEqual(calls?[0]?["params"]?["folder"]?.stringValue, "folder:FIXTUREFLD01")
+            XCTAssertEqual(calls?[1]?["command"]?.stringValue, "doc.open")
+        }
+        XCTAssertNil(newSet.params(MenuContext(app: h.app))["calls"]?[0]?["params"]?["folder"], "the root without a folder")
+    }
+
+    func testCardMenuEntriesShowContextTitlesChecksAndShortcuts() {
+        let h = harness()
+        var item = MenuItemDescriptor(id: "test.card.star", title: "Star", location: .card, order: 50, owner: "test",
+                                      command: "test.star")
+        item.contextTitle = { ctx in ctx.ref == "card:FIXTUREDOC03/FIXTURECRD01" ? "Unstar" : "Star" }
+        item.isChecked = { _ in true }
+        item.shortcut = KeyShortcut("s", [.command, .shift])
+        let context = MenuContext(app: h.app, session: h.session, doc: Fixtures.studySetID, ref: "card:FIXTUREDOC03/FIXTURECRD01")
+        XCTAssertEqual(item.resolvedTitle(for: context), "Unstar")
+        XCTAssertEqual(MenuEntry.display(item.shortcut!), "⇧⌘S")
+        XCTAssertEqual(MenuEntry.display(KeyShortcut("return", [.command, .option, .control])), "⌃⌥⌘↩")
+        XCTAssertNotNil(NibSnapshot.image(MenuEntry(item: item, context: context) {}, size: CGSize(width: 240, height: 44)))
     }
 }
