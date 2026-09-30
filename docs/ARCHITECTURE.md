@@ -72,7 +72,7 @@ G:\Projects\Nib\
 │   ├── App/ShellViewController.swift   SceneNavigator, tabs model, key commands, fallbacks
 │   ├── App/FeatureList.swift           generated list of every feature entry type
 │   ├── Intents/NibAppIntents.swift     App Intents (F074; must live in the app target)
-│   ├── Nib.entitlements                app group (used only for CI ad-hoc signing; progressive enhancement)
+│   ├── Nib.entitlements                app group + user fonts (app-usage); CI ad-hoc signing only; progressive enhancement
 │   └── Resources/                      Assets.xcassets, Localizable.xcstrings, parity.json
 ├── NibWidgets/                         widget extension (F096)
 ├── NibShare/                           optional share extension (F064; App Group inbox or pasteboard hand-off)
@@ -1564,7 +1564,7 @@ Errors travel to JS as rejected Promises (`err.code`, `err.message`, `err.path`,
 On `main`, on pull requests and on `workflow_dispatch`, two parallel jobs run:
 
 - **test:** `brew install xcodegen` → `Scripts/make_icons.swift` → `Scripts/lint.py` (code rules + docs lint) → `xcodegen generate` → relay self-test when `tools/relay/relay.mjs` exists → pick a simulator whose runtime is not newer than the selected SDK → `xcodebuild test -scheme NibKit-Package -parallel-testing-enabled NO` in `NibKit/` → upload logs and the xcresult.
-- **ipa** (independent, so an IPA is produced even when tests fail): xcodegen → `xcodebuild archive` (Release, `generic/platform=iOS`, `CODE_SIGNING_ALLOWED=NO`; the archive compiles the app, so there is no separate simulator build) → ad-hoc sign with the entitlements files (App Group, for sideloading tools that honour it) → `Nib-unsigned.ipa` (checks `Payload/Nib.app/PlugIns/NibWidgets.appex` exists) and `Nib-unsigned-noextensions.ipa` (widget and share extensions removed) → upload.
+- **ipa** (independent, so an IPA is produced even when tests fail): xcodegen → `xcodebuild archive` (Release, `generic/platform=iOS`, `CODE_SIGNING_ALLOWED=NO`; the archive compiles the app, so there is no separate simulator build) → ad-hoc sign with the entitlements files (the App Group, and for the app the user-fonts entitlement `app-usage`: progressive enhancement, for sideloading tools that honour them) → `Nib-unsigned.ipa` (checks `Payload/Nib.app/PlugIns/NibWidgets.appex` exists) and `Nib-unsigned-noextensions.ipa` (widget and share extensions removed) → upload.
 
 **Feature branches.** Each feature agent pushes `feat/<FeatureID>` (for example `feat/F012`). Those pushes run only the quick **feature** job, which gives a compile-and-test result for that one feature in minutes:
 
