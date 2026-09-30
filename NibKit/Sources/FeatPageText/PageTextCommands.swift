@@ -31,13 +31,6 @@ enum PageTextStyle: String, CaseIterable {
 
 // MARK: - Page text model (pure)
 
-struct PageMargins: Equatable {
-    var top: Double
-    var left: Double
-    var bottom: Double
-    var right: Double
-}
-
 enum PageTextModel {
     static let fontFamily = "Helvetica"
     static let maxIndent = 6
@@ -54,25 +47,32 @@ enum PageTextModel {
         !item.deleted && item.kind == .text && item.text?.style.fullPage == true
     }
 
-    /// Page-sized minus the template margins; nil for infinite whiteboard boards.
-    /// ponytail: margins are page-proportional plus the template's `margin` param (templates publish no text area,
-    /// see contract gaps); rotated pages use the unrotated page frame, like every other item.
-    static func frame(for page: PageRecord) -> Frame? {
+    /// The writing area the page's template publishes (`TemplateDefinition.metrics(for:size:)`); nil when the page
+    /// has no template background or its template is not installed.
+    static func metrics(for page: PageRecord, in content: ContentRegistries) -> TemplateMetrics? {
+        guard let ref = page.background.template, let template = content.template(ref) else { return nil }
+        return template.metrics(for: ref.params, size: page.size)
+    }
+
+    /// Page-sized minus the margins; nil for infinite whiteboard boards. Rotated pages use the unrotated page frame,
+    /// like every other item (only a PDF or image background turns, `PageRecord.rotation`).
+    static func frame(for page: PageRecord, metrics: TemplateMetrics? = nil) -> Frame? {
         guard let size = page.size else { return nil }
-        let m = margins(page.background, size: size)
+        let m = margins(metrics, size: size)
         return Frame(x: m.left, y: m.top, w: max(size.width - m.left - m.right, 1), h: max(size.height - m.top - m.bottom, 1))
     }
 
-    static func margins(_ background: Background, size: PageSize) -> PageMargins {
+    /// Typographic page margins, widened to the template's writing area (`TemplateMetrics.margins`). A side the
+    /// template rules off with a margin line keeps `marginGap` from the line.
+    static func margins(_ metrics: TemplateMetrics?, size: PageSize) -> PageInsets {
         let side = min(max(size.width * 0.085, 24), 72)
         let top = min(max(size.height * 0.085, 36), 96)
-        var m = PageMargins(top: top, left: side, bottom: side, right: side)
-        guard let margin = background.template?.params["margin"] else { return m }
-        if let points = margin.doubleValue, points > 1, points < size.width / 2 {
-            m.left = max(side, points + marginGap)                                   // margin line position in points
-        } else if margin.boolValue == true {
-            m.left = max(side, 70.87 * size.width / PageSize.a4.width + marginGap)  // the 25 mm rule (DESIGN §3.6)
-        }
+        var m = PageInsets(top: top, left: side, bottom: side, right: side)
+        guard let t = metrics?.margins else { return m }
+        if t.left > 0, t.left < size.width / 2 { m.left = max(m.left, t.left + marginGap) }
+        if t.right > 0, t.right < size.width / 2 { m.right = max(m.right, t.right + marginGap) }
+        if t.top > 0, t.top < size.height / 2 { m.top = max(m.top, t.top) }
+        if t.bottom > 0, t.bottom < size.height / 2 { m.bottom = max(m.bottom, t.bottom) }
         return m
     }
 
@@ -163,8 +163,9 @@ struct StartPageText: NibCommand {
             chosen = NibID(id)
         }
         let layer = ctx.activeSession?.activeLayer ?? 0
+        let content = ctx.content
         let (box, created) = try ctx.mutate { tx in
-            try ensureBox(tx, doc: doc, page: page, id: chosen, layer: layer)
+            try ensureBox(tx, doc: doc, page: page, id: chosen, layer: layer, content: content)
         }
         if ctx.principal.isUser, !ctx.dryRun, let session = ctx.activeSession, session.document == doc {
             PageTextEditor.begin(box, doc: doc, page: page, session: session)
@@ -187,13 +188,13 @@ struct StartPageText: NibCommand {
     }
 
     /// The one-box-per-page rule: reuse the existing box (merging duplicates that sync brought in, re-fitting it to
-    /// the page and keeping it at the bottom of the z-order), or create it.
+    /// the page's writing area and keeping it at the bottom of the z-order), or create it.
     static func ensureBox(_ tx: DocTransaction, doc: DocumentID, page: PageID, id: ElementID?,
-                          layer: Int) throws -> (Item, Bool) {
+                          layer: Int, content: ContentRegistries) throws -> (Item, Bool) {
         guard let record = try tx.content(doc).page(page), !record.deleted else {
             throw NibError.notFound("page \(page.raw) in document \(doc.raw)")
         }
-        guard let frame = PageTextModel.frame(for: record) else {
+        guard let frame = PageTextModel.frame(for: record, metrics: PageTextModel.metrics(for: record, in: content)) else {
             throw NibError(.unsupported, "full-page typing needs a fixed-size page; whiteboard boards are infinite",
                            hint: "use text.createBox on a board")
         }

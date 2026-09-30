@@ -48,6 +48,23 @@ private struct FakeItemUpdate: NibCommand {
     }
 }
 
+/// `FakeItemUpdate` that fails while `failing` is set (a store error, a document locked meanwhile).
+private struct FlakyItemUpdate: NibCommand {
+    @MainActor static var failing = false
+
+    static let descriptor = CommandDescriptor(id: CommandIDs.itemUpdate, title: "Update Item", summary: "Test only.",
+                                              effect: .edit)
+
+    static func run(_ p: FakeItemUpdate.Params, _ ctx: CommandContext) async throws -> NoResult {
+        if failing { throw NibError(.conflict, "the store is busy") }
+        return try await FakeItemUpdate.run(p, ctx)
+    }
+}
+
+private final class Counter: @unchecked Sendable {
+    var count = 0
+}
+
 /// Stand-in for F007's `page.add`: appends an A4 ruled page with the given id.
 private struct FakePageAdd: NibCommand {
     struct Params: Codable {
@@ -194,20 +211,94 @@ final class FeatPageTextTests: XCTestCase {
 
     // MARK: Model
 
-    func testFrameIsThePageMinusTemplateMargins() throws {
-        let plain = PageRecord(id: "PAGEA", size: .a4, background: .ofTemplate("builtin.ruled"))
-        let f = try XCTUnwrap(PageTextModel.frame(for: plain))
+    func testFrameIsThePageMinusTheTemplatesWritingArea() throws {
+        let page = PageRecord(id: "PAGEA", size: .a4, background: .ofTemplate(TemplateIDs.ruled))
+        let f = try XCTUnwrap(PageTextModel.frame(for: page))
         XCTAssertGreaterThan(f.x, 0)
         XCTAssertGreaterThan(f.y, 0)
         XCTAssertLessThan(f.x + f.w, PageSize.a4.width)
         XCTAssertLessThan(f.y + f.h, PageSize.a4.height)
+        XCTAssertEqual(PageTextModel.frame(for: page, metrics: TemplateMetrics()), f, "no writing area published")
 
-        let margin = PageRecord(id: "PAGEB", size: .a4, background: .ofTemplate("builtin.ruled", params: ["margin": true]))
-        XCTAssertGreaterThan(try XCTUnwrap(PageTextModel.frame(for: margin)).x, f.x, "text starts right of the margin line")
-        let at = PageRecord(id: "PAGEC", size: .a4, background: .ofTemplate("builtin.ruled", params: ["margin": 90]))
-        XCTAssertEqual(try XCTUnwrap(PageTextModel.frame(for: at)).x, 90 + PageTextModel.marginGap)
+        // A template without a metrics provider: its "margin" param, in points or true for 25 mm.
+        let plain = TemplateDefinition(id: TemplateIDs.ruled, title: "Ruled", category: "Writing", owner: "test") { _, _, _ in
+            TemplateRender(paper: .white)
+        }
+        let at = plain.metrics(for: [TemplateParamNames.margin: 90], size: .a4)
+        XCTAssertEqual(try XCTUnwrap(PageTextModel.frame(for: page, metrics: at)).x, 90 + PageTextModel.marginGap)
+        let rule = plain.metrics(for: [TemplateParamNames.margin: true], size: .a4)
+        XCTAssertGreaterThan(try XCTUnwrap(PageTextModel.frame(for: page, metrics: rule)).x, f.x,
+                             "text starts right of the margin line")
+
+        // A ruled paper's writing area: a margin line on the left, rules from 120 pt down, nothing on the right.
+        let ruled = TemplateMetrics(spacing: 24, margins: PageInsets(top: 120, left: 80, bottom: 12, right: 0))
+        let r = try XCTUnwrap(PageTextModel.frame(for: page, metrics: ruled))
+        XCTAssertEqual(r.x, 80 + PageTextModel.marginGap)
+        XCTAssertEqual(r.y, 120)
+        XCTAssertEqual(r.x + r.w, f.x + f.w, "the typographic margin where the template has none")
+        XCTAssertEqual(r.y + r.h, f.y + f.h, "never closer to the edge than the typographic margin")
 
         XCTAssertNil(PageTextModel.frame(for: PageRecord(id: "BOARD", size: nil)))
+    }
+
+    func testANewBoxFillsTheInstalledTemplatesWritingArea() async throws {
+        let h = Harness(features: [FeatPageTextFeature.self])
+        var ruled = TemplateDefinition(id: TemplateIDs.ruled, title: "Ruled", category: "Writing", owner: "test") { _, _, _ in
+            TemplateRender(paper: .white)
+        }
+        ruled.metricsProvider = { _, _ in TemplateMetrics(spacing: 24, margins: PageInsets(top: 130, left: 90)) }
+        h.app.content.templates.register(ruled)
+
+        let r = try await h.run("text.startPageText", ["page": .string(page2Ref)])
+        guard case let .item(_, page, id)? = NodeRef(r["ref"]?.stringValue ?? "") else { return XCTFail("no ref") }
+        let frame = try XCTUnwrap(try h.app.workspace.item(Fixtures.docID, page: page, id: id).text?.frame)
+        XCTAssertEqual(frame.x, 90 + PageTextModel.marginGap)
+        XCTAssertEqual(frame.y, 130)
+        let record = try XCTUnwrap(try h.app.workspace.content(Fixtures.docID).page(page))
+        XCTAssertEqual(PageTextModel.metrics(for: record, in: h.app.content)?.margins?.left, 90)
+    }
+
+    // MARK: Menu and key command
+
+    func testOneLongPressEntryTitledForThePage() async throws {
+        let h = Harness(features: [FeatPageTextFeature.self])
+        h.app.commands.register(FakeItemUpdate.self)
+        let entry = try XCTUnwrap(h.app.ui.menus.get("pagetext.start"))
+        XCTAssertEqual(h.app.ui.menus.all.filter { $0.owner == FeatPageTextFeature.id }.count, 1)
+        XCTAssertEqual(entry.command, CommandIDs.textStartPageText)
+        XCTAssertEqual(entry.shortcut, KeyShortcut("t", [.command, .option]))
+        let page2 = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page2)
+        XCTAssertTrue(entry.isVisible(page2))
+        XCTAssertEqual(entry.resolvedTitle(for: page2), String(localized: "Start Typing"))
+        XCTAssertEqual(entry.params(page2), ["page": .string(page2Ref)])
+
+        let r = try await h.run("text.startPageText", ["page": .string(page2Ref)])
+        XCTAssertEqual(entry.resolvedTitle(for: page2), String(localized: "Start Typing"), "an empty box is no text yet")
+        try await h.run(CommandIDs.itemUpdate, ["ref": r["ref"] ?? .null, "patch": ["text": ["text": "Notes"]]])
+        XCTAssertEqual(entry.resolvedTitle(for: page2), String(localized: "Edit Text"))
+
+        let board = MenuContext(app: h.app, session: h.session, doc: "FIXTUREDOC04", page: "FIXTUREBRD01")
+        XCTAssertFalse(entry.isVisible(board), "an infinite board has no page to fill")
+        h.session.readOnly = true
+        XCTAssertFalse(entry.isVisible(page2))
+    }
+
+    func testStartTypingKeyIsForNotebooksAndTypesOnTheWindowsPage() async throws {
+        let h = Harness(features: [FeatPageTextFeature.self])
+        let key = try XCTUnwrap(h.app.content.keyCommands.get("pagetext.start"))
+        XCTAssertEqual(key.command, CommandIDs.textStartPageText)
+        XCTAssertEqual(key.shortcut, KeyShortcut("t", [.command, .option]))
+        XCTAssertTrue(key.isActive(in: KeyCommandContext(docKind: .notebook)))
+        XCTAssertTrue(key.isActive(in: KeyCommandContext(docKind: .notebook, isEditingText: true)), "also while typing")
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: .whiteboard)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(docKind: nil, hasTabs: true)), "never in the library")
+        XCTAssertTrue(KeyCommandRouting.overridesSystemKeys(key, in: KeyCommandContext(docKind: .notebook, isEditingText: true)))
+
+        h.session.page = Fixtures.page2
+        let params = key.resolvedParams(for: h.session)
+        XCTAssertEqual(params, ["page": .string(page2Ref)])
+        let r = try await h.run(key.command, params)
+        XCTAssertEqual(r["ref"]?.stringValue?.hasPrefix("item:FIXTUREDOC01/FIXTUREPG002/"), true)
     }
 
     func testStylePresets() {
@@ -264,6 +355,12 @@ final class FeatPageTextTests: XCTestCase {
         XCTAssertEqual(PageTextLayout.offset(of: spot, in: marked), 11)
         XCTAssertEqual(PageTextLayout.offset(of: spot, in: plain), 6)
         XCTAssertEqual(PageTextLayout.paragraphRanges(NSAttributedString(string: "a\n")).count, 2)
+
+        // EditorSession.editingTextRange counts plain-text units: markers never count.
+        XCTAssertEqual(PageTextLayout.plainRange(NSRange(location: 5, length: 0), in: marked), [3, 0])
+        XCTAssertEqual(PageTextLayout.plainRange(NSRange(location: 2, length: 9), in: marked), [0, 6])
+        XCTAssertEqual(PageTextLayout.plainRange(NSRange(location: 1, length: 0), in: marked), [0, 0], "inside a marker")
+        XCTAssertEqual(PageTextLayout.plainRange(NSRange(location: 6, length: 1), in: plain), [6, 1])
     }
 
     func testTextMustFitThePage() {
@@ -297,16 +394,29 @@ final class FeatPageTextTests: XCTestCase {
         let (page, id) = try await start(h, page2Ref)
         XCTAssertEqual(host.hidden[page], [id], "the drawn box hides under the live text view")
         XCTAssertTrue(h.session.isEditingText)
+        XCTAssertEqual(h.session.editingTextRef, NodeRef.item(Fixtures.docID, page, id).description)
+        XCTAssertEqual(h.session.editingTextRange, [0, 0])
         XCTAssertTrue(editor.hitTest(host.viewPoint(Point(300, 400), page: page), host: host))
         XCTAssertFalse(editor.hitTest(host.viewPoint(Point(4, 4), page: page), host: host))
         let tv = try XCTUnwrap(textView(host))
 
         let depth = h.undoDepth(Fixtures.docID)
         XCTAssertTrue(typeText("Hello", editor, tv))
+        XCTAssertEqual(h.session.editingTextRange, [5, 0])
         editor.perform(key: "style.heading")
         editor.perform(key: "list.bullet")
+        XCTAssertEqual(tv.text, "• Hello")
+        XCTAssertEqual(h.session.editingTextRange, [5, 0], "the list marker is not text")
+        tv.selectedRange = NSRange(location: 2, length: 3)
+        editor.textViewDidChangeSelection(tv)
+        XCTAssertEqual(h.session.editingTextRange, [0, 3])
         editor.finish()
         XCTAssertFalse(h.session.isEditingText)
+        XCTAssertNil(h.session.editingTextRef)
+        XCTAssertNil(h.session.editingTextRange)
+        XCTAssertTrue(tv.superview === host.canvasView, "the finished text stays until the box is drawn with it")
+        XCTAssertFalse(tv.isUserInteractionEnabled)
+        XCTAssertFalse(editor.hitTest(host.viewPoint(Point(300, 400), page: page), host: host))
 
         let committed = await eventually { self.boxText(h, page, id)?.paragraphs.first?.list == .bullet }
         XCTAssertTrue(committed)
@@ -314,11 +424,12 @@ final class FeatPageTextTests: XCTestCase {
         XCTAssertEqual(text.plainText, "Hello", "the typed text reaches the locked box")
         XCTAssertEqual(text.paragraphs.first?.style, PageTextStyle.heading.rawValue)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1, "one typing session is one undo step")
-        let shown = await eventually { host.hidden[page] == nil }
-        XCTAssertTrue(shown, "the drawn box shows again once it has the final text")
+        let shown = await eventually { host.hidden[page] == nil && tv.superview == nil }
+        XCTAssertTrue(shown, "the drawn box shows again once it has the final text, then the text view goes")
+        XCTAssertTrue(host.renderWaits.contains(page), "after the canvas has drawn the page")
     }
 
-    func testEachDebouncedCommitIsAnUndoStepThatUndoesCompletely() async throws {
+    func testDebouncedCommitsMergeIntoOneUndoStep() async throws {
         let h = Harness(features: [FeatPageTextFeature.self])
         h.app.commands.register(FakeItemUpdate.self)
         let host = FakeCanvasHost(h)
@@ -337,15 +448,56 @@ final class FeatPageTextTests: XCTestCase {
         XCTAssertTrue(typeText(" two", editor, tv))
         let second = await eventually { self.boxText(h, page, id)?.plainText == "One two" }
         XCTAssertTrue(second)
-        // Not merged into one group: DocTransaction.revert would then restore only the last write of the box.
-        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 2, "each commit is its own undo step")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1, "one typing session is one undo step")
+        XCTAssertTrue(typeText("!", editor, tv))
         editor.finish()
-        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 2, "nothing was left to commit on Done")
+        let last = await eventually { self.boxText(h, page, id)?.plainText == "One two!" }
+        XCTAssertTrue(last, "Done commits what the debounce had not")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
 
+        // The box was written three times in the step; undo restores it completely (contracts-v2 revert rebasing).
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
-        XCTAssertEqual(boxText(h, page, id)?.plainText, "One", "the latest commit undoes completely")
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "")
+        XCTAssertEqual(boxText(h, page, id)?.paragraphs.first?.style, PageTextStyle.body.rawValue)
         XCTAssertTrue(h.app.bus.redo(Fixtures.docID))
-        XCTAssertEqual(boxText(h, page, id)?.plainText, "One two")
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "One two!")
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID), "then the box's creation")
+        XCTAssertFalse(try h.app.workspace.items(Fixtures.docID, page: page).contains(where: PageTextModel.isFullPageBox))
+    }
+
+    func testAFailedFinalCommitReopensTheBoxWithTheText() async throws {
+        let h = Harness(features: [FeatPageTextFeature.self])
+        h.app.commands.register(FlakyItemUpdate.self)
+        FlakyItemUpdate.failing = false
+        defer { FlakyItemUpdate.failing = false }
+        let host = FakeCanvasHost(h)
+        let editor = PageTextEditor()
+        editor.attach(to: host)
+        defer { editor.detach(from: host) }
+        let reports = Counter()
+        let observer = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { _ in
+            reports.count += 1
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let (page, id) = try await start(h, page2Ref)
+        let depth = h.undoDepth(Fixtures.docID)
+        FlakyItemUpdate.failing = true
+        XCTAssertTrue(typeText("Keep me", editor, try XCTUnwrap(textView(host))))
+        editor.finish()
+        XCTAssertFalse(h.session.isEditingText)
+        let reopened = await eventually { self.textView(host)?.text == "Keep me" && h.session.isEditingText }
+        XCTAssertTrue(reopened, "never drops the only copy of what was typed")
+        XCTAssertEqual(reports.count, 1, "the failure is reported once")
+        XCTAssertEqual(host.hidden[page], [id])
+        XCTAssertEqual(boxText(h, page, id)?.plainText, "")
+
+        FlakyItemUpdate.failing = false
+        let saved = await eventually { self.boxText(h, page, id)?.plainText == "Keep me" }
+        XCTAssertTrue(saved, "the reopened box saves it on its own")
+        XCTAssertEqual(reports.count, 1, "retries stay quiet")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 1)
     }
 
     func testEditorReloadsOnOutsideChangesAndUndoStartsANewStep() async throws {
@@ -450,8 +602,9 @@ final class FeatPageTextTests: XCTestCase {
         return (page, id)
     }
 
+    /// The live text view (finished ones stay inert over their box until it is drawn).
     private func textView(_ host: FakeCanvasHost) -> PageTextView? {
-        host.canvasView.subviews.lazy.compactMap { $0 as? PageTextView }.first
+        host.canvasView.subviews.lazy.compactMap { $0 as? PageTextView }.first { $0.editor != nil }
     }
 
     private func boxText(_ h: Harness, _ page: PageID, _ id: ElementID) -> RichText? {

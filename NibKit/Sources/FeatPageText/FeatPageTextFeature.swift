@@ -4,6 +4,9 @@ import NibDesign
 /// Full-page typing (F028): `text.startPageText`, the on-canvas editor, the page long-press entry and ⌥⌘T.
 public enum FeatPageTextFeature: NibFeature {
     public static let id = "pagetext"
+    static let shortcut = KeyShortcut("t", [.command, .option])
+    /// Id of the long-press entry and of the ⌥⌘T key.
+    static let entryID = "pagetext.start"
 
     public static func register(_ app: NibApp) {
         app.commands.register(StartPageText.self)
@@ -12,24 +15,30 @@ public enum FeatPageTextFeature: NibFeature {
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "pagetext.editor", owner: id, order: -100,
                                                                      docKinds: [.notebook]) { _ in PageTextEditor() })
 
-        // One long-press slot: "Start Typing" on a page without typed text, "Edit Text" once it has some.
-        app.ui.menus.register(MenuItemDescriptor(
-            id: "pagetext.start", title: String(localized: "Start Typing"), icon: NibSymbol.pageTyping.name,
-            location: .pageLongPress, order: 150, owner: id, command: StartPageText.descriptor.id,
-            params: pageParams, isVisible: { canType($0) && !hasPageText($0) }))
-        app.ui.menus.register(MenuItemDescriptor(
-            id: "pagetext.edit", title: String(localized: "Edit Text"), icon: NibSymbol.pageTyping.name,
-            location: .pageLongPress, order: 150, owner: id, command: StartPageText.descriptor.id,
-            params: pageParams, isVisible: { canType($0) && hasPageText($0) }))
+        // One long-press entry: "Start Typing" on a page without typed text, "Edit Text" once it has some.
+        var entry = MenuItemDescriptor(
+            id: entryID, title: String(localized: "Start Typing"), icon: NibSymbol.pageTyping.name,
+            location: .pageLongPress, order: 150, owner: id, command: CommandIDs.textStartPageText,
+            params: pageParams, isVisible: { canType($0) })
+        entry.contextTitle = { hasPageText($0) ? String(localized: "Edit Text") : String(localized: "Start Typing") }
+        entry.shortcut = shortcut
+        app.ui.menus.register(entry)
 
-        let startKey = "pagetext.start"
-        app.content.keyCommands.register(KeyCommandDescriptor(
-            id: startKey, title: String(localized: "Start Typing"), shortcut: KeyShortcut("t", [.command, .option]),
-            command: StartPageText.descriptor.id, scope: .document, owner: id))
+        // Notebooks only (whiteboard boards are infinite); the key types on the key window's current page.
+        var key = KeyCommandDescriptor(id: entryID, title: String(localized: "Start Typing"), shortcut: shortcut,
+                                       command: CommandIDs.textStartPageText, scope: .document, owner: id)
+        key.docKinds = [.notebook]
+        key.sessionParams = { sessionParams($0) }
+        app.content.keyCommands.register(key)
     }
 
     private static func pageParams(_ ctx: MenuContext) -> JSONValue {
         guard let doc = ctx.doc, let page = ctx.page else { return [:] }
+        return ["page": .string(NodeRef.page(doc, page).description)]
+    }
+
+    private static func sessionParams(_ session: EditorSession) -> JSONValue {
+        guard let doc = session.document, let page = session.page else { return [:] }
         return ["page": .string(NodeRef.page(doc, page).description)]
     }
 

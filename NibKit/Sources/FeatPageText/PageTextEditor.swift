@@ -58,6 +58,17 @@ enum PageTextLayout {
         return r.location + marker + min(max(spot.offset, 0), r.length - marker)
     }
 
+    /// `range` of the view's text as [start, length] in plain-text units (UTF-16, list markers excluded), the way
+    /// `EditorSession.editingTextRange` reports it.
+    static func plainRange(_ range: NSRange, in s: NSAttributedString) -> [Int] {
+        func plain(_ offset: Int) -> Int {
+            let o = min(max(offset, 0), s.length)
+            return o - markerLength(s, in: NSRange(location: 0, length: o))
+        }
+        let start = plain(range.location)
+        return [start, max(0, plain(NSMaxRange(range)) - start)]
+    }
+
     /// Height the text takes at `width` (TextKit 1 metrics, the same as the editor's text view and the drawer).
     static func usedHeight(_ text: NSAttributedString, width: CGFloat) -> CGFloat {
         guard text.length > 0 else { return 0 }
@@ -87,27 +98,15 @@ enum PageTextLayout {
     }
 }
 
-/// Text-format glyphs. NibSymbol has no bold, italic, underline, strikethrough or indent cases yet (contract request,
-/// ARCHITECTURE §15.11), so they come through `NibSymbol(systemName:)`, which rejects banned names and symbols this OS
-/// lacks; a text label is the fallback. Replace with the NibSymbol cases once they land.
-enum PageTextGlyph {
-    static let bold = NibSymbol(systemName: "bold")
-    static let italic = NibSymbol(systemName: "italic")
-    static let underline = NibSymbol(systemName: "underline")
-    static let strikethrough = NibSymbol(systemName: "strikethrough")
-    static let indent = NibSymbol(systemName: "increase.indent")
-    static let outdent = NibSymbol(systemName: "decrease.indent")
-}
-
 // MARK: - Editor (canvas attachment)
 
 /// Full-page typing on the canvas: a TextKit text view laid exactly over the page's full-page box while it is being
 /// edited, with an opaque formatting bar above the keyboard (DESIGN §14.17: no liquid on text-editing surfaces).
 /// Typing is committed through `item.update` half a second after it pauses (and on Done): the box is locked so
-/// transform, the eraser and the text tool leave it alone, and item.update checks only the document lock. Each commit
-/// is its own undo step, as in F026's text boxes: `DocTransaction.revert` cannot undo a record written twice in one
-/// undo group (contract gap), so merging a session's commits would make undo restore only the last of them.
-/// Undo, sync and AI edits of the box reload the view.
+/// transform, the eraser and the text tool leave it alone, and item.update checks only the document lock. The commits
+/// of one typing session share an undo group, so the session is one undo step (`DocTransaction.revert` restores a
+/// record written several times in one group completely). Undo, sync and AI edits of the box reload the view, and
+/// typing after them is a new undo step.
 @MainActor
 final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGestureRecognizerDelegate,
                             UIColorPickerViewControllerDelegate {
@@ -140,8 +139,12 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     private var commitObserver: EventSubscription?
     private var sessionObservers: Set<AnyCancellable> = []
 
-    /// Undo groups of this editor's commits in flight, so their changesets are not taken for outside changes.
-    private var ownGroups: Set<String> = []
+    /// Undo group of the current typing session: its commits merge into one undo step.
+    private var group = NibID.make().raw
+    /// Text a finished session sent that has not landed yet (`sending`) or failed to: opening the box shows it.
+    private var unsaved: [ElementID: (text: RichText, sending: Bool)] = [:]
+    /// Text views of finished sessions, left inert over their box until the canvas has drawn the committed text.
+    private var ghosts: [ElementID: (view: UIView, page: PageID, frame: Frame, storage: NSTextStorage?)] = [:]
     private var dirty = false
     private var commitTask: Task<Void, Never>?
     /// Model of the last paragraph while it has no character of its own to carry its style, list and indent.
@@ -198,11 +201,14 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         if let tap = outsideTap { host.canvasView.removeGestureRecognizer(tap) }
         outsideTap = nil
         NotificationCenter.default.removeObserver(self)
+        for ghost in ghosts.values { ghost.view.removeFromSuperview() }
+        ghosts = [:]
         Self.live.removeAll { $0.editor == nil || $0.editor === self }
         self.host = nil
     }
 
     func canvasDidChange(_ host: CanvasHost) {
+        for ghost in ghosts.values { place(ghost.view, frame: ghost.frame, page: ghost.page) }
         if let p = pendingBegin, host.pageFrame(p.page) != nil {
             pendingBegin = nil
             beginEditing(p.item, doc: p.doc, page: p.page)
@@ -230,7 +236,11 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
             pendingBegin = (item, doc, page)                    // a page just added is laid out on the next change
             return
         }
+        dropGhost(item.id)                                      // the live view takes over from a finished one
+        let restored = unsaved[item.id]                         // a finished session's text that has not landed
+        let initial = restored?.text ?? box.text
         editing = Target(doc: doc, page: page, item: item.id, frame: box.frame, defaults: box.style.defaults)
+        group = NibID.make().raw                                // a new typing session is a new undo step
         dirty = false
         commitFailing = false
         rejectedInsert = false
@@ -238,10 +248,10 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         afterReturn = nil
         let tv = makeTextView(size: CGSize(width: box.frame.w, height: box.frame.h))
         textView = tv
-        let text = RichTextBridge.attributed(box.text, base: box.style.defaults)
+        let text = RichTextBridge.attributed(initial, base: box.style.defaults)
         tv.attributedText = text
-        trailing = Self.shell(box.text.paragraphs.last ?? Paragraph())
-        if let next = continuation, box.text.isEmpty { trailing = next }
+        trailing = Self.shell(initial.paragraphs.last ?? Paragraph())
+        if let next = continuation, initial.isEmpty { trailing = next }
         continuation = nil
         host.canvasView.addSubview(tv)
         host.setHidden([item.id], page: page)
@@ -252,16 +262,26 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         fixTypingAttributes()
         updateOverflow()
         updateBar()
+        publishEditingText()
+        if let r = restored, !r.sending {                       // its commit failed: this session saves it
+            unsaved[item.id] = nil
+            commitFailing = true                                // the failure was reported; retries stay quiet
+            dirty = true
+            scheduleCommit()
+        }
         focus(tv)
         UIAccessibility.post(notification: .screenChanged, argument: tv)
     }
 
-    /// Ends typing: commits what is pending, removes the text view and shows the box's rendering again.
+    /// Ends typing: commits what is pending and shows the box's rendering again. The finished text view stays on
+    /// screen, inert, until the canvas has drawn the committed text, so the page never shows a blank frame.
     func finish(commit: Bool = true) {
         pendingBegin = nil
         guard let e = editing, let tv = textView else { return }
         let text = currentRichText()
         let send = commit && dirty
+        let group = self.group
+        let textStorage = storage                               // the view's text lives as long as it is shown
         editing = nil
         dirty = false
         commitTask?.cancel()
@@ -274,39 +294,73 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         tv.delegate = nil
         tv.editor = nil
         if tv.isFirstResponder { _ = tv.resignFirstResponder() }
-        tv.removeFromSuperview()
         textView = nil
         storage = nil
         bar = nil
         checkboxTap = nil
-        guard let host = host else { return }
+        guard let host = host else {
+            tv.removeFromSuperview()
+            return
+        }
         host.session.isEditingText = false
-        let page = e.page
-        if send {
-            let app = host.app
-            let session = host.session
-            let ref = NodeRef.item(e.doc, e.page, e.item).description
-            let group = NibID.make().raw
-            ownGroups.insert(group)                              // the box may be opened again before this lands
-            Task { @MainActor [weak self, weak host] in
-                let ok = await PageTextEditor.send(text, ref: ref, group: group, session: session, app: app)
-                self?.ownGroups.remove(group)
-                if ok {
-                    host?.setHidden([], page: page)              // show the drawn box once it has the final text
-                } else {
-                    self?.reopen(e, with: text)                  // never drop the only copy of what was typed
-                }
+        host.session.editingTextRef = nil
+        host.session.editingTextRange = nil
+        guard commit else {                                     // undone or deleted: nothing of it stays
+            tv.removeFromSuperview()
+            host.setHidden([], page: e.page)
+            return
+        }
+        keepAsGhost(tv, e, storage: textStorage)
+        guard send else {
+            showBox(e, dropping: tv)
+            return
+        }
+        unsaved[e.item] = (text, true)
+        let app = host.app
+        let session = host.session
+        let ref = NodeRef.item(e.doc, e.page, e.item).description
+        Task { @MainActor [weak self, weak tv] in
+            let ok = await PageTextEditor.send(text, ref: ref, group: group, session: session, app: app)
+            guard let self = self else {
+                tv?.removeFromSuperview()
+                return
             }
-        } else {
-            host.setHidden([], page: page)
+            self.landed(e, text: text, group: group, ghost: tv, ok: ok)
         }
     }
 
-    /// A commit failed after typing ended: open the box again with the unsaved text, so it can be retried or copied.
-    private func reopen(_ e: Target, with text: RichText) {
+    /// The final commit of a finished session landed, or failed.
+    private func landed(_ e: Target, text: RichText, group: String, ghost: UIView?, ok: Bool) {
+        let latest = unsaved[e.item]?.text == text              // no later session sent newer text meanwhile
+        if ok {
+            if latest { unsaved[e.item] = nil }
+            if let ghost = ghost { showBox(e, dropping: ghost) }  // the drawn box has the final text now
+            return
+        }
+        if let ghost = ghost, ghosts[e.item]?.view === ghost { dropGhost(e.item) }
+        guard latest else { return }
+        if let now = editing, now.doc == e.doc, now.item == e.item {
+            unsaved[e.item] = nil                               // opened again meanwhile, showing this text
+            commitFailing = true
+            dirty = true
+            scheduleCommit()
+            return
+        }
+        unsaved[e.item] = (text, false)                         // never drop the only copy of what was typed
+        if editing == nil {
+            reopen(e, group: group)
+        } else {
+            unhide(e)                                           // restored when the box is opened next
+        }
+    }
+
+    /// A commit failed after typing ended: open the box again (it restores the unsaved text), so it can be retried or
+    /// copied. The retry stays in the session's undo step.
+    private func reopen(_ e: Target, group: String) {
         guard editing == nil, let host = host else { return }
         guard let item = try? host.app.workspace.item(e.doc, page: e.page, id: e.item), !item.deleted,
-              let box = item.text else {
+              item.text != nil else {
+            unsaved[e.item] = nil
             host.setHidden([], page: e.page)
             return
         }
@@ -315,12 +369,49 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
             host.setHidden([], page: e.page)
             return
         }
-        commitFailing = true                                   // the failure was reported; retries stay quiet
-        trailing = Self.shell(text.paragraphs.last ?? Paragraph())
-        let s = RichTextBridge.attributed(text, base: box.style.defaults)
-        let end = PageTextLayout.spot(at: s.length, in: s)
-        install(s, selection: (end, end))
-        textChanged()
+        self.group = group
+    }
+
+    // MARK: Finished text views
+
+    private func keepAsGhost(_ tv: UITextView, _ e: Target, storage: NSTextStorage?) {
+        dropGhost(e.item)
+        tv.isEditable = false
+        tv.isSelectable = false
+        tv.isUserInteractionEnabled = false
+        tv.inputAccessoryView = nil
+        tv.accessibilityElementsHidden = true
+        ghosts[e.item] = (tv, e.page, e.frame, storage)
+    }
+
+    /// Shows the drawn box of `e` again, unless a session on its page keeps it hidden.
+    private func unhide(_ e: Target) {
+        guard let host = host, editing?.doc != e.doc || editing?.page != e.page else { return }
+        host.setHidden([], page: e.page)
+    }
+
+    private func dropGhost(_ item: ElementID) {
+        ghosts.removeValue(forKey: item)?.view.removeFromSuperview()
+    }
+
+    /// Shows the drawn box again (unless a new session on the page hides it) and drops `ghost` once the canvas has
+    /// redrawn the page (`CanvasHost.afterNextRender`), or after a second at most.
+    private func showBox(_ e: Target, dropping ghost: UIView) {
+        guard let host = host else {
+            ghost.removeFromSuperview()
+            return
+        }
+        unhide(e)
+        let drop: @MainActor () -> Void = { [weak self, weak ghost] in
+            guard let ghost = ghost else { return }
+            if self?.ghosts[e.item]?.view === ghost { self?.ghosts[e.item] = nil }
+            ghost.removeFromSuperview()
+        }
+        host.afterNextRender(page: e.page, drop)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            drop()
+        }
     }
 
     private func makeTextView(size: CGSize) -> PageTextView {
@@ -361,25 +452,30 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
     }
 
     private func layoutTextView() {
-        guard let host = host, let e = editing, let tv = textView else { return }
-        guard host.pageFrame(e.page) != nil else {
-            tv.isHidden = true
-            return
-        }
-        tv.isHidden = false
-        let a = host.viewPoint(Point(e.frame.x, e.frame.y), page: e.page)
-        let b = host.viewPoint(Point(e.frame.x + e.frame.w, e.frame.y + e.frame.h), page: e.page)
-        let scale = max((b.x - a.x) / CGFloat(e.frame.w), 0.01)
+        guard let e = editing, let tv = textView else { return }
         let size = CGSize(width: e.frame.w, height: e.frame.h)
         if tv.textContainer.size.width != size.width {
             tv.textContainer.size = CGSize(width: size.width, height: .greatestFiniteMagnitude)
         }
-        tv.transform = .identity
-        tv.bounds = CGRect(origin: .zero, size: size)
-        tv.transform = CGAffineTransform(scaleX: scale, y: scale)
-        tv.center = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+        guard let scale = place(tv, frame: e.frame, page: e.page) else { return }
         let contentScale = PageTextLayout.contentScale(zoom: scale, screenScale: tv.traitCollection.displayScale, boxSize: size)
         applyContentScale(contentScale, to: tv)
+    }
+
+    /// Lays `view`, sized to `frame` in page points, over `frame` through the canvas's page transform (zoom, layout
+    /// and page rotation). Returns the zoom scale, or nil (and hides the view) while the page is not laid out.
+    @discardableResult
+    private func place(_ view: UIView, frame: Frame, page: PageID) -> CGFloat? {
+        guard let host = host, let t = host.pageTransform(page) else {
+            view.isHidden = true
+            return nil
+        }
+        view.isHidden = false
+        view.transform = .identity
+        view.bounds = CGRect(origin: .zero, size: CGSize(width: frame.w, height: frame.h))
+        view.transform = CGAffineTransform(a: t.a, b: t.b, c: t.c, d: t.d, tx: 0, ty: 0)
+        view.center = CGPoint(x: frame.x + frame.w / 2, y: frame.y + frame.h / 2).applying(t)
+        return max(abs(t.a * t.d - t.b * t.c).squareRoot(), 0.01)
     }
 
     /// Re-rasterising a page-sized view is expensive: during a pinch only a 25 % change re-renders at once; the exact
@@ -496,7 +592,15 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         scheduleCommit()
         updateOverflow()
         updateBar(rich)
+        publishEditingText()
         revealCaretIfNeeded()
+    }
+
+    /// What is being edited, for links (F029), spellcheck and the assistant's context (`EditorSession.editingTextRef`).
+    private func publishEditingText() {
+        guard let host = host, let e = editing, let tv = textView else { return }
+        host.session.editingTextRef = NodeRef.item(e.doc, e.page, e.item).description
+        host.session.editingTextRange = PageTextLayout.plainRange(tv.selectedRange, in: tv.attributedText ?? NSAttributedString())
     }
 
     private func caretSpot() -> TextSpot {
@@ -713,18 +817,21 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         guard dirty, let e = editing, let host = host else { return }
         dirty = false                                          // typing during the send marks it dirty again
         let text = currentRichText()
-        let group = NibID.make().raw                           // one undo step per commit (see the type comment)
-        ownGroups.insert(group)
+        let group = self.group                                 // the session's commits merge into one undo step
         let ok = await Self.send(text, ref: NodeRef.item(e.doc, e.page, e.item).description, group: group,
                                  session: host.session, app: host.app, quiet: commitFailing)
-        ownGroups.remove(group)                                // its changeset has been observed by now
         commitFailing = !ok
         guard !ok else { return }
         if let now = editing, now.item == e.item, now.doc == e.doc {
             dirty = true                                       // keep the text and try again
             scheduleCommit()
-        } else if editing == nil {
-            reopen(e, with: text)
+        } else if unsaved[e.item] == nil {                     // typing ended while this was the only copy
+            unsaved[e.item] = (text, false)
+            if editing == nil {
+                reopen(e, group: group)
+            } else {
+                unhide(e)                                      // restored when the box is opened next
+            }
         }
     }
 
@@ -762,7 +869,8 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
                     finish(commit: false)                           // undone, deleted or no longer a page box
                     return
                 }
-                guard !ownGroups.contains(cs.group) else { return } // our own commit
+                guard cs.group != group else { return }             // this session's own commit
+                group = NibID.make().raw                            // typing after an outside change is a new step
                 if cs.command == CommandIDs.undo || cs.command == CommandIDs.redo || cs.command == CommandIDs.revertGroup {
                     commitTask?.cancel()                            // the undo wins over typing not yet committed
                     dirty = false
@@ -850,6 +958,7 @@ final class PageTextEditor: NSObject, CanvasAttachment, UITextViewDelegate, UIGe
         guard editing != nil else { return }
         fixTypingAttributes()
         updateBar()
+        publishEditingText()
         revealCaretIfNeeded()
     }
 
@@ -1056,17 +1165,6 @@ final class PageTextView: UITextView {
 
 // MARK: - Formatting bar
 
-/// DESIGN values the bar copies until NibDesign has them (contract request, ARCHITECTURE §15.11: a UIKit
-/// `NibPenSwatch` image and a hairline divider token). Replace with the tokens once they land.
-private enum BarLiteral {
-    /// `NibPenSwatch` at palette size, 22 pt (DESIGN §13.3).
-    static let swatchSide: CGFloat = 22
-    /// The permanent 1 pt `swatchRing` on inks that vanish against the chrome (DESIGN §3.3, §3.4).
-    static let swatchRing: CGFloat = 1
-    /// Swatch outline and divider hairline, 0.5 pt (DESIGN §3.4 swatches, §5 palette divider).
-    static let hairline: CGFloat = 0.5
-}
-
 struct PageTextBarState: Equatable {
     var style: PageTextStyle = .body
     var bold = false
@@ -1090,22 +1188,18 @@ final class PageTextBar: UIInputView {
     private let scroll = UIScrollView()
     private let controls = UIStackView()
     private lazy var styleButton = menuButton(label: String(localized: "Text Style"))
-    private lazy var boldButton = iconButton(PageTextGlyph.bold, fallback: "B", label: String(localized: "Bold")) {
-        $0.toggle(.bold)
+    private lazy var boldButton = iconButton(.bold, label: String(localized: "Bold")) { $0.toggle(.bold) }
+    private lazy var italicButton = iconButton(.italic, label: String(localized: "Italic")) { $0.toggle(.italic) }
+    private lazy var underlineButton = iconButton(.underline, label: String(localized: "Underline")) {
+        $0.toggle(.underline)
     }
-    private lazy var italicButton = iconButton(PageTextGlyph.italic, fallback: "I", label: String(localized: "Italic")) {
-        $0.toggle(.italic)
+    private lazy var strikeButton = iconButton(.strikethrough, label: String(localized: "Strikethrough")) {
+        $0.toggle(.strikethrough)
     }
-    private lazy var underlineButton = iconButton(PageTextGlyph.underline, fallback: "U",
-                                                  label: String(localized: "Underline")) { $0.toggle(.underline) }
-    private lazy var strikeButton = iconButton(PageTextGlyph.strikethrough, fallback: "S",
-                                               label: String(localized: "Strikethrough")) { $0.toggle(.strikethrough) }
     private lazy var colourButton = menuButton(label: String(localized: "Text Colour"))
     private lazy var listButton = menuButton(label: String(localized: "List"))
-    private lazy var outdentButton = iconButton(PageTextGlyph.outdent, fallback: "<",
-                                                label: String(localized: "Decrease Indent")) { $0.indent(-1) }
-    private lazy var indentButton = iconButton(PageTextGlyph.indent, fallback: ">",
-                                               label: String(localized: "Increase Indent")) { $0.indent(1) }
+    private lazy var outdentButton = iconButton(.outdent, label: String(localized: "Decrease Indent")) { $0.indent(-1) }
+    private lazy var indentButton = iconButton(.indent, label: String(localized: "Increase Indent")) { $0.indent(1) }
     private lazy var doneButton = textButton(String(localized: "Done"), symbol: nil,
                                              label: String(localized: "Done typing")) { $0.finish() }
     private lazy var addPageButton = textButton(String(localized: "Add page to continue"), symbol: .addPage,
@@ -1203,22 +1297,22 @@ final class PageTextBar: UIInputView {
         underlineButton.isSelected = s.underline
         strikeButton.isSelected = s.strikethrough
 
-        let dark = traitCollection.userInterfaceStyle == .dark
         let ink = NibInk.allCases.first { PageTextModel.rgba($0) == s.color }
         var colour = colourButton.configuration
-        colour?.image = Self.swatch((s.color ?? .black).uiColor, ring: ink?.needsRing(dark: dark) ?? false)
+        colour?.image = UIImage.nibSwatch(Self.swatch(s.color, ink: ink))
         colourButton.configuration = colour
         colourButton.accessibilityValue = s.color == nil ? String(localized: "Default") : ink?.name ?? String(localized: "Custom")
-        colourButton.menu = colourMenu(current: s.color, dark: dark)
+        colourButton.menu = colourMenu(current: s.color)
 
         var list = listButton.configuration
-        list?.image = UIImage(nib: .listView)
+        list?.image = UIImage(nib: Self.listSymbol(s.list))
         list?.preferredSymbolConfigurationForImage = NibUIFont.glyph(.panel)
         listButton.configuration = list
         listButton.isSelected = s.list != .plain
         listButton.accessibilityValue = Self.listTitle(s.list)
         listButton.menu = UIMenu(title: String(localized: "List"), children: ListKind.allCases.map { kind in
-            UIAction(title: Self.listTitle(kind), state: kind == s.list ? .on : .off) { [weak self] _ in
+            UIAction(title: Self.listTitle(kind), image: kind == .plain ? nil : UIImage(nib: Self.listSymbol(kind)),
+                     state: kind == s.list ? .on : .off) { [weak self] _ in
                 self?.editor?.setList(kind, toggles: false)
             }
         })
@@ -1230,16 +1324,16 @@ final class PageTextBar: UIInputView {
         return heightChanged
     }
 
-    private func colourMenu(current: RGBA?, dark: Bool) -> UIMenu {
+    private func colourMenu(current: RGBA?) -> UIMenu {
         let inks = NibInk.allCases.map { ink -> UIAction in
             let rgba = PageTextModel.rgba(ink)
-            return UIAction(title: ink.name, image: Self.swatch(ink.uiColor, ring: ink.needsRing(dark: dark)),
+            return UIAction(title: ink.name, image: UIImage.nibSwatch(NibSwatch(ink: ink)),
                             state: rgba == current ? .on : .off) { [weak self] _ in self?.editor?.setColor(rgba) }
         }
         // nil = the box default (RichTextBridge's near-black), which is what a fresh page types in.
-        let standard = UIAction(title: String(localized: "Default"), image: Self.swatch(RGBA.black.uiColor, ring: dark),
+        let standard = UIAction(title: String(localized: "Default"), image: UIImage.nibSwatch(Self.swatch(nil, ink: nil)),
                                 state: current == nil ? .on : .off) { [weak self] _ in self?.editor?.setColor(nil) }
-        let custom = UIAction(title: String(localized: "Custom Colour…")) { [weak self] _ in
+        let custom = UIAction(title: String(localized: "Custom Colour…"), image: UIImage(nib: .customColour)) { [weak self] _ in
             self?.editor?.presentColorPicker()
         }
         return UIMenu(title: String(localized: "Text Colour"),
@@ -1264,19 +1358,22 @@ final class PageTextBar: UIInputView {
         return a
     }
 
-    static func swatch(_ color: UIColor, ring: Bool) -> UIImage {
-        let side = BarLiteral.swatchSide
-        let image = UIGraphicsImageRenderer(size: CGSize(width: side, height: side)).image { _ in
-            let inset = BarLiteral.swatchRing
-            let rect = CGRect(x: inset, y: inset, width: side - 2 * inset, height: side - 2 * inset)
-            color.setFill()
-            UIBezierPath(ovalIn: rect).fill()
-            let outline = UIBezierPath(ovalIn: rect)
-            outline.lineWidth = ring ? BarLiteral.swatchRing : BarLiteral.hairline
-            (ring ? NibUIColor.swatchRing : NibUIColor.swatchHairline).setStroke()
-            outline.stroke()
+    /// The swatch of a text colour: the ink it is, else the colour itself (the box default when nil), ringed by
+    /// NibDesign's rule where it would vanish against the chrome.
+    static func swatch(_ color: RGBA?, ink: NibInk?) -> NibSwatch {
+        if let ink = ink { return NibSwatch(ink: ink) }
+        let c = color ?? .black
+        let hex = UInt32(c.r) << 16 | UInt32(c.g) << 8 | UInt32(c.b)
+        return NibSwatch(id: "pagetext.colour.\(hex)", hex: hex,
+                         name: color == nil ? String(localized: "Default") : String(localized: "Custom"))
+    }
+
+    private static func listSymbol(_ kind: ListKind) -> NibSymbol {
+        switch kind {
+        case .plain, .bullet: return .listBulleted
+        case .number, .numberParen: return .listNumbered
+        case .todo: return .checklist
         }
-        return image.withRenderingMode(.alwaysOriginal)
     }
 
     private func baseConfiguration() -> UIButton.Configuration {
@@ -1289,15 +1386,10 @@ final class PageTextBar: UIInputView {
         return config
     }
 
-    private func iconButton(_ symbol: NibSymbol?, fallback: String, label: String,
-                            action: @escaping (PageTextEditor) -> Void) -> UIButton {
+    private func iconButton(_ symbol: NibSymbol, label: String, action: @escaping (PageTextEditor) -> Void) -> UIButton {
         var config = baseConfiguration()
-        if let symbol = symbol, let image = UIImage(nib: symbol) {
-            config.image = image
-            config.preferredSymbolConfigurationForImage = NibUIFont.glyph(.panel)
-        } else {
-            config.attributedTitle = Self.title(fallback)
-        }
+        config.image = UIImage(nib: symbol)
+        config.preferredSymbolConfigurationForImage = NibUIFont.glyph(.panel)
         let button = UIButton(configuration: config, primaryAction: UIAction { [weak self] _ in
             if let editor = self?.editor { action(editor) }
         })
@@ -1350,7 +1442,7 @@ final class PageTextBar: UIInputView {
         line.backgroundColor = NibUIColor.separator
         line.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            line.widthAnchor.constraint(equalToConstant: BarLiteral.hairline),
+            line.widthAnchor.constraint(equalToConstant: NibStroke.hairline),
             line.heightAnchor.constraint(equalToConstant: NibSpacing.xxl)
         ])
         return line
