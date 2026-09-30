@@ -1,0 +1,41 @@
+{
+  "verdict": "pass",
+  "issues": [
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/FeatTextDocEditingFeature.swift:455-467 (TextDocEditingController.execute); SlashMenu.swift:155-184 (SlashPlanner.calls), :588-605 (interceptMarkdown), :697-714 (runSlash)",
+      "problem": "A multi-call action (slash pick, '--- ' divider shortcut, duplicate) runs each call through its own editor.run, and each run is queued separately. A keystroke commit queued while call 1 is running therefore lands between the calls. NibContracts Undo.record merges a changeset only when top.group == cs.group, so the action becomes two or three undo steps instead of one. In the same window, a character typed right after Return or space is committed from a text view that still shows '/query' or '---'. That puts the query back, or on a block that is now a divider it is refused with a toast and the character is lost. Separately, SlashPlanner puts the '/query' cleanup before a plugin's insert command. A plugin command that throws then leaves the line with its query removed and nothing inserted.",
+      "fix": "Run the whole list as ONE queued call: `guard let value = await editor.run(CommandIDs.batch, [\"calls\": .array(calls.map { $0.json })], group: group)`. Map `value[\"results\"]` to the per-call values and return nil when any `ok` is false. In SlashPlanner.calls, append the insert call first and the text block.update / block.delete after it (update focusResultOf to 0). Nothing then changes when a plugin insert fails."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/FeatTextDocEditingFeature.swift:334-346 (keyCommands, menu navigation); SlashMenu.swift:567-576",
+      "problem": "While the slash or Turn Into popover is open, Up/Down/Return/Tab/Escape are registered unconditionally with wantsPriorityOverSystemBehavior. (1) With a hardware keyboard and 'No matching blocks' showing, Return and Tab call state.pick on an empty list and do nothing. The text interceptor's intended fall-through (close the menu and let Return split the line) is never reached. (2) updateSlash keeps the menu open while the text view has marked text. The key commands then take the IME's candidate-navigation and commit keys, so a CJK query typed after '/' cannot be converted or committed with Return or the arrows.",
+      "fix": "In keyCommands(), add the navigation commands only when `editor.focusedTextView?.markedTextRange == nil`. Add return/tab only when `!state.choices.isEmpty`. Alternatively, make their handler call closeSlash() and then `editor.focusedTextView?.insertText(\"\\n\")` when the list is empty, so Return keeps its meaning."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatTextDocTests/SlashMenuTests.swift",
+      "problem": "The acceptance logic is well covered: filtering and aliases, planners, every Turn Into pair, reorder planning and commitMove. The editor glue has no test: calls(for:) and perform with a focused block (move, duplicate focus hand-off, delete focus, toggle done, ⌃⌘ kind keys), inlineCall/applyInline turning a text-view selection into one block.update (including the 'caption' field for image captions), interceptSlash → updateSlash → pickSlash → runSlash, interceptMarkdown, and keyCommands() while a menu is open. testShortcutParamsComeFromTheWindow… only checks the empty case.",
+      "fix": "Add editor-level tests. Put the TextDocViewController in a UIWindow, lay it out, and focus with `editor.focus(Fixtures.paragraphBlockID, at: 0)` (or call `textViewDidBeginEditing(cell.textView)` and set `selectedRange`). Then assert: sessionParams(.moveDown/.duplicate/.deleteBlock/.heading2) give the expected block.* calls; inlineCall(.bold) over a range is one block.update with `text` (and with `caption` in an image caption); typing '/' + 'h2' via shouldChangeTextIn/insertText opens the menu with Heading 2 first, and pickSlash(0) leaves a heading2 in one undo step; '# ' on a paragraph becomes heading1; keyCommands() with an empty choice list has no Return command (after the fix above)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/BlockDragHandles.swift:292-294 (lift scale), :353-358 (autoscroll edge and speed)",
+      "problem": "The drag ghost's lift uses a literal `CGAffineTransform(scaleX: 1.02, y: 1.02)`. The autoscroll zone (`hitTarget * 1.5`) and speed (`NibSpacing.m` per frame) are ad-hoc values dressed as tokens. The Slop checklist allows tokens only. The scale also still runs under Reduce Motion (animateUIKit only swaps the spring).",
+      "fix": "File docs/contract-requests/F102-lift-scale.md asking for a public `NibMotion.liftScale` (DropletStyle already uses 1.02 internally) and an autoscroll edge/speed pair. Until then, keep the three values in one internal `DragMetrics` enum with a comment that cites the request. Skip the scale when `UIAccessibility.isReduceMotionEnabled`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/BlockDragHandles.swift:151-168 (refresh), :48-80 (BlockHandleView)",
+      "problem": "The handle appears only for the hovered block or the block whose text view is focused. On touch without a pointer, a divider, table, custom block or image (unless its caption is being edited) never gets a handle, so it cannot be dragged. DESIGN.md §14.17 says handles appear 'on hover or long-press'. BlockHandleView is also a plain UIView that cannot take Full Keyboard Access focus (Slop: focus rings visible for Full Keyboard Access).",
+      "fix": "In the cell decorator, add a single-tap recognizer to non-text cells that sets the overlay's shown block (a `selected` id next to `hovered`, cleared on the next focus change), so the handle appears beside the tapped block. In BlockHandleView, override `canBecomeFocused` to return true, set `focusEffect = UIFocusHaloEffect()`, and call onActivate from pressesBegan for Space/Return."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatTextDoc/InlineFormatting.swift:459-460 (FormattingBar.add)",
+      "problem": "The formatting bar's pointer tooltips show only the title (Bold, Inline Code, Highlight…). The ⌘B / ⌘E / ⇧⌘H / ⌃⌘= shortcuts never appear there. The Slop checklist requires that 'every shortcut shows its KeyHint'.",
+      "fix": "Map the bar item to its TextDocShortcut (.style(.bold) → .bold, .highlight → .highlight, .turnInto → .turnInto…). Set `b.toolTip = \"\\(title)  \\(shortcut.display)\"`, reading the live descriptor (`app.content.keyCommands.get(s.id)?.shortcut`) so remapped keys show correctly."
+    }
+  ]
+}

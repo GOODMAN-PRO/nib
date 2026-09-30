@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatScan/ScanCommands.swift:65-110 (ScanDocuments.run, ScanPipeline.prepare) and DocumentCamera.capture:749",
+      "problem": "Nothing is shown while the scan is processed. DocumentCamera.capture dismisses the camera as soon as the person taps Save. After that, prepare runs JPEG encoding plus accurate Vision OCR one sheet at a time (about 5 s per sheet on the CI simulator, roughly 1 to 2 s per sheet on a device). Assets are stored and pages inserted only after all of that. For a 10 to 30 page scan the person gets 10 s or more with no indicator, no progress and no VoiceOver announcement, and then a notebook opens or pages appear. The scan looks lost, and scanning again creates duplicates. DESIGN.md 14.18 requires a loading treatment for import-like work ('a determinate 3 pt bar where the action was started') and says every state says what is happening.",
+      "fix": "Give ScanPipeline.prepare a progress callback `(done: Int, total: Int) -> Void`, called on the main actor after each sheet. In ScanDocuments.run, before prepare, get `let host = ctx.activeSession?.floatingHost ?? ctx.navigator?.floatingHost`. Present a HUD with `host?.present(\"scan.progress\") { NibHUDGroup(id: \"scan.progress\") { NibHUDText(String(localized: \"Reading scanned pages\"), secondary: \"\\(done) of \\(total)\"); NibProgressBar(value: Double(done) / Double(total)) } }`, built in a small view in QRScannerView.swift or a new internal view in the module. Re-present it with new values from the callback, and `host?.dismiss(\"scan.progress\")` in a `defer` that covers prepare, store and insert. Post an AccessibilityNotification.Announcement when it starts. In the tests, make FakeFloatingHost record present and dismiss ids, and assert that a 3-sheet scan presents \"scan.progress\" and dismisses it both on success and on the FullAssetStore failure path."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatScan/QRScannerView.swift:57-66 (QRScannerModel.found), 252-257 (didAdd), 138-143 (result text)",
+      "problem": "Untrusted input at the confirm step. Every newly recognised code replaces the code on the panel at once (recognizesMultipleItems: true), so the target of 'Open Link' can change between reading and tapping. A second code coming into view, such as a sticker placed next to a real one, is opened instead of the one the person read. The link is also middle-truncated at 4 lines, so a long host such as 'bank.example.com.<long>.evil.test' can have its registrable part hidden, although the panel is meant to show the code in full.",
+      "fix": "While a code is on the panel, ignore didAdd. Replace it only on didTapOn, or after dismissCode(). If replacing on didAdd is kept, set `lastChange = Date()` in found() and make confirm() a no-op for 0.5 s after a change. Show the URL host on its own line with no truncation (`Text(payload.url?.host() ?? \"\")`, NibFont.headline) above the full link, and let the link wrap fully with `.lineLimit(nil)` inside the panel's scroll limit. Extend testScannerModelShowsTheLatestCodeAndFinishesOnce to check that a second found() does not replace a shown code and that confirm() right after a swap does nothing."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatScan/ScanCommands.swift:367 (ScanPipeline.insert)",
+      "problem": "Caller-chosen ids are checked in ScanTarget.resolve before the camera opens, which can be minutes before insert. When the pages go into an existing notebook, insert reuses whatever record has that id: `content.page(ids[i]) ?? PageRecord(id:)`. If another caller (AI batch, plugin, sync) creates a page with that id in the meantime, the scan silently overwrites that page's background, size, rotation, order and ext. That reuse is only meant for the new notebook's stand-in first page.",
+      "fix": "Pass `created` (or the stand-in id) into insert. Reuse an existing record only for the stand-in. For any other id, `guard content.page(ids[i]) == nil else { throw NibError(.invalidParams, \"page id \\(ids[i].raw) already exists\", path: \"$.ids\") }`, so the mutate rolls back. Add a test where a FakeScanDevice hook adds page \"SCANPAGE0001\" through h.run(\"page.add\"...) or tx.put during captureDocuments, then scan.documents with that id throws invalidParams and the existing page is unchanged."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatScan/ScanCommands.swift:744-754 (DocumentCamera.capture), 659-666 (ScanStage.presenter); QRScannerView.swift:22-39 (QRScannerSession.run)",
+      "problem": "Both waits resume only from the presented controller's callbacks. If present(_:animated:) does nothing, the command awaits forever and the continuation leaks. That happens when presenter() stops at a controller whose presented controller is being dismissed (the walk skips it but its presenter still has presentedViewController set), or when the window is detached.",
+      "fix": "In ScanStage.presenter(), after the walk, `guard top.presentedViewController == nil, top.view.window != nil else { throw NibError.unavailable(\"the window is busy; try again\") }`. In both capture paths, present with a completion that checks `camera.presentingViewController != nil` (host.presentingViewController for the QR reader). If it is nil, resume with NibError.unavailable (DocumentCameraDelegate.finish(.failure(...)); model.finish(nil) for the reader)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatScan/ScanCommands.swift:305-318, 348-352 (ScanPipeline.prepare / store)",
+      "problem": "Memory on long scans: every sheet's full-resolution JPEG (about 1 to 3 MB each) plus its OCR blocks is kept in `pages` until the whole scan has been processed. Only then are they written. A 50-sheet scan holds about 100 MB on top of the VNDocumentCameraScan, which contradicts the 'never holds every full-size image' intent.",
+      "fix": "Stream the pipeline. For an existing notebook, call store.put for each sheet right after process() and keep only the AssetRef, size and blocks (a ScannedPage without jpeg). For a new notebook, create it after the first sheet is processed (its size is known then) and stream the rest the same way. The existing deletePermanently cleanup still covers failures. Add a test with a recording AssetStore that checks put is called once per sheet, in order, before the mutate."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatScan/ScanCommands.swift:696 (SystemScanDevice.captureDocuments)",
+      "problem": "When camera access is off, Scan Document only throws, so the shell shows the error message as a toast with no way to fix it. Scan QR Code shows a full state with an 'Open Settings' action. DESIGN.md 14.18 says every message states what to do next with a verb-plus-object action.",
+      "fix": "Before throwing CameraAccess.deniedError, post `(stage.session?.floatingHost ?? stage.navigator?.floatingHost)?.postToast(String(localized: \"Camera access is off for Nib\"), actionTitle: String(localized: \"Open Settings\")) { CameraAccess.openSettings() }`. Then return nil (cancelled) for the user principal, or keep throwing unavailable for other principals so they still get an error."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatScan/ScanCommands.swift:473-506 (ScanText)",
+      "problem": "The 'nib.scanText' boxes are page points computed for rotation 0 and the size at scan time. page.rotate (which turns the image background) or a page size change leaves them pointing at the wrong place, so search highlights on a scanned sheet that was rotated upright land on the wrong words.",
+      "fix": "Register a commit observer in FeatScanFeature.register (the same mechanism F031 uses for attach-after-move). When a page that has PageRecord.scanTextExtKey changes rotation or size, map each bbox back through the inverse of the old `PageRecord.backgroundTransform(sourceSize:rotation:pageSize:)` and forward through the new one. Write the result with tx.put in the same group, and store the source pixel size alongside so both transforms can be rebuilt. At minimum, document in ScanText that the boxes assume rotation 0. Add a test: scan, page.rotate 90, and check that the box still covers the same image region."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatScanTests/FeatScanTests.swift",
+      "problem": "The QR reader is a new screen (Clear bar, Deep result panel, two camera-problem states), but it has no snapshots. DESIGN.md 15.7 asks for Light, Dark and AX3 snapshots of every new screen, and NibTesting now provides NibSnapshot (contracts-v2 G20). Only the model and the action titles are tested.",
+      "fix": "Add a test that renders `NibSnapshot.images(QRResultPanel(payload: QRPayload(\"https://example.com/a-very-long-path\"), onClose: {}, action: {}), size: CGSize(width: 375, height: 260))` for each kind, and QRProblemView for .denied and .unavailable. Assert each variant (light, dark, largeText) is non-nil. Assert `NibSnapshot.fittingSize(..., width: 375, variant: .largeText).width <= 375`, so nothing overflows iPhone width at AX3."
+    }
+  ]
+}
