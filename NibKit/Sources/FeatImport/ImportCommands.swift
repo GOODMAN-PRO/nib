@@ -46,10 +46,17 @@ enum ImportFormats {
 
 /// A file that was not imported, with the error's code, message and what to do next.
 struct ImportFailure: Codable, Equatable {
+    /// The input as the caller gave it.
     var url: String
+    /// The file inside that zip or folder that was skipped while the rest came in ("Notes.zip › Chemistry/a.key");
+    /// nil when `url` itself was not imported.
+    var entry: String?
     var code: String
     var message: String
     var hint: String?
+
+    /// What the dialog and the toast name: the skipped entry, else the file.
+    var title: String { entry ?? ImportNaming.displayName(of: url) }
 }
 
 /// Result of `import.files` and `import.pick`.
@@ -58,9 +65,10 @@ struct ImportResult: Codable, Equatable {
     var refs: [String]
     /// Pages inserted into an existing document ("page:D/P"), in page order.
     var pages: [String]?
-    /// Library folders created for imported folder trees, zip archives and backups ("folder:F").
+    /// Library folders that imported folder trees, zip archives and backups went into ("folder:F"): created, or
+    /// existing folders with the same name that they joined.
     var folders: [String]?
-    /// Files that could not be imported while others were.
+    /// Files that could not be imported while others were, and files skipped inside zips and folders.
     var failed: [ImportFailure]?
     /// The user closed the import dialog or the Files picker.
     var cancelled: Bool?
@@ -425,6 +433,50 @@ final class ImportStaging {
     }
 }
 
+// MARK: - Reports
+
+/// What one importer call did besides returning documents: entries of a zip or folder it skipped (and why), the library
+/// folders it put things in, and whether a file went through a lossy conversion (Word, PowerPoint, web pages → PDF).
+/// Importers only return document ids, so the engine hands a report down as a task local (`ImportReporting`) around
+/// each call. Main actor only.
+@MainActor
+final class ImportReport {
+    struct Skipped {
+        /// "Notes.zip › Chemistry/notes.key".
+        var entry: String
+        var error: NibError
+    }
+
+    private(set) var skipped: [Skipped] = []
+    /// Every folder used, in the order it was first used.
+    private(set) var folders: [FolderID] = []
+    /// The folders that sit right in the destination (a dropped folder, the top level of a zip).
+    private(set) var topFolders: [FolderID] = []
+    var converted = false
+
+    func skip(_ entry: String, _ error: Error) {
+        skipped.append(Skipped(entry: entry, error: NibError.wrap(error)))
+    }
+
+    func use(_ folder: FolderID, top: Bool) {
+        if !folders.contains(folder) { folders.append(folder) }
+        if top, !topFolders.contains(folder) { topFolders.append(folder) }
+    }
+
+    /// Takes in what a nested call reported (a zip inside a zip): its entries under `prefix`, its top folders as top
+    /// folders here only when `top`.
+    func absorb(_ other: ImportReport, prefix: String, top: Bool) {
+        for s in other.skipped { skipped.append(Skipped(entry: prefix + s.entry, error: s.error)) }
+        for f in other.folders { use(f, top: top && other.topFolders.contains(f)) }
+        if other.converted { converted = true }
+    }
+}
+
+/// The report of the importer call running in this task (nil outside `import.files`).
+enum ImportReporting {
+    @TaskLocal static var current: ImportReport?
+}
+
 // MARK: - Dispatch
 
 /// Files that one importer call handles: a run of images becomes one notebook (or consecutive pages).
@@ -639,10 +691,11 @@ enum ImportEngine {
             }
         }
 
-        let foldersBefore = folderIDs(library)
         var refs: [String] = []
         var pageRefs: [String] = []
         var created: [DocumentID] = []
+        var folders: [FolderID] = []
+        var topFolders: [FolderID] = []
         var importedFiles = 0
         var done = 0
         for group in groups(staged.map { (url: $0.url, isDirectory: $0.isDirectory) }, content: ctx.content) {
@@ -652,8 +705,11 @@ enum ImportEngine {
                               label: ImportUI.progressLabel(files[0].source.name, index: done, count: staged.count))
             let before = dest.doc.flatMap { d in try? ctx.workspace.content(d).livePages.map { $0.id } } ?? []
             let target = dest.target(displayName: ImportNaming.title(of: files[0].url), ids: idQueue)
+            let report = ImportReport()
             do {
-                let docs = try await run(group, urls: files.map { $0.url }, target: target, ctx: ctx)
+                let docs = try await ImportReporting.$current.withValue(report) {
+                    try await run(group, urls: files.map { $0.url }, target: target, ctx: ctx)
+                }
                 for d in docs where !refs.contains(NodeRef.document(d).description) {
                     refs.append(NodeRef.document(d).description)
                 }
@@ -661,30 +717,37 @@ enum ImportEngine {
                     let known = Set(before)
                     let added = ((try? ctx.workspace.content(d).livePages.map { $0.id }) ?? []).filter { !known.contains($0) }
                     pageRefs += added.map { NodeRef.page(d, $0).description }
-                    idQueue.removeFirst(min(added.count, idQueue.count))
+                    consumeIDs(&idQueue, takenBy: added)
                     if let last = added.last {                                     // the next file follows this one
                         dest.position = .after
                         dest.anchor = last
                     }
                 } else {
                     created += docs
-                    idQueue.removeFirst(min(docs.count, idQueue.count))
+                    consumeIDs(&idQueue, takenBy: docs)
                     rememberSource(files, docs: docs, ctx: ctx)
                 }
+                for f in report.folders where !folders.contains(f) { folders.append(f) }
+                for f in report.topFolders where !topFolders.contains(f) { topFolders.append(f) }
                 importedFiles += files.count
-                for f in files { consumeImported(f.source.original) }
+                // What was skipped inside a zip or folder is listed; its source stays where it was, so nothing the
+                // person hasn't got in the library is deleted.
+                for s in report.skipped {
+                    failures.append(failure(files[0].source.original, s.error, entry: s.entry))
+                }
+                for f in files {
+                    if report.skipped.isEmpty {
+                        consumeImported(f.source.original, converted: report.converted)
+                    } else {
+                        keepSource(f.source.original)
+                    }
+                }
             } catch {
                 for f in files { failures.append(failure(f.source.original, error)) }
             }
             done += files.count
         }
-        let newFolders = folderIDs(library).subtracting(foldersBefore)
-        let newFolderNodes = library.allNodes().filter { newFolders.contains($0.id) }
-            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-        let folderRefs = newFolderNodes.map { NodeRef.folder($0.id).description }
-        // The folders made right at the destination (a dropped folder, the top level of a zip).
-        let topFolders = newFolderNodes.filter { $0.parent == dest.folder }.map { $0.id }
-
+        let folderRefs = folders.map { NodeRef.folder($0).description }
         let failed = failures.map { $0.0 }
         if importedFiles == 0, session == nil, let first = failures.first {
             var e = first.1
@@ -695,8 +758,9 @@ enum ImportEngine {
                                   folders: folderRefs.isEmpty ? nil : folderRefs, failed: failed.isEmpty ? nil : failed)
         if let session = session {
             session.finish(imported: importedFiles, failures: failed, stopped: session.isCancelled)
-            // The person has seen what failed; Open In and share copies are not offered again.
-            for f in failed { consumeInboxCopy(f.url) }
+            // The person has seen what failed; Open In and share copies of files that failed as a whole are not offered
+            // again. A zip or folder imported in part stays (it still holds what was skipped).
+            for f in failed where f.entry == nil { consumeInboxCopy(f.url) }
         } else if ctx.principal.isUser, !failed.isEmpty {
             ImportUI.reportPartialFailure(failed, ctx: ctx)
         }
@@ -771,8 +835,11 @@ enum ImportEngine {
         }
     }
 
-    private static func folderIDs(_ library: LibraryService) -> Set<FolderID> {
-        Set(library.allNodes().filter { $0.kind == .folder }.map { $0.id })
+    /// Drops the caller's ids the new documents or pages took (from the head of the queue). Ids an importer ignored
+    /// (packages, zips, folders, other owners' importers) stay for the next file.
+    static func consumeIDs(_ ids: inout [NibID], takenBy created: [NibID]) {
+        let taken = Set(created)
+        while let first = ids.first, taken.contains(first) { ids.removeFirst() }
     }
 
     /// Import-in-place: a PDF opened from a Files provider keeps a bookmark to its source, so "Save changes to
@@ -797,13 +864,26 @@ enum ImportEngine {
         try? FileManager.default.removeItem(at: url)
     }
 
-    /// After a successful import: inbox copies, plus loose Documents files the inbox scan offered, are removed.
-    private static func consumeImported(_ original: String) {
+    /// After a complete import: inbox copies, plus loose Documents files the inbox scan offered, are removed. A loose
+    /// file that went through a lossy conversion (Word, PowerPoint, web pages → PDF) is the person's original: it
+    /// stays, and the scan does not offer it again.
+    private static func consumeImported(_ original: String, converted: Bool) {
         consumeInboxCopy(original)
         guard let url = URL(string: original), url.isFileURL else { return }
         let path = url.standardizedFileURL.path
         guard consumableFiles.remove(path) != nil else { return }
+        if converted {
+            InboxScanner.decline(url)
+            return
+        }
         try? FileManager.default.removeItem(at: url)
+    }
+
+    /// A source imported in part stays where it is; the inbox scan does not offer it again until it changes.
+    private static func keepSource(_ original: String) {
+        guard let url = URL(string: original), url.isFileURL else { return }
+        consumableFiles.remove(url.standardizedFileURL.path)
+        InboxScanner.decline(url)
     }
 
     /// Shows what arrived (`ImportReveal.plan`).
@@ -850,9 +930,9 @@ enum ImportEngine {
         inFlight.subtract(paths)
     }
 
-    private static func failure(_ original: String, _ error: Error) -> (ImportFailure, NibError) {
+    private static func failure(_ original: String, _ error: Error, entry: String? = nil) -> (ImportFailure, NibError) {
         let e = NibError.wrap(error)
-        return (ImportFailure(url: original, code: e.code.rawValue, message: e.message, hint: e.hint), e)
+        return (ImportFailure(url: original, entry: entry, code: e.code.rawValue, message: e.message, hint: e.hint), e)
     }
 }
 

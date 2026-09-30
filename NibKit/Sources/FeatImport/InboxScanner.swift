@@ -63,6 +63,18 @@ enum ShareHandoff {
     @MainActor
     static var lastTaken: Date?
 
+    /// The pasteboard's `changeCount` when the person last refused the paste prompt. The items stay on the pasteboard
+    /// (for up to an hour), so the scan leaves them alone until the pasteboard changes; opening the hand-off link
+    /// again asks again.
+    @MainActor
+    static var deniedChangeCount: Int?
+
+    /// True when the scan on activation should take the waiting items (and so maybe show the paste prompt).
+    @MainActor
+    static func shouldOffer(isWaiting: Bool, changeCount: Int) -> Bool {
+        isWaiting && deniedChangeCount != changeCount
+    }
+
     static func isHandoffLink(_ string: String) -> Bool {
         guard let c = URLComponents(string: string), c.scheme?.lowercased() == NibFormat.urlScheme,
               c.host?.lowercased() == "import" else { return false }
@@ -84,11 +96,13 @@ enum ShareHandoff {
         }
         let urls = try write(board.items, into: dir)
         guard !urls.isEmpty else {
+            deniedChangeCount = board.changeCount
             throw NibError(.userDenied, "Nib couldn't read what was shared",
                            hint: "share it again and allow pasting when iOS asks")
         }
         board.items = []
         lastTaken = Date()
+        deniedChangeCount = nil
         return urls
     }
 
@@ -172,7 +186,14 @@ enum InboxFiles {
 enum InboxScanner {
     private static var observer: NSObjectProtocol?
     private static var busy = false
-    private static var declined = Set<String>()
+    private(set) static var declined = Set<String>()
+
+    /// Leaves `url` alone from now on, until it changes or Nib relaunches (a file imported in part, a converted
+    /// original).
+    static func decline(_ url: URL) {
+        guard url.isFileURL else { return }
+        declined.insert(InboxFiles.key(url))
+    }
 
     static func start(_ app: NibApp) {
         guard !NibApp.isHostlessTest, observer == nil else { return }
@@ -197,7 +218,7 @@ enum InboxScanner {
               let root = nav.rootViewController, root.view.window != nil, root.presentedViewController == nil else { return }
         busy = true
         defer { busy = false }
-        if ShareHandoff.isWaiting {
+        if ShareHandoff.shouldOffer(isWaiting: ShareHandoff.isWaiting, changeCount: UIPasteboard.general.changeCount) {
             await runImport([ShareHandoff.link], app: app, navigator: nav)
             return
         }

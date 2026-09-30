@@ -297,14 +297,23 @@ struct ImportDialogView: View {
         }
     }
 
+    /// The library and its folders as an outline: `NibOutlineRow` indents per level (capped), marks the selected
+    /// folder (emphasis title, fill, Selected trait) and keeps 44 pt rows.
     private var folderSection: some View {
         Section {
             ForEach(model.folders) { option in
-                choiceRow(option.title, icon: option.folder == nil ? NibSymbol.library : NibSymbol.folder,
-                          selected: model.folder == option.folder,
-                          indent: CGFloat(min(option.depth, NibMetrics.outlineMaxDepth)) * NibMetrics.outlineIndent) {
+                Button {
                     model.folder = option.folder
+                } label: {
+                    NibOutlineRow(option.title, depth: option.depth + 1, isSelected: model.folder == option.folder,
+                                  reservesDisclosure: false) {
+                        Image(nib: option.folder == nil ? .library : .folder)
+                            .foregroundStyle(NibColor.labelSecondary)
+                            .accessibilityHidden(true)
+                    }
                 }
+                .buttonStyle(.plain)
+                .hoverEffect(.highlight)
             }
         } header: {
             Text(String(localized: "Folder"))
@@ -328,8 +337,9 @@ struct ImportDialogView: View {
         }
     }
 
-    /// A selectable row: the checkmark and the Selected trait carry the choice (never colour alone).
-    private func choiceRow(_ title: String, icon: NibSymbol?, selected: Bool, indent: CGFloat = 0,
+    /// A selectable row of a flat list (mode, position): the checkmark and the Selected trait carry the choice (never
+    /// colour alone).
+    private func choiceRow(_ title: String, icon: NibSymbol?, selected: Bool,
                            action: @escaping () -> Void) -> some View {
         Button(action: action) {
             NibRow(title, icon: icon) {
@@ -340,7 +350,6 @@ struct ImportDialogView: View {
                         .accessibilityHidden(true)
                 }
             }
-            .padding(.leading, indent)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -401,8 +410,7 @@ struct ImportDialogView: View {
         List {
             Section {
                 ForEach(Array(model.failures.enumerated()), id: \.offset) { entry in
-                    NibRow(ImportNaming.displayName(of: entry.element.url), subtitle: entry.element.message,
-                           icon: .warningTriangle)
+                    NibRow(entry.element.title, subtitle: entry.element.message, icon: .warningTriangle)
                         .accessibilityElement(children: .combine)
                 }
             } header: {
@@ -435,6 +443,9 @@ final class ImportDialogSession {
     private weak var navigator: SceneNavigator?
     private var controller: UIViewController?
     private var pending: CheckedContinuation<ImportDialogOutcome, Never>?
+    /// Watches the dialog's window while it waits for a choice: closing that window (app switcher, Stage Manager)
+    /// never calls `onChoose`.
+    private var disconnectObserver: NSObjectProtocol?
 
     init(navigator: SceneNavigator, library: LibraryService?, workspace: Workspace, session: EditorSession?,
          sources: [ImportSource], preset: ImportDestination?) {
@@ -469,6 +480,7 @@ final class ImportDialogSession {
             pending = continuation
             model.onChoose = { [weak self] choice in self?.resolve(choice.map { .chosen($0) } ?? .cancelled) }
             model.onClose = { [weak self] in self?.dismiss() }
+            watchScene(of: navigator)
             let host = UIHostingController(rootView: ImportDialogView(model: model))
             host.modalPresentationStyle = .formSheet
             host.isModalInPresentation = true
@@ -491,7 +503,9 @@ final class ImportDialogSession {
     func finish(imported: Int, failures: [ImportFailure], stopped: Bool) {
         let message: String
         if !failures.isEmpty {
-            message = String(localized: "\(failures.count) of \(model.names.count) files were not imported.")
+            // Files skipped inside a zip or folder count too, so this is not "n of the files chosen".
+            message = failures.count == 1 ? String(localized: "1 file was not imported.")
+                                          : String(localized: "\(failures.count) files were not imported.")
         } else if stopped {
             message = String(localized: "Import stopped. \(imported) of \(model.names.count) files imported.")
         } else {
@@ -515,6 +529,7 @@ final class ImportDialogSession {
     private func resolve(_ outcome: ImportDialogOutcome) {
         guard let continuation = pending else { return }
         pending = nil
+        stopWatchingScene()
         if case .chosen = outcome { model.phase = .importing } else { dismiss() }
         continuation.resume(returning: outcome)
     }
@@ -522,10 +537,32 @@ final class ImportDialogSession {
     private func dismiss() {
         controller?.dismiss(animated: true)
         controller = nil
+        stopWatchingScene()
         if let continuation = pending {
             pending = nil
             continuation.resume(returning: .cancelled)
         }
+    }
+
+    /// When the window showing the dialog goes away before the person chose, the call ends as `.notShown`: nothing is
+    /// removed, the claimed files are released and the inbox scan offers them again.
+    private func watchScene(of navigator: SceneNavigator) {
+        stopWatchingScene()
+        guard let scene = navigator.rootViewController?.view.window?.windowScene else { return }
+        disconnectObserver = NotificationCenter.default.addObserver(forName: UIScene.didDisconnectNotification,
+                                                                    object: scene, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.sceneDisconnected() }
+        }
+    }
+
+    func sceneDisconnected() {
+        controller = nil
+        resolve(.notShown)
+    }
+
+    private func stopWatchingScene() {
+        if let observer = disconnectObserver { NotificationCenter.default.removeObserver(observer) }
+        disconnectObserver = nil
     }
 }
 
@@ -640,7 +677,7 @@ enum ImportUI {
     /// Files that failed while others were imported, as a toast in the invoking window.
     static func reportPartialFailure(_ failures: [ImportFailure], ctx: CommandContext) {
         guard let first = failures.first else { return }
-        let name = ImportNaming.displayName(of: first.url)
+        let name = first.title
         let message = failures.count == 1
             ? String(localized: "“\(name)” wasn't imported: \(first.message)")
             : String(localized: "\(failures.count) files weren't imported. First: “\(name)”: \(first.message)")

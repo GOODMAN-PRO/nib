@@ -36,6 +36,21 @@ final class FeatImportTests: XCTestCase {
 
     private func urls(_ files: [URL]) -> JSONValue { .array(files.map { .string($0.absoluteString) }) }
 
+    /// A folder of its own inside Documents/Inbox, where iOS puts Open In copies; removed after the test.
+    private func inboxDir() throws -> URL {
+        let dir = ImportLocations.openInInbox.appendingPathComponent("FeatImportTests-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        return dir
+    }
+
+    private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath: url.path) }
+
+    /// Every path under `dir`, sorted ([] when it does not exist).
+    private func listing(_ dir: URL) -> [String] {
+        ((FileManager.default.enumerator(atPath: dir.path)?.allObjects as? [String]) ?? []).sorted()
+    }
+
     private func livePages(_ h: Harness, _ doc: DocumentID = Fixtures.docID) throws -> [PageID] {
         try h.app.workspace.content(doc).livePages.map { $0.id }
     }
@@ -224,6 +239,26 @@ final class FeatImportTests: XCTestCase {
         XCTAssertEqual(result["refs"]?.arrayValue?.count, 2)
         let folders = Set((result["folders"]?.arrayValue ?? []).compactMap { $0.stringValue })
         XCTAssertEqual(folders, ["folder:" + physics.id.raw, "folder:" + chemistry.id.raw])
+        // The file nothing could import is listed under its path in the zip.
+        let failed = result["failed"]?.arrayValue ?? []
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertEqual(failed.first?["url"]?.stringValue, zip.absoluteString)
+        XCTAssertEqual(failed.first?["entry"]?.stringValue, "Science.zip › Chemistry/notes.xyz")
+        XCTAssertEqual(failed.first?["code"]?.stringValue, "unsupported")
+    }
+
+    func testZipsThatJoinAnExistingFolderReportThatFolder() async throws {
+        let h = harness()
+        let root = try tempDir()
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try writePNG("fixtures/Extra.png", in: source)
+        let zip = root.appendingPathComponent("More.zip")
+        try ArchiveIO.archive(contentsOf: source, to: zip)
+
+        let result = try await h.run("import.files", ["urls": urls([zip]), "folder": "lib"])
+        XCTAssertEqual(result["folders"], ["folder:FIXTUREFLD01"] as JSONValue, "an existing folder with the name is reused")
+        XCTAssertTrue(h.library.children(of: Fixtures.folderID).contains { $0.kind == .document && $0.title == "Extra" })
+        XCTAssertEqual(h.library.children(of: nil).filter { $0.kind == .folder }.count, 1)
     }
 
     func testZippedLibraryFoldersKeepTheirStyle() async throws {
@@ -252,27 +287,136 @@ final class FeatImportTests: XCTestCase {
         let data = backup.appendingPathComponent(NibFormat.libraryDirectory, isDirectory: true)
         let template = "Planner-" + UUID().uuidString + ".pdf"
         let trashed = "Old-" + UUID().uuidString + ".png"
+        let plugin = "plugins/example.restored/extra-" + UUID().uuidString + ".js"
         try FileManager.default.createDirectory(at: data.appendingPathComponent("templates/Imported", isDirectory: true),
                                                 withIntermediateDirectories: true)
         try Data("%PDF-1.4".utf8).write(to: data.appendingPathComponent("templates/Imported/" + template))
         try writePNG("trash/" + trashed, in: data)
+        try FileManager.default.createDirectory(at: data.appendingPathComponent("plugins/example.restored", isDirectory: true),
+                                                withIntermediateDirectories: true)
+        try Data("nib.log('hi')".utf8).write(to: data.appendingPathComponent(plugin))
         try writePNG("Physics/Waves.png", in: backup)
         let zip = root.appendingPathComponent("Nib Backup.zip")
         try ArchiveIO.archive(contentsOf: backup, to: zip)
         let restored = h.library.metadataURL.appendingPathComponent("templates/Imported/" + template)
         let notRestored = h.library.metadataURL.appendingPathComponent("trash/" + trashed)
+        let pluginCopy = h.library.metadataURL.appendingPathComponent(plugin)
         addTeardownBlock {
             try? FileManager.default.removeItem(at: restored)
             try? FileManager.default.removeItem(at: notRestored)
+            try? FileManager.default.removeItem(at: pluginCopy)
         }
 
         let result = try await h.run("import.files", ["urls": urls([zip]), "folder": "lib"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: restored.path), "library data joins this library")
         XCTAssertFalse(FileManager.default.fileExists(atPath: notRestored.path), "the backup's trash stays out")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: pluginCopy.path), "plugins are installed again through their review")
         let physics = try XCTUnwrap(h.library.children(of: nil).first { $0.kind == .folder && $0.title == "Physics" })
         XCTAssertEqual(h.library.children(of: physics.id).map { $0.title }, ["Waves"])
         XCTAssertFalse(h.library.allNodes().contains { $0.title == NibFormat.libraryDirectory })
         XCTAssertEqual(result["refs"]?.arrayValue?.count, 1)
+    }
+
+    func testOtherCallersGetABackupsFoldersButNotItsLibraryData() async throws {
+        let h = harness()
+        let root = try tempDir()
+        let backup = root.appendingPathComponent("backup", isDirectory: true)
+        let data = backup.appendingPathComponent(NibFormat.libraryDirectory, isDirectory: true)
+        let fm = FileManager.default
+        for dir in ["plugin-data/other.plugin", "plugins/installed.plugin", "ai"] {
+            try fm.createDirectory(at: data.appendingPathComponent(dir, isDirectory: true), withIntermediateDirectories: true)
+        }
+        // A new device's synced settings, another plugin's storage, a planted chat, a file inside a plugin folder.
+        try Data(#"{"plugins.galleries": ["https://gallery.invalid"]}"#.utf8).write(to: data.appendingPathComponent("prefs.0badc0de.json"))
+        try Data("{}".utf8).write(to: data.appendingPathComponent("plugin-data/other.plugin/storage.0badc0de.json"))
+        try Data("{}\n".utf8).write(to: data.appendingPathComponent("ai/chat.0badc0de.jsonl"))
+        try Data("x".utf8).write(to: data.appendingPathComponent("plugins/installed.plugin/extra.js"))
+        try writePNG("Physics/Waves.png", in: backup)
+        let zip = root.appendingPathComponent("Nib Backup.zip")
+        try ArchiveIO.archive(contentsOf: backup, to: zip)
+        let ref = try h.assets.putTemporary(try Data(contentsOf: zip), ext: "zip")
+        let before = listing(h.library.metadataURL)
+
+        let result = try await h.run("import.files", ["urls": [.string("tmp:" + ref.name)], "folder": "lib"], as: .ai("chat"))
+        XCTAssertEqual(listing(h.library.metadataURL), before, "only the user restores library data")
+        let physics = try XCTUnwrap(h.library.children(of: nil).first { $0.kind == .folder && $0.title == "Physics" })
+        XCTAssertEqual(h.library.children(of: physics.id).map { $0.title }, ["Waves"], "folders and documents still come in")
+        let failed = result["failed"]?.arrayValue ?? []
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertEqual(failed.first?["code"]?.stringValue, "permission_denied")
+        XCTAssertEqual(failed.first?["entry"]?.stringValue, ref.name + " › " + NibFormat.libraryDirectory)
+    }
+
+    // MARK: What happens to the source
+
+    func testSkippedEntriesAreListedAndTheInboxCopyStays() async throws {
+        let h = harness()
+        let source = try tempDir().appendingPathComponent("Notes", isDirectory: true)
+        try writePNG("scan.png", in: source)
+        try Data("?".utf8).write(to: source.appendingPathComponent("notes.xyz"))
+        let zip = try inboxDir().appendingPathComponent("Notes.zip")
+        try ArchiveIO.archive(contentsOf: source, to: zip)
+
+        let result = try await h.run("import.files", ["urls": urls([zip]), "folder": "lib"])
+        XCTAssertEqual(result["refs"]?.arrayValue?.count, 1)
+        let failed = result["failed"]?.arrayValue ?? []
+        XCTAssertEqual(failed.count, 1)
+        XCTAssertEqual(failed.first?["url"]?.stringValue, zip.absoluteString)
+        XCTAssertEqual(failed.first?["entry"]?.stringValue, "Notes.zip › notes.xyz")
+        XCTAssertEqual(failed.first?["code"]?.stringValue, "unsupported")
+        XCTAssertTrue(exists(zip), "the Open In copy still holds what was skipped")
+    }
+
+    func testOpenInCopiesGoOnlyOnceImported() async throws {
+        let h = harness()
+        let inbox = try inboxDir()
+        let image = try writePNG("scan.png", in: inbox)
+        let odd = inbox.appendingPathComponent("data.xyz")
+        try Data("?".utf8).write(to: odd)
+
+        _ = try await h.run("import.files", ["urls": urls([image]), "folder": "lib"])
+        XCTAssertFalse(exists(image), "an imported Open In copy is removed")
+        await expectError(.unsupported) {
+            _ = try await h.run("import.files", ["urls": urls([odd]), "folder": "lib"])
+        }
+        XCTAssertTrue(exists(odd), "a copy that failed stays")
+    }
+
+    func testLooseFilesGoOnlyAfterACompleteImport() async throws {
+        let h = harness()
+        let fake = FakeConverter()
+        OfficeConverter.converter = fake
+        defer { OfficeConverter.converter = WebKitPDFConverter() }
+        _ = registerRecordingPDFImporter(h)
+        let dir = try tempDir()
+        let image = try writePNG("scan.png", in: dir)
+        let odd = dir.appendingPathComponent("data.xyz")
+        try Data("?".utf8).write(to: odd)
+        let report = dir.appendingPathComponent("Report.docx")
+        try Data("PK".utf8).write(to: report)
+        let notes = dir.appendingPathComponent("Notes", isDirectory: true)
+        try writePNG("page.png", in: notes)
+        try Data("?".utf8).write(to: notes.appendingPathComponent("notes.xyz"))
+        let zip = dir.appendingPathComponent("Notes.zip")
+        try ArchiveIO.archive(contentsOf: notes, to: zip)
+        // Files the inbox scan offered from "On My iPad › Nib" (Finder, file sharing).
+        let paths = [image, odd, report, zip].map { $0.standardizedFileURL.path }
+        ImportEngine.consumableFiles.formUnion(paths)
+        defer { ImportEngine.consumableFiles.subtract(paths) }
+
+        _ = try await h.run("import.files", ["urls": urls([image]), "folder": "lib"])
+        XCTAssertFalse(exists(image), "a loose file the scan offered is removed once imported")
+        await expectError(.unsupported) {
+            _ = try await h.run("import.files", ["urls": urls([odd]), "folder": "lib"])
+        }
+        XCTAssertTrue(exists(odd), "a failed file stays")
+        let partial = try await h.run("import.files", ["urls": urls([zip]), "folder": "lib"])
+        XCTAssertEqual(partial["failed"]?.arrayValue?.count, 1)
+        XCTAssertTrue(exists(zip), "a zip imported in part stays")
+        _ = try await h.run("import.files", ["urls": urls([report]), "folder": "lib"])
+        XCTAssertEqual(fake.calls.count, 1)
+        XCTAssertTrue(exists(report), "the original of a lossy conversion stays")
+        XCTAssertTrue(InboxScanner.declined.contains(InboxFiles.key(report)), "and is not offered again")
     }
 
     func testFilesAnotherImportIsWorkingOnAreLeftAlone() async throws {
@@ -338,6 +482,32 @@ final class FeatImportTests: XCTestCase {
         XCTAssertEqual(h.library.node("FAKEDOC00002")?.title, "Lecture 4")
         // The staged copies are gone once the import returns.
         XCTAssertFalse(seen.contains { FileManager.default.fileExists(atPath: $0.url.path) })
+    }
+
+    func testIDsAnImporterIgnoresStayForTheNextFile() async throws {
+        let h = harness()
+        func register(_ ext: String, usesIDs: Bool) {
+            h.app.content.importers.register(ImporterDescriptor(id: "test." + ext, title: ext, fileExtensions: [ext],
+                                                                owner: "test") { _, target, ctx in
+                let library = try ctx.services.require(ctx.services.library, "the library")
+                let id = usesIDs ? (target.ids?.first ?? NibID.make()) : NibID.make()
+                let meta = DocumentMeta(id: id, kind: .notebook)
+                return [try library.createDocument(DocumentContent(meta: meta, pages: [PageRecord()]),
+                                                   title: target.displayName ?? "?", in: target.folder)]
+            })
+        }
+        register("ignoring", usesIDs: false)
+        register("taking", usesIDs: true)
+        let dir = try tempDir()
+        let first = dir.appendingPathComponent("first.ignoring")
+        let second = dir.appendingPathComponent("second.taking")
+        try Data("1".utf8).write(to: first)
+        try Data("2".utf8).write(to: second)
+
+        let result = try await h.run("import.files", ["urls": urls([first, second]), "folder": "lib", "ids": ["TAKENDOC0001"]])
+        XCTAssertEqual(result["refs"]?.arrayValue?.count, 2)
+        XCTAssertEqual(result["refs"]?.arrayValue?.last, "doc:TAKENDOC0001")
+        XCTAssertEqual(h.library.node("TAKENDOC0001")?.title, "second")
     }
 
     func testTemporaryAssetsImportUnderTheirNames() async throws {

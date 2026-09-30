@@ -402,6 +402,79 @@ final class ImportDispatchTests: XCTestCase {
         // A stopped import counts what arrived, not the files minus the failures.
         model.showResult(imported: 0, failures: [ImportFailure(url: "tmp:b.png", code: "unsupported", message: "no")])
         XCTAssertEqual(model.title, "0 of 2 imported")
+        // Failures name the file, or the entry skipped inside a zip or folder.
+        XCTAssertEqual(ImportFailure(url: "tmp:b.png", code: "unsupported", message: "no").title, "b.png")
+        XCTAssertEqual(ImportFailure(url: "tmp:n.zip", entry: "Notes.zip › Chemistry/a.key", code: "unsupported",
+                                     message: "no").title, "Notes.zip › Chemistry/a.key")
+    }
+
+    // MARK: Reports, ids and permissions
+
+    func testNestedReportsKeepTheirPathAndFolders() {
+        let inner = ImportReport()
+        inner.skip("Inner.zip › a.key", NibError(.unsupported, "no"))
+        inner.use("INNERFOLDER", top: true)
+        inner.use("INNERCHILD", top: false)
+        inner.converted = true
+
+        let nested = ImportReport()
+        nested.absorb(inner, prefix: "Outer.zip › Physics/", top: false)
+        XCTAssertEqual(nested.skipped.map { $0.entry }, ["Outer.zip › Physics/Inner.zip › a.key"])
+        XCTAssertEqual(nested.skipped.first?.error.code, .unsupported)
+        XCTAssertEqual(nested.folders, ["INNERFOLDER", "INNERCHILD"])
+        XCTAssertEqual(nested.topFolders, [], "a zip inside a folder of the zip is not at the destination")
+        XCTAssertTrue(nested.converted)
+
+        let atTop = ImportReport()
+        atTop.use("INNERFOLDER", top: true)
+        atTop.absorb(inner, prefix: "", top: true)
+        XCTAssertEqual(atTop.folders, ["INNERFOLDER", "INNERCHILD"], "a folder used twice is listed once")
+        XCTAssertEqual(atTop.topFolders, ["INNERFOLDER"])
+    }
+
+    func testOnlyTheIDsTheNewRecordsTookAreUsedUp() {
+        var ids: [NibID] = ["A", "B", "C"]
+        ImportEngine.consumeIDs(&ids, takenBy: ["RANDOM"])
+        XCTAssertEqual(ids, ["A", "B", "C"], "an importer that ignored the ids leaves them for the next file")
+        ImportEngine.consumeIDs(&ids, takenBy: ["B", "A"])
+        XCTAssertEqual(ids, ["C"])
+        ImportEngine.consumeIDs(&ids, takenBy: [])
+        XCTAssertEqual(ids, ["C"])
+    }
+
+    func testWebNavigationStaysWhereTheCallerMayGo() throws {
+        let page = try XCTUnwrap(URL(string: "https://example.com/biology"))
+        let plain = try XCTUnwrap(URL(string: "http://example.com/biology"))
+        let other = try XCTUnwrap(URL(string: "https://tracker.example.net/"))
+        XCTAssertTrue(WebNavigationPolicy.unrestricted.allows(plain), "the person follows any redirect")
+
+        let ai = WebNavigationPolicy(restricted: true)
+        XCTAssertTrue(ai.allows(page))
+        XCTAssertTrue(ai.allows(other))
+        XCTAssertFalse(ai.allows(plain))
+        XCTAssertFalse(ai.allows(try XCTUnwrap(URL(string: "data:text/html,hi"))))
+        XCTAssertFalse(ai.allows(URL(fileURLWithPath: "/etc/hosts")))
+
+        let plugin = WebNavigationPolicy(restricted: true, hosts: ["example.com"])
+        XCTAssertTrue(plugin.allows(try XCTUnwrap(URL(string: "https://EXAMPLE.com/chemistry"))))
+        XCTAssertFalse(plugin.allows(other), "a redirect off the manifest's hosts is refused")
+
+        let dir = URL(fileURLWithPath: "/tmp/nib-import-tests/convert", isDirectory: true)
+        let local = WebNavigationPolicy(restricted: true, fileDirectory: dir)
+        XCTAssertTrue(local.allows(dir.appendingPathComponent("Saved page.html")))
+        XCTAssertFalse(local.allows(URL(fileURLWithPath: "/tmp/nib-import-tests/elsewhere.html")))
+        XCTAssertFalse(local.allows(plain))
+    }
+
+    func testARefusedPasteIsNotAskedForAgainUntilThePasteboardChanges() {
+        let saved = ShareHandoff.deniedChangeCount
+        defer { ShareHandoff.deniedChangeCount = saved }
+        ShareHandoff.deniedChangeCount = nil
+        XCTAssertTrue(ShareHandoff.shouldOffer(isWaiting: true, changeCount: 5))
+        XCTAssertFalse(ShareHandoff.shouldOffer(isWaiting: false, changeCount: 5))
+        ShareHandoff.deniedChangeCount = 5
+        XCTAssertFalse(ShareHandoff.shouldOffer(isWaiting: true, changeCount: 5))
+        XCTAssertTrue(ShareHandoff.shouldOffer(isWaiting: true, changeCount: 6))
     }
 
     // MARK: After the import
@@ -709,9 +782,14 @@ final class ImportDispatchTests: XCTestCase {
         try Data("x".utf8).write(to: source.appendingPathComponent("trash/Old.nibnote"))
         try Data("mine".utf8).write(to: destination.appendingPathComponent("prefs.1a2b3c4d.json"))
 
-        try ArchiveIO.merge(source, into: destination, skipping: ["trash"])
+        try fm.createDirectory(at: source.appendingPathComponent("plugins/some.plugin", isDirectory: true),
+                               withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: source.appendingPathComponent("plugins/some.plugin/main.js"))
+
+        try ArchiveIO.merge(source, into: destination, skipping: PackageImporter.backupDataSkipped)
         XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("templates/Planner/week.pdf")), Data("new".utf8))
         XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("prefs.1a2b3c4d.json")), Data("mine".utf8))
         XCTAssertFalse(fm.fileExists(atPath: destination.appendingPathComponent("trash").path))
+        XCTAssertFalse(fm.fileExists(atPath: destination.appendingPathComponent("plugins").path))
     }
 }

@@ -4,7 +4,8 @@ import NibContracts
 
 /// .nibnote packages (and legacy .nib package folders), zip archives of folders, whole-library backups and plain
 /// folders. Folder structure is kept: every directory becomes a library folder (an existing one with the same name
-/// is reused), packages go through `LibraryService.importPackage`, other files through the importer registry.
+/// is reused), packages go through `LibraryService.importPackage`, other files through the importer registry. Entries
+/// that can't be imported are reported one by one (`ImportReport`), never dropped silently.
 @MainActor
 enum PackageImporter {
     static func packageDescriptor(owner: String) -> ImporterDescriptor {
@@ -64,17 +65,38 @@ enum PackageImporter {
             throw NibError(.unsupported, "\(url.lastPathComponent) isn't a zip archive Nib can open: \(error.localizedDescription)")
         }
         let library = try ctx.services.require(ctx.services.library, "the library")
-        if let backup = backupRoot(in: dest) {
-            // A whole-library backup: its library data (templates, elements, tape, plugins, plugin data, AI chats,
-            // other devices' prefs) joins this library's, then its folders and documents are recreated.
-            let data = backup.appendingPathComponent(NibFormat.libraryDirectory, isDirectory: true)
-            let into = library.metadataURL
-            try await Task.detached(priority: .userInitiated) { try ArchiveIO.merge(data, into: into, skipping: ["trash"]) }.value
-            library.refresh()
-            return try await importContents(of: backup, into: target.folder, ctx: ctx, library: library)
+        let name = url.lastPathComponent
+        let report = ImportReport()
+        guard let backup = backupRoot(in: dest) else {
+            let docs = await importContents(of: dest, into: target.folder, ctx: ctx, library: library, report: report,
+                                            prefix: name + " › ", top: true)
+            return try deliver(docs, report, source: name)
         }
-        return try await importContents(of: dest, into: target.folder, ctx: ctx, library: library)
+        // A whole-library backup: its folders and documents are recreated. Only the person restores its library data
+        // (templates, elements, tape, plugin data, AI chats, other devices' prefs): those files skip the checks their
+        // own commands make (settings.set, nib.storage, plugin.install), so the AI, plugins and the bridge get the
+        // folders and documents only.
+        let inner = backup == dest ? "" : backup.lastPathComponent + "/"
+        let data = backup.appendingPathComponent(NibFormat.libraryDirectory, isDirectory: true)
+        if ctx.principal.isUser {
+            let into = library.metadataURL
+            let skipping = backupDataSkipped
+            try await Task.detached(priority: .userInitiated) { try ArchiveIO.merge(data, into: into, skipping: skipping) }.value
+            library.refresh()
+        } else if !ArchiveIO.visibleEntries(of: data, includingHidden: true).isEmpty {
+            report.skip(name + " › " + inner + NibFormat.libraryDirectory,
+                        NibError(.permissionDenied, "only the user can restore a backup's library data (templates, plugin data, settings, AI chats)",
+                                 hint: "ask the user to import the backup themselves; its folders and documents were imported"))
+        }
+        let docs = await importContents(of: backup, into: target.folder, ctx: ctx, library: library, report: report,
+                                        prefix: name + " › " + inner, top: true)
+        return try deliver(docs, report, source: name)
     }
+
+    /// Library data a backup never brings back: its trash, and plugins, which are installed again through
+    /// plugin.install and its review (a restored plugin folder would skip it, and files added to an installed plugin's
+    /// hashed folder would change what the person approved).
+    nonisolated static let backupDataSkipped: Set<String> = ["trash", "plugins"]
 
     /// A dropped or picked folder: recreated as a library folder with everything inside it.
     static func importFolder(_ url: URL, into parent: FolderID?, ctx: CommandContext) async throws -> [DocumentID] {
@@ -82,52 +104,80 @@ enum PackageImporter {
         let library = try ctx.services.require(ctx.services.library, "the library")
         let folder = try folderNamed(url.lastPathComponent, in: parent, library: library,
                                      style: FolderStyleFiles.style(in: url))
-        return try await importContents(of: url, into: folder, ctx: ctx, library: library)
+        let report = ImportReport()
+        report.use(folder, top: true)
+        let docs = await importContents(of: url, into: folder, ctx: ctx, library: library, report: report,
+                                        prefix: url.lastPathComponent + " › ", top: false)
+        return try deliver(docs, report, source: url.lastPathComponent)
     }
 
+    /// Hands what a zip or folder import did to the engine (`ImportReporting.current`) and returns its documents.
+    /// When nothing at all came in (no document, no folder), the first reason is thrown instead.
+    private static func deliver(_ docs: [DocumentID], _ report: ImportReport, source: String) throws -> [DocumentID] {
+        if docs.isEmpty, report.folders.isEmpty, let first = report.skipped.first {
+            var e = first.error
+            let reason = "\(first.entry): \(e.message)"
+            e.message = report.skipped.count == 1 ? reason
+                : "none of the \(report.skipped.count) files in \(source) could be imported; first: " + reason
+            throw e
+        }
+        ImportReporting.current?.absorb(report, prefix: "", top: true)
+        return docs
+    }
+
+    /// Deepest folder level a zip or folder tree is recreated to; deeper folders are skipped (and reported).
+    static let maxTreeDepth = NibLimits.maxNesting * 2
+
     /// Imports every visible entry of `dir` into `folder`: packages as documents, directories as folders (recursively),
-    /// files through the registry (runs of images become one notebook). Files nothing can import are skipped; when
-    /// nothing at all could be imported, the first reason is thrown.
+    /// files through the registry (runs of images become one notebook). Nothing is thrown: every entry that could not
+    /// be imported goes into `report` under its path (`prefix` + the path inside `dir`, "Notes.zip › Chemistry/a.key"),
+    /// with the folders used (created, or existing ones with the same name; `top` when they sit right in the
+    /// destination) and any conversion.
     static func importContents(of dir: URL, into folder: FolderID?, ctx: CommandContext, library: LibraryService,
-                               depth: Int = 0) async throws -> [DocumentID] {
-        guard depth < NibLimits.maxNesting * 2 else { return [] }
+                               report: ImportReport, prefix: String, top: Bool, depth: Int = 0) async -> [DocumentID] {
         var docs: [DocumentID] = []
-        var foundFolder = false
-        var firstError: Error?
         var files: [(url: URL, isDirectory: Bool)] = []
         for entry in ArchiveIO.visibleEntries(of: dir) {
+            let name = entry.url.lastPathComponent
             do {
                 if entry.isDirectory && isPackage(entry.url) {
                     docs.append(try library.importPackage(at: entry.url, into: folder))
                 } else if entry.isDirectory {
-                    let child = try folderNamed(entry.url.lastPathComponent, in: folder, library: library,
-                                                style: FolderStyleFiles.style(in: entry.url))
-                    foundFolder = true
-                    docs += try await importContents(of: entry.url, into: child, ctx: ctx, library: library, depth: depth + 1)
+                    guard depth + 1 < maxTreeDepth else {
+                        throw NibError(.unsupported, "folders nested more than \(maxTreeDepth) levels deep are not imported",
+                                       hint: "move the folder higher up and import it on its own")
+                    }
+                    let child = try folderNamed(name, in: folder, library: library, style: FolderStyleFiles.style(in: entry.url))
+                    report.use(child, top: top)
+                    docs += await importContents(of: entry.url, into: child, ctx: ctx, library: library, report: report,
+                                                 prefix: prefix + name + "/", top: false, depth: depth + 1)
                 } else {
                     files.append(entry)
                 }
             } catch {
-                firstError = firstError ?? error
-                importLog.error("skipped \(entry.url.lastPathComponent, privacy: .private): \(error.localizedDescription, privacy: .public)")
+                report.skip(prefix + name, error)
+                importLog.error("skipped \(name, privacy: .private): \(error.localizedDescription, privacy: .public)")
             }
         }
         for group in ImportEngine.groups(files, content: ctx.content) {
             let urls = group.indices.map { files[$0].url }
             guard group.kind != .unsupported else {
-                firstError = firstError ?? ImportEngine.unsupported(urls[0], content: ctx.content)
+                for url in urls { report.skip(prefix + url.lastPathComponent, ImportEngine.unsupported(url, content: ctx.content)) }
                 continue
             }
+            // A zip inside the zip reports its own skipped entries, folders and conversions.
+            let nested = ImportReport()
             do {
-                docs += try await ImportEngine.run(group, urls: urls,
-                                                   target: ImportTarget(folder: folder, displayName: ImportNaming.title(of: urls[0])),
-                                                   ctx: ctx)
+                let target = ImportTarget(folder: folder, displayName: ImportNaming.title(of: urls[0]))
+                docs += try await ImportReporting.$current.withValue(nested) {
+                    try await ImportEngine.run(group, urls: urls, target: target, ctx: ctx)
+                }
+                report.absorb(nested, prefix: prefix, top: top)
             } catch {
-                firstError = firstError ?? error
+                for url in urls { report.skip(prefix + url.lastPathComponent, error) }
                 importLog.error("skipped a file: \(error.localizedDescription, privacy: .public)")
             }
         }
-        if docs.isEmpty, !foundFolder, let e = firstError { throw e }
         return docs
     }
 
@@ -210,14 +260,15 @@ enum ArchiveIO {
         try FileManager.default.zipItem(at: folder, to: archive, shouldKeepParent: false, compressionMethod: .deflate)
     }
 
-    /// Entries of `dir` sorted by name, without hidden files, macOS resource forks (__MACOSX) and symbolic links.
-    static func visibleEntries(of dir: URL) -> [(url: URL, isDirectory: Bool)] {
+    /// Entries of `dir` sorted by name, without hidden files (unless `includingHidden`), macOS resource forks
+    /// (__MACOSX) and symbolic links.
+    static func visibleEntries(of dir: URL, includingHidden: Bool = false) -> [(url: URL, isDirectory: Bool)] {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
         let urls = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys,
-                                                                   options: [.skipsHiddenFiles])) ?? []
+                                                                   options: includingHidden ? [] : [.skipsHiddenFiles])) ?? []
         return urls.compactMap { url -> (url: URL, isDirectory: Bool)? in
             let name = url.lastPathComponent
-            guard !name.hasPrefix("."), name != "__MACOSX" else { return nil }
+            guard includingHidden || !name.hasPrefix("."), name != "__MACOSX" else { return nil }
             let values = try? url.resourceValues(forKeys: Set(keys))
             if values?.isSymbolicLink == true { return nil }
             return (url, values?.isDirectory ?? false)
@@ -226,8 +277,8 @@ enum ArchiveIO {
     }
 
     /// Copies every file under `source` into `destination` that is not there yet (a backup's templates, elements, tape,
-    /// plugins, plugin data, AI chats and other devices' prefs). Existing files always win; `skipping` names top-level
-    /// entries to leave out. Restored plugins still need review: their grant is device-local.
+    /// plugin data, AI chats and other devices' prefs). Existing files always win; `skipping` names top-level entries to
+    /// leave out (`PackageImporter.backupDataSkipped`).
     static func merge(_ source: URL, into destination: URL, skipping: Set<String>) throws {
         let fm = FileManager.default
         guard let walker = fm.enumerator(at: source, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else { return }

@@ -64,7 +64,10 @@ enum OfficeConverter {
         try FileManager.default.moveItem(at: converted.pdf, to: pdf)
         var target = target
         target.displayName = name
-        return try await pdfImporter.handler(pdf, target, ctx)
+        let docs = try await pdfImporter.handler(pdf, target, ctx)
+        // The PDF is a lossy copy: the engine keeps the person's original file.
+        ImportReporting.current?.converted = true
+        return docs
     }
 
     /// A web page is named after its title when it has one; a document keeps its file name.
@@ -86,13 +89,64 @@ enum OfficeConverter {
             throw NibError(.permissionDenied, "loading \(url.host ?? "a web page") needs the 'network' permission",
                            hint: "upload a PDF of the page with asset.upload and import its tmp: ref")
         }
-        if case let .plugin(id) = ctx.principal,
-           let manifest = ctx.services.get(ServiceKeys.pluginHost, as: PluginHosting.self)?.handle(id)?.manifest {
+        if let hosts = pluginHosts(ctx) {
             let host = (url.host ?? "").lowercased()
-            guard (manifest.network?.hosts ?? []).contains(where: { $0.lowercased() == host }) else {
+            guard hosts.contains(host) else {
                 throw NibError(.permissionDenied, "'\(host)' is not in the plugin's network.hosts",
                                hint: "add the host to manifest network.hosts")
             }
+        }
+    }
+
+    /// The hosts a plugin caller's manifest lists (lowercased); nil for other callers.
+    static func pluginHosts(_ ctx: CommandContext) -> Set<String>? {
+        guard case let .plugin(id) = ctx.principal,
+              let manifest = ctx.services.get(ServiceKeys.pluginHost, as: PluginHosting.self)?.handle(id)?.manifest else {
+            return nil
+        }
+        return Set((manifest.network?.hosts ?? []).map { $0.lowercased() })
+    }
+}
+
+/// Where the off-screen web view's main frame may go. The person may follow any redirect or link; for the AI, the
+/// bridge and plugins it stays on https (a plugin on its manifest's network.hosts) and inside the converted file's
+/// folder, so a redirect can't put a page they may not load into a PDF they can then read. Pure.
+struct WebNavigationPolicy: Equatable {
+    /// False for the person: everything is allowed.
+    var restricted: Bool
+    /// Hosts that may be shown (lowercased); nil = any https host.
+    var hosts: Set<String>?
+    /// The folder a converted local file is read from (its own address stays allowed).
+    var fileDirectory: URL?
+
+    static let unrestricted = WebNavigationPolicy(restricted: false)
+
+    init(restricted: Bool, hosts: Set<String>? = nil, fileDirectory: URL? = nil) {
+        self.restricted = restricted
+        self.hosts = hosts
+        self.fileDirectory = fileDirectory
+    }
+
+    /// The caller's policy for `source`.
+    @MainActor
+    static func of(_ ctx: CommandContext, source: WebSource) -> WebNavigationPolicy {
+        guard !ctx.principal.isUser else { return .unrestricted }
+        var dir: URL?
+        if case .file(let url) = source { dir = url.deletingLastPathComponent() }
+        return WebNavigationPolicy(restricted: true, hosts: OfficeConverter.pluginHosts(ctx), fileDirectory: dir)
+    }
+
+    func allows(_ url: URL) -> Bool {
+        guard restricted else { return true }
+        switch url.scheme?.lowercased() {
+        case "file"?:
+            guard let dir = fileDirectory else { return false }
+            return ImportLocations.isInside(url, dir)
+        case "https"?:
+            guard let host = url.host?.lowercased(), !host.isEmpty else { return false }
+            return hosts.map { $0.contains(host) } ?? true
+        default:
+            return false
         }
     }
 }
@@ -118,7 +172,8 @@ final class WebKitPDFConverter: PDFConverting {
         // Office files and saved pages render without scripts; a live page may need them for its layout.
         let isRemote: Bool
         if case .remote = source { isRemote = true } else { isRemote = false }
-        let renderer = WebPDFRenderer(host: window, width: paper.width, javaScript: isRemote)
+        let renderer = WebPDFRenderer(host: window, width: paper.width, javaScript: isRemote,
+                                      policy: WebNavigationPolicy.of(ctx, source: source))
         defer { renderer.tearDown() }
         try await renderer.load(source, settle: layout.settleSeconds)
         let pdf = dir.appendingPathComponent("converted-" + UUID().uuidString + ".pdf")
@@ -209,10 +264,14 @@ final class PaperRenderer: UIPrintPageRenderer {
 @MainActor
 final class WebPDFRenderer: NSObject, WKNavigationDelegate {
     private let webView: WKWebView
+    private let policy: WebNavigationPolicy
     private var loading: CheckedContinuation<Void, Error>?
     private var timeout: Task<Void, Never>?
+    /// A main-frame navigation the policy refused: the conversion fails with it, also after the load finished.
+    private var refused: NibError?
 
-    init(host: UIView, width: CGFloat, javaScript: Bool) {
+    init(host: UIView, width: CGFloat, javaScript: Bool, policy: WebNavigationPolicy = .unrestricted) {
+        self.policy = policy
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = javaScript
@@ -246,6 +305,7 @@ final class WebPDFRenderer: NSObject, WKNavigationDelegate {
         }
         timeout?.cancel()
         try await Task.sleep(nanoseconds: UInt64(settle * 1_000_000_000))
+        if let refused = refused { throw refused }
     }
 
     /// Paginates with the web view's print formatter; a layout the formatter cannot paginate becomes one tall page.
@@ -293,6 +353,22 @@ final class WebPDFRenderer: NSObject, WKNavigationDelegate {
     }
 
     // MARK: WKNavigationDelegate
+
+    /// Redirects, scripts and meta refreshes that would take the main frame somewhere the caller may not load are
+    /// cancelled, and the conversion fails.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
+        let isMainFrame = navigationAction.targetFrame?.isMainFrame ?? true
+        guard isMainFrame, let url = navigationAction.request.url, !policy.allows(url) else {
+            decisionHandler(.allow)
+            return
+        }
+        decisionHandler(.cancel)
+        let error = NibError(.permissionDenied, "the page tried to open \(url.host ?? url.scheme ?? "another address"), which this caller may not load",
+                             hint: "import a page that doesn't redirect, or upload a PDF of it with asset.upload")
+        refused = refused ?? error
+        finishLoading(error)
+    }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         finishLoading(nil)
