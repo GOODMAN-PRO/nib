@@ -93,10 +93,10 @@ enum BridgeUISettings {
 /// The F090 and F027 commands this feature calls, always as the user (security settings are user only).
 @MainActor
 enum BridgeCalls {
-    static let setEnabledID = "bridge.setEnabled"
-    static let statusID = "bridge.status"
+    static let setEnabledID = CommandIDs.bridgeSetEnabled
+    static let statusID = CommandIDs.bridgeStatus
     /// F027 (Settings screens): `settings.open {page?}`.
-    static let settingsOpenID = "settings.open"
+    static let settingsOpenID = CommandIDs.settingsOpen
 
     @discardableResult
     static func run(_ app: NibApp, _ command: String, _ params: JSONValue = [:]) async throws -> JSONValue {
