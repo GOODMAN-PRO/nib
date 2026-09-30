@@ -3,6 +3,25 @@
 <plist version="1.0">
 <dict>
 	<key>PreferenceSpecifiers</key>
-	<array/>
+	<array>
+		<dict>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+			<key>Title</key>
+			<string>Troubleshooting</string>
+			<key>FooterText</key>
+			<string>When this is on, the next time you open Nib it saves a copy of your whole library as a zip in the Files app, in Nib's diagnostics folder, then turns this off. Use it when Nib can't open or support asks for your library. The copy holds your notes: share it only with someone you trust.</string>
+		</dict>
+		<dict>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+			<key>Title</key>
+			<string>Temporary Diagnostic Mode</string>
+			<key>Key</key>
+			<string>nib_temp_diagnostic</string>
+			<key>DefaultValue</key>
+			<false/>
+		</dict>
+	</array>
 </dict>
 </plist>
