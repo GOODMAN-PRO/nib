@@ -23,6 +23,12 @@ final class FakeNavigator: SceneNavigator {
     func presentModal(_ viewController: UIViewController) {}
 }
 
+/// The commands `.nibCommandFailed` named, in order. The model posts on the main actor and the observer runs
+/// synchronously there, so the log is only touched from the main thread.
+final class FailureLog: @unchecked Sendable {
+    var commands: [String] = []
+}
+
 /// Params of every call a stand-in command received, in order.
 @MainActor
 final class CallLog {
@@ -45,14 +51,32 @@ final class FeatOnboardingTests: XCTestCase {
                                      isDirectory: true)
 
     /// A harness with onboarding registered, a window that is the active one, and a model on a movable library root.
-    private func make(root: URL? = nil) -> (Harness, FakeNavigator, OnboardingModel, RootBox) {
+    /// The model runs as on iPad unless `idiom` says otherwise.
+    private func make(root: URL? = nil, idiom: UIUserInterfaceIdiom = .pad) -> (Harness, FakeNavigator, OnboardingModel, RootBox) {
         let h = Harness(features: [FeatOnboardingFeature.self])
         let nav = FakeNavigator()
         h.app.services.sessions.add(nav.session)
         h.app.ui.activeNavigator = nav
         let box = RootBox(root ?? appDocuments)
-        let model = OnboardingModel(app: h.app, navigator: nav, containerHome: home, libraryRoot: { box.url })
+        let model = OnboardingModel(app: h.app, navigator: nav, containerHome: home, libraryRoot: { box.url }, idiom: idiom)
         return (h, nav, model, box)
+    }
+
+    /// Records the commands the screen reports as failed (`.nibCommandFailed`, as `app.perform` posts them).
+    private func watchFailures(_ h: Harness) -> (FailureLog, OnboardingSubscription) {
+        let failures = FailureLog()
+        let token = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: h.app, queue: nil) { note in
+            failures.commands.append(note.userInfo?["command"] as? String ?? "?")
+        }
+        return (failures, OnboardingSubscription { NotificationCenter.default.removeObserver(token) })
+    }
+
+    /// Stand-ins for the sample notebook's commands: a notebook with a cover and two paper pages.
+    private func fakeSampleCommands(_ h: Harness, log: CallLog) throws {
+        let created = try JSONValue.parse(#"{"ref": "doc:SAMPLEDOC001", "title": "Welcome to Nib", "pages": ["page:SAMPLEDOC001/COVER0000001", "page:SAMPLEDOC001/PAPER0000001", "page:SAMPLEDOC001/PAPER0000002"]}"#)
+        fake(h, CommandIDs.docCreate, effect: .library, log: log) { _ in created }
+        fake(h, CommandIDs.textCreateBox, effect: .edit, log: log) { _ in ["ref": "item:SAMPLEDOC001/PAPER0000001/T1"] }
+        fake(h, CommandIDs.inkWriteText, effect: .edit, log: log) { _ in ["refs": []] }
     }
 
     final class RootBox {
@@ -219,6 +243,20 @@ final class FeatOnboardingTests: XCTestCase {
         XCTAssertEqual(nav.libraryShows, 1)
     }
 
+    /// `window.showLibrary` acts on the active window, so a window that is not the active one is sent to its library
+    /// directly.
+    func testLeavingFromAWindowThatIsNotTheActiveOneShowsTheLibraryThere() async {
+        let (h, nav, model, _) = make(root: iCloudFolder)
+        let other = FakeNavigator()
+        h.app.services.sessions.add(other.session)
+        h.app.ui.activeNavigator = other
+        await model.skip()
+        XCTAssertTrue(isDone(h))
+        XCTAssertEqual(nav.libraryShows, 1)
+        XCTAssertEqual(other.libraryShows, 0, "the other window keeps what it shows")
+        XCTAssertNil(model.busy)
+    }
+
     func testFinishingInAnotherWindowOrByTheAIClosesThisOne() async throws {
         let (h, nav, model, _) = make()
         try await h.run("settings.set", ["name": "onboarding.done", "value": true], as: .ai("chat1"))
@@ -238,6 +276,48 @@ final class FeatOnboardingTests: XCTestCase {
         try await h.run("settings.set", ["name": "stylus.mode", "value": "pencilOnly"], as: .bridge("smoke"))
         let followed = await eventually { model.stylusMode == .pencilOnly }
         XCTAssertTrue(followed, "a change made elsewhere shows at once")
+    }
+
+    /// iPhone has no Apple Pencil: unless the user chooses, fingers write there once the Pencil step shows.
+    func testIPhoneWritesWithFingersUnlessTheUserChoosesOtherwise() async throws {
+        let (h, _, model, _) = make(idiom: .phone)
+        XCTAssertFalse(model.isPad)
+        XCTAssertEqual(h.app.settings.get(NibSettings.stylusMode), .pencilOnly, "the contracts' default")
+        model.advance()
+        let switched = await eventually { h.app.settings.get(NibSettings.stylusMode) == .anyInput }
+        XCTAssertTrue(switched, "the Pencil step on iPhone starts on Any Input")
+        XCTAssertEqual(model.stylusMode, .anyInput)
+        await model.setStylusMode(.pencilOnly)
+        model.goBack()
+        model.advance()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(h.app.settings.get(NibSettings.stylusMode), .pencilOnly, "the user's choice is never overridden")
+        await model.skip()
+        XCTAssertTrue(isDone(h))
+        XCTAssertEqual(h.app.settings.get(NibSettings.stylusMode), .pencilOnly)
+    }
+
+    func testSkippingOnIPhoneBeforeThePencilStepStillLetsFingersWrite() async {
+        let (h, nav, model, _) = make(root: iCloudFolder, idiom: .phone)
+        await model.skip()
+        XCTAssertTrue(isDone(h))
+        XCTAssertEqual(h.app.settings.get(NibSettings.stylusMode), .anyInput)
+        XCTAssertEqual(nav.libraryShows, 1)
+
+        let (h2, _, model2, _) = make(root: iCloudFolder, idiom: .phone)
+        for _ in 0..<3 { model2.advance() }
+        await model2.finish(openQuickNote: false)
+        XCTAssertTrue(isDone(h2))
+        XCTAssertEqual(h2.app.settings.get(NibSettings.stylusMode), .anyInput, "finishing does the same")
+    }
+
+    func testIPadKeepsApplePencilUnlessTheUserChooses() async throws {
+        let (h, _, model, _) = make(root: iCloudFolder)
+        model.advance()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        await model.skip()
+        XCTAssertTrue(isDone(h))
+        XCTAssertEqual(h.app.settings.get(NibSettings.stylusMode), .pencilOnly)
     }
 
     func testPencilBindingsParseFilterAndSave() async throws {
@@ -290,10 +370,14 @@ final class FeatOnboardingTests: XCTestCase {
         h.app.ui.settingsPages.register(SettingsPageDescriptor(id: "settings.editing", title: "Editing", icon: "pencil",
                                                                section: .editing, order: 1, owner: "settings",
                                                                makeView: { _ in AnyView(EmptyView()) }))
+        h.app.ui.settingsPages.register(SettingsPageDescriptor(id: "plugin.promptlibrary", title: "Prompts", icon: "text",
+                                                               section: .ai, order: 1, owner: "promptlibrary",
+                                                               makeView: { _ in AnyView(EmptyView()) }))
+        XCTAssertEqual(model.aiSettingsPage, "plugin.promptlibrary", "without F086 the section's first page opens")
         h.app.ui.settingsPages.register(SettingsPageDescriptor(id: "aisettings.providers", title: "AI", icon: "drop",
                                                                section: .ai, order: 10, owner: "aisettings",
                                                                makeView: { _ in AnyView(EmptyView()) }))
-        XCTAssertEqual(model.aiSettingsPage, "aisettings.providers")
+        XCTAssertEqual(model.aiSettingsPage, "aisettings.providers", "F086's provider page wins over other AI pages")
         await model.openAISettings()
         XCTAssertEqual(log.params(CommandIDs.settingsOpen), [["page": "aisettings.providers"]])
         await model.loadProviders()
@@ -303,15 +387,38 @@ final class FeatOnboardingTests: XCTestCase {
                        [ProviderSummary(id: "x", name: "x", kind: nil, isActive: true)])
     }
 
+    func testProvidersReloadOnlyWhileTheAIStepShows() async throws {
+        let (h, _, model, _) = make()
+        let log = CallLog()
+        var rows: JSONValue = []
+        fake(h, CommandIDs.aiProviderList, effect: .read, log: log) { _ in rows }
+        h.app.settings.declare(SettingKey("aiprovider.maxSteps", default: 8.0), summary: "Most tool steps in a turn.",
+                               owner: "aisettings", schema: .num())
+        await model.reloadProvidersIfShown()
+        XCTAssertEqual(log.commands, [], "not on the library step")
+        XCTAssertFalse(model.presentsSheet, "nothing is presented over the window")
+        model.advance()
+        model.advance()
+        let first = await eventually { log.commands.count == 1 }
+        XCTAssertTrue(first, "the AI step loads the providers when it shows")
+        rows = try JSONValue.parse(#"[{"id": "p1", "name": "Claude", "active": true}]"#)
+        try await h.run("settings.set", ["name": "aiprovider.maxSteps", "value": 12])
+        let reloaded = await eventually { model.providers.count == 1 }
+        XCTAssertTrue(reloaded, "a setting F086 owns changed")
+        NotificationCenter.default.post(name: UIScene.didActivateNotification, object: nil)
+        let again = await eventually { log.commands.count >= 3 }
+        XCTAssertTrue(again, "the app came back to the foreground")
+        XCTAssertTrue(model.isAISetting("aiprovider.maxSteps"), "owned by F086")
+        XCTAssertTrue(model.isAISetting(NibSettings.aiDirectToolsName))
+        XCTAssertFalse(model.isAISetting("stylus.mode"))
+    }
+
     // MARK: Finish: sample notebook and QuickNote
 
     func testFinishAddsTheSampleNotebookAndOpensAQuickNote() async throws {
         let (h, nav, model, _) = make(root: iCloudFolder)
         let log = CallLog()
-        let created = try JSONValue.parse(#"{"ref": "doc:SAMPLEDOC001", "title": "Welcome to Nib", "pages": ["page:SAMPLEDOC001/COVER0000001", "page:SAMPLEDOC001/PAPER0000001", "page:SAMPLEDOC001/PAPER0000002"]}"#)
-        fake(h, CommandIDs.docCreate, effect: .library, log: log) { _ in created }
-        fake(h, CommandIDs.textCreateBox, effect: .edit, log: log) { _ in ["ref": "item:SAMPLEDOC001/PAPER0000001/T1"] }
-        fake(h, CommandIDs.inkWriteText, effect: .edit, log: log) { _ in ["refs": []] }
+        try fakeSampleCommands(h, log: log)
         fake(h, CommandIDs.docQuickNote, effect: .library, log: log) { _ in ["ref": "doc:QUICKNOTE001"] }
         for _ in 0..<3 { model.advance() }
         XCTAssertEqual(model.step, .done)
@@ -329,11 +436,88 @@ final class FeatOnboardingTests: XCTestCase {
                                                   .string("page:SAMPLEDOC001/PAPER0000001")],
                        "the tour goes on the first paper page, after the cover")
         let tour = try XCTUnwrap(boxes.last?["text"]).decode(RichText.self)
-        XCTAssertTrue(tour.plainText.contains(SampleNotebook.tips(stylusMode: .pencilOnly)[0]))
+        let tips = SampleNotebook.tips(stylusMode: .pencilOnly, libraryOutside: true)
+        XCTAssertTrue(tour.plainText.contains(tips[0]))
+        XCTAssertTrue(tour.plainText.contains(tips[1]), "the library is outside Nib, so it is safe from reinstalls")
+        XCTAssertNil(boxes.first?["style"], "the title keeps F026's style")
+        XCTAssertEqual(boxes.last?["style"], ["autoGrow": false], "the tour keeps its frame above the handwriting line")
         XCTAssertEqual(log.params(CommandIDs.inkWriteText).first?["color"],
                        .string(h.app.settings.get(NibSettings.presets("pen")).color.hex))
         XCTAssertEqual(nav.libraryShows, 0, "the QuickNote opens instead of the library")
         XCTAssertNil(model.busy)
+    }
+
+    /// P-014: the tour never tells a user whose notes are inside Nib that they survive a reinstall.
+    func testSampleNotebookWithTheLibraryInsideWarnsAboutReinstalls() async throws {
+        let (h, _, model, _) = make()
+        let log = CallLog()
+        try fakeSampleCommands(h, log: log)
+        XCTAssertTrue(model.placement.isInsideApp)
+        model.keepInApp()
+        model.confirmKeepInApp()
+        for _ in 0..<2 { model.advance() }
+        await model.finish(openQuickNote: false)
+        let tour = try XCTUnwrap(log.params(CommandIDs.textCreateBox).last?["text"]).decode(RichText.self).plainText
+        let safe = SampleNotebook.tips(stylusMode: .pencilOnly, libraryOutside: true)[1]
+        let warning = SampleNotebook.tips(stylusMode: .pencilOnly, libraryOutside: false)[1]
+        XCTAssertFalse(tour.contains(safe), "notes inside the app are deleted with it")
+        XCTAssertFalse(tour.contains("safe when Nib is reinstalled"))
+        XCTAssertTrue(tour.contains(warning))
+        XCTAssertNotEqual(safe, warning)
+    }
+
+    func testAFailedSampleStepIsReportedUnderItsOwnCommand() async throws {
+        let (h, nav, model, _) = make(root: iCloudFolder)
+        let log = CallLog()
+        let created = try JSONValue.parse(#"{"ref": "doc:SAMPLEDOC001", "pages": ["page:SAMPLEDOC001/P1", "page:SAMPLEDOC001/P2"]}"#)
+        fake(h, CommandIDs.docCreate, effect: .library, log: log) { _ in created }
+        fake(h, CommandIDs.textCreateBox, effect: .edit, log: log) { _ in throw NibError(.invalidParams, "bad frame") }
+        let (failures, watch) = watchFailures(h)
+        await model.finish(openQuickNote: false)
+        XCTAssertEqual(failures.commands, [CommandIDs.textCreateBox], "not doc.create, which worked")
+        XCTAssertTrue(isDone(h))
+        XCTAssertEqual(nav.libraryShows, 1, "the library still opens")
+        XCTAssertNil(model.busy)
+        _ = watch
+    }
+
+    func testAFailedQuickNoteFallsBackToTheLibrary() async {
+        let (h, nav, model, _) = make(root: iCloudFolder)
+        let log = CallLog()
+        fake(h, CommandIDs.docQuickNote, effect: .library, log: log) { _ in throw NibError(.unavailable, "No QuickNote") }
+        let (failures, watch) = watchFailures(h)
+        model.addsSampleNotebook = false
+        await model.finish(openQuickNote: true)
+        XCTAssertEqual(log.commands, [CommandIDs.docQuickNote])
+        XCTAssertTrue(isDone(h))
+        XCTAssertEqual(nav.libraryShows, 1, "the library opens instead")
+        XCTAssertEqual(failures.commands, [CommandIDs.docQuickNote])
+        XCTAssertNil(model.busy)
+        _ = watch
+    }
+
+    func testFailingToSaveDoneKeepsTheScreenAndSaysWhy() async {
+        let (h, nav, model, _) = make(root: iCloudFolder)
+        h.app.bus.hooks.register(CommandHookDescriptor(id: "test.settingsFull", owner: "test",
+                                                       commands: [CommandIDs.settingsSet]) { _, params in
+            if params["name"]?.stringValue == "onboarding.done" { throw NibError(.unavailable, "Settings can't be saved") }
+            return nil
+        })
+        await model.skip()
+        XCTAssertFalse(isDone(h))
+        XCTAssertNil(model.busy)
+        XCTAssertNotNil(model.message)
+        XCTAssertEqual(nav.libraryShows, 0, "onboarding stays up")
+        XCTAssertEqual(model.step, .library)
+
+        model.message = nil
+        for _ in 0..<3 { model.advance() }
+        await model.finish(openQuickNote: true)
+        XCTAssertFalse(isDone(h))
+        XCTAssertNil(model.busy, "the buttons work again")
+        XCTAssertNotNil(model.message)
+        XCTAssertEqual(nav.libraryShows, 0)
+        XCTAssertEqual(model.step, .done)
     }
 
     func testFinishWithoutTheSampleOrQuickNoteFeaturesShowsTheLibrary() async {
@@ -360,25 +544,41 @@ final class FeatOnboardingTests: XCTestCase {
     }
 
     func testSampleNotebookLayoutStaysOnThePage() {
-        for size in [PageSize.a4, PageSize.standard, PageSize(612, 792), PageSize(842, 595), PageSize(300, 400)] {
-            for mode in StylusMode.allCases {
-                let boxes = SampleNotebook.boxes(pageSize: size, stylusMode: mode)
-                XCTAssertEqual(boxes.count, 2)
-                for box in boxes {
-                    let f = box.frame
-                    XCTAssertGreaterThanOrEqual(f[0], 0)
-                    XCTAssertGreaterThanOrEqual(f[1], 0)
-                    XCTAssertLessThanOrEqual(f[0] + f[2], size.width + 0.001, "\(size) \(f)")
-                    XCTAssertLessThanOrEqual(f[1] + f[3], size.height + 0.001, "\(size) \(f)")
-                }
-                XCTAssertLessThanOrEqual(boxes[0].frame[1] + boxes[0].frame[3], boxes[1].frame[1], "title above the tour")
-                let at = SampleNotebook.handwritingOrigin(pageSize: size, stylusMode: mode)
-                XCTAssertLessThan(at[1] + SampleNotebook.handwritingSize, size.height, "\(size)")
+        let cases = [PageSize.a4, PageSize.standard, PageSize(612, 792), PageSize(842, 595), PageSize(300, 400)]
+            .flatMap { size in StylusMode.allCases.flatMap { mode in [true, false].map { (size, mode, $0) } } }
+        for (size, mode, outside) in cases {
+            let tour = SampleNotebook.tourLayout(pageSize: size, stylusMode: mode, libraryOutside: outside)
+            XCTAssertLessThanOrEqual(tour.needed, tour.available, "\(size): the estimated tour fits above the handwriting")
+            XCTAssertFalse(tour.tips.isEmpty, "\(size)")
+            XCTAssertEqual(tour.tips, Array(SampleNotebook.tips(stylusMode: mode, libraryOutside: outside).prefix(tour.tips.count)),
+                           "tips go from the end")
+            let boxes = SampleNotebook.boxes(pageSize: size, stylusMode: mode, libraryOutside: outside)
+            XCTAssertEqual(boxes.count, 2)
+            XCTAssertFalse(boxes[1].autoGrow, "the tour box keeps its frame")
+            XCTAssertEqual(boxes[1].frame[3], tour.needed)
+            for box in boxes {
+                let f = box.frame
+                XCTAssertGreaterThanOrEqual(f[0], 0)
+                XCTAssertGreaterThanOrEqual(f[1], 0)
+                XCTAssertLessThanOrEqual(f[0] + f[2], size.width + 0.001, "\(size) \(f)")
+                XCTAssertLessThanOrEqual(f[1] + f[3], size.height + 0.001, "\(size) \(f)")
             }
+            XCTAssertLessThanOrEqual(boxes[0].frame[1] + boxes[0].frame[3], boxes[1].frame[1], "title above the tour")
+            let at = SampleNotebook.handwritingOrigin(pageSize: size, stylusMode: mode, libraryOutside: outside)
+            XCTAssertLessThan(at[1] + SampleNotebook.handwritingSize, size.height, "\(size)")
+            XCTAssertGreaterThanOrEqual(at[1], boxes[1].frame[1] + boxes[1].frame[3], "\(size): handwriting under the tour")
         }
-        let tips = SampleNotebook.tips(stylusMode: .anyInput).joined(separator: " ")
-        XCTAssertFalse(tips.contains("!"), "no exclamation marks in copy")
-        XCTAssertFalse(tips.contains("\u{2014}"), "no em dashes in copy")
+        let small = SampleNotebook.tourLayout(pageSize: PageSize(300, 400), stylusMode: .pencilOnly, libraryOutside: false)
+        XCTAssertEqual(small.fontSize, SampleNotebook.smallestBodySize)
+        XCTAssertLessThan(small.tips.count, SampleNotebook.tips(stylusMode: .pencilOnly, libraryOutside: false).count,
+                          "a small page drops tips rather than running past the page")
+        XCTAssertEqual(SampleNotebook.tourLayout(pageSize: .a4, stylusMode: .pencilOnly, libraryOutside: true).tips.count,
+                       SampleNotebook.tips(stylusMode: .pencilOnly, libraryOutside: true).count, "A4 keeps the whole tour")
+        for outside in [true, false] {
+            let tips = SampleNotebook.tips(stylusMode: .anyInput, libraryOutside: outside).joined(separator: " ")
+            XCTAssertFalse(tips.contains("!"), "no exclamation marks in copy")
+            XCTAssertFalse(tips.contains("\u{2014}"), "no em dashes in copy")
+        }
     }
 
     // MARK: Steps and layout

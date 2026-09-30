@@ -12,7 +12,7 @@ import NibContracts
 ///   changes nothing, and F070 keeps warning while it is the case;
 /// - Apple Pencil or finger: `settings.set {name: "stylus.mode"}` (`NibSettings.stylusMode`); the double-tap and
 ///   squeeze bindings: `pencil.actions` (F043) to read them, `settings.set` on `pencilhw.doubleTap` / `.squeeze`;
-/// - AI: `settings.open {page}` at the Settings page of the `.ai` section (F086), `ai.provider.list` to show what is
+/// - AI: `settings.open {page}` at F086's Settings page of the `.ai` section, `ai.provider.list` to show what is
 ///   connected; keys are entered only there;
 /// - sample notebook: `doc.create` (F002), then `text.createBox` (F026) and `ink.writeText` (F059) when installed;
 /// - done or skipped: `settings.set {name: "onboarding.done", value: true}`, then `doc.quickNote` (F021) or
@@ -45,6 +45,8 @@ enum OnboardingSettings {
 enum OnboardingNames {
     static let doubleTapSetting = "pencilhw.doubleTap"
     static let squeezeSetting = "pencilhw.squeeze"
+    /// F086 (`FeatAISettingsFeature.id`): its `.ai` Settings page holds the providers and their keys.
+    static let aiSettingsOwner = "aisettings"
 }
 
 /// The shell's `ui.screens.onboarding` factory: a screen while onboarding is unfinished on this device, nil after.
@@ -188,23 +190,6 @@ struct ProviderSummary: Identifiable, Equatable {
     }
 }
 
-/// The provider presets F086 offers (ARCHITECTURE.md §12, AI.md); each row opens AI settings, where keys are entered.
-struct ProviderPreset: Identifiable, Equatable {
-    let id: String
-    let name: String
-    let detail: String
-
-    static var all: [ProviderPreset] {
-        [ProviderPreset(id: "anthropic", name: "Anthropic", detail: String(localized: "Claude models, with your own key")),
-         ProviderPreset(id: "openai", name: "OpenAI", detail: String(localized: "GPT models, with your own key")),
-         ProviderPreset(id: "openrouter", name: "OpenRouter", detail: String(localized: "Many models through one key")),
-         ProviderPreset(id: "ollama", name: "Ollama", detail: String(localized: "Models running on your own computer")),
-         ProviderPreset(id: "lmstudio", name: "LM Studio", detail: String(localized: "Models running on your own computer")),
-         ProviderPreset(id: "custom", name: String(localized: "Other Server"),
-                        detail: String(localized: "Any OpenAI-compatible endpoint"))]
-    }
-}
-
 // MARK: - Sample notebook
 
 /// The sample notebook "create sample notebook" adds: two pages, a title and a short tour on the first paper page
@@ -215,24 +200,52 @@ enum SampleNotebook {
         /// [x, y, w, h] in page points.
         var frame: [Double]
         var text: RichText
+        /// false for the tour: its frame is sized from the estimate below and must not grow past the handwriting line
+        /// (F026's `TextBoxStyle.autoGrow` defaults to true).
+        var autoGrow = true
+    }
+
+    /// The tour's place on the page: which tips fit, at which size, and how tall the text is estimated to be.
+    struct TourLayout: Equatable {
+        var margin: Double
+        var width: Double
+        var bodyTop: Double
+        /// Height between the title and the handwriting line.
+        var available: Double
+        var fontSize: Double
+        var tips: [String]
+        /// The estimated height of the intro and `tips` at `fontSize`; at most `available` whenever the intro alone fits.
+        var needed: Double
+    }
+
+    /// A step that failed while the sample was built, with the command that failed (for the log and the toast).
+    struct Failure: Error {
+        let command: String
+        let error: NibError
     }
 
     static let pageCount = 2
     static let titleSize = 30.0
     static let bodySize = 17.0
+    static let smallestBodySize = 13.0
     static let handwritingSize = 28.0
 
     static var title: String { String(localized: "Welcome to Nib") }
 
-    static func tips(stylusMode: StylusMode) -> [String] {
+    /// The reinstall tip tells the truth about where the library is (P-014): safe only in a folder outside Nib.
+    static func tips(stylusMode: StylusMode, libraryOutside: Bool) -> [String] {
         let writing = stylusMode == .pencilOnly
             ? String(localized: "Write with Apple Pencil. Fingers scroll, zoom and select, so a resting hand never leaves a mark.")
             : String(localized: "Write with your finger or any stylus. Scroll and zoom with two fingers.")
+        let library = libraryOutside
+            ? String(localized: "Every notebook is a file in your library folder, so it stays safe when Nib is reinstalled.")
+            : String(localized: "Your notes are inside Nib, so reinstalling the app deletes them. Move them to a folder from Cloud & Backup.")
+        // Most important first: a small page drops tips from the end.
         return [writing,
+                library,
                 String(localized: "Hold the pen still at the end of a stroke to snap it to a straight line or a shape."),
                 String(localized: "Drag the tool palette to any edge of the screen, wherever it suits your hand."),
                 String(localized: "Search finds your handwriting as well as typed text."),
-                String(localized: "Every notebook is a file in your library folder, so it stays safe when Nib is reinstalled."),
                 String(localized: "Connect your own AI model in Settings to ask questions about your notes.")]
     }
 
@@ -246,39 +259,53 @@ enum SampleNotebook {
         return max(1, Int((Double(text.count) / Double(perLine)).rounded(.up)))
     }
 
-    /// Page margins, the title box and the tour box for a page of `size`; every frame lies inside the page, leaving
-    /// room for the handwriting line. The tour steps down from 17 to 13 pt when a small page needs it.
-    static func boxes(pageSize size: PageSize, stylusMode: StylusMode) -> [Box] {
+    /// Estimated height of the intro, a blank line and `tips` as bullets, `width` wide at `size` points.
+    static func estimatedHeight(tips: [String], width: Double, size: Double) -> Double {
+        let lines = estimatedLines(intro, width: width, size: size) + (tips.isEmpty ? 0 : 1)
+            + tips.reduce(0) { $0 + estimatedLines($1, width: width - size * 1.5, size: size) }
+        return (Double(lines) * size * 1.35 + 8).rounded(.up)
+    }
+
+    /// The tour steps down from 17 to 15 to 13 pt; when even 13 pt is too tall for a small page, tips go from the end
+    /// until the rest fits, so the text never runs past the handwriting line or the page.
+    static func tourLayout(pageSize size: PageSize, stylusMode: StylusMode, libraryOutside: Bool) -> TourLayout {
         let margin = min(56, max(24, size.width * 0.09))
         let width = max(80, size.width - 2 * margin)
-        let titleTop = margin
-        let titleHeight = 44.0
-        let bodyTop = titleTop + titleHeight + 16
+        let bodyTop = margin + 44 + 16
         let available = max(60, size.height - bodyTop - margin - (handwritingSize + 40))
-        let tour = tips(stylusMode: stylusMode)
-        var fontSize = 13.0
-        var bodyHeight = available
-        for candidate in [bodySize, 15, 13] {
-            let lines = estimatedLines(intro, width: width, size: candidate) + 1
-                + tour.reduce(0) { $0 + estimatedLines($1, width: width - candidate * 1.5, size: candidate) }
-            let needed = (Double(lines) * candidate * 1.35 + 8).rounded(.up)
-            if needed <= available || candidate == 13 {
-                fontSize = candidate
-                bodyHeight = min(needed, available)
-                break
-            }
+        var tour = tips(stylusMode: stylusMode, libraryOutside: libraryOutside)
+        func layout(_ fontSize: Double) -> TourLayout {
+            TourLayout(margin: margin, width: width, bodyTop: bodyTop, available: available, fontSize: fontSize, tips: tour,
+                       needed: estimatedHeight(tips: tour, width: width, size: fontSize))
         }
+        for candidate in [bodySize, 15] {
+            let fit = layout(candidate)
+            if fit.needed <= available { return fit }
+        }
+        while !tour.isEmpty && layout(smallestBodySize).needed > available { tour.removeLast() }
+        return layout(smallestBodySize)
+    }
+
+    /// The title box and the tour box for a page of `size`; every frame lies inside the page, leaving room for the
+    /// handwriting line.
+    static func boxes(pageSize size: PageSize, stylusMode: StylusMode, libraryOutside: Bool) -> [Box] {
+        let tour = tourLayout(pageSize: size, stylusMode: stylusMode, libraryOutside: libraryOutside)
+        let titleTop = tour.margin
         let bold = TextAttributes(size: titleSize, bold: true)
-        let body = TextAttributes(size: fontSize)
-        var paragraphs = [Paragraph(runs: [TextRun(intro, body)]), Paragraph()]
-        paragraphs += tour.map { Paragraph(runs: [TextRun($0, body)], list: .bullet) }
-        return [Box(frame: [margin, titleTop, width, titleHeight], text: RichText(plain: title, attrs: bold)),
-                Box(frame: [margin, bodyTop, width, bodyHeight], text: RichText(paragraphs: paragraphs))]
+        let body = TextAttributes(size: tour.fontSize)
+        var paragraphs = [Paragraph(runs: [TextRun(intro, body)])]
+        if !tour.tips.isEmpty { paragraphs.append(Paragraph()) }
+        paragraphs += tour.tips.map { Paragraph(runs: [TextRun($0, body)], list: .bullet) }
+        return [Box(frame: [tour.margin, titleTop, tour.width, 44], text: RichText(plain: title, attrs: bold)),
+                Box(frame: [tour.margin, tour.bodyTop, tour.width, min(tour.needed, tour.available)],
+                    text: RichText(paragraphs: paragraphs), autoGrow: false)]
     }
 
     /// Where the handwriting line starts: under the tour box, inside the page.
-    static func handwritingOrigin(pageSize size: PageSize, stylusMode: StylusMode) -> [Double] {
-        guard let last = boxes(pageSize: size, stylusMode: stylusMode).last else { return [56, 72] }
+    static func handwritingOrigin(pageSize size: PageSize, stylusMode: StylusMode, libraryOutside: Bool) -> [Double] {
+        guard let last = boxes(pageSize: size, stylusMode: stylusMode, libraryOutside: libraryOutside).last else {
+            return [56, 72]
+        }
         let y = min(last.frame[1] + last.frame[3] + 40, size.height - handwritingSize - 24)
         return [last.frame[0], max(0, y)]
     }
@@ -288,30 +315,40 @@ enum SampleNotebook {
         pages.count > requested ? pages.dropFirst(pages.count - requested).first : pages.first
     }
 
-    /// Creates the notebook and its content as one undo group; returns the new document ref.
+    /// Creates the notebook and its content as one undo group; returns the new document ref. A failing step throws
+    /// `Failure` naming its command.
     @MainActor
-    static func create(pageSize: PageSize, stylusMode: StylusMode, inkColor: RGBA, isInstalled: (String) -> Bool,
+    static func create(pageSize: PageSize, stylusMode: StylusMode, libraryOutside: Bool, inkColor: RGBA,
+                       isInstalled: (String) -> Bool,
                        run: (String, JSONValue, String) async throws -> JSONValue) async throws -> String? {
         let group = NibID.make().raw
-        let created = try await run(CommandIDs.docCreate,
-                                    ["kind": "notebook", "title": .string(title), "pages": .number(Double(pageCount))], group)
-        let pages = created["pages"]?.arrayValue?.compactMap { $0.stringValue } ?? []
-        guard let page = firstPaperPage(pages, requested: pageCount) else { return created["ref"]?.stringValue }
-        if isInstalled(CommandIDs.textCreateBox) {
-            for box in boxes(pageSize: pageSize, stylusMode: stylusMode) {
-                let frame = JSONValue.array(box.frame.map { .number($0) })
-                _ = try await run(CommandIDs.textCreateBox,
-                                  ["page": .string(page), "frame": frame, "text": try JSONValue.from(box.text)], group)
+        var command = CommandIDs.docCreate
+        do {
+            let created = try await run(command, ["kind": "notebook", "title": .string(title),
+                                                  "pages": .number(Double(pageCount))], group)
+            let pages = created["pages"]?.arrayValue?.compactMap { $0.stringValue } ?? []
+            guard let page = firstPaperPage(pages, requested: pageCount) else { return created["ref"]?.stringValue }
+            if isInstalled(CommandIDs.textCreateBox) {
+                command = CommandIDs.textCreateBox
+                for box in boxes(pageSize: pageSize, stylusMode: stylusMode, libraryOutside: libraryOutside) {
+                    var params: [String: JSONValue] = ["page": .string(page), "frame": .array(box.frame.map { .number($0) }),
+                                                       "text": try JSONValue.from(box.text)]
+                    if !box.autoGrow { params["style"] = ["autoGrow": false] }
+                    _ = try await run(command, .object(params), group)
+                }
             }
+            if isInstalled(CommandIDs.inkWriteText) {
+                command = CommandIDs.inkWriteText
+                let at = handwritingOrigin(pageSize: pageSize, stylusMode: stylusMode, libraryOutside: libraryOutside)
+                _ = try await run(command, ["page": .string(page),
+                                            "text": .string(String(localized: "Try writing on the next page.")),
+                                            "at": .array(at.map { .number($0) }), "size": .number(handwritingSize),
+                                            "color": .string(inkColor.hex)], group)
+            }
+            return created["ref"]?.stringValue
+        } catch {
+            throw Failure(command: command, error: NibError.wrap(error))
         }
-        if isInstalled(CommandIDs.inkWriteText) {
-            let at = handwritingOrigin(pageSize: pageSize, stylusMode: stylusMode)
-            _ = try await run(CommandIDs.inkWriteText,
-                              ["page": .string(page), "text": .string(String(localized: "Try writing on the next page.")),
-                               "at": .array(at.map { .number($0) }), "size": .number(handwritingSize),
-                               "color": .string(inkColor.hex)], group)
-        }
-        return created["ref"]?.stringValue
     }
 }
 
@@ -357,20 +394,25 @@ final class OnboardingModel: ObservableObject {
     private(set) weak var navigator: SceneNavigator?
     private let containerHome: URL
     private let libraryRoot: @MainActor () -> URL?
+    private let idiom: UIUserInterfaceIdiom
     private var finishing = false
+    /// The user picked Apple Pencil or Any Input, or the iPhone default was applied: never changed for them after.
+    private var stylusDecided = false
     private var subscriptions: [OnboardingSubscription] = []
     private let log = Logger(subsystem: "app.nib", category: FeatOnboardingFeature.id)
 
     /// The app's own container (`NSHomeDirectory()`): a library under it is deleted with the app.
     static var appContainer: URL { URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true) }
 
-    /// `containerHome` defaults to the app's container and `libraryRoot` to the library service's root (tests pass
-    /// their own).
-    init(app: NibApp, navigator: SceneNavigator?, containerHome: URL? = nil, libraryRoot: (@MainActor () -> URL?)? = nil) {
+    /// `containerHome` defaults to the app's container, `libraryRoot` to the library service's root and `idiom` to the
+    /// device's (tests pass their own).
+    init(app: NibApp, navigator: SceneNavigator?, containerHome: URL? = nil, libraryRoot: (@MainActor () -> URL?)? = nil,
+         idiom: UIUserInterfaceIdiom? = nil) {
         self.app = app
         self.navigator = navigator
         self.containerHome = containerHome ?? OnboardingModel.appContainer
         self.libraryRoot = libraryRoot ?? { [weak app] in app?.services.library?.rootURL }
+        self.idiom = idiom ?? UIDevice.current.userInterfaceIdiom
         self.stylusMode = app.settings.get(NibSettings.stylusMode)
         refreshPlacement()
         observe()
@@ -384,13 +426,16 @@ final class OnboardingModel: ObservableObject {
     var canOpenQuickNote: Bool { isInstalled(CommandIDs.docQuickNote) }
     var canCreateSample: Bool { isInstalled(CommandIDs.docCreate) }
 
-    /// The Settings page of the AI section (F086's provider settings), when Settings (F027) can open it.
+    /// F086's provider page in the AI section of Settings (else the section's first page), when Settings (F027) can
+    /// open it. Other features and plugins may add pages to the section too.
     var aiSettingsPage: String? {
         guard isInstalled(CommandIDs.settingsOpen) else { return nil }
-        return app.ui.settingsPages.all.first { $0.section == .ai }?.id
+        let pages = app.ui.settingsPages.all
+        return (pages.first { $0.section == .ai && $0.owner == OnboardingNames.aiSettingsOwner }
+                ?? pages.first { $0.section == .ai })?.id
     }
 
-    var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+    var isPad: Bool { idiom == .pad }
 
     var liquidMode: String { app.settings.get(NibSettings.liquidMode) }
 
@@ -416,7 +461,11 @@ final class OnboardingModel: ObservableObject {
         step = target
         switch target {
         case .library: refreshPlacement()
-        case .pencil: Task { await self.loadPencilBindings() }
+        case .pencil:
+            Task {
+                await self.applyPhoneStylusDefault()
+                await self.loadPencilBindings()
+            }
         case .assistant: Task { await self.loadProviders() }
         case .done: break
         }
@@ -462,7 +511,29 @@ final class OnboardingModel: ObservableObject {
 
     // MARK: Apple Pencil or finger
 
+    /// The user's choice (the Apple Pencil and Any Input tiles).
     func setStylusMode(_ mode: StylusMode) async {
+        stylusDecided = true
+        do {
+            try await writeStylusMode(mode)
+        } catch {
+            message = NibError.wrap(error).message
+        }
+    }
+
+    /// iPhone has no Apple Pencil, and `stylus.mode` defaults to pencilOnly: unless the user chose, fingers write there.
+    /// Runs when the Pencil step first shows, and on finish or skip when it never showed.
+    func applyPhoneStylusDefault() async {
+        guard !isPad, !stylusDecided else { return }
+        stylusDecided = true
+        do {
+            try await writeStylusMode(.anyInput)
+        } catch {
+            log.error("settings.set stylus.mode failed: \(NibError.wrap(error).message, privacy: .public)")
+        }
+    }
+
+    private func writeStylusMode(_ mode: StylusMode) async throws {
         guard mode != stylusMode else { return }
         let previous = stylusMode
         stylusMode = mode
@@ -470,7 +541,7 @@ final class OnboardingModel: ObservableObject {
             try await run(CommandIDs.settingsSet, ["name": .string(NibSettings.stylusMode.name), "value": .string(mode.rawValue)])
         } catch {
             stylusMode = previous
-            message = NibError.wrap(error).message
+            throw error
         }
     }
 
@@ -524,11 +595,27 @@ final class OnboardingModel: ObservableObject {
         }
     }
 
-    /// While the AI step shows: reloads the providers each time Settings, presented over this window, closes.
+    /// Reloads the connected providers while the AI step shows (a Settings change owned by AI, the app coming back
+    /// to the foreground, the screen appearing again, Settings closing).
+    func reloadProvidersIfShown() async {
+        guard step == .assistant else { return }
+        await loadProviders()
+    }
+
+    /// Whether a sheet other than an alert (Settings) is presented over this window.
+    var presentsSheet: Bool {
+        guard let presented = navigator?.rootViewController?.presentedViewController else { return false }
+        return !(presented is UIAlertController)
+    }
+
+    /// Fallback while the AI step shows: reloads the providers each time a sheet presented over this window (Settings)
+    /// closes. Contract gap: no contract announces a change to the provider list (F086 keeps configs in Application
+    /// Support, not in `SettingsStore`, and there is no `ai.providers` change event), so a provider saved in Settings
+    /// is noticed only by polling. Alerts over this window (Skip Setup) do not count.
     func watchSettingsReturns() async {
         var wasPresenting = false
         while !Task.isCancelled {
-            let presenting = navigator?.rootViewController?.presentedViewController != nil
+            let presenting = presentsSheet
             if wasPresenting && !presenting { await loadProviders() }
             wasPresenting = presenting
             try? await Task.sleep(nanoseconds: 400_000_000)
@@ -554,6 +641,7 @@ final class OnboardingModel: ObservableObject {
 
     private func completeSkip() async {
         guard await markDone() else { return }
+        await applyPhoneStylusDefault()
         await leave()
         busy = nil
     }
@@ -563,12 +651,17 @@ final class OnboardingModel: ObservableObject {
     func finish(openQuickNote: Bool) async {
         guard busy == nil else { return }
         guard await markDone() else { return }
+        await applyPhoneStylusDefault()
         if addsSampleNotebook && canCreateSample {
+            refreshPlacement()
             do {
                 _ = try await SampleNotebook.create(
-                    pageSize: app.settings.get(NibSettings.defaultPageSize), stylusMode: stylusMode, inkColor: penStyle.color,
+                    pageSize: app.settings.get(NibSettings.defaultPageSize), stylusMode: stylusMode,
+                    libraryOutside: placement.isOutside, inkColor: penStyle.color,
                     isInstalled: { [unowned self] in self.isInstalled($0) },
                     run: { [unowned self] id, params, group in try await self.run(id, params, group: group) })
+            } catch let failure as SampleNotebook.Failure {
+                report(failure.error, command: failure.command)
             } catch {
                 report(error, command: CommandIDs.docCreate)
             }
@@ -645,6 +738,16 @@ final class OnboardingModel: ObservableObject {
             Task { @MainActor in self?.refreshPlacement() }
         }
         subscriptions.append(OnboardingSubscription { events.cancel() })
+        let activation = NotificationCenter.default.addObserver(forName: UIScene.didActivateNotification, object: nil,
+                                                                queue: .main) { [weak self] _ in
+            Task { @MainActor in await self?.reloadProvidersIfShown() }
+        }
+        subscriptions.append(OnboardingSubscription { NotificationCenter.default.removeObserver(activation) })
+    }
+
+    /// Settings F086 owns (and any `ai.` setting): a provider may have changed with them.
+    func isAISetting(_ name: String) -> Bool {
+        name.hasPrefix("ai.") || app.settings.descriptor(name)?.owner == OnboardingNames.aiSettingsOwner
     }
 
     func settingDidChange(_ name: String?) {
@@ -658,6 +761,8 @@ final class OnboardingModel: ObservableObject {
             navigator?.showLibrary(folder: nil)
         } else if name == OnboardingNames.doubleTapSetting || name == OnboardingNames.squeezeSetting {
             if step == .pencil { Task { await self.loadPencilBindings() } }
+        } else if isAISetting(name) {
+            Task { await self.reloadProvidersIfShown() }
         }
     }
 }

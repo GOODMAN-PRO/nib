@@ -29,8 +29,10 @@ final class OnboardingHostingController: UIHostingController<OnboardingView> {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        // The folder sync engine (F025) may have resolved the library bookmark since the model was made.
+        // The folder sync engine (F025) may have resolved the library bookmark since the model was made, and a
+        // full-screen Settings may have just closed over the AI step.
         model.refreshPlacement()
+        Task { await model.reloadProvidersIfShown() }
     }
 }
 
@@ -132,6 +134,9 @@ struct OnboardingView: View {
             practiceHasInk = false
             // A new page: VoiceOver starts again at its top ("Step 2 of 4", then the headline).
             UIAccessibility.post(notification: .screenChanged, argument: nil)
+        }
+        .onAppear {
+            Task { await model.reloadProvidersIfShown() }
         }
         .task(id: model.step) {
             if model.step == .assistant { await model.watchSettingsReturns() }
@@ -314,9 +319,10 @@ struct OnboardingView: View {
 
     // MARK: Step 3: bring your own AI (optional)
 
+    /// The presets live in F086's editor; this step names them and opens Settings once ("Set Up AI" in the footer).
     @ViewBuilder private var assistantStep: some View {
         headline(String(localized: "Bring your own AI."))
-        bodyText(String(localized: "Optional. Use Claude, GPT or any model on OpenRouter with your own key, or a model on your own computer with Ollama or LM Studio. Nib sends a note to your provider only when you ask."))
+        bodyText(String(localized: "Optional. Use Claude, GPT or any model on OpenRouter with your own key, a model on your own computer with Ollama or LM Studio, or your own server. Nib sends a note to your provider only when you ask."))
         note(String(localized: "Keys are entered in Settings, never here."))
         if !model.providers.isEmpty {
             VStack(spacing: 0) {
@@ -332,37 +338,13 @@ struct OnboardingView: View {
                         }
                     }
                     .accessibilityElement(children: .combine)
-                    hairline
+                    if provider.id != model.providers.last?.id { hairline }
                 }
             }
         }
-        if model.aiSettingsPage != nil {
-            VStack(spacing: 0) {
-                ForEach(ProviderPreset.all) { preset in
-                    providerRow(preset)
-                    if preset.id != ProviderPreset.all.last?.id { hairline }
-                }
-            }
-        } else {
+        if model.aiSettingsPage == nil {
             NibBanner(String(localized: "AI settings aren't part of this build."), style: .info, symbol: .assistant)
         }
-    }
-
-    private func providerRow(_ preset: ProviderPreset) -> some View {
-        Button {
-            Task { await model.openAISettings() }
-        } label: {
-            NibInspectorRow(preset.name, subtitle: preset.detail) {
-                Image(nib: .forward)
-                    .font(NibFont.footnoteEmphasis)
-                    .foregroundStyle(NibColor.labelTertiary)
-                    .accessibilityHidden(true)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: NibRadius.sidebarRow, style: .continuous)))
-        .accessibilityElement(children: .combine)
-        .accessibilityHint(String(localized: "Opens AI settings"))
     }
 
     // MARK: Step 4: done
@@ -409,8 +391,16 @@ struct OnboardingView: View {
         case .pencil:
             return [next]
         case .assistant:
-            return model.providers.isEmpty ? [action("skip", String(localized: "Skip"), nil, .secondary) { model.advance() }]
-                                           : [next]
+            let setUp: () -> Void = { Task { await model.openAISettings() } }
+            guard model.aiSettingsPage != nil else {
+                return model.providers.isEmpty ? [action("skip", String(localized: "Skip"), nil, .secondary) { model.advance() }]
+                                               : [next]
+            }
+            if model.providers.isEmpty {
+                return [action("skip", String(localized: "Skip"), nil, .plain) { model.advance() },
+                        action("setup", String(localized: "Set Up AI"), .assistant, .primary) { setUp() }]
+            }
+            return [action("settings", String(localized: "AI Settings"), nil, .plain) { setUp() }, next]
         case .done:
             let library: () -> Void = { Task { await model.finish(openQuickNote: false) } }
             guard model.canOpenQuickNote else {
@@ -517,6 +507,7 @@ struct OnboardingView: View {
                 Task { await model.chooseFolder() }
             }
             Button(String(localized: "Keep Notes in Nib"), role: .destructive) { model.confirmKeepInApp() }
+            Button(String(localized: "Cancel"), role: .cancel) { model.confirmation = nil }
         case .skipInsideApp:
             Button(String(localized: "Skip Setup"), role: .destructive) { Task { await model.confirmSkip() } }
             Button(String(localized: "Cancel"), role: .cancel) { model.confirmation = nil }
