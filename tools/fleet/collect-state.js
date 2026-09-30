@@ -54,6 +54,8 @@ for (const f of spec.features) {
   if (ci) { s.ci = ci; if (ci === 'green') report.ciGreen++; else report.ciRed.push(f.id) }
   if (review && review.verdict) { s.review = review.verdict; report.reviewed++ }
   if (fixed && fixed.status) { s.fixed = fixed.status; report.fixed++ }
+  if (fixed && fixed.v2adopt) s.v2 = 1
+  if (/^WIP /.test(sh('git log -1 --format=%s', wt))) s.wip = 1
   if (s.ci === 'green' && (s.review === 'pass' || s.fixed === 'green')) report.fullyDone.push(f.id)
   if (Object.keys(s).length) state[f.id] = s
 }

@@ -20,7 +20,7 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 
 ## Follow-ups (not in any agent yet)
 - F009: highlighter live preview treats 3-point curves as passing through the middle point; F030/F031 use control points. Needs a FIX pass after contracts-v2.
-- F036: drop-to-attach criterion removed pending undo coalescing fix; restore after contracts-v2 (FIX pass). Update F036 line in contract-gaps.md.
+- F036: drop-to-attach RESTORED (36aa13d, run 36227055835).
 - App target: add user-fonts entitlement (com.apple.developer.user-fonts=[app-usage]) or UIAppSupportsInstalledFonts for F026 T-059/P-083 (owner of Nib/ Info.plist or integration).
 - Integration spec edit: add image.pick {source, page?|doc?|ref?|refs?, point?, position?, anchor?, ids?} (edit, user presence, sensitive) to F034 commands in forge-spec.json + ARCHITECTURE §6.5.
 - Integration spec edit: ARCHITECTURE catalogue: element.create gains optional fallback:Bool (F035).
@@ -54,3 +54,30 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - design v2.1 merged (palette re-form on external dock change; reflow 180 ms dwell). Known edge: .dropletDockable orientation flip-back within ~190 ms mislays; could reuse palette logic.
 - F022 V2ADOPT: Move Pages sheet must read PanelContext.params["pages"] (F023 multi-page move). F022/F023 duplicate the nib-pages/1 payload encoder: a shared contract type would remove it.
 - NibSymbol: rotate glyph; 3 pt drag-preview border token (F023).
+- contract gap: bridge per-call event (F090 emits bridge.status only on state/session change); ARCHITECTURE §12 pairing link should document optional port (F074 spec already says so).
+- F017 V2ADOPT green (d0849c6): overlays hosted, floatingHost published, toolbarView full-window, openPanels, PanelContext params/presentation.
+- Remaining chrome gaps: DropletStyle per-droplet recede opt-out (NibDesign); overlay 'instant' show; contract for palette dock location so bottom overlays avoid a bottom-docked palette on iPad; toast bud swallows first outside touch; shell must track key-window changes (window.showLibrary) and forward childForStatusBarHidden (P-106).
+- Spec pass 2 items: audio.play toggle? + clip optional for user; audio.pause close?; playback status recording field (F052). Panel tabs have no live icon (Audio tab recording dot) -> contract gap.
+- Shell v2 (branch v2/shell, Nib/App/** scaffold-owned): key commands honour docKinds/sessionParams, ⌘Z window-undo fallback, key-window tracking, childForStatusBarHidden, user-fonts entitlement. After merge, the CONTRACTS.md v2.2 Adopt steps: F014 limits its clipboard keys to notebooks and whiteboards, F017 drops the activeNavigator assignment in goToLibrary, F018 restores tabs with addTab and marks ⌘W/⌥⌘W/⌘1–9 whileTabsOpen, F043 moves off ⌥⌘P, F049 keeps its own ⇥/⇧⇥/⎋ keys, F102 re-registers scoped key commands.
+- NibDesign gaps (F013): non-refracting Clear capsule preset; non-modal bud from a source (object menu); contract to distinguish input types (right-click vs finger/pencil long press).
+- contract gaps (F023 review): F108 per-page seen-state contract; shared nib-pages/1 payload type (F022/F023 duplicate).
+- Spec pass 2: scan.documents gains anchor? (F065). F055 V2ADOPT: IndexKeys.scanText -> PageRecord.scanTextExtKey.
+
+## Spec pass 2 (applied)
+Branch v2/spec2 (docs only: forge-spec.json descriptions, ARCHITECTURE §6.1/§6.5/§12/§13, CONTRACTS changelog prose; no Swift, no new catalogue ids, so CommandCatalogueTests stays green; files/tests ownership unchanged; lint 0 errors).
+- F052: audio.record `action` start|stop|pause|resume|toggle → {ref, doc, state, duration}; audio.play {clip, t?, toggle?} (user may omit clip); audio.pause {close?}; playback status gains `recording` ({clip, doc, state, duration} or null). Spec + §6.5 rows. Matches the built code: no delta.
+- F065: scan.documents gains anchor? (spec + §6.5 row); scan text via `PageRecord.scanTextExtKey`. Built code already does both: no delta.
+- F055: description reads the scan text through `PageRecord.scanTextExtKey` (G22). V2ADOPT delta: Indexer.swift `IndexKeys.scanText` → `PageRecord.scanTextExtKey`.
+- F019 (unbuilt): double tap on New (+) → `doc.quickNote {folder}`; every library menu fills `MenuContext.folder`; libraryNew inside a folder also passes `nodes: [folder]` (what F020/F044 read today); presents panels in library windows: `library.setView` gains additive `panel?, params?, close?` (libraryTab → select tab; sheet/fullScreen/floating → presented over the library with PanelContext.params = params) → {panel, placement} | {panel, closed}. library.reorder / Manual sort / NibReflow text kept.
+- F017: panel.open pins PanelContext.params = flat keys of the call minus `id` and `edge`, nested `params` merged over them (exactly what ChromeCommands.panelParams does); returns {id, placement}; panel.close → {closed}. V2ADOPT delta: with no open document, panel.open / panel.close forward to `library.setView {panel: id, params}` / `{panel: id, close: true}` (F019) instead of throwing unavailable (unavailable only when F019 is missing).
+- F045 (unbuilt): template.choose {kind, size?, color?, doc?} → {background, size}: kind paper|cover; size [w, h] page points (always present, orientation applied); color = RGBA hex preselect; background = Background JSON (custom paper: asset stored in `doc` when given, else a `tmp:` asset); cancel → user_denied. What F021/F022 already send and read.
+- F021: V2ADOPT delta: a custom paper from template.choose names a `tmp:` asset → store it in the new notebook with asset.put and rewrite the Background's asset before page.setBackground. Optional: openParams may stop duplicating folder/kind under `params` (the flat rule delivers the top-level keys).
+- F022: V2ADOPT delta: Add Page › Choose Template passes `doc` to template.choose; Move Pages sheet (`PanelIDs.movePages`) reads `PanelContext.params["pages"]` (spec now says so too).
+- F023: spec says Move opens `PanelIDs.movePages` with `pages` (built code already does): no delta.
+- F087 (unbuilt): doc.suggestTitle → {title} (one line, ≤ 60 chars, AI else first recognised line, null when nothing readable; no unavailable without a provider). §6.5 row too. F021 already reads `title`.
+- F074 (unbuilt): parses nib://bridge/pair?host=&port=&token= (port optional, default 7331, any order); acceptance covers with/without port. ARCHITECTURE §12 pairing link documents the optional port.
+- F091: spec names its QR pairing URL (with port), which the built code already writes: no delta.
+- F027: spec says settings.open's panels go through panel.open (F017 → F019 from the library). FIX delta: drop the review's direct-present workaround idea; keep forwarding to panel.open.
+- F007 (unbuilt): v2 items were present (NibSettings.penReactsToRoll, drawAndHold, F009 EMA rule, circle-to-lasso commit, wrapped shape.recognize + shapeSnapped, batch put); added `confidence?` to the recognize result and pinned `pen.style` = PenStyle raw value (F038 reads it).
+- F020 / F044: nothing breaks (F019 passes the folder in `nodes` for libraryNew and presents their sheets). Optional V2ADOPT: one sheet panel reading `PanelContext.params["folder"]` / `MenuContext.folder` instead of per-folder panel ids.
+- Integration spec edits (F034 image.pick, F035 element.create fallback, F041 layer.exportOptions, F066 visibleLayersOnly/visibleLayers): already in forge-spec and §6.5; nothing to apply.
