@@ -378,6 +378,97 @@ final class FeatSmartInkTests: XCTestCase {
         XCTAssertNil(model.target)
     }
 
+    /// The object menu enters the mode as a temporary tool (contracts-v2 G15): the mode edits the lasso's selection as
+    /// it is, and Done hands the strokes back as the selection, returns to the lasso and reports `tool.finished`.
+    func testObjectMenuEntersAsATemporaryToolAndDoneReturnsToTheLasso() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        let s = Synth.paragraph()
+        _ = try await install(s, in: h)
+        h.session.page = page
+        h.session.tool = "lasso"
+        h.session.selection = Selection(doc: doc, page: page, items: s.ids)
+        try await h.run(CommandIDs.toolSelect, ["tool": .string(FeatSmartInkFeature.toolID), "temporary": true])
+        XCTAssertEqual(h.session.tool, FeatSmartInkFeature.toolID)
+        XCTAssertEqual(h.session.temporaryReturnTool, "lasso")
+
+        // The canvas activates the tool the window now shows.
+        let host = FakeCanvasHost(h)
+        let tool = EditHandwritingTool()
+        tool.activate(host)
+        let model = EditHandwritingModel.of(h.session)
+        await model.reload()
+        XCTAssertEqual(Set(model.target?.ids ?? []), Set(s.ids), "the mode edits what the menu was opened on")
+        XCTAssertTrue(h.session.selection.isEmpty, "the mode shows its own frame instead of the lasso's")
+
+        let since = h.app.events.lastSeq
+        model.finish()
+        XCTAssertEqual(h.session.tool, "lasso")
+        XCTAssertNil(h.session.temporaryReturnTool)
+        XCTAssertEqual(Set(h.session.selection.items), Set(s.ids), "the edited strokes are the lasso's selection again")
+        let finished = h.app.events.events(since: since).filter { $0.type == NibEventType.toolFinished }
+        XCTAssertEqual(finished.count, 1)
+        XCTAssertEqual(finished.first?.payload?["tool"]?.stringValue, FeatSmartInkFeature.toolID)
+
+        // A second Done before the canvas deactivates the tool never switches back to it.
+        model.finish()
+        XCTAssertEqual(h.session.tool, "lasso")
+        tool.deactivate(host)
+        XCTAssertFalse(model.isActive)
+    }
+
+    /// Entered from the palette's More grid (a regular tool switch), Done returns to the tool used before.
+    func testDoneAfterARegularSwitchReturnsToThePreviousTool() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        let s = Synth.paragraph()
+        _ = try await install(s, in: h)
+        h.session.page = page
+        h.session.tool = "pencil"
+        try await h.run(CommandIDs.toolSelect, ["tool": .string(FeatSmartInkFeature.toolID)])
+        XCTAssertNil(h.session.temporaryReturnTool)
+        let host = FakeCanvasHost(h)
+        let tool = EditHandwritingTool()
+        tool.activate(host)
+        let model = EditHandwritingModel.of(h.session)
+        XCTAssertNil(model.target, "nothing was selected: the mode waits for a tap on a block")
+        model.finish()
+        XCTAssertEqual(h.session.tool, "pencil")
+        tool.deactivate(host)
+    }
+
+    /// The overlay draws the side handles (NibDesign's handle beads) where the canvas shows the column's edges, through
+    /// the canvas's page transform (contracts-v2 G14): zoomed, on the second page.
+    func testOverlayPlacesTheHandlesThroughThePageTransform() async throws {
+        let h = Harness(features: [FeatSmartInkFeature.self])
+        let s = Synth.paragraph()
+        let (model, tool, host) = try await editMode(h, s)
+        host.zoomScale = 2
+        let overlay = EditHandwritingOverlay()
+        overlay.attach(to: host)
+        overlay.render()
+        let content = try XCTUnwrap(overlay.view.content)
+        XCTAssertEqual(content.handles.count, 2)
+        let text = InkLayout.union(model.layout.words(ofColumn: model.activeColumn).map { $0.box })
+        let expected = [model.columnLeft, model.columnLeft + model.columnWidth].map { x in
+            host.viewPoint(model.layout.toPage(Point(x, text.midY)), page: page)
+        }
+        for (handle, want) in zip(content.handles, expected) {
+            XCTAssertEqual(handle.x, want.x, accuracy: 0.01)
+            XCTAssertEqual(handle.y, want.y, accuracy: 0.01)
+        }
+        XCTAssertGreaterThan(content.handles[0].y, host.pageFrame(Fixtures.page1)?.maxY ?? .infinity, "on page 2")
+        for (view, centre) in zip(overlay.view.handleViews, content.handles) {
+            XCTAssertFalse(view.isHidden)
+            XCTAssertEqual(view.center.x, centre.x, accuracy: 0.01)
+            XCTAssertEqual(view.center.y, centre.y, accuracy: 0.01)
+        }
+
+        tool.deactivate(host)
+        overlay.render()
+        XCTAssertNil(overlay.view.content)
+        XCTAssertTrue(overlay.view.handleViews.allSatisfy { $0.isHidden })
+        overlay.detach(from: host)
+    }
+
     /// Delete Word on the first word of a line: the column flows on at its width as if the word were gone (no false
     /// indent), then the word is deleted. One undo step that restores everything.
     func testEditModeDeleteClosesTheHoleAndReflows() async throws {

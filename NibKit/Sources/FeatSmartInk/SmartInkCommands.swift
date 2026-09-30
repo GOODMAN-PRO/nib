@@ -191,7 +191,7 @@ struct HandwritingWords: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "handwriting.words", title: "Handwriting Lines and Words",
+        id: CommandIDs.handwritingWords, title: "Handwriting Lines and Words",
         summary: "Group handwriting strokes into lines and words, column by column in reading order: bboxes, baselines, angles, paragraph starts and recognised text when available.",
         params: .obj(["refs": SmartInkSchema.refs,
                       "cursor": .str("from a truncated result: continue from this line")],
@@ -264,7 +264,7 @@ struct HandwritingReflow: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "handwriting.reflow", title: "Reflow Handwriting",
+        id: CommandIDs.handwritingReflow, title: "Reflow Handwriting",
         summary: "Reflow handwriting to a new column width by moving whole words (paragraphs, lists and indents kept). Side-by-side columns reflow separately; words can be left out or flowed in.",
         params: .obj(["refs": SmartInkSchema.refs,
                       "width": .num("column width in page points", min: 1, max: SmartInkSchema.coordinateLimit),
@@ -350,7 +350,7 @@ struct HandwritingStraighten: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "handwriting.straighten", title: "Straighten Lines",
+        id: CommandIDs.handwritingStraighten, title: "Straighten Lines",
         summary: "Straighten slanted handwritten lines: each line is sheared (or rotated past 15°) to horizontal about its centre, or about its left end (pivot left: a continued line meets what is already level).",
         params: .obj(["refs": SmartInkSchema.refs,
                       "minAngle": .num("degrees: lines flatter than this stay as written (default 0.5)", min: 0, max: 45),
@@ -398,7 +398,7 @@ struct HandwritingAlign: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "handwriting.align", title: "Align Handwriting",
+        id: CommandIDs.handwritingAlign, title: "Align Handwriting",
         summary: "Align handwritten lines to the left edge, centre or right edge of their column (side-by-side columns align separately).",
         params: .obj(["refs": SmartInkSchema.refs,
                       "align": .str("left, centre (or center) or right", choices: ["left", "centre", "center", "right"])],
@@ -442,7 +442,7 @@ struct HandwritingInsertSpace: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "handwriting.insertSpace", title: "Insert Space",
+        id: CommandIDs.handwritingInsertSpace, title: "Insert Space",
         summary: "Insert vertical space at page y, pushing the ink and items below down by height. A negative height closes space, at most up to the lowest item above y. Reports items pushed past the page bottom.",
         params: .obj(["page": .ref,
                       "y": .num("page y where the space opens", min: -SmartInkSchema.coordinateLimit,

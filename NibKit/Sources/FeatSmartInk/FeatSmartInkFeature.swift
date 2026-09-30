@@ -67,12 +67,12 @@ public enum FeatSmartInkFeature: NibFeature {
             params: { _ in ["tool": .string(tool), "temporary": true] }, isVisible: editable, submenu: smartInk))
         app.ui.menus.register(MenuItemDescriptor(
             id: "smartink.straighten", title: String(localized: "Straighten Lines"), icon: NibSymbol.straighten.name,
-            location: .objectMenu, order: 610, owner: id, command: HandwritingStraighten.descriptor.id,
+            location: .objectMenu, order: 610, owner: id, command: CommandIDs.handwritingStraighten,
             params: { ctx in ["refs": .array(ctx.selection.refs.map { .string($0) })] },
             isVisible: editable, submenu: smartInk))
         app.ui.menus.register(MenuItemDescriptor(
             id: "smartink.insertSpace", title: String(localized: "Insert Space"), icon: NibSymbol.insertSpace.name,
-            location: .pageLongPress, order: 600, owner: id, command: HandwritingInsertSpace.descriptor.id,
+            location: .pageLongPress, order: 600, owner: id, command: CommandIDs.handwritingInsertSpace,
             params: { ctx in
                 guard let doc = ctx.doc, let page = ctx.page, let point = ctx.point else { return [:] }
                 return ["page": .string(NodeRef.page(doc, page).description), "y": .number(point.y),
@@ -184,7 +184,7 @@ final class AutoStraightener {
                                      "pivot": .string(InkPivot.left.rawValue)]
             Task {
                 // Best effort: a burst that was erased or locked meanwhile simply stays as written.
-                _ = try? await app.bus.execute(Invocation(command: HandwritingStraighten.descriptor.id, params: params,
+                _ = try? await app.bus.execute(Invocation(command: CommandIDs.handwritingStraighten, params: params,
                                                           session: session))
             }
         }
