@@ -349,10 +349,11 @@ struct ContributionMapper {
             let placement = panel.placement.flatMap(PanelPlacement.init(rawValue:)) ?? .floating
             let entry = panel.entry
             let title = panel.title
+            let panelID = panel.id
             var d = PanelDescriptor(id: panel.id, title: title, icon: panel.icon ?? "puzzlepiece.extension",
                                     placement: placement, order: 1000 + i, owner: pid) { context in
                 guard let factory = context.app.services.get(ServiceKeys.pluginPanels, as: PluginPanelFactory.self) else {
-                    return AnyView(PluginPanelUnavailable(title: title, dismiss: context.dismiss))
+                    return AnyView(PluginPanelUnavailable(title: title, panelID: panelID, context: context))
                 }
                 return factory.makePanel(manifest: manifest, folder: folder, entry: entry, context: context)
             }
@@ -1709,10 +1710,12 @@ struct CustomItemInspector: View {
     }
 }
 
-/// Shown instead of a plugin panel when the panels feature is not installed.
+/// Shown instead of a plugin panel when the panels feature is not installed. Close runs `panel.close` like the panel
+/// chrome does (the window's own dismiss when that command is not installed either).
 struct PluginPanelUnavailable: View {
     let title: String
-    let dismiss: @MainActor () -> Void
+    let panelID: String
+    let context: PanelContext
 
     var body: some View {
         VStack(spacing: 12) {
@@ -1720,7 +1723,13 @@ struct PluginPanelUnavailable: View {
             Text(String(localized: "Plugin panels are not available in this build of Nib."))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
-            Button(String(localized: "Close")) { dismiss() }
+            Button(String(localized: "Close")) {
+                if context.app.commands.descriptor(CommandIDs.panelClose) != nil {
+                    context.app.perform(CommandIDs.panelClose, ["id": .string(panelID)], session: context.session)
+                } else {
+                    context.dismiss()
+                }
+            }
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)

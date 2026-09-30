@@ -390,6 +390,14 @@ enum ManifestValidator {
             if (hook.effect ?? "edit") != Effect.read.rawValue {
                 fail("hook commands must be declared \"effect\": \"read\"", p + ".command")
             }
+            // The hook runs as the plugin before every matching call; without the scope its read needs, every one of
+            // those calls would be refused.
+            let target = hook.target.flatMap(CommandTarget.init(rawValue:)) ?? .document
+            let needed = target == .document ? Scope.documentRead : target == .library ? Scope.libraryRead : Scope.app
+            if !m.permissions.contains(needed.rawValue) {
+                fail("the hook command reads with target \(target.rawValue), so the plugin needs the \"\(needed.rawValue)\" permission",
+                     p + ".command")
+            }
         }
         // Content packs
         unique(c?.elements, { $0.id }, "$.contributes.elements")
@@ -465,8 +473,11 @@ final class PluginHost: PluginHosting {
 
     // MARK: PluginHosting
 
+    /// Every plugin folder found in the library (a folder the installer just removed drops out at once, before the next
+    /// rescan forgets its record).
     var installed: [PluginInfo] {
-        records.values.sorted { ($0.manifest?.name ?? $0.id, $0.id) < ($1.manifest?.name ?? $1.id, $1.id) }.map(info)
+        records.values.filter { FileManager.default.fileExists(atPath: $0.folder.path) }
+            .sorted { ($0.manifest?.name ?? $0.id, $0.id) < ($1.manifest?.name ?? $1.id, $1.id) }.map(info)
     }
 
     func info(_ r: PluginRecord) -> PluginInfo {

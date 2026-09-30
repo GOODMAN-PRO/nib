@@ -242,6 +242,7 @@ final class NibPluginHostTests: XCTestCase {
         await kit.host.refresh(startApproved: true)
         XCTAssertEqual(kit.host.state(id), .running)
         try FileManager.default.removeItem(at: kit.root.appendingPathComponent(id))
+        XCTAssertEqual(kit.host.installed.count, 0, "a removed folder drops out of the list at once")
         await kit.host.refresh(startApproved: false)
         XCTAssertNil(kit.host.state(id))
         XCTAssertNil(kit.h.app.commands.descriptor("\(id).hello"))

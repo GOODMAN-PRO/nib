@@ -269,6 +269,14 @@ final class ContributionMapperTests: XCTestCase {
             XCTAssertTrue((error as? NibError)?.message.contains("more problems") == true)
         }
 
+        let hookWithoutScope = try JSONValue.parse(#"""
+        {"id": "dev.x.y", "name": "Y", "version": "1.0.0", "api": 1, "entry": "main.js", "permissions": ["app"],
+         "contributes": {"commands": [{"id": "dev.x.y.g", "title": "G", "summary": "G.", "effect": "read"}],
+                         "commandHooks": [{"commands": ["page.*"], "command": "dev.x.y.g"}]}}
+        """#).decode(PluginManifest.self)
+        XCTAssertEqual(ManifestValidator.problems(hookWithoutScope, folder: nil).map { $0.path },
+                       ["$.contributes.commandHooks[0].command"], "a hook reading documents needs document:read")
+
         let good = try Self.fixture().decode(PluginManifest.self)
         XCTAssertEqual(ManifestValidator.problems(good, folder: nil).map { $0.description }, [])
         // With the folder, missing files are reported.
