@@ -54,11 +54,8 @@ final class LassoTool: CanvasTool {
     // MARK: Gesture
 
     /// Samples over another page are expressed in the start page's coordinates, so a lasso can cross a page gap.
-    private func pagePoint(_ s: CanvasSample, on page: PageID, host: CanvasHost) -> Point {
-        guard s.page != page, let frame = host.pageFrame(page) else { return s.location }
-        let v = host.viewPoint(s.location, page: s.page)
-        let z = max(host.zoomScale, 0.01)
-        return Point(Double(v.x - frame.minX) / z, Double(v.y - frame.minY) / z)
+    func pagePoint(_ s: CanvasSample, on page: PageID, host: CanvasHost) -> Point {
+        host.convert(s.location, from: s.page, to: page) ?? s.location
     }
 
     private func redraw(page: PageID, host: CanvasHost) {
@@ -109,6 +106,7 @@ final class LassoTool: CanvasTool {
         let items = (try? host.app.workspace.items(doc, page: page)) ?? []
         let tolerance = SelectionEngine.tapTolerance(zoom: host.zoomScale)
         if let hit = SelectionEngine.tapTarget(at: point, in: items, layer: session.activeLayer, tolerance: tolerance,
+                                               hitArea: SelectionSupport.hitArea(host.app.content),
                                                accept: { include.contains(LassoCategory.of($0)) }) {
             run(SelectionSet.self, SelectionSet.Params(refs: [NodeRef.item(doc, page, hit.id).description]), host: host)
         } else if !session.selection.isEmpty {

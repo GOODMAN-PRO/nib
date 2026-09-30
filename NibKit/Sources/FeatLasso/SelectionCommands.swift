@@ -117,9 +117,11 @@ enum LassoGeometry {
         return Geo.polygonContains(outline, poly.first)
     }
 
-    /// Selection semantics: an item is selected when any part of it touches the polygon.
-    static func touches(_ item: Item, _ poly: LassoPolygon) -> Bool {
-        guard item.bounds.intersects(poly.bounds) else { return false }
+    /// Selection semantics: an item is selected when any part of it touches the polygon. `hitArea` is where the item's
+    /// drawer says it takes lasso hits when that differs from `Item.bounds` (`ItemDrawer.hitBounds`: a collapsed sticky
+    /// note's icon, a full-page text box's laid-out text); boxed items then touch through that rect.
+    static func touches(_ item: Item, _ poly: LassoPolygon, hitArea: Rect? = nil) -> Bool {
+        guard reach(item, hitArea).intersects(poly.bounds) else { return false }
         switch item.kind {
         case .stroke:
             return lineTouches(item.stroke?.polyline ?? [], poly)
@@ -130,12 +132,21 @@ enum LassoGeometry {
             guard let s = item.shape else { return false }
             if s.points.count >= 3 && s.shape == .polygon { return areaTouches(s.points, poly) }
             if s.points.count >= 2 { return lineTouches(s.points, poly) }
+            if let area = hitArea { return areaTouches(corners(area), poly) }
             return areaTouches(s.frame.corners, poly)
         case .comment:
-            return areaTouches(corners(item.bounds), poly)
+            return areaTouches(corners(hitArea ?? item.bounds), poly)
         case .text, .image, .sticky, .math, .custom:
+            if let area = hitArea { return areaTouches(corners(area), poly) }
             return areaTouches(item.frame?.corners ?? corners(item.bounds), poly)
         }
+    }
+
+    /// Everything that can take a hit: the item's bounds and its drawer's hit area (the prefilter; hot, no closures).
+    static func reach(_ item: Item, _ hitArea: Rect?) -> Rect {
+        let bounds = item.bounds
+        guard let area = hitArea else { return bounds }
+        return bounds.union(area)
     }
 
     static func corners(_ r: Rect) -> [Point] {
@@ -145,8 +156,9 @@ enum LassoGeometry {
     // MARK: Taps
 
     /// True when a tap at `p` (page points) lands on the item, `tolerance` page points around its ink or outline.
-    static func hit(_ item: Item, at p: Point, tolerance tol: Double) -> Bool {
-        guard item.bounds.insetBy(-tol).contains(p) else { return false }
+    /// `hitArea` as in `touches(_:_:hitArea:)`.
+    static func hit(_ item: Item, at p: Point, tolerance tol: Double, hitArea: Rect? = nil) -> Bool {
+        guard reach(item, hitArea).insetBy(-tol).contains(p) else { return false }
         switch item.kind {
         case .stroke:
             guard let s = item.stroke else { return false }
@@ -160,10 +172,12 @@ enum LassoGeometry {
                 return Geo.polygonContains(s.points, p) || distance(p, toPolyline: s.points + [s.points[0]]) <= tol
             }
             if s.points.count >= 2 { return distance(p, toPolyline: s.points) <= tol + s.style.strokeWidth / 2 }
+            if let area = hitArea { return area.insetBy(-tol).contains(p) }
             return frameContains(s.frame, p, margin: tol)
         case .comment:
-            return true
+            return hitArea.map { $0.insetBy(-tol).contains(p) } ?? true
         case .text, .image, .sticky, .math, .custom:
+            if let area = hitArea { return area.insetBy(-tol).contains(p) }
             return item.frame.map { frameContains($0, p, margin: tol) } ?? true
         }
     }
@@ -192,8 +206,9 @@ enum LassoGeometry {
         return out
     }
 
-    /// Maps a lasso outline drawn around `from` onto the same selection now occupying `to` (after a move or resize).
-    /// ponytail: scale + translate only; a rotated selection keeps an axis-aligned outline.
+    /// Maps a lasso outline drawn around `from` onto the same selection now occupying `to`. Only for a change that moved
+    /// the items without carrying `Selection.outline` along (the transform feature, F012, transforms it itself, rotation
+    /// included), so scale + translate is enough.
     static func map(_ outline: [Point], from: Rect, to: Rect) -> [Point] {
         let sx = from.width > 0.001 ? to.width / from.width : 1
         let sy = from.height > 0.001 ? to.height / from.height : 1
@@ -204,21 +219,27 @@ enum LassoGeometry {
 // MARK: - Selection engine
 
 enum SelectionEngine {
+    /// Where an item takes taps and lasso hits when it differs from its own geometry (nil = its geometry).
+    typealias HitArea = (Item) -> Rect?
+
     /// Live items of `layer` in the included categories that touch the polygon, in z-order.
     static func select(_ items: [Item], polygon: [Point], include: Set<LassoCategory>, layer: Int,
-                       excluding: Set<ElementID> = []) -> [Item] {
+                       excluding: Set<ElementID> = [], hitArea: HitArea = { _ in nil }) -> [Item] {
         guard let poly = LassoPolygon(polygon) else { return [] }
         return items.filter { item in
-            !item.deleted && item.layer == layer && !excluding.contains(item.id)
-                && include.contains(LassoCategory.of(item)) && LassoGeometry.touches(item, poly)
+            guard !item.deleted, item.layer == layer, !excluding.contains(item.id),
+                  include.contains(LassoCategory.of(item)) else { return false }
+            // Ink is hit-tested along its path; only other kinds ask their drawer.
+            return LassoGeometry.touches(item, poly, hitArea: item.kind == .stroke ? nil : hitArea(item))
         }
     }
 
     /// The topmost live item of `layer` under a tap that `accept` allows.
     static func tapTarget(at p: Point, in items: [Item], layer: Int, tolerance: Double,
-                          accept: (Item) -> Bool) -> Item? {
+                          hitArea: HitArea = { _ in nil }, accept: (Item) -> Bool) -> Item? {
         for item in items.reversed() where !item.deleted && item.layer == layer && accept(item) {
-            if LassoGeometry.hit(item, at: p, tolerance: tolerance) { return item }
+            let area = item.kind == .stroke ? nil : hitArea(item)
+            if LassoGeometry.hit(item, at: p, tolerance: tolerance, hitArea: area) { return item }
         }
         return nil
     }
@@ -231,28 +252,9 @@ enum SelectionEngine {
 
 // MARK: - Session state
 
-/// The lasso outline of each window's selection (`Selection` holds only item ids and bounds), so the overlay can draw
-/// the dashed path the person drew. Keyed by session id; replaced or dropped whenever a command changes the selection.
-@MainActor
-enum SelectionOutlines {
-    struct Outline {
-        var doc: DocumentID
-        var page: PageID
-        var items: Set<ElementID>
-        /// Page points, as drawn.
-        var polygon: [Point]
-        /// Union of the selected items' bounds when the outline was drawn.
-        var base: Rect
-    }
-
-    static var bySession: [NibID: Outline] = [:]
-}
-
 @MainActor
 enum SelectionSupport {
     static let lassoTool = "lasso"
-    /// `session.toolOptions["lasso"]` key remembering the tool to return to after a quick selection or Circle to Lasso.
-    static let returnToolKey = "returnTool"
 
     static func session(_ ctx: CommandContext) throws -> EditorSession {
         guard let s = ctx.activeSession else {
@@ -261,15 +263,22 @@ enum SelectionSupport {
         return s
     }
 
-    static func page(_ ref: String, _ ctx: CommandContext, path: String = "$.page") throws -> (DocumentID, PageID) {
-        guard case let .page(doc, page)? = NodeRef(ref) else {
-            throw NibError(.invalidParams, "expected a page ref like page:D/P", path: path,
-                           hint: "call query.context for the current page ref")
+    /// A live page from a page ref; nil or empty = the invoking window's current page (session default, §6.1).
+    static func page(_ ref: String?, _ ctx: CommandContext, path: String = "$.page") throws -> (DocumentID, PageID) {
+        let target: (doc: DocumentID, page: PageID)
+        if let ref = ref, !ref.isEmpty {
+            guard case let .page(d, p)? = NodeRef(ref) else {
+                throw NibError(.invalidParams, "expected a page ref like page:D/P", path: path,
+                               hint: "call query.context for the current page ref")
+            }
+            target = (d, p)
+        } else {
+            target = try ctx.pageOrSession(nil)
         }
-        guard let record = try ctx.workspace.content(doc).page(page), !record.deleted else {
-            throw NibError.notFound("page \(page.raw) in document \(doc.raw)")
+        guard let record = try ctx.workspace.content(target.doc).page(target.page), !record.deleted else {
+            throw NibError.notFound("page \(target.page.raw) in document \(target.doc.raw)")
         }
-        return (doc, page)
+        return (target.doc, target.page)
     }
 
     static func include(_ names: [String]?, _ ctx: CommandContext) throws -> Set<LassoCategory> {
@@ -285,40 +294,34 @@ enum SelectionSupport {
         return out
     }
 
-    /// Makes `items` the session's selection (empty clears it) and remembers the drawn outline.
+    /// The drawers' hit areas (`ItemDrawer.hitBounds`, contracts-v2 G14).
+    static func hitArea(_ content: ContentRegistries) -> SelectionEngine.HitArea {
+        { item in content.drawer(for: item)?.hitBounds(item) }
+    }
+
+    /// Makes `items` the session's selection (empty clears it), carrying the drawn lasso outline (`Selection.outline`).
     @discardableResult
     static func apply(_ items: [Item], doc: DocumentID, page: PageID, outline: [Point]?,
                       session: EditorSession) -> SelectionOutput {
         guard let bounds = LassoGeometry.union(items) else {
-            SelectionOutlines.bySession[session.id] = nil
             session.selection = Selection()
             return SelectionOutput(refs: [], count: 0, bounds: nil)
         }
-        let ids = items.map { $0.id }
-        if let outline = outline, outline.count >= 3 {
-            SelectionOutlines.bySession[session.id] = SelectionOutlines.Outline(
-                doc: doc, page: page, items: Set(ids), polygon: outline, base: bounds)
-        } else {
-            SelectionOutlines.bySession[session.id] = nil
-        }
-        session.selection = Selection(doc: doc, page: page, items: ids, bounds: bounds)
-        return SelectionOutput(refs: session.selection.refs, count: ids.count, bounds: bounds)
+        session.selection = Selection(doc: doc, page: page, items: items.map { $0.id }, bounds: bounds,
+                                      outline: outline.flatMap { $0.count >= 3 ? $0 : nil })
+        return SelectionOutput(refs: session.selection.refs, count: items.count, bounds: bounds)
     }
 
-    /// Clears the selection; a temporary lasso (quick selection, Circle to Lasso) hands back the previous tool.
+    /// Clears the selection; a temporary lasso (quick selection, Circle to Lasso) hands back the tool it replaced.
     static func clear(_ session: EditorSession) {
-        SelectionOutlines.bySession[session.id] = nil
         session.selection = Selection()
-        let back = session.toolOptions[lassoTool]?[returnToolKey]?.stringValue
-        session.toolOptions[lassoTool] = nil
-        if let back = back, session.tool == lassoTool { session.tool = back }
+        if session.tool == lassoTool { session.endTemporaryTool() }
     }
 
-    /// Switches to the lasso for a selection made without it, remembering the tool to return to.
+    /// Switches to the lasso for a selection made without it, until the selection ends (`selectTemporarily`).
     static func enterLasso(_ session: EditorSession) {
         guard session.tool != lassoTool else { return }
-        session.toolOptions[lassoTool] = [returnToolKey: .string(session.tool)]
-        session.tool = lassoTool
+        session.selectTemporarily(lassoTool)
     }
 }
 
@@ -362,7 +365,6 @@ struct SelectionSet: NibCommand {
             ids.append(id)
         }
         guard let t = target else {
-            SelectionOutlines.bySession[session.id] = nil
             session.selection = Selection()
             return SelectionOutput(refs: [], count: 0, bounds: nil)
         }
@@ -419,7 +421,8 @@ struct SelectionFromPolygon: NibCommand {
         }
         let include = try SelectionSupport.include(p.include, ctx)
         let items = SelectionEngine.select(try ctx.workspace.items(doc, page: page), polygon: p.polygon,
-                                           include: include, layer: session.activeLayer)
+                                           include: include, layer: session.activeLayer,
+                                           hitArea: SelectionSupport.hitArea(ctx.content))
         return SelectionSupport.apply(items, doc: doc, page: page, outline: p.polygon, session: session)
     }
 }
@@ -453,7 +456,8 @@ struct SelectionFromRect: NibCommand {
         let polygon = LassoGeometry.corners(rect)
         let include = try SelectionSupport.include(p.include, ctx)
         let items = SelectionEngine.select(try ctx.workspace.items(doc, page: page), polygon: polygon,
-                                           include: include, layer: session.activeLayer)
+                                           include: include, layer: session.activeLayer,
+                                           hitArea: SelectionSupport.hitArea(ctx.content))
         return SelectionSupport.apply(items, doc: doc, page: page, outline: polygon, session: session)
     }
 }
@@ -496,7 +500,8 @@ struct SelectionFromLoop: NibCommand {
         let outline = stroke.polyline
         let include = LassoSettings.included(ctx.services.settings)
         let items = SelectionEngine.select(try ctx.workspace.items(doc, page: page), polygon: outline,
-                                           include: include, layer: session.activeLayer, excluding: [strokeID])
+                                           include: include, layer: session.activeLayer, excluding: [strokeID],
+                                           hitArea: SelectionSupport.hitArea(ctx.content))
         try ctx.mutate { tx in try tx.delete(item: strokeID, doc: doc, page: page) }
         let out = SelectionSupport.apply(items, doc: doc, page: page, outline: outline, session: session)
         if !items.isEmpty { SelectionSupport.enterLasso(session) }
@@ -506,12 +511,13 @@ struct SelectionFromLoop: NibCommand {
 
 struct SelectionSelectAll: NibCommand {
     struct Params: Codable {
-        var page: String
+        /// The schema requires it; the user may omit it (⌘A, menus): the window's current page (§6.1 session default).
+        var page: String?
     }
 
     static let descriptor = CommandDescriptor(
         id: "selection.selectAll", title: "Select All",
-        summary: "Select every item on a page's active layer (locked items included).",
+        summary: "Select every item on a page's active layer (locked items included). From a key command or menu the page defaults to the window's current page.",
         params: .obj(["page": .ref], required: ["page"]),
         examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001"]],
         effect: .session)
@@ -557,19 +563,17 @@ struct SelectionTapAt: NibCommand {
             return Output(handled: true)                    // on the selection: its handles and menu take the tap
         }
         let items = try ctx.workspace.items(doc, page: page)
-        let tool = session.tool
+        let hitArea = SelectionSupport.hitArea(ctx.content)
         var target: Item?
-        if tool == SelectionSupport.lassoTool {
+        // Tools that edit an item kind on tap claim it earlier in the tap chain (text.tapAt, sticky.tapAt, shape.tapAt
+        // run before order 400 for their item kinds), so what reaches here is for selecting.
+        if session.tool == SelectionSupport.lassoTool {
             let include = LassoSettings.included(ctx.services.settings)
-            target = SelectionEngine.tapTarget(at: p.point, in: items, layer: session.activeLayer, tolerance: tolerance) {
-                include.contains(LassoCategory.of($0))
-            }
+            target = SelectionEngine.tapTarget(at: p.point, in: items, layer: session.activeLayer, tolerance: tolerance,
+                                               hitArea: hitArea) { include.contains(LassoCategory.of($0)) }
         } else if ctx.services.settings.get(NibSettings.objectTapSelection) {
-            target = SelectionEngine.tapTarget(at: p.point, in: items, layer: session.activeLayer, tolerance: tolerance) {
-                $0.kind != .stroke
-            }
-            // The text tool edits the text box under the tap instead of selecting it.
-            if tool == "text", target?.kind == .text { return Output(handled: false) }
+            target = SelectionEngine.tapTarget(at: p.point, in: items, layer: session.activeLayer, tolerance: tolerance,
+                                               hitArea: hitArea) { $0.kind != .stroke }
         }
         if let target = target {
             SelectionSupport.apply([target], doc: doc, page: page, outline: nil, session: session)
@@ -584,31 +588,28 @@ struct SelectionTapAt: NibCommand {
 
 // MARK: - Housekeeping
 
-/// Keeps every window's selection honest after commits (moves update its bounds, deletions clear it), drops the
-/// return tool once someone picks another tool, and keeps the toolbar glyph in step with `lasso.type`.
+/// Keeps every window's selection honest after commits (moves update its bounds and outline, deletions clear it) and
+/// asks the chrome to re-read the lasso's live toolbar glyph when `lasso.type` changes.
 @MainActor
 enum LassoHousekeeping {
     private static var retained: [AnyObject] = []
     private static var cancellables: [AnyCancellable] = []
+    /// The latest scheduled refresh (tests await it).
+    private(set) static var pending: Task<Void, Never>?
 
     static func start(_ app: NibApp) {
         retained.append(app.bus.observeCommits { [weak app] cs in
-            guard let app = app else { return }
-            for session in app.services.sessions.sessions { refresh(session, after: cs, app: app) }
+            // Commit observers run inside the command's write. Refresh once that command is done with the selection,
+            // so a mover that carries it itself (F012 moves bounds and outline with the items) is not moved twice.
+            pending = Task { @MainActor [weak app] in
+                guard let app = app else { return }
+                for session in app.services.sessions.sessions { refresh(session, after: cs, app: app) }
+            }
         })
-        retained.append(app.events.subscribe { [weak app] e in
-            guard e.type == NibEventType.toolChanged, let app = app,
-                  let raw = e.payload?["session"]?.stringValue,
-                  let session = app.services.sessions.session(NibID(raw)),
-                  session.tool != SelectionSupport.lassoTool else { return }
-            session.toolOptions[SelectionSupport.lassoTool] = nil
-        })
-        let settings = app.settings
-        app.ui.toolbar.register(FeatLassoFeature.toolbarItem(app, type: settings.get(LassoSettings.type)))
-        cancellables.append(NotificationCenter.default.publisher(for: SettingsStore.didChange, object: settings)
+        cancellables.append(NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
             .sink { [weak app] note in
                 guard let app = app, note.userInfo?["name"] as? String == LassoSettings.type.name else { return }
-                app.ui.toolbar.register(FeatLassoFeature.toolbarItem(app, type: app.settings.get(LassoSettings.type)))
+                app.ui.setNeedsChromeUpdate()
             })
     }
 
@@ -623,7 +624,13 @@ enum LassoHousekeeping {
         if live.count != wanted.count {
             SelectionSupport.clear(session)
         } else if let bounds = LassoGeometry.union(live), bounds != selection.bounds {
-            session.selection.bounds = bounds
+            // Whatever moved the items left the selection behind (F012 updates bounds and outline itself).
+            var next = selection
+            if let outline = selection.outline, let old = selection.bounds {
+                next.outline = LassoGeometry.map(outline, from: old, to: bounds)
+            }
+            next.bounds = bounds
+            session.selection = next
         }
     }
 }

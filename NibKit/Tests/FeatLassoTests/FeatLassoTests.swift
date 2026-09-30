@@ -173,7 +173,10 @@ final class FeatLassoTests: XCTestCase {
         XCTAssertEqual(refs(r), [ref(Fixtures.mathID), ref(Fixtures.imageID)])
         XCTAssertFalse(try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).contains { $0.id == loopID })
         XCTAssertEqual(h.session.tool, "lasso")
-        XCTAssertNotNil(SelectionOutlines.bySession[h.session.id])
+        XCTAssertEqual(h.session.temporaryReturnTool, "pen", "Circle to Lasso is a temporary lasso")
+        let outline = try XCTUnwrap(h.session.selection.outline, "the loop is the selection's outline")
+        XCTAssertGreaterThanOrEqual(outline.count, 3)
+        XCTAssertEqual(Rect.bounding(outline)?.minX ?? 0, 58, accuracy: 1)
 
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(try h.snapshot(), before, "undo restores the loop stroke")
@@ -191,11 +194,14 @@ final class FeatLassoTests: XCTestCase {
         XCTAssertEqual(onImage["handled"]?.boolValue, true)
         XCTAssertEqual(h.session.selection.items, [Fixtures.imageID])
         XCTAssertEqual(h.session.tool, "lasso")
+        XCTAssertEqual(h.session.temporaryReturnTool, "pen")
+        XCTAssertNil(h.session.selection.outline, "a tap selection has no lasso outline")
 
         let elsewhere = try await h.run("selection.tapAt", ["page": .string(pageRef), "point": [300, 800]])
         XCTAssertEqual(elsewhere["handled"]?.boolValue, true)
         XCTAssertTrue(h.session.selection.isEmpty)
         XCTAssertEqual(h.session.tool, "pen")
+        XCTAssertNil(h.session.temporaryReturnTool)
 
         let empty = try await h.run("selection.tapAt", ["page": .string(pageRef), "point": [300, 800]])
         XCTAssertEqual(empty["handled"]?.boolValue, false, "nothing to select or clear: the tool gets the tap")
@@ -209,18 +215,57 @@ final class FeatLassoTests: XCTestCase {
         XCTAssertTrue(h.session.selection.isEmpty)
     }
 
-    func testTapWithTheLassoSelectsInkAndTheTextToolKeepsTextBoxes() async throws {
+    func testTapWithTheLassoSelectsInkAndOtherToolsLeaveEditingToTheTapChain() async throws {
         let h = harness()
         h.session.tool = "lasso"
         let onInk = try await h.run("selection.tapAt", ["page": .string(pageRef), "point": [100, 121]])
         XCTAssertEqual(onInk["handled"]?.boolValue, true)
         XCTAssertEqual(h.session.selection.items, [Fixtures.strokeID])
+        XCTAssertNil(h.session.temporaryReturnTool, "the lasso was already the tool")
 
         try await h.run("selection.clear")
+        XCTAssertEqual(h.session.tool, "lasso", "clearing never switches away from a lasso the person picked")
+
+        // No tool-id special cases: a tool that edits a kind on tap claims it earlier in the chain (text.tapAt is
+        // offered text boxes before selection.tapAt), so a tap that reaches order 400 selects.
         h.session.tool = "text"
         let onText = try await h.run("selection.tapAt", ["page": .string(pageRef), "point": [200, 420]])
-        XCTAssertEqual(onText["handled"]?.boolValue, false)
-        XCTAssertTrue(h.session.selection.isEmpty)
+        XCTAssertEqual(onText["handled"]?.boolValue, true)
+        XCTAssertEqual(h.session.selection.items, [Fixtures.textID])
+    }
+
+    func testSelectAllDefaultsToTheWindowsPageForTheUser() async throws {
+        let h = harness()
+        let all = try await h.run("selection.selectAll")
+        XCTAssertEqual(all["count"]?.intValue, 10)
+        XCTAssertEqual(h.session.selection.page, Fixtures.page1)
+        do {
+            try await h.run("selection.selectAll", [:], as: .ai("test"))
+            XCTFail("the AI must name the page")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .invalidParams)
+        }
+    }
+
+    func testDrawerHitAreasDecideLassoAndTapHits() async throws {
+        let h = harness()
+        // A collapsed sticky note answers only at its 24 pt icon in the top-left corner of its frame (400, 120, 140, 140).
+        h.app.content.drawers.register(ItemDrawerEntry(key: ItemKind.sticky.rawValue, owner: "test",
+                                                       drawer: HitAreaDrawer(Rect(x: 400, y: 120, width: 24, height: 24))))
+        let lowerHalf = polygon([(450, 200), (560, 200), (560, 280), (450, 280)], include: ["sticky"])
+        let missed = try await h.run("selection.fromPolygon", lowerHalf)
+        XCTAssertEqual(missed["count"]?.intValue, 0, "the frame is not the hit area")
+        let icon = polygon([(380, 100), (430, 100), (430, 150), (380, 150)], include: ["sticky"])
+        let hit = try await h.run("selection.fromPolygon", icon)
+        XCTAssertEqual(refs(hit), [ref(Fixtures.stickyID)])
+
+        try await h.run("selection.clear")
+        h.session.tool = "pen"
+        let offIcon = try await h.run("selection.tapAt", ["page": .string(pageRef), "point": [500, 240]])
+        XCTAssertEqual(offIcon["handled"]?.boolValue, false)
+        let onIcon = try await h.run("selection.tapAt", ["page": .string(pageRef), "point": [410, 130]])
+        XCTAssertEqual(onIcon["handled"]?.boolValue, true)
+        XCTAssertEqual(h.session.selection.items, [Fixtures.stickyID])
     }
 
     // MARK: Housekeeping (start)
@@ -231,23 +276,37 @@ final class FeatLassoTests: XCTestCase {
         h.app.commands.register(TestDelete.self)
         LassoHousekeeping.start(h.app)
 
-        try await h.run("selection.set", ["refs": [.string(ref(Fixtures.imageID))]])
+        try await h.run("selection.fromPolygon", polygon([(330, 490), (370, 490), (370, 530), (330, 530)]))
         try await h.run("test.nudge", ["id": "FIXTUREIMG01", "dx": 10])
+        await LassoHousekeeping.pending?.value
         XCTAssertEqual(h.session.selection.bounds, Rect(x: 330, y: 480, width: 64, height: 64), "bounds follow a move")
+        XCTAssertEqual(h.session.selection.outline, [Point(340, 490), Point(380, 490), Point(380, 530), Point(340, 530)],
+                       "the outline follows a move that did not carry it along")
+        // A mover that carries the selection itself (F012 transforms bounds and outline) is left alone.
+        try await h.run("test.nudge", ["id": "FIXTUREIMG01", "dx": 10, "carry": true])
+        await LassoHousekeeping.pending?.value
+        XCTAssertEqual(h.session.selection.bounds, Rect(x: 340, y: 480, width: 64, height: 64))
+        XCTAssertEqual(h.session.selection.outline, [Point(350, 490), Point(390, 490), Point(390, 530), Point(350, 530)])
         try await h.run("test.delete", ["id": "FIXTUREIMG01"])
+        await LassoHousekeeping.pending?.value
         XCTAssertTrue(h.session.selection.isEmpty, "a deleted item leaves the selection")
 
         h.session.tool = "pen"
         try await h.run("selection.tapAt", ["page": .string(pageRef), "point": [122, 725]])   // the custom item
         XCTAssertEqual(h.session.tool, "lasso")
-        h.session.tool = "eraser"
-        XCTAssertNil(h.session.toolOptions["lasso"], "picking another tool forgets the return tool")
+        XCTAssertEqual(h.session.temporaryReturnTool, "pen")
+        try await h.run("tool.select", ["tool": "eraser"])
+        XCTAssertNil(h.session.temporaryReturnTool, "picking another tool forgets the return tool")
         try await h.run("selection.clear")
         XCTAssertEqual(h.session.tool, "eraser")
 
-        XCTAssertEqual(h.app.ui.toolbar.get("lasso")?.icon, "lasso")
+        let item = try XCTUnwrap(h.app.ui.toolbar.get("lasso"))
+        XCTAssertEqual(item.icon, "lasso")
+        XCTAssertEqual(item.resolvedIcon(for: h.session), "lasso")
+        let update = expectation(forNotification: .nibChromeNeedsUpdate, object: h.app.ui)
         try await h.run("settings.set", ["name": "lasso.type", "value": "rectangle"])
-        XCTAssertEqual(h.app.ui.toolbar.get("lasso")?.icon, "rectangle.dashed")
+        await fulfillment(of: [update], timeout: 2)
+        XCTAssertEqual(item.resolvedIcon(for: h.session), "rectangle.dashed", "the glyph is live state")
     }
 
     // MARK: The tool
@@ -276,6 +335,13 @@ final class FeatLassoTests: XCTestCase {
         tool.tap(sample(300, 800), host: host)
         await tool.pending?.value
         XCTAssertTrue(h.session.selection.isEmpty, "a tap on empty paper deselects")
+
+        // A lasso that crosses the page gap keeps drawing in its start page's coordinates (CanvasHost.convert).
+        host.zoomScale = 2
+        let below = tool.pagePoint(CanvasSample(page: Fixtures.page2, location: Point(100, 10)), on: Fixtures.page1,
+                                   host: host)
+        XCTAssertEqual(below.x, 100, accuracy: 0.001)
+        XCTAssertEqual(below.y, host.pageSize.height + host.gap + 10, accuracy: 0.001)
     }
 
     // MARK: The overlay
@@ -299,10 +365,30 @@ final class FeatLassoTests: XCTestCase {
         overlay.canvasDidChange(host)
         XCTAssertEqual(overlay.view.content?.box, CGRect(x: 640, y: 960, width: 128, height: 128))
 
+        // The canvas calls canvasDidChange on every selection change and commit.
         try await h.run("selection.set", ["refs": [.string(ref(Fixtures.shapeID))]])
+        overlay.canvasDidChange(host)
         XCTAssertEqual(overlay.view.content?.drawsBox, false, "a by-ref selection draws a dashed box, not a lasso")
+        let shape = try XCTUnwrap(h.session.selection.bounds)
+        XCTAssertEqual(overlay.view.content?.outline.boundingBoxOfPath,
+                       CGRect(x: shape.x * 2, y: shape.y * 2, width: shape.width * 2, height: shape.height * 2)
+                           .insetBy(dx: -SelectionStyle.boxPadding, dy: -SelectionStyle.boxPadding))
+
+        // Another feature's outline (F012 rotating the selection) is drawn as given, not re-derived.
+        let diamond = [Point(180, 245), Point(260, 200), Point(340, 245), Point(260, 290)]
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID],
+                                        bounds: Rect(x: 180, y: 200, width: 160, height: 90), outline: diamond)
+        overlay.canvasDidChange(host)
+        XCTAssertEqual(overlay.view.content?.drawsBox, true)
+        XCTAssertEqual(overlay.view.content?.outline.boundingBoxOfPath, CGRect(x: 360, y: 400, width: 320, height: 180))
+
+        // A selection written without bounds still gets them (from the items).
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.imageID])
+        overlay.canvasDidChange(host)
+        XCTAssertEqual(overlay.view.content?.box, CGRect(x: 640, y: 960, width: 128, height: 128))
 
         try await h.run("selection.clear")
+        overlay.canvasDidChange(host)
         XCTAssertNil(overlay.view.content)
         XCTAssertFalse(overlay.view.isAccessibilityElement)
         overlay.detach(from: host)
@@ -369,6 +455,8 @@ private struct TestNudge: NibCommand {
     struct Params: Codable {
         var id: String
         var dx: Double
+        /// Move the window's selection (bounds and outline) along, as F012 does.
+        var carry: Bool?
     }
 
     static let descriptor = CommandDescriptor(id: "test.nudge", title: "Nudge",
@@ -378,6 +466,12 @@ private struct TestNudge: NibCommand {
         try ctx.mutate { tx in
             let item = try tx.item(Fixtures.docID, page: Fixtures.page1, id: NibID(p.id))
             try tx.put(item.transformed(by: .translation(p.dx, 0)), doc: Fixtures.docID, page: Fixtures.page1)
+        }
+        if p.carry == true, let session = ctx.activeSession {
+            var next = session.selection
+            next.bounds = next.bounds.map { Rect(x: $0.x + p.dx, y: $0.y, width: $0.width, height: $0.height) }
+            next.outline = next.outline?.map { Point($0.x + p.dx, $0.y) }
+            session.selection = next
         }
         return NoResult()
     }
@@ -395,6 +489,17 @@ private struct TestDelete: NibCommand {
         try ctx.mutate { tx in try tx.delete(item: NibID(p.id), doc: Fixtures.docID, page: Fixtures.page1) }
         return NoResult()
     }
+}
+
+/// A drawer whose items take hits only in `area` (a collapsed sticky note's icon).
+private final class HitAreaDrawer: ItemDrawer {
+    let area: Rect
+
+    init(_ area: Rect) { self.area = area }
+
+    func draw(_ item: Item, in context: DrawContext) {}
+
+    func hitBounds(_ item: Item) -> Rect? { area }
 }
 
 /// Deterministic xorshift generator, so the geometry comparison is reproducible.

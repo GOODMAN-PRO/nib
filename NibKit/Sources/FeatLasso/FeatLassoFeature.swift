@@ -26,23 +26,33 @@ public enum FeatLassoFeature: NibFeature {
 
         app.ui.canvasTools.register(CanvasToolDescriptor(id: SelectionSupport.lassoTool, title: String(localized: "Lasso"),
                                                          owner: id, make: { LassoTool() }))
-        app.ui.toolbar.register(toolbarItem(app, type: LassoSettings.type.defaultValue))
+        app.ui.toolbar.register(toolbarItem(app))
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "lasso.selection", owner: id, order: 100,
                                                                      make: { _ in SelectionOverlay() }))
-        app.content.tapHandlers.register(TapHandlerDescriptor(id: "selection.tapAt", owner: id, gesture: .tap,
-                                                              command: "selection.tapAt", order: 400))
+        app.content.tapHandlers.register(TapHandlerDescriptor(id: CommandIDs.selectionTapAt, owner: id, gesture: .tap,
+                                                              command: CommandIDs.selectionTapAt, order: 400))
     }
 
     public static func start(_ app: NibApp) async {
         LassoHousekeeping.start(app)
     }
 
-    /// The fixed first toolbar slot. Its glyph follows `lasso.type` (DESIGN.md §8.1: `lasso` / `rectangle.dashed`).
-    static func toolbarItem(_ app: NibApp, type: LassoType) -> ToolbarItemDescriptor {
-        ToolbarItemDescriptor(
-            id: SelectionSupport.lassoTool, title: String(localized: "Lasso"), icon: type.symbol.name, group: .lasso,
-            order: 0, owner: id, toolID: SelectionSupport.lassoTool, shortcut: KeyShortcut("v"), hideable: false,
-            settings: { session in AnyView(LassoSettingsView(app: app, session: session)) })
+    /// The fixed first toolbar slot. Its glyph follows `lasso.type` (DESIGN.md §8.1: `lasso` / `rectangle.dashed`) as
+    /// live state (`sessionIcon`); `LassoHousekeeping` asks the chrome to re-read it when the setting changes.
+    static func toolbarItem(_ app: NibApp) -> ToolbarItemDescriptor {
+        let settings = app.settings
+        var item = ToolbarItemDescriptor(
+            id: SelectionSupport.lassoTool, title: String(localized: "Lasso"),
+            icon: LassoSettings.type.defaultValue.symbol.name, group: .lasso, order: 0, owner: id,
+            toolID: SelectionSupport.lassoTool, shortcut: KeyShortcut("v"), hideable: false,
+            settings: { [weak app] session in
+                guard let app = app else { return AnyView(EmptyView()) }
+                return AnyView(LassoSettingsView(app: app, session: session))
+            })
+        item.sessionIcon = { [weak settings] _ in
+            (settings?.get(LassoSettings.type) ?? LassoSettings.type.defaultValue).symbol.name
+        }
+        return item
     }
 }
 
