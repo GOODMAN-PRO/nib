@@ -210,6 +210,12 @@ final class ChatStore {
 
     func messages(_ chat: String) -> [ChatRecord] { state(chat)?.messages ?? [] }
 
+    /// True when the conversation was deleted (on any device).
+    func isDeleted(_ chat: String) -> Bool {
+        refresh()
+        return chats[chat]?.isDeleted ?? false
+    }
+
     /// The messages the conversation shows (`AIService.messages`): answers that failed before writing anything are left out.
     func visibleMessages(_ chat: String) -> [ChatRecord] {
         messages(chat).filter { !($0.role == "assistant" && ($0.text ?? "").isEmpty) }

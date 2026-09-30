@@ -242,6 +242,9 @@ final class AgentToolRunner {
         guard setup.vision else {
             return await pageText(args, note: "This model cannot see images, so here is the page's recognised text instead.")
         }
+        guard bus.registry.entry(CommandIDs.renderPage) != nil else {
+            return await pageText(args, note: "Rendering is not available here, so here is the page's recognised text instead.")
+        }
         guard let inv = ToolCatalog.invocation(tool: "nib_render", arguments: args, registry: bus.registry,
                                                principal: setup.principal, group: setup.group,
                                                readOnly: setup.readOnly, session: setup.session) else {

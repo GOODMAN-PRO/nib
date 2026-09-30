@@ -135,9 +135,9 @@ final class AgentLoop {
             guard out.steps < maxSteps else {
                 // The model ignored the step-limit note: stop without running more tools.
                 out.stepLimitReached = true
-                let note = "(Stopped after \(maxSteps) tool steps.)"
-                out.text += out.text.isEmpty ? note : "\n\n" + note
-                sink(.text(out.text == note ? note : "\n\n" + note))
+                let note = (out.text.isEmpty ? "" : "\n\n") + "(Stopped after \(maxSteps) tool steps.)"
+                out.text += note
+                sink(.text(note))
                 return out
             }
             out.steps += 1

@@ -154,6 +154,10 @@ final class AgentService: AIService {
             return .failure(NibError(.invalidParams, "the request has no message", path: "$.messages"))
         }
         let chatID = request.chatID ?? NibID.make().raw
+        if request.chatID != nil && chatStore.isDeleted(chatID) {
+            return .failure(NibError(.notFound, "conversation '\(chatID)' was deleted", path: "$.chat",
+                                     hint: "start a new conversation"))
+        }
         guard running[chatID] == nil else {
             return .failure(NibError(.conflict, "this conversation is already answering",
                                      hint: "wait for the answer or stop it first"))

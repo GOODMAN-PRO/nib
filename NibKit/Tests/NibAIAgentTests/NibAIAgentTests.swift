@@ -209,6 +209,25 @@ final class NibAIAgentTests: XCTestCase {
         } catch let e as NibError {
             XCTAssertEqual(e.code, .notFound)
         }
+        do {
+            _ = try await agent.complete(AgentFixture.request("Continue", mode: .ask, chat: chat, principal: .user))
+            XCTFail("a deleted conversation cannot be continued")
+        } catch let e as NibError {
+            XCTAssertEqual(e.code, .notFound)
+        }
+    }
+
+    func testRenderFallsBackToPageTextWithoutARenderer() async throws {
+        let (h, _) = AgentFixture.make(P(events: []))
+        let toolbox = AgentToolbox.build(registry: h.app.commands, settings: h.app.settings, pluginHost: nil, exposure: .ai,
+                                         readOnly: true, requested: nil, supportsTools: true)
+        let runner = AgentToolRunner(bus: h.app.bus, toolbox: toolbox, setup: AgentToolRunner.Setup(
+            principal: .ai("RUNNER000003"), group: "RUNNERGROUP3", readOnly: true, session: h.session, depth: 0,
+            inheritedPolicy: nil, vision: true, timeout: 5))
+        let outcome = await runner.run(name: "nib_render", arguments: ["page": "page:FIXTUREDOC01/FIXTUREPG001"])
+        XCTAssertFalse(outcome.isError)
+        XCTAssertTrue(textOf(outcome).contains("Rendering is not available"))
+        XCTAssertTrue(textOf(outcome).contains("Velocity is displacement over time"))
     }
 
     /// Continuing a conversation sends the stored history; JSON-only feature prompts stay out of the chat list.
@@ -324,6 +343,33 @@ final class NibAIAgentTests: XCTestCase {
         XCTAssertEqual(pager.fit(["small": true]), ["small": true])
     }
 
+    /// Enabled plugins' `aiDirect` commands become tools and their `ai.instructions` join the static prompt.
+    func testPluginDirectToolsAndInstructions() async throws {
+        let provider = P(events: [P.answer("Ready.")])
+        let (h, agent) = AgentFixture.make(provider)
+        let manifest = try PluginManifest.fixture(id: "dev.test.cards", contributes: [
+            "commands": [["id": "dev.test.cards.make", "title": "Make Cards", "summary": "Make flashcards.", "aiDirect": true],
+                         ["id": "dev.test.cards.hidden", "title": "Hidden", "summary": "Not direct."]],
+            "ai": ["instructions": "Use dev.test.cards.make when the user wants flashcards."]])
+        let host = FakePluginHost(manifest: manifest)
+        h.app.services.set(host, for: ServiceKeys.pluginHost)
+        for c in ["dev.test.cards.make", "dev.test.cards.hidden"] {
+            h.app.commands.register(CommandDescriptor(id: c, title: c, summary: "Plugin command.", params: .obj(["n": .int()]),
+                                                      examples: [[:]], effect: .edit, owner: "dev.test.cards")) { _, _ in .null }
+        }
+        _ = try await agent.complete(AgentFixture.request("Make cards"))
+        let request = try XCTUnwrap(provider.requests.first)
+        let names = request.tools.map(\.name)
+        XCTAssertTrue(names.contains("dev__test__cards__make"))
+        XCTAssertFalse(names.contains("dev__test__cards__hidden"))
+        XCTAssertTrue(request.system.contains("- Use dev.test.cards.make when the user wants flashcards."))
+        XCTAssertTrue(request.system.contains("- dev.test.cards (2): dev.test.cards.hidden, dev.test.cards.make"))
+
+        host.info.enabled = false
+        XCTAssertFalse(AgentToolbox.directCommandIDs(registry: h.app.commands, settings: h.app.settings, pluginHost: host)
+            .contains("dev.test.cards.make"), "disabled plugins offer no tools")
+    }
+
     // MARK: System prompt
 
     func testSystemPromptParts() throws {
@@ -377,5 +423,39 @@ final class NibAIAgentTests: XCTestCase {
             if case .text(let t) = part { return t }
             return nil
         }.joined()
+    }
+}
+
+/// A plugin host with one running plugin.
+@MainActor
+final class FakePluginHost: PluginHosting {
+    final class Handle: PluginRuntimeHandle {
+        let manifest: PluginManifest
+        var logs: [String] = []
+        init(_ manifest: PluginManifest) { self.manifest = manifest }
+        func invoke(command: String, params: JSONValue, context: CommandContext) async throws -> JSONValue { .null }
+        func deliver(_ event: NibEvent) {}
+        func postMessage(from panel: String, message: JSONValue) {}
+        func evaluate(_ javascript: String) async -> String { "" }
+        func stop() {}
+    }
+
+    var info: PluginInfo
+    let runtime: Handle
+
+    init(manifest: PluginManifest) {
+        info = PluginInfo(id: manifest.id, name: manifest.name, version: manifest.version, enabled: true, needsReview: false,
+                          permissions: manifest.permissions, sha256: "0")
+        runtime = Handle(manifest)
+    }
+
+    var installed: [PluginInfo] { [info] }
+    func handle(_ id: String) -> PluginRuntimeHandle? { id == info.id && info.enabled ? runtime : nil }
+    func folder(_ id: String) -> URL? { nil }
+    func load(_ id: String) async throws {}
+    func unload(_ id: String) {}
+    func setEnabled(_ id: String, _ enabled: Bool) async throws { info.enabled = enabled }
+    var aiInstructions: [String] {
+        info.enabled ? [runtime.manifest.contributes?.ai?.instructions].compactMap { $0 } : []
     }
 }
