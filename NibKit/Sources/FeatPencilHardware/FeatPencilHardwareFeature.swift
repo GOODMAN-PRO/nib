@@ -4,20 +4,23 @@ import SwiftUI
 
 /// Apple Pencil hardware (F043): double-tap, Apple Pencil Pro squeeze, hover preview and Pencil Pro haptics.
 ///
-/// - `ui.pencilHandler` receives what the canvas forwards; a canvas attachment also installs a `UIPencilInteraction`
-///   and a Pencil hover recogniser, so the feature works on its own (duplicates are dropped).
+/// - `ui.pencilHandler` receives what the canvas forwards; until the canvas owns them (F101), a canvas attachment also
+///   installs a `UIPencilInteraction` and a Pencil hover recogniser, so the feature works on its own (duplicates are
+///   dropped).
+/// - Plays the Apple Pencil Pro haptics other features ask for (`shape.snapped`, `pencil.haptic`).
 /// - Every gesture runs `pencil.gesture`, which resolves the binding to one command: `tool.select`, `pencil.palette`
 ///   or a `PencilActionDescriptor` from `content.pencilActions` (plugins add some).
 /// - Settings › Stylus › Apple Pencil chooses the bindings through `settings.set`.
 public enum FeatPencilHardwareFeature: NibFeature {
     public static let id = "pencilhw"
-    /// ⌥⌘P shows the Pencil palette mid-canvas (keyboard and pointer people get the same palette).
+    /// ⌃⌘P shows the Pencil palette mid-canvas (keyboard and pointer people get the same palette). ⌥⌘P is F052's
+    /// Play or Pause Audio (contracts-v2.2 key routing).
     static let paletteShortcut = "pencilhw.palette"
+    static let paletteKey = KeyShortcut("p", [.command, .control])
 
     public static func register(_ app: NibApp) {
         let handler = PencilHandler(app: app)
         app.ui.pencilHandler = handler
-        app.services.set(handler, for: PencilHandler.serviceKey)
         PencilSettings.declare(app.settings, owner: id)
 
         app.commands.register(PencilGestureCommand.self)
@@ -32,19 +35,26 @@ public enum FeatPencilHardwareFeature: NibFeature {
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: "pencilhw.interaction", owner: id, order: 900) { _ in
             PencilInteractionAttachment(handler: handler)
         })
-        app.ui.settingsPages.register(SettingsPageDescriptor(
+        var page = SettingsPageDescriptor(
             id: "pencilhw", title: String(localized: "Apple Pencil"), icon: NibSymbol.pen.name, section: .stylus,
             order: 0, owner: id) { app in
             AnyView(PencilSettingsView(app: app))
-        })
-        app.content.keyCommands.register(KeyCommandDescriptor(
-            id: paletteShortcut, title: String(localized: "Show Pencil Palette"),
-            shortcut: KeyShortcut("p", [.command, .option]), command: PencilCommandIDs.palette,
-            params: ["kind": .string(PaletteKind.tools.rawValue)], scope: .document, owner: id))
+        }
+        // Settings search (F027) finds the page by what it sets, not only by its title.
+        page.keywords = [String(localized: "Double-tap"), String(localized: "Squeeze"), String(localized: "Hover"),
+                         String(localized: "Haptics"), String(localized: "Pen rotation"), String(localized: "Palette")]
+        app.ui.settingsPages.register(page)
+        var showPalette = KeyCommandDescriptor(
+            id: paletteShortcut, title: String(localized: "Show Pencil Palette"), shortcut: paletteKey,
+            command: CommandIDs.pencilPalette, params: ["kind": .string(PaletteKind.tools.rawValue)], scope: .document,
+            owner: id)
+        // The palette sits on a page canvas: the key is live only where there is one.
+        showPalette.docKinds = [.notebook, .whiteboard]
+        app.content.keyCommands.register(showPalette)
     }
 
     public static func start(_ app: NibApp) async {
-        app.services.get(PencilHandler.serviceKey, as: PencilHandler.self)?.start()
+        (app.ui.pencilHandler as? PencilHandler)?.start()
     }
 }
 
@@ -55,10 +65,6 @@ enum PencilSettings {
     static let squeeze = SettingKey("pencilhw.squeeze", default: PencilBuiltin.system.rawValue)
     static let hoverPreview = SettingKey("pencilhw.hoverPreview", default: true)
     static let haptics = SettingKey("pencilhw.haptics", default: true)
-    /// F007's Dynamic Ink switch (declared by F007; read and offered here only when it is declared).
-    /// ponytail: an assumed name (no contract defines it; InkStyle.reactsToRoll is per style). F007 declares exactly
-    /// this key, or a shared NibSettings key replaces it; until then the toggle and its footer sentence stay hidden.
-    static let reactToRoll = "pen.reactToRoll"
 
     static func key(_ gesture: PencilGesture) -> SettingKey<String> {
         gesture == .doubleTap ? doubleTap : squeeze
@@ -73,7 +79,7 @@ enum PencilSettings {
                   owner: owner, schema: binding)
         s.declare(hoverPreview, summary: "Show the current tool's tip where a hovering Apple Pencil will touch the page.",
                   owner: owner, schema: .bool())
-        s.declare(haptics, summary: "Apple Pencil Pro haptics when a Pencil palette opens and when a drawn shape snaps.",
+        s.declare(haptics, summary: "Apple Pencil Pro haptics when a Pencil palette opens, a drawn shape snaps or an object snaps to a guide.",
                   owner: owner, schema: .bool())
     }
 }
@@ -141,7 +147,7 @@ struct PencilGestureCommand: NibCommand {
             return Output(binding: binding, command: nil)
         }
         // A palette opened by the Pencil itself plays the Pencil Pro haptic; one opened by AI or a plugin does not.
-        handler.markPaletteFromPencil(fromPencil && invocation.command == PencilCommandIDs.palette)
+        handler.markPaletteFromPencil(fromPencil && invocation.command == CommandIDs.pencilPalette)
         defer { handler.markPaletteFromPencil(false) }
         _ = try await ctx.execute(invocation.command, invocation.params)
         return Output(binding: binding, command: invocation.command)
@@ -217,7 +223,7 @@ struct PencilActionsCommand: NibCommand {
         let handler = try PencilHandler.resolve(ctx)
         var system: [String: String] = [:]
         for g in PencilGesture.allCases { system[g.rawValue] = handler.systemPreference(g).rawValue }
-        let choices = PencilChoices.all(for: nil, actions: handler.actions, systemTitle: nil)
+        let choices = PencilChoices.all(for: nil, actions: ctx.content.pencilActions.all, systemTitle: nil)
         return Output(doubleTap: handler.binding(.doubleTap), squeeze: handler.binding(.squeeze), system: system,
                       choices: choices.map { Choice(id: $0.id, title: $0.title, gestures: $0.gestures, owner: $0.owner) })
     }
@@ -282,11 +288,10 @@ struct PencilSettingsView: View {
     let app: NibApp
     @State private var revision = 0
 
-    private var handler: PencilHandler? { app.services.get(PencilHandler.serviceKey, as: PencilHandler.self) }
+    private var handler: PencilHandler? { app.ui.pencilHandler as? PencilHandler }
 
     var body: some View {
         let _ = revision
-        let roll = app.settings.descriptor(PencilSettings.reactToRoll)
         List {
             bindingSection(.doubleTap)
             bindingSection(.squeeze)
@@ -301,19 +306,14 @@ struct PencilSettingsView: View {
             Section {
                 SettingToggle(app: app, title: String(localized: "Pencil haptics"), name: PencilSettings.haptics.name,
                               stored: app.settings.get(PencilSettings.haptics))
-                if let roll {
-                    SettingToggle(app: app, title: String(localized: "React to pen rotation"), name: roll.name,
-                                  stored: (app.settings.json(roll.name) ?? roll.defaultValue).boolValue ?? false)
-                }
+                // Dynamic Ink: F007 owns the setting, this page offers it (NibSettings.penReactsToRoll).
+                SettingToggle(app: app, title: String(localized: "React to pen rotation"),
+                              name: NibSettings.penReactsToRoll.name,
+                              stored: app.settings.get(NibSettings.penReactsToRoll))
             } header: {
                 Text(String(localized: "Apple Pencil Pro"))
             } footer: {
-                // The rotation sentence only when F007's switch exists and the toggle above is shown.
-                if roll != nil {
-                    Text(String(localized: "Apple Pencil Pro taps in your hand when a palette opens and when a shape snaps. With pen rotation on, turning the barrel turns the fountain pen's nib."))
-                } else {
-                    Text(String(localized: "Apple Pencil Pro taps in your hand when a palette opens and when a shape snaps."))
-                }
+                Text(String(localized: "Apple Pencil Pro taps in your hand when a palette opens, a shape snaps or an object snaps to a guide. With pen rotation on, turning the barrel turns the fountain pen's nib."))
             }
             hardwareSection
         }

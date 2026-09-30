@@ -30,9 +30,6 @@ enum HoverPreviewGeometry {
     static let minimumDot = 3.0
     static let inkOpacity = 0.9
     static let highlightOpacity = 0.5
-    /// The swatch hairline (DESIGN.md §3: swatches are flat colour with a 0.5 pt hairline), so the dot reads over ink
-    /// of its own colour. ponytail: NibDesign has the width only inside `NibPenSwatch`; a token would replace it.
-    static let hairline = 0.5
 
     /// - Parameters:
     ///   - presets: the tool's colour and thickness presets (nil for tools without them).
@@ -61,7 +58,8 @@ enum HoverPreviewGeometry {
                                      color: p.color.withAlpha(min(p.color.alpha, highlightOpacity)))
         default:
             // Lasso, text, plugin tools: nothing to preview. The eraser draws its own hover cursor (F010's
-            // `EraserTool.hover`); tools that implement `CanvasTool.hover` own their cursor, so no second ring here.
+            // `EraserTool.hover`, sized by `NibSettings.eraserSize`); tools that implement `CanvasTool.hover` own their
+            // cursor, so no second ring here.
             return .none
         }
     }
@@ -106,9 +104,9 @@ final class HoverPreview {
         layer.position = point
         layer.setAffineTransform(CGAffineTransform(rotationAngle: CGFloat(shape.angle)))
         layer.fillColor = shape.color?.cgColor
-        // A hairline keeps the dot visible over ink of the same colour.
+        // The swatch hairline (DESIGN.md §3) keeps the dot visible over ink of the same colour.
         layer.strokeColor = NibUIColor.swatchHairline.resolvedColor(with: traits).cgColor
-        layer.lineWidth = CGFloat(HoverPreviewGeometry.hairline)
+        layer.lineWidth = NibStroke.hairline
         layer.isHidden = false
         CATransaction.commit()
     }

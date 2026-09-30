@@ -23,8 +23,6 @@ struct PalettePlan: Equatable {
         var value: String?
     }
 
-    /// F016's current toolbar layout: {order: [descriptor ids], hidden: [descriptor ids]}; nil until customised.
-    static let layoutSetting = "toolbar.layout"
     /// F016's everyday tools (DESIGN.md §14.3): on the toolbar until the person customises it; the other built-in
     /// tools wait in More. Kept equal to `ToolbarLayoutEngine.everyday` (feat/F016, ToolbarCustomization.swift).
     static let everyday: Set<String> = ["lasso", "pen", "highlighter", "eraser", "shape", "drawShape", "text"]
@@ -52,7 +50,8 @@ struct PalettePlan: Equatable {
     var showsColours: Bool { presetTool != nil && !swatches.isEmpty }
     var showsWidths: Bool { kind != .colours && presetTool != nil && !widths.isEmpty }
 
-    static func make(kind: PaletteKind, toolbar: [ToolbarItemDescriptor], layout: JSONValue?, tool: String,
+    /// - Parameter layout: F016's toolbar layout (`NibSettings.toolbarLayout`); nil until the person customises it.
+    static func make(kind: PaletteKind, toolbar: [ToolbarItemDescriptor], layout: ToolbarLayoutSetting?, tool: String,
                      previousTool: String?, presets: (String) -> ToolPresets, canUndo: Bool, canRedo: Bool,
                      isPlugin: (String) -> Bool) -> PalettePlan {
         var plan = PalettePlan(kind: kind, selectedTool: tool)
@@ -84,10 +83,11 @@ struct PalettePlan: Equatable {
     /// registry order. An item the layout knows is shown exactly when it is not in `hidden`; one it doesn't know
     /// follows F016's default (everyday tools and plugin tools on the toolbar, the rest in More). One slot per tool
     /// (`toolID ?? id`), first descriptor wins. Accessories take part in the arrangement but not in the result.
-    static func mirror(_ items: [ToolbarItemDescriptor], layout: JSONValue?,
+    /// Layout ids are matched against descriptor ids, as F016's palette matches them.
+    static func mirror(_ items: [ToolbarItemDescriptor], layout: ToolbarLayoutSetting?,
                        isPlugin: (String) -> Bool) -> [ToolbarItemDescriptor] {
-        let order = (layout?["order"]?.arrayValue ?? []).compactMap { $0.stringValue }
-        let hidden = Set((layout?["hidden"]?.arrayValue ?? []).compactMap { $0.stringValue })
+        let order = layout?.order ?? []
+        let hidden = Set(layout?.hidden ?? [])
         let known = Set(order).union(hidden)
         var rank: [String: Int] = [:]
         for (i, id) in order.enumerated() where rank[id] == nil { rank[id] = i }
@@ -122,16 +122,6 @@ struct PalettePlan: Equatable {
 
     static func rows<T>(_ items: [T], perRow: Int = PalettePlan.perRow) -> [[T]] {
         stride(from: 0, to: items.count, by: perRow).map { Array(items[$0..<min($0 + perRow, items.count)]) }
-    }
-
-    /// `NibStrokeWidthSlider`'s preset dots (DESIGN.md §15: "Three preset dots (5, 8, 12 pt)"), thinnest first, so a
-    /// thickness looks the same here and in the tool's popover.
-    /// ponytail: NibDesign keeps these sizes inside `NibStrokeWidthSlider`; a public preset-dot token or component
-    /// there would replace this table.
-    static let dotSizes: [CGFloat] = [5, 8, 12]
-
-    static func dot(_ index: Int) -> CGFloat {
-        dotSizes[min(max(index, 0), dotSizes.count - 1)]
     }
 }
 
@@ -206,7 +196,7 @@ final class PaletteModel: ObservableObject {
         let docKind = doc.flatMap { try? app.workspace.content($0).meta.kind } ?? .notebook
         let features = Set(app.featureIDs)
         return PalettePlan.make(
-            kind: kind, toolbar: app.ui.toolbarItems(for: docKind), layout: app.settings.json(PalettePlan.layoutSetting),
+            kind: kind, toolbar: app.ui.toolbarItems(for: docKind), layout: app.settings.get(NibSettings.toolbarLayout),
             tool: session.tool, previousTool: session.previousTool,
             presets: { app.settings.get(NibSettings.presets($0)) },
             canUndo: doc.map { app.bus.history.canUndo($0) } ?? false,
@@ -252,7 +242,7 @@ final class PaletteModel: ObservableObject {
 
     func chooseSwatch(_ index: Int) {
         guard let tool = plan.presetTool else { return }
-        app.perform(PencilCommandIDs.presetSelect, ["tool": .string(tool), "swatch": .number(Double(index))],
+        app.perform(CommandIDs.presetSelect, ["tool": .string(tool), "swatch": .number(Double(index))],
                     session: session)
         if plan.switchesTool { app.perform(CommandIDs.toolSelect, ["tool": .string(tool)], session: session) }
         onDismiss()
@@ -260,7 +250,7 @@ final class PaletteModel: ObservableObject {
 
     func chooseWidth(_ index: Int) {
         guard let tool = plan.presetTool else { return }
-        app.perform(PencilCommandIDs.presetSelect, ["tool": .string(tool), "width": .number(Double(index))],
+        app.perform(CommandIDs.presetSelect, ["tool": .string(tool), "width": .number(Double(index))],
                     session: session)
         if plan.switchesTool { app.perform(CommandIDs.toolSelect, ["tool": .string(tool)], session: session) }
     }
@@ -327,10 +317,10 @@ struct SqueezePaletteView: View {
             ForEach(Array(PalettePlan.rows(plan.tools).enumerated()), id: \.offset) { _, row in
                 HStack(spacing: 0) {
                     ForEach(row) { tool in
+                        // NibToolButton carries its own tooltip (the tool's name) and dims itself when disabled.
                         NibToolButton(tool: nibTool(tool), isSelected: tool.toolID != nil && tool.toolID == plan.selectedTool) {
                             model.choose(tool)
                         }
-                        .help(tool.title)
                     }
                 }
             }
@@ -343,24 +333,16 @@ struct SqueezePaletteView: View {
                 tint: tool.tint.map { Color(uiColor: $0.uiColor) })
     }
 
+    /// `NibIconButton` shows its label as the tooltip and dims itself to `NibOpacity.disabled` when disabled
+    /// (DESIGN.md §15 common states), so `.disabled` is all a greyed-out undo needs.
     private func historyRow(_ plan: PalettePlan) -> some View {
         HStack(spacing: 0) {
             NibIconButton(.undo, label: String(localized: "Undo"), size: .palette) { model.undo() }
                 .disabled(!plan.canUndo)
-                .opacity(plan.canUndo ? 1 : Self.disabledOpacity)
-                .help(String(localized: "Undo"))
             NibIconButton(.redo, label: String(localized: "Redo"), size: .palette) { model.redo() }
                 .disabled(!plan.canRedo)
-                .opacity(plan.canRedo ? 1 : Self.disabledOpacity)
-                .help(String(localized: "Redo"))
         }
     }
-
-    /// DESIGN.md §15 common states: "Disabled: 40 % opacity, no hit testing". `.disabled` removes hit testing but
-    /// does not dim: `NibIconButton` draws its glyph in an explicit colour and `NibPressStyle` ignores `isEnabled`
-    /// (only `NibButton` dims itself), so this is the one dim, not a second one.
-    /// ponytail: when NibIconButton reads `isEnabled` itself, drop this.
-    static let disabledOpacity = 0.4
 
     private func swatchRows(_ plan: PalettePlan) -> some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -371,7 +353,7 @@ struct SqueezePaletteView: View {
                                      size: .popover) {
                             model.chooseSwatch(index)
                         }
-                        .help(PaletteNames.colour(plan.swatches[index], index: index))
+                        .nibTooltip(PaletteNames.colour(plan.swatches[index], index: index))
                     }
                 }
             }
@@ -385,30 +367,15 @@ struct SqueezePaletteView: View {
                          ringsLight: ink?.needsRing(dark: false) ?? false, ringsDark: ink?.needsRing(dark: true) ?? false)
     }
 
-    /// The selection shape of `NibStrokeWidthSlider`'s presets, so the same presets look the same in both places.
-    private var presetShape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous)
-    }
-
+    /// The thickness presets as the tool's popover draws them (`NibWidthPresetButton`, `NibMetrics.widthPresetDot`),
+    /// so a thickness looks the same in both places; the button carries its label, tooltip and selected trait.
     private func widthRow(_ plan: PalettePlan) -> some View {
         HStack(spacing: 0) {
             ForEach(Array(plan.widths.enumerated()), id: \.offset) { index, width in
-                let selected = index == plan.selectedWidth
-                let label = PaletteNames.thickness(width)
-                Button {
+                NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(index), isSelected: index == plan.selectedWidth,
+                                     label: PaletteNames.thickness(width)) {
                     model.chooseWidth(index)
-                } label: {
-                    Circle()
-                        .fill(NibColor.label)
-                        .frame(width: PalettePlan.dot(index), height: PalettePlan.dot(index))
-                        .frame(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-                        .background(selected ? NibColor.fill3 : Color.clear, in: presetShape)
-                        .contentShape(presetShape)
                 }
-                .buttonStyle(NibPressStyle(shape: presetShape))
-                .accessibilityLabel(label)
-                .accessibilityAddTraits(selected ? .isSelected : [])
-                .help(label)
             }
         }
     }

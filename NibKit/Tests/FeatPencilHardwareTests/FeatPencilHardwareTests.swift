@@ -141,7 +141,7 @@ final class FeatPencilHardwareTests: XCTestCase {
             item("tape", .tools, order: 60, tool: "tape"),
         ]
         let plugin: (String) -> Bool = { $0 == "dev.stamp" }
-        func mirror(_ items: [ToolbarItemDescriptor], _ layout: JSONValue?) -> [String] {
+        func mirror(_ items: [ToolbarItemDescriptor], _ layout: ToolbarLayoutSetting?) -> [String] {
             PalettePlan.mirror(items, layout: layout, isPlugin: plugin).map { $0.id }
         }
 
@@ -150,20 +150,21 @@ final class FeatPencilHardwareTests: XCTestCase {
 
         // Customised: saved order, hidden tools out, the lasso first and never hidden. Tape was never placed, so it
         // follows its default (More), like a built-in tool added after the person customised the toolbar.
-        let layout: JSONValue = ["order": ["eraser", "dev.stamp.tool", "pen", "lasso"], "hidden": ["highlighter", "lasso"]]
+        let layout = ToolbarLayoutSetting(order: ["eraser", "dev.stamp.tool", "pen", "lasso"],
+                                          hidden: ["highlighter", "lasso"])
         let expected = ["lasso", "eraser", "dev.stamp.tool", "pen"]
         XCTAssertEqual(mirror(items, layout), expected)
 
         // Items the layout never mentions keep their defaults and follow the ordered ones in registry order; tape shows
         // once the person has placed it on the toolbar.
-        XCTAssertEqual(mirror(items, ["order": ["pen"], "hidden": ["highlighter"]]),
+        XCTAssertEqual(mirror(items, ToolbarLayoutSetting(order: ["pen"], hidden: ["highlighter"])),
                        ["lasso", "pen", "eraser", "dev.stamp.tool"])
-        XCTAssertEqual(mirror(items, ["order": ["tape", "pen"], "hidden": []]),
+        XCTAssertEqual(mirror(items, ToolbarLayoutSetting(order: ["tape", "pen"])),
                        ["lasso", "tape", "pen", "highlighter", "eraser", "dev.stamp.tool"])
 
         // A lasso left hideable by its descriptor is still never hidden (F016 treats the lasso group as fixed).
         let hideableLasso = [item("lasso", .lasso, order: 0, tool: "lasso", hideable: true)] + items.dropFirst()
-        XCTAssertEqual(mirror(hideableLasso, ["order": [], "hidden": ["lasso", "pen"]]),
+        XCTAssertEqual(mirror(hideableLasso, ToolbarLayoutSetting(hidden: ["lasso", "pen"])),
                        ["lasso", "highlighter", "eraser", "dev.stamp.tool"])
 
         // Layout ids are descriptor ids only (a tool id does not hide a differently named item), and each tool gets one
@@ -172,8 +173,8 @@ final class FeatPencilHardwareTests: XCTestCase {
                        item("tool.pen", .tools, order: 10, tool: "pen"),
                        item("tool.pen.copy", .tools, order: 20, tool: "pen"),
                        item("tool.pen", .tools, order: 30, tool: "pencil")]
-        XCTAssertEqual(mirror(renamed, ["order": [], "hidden": ["pen"]]), ["lasso", "tool.pen"])
-        XCTAssertEqual(mirror(renamed, ["order": ["tool.pen.copy"], "hidden": []]), ["lasso", "tool.pen.copy"])
+        XCTAssertEqual(mirror(renamed, ToolbarLayoutSetting(hidden: ["pen"])), ["lasso", "tool.pen"])
+        XCTAssertEqual(mirror(renamed, ToolbarLayoutSetting(order: ["tool.pen.copy"])), ["lasso", "tool.pen.copy"])
 
         let plan = PalettePlan.make(kind: .tools, toolbar: items, layout: layout, tool: "pen", previousTool: nil,
                                     presets: { ToolPresets.defaults(for: $0) }, canUndo: true, canRedo: false,
@@ -298,6 +299,27 @@ final class FeatPencilHardwareTests: XCTestCase {
         XCTAssertTrue(handler.seen.contains(.hover))
     }
 
+    func testHoverPreviewTurnsThePenNibOnlyWithDynamicInk() throws {
+        try XCTSkipUnless(PencilHandler.systemShowsHoverPreview, "the simulator's hover preview setting is off")
+        let rolled = CanvasSample(page: Fixtures.page1, location: Point(50, 60), roll: 0.5)
+        /// The preview's turn after one rolled hover, with Dynamic Ink (`NibSettings.penReactsToRoll`) as given.
+        func angle(reactsToRoll: Bool?) throws -> Double {
+            let h = Harness(features: [FeatPencilHardwareFeature.self])
+            if let reactsToRoll { h.app.settings.set(NibSettings.penReactsToRoll, reactsToRoll) }
+            let handler = try pencilHandler(h)
+            let host = FakeCanvasHost(h)
+            h.session.tool = "pen"
+            handler.pencilHover(rolled, session: h.session, host: host)
+            XCTAssertTrue(handler.seen.contains(.roll))
+            let layer = try XCTUnwrap(host.overlayLayer.sublayers?.compactMap { $0 as? CAShapeLayer }.first)
+            let t = layer.affineTransform()
+            return Double(atan2(t.b, t.a))
+        }
+        XCTAssertEqual(try angle(reactsToRoll: nil), 0.5, accuracy: 0.001, "Dynamic Ink is on by default")
+        XCTAssertEqual(try angle(reactsToRoll: true), 0.5, accuracy: 0.001)
+        XCTAssertEqual(try angle(reactsToRoll: false), 0, accuracy: 0.001, "without Dynamic Ink the dot does not turn")
+    }
+
     func testHardwareMatrixReportsWhatThisPencilDid() {
         XCTAssertEqual(PencilCapability.pressure.support(seen: [], proSupported: false), .available)
         XCTAssertEqual(PencilCapability.hover.support(seen: [], proSupported: true), .notDetected)
@@ -416,18 +438,18 @@ final class FeatPencilHardwareTests: XCTestCase {
         let handler = try pencilHandler(h)
         handler.start()
         let host = FakeCanvasHost(h)
-        let page: JSONValue = "page:FIXTUREDOC01/FIXTUREPG001"
-        func snap(_ doc: DocumentID, _ payload: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG001", "shape": "ellipse"]) {
-            h.app.events.emit("shape.snapped", doc: doc, payload: payload)
+        let page = "page:FIXTUREDOC01/FIXTUREPG001"
+        func snap(_ doc: DocumentID, point: Point? = nil, page ref: String = page) {
+            h.app.events.emit(ShapeSnappedPayload(page: ref, shape: "ellipse", point: point), doc: doc)
         }
 
         snap(Fixtures.docID)
         XCTAssertNil(handler.lastFeedback, "the Pencil has not been used on any canvas")
 
         handler.pencilHover(CanvasSample(page: Fixtures.page1, location: Point(50, 60)), session: h.session, host: host)
-        snap("OTHERDOC0001")
+        snap("OTHERDOC0001", page: "page:OTHERDOC0001/FIXTUREPG001")
         XCTAssertNil(handler.lastFeedback, "a snap in another document is not this Pencil's")
-        h.app.events.emit("shape.created", doc: Fixtures.docID, payload: ["page": page])
+        h.app.events.emit("shape.created", doc: Fixtures.docID, payload: ["page": .string(page)])
         XCTAssertNil(handler.lastFeedback, "only the snap event plays it")
 
         snap(Fixtures.docID)
@@ -435,14 +457,69 @@ final class FeatPencilHardwareTests: XCTestCase {
         XCTAssertEqual(handler.lastFeedback?.point, host.viewPoint(Point(50, 60), page: Fixtures.page1))
 
         handler.lastFeedback = nil
-        snap(Fixtures.docID, ["page": page, "shape": "rectangle", "at": [10, 20]])
+        snap(Fixtures.docID, point: Point(10, 20))
         XCTAssertEqual(handler.lastFeedback?.point, host.viewPoint(Point(10, 20), page: Fixtures.page1),
                        "the snap's own point wins")
+
+        // An event without a doc still names its document in the page ref.
+        handler.lastFeedback = nil
+        h.app.events.emit(ShapeSnappedPayload(page: "page:OTHERDOC0001/FIXTUREPG001", shape: "ellipse"))
+        XCTAssertNil(handler.lastFeedback)
 
         handler.lastFeedback = nil
         try await h.run("settings.set", ["name": "pencilhw.haptics", "value": false])
         snap(Fixtures.docID)
         XCTAssertNil(handler.lastFeedback, "Pencil haptics off")
+    }
+
+    func testPencilHapticRequestsPlayOnTheRequestingWindowsCanvas() async throws {
+        let h = Harness(features: [FeatPencilHardwareFeature.self])
+        let handler = try pencilHandler(h)
+        handler.start()
+        let page = "page:FIXTUREDOC01/FIXTUREPG001"
+
+        // No session and no Pencil use yet: nowhere to play it.
+        h.app.events.emit(PencilHapticPayload(kind: "alignment", page: page, point: Point(5, 5)), doc: Fixtures.docID)
+        XCTAssertNil(handler.lastFeedback)
+
+        // A ruler or guide snap names its window: it plays on that window's canvas at the snap.
+        let host = FakeCanvasHost(h)
+        let editor = FakeEditor(host)
+        h.session.editor = editor
+        let session = h.session.id.raw
+        h.app.events.emit(PencilHapticPayload(kind: "alignment", page: page, point: Point(30, 40), session: session),
+                          doc: Fixtures.docID)
+        XCTAssertEqual(handler.lastFeedback?.kind, .alignment)
+        XCTAssertEqual(handler.lastFeedback?.point, host.viewPoint(Point(30, 40), page: Fixtures.page1))
+
+        handler.lastFeedback = nil
+        h.app.events.emit(PencilHapticPayload(kind: "generic", session: session), doc: Fixtures.docID)
+        XCTAssertEqual(handler.lastFeedback?.kind, .path)
+        XCTAssertEqual(handler.lastFeedback?.point, CGPoint(x: host.canvasView.bounds.midX, y: host.canvasView.bounds.midY),
+                       "no point and no Pencil position: mid-canvas")
+        handler.lastFeedback = nil
+        h.app.events.emit(PencilHapticPayload(kind: "levelChange", page: page, session: session))
+        XCTAssertEqual(handler.lastFeedback?.kind, .alignment)
+        let frame = try XCTUnwrap(host.pageFrame(Fixtures.page1))
+        XCTAssertEqual(handler.lastFeedback?.point, CGPoint(x: frame.midX, y: frame.midY), "a page without a point: mid-page")
+
+        // Never on a canvas that shows another document.
+        handler.lastFeedback = nil
+        h.app.events.emit(PencilHapticPayload(session: session), doc: "OTHERDOC0001")
+        XCTAssertNil(handler.lastFeedback)
+
+        // The Pencil haptics setting applies to every request.
+        try await h.run("settings.set", ["name": "pencilhw.haptics", "value": false])
+        h.app.events.emit(PencilHapticPayload(session: session), doc: Fixtures.docID)
+        XCTAssertNil(handler.lastFeedback)
+        withExtendedLifetime(editor) {}
+    }
+
+    func testHapticKindsMapToTheCanvasFeedbacks() {
+        XCTAssertEqual(PencilHandler.Feedback(hapticKind: "alignment"), .alignment)
+        XCTAssertEqual(PencilHandler.Feedback(hapticKind: "levelChange"), .alignment)
+        XCTAssertEqual(PencilHandler.Feedback(hapticKind: "generic"), .path)
+        XCTAssertEqual(PencilHandler.Feedback(hapticKind: "future.kind"), .alignment)
     }
 
     // MARK: Commands and registration
@@ -451,12 +528,24 @@ final class FeatPencilHardwareTests: XCTestCase {
         let h = Harness(features: [FeatPencilHardwareFeature.self])
         XCTAssertNoThrow(try pencilHandler(h))
         XCTAssertEqual(h.app.ui.settingsPages.get("pencilhw")?.section, .stylus)
-        XCTAssertEqual(h.app.content.keyCommands.get("pencilhw.palette")?.command, "pencil.palette")
+        XCTAssertEqual(h.app.ui.settingsPages.get("pencilhw")?.keywords.isEmpty, false, "settings search finds the page")
+        let key = try XCTUnwrap(h.app.content.keyCommands.get("pencilhw.palette"))
+        XCTAssertEqual(key.command, "pencil.palette")
         XCTAssertEqual(h.app.content.pencilActions.get("pencilhw.undo")?.command, "edit.undo")
-        // The descriptors spell their ids out (lint reads them); the constants callers use must match.
-        XCTAssertEqual(PencilGestureCommand.descriptor.id, PencilCommandIDs.gesture)
-        XCTAssertEqual(PencilPaletteCommand.descriptor.id, PencilCommandIDs.palette)
-        XCTAssertEqual(PencilActionsCommand.descriptor.id, PencilCommandIDs.actions)
+        // The descriptors spell their ids out (lint reads them); the catalogue constants callers use must match.
+        XCTAssertEqual(PencilGestureCommand.descriptor.id, CommandIDs.pencilGesture)
+        XCTAssertEqual(PencilPaletteCommand.descriptor.id, CommandIDs.pencilPalette)
+        XCTAssertEqual(PencilActionsCommand.descriptor.id, CommandIDs.pencilActions)
+
+        // ⌃⌘P, live only over a page canvas: ⌥⌘P is F052's Play or Pause Audio (contracts-v2.2 key routing).
+        XCTAssertEqual(key.shortcut, KeyShortcut("p", [.command, .control]))
+        XCTAssertEqual(key.docKinds, [.notebook, .whiteboard])
+        XCTAssertTrue(key.isActive(in: KeyCommandContext(inDocument: true, docKind: .notebook)))
+        XCTAssertTrue(key.isActive(in: KeyCommandContext(inDocument: true, docKind: .whiteboard)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(inDocument: true, docKind: .studySet)))
+        XCTAssertFalse(key.isActive(in: KeyCommandContext(inDocument: false, docKind: nil)))
+        let clashes = h.app.content.keyCommands.all.filter { $0.id != key.id && $0.shortcut == key.shortcut }
+        XCTAssertEqual(clashes.map { $0.id }, [], "no other key on ⌃⌘P")
 
         let host = FakeCanvasHost(h)
         let attachment = try XCTUnwrap(h.app.ui.canvasAttachments.get("pencilhw.interaction")).make(host)
@@ -532,7 +621,7 @@ final class FeatPencilHardwareTests: XCTestCase {
             h.app.ui.toolbar.register(item(id, id == "lasso" ? .lasso : .tools, order: index, tool: id,
                                            hideable: id != "lasso"))
         }
-        h.app.settings.setJSON("toolbar.layout", ["order": ["eraser", "pen"], "hidden": ["highlighter"]])
+        h.app.settings.set(NibSettings.toolbarLayout, ToolbarLayoutSetting(order: ["eraser", "pen"], hidden: ["highlighter"]))
 
         do {
             try await h.run("pencil.palette", ["kind": "tools"])

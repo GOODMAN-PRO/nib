@@ -80,14 +80,6 @@ enum PaletteKind: String, CaseIterable, Codable {
     case attributes
 }
 
-enum PencilCommandIDs {
-    static let gesture = "pencil.gesture"
-    static let palette = "pencil.palette"
-    static let actions = "pencil.actions"
-    /// Owner: F008 (not in `CommandIDs`).
-    static let presetSelect = "preset.select"
-}
-
 /// A command call a Pencil gesture resolves to.
 struct PencilInvocation: Equatable {
     var command: String
@@ -165,10 +157,11 @@ enum PencilActionResolver {
             params["page"] = .string(NodeRef.page(doc, page).description)
             params["at"] = .array([.number(point.x), .number(point.y)])
         }
-        return PencilInvocation(command: PencilCommandIDs.palette, params: .object(params))
+        return PencilInvocation(command: CommandIDs.pencilPalette, params: .object(params))
     }
 
-    /// What a bound Pencil action's command receives besides its own params: {gesture, doc?, page?, at?}.
+    /// What a bound Pencil action's command receives besides its own params (`PencilActionDescriptor`'s contract):
+    /// {gesture, doc, page?, at?}.
     static func contextParams(_ gesture: PencilGesture, _ context: PencilActionContext) -> JSONValue {
         var params: [String: JSONValue] = ["gesture": .string(gesture.rawValue)]
         if let doc = context.doc {
@@ -212,8 +205,9 @@ enum PencilChoices {
     }
 }
 
-/// Drops the second delivery of one physical gesture. The canvas (F101) forwards Pencil events through
-/// `PencilEventHandler`, and this feature's own `UIPencilInteraction` sees the same tap; whichever arrives first wins.
+/// Drops the second delivery of one physical gesture. The canvas owns a `UIPencilInteraction` and forwards through
+/// `PencilEventHandler` (F101), and this feature's own interaction sees the same tap until then; whichever arrives first
+/// wins (the `PencilEventHandler` contract asks a handler that installs its own to drop duplicates).
 struct PencilEventGate {
     var window: TimeInterval
     private var last: [String: TimeInterval] = [:]
@@ -260,19 +254,13 @@ enum PencilCapability: String, CaseIterable, Identifiable {
 // MARK: - The handler (ui.pencilHandler)
 
 /// Apple Pencil hardware: double-tap, squeeze, hover preview and Pencil Pro haptics. Installed as `ui.pencilHandler`
-/// (the canvas forwards to it) and reached by this feature's commands through `services`.
+/// (the canvas forwards to it); this feature's commands reach it there too (`ctx.ui`).
 @MainActor
 final class PencilHandler: PencilEventHandler {
-    static let serviceKey = "pencilhw.handler"
-
     /// How long a Pencil position stays "where the Pencil is" after it was recorded (seconds).
     static let pointLifetime: TimeInterval = 2
     /// How long a gesture `receive` sent waits for `pencil.gesture` to pick it up (seconds).
     static let pendingLifetime: TimeInterval = 1
-    /// F030's snap event (T-117), emitted on `app.events` with `doc` and payload {page, shape}.
-    /// ponytail: owned by F030 (`ShapeRecognitionEvents.snapped` in FeatShapeRecognition/DrawShapeTool.swift) and not in
-    /// `NibEventType`; move to the contract constant when one is added.
-    static let shapeSnapped = "shape.snapped"
 
     private weak var app: NibApp?
     /// The iPad's Apple Pencil preference per gesture; tests replace it.
@@ -294,7 +282,7 @@ final class PencilHandler: PencilEventHandler {
     private var paletteFromPencil = false
     private var styles: [String: HoverStyle] = [:]
     private var generators: [ObjectIdentifier: AnyObject] = [:]
-    private var snaps: EventSubscription?
+    private var hapticEvents: EventSubscription?
     private var bag = Set<AnyCancellable>()
     /// The last haptic asked for (kind and view point), for tests (which also reset it); the generator itself can't be
     /// observed.
@@ -307,10 +295,16 @@ final class PencilHandler: PencilEventHandler {
     }
 
     enum Feedback {
-        /// A Pencil palette opening.
+        /// A Pencil palette opening; a guide, angle or grid snap (`pencil.haptic`).
         case alignment
-        /// A drawn shape snapping into place.
+        /// A drawn shape snapping into place (`shape.snapped`).
         case path
+
+        /// A `PencilHapticPayload.kind`. `UICanvasFeedbackGenerator` has two feedbacks: the alignment tick for
+        /// "alignment", "levelChange" and kinds this build does not know, the completion for "generic".
+        init(hapticKind: String) {
+            self = hapticKind == "generic" ? .path : .alignment
+        }
     }
 
     init(app: NibApp) {
@@ -324,7 +318,7 @@ final class PencilHandler: PencilEventHandler {
     }
 
     static func resolve(_ ctx: CommandContext) throws -> PencilHandler {
-        guard let handler = ctx.services.get(serviceKey, as: PencilHandler.self) else {
+        guard let handler = ctx.ui?.pencilHandler as? PencilHandler else {
             throw NibError.unavailable("Apple Pencil support")
         }
         return handler
@@ -352,12 +346,17 @@ final class PencilHandler: PencilEventHandler {
         return false
     }
 
-    /// Listens for F030's snaps, for the Pencil Pro snap haptic (called from `start`, never from `register`).
+    /// Listens for `shape.snapped` (F009, F030) and `pencil.haptic` (F012, F039 and plugins), the Pencil Pro haptics
+    /// other features ask for (called from `start`, never from `register`).
     func start() {
-        guard let app, snaps == nil else { return }
-        snaps = app.events.subscribe { [weak self] event in
-            guard event.type == PencilHandler.shapeSnapped else { return }
-            self?.didSnap(event)
+        guard let app, hapticEvents == nil else { return }
+        hapticEvents = app.events.subscribe { [weak self] event in
+            guard let self else { return }
+            if let snap = event.decode(ShapeSnappedPayload.self) {
+                self.didSnap(snap, doc: event.doc)
+            } else if let haptic = event.decode(PencilHapticPayload.self) {
+                self.didRequestHaptic(haptic, doc: event.doc)
+            }
         }
     }
 
@@ -399,7 +398,7 @@ final class PencilHandler: PencilEventHandler {
             return
         }
         pendingGesture = (gesture, now)
-        performCommand(PencilCommandIDs.gesture, gestureParams(gesture, host: host), session)
+        performCommand(CommandIDs.pencilGesture, gestureParams(gesture, host: host), session)
     }
 
     /// `pencil.gesture`: whether this run comes from the Pencil itself (`receive`), not from AI, a plugin or a script.
@@ -486,10 +485,8 @@ final class PencilHandler: PencilEventHandler {
         if let cached = styles[tool] { return cached }
         guard let app else { return HoverStyle(presets: nil, reactsToRoll: false) }
         let presets = NibSettings.presetTools.contains(tool) ? app.settings.get(NibSettings.presets(tool)) : nil
-        // F007's Dynamic Ink switch: the pen's nib turns with the barrel only when the pen reacts to roll.
-        let roll = app.settings.json(PencilSettings.reactToRoll)
-            ?? app.settings.descriptor(PencilSettings.reactToRoll)?.defaultValue
-        let style = HoverStyle(presets: presets, reactsToRoll: roll?.boolValue ?? false)
+        // Dynamic Ink (F007's switch): the pen's nib turns with the barrel only when the pen reacts to roll.
+        let style = HoverStyle(presets: presets, reactsToRoll: app.settings.get(NibSettings.penReactsToRoll))
         styles[tool] = style
         return style
     }
@@ -569,37 +566,55 @@ final class PencilHandler: PencilEventHandler {
         return generator
     }
 
-    /// Snapping haptic (T-117): F030 emits `shape.snapped` the moment a drawn stroke snaps to a shape (on lift, or
-    /// while the Pencil is still down with Draw and Hold). It plays on the canvas the Pencil was last used on, and only
-    /// when the snap is in that canvas's document; at the snap's own point when the event carries one, else where the
-    /// Pencil is, else mid-page. The ruler and alignment guides play their own (F039, F012).
-    func didSnap(_ event: NibEvent) {
-        guard let host = lastHost, let doc = event.doc, doc == host.documentID else { return }
+    /// Snapping haptic (T-117): F030 (Draw Shape) and F009 (Draw and Hold) emit `shape.snapped` the moment a drawn stroke
+    /// snaps to a shape (on lift, or while the Pencil is still down with Draw and Hold).
+    func didSnap(_ snap: ShapeSnappedPayload, doc: DocumentID?) {
+        guard let host = hapticHost(session: snap.session, doc: doc ?? Self.document(of: snap.page)) else { return }
+        feedback(.path, host: host, at: hapticPoint(page: snap.page, point: snap.point, host: host))
+    }
+
+    /// `pencil.haptic`: another feature asks for an Apple Pencil Pro haptic (ruler angle snaps F039, alignment guides
+    /// F012). Only this module may use `UICanvasFeedbackGenerator`; the Pencil haptics setting applies to every request.
+    func didRequestHaptic(_ request: PencilHapticPayload, doc: DocumentID?) {
+        guard let host = hapticHost(session: request.session, doc: doc ?? request.page.flatMap(Self.document(of:)))
+        else { return }
+        feedback(Feedback(hapticKind: request.kind), host: host, at: hapticPoint(page: request.page, point: request.point,
+                                                                                 host: host))
+    }
+
+    /// The canvas a requested haptic plays on: the requesting window's (the payload's session), else the canvas the
+    /// Pencil was last used on; never one that shows another document than the event's.
+    private func hapticHost(session id: String?, doc: DocumentID?) -> CanvasHost? {
+        var host: CanvasHost?
+        if let id, let session = app?.services.sessions.session(NibID(id)) { host = canvasHost(for: session) }
+        guard let host = host ?? lastHost else { return nil }
+        if let doc, doc != host.documentID { return nil }
+        return host
+    }
+
+    /// At the page point the request names, else where the Pencil is, else mid-page, else mid-canvas.
+    private func hapticPoint(page ref: String?, point: Point?, host: CanvasHost) -> CGPoint {
         var page: PageID?
-        if let ref = event.payload?["page"]?.stringValue, let node = NodeRef(ref), case let .page(pageDoc, id) = node,
-           pageDoc == doc {
-            page = id
-        }
-        let point: CGPoint
-        if let page, let at = event.payload?["at"]?.arrayValue, at.count == 2,
-           let x = at[0].doubleValue, let y = at[1].doubleValue {
-            point = host.viewPoint(Point(x, y), page: page)
-        } else if let pencil = recentPoint(host) {
-            point = pencil
-        } else if let page, let frame = host.pageFrame(page) {
-            point = CGPoint(x: frame.midX, y: frame.midY)
-        } else {
-            point = CGPoint(x: host.canvasView.bounds.midX, y: host.canvasView.bounds.midY)
-        }
-        feedback(.path, host: host, at: point)
+        if let ref, let node = NodeRef(ref), case let .page(doc, id) = node, doc == host.documentID { page = id }
+        if let page, let point { return host.viewPoint(point, page: page) }
+        if let pencil = recentPoint(host) { return pencil }
+        if let page, let frame = host.pageFrame(page) { return CGPoint(x: frame.midX, y: frame.midY) }
+        return CGPoint(x: host.canvasView.bounds.midX, y: host.canvasView.bounds.midY)
+    }
+
+    private static func document(of pageRef: String) -> DocumentID? {
+        guard let node = NodeRef(pageRef), case let .page(doc, _) = node else { return nil }
+        return doc
     }
 }
 
 // MARK: - The canvas attachment: UIPencilInteraction and the Pencil hover recogniser
 
 /// Installs a `UIPencilInteraction` and a Pencil-only hover recogniser on every notebook and whiteboard canvas, so
-/// double-tap, squeeze and the hover preview work however the canvas forwards events. A second delivery of one
-/// gesture is dropped by `PencilEventGate`.
+/// double-tap, squeeze and the hover preview work before the canvas forwards them itself (the `PencilEventHandler`
+/// contract: the canvas owns one interaction per canvas once F101 lands). A second delivery of one gesture is dropped
+/// by `PencilEventGate`; a second hover sample at the same position changes nothing. Squeeze locations are in
+/// `canvasView` coordinates, as the contract pins them for forwarded squeezes.
 @MainActor
 final class PencilInteractionAttachment: NSObject, CanvasAttachment, UIPencilInteractionDelegate,
     UIGestureRecognizerDelegate {
