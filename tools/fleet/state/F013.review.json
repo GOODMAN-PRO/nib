@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatObjectMenu/ObjectCommands.swift:29 (ItemTargets.resolve, used by ItemDelete/ItemArrange/ItemRecolor/ItemSetLocked .run); key commands in FeatObjectMenuFeature.swift:26 + ObjectCommands.swift:236-261",
+      "problem": "Read-only mode can be bypassed from the keyboard. The menu entries hide edits when session.readOnly is true, but the command handlers only check store read-only (ctx.isReadOnly(doc)), never the invoking window's view-mode flag. ShellViewController dispatches .canvas-scope key commands whatever session.readOnly is, so in a read-only (F042) window with a selection, Delete deletes it, the arrange chords reorder it and Cmd-L locks it. A selection can exist in read-only mode: one made before switching, or one from a right-click on an item, which contextMenu(at:) turns into selection.set even in read-only. F014 guards the same case (ClipboardCore.isReadOnly), and its review rated it major.",
+      "fix": "At the top of ItemTargets.resolve, return nil (the existing no-op path) when `ctx.principal.isUser && ctx.session?.readOnly == true`. Use ctx.session, not activeSession, so AI and bridge calls are not blocked by some other window's mode. Also skip the selection.set in ObjectMenuAttachment.contextMenu(at:) when host.session.readOnly. Add a test: h.session.readOnly = true, select shape and image, then run item.delete [:], item.arrange {to: front}, item.setLocked {locked: true} and item.recolor {color} as the user; assert h.snapshot() is unchanged and undoDepth == 0."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatObjectMenu/ObjectCommands.swift:103-114 (SelectionFacts.of) called from every entry closure at :141-142; PageLongPressMenu.swift:229-233 (commit observer) and :279-295 (rebuild)",
+      "problem": "Performance on large pages. Each of the 13 generic entries' isVisible and params closures calls SelectionFacts.of(ctx), and each call copies and scans every Item on the page (workspace.allItems + filter). ObjectMenuAttachment rebuilds (app.ui.menuItems(.objectMenu, …)) on every selection change and on every commit in any document while anything is selected, because the observeCommits handler ignores which document changed. A board near NibLimits.boardItemLimit (100,000 items) then does about 1.4M Item copies on the main actor per rebuild. Collaborator, AI or sync commits on another notebook, and every tick of the Custom colour picker, stall the UI while a selection is held.",
+      "fix": "Resolve the facts once per selection state instead of once per closure. Add a @MainActor single-slot cache in SelectionFacts keyed by (doc, page, selection.items, bounds, readOnly, the last Changeset.seq seen). Invalidate it from one app.bus.observeCommits made on first use; do not read registries in register. Build the item lookup from the selected ids, not a full filter per call. In the attachment's commit handler, return early unless the changeset's mutations touch host.documentID and the selection's page. Add a timing test: h.insert 20,000 strokes, select one, and assert that app.ui.menuItems(.objectMenu, ctx) plus attachment.refresh() after a commit take less than budget × 4 (XCTAssertLessThan)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatObjectMenu/FeatObjectMenuFeature.swift:37-41 (PanelDescriptor placement .floating) and ObjectCommands.swift:193-204 (Style entry → panel.open); ObjectMenuView.swift:563-657",
+      "problem": "Style opens the matching InspectorDescriptor as a draggable .floating panel through panel.open, detached from the selection. The spec says the menu and its popovers are floating chrome: session.floatingHost (setAnchor + present) or an .anchored .popover ChromeOverlayDescriptor (G12). The contracts-v2 changelog G12 lists exactly this pattern (F037's panel opened through panel.open) as the workaround those APIs replace. The Colour popover already does this correctly.",
+      "fix": "Handle Style the way Colour is handled. In ObjectMenuModel.perform, when the entry id is ObjectMenuIDs.style, open a NibBudPopover presented in session.floatingHost (present it in ObjectMenuAttachment.present(on:) next to the colour popover). Bud it from a .nibBudAnchor on the Style/More control or from the ObjectMenuIDs.overlay selection-top anchor already set, with placement from colourAbove. It hosts StylePanelModel's segmented control plus inspector.makeView(inspectorContext). Present the same popover from the right-click and edit-menu paths through the floating host. Keep the .floating panel registration only as the fallback when session.floatingHost is nil. Extend the attachment test: perform(style) makes floating.isPresenting(<style popover id>) true."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatObjectMenu/ObjectCommands.swift:258-259 and :161 (Unlock Selection ⌥⌘L)",
+      "problem": "⌥⌘L is also F041's Layers panel key command (FeatLayers/LayersPanel.swift, scope .document). The shell builds both UIKeyCommands, and F013's (order 406) shadows the Layers shortcut everywhere on the canvas.",
+      "fix": "Give Unlock Selection a free chord, e.g. ⇧⌘L (KeyShortcut(\"l\", [.command, .shift])), in both the key command and the Unlock menu entry's display shortcut."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatObjectMenu/ObjectCommands.swift:595 (ItemSetLocked.run ctx.mutate)",
+      "problem": "Unlocking is recorded in undo history and the undo button title as \"Lock\", because mutate falls back to the descriptor title.",
+      "fix": "Pass a label: `ctx.mutate(p.locked ? \"Lock\" : \"Unlock\") { … }` (String(localized:) if labels are user-visible)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatObjectMenu/ObjectMenuView.swift:330-352 (pickCustom/recolor) and PageLongPressMenu.swift:588-593 (colorPickerViewController didSelect continuously)",
+      "problem": "The custom colour picker runs a full item.recolor, with a commit, a renderer invalidation and a menu rebuild, on every drag tick. All ticks share one undo group, so one undo entry accumulates tick count × selection size mutations. That is heavy for a large ink selection.",
+      "fix": "Coalesce continuous picks. Apply at most one recolor per ~100 ms (store the pending colour and flush it from one scheduled MainActor Task), and always apply the final value, i.e. when `continuously == false` in the UIKit delegate or when the popover closes. Keep the same group."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatObjectMenu/ObjectCommands.swift:111-171 (DeletePlan.make) and :327-338 (ArrangePlanner.withAttached)",
+      "problem": "A locked item attached to an unlocked container is deleted (item.delete) or restacked (item.arrange) along with it, although locked items are documented as left alone until unlocked. Separately, the BFS uses queue.removeFirst(), which is O(n²) when deleting thousands of selected strokes.",
+      "fix": "When collecting attached children, throw NibError(.invalidParams, \"item <id> is locked\", path: <target's path>, hint: ItemTargets.unlockHint) if any collected child is locked; or detach it (attachedTo = nil) instead of deleting or moving it. Replace queue.removeFirst() with an index cursor over the queue array."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatObjectMenu/ObjectMenuView.swift:377-389 (ObjectMenuOverlay .transition(.opacity))",
+      "problem": "DESIGN.md §10.6 and §941 say the lasso object menu buds from the selection's top edge. The capsule only fades in and out, even though the attachment already sets the ObjectMenuIDs.overlay anchor on the selection's top edge as a bud source.",
+      "fix": "Use `.budsFrom(ObjectMenuIDs.overlay, isPresented: $model.isShown)` on the capsule droplet. If the bud's modal dismiss area would block dragging the selection, file docs/contract-requests/F013-nonmodal-bud.md for a non-modal bud variant and keep the fade until NibDesign provides one."
+    }
+  ]
+}
