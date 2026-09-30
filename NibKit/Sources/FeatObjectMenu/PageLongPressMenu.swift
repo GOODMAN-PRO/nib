@@ -33,7 +33,7 @@ struct MenuShowAt: NibCommand {
     static let example: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG002", "point": [200, 300]]
 
     static let descriptor = CommandDescriptor(
-        id: "menu.showAt", title: "Show Page Menu",
+        id: CommandIDs.menuShowAt, title: "Show Page Menu",
         summary: "Open the page long-press / right-click menu at a point; returns the entries offered (handled=false when no window shows the page).",
         params: .obj(["page": .ref,
                       "point": .point,
@@ -325,7 +325,8 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         }
         let viewRect = ScreenshotSharing.viewRect(facts.bounds, page: facts.page, host: host)
         guard let target = host.session.floatingHost else {
-            // A container without a floating host (it predates contracts-v2): the system edit menu, once per selection.
+            // A window without a floating host (the document chrome, F017, sets one; without it none is there): the
+            // system edit menu, once per selection.
             dismissFloating()
             if contentChanged, editMenuShownFor != host.session.selection {
                 editMenuShownFor = host.session.selection

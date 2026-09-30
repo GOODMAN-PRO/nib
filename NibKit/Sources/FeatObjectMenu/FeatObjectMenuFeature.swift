@@ -26,7 +26,7 @@ public enum FeatObjectMenuFeature: NibFeature {
         for key in ObjectMenuEntries.keyCommands(owner: id) { app.content.keyCommands.register(key) }
         // Last in the long-press chain: links, comments and the rest get their chance first.
         app.content.tapHandlers.register(TapHandlerDescriptor(
-            id: ObjectMenuIDs.longPressHandler, owner: id, gesture: .longPress, command: MenuShowAt.descriptor.id,
+            id: ObjectMenuIDs.longPressHandler, owner: id, gesture: .longPress, command: CommandIDs.menuShowAt,
             order: 900, worksInReadOnly: true))
         app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(id: ObjectMenuIDs.attachment, owner: id, order: 950) { _ in
             ObjectMenuAttachment()
@@ -278,7 +278,7 @@ enum ObjectMenuEntries {
               quick: true, destructive: true, shortcut: KeyShortcut("delete"),
               params: { f, _ in ["refs": f.refs(f.items)] }, visible: { f, _ in f.isEditable })
         // The Delete slot turns into the lock when the selection holds locked items (tap to unlock).
-        entry(ObjectMenuIDs.unlock, String(localized: "Unlock"), .lock, order: 40, command: ItemSetLocked.descriptor.id,
+        entry(ObjectMenuIDs.unlock, String(localized: "Unlock"), .lock, order: 40, command: CommandIDs.itemSetLocked,
               quick: true, shortcut: ObjectMenuEntries.unlockShortcut,
               params: { f, _ in ["refs": f.refs(f.locked), "locked": false] },
               visible: { f, _ in !f.readOnly && f.anyLocked })
@@ -297,15 +297,15 @@ enum ObjectMenuEntries {
             let to = step.0
             // Only the first carries the glyph: the submenu shows it, the rows inside stay text.
             entry(ObjectMenuIDs.arrange(to), step.1, i == 0 ? NibSymbol.arrange : nil, order: 800 + i,
-                  command: ItemArrange.descriptor.id, submenu: arrange, shortcut: step.2,
+                  command: CommandIDs.itemArrange, submenu: arrange, shortcut: step.2,
                   params: { f, _ in ["refs": f.refs(f.items), "to": .string(to.rawValue)] }, visible: { f, _ in f.isEditable })
         }
-        entry(ObjectMenuIDs.lock, String(localized: "Lock"), .lock, order: 850, command: ItemSetLocked.descriptor.id,
+        entry(ObjectMenuIDs.lock, String(localized: "Lock"), .lock, order: 850, command: CommandIDs.itemSetLocked,
               shortcut: KeyShortcut("l", [.command]),
               params: { f, _ in ["refs": f.refs(f.lockable), "locked": true] },
               visible: { f, _ in !f.readOnly && !f.lockable.isEmpty })
         entry(ObjectMenuIDs.screenshot, String(localized: "Take Screenshot"), .screenshot, order: 860,
-              command: SelectionScreenshot.descriptor.id,
+              command: CommandIDs.selectionScreenshot,
               params: { f, _ in
                   ["page": .string(NodeRef.page(f.doc, f.page).description),
                    "rect": .array([.number(f.bounds.x), .number(f.bounds.y), .number(f.bounds.width), .number(f.bounds.height)])]
@@ -367,16 +367,16 @@ enum ObjectMenuEntries {
             key("delete", String(localized: "Delete Selection"), KeyShortcut("delete"), CommandIDs.itemDelete, [:],
                 order: 400),
             key("front", String(localized: "Bring to Front"), KeyShortcut("]", [.command, .option, .shift]),
-                ItemArrange.descriptor.id, ["to": "front"], order: 401),
+                CommandIDs.itemArrange, ["to": "front"], order: 401),
             key("forward", String(localized: "Bring Forward"), KeyShortcut("]", [.command, .option]),
-                ItemArrange.descriptor.id, ["to": "forward"], order: 402),
+                CommandIDs.itemArrange, ["to": "forward"], order: 402),
             key("backward", String(localized: "Send Backward"), KeyShortcut("[", [.command, .option]),
-                ItemArrange.descriptor.id, ["to": "backward"], order: 403),
+                CommandIDs.itemArrange, ["to": "backward"], order: 403),
             key("back", String(localized: "Send to Back"), KeyShortcut("[", [.command, .option, .shift]),
-                ItemArrange.descriptor.id, ["to": "back"], order: 404),
-            key("lock", String(localized: "Lock Selection"), KeyShortcut("l", [.command]), ItemSetLocked.descriptor.id,
+                CommandIDs.itemArrange, ["to": "back"], order: 404),
+            key("lock", String(localized: "Lock Selection"), KeyShortcut("l", [.command]), CommandIDs.itemSetLocked,
                 ["locked": true], order: 405),
-            key("unlock", String(localized: "Unlock Selection"), unlockShortcut, ItemSetLocked.descriptor.id,
+            key("unlock", String(localized: "Unlock Selection"), unlockShortcut, CommandIDs.itemSetLocked,
                 ["locked": false], order: 406)
         ]
     }

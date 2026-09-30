@@ -197,7 +197,7 @@ struct ItemDelete: NibCommand {
     ]
 
     static let descriptor = CommandDescriptor(
-        id: "item.delete", title: "Delete",
+        id: CommandIDs.itemDelete, title: "Delete",
         summary: "Delete items; attached contents go too, connectors to them are detached (or deleted when both ends go).",
         params: .obj(["refs": .arr(.ref, "item refs, e.g. item:D/P/I (any pages; locked items are refused)")],
                      required: ["refs"]),
@@ -362,7 +362,7 @@ struct ItemArrange: NibCommand {
     static let exampleBack: JSONValue = ["refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTUREIMG01"], "to": "back"]
 
     static let descriptor = CommandDescriptor(
-        id: "item.arrange", title: "Arrange",
+        id: CommandIDs.itemArrange, title: "Arrange",
         summary: "Bring items to front / send to back, or step them forward / backward past the nearest overlapping item.",
         params: .obj(["refs": .arr(.ref, "item refs, e.g. item:D/P/I"),
                       "to": .str("front | back | forward | backward", choices: ArrangeOrder.allCases.map { $0.rawValue })],
@@ -512,7 +512,7 @@ struct ItemRecolor: NibCommand {
     static let exampleBoard: JSONValue = ["refs": ["item:FIXTUREDOC04/FIXTUREBRD01/FIXTUREBSH01"], "color": "#D9432BFF"]
 
     static let descriptor = CommandDescriptor(
-        id: "item.recolor", title: "Colour",
+        id: CommandIDs.itemRecolor, title: "Colour",
         summary: "Recolour ink, shapes (outline and fill), text boxes, sticky notes and maths; images and comments are skipped.",
         params: .obj(["refs": .arr(.ref, "item refs, e.g. item:D/P/I"), "color": .color], required: ["refs", "color"]),
         examples: [example, exampleBoard],
@@ -586,7 +586,7 @@ struct ItemSetLocked: NibCommand {
     static let exampleUnlock: JSONValue = ["refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"], "locked": false]
 
     static let descriptor = CommandDescriptor(
-        id: "item.setLocked", title: "Lock",
+        id: CommandIDs.itemSetLocked, title: "Lock",
         summary: "Lock or unlock images, text boxes, shapes and sticky notes (locked items cannot be moved, erased or edited).",
         params: .obj(["refs": .arr(.ref, "item refs, e.g. item:D/P/I"),
                       "locked": .bool("true locks, false unlocks")], required: ["refs", "locked"]),

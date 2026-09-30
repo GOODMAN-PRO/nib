@@ -34,7 +34,7 @@ struct SelectionScreenshot: NibCommand {
     static let examplePDF: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG003", "rect": [0, 0, 300, 150], "scale": 3]
 
     static let descriptor = CommandDescriptor(
-        id: "selection.screenshot", title: "Take Screenshot",
+        id: CommandIDs.selectionScreenshot, title: "Take Screenshot",
         summary: "Render a page region (PDF and background included) to a temporary PNG of rect × scale pixels for sharing or pasting.",
         params: .obj(["page": .ref,
                       "rect": .rect,
@@ -286,13 +286,13 @@ final class ScreenshotTool: CanvasTool {
         let view = host.canvasView
         pending = Task { @MainActor [weak self] in
             do {
-                let r = try await app.bus.execute(SelectionScreenshot.descriptor.id, params, session: session)
+                let r = try await app.bus.execute(CommandIDs.selectionScreenshot, params, session: session)
                 if let asset = r["asset"]?.stringValue {
                     ScreenshotSharing.share(asset, app: app, from: view, sourceRect: source)
                 }
             } catch {
                 NotificationCenter.default.post(name: .nibCommandFailed, object: app,
-                                                userInfo: ["command": SelectionScreenshot.descriptor.id,
+                                                userInfo: ["command": CommandIDs.selectionScreenshot,
                                                            "error": NibError.wrap(error)])
             }
             // Back to the tool the page menu interrupted, unless the user already switched.

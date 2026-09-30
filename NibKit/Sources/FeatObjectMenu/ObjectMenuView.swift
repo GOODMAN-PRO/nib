@@ -724,9 +724,10 @@ final class StylePanelModel: ObservableObject {
     private var selectionWatch: AnyCancellable?
     private var commits: EventSubscription?
 
+    /// The Style panel's model: `PanelContext.params` is one flat object (spec pass 2: `panel.open {id, inspector}` and
+    /// `{id, params: {inspector}}` both arrive as `{inspector}`).
     convenience init(context: PanelContext) {
-        self.init(app: context.app, session: context.session,
-                  preferred: context.params["inspector"]?.stringValue ?? context.params["params"]?["inspector"]?.stringValue)
+        self.init(app: context.app, session: context.session, preferred: context.params["inspector"]?.stringValue)
     }
 
     init(app: NibApp, session: EditorSession?, preferred: String?) {

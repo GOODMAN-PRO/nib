@@ -110,6 +110,40 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertEqual(h.app.commands.descriptor("item.delete")?.destructive, true)
         XCTAssertEqual(h.app.commands.descriptor("selection.screenshot")?.effect, .read)
         XCTAssertEqual(h.app.commands.descriptor("menu.showAt")?.effect, .session)
+        // contracts-v2.1: every id is the catalogue constant.
+        XCTAssertEqual([ItemDelete.descriptor.id, ItemArrange.descriptor.id, ItemRecolor.descriptor.id,
+                        ItemSetLocked.descriptor.id, SelectionScreenshot.descriptor.id, MenuShowAt.descriptor.id],
+                       [CommandIDs.itemDelete, CommandIDs.itemArrange, CommandIDs.itemRecolor, CommandIDs.itemSetLocked,
+                        CommandIDs.selectionScreenshot, CommandIDs.menuShowAt])
+    }
+
+    /// contracts-v2.2 key routing as the shell applies it: the object keys are live on a notebook or whiteboard canvas,
+    /// stand back while text is edited, never reach text documents, study sets or the library, and win their shortcuts.
+    func testKeysAreLiveOnlyOnTheCanvasOfNotebooksAndWhiteboards() {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let all = h.app.content.keyCommands.all
+        let mine = Set(all.filter { $0.owner == FeatObjectMenuFeature.id }.map { $0.id })
+        XCTAssertEqual(mine.count, 7)
+        for kind in [DocumentKind.notebook, .whiteboard] {
+            let live = Set(KeyCommandRouting.active(all, in: KeyCommandContext(docKind: kind)).map { $0.id })
+            XCTAssertTrue(mine.isSubset(of: live), "\(kind)")
+            XCTAssertTrue(KeyCommandRouting.active(all, in: KeyCommandContext(docKind: kind, isEditingText: true))
+                .allSatisfy { $0.owner != FeatObjectMenuFeature.id }, "\(kind) while editing text")
+        }
+        for kind in DocumentKind.allCases where kind != .notebook && kind != .whiteboard {
+            XCTAssertTrue(KeyCommandRouting.active(all, in: KeyCommandContext(docKind: kind))
+                .allSatisfy { $0.owner != FeatObjectMenuFeature.id }, "\(kind)")
+        }
+        XCTAssertTrue(KeyCommandRouting.active(all, in: KeyCommandContext(docKind: nil, hasTabs: true))
+            .allSatisfy { $0.owner != FeatObjectMenuFeature.id })
+        // A key any document kind could use loses ⌫ to the canvas-scoped Delete Selection.
+        let rival = KeyCommandDescriptor(id: "test.anyKindDelete", title: "Rival", shortcut: KeyShortcut("delete"),
+                                         command: CommandIDs.itemDelete, params: [:], scope: .document, order: 0,
+                                         owner: "test")
+        let delete = all.first { $0.owner == FeatObjectMenuFeature.id && $0.shortcut == KeyShortcut("delete") }
+        XCTAssertNotNil(delete)
+        XCTAssertEqual(KeyCommandRouting.active(all + [rival], in: KeyCommandContext(docKind: .notebook))
+            .first { $0.shortcut == KeyShortcut("delete") }?.id, delete?.id)
     }
 
     func testKeysLongPressToolPanelAndAttachmentAreRegistered() {
@@ -565,6 +599,29 @@ final class FeatObjectMenuTests: XCTestCase {
                        ["test.box", "test.text"])
         XCTAssertEqual(InspectorMatcher.items(for: try XCTUnwrap(h.app.ui.inspectors.get("test.text")), in: items).map { $0.id },
                        [Fixtures.textID])
+    }
+
+    /// The Style panel reads the inspector from `PanelContext.params`, which spec pass 2 pins as one flat object: the
+    /// Style entry's `panel.open {id, inspector}` arrives as `{inspector}`.
+    func testStylePanelReadsTheInspectorFromFlatPanelParams() throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        for (id, order) in [("test.text", 1), ("test.box", 2)] {
+            h.app.ui.inspectors.register(InspectorDescriptor(id: id, title: id, icon: "square", itemKinds: [.text],
+                                                             order: order, owner: "test") { _ in AnyView(EmptyView()) })
+        }
+        select(h, [Fixtures.textID])
+        var context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+        context.params = ["inspector": "test.box"]
+        let named = StylePanelModel(context: context)
+        XCTAssertEqual(named.inspector?.id, "test.box")
+        XCTAssertEqual(named.choices.map { $0.id }, ["test.text", "test.box"])
+        context.params = [:]
+        XCTAssertEqual(StylePanelModel(context: context).inspector?.id, "test.text")
+        // The entry's params are exactly what panel.open flattens into the panel's params (plus the panel id).
+        let entry = try XCTUnwrap(h.app.ui.menus.get(ObjectMenuIDs.style)?.params(self.context(h)))
+        XCTAssertEqual(entry["id"], .string(ObjectMenuIDs.stylePanel))
+        XCTAssertEqual(entry["inspector"], "test.text")
+        _ = try XCTUnwrap(h.app.ui.panels.get(ObjectMenuIDs.stylePanel)).makeView(context)
     }
 
     func testMenusHideEntriesWhoseIsVisibleIsFalse() async {
