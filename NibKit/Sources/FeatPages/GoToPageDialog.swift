@@ -6,16 +6,16 @@ import NibDesign
 
 // The page sheets: Go to Page (⌥⌘G, More › Go to Page…), Move Pages (Move to Another Notebook…) and Add Page ›
 // Import… (the system document picker). All are opened with panel.open, act through commands, and are opaque sheets:
-// no droplets on sheets (DESIGN.md §2.4, §10.15).
+// no droplets on sheets (DESIGN.md §2.4, §10.15). What a sheet acts on arrives as `PanelContext.params`.
 
 @MainActor
 enum PageDialogs {
     static let goToPageID = "pages.goToPage"
+    /// `panel.open {id: "pages.movePages", pages?: ["page:D/P", …]}`: moves exactly those pages (default: the open page).
     static let movePagesID = "pages.movePages"
-    static let importPositions: [PagePosition] = [.before, .after, .end]
-
-    /// One picker sheet per Add Page position.
-    static func importID(_ position: PagePosition) -> String { "pages.import." + position.rawValue }
+    /// `panel.open {id: "pages.import", doc?, position?, anchor?}`: where the picked files go (default: the open
+    /// document, at the Add Page position relative to the open page).
+    static let importID = "pages.import"
 
     static func register(_ app: NibApp) {
         app.ui.panels.register(PanelDescriptor(
@@ -28,13 +28,11 @@ enum PageDialogs {
             order: 901, owner: FeatPagesFeature.id, docKinds: [.notebook, .whiteboard]) { context in
                 AnyView(MovePagesSheet(context: context))
             })
-        for (i, position) in importPositions.enumerated() {
-            app.ui.panels.register(PanelDescriptor(
-                id: importID(position), title: String(localized: "Import"), icon: NibSymbol.importFile.name,
-                placement: .sheet, order: 902 + i, owner: FeatPagesFeature.id, docKinds: [.notebook]) { context in
-                    AnyView(ImportPagesSheet(context: context, position: position))
-                })
-        }
+        app.ui.panels.register(PanelDescriptor(
+            id: importID, title: String(localized: "Import"), icon: NibSymbol.importFile.name,
+            placement: .sheet, order: 902, owner: FeatPagesFeature.id, docKinds: [.notebook]) { context in
+                AnyView(ImportPagesSheet(context: context))
+            })
     }
 }
 
@@ -169,11 +167,47 @@ struct GoToPageDialog: View {
 
 // MARK: - Move Pages
 
+/// The pages the Move Pages sheet moves.
+enum MovePagesSelection {
+    /// `PanelContext.params["pages"]` (page refs; a bare page id is read in the open document; `{params: {pages}}` is
+    /// read too), exactly those and in that order. Without the key, the open page. Unusable entries are left out, so
+    /// a selection that names nothing movable moves nothing (it never falls back to the open page).
+    static func refs(_ params: JSONValue, openDoc: DocumentID?, openPage: PageID?) -> [String] {
+        guard let given = params["pages"] ?? params["params"]?["pages"] else {
+            guard let openDoc, let openPage else { return [] }
+            return [NodeRef.page(openDoc, openPage).description]
+        }
+        let list = given.arrayValue ?? [given]
+        var out: [String] = []
+        for value in list {
+            guard let text = value.stringValue else { continue }
+            let ref: String
+            if case let .page(d, p)? = NodeRef(text) {
+                ref = NodeRef.page(d, p).description
+            } else if let openDoc, NibID.isValid(text) {
+                ref = NodeRef.page(openDoc, NibID(text)).description
+            } else {
+                continue
+            }
+            if !out.contains(ref) { out.append(ref) }
+        }
+        return out
+    }
+
+    /// The documents the pages are in (never offered as the destination).
+    static func documents(_ refs: [String]) -> Set<DocumentID> {
+        Set(refs.compactMap { ref -> DocumentID? in
+            guard case let .page(d, _)? = NodeRef(ref) else { return nil }
+            return d
+        })
+    }
+}
+
 /// The documents pages can move to: other notebooks and whiteboards, most recently changed first.
 enum MovePagesTargets {
-    static func candidates(_ nodes: [LibraryNode], excluding doc: DocumentID?) -> [LibraryNode] {
+    static func candidates(_ nodes: [LibraryNode], excluding docs: Set<DocumentID>) -> [LibraryNode] {
         nodes.filter { node in
-            node.kind == .document && node.id != doc && node.trashedAt == nil
+            node.kind == .document && !docs.contains(node.id) && node.trashedAt == nil
                 && (node.documentKind == .notebook || node.documentKind == .whiteboard)
         }
         .sorted { $0.modified > $1.modified }
@@ -186,9 +220,9 @@ enum MovePagesTargets {
     }
 }
 
-/// Move Pages (D-056): pick the notebook; the open page lands at its end in one undoable step (page.moveTo).
-/// ponytail: the open page only, because panel.open carries just the panel id; moving a sidebar selection through this
-/// sheet needs panel.open params in PanelContext (a contract request).
+/// Move Pages (D-056): pick the notebook; the pages land at its end in one undoable step (page.moveTo), which one undo
+/// in either document takes back. The pages come from `PanelContext.params["pages"]` (the page sidebar's selection,
+/// More › This Page), else the open page.
 @MainActor
 struct MovePagesSheet: View {
     let context: PanelContext
@@ -198,13 +232,11 @@ struct MovePagesSheet: View {
 
     init(context: PanelContext) {
         self.context = context
-        let doc = context.session?.document
-        if let doc, let page = context.session?.page {
-            pages = [NodeRef.page(doc, page).description]
-        } else {
-            pages = []
-        }
-        candidates = MovePagesTargets.candidates(context.app.services.library?.allNodes() ?? [], excluding: doc)
+        let open = context.session?.document
+        pages = MovePagesSelection.refs(context.params, openDoc: open, openPage: context.session?.page)
+        var sources = MovePagesSelection.documents(pages)
+        if sources.isEmpty, let open { sources.insert(open) }
+        candidates = MovePagesTargets.candidates(context.app.services.library?.allNodes() ?? [], excluding: sources)
     }
 
     var body: some View {
@@ -212,8 +244,8 @@ struct MovePagesSheet: View {
         VStack(spacing: 0) {
             NibSheetHeader(title, onCancel: { context.dismiss() })
             if pages.isEmpty {
-                NibEmptyState(symbol: .pages, title: String(localized: "No page open"),
-                              message: String(localized: "Open a page, then choose Move to Another Notebook."))
+                NibEmptyState(symbol: .pages, title: String(localized: "No pages to move"),
+                              message: String(localized: "Open a page or select pages in the sidebar, then choose Move to Another Notebook."))
                 Spacer(minLength: 0)
             } else if candidates.isEmpty {
                 NibEmptyState(symbol: .notebook, title: String(localized: "No other notebooks"),
@@ -283,19 +315,21 @@ struct MovePagesSheet: View {
 
 // MARK: - Import (Add Page › Import…)
 
-/// Add Page › Import… (D-091): the system document picker; the chosen files go into the open notebook before or after
-/// the open page, or at its end, through import.files (F064).
+/// Add Page › Import… (D-091): the system document picker; the chosen files go into the notebook at the place the menu
+/// passed in `PanelContext.params` {doc, position, anchor?} (before or after the page it was opened on, or at the
+/// end), through import.files (F064).
 @MainActor
 struct ImportPagesSheet: View {
     static let types: [UTType] = [.pdf, .image, .presentation, .compositeContent]
 
     let context: PanelContext
-    let position: PagePosition
 
     var body: some View {
         PagesDocumentPicker(types: ImportPagesSheet.types, onPick: { urls in
-            if let doc = context.session?.document, !urls.isEmpty {
-                let plan = AddPagePlan(position: position, doc: doc, page: context.session?.page)
+            let plan = AddPagePlan(params: context.params, openDoc: context.session?.document,
+                                   openPage: context.session?.page,
+                                   fallback: AddPagePosition.current(context.app.settings))
+            if let plan, !urls.isEmpty {
                 context.app.perform(CommandIDs.importFiles, plan.importFiles(urls), session: context.session)
             }
             context.dismiss()

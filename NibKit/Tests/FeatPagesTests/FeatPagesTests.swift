@@ -26,31 +26,73 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertEqual(key?.shortcut, KeyShortcut("g", [.command, .option]))
         XCTAssertEqual(key?.params["id"]?.stringValue, PageDialogs.goToPageID)
         XCTAssertNotNil(h.app.ui.panels.get(PageDialogs.goToPageID))
-        for position in PageDialogs.importPositions { XCTAssertNotNil(h.app.ui.panels.get(PageDialogs.importID(position))) }
+        XCTAssertNotNil(h.app.ui.panels.get(PageDialogs.movePagesID))
+        XCTAssertNotNil(h.app.ui.panels.get(PageDialogs.importID))
+        XCTAssertNotNil(h.app.settings.descriptor(AddPagePosition.key.name), "the Add Page position is a declared setting")
     }
 
-    func testAddPageMenuRunsPageAddAtTheChosenPlace() async throws {
+    func testAddPageMenuTicksOnePositionAndAddsPagesThere() async throws {
         PageClipboard.clear()
         let h = Harness(features: [FeatPagesFeature.self])
         let ctx = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page2)
         let items = h.app.ui.menuItems(.addPage, ctx)
-        XCTAssertEqual(items.count, 9, "3 places × current, choose, import; paste hides while the clipboard is empty")
-        XCTAssertEqual(Set(items.compactMap { $0.submenu }).count, 3)
+        XCTAssertEqual(items.map { $0.id }, ["pages.add.position.before", "pages.add.position.after", "pages.add.position.end",
+                                             "pages.add.current", "pages.add.choose", "pages.add.import"],
+                       "paste hides while the page clipboard is empty")
+        let ticked = { h.app.ui.menuItems(.addPage, ctx).filter { $0.isChecked?(ctx) == true }.map { $0.id } }
+        XCTAssertEqual(ticked(), ["pages.add.position.after"], "after this page until the person picks another place")
 
-        let before = try XCTUnwrap(items.first { $0.id == "pages.add.before.current" })
+        // Ticking Before is a settings.set, so plugins, the AI and the bridge can pick the place too.
+        let before = try XCTUnwrap(items.first { $0.id == "pages.add.position.before" })
+        XCTAssertEqual(before.command, CommandIDs.settingsSet)
         try await h.run(before.command, before.params(ctx))
+        XCTAssertEqual(AddPagePosition.current(h.app.settings), .before)
+        XCTAssertEqual(ticked(), ["pages.add.position.before"])
+
+        let current = try XCTUnwrap(items.first { $0.id == "pages.add.current" })
+        XCTAssertEqual(current.params(ctx)["position"]?.stringValue, "before")
+        try await h.run(current.command, current.params(ctx))
         let live = try h.app.workspace.content(Fixtures.docID).livePages.map { $0.id }
         XCTAssertEqual(live.count, 4)
         XCTAssertEqual(live[2], Fixtures.page2, "the new page sits right before the page the menu was opened on")
 
-        let importEnd = try XCTUnwrap(items.first { $0.id == "pages.add.end.import" })
-        XCTAssertEqual(importEnd.params(ctx)["id"]?.stringValue, PageDialogs.importID(.end))
+        // Import opens one sheet and hands it the place as panel params.
+        try await h.run(CommandIDs.settingsSet, ["name": .string(AddPagePosition.key.name), "value": "end"])
+        let importEntry = try XCTUnwrap(items.first { $0.id == "pages.add.import" })
+        let open = importEntry.params(ctx)
+        XCTAssertEqual(open["id"]?.stringValue, PageDialogs.importID)
+        XCTAssertEqual(open["doc"]?.stringValue, "doc:FIXTUREDOC01")
+        XCTAssertEqual(open["position"]?.stringValue, "end")
+        XCTAssertNil(open["anchor"], "the end needs no anchor")
+        do {
+            try await h.run(CommandIDs.settingsSet, ["name": .string(AddPagePosition.key.name), "value": "sideways"])
+            XCTFail("only before, after and end are places")
+        } catch is NibError {}
+        XCTAssertEqual(AddPagePosition.current(h.app.settings), .end)
 
         let board = MenuContext(app: h.app, session: h.session, doc: Fixtures.whiteboardID)
         XCTAssertTrue(h.app.ui.menuItems(.addPage, board).isEmpty, "whiteboards add boards, not pages")
 
         try await h.run("page.copy", ["pages": ["page:FIXTUREDOC01/FIXTUREPG001"]])
-        XCTAssertEqual(h.app.ui.menuItems(.addPage, ctx).count, 12)
+        XCTAssertEqual(h.app.ui.menuItems(.addPage, ctx).last?.id, "pages.add.paste")
+    }
+
+    func testImportSheetReadsItsPlaceFromThePanelParams() {
+        let url = URL(fileURLWithPath: "/tmp/Inbox/Lecture.pdf")
+        let menu = AddPagePlan(position: .before, doc: Fixtures.docID, page: Fixtures.page2)
+        guard case .object(var params) = menu.importPanel else { return XCTFail("not an object") }
+        params["id"] = nil      // panel.open hands the sheet every key but id
+        let read = AddPagePlan(params: .object(params), openDoc: Fixtures.docID, openPage: Fixtures.page1, fallback: .end)
+        XCTAssertEqual(read, menu, "the page the menu was opened on, not the open page")
+        XCTAssertEqual(read?.importFiles([url])["anchor"]?.stringValue, "page:FIXTUREDOC01/FIXTUREPG002")
+
+        // Opened without params (panel.open {id} from a plugin or the AI): the open page and the stored position.
+        let bare = AddPagePlan(params: [:], openDoc: Fixtures.docID, openPage: Fixtures.page1, fallback: .after)
+        XCTAssertEqual(bare, AddPagePlan(position: .after, doc: Fixtures.docID, page: Fixtures.page1))
+        XCTAssertNil(AddPagePlan(params: [:], openDoc: nil, openPage: nil, fallback: .after), "no notebook to import into")
+        let elsewhere = AddPagePlan(params: ["doc": "doc:OTHERDOC0001", "position": "after"], openDoc: Fixtures.docID,
+                                    openPage: Fixtures.page1, fallback: .after)
+        XCTAssertNil(elsewhere?.page, "the open page is no anchor in another notebook")
     }
 
     func testThisPageActionsActOnTheOpenPageAndTheSidebarMenusAreF023s() throws {
@@ -69,8 +111,39 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertEqual(rotate?.params(ctx)["degrees"]?.intValue, 270)
         let move = items.first { $0.id == "pages.documentMore.move" }
         XCTAssertEqual(move?.params(ctx)["id"]?.stringValue, PageDialogs.movePagesID)
+        XCTAssertEqual(move?.params(ctx)["pages"], pages, "the sheet is told which page to move")
         let board = MenuContext(app: h.app, session: h.session, doc: Fixtures.whiteboardID, page: Fixtures.boardID)
         XCTAssertFalse(h.app.ui.menuItems(.documentMore, board).contains { $0.id == "pages.documentMore.trash" })
+    }
+
+    func testMoveSheetMovesExactlyThePagesItWasOpenedWith() {
+        let h = Harness(features: [FeatPagesFeature.self])
+        // What the page sidebar (F023) passes for a selection: panel.open {id: "pages.movePages", pages: [...]}.
+        var context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
+        context.params = ["pages": ["page:FIXTUREDOC01/FIXTUREPG003", "page:FIXTUREDOC01/FIXTUREPG002"]]
+        let sheet = MovePagesSheet(context: context)
+        XCTAssertEqual(sheet.pages, ["page:FIXTUREDOC01/FIXTUREPG003", "page:FIXTUREDOC01/FIXTUREPG002"],
+                       "the selection, in its order, not the open page")
+        XCTAssertFalse(sheet.candidates.contains { $0.id == Fixtures.docID }, "never offered as its own destination")
+
+        // Without params: the open page.
+        let bare = MovePagesSheet(context: PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {}))
+        XCTAssertEqual(bare.pages, h.session.page.map { [NodeRef.page(Fixtures.docID, $0).description] } ?? [])
+
+        let open = (doc: Fixtures.docID, page: Fixtures.page2)
+        XCTAssertEqual(MovePagesSelection.refs(["pages": ["page:FIXTUREDOC01/FIXTUREPG001", "page:FIXTUREDOC01/FIXTUREPG001"]],
+                                               openDoc: open.doc, openPage: open.page),
+                       ["page:FIXTUREDOC01/FIXTUREPG001"], "each page once")
+        XCTAssertEqual(MovePagesSelection.refs(["params": ["pages": ["FIXTUREPG003"]]], openDoc: open.doc, openPage: open.page),
+                       ["page:FIXTUREDOC01/FIXTUREPG003"], "nested params and bare ids in the open document")
+        XCTAssertEqual(MovePagesSelection.refs(["pages": "page:FIXTUREDOC01/FIXTUREPG001"], openDoc: open.doc, openPage: open.page),
+                       ["page:FIXTUREDOC01/FIXTUREPG001"])
+        XCTAssertEqual(MovePagesSelection.refs(["pages": [], "id": "x"], openDoc: open.doc, openPage: open.page), [],
+                       "an empty selection moves nothing; it never falls back to the open page")
+        XCTAssertEqual(MovePagesSelection.refs(["pages": ["not a ref!", 7]], openDoc: open.doc, openPage: open.page), [])
+        XCTAssertEqual(MovePagesSelection.refs([:], openDoc: nil, openPage: nil), [])
+        XCTAssertEqual(MovePagesSelection.documents(["page:FIXTUREDOC01/FIXTUREPG001", "page:FIXTUREDOC04/FIXTUREBRD01"]),
+                       [Fixtures.docID, Fixtures.whiteboardID])
     }
 
     // MARK: Pure logic
@@ -151,12 +224,36 @@ final class FeatPagesTests: XCTestCase {
         XCTAssertTrue(PageTemplates.isCover(TemplateRef("cover.solid"), nil))
         XCTAssertFalse(PageTemplates.isCover(TemplateRef("builtin.ruled"), nil))
         XCTAssertFalse(PageTemplates.isCover(TemplateRef("x.coverless"), nil), "only the cover. prefix names a cover")
+
+        // A registered definition decides, whatever its id says.
+        let h = Harness(features: [FeatPagesFeature.self])
+        h.app.content.templates.register(TemplateDefinition(id: "test.linen", title: "Linen", category: "Covers", isCover: true,
+                                                            owner: "test") { _, _, _ in TemplateRender(paper: RGBA(0xFF, 0xFF, 0xFF)) })
+        h.app.content.templates.register(TemplateDefinition(id: "cover.notReally", title: "Paper", category: "Paper",
+                                                            owner: "test") { _, _, _ in TemplateRender(paper: RGBA(0xFF, 0xFF, 0xFF)) })
+        XCTAssertTrue(PageTemplates.isCover(TemplateRef("test.linen"), h.app.content))
+        XCTAssertFalse(PageTemplates.isCover(TemplateRef("cover.notReally"), h.app.content))
     }
 
     func testRotationWrapsAndImagePagesKeepProportions() {
         XCTAssertEqual(PageRotation.apply(90, to: 270), 0)
         XCTAssertEqual(PageRotation.apply(-90, to: 0), 270)
         XCTAssertEqual(PageRotation.apply(180, to: 90), 270)
+        XCTAssertEqual(PageRotation.turned(.a4, by: 90), PageSize(841.89, 595.28))
+        XCTAssertEqual(PageRotation.turned(.a4, by: -180), .a4)
+        // A quarter turn clockwise (y down): the top-left corner goes to the top-right, the top-right to the bottom-right.
+        let quarter = PageRotation.turn(90, size: PageSize(100, 200))
+        XCTAssertEqual(quarter.apply(Point(0, 0)), Point(200, 0))
+        XCTAssertEqual(quarter.apply(Point(100, 0)), Point(200, 100))
+        XCTAssertEqual(PageRotation.turn(270, size: PageSize(100, 200)).apply(Point(0, 0)), Point(0, 100))
+        XCTAssertEqual(PageRotation.turn(180, size: PageSize(100, 200)).apply(Point(10, 20)), Point(90, 180))
+        // The turned background fills the turned page exactly (PageRecord.backgroundTransform, contracts-v2 G22).
+        let pdf = PageRotation.turned(PageRecord(size: PageSize(100, 200), background: .ofPDF(AssetRef("a.pdf"), page: 0)), by: 90)
+        let fit = pdf.page.backgroundTransform(sourceSize: PageSize(100, 200))
+        XCTAssertEqual(fit, quarter, "no letterboxing: the turn is the whole map")
+        XCTAssertNil(PageRotation.turned(PageRecord(size: nil), by: 90).items, "an infinite board only turns its background")
+        XCTAssertEqual(PageRotation.normalized(2 * .pi), 0)
+        XCTAssertEqual(PageRotation.normalized(3 * .pi / 2), -.pi / 2, accuracy: 1e-12)
         let wide = ImagePageSize.fit(width: 4000, height: 3000)
         XCTAssertEqual(wide.width, PageSize.a4.height, accuracy: 0.001)
         XCTAssertEqual(wide.height, PageSize.a4.height * 0.75, accuracy: 0.001)
@@ -230,12 +327,12 @@ final class FeatPagesTests: XCTestCase {
             LibraryNode(id: "GONE", kind: .document, title: "Old", path: "Old", documentKind: .notebook, modified: 8, trashedAt: 3),
             LibraryNode(id: "FLDR", kind: .folder, title: "Science", path: "Science", modified: 6)
         ]
-        let targets = MovePagesTargets.candidates(nodes, excluding: "SELF")
+        let targets = MovePagesTargets.candidates(nodes, excluding: ["SELF"])
         XCTAssertEqual(targets.map { $0.id.raw }, ["NEW", "OLD"])
         XCTAssertEqual(MovePagesTargets.filter(targets, query: "science").map { $0.id.raw }, ["OLD"])
     }
 
-    func testImportParamsCarryThePlace() {
+    func testImportFilesParamsCarryThePlace() {
         let url = URL(fileURLWithPath: "/tmp/Inbox/Lecture.pdf")
         let after = AddPagePlan(position: .after, doc: Fixtures.docID, page: Fixtures.page1).importFiles([url])
         XCTAssertEqual(after["doc"]?.stringValue, "doc:FIXTUREDOC01")

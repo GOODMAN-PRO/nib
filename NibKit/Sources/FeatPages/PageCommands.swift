@@ -127,7 +127,7 @@ struct PageAdd: NibCommand {
         default:
             let paper = content.meta.defaultTemplate ?? settings.get(NibSettings.defaultPaper)
             var isCover = false
-            if let template = reference?.background.template { isCover = PageTemplates.isCover(template, ctx.services) }
+            if let template = reference?.background.template { isCover = PageTemplates.isCover(template, ctx.content) }
             let background = CurrentTemplate.background(reference: reference, defaultPaper: paper, referenceIsCover: isCover)
             specs = Array(repeating: PageSpec(background: background, size: size), count: count)
         }
@@ -141,9 +141,8 @@ struct PageAdd: NibCommand {
         for (i, spec) in specs.enumerated() {
             records.append(PageRecord(id: ids[i] ?? NibID.make(), order: keys[i], size: spec.size, background: spec.background))
         }
-        try ctx.mutate { tx in
-            for r in records { try tx.put(r, doc: doc) }
-        }
+        // One batch write: a long PDF added page by page does not re-sort the page list once per page.
+        try ctx.mutate { tx in try tx.put(records, doc: doc) }
         let refs = records.map { NodeRef.page(doc, $0.id).description }
         await PageNavigation.reveal(refs.first, doc: doc, ctx)
         return Output(ref: refs[0], refs: refs)
@@ -374,7 +373,7 @@ struct PageMoveTo: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "page.moveTo", title: "Move Pages",
-        summary: "Move pages with their items, images and outline entries to the end of another notebook or whiteboard as one undo group (undo it in both documents). Returns the new page refs.",
+        summary: "Move pages with their items, images and outline entries to the end of another notebook or whiteboard; one undo in either document restores both. Returns the new page refs.",
         params: .obj(["pages": PageCommands.pagesSchema, "doc": .ref, "ids": PageCommands.idsSchema], required: ["pages", "doc"]),
         examples: [PageMoveTo.example], effect: .edit)
 
@@ -404,6 +403,8 @@ struct PageMoveTo: NibCommand {
             plan = try MovePlan(sources, to: target, ids: chosen, ctx)
         }
         let defaultSize = ctx.services.settings.get(NibSettings.defaultPageSize)
+        // Across documents the move is ONE undo step: undoing it in either document restores both (contracts-v2 G4).
+        if !plan.movedIDs.isEmpty, !ctx.dryRun { ctx.linkUndoAcrossDocuments() }
         try ctx.mutate { tx in
             for (i, m) in plan.moving.enumerated() {
                 if m.doc == target {
@@ -417,7 +418,8 @@ struct PageMoveTo: NibCommand {
                 let items = ItemCloner.clone(AssetRefs.rewriting(original, map.names), freshIDs: m.freshItems)
                 let page = PageFactory.fitted(PageFactory.copy(of: AssetRefs.rewriting(m.page, map), id: m.newID, order: plan.keys[i]),
                                               to: plan.targetKind, defaultSize: defaultSize)
-                try PageWriter.insert([(page, items)], doc: target, tx: tx)
+                try PageWriter.insert([(page, items)], doc: target,
+                                      movedFrom: m.freshItems ? nil : (doc: m.doc, page: m.page.id), tx: tx)
                 try PageWriter.remove(m.page, items: original, doc: m.doc, trashedAt: nil, tx: tx)
             }
             for (doc, moved) in plan.movedIDs {
@@ -581,7 +583,7 @@ struct PageRotate: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "page.rotate", title: "Rotate Pages",
-        summary: "Rotate pages 90° clockwise, or by degrees (180, 270, -90); all: doc ref rotates every page of that document.",
+        summary: "Rotate pages 90° clockwise, or by degrees (180, 270, -90): the page turns with its items and PDF or image background; all: doc ref rotates every page.",
         params: .obj([
             "pages": PageCommands.pagesSchema,
             "all": .anything("doc:D (or true for the open document): rotate every page instead of pages"),
@@ -613,12 +615,16 @@ struct PageRotate: NibCommand {
         var records: [(doc: DocumentID, page: PageRecord)] = []
         for (i, t) in targets.enumerated() {
             let content = try PageArgs.pagedContent(t.doc, ctx, path: "$.pages[\(i)]")
-            var page = try PageArgs.livePage(t.page, in: content, path: "$.pages[\(i)]")
-            page.rotation = PageRotation.apply(degrees, to: page.rotation)
-            records.append((t.doc, page))
+            records.append((t.doc, try PageArgs.livePage(t.page, in: content, path: "$.pages[\(i)]")))
         }
         try ctx.mutate { tx in
-            for r in records { try tx.put(r.page, doc: r.doc) }
+            for r in records {
+                let turned = PageRotation.turned(r.page, by: degrees)
+                try tx.put(turned.page, doc: r.doc)
+                guard let map = turned.items else { continue }
+                let items = try tx.items(r.doc, page: r.page.id).filter { !$0.deleted }
+                try tx.put(items.map { PageRotation.turn($0, by: map) }, doc: r.doc, page: r.page.id)
+            }
         }
         return Output(rotated: records.count)
     }
@@ -859,14 +865,10 @@ enum PageArgs {
 
 @MainActor
 enum PageTemplates {
-    /// This app's template registry, left in its services by `FeatPagesFeature.register` (not the process-wide
-    /// `NibApp.shared`, which another app in the same process may own).
-    static let registryKey = "pages.templates"
-
-    /// Covers never repeat as "current template". ponytail: without a registered definition the "cover." id prefix
-    /// (NibTemplates' naming) decides.
-    static func isCover(_ ref: TemplateRef, _ services: NibServices?) -> Bool {
-        if let definition = services?.get(registryKey, as: ContentRegistries.self)?.template(ref) { return definition.isCover }
+    /// Covers never repeat as "current template". The app's template registry (`ctx.content`) decides; without a
+    /// registered definition the "cover." id prefix (NibTemplates' naming) does.
+    static func isCover(_ ref: TemplateRef, _ content: ContentRegistries?) -> Bool {
+        if let definition = content?.template(ref) { return definition.isCover }
         return ref.id.hasPrefix("cover.")
     }
 }
@@ -948,8 +950,15 @@ enum PagePasting {
         guard !payload.pages.isEmpty else { throw PageClipboard.emptyError }
         let chosen = try NewPageIDs.parse(id: id, ids: ids, count: payload.pages.count)
         try NewPageIDs.checkUnused(chosen, in: ctx.workspace.content(doc))
+        let intoSource = payload.source == NodeRef.document(doc).description
+        // Back in its own document a page keeps its references; anywhere else its PDF page must travel with it.
+        if !intoSource, let gap = payload.missingPDFPages.first {
+            throw NibError(.invalidParams,
+                           "page \(gap.page.raw) shows PDF page \(gap.pdfPage) of \(gap.asset), which the payload's assets do not carry",
+                           hint: "list every PDF page the pages show in that asset's pdfPages, or include the whole PDF")
+        }
         var map = AssetMap()
-        if !ctx.dryRun, !payload.assets.isEmpty, payload.source != NodeRef.document(doc).description {
+        if !ctx.dryRun, !payload.assets.isEmpty, !intoSource {
             let store = try ctx.services.require(ctx.services.assets, "the asset store")
             let assets = payload.assets
             let pdfUse = payload.pdfUse
@@ -976,11 +985,20 @@ enum PagePasting {
 
 @MainActor
 enum PageWriter {
-    /// Writes new page records and then their items (an item needs its page to exist).
-    static func insert(_ plan: [(PageRecord, [Item])], doc: DocumentID, tx: DocTransaction) throws {
+    /// Writes new page records and then their items (an item needs its page to exist). `movedFrom`: the page the
+    /// items (under the same ids) are moving from; they keep the provenance stored there (contracts-v2 G5), so the AI
+    /// or a plugin moving the user's handwriting leaves it the user's. Copies are new records of the caller.
+    static func insert(_ plan: [(PageRecord, [Item])], doc: DocumentID, movedFrom: (doc: DocumentID, page: PageID)? = nil,
+                       tx: DocTransaction) throws {
         for (page, items) in plan {
             try tx.put(page, doc: doc)
-            for item in items { try tx.put(item, doc: doc, page: page.id) }
+            for item in items {
+                if let source = movedFrom {
+                    try tx.put(item, doc: doc, page: page.id, keepingProvenanceFrom: source.page, in: source.doc)
+                } else {
+                    try tx.put(item, doc: doc, page: page.id)
+                }
+            }
         }
     }
 
@@ -1173,6 +1191,49 @@ enum PageRotation {
     /// 0, 90, 180 or 270 after turning `degrees` clockwise.
     static func apply(_ degrees: Int, to rotation: Int) -> Int {
         ((rotation + degrees) % 360 + 360) % 360
+    }
+
+    /// `page` turned `degrees` clockwise with its content. `PageRecord.rotation` only turns a PDF or image background
+    /// (contracts-v2 G22), so the page itself swaps sides on a quarter turn and `items` is the map its items take (page
+    /// points, y down; the turned page's top-left stays the origin). The background turns with `rotation` and, fitted
+    /// into the turned size, still fills the page. An infinite board (no size) has no corner to turn about: only its
+    /// background turns (`items` nil).
+    static func turned(_ page: PageRecord, by degrees: Int) -> (page: PageRecord, items: Affine?) {
+        var out = page
+        out.rotation = apply(degrees, to: page.rotation)
+        guard let size = page.size else { return (out, nil) }
+        out.size = turned(size, by: degrees)
+        return (out, turn(degrees, size: size))
+    }
+
+    static func turned(_ size: PageSize, by degrees: Int) -> PageSize {
+        apply(degrees, to: 0) % 180 == 0 ? size : PageSize(size.height, size.width)
+    }
+
+    /// Page points of a `size` page → page points of the page turned `degrees` clockwise.
+    static func turn(_ degrees: Int, size: PageSize) -> Affine {
+        switch apply(degrees, to: 0) {
+        case 90: return Affine(a: 0, b: 1, c: -1, d: 0, tx: size.height, ty: 0)
+        case 180: return Affine(a: -1, b: 0, c: 0, d: -1, tx: size.width, ty: size.height)
+        case 270: return Affine(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: size.width)
+        default: return .identity
+        }
+    }
+
+    /// `item` moved with its page. Frame angles stay within ±π, so four quarter turns give the original frame back.
+    static func turn(_ item: Item, by map: Affine) -> Item {
+        var out = item.transformed(by: map)
+        if var frame = out.frame {
+            frame.rotation = normalized(frame.rotation)
+            out.frame = frame
+        }
+        return out
+    }
+
+    static func normalized(_ angle: Double) -> Double {
+        let full = 2 * Double.pi
+        let wrapped = angle - (angle / full).rounded() * full
+        return abs(wrapped) < 1e-9 ? 0 : wrapped
     }
 }
 

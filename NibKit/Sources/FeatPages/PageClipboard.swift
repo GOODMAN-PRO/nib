@@ -7,7 +7,9 @@ import NibContracts
 
 /// The page clipboard: pages, their live items and the assets they reference, as JSON on the pasteboard under UTI
 /// `app.nib.pages` (the page-level sibling of the "nib-fragment/1" item fragment). The sidebar's drag between windows
-/// carries the same JSON, and `page.paste {payload}` accepts it directly.
+/// (F023) carries the same JSON, and `page.paste {payload}` accepts it directly. Asset bytes travel as base64 (`data`);
+/// a PDF used only as page backgrounds is cut down to the PDF pages in use, listed in `pdfPages` (source page numbers
+/// in the order they appear in `data`). Stroke points travel in the compact package form (`ptsB64`).
 struct PagesPayload: Codable, Equatable {
     static let currentFormat = "nib-pages/1"
 
@@ -110,12 +112,32 @@ struct PagesPayload: Codable, Equatable {
     /// PDF assets used only as page backgrounds here, with the PDF pages in use.
     var pdfUse: [String: [Int]] { AssetRefs.pdfPagesInUse(pages.map { $0.page }, items: pages.flatMap { $0.items }) }
 
-    /// Pasteboard JSON: every asset with its bytes (PDFs cut down to the pages in use; unreadable ones left out).
-    /// Blocking file and PDF work: run it off the main actor.
+    /// Pages showing a PDF page that the payload's bytes do not hold: the PDF travels only as cuts (`pdfPages`) and
+    /// none of them has that page. Pasted into another document they would point at a PDF page that is not there.
+    var missingPDFPages: [(page: PageID, asset: String, pdfPage: Int)] {
+        var carried: [String: Set<Int>] = [:]
+        var whole = Set<String>()
+        for asset in assets where asset.data != nil {
+            if let numbers = asset.pdfPages { carried[asset.name, default: []].formUnion(numbers) } else { whole.insert(asset.name) }
+        }
+        return pages.compactMap { entry -> (page: PageID, asset: String, pdfPage: Int)? in
+            let background = entry.page.background
+            guard background.kind == .pdf, let name = background.asset?.name, !whole.contains(name),
+                  let numbers = carried[name] else { return nil }
+            let number = background.pdfPage ?? 0
+            return numbers.contains(number) ? nil : (page: entry.page.id, asset: name, pdfPage: number)
+        }
+    }
+
+    /// Pasteboard JSON: every asset with its bytes (PDFs cut down to the pages in use; unreadable ones left out), with
+    /// stroke points in the compact form, as the page sidebar's drag encodes them. Blocking file and PDF work: run it
+    /// off the main actor.
     func encodedWithBytes(store: AssetStore?, pdfUse: [String: [Int]]) throws -> Data {
         var copy = self
         if let store { copy.assets = try AssetTransfer.fill(assets, pdfUse: pdfUse, store: store, strict: false) }
-        return try JSONEncoder().encode(copy)
+        let encoder = JSONEncoder()
+        encoder.userInfo[.nibCompactPoints] = true
+        return try encoder.encode(copy)
     }
 }
 
@@ -309,10 +331,11 @@ enum AssetTransfer {
         return out
     }
 
-    /// Stores the bytes of `assets` in `doc` and returns how references to them change.
+    /// Stores the bytes of `assets` in `doc` and returns how references to them change. Several copies of one name are
+    /// merged first (`merged`), so each page keeps its own PDF page.
     static func install(_ assets: [PagesPayload.Asset], into doc: DocumentID, store: AssetStore) throws -> AssetMap {
         var map = AssetMap()
-        for asset in assets {
+        for asset in merged(assets) {
             guard let data = asset.data else { continue }
             let ext = AssetRef(asset.name).ext
             let stored = try store.put(data, ext: ext.isEmpty ? "bin" : ext, doc: doc)
@@ -323,6 +346,29 @@ enum AssetTransfer {
             }
         }
         return map
+    }
+
+    /// One entry per asset name. A payload put together from several drags or clipboards (the page sidebar merges one
+    /// payload per dragged page), or built by a plugin or the AI, can carry the same PDF several times, each cut down
+    /// to other pages. Keeping one cut would leave the other pages pointing at PDF pages it does not have, so the cuts
+    /// are combined into one PDF whose `pdfPages` lists every source page once. A whole copy of the file (no
+    /// `pdfPages`) holds every page and wins; otherwise the first copy with bytes wins (names are content hashes).
+    static func merged(_ assets: [PagesPayload.Asset]) -> [PagesPayload.Asset] {
+        var names: [String] = []
+        var groups: [String: [PagesPayload.Asset]] = [:]
+        for asset in assets {
+            if groups[asset.name] == nil { names.append(asset.name) }
+            groups[asset.name, default: []].append(asset)
+        }
+        return names.compactMap { name -> PagesPayload.Asset? in
+            guard let group = groups[name], let first = group.first else { return nil }
+            guard group.count > 1 else { return first }
+            let withBytes = group.filter { $0.data != nil }
+            if let whole = withBytes.first(where: { $0.pdfPages == nil }) { return whole }
+            guard let firstCut = withBytes.first else { return first }
+            guard withBytes.count > 1 else { return firstCut }
+            return PDFCut.combine(withBytes) ?? firstCut
+        }
     }
 
     private static func read(_ ref: AssetRef, doc: DocumentID, store: AssetStore, strict: Bool) throws -> Data? {
@@ -355,5 +401,25 @@ enum PDFCut {
             out.insert(page, at: out.pageCount)
         }
         return out.dataRepresentation()
+    }
+
+    /// Several cuts of one PDF (each with its `pdfPages`) as one cut: every source page once, in first-seen order.
+    /// nil when a cut cannot be read or holds fewer pages than it lists.
+    static func combine(_ cuts: [PagesPayload.Asset]) -> PagesPayload.Asset? {
+        guard let name = cuts.first?.name else { return nil }
+        let out = PDFDocument()
+        var numbers: [Int] = []
+        var seen = Set<Int>()
+        for cut in cuts {
+            guard let data = cut.data, let listed = cut.pdfPages, let pdf = PDFDocument(data: data), !pdf.isLocked,
+                  pdf.pageCount >= listed.count else { return nil }
+            for (i, number) in listed.enumerated() where seen.insert(number).inserted {
+                guard let page = pdf.page(at: i)?.copy() as? PDFPage else { return nil }
+                out.insert(page, at: out.pageCount)
+                numbers.append(number)
+            }
+        }
+        guard let data = out.dataRepresentation() else { return nil }
+        return PagesPayload.Asset(name: name, data: data, pdfPages: numbers)
     }
 }
