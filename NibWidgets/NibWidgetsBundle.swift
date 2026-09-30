@@ -146,8 +146,11 @@ enum WidgetMetrics {
     static let xs: CGFloat = 4
     static let s: CGFloat = 8
     static let m: CGFloat = 12
+    static let xl: CGFloat = 20
     /// Hit targets and the QuickNote disc (DESIGN.md §5: 44 pt, always).
     static let target: CGFloat = 44
+    /// The most a 44 pt target grows with Dynamic Type (`NibMetrics.barHeightMax`).
+    static let targetMax: CGFloat = 52
     /// Ruled narrow template pitch (DESIGN.md §3.6: 20 pt) and the rule weight (0.5 pt).
     static let rulePitch: CGFloat = 20
     static let ruleWidth: CGFloat = 0.5

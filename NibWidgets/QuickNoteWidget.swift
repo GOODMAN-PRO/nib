@@ -56,12 +56,28 @@ struct QuickNoteWidgetView: View {
 }
 
 /// A sheet of ruled paper with the compose disc: the page carries the look, the accent marks the one action.
+/// The disc grows with the text up to 52 pt; when the text is too large for the subtitle as well (xxxLarge on a 141 or
+/// 148 pt widget), the subtitle goes rather than running past the content margin.
 struct QuickNoteTileView: View {
     @Environment(\.colorScheme) private var scheme
-    @ScaledMetric(relativeTo: .headline) private var disc: CGFloat = WidgetMetrics.target
+    @ScaledMetric(relativeTo: .headline) private var scaledDisc: CGFloat = WidgetMetrics.target
+
+    private var disc: CGFloat { min(scaledDisc, WidgetMetrics.targetMax) }
+    private var palette: WidgetPalette { WidgetPalette(scheme: scheme) }
 
     var body: some View {
-        let palette = WidgetPalette(scheme: scheme)
+        ViewThatFits(in: .vertical) {
+            tile(subtitle: true)
+            tile(subtitle: false)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("New QuickNote"))
+        .accessibilityHint(Text("Opens Nib on a new page."))
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private func tile(subtitle: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             ZStack {
                 Circle()
@@ -78,16 +94,16 @@ struct QuickNoteTileView: View {
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
-            Text("Start writing")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .layoutPriority(1)
+            if subtitle {
+                Text("Start writing")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text("New QuickNote"))
-        .accessibilityHint(Text("Opens Nib on a new page."))
-        .accessibilityAddTraits(.isButton)
     }
 }
 
@@ -375,7 +391,12 @@ struct FavouritesProvider: TimelineProvider {
     }
 
     func getSnapshot(in context: Context, completion: @escaping (FavouritesEntry) -> Void) {
-        completion(FavouritesEntry(date: Date(), state: FavouritesFile.load(from: WidgetAppGroup.containerURL)))
+        var state = FavouritesFile.load(from: WidgetAppGroup.containerURL)
+        // Before the app has written any favourites the gallery shows what the widget does, not the empty card.
+        if context.isPreview, state == .loaded([]) {
+            state = .loaded(FavouritesWidgetView.sampleItems(FavouritesLayout.of(context.family).capacity))
+        }
+        completion(FavouritesEntry(date: Date(), state: state))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<FavouritesEntry>) -> Void) {
@@ -385,21 +406,31 @@ struct FavouritesProvider: TimelineProvider {
     }
 }
 
-/// How many favourites each family shows, as columns × rows of tiles.
+/// How many favourites each family shows, as columns × rows of tiles, and whether a header sits above them.
 struct FavouritesLayout: Equatable {
     var columns: Int
     var rows: Int
+    /// Medium has no header: a header over two rows of 44 pt tiles does not fit its 141 pt (iPad) and 148 pt
+    /// (iPhone SE) heights. Two rows alone (2 × 44 + 8 = 96 pt) fit every medium widget.
+    var showsHeader: Bool
 
     var capacity: Int { columns * rows }
 
     static func of(_ family: WidgetFamily) -> FavouritesLayout {
         switch family {
-        case .systemSmall: return FavouritesLayout(columns: 1, rows: 1)
-        case .systemMedium: return FavouritesLayout(columns: 2, rows: 2)
-        case .systemLarge: return FavouritesLayout(columns: 2, rows: 4)
-        case .systemExtraLarge: return FavouritesLayout(columns: 4, rows: 4)
-        default: return FavouritesLayout(columns: 2, rows: 2)
+        case .systemSmall: return FavouritesLayout(columns: 1, rows: 1, showsHeader: true)
+        case .systemMedium: return FavouritesLayout(columns: 2, rows: 2, showsHeader: false)
+        case .systemLarge: return FavouritesLayout(columns: 2, rows: 4, showsHeader: true)
+        case .systemExtraLarge: return FavouritesLayout(columns: 4, rows: 4, showsHeader: true)
+        default: return FavouritesLayout(columns: 2, rows: 2, showsHeader: false)
         }
+    }
+
+    /// One tile in a grid of `size`: the columns and rows share it after the gaps, and a tile is never under 44 pt tall.
+    func tileSize(in size: CGSize, spacing: CGFloat = WidgetMetrics.s) -> CGSize {
+        let width = (size.width - spacing * CGFloat(max(columns - 1, 0))) / CGFloat(max(columns, 1))
+        let height = (size.height - spacing * CGFloat(max(rows - 1, 0))) / CGFloat(max(rows, 1))
+        return CGSize(width: max(width, 0), height: max(height, WidgetMetrics.target))
     }
 }
 
@@ -407,6 +438,8 @@ struct FavouritesWidgetView: View {
     let entry: FavouritesEntry
     @Environment(\.widgetFamily) private var family
     @Environment(\.colorScheme) private var scheme
+
+    private var isSmall: Bool { family == .systemSmall }
 
     var body: some View {
         content
@@ -420,12 +453,15 @@ struct FavouritesWidgetView: View {
         switch entry.state {
         case .unavailable:
             FavouritesMessageView(symbol: WidgetSymbol.unavailable, title: Text("Favourites unavailable"),
-                                  message: Text("Touch and hold the Nib icon to open a favourite."),
-                                  compact: family == .systemSmall)
+                                  message: isSmall ? Text("Touch and hold the Nib icon to open one.")
+                                      : Text("Touch and hold the Nib icon to open a favourite."),
+                                  compact: isSmall)
         case .loaded(let items) where items.isEmpty:
-            FavouritesMessageView(symbol: WidgetSymbol.favouritesEmpty, title: Text("No favourites yet"),
-                                  message: Text("Star a notebook in Nib to keep it here."),
-                                  compact: family == .systemSmall)
+            FavouritesMessageView(symbol: WidgetSymbol.favouritesEmpty,
+                                  title: isSmall ? Text("No favourites") : Text("No favourites yet"),
+                                  message: isSmall ? Text("Star a notebook in Nib.")
+                                      : Text("Star a notebook in Nib to keep it here."),
+                                  compact: isSmall)
         case .loaded(let items):
             listing(items)
         case .placeholder:
@@ -435,7 +471,7 @@ struct FavouritesWidgetView: View {
     }
 
     @ViewBuilder private func listing(_ items: [FavouriteItem]) -> some View {
-        if family == .systemSmall, let first = items.first {
+        if isSmall, let first = items.first {
             FavouriteSmallView(item: first)
                 .widgetURL(first.url)
         } else {
@@ -449,6 +485,26 @@ struct FavouritesWidgetView: View {
             NibWidgetLinks.open(document: "placeholder-\(i)").map {
                 FavouriteItem(id: "placeholder-\(i)", title: String(localized: "Notebook title"), kind: .notebook,
                               folder: String(localized: "Folder"), url: $0)
+            }
+        }
+    }
+
+    /// What the widget gallery shows before the app has written favourites.json: plausible favourites of each kind,
+    /// drawn as content (not redacted) so the preview shows what the widget does.
+    static func sampleItems(_ count: Int) -> [FavouriteItem] {
+        let samples: [(String, FavouriteItem.Kind, String)] = [
+            (String(localized: "Biology"), .notebook, String(localized: "Year 12")),
+            (String(localized: "Lab sketches"), .whiteboard, String(localized: "Chemistry")),
+            (String(localized: "Essay plan"), .textDocument, String(localized: "English")),
+            (String(localized: "Vocabulary"), .studySet, String(localized: "Spanish")),
+            (String(localized: "Lecture notes"), .notebook, String(localized: "History")),
+            (String(localized: "Formulas"), .studySet, String(localized: "Physics")),
+            (String(localized: "Mind map"), .whiteboard, String(localized: "Psychology")),
+            (String(localized: "Reading list"), .textDocument, String(localized: "Literature")),
+        ]
+        return samples.prefix(max(count, 1)).enumerated().compactMap { i, sample in
+            NibWidgetLinks.open(document: "sample-\(i)").map {
+                FavouriteItem(id: "sample-\(i)", title: sample.0, kind: sample.1, folder: sample.2, url: $0)
             }
         }
     }
@@ -469,30 +525,18 @@ struct FavouritesHeaderView: View {
     }
 }
 
-/// Small: the most recently edited favourite; the whole widget opens it.
+/// Small: the most recently edited favourite; the whole widget opens it. The header goes first, then the glyph, when
+/// the widget is too short for them (141 and 148 pt widgets, large text), so the title is never what gets cut.
 struct FavouriteSmallView: View {
     let item: FavouriteItem
     @Environment(\.colorScheme) private var scheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            FavouritesHeaderView()
-            Spacer(minLength: WidgetMetrics.s)
-            Image(systemName: item.kind.symbol)
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(WidgetPalette(scheme: scheme).accent)
-                .widgetAccentable()
-                .padding(.bottom, WidgetMetrics.xs)
-            Text(item.title)
-                .font(.headline)
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-            if let folder = item.folder {
-                Text(folder)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
+        ViewThatFits(in: .vertical) {
+            card(header: true, glyph: true, fitted: true)
+            card(header: false, glyph: true, fitted: true)
+            card(header: false, glyph: false, fitted: true)
+            card(header: false, glyph: false, fitted: false)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityElement(children: .ignore)
@@ -500,26 +544,62 @@ struct FavouriteSmallView: View {
         .accessibilityHint(Text("Opens it in Nib."))
         .accessibilityAddTraits(.isButton)
     }
+
+    /// `fitted` gives the text its full height (ViewThatFits only picks it when that fits); the last resort keeps
+    /// line limits instead.
+    private func card(header: Bool, glyph: Bool, fitted: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if header {
+                FavouritesHeaderView()
+                Spacer(minLength: WidgetMetrics.s)
+            }
+            if glyph {
+                Image(systemName: item.kind.symbol)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(WidgetPalette(scheme: scheme).accent)
+                    .widgetAccentable()
+                    .padding(.bottom, WidgetMetrics.xs)
+            }
+            if !header {
+                Spacer(minLength: 0)
+            }
+            Text(item.title)
+                .font(.headline)
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: fitted)
+                .layoutPriority(1)
+            if let folder = item.folder {
+                Text(folder)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: fitted)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
 }
 
-/// Medium, Large and Extra Large: a header and a grid of tiles, each its own link. Empty slots keep the tiles one size.
+/// Medium, Large and Extra Large: a grid of tiles, each its own link, under a header on Large and Extra Large. The
+/// rows share the height (a tile is never under 44 pt), and empty slots keep the tiles one size.
 struct FavouritesGridView: View {
     let items: [FavouriteItem]
     let layout: FavouritesLayout
 
     var body: some View {
         VStack(alignment: .leading, spacing: WidgetMetrics.s) {
-            FavouritesHeaderView()
-            Grid(horizontalSpacing: WidgetMetrics.s, verticalSpacing: WidgetMetrics.s) {
-                ForEach(0..<layout.rows, id: \.self) { row in
-                    GridRow {
-                        ForEach(0..<layout.columns, id: \.self) { column in
-                            let index = row * layout.columns + column
-                            if index < items.count {
-                                FavouriteTileView(item: items[index])
-                            } else {
-                                Color.clear
-                                    .accessibilityHidden(true)
+            if layout.showsHeader {
+                FavouritesHeaderView()
+            }
+            GeometryReader { proxy in
+                let tile = layout.tileSize(in: proxy.size)
+                VStack(alignment: .leading, spacing: WidgetMetrics.s) {
+                    ForEach(0..<layout.rows, id: \.self) { row in
+                        HStack(spacing: WidgetMetrics.s) {
+                            ForEach(0..<layout.columns, id: \.self) { column in
+                                slot(row * layout.columns + column)
+                                    .frame(width: tile.width, height: tile.height)
                             }
                         }
                     }
@@ -528,40 +608,38 @@ struct FavouritesGridView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
+
+    @ViewBuilder private func slot(_ index: Int) -> some View {
+        if index < items.count {
+            FavouriteTileView(item: items[index])
+        } else {
+            Color.clear
+                .accessibilityHidden(true)
+        }
+    }
 }
 
+/// One favourite in the grid: the kind glyph in the accent, the title in up to two lines, and the folder when there is
+/// room for it as well. The title wins: a long title takes its second line before the folder does.
 struct FavouriteTileView: View {
     let item: FavouriteItem
     @Environment(\.colorScheme) private var scheme
     @Environment(\.colorSchemeContrast) private var contrast
-    @ScaledMetric(relativeTo: .footnote) private var glyphWidth: CGFloat = 20
+    @ScaledMetric(relativeTo: .footnote) private var glyphWidth: CGFloat = WidgetMetrics.xl
+
+    private var palette: WidgetPalette { WidgetPalette(scheme: scheme, contrast: contrast) }
 
     var body: some View {
-        let palette = WidgetPalette(scheme: scheme, contrast: contrast)
         Link(destination: item.url) {
-            HStack(alignment: .firstTextBaseline, spacing: WidgetMetrics.s) {
-                Image(systemName: item.kind.symbol)
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(palette.accent)
-                    .widgetAccentable()
-                    .frame(width: glyphWidth)
-                VStack(alignment: .leading, spacing: WidgetMetrics.xxs) {
-                    Text(item.title)
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-                    if let folder = item.folder {
-                        Text(folder)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-                Spacer(minLength: 0)
+            ViewThatFits(in: .vertical) {
+                row(titleLines: 2, folder: true)
+                row(titleLines: 2, folder: false)
+                row(titleLines: 1, folder: true)
+                row(titleLines: 1, folder: false)
             }
-            .padding(WidgetMetrics.m)
+            .padding(.horizontal, WidgetMetrics.m)
+            .padding(.vertical, WidgetMetrics.s)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .frame(minHeight: WidgetMetrics.target)
             .background(ContainerRelativeShape().fill(palette.fill))
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(Text(item.accessibilityText))
@@ -569,9 +647,40 @@ struct FavouriteTileView: View {
             .accessibilityAddTraits(.isButton)
         }
     }
+
+    /// The text is drawn in the neutrals rather than the Link's tint: the accent belongs to the glyph alone.
+    private func row(titleLines: Int, folder: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: WidgetMetrics.s) {
+            Image(systemName: item.kind.symbol)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(palette.accent)
+                .widgetAccentable()
+                .frame(width: glyphWidth)
+            VStack(alignment: .leading, spacing: WidgetMetrics.xxs) {
+                Text(item.title)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Color.primary)
+                    .lineLimit(titleLines)
+                    .fixedSize(horizontal: false, vertical: true)
+                if folder, let name = item.folder {
+                    Text(name)
+                        .font(.caption2)
+                        .foregroundStyle(Color.secondary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        // A Link centres wrapped lines like a button label; the tile reads from the leading edge.
+        .multilineTextAlignment(.leading)
+    }
 }
 
 /// Empty and unavailable states: a quiet glyph, what happened, what to do next. No button (the widget opens Nib).
+/// Small drops the header. When the widget is too short for the rest (141 and 148 pt widgets, large text) the header
+/// goes, then the glyph; when even the text alone does not fit at the reader's size (xxxLarge on a small widget) it is
+/// drawn at the default size rather than cut off, since it is the only thing telling the reader what to do.
 struct FavouritesMessageView: View {
     let symbol: String
     let title: Text
@@ -579,28 +688,53 @@ struct FavouritesMessageView: View {
     let compact: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: WidgetMetrics.xs) {
-            FavouritesHeaderView()
-            Spacer(minLength: WidgetMetrics.s)
-            Image(systemName: symbol)
-                .font(compact ? Font.title3 : Font.title2)
-                .foregroundStyle(.tertiary)
-                .padding(.bottom, WidgetMetrics.xs)
-                .accessibilityHidden(true)
-            title
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-            message
-                .font(compact ? Font.caption : Font.footnote)
-                .foregroundStyle(.secondary)
-                .lineLimit(compact ? 3 : 2)
-            if !compact {
-                Spacer(minLength: 0)
-            }
+        ViewThatFits(in: .vertical) {
+            card(header: !compact, glyph: true, fitted: true)
+            card(header: false, glyph: true, fitted: true)
+            card(header: false, glyph: false, fitted: true)
+            card(header: false, glyph: false, fitted: true)
+                .dynamicTypeSize(...DynamicTypeSize.large)
+            card(header: false, glyph: false, fitted: false)
+                .dynamicTypeSize(...DynamicTypeSize.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .accessibilityElement(children: .combine)
+    }
+
+    /// `fitted` gives the text its full height (ViewThatFits only picks it when that fits); the last resort keeps
+    /// line limits and lets the text shrink a little instead.
+    private func card(header: Bool, glyph: Bool, fitted: Bool) -> some View {
+        VStack(alignment: .leading, spacing: WidgetMetrics.xs) {
+            if header {
+                FavouritesHeaderView()
+                Spacer(minLength: WidgetMetrics.s)
+            }
+            if glyph {
+                Image(systemName: symbol)
+                    .font(compact ? Font.title3 : Font.title2)
+                    .foregroundStyle(.tertiary)
+                    .padding(.bottom, header ? WidgetMetrics.xs : 0)
+                    .accessibilityHidden(true)
+            }
+            if !header {
+                Spacer(minLength: 0)
+            }
+            title
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(fitted ? nil : 2)
+                .minimumScaleFactor(fitted ? 1 : 0.8)
+                .fixedSize(horizontal: false, vertical: fitted)
+                .layoutPriority(1)
+            message
+                .font(compact ? Font.caption : Font.footnote)
+                .foregroundStyle(.secondary)
+                .lineLimit(fitted ? nil : 4)
+                .minimumScaleFactor(fitted ? 1 : 0.8)
+                .fixedSize(horizontal: false, vertical: fitted)
+                .layoutPriority(1)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
