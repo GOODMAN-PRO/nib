@@ -1,0 +1,65 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLock/PasswordSetupView.swift:356-375 (LockSettingsModel.setBiometrics) and LockCommands.swift:183-187 (LockStore.setBiometrics)",
+      "problem": "Anyone at the device can turn on Face ID / Touch ID without knowing the lock password, which bypasses the lock. The Settings > General > Password Protection toggle only runs a biometric check and then settings.set security.lock.biometrics true. Anyone whose face or finger is enrolled on the device, for example a family member's Touch ID finger, can switch it on and then open every locked document with biometrics. The lock.setup sheet asks for the current password for the same toggle (canSave needs `current` in change mode), so the two paths do not agree. Apple Notes asks for the password before its Touch ID option.",
+      "fix": "Ask for the password before biometrics are turned on. Add a password-only `UnlockPurpose.verify` (no biometry button) to LockServiceImpl.prompt. Then register a guarding hook on `settings.set` in FeatLockFeature.register: when params name == \"security.lock.biometrics\" and value == true, it runs service.unlock(doc-less verify) and throws .userDenied when that fails. This also covers every other settings.set path. Turning it off needs no check. Better still, have the page's toggle open lock.setup (change mode). Add a test: settings.set {security.lock.biometrics: true} as the user with a scripted wrong password leaves the setting false."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLock/LockCommands.swift:224-231 (doc.setLocked mutate is a normal undo step); no guard on edit.undo / edit.redo",
+      "problem": "The AI, a plugin or the bridge can remove a document's lock without the password by calling edit.undo. The document the user locks while looking at it stays unlocked for the session (keepUnlocked), so Gateway.isLocked is false for it. edit.undo {doc} from .ai(\"chat\") then passes authorisation. It is not destructive, so no confirmation is asked. It reverts the \"Lock Document\" meta write and saves meta.locked = false, which syncs everywhere. That goes against the spec (\"removing asks for the password\") and the FEATURES.md protected-field rule (meta.locked changes only through doc.setLocked). A prompt-injected assistant can strip locks silently.",
+      "fix": "In FeatLockFeature.register, register CommandHookDescriptor.guarding(id: \"lock.undoGuard\", commands: [CommandIDs.undo, CommandIDs.redo]). For a non-user principal, resolve the doc (ctx.documentOrSession) and read ctx.bus.history.entries(doc).last for undo. If that entry has a `.meta(_, before, after)` mutation where before.locked && !after.locked would result (undo of a lock: after.locked == true && before.locked == false), throw NibError(.permissionDenied, \"undoing this step would remove the document's lock\", hint: \"the user removes locks with doc.setLocked\"). For redo, do the same check with redoLabel == \"Remove Lock\". Add a test: the user locks the on-screen doc, then edit.undo {doc} as .ai throws and meta.locked stays true."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatLock/UnlockPrompt.swift:400 (coverLockedWindows uses navigator.activeDocument); LockServiceImpl.swift:456-460 (isOpenInWindow uses activeNavigator.openDocuments)",
+      "problem": "The code decides whether a document is on screen from `activeDocument` and `openDocuments`. The shell (Nib/App/ShellViewController.showLibrary) keeps both after Back to the library and only sets session.document = nil. This causes two bugs. (a) After a relock, a window that shows the library gets a full-screen \"Locked\" cover for the last document opened in it, and the person has to tap Close. This happens on every 2-minute relock after reading a locked notebook. (b) The user opens document A, goes Back, and picks Lock on A in the library. isOpenInWindow is true, so keepUnlocked is set: A still opens without a password until the next relock, and the gateway treats it as unlocked for the AI, plugins and the bridge.",
+      "fix": "Use the window's session as the signal. In coverLockedWindows, use `guard let doc = navigator.session.document, service.isLocked(doc)`. In isOpenInWindow, return only `app.services.sessions.sessions.contains { $0.document == doc }` (and navigators' session.document). Drop openDocuments, or treat background tabs as not shown so they lock at once and hit the open gate on the next tab switch. Add tests with a fake SceneNavigator whose session.document is nil but whose activeDocument/openDocuments still hold the doc: no cover, and doc.setLocked locks it at once."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Tests/FeatLockTests/FeatLockTests.swift:226-228 (\"the views are checked on device\"); no snapshots for UnlockPromptView, LockedCoverView, PasswordSetupView, PasswordSettingsPage",
+      "problem": "DESIGN.md section 15.7 and the section 16 review gate ask for snapshots of every new screen in Light, Dark and AX3 before review. Contracts-v2 added NibSnapshot (CONTRACTS.md, NibTesting/Snapshot.swift) for this in hostless tests. F071 adds four screens and none of them has a snapshot or AX3 fit check. The tests skip the views on purpose, which is the workaround contracts-v2 removed.",
+      "fix": "Add NibSnapshot.images(...) tests for UnlockPromptView (open with the hint due, removeLock, assistant requester), LockedCoverView (light paper and dark paper), PasswordSetupView (create with a reason banner, change with locked documents) and PasswordSettingsPage (configured with biometry). Assert every Variant renders. Add NibSnapshot.fittingSize(..., width: NibMetrics.onboardingCardWidth, variant: .largeText) checks so the prompt still lays out (scrolls) at AX3."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLock/FeatLockFeature.swift:41 (only doc.unlock has a guard); Gateway only sees refs in params",
+      "problem": "Commands that fall back to the window's session (ctx.activeSession; the bridge's nil session means sessions.active) and take no doc ref can still reach a locked document. Examples are session-only commands, and commands whose schema leaves doc/page/refs optional. Two cases leave a locked document as the session's document: after a relock (the cover hides the window, but session.document is unchanged and an AI turn may still be running), and when the AI locks the document on screen. Gateway.referencedDocuments sees nothing in these calls, so no `locked` error is raised.",
+      "fix": "In start(), register a guarding hook over every registered command namespace (\"<ns>.*\"). For a non-user principal, when the descriptor target is .document and Gateway.referencedDocuments(params) is empty, it throws NibError(.locked, ...) if ctx.activeSession?.document is locked. Also file a section 16 request so Gateway.authorize receives the invocation's session document."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLock/LockServiceImpl.swift:467-475 (didSetLocked) and observe(_:)",
+      "problem": "When a non-user principal, or a remote device through sync, locks the document a window is showing, the document becomes locked but stays visible with no cover. The user keeps editing a document that the gateway treats as locked. DESIGN.md section 14.2 says a locked document's page is replaced by the locked field.",
+      "fix": "When a document becomes locked while a window's session.document == doc and it is not in `unlocked`, call presenter?.coverLockedWindows(). Alternatively, treat a lock added by someone else to an on-screen document as kept unlocked until the next relock, as the user's own lock is."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLock/LockServiceImpl.swift:99-102 (LockVerifier.isUsable)",
+      "problem": "The synced verifier's hash length has no upper bound. matches() derives `hash.count` bytes, so a crafted security.lock.verifier with a large hash and 10,000,000 rounds keeps a core busy for minutes on every check, and the prompt stays on \"Checking\". Also, a verifier from a newer build with an unknown algorithm is still reported as configured, and every entry just says \"Wrong password\".",
+      "fix": "Require (16...64).contains(hash.count) and (8...64).contains(salt.count) in isUsable. When a verifier is present but !isUsable, show \"This password was set by a newer version of Nib. Update Nib to unlock.\" instead of counting wrong entries."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLock/LockServiceImpl.swift:506-512 (prompt, the !isConfigured branch)",
+      "problem": "When a document carries a lock but this device has no verifier yet (the library's prefs have not synced), anyone at the device can create a new password and open it. That new verifier then wins LWW and replaces the real password on every device.",
+      "fix": "When locked documents exist and there is no verifier, fail closed. Show \"Waiting for this library's password to sync\" and set a new password only after an explicit confirmation that replaces the password for every device. Or keep the created verifier device-local until sync confirms that no other verifier exists."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLock/UnlockPrompt.swift:373 and :386-387 (sheet sizes 460 / 640, onboardingCardWidth + x6)",
+      "problem": "The sheet sizes are hand-set: literal heights, and a width made by adding a spacing token to the onboarding card width. DESIGN.md section 15.6 says a missing metric goes through a contract request, not a local value. The hint row is also a raw TextField in a normal list cell, while the password rows are NibSecureFields on a clear row background, so the setup sheet mixes two field styles.",
+      "fix": "File a section 16 request for NibMetrics.lockPromptSize / passwordSheetSize (or reuse NibMetrics.newDocumentSheetSize), and use it in LockPresentation.styleSheet. Give the hint the same field treatment as the secure fields (NibField on a clear row), or put all three in plain grouped cells."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatLock/PasswordSetupView.swift:329-338 (LockSettingsModel refresh subscription) and LockCommands.swift:176-178",
+      "problem": "While the settings page is open, refresh() scans the whole library (allNodes + trashedNodes + every loaded head) on every .nibChromeNeedsUpdate notification. Separately, LockStore.apply quietly turns biometrics off when Face ID is briefly unavailable (for example after a lockout), because it requires biometrics?.kind != nil.",
+      "fix": "Debounce refresh (.debounce(for: .milliseconds(200))) and only recount lockedDocuments on library.changed or lock.changed. In LockStore.apply, change the biometrics setting only when result.biometrics != request.biometricsOn."
+    }
+  ]
+}
