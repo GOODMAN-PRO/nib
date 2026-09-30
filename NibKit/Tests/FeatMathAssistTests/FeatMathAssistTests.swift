@@ -31,26 +31,27 @@ final class FeatMathAssistTests: XCTestCase {
     func testRegistersExactlyItsCommands() {
         let h = harness()
         let ids = Set(h.app.commands.all().filter { $0.owner == FeatMathAssistFeature.id }.map { $0.id })
-        XCTAssertEqual(ids, ["math.evaluate"])
-        let descriptor = h.app.commands.descriptor("math.evaluate")
+        XCTAssertEqual(ids, [CommandIDs.mathEvaluate])
+        XCTAssertEqual(CommandIDs.mathEvaluate, "math.evaluate", "the catalogue id (ARCHITECTURE.md §6.5)")
+        let descriptor = h.app.commands.descriptor(CommandIDs.mathEvaluate)
         XCTAssertEqual(descriptor?.effect, .read)
         XCTAssertEqual(descriptor?.exposure, .all)
     }
 
     func testDescriptorExamplesRun() async throws {
         let h = harness()
-        let examples = try XCTUnwrap(h.app.commands.descriptor("math.evaluate")).examples
+        let examples = try XCTUnwrap(h.app.commands.descriptor(CommandIDs.mathEvaluate)).examples
         for example in examples {
-            let result = try await h.run("math.evaluate", example, as: .ai("examples"))
+            let result = try await h.run(CommandIDs.mathEvaluate, example, as: .ai("examples"))
             XCTAssertNotNil(result["answer"]?.stringValue, example.jsonString())
         }
-        let withVariables = try await h.run("math.evaluate", examples[2])
+        let withVariables = try await h.run(CommandIDs.mathEvaluate, examples[2])
         XCTAssertEqual(withVariables["answer"]?.stringValue, "11")
     }
 
     func testSolvesAnEquationThroughTheBus() async throws {
         let h = harness()
-        let result = try await h.run("math.evaluate", ["expression": "x^2 - 5x + 6 = 0"])
+        let result = try await h.run(CommandIDs.mathEvaluate, ["expression": "x^2 - 5x + 6 = 0"])
         XCTAssertEqual(result["kind"]?.stringValue, "solutions")
         XCTAssertEqual(result["answer"]?.stringValue, "x = 2, x = 3")
         XCTAssertEqual(result["latex"]?.stringValue, "x = 2, x = 3")
@@ -62,7 +63,7 @@ final class FeatMathAssistTests: XCTestCase {
     func testVariablesAndFormat() async throws {
         let h = harness()
         let variables: JSONValue = ["a": 0.5, "f(x)": "x^2"]
-        let result = try await h.run("math.evaluate",
+        let result = try await h.run(CommandIDs.mathEvaluate,
                                      ["expression": "f(3) + a =", "variables": variables, "format": "mixed"])
         XCTAssertEqual(result["answer"]?.stringValue, "9 1/2")
         XCTAssertEqual(result["value"]?.doubleValue, 9.5)
@@ -74,9 +75,9 @@ final class FeatMathAssistTests: XCTestCase {
         let h = harness()
         let rows: JSONValue = [[1, 2], [3, 4]]
         let variables: JSONValue = ["A": rows]
-        let det = try await h.run("math.evaluate", ["expression": "det(A) =", "variables": variables])
+        let det = try await h.run(CommandIDs.mathEvaluate, ["expression": "det(A) =", "variables": variables])
         XCTAssertEqual(det["value"]?.doubleValue, -2)
-        let inverse = try await h.run("math.evaluate",
+        let inverse = try await h.run(CommandIDs.mathEvaluate,
                                       ["expression": "A^{-1} =", "variables": variables, "format": "decimal"])
         XCTAssertEqual(inverse["kind"]?.stringValue, "matrix")
         let expected: JSONValue = [[-2, 1], [1.5, -0.5]]
@@ -87,10 +88,13 @@ final class FeatMathAssistTests: XCTestCase {
     func testUnsupportedSuggestsAISolveWithTheExpression() async throws {
         let h = harness()
         for expression in ["sin(x) = 1/2", "f'(x) = 1", "\\lim_{x \\to 0} \"x\""] {
-            let error = await nibError { _ = try await h.run("math.evaluate", ["expression": .string(expression)]) }
+            let error = await nibError {
+                _ = try await h.run(CommandIDs.mathEvaluate, ["expression": .string(expression)])
+            }
             XCTAssertEqual(error?.code, .unsupported, expression)
             let hint = try XCTUnwrap(error?.hint, expression)
-            let prefix = "try AI Solve: call math.solve "
+            let prefix = "try AI Solve: call \(CommandIDs.mathSolve) "
+            XCTAssertEqual(CommandIDs.mathSolve, "math.solve")
             XCTAssertTrue(hint.hasPrefix(prefix), hint)
             let call = try JSONValue.parse(String(hint.dropFirst(prefix.count)))
             XCTAssertEqual(call["latex"]?.stringValue, expression)
@@ -102,18 +106,18 @@ final class FeatMathAssistTests: XCTestCase {
     func testOverlongInputIsRefusedAtItsPath() async {
         let h = harness()
         let long = Array(repeating: "1", count: 2_001).joined(separator: "+") + " ="
-        let tooLong = await nibError { _ = try await h.run("math.evaluate", ["expression": .string(long)]) }
+        let tooLong = await nibError { _ = try await h.run(CommandIDs.mathEvaluate, ["expression": .string(long)]) }
         XCTAssertEqual(tooLong?.code, .invalidParams)
         XCTAssertEqual(tooLong?.path, "$.expression")
         let variables: JSONValue = ["a": .string(String(repeating: "1+", count: 1_000) + "1")]
         let longVariable = await nibError {
-            _ = try await h.run("math.evaluate", ["expression": "a =", "variables": variables])
+            _ = try await h.run(CommandIDs.mathEvaluate, ["expression": "a =", "variables": variables])
         }
         XCTAssertEqual(longVariable?.code, .invalidParams)
         XCTAssertEqual(longVariable?.path, "$.variables.a")
+        let nested = String(repeating: "(", count: 1_000) + "1" + String(repeating: ")", count: 1_000) + " ="
         let deep = await nibError {
-            _ = try await h.run("math.evaluate", ["expression": .string(String(repeating: "(", count: 1_000) + "1" +
-                                                                       String(repeating: ")", count: 1_000) + " =")])
+            _ = try await h.run(CommandIDs.mathEvaluate, ["expression": .string(nested)])
         }
         XCTAssertEqual(deep?.code, .unsupported, "too deeply nested: refused, never a stack overflow")
     }
@@ -121,27 +125,28 @@ final class FeatMathAssistTests: XCTestCase {
     func testBadParametersNameTheirPath() async {
         let h = harness()
         let badFormat = await nibError {
-            _ = try await h.run("math.evaluate", ["expression": "1 =", "format": "roman"])
+            _ = try await h.run(CommandIDs.mathEvaluate, ["expression": "1 =", "format": "roman"])
         }
         XCTAssertEqual(badFormat?.code, .invalidParams)
         XCTAssertEqual(badFormat?.path, "$.format")
         let badName: JSONValue = ["2x": 3]
         let badVariable = await nibError {
-            _ = try await h.run("math.evaluate", ["expression": "1 =", "variables": badName])
+            _ = try await h.run(CommandIDs.mathEvaluate, ["expression": "1 =", "variables": badName])
         }
         XCTAssertEqual(badVariable?.code, .invalidParams)
         XCTAssertEqual(badVariable?.path, "$.variables.2x")
         let aiFormat = await nibError {
-            _ = try await h.run("math.evaluate", ["expression": "1 =", "format": "roman"], as: .ai("chat"))
+            _ = try await h.run(CommandIDs.mathEvaluate, ["expression": "1 =", "format": "roman"], as: .ai("chat"))
         }
         XCTAssertEqual(aiFormat?.code, .invalidParams, "the schema's choices reject it for non-user callers")
     }
 
     func testAIAndBridgeCanEvaluate() async throws {
         let h = harness()
-        let ai = try await h.run("math.evaluate", ["expression": "2+3="], as: .ai("chat"))
+        let ai = try await h.run(CommandIDs.mathEvaluate, ["expression": "2+3="], as: .ai("chat"))
         XCTAssertEqual(ai["answer"]?.stringValue, "5")
-        let bridge = try await h.run("math.evaluate", ["expression": "x + y = 3; x - y = 1"], as: .bridge("test"))
+        let bridge = try await h.run(CommandIDs.mathEvaluate, ["expression": "x + y = 3; x - y = 1"],
+                                     as: .bridge("test"))
         XCTAssertEqual(bridge["answer"]?.stringValue, "x = 2, y = 1")
     }
 }

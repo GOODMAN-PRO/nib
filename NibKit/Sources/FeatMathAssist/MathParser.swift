@@ -16,7 +16,7 @@ enum MathFailure {
     /// backslashes in the maths survive being copied into a tool call.
     static func aiSolveHint(for latex: String) -> String {
         let call: JSONValue = ["latex": .string(latex), "mode": "solve"]
-        return "try AI Solve: call math.solve " + call.jsonString()
+        return "try AI Solve: call \(CommandIDs.mathSolve) " + call.jsonString()
     }
 
     static func syntax(_ message: String) -> NibError {

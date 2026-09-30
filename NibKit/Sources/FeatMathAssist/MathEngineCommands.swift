@@ -708,7 +708,7 @@ struct MathEvaluate: NibCommand {
     ]
 
     static let descriptor = CommandDescriptor(
-        id: "math.evaluate", title: "Evaluate Maths",
+        id: CommandIDs.mathEvaluate, title: "Evaluate Maths",
         summary: "Work out an expression, equation or system on-device (earlier lines may define a = 2, f(x) = x^2); answer as a fraction, mixed number or decimal.",
         params: .obj([
             "expression": .str("maths as text or LaTeX, e.g. '2(3+4)^2 =', 'x^2 - 5x + 6 = 0', 'x + y = 3; x - y = 1', 'a = 2\\n3a ='"),
