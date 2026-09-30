@@ -60,16 +60,24 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
-    private var shell: ShellViewController?
+    private(set) var shell: ShellViewController?
+    private var keyObserver: NSObjectProtocol?
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         guard let windowScene = scene as? UIWindowScene, let app = NibApp.shared else { return }
         let shell = ShellViewController(app: app)
         let window = UIWindow(windowScene: windowScene)
         window.rootViewController = shell
-        window.makeKeyAndVisible()
         self.window = window
         self.shell = shell
+        // Commands target the window the user works in: follow the key window across scenes (Split View, Stage
+        // Manager, external keyboard focus), not only scene activation, which several windows share.
+        keyObserver = NotificationCenter.default.addObserver(forName: UIWindow.didBecomeKeyNotification, object: window,
+                                                             queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.shell?.windowDidBecomeKey() }
+        }
+        window.makeKeyAndVisible()
+        shell.activateWindow()
         app.ui.sceneHooks?.sceneDidConnect(windowScene, options: connectionOptions, navigator: shell)
         for context in connectionOptions.urlContexts { shell.handle(url: context.url) }
         if let item = connectionOptions.shortcutItem {
@@ -79,28 +87,51 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     func windowScene(_ windowScene: UIWindowScene, performActionFor shortcutItem: UIApplicationShortcutItem,
                      completionHandler: @escaping (Bool) -> Void) {
+        shell?.activateWindow()
         NibApp.shared?.perform(CommandIDs.appQuickAction, ["type": .string(shortcutItem.type)], session: shell?.session)
         completionHandler(true)
     }
 
     func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+        shell?.activateWindow()
         for context in URLContexts { shell?.handle(url: context.url) }
     }
 
     func sceneDidBecomeActive(_ scene: UIScene) {
         guard let shell = shell, let app = NibApp.shared else { return }
-        app.ui.activeNavigator = shell
-        app.services.sessions.activate(shell.session)
+        // Several windows become active together; the key one wins, and any active one beats a window that is not key.
+        let current = app.ui.activeNavigator
+        if shell.isKeyWindow || current == nil || (current as? ShellViewController)?.isKeyWindow != true {
+            shell.activateWindow()
+        }
     }
 
     func sceneDidDisconnect(_ scene: UIScene) {
-        guard let shell = shell else { return }
-        NibApp.shared?.services.sessions.remove(shell.session)
+        if let observer = keyObserver { NotificationCenter.default.removeObserver(observer) }
+        keyObserver = nil
+        guard let shell = shell, let app = NibApp.shared else { return }
+        app.services.sessions.remove(shell.session)
+        guard app.ui.activeNavigator === shell else { return }
+        app.ui.activeNavigator = nil
+        SceneDelegate.nextWindow(after: scene)?.activateWindow()
     }
 
     func stateRestorationActivity(for scene: UIScene) -> NSUserActivity? {
         guard let shell = shell else { return nil }
         return NibApp.shared?.ui.sceneHooks?.restorationActivity(shell)
+    }
+
+    /// The window that takes over when `closed` goes away: the key window, else the most recently active session's,
+    /// else any foreground window.
+    private static func nextWindow(after closed: UIScene) -> ShellViewController? {
+        let shells = UIApplication.shared.connectedScenes
+            .filter { $0 !== closed && $0.activationState != .unattached && $0.activationState != .background }
+            .compactMap { ($0.delegate as? SceneDelegate)?.shell }
+        if let key = shells.first(where: { $0.isKeyWindow }) { return key }
+        if let active = NibApp.shared?.services.sessions.active, let owner = shells.first(where: { $0.session === active }) {
+            return owner
+        }
+        return shells.first
     }
 }
 

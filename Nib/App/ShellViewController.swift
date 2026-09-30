@@ -13,6 +13,12 @@ final class ShellViewController: UIViewController, SceneNavigator {
     private var content: UIViewController?
     private var tabBar: UIView?
     private var failureObserver: NSObjectProtocol?
+    /// What the window shows right now, for key commands (`KeyCommandContext`): a document of `shownKind`, or the
+    /// library / onboarding. `activeDocument` stays the selected tab while the library shows.
+    private var showsDocument = false
+    private var shownKind: DocumentKind?
+    /// The UIKeyCommands last handed to UIKit, rebuilt when the registry or the window's context changes.
+    private var keyCommandCache: (generation: UInt64, context: KeyCommandContext, commands: [UIKeyCommand])?
 
     init(app: NibApp) {
         self.app = app
@@ -30,7 +36,7 @@ final class ShellViewController: UIViewController, SceneNavigator {
         view.backgroundColor = .systemBackground
         failureObserver = NotificationCenter.default.addObserver(forName: .nibCommandFailed, object: nil, queue: .main) { [weak self] note in
             let message = (note.userInfo?["error"] as? NibError)?.message ?? "Something went wrong"
-            Task { @MainActor in self?.toast(message) }
+            Task { @MainActor in self?.toastIfActive(message) }
         }
         if let onboarding = app.ui.screens.onboarding?(app, self) {
             display(onboarding)
@@ -41,7 +47,7 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        becomeFirstResponder()
+        reclaimKeyFocusIfNeeded()
     }
 
     override func viewDidLayoutSubviews() {
@@ -55,10 +61,50 @@ final class ShellViewController: UIViewController, SceneNavigator {
         }
     }
 
+    // MARK: Window activation (key-window tracking)
+
+    /// Makes this window the one that app-level commands target: `ui.activeNavigator` (what `ctx.navigator` returns to
+    /// `window.showLibrary`, `doc.open`, `panel.open`…) and the active session (`ctx.activeSession`, `session.activated`).
+    /// The scene delegate calls it when the window becomes key or its scene becomes active, and the key-command bridge
+    /// before every command it runs.
+    func activateWindow() {
+        if app.ui.activeNavigator !== self { app.ui.activeNavigator = self }
+        app.services.sessions.activate(session)   // emits `session.activated` only when it changes
+    }
+
+    /// The window became key (the scene delegate observes `UIWindow.didBecomeKeyNotification`): commands now target it,
+    /// and it takes keyboard focus when nothing inside it has it, so its key commands work at once.
+    func windowDidBecomeKey() {
+        activateWindow()
+        reclaimKeyFocusIfNeeded()
+    }
+
+    /// True when this window is the key window, i.e. the one that receives hardware keys.
+    var isKeyWindow: Bool { viewIfLoaded?.window?.isKeyWindow ?? false }
+
+    // MARK: Presentation state of the content (status bar, home indicator, system edge gestures)
+
+    // The shown screen decides (the document chrome hides the status bar for P-106 / `editing.hideStatusBar`,
+    // presentation and full-screen modes hide the home indicator and defer edge gestures).
+    override var childForStatusBarHidden: UIViewController? { content }
+    override var childForStatusBarStyle: UIViewController? { content }
+    override var childForHomeIndicatorAutoHidden: UIViewController? { content }
+    override var childForScreenEdgesDeferringSystemGestures: UIViewController? { content }
+    override var childViewControllerForPointerLock: UIViewController? { content }
+
+    private func contentPresentationDidChange() {
+        setNeedsStatusBarAppearanceUpdate()
+        setNeedsUpdateOfHomeIndicatorAutoHidden()
+        setNeedsUpdateOfScreenEdgesDeferringSystemGestures()
+        setNeedsUpdateOfPrefersPointerLocked()
+    }
+
     // MARK: SceneNavigator
 
     func showLibrary(folder: FolderID?) {
         session.document = nil
+        showsDocument = false
+        shownKind = nil
         display(app.ui.screens.libraryRoot?(app, self) ?? FallbackLibraryViewController(app: app, navigator: self))
     }
 
@@ -97,10 +143,20 @@ final class ShellViewController: UIViewController, SceneNavigator {
         session.selection = Selection()
         session.page = page ?? docContent.livePages.first?.id
         let kind = docContent.meta.kind
+        showsDocument = true
+        shownKind = kind
         let editor = app.ui.editors.get(kind.rawValue)?.make(doc, session, app)
             ?? FallbackEditorViewController(message: "No editor is installed for \(kind.rawValue) documents.")
         display(app.ui.screens.documentContainer?(editor, doc, app, self) ?? editor)
         if let p = page { session.editor?.reveal(page: p, rect: nil, animated: false) }
+    }
+
+    /// contracts-v2 (G1): a restored tab joins the tab strip without being shown and without building its editor;
+    /// selecting it later opens it (through `ui.openGate`) like any other tab.
+    func addTab(_ doc: DocumentID) {
+        guard !openDocuments.contains(doc) else { return }
+        openDocuments.append(doc)
+        refreshTabBar()
     }
 
     func closeDocument(_ doc: DocumentID) {
@@ -132,27 +188,99 @@ final class ShellViewController: UIViewController, SceneNavigator {
 
     override var canBecomeFirstResponder: Bool { true }
 
+    /// What decides which key commands are live in this window: the document kind it shows, and whether text has the
+    /// keyboard (a Nib text editor sets `session.isEditingText`; any other text field or view in the window counts too,
+    /// so typing in a search field or a rename alert never switches tools).
+    var keyCommandContext: KeyCommandContext {
+        let typing = session.isEditingText || ShellFocus.isEditingText(in: viewIfLoaded?.window)
+        return KeyCommandContext(inDocument: showsDocument, docKind: shownKind, isEditingText: typing)
+    }
+
+    /// One UIKeyCommand per shortcut: the registered descriptors live in this window (`KeyScope`, `docKinds`), the most
+    /// specific winning a shared shortcut (`KeyCommandRouting`), in registry order.
     override var keyCommands: [UIKeyCommand]? {
-        let inDocument = activeDocument != nil
-        return app.content.keyCommands.all.compactMap { d -> UIKeyCommand? in
-            switch d.scope {
-            case .global: break
-            case .library: if inDocument { return nil }
-            case .document: if !inDocument { return nil }
-            case .canvas: if !inDocument || session.isEditingText { return nil }
-            }
+        let context = keyCommandContext
+        let generation = app.content.keyCommands.generation
+        if let cache = keyCommandCache, cache.generation == generation, cache.context == context { return cache.commands }
+        let commands = KeyCommandRouting.active(app.content.keyCommands.all, in: context).map { d -> UIKeyCommand in
             let command = UIKeyCommand(title: d.title, action: #selector(runKeyCommand(_:)),
                                        input: ShellViewController.keyInput(d.shortcut.key),
                                        modifierFlags: ShellViewController.modifierFlags(d.shortcut.modifiers),
                                        propertyList: d.id)
-            command.wantsPriorityOverSystemBehavior = true
+            command.wantsPriorityOverSystemBehavior = KeyCommandRouting.overridesSystemKeys(d, in: context)
             return command
         }
+        keyCommandCache = (generation, context, commands)
+        return commands
     }
 
     @objc private func runKeyCommand(_ sender: UIKeyCommand) {
-        guard let id = sender.propertyList as? String, let d = app.content.keyCommands.get(id) else { return }
-        app.perform(d.command, d.params, session: session)
+        guard let d = liveKeyCommand(sender) else { return }
+        activateWindow()
+        let params = d.resolvedParams(for: session)
+        switch undoRoute(d, params: params) {
+        case .window?:
+            undoWindow(redo: d.command == CommandIDs.redo)
+        case .nothing?:
+            return
+        case .document?, nil:
+            app.perform(d.command, params, session: session)
+        }
+    }
+
+    /// Menu and discoverability validation: a key command is enabled while it is live in this window, and ⌘Z / ⇧⌘Z
+    /// while the document's history or the window's UndoManager has a step. A disabled key falls through to the system.
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        guard action == #selector(runKeyCommand(_:)) else { return super.canPerformAction(action, withSender: sender) }
+        guard let command = sender as? UIKeyCommand, let d = liveKeyCommand(command) else { return false }
+        return undoRoute(d, params: d.resolvedParams(for: session)) != .nothing
+    }
+
+    /// Titles follow the registry; ⌘Z / ⇧⌘Z falling back to the window's UndoManager name its step ("Undo Move Palette").
+    override func validate(_ command: UICommand) {
+        super.validate(command)
+        guard command.action == #selector(runKeyCommand(_:)), let id = command.propertyList as? String,
+              let d = app.content.keyCommands.get(id) else { return }
+        command.title = d.title
+        if case .window? = undoRoute(d, params: d.resolvedParams(for: session)), let manager = windowUndoManager {
+            command.title = d.command == CommandIDs.redo ? manager.redoMenuItemTitle : manager.undoMenuItemTitle
+        }
+    }
+
+    /// The descriptor behind a UIKeyCommand this shell built, when it is still registered and live in this window.
+    private func liveKeyCommand(_ command: UIKeyCommand) -> KeyCommandDescriptor? {
+        guard let id = command.propertyList as? String, let d = app.content.keyCommands.get(id),
+              d.isActive(in: keyCommandContext) else { return nil }
+        return d
+    }
+
+    /// The window's UndoManager: window-level steps that are not in any document ("Move Palette", F016).
+    private var windowUndoManager: UndoManager? { viewIfLoaded?.window?.undoManager }
+
+    /// Where `edit.undo` / `edit.redo` act (nil for any other command): the document's history while it has a step,
+    /// else the window's UndoManager.
+    private func undoRoute(_ d: KeyCommandDescriptor, params: JSONValue) -> UndoRoute? {
+        UndoRoute.forCommand(d.command, params: params, session: session, history: app.bus.history,
+                             window: windowUndoManager)
+    }
+
+    private func undoWindow(redo: Bool) {
+        // NSUndoManager closes one open top-level group itself; undoing inside a nested group or a replay would throw.
+        guard let manager = windowUndoManager, manager.groupingLevel <= 1,
+              !manager.isUndoing, !manager.isRedoing else { return }
+        if redo {
+            if manager.canRedo { manager.redo() }
+        } else if manager.canUndo {
+            manager.undo()
+        }
+    }
+
+    /// Takes keyboard focus back when nothing in this window has it (the responder that had it left with the screen it
+    /// belonged to), so the key commands keep working. Never takes it from a responder in this window.
+    private func reclaimKeyFocusIfNeeded() {
+        guard let window = viewIfLoaded?.window, window.isKeyWindow, !isFirstResponder,
+              !ShellFocus.hasFocus(in: window) else { return }
+        becomeFirstResponder()
     }
 
     private static func keyInput(_ key: String) -> String {
@@ -202,7 +330,11 @@ final class ShellViewController: UIViewController, SceneNavigator {
         view.addSubview(vc.view)
         vc.didMove(toParent: self)
         content = vc
+        keyCommandCache = nil
         refreshTabBar()
+        contentPresentationDidChange()
+        // The new screen may take focus as it appears; only when nothing did does the shell take it.
+        Task { @MainActor [weak self] in self?.reclaimKeyFocusIfNeeded() }
     }
 
     private func refreshTabBar() {
@@ -213,6 +345,12 @@ final class ShellViewController: UIViewController, SceneNavigator {
             tabBar = bar
         }
         view.setNeedsLayout()
+    }
+
+    /// Command failures are posted app-wide; only the window the user is working in shows them.
+    private func toastIfActive(_ message: String) {
+        guard app.ui.activeNavigator === self || app.ui.activeNavigator == nil else { return }
+        toast(message)
     }
 
     private func toast(_ message: String) {
@@ -236,6 +374,49 @@ final class ShellViewController: UIViewController, SceneNavigator {
         } completion: { _ in
             label.removeFromSuperview()
         }
+    }
+}
+
+// MARK: - Keyboard focus
+
+/// Which responder has the keyboard in the key window. UIKit has no public accessor, so a nil-targeted action asks
+/// the first responder to identify itself (it reaches the window, scene or application when nothing has focus).
+@MainActor
+enum ShellFocus {
+    fileprivate static weak var captured: UIResponder?
+
+    static func firstResponder() -> UIResponder? {
+        captured = nil
+        defer { captured = nil }
+        UIApplication.shared.sendAction(#selector(UIResponder.nibShellCaptureFirstResponder(_:)), to: nil, from: nil, for: nil)
+        return captured
+    }
+
+    /// True when a view or view controller inside `window` has the keyboard.
+    static func hasFocus(in window: UIWindow) -> Bool {
+        guard let responder = firstResponder() else { return false }
+        return self.window(of: responder) === window
+    }
+
+    /// True when an editable text field or text view (or another text input) in `window` has the keyboard.
+    static func isEditingText(in window: UIWindow?) -> Bool {
+        guard let window, let responder = firstResponder(), self.window(of: responder) === window else { return false }
+        if let textView = responder as? UITextView { return textView.isEditable }
+        if let field = responder as? UITextField { return field.isEnabled }
+        return responder is UIKeyInput
+    }
+
+    private static func window(of responder: UIResponder) -> UIWindow? {
+        if responder is UIWindow { return nil }   // the window itself: nothing inside it has focus
+        if let view = responder as? UIView { return view.window }
+        if let controller = responder as? UIViewController { return controller.viewIfLoaded?.window }
+        return nil
+    }
+}
+
+extension UIResponder {
+    @objc fileprivate func nibShellCaptureFirstResponder(_ sender: Any?) {
+        ShellFocus.captured = self
     }
 }
 

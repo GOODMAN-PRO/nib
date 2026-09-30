@@ -91,7 +91,9 @@ enum NameLookupCanary {
         DrawPurpose.self, ExportOptionKeys.self, TextLayoutInfo.self, TextLayoutDescriptor.self, PanelPresentation.self,
         ChromePlacement.self, ChromeSurface.self, ChromeAnchor.self, ChromeContext.self, ChromeOverlayDescriptor.self,
         DisplayFontWeight.self, NibFragment.self, BridgeNames.self, PanelIDs.self, ToolbarLayoutSetting.self,
-        TemplateIDs.self, TemplateParamNames.self, FloatingHosting.self, ToolMenuPopover.self, NibSnapshot.self
+        TemplateIDs.self, TemplateParamNames.self, FloatingHosting.self, ToolMenuPopover.self, NibSnapshot.self,
+        // contracts-v2.2 (app shell)
+        KeyCommandContext.self, KeyCommandRouting.self, UndoRoute.self
     ]
 
     /// Protocols with associated types / Self requirements are checked as generic constraints.
