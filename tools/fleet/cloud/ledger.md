@@ -61,3 +61,4 @@ Blocked on contracts-v2: F031 (revert bug), all IMPLEMENT (61 features incl. F06
 - Shell v2 (branch v2/shell, Nib/App/** scaffold-owned): key commands honour docKinds/sessionParams, ⌘Z window-undo fallback, key-window tracking, childForStatusBarHidden, user-fonts entitlement. After merge: F102/F014 re-register scoped key commands.
 - NibDesign gaps (F013): non-refracting Clear capsule preset; non-modal bud from a source (object menu); contract to distinguish input types (right-click vs finger/pencil long press).
 - contract gaps (F023 review): F108 per-page seen-state contract; shared nib-pages/1 payload type (F022/F023 duplicate).
+- Spec pass 2: scan.documents gains anchor? (F065). F055 V2ADOPT: IndexKeys.scanText -> PageRecord.scanTextExtKey.
