@@ -78,7 +78,8 @@ final class TimeKeeper: ObservableObject {
     @Published private(set) var barVisible = true
     @Published private(set) var modes: [TimerPreset] = []
     @Published private(set) var history: [TimerRecord] = []
-    /// The Time Keeper panel is on screen (its view reports this).
+    /// A Time Keeper panel is on screen in some window (its view reports this). Only windows without a document fall
+    /// back to it; see `isPanelOpen(in:)`.
     var panelOpen = false
     /// Nib is in the foreground (set from the app's active and background notifications in `begin`; tests set it).
     /// In the background the scheduled notification is how a countdown's end is heard, so a finish noticed then
@@ -128,6 +129,14 @@ final class TimeKeeper: ObservableObject {
 
     /// The bar overlay is up in canvas windows: a session is active and its bar is not hidden.
     var showsBarOverlay: Bool { engine.isActive && barVisible }
+
+    /// The Time Keeper panel is open in `session`'s window. The document chrome keeps each window's open panels in
+    /// `EditorSession.openPanels` (contracts-v2), so K and `hide` act on the window they came from; a window without a
+    /// document (the library) falls back to the panel's own report.
+    func isPanelOpen(in session: EditorSession?) -> Bool {
+        guard let session, session.document != nil else { return panelOpen }
+        return session.openPanels.contains(Self.panelID)
+    }
 
     // MARK: Sessions
 
@@ -259,7 +268,8 @@ final class TimeKeeper: ObservableObject {
     /// a text document, a study set) needs an alert: iPad has no haptics and VoiceOver's announcement reaches only
     /// VoiceOver users.
     func finishNeedsAlert() -> Bool {
-        isForeground && !panelOpen && !showsBar(in: app?.services.sessions.active)
+        let active = app?.services.sessions.active
+        return isForeground && !isPanelOpen(in: active) && !showsBar(in: active)
     }
 
     /// "Time's up" with Start Again and Done, on the active window.
@@ -273,10 +283,10 @@ final class TimeKeeper: ObservableObject {
         alert.addAction(UIAlertAction(title: String(localized: "Start Again"), style: .default) { [weak self, weak navigator] _ in
             var params: [String: JSONValue] = ["seconds": .number(Double(seconds))]
             if let label { params["label"] = .string(label) }
-            self?.perform("timer.start", .object(params), session: navigator?.session)
+            self?.perform(CommandIDs.timerStart, .object(params), session: navigator?.session)
         })
         alert.addAction(UIAlertAction(title: String(localized: "Done"), style: .cancel) { [weak self] _ in
-            self?.perform("timer.control", ["action": "stop"])
+            self?.perform(CommandIDs.timerControl, ["action": "stop"])
         })
         finishAlert = alert
         navigator.presentModal(alert)
@@ -460,11 +470,9 @@ final class TimeKeeper: ObservableObject {
         } ?? false
     }
 
-    /// The window the user is in: the active navigator's, else the active session's (hostless tests have no
-    /// navigator; the shell sets both together).
-    private var activeWindow: NibID? {
-        app?.ui.activeNavigator?.session.id ?? app?.services.sessions.active?.id
-    }
+    /// The window the user is in: the shell makes the key window the active session (contracts-v2.2), together with
+    /// `ui.activeNavigator`, and emits `session.activated`.
+    private var activeWindow: NibID? { app?.services.sessions.active?.id }
 
     /// Asks the window that left the session's document once it is the active one, while that still matters: the
     /// session is running or paused, the window has not gone back to the document, no other window shows it and the
@@ -494,10 +502,10 @@ final class TimeKeeper: ObservableObject {
             message: String(localized: "Stop it and save the session to your history, or keep it while you work elsewhere."),
             preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: String(localized: "Stop and Save"), style: .default) { [weak self] _ in
-            self?.perform("timer.control", ["action": "stop"])
+            self?.perform(CommandIDs.timerControl, ["action": "stop"])
         })
         alert.addAction(UIAlertAction(title: String(localized: "Discard Session"), style: .destructive) { [weak self] _ in
-            self?.perform("timer.control", ["action": "discard"])
+            self?.perform(CommandIDs.timerControl, ["action": "discard"])
         })
         alert.addAction(UIAlertAction(title: String(localized: "Keep Session"), style: .cancel))
         navigator.presentModal(alert)
@@ -535,7 +543,7 @@ struct TimerStart: NibCommand {
     typealias Output = TimerStatus
 
     static let descriptor = CommandDescriptor(
-        id: "timer.start", title: "Start Timer",
+        id: CommandIDs.timerStart, title: "Start Timer",
         summary: "Start a Time Keeper countdown of `seconds` (1–86400) with an optional label; a running timer or stopwatch is stopped and saved first.",
         params: .obj(["seconds": .int("countdown length in seconds", min: 1, max: TimerEngine.maxSeconds),
                       "label": .str("optional name shown on the bar and in history (one line, ≤ 60 characters)")],
@@ -567,7 +575,7 @@ struct TimerControl: NibCommand {
     typealias Output = TimerStatus
 
     static let descriptor = CommandDescriptor(
-        id: "timer.control", title: "Control Time Keeper",
+        id: CommandIDs.timerControl, title: "Control Time Keeper",
         summary: "Pause, resume or end the Time Keeper timer/stopwatch (stop saves it to history, discard does not), show/hide its bar without stopping it, or open its panel.",
         params: .obj(["action": .str("what to do", choices: Action.allCases.map { $0.rawValue }),
                       "instant": .bool("keyboard: open the panel without the bud animation")],
@@ -601,10 +609,10 @@ struct TimerControl: NibCommand {
             await hide(keeper, ctx)
         case .toggleVisibility:
             // On a canvas the key and the accessory toggle the bar of a running session; everywhere else, and with
-            // nothing running, they open and close the panel.
+            // nothing running, they open and close the panel of the window they came from.
             if keeper.engine.isActive && keeper.showsBar(in: ctx.activeSession) {
                 keeper.setBarVisible(!keeper.barVisible)
-            } else if keeper.panelOpen {
+            } else if keeper.isPanelOpen(in: ctx.activeSession) {
                 await closePanel(ctx)
             } else {
                 await openPanel(ctx, instant: instant)
@@ -661,22 +669,23 @@ struct TimerControl: NibCommand {
         }
     }
 
-    /// Hides the bar (the session keeps running) and closes the panel.
+    /// Hides the bar (the session keeps running) and closes the panel of the calling window.
     private static func hide(_ keeper: TimeKeeper, _ ctx: CommandContext) async {
         if keeper.engine.isActive { keeper.setBarVisible(false) }
-        if keeper.panelOpen { await closePanel(ctx) }
+        if keeper.isPanelOpen(in: ctx.activeSession) { await closePanel(ctx) }
     }
 
-    /// The panel host is the document chrome (F017), an optional dependency: without it the call is a no-op.
-    /// `instant` (the K key) reaches the host as `PanelContext.params`, so it opens without the bud (DESIGN.md §9.3).
+    /// The panel host is the document chrome (F017), which hands a window without a document to the library (F019,
+    /// spec pass 2); both are optional dependencies, so without them the call is a no-op. `instant` (the K key)
+    /// reaches the host as `PanelContext.params`, so it opens without the bud (DESIGN.md §9.3).
     private static func openPanel(_ ctx: CommandContext, instant: Bool) async {
         var params: [String: JSONValue] = ["id": .string(TimeKeeper.panelID)]
         if instant { params["params"] = ["instant": true] }
-        _ = try? await ctx.execute("panel.open", .object(params))
+        _ = try? await ctx.execute(CommandIDs.panelOpen, .object(params))
     }
 
     private static func closePanel(_ ctx: CommandContext) async {
-        _ = try? await ctx.execute("panel.close", ["id": .string(TimeKeeper.panelID)])
+        _ = try? await ctx.execute(CommandIDs.panelClose, ["id": .string(TimeKeeper.panelID)])
     }
 }
 
@@ -685,7 +694,7 @@ struct StopwatchStart: NibCommand {
     typealias Output = TimerStatus
 
     static let descriptor = CommandDescriptor(
-        id: "stopwatch.start", title: "Start Stopwatch",
+        id: CommandIDs.stopwatchStart, title: "Start Stopwatch",
         summary: "Start the Time Keeper stopwatch from zero; a running timer or stopwatch is stopped and saved first.",
         params: .empty, examples: [[:]], effect: .session, target: .app)
 
@@ -702,7 +711,7 @@ struct StopwatchLap: NibCommand {
     typealias Output = TimerStatus
 
     static let descriptor = CommandDescriptor(
-        id: "stopwatch.lap", title: "Record Lap",
+        id: CommandIDs.stopwatchLap, title: "Record Lap",
         summary: "Record a lap on the running Time Keeper stopwatch; returns every lap with its total and split in seconds.",
         params: .empty, examples: [[:]], effect: .session, target: .app)
 
@@ -737,7 +746,7 @@ struct TimerHistory: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "timer.history", title: "Time Keeper History",
+        id: CommandIDs.timerHistory, title: "Time Keeper History",
         summary: "Past Time Keeper sessions newest first (name, document, duration, laps), plus the running session and saved modes; page with cursor.",
         params: .obj(["limit": .int("sessions per page (default 50)", min: 1, max: 200),
                       "cursor": .str("the cursor of the previous page")]),
@@ -774,7 +783,7 @@ struct TimerSaveMode: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "timer.saveMode", title: "Save Timer Mode",
+        id: CommandIDs.timerSaveMode, title: "Save Timer Mode",
         summary: "Save a named custom timer mode of `seconds` (1–86400), synced across devices; a mode of the same name (any case) is replaced.",
         params: .obj(["name": .str("mode name, one line of at most 40 characters"),
                       "seconds": .int("length in seconds", min: 1, max: TimerEngine.maxSeconds)],
@@ -800,7 +809,7 @@ struct TimerDeleteMode: NibCommand {
     typealias Output = TimerSaveMode.Output
 
     static let descriptor = CommandDescriptor(
-        id: "timer.deleteMode", title: "Delete Timer Mode",
+        id: CommandIDs.timerDeleteMode, title: "Delete Timer Mode",
         summary: "Delete a saved custom timer mode by name (any case) on every device; timer.history lists the saved modes.",
         params: .obj(["name": .str("the mode's name")], required: ["name"]),
         examples: [["name": "Pomodoro"]],

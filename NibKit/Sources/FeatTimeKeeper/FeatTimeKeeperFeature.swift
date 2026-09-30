@@ -51,13 +51,14 @@ public enum FeatTimeKeeperFeature: NibFeature {
         let icon = NibSymbol.timer.name
         var accessory = ToolbarItemDescriptor(
             id: "timekeeper", title: title, icon: icon, group: .accessories, order: 700, owner: id,
-            command: "timer.control", params: ["action": "toggleVisibility"], shortcut: KeyShortcut("k"))
+            command: CommandIDs.timerControl, params: ["action": "toggleVisibility"], shortcut: KeyShortcut("k"))
         // On while a timer or stopwatch is running, paused or finished and not yet cleared.
         accessory.isOn = { _ in keeper.engine.isActive }
         app.ui.toolbar.register(accessory)
         app.ui.menus.register(MenuItemDescriptor(
             id: "timekeeper.more", title: title, icon: icon, location: .documentMore, order: 700, owner: id,
-            command: "timer.control", params: { _ in ["action": "open"] }))
+            command: CommandIDs.timerControl, params: { _ in ["action": "open"] }))
+        // The panel host draws the header (title, glyph, placement menu and Close): `providesHeader` stays false.
         app.ui.panels.register(PanelDescriptor(
             id: TimeKeeper.panelID, title: title, icon: icon, placement: .floating, order: 700, owner: id,
             makeView: { context in AnyView(TimeKeeperPanel(keeper: keeper, context: context)) }))
@@ -70,19 +71,22 @@ public enum FeatTimeKeeperFeature: NibFeature {
             makeView: { context in AnyView(TimeKeeperBar(keeper: keeper, session: context.session)) }))
 
         // Keyboard paths never animate (DESIGN.md §9.3), so K passes `instant` (the panel host reads it from
-        // PanelContext.params and skips the bud).
+        // PanelContext.params and skips the bud). The shell routes these through KeyCommandRouting (contracts-v2.2):
+        // K is a plain letter, so it is `.canvas` (any document, never while text has the keyboard). The session runs
+        // app-wide and its panel also opens over the library (spec pass 2), so ⇧⌘K and ⌥⌘K are `.global`: a
+        // `.document` key is no longer live in a library window.
         func key(_ name: String, _ title: String, _ shortcut: KeyShortcut, _ command: String, _ params: JSONValue,
                  _ scope: KeyScope) {
             app.content.keyCommands.register(KeyCommandDescriptor(
                 id: id + "." + name, title: title, shortcut: shortcut, command: command, params: params, scope: scope,
                 owner: id))
         }
-        key("toggle", String(localized: "Show or Hide Time Keeper"), KeyShortcut("k"), "timer.control",
+        key("toggle", String(localized: "Show or Hide Time Keeper"), KeyShortcut("k"), CommandIDs.timerControl,
             ["action": "toggleVisibility", "instant": true], .canvas)
         key("pause", String(localized: "Pause or Resume Time Keeper"), KeyShortcut("k", [.command, .shift]),
-            "timer.control", ["action": "togglePause"], .document)
-        key("lap", String(localized: "Record Stopwatch Lap"), KeyShortcut("k", [.command, .option]), "stopwatch.lap",
-            [:], .document)
+            CommandIDs.timerControl, ["action": "togglePause"], .global)
+        key("lap", String(localized: "Record Stopwatch Lap"), KeyShortcut("k", [.command, .option]),
+            CommandIDs.stopwatchLap, [:], .global)
     }
 
     public static func start(_ app: NibApp) async {

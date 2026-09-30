@@ -31,7 +31,8 @@ struct TimeKeeperProgress: View {
 
 /// The Time Keeper panel (a floating Deep panel from the document chrome; a sheet in compact windows). Idle: Timer or
 /// Stopwatch, the duration typed or handwritten, presets, your saved modes and a name. Running: the clock, controls
-/// and laps. Always: the session history.
+/// and laps. Always: the session history. The host draws the panel header (contracts-v2 `providesHeader` is false),
+/// so the view starts with its content.
 struct TimeKeeperPanel: View {
     @ObservedObject var keeper: TimeKeeper
     let context: PanelContext
@@ -55,25 +56,22 @@ struct TimeKeeperPanel: View {
     private var seconds: Int? { DurationParser.seconds(from: durationText) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            NibPanelHeader(title: String(localized: "Time Keeper"), symbol: NibSymbol.timer) { context.dismiss() }
-            ScrollView {
-                VStack(alignment: .leading, spacing: NibSpacing.xl) {
-                    if keeper.engine.isActive {
-                        TimeKeeperRunningSection(keeper: keeper, barAvailable: keeper.showsBar(in: context.session),
-                                                 run: { command, params in run(command, params) })
-                    } else {
-                        setup
-                    }
-                    // A value, compared before its body is built: the clock above ticks every second, the history
-                    // changes only when a session ends.
-                    TimeKeeperHistorySection(records: keeper.history).equatable()
+        ScrollView {
+            VStack(alignment: .leading, spacing: NibSpacing.xl) {
+                if keeper.engine.isActive {
+                    TimeKeeperRunningSection(keeper: keeper, barAvailable: keeper.showsBar(in: context.session),
+                                             run: { command, params in run(command, params) })
+                } else {
+                    setup
                 }
-                .padding(NibSpacing.l)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // A value, compared before its body is built: the clock above ticks every second, the history
+                // changes only when a session ends.
+                TimeKeeperHistorySection(records: keeper.history).equatable()
             }
-            .scrollBounceBehavior(.basedOnSize)
+            .padding(NibSpacing.l)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .scrollBounceBehavior(.basedOnSize)
         .onAppear {
             keeper.panelOpen = true
             keeper.refreshStored()
@@ -90,7 +88,7 @@ struct TimeKeeperPanel: View {
         .confirmationDialog(String(localized: "Delete this mode?"), isPresented: deleteIsPresented,
                             titleVisibility: .visible, presenting: pendingDelete) { mode in
             Button(String(localized: "Delete Mode"), role: .destructive) {
-                run("timer.deleteMode", ["name": .string(mode.name)])
+                run(CommandIDs.timerDeleteMode, ["name": .string(mode.name)])
             }
         } message: { mode in
             Text(String(localized: "\(mode.name) will be removed from your modes on every device."))
@@ -131,7 +129,7 @@ struct TimeKeeperPanel: View {
                 .foregroundStyle(NibColor.labelSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             NibButton(String(localized: "Start Stopwatch"), symbol: .play, kind: .primary, expands: true) {
-                run("stopwatch.start")
+                run(CommandIDs.stopwatchStart)
                 dismissIfBarShows()
             }
         }
@@ -290,7 +288,7 @@ struct TimeKeeperPanel: View {
         var params: [String: JSONValue] = ["seconds": .number(Double(s))]
         let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
         if !label.isEmpty { params["label"] = .string(label) }
-        run("timer.start", .object(params))
+        run(CommandIDs.timerStart, .object(params))
         let k = keeper
         k.notifier.requestAuthorizationIfNeeded { k.rescheduleNotification() }
         dismissIfBarShows()
@@ -305,7 +303,7 @@ struct TimeKeeperPanel: View {
         guard let s = seconds else { return }
         let mode = modeName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !mode.isEmpty else { return }
-        run("timer.saveMode", ["name": .string(mode), "seconds": .number(Double(s))])
+        run(CommandIDs.timerSaveMode, ["name": .string(mode), "seconds": .number(Double(s))])
         modeName = ""
     }
 }
@@ -391,7 +389,7 @@ struct TimeKeeperRunningSection: View {
         .confirmationDialog(String(localized: "Discard this session?"), isPresented: $confirmsDiscard,
                             titleVisibility: .visible) {
             Button(String(localized: "Discard Session"), role: .destructive) {
-                run("timer.control", ["action": "discard"])
+                run(CommandIDs.timerControl, ["action": "discard"])
             }
         } message: {
             Text(String(localized: "It won't be saved to your history."))
@@ -414,7 +412,7 @@ struct TimeKeeperRunningSection: View {
                 if barAvailable {
                     NibButton(keeper.barVisible ? String(localized: "Hide Bar") : String(localized: "Show Bar"),
                               symbol: keeper.barVisible ? NibSymbol.eyeSlash : NibSymbol.eye, kind: .plain) {
-                        run("timer.control", ["action": keeper.barVisible ? "hide" : "show"])
+                        run(CommandIDs.timerControl, ["action": keeper.barVisible ? "hide" : "show"])
                     }
                 }
                 Spacer(minLength: 0)
@@ -429,10 +427,10 @@ struct TimeKeeperRunningSection: View {
         NibButton(String(localized: "Start Again"), symbol: .retry, expands: true) {
             var params: [String: JSONValue] = ["seconds": .number(Double(e.seconds))]
             if let label = e.label { params["label"] = .string(label) }
-            run("timer.start", .object(params))
+            run(CommandIDs.timerStart, .object(params))
         }
         NibButton(String(localized: "Done"), symbol: .checkmark, expands: true) {
-            run("timer.control", ["action": "stop"])
+            run(CommandIDs.timerControl, ["action": "stop"])
         }
     }
 
@@ -440,15 +438,15 @@ struct TimeKeeperRunningSection: View {
         NibButton(e.state == .running ? String(localized: "Pause") : String(localized: "Resume"),
                   symbol: e.state == .running ? NibSymbol.pause : NibSymbol.play, expands: true,
                   shortcut: TimeKeeperKeys.pause) {
-            run("timer.control", ["action": "togglePause"])
+            run(CommandIDs.timerControl, ["action": "togglePause"])
         }
         if e.kind == .stopwatch && e.state == .running {
             NibButton(String(localized: "Lap"), symbol: NibSymbol.lap, expands: true, shortcut: TimeKeeperKeys.lap) {
-                run("stopwatch.lap", [:])
+                run(CommandIDs.stopwatchLap, [:])
             }
         }
         NibButton(String(localized: "Stop and Save"), symbol: .stop, expands: true) {
-            run("timer.control", ["action": "stop"])
+            run(CommandIDs.timerControl, ["action": "stop"])
         }
     }
 }
@@ -600,27 +598,27 @@ struct TimeKeeperBar: View {
                     NibIconButton(.retry, label: String(localized: "Start Again")) {
                         var params: [String: JSONValue] = ["seconds": .number(Double(e.seconds))]
                         if let label = e.label { params["label"] = .string(label) }
-                        run("timer.start", .object(params))
+                        run(CommandIDs.timerStart, .object(params))
                     }
                 } else {
                     NibIconButton(e.state == .running ? NibSymbol.pause : NibSymbol.play,
                                   label: e.state == .running ? String(localized: "Pause") : String(localized: "Resume"),
                                   shortcut: TimeKeeperKeys.pause) {
-                        run("timer.control", ["action": "togglePause"])
+                        run(CommandIDs.timerControl, ["action": "togglePause"])
                     }
                 }
                 summary(e, at: t)
                 if e.kind == .stopwatch && e.state == .running {
                     NibIconButton(NibSymbol.lap, label: String(localized: "Record Lap"), shortcut: TimeKeeperKeys.lap) {
-                        run("stopwatch.lap")
+                        run(CommandIDs.stopwatchLap)
                     }
                 }
                 NibIconButton(e.state == .finished ? NibSymbol.checkmark : NibSymbol.stop,
                               label: e.state == .finished ? String(localized: "Done") : String(localized: "Stop and Save")) {
-                    run("timer.control", ["action": "stop"])
+                    run(CommandIDs.timerControl, ["action": "stop"])
                 }
                 NibIconButton(.chevronDown, label: String(localized: "Hide Time Keeper")) {
-                    run("timer.control", ["action": "hide"])
+                    run(CommandIDs.timerControl, ["action": "hide"])
                 }
             }
             .padding(.horizontal, NibSpacing.xs)
@@ -639,7 +637,7 @@ struct TimeKeeperBar: View {
     private func summary(_ e: TimerEngine, at t: Date) -> some View {
         let spoken = TimerFormat.spokenDisplay(e, at: t)
         return Button {
-            run("timer.control", ["action": "open"])
+            run(CommandIDs.timerControl, ["action": "open"])
         } label: {
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 HStack(spacing: NibSpacing.s) {

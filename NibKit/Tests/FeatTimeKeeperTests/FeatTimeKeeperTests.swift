@@ -67,10 +67,15 @@ final class FeatTimeKeeperTests: XCTestCase {
     func testRegistersCommandsAccessoryPanelKeysAndBar() throws {
         let (h, _, _, _) = try make()
         XCTAssertEqual(FeatTimeKeeperFeature.id, "timekeeper")
-        for id in ["timer.start", "timer.control", "stopwatch.start", "stopwatch.lap", "timer.history",
-                   "timer.saveMode", "timer.deleteMode"] {
+        // The catalogue constants (contracts-v2.1) name exactly the commands the feature registers.
+        let ids = [CommandIDs.timerStart, CommandIDs.timerControl, CommandIDs.stopwatchStart, CommandIDs.stopwatchLap,
+                   CommandIDs.timerHistory, CommandIDs.timerSaveMode, CommandIDs.timerDeleteMode]
+        XCTAssertEqual(ids, ["timer.start", "timer.control", "stopwatch.start", "stopwatch.lap", "timer.history",
+                             "timer.saveMode", "timer.deleteMode"])
+        for id in ids {
             XCTAssertEqual(h.app.commands.descriptor(id)?.owner, "timekeeper", id)
         }
+        XCTAssertEqual(Set(h.app.commands.all().filter { $0.owner == "timekeeper" }.map { $0.id }), Set(ids))
         XCTAssertEqual(h.app.commands.descriptor("timer.history")?.effect, .read)
         XCTAssertEqual(h.app.commands.descriptor("timer.start")?.effect, .session)
         XCTAssertEqual(h.app.commands.descriptor("timer.deleteMode")?.destructive, true)
@@ -82,6 +87,7 @@ final class FeatTimeKeeperTests: XCTestCase {
         XCTAssertEqual(accessory?.params, ["action": "toggleVisibility"])
         XCTAssertEqual(h.app.ui.menus.get("timekeeper.more")?.command, "timer.control")
         XCTAssertEqual(h.app.ui.panels.get("timekeeper")?.placement, .floating)
+        XCTAssertEqual(h.app.ui.panels.get("timekeeper")?.providesHeader, false, "the panel host draws the header")
         let bar = try XCTUnwrap(h.app.ui.chromeOverlays.get("timekeeper.bar"), "the bar is a chrome overlay")
         XCTAssertEqual(bar.placement, .bottom)
         XCTAssertEqual(bar.surface, .bar)
@@ -91,7 +97,9 @@ final class FeatTimeKeeperTests: XCTestCase {
         XCTAssertEqual(h.app.content.keyCommands.get("timekeeper.toggle")?.shortcut, KeyShortcut("k"))
         XCTAssertEqual(h.app.content.keyCommands.get("timekeeper.toggle")?.scope, .canvas)
         XCTAssertEqual(h.app.content.keyCommands.get("timekeeper.pause")?.command, "timer.control")
+        XCTAssertEqual(h.app.content.keyCommands.get("timekeeper.pause")?.scope, .global)
         XCTAssertEqual(h.app.content.keyCommands.get("timekeeper.lap")?.command, "stopwatch.lap")
+        XCTAssertEqual(h.app.content.keyCommands.get("timekeeper.lap")?.scope, .global)
         XCTAssertNotNil(h.app.settings.descriptor("timer.history.ABC"))
         XCTAssertEqual(h.app.settings.descriptor("timer.history.ABC")?.synced, true)
         XCTAssertEqual(h.app.settings.descriptor("timer.modes.Pomodoro")?.synced, true)
@@ -252,6 +260,109 @@ final class FeatTimeKeeperTests: XCTestCase {
         XCTAssertEqual(opened.count, 3)
         XCTAssertEqual(opened.last, ["id": "timekeeper"], "the menu opens it with the usual bud")
         XCTAssertTrue(keeper.loadHistory().isEmpty, "a discarded session is not saved")
+    }
+
+    /// Where the shell (contracts-v2.2 `KeyCommandRouting`) makes each Time Keeper key live, and what it runs.
+    func testKeysFollowTheShellsRouting() async throws {
+        let (h, keeper, _, _) = try make()
+        let keys = h.app.content.keyCommands.all.filter { $0.owner == "timekeeper" }
+        XCTAssertEqual(keys.count, 3)
+        func live(_ context: KeyCommandContext) -> Set<String> {
+            Set(KeyCommandRouting.active(keys, in: context).map { $0.id })
+        }
+        let all: Set<String> = ["timekeeper.toggle", "timekeeper.pause", "timekeeper.lap"]
+        XCTAssertEqual(live(KeyCommandContext(docKind: .notebook)), all)
+        XCTAssertEqual(live(KeyCommandContext(docKind: .whiteboard)), all)
+        XCTAssertEqual(live(KeyCommandContext(docKind: .textDocument)), all, "K opens the panel off the canvas")
+        XCTAssertEqual(live(KeyCommandContext(docKind: .notebook, isEditingText: true)),
+                       ["timekeeper.pause", "timekeeper.lap"], "a plain K never interrupts typing")
+        XCTAssertEqual(live(KeyCommandContext(docKind: nil)), ["timekeeper.pause", "timekeeper.lap"],
+                       "the session runs app-wide, so it can be paused from the library")
+        XCTAssertEqual(live(KeyCommandContext(docKind: nil, hasTabs: true)), ["timekeeper.pause", "timekeeper.lap"])
+        let pause = try XCTUnwrap(h.app.content.keyCommands.get("timekeeper.pause"))
+        let lap = try XCTUnwrap(h.app.content.keyCommands.get("timekeeper.lap"))
+        let toggle = try XCTUnwrap(h.app.content.keyCommands.get("timekeeper.toggle"))
+        XCTAssertTrue(KeyCommandRouting.overridesSystemKeys(pause, in: KeyCommandContext(docKind: .notebook,
+                                                                                         isEditingText: true)))
+        XCTAssertEqual(toggle.resolvedParams(for: h.session), ["action": "toggleVisibility", "instant": true])
+
+        // What the shell runs for ⇧⌘K and ⌥⌘K in a library window (resolvedParams of the key window's session).
+        h.session.document = nil
+        try await h.run("stopwatch.start")
+        var status = try await h.run(lap.command, lap.resolvedParams(for: h.session))
+        XCTAssertEqual(status["laps"]?.arrayValue?.count, 1)
+        status = try await h.run(pause.command, pause.resolvedParams(for: h.session))
+        XCTAssertEqual(status["state"], "paused")
+        XCTAssertEqual(keeper.engine.state, .paused)
+    }
+
+    /// K, `hide` and the finish alert look at the panel of the window they act for: the document chrome keeps it in
+    /// `EditorSession.openPanels` (contracts-v2); a library window falls back to the panel's own report.
+    func testThePanelIsTrackedPerWindow() async throws {
+        let (h, keeper, notifier, clock) = try make()
+        // Stand-ins for the document chrome's panel host (F017), which records open panels in the window's session.
+        var calls: [String] = []
+        h.app.commands.register(CommandDescriptor(
+            id: "panel.open", title: "Open Panel", summary: "Test stand-in for the document chrome's panel host.",
+            params: .obj(["id": .str(), "params": .anything()], required: ["id"]), effect: .session, target: .app,
+            owner: "test")) { json, ctx in
+            calls.append("open")
+            if let id = json["id"]?.stringValue { ctx.activeSession?.openPanels.insert(id) }
+            return .null
+        }
+        h.app.commands.register(CommandDescriptor(
+            id: "panel.close", title: "Close Panel", summary: "Test stand-in for the document chrome's panel host.",
+            params: .obj(["id": .str()], required: ["id"]), effect: .session, target: .app,
+            owner: "test")) { json, ctx in
+            calls.append("close")
+            if let id = json["id"]?.stringValue { ctx.activeSession?.openPanels.remove(id) }
+            return .null
+        }
+        @discardableResult
+        func run(_ params: JSONValue, in session: EditorSession) async throws -> JSONValue {
+            try await h.app.bus.execute(Invocation(command: "timer.control", params: params, session: session)).value
+        }
+        let a = h.session
+        a.document = Fixtures.textDocID
+        let b = EditorSession()
+        b.document = Fixtures.textDocID
+        h.app.services.sessions.add(b)
+        h.app.services.sessions.activate(a)
+
+        try await run(["action": "toggleVisibility"], in: a)
+        XCTAssertTrue(keeper.isPanelOpen(in: a))
+        XCTAssertFalse(keeper.isPanelOpen(in: b))
+        try await run(["action": "toggleVisibility"], in: b)
+        XCTAssertEqual(calls, ["open", "open"], "K in another window opens the panel there, not closes this one")
+        try await run(["action": "toggleVisibility"], in: a)
+        XCTAssertEqual(calls.last, "close")
+        XCTAssertFalse(keeper.isPanelOpen(in: a))
+        XCTAssertTrue(keeper.isPanelOpen(in: b))
+        try await run(["action": "hide"], in: a)
+        XCTAssertEqual(calls.count, 3, "hide in a window without the panel closes nothing")
+        try await run(["action": "hide"], in: b)
+        XCTAssertEqual(calls.last, "close")
+        XCTAssertFalse(keeper.isPanelOpen(in: b))
+
+        // The finish alert: the active window's panel shows the end.
+        try await run(["action": "open"], in: a)
+        XCTAssertFalse(keeper.finishNeedsAlert(), "the panel is open in the active window")
+        h.app.services.sessions.activate(b)
+        XCTAssertTrue(keeper.finishNeedsAlert(), "the panel is open only in a window the user is not in")
+        try await h.run("timer.start", ["seconds": 30])
+        clock.advance(31)
+        keeper.tick()
+        XCTAssertEqual(keeper.engine.state, .finished)
+        XCTAssertEqual(notifier.chimes, 1, "the end is announced in the window the user is in")
+
+        // A library window has no document chrome: the panel's own report stands in.
+        try await run(["action": "hide"], in: a)
+        b.document = nil
+        XCTAssertFalse(keeper.isPanelOpen(in: b))
+        keeper.panelOpen = true
+        XCTAssertTrue(keeper.isPanelOpen(in: b))
+        XCTAssertFalse(keeper.finishNeedsAlert())
+        XCTAssertFalse(keeper.isPanelOpen(in: a), "a document window goes by its own open panels")
     }
 
     func testModesAreSavedReplacedAndDeleted() async throws {
