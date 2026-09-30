@@ -26,9 +26,8 @@ public enum FeatTextDocFeature: NibFeature {
                                    owner: id, schema: .str("document name"))
     }
 
-    /// ⇧⌘T in the library makes a new text document (the `nib://new` deep link creates and opens it). The keyboard
-    /// feature (F073) may map the same shortcut; registries are read only here, after every feature registered, so
-    /// the shortcut exists exactly once.
+    /// ⇧⌘T in the library makes a new text document and opens it. The keyboard feature (F073) may map the same
+    /// shortcut; registries are read only here, after every feature registered, so the shortcut exists exactly once.
     public static func start(_ app: NibApp) async {
         let shortcut = TextDocMenus.newDocumentShortcut
         let taken = app.content.keyCommands.all.contains {
@@ -36,10 +35,7 @@ public enum FeatTextDocFeature: NibFeature {
                 && $0.shortcut.modifiers == shortcut.modifiers
         }
         guard !taken else { return }
-        app.content.keyCommands.register(KeyCommandDescriptor(
-            id: TextDocMenus.newDocumentKeyID, title: String(localized: "New Text Document"), shortcut: shortcut,
-            command: CommandIDs.appOpenURL, params: ["url": .string(TextDocMenus.newDocumentURL)], scope: .library,
-            order: 400, owner: id))
+        app.content.keyCommands.register(TextDocMenus.newDocumentKey(owner: id))
     }
 }
 
@@ -58,7 +54,7 @@ enum BuiltinBlockKinds {
 
     static var entries: [Entry] {
         [
-            Entry(kind: .paragraph, title: String(localized: "Text"), icon: "text.alignleft", order: 100,
+            Entry(kind: .paragraph, title: String(localized: "Text"), icon: NibSymbol.alignLeft.name, order: 100,
                   aliases: ["text", "plain", "paragraph", "p"]),
             Entry(kind: .heading1, title: String(localized: "Heading 1"), icon: "1.square", order: 110,
                   aliases: ["h1", "title", "#", "heading"]),
@@ -66,21 +62,21 @@ enum BuiltinBlockKinds {
                   aliases: ["h2", "subtitle", "##", "heading"]),
             Entry(kind: .heading3, title: String(localized: "Heading 3"), icon: "3.square", order: 130,
                   aliases: ["h3", "###", "heading"]),
-            Entry(kind: .bullet, title: String(localized: "Bulleted List"), icon: "list.bullet", order: 200,
+            Entry(kind: .bullet, title: String(localized: "Bulleted List"), icon: NibSymbol.listBulleted.name, order: 200,
                   aliases: ["bullet", "list", "ul", "-", "*"]),
-            Entry(kind: .numbered, title: String(localized: "Numbered List"), icon: "list.number", order: 210,
+            Entry(kind: .numbered, title: String(localized: "Numbered List"), icon: NibSymbol.listNumbered.name, order: 210,
                   aliases: ["numbered", "number", "ol", "1."]),
-            Entry(kind: .todo, title: String(localized: "To-do List"), icon: "checklist", order: 220,
+            Entry(kind: .todo, title: String(localized: "To-do List"), icon: NibSymbol.checklist.name, order: 220,
                   aliases: ["todo", "to-do", "task", "checkbox", "check", "[]"]),
             Entry(kind: .quote, title: String(localized: "Quote"), icon: "text.quote", order: 300,
                   aliases: ["quote", "blockquote", ">"]),
-            Entry(kind: .code, title: String(localized: "Code"), icon: "chevron.left.forwardslash.chevron.right", order: 310,
+            Entry(kind: .code, title: String(localized: "Code"), icon: NibSymbol.inlineCode.name, order: 310,
                   aliases: ["code", "snippet", "```"]),
-            Entry(kind: .divider, title: String(localized: "Divider"), icon: "minus", order: 320,
+            Entry(kind: .divider, title: String(localized: "Divider"), icon: NibSymbol.minus.name, order: 320,
                   aliases: ["divider", "line", "separator", "hr", "---"]),
             Entry(kind: .image, title: String(localized: "Image"), icon: NibSymbol.image.name, order: 400,
                   aliases: ["image", "photo", "picture"]),
-            Entry(kind: .video, title: String(localized: "Video"), icon: "play.rectangle", order: 410,
+            Entry(kind: .video, title: String(localized: "Video"), icon: NibSymbol.present.name, order: 410,
                   aliases: ["video", "movie", "youtube", "link"])
         ]
     }
@@ -100,7 +96,16 @@ enum BuiltinBlockKinds {
 enum TextDocMenus {
     static let newDocumentKeyID = "textdoc.new"
     static let newDocumentShortcut = KeyShortcut("t", [.command, .shift])
-    static let newDocumentURL = NibFormat.urlScheme + "://new?kind=" + DocumentKind.textDocument.rawValue
+
+    /// ⇧⌘T: the same doc.create + doc.open as the menu entry. The shell resolves `sessionParams` each time the key
+    /// is pressed, so every press gets a fresh document id (contracts-v2 G16).
+    static func newDocumentKey(owner: String) -> KeyCommandDescriptor {
+        var key = KeyCommandDescriptor(
+            id: newDocumentKeyID, title: String(localized: "New Text Document"), shortcut: newDocumentShortcut,
+            command: CommandIDs.batch, scope: .library, order: 400, owner: owner)
+        key.sessionParams = { _ in TextDocMenus.newDocumentParams(folder: nil) }
+        return key
+    }
 
     static func items(owner: String) -> [MenuItemDescriptor] {
         var out: [MenuItemDescriptor] = []
@@ -112,7 +117,7 @@ enum TextDocMenus {
         newItem.shortcut = newDocumentShortcut
         out.append(newItem)
         out.append(MenuItemDescriptor(
-            id: "textdoc.block.duplicate", title: String(localized: "Duplicate"), icon: "plus.square.on.square",
+            id: "textdoc.block.duplicate", title: String(localized: "Duplicate"), icon: NibSymbol.duplicate.name,
             location: .block, order: 100, owner: owner, command: CommandIDs.batch,
             params: { ctx in TextDocMenus.duplicateParams(ctx) },
             isVisible: { ctx in TextDocMenus.editable(ctx) && TextDocMenus.kind(ctx).map { $0 != .table } == true }))
@@ -178,16 +183,20 @@ enum TextDocMenus {
         return (doc, blocks[i], i, blocks)
     }
 
-    /// doc.create + doc.open as one call (the new document opens with the caret in its first line).
+    /// The New menu's call, in the folder it was opened in (contracts-v2 `MenuContext.folder`; hosts before it
+    /// passed the folder as the ref).
     static func newDocumentParams(_ ctx: MenuContext) -> JSONValue {
+        if let folder = ctx.folder { return newDocumentParams(folder: folder) }
+        if let ref = ctx.ref, case .folder(let folder)? = NodeRef(ref) { return newDocumentParams(folder: folder) }
+        return newDocumentParams(folder: nil)
+    }
+
+    /// doc.create (with a fresh id) + doc.open as one call; the new document opens with the caret in its first line.
+    /// nil = the library's top level.
+    static func newDocumentParams(folder: FolderID?) -> JSONValue {
         let id = NibID.make()
         var create: [String: JSONValue] = ["kind": .string(DocumentKind.textDocument.rawValue), "id": .string(id.raw)]
-        // The folder the New menu was opened in (contracts-v2 `MenuContext.folder`; hosts before it passed the ref).
-        if let folder = ctx.folder {
-            create["folder"] = .string(NodeRef.folder(folder).description)
-        } else if let ref = ctx.ref, case .folder? = NodeRef(ref) {
-            create["folder"] = .string(ref)
-        }
+        if let folder = folder { create["folder"] = .string(NodeRef.folder(folder).description) }
         let open: JSONValue = ["doc": .string(NodeRef.document(id).description)]
         let calls: [JSONValue] = [["command": .string(CommandIDs.docCreate), "params": .object(create)],
                                   ["command": .string(CommandIDs.docOpen), "params": open]]
