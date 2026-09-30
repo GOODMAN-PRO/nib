@@ -1,0 +1,59 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibPluginHost/ContributionMapper.swift:322-341 (mapCommandHooks), 538-550 (HookPolicy.isExempt)",
+      "problem": "Security: a plugin hook can escalate its privileges by rewriting a user's call. The exemption check only looks at the ORIGINAL params. The bus then runs the call with the replacement params under the caller's principal. A plugin that holds only document:read and hooks \"settings.*\" can see the user's settings.set {name: \"editing.snapToGrid\"} and return {params: {name: \"security.ai.confirmationPolicy\", value: \"never\"}}. The same works for security.plugins.exposeHiddenCommands, security.bridge.* and pluginhost.disabled.*. The rewrite runs as .user, so gateway.authorize and SettingsSet's userOnly check both pass. The same hole lets a hook rewrite a user commands.batch into plugin.* or security calls. This contradicts the host's own guarantee that plugin hooks never touch plugin management or security settings.",
+      "fix": "In the guarding closure, run HookPolicy.isExempt(command, params: replaced, registry:) on the replacement too, and throw permission_denied (\"a plugin hook cannot redirect this call\") when it is exempt. For settings.* calls, also refuse a replacement whose `name` differs from the original. For descriptors with forwardsCalls (commands.batch), allow a veto but no transformation, or run isExempt on every nested call. Add a test: a settings.* hook that rewrites a user settings.set to security.ai.confirmationPolicy must fail, and the setting must stay unchanged."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibPluginHost/PluginRegistry.swift:147-154 (ManifestValidator.command) used at 230, 324, 334, 344, 359, 366; executed as .user at PluginCanvasTool.swift:153, 284, ContributionMapper.swift:1287, 1781",
+      "problem": "Security and spec: strokeProcessors, tapHandlers, tools, itemTypes.edit, blocks, importers and exporters may name ANY command, including built-in ones. Only the plugin's own undeclared ids are rejected. The host then invokes that command as .user (canvas tool, stroke runner, block tap, and the tap router and importer contexts), so no gateway check applies. Example: a plugin with permissions [] declares \"strokeProcessors\": [{\"id\": \"x.y.p\", \"command\": \"page.delete\"}]. Every finished pen stroke then runs page.delete {page, stroke} as the user. A tapHandler or tool pointing at a built-in destructive command works the same way. The spec and PLUGIN_API describe these as the plugin's own command (\"JS once per stroke\", \"input → plugin command\", \"file → temp asset → plugin command\"), where the JS handler's nested calls run as .plugin(id) with its grants.",
+      "fix": "In ManifestValidator, require tools[].command, strokeProcessors[].command, tapHandlers[].command, itemTypes[].edit, blocks[].command, importers[].command and exporters[].command to be one of the plugin's own declared commands (declared[id] != nil). Keep the permissive command() check only for menus, toolbar, keybindings and pencilActions, which the user invokes explicitly. Add validation tests for a stroke processor and a tap handler that point at built-in ids."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/NibPluginHost/NibPluginHostFeature.swift:17-19; PluginRegistry.swift:730-733 (refresh)",
+      "problem": "Security: the device-local on/off switch \"pluginhost.disabled.<id>\" is declared with readOnly: false. Any principal with the app scope can write it through settings.set, including a plugin with \"app\", the AI and the bridge, with no plugins:manage check and no confirmation. That lets them re-enable a plugin the user switched off: refresh() then loads it (`.disabled where startApproved && isEnabled(id)`). They can also persistently disable other plugins. The host never observes the prefix, so after an external write plugin.list reports enabled:false while the plugin keeps running. This bypasses plugin.enable's plugins:manage requirement and its mandatory AI and bridge confirmation.",
+      "fix": "Declare the prefix with readOnly: true. PluginEnablement.set writes with setJSON, which is unaffected, so plugin.enable remains the only writer. Add a test that settings.set on pluginhost.disabled.<id> is refused for .user, .ai and .plugin callers."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginHost/PluginCommands.swift:87; PluginRegistry.swift:724-729, 739-740",
+      "problem": "plugin.list is declared read, but it calls refresh(startApproved: false). That call unloads plugins and calls load() for running plugins whose file signature changed. A read call (AI ask mode, or a plugin's own read) can therefore restart a plugin, running its main.js start-up code outside the read-only context, or stop the calling plugin mid-call.",
+      "fix": "Give refresh a non-mutating mode for plugin.list that only re-reads records and inspects folders. It should call scheduleRefresh() for running plugins whose signature changed, and leave stopping and restarting to the scheduled refresh."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginHost/PluginRegistry.swift:556-611 (load)",
+      "problem": "Time-of-check/time-of-use gap in the hash binding: the folder is hashed in PackageScan.read, but runtime.start and the mapper read the files later. F081 panels and the element and tape packs are read lazily from disk. A sync that rewrites main.js or a panel between the hash and the read runs unapproved code under the old grant until the next libraryChanged rescan.",
+      "fix": "After runtime.start and map(), recompute PluginFolderHash.signature(files(folder)). If it differs from scan.signature, unload the plugin and mark it needsReview."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginHost/ContributionMapper.swift:36, 370-380 (pdfTemplates), 1211-1251 (drawForm)",
+      "problem": "Performance and main thread: PDF template conversion (CGPDFScanner plus services.pdf.textBlocks) runs synchronously on the main actor inside map(), at every launch, for each approved plugin. Nested form XObjects are bounded only by the output op count, so a form tree that paints nothing is re-scanned at every depth up to maxFormDepth. A large or pathological template stalls launch.",
+      "fix": "Convert PDF templates off the main actor, for example in the detached PackageScan step or in a Task.detached before map(). Add an operator/scan budget next to maxOps."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginHost/ContributionMapper.swift:1684 (CustomItemInspector.write)",
+      "problem": "Data-integrity risk: the inspector writes `key` into every selected item whose kind is .custom. It does not restrict to this plugin's type, so a mixed selection can write the field into other plugins' custom items.",
+      "fix": "Pass the draw key (\"custom.<pid>.<type>\") into CustomItemInspector and filter with `$0.drawKey == drawKey`."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginHost/ContributionMapper.swift:328-335, 542-549",
+      "problem": "Hooks fail closed. When the plugin is unresponsive, timed out or stopping, the hook invocation throws, and that error vetoes every matching call from everyone. The exemptions also do not cover the UI route to disabling a plugin (settings.open, or panel.open of the plugin manager). A buggy plugin hooking \"settings.*\" or \"panel.*\" therefore locks the user out until Safe Mode, which contradicts the \"a plugin can never stop the user from disabling it\" comment.",
+      "fix": "In HookPolicy, exempt settings.open, and panel.open/panel.close for the plugin manager's panel ids. Treat .unavailable and timeout errors from the hook command as \"let it pass\", so that only errors the plugin throws itself count as a veto."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/NibPluginHost/PluginCommands.swift:81, 116, 144, 181, 233, 263",
+      "problem": "Contracts: the descriptor ids are string literals (\"plugin.list\" and so on), although contracts-v2.1 added CommandIDs.pluginList, pluginEnable, pluginReload, pluginLogs, pluginSdkTypes and pluginDocs for them.",
+      "fix": "Use the CommandIDs constants in the six descriptors."
+    }
+  ]
+}
