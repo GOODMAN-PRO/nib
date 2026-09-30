@@ -167,17 +167,26 @@ enum ZoomRules {
         return clamp(next ?? (zoomIn ? limits.upperBound : limits.lowerBound), limits)
     }
 
-    /// Percent for the HUD and VoiceOver.
-    static func percent(_ z: Double) -> Int { Int((z * 100).rounded()) }
+    /// Percent for the HUD and VoiceOver, halves rounded up (1.255 is 126 %, although 1.255 × 100 is 125.4999… in
+    /// binary floating point).
+    static func percent(_ z: Double) -> Int {
+        guard z.isFinite else { return 0 }
+        return Int((z * 100 + 1e-9).rounded())
+    }
 }
 
 // MARK: - The board world (pure)
 
 /// An infinite board is shown as a large, finite world that grows before you reach its edge: the content bounds and
 /// the origin, padded by `margin` (at least three windows at the smallest zoom), grown again whenever the visible
-/// area comes within a quarter margin of an edge.
+/// area comes within a quarter margin of an edge. It stops growing at `reach` from the origin (content already
+/// further out stays reachable).
 struct BoardWorld: Equatable {
     var rect: Rect
+
+    /// How far a board reaches from its origin, in page points (about 350 m). Stroke points are 32-bit floats, still
+    /// precise to 1/16 pt out here; further out handwriting would turn jagged.
+    static let reach: Double = 1_000_000
 
     static func margin(viewport: CGSize, minZoom: Double) -> Double {
         max(4096, 3 * Double(max(viewport.width, viewport.height)) / max(minZoom, 0.001))
@@ -186,20 +195,27 @@ struct BoardWorld: Equatable {
     static func initial(content: Rect?, margin: Double) -> BoardWorld {
         var core = Rect(x: 0, y: 0, width: 1, height: 1)
         if let c = content, !c.isEmpty, [c.x, c.y, c.width, c.height].allSatisfy({ $0.isFinite }) { core = core.union(c) }
-        return BoardWorld(rect: core.insetBy(-margin))
+        return BoardWorld(rect: limited(core.insetBy(-margin), keeping: core))
     }
 
     /// A larger world when `visible` comes within a quarter margin of an edge (or leaves the world); nil when the
-    /// world is large enough.
+    /// world is large enough (or already reaches as far as a board may).
     func growing(toKeep visible: Rect, margin: Double) -> BoardWorld? {
-        let reach = margin / 4
+        let near = margin / 4
         var minX = rect.minX, minY = rect.minY, maxX = rect.maxX, maxY = rect.maxY
-        if visible.minX - reach < minX { minX = visible.minX - margin }
-        if visible.minY - reach < minY { minY = visible.minY - margin }
-        if visible.maxX + reach > maxX { maxX = visible.maxX + margin }
-        if visible.maxY + reach > maxY { maxY = visible.maxY + margin }
-        let grown = Rect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        if visible.minX - near < minX { minX = visible.minX - margin }
+        if visible.minY - near < minY { minY = visible.minY - margin }
+        if visible.maxX + near > maxX { maxX = visible.maxX + margin }
+        if visible.maxY + near > maxY { maxY = visible.maxY + margin }
+        let grown = BoardWorld.limited(Rect(x: minX, y: minY, width: maxX - minX, height: maxY - minY), keeping: rect)
         return grown == rect ? nil : BoardWorld(rect: grown)
+    }
+
+    /// `r` cut to ±`reach`, but never smaller than `keep`.
+    static func limited(_ r: Rect, keeping keep: Rect) -> Rect {
+        let minX = min(max(r.minX, -reach), keep.minX), minY = min(max(r.minY, -reach), keep.minY)
+        let maxX = max(min(r.maxX, reach), keep.maxX), maxY = max(min(r.maxY, reach), keep.maxY)
+        return Rect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
     }
 }
 
@@ -336,8 +352,15 @@ final class DocumentScrollView: UIScrollView {
         addSubview(wetInkContainer)
         restrictGesturesToFingers()
         panGestureRecognizer.allowedScrollTypesMask = .all
+        // The indicators run between the bars and the palette (updateInsets), not under them.
+        automaticallyAdjustsScrollIndicatorInsets = false
         isAccessibilityElement = false
         accessibilityIgnoresInvertColors = true
+        registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitDisplayScale.self]) {
+            (view: DocumentScrollView, previous: UITraitCollection) in
+            if previous.userInterfaceStyle != view.traitCollection.userInterfaceStyle { view.updateShadows() }
+            if previous.displayScale != view.traitCollection.displayScale { view.updateTiles() }
+        }
     }
 
     required init?(coder: NSCoder) { return nil }
@@ -401,6 +424,9 @@ final class DocumentScrollView: UIScrollView {
         let wanted = UIEdgeInsets(top: base.top + external.top, left: base.left + external.left,
                                   bottom: base.bottom + external.bottom, right: base.right + external.right)
         if contentInset != wanted { contentInset = wanted }
+        let indicators = mode.isWorld ? UIEdgeInsets.zero : chromeInsets
+        if verticalScrollIndicatorInsets != indicators { verticalScrollIndicatorInsets = indicators }
+        if horizontalScrollIndicatorInsets != indicators { horizontalScrollIndicatorInsets = indicators }
     }
 
     /// The insets this view applied itself (chrome and centring), without other features' additions.
@@ -544,13 +570,7 @@ final class DocumentScrollView: UIScrollView {
         }
     }
 
-    // MARK: Traits and accessibility
-
-    override func traitCollectionDidChange(_ previous: UITraitCollection?) {
-        super.traitCollectionDidChange(previous)
-        if previous?.userInterfaceStyle != traitCollection.userInterfaceStyle { updateShadows() }
-        if previous?.displayScale != traitCollection.displayScale { updateTiles() }
-    }
+    // MARK: Layout and accessibility
 
     override func layoutSubviews() {
         super.layoutSubviews()

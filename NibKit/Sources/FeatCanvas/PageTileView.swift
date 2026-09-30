@@ -1,4 +1,5 @@
 import UIKit
+import SwiftUI
 import NibContracts
 import NibDesign
 
@@ -94,6 +95,10 @@ enum CanvasLayers {
 /// coordinates. It shows, bottom to top: the paper colour, a low-resolution preview of the whole page (notebook pages
 /// only), the previous zoom level's tiles until the current level covers them, the current level's tiles, and live
 /// views (GIFs, videos, plugin views) over their items. Page views are recycled as the canvas scrolls.
+///
+/// A page that comes on screen shows its paper at once and fades its content in over 120 ms when the first bitmap
+/// lands (DESIGN.md §14.18, `NibMotion.fade`); after that nothing it draws animates: a re-render after a commit (the
+/// dry-tile swap), a new zoom level or a replay frame replaces the bitmaps in place (§9.3).
 final class PageTileView: UIView {
     private(set) var pageID: PageID?
     private(set) var record: PageRecord?
@@ -102,11 +107,15 @@ final class PageTileView: UIView {
     private(set) var level: Int = 0
     weak var source: PageTileSource?
 
+    /// Holds the bitmap layers (page coordinates) so the page's first content can fade in as one.
+    private let contentView = UIView()
     private let previewLayer = CALayer()
     private let fallbackLayer = CALayer()
     private let tileLayer = CALayer()
     /// Live views (`CanvasHost.attachLiveView`) sit here, in page coordinates, above the tiles.
     let liveViewContainer = PassThroughView()
+    /// The page's first bitmap has landed since it was configured (its content is faded in).
+    private(set) var hasShownContent = false
 
     private final class Slot {
         let layer = CALayer()
@@ -133,10 +142,14 @@ final class PageTileView: UIView {
         isUserInteractionEnabled = true
         accessibilityIgnoresInvertColors = true
         isAccessibilityElement = false
+        contentView.isUserInteractionEnabled = false
+        contentView.backgroundColor = .clear
+        contentView.alpha = 0
+        addSubview(contentView)
         for l in [previewLayer, fallbackLayer, tileLayer] {
             l.actions = CanvasLayers.noActions
             l.masksToBounds = false
-            layer.addSublayer(l)
+            contentView.layer.addSublayer(l)
         }
         previewLayer.contentsGravity = .resize
         previewLayer.minificationFilter = .trilinear
@@ -164,6 +177,9 @@ final class PageTileView: UIView {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             bounds = pageRect.cg
+            // The content view's own coordinates are page coordinates too, so tile frames need no conversion.
+            contentView.bounds = pageRect.cg
+            contentView.center = CGPoint(x: pageRect.midX, y: pageRect.midY)
             for l in [previewLayer, fallbackLayer, tileLayer] { l.frame = pageRect.cg }
             liveViewContainer.frame = pageRect.cg
             CATransaction.commit()
@@ -189,6 +205,22 @@ final class PageTileView: UIView {
         previewFailed = false
         covered = nil
         for v in liveViewContainer.subviews { v.removeFromSuperview() }
+        // Paper only until the first bitmap lands (a new page, or one whose background or size changed).
+        contentView.layer.removeAllAnimations()
+        contentView.alpha = 0
+        hasShownContent = false
+    }
+
+    /// The first bitmap since the page was configured landed: its content fades in (`NibMotion.fade`, 120 ms). The
+    /// SwiftUI timing token drives UIKit from iOS 18; iOS 17 shows it at once.
+    private func contentLanded() {
+        guard !hasShownContent else { return }
+        hasShownContent = true
+        if #available(iOS 18, *), window != nil {
+            UIView.animate(NibMotion.fade) { self.contentView.alpha = 1 }
+        } else {
+            contentView.alpha = 1
+        }
     }
 
     /// Recycled: nothing on screen, nothing in flight.
@@ -305,6 +337,7 @@ final class PageTileView: UIView {
                 CATransaction.commit()
                 slot.hasImage = true
                 self.dropCoveredFallback()
+                self.contentLanded()
             }
             self.renderFinished()
         }
@@ -327,6 +360,7 @@ final class PageTileView: UIView {
                     CATransaction.setDisableActions(true)
                     self.previewLayer.contents = image
                     CATransaction.commit()
+                    self.contentLanded()
                 }
                 self.renderFinished()
             } catch {
@@ -416,6 +450,8 @@ final class PageTileView: UIView {
     /// Tile keys on screen or requested at the current level.
     var tileKeys: Set<TileKey> { Set(slots.keys) }
     var hasPreview: Bool { previewLayer.contents != nil }
+    /// The opacity of the page's bitmaps (0 until the first one lands, then 1).
+    var contentAlpha: CGFloat { contentView.alpha }
 }
 
 /// A view that never takes a touch itself; its subviews still can.

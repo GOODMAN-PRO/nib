@@ -56,6 +56,12 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     // Tracking
     private var settingSessionPage = false
+    /// The page a command, the page HUD or the scrubber asked for. It stays the current page while any of it is on
+    /// screen, even when another page holds the middle of the window (zoomed out, short pages), until the user
+    /// scrolls or zooms.
+    private var requestedPage: PageID?
+    /// A programmatic scroll is animating towards `requestedPage`.
+    private var isAnimatingScroll = false
     private var dragStartIndex = 0
     private var addPageArmed = false
     private(set) var isClosed = false
@@ -73,9 +79,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     private var replayDirty = false
 
     // Views
-    private let scrubber = PageScrubberView()
+    let scrubber = PageScrubberView()
     private let addPageIndicator = AddPageIndicatorView()
-    private let errorView = PageErrorView()
+    let errorView = PageErrorView()
     private var emptyHost: UIViewController?
 
     init(documentID: DocumentID, session: EditorSession, app: NibApp) {
@@ -129,6 +135,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         fixedOverlay.addSubview(scrubber)
         errorView.isHidden = true
         errorView.onRetry = { [weak self] in self?.retryFailedPages() }
+        errorView.onRestore = { [weak self] in self?.restoreFromBackup() }
         fixedOverlay.addSubview(errorView)
 
         let tap = host.doubleTapZoomRecognizer
@@ -137,6 +144,12 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         tap.delegate = self
         tap.addTarget(self, action: #selector(doubleTapped(_:)))
         scrollView.addGestureRecognizer(tap)
+
+        // iPad ↔ iPhone layout (Split View, Slide Over): the chrome's room and the fit width change.
+        registerForTraitChanges([UITraitHorizontalSizeClass.self]) { (vc: CanvasViewController, _: UITraitCollection) in
+            vc.updateChromeInsets()
+            vc.view.setNeedsLayout()
+        }
 
         open()
     }
@@ -176,14 +189,6 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     override func viewSafeAreaInsetsDidChange() {
         super.viewSafeAreaInsetsDidChange()
         updateChromeInsets()
-    }
-
-    override func traitCollectionDidChange(_ previous: UITraitCollection?) {
-        super.traitCollectionDidChange(previous)
-        if previous?.horizontalSizeClass != traitCollection.horizontalSizeClass {
-            updateChromeInsets()
-            view.setNeedsLayout()
-        }
     }
 
     /// Opens (or re-opens) the canvas: observers, tool, attachments, the input half.
@@ -456,12 +461,30 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     private func setOffset(_ o: CGPoint, animated: Bool = false) {
         let target = clampedOffset(o)
-        let animate = animated && !UIAccessibility.isReduceMotionEnabled
+        let animate = animated && !UIAccessibility.isReduceMotionEnabled && scrollView.contentOffset != target
         if animate {
+            isAnimatingScroll = true
             scrollView.setContentOffset(target, animated: true)
-        } else if scrollView.contentOffset != target {
-            scrollView.contentOffset = target
+        } else {
+            // Setting the offset stops any scroll animation in flight.
+            isAnimatingScroll = false
+            if scrollView.contentOffset != target { scrollView.contentOffset = target }
         }
+    }
+
+    /// The part of the window the chrome leaves free (a board has no chrome insets), in scroll view coordinates.
+    private var unobscuredRect: CGRect {
+        let b = scrollView.bounds
+        let i = scrollView.mode.isWorld ? UIEdgeInsets.zero : scrollView.chromeInsets
+        return CGRect(x: b.minX + i.left, y: b.minY + i.top, width: max(0, b.width - i.left - i.right),
+                      height: max(0, b.height - i.top - i.bottom))
+    }
+
+    /// True when at least a point of `page` shows in the unobscured window.
+    private func isShowing(_ page: PageID) -> Bool {
+        guard let f = host.pageFrame(page) else { return false }
+        let i = f.intersection(unobscuredRect)
+        return !i.isNull && i.width >= 1 && i.height >= 1
     }
 
     /// The page point under a window point (offset from the scroll view's bounds origin), the nearest page's when the
@@ -524,6 +547,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     /// Double-tap: fit ↔ twice fit, around the tapped point.
     func toggleZoom(at viewPoint: CGPoint) {
         guard didInitialLayout, !isClosed else { return }
+        requestedPage = nil
         let target = ZoomRules.toggleTarget(current: scrollView.zoom, fit: fitZoom, limits: zoomLimits)
         let w = CGPoint(x: viewPoint.x - scrollView.bounds.minX, y: viewPoint.y - scrollView.bounds.minY)
         let a = anchor(atWindow: w)
@@ -563,6 +587,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             pendingPage = page
             return
         }
+        requestedPage = page
         if mode(for: page) != mode {
             relayout(anchor: nil, initial: true)
             return
@@ -603,23 +628,25 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
             return
         }
         if mode(for: page) != mode { relayout(anchor: nil, initial: true) }
+        requestedPage = page
+        // A board item can lie beyond the part of the world laid out so far (an item the assistant just placed far
+        // away): grow the world to take it first, so the scroll below can reach it.
+        if mode.isWorld { growBoard(toKeep: rect) }
         guard let t = host.pageTransform(page) else { return }
-        let bounds = scrollView.bounds
-        let insets = scrollView.mode.isWorld ? UIEdgeInsets.zero : scrollView.chromeInsets
-        let margin = NibSpacing.l
-        let visible = CGRect(x: bounds.minX + insets.left + margin, y: bounds.minY + insets.top + margin,
-                             width: max(1, bounds.width - insets.left - insets.right - 2 * margin),
-                             height: max(1, bounds.height - insets.top - insets.bottom - 2 * margin))
+        let free = unobscuredRect
+        let margin = min(NibSpacing.l, free.width / 4, free.height / 4)
+        let visible = free.insetBy(dx: margin, dy: margin)
         var target = rect.cg.applying(t)
         if target.width > visible.width || target.height > visible.height {
-            // Too big for the window: zoom out until it fits (never in).
+            // Too big for the window: zoom out until it fits (never in), then centre it in the free part (its centre
+            // as an offset from the window's origin, which zooming does not move).
+            let centre = CGPoint(x: free.midX - scrollView.bounds.minX, y: free.midY - scrollView.bounds.minY)
             let k = min(visible.width / max(target.width, 1), visible.height / max(target.height, 1))
             applyZoom(scrollView.zoom * Double(k))
             isAtFit = abs(scrollView.zoom - fitZoom) <= fitZoom * 0.001
             guard let t2 = host.pageTransform(page) else { return }
             target = rect.cg.applying(t2)
-            setOffset(CGPoint(x: target.midX - (insets.left + visible.width / 2 + margin),
-                              y: target.midY - (insets.top + visible.height / 2 + margin)), animated: animated)
+            setOffset(CGPoint(x: target.midX - centre.x, y: target.midY - centre.y), animated: animated)
             endZoom()
             return
         }
@@ -654,16 +681,21 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     /// Pans by page points (or fractions of the window). A paged window turns the page for a window-sized step.
     func scrollBy(dx: Double, dy: Double, windowFractions: Bool, animated: Bool) {
-        guard isViewLoaded, didInitialLayout else { return }
+        guard isViewLoaded, didInitialLayout, !isClosed else { return }
         if windowFractions, case .stack(.horizontal) = mode, abs(dx) >= 0.5,
            let current = session.page, let i = scrollView.index(of: current) {
             let j = min(max(i + (dx > 0 ? 1 : -1), 0), scrollView.pages.count - 1)
             if j != i { return goToPage(scrollView.pages[j], animated: animated) }
         }
-        let z = scrollView.zoom
+        requestedPage = nil
+        let z = max(scrollView.zoom, 1e-9)
         let b = scrollView.bounds.size
         let vx = windowFractions ? dx * Double(b.width) : dx * z
         let vy = windowFractions ? dy * Double(b.height) : dy * z
+        // A board grows ahead of a pan of any length (the minimap's drag, the assistant), within its reach.
+        if let v = visibleWorldRect {
+            growBoard(toKeep: Rect(x: v.x + vx / z, y: v.y + vy / z, width: v.width, height: v.height))
+        }
         let o = scrollView.contentOffset
         setOffset(CGPoint(x: Double(o.x) + vx, y: Double(o.y) + vy), animated: animated)
         finishViewChange(bake: true)
@@ -723,13 +755,16 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         if livePages.contains(where: { $0.id == p }) { goToPage(p, animated: false) }
     }
 
-    /// The page at the middle of the window.
+    /// The current page: the one asked for while it shows (and while a scroll animates towards it), else the page at
+    /// the middle of the window.
     private(set) var displayedPage: PageID?
 
     private func updateCurrentPage() {
-        guard let a = centreAnchor() else { return }
-        let page = a.page
-        guard page != displayedPage else { return }
+        var current = centreAnchor()?.page
+        if let r = requestedPage {
+            if isAnimatingScroll || isShowing(r) { current = r } else { requestedPage = nil }
+        }
+        guard let page = current, page != displayedPage else { return }
         displayedPage = page
         setSessionPage(page)
         updateHUD()
@@ -756,10 +791,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         var visible: Rect?
         if let page = displayedPage ?? currentPage, let f = scrollView.layoutFrame(page),
            let origin = scrollView.layoutOrigin(page) {
-            let b = scrollView.bounds
-            let i = scrollView.mode.isWorld ? UIEdgeInsets.zero : scrollView.chromeInsets
-            let window = CGRect(x: b.minX + i.left, y: b.minY + i.top, width: max(0, b.width - i.left - i.right),
-                                height: max(0, b.height - i.top - i.bottom))
+            let window = unobscuredRect
             let a = scrollView.layoutPoint(window.origin), c = scrollView.layoutPoint(CGPoint(x: window.maxX, y: window.maxY))
             var r = Rect(x: a.x, y: a.y, width: c.x - a.x, height: c.y - a.y)
             if !scrollView.mode.isWorld {
@@ -892,15 +924,29 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         return fitZoom
     }
 
-    /// Grows the board world when the window nears its edge, keeping everything where it is on screen.
+    /// Grows the board world when the window nears its edge (once a drag or zoom has settled), keeping everything
+    /// where it is on screen.
     private func growBoardIfNeeded() {
-        guard case .world(let id) = mode, let world = board, !scrollView.isDragging, !scrollView.isDecelerating,
-              !scrollView.isZoomingNow else { return }
+        guard mode.isWorld, !scrollView.isDragging, !scrollView.isDecelerating, !scrollView.isZoomingNow,
+              let visible = visibleWorldRect else { return }
+        growBoard(toKeep: visible)
+    }
+
+    /// The window in board (world) coordinates; nil unless a board is showing.
+    private var visibleWorldRect: Rect? {
+        guard mode.isWorld, let world = board else { return nil }
+        let v = scrollView.visibleLayoutRect
+        return Rect(x: v.x + world.rect.x, y: v.y + world.rect.y, width: v.width, height: v.height)
+    }
+
+    /// Grows the board world so `rect` (board coordinates) and a margin around it are inside it, keeping everything
+    /// where it is on screen. False when the world was already large enough.
+    @discardableResult
+    private func growBoard(toKeep rect: Rect) -> Bool {
+        guard case .world(let id) = mode, let world = board,
+              [rect.x, rect.y, rect.width, rect.height].allSatisfy({ $0.isFinite }) else { return false }
         let margin = BoardWorld.margin(viewport: scrollView.bounds.size, minZoom: ZoomRules.boardRange.lowerBound)
-        let visible = scrollView.visibleLayoutRect
-        let visibleWorld = Rect(x: visible.x + world.rect.x, y: visible.y + world.rect.y, width: visible.width,
-                                height: visible.height)
-        guard let grown = world.growing(toKeep: visibleWorld, margin: margin) else { return }
+        guard let grown = world.growing(toKeep: rect, margin: margin) else { return false }
         let z = scrollView.zoom
         let dx = (world.rect.x - grown.rect.x) * z, dy = (world.rect.y - grown.rect.y) * z
         let offset = scrollView.contentOffset
@@ -910,6 +956,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         refreshConfiguredPages()
         scrollView.contentOffset = CGPoint(x: Double(offset.x) + dx, y: Double(offset.y) + dy)
         finishViewChange(bake: true)
+        return true
     }
 
     // MARK: Scroll view delegate
@@ -928,6 +975,9 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        // The user takes over: the page at the middle of the window is the current page again.
+        requestedPage = nil
+        isAnimatingScroll = false
         dragStartIndex = displayedPage.flatMap { self.scrollView.index(of: $0) } ?? 0
         hud.setScrolling(true, compact: isCompact)
     }
@@ -963,9 +1013,14 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) { scrollDidSettle() }
 
-    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) { scrollDidSettle() }
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        isAnimatingScroll = false
+        scrollDidSettle()
+    }
 
     private func scrollDidSettle() {
+        guard didInitialLayout, !isClosed else { return }
+        updateCurrentPage()
         hud.setScrolling(false, compact: isCompact)
         // A board lists the items near the window for VoiceOver: the window moved.
         if mode.isWorld { for v in scrollView.pageViews.values { v.invalidateAccessibility() } }
@@ -975,6 +1030,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     }
 
     func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
+        requestedPage = nil
         self.scrollView.isZoomingNow = true
         hudLingerTask?.cancel()
         hud.setPinching(true)
@@ -1162,7 +1218,7 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     // MARK: Add page by pulling past the end (D-053)
 
     private var canAddPage: Bool {
-        kind == .notebook && !host.isReadOnly && app.commands.entry("page.add") != nil
+        kind == .notebook && !host.isReadOnly && app.commands.entry(CommandIDs.pageAdd) != nil
     }
 
     private func updateAddPageIndicator() {
@@ -1199,10 +1255,24 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         addPageIndicator.isHidden = false
     }
 
-    private func addPage() {
+    /// Adds a page at the end through `page.add` (F022, with our own id for it) and shows it. Failures reach the user
+    /// the way `app.perform` reports them (a toast from the shell).
+    func addPage() {
         guard canAddPage else { return }
-        app.perform("page.add", ["doc": .string(NodeRef.document(documentID).description), "position": "end"],
-                    session: session)
+        let id = NibID.make()
+        let params: JSONValue = ["doc": .string(NodeRef.document(documentID).description), "position": "end",
+                                 "id": .string(id.raw)]
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            do {
+                _ = try await self.app.bus.execute(CommandIDs.pageAdd, params, session: self.session)
+                guard !self.isClosed else { return }
+                self.goToPage(id, animated: true)
+            } catch {
+                NotificationCenter.default.post(name: .nibCommandFailed, object: self.app,
+                                                userInfo: ["command": CommandIDs.pageAdd, "error": NibError.wrap(error)])
+            }
+        }
     }
 
     // MARK: Fixed views: scrubber, error, empty state
@@ -1216,20 +1286,29 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         if case .stack(.horizontal) = mode, kind == .notebook, scrollView.pages.count > 1 {
             scrollView.showsVerticalScrollIndicator = false
             scrollView.showsHorizontalScrollIndicator = false
+            // Between the bars and the page HUD (bottom-right, a resting gap above the bottom inset), so the last
+            // page's thumb never sits under the HUD.
             let w = NibMetrics.hitTarget
+            let bottom = insets.bottom + NibMetrics.hudHeight + NibMetrics.minimumRestingGap
             scrubber.frame = CGRect(x: b.maxX - insets.right - w, y: insets.top, width: w,
-                                    height: max(w, b.height - insets.top - insets.bottom))
+                                    height: max(w, b.height - insets.top - bottom))
             scrubber.update(count: scrollView.pages.count,
                             index: displayedPage.flatMap { scrollView.index(of: $0) } ?? 0)
             scrubber.isHidden = false
         } else {
-            scrollView.showsVerticalScrollIndicator = true
-            scrollView.showsHorizontalScrollIndicator = true
+            // A board's world has no meaningful extent to indicate (its minimap does that, F044).
+            let indicators = !mode.isWorld
+            if scrollView.showsVerticalScrollIndicator != indicators { scrollView.showsVerticalScrollIndicator = indicators }
+            if scrollView.showsHorizontalScrollIndicator != indicators {
+                scrollView.showsHorizontalScrollIndicator = indicators
+            }
             scrubber.isHidden = true
         }
         if let page = displayedPage, failedPages.contains(page), let f = host.pageFrame(page) {
+            errorView.showsRestore = canRestoreFromBackup
             let visible = scrollView.convert(f, to: fixedOverlay).intersection(b)
-            let size = errorView.systemLayoutSizeFitting(CGSize(width: min(b.width - 2 * NibSpacing.l, 360), height: 0),
+            let width = max(NibMetrics.hitTarget, min(b.width - 2 * NibSpacing.l, NibMetrics.panelWidth))
+            let size = errorView.systemLayoutSizeFitting(CGSize(width: width, height: 0),
                                                           withHorizontalFittingPriority: .required,
                                                           verticalFittingPriority: .fittingSizeLevel)
             let centre = visible.isNull ? CGPoint(x: b.midX, y: b.midY) : CGPoint(x: visible.midX, y: visible.midY)
@@ -1245,7 +1324,23 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         guard index >= 0, index < scrollView.pages.count else { return }
         let page = scrollView.pages[index]
         guard page != displayedPage else { return }
-        app.perform("view.goToPage", ["page": .string(NodeRef.page(documentID, page).description)], session: session)
+        app.perform(CommandIDs.viewGoToPage, ["page": .string(NodeRef.page(documentID, page).description)], session: session)
+    }
+
+    /// "Restore from Backup" under a page that failed to render: the Cloud & Backup panel (F070), when it exists.
+    private var canRestoreFromBackup: Bool {
+        app.commands.entry(CommandIDs.panelOpen) != nil && app.ui.panels.get(PanelIDs.cloudBackup) != nil
+    }
+
+    private func restoreFromBackup() {
+        guard canRestoreFromBackup else { return }
+        app.perform(CommandIDs.panelOpen, ["id": .string(PanelIDs.cloudBackup)], session: session)
+    }
+
+    /// The `index`-th sized page (the page HUD's numbering), nil when there is none.
+    func hudPage(at index: Int) -> PageID? {
+        let pages = livePages.filter { $0.size != nil }
+        return pages.indices.contains(index) ? pages[index].id : nil
     }
 
     /// A notebook without pages: say so and offer a page.
@@ -1283,26 +1378,27 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
 
 // MARK: - HUD model
 
-/// What the page HUD and the pinch-zoom HUD show for one canvas (chrome overlays, `FeatCanvasFeature`). Changes that
-/// alter whether a HUD shows ask the chrome to re-evaluate (`UIRegistries.setNeedsChromeUpdate`).
+/// What the page HUD and the pinch-zoom HUD show for one canvas (chrome overlays, `FeatCanvasFeature`). A notebook's
+/// page HUD reads "3 / 12" (D-125); a board's reads its zoom, "45 %" (DESIGN.md §14.17). Changes that alter whether a
+/// HUD shows ask the chrome to re-evaluate (`UIRegistries.setNeedsChromeUpdate`).
 @MainActor
 final class CanvasHUDModel: ObservableObject {
     weak var canvas: CanvasViewController?
-    /// 0-based index of the page at the middle of the window.
+    /// 0-based index of the current page among the sized pages.
     @Published private(set) var pageIndex: Int?
     @Published private(set) var pageCount = 0
     @Published private(set) var zoomPercent = 100
     @Published private(set) var isLoading = false
     @Published private(set) var isPinching = false
+    @Published private(set) var isBoard = false
     private(set) var isScrolling = false
-    private(set) var isBoard = false
     private var isCompact = false
 
     func update(index: Int?, count: Int, isBoard: Bool, zoomPercent: Int) {
         let visibilityChanged = (pageCount == 0) != (count == 0) || self.isBoard != isBoard
         if pageIndex != index { pageIndex = index }
         if pageCount != count { pageCount = count }
-        self.isBoard = isBoard
+        if self.isBoard != isBoard { self.isBoard = isBoard }
         setZoom(zoomPercent)
         if visibilityChanged { chromeNeedsUpdate() }
     }
@@ -1329,34 +1425,51 @@ final class CanvasHUDModel: ObservableObject {
         if compact { chromeNeedsUpdate() }
     }
 
-    var showsPageHUD: Bool { !isBoard && pageCount > 0 && !(isCompact && isScrolling) }
+    /// A board always shows its zoom; a notebook shows its page number once it has pages.
+    var showsPageHUD: Bool { (isBoard || pageCount > 0) && !(isCompact && isScrolling) }
     var showsZoomHUD: Bool { isPinching }
 
-    var primaryText: String { ((pageIndex ?? 0) + 1).formatted() }
-    var secondaryText: String { "/ " + pageCount.formatted() }
+    var primaryText: String { isBoard ? zoomText : ((pageIndex ?? 0) + 1).formatted() }
+    var secondaryText: String? { isBoard ? nil : "/ " + pageCount.formatted() }
     var zoomText: String { (Double(zoomPercent) / 100).formatted(.percent.precision(.fractionLength(0))) }
 
     var accessibilityLabel: String {
-        String(localized: "Page \((pageIndex ?? 0) + 1) of \(pageCount)")
+        isBoard ? String(localized: "Zoom") : String(localized: "Page \((pageIndex ?? 0) + 1) of \(pageCount)")
     }
 
-    var canShowNavigator: Bool { canvas?.app.commands.entry("sidebar.toggle") != nil }
+    var accessibilityHint: String {
+        isBoard ? String(localized: "Swipe up or down to zoom in or out.")
+                : String(localized: "Swipe up or down to change page.")
+    }
+
+    /// The navigator the HUD's glyph opens: the page thumbnails, or a whiteboard's boards.
+    var navigatorLabel: String { isBoard ? String(localized: "Show Boards") : String(localized: "Show Pages") }
+
+    var canShowNavigator: Bool { canvas?.app.commands.entry(CommandIDs.sidebarToggle) != nil }
 
     func showNavigator() {
         guard let c = canvas, canShowNavigator else { return }
-        c.app.perform("sidebar.toggle", [:], session: c.session)
+        c.app.perform(CommandIDs.sidebarToggle, [:], session: c.session)
     }
 
-    /// Goes to page `index` (0-based) through `view.goToPage`, so the HUD does what plugins and the AI can do.
+    /// Goes to the `index`-th page (0-based) through `view.goToPage`, so the HUD does what plugins and the AI can do.
     func go(to index: Int) {
-        guard let c = canvas, pageCount > 0 else { return }
+        guard let c = canvas, !isBoard, pageCount > 0 else { return }
         let i = min(max(index, 0), pageCount - 1)
-        guard i != pageIndex else { return }
-        c.app.perform("view.goToPage", ["index": .number(Double(i)), "doc": .string(NodeRef.document(c.documentID).description)],
+        guard i != pageIndex, let page = c.hudPage(at: i) else { return }
+        c.app.perform(CommandIDs.viewGoToPage, ["page": .string(NodeRef.page(c.documentID, page).description)],
                       session: c.session)
     }
 
-    func step(forward: Bool) { go(to: (pageIndex ?? 0) + (forward ? 1 : -1)) }
+    /// VoiceOver's adjustable action: the next or previous page; on a board, one zoom step (`view.zoom {step}`).
+    func step(forward: Bool) {
+        guard let c = canvas else { return }
+        if isBoard {
+            c.app.perform(CommandIDs.viewZoom, ["step": .string(forward ? "in" : "out")], session: c.session)
+        } else {
+            go(to: (pageIndex ?? 0) + (forward ? 1 : -1))
+        }
+    }
 
     private func chromeNeedsUpdate() {
         guard let c = canvas else { return }
@@ -1366,18 +1479,21 @@ final class CanvasHUDModel: ObservableObject {
 
 // MARK: - HUD views (chrome overlays)
 
-/// The page HUD (DESIGN.md §14.2, D-125): the page navigator button and "3 / 12", bottom-right, clear of the palette.
-/// Tap the glyph for the page navigator; drag along it to scrub pages. The chrome gives it its Clear droplet.
+/// The page HUD (DESIGN.md §14.2, D-125): the navigator glyph and "3 / 12", bottom-right, clear of the palette (the
+/// chrome places it). Tap the glyph for the page navigator; drag along the HUD to scrub pages. On a board it shows the
+/// zoom instead (§14.17). The chrome gives it its Clear droplet.
 struct CanvasPageHUD: View {
     @ObservedObject var model: CanvasHUDModel
     @State private var scrubStart: Int?
     /// Points of drag per page when scrubbing along the HUD.
-    private static let scrubStep: CGFloat = 24
+    private static let scrubStep = NibSpacing.xxl
+    /// Movement before a press on the HUD becomes a scrub (a tap on the glyph stays a tap).
+    private static let scrubSlop = NibSpacing.s
 
     var body: some View {
         HStack(spacing: NibSpacing.xxs) {
             if model.canShowNavigator {
-                NibIconButton(.pages, label: String(localized: "Show Pages"), size: .bar) { model.showNavigator() }
+                NibIconButton(.pages, label: model.navigatorLabel, size: .bar) { model.showNavigator() }
             }
             if model.isLoading {
                 ProgressView()
@@ -1391,8 +1507,9 @@ struct CanvasPageHUD: View {
         .nibChromeTypeCap()
         .contentShape(Rectangle())
         .gesture(
-            DragGesture(minimumDistance: 6)
+            DragGesture(minimumDistance: CanvasPageHUD.scrubSlop)
                 .onChanged { value in
+                    guard !model.isBoard else { return }
                     let start = scrubStart ?? (model.pageIndex ?? 0)
                     if scrubStart == nil { scrubStart = start }
                     let delta = Int((value.translation.width / CanvasPageHUD.scrubStep).rounded(.towardZero))
@@ -1402,7 +1519,8 @@ struct CanvasPageHUD: View {
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(model.accessibilityLabel)
-        .accessibilityHint(String(localized: "Swipe up or down to change page."))
+        .accessibilityValue(model.isBoard ? model.zoomText : "")
+        .accessibilityHint(model.accessibilityHint)
         .accessibilityAdjustableAction { direction in
             switch direction {
             case .increment: model.step(forward: true)
@@ -1412,7 +1530,7 @@ struct CanvasPageHUD: View {
         }
         .accessibilityActions {
             if model.canShowNavigator {
-                Button(String(localized: "Show Pages")) { model.showNavigator() }
+                Button(model.navigatorLabel) { model.showNavigator() }
             }
         }
     }
@@ -1436,14 +1554,19 @@ struct CanvasZoomHUD: View {
 // MARK: - Page scrubber (D-118)
 
 /// Horizontal paging's page scrubber: a thin thumb on the right edge, like the system's draggable scroll indicator,
-/// that jumps between pages as you drag it (through `view.goToPage`). Adjustable for VoiceOver. It steps back while
-/// the Pencil is down.
+/// that jumps between pages as you drag it with a finger or the pointer (through `view.goToPage`). Only the thumb's
+/// 44 pt hit area takes touches, so the Pencil writes right up to the page's edge everywhere else; while the Pencil
+/// is down it steps back and takes none. Adjustable for VoiceOver.
 final class PageScrubberView: UIView, UIPointerInteractionDelegate {
     var onScrub: ((Int) -> Void)?
     private let thumb = UIView()
+    private let pan = UIPanGestureRecognizer()
     private(set) var count = 0
     private(set) var index = 0
     private var dragging = false
+    /// Where on the thumb the finger went down (from its centre), so it does not jump under the finger.
+    private var grab: CGFloat = 0
+    private var restore: Task<Void, Never>?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1452,8 +1575,10 @@ final class PageScrubberView: UIView, UIPointerInteractionDelegate {
         thumb.layer.cornerCurve = .continuous
         thumb.isUserInteractionEnabled = false
         addSubview(thumb)
-        addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(panned(_:))))
-        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
+        // Fingers, trackpads and mice; the Pencil writes.
+        pan.allowedTouchTypes = [UITouch.TouchType.direct, .indirect, .indirectPointer].map { NSNumber(value: $0.rawValue) }
+        pan.addTarget(self, action: #selector(panned(_:)))
+        addGestureRecognizer(pan)
         addInteraction(UIPointerInteraction(delegate: self))
         isAccessibilityElement = true
         accessibilityTraits = .adjustable
@@ -1463,9 +1588,9 @@ final class PageScrubberView: UIView, UIPointerInteractionDelegate {
     required init?(coder: NSCoder) { return nil }
 
     func update(count: Int, index: Int) {
-        guard count != self.count || index != self.index else { return }
+        guard count != self.count || (index != self.index && !dragging) else { return }
         self.count = count
-        if !dragging { self.index = index }
+        if !dragging { self.index = min(max(index, 0), max(count - 1, 0)) }
         accessibilityValue = String(localized: "Page \(self.index + 1) of \(count)")
         setNeedsLayout()
     }
@@ -1486,6 +1611,18 @@ final class PageScrubberView: UIView, UIPointerInteractionDelegate {
         thumb.layer.cornerRadius = NibRadius.capsule(w)
     }
 
+    /// The part that takes touches: the thumb's row, at least 44 pt tall, across the scrubber's 44 pt width.
+    var thumbHitRect: CGRect {
+        let t = thumb.frame
+        let h = max(t.height, NibMetrics.hitTarget)
+        return CGRect(x: bounds.minX, y: t.midY - h / 2, width: bounds.width, height: h)
+    }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        thumbHitRect.contains(point)
+    }
+
+    /// The page for a thumb centred at `y`.
     private func index(at y: CGFloat) -> Int {
         let t = track
         let h = min(thumbHeight, t.height)
@@ -1495,22 +1632,22 @@ final class PageScrubberView: UIView, UIPointerInteractionDelegate {
     }
 
     @objc private func panned(_ g: UIPanGestureRecognizer) {
+        let y = g.location(in: self).y
         switch g.state {
-        case .began, .changed:
+        case .began:
             dragging = true
-            move(to: index(at: g.location(in: self).y))
+            grab = y - thumb.frame.midY
+        case .changed:
+            move(to: index(at: y - grab))
         default:
             dragging = false
         }
     }
 
-    @objc private func tapped(_ g: UITapGestureRecognizer) {
-        move(to: index(at: g.location(in: self).y))
-    }
-
     private func move(to i: Int) {
         guard count > 0, i != index else { return }
         index = i
+        accessibilityValue = String(localized: "Page \(index + 1) of \(count)")
         setNeedsLayout()
         onScrub?(i)
     }
@@ -1518,26 +1655,31 @@ final class PageScrubberView: UIView, UIPointerInteractionDelegate {
     override func accessibilityIncrement() { move(to: min(index + 1, count - 1)) }
     override func accessibilityDecrement() { move(to: max(index - 1, 0)) }
 
-    /// Steps back to the recede opacity while the Pencil is down (DESIGN.md §10.8); back after the recede delay.
+    /// Steps back to the recede opacity while the Pencil is down and takes no touches (DESIGN.md §10.8); back after
+    /// the recede delay.
     func recede(_ inking: Bool) {
         restore?.cancel()
         restore = nil
         if inking {
             alpha = CGFloat(NibOpacity.recede)
-        } else if alpha < 1 {
+            isUserInteractionEnabled = false
+        } else if alpha < 1 || !isUserInteractionEnabled {
             restore = Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(NibMotion.recedeDelay * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                self?.alpha = 1
+                guard !Task.isCancelled, let self = self else { return }
+                self.alpha = 1
+                self.isUserInteractionEnabled = true
             }
         }
     }
 
-    private var restore: Task<Void, Never>?
+    func pointerInteraction(_ interaction: UIPointerInteraction, regionFor request: UIPointerRegionRequest,
+                            defaultRegion: UIPointerRegion) -> UIPointerRegion? {
+        thumbHitRect.contains(request.location) ? UIPointerRegion(rect: thumbHitRect) : nil
+    }
 
     func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
-        let preview = UITargetedPreview(view: thumb)
-        return UIPointerStyle(effect: .highlight(preview))
+        UIPointerStyle(effect: .highlight(UITargetedPreview(view: thumb)))
     }
 }
 
@@ -1560,6 +1702,7 @@ final class AddPageIndicatorView: UIView {
         label.adjustsFontForContentSizeCategory = true
         label.textColor = NibUIColor.labelSecondary
         label.textAlignment = .center
+        label.numberOfLines = 0
         addSubview(icon)
         addSubview(label)
         set(armed: false)
@@ -1576,7 +1719,7 @@ final class AddPageIndicatorView: UIView {
     }
 
     var fittingSize: CGSize {
-        let text = label.sizeThatFits(CGSize(width: 320, height: CGFloat.greatestFiniteMagnitude))
+        let text = label.sizeThatFits(CGSize(width: NibMetrics.popoverContentWidth, height: CGFloat.greatestFiniteMagnitude))
         return CGSize(width: max(text.width, NibMetrics.hitTarget), height: NibMetrics.hitTarget + NibSpacing.xs + text.height)
     }
 
@@ -1590,10 +1733,17 @@ final class AddPageIndicatorView: UIView {
 
 // MARK: - Render failure (DESIGN.md §14.18)
 
-/// "Couldn't show this page." with Try Again, over a page whose render failed.
+/// "Couldn't show this page." with Try Again and, when the Cloud & Backup panel exists, Restore from Backup, over a
+/// page whose render failed.
 final class PageErrorView: UIView {
     var onRetry: (() -> Void)?
+    var onRestore: (() -> Void)?
+    /// Shows Restore from Backup (the canvas sets it when the Cloud & Backup panel is registered).
+    var showsRestore = false {
+        didSet { restoreButton.isHidden = !showsRestore }
+    }
     private let stack = UIStackView()
+    private let restoreButton = UIButton(type: .system)
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1609,19 +1759,19 @@ final class PageErrorView: UIView {
         label.textColor = NibUIColor.label
         label.numberOfLines = 0
         label.textAlignment = .center
-        let button = UIButton(type: .system)
-        button.setTitle(String(localized: "Try Again"), for: .normal)
-        button.titleLabel?.font = NibUIFont.button
-        button.titleLabel?.adjustsFontForContentSizeCategory = true
-        button.tintColor = NibUIColor.accent
-        button.addTarget(self, action: #selector(retry), for: .primaryActionTriggered)
-        button.heightAnchor.constraint(greaterThanOrEqualToConstant: NibMetrics.hitTarget).isActive = true
+        let retryButton = PageErrorView.button(String(localized: "Try Again"))
+        retryButton.addTarget(self, action: #selector(retry), for: .primaryActionTriggered)
+        restoreButton.setTitle(String(localized: "Restore from Backup"), for: .normal)
+        PageErrorView.style(restoreButton)
+        restoreButton.addTarget(self, action: #selector(restore), for: .primaryActionTriggered)
+        restoreButton.isHidden = true
         stack.axis = .vertical
         stack.alignment = .center
         stack.spacing = NibSpacing.s
         stack.addArrangedSubview(icon)
         stack.addArrangedSubview(label)
-        stack.addArrangedSubview(button)
+        stack.addArrangedSubview(retryButton)
+        stack.addArrangedSubview(restoreButton)
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
         NSLayoutConstraint.activate([
@@ -1635,7 +1785,30 @@ final class PageErrorView: UIView {
 
     required init?(coder: NSCoder) { return nil }
 
+    private static func button(_ title: String) -> UIButton {
+        let b = UIButton(type: .system)
+        b.setTitle(title, for: .normal)
+        style(b)
+        return b
+    }
+
+    private static func style(_ b: UIButton) {
+        b.titleLabel?.font = NibUIFont.button
+        b.titleLabel?.adjustsFontForContentSizeCategory = true
+        b.titleLabel?.numberOfLines = 0
+        b.titleLabel?.textAlignment = .center
+        b.tintColor = NibUIColor.accent
+        b.heightAnchor.constraint(greaterThanOrEqualToConstant: NibMetrics.hitTarget).isActive = true
+        b.widthAnchor.constraint(greaterThanOrEqualToConstant: NibMetrics.hitTarget).isActive = true
+    }
+
     @objc private func retry() { onRetry?() }
+    @objc private func restore() { onRestore?() }
+
+    /// The buttons' titles, visible ones only (tests and host inspection).
+    var actionTitles: [String] {
+        stack.arrangedSubviews.compactMap { ($0 as? UIButton).flatMap { $0.isHidden ? nil : $0.title(for: .normal) } }
+    }
 }
 
 // MARK: - Item accessibility
@@ -1677,8 +1850,8 @@ enum CanvasAccessibility {
         switch item.kind {
         case .comment:
             guard let c = item.comment else { return [] }
-            let open: (() -> Void)? = app.commands.entry("comment.tapAt") == nil ? nil : {
-                app.perform("comment.tapAt", ["page": .string(NodeRef.page(doc, page).description),
+            let open: (() -> Void)? = app.commands.entry(CommandIDs.commentTapAt) == nil ? nil : {
+                app.perform(CommandIDs.commentTapAt, ["page": .string(NodeRef.page(doc, page).description),
                                               "point": [.number(c.anchor.x), .number(c.anchor.y)]], session: canvas.session)
             }
             let first = c.messages.first.map { clipped($0.author.isEmpty ? $0.text : $0.author + ": " + $0.text) }
@@ -1694,9 +1867,9 @@ enum CanvasAccessibility {
                                    value: clipped(plain)))
             }
             for (label, link) in links(in: text) {
-                guard let params = followParams(link), app.commands.entry("link.follow") != nil else { continue }
+                guard let params = followParams(link), app.commands.entry(CommandIDs.linkFollow) != nil else { continue }
                 out.append(element(clipped(label), traits: .link, activate: {
-                    app.perform("link.follow", params, session: canvas.session)
+                    app.perform(CommandIDs.linkFollow, params, session: canvas.session)
                 }))
             }
             return out

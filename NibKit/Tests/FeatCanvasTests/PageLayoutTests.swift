@@ -195,6 +195,31 @@ final class PageLayoutTests: XCTestCase {
         XCTAssertEqual(empty.rect, Rect(x: -100, y: -100, width: 201, height: 201))
     }
 
+    func testBoardWorldStopsGrowingAtItsReachButKeepsContentReachable() {
+        let margin = 100_000.0
+        let world = BoardWorld.initial(content: nil, margin: margin)
+        let edge = Rect(x: BoardWorld.reach - 10, y: 0, width: 5, height: 5)
+        let grown = world.growing(toKeep: edge, margin: margin)
+        XCTAssertEqual(grown?.rect.maxX ?? 0, BoardWorld.reach, accuracy: 1e-6, "no further than the reach")
+        XCTAssertEqual(grown?.rect.minX ?? 0, world.rect.minX, accuracy: 1e-6)
+        XCTAssertNil(grown?.growing(toKeep: edge, margin: margin), "already as large as a board may be")
+        // Content imported beyond the reach stays inside the world.
+        let beyond = Rect(x: -3_000_000, y: 0, width: 10, height: 10)
+        let imported = BoardWorld.initial(content: beyond, margin: margin)
+        XCTAssertTrue(imported.rect.contains(beyond))
+        XCTAssertEqual(imported.rect.maxX, margin + 1, accuracy: 1e-6)
+        // Stroke points are 32-bit floats: at the reach they still resolve 1/16 pt.
+        XCTAssertLessThanOrEqual(Float(BoardWorld.reach).ulp, 1 / 16)
+    }
+
+    func testZoomPercentRoundsHalvesUp() {
+        XCTAssertEqual(ZoomRules.percent(0.5), 50)
+        XCTAssertEqual(ZoomRules.percent(1.255), 126)
+        XCTAssertEqual(ZoomRules.percent(0.045), 5)
+        XCTAssertEqual(ZoomRules.percent(8), 800)
+        XCTAssertEqual(ZoomRules.percent(.nan), 0)
+    }
+
     // MARK: Paging
 
     private func paged(_ widths: [Double], viewport: Double) -> (frames: [(min: Double, max: Double)], slots: [(min: Double, max: Double)]) {

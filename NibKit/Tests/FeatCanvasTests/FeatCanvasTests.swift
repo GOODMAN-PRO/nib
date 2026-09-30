@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatCanvas
@@ -118,7 +119,7 @@ final class FeatCanvasTests: XCTestCase {
         let pageHUD = h.app.ui.chromeOverlays.get(CanvasChrome.pageHUD)
         XCTAssertEqual(pageHUD?.placement, .bottomTrailing)
         XCTAssertEqual(pageHUD?.surface, .hud)
-        XCTAssertEqual(pageHUD?.docKinds, [.notebook])
+        XCTAssertEqual(pageHUD?.docKinds, [.notebook, .whiteboard], "a board's page HUD shows its zoom")
         let zoomHUD = h.app.ui.chromeOverlays.get(CanvasChrome.zoomHUD)
         XCTAssertEqual(zoomHUD?.placement, .top)
         XCTAssertEqual(zoomHUD?.isInteractive, false)
@@ -165,11 +166,17 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(frame.midX - vc.scrollView.bounds.minX, windowSize.width / 2, accuracy: 0.5)
         XCTAssertEqual(frame.minY - vc.scrollView.bounds.minY, vc.scrollView.chromeInsets.top, accuracy: 0.5)
         XCTAssertEqual(vc.scrollView.chromeInsets.top, 8 + 44 + 12, accuracy: 0.5, "below the nav bar")
+        // The scroll indicator (draggable, D-118) runs between the bars and the bottom inset.
+        XCTAssertTrue(vc.scrollView.showsVerticalScrollIndicator)
+        XCTAssertEqual(vc.scrollView.verticalScrollIndicatorInsets, vc.scrollView.chromeInsets)
 
         // Only the pages near the window have views; paper shadows sit under them.
         XCTAssertNotNil(vc.scrollView.pageViews[Fixtures.page1])
         XCTAssertNotNil(vc.scrollView.pageViews[Fixtures.page2])
         XCTAssertNil(vc.scrollView.pageViews[Fixtures.pdfPage])
+        // No renderer in this app: the pages show their paper and nothing else, and that is not an error.
+        XCTAssertEqual(vc.scrollView.pageViews[Fixtures.page1]?.contentAlpha, 0)
+        XCTAssertTrue(vc.failedPages.isEmpty)
 
         // The HUD reads "1 / 3".
         XCTAssertEqual(vc.hud.pageIndex, 0)
@@ -713,6 +720,9 @@ final class FeatCanvasTests: XCTestCase {
         }
         await waitUntil("page 1 to settle") { vc.scrollView.pageViews[Fixtures.page1]?.isSettled ?? false }
         XCTAssertTrue(vc.scrollView.pageViews[Fixtures.page1]?.hasPreview ?? false)
+        // The page's content came in with its first bitmap (DESIGN.md §14.18); the paper was there all along.
+        XCTAssertEqual(vc.scrollView.pageViews[Fixtures.page1]?.hasShownContent, true)
+        XCTAssertEqual(vc.scrollView.pageViews[Fixtures.page1]?.contentAlpha, 1)
 
         // Zooming in re-bakes at the new level when the zoom ends.
         _ = try await h.run("view.zoom", ["scale": 4])
@@ -817,7 +827,13 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(vc.scrollView.pages, [Fixtures.boardID])
         XCTAssertEqual(vc.zoomLimits, ZoomRules.boardRange)
         XCTAssertEqual(vc.zoom, 1, accuracy: 1e-9, "a board opens at 100 %")
-        XCTAssertFalse(vc.hud.showsPageHUD, "boards have no page number")
+        XCTAssertFalse(vc.scrollView.showsVerticalScrollIndicator, "an infinite board has no extent to indicate")
+        // DESIGN.md §14.17: the page HUD shows the zoom instead of a page number.
+        XCTAssertTrue(vc.hud.showsPageHUD)
+        XCTAssertTrue(vc.hud.isBoard)
+        XCTAssertEqual(vc.hud.primaryText, vc.hud.zoomText)
+        XCTAssertNil(vc.hud.secondaryText)
+        XCTAssertEqual(vc.hud.accessibilityLabel, "Zoom")
 
         // The content is centred in the window.
         let shape = try h.app.workspace.item(Fixtures.whiteboardID, page: Fixtures.boardID, id: Fixtures.boardShapeID)
@@ -871,6 +887,16 @@ final class FeatCanvasTests: XCTestCase {
         let back = try XCTUnwrap(vc.host.pagePoint(vc.host.viewPoint(Point(-69_000, 40), page: Fixtures.boardID)))
         XCTAssertEqual(back.point.x, -69_000, accuracy: 1e-6)
         XCTAssertEqual(back.point.y, 40, accuracy: 1e-6)
+
+        // A pan longer than the world (the minimap, the assistant) grows it first, so it lands where it was asked.
+        _ = try await h.run("view.scrollBy", ["dx": 0, "dy": 300_000])
+        let far = try centre()
+        XCTAssertEqual(far.x, now.x, accuracy: 1)
+        XCTAssertEqual(far.y, now.y + 300_000, accuracy: 1)
+        // …up to the board's reach.
+        _ = try await h.run("view.scrollBy", ["dx": 0, "dy": 5_000_000])
+        XCTAssertLessThanOrEqual(try XCTUnwrap(vc.board).rect.maxY, BoardWorld.reach + 1e-6)
+        XCTAssertLessThanOrEqual(try centre().y, BoardWorld.reach)
     }
 
     // MARK: Horizontal paging
@@ -1049,6 +1075,197 @@ final class FeatCanvasTests: XCTestCase {
         vc.closeCanvas()
         XCTAssertEqual(probe.closes, 1)
         XCTAssertNil(vc.host.inputController)
+    }
+
+    // MARK: The current page
+
+    func testTheRequestedPageStaysCurrentWhileItShowsUntilTheUserScrolls() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        _ = try await h.run("view.zoom", ["scale": 0.5])
+        _ = try await h.run("view.goToPage", ["index": -1])
+        // Zoomed out, the last page cannot scroll up to the bars and page 2 holds the middle of the window; the page
+        // asked for is still the current page (D-064, D-125).
+        let sv = vc.scrollView
+        let middle = CGPoint(x: sv.bounds.midX, y: unobscured(vc).midY)
+        XCTAssertEqual(vc.host.pagePoint(middle)?.page, Fixtures.page2)
+        XCTAssertEqual(h.session.page, Fixtures.pdfPage)
+        XCTAssertEqual(vc.displayedPage, Fixtures.pdfPage)
+        XCTAssertEqual(vc.hud.pageIndex, 2)
+        XCTAssertEqual(vc.hud.primaryText, "3")
+
+        // The user takes over: the page in the middle of the window is current again.
+        vc.scrollViewWillBeginDragging(sv)
+        sv.contentOffset = CGPoint(x: sv.contentOffset.x, y: sv.contentOffset.y - 1)
+        vc.scrollViewDidEndDragging(sv, willDecelerate: false)
+        XCTAssertEqual(vc.displayedPage, Fixtures.page2)
+        XCTAssertEqual(h.session.page, Fixtures.page2)
+        XCTAssertEqual(vc.hud.pageIndex, 1)
+    }
+
+    // MARK: Adding pages (D-053)
+
+    /// A stand-in for F022's `page.add` at the end of a document, honouring the caller's `id`.
+    private func registerPageAddStandIn(_ h: Harness) {
+        h.app.commands.register(CommandDescriptor(
+            id: CommandIDs.pageAdd, title: "Add Page", summary: "Test stand-in for page.add.",
+            params: .obj(["doc": .ref, "position": .str(), "id": .str()], required: ["doc"]), effect: .edit)) { params, ctx in
+            let doc = NodeRef.documentID(from: params["doc"]?.stringValue ?? "")
+            let id = NibID(params["id"]?.stringValue ?? NibID.make().raw)
+            try ctx.mutate { tx in
+                let order = try tx.content(doc).orderKey(.end, relativeTo: nil)
+                _ = try tx.put(PageRecord(id: id, order: order), doc: doc)
+            }
+            return ["ref": .string(NodeRef.page(doc, id).description)]
+        }
+    }
+
+    func testAddingAPageFromTheCanvasShowsTheNewPage() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        let pageView = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.page1])
+        let summary = try XCTUnwrap(pageView.accessibilityElements?.first as? UIAccessibilityElement)
+        XCTAssertEqual(summary.accessibilityCustomActions?.count ?? 0, 0, "no Add Page without page.add")
+
+        registerPageAddStandIn(h)
+        pageView.invalidateAccessibility()
+        let actions = (pageView.accessibilityElements?.first as? UIAccessibilityElement)?.accessibilityCustomActions
+        XCTAssertEqual(actions?.map { $0.name }, ["Add Page"], "VoiceOver's equivalent of pulling past the last page")
+
+        // Pulling past the last page and letting go (or the Add Page action) adds a page at the end and shows it.
+        vc.addPage()
+        await waitUntil("the new page") { (try? h.app.workspace.content(Fixtures.docID).livePages.count) == 4 }
+        let added = try XCTUnwrap(h.app.workspace.content(Fixtures.docID).livePages.last).id
+        await waitUntil("the canvas to show the new page") { h.session.page == added }
+        XCTAssertEqual(vc.scrollView.pages.last, added)
+        XCTAssertEqual(vc.displayedPage, added)
+        XCTAssertEqual(vc.hud.primaryText, "4")
+        XCTAssertEqual(vc.hud.secondaryText, "/ 4")
+
+        // Read-only documents take no new pages.
+        h.session.readOnly = true
+        vc.addPage()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(try h.app.workspace.content(Fixtures.docID).livePages.count, 4)
+    }
+
+    // MARK: Boards reach far
+
+    func testRevealGrowsABoardToAnItemPlacedFarAway() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
+        let before = try XCTUnwrap(vc.board).rect
+        // Placed far off after the board opened (the assistant, a collaborator).
+        let far = Item(kind: .shape, shape: ShapeItem(shape: .rectangle, frame: Frame(x: 400_000, y: -250_000, w: 120, h: 80)))
+        let written = try await h.insert([far], page: Fixtures.boardID, doc: Fixtures.whiteboardID)
+        let item = try XCTUnwrap(written.first)
+        let hit = h.app.content.hitBounds(for: item)
+        XCTAssertFalse(before.contains(hit))
+
+        let r = try await h.run("view.reveal", ["ref": .string(NodeRef.item(Fixtures.whiteboardID, Fixtures.boardID, item.id).description)])
+        XCTAssertEqual(try r["rect"]?.decode(Rect.self), hit)
+        XCTAssertTrue(try XCTUnwrap(vc.board).rect.contains(hit), "the world grew to take the item")
+        let t = try XCTUnwrap(vc.host.pageTransform(Fixtures.boardID))
+        XCTAssertTrue(vc.scrollView.bounds.contains(hit.cg.applying(t)), "the item is on screen")
+    }
+
+    // MARK: Scrubber (D-118)
+
+    func testScrubberTakesTouchesOnlyAtItsThumbAndStepsBackWhileWriting() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        h.app.commands.register(CommandDescriptor(id: "test.pageHorizontally", title: "Page Horizontally",
+                                                  summary: "Test helper.", effect: .edit)) { _, ctx in
+            try ctx.mutate { tx in
+                var meta = try tx.content(Fixtures.docID).meta
+                meta.scrollDirection = .horizontal
+                try tx.putMeta(meta)
+            }
+            return .null
+        }
+        _ = try await h.run("test.pageHorizontally")
+        let vc = try makeCanvas(h)
+        let s = vc.scrubber
+        XCTAssertFalse(s.isHidden)
+        XCTAssertTrue(s.superview === vc.fixedOverlay, "it stays put while the pages scroll")
+        XCTAssertEqual(s.count, 3)
+        XCTAssertEqual(s.index, 0)
+        s.layoutIfNeeded()
+        let thumb = s.thumbHitRect
+        XCTAssertGreaterThanOrEqual(thumb.width, 44)
+        XCTAssertGreaterThanOrEqual(thumb.height, 44)
+        XCTAssertTrue(s.point(inside: CGPoint(x: thumb.midX, y: thumb.midY), with: nil))
+        XCTAssertFalse(s.point(inside: CGPoint(x: s.bounds.midX, y: s.bounds.maxY - 4), with: nil),
+                       "away from the thumb the Pencil writes on the page")
+        let pencil = NSNumber(value: UITouch.TouchType.pencil.rawValue)
+        for g in s.gestureRecognizers ?? [] { XCTAssertFalse(g.allowedTouchTypes.contains(pencil)) }
+
+        // VoiceOver adjusts it: the next page, through view.goToPage.
+        XCTAssertTrue(s.accessibilityTraits.contains(.adjustable))
+        s.accessibilityIncrement()
+        await waitUntil("page 2") { h.session.page == Fixtures.page2 }
+        XCTAssertEqual(s.index, 1)
+
+        // While the Pencil is down it recedes and takes no touches; it comes back after the Pencil lifts.
+        h.session.inking.begin()
+        XCTAssertFalse(s.isUserInteractionEnabled)
+        XCTAssertLessThan(s.alpha, 1)
+        h.session.inking.end()
+        await waitUntil("the scrubber to come back") { s.isUserInteractionEnabled && s.alpha == 1 }
+    }
+
+    // MARK: Decorations follow the canvas cheaply
+
+    func testDecorationsMoveWithScrollingAndRedrawOnlyForANewZoom() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        let attachment = try XCTUnwrap(vc.attachmentHost.attachment(id: DecorationAttachment.id) as? DecorationAttachment)
+        _ = try await h.run("canvas.decorate", CanvasDecorate.example)
+        let layer = try XCTUnwrap(attachment.layer(for: Fixtures.page1))
+        let redraws = layer.redraws
+        XCTAssertGreaterThan(redraws, 0)
+        let t0 = try XCTUnwrap(vc.host.pageTransform(Fixtures.page1))
+        XCTAssertEqual(layer.frame.minY, layer.drawnRect.applying(t0).minY, accuracy: 1e-6)
+        XCTAssertEqual(layer.drawnZoom, t0.a, accuracy: 1e-9)
+
+        _ = try await h.run("view.scrollBy", ["dx": 0, "dy": 20])
+        XCTAssertEqual(layer.redraws, redraws, "a small scroll only moves the layer")
+        let t1 = try XCTUnwrap(vc.host.pageTransform(Fixtures.page1))
+        XCTAssertEqual(layer.frame.minY, layer.drawnRect.applying(t1).minY, accuracy: 1e-6)
+
+        _ = try await h.run("view.zoom", ["scale": 3])
+        XCTAssertGreaterThan(layer.redraws, redraws, "a new zoom draws again")
+        XCTAssertEqual(layer.drawnZoom, 3, accuracy: 1e-9)
+        // At 300 % only the part of the page around the window is drawn.
+        XCTAssertLessThan(layer.drawnRect.height, PageSize.a4.height)
+    }
+
+    // MARK: Render failure (DESIGN.md §14.18)
+
+    func testAPageThatFailsToRenderOffersTryAgainAndRestoreFromBackup() async throws {
+        let h = Harness(features: [FeatCanvasFeature.self])
+        let vc = try makeCanvas(h)
+        vc.pageDidFail(Fixtures.page1)
+        XCTAssertFalse(vc.errorView.isHidden)
+        XCTAssertTrue(vc.errorView.superview === vc.fixedOverlay)
+        XCTAssertEqual(vc.errorView.actionTitles, ["Try Again"], "no backups without the Cloud & Backup panel")
+
+        var opened: [JSONValue] = []
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open Panel", summary: "Test stand-in.",
+                                                  params: .obj(["id": .str()], required: ["id"]), effect: .session)) { params, _ in
+            opened.append(params)
+            return .null
+        }
+        h.app.ui.panels.register(PanelDescriptor(id: PanelIDs.cloudBackup, title: "Cloud & Backup", icon: "externaldrive",
+                                                 placement: .sheet, order: 0, owner: "test") { _ in AnyView(EmptyView()) })
+        vc.pageDidFail(Fixtures.page1)
+        XCTAssertEqual(vc.errorView.actionTitles, ["Try Again", "Restore from Backup"])
+        vc.errorView.onRestore?()
+        await waitUntil("panel.open") { !opened.isEmpty }
+        XCTAssertEqual(opened.first?["id"]?.stringValue, PanelIDs.cloudBackup)
+
+        vc.errorView.onRetry?()
+        XCTAssertTrue(vc.errorView.isHidden)
+        XCTAssertTrue(vc.failedPages.isEmpty)
     }
 }
 

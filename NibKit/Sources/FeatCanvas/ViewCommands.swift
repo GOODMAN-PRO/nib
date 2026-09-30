@@ -38,7 +38,7 @@ enum CanvasLocator {
         var params: [String: JSONValue] = ["doc": .string(NodeRef.document(doc).description)]
         if let p = page { params["page"] = .string(NodeRef.page(doc, p).description) }
         do {
-            _ = try await ctx.execute("doc.open", .object(params))
+            _ = try await ctx.execute(CommandIDs.docOpen, .object(params))
         } catch let e as NibError where e.code == .unavailable {
             guard let navigator = ctx.navigator else {
                 throw NibError(.unavailable, "no window can show document \(doc.raw)",

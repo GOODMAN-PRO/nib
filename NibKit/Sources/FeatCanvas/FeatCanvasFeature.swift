@@ -31,9 +31,10 @@ public enum FeatCanvasFeature: NibFeature {
             DecorationAttachment(store: store)
         })
 
+        // The page HUD: "3 / 12" on a notebook, the zoom on a board (DESIGN.md §14.2, §14.17).
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
             id: CanvasChrome.pageHUD, owner: id, placement: .bottomTrailing, surface: .hud, order: 100,
-            recedesWhileWriting: true, isInteractive: true, docKinds: [.notebook],
+            recedesWhileWriting: true, isInteractive: true, docKinds: [.notebook, .whiteboard],
             isVisible: { ctx in CanvasChrome.canvas(ctx)?.hud.showsPageHUD ?? false },
             makeView: { ctx in
                 guard let canvas = CanvasChrome.canvas(ctx) else { return AnyView(EmptyView()) }
@@ -50,7 +51,7 @@ public enum FeatCanvasFeature: NibFeature {
 
         for pan in CanvasKeys.pans {
             var d = KeyCommandDescriptor(id: pan.id, title: pan.title, shortcut: KeyShortcut(pan.key, [.option]),
-                                         command: "view.scrollBy",
+                                         command: CommandIDs.viewScrollBy,
                                          params: ["dx": .number(pan.dx), "dy": .number(pan.dy), "unit": "window"],
                                          scope: .canvas, order: 800, owner: id)
             d.docKinds = [.notebook, .whiteboard]

@@ -98,8 +98,9 @@ final class CanvasAttachmentHost {
 // MARK: - Built-in decoration attachment (canvas.decorate)
 
 /// Draws `DecorationStore` overlays (`canvas.decorate`, `nib.canvas.decorate`) with the shared `DisplayList.draw`.
-/// One layer per decorated page, covering only the visible part of that page (a page at 800 % would otherwise need
-/// a bitmap hundreds of megapixels large). It never takes a touch.
+/// One layer per decorated page, covering only the part of that page around the window (a page at 800 % would
+/// otherwise need a bitmap hundreds of megapixels large). Scrolling only moves the layer; it is drawn again when the
+/// decorations or the zoom change, or the window leaves the part it drew. It never takes a touch.
 @MainActor
 final class DecorationAttachment: CanvasAttachment {
     static let id = "canvas.decorations"
@@ -143,6 +144,9 @@ final class DecorationAttachment: CanvasAttachment {
     /// Pages with decorations right now.
     var decoratedPages: Set<PageID> { Set(layers.keys) }
 
+    /// The layer drawing `page`'s decorations (tests and host inspection).
+    func layer(for page: PageID) -> DecorationLayer? { layers[page] }
+
     private func refresh() {
         guard let host = host else { return }
         let canvas = host.canvasView
@@ -154,17 +158,18 @@ final class DecorationAttachment: CanvasAttachment {
         let visible = canvas.bounds
         let scale = canvas.traitCollection.displayScale > 0 ? canvas.traitCollection.displayScale : 2
         for page in pages {
-            guard let frame = host.pageFrame(page), let t = host.pageTransform(page) else {
+            guard let frame = host.pageFrame(page), let t = host.pageTransform(page), t.a > 0 else {
                 layers[page]?.removeFromSuperlayer()
                 layers[page] = nil
                 continue
             }
-            // The visible part of the page (a board is unbounded), grown a little so small scrolls do not redraw.
-            let area = frame.intersection(visible.insetBy(dx: -visible.width * 0.25, dy: -visible.height * 0.25))
-            guard !area.isNull, area.width > 0, area.height > 0 else {
+            // The part of the page (a board's frame is its whole world) the window shows, in page coordinates.
+            let shown = frame.intersection(visible)
+            guard !shown.isNull, shown.width > 0, shown.height > 0 else {
                 layers[page]?.isHidden = true
                 continue
             }
+            let toPage = t.inverted()
             let l: DecorationLayer
             if let existing = layers[page] {
                 l = existing
@@ -175,24 +180,30 @@ final class DecorationAttachment: CanvasAttachment {
                 layers[page] = l
             }
             l.isHidden = false
-            l.update(frame: area, transform: t, lists: store.decorations(doc: host.documentID, page: page).map { $0.display },
+            l.update(needed: shown.applying(toPage), page: frame.applying(toPage), transform: t,
+                     lists: store.decorations(doc: host.documentID, page: page).map { $0.display },
                      generation: store.generation, assets: host.app.services.assets, doc: host.documentID)
         }
     }
 }
 
-/// One page's decorations, drawn for the visible area only.
+/// One page's decorations, drawn for the part of the page around the window. It keeps its bitmap while the window
+/// scrolls inside what it drew at the same zoom, and is only moved then.
 final class DecorationLayer: CALayer {
     private var lists: [DisplayList] = []
-    private var pageTransform = CGAffineTransform.identity
     private var generation = -1
     private var assets: AssetStore?
     private var doc: DocumentID?
+    /// What the bitmap shows, in page coordinates, and at which zoom (view points per page point).
+    private(set) var drawnRect = CGRect.null
+    private(set) var drawnZoom: CGFloat = 0
+    /// How many times the layer asked to be drawn again (tests and host inspection).
+    private(set) var redraws = 0
 
     override init() {
         super.init()
         actions = CanvasLayers.noActions
-        needsDisplayOnBoundsChange = true
+        needsDisplayOnBoundsChange = false
         isOpaque = false
     }
 
@@ -202,27 +213,39 @@ final class DecorationLayer: CALayer {
 
     required init?(coder: NSCoder) { return nil }
 
-    /// Redraws when the decorations, the zoom or the covered area changed.
-    func update(frame area: CGRect, transform: CGAffineTransform, lists: [DisplayList], generation: Int,
+    /// Places the layer for `transform` (page → canvas view) and draws again when the decorations or the zoom changed
+    /// or `needed` (page coordinates) is no longer inside what was drawn. A redraw covers `needed` plus a quarter of
+    /// it on every side, within `page`, so small scrolls reuse the bitmap.
+    func update(needed: CGRect, page: CGRect, transform: CGAffineTransform, lists: [DisplayList], generation: Int,
                 assets: AssetStore?, doc: DocumentID) {
-        let moved = frame != area || pageTransform != transform
-        guard moved || generation != self.generation else { return }
+        let zoom = transform.a
+        // Half a point of slack: `needed` comes through an inverted transform and carries rounding.
+        let redraw = generation != self.generation || abs(zoom - drawnZoom) > zoom * 1e-9 || drawnRect.isNull
+            || !drawnRect.insetBy(dx: -0.5, dy: -0.5).contains(needed)
+        if redraw {
+            let grown = needed.insetBy(dx: -needed.width / 4, dy: -needed.height / 4).intersection(page)
+            drawnRect = grown.isNull ? needed : grown
+            drawnZoom = zoom
+            self.lists = lists
+            self.generation = generation
+            self.assets = assets
+            self.doc = doc
+        }
+        let area = drawnRect.applying(transform)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        frame = area
+        if frame != area { frame = area }
         CATransaction.commit()
-        pageTransform = transform
-        self.lists = lists
-        self.generation = generation
-        self.assets = assets
-        self.doc = doc
-        setNeedsDisplay()
+        if redraw {
+            redraws += 1
+            setNeedsDisplay()
+        }
     }
 
     override func draw(in ctx: CGContext) {
-        // Page coordinates → this layer: the page transform (zoom and position in the canvas), less our origin.
-        ctx.translateBy(x: -frame.minX, y: -frame.minY)
-        ctx.concatenate(pageTransform)
+        // Page coordinates → this layer: the zoom, less what the layer's origin shows.
+        ctx.scaleBy(x: drawnZoom, y: drawnZoom)
+        ctx.translateBy(x: -drawnRect.minX, y: -drawnRect.minY)
         for list in lists { list.draw(in: ctx, assets: assets, doc: doc) }
     }
 }
