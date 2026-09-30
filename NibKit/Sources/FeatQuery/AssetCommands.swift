@@ -13,10 +13,7 @@ enum AssetBytes {
         return e
     }
 
-    /// Largest file a url input may name (it is read into memory).
-    static let maxInputBytes = 200 * 1024 * 1024
-
-    /// Asset and tmp: names are one path component: `name.ext` of [A-Za-z0-9_-] (so never "..", "/").
+    /// Asset names are one path component: `name.ext` of [A-Za-z0-9_-] (so never "..", "/").
     static func checkName(_ name: String, path: String) throws {
         guard name.range(of: #"\A[A-Za-z0-9_-]{1,128}(\.[A-Za-z0-9]{1,10})?\z"#, options: .regularExpression) != nil else {
             throw NibError(.invalidParams, "'\(name)' is not an asset name", path: path,
@@ -33,24 +30,26 @@ enum AssetBytes {
         return data
     }
 
-    /// tmp: refs, https and (user only) file:// all go through `ctx.inputFile`; the read happens off the main actor.
-    /// Plugins need the `network` permission for http(s) urls, and files over `maxInputBytes` are refused.
+    /// tmp: refs, https and (user only) file:// all go through `ctx.inputFile`, which checks tmp: names, the scheme,
+    /// the `network` scope (and a plugin's `network.hosts`) and caps downloads at `NibLimits.maxDownloadBytes`.
+    /// The file is read into memory, so local files (tmp:, file://) are held to the same cap; the read happens off
+    /// the main actor.
     static func load(base64: String?, url: String?, _ ctx: CommandContext) async throws -> Data {
         switch (base64, url) {
         case (.some(let b), .none):
             return try decode(b, path: "$.base64")
         case (.none, .some(let u)):
-            if u.hasPrefix("tmp:") { try checkName(String(u.dropFirst(4)), path: "$.url") }
-            // ponytail: CommandContext.inputFile should own this check for every url-taking command (contract gap).
-            if case .plugin = ctx.principal, let scheme = URL(string: u)?.scheme?.lowercased(),
-               scheme == "https" || scheme == "http", !ctx.bus.gateway.grants(ctx.principal).contains(.network) {
-                throw NibError(.permissionDenied, "downloading a url needs the network permission", path: "$.url",
-                               hint: "upload the bytes with asset.upload and pass the returned tmp: ref")
+            let file: URL
+            do {
+                file = try await ctx.inputFile(u)
+            } catch var e as NibError {
+                if e.path == nil { e.path = "$.url" }
+                throw e
             }
-            let file = try await ctx.inputFile(u)
             let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-            guard size <= maxInputBytes else {
-                throw NibError(.invalidParams, "\(u) is larger than \(maxInputBytes / 1024 / 1024) MB", path: "$.url")
+            guard size <= NibLimits.maxDownloadBytes else {
+                throw NibError(.invalidParams, "\(u) is larger than \(NibLimits.maxDownloadBytes / 1_048_576) MB",
+                               path: "$.url")
             }
             do {
                 return try await Task.detached { try Data(contentsOf: file) }.value

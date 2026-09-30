@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 import NibContracts
 import NibTesting
 import FeatQuery
@@ -135,7 +136,37 @@ final class FeatQueryTests: XCTestCase {
         XCTAssertEqual(c["page"]?["index"]?.intValue, 0)
         XCTAssertEqual(c["selection"]?["kinds"], JSONValue.array(["sticky", "text"]))
         XCTAssertEqual(c["selection"]?["bbox"], JSONValue.array([72, 120, 468, 320]))
-        XCTAssertEqual(c["tabs"], JSONValue.array(["doc:FIXTUREDOC01"]))
+        XCTAssertEqual(c["tabs"], JSONValue.array(["doc:FIXTUREDOC01"]), "headless: only the session's document")
+
+        // With a window, the tabs come from its navigator (`ctx.navigator`).
+        let window = TabsNavigator(session: h.session, tabs: [Fixtures.docID, Fixtures.textDocID])
+        h.app.ui.activeNavigator = window
+        let tabbed = try await h.run("query.context", [:], as: .ai("ctx"))
+        XCTAssertEqual(tabbed["tabs"], JSONValue.array(["doc:FIXTUREDOC01", "doc:FIXTUREDOC02"]))
+        // Another window's navigator does not describe this session's tabs.
+        let other = TabsNavigator(session: EditorSession(), tabs: [Fixtures.textDocID])
+        h.app.ui.activeNavigator = other
+        let foreign = try await h.run("query.context", ["session": .string(h.session.id.raw)])
+        XCTAssertEqual(foreign["tabs"], JSONValue.array(["doc:FIXTUREDOC01"]))
+        withExtendedLifetime([window, other]) {}
+    }
+
+    func testCustomItemTextFollowsTheRegisteredTextPath() async throws {
+        let h = harness()
+        let ref: JSONValue = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECUS01"
+        func text() async throws -> String? {
+            let page = try await h.run("query.get", ["ref": "page:FIXTUREDOC01/FIXTUREPG001"])
+            return page["items"]?.arrayValue?.first(where: { $0["ref"] == ref })?["text"]?.stringValue
+        }
+        let unregistered = try await text()
+        XCTAssertEqual(unregistered, "Fixture box", "without a registered type, data.title is the text")
+        try await h.run("node.set", json(#"{"ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURECUS01", "fields": {"custom": {"data": {"caption": {"line": "Registered caption"}}}}}"#))
+        h.app.content.customItemTypes.register(
+            CustomItemTypeDescriptor(owner: "nib.fixture", type: "box", title: "Box", textPath: "caption.line"))
+        let registered = try await text()
+        XCTAssertEqual(registered, "Registered caption")
+        let found = try await h.run("query.find", json(#"{"in": "doc:FIXTUREDOC01", "text": "registered caption"}"#))
+        XCTAssertEqual(found["items"]?.arrayValue?.compactMap { $0["ref"] }, [ref])
     }
 
     func testFindFiltersByToolFieldsTextAndArea() async throws {
@@ -249,6 +280,29 @@ final class FeatQueryTests: XCTestCase {
         XCTAssertGreaterThan(stroke.bounds.maxY, 350)
         XCTAssertNotEqual(stroke.bounds, oldBounds)
         XCTAssertEqual(h.undoDepth(Fixtures.docID), 1)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
+        XCTAssertEqual(try h.snapshot(), before)
+    }
+
+    func testAIMovesAcrossPagesKeepProvenance() async throws {
+        let h = harness()
+        try await h.run("item.create", json(#"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "id": "USERNOTE1", "item": {"kind": "shape", "shape": {"shape": "ellipse", "frame": {"x": 20, "y": 20, "w": 80, "h": 80}}}}"#))
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "USERNOTE1").createdBy, "user")
+        let before = try h.snapshot()
+        let depth = h.undoDepth(Fixtures.docID)
+        let r = try await h.run("node.move", ["ref": "item:FIXTUREDOC01/FIXTUREPG001/USERNOTE1", "to": "page:FIXTUREDOC01/FIXTUREPG002"],
+                                as: .ai("mover"))
+        XCTAssertEqual(r["newRef"]?.stringValue, "item:FIXTUREDOC01/FIXTUREPG002/USERNOTE1")
+        let moved = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page2, id: "USERNOTE1")
+        XCTAssertEqual(moved.createdBy, "user", "the AI moving the user's shape keeps it the user's")
+        XCTAssertFalse(moved.deleted)
+        XCTAssertThrowsError(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "USERNOTE1"))
+        // And back again: the tombstone it left is its own slot.
+        try await h.run("node.move", ["ref": "item:FIXTUREDOC01/FIXTUREPG002/USERNOTE1", "to": "page:FIXTUREDOC01/FIXTUREPG001"],
+                        as: .ai("mover"))
+        XCTAssertEqual(try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "USERNOTE1").createdBy, "user")
+        XCTAssertEqual(h.undoDepth(Fixtures.docID), depth + 2)
+        XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertTrue(h.app.bus.undo(Fixtures.docID))
         XCTAssertEqual(try h.snapshot(), before)
     }
@@ -502,13 +556,51 @@ final class FeatQueryTests: XCTestCase {
         XCTAssertEqual(tmp?.code, .invalidParams)
         XCTAssertEqual(tmp?.path, "$.url")
 
-        // A plugin without the network permission cannot make the app fetch URLs.
-        h.app.gateway.grants = { _ in [.documentRead, .documentWrite] }
-        let net = await nibError {
-            try await h.run("asset.put", ["doc": "doc:FIXTUREDOC01", "url": "https://example.com/x.png", "ext": "png"],
-                            as: .plugin("dev.example"))
+        // Plain http is user-only (`ctx.inputFile`), whatever the caller's scopes.
+        let http = await nibError {
+            try await h.run("asset.put", ["doc": "doc:FIXTUREDOC01", "url": "http://example.com/x.png", "ext": "png"],
+                            as: .ai("c3"))
         }
-        XCTAssertEqual(net?.code, .permissionDenied)
-        XCTAssertEqual(net?.path, "$.url")
+        XCTAssertEqual(http?.code, .permissionDenied)
+        XCTAssertEqual(http?.path, "$.url")
+        // A plugin or the AI without the network permission cannot make the app fetch URLs.
+        h.app.gateway.grants = { _ in [.documentRead, .documentWrite] }
+        for principal in [Principal.plugin("dev.example"), .ai("c3")] {
+            let net = await nibError {
+                try await h.run("asset.put", ["doc": "doc:FIXTUREDOC01", "url": "https://example.com/x.png", "ext": "png"],
+                                as: principal)
+            }
+            XCTAssertEqual(net?.code, .permissionDenied, "\(principal)")
+            XCTAssertEqual(net?.path, "$.url", "\(principal)")
+        }
     }
+
+    func testAssetPutIsAnEditThatIsNotUndoable() async throws {
+        let h = harness()
+        let d = try XCTUnwrap(h.app.commands.descriptor("asset.put"))
+        XCTAssertEqual(d.effect, .edit)
+        XCTAssertFalse(d.undoable)
+        let depth = h.undoDepth(Fixtures.textDocID)
+        try await h.run("asset.put", ["doc": "doc:FIXTUREDOC02", "ext": "png",
+                                      "base64": .string(Fixtures.pngData.base64EncodedString())])
+        XCTAssertEqual(h.undoDepth(Fixtures.textDocID), depth, "storing an asset adds no undo step")
+    }
+}
+
+/// A window navigator with fixed tabs (query.context reads `openDocuments` of the active window).
+@MainActor
+private final class TabsNavigator: SceneNavigator {
+    let session: EditorSession
+    let openDocuments: [DocumentID]
+    init(session: EditorSession, tabs: [DocumentID]) {
+        self.session = session
+        openDocuments = tabs
+    }
+    var activeDocument: DocumentID? { openDocuments.first }
+    var rootViewController: UIViewController? { nil }
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {}
+    func closeDocument(_ doc: DocumentID) {}
+    func showLibrary(folder: FolderID?) {}
+    func showSettings(page: String?) {}
+    func presentModal(_ viewController: UIViewController) {}
 }

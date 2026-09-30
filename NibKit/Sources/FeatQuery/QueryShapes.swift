@@ -24,12 +24,6 @@ enum Shapes {
         return r
     }
 
-    /// The app that owns this call's bus (registries the context does not carry: custom item types, navigator).
-    static func app(_ ctx: CommandContext) -> NibApp? {
-        guard let app = NibApp.shared, app.bus === ctx.bus else { return nil }
-        return app
-    }
-
     /// Password-locked documents are never expanded for non-user principals (ARCHITECTURE §7.4).
     static func hidden(_ doc: DocumentID, _ ctx: CommandContext) -> Bool {
         !ctx.principal.isUser && isLocked(doc, ctx)
@@ -133,7 +127,7 @@ enum Shapes {
 
     /// Text of a custom item via its registered `textPath` (else `data.title` / `data.text`).
     static func customText(_ c: CustomItem, _ ctx: CommandContext) -> String? {
-        let declared = app(ctx)?.content.customItemTypes.get("custom." + c.owner + "." + c.type)?.textPath
+        let declared = ctx.content.customItemTypes.get("custom." + c.owner + "." + c.type)?.textPath
         for path in declared.map({ [$0] }) ?? ["title", "text"] {
             var v: JSONValue? = c.data
             for key in path.split(separator: ".") { v = v?[String(key)] }

@@ -246,18 +246,6 @@ enum Edits {
             if changed { try tx.put(it, doc: doc, page: page) }
         }
     }
-
-    /// The item without references to other items of its old page (they do not exist on the new one).
-    static func unanchored(_ item: Item) -> Item {
-        var it = item
-        it.attachedTo = nil
-        if var c = it.connector {
-            c.from = ConnectorEnd(point: c.from.point)
-            c.to = ConnectorEnd(point: c.to.point)
-            it.connector = c
-        }
-        return it
-    }
 }
 
 // MARK: - node.insert
@@ -503,7 +491,7 @@ struct NodeMove: NibCommand {
 
     static let descriptor = CommandDescriptor(
         id: "node.move", title: "Move Node",
-        summary: "Reorder or reparent: an item to a z index or another page (id kept; AI/plugin cross-page moves re-stamp createdBy), a page/block/card to an index, an outline under another.",
+        summary: "Reorder or reparent: an item to a z index or another page (id and createdBy kept), a page/block/card to an index, an outline under another.",
         params: .obj(["ref": .ref,
                       "to": .str("items: page:D/P; pages, blocks, cards: doc:D; outline entries: doc:D or outline:D/O"),
                       "at": .int("index among the new siblings (items: z order, 0 = bottom); default last/top", min: 0)],
@@ -536,23 +524,21 @@ struct NodeMove: NibCommand {
                 let stored = moved
                 try ctx.mutate { tx in try tx.put(stored, doc: doc, page: page) }
             } else {
-                // A tombstone of this id on the target is taken too, unless it is this item moving back (same
-                // createdBy): `DocTransaction.put` would keep the tombstone's provenance for non-user principals.
-                // ponytail: a non-user cross-page move stamps the mover as createdBy (put treats it as a create);
-                // keeping the original needs a DocTransaction move/put(keepingProvenanceOf:) contract change.
+                // Removed ids stay taken (as in item.create): a tombstone of this id on the target is reused only by
+                // the user or by this item moving back (same createdBy), so no other item takes over a removed item's
+                // slot and the attachments and connector ends that may still name it.
                 let targetAll = try ctx.workspace.allItems(doc, page: target)
                 if let taken = targetAll.first(where: { $0.id == id }),
                    !taken.deleted || (!ctx.principal.isUser && taken.createdBy != item.createdBy) {
                     throw NibError(.conflict, "page \(target) already has (or had) an item \(id)",
                                    hint: "move a copy made with item.create and your own id instead")
                 }
-                var moved = Edits.unanchored(item)
-                moved.z = Shapes.orderKey(at: p.at, among: targetAll.filter { !$0.deleted }.map { $0.z })
-                let stored = moved
+                let z = Shapes.orderKey(at: p.at, among: targetAll.filter { !$0.deleted }.map { $0.z })
+                // `tx.move` tombstones the source, keeps the item's provenance for every principal and drops anchors
+                // that do not resolve on the target page; items on the old page let go of it first.
                 try ctx.mutate { tx in
                     try Edits.detach(id, doc: doc, page: page, tx)
-                    try tx.delete(item: id, doc: doc, page: page)
-                    try tx.put(stored, doc: doc, page: target)
+                    try tx.move(item: id, doc: doc, from: page, to: target, z: z)
                 }
             }
             return Output(newRef: NodeRef.item(doc, target, id).description)

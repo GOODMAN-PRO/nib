@@ -28,8 +28,9 @@ struct QueryContext: NibCommand {
 
         var o: [String: JSONValue] = ["session": .string(s.id.raw), "tool": .string(s.tool), "readOnly": .bool(s.readOnly),
                                       "activeLayer": .number(Double(s.activeLayer))]
-        let navigator = Shapes.app(ctx)?.ui.activeNavigator
-        let tabs = navigator.flatMap { $0.session === s ? $0.openDocuments : nil } ?? (s.document.map { [$0] } ?? [])
+        // Open tabs of the session's window when it is the active one (`ctx.navigator`); else (headless, or another
+        // window's session) only the session's document.
+        let tabs = ctx.navigator.flatMap { $0.session === s ? $0.openDocuments : nil } ?? (s.document.map { [$0] } ?? [])
         o["tabs"] = .array(tabs.map { JSONValue.string(NodeRef.document($0).description) })
         o["selection"] = .object(["refs": .array([])])
         guard let doc = s.document else { return .object(o) }
