@@ -612,11 +612,13 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
 @MainActor
 enum ImportUI {
     /// The window that asks the user, waiting briefly for it: an Open In at launch arrives before the window is active.
-    /// The calling window's own navigator when there are several (Split View, Stage Manager), else the active one.
+    /// The shell makes the window the user works in the active one (key window, Open In, key commands), so that is
+    /// `ctx.navigator`; a call from another window (a drop into a window that is not key, in Split View or Stage
+    /// Manager) is asked in its own window.
     static func navigator(_ ctx: CommandContext) async -> SceneNavigator? {
         guard !NibApp.isHostlessTest, ctx.app != nil else { return nil }
         for _ in 0..<40 {
-            if let nav = navigator(showing: ctx.session) ?? ctx.navigator, nav.rootViewController?.view.window != nil {
+            if let nav = navigator(for: ctx.session, active: ctx.navigator), nav.rootViewController?.view.window != nil {
                 return nav
             }
             try? await Task.sleep(nanoseconds: 100_000_000)
@@ -624,7 +626,14 @@ enum ImportUI {
         return nil
     }
 
-    /// The navigator whose window runs `session`.
+    /// The navigator of the window running `session`: the active one when it runs it (or no session was given), else
+    /// the window found by its session, else the active one.
+    static func navigator(for session: EditorSession?, active: SceneNavigator?) -> SceneNavigator? {
+        guard let session = session, active?.session !== session else { return active }
+        return navigator(showing: session) ?? active
+    }
+
+    /// The navigator whose window runs `session` (a window other than the active one).
     static func navigator(showing session: EditorSession?) -> SceneNavigator? {
         guard let session = session else { return nil }
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {

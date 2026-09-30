@@ -823,11 +823,12 @@ enum ImportEngine {
                            path: "$.doc", hint: "update Nib, or import the files as new documents")
         }
         if dest.anchor == nil, dest.position == .before || dest.position == .after {
-            guard let s = ctx.activeSession, s.document == d, let page = s.page else {
+            // §6.1 session default: the current page of the window that shows this document.
+            guard let current = try? ctx.pageOrSession(nil, field: "anchor"), current.doc == d else {
                 throw NibError(.invalidParams, "'anchor' (page:D/P) is needed to place pages before or after a page",
                                path: "$.anchor", hint: "pass anchor, or position start or end")
             }
-            dest.anchor = page
+            dest.anchor = current.page
         }
         if let a = dest.anchor, content.pageIndex(a) == nil {
             throw NibError(.notFound, "page \(a.raw) not found in document \(d.raw)", path: "$.anchor",
@@ -957,7 +958,7 @@ struct ImportFiles: NibCommand {
                                        "position": "after", "anchor": "page:FIXTUREDOC01/FIXTUREPG001"]
         let withID: JSONValue = ["urls": ["tmp:holiday.jpg"], "folder": "lib", "ids": ["HOLIDAYDOC01"]]
         return CommandDescriptor(
-            id: "import.files", title: "Import Files",
+            id: CommandIDs.importFiles, title: "Import Files",
             summary: "Import files (PDF, images, Word, PowerPoint, web pages, .nibnote, zips, backups, CSV/TXT, plugins) as new documents in a folder or as pages of a document → {refs, pages?, folders?, failed?}.",
             params: .obj([
                 "urls": .arr(.str("tmp:<name> from asset.upload, an https URL, or file:// (user only)")),
@@ -993,7 +994,7 @@ struct ImportPick: NibCommand {
     typealias Output = ImportResult
 
     static let descriptor = CommandDescriptor(
-        id: "import.pick", title: "Import Files",
+        id: CommandIDs.importPick, title: "Import Files",
         summary: "Show the Files picker and import the chosen files: target lib or folder:F (new documents), doc:D or page:D/P (pages); omitted asks where.",
         params: .obj(["target": .str("lib, folder:F, doc:D (pages at the end) or page:D/P (pages after it); omitted = ask")]),
         examples: [["target": "folder:FIXTUREFLD01"], ["target": "page:FIXTUREDOC01/FIXTUREPG001"]],

@@ -81,10 +81,12 @@ final class FeatImportTests: XCTestCase {
                    ImportFormats.officeImporterID, ImportFormats.webImporterID] {
             XCTAssertEqual(h.app.content.importers.get(id)?.owner, FeatImportFeature.id, id)
         }
-        XCTAssertEqual(h.app.commands.descriptor("import.files")?.effect, .library)
-        XCTAssertEqual(h.app.commands.descriptor("import.files")?.owner, FeatImportFeature.id)
-        XCTAssertEqual(h.app.commands.descriptor("import.pick")?.userPresence, true)
-        XCTAssertEqual(h.app.content.keyCommands.get("import.pick")?.command, "import.pick")
+        XCTAssertEqual(CommandIDs.importFiles, "import.files")
+        XCTAssertEqual(CommandIDs.importPick, "import.pick")
+        XCTAssertEqual(h.app.commands.descriptor(CommandIDs.importFiles)?.effect, .library)
+        XCTAssertEqual(h.app.commands.descriptor(CommandIDs.importFiles)?.owner, FeatImportFeature.id)
+        XCTAssertEqual(h.app.commands.descriptor(CommandIDs.importPick)?.userPresence, true)
+        XCTAssertEqual(h.app.content.keyCommands.get(CommandIDs.importPick)?.command, CommandIDs.importPick)
 
         let libraryNew = try XCTUnwrap(h.app.ui.menus.get("import.libraryNew"))
         XCTAssertEqual(libraryNew.location, .libraryNew)
@@ -93,13 +95,50 @@ final class FeatImportTests: XCTestCase {
         XCTAssertEqual(libraryNew.params(MenuContext(app: h.app, folder: Fixtures.folderID)), inFolder)
         XCTAssertEqual(libraryNew.params(MenuContext(app: h.app)), atRoot)
 
+        XCTAssertEqual(libraryNew.command, CommandIDs.importPick)
+        XCTAssertEqual(libraryNew.shortcut, KeyShortcut("i", [.command, .shift]))
+
         let addPage = try XCTUnwrap(h.app.ui.menus.get("import.addPage"))
+        XCTAssertEqual(addPage.command, CommandIDs.importPick)
         let onPage = MenuContext(app: h.app, session: h.session, doc: Fixtures.docID, page: Fixtures.page2)
         let afterPage: JSONValue = ["target": "page:FIXTUREDOC01/FIXTUREPG002"]
         XCTAssertTrue(addPage.isVisible(onPage))
         XCTAssertEqual(addPage.params(onPage), afterPage)
         XCTAssertFalse(addPage.isVisible(MenuContext(app: h.app, doc: Fixtures.textDocID)))
         XCTAssertFalse(addPage.isVisible(MenuContext(app: h.app, doc: Fixtures.whiteboardID)))
+    }
+
+    /// ⇧⌘I is live in every window under the shell's key routing (contracts-v2.2): the library, every document kind,
+    /// while text is being edited and while tabs are open, and it wins its shortcut there.
+    func testImportKeyIsLiveInEveryWindow() throws {
+        let h = harness()
+        let key = try XCTUnwrap(h.app.content.keyCommands.get(CommandIDs.importPick))
+        XCTAssertEqual(key.scope, .global)
+        XCTAssertEqual(key.shortcut, KeyShortcut("i", [.command, .shift]))
+        var contexts = [KeyCommandContext(docKind: nil), KeyCommandContext(docKind: nil, hasTabs: true)]
+        for kind in DocumentKind.allCases {
+            contexts.append(KeyCommandContext(docKind: kind))
+            contexts.append(KeyCommandContext(docKind: kind, isEditingText: true, hasTabs: true))
+        }
+        for context in contexts {
+            XCTAssertTrue(key.isActive(in: context), "\(context)")
+            XCTAssertTrue(KeyCommandRouting.active(h.app.content.keyCommands.all, in: context).contains { $0.id == key.id },
+                          "\(context)")
+            XCTAssertTrue(KeyCommandRouting.overridesSystemKeys(key, in: context), "\(context)")
+        }
+        XCTAssertEqual(key.resolvedParams(for: h.session), key.params)
+    }
+
+    /// The dialog and the Files picker show in the window the call came from: the active window when it runs the call
+    /// (the shell activates the window the user works in), else the caller's own window, else the active one.
+    func testTheCallingWindowAsks() {
+        let active = StubNavigator()
+        let other = EditorSession()
+        XCTAssertTrue(ImportUI.navigator(for: active.session, active: active) === active)
+        XCTAssertTrue(ImportUI.navigator(for: nil, active: active) === active)
+        XCTAssertTrue(ImportUI.navigator(for: other, active: active) === active)     // no window runs it here
+        XCTAssertNil(ImportUI.navigator(for: other, active: nil))
+        XCTAssertNil(ImportUI.navigator(for: nil, active: nil))
     }
 
     // MARK: Images
@@ -193,6 +232,21 @@ final class FeatImportTests: XCTestCase {
         var expected = before
         expected.insert("BEFOREPAGE01", at: try XCTUnwrap(before.firstIndex(of: Fixtures.page2)))
         XCTAssertEqual(try livePages(h), expected)
+    }
+
+    func testBeforeOrAfterWithoutAnAnchorNeedsAnOpenPageOfThatDocument() async throws {
+        let h = harness()
+        let image = try writePNG("scan.png", in: try tempDir())
+        h.session.page = nil
+        await expectError(.invalidParams, path: "$.anchor") {
+            _ = try await h.run("import.files", ["urls": urls([image]), "doc": "doc:FIXTUREDOC01", "position": "after"])
+        }
+        h.session.page = Fixtures.page1
+        h.session.document = Fixtures.whiteboardID
+        await expectError(.invalidParams, path: "$.anchor") {
+            _ = try await h.run("import.files", ["urls": urls([image]), "doc": "doc:FIXTUREDOC01", "position": "before"])
+        }
+        XCTAssertEqual(h.undoDepths()[Fixtures.docID], 0)
     }
 
     func testImagesOnlyBecomePagesOfNotebooks() async throws {
@@ -743,4 +797,18 @@ final class FeatImportTests: XCTestCase {
         XCTAssertEqual(preset.presetSummary, "New documents go into “Fixtures”.")
         XCTAssertEqual(preset.folder, Fixtures.folderID)
     }
+}
+
+/// A window for the navigator choice: nothing is shown or opened.
+@MainActor
+private final class StubNavigator: SceneNavigator {
+    let session = EditorSession()
+    var openDocuments: [DocumentID] { [] }
+    var activeDocument: DocumentID? { nil }
+    var rootViewController: UIViewController? { nil }
+    func openDocument(_ doc: DocumentID, page: PageID?, mode: OpenMode) {}
+    func closeDocument(_ doc: DocumentID) {}
+    func showLibrary(folder: FolderID?) {}
+    func showSettings(page: String?) {}
+    func presentModal(_ viewController: UIViewController) {}
 }

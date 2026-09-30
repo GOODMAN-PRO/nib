@@ -22,9 +22,10 @@ public enum FeatImportFeature: NibFeature {
         app.content.importers.register(OfficeConverter.webDescriptor(owner: id))
 
         for item in ImportMenus.items(owner: id) { app.ui.menus.register(item) }
+        // ⇧⌘I everywhere (`.global`: live in the library and in every document kind under the shell's key routing).
         app.content.keyCommands.register(KeyCommandDescriptor(
-            id: "import.pick", title: String(localized: "Import Files…"), shortcut: KeyShortcut("i", [.command, .shift]),
-            command: "import.pick", scope: .global, owner: id))
+            id: CommandIDs.importPick, title: String(localized: "Import Files…"),
+            shortcut: KeyShortcut("i", [.command, .shift]), command: CommandIDs.importPick, scope: .global, owner: id))
     }
 
     public static func start(_ app: NibApp) async {
@@ -39,13 +40,13 @@ enum ImportMenus {
         // + New › Import Files: new documents in the folder the library shows.
         var libraryNew = MenuItemDescriptor(
             id: "import.libraryNew", title: String(localized: "Import Files"), icon: NibSymbol.importFile.name,
-            location: .libraryNew, order: 600, owner: owner, command: "import.pick",
+            location: .libraryNew, order: 600, owner: owner, command: CommandIDs.importPick,
             params: { context in ImportMenus.libraryTarget(folder: context.folder) })
         libraryNew.shortcut = KeyShortcut("i", [.command, .shift])
         // Add Page › Import: pages after the current one.
         let addPage = MenuItemDescriptor(
             id: "import.addPage", title: String(localized: "Import Pages"), icon: NibSymbol.importFile.name,
-            location: .addPage, order: 500, owner: owner, command: "import.pick",
+            location: .addPage, order: 500, owner: owner, command: CommandIDs.importPick,
             params: { context in ImportMenus.pageTarget(doc: context.doc ?? context.session?.document,
                                                         page: context.page ?? context.session?.page) },
             isVisible: { context in
