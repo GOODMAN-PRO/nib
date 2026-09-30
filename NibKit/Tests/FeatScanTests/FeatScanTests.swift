@@ -224,6 +224,10 @@ final class FeatScanTests: XCTestCase {
         let problems = await CommandConformance.check(features: [FeatScanFeature.self])
         XCTAssertEqual(problems, [])
 
+        // The ids are the catalogue's (contracts-v2.1 constants), which the menus run too.
+        XCTAssertEqual(ScanDocuments.descriptor.id, CommandIDs.scanDocuments)
+        XCTAssertEqual(ScanQR.descriptor.id, CommandIDs.scanQr)
+
         let h = Harness(features: [FeatScanFeature.self])
         let scan = try XCTUnwrap(h.app.commands.descriptor("scan.documents"))
         XCTAssertEqual(scan.owner, "scan")
@@ -799,7 +803,7 @@ final class FeatScanTests: XCTestCase {
         let pixels = Rect(x: 124, y: 175.4, width: 620, height: 87.7)
         h.app.services.recognizer = FakeRecognizer([TextRecognition(text: "Mitochondria", bbox: pixels, source: "image")])
         // page.rotate (F022) turns the background and swaps the page's sides.
-        h.app.commands.register(CommandDescriptor(id: "page.rotate", title: "Rotate Page", summary: "Test stand-in.",
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.pageRotate, title: "Rotate Page", summary: "Test stand-in.",
                                                   params: .obj(["page": .str()], required: ["page"]),
                                                   effect: .edit)) { params, ctx in
             guard let ref = params["page"]?.stringValue, case let .page(doc, id)? = NodeRef(ref) else {
@@ -943,7 +947,7 @@ final class FeatScanTests: XCTestCase {
     func testScanQRHandsNibLinksToTheDeepLinkCommand() async throws {
         let h = Harness(features: [FeatScanFeature.self])
         var received: [JSONValue] = []
-        h.app.commands.register(CommandDescriptor(id: "app.openURL", title: "Open URL", summary: "Test stand-in.",
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.appOpenURL, title: "Open URL", summary: "Test stand-in.",
                                                   params: .obj(["url": .str()], required: ["url"]), effect: .session,
                                                   target: .app)) { params, _ in
             received.append(params)

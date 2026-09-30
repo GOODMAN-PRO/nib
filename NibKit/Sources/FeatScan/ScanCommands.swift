@@ -44,7 +44,7 @@ struct ScanDocuments: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "scan.documents", title: "Scan Documents",
+        id: CommandIDs.scanDocuments, title: "Scan Documents",
         summary: "Scan paper with the document camera (edge detection, several pages, OCR for search) into a new notebook in folder, or into doc at position/anchor.",
         params: .obj([
             "doc": .str("doc:D notebook to add the scanned pages to; omit to make a new notebook"),
@@ -812,7 +812,7 @@ struct ScanQR: NibCommand {
     }
 
     static let descriptor = CommandDescriptor(
-        id: "scan.qr", title: "Scan QR Code",
+        id: CommandIDs.scanQr, title: "Scan QR Code",
         summary: "Show the camera to read a QR code; web links open in Safari, nib:// links open in Nib, other text is copied. Returns the code's text.",
         params: .empty, examples: [JSONValue.object([:])], effect: .session, target: .app, userPresence: true)
 
