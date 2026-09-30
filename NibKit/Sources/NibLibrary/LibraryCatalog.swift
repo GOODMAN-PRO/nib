@@ -628,11 +628,20 @@ struct CatalogCache {
                 opt(e.trashedTitle)]
     }
 
+    /// A string of a parsed row as a native Swift string. `JSONSerialization` hands out bridged `NSString`s, which
+    /// hash and compare through the slow foreign-string path; paths and ids are dictionary keys and sort keys, so
+    /// each one is copied to contiguous UTF-8 once here instead of on every comparison.
+    private static func nativeString(_ value: Any) -> String? {
+        guard var s = value as? String else { return nil }
+        s.makeContiguousUTF8()
+        return s
+    }
+
     static func entry(_ r: [Any]) -> CatalogEntry? {
-        guard r.count == 30, let id = r[0] as? String, let kindRaw = r[1] as? String,
-              let kind = LibraryNodeKind(rawValue: kindRaw), let title = r[2] as? String, let path = r[3] as? String,
-              let parentPath = r[17] as? String else { return nil }
-        func string(_ i: Int) -> String? { r[i] as? String }
+        func string(_ i: Int) -> String? { nativeString(r[i]) }
+        guard r.count == 30, let id = string(0), let kindRaw = r[1] as? String,
+              let kind = LibraryNodeKind(rawValue: kindRaw), let title = string(2), let path = string(3),
+              let parentPath = string(17) else { return nil }
         func double(_ i: Int) -> Double? { (r[i] as? NSNumber)?.doubleValue }
         func bool(_ i: Int) -> Bool { (r[i] as? NSNumber)?.boolValue ?? false }
         var node = LibraryNode(id: NibID(id), kind: kind, title: title, path: path)
@@ -656,7 +665,7 @@ struct CatalogCache {
         if let flat = r[27] as? [Any] {
             var i = 0
             while i + 1 < flat.count {
-                if let page = flat[i] as? String, let at = (flat[i + 1] as? NSNumber)?.doubleValue {
+                if let page = nativeString(flat[i]), let at = (flat[i + 1] as? NSNumber)?.doubleValue {
                     e.trashedPages.append(TrashedPage(page: NibID(page), trashedAt: at))
                 }
                 i += 2
