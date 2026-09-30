@@ -12,11 +12,14 @@ import NibDesign
 ///   the state of Temporary Diagnostic Mode.
 /// - `diagnostics.export {includeTitles?}` builds the zip (`DiagnosticsExporter`); it never holds note content.
 /// - `diagnostics.setFeatureEnabled {id, enabled}` writes `SafeMode.disabledFeatures` (applied at the next launch by the
-///   app shell) or, for "plugin:<id>", turns the plugin off or on through `plugin.enable`.
+///   app shell) or, for "plugin:<id>", turns the plugin off or on through `plugin.enable`. Password lock and managed
+///   configuration always stay on, and only the person may even ask (`FeatureCatalog.guarded`).
 /// - Temporary Diagnostic Mode: the `nib_temp_diagnostic` switch in the iOS Settings app (Nib/Settings.bundle) makes the
-///   next launch zip the raw library into Documents/diagnostics, then turns itself off.
+///   next launch (before any feature starts), or the return from the Settings app, zip the raw library into
+///   Documents/diagnostics with background time, then turns itself off. A copy iOS interrupted is cleared at launch.
 /// - Crash-loop protection (N-026): the shell's `SafeMode` counts launches that never finished; this feature snapshots
-///   the result at registration (the shell resets the counter once every feature started) and tells the person.
+///   the result at registration (the shell resets the counter once every feature started) and tells the person. A
+///   launch without the library browser, Settings or the document bars offers the Troubleshooting page the same way.
 public enum FeatDiagnosticsFeature: NibFeature {
     public static let id = "diagnostics"
 
@@ -33,6 +36,16 @@ public enum FeatDiagnosticsFeature: NibFeature {
         }
         page.keywords = DiagnosticsIDs.keywords
         app.ui.settingsPages.register(page)
+
+        // Temporary Diagnostic Mode starts before any feature's `start` (the launch that crashes in one of them is
+        // the case it exists for): this task runs ahead of the shell's start task. The library root is read inside
+        // it, once every feature has registered.
+        if !NibApp.isHostlessTest {
+            Task { @MainActor [weak app] in
+                guard let app = app else { return }
+                runtime.prepareLaunch(libraryRoot: app.services.library?.rootURL)
+            }
+        }
     }
 
     public static func start(_ app: NibApp) async {
@@ -42,12 +55,14 @@ public enum FeatDiagnosticsFeature: NibFeature {
 
 // MARK: - Names
 
+/// The command ids come from `CommandIDs`; the descriptors spell them out because Scripts/lint.py reads a feature's
+/// registrations from the descriptors' string literals (a test checks the two agree).
 enum DiagnosticsIDs {
     /// `FeatDiagnosticsFeature.id`, usable off the main actor.
     static let feature = "diagnostics"
     static let settingsPage = "diagnostics.troubleshooting"
-    static let exportCommand = "diagnostics.export"
-    static let setFeatureEnabledCommand = "diagnostics.setFeatureEnabled"
+    static let exportCommand = CommandIDs.diagnosticsExport
+    static let setFeatureEnabledCommand = CommandIDs.diagnosticsSetFeatureEnabled
     /// `diagnostics.setFeatureEnabled {id: "plugin:<plugin id>"}` switches a plugin.
     static let pluginPrefix = "plugin:"
     /// Documents/diagnostics: where Temporary Diagnostic Mode leaves the library copy (visible in the Files app).
@@ -120,6 +135,15 @@ struct FeatureInfo: Equatable {
 enum FeatureCatalog {
     /// Nib needs these to open the library at all (and this one to turn the others back on).
     static let required: Set<String> = [DiagnosticsIDs.feature, "store", "library", "sync"]
+    /// Security features: without them password-locked documents open without the password (`lock`) and MDM
+    /// restrictions stop applying (`managed`). No one turns them off from here, and only the person may ask at all
+    /// (ARCHITECTURE.md §6.4: a principal never widens its own permissions).
+    static let guarded: Set<String> = ["lock", "managed"]
+    /// Shown as "Always on" and refused by `diagnostics.setFeatureEnabled {enabled: false}`.
+    static let alwaysOn: Set<String> = required.union(guarded)
+    /// The way back to Troubleshooting: the library sidebar's Settings entry (`libraryui`), the Settings screens
+    /// (`settings`) and the document bars (`chrome`). A launch without one of them says so and offers the page.
+    static let navigation: Set<String> = ["libraryui", "settings", "chrome"]
 
     static let all: [FeatureInfo] = [
         FeatureInfo("store", String(localized: "Document storage")),
@@ -265,6 +289,10 @@ enum FeatureToggleRules {
             // The second half of a split feature needs its first half.
             if let parent = FeatureCatalog.parent(of: id), next.remove(parent) != nil { also.append(parent) }
         } else {
+            guard !FeatureCatalog.guarded.contains(id) else {
+                throw NibError(.invalidParams, "'\(id)' can't be turned off: it keeps locked documents and managed restrictions in force",
+                               path: "$.id", hint: "turn off another feature, or report the problem with diagnostics.export")
+            }
             guard !FeatureCatalog.required.contains(id) else {
                 throw NibError(.invalidParams, "'\(id)' can't be turned off: Nib needs it to open the library",
                                path: "$.id", hint: "turn off another feature, or report the problem with diagnostics.export")
@@ -324,8 +352,71 @@ enum LibraryCopyState: Equatable {
     case failed(String)
 }
 
+/// The alert a launch opens with (once per launch), offering the Troubleshooting page.
+enum LaunchNoticeKind: Equatable {
+    /// Two launches in a row died before finishing: plugins are paused.
+    case safeMode
+    /// Features the way back to Troubleshooting goes through (`FeatureCatalog.navigation`) are turned off.
+    case featuresOff
+}
+
+/// Presents the launch notice (tests record it instead).
+@MainActor
+protocol LaunchNoticePresenting: AnyObject {
+    func present(_ kind: LaunchNoticeKind, app: NibApp)
+}
+
+@MainActor
+final class SystemLaunchNoticePresenter: LaunchNoticePresenting {
+    private var notice: SafeModeNotice?
+
+    func present(_ kind: LaunchNoticeKind, app: NibApp) {
+        guard !NibApp.isHostlessTest else { return }
+        let notice = SafeModeNotice(kind: kind)
+        self.notice = notice
+        notice.presentWhenReady(app)
+    }
+}
+
+/// Keeps the process running while the library copy finishes after Nib leaves the screen (a UIKit background task).
+@MainActor
+protocol DiagnosticsBackgroundActivity: AnyObject {
+    /// A token for `end`; nil when no background time was granted (or in hostless tests).
+    func begin(_ name: String) -> AnyObject?
+    func end(_ token: AnyObject?)
+}
+
+@MainActor
+final class SystemBackgroundActivity: DiagnosticsBackgroundActivity {
+    private final class Token: @unchecked Sendable {
+        var identifier = UIBackgroundTaskIdentifier.invalid
+    }
+
+    func begin(_ name: String) -> AnyObject? {
+        guard !NibApp.isHostlessTest else { return nil }
+        let token = Token()
+        token.identifier = UIApplication.shared.beginBackgroundTask(withName: name) {
+            // Time is up: iOS suspends Nib and the copy resumes when it comes back. If iOS ends Nib instead, the next
+            // launch removes the partial file and says the copy was interrupted.
+            MainActor.assumeIsolated {
+                guard token.identifier != .invalid else { return }
+                UIApplication.shared.endBackgroundTask(token.identifier)
+                token.identifier = .invalid
+            }
+        }
+        return token.identifier == .invalid ? nil : token
+    }
+
+    func end(_ token: AnyObject?) {
+        guard let token = token as? Token, token.identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(token.identifier)
+        token.identifier = .invalid
+    }
+}
+
 /// One per app (service "diagnostics.runtime"): the safe-mode snapshot taken at launch, the injectable system seams
-/// (safe-mode storage, log source, share sheet, Settings.bundle switch) and the library-copy state the page shows.
+/// (safe-mode storage, log source, share sheet, Settings.bundle switch, launch notice, background time) and the
+/// library-copy state the page shows.
 @MainActor
 final class DiagnosticsRuntime: ObservableObject {
     static let serviceKey = "diagnostics.runtime"
@@ -339,16 +430,21 @@ final class DiagnosticsRuntime: ObservableObject {
     var logSource: DiagnosticsLogSource = ProcessLogSource()
     var sharing: DiagnosticsSharing = SystemDiagnosticsSharing()
     var diagnosticSwitch: TemporaryDiagnosticSwitch = SettingsBundleSwitch()
-    /// Where exports are built (emptied before each one).
+    var noticePresenter: LaunchNoticePresenting = SystemLaunchNoticePresenter()
+    var backgroundActivity: DiagnosticsBackgroundActivity = SystemBackgroundActivity()
+    /// Where exports are built, one subfolder per export (older than an hour: removed).
     var exportDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("nib-diagnostics", isDirectory: true)
     var documentsDirectory: URL
 
     @Published private(set) var libraryCopy: LibraryCopyState = .idle
     /// Bumped whenever a safe-mode choice changes, so an open page re-reads them.
     @Published private(set) var revision = 0
+    /// The notice this launch opened with (set by `start`).
+    private(set) var launchNotice: LaunchNoticeKind?
 
     private let log = Logger(subsystem: "app.nib", category: "diagnostics")
-    private var notice: SafeModeNotice?
+    private var sweptInterruptedCopies = false
+    private var activationObserver: NSObjectProtocol?
 
     init(safeMode: SafeModeStore) {
         self.safeMode = safeMode
@@ -370,26 +466,75 @@ final class DiagnosticsRuntime: ObservableObject {
         documentsDirectory.appendingPathComponent(DiagnosticsIDs.libraryCopyFolder, isDirectory: true)
     }
 
+    /// The notice a launch like this one opens with: safe mode first, then a way back that is turned off.
+    var pendingLaunchNotice: LaunchNoticeKind? {
+        if launchedInSafeMode { return .safeMode }
+        if !disabledAtLaunch.isDisjoint(with: FeatureCatalog.navigation) { return .featuresOff }
+        return nil
+    }
+
     func start(_ app: NibApp) {
         if launchedInSafeMode {
             log.notice("Launched in safe mode; features off: \(self.disabledAtLaunch.sorted().joined(separator: ","), privacy: .public)")
         }
-        if !NibApp.isHostlessTest {
-            startTemporaryDiagnosticModeIfRequested(libraryRoot: app.services.library?.rootURL)
-            if launchedInSafeMode {
-                let notice = SafeModeNotice()
-                self.notice = notice
-                notice.presentWhenReady(app)
+        restoreAlwaysOnFeatures()
+        sweepInterruptedCopies()
+        if launchNotice == nil, let kind = pendingLaunchNotice {
+            launchNotice = kind
+            noticePresenter.present(kind, app: app)
+        }
+        guard !NibApp.isHostlessTest else { return }
+        // Back from the Settings app with the switch on: no cold launch needed.
+        if activationObserver == nil {
+            activationObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self, weak app] _ in
+                Task { @MainActor in
+                    guard let self = self else { return }
+                    self.startTemporaryDiagnosticModeIfRequested(libraryRoot: app?.services.library?.rootURL)
+                }
             }
         }
+        prepareLaunch(libraryRoot: app.services.library?.rootURL)
+    }
+
+    /// Everything Temporary Diagnostic Mode does at launch: clears what an interrupted copy left, then copies the
+    /// library when the switch is on. Runs from `register`'s task and again from `start` (the second run finds the
+    /// switch already off).
+    func prepareLaunch(libraryRoot: URL?) {
+        sweepInterruptedCopies()
+        startTemporaryDiagnosticModeIfRequested(libraryRoot: libraryRoot)
     }
 
     func noteChoicesChanged() {
         revision += 1
     }
 
+    /// A security or launch-critical feature found in the safe-mode list (written by an older build, or straight into
+    /// the defaults) was skipped in this launch; it comes back at the next one.
+    func restoreAlwaysOnFeatures() {
+        let stray = safeMode.disabledFeatures.intersection(FeatureCatalog.alwaysOn)
+        guard !stray.isEmpty else { return }
+        safeMode.disabledFeatures.subtract(stray)
+        noteChoicesChanged()
+        log.notice("Features that stay on were in the safe-mode list; back at the next launch: \(stray.sorted().joined(separator: ","), privacy: .public)")
+    }
+
+    /// Once per launch, before the switch is read: removes the hidden partial zip a copy leaves when iOS ended Nib
+    /// during it (the Files app never shows it, and it holds the person's notes), and says the copy was interrupted.
+    @discardableResult
+    func sweepInterruptedCopies() -> Bool {
+        guard !sweptInterruptedCopies, libraryCopy != .running else { return false }
+        sweptInterruptedCopies = true
+        let removed = LibraryArchiver.removePartialCopies(in: libraryCopyFolder)
+        guard removed > 0 else { return false }
+        log.notice("Temporary Diagnostic Mode: removed \(removed) interrupted library copies")
+        libraryCopy = .failed(String(localized: "The last library copy was interrupted. Turn Temporary Diagnostic Mode on again."))
+        return true
+    }
+
     /// P-093: when the Settings.bundle switch is on, turns it off first (a crash while copying must not repeat on every
-    /// launch), then zips the raw library into Documents/diagnostics off the main actor.
+    /// launch), then zips the raw library into Documents/diagnostics off the main actor, with background time so the
+    /// copy can finish after the person leaves Nib to look for it in the Files app.
     @discardableResult
     func startTemporaryDiagnosticModeIfRequested(libraryRoot: URL?) -> Task<LibraryCopyState, Never>? {
         guard diagnosticSwitch.isOn, libraryCopy != .running else { return nil }
@@ -398,6 +543,7 @@ final class DiagnosticsRuntime: ObservableObject {
         let folder = libraryCopyFolder
         let log = self.log
         libraryCopy = .running
+        let activity = backgroundActivity.begin("Nib library copy")
         log.notice("Temporary Diagnostic Mode: copying the library")
         let work = Task.detached(priority: .utility) { () -> LibraryCopyState in
             do {
@@ -412,6 +558,7 @@ final class DiagnosticsRuntime: ObservableObject {
         return Task { @MainActor in
             let state = await work.value
             self.libraryCopy = state
+            self.backgroundActivity.end(activity)
             return state
         }
     }
@@ -450,14 +597,21 @@ struct DiagnosticsExportCommand: NibCommand {
         /// Report an Issue links prefilled with the summary.
         var reportURL: String?
         var mailURL: String?
+        /// summary.txt: version, device, safe mode, features off, plugin and library counts (never titles).
+        var summary: String
+        /// This launch is in safe mode (plugins paused).
+        var launchedInSafeMode: Bool
+        /// Feature ids off at the next launch (`SafeMode.disabledFeatures`).
+        var disabled: [String]
     }
 
+    /// `library:read` on top of `app`: the export carries library counts and, with includeTitles, every title.
     static let descriptor = CommandDescriptor(
         id: "diagnostics.export", title: "Export Diagnostics",
-        summary: "Zip this session's logs, device info, features, plugins and library counts (titles only with includeTitles; never note content) and share it → {file: tmp:, bytes, entries}.",
+        summary: "Zip this session's logs, device, features, plugins and library counts (titles only with includeTitles; never note content), share it → {file, summary, launchedInSafeMode, disabled}.",
         params: .obj(["includeTitles": .bool("also list document and folder titles (default false)")]),
         examples: [[:], ["includeTitles": true]],
-        effect: .read, target: .app, userPresence: true)
+        effect: .read, target: .app, extraScopes: [.libraryRead], userPresence: true)
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let runtime = DiagnosticsRuntime.resolve(ctx.services)
@@ -486,7 +640,9 @@ struct DiagnosticsExportCommand: NibCommand {
         return Output(file: built.1, name: archive.name, bytes: archive.bytes, entries: archive.entries,
                       includesTitles: includeTitles, logLines: archive.logLines, shared: shared,
                       reportURL: IssueReport.githubURL(summary: input.summary)?.absoluteString,
-                      mailURL: IssueReport.mailURL(summary: input.summary)?.absoluteString)
+                      mailURL: IssueReport.mailURL(summary: input.summary)?.absoluteString,
+                      summary: input.summary, launchedInSafeMode: runtime.launchedInSafeMode,
+                      disabled: runtime.safeMode.disabledFeatures.sorted())
     }
 }
 
@@ -534,6 +690,13 @@ struct DiagnosticsSetFeatureEnabledCommand: NibCommand {
             log.notice("Plugin \(plugin, privacy: .public) turned \(p.enabled ? "on" : "off", privacy: .public)")
             return Output(id: id, enabled: p.enabled, running: nil, pendingRelaunch: false,
                           disabled: runtime.safeMode.disabledFeatures.sorted(), alsoChanged: [])
+        }
+
+        // Password lock and managed configuration: turning them off would open every locked document to the caller
+        // (and drop MDM restrictions), so no one but the person may even ask; the rules below refuse the person too.
+        if !p.enabled, FeatureCatalog.guarded.contains(id), !ctx.principal.isUser {
+            throw NibError(.permissionDenied, "\(ctx.principal.kind) callers can't turn off '\(id)': it protects locked documents and managed settings",
+                           path: "$.id", hint: "turn off another feature, or report the problem with diagnostics.export")
         }
 
         let running = Set(ctx.app?.featureIDs ?? [])

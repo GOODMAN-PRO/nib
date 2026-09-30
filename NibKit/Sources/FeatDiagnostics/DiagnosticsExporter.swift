@@ -81,28 +81,226 @@ struct ProcessLogSource: DiagnosticsLogSource {
 }
 
 /// Masks library titles in free text (log lines can name a document or a folder in a message or a path).
+///
+/// One pass over the text's UTF-8 bytes, whatever the size of the library: every spelling of every title goes into
+/// one byte trie, and each position where a title could start walks it only as far as the text still matches (a
+/// position inside a word, or on a byte no title starts with, costs nothing). A title matches only as a whole word or
+/// path component: "app" leaves "app.nib/diagnostics" alone, while "Physics" is masked in "Physics 9702",
+/// "Notes/Physics/" and "Physics.nibnote". Each title is also looked for in its composed (NFC) and decomposed (NFD)
+/// forms and percent-encoded ("Physics%209702"), the spellings file-system errors and URLs log.
 struct DiagnosticsRedactor {
     static let placeholder = "\u{2039}title\u{203A}"
     /// Titles shorter than this are left alone: masking every "ab" would garble the log without protecting anything.
     static let minimumLength = 3
+    /// After one of these a title still ends a file name ("Physics.nibnote", "Physics 9702.pdf"). The legacy package
+    /// extension ("nib") counts only for a path component, so the "app.nib" subsystem is never taken for a file.
+    static let fileExtensions: Set<String> = [
+        NibFormat.packageExtension, NibFormat.pluginExtension, "nibcollection", "nibbackup",
+        "pdf", "zip", "json", "txt", "md", "markdown", "rtf", "rtfd", "html", "htm", "csv", "xml", "plist",
+        "png", "jpg", "jpeg", "heic", "heif", "gif", "tif", "tiff", "bmp", "svg", "webp",
+        "m4a", "mp3", "wav", "caf", "aac", "aif", "aiff", "mov", "mp4", "m4v",
+        "doc", "docx", "ppt", "pptx", "xls", "xlsx", "key", "pages", "numbers", "epub", "goodnotes", "note", "enex",
+        "bak", "tmp", "partial",
+    ]
+    private static let longestExtension = 13
 
-    /// Longest first, so "Physics 9702" is masked before "Physics".
+    /// A spelling ends at this trie node.
+    private static let terminal: UInt8 = 1
+    /// It starts (ends) with a letter or digit, so the text must not continue the word before (after) it.
+    private static let wordStart: UInt8 = 2
+    private static let wordEnd: UInt8 = 4
+
+    /// The titles looked for, longest first.
     let titles: [String]
+    /// Trie edges keyed by `node << 8 | byte`; node 0 is the root.
+    private let edges: [UInt64: Int32]
+    /// Per node: `terminal`, `wordStart`, `wordEnd` bits.
+    private let flags: [UInt8]
+    /// Bytes some spelling starts with (the root's edges, as a table).
+    private let startBytes: [Bool]
 
     init(titles: [String]) {
         let cleaned = Set(titles.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
             .filter { $0.count >= DiagnosticsRedactor.minimumLength }
         self.titles = cleaned.sorted { $0.count != $1.count ? $0.count > $1.count : $0 < $1 }
+
+        // Keyed by bytes: String equality is canonical, so a Set<String> would fold the NFD spelling into the NFC one.
+        var spellings: [[UInt8]: String] = [:]
+        for title in cleaned {
+            for form in [title, title.precomposedStringWithCanonicalMapping, title.decomposedStringWithCanonicalMapping] {
+                spellings[Array(form.utf8)] = form
+                if let encoded = form.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) {
+                    spellings[Array(encoded.utf8)] = encoded
+                }
+            }
+        }
+        var edges: [UInt64: Int32] = [:]
+        edges.reserveCapacity(spellings.count * 8)
+        var flags: [UInt8] = [0]
+        var startBytes = [Bool](repeating: false, count: 256)
+        for (bytes, spelling) in spellings {
+            guard bytes.count >= 3, let first = spelling.unicodeScalars.first,
+                  let last = spelling.unicodeScalars.last else { continue }
+            var node: Int32 = 0
+            for byte in bytes {
+                let key = UInt64(node) << 8 | UInt64(byte)
+                if let next = edges[key] {
+                    node = next
+                } else {
+                    let next = Int32(flags.count)
+                    flags.append(0)
+                    edges[key] = next
+                    node = next
+                }
+            }
+            var bits = DiagnosticsRedactor.terminal
+            if DiagnosticsRedactor.isWord(first.value) { bits |= DiagnosticsRedactor.wordStart }
+            if DiagnosticsRedactor.isWord(last.value) { bits |= DiagnosticsRedactor.wordEnd }
+            flags[Int(node)] = bits
+            startBytes[Int(bytes[0])] = true
+        }
+        self.edges = edges
+        self.flags = flags
+        self.startBytes = startBytes
     }
 
     func redact(_ text: String) -> String {
-        guard !titles.isEmpty, !text.isEmpty else { return text }
-        let s = NSMutableString(string: text)
-        for title in titles {
-            s.replaceOccurrences(of: title, with: DiagnosticsRedactor.placeholder, options: [.literal],
-                                 range: NSRange(location: 0, length: s.length))
+        guard flags.count > 1, text.utf8.count >= 3 else { return text }
+        var text = text
+        let masked: [UInt8]? = text.withUTF8 { scan($0) }
+        return masked.map { String(decoding: $0, as: UTF8.self) } ?? text
+    }
+
+    /// The masked bytes, or nil when nothing matched.
+    private func scan(_ u: UnsafeBufferPointer<UInt8>) -> [UInt8]? {
+        let n = u.count
+        let placeholder = Array(DiagnosticsRedactor.placeholder.utf8)
+        let edges = self.edges
+        let flags = self.flags
+        let startBytes = self.startBytes
+        var out: [UInt8] = []
+        var copied = 0
+        var matchedAny = false
+        var i = 0
+        while i < n {
+            let b0 = u[i]
+            guard startBytes[Int(b0)] else {
+                i += 1
+                continue
+            }
+            let leftOK = DiagnosticsRedactor.isLeftBoundary(u, i)
+            // Inside a word nothing that starts with a letter or digit can match: skip before walking the trie.
+            if b0 < 0x80, !leftOK, DiagnosticsRedactor.isWordByte(b0) {
+                i += 1
+                continue
+            }
+            // Walk as far as the text matches; keep the longest spelling whose boundaries hold.
+            let afterSlash = i > 0 && u[i - 1] == 0x2F
+            var node: Int32 = 0
+            var length = 0
+            var k = i
+            while k < n, let next = edges[UInt64(node) << 8 | UInt64(u[k])] {
+                node = next
+                k += 1
+                let bits = flags[Int(node)]
+                guard bits & DiagnosticsRedactor.terminal != 0 else { continue }
+                if bits & DiagnosticsRedactor.wordStart != 0 && !leftOK { continue }
+                if bits & DiagnosticsRedactor.wordEnd != 0
+                    && !DiagnosticsRedactor.isRightBoundary(u, k, afterSlash: afterSlash) { continue }
+                length = k - i
+            }
+            guard length > 0 else {
+                i += 1
+                continue
+            }
+            if !matchedAny {
+                matchedAny = true
+                out.reserveCapacity(n)
+            }
+            out.append(contentsOf: UnsafeBufferPointer(rebasing: u[copied..<i]))
+            out.append(contentsOf: placeholder)
+            i += length
+            copied = i
         }
-        return s as String
+        guard matchedAny else { return nil }
+        out.append(contentsOf: UnsafeBufferPointer(rebasing: u[copied..<n]))
+        return out
+    }
+
+    // MARK: Boundaries
+
+    /// ASCII letters, digits and "_".
+    static func isWordByte(_ b: UInt8) -> Bool {
+        (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F
+    }
+
+    private static func isHexByte(_ b: UInt8) -> Bool {
+        (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x46) || (b >= 0x61 && b <= 0x66)
+    }
+
+    /// Letters, digits and combining marks continue a word. Scripts written without spaces between words (Thai, Lao,
+    /// CJK, kana) have no boundaries to look for, so their characters never continue one.
+    static func isWord(_ v: UInt32) -> Bool {
+        if v < 0x80 { return isWordByte(UInt8(v)) }
+        if (0x0E00...0x0EFF).contains(v) || (0x2E80...0xA4CF).contains(v) || (0xF900...0xFAFF).contains(v)
+            || (0xFF00...0xFFEF).contains(v) || (0x20000...0x3FFFF).contains(v) {
+            return false
+        }
+        guard let scalar = Unicode.Scalar(v) else { return false }
+        switch scalar.properties.generalCategory {
+        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter,
+             .nonspacingMark, .spacingMark, .enclosingMark, .decimalNumber, .letterNumber, .otherNumber,
+             .connectorPunctuation:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The scalar whose UTF-8 sequence starts at `j` (U+FFFD for a stray continuation byte).
+    private static func scalar(_ u: UnsafeBufferPointer<UInt8>, at j: Int) -> UInt32 {
+        let b0 = UInt32(u[j])
+        if b0 < 0x80 { return b0 }
+        func next(_ k: Int) -> UInt32 { j + k < u.count ? UInt32(u[j + k] & 0x3F) : 0 }
+        if b0 >= 0xF0 { return (b0 & 0x07) << 18 | next(1) << 12 | next(2) << 6 | next(3) }
+        if b0 >= 0xE0 { return (b0 & 0x0F) << 12 | next(1) << 6 | next(2) }
+        if b0 >= 0xC0 { return (b0 & 0x1F) << 6 | next(1) }
+        return 0xFFFD
+    }
+
+    /// Nothing before `i` continues the word: the start, a space, "/", punctuation or a percent escape ("%20").
+    /// A "." does continue it ("app.nib": a dotted identifier).
+    static func isLeftBoundary(_ u: UnsafeBufferPointer<UInt8>, _ i: Int) -> Bool {
+        guard i > 0 else { return true }
+        let b = u[i - 1]
+        if b < 0x80 {
+            if b == 0x2E { return false }
+            if !isWordByte(b) { return true }
+            return i >= 3 && u[i - 3] == 0x25 && isHexByte(u[i - 2]) && isHexByte(b)
+        }
+        var j = i - 1
+        while j > 0 && u[j] & 0xC0 == 0x80 { j -= 1 }
+        return !isWord(scalar(u, at: j))
+    }
+
+    /// Nothing after `end` continues the word. A "." ends it at the end of a sentence ("Physics.") or before a file
+    /// extension ("Physics.nibnote"), not inside a dotted identifier ("app.nib").
+    static func isRightBoundary(_ u: UnsafeBufferPointer<UInt8>, _ end: Int, afterSlash: Bool) -> Bool {
+        let n = u.count
+        guard end < n else { return true }
+        let b = u[end]
+        if b >= 0x80 { return !isWord(scalar(u, at: end)) }
+        guard b == 0x2E else { return !isWordByte(b) }
+        let start = end + 1
+        guard start < n else { return true }
+        let c = u[start]
+        if c >= 0x80 ? !isWord(scalar(u, at: start)) : !isWordByte(c) { return true }
+        var k = start
+        while k < n, k - start <= longestExtension, u[k] < 0x80, isWordByte(u[k]) { k += 1 }
+        guard k - start <= longestExtension else { return false }
+        if k < n, u[k] >= 0x80 ? isWord(scalar(u, at: k)) : isWordByte(u[k]) { return false }
+        let ext = String(decoding: UnsafeBufferPointer(rebasing: u[start..<k]), as: UTF8.self).lowercased()
+        return fileExtensions.contains(ext) || (afterSlash && ext == NibFormat.legacyPackageExtension)
     }
 }
 
@@ -428,6 +626,8 @@ struct DiagnosticsInput {
     /// Library titles masked in the log when titles are left out.
     var titles: [String]
     var libraryRoot: URL?
+    /// Temporary Diagnostic Mode's folder (Documents/diagnostics), left out of the library's storage figures.
+    var libraryCopyFolder: URL?
     var logSource: DiagnosticsLogSource
     var logLimit: Int = 20_000
 }
@@ -452,7 +652,8 @@ enum DiagnosticsCollector {
                                 detailedLogs: experiments[ExperimentalFlags.detailedLogs] ?? false,
                                 app: appInfo, device: device, features: features, plugins: plugins, library: library,
                                 settings: DiagnosticsSettingsPolicy.report(settings), summary: summary, titles: titles,
-                                libraryRoot: services.library?.rootURL, logSource: runtime.logSource)
+                                libraryRoot: services.library?.rootURL, libraryCopyFolder: runtime.libraryCopyFolder,
+                                logSource: runtime.logSource)
     }
 
     static func appInfo(app: NibApp?, settings: SettingsStore, runtime: DiagnosticsRuntime) -> DiagnosticsAppInfo {
@@ -502,7 +703,7 @@ enum DiagnosticsCollector {
         let ids = runningSet.union(off).union(atLaunch).sorted()
         let features = ids.map { id in
             DiagnosticsFeaturesReport.Feature(id: id, title: FeatureCatalog.title(id), running: runningSet.contains(id),
-                                              enabled: !off.contains(id), required: FeatureCatalog.required.contains(id))
+                                              enabled: !off.contains(id), required: FeatureCatalog.alwaysOn.contains(id))
         }
         return DiagnosticsFeaturesReport(launchedInSafeMode: runtime.launchedInSafeMode, features: features,
                                          turnedOff: off.sorted(),
@@ -598,17 +799,23 @@ struct DiagnosticsArchive: Equatable {
 }
 
 enum DiagnosticsExporter {
-    /// Builds "Nib Diagnostics <stamp>.zip" in `directory` (emptied first: only the latest export is kept).
+    /// How long an export stays in the temporary folder (a share sheet or the assistant may still be using it).
+    static let keepFor: TimeInterval = 3_600
+
+    /// Builds "Nib Diagnostics <stamp>.zip" in its own subfolder of `directory`, so a second export (the assistant's,
+    /// while the person's share sheet is still open) never touches the first. Exports older than `keepFor` go.
     static func build(_ input: DiagnosticsInput, in directory: URL) throws -> DiagnosticsArchive {
         let fm = FileManager.default
-        try? fm.removeItem(at: directory)
         try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        prune(directory, olderThan: Date().addingTimeInterval(-keepFor))
+        let exportFolder = directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: exportFolder, withIntermediateDirectories: true)
         let name = "Nib Diagnostics " + DiagnosticsFormat.fileStamp(input.generated)
-        let url = directory.appendingPathComponent(name + ".zip")
+        let url = exportFolder.appendingPathComponent(name + ".zip")
 
         var library = input.library
         if let root = input.libraryRoot, library.available {
-            library.storage = LibraryStorage.measure(root: root)
+            library.storage = LibraryStorage.measure(root: root, excluding: input.libraryCopyFolder.map { [$0] } ?? [])
         }
         let redactor = DiagnosticsRedactor(titles: input.includeTitles ? [] : input.titles)
         var logText: String
@@ -644,6 +851,18 @@ enum DiagnosticsExporter {
                                   logLines: logLines)
     }
 
+    /// Removes earlier exports (subfolders, or zips from before they had one) last changed before `date`.
+    static func prune(_ directory: URL, olderThan date: Date) {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .creationDateKey]
+        let items = (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys, options: [])) ?? []
+        for item in items {
+            let values = try? item.resourceValues(forKeys: Set(keys))
+            let changed = max(values?.contentModificationDate ?? .distantPast, values?.creationDate ?? .distantPast)
+            if changed < date { try? fm.removeItem(at: item) }
+        }
+    }
+
     private struct DeviceFile: Codable {
         var generated: String
         var app: DiagnosticsAppInfo
@@ -672,13 +891,15 @@ enum DiagnosticsExporter {
 
 /// Size of the library folder (counts and bytes; names are never recorded).
 enum LibraryStorage {
-    static func measure(root: URL, limit: Int = 500_000) -> DiagnosticsLibraryReport.Storage? {
+    /// `excluding`: folders inside the library that are not part of it (Temporary Diagnostic Mode's copies).
+    static func measure(root: URL, excluding: [URL] = [], limit: Int = 500_000) -> DiagnosticsLibraryReport.Storage? {
         let scoped = root.startAccessingSecurityScopedResource()
         defer { if scoped { root.stopAccessingSecurityScopedResource() } }
         let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .fileSizeKey]
         guard let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: [],
                                                           errorHandler: { _, _ in true }) else { return nil }
         let rootCount = root.standardizedFileURL.pathComponents.count
+        let skipped = Set(excluding.compactMap { LibraryArchiver.relativePath(of: $0, in: root) })
         var storage = DiagnosticsLibraryReport.Storage(files: 0, bytes: 0, packages: 0, packageBytes: 0,
                                                        metadataBytes: 0, truncated: false)
         for case let url as URL in walker {
@@ -688,6 +909,10 @@ enum LibraryStorage {
             }
             let values = try? url.resourceValues(forKeys: Set(keys))
             if values?.isDirectory == true {
+                if !skipped.isEmpty, let path = LibraryArchiver.relativePath(of: url, in: root), skipped.contains(path) {
+                    walker.skipDescendants()
+                    continue
+                }
                 if url.pathExtension == NibFormat.packageExtension { storage.packages += 1 }
                 continue
             }
@@ -834,6 +1059,11 @@ enum LibraryArchiver {
             try writer.finish()
             try? fm.removeItem(at: final)
             try fm.moveItem(at: partial, to: final)
+            // A copy of the whole library does not belong in the device backup (the library itself is in it).
+            var excluded = URLResourceValues()
+            excluded.isExcludedFromBackup = true
+            var backupURL = final
+            try? backupURL.setResourceValues(excluded)
             let bytes = Int64((try? final.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
             return Result(url: final, bytes: bytes, files: files)
         } catch {
@@ -855,6 +1085,23 @@ enum LibraryArchiver {
     static func availableCapacity(_ url: URL) -> Int64? {
         try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage
+    }
+
+    /// The hidden partial file of a copy in progress: ".Nib Library <stamp>.zip.partial".
+    static func isPartialCopy(_ name: String) -> Bool {
+        name.hasPrefix("." + filePrefix) && name.hasSuffix(".partial")
+    }
+
+    /// Deletes the partial files interrupted copies left in `folder` (the Files app hides them); returns how many.
+    @discardableResult
+    static func removePartialCopies(in folder: URL) -> Int {
+        let fm = FileManager.default
+        let names = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
+        var removed = 0
+        for name in names where isPartialCopy(name) {
+            if (try? fm.removeItem(at: folder.appendingPathComponent(name))) != nil { removed += 1 }
+        }
+        return removed
     }
 
     /// The newest library copy in `folder`, if any.

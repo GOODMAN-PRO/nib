@@ -115,8 +115,9 @@ final class TroubleshootingModel: ObservableObject {
         running.union(disabled).union(disabledAtLaunch).map { id in
             let isOn = !disabled.contains(id)
             let pending = running.contains(id) ? !isOn : (isOn && disabledAtLaunch.contains(id))
+            // One that stays on but is off anyway (an older build's choice) keeps its switch, so it can come back.
             return FeatureRow(id: id, title: FeatureCatalog.title(id), isOn: isOn,
-                              isRequired: FeatureCatalog.required.contains(id), isPending: pending)
+                              isRequired: FeatureCatalog.alwaysOn.contains(id) && isOn, isPending: pending)
         }
         .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
     }
@@ -451,13 +452,7 @@ struct TroubleshootingPage: View {
     private var featuresSection: some View {
         Section {
             if model.showsAllFeatures {
-                TextField(String(localized: "Find a feature"), text: $model.filter)
-                    .font(NibFont.body)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.search)
-                    .frame(minHeight: NibMetrics.hitTarget)
-                    .accessibilityLabel(String(localized: "Find a feature"))
+                NibSearchField(text: $model.filter, prompt: String(localized: "Find a feature"))
             }
             let rows = model.shownFeatures
             if rows.isEmpty {
@@ -470,21 +465,17 @@ struct TroubleshootingPage: View {
             ForEach(rows) { row in
                 featureRow(row)
             }
-            Button {
+            NibButton(model.showsAllFeatures ? String(localized: "Hide Features That Are On")
+                                             : String(localized: "Show All Features"),
+                      kind: .plain) {
                 model.showsAllFeatures.toggle()
                 if !model.showsAllFeatures { model.filter = "" }
-            } label: {
-                Text(model.showsAllFeatures ? String(localized: "Hide Features That Are On")
-                                            : String(localized: "Show All Features"))
-                    .font(NibFont.body)
-                    .foregroundStyle(NibColor.accent)
-                    .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
-                    .contentShape(Rectangle())
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         } header: {
             TroubleshootingHeader(String(localized: "Features"))
         } footer: {
-            TroubleshootingFooter(String(localized: "Turning a feature off takes effect the next time you open Nib, so you can find the one that stops it from opening. The features Nib needs to open your library stay on."))
+            TroubleshootingFooter(String(localized: "Turning a feature off takes effect the next time you open Nib, so you can find the one that stops it from opening. The features Nib needs to open your library, Password lock and managed settings stay on."))
         }
     }
 
@@ -532,7 +523,7 @@ struct TroubleshootingPage: View {
 
     private var diagnosticModeSection: some View {
         Section {
-            Text(String(localized: "Turn on Temporary Diagnostic Mode under Nib in the Settings app. The next time you open Nib, it saves a copy of your whole library as a zip in the Files app, in Nib's diagnostics folder, then turns itself off."))
+            Text(String(localized: "Turn on Temporary Diagnostic Mode under Nib in the Settings app. When you come back to Nib, or the next time it opens, it saves a copy of your whole library as a zip in the Files app, in Nib's diagnostics folder, then turns itself off."))
                 .font(NibFont.callout)
                 .foregroundStyle(NibColor.label)
                 .fixedSize(horizontal: false, vertical: true)
@@ -704,12 +695,35 @@ enum TroubleshootingNavigation {
     }
 }
 
-/// Once per safe-mode launch, as soon as a window shows: a system alert that says why plugins are paused and offers
-/// the Troubleshooting page (where the banner stays while the launch lasts).
+/// Once per launch, as soon as a window shows: a system alert that offers the Troubleshooting page. In safe mode it
+/// says why plugins are paused (the page's banner stays while the launch lasts); when a feature the way back goes
+/// through is off (the library browser, Settings or the document bars), it is the way back, since after a relaunch
+/// nothing else on screen may lead there.
 @MainActor
 final class SafeModeNotice {
+    let kind: LaunchNoticeKind
     private var observers: [NSObjectProtocol] = []
     private var presented = false
+
+    init(kind: LaunchNoticeKind = .safeMode) {
+        self.kind = kind
+    }
+
+    var title: String {
+        switch kind {
+        case .safeMode: return String(localized: "Nib started in safe mode")
+        case .featuresOff: return String(localized: "Some features are turned off")
+        }
+    }
+
+    var message: String {
+        switch kind {
+        case .safeMode:
+            return String(localized: "Nib closed unexpectedly while opening, so plugins are paused for now. You can turn off what might be causing it in Troubleshooting.")
+        case .featuresOff:
+            return String(localized: "You turned off features in Troubleshooting, including ones Nib uses to show your library or Settings. You can turn them back on there.")
+        }
+    }
 
     func presentWhenReady(_ app: NibApp) {
         if tryPresent(app) { return }
@@ -735,9 +749,7 @@ final class SafeModeNotice {
         var top = root
         while let next = top.presentedViewController, !next.isBeingDismissed { top = next }
         presented = true
-        let alert = UIAlertController(title: String(localized: "Nib started in safe mode"),
-                                      message: String(localized: "Nib closed unexpectedly while opening, so plugins are paused for now. You can turn off what might be causing it in Troubleshooting."),
-                                      preferredStyle: .alert)
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: String(localized: "Not Now"), style: .cancel))
         let review = UIAlertAction(title: String(localized: "Open Troubleshooting"), style: .default) { [weak app] _ in
             Task { @MainActor in

@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>StringsTable</key>
+	<string>Root</string>
 	<key>PreferenceSpecifiers</key>
 	<array>
 		<dict>
@@ -10,7 +12,7 @@
 			<key>Title</key>
 			<string>Troubleshooting</string>
 			<key>FooterText</key>
-			<string>When this is on, the next time you open Nib it saves a copy of your whole library as a zip in the Files app, in Nib's diagnostics folder, then turns this off. Use it when Nib can't open or support asks for your library. The copy holds your notes: share it only with someone you trust.</string>
+			<string>When this is on, the next time you open or return to Nib it saves a copy of your whole library as a zip in the Files app, in Nib's diagnostics folder, then turns this off. Use it when Nib can't open or support asks for your library. The copy holds your notes: share it only with someone you trust.</string>
 		</dict>
 		<dict>
 			<key>Type</key>

@@ -49,6 +49,30 @@ final class FakeSharing: DiagnosticsSharing {
     }
 }
 
+@MainActor
+final class RecordingNoticePresenter: LaunchNoticePresenting {
+    private(set) var presented: [LaunchNoticeKind] = []
+
+    func present(_ kind: LaunchNoticeKind, app: NibApp) {
+        presented.append(kind)
+    }
+}
+
+@MainActor
+final class FakeBackgroundActivity: DiagnosticsBackgroundActivity {
+    private(set) var begun: [String] = []
+    private(set) var ended = 0
+
+    func begin(_ name: String) -> AnyObject? {
+        begun.append(name)
+        return NSObject()
+    }
+
+    func end(_ token: AnyObject?) {
+        if token != nil { ended += 1 }
+    }
+}
+
 /// A second running feature, so safe-mode switches have something that runs in this launch.
 enum FakeLaserFeature: NibFeature {
     static let id = "laser"
@@ -167,6 +191,8 @@ final class FeatDiagnosticsTests: XCTestCase {
         runtime.logSource = FakeLogSource(entries: [])
         runtime.sharing = FakeSharing()
         runtime.diagnosticSwitch = FakeSwitch(false)
+        runtime.noticePresenter = RecordingNoticePresenter()
+        runtime.backgroundActivity = FakeBackgroundActivity()
         let base = FileManager.default.temporaryDirectory.appendingPathComponent("nib-diagnostics-tests-" + UUID().uuidString,
                                                                                   isDirectory: true)
         runtime.exportDirectory = base.appendingPathComponent("export", isDirectory: true)
@@ -228,11 +254,16 @@ final class FeatDiagnosticsTests: XCTestCase {
 
     func testRegistersItsCommandsAndTheTroubleshootingPage() {
         let (h, _) = makeHarness()
-        let export = h.app.commands.descriptor("diagnostics.export")
+        XCTAssertEqual(DiagnosticsExportCommand.descriptor.id, CommandIDs.diagnosticsExport)
+        XCTAssertEqual(DiagnosticsSetFeatureEnabledCommand.descriptor.id, CommandIDs.diagnosticsSetFeatureEnabled)
+        let export = h.app.commands.descriptor(CommandIDs.diagnosticsExport)
         XCTAssertEqual(export?.effect, .read)
         XCTAssertEqual(export?.userPresence, true)
         XCTAssertEqual(export?.owner, FeatDiagnosticsFeature.id)
-        let toggle = h.app.commands.descriptor("diagnostics.setFeatureEnabled")
+        // The export lists the library (counts, and titles on request): `library:read`, not just `app`.
+        XCTAssertEqual(export?.scopes.contains(.libraryRead), true)
+        XCTAssertEqual(export?.scopes.contains(.app), true)
+        let toggle = h.app.commands.descriptor(CommandIDs.diagnosticsSetFeatureEnabled)
         XCTAssertEqual(toggle?.effect, .session)
         XCTAssertEqual(toggle?.owner, FeatDiagnosticsFeature.id)
         let page = h.app.ui.settingsPages.all.first { $0.id == DiagnosticsIDs.settingsPage }
@@ -253,6 +284,9 @@ final class FeatDiagnosticsTests: XCTestCase {
         let (output, files) = try await export(h)
         XCTAssertFalse(output.includesTitles)
         XCTAssertTrue(output.shared)
+        XCTAssertFalse(output.launchedInSafeMode)
+        XCTAssertEqual(output.disabled, [])
+        XCTAssertEqual(output.summary, file("summary.txt", in: files)?.trimmingCharacters(in: .newlines))
         XCTAssertEqual((runtime.sharing as? FakeSharing)?.shared.count, 1)
         XCTAssertEqual(output.logLines, 1)
         for name in ["README.txt", "summary.txt", "device.json", "features.json", "plugins.json", "library.json",
@@ -332,7 +366,9 @@ final class FeatDiagnosticsTests: XCTestCase {
             return list
         }
         XCTAssertTrue(runtime.launchedInSafeMode)
-        let (_, files) = try await export(h)
+        let (output, files) = try await export(h)
+        XCTAssertTrue(output.launchedInSafeMode)
+        XCTAssertTrue(output.summary.contains("Safe mode: on for this launch"))
         let plugins = try JSONValue.parse(try XCTUnwrap(file("plugins.json", in: files)))
         XCTAssertEqual(plugins["available"], .bool(true))
         XCTAssertEqual(plugins["runningInThisLaunch"], .bool(false))
@@ -340,6 +376,38 @@ final class FeatDiagnosticsTests: XCTestCase {
         let summary = try XCTUnwrap(file("summary.txt", in: files))
         XCTAssertTrue(summary.contains("Safe mode: on for this launch"))
         XCTAssertTrue(summary.contains("Plugins: 1 installed, 1 on, none running in safe mode"))
+    }
+
+    func testEachExportKeepsItsOwnFolderAndOldOnesGo() async throws {
+        let (h, runtime) = makeHarness()
+        let fm = FileManager.default
+        let old = runtime.exportDirectory.appendingPathComponent("earlier-export", isDirectory: true)
+        try fm.createDirectory(at: old, withIntermediateDirectories: true)
+        try Data("zip".utf8).write(to: old.appendingPathComponent("Nib Diagnostics.zip"))
+        let past = Date().addingTimeInterval(-2 * DiagnosticsExporter.keepFor)
+        try fm.setAttributes([.modificationDate: past, .creationDate: past], ofItemAtPath: old.path)
+
+        _ = try await export(h)
+        // A second export (the assistant's) while the first one's share sheet is still open.
+        _ = try await export(h)
+        let shared = try XCTUnwrap((runtime.sharing as? FakeSharing)?.shared)
+        XCTAssertEqual(shared.count, 2)
+        XCTAssertNotEqual(shared[0].deletingLastPathComponent(), shared[1].deletingLastPathComponent())
+        for url in shared { XCTAssertTrue(fm.fileExists(atPath: url.path), url.lastPathComponent) }
+        XCTAssertFalse(fm.fileExists(atPath: old.path))
+    }
+
+    func testExportNeedsLibraryReadBecauseItListsTheLibrary() async throws {
+        let (h, _) = makeHarness()
+        let plugin = Principal.plugin("dev.nib.cards")
+        h.app.gateway.grants = { p in p == plugin ? [.app] : Gateway.defaultGrants(p) }
+        await assertNibError(.permissionDenied) {
+            _ = try await h.run(CommandIDs.diagnosticsExport, ["includeTitles": true], as: plugin)
+        }
+        h.app.gateway.grants = { p in p == plugin ? [.app, .libraryRead] : Gateway.defaultGrants(p) }
+        let output = try await h.run(CommandIDs.diagnosticsExport, [:], as: plugin)
+            .decode(DiagnosticsExportCommand.Output.self)
+        XCTAssertFalse(output.includesTitles)
     }
 
     // MARK: diagnostics.setFeatureEnabled (N-026)
@@ -371,9 +439,30 @@ final class FeatDiagnosticsTests: XCTestCase {
         XCTAssertEqual(store.disabledFeatures, [])
         XCTAssertEqual(out.alsoChanged, ["canvas"])
 
-        // The assistant can do it too (a session command, not security).
+        // The assistant and the bridge may turn an ordinary feature off (a session command)...
         _ = try await h.run("diagnostics.setFeatureEnabled", ["id": "laser", "enabled": false], as: .ai("chat"))
         XCTAssertEqual(store.disabledFeatures, ["laser"])
+        _ = try await h.run("diagnostics.setFeatureEnabled", ["id": "laser", "enabled": true], as: .bridge("x"))
+        XCTAssertEqual(store.disabledFeatures, [])
+        // A plugin granted "Control the app" too.
+        let plugin = Principal.plugin("dev.nib.cards")
+        h.app.gateway.grants = { p in p == plugin ? [.app] : Gateway.defaultGrants(p) }
+        _ = try await h.run("diagnostics.setFeatureEnabled", ["id": "laser", "enabled": false], as: plugin)
+        XCTAssertEqual(store.disabledFeatures, ["laser"])
+        _ = try await h.run("diagnostics.setFeatureEnabled", ["id": "laser", "enabled": true])
+        // ...but never Password lock or managed configuration: that would open every locked document to them.
+        for id in ["lock", "managed"] {
+            for principal in [Principal.ai("chat"), .bridge("x"), plugin] {
+                await assertNibError(.permissionDenied) {
+                    _ = try await h.run("diagnostics.setFeatureEnabled", ["id": .string(id), "enabled": false], as: principal)
+                }
+            }
+            // Nor the person, from the page: they stay on ("Always on"), like the features Nib needs to open.
+            await assertNibError(.invalidParams) {
+                _ = try await h.run("diagnostics.setFeatureEnabled", ["id": .string(id), "enabled": false])
+            }
+        }
+        XCTAssertEqual(store.disabledFeatures, [])
 
         await assertNibError(.invalidParams) {
             _ = try await h.run("diagnostics.setFeatureEnabled", ["id": "diagnostics", "enabled": false])
@@ -430,6 +519,57 @@ final class FeatDiagnosticsTests: XCTestCase {
         XCTAssertEqual(change.disabled, ["mathassist", "mathassistoverlay", "mathgraph"])
         XCTAssertEqual(change.alsoChanged, ["mathassistoverlay"])
         XCTAssertEqual(FeatureCatalog.title("somethingnew"), "somethingnew")
+        XCTAssertTrue(FeatureCatalog.guarded.isSubset(of: FeatureCatalog.ids))
+        XCTAssertTrue(FeatureCatalog.navigation.isSubset(of: FeatureCatalog.ids))
+        XCTAssertThrowsError(try FeatureToggleRules.apply(id: "lock", enabled: false, disabled: [], known: FeatureCatalog.ids))
+        XCTAssertEqual(try FeatureToggleRules.apply(id: "lock", enabled: true, disabled: ["lock"], known: FeatureCatalog.ids).disabled, [])
+    }
+
+    /// The catalogue follows the ARCHITECTURE.md §3 table: every entry id, and every split feature's second half
+    /// (F101–F110) names its first half (the first dependency in the same module) as `parent`.
+    func testFeatureCatalogueMatchesTheArchitectureTable() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // FeatDiagnosticsTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // NibKit
+            .deletingLastPathComponent() // repository root
+        let text = try String(contentsOf: root.appendingPathComponent("docs/ARCHITECTURE.md"), encoding: .utf8)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let start = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("## 3. ") }, "ARCHITECTURE.md has no §3 heading")
+        let end = lines[(start + 1)...].firstIndex { $0.hasPrefix("## ") } ?? lines.endIndex
+
+        struct Row {
+            var number: String
+            var module: String
+            var id: String
+            var dependsOn: [String]
+        }
+        var rows: [Row] = []
+        for line in lines[start..<end] where line.hasPrefix("| F") {
+            let cells = line.split(separator: "|", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            guard cells.count >= 8 else { continue }
+            let spans = cells[3].split(separator: "`", omittingEmptySubsequences: false)
+            guard spans.count >= 4 else { continue } // "— (no Swift module)"
+            let number = String(cells[1].prefix { $0 != " " })
+            let depends = cells[7].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { $0.hasPrefix("F") }
+            rows.append(Row(number: number, module: cells[2], id: String(spans[3]), dependsOn: depends))
+        }
+        XCTAssertGreaterThan(rows.count, 100, "the §3 table could not be read")
+        XCTAssertEqual(Set(rows.map { $0.id }), FeatureCatalog.ids, "FeatureCatalog.all differs from ARCHITECTURE.md §3")
+
+        let byNumber = Dictionary(rows.map { ($0.number, $0) }, uniquingKeysWith: { a, _ in a })
+        for row in rows {
+            let isSecondHalf = (Int(row.number.dropFirst()) ?? 0) >= 101 && (Int(row.number.dropFirst()) ?? 0) <= 110
+            guard isSecondHalf else {
+                XCTAssertNil(FeatureCatalog.parent(of: row.id), "\(row.id) is not a split feature's second half")
+                continue
+            }
+            let first = try XCTUnwrap(row.dependsOn.first.flatMap { byNumber[$0] }, "\(row.number) lists no first half")
+            XCTAssertEqual(first.module, row.module, "\(row.number)'s first dependency is in another module")
+            XCTAssertEqual(FeatureCatalog.parent(of: row.id), first.id, "\(row.id) must name \(first.id) as its parent")
+        }
     }
 
     // MARK: Troubleshooting page model
@@ -518,6 +658,53 @@ final class FeatDiagnosticsTests: XCTestCase {
         XCTAssertNil(withUnknown.last?.owner)
     }
 
+    func testSecurityFeaturesShowAsAlwaysOnAndComeBackIfTheyWereOff() {
+        let rows = TroubleshootingModel.featureRows(running: ["lock", "managed", "laser"], disabled: [], disabledAtLaunch: [])
+        XCTAssertEqual(rows.first { $0.id == "lock" }?.isRequired, true)
+        XCTAssertEqual(rows.first { $0.id == "managed" }?.isRequired, true)
+        XCTAssertEqual(rows.first { $0.id == "laser" }?.isRequired, false)
+        // Off anyway (an older build's choice): the switch stays so it can be turned back on.
+        let off = TroubleshootingModel.featureRows(running: [], disabled: ["lock"], disabledAtLaunch: ["lock"])
+        XCTAssertEqual(off.first { $0.id == "lock" }?.isRequired, false)
+
+        // A launch that skipped one brings it back at the next.
+        let store = InMemorySafeModeStore(disabled: ["lock", "laser", "library"])
+        let (h, runtime) = makeHarness(safeMode: store)
+        runtime.start(h.app)
+        XCTAssertEqual(store.disabledFeatures, ["laser"])
+        XCTAssertEqual(runtime.disabledAtLaunch, ["lock", "laser", "library"])
+    }
+
+    func testLaunchNoticeOffersTroubleshootingWhenTheWayBackIsOff() {
+        let cases: [(disabled: Set<String>, safeMode: Bool, expected: LaunchNoticeKind)] = [
+            (["libraryui"], false, .featuresOff),
+            (["settings", "laser"], false, .featuresOff),
+            (["chrome"], false, .featuresOff),
+            (["laser"], true, .safeMode),
+            (["libraryui"], true, .safeMode),
+        ]
+        for (disabled, safeMode, expected) in cases {
+            let (h, runtime) = makeHarness(safeMode: InMemorySafeModeStore(isActive: safeMode, disabled: disabled))
+            let presenter = RecordingNoticePresenter()
+            runtime.noticePresenter = presenter
+            runtime.start(h.app)
+            runtime.start(h.app)
+            XCTAssertEqual(presenter.presented, [expected], "\(disabled)")
+            XCTAssertEqual(runtime.launchNotice, expected)
+        }
+        let quiet: [Set<String>] = [[], ["laser", "pen"]]
+        for disabled in quiet {
+            let (h, runtime) = makeHarness(safeMode: InMemorySafeModeStore(disabled: disabled))
+            let presenter = RecordingNoticePresenter()
+            runtime.noticePresenter = presenter
+            runtime.start(h.app)
+            XCTAssertEqual(presenter.presented, [], "\(disabled)")
+            XCTAssertNil(runtime.launchNotice)
+        }
+        XCTAssertEqual(SafeModeNotice(kind: .featuresOff).title, "Some features are turned off")
+        XCTAssertFalse(SafeModeNotice(kind: .safeMode).message.isEmpty)
+    }
+
     func testTroubleshootingPageRendersInEveryVariant() {
         let (h, runtime) = makeHarness(safeMode: InMemorySafeModeStore(isActive: true, disabled: ["laser"]))
         let images = NibSnapshot.images(NavigationStack { TroubleshootingPage(app: h.app, runtime: runtime) },
@@ -567,6 +754,37 @@ final class FeatDiagnosticsTests: XCTestCase {
         let texts = try zip.texts()
         XCTAssertEqual(texts["Nib Library/Physics/Waves.nibnote/doc.0000abcd.json"], "{\"pages\":[]}")
         XCTAssertFalse(fm.fileExists(atPath: runtime.libraryCopyFolder.appendingPathComponent("." + name + ".partial").path))
+        // Background time for the copy, given back once it finished; the copy stays out of the device backup.
+        let activity = try XCTUnwrap(runtime.backgroundActivity as? FakeBackgroundActivity)
+        XCTAssertEqual(activity.begun.count, 1)
+        XCTAssertEqual(activity.ended, 1)
+        let values = try runtime.libraryCopyFolder.appendingPathComponent(name).resourceValues(forKeys: [.isExcludedFromBackupKey])
+        XCTAssertEqual(values.isExcludedFromBackup, true)
+        // The library's storage figures leave the copies out.
+        let storage = try XCTUnwrap(LibraryStorage.measure(root: root, excluding: [runtime.libraryCopyFolder]))
+        let everything = try XCTUnwrap(LibraryStorage.measure(root: root))
+        XCTAssertEqual(storage.files, 2)
+        XCTAssertGreaterThan(everything.files, storage.files)
+    }
+
+    func testAnInterruptedLibraryCopyIsRemovedAtTheNextLaunch() throws {
+        let (h, runtime) = makeHarness()
+        let fm = FileManager.default
+        try fm.createDirectory(at: runtime.libraryCopyFolder, withIntermediateDirectories: true)
+        let partial = runtime.libraryCopyFolder.appendingPathComponent(".Nib Library 2026-09-30 10.00.00.zip.partial")
+        let finished = runtime.libraryCopyFolder.appendingPathComponent("Nib Library 2026-09-29 10.00.00.zip")
+        try Data("half a library".utf8).write(to: partial)
+        try Data("a whole one".utf8).write(to: finished)
+
+        runtime.start(h.app)
+        XCTAssertFalse(fm.fileExists(atPath: partial.path))
+        XCTAssertTrue(fm.fileExists(atPath: finished.path))
+        guard case .failed(let message) = runtime.libraryCopy else {
+            return XCTFail("expected the interrupted copy to be reported, got \(runtime.libraryCopy)")
+        }
+        XCTAssertFalse(message.isEmpty)
+        // Once per launch: a later copy's partial file is never taken for an interrupted one.
+        XCTAssertFalse(runtime.sweepInterruptedCopies())
     }
 
     func testLibraryCopyRefusesWhenTheDiskIsFull() throws {
@@ -631,6 +849,56 @@ final class FeatDiagnosticsTests: XCTestCase {
         let p = DiagnosticsRedactor.placeholder
         XCTAssertEqual(redactor.redact("Opened Physics 9702 then Physics; ab stays"), "Opened \(p) then \(p); ab stays")
         XCTAssertEqual(DiagnosticsRedactor(titles: []).redact("Physics"), "Physics")
+    }
+
+    func testRedactorMatchesWholeWordsAndPathsInEverySpelling() {
+        let p = DiagnosticsRedactor.placeholder
+        let redactor = DiagnosticsRedactor(titles: ["Physics 9702", "Physics", "Caf\u{00E9} Notes", "app", "\u{7269}\u{7406}\u{7B14}\u{8BB0}"])
+        // URL and file-system spellings.
+        XCTAssertEqual(redactor.redact("open file:///Documents/Physics%209702.nibnote failed"),
+                       "open file:///Documents/\(p).nibnote failed")
+        XCTAssertEqual(redactor.redact("Notes/Physics/Waves.pdf and Physics."), "Notes/\(p)/Waves.pdf and \(p).")
+        XCTAssertEqual(redactor.redact("moved Cafe\u{0301} Notes.nibnote"), "moved \(p).nibnote")
+        XCTAssertEqual(redactor.redact("path Caf%C3%A9%20Notes/doc.json"), "path \(p)/doc.json")
+        XCTAssertEqual(redactor.redact("legacy Import/Physics.nib/doc.json"), "legacy Import/\(p).nib/doc.json")
+        // Whole words only: identifiers and longer words stay.
+        let line = "2026-10-01T10:00:00.000Z  notice app.nib/diagnostics  Exported com.app.thing Physicsbook Physics2 apps"
+        XCTAssertEqual(redactor.redact(line), line)
+        XCTAssertEqual(redactor.redact("Opened app, then app."), "Opened \(p), then \(p).")
+        // Scripts without spaces between words.
+        XCTAssertEqual(redactor.redact("\u{6253}\u{5F00}\u{7269}\u{7406}\u{7B14}\u{8BB0}\u{5931}\u{8D25}"), "\u{6253}\u{5F00}\(p)\u{5931}\u{8D25}")
+    }
+
+    /// One pass over the log, whatever the size of the library (a pass per title took minutes for 10,000 titles).
+    func testRedactorScansALargeLogQuickly() {
+        let syllables = ["ka", "lo", "mi", "ren", "tu", "sa", "vo", "ne", "pi", "dor", "el", "qua"]
+        var titles: [String] = []
+        for i in 0..<10_000 {
+            let a = syllables[i % syllables.count], b = syllables[(i / 12) % syllables.count]
+            titles.append("\(a.capitalized)\(b) \(i)")
+        }
+        var lines: [DiagnosticsLogLine] = []
+        lines.reserveCapacity(20_000)
+        let date = Date(timeIntervalSince1970: 1_790_000_000)
+        for i in 0..<20_000 {
+            let title = titles[(i &* 7919) % titles.count]
+            let message = i % 4 == 0
+                ? "Opened \(title) from Library/Folder \(i % 50)/\(title).nibnote in 12 ms"
+                : "Rendered tile 3/\(i % 97) of page \(i % 31) at zoom 1.25, cache hit ratio 0.93, queue depth \(i % 5)"
+            lines.append(DiagnosticsLogLine(date: date, level: "info", subsystem: "app.nib", category: "render",
+                                            message: message))
+        }
+        let text = DiagnosticsFormat.logText(lines)
+        let started = Date()
+        let redactor = DiagnosticsRedactor(titles: titles)
+        let masked = redactor.redact(text)
+        let elapsed = Date().timeIntervalSince(started)
+        print("Redacted \(text.utf8.count) bytes against \(titles.count) titles in \(elapsed) s")
+        XCTAssertLessThan(elapsed, 1, "redaction must stay a single pass")
+        XCTAssertFalse(masked.contains(titles[0]))
+        XCTAssertFalse(masked.contains(titles[(4 &* 7919) % titles.count] + ".nibnote"))
+        XCTAssertTrue(masked.contains("app.nib/render"))
+        XCTAssertEqual(masked.components(separatedBy: DiagnosticsRedactor.placeholder).count - 1, 5_000 * 2)
     }
 
     func testReportLinksCarryTheSummaryIntact() throws {
