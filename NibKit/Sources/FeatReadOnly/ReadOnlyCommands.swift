@@ -43,7 +43,8 @@ final class ReadOnlyInkGate: StrokeProcessor {
 
 struct PDFMarkSelection: NibCommand {
     struct Params: Codable {
-        var page: String
+        /// The user may omit it (the window's current page, §6.1 session defaults).
+        var page: String?
         var from: [Double]
         var to: [Double]
         var style: String
@@ -82,18 +83,26 @@ struct PDFMarkSelection: NibCommand {
         guard Set(ids).count == ids.count else {
             throw NibError(.invalidParams, "ids must be unique", path: "$.ids")
         }
-        let source = try PDFTextSource.resolve(p.page, workspace: ctx.workspace, services: ctx.services)
+        let source = try PDFTextSource.resolve(try ctx.pageOrSession(p.page), workspace: ctx.workspace,
+                                               services: ctx.services)
+        let doc = source.doc, page = source.page
+        // Documents Nib will not write (saved by a newer Nib, files that cannot be written) refuse every caller.
+        if ctx.isReadOnly(doc) {
+            throw NibError(.unsupported, "document \(doc.raw) is read-only", path: "$.page",
+                           hint: "the document was saved by a newer version of Nib or its files cannot be written")
+        }
         let found = await source.selection(from: from, to: to)
-        guard !found.rects.isEmpty else {
+        guard !found.lines.isEmpty else {
             throw NibError(.notFound, "no PDF text between the two points",
                            hint: "call pdf.text for the page's text and pass points that lie on its lines")
         }
-        let strokes = PDFMarkGeometry.strokes(over: found.rects, style: style)
+        let strokes = PDFMarkGeometry.strokes(over: found.lines, style: style)
         let layer = ctx.activeSession?.activeLayer ?? 0
-        let doc = source.doc, page = source.page
-        let taken = try Set(ctx.workspace.allItems(doc, page: page).map { $0.id.raw })
-        for (i, id) in ids.enumerated() where taken.contains(id) {
-            throw NibError(.conflict, "an item with id \(id) already exists on the page", path: "$.ids[\(i)]")
+        if !ids.isEmpty {
+            let taken = try Set(ctx.workspace.allItems(doc, page: page).map { $0.id.raw })
+            for (i, id) in ids.enumerated() where taken.contains(id) {
+                throw NibError(.conflict, "an item with id \(id) already exists on the page", path: "$.ids[\(i)]")
+            }
         }
         let label = style == .highlight ? "Highlight Text" : "Strike Through Text"
         let refs = try ctx.mutate(label) { tx -> [String] in
@@ -114,7 +123,8 @@ struct PDFMarkSelection: NibCommand {
 
 struct PDFCopyText: NibCommand {
     struct Params: Codable {
-        var page: String
+        /// The user may omit it (the window's current page, §6.1 session defaults).
+        var page: String?
         var from: [Double]
         var to: [Double]
     }
@@ -133,7 +143,8 @@ struct PDFCopyText: NibCommand {
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let from = try PDFTextSource.point(p.from, path: "$.from")
         let to = try PDFTextSource.point(p.to, path: "$.to")
-        let source = try PDFTextSource.resolve(p.page, workspace: ctx.workspace, services: ctx.services)
+        let source = try PDFTextSource.resolve(try ctx.pageOrSession(p.page), workspace: ctx.workspace,
+                                               services: ctx.services)
         let found = await source.selection(from: from, to: to)
         guard !found.text.isEmpty else {
             throw NibError(.notFound, "no PDF text between the two points",
@@ -148,8 +159,9 @@ struct PDFCopyText: NibCommand {
 
 // MARK: - pdf.tapAt (the long-press tap handler)
 
-/// Offered finger long-presses on the canvas in both modes. Selects the PDF text line under the finger and hands it
-/// to this window's `PDFTextMenuAttachment`, which shows the selection, its handles and the text menu.
+/// Offered finger long-presses on the canvas in both modes. Selects the PDF word under the finger (the PDF engine's
+/// `word(_:page:at:)`), else the line, and hands it to this window's `PDFTextMenuAttachment`, which shows the
+/// selection, its handles and the text menu.
 struct PDFTapAt: NibCommand {
     struct Params: Codable {
         var page: String
@@ -164,7 +176,7 @@ struct PDFTapAt: NibCommand {
     static let example: JSONValue = ["page": "page:FIXTUREDOC01/FIXTUREPG003", "point": [100, 82], "gesture": "longPress"]
     static let descriptor = CommandDescriptor(
         id: "pdf.tapAt", title: "Select PDF Text at Point",
-        summary: "Tap chain: a long-press on PDF text selects the line under the point and shows Highlight, Strikethrough, Define, Speak and Copy.",
+        summary: "Tap chain: a long-press on PDF text selects the word under the point (the line when the PDF engine finds no word) and shows Highlight, Strikethrough, Define, Speak and Copy.",
         params: .obj(["page": .ref, "point": .point, "ref": .ref,
                       "gesture": .str("canvas gesture", choices: CanvasGesture.allCases.map { $0.rawValue })],
                      required: ["page", "point"]),
@@ -173,34 +185,27 @@ struct PDFTapAt: NibCommand {
 
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let point = try PDFTextSource.point(p.point, path: "$.point")
-        guard case .page? = NodeRef(p.page) else {
+        guard case let .page(doc, pageID)? = NodeRef(p.page) else {
             throw NibError(.invalidParams, "expected a page ref like page:D/P", path: "$.page")
         }
         let declined = Output(handled: false, text: nil)
         guard (p.gesture ?? CanvasGesture.longPress.rawValue) == CanvasGesture.longPress.rawValue else { return declined }
         // Typed text, images, shapes and sticky notes over the PDF keep their own long-press; ink does not block text.
-        if let ref = p.ref, case let .item(doc, page, id)? = NodeRef(ref),
-           let item = try? ctx.workspace.item(doc, page: page, id: id), item.kind != .stroke {
+        if let ref = p.ref, case let .item(itemDoc, itemPage, id)? = NodeRef(ref),
+           let item = try? ctx.workspace.item(itemDoc, page: itemPage, id: id), item.kind != .stroke {
             return declined
         }
         // Not a PDF page, or no PDF engine: decline so the next handler (the page menu) gets the gesture.
-        guard let source = try? PDFTextSource.resolve(p.page, workspace: ctx.workspace, services: ctx.services) else {
+        guard let source = try? PDFTextSource.resolve((doc, pageID), workspace: ctx.workspace, services: ctx.services),
+              let selection = await source.pick(at: point) else {
             return declined
         }
-        let lines = await source.lines()
-        guard let line = PDFTextPick.line(at: point, lines: lines) else { return declined }
-        let found = await source.selection(from: line.from, to: line.to)
-        guard !found.rects.isEmpty, !found.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return declined
-        }
-        let selection = PDFTextSelection(doc: source.doc, page: source.page, from: line.from, to: line.to,
-                                         text: found.text, rects: found.rects)
         guard let menu = PDFTextMenuAttachment.attachment(for: ctx.activeSession), menu.documentID == source.doc else {
             // No canvas shows this document in the caller's window (bridge, AI): report the text, consume nothing.
-            return Output(handled: false, text: found.text)
+            return Output(handled: false, text: selection.text)
         }
         menu.show(selection)
-        return Output(handled: true, text: found.text)
+        return Output(handled: true, text: selection.text)
     }
 }
 
@@ -210,10 +215,99 @@ enum PDFMarkStyle: String, CaseIterable {
     case highlight, strikeout
 }
 
+/// One line of PDF text in Nib page points: its midline in reading direction (`start` → `end`) and its height across
+/// that midline. On an unrotated page it runs from the line rect's left middle to its right middle; a page whose PDF
+/// background is turned (`PageRecord.rotation`) turns it with the background.
+struct PDFTextLine: Equatable {
+    var start: Point
+    var end: Point
+    var thickness: Double
+
+    init(start: Point, end: Point, thickness: Double) {
+        self.start = start
+        self.end = end
+        self.thickness = thickness
+    }
+
+    /// The line of an upright rect (PDF points, or an unrotated page).
+    init(rect: Rect) {
+        self.init(start: Point(rect.minX, rect.midY), end: Point(rect.maxX, rect.midY), thickness: rect.height)
+    }
+
+    /// Unit vector in reading direction; (1, 0) for a line without length.
+    var direction: Point {
+        let d = end - start
+        let length = hypot(d.x, d.y)
+        return length > 0 ? d * (1 / length) : Point(1, 0)
+    }
+
+    /// Unit vector from the text's top to its bottom: down on an unrotated page.
+    var normal: Point {
+        let u = direction
+        return Point(-u.y, u.x)
+    }
+
+    /// The four corners of the line's box: top start, top end, bottom end, bottom start.
+    var corners: [Point] {
+        let half = normal * (thickness / 2)
+        return [start - half, end - half, end + half, start + half]
+    }
+
+    var bounds: Rect { Rect.bounding(corners) ?? .zero }
+
+    /// The same line through `t`, a rotation with uniform scale (a background transform or the canvas zoom).
+    func applying(_ t: Affine) -> PDFTextLine {
+        PDFTextLine(start: t.apply(start), end: t.apply(end), thickness: thickness * abs(t.determinant).squareRoot())
+    }
+}
+
 struct PDFTextFound {
     var text: String
-    /// One rect per text line, in Nib page points.
+    /// One bounding rect per text line, in Nib page points.
     var rects: [Rect]
+    /// The same lines with their direction (for marks and handles on turned backgrounds).
+    var lines: [PDFTextLine]
+}
+
+/// Where a PDF page sits on its Nib page: contracts-v2 `PageRecord.backgroundTransform` (turned by `rotation`,
+/// aspect-fitted and centred; the identity for an imported page). The PDF service speaks the PDF page's points
+/// (top-left origin); commands and the canvas speak Nib page points.
+struct PDFPageMapping {
+    let toPage: Affine
+    let toPDF: Affine
+
+    init(_ transform: Affine) {
+        toPage = transform
+        toPDF = transform.inverted ?? .identity
+    }
+
+    /// The mapping for page `index` of `url` on a page of `pageSize` whose background is turned by `rotation`
+    /// (identity when the PDF engine does not know the PDF page's size).
+    init(service: PDFService, url: URL, index: Int, rotation: Int, pageSize: PageSize?) {
+        guard let source = service.pageSize(url, page: index) else {
+            self.init(.identity)
+            return
+        }
+        self.init(PageRecord.backgroundTransform(sourceSize: source, rotation: rotation, pageSize: pageSize))
+    }
+
+    /// Page points per PDF point.
+    var scale: Double { abs(toPage.determinant).squareRoot() }
+
+    func pagePoint(_ p: Point) -> Point { toPage.apply(p) }
+    func pdfPoint(_ p: Point) -> Point { toPDF.apply(p) }
+
+    func pageRect(_ r: Rect) -> Rect {
+        let corners = [Point(r.minX, r.minY), Point(r.maxX, r.minY), Point(r.maxX, r.maxY), Point(r.minX, r.maxY)]
+        return Rect.bounding(corners.map(toPage.apply)) ?? .zero
+    }
+
+    func pageLine(_ r: Rect) -> PDFTextLine { PDFTextLine(rect: r).applying(toPage) }
+
+    func found(text: String, pdfRects: [Rect]) -> PDFTextFound {
+        let rects = pdfRects.filter { !$0.isEmpty }
+        return PDFTextFound(text: text, rects: rects.map(pageRect), lines: rects.map(pageLine))
+    }
 }
 
 /// The PDF page behind a Nib page, resolved for `services.pdf`. Every PDFKit call runs off the main actor.
@@ -225,14 +319,16 @@ struct PDFTextSource {
     let index: Int
     /// The Nib page size (nil = infinite board: the PDF sits at the origin, unscaled).
     let pageSize: PageSize?
+    /// `PageRecord.rotation`: turns the PDF background (not the items) clockwise.
+    let rotation: Int
     let service: PDFService
 
-    /// Throws `invalid_params` for a page without a PDF background and `unavailable` without the PDF engine.
+    /// Throws `not_found` for a missing page, `invalid_params` for a page without a PDF background and `unavailable`
+    /// without the PDF engine.
     @MainActor
-    static func resolve(_ ref: String, workspace: Workspace, services: NibServices) throws -> PDFTextSource {
-        guard case let .page(doc, pageID)? = NodeRef(ref) else {
-            throw NibError(.invalidParams, "expected a page ref like page:D/P", path: "$.page")
-        }
+    static func resolve(_ ref: (doc: DocumentID, page: PageID), workspace: Workspace,
+                        services: NibServices) throws -> PDFTextSource {
+        let (doc, pageID) = ref
         guard let record = try workspace.content(doc).page(pageID), !record.deleted else {
             throw NibError.notFound("page \(pageID.raw) in document \(doc.raw)")
         }
@@ -246,7 +342,7 @@ struct PDFTextSource {
             throw NibError.notFound("PDF asset \(asset.name) of document \(doc.raw)")
         }
         return PDFTextSource(doc: doc, page: pageID, url: url, index: record.background.pdfPage ?? 0,
-                             pageSize: record.size, service: service)
+                             pageSize: record.size, rotation: record.rotation, service: service)
     }
 
     static func point(_ v: [Double], path: String) throws -> Point {
@@ -256,64 +352,92 @@ struct PDFTextSource {
         return Point(v[0], v[1])
     }
 
-    /// Text and line rects between two Nib page points.
+    /// Runs `body` with the PDF engine and this page's mapping off the main actor.
+    private func detached<T: Sendable>(_ body: @escaping @Sendable (PDFService, URL, Int, PDFPageMapping) -> T) async -> T {
+        let service = service, url = url, index = index, rotation = rotation, pageSize = pageSize
+        return await Task.detached(priority: .userInitiated) { () -> T in
+            body(service, url, index, PDFPageMapping(service: service, url: url, index: index, rotation: rotation,
+                                                     pageSize: pageSize))
+        }.value
+    }
+
+    /// Text and lines between two Nib page points.
     func selection(from: Point, to: Point) async -> PDFTextFound {
-        let service = service, url = url, index = index, pageSize = pageSize
-        return await Task.detached(priority: .userInitiated) { () -> PDFTextFound in
-            let placement = PDFPlacement(pdf: service.pageSize(url, page: index), page: pageSize)
-            let found = service.selection(url, page: index, from: placement.toPDF(from), to: placement.toPDF(to))
-            return PDFTextFound(text: found.text, rects: found.rects.map { placement.toPage($0) }.filter { !$0.isEmpty })
-        }.value
-    }
-
-    /// The page's text lines, in Nib page points.
-    func lines() async -> [Rect] {
-        let service = service, url = url, index = index, pageSize = pageSize
-        return await Task.detached(priority: .userInitiated) { () -> [Rect] in
-            let placement = PDFPlacement(pdf: service.pageSize(url, page: index), page: pageSize)
-            return service.textBlocks(url, page: index).map { placement.toPage($0.bbox) }
-        }.value
-    }
-}
-
-/// Where a PDF page sits on its Nib page: aspect-fitted and centred, the identity for an imported page (same size),
-/// as the PDF engine's own commands place it. The PDF service speaks the PDF page's points (top-left origin);
-/// commands and the canvas speak Nib page points. `PageRecord.rotation` turns background and items together, so it
-/// moves nothing in page points.
-struct PDFPlacement: Equatable {
-    let scale: Double
-    let origin: Point
-
-    init(pdf: PageSize?, page: PageSize?) {
-        guard let pdf = pdf, let page = page, pdf.width > 0, pdf.height > 0, page.width > 0, page.height > 0 else {
-            scale = 1
-            origin = .zero
-            return
+        await detached { service, url, index, mapping in
+            let found = service.selection(url, page: index, from: mapping.pdfPoint(from), to: mapping.pdfPoint(to))
+            return mapping.found(text: found.text, pdfRects: found.rects)
         }
-        let k = min(page.width / pdf.width, page.height / pdf.height)
-        scale = k
-        origin = Point((page.width - pdf.width * k) / 2, (page.height - pdf.height * k) / 2)
     }
 
-    func toPage(_ p: Point) -> Point { Point(origin.x + p.x * scale, origin.y + p.y * scale) }
-    func toPDF(_ p: Point) -> Point { Point((p.x - origin.x) / scale, (p.y - origin.y) / scale) }
+    /// What a long-press at `point` selects: the word under it (`PDFService.word`), else the text line nearest it;
+    /// nil when there is no text there.
+    func pick(at point: Point) async -> PDFTextSelection? {
+        let doc = doc, page = page
+        let picked: (from: Point, to: Point, found: PDFTextFound)? = await detached { service, url, index, mapping in
+            let p = mapping.pdfPoint(point)
+            if let word = service.word(url, page: index, at: p), !word.rect.isEmpty,
+               !word.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let anchors = PDFTextPick.anchors(of: word.rect)
+                return (mapping.pagePoint(anchors.from), mapping.pagePoint(anchors.to),
+                        mapping.found(text: word.text, pdfRects: [word.rect]))
+            }
+            let lines = service.textBlocks(url, page: index).map { $0.bbox }
+            guard let line = PDFTextPick.line(at: p, lines: lines, slop: PDFTextPick.slop / max(mapping.scale, 1e-6)) else {
+                return nil
+            }
+            let found = service.selection(url, page: index, from: line.from, to: line.to)
+            return (mapping.pagePoint(line.from), mapping.pagePoint(line.to),
+                    mapping.found(text: found.text, pdfRects: found.rects))
+        }
+        guard let picked = picked, !picked.found.lines.isEmpty,
+              !picked.found.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return PDFTextSelection(doc: doc, page: page, from: picked.from, to: picked.to, text: picked.found.text,
+                                rects: picked.found.rects, lines: picked.found.lines)
+    }
 
-    func toPage(_ r: Rect) -> Rect {
-        let a = toPage(Point(r.minX, r.minY)), b = toPage(Point(r.maxX, r.maxY))
-        return Rect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
+    /// The anchor one step further than `anchor` in reading order: forward, the end of its line (or of the next line
+    /// when it is already there); backward, the start of its line (or of the previous one). nil at the text's ends.
+    /// Lets VoiceOver and Switch Control grow a selection without dragging its handles.
+    func extended(_ anchor: Point, forward: Bool) async -> Point? {
+        await detached { service, url, index, mapping in
+            let lines = service.textBlocks(url, page: index).map { $0.bbox }
+            return PDFTextPick.extended(mapping.pdfPoint(anchor), forward: forward, lines: lines,
+                                        slop: PDFTextPick.slop / max(mapping.scale, 1e-6))
+                .map(mapping.pagePoint)
+        }
     }
 }
 
-/// What a long-press selects: the whole text line under the finger; the selection handles then refine it.
-/// ponytail: a line, not a word, because `PDFService` only selects between two points; a word needs a word-at-point
-/// API in the contracts.
+/// Anchor maths in PDF page points, where text lines are upright rects.
 enum PDFTextPick {
-    /// Anchor points selecting the line nearest `point` among `lines` within `slop` points; nil when none is that near.
-    static func line(at point: Point, lines: [Rect], slop: Double = 4) -> (from: Point, to: Point)? {
+    /// How far off a line (page points) a long-press still selects it.
+    static let slop = 4.0
+    /// Anchors sit this far inside a line's ends so the engine selects its first and last characters.
+    static func anchors(of r: Rect) -> (from: Point, to: Point) {
+        let inset = min(0.5, r.width / 4)
+        return (Point(r.minX + inset, r.midY), Point(r.maxX - inset, r.midY))
+    }
+
+    /// Anchor points selecting the line nearest `point` among `lines` within `slop`; nil when none is that near.
+    static func line(at point: Point, lines: [Rect], slop: Double = PDFTextPick.slop) -> (from: Point, to: Point)? {
         let near = lines.filter { !$0.isEmpty && $0.insetBy(-slop).contains(point) }
         guard let line = near.min(by: { abs($0.midY - point.y) < abs($1.midY - point.y) }) else { return nil }
-        let inset = min(0.5, line.width / 4)
-        return (Point(line.minX + inset, line.midY), Point(line.maxX - inset, line.midY))
+        return anchors(of: line)
+    }
+
+    /// See `PDFTextSource.extended(_:forward:)`; `lines` in any order.
+    static func extended(_ anchor: Point, forward: Bool, lines: [Rect], slop: Double = PDFTextPick.slop) -> Point? {
+        let ordered = lines.filter { !$0.isEmpty }.sorted { ($0.minY, $0.minX) < ($1.minY, $1.minX) }
+        let containing = ordered.firstIndex { $0.insetBy(-slop).contains(anchor) }
+        let nearest = ordered.indices.min { abs(ordered[$0].midY - anchor.y) < abs(ordered[$1].midY - anchor.y) }
+        guard let i = containing ?? nearest else { return nil }
+        let here = anchors(of: ordered[i])
+        if forward {
+            if anchor.x < here.to.x - 0.5 { return here.to }
+            return i + 1 < ordered.count ? anchors(of: ordered[i + 1]).to : nil
+        }
+        if anchor.x > here.from.x + 0.5 { return here.from }
+        return i > 0 ? anchors(of: ordered[i - 1]).from : nil
     }
 }
 
@@ -325,18 +449,19 @@ enum PDFMarkGeometry {
     /// Vermilion, the conventional red strikethrough.
     static let strikeColour = rgba(NibInk.vermilion.hex, alpha: 255)
 
-    static func strokes(over rects: [Rect], style: PDFMarkStyle, t0: Double = Date().timeIntervalSince1970) -> [Stroke] {
-        rects.filter { !$0.isEmpty }.map { r -> Stroke in
+    static func strokes(over lines: [PDFTextLine], style: PDFMarkStyle,
+                        t0: Double = Date().timeIntervalSince1970) -> [Stroke] {
+        lines.filter { $0.thickness > 0 && $0.start != $0.end }.map { line -> Stroke in
             let ink: InkStyle
             switch style {
             case .highlight:
-                ink = InkStyle(tool: .highlighter, pen: nil, color: highlightColour, width: r.height)
+                ink = InkStyle(tool: .highlighter, pen: nil, color: highlightColour, width: line.thickness)
             case .strikeout:
-                ink = InkStyle(tool: .pen, pen: .ball, color: strikeColour, width: min(max(r.height * 0.08, 1), 2.5))
+                ink = InkStyle(tool: .pen, pen: .ball, color: strikeColour, width: min(max(line.thickness * 0.08, 1), 2.5))
             }
-            let y = Float(r.midY)
-            var stroke = Stroke(style: ink, points: [StrokePoint(x: Float(r.minX), y: y, t: 0),
-                                                     StrokePoint(x: Float(r.maxX), y: y, t: 0.05)], t0: t0)
+            var stroke = Stroke(style: ink, points: [StrokePoint(x: Float(line.start.x), y: Float(line.start.y), t: 0),
+                                                     StrokePoint(x: Float(line.end.x), y: Float(line.end.y), t: 0.05)],
+                                t0: t0)
             InkModel.prepare(&stroke)
             return stroke
         }
