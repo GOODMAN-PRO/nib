@@ -287,10 +287,16 @@ final class NibExportTests: XCTestCase {
     /// back to packages.
     func testZipKeepsTheFolderTree() async throws {
         let h = Harness(features: [NibExportFeature.self])
+        _ = try h.app.workspace.content(Fixtures.docID)
+        _ = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1)
+        let loaded = Set(h.app.workspace.loadedDocuments)
+        let cached = h.app.workspace.cachedPages(Fixtures.docID)
         let out = try await h.run(CommandIDs.exportRun, ["docs": ["folder:FIXTUREFLD01"], "format": "zip",
                                                          "options": ["itemFormat": "pdf"], "inline": true])
         let files = try XCTUnwrap(out["files"]?.arrayValue)
         XCTAssertEqual(files.map { $0["name"]?.stringValue }, ["Fixtures.zip"])
+        XCTAssertEqual(Set(h.app.workspace.loadedDocuments), loaded)
+        XCTAssertEqual(h.app.workspace.cachedPages(Fixtures.docID), cached)
         let data = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(files[0]["base64"]?.stringValue)))
         for entry in ["Fixtures/Fixture Notebook.pdf", "Fixtures/Fixture Whiteboard.pdf",
                       "Fixtures/Fixture Study Set.nibnote.zip", "Fixtures/Fixture Text Document.nibnote.zip"] {
@@ -312,4 +318,71 @@ final class NibExportTests: XCTestCase {
         XCTAssertTrue(file["asset"]?.stringValue?.hasPrefix("tmp:") ?? false)
         XCTAssertFalse(FileManager.default.fileExists(atPath: big.path), "the exporter's file is cleaned up")
     }
+    func testCacheGuardPreservesPagesLoadedByTheCanvasDuringExport() throws {
+        let h = Harness(features: [NibExportFeature.self])
+        h.app.workspace.evictPages(Fixtures.docID, keeping: [])
+        let guarder = PageCacheGuard(h.app.workspace, doc: Fixtures.docID)
+        _ = try guarder.track(Fixtures.page1) { try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1) }
+        _ = try h.app.workspace.items(Fixtures.docID, page: Fixtures.page2)
+        guarder.evict()
+        XCTAssertEqual(h.app.workspace.cachedPages(Fixtures.docID), [Fixtures.page2])
+    }
+
+    func testMultiDocumentPageRangeSkipsShorterDocuments() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        let out = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01", "doc:FIXTUREDOC04"],
+                                                         "format": "pdf", "options": ["pageRange": "2-"]])
+        XCTAssertEqual(out["files"]?.arrayValue?.count, 1)
+        XCTAssertEqual(try ExportPages.parseRange("5-", count: 3, allowEmpty: true), [])
+        do {
+            _ = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC01", "doc:FIXTUREDOC04"],
+                                                       "format": "pdf", "options": ["pageRange": "5-"]])
+            XCTFail("no document supplies a sheet")
+        } catch let error as NibError { XCTAssertEqual(error.code, .invalidParams) }
+    }
+
+    func testDeliveryPreservesFilesOutsideTemporaryDirectory() throws {
+        let file = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("export-preserve-" + UUID().uuidString)
+        try Data("source".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        XCTAssertFalse(ExportDelivery.isTemporary(file))
+        ExportDelivery.discard([file])
+        XCTAssertEqual(try Data(contentsOf: file), Data("source".utf8))
+    }
+
+    func testFailedPDFExportRemovesEarlierFilesAndClosesDocuments() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("nib-export")
+        func folders() -> Set<String> { Set((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []) }
+        let before = folders()
+        let loaded = Set(h.app.workspace.loadedDocuments)
+        h.app.commands.register(CommandDescriptor(id: "test.failExport", title: "Fail export", summary: "Exercise partial cleanup.",
+                                                  effect: .read, exposure: .ui)) { _, ctx in
+            _ = try await PDFExporter.export(ExportRequest(documents: [Fixtures.docID, Fixtures.textDocID]), ctx)
+            return .null
+        }
+        do {
+            try await h.run("test.failExport")
+            XCTFail("PDF refuses text documents")
+        } catch let error as NibError { XCTAssertEqual(error.code, .unsupported) }
+        XCTAssertEqual(folders(), before)
+        XCTAssertEqual(Set(h.app.workspace.loadedDocuments), loaded)
+    }
+
+    func testZipCopiesAnExporterSourceOutsideTemporaryDirectory() async throws {
+        let h = Harness(features: [NibExportFeature.self])
+        let file = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("export-source-" + UUID().uuidString + ".txt")
+        let bytes = Data("preserve the source".utf8)
+        try bytes.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        var descriptor = ExporterDescriptor(id: "test.source", title: "Source", fileExtension: "txt", utType: "public.plain-text",
+                                            owner: "test") { _, _ in [file] }
+        descriptor.docKinds = [.textDocument]
+        h.app.content.exporters.register(descriptor)
+        let out = try await h.run(CommandIDs.exportRun, ["docs": ["doc:FIXTUREDOC02"], "format": "zip",
+                                                         "options": ["itemFormat": "test.source"], "inline": true])
+        XCTAssertEqual(out["files"]?.arrayValue?.count, 1)
+        XCTAssertEqual(try Data(contentsOf: file), bytes)
+    }
+
 }

@@ -64,10 +64,22 @@ struct ExportRun: NibCommand {
             throw NibError(.invalidParams, "format must not be empty", path: "$.format", hint: ExportDispatch.formatsHint(ctx))
         }
         let options = try ExportOptions(p.options ?? [:])
-        let scope = try ExportScope.resolve(docs: p.docs, pages: p.pages, ctx: ctx)
+        var scope = try ExportScope.resolve(docs: p.docs, pages: p.pages, ctx: ctx)
+        if scope.docs.count > 1, options.pageRange != nil {
+            scope.docs = try scope.docs.filter {
+                try !ExportPages.rangeSkips(ctx.workspace.peekContent($0), pages: scope.pages, range: options.pageRange)
+            }
+            guard !scope.docs.isEmpty else { throw ExportPages.nothingInRange(options.pageRange) }
+        }
         let groups = try ExportDispatch.plan(format: format, scope: scope, ctx: ctx)
+        // The built-in exporters close each document they opened as soon as they are done with it; this also closes
+        // the ones any other exporter opened and left open.
+        let uses = scope.docs.map { ExportDocumentUse($0, ctx: ctx) }
         var urls: [URL] = []
-        defer { ExportDelivery.discard(urls) }
+        defer {
+            ExportDelivery.discard(urls)
+            for use in uses { use.end() }
+        }
         for group in groups {
             let request = ExportRequest(documents: group.docs, pages: scope.pages, options: options.raw,
                                         fileName: groups.count == 1 ? p.name : nil)
@@ -81,10 +93,13 @@ struct ExportRun: NibCommand {
 
 // MARK: - Scope
 
-/// What `docs` and `pages` name: documents in order (folders expanded, duplicates dropped) and the page filter.
+/// What `docs` and `pages` name: documents in order (folders expanded, duplicates dropped), the page filter, and
+/// each document's kind. Documents are checked with `Workspace.peekContent`, so resolving a folder or the whole
+/// library opens none of them.
 struct ExportScope {
     var docs: [DocumentID]
     var pages: [PageID]?
+    var kinds: [DocumentID: DocumentKind] = [:]
 
     @MainActor
     static func resolve(docs refs: [String]?, pages pageRefs: [String]?, ctx: CommandContext) throws -> ExportScope {
@@ -93,6 +108,18 @@ struct ExportScope {
         func add(_ doc: DocumentID) {
             if seen.insert(doc).inserted { docs.append(doc) }
         }
+        func refuseLocked(_ doc: DocumentID, path: String) throws {
+            if ctx.services.lock?.isLocked(doc) == true {
+                throw NibError(.locked, "doc:\(doc.raw) is locked", path: path, hint: "unlock the document, then export it again")
+            }
+        }
+        var heads: [DocumentID: DocumentContent] = [:]
+        func head(_ doc: DocumentID) throws -> DocumentContent {
+            if let h = heads[doc] { return h }
+            let h = try ctx.workspace.peekContent(doc)
+            heads[doc] = h
+            return h
+        }
         var pageIDs: [PageID]?
         if let pageRefs = pageRefs {
             var ids: [PageID] = []
@@ -100,7 +127,8 @@ struct ExportScope {
                 guard case let .page(doc, page)? = NodeRef(ref) else {
                     throw NibError(.invalidParams, "expected a page ref (page:D/P)", path: "$.pages[\(i)]")
                 }
-                guard let record = try ctx.workspace.content(doc).page(page), !record.deleted else {
+                try refuseLocked(doc, path: "$.pages[\(i)]")
+                guard let record = try? head(doc).page(page), !record.deleted else {
                     throw NibError(.notFound, "page \(page.raw) not found in doc:\(doc.raw)", path: "$.pages[\(i)]",
                                    hint: "list the pages with query.get {\"ref\": \"doc:\(doc.raw)\"}")
                 }
@@ -126,19 +154,17 @@ struct ExportScope {
         guard !docs.isEmpty else {
             throw NibError(.invalidParams, "nothing to export", path: "$.docs", hint: "pass document refs such as doc:D")
         }
+        var kinds: [DocumentID: DocumentKind] = [:]
         for (i, doc) in docs.enumerated() {
+            try refuseLocked(doc, path: "$.docs[\(i)]")
             do {
-                _ = try ctx.workspace.content(doc)
+                kinds[doc] = try (heads[doc] ?? ctx.workspace.peekContent(doc)).meta.kind
             } catch let e as NibError where e.code == .notFound {
                 throw NibError(.notFound, "document \(doc.raw) not found", path: "$.docs[\(i)]",
                                hint: "list documents with query.tree {\"ref\": \"lib\"}")
             }
-            if ctx.services.lock?.isLocked(doc) == true {
-                throw NibError(.locked, "doc:\(doc.raw) is locked", path: "$.docs[\(i)]",
-                               hint: "unlock the document, then export it again")
-            }
         }
-        return ExportScope(docs: docs, pages: pageIDs)
+        return ExportScope(docs: docs, pages: pageIDs, kinds: kinds)
     }
 
     /// Every document under `folder` (sub-folders included), in library order.
@@ -190,7 +216,8 @@ enum ExportDispatch {
         }
         var groups: [Group] = []
         for doc in scope.docs {
-            let kind = try ctx.workspace.content(doc).meta.kind
+            if ctx.services.lock?.isLocked(doc) == true { throw NibError(.locked, "doc:\(doc.raw) is locked") }
+            let kind = try scope.kinds[doc] ?? ctx.workspace.peekContent(doc).meta.kind
             guard let exporter = exporter(format, for: kind, in: exporters) else {
                 let usable = exporters.filter { $0.docKinds.map { $0.contains(kind) } ?? true }.map { $0.id }
                 throw NibError(.unsupported, "format '\(format)' cannot export a \(kind.rawValue) (doc:\(doc.raw))",
@@ -251,20 +278,32 @@ enum ExportDelivery {
     }
 
     /// Removes the exporters' temporary files (their bytes now live in the asset store) and empty folders they left.
+    /// Only files inside the temporary directory are removed: an exporter that hands back an existing file (a document
+    /// asset, an imported source) never loses it.
     static func discard(_ urls: [URL]) {
         let fm = FileManager.default
-        let temporary = fm.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath().path
         var folders = Set<URL>()
-        for url in urls {
+        for url in urls where isTemporary(url) {
             try? fm.removeItem(at: url)
             folders.insert(url.deletingLastPathComponent())
         }
         // Only an exporter's own (now empty) folder inside the temporary directory, never that directory itself.
         for folder in folders {
-            let path = folder.standardizedFileURL.resolvingSymlinksInPath().path
-            guard path.hasPrefix(temporary + "/"), path != temporary,
-                  (try? fm.contentsOfDirectory(atPath: folder.path))?.isEmpty ?? false else { continue }
+            guard isTemporary(folder), (try? fm.contentsOfDirectory(atPath: folder.path))?.isEmpty ?? false else { continue }
             try? fm.removeItem(at: folder)
         }
+    }
+
+    /// True when `url` resolves to a path strictly inside the temporary directory.
+    static func isTemporary(_ url: URL) -> Bool {
+        let temporary = resolved(FileManager.default.temporaryDirectory)
+        let path = resolved(url)
+        return path.hasPrefix(temporary + "/") && path != temporary
+    }
+
+    private static func resolved(_ url: URL) -> String {
+        var path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        return path
     }
 }

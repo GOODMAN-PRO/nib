@@ -42,7 +42,8 @@ final class PackageSource {
             throw NibError(.locked, "doc:\(doc.raw) is locked", path: "$.docs", hint: "unlock the document, then export it again")
         }
         let content = try ctx.workspace.content(doc)
-        let selected = content.livePages.isEmpty ? [] : try ExportPages.select(content, pages: request.pages, range: options.pageRange)
+        let selected = content.livePages.isEmpty ? [] : try ExportPages.select(content, pages: request.pages, range: options.pageRange,
+                                                                              skipOutOfRange: request.documents.count > 1)
         let head = exportedHead(content, pages: selected, options: options)
         let job = PackageJob(doc: doc, title: ExportNames.title(doc, kind: content.meta.kind, ctx: ctx),
                              device: ctx.app?.deviceHex ?? ctx.workspace.clock.deviceHex, head: head,
@@ -102,10 +103,9 @@ final class PackageSource {
     /// Live items of the `index`-th exported page on the exported layers (comments left out when asked).
     func items(_ index: Int) throws -> [Item] {
         let page = job.pages[index]
-        var list = try workspace.items(job.doc, page: page)
+        var list = try cache.track(page) { try workspace.items(job.doc, page: page) }
         if let layers = layers { list = list.filter { layers.contains($0.layer) } }
         if !comments { list = list.filter { $0.kind != .comment } }
-        cache.loaded(page)
         return list
     }
 
@@ -122,10 +122,17 @@ enum PackageExporter {
             throw NibError(.invalidParams, "no document to export", path: "$.docs", hint: "pass the documents to export")
         }
         let folder = try ExportNames.scratchFolder()
+        var completed = false
+        defer { if !completed { try? FileManager.default.removeItem(at: folder) } }
         var used = Set<String>()
         var urls: [URL] = []
         for doc in request.documents {
+            let use = ExportDocumentUse(doc, ctx: ctx)
+            defer { use.end() }
             let source = try PackageSource.make(doc, request: request, options: options, ctx: ctx)
+            defer { source.evict() }
+            if request.documents.count > 1, options.pageRange != nil, source.job.pages.isEmpty,
+               source.job.head.meta.kind == .notebook || source.job.head.meta.kind == .whiteboard { continue }
             let requested = request.documents.count == 1
                 ? request.fileName.map { PDFExporter.stripExtension(PDFExporter.stripExtension($0, "zip"), NibFormat.packageExtension) }
                 : nil
@@ -135,15 +142,11 @@ enum PackageExporter {
                                                                            used: &used))
             let packageJob = job
             let pull = MainPull<[Item]> { index in try source.items(index) }
-            do {
-                try await ExportWorker.run { try PackageWriter.writeArchive(packageJob, pull: pull, to: archive) }
-            } catch {
-                source.evict()
-                throw error
-            }
-            source.evict()
+            try await ExportWorker.run { try PackageWriter.writeArchive(packageJob, pull: pull, to: archive) }
             urls.append(archive)
         }
+        guard !urls.isEmpty else { throw ExportPages.nothingInRange(options.pageRange) }
+        completed = true
         return urls
     }
 
@@ -160,12 +163,20 @@ enum PackageExporter {
         let dropped = max(common.count - 1, 0)
         let exporters = ctx.content.exporters.all.filter { $0.id != ExportFormat.zip }
         let folder = try ExportNames.scratchFolder()
+        var completed = false
+        defer { if !completed { try? fm.removeItem(at: folder) } }
         let staging = folder.appendingPathComponent("tree-" + UUID().uuidString, isDirectory: true)
         try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        var exportedDocuments = 0
         var usedPerFolder: [String: Set<String>] = [:]
         do {
             for (i, doc) in request.documents.enumerated() {
-                let kind = try ctx.workspace.content(doc).meta.kind
+                if ctx.services.lock?.isLocked(doc) == true { throw NibError(.locked, "doc:\(doc.raw) is locked") }
+                let use = ExportDocumentUse(doc, ctx: ctx)
+                defer { use.end() }
+                let head = try ctx.workspace.peekContent(doc)
+                if request.documents.count > 1, try ExportPages.rangeSkips(head, pages: request.pages, range: options.pageRange) { continue }
+                let kind = head.meta.kind
                 guard let exporter = ExportDispatch.exporter(options.itemFormat, for: kind, in: exporters)
                     ?? ExportDispatch.exporter(ExportFormat.nibnote, for: kind, in: exporters) else {
                     throw NibError(.unsupported, "no exporter can put a \(kind.rawValue) into a zip (doc:\(doc.raw))",
@@ -173,6 +184,8 @@ enum PackageExporter {
                 }
                 let files = try await exporter.handler(ExportRequest(documents: [doc], pages: request.pages,
                                                                      options: request.options), ctx)
+                defer { ExportDelivery.discard(files) }
+                exportedDocuments += 1
                 let components = chains[i].dropFirst(dropped).map { ExportNames.sanitize($0, fallback: String(localized: "Folder")) }
                 var dir = staging
                 for c in components { dir.appendPathComponent(c, isDirectory: true) }
@@ -181,7 +194,11 @@ enum PackageExporter {
                 var used = usedPerFolder[key] ?? []
                 for file in files {
                     let name = ExportNames.unique(file.deletingPathExtension().lastPathComponent, ext: file.pathExtension, used: &used)
-                    try fm.moveItem(at: file, to: dir.appendingPathComponent(name))
+                    if ExportDelivery.isTemporary(file) {
+                        try fm.moveItem(at: file, to: dir.appendingPathComponent(name))
+                    } else {
+                        try fm.copyItem(at: file, to: dir.appendingPathComponent(name))
+                    }
                 }
                 usedPerFolder[key] = used
                 ExportDelivery.discard(files)
@@ -190,6 +207,7 @@ enum PackageExporter {
             try? fm.removeItem(at: staging)
             throw error
         }
+        guard exportedDocuments > 0 else { throw ExportPages.nothingInRange(options.pageRange) }
         let rootName = request.fileName.map { ExportNames.sanitize(PDFExporter.stripExtension($0, "zip"), fallback: "Nib") }
             ?? common.last.map { ExportNames.sanitize($0, fallback: "Nib") }
             ?? String(localized: "Nib Export")
@@ -198,6 +216,7 @@ enum PackageExporter {
             defer { try? FileManager.default.removeItem(at: staging) }
             try FileManager.default.zipItem(at: staging, to: archive, shouldKeepParent: false, compressionMethod: .deflate)
         }
+        completed = true
         return [archive]
     }
 
@@ -288,13 +307,7 @@ enum PackageWriter {
 /// The asset files a document's records refer to (`assets/<name>` in the package).
 enum PackageAssets {
     static func refs(in item: Item) -> Set<String> {
-        var out = Set<String>()
-        if let i = item.image { out.insert(i.asset.name) }
-        if let p = item.stroke?.style.tapePattern { out.insert(p.name) }
-        if let c = item.custom { for op in c.display.ops { if let a = op.asset { out.insert(a.name) } } }
-        for text in [item.text?.text, item.sticky?.text, item.shape?.text, item.connector?.label] {
-            out.formUnion(refs(in: text))
-        }
+        var out = Set(NibFragment.assetRefs(item).map { $0.name })
         for s in item.math?.sourceInk ?? [] { if let p = s.style.tapePattern { out.insert(p.name) } }
         return out
     }
