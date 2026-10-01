@@ -125,7 +125,7 @@ public struct NibPenSwatch: View {
                 .overlay {
                     if isSelected {
                         Circle()
-                            .stroke(NibColor.label, lineWidth: 2)
+                            .stroke(NibChromeColor(NibColor.label), lineWidth: 2)
                             .frame(width: diameter + 7, height: diameter + 7)
                     }
                 }
@@ -184,7 +184,7 @@ public struct NibToolButton: View {
             Image(nib: tool.symbol)
                 .font(NibFont.glyph(.palette, size: min(glyph, 28)))
                 .symbolRenderingMode(tool.tint == nil ? .hierarchical : .palette)
-                .foregroundStyle(NibColor.label, tool.tint ?? NibColor.label)
+                .foregroundStyle(NibChromeColor(NibColor.label), NibChromeColor(tool.tint ?? NibColor.label))
                 .opacity(isEnabled ? (isSelected ? 1 : NibOpacity.unselectedTool) : NibOpacity.disabled)
                 .animation(NibMotion.colorChange, value: isSelected)
                 .overlay(alignment: .topTrailing) {

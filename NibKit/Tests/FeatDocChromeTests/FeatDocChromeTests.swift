@@ -66,6 +66,24 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(layout.overlayRegion, CGRect(x: 16, y: 92, width: 546, height: 1066))
     }
 
+    func testLargePortraitNavigatorNeverDocksOrReservesItsWidthThroughThePalette() {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1024, height: 1366)] {
+            for side in SidebarSide.allCases {
+                var layout = ChromeLayout(size: size, safeArea: .zero,
+                                          left: side == .left ? NibMetrics.navigatorWidth : nil,
+                                          right: side == .right ? NibMetrics.navigatorWidth : nil, mode: .sidebar)
+                XCTAssertEqual(layout.presentation, .overlay)
+                XCTAssertEqual((side == .left ? layout.left : layout.right)?.width, NibMetrics.navigatorWidth)
+                XCTAssertEqual(layout.editor, CGRect(origin: .zero, size: size))
+                layout.avoidPalette(NibPaletteDock(edge: side == .left ? .leading : .trailing), thickness: 56,
+                                    optionsSize: CGSize(width: 320, height: 44))
+                XCTAssertEqual(layout.editorInsets.left + layout.editorInsets.right, 88)
+                XCTAssertEqual(layout.editor.width - layout.editorInsets.left - layout.editorInsets.right,
+                               size.width - 88, "the floating navigator and options arm must not shrink page fitting")
+            }
+        }
+    }
+
     func testCompactWidthPresentsSidebarsAsSheets() {
         for side in [SidebarSide.left, .right] {
             let layout = ChromeLayout(size: CGSize(width: 393, height: 852),
@@ -236,7 +254,7 @@ final class FeatDocChromeTests: XCTestCase {
         }
     }
 
-    func testEveryPaletteDockReservesTheFusedFootprintInEditorAndOverlayRegions() {
+    func testEveryPaletteDockSeparatesSideRailFittingFromFloatingOptionsClearance() {
         let size = CGSize(width: 1194, height: 834)
         for edge in NibDock.allCases {
             var layout = ChromeLayout(size: size, safeArea: .zero, left: nil, right: nil, mode: .sidebar)
@@ -250,17 +268,17 @@ final class FeatDocChromeTests: XCTestCase {
                 XCTAssertEqual(layout.editorInsets.bottom, 16 + 56 + 44 - 1 + 16)
                 XCTAssertEqual(layout.overlayRegion.maxY, size.height - layout.editorInsets.bottom)
             case .leading:
-                XCTAssertEqual(layout.editorInsets.left, 16 + 56 + 280 - 1 + 16)
-                XCTAssertEqual(layout.overlayRegion.minX, layout.editorInsets.left)
+                XCTAssertEqual(layout.editorInsets.left, 16 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.minX, 16 + 56 + 280 - 1 + 16)
             case .trailing:
-                XCTAssertEqual(layout.editorInsets.right, 16 + 56 + 280 - 1 + 16)
-                XCTAssertEqual(layout.overlayRegion.maxX, size.width - layout.editorInsets.right)
+                XCTAssertEqual(layout.editorInsets.right, 16 + 56 + 16)
+                XCTAssertEqual(layout.overlayRegion.maxX, size.width - (16 + 56 + 280 - 1 + 16))
             }
             XCTAssertEqual(layout.editor.size, size, "content still scrolls under the palette")
         }
     }
 
-    func testMeasuredOptionsWidthChangesSideClearanceAndClosingChromeRestoresIt() {
+    func testMeasuredOptionsWidthChangesFloatingClearanceWithoutRefittingThePage() {
         let size = CGSize(width: 1194, height: 834)
         let closed = ChromeLayout(size: size, safeArea: .zero, left: nil, right: nil, mode: .sidebar)
         var narrow = closed
@@ -269,14 +287,73 @@ final class FeatDocChromeTests: XCTestCase {
                             optionsSize: CGSize(width: 200, height: 44))
         wide.avoidPalette(NibPaletteDock(edge: .leading), thickness: 56,
                           optionsSize: CGSize(width: 320, height: 44))
-        XCTAssertEqual(wide.editorInsets.left - narrow.editorInsets.left, 120)
+        XCTAssertEqual(wide.editorInsets, narrow.editorInsets)
+        XCTAssertEqual(wide.overlayRegion.minX - narrow.overlayRegion.minX, 120)
+        XCTAssertEqual(wide.floatingRegion.minX - narrow.floatingRegion.minX, 120)
         XCTAssertEqual(closed.editorInsets.left, 0)
         var rightSidebar = ChromeLayout(size: size, safeArea: .zero, left: nil, right: 344,
                                        mode: .sidebar, assistantTrailing: true)
         rightSidebar.avoidPalette(NibPaletteDock(edge: .trailing), thickness: 56,
                                   optionsSize: CGSize(width: 200, height: 44))
-        XCTAssertEqual(rightSidebar.editorInsets.right, 16 + 56 + 200 - 1 + 16,
+        XCTAssertEqual(rightSidebar.editorInsets.right, 16 + 56 + 16,
                        "the sidebar's reserved width is not counted again inside the editor")
+        XCTAssertEqual(rightSidebar.overlayRegion.maxX,
+                       rightSidebar.editor.maxX - (16 + 56 + 200 - 1 + 16))
+    }
+
+    func testPaletteEligibilityClearsReservationsForTextAndStudyEditors() {
+        for kind in DocumentKind.allCases {
+            for readOnly in [false, true] {
+                for hasToolbar in [false, true] {
+                    let reserves = ChromePalettePolicy.reservesSpace(kind: kind, readOnly: readOnly,
+                                                                    hasToolbar: hasToolbar,
+                                                                    bottomAssistant: false, detent: .medium)
+                    XCTAssertEqual(reserves, hasToolbar && !readOnly && (kind == .notebook || kind == .whiteboard))
+                }
+            }
+        }
+        for size in [CGSize(width: 1024, height: 1366), CGSize(width: 1366, height: 1024)] {
+            let base = ChromeLayout(size: size, safeArea: .zero, left: nil, right: nil, mode: .sidebar)
+            // Model a switch with the same registered factory and cached options measurement.
+            for kind in [DocumentKind.notebook, .textDocument, .studySet, .whiteboard] {
+                var layout = base
+                if ChromePalettePolicy.reservesSpace(kind: kind, readOnly: false, hasToolbar: true,
+                                                     bottomAssistant: false, detent: .medium) {
+                    layout.avoidPalette(NibPaletteDock(edge: .leading), thickness: 56,
+                                        optionsSize: CGSize(width: 320, height: 44))
+                }
+                if kind == .textDocument || kind == .studySet {
+                    XCTAssertEqual(layout.editorInsets, base.editorInsets)
+                    XCTAssertEqual(layout.editor.midX, size.width / 2)
+                    XCTAssertEqual(EditorHost.additionalInsets(layout.editorInsets, system: .zero).left, 0)
+                    XCTAssertEqual(EditorHost.additionalInsets(layout.editorInsets, system: .zero).right, 0)
+                } else {
+                    XCTAssertEqual(layout.editorInsets.left, 88)
+                }
+            }
+        }
+    }
+
+    func testCompactAssistantSheetsSuppressPaletteAndRestoreItWithoutChangingReservation() {
+        let state = ChromeState()
+        let layout = ChromeLayout(size: CGSize(width: 393, height: 852), safeArea: .zero,
+                                  left: nil, right: nil, mode: .sidebar, idiom: .phone)
+        let reserves = ChromePalettePolicy.reservesSpace(kind: .notebook, readOnly: false, hasToolbar: true,
+                                                        bottomAssistant: false, detent: .medium)
+        XCTAssertTrue(reserves)
+        for spot in [PanelSpot.right, .floating, .sheet] {
+            state.open(PanelIDs.assistant, at: spot)
+            let sheet = PresentedSheet.current(state, compact: layout.isCompact)
+            XCTAssertNotNil(sheet)
+            XCTAssertFalse(ChromePalettePolicy.showsPalette(reservesSpace: reserves, compact: true, sheet: sheet))
+            XCTAssertTrue(ChromePalettePolicy.showsPalette(reservesSpace: reserves, compact: false, sheet: sheet))
+            state.close(PanelIDs.assistant)
+            XCTAssertTrue(ChromePalettePolicy.showsPalette(reservesSpace: reserves, compact: true,
+                                                          sheet: PresentedSheet.current(state, compact: true)))
+        }
+        XCTAssertFalse(ChromePalettePolicy.reservesSpace(kind: .notebook, readOnly: false, hasToolbar: true,
+                                                         bottomAssistant: true, detent: .expanded))
+        XCTAssertFalse(ChromePalettePolicy.showsPalette(reservesSpace: false, compact: false, sheet: nil))
     }
 
     func testPhoneLandscapePaletteLeavesAUsableViewportWithoutDoubleCountingCanvasInsets() {
@@ -306,6 +383,76 @@ final class FeatDocChromeTests: XCTestCase {
     }
 
     // MARK: Chrome overlays
+
+    func testNarrowPortraitSearchCounterMovesAbovePageHUDAndKeyboard() throws {
+        typealias Item = ChromeOverlayGeometry.Item
+        let items = [Item(id: "search", placement: .bottom, size: CGSize(width: 240, height: 44)),
+                     Item(id: "page", placement: .bottomTrailing, size: CGSize(width: 104, height: 44))]
+        // These are the remaining widths beside a portrait sidebar/palette, including a near miss (<16 pt).
+        for width: CGFloat in [272, 360, 460] {
+            let region = CGRect(x: 272, y: 92, width: width, height: 950)
+            for keyboard in [nil, CGRect(x: 0, y: 650, width: 1024, height: 716)] as [CGRect?] {
+                let frames = ChromeOverlayGeometry.frames(items, in: region, keyboardFrame: keyboard)
+                let page = try XCTUnwrap(frames["page"])
+                let search = try XCTUnwrap(frames["search"])
+                XCTAssertEqual(page.maxY, keyboard.map { $0.minY - NibSpacing.l } ?? region.maxY)
+                XCTAssertEqual(search.maxY + NibMetrics.minimumRestingGap, page.minY)
+                XCTAssertEqual(page.maxX, region.maxX)
+                XCTAssertEqual(search.midX, region.midX)
+                XCTAssertEqual(search.size, items[0].size)
+                XCTAssertEqual(page.size, items[1].size)
+                XCTAssertTrue(region.contains(search))
+                XCTAssertEqual(ChromeOverlayGeometry.frames(Array(items.reversed()), in: region, keyboardFrame: keyboard),
+                               frames, "placement priority cannot depend on registry or dictionary ordering")
+            }
+        }
+    }
+
+    func testBottomHUDsShareARowAtExactlyTheRestingGapAndStackBelowIt() throws {
+        typealias Item = ChromeOverlayGeometry.Item
+        let items = [Item(id: "search", placement: .bottom, size: CGSize(width: 240, height: 44)),
+                     Item(id: "page", placement: .bottomTrailing, size: CGSize(width: 104, height: 44))]
+        // (480 - 240) / 2 - 104 == 16, with the centre and trailing placements unchanged.
+        for width: CGFloat in [479, 480, 834, 1194] {
+            let region = CGRect(x: 16, y: 92, width: width, height: 500)
+            let frames = ChromeOverlayGeometry.frames(items, in: region)
+            let page = try XCTUnwrap(frames["page"])
+            let search = try XCTUnwrap(frames["search"])
+            if width < 480 {
+                XCTAssertEqual(search.maxY + NibMetrics.minimumRestingGap, page.minY)
+            } else {
+                XCTAssertEqual(search.maxY, page.maxY)
+                XCTAssertGreaterThanOrEqual(page.minX - search.maxX, NibMetrics.minimumRestingGap)
+            }
+        }
+    }
+
+    func testAllBottomPlacementGroupsAndMultipleRowsHaveSeparateTargets() throws {
+        typealias Item = ChromeOverlayGeometry.Item
+        let region = CGRect(x: 300, y: 92, width: 272, height: 800)
+        let keyboard = CGRect(x: 0, y: 700, width: 1024, height: 666)
+        let items = [Item(id: "search", placement: .bottom, size: CGSize(width: 240, height: 44)),
+                     Item(id: "audio", placement: .bottom, size: CGSize(width: 260, height: 60)),
+                     Item(id: "leading", placement: .bottomLeading, size: CGSize(width: 200, height: 44)),
+                     Item(id: "page", placement: .bottomTrailing, size: CGSize(width: 104, height: 44)),
+                     Item(id: "trailing", placement: .bottomTrailing, size: CGSize(width: 180, height: 52))]
+        let frames = ChromeOverlayGeometry.frames(items, in: region, keyboardFrame: keyboard)
+        XCTAssertEqual(frames.count, items.count)
+        for (index, item) in items.enumerated() {
+            let frame = try XCTUnwrap(frames[item.id])
+            XCTAssertEqual(frame.size, item.size)
+            XCTAssertTrue(region.contains(frame))
+            XCTAssertLessThanOrEqual(frame.maxY, keyboard.minY - NibSpacing.l)
+            for other in items.dropFirst(index + 1) {
+                let second = try XCTUnwrap(frames[other.id])
+                let gap = NibMetrics.minimumRestingGap
+                XCTAssertTrue(frame.maxX + gap <= second.minX || second.maxX + gap <= frame.minX
+                              || frame.maxY + gap <= second.minY || second.maxY + gap <= frame.minY,
+                              "\(item.id) collides with \(other.id)")
+            }
+        }
+        XCTAssertLessThan(try XCTUnwrap(frames["audio"]).minY, try XCTUnwrap(frames["search"]).minY)
+    }
 
     func testOverlayGeometryPlacesAndStacksEachPlacement() {
         let region = CGRect(x: 16, y: 88, width: 1162, height: 710)

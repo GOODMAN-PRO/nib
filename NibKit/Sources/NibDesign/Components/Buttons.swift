@@ -155,7 +155,7 @@ public struct NibIconButton: View {
         Button(action: action) {
             Image(nib: symbol)
                 .font(glyph)
-                .foregroundStyle(tint)
+                .foregroundStyle(NibChromeColor(tint))
                 .frame(width: disc ?? 40, height: disc ?? 40)
                 .background {
                     if disc != nil || isOn {
@@ -163,7 +163,7 @@ public struct NibIconButton: View {
                     }
                 }
                 .overlay {
-                    if isOn { Circle().strokeBorder(.primary, lineWidth: NibSpacing.xxs) }
+                    if isOn { Circle().strokeBorder(NibChromeColor(NibColor.label), lineWidth: NibSpacing.xxs) }
                 }
                 .opacity(isEnabled ? 1 : NibOpacity.disabled)
                 .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)

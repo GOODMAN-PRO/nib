@@ -473,11 +473,76 @@ final class FeatSearchUITests: XCTestCase {
         let h = Harness(features: [FeatSearchUIFeature.self])
         installDependencies(h, hits: [hit()])
         try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "Hello"])
+        // Exercise the full-screen phone panel's external-dismiss path on every test device.
+        try await h.run(CommandIDs.panelOpen, ["id": .string(SearchOpen.documentPanel)])
         let state = SearchRuntime.from(h.app).state(h.session)
         XCTAssertTrue(state.isPresented)
         h.session.openPanels.remove(SearchOpen.documentPanel)
         XCTAssertFalse(state.isPresented)
         XCTAssertEqual(state.query, "Hello")
+    }
+
+    func testDocumentSearchUsesDedicatedSurfaceWithoutNavigatorTabs() async throws {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        installDependencies(h, hits: [hit()])
+        let panel = try XCTUnwrap(h.app.ui.panels.get(SearchOpen.documentPanel))
+        XCTAssertEqual(panel.placement, .fullScreen)
+        XCTAssertTrue(panel.providesHeader)
+        XCTAssertFalse(h.app.ui.panels.all.contains { $0.owner == "searchui" && $0.placement == .sidebarTab })
+        let overlay = try XCTUnwrap(h.app.ui.chromeOverlays.get("searchui.document"))
+        XCTAssertEqual(overlay.placement, .top)
+        XCTAssertEqual(overlay.surface, .none)
+        XCTAssertNil(h.app.ui.chromeOverlays.get("searchui.field"), "The field must not be hosted separately from results")
+        let toolbar = try XCTUnwrap(h.app.ui.toolbar.get("searchui.find"))
+        XCTAssertEqual(toolbar.isOn?(h.session), false)
+
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "query": "Hello"])
+        XCTAssertEqual(h.session.openPanels.contains(SearchOpen.documentPanel), SearchOpen.usesDocumentSheet)
+        XCTAssertEqual(toolbar.isOn?(h.session), true)
+        // iPad portrait is regular width; narrow Split View is compact. Both keep one surface.
+        for compact in [false, true] {
+            let context = ChromeContext(app: h.app, session: h.session, kind: .notebook, isCompact: compact)
+            XCTAssertEqual(overlay.isVisible(context), !SearchOpen.usesDocumentSheet)
+        }
+
+        try await h.run(CommandIDs.searchOpen, ["scope": "document", "close": true])
+        let state = SearchRuntime.from(h.app).state(h.session)
+        XCTAssertFalse(state.isPresented)
+        XCTAssertEqual(state.query, "Hello")
+        XCTAssertNil(state.flashID)
+        XCTAssertFalse(h.session.openPanels.contains(SearchOpen.documentPanel))
+        XCTAssertEqual(toolbar.isOn?(h.session), false)
+        XCTAssertFalse(overlay.isVisible(ChromeContext(app: h.app, session: h.session)))
+    }
+
+    func testDocumentSearchFieldAndResultsFillPortraitAndSplitViewWidth() {
+        let h = Harness(features: [FeatSearchUIFeature.self])
+        let state = SearchState()
+        state.scope = NodeRef.document(Fixtures.docID).description
+        state.query = "Hello"
+        state.matches = [hit()]
+        state.isPresented = true
+        state.instant = true
+        let field = DocumentSearchField(app: h.app, session: h.session, state: state)
+        let panel = DocumentSearchPanel(app: h.app, session: h.session, state: state)
+        for windowWidth: CGFloat in [390, 600, 834, 1024] {
+            let availableWidth = windowWidth - 2 * NibMetrics.chromeInset
+            for variant in NibSnapshot.Variant.allCases {
+                XCTAssertEqual(NibSnapshot.fittingSize(field, width: availableWidth, variant: variant).width,
+                    availableWidth, accuracy: 1, "The field must span the same column as results, even above 560 pt")
+                XCTAssertEqual(NibSnapshot.fittingSize(panel, width: availableWidth, variant: variant).width,
+                    availableWidth, accuracy: 1, "Search must fit between the host's 16 pt side margins")
+            }
+        }
+        for variant in NibSnapshot.Variant.allCases {
+            let portrait = panel.padding(.horizontal, NibMetrics.chromeInset)
+            if let image = NibSnapshot.image(portrait, size: CGSize(width: 834, height: 700), variant: variant) {
+                let attachment = XCTAttachment(image: image)
+                attachment.name = "Portrait document search " + variant.rawValue
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            } else { XCTFail("Portrait document search did not render") }
+        }
     }
 
     func testInvalidMatchAndScopeAreRejected() async throws {
@@ -506,6 +571,8 @@ final class FeatSearchUITests: XCTestCase {
     func testResultSnapshotsAcrossThemesAndAccessibility() {
         let h = Harness(features: [FeatSearchUIFeature.self])
         let state = SearchState()
+        state.isPresented = true
+        state.instant = true
         state.query = "Hello"
         state.matches = [hit()]
         let row = SearchResultRow(app: h.app, session: h.session, state: state, hit: hit())

@@ -46,7 +46,7 @@ public struct NibHUDText: View {
             }
         }
         .font(NibFont.hud)
-        .foregroundStyle(NibColor.label)
+        .foregroundStyle(NibChromeColor(NibColor.label))
         .lineLimit(1)
         .padding(.horizontal, NibSpacing.s)
         .accessibilityElement(children: .combine)
@@ -126,7 +126,7 @@ public struct NibPresenceStack: View {
                 Text(verbatim: "+\(split.overflow)")
                     .font(NibFont.caption2)
                     .monospacedDigit()
-                    .foregroundStyle(NibColor.label)
+                    .foregroundStyle(NibChromeColor(NibColor.label))
                     .frame(minWidth: NibMetrics.presenceBead, minHeight: NibMetrics.presenceBead)
                     .background(NibColor.fill1, in: Circle())
             }
@@ -224,7 +224,7 @@ public struct NibBanner: View {
     private var messageLabel: some View {
         Text(message)
             .font(NibFont.callout)
-            .foregroundStyle(NibColor.label)
+            .foregroundStyle(NibChromeColor(NibColor.label))
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -350,7 +350,7 @@ public struct NibDropletButton: View {
                     .lineLimit(1)
                 }
             }
-            .foregroundStyle(kind == .tinted ? NibColor.onAccent : NibColor.label)
+            .foregroundStyle(NibChromeColor(kind == .tinted ? NibColor.onAccent : NibColor.label))
             .opacity(isEnabled ? 1 : NibOpacity.disabled)
             .padding(.horizontal, title == nil ? 0 : NibSpacing.l)
             .frame(minWidth: kind == .tinted && title != nil ? 96 : NibMetrics.hitTarget,

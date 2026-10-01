@@ -46,9 +46,17 @@ struct NibNativeGlass<Foreground: View>: View {
     let effect: Glass
     let shape: NibDropletShape
     @ViewBuilder let foreground: () -> Foreground
+    @Environment(\.self) private var environment
 
     var body: some View {
-        foreground().glassEffect(effect, in: shape)
+        // Capture the app's appearance outside the glass host. Native glass can adapt its foreground to white
+        // paper, but our dark contrast underlay still needs the app's light label/icon tokens (DESIGN.md §2.4).
+        let appearance = NibChromeAppearance(environment)
+        foreground()
+            .foregroundStyle(Color(NibColor.label.resolve(in: environment)))
+            .environment(\.nibChromeAppearance, appearance)
+            .environment(\.colorScheme, appearance.colorScheme)
+            .glassEffect(effect, in: shape)
     }
 }
 
@@ -148,9 +156,8 @@ struct NibGlassModifier: ViewModifier {
             // Pencil down or a Liquid change never rebuilds the content.
             NibNativeGlass(effect: systemGlass, shape: shape) {
                 content
-                    .foregroundStyle(.primary)
-                    .background { systemUnderlay }
             }
+            .background { systemUnderlay }
             .background {
                 GeometryReader { proxy in
                     Color.clear

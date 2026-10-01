@@ -71,6 +71,7 @@ final class LibraryViewModel: ObservableObject {
     let coverCache: LibraryCoverCache
     @Published var hasLibraryDrag = false
     @Published var menu: String?
+    @Published private(set) var menuAnchors: [String: CGRect] = [:]
     @Published var renaming: String?
     @Published var search = ""
     @Published var sidebarVisible = true
@@ -497,10 +498,7 @@ struct LibraryRootView: View {
             .onPreferenceChange(LibraryTargets.self) { targets = $0 }
             .onPreferenceChange(LibraryChromeFrames.self) { frames in
                 chromeFrames = frames
-                for id in ["library.app", "library.sort"] {
-                    if let frame = frames["anchor." + id] { model.floating.setAnchor(id, rect: frame) }
-                    else { model.floating.removeAnchor(id) }
-                }
+                model.updateMenuAnchors(from: frames)
             }
             .nibLiquidMode(model.liquidMode)
             .nibSheet(item: sheetBinding) { panel in LibraryPanelView(panel: panel, model: model) }
@@ -622,7 +620,8 @@ struct LibraryRootView: View {
             } else {
                 NibBarGroup(id: "library.controls") {
                     NibIconButton(.search, label: String(localized: "Search Library")) { model.perform(CommandIDs.searchOpen) }
-                    NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }.nibBudAnchor("library.sort")
+                    NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }
+                        .libraryChromeFrame("anchor.library.sort")
                     NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) { model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"]) }
                 }
             }
@@ -637,14 +636,34 @@ struct LibraryRootView: View {
     }
 }
 
-private struct LibraryChromeFrames: PreferenceKey {
+extension LibraryViewModel {
+    /// The root and its full-size droplet container share an origin. Resolve control frames there,
+    /// after custom layout, rather than measuring again inside individual droplets.
+    func updateMenuAnchors(from frames: [String: CGRect]) {
+        var anchors: [String: CGRect] = [:]
+        for id in ["library.new", "library.sort", "library.app"] {
+            if let frame = frames["anchor." + id], !frame.isEmpty, !frame.isInfinite,
+               frame.size.width > 0, frame.size.height > 0,
+               frame.minX.isFinite, frame.minY.isFinite, frame.maxX.isFinite, frame.maxY.isFinite {
+                floating.setAnchor(id, rect: frame)
+                anchors[id] = frame
+            } else {
+                floating.removeAnchor(id)
+            }
+        }
+        // A menu requested before layout remains pending until its source has usable geometry.
+        if menuAnchors != anchors { menuAnchors = anchors }
+    }
+}
+
+struct LibraryChromeFrames: PreferenceKey {
     static var defaultValue: [String: CGRect] = [:]
     static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { _, frame in frame })
     }
 }
 
-private extension View {
+extension View {
     func libraryChromeFrame(_ id: String) -> some View {
         background {
             GeometryReader { geometry in

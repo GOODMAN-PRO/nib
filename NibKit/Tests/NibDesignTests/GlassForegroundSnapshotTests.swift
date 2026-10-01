@@ -14,7 +14,7 @@ final class GlassForegroundSnapshotTests: XCTestCase {
         try assertHostlessForegroundGuarantees()
         guard NibSnapshot.supportsHostedImages else { return }
         for variant in [NibSnapshot.Variant.light, .dark] {
-            for surface in [NibGlassForegroundGallery.Surface.bar, .palette, .deep] {
+            for surface in [NibGlassForegroundGallery.Surface.bar, .palette, .deep, .hud, .standaloneHUD] {
                 let reference = try await capture(surface, glass: false, variant: variant)
                 let rendered = try await capture(surface, variant: variant)
                 let empty = try await capture(surface, showsContent: false, variant: variant)
@@ -108,6 +108,60 @@ final class GlassForegroundSnapshotTests: XCTestCase {
         XCTAssertEqual(NibUIColor.deepBody.resolvedColor(with: dark).cgColor.alpha, 0.86, accuracy: 0.001)
     }
 
+    func testChromeColoursKeepAppAppearanceWhenGlassAdaptsToTheOppositeBackdrop() {
+        for scheme in [ColorScheme.light, .dark] {
+            var app = EnvironmentValues()
+            app.colorScheme = scheme
+            var glass = EnvironmentValues()
+            glass.colorScheme = scheme == .dark ? .light : .dark
+            glass.nibChromeAppearance = NibChromeAppearance(app)
+            for token in [NibColor.label, NibColor.labelSecondary, NibColor.accent, NibColor.warning,
+                          NibColor.onAccent, NibInk.cobalt.color] {
+                XCTAssertEqual(NibChromeColor(token).resolve(in: glass), token.resolve(in: app))
+            }
+            // Ordinary components still follow their local appearance when they are outside a glass host.
+            glass.nibChromeAppearance = nil
+            XCTAssertEqual(NibChromeColor(NibColor.label).resolve(in: glass), NibColor.label.resolve(in: glass))
+        }
+    }
+
+    func testSharedChromeComponentsKeepTheirGlyphsWhenGlassChangesLocalAppearance() throws {
+        let components: [(String, AnyView)] = [
+            ("title", AnyView(NibBarTitle(title: "Physics", subtitle: "Page 1 of 4"))),
+            ("toolbar", AnyView(NibToolbarItem(.search, label: "Search") {})),
+            ("tool", AnyView(NibToolButton(tool: NibTool(id: "pen", label: "Pen", symbol: .pen),
+                                            isSelected: true) {})),
+            ("hud", AnyView(NibHUDText("125%", secondary: "3 of 12"))),
+            ("search", AnyView(NibSearchField(text: .constant(""), prompt: "Find", style: .onDroplet)
+                .frame(width: 240)))
+        ]
+        for variant in [NibSnapshot.Variant.light, .dark] {
+            var app = EnvironmentValues()
+            app.colorScheme = variant.colorScheme
+            let opposite: ColorScheme = variant == .dark ? .light : .dark
+            for (name, component) in components {
+                let reference = try XCTUnwrap(NibSnapshot.image(component, size: size, variant: variant))
+                let adapted = try XCTUnwrap(NibSnapshot.image(
+                    component.environment(\.colorScheme, opposite)
+                        .environment(\.nibChromeAppearance, NibChromeAppearance(app)),
+                    size: size, variant: variant))
+                var cores = 0
+                for y in 100..<140 {
+                    for x in 40..<320 {
+                        let point = CGPoint(x: CGFloat(x), y: CGFloat(y))
+                        let ref = try XCTUnwrap(NibSnapshot.pixel(reference, at: point))
+                        let isCore = variant == .dark ? min(ref.r, ref.g, ref.b) > 252 : max(ref.r, ref.g, ref.b) < 3
+                        guard ref.a > 252, isCore else { continue }
+                        cores += 1
+                        let actual = try XCTUnwrap(NibSnapshot.pixel(adapted, at: point))
+                        XCTAssertEqual(actual, ref, "\(name), \(variant): glass must not recolour the glyph core")
+                    }
+                }
+                XCTAssertGreaterThan(cores, 10, "\(name): sample real full-strength glyphs")
+            }
+        }
+    }
+
     private func assertHostlessForegroundGuarantees() throws {
         if #available(iOS 26.0, *) {
             let host = NibNativeGlass(effect: NibSystemGlass.of(.clear, interactive: true).glass,
@@ -123,7 +177,7 @@ final class GlassForegroundSnapshotTests: XCTestCase {
             let scheme: ColorScheme = dark ? .dark : .light
             let traits = UITraitCollection(userInterfaceStyle: dark ? .dark : .light)
             let ink = UIColor.black, paper = UIColor.white
-            for style in [DropletStyle.bar, .palette, .popover] {
+            for style in [DropletStyle.bar, .palette, .popover, .hud] {
                 let field = DropletField()
                 field.usesSystemGlass = true
                 field.setRest("foreground", CGRect(x: 40, y: 100, width: 280, height: 44), style: style)

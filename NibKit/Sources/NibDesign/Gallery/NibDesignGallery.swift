@@ -100,7 +100,7 @@ public struct NibDesignGallery: View {
 /// Small, deterministic live-glass regression scenes. Foreground references retain identical layout without glass;
 /// blank-glass captures isolate glyph pixels from the material, its rim and its backdrop.
 public struct NibGlassForegroundGallery: View {
-    public enum Surface: CaseIterable { case bar, palette, library, deep }
+    public enum Surface: CaseIterable { case bar, palette, library, deep, hud, standaloneHUD }
     let surface: Surface
     let glass: Bool
     let showsContent: Bool
@@ -142,6 +142,17 @@ public struct NibGlassForegroundGallery: View {
                 NibDropletButton(id: "library.new.button", title: "New", symbol: .plus, kind: .tinted) {}
                     .frame(width: 96)
             }
+        } else if surface == .bar {
+            NibBarGroup(id: "gallery.foreground") {
+                foreground.opacity(showsContent ? 1 : 0)
+            }
+        } else if surface == .hud {
+            NibHUDGroup(id: "gallery.foreground") {
+                foreground.opacity(showsContent ? 1 : 0)
+            }
+        } else if surface == .standaloneHUD {
+            foreground.opacity(showsContent ? 1 : 0)
+                .nibGlass(.clear, interactive: true)
         } else {
             foreground.opacity(showsContent ? 1 : 0)
                 .droplet("gallery.foreground", style: surface == .deep ? .popover : (surface == .palette ? .palette : .bar))
@@ -150,14 +161,17 @@ public struct NibGlassForegroundGallery: View {
 
     private var foreground: some View {
         HStack(spacing: NibSpacing.m) {
-            Image(nib: .pen).font(NibFont.glyph(.bar))
-            Image(nib: .search).font(NibFont.glyph(.bar))
             if surface == .palette {
-                Image(nib: .eraser).font(NibFont.glyph(.bar))
+                NibToolButton(tool: NibTool(id: "pen", label: "Pen", symbol: .pen), isSelected: true) {}
+                NibToolButton(tool: NibTool(id: "eraser", label: "Eraser", symbol: .eraser), isSelected: true) {}
                 ForEach(NibInk.quickSlots, id: \.self) { ink in
                     Circle().fill(ink.color).frame(width: 18, height: 18)
                 }
+            } else if surface == .hud || surface == .standaloneHUD {
+                NibIconButton(.search, label: "Search") {}
+                NibHUDText("125%", secondary: "3 of 12")
             } else {
+                NibToolbarItem(.search, label: "Search") {}
                 NibBarTitle(title: "Physics — Motion", subtitle: "Page 1 of 4")
             }
         }

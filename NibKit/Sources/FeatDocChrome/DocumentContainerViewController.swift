@@ -9,7 +9,7 @@ import NibDesign
 /// Where everything in a document window goes (DESIGN.md §5, §14.2, §14.4). Pure, so it is unit-tested for compact
 /// and regular widths and both sidebar sides.
 /// - Phones, compact-height windows and widths below 600 pt use sheets for sidebars and floating panels.
-/// - From 900 pt sidebars dock and the editor insets so the page stays fully visible; in between they float over it.
+/// - In landscape from 900 pt sidebars dock; in portrait they float over the full editor (§14.4).
 struct ChromeLayout: Equatable {
     enum SidebarPresentation: Equatable {
         case docked, overlay, sheet
@@ -97,7 +97,7 @@ struct ChromeLayout: Equatable {
             let proposedMinX = left?.maxX ?? 0
             let editorMinX = assistantTrailing && editorMaxX - proposedMinX < ChromeLayout.minimumDockedEditorWidth
                 ? 0 : proposedMinX
-            if (assistantTrailing && right != nil) || (anyOpen && width >= ChromeLayout.dockingWidth
+            if (assistantTrailing && right != nil) || (anyOpen && width > height && width >= ChromeLayout.dockingWidth
                 && editorMaxX - editorMinX >= ChromeLayout.minimumDockedEditorWidth) {
                 presentation = .docked
                 editor = CGRect(x: editorMinX, y: 0, width: editorMaxX - editorMinX, height: height)
@@ -149,8 +149,8 @@ struct ChromeLayout: Equatable {
         }
     }
 
-    /// The measured options bar is fused to the palette with a 1 pt overlap. Reserve its whole cross-axis
-    /// footprint, even when the options collapse during scrolling, so the fitted page does not jump under the pen.
+    /// Side palettes reserve only their rail for page fitting. Their horizontal options arm is a local floating
+    /// occlusion, never a full-height editor inset. Keep its measured footprint for floating chrome clearance.
     mutating func avoidPalette(_ dock: NibPaletteDock, thickness: CGFloat, optionsHeight: CGFloat = 0,
                                optionsSize: CGSize? = nil) {
         let region = DropletDockModel.region(size: toolbarContentSize, safeArea: EdgeInsets(), compact: isCompact)
@@ -179,10 +179,23 @@ struct ChromeLayout: Equatable {
             }
             occupied = palette.union(frame)
         }
+        let before = editorInsets
         avoidPalette(occupied: occupied, edge: dock.edge)
+        if dock.isVertical {
+            // An overlaid navigator moves the palette but must not become an implicit fitted-page inset.
+            // Reserve one rail at the editor edge; the navigator and projecting options still float over paper.
+            let leading = presentation == .overlay && left != nil
+                ? thickness + NibMetrics.chromeInset + NibSpacing.l + before.left
+                : palette.maxX + NibSpacing.l - editor.minX
+            let trailing = presentation == .overlay && right != nil
+                ? thickness + NibMetrics.chromeInset + NibSpacing.l + before.right
+                : editor.maxX - palette.minX + NibSpacing.l
+            editorInsets.left = dock.edge == .leading ? max(before.left, leading) : before.left
+            editorInsets.right = dock.edge == .trailing ? max(before.right, trailing) : before.right
+        }
     }
 
-    /// Accepts the union in container coordinates; both overlay layout and editor fit/reveal use this same bound.
+    /// Accepts an occupied bound in container coordinates; side-rail fitting is separated by the caller above.
     mutating func avoidPalette(occupied: CGRect, edge: NibDock) {
         guard !occupied.isNull, !occupied.isEmpty else { return }
         let gap = NibSpacing.l
@@ -691,6 +704,22 @@ enum PresentedSheet: Hashable {
     }
 }
 
+/// F016 renders a drawing palette only for notebook and whiteboard editors. A registered toolbar factory can
+/// return EmptyView for other documents, so its presence alone must never reserve space (DESIGN.md §14.17).
+enum ChromePalettePolicy {
+    static func reservesSpace(kind: DocumentKind, readOnly: Bool, hasToolbar: Bool,
+                              bottomAssistant: Bool, detent: AssistantDetent) -> Bool {
+        hasToolbar && !readOnly && (kind == .notebook || kind == .whiteboard)
+            && (!bottomAssistant || detent == .medium)
+    }
+
+    /// Remove the underlying droplets while a compact sheet is visible, including its options and buds.
+    /// This is a rendering decision only: presenting/dismissing a sheet must not refit or move the paper.
+    static func showsPalette(reservesSpace: Bool, compact: Bool, sheet: PresentedSheet?) -> Bool {
+        reservesSpace && !(compact && sheet != nil)
+    }
+}
+
 // MARK: - View controller
 
 /// `ui.screens.documentContainer`: the editor view controller under the window's one droplet container, which holds
@@ -911,7 +940,7 @@ struct ChromeRootView: View {
             }
         }
         .background {
-            if toolbar != nil, !model.snapshot.readOnly {
+            if reservesPaletteSpace(layout) {
                 ChromeOptionsMeasurement(chrome: chrome, live: live, tool: model.snapshot.tool,
                                          kind: model.snapshot.kind) { tool, size in
                     if optionsSizes[tool] != size { optionsSizes[tool] = size }
@@ -938,7 +967,7 @@ struct ChromeRootView: View {
                                   verticalSizeClass: geometry.verticalSizeClass,
                                   assistantTrailing: state.tabs[.right] == PanelIDs.assistant,
                                   assistantDetent: state.assistantDetent)
-        if paletteFits(layout), toolbar != nil, !model.snapshot.readOnly {
+        if reservesPaletteSpace(layout) {
             // Read F016's existing setting; do not redeclare its key or depend on the feature's private runtime.
             let saved = chrome.app.settings.json("toolbar.dock")
             let edge = saved?["edge"]?.stringValue.flatMap { NibDock(commandValue: $0) }
@@ -959,8 +988,15 @@ struct ChromeRootView: View {
 
     /// At the 90% assistant detent there is no band left for a palette plus options and a writable viewport.
     /// Restore it at 45% or when the assistant closes; never lay it across the dock's header or the page's last line.
-    private func paletteFits(_ layout: ChromeLayout) -> Bool {
-        layout.assistantBottom == nil || state.assistantDetent == .medium
+    private func reservesPaletteSpace(_ layout: ChromeLayout) -> Bool {
+        ChromePalettePolicy.reservesSpace(kind: model.snapshot.kind, readOnly: model.snapshot.readOnly,
+                                         hasToolbar: toolbar != nil, bottomAssistant: layout.assistantBottom != nil,
+                                         detent: state.assistantDetent)
+    }
+
+    private func showsPalette(_ layout: ChromeLayout) -> Bool {
+        ChromePalettePolicy.showsPalette(reservesSpace: reservesPaletteSpace(layout), compact: layout.isCompact,
+                                        sheet: PresentedSheet.current(state, compact: layout.isCompact))
     }
 
     private var liquidMode: NibLiquidMode {
@@ -989,7 +1025,7 @@ struct ChromeRootView: View {
             sidebars(layout)
             ChromeOverlayLayer(model: overlays, inking: inking, region: layout.overlayRegion,
                                keyboardFrame: geometry.keyboardFrame)
-            if let toolbar, paletteFits(layout) {
+            if let toolbar, showsPalette(layout) {
                 // Full height between open sidebars; padded by the safe area the root ignores (see ChromeLayout).
                 toolbar
                     .environment(\.horizontalSizeClass, layout.isCompact ? .compact : .regular)

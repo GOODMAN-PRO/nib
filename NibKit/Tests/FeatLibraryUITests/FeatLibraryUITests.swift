@@ -41,7 +41,7 @@ final class FeatLibraryUITests: XCTestCase {
                     let anchors = compact ? ["library.new"] : ["library.new", "library.sort"]
                     var registeredFrames: [String: CGRect] = [:]
                     var drawnIDs: Set<String> = []
-                    var registeredAnchors: Set<String> = []
+                    var registeredAnchors: [String: CGRect] = [:]
                     var registeredStyles: [String: DropletStyle] = [:]
                     var presentations: [String: DropletPresentation] = [:]
                     // Use the production controls and their custom layout, over the worst-case contrast backdrop.
@@ -66,11 +66,14 @@ final class FeatLibraryUITests: XCTestCase {
                                         registeredFrames[id] = field.visualFrame(id)
                                         if field.node(id).presentation.isDrawn { drawnIDs.insert(id) }
                                     }
-                                    registeredAnchors = Set(field.worldAnchors.keys)
+                                    registeredAnchors = field.worldAnchors
                                 }
+                                NibFloatingLayer(host: model.floating)
                             }
                         }
                     }
+                    .coordinateSpace(name: "library.chrome")
+                    .onPreferenceChange(LibraryChromeFrames.self) { model.updateMenuAnchors(from: $0) }
                     .nibLiquidMode(mode)
                     .environment(\.horizontalSizeClass, compact ? .compact : .regular)
                     let image = try await hostlessLayoutImage(view, size: size, variant: variant)
@@ -132,11 +135,107 @@ final class FeatLibraryUITests: XCTestCase {
                             XCTAssertLessThan(bodyPixel.r, 225, "\(name): Clear must draw over white")
                         }
                     }
-                    XCTAssertTrue(registeredAnchors.isSuperset(of: anchors), "\(name): bud anchors must follow placement")
+                    XCTAssertTrue(Set(registeredAnchors.keys).isSuperset(of: anchors), "\(name): bud anchors must follow placement")
+                    XCTAssertEqual(try XCTUnwrap(registeredAnchors["library.new"]), tinted,
+                                   "\(name): New must anchor to its actual button")
+                    if !compact {
+                        let sort = try XCTUnwrap(registeredAnchors["library.sort"])
+                        XCTAssertEqual(sort.midX, clear.midX, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.midY, clear.midY, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.width, NibMetrics.hitTarget, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.height, NibMetrics.hitTarget, accuracy: 0.5, name)
+                    }
                 }
             }
         }
     }
+    func testLibraryRootMenusRestBesideTheirActualSources() async throws {
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834)] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                for mode in [NibLiquidMode.full, .off] {
+                    for menu in ["new", "sort"] {
+                        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+                        model.sidebarVisible = false
+                        model.liquidMode = mode
+                        // Exercise a request before the first layout as well as the settled presentation.
+                        model.menu = menu
+                        let source = "library." + menu, popover = "library." + menu + ".menu"
+                        var capturedField: DropletField?
+                        var anchorFrames: [String: CGRect] = [:]
+                        var presentedFrames: [String: CGRect] = [:]
+                        var menuIsDrawn = false
+                        h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+                            id: "test.menuGeometry", owner: "test", placement: .center, surface: .none,
+                            isInteractive: false) { _ in
+                                AnyView(LibraryChromeFieldProbe(
+                                    ids: ["library.controls", "library.new.button", popover],
+                                    anchors: ["library.new", "library.sort"]) { capturedField = $0 })
+                            })
+                        _ = try await hostlessLayoutImage(LibraryRootView(model: model), size: size,
+                                                          variant: variant, settlePasses: mode == .full ? 60 : 10) {
+                            guard let field = capturedField else { return }
+                            anchorFrames = field.worldAnchors
+                            for id in ["library.controls", "library.new.button", popover] {
+                                presentedFrames[id] = field.visualFrame(id)
+                            }
+                            menuIsDrawn = field.node(popover).presentation.isDrawn
+                        }
+                        let name = "\(menu)-\(size)-\(variant.rawValue)-\(mode.rawValue)"
+                        let anchor = try XCTUnwrap(anchorFrames[source], name)
+                        let controls = try XCTUnwrap(presentedFrames["library.controls"], name)
+                        let newButton = try XCTUnwrap(presentedFrames["library.new.button"], name)
+                        XCTAssertEqual(try XCTUnwrap(anchorFrames["library.new"]), newButton, name)
+                        let sort = try XCTUnwrap(anchorFrames["library.sort"], name)
+                        XCTAssertEqual(sort.midX, controls.midX, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.midY, controls.midY, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.size.width, NibMetrics.hitTarget, accuracy: 0.5, name)
+                        XCTAssertEqual(sort.size.height, NibMetrics.hitTarget, accuracy: 0.5, name)
+                        XCTAssertGreaterThan(anchor.minX, size.width / 2, name)
+                        XCTAssertLessThan(anchor.maxY, size.height / 2, name)
+
+                        let frame = try XCTUnwrap(presentedFrames[popover], name)
+                        XCTAssertTrue(menuIsDrawn, name)
+                        XCTAssertEqual(frame.width, NibMetrics.popoverWidth, accuracy: 0.5, name)
+                        XCTAssertGreaterThan(frame.height, 0, name)
+                        XCTAssertEqual(frame.minY - anchor.maxY, NibMetrics.popoverGap, accuracy: 0.5, name)
+                        let inset = NibMetrics.chromeInset
+                        let expectedX = min(anchor.midX, size.width - inset - frame.width / 2)
+                        XCTAssertEqual(frame.midX, expectedX, accuracy: 0.5, name)
+                        XCTAssertGreaterThanOrEqual(frame.minX, inset - 0.5, name)
+                        XCTAssertLessThanOrEqual(frame.maxX, size.width - inset + 0.5, name)
+                        XCTAssertGreaterThanOrEqual(frame.minY, inset - 0.5, name)
+                        XCTAssertLessThanOrEqual(frame.maxY, size.height - inset + 0.5, name)
+                    }
+                }
+            }
+        }
+    }
+
+    func testLibraryMenuWaitsForUsableSourceGeometry() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        model.menu = "new"
+        model.updateMenuAnchors(from: ["anchor.library.new": .zero])
+        var capturedField: DropletField?
+        let view = NibDropletContainer {
+            LibraryBuds(model: model)
+            LibraryChromeFieldProbe(ids: [], anchors: []) { capturedField = $0 }
+            NibFloatingLayer(host: model.floating)
+        }.nibLiquidMode(.off)
+        _ = try await hostlessLayoutImage(view, size: CGSize(width: 834, height: 1194), variant: .light)
+        let field = try XCTUnwrap(capturedField)
+        XCTAssertFalse(field.node("library.new.menu").presentation.isDrawn)
+        XCTAssertNil(model.menuAnchors["library.new"])
+        XCTAssertNil(model.floating.anchors["library.new"])
+        XCTAssertEqual(model.menu, "new", "Keep the request pending until layout publishes its source")
+
+        model.updateMenuAnchors(from: ["anchor.library.new": CGRect(x: 700, y: 16, width: 96, height: 44)])
+        XCTAssertNotNil(model.menuAnchors["library.new"])
+        XCTAssertNotNil(model.floating.anchors["library.new"])
+        model.updateMenuAnchors(from: [:])
+        XCTAssertTrue(model.menuAnchors.isEmpty)
+        XCTAssertNil(model.floating.anchors["library.new"], "A removed control must not retain a stale source")
+    }
+
     func testLibraryRootChromeSnapshots() async throws {
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)
@@ -193,7 +292,8 @@ final class FeatLibraryUITests: XCTestCase {
     /// Native glass is checked structurally; off-mode pixels and UIKit navigation/scroll views
     /// can be captured directly from their laid-out layers.
     private func hostlessLayoutImage<V: View>(_ view: V, size: CGSize,
-                                             variant: NibSnapshot.Variant) async throws -> UIImage {
+                                             variant: NibSnapshot.Variant, settlePasses: Int = 5,
+                                             inspect: () -> Void = {}) async throws -> UIImage {
         let host = UIHostingController(rootView: view.ignoresSafeArea()
             .environment(\.colorScheme, variant.colorScheme)
             .environment(\.dynamicTypeSize, variant.dynamicTypeSize))
@@ -203,11 +303,12 @@ final class FeatLibraryUITests: XCTestCase {
         defer { window.isHidden = true; window.rootViewController = nil }
         host.view.frame = window.bounds
         host.view.backgroundColor = .clear
-        for _ in 0..<5 {
+        for _ in 0..<settlePasses {
             host.view.setNeedsLayout()
             host.view.layoutIfNeeded()
             try await Task.sleep(for: .milliseconds(20))
         }
+        inspect()
         host.view.layer.displayIfNeeded()
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1

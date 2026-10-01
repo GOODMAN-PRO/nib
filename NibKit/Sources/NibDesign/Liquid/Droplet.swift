@@ -218,20 +218,20 @@ struct DropletBodyModifier: ViewModifier {
             let dy = (presentation.bodySize.height - presentation.restSize.height) / 2
             NibNativeGlass(effect: field.isFrozen ? .identity : style.systemGlass, shape: shape) {
                 content
-                    .foregroundStyle(.primary)
                     .padding(.horizontal, dx)
                     .padding(.vertical, dy)
-                    .background {
-                        if field.isFrozen {
-                            shape.fill(NibGlassBodyTint.color(style.glassKind, paperShare: presentation.paperShare,
-                                                             colorScheme: colorScheme))
-                        } else {
-                            shape.fill(NibGlassBodyTint.systemUnderlay(style.glassKind, colorScheme: colorScheme,
-                                                                      paperShare: presentation.paperShare))
-                        }
-                    }
             }
             .modifier(GlassIDModifier(id: id, namespace: namespace))
+            .background {
+                // The fill must be a backdrop of the returned glass host, never part of its foreground.
+                if field.isFrozen {
+                    shape.fill(NibGlassBodyTint.color(style.glassKind, paperShare: presentation.paperShare,
+                                                     colorScheme: colorScheme))
+                } else {
+                    shape.fill(NibGlassBodyTint.systemUnderlay(style.glassKind, colorScheme: colorScheme,
+                                                              paperShare: presentation.paperShare))
+                }
+            }
             .overlay {
                 if presentation.rim > 1.001 {
                     NibLiftRim(cornerRadius: shape.cornerRadius, boost: presentation.rim - 1)
