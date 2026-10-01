@@ -1,0 +1,89 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatBackup/BackupWriter.swift: BackupWriter.isCache (lines 44-50), used by archive() at line 73",
+      "problem": "isCache matches bare path components anywhere in the user's library tree: 'cache', 'caches', 'thumbnails', 'previews', 'tmp', 'temp'. A user folder named 'Temp', 'Previews' or 'Cache' (or a template group or element collection with that name under .nib-library) is skipped with skipDescendants. Every notebook inside it is silently left out of the manual ZIP, and the backup still reports success. The documented library and package layout (ARCHITECTURE 4.1/4.2) has no cache folders, so this rule only ever drops user data.",
+      "fix": "Exclude only junk files (.DS_Store, *.partial, *.tmp file names, never directories) and, if one is ever defined, an explicit library-relative cache prefix such as '.nib-library/caches/'. Never match bare folder names in the user tree. Add a test where 'Temp/Notes.nibnote/doc.x.json' and 'Previews/A.nibnote/...' appear in the archive."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatBackup/FeatBackupFeature.swift: BackupEngine.committed (156-168), schedule (280-286), emit (273-277)",
+      "problem": "committed is a synchronous commit observer, so it runs inside every stroke commit on the main actor. When a destination is set, each commit does all of this: app.services.library.allNodes() over the whole catalog, eligible() (BackupSettings.read, names(prefix:) and a diacritic-insensitive substring match for every node and every exclusion), a full-queue JSON encode and atomic write through persist(), a synchronous BGTaskScheduler.submit through scheduleBackgroundTask, and two events. Each event makes the settings page and F070's CloudStatusPanel re-query. After backup.configure the whole library sits in the queue for 12 h, so with 5,000 documents every stroke writes about 5,000 entries to disk. This breaks the 2 ms stroke-finalize budget (ARCHITECTURE 20) and the P-095 battery profile this feature owns.",
+      "fix": "In committed: return early unless some mutation passes BackupQueue.triggers. Resolve only changes.documents with library.node(_:) and test the exclusion on those nodes, not allNodes(). When every triggering document is already queued, only rotate tokens in memory. Coalesce persist(), schedule() and emit() with one short debounce (about 2 s, a single pending Task). Call app.scheduleBackgroundTask only when the computed due date changes. Add a test that 1,000 commits over a 5,000-node fake library stay under the budget (XCTAssertLessThan(elapsed, budget * 4))."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatBackup/FeatBackupFeature.swift: contentStamp (204-224), called from libraryChanged (189-190) for every rescanned document and from run (364) after every backed-up document",
+      "problem": "contentStamp is a @MainActor method. It calls persistence.loadHead and then persistence.loadItems for every live page, and each call decodes, merges and JSON-encodes the page synchronously on the main actor. A 500-page notebook means 500 page decodes (the budget allows up to 50 ms each, far above the 16 ms main-actor rule in ARCHITECTURE 14). This runs after every automatic backup of that document, including the foreground 30 s tick while the user is writing, and once per changed document on each library.changed after a WebDAV or folder refresh. Contracts-v2 already provides DocumentPersistence.contentRevision(doc, page:), which gives a page's stored max revision without loading its items, for exactly this kind of validity check.",
+      "fix": "Store each page's contentRevision in BackupContentStamp. On a rescan or after a backup, load and hash items only for pages whose contentRevision differs from the stored one, or is nil. Compare those pages' item hashes as now, so deletion-only changes are still ignored. Skip the post-backup stamp entirely when no page revision moved. Add a test with a page whose revision is unchanged and assert that loadItems is not called (counting fake persistence)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatBackup/FeatBackupFeature.swift: start() didEnterBackground/didBecomeActive observers (136-146) and manual() catch block (440-445)",
+      "problem": "The spec says manual backup is 'foreground; restarts if interrupted'. On backgrounding the engine only cancels the archive and sets manualInterrupted. On return, didBecomeActive only calls tick(). Nothing restarts the manual backup, and manualInterrupted is not even shown on the settings page. The user has to notice the warning and start it again by hand, so the acceptance criterion is not implemented.",
+      "fix": "In the didBecomeActive observer: if manualInterrupted && !running, clear the flag and call app.perform(CommandIDs.backupManual) (user principal, foreground, so user presence holds). Inject the lifecycle (or expose a resumeInterruptedManual() hook) so a test can simulate background, then active, and assert a second archive run starts."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatBackup/FeatBackupFeature.swift: manual() lines 431-435",
+      "problem": "After building the ZIP, manual() copies the whole archive into the temporary asset store (Data(contentsOf:.mappedIfSafe) then putTemporary) before it even checks ctx.navigator and shows the save picker. For a multi-GB library this doubles peak disk use (triples it with the Files export copy). On a nearly full device putTemporary throws ENOSPC and the manual backup fails, although a valid ZIP was already built. The copy then lingers for an hour. Scenario: 4 GB of PDFs with 6 GB free means the ZIP succeeds, the temporary copy fails, and there is no backup.",
+      "fix": "Check ctx.navigator before archiving. When a navigator exists (the user flow), present saveArchive with the archive URL and return {name, skippedLocked, restoreCommand} without putTemporary. Create the tmp: asset only for callers without a navigator that need it, and then fail early with a clear storage error rather than after the archive is built."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBackup/FeatBackupFeature.swift: run() line 364",
+      "problem": "The baseline stamp is computed from current persistence after the export and upload. If folder or WebDAV sync rewrites an unopened document during the upload (no commit is fired), the saved baseline includes content that is not in the uploaded file. The entry is acknowledged, and the next rescan sees no difference, so that content is never backed up until it changes again.",
+      "fix": "Compute the stamp right after persistence.flush and before export.run. Save it, and acknowledge the entry, only after a successful delivery, so a change during the upload is detected by the next rescan."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBackup/FeatBackupFeature.swift: libraryChanged line 192",
+      "problem": "A content change is queued only when an old stamp exists ('if let old, fresh.hasChanges(since: old)'). Scenario: run backup.clearQueue before the first automatic run (or have a document that was never stamped), then another device edits an unopened document. The rescan saves the new stamp as the baseline and queues nothing, so the edit never reaches the backup.",
+      "fix": "Treat a missing old stamp as changed and enqueue the document, or write baselines for every eligible document in clearQueue and configurationChanged."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBackup/BackupWriter.swift: safeName (19-25), relativePath (40), write -> components(relativePath, allowEmpty: false) (135)",
+      "problem": "safeName truncates to 100 Characters, but components() rejects any component over 200 UTF-8 bytes, and the file name also carries '-<id>.nibnote.zip'. A 63-character CJK title (or a long emoji title, or a long folder name) produces a component over 200 bytes. Every folder-destination run then fails for that document with invalidParams, and the entry stays queued with a permanent error.",
+      "fix": "Truncate safeName by UTF-8 byte length (for example 150 bytes) at a Character boundary, so the id suffix and extension always fit. Add a test with a 120-character CJK title."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBackup/BackupWriter.swift: archive() lines 63-110",
+      "problem": "Packages are enumerated first and then read file by file, each under its own coordinated read. A sync write between enumeration and reading (for example a new assets/<sha>.png plus an updated pages/<p>/<dev>.nibpage) can produce a ZIP whose page references an asset that is missing from it. Restoring that ZIP gives a broken image.",
+      "fix": "For each package directory, take one coordinated read of the package URL, and enumerate and add all of its entries inside that block (or copy the package to staging under that one read and archive the copy)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBackup/FeatBackupFeature.swift: configurationChanged (238-242) with BackupQueue.isDue",
+      "problem": "Enabling automatic backup queues the whole library with queuedAt = now and lastAttempt = nil, so the first pass is due only a full interval later. With the default setting, a user who turns on backup has no backup for 12 hours unless they tap Back Up Now.",
+      "fix": "When the destination, format or folder changes, set queue.lastAttempt = now - BackupQueue.interval(frequent:), so the initial pass runs at the next foreground tick or background window. Keep the current behaviour for exclusion-only and frequency-only changes. Add a test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBackup/FeatBackupFeature.swift: manual() catch (446); BackupCommands.swift BackupSystemPicker cancel paths (205-206)",
+      "problem": "Cancelling the Files save sheet throws NibError(.userDenied). manual() passes it to report(), which sets state 'error' and a persistent 'Files selection cancelled' warning banner. F070's Cloud & Backup panel also shows this as a backup failure.",
+      "fix": "In manual(), catch NibError with code .userDenied: set state to 'idle' and error to nil, emit(), and rethrow without report()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBackup/BackupQueue.swift: BackupSettings.declare/write (120-153)",
+      "problem": "backup.format and the backup.exclusion.* entries are synced, but destination, folder and frequent are device-local, and nothing observes synced changes. Changing the format on device B silently changes device A's format without regenerating A's queue, so A ends up with a mix of nib-only and PDF backups. Backups are otherwise per device (per-device queue and destination).",
+      "fix": "Declare backup.format as device-local like the other backup keys. Alternatively, observe settings changes for backup.format and the backup.exclusion. prefix and call engine.configurationChanged()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBackup/BackupSettingsPage.swift lines 65-68 and 85-90",
+      "problem": "During a manual backup the determinate NibProgressBar is drawn in the 'This device' section, not where the action was started. DESIGN.md 14.18 says export and import loading is 'a determinate 3 pt bar where the action was started'.",
+      "fix": "While the manual backup runs (status.running with the manual flag, or a 'manual' field added to BackupStatusInfo), show NibProgressBar(value: status.progress) under the Create Library Backup button. Keep the automatic run's bar in the 'This device' section."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatBackup/BackupCommands.swift: BackupConfigure.run (50-81)",
+      "problem": "A webdav destination is accepted without checking that WebDAV is configured or that the backup folder lies outside the WebDAV library folder. Every later run then fails inside webdav.put (unavailable, or invalidParams 'path is inside the synced library folder'), after the whole library has been queued.",
+      "fix": "For kind 'webdav', before writing settings run ctx.execute(CommandIDs.webdavPut, {path: <folder>/probe, file: 'tmp:probe'}) as a dry run, or check webdav.status. Turn a failure into invalidParams at $.destination with a hint to configure WebDAV or choose another folder."
+    }
+  ]
+}
