@@ -1,0 +1,16 @@
+{
+  "feature": "F086",
+  "commit": "a8c58e954124ca7efacd9ba4469a1cf847de74f2",
+  "gaps": [
+    {
+      "owner": "NibContracts / F084",
+      "request": "Add NibSettings.aiMaxSteps = SettingKey(\"ai.maxSteps\", default: 40, synced: true), schema .int(min: 1, max: 100). AgentService must clamp request.maxSteps to this setting. Add the request-level integration test in the owner once wired.",
+      "current": "F086 declares and writes the shared synced name, tests synced typed readback, and removes the fixed-limit UI stub."
+    },
+    {
+      "owner": "NibContracts / F083",
+      "request": "Expose AIProviderStore.credentialsMissing(_:) using the persisted hasKey flag and add a throwing durable delete API without breaking existing conformers. F086 can then use the authoritative credential status and report persistence failures.",
+      "current": "F086 repairs its device marker whenever Keychain contains a key and retains deletion/key-removal checks; the current nonthrowing store contract cannot prove persistence succeeded."
+    }
+  ]
+}

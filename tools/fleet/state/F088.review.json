@@ -1,0 +1,83 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIMath/MathTutor.swift MathTutor.teacherHints (L79-88); AIMathCommands.swift L53-75; Tests/FeatAIMathTests/MathTutorTests.swift L85-103",
+      "problem": "S-070 teacher-approved hints are wired to an answer-zone shape that F099 never produces. The code accepts only custom items with owner \"teacher\", type \"answerZone\" and data.revealedHintCount/hintsRevealed. F099 (spec on origin/main and origin/feat/F099 AnswerZones.swift L24-25, L79-82) stores zones as owner \"nib.answerZone\", type \"zone\", data {hints, revealed}. A real zone therefore always fails the check, and Teach Me falls through to math.recognize on the zone ref, which F060 rejects ('Math conversion accepts handwriting only'). The tests use the invented shape, so they pass anyway. After a lesson starts, the teacher hints also disappear from the UI, because they render only in the review view.",
+      "fix": "Match owner == \"nib.answerZone\" && type == \"zone\", and read data.hints and data.revealed. Replace the test fixture with F099's AnswerZone JSON. Keep the teacher-hint section (with Reveal Teacher Hint) visible in the explanation view as well."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIMath/AIMathCommands.swift verify (L161-165); Tests/FeatAIMathTests/MathTutorTests.swift L112-125",
+      "problem": "Matrix answers are never verified against the real evaluator. F061's math.evaluate returns MathAnswer {kind:\"matrix\", matrix:[[...]], answer, exact}, with value absent for matrices. verify reads result[\"value\"] ?? result[\"result\"] ?? result, so for a matrix it gets the whole object, isNumeric is false and the result is always .unverified. S-024 promises on-device checking of matrices. The test passes only because its fake returns [\"value\": [[1,2],[3,4]]], which is not F061's shape.",
+      "fix": "Decode math.evaluate's MathAnswer fields. Compare `matrix` when kind == \"matrix\", `value` for kind \"value\", and `solutions[].value` / `values` for kind \"solutions\". Update every math.evaluate fake to return F061's MathAnswer JSON ({kind, answer, latex, exact, value?/matrix?/solutions?})."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIMath/MathTutor.swift close (L190-192); AIMathCommands.swift L157, L165, L179-182",
+      "problem": "The comparison tolerance is 1e-9 relative, so correct rounded answers are reported as wrong. An AI answer of \"1.414\" for \\sqrt{2} or \"0.333\" for 1/3 shows 'The AI answer failed the on-device check'. A student typing x=0.33 for 3x=1 gets 'Your answer does not satisfy the problem'. F061's numeric calculus results (exact:false, e.g. definite integrals) can also miss 1e-9, so a correct '1/3' for \\int_0^1 x^2dx can be flagged as a mismatch.",
+      "fix": "Make the comparison precision-aware. Derive the tolerance from the candidate text (half a unit in the last given decimal place, e.g. 5e-4 for '1.414'), and loosen it to about 1e-6 relative when math.evaluate reports exact == false. For assignments, compare the residual |lhs-rhs| against the precision propagated from the given digits. Add tests for rounded decimals and numeric integrals."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIMath/AIMathCommands.swift verify (L143-171); MathTutor.swift assignments/numericValue (L161-176)",
+      "problem": "For most equations the Teach Me answer check cannot run, so the 'hint -> answer check' criterion is mostly unverifiable. A bare number for an equation ('3' for 2x=6) skips the assignment path, and the equation contains '=', so the result is .unverified. Multiple roots ('x=2, x=3' or 'x=2 or x=3' for x^2-5x+6=0) are rejected by assignments() because of the duplicate variable and are labelled 'Symbolic answer'. A handwritten question with a trailing '=' ('2+2=', which F061 supports) is never verified. The reverse case is also wrong: answer 'x=999' for '2+2=4' verifies, because unused assignments are accepted.",
+      "fix": "For equations and systems, call math.evaluate on the equation text (system lines joined with newlines) and compare the candidate against the returned solutions[].value / values as a set. The candidate can be a bare number when there is one unknown, assignments, or a list of roots. Strip a trailing '=' before evaluating a question. Require every assigned variable to appear in the problem. Classify numeric multi-root answers as numeric, not symbolic."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIMath/FeatAIMathFeature.swift menu params (L19-32); AIMathCommands.swift recognize (L63-67, L86-89)",
+      "problem": "The 'PDF question' and typed-input sources are not implemented. Every ref goes straight to math.recognize, which (F060 MathSelection.load strokesOnly) accepts only handwriting stroke item refs. The .pageLongPress and .documentMore entries with no selection send a page ref, which fails with 'Math needs item refs'. The .textSelection entry sends the text/PDF ref and ignores MenuContext.textRange. A lassoed math item (which already holds LaTeX) or text box fails with 'accepts handwriting only'. The object-menu entry is also visible for images, shapes and stickers (isVisible checks only doc != nil).",
+      "fix": "Route each ref by kind during action=recognize. Send stroke items to math.recognize. Read math items' LaTeX and text items' text through query.get, cut to textRange, which the menu should pass as a param. Read PDF and page refs through recognize.pageText (blocks with source pdf/scan/typed, filtered to the lasso bbox) or pdf.text. Gate isVisible on itemKinds containing stroke/math/text, or a page with PDF/scan text."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIMath/SolvePanel.swift init/@StateObject (L100-112), .task (L142)",
+      "problem": "Opening the panel again shows stale content. F017's panel.open updates PanelContext.params for an already-open floating panel, but SolvePanel creates its model once in @StateObject, and the .task runs once. Choosing Solve on a second lassoed problem, or Teach Me while the Solve panel is open, keeps the first problem's refs, mode and lesson, and the new selection is silently ignored.",
+      "fix": "Key the panel content by its params, e.g. an inner SolvePanelContent(context:).id(context.params.jsonString()). Alternatively, use .onChange(of: context.params) to reset model.refs, state.mode and latex and run .recognize again. Add a test that reopens with different params."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIMath/AIMathCommands.swift L45-50, validate (L132-141)",
+      "problem": "When a caller supplies new latex with an existing state, the equations are replaced but plan, verification, revealed and hintCount are kept. An AI or plugin call such as {latex:new, action:reveal, state:old} returns the old answer marked 'verified' for a different problem. The verification value in the caller-supplied state is trusted without being recomputed.",
+      "fix": "If the parsed equations differ from state.equations, reset plan, verification (to .unverified), hintCount, expanded, revealed and feedback. Ignore or recompute the incoming state.verification instead of echoing it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIMath/AIMathCommands.swift L101-116",
+      "problem": "Better Explanation asks the model to return the whole hint list and answer again, then replaces both. Hints the student already saw can change, and the final answer can change without notice.",
+      "fix": "Ask for a single replacement hint at index hintCount-1 (schema {hint}) and put it into the existing plan.hints. Keep plan.answer unchanged, and reject the response if it contains a different answer."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIMath/SolvePanel.swift L168, L197, L205, L211, L226",
+      "problem": "Formulas (equations, answer, step detail) are set in NibFont.body as raw LaTeX. DESIGN.md §4.1 reserves NibFont.math for 'Formulas in the assistant'. VoiceOver reads backslash commands aloud ('backslash frac ...').",
+      "fix": "Use NibFont.math for equations and the answer. Give each formula an accessibilityLabel with a spoken form, either a small LaTeX-to-speech mapping or a plain-text 'spoken' field requested in the JSON protocol."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIMath/SolvePanel.swift L146-156, L182, L218-231, L239",
+      "problem": "Several items fail the Slop checklist. Button labels are not verb + object: 'Continue', 'Next Hint', 'Better Explanation', 'Alternative Method'. The panel shows what it reads as plain caption text rather than NibChip(.context) chips (Trust row). 'Selected problem · 1 sources' is not pluralised. The 'Teacher-approved hints' heading lacks the .isHeader trait.",
+      "fix": "Rename the buttons, e.g. 'Solve Problem' / 'Start Lesson', 'Show Next Hint', 'Explain Differently', 'Try Another Method'. Show the sources as NibChip(style: .context). Use a pluralised localized string. Add .accessibilityAddTraits(.isHeader) to the teacher-hints heading."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIMath/SolvePanel.swift run (L42-63), L129; AIMathCommands.swift equations (L123-130)",
+      "problem": "Every local toggle (expand a step, next hint, reveal) sets busy, disables the whole panel and flashes 'Checking the maths…' for a pure state transition. The warning that F060's math.recognize returns ('On-device recognition handles simple maths. Check each line…') is discarded, so users are never told to double-check offline recognition.",
+      "fix": "Show the trace row and disable the panel only for actions that recognise, call the AI or evaluate (recognize, solve, alternative, explain, check). Carry recognition `warning`/`source` into MathSession and show it as a NibBanner above the equation list."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIMath/AIMathCommands.swift L88-113; SolvePanel.swift L49-51",
+      "problem": "Cancellation is checked only after ai.complete returns. If the panel is closed while recognition or evaluation is still running, the provider request is still sent and uses the user's tokens. The panel Task also turns weak self into a strong reference for the whole await.",
+      "fix": "Call try Task.checkCancellation() before ai.complete and between the math.evaluate calls in verify. In the panel Task, capture only the params and re-acquire self after the await before publishing."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatAIMathTests/*",
+      "problem": "The tests use fake dependency outputs that do not match the real contracts (matrix 'value', answer-zone owner 'teacher'), which is why the majors above pass CI. They do not cover menu param building (page fallback, textSelection), reopening the panel, rounded-decimal tolerance, a bare-number answer to an equation, or teacher hints in F099's shape. The snapshot test only checks the image width.",
+      "fix": "Build fakes from F060 MathRecognition {lines, source, warning}, F061 MathAnswer and F099 AnswerZone JSON. Add the missing cases above. Snapshot the teacher-hint and error-banner states too."
+    }
+  ]
+}
