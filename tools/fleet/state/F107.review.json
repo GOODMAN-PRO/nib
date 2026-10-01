@@ -1,0 +1,89 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/FeatMathGraphFeature.swift:38-43 (KeyCommandDescriptor mathgraph.insert)",
+      "problem": "Insert Graph is bound to Shift-Cmd-G. ARCHITECTURE.md section 6.5 documents that key as search.step previous, and F056 (searchui.previous) and F073 (findPrevious) both register it at .document scope with docKinds nil. KeyCommandRouting.precedes lets the command limited to fewer docKinds win, so in every notebook and whiteboard Shift-Cmd-G opens the Insert Graph sheet instead of running Find Previous.",
+      "fix": "Remove the key command, or move it to a chord no feature uses (no branch registers Ctrl-Cmd-G). Add a test that runs KeyCommandRouting.active over this feature's keys plus a .document search.step descriptor on Shift-Cmd-G in a notebook context and asserts that search.step wins."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/FeatMathGraphFeature.swift:50-60 (GraphDrawer.draw); GraphCommands.swift (display is only rebuilt in create/setViewport)",
+      "problem": "Resizing a graph does not regenerate or rescale it. Item.transformed(by:) (F012 resize handles, item.transform) changes only custom.frame, so the stored DisplayList keeps the old size. Enlarging leaves an unpainted band: the white background rect, grid and axes stop at the old edge. Shrinking crops the curves and leaves the display list outside the frame, so the acceptance criterion 'graph display list stays inside its frame' fails for any resized graph, and a host that draws the portable display without GraphDrawer overflows.",
+      "fix": "In GraphDrawer.draw, take the built size from the first op (the background .rect op, or store size [w, h] in GraphData) and call cg.scaleBy(x: f.w / built.w, y: f.h / built.h) before custom.display.draw, so the graph always fills its current frame. setViewport already rebuilds at custom.frame, so the next edit re-samples at the new size. Add a test: create a graph, apply item.transformed(by: scale 2) via the transform command, then call setViewport and assert that every op lies inside the new frame."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/FeatMathGraphFeature.swift:183-184, 198-199, 217-219 (viewport fields formatted with MathEngine.numberText)",
+      "problem": "MathEngine.numberText writes e-notation Doubles as maths text, e.g. '(6.103515625*10^(-05))', which Double(_:) cannot parse. The viewport then becomes nil: Save Graph is disabled, the preview clears, zoom and drag do nothing, and no message appears. This happens after 19 taps of Zoom Out from the default scale, sooner with pinch, on any pan at scale above about 1e5, and when opening a graph whose stored scale or centre has a magnitude below 1e-4 (for example scale 0.000001, which the API accepts and the tests use). In comma-decimal locales, typing '0,5' disables Save the same silent way.",
+      "fix": "Format the fields with a representation Double(_:) accepts, such as String(d), which gives '6.103515625e-05' and parses back. Parse with Double(text) ?? Double(text.replacingOccurrences(of: \",\", with: \".\")). When a field does not parse, show an inline error under it instead of silently disabling Save. Factor this into a small internal helper and test the round trip for 1e-6, 6.1e-5, 0.1 and 1e12."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/GraphBuilder.swift:192-235 (sample: shared 16384-evaluation cap, segment subdivision)",
+      "problem": "The 16,384-evaluation cap is shared across the whole curve, and segment() subdivides to depth 6 even when a, mid and b are all far outside the plot. Steep off-screen sections use up the cap before the sampler reaches the visible part, and everything after that is silently dropped. A simulation of the exact algorithm on the tests' 320x240 frame found that each of these uses all 16,384 evaluations and draws no curve: 100000*x^2 at the default viewport, x^2 at scale 0.0001, x^3 at scale 0.01 (reachable with Zoom Out), and x^2 at scale 0.001 on a 2048-wide frame. testDisplayListAndStrokeExtentsStayInsideFrameAtExtremeViewports passes only because it never asserts that a curve exists.",
+      "fix": "In segment(), when a.y, mid.y and b.y are all below clip.minY or all above clip.maxY, flush and return without subdividing. Give each base interval its own subdivision allowance, e.g. max(8, 16384 / count) evaluations, so one interval cannot starve the rest. Extend the extreme-viewport test to assert at least one polyline for x^2 at scale 1e-4, x^3 at scale 0.01 and 100000*x^2 at the default viewport."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/GraphBuilder.swift:196-200; GraphCommands.swift:94-96, 153-155",
+      "problem": "Graph sampling has no total work or time limit and cannot be cancelled from a command. MathEngine.function creates a fresh MathEvaluator for every sample, each with its own 3M-unit step budget, so F061's 20M per-request workBudget never covers a graph. One build may take up to 16,384 samples per expression times 8 expressions. math.graph.create and math.graph.setViewport pass no MathCancellation, and MathStack.perform ignores Task cancellation. An AI or plugin call with eight copies of 'sum(sin(k*x), k, 1, 99999)' (about 500k units per sample) therefore runs for minutes on an 8 MB thread nothing can stop, and repeated calls pile up threads. This is an unbounded-cost hole at the AI and plugin trust boundary.",
+      "fix": "Give GraphBuilder.build a whole-build budget: a deadline (for example 2 s) or a shared work counter checked in point(). Once it is exceeded, stop and throw NibError(.unsupported, \"This graph takes too long to draw\", hint: \"Use simpler expressions or a smaller range.\"). In GraphCreate and GraphSetViewport, create a MathCancellation, pass it to build, and wrap MathStack.perform in withTaskCancellationHandler { ... } onCancel: { cancellation.cancel() }. Add a test that the heavy sum expression is rejected within XCTAssertLessThan(elapsed, budget * 4)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/GraphCommands.swift:80-83 (caller id validation)",
+      "problem": "The caller-chosen id is checked only for being empty or containing '/' or ':'. ARCHITECTURE.md section 6.1 says creating commands must accept a caller id only when NibID.isValid holds (1 to 64 characters of [A-Za-z0-9_-]) and must otherwise throw invalid_params. As written, AI and plugin ids such as 'a b', 'x.y', non-ASCII strings or a 10,000-character string are stored as item ids.",
+      "fix": "Replace the guard with: guard NibID.isValid(id.raw) else { throw GraphBuilder.invalid(\"Use 1 to 64 letters, digits, _ or - for the id.\", path: \"$.id\") }. Add those rejected ids to testCallerIDsAndCreationUndoRedo and assert .invalidParams with an unchanged snapshot."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMathAssist/GraphCommands.swift:84-91, 92, 99 (checkID)",
+      "problem": "checkID runs on every create, including creates with a generated NibID.make() id. It calls ctx.workspace.allItems on every page of the document, and does so twice, on the main actor. On a large notebook every graph insert synchronously loads all pages' items from persistence into the workspace cache. That causes a UI stall and a memory spike, and undoes the page eviction (evictPages).",
+      "fix": "Check only when p.id is supplied, and check only the target page: try ctx.workspace.allItems(doc, page: page).contains { $0.id == id && !$0.deleted }. Repeat the check inside ctx.mutate (tx.item on the target page) so it cannot race with the write. A generated id needs no scan."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/GraphBuilder.swift:33-45 (GraphData coding) and 88-92 (per-expression validation)",
+      "problem": "A graph saved with a newline inside an expression does not read back the same. The parser drops empty lines, so expressions [\"x\\n\"] (or \"x\\r\\n\") pass validation and create succeeds. GraphData then stores the joined string and decodes it as [\"x\", \"\"], so every later math.graph.setViewport with only x/y/scale fails with 'Each expression needs 1-2048 bytes' at $.expressions[1].",
+      "fix": "In build, reject any expression that contains \\n or \\r (path $.expressions[i]), or trim each expression before validating and storing it. In GraphData.init(from:), drop empty lines after splitting. Add a test: create with [\"x\\n\"] (expect rejection, or a stored [\"x\"]), then call setViewport with x, y and scale."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/GraphBuilder.swift:203-213 (append) and 160-163 (polyline ops)",
+      "problem": "Curve points are stored at full Double precision with no simplification. y = x on a 400 pt frame stores 401 points, and an oscillating curve can store up to 16,384. With 8 curves one item can serialise to several MB, and a copy goes into every undo entry and every sync of the page.",
+      "fix": "Before building each .polyline op, round points to 0.01 pt and drop points within 0.25 pt of the line through their neighbours (Ramer-Douglas-Peucker). Add a test asserting a JSON byte budget for an 8-curve graph."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/GraphBuilder.swift:216-226 (segment acceptance)",
+      "problem": "A segment is accepted when only its midpoint lies close to the chord, so periodic aliasing turns into straight lines. sin(64*pi*x) at the default viewport is 0 at every base sample and every midpoint, so the graph draws y = 0 where the function swings by 32 pt.",
+      "fix": "Before accepting a depth-0 segment, also evaluate the quarter points. Alternatively, offset the base sample positions by a fixed irrational fraction of the step so that integer-frequency functions do not alias."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/GraphBuilder.swift:117-135 (grid and axes)",
+      "problem": "The graph draws no numeric tick labels. After any pan or zoom a reader of the page cannot tell the scale or position, which weakens S-027 (2D graph generation).",
+      "fix": "Add .text DisplayOps for the grid values along each axis, using gridStep for the values, a small fontSize, NibInk.graphite and .center alignment, with each label rect clamped inside the plot. Cover the labels in the in-frame test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/FeatMathGraphFeature.swift:36-38 (toolbar item)",
+      "problem": "The Insert Graph toolbar item stays enabled in read-only windows, and tapping it only shows a permission-denied toast. The menu item already hides itself in read-only.",
+      "fix": "Assign the descriptor to a var and set isEnabled = { !$0.readOnly } before registering it."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMathAssist/FeatMathGraphFeature.swift:108-115, 153-162 (editor fields)",
+      "problem": "The editor hand-builds field styling (fill4 background with a field radius) instead of using NibDesign's NibField component. The numeric fields open the full alphabetic keyboard on iPhone.",
+      "fix": "Use NibField(text: $expressions, prompt: ..., lines: 3...8) for the expressions and NibField for Centre x, Centre y and Points per unit, adding .keyboardType(.numbersAndPunctuation) to the numeric fields."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatMathAssistTests/GraphBuilderTests.swift",
+      "problem": "The riskiest UI logic has no tests. The edit-mode load (parsing the query.get result, including a display trimmed by F003's 20 KB cap, plus the rev string) and the save parameter assembly are untested. The snapshot test only renders insert mode and asserts the image is non-nil.",
+      "fix": "Move the record parsing and the save-parameter building into internal static functions, e.g. GraphEditorModel.parse(_ result: JSONValue) throws -> (Frame, GraphData, String?) and saveParams(...). Test them with an F003-shaped result {ref, kind, custom: {owner, type, frame, data, display truncated}, rev, truncated: true}. Snapshot the editor in edit mode by registering a fake query.get, as the test already does for panel.open."
+    }
+  ]
+}
