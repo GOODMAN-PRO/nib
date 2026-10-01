@@ -1,1 +1,185 @@
-{}
+{
+  "id": "dev.nib.graph",
+  "name": "Graph Paper",
+  "version": "1.0.0",
+  "api": 1,
+  "author": "Nib",
+  "description": "A generated pack of 5 mm, 10 mm and quarter-inch grid papers with adjustable spacing and colours.",
+  "entry": "main.js",
+  "permissions": [],
+  "network": {
+    "hosts": []
+  },
+  "contributes": {
+    "templates": [
+      {
+        "id": "dev.nib.graph.fine",
+        "title": "Fine Graph · 5 mm",
+        "category": "Graph Paper",
+        "kind": "spec",
+        "isCover": false,
+        "size": {
+          "width": 595.28,
+          "height": 841.89
+        },
+        "params": {
+          "paper": {
+            "type": "color",
+            "default": "#FFFFFFFF"
+          },
+          "grid": {
+            "type": "color",
+            "default": "#B8CDDEFF"
+          },
+          "spacing": {
+            "type": "number",
+            "default": 14.173228,
+            "minimum": 4,
+            "maximum": 72
+          }
+        },
+        "spec": {
+          "paper": "$paper",
+          "ops": [
+            {
+              "op": "hlines",
+              "rect": [
+                28,
+                28,
+                539.28,
+                785.89
+              ],
+              "spacing": "$spacing",
+              "stroke": "$grid",
+              "width": 0.4
+            },
+            {
+              "op": "vlines",
+              "rect": [
+                28,
+                28,
+                539.28,
+                785.89
+              ],
+              "spacing": "$spacing",
+              "stroke": "$grid",
+              "width": 0.4
+            }
+          ]
+        }
+      },
+      {
+        "id": "dev.nib.graph.classic",
+        "title": "Graph · 10 mm",
+        "category": "Graph Paper",
+        "kind": "spec",
+        "isCover": false,
+        "size": {
+          "width": 595.28,
+          "height": 841.89
+        },
+        "params": {
+          "paper": {
+            "type": "color",
+            "default": "#FFFFFFFF"
+          },
+          "grid": {
+            "type": "color",
+            "default": "#BCC6CCFF"
+          },
+          "spacing": {
+            "type": "number",
+            "default": 28.346457,
+            "minimum": 4,
+            "maximum": 72
+          }
+        },
+        "spec": {
+          "paper": "$paper",
+          "ops": [
+            {
+              "op": "hlines",
+              "rect": [
+                28,
+                28,
+                539.28,
+                785.89
+              ],
+              "spacing": "$spacing",
+              "stroke": "$grid",
+              "width": 0.4
+            },
+            {
+              "op": "vlines",
+              "rect": [
+                28,
+                28,
+                539.28,
+                785.89
+              ],
+              "spacing": "$spacing",
+              "stroke": "$grid",
+              "width": 0.4
+            }
+          ]
+        }
+      },
+      {
+        "id": "dev.nib.graph.quarter",
+        "title": "Graph · Quarter Inch",
+        "category": "Graph Paper",
+        "kind": "spec",
+        "isCover": false,
+        "size": {
+          "width": 595.28,
+          "height": 841.89
+        },
+        "params": {
+          "paper": {
+            "type": "color",
+            "default": "#FFFFFFFF"
+          },
+          "grid": {
+            "type": "color",
+            "default": "#BCD5CAFF"
+          },
+          "spacing": {
+            "type": "number",
+            "default": 18,
+            "minimum": 4,
+            "maximum": 72
+          }
+        },
+        "spec": {
+          "paper": "$paper",
+          "ops": [
+            {
+              "op": "hlines",
+              "rect": [
+                28,
+                28,
+                539.28,
+                785.89
+              ],
+              "spacing": "$spacing",
+              "stroke": "$grid",
+              "width": 0.4
+            },
+            {
+              "op": "vlines",
+              "rect": [
+                28,
+                28,
+                539.28,
+                785.89
+              ],
+              "spacing": "$spacing",
+              "stroke": "$grid",
+              "width": 0.4
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

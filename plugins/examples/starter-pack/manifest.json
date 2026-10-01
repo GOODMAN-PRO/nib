@@ -1,1 +1,223 @@
-{}
+{
+  "id": "dev.nib.starter",
+  "name": "Starter Pack",
+  "version": "1.0.0",
+  "api": 1,
+  "author": "Nib",
+  "description": "A cover, ruled and dot papers, reusable arrows, and a retrospective board framework.",
+  "entry": "main.js",
+  "permissions": [],
+  "network": {
+    "hosts": []
+  },
+  "contributes": {
+    "templates": [
+      {
+        "id": "dev.nib.starter.cover",
+        "title": "Field Notes Cover",
+        "category": "Starter Pack",
+        "kind": "spec",
+        "isCover": true,
+        "size": {
+          "width": 595.28,
+          "height": 841.89
+        },
+        "params": {
+          "paper": {
+            "type": "color",
+            "default": "#FFFFFFFF"
+          },
+          "accent": {
+            "type": "color",
+            "default": "#267A79FF"
+          }
+        },
+        "spec": {
+          "paper": "$paper",
+          "ops": [
+            {
+              "op": "rect",
+              "rect": [
+                0,
+                0,
+                595.28,
+                841.89
+              ],
+              "fill": "$accent"
+            },
+            {
+              "op": "text",
+              "rect": [
+                48,
+                84,
+                499,
+                64
+              ],
+              "text": "FIELD NOTES",
+              "fontSize": 36,
+              "weight": "semibold",
+              "stroke": "#FFFFFFFF"
+            },
+            {
+              "op": "line",
+              "points": [
+                [
+                  48,
+                  162
+                ],
+                [
+                  547,
+                  162
+                ]
+              ],
+              "stroke": "#FFFFFFFF",
+              "width": 1
+            },
+            {
+              "op": "text",
+              "rect": [
+                48,
+                728,
+                499,
+                30
+              ],
+              "text": "Name __________________",
+              "fontSize": 16,
+              "stroke": "#FFFFFFFF"
+            }
+          ]
+        }
+      },
+      {
+        "id": "dev.nib.starter.ruled",
+        "title": "Field Notes Ruled",
+        "category": "Starter Pack",
+        "kind": "spec",
+        "isCover": false,
+        "size": {
+          "width": 595.28,
+          "height": 841.89
+        },
+        "params": {
+          "paper": {
+            "type": "color",
+            "default": "#FFFFFFFF"
+          },
+          "accent": {
+            "type": "color",
+            "default": "#267A79FF"
+          }
+        },
+        "spec": {
+          "paper": "$paper",
+          "ops": [
+            {
+              "op": "hlines",
+              "rect": [
+                48,
+                60,
+                499,
+                720
+              ],
+              "spacing": 24,
+              "stroke": "#CCD8D8FF",
+              "width": 0.5
+            },
+            {
+              "op": "line",
+              "points": [
+                [
+                  84,
+                  48
+                ],
+                [
+                  84,
+                  794
+                ]
+              ],
+              "stroke": "$accent",
+              "width": 0.5
+            }
+          ]
+        }
+      },
+      {
+        "id": "dev.nib.starter.dots",
+        "title": "Field Notes Dots",
+        "category": "Starter Pack",
+        "kind": "spec",
+        "isCover": false,
+        "size": {
+          "width": 595.28,
+          "height": 841.89
+        },
+        "params": {
+          "paper": {
+            "type": "color",
+            "default": "#FFFFFFFF"
+          },
+          "accent": {
+            "type": "color",
+            "default": "#267A79FF"
+          }
+        },
+        "spec": {
+          "paper": "$paper",
+          "ops": [
+            {
+              "op": "dots",
+              "rect": [
+                36,
+                36,
+                523,
+                770
+              ],
+              "spacing": 18,
+              "stroke": "$accent",
+              "radius": 0.7
+            }
+          ]
+        }
+      }
+    ],
+    "elements": [
+      {
+        "id": "dev.nib.starter.arrows",
+        "title": "Arrows",
+        "files": [
+          "elements/arrows.json"
+        ]
+      }
+    ],
+    "boardTemplates": [
+      {
+        "id": "dev.nib.starter.retro",
+        "title": "Retrospective",
+        "icon": "rectangle.3.group",
+        "diagram": {
+          "layout": "flow",
+          "style": "classic",
+          "origin": [
+            0,
+            0
+          ],
+          "nodes": [
+            {
+              "id": "wentWell",
+              "label": "What went well"
+            },
+            {
+              "id": "improve",
+              "label": "What to improve"
+            },
+            {
+              "id": "next",
+              "label": "Next steps"
+            }
+          ],
+          "edges": []
+        }
+      }
+    ]
+  }
+}

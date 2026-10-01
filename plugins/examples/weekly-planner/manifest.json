@@ -1,1 +1,350 @@
-{}
+{
+  "id": "dev.nib.planner",
+  "name": "Weekly Planner",
+  "version": "1.0.0",
+  "api": 1,
+  "author": "Nib",
+  "description": "A seven-day planner with paper, accent, heading and writing-line parameters.",
+  "entry": "main.js",
+  "permissions": [],
+  "network": {
+    "hosts": []
+  },
+  "contributes": {
+    "templates": [
+      {
+        "id": "dev.nib.planner.weekly",
+        "title": "Weekly Planner",
+        "category": "Planners",
+        "kind": "spec",
+        "isCover": false,
+        "size": {
+          "width": 595.28,
+          "height": 841.89
+        },
+        "params": {
+          "paper": {
+            "type": "color",
+            "default": "#FFFFFFFF"
+          },
+          "accent": {
+            "type": "color",
+            "default": "#267A79FF"
+          },
+          "heading": {
+            "type": "choice",
+            "default": "This week",
+            "choices": [
+              "This week",
+              "Weekly plan"
+            ]
+          },
+          "lineSpacing": {
+            "type": "number",
+            "default": 20,
+            "minimum": 12,
+            "maximum": 32
+          }
+        },
+        "spec": {
+          "paper": "$paper",
+          "ops": [
+            {
+              "op": "text",
+              "rect": [
+                36,
+                32,
+                523,
+                40
+              ],
+              "text": "$heading",
+              "fontSize": 26,
+              "weight": "semibold",
+              "stroke": "$accent"
+            },
+            {
+              "op": "text",
+              "rect": [
+                36,
+                92,
+                110,
+                24
+              ],
+              "text": "Monday",
+              "fontSize": 13,
+              "weight": "semibold",
+              "stroke": "$accent"
+            },
+            {
+              "op": "hlines",
+              "rect": [
+                148,
+                92,
+                411,
+                82
+              ],
+              "spacing": "$lineSpacing",
+              "stroke": "#CED8D8FF",
+              "width": 0.5
+            },
+            {
+              "op": "line",
+              "points": [
+                [
+                  36,
+                  178
+                ],
+                [
+                  559,
+                  178
+                ]
+              ],
+              "stroke": "$accent",
+              "width": 0.5
+            },
+            {
+              "op": "text",
+              "rect": [
+                36,
+                190,
+                110,
+                24
+              ],
+              "text": "Tuesday",
+              "fontSize": 13,
+              "weight": "semibold",
+              "stroke": "$accent"
+            },
+            {
+              "op": "hlines",
+              "rect": [
+                148,
+                190,
+                411,
+                82
+              ],
+              "spacing": "$lineSpacing",
+              "stroke": "#CED8D8FF",
+              "width": 0.5
+            },
+            {
+              "op": "line",
+              "points": [
+                [
+                  36,
+                  276
+                ],
+                [
+                  559,
+                  276
+                ]
+              ],
+              "stroke": "$accent",
+              "width": 0.5
+            },
+            {
+              "op": "text",
+              "rect": [
+                36,
+                288,
+                110,
+                24
+              ],
+              "text": "Wednesday",
+              "fontSize": 13,
+              "weight": "semibold",
+              "stroke": "$accent"
+            },
+            {
+              "op": "hlines",
+              "rect": [
+                148,
+                288,
+                411,
+                82
+              ],
+              "spacing": "$lineSpacing",
+              "stroke": "#CED8D8FF",
+              "width": 0.5
+            },
+            {
+              "op": "line",
+              "points": [
+                [
+                  36,
+                  374
+                ],
+                [
+                  559,
+                  374
+                ]
+              ],
+              "stroke": "$accent",
+              "width": 0.5
+            },
+            {
+              "op": "text",
+              "rect": [
+                36,
+                386,
+                110,
+                24
+              ],
+              "text": "Thursday",
+              "fontSize": 13,
+              "weight": "semibold",
+              "stroke": "$accent"
+            },
+            {
+              "op": "hlines",
+              "rect": [
+                148,
+                386,
+                411,
+                82
+              ],
+              "spacing": "$lineSpacing",
+              "stroke": "#CED8D8FF",
+              "width": 0.5
+            },
+            {
+              "op": "line",
+              "points": [
+                [
+                  36,
+                  472
+                ],
+                [
+                  559,
+                  472
+                ]
+              ],
+              "stroke": "$accent",
+              "width": 0.5
+            },
+            {
+              "op": "text",
+              "rect": [
+                36,
+                484,
+                110,
+                24
+              ],
+              "text": "Friday",
+              "fontSize": 13,
+              "weight": "semibold",
+              "stroke": "$accent"
+            },
+            {
+              "op": "hlines",
+              "rect": [
+                148,
+                484,
+                411,
+                82
+              ],
+              "spacing": "$lineSpacing",
+              "stroke": "#CED8D8FF",
+              "width": 0.5
+            },
+            {
+              "op": "line",
+              "points": [
+                [
+                  36,
+                  570
+                ],
+                [
+                  559,
+                  570
+                ]
+              ],
+              "stroke": "$accent",
+              "width": 0.5
+            },
+            {
+              "op": "text",
+              "rect": [
+                36,
+                582,
+                110,
+                24
+              ],
+              "text": "Saturday",
+              "fontSize": 13,
+              "weight": "semibold",
+              "stroke": "$accent"
+            },
+            {
+              "op": "hlines",
+              "rect": [
+                148,
+                582,
+                411,
+                82
+              ],
+              "spacing": "$lineSpacing",
+              "stroke": "#CED8D8FF",
+              "width": 0.5
+            },
+            {
+              "op": "line",
+              "points": [
+                [
+                  36,
+                  668
+                ],
+                [
+                  559,
+                  668
+                ]
+              ],
+              "stroke": "$accent",
+              "width": 0.5
+            },
+            {
+              "op": "text",
+              "rect": [
+                36,
+                680,
+                110,
+                24
+              ],
+              "text": "Sunday",
+              "fontSize": 13,
+              "weight": "semibold",
+              "stroke": "$accent"
+            },
+            {
+              "op": "hlines",
+              "rect": [
+                148,
+                680,
+                411,
+                82
+              ],
+              "spacing": "$lineSpacing",
+              "stroke": "#CED8D8FF",
+              "width": 0.5
+            },
+            {
+              "op": "line",
+              "points": [
+                [
+                  36,
+                  766
+                ],
+                [
+                  559,
+                  766
+                ]
+              ],
+              "stroke": "$accent",
+              "width": 0.5
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
