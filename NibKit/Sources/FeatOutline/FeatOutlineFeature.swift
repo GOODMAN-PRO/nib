@@ -10,11 +10,14 @@ public enum FeatOutlineFeature: NibFeature {
     public static func register(_ app: NibApp) {
         OutlineCommands.register(app.commands)
         OutlineSettings.declare(app.settings, owner: id)
-        app.ui.panels.register(PanelDescriptor(
+        var outlinePanel = PanelDescriptor(
             id: OutlinePanels.outline, title: String(localized: "Outline"), icon: NibSymbol.outline.name,
             placement: .sidebarTab, order: OutlinePanels.outlineOrder, owner: id, docKinds: [.notebook]) { context in
                 AnyView(OutlinePanel(context: context))
-            })
+            }
+        // Keep the narrow navigator's title clear of the chrome's placement accessories.
+        outlinePanel.providesHeader = true
+        app.ui.panels.register(outlinePanel)
         app.ui.panels.register(PanelDescriptor(
             id: OutlinePanels.bookmarks, title: String(localized: "Bookmarks"), icon: NibSymbol.bookmark.name,
             placement: .sidebarTab, order: OutlinePanels.bookmarksOrder, owner: id, docKinds: [.notebook]) { context in

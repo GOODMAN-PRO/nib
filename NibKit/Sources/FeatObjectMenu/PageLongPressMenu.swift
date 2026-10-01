@@ -330,15 +330,21 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
         }
         let viewRect = ScreenshotSharing.viewRect(facts.bounds, page: facts.page, host: host)
         guard let target = host.session.floatingHost else {
-            // A window without a floating host (the document chrome, F017, sets one; without it none is there): the
-            // system edit menu, once per selection.
+            // The canvas can restore a selection before the document chrome publishes its floating host.
+            // That weak property emits no event, so keep recovery pending even when page geometry is ready.
+            model.isShown = false
+            model.colourOpen = false
+            model.styleOpen = false
             dismissFloating()
+            lastContainerRect = nil
+            // A window without chrome still gets the system edit menu, once per selection.
             if contentChanged, editMenuShownFor != host.session.selection {
                 editMenuShownFor = host.session.selection
                 let menu = uiMenu(model.entries, context: model.context, facts: facts, title: model.header ?? "",
                                   shortcuts: false)
                 presentEditMenu(menu, at: CGPoint(x: viewRect.midX, y: viewRect.minY), target: viewRect)
             }
+            scheduleReshow()
             return
         }
         present(on: target)
@@ -379,6 +385,10 @@ final class ObjectMenuAttachment: NSObject, CanvasAttachment, UIContextMenuInter
 
     private func show() {
         guard !model.isShown else { return }
+        if editMenuShownFor != nil {
+            editMenu?.dismissMenu()
+            editMenuShownFor = nil
+        }
         model.isShown = true
         if UIAccessibility.isVoiceOverRunning { UIAccessibility.post(notification: .layoutChanged, argument: nil) }
     }

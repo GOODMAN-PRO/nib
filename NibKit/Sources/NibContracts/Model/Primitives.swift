@@ -177,25 +177,36 @@ public final class HLCClock {
 /// Base-62 fractional index used for z-order, page order, block/card/outline order.
 /// Keys never end in "0", so a key can always be generated between any two keys.
 public enum FractionalIndex {
-    private static let digits: [Character] = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+    private static let digits = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz".utf8)
 
-    private static func value(_ c: Character) -> Int { digits.firstIndex(of: c) ?? 0 }
-
-    /// A key strictly between `a` and `b` (nil = unbounded). Precondition: a < b when both are given.
-    public static func between(_ a: String?, _ b: String?) -> String {
-        String(mid(Array(a ?? ""), b.map { Array($0) }))
+    private static func value(_ byte: UInt8) -> Int {
+        switch byte {
+        case 48...57: return Int(byte - 48)
+        case 65...90: return Int(byte - 65) + 10
+        case 97...122: return Int(byte - 97) + 36
+        default: return 0
+        }
     }
 
-    /// contracts-v2: `count` increasing keys strictly between `a` and `b` (nil = unbounded), built by bisection so they
-    /// stay short: about log62(count) + 1 characters (10,000 keys ≤ 4 characters), where `sequence` grows by one
-    /// character every few keys. For imports and batch inserts. Precondition: a < b when both are given.
+    /// A key strictly between `a` and `b` (nil = unbounded). Precondition: a < b when both are given.
+    /// Existing base-62 keys keep their lexical order; no stored keys need rewriting.
+    public static func between(_ a: String?, _ b: String?) -> String {
+        if let a, !a.isEmpty, b == nil { return boundary(a, increasing: true) }
+        if (a == nil || a?.isEmpty == true), let b, !b.isEmpty { return boundary(b, increasing: false) }
+        return midpoint(a, b)
+    }
+
+    /// `count` increasing keys strictly between `a` and `b` (nil = unbounded), built by bisection so they
+    /// stay short: about log62(count) + 1 characters (10,000 keys ≤ 4 characters). For imports and batch inserts.
+    /// Precondition: a < b when both are given.
     public static func balanced(count: Int, after a: String? = nil, before b: String? = nil) -> [String] {
         guard count > 0 else { return [] }
         var out = [String](repeating: "", count: count)
         func fill(_ lo: Int, _ hi: Int, _ left: String?, _ right: String?) {
             guard lo <= hi else { return }
             let mid = (lo + hi) / 2
-            let key = between(left, right)
+            // Batch insertion divides space evenly, including its unbounded edges.
+            let key = midpoint(left, right)
             out[mid] = key
             fill(lo, mid - 1, left, key)
             fill(mid + 1, hi, key, right)
@@ -207,6 +218,7 @@ public enum FractionalIndex {
     /// `count` increasing keys after `a`.
     public static func sequence(after a: String?, count: Int) -> [String] {
         var out: [String] = []
+        out.reserveCapacity(max(0, count))
         var last = a
         for _ in 0..<max(0, count) {
             let k = between(last, nil)
@@ -216,19 +228,66 @@ public enum FractionalIndex {
         return out
     }
 
-    private static func mid(_ a: [Character], _ b: [Character]?) -> [Character] {
-        if let b = b {
-            var n = 0
-            while n < b.count && (n < a.count ? a[n] : "0") == b[n] { n += 1 }
-            if n > 0 {
-                return Array(b[0..<n]) + mid(Array(a.dropFirst(n)), Array(b.dropFirst(n)))
-            }
+    /// Boundary runs use a base-62 counter. A leading run of z (append) or 0 (prepend) encodes the
+    /// counter's width minus one. Each extra prefix digit buys 62 times more slots, so sequential keys
+    /// grow logarithmically. Any legacy key can be read as a prefix/counter/suffix: changing the counter
+    /// strictly orders the result regardless of the suffix. Short counters are right-padded with zero.
+    private static func boundary(_ key: String, increasing: Bool) -> String {
+        let bytes = Array(key.utf8)
+        let edge = increasing ? 61 : 0
+        var prefix = 0
+        while prefix < bytes.count && value(bytes[prefix]) == edge { prefix += 1 }
+        let width = prefix + 1
+        var counter = [Int](repeating: 0, count: width)
+        for i in 0..<min(width, bytes.count - prefix) { counter[i] = value(bytes[prefix + i]) }
+        var i = width - 1
+        if increasing {
+            while counter[i] == 61 { counter[i] = 0; i -= 1 }
+            counter[i] += 1
+        } else {
+            while counter[i] == 0 { counter[i] = 61; i -= 1 }
+            counter[i] -= 1
         }
-        let da = a.isEmpty ? 0 : value(a[0])
-        let db = b.map { $0.isEmpty ? 62 : value($0[0]) } ?? 62
-        if db - da > 1 { return [digits[(da + db) / 2]] }
-        if let b = b, b.count > 1 { return [b[0]] }
-        return [digits[da]] + mid(Array(a.dropFirst()), nil)
+        var result = [UInt8](repeating: digits[edge], count: prefix)
+        if counter[0] == edge {
+            // Crossing the counter's first digit opens the next, wider interval.
+            result.append(digits[edge])
+            result += increasing
+                ? [UInt8](repeating: digits[0], count: width) + [digits[1]]
+                : [UInt8](repeating: digits[61], count: width + 1)
+        } else {
+            result += counter.map { digits[$0] }
+            // Zero-terminated keys have no room immediately before them; retain the existing invariant.
+            if result.last == digits[0] { result.append(digits[31]) }
+        }
+        return String(decoding: result, as: UTF8.self)
+    }
+
+    /// The legacy midpoint rule, iterated over ASCII once. No recursive suffix copies or alphabet scans,
+    /// even for old documents with hundreds of shared prefix characters.
+    private static func midpoint(_ a: String?, _ b: String?) -> String {
+        let lower = Array((a ?? "").utf8)
+        let upper = b.map { Array($0.utf8) }
+        var bounded = upper != nil
+        var result: [UInt8] = []
+        var i = 0
+        while true {
+            let da = i < lower.count ? value(lower[i]) : 0
+            let db = bounded && i < upper!.count ? value(upper![i]) : 62
+            if da == db {
+                result.append(digits[da])
+            } else if db - da > 1 {
+                result.append(digits[(da + db) / 2])
+                return String(decoding: result, as: UTF8.self)
+            } else if bounded && i + 1 < upper!.count {
+                result.append(digits[db])
+                return String(decoding: result, as: UTF8.self)
+            } else {
+                result.append(digits[da])
+                bounded = false
+            }
+            i += 1
+        }
     }
 }
 

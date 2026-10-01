@@ -15,6 +15,7 @@ public struct NibDropletContainer<Content: View>: View {
     @Environment(\.nibLiquidMode) private var mode
     @Environment(\.nibBackdrop) private var backdrop
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.self) private var environment
     @Environment(\.horizontalSizeClass) private var sizeClass
     private let inking: NibInkingState?
     private let content: Content
@@ -51,6 +52,7 @@ public struct NibDropletContainer<Content: View>: View {
         .environment(field)
         .environment(\.nibGlassNamespace, glassNamespace)
         .environment(\.nibIsInking, field.isFrozen)
+        .environment(\.nibChromeAppearance, NibChromeAppearance(environment))
         .onChange(of: reduceMotion, initial: true) { _, value in field.reduceMotion = value }
         .onChange(of: mode, initial: true) { _, value in
             field.mode = value
@@ -70,11 +72,19 @@ public struct NibDropletContainer<Content: View>: View {
     @ViewBuilder private var layers: some View {
         if #available(iOS 26.0, *) {
             if usesSystemGlass {
-                GlassEffectContainer(spacing: field.metrics.mergeDistance) {
-                    ZStack {
-                        NeckGlassLayer(field: field)
-                        content
+                ZStack {
+                    NativeGlassBackdropLayer(field: field)
+                    GlassEffectContainer(spacing: field.metrics.mergeDistance) {
+                        ZStack {
+                            NeckGlassLayer(field: field)
+                            content
+                        }
                     }
+                    .environment(\.colorScheme, colorScheme)
+                    .backgroundPreferenceValue(NibStaticGlassBackdropKey.self) { backdrops in
+                        NativeStaticGlassBackdropLayer(backdrops: backdrops)
+                    }
+                    .transformPreference(NibStaticGlassBackdropKey.self) { $0 = [] }
                 }
             } else {
                 fallback
@@ -93,6 +103,76 @@ public struct NibDropletContainer<Content: View>: View {
                 WaterLayer(field: field)
             }
             content
+        }
+    }
+}
+
+/// A static nibGlass surface has no field entry. Carry its bounds and neutral body out of the native container
+/// with an anchor preference so it follows the same backdrop ordering as registered droplets.
+struct NibStaticGlassBackdrop {
+    let bounds: Anchor<CGRect>
+    let shape: NibDropletShape
+    let tint: Color
+}
+
+struct NibStaticGlassBackdropKey: PreferenceKey {
+    static let defaultValue: [NibStaticGlassBackdrop] = []
+    static func reduce(value: inout [NibStaticGlassBackdrop], nextValue: () -> [NibStaticGlassBackdrop]) {
+        value += nextValue()
+    }
+}
+
+struct NativeStaticGlassBackdropLayer: View {
+    let backdrops: [NibStaticGlassBackdrop]
+
+    var body: some View {
+        GeometryReader { proxy in
+            Canvas { context, _ in
+                for backdrop in backdrops {
+                    context.fill(backdrop.shape.path(in: proxy[backdrop.bounds]), with: .color(backdrop.tint))
+                }
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
+/// System glass in a container is rendered behind the container's content. Neutral contrast protection must
+/// therefore be outside that container, underneath the combined effect, rather than a droplet's background.
+/// The existing field supplies the exact silhouettes, visibility, paper overlap and Pencil recede opacity.
+struct NativeGlassBackdropLayer: View {
+    let field: DropletField
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ClusterLayer(field: field) { cluster in
+            let offset = CGAffineTransform(translationX: -cluster.frame.minX, y: -cluster.frame.minY)
+            let fills = cluster.renders.map { render in
+                let kind: NibGlass = render.material == .deep ? .deep : (render.material == .tinted ? .tinted : .clear)
+                // Paper-resident styles can disable refraction; they still need contrast protection.
+                let paper = field.node(render.id).presentation.paperShare
+                let tint = field.isFrozen
+                    ? NibGlassBodyTint.color(kind, paperShare: paper, colorScheme: colorScheme)
+                    : NibGlassBodyTint.systemUnderlay(kind, colorScheme: colorScheme, paperShare: paper)
+                return NativeGlassBackdropCanvas.Fill(path: render.path.applying(offset), tint: tint)
+            }
+            NativeGlassBackdropCanvas(fills: fills).equatable()
+        }
+    }
+}
+
+/// A moving cluster must not redraw the neutral body of every resting cluster.
+struct NativeGlassBackdropCanvas: View, Equatable {
+    struct Fill: Equatable {
+        let path: Path
+        let tint: Color
+    }
+    let fills: [Fill]
+
+    var body: some View {
+        Canvas { context, _ in
+            for fill in fills { context.fill(fill.path, with: .color(fill.tint)) }
         }
     }
 }

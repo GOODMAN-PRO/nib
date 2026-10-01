@@ -85,14 +85,23 @@ final class PerformanceTests: XCTestCase {
                 last = key
             }
         }
-        // Known contract issue (F100 contract gap): `between(last, nil)` lengthens the key by one character every ~6
-        // appends (1,000 strokes drawn one by one on a page give ~170-character z keys) and `mid` copies the key at
-        // every recursion level, so each append costs O(length²). Non-strict: this passes again once it is fixed.
-        XCTExpectFailure("FractionalIndex appends on top grow keys linearly (contract gap)", strict: false) {
-            assertWithinBudget(appends, Budget.fractionalIndexAppends, "FractionalIndex 1k appends on top")
-        }
-        XCTAssertLessThanOrEqual(top.last?.count ?? 0, 200, "append keys: one character per ~6 appends")
+        assertWithinBudget(appends, Budget.fractionalIndexAppends, "FractionalIndex 1k appends on top")
+        XCTAssertLessThanOrEqual(top.map { $0.count }.max() ?? 0, 4, "append counters stay short")
         XCTAssertTrue(zip(top, top.dropFirst()).allSatisfy { $0 < $1 })
+
+        var bottom: [String] = []
+        let prepends = best {
+            bottom = []
+            var first: String?
+            for _ in 0..<1_000 {
+                let key = FractionalIndex.between(nil, first)
+                bottom.append(key)
+                first = key
+            }
+        }
+        assertWithinBudget(prepends, Budget.fractionalIndexAppends, "FractionalIndex 1k prepends")
+        XCTAssertLessThanOrEqual(bottom.map { $0.count }.max() ?? 0, 4, "prepend counters stay short")
+        XCTAssertTrue(zip(bottom, bottom.dropFirst()).allSatisfy { $0 > $1 })
 
         let balanced = FractionalIndex.balanced(count: 10_000)
         XCTAssertTrue(zip(balanced, balanced.dropFirst()).allSatisfy { $0 < $1 })

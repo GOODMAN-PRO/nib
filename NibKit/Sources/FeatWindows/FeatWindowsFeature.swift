@@ -11,7 +11,16 @@ public enum FeatWindowsFeature: NibFeature {
     public static func register(_ app: NibApp) {
         let scenes = WindowScenes(app: app)
         app.services.set(scenes, for: WindowScenes.serviceKey)
-        app.ui.sceneHooks = SceneHooksImpl(app: app, scenes: scenes)
+        let hooks = SceneHooksImpl(app: app, scenes: scenes)
+        app.ui.sceneHooks = hooks
+
+        // Last after-title control: its measured edge anchors the tabs in the gap between the bars.
+        var tabs = ToolbarItemDescriptor(id: "windows.tabs.menu", title: String(localized: "Tabs"),
+                                         icon: NibSymbol.templates.name, group: .navLeading, order: .max,
+                                         owner: id, hideable: false, docKinds: Set(DocumentKind.allCases))
+        tabs.navSlot = .afterTitle
+        tabs.compactStatus = { [weak hooks] context in hooks?.documentTabsMenu(context) }
+        app.ui.toolbar.register(tabs)
 
         app.commands.register(DocOpen.self)
         app.commands.register(WindowOpen.self)

@@ -45,8 +45,10 @@ struct BoxMemo {
 struct HandleLayout {
     /// 12 pt beads (DESIGN.md §14.3).
     static let bead = NibMetrics.handleBead
-    /// Keep the rotation and top-edge hit areas separate, with a small gap in canvas-view points at any zoom.
-    static let rotationLift = max(NibMetrics.rotationHandleOffset, NibMetrics.hitTarget + NibSpacing.xs)
+    /// Screen-space offset shared with object-menu clearance (DESIGN.md §14.3). Lifting it farther puts the
+    /// bead inside the menu's glass, where refraction can produce a second visual centre. Overlapping hit areas
+    /// are resolved by the nearest handle, without moving either bead away from its hotspot.
+    static let rotationLift = NibMetrics.rotationHandleOffset
     /// Every handle answers within a 44 pt target.
     static let reach = NibMetrics.hitTarget / 2
     /// Sides shorter than this on screen keep only their corners.

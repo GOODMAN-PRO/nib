@@ -1003,6 +1003,119 @@ final class FeatObjectMenuTests: XCTestCase {
         XCTAssertEqual(floating.anchors[ObjectMenuIDs.overlay], CGRect(x: 180, y: 224, width: 160, height: 0))
     }
 
+    func testRestoredSelectionPresentsAfterTheFloatingHostIsPublished() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        // Document chrome loads its canvas before publishing session.floatingHost.
+        select(h, [Fixtures.shapeID], bounds: Rect(x: 100, y: 200, width: 160, height: 90))
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        XCTAssertTrue(attachment.model.hasEntries)
+        XCTAssertFalse(attachment.model.isShown)
+        let rebuilds = attachment.rebuilds
+
+        // Wait through a retry with no host, then publish one without sending another canvas/selection event.
+        try await Task.sleep(nanoseconds: 600_000_000)
+        let floating = FakeFloatingHost()
+        floating.containerOffset = CGPoint(x: 48, y: 24)
+        h.session.floatingHost = floating
+        try await waitUntil({ attachment.model.isShown }, "A settled restored selection must show its actions")
+        XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.overlay))
+        XCTAssertEqual(floating.anchors[ObjectMenuIDs.overlay], CGRect(x: 148, y: 224, width: 160, height: 0))
+        XCTAssertEqual(attachment.model.anchor, CGRect(x: 148, y: 224, width: 160, height: 90))
+        XCTAssertEqual(attachment.rebuilds, rebuilds, "Host readiness only repositions the existing menu")
+    }
+
+    func testSelectionMenuRecoversAfterTheFloatingHostIsReplaced() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let original = FakeFloatingHost()
+        h.session.floatingHost = original
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        select(h, [Fixtures.shapeID], bounds: Rect(x: 100, y: 200, width: 160, height: 90))
+        XCTAssertTrue(attachment.model.isShown)
+        attachment.model.colourOpen = true
+
+        h.session.floatingHost = nil
+        attachment.canvasDidChange(host)
+        XCTAssertFalse(attachment.model.isShown)
+        XCTAssertFalse(attachment.model.colourOpen)
+        XCTAssertFalse(original.isPresenting(ObjectMenuIDs.overlay))
+        XCTAssertNil(original.anchors[ObjectMenuIDs.overlay])
+
+        let replacement = FakeFloatingHost()
+        replacement.conversionAvailable = false
+        h.session.floatingHost = replacement
+        try await waitUntil({ replacement.isPresenting(ObjectMenuIDs.overlay) })
+        XCTAssertFalse(attachment.model.isShown, "Wait for the new layer's geometry")
+        replacement.conversionAvailable = true
+        try await waitUntil({ attachment.model.isShown })
+        XCTAssertEqual(replacement.anchors[ObjectMenuIDs.overlay], CGRect(x: 100, y: 200, width: 160, height: 0))
+    }
+
+    func testLassoSelectionWaitsForTheFloatingHostWithoutAnotherCanvasEvent() async throws {
+        let h = Harness(features: [FeatObjectMenuFeature.self])
+        let host = FakeCanvasHost(h)
+        let attachment = ObjectMenuAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        select(h, [Fixtures.shapeID], bounds: Rect(x: 100, y: 200, width: 160, height: 90))
+        XCTAssertFalse(attachment.model.isShown)
+        let floating = FakeFloatingHost()
+        h.session.floatingHost = floating
+        try await waitUntil({ attachment.model.isShown })
+        XCTAssertTrue(floating.isPresenting(ObjectMenuIDs.overlay))
+        XCTAssertEqual(floating.anchors[ObjectMenuIDs.overlay], CGRect(x: 100, y: 200, width: 160, height: 0))
+
+        // The actual capsule stays above the selection and inside the visible container in the reported sizes.
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834), CGSize(width: 390, height: 844)] {
+            let compact = size.width < 600
+            let bar = ObjectMenuBar(model: attachment.model,
+                                    maxQuick: compact ? ObjectMenuComposer.compactQuick : ObjectMenuComposer.regularQuick)
+            for variant in NibSnapshot.Variant.allCases {
+                let measured = NibSnapshot.fittingSize(bar, width: size.width, variant: variant)
+                let bounds = CGRect(origin: .zero, size: size)
+                let placement = try XCTUnwrap(ObjectMenuPlacement.place(bar: measured, selection: attachment.model.anchor,
+                                                                        in: bounds, top: 60, bottom: 16))
+                let frame = CGRect(x: placement.centre.x - measured.width / 2,
+                                   y: placement.centre.y - measured.height / 2,
+                                   width: measured.width, height: measured.height)
+                XCTAssertTrue(placement.above, "\(size), \(variant)")
+                XCTAssertEqual(placement.centre.x, attachment.model.anchor.midX, accuracy: 0.5)
+                XCTAssertEqual(frame.maxY, attachment.model.anchor.minY - ObjectMenuPlacement.gapAbove, accuracy: 0.5)
+                XCTAssertGreaterThanOrEqual(frame.minX, 16)
+                XCTAssertLessThanOrEqual(frame.maxX, bounds.maxX - 16)
+                XCTAssertGreaterThanOrEqual(frame.minY, 60)
+                XCTAssertLessThanOrEqual(frame.maxY, bounds.maxY - 16)
+            }
+        }
+    }
+
+    func testDeselectionAndDetachCancelWaitingForTheFloatingHost() async throws {
+        for detach in [false, true] {
+            let h = Harness(features: [FeatObjectMenuFeature.self])
+            let host = FakeCanvasHost(h)
+            let attachment = ObjectMenuAttachment()
+            attachment.attach(to: host)
+            select(h, [Fixtures.shapeID])
+            if detach {
+                attachment.detach(from: host)
+            } else {
+                h.session.selection = Selection()
+            }
+            let floating = FakeFloatingHost()
+            h.session.floatingHost = floating
+            try await Task.sleep(nanoseconds: 900_000_000)
+            XCTAssertFalse(attachment.model.isShown)
+            XCTAssertFalse(floating.isPresenting(ObjectMenuIDs.overlay))
+            XCTAssertEqual(floating.conversionAttempts, 0, "Cancelled recovery must not resurrect the capsule")
+            if !detach { attachment.detach(from: host) }
+        }
+    }
+
     func testMenuRecoversWhenGeometryDisappearsDuringReshow() async throws {
         let h = Harness(features: [FeatObjectMenuFeature.self])
         let host = FakeCanvasHost(h)

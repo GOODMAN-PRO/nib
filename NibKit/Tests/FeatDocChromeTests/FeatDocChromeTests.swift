@@ -953,6 +953,63 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertTrue(compact.overflow.map(\.id).contains(NavBarModel.addPage))
     }
 
+    func testAssistantDropletTransfersToPanelHeaderAndReturnsOnClose() async throws {
+        for side in ["left", "right"] {
+            let h = Harness(features: [FeatDocChromeFeature.self])
+            var assistant = panel(PanelIDs.assistant, .floating)
+            assistant.providesHeader = true
+            h.app.ui.panels.register(assistant)
+            h.app.ui.panels.register(panel("test.other", .floating))
+            h.app.settings.setJSON(ChromeSettings.placementName(PanelIDs.assistant), .string(side))
+            let window = try makeWindow(h)
+            let snapshot = ChromeDocumentModel(chrome: window).snapshot
+            let resting = window.navItems(snapshot: snapshot, compact: false).assistant
+            XCTAssertEqual(resting?.action, .command("panel.open", ["id": .string(PanelIDs.assistant)]))
+            XCTAssertEqual(resting?.symbol, .assistant)
+
+            // Opening another panel must leave the assistant's resting control available.
+            try await h.run("panel.open", ["id": "test.other"])
+            XCTAssertEqual(window.navItems(snapshot: snapshot, compact: false).assistant, resting)
+            try await h.run("panel.open", ["id": .string(PanelIDs.assistant)])
+            XCTAssertEqual(try chromeState(h).spot(of: PanelIDs.assistant), side == "left" ? .left : .right)
+            XCTAssertFalse(window.drawsHeader(assistant), "Keep the assistant's own NibPanelHeader")
+            for compact in [false, true] {
+                let items = window.navItems(snapshot: snapshot, compact: compact)
+                XCTAssertNil(items.assistant)
+                XCTAssertFalse((items.leading + items.trailing + items.overflow).contains { NavBarModel.isAssistant($0) },
+                               "The open panel owns the drop; no duplicate control in either bar or More")
+            }
+
+            try await h.run("panel.close", ["id": .string(PanelIDs.assistant)])
+            XCTAssertEqual(window.navItems(snapshot: snapshot, compact: false).assistant, resting)
+            XCTAssertEqual(window.navItems(snapshot: snapshot, compact: true).trailing.first { NavBarModel.isAssistant($0) }, resting)
+        }
+    }
+
+    func testOpenAssistantAlsoRemovesFeatureRegisteredDroplets() {
+        for group in [ToolbarGroup.navLeading, .navTrailing] {
+            for command in ["panel.open", "panel.close", "ai.chat.open", "ai.chat.close"] {
+                let assistant = ToolbarItemDescriptor(id: "feature.assistant", title: "Assistant",
+                                                      icon: NibSymbol.assistant.name, group: group, order: 1,
+                                                      owner: "test", command: command,
+                                                      params: ["id": .string(PanelIDs.assistant)])
+                var input = NavBarModel.Input(
+                    doc: Fixtures.docID, kind: .notebook, page: Fixtures.page1, readOnly: false, bookmarked: false,
+                    tool: "pen", hasSidebar: true, sidebarVisible: true, assistantPanel: PanelIDs.assistant,
+                    assistantOpen: true, registered: [assistant], commandExists: { _ in true }, hasMenu: { _ in true })
+                for compact in [false, true] {
+                    let items = NavBarModel.split(NavBarModel.build(input), compact: compact)
+                    XCTAssertNil(items.assistant)
+                    XCTAssertFalse((items.leading + items.trailing + items.overflow).contains { NavBarModel.isAssistant($0) })
+                    XCTAssertTrue(items.trailing.contains { $0.id == NavBarModel.undo })
+                    XCTAssertTrue(items.trailing.contains { $0.id == NavBarModel.more })
+                }
+                input.assistantOpen = false
+                XCTAssertEqual(NavBarModel.build(input).assistant?.id, assistant.id)
+            }
+        }
+    }
+
     func testCompactUndoAndAssistantIgnoreFeatureRegistrySideAndOrdering() {
         for group in [ToolbarGroup.navLeading, .navTrailing] {
             var undo = ToolbarItemDescriptor(id: "feature.undo", title: "Undo", icon: NibSymbol.undo.name,

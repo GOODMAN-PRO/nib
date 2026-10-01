@@ -64,6 +64,77 @@ final class NibTemplatesTests: XCTestCase {
 
     // MARK: Templates
 
+    func testDefaultCoverCatalogueUsesTheEightNamedClothsAndKeepsSavedIDs() throws {
+        let h = Harness(features: [NibTemplatesFeature.self], fixtures: false)
+        let covers = h.app.content.templates.all.filter(\.isCover)
+        XCTAssertEqual(covers.map(\.title),
+                       ["Moss", "Carbon", "Terracotta", "Sand", "Navy", "Oxblood", "Stone", "Paper"])
+        XCTAssertEqual(Set(covers.map(\.id)), Set([
+            "cover.solid", "cover.band", "cover.stripes", "cover.dots",
+            "cover.kraft", "cover.grid", "cover.frame", "cover.split"
+        ]))
+        let hexes: [UInt32] = [0x2F4A3E, 0x2A2D33, 0xA4553A, 0xD5C6A8,
+                              0x23324F, 0x5E1F24, 0x8C8A84, 0xF3F1EC]
+        XCTAssertEqual(covers.map { $0.render([:], .a4, 1).paper }, hexes.map(TemplatePalette.rgba))
+        XCTAssertEqual(covers.map { $0.defaults[TemplateParamNames.color] },
+                       hexes.map { .string(TemplatePalette.rgba($0).hex) })
+        let defaultRef = h.app.settings.get(NibSettings.defaultCover)
+        let defaultCover = try XCTUnwrap(h.app.content.templates.get(defaultRef.id))
+        XCTAssertEqual(defaultCover.title, "Moss")
+        XCTAssertEqual(defaultCover.render(defaultRef.params, PageSize(140, 182), 1).display.ops.count, 2)
+    }
+
+    func testEveryClothHasOnlyAFullHeightSpineAndElasticBand() throws {
+        let sizes = [PageSize(140, 182), PageSize(88, 116), PageSize(104, 136),
+                     .a4, PageSize.a4.rotated, .standard, .standardLandscape]
+        for cover in CoverTemplates.all {
+            for size in sizes {
+                for scale in [0.25, 1.0, 3.0] {
+                    let render = cover.render([:], size, scale)
+                    let ops = render.display.ops
+                    XCTAssertEqual(ops.count, 2, "\(cover.id): only spine and band, no pattern or label")
+                    let spine = try XCTUnwrap(ops.first)
+                    let band = try XCTUnwrap(ops.last)
+                    let unit = size.width / 140
+                    for op in ops {
+                        XCTAssertEqual(op.op, .rect)
+                        XCTAssertNil(op.stroke)
+                        XCTAssertNil(op.text)
+                        let rect = try XCTUnwrap(op.rect)
+                        XCTAssertEqual(rect.minY, 0)
+                        XCTAssertEqual(rect.height, size.height)
+                    }
+                    let spineRect = try XCTUnwrap(spine.rect)
+                    let bandRect = try XCTUnwrap(band.rect)
+                    XCTAssertEqual(spineRect.minX, 0)
+                    XCTAssertEqual(spineRect.width / unit, 13, accuracy: 1e-9)
+                    XCTAssertEqual(bandRect.width / unit, 5, accuracy: 1e-9)
+                    XCTAssertEqual((size.width - bandRect.minX) / unit, 22, accuracy: 1e-9)
+                    // Opaque shades lower each cloth channel by 16% and 30%, including light cloths.
+                    for (op, factor) in [(spine, 0.84), (band, 0.70)] {
+                        let fill = try XCTUnwrap(op.fill)
+                        XCTAssertEqual(Double(fill.r), Double(render.paper.r) * factor, accuracy: 0.5)
+                        XCTAssertEqual(Double(fill.g), Double(render.paper.g) * factor, accuracy: 0.5)
+                        XCTAssertEqual(Double(fill.b), Double(render.paper.b) * factor, accuracy: 0.5)
+                        XCTAssertEqual(fill.a, 255)
+                    }
+                }
+            }
+        }
+    }
+
+    func testCustomCoverColoursKeepBothClothDetails() {
+        for cover in CoverTemplates.all {
+            for color in ["navy", "#123456", "kraft"] {
+                let render = cover.render([TemplateParamNames.color: .string(color)], .a4, 2)
+                XCTAssertEqual(render.paper, TemplatePalette.parse(.string(color)))
+                XCTAssertEqual(render.display.ops.count, 2)
+                XCTAssertEqual(render.display.ops.first?.fill, TemplatePalette.shade(render.paper, 0.16))
+                XCTAssertEqual(render.display.ops.last?.fill, TemplatePalette.shade(render.paper, 0.30))
+            }
+        }
+    }
+
     func testEveryTemplateRendersInsideThePageAtA4AndStandardInBothOrientations() {
         let h = Harness(features: [NibTemplatesFeature.self], fixtures: false)
         let templates = h.app.content.templates.all.filter { $0.owner == NibTemplatesFeature.id }
@@ -304,6 +375,10 @@ final class NibTemplatesTests: XCTestCase {
 
         let covers = try await h.run("template.list", ["covers": true])
         XCTAssertEqual(covers["templates"]?.arrayValue?.count, 8)
+        XCTAssertEqual(covers["templates"]?.arrayValue?.compactMap { $0["title"]?.stringValue },
+                       ["Moss", "Carbon", "Terracotta", "Sand", "Navy", "Oxblood", "Stone", "Paper"])
+        XCTAssertEqual(covers["coverColors"]?.arrayValue?.compactMap { $0["name"]?.stringValue },
+                       NibCoverCloth.allCases.map(\.rawValue))
         let planners = try await h.run("template.list", ["category": "planners"], as: .ai("test"))
         let plannerCategories = planners["templates"]?.arrayValue?.compactMap { $0["category"]?.stringValue } ?? []
         XCTAssertFalse(plannerCategories.isEmpty)

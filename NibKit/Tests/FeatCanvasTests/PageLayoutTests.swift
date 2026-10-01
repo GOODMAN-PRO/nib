@@ -1,12 +1,56 @@
 import XCTest
 import UIKit
 import NibContracts
+import NibDesign
 @testable import FeatCanvas
 
 /// Pure layout, zoom, board-world, paging and tile-grid rules of the canvas (F006).
 final class PageLayoutTests: XCTestCase {
     private let a4 = PageSize.a4
     private let letterLandscape = PageSize.letter.rotated
+
+    func testMeasuredTopChromeIsCountedOnceWithTabsAndSafeArea() {
+        let baseline = NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.m
+        for compact in [false, true] {
+            for systemTop in [CGFloat(0), 24, 59] {
+                for tabs in [CGFloat(0), NibMetrics.tabCapsuleHeight] {
+                    // Actual top palette/options extent, with only the host's clearance after it.
+                    let occupiedBottom = systemTop + tabs + NibMetrics.barTopGap + NibMetrics.barHeight
+                        + NibSpacing.l + NibMetrics.paletteThickness + NibMetrics.barHeight - 1
+                    let desiredTop = occupiedBottom + NibSpacing.l
+                    let additional = UIEdgeInsets(top: desiredTop - systemTop - baseline,
+                                                  left: 0, bottom: 0, right: 0)
+                    let safe = UIEdgeInsets(top: systemTop + additional.top, left: 44, bottom: 21, right: 44)
+                    let result = CanvasChromeInsets.resolve(safeArea: safe, additional: additional,
+                        compact: compact, topDocked: true, fallbackTop: desiredTop + 100)
+                    XCTAssertEqual(result.top, desiredTop, accuracy: 1e-9,
+                                   "measured chrome wins over estimated options and is never added twice")
+                    XCTAssertEqual(result.top - occupiedBottom, NibSpacing.l, accuracy: 1e-9)
+                    XCTAssertEqual(result.bottom, safe.bottom + NibSpacing.l, accuracy: 1e-9)
+                    XCTAssertEqual(result.left, safe.left)
+                    XCTAssertEqual(result.right, safe.right)
+                }
+            }
+        }
+    }
+
+    func testTopDockReleasesBottomRailButRetainsMeasuredPanelClearance() {
+        let safe = UIEdgeInsets(top: 0, left: 0, bottom: 21, right: 0)
+        let bottom = CanvasChromeInsets.resolve(safeArea: safe, additional: .zero, compact: true,
+                                               topDocked: false, fallbackTop: nil)
+        XCTAssertEqual(bottom.bottom, 21 + NibMetrics.canvasBottomInsetCompact)
+        let top = CanvasChromeInsets.resolve(safeArea: safe, additional: .zero, compact: true,
+                                            topDocked: true, fallbackTop: 180)
+        XCTAssertEqual(top.top, 180)
+        XCTAssertGreaterThan(390 - top.top - top.bottom, 390 * 0.4)
+        XCTAssertEqual(bottom.bottom - top.bottom, NibMetrics.canvasBottomInsetCompact - NibSpacing.l)
+        let panelSafe = UIEdgeInsets(top: 0, left: 0, bottom: 141, right: 0)
+        let panel = CanvasChromeInsets.resolve(safeArea: panelSafe,
+            additional: UIEdgeInsets(top: 0, left: 0, bottom: 120, right: 0), compact: true,
+            topDocked: true, fallbackTop: 180)
+        XCTAssertEqual(panel.bottom, 141 + NibMetrics.canvasBottomInsetCompact,
+                       "the host's measured panel clearance uses the same baseline as EditorHost")
+    }
 
     // MARK: Vertical
 

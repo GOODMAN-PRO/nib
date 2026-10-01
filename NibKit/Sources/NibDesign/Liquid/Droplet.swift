@@ -194,7 +194,6 @@ struct DropletBodyModifier: ViewModifier {
     let field: DropletField
     var isBud = false
     var requestedHidden = false
-    @Environment(\.colorScheme) private var colorScheme
 
     var drawsNativeBody: Bool {
         Self.drawsBody(style: style, presentation: presentation, isBud: isBud, requestedHidden: requestedHidden)
@@ -222,16 +221,8 @@ struct DropletBodyModifier: ViewModifier {
                     .padding(.vertical, dy)
             }
             .modifier(GlassIDModifier(id: id, namespace: namespace))
-            .background {
-                // The fill must be a backdrop of the returned glass host, never part of its foreground.
-                if field.isFrozen {
-                    shape.fill(NibGlassBodyTint.color(style.glassKind, paperShare: presentation.paperShare,
-                                                     colorScheme: colorScheme))
-                } else {
-                    shape.fill(NibGlassBodyTint.systemUnderlay(style.glassKind, colorScheme: colorScheme,
-                                                              paperShare: presentation.paperShare))
-                }
-            }
+            // The container draws the contrast/frozen body behind GlassEffectContainer. A background
+            // here belongs to that container's content, above its combined native backdrop effect.
             .overlay {
                 if presentation.rim > 1.001 {
                     NibLiftRim(cornerRadius: shape.cornerRadius, boost: presentation.rim - 1)

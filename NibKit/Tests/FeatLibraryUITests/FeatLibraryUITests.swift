@@ -258,7 +258,7 @@ final class FeatLibraryUITests: XCTestCase {
     }
     func testFolderTitlesFitTheirMeasuredGridCellsWithoutTruncation() async throws {
         let h = harness(), model = LibraryModels.get(h.app).model(h.session)
-        let rows = ["Research", "Reference notes", "Reading"].enumerated().map { index, title in
+        let rows = ["Research", "Semester Notes", "Reference notes", "Reading"].enumerated().map { index, title in
             LibraryRow(ref: "folder:TITLETEST0\(index)", kind: "folder", title: title)
         }
         model.rows = rows
@@ -344,7 +344,7 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertFalse(LibraryPresentation.isCompact(size: CGSize(width: 1194, height: 834), idiom: .pad))
     }
 
-    func testBridgeStatusSharesControlRowAndMovesToBottomOnPhone() throws {
+    func testBridgeStatusMovesToNavigationAndLeavesPhoneActionPairSeparate() throws {
         for size in [CGSize(width: 390, height: 844), CGSize(width: 844, height: 390), CGSize(width: 768, height: 1024)] {
             let compact = size.height < 600 || size.width < 600
             let controlsWidth: CGFloat = compact ? 104 : 252
@@ -359,9 +359,9 @@ final class FeatLibraryUITests: XCTestCase {
             }.padding(NibSpacing.l).background(NibPaper.white.color)
             let image = try XCTUnwrap(NibSnapshot.image(view, size: size))
             let midY: CGFloat = compact ? size.height - 16 - 22 : 16 + 22
-            let status = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width - 16 - 44 - 16 - 30, y: midY)))
-            let secondStatus = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width - 16 - 22, y: midY)))
-            let controls = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width - 16 - 44 - 16 - 60 - 16 - controlsWidth / 2, y: midY)))
+            let status = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: compact ? 16 + 30 : size.width - 16 - 44 - 16 - 30, y: midY)))
+            let secondStatus = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: compact ? 16 + 60 + 16 + 22 : size.width - 16 - 22, y: midY)))
+            let controls = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: compact ? size.width - 16 - controlsWidth / 2 : size.width - 16 - 44 - 16 - 60 - 16 - controlsWidth / 2, y: midY)))
             XCTAssertGreaterThan(Int(status.r) - Int(status.b), 80, "Status must align with the measured control row")
             XCTAssertGreaterThan(Int(secondStatus.g) - Int(secondStatus.b), 20, "Contributions must sit beside one another")
             XCTAssertGreaterThan(Int(controls.b) - Int(controls.r), 80)
@@ -372,8 +372,118 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
 
+    func testPhoneStatusRemainsInNavigationWhileBrowserHasOnlySearchAndNew() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        for (id, placement) in [("test.sync", ChromePlacement.bottomTrailing), ("test.bridge", .topTrailing)] {
+            h.app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
+                id: id, owner: "test", placement: placement, surface: .none) { _ in
+                    AnyView(Color.red.frame(width: 44, height: 44))
+                })
+        }
+        for sidebar in [true, false] {
+            model.sidebarVisible = sidebar
+            var frames: [String: CGRect] = [:]
+            let view = LibraryRootView(model: model, idiom: .phone)
+                .onPreferenceChange(LibraryChromeFrames.self) { frames = $0 }
+            _ = try await hostlessLayoutImage(view, size: CGSize(width: 393, height: 852), variant: .light)
+            for id in ["test.sync", "test.bridge"] {
+                XCTAssertEqual(frames["overlay." + id] != nil, sidebar)
+            }
+            if sidebar {
+                XCTAssertNil(frames["bottom.controls"])
+            } else {
+                let controls = try XCTUnwrap(frames["bottom.controls"])
+                XCTAssertEqual(controls.width, LibraryPresentation.actionPairWidth, accuracy: 0.5)
+                XCTAssertEqual(controls.maxX, 393 - NibSpacing.l, accuracy: 0.5)
+            }
+        }
+    }
+
+    func testNewMenuViewportEndsBetweenRowsAndReservesContinuationCue() {
+        for height: CGFloat in [220, 310, 415, 520, 800] {
+            for rowHeight: CGFloat in [44, 52, 64] {
+                let header: CGFloat = 66
+                let layout = LibraryMenuViewport(available: height, count: 9, rowHeight: rowHeight, header: header)
+                XCTAssertEqual(layout.viewportHeight.truncatingRemainder(dividingBy: rowHeight), 0)
+                XCTAssertLessThanOrEqual(layout.height, min(height, NibMetrics.popoverMaxHeight))
+                XCTAssertGreaterThanOrEqual(layout.viewportHeight, rowHeight)
+                if layout.scrolls {
+                    XCTAssertGreaterThanOrEqual(layout.height - header - layout.viewportHeight, NibSpacing.l + NibSpacing.m)
+                } else {
+                    XCTAssertEqual(layout.viewportHeight, 9 * rowHeight)
+                }
+            }
+        }
+        let shortMenu = LibraryMenuViewport(available: 520, count: 3, rowHeight: 44, header: 66)
+        XCTAssertFalse(shortMenu.scrolls)
+        XCTAssertEqual(shortMenu.viewportHeight, 132)
+    }
+
+    func testFolderStyleResolvesSymbolEmojiAndDefaultForBothLayouts() throws {
+        var row = LibraryRow(ref: "folder:STYLECHECK01", kind: "folder", title: "Semester Notes", color: "#0066E0", icon: "graduationcap.fill")
+        XCTAssertEqual(row.folderGlyph, .symbol(try XCTUnwrap(NibSymbol(systemName: "graduationcap.fill"))))
+        XCTAssertEqual(UIColor(row.folderColor), try XCTUnwrap(RGBA(hex: "#0066E0")).uiColor)
+        row.icon = "📚"
+        XCTAssertEqual(row.folderGlyph, .emoji("📚"))
+        row.icon = nil
+        XCTAssertEqual(row.folderGlyph, .symbol(.folderFill))
+    }
+
+    func testFolderListRowDrawsTheStoredBlueGlyphInBothThemes() throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let row = LibraryRow(ref: "folder:STYLECHECK01", kind: "folder", title: "Semester Notes", color: "#0066E0", icon: "graduationcap.fill")
+        for variant in [NibSnapshot.Variant.light, .dark] {
+            let image = try XCTUnwrap(NibSnapshot.image(
+                LibraryListRow(row: row, model: model).background(NibColor.background),
+                size: CGSize(width: 400, height: 80), variant: variant))
+            var bluePixels = 0
+            for y in 8..<72 {
+                for x in 8..<44 {
+                    let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                    if Int(pixel.b) - Int(pixel.r) > 80 && Int(pixel.b) - Int(pixel.g) > 40 { bluePixels += 1 }
+                }
+            }
+            XCTAssertGreaterThan(bluePixels, 40, "A generic grey folder must not replace the stored glyph colour")
+        }
+    }
+
+    func testCompactHeightPresentsFoldersBesideCompleteDocumentCards() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        let folder = LibraryRow(ref: "folder:LANDSCAPE01", kind: "folder", title: "Semester Notes")
+        let document = LibraryRow(ref: "doc:LANDSCAPE02", kind: "notebook", title: "Physics", pages: 12)
+        model.rows = [folder, document]
+        model.applySort()
+        for width: CGFloat in [520, 656] {
+            var frames: [String: CGRect] = [:]
+            let view = LibraryGridView(model: model, compactHeight: true)
+                .environment(\.horizontalSizeClass, .compact)
+                .onPreferenceChange(LibraryFrames.self) { frames = $0 }
+            _ = try await hostlessLayoutImage(view, size: CGSize(width: width, height: 250), variant: .light)
+            let folderFrame = try XCTUnwrap(frames[folder.ref])
+            let documentFrame = try XCTUnwrap(frames[document.ref])
+            XCTAssertGreaterThanOrEqual(documentFrame.minX, folderFrame.maxX + NibSpacing.l - 0.5)
+            XCTAssertLessThanOrEqual(documentFrame.maxY, 250, "The cover, title and metadata must fit initially")
+            XCTAssertLessThanOrEqual(documentFrame.maxX, width)
+        }
+    }
+
+    func testRootHidesBreadcrumbButFolderRetainsAncestorNavigation() async throws {
+        let h = harness(), model = LibraryModels.get(h.app).model(h.session)
+        model.sidebarVisible = false
+        await model.appear()
+        for folder in [nil, model.allFolders.first?.nodeID] {
+            model.folder = folder
+            var targets: [String: CGRect] = [:]
+            let view = LibraryRootView(model: model, idiom: .pad)
+                .onPreferenceChange(LibraryTargets.self) { targets = $0 }
+            _ = try await hostlessLayoutImage(view, size: CGSize(width: 834, height: 1194), variant: .light)
+            XCTAssertEqual(targets["breadcrumb:lib"] != nil, folder != nil)
+        }
+        XCTAssertFalse(model.allFolders.isEmpty, "The ancestor check requires a folder fixture")
+    }
+
     func testFolderColumnsPreserveOrdinaryNamesBeforeAddingColumns() {
-        let minimum = LibraryFolderLayout.minimumWidth(names: ["Semester 1", "Physics 9702"], font: NibUIFont.button)
+        let minimum = LibraryFolderLayout.minimumWidth(names: ["Semester Notes", "Physics 9702"], font: NibUIFont.button)
         let width: CGFloat = 656
         let count = LibraryFolderLayout.columnCount(width: width, minimum: minimum, gutter: NibMetrics.libraryGutter)
         XCTAssertLessThan(count, 4)

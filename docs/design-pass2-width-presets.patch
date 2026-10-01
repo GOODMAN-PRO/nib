@@ -1,0 +1,19 @@
+--- a/NibKit/Sources/FeatPresets/ToolPresetMenu.swift
++++ b/NibKit/Sources/FeatPresets/ToolPresetMenu.swift
+@@ -413,12 +413,12 @@
+         HStack(spacing: 0) {
+             ForEach(0..<PresetRules.widthSlots, id: \.self) { i in
+                 let selected = i == presets.selectedWidth
+-                LineSampleButton(lineWidth: WidthScale.slotLineWidth(presets.widths[i], tool: tool), pattern: presets.patterns[i],
+-                                 isSelected: selected, label: String(localized: "Thickness \(i + 1)"),
+-                                 value: PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i]),
+-                                 hint: selected ? String(localized: "Double-tap to adjust.") : nil) {
++                NibWidthPresetButton(diameter: NibMetrics.widthPresetDot(i), isSelected: selected,
++                                     label: String(localized: "Thickness \(i + 1)")) {
+                     model.tapWidth(i)
+                 }
++                .accessibilityValue(PresetText.widthValue(presets.widths[i], pattern: presets.patterns[i]))
++                .accessibilityHint(selected ? String(localized: "Double-tap to adjust.") : "")
+                 .presetPopoverSource(tool, model.shown == .width(i))
+             }
+             NibBarSeparator()

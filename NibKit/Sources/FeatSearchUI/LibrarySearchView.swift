@@ -8,6 +8,7 @@ struct LibrarySearchView: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
+    @State private var searchPresented = true
     var body: some View {
         NavigationStack {
             SearchResults(app: app, session: session, state: state)
@@ -15,10 +16,12 @@ struct LibrarySearchView: View {
                 .navigationTitle(String(localized: "Search"))
                 .navigationBarTitleDisplayMode(.inline)
                 .searchable(text: searchBinding(app: app, session: session, state: state),
+                    isPresented: $searchPresented,
                     placement: .navigationBarDrawer(displayMode: .always), prompt: String(localized: "Search your notes"))
+                .onChange(of: state.focusGeneration) { _, _ in searchPresented = true }
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        NibButton(String(localized: "Close search"), kind: .plain) {
+                        Button(String(localized: "Close search")) {
                             app.perform(CommandIDs.searchOpen, ["scope": .string(state.scope), "close": true], session: session)
                         }
                     }
@@ -33,13 +36,17 @@ struct LibrarySearchOverlay: View {
     let app: NibApp
     let session: EditorSession
     @ObservedObject var state: SearchState
-    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var viewport: SearchViewport?
     var body: some View {
-        if sizeClass == .compact {
+        if SearchOpen.usesDocumentSheet {
             LibrarySearchView(app: app, session: session, state: state)
         } else {
             GeometryReader { geometry in
-                let width = min(NibMetrics.searchWidth, geometry.size.width - NibSpacing.x3)
+                let width = SearchViewport.panelWidth(availableWidth: geometry.size.width - 2 * NibMetrics.chromeInset,
+                    windowSize: viewport?.windowSize ?? geometry.size)
+                let top = NibMetrics.barTopGap + NibMetrics.barHeight + NibMetrics.minimumRestingGap
+                let height = SearchViewport.resultsHeight(availableHeight: min(geometry.size.height,
+                    viewport?.availableHeight ?? geometry.size.height) - top, reservesNavigation: false)
                 ZStack(alignment: .top) {
                     NibColor.scrim.opacity(0)
                         .contentShape(Rectangle())
@@ -52,16 +59,23 @@ struct LibrarySearchOverlay: View {
                         }
                         .padding(.trailing, NibSpacing.xs)
                         .frame(width: width)
+                        .nibChromeTypeCap()
                         .droplet("searchui.libraryField", style: .bar)
                         .budsFrom("library.search", isPresented: presentationBinding, instant: state.instant)
                         SearchResults(app: app, session: session, state: state)
                             .frame(width: width)
-                            .frame(maxHeight: min(NibMetrics.searchResultsMaxHeight,
-                                max(NibMetrics.hitTarget, geometry.size.height - NibMetrics.barHeight - NibSpacing.x6)))
+                            .frame(height: height)
+                            .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                             .droplet("searchui.libraryResults", style: .panel)
                             .budsFrom("searchui.libraryField", isPresented: presentationBinding, instant: state.instant)
                     }
-                    .padding(.top, NibSpacing.l)
+                    .padding(.top, top)
+                }
+                .background {
+                    SearchViewportReader { viewport = $0 }
+                        .frame(width: width)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
                 }
             }
         }

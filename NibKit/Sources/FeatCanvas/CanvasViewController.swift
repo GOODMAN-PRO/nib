@@ -184,7 +184,8 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         guard size.width > 0, size.height > 0, !isClosed else { return }
         // Capture the reading position before UIKit adjusts the content inset.
         let anchor = didInitialLayout ? centreAnchor() : nil
-        let fittedPage = isAtFit && !hasManualPan ? currentPage : nil
+        // Docking and tabs move floating chrome, not the paper. Only a viewport resize may refit its top.
+        let fittedPage = size != lastViewport && isAtFit && !hasManualPan ? currentPage : nil
         let previousInsets = scrollView.chromeInsets
         updateChromeInsets()
         if size != lastViewport || previousInsets != scrollView.chromeInsets || !didInitialLayout {
@@ -331,25 +332,33 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
     /// starts below the bars and its last line scrolls above the palette.
     private func updateChromeInsets() {
         let safe = view.safeAreaInsets
-        var top = safe.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.m
+        var fallbackTop: CGFloat?
+        var topDocked = false
         if app.ui.screens.toolbarView != nil, !session.readOnly {
             let savedName = app.settings.json(CommandIDs.toolbarDock)?["edge"]?.stringValue
             let savedEdge = savedName.flatMap { NibDock(commandValue: $0) }
             let defaultEdge: NibDock = isCompact ? .bottom : (view.bounds.width > view.bounds.height ? .leading : .top)
             if (savedEdge ?? defaultEdge) == .top {
+                topDocked = true
+                // EditorHost passes the chrome's occupied bounds through additionalSafeAreaInsets,
+                // less the canvas baseline. Never feed that clearance back into the dock geometry.
                 let region = DropletDockModel.region(
                     size: view.bounds.size,
-                    safeArea: EdgeInsets(top: safe.top, leading: safe.left, bottom: safe.bottom, trailing: safe.right),
+                    safeArea: EdgeInsets(top: max(0, safe.top - additionalSafeAreaInsets.top),
+                                         leading: max(0, safe.left - additionalSafeAreaInsets.left),
+                                         bottom: max(0, safe.bottom - additionalSafeAreaInsets.bottom),
+                                         trailing: max(0, safe.right - additionalSafeAreaInsets.right)),
                     compact: isCompact)
                 let thickness = min(NibMetrics.paletteThicknessMax, max(NibMetrics.paletteThickness,
                     UIFontMetrics(forTextStyle: .body)
                         .scaledValue(for: NibMetrics.paletteThickness, compatibleWith: traitCollection)))
-                // Reserve the fused options bar too, even while scrolling temporarily folds it away.
-                top = region.minY + thickness + NibMetrics.barHeight + NibSpacing.m
+                // Standalone editors have no measured chrome; use the shared dock metrics as a fallback.
+                fallbackTop = region.minY + thickness + NibMetrics.barHeight + NibSpacing.m
             }
         }
-        let bottom = isCompact ? safe.bottom + NibMetrics.canvasBottomInsetCompact : safe.bottom + NibSpacing.l
-        scrollView.chromeInsets = UIEdgeInsets(top: top, left: safe.left, bottom: bottom, right: safe.right)
+        scrollView.chromeInsets = CanvasChromeInsets.resolve(safeArea: safe, additional: additionalSafeAreaInsets,
+                                                            compact: isCompact, topDocked: topDocked,
+                                                            fallbackTop: fallbackTop)
     }
 
     /// Lays the pages out for the current mode and window, then zooms and scrolls: to the current page at fit the first

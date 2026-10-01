@@ -49,7 +49,7 @@ struct NavStatusItem: Identifiable, Equatable {
 struct NavBarItems: Equatable {
     var leading: [NavItem]
     var trailing: [NavItem]
-    /// iPad: a separate 44 pt droplet, 16 pt beyond the editing group.
+    /// iPad: a resting 44 pt droplet, 16 pt beyond the editing group; the open panel owns the drop mark.
     var assistant: NavItem? = nil
     /// Compact windows: items that moved into More.
     var overflow: [NavItem] = []
@@ -176,7 +176,10 @@ enum NavBarModel {
             NavStatusItem(id: $0.id, showsInCompactWidth: $0.showsInCompactWidth)
         }
         let all = (leading + trailing).sorted(by: byOrder)
-        let assistantItem = all.first { isAssistant($0) }
+        // §14.9: opening the assistant transfers its drop to NibPanelHeader. Remove the resting control
+        // at composition time so neither the separate droplet nor compact navigation duplicates the header.
+        // This also covers feature-registered assistant actions; closing the panel restores their live state.
+        let assistantItem = input.assistantOpen ? nil : all.first { isAssistant($0) }
         let editing = all.filter { editingOrder($0) != nil }.sorted {
             (editingOrder($0) ?? 0, $0.order, $0.id) < (editingOrder($1) ?? 0, $1.order, $1.id)
         }

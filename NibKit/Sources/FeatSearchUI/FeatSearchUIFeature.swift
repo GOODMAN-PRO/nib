@@ -72,7 +72,7 @@ public enum FeatSearchUIFeature: NibFeature {
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(id: "searchui.counter", owner: id, placement: .bottom, surface: .none,
             isVisible: { context in
                 let state = SearchRuntime.from(context.app).state(context.session)
-                return !state.isLibraryScope && state.isPresented && state.document == context.session.document && !state.visibleMatches.isEmpty
+                return !SearchOpen.usesDocumentSheet && !state.isLibraryScope && state.isPresented && state.document == context.session.document && !state.visibleMatches.isEmpty
             }, makeView: { context in
                 AnyView(SearchCounter(app: context.app, session: context.session,
                     state: SearchRuntime.from(context.app).state(context.session)))
@@ -151,13 +151,13 @@ struct SearchOpen: NibCommand {
         if let query = p.query { state.query = query }
         if let filter = p.filter, let value = SearchFilter(rawValue: filter.rawValue) {
             state.filter = value
-            if !state.visibleMatches.contains(where: { $0.id == state.selectedID }) { state.selectedID = nil }
+            state.reconcileSelection()
         }
         if p.query == nil && p.filter == nil && p.match == nil { state.instant = p.instant ?? false }
         state.isPresented = true
         if p.match == nil && p.refresh != true && !changed && p.filter == nil { state.focusGeneration += 1 }
         if p.match == nil && p.refresh != true {
-            if state.isLibraryScope, let host = session.floatingHost {
+            if state.isLibraryScope, !usesDocumentSheet, let host = session.floatingHost {
                 if !host.isPresenting(libraryOverlay) {
                     host.present(libraryOverlay) { LibrarySearchOverlay(app: app, session: session, state: state) }
                 }

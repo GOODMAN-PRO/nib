@@ -108,6 +108,46 @@ final class GlassForegroundSnapshotTests: XCTestCase {
         XCTAssertEqual(NibUIColor.deepBody.resolvedColor(with: dark).cgColor.alpha, 0.86, accuracy: 0.001)
     }
 
+    func testNativeBackdropDarkensOnlyTheDropletSilhouettesBeforeGlassComposites() throws {
+        let canvas = CGSize(width: 360, height: 400)
+        let paper = CGRect(origin: .zero, size: canvas)
+        let surfaces: [(DropletStyle, CGRect)] = [
+            (.bar, CGRect(x: 40, y: 100, width: 280, height: 44)),
+            (.palette, CGRect(x: 40, y: 44, width: 56, height: 300)),
+            (.popover, CGRect(x: 40, y: 40, width: 280, height: 320)),
+            (.hud, CGRect(x: 40, y: 100, width: 120, height: 40)),
+            // A nonrefracting page-resident chip still needs the same neutral contrast protection.
+            (.chip, CGRect(x: 40, y: 100, width: 180, height: 44))
+        ]
+        for (style, frame) in surfaces {
+            let field = DropletField()
+            field.usesSystemGlass = true
+            field.setBackdrop([paper])
+            field.setRest("surface", frame, style: style)
+            defer { field.unregister("surface") }
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                let underlay = NativeGlassBackdropLayer(field: field).background(Color.white)
+                let image = try XCTUnwrap(NibSnapshot.image(underlay, size: canvas, variant: variant))
+                let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: frame.midX, y: frame.midY)))
+                if variant == .dark {
+                    XCTAssertLessThan(max(centre.r, centre.g, centre.b), 85, "Glass must sample a dark backdrop")
+                    XCTAssertGreaterThanOrEqual(contrast(RGBA.white, centre), 4.5)
+                } else {
+                    XCTAssertEqual(centre, RGBA.white, "No extra body behind light system glass")
+                }
+                XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: 2, y: 2)), RGBA.white,
+                               "The underlay must not tint the page outside the droplet")
+            }
+            // Backdrop changes publish even while the field is idle, with no display-link tick.
+            field.setBackdrop([])
+            if style.material == .clear {
+                let image = try XCTUnwrap(NibSnapshot.image(NativeGlassBackdropLayer(field: field).background(Color.white),
+                                                           size: canvas, variant: .dark))
+                XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: frame.midX, y: frame.midY)), RGBA.white)
+            }
+        }
+    }
+
     func testChromeColoursKeepAppAppearanceWhenGlassAdaptsToTheOppositeBackdrop() {
         for scheme in [ColorScheme.light, .dark] {
             var app = EnvironmentValues()
@@ -125,6 +165,32 @@ final class GlassForegroundSnapshotTests: XCTestCase {
         }
     }
 
+    func testStaticGlassCanCarryItsUnderlayOutsideAContainerWithoutTintingPaper() throws {
+        let shape = NibDropletShape()
+        for variant in [NibSnapshot.Variant.light, .dark] {
+            let tint = NibGlassBodyTint.systemUnderlay(.clear, colorScheme: variant.colorScheme, paperShare: 1)
+            // Exercise the same anchor transport without a UIKit-backed glass host, so this runs hostless too.
+            let view = Color.clear
+                .frame(width: 180, height: 44)
+                .anchorPreference(key: NibStaticGlassBackdropKey.self, value: .bounds) {
+                    [NibStaticGlassBackdrop(bounds: $0, shape: shape, tint: tint)]
+                }
+                .frame(width: 360, height: 240)
+                .backgroundPreferenceValue(NibStaticGlassBackdropKey.self) {
+                    NativeStaticGlassBackdropLayer(backdrops: $0)
+                }
+                .background(Color.white)
+            let image = try XCTUnwrap(NibSnapshot.image(view, size: size, variant: variant))
+            let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 180, y: 120)))
+            if variant == .dark {
+                XCTAssertGreaterThanOrEqual(contrast(RGBA.white, centre), 4.5)
+            } else {
+                XCTAssertEqual(centre, RGBA.white)
+            }
+            XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: 20, y: 20)), RGBA.white)
+        }
+    }
+
     func testSharedChromeComponentsKeepTheirGlyphsWhenGlassChangesLocalAppearance() throws {
         let components: [(String, AnyView)] = [
             ("title", AnyView(NibBarTitle(title: "Physics", subtitle: "Page 1 of 4"))),
@@ -132,6 +198,7 @@ final class GlassForegroundSnapshotTests: XCTestCase {
             ("tool", AnyView(NibToolButton(tool: NibTool(id: "pen", label: "Pen", symbol: .pen),
                                             isSelected: true) {})),
             ("hud", AnyView(NibHUDText("125%", secondary: "3 of 12"))),
+            ("width", AnyView(NibWidthPresetButton(diameter: 12, isSelected: true, label: "Thickness") {})),
             ("search", AnyView(NibSearchField(text: .constant(""), prompt: "Find", style: .onDroplet)
                 .frame(width: 240)))
         ]

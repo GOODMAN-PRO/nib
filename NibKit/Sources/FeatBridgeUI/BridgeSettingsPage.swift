@@ -821,6 +821,7 @@ struct BridgeSettingsPage: View {
         Section {
             NibToggle(String(localized: "MCP bridge"),
                       isOn: Binding(get: { model.isEnabled }, set: { on in Task { await model.setEnabled(on) } }))
+                .tint(NibColor.success)
                 .disabled(model.busy)
             BridgeStatusRow(state: model.state, detail: model.stateDetail)
         } footer: {
@@ -1142,6 +1143,7 @@ struct BridgeSettingsPage: View {
         Section {
             NibToggle(String(localized: "Keep screen awake"),
                       isOn: Binding(get: { model.keepScreenAwake }, set: { on in Task { await model.setKeepScreenAwake(on) } }))
+                .tint(NibColor.success)
         } footer: {
             BridgeFooter(String(localized: "iOS pauses the bridge when the screen locks or you leave Nib. While the bridge is on, this stops the screen from locking."))
         }

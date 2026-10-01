@@ -41,9 +41,9 @@ enum TemplatePalette {
 
     static let kraft = RGBA(0xC4, 0xA2, 0x7A)
 
-    /// Cover cloths (DESIGN.md §3.6) plus kraft.
+    /// The eight cover cloths shared with NibDesign (DESIGN.md §3.6).
     static let cloths: [(name: String, color: RGBA)] =
-        NibCoverCloth.allCases.map { (name: $0.rawValue, color: TemplatePalette.rgba($0.hex)) } + [(name: "kraft", color: kraft)]
+        NibCoverCloth.allCases.map { (name: $0.rawValue, color: TemplatePalette.rgba($0.hex)) }
 
     /// "#RRGGBB[AA]" or a preset name ("white", "yellow", "dark", "ivory", …, cloth names such as "navy").
     static func parse(_ value: JSONValue?) -> RGBA? {
@@ -51,6 +51,8 @@ enum TemplatePalette {
         let s = raw.trimmingCharacters(in: .whitespaces).lowercased()
         if let p = papers.first(where: { $0.name == s }) { return p.paper }
         if let c = cloths.first(where: { $0.name == s }) { return c.color }
+        // Preserve saved custom colours without offering kraft as a ninth default cloth.
+        if s == "kraft" { return kraft }
         return RGBA(hex: s)
     }
 
