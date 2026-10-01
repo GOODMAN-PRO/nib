@@ -93,8 +93,15 @@ final class FailedCommands: @unchecked Sendable {
 final class TabStripTestFloatingHost: FloatingHosting {
     private(set) var content: [String: AnyView] = [:]
 
-    func present(_ id: String, content: AnyView) { self.content[id] = content }
-    func dismiss(_ id: String) { content[id] = nil }
+    var renderedHost: NibFloatingHost?
+    func present(_ id: String, content: AnyView) {
+        self.content[id] = content
+        renderedHost?.present(id) { content }
+    }
+    func dismiss(_ id: String) {
+        content[id] = nil
+        renderedHost?.dismiss(id)
+    }
     func isPresenting(_ id: String) -> Bool { content[id] != nil }
     func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { false }
     func removeAnchor(_ id: String) {}
@@ -772,20 +779,19 @@ final class FeatWindowsTests: XCTestCase {
         document.additionalSafeAreaInsets = UIEdgeInsets(top: 8, left: 4, bottom: 12, right: 4)
         let originalInsets = document.additionalSafeAreaInsets
         let host = TabStripTestFloatingHost()
-        let menu = UIView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
-        menu.semanticContentAttribute = .forceLeftToRight
         var anchor = CGRect(x: 308, y: 32, width: 44, height: 44)
         var bounds = CGRect(x: 24, y: 24, width: 1146, height: 780)
-        host.convertRect = { _, view in view === menu ? anchor : bounds }
         let presentation = TabStripDocumentPresentation(controller: document, host: host)
-        presentation.updateGeometry(from: menu, compact: false)
+        presentation.updateContainer(bounds)
+        presentation.updateAnchor(anchor, compact: false, rightToLeft: false)
         let wideSlot = presentation.slot
         XCTAssertEqual(wideSlot.midY, anchor.midY)
         XCTAssertGreaterThan(wideSlot.width, 0)
 
         anchor = CGRect(x: 224, y: 56, width: 44, height: 44)
         bounds.size.width = 393
-        presentation.updateGeometry(from: menu, compact: true)
+        presentation.updateContainer(bounds)
+        presentation.updateAnchor(anchor, compact: true, rightToLeft: false)
         XCTAssertTrue(presentation.compact)
         XCTAssertEqual(presentation.slot.midY, anchor.midY)
         XCTAssertEqual(presentation.slot.width, 0)
@@ -793,14 +799,143 @@ final class FeatWindowsTests: XCTestCase {
 
         anchor = CGRect(x: 352, y: 32, width: 44, height: 44)
         bounds.size.width = 1146
-        presentation.updateGeometry(from: menu, compact: false)
+        presentation.updateContainer(bounds)
+        presentation.updateAnchor(anchor, compact: false, rightToLeft: false)
         XCTAssertLessThan(presentation.slot.width, wideSlot.width)
         anchor.origin.x += 44 // a status/title change without resizing the window
-        presentation.refreshGeometry()
+        presentation.updateAnchor(anchor, compact: false, rightToLeft: false)
         XCTAssertEqual(presentation.slot.minX, anchor.maxX + NibSpacing.xs + NibSpacing.l)
         presentation.dismiss()
         XCTAssertEqual(presentation.slot, .zero)
         XCTAssertEqual(document.additionalSafeAreaInsets, originalInsets)
+    }
+
+    func testDocumentTabMeasurementsCanArriveInEitherOrderAndRecoverFromNoRoom() {
+        for anchorFirst in [false, true] {
+            let document = UIViewController()
+            document.loadViewIfNeeded()
+            let host = TabStripTestFloatingHost()
+            let presentation = TabStripDocumentPresentation(controller: document, host: host)
+            let anchor = CGRect(x: 308, y: 32, width: 44, height: 44)
+            let wide = CGRect(x: 24, y: 24, width: 1146, height: 780)
+            if anchorFirst {
+                // The menu lays out before the floating layer attaches; no UIKit conversion is available.
+                presentation.updateAnchor(anchor, compact: false, rightToLeft: false)
+                XCTAssertEqual(presentation.slot, .zero)
+                presentation.updateContainer(wide)
+            } else {
+                presentation.updateContainer(wide)
+                XCTAssertEqual(presentation.slot, .zero)
+                presentation.updateAnchor(anchor, compact: false, rightToLeft: false)
+            }
+            let original = presentation.slot
+            let plan = TabStripLayout.documentPlan(count: 3, active: 2, width: original.width, compact: false)
+            XCTAssertFalse(plan.shown.isEmpty)
+            XCTAssertTrue(plan.shown.contains(2))
+            XCTAssertEqual(original.midY, anchor.midY)
+
+            presentation.updateContainer(CGRect(x: 24, y: 24, width: 393, height: 780))
+            XCTAssertEqual(presentation.slot.width, 0)
+            presentation.updateContainer(wide)
+            XCTAssertEqual(presentation.slot, original) // no menu movement or tab-model update needed
+
+            document.additionalSafeAreaInsets.right = 30
+            document.view.layoutIfNeeded()
+            presentation.refreshGeometry()
+            let expected = TabStripLayout.documentSlot(control: anchor,
+                bounds: wide.inset(by: document.view.safeAreaInsets), compact: false, rightToLeft: false)
+            XCTAssertEqual(presentation.slot, expected)
+
+            presentation.updateContainer(.zero)
+            XCTAssertEqual(presentation.slot, .zero)
+            presentation.updateContainer(wide)
+            XCTAssertEqual(presentation.slot, expected)
+            presentation.updateAnchor(.null, compact: true, rightToLeft: false)
+            XCTAssertTrue(presentation.compact) // layout mode survives unavailable initial geometry
+            XCTAssertEqual(presentation.slot, .zero)
+        }
+    }
+
+    func testDocumentTabPlacementMirrorsMeasuredFramesInFloatingCoordinates() {
+        let document = UIViewController()
+        document.loadViewIfNeeded()
+        let host = TabStripTestFloatingHost()
+        let presentation = TabStripDocumentPresentation(controller: document, host: host)
+        let bounds = CGRect(x: 90, y: 28, width: 1194, height: 834)
+        let anchor = CGRect(x: 350, y: 60, width: 44, height: 44)
+        presentation.updateContainer(bounds)
+        presentation.updateAnchor(anchor, compact: false, rightToLeft: false)
+        let ltr = presentation.slot
+        let mirrored = CGRect(x: bounds.minX + bounds.maxX - anchor.maxX,
+                              y: anchor.minY, width: anchor.width, height: anchor.height)
+        presentation.updateAnchor(mirrored, compact: false, rightToLeft: true)
+        XCTAssertEqual(presentation.slot.width, ltr.width)
+        XCTAssertEqual(presentation.slot.minX, bounds.minX + bounds.maxX - ltr.maxX)
+        XCTAssertEqual(presentation.slot.midY, anchor.midY)
+    }
+
+    func testLaidOutDocumentMenuShowsCapsulesAfterFloatingHostAttachmentInBothAppearances() async throws {
+        let (h, scenes, _) = try windows()
+        h.app.settings.set(WindowSettings.showTabs, true)
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let model = TabStripModel(app: h.app, navigator: navigator, scenes: scenes)
+
+        for appearance in [ColorScheme.light, .dark] {
+            let document = UIViewController()
+            document.loadViewIfNeeded()
+            let host = TabStripTestFloatingHost()
+            let floating = NibFloatingHost()
+            host.renderedHost = floating
+            let presentation = TabStripDocumentPresentation(controller: document, host: host)
+            presentation.present(model)
+            let root = NibDropletContainer {
+                ZStack(alignment: .topLeading) {
+                    DocumentTabsMenu(model: model, placement: presentation, compact: false)
+                        .position(x: 330, y: 54)
+                    NibFloatingLayer(host: floating)
+                }
+            }
+            .environment(\.colorScheme, appearance)
+            let hosting = UIHostingController(rootView: root)
+            hosting.safeAreaRegions = []
+            document.addChild(hosting)
+            document.view.addSubview(hosting.view)
+            hosting.didMove(toParent: document)
+            hosting.view.frame = CGRect(x: 0, y: 0, width: 1194, height: 834)
+            let window = UIWindow(frame: hosting.view.frame)
+            window.rootViewController = document
+            window.isHidden = false
+            defer {
+                presentation.dismiss()
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            hosting.view.layoutIfNeeded()
+            try await waitUntil { presentation.slot.width >= 2 * 120 + 2 * TabStripLayout.inset }
+            let wide = presentation.slot
+            let plan = TabStripLayout.documentPlan(count: model.tabs.count, active: model.activeIndex,
+                                                  width: wide.width, compact: false)
+            XCTAssertEqual(plan.shown, [0, 1], "Both landscape tabs must render in \(appearance)")
+            XCTAssertEqual(wide.midY, 54, accuracy: 0.5)
+            XCTAssertEqual(wide.minX, 352 + NibSpacing.xs + NibSpacing.l, accuracy: 0.5)
+
+            hosting.view.frame.size.width = 393
+            hosting.view.setNeedsLayout()
+            hosting.view.layoutIfNeeded()
+            try await waitUntil { presentation.slot.width == 0 }
+            XCTAssertEqual(presentation.slot.width, 0)
+            XCTAssertTrue(TabStripLayout.documentPlan(count: 2, active: 1,
+                width: presentation.slot.width, compact: false).shown.isEmpty)
+
+            hosting.view.frame.size.width = 1194
+            hosting.view.setNeedsLayout()
+            hosting.view.layoutIfNeeded()
+            try await waitUntil { presentation.slot == wide }
+            XCTAssertEqual(presentation.slot, wide)
+            XCTAssertEqual(document.additionalSafeAreaInsets, .zero)
+        }
     }
 
     func testDocumentTabsFitOnlyTheSpaceBetweenTheBars() {

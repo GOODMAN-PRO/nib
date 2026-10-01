@@ -3,6 +3,7 @@ import SwiftUI
 import UIKit
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatPresets
 
 /// Paints `rect` (page points) in `colour` over white, for the requested region; `scaleFactor` makes it answer with a
@@ -131,6 +132,84 @@ final class FeatPresetsTests: XCTestCase {
             // Three thickness slots, a separator and three colour slots at least.
             XCTAssertGreaterThan(size.width, 6 * 44, tool)
         }
+    }
+
+    /// Include the toolbar-owned chevron, separator and NibDesign capsule padding in the fit check.
+    /// fixedSize prevents the proposed width from hiding an intrinsically oversized row, as in the screenshots.
+    func testCompactPresetCapsuleFitsChromeInsetsWithoutShrinkingTargets() throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        for tool in NibSettings.presetTools {
+            for count in [1, 3, ToolPresets.maxSwatches] {
+                var saved = ToolPresets.defaults(for: tool)
+                saved.swatches = Array(repeating: saved.swatches[0], count: count)
+                saved.selectedSwatch = count - 1
+                h.app.settings.set(NibSettings.presets(tool), saved)
+                let model = PresetMenuModel(app: h.app, session: h.session, tool: tool)
+                for appearance in [ColorScheme.light, .dark] {
+                    for typeSize in [DynamicTypeSize.large, .accessibility3] {
+                        let capsule = NibToolOptionsBar(id: "test.presets") {
+                            HStack(spacing: 0) {
+                                ToolPresetMenu(model: model)
+                                NibBarSeparator()
+                                NibIconButton(.chevronDown, label: "Tool Settings") {}
+                            }
+                        }
+                        .fixedSize()
+                        .environment(\.horizontalSizeClass, .compact)
+                        .environment(\.colorScheme, appearance)
+                        .environment(\.dynamicTypeSize, typeSize)
+                        let host = UIHostingController(rootView: capsule)
+                        let size = host.sizeThatFits(in: CGSize(width: 320, height: 852))
+                        let context = "\(tool), \(count) swatches, \(appearance), \(typeSize)"
+                        XCTAssertLessThanOrEqual(size.width, 320 - 2 * NibMetrics.chromeInset, context)
+                        XCTAssertGreaterThanOrEqual(size.width, 5 * NibMetrics.hitTarget,
+                                                    "Three widths, current colour and expansion: \(context)")
+                        XCTAssertGreaterThanOrEqual(size.height, NibMetrics.hitTarget, context)
+
+                        // Restore, Done and the host chevron must also fit after a long-press rearrangement.
+                        model.beginArranging()
+                        let arranged = host.sizeThatFits(in: CGSize(width: 320, height: 852))
+                        XCTAssertLessThanOrEqual(arranged.width, 320 - 2 * NibMetrics.chromeInset, context)
+                        model.endArranging()
+                    }
+                }
+            }
+        }
+    }
+
+    func testCompactColourOptionsExposeSavedPresetsAndAddThroughExistingPopover() async throws {
+        let h = Harness(features: [FeatPresetsFeature.self])
+        let model = PresetMenuModel(app: h.app, session: h.session, tool: "pen")
+        model.tapSwatch(model.presets.selectedSwatch)
+        XCTAssertEqual(model.popover, .colour(.slot(0)))
+
+        // The compact bar has no Add control; the same action now comes from its expanded colour options.
+        model.addColour()
+        XCTAssertEqual(model.popover, .colour(.add))
+        XCTAssertEqual(model.makePopover().source, PresetMenuModel.anchorID("pen"))
+        let added = try XCTUnwrap(model.pick(vermilion))
+        let succeeded = await added.value
+        XCTAssertTrue(succeeded)
+        model.reload()
+        XCTAssertEqual(model.presets.swatches.count, 4)
+        XCTAssertEqual(model.presets.selectedSwatch, 3)
+
+        // A saved slot that is absent from the compact bar remains selectable without replacing any colour.
+        let colours = model.presets.swatches
+        model.tapSwatch(0)
+        for _ in 0..<200 where presets(h, "pen").selectedSwatch != 0 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        model.reload()
+        XCTAssertEqual(model.presets.selectedSwatch, 0)
+        XCTAssertEqual(model.presets.swatches, colours)
+        model.tapSwatch(0)
+        let content = UIHostingController(rootView: model.makePopover().content
+            .environment(\.horizontalSizeClass, .compact)
+            .frame(width: NibMetrics.popoverContentWidth))
+        let size = content.sizeThatFits(in: CGSize(width: NibMetrics.popoverContentWidth, height: 834))
+        XCTAssertEqual(size.width, NibMetrics.popoverContentWidth, accuracy: 0.5)
+        XCTAssertGreaterThanOrEqual(size.height, NibMetrics.hitTarget)
     }
 
     func testBarAndPopoverRenderInEveryMode() throws {

@@ -8,6 +8,8 @@ import NibDesign
 struct SearchViewport: Equatable {
     var windowSize: CGSize
     var availableHeight: CGFloat
+    /// The visible part of the host, expressed in the host's own coordinates.
+    var visibleBounds: CGRect
 
     static var idealHeight: CGFloat {
         NibMetrics.barHeight + NibMetrics.minimumRestingGap + NibMetrics.searchResultsMaxHeight
@@ -18,9 +20,14 @@ struct SearchViewport: Equatable {
         2 * (NibMetrics.hitTarget + NibMetrics.minimumRestingGap)
     }
     static func panelWidth(availableWidth: CGFloat, windowSize: CGSize?) -> CGFloat {
-        let available = max(0, availableWidth)
-        guard let windowSize, windowSize.width > windowSize.height else { return available }
-        return min(NibMetrics.searchWidth, available)
+        guard let windowSize else { return max(0, availableWidth) }
+        let available = max(0, min(availableWidth, windowSize.width - 2 * NibMetrics.chromeInset))
+        return windowSize.width > windowSize.height ? min(NibMetrics.searchWidth, available) : available
+    }
+    static func hostBounds(proposedSize: CGSize, viewport: SearchViewport?) -> CGRect {
+        let proposed = CGRect(origin: .zero, size: proposedSize)
+        let visible = proposed.intersection(viewport?.visibleBounds ?? proposed)
+        return visible.isEmpty ? .zero : visible
     }
     static func resultsHeight(availableHeight: CGFloat, reservesNavigation: Bool) -> CGFloat {
         max(0, min(NibMetrics.searchResultsMaxHeight,
@@ -33,7 +40,9 @@ struct SearchViewport: Equatable {
         if let keyboard, keyboard.intersects(frame), keyboard.maxY > frame.minY {
             bottom = min(bottom, keyboard.minY - NibMetrics.minimumRestingGap)
         }
-        return SearchViewport(windowSize: windowBounds.size, availableHeight: max(0, bottom - frame.minY))
+        let visible = windowBounds.intersection(frame)
+        return SearchViewport(windowSize: windowBounds.size, availableHeight: max(0, bottom - frame.minY),
+            visibleBounds: visible.isEmpty ? .zero : visible.offsetBy(dx: -frame.minX, dy: -frame.minY))
     }
 }
 

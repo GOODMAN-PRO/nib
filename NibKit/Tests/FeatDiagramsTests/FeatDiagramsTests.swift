@@ -2,6 +2,7 @@ import XCTest
 import UIKit
 import NibContracts
 import NibTesting
+import NibDesign
 @testable import FeatDiagrams
 
 @MainActor
@@ -778,6 +779,144 @@ final class FeatDiagramsTests: XCTestCase {
     }
 
     // MARK: Handles and hover
+
+    func testQuickDiagramIPhoneClippingAndMenuFallbackInBothAppearances() async throws {
+        for appearance in [UIUserInterfaceStyle.light, .dark] {
+            let h = Harness(features: [FeatDiagramsFeature.self])
+            let host = FakeCanvasHost(h)
+            host.canvasView.overrideUserInterfaceStyle = appearance
+            // Pan to a shape far enough onto the page that both hidden sides can create another shape.
+            var source = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
+            var sourceFrame = try XCTUnwrap(source.frame)
+            sourceFrame.x = 320
+            source.frame = sourceFrame
+            try await h.insert([source])
+            // The fake does not attach registry entries. Advertise the object-menu capability without importing
+            // another feature: production presents this attachment after Quick Diagramming has refreshed.
+            h.app.ui.canvasAttachments.register(CanvasAttachmentDescriptor(
+                id: "objectmenu.menus", owner: "objectmenu", order: 950) { QuickDiagramOverlay(host: $0) })
+            host.canvasView.bounds = CGRect(x: 268, y: 0, width: 345, height: 760)
+            h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+            let overlay = QuickDiagramOverlay(host: host)
+            overlay.attach(to: host)
+            defer { overlay.detach(from: host) }
+
+            let shape = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
+            let candidates = QuickDiagramOverlay.dots(for: shape, transform: .identity)
+            let left = try XCTUnwrap(candidates.first { $0.side == .left })
+            let top = try XCTUnwrap(candidates.first { $0.side == .top })
+            XCTAssertFalse(overlay.hitTest(left.view, host: host), "half-clipped left bead has no hit target")
+            XCTAssertFalse(overlay.hitTest(top.view, host: host), "the menu-covered upper bead is absent")
+            XCTAssertEqual(overlay.shownHandles.map(\.center), [CGPoint(x: 532, y: 245)])
+            let exclusions = QuickDiagramOverlay.menuExclusions(selection: shape.bounds.cg,
+                                                                container: host.canvasView.bounds)
+            for handle in overlay.shownHandles {
+                let rect = QuickDiagramOverlay.hitRect(at: handle.center)
+                XCTAssertTrue(host.canvasView.bounds.contains(rect))
+                XCTAssertFalse(exclusions.contains { $0.intersects(rect) })
+            }
+
+            let context = MenuContext(app: h.app, session: h.session, selection: h.session.selection)
+            let menu = h.app.ui.menuItems(.objectMenu, context)
+            for side in [ConnectorSide.left, .top] {
+                let entry = try XCTUnwrap(menu.first { $0.id == "diagrams.addConnected." + side.name })
+                XCTAssertEqual(entry.submenu, String(localized: "Add Connected Shape"))
+                XCTAssertEqual(entry.command, CommandIDs.diagramAddConnected)
+                XCTAssertEqual(entry.params(context)["side"]?.stringValue, side.name)
+                let result = try await h.run(entry.command, entry.params(context))
+                XCTAssertNotNil(result["ref"]?.stringValue, "a hidden side still creates its connected shape")
+            }
+        }
+    }
+
+    func testQuickDiagramUsesWhole44PointRectForTouchAndAccessibility() throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let host = FakeCanvasHost(h)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        let overlay = QuickDiagramOverlay(host: host)
+        overlay.attach(to: host)
+        defer { overlay.detach(from: host) }
+        let centre = CGPoint(x: 312, y: 245)
+        let rect = QuickDiagramOverlay.hitRect(at: centre)
+        XCTAssertEqual(rect.size, CGSize(width: 44, height: 44))
+        for dx in [-21.0, 21.0] {
+            for dy in [-21.0, 21.0] {
+                XCTAssertTrue(overlay.hitTest(CGPoint(x: centre.x + dx, y: centre.y + dy), host: host))
+            }
+        }
+        XCTAssertFalse(overlay.hitTest(CGPoint(x: centre.x + 23, y: centre.y), host: host))
+        let elements = try XCTUnwrap(host.canvasView.subviews.last?.accessibilityElements as? [UIAccessibilityElement])
+        let element = try XCTUnwrap(elements.first { $0.accessibilityLabel == QuickDiagramOverlay.label(.right) })
+        XCTAssertEqual(element.accessibilityFrameInContainerSpace, rect)
+    }
+
+    func testQuickDiagramViewportChangesRemoveAndRestoreHitAndAccessibilityTargets() throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        let host = FakeCanvasHost(h)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.shapeID])
+        let overlay = QuickDiagramOverlay(host: host)
+        overlay.attach(to: host)
+        defer { overlay.detach(from: host) }
+        let full = host.canvasView.bounds
+        let right = CGPoint(x: 312, y: 245)
+        XCTAssertTrue(overlay.hitTest(right, host: host))
+        // A visible bead centre is insufficient if part of its hit rectangle is outside the unobscured canvas.
+        host.canvasView.bounds = CGRect(x: 0, y: 0, width: 320, height: 760)
+        overlay.canvasDidChange(host)
+        XCTAssertFalse(overlay.hitTest(right, host: host))
+        host.canvasView.bounds = full
+        h.session.page = Fixtures.page1
+        h.session.visibleRect = Rect(x: 100, y: 200, width: 160, height: 90)
+        overlay.canvasDidChange(host)
+        XCTAssertTrue(overlay.shownHandles.isEmpty)
+        XCTAssertNil(host.canvasView.subviews.last?.accessibilityElements)
+        h.session.visibleRect = nil
+        overlay.canvasDidChange(host)
+        XCTAssertEqual(overlay.shownHandles.count, 4)
+        XCTAssertTrue(overlay.hitTest(right, host: host))
+    }
+
+    func testQuickDiagramAvoidsRotatedSelectionTargetsAtEveryZoom() throws {
+        let h = Harness(features: [FeatDiagramsFeature.self])
+        var shape = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.shapeID)
+        for angle in [0.0, Double.pi / 4, Double.pi / 2] {
+            var frame = try XCTUnwrap(shape.frame)
+            frame.rotation = angle
+            shape.frame = frame
+            for zoom in [0.25, 1.0, 2.0] {
+                let transform = CGAffineTransform(scaleX: zoom, y: zoom).translatedBy(x: 300, y: 300)
+                let visible = CGRect(x: 0, y: 0, width: 1400, height: 1800)
+                let dots = QuickDiagramOverlay.dots(for: shape, transform: transform, visibleBounds: visible)
+                XCTAssertFalse(dots.isEmpty)
+                var occupied = QuickDiagramOverlay.selectionHitRects(for: shape, transform: transform)
+                for dot in dots {
+                    XCTAssertTrue(visible.contains(dot.hitRect))
+                    XCTAssertFalse(occupied.contains { $0.intersects(dot.hitRect) })
+                    XCTAssertEqual(dot.anchor, Anchoring.point(shape, dot.side), "placement preserves the page anchor")
+                    occupied.append(dot.hitRect)
+                }
+            }
+        }
+    }
+
+    func testQuickDiagramMenuReservationsCoverAboveBelowAndPinnedBars() {
+        let container = CGRect(x: 0, y: 44, width: 393, height: 760)
+        for selection in [CGRect(x: 20, y: 280, width: 160, height: 90),
+                          CGRect(x: 20, y: -100, width: 160, height: 1200)] {
+            let bands = QuickDiagramOverlay.menuExclusions(selection: selection, container: container)
+            let visible = selection.intersection(container)
+            for height in [NibMetrics.barHeight, NibMetrics.barHeightMax] {
+                let ys = [visible.minY - NibMetrics.rotationHandleOffset - NibMetrics.hitTarget / 2 - height,
+                          visible.maxY + NibMetrics.hitTarget / 2 + NibSpacing.xs,
+                          container.minY + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.s,
+                          container.maxY - NibMetrics.chromeInset - height]
+                for y in ys {
+                    let menu = CGRect(x: 16, y: y, width: 300, height: height)
+                    XCTAssertTrue(bands.contains { $0.contains(menu) })
+                }
+            }
+        }
+    }
 
     func testHandlesAreNibDesignBeadsTintedWhenAttached() async throws {
         let h = Harness(features: [FeatDiagramsFeature.self])

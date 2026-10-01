@@ -9,9 +9,8 @@ import NibDesign
 /// handle beads: they never deform or animate and draw no glass (precision affordances on the page, DESIGN.md §10.15).
 @MainActor
 final class QuickDiagramOverlay: CanvasAttachment {
-    /// How far each dot sits outside its side (view points): clear of the selection's own resize handles and of the
-    /// rotation bead 24 pt above the top edge, even counting both 44 pt hit areas' centres.
-    static let dotOffset: CGFloat = 52
+    /// Clear of a resize handle's complete hit target; the top side also clears the rotation handle.
+    static let dotOffset = NibMetrics.hitTarget + NibSpacing.s
     /// How close (view points) a released dot must be to an item to connect to it.
     static let snapReach: CGFloat = 16
     static let dragSlop: CGFloat = 6
@@ -24,11 +23,14 @@ final class QuickDiagramOverlay: CanvasAttachment {
         var item: Item
     }
 
+    @MainActor
     struct Dot {
         var side: ConnectorSide
         /// The side's midpoint on the page, where a connector leaves from.
         var anchor: Point
         var view: CGPoint
+
+        var hitRect: CGRect { QuickDiagramOverlay.hitRect(at: view) }
     }
 
     struct Drag {
@@ -145,7 +147,19 @@ final class QuickDiagramOverlay: CanvasAttachment {
         guard let host = kit.host else { return }
         target = QuickDiagramOverlay.selectedShape(in: host)
         if let t = target, let tf = kit.transform(page: t.page) {
-            dots = QuickDiagramOverlay.dots(for: t.item, transform: tf)
+            let visible = Self.visibleBounds(in: host, page: t.page, transform: tf)
+            var exclusions: [CGRect] = []
+            // Reserve the menu before it appears, too: its attachment is refreshed after this one and SwiftUI
+            // lays it out asynchronously. No transient covered bead or stale hit target during that interval.
+            if host.app.ui.canvasAttachments.get("objectmenu.menus") != nil {
+                let canvas = host.canvasView
+                let safe = canvas.window.map { canvas.convert($0.safeAreaLayoutGuide.layoutFrame, from: $0) }
+                    ?? canvas.bounds.inset(by: canvas.safeAreaInsets)
+                let selection = (host.session.selection.bounds ?? t.item.bounds).cg.applying(tf)
+                exclusions = Self.menuExclusions(selection: selection, container: safe)
+            }
+            dots = Self.dots(for: t.item, transform: tf, visibleBounds: visible, excluding: exclusions)
+            if let d = drag, !dots.contains(where: { $0.side == d.side }) { drag = nil }
         } else {
             dots = []
             drag = nil
@@ -162,10 +176,13 @@ final class QuickDiagramOverlay: CanvasAttachment {
         return Target(doc: doc, page: page, item: item)
     }
 
-    /// A dot per side: `dotOffset` view points out from the side's midpoint, along the (possibly rotated) side normal.
-    static func dots(for item: Item, transform t: CGAffineTransform) -> [Dot] {
+    /// Only complete, unobstructed targets are drawn. Blocked sides remain in More → Add Connected Shape
+    /// (`DiagramMenus`), with the same commands and keyboard equivalents. Never clamp a bead onto a resize handle.
+    static func dots(for item: Item, transform t: CGAffineTransform,
+                     visibleBounds: CGRect = .infinite, excluding exclusions: [CGRect] = []) -> [Dot] {
         let centre = Anchoring.centre(item).cg.applying(t)
-        return ConnectorSide.allCases.map { side in
+        var occupied = selectionHitRects(for: item, transform: t) + exclusions
+        return ConnectorSide.allCases.compactMap { side in
             let anchor = Anchoring.point(item, side)
             let v = anchor.cg.applying(t)
             var dx = v.x - centre.x, dy = v.y - centre.y
@@ -177,7 +194,69 @@ final class QuickDiagramOverlay: CanvasAttachment {
                 dx /= len
                 dy /= len
             }
-            return Dot(side: side, anchor: anchor, view: CGPoint(x: v.x + dx * dotOffset, y: v.y + dy * dotOffset))
+            // Targets stay axis-aligned even when the shape rotates. A diagonal needs more normal distance
+            // to separate two full squares than two circles of the same diameter.
+            let offset = dotOffset / max(abs(dx), abs(dy)) + (side == .top ? NibMetrics.rotationHandleOffset : 0)
+            let dot = Dot(side: side, anchor: anchor, view: CGPoint(x: v.x + dx * offset, y: v.y + dy * offset))
+            guard visibleBounds.contains(dot.hitRect), !occupied.contains(where: { $0.intersects(dot.hitRect) }) else {
+                return nil
+            }
+            occupied.append(dot.hitRect)
+            return dot
+        }
+    }
+
+    static func hitRect(at centre: CGPoint) -> CGRect {
+        let size = NibMetrics.hitTarget
+        return CGRect(x: centre.x - size / 2, y: centre.y - size / 2, width: size, height: size)
+    }
+
+    /// Use the viewport, not the scroll view's content-sized overlay. Clip through ancestors (including a split
+    /// view's canvas) and the session's unobscured page region, all converted to canvas coordinates.
+    static func visibleBounds(in host: CanvasHost, page: PageID, transform: CGAffineTransform) -> CGRect {
+        let canvas = host.canvasView
+        var visible = canvas.bounds.inset(by: canvas.safeAreaInsets)
+        var ancestor = canvas.superview
+        while let view = ancestor {
+            if view.clipsToBounds || view is UIWindow {
+                visible = visible.intersection(canvas.convert(view.bounds.inset(by: view.safeAreaInsets), from: view))
+            }
+            ancestor = view.superview
+        }
+        if host.session.page == page, let rect = host.session.visibleRect {
+            visible = visible.intersection(rect.cg.applying(transform))
+        }
+        return visible
+    }
+
+    /// All corner, edge and rotation hit rectangles, including rotated shapes. Reserving even a short side's
+    /// omitted midpoint avoids stealing touches from the selection's body at small zoom scales.
+    static func selectionHitRects(for item: Item, transform: CGAffineTransform) -> [CGRect] {
+        let corners = (item.frame ?? Frame(item.bounds)).corners.map { $0.cg.applying(transform) }
+        let edges = (0..<4).map { i in
+            CGPoint(x: (corners[i].x + corners[(i + 1) % 4].x) / 2,
+                    y: (corners[i].y + corners[(i + 1) % 4].y) / 2)
+        }
+        let dx = edges[0].x - edges[2].x, dy = edges[0].y - edges[2].y
+        let length = hypot(dx, dy)
+        let rotation = CGPoint(x: edges[0].x + (length > 0 ? dx / length : 0) * NibMetrics.rotationHandleOffset,
+                               y: edges[0].y + (length > 0 ? dy / length : -1) * NibMetrics.rotationHandleOffset)
+        return (corners + edges + [rotation]).map { hitRect(at: $0) }
+    }
+
+    /// FloatingHosting exposes anchors, not measured sibling frames. Conservatively reserve the full-width bands
+    /// containing every object-menu placement: above, below, or pinned to a safe edge. Using the maximum bar height
+    /// covers Dynamic Type and avoids depending on F013's private layout or asynchronous presentation state.
+    static func menuExclusions(selection: CGRect, container: CGRect) -> [CGRect] {
+        let selection = selection.intersection(container)
+        guard !selection.isNull, !container.isEmpty else { return [] }
+        let height = NibMetrics.barHeightMax
+        let above = selection.minY - NibMetrics.rotationHandleOffset - NibMetrics.hitTarget / 2 - height
+        let below = selection.maxY + NibMetrics.hitTarget / 2 + NibSpacing.xs
+        let top = container.minY + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.s
+        let bottom = container.maxY - NibMetrics.chromeInset - height
+        return [above, below, top, max(top, bottom)].map {
+            CGRect(x: container.minX, y: $0, width: container.width, height: height)
         }
     }
 
@@ -189,7 +268,7 @@ final class QuickDiagramOverlay: CanvasAttachment {
     }
 
     private func dot(near v: CGPoint) -> Dot? {
-        dots.filter { OverlayKit.distance($0.view, v) <= OverlayKit.hitRadius }
+        dots.filter { $0.hitRect.contains(v) }
             .min { OverlayKit.distance($0.view, v) < OverlayKit.distance($1.view, v) }
     }
 
@@ -226,8 +305,7 @@ final class QuickDiagramOverlay: CanvasAttachment {
     private func element(for dot: Dot, _ t: Target) -> OverlayElement {
         let e = elements[dot.side] ?? OverlayElement(accessibilityContainer: kit.view)
         elements[dot.side] = e
-        let d = NibMetrics.hitTarget
-        e.accessibilityFrameInContainerSpace = CGRect(x: dot.view.x - d / 2, y: dot.view.y - d / 2, width: d, height: d)
+        e.accessibilityFrameInContainerSpace = dot.hitRect
         e.accessibilityLabel = QuickDiagramOverlay.label(dot.side)
         e.accessibilityHint = String(localized: "Adds a matching shape joined to this one. Drag to another shape to connect them.")
         e.accessibilityTraits = .button

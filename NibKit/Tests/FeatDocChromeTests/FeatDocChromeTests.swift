@@ -19,6 +19,81 @@ final class FeatDocChromeTests: XCTestCase {
 
     // MARK: Layout view model
 
+    func testPortraitSearchSpansBelowBarsRegardlessOfPaletteDockOptionsOrSidebar() throws {
+        let safe = UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0)
+        for size in [CGSize(width: 834, height: 1194), CGSize(width: 1024, height: 1366),
+                     CGSize(width: 507, height: 1024)] {
+            for edge in [NibDock.top, .bottom, .leading, .trailing] {
+                for side in SidebarSide.allCases {
+                    var layout = ChromeLayout(size: size, safeArea: safe,
+                        left: side == .left ? NibMetrics.navigatorWidth : nil,
+                        right: side == .right ? NibMetrics.navigatorWidth : nil, mode: .sidebar,
+                        documentSearchPresented: true)
+                    layout.avoidPalette(NibPaletteDock(edge: edge), thickness: NibMetrics.paletteThickness,
+                        optionsSize: CGSize(width: 320, height: NibMetrics.barHeight))
+
+                    let search = try XCTUnwrap(layout.documentSearchRegion)
+                    XCTAssertEqual(search.minX, NibMetrics.chromeInset)
+                    XCTAssertEqual(search.width, size.width - 2 * NibMetrics.chromeInset)
+                    XCTAssertEqual(search.minY, layout.bar.maxY + NibSpacing.l)
+                    XCTAssertEqual(search.maxY, size.height - safe.bottom - NibMetrics.chromeInset)
+                    XCTAssertEqual(layout.activeOverlayRegion, search)
+                    XCTAssertFalse(ChromePalettePolicy.showsPalette(reservesSpace: true,
+                        compact: layout.isCompact, sheet: nil, documentSearchRegion: search))
+
+                    // Exercise the same placement path as the field/results and bottom navigation HUDs.
+                    let keyboard = CGRect(x: 0, y: size.height - 350, width: size.width, height: 350)
+                    let frames = ChromeOverlayGeometry.frames([
+                        .init(id: "searchui.document", placement: .top,
+                              size: CGSize(width: search.width, height: NibMetrics.barHeight)),
+                        .init(id: "searchui.counter", placement: .bottom, size: CGSize(width: 240, height: 44)),
+                        .init(id: "page", placement: .bottomTrailing, size: CGSize(width: 88, height: 44))
+                    ], in: layout.activeOverlayRegion, keyboardFrame: keyboard)
+                    let field = try XCTUnwrap(frames["searchui.document"])
+                    XCTAssertEqual(field.minX, search.minX)
+                    XCTAssertEqual(field.width, search.width)
+                    XCTAssertEqual(field.minY, search.minY)
+                    let counter = try XCTUnwrap(frames["searchui.counter"])
+                    let page = try XCTUnwrap(frames["page"])
+                    XCTAssertLessThanOrEqual(counter.maxY, keyboard.minY - NibSpacing.l)
+                    XCTAssertFalse(counter.intersects(page))
+                }
+            }
+        }
+    }
+
+    func testSearchDismissalAndRotationRestorePaletteWithoutRefittingThePage() throws {
+        let safe = UIEdgeInsets(top: 64, left: 12, bottom: 20, right: 8)
+        let size = CGSize(width: 834, height: 1194)
+        func layout(search: Bool) -> ChromeLayout {
+            var value = ChromeLayout(size: size, safeArea: safe, left: nil, right: nil, mode: .sidebar,
+                                     documentSearchPresented: search)
+            value.avoidPalette(NibPaletteDock(edge: .leading), thickness: NibMetrics.paletteThickness,
+                               optionsSize: CGSize(width: 320, height: NibMetrics.barHeight))
+            return value
+        }
+        let open = layout(search: true)
+        let closed = layout(search: false)
+        let search = try XCTUnwrap(open.documentSearchRegion)
+        XCTAssertEqual(search.minX, safe.left + NibMetrics.chromeInset)
+        XCTAssertEqual(search.maxX, size.width - safe.right - NibMetrics.chromeInset)
+        XCTAssertEqual(search.minY, safe.top + NibMetrics.barTopGap + NibMetrics.barHeight + NibSpacing.l)
+        XCTAssertEqual(open.editor, closed.editor)
+        XCTAssertEqual(open.editorInsets, closed.editorInsets)
+        XCTAssertNil(closed.documentSearchRegion)
+        XCTAssertEqual(closed.activeOverlayRegion, closed.overlayRegion)
+        XCTAssertTrue(ChromePalettePolicy.showsPalette(reservesSpace: true, compact: closed.isCompact,
+            sheet: nil, documentSearchRegion: closed.documentSearchRegion))
+
+        for (size, idiom) in [(CGSize(width: 1194, height: 834), UIUserInterfaceIdiom.pad),
+                              (CGSize(width: 393, height: 852), UIUserInterfaceIdiom.phone)] {
+            let value = ChromeLayout(size: size, safeArea: safe, left: nil, right: nil, mode: .sidebar,
+                                     idiom: idiom, documentSearchPresented: true)
+            XCTAssertNil(value.documentSearchRegion)
+            XCTAssertEqual(value.activeOverlayRegion, value.overlayRegion)
+        }
+    }
+
     func testRegularLandscapeDocksTheSidebarOnEitherSide() {
         let size = CGSize(width: 1194, height: 834)
         let safe = UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0)

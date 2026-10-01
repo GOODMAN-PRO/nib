@@ -417,7 +417,9 @@ struct TabDrag: ViewModifier {
 final class TabStripDocumentPresentation: ObservableObject {
     private(set) weak var controller: UIViewController?
     private(set) weak var host: FloatingHosting?
-    private weak var anchorView: UIView?
+    private var anchorFrame: CGRect?
+    private var containerFrame: CGRect?
+    private var rightToLeft = false
     private(set) var model: TabStripModel?
     @Published private(set) var slot: CGRect = .zero
     @Published private(set) var compact = false
@@ -435,25 +437,42 @@ final class TabStripDocumentPresentation: ObservableObject {
 
     func dismiss() {
         model = nil
-        anchorView = nil
+        anchorFrame = nil
+        containerFrame = nil
         slot = .zero
         host?.dismiss(TabStripLayout.dropletID)
     }
 
-    func updateGeometry(from control: UIView, compact: Bool) {
-        anchorView = control
-        guard let view = controller?.viewIfLoaded, let host,
-              let anchor = host.containerRect(control.bounds, from: control),
-              anchor.width >= NibMetrics.hitTarget, anchor.height >= NibMetrics.hitTarget,
-              let bounds = host.containerRect(view.bounds.inset(by: view.safeAreaInsets), from: view) else { return }
-        let value = TabStripLayout.documentSlot(control: anchor, bounds: bounds, compact: compact,
-                                               rightToLeft: control.effectiveUserInterfaceLayoutDirection == .rightToLeft)
+    /// Both measurements come from final SwiftUI layout in NibLiquid.space, the floating host's coordinates.
+    /// A UIViewRepresentable background can still have zero/ideal bounds when the menu is already laid out;
+    /// reading those bounds (or waiting for UIKit conversion to attach) must not suppress valid capsules.
+    func updateAnchor(_ frame: CGRect, compact: Bool, rightToLeft: Bool) {
+        anchorFrame = usable(frame) ? frame : nil
+        self.rightToLeft = rightToLeft
         if self.compact != compact { self.compact = compact }
-        if slot != value { slot = value }
+        refreshGeometry()
+    }
+
+    func updateContainer(_ frame: CGRect) {
+        containerFrame = usable(frame) ? frame : nil
+        refreshGeometry()
     }
 
     func refreshGeometry() {
-        if let anchorView { updateGeometry(from: anchorView, compact: compact) }
+        guard let anchor = anchorFrame, let container = containerFrame,
+              let view = controller?.viewIfLoaded else {
+            if slot != .zero { slot = .zero }
+            return
+        }
+        let bounds = container.inset(by: view.safeAreaInsets)
+        let value = TabStripLayout.documentSlot(control: anchor, bounds: bounds, compact: compact,
+                                               rightToLeft: rightToLeft)
+        if slot != value { slot = value }
+    }
+
+    private func usable(_ frame: CGRect) -> Bool {
+        !frame.isNull && !frame.isInfinite && frame.origin.x.isFinite && frame.origin.y.isFinite
+            && frame.width.isFinite && frame.height.isFinite && frame.width > 0 && frame.height > 0
     }
 }
 
@@ -465,10 +484,23 @@ private struct TabStripDocumentView: View {
         let slot = placement.slot
         let plan = TabStripLayout.documentPlan(count: model.tabs.count, active: model.activeIndex,
                                                width: slot.width, compact: placement.compact)
-        if !plan.shown.isEmpty {
-            TabStripView(model: model, documentPlan: plan)
-                .frame(width: slot.width, height: TabStripLayout.stripHeight)
-                .position(x: slot.midX, y: slot.midY)
+        // Keep the measurement surface mounted even while the first layout has no slot. Otherwise the
+        // menu-only state cannot recover when the floating layer attaches or the window gains enough room.
+        ZStack(alignment: .topLeading) {
+            TabStripLayoutReader(placement: placement)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            if !plan.shown.isEmpty {
+                TabStripView(model: model, documentPlan: plan)
+                    .frame(width: slot.width, height: TabStripLayout.stripHeight)
+                    .position(x: slot.midX, y: slot.midY)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: NibLiquid.space)
+        } action: { frame in
+            placement.updateContainer(frame)
         }
     }
 }
@@ -479,6 +511,7 @@ struct DocumentTabsMenu: View {
     @ObservedObject var model: TabStripModel
     let placement: TabStripDocumentPresentation
     let compact: Bool
+    @Environment(\.layoutDirection) private var layoutDirection
 
     var body: some View {
         Menu {
@@ -508,35 +541,46 @@ struct DocumentTabsMenu: View {
         .buttonStyle(NibPressStyle(shape: Capsule()))
         .accessibilityLabel(String(localized: "Tabs"))
         .accessibilityValue(String(localized: "\(model.tabs.count) open documents"))
-        .background(TabStripAnchorReader(placement: placement, compact: compact).allowsHitTesting(false))
-        .onGeometryChange(for: CGRect.self) { proxy in proxy.frame(in: .global) } action: { _ in
-            placement.refreshGeometry()
+        .background {
+            GeometryReader { proxy in
+                let frame = proxy.frame(in: NibLiquid.space)
+                Color.clear
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: NibLiquid.space) } action: { frame in
+                        placement.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                    }
+                    .onChange(of: compact) { _, compact in
+                        placement.updateAnchor(frame, compact: compact, rightToLeft: layoutDirection == .rightToLeft)
+                    }
+                    .onChange(of: layoutDirection) { _, direction in
+                        placement.updateAnchor(frame, compact: compact, rightToLeft: direction == .rightToLeft)
+                    }
+            }
+            .allowsHitTesting(false)
         }
     }
 }
 
-private struct TabStripAnchorReader: UIViewRepresentable {
+/// Final UIKit attachment/layout can follow SwiftUI's geometry callbacks. Refresh the safe-area-dependent
+/// bounds then as well, without using this representable's proposed size as the menu's measured frame.
+private struct TabStripLayoutReader: UIViewRepresentable {
     let placement: TabStripDocumentPresentation
-    let compact: Bool
 
-    func makeUIView(context: Context) -> TabStripAnchorView {
-        let view = TabStripAnchorView()
+    func makeUIView(context: Context) -> TabStripLayoutView {
+        let view = TabStripLayoutView()
         view.placement = placement
-        view.compact = compact
         view.isUserInteractionEnabled = false
         return view
     }
 
-    func updateUIView(_ view: TabStripAnchorView, context: Context) {
+    func updateUIView(_ view: TabStripLayoutView, context: Context) {
         view.placement = placement
-        view.compact = compact
         view.scheduleUpdate()
     }
 }
 
-private final class TabStripAnchorView: UIView {
+private final class TabStripLayoutView: UIView {
     weak var placement: TabStripDocumentPresentation?
-    var compact = false
+    private var updateScheduled = false
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
@@ -554,9 +598,12 @@ private final class TabStripAnchorView: UIView {
     }
 
     func scheduleUpdate() {
+        guard !updateScheduled else { return }
+        updateScheduled = true
         Task { @MainActor [weak self] in
             guard let self else { return }
-            placement?.updateGeometry(from: self, compact: compact)
+            updateScheduled = false
+            placement?.refreshGeometry()
         }
     }
 }

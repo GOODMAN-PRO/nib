@@ -60,6 +60,11 @@ struct NibNativeGlass<Foreground: View>: View {
             // The material needs the same appearance as its foreground. An environment override only
             // before glassEffect reaches the labels, leaving the native effect free to render light glass.
             .environment(\.colorScheme, appearance.colorScheme)
+            .environment(\.nibChromeAppearance, appearance)
+            // The UIKit-backed effect captures traits when its native host is created. Updating only
+            // SwiftUI's environment can leave that host in its previous appearance. Recreate this
+            // effect/foreground pair together, without replacing the container's field or glass IDs.
+            .id(appearance.colorScheme)
     }
 }
 
@@ -149,6 +154,7 @@ struct NibGlassModifier: ViewModifier {
     /// While the Pencil is down nothing samples the backdrop (DESIGN.md §10.8).
     @Environment(\.nibIsInking) private var frozen
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.nibChromeAppearance) private var chromeAppearance
     @Environment(\.nibBackdrop) private var backdrop
     @Environment(DropletField.self) private var field: DropletField?
     @State private var restFrame = CGRect.zero
@@ -167,15 +173,12 @@ struct NibGlassModifier: ViewModifier {
             .anchorPreference(key: NibStaticGlassBackdropKey.self, value: .bounds) { bounds in
                 sharesNativeBackdrop
                     ? [NibStaticGlassBackdrop(bounds: bounds, shape: shape,
-                        tint: NibGlassBodyTint.systemUnderlay(kind, colorScheme: colorScheme, paperShare: paperShare))]
+                        tint: NibGlassBodyTint.systemUnderlay(kind, colorScheme: resolvedScheme, paperShare: paperShare))]
                     : []
             }
             .background {
-                GeometryReader { proxy in
-                    Color.clear
-                        .onAppear { restFrame = proxy.frame(in: NibLiquid.space) }
-                        .onChange(of: proxy.frame(in: NibLiquid.space)) { _, frame in restFrame = frame }
-                }
+                Color.clear
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: NibLiquid.space) } action: { restFrame = $0 }
             }
         } else {
             content.background { fallback }
@@ -189,8 +192,10 @@ struct NibGlassModifier: ViewModifier {
     }
 
     private var tint: Color {
-        NibGlassBodyTint.color(kind, paperShare: paperShare, colorScheme: colorScheme)
+        NibGlassBodyTint.color(kind, paperShare: paperShare, colorScheme: resolvedScheme)
     }
+
+    private var resolvedScheme: ColorScheme { chromeAppearance?.colorScheme ?? colorScheme }
 
     private var paperShare: Double { DropletField.paperShare(restFrame, in: backdrop) }
 
@@ -210,7 +215,7 @@ struct NibGlassModifier: ViewModifier {
         } else if frozen {
             shape.fill(tint)
         } else {
-            shape.fill(NibGlassBodyTint.systemUnderlay(kind, colorScheme: colorScheme, paperShare: paperShare))
+            shape.fill(NibGlassBodyTint.systemUnderlay(kind, colorScheme: resolvedScheme, paperShare: paperShare))
         }
     }
 

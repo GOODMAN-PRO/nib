@@ -824,30 +824,26 @@ extension NewNotebookSheet {
 
 // MARK: - Sheet
 
-/// Reserve a visible paper viewport even when the cover controls or Dynamic Type make the form tall.
-/// Both regions scroll independently; paper, category labels and the options below it share one clipped
-/// viewport, so the continuation fade is always at the visible edge rather than below the sheet.
+/// Keep preview, cover choices and paper in one continuous form (DESIGN.md §14.6).
+/// A separate, height-limited upper scroller hides the cover strip behind the preview. The whole form
+/// scrolls instead, with the paper continuation fade at the visible edge rather than below the sheet.
 struct NewNotebookFormViewport<Form: View, Paper: View>: View {
     let contentInset: CGFloat
     @ViewBuilder var form: Form
     @ViewBuilder var paper: Paper
 
     var body: some View {
-        GeometryReader { geometry in
-            VStack(spacing: 0) {
-                ScrollView {
-                    form.padding(.vertical, NibSpacing.xl)
-                }
-                .frame(height: geometry.size.height * 0.4)
-                ScrollView {
-                    paper.padding(.top, NibSpacing.m)
-                        .padding(.bottom, NibSpacing.l)
-                }
-                .nibFadeBottomEdge()
+        ScrollView {
+            VStack(alignment: .leading, spacing: NibSpacing.xl) {
+                form
+                paper
             }
-            .contentMargins(.horizontal, contentInset, for: .scrollContent)
-            .scrollDismissesKeyboard(.interactively)
+            .padding(.top, NibSpacing.xl)
+            .padding(.bottom, NibSpacing.l)
         }
+        .contentMargins(.horizontal, contentInset, for: .scrollContent)
+        .scrollDismissesKeyboard(.interactively)
+        .nibFadeBottomEdge()
     }
 }
 

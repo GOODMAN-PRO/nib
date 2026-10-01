@@ -73,7 +73,6 @@ public struct NibDropletContainer<Content: View>: View {
         if #available(iOS 26.0, *) {
             if usesSystemGlass {
                 ZStack {
-                    NativeGlassBackdropLayer(field: field)
                     GlassEffectContainer(spacing: field.metrics.mergeDistance) {
                         ZStack {
                             NeckGlassLayer(field: field)
@@ -82,7 +81,11 @@ public struct NibDropletContainer<Content: View>: View {
                     }
                     .environment(\.colorScheme, colorScheme)
                     .backgroundPreferenceValue(NibStaticGlassBackdropKey.self) { backdrops in
-                        NativeStaticGlassBackdropLayer(backdrops: backdrops)
+                        ZStack {
+                            NativeGlassBackdropLayer(field: field, backdrop: backdrop)
+                            NativeStaticGlassBackdropLayer(backdrops: backdrops)
+                        }
+                        .environment(\.nibChromeAppearance, NibChromeAppearance(environment))
                     }
                     .transformPreference(NibStaticGlassBackdropKey.self) { $0 = [] }
                 }
@@ -143,15 +146,21 @@ struct NativeStaticGlassBackdropLayer: View {
 /// The existing field supplies the exact silhouettes, visibility, paper overlap and Pencil recede opacity.
 struct NativeGlassBackdropLayer: View {
     let field: DropletField
-    @Environment(\.colorScheme) private var colorScheme
+    /// The live page geometry arrives before the field's onChange/publish cycle. Use it immediately,
+    /// including for styles that disable refraction (whose render.paper is deliberately zero).
+    var backdrop: [CGRect]? = nil
+    @Environment(\.self) private var environment
 
     var body: some View {
+        let appearance = environment.nibChromeAppearance ?? NibChromeAppearance(environment)
+        let colorScheme = appearance.colorScheme
         ClusterLayer(field: field) { cluster in
             let offset = CGAffineTransform(translationX: -cluster.frame.minX, y: -cluster.frame.minY)
             let fills = cluster.renders.map { render in
                 let kind: NibGlass = render.material == .deep ? .deep : (render.material == .tinted ? .tinted : .clear)
                 // Paper-resident styles can disable refraction; they still need contrast protection.
-                let paper = field.node(render.id).presentation.paperShare
+                let paper = backdrop.map { DropletField.paperShare(render.path.boundingRect, in: $0) }
+                    ?? field.node(render.id).presentation.paperShare
                 let tint = field.isFrozen
                     ? NibGlassBodyTint.color(kind, paperShare: paper, colorScheme: colorScheme)
                     : NibGlassBodyTint.systemUnderlay(kind, colorScheme: colorScheme, paperShare: paper)

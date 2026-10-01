@@ -184,11 +184,12 @@ final class CanvasViewController: UIViewController, DocumentEditing, UIScrollVie
         guard size.width > 0, size.height > 0, !isClosed else { return }
         // Capture the reading position before UIKit adjusts the content inset.
         let anchor = didInitialLayout ? centreAnchor() : nil
-        // Docking and tabs move floating chrome, not the paper. Only a viewport resize may refit its top.
-        let fittedPage = size != lastViewport && isAtFit && !hasManualPan ? currentPage : nil
         let previousInsets = scrollView.chromeInsets
         updateChromeInsets()
-        if size != lastViewport || previousInsets != scrollView.chromeInsets || !didInitialLayout {
+        let fitAreaChanged = size != lastViewport || previousInsets != scrollView.chromeInsets
+        // Keep fitted paper below the complete chrome footprint; manual navigation keeps its reading anchor.
+        let fittedPage = fitAreaChanged && isAtFit && !hasManualPan ? currentPage : nil
+        if fitAreaChanged || !didInitialLayout {
             lastViewport = size
             relayout(anchor: anchor, initial: !didInitialLayout, fittedPage: fittedPage)
             didInitialLayout = true

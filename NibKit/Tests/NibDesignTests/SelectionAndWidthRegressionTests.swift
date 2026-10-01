@@ -6,6 +6,62 @@ import NibTesting
 
 @MainActor
 final class SelectionAndWidthRegressionTests: XCTestCase {
+    func testOptionsPlacementUsesTheCurrentViewportOnItsFirstLayout() throws {
+        for width in [CGFloat(320), 393, 852] {
+            let size = CGSize(width: width, height: 300)
+            let bounds = CGRect(origin: .zero, size: size)
+            for placement in [NibBudPlacement.above, .below] {
+                let anchor = CGRect(x: 16, y: placement == .above ? 220 : 40, width: 44, height: 56)
+                // An actual Layout pass, without a previous geometry callback or cached options size.
+                let view = NibToolOptionsPlacement(containerSize: size, bounds: bounds,
+                                                   anchor: anchor, placement: placement) {
+                    Color.black.frame(width: width - 32, height: 44)
+                }
+                .background(Color.white)
+                let image = try XCTUnwrap(NibSnapshot.image(view, size: size))
+                let y = placement == .above ? anchor.minY - 22 : anchor.maxY + 22
+                XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: 15, y: y)), .white)
+                XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: 17, y: y)), RGBA(0, 0, 0, 255))
+                XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: width - 17, y: y)), RGBA(0, 0, 0, 255))
+                XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: width - 15, y: y)), .white)
+            }
+        }
+    }
+
+    func testOptionsViewportFitsPhonesWithoutCompressingItsControls() {
+        for variant in [NibSnapshot.Variant.light, .dark, .largeText] {
+            for phoneWidth in [CGFloat(320), 375, 393, 430] {
+                let available = phoneWidth - 2 * NibMetrics.chromeInset
+                let bar = NibToolOptionsBar(id: "options", availableWidth: available) {
+                    ForEach(0..<12) { index in
+                        NibWidthPresetButton(diameter: 8, isSelected: index == 0, label: "Width \(index)") {}
+                    }
+                }
+                let size = NibSnapshot.fittingSize(bar, width: phoneWidth, variant: variant)
+                XCTAssertEqual(size.width, available, accuracy: 0.01)
+                XCTAssertEqual(size.height, NibMetrics.barHeight, accuracy: 0.01)
+                XCTAssertTrue(String(reflecting: type(of: bar.body)).contains("ScrollView"))
+                let target = NibWidthPresetButton(diameter: 8, isSelected: false, label: "Width") {}
+                XCTAssertEqual(NibSnapshot.fittingSize(target, width: available, variant: variant),
+                               CGSize(width: 44, height: 44))
+                for placement in [NibBudPlacement.above, .below] {
+                    for anchorX in [CGFloat(16), phoneWidth / 2, phoneWidth - 60] {
+                        let bounds = CGRect(x: 0, y: 0, width: phoneWidth, height: 852)
+                        let anchor = CGRect(x: anchorX, y: placement == .above ? 740 : 100, width: 44, height: 56)
+                        let centre = placement.centre(size: size, beside: anchor, gap: 0, in: bounds, alignment: .centre)
+                        XCTAssertEqual(centre.x - size.width / 2, 16, accuracy: 0.01)
+                        XCTAssertEqual(centre.x + size.width / 2, phoneWidth - 16, accuracy: 0.01)
+                    }
+                }
+            }
+        }
+        // Existing callers that measure options without a viewport retain their intrinsic size.
+        let intrinsic = NibToolOptionsBar(id: "intrinsic") {
+            Color.clear.frame(width: 88, height: 44)
+        }
+        XCTAssertEqual(NibSnapshot.fittingSize(intrinsic, width: 393), CGSize(width: 96, height: 44))
+    }
+
     func testCoverMarkersKeepWhiteTicksAndOutlinedEmptyCentresInBothAppearances() throws {
         for variant in [NibSnapshot.Variant.light, .dark] {
             for cover in [Color.white, .black, NibColor.accent] {

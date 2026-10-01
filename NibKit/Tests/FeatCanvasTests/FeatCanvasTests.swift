@@ -217,65 +217,62 @@ final class FeatCanvasTests: XCTestCase {
         XCTAssertEqual(vc.hud.zoomPercent, ZoomRules.percent(vc.zoom))
     }
 
-    func testTopDockKeepsFittedPageBelowOptionsInPhoneLandscape() async throws {
-        for appearance in [UIUserInterfaceStyle.light, .dark] {
-            let h = Harness(features: [FeatCanvasFeature.self])
-            // Stand in for the toolbar screen without importing another feature's implementation.
-            h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
-            h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
-            let vc = try makeCanvas(h, page: Fixtures.page2, size: CGSize(width: 844, height: 390))
-            defer { vc.closeCanvas() }
-            vc.traitOverrides.horizontalSizeClass = .compact
-            vc.overrideUserInterfaceStyle = appearance
-            vc.view.setNeedsLayout()
-            vc.view.layoutIfNeeded()
-            _ = try await h.run("view.zoom", ["fit": true])
-            let originalTop = vc.scrollView.chromeInsets.top
-            let originalAnchor = windowPoint(vc, Point(200, 200), Fixtures.page2)
-
-            h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "top", "along": 0.5])
-            await waitUntil("top dock clearance") {
+    func testTopDockAutomaticallyKeepsFittedPageBelowOptionsInBothAppearances() async throws {
+        for (size, compact) in [(CGSize(width: 834, height: 1194), false),
+                                (CGSize(width: 844, height: 390), true)] {
+            for appearance in [UIUserInterfaceStyle.light, .dark] {
+                let h = Harness(features: [FeatCanvasFeature.self])
+                // Stand in for the toolbar screen without importing another feature's implementation.
+                h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
+                h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
+                let vc = try makeCanvas(h, page: Fixtures.page2, size: size)
+                defer { vc.closeCanvas() }
+                vc.traitOverrides.horizontalSizeClass = compact ? .compact : .regular
+                vc.overrideUserInterfaceStyle = appearance
+                vc.view.setNeedsLayout()
                 vc.view.layoutIfNeeded()
-                return vc.scrollView.chromeInsets.top > originalTop
-            }
-            let dockedAnchor = windowPoint(vc, Point(200, 200), Fixtures.page2)
-            XCTAssertEqual(dockedAnchor.x, originalAnchor.x, accuracy: 0.5)
-            XCTAssertEqual(dockedAnchor.y, originalAnchor.y, accuracy: 0.5, "docking must leave paper in place")
-            XCTAssertEqual(vc.scrollView.chromeInsets.bottom, vc.view.safeAreaInsets.bottom + NibSpacing.l,
-                           accuracy: 0.5, "top docking releases the empty bottom palette rail")
-            // Only an explicit fit moves the page below the newly docked palette.
-            _ = try await h.run("view.zoom", ["fit": true])
-            let safe = vc.view.safeAreaInsets
-            let paletteRegion = DropletDockModel.region(
-                size: vc.view.bounds.size,
-                safeArea: EdgeInsets(top: safe.top, leading: safe.left, bottom: safe.bottom, trailing: safe.right),
-                compact: true)
-            let pageTop = windowPoint(vc, .zero, Fixtures.page2).y
-            XCTAssertGreaterThanOrEqual(pageTop, paletteRegion.minY + NibMetrics.paletteThickness
-                                        + NibMetrics.barHeight + NibSpacing.m - 0.5)
-            XCTAssertEqual(pageTop, vc.scrollView.chromeInsets.top, accuracy: 0.5)
-            XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
-            XCTAssertEqual(h.session.page, Fixtures.page2)
-            XCTAssertGreaterThan(vc.view.bounds.height - vc.scrollView.chromeInsets.top
-                                 - vc.scrollView.chromeInsets.bottom, vc.view.bounds.height / 2)
+                _ = try await h.run("view.zoom", ["fit": true])
+                let originalTop = vc.scrollView.chromeInsets.top
 
-            // Docking back also preserves the anchor; explicit fit uses the released clearance.
-            h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
-            await waitUntil("bottom dock clearance") {
-                vc.view.layoutIfNeeded()
-                return vc.scrollView.chromeInsets.top == originalTop
+                h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "top", "along": 0.5])
+                await waitUntil("top dock clearance") {
+                    vc.view.layoutIfNeeded()
+                    return vc.scrollView.chromeInsets.top > originalTop
+                }
+                XCTAssertEqual(vc.scrollView.chromeInsets.bottom, vc.view.safeAreaInsets.bottom + NibSpacing.l,
+                               accuracy: 0.5, "top docking releases the empty bottom palette rail")
+                // Docking alone must keep the fitted page clear of both the palette and its options.
+                let safe = vc.view.safeAreaInsets
+                let paletteRegion = DropletDockModel.region(
+                    size: vc.view.bounds.size,
+                    safeArea: EdgeInsets(top: safe.top, leading: safe.left, bottom: safe.bottom, trailing: safe.right),
+                    compact: compact)
+                let pageTop = windowPoint(vc, .zero, Fixtures.page2).y
+                XCTAssertGreaterThanOrEqual(pageTop, paletteRegion.minY + NibMetrics.paletteThickness
+                                            + NibMetrics.barHeight + NibSpacing.m - 0.5)
+                XCTAssertEqual(pageTop, vc.scrollView.chromeInsets.top, accuracy: 0.5)
+                XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
+                XCTAssertEqual(h.session.page, Fixtures.page2)
+                XCTAssertGreaterThan(vc.view.bounds.height - vc.scrollView.chromeInsets.top
+                                     - vc.scrollView.chromeInsets.bottom, vc.view.bounds.height / 2)
+
+                // Docking back automatically uses the released clearance on the same page.
+                h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "bottom", "along": 0.5])
+                await waitUntil("bottom dock clearance") {
+                    vc.view.layoutIfNeeded()
+                    return vc.scrollView.chromeInsets.top == originalTop
+                }
+                XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
+                XCTAssertEqual(windowPoint(vc, .zero, Fixtures.page2).y, originalTop, accuracy: 0.5)
+                XCTAssertEqual(h.session.page, Fixtures.page2)
             }
-            XCTAssertEqual(windowPoint(vc, .zero, Fixtures.page2).y, pageTop, accuracy: 0.5)
-            _ = try await h.run("view.zoom", ["fit": true])
-            XCTAssertEqual(windowPoint(vc, .zero, Fixtures.page2).y, originalTop, accuracy: 0.5)
-            XCTAssertEqual(h.session.page, Fixtures.page2)
         }
     }
 
-    func testMeasuredChromeAndTabsPreserveFittedAndManualPageAnchors() throws {
+    func testMeasuredChromeAndTabsRefitUntouchedPagesAndPreserveManualAnchors() throws {
         for size in [CGSize(width: 834, height: 1194), CGSize(width: 1194, height: 834),
                      CGSize(width: 844, height: 390)] {
-            for zoomIn in [false, true] {
+            for (zoomIn, pan) in [(false, false), (false, true), (true, false), (true, true)] {
                 let h = Harness(features: [FeatCanvasFeature.self])
                 h.app.ui.screens.toolbarView = { _, _ in AnyView(EmptyView()) }
                 h.app.settings.setJSON(CommandIDs.toolbarDock, ["edge": "top", "along": 0.5])
@@ -283,8 +280,8 @@ final class FeatCanvasTests: XCTestCase {
                 defer { vc.closeCanvas() }
                 if zoomIn {
                     vc.setZoom(vc.fitZoom * 2, anchor: nil, centreFit: false)
-                    vc.scrollBy(dx: 0, dy: 160, windowFractions: false, animated: false)
                 }
+                if pan { vc.scrollBy(dx: 0, dy: 160, windowFractions: false, animated: false) }
                 let point = Point(200, 200)
                 // Model EditorHost's measured clearance, then add/remove the optional tab band.
                 // Keep the canvas in a real window so UIKit incorporates additionalSafeAreaInsets.
@@ -300,12 +297,24 @@ final class FeatCanvasTests: XCTestCase {
                     vc.additionalSafeAreaInsets.top = extra
                     vc.view.setNeedsLayout()
                     vc.view.layoutIfNeeded()
-                    // The shell also reloads after forwarding geometry; that must not reset the anchor.
+                    let laidOutAnchor = windowPoint(vc, point, Fixtures.page2)
+                    if zoomIn || pan {
+                        XCTAssertEqual(laidOutAnchor.x, hostedAnchor.x, accuracy: 0.5)
+                        XCTAssertEqual(laidOutAnchor.y, hostedAnchor.y, accuracy: 0.5)
+                        XCTAssertEqual(vc.zoom, hostedZoom, accuracy: 1e-9)
+                    } else {
+                        XCTAssertEqual(windowPoint(vc, .zero, Fixtures.page2).y,
+                                       vc.scrollView.chromeInsets.top, accuracy: 0.5)
+                        XCTAssertEqual(vc.zoom, vc.fitZoom, accuracy: 1e-9)
+                    }
+                    // The shell's reload must retain the newly fitted position or the manual reading anchor.
+                    let laidOutZoom = vc.zoom
                     vc.reloadAll()
                     let after = windowPoint(vc, point, Fixtures.page2)
-                    XCTAssertEqual(after.x, hostedAnchor.x, accuracy: 0.5)
-                    XCTAssertEqual(after.y, hostedAnchor.y, accuracy: 0.5)
-                    XCTAssertEqual(vc.zoom, hostedZoom, accuracy: 1e-9)
+                    XCTAssertEqual(after.x, laidOutAnchor.x, accuracy: 0.5)
+                    XCTAssertEqual(after.y, laidOutAnchor.y, accuracy: 0.5)
+                    XCTAssertEqual(vc.zoom, laidOutZoom, accuracy: 1e-9)
+                    XCTAssertEqual(h.session.page, Fixtures.page2)
                     if extra > 0 {
                         XCTAssertEqual(vc.scrollView.chromeInsets.top,
                                        vc.view.safeAreaInsets.top + NibMetrics.barTopGap

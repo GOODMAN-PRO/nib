@@ -55,6 +55,10 @@ struct ChromeLayout: Equatable {
     /// Where chrome overlays rest (contracts-v2 `ChromeOverlayDescriptor`): inside the safe area, below the bars,
     /// between open sidebars, 16 pt above the bottom safe area (on iPhone above the bottom palette: 56 + 8 + 16).
     var overlayRegion: CGRect
+    /// Portrait / Split View search owns the full safe-area width below the bars (§14.5), independently of
+    /// sidebars and the palette's options arm. Its match and page HUDs share this region for collision avoidance.
+    var documentSearchRegion: CGRect?
+    var activeOverlayRegion: CGRect { documentSearchRegion ?? overlayRegion }
     /// The frame `.nibToast` places toasts at the bottom of (24 pt above its bottom edge): the safe area's bottom, on
     /// iPhone the overlay region's, so a toast never covers the palette.
     var toast: CGRect
@@ -62,7 +66,8 @@ struct ChromeLayout: Equatable {
     /// `left` / `right`: the width of the panel a side shows, nil when that side is closed.
     init(size: CGSize, safeArea: UIEdgeInsets, left leftWidth: CGFloat?, right rightWidth: CGFloat?, mode: SidebarMode,
          idiom: UIUserInterfaceIdiom = .pad, verticalSizeClass: UIUserInterfaceSizeClass = .regular,
-         assistantTrailing: Bool = false, assistantDetent: AssistantDetent = .medium) {
+         assistantTrailing: Bool = false, assistantDetent: AssistantDetent = .medium,
+         documentSearchPresented: Bool = false) {
         let inset = NibMetrics.chromeInset
         let width = size.width
         let height = size.height
@@ -132,6 +137,10 @@ struct ChromeLayout: Equatable {
         self.floatingRegion = CGRect(x: floatMinX, y: top, width: floatMaxX - floatMinX,
                                      height: max(0, floatingBottom - top))
         self.overlayRegion = overlay
+        self.documentSearchRegion = documentSearchPresented && idiom == .pad
+            && (height >= width || width < ChromeLayout.dockingWidth)
+            ? CGRect(x: bar.minX, y: top, width: bar.width,
+                     height: max(0, height - safeArea.bottom - inset - top)) : nil
         let toastBottom = compact ? overlay.maxY + NibSpacing.xxl : height - safeArea.bottom
         self.toast = CGRect(x: toolMinX, y: 0, width: toolMaxX - toolMinX, height: max(0, toastBottom))
         if bottomAssistant {
@@ -713,10 +722,11 @@ enum ChromePalettePolicy {
             && (!bottomAssistant || detent == .medium)
     }
 
-    /// Remove the underlying droplets while a compact sheet is visible, including its options and buds.
-    /// This is a rendering decision only: presenting/dismissing a sheet must not refit or move the paper.
-    static func showsPalette(reservesSpace: Bool, compact: Bool, sheet: PresentedSheet?) -> Bool {
-        reservesSpace && !(compact && sheet != nil)
+    /// Remove the underlying droplets while a compact sheet or full-width search occupies their region,
+    /// including options and buds. Keep the reservation and saved dock so dismissal does not refit the paper.
+    static func showsPalette(reservesSpace: Bool, compact: Bool, sheet: PresentedSheet?,
+                             documentSearchRegion: CGRect? = nil) -> Bool {
+        reservesSpace && !(compact && sheet != nil) && documentSearchRegion == nil
     }
 }
 
@@ -896,7 +906,7 @@ struct ChromeRootView: View {
     let toolbar: AnyView?
     let inking: ChromeInkingMirror
     let backdrop: ChromeBackdrop
-    let overlays: ChromeOverlayModel
+    @ObservedObject var overlays: ChromeOverlayModel
     let floating: NibFloatingHost
     let live: ChromeLiveState
     @ObservedObject private var geometry: ChromeGeometry
@@ -966,7 +976,8 @@ struct ChromeRootView: View {
                                   right: sidebarWidth(.right), mode: state.mode, idiom: geometry.idiom,
                                   verticalSizeClass: geometry.verticalSizeClass,
                                   assistantTrailing: state.tabs[.right] == PanelIDs.assistant,
-                                  assistantDetent: state.assistantDetent)
+                                  assistantDetent: state.assistantDetent,
+                                  documentSearchPresented: overlays.overlays.contains { $0.id == "searchui.document" })
         if reservesPaletteSpace(layout) {
             // Read F016's existing setting; do not redeclare its key or depend on the feature's private runtime.
             let saved = chrome.app.settings.json("toolbar.dock")
@@ -996,7 +1007,8 @@ struct ChromeRootView: View {
 
     private func showsPalette(_ layout: ChromeLayout) -> Bool {
         ChromePalettePolicy.showsPalette(reservesSpace: reservesPaletteSpace(layout), compact: layout.isCompact,
-                                        sheet: PresentedSheet.current(state, compact: layout.isCompact))
+                                        sheet: PresentedSheet.current(state, compact: layout.isCompact),
+                                        documentSearchRegion: layout.documentSearchRegion)
     }
 
     private var liquidMode: NibLiquidMode {
@@ -1023,7 +1035,7 @@ struct ChromeRootView: View {
         let snapshot = model.snapshot
         ZStack(alignment: .topLeading) {
             sidebars(layout)
-            ChromeOverlayLayer(model: overlays, inking: inking, region: layout.overlayRegion,
+            ChromeOverlayLayer(model: overlays, inking: inking, region: layout.activeOverlayRegion,
                                keyboardFrame: geometry.keyboardFrame)
             if let toolbar, showsPalette(layout) {
                 // Full height between open sidebars; padded by the safe area the root ignores (see ChromeLayout).

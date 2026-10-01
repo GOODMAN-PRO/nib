@@ -422,10 +422,16 @@ struct ToolPresetMenu: View {
                 .presetPopoverSource(tool, model.shown == .width(i))
             }
             NibBarSeparator()
-            swatchStrip(arranging: false)
-            if presets.swatches.count < ToolPresets.maxSwatches {
-                NibIconButton(.plus, label: String(localized: "Add Colour")) { model.addColour() }
-                    .presetPopoverSource(tool, model.shown == .colour(.add))
+            if sizeClass == .compact {
+                // Leave room for the host's settings chevron and the capsule's chrome insets. The selected
+                // colour opens the existing colour popover, which holds the remaining presets and Add Colour.
+                swatchSlot(presets.selectedSwatch, presets.swatches[presets.selectedSwatch], arranging: false)
+            } else {
+                swatchStrip(arranging: false)
+                if presets.swatches.count < ToolPresets.maxSwatches {
+                    NibIconButton(.plus, label: String(localized: "Add Colour")) { model.addColour() }
+                        .presetPopoverSource(tool, model.shown == .colour(.add))
+                }
             }
         }
     }
@@ -442,9 +448,10 @@ struct ToolPresetMenu: View {
         }
     }
 
-    /// iPhone shows three and a half slots and scrolls; iPad shows eight.
+    /// Rearranging on iPhone leaves room for Restore, Done and the host's settings chevron, even at 320 pt.
+    /// The normal compact row shows only the selected swatch; iPad shows eight and scrolls.
     private func stripWidth(_ count: Int) -> CGFloat {
-        let cap: Double = sizeClass == .compact ? 3.5 : 8
+        let cap: Double = sizeClass == .compact ? 2.5 : 8
         return CGFloat(min(Double(count), cap)) * NibMetrics.paletteSwatchPitch
     }
 
@@ -459,7 +466,7 @@ struct ToolPresetMenu: View {
             }
             .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
             .onAppear { proxy.scrollTo(presets.selectedSwatch, anchor: .center) }
-            // Keys 1-9/0, the AI or another window can select a slot scrolled out of view (iPhone shows 3.5).
+            // Keys 1-9/0, the AI or another window can select a slot scrolled out of view.
             .onChange(of: presets.selectedSwatch) { _, s in proxy.scrollTo(s, anchor: .center) }
         }
         .frame(width: stripWidth(presets.swatches.count), height: NibMetrics.hitTarget)
@@ -495,7 +502,9 @@ struct ToolPresetMenu: View {
             SwatchSlot(tool: tool, swatch: swatch, name: name, isSelected: i == presets.selectedSwatch, registry: registry) {
                 model.tapSwatch(i)
             }
-            .presetPopoverSource(tool, model.shown == .colour(.slot(i)))
+            // In compact width the selected swatch remains the source while the popover adds a colour or
+            // edits another saved slot: those controls no longer live in the bar.
+            .presetPopoverSource(tool, isColourSource(i))
             .contextMenu {
                 Button(String(localized: "Change Colour")) { model.open(.colour(.slot(i))) }
                 Button(String(localized: "Rearrange Colours")) { model.beginArranging() }
@@ -507,6 +516,13 @@ struct ToolPresetMenu: View {
             .accessibilityAction(named: Text(String(localized: "Change Colour"))) { model.open(.colour(.slot(i))) }
             .accessibilityAction(named: Text(String(localized: "Rearrange Colours"))) { model.beginArranging() }
         }
+    }
+
+    private func isColourSource(_ index: Int) -> Bool {
+        if sizeClass == .compact, case .colour = model.shown {
+            return index == presets.selectedSwatch
+        }
+        return model.shown == .colour(.slot(index))
     }
 }
 

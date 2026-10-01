@@ -13,6 +13,7 @@ final class GlassForegroundSnapshotTests: XCTestCase {
     func testBarPaletteAndDeepGlyphsStayCrispAndReadable() async throws {
         try assertHostlessForegroundGuarantees()
         guard NibSnapshot.supportsHostedImages else { return }
+        try await assertLiveAppearanceChangesOverWhitePaper()
         for variant in [NibSnapshot.Variant.light, .dark] {
             for surface in [NibGlassForegroundGallery.Surface.bar, .palette, .deep, .hud, .standaloneHUD] {
                 let reference = try await capture(surface, glass: false, variant: variant)
@@ -163,6 +164,114 @@ final class GlassForegroundSnapshotTests: XCTestCase {
             glass.nibChromeAppearance = nil
             XCTAssertEqual(NibChromeColor(NibColor.label).resolve(in: glass), NibColor.label.resolve(in: glass))
         }
+    }
+
+    func testNativeUnderlayUsesLivePaperGeometryAndCapturedAppAppearance() throws {
+        let frame = CGRect(x: 40, y: 100, width: 280, height: 44)
+        let paper = CGRect(origin: .zero, size: size)
+        var app = EnvironmentValues()
+        app.colorScheme = .dark
+        for style in [DropletStyle.bar, .palette, .hud, .chip] {
+            let field = DropletField()
+            field.usesSystemGlass = true
+            field.setRest("live", frame, style: style)
+            defer { field.unregister("live") }
+            XCTAssertEqual(field.node("live").presentation.paperShare, 0)
+            // The page registration changes in SwiftUI before the field's onChange publishes.
+            // Simulate native glass adapting the local environment to light at that same moment.
+            let live = NativeGlassBackdropLayer(field: field, backdrop: [paper])
+                .environment(\.nibChromeAppearance, NibChromeAppearance(app))
+                .environment(\.colorScheme, .light)
+                .background(Color.white)
+            let image = try XCTUnwrap(NibSnapshot.image(live, size: size))
+            let centre = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 180, y: 120)))
+            XCTAssertLessThan(max(centre.r, centre.g, centre.b), 85)
+            XCTAssertGreaterThanOrEqual(contrast(.white, centre), 4.5)
+            XCTAssertEqual(NibSnapshot.pixel(image, at: CGPoint(x: 2, y: 2)), .white)
+
+            // And the inverse: leaving white paper removes the exception without waiting for physics.
+            field.setBackdrop([paper])
+            let removed = NativeGlassBackdropLayer(field: field, backdrop: [])
+                .environment(\.nibChromeAppearance, NibChromeAppearance(app))
+                .background(Color.white)
+            let cleared = try XCTUnwrap(NibSnapshot.image(removed, size: size, variant: .dark))
+            XCTAssertEqual(NibSnapshot.pixel(cleared, at: CGPoint(x: 180, y: 120)), .white)
+        }
+    }
+
+    /// Keep one UIKit host alive while SwiftUI changes appearance. Fresh hosts whose UIKit traits already
+    /// match the requested snapshot cannot detect a stale native glass subtree.
+    private func assertLiveAppearanceChangesOverWhitePaper() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let previousKeyWindow = scene.windows.first { $0.isKeyWindow }
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(origin: .zero, size: size)
+        let host = UIHostingController(rootView: AppearanceProbe(surface: .bar, scheme: .light, showsContent: true))
+        // Deliberately leave UIKit light. Nib must apply the live app appearance at the native effect boundary.
+        host.overrideUserInterfaceStyle = .light
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            previousKeyWindow?.makeKey()
+        }
+        host.view.frame = window.bounds
+        for surface in [NibGlassForegroundGallery.Surface.bar, .palette, .hud, .standaloneHUD, .deep] {
+            for scheme in [ColorScheme.light, .dark, .light, .dark] {
+                host.rootView = AppearanceProbe(surface: surface, scheme: scheme, showsContent: true)
+                host.view.layoutIfNeeded()
+                try await Task.sleep(nanoseconds: 500_000_000)
+                let rendered = try liveImage(host.view)
+                host.rootView = AppearanceProbe(surface: surface, scheme: scheme, showsContent: false)
+                host.view.layoutIfNeeded()
+                try await Task.sleep(nanoseconds: 500_000_000)
+                let empty = try liveImage(host.view)
+                let variant: NibSnapshot.Variant = scheme == .dark ? .dark : .light
+                let reference = try XCTUnwrap(NibSnapshot.image(
+                    NibGlassForegroundGallery(surface: surface, glass: false), size: size, variant: variant))
+                var cores = 0, readable = 0
+                for y in 102..<138 {
+                    for x in 44..<316 {
+                        let point = CGPoint(x: x, y: y)
+                        let ref = try XCTUnwrap(NibSnapshot.pixel(reference, at: point))
+                        let neutral = abs(Int(ref.r) - Int(ref.g)) < 5 && abs(Int(ref.g) - Int(ref.b)) < 5
+                        let core = scheme == .dark ? min(ref.r, ref.g, ref.b) > 252 : max(ref.r, ref.g, ref.b) < 3
+                        guard neutral && core else { continue }
+                        cores += 1
+                        let glyph = try XCTUnwrap(NibSnapshot.pixel(rendered, at: point))
+                        let body = try XCTUnwrap(NibSnapshot.pixel(empty, at: point))
+                        if contrast(glyph, body) >= 4.5 { readable += 1 }
+                    }
+                }
+                attach(rendered, name: "live-appearance-\(surface)-\(scheme)")
+                XCTAssertGreaterThan(cores, 40)
+                XCTAssertGreaterThanOrEqual(Double(readable) / Double(max(cores, 1)), 0.9,
+                                            "\(surface), \(scheme): live native glass must retain 4.5:1 contrast")
+            }
+        }
+    }
+
+    private struct AppearanceProbe: View {
+        let surface: NibGlassForegroundGallery.Surface
+        let scheme: ColorScheme
+        let showsContent: Bool
+
+        var body: some View {
+            NibGlassForegroundGallery(surface: surface, showsContent: showsContent)
+                .environment(\.colorScheme, scheme)
+                .ignoresSafeArea()
+        }
+    }
+
+    private func liveImage(_ view: UIView) throws -> UIImage {
+        view.layoutIfNeeded()
+        var drawn = false
+        let image = UIGraphicsImageRenderer(size: size).image { _ in
+            drawn = view.drawHierarchy(in: CGRect(origin: .zero, size: size), afterScreenUpdates: true)
+        }
+        XCTAssertTrue(drawn, "The live native compositor must produce the regression image")
+        return image
     }
 
     func testStaticGlassCanCarryItsUnderlayOutsideAContainerWithoutTintingPaper() throws {
