@@ -159,9 +159,15 @@ final class FeatAIChatTests: XCTestCase {
         XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
     }
 
-    func testCanvasHandleRequiresProviderAndSelectionAndTracksFirstLine() throws {
+    func testCanvasHandleRequiresProviderAndSelectionAndTracksFirstLine() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let host = FakeCanvasHost(h)
+        let window = UIWindow(frame: host.canvasView.bounds)
+        let root = UIViewController()
+        root.view = host.canvasView
+        window.rootViewController = root
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; window.rootViewController = nil }
         let attachment = ChatInlineAttachment()
         attachment.attach(to: host)
         defer { attachment.detach(from: host) }
@@ -191,6 +197,8 @@ final class FeatAIChatTests: XCTestCase {
         }
         let lineHeight = RichTextBridge.font(item.text?.text.paragraphs.first?.runs.first?.attrs ?? TextAttributes(), base: layout.base).lineHeight
         XCTAssertEqual(frame.midY, CGFloat(layout.container.y) + lineHeight / 2, accuracy: 1)
+        controller.view.layoutIfNeeded()
+        try await Task.sleep(nanoseconds: 100_000_000)
         controller.view.layoutIfNeeded()
         func findButton(_ view: UIView) -> UIButton? {
             if let button = view as? UIButton { return button }

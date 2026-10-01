@@ -30,8 +30,14 @@ public enum NibSnapshot {
 
     /// Live compositor capture, including Liquid Glass and UIKit-backed content. ImageRenderer cannot exercise
     /// the glass foreground/backdrop ordering. Keep a visible window alive until layout and the compositor settle.
+    /// Hostless package tests have no window scene and cannot capture the system compositor.
+    public static var supportsHostedImages: Bool {
+        UIApplication.shared.connectedScenes.contains { $0 is UIWindowScene }
+    }
+
     public static func hostedImage<V: View>(_ view: V, size: CGSize, variant: Variant = .light,
                                            scale: CGFloat = 2) async throws -> UIImage? {
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return nil }
         let styled = view
             .frame(width: size.width, height: size.height)
             .ignoresSafeArea()
@@ -39,18 +45,15 @@ public enum NibSnapshot {
             .environment(\.dynamicTypeSize, variant.dynamicTypeSize)
         let host = UIHostingController(rootView: styled)
         host.overrideUserInterfaceStyle = variant == .dark ? .dark : .light
-        let window: UIWindow
-        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
-            window = UIWindow(windowScene: scene)
-        } else {
-            window = UIWindow(frame: CGRect(origin: .zero, size: size))
-        }
+        let previousKeyWindow = scene.windows.first { $0.isKeyWindow }
+        let window = UIWindow(windowScene: scene)
         window.frame = CGRect(origin: .zero, size: size)
         window.rootViewController = host
-        window.isHidden = false
+        window.makeKeyAndVisible()
         defer {
             window.isHidden = true
             window.rootViewController = nil
+            previousKeyWindow?.makeKey()
         }
         host.view.frame = window.bounds
         host.view.backgroundColor = .clear

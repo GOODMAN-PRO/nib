@@ -1408,6 +1408,7 @@ final class FeatCreateTests: XCTestCase {
     // MARK: - Screens render (Light, Dark, AX3)
 
     func testNewNotebookWithCoverColoursFitsA402PointPhone() async throws {
+        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Live sheet geometry requires an app-hosted window scene; validate it in simulator captures.")
         let h = harness()
         h.app.content.templates.register(Self.ruled())
         h.app.content.templates.register(Self.solidCover())

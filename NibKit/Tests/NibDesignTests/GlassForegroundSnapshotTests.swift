@@ -11,6 +11,7 @@ final class GlassForegroundSnapshotTests: XCTestCase {
     private let size = CGSize(width: 360, height: 240)
 
     func testBarPaletteAndDeepGlyphsStayCrispAndReadable() async throws {
+        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Liquid Glass compositor snapshots require an app-hosted window scene; validate them in simulator captures.")
         for variant in [NibSnapshot.Variant.light, .dark] {
             for surface in [NibGlassForegroundGallery.Surface.bar, .palette, .deep] {
                 let reference = try await capture(surface, glass: false, variant: variant)
@@ -63,6 +64,7 @@ final class GlassForegroundSnapshotTests: XCTestCase {
     }
 
     func testLibraryNewHasAccentBehindItsLabelInBothAppearances() async throws {
+        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Liquid Glass compositor snapshots require an app-hosted window scene; validate them in simulator captures.")
         for variant in [NibSnapshot.Variant.light, .dark] {
             let image = try await capture(.library, variant: variant)
             attach(image, name: "library-new-\(variant.rawValue)")

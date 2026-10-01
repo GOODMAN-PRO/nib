@@ -30,6 +30,7 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertEqual(problems, [])
     }
     func testLibraryChromeLayoutRegistersAndDrawsItsDropletBodies() async throws {
+        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Liquid Glass compositor snapshots require an app-hosted window scene; validate them in simulator captures.")
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)
         let root = LibraryRootView(model: model)
@@ -110,6 +111,7 @@ final class FeatLibraryUITests: XCTestCase {
         }
     }
     func testLibraryRootChromeSnapshots() async throws {
+        try XCTSkipUnless(NibSnapshot.supportsHostedImages, "Library compositor snapshots require an app-hosted window scene; validate them in simulator captures.")
         let h = harness()
         let model = LibraryModels.get(h.app).model(h.session)
         model.setView(["sidebar": false])
@@ -131,9 +133,18 @@ final class FeatLibraryUITests: XCTestCase {
         let image = try XCTUnwrap(NibSnapshot.image(
             NibDropletButton(id: "new", title: "New", symbol: .plus, kind: .tinted) {}
                 .environment(field).background(NibColor.background), size: CGSize(width: 96, height: 44)))
-        let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 16, y: 10)))
-        XCTAssertGreaterThan(Int(pixel.b) - Int(pixel.r), 50)
-        XCTAssertGreaterThan(Int(pixel.b) - Int(pixel.g), 30)
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "library-new-before-registration"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        var accentPixels = 0
+        for y in 8..<36 {
+            for x in 8..<88 {
+                let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                if Int(pixel.b) - Int(pixel.r) > 50 && Int(pixel.b) - Int(pixel.g) > 30 { accentPixels += 1 }
+            }
+        }
+        XCTAssertGreaterThan(accentPixels, 800, "The button needs an accent body beneath its white glyphs.")
     }
     func testPerFolderViewsAndWindowIsolation() async throws {
         let h = harness()

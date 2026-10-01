@@ -194,7 +194,9 @@ struct DropletBodyModifier: ViewModifier {
     @Environment(\.colorScheme) private var colorScheme
 
     func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) {
+        // Disabled glass and frame-only droplets must remain ordinary SwiftUI content. Even identity glass
+        // creates a system compositor host, which offscreen ImageRenderer cannot draw.
+        if #available(iOS 26.0, *), field.usesSystemGlass, style.drawsBody {
             let enabled = field.usesSystemGlass && style.drawsBody
             let drawn = enabled && presentation.isDrawn && !presentation.hidden
             let shape = NibDropletShape(cornerRadius: style.cornerRadius == nil ? nil : presentation.cornerRadius)
