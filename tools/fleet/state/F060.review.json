@@ -1,0 +1,89 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/FeatMath/MathDrawer.swift:17-46 (MathTypesetter.validate), used by MathCommands.swift:144 (math.setLatex) and MathDrawer.draw",
+      "problem": "validate only limits brace depth, so nesting without braces gets through, e.g. \"\\sqrt \" or \"\\frac1\" repeated. I reproduced this with SwiftMath 1.7.3 (the pinned revision) in a release build. On a 512 KB stack (the size of tile and worker threads), MTMathListBuilder.build crashes with SIGBUS on \"\\sqrt \" x1300 (7.8 KB, which is under the 8192-byte limit). On a 1 MB stack, \"\\sqrt \" x600 (3.6 KB) parses but crashes while typesetting, and \"\\frac1\" x300 crashes at 512 KB. math.setLatex calls validate (a parse only) on the main thread and never typesets, so the AI, a plugin, the bridge, or an imported or synced .nib file can store such a line. After that, every tile render of the page calls image() -> validate -> parse on a 512 KB thread, so the app crash-loops whenever that page or export is drawn, on every device the document syncs to.",
+      "fix": "Make validate reject this input before SwiftMath recurses. (a) Cap each line at the length the raster guard can draw (about 1024 bytes). (b) Count structural tokens (\\\\[a-zA-Z]+, ^, _) per line and reject above a small bound. (c) After parsing, walk the MTMathList iteratively (fraction numerator and denominator, radical, sub and superscripts, inner, accent, over/underline, table cells) and reject depth above NibLimits.maxNesting. Also run every SwiftMath parse and typeset inside MathTypesetter on one dedicated Thread with stackSize >= 8 MB. Add tests: \"\\\\sqrt \" x1300 and \"\\\\frac1\" x300 must make math.setLatex and math.convert throw invalid_params with the document unchanged, and MathDrawer.draw must return without typesetting an item that already holds such LaTeX."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMath/MathCommands.swift:139-147 (MathSetLatex) and MathDrawer.swift:121-134",
+      "problem": "math.setLatex keeps the old frame, and the drawer fills the frame by stretching the image unevenly (cg.draw(cgImage, in: 0,0,frame.w,frame.h)). Editing LaTeX in the normal recognise-then-correct flow therefore distorts the formula: changing x to \\frac{a+b}{c} squashes it into the old aspect ratio. The fixture (\\frac{a}{b} in a 120x40 frame) already draws stretched. setLatex also never typesets, so a valid line between 482 and 8192 bytes is accepted, the drawer's scale-1 image then throws 'too wide', and the object becomes invisible.",
+      "fix": "In MathSetLatex, call MathTypesetter.shared.image(lines:color:scale:1) as math.convert does, so lines that cannot be drawn are rejected. Then set frame.h = frame.w * natural.h / natural.w, keeping x, y, w and rotation. In MathDrawer, fit the image inside the frame without changing its aspect ratio (s = min(w/nw, h/nh), drawn from the top leading corner) instead of stretching it. Add a test: setLatex from [\"x\"] to [\"\\\\frac{a+b}{c}\"] changes frame.h, undo restores the old frame, and a 600-character line is rejected."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMath/MathDrawer.swift:13, 69-122",
+      "problem": "The drawer rasterises the whole object for every tile at an arbitrary density (context.scale x frame/natural, clamped only to 16). Four problems follow. (1) Each zoom level is a new cache key, so pinch-zoom re-typesets on every tile. (2) SwiftMath's MathImage.asImage uses UIGraphicsImageRenderer(size:) at screen scale (2-3x), so the per-line images are 4-9x the pixel count the final 8192 / 16.7 MP check assumes. All lines are rendered before that check, so a 10-line object at density 16 allocates hundreds of MB per draw (jetsam risk). (3) NSCache's 24 MB totalCostLimit is smaller than one such image, so nothing is cached and every tile repeats the work. validate also re-parses every line on each call, even on a cache hit. (4) pointSize comes from NibUIFont.documentBody, which scales with Dynamic Type through UIFontMetrics. Document rendering and its limits therefore depend on the device: at AX5 (about 53 pt), lines over about 154 characters are rejected by math.convert and drawn as nothing, while they work on other devices.",
+      "fix": "Typeset at a fixed reference size that does not scale with Dynamic Type; the frame decides the visible size. Round the drawer's density to a power of two, and cap it so the composite is at most about 4 MP and always fits the cache cost limit. Estimate the composite size from the display-list metrics before rendering any line. Request fontSize / UIGraphicsImageRendererFormat.preferred().scale from MathImage, or render with your own scale-1 format, so the pixel budget is accurate. Check the cache before calling validate. Add a test that drawing the same object at two zoom levels that round to the same density returns the identical cached image."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMath/MathEditorSheet.swift:52-62",
+      "problem": "ForEach(lines.indices, id: \\.self) uses NibField bindings that capture an index (Binding(get: { lines[index] }, set: { lines[index] = $0 })). Removing a line, especially the focused last line through its own Remove line button, lets the TextField commit read or write the stale index, and the app crashes with 'Index out of range'. This is the main editing surface of the feature.",
+      "fix": "Model rows as `struct LatexLine: Identifiable { let id = UUID(); var text: String }`, use `ForEach($lines) { $line in NibField(text: $line.text, ...) }`, remove rows by id, and map back to [String] for the commands."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMath/FeatMathFeature.swift:16-17",
+      "problem": "MathEditorSheet draws its own NibSheetHeader (Done, title, Apply), but the PanelDescriptor leaves providesHeader at its default of false. Under contracts-v2 the panel chrome (F017) then adds its own header as well, so the sheet shows two headers and two dismiss controls. contracts-v2 provides PanelDescriptor.providesHeader for exactly this case.",
+      "fix": "`var editor = PanelDescriptor(id: editorPanel, ...); editor.providesHeader = true; app.ui.panels.register(editor)`, and assert it in testRegistrationAndCommandConformance."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMath/MathRecognizer.swift:11-27 (MathNormalizer.line)",
+      "problem": "Symbol substitution runs before fraction detection, and the fraction regex's lookbehind does not exclude a backslash. I ran MathNormalizer.line: \"π/2\" -> `\\\\frac{pi}{2}` and \"2π/3\" -> `2\\\\frac{pi}{3}`, which is a LaTeX row break followed by the italic letters f r a c p i. SwiftMath parses this without error, so the garbage passes validate and reaches the preview and the document for one of the most common inputs. The same function turns \"1 / 2 / 3\" into `\\frac{1}{2} / 3` (a partial conversion). The stacked-fraction bar regex ^[-−―_]{2,}$ misses the em and en dashes (—, –) that Vision usually returns for a bar.",
+      "fix": "Add \\\\ to the lookbehind (`(?<![\\\\\\w}./])`) and accept `\\\\[a-zA-Z]+` as a fraction atom, so \"π/2\" becomes `\\frac{\\pi}{2}`. Treat a slash chain separated by whitespace as ambiguous, as the code already does for 1/2/3. Add — and – to the bar class. Add unit tests for π/2, 2π/3, 1 / 2 / 3, and the stacked fractions [\"x+1\",\"—\",\"2\"] and [\"x+1\",\"–\",\"2\"]."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMath/MathEditorSheet.swift:34-36, 128-151",
+      "problem": "The error banner's Retry always calls load(). After an Apply failure this resets ref from the panel params, which is nil after a successful convert, so the sheet falls back to 'Convert' mode with the deleted stroke refs. It also overwrites the user's edited LaTeX with a fresh recognition, which sends the ink to the provider again.",
+      "fix": "Set the target ref once, keeping the converted ref. Keep load errors and apply errors apart: Retry after an apply failure calls apply(). Never replace edited lines unless the user asks for that."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMath/MathCommands.swift:29-33",
+      "problem": "For each of up to 1000 refs, MathSelection.load runs a nested query.get with points: true and throws the result away. Once F003 is installed, that is 1000 nested invocations (hooks, gateway, full stroke-point JSON) on the main actor that do nothing.",
+      "fix": "Delete the call. The outer command is already authorised, and commands may read ctx.workspace."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMath/FeatMathFeature.swift:14 and MathCommands.swift:190-227 (math.transfer)",
+      "problem": "math.transfer is not in ARCHITECTURE §6.5 or the F060 'Commands owned' list, and lint warns: 'F060 registers math.transfer, which ARCHITECTURE §6.5 does not list for it'. It also presents on ctx.activeSession?.editor, which in multi-window iPad can be a different window from the one that invoked it, and it bypasses SceneNavigator.presentModal.",
+      "fix": "Either file the id for §6.5 and forge-spec, or remove it. Copy LaTeX through CommandIDs.clipboardCopyText {text}. Run the image and handwriting copy/share from the sheet's UI code after math.copy. Present on ctx.session?.editor / ctx.navigator?.presentModal, with the popover anchored to that window."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMath/MathRecognizer.swift:57-76",
+      "problem": "The render.page path leaves out `layers`, so every layer and every other item in the region is rendered. The renderer fallback renders only items[0].layer, although math.recognize accepts selections that span layers. The two paths give different images.",
+      "fix": "Pass the selection's layer set (Set(selection.items.map(\\.layer))) as render.page `layers` and as RenderRequest.layers, and test a selection that spans two layers."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMath/MathEditorSheet.swift:90, 118-126; MathRecognizer.swift:62, 74",
+      "problem": "Every keystroke re-validates and rasterises all lines on the main thread while holding the lock the tile renderers share. recognize also decodes and encodes the PNG on the main actor. Both break the 16 ms main-actor rule.",
+      "fix": "Debounce the preview (about 150 ms) and typeset it in a cancellable detached task. Move the PNG decode and encode into the detached Vision/renderer work."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMath/MathEditorSheet.swift:153-167 and MathCommands.swift:81-124",
+      "problem": "Conversion from the sheet passes explicit LaTeX and re-reads the strokes when Apply is pressed. If sync, collaboration or a plugin changed the ink after recognition, LaTeX recognised from the old ink replaces the new ink without any warning.",
+      "fix": "Have the sheet keep the item revs it recognised. Pass them through an additive optional param (e.g. `revs`) that math.convert checks inside mutate, throwing conflict on a mismatch."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMath/MathEditorSheet.swift:60",
+      "problem": "Every row's 'Remove line' button has the same VoiceOver label, so VoiceOver users cannot tell which line a button removes.",
+      "fix": ".accessibilityLabel(String(localized: \"Remove line \\(index + 1)\")) (or the line's id-based position)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatMathTests/FeatMathTests.swift, MathNormalizerTests.swift",
+      "problem": "The riskiest logic is untested: brace-less nesting limits, setLatex renderability and frame update, π/2 normalisation, rejection of multi-layer, cross-page and read-only selections, and the requireUnchanged conflict path when ink changes during recognition. The drawer test only checks that some pixel is non-zero.",
+      "fix": "Add the tests named in the issues above, plus a FakeAIService response that is delayed while the stroke is edited, asserting a conflict and an unchanged snapshot."
+    }
+  ]
+}
