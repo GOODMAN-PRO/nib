@@ -25,6 +25,15 @@ final class MathNormalizerTests: XCTestCase {
         XCTAssertEqual(MathNormalizer.lines(["", "x²+1", "---", "2", "y = 3", " "]), ["\\frac{x^{2}+1}{2}", "y = 3"])
     }
 
+    func testPiFractionsAndSpacedSlashChains() {
+        XCTAssertEqual(MathNormalizer.line("π/2"), "\\frac{\\pi}{2}")
+        XCTAssertEqual(MathNormalizer.line("2π/3"), "\\frac{2\\pi}{3}")
+        XCTAssertEqual(MathNormalizer.line("1 / 2 / 3"), "1 / 2 / 3")
+        for bar in ["—", "–"] {
+            XCTAssertEqual(MathNormalizer.lines(["x+1", bar, "2"]), ["\\frac{x+1}{2}"])
+        }
+    }
+
     func testExistingLatexIsUntouched() {
         XCTAssertEqual(MathNormalizer.line(" \\frac{a}{b} "), "\\frac{a}{b}")
         XCTAssertEqual(MathNormalizer.lines([]), [])

@@ -1,6 +1,5 @@
 import Foundation
 import UIKit
-import UniformTypeIdentifiers
 import NibContracts
 import NibDesign
 
@@ -26,11 +25,6 @@ struct MathSelection {
                 throw NibError(.invalidParams, "Select distinct items on one page", path: "$.refs", hint: "select a single equation on one page")
             }
             if ctx.services.lock?.isLocked(d) == true { throw NibError(.locked, "Unlock the document before converting or copying maths") }
-            if ctx.bus.registry.entry(CommandIDs.queryGet) != nil {
-                // The public query may return a summary rather than the full typed payload. The workspace is
-                // the contract read model for that payload; UI and external clients only call commands.
-                _ = try await ctx.execute(CommandIDs.queryGet, ["ref": .string(ref), "points": true])
-            }
             let item = try ctx.workspace.item(d, page: p, id: id)
             if strokesOnly && (item.kind != .stroke || item.stroke == nil || item.stroke?.style.tool == .tape) {
                 throw NibError(.invalidParams, "Math conversion accepts handwriting only", path: "$.refs", hint: "select pen or pencil strokes")
@@ -72,11 +66,11 @@ struct MathRecognize: NibCommand {
 }
 
 struct MathConvert: NibCommand {
-    struct Params: Codable { var refs: [String]; var latex: [String]?; var id: String? }
+    struct Params: Codable { var refs: [String]; var latex: [String]?; var id: String?; var revs: [Rev]? = nil }
     struct Output: Codable { var ref: String; var lines: [String] }
     static let descriptor = CommandDescriptor(id: CommandIDs.mathConvert, title: String(localized: "Convert to Maths"),
-        summary: "Replace selected handwriting with a math object, retaining the original ink. latex is an array of LaTeX lines; id chooses its ID.",
-        params: .obj(["refs": .arr(.ref), "latex": .arr(.str()), "id": .str()], required: ["refs"]),
+        summary: "Replace selected handwriting with a math object, retaining the original ink. latex is an array of LaTeX lines; id chooses its ID; optional revs guards against ink changed since recognition.",
+        params: .obj(["refs": .arr(.ref), "latex": .arr(.str()), "id": .str(), "revs": .arr(.str("Recognised item revision, in the same order as refs"))], required: ["refs"]),
         examples: [["refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"], "latex": ["x^{2}+1"], "id": "MATHCONVERT01"]], effect: .edit)
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
         let selection = try await MathSelection.load(p.refs, ctx, strokesOnly: true)
@@ -89,15 +83,26 @@ struct MathConvert: NibCommand {
             // The nested sensitive read applies the gateway's provider disclosure to every principal.
             lines = try await ctx.execute(MathRecognize.self, MathRecognize.Params(refs: p.refs)).lines
         }
-        try MathTypesetter.shared.validate(lines)
         let color = selection.items.first?.stroke?.style.color ?? RGBA(NibInk.carbon.uiColor)
-        let natural = try MathTypesetter.shared.image(lines: lines, color: color, scale: 1).size
+        let natural = try await Task.detached(priority: .userInitiated) {
+            try MathTypesetter.shared.image(lines: lines, color: color, scale: 1).size
+        }.value
         let width = max(1, selection.bounds.width)
         let height = max(1, width * Double(natural.height / max(1, natural.width)))
         guard width.isFinite, height.isFinite else { throw NibError(.invalidParams, "The handwriting has invalid bounds", path: "$.refs") }
         let math = MathItem(frame: Frame(x: selection.bounds.x, y: selection.bounds.y, w: width, h: height),
                             latex: lines, color: color, sourceInk: selection.items.compactMap(\.stroke))
+        if let revs = p.revs, revs.count != selection.items.count {
+            throw NibError(.invalidParams, "Pass one recognised revision per ref", path: "$.revs")
+        }
         try ctx.mutate { tx in
+            if let revs = p.revs {
+                for (index, item) in selection.items.enumerated() {
+                    guard try tx.item(selection.doc, page: selection.page, id: item.id).rev == revs[index] else {
+                        throw NibError(.conflict, "The handwriting changed since recognition", hint: "recognise the selection again")
+                    }
+                }
+            }
             try selection.requireEditable(ctx)
             try selection.requireUnchanged(tx)
             guard !(try ctx.workspace.allItems(selection.doc, page: selection.page)).contains(where: { $0.id == id }) else {
@@ -133,7 +138,7 @@ struct MathConvert: NibCommand {
 struct MathSetLatex: NibCommand {
     struct Params: Codable { var ref: String; var lines: [String] }
     static let descriptor = CommandDescriptor(id: CommandIDs.mathSetLatex, title: String(localized: "Edit LaTeX"),
-        summary: "Replace a math object's LaTeX lines while preserving its colour, frame and original handwriting.",
+        summary: "Replace a math object's LaTeX lines while preserving its colour, position, width, rotation and original handwriting, and fitting its height to the formula.",
         params: .obj(["ref": .ref, "lines": .arr(.str())], required: ["ref", "lines"]),
         examples: [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01", "lines": ["\\frac{a}{b}", "x^{2}"]]], effect: .edit)
     static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
@@ -141,9 +146,17 @@ struct MathSetLatex: NibCommand {
         try selection.requireEditable(ctx)
         var item = selection.items[0]
         guard var math = item.math else { throw NibError(.invalidParams, "Select a math object", path: "$.ref", hint: "call query.get to inspect the item kind") }
-        try MathTypesetter.shared.validate(p.lines)
+        let color = math.color
+        let natural = try await Task.detached(priority: .userInitiated) {
+            try MathTypesetter.shared.image(lines: p.lines, color: color, scale: 1).size
+        }.value
+        math.frame.h = math.frame.w * natural.height / natural.width
         math.latex = p.lines; item.math = math
-        try ctx.mutate { tx in try tx.put(item, doc: selection.doc, page: selection.page) }
+        try ctx.mutate { tx in
+            try selection.requireEditable(ctx)
+            try selection.requireUnchanged(tx)
+            try tx.put(item, doc: selection.doc, page: selection.page)
+        }
         return NoResult()
     }
 }
@@ -168,10 +181,13 @@ struct MathCopy: NibCommand {
         case "latex": return Output(format: "latex", latex: math.latex.joined(separator: "\n"), lines: math.latex)
         case "image":
             guard let assets = ctx.services.assets else { throw NibError.unavailable("The asset store is not installed") }
-            let natural = try MathTypesetter.shared.image(lines: math.latex, color: math.color, scale: 1)
-            let density = 2 * max(math.frame.w / max(1, natural.size.width), math.frame.h / max(1, natural.size.height))
-            let image = (try? MathTypesetter.shared.image(lines: math.latex, color: math.color, scale: density)) ?? natural
-            guard let data = image.pngData() else { throw NibError(.internalError, "The formula could not be encoded") }
+            let data = try await Task.detached(priority: .userInitiated) {
+                let natural = try MathTypesetter.shared.image(lines: math.latex, color: math.color, scale: 1)
+                let density = 2 * min(math.frame.w / max(1, natural.size.width), math.frame.h / max(1, natural.size.height))
+                let image = try MathTypesetter.shared.image(lines: math.latex, color: math.color, scale: density)
+                guard let data = image.pngData() else { throw NibError(.internalError, "The formula could not be encoded") }
+                return data
+            }.value
             let asset = try assets.putTemporary(data, ext: "png")
             return Output(format: "image", asset: "tmp:" + asset.name)
         case "handwriting":
@@ -183,46 +199,5 @@ struct MathCopy: NibCommand {
             return Output(format: "handwriting", fragment: fragment)
         default: throw NibError(.invalidParams, "Choose latex, image or handwriting", path: "$.as", hint: "call commands.describe for math.copy")
         }
-    }
-}
-
-/// UI effects stay separate from the portable read API used by plugins and AI.
-struct MathTransfer: NibCommand {
-    struct Params: Codable { var ref: String; var `as`: String; var action: String }
-    static let descriptor = CommandDescriptor(id: "math.transfer", title: String(localized: "Copy or Share Maths"),
-        summary: "Copy or share LaTeX, a PNG image, or original handwriting using the system UI.",
-        params: .obj(["ref": .ref, "as": .str(choices: ["latex", "image", "handwriting"]), "action": .str(choices: ["copy", "share"])], required: ["ref", "as", "action"]),
-        examples: [["ref": "item:FIXTUREDOC01/FIXTUREPG001/FIXTUREMTH01", "as": "latex", "action": "copy"]],
-        effect: .session, exposure: .ui, userPresence: true)
-    static func run(_ p: Params, _ ctx: CommandContext) async throws -> NoResult {
-        guard ctx.principal.isUser, !NibApp.isHostlessTest else { throw NibError.unavailable("Copy and share require an interactive window") }
-        let result = try await ctx.execute(MathCopy.self, MathCopy.Params(ref: p.ref, as: p.as))
-        var shareItem: Any
-        var clipboard: [String: Any]
-        if let latex = result.latex { shareItem = latex; clipboard = [UTType.utf8PlainText.identifier: latex] }
-        else if let name = result.asset {
-            let url = try await ctx.inputFile(name)
-            let bytes = try Data(contentsOf: url)
-            shareItem = url; clipboard = [UTType.png.identifier: bytes]
-        } else if let fragment = result.fragment, let bytes = fragment.encoded() {
-            shareItem = bytes; clipboard = [NibFragment.typeIdentifier: bytes]
-        } else { throw NibError(.internalError, "No math content was returned") }
-        if p.action == "copy" { UIPasteboard.general.setItems([clipboard]); return NoResult() }
-        guard p.action == "share", let presenter = ctx.activeSession?.editor as? UIViewController else {
-            throw NibError.unavailable("Open this document before sharing maths")
-        }
-        if let fragment = result.fragment, let bytes = fragment.encoded() {
-            guard let assets = ctx.services.assets else { throw NibError.unavailable("The asset store is not installed") }
-            let ref = try assets.putTemporary(bytes, ext: "nibfragment")
-            guard let url = assets.temporaryURL(ref) else { throw NibError.unavailable("The handwriting file could not be prepared") }
-            shareItem = url
-        }
-        let sheet = UIActivityViewController(activityItems: [shareItem], applicationActivities: nil)
-        var top = presenter
-        while let next = top.presentedViewController { top = next }
-        sheet.popoverPresentationController?.sourceView = top.view
-        sheet.popoverPresentationController?.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.midY, width: 1, height: 1)
-        top.present(sheet, animated: !UIAccessibility.isReduceMotionEnabled)
-        return NoResult()
     }
 }

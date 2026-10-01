@@ -23,7 +23,10 @@ enum MathNormalizer {
         for (from, to) in substitutions { text = text.replacingOccurrences(of: from, with: to) }
         text = text.replacingOccurrences(of: #"\^(-?\d+|[a-zA-Z])"#, with: "^{$1}", options: .regularExpression)
         // Only simple atoms or explicitly grouped terms are unambiguous slash fractions.
-        text = text.replacingOccurrences(of: #"(?<![\w}./])([a-zA-Z]+|\d+(?:\.\d+)?|\([^()]+\))\s*/\s*([a-zA-Z]+|\d+(?:\.\d+)?|\([^()]+\))(?![\w./])"#,
+        if text.range(of: #"/\s*(?:\\[a-zA-Z]+|[a-zA-Z]+|\d+(?:\.\d+)?)\s*/"#, options: .regularExpression) != nil {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        text = text.replacingOccurrences(of: #"(?<![\\\w}./])(\d*\\[a-zA-Z]+|[a-zA-Z]+|\d+(?:\.\d+)?|\([^()]+\))\s*/\s*(\d*\\[a-zA-Z]+|[a-zA-Z]+|\d+(?:\.\d+)?|\([^()]+\))(?![\w./])"#,
                                         with: #"\\frac{$1}{$2}"#, options: .regularExpression)
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -32,7 +35,7 @@ enum MathNormalizer {
         let nonempty = input.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         var out: [String] = [], index = 0
         while index < nonempty.count {
-            if index + 2 < nonempty.count, nonempty[index + 1].range(of: #"^[-−―_]{2,}$"#, options: .regularExpression) != nil {
+            if index + 2 < nonempty.count, nonempty[index + 1].range(of: #"^[-−―_—–]+$"#, options: .regularExpression) != nil {
                 out.append("\\frac{" + line(nonempty[index]) + "}{" + line(nonempty[index + 2]) + "}")
                 index += 3
             } else { out.append(line(nonempty[index])); index += 1 }
@@ -45,6 +48,7 @@ struct MathRecognition: Codable {
     var lines: [String]
     var source: String
     var warning: String?
+    var revs: [Rev]? = nil
 }
 
 @MainActor
@@ -52,15 +56,18 @@ enum MathRecognizer {
     static func recognize(_ selection: MathSelection, _ ctx: CommandContext) async throws -> MathRecognition {
         let region = selection.bounds
         let pageRef = NodeRef.page(selection.doc, selection.page).description
+        let layers = Set(selection.items.map(\.layer))
         let image: CGImage
         let asset: AssetRef
         if ctx.bus.registry.entry(CommandIDs.renderPage) != nil {
             let result = try await ctx.execute(CommandIDs.renderPage,
-                                               ["page": .string(pageRef), "region": try JSONValue.from([region.x, region.y, region.width, region.height]), "background": true])
+                                               ["page": .string(pageRef), "region": try JSONValue.from([region.x, region.y, region.width, region.height]), "background": true, "layers": try JSONValue.from(layers.sorted())])
             guard let name = result["asset"]?.stringValue else { throw NibError(.internalError, "render.page returned no image") }
             let url = try await ctx.inputFile(name)
-            guard let loaded = UIImage(contentsOfFile: url.path)?.cgImage else { throw NibError(.internalError, "The selection image could not be read") }
-            image = loaded
+            image = try await Task.detached(priority: .userInitiated) {
+                guard let loaded = UIImage(contentsOfFile: url.path)?.cgImage else { throw NibError(.internalError, "The selection image could not be read") }
+                return loaded
+            }.value
             asset = AssetRef(name.hasPrefix("tmp:") ? String(name.dropFirst(4)) : name)
         } else {
             // F004's command may not be installed in a feature-only host. Use its contract service.
@@ -69,13 +76,17 @@ enum MathRecognizer {
             }
             let scale = min(2, 1568 / max(1, max(region.width, region.height)))
             let result = try await renderer.render(RenderRequest(doc: selection.doc, page: selection.page, region: region,
-                                                                 scale: scale, layers: [selection.items[0].layer]))
+                                                                 scale: scale, layers: layers))
             image = result.image
-            guard let data = UIImage(cgImage: image).pngData() else { throw NibError(.internalError, "The selection image could not be encoded") }
+            let data = try await Task.detached(priority: .userInitiated) {
+                guard let data = UIImage(cgImage: image).pngData() else { throw NibError(.internalError, "The selection image could not be encoded") }
+                return data
+            }.value
             asset = try assets.putTemporary(data, ext: "png")
         }
         try Task.checkCancellation()
         var warning: String?
+    var revs: [Rev]? = nil
         if let ai = ctx.services.ai, ai.isConfigured, ai.supportsVision {
             do {
                 let request = AIRequest(system: "Transcribe only the selected handwritten mathematics. Return JSON {\"lines\":[\"LaTeX\"]}, one entry per line. Do not solve, explain or call tools.",
@@ -87,8 +98,8 @@ enum MathRecognizer {
                 try Task.checkCancellation()
                 struct Response: Decodable { var lines: [String] }
                 let parsed = try JSONValue.parse(response.text).decode(Response.self)
-                try MathTypesetter.shared.validate(parsed.lines)
-                return MathRecognition(lines: parsed.lines, source: "ai", warning: nil)
+                try await Task.detached(priority: .userInitiated) { try MathTypesetter.shared.validate(parsed.lines) }.value
+                return MathRecognition(lines: parsed.lines, source: "ai", warning: nil, revs: selection.items.map(\.rev))
             } catch is CancellationError { throw CancellationError() }
             catch { warning = String(localized: "Your provider could not recognise this selection. Check the on-device result before converting.") }
         }
@@ -112,7 +123,7 @@ enum MathRecognizer {
             throw NibError(.unavailable, String(localized: "No maths was recognised. Try selecting a clearer equation."),
                            hint: "call math.convert with explicit latex, or edit the LaTeX in the preview")
         }
-        try MathTypesetter.shared.validate(lines)
-        return MathRecognition(lines: lines, source: "offline", warning: warning ?? String(localized: "On-device recognition handles simple maths. Check each line before converting."))
+        try await Task.detached(priority: .userInitiated) { try MathTypesetter.shared.validate(lines) }.value
+        return MathRecognition(lines: lines, source: "offline", warning: warning ?? String(localized: "On-device recognition handles simple maths. Check each line before converting."), revs: selection.items.map(\.rev))
     }
 }
