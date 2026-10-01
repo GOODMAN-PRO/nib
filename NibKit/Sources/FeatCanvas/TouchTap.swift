@@ -32,8 +32,8 @@ struct StrokeStillness {
     }
 }
 
-/// Observes the same UIKit stream as PencilKit. It recognises immediately, so an attachment or palm can prevent
-/// the document's pan/pinch/drawing recognisers; ordinary wet ink is simultaneous with PencilKit. It never cancels
+/// Observes the same UIKit stream as PencilKit. Only a newly claimed attachment may prevent
+/// the document's recognisers; tool and rejected contacts stay simultaneous. It never cancels
 /// UIView touch delivery and cannot be cancelled by a scroll recogniser (navigation still needs tap detection).
 @MainActor
 final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
@@ -44,6 +44,7 @@ final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
     var prevents: ((UIGestureRecognizer) -> Bool)?
     private var ids: [ObjectIdentifier: Int] = [:]
     private var nextID = 1
+    private(set) var enteringBegan = false
 
     init() {
         super.init(target: nil, action: nil)
@@ -61,10 +62,12 @@ final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
             ids[ObjectIdentifier(touch)] = id
             began?(touch, event, id)
         }
+        enteringBegan = state == .possible
         state = state == .possible ? .began : .changed
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        enteringBegan = false
         for touch in touches {
             if let id = ids[ObjectIdentifier(touch)] { moved?(touch, event, id) }
         }
@@ -75,6 +78,7 @@ final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { finish(touches, event: event, cancelled: true) }
 
     private func finish(_ touches: Set<UITouch>, event: UIEvent, cancelled: Bool) {
+        enteringBegan = false
         for touch in touches {
             if let id = ids.removeValue(forKey: ObjectIdentifier(touch)) { ended?(touch, event, id, cancelled) }
         }
@@ -84,6 +88,7 @@ final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
     override func reset() {
         super.reset()
         ids.removeAll()
+        enteringBegan = false
         resetStream?()
     }
 
@@ -127,4 +132,32 @@ final class TouchTap: UIGestureRecognizer, UIGestureRecognizerDelegate {
                             roll: roll, timestamp: touch.timestamp, isPencil: touch.type == .pencil,
                             isPredicted: predicted, modifiers: modifiers, touchID: touchID)
     }
+}
+
+/// A failure dependency for scroll navigation, without replacing UIScrollView's private delegate.
+/// It stays possible for a palm or lone drawing finger; eligible contacts release pan/pinch together.
+/// PencilKit never depends on this recognizer, so a resting palm cannot prevent writing.
+@MainActor
+final class CanvasNavigationGate: UIGestureRecognizer {
+    var isEligible: ((UITouch) -> Bool)?
+    var requiredContacts: (() -> Int)?
+    private var contacts: Set<ObjectIdentifier> = []
+    override init(target: Any?, action: Selector?) {
+        super.init(target: target, action: action)
+        cancelsTouchesInView = false
+        allowedTouchTypes = [UITouch.TouchType.direct, .indirectPointer, .indirect].map { NSNumber(value: $0.rawValue) }
+    }
+    convenience init() { self.init(target: nil, action: nil) }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        for touch in touches where isEligible?(touch) == true { contacts.insert(ObjectIdentifier(touch)) }
+        if contacts.count >= (requiredContacts?() ?? 1) { state = .failed }
+    }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        for touch in touches { contacts.remove(ObjectIdentifier(touch)) }
+        if event.allTouches?.allSatisfy({ $0.phase == .ended || $0.phase == .cancelled }) == true { state = .failed }
+    }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) { touchesEnded(touches, with: event) }
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func reset() { super.reset(); contacts.removeAll() }
 }

@@ -18,6 +18,13 @@ final class GestureRouter {
     var isReadOnly: () -> Bool
     var topmostItem: (CanvasSample) -> Item?
     private var routes: [Int: Route] = [:]
+    private struct BufferedSamples {
+        let began: CanvasSample
+        let tool: CanvasTool
+        var moved: [CanvasSample] = []
+        var ended: CanvasSample?
+    }
+    private var buffered: [Int: BufferedSamples] = [:]
     private static let log = Logger(subsystem: "app.nib", category: "canvasinput")
 
     init(host: CanvasHost, attachments: @escaping () -> [CanvasAttachment],
@@ -45,13 +52,19 @@ final class GestureRouter {
         routes[sample.touchID] = route
         switch route {
         case .attachment(let attachment): attachment.touchesBegan(sample, host: host)
-        case .tool(let tool) where tool.inputMode == .samples: tool.touchesBegan(sample, host: host)
+        case .tool(let tool) where tool.inputMode == .samples:
+            if sample.isPencil { tool.touchesBegan(sample, host: host) }
+            else { buffered[sample.touchID] = BufferedSamples(began: sample, tool: tool) }
         default: break
         }
     }
 
     func move(_ samples: [CanvasSample]) {
         guard let host = host, let id = samples.first?.touchID else { return }
+        if buffered[id] != nil {
+            buffered[id]?.moved += samples
+            return
+        }
         switch routes[id] {
         case .attachment(let attachment): attachment.touchesMoved(samples, host: host)
         case .tool(let tool) where tool.inputMode == .samples: tool.touchesMoved(samples, host: host)
@@ -63,6 +76,10 @@ final class GestureRouter {
     func end(_ sample: CanvasSample) -> Route? {
         let route = routes.removeValue(forKey: sample.touchID)
         guard let host = host else { return route }
+        if buffered[sample.touchID] != nil {
+            buffered[sample.touchID]?.ended = sample
+            return route
+        }
         switch route {
         case .attachment(let attachment): attachment.touchesEnded(sample, host: host)
         case .tool(let tool) where tool.inputMode == .samples: tool.touchesEnded(sample, host: host)
@@ -73,6 +90,7 @@ final class GestureRouter {
 
     func cancel(_ touchID: Int) {
         let route = routes.removeValue(forKey: touchID)
+        if buffered.removeValue(forKey: touchID) != nil { return }
         guard let host = host else { return }
         switch route {
         case .attachment(let attachment): attachment.touchesCancelled(host: host)
@@ -81,13 +99,26 @@ final class GestureRouter {
         }
     }
 
-    func cancelAll() { for id in Array(routes.keys) { cancel(id) } }
+    func cancelAll() {
+        for id in Array(routes.keys) { cancel(id) }
+        buffered.removeAll()
+    }
+    func releaseBufferedSamples(_ touchID: Int) {
+        guard let buffer = buffered.removeValue(forKey: touchID), let host = host else { return }
+        buffer.tool.touchesBegan(buffer.began, host: host)
+        if !buffer.moved.isEmpty { buffer.tool.touchesMoved(buffer.moved, host: host) }
+        if let ended = buffer.ended { buffer.tool.touchesEnded(ended, host: host) }
+    }
+    func resolveBufferedTap(_ touchID: Int, handled: Bool) {
+        if handled { buffered[touchID] = nil }
+        else { releaseBufferedSamples(touchID) }
+    }
 
     /// Attachments get first refusal even in read-only mode; only fingers enter the command tap chain.
     /// A touch that was claimed never becomes a canvas pan/zoom, even if its attachment passes on its tap.
     @discardableResult
-    func gesture(_ gesture: CanvasGesture, sample: CanvasSample, route: Route? = nil) async -> Bool {
-        guard let host = host else { return false }
+    func gesture(_ gesture: CanvasGesture, sample: CanvasSample, route: Route? = nil, deferSampleTool: Bool = false) async -> Bool {
+        guard !Task.isCancelled, let host = host else { return false }
         if case .rejected? = route { return true }
         let claimed: CanvasAttachment?
         if case .attachment(let attachment)? = route {
@@ -120,6 +151,7 @@ final class GestureRouter {
         }
         guard !Task.isCancelled else { return true }
         guard !isReadOnly(), let tool = activeTool() else { return claimed != nil }
+        if deferSampleTool, tool.inputMode == .samples { return claimed != nil }
         if gesture == .longPress { tool.longPress(sample, host: host) }
         else { tool.tap(sample, host: host) }
         return claimed != nil || tool.inputMode != .pencilKit
@@ -133,6 +165,6 @@ final class GestureRouter {
     }
 }
 
-// Contract requests owned by F101 (F010 deferred gaps): CanvasHost needs a render-matched partial-stroke preview
-// API and an items-in-rect per-page spatial index. The shared protocol cannot be extended within F101's owned files;
+// ponytail: F101 requests a render-matched partial-stroke ink preview API on CanvasHost
+// and a per-page spatial index for items-in-rect queries. The shared protocol cannot be extended within F101's owned files;
 // current tools can use PKBridge.drawing + their overlayLayer and Workspace.items as the contract permits.

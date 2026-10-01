@@ -3,6 +3,108 @@ import PencilKit
 import NibContracts
 import NibDesign
 
+/// Pure capture ledger. A native tool-begin admits a capture; creationDate identifies the resulting
+/// stroke independently of its position in PKDrawing. Contacts that never draw cannot shift the queue.
+struct WetInkLedger<Payload, Ink> {
+    struct Capture {
+        let id: UUID
+        let startedAt: Date
+        let payload: Payload
+        var nativeStarted = false
+        var nativeEnded = false
+        var ended = false
+        var pendingGesture = false
+        var cancelled = false
+    }
+    struct Entry {
+        let identity: Date
+        var capture: Capture?
+        var ink: Ink
+        var delivered = false
+        var ready = false
+    }
+    private(set) var captures: [Capture] = []
+    private(set) var entries: [Entry] = []
+    var isEmpty: Bool { captures.isEmpty && entries.isEmpty }
+    var hasLiveCapture: Bool { captures.contains { !$0.ended } }
+
+    mutating func register(id: UUID, startedAt: Date, payload: Payload, nativeStarted: Bool = false) {
+        captures.append(Capture(id: id, startedAt: startedAt, payload: payload, nativeStarted: nativeStarted))
+    }
+    mutating func nativeBegin(_ id: UUID) {
+        if let i = captures.firstIndex(where: { $0.id == id }) { captures[i].nativeStarted = true }
+    }
+    private mutating func update(_ id: UUID, _ body: (inout Capture) -> Void) {
+        if let i = captures.firstIndex(where: { $0.id == id }) { body(&captures[i]) }
+        if let i = entries.firstIndex(where: { $0.capture?.id == id }), var capture = entries[i].capture {
+            body(&capture)
+            entries[i].capture = capture
+        }
+    }
+    mutating func end(_ id: UUID, pendingGesture: Bool = false) {
+        update(id) { $0.ended = true; $0.pendingGesture = pendingGesture }
+    }
+    mutating func resolveGesture(_ id: UUID) { update(id) { $0.pendingGesture = false } }
+    mutating func nativeEnd() {
+        for i in captures.indices where captures[i].nativeStarted { captures[i].nativeEnded = true }
+        for i in entries.indices where entries[i].capture?.nativeStarted == true { entries[i].capture?.nativeEnded = true }
+    }
+    mutating func append(identity: Date, ink: Ink) {
+        if let i = entries.firstIndex(where: { $0.identity == identity }) {
+            if !entries[i].delivered { entries[i].ink = ink }
+            return
+        }
+        let nearest = captures.indices.filter { captures[$0].nativeStarted }.min {
+            abs(captures[$0].startedAt.timeIntervalSince(identity)) < abs(captures[$1].startedAt.timeIntervalSince(identity))
+        }
+        let capture: Capture?
+        if let i = nearest, abs(captures[i].startedAt.timeIntervalSince(identity)) < 0.25 {
+            capture = captures.remove(at: i)
+        } else { capture = nil }
+        entries.append(Entry(identity: identity, capture: capture, ink: ink, ready: capture == nil || capture?.cancelled == true))
+    }
+    /// Called after a native end and drawing reconciliation. No-stroke captures cease blocking retirement.
+    mutating func discardUnstartedEnded() { captures.removeAll { $0.ended && !$0.nativeStarted } }
+    mutating func discardUnproduced(completedOnly: Bool = false) {
+        captures.removeAll { $0.ended && (!completedOnly || $0.nativeEnded || !$0.nativeStarted) }
+    }
+    mutating func takeDeliveries() -> [Entry] {
+        var result: [Entry] = []
+        for i in entries.indices {
+            guard let c = entries[i].capture, c.ended, c.nativeEnded, !c.pendingGesture, !c.cancelled,
+                  !entries[i].delivered, !entries[i].ready else { continue }
+            entries[i].delivered = true
+            result.append(entries[i])
+        }
+        return result
+    }
+    @discardableResult mutating func cancel(_ id: UUID) -> Bool {
+        if let i = captures.firstIndex(where: { $0.id == id }) {
+            guard !captures[i].cancelled else { return false }
+            if captures[i].ended { captures[i].cancelled = true }
+            else { captures.remove(at: i) }
+            return true
+        }
+        if let i = entries.firstIndex(where: { $0.capture?.id == id }), !entries[i].ready {
+            entries[i].ready = true
+            entries[i].capture?.ended = true
+            entries[i].capture?.cancelled = true
+            entries[i].capture?.pendingGesture = false
+            return true
+        }
+        return false
+    }
+    mutating func markReady(_ id: UUID) {
+        if let i = entries.firstIndex(where: { $0.capture?.id == id }) { entries[i].ready = true }
+    }
+    @discardableResult mutating func retire() -> Bool {
+        guard !hasLiveCapture, !entries.contains(where: { $0.capture.map { !$0.ended } ?? false }),
+              entries.contains(where: { $0.ready }) else { return false }
+        entries.removeAll { $0.ready }
+        return true
+    }
+}
+
 /// A single wet-to-dry hand-off, also used when a tool replaces captured ink from strokeFinished.
 @MainActor
 final class WetStrokeHandoff {
@@ -62,6 +164,8 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         let style: InkStyle
         let origin: Point
         let began: CanvasSample
+        let startedAt: Date
+        let contact: ObjectIdentifier?
         var last: CanvasSample
         var points: [CanvasSample] = []
         var stillness: StrokeStillness
@@ -73,12 +177,14 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         var longPressed = false
         weak var surface: Surface?
 
-        init(sample: CanvasSample, tool: CanvasTool, style: InkStyle, origin: Point, screenPoint: Point) {
+        init(sample: CanvasSample, tool: CanvasTool, style: InkStyle, origin: Point, screenPoint: Point, contact: ObjectIdentifier? = nil, startedAt: Date? = nil) {
             page = sample.page
             self.tool = tool
             self.style = style
             self.origin = origin
             began = sample
+            self.contact = contact
+            self.startedAt = startedAt ?? Date(timeIntervalSinceNow: sample.timestamp - ProcessInfo.processInfo.systemUptime)
             last = sample
             points = [sample]
             stillness = StrokeStillness(point: screenPoint, timestamp: sample.timestamp)
@@ -95,19 +201,15 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         }
     }
 
-    @MainActor private struct Entry {
-        let id: UUID
-        let stroke: PKStroke
-        let handoff = WetStrokeHandoff()
-        var ready = false
-    }
     @MainActor private final class Surface {
-        let page: PageID
+        var page: PageID
         let highlighter: Bool
-        let region: Rect
+        var region: Rect
         let canvas = InputInkCanvas(frame: .zero)
-        var captures: [Capture] = []
-        var entries: [Entry] = []
+        var ledger = WetInkLedger<Capture, PKStroke>()
+        var acceptedContacts: Set<ObjectIdentifier> = []
+        var startedContact: ObjectIdentifier?
+        var toolEnded = false
         var active = true
         var replacingDrawing = false
         var style: InkStyle?
@@ -151,6 +253,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     private var gestureTasks: [UUID: Task<Void, Never>] = [:]
     private var closing = false
     private var navigating = false
+    private var inking = false
+    private var stylusMode: StylusMode = .pencilOnly
+    private var reduceLatency = true
+    private var palmRejection = PalmRejection(sensitivity: 1, writingPosture: 0)
+    private let navigationGate = CanvasNavigationGate()
 
     private lazy var router: GestureRouter? = {
         guard let host = host else { return nil }
@@ -166,6 +273,18 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     func install() {
         guard let host = host else { return }
+        refreshSettings()
+        navigationGate.isEligible = { [weak self] touch in
+            guard let self = self, touch.type != .pencil else { return false }
+            return !self.isRejectedOrClaimed(self.decision(touch))
+        }
+        navigationGate.requiredContacts = { [weak self] in
+            guard let self = self else { return 1 }
+            return self.stylusMode == .anyInput && self.host?.isReadOnly == false ? 2 : 1
+        }
+        host.canvasView.addGestureRecognizer(navigationGate)
+        host.scrollView.panGestureRecognizer.require(toFail: navigationGate)
+        host.scrollView.pinchGestureRecognizer?.require(toFail: navigationGate)
         host.doubleTapZoomRecognizer.isEnabled = false
         surfaceContainer.backgroundColor = .clear
         surfaceContainer.prepareContact = { [weak self] point, event in
@@ -182,7 +301,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         touchTap.began = { [weak self] touch, event, id in self?.begin(touch, event: event, id: id) }
         touchTap.moved = { [weak self] touch, event, id in self?.move(touch, event: event, id: id) }
         touchTap.ended = { [weak self] touch, event, id, cancelled in self?.end(touch, event: event, id: id, cancelled: cancelled) }
-        touchTap.resetStream = { [weak self] in self?.resetTouches() }
+        touchTap.resetStream = { [weak self] in self?.resetTouches(clearGestures: false) }
         touchTap.prevents = { [weak self] other in self?.prevents(other) ?? false }
         host.canvasView.addGestureRecognizer(touchTap)
         pencil.delegate = self
@@ -209,10 +328,19 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     private func settingsChanged(_ name: String?) {
         guard !closing else { return }
+        refreshSettings()
         let inputKeys = [NibSettings.stylusMode.name, NibSettings.palmSensitivity.name, NibSettings.writingPosture.name]
         if let name = name, inputKeys.contains(name) { resetTouches() }
         // Read new tool styling between strokes. Unrelated synced preferences must not interrupt live ink.
         if tracks.isEmpty { updateSurfaces() }
+    }
+
+    private func refreshSettings() {
+        guard let settings = host?.app.settings else { return }
+        stylusMode = settings.get(NibSettings.stylusMode)
+        reduceLatency = settings.get(NibSettings.reduceLatency)
+        palmRejection = PalmRejection(sensitivity: settings.get(NibSettings.palmSensitivity),
+                                      writingPosture: settings.get(NibSettings.writingPosture))
     }
 
     // MARK: Wet surfaces and page coordinates
@@ -236,7 +364,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                     surface.canvas.tool = PKInkingTool(PKBridge.inkType(style), color: style.color.uiColor, width: CGFloat(style.width))
                     surface.style = style
                 }
-                surface.canvas.drawingPolicy = host.app.settings.get(NibSettings.stylusMode) == .anyInput ? .anyInput : .pencilOnly
+                surface.canvas.drawingPolicy = stylusMode == .anyInput ? .anyInput : .pencilOnly
             }
         }
         for surface in surfaces {
@@ -259,6 +387,15 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                           width: Double(bounds.width) / z + 512, height: Double(bounds.height) / z + 512)
         } else {
             region = Rect(x: 0, y: 0, width: Double(frame.width) / z, height: Double(frame.height) / z)
+        }
+        if let surface = surfaces.first(where: { !$0.active && $0.highlighter == highlighter && $0.ledger.isEmpty }) {
+            surface.page = page
+            surface.region = region
+            surface.active = true
+            surface.acceptedContacts.removeAll()
+            surface.startedContact = nil
+            surface.toolEnded = false
+            return
         }
         let surface = Surface(page: page, highlighter: highlighter, region: region)
         let canvas = surface.canvas
@@ -284,7 +421,14 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                 return hypot(pa.x - at.x, pa.y - at.y) < hypot(pb.x - at.x, pb.y - at.y)
             }
             guard let touch = touch else { return false }
-            if case .tool(let tool) = self.decision(touch), tool.inputMode == .pencilKit { return true }
+            let contact = ObjectIdentifier(touch)
+            guard surface.acceptedContacts.isEmpty || surface.acceptedContacts.contains(contact),
+                  let sample = TouchTap.sample(touch, event: event, touchID: 0, host: host),
+                  sample.page == surface.page, surface.region.contains(sample.location) else { return false }
+            if case .tool(let tool) = self.decision(touch), tool.inputMode == .pencilKit {
+                surface.acceptedContacts.insert(contact)
+                return true
+            }
             return false
         }
         surfaces.append(surface)
@@ -307,10 +451,15 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     }
 
     private func pruneSurfaces() {
-        for surface in surfaces where !surface.active && surface.entries.isEmpty && surface.captures.isEmpty {
-            surface.canvas.removeFromSuperview()
+        // Keep one idle canvas of each kind for the next page/window; retain additional ones only for wet ink.
+        for highlighter in [false, true] {
+            let candidates = surfaces.filter { $0.highlighter == highlighter && !$0.active && $0.ledger.isEmpty }
+            let keep = surfaces.contains { $0.highlighter == highlighter && $0.active } ? nil : candidates.first
+            for surface in candidates where surface !== keep {
+                surface.canvas.removeFromSuperview()
+                surfaces.removeAll { $0 === surface }
+            }
         }
-        surfaces.removeAll { !$0.active && $0.entries.isEmpty && $0.captures.isEmpty }
     }
 
     /// Re-centre an empty whiteboard capture window after navigation, keeping retained wet strokes fixed in world space.
@@ -339,7 +488,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         let route: GestureRouter.Route
         // Attachments are asked first for every contact. Palm filtering protects all fall-through canvas actions.
         let candidate = router?.route(at: at, isPencil: isPencil,
-                                     canDraw: isPencil || host.app.settings.get(NibSettings.stylusMode) == .anyInput) ?? .rejected
+                                     canDraw: isPencil || stylusMode == .anyInput) ?? .rejected
         if case .attachment = candidate { route = candidate }
         else if rejectsPalm(touch, host: host) { route = .rejected }
         else { route = candidate }
@@ -348,40 +497,33 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     }
 
     private func rejectsPalm(_ touch: UITouch, host: CanvasHostImpl) -> Bool {
+        guard touch.type != .pencil else { return false }
         let at = touch.location(in: host.canvasView)
         let pencilPoint = tracks.values.first(where: { $0.last.isPencil }).map { host.viewPoint($0.last.location, page: $0.last.page) }
         let kind: PalmRejection.ContactKind = touch.type == .pencil ? .pencil : (touch.type == .direct ? .finger : .pointer)
-        let rejection = PalmRejection(sensitivity: host.app.settings.get(NibSettings.palmSensitivity),
-                                      writingPosture: host.app.settings.get(NibSettings.writingPosture))
-        return rejection.rejects(.init(kind: kind, majorRadius: Double(touch.majorRadius), location: Point(at)),
+        return palmRejection.rejects(.init(kind: kind, majorRadius: Double(touch.majorRadius), location: Point(at)),
                                  pencilLocation: pencilPoint.map { Point($0) })
     }
 
     private func prevents(_ other: UIGestureRecognizer) -> Bool {
-        guard let host = host else { return false }
-        let exclusive = tracks.values.contains { track in
-            switch track.route {
-            case .attachment, .rejected: return true
-            case .tool(let tool): return !navigating && tool.inputMode != .taps
-            case .navigation: return false
-            }
-        }
-        if other === host.scrollView.panGestureRecognizer || other === host.scrollView.pinchGestureRecognizer { return exclusive }
-        for surface in surfaces where other === surface.canvas.drawingGestureRecognizer {
-            return navigating || tracks.values.contains { track in
-                switch track.route {
-                case .attachment, .rejected: return true
-                default: return false
-                }
-            }
-        }
-        return false
+        guard touchTap.enteringBegan, let host = host else { return false }
+        let claimed = tracks.values.contains { if case .attachment = $0.route { return true }; return false }
+        return claimed && (other === host.scrollView.panGestureRecognizer || other === host.scrollView.pinchGestureRecognizer
+            || surfaces.contains { other === $0.canvas.drawingGestureRecognizer })
     }
 
     private func begin(_ touch: UITouch, event: UIEvent, id: Int) {
         guard let host = host, let sample = TouchTap.sample(touch, event: event, touchID: id, host: host) else { return }
-        let route = decision(touch)
-        let track = Track(sample: sample, screenStart: Point(touch.location(in: host.canvasView)), route: route)
+        begin(sample, screenPoint: Point(touch.location(in: host.canvasView)), route: decision(touch),
+              contact: ObjectIdentifier(touch))
+    }
+
+    /// UIKit edges translate contacts into these deterministic events; tests exercise the production state machine.
+    func begin(_ sample: CanvasSample, screenPoint: Point, route: GestureRouter.Route,
+               contact: ObjectIdentifier? = nil, startedAt: Date? = nil) {
+        guard let host = host else { return }
+        let id = sample.touchID
+        let track = Track(sample: sample, screenStart: screenPoint, route: route)
         tracks[id] = track
         router?.begin(sample, route: route)
         let fingers = tracks.values.filter { !$0.sample.isPencil && !isRejectedOrClaimed($0.route) }
@@ -402,16 +544,22 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                 inputPage = sample.page
                 updateSurfaces()
             }
-            let surface = surfaces.first { $0.active && $0.page == sample.page && $0.highlighter == (style.tool == .highlighter) }
+            let surface = surfaces.first { surface in
+                surface.active && surface.page == sample.page && surface.highlighter == (style.tool == .highlighter)
+                    && surface.region.contains(sample.location)
+                    && contact.map { surface.acceptedContacts.contains($0) } == true
+            }
             let capture = Capture(sample: sample, tool: tool, style: style, origin: surface.map { Point($0.region.x, $0.region.y) } ?? .zero,
-                                  screenPoint: track.screenStart)
+                                  screenPoint: track.screenStart, contact: contact, startedAt: startedAt)
             track.capture = capture
             if tool.inputMode == .pencilKit {
                 capture.surface = surface
-                surface?.captures.append(capture)
+                surface?.ledger.register(id: capture.id, startedAt: capture.startedAt, payload: capture,
+                                         nativeStarted: surface?.startedContact == capture.contact)
             }
-            host.beginInking(page: sample.page, strokeBounds: capture.bounds)
+            beginInking(capture)
         }
+        endInkingIfIdle()
         if !navigating && !isRejected(track.route) { scheduleHold(track) }
     }
 
@@ -423,14 +571,18 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             track.route = .rejected
             track.moved = true
             track.holdTask?.cancel()
-            if !tracks.values.contains(where: { $0.capture != nil && !($0.capture?.cancelled ?? true) }) { host.endInking() }
+            endInkingIfIdle()
             return
         }
         let samples = TouchTap.samples(touch: touch, event: event, touchID: id,
-                                      reduceLatency: host.app.settings.get(NibSettings.reduceLatency), host: host)
-        guard let last = samples.last(where: { !$0.isPredicted }) else { return }
+                                      reduceLatency: reduceLatency, host: host)
+        move(samples, screenPoint: Point(touch.location(in: host.canvasView)), id: id)
+    }
+
+    func move(_ samples: [CanvasSample], screenPoint: Point, id: Int) {
+        guard let host = host, let track = tracks[id], let last = samples.last(where: { !$0.isPredicted }) else { return }
         track.last = last
-        if track.screenStart.distance(to: Point(touch.location(in: host.canvasView))) > 8 { track.moved = true }
+        if track.screenStart.distance(to: screenPoint) > 8 { track.moved = true }
         if let capture = track.capture, !capture.cancelled || capture.handedOff {
             let previousMotion = capture.stillness.lastMotion
             for sample in samples where !sample.isPredicted {
@@ -448,16 +600,25 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             if capture.handedOff { capture.tool.touchesMoved(samples, host: host) }
             if capture.stillness.lastMotion != previousMotion { scheduleHold(track) }
         }
+        if track.moved { router?.releaseBufferedSamples(id) }
         router?.move(samples)
     }
 
     private func end(_ touch: UITouch, event: UIEvent, id: Int, cancelled: Bool) {
         guard let host = host, let track = tracks[id] else { return }
         if !cancelled { move(touch, event: event, id: id) }
-        tracks.removeValue(forKey: id)
         decisions.removeValue(forKey: ObjectIdentifier(touch))
+        for surface in surfaces { surface.acceptedContacts.remove(ObjectIdentifier(touch)) }
+        end(TouchTap.sample(touch, event: event, touchID: id, host: host) ?? track.last, cancelled: cancelled)
+    }
+
+    func end(_ sample: CanvasSample, cancelled: Bool = false) {
+        guard let host = host, let track = tracks.removeValue(forKey: sample.touchID) else { return }
+        let id = sample.touchID
+        if let contact = track.capture?.contact {
+            for surface in surfaces { surface.acceptedContacts.remove(contact) }
+        }
         track.holdTask?.cancel()
-        let sample = TouchTap.sample(touch, event: event, touchID: id, host: host) ?? track.last
         let route = track.route
         if cancelled {
             router?.cancel(id)
@@ -479,9 +640,17 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
                 }
             }
         }
-        if !tracks.values.contains(where: { $0.capture != nil && !($0.capture?.cancelled ?? true) }) { host.endInking() }
+        endInkingIfIdle()
         if tracks.isEmpty { navigating = false }
-        for surface in surfaces { process(surface); removeReady(surface) }
+        if let capture = track.capture, let surface = capture.surface {
+            surface.ledger.end(capture.id, pendingGesture: capture.gesturePending)
+        }
+        for surface in surfaces {
+            process(surface)
+            surface.ledger.discardUnstartedEnded()
+            if surface.toolEnded { surface.ledger.discardUnproduced() }
+            removeReady(surface)
+        }
         if tracks.isEmpty { updateSurfaces() }
         refreshWorldWindow()
     }
@@ -499,32 +668,40 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             try? await Task.sleep(nanoseconds: 500_000_000)
             guard !Task.isCancelled, let self = self, let track = track, let host = self.host,
                   self.tracks[track.sample.touchID] === track, !self.navigating else { return }
-            if let capture = track.capture, track.moved, !capture.cancelled, !capture.handedOff,
-               capture.tool.inputMode == .pencilKit,
-               capture.stillness.fire(at: ProcessInfo.processInfo.systemUptime) {
-                if capture.tool.strokeHeld(capture.stroke(), page: capture.page, host: host) {
-                    self.cancel(capture)
-                    capture.handedOff = true
-                    host.beginInking(page: capture.page, strokeBounds: capture.bounds)
-                }
-            } else if !track.moved && !track.longPressed {
-                track.longPressed = true
-                track.capture?.longPressed = true
-                if !track.sample.isPencil {
-                    let handled = await self.router?.gesture(.longPress, sample: track.last, route: track.route) ?? false
-                    if handled, let capture = track.capture { self.cancel(capture) }
-                } else if case .attachment(let attachment) = track.route {
-                    _ = attachment.gesture(.longPress, at: track.last, host: host)
-                } else if !host.isReadOnly {
-                    host.activeTool?.longPress(track.last, host: host)
-                }
-            }
+            await self.hold(track.sample.touchID, at: ProcessInfo.processInfo.systemUptime)
+        }
+    }
+
+    func hold(_ id: Int, at timestamp: TimeInterval) async {
+        guard let track = tracks[id], let host = host, !navigating else { return }
+        if let capture = track.capture, track.moved, !capture.cancelled, !capture.handedOff,
+           capture.surface != nil, capture.tool.inputMode == .pencilKit,
+           capture.stillness.fire(at: timestamp) {
+            // Keep the inking signal through reentrant cancelWetStroke calls from the hold handler.
+            capture.handedOff = true
+            if capture.tool.strokeHeld(capture.stroke(), page: capture.page, host: host) { cancel(capture) }
+            else { capture.handedOff = false; endInkingIfIdle() }
+        } else if !track.moved && !track.longPressed {
+            track.longPressed = true
+            track.capture?.longPressed = true
+            if !track.sample.isPencil {
+                let handled = await router?.gesture(.longPress, sample: track.last, route: track.route, deferSampleTool: true) ?? false
+                guard !Task.isCancelled, tracks[id] === track else { return }
+                if handled {
+                    router?.cancel(id)
+                    if let capture = track.capture { cancel(capture) }
+                } else { router?.releaseBufferedSamples(id) }
+                endInkingIfIdle()
+            } else if case .attachment(let attachment) = track.route {
+                _ = attachment.gesture(.longPress, at: track.last, host: host)
+            } else if !host.isReadOnly { host.activeTool?.longPress(track.last, host: host) }
         }
     }
 
     private func queueTap(_ sample: CanvasSample, route: GestureRouter.Route, capture: Capture?) {
         if let pending = pendingTap,
            pending.sample.page == sample.page,
+           sample.timestamp >= pending.sample.timestamp,
            sample.timestamp - pending.sample.timestamp <= 0.3,
            pending.sample.location.distance(to: sample.location) * (host?.zoomScale ?? 1) <= 24 {
             tapTask?.cancel()
@@ -551,16 +728,20 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     private func dispatchGesture(_ gesture: CanvasGesture, sample: CanvasSample, route: GestureRouter.Route, captures: [Capture]) {
         let id = UUID()
         gestureTasks[id] = Task { @MainActor [weak self] in
-            guard let self = self, !self.closing else { return }
-            let handled = await self.router?.gesture(gesture, sample: sample, route: route) ?? false
+            guard !Task.isCancelled, let self = self, !self.closing else { return }
+            let handled = await self.router?.gesture(gesture, sample: sample, route: route, deferSampleTool: true) ?? false
             guard !Task.isCancelled, !self.closing else { return }
             for capture in captures {
                 capture.gesturePending = false
+                capture.surface?.ledger.resolveGesture(capture.id)
                 if handled { self.cancel(capture) }
+                if capture.tool.inputMode == .samples {
+                    self.router?.resolveBufferedTap(capture.began.touchID, handled: handled)
+                }
                 if let surface = capture.surface { self.process(surface); self.removeReady(surface) }
             }
             if !handled && gesture == .doubleTap, let host = self.host,
-               host.app.settings.get(NibSettings.stylusMode) != .anyInput,
+               self.stylusMode != .anyInput,
                !self.isRejectedOrClaimed(route) { host.zoomToggle(at: host.viewPoint(sample.location, page: sample.page)) }
             self.gestureTasks[id] = nil
         }
@@ -568,13 +749,36 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     // MARK: PencilKit hand-off
 
-    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
-        // Final pressure can arrive after this callback. Only drawingDidChange supplies a durable PKStroke.
+    func acceptContact(_ contact: ObjectIdentifier, sample: CanvasSample) -> PKCanvasView? {
+        guard let surface = surfaces.first(where: {
+            $0.active && $0.canvas.isUserInteractionEnabled && $0.page == sample.page
+                && $0.region.contains(sample.location) && ($0.acceptedContacts.isEmpty || $0.acceptedContacts.contains(contact))
+        }) else { return nil }
+        surface.acceptedContacts.insert(contact)
+        return surface.canvas
+    }
+
+    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
         guard let surface = surfaces.first(where: { $0.canvas === canvasView }) else { return }
-                Task { @MainActor [weak self, weak surface] in
+        surface.toolEnded = false
+        surface.startedContact = surface.acceptedContacts.first
+        if let capture = surface.ledger.captures.first(where: { $0.payload.contact == surface.startedContact }) {
+            surface.ledger.nativeBegin(capture.id)
+        }
+    }
+    func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
+        guard let surface = surfaces.first(where: { $0.canvas === canvasView }) else { return }
+        surface.toolEnded = true
+        surface.ledger.nativeEnd()
+        surface.startedContact = nil
+        // Reconcile after UIKit's end callbacks and PencilKit's final pressure notification.
+        Task { @MainActor [weak self, weak surface] in
+            await Task.yield()
             guard let self = self, let surface = surface else { return }
             self.process(surface)
+            surface.ledger.discardUnproduced(completedOnly: true)
             self.removeReady(surface)
+            self.pruneSurfaces()
         }
     }
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
@@ -584,23 +788,18 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     private func process(_ surface: Surface) {
         guard let host = host, !closing, !surface.replacingDrawing else { return }
-        let drawing = surface.canvas.drawing.strokes
-        while drawing.count > surface.entries.count, let capture = surface.captures.first,
-              capture.ended, !capture.gesturePending {
-            surface.captures.removeFirst()
-            let pk = drawing[surface.entries.count]
-            surface.entries.append(Entry(id: capture.id, stroke: pk, ready: capture.cancelled))
-            if capture.cancelled { continue }
-            let handoff = surface.entries[surface.entries.count - 1].handoff
+        for pk in surface.canvas.drawing.strokes { surface.ledger.append(identity: pk.path.creationDate, ink: pk) }
+        for entry in surface.ledger.takeDeliveries() {
+            guard let capture = entry.capture?.payload else { continue }
+            let handoff = WetStrokeHandoff()
             delivering = handoff
-            if host.isReadOnly {
-                markReady(surface, id: capture.id)
-            } else {
+            if host.isReadOnly { surface.ledger.markReady(capture.id) }
+            else {
                 let rolls = capture.points.map { (t: $0.timestamp - capture.began.timestamp, roll: $0.roll) }
-                handoff.deliver(pk, style: capture.style, page: capture.page, origin: capture.origin, rolls: rolls,
+                handoff.deliver(entry.ink, style: capture.style, page: capture.page, origin: capture.origin, rolls: rolls,
                                 tool: capture.tool, host: host) { [weak self, weak surface] in
                     guard let self = self, let surface = surface else { return }
-                    self.markReady(surface, id: capture.id)
+                    surface.ledger.markReady(capture.id)
                     Task { @MainActor [weak self, weak surface] in
                         guard let self = self, let surface = surface else { return }
                         self.removeReady(surface)
@@ -610,18 +809,11 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
             delivering = nil
         }
     }
-
-    private func markReady(_ surface: Surface, id: UUID) {
-        if let i = surface.entries.firstIndex(where: { $0.id == id }) { surface.entries[i].ready = true }
-    }
     private func removeReady(_ surface: Surface) {
-        guard !surface.captures.contains(where: { !$0.ended }), !tracks.values.contains(where: {
+        guard surface.startedContact == nil, !tracks.values.contains(where: {
             $0.capture?.surface === surface && !($0.capture?.ended ?? true)
-        }), surface.entries.contains(where: { $0.ready }) else { return }
-        // An ended stroke may still be waiting for its final pressure callback; do not overwrite it.
-        guard surface.captures.isEmpty else { return }
-        surface.entries.removeAll { $0.ready }
-        replaceDrawing(surface, strokes: surface.entries.map(\.stroke))
+        }), surface.ledger.retire() else { return }
+        replaceDrawing(surface, strokes: surface.ledger.entries.map(\.ink))
         pruneSurfaces()
     }
     private func replaceDrawing(_ surface: Surface, strokes: [PKStroke]) {
@@ -630,27 +822,39 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         surface.replacingDrawing = false
     }
 
-    private func cancel(_ capture: Capture) {
-        guard !capture.cancelled else { return }
+    @discardableResult private func cancel(_ capture: Capture) -> Bool {
+        guard !capture.cancelled else { return false }
         let hadEnded = capture.ended
         capture.cancelled = true
         capture.ended = true
-        guard let surface = capture.surface else { return }
-        // Already delivered: only discard that finished stroke. Draw-and-Hold: cancel the live recogniser, then
-        // restore the other retained wet strokes. Repeating cancellation never clears a previous stroke.
-        if surface.entries.contains(where: { $0.id == capture.id }) { markReady(surface, id: capture.id); removeReady(surface); return }
-        if hadEnded { return }
-        let position = surface.captures.firstIndex { $0 === capture }
-        var retained = surface.canvas.drawing.strokes
-        if let position = position, retained.indices.contains(surface.entries.count + position) {
-            retained.remove(at: surface.entries.count + position)
+        if let surface = capture.surface {
+            surface.ledger.cancel(capture.id)
+            if !hadEnded {
+                surface.replacingDrawing = true
+                surface.canvas.drawingGestureRecognizer.isEnabled = false
+                surface.canvas.drawingGestureRecognizer.isEnabled = true
+                surface.replacingDrawing = false
+                replaceDrawing(surface, strokes: surface.ledger.entries.filter { !$0.ready }.map(\.ink))
+                surface.acceptedContacts.removeAll()
+                surface.startedContact = nil
+            }
+            removeReady(surface)
         }
-        surface.captures.removeAll { $0 === capture }
-        surface.replacingDrawing = true
-        surface.canvas.drawingGestureRecognizer.isEnabled = false
-        surface.canvas.drawingGestureRecognizer.isEnabled = true
-        surface.canvas.drawing = PKDrawing(strokes: retained)
-        surface.replacingDrawing = false
+        return !hadEnded
+    }
+
+    private func beginInking(_ capture: Capture) {
+        guard !inking else { return }
+        inking = true
+        host?.beginInking(page: capture.page, strokeBounds: capture.bounds)
+    }
+    private func endInkingIfIdle() {
+        guard inking, !tracks.values.contains(where: {
+            guard let capture = $0.capture else { return false }
+            return capture.handedOff || (!capture.cancelled && !capture.ended)
+        }) else { return }
+        inking = false
+        host?.endInking()
     }
 
     // MARK: Hardware forwarding
@@ -693,10 +897,27 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     func canvasReadOnlyDidChange(_ host: CanvasHostImpl) { resetTouches(); updateSurfaces() }
     func canvasCancelWetStroke(_ host: CanvasHostImpl) {
         if let delivering = delivering { delivering.cancel(); return }
-        for track in tracks.values { if let capture = track.capture { cancel(capture) } }
-        host.endInking()
+        var changed = false
+        for track in tracks.values {
+            if let capture = track.capture, !capture.handedOff { changed = cancel(capture) || changed }
+        }
+        if changed { endInkingIfIdle() }
     }
-    private func resetTouches() {
+    private func resetTouches(clearGestures: Bool = true) {
+        if !clearGestures && tracks.isEmpty { decisions.removeAll(); navigating = false; return }
+        if clearGestures {
+            tapTask?.cancel()
+            tapTask = nil
+            if let capture = pendingTap?.capture { cancel(capture) }
+            pendingTap = nil
+            for task in gestureTasks.values { task.cancel() }
+            gestureTasks.removeAll()
+            for surface in surfaces {
+                for entry in surface.ledger.entries where entry.capture?.pendingGesture == true {
+                    if let capture = entry.capture?.payload { cancel(capture) }
+                }
+            }
+        }
         for track in tracks.values {
             track.holdTask?.cancel()
             if let capture = track.capture, !capture.ended { cancel(capture) }
@@ -705,7 +926,13 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         decisions.removeAll()
         router?.cancelAll()
         navigating = false
-        host?.endInking()
+        endInkingIfIdle()
+        for surface in surfaces {
+            surface.acceptedContacts.removeAll()
+            surface.startedContact = nil
+            surface.ledger.discardUnproduced()
+            removeReady(surface)
+        }
     }
     func canvasWillClose(_ host: CanvasHostImpl) {
         closing = true
@@ -717,6 +944,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         if let notification = notification { NotificationCenter.default.removeObserver(notification) }
         notification = nil
         host.canvasView.removeGestureRecognizer(touchTap)
+        host.canvasView.removeGestureRecognizer(navigationGate)
         if let hover = hover { host.canvasView.removeGestureRecognizer(hover) }
         if let pointerHover = pointerHover { host.canvasView.removeGestureRecognizer(pointerHover) }
         host.canvasView.removeInteraction(pencil)
