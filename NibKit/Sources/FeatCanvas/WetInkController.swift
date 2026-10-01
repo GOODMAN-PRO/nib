@@ -258,6 +258,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
     private var reduceLatency = true
     private var palmRejection = PalmRejection(sensitivity: 1, writingPosture: 0)
     private let navigationGate = CanvasNavigationGate()
+    private weak var gatedPinch: UIGestureRecognizer?
 
     private lazy var router: GestureRouter? = {
         guard let host = host else { return nil }
@@ -284,7 +285,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         }
         host.canvasView.addGestureRecognizer(navigationGate)
         host.scrollView.panGestureRecognizer.require(toFail: navigationGate)
-        host.scrollView.pinchGestureRecognizer?.require(toFail: navigationGate)
+        attachPinchGate()
         host.doubleTapZoomRecognizer.isEnabled = false
         surfaceContainer.backgroundColor = .clear
         surfaceContainer.prepareContact = { [weak self] point, event in
@@ -345,8 +346,16 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
 
     // MARK: Wet surfaces and page coordinates
 
+    private func attachPinchGate() {
+        // UIScrollView lazily creates pinch when its zoom range becomes nontrivial (often after install).
+        guard let pinch = host?.scrollView.pinchGestureRecognizer, pinch !== gatedPinch else { return }
+        pinch.require(toFail: navigationGate)
+        gatedPinch = pinch
+    }
+
     private func updateSurfaces() {
         guard let host = host, !closing else { return }
+        attachPinchGate()
         let page = inputPage ?? host.session.page
         let style = host.activeTool?.inkStyle(host)
         let inkEnabled = host.isInkEnabled && host.activeTool?.inputMode == .pencilKit && style != nil
@@ -944,6 +953,7 @@ final class WetInkController: NSObject, CanvasInputController, PKCanvasViewDeleg
         if let notification = notification { NotificationCenter.default.removeObserver(notification) }
         notification = nil
         host.canvasView.removeGestureRecognizer(touchTap)
+        navigationGate.isEnabled = false
         host.canvasView.removeGestureRecognizer(navigationGate)
         if let hover = hover { host.canvasView.removeGestureRecognizer(hover) }
         if let pointerHover = pointerHover { host.canvasView.removeGestureRecognizer(pointerHover) }
