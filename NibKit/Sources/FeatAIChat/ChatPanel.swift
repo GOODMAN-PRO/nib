@@ -7,6 +7,7 @@ import NibDesign
 struct ChatPanel: View {
     @ObservedObject var model: ChatViewModel
     let context: PanelContext
+    @State private var deletingChat: String?
     @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
@@ -19,7 +20,7 @@ struct ChatPanel: View {
                     ForEach(sizeClass == .compact ? [PanelPresentation.floating, .sidebar] : [.floating, .sidebar, .window], id: \.self) { mode in
                         Button(modeTitle(mode)) { model.perform(ChatCommand.open, ["mode": .string(mode.rawValue)]) }
                     }
-                    Button(String(localized: "AI settings")) { model.perform(CommandIDs.settingsOpen, ["page": "ai"]) }
+                    Button(String(localized: "AI settings")) { model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)]) }
                 } label: {
                     Image(nib: .more).font(NibFont.glyph(.panel))
                         .foregroundStyle(NibColor.labelSecondary)
@@ -44,6 +45,17 @@ struct ChatPanel: View {
             }
         })) {
             if let pending = model.confirmation { ConfirmationSheet(model: model, pending: pending) }
+        }
+        .confirmationDialog(String(localized: "Delete Conversation"), isPresented: Binding(
+            get: { deletingChat != nil }, set: { if !$0 { deletingChat = nil } }
+        ), titleVisibility: .visible) {
+            Button(String(localized: "Delete Conversation"), role: .destructive) {
+                if let id = deletingChat { model.perform(CommandIDs.aiChatDelete, ["chat": .string(id)]) }
+                deletingChat = nil
+            }
+            Button(String(localized: "Cancel"), role: .cancel) { deletingChat = nil }
+        } message: {
+            Text(String(localized: "This conversation will be deleted on every device."))
         }
         .fileImporter(isPresented: $model.needsImagePicker, allowedContentTypes: [.image]) { result in
             switch result {
@@ -123,7 +135,7 @@ struct ChatPanel: View {
                         NibEmptyState(symbol: .assistant, title: String(localized: "Connect a model"),
                                       message: String(localized: "Connect a model to use the assistant."))
                         ForEach(["Anthropic", "OpenAI-compatible", "Ollama", "LM Studio", "Custom"], id: \.self) { provider in
-                            NibButton(provider, symbol: .settings, kind: .plain) { model.perform(CommandIDs.settingsOpen, ["page": "ai"]) }
+                            NibButton(provider, symbol: .settings, kind: .plain) { model.perform(CommandIDs.settingsOpen, ["page": .string(model.settingsPageID)]) }
                         }
                     } else if model.entries.isEmpty {
                         Text(String(localized: "Ask about your notes, or switch to Edit to change them."))
@@ -131,30 +143,20 @@ struct ChatPanel: View {
                     }
                     ForEach(model.entries) { entry in ChatMessageView(model: model, entry: entry).id(entry.id) }
                     if model.isStreaming, model.entries.last?.text.isEmpty == true {
-                        HStack(spacing: NibSpacing.s) {
-                            ProgressView()
-                            Text(String(localized: "Reading your context…")).font(NibFont.caption1)
-                        }
-                        .foregroundStyle(NibColor.labelSecondary)
+                        NibTraceRow(String(localized: "Reading your context…"), phase: .running)
                     }
                     if model.isGeneratingImage {
-                        HStack(spacing: NibSpacing.s) {
-                            ProgressView()
-                            Text(String(localized: "Generating image…")).font(NibFont.caption1)
-                        }
+                        NibTraceRow(String(localized: "Generating image…"), phase: .running)
+                    }
+                    if model.isLoadingChat {
+                        NibTraceRow(String(localized: "Loading conversation…"), phase: .running)
                     }
                     if let draft = model.draft { ChatDraftView(model: model, draft: draft).id(draft.id) }
                     if let error = model.error {
-                        VStack(alignment: .leading, spacing: NibSpacing.s) {
-                            Label { Text(error.message).font(NibFont.footnote).foregroundStyle(NibColor.label) } icon: {
-                                Image(nib: .warningTriangle).foregroundStyle(NibColor.warning)
-                            }
-                            if let hint = error.hint { Text(hint).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
-                            if model.retryPrompt != nil {
-                                NibButton(String(localized: "Retry"), symbol: .retry, kind: .plain) { model.perform(ChatCommand.send, ["retry": true]) }
-                                    .disabled(model.isStreaming)
-                            }
-                        }
+                        NibBanner([error.message, error.hint].compactMap { $0 }.joined(separator: "\n"),
+                                  action: model.retryPrompt != nil && !model.isStreaming ? NibAction(String(localized: "Retry")) {
+                            model.perform(ChatCommand.send, ["retry": true])
+                        } : nil)
                     }
                     Color.clear.frame(height: NibSpacing.xxs).id("aichat.bottom")
                 }
@@ -171,7 +173,7 @@ struct ChatPanel: View {
                 ScrollView(.horizontal) {
                     HStack(spacing: NibSpacing.s) {
                         ForEach(model.quickActions, id: \.id) { action in
-                            NibChip(action.title, action: { model.perform(ChatCommand.send, ["action": .string(action.id)]) })
+                            NibChip(action.title, symbol: NibSymbol(systemName: action.icon), action: { model.perform(ChatCommand.send, ["action": .string(action.id)]) })
                         }
                     }
                     .padding(.vertical, NibSpacing.s)
@@ -221,11 +223,11 @@ struct ChatPanel: View {
                             }
                         }
                         HStack(spacing: NibSpacing.s) {
-                            NibButton(String(localized: "Rename"), kind: .plain, size: .compact) {
+                            NibButton(String(localized: "Rename Conversation"), kind: .plain, size: .compact) {
                                 model.perform(ChatCommand.inspect, ["section": "rename", "chat": .string(chat.id)])
                             }
-                            NibButton(String(localized: "Delete"), kind: .destructivePlain, size: .compact) {
-                                model.perform(CommandIDs.aiChatDelete, ["chat": .string(chat.id)])
+                            NibButton(String(localized: "Delete Conversation"), kind: .destructivePlain, size: .compact) {
+                                deletingChat = chat.id
                             }
                         }
                     }
@@ -265,7 +267,10 @@ final class ChatWindowScenes: SceneHooks {
 
     init(app: NibApp, wrapped: SceneHooks?) { self.app = app; self.wrapped = wrapped }
 
+    private func pruneWindows() { windows = windows.filter { $0.value.scene != nil } }
+
     func open(_ model: ChatViewModel) throws {
+        pruneWindows()
         guard !NibApp.isHostlessTest else { throw NibError.unavailable("assistant windows require the app") }
         guard UIApplication.shared.supportsMultipleScenes else {
             throw NibError(.unsupported, "use the assistant sheet on this device")
@@ -278,6 +283,7 @@ final class ChatWindowScenes: SceneHooks {
     }
 
     func close(_ session: EditorSession) -> Bool {
+        pruneWindows()
         guard let scene = windows[session.id.raw]?.scene else { return false }
         UIApplication.shared.requestSceneSessionDestruction(scene.session, options: nil) { [weak self] error in
             Task { @MainActor in
@@ -289,13 +295,13 @@ final class ChatWindowScenes: SceneHooks {
     }
 
     func sceneDidConnect(_ scene: UIWindowScene, options: UIScene.ConnectionOptions, navigator: SceneNavigator) {
+        pruneWindows()
         let activities = Array(options.userActivities) + (scene.session.stateRestorationActivity.map { [$0] } ?? [])
         guard let activity = activities.first(where: { $0.activityType == Self.activityType }) else {
             wrapped?.sceneDidConnect(scene, options: options, navigator: navigator)
             return
         }
         let model = ChatRuntime.get(app).model(for: navigator.session)
-        model.presentation = .window
         let savedScope: AIScope
         if let raw = activity.userInfo?["scope"] as? String, let json = try? JSONValue.parse(raw), let scope = try? json.decode(AIScope.self) {
             savedScope = scope
@@ -327,6 +333,7 @@ final class ChatWindowScenes: SceneHooks {
     }
 
     func restorationActivity(_ navigator: SceneNavigator) -> NSUserActivity? {
+        pruneWindows()
         if windows[navigator.session.id.raw]?.scene != nil {
             return activity(for: ChatRuntime.get(app).model(for: navigator.session))
         }
@@ -334,7 +341,8 @@ final class ChatWindowScenes: SceneHooks {
     }
 
     func makeTabBar(_ navigator: SceneNavigator) -> UIView? {
-        windows[navigator.session.id.raw]?.scene == nil ? wrapped?.makeTabBar(navigator) : nil
+        pruneWindows()
+        return windows[navigator.session.id.raw]?.scene == nil ? wrapped?.makeTabBar(navigator) : nil
     }
 
     private func activity(for model: ChatViewModel) -> NSUserActivity {

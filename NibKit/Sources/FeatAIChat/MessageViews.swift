@@ -27,21 +27,21 @@ struct ChatMessageView: View {
                     .font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
             }
             ForEach(entry.tools) { tool in
-                ChatToolRow(tool: tool, expanded: model.showsTools)
+                ChatToolRow(tool: tool, title: model.app?.commands.descriptor(tool.name)?.title ?? String(localized: "Tool action"), expanded: model.showsTools)
             }
             if !entry.tools.isEmpty {
                 NibButton(model.showsTools ? String(localized: "Hide tool calls") : String(localized: "Show tool calls"), kind: .plain, size: .compact) {
                     model.perform(ChatCommand.inspect, ["section": "tools"])
                 }
             }
-            if !ChatCitations.refs(in: entry.text).isEmpty {
+            if !entry.citationRefs.isEmpty {
                 ScrollView(.horizontal) {
                     HStack(spacing: NibSpacing.s) {
-                        ForEach(ChatCitations.refs(in: entry.text), id: \.self) { ref in
-                            NibChip(ref, symbol: .citation, style: .citation, action: {
+                        ForEach(entry.citationRefs, id: \.self) { ref in
+                            NibChip(entry.citationLabels[ref] ?? String(localized: "Reference"), symbol: .citation, style: .citation, action: {
                                 model.perform(CommandIDs.viewReveal, ["ref": .string(ref)])
                             })
-                            .accessibilityLabel(String(localized: "Reveal citation \(ref)"))
+                            .accessibilityLabel(String(localized: "Show \(entry.citationLabels[ref] ?? String(localized: "Reference"))"))
                         }
                     }
                     .padding(.vertical, NibSpacing.s)
@@ -52,6 +52,9 @@ struct ChatMessageView: View {
                     Text(entry.revertNote ?? String(localized: "Changes reverted"))
                         .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
                 } else {
+                    if let note = entry.revertNote {
+                        NibBanner(note)
+                    }
                     NibProposalReceipt(count: entry.changes.count, onUndo: {
                         model.perform(ChatCommand.undo, ["message": .string(entry.id)])
                     }, onShow: {
@@ -70,7 +73,7 @@ struct ChatMessageView: View {
     }
 
     private var paragraph: some View {
-        Text(entry.text).font(NibFont.chat).foregroundStyle(NibColor.label)
+        Text(entry.displayText).font(NibFont.chat).foregroundStyle(NibColor.label)
             .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
     }
 
@@ -78,8 +81,12 @@ struct ChatMessageView: View {
         NibButton(String(localized: "Use as draft"), symbol: .text, kind: .plain, size: .compact) {
             model.perform(ChatCommand.draft, ["action": "answer", "message": .string(entry.id)])
         }
-        NibButton(String(localized: "Thumbs up"), kind: entry.rating == "up" ? .secondary : .plain, size: .compact) { rate("up") }
-        NibButton(String(localized: "Thumbs down"), kind: entry.rating == "down" ? .secondary : .plain, size: .compact) { rate("down") }
+        if entry.isPersisted {
+            NibButton(String(localized: "Thumbs up"), symbol: NibSymbol(systemName: "hand.thumbsup"), kind: entry.rating == "up" ? .secondary : .plain, size: .compact) { rate("up") }
+                .accessibilityAddTraits(entry.rating == "up" ? .isSelected : [])
+            NibButton(String(localized: "Thumbs down"), symbol: NibSymbol(systemName: "hand.thumbsdown"), kind: entry.rating == "down" ? .secondary : .plain, size: .compact) { rate("down") }
+                .accessibilityAddTraits(entry.rating == "down" ? .isSelected : [])
+        }
     }
 
     private func rate(_ rating: String) {
@@ -91,24 +98,14 @@ struct ChatMessageView: View {
 
 struct ChatToolRow: View {
     let tool: ChatToolActivity
+    let title: String
     let expanded: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: NibSpacing.xs) {
-            HStack(spacing: NibSpacing.s) {
-                if let ok = tool.succeeded {
-                    Image(nib: ok ? .checkmark : .warningTriangle)
-                        .foregroundStyle(ok ? NibColor.success : NibColor.warning)
-                        .accessibilityLabel(tool.cancelled ? String(localized: "Cancelled") : (ok ? String(localized: "Succeeded") : String(localized: "Failed")))
-                } else {
-                    ProgressView().accessibilityLabel(String(localized: "Running tool"))
-                }
-                Text(tool.name).font(NibFont.caption1)
-                if let changes = tool.changes, !changes.isEmpty {
-                    Text(String(localized: "\(changes.count) changes")).font(NibFont.caption1)
-                }
-            }
-            .foregroundStyle(NibColor.labelSecondary)
-            if expanded { NibCodeBlock(tool.arguments.jsonString(pretty: true)) }
+            NibTraceRow(title + (tool.cancelled ? " · " + String(localized: "Cancelled") : "") +
+                        (tool.changes.map { String(localized: " · \($0.count) changes") } ?? ""),
+                        phase: tool.succeeded == nil ? .running : (tool.succeeded == true ? .done : .warning))
+            if expanded { NibCodeBlock(tool.name + "\n" + tool.arguments.jsonString(pretty: true)) }
         }
     }
 }
@@ -163,6 +160,7 @@ struct ChatAnswerTransfer: Codable, Transferable {
     var chatID: String?
     static var transferRepresentation: some TransferRepresentation {
         CodableRepresentation(contentType: contentType)
+        ProxyRepresentation(exporting: \.text)
     }
 }
 

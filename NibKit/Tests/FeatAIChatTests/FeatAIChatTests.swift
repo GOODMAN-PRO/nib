@@ -1,4 +1,5 @@
 import XCTest
+import UIKit
 import NibContracts
 import NibTesting
 @testable import FeatAIChat
@@ -64,6 +65,11 @@ final class FeatAIChatTests: XCTestCase {
         h.app.settings.declarePrefix("chrome.panelPlacement.", synced: false, summary: "Test chrome placement.", owner: "test",
                                      schema: .str(choices: ["left", "right", "floating"]))
         var opened: [JSONValue] = []
+        var closed = 0
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.panelClose, title: "Close panel", summary: "Test panel host.", effect: .session)) { _, _ in
+            closed += 1
+            return [:]
+        }
         h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open panel", summary: "Test panel host.", effect: .session)) { p, _ in
             opened.append(p)
             return [:]
@@ -73,11 +79,39 @@ final class FeatAIChatTests: XCTestCase {
         XCTAssertEqual(h.app.settings.json(name)?.stringValue, expected)
         _ = try await h.run(ChatCommand.open, ["mode": "floating"])
         XCTAssertEqual(h.app.settings.json(name)?.stringValue, "floating")
-        XCTAssertEqual(opened.map { $0["id"]?.stringValue }, [PanelIDs.assistant, PanelIDs.assistant])
+        h.session.openPanels.insert(PanelIDs.assistant)
+        _ = try await h.run(ChatCommand.open)
+        XCTAssertEqual(h.app.settings.json(name)?.stringValue, "floating")
+        XCTAssertEqual(closed, 0)
+        XCTAssertEqual(opened.last?["params"]?["scope"]?.stringValue, "document")
+        XCTAssertEqual(opened.map { $0["id"]?.stringValue }, [PanelIDs.assistant, PanelIDs.assistant, PanelIDs.assistant])
     }
 
     func testCitationsValidateAndDeduplicateRefs() {
         let text = "See [page:FIXTUREDOC01/FIXTUREPG001] and item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01. Again page:FIXTUREDOC01/FIXTUREPG001. Ignore page:broken."
         XCTAssertEqual(ChatCitations.refs(in: text), ["page:FIXTUREDOC01/FIXTUREPG001", "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"])
     }
+    func testJPEGAttachmentKeepsItsMediaType() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.services.ai = FakeAIService()
+        let jpeg = try XCTUnwrap(UIImage(data: Fixtures.pngData)?.jpegData(compressionQuality: 0.8))
+        let result = try await h.run(ChatCommand.attach, ["source": "image", "base64": .string(jpeg.base64EncodedString())])
+        let ref = AssetRef(try XCTUnwrap(result["asset"]?.stringValue))
+        XCTAssertEqual(URL(fileURLWithPath: ref.name).pathExtension, "jpg")
+        let url = try XCTUnwrap(h.assets.temporaryURL(ref))
+        XCTAssertEqual(try Data(contentsOf: url), jpeg)
+    }
+
+    func testCitationsHaveCachedHumanLabelsAndReadableParagraphs() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.services.ai = FakeAIService(responses: [.init(text: "See page:FIXTUREDOC01/FIXTUREPG001 and item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01.")])
+        let model = ChatRuntime.get(h.app).model(for: h.session)
+        _ = try await model.send(prompt: "Cite", principal: .user, group: "CITE")
+        let entry = try XCTUnwrap(model.entries.last)
+        XCTAssertEqual(entry.citationLabels["page:FIXTUREDOC01/FIXTUREPG001"], "Page 1")
+        XCTAssertEqual(entry.citationLabels["item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"], "Text on page 1")
+        XCTAssertFalse(entry.displayText.contains("FIXTURE"))
+        XCTAssertTrue(entry.displayText.contains("Page 1"))
+    }
+
 }

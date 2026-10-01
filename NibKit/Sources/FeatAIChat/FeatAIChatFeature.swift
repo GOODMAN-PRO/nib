@@ -14,7 +14,6 @@ public enum FeatAIChatFeature: NibFeature {
         var panel = PanelDescriptor(id: PanelIDs.assistant, title: String(localized: "Assistant"),
                                     icon: NibSymbol.assistant.name, placement: .floating, order: 850, owner: id) { context in
             let model = ChatRuntime.get(context.app).model(for: context.session)
-            model.presentation = context.presentation ?? .floating
             return AnyView(ChatPanel(model: model, context: context))
         }
         panel.providesHeader = true
@@ -45,10 +44,6 @@ public enum FeatAIChatFeature: NibFeature {
             app.ui.sceneHooks = scenes
         }
         app.gateway.setPresenter(runtime, forPrincipalKind: "ai")
-        app.gateway.setPolicy(forPrincipalKind: "ai") { [weak runtime, weak app] principal in
-            if runtime?.hasTurn(for: principal) == true { return .always }
-            return app?.settings.get(NibSettings.aiConfirmationPolicy) ?? .destructive
-        }
     }
 }
 
@@ -87,7 +82,15 @@ final class ChatRuntime: ConfirmationPresenter {
         app.services.set(runtime, for: serviceKey)
         return runtime
     }
+    func pruneModels() {
+        let active = Set(app.services.sessions.sessions.map { $0.id.raw })
+        for key in Array(models.keys) where key != "library" && !active.contains(key) {
+            models.removeValue(forKey: key)?.stop()
+        }
+    }
+
     func model(for session: EditorSession?) -> ChatViewModel {
+        pruneModels()
         let key = session?.id.raw ?? "library"
         if let model = models[key] { return model }
         let model = ChatViewModel(app: app, session: session)
@@ -95,18 +98,17 @@ final class ChatRuntime: ConfirmationPresenter {
         return model
     }
 
-    func hasTurn(for principal: Principal) -> Bool {
-        guard case .ai(let chat) = principal else { return false }
-        return models.values.contains { $0.isStreaming && $0.isVisible && $0.chatID == chat }
-    }
-
     func confirm(_ request: ConfirmationRequest) async -> ConfirmationDecision {
+        pruneModels()
         guard case .ai(let chat) = request.principal,
               let model = models.values.first(where: { $0.isStreaming && $0.isVisible && $0.chatID == chat }) else { return await fallback?.confirm(request) ?? .deny }
+        let token = model.turnToken
         let pending = ChatConfirmation(request: request)
+        let host = app.services.get(ServiceKeys.pluginHost, as: PluginHosting.self)
+        let pluginOwned = host?.installed.contains { $0.id == request.command.owner } == true
         // Never contact a provider, capture media or execute an irreversible action just to preview it.
         if request.command.effect == .edit, !request.command.sensitive, !request.command.userPresence,
-           !request.command.forwardsCalls {
+           !request.command.forwardsCalls, !request.command.scopes.contains(.network), !pluginOwned {
             do {
                 let preview = try await app.bus.execute(Invocation(command: request.command.id, params: request.params,
                     principal: .user, session: model.session, dryRun: true))
@@ -118,7 +120,9 @@ final class ChatRuntime: ConfirmationPresenter {
         } else {
             pending.previewText = String(localized: "This action cannot be previewed without running it.")
         }
-        guard model.isStreaming else { return .deny }
+        guard model.isStreaming, model.turnToken == token else { return .deny }
+        pending.labels = Dictionary(uniqueKeysWithValues: ChatCitations.refs(in: pending.parameterSummary).map { ($0, model.citationLabel($0)) })
+        for ref in pending.summary?.all ?? [] { pending.labels[ref] = model.citationLabel(ref) }
         return await model.requestConfirmation(pending)
     }
 }
@@ -137,7 +141,7 @@ enum ChatCommands {
             app.commands.register(descriptor) { params, ctx in
                 do { return try await handler(params, ctx) }
                 catch {
-                    if !ctx.dryRun, let app = ctx.app {
+                    if !ctx.dryRun, !(error is CancellationError), let app = ctx.app {
                         ChatRuntime.get(app).model(for: ctx.activeSession).error = NibError.wrap(error)
                     }
                     throw error
@@ -153,10 +157,12 @@ enum ChatCommands {
                     guard !model.isStreaming else { throw NibError(.conflict, "stop this turn before changing its context") }
                     try model.setScope(try kind(scope), refs: try refs(p))
                 }
-                let mode = p["mode"]?.stringValue ?? "sidebar"
+                let panelParams: JSONValue = ["scope": .string(model.scope.kind.rawValue), "refs": .array(model.scope.refs.map(JSONValue.string))]
+                guard let mode = p["mode"]?.stringValue else {
+                    return try await ctx.execute(CommandIDs.panelOpen, ["id": .string(PanelIDs.assistant), "params": panelParams])
+                }
                 guard ["floating", "sidebar", "window"].contains(mode) else { throw NibError.invalid("unknown panel mode", path: "$.mode") }
                 guard !model.isStreaming, !model.isGeneratingImage else { throw NibError(.conflict, "stop this turn before changing panel mode") }
-                model.presentation = PanelPresentation(rawValue: mode) ?? .floating
                 if mode == "window" {
                     guard let app = ctx.app, let scenes = ChatRuntime.get(app).windowScenes else { throw NibError.unavailable("assistant window routing") }
                     try scenes.open(model)
@@ -171,7 +177,7 @@ enum ChatCommands {
                 if ctx.activeSession?.openPanels.contains(PanelIDs.assistant) == true {
                     _ = try await ctx.execute(CommandIDs.panelClose, ["id": .string(PanelIDs.assistant)])
                 }
-                return try await ctx.execute(CommandIDs.panelOpen, ["id": .string(PanelIDs.assistant), "params": ["mode": .string(mode)]])
+                return try await ctx.execute(CommandIDs.panelOpen, ["id": .string(PanelIDs.assistant), "params": panelParams])
             }
         register(ChatCommand.close, "Close Assistant", "Stop this window's turn, deny pending requests and close the assistant panel.") { _, ctx in
             if ctx.dryRun { return [:] }
@@ -295,8 +301,8 @@ enum ChatCommands {
                     if let base64 = p["base64"]?.stringValue {
                         guard base64.utf8.count <= 28_000_000, let data = Data(base64Encoded: base64) else { throw NibError.invalid("invalid image bytes", path: "$.base64") }
                         ref = try await Task.detached { () throws -> AssetRef in
-                            guard UIImage(data: data) != nil else { throw NibError.invalid("unreadable image", path: "$.base64") }
-                            return try assets.putTemporary(data, ext: "png")
+                            let image = try ChatImageBytes.normalized(data)
+                            return try assets.putTemporary(image.data, ext: image.ext)
                         }.value
                     } else {
                         ref = AssetRef(try string(p, "asset"))
@@ -349,9 +355,8 @@ enum ChatCommands {
                 let result: JSONValue
                 if let asset = draft.asset {
                     let (d, page) = try ctx.pageOrSession(p["page"]?.stringValue)
-                    guard let assets = ctx.services.assets, let url = assets.temporaryURL(asset) else { throw NibError.notFound("generated image") }
-                    let data = try await Task.detached { try Data(contentsOf: url) }.value
-                    params = params.merging(["page": .string(NodeRef.page(d, page).description), "base64": .string(data.base64EncodedString()), "at": p["at"] ?? [72, 72]])
+                    guard let assets = ctx.services.assets, assets.temporaryURL(asset) != nil else { throw NibError.notFound("generated image") }
+                    params = params.merging(["page": .string(NodeRef.page(d, page).description), "url": .string("tmp:" + asset.name), "at": p["at"] ?? [72, 72]])
                     result = try await insertAIContent(CommandIDs.imageInsert, params, context: ctx, chat: model.chatID ?? draft.id)
                 } else if model.docKind == .textDocument {
                     let d = try ctx.documentOrSession(p["doc"]?.stringValue)

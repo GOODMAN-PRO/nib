@@ -9,6 +9,8 @@ final class ChatConfirmation: Identifiable {
     let request: ConfirmationRequest
     var summary: ChangeSummary?
     var previewText = ""
+    var labels: [String: String] = [:]
+    var displayParameters: String { ChatCitations.replacingRefs(in: parameterSummary, labels: labels) }
     init(request: ConfirmationRequest) { self.request = request }
 
     var parameterSummary: String {
@@ -35,13 +37,13 @@ struct ConfirmationSheet: View {
                     Image(nib: .permission).foregroundStyle(NibColor.warning)
                 }
                 Text(pending.request.command.summary).font(NibFont.body)
-                Text(pending.parameterSummary).font(NibFont.footnote).textSelection(.enabled)
+                Text(pending.displayParameters).font(NibFont.footnote).textSelection(.enabled)
                 Text(pending.previewText).font(NibFont.bodyEmphasis)
                 if let summary = pending.summary {
                     ForEach(Array(summary.all.enumerated()), id: \.offset) { row in
                         HStack(alignment: .top, spacing: NibSpacing.s) {
                             NibBadge(.number(row.offset + 1))
-                            Text(row.element).font(NibFont.footnote).textSelection(.enabled)
+                            Text(pending.labels[row.element] ?? String(localized: "Changed item")).font(NibFont.footnote).textSelection(.enabled)
                         }
                     }
                 }
