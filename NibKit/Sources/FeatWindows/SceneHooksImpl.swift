@@ -1,4 +1,5 @@
 import UIKit
+import Combine
 import NibContracts
 
 /// `app.ui.sceneHooks`: what a window opens with (a requested document, its restored tabs, or on a cold launch the
@@ -21,10 +22,23 @@ final class SceneHooksImpl: SceneHooks {
     private weak var app: NibApp?
     let scenes: WindowScenes
     private var launchHandled = false
+    private var tabPresentations: [NibID: TabStripDocumentPresentation] = [:]
+    private var tabsSettingsWatch: AnyCancellable?
 
     init(app: NibApp, scenes: WindowScenes) {
         self.app = app
         self.scenes = scenes
+        tabsSettingsWatch = NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard note.userInfo?["name"] as? String == WindowSettings.showTabs.name else { return }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    for navigator in self.scenes.all where navigator.session.document != nil {
+                        _ = self.makeTabBar(navigator)
+                    }
+                }
+            }
     }
 
     // MARK: SceneHooks
@@ -53,8 +67,31 @@ final class SceneHooksImpl: SceneHooks {
     func makeTabBar(_ navigator: SceneNavigator) -> UIView? {
         scenes.add(navigator)
         scenes.updateSceneTitle(navigator)
-        guard let app, TabStripLayout.showsStrip(tabCount: navigator.openDocuments.count,
-                                                 openAsTabs: app.settings.get(NibSettings.openAsTabs)) else { return nil }
+        guard let app else { return nil }
+        let visible = TabStripLayout.showsStrip(tabCount: navigator.openDocuments.count,
+                                                enabled: app.settings.get(WindowSettings.showTabs))
+        // The shell asks after attaching its content controller. Returning nil here stops it from reserving and
+        // clipping a separate 36 pt UIKit band; the floating host renders tabs inside the document's one container.
+        if navigator.session.document != nil, let host = navigator.floatingHost,
+           let root = navigator.rootViewController, let rootView = root.viewIfLoaded,
+           let controller = root.children.first(where: { $0.viewIfLoaded?.superview === rootView }) {
+            if let old = tabPresentations[navigator.session.id], old.controller !== controller || old.host !== host {
+                old.dismiss()
+                tabPresentations[navigator.session.id] = nil
+            }
+            if visible {
+                let presentation = tabPresentations[navigator.session.id]
+                    ?? TabStripDocumentPresentation(controller: controller, host: host)
+                tabPresentations[navigator.session.id] = presentation
+                presentation.present(TabStripModel(app: app, navigator: navigator, scenes: scenes))
+            } else {
+                tabPresentations.removeValue(forKey: navigator.session.id)?.dismiss()
+            }
+            tabPresentations = tabPresentations.filter { $0.value.controller != nil && $0.value.host != nil }
+            return nil
+        }
+        tabPresentations.removeValue(forKey: navigator.session.id)?.dismiss()
+        guard visible else { return nil }
         return TabStripHostView(model: TabStripModel(app: app, navigator: navigator, scenes: scenes))
     }
 

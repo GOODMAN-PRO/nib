@@ -174,7 +174,7 @@ struct StudySessionAction: NibCommand {
             model.accept(content)
             if p.action == "grade" {
                 guard let rating = p.rating else { throw NibError.invalid("Choose a grade.", path: "$.rating") }
-                if model.flipped, model.mode == "smartLearn", let card = model.current {
+                if model.flipped, let card = model.current {
                     _ = try await ctx.execute(CommandIDs.studyGrade, ["card": .string(NodeRef.card(doc, card.id).description),
                                                                      "knewIt": .bool(rating.knewIt), "rating": .string(rating.rawValue)])
                 }

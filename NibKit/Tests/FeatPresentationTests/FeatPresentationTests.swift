@@ -590,7 +590,7 @@ final class FeatPresentationTests: XCTestCase {
     func testPresenterHUDIsAChromeOverlayOfTheActiveWindow() async throws {
         let h = Harness(features: [FeatPresentationFeature.self])
         let controller = try XCTUnwrap(h.app.services.get(PresentationController.serviceKey, as: PresentationController.self))
-        func shown(_ session: EditorSession, compact: Bool = false, kind: DocumentKind = .notebook) -> [String] {
+        func shown(_ session: EditorSession, compact: Bool = false, kind: DocumentKind? = .notebook) -> [String] {
             h.app.ui.visibleChromeOverlays(ChromeContext(app: h.app, session: session, kind: kind, isCompact: compact))
                 .filter { $0.owner == FeatPresentationFeature.id }.map { $0.id }
         }
@@ -614,6 +614,8 @@ final class FeatPresentationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(updates, 1, "a display connecting asks the chrome to show the HUD")
         XCTAssertEqual(shown(h.session), [PresentationController.hudID])
         XCTAssertEqual(shown(h.session, compact: true), [PresentationController.compactHUDID])
+        XCTAssertEqual(shown(h.session, kind: nil), [], "the library has no presenter HUD, even with the active session")
+        XCTAssertEqual(shown(h.session, compact: true, kind: nil), [], "compact library chrome also excludes the HUD")
         XCTAssertEqual(shown(h.session, kind: .textDocument), [PresentationController.hudID],
                        "Stop stays reachable from any document window")
 
@@ -623,6 +625,8 @@ final class FeatPresentationTests: XCTestCase {
         XCTAssertEqual(shown(h.session), [], "mirroring shows the window itself: no HUD")
         _ = try await h.run("present.setMode", ["mode": "mirror", "blank": true])
         XCTAssertEqual(shown(h.session), [PresentationController.hudID], "a blanked display keeps the HUD to undo it")
+        XCTAssertEqual(shown(h.session, kind: nil), [], "blanking the external display does not put a HUD in the library")
+        XCTAssertEqual(shown(h.session, compact: true, kind: nil), [], "blanking also keeps compact library chrome clear")
         _ = try await h.run("present.setMode", ["mode": "presenter", "blank": false])
 
         // Another window becomes active: the HUD moves there.

@@ -1,6 +1,8 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatWhiteboard
 
@@ -19,6 +21,25 @@ private final class ScriptedRenderer: PageRenderer {
     func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { nil }
     func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
     func purgeCaches() {}
+}
+
+/// The document window's floating host, with canvas bounds converted out of their scrolling coordinate space.
+@MainActor
+private final class MinimapTestFloatingHost: FloatingHosting {
+    var entries: [String: AnyView] = [:]
+    var origin = CGPoint(x: 24, y: 48)
+    var canConvert = true
+
+    func present(_ id: String, content: AnyView) { entries[id] = content }
+    func dismiss(_ id: String) { entries[id] = nil }
+    func isPresenting(_ id: String) -> Bool { entries[id] != nil }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { containerRect(rect, from: view) != nil }
+    func removeAnchor(_ id: String) {}
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? {
+        guard canConvert else { return nil }
+        return rect.offsetBy(dx: origin.x - view.bounds.minX, dy: origin.y - view.bounds.minY)
+    }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
 }
 
 @MainActor
@@ -723,33 +744,94 @@ final class FeatWhiteboardTests: XCTestCase {
         XCTAssertEqual(calls.first?["dy"]?.doubleValue ?? 0, -40, accuracy: 1e-6)
     }
 
-    func testMinimapAttachesToAWhiteboardCanvasAndClaimsOnlyItsParts() throws {
+    func testMinimapPresentsInTheWindowContainerAndClaimsOnlyItsParts() throws {
+        let h = harness()
+        h.session.document = Fixtures.whiteboardID
+        h.session.page = Fixtures.boardID
+        let host = FakeCanvasHost(app: h.app, session: h.session, doc: Fixtures.whiteboardID, pages: [Fixtures.boardID])
+        let floating = MinimapTestFloatingHost()
+        h.session.floatingHost = floating
+        let minimap = MinimapAttachment()
+        minimap.attach(to: host)
+        XCTAssertTrue(floating.isPresenting(MinimapAttachment.id))
+        XCTAssertTrue(host.canvasView.subviews.isEmpty, "floating chrome belongs to the window, not the scrolling canvas")
+        XCTAssertEqual(minimap.model?.itemCount, 1)
+        XCTAssertEqual(minimap.model?.limit, BoardLimitStatus.ok)
+
+        minimap.canvasDidChange(host)
+        let region = try XCTUnwrap(minimap.model?.floatingRegion)
+        XCTAssertEqual(region.maxX, floating.origin.x + host.canvasView.bounds.width - NibMetrics.chromeInset)
+        XCTAssertEqual(region.maxY, floating.origin.y + host.canvasView.bounds.height
+                       - MinimapLayout.bottomClearance(compact: false))
+        XCTAssertFalse(minimap.hitTest(CGPoint(x: 8, y: 8), host: host), "the top-left corner is canvas")
+        XCTAssertFalse(minimap.hitTest(CGPoint(x: 500, y: 500), host: host), "unreported frames never claim canvas")
+
+        let frames = try XCTUnwrap(minimap.model?.hitFrames)
+        frames.set(.map, CGRect(x: region.maxX - 208, y: region.maxY - 200, width: 208, height: 144))
+        frames.set(.controls, CGRect(x: region.maxX - 184, y: region.maxY - 40, width: 184, height: 40))
+        let mapPoint = CGPoint(x: region.maxX - 100 - floating.origin.x,
+                               y: region.maxY - 100 - floating.origin.y)
+        let gapPoint = CGPoint(x: mapPoint.x, y: region.maxY - 48 - floating.origin.y)
+        XCTAssertTrue(minimap.hitTest(mapPoint, host: host))
+        XCTAssertFalse(minimap.hitTest(gapPoint, host: host), "the 16 pt gap stays canvas")
+
+        host.canvasView.bounds.origin = CGPoint(x: 500, y: -200)
+        minimap.canvasDidChange(host)
+        XCTAssertEqual(minimap.model?.floatingRegion, region, "the minimap stays fixed when the canvas pans")
+        XCTAssertTrue(minimap.hitTest(CGPoint(x: mapPoint.x + 500, y: mapPoint.y - 200), host: host))
+
+        // Only the parts take touches: the gap between the map and the controls row stays canvas.
+        let parts = [CGRect(x: 0, y: 0, width: 208, height: 144), CGRect(x: 24, y: 160, width: 184, height: 40)]
+        XCTAssertTrue(MinimapAttachment.overlayTakes(CGPoint(x: 100, y: 100), parts: parts))
+        XCTAssertFalse(MinimapAttachment.overlayTakes(CGPoint(x: 100, y: 152), parts: parts))
+        XCTAssertFalse(MinimapAttachment.overlayTakes(CGPoint(x: 10, y: 190), parts: parts))
+        XCTAssertTrue(MinimapAttachment.overlayTakes(CGPoint(x: 10, y: 190), parts: []), "before layout the whole overlay")
+
+        minimap.detach(from: host)
+        XCTAssertFalse(floating.isPresenting(MinimapAttachment.id))
+        XCTAssertNil(minimap.model)
+    }
+
+    func testMinimapWaitsForTheWindowHostAndCleansUpWhenItChanges() throws {
         let h = harness()
         h.session.document = Fixtures.whiteboardID
         h.session.page = Fixtures.boardID
         let host = FakeCanvasHost(app: h.app, session: h.session, doc: Fixtures.whiteboardID, pages: [Fixtures.boardID])
         let minimap = MinimapAttachment()
         minimap.attach(to: host)
-        let view = try XCTUnwrap(minimap.hosting?.view)
-        XCTAssertTrue(view.isDescendant(of: host.canvasView))
-        XCTAssertEqual(minimap.model?.itemCount, 1)
-        XCTAssertEqual(minimap.model?.limit, BoardLimitStatus.ok)
+        XCTAssertNil(minimap.model?.floatingRegion)
+        XCTAssertTrue(host.canvasView.subviews.isEmpty)
 
+        let first = MinimapTestFloatingHost()
+        first.canConvert = false
+        h.session.floatingHost = first
         minimap.canvasDidChange(host)
-        XCTAssertGreaterThan(view.frame.width, 0)
-        XCTAssertGreaterThan(view.frame.height, 0)
-        XCTAssertLessThanOrEqual(view.frame.maxX, host.canvasView.bounds.maxX - 16 + 0.5, "16 pt chrome inset")
-        XCTAssertFalse(minimap.hitTest(CGPoint(x: 8, y: 8), host: host), "the top-left corner is canvas")
-        XCTAssertTrue(minimap.hitTest(CGPoint(x: view.frame.midX, y: view.frame.midY), host: host))
+        XCTAssertTrue(first.isPresenting(MinimapAttachment.id))
+        XCTAssertNil(minimap.model?.floatingRegion, "wait until the layer joins the canvas's window")
+        first.canConvert = true
+        minimap.canvasDidChange(host)
+        XCTAssertNotNil(minimap.model?.floatingRegion)
 
-        // Only the parts take touches: the gap between the map and the controls row stays canvas.
-        let parts = [CGRect(x: 0, y: 0, width: 224, height: 160), CGRect(x: 40, y: 168, width: 184, height: 40)]
-        XCTAssertTrue(MinimapAttachment.overlayTakes(CGPoint(x: 100, y: 100), parts: parts))
-        XCTAssertFalse(MinimapAttachment.overlayTakes(CGPoint(x: 100, y: 164), parts: parts))
-        XCTAssertFalse(MinimapAttachment.overlayTakes(CGPoint(x: 10, y: 190), parts: parts))
-        XCTAssertTrue(MinimapAttachment.overlayTakes(CGPoint(x: 10, y: 190), parts: []), "before layout the whole overlay")
+        let second = MinimapTestFloatingHost()
+        h.session.floatingHost = second
+        minimap.canvasDidChange(host)
+        XCTAssertFalse(first.isPresenting(MinimapAttachment.id))
+        XCTAssertTrue(second.isPresenting(MinimapAttachment.id))
 
+        h.session.floatingHost = nil
+        minimap.canvasDidChange(host)
+        XCTAssertFalse(second.isPresenting(MinimapAttachment.id))
+        XCTAssertNil(minimap.model?.floatingRegion)
         minimap.detach(from: host)
-        XCTAssertNil(view.superview)
+    }
+
+    func testMinimapClearsPageHUDAndFusedPaletteOptionsInLandscape() {
+        let regular = MinimapLayout.bottomClearance(compact: false)
+        XCTAssertEqual(regular, NibMetrics.chromeInset + NibMetrics.hudHeight + NibSpacing.l)
+        let landscape = MinimapLayout.bottomClearance(compact: false, compactHeight: true)
+        XCTAssertGreaterThanOrEqual(landscape, NibMetrics.canvasBottomInsetCompact + NibMetrics.hudHeight + NibSpacing.l)
+        XCTAssertGreaterThanOrEqual(landscape, NibMetrics.barTopGap + NibMetrics.paletteThicknessMax
+                                   + NibMetrics.barHeightMax - 1 + NibSpacing.l)
+        XCTAssertEqual(landscape, MinimapLayout.bottomClearance(compact: true))
     }
 }

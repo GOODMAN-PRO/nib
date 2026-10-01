@@ -2,6 +2,7 @@ import XCTest
 import SwiftUI
 import UIKit
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatDocChrome
 
@@ -26,31 +27,31 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertFalse(left.isCompact)
         XCTAssertEqual(left.presentation, .docked)
         XCTAssertEqual(left.bar, CGRect(x: 16, y: 32, width: 1162, height: 44))
-        XCTAssertEqual(left.left, CGRect(x: 16, y: 88, width: 240, height: 726))
+        XCTAssertEqual(left.left, CGRect(x: 16, y: 92, width: 240, height: 722))
         XCTAssertNil(left.right)
         XCTAssertEqual(left.editor, CGRect(x: 256, y: 0, width: 938, height: 834))
         // The palette's layer: full height (its dock region keeps it below the bars), beside the sidebar.
         XCTAssertEqual(left.toolbar, CGRect(x: 256, y: 0, width: 938, height: 834))
         XCTAssertEqual(left.toolbarInsets, EdgeInsets(top: 24, leading: 0, bottom: 20, trailing: 0))
-        XCTAssertEqual(left.floatingRegion, CGRect(x: 272, y: 88, width: 906, height: 726))
-        XCTAssertEqual(left.overlayRegion, CGRect(x: 272, y: 88, width: 906, height: 710))
+        XCTAssertEqual(left.floatingRegion, CGRect(x: 272, y: 92, width: 906, height: 722))
+        XCTAssertEqual(left.overlayRegion, CGRect(x: 272, y: 92, width: 906, height: 706))
         XCTAssertEqual(left.toast, CGRect(x: 256, y: 0, width: 938, height: 814))
 
         let right = ChromeLayout(size: size, safeArea: safe, left: nil, right: 240, mode: .sidebar)
         XCTAssertEqual(right.presentation, .docked)
         XCTAssertNil(right.left)
-        XCTAssertEqual(right.right, CGRect(x: 938, y: 88, width: 240, height: 726))
+        XCTAssertEqual(right.right, CGRect(x: 938, y: 92, width: 240, height: 722))
         XCTAssertEqual(right.editor, CGRect(x: 0, y: 0, width: 938, height: 834))
         // A docked panel on the right moves the palette's right dock to its leading edge.
         XCTAssertEqual(right.toolbar, CGRect(x: 0, y: 0, width: 938, height: 834))
-        XCTAssertEqual(right.floatingRegion, CGRect(x: 16, y: 88, width: 906, height: 726))
-        XCTAssertEqual(right.overlayRegion, CGRect(x: 16, y: 88, width: 906, height: 710))
+        XCTAssertEqual(right.floatingRegion, CGRect(x: 16, y: 92, width: 906, height: 722))
+        XCTAssertEqual(right.overlayRegion, CGRect(x: 16, y: 92, width: 906, height: 706))
 
         let closed = ChromeLayout(size: size, safeArea: safe, left: nil, right: nil, mode: .sidebar)
         XCTAssertEqual(closed.editor, CGRect(x: 0, y: 0, width: 1194, height: 834))
         XCTAssertEqual(closed.toolbar, CGRect(x: 0, y: 0, width: 1194, height: 834))
-        XCTAssertEqual(closed.floatingRegion, CGRect(x: 16, y: 88, width: 1162, height: 726))
-        XCTAssertEqual(closed.overlayRegion, CGRect(x: 16, y: 88, width: 1162, height: 710))
+        XCTAssertEqual(closed.floatingRegion, CGRect(x: 16, y: 92, width: 1162, height: 722))
+        XCTAssertEqual(closed.overlayRegion, CGRect(x: 16, y: 92, width: 1162, height: 706))
     }
 
     func testRegularPortraitFloatsTheSidebarOverThePage() {
@@ -59,10 +60,10 @@ final class FeatDocChromeTests: XCTestCase {
                                   left: nil, right: 240, mode: .sidebar)
         XCTAssertFalse(layout.isCompact)
         XCTAssertEqual(layout.presentation, .overlay)
-        XCTAssertEqual(layout.right, CGRect(x: 578, y: 88, width: 240, height: 1086))
+        XCTAssertEqual(layout.right, CGRect(x: 578, y: 92, width: 240, height: 1082))
         XCTAssertEqual(layout.editor, CGRect(x: 0, y: 0, width: 834, height: 1194))
         XCTAssertEqual(layout.toolbar, CGRect(x: 0, y: 0, width: 578, height: 1194))
-        XCTAssertEqual(layout.overlayRegion, CGRect(x: 16, y: 88, width: 546, height: 1070))
+        XCTAssertEqual(layout.overlayRegion, CGRect(x: 16, y: 92, width: 546, height: 1066))
     }
 
     func testCompactWidthPresentsSidebarsAsSheets() {
@@ -79,7 +80,7 @@ final class FeatDocChromeTests: XCTestCase {
             XCTAssertEqual(layout.toolbar, CGRect(x: 0, y: 0, width: 393, height: 852))
             XCTAssertEqual(layout.toolbarInsets, EdgeInsets(top: 59, leading: 0, bottom: 34, trailing: 0))
             // Overlays and toasts stay above the iPhone's bottom palette (56 + 8 + 16 above the home indicator).
-            XCTAssertEqual(layout.overlayRegion, CGRect(x: 16, y: 123, width: 361, height: 615))
+            XCTAssertEqual(layout.overlayRegion, CGRect(x: 16, y: 127, width: 361, height: 611))
             XCTAssertEqual(layout.toast, CGRect(x: 0, y: 0, width: 393, height: 762))
         }
     }
@@ -88,7 +89,7 @@ final class FeatDocChromeTests: XCTestCase {
         let layout = ChromeLayout(size: CGSize(width: 1194, height: 834),
                                   safeArea: UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0),
                                   left: 240, right: nil, mode: .window)
-        XCTAssertEqual(layout.window, CGRect(x: 16, y: 88, width: 1162, height: 726))
+        XCTAssertEqual(layout.window, CGRect(x: 16, y: 92, width: 1162, height: 722))
         XCTAssertNil(layout.left)
         XCTAssertEqual(layout.editor, CGRect(x: 0, y: 0, width: 1194, height: 834))
         XCTAssertEqual(layout.toolbar, CGRect(x: 0, y: 0, width: 1194, height: 834))
@@ -104,6 +105,59 @@ final class FeatDocChromeTests: XCTestCase {
                                          size: size, in: region),
                        CGPoint(x: 1006, y: 534))
         XCTAssertEqual(FloatingSnap.initial(index: 1, size: size, in: region), CGPoint(x: 1006, y: 392))
+    }
+
+    func testWidePhoneAndCompactHeightPresentPanelsAsSheets() {
+        for (idiom, vertical) in [(UIUserInterfaceIdiom.phone, UIUserInterfaceSizeClass.regular),
+                                  (.pad, .compact)] {
+            let layout = ChromeLayout(size: CGSize(width: 874, height: 402),
+                                      safeArea: UIEdgeInsets(top: 0, left: 59, bottom: 21, right: 59),
+                                      left: 240, right: 344, mode: .sidebar,
+                                      idiom: idiom, verticalSizeClass: vertical)
+            XCTAssertTrue(layout.isCompact)
+            XCTAssertEqual(layout.presentation, .sheet)
+            XCTAssertNil(layout.left)
+            XCTAssertNil(layout.right)
+            XCTAssertEqual(layout.floatingRegion.maxY, 301)
+            XCTAssertEqual(layout.floatingRegion.maxY, layout.overlayRegion.maxY)
+            let state = ChromeState()
+            state.open("assistant", at: .floating)
+            XCTAssertEqual(PresentedSheet.current(state, compact: layout.isCompact), .floating("assistant"))
+        }
+    }
+
+    func testTopAndBottomPaletteKeepOverlaysAndFloatingPanelsClear() {
+        var layout = ChromeLayout(size: CGSize(width: 1194, height: 834),
+                                  safeArea: UIEdgeInsets(top: 24, left: 0, bottom: 20, right: 0),
+                                  left: nil, right: nil, mode: .sidebar)
+        let bar = layout.bar
+        let toolbar = layout.toolbar
+        layout.avoidPalette(NibPaletteDock(edge: .top), thickness: 56, optionsHeight: 44)
+        // Palette starts at 92, ends at 148; its fused options end at 191, then a 16 pt resting gap.
+        XCTAssertEqual(layout.overlayRegion.minY, 207)
+        XCTAssertEqual(layout.floatingRegion.minY, 207)
+        XCTAssertEqual(layout.bar, bar)
+        XCTAssertEqual(layout.toolbar, toolbar)
+        layout.avoidPalette(NibPaletteDock(edge: .bottom), thickness: 56, optionsHeight: 44)
+        XCTAssertEqual(layout.overlayRegion.maxY, 683)
+        XCTAssertEqual(layout.floatingRegion.maxY, 683)
+    }
+
+    func testKeyboardOnlyShortensResultsAndMovesBottomHUDs() {
+        let region = CGRect(x: 16, y: 92, width: 1162, height: 706)
+        let keyboard = CGRect(x: 0, y: 500, width: 1194, height: 334)
+        let results = ChromeRegion.avoidingKeyboard(keyboard, in: region)
+        XCTAssertEqual(results.minY, region.minY)
+        XCTAssertEqual(results.maxY, 484)
+        typealias Item = ChromeOverlayGeometry.Item
+        let frames = ChromeOverlayGeometry.frames([
+            Item(id: "field", placement: .top, size: CGSize(width: 560, height: 44)),
+            Item(id: "pageHUD", placement: .bottomTrailing, size: CGSize(width: 100, height: 40))
+        ], in: region, keyboardFrame: keyboard)
+        XCTAssertEqual(frames["field"]?.minY, region.minY)
+        XCTAssertEqual(frames["pageHUD"]?.maxY, 484)
+        XCTAssertEqual(ChromeRegion.avoidingKeyboard(nil, in: region), region)
+        XCTAssertEqual(ChromeRegion.avoidingKeyboard(CGRect(x: 0, y: 834, width: 1194, height: 334), in: region), region)
     }
 
     // MARK: Chrome overlays
@@ -603,6 +657,34 @@ final class FeatDocChromeTests: XCTestCase {
         XCTAssertEqual(compact.trailing.map(\.id), [NavBarModel.assistant, NavBarModel.more])
         XCTAssertTrue(compact.overflow.map(\.id).contains(NavBarModel.sidebar))
         XCTAssertTrue(compact.overflow.map(\.id).contains(NavBarModel.addPage))
+    }
+
+    func testAfterTitleStatusesKeepTheirSlotOnCompactWidth() {
+        var bridge = ToolbarItemDescriptor(id: "bridge", title: "Client", icon: "circle",
+                                           group: .navLeading, order: 40, owner: "test")
+        bridge.navSlot = .afterTitle
+        bridge.compactStatus = { _ in AnyView(Text("Client")) }
+        var presence = bridge
+        presence.id = "presence"
+        presence.order = 30
+        var regularOnly = bridge
+        regularOnly.id = "regularOnly"
+        regularOnly.showsInCompactWidth = false
+        var legacy = ToolbarItemDescriptor(id: "legacy", title: "Search", icon: "magnifyingglass",
+                                           group: .navLeading, order: 20, owner: "test", command: "search.open")
+        legacy.navSlot = .afterTitle // No status provider: keep the legacy icon path.
+        let input = NavBarModel.Input(
+            doc: Fixtures.docID, kind: .notebook, page: Fixtures.page1, readOnly: false, bookmarked: false, tool: "pen",
+            hasSidebar: false, sidebarVisible: false, assistantPanel: nil, assistantOpen: false,
+            registered: [bridge, regularOnly, legacy, presence], commandExists: { _ in false }, hasMenu: { _ in false })
+        let regular = NavBarModel.build(input)
+        XCTAssertEqual(regular.afterTitle.map(\.id), ["presence", "bridge", "regularOnly"])
+        XCTAssertTrue(regular.leading.contains { $0.id == "legacy" })
+        XCTAssertFalse(regular.leading.contains { $0.id == "bridge" })
+        let compact = NavBarModel.split(regular, compact: true)
+        XCTAssertEqual(compact.afterTitle.map(\.id), ["presence", "bridge"])
+        XCTAssertFalse(compact.overflow.contains { $0.id == "bridge" || $0.id == "presence" })
+        XCTAssertTrue(compact.overflow.contains { $0.id == "legacy" })
     }
 
     func testNavItemsShowTheLiveStateOfFeatureItems() {

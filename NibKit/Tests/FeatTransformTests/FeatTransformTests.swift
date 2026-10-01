@@ -1,6 +1,7 @@
 import XCTest
 import UIKit
 import NibContracts
+import NibDesign
 import NibTesting
 @testable import FeatTransform
 
@@ -383,9 +384,35 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(l.target(at: CGPoint(x: 102, y: 203)), .corner(0))
         XCTAssertEqual(l.target(at: CGPoint(x: 262, y: 245)), .edge(1))
         XCTAssertEqual(l.target(at: CGPoint(x: 180, y: 290)), .edge(2))
-        XCTAssertEqual(l.target(at: CGPoint(x: 180, y: 178)), .rotate)
+        XCTAssertEqual(l.target(at: l.rotation), .rotate)
         XCTAssertEqual(l.target(at: CGPoint(x: 150, y: 240)), .body)
         XCTAssertNil(l.target(at: CGPoint(x: 400, y: 400)))
+    }
+
+    func testRotationAndTopEdgeHitAreasStaySeparateAtEveryZoomAndAngle() {
+        for zoom: CGFloat in [0.5, 1, 3] {
+            for angle in [0.0, Double.pi / 6, Double.pi / 2, Double.pi] {
+                let frame = Frame(x: 100, y: 200, w: 160, h: 90, rotation: angle)
+                let l = HandleLayout(corners: frame.corners.map {
+                    $0.cg.applying(CGAffineTransform(scaleX: zoom, y: zoom))
+                })
+                XCTAssertTrue(l.showsTopBottom)
+                let top = l.edges[0]
+                let distance = HandleLayout.distance(top, l.rotation)
+                XCTAssertGreaterThan(distance, NibMetrics.hitTarget)
+                let unit = CGPoint(x: (l.rotation.x - top.x) / distance,
+                                   y: (l.rotation.y - top.y) / distance)
+                // Each complete hit area still belongs to its own handle, including the side facing the other.
+                let edgeBoundary = CGPoint(x: top.x + unit.x * (HandleLayout.reach - 0.01),
+                                           y: top.y + unit.y * (HandleLayout.reach - 0.01))
+                let rotationBoundary = CGPoint(x: l.rotation.x - unit.x * (HandleLayout.reach - 0.01),
+                                               y: l.rotation.y - unit.y * (HandleLayout.reach - 0.01))
+                XCTAssertEqual(l.target(at: edgeBoundary), .edge(0))
+                XCTAssertEqual(l.target(at: rotationBoundary), .rotate)
+                XCTAssertNil(l.target(at: HandleLayout.mid(top, l.rotation)), "the hit targets have a gap")
+                XCTAssertTrue(l.bounds.contains(l.rotation), "overlay bounds include the lifted rotation handle")
+            }
+        }
     }
 
     func testHandlesClaimTouchesOnHandlesAndBodyOnly() throws {
@@ -398,8 +425,9 @@ final class FeatTransformTests: XCTestCase {
         // The shape's frame is (100, 200, 160, 90); page 1 sits at the view origin at zoom 1.
         XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 245), host: host), "body")
         XCTAssertTrue(handles.hitTest(CGPoint(x: 90, y: 190), host: host), "top-left corner")
-        XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 176), host: host), "rotation bead")
-        XCTAssertFalse(handles.hitTest(CGPoint(x: 180, y: 150), host: host), "above the rotation bead")
+        let rotation = try XCTUnwrap(handles.layout).rotation
+        XCTAssertTrue(handles.hitTest(rotation, host: host), "rotation bead")
+        XCTAssertFalse(handles.hitTest(CGPoint(x: rotation.x, y: rotation.y - 23), host: host), "above the rotation bead")
         XCTAssertFalse(handles.hitTest(CGPoint(x: 500, y: 700), host: host), "elsewhere on the page")
         h.session.readOnly = true
         XCTAssertFalse(handles.hitTest(CGPoint(x: 180, y: 245), host: host), "read-only")
@@ -527,7 +555,8 @@ final class FeatTransformTests: XCTestCase {
         XCTAssertEqual(handles.hovered, .corner(0))
         handles.hover(sample(page1, 180, 245), host: host)
         XCTAssertNil(handles.hovered, "the body has no hover wash")
-        handles.hover(sample(page1, 180, 176, pencil: true), host: host)
+        let rotation = try XCTUnwrap(handles.layout).rotation
+        handles.hover(sample(page1, Double(rotation.x), Double(rotation.y), pencil: true), host: host)
         XCTAssertEqual(handles.hovered, .rotate, "a hovering Pencil too")
         handles.hover(nil, host: host)
         XCTAssertNil(handles.hovered)
@@ -594,12 +623,15 @@ final class FeatTransformTests: XCTestCase {
         let host = FakeCanvasHost(h)
         let handles = try makeHandles(h, host)
         h.session.selection = Selection(doc: doc, page: page1, items: [Fixtures.shapeID])
-        XCTAssertTrue(handles.hitTest(CGPoint(x: 180, y: 176), host: host))
-        XCTAssertEqual(handles.layout?.target(at: CGPoint(x: 180, y: 176)), .rotate)
+        handles.canvasDidChange(host)
+        let rotation = try XCTUnwrap(handles.layout).rotation
+        XCTAssertTrue(handles.hitTest(rotation, host: host))
+        XCTAssertEqual(handles.layout?.target(at: rotation), .rotate)
         // The bead sits straight above the centre (180, 245); turning it 20° clockwise with Shift lands on 15°.
         let a = -70 * Double.pi / 180
-        let end = sample(page1, 180 + 69 * cos(a), 245 + 69 * sin(a), [.shift])
-        handles.touchesBegan(sample(page1, 180, 176), host: host)
+        let radius = Double(245 - rotation.y)
+        let end = sample(page1, 180 + radius * cos(a), 245 + radius * sin(a), [.shift])
+        handles.touchesBegan(sample(page1, Double(rotation.x), Double(rotation.y)), host: host)
         handles.touchesMoved([end], host: host)
         handles.touchesEnded(end, host: host)
         await handles.pendingCommit?.value

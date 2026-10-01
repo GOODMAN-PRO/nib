@@ -253,6 +253,70 @@ final class CanvasHostImpl: CanvasHost, PageTileSource {
 
     // MARK: PageTileSource
 
+    /// A bounded, low-resolution placeholder, never a bitmap of the entire world. Uses the same template API and
+    /// world anchoring as F004; boxes follow the minimap's sketch, filtered by the window's layers and hidden items.
+    func placeholderTile(page: PageID, region: Rect, scale: Double) -> CGImage? {
+        guard let record = try? app.workspace.content(documentID).livePages.first(where: { $0.id == page }),
+              record.size == nil else { return nil }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = CGFloat(min(scale, 256 / max(region.width, region.height)))
+        format.opaque = true
+        let image = UIGraphicsImageRenderer(size: region.cg.size, format: format).image { context in
+            let cg = context.cgContext
+            cg.translateBy(x: -CGFloat(region.x), y: -CGFloat(region.y))
+            var paper = record.background.color ?? RGBA.white
+            cg.setFillColor(paper.cgColor)
+            cg.fill(region.cg)
+            if let ref = record.background.template, let definition = app.content.template(ref) {
+                let params = definition.defaults.merging(ref.params) { $1 }
+                let rendered: TemplateRender
+                let origin: Point
+                if definition.renderRegion != nil {
+                    rendered = definition.renderOps(params, size: PageSize(region.width, region.height), scale: scale,
+                                                    region: region)
+                    origin = .zero
+                } else {
+                    let period = definition.metrics(for: params, size: nil).repeatPeriod ?? PageSize(240, 240)
+                    let px = period.width.isFinite ? max(1, period.width) : 240
+                    let py = period.height.isFinite ? max(1, period.height) : 240
+                    origin = Point(floor(region.minX / px) * px, floor(region.minY / py) * py)
+                    let size = PageSize(ceil((region.maxX - origin.x) / px) * px,
+                                        ceil((region.maxY - origin.y) / py) * py)
+                    rendered = definition.renderOps(params, size: size, scale: scale, region: nil)
+                }
+                paper = rendered.paper
+                cg.setFillColor(paper.cgColor)
+                cg.fill(region.cg)
+                rendered.display.draw(in: cg, origin: origin, assets: app.services.assets, doc: documentID)
+            } else if record.background.template?.id == TemplateIDs.whiteboardDots {
+                // Templates are optional in the contracts. Keep the default board readable while they are absent.
+                let spacing = 20 / pow(2, floor(log2(max(scale, 0.001) / 2)))
+                let grid = Rect(x: floor(region.x / spacing) * spacing, y: floor(region.y / spacing) * spacing,
+                                width: region.width + spacing, height: region.height + spacing)
+                DisplayList(ops: [DisplayOp(op: .dots, rect: grid, fill: RGBA.black.withAlpha(0.18),
+                                           spacing: spacing, radius: 1.6 / scale)]).draw(in: cg)
+            }
+            let items = (try? app.workspace.items(documentID, page: page)) ?? []
+            let hidden = hiddenItems[page] ?? []
+            // Board paper can be dark independently of the UI theme.
+            let brightness = 0.2126 * Double(paper.r) + 0.7152 * Double(paper.g) + 0.0722 * Double(paper.b)
+            let ink = brightness < 128 ? RGBA.white : RGBA.black
+            cg.setFillColor(ink.withAlpha(0.12).cgColor)
+            cg.setStrokeColor(ink.withAlpha(0.45).cgColor)
+            cg.setLineWidth(CGFloat(1 / scale))
+            for item in items where visibleLayers.contains(item.layer) && !hidden.contains(item.id) {
+                // Replay must not reveal items that have not appeared yet.
+                if let replay = session.replay, replay.mode == .reveal, let stroke = item.stroke,
+                   stroke.t0 > replay.time { continue }
+                let rect = app.content.paintBounds(for: item)
+                guard rect.intersects(region) else { continue }
+                cg.fill(rect.cg)
+                cg.stroke(rect.cg)
+            }
+        }
+        return image.cgImage
+    }
+
     func renderTile(page: PageID, region: Rect?, scale: Double) async throws -> CGImage {
         guard let renderer = app.services.renderer else { throw NibError.unavailable("page renderer") }
         var request = RenderRequest(doc: documentID, page: page, region: region, scale: scale, layers: visibleLayers,

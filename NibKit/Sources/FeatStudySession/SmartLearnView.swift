@@ -18,11 +18,13 @@ struct StudySummaryView: View {
                 .font(NibFont.emptyTitle)
             if model.liveCards.isEmpty {
                 Text(String(localized: "Add cards in the study set editor to begin."))
-            } else if smartLearn {
+            } else {
                 Text(String(localized: "Reviewed: \(model.reviewed.count)"))
-                Text(String(localized: "Due tomorrow: \(dueTomorrow)"))
-                if let next = model.nextReview {
-                    Text(String(localized: "Next review: \(Date(timeIntervalSince1970: max(next, model.runtime.now())).formatted(date: .abbreviated, time: .shortened))"))
+                if smartLearn {
+                    Text(String(localized: "Due tomorrow: \(dueTomorrow)"))
+                    if let next = model.nextReview {
+                        Text(String(localized: "Next review: \(Date(timeIntervalSince1970: max(next, model.runtime.now())).formatted(date: .abbreviated, time: .shortened))"))
+                    }
                 }
                 if !model.hardest.isEmpty {
                     Text(String(localized: "Hardest cards")).font(NibFont.headline)

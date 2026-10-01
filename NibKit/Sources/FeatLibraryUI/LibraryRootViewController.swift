@@ -154,6 +154,11 @@ final class LibraryViewModel: ObservableObject {
         // Query the live registry every time, including descriptors replaced under the same id/generation change.
         app.ui.visibleChromeOverlays(context)
     }
+    func libraryBanner(isCompact: Bool) -> AnyView? {
+        // F070 contributes content through the service escape hatch, without a feature-module dependency.
+        let makeBanner = app.services.get("syncui.libraryBanner", as: (@MainActor (ChromeContext) -> AnyView?).self)
+        return makeBanner?(chromeContext(isCompact: isCompact))
+    }
     func chromeAnchor(_ overlay: ChromeOverlayDescriptor, context: ChromeContext) -> CGRect? {
         // There is no page canvas in a library window; only window anchors can be resolved here.
         guard case .window(let rect)? = overlay.anchor?(context) else { return nil }
@@ -386,72 +391,92 @@ final class LibraryRootViewController: UIViewController {
 
 struct LibraryRootView: View {
     @ObservedObject var model: LibraryViewModel
-    @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var targets: [String: CGRect] = [:]
+    @State private var chromeFrames: [String: CGRect] = [:]
     var body: some View {
         GeometryReader { geometry in
             let compact = geometry.size.width < NibMetrics.compactBreakpoint
             let inlineSidebar = geometry.size.width >= NibMetrics.librarySidebarBreakpoint
-            NibDropletContainer {
+            ZStack {
                 let context = model.chromeContext(isCompact: compact)
                 let overlays = model.visibleChromeOverlays(context)
                 HStack(spacing: 0) {
                     if inlineSidebar || (compact && model.sidebarVisible) {
-                        sidebar.frame(width: inlineSidebar ? NibMetrics.sidebarWidth : nil)
+                        sidebar(compact: compact).frame(width: inlineSidebar ? NibMetrics.sidebarWidth : nil)
                     }
                     if !compact || !model.sidebarVisible {
-                        if compact { NavigationStack { content }.frame(maxWidth: .infinity, maxHeight: .infinity) }
-                        else { content.frame(maxWidth: .infinity, maxHeight: .infinity) }
+                        if compact { NavigationStack { content(compact: compact) }.frame(maxWidth: .infinity, maxHeight: .infinity) }
+                        else { content(compact: compact).frame(maxWidth: .infinity, maxHeight: .infinity) }
                     }
                 }
                 .background(NibColor.background)
                 if !inlineSidebar && !compact && model.sidebarVisible {
-                    HStack { sidebar.frame(width: NibMetrics.sidebarWidth); Spacer() }
+                    HStack { sidebar(compact: false).frame(width: NibMetrics.sidebarWidth); Spacer() }
                         .background(NibColor.background.opacity(NibOpacity.disabled).onTapGesture { model.setView(["sidebar": false]) })
                 }
-                LibraryChromeOverlayLayout {
-                    if !inlineSidebar && (!compact || !model.sidebarVisible) {
-                        NibIconButton(.sidebar, label: String(localized: "Show Library")) { model.setView(["sidebar": true]) }
-                            .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .topLeading, isControls: true))
-                    }
-                    if !compact {
-                        chrome(compact: false)
-                            .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .topTrailing, isControls: true))
-                    }
-                    if model.selection.isSelecting {
-                        selectionBar
-                            .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .bottom, isControls: true))
-                    }
-                    if compact && !model.sidebarVisible && !model.selection.isSelecting {
-                        chrome(compact: true)
-                            .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .bottomTrailing, isControls: true))
-                    }
-                    ForEach(overlays, id: \.id) { overlay in
-                        let anchor = model.chromeAnchor(overlay, context: context)
-                        if overlay.placement != .anchored || anchor != nil {
-                            LibraryChromeOverlaySurface(overlay: overlay, context: context)
-                                .layoutValue(key: LibraryChromeOverlaySlot.self,
-                                             value: .init(placement: overlay.placement, anchor: anchor))
-                                .zIndex(Double(overlay.order))
+                NibDropletContainer {
+                    ZStack {
+                        LibraryChromeOverlayLayout(inlineSidebar: inlineSidebar, compact: compact,
+                                                  titleBottom: compact && model.sidebarVisible
+                                                    ? chromeFrames["title"]?.maxY ?? NibSpacing.x6 + NibSpacing.l
+                                                    : NibSpacing.x6 + NibSpacing.l) {
+                            if !inlineSidebar && (!compact || !model.sidebarVisible) {
+                                NibIconButton(.sidebar, label: String(localized: "Show Library")) { model.setView(["sidebar": true]) }
+                                    .libraryChromeFrame("top.sidebar")
+                                    .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .topLeading, isControls: true))
+                            }
+                            if !compact {
+                                chrome(compact: false)
+                                    .libraryChromeFrame("top.controls")
+                                    .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .topTrailing, isControls: true))
+                            }
+                            if model.selection.isSelecting {
+                                selectionBar
+                                    .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .bottom, isControls: true))
+                            }
+                            if compact && !model.sidebarVisible && !model.selection.isSelecting {
+                                chrome(compact: true)
+                                    .layoutValue(key: LibraryChromeOverlaySlot.self, value: .init(placement: .bottomTrailing, isControls: true))
+                            }
+                            ForEach(overlays, id: \.id) { overlay in
+                                let anchor = model.chromeAnchor(overlay, context: context)
+                                if overlay.placement != .anchored || anchor != nil {
+                                    LibraryChromeOverlaySurface(overlay: overlay, context: context)
+                                        .libraryChromeFrame((overlay.placement.isLibraryTop ? "top." : "overlay.") + overlay.id)
+                                        .layoutValue(key: LibraryChromeOverlaySlot.self,
+                                                     value: .init(placement: overlay.placement, anchor: anchor,
+                                                                  isBanner: overlay.surface == .none && [.topLeading, .top].contains(overlay.placement)))
+                                        .layoutValue(key: LibraryChromeBannerFrame.self, value: chromeFrames["banner"])
+                                        .zIndex(Double(overlay.order))
+                                }
+                            }
                         }
+                        .padding(NibSpacing.l)
+                        LibraryBuds(model: model)
+                        NibReflowCarrier(model.reflow, id: "library.card.carrier") { ref in
+                            LibraryStackedCarrier(ref: ref, model: model)
+                        }
+                        NibReflowCarrier(model.folderReflow, id: "library.folder.carrier") { ref in
+                            LibraryStackedCarrier(ref: ref, model: model)
+                        }
+                        LibraryDragMonitor(model: model, targets: targets)
+                        NibFloatingLayer(host: model.floating)
+                            .nibToast(model.floating.toastBinding)
                     }
                 }
-                .padding(NibSpacing.l)
-                LibraryBuds(model: model)
-                NibReflowCarrier(model.reflow, id: "library.card.carrier") { ref in
-                    LibraryStackedCarrier(ref: ref, model: model)
-                }
-                NibReflowCarrier(model.folderReflow, id: "library.folder.carrier") { ref in
-                    LibraryStackedCarrier(ref: ref, model: model)
-                }
-                LibraryDragMonitor(model: model, targets: targets)
-                NibFloatingLayer(host: model.floating)
+                .environment(\.horizontalSizeClass, compact ? .compact : .regular)
             }
+            .coordinateSpace(name: "library.chrome")
             .onPreferenceChange(LibraryTargets.self) { targets = $0 }
-
-            .nibToast(model.floating.toastBinding)
+            .onPreferenceChange(LibraryChromeFrames.self) { frames in
+                chromeFrames = frames
+                for id in ["library.app", "library.sort"] {
+                    if let frame = frames["anchor." + id] { model.floating.setAnchor(id, rect: frame) }
+                    else { model.floating.removeAnchor(id) }
+                }
+            }
             .nibLiquidMode(model.liquidMode)
-            .sheet(item: sheetBinding) { panel in LibraryPanelView(panel: panel, model: model) }
+            .nibSheet(item: sheetBinding) { panel in LibraryPanelView(panel: panel, model: model) }
             .fullScreenCover(item: fullScreenBinding) { panel in LibraryPanelView(panel: panel, model: model) }
             .confirmationDialog(model.confirmation?.title ?? "", isPresented: Binding(get: { model.confirmation != nil }, set: { if !$0 { model.confirmation = nil } }), titleVisibility: .visible) {
                 if let confirmation = model.confirmation {
@@ -471,9 +496,17 @@ struct LibraryRootView: View {
     private var fullScreenBinding: Binding<LibraryPanel?> {
         Binding(get: { model.modal?.presentation == .fullScreen ? model.modal : nil }, set: { if $0 == nil, let modal = model.modal { model.setView(["panel": .string(modal.id), "close": true]) } })
     }
-    private var sidebar: some View {
+    private var topChromeBottom: CGFloat {
+        chromeFrames.filter { $0.key.hasPrefix("top.") }.values.map(\.maxY).max() ?? 0
+    }
+    private var compactChromeHeight: CGFloat {
+        max(0, topChromeBottom - (chromeFrames["title"]?.maxY ?? 0))
+    }
+    private func sidebar(compact: Bool) -> some View {
         VStack(alignment: .leading, spacing: NibSpacing.l) {
             Text(String(localized: "Library")).font(NibFont.display).foregroundStyle(NibColor.label).padding(.top, NibSpacing.x6)
+                .libraryChromeFrame(compact ? "title" : "sidebar.title")
+            if compact && compactChromeHeight > 0 { Color.clear.frame(height: compactChromeHeight) }
             ScrollView {
                 VStack(spacing: NibSpacing.xs) {
                     Button { model.setView(["panel": "documents", "folder": "lib", "sidebar": false]) } label: {
@@ -499,49 +532,67 @@ struct LibraryRootView: View {
             HStack {
                 Text(model.syncText).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
                 Spacer()
-                NibIconButton(.settings, label: String(localized: "App Menu")) { model.setView(["menu": "app"]) }.nibBudAnchor("library.app")
+                NibIconButton(.settings, label: String(localized: "App Menu")) { model.setView(["menu": "app"]) }
+                    .libraryChromeFrame("anchor.library.app")
             }
         }.padding(NibSpacing.l).background(NibColor.backgroundSecondary).libraryDropTarget("sidebar")
     }
-    @ViewBuilder private var content: some View {
+    @ViewBuilder private func content(compact: Bool) -> some View {
         if let tab = model.tab { LibraryPanelView(panel: tab, model: model) }
         else {
-            VStack(alignment: .leading, spacing: NibSpacing.s) {
-                HStack {
-                    Text(model.title).font(NibFont.display).foregroundStyle(NibColor.label)
-                    Spacer()
-                    if sizeClass == .compact {
-                        NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }.nibBudAnchor("library.sort")
-                        NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) { model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"]) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: NibSpacing.s) {
+                    if let banner = model.libraryBanner(isCompact: compact) {
+                        banner.frame(maxWidth: .infinity, alignment: .leading)
                     }
-                }
-                Text(LibraryRow.itemCount(model.visibleRows.count) + " · " + model.sort.title).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
-                ScrollView(.horizontal) {
-                    HStack(spacing: NibSpacing.s) {
-                        breadcrumb(String(localized: "Documents"), ref: "lib")
-                        ForEach(model.breadcrumbs) { row in
-                            Image(nib: .forward).foregroundStyle(NibColor.labelTertiary).accessibilityHidden(true)
-                            breadcrumb(row.name, ref: row.ref)
+                    HStack {
+                        Text(model.title).font(NibFont.display).foregroundStyle(NibColor.label)
+                        Spacer()
+                        if compact {
+                            NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }
+                                .libraryChromeFrame("anchor.library.sort")
+                            NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) { model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"]) }
                         }
                     }
+                    .libraryChromeFrame("title")
+                    Text(LibraryRow.itemCount(model.visibleRows.count) + " · " + model.sort.title).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
+                    ScrollView(.horizontal) {
+                        HStack(spacing: NibSpacing.s) {
+                            breadcrumb(String(localized: "Documents"), ref: "lib")
+                            ForEach(model.breadcrumbs) { row in
+                                Image(nib: .forward).foregroundStyle(NibColor.labelTertiary).accessibilityHidden(true)
+                                breadcrumb(row.name, ref: row.ref)
+                            }
+                        }
+                    }
+                    if let error = model.error {
+                        NibBanner(error, action: NibAction(String(localized: "Try Again")) { model.setView(["folder": model.folderRef]) })
+                            .libraryChromeFrame("banner")
+                    }
+                    LibraryGridView(model: model)
+                        .environment(\.horizontalSizeClass, compact ? .compact : .regular)
+                        // The library owns vertical scrolling so its header stays in the same content flow.
+                        .scrollDisabled(true)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                if let error = model.error {
-                    NibBanner(error, action: NibAction(String(localized: "Try Again")) { model.setView(["folder": model.folderRef]) })
-                }
-                LibraryGridView(model: model)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, compact ? NibSpacing.l : NibMetrics.libraryGutter)
+                .padding(.top, max(NibSpacing.x6 + NibSpacing.l, topChromeBottom + NibMetrics.minimumRestingGap))
             }
-            .padding(.horizontal, sizeClass == .compact ? NibSpacing.l : NibMetrics.libraryGutter)
-            .padding(.top, NibSpacing.x6 + NibSpacing.l)
         }
     }
     private func breadcrumb(_ title: String, ref: String) -> some View {
         NibButton(title, kind: .plain) { model.setView(["folder": .string(ref)]) }.libraryDropTarget("breadcrumb:" + ref)
     }
-    private func chrome(compact: Bool) -> some View {
+    func chrome(compact: Bool) -> some View {
         HStack(spacing: NibSpacing.l) {
-            NibBarGroup(id: "library.controls") {
-                NibIconButton(.search, label: String(localized: "Search Library")) { model.perform(CommandIDs.searchOpen) }
-                if !compact {
+            if compact {
+                NibDropletButton(id: "library.controls", symbol: .search, label: String(localized: "Search Library")) {
+                    model.perform(CommandIDs.searchOpen)
+                }
+            } else {
+                NibBarGroup(id: "library.controls") {
+                    NibIconButton(.search, label: String(localized: "Search Library")) { model.perform(CommandIDs.searchOpen) }
                     NibIconButton(.sort, label: String(localized: "Sort and View")) { model.setView(["menu": "sort"]) }.nibBudAnchor("library.sort")
                     NibIconButton(.select, label: String(localized: "Select Items"), isOn: model.selection.isSelecting) { model.setView(["selection": model.selection.isSelecting ? "clear" : "begin"]) }
                 }
@@ -557,26 +608,60 @@ struct LibraryRootView: View {
     }
 }
 
-private struct LibraryChromeOverlaySlot: LayoutValueKey {
+private struct LibraryChromeFrames: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, frame in frame })
+    }
+}
+
+private extension View {
+    func libraryChromeFrame(_ id: String) -> some View {
+        background {
+            GeometryReader { geometry in
+                Color.clear.preference(key: LibraryChromeFrames.self, value: [id: geometry.frame(in: .named("library.chrome"))])
+            }
+        }
+    }
+}
+
+private extension ChromePlacement {
+    var isLibraryTop: Bool { [.topLeading, .top, .topTrailing].contains(self) }
+}
+
+private struct LibraryChromeBannerFrame: LayoutValueKey {
+    static let defaultValue: CGRect? = nil
+}
+
+struct LibraryChromeOverlaySlot: LayoutValueKey {
     struct Value {
         var placement: ChromePlacement
         var isControls = false
         var anchor: CGRect?
+        var isBanner = false
     }
     static let defaultValue = Value(placement: .center)
 }
 
 /// One layout keeps every descriptor a sibling, so registry order also determines z-order across placements.
-private struct LibraryChromeOverlayLayout: Layout {
+struct LibraryChromeOverlayLayout: Layout {
+    var inlineSidebar: Bool
+    var compact: Bool
+    var titleBottom: CGFloat
+
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         proposal.replacingUnspecifiedDimensions()
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         let gap = NibMetrics.minimumRestingGap
-        let offer = ProposedViewSize(width: bounds.width, height: bounds.height)
+        let contentBounds = CGRect(x: bounds.minX + (inlineSidebar ? NibMetrics.sidebarWidth : 0), y: bounds.minY,
+                                   width: max(0, bounds.width - (inlineSidebar ? NibMetrics.sidebarWidth : 0)), height: bounds.height)
+        let offer = ProposedViewSize(width: contentBounds.width, height: bounds.height)
         var sizes = subviews.map { $0.sizeThatFits(offer) }
         let groups = Dictionary(grouping: subviews.indices) { subviews[$0][LibraryChromeOverlaySlot.self].placement }
+        var banners = subviews.compactMap { $0[LibraryChromeBannerFrame.self] }
+        var topStacks = CGRect.null
         // Leave the top-leading banner room beside the sidebar button and the New/status group.
         let trailing = groups[.topTrailing] ?? []
         let trailingControls = trailing.filter { subviews[$0][LibraryChromeOverlaySlot.self].isControls }
@@ -587,45 +672,72 @@ private struct LibraryChromeOverlayLayout: Layout {
         let leading = groups[.topLeading] ?? []
         let leadingWidth = leading.filter { subviews[$0][LibraryChromeOverlaySlot.self].isControls }
             .reduce(CGFloat(0)) { $0 + sizes[$1].width + gap }
+        let availableLeadingWidth = contentBounds.width - trailingWidth - leadingWidth - gap
+        let stackLeading = compact || availableLeadingWidth < NibMetrics.folderTileMinWidth
         for index in leading where !subviews[index][LibraryChromeOverlaySlot.self].isControls {
-            sizes[index] = subviews[index].sizeThatFits(.init(width: max(0, bounds.width - trailingWidth - leadingWidth - gap),
+            sizes[index] = subviews[index].sizeThatFits(.init(width: max(0, stackLeading ? contentBounds.width : availableLeadingWidth),
                                                             height: bounds.height))
         }
-        for placement in ChromePlacement.allCases {
+        // Resolve both edge stacks before the centred HUDs, independent of the enum's declaration order.
+        let placements: [ChromePlacement] = [.topLeading, .topTrailing, .top] + ChromePlacement.allCases.filter { !$0.isLibraryTop }
+        for placement in placements {
             let indices = groups[placement] ?? []
             let controls = indices.first { subviews[$0][LibraryChromeOverlaySlot.self].isControls }
-            let overlays = indices.filter { !subviews[$0][LibraryChromeOverlaySlot.self].isControls }
+            let descriptors = indices.filter { !subviews[$0][LibraryChromeOverlaySlot.self].isControls }
+            let overlays = descriptors.filter { subviews[$0][LibraryChromeOverlaySlot.self].isBanner }
+                + descriptors.filter { !subviews[$0][LibraryChromeOverlaySlot.self].isBanner }
             let controlSize = controls.map { sizes[$0] } ?? .zero
             let overlayWidth = overlays.map { sizes[$0].width }.max() ?? 0
             let bottom = [.bottomLeading, .bottom, .bottomTrailing].contains(placement)
             let centred = [.leading, .center, .trailing].contains(placement)
             let totalHeight = overlays.reduce(CGFloat(0)) { $0 + sizes[$1].height }
                 + gap * CGFloat(max(0, overlays.count - 1))
-            var y = bottom ? bounds.maxY : centred ? bounds.midY - totalHeight / 2 : bounds.minY
+            let topY = compact ? max(bounds.minY, titleBottom + gap) : bounds.minY
+            var y = bottom ? bounds.maxY : centred ? bounds.midY - totalHeight / 2 : topY
+            if placement == .top, !topStacks.isNull { y = max(y, topStacks.maxY + gap) }
+            if placement == .topLeading && stackLeading {
+                let controlBottom = max(controlSize.height, trailingControls.map { sizes[$0].height }.max() ?? 0)
+                if controlBottom > 0 { y += controlBottom + gap }
+            }
             if let controls {
-                var x = horizontalOrigin(placement, width: controlSize.width, in: bounds)
+                var x = horizontalOrigin(placement, width: controlSize.width, in: placement.isLibraryTop ? contentBounds : bounds)
                 if [.topTrailing, .bottomTrailing].contains(placement), !overlays.isEmpty {
                     // Status is on the right of New, and its entire stack reserves space clear of the controls.
                     x -= overlayWidth + gap
                 }
-                subviews[controls].place(at: .init(x: x, y: bottom ? bounds.maxY - controlSize.height : bounds.minY),
+                let rect = avoidingBanners(CGRect(x: x, y: bottom ? bounds.maxY - controlSize.height : topY,
+                                                 width: controlSize.width, height: controlSize.height), banners: banners, bottom: bottom)
+                subviews[controls].place(at: rect.origin,
                                          anchor: .topLeading, proposal: .init(controlSize))
+                if placement.isLibraryTop { topStacks = topStacks.union(rect) }
                 if placement == .bottom { y -= controlSize.height + gap }
             }
             for index in overlays {
                 let size = sizes[index]
-                var x = horizontalOrigin(placement, width: size.width, in: bounds)
-                if placement == .topLeading, controls != nil { x += controlSize.width + gap }
+                var x = horizontalOrigin(placement, width: size.width, in: placement.isLibraryTop ? contentBounds : bounds)
+                if placement == .topLeading, controls != nil && !stackLeading { x += controlSize.width + gap }
                 if bottom { y -= size.height }
                 if placement == .anchored, let anchor = subviews[index][LibraryChromeOverlaySlot.self].anchor {
                     x = min(max(anchor.midX - size.width / 2, bounds.minX), max(bounds.minX, bounds.maxX - size.width))
                     let below = anchor.maxY + NibMetrics.popoverGap
                     y = below + size.height <= bounds.maxY ? below : max(bounds.minY, anchor.minY - NibMetrics.popoverGap - size.height)
                 }
-                subviews[index].place(at: .init(x: x, y: y), anchor: .topLeading, proposal: .init(size))
-                y += bottom ? -gap : size.height + gap
+                let rect = avoidingBanners(CGRect(origin: .init(x: x, y: y), size: size), banners: banners, bottom: bottom)
+                subviews[index].place(at: rect.origin, anchor: .topLeading, proposal: .init(size))
+                if subviews[index][LibraryChromeOverlaySlot.self].isBanner { banners.append(rect) }
+                if placement.isLibraryTop { topStacks = topStacks.union(rect) }
+                y = bottom ? rect.minY - gap : rect.maxY + gap
             }
         }
+    }
+
+    private func avoidingBanners(_ proposed: CGRect, banners: [CGRect], bottom: Bool) -> CGRect {
+        var frame = proposed
+        while let banner = banners.first(where: { $0.intersects(frame) }) {
+            frame.origin.y = bottom ? banner.minY - NibMetrics.minimumRestingGap - frame.height
+                : banner.maxY + NibMetrics.minimumRestingGap
+        }
+        return frame
     }
 
     private func horizontalOrigin(_ placement: ChromePlacement, width: CGFloat, in bounds: CGRect) -> CGFloat {
@@ -740,12 +852,14 @@ struct LibraryConfirmation {
 @MainActor
 final class LibraryCoverCache: ObservableObject {
     let images = NSCache<NSString, UIImage>()
+    private let subtitles = NSCache<NSString, NSString>()
     @Published private(set) var revisions: [DocumentID: Int] = [:]
     private var keys: [DocumentID: Set<String>] = [:]
     private var subscription: EventSubscription?
     init() {
         images.countLimit = NibMetrics.libraryCoverCacheCount
         images.totalCostLimit = NibMetrics.libraryCoverCacheBytes
+        subtitles.countLimit = NibMetrics.libraryCoverCacheCount
     }
     func observe(_ events: EventBus) {
         subscription = events.subscribe { [weak self] event in
@@ -755,8 +869,23 @@ final class LibraryCoverCache: ObservableObject {
     }
     deinit { subscription?.cancel() }
     func invalidate(_ doc: DocumentID) {
-        for key in keys.removeValue(forKey: doc) ?? [] { images.removeObject(forKey: key as NSString) }
+        for key in keys.removeValue(forKey: doc) ?? [] {
+            images.removeObject(forKey: key as NSString)
+            subtitles.removeObject(forKey: key as NSString)
+        }
         revisions[doc, default: 0] += 1
+    }
+    func subtitle(_ row: LibraryRow, app: NibApp) -> String? {
+        guard row.kind == "studySet" || row.kind == "textDocument",
+              row.locked != true, app.services.lock?.isLocked(row.nodeID) != true else { return nil }
+        let key = row.ref + String(row.modified ?? 0)
+        if let cached = subtitles.object(forKey: key as NSString) { return cached as String }
+        // Read only a visible item's head, without opening it or retaining its content in the workspace.
+        guard let content = try? app.workspace.peekContent(row.nodeID) else { return nil }
+        let subtitle = row.subtitle(content: content)
+        keys[row.nodeID, default: []].insert(key)
+        subtitles.setObject(subtitle as NSString, forKey: key as NSString)
+        return subtitle
     }
     func thumbnail(_ row: LibraryRow, app: NibApp) async -> UIImage? {
         guard row.locked != true, app.services.lock?.isLocked(row.nodeID) != true else { return nil }

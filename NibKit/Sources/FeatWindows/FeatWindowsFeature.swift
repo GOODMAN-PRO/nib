@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import NibContracts
 import NibDesign
 
@@ -17,6 +18,14 @@ public enum FeatWindowsFeature: NibFeature {
         app.commands.register(TabClose.self)
         app.commands.register(TabCloseOthers.self)
         app.commands.register(TabSelect.self)
+
+        app.settings.declare(WindowSettings.showTabs,
+                             summary: "Show document tabs when more than one document is open. Off by default.",
+                             owner: id, schema: .bool())
+        app.ui.settingsPages.register(SettingsPageDescriptor(
+            id: "windows.settings.tabs", title: String(localized: "Tabs"), icon: "rectangle.on.rectangle",
+            section: .editing, order: 20, owner: id,
+            makeView: { app in AnyView(WindowTabsSettingsView(app: app)) }))
 
         app.settings.declare(WindowSettings.lastSession,
                              summary: "Tabs, document and page of the frontmost window when Nib last went to the background; a cold launch reopens that document.",

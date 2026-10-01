@@ -17,7 +17,7 @@ final class FeatCanvasTests: XCTestCase {
     /// Opens the editor the feature registered for `doc`'s kind in a window-sized view, laid out.
     @discardableResult
     private func makeCanvas(_ h: Harness, doc: DocumentID = Fixtures.docID, page: PageID? = nil,
-                            input: ((CanvasHostImpl) -> Void)? = nil) throws -> CanvasViewController {
+                            input: ((CanvasHostImpl) -> Void)? = nil, size: CGSize? = nil) throws -> CanvasViewController {
         let content = try h.app.workspace.content(doc)
         h.session.document = doc
         h.session.page = page ?? content.livePages.first?.id
@@ -28,7 +28,7 @@ final class FeatCanvasTests: XCTestCase {
         defer { CanvasInputHooks.install = saved }
         let vc = try XCTUnwrap(descriptor.make(doc, h.session, h.app) as? CanvasViewController)
         vc.loadViewIfNeeded()
-        vc.view.frame = CGRect(origin: .zero, size: windowSize)
+        vc.view.frame = CGRect(origin: .zero, size: size ?? windowSize)
         vc.view.setNeedsLayout()
         vc.view.layoutIfNeeded()
         if !vc.didInitialLayout { vc.viewDidLayoutSubviews() }
@@ -949,6 +949,66 @@ final class FeatCanvasTests: XCTestCase {
 
     // MARK: Whiteboard
 
+    /// Pixel coverage inside the viewport catches a world-origin error that tile-key and minimap checks cannot.
+    private func boardSnapshot(_ vc: CanvasViewController) -> UIImage {
+        vc.view.layoutIfNeeded()
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: vc.view.bounds.size, format: format).image { context in
+            vc.view.layer.render(in: context.cgContext)
+        }
+    }
+
+    private func boardPixel(_ image: UIImage, at point: Point, canvas vc: CanvasViewController,
+                            file: StaticString = #filePath, line: UInt = #line) throws -> RGBA {
+        let position = vc.scrollView.convert(vc.host.viewPoint(point, page: Fixtures.boardID), to: vc.view)
+        XCTAssertTrue(vc.view.bounds.contains(position), "sample must be inside the viewport", file: file, line: line)
+        return try XCTUnwrap(NibSnapshot.pixel(image, at: position), file: file, line: line)
+    }
+
+    func testWhiteboardViewportSnapshotShowsItemsAndDotsBeforeTilesArrive() throws {
+        for size in [windowSize, CGSize(width: 390, height: 844)] {
+            let h = Harness(features: [FeatCanvasFeature.self])
+            let vc = try makeCanvas(h, doc: Fixtures.whiteboardID, size: size)
+            defer { vc.closeCanvas() }
+            let view = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
+            XCTAssertEqual(vc.zoom, 1, accuracy: 1e-9)
+            XCTAssertFalse(view.tileKeys.isEmpty, "opening at unchanged 100 % must request visible tiles")
+            XCTAssertFalse(view.hasShownContent, "this snapshot precedes the first asynchronous render")
+            let image = boardSnapshot(vc)
+            let paper = try boardPixel(image, at: Point(235, 175), canvas: vc)
+            let item = try boardPixel(image, at: Point(105, 65), canvas: vc)
+            let dot = try boardPixel(image, at: Point(240, 180), canvas: vc)
+            XCTAssertNotEqual(item, paper, "a pending board must show the item sketch, never empty paper")
+            XCTAssertNotEqual(dot, paper, "the dot grid must be visible before tiles arrive")
+        }
+    }
+
+    func testWhiteboardViewportSnapshotShowsRenderedItemsAfterZoomAndWorldGrowth() async throws {
+        for size in [windowSize, CGSize(width: 390, height: 844)] {
+            let h = Harness(features: [FeatCanvasFeature.self])
+            h.app.services.renderer = BoardSnapshotRenderer()
+            let vc = try makeCanvas(h, doc: Fixtures.whiteboardID, size: size)
+            defer { vc.closeCanvas() }
+            func assertRenderedItem() async throws {
+                let view = try XCTUnwrap(vc.scrollView.pageViews[Fixtures.boardID])
+                await waitUntil("whiteboard tiles") { view.isSettled && view.hasShownContent }
+                let pixel = try boardPixel(boardSnapshot(vc), at: Point(105, 65), canvas: vc)
+                XCTAssertGreaterThan(Int(pixel.g), Int(pixel.r) + 40, "the rendered item must occupy the viewport")
+            }
+            try await assertRenderedItem()
+            _ = try await h.run("view.zoom", ["scale": 0.5])
+            try await assertRenderedItem()
+            _ = try await h.run("view.zoom", ["actual": true])
+            try await assertRenderedItem()
+            let world = try XCTUnwrap(vc.board).rect
+            _ = try await h.run("view.scrollBy", ["dx": -70_000, "dy": 0])
+            XCTAssertLessThan(try XCTUnwrap(vc.board).rect.minX, world.minX)
+            _ = try await h.run("view.zoom", ["fit": true])
+            try await assertRenderedItem()
+        }
+    }
+
     func testWhiteboardIsOneInfiniteWorldWithBoardZoomLimits() async throws {
         let h = Harness(features: [FeatCanvasFeature.self])
         let vc = try makeCanvas(h, doc: Fixtures.whiteboardID)
@@ -1585,6 +1645,30 @@ private final class ShiftProcessor: StrokeProcessor {
 @MainActor
 private final class DropProcessor: StrokeProcessor {
     func process(_ stroke: inout Stroke, page: PageID, session: EditorSession) -> Bool { false }
+}
+
+/// World-coordinate test tiles with a coloured item at the fixture shape, so paper and placeholders cannot pass
+/// the rendered-content snapshot assertion. No dependency on another feature's drawers.
+private final class BoardSnapshotRenderer: PageRenderer {
+    func render(_ request: RenderRequest) async throws -> RenderResult {
+        let region = request.region ?? Rect(x: 0, y: 0, width: 200, height: 120)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = CGFloat(request.scale)
+        format.opaque = true
+        let image = UIGraphicsImageRenderer(size: region.cg.size, format: format).image { context in
+            let cg = context.cgContext
+            cg.translateBy(x: -CGFloat(region.x), y: -CGFloat(region.y))
+            cg.setFillColor(RGBA.white.cgColor)
+            cg.fill(region.cg)
+            cg.setFillColor(RGBA(30, 170, 70).cgColor)
+            cg.fill(CGRect(x: 0, y: 0, width: 200, height: 120))
+        }
+        return RenderResult(image: image.cgImage!, region: region, scale: request.scale)
+    }
+
+    func thumbnail(doc: DocumentID, page: PageID, maxPixelSize: Int) async -> CGImage? { nil }
+    func invalidate(doc: DocumentID, page: PageID, rect: Rect?) {}
+    func purgeCaches() {}
 }
 
 /// Records every render request (renders run concurrently, off the main actor) and returns a tiny bitmap.

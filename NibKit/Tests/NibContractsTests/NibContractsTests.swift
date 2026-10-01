@@ -1,9 +1,35 @@
 import XCTest
+import SwiftUI
 import NibContracts
 import NibTesting
 
 @MainActor
 final class NibContractsTests: XCTestCase {
+    func testAfterTitleStatusIsOptionalAndReceivesTheWindowContext() throws {
+        let h = Harness()
+        var item = ToolbarItemDescriptor(id: "test.status", title: "Client", icon: "circle",
+                                         group: .navLeading, order: 40, owner: "test", command: "test.details")
+        XCTAssertNil(item.compactStatus, "existing descriptors keep their icon rendering")
+        XCTAssertEqual(item.navSlot, .beforeTitle)
+        XCTAssertEqual(item.command, "test.details")
+        item.navSlot = .afterTitle
+        var seenContext: ChromeContext?
+        item.compactStatus = { context in
+            seenContext = context
+            return context.kind == nil ? nil : AnyView(Text("Client"))
+        }
+        h.app.ui.toolbar.register(item)
+        let status = try XCTUnwrap(h.app.ui.toolbar.get(item.id))
+        XCTAssertEqual(status.navSlot, .afterTitle)
+        XCTAssertNotNil(status.compactStatus?(ChromeContext(app: h.app, session: h.session,
+                                                          kind: .notebook, isCompact: true)))
+        XCTAssertTrue(seenContext?.session === h.session)
+        XCTAssertEqual(seenContext?.kind, .notebook)
+        XCTAssertEqual(seenContext?.isCompact, true)
+        XCTAssertNil(status.compactStatus?(ChromeContext(app: h.app, session: h.session)),
+                     "a status provider can hide itself without changing registration")
+    }
+
     func testFractionalIndexOrdering() {
         var keys: [String] = []
         var last: String?

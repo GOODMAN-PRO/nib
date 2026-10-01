@@ -199,7 +199,7 @@ struct PluginListView: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
-        .navigationTitle(String(localized: "Plugins"))
+        .navigationBarTitleDisplayMode(.inline)
         .refreshable { await refresh() }
     }
     private func row(_ plugin: InstalledPlugin) -> some View {

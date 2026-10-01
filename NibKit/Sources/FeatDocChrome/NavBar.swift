@@ -41,11 +41,18 @@ struct NavItem: Identifiable, Equatable {
     var showsInCompactWidth = true
 }
 
+struct NavStatusItem: Identifiable, Equatable {
+    var id: String
+    var showsInCompactWidth: Bool
+}
+
 struct NavBarItems: Equatable {
     var leading: [NavItem]
     var trailing: [NavItem]
     /// Compact windows: items that moved into More.
     var overflow: [NavItem] = []
+    /// Optional status controls in the leading group, immediately after the title (contracts-v2.3).
+    var afterTitle: [NavStatusItem] = []
 }
 
 /// Builds the nav bar (D-079): leading Library, Sidebar, Search, Assistant, Read Only, Bookmark; trailing Add Page,
@@ -86,7 +93,12 @@ enum NavBarModel {
         var leading: [NavItem] = []
         var trailing: [NavItem] = []
         var features: [NavItem] = []
+        var statuses: [ToolbarItemDescriptor] = []
         for descriptor in input.registered where descriptor.group == .navLeading || descriptor.group == .navTrailing {
+            if descriptor.group == .navLeading, descriptor.navSlot == .afterTitle, descriptor.compactStatus != nil {
+                statuses.append(descriptor)
+                continue
+            }
             guard let item = navItem(for: descriptor, tool: input.tool, session: input.session) else { continue }
             features.append(item)
             if descriptor.group == .navLeading {
@@ -148,12 +160,17 @@ enum NavBarModel {
                                 action: .menu(.more)))
 
         let byOrder: (NavItem, NavItem) -> Bool = { ($0.order, $0.id) < ($1.order, $1.id) }
-        return NavBarItems(leading: leading.sorted(by: byOrder), trailing: trailing.sorted(by: byOrder))
+        let afterTitle = statuses.sorted { ($0.order, $0.id) < ($1.order, $1.id) }.map {
+            NavStatusItem(id: $0.id, showsInCompactWidth: $0.showsInCompactWidth)
+        }
+        return NavBarItems(leading: leading.sorted(by: byOrder), trailing: trailing.sorted(by: byOrder),
+                           afterTitle: afterTitle)
     }
 
     /// Compact windows (DESIGN.md §14.2, iPhone): leading keeps Library (the title joins it); trailing keeps the first
     /// feature item (Undo), the Assistant and More; everything else moves into More. Items registered for regular
-    /// widths only (`showsInCompactWidth` false) do not show at all.
+    /// widths only (`showsInCompactWidth` false) do not show at all. After-title status controls keep their slot;
+    /// their providers collapse the label to the dot using `ChromeContext.isCompact`.
     static func split(_ items: NavBarItems, compact: Bool) -> NavBarItems {
         guard compact else { return items }
         var leading: [NavItem] = []
@@ -180,7 +197,8 @@ enum NavBarModel {
             }
         }
         let trailing = [kept, assistantItem, more].compactMap { $0 }
-        return NavBarItems(leading: leading, trailing: trailing, overflow: overflow)
+        return NavBarItems(leading: leading, trailing: trailing, overflow: overflow,
+                           afterTitle: items.afterTitle.filter(\.showsInCompactWidth))
     }
 
     /// A registered nav item as the window sees it now: `resolvedParams`, `resolvedTitle`, `resolvedIcon`, and its
@@ -232,12 +250,12 @@ enum NavBarModel {
 
 // MARK: - Nav bar view
 
-/// Three Clear bar droplets: leading actions, the title (tap for the document menu) and trailing menus. In compact
-/// windows the title rides in the leading bar.
+/// Clear leading and trailing bars. The title and optional status controls share the leading bar on every width.
 struct NavBarView: View {
     let chrome: ChromeWindow
     let items: NavBarItems
     let title: String
+    let kind: DocumentKind
     let subtitle: String?
     let readOnly: Bool
     let titleHasMenu: Bool
@@ -249,20 +267,30 @@ struct NavBarView: View {
         HStack(spacing: 0) {
             NibBarGroup(id: "chrome.bar.leading") {
                 ForEach(items.leading) { item in button(item) }
-                if compact { titleView }
+                titleView
+                ForEach(items.afterTitle) { item in status(item) }
             }
-            .fixedSize(horizontal: !compact, vertical: false)
-            .layoutPriority(compact ? 1 : 0)
+            .layoutPriority(1)
             Spacer(minLength: NibSpacing.l)
-            if !compact {
-                NibBarGroup(id: "chrome.bar.title") { titleView }
-                    .layoutPriority(1)
-                Spacer(minLength: NibSpacing.l)
-            }
             NibBarGroup(id: "chrome.bar.trailing") {
                 ForEach(items.trailing) { item in button(item) }
             }
             .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    @ViewBuilder
+    private func status(_ item: NavStatusItem) -> some View {
+        let context = ChromeContext(app: chrome.app, session: chrome.session, navigator: chrome.navigator,
+                                    kind: kind, isCompact: compact)
+        if let provider = chrome.app.ui.toolbar.get(item.id)?.compactStatus,
+           let content = provider(context) {
+            content
+                .fixedSize(horizontal: true, vertical: false)
+                .font(NibFont.caption1)
+                .foregroundStyle(NibColor.label)
+                .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+                .disabled(!(chrome.app.ui.toolbar.get(item.id)?.isEnabled?(chrome.session) ?? true))
         }
     }
 
@@ -359,8 +387,9 @@ struct NavBarHost: View {
 
     var body: some View {
         let items = chrome.navItems(snapshot: snapshot, compact: layout.isCompact)
-        NavBarView(chrome: chrome, items: items, title: snapshot.title, subtitle: NavBarModel.subtitle(snapshot),
-                   readOnly: snapshot.readOnly, titleHasMenu: !chrome.menuItems(.documentTitle).isEmpty,
+        NavBarView(chrome: chrome, items: items, title: snapshot.title, kind: snapshot.kind,
+                   subtitle: NavBarModel.subtitle(snapshot), readOnly: snapshot.readOnly,
+                   titleHasMenu: !chrome.menuItems(.documentTitle).isEmpty,
                    compact: layout.isCompact, sidebarMode: sidebarMode, openMenu: $openMenu)
             .frame(width: layout.bar.width, height: layout.bar.height)
             .position(x: layout.bar.midX, y: layout.bar.midY)

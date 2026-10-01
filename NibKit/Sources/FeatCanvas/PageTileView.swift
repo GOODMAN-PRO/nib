@@ -70,6 +70,8 @@ protocol PageTileSource: AnyObject {
     /// Renders `region` of `page` at `scale` px/pt. Throws when there is no renderer, the page is gone or the render
     /// failed; `CancellationError` when the calling Task was cancelled.
     func renderTile(page: PageID, region: Rect?, scale: Double) async throws -> CGImage
+    /// Cheap paper/grid and item boxes for a board tile while its renderer is unavailable or still loading.
+    func placeholderTile(page: PageID, region: Rect, scale: Double) -> CGImage?
     /// The page view finished every render it had in flight (tiles and preview).
     func pageTileViewDidSettle(_ view: PageTileView)
     /// A render of the page (a tile or its low-resolution preview) failed, not cancelled: the canvas shows "Couldn't
@@ -94,8 +96,9 @@ enum CanvasLayers {
 /// One page (or one infinite board) on the canvas. It lives inside the zoomed content view, so its coordinates are
 /// page points: for a board its bounds origin is the board world's minimum corner, so tile frames are world
 /// coordinates. It shows, bottom to top: the paper colour, a low-resolution preview of the whole page (notebook pages
-/// only), the previous zoom level's tiles until the current level covers them, the current level's tiles, and live
-/// views (GIFs, videos, plugin views) over their items. Page views are recycled as the canvas scrolls.
+/// only), board grid/item placeholders, the previous zoom level's tiles until the current level covers them, the
+/// current level's tiles, and live views (GIFs, videos, plugin views) over their items. Page views are recycled as
+/// the canvas scrolls.
 ///
 /// A page that comes on screen shows its paper at once and fades its content in over 120 ms when the first bitmap
 /// lands (DESIGN.md §14.18, `NibMotion.fade`); after that nothing it draws animates: a re-render after a commit (the
@@ -111,15 +114,19 @@ final class PageTileView: UIView {
     /// Holds the bitmap layers (page coordinates) so the page's first content can fade in as one.
     private let contentView = UIView()
     private let previewLayer = CALayer()
+    private let placeholderLayer = CALayer()
     private let fallbackLayer = CALayer()
     private let tileLayer = CALayer()
     /// Live views (`CanvasHost.attachLiveView`) sit here, in page coordinates, above the tiles.
     let liveViewContainer = PassThroughView()
     /// The page's first bitmap has landed since it was configured (its content is faded in).
     private(set) var hasShownContent = false
+    private var isFadingContent = false
+    private var contentGeneration = 0
 
     private final class Slot {
         let layer = CALayer()
+        let placeholder = CALayer()
         var task: Task<Void, Never>?
         var hasImage = false
         var token = 0
@@ -148,6 +155,8 @@ final class PageTileView: UIView {
         contentView.isUserInteractionEnabled = false
         contentView.backgroundColor = .clear
         contentView.alpha = 0
+        placeholderLayer.actions = CanvasLayers.noActions
+        layer.addSublayer(placeholderLayer)
         addSubview(contentView)
         for l in [previewLayer, fallbackLayer, tileLayer] {
             l.actions = CanvasLayers.noActions
@@ -184,8 +193,14 @@ final class PageTileView: UIView {
             // The content view's own coordinates are page coordinates too, so tile frames need no conversion.
             contentView.bounds = pageRect.cg
             contentView.center = CGPoint(x: pageRect.midX, y: pageRect.midY)
-            for l in [previewLayer, fallbackLayer, tileLayer] { l.frame = pageRect.cg }
-            liveViewContainer.frame = pageRect.cg
+            // Container layers must use world coordinates too. A frame alone leaves their bounds at (0, 0),
+            // shifting every board tile by the world's (usually large negative) origin.
+            for l in [placeholderLayer, previewLayer, fallbackLayer, tileLayer] {
+                l.bounds = pageRect.cg
+                l.position = CGPoint(x: pageRect.midX, y: pageRect.midY)
+            }
+            liveViewContainer.bounds = pageRect.cg
+            liveViewContainer.center = CGPoint(x: pageRect.midX, y: pageRect.midY)
             CATransaction.commit()
         }
         if changed {
@@ -201,6 +216,7 @@ final class PageTileView: UIView {
         for s in slots.values {
             s.task?.cancel()
             s.layer.removeFromSuperlayer()
+            s.placeholder.removeFromSuperlayer()
         }
         slots.removeAll()
         clearFallback()
@@ -215,10 +231,12 @@ final class PageTileView: UIView {
         failureReported = false
         covered = nil
         for v in liveViewContainer.subviews { v.removeFromSuperview() }
-        // Paper only until the first bitmap lands (a new page, or one whose background or size changed).
+        // The board's placeholders sit outside this fade and stay visible until its bitmaps land.
         contentView.layer.removeAllAnimations()
         contentView.alpha = 0
         hasShownContent = false
+        isFadingContent = false
+        contentGeneration += 1
     }
 
     /// The first bitmap since the page was configured landed: its content fades in (`NibMotion.fade`, 120 ms). The
@@ -227,9 +245,24 @@ final class PageTileView: UIView {
         guard !hasShownContent else { return }
         hasShownContent = true
         if #available(iOS 18, *), window != nil {
-            UIView.animate(NibMotion.fade) { self.contentView.alpha = 1 }
+            isFadingContent = true
+            let generation = contentGeneration
+            UIView.animate(NibMotion.fade, changes: { self.contentView.alpha = 1 }, completion: { [weak self] in
+                guard let self, self.contentGeneration == generation else { return }
+                self.isFadingContent = false
+                self.dropLandedPlaceholders()
+            })
         } else {
             contentView.alpha = 1
+            dropLandedPlaceholders()
+        }
+    }
+
+    private func dropLandedPlaceholders() {
+        guard !isFadingContent else { return }
+        for slot in slots.values where slot.hasImage {
+            slot.placeholder.removeFromSuperlayer()
+            slot.placeholder.contents = nil
         }
     }
 
@@ -272,6 +305,7 @@ final class PageTileView: UIView {
         for (key, slot) in slots where !wantedSet.contains(key) && !CanvasTileGrid.rect(key).intersects(keep) {
             slot.task?.cancel()
             slot.layer.removeFromSuperlayer()
+            slot.placeholder.removeFromSuperlayer()
             slots[key] = nil
         }
         for key in wanted where slots[key] == nil {
@@ -282,6 +316,14 @@ final class PageTileView: UIView {
             slot.layer.magnificationFilter = .linear
             slot.layer.frame = CanvasTileGrid.rect(key).cg
             slot.layer.isOpaque = false
+            if isWorld {
+                slot.placeholder.actions = CanvasLayers.noActions
+                slot.placeholder.frame = slot.layer.frame
+                slot.placeholder.contentsGravity = .resize
+                slot.placeholder.contents = source?.placeholderTile(page: pageID, region: CanvasTileGrid.rect(key),
+                                                                     scale: CanvasTileGrid.scale(level: level))
+                placeholderLayer.addSublayer(slot.placeholder)
+            }
             tileLayer.addSublayer(slot.layer)
             slots[key] = slot
             request(key, slot: slot, page: pageID)
@@ -295,6 +337,10 @@ final class PageTileView: UIView {
     func invalidate(_ rect: Rect?) {
         guard let pageID = pageID else { return }
         for (key, slot) in slots where rect.map({ CanvasTileGrid.rect(key).intersects($0) }) ?? true {
+            if isWorld && !slot.hasImage {
+                slot.placeholder.contents = source?.placeholderTile(page: pageID, region: CanvasTileGrid.rect(key),
+                                                                     scale: CanvasTileGrid.scale(level: level))
+            }
             request(key, slot: slot, page: pageID)
         }
         for (key, layer) in fallback where rect.map({ CanvasTileGrid.rect(key).intersects($0) }) ?? true {
@@ -315,6 +361,7 @@ final class PageTileView: UIView {
         for (key, slot) in slots where !CanvasTileGrid.rect(key).intersects(covered) {
             slot.task?.cancel()
             slot.layer.removeFromSuperlayer()
+            slot.placeholder.removeFromSuperlayer()
             slots[key] = nil
         }
     }
@@ -355,6 +402,7 @@ final class PageTileView: UIView {
                 slot.hasImage = true
                 self.dropCoveredFallback()
                 self.contentLanded()
+                self.dropLandedPlaceholders()
             } else if let error = failure, !Task.isCancelled {
                 // The slot stays, so Try Again (`retry`) asks for this tile again.
                 self.renderFailed(error)
@@ -419,6 +467,7 @@ final class PageTileView: UIView {
     private func moveTilesToFallback() {
         for (key, slot) in slots {
             slot.task?.cancel()
+            slot.placeholder.removeFromSuperlayer()
             if slot.hasImage {
                 slot.layer.removeFromSuperlayer()
                 fallbackLayer.addSublayer(slot.layer)

@@ -28,10 +28,20 @@ public enum FeatBridgeUIFeature: NibFeature {
         page.keywords = BridgeUIIDs.keywords
         app.ui.settingsPages.register(page)
 
+        var status = ToolbarItemDescriptor(
+            id: BridgeUIIDs.statusItem, title: String(localized: "MCP Bridge"), icon: NibSymbol.bridge.name,
+            group: .navLeading, order: 40, owner: id, hideable: false, docKinds: Set(DocumentKind.allCases))
+        status.navSlot = .afterTitle
+        status.compactStatus = { context in
+            guard context.kind != nil, monitor.pillVisible else { return nil }
+            return AnyView(BridgeStatusPill(monitor: monitor, context: context, isNavStatus: true))
+        }
+        app.ui.toolbar.register(status)
+
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
-            id: BridgeUIIDs.statusOverlay, owner: id, placement: .topLeading, surface: .pill, order: 40,
+            id: BridgeUIIDs.libraryStatusOverlay, owner: id, placement: .topTrailing, surface: .pill, order: 40,
             recedesWhileWriting: true, isInteractive: true,
-            isVisible: { _ in monitor.pillVisible },
+            isVisible: { context in context.kind == nil && monitor.pillVisible },
             makeView: { context in AnyView(BridgeStatusPill(monitor: monitor, context: context)) }))
 
         // `.global`, no `docKinds`, no `sessionParams` (contracts-v2.2 shell routing): live in the library and in every
@@ -51,7 +61,8 @@ public enum FeatBridgeUIFeature: NibFeature {
 
 enum BridgeUIIDs {
     static let settingsPage = "bridgeui.settings"
-    static let statusOverlay = "bridgeui.status"
+    static let statusItem = "bridgeui.status"
+    static let libraryStatusOverlay = "bridgeui.libraryStatus"
     static let keyCommand = "bridgeui.openSettings"
     /// ⇧⌥⌘B. ⌥⌘B is F046's bookmark toggle (`page.setBookmarked`, document scope), so the global Bridge shortcut adds
     /// Shift; no other feature maps ⇧⌥⌘B.

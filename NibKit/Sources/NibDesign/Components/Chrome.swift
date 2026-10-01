@@ -219,10 +219,12 @@ struct NibToastPresenter: ViewModifier {
         content
             .overlay(alignment: .bottom) {
                 VStack(spacing: 0) {
-                    NibToast(shown?.message ?? "", action: shown?.action)
-                        .droplet("nib.toast", style: .toast)
-                        .budsFrom("nib.toast.source", isPresented: $presented)
-                        .padding(.bottom, NibSpacing.xxl)
+                    if let shown {
+                        NibToast(shown.message, action: shown.action)
+                            .droplet("nib.toast", style: .toast)
+                            .budsFrom("nib.toast.source", isPresented: $presented)
+                            .padding(.bottom, NibSpacing.xxl)
+                    }
                     Color.clear
                         .frame(width: 1, height: 1)
                         .nibBudAnchor("nib.toast.source")          // it buds up from just below its rest
@@ -231,6 +233,13 @@ struct NibToastPresenter: ViewModifier {
             .task(id: item?.id) {
                 guard let next = item else {
                     presented = false
+                    guard shown != nil else { return }
+                    // Retain the content for retraction, then remove the droplet entirely. Replacement cancels
+                    // this task, so an old dismissal cannot clear a newer toast.
+                    do { try await Task.sleep(for: .seconds(NibMotion.retract.response * 3)) }
+                    catch { return }
+                    guard !Task.isCancelled, item == nil else { return }
+                    shown = nil
                     return
                 }
                 shown = next
@@ -244,6 +253,10 @@ struct NibToastPresenter: ViewModifier {
                 }
                 presented = false
                 if item?.id == next.id { item = nil }
+            }
+            .onChange(of: presented) { _, visible in
+                // Escape or the container's dismissal also cancels the timer and clears the bound item.
+                if !visible, !presented, item?.id == shown?.id { item = nil }
             }
     }
 }

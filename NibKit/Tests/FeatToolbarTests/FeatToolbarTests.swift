@@ -520,6 +520,71 @@ final class FeatToolbarTests: XCTestCase {
         XCTAssertEqual(model.quickInks(compact: true).map { $0.index }, [2])
     }
 
+    /// A shared accessory and quick inks must never create palette chrome over a text document or study set.
+    func testPaletteOnlyAppearsInCanvasDocumentsAndFollowsDocumentChanges() {
+        let h = harness()
+        h.app.ui.toolbar.register(ToolbarItemDescriptor(
+            id: "testtools.sharedAccessory", title: "Shared Accessory", icon: "ruler", group: .accessories,
+            order: 50, owner: TestToolsFeature.id, docKinds: Set(DocumentKind.allCases), command: "ruler.toggle"))
+        let model = ToolbarModel(app: h.app, session: h.session)
+
+        for (document, kind, expected) in [
+            (Fixtures.docID, DocumentKind.notebook, true),
+            (Fixtures.textDocID, .textDocument, false),
+            (Fixtures.whiteboardID, .whiteboard, true),
+            (Fixtures.studySetID, .studySet, false),
+            (Fixtures.docID, .notebook, true)
+        ] {
+            h.session.document = document
+            XCTAssertEqual(model.kind, kind)
+            XCTAssertFalse(model.more.isEmpty, "the shared accessory reproduces the otherwise empty shell")
+            XCTAssertFalse(model.quickInks(compact: false).isEmpty)
+            XCTAssertFalse(model.quickInks(compact: true).isEmpty)
+            XCTAssertEqual(model.isPaletteDocument, expected)
+            XCTAssertEqual(model.showsPalette, expected)
+        }
+
+        h.session.readOnly = true
+        XCTAssertFalse(model.showsPalette)
+        h.session.readOnly = false
+        h.session.document = nil
+        XCTAssertFalse(model.isPaletteDocument)
+        XCTAssertFalse(model.showsPalette)
+    }
+
+    /// A missing tool has no bead; tools in More are promoted, while compact-width filtering stays authoritative.
+    func testPaletteSelectionOnlyMatchesAnAvailableTool() async throws {
+        let h = harness()
+        var plugin = ToolbarItemDescriptor(
+            id: "stamps.stamp", title: "Stamp", icon: "seal", group: .tools, order: 50, owner: "com.example.stamps",
+            toolID: "com.example.stamps.tool")
+        plugin.showsInCompactWidth = false
+        h.app.ui.toolbar.register(plugin)
+        let model = ToolbarModel(app: h.app, session: h.session)
+        XCTAssertEqual(model.paletteSelection(compact: false), "pen")
+
+        try await h.run("toolbar.setLayout", ["order": [], "hidden": ["text.item"]])
+        model.refresh()
+        h.session.tool = "text"
+        XCTAssertTrue(model.more.contains { $0.id == "text" })
+        XCTAssertEqual(model.paletteSelection(compact: false), "text")
+        XCTAssertEqual(model.paletteSelection(compact: true), "text")
+
+        h.session.tool = "com.example.stamps.tool"
+        XCTAssertEqual(model.paletteSelection(compact: false), "com.example.stamps.tool")
+        XCTAssertEqual(model.paletteSelection(compact: true), "")
+        XCTAssertEqual(h.session.tool, "com.example.stamps.tool", "filtering never changes the session's tool")
+        h.app.ui.toolbar.unregister(owner: "com.example.stamps")
+        model.refresh()
+        XCTAssertEqual(model.paletteSelection(compact: false), "")
+
+        for tool in ["unknown", "ruler.item"] {
+            h.session.tool = tool
+            XCTAssertEqual(model.paletteSelection(compact: false), "")
+            XCTAssertEqual(model.paletteSelection(compact: true), "")
+        }
+    }
+
     /// A tool whose stickiness comes from a setting, like F026's pinned text tool.
     private func registerPinnableNote(_ h: Harness) {
         let settings = h.app.settings

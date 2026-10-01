@@ -260,16 +260,72 @@ struct ChatProposalsView: View {
     }
 }
 
-struct ChatBlockButton: View {
+/// A selected canvas item's assistant action. Text documents use F047's own BlockCell.aiButton.
+/// UIKit configuration keeps the page-resident AI mark in accent instead of NibIconButton's label colour.
+struct ChatBlockButton: UIViewRepresentable {
     let ref: String
     @ObservedObject var model: ChatViewModel
-    var body: some View {
-        NibIconButton(.assistant, label: String(localized: "Ask about this block")) {
-            model.perform(ChatCommand.askBlock, ["ref": .string(ref)])
+
+    func makeUIView(context: Context) -> UIButton {
+        let ref = ref
+        let model = model
+        let button = UIButton(type: .system, primaryAction: UIAction { [weak model] _ in
+            model?.perform(ChatCommand.askBlock, ["ref": .string(ref)])
+        })
+        var configuration = UIButton.Configuration.plain()
+        configuration.image = UIImage(nib: .assistant)
+        configuration.preferredSymbolConfigurationForImage = NibUIFont.glyph(.panel)
+        configuration.baseForegroundColor = NibUIColor.accent
+        configuration.contentInsets = .zero
+        button.configuration = configuration
+        button.isPointerInteractionEnabled = true
+        button.showsLargeContentViewer = true
+        button.largeContentImage = configuration.image
+        button.largeContentTitle = String(localized: "Ask about this block")
+        button.addInteraction(UILargeContentViewerInteraction())
+        updateUIView(button, context: context)
+        return button
+    }
+
+    func updateUIView(_ button: UIButton, context: Context) {
+        button.accessibilityLabel = String(localized: "Ask about this block")
+        button.accessibilityIdentifier = "aichat.block." + ref
+        button.accessibilityHint = String(localized: "Opens the assistant with only this block selected as context.")
+        button.isEnabled = model.isConfigured && !(model.isStreaming || model.isLoadingChat)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UIButton, context: Context) -> CGSize? {
+        CGSize(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+    }
+}
+
+@MainActor
+private enum ChatAccessoryLayout {
+    static func firstLine(of item: Item, page: PageID, host: CanvasHost) -> CGRect {
+        guard let text = item.text?.text, let layout = host.app.content.textLayout(for: item),
+              let pageTransform = host.pageTransform(page) else {
+            let bounds = item.bounds
+            return CGRect(x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height)
+                .applying(host.pageTransform(page) ?? .identity)
         }
-        .accessibilityIdentifier("aichat.block." + ref)
-        .accessibilityHint(String(localized: "Opens the assistant with only this block selected as context."))
-        .disabled(model.isStreaming || model.isLoadingChat)
+        let storage = NSTextStorage(attributedString: RichTextBridge.attributed(text, base: layout.base))
+        let manager = NSLayoutManager()
+        let box = layout.container
+        let container = NSTextContainer(size: CGSize(width: max(1, box.w), height: .greatestFiniteMagnitude))
+        container.lineFragmentPadding = CGFloat(TextLayoutInfo.lineFragmentPadding)
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+        manager.ensureLayout(for: container)
+        var line = manager.numberOfGlyphs > 0
+            ? manager.lineFragmentRect(forGlyphAt: 0, effectiveRange: nil)
+            : CGRect(x: 0, y: 0, width: box.w, height: RichTextBridge.font(TextAttributes(), base: layout.base).lineHeight)
+        if layout.centredVertically {
+            line.origin.y += max(0, CGFloat(box.h) - manager.usedRect(for: container).height) / 2
+        }
+        let transform = CGAffineTransform(translationX: box.x + box.w / 2, y: box.y + box.h / 2)
+            .rotated(by: box.rotation).translatedBy(x: -box.w / 2, y: -box.h / 2)
+            .concatenating(pageTransform)
+        return line.applying(transform)
     }
 }
 
@@ -309,6 +365,17 @@ final class ChatInlineAttachment: CanvasAttachment {
             // Published sends before assignment; queue one layout after the state transition.
             Task { @MainActor [weak self] in if let self, let host = self.host { self.canvasDidChange(host) } }
         }.store(in: &observers)
+        host.session.$selection.dropFirst().sink { [weak self] _ in
+            Task { @MainActor [weak self] in
+                if let self, let host = self.host { self.canvasDidChange(host) }
+            }
+        }.store(in: &observers)
+        NotificationCenter.default.publisher(for: SettingsStore.didChange, object: host.app.settings)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    if let self, let host = self.host { self.canvasDidChange(host) }
+                }
+            }.store(in: &observers)
         canvasDidChange(host)
     }
     func detach(from host: CanvasHost) {
@@ -320,24 +387,41 @@ final class ChatInlineAttachment: CanvasAttachment {
 
     func canvasDidChange(_ host: CanvasHost) {
         let model = ChatRuntime.get(host.app).model(for: host.session)
-        guard let content = try? host.app.workspace.content(host.documentID) else { return }
+        guard let content = try? host.app.workspace.content(host.documentID) else {
+            for button in buttons.values { button.view.removeFromSuperview() }
+            for mark in marks.values { mark.view.removeFromSuperview() }
+            buttons = [:]; marks = [:]
+            return
+        }
         var activeButtons = Set<String>()
         var activeMarks = Set<String>()
+        var controls: [CGRect] = []
+        let selection = host.session.selection
         for page in content.livePages {
             guard let pageRect = host.pageFrame(page.id), pageRect.intersects(host.canvasView.bounds),
                   let items = try? host.app.workspace.items(host.documentID, page: page.id) else { continue }
             let occupied = items.map { itemRect($0.bounds, page: page.id, host: host) }
-            var controls: [CGRect] = []
-            for item in items where item.kind == .text || (item.kind == .stroke && host.session.selection.items.contains(item.id)) {
+            for item in items where item.kind == .text || item.kind == .stroke {
                 let ref = NodeRef.item(host.documentID, page.id, item.id).description
+                let selected = selection.doc == host.documentID && selection.page == page.id && selection.items.contains(item.id)
+                guard model.isConfigured, selected else { continue }
                 let bounds = itemRect(item.bounds, page: page.id, host: host)
                 guard bounds.intersects(host.canvasView.bounds) else { continue }
                 let size = CGSize(width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-                let centre = NibTether<EmptyView>.restingCentre(chip: size, line: bounds.midY,
-                    page: pageRect, trailingLimit: min(pageRect.maxX, host.canvasView.bounds.maxX), ink: occupied + controls)
-                let frame = CGRect(x: centre.x - size.width / 2, y: centre.y - size.height / 2, width: size.width, height: size.height)
-                guard !occupied.contains(where: { $0.insetBy(dx: -NibSpacing.s, dy: -NibSpacing.s).intersects(frame) }),
-                      !controls.contains(where: { $0.intersects(frame) }) else { continue }
+                let firstLine = ChatAccessoryLayout.firstLine(of: item, page: page.id, host: host)
+                // A comment or other item can occupy the trailing margin; try the leading margin too.
+                let marginPositions = [min(pageRect.maxX - NibSpacing.s, host.canvasView.bounds.maxX) - size.width,
+                                       max(pageRect.minX + NibSpacing.s, host.canvasView.bounds.minX)]
+                let candidates = marginPositions.map {
+                    CGRect(x: $0, y: firstLine.minY + (firstLine.height - size.height) / 2,
+                           width: size.width, height: size.height)
+                }
+                guard let frame = candidates.first(where: { frame in
+                    host.canvasView.bounds.contains(frame)
+                        && !occupied.contains(where: { $0.insetBy(dx: -NibSpacing.s, dy: -NibSpacing.s).intersects(frame) })
+                        // Keep full 44 pt targets apart, including equality and adjacent pages.
+                        && !controls.contains(where: { abs($0.midY - frame.midY) <= NibMetrics.hitTarget })
+                }) else { continue }
                 let button = buttons[ref] ?? UIHostingController(rootView: ChatBlockButton(ref: ref, model: model))
                 button.view.backgroundColor = .clear
                 button.view.frame = frame
@@ -374,9 +458,9 @@ final class ChatInlineAttachment: CanvasAttachment {
     }
 }
 
-/// F047 does not expose a block-accessory registry. Compose its editor factory without replacing any block
-/// renderer or editing delegate. Accessible block refs are preferred; a single-section list with exactly one
-/// row per live block is the compatibility fallback. Never guess for an unfamiliar editor layout.
+/// Adds F085's proposal previews while F047 owns block AI buttons, renderers and editing delegates.
+/// Accessible block refs are preferred; a single-section list with exactly one row per live block is the
+/// compatibility fallback. Never guess for an unfamiliar editor layout.
 @MainActor
 final class ChatBlockEditor: UIViewController, DocumentEditing {
     let wrapped: UIViewController
@@ -390,7 +474,6 @@ final class ChatBlockEditor: UIViewController, DocumentEditing {
     private var subscriptions = Set<AnyCancellable>()
     private var scrollIDs = Set<ObjectIdentifier>()
     private var events: EventSubscription?
-    private(set) var controls: [String: UIHostingController<ChatBlockButton>] = [:]
     private(set) var previews: [String: UIHostingController<ChatProofMark>] = [:]
 
     init(wrapped: UIViewController, editing: DocumentEditing, app: NibApp) {
@@ -406,6 +489,17 @@ final class ChatBlockEditor: UIViewController, DocumentEditing {
         model.$proposals.combineLatest(model.$showsProposalsOnPage).sink { [weak self] _, _ in
             Task { @MainActor [weak self] in self?.view.setNeedsLayout() }
         }.store(in: &subscriptions)
+        session.$selection.dropFirst().receive(on: RunLoop.main).sink { [weak self] _ in
+            self?.view.setNeedsLayout()
+        }.store(in: &subscriptions)
+        for name in [UITextView.textDidBeginEditingNotification, UITextView.textDidEndEditingNotification,
+                     UITextView.textDidChangeNotification] {
+            NotificationCenter.default.publisher(for: name).sink { [weak self] notification in
+                guard let self, let textView = notification.object as? UITextView,
+                      textView.isDescendant(of: self.wrapped.view) else { return }
+                Task { @MainActor [weak self] in self?.view.setNeedsLayout() }
+            }.store(in: &subscriptions)
+        }
         events = app.events.subscribe { [weak self] event in
             Task { @MainActor [weak self] in
                 guard let self, event.doc == self.documentID else { return }
@@ -449,30 +543,22 @@ final class ChatBlockEditor: UIViewController, DocumentEditing {
                 for cell in collection.visibleCells {
                     guard let index = collection.indexPath(for: cell), index.section == 0,
                           blocks.indices.contains(index.item) else { continue }
-                    rows[NodeRef.block(documentID, blocks[index.item].id).description] = cell.convert(cell.bounds, to: accessories)
+                    let ref = NodeRef.block(documentID, blocks[index.item].id).description
+                    rows[ref] = cell.convert(cell.bounds, to: accessories)
                 }
                 return
             }
             if let table = node as? UITableView, table.numberOfSections == 1, table.numberOfRows(inSection: 0) == blocks.count {
                 for cell in table.visibleCells {
                     guard let index = table.indexPath(for: cell), blocks.indices.contains(index.row) else { continue }
-                    rows[NodeRef.block(documentID, blocks[index.row].id).description] = cell.convert(cell.bounds, to: accessories)
+                    let ref = NodeRef.block(documentID, blocks[index.row].id).description
+                    rows[ref] = cell.convert(cell.bounds, to: accessories)
                 }
                 return
             }
             for child in node.subviews { visit(child) }
         }
         visit(wrapped.view)
-        var visible = Set<String>()
-        for (ref, rect) in rows where rect.intersects(accessories.bounds) {
-            let control = controls[ref] ?? UIHostingController(rootView: ChatBlockButton(ref: ref, model: model))
-            if controls[ref] == nil { addChild(control); accessories.addSubview(control.view); control.didMove(toParent: self) }
-            control.view.backgroundColor = .clear
-            let x = max(0, min(rect.maxX + NibSpacing.s, accessories.bounds.maxX - NibMetrics.hitTarget))
-            control.view.frame = CGRect(x: x, y: rect.minY, width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
-            controls[ref] = control; visible.insert(ref)
-        }
-        for ref in Array(controls.keys) where !visible.contains(ref) { remove(controls.removeValue(forKey: ref)) }
         var shown = Set<String>()
         if model.showsProposalsOnPage {
             for row in model.proposals where row.included {

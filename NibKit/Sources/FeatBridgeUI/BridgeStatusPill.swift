@@ -58,9 +58,6 @@ struct BridgePillPresentation: Equatable {
     var secondary: String?
     var accessibilityLabel: String
 
-    /// A last call older than this is not named in the pill (the popover still shows it).
-    static let recentCall: TimeInterval = 600
-
     /// The pill shows while the bridge is meant to run: on, starting, or needing attention. Not while it is off or
     /// paused in the background (then nobody sees the chrome anyway).
     static func isVisible(_ snapshot: BridgeSnapshot?) -> Bool {
@@ -96,15 +93,8 @@ struct BridgePillPresentation: Equatable {
             }
             let names = s.clients.map { $0.name }
             label += ". " + String(localized: "Connected: \(ListFormatter.localizedString(byJoining: names))")
-            let call = s.lastCall.flatMap { now.timeIntervalSince1970 - $0.at <= recentCall ? $0 : nil }
-            if let call = call {
-                label += ". " + String(localized: "Last call: \(BridgeFormat.callText(call, now: now, full: true))")
-            }
-            var extra: [String] = []
-            if names.count > 1 { extra.append("+\(names.count - 1)") }
-            if let call = call, !compact { extra.append(call.what) }
             return BridgePillPresentation(dot: .connected, primary: first.name,
-                                          secondary: extra.isEmpty ? nil : extra.joined(separator: " \u{00B7} "),
+                                          secondary: names.count > 1 ? "+\(names.count - 1)" : nil,
                                           accessibilityLabel: label)
         }
     }
@@ -120,12 +110,13 @@ final class BridgePillState: ObservableObject {
     @Published var busy = false
 }
 
-/// The bridge status pill in the document chrome (`ui.chromeOverlays`, `.topLeading`, `.pill`): a dot and the connected
-/// client (or the address), budding a popover with the address, the clients and the last call. The chrome gives it its
-/// Clear pill droplet and fades it while the Pencil is down; it draws no glass of its own.
+/// A dot and the connected client, budding details with the address, clients and last call. In documents it sits
+/// after the title in the leading bar; the library gives it its existing Clear pill. It draws no glass of its own.
 struct BridgeStatusPill: View {
     @ObservedObject var monitor: BridgeMonitor
     let context: ChromeContext
+    /// The document's after-title control uses caption1 and folds to its dot on compact width.
+    var isNavStatus = false
     @StateObject private var state = BridgePillState()
 
     var body: some View {
@@ -136,17 +127,32 @@ struct BridgeStatusPill: View {
             HStack(spacing: NibSpacing.xxs) {
                 if let kind = presentation?.dot.statusKind {
                     NibStatusDot(kind)
-                        .padding(.leading, NibSpacing.s)
+                } else if isNavStatus {
+                    Circle()
+                        .fill(NibColor.labelSecondary)
+                        .frame(width: NibMetrics.statusDot, height: NibMetrics.statusDot)
+                        .accessibilityHidden(true)
                 }
-                NibHUDText(presentation?.primary ?? String(localized: "Bridge"), secondary: presentation?.secondary)
+                if !isNavStatus || !context.isCompact {
+                    Text(presentation?.primary ?? String(localized: "Bridge"))
+                    if !isNavStatus, let secondary = presentation?.secondary {
+                        Text(secondary)
+                    }
+                }
             }
-            .frame(minHeight: NibMetrics.hitTarget)
+            .font(isNavStatus ? NibFont.caption1 : NibFont.caption1Emphasis)
+            .foregroundStyle(NibColor.label)
+            .lineLimit(1)
+            .padding(.horizontal, NibSpacing.s)
+            .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
             .contentShape(Capsule())
         }
         .buttonStyle(NibPressStyle(shape: Capsule()))
         .nibBudAnchor(BridgeUIIDs.pillAnchor)
         .nibChromeTypeCap()
-        .accessibilityLabel(presentation?.accessibilityLabel ?? String(localized: "MCP bridge"))
+        .accessibilityLabel(isNavStatus && presentation?.dot == .connected
+                            ? String(localized: "\(presentation?.primary ?? "") connected")
+                            : presentation?.accessibilityLabel ?? String(localized: "MCP bridge"))
         .accessibilityHint(String(localized: "Shows the address, the clients and the last call."))
         .accessibilityAddTraits(state.detailsPresented ? .isSelected : [])
         .onAppear { monitor.watch() }

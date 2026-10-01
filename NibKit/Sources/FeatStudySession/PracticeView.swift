@@ -116,7 +116,7 @@ final class StudySessionModel: ObservableObject {
         if !started { language = StudyVoiceLanguages.resolve(content.meta.language, installed: voiceLanguages) ?? content.meta.language }
         if started {
             queue.removeAll { cardsByID[$0] == nil }
-            if mode == "practice" { index = oldID.flatMap { queue.firstIndex(of: $0) } ?? min(index, max(0, queue.count - 1)) }
+            if mode == "practice" { index = oldID.flatMap { queue.firstIndex(of: $0) } ?? min(index, queue.count) }
             else { moveToDueCard() }
         }
         if oldID != current?.id {
@@ -173,12 +173,15 @@ final class StudySessionModel: ObservableObject {
     }
 
     func recordGrade(_ id: NibID, rating: StudyRating) {
-        guard started, mode == "smartLearn", queue.contains(id), !reviewed.contains(id) else { return }
-        reviewed.append(id)
-        if rating == .again || rating == .hard { hardest.append(id) }
+        guard started, queue.contains(id) else { return }
+        if mode == "practice" {
+            guard current?.id == id else { return }
+        } else if reviewed.contains(id) { return }
+        if !reviewed.contains(id) { reviewed.append(id) }
+        if (rating == .again || rating == .hard), !hardest.contains(id) { hardest.append(id) }
         instantFlip = true
         flipped = false; speaker.stop()
-        moveToDueCard()
+        if mode == "practice" { index += 1 } else { moveToDueCard() }
     }
 
     private func moveToDueCard() {
@@ -261,25 +264,27 @@ struct PracticeView: View {
     var body: some View { StudySessionView(model: model, smartLearn: false, close: close) }
 }
 
+enum StudyCardLayout {
+    /// Fit the paper's aspect ratio into the space left after the HUD and grading controls have laid out.
+    static func fittingSize(in available: CGSize) -> CGSize {
+        let paper = NibMetrics.studyCardSize
+        let scale = min(1, max(0, available.width) / paper.width, max(0, available.height) / paper.height)
+        return CGSize(width: paper.width * scale, height: paper.height * scale)
+    }
+}
+
 struct StudySessionView: View {
     @ObservedObject var model: StudySessionModel
     let smartLearn: Bool
     let close: () -> Void
-    @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var drag = CGSize.zero
     @State private var swiping = false
     @State private var resetConfirmed = false
+    @State private var optionsPresented = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            ScrollView { sessionContent }
-            .scrollBounceBehavior(.basedOnSize)
-            .disabled(swiping)
-        }
-        .background(model.desk)
-        .foregroundStyle(NibColor.label)
+        sessionLayout
         .task {
             model.onEnd = close
             let mode = smartLearn ? "smartLearn" : "practice"
@@ -293,7 +298,7 @@ struct StudySessionView: View {
         }
         .onDisappear {
             model.onEnd = nil
-            if !model.scratchPresented {
+            if !model.scratchPresented && !optionsPresented {
                 model.app.perform(StudySessionAction.id, ["doc": .string(model.docRef), "action": "end"], session: model.session)
             }
         }
@@ -303,35 +308,78 @@ struct StudySessionView: View {
         NibPanelHeader(title: smartLearn ? String(localized: "Smart Learn") : String(localized: "Practice"),
                        symbol: .studySets, onClose: {
                            model.end(close: close)
-                       })
-    }
-
-    var sessionContent: some View {
-        VStack(spacing: NibSpacing.xxl) {
-            if let error = model.error { NibBanner(error) }
-            if !model.started, model.error == nil {
-                ProgressView().accessibilityLabel(String(localized: "Loading study cards"))
-            } else if let card = model.current {
-                progress
-                cardView(card)
-                if smartLearn { grading } else { navigation }
-                controls
-            } else if model.started {
-                StudySummaryView(model: model, smartLearn: smartLearn, close: close)
-                controls
+                       }) {
+            HStack(spacing: NibSpacing.xs) {
+                if !smartLearn, model.current != nil {
+                    NibIconButton(.back, label: String(localized: "Previous Card"), size: .panel,
+                                  shortcut: KeyboardShortcut(.leftArrow, modifiers: [])) {
+                        model.action("previous", instant: true)
+                    }.disabled(model.busy || model.index == 0)
+                    NibIconButton(.forward, label: String(localized: "Next Card"), size: .panel,
+                                  shortcut: KeyboardShortcut(.rightArrow, modifiers: [])) {
+                        model.action("next", instant: true)
+                    }.disabled(model.busy || model.index + 1 >= model.queue.count)
+                }
+                NibIconButton(.more, label: String(localized: "Study options"), size: .panel) {
+                    optionsPresented = true
+                }
+                .popover(isPresented: $optionsPresented) {
+                    VStack(spacing: 0) {
+                        NibPanelHeader(title: String(localized: "Study options"), symbol: .studySets,
+                                       onClose: { optionsPresented = false })
+                        ScrollView { controls.padding(NibSpacing.l) }
+                            .scrollBounceBehavior(.basedOnSize)
+                    }
+                    .frame(idealWidth: NibMetrics.studyCardSize.width,
+                           idealHeight: NibMetrics.popoverMaxHeight)
+                    .background(NibColor.background)
+                    .foregroundStyle(NibColor.label)
+                }
             }
         }
-        .padding(NibSpacing.l)
-        .frame(maxWidth: .infinity)
     }
 
-    /// The same screen composition, without the system-backed scroll view or live lifecycle callbacks, for
-    /// hostless layout snapshots. The actual panel always keeps its native scroll container.
-    var snapshotContent: some View {
-        VStack(spacing: 0) { header; sessionContent }
-            .background(model.desk)
-            .foregroundStyle(NibColor.label)
+    private var sessionLayout: some View {
+        NibDropletContainer {
+            VStack(spacing: 0) {
+                header
+                if let card = model.current {
+                    VStack(spacing: NibSpacing.l) {
+                        if let error = model.error { NibBanner(error) }
+                        progress.fixedSize(horizontal: false, vertical: true)
+                        GeometryReader { geometry in
+                            cardView(card, size: StudyCardLayout.fittingSize(in: geometry.size))
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .disabled(swiping)
+                        grading.fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, NibSpacing.l)
+                    .padding(.bottom, NibSpacing.l)
+                } else {
+                    ScrollView {
+                        VStack(spacing: NibSpacing.xxl) {
+                            if let error = model.error { NibBanner(error) }
+                            if !model.started, model.error == nil {
+                                ProgressView().accessibilityLabel(String(localized: "Loading study cards"))
+                            } else if model.started {
+                                StudySummaryView(model: model, smartLearn: smartLearn, close: close)
+                            }
+                        }
+                        .padding(NibSpacing.l)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .scrollBounceBehavior(.basedOnSize)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(model.desk.ignoresSafeArea())
+        .foregroundStyle(NibColor.label)
     }
+
+    /// The actual screen composition without session lifecycle callbacks, for layout snapshots.
+    var snapshotContent: some View { sessionLayout }
 
     private var progress: some View {
         VStack(spacing: NibSpacing.s) {
@@ -346,17 +394,15 @@ struct StudySessionView: View {
         Double(smartLearn ? model.reviewed.count : model.index + 1) / Double(max(model.queue.count, 1))
     }
 
-    private func cardView(_ card: StudyCard) -> some View {
+    private func cardView(_ card: StudyCard, size: CGSize) -> some View {
         NibFlashcard(isFlipped: model.flipped, fill: model.cardFill) {
             StudyFaceView(model: model, card: card, face: card.front, back: false)
         } back: {
             StudyFaceView(model: model, card: card, face: card.back, back: true)
         }
-        .frame(maxWidth: NibMetrics.studyCardSize.width)
-        .frame(height: typeSize.isAccessibilitySize ? nil : NibMetrics.studyCardSize.height)
-        .frame(minHeight: NibMetrics.studyCardSize.height)
+        .frame(width: size.width, height: size.height)
         .offset(drag)
-        .rotationEffect(.degrees(reduceMotion ? 0 : min(6, max(-6, Double(drag.width / NibMetrics.studyCardSize.width) * 6))))
+        .rotationEffect(.degrees(reduceMotion ? 0 : min(6, max(-6, Double(drag.width / max(size.width, 1)) * 6))))
         .transaction { if model.instantFlip { $0.disablesAnimations = true } }
         .contentShape(RoundedRectangle(cornerRadius: NibRadius.studyCard))
         .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: NibRadius.studyCard))
@@ -368,13 +414,13 @@ struct StudySessionView: View {
         }.onEnded { value in
             guard !model.busy, !swiping else { drag = .zero; return }
             let travel = value.predictedEndTranslation.width
-            if abs(travel) > NibMetrics.studyCardSize.width / 4 {
-                if smartLearn, model.flipped, !model.readOnly {
+            if abs(travel) > size.width / 4 {
+                if model.flipped, !model.readOnly {
                     if reduceMotion { model.grade(travel > 0 ? .good : .again); drag = .zero }
                     else {
                         swiping = true
                         withAnimation(NibMotion.sheet.animation, completionCriteria: .logicallyComplete) {
-                            drag = CGSize(width: travel > 0 ? max(travel, NibMetrics.studyCardSize.width) : min(travel, -NibMetrics.studyCardSize.width), height: value.predictedEndTranslation.height)
+                            drag = CGSize(width: travel > 0 ? max(travel, size.width) : min(travel, -size.width), height: value.predictedEndTranslation.height)
                         } completion: {
                             if model.current?.id == card.id { model.grade(travel > 0 ? .good : .again) }
                             swiping = false
@@ -384,7 +430,7 @@ struct StudySessionView: View {
                     }
                 } else if !smartLearn { model.action(travel < 0 ? "next" : "previous", instant: true) }
             }
-            if !(smartLearn && model.flipped && !model.readOnly && !reduceMotion && abs(travel) > NibMetrics.studyCardSize.width / 4) {
+            if !(model.flipped && !model.readOnly && !reduceMotion && abs(travel) > size.width / 4) {
                 withAnimation(NibMotion.slot.animation) { drag = .zero }
             }
         })
@@ -394,26 +440,10 @@ struct StudySessionView: View {
         .accessibilityAction(named: String(localized: "Flip Card")) { model.action("flip", instant: true) }
         .accessibilityAction(named: String(localized: "Previous Card")) { if !smartLearn { model.action("previous", instant: true) } }
         .accessibilityAction(named: String(localized: "Next Card")) { if !smartLearn { model.action("next", instant: true) } }
-        .accessibilityAction(named: String(localized: "Still Learning")) { if smartLearn { model.grade(.again) } }
-        .accessibilityAction(named: String(localized: "Knew It")) { if smartLearn { model.grade(.good) } }
+        .accessibilityAction(named: String(localized: "Still Learning")) { model.grade(.again) }
+        .accessibilityAction(named: String(localized: "Knew It")) { model.grade(.good) }
     }
 
-    private var navigation: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: NibSpacing.l) { previous; flip; next }
-            VStack(spacing: NibSpacing.s) { flip; HStack { previous; next } }
-        }
-    }
-    private var previous: some View {
-        NibButton(String(localized: "Previous Card"), symbol: .back,
-                  shortcut: KeyboardShortcut(.leftArrow, modifiers: [])) { model.action("previous", instant: true) }
-            .disabled(model.busy || model.index == 0)
-    }
-    private var next: some View {
-        NibButton(String(localized: "Next Card"), symbol: .forward,
-                  shortcut: KeyboardShortcut(.rightArrow, modifiers: [])) { model.action("next", instant: true) }
-            .disabled(model.busy || model.index + 1 >= model.queue.count)
-    }
     private var flip: some View {
         NibButton(String(localized: "Flip Card"), kind: .plain,
                   shortcut: KeyboardShortcut(.space, modifiers: [])) { model.action("flip", instant: true) }.disabled(model.busy)
@@ -421,17 +451,15 @@ struct StudySessionView: View {
 
     private var grading: some View {
         VStack(spacing: NibSpacing.s) {
-            flip
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: NibSpacing.l) { ForEach(StudyRating.allCases, id: \.self) { gradeButton($0) } }
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: NibSpacing.l) {
                     ForEach(StudyRating.allCases, id: \.self) { gradeButton($0) }
                 }
             }
-            Text(String(localized: "Still Learning: Again or Hard. Knew It: Good or Easy."))
-                .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
             if model.readOnly { Text(String(localized: "This study set is read-only.")) }
         }
+        .frame(maxWidth: .infinity)
     }
     private func gradeButton(_ rating: StudyRating) -> some View {
         let key = String((StudyRating.allCases.firstIndex(of: rating) ?? 0) + 1)
@@ -443,6 +471,7 @@ struct StudySessionView: View {
 
     private var controls: some View {
         VStack(alignment: .leading, spacing: NibSpacing.m) {
+            if model.current != nil { flip }
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: NibSpacing.m) { speech; language; scratch }
                 VStack(alignment: .leading, spacing: NibSpacing.s) { speech; language; scratch }
@@ -493,6 +522,7 @@ struct StudySessionView: View {
     }
     private var scratch: some View {
         NibButton(String(localized: "Open Scratchpad"), symbol: .quickNote, kind: .plain) {
+            optionsPresented = false
             model.action("scratch")
         }.disabled(model.busy || model.app.ui.panels.get("studyeditor.scratch") == nil)
     }

@@ -23,7 +23,9 @@ final class FeatSyncUITests: XCTestCase {
         XCTAssertEqual(h.app.commands.descriptor(CommandIDs.libraryRepair)?.owner, "syncui")
         XCTAssertEqual(h.app.commands.descriptor(CommandIDs.libraryRepair)?.effect, .session)
         XCTAssertEqual(h.app.ui.panels.get(PanelIDs.cloudBackup)?.providesHeader, true)
-        XCTAssertNotNil(h.app.ui.chromeOverlays.get("syncui.containerBanner"))
+        XCTAssertNil(h.app.ui.chromeOverlays.get("syncui.containerBanner"))
+        XCTAssertNotNil(h.app.services.get(FeatSyncUIFeature.libraryBannerKey,
+                                          as: (@MainActor (ChromeContext) -> AnyView?).self))
         XCTAssertNotNil(h.app.ui.chromeOverlays.get("syncui.readOnlyBanner"))
         XCTAssertNil(h.app.services.get(CloudStatusModel.key, as: CloudStatusModel.self))
         let problems = await CommandConformance.check(features: [FeatSyncUIFeature.self])
@@ -174,10 +176,17 @@ final class FeatSyncUITests: XCTestCase {
         func overlays(_ kind: DocumentKind? = nil, compact: Bool = false) -> [String] {
             h.app.ui.visibleChromeOverlays(ChromeContext(app: h.app, session: h.session, kind: kind, isCompact: compact)).map(\.id)
         }
+        let libraryBanner = try XCTUnwrap(h.app.services.get(FeatSyncUIFeature.libraryBannerKey,
+                                                             as: (@MainActor (ChromeContext) -> AnyView?).self))
         h.app.services.set(NSNumber(value: true), for: "library.inContainer")
-        XCTAssertTrue(overlays().contains("syncui.containerBanner"))
+        for compact in [false, true] {
+            XCTAssertNotNil(libraryBanner(ChromeContext(app: h.app, session: h.session, isCompact: compact)))
+            XCTAssertFalse(overlays(compact: compact).contains("syncui.containerBanner"))
+        }
+        XCTAssertNil(libraryBanner(ChromeContext(app: h.app, session: h.session, kind: .notebook)))
         XCTAssertFalse(overlays(.notebook).contains("syncui.containerBanner"))
         h.app.services.set(NSNumber(value: false), for: "library.inContainer")
+        XCTAssertNil(libraryBanner(ChromeContext(app: h.app, session: h.session)))
         XCTAssertFalse(overlays().contains("syncui.containerBanner"))
         XCTAssertTrue(overlays(compact: true).contains("syncui.libraryStatusCompact"))
         XCTAssertFalse(overlays(compact: true).contains("syncui.libraryStatus"))

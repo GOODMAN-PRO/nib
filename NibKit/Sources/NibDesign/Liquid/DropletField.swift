@@ -10,6 +10,8 @@ struct DropletPresentation: Equatable {
     var revealed = true
     var contentOpacity: Double = 1
     var contentTransform: CGAffineTransform = .identity
+    var restSize: CGSize = .zero
+    var paperShare: Double = 0
     var bodySize: CGSize = .zero
     var bodyOffset: CGPoint = .zero
     var cornerRadius: CGFloat = 0
@@ -438,7 +440,9 @@ final class DropletField {
     func anchorRect(_ source: String) -> CGRect? { sourceRect(source) }
 
     /// Share of a box over light paper (`nibBackdrop`).
-    private func paperShare(_ box: CGRect) -> Double {
+    private func paperShare(_ box: CGRect) -> Double { Self.paperShare(box, in: backdrop) }
+
+    static func paperShare(_ box: CGRect, in backdrop: [CGRect]) -> Double {
         guard NibGeometry.isUsable(box) else { return 0 }
         let area = max(box.width * box.height, 1)
         let covered = backdrop.reduce(CGFloat(0)) { sum, page in
@@ -503,6 +507,8 @@ final class DropletField {
         p.contentOpacity = alpha
         p.contentTransform = DropletPhysics.aboutCentre(
             DropletPhysics.transform(offset: offset, anchor: anchor, linear: content), size: e.rest.size)
+        p.restSize = e.rest.size
+        p.paperShare = paperShare(visualBox(e))
         p.bodySize = NibGeometry.size(CGSize(width: size.width * body.a, height: size.height * body.d))
         p.bodyOffset = NibGeometry.point(CGPoint(x: offset.x + anchor.x * (1 - body.a), y: offset.y + anchor.y * (1 - body.d)))
         p.cornerRadius = NibGeometry.dimension(cornerRadius(e) * min(body.a, body.d))

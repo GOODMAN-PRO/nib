@@ -51,7 +51,7 @@ struct DropletModifier: ViewModifier {
             AttachedDroplet(content: content, id: id, style: style, managesDrag: managesDrag, dragScale: dragScale,
                             bondsWith: bondsWith, onDrag: onDrag, field: field, node: field.node(id),
                             namespace: namespace, bud: bud)
-        } else {
+        } else if bud?.isPresented.wrappedValue ?? true {
             content.nibGlass(style.glassKind, cornerRadius: style.cornerRadius, interactive: style.isInteractive)
         }
     }
@@ -93,18 +93,16 @@ struct AttachedDroplet<Content: View>: View {
                     Rectangle().padding(-64)
                 }
             }
-            .opacity(p.contentOpacity * recede)
-            .animation(p.recedes ? NibMotion.recede : NibMotion.enter, value: p.recedes)
-            .transformEffect(p.contentTransform)
+            .opacity(p.contentOpacity)
+            .transformEffect(contentTransform(p))
+            .modifier(DropletBodyModifier(id: id, style: style, presentation: p, namespace: namespace, field: field))
             .overlay {
                 if !style.drawsBody && p.isDrawn {
-                    FrameRim(style: style, presentation: p).opacity(recede)
+                    FrameRim(style: style, presentation: p)
                 }
             }
-            .background {
-                SystemBody(id: id, style: style, presentation: p, namespace: namespace, field: field)
-                    .opacity(recede)
-            }
+            .opacity(recede)
+            .animation(p.recedes ? NibMotion.recede : NibMotion.enter, value: p.recedes)
             .allowsHitTesting(!hidden)
             .accessibilityHidden(hidden)
             // An open bud is modal for VoiceOver: focus moves into it when its content is revealed, the canvas behind
@@ -141,6 +139,16 @@ struct AttachedDroplet<Content: View>: View {
             }
     }
 
+    private func contentTransform(_ p: DropletPresentation) -> CGAffineTransform {
+        var transform = p.contentTransform
+        if field.usesSystemGlass && style.drawsBody {
+            // The entire content-hosted glass moves by bodyOffset below. Do not translate the glyphs twice.
+            transform.tx -= p.bodyOffset.x
+            transform.ty -= p.bodyOffset.y
+        }
+        return transform
+    }
+
     private var dragGesture: some Gesture {
         DragGesture(minimumDistance: DropletPhysics.pickupSlop, coordinateSpace: NibLiquid.space)
             .onChanged { value in
@@ -174,59 +182,49 @@ struct FrameRim: View {
     }
 }
 
-/// The droplet's body on iOS 26+: system glass sized and offset by the physics (axis-aligned stretch through the frame,
-/// which the glass union definitely honours). On iOS 17–25 the container's field draws the body, so this is empty.
-struct SystemBody: View {
+/// Hosts system glass on its foreground content, never on a sibling shape that can refract the glyphs.
+/// Reciprocal padding gives the glass its physics envelope while preserving the original layout proposal and rest
+/// frame. A fixed body frame alone would feed its animated size back into RestReader, or collapse the first frame.
+struct DropletBodyModifier: ViewModifier {
     let id: String
     let style: DropletStyle
     let presentation: DropletPresentation
     let namespace: Namespace.ID?
     let field: DropletField
+    @Environment(\.colorScheme) private var colorScheme
 
-    var body: some View {
+    func body(content: Content) -> some View {
         if #available(iOS 26.0, *) {
-            if field.usesSystemGlass && presentation.isDrawn && !presentation.hidden && style.drawsBody {
-                GlassBody(id: id, style: style, presentation: presentation, namespace: namespace, frozen: field.isFrozen)
-            }
-        }
-    }
-}
-
-@available(iOS 26.0, *)
-struct GlassBody: View {
-    let id: String
-    let style: DropletStyle
-    let presentation: DropletPresentation
-    let namespace: Namespace.ID?
-    /// While the Pencil is down the glass does not sample the backdrop: `.identity` over the plain body tint. At 22 %
-    /// the swap is invisible, and nothing re-samples the canvas 120 times a second.
-    let frozen: Bool
-
-    var body: some View {
-        let shape = NibDropletShape(cornerRadius: style.cornerRadius == nil ? nil : presentation.cornerRadius)
-        shape
-            .fill(frozen ? tint : Color.clear)
-            .frame(width: max(0, presentation.bodySize.width), height: max(0, presentation.bodySize.height))
-            .glassEffect(frozen ? .identity : style.systemGlass, in: shape)
-            .modifier(GlassIDModifier(id: id, namespace: namespace))
-            .overlay {
-                // Nothing is painted on system glass at rest: its own rim, shadow and lensing are the droplet (a bud's
-                // outline is for the iOS 17–25 water only). Held, the rim brightens (DESIGN.md §10.9).
-                if presentation.rim > 1.001 {
-                    NibLiftRim(cornerRadius: style.cornerRadius == nil ? nil : presentation.cornerRadius,
-                               boost: presentation.rim - 1)
+            let enabled = field.usesSystemGlass && style.drawsBody
+            let drawn = enabled && presentation.isDrawn && !presentation.hidden
+            let shape = NibDropletShape(cornerRadius: style.cornerRadius == nil ? nil : presentation.cornerRadius)
+            let dx = enabled ? (presentation.bodySize.width - presentation.restSize.width) / 2 : 0
+            let dy = enabled ? (presentation.bodySize.height - presentation.restSize.height) / 2 : 0
+            content
+                .padding(.horizontal, dx)
+                .padding(.vertical, dy)
+                .background {
+                    if drawn {
+                        if field.isFrozen {
+                            shape.fill(NibGlassBodyTint.color(style.glassKind, paperShare: presentation.paperShare))
+                        } else {
+                            shape.fill(NibGlassBodyTint.systemUnderlay(style.glassKind, colorScheme: colorScheme,
+                                                                       paperShare: presentation.paperShare))
+                        }
+                    }
                 }
-            }
-            .offset(x: presentation.bodyOffset.x, y: presentation.bodyOffset.y)
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-    }
-
-    private var tint: Color {
-        switch style.material {
-        case .clear: return NibColor.clearBody
-        case .deep: return NibColor.deepBody
-        case .tinted: return NibColor.accent
+                .glassEffect(drawn && !field.isFrozen ? style.systemGlass : .identity, in: shape)
+                .modifier(GlassIDModifier(id: id, namespace: namespace))
+                .overlay {
+                    if drawn && presentation.rim > 1.001 {
+                        NibLiftRim(cornerRadius: shape.cornerRadius, boost: presentation.rim - 1)
+                    }
+                }
+                .offset(x: enabled ? presentation.bodyOffset.x : 0, y: enabled ? presentation.bodyOffset.y : 0)
+                .padding(.vertical, -dy)
+                .padding(.horizontal, -dx)
+        } else {
+            content
         }
     }
 }
@@ -252,11 +250,14 @@ struct RestReader: View {
     let field: DropletField
 
     var body: some View {
-        GeometryReader { proxy in
-            Color.clear
-                .onAppear { field.setRest(id, proxy.frame(in: NibLiquid.space), style: style) }
-                .onChange(of: proxy.frame(in: NibLiquid.space)) { _, frame in field.setRest(id, frame, style: style) }
-        }
+        Color.clear
+            // Custom Layout places its children after their bodies are evaluated. Observe the final geometry,
+            // including the first usable frame, rather than relying on appearance or another body evaluation.
+            .onGeometryChange(for: CGRect.self) { proxy in
+                proxy.frame(in: NibLiquid.space)
+            } action: { frame in
+                field.setRest(id, frame, style: style)
+            }
     }
 }
 
@@ -265,10 +266,11 @@ struct BudAnchorReader: View {
     @Environment(DropletField.self) private var field: DropletField?
 
     var body: some View {
-        GeometryReader { proxy in
-            Color.clear
-                .onAppear { field?.setWorldAnchor(id, proxy.frame(in: NibLiquid.space)) }
-                .onChange(of: proxy.frame(in: NibLiquid.space)) { _, frame in field?.setWorldAnchor(id, frame) }
-        }
+        Color.clear
+            .onGeometryChange(for: CGRect.self) { proxy in
+                proxy.frame(in: NibLiquid.space)
+            } action: { frame in
+                field?.setWorldAnchor(id, frame)
+            }
     }
 }

@@ -1,16 +1,20 @@
 import SwiftUI
 import UIKit
+import Combine
 import NibContracts
 import NibDesign
 
 // MARK: - Layout
 
-/// The tab strip the shell shows above the document chrome: one Clear droplet, centred, holding the Library button and
+/// The tab strip above the document chrome: one Clear droplet, centred, holding the Library button and
 /// up to five 32 pt tab capsules (DESIGN.md §14.2); tabs that do not fit go into a "N more" menu, and the current tab
 /// is always among the visible ones. Pure, so it is unit-tested.
 enum TabStripLayout {
-    /// The shell gives the strip this height.
+    static let dropletID = "windows.tabs"
+    /// Visual height; the legacy library host also receives this height from the shell.
     static let stripHeight: CGFloat = 36
+    /// Until chrome exposes a centre slot, its bars sit a full droplet gap below the tabs.
+    static let documentTopInset = stripHeight + NibSpacing.l
     static let tabHeight = NibMetrics.tabCapsuleHeight
     /// Tab capsules sit concentric inside the droplet.
     static let inset: CGFloat = (stripHeight - tabHeight) / 2
@@ -34,11 +38,10 @@ enum TabStripLayout {
 
     static func tabWidths(compact: Bool) -> ClosedRange<CGFloat> { compact ? 96...180 : 120...220 }
 
-    /// Tabs on (Settings › Editing) show the strip from the first document; tabs off, once there is a second tab to
-    /// switch to. Not by width: the strip is built before the window has one, and a Split View or Stage Manager resize
-    /// does not rebuild it; `plan` fits it to whatever width it gets.
-    static func showsStrip(tabCount: Int, openAsTabs: Bool) -> Bool {
-        tabCount > 1 || (tabCount == 1 && openAsTabs)
+    /// Optional chrome only appears when enabled and there is another document to switch to. Opening policy
+    /// (`editing.openAsTabs`) is separate: restored tabs never force chrome on, and one document needs no strip.
+    static func showsStrip(tabCount: Int, enabled: Bool) -> Bool {
+        enabled && tabCount > 1
     }
 
     static func plan(count: Int, active: Int?, width: CGFloat) -> Plan {
@@ -70,6 +73,43 @@ enum TabStripLayout {
     }
 }
 
+// MARK: - Settings
+
+/// Settings › Editing › Tabs. Uses the shared command and store, without redeclaring `editing.openAsTabs`.
+@MainActor
+struct WindowTabsSettingsView: View {
+    let app: NibApp
+    @State private var enabled: Bool
+
+    init(app: NibApp) {
+        self.app = app
+        _enabled = State(initialValue: app.settings.get(WindowSettings.showTabs))
+    }
+
+    var body: some View {
+        List {
+            Section {
+                Toggle(String(localized: "Show document tabs"), isOn: Binding(
+                    get: { enabled },
+                    set: { value in
+                        app.perform(CommandIDs.settingsSet,
+                                    ["name": .string(WindowSettings.showTabs.name), "value": .bool(value)])
+                    }))
+            } footer: {
+                Text(String(localized: "Show tabs when more than one document is open."))
+                    .font(NibFont.footnote)
+                    .foregroundStyle(NibColor.labelSecondary)
+            }
+        }
+        .listStyle(.insetGrouped)
+        .onReceive(NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
+            .receive(on: DispatchQueue.main)) { note in
+                guard note.userInfo?["name"] as? String == WindowSettings.showTabs.name else { return }
+                enabled = app.settings.get(WindowSettings.showTabs)
+            }
+    }
+}
+
 // MARK: - Model
 
 /// Cancels an event subscription when its owner goes away.
@@ -93,10 +133,12 @@ final class TabStripModel: ObservableObject {
     @Published private(set) var tabs: [Tab] = []
     @Published private(set) var activeIndex: Int? = nil
     @Published private(set) var showsLibrary = false
+    @Published private(set) var isVisible = false
     let app: NibApp
     let scenes: WindowScenes
     private(set) weak var navigator: SceneNavigator?
     private var libraryWatch: EventToken?
+    private var settingsWatch: AnyCancellable?
 
     init(app: NibApp, navigator: SceneNavigator, scenes: WindowScenes) {
         self.app = app
@@ -107,6 +149,12 @@ final class TabStripModel: ObservableObject {
             guard event.type == NibEventType.libraryChanged else { return }
             Task { @MainActor [weak self] in self?.reload() }
         })
+        settingsWatch = NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard note.userInfo?["name"] as? String == WindowSettings.showTabs.name else { return }
+                Task { @MainActor [weak self] in self?.reload() }
+            }
     }
 
     /// The tab on screen; nil while the library is.
@@ -118,6 +166,7 @@ final class TabStripModel: ObservableObject {
         tabs = docs.enumerated().map { Tab(id: $0.element, index: $0.offset, title: scenes.title(of: $0.element)) }
         activeIndex = navigator.activeDocument.flatMap { docs.firstIndex(of: $0) }
         showsLibrary = navigator.session.document == nil
+        isVisible = TabStripLayout.showsStrip(tabCount: docs.count, enabled: app.settings.get(WindowSettings.showTabs))
     }
 
     func select(_ index: Int) {
@@ -163,9 +212,11 @@ struct TabStripView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let plan = TabStripLayout.plan(count: model.tabs.count, active: model.activeIndex, width: proxy.size.width)
-            strip(plan)
-                .frame(width: proxy.size.width, height: proxy.size.height)
+            if model.isVisible {
+                let plan = TabStripLayout.plan(count: model.tabs.count, active: model.activeIndex, width: proxy.size.width)
+                strip(plan)
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+            }
         }
         .nibChromeTypeCap()
     }
@@ -186,7 +237,7 @@ struct TabStripView: View {
         }
         .padding(.horizontal, TabStripLayout.inset)
         .frame(height: TabStripLayout.stripHeight)
-        .nibGlass(.clear)
+        .droplet(TabStripLayout.dropletID, style: .bar)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Tabs"))
     }
@@ -323,26 +374,116 @@ struct TabDrag: ViewModifier {
     }
 }
 
-// MARK: - UIKit host
+// MARK: - Document floating host
 
-/// The view `makeTabBar` hands the shell. The shell lays it out 36 pt tall at the top of the safe area; this view
-/// paints the band behind it (desk under documents, background under the library, up through the status bar so the
-/// window has no seam), hosts the SwiftUI strip as a child view controller, and lets the tab capsules' 44 pt hit
-/// areas reach 4 pt past the band, but only under the droplet, never over the canvas beside it.
+/// Uses the contracts-v2 floating host, so tabs share the bars' container, backdrop and Pencil recede behaviour.
+/// The extra safe area moves chrome, not the full-bleed document frame. Only this feature's contribution is removed.
+@MainActor
+final class TabStripDocumentPresentation: ObservableObject {
+    private(set) weak var controller: UIViewController?
+    private(set) weak var host: FloatingHosting?
+    @Published private(set) var top: CGFloat = 0
+    private var reservedTop: CGFloat = 0
+
+    init(controller: UIViewController, host: FloatingHosting) {
+        self.controller = controller
+        self.host = host
+    }
+
+    func present(_ model: TabStripModel) {
+        guard let controller, let host else { return }
+        let required = TabStripLayout.documentTopInset
+        controller.additionalSafeAreaInsets.top += required - reservedTop
+        reservedTop = required
+        updateGeometry()
+        host.present(TabStripLayout.dropletID, content: AnyView(TabStripDocumentView(model: model, placement: self)))
+    }
+
+    func dismiss() {
+        if let controller {
+            controller.additionalSafeAreaInsets.top -= reservedTop
+        }
+        reservedTop = 0
+        host?.dismiss(TabStripLayout.dropletID)
+    }
+
+    func updateGeometry() {
+        guard let controller, let view = controller.viewIfLoaded else { return }
+        let value = max(0, view.safeAreaInsets.top - reservedTop)
+        if top != value { top = value }
+    }
+}
+
+private struct TabStripDocumentView: View {
+    @ObservedObject var model: TabStripModel
+    @ObservedObject var placement: TabStripDocumentPresentation
+
+    var body: some View {
+        GeometryReader { proxy in
+            TabStripView(model: model)
+                .frame(width: proxy.size.width, height: TabStripLayout.stripHeight)
+                .position(x: proxy.size.width / 2,
+                          y: placement.top + NibMetrics.barTopGap + TabStripLayout.stripHeight / 2)
+        }
+        .background(TabStripSafeAreaReader(placement: placement).allowsHitTesting(false))
+    }
+}
+
+/// SwiftUI's floating layer ignores the safe area. Read UIKit's actual document safe area instead, and follow
+/// status-bar changes, rotation and Stage Manager resizing without creating another hosting controller/container.
+private struct TabStripSafeAreaReader: UIViewRepresentable {
+    let placement: TabStripDocumentPresentation
+
+    func makeUIView(context: Context) -> TabStripSafeAreaView {
+        let view = TabStripSafeAreaView()
+        view.placement = placement
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: TabStripSafeAreaView, context: Context) {
+        view.placement = placement
+        view.scheduleUpdate()
+    }
+}
+
+private final class TabStripSafeAreaView: UIView {
+    weak var placement: TabStripDocumentPresentation?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        scheduleUpdate()
+    }
+
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        scheduleUpdate()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        scheduleUpdate()
+    }
+
+    func scheduleUpdate() {
+        Task { @MainActor [weak placement] in placement?.updateGeometry() }
+    }
+}
+
+// MARK: - Legacy UIKit host
+
+/// Used by the library and navigators without a floating host. Its background is transparent, including the status
+/// bar; the capsules' 44 pt hit areas extend only under the droplet. Document windows use their existing container.
 final class TabStripHostView: UIView {
     private let model: TabStripModel
     private let hosting: UIHostingController<TabStripView>
-    private let backdrop = UIView()
 
     init(model: TabStripModel) {
         self.model = model
         hosting = UIHostingController(rootView: TabStripView(model: model))
         super.init(frame: .zero)
-        backdrop.isUserInteractionEnabled = false
-        backdrop.backgroundColor = model.showsLibrary ? NibUIColor.background : NibUIColor.desk
         hosting.view.backgroundColor = .clear
         hosting.safeAreaRegions = []
-        addSubview(backdrop)
         addSubview(hosting.view)
         clipsToBounds = false
     }
@@ -351,13 +492,10 @@ final class TabStripHostView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let top = frame.minY
-        backdrop.frame = CGRect(x: 0, y: -top, width: bounds.width, height: top + bounds.height)
         hosting.view.frame = bounds.insetBy(dx: 0, dy: -TabStripLayout.overhang)
     }
 
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-        if bounds.contains(point) { return true }
         guard point.y >= -TabStripLayout.overhang, point.y < bounds.maxY + TabStripLayout.overhang else { return false }
         let plan = TabStripLayout.plan(count: model.tabs.count, active: model.activeIndex, width: bounds.width)
         return TabStripLayout.dropletSpan(plan, width: bounds.width).contains(point.x)

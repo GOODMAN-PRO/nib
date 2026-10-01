@@ -22,7 +22,6 @@ extension View {
 struct LibraryGridView: View {
     @ObservedObject var model: LibraryViewModel
     @Environment(\.horizontalSizeClass) private var sizeClass
-    @Environment(\.dynamicTypeSize) private var typeSize
     @State private var contentWidth: CGFloat = 0
     @State private var frames: [String: CGRect] = [:]
     @State private var dragSelection = LibrarySelection()
@@ -70,7 +69,7 @@ struct LibraryGridView: View {
                     .padding(.bottom, NibMetrics.canvasBottomInsetCompact)
                 }
                 .scrollDisabled(model.selection.isSelecting && selecting)
-                .searchable(text: $searchText, prompt: String(localized: "Search this folder"))
+                .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: String(localized: "Search this folder"))
                 .overlay {
                     if model.visibleRows.isEmpty {
                         NibEmptyState(symbol: .search, title: String(localized: "No matching items"),
@@ -95,15 +94,23 @@ struct LibraryGridView: View {
     private var gutter: CGFloat { sizeClass == .compact ? NibSpacing.l : NibMetrics.libraryGutter }
     private var coverWidth: CGFloat { sizeClass == .compact ? NibMetrics.coverSizeCompact.width : NibMetrics.coverSize.width }
     private var coverColumns: [GridItem] {
-        if sizeClass == .compact && !typeSize.isAccessibilitySize {
-            return Array(repeating: GridItem(.flexible(minimum: 0), spacing: gutter), count: LibrarySorting.compactColumns(width: contentWidth))
+        let count = sizeClass == .compact ? LibrarySorting.compactColumns(width: contentWidth)
+            : max(1, Int((contentWidth + gutter) / (coverWidth + gutter)))
+        return Array(repeating: GridItem(.fixed(coverWidth), spacing: gutter, alignment: .top), count: count)
+    }
+    private var folderColumns: [GridItem] {
+        if sizeClass != .compact {
+            let width = max(0, (contentWidth - 3 * NibMetrics.libraryGutter) / 4)
+            return Array(repeating: GridItem(.fixed(width), spacing: NibMetrics.libraryGutter, alignment: .top), count: 4)
         }
-        return [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? NibMetrics.thumbnailWidth : coverWidth), spacing: gutter)]
+        let count = max(1, Int((contentWidth + gutter) / (NibMetrics.folderTileMinWidth + gutter)))
+        let width = max(0, (contentWidth - CGFloat(count - 1) * gutter) / CGFloat(count))
+        return Array(repeating: GridItem(.fixed(width), spacing: gutter, alignment: .top), count: count)
     }
     @ViewBuilder private var grid: some View {
         if !folders.isEmpty {
             Text(String(localized: "Folders")).font(NibFont.title3).foregroundStyle(NibColor.label)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: NibMetrics.folderTileMinWidth), spacing: gutter)], alignment: .leading, spacing: gutter) {
+            LazyVGrid(columns: folderColumns, alignment: .leading, spacing: gutter) {
                 ForEach(folders) { row in
                     cell(row)
                         .nibReflowItem(row.ref, in: model.folderReflow)
@@ -112,7 +119,8 @@ struct LibraryGridView: View {
             }
         }
         if !documents.isEmpty {
-            Text(String(localized: "Notebooks")).font(NibFont.title3).foregroundStyle(NibColor.label)
+            Text(documents.allSatisfy { $0.kind == "notebook" } ? String(localized: "Notebooks") : String(localized: "Documents"))
+                .font(NibFont.title3).foregroundStyle(NibColor.label)
             LazyVGrid(columns: coverColumns, alignment: .leading, spacing: gutter) {
                 ForEach(documents) { row in
                     cell(row)
@@ -132,31 +140,7 @@ struct LibraryGridView: View {
         }
     }
     private func cell(_ row: LibraryRow, list: Bool = false) -> some View {
-        VStack(alignment: .leading, spacing: NibSpacing.xs) {
-            Button {
-                if model.selection.isSelecting { model.setView(["selection": "toggle", "refs": .array([.string(row.ref)])]) }
-                else if row.isFolder { model.setView(["folder": .string(row.ref), "sidebar": false]) }
-                else { model.perform(CommandIDs.docOpen, ["doc": .string(row.ref)]) }
-            } label: {
-                if list { LibraryListRow(row: row, model: model) }
-                else { LibraryCard(row: row, model: model) }
-            }
-            .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(row.accessibilityLabel)
-            .accessibilityValue(row.accessibilityValue)
-            .accessibilityAddTraits(model.selection.isSelecting && model.selection.refs.contains(row.ref) ? .isSelected : [])
-            .contextMenu {
-                LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
-            } preview: { LibraryCard(row: row, model: model) }
-            if model.renaming == row.ref { LibraryRenameField(row: row, model: model) }
-        }
-        .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
-        .background { GeometryReader { geometry in
-            Color.clear.preference(key: LibraryFrames.self, value: [row.ref: geometry.frame(in: .named("library.selection"))])
-        } }
-        .libraryDropTarget(row.isFolder ? row.ref : nil)
-
+        LibraryCell(row: row, model: model, list: list)
     }
     private var selectionGesture: some Gesture {
         DragGesture(minimumDistance: NibSpacing.xs + NibSpacing.xxs, coordinateSpace: .named("library.selection"))
@@ -184,10 +168,58 @@ struct LibraryGridView: View {
     }
 }
 
+/// Loads document counts only for cells the lazy grid/list actually presents.
+private struct LibraryCell: View {
+    let row: LibraryRow
+    @ObservedObject var model: LibraryViewModel
+    @ObservedObject private var cache: LibraryCoverCache
+    let list: Bool
+    @State private var subtitle: String?
+    init(row: LibraryRow, model: LibraryViewModel, list: Bool) {
+        self.row = row; self.model = model; self.cache = model.coverCache; self.list = list
+    }
+    private var isLocked: Bool { row.locked == true || model.app.services.lock?.isLocked(row.nodeID) == true }
+    private func accessibilityValue(subtitle: String?) -> String {
+        [isLocked && row.locked != true ? String(localized: "Locked") : "", row.accessibilityValue(subtitle: subtitle)]
+            .filter { !$0.isEmpty }.joined(separator: ", ")
+    }
+    var body: some View {
+        let visibleSubtitle = isLocked ? nil : subtitle
+        VStack(alignment: .leading, spacing: NibSpacing.xs) {
+            Button {
+                if model.selection.isSelecting { model.setView(["selection": "toggle", "refs": .array([.string(row.ref)])]) }
+                else if row.isFolder { model.setView(["folder": .string(row.ref), "sidebar": false]) }
+                else { model.perform(CommandIDs.docOpen, ["doc": .string(row.ref)]) }
+            } label: {
+                if list { LibraryListRow(row: row, model: model, subtitle: visibleSubtitle) }
+                else { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+            }
+            .buttonStyle(NibPressStyle(shape: RoundedRectangle(cornerRadius: row.isFolder ? NibRadius.tile : NibRadius.coverEdge)))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(row.accessibilityLabel)
+            .accessibilityValue(accessibilityValue(subtitle: visibleSubtitle))
+            .accessibilityAddTraits(model.selection.isSelecting && model.selection.refs.contains(row.ref) ? .isSelected : [])
+            .contextMenu {
+                LibraryMenuEntries(model: model, location: .libraryItem, rows: [row])
+            } preview: { LibraryCard(row: row, model: model, subtitle: visibleSubtitle) }
+            if model.renaming == row.ref { LibraryRenameField(row: row, model: model) }
+        }
+        .frame(maxWidth: .infinity, minHeight: NibMetrics.hitTarget, alignment: .leading)
+        .background { GeometryReader { geometry in
+            Color.clear.preference(key: LibraryFrames.self, value: [row.ref: geometry.frame(in: .named("library.selection"))])
+        } }
+        .libraryDropTarget(row.isFolder ? row.ref : nil)
+        .task(id: row.ref + String(row.modified ?? 0) + ":" + String(cache.revisions[row.nodeID] ?? 0) + ":" + String(isLocked)) {
+            subtitle = cache.subtitle(row, app: model.app)
+        }
+    }
+}
+
 struct LibraryCard: View {
     var row: LibraryRow?
     @ObservedObject var model: LibraryViewModel
     var thumbnail = true
+    var subtitle: String? = nil
     var body: some View {
         if let row {
             if row.isFolder {
@@ -199,16 +231,13 @@ struct LibraryCard: View {
                         if model.selection.isSelecting { NibBadge(.type(model.selection.refs.contains(row.ref) ? .checkCircleFill : .circle)).padding(NibSpacing.xs) }
                     }
             } else {
-                NibDocumentCard(title: row.name, subtitle: row.pages.map(LibraryRow.pageCount) ?? String(localized: "Document"),
-                    isFavorite: row.favorite == true, typeBadge: badge(row.kind),
+                NibDocumentCard(title: row.name, subtitle: subtitle ?? row.subtitle(),
+                    isFavorite: row.favorite == true, typeBadge: row.typeBadge,
                     isSelected: model.selection.isSelecting ? model.selection.refs.contains(row.ref) : nil, absorbOffset: model.absorbing[row.ref]) {
                         LibraryCover(row: row, model: model, loadsThumbnail: thumbnail)
                     }
             }
         }
-    }
-    private func badge(_ kind: String) -> NibSymbol? {
-        switch kind { case "whiteboard": return .whiteboard; case "textDocument": return .textDocument; case "studySet": return .studySets; default: return nil }
     }
 }
 
@@ -225,20 +254,20 @@ struct LibraryCover: View {
         ZStack {
             NibPaper.white.color
             if !isLocked, let rendered = image ?? model.coverCache.images.object(forKey: cacheKey as NSString) { Image(uiImage: rendered).resizable().scaledToFit() }
-            else { Image(nib: isLocked ? .lock : .notebook).font(NibFont.display).foregroundStyle(NibColor.labelTertiary) }
+            else { Image(nib: isLocked ? .lock : row.typeBadge ?? .notebook).font(NibFont.display).foregroundStyle(NibColor.labelTertiary) }
         }
         .overlay(alignment: .topLeading) {
             HStack(spacing: NibSpacing.xs) {
                 if isLocked { NibBadge(.type(.lock)) }
-                if row.sync != SyncBadge.synced.rawValue { NibBadge(.type(row.sync == SyncBadge.error.rawValue ? .syncError : row.sync == SyncBadge.localOnly.rawValue ? .notebook : .syncing)) }
+                if let symbol = row.syncSymbol { NibBadge(.type(symbol)) }
             }.padding(NibSpacing.xs)
         }
         .accessibilityLabel(status)
         .task(id: cacheKey + String(cache.revisions[row.nodeID] ?? 0)) { await load() }
     }
     private var status: String {
-        [row.locked == true ? String(localized: "Locked") : "", row.favorite == true ? String(localized: "Favourite") : "",
-         row.sync == SyncBadge.error.rawValue ? String(localized: "Sync error") : row.sync == SyncBadge.syncing.rawValue ? String(localized: "Syncing") : ""].filter { !$0.isEmpty }.joined(separator: ", ")
+        [isLocked && row.locked != true ? String(localized: "Locked") : "", row.accessibilityStatus]
+            .filter { !$0.isEmpty }.joined(separator: ", ")
     }
     private var isLocked: Bool { row.locked == true || model.app.services.lock?.isLocked(row.nodeID) == true }
     private var cacheKey: String { row.ref + String(row.modified ?? 0) }
@@ -251,12 +280,14 @@ struct LibraryCover: View {
 struct LibraryListRow: View {
     let row: LibraryRow
     @ObservedObject var model: LibraryViewModel
+    var subtitle: String? = nil
     var body: some View {
         HStack(spacing: NibSpacing.l) {
             if row.isFolder { Image(nib: .folderFill).foregroundStyle(NibColor.labelSecondary) }
             else { LibraryCover(row: row, model: model).frame(width: NibMetrics.rowThumbnailWidth, height: NibMetrics.barHeightMax) }
             VStack(alignment: .leading, spacing: NibSpacing.xs) {
                 Text(row.name).font(NibFont.body).foregroundStyle(NibColor.label)
+                if !row.isFolder { Text(subtitle ?? row.subtitle()).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary) }
                 Text(Date(timeIntervalSince1970: row.modified ?? 0), style: .date).font(NibFont.caption1).foregroundStyle(NibColor.labelSecondary)
             }
             Spacer()

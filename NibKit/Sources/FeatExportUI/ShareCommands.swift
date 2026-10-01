@@ -257,7 +257,8 @@ enum ExportPresentation {
     static let anchorID = "exportui.source"
     static func anchorRect(in parent: UIViewController) -> CGRect {
         CGRect(x: parent.view.bounds.maxX - NibMetrics.hitTarget - NibMetrics.chromeInset,
-               y: parent.view.safeAreaInsets.top, width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
+               y: parent.view.safeAreaInsets.top + NibMetrics.barTopGap,
+               width: NibMetrics.hitTarget, height: NibMetrics.hitTarget)
     }
     static func anchor(_ controller: UIViewController, in parent: UIViewController) {
         guard let popover = controller.popoverPresentationController else { return }
@@ -277,12 +278,21 @@ final class SystemExportPresenter: NSObject, ExportPresenting, UIDocumentPickerD
         let session = ctx.activeSession
         let isCompact = parent.traitCollection.horizontalSizeClass == .compact
         if !isCompact, let host = session?.floatingHost ?? ctx.navigator?.floatingHost {
-            let source = ExportPresentation.anchorID
+            let anchorID = ExportPresentation.anchorID
+            // The document chrome owns Share's real bud anchor. Library exports use the registered fallback.
+            let source = session?.document != nil ? "chrome.anchor.share" : anchorID
             let rect = ExportPresentation.anchorRect(in: parent)
-            guard host.setAnchor(source, rect: rect, in: parent.view) else { throw NibError.unavailable("the export anchor") }
+            guard let sourceRect = host.containerRect(rect, from: parent.view),
+                  host.setAnchor(anchorID, rect: rect, in: parent.view) else { throw NibError.unavailable("the export anchor") }
             host.present("exportui.dialog", content: AnyView(ExportPopover(selection: selection, draft: draft,
                 printing: printing, app: app, session: session, host: host,
-                source: source, instant: instant)))
+                source: source, sourceRect: sourceRect, updateSourceRect: { [weak parent, weak host] in
+                    guard let parent, let host else { return nil }
+                    let rect = ExportPresentation.anchorRect(in: parent)
+                    guard let converted = host.containerRect(rect, from: parent.view),
+                          host.setAnchor(anchorID, rect: rect, in: parent.view) else { return nil }
+                    return converted
+                }, instant: instant)))
         } else {
             let controller = UIHostingController(rootView: ExportSheet(selection: selection, draft: draft, printing: printing,
                                                                         app: app, session: session))

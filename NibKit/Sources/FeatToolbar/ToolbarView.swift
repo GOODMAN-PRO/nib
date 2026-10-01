@@ -22,14 +22,18 @@ struct ToolbarScreen: View {
     }
 
     var body: some View {
-        GeometryReader { proxy in
-            ToolbarRootView(model: model, size: proxy.size, compact: sizeClass == .compact)
+        if model.isPaletteDocument {
+            GeometryReader { proxy in
+                ToolbarRootView(model: model, size: proxy.size, compact: sizeClass == .compact)
+            }
+            // Settings › Appearance › Liquid for the palette's own motion (the Reduce Motion / Off cross-fade).
+            .nibLiquidMode(model.liquidMode)
+            .onAppear { model.attachUndoManager(undoManager) }
+            .onChange(of: undoManager.map { ObjectIdentifier($0) }) { _, _ in model.attachUndoManager(undoManager) }
+            .onDisappear { model.attachUndoManager(nil) }
+        } else {
+            EmptyView()
         }
-        // Settings › Appearance › Liquid for the palette's own motion (the Reduce Motion / Off cross-fade).
-        .nibLiquidMode(model.liquidMode)
-        .onAppear { model.attachUndoManager(undoManager) }
-        .onChange(of: undoManager.map { ObjectIdentifier($0) }) { _, _ in model.attachUndoManager(undoManager) }
-        .onDisappear { model.attachUndoManager(nil) }
     }
 }
 
@@ -169,12 +173,21 @@ final class ToolbarModel: ObservableObject {
         commits?.cancel()
     }
 
-    var showsPalette: Bool { !isReadOnly && kind != nil && !(shown.isEmpty && more.isEmpty) }
+    var isPaletteDocument: Bool { kind.map { ToolbarLayoutEngine.paletteKinds.contains($0) } ?? false }
+
+    var showsPalette: Bool { isPaletteDocument && !isReadOnly && !(shown.isEmpty && more.isEmpty) }
 
     /// The palette's items for this width: an item that is not for compact widths stays off the iPhone palette.
     func items(compact: Bool) -> (shown: [PaletteItem], more: [PaletteItem]) {
         guard compact else { return (shown, more) }
         return (shown.filter { $0.showsInCompactWidth }, more.filter { $0.showsInCompactWidth })
+    }
+
+    /// An unmatched selection draws no bead in `NibToolPalette`. Keep the session's tool unchanged when its item
+    /// is absent at this width; a tool in More still has a slot because the palette promotes it when selected.
+    func paletteSelection(compact: Bool) -> String {
+        let items = items(compact: compact)
+        return (items.shown + items.more).contains { $0.isTool && $0.id == tool } ? tool : ""
     }
 
     // MARK: Reading state
@@ -519,29 +532,33 @@ struct ToolbarRootView: View {
     /// snaps to the dock the projected finger chose and plips once; its re-form and the Reduce Motion cross-fade are
     /// the engine's too. The dock binding hands every move to `toolbar.dock`.
     var body: some View {
-        let dock = model.dock(for: size, compact: compact)
-        let inks = model.quickInks(compact: compact)
-        let items = model.items(compact: compact)
-        ZStack(alignment: .topLeading) {
-            if model.showsPalette {
-                if model.isVisible {
-                    NibToolPalette(id: ToolbarModel.paletteID, tools: items.shown.map { tool($0) },
-                                   moreTools: items.more.map { tool($0) }, selection: selection,
-                                   swatches: inks.map { swatch($0) }, swatch: swatchIndex(inks),
-                                   dock: dockBinding(dock),
-                                   toolOptions: { model.toolOptions(for: $0) },
-                                   settingsPresented: $model.settingsOpen, morePresented: $model.moreOpen,
-                                   onReselect: { model.toolReselected($0) }) { id in
-                        ToolSettingsContent(model: model, toolID: id)
+        if model.isPaletteDocument {
+            let dock = model.dock(for: size, compact: compact)
+            let inks = model.quickInks(compact: compact)
+            let items = model.items(compact: compact)
+            ZStack(alignment: .topLeading) {
+                if model.showsPalette {
+                    if model.isVisible {
+                        NibToolPalette(id: ToolbarModel.paletteID, tools: items.shown.map { tool($0) },
+                                       moreTools: items.more.map { tool($0) }, selection: selection,
+                                       swatches: inks.map { swatch($0) }, swatch: swatchIndex(inks),
+                                       dock: dockBinding(dock),
+                                       toolOptions: { model.toolOptions(for: $0) },
+                                       settingsPresented: $model.settingsOpen, morePresented: $model.moreOpen,
+                                       onReselect: { model.toolReselected($0) }) { id in
+                            ToolSettingsContent(model: model, toolID: id)
+                        }
+                    } else {
+                        RevealToolsButton(dock: dock, onDock: { model.requestDock($0) }) { model.setVisible(true) }
                     }
-                } else {
-                    RevealToolsButton(dock: dock, onDock: { model.requestDock($0) }) { model.setVisible(true) }
                 }
             }
-        }
-        .frame(width: size.width, height: size.height, alignment: .topLeading)
-        .onChange(of: WindowMetrics(size: size, compact: compact), initial: true) { _, window in
-            model.windowDidChange(size: window.size, compact: window.compact)
+            .frame(width: size.width, height: size.height, alignment: .topLeading)
+            .onChange(of: WindowMetrics(size: size, compact: compact), initial: true) { _, window in
+                model.windowDidChange(size: window.size, compact: window.compact)
+            }
+        } else {
+            EmptyView()
         }
     }
 
@@ -551,7 +568,7 @@ struct ToolbarRootView: View {
     }
 
     private var selection: Binding<String> {
-        Binding(get: { model.tool }, set: { model.select($0) })
+        Binding(get: { model.paletteSelection(compact: compact) }, set: { model.select($0) })
     }
 
     /// Positions in `inks`, which on iPhone holds only the current ink.

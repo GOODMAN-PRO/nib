@@ -5,6 +5,8 @@ import NibDesign
 
 public enum FeatSyncUIFeature: NibFeature {
     public static let id = "syncui"
+    /// F019's inline library header slot. The boxed main-actor factory returns nil when hidden.
+    public static let libraryBannerKey = "syncui.libraryBanner"
 
     public static func register(_ app: NibApp) {
         app.services.set(RepairState(), for: RepairState.key)
@@ -38,13 +40,12 @@ public enum FeatSyncUIFeature: NibFeature {
             isVisible: { $0.kind == nil && $0.isCompact }) { context in
                 AnyView(CloudStatusButton(app: context.app, model: CloudStatusModel.shared(context.app), compact: true))
             })
-        app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
-            id: "syncui.containerBanner", owner: id, placement: .topLeading, surface: .none,
-            recedesWhileWriting: true, isVisible: { context in
-                context.kind == nil && context.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true
-            }) { context in
-                AnyView(ContainerLibraryBanner(app: context.app))
-            })
+        let libraryBanner: @MainActor (ChromeContext) -> AnyView? = { context in
+            guard context.kind == nil,
+                  context.app.services.get("library.inContainer", as: NSNumber.self)?.boolValue == true else { return nil }
+            return AnyView(ContainerLibraryBanner(app: context.app))
+        }
+        app.services.set(libraryBanner as AnyObject, for: libraryBannerKey)
         app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
             id: "syncui.readOnlyBanner", owner: id, placement: .top, surface: .none,
             recedesWhileWriting: true, isVisible: { context in

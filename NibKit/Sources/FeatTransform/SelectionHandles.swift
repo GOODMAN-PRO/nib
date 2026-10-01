@@ -45,8 +45,8 @@ struct BoxMemo {
 struct HandleLayout {
     /// 12 pt beads (DESIGN.md §14.3).
     static let bead = NibMetrics.handleBead
-    /// The rotation bead floats 24 pt above the top edge on a hairline.
-    static let rotationLift = NibMetrics.rotationHandleOffset
+    /// Keep the rotation and top-edge hit areas separate, with a small gap in canvas-view points at any zoom.
+    static let rotationLift = max(NibMetrics.rotationHandleOffset, NibMetrics.hitTarget + NibSpacing.xs)
     /// Every handle answers within a 44 pt target.
     static let reach = NibMetrics.hitTarget / 2
     /// Sides shorter than this on screen keep only their corners.
@@ -134,7 +134,7 @@ struct HandleLayout {
 
 /// "transform.handles": the selection's scale, resize and rotation handles and drag-to-move, claimed before the tap
 /// handlers and the active tool, so they work whatever tool is active (ARCHITECTURE.md §8.5). Two fingers, or
-/// Option, drag out a copy. Handles are rigid water beads (`NibHandleView`): Clear corners, Tinted edges, a Clear
+/// Option, drag out a copy. Handles are rigid Tinted water beads (`NibHandleView`): corners, edges and the
 /// rotation bead on a hairline (DESIGN.md §14.3); nothing on them deforms or animates. A pointer or a hovering Pencil
 /// over a handle washes its 44 pt hit area. Taps, double-taps and long-presses on the selection are not drags: they
 /// pass on to the tap handlers (`gesture(_:at:host:)` returns false).
@@ -178,9 +178,9 @@ final class SelectionHandles: NSObject, CanvasAttachment, UIGestureRecognizerDel
 
     override init() {
         overlay = UIView(frame: .zero)
-        cornerBeads = (0..<4).map { _ in NibHandleView(style: .clear) }
+        cornerBeads = (0..<4).map { _ in NibHandleView(style: .tinted) }
         edgeBeads = (0..<4).map { _ in NibHandleView(style: .tinted) }
-        rotationBead = NibHandleView(style: .clear)
+        rotationBead = NibHandleView(style: .tinted)
         accessView = HandleAccessView(frame: .zero)
         super.init()
     }

@@ -186,14 +186,16 @@ final class FeatBridgeUITests: XCTestCase {
         XCTAssertTrue(page?.keywords.contains("Claude Code") ?? false)
         XCTAssertTrue(page?.keywords.contains("MagicDNS") ?? false)
 
-        let pill = h.app.ui.chromeOverlays.get(BridgeUIIDs.statusOverlay)
-        XCTAssertEqual(pill?.placement, .topLeading)
-        XCTAssertEqual(pill?.surface, .pill)
-        XCTAssertEqual(pill?.recedesWhileWriting, true, "the pill steps back while the Pencil is down")
-        XCTAssertEqual(pill?.isInteractive, true)
+        let status = h.app.ui.toolbar.get(BridgeUIIDs.statusItem)
+        XCTAssertEqual(status?.group, .navLeading)
+        XCTAssertEqual(status?.navSlot, .afterTitle)
+        XCTAssertNotNil(status?.compactStatus)
+        XCTAssertNil(h.app.ui.chromeOverlays.get(BridgeUIIDs.statusItem))
+        let libraryPill = h.app.ui.chromeOverlays.get(BridgeUIIDs.libraryStatusOverlay)
+        XCTAssertEqual(libraryPill?.placement, .topTrailing, "library status joins the floating top-right controls")
+        XCTAssertEqual(libraryPill?.surface, .pill)
         let context = ChromeContext(app: h.app, session: h.session, kind: .notebook)
-        XCTAssertEqual(h.app.ui.visibleChromeOverlays(context).map { $0.id }.contains(BridgeUIIDs.statusOverlay), false,
-                       "no pill while the bridge is off")
+        XCTAssertNil(status?.compactStatus?(context), "no status while the bridge is off")
 
         let key = h.app.content.keyCommands.get(BridgeUIIDs.keyCommand)
         XCTAssertEqual(key?.command, "settings.open")
@@ -216,6 +218,31 @@ final class FeatBridgeUITests: XCTestCase {
         XCTAssertTrue(h.app.commands.all().filter { $0.owner == "bridgeui" }.isEmpty,
                       "every action runs F090's or the contracts' commands; F091 owns none (ARCHITECTURE §6.5)")
         XCTAssertFalse(monitor.isStarted, "register never subscribes; start does")
+    }
+
+    func testRegistersAfterTitleStatusInEveryDocumentKindAndWidth() async throws {
+        let (h, fake, monitor) = makeHarness()
+        fake?.clients = [["name": "claude-code", "sessions": 1]]
+        try await h.run("bridge.setEnabled", ["enabled": true])
+        await monitor.refresh()
+        let item = try XCTUnwrap(h.app.ui.toolbar.get(BridgeUIIDs.statusItem))
+        XCTAssertEqual(item.owner, "bridgeui")
+        XCTAssertEqual(item.navSlot, .afterTitle)
+        XCTAssertFalse(item.hideable)
+        XCTAssertTrue(item.showsInCompactWidth)
+        for kind in DocumentKind.allCases {
+            XCTAssertTrue(h.app.ui.toolbarItems(for: kind).contains { $0.id == item.id })
+            for compact in [false, true] {
+                let context = ChromeContext(app: h.app, session: h.session, kind: kind, isCompact: compact)
+                XCTAssertNotNil(item.compactStatus?(context))
+                XCTAssertFalse(h.app.ui.visibleChromeOverlays(context).contains { $0.id == item.id })
+            }
+        }
+        XCTAssertNil(item.compactStatus?(ChromeContext(app: h.app, session: h.session)),
+                     "the library continues to use its existing overlay")
+        try await h.run("bridge.setEnabled", ["enabled": false])
+        await monitor.refresh()
+        XCTAssertNil(item.compactStatus?(ChromeContext(app: h.app, session: h.session, kind: .notebook)))
     }
 
     /// Shell v2 (contracts-v2.2) routes key commands by `KeyCommandRouting`: the Bridge Settings key is live in the
@@ -314,7 +341,11 @@ final class FeatBridgeUITests: XCTestCase {
         await fulfillment(of: [update], timeout: 2)
         XCTAssertTrue(monitor.pillVisible)
         let context = ChromeContext(app: h.app, session: h.session, kind: .notebook)
-        XCTAssertTrue(h.app.ui.visibleChromeOverlays(context).contains { $0.id == BridgeUIIDs.statusOverlay })
+        XCTAssertNotNil(h.app.ui.toolbar.get(BridgeUIIDs.statusItem)?.compactStatus?(context))
+        XCTAssertFalse(h.app.ui.visibleChromeOverlays(context).contains { $0.id == BridgeUIIDs.libraryStatusOverlay })
+        let libraryContext = ChromeContext(app: h.app, session: h.session)
+        XCTAssertEqual(h.app.ui.visibleChromeOverlays(libraryContext).map { $0.id }, [BridgeUIIDs.libraryStatusOverlay],
+                       "the library renders one status at the top right, never over its sidebar title")
     }
 
     func testMonitorRefreshesOnBridgeStatusEventsAndSettingChanges() async throws {
@@ -941,20 +972,37 @@ final class FeatBridgeUITests: XCTestCase {
         let connected = BridgePillPresentation.make(busy, compact: false, now: now)
         XCTAssertEqual(connected.dot, .connected)
         XCTAssertEqual(connected.primary, "claude-code")
-        XCTAssertEqual(connected.secondary, "+1 \u{00B7} page.add")
+        XCTAssertEqual(connected.secondary, "+1")
         XCTAssertTrue(connected.accessibilityLabel.contains("claude-code"))
         XCTAssertTrue(connected.accessibilityLabel.contains("cursor"))
-        XCTAssertTrue(connected.accessibilityLabel.contains("page.add"))
+        XCTAssertFalse(connected.accessibilityLabel.contains("page.add"), "command details belong in the popover")
         XCTAssertEqual(BridgePillPresentation.make(busy, compact: true, now: now).secondary, "+1", "compact: name and count")
 
         let later = BridgePillPresentation.make(busy, compact: false, now: Date(timeIntervalSince1970: 1_010_000))
-        XCTAssertEqual(later.secondary, "+1", "an old call is not named in the pill")
+        XCTAssertEqual(later.secondary, "+1", "call age never changes the status label")
 
         let missing = BridgePillPresentation.make(BridgeSnapshot(enabled: true, state: .tokenMissing), compact: false, now: now)
         XCTAssertEqual(missing.dot, .warning)
         let failed = BridgePillPresentation.make(BridgeSnapshot(enabled: true, state: .failed), compact: true, now: now)
         XCTAssertEqual(failed.dot, .warning)
         XCTAssertNil(failed.secondary)
+    }
+
+    func testStatusKeepsRawCommandsInDetailsForEveryWidth() {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        for command in ["toolbar.dock", "panel.open", "library.setView"] {
+            let call = BridgeSnapshot.Call(client: "mcp", tool: "nib_run", command: command, at: now.timeIntervalSince1970)
+            let snapshot = BridgeSnapshot(enabled: true, state: .listening,
+                                          clients: [BridgeSnapshot.Client(name: "mcp", sessions: 1)], lastCall: call)
+            for compact in [false, true] {
+                let presentation = BridgePillPresentation.make(snapshot, compact: compact, now: now)
+                XCTAssertEqual(presentation.dot, .connected)
+                XCTAssertEqual(presentation.primary, "mcp")
+                XCTAssertNil(presentation.secondary, "a single client's status never includes the last command")
+                XCTAssertFalse(presentation.accessibilityLabel.contains(command))
+            }
+            XCTAssertTrue(BridgeFormat.callText(call, now: now).contains(command), "details retain the last command")
+        }
     }
 
     func testClientAndCallText() {
@@ -1042,7 +1090,8 @@ final class FeatBridgeUITests: XCTestCase {
 
         for compact in [false, true] {
             let context = ChromeContext(app: h.app, session: h.session, kind: .notebook, isCompact: compact)
-            let pill = try XCTUnwrap(h.app.ui.chromeOverlays.get(BridgeUIIDs.statusOverlay)).makeView(context)
+            let status = try XCTUnwrap(h.app.ui.toolbar.get(BridgeUIIDs.statusItem)?.compactStatus)
+            let pill = try XCTUnwrap(status(context))
             XCTAssertEqual(NibSnapshot.images(pill, size: CGSize(width: 320, height: 44)).count,
                            NibSnapshot.Variant.allCases.count)
         }

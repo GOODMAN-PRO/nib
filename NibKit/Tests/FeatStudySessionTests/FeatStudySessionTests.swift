@@ -163,8 +163,8 @@ final class FeatStudySessionTests: XCTestCase {
 
     func testSchemasPanelsShortcutsAndConformance() async throws {
         let (h, _, _) = harness()
-        XCTAssertNotNil(h.app.ui.panels.get(PanelIDs.studyPractice))
-        XCTAssertNotNil(h.app.ui.panels.get(PanelIDs.studySmartLearn))
+        XCTAssertEqual(h.app.ui.panels.get(PanelIDs.studyPractice)?.placement, .fullScreen)
+        XCTAssertEqual(h.app.ui.panels.get(PanelIDs.studySmartLearn)?.placement, .fullScreen)
         XCTAssertTrue(h.app.content.keyCommands.all.filter { $0.owner == "studysession" }.allSatisfy { $0.docKinds == [.studySet] })
         for descriptor in h.app.commands.all() where descriptor.owner == "studysession" {
             XCTAssertFalse(descriptor.examples.isEmpty)
@@ -182,6 +182,57 @@ final class FeatStudySessionTests: XCTestCase {
             try await h.run(CommandIDs.studySetTheme, ["doc": "doc:FIXTUREDOC01", "card": "ivory"])
             XCTFail("Notebook must not be treated as a study set")
         } catch let error as NibError { XCTAssertEqual(error.code, .invalidParams) }
+    }
+
+    func testPracticeGradeKeysAdvanceAndKeepCompletedSessionAfterReload() async throws {
+        let (h, runtime, _) = harness()
+        let model = runtime.model(app: h.app, doc: doc, session: h.session)
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "start", "mode": "practice"])
+        let first = try XCTUnwrap(model.current)
+        let total = model.queue.count
+        let before = try h.snapshot(doc)
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "grade", "rating": "hard"])
+        XCTAssertEqual(try h.snapshot(doc), before, "A hidden answer cannot be graded by a shortcut.")
+        XCTAssertEqual(model.current?.id, first.id)
+
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "flip", "instant": true])
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "grade", "rating": "hard"])
+        XCTAssertEqual(model.index, 1)
+        XCTAssertFalse(model.flipped)
+        XCTAssertEqual(model.reviewed, [first.id])
+        XCTAssertEqual(model.hardest, [first.id])
+
+        // Revisiting a graded practice card must still allow grading and advancing it again.
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "previous"])
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "flip", "instant": true])
+        try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "grade", "rating": "good"])
+        XCTAssertEqual(model.index, 1)
+        XCTAssertEqual(model.reviewed, [first.id])
+
+        while let card = model.current {
+            try await h.run(CommandIDs.studyGrade, ["card": .string(NodeRef.card(doc, card.id).description), "knewIt": true])
+        }
+        try await model.reload()
+        XCTAssertNil(model.current, "Reloading after the final grade must preserve the summary.")
+        XCTAssertEqual(model.index, total)
+        XCTAssertEqual(model.reviewed.count, total)
+        XCTAssertEqual(h.undoDepth(doc), 0)
+    }
+
+    func testStudyCardFitsAvailableSpaceAndPreservesPaperAspectRatio() {
+        let paper = NibMetrics.studyCardSize
+        XCTAssertEqual(StudyCardLayout.fittingSize(in: CGSize(width: 1_024, height: 768)), paper)
+        let portrait = StudyCardLayout.fittingSize(in: CGSize(width: 390 - 2 * NibSpacing.l, height: 600))
+        XCTAssertEqual(portrait.width, 358, accuracy: 0.01)
+        // A 402 pt landscape window leaves a much shorter slot once its HUD and grading row are reserved.
+        let landscape = StudyCardLayout.fittingSize(in: CGSize(width: 874 - 2 * NibSpacing.l, height: 200))
+        XCTAssertEqual(landscape.height, 200, accuracy: 0.01)
+        for fitted in [portrait, landscape] {
+            XCTAssertLessThanOrEqual(fitted.width, paper.width)
+            XCTAssertLessThanOrEqual(fitted.height, paper.height)
+            XCTAssertEqual(fitted.width / fitted.height, paper.width / paper.height, accuracy: 0.001)
+        }
+        XCTAssertEqual(StudyCardLayout.fittingSize(in: CGSize(width: 100, height: 0)), .zero)
     }
 
     func testDryRunHasNoSessionOrReminderEffectsAndReadOnlyRejectsGrades() async throws {
@@ -208,18 +259,19 @@ final class FeatStudySessionTests: XCTestCase {
             try await h.run(StudySessionAction.id, ["doc": .string(docRef), "action": "start", "mode": .string(learn ? "smartLearn" : "practice")])
             XCTAssertNotNil(model.current)
             for variant in NibSnapshot.Variant.allCases {
-                for width in [CGFloat(390), CGFloat(768)] {
+                for size in [CGSize(width: 390, height: 844), CGSize(width: 874, height: 402),
+                             CGSize(width: 768, height: 1_024)] {
                     let view = StudySessionView(model: model, smartLearn: learn, close: {}).snapshotContent
-                    let fitted = NibSnapshot.fittingSize(view, width: width, variant: variant)
-                    XCTAssertLessThanOrEqual(fitted.width, width + 1)
-                    let image = try XCTUnwrap(NibSnapshot.image(view,
-                        size: CGSize(width: width, height: max(900, fitted.height)), variant: variant, scale: 1))
-                    // The card must render as paper against its desk, not a blank scroll-view capture.
+                    let fitted = NibSnapshot.fittingSize(view.frame(height: size.height), width: size.width, variant: variant)
+                    XCTAssertLessThanOrEqual(fitted.width, size.width + 1)
+                    XCTAssertLessThanOrEqual(fitted.height, size.height + 1)
+                    let image = try XCTUnwrap(NibSnapshot.image(view, size: size, variant: variant, scale: 1))
+                    // The bounded session must render its paper card in portrait and short landscape windows.
                     let desk = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 1, y: image.size.height - 1)))
-                    let card = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: width / 2, y: 250)))
+                    let card = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: size.width / 2, y: size.height / 2)))
                     XCTAssertNotEqual(card, desk)
                     let attachment = XCTAttachment(image: image)
-                    attachment.name = "\(learn ? "SmartLearn" : "Practice")-\(variant.rawValue)-\(Int(width))"
+                    attachment.name = "\(learn ? "SmartLearn" : "Practice")-\(variant.rawValue)-\(Int(size.width))x\(Int(size.height))"
                     attachment.lifetime = .keepAlways
                     add(attachment)
                 }

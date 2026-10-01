@@ -17,7 +17,7 @@ public enum FeatStudySessionFeature: NibFeature {
         app.commands.register(StudyRequestReminders.self)
         for (panel, learn) in [(PanelIDs.studyPractice, false), (PanelIDs.studySmartLearn, true)] {
             var descriptor = PanelDescriptor(id: panel, title: learn ? String(localized: "Smart Learn") : String(localized: "Practice"),
-                icon: NibSymbol.studySets.name, placement: .sheet, order: learn ? 510 : 500, owner: id, docKinds: [.studySet]) { context in
+                icon: NibSymbol.studySets.name, placement: .fullScreen, order: learn ? 510 : 500, owner: id, docKinds: [.studySet]) { context in
                 guard let runtime = context.app.services.get(StudyRuntime.serviceKey, as: StudyRuntime.self),
                       let doc = context.params["doc"]?.stringValue.map(NodeRef.documentID(from:)) ?? context.session?.document else {
                     return AnyView(NibEmptyState(symbol: .studySets, title: String(localized: "Open a study set")))

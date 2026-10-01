@@ -1407,6 +1407,40 @@ final class FeatCreateTests: XCTestCase {
 
     // MARK: - Screens render (Light, Dark, AX3)
 
+    func testNewNotebookWithCoverColoursFitsA402PointPhone() async throws {
+        let h = harness()
+        h.app.content.templates.register(Self.ruled())
+        h.app.content.templates.register(Self.solidCover())
+        h.app.settings.set(NibSettings.coverByDefault, true)
+        h.app.settings.set(NibSettings.defaultCover, TemplateRef("cover.solid"))
+        let phone = CGSize(width: 402, height: 874)
+
+        for variant in NibSnapshot.Variant.allCases {
+            let sheet = NewNotebookSheet(app: h.app, folder: nil, kind: .notebook, session: h.session,
+                                         navigator: nil, onDone: {})
+                .environment(\.horizontalSizeClass, .compact)
+            // Live hosting lets the sheet measure its width and settle into the compact layout.
+            let captured = try await NibSnapshot.hostedImage(sheet, size: phone, variant: variant)
+            let image = try XCTUnwrap(captured)
+            XCTAssertEqual(image.size, phone)
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "NewNotebook-cover-colours-iPhone-402-\(variant.rawValue)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+
+            // A nine-column swatch grid widens the whole sheet and pushes Cancel into this 16 pt margin.
+            let background = try XCTUnwrap(NibSnapshot.pixel(image, at: .zero))
+            var occupiedMarginPixels = 0
+            for y in 16..<44 {
+                for x in 0..<16 {
+                    let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                    if pixel != background { occupiedMarginPixels += 1 }
+                }
+            }
+            XCTAssertEqual(occupiedMarginPixels, 0, "Cancel must stay inside the sheet padding (\(variant.rawValue))")
+        }
+    }
+
     func testSheetsRenderInEveryVariant() async throws {
         let h = harness()
         h.app.content.templates.register(Self.ruled())

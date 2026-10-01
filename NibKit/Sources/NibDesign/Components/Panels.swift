@@ -319,10 +319,27 @@ public extension View {
             content().modifier(NibSheetChrome())
         }
     }
+
+    /// Item-driven sheets use the same sizing and opaque chrome as Boolean-driven sheets.
+    func nibSheet<Item: Identifiable, SheetContent: View>(item: Binding<Item?>,
+                                                         @ViewBuilder content: @escaping (Item) -> SheetContent) -> some View {
+        sheet(item: item) { item in
+            content(item).modifier(NibSheetChrome())
+        }
+    }
 }
 
 struct NibSheetChrome: ViewModifier {
     func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            chrome(content)
+                .presentationSizing(.form.fitted(horizontal: true, vertical: true))
+        } else {
+            chrome(content)
+        }
+    }
+
+    @ViewBuilder private func chrome(_ content: Content) -> some View {
         if #available(iOS 26.0, *) {
             content
         } else {

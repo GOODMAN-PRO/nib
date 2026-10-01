@@ -76,6 +76,8 @@ struct WindowState: Codable, Equatable {
 }
 
 enum WindowSettings {
+    /// Optional chrome, independent of whether opening a document creates or replaces a tab.
+    static let showTabs = SettingKey("editing.showTabs", default: false, synced: true)
     /// The frontmost window when Nib last went to the background; a cold launch reopens its document.
     static let lastSession = SettingKey("windows.lastSession", default: WindowState.library)
 }

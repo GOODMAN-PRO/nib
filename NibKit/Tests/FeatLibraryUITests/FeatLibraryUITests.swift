@@ -2,7 +2,7 @@ import XCTest
 import SwiftUI
 import UIKit
 import NibContracts
-import NibDesign
+@testable import NibDesign
 import NibTesting
 @testable import FeatLibraryUI
 
@@ -28,6 +28,112 @@ final class FeatLibraryUITests: XCTestCase {
     func testCommandConformance() async {
         let problems = await CommandConformance.check(features: [FeatLibraryUIFeature.self])
         XCTAssertEqual(problems, [])
+    }
+    func testLibraryChromeLayoutRegistersAndDrawsItsDropletBodies() async throws {
+        let h = harness()
+        let model = LibraryModels.get(h.app).model(h.session)
+        let root = LibraryRootView(model: model)
+        for compact in [false, true] {
+            let size = CGSize(width: compact ? 390 : 1024, height: 240)
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                for mode in [NibLiquidMode.full, .off] {
+                    let ids = ["library.controls", "library.new.button"]
+                    let anchors = compact ? ["library.new"] : ["library.new", "library.sort"]
+                    var registeredFrames: [String: CGRect] = [:]
+                    var drawnIDs: Set<String> = []
+                    var registeredAnchors: Set<String> = []
+                    // Use the production controls and their custom layout, over the worst-case contrast backdrop.
+                    let view = ZStack {
+                        NibColor.label
+                        NibDropletContainer {
+                            ZStack {
+                                LibraryChromeOverlayLayout(inlineSidebar: !compact, compact: compact, titleBottom: 64) {
+                                    root.chrome(compact: compact)
+                                        .layoutValue(key: LibraryChromeOverlaySlot.self,
+                                                     value: .init(placement: compact ? .bottomTrailing : .topTrailing,
+                                                                  isControls: true))
+                                }
+                                .padding(NibSpacing.l)
+                                LibraryChromeFieldProbe(ids: ids, anchors: anchors) { field in
+                                    // Copy the state while the live window is attached. hostedImage tears down
+                                    // the window on return, which unregisters droplets from their field.
+                                    for id in ids {
+                                        registeredFrames[id] = field.visualFrame(id)
+                                        if field.node(id).presentation.isDrawn { drawnIDs.insert(id) }
+                                    }
+                                    registeredAnchors = Set(field.worldAnchors.keys)
+                                }
+                            }
+                        }
+                    }
+                    .nibLiquidMode(mode)
+                    .environment(\.horizontalSizeClass, compact ? .compact : .regular)
+                    let rendered = try await NibSnapshot.hostedImage(view, size: size, variant: variant)
+                    let image = try XCTUnwrap(rendered)
+                    let name = "library-chrome-\(compact ? "iphone" : "ipad")-\(variant.rawValue)-\(mode.rawValue)"
+                    let attachment = XCTAttachment(image: image)
+                    attachment.name = name
+                    attachment.lifetime = .keepAlways
+                    add(attachment)
+
+                    let clear = try XCTUnwrap(registeredFrames["library.controls"], "\(name): Clear needs a rest frame")
+                    let tinted = try XCTUnwrap(registeredFrames["library.new.button"], "\(name): New needs a rest frame")
+                    XCTAssertEqual(drawnIDs, Set(ids), name)
+                    XCTAssertEqual(clear.width, compact ? 44 : 140, accuracy: 0.5, name)
+                    XCTAssertEqual(tinted.width, compact ? 44 : 96, accuracy: 0.5, name)
+                    XCTAssertEqual(tinted.height, 44, accuracy: 0.5, name)
+                    XCTAssertEqual(tinted.minX - clear.maxX, 16, accuracy: 0.5, name)
+                    XCTAssertEqual(tinted.maxX, size.width - NibSpacing.l, accuracy: 0.5, name)
+                    XCTAssertEqual(tinted.minY, compact ? size.height - NibSpacing.l - 44 : NibSpacing.l,
+                                   accuracy: 0.5, name)
+
+                    var accentPixels = 0
+                    let interior = tinted.insetBy(dx: 8, dy: 8)
+                    for y in Int(interior.minY)..<Int(interior.maxY) {
+                        for x in Int(interior.minX)..<Int(interior.maxX) {
+                            let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: CGFloat(x), y: CGFloat(y))))
+                            if Int(pixel.b) - Int(pixel.r) > 50 && Int(pixel.b) - Int(pixel.g) > 30 { accentPixels += 1 }
+                        }
+                    }
+                    XCTAssertGreaterThan(Double(accentPixels) / Double(interior.width * interior.height), 0.55,
+                                         "\(name): onAccent must have a visible accent body")
+                    // Sample the core before the Search glyph, beyond the refractive rim band.
+                    let bodyPixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: clear.minX + 9, y: clear.midY)))
+                    if variant == .light {
+                        XCTAssertGreaterThan(bodyPixel.r, 30, "\(name): Clear must draw over black")
+                    } else {
+                        XCTAssertLessThan(bodyPixel.r, 225, "\(name): Clear must draw over white")
+                    }
+                    XCTAssertTrue(registeredAnchors.isSuperset(of: anchors), "\(name): bud anchors must follow placement")
+                }
+            }
+        }
+    }
+    func testLibraryRootChromeSnapshots() async throws {
+        let h = harness()
+        let model = LibraryModels.get(h.app).model(h.session)
+        model.setView(["sidebar": false])
+        for compact in [false, true] {
+            for variant in [NibSnapshot.Variant.light, .dark] {
+                let rendered = try await NibSnapshot.hostedImage(
+                    LibraryRootView(model: model), size: CGSize(width: compact ? 390 : 1024, height: compact ? 844 : 768),
+                    variant: variant)
+                let image = try XCTUnwrap(rendered)
+                let attachment = XCTAttachment(image: image)
+                attachment.name = "library-root-\(compact ? "iphone" : "ipad")-\(variant.rawValue)"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            }
+        }
+    }
+    func testTintedButtonHasAccentBeforeDropletRegistration() throws {
+        let field = DropletField()
+        let image = try XCTUnwrap(NibSnapshot.image(
+            NibDropletButton(id: "new", title: "New", symbol: .plus, kind: .tinted) {}
+                .environment(field).background(NibColor.background), size: CGSize(width: 96, height: 44)))
+        let pixel = try XCTUnwrap(NibSnapshot.pixel(image, at: CGPoint(x: 16, y: 10)))
+        XCTAssertGreaterThan(Int(pixel.b) - Int(pixel.r), 50)
+        XCTAssertGreaterThan(Int(pixel.b) - Int(pixel.g), 30)
     }
     func testPerFolderViewsAndWindowIsolation() async throws {
         let h = harness()
@@ -287,6 +393,23 @@ final class FeatLibraryUITests: XCTestCase {
         let other = EditorSession(); h.app.services.sessions.add(other)
         XCTAssertTrue(LibraryModels.get(h.app).model(other).coverCache === model.coverCache)
     }
+    func testDocumentCountsDoNotOpenDocumentsAndInvalidateWithTheirCover() throws {
+        let h = harness()
+        let cache = LibraryModels.get(h.app).coverCache
+        var row = LibraryRow.from(try XCTUnwrap(h.library.node(Fixtures.studySetID)))
+        let loaded = h.app.workspace.loadedDocuments
+        XCTAssertEqual(cache.subtitle(row, app: h.app), "2 cards")
+        XCTAssertEqual(Set(h.app.workspace.loadedDocuments), Set(loaded))
+        var content = try h.persistence.loadHead(Fixtures.studySetID)
+        content.cards[0].deleted = true
+        h.persistence.heads[Fixtures.studySetID] = content
+        XCTAssertEqual(cache.subtitle(row, app: h.app), "2 cards")
+        cache.invalidate(Fixtures.studySetID)
+        XCTAssertEqual(cache.subtitle(row, app: h.app), "1 card")
+        row.locked = true
+        XCTAssertNil(cache.subtitle(row, app: h.app))
+        XCTAssertEqual(Set(h.app.workspace.loadedDocuments), Set(loaded))
+    }
     func testSessionModelReleasedAfterControllerAndSessionRemoval() async throws {
         let h = harness(), session = EditorSession()
         h.app.services.sessions.add(session)
@@ -425,6 +548,28 @@ final class FeatLibraryUITests: XCTestCase {
         XCTAssertNil(commands.last?.1["folder"])
     }
 
+}
+
+@MainActor
+private struct LibraryChromeFieldProbe: View {
+    @Environment(DropletField.self) private var field: DropletField?
+    let ids: [String]
+    let anchors: [String]
+    let capture: (DropletField) -> Void
+
+    private var ready: Bool {
+        guard let field else { return false }
+        return ids.allSatisfy { field.node($0).presentation.isDrawn }
+            && anchors.allSatisfy { field.worldAnchors[$0] != nil }
+    }
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onChange(of: ready, initial: true) { _, ready in
+                if ready, let field { capture(field) }
+            }
+    }
 }
 
 @MainActor

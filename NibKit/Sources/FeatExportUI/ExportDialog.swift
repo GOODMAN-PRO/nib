@@ -461,30 +461,41 @@ struct ExportPopover: View {
     let session: EditorSession?
     let host: FloatingHosting
     let source: String
+    /// The registered source rect, in the floating container's coordinate space.
+    let sourceRect: CGRect
+    let updateSourceRect: @MainActor () -> CGRect?
     let instant: Bool
     @State private var presented = true
-    @Environment(\.dynamicTypeSize) private var typeSize
+    @State private var currentSourceRect: CGRect?
+    @State private var popoverSize = CGSize(width: NibMetrics.popoverWidth, height: 200)
+    @Environment(\.horizontalSizeClass) private var sizeClass
     var body: some View {
         ZStack {
             // Capture outside touches before they reach the canvas.
             Rectangle().fill(NibColor.background.opacity(0)).contentShape(Rectangle())
                 .onTapGesture { close() }.accessibilityHidden(true)
-            if instant {
-                // The keyboard has no spatial bud transition. This remains in the host's single container.
-                VStack {
-                    NibPopoverPanel(title: title, width: NibMetrics.panelWidth(typeSize)) { contents }
-                        .droplet("exportui.popover", style: .popover)
-                    Spacer(minLength: 0)
-                }
-                .frame(maxWidth: .infinity, alignment: .trailing)
-                .padding(NibMetrics.chromeInset)
-            } else {
-                NibBudPopover(id: "exportui.popover", source: source, isPresented: $presented,
-                              title: title, width: NibMetrics.panelWidth(typeSize)) { contents }
+            GeometryReader { geometry in
+                let bounds = geometry.frame(in: NibLiquid.space)
+                let anchor = currentSourceRect ?? sourceRect
+                let gap = sizeClass == .compact ? NibMetrics.popoverGapCompact : NibMetrics.popoverGap
+                // NibBudPopover's .below rule: retain the source gap and clamp only horizontally.
+                let inset = bounds.insetBy(dx: NibMetrics.chromeInset, dy: NibMetrics.chromeInset)
+                let halfWidth = popoverSize.width / 2
+                let centreX = min(max(anchor.midX, inset.minX + halfWidth),
+                                  max(inset.minX + halfWidth, inset.maxX - halfWidth))
+                NibPopoverPanel(title: title, width: NibMetrics.popoverWidth) { contents }
+                    .onGeometryChange(for: CGSize.self) { $0.size } action: { popoverSize = $0 }
+                    .droplet("exportui.popover", style: .popover)
+                    .budsFrom(source, isPresented: $presented, instant: instant)
+                    .position(x: centreX - bounds.minX,
+                              y: anchor.maxY + gap + popoverSize.height / 2 - bounds.minY)
+                    .onGeometryChange(for: CGRect.self) { _ in bounds } action: { _ in
+                        currentSourceRect = updateSourceRect()
+                    }
             }
         }
         .onChange(of: presented) { _, value in
-            // NibBudPopover also closes through Escape and VoiceOver, so release the outside-touch shield.
+            // Buds also close through Escape and VoiceOver, so release the outside-touch shield.
             if !value { close() }
         }
     }

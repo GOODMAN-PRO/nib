@@ -15,7 +15,7 @@ struct ToolbarEntry: Equatable {
     let hideable: Bool
     let isPlugin: Bool
 
-    /// Where the item sits before anyone customises the palette: the lasso, the six everyday tools and every plugin
+    /// Where the item sits before anyone customises the palette: the six everyday tools (including lasso) and every plugin
     /// item on the palette; the occasional tools and the accessories in More (DESIGN.md §14.3).
     var isDefaultShown: Bool {
         !hideable || isPlugin || group == .lasso || ToolbarLayoutEngine.everyday.contains(toolID ?? id)
@@ -34,7 +34,7 @@ enum ToolbarLayoutEngine {
     /// The document kinds that have a palette.
     static let paletteKinds: Set<DocumentKind> = [.notebook, .whiteboard]
     /// DESIGN.md §14.3: pen, highlighter, eraser, lasso, shapes and text are on the palette by default.
-    static let everyday: Set<String> = ["lasso", "pen", "highlighter", "eraser", "shape", "drawShape", "text"]
+    static let everyday: Set<String> = ["lasso", "pen", "highlighter", "eraser", "shape", "text"]
 
     /// Palette items from toolbar descriptors (registry order). An owner that is not a registered feature is a plugin.
     static func entries(_ descriptors: [ToolbarItemDescriptor], featureIDs: Set<String>) -> [ToolbarEntry] {

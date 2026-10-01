@@ -388,7 +388,10 @@ final class DocumentScrollView: UIScrollView {
         contentView.center = CGPoint(x: size.width * Double(z) / 2, y: size.height * Double(z) / 2)
         contentSize = CGSize(width: size.width * Double(z), height: size.height * Double(z))
         for (id, v) in pageViews {
-            if let i = indexOf[id] { v.frame = layout.frames[i].cg }
+            if let i = indexOf[id] {
+                v.frame = layout.frames[i].cg
+                if mode.isWorld { host?.documentScrollView(self, configure: v, for: id) }
+            }
         }
         CATransaction.commit()
         updateInsets()
@@ -404,6 +407,7 @@ final class DocumentScrollView: UIScrollView {
             contentSize = target
         }
         updateInsets()
+        updateVisiblePages()
     }
 
     /// Chrome insets plus centring, preserving whatever other features added (a text editor's keyboard inset).
@@ -500,6 +504,8 @@ final class DocumentScrollView: UIScrollView {
             host?.documentScrollView(self, configure: v, for: id)
         }
         updateShadows()
+        // Coverage must not depend on a delegate callback: opening at 100 % need not change zoom or offset.
+        updateTiles()
     }
 
     private func recycle(_ v: PageTileView, _ id: PageID) {
@@ -553,9 +559,10 @@ final class DocumentScrollView: UIScrollView {
     private var shadowIsDark: [PageID: Bool] = [:]
 
     /// Asks every page view for the tiles its visible part (plus a quarter window each side) needs at the current zoom
-    /// level. Not called during a pinch: the tiles on screen scale until the zoom ends.
+    /// level. During a pinch the existing bucket is kept; newly exposed regions still get placeholders and tiles.
     func updateTiles() {
         let visible = visibleLayoutRect
+        guard visible.width > 0, visible.height > 0 else { return }
         let marginX = visible.width * 0.25, marginY = visible.height * 0.25
         let wanted = Rect(x: visible.x - marginX, y: visible.y - marginY, width: visible.width + 2 * marginX,
                           height: visible.height + 2 * marginY)
@@ -566,7 +573,7 @@ final class DocumentScrollView: UIScrollView {
             let pageRect = Rect(x: wanted.x - origin.x, y: wanted.y - origin.y, width: wanted.width, height: wanted.height)
             let onPage = mode.isWorld || pageRect.intersects(Rect(x: f.x - origin.x, y: f.y - origin.y,
                                                                   width: f.width, height: f.height))
-            if onPage { v.updateCoverage(visible: pageRect, level: level, bake: true) }
+            if onPage { v.updateCoverage(visible: pageRect, level: level, bake: !isZoomingNow && !isZooming) }
         }
     }
 
@@ -576,6 +583,7 @@ final class DocumentScrollView: UIScrollView {
         super.layoutSubviews()
         let content = CGRect(origin: .zero, size: contentSize)
         if wetInkContainer.frame != content { wetInkContainer.frame = content }
+        updateVisiblePages()
     }
 
     override func accessibilityScroll(_ direction: UIAccessibilityScrollDirection) -> Bool {

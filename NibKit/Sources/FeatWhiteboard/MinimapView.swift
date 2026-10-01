@@ -163,15 +163,16 @@ enum BoardLimitGate {
 }
 
 enum MinimapLayout {
-    /// Space kept free below the minimap: the page HUD (bottom-right, 16 pt in) on iPad; the palette's canvas inset on
-    /// iPhone.
-    static func bottomClearance(compact: Bool) -> CGFloat {
-        compact ? NibMetrics.canvasBottomInsetCompact + NibSpacing.s
-            : NibMetrics.chromeInset + NibMetrics.hudHeight + NibMetrics.minimumRestingGap
+    /// Keep a full resting gap above the page HUD and the bottom palette, including its fused options bar.
+    /// Compact-height windows include iPhone landscape even when their horizontal size class is regular.
+    static func bottomClearance(compact: Bool, compactHeight: Bool = false, hasOptionsBar: Bool = true) -> CGFloat {
+        let bottomInset = compact || compactHeight ? NibMetrics.canvasBottomInsetCompact : NibMetrics.chromeInset
+        let hud = bottomInset + NibMetrics.hudHeight + NibSpacing.l
+        guard compact || compactHeight else { return hud }
+        let palette = NibMetrics.barTopGap + NibMetrics.paletteThicknessMax
+            + (hasOptionsBar ? NibMetrics.barHeightMax - 1 : 0) + NibSpacing.l
+        return max(hud, palette)
     }
-
-    /// The overlay's coordinate space: the frames of its parts (the only places it takes touches) are reported in it.
-    static let space = NamedCoordinateSpace.named("whiteboard.minimap")
 }
 
 /// The parts of the overlay that take touches; the gaps between them stay canvas.
@@ -179,7 +180,7 @@ enum MinimapPart: Hashable {
     case banner, map, controls
 }
 
-/// Frames of the overlay's parts in `MinimapLayout.space`, as SwiftUI lays them out (written from layout callbacks,
+/// Frames of the overlay's parts in `NibLiquid.space`, as SwiftUI lays them out (written from layout callbacks,
 /// read by hit testing; both on the main thread).
 final class MinimapHitFrames {
     private(set) var frames: [MinimapPart: CGRect] = [:]
@@ -215,6 +216,8 @@ final class MinimapModel: ObservableObject {
     @Published var compact = false {
         didSet { if oldValue != compact { updateGeometry() } }
     }
+    /// The visible canvas region, converted into the window's droplet container and cleared of its bottom chrome.
+    @Published var floatingRegion: CGRect?
     /// Where the overlay's parts are, so only they (not the gaps between them) take touches.
     let hitFrames = MinimapHitFrames()
 
@@ -511,35 +514,26 @@ final class MinimapModel: ObservableObject {
 // MARK: - Canvas attachment
 
 /// "whiteboard.minimap" (D-028, D-116): an overview of the board with the viewport, drag or tap to pan, double-tap to
-/// fit all content, zoom % with − / + (5–400 %), a show/hide button, and the board's item-limit warning (D-030).
+/// fit all content, − / + (5–400 %), a show/hide button, and the board's item-limit warning (D-030).
+/// The page HUD owns the zoom readout (§14.17).
 /// Pinned to the bottom trailing corner of the visible canvas, above the page HUD; it claims the touches on its parts
 /// so they never reach the active tool, and on a full board every touch that would ink it (`BoardLimitGate`).
 @MainActor
 final class MinimapAttachment: CanvasAttachment {
     static let id = "whiteboard.minimap"
-    /// Above page tiles and selection handles.
-    static let zPosition: CGFloat = 30
-
     private(set) var model: MinimapModel?
-    private(set) var hosting: UIHostingController<MinimapOverlay>?
     private var subscriptions: [EventSubscription] = []
     private var observers: [NSObjectProtocol] = []
     private var modelChanges: AnyCancellable?
+    private var sessionChanges: AnyCancellable?
     private weak var host: CanvasHost?
-    private var sizeKey: String?
-    private var fittedSize: CGSize = .zero
+    private weak var floatingHost: FloatingHosting?
 
     func attach(to host: CanvasHost) {
         self.host = host
         let model = MinimapModel(app: host.app, doc: host.documentID, session: host.session)
         model.host = host
-        let hosting = UIHostingController(rootView: MinimapOverlay(model: model))
-        hosting.view.backgroundColor = .clear
-        hosting.safeAreaRegions = []
-        hosting.view.layer.zPosition = Self.zPosition
-        host.canvasView.addSubview(hosting.view)
         self.model = model
-        self.hosting = hosting
         subscriptions.append(host.app.bus.observeCommits { [weak model] changes in model?.committed(changes) })
         subscriptions.append(host.session.inking.observe { [weak model] signal in model?.inkingChanged(signal.isInking) })
         observers.append(NotificationCenter.default.addObserver(forName: SettingsStore.didChange, object: host.app.settings,
@@ -547,23 +541,30 @@ final class MinimapAttachment: CanvasAttachment {
             guard (note.userInfo?["name"] as? String) == Whiteboard.minimapVisible.name else { return }
             Task { @MainActor in model?.settingsChanged() }
         })
-        // The overlay changes size when the map, the banner or the size class changes: re-pin it after SwiftUI updates.
+        // Layout follows changes to the board and the active tool's options, after their published state lands.
         modelChanges = model.objectWillChange.sink { [weak self] _ in
+            Task { @MainActor in self?.layout() }
+        }
+        sessionChanges = host.session.objectWillChange.sink { [weak self] _ in
             Task { @MainActor in self?.layout() }
         }
         model.reloadContent()
         canvasDidChange(host)
+        // Attachments can be installed before the document container publishes its floating host.
+        Task { @MainActor [weak self] in self?.layout() }
     }
 
     func detach(from host: CanvasHost) {
-        hosting?.view.removeFromSuperview()
-        hosting = nil
+        floatingHost?.dismiss(Self.id)
+        floatingHost = nil
         subscriptions.forEach { $0.cancel() }
         subscriptions = []
         observers.forEach { NotificationCenter.default.removeObserver($0) }
         observers = []
         modelChanges = nil
+        sessionChanges = nil
         model = nil
+        self.host = nil
     }
 
     func canvasDidChange(_ host: CanvasHost) {
@@ -572,10 +573,14 @@ final class MinimapAttachment: CanvasAttachment {
     }
 
     func hitTest(_ viewPoint: CGPoint, isPencil: Bool, host: CanvasHost) -> Bool {
-        guard let model, let view = hosting?.view, view.superview != nil, !view.isHidden else { return false }
+        guard let model else { return false }
         if model.blocksWriting(isPencil: isPencil) { return true }
-        guard view.frame.contains(viewPoint) else { return false }
-        return Self.overlayTakes(view.convert(viewPoint, from: host.canvasView), parts: Array(model.hitFrames.frames.values))
+        guard let floatingHost, floatingHost.isPresenting(Self.id),
+              let point = floatingHost.containerRect(CGRect(origin: viewPoint, size: .zero), from: host.canvasView)?.origin
+        else { return false }
+        let parts = Array(model.hitFrames.frames.values).filter { !$0.isEmpty }
+        // Until SwiftUI reports the parts, native hit testing still handles the floating controls. Never claim canvas.
+        return !parts.isEmpty && Self.overlayTakes(point, parts: parts)
     }
 
     /// A canvas that does not say which input it is: treated as the Pencil, so a full board never takes ink.
@@ -604,51 +609,85 @@ final class MinimapAttachment: CanvasAttachment {
         return Rect.bounding([a.point, c.point])
     }
 
-    /// Pins the overlay to the visible canvas's bottom trailing corner. Runs on every scroll frame, so SwiftUI is asked
-    /// for the overlay's size only when something that shapes it changed.
+    /// Present through the window's host, so every surface joins the chrome's single droplet container. Converting
+    /// canvas bounds (rather than using their scrolling origin directly) also keeps the minimap fixed during pans.
     private func layout() {
-        guard let host, let hosting, let model else { return }
+        guard let host, let model else { return }
         let canvas = host.canvasView
-        let compact = canvas.traitCollection.horizontalSizeClass == .compact || canvas.bounds.width < NibMetrics.compactBreakpoint
+        let compactHeight = canvas.traitCollection.verticalSizeClass == .compact
+        let compact = canvas.traitCollection.horizontalSizeClass == .compact || compactHeight
+            || canvas.bounds.width < NibMetrics.compactBreakpoint
         if model.compact != compact { model.compact = compact }
         if canvas.traitCollection.displayScale > 0 { model.displayScale = canvas.traitCollection.displayScale }
-        let key = "\(model.showsMap)|\(model.limit)|\(model.limit == .ok ? 0 : model.itemCount)|\(compact)|"
-            + canvas.traitCollection.preferredContentSizeCategory.rawValue
-        if key != sizeKey {
-            fittedSize = hosting.sizeThatFits(in: canvas.bounds.size)
-            sizeKey = key
+        guard let floating = host.session.floatingHost else {
+            floatingHost?.dismiss(Self.id)
+            floatingHost = nil
+            if model.floatingRegion != nil { model.floatingRegion = nil }
+            return
         }
-        let size = fittedSize
-        let b = canvas.bounds, safe = canvas.safeAreaInsets
-        let frame = CGRect(x: b.maxX - safe.right - NibMetrics.chromeInset - size.width,
-                           y: b.maxY - safe.bottom - MinimapLayout.bottomClearance(compact: compact) - size.height,
-                           width: size.width, height: size.height)
-        if hosting.view.frame != frame { hosting.view.frame = frame }
+        if floatingHost !== floating {
+            floatingHost?.dismiss(Self.id)
+            floatingHost = floating
+        }
+        if !floating.isPresenting(Self.id) {
+            floating.present(Self.id) {
+                MinimapFloatingOverlay(model: model, updateLayout: { [weak self] in self?.layout() })
+            }
+        }
+        let safe = canvas.safeAreaInsets
+        let clearance = MinimapLayout.bottomClearance(compact: compact, compactHeight: compactHeight)
+        let region = canvas.bounds.inset(by: UIEdgeInsets(top: safe.top + NibMetrics.chromeInset,
+                                                       left: safe.left + NibMetrics.chromeInset,
+                                                       bottom: safe.bottom + clearance,
+                                                       right: safe.right + NibMetrics.chromeInset))
+        let converted = floating.containerRect(region, from: canvas)
+        if model.floatingRegion != converted { model.floatingRegion = converted }
     }
 }
 
 // MARK: - Views
 
+/// Full-window floating content. Only the minimap's parts take touches; the canvas remains reachable in the gaps.
+struct MinimapFloatingOverlay: View {
+    @ObservedObject var model: MinimapModel
+    let updateLayout: @MainActor () -> Void
+
+    var body: some View {
+        GeometryReader { proxy in
+            if let region = model.floatingRegion, region.width > 0, region.height > 0 {
+                MinimapOverlay(model: model)
+                    .frame(width: region.width, height: region.height, alignment: .bottomTrailing)
+                    .position(x: region.midX, y: region.midY)
+            }
+            // The reference view may join the window after attach; re-convert when the layer is laid out.
+            Color.clear
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+                .onGeometryChange(for: CGSize.self) { _ in proxy.size } action: { _ in
+                    Task { @MainActor in updateLayout() }
+                }
+        }
+        .task { updateLayout() }
+    }
+}
+
 struct MinimapOverlay: View {
     @ObservedObject var model: MinimapModel
 
     var body: some View {
-        VStack(alignment: .trailing, spacing: NibSpacing.s) {
+        VStack(alignment: .trailing, spacing: NibSpacing.l) {
             if model.limit != .ok { MinimapLimitBanner(model: model).minimapPart(.banner, model.hitFrames) }
             if model.showsMap { MinimapMap(model: model).minimapPart(.map, model.hitFrames) }
             MinimapControls(model: model).minimapPart(.controls, model.hitFrames)
         }
         .fixedSize()
-        .coordinateSpace(MinimapLayout.space)
-        .opacity(model.receding ? NibOpacity.recede : 1)
-        .animation(model.receding ? NibMotion.recede : NibMotion.enter, value: model.receding)
     }
 }
 
 private extension View {
     /// Reports this part's frame, so only the parts (not the gaps between them) take touches.
     func minimapPart(_ part: MinimapPart, _ frames: MinimapHitFrames) -> some View {
-        onGeometryChange(for: CGRect.self) { $0.frame(in: MinimapLayout.space) } action: { frames.set(part, $0) }
+        onGeometryChange(for: CGRect.self) { $0.frame(in: NibLiquid.space) } action: { frames.set(part, $0) }
             .onDisappear { frames.set(part, nil) }
     }
 }
@@ -687,10 +726,11 @@ struct MinimapMap: View {
             }
         }
         .frame(width: g.size.width, height: g.size.height, alignment: .topLeading)
-        .clipShape(RoundedRectangle(cornerRadius: NibRadius.concentric(NibRadius.popover, inset: NibSpacing.s),
-                                    style: .continuous))
+        // The droplet clips to its own body; the board render has no inset card or separate rounded bezel.
+        .clipped()
         .contentShape(Rectangle())
-        .gesture(DragGesture(minimumDistance: 3)
+        // Panning the viewport takes priority over the floating-panel preset's pickup gesture.
+        .highPriorityGesture(DragGesture(minimumDistance: 3)
             .updating($dragging) { _, state, _ in state = true }
             .onChanged { model.drag(to: $0.location) }
             .onEnded { _ in model.endDrag() })
@@ -715,12 +755,11 @@ struct MinimapMap: View {
         .accessibilityAction(named: Text(String(localized: "Move View Right"))) { model.pan(dx: 1, dy: 0) }
         .accessibilityAction(named: Text(String(localized: "Move View Up"))) { model.pan(dx: 0, dy: -1) }
         .accessibilityAction(named: Text(String(localized: "Move View Down"))) { model.pan(dx: 0, dy: 1) }
-        .padding(NibSpacing.s)
-        .nibGlass(.deep, cornerRadius: NibRadius.popover)
+        .droplet("whiteboard.minimap", style: .floatingPanel)
     }
 }
 
-/// Show/hide, − zoom % +, fit: a Clear HUD, 40 pt tall like every HUD.
+/// Show/hide, − / +, fit: a Clear HUD, 40 pt tall like every HUD. Zoom is shown by the page HUD.
 struct MinimapControls: View {
     @ObservedObject var model: MinimapModel
 
@@ -734,13 +773,6 @@ struct MinimapControls: View {
             NibBarSeparator()
             NibIconButton(.minus, label: String(localized: "Zoom Out"), size: .bar) { model.zoomOut() }
                 .disabled(model.zoom <= MinimapZoom.range.lowerBound * 1.001)
-            Text(model.zoom, format: .percent.precision(.fractionLength(0)))
-                .font(NibFont.hud)
-                .foregroundStyle(NibColor.label)
-                .monospacedDigit()
-                .frame(minWidth: NibSpacing.x5)
-                .accessibilityLabel(String(localized: "Zoom"))
-                .accessibilityValue(Text(model.zoom, format: .percent.precision(.fractionLength(0))))
             NibIconButton(.plus, label: String(localized: "Zoom In"), size: .bar) { model.zoomIn() }
                 .disabled(model.zoom >= MinimapZoom.range.upperBound * 0.999)
             NibIconButton(.fitToContent, label: String(localized: "Fit All Content"), size: .bar) { model.fit() }
@@ -748,7 +780,7 @@ struct MinimapControls: View {
         .padding(.horizontal, NibSpacing.xs)
         .frame(height: NibMetrics.hudHeight)
         .nibChromeTypeCap()
-        .nibGlass(.clear)
+        .droplet("whiteboard.minimapControls", style: .hud)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(String(localized: "Board zoom"))
     }
@@ -781,8 +813,8 @@ struct MinimapLimitBanner: View {
             }
         }
         .padding(NibSpacing.m)
-        .frame(width: MinimapGeometry.mapSize(compact: model.compact).width + 2 * NibSpacing.s, alignment: .leading)
-        .nibGlass(.deep, cornerRadius: NibRadius.popover)
+        .frame(width: MinimapGeometry.mapSize(compact: model.compact).width, alignment: .leading)
+        .droplet("whiteboard.minimapLimit", style: .panel)
         .accessibilityElement(children: .contain)
     }
 

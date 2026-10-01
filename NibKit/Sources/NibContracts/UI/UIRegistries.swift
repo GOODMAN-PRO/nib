@@ -16,7 +16,12 @@ public enum ToolbarGroup: String, Codable, CaseIterable {
     case navTrailing
 }
 
-/// Every toolbar button is either a canvas tool (activated via `tool.select`) or a command. No other actions exist.
+/// contracts-v2.3: a leading nav item's position relative to the document title; `order` sorts within the slot.
+public enum ToolbarNavSlot: String, Codable, CaseIterable {
+    case beforeTitle, afterTitle
+}
+
+/// Toolbar buttons select a canvas tool or run a command; compact status views may bud their own details popover.
 public struct ToolbarItemDescriptor: Registrable {
     public var id: String
     public var title: String
@@ -53,6 +58,14 @@ public struct ToolbarItemDescriptor: Registrable {
     public var sessionIcon: (@MainActor (EditorSession) -> String)? = nil
     /// Also shown on compact width (iPhone); false = regular width only.
     public var showsInCompactWidth: Bool = true
+
+    /// contracts-v2.3: explicit title-relative slot for `navLeading` status items. Existing items stay unchanged.
+    public var navSlot: ToolbarNavSlot = .beforeTitle
+    /// contracts-v2.3: optional compact status control, rendered in place of the icon in `navLeading` / `afterTitle`.
+    /// nil keeps the existing icon path; a provider returning nil hides the status. The view owns its tap (a command
+    /// or details popover) and live observation. Use NibDesign's 6 pt status dot and colour tokens, caption1, a 44 pt
+    /// hit target, and "<client> connected" for VoiceOver; compact width shows only the dot. Draw no separate surface.
+    public var compactStatus: (@MainActor (ChromeContext) -> AnyView?)? = nil
 
     @MainActor
     public func resolvedParams(for session: EditorSession) -> JSONValue {

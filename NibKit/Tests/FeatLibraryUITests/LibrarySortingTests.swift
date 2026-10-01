@@ -88,6 +88,50 @@ final class LibrarySortingTests: XCTestCase {
         XCTAssertEqual(document.accessibilityValue, "Locked, Favourite, Syncing, 2 pages")
         XCTAssertEqual(LibraryRow.itemCount(1), "1 item")
     }
+    func testLocalOnlyHasNoTypeLikeSyncBadgeAndReachesVoiceOver() {
+        var document = row("doc:A", "Notes")
+        document.sync = SyncBadge.localOnly.rawValue
+        document.pages = 2
+        XCTAssertNil(document.syncSymbol)
+        XCTAssertEqual(document.accessibilityValue, "Not synced, 2 pages")
+        document.sync = SyncBadge.downloading.rawValue
+        XCTAssertEqual(document.syncSymbol, .syncing)
+        XCTAssertEqual(document.accessibilityValue, "Downloading, 2 pages")
+        document.sync = nil
+        XCTAssertNil(document.syncSymbol)
+    }
+    func testStudySetSubtitleCountsLiveCardsInsteadOfPages() {
+        var document = row("doc:A", "Revision")
+        document.kind = "studySet"
+        document.pages = 0
+        let card = StudyCard(front: CardFace(), back: CardFace())
+        var deleted = StudyCard(front: CardFace(), back: CardFace())
+        deleted.deleted = true
+        var content = DocumentContent(meta: DocumentMeta(kind: .studySet), cards: [card, deleted])
+        XCTAssertEqual(document.typeBadge, .studySets)
+        XCTAssertEqual(document.subtitle(content: content), "1 card")
+        content.cards.append(StudyCard(front: CardFace(), back: CardFace()))
+        XCTAssertEqual(document.subtitle(content: content), "2 cards")
+        XCTAssertEqual(document.accessibilityValue(subtitle: document.subtitle(content: content)), "2 cards")
+        content.cards = [deleted]
+        XCTAssertEqual(document.subtitle(content: content), "0 cards")
+    }
+    func testTextDocumentWordCountIncludesCaptionsAndTablesButNotDeletedBlocks() {
+        var document = row("doc:A", "Essay")
+        document.kind = "textDocument"
+        document.pages = 0
+        let paragraph = TextBlock(kind: .paragraph, text: RichText(plain: "Two words."))
+        var image = TextBlock(kind: .image)
+        image.caption = RichText(plain: "Figure caption")
+        var table = TextBlock(kind: .table)
+        table.table = TableData(rows: [[TableCell(text: RichText(plain: "Table cell"))]])
+        var deleted = TextBlock(kind: .paragraph, text: RichText(plain: "Do not count"))
+        deleted.deleted = true
+        let content = DocumentContent(meta: DocumentMeta(kind: .textDocument), blocks: [paragraph, image, table, deleted])
+        XCTAssertEqual(document.typeBadge, .textDocument)
+        XCTAssertEqual(document.subtitle(content: content), "6 words")
+        XCTAssertEqual(document.subtitle(content: DocumentContent(meta: content.meta)), "0 words")
+    }
     func testSelectionSwipeAndPointerMarqueeKeepBaseline() {
         var selection = LibrarySelection()
         selection.toggle("D")

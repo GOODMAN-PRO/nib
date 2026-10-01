@@ -118,6 +118,7 @@ final class FeatAIChatTests: XCTestCase {
 
     func testInlineCanvasButtonRoutesExactContextAndPreviewFollowsZoom() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.services.ai = FakeAIService()
         var params: JSONValue = [:]
         h.app.commands.register(CommandDescriptor(id: CommandIDs.panelOpen, title: "Open panel", summary: "Record host context.", effect: .session)) { p, ctx in
             params = p
@@ -128,6 +129,9 @@ final class FeatAIChatTests: XCTestCase {
         let attachment = ChatInlineAttachment()
         attachment.attach(to: host)
         let ref = "item:FIXTUREDOC01/FIXTUREPG001/FIXTURETXT01"
+        XCTAssertTrue(attachment.buttons.isEmpty, "Reading a page must not reveal block handles.")
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [Fixtures.textID])
+        attachment.canvasDidChange(host)
         let button = try XCTUnwrap(attachment.buttons[ref])
         XCTAssertGreaterThanOrEqual(button.view.frame.width, NibMetrics.hitTarget)
         XCTAssertGreaterThanOrEqual(button.view.frame.height, NibMetrics.hitTarget)
@@ -153,6 +157,129 @@ final class FeatAIChatTests: XCTestCase {
         attachment.detach(from: host)
         XCTAssertTrue(attachment.buttons.isEmpty)
         XCTAssertTrue(host.overlayLayer.sublayers?.isEmpty ?? true)
+    }
+
+    func testCanvasHandleRequiresProviderAndSelectionAndTracksFirstLine() throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        let host = FakeCanvasHost(h)
+        let attachment = ChatInlineAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        let item = try XCTUnwrap(h.app.workspace.items(Fixtures.docID, page: Fixtures.page1).first { $0.id == Fixtures.textID })
+        let layout = try XCTUnwrap(h.app.content.textLayout(for: item))
+        let ref = NodeRef.item(Fixtures.docID, Fixtures.page1, item.id).description
+        XCTAssertTrue(attachment.buttons.isEmpty)
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [item.id])
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.buttons.isEmpty, "A selection without an AI service must not show a button.")
+        let ai = FakeAIService()
+        ai.isConfigured = false
+        h.app.services.ai = ai
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.buttons.isEmpty, "An unconfigured provider must not show a button.")
+
+        ai.isConfigured = true
+        attachment.canvasDidChange(host)
+        XCTAssertEqual(Set(attachment.buttons.keys), [ref])
+        let controller = try XCTUnwrap(attachment.buttons[ref])
+        let frame = controller.view.frame
+        // The fixture has a comment in the trailing margin. The selected item's control must avoid it.
+        for occupied in try h.app.workspace.items(Fixtures.docID, page: Fixtures.page1) {
+            let bounds = occupied.bounds
+            let rect = CGRect(x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height)
+            XCTAssertFalse(rect.insetBy(dx: -NibSpacing.s, dy: -NibSpacing.s).intersects(frame))
+        }
+        let lineHeight = RichTextBridge.font(item.text?.text.paragraphs.first?.runs.first?.attrs ?? TextAttributes(), base: layout.base).lineHeight
+        XCTAssertEqual(frame.midY, CGFloat(layout.container.y) + lineHeight / 2, accuracy: 1)
+        controller.view.layoutIfNeeded()
+        func findButton(_ view: UIView) -> UIButton? {
+            if let button = view as? UIButton { return button }
+            return view.subviews.compactMap(findButton).first
+        }
+        let button = try XCTUnwrap(findButton(controller.view))
+        let foreground = try XCTUnwrap(button.configuration?.baseForegroundColor)
+        for style in [UIUserInterfaceStyle.light, .dark] {
+            let traits = UITraitCollection(userInterfaceStyle: style)
+            XCTAssertEqual(foreground.resolvedColor(with: traits), NibUIColor.accent.resolvedColor(with: traits))
+        }
+        host.zoomScale = 1.5
+        attachment.canvasDidChange(host)
+        let zoomed = try XCTUnwrap(attachment.buttons[ref]?.view.frame)
+        XCTAssertEqual(zoomed.midY, frame.midY * 1.5, accuracy: 0.1)
+        XCTAssertEqual(zoomed.height, NibMetrics.hitTarget)
+        ai.isConfigured = false
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.buttons.isEmpty, "Removing provider configuration must remove the tappable view.")
+        XCTAssertNil(controller.view.superview)
+        ai.isConfigured = true
+        h.session.selection = Selection()
+        h.session.isEditingText = true
+        h.session.editingTextRef = ref
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.buttons.isEmpty, "Focus alone must not reveal canvas AI marks.")
+        let hover = CanvasSample(page: Fixtures.page1, location: Point(item.bounds.midX, item.bounds.midY), isPencil: false)
+        attachment.hover(hover, host: host)
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.buttons.isEmpty, "Hover alone must not reveal canvas AI marks.")
+        h.session.isEditingText = false
+        h.session.editingTextRef = nil
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page2, items: [item.id])
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.buttons.isEmpty, "Selection must belong to this page.")
+        h.session.selection = Selection(doc: Fixtures.textDocID, page: Fixtures.page1, items: [item.id])
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.buttons.isEmpty, "Selection must belong to this document.")
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page1, items: [item.id])
+        attachment.canvasDidChange(host)
+        XCTAssertEqual(Set(attachment.buttons.keys), [ref])
+        h.session.selection = Selection()
+        attachment.canvasDidChange(host)
+        XCTAssertTrue(attachment.buttons.isEmpty)
+    }
+
+    func testSelectedCanvasHandlesNeverOverlapAtOrBelow44Points() async throws {
+        let h = Harness(features: [FeatAIChatFeature.self])
+        h.app.services.ai = FakeAIService()
+        let firstID = NibID.make()
+        let secondID = NibID.make()
+        let template = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: Fixtures.textID)
+        h.app.commands.register(CommandDescriptor(id: "test.spaceText", title: "Space text", summary: "Place selected text items.", effect: .edit)) { p, ctx in
+            let gap = p["gap"]?.doubleValue ?? 28
+            let z = FractionalIndex.sequence(after: nil, count: 2)
+            try ctx.mutate { tx in
+                for (index, id) in [firstID, secondID].enumerated() {
+                    var item = template
+                    item.id = id
+                    item.z = z[index]
+                    item.text?.frame = Frame(x: 72, y: 400 + Double(index) * gap, w: 300, h: 40)
+                    try tx.put(item, doc: Fixtures.docID, page: Fixtures.page2)
+                }
+            }
+            return [:]
+        }
+        let host = FakeCanvasHost(h)
+        host.canvasView.frame.size.height = 2400
+        let attachment = ChatInlineAttachment()
+        attachment.attach(to: host)
+        defer { attachment.detach(from: host) }
+        h.session.selection = Selection(doc: Fixtures.docID, page: Fixtures.page2, items: [firstID, secondID])
+        for gap in [28.0, 44.0, 45.0] {
+            _ = try await h.run("test.spaceText", ["gap": .number(gap)])
+            attachment.canvasDidChange(host)
+            XCTAssertEqual(attachment.buttons.count, gap <= 44 ? 1 : 2, "Gap: \(gap)")
+            let frames = attachment.buttons.values.map { $0.view.frame }
+            for frame in frames {
+                XCTAssertEqual(frame.width, NibMetrics.hitTarget)
+                XCTAssertEqual(frame.height, NibMetrics.hitTarget)
+            }
+            if frames.count == 2 {
+                XCTAssertFalse(frames[0].intersects(frames[1]))
+                XCTAssertGreaterThan(abs(frames[0].midY - frames[1].midY), NibMetrics.hitTarget)
+            }
+        }
+        host.zoomScale = 0.5
+        attachment.canvasDidChange(host)
+        XCTAssertEqual(attachment.buttons.count, 1, "Spacing must be checked in view points after zoom.")
     }
 
     func testPlacementSwitchRetainsConversationContextAndReopensHostOnBothSides() async throws {
@@ -205,7 +332,7 @@ final class FeatAIChatTests: XCTestCase {
         }
     }
 
-    func testTextDocumentAccessoryPreservesEditorAndMapsEachVisibleBlock() async throws {
+    func testTextDocumentPreviewPreservesEditorWithoutDuplicatingBlockButtons() async throws {
         let h = Harness(features: [FeatAIChatFeature.self])
         let blocks = try h.app.workspace.content(Fixtures.textDocID).liveBlocks
         let refs = blocks.map { NodeRef.block(Fixtures.textDocID, $0.id).description }
@@ -225,14 +352,29 @@ final class FeatAIChatTests: XCTestCase {
         XCTAssertTrue(h.session.editor === editor)
         XCTAssertTrue(wrapper.forwardedEditor === editor)
         wrapper.updateAccessories()
-        XCTAssertEqual(Set(wrapper.controls.keys), Set(refs))
-        for cell in editor.collection.visibleCells {
-            XCTAssertNil(cell.accessibilityIdentifier)
-            let index = try XCTUnwrap(editor.collection.indexPath(for: cell))
-            let control = try XCTUnwrap(wrapper.controls[refs[index.item]])
-            let rect = cell.convert(cell.bounds, to: wrapper.view)
-            XCTAssertEqual(control.view.frame.minY, rect.minY, accuracy: 0.1)
+        func hasDuplicateAIButton(_ view: UIView) -> Bool {
+            if view.accessibilityIdentifier?.hasPrefix("aichat.block.") == true { return true }
+            return view.subviews.contains(where: hasDuplicateAIButton)
         }
+        for configured in [false, true] {
+            let ai = FakeAIService()
+            ai.isConfigured = configured
+            h.app.services.ai = ai
+            for cell in editor.collection.visibleCells {
+                let index = try XCTUnwrap(editor.collection.indexPath(for: cell))
+                h.session.isEditingText = true
+                h.session.editingTextRef = refs[index.item]
+                editor.collection.selectItem(at: index, animated: false, scrollPosition: [])
+                wrapper.updateAccessories()
+                XCTAssertFalse(hasDuplicateAIButton(wrapper.view), "F047 must own the only per-block AI control.")
+                XCTAssertEqual(wrapper.children.count, 1, "F085 must not add a button controller per row.")
+                editor.collection.deselectItem(at: index, animated: false)
+            }
+        }
+        h.session.isEditingText = false
+        h.session.editingTextRef = nil
+        wrapper.updateAccessories()
+        XCTAssertFalse(hasDuplicateAIButton(wrapper.view))
 
         let target = NodeRef.block(Fixtures.textDocID, Fixtures.paragraphBlockID).description
         let model = ChatRuntime.get(h.app).model(for: h.session)
@@ -295,7 +437,18 @@ private final class AccessoryTestEditor: UIViewController, DocumentEditing, UICo
     func numberOfSections(in collectionView: UICollectionView) -> Int { 1 }
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int { blockCount }
     func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
-        collectionView.dequeueReusableCell(withReuseIdentifier: "block", for: indexPath)
+        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "block", for: indexPath)
+        cell.contentView.subviews.forEach { $0.removeFromSuperview() }
+        let textView = UITextView(frame: cell.contentView.bounds)
+        textView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        textView.textContainerInset = UIEdgeInsets(top: NibSpacing.s, left: 0, bottom: 0, right: 0)
+        let font = indexPath.item == 0 ? NibUIFont.documentHeading(1) : NibUIFont.documentBody
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.minimumLineHeight = indexPath.item == 0 ? NibMetrics.hitTarget : NibMetrics.hitTarget / 2
+        paragraph.maximumLineHeight = paragraph.minimumLineHeight
+        textView.attributedText = NSAttributedString(string: "First line\nSecond line", attributes: [.font: font, .paragraphStyle: paragraph])
+        cell.contentView.addSubview(textView)
+        return cell
     }
     func reveal(page: PageID, rect: Rect?, animated: Bool) { revealed = page }
     func reveal(block: NibID, animated: Bool) { revealed = block }

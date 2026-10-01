@@ -830,7 +830,8 @@ extension NewNotebookSheet {
 struct NewNotebookSheet: View {
     @StateObject private var model: NewNotebookModel
     let onDone: () -> Void
-    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var measuredWidth = NibMetrics.newDocumentSheetSize.width
+    @State private var windowSize: CGSize?
     @Environment(\.dynamicTypeSize) private var typeSize
     @FocusState private var titleFocused: Bool
 
@@ -839,15 +840,36 @@ struct NewNotebookSheet: View {
         _model = StateObject(wrappedValue: NewNotebookModel(app: app, folder: folder, kind: kind, session: session,
                                                             navigator: navigator))
         self.onDone = onDone
+        _windowSize = State(initialValue: navigator?.rootViewController?.viewIfLoaded?.window?.bounds.size)
     }
 
-    private var compact: Bool { sizeClass == .compact }
+    // A form sheet can be narrower than its presenting window. Its width must not turn an iPad into a phone layout.
+    private var compact: Bool {
+        UIDevice.current.userInterfaceIdiom == .phone
+            || (windowSize?.width ?? NibMetrics.newDocumentSheetSize.width) < NibMetrics.compactBreakpoint
+    }
+    private var contentInset: CGFloat { compact ? NibSpacing.l : NibSpacing.xl }
+    private var sheetSize: CGSize {
+        guard let windowSize else { return NibMetrics.newDocumentSheetSize }
+        return CGSize(width: min(NibMetrics.newDocumentSheetSize.width, windowSize.width - NibSpacing.xl * 2),
+                      height: min(NibMetrics.newDocumentSheetSize.height, windowSize.height - NibSpacing.xl * 2))
+    }
     private var draft: NotebookDraft { model.draft }
 
     var body: some View {
+        if compact {
+            sheetContent.presentationDetents([.large])
+        } else {
+            sheetContent
+        }
+    }
+
+    private var sheetContent: some View {
         VStack(spacing: 0) {
             NibSheetHeader(draft.kind.sheetTitle, primaryTitle: compact ? nil : String(localized: "Create"),
                            isPrimaryEnabled: !model.isWorking, onCancel: onDone, onPrimary: create)
+                // The shared header supplies 20 pt; align its phone content to the scroll view's 16 pt margin.
+                .padding(.horizontal, contentInset - NibSpacing.xl)
             ScrollView {
                 VStack(alignment: .leading, spacing: NibSpacing.xl) {
                     if let message = model.message {
@@ -866,18 +888,29 @@ struct NewNotebookSheet: View {
                         EmptyView()
                     }
                 }
-                .padding(NibSpacing.xl)
+                .padding(.vertical, NibSpacing.xl)
             }
+            .contentMargins(.horizontal, contentInset, for: .scrollContent)
             .scrollDismissesKeyboard(.interactively)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             if compact {
                 NibButton(draft.kind.createTitle, kind: .primary, expands: true, shortcut: .defaultAction, action: create)
                     .disabled(model.isWorking)
-                    .padding(.horizontal, NibSpacing.xl)
+                    .padding(.horizontal, NibSpacing.l)
                     .padding(.vertical, NibSpacing.s)
+                    .background(NibColor.backgroundSecondary)
             }
         }
         .background(NibColor.backgroundSecondary)
-        .frame(idealWidth: NibMetrics.newDocumentSheetSize.width, idealHeight: NibMetrics.newDocumentSheetSize.height)
+        // nibSheet fits its content; idealWidth alone lets the system keep its narrower default form size.
+        .frame(width: compact ? nil : sheetSize.width, height: compact ? nil : sheetSize.height)
+        .background {
+            NewNotebookWindowReader { windowSize = $0 }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { measuredWidth = $0 }
         .interactiveDismissDisabled(model.isWorking)
     }
 
@@ -891,7 +924,9 @@ struct NewNotebookSheet: View {
 
     private var kindPicker: some View {
         ViewThatFits(in: .horizontal) {
-            NibSegmentedControl(selection: $model.draft.kind, options: NewDocumentKind.allCases, title: { $0.title })
+            NibSegmentedControl(selection: $model.draft.kind, options: NewDocumentKind.allCases,
+                                title: { compact && $0 == .textDocument ? String(localized: "Text") : $0.title })
+                .fixedSize(horizontal: true, vertical: false)
             Picker(String(localized: "Type"), selection: $model.draft.kind) {
                 ForEach(NewDocumentKind.allCases) { kind in
                     Text(kind.title).tag(kind)
@@ -952,7 +987,8 @@ struct NewNotebookSheet: View {
                 NibSwatchGrid(swatches: NibCoverCloth.allCases.map { NibSwatch(cloth: $0) },
                               selection: Binding(get: { model.draft.cloth?.rawValue },
                                                  set: { model.draft.cloth = $0.flatMap(NibCoverCloth.init(rawValue:)) }),
-                              columns: NibCoverCloth.allCases.count + 1, noneLabel: String(localized: "Cover's own colour"))
+                              columns: swatchColumns(count: NibCoverCloth.allCases.count + 1),
+                              noneLabel: String(localized: "Cover's own colour"))
             }
         }
     }
@@ -1041,7 +1077,7 @@ struct NewNotebookSheet: View {
 
     @ViewBuilder
     private var optionsSection: some View {
-        let layout = compact || typeSize.isAccessibilitySize
+        let layout = compact || measuredWidth < NibMetrics.newDocumentSheetSize.width || typeSize.isAccessibilitySize
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: NibSpacing.xl))
             : AnyLayout(HStackLayout(alignment: .top, spacing: NibSpacing.xl))
         layout {
@@ -1072,7 +1108,14 @@ struct NewNotebookSheet: View {
         NibSwatchGrid(swatches: papers.map { NibSwatch(paper: $0) },
                       selection: Binding(get: { model.draft.paperColour?.rawValue },
                                          set: { model.draft.paperColour = $0.flatMap(NibPaper.init(rawValue:)) }),
-                      columns: papers.count + 1, noneLabel: String(localized: "Template's own colour"))
+                      columns: compact ? swatchColumns(count: papers.count + 1) : papers.count + 1,
+                      noneLabel: String(localized: "Template's own colour"))
+    }
+
+    private func swatchColumns(count: Int) -> Int {
+        // Clamp to the window too: a grid's minimum width must not enlarge the measurement that sizes that grid.
+        let width = min(measuredWidth, windowSize?.width ?? measuredWidth)
+        return min(count, max(1, Int((width - contentInset * 2) / NibMetrics.hitTarget)))
     }
 
     private var customSizeFields: some View {
@@ -1125,6 +1168,43 @@ struct NewNotebookSheet: View {
             NibInspectorSection(String(localized: "Colour")) {
                 paperColours(NotebookDraft.boardColours)
             }
+        }
+    }
+}
+
+/// Reads the hosting window, including Split View and Stage Manager resizes, without relying on sheet size classes.
+private struct NewNotebookWindowReader: UIViewRepresentable {
+    let onChange: (CGSize) -> Void
+
+    func makeUIView(context: Context) -> WindowView {
+        let view = WindowView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateUIView(_ uiView: WindowView, context: Context) {
+        uiView.onChange = onChange
+        uiView.reportSize()
+    }
+
+    final class WindowView: UIView {
+        var onChange: ((CGSize) -> Void)?
+        private var reportedSize: CGSize?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            reportSize()
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            reportSize()
+        }
+
+        func reportSize() {
+            guard let size = window?.bounds.size, size.width > 0, size.height > 0, size != reportedSize else { return }
+            reportedSize = size
+            DispatchQueue.main.async { [weak self] in self?.onChange?(size) }
         }
     }
 }

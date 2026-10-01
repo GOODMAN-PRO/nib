@@ -195,29 +195,49 @@ public struct NibBanner: View {
     }
 
     public var body: some View {
-        HStack(alignment: .center, spacing: NibSpacing.m) {
+        HStack(alignment: .firstTextBaseline, spacing: NibSpacing.m) {
             Image(nib: symbol ?? (style == .warning ? .warningTriangle : .info))
                 .font(NibFont.glyph(.panel))
                 .foregroundStyle(style == .warning ? NibColor.warning : NibColor.labelSecondary)
                 .accessibilityHidden(true)
-            Text(message)
-                .font(NibFont.callout)
-                .foregroundStyle(NibColor.label)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            if let action {
-                Button(action.title, action: action.handler)
-                    .font(NibFont.button)
-                    .foregroundStyle(NibColor.accent)
-                    .buttonStyle(.plain)
-                    .frame(minHeight: NibMetrics.hitTarget)
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: NibSpacing.m) {
+                    messageLabel
+                    actionButton
+                }
+                // Measure the row without squeezing the message to make room for its action.
+                .fixedSize(horizontal: true, vertical: false)
+                VStack(alignment: .leading, spacing: NibSpacing.s) {
+                    messageLabel
+                    actionButton
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, NibSpacing.l)
         .padding(.vertical, NibSpacing.xs)
         .frame(minHeight: NibMetrics.hitTarget)
         .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.proposal, style: .continuous))
         .accessibilityElement(children: .contain)
+    }
+
+    private var messageLabel: some View {
+        Text(message)
+            .font(NibFont.callout)
+            .foregroundStyle(NibColor.label)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var actionButton: some View {
+        if let action {
+            Button(action.title, action: action.handler)
+                .font(NibFont.button)
+                .foregroundStyle(NibColor.accent)
+                .buttonStyle(.plain)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(minHeight: NibMetrics.hitTarget)
+        }
     }
 }
 
@@ -333,7 +353,15 @@ public struct NibDropletButton: View {
             .foregroundStyle(kind == .tinted ? NibColor.onAccent : NibColor.label)
             .opacity(isEnabled ? 1 : NibOpacity.disabled)
             .padding(.horizontal, title == nil ? 0 : NibSpacing.l)
-            .frame(minWidth: NibMetrics.hitTarget, minHeight: NibMetrics.hitTarget)
+            .frame(minWidth: kind == .tinted && title != nil ? 96 : NibMetrics.hitTarget,
+                   minHeight: NibMetrics.hitTarget)
+            .background {
+                // The onAccent foreground always has an accent body, including before geometry registration
+                // and under system glass. This is an underlay, not another glass surface or rim.
+                if kind == .tinted {
+                    Capsule().fill(NibColor.accent)
+                }
+            }
             .contentShape(Capsule())
         }
         .buttonStyle(NibPressStyle(shape: Capsule()))

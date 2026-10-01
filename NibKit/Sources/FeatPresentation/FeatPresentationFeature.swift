@@ -44,7 +44,7 @@ public enum FeatPresentationFeature: NibFeature {
             app.ui.chromeOverlays.register(ChromeOverlayDescriptor(
                 id: compact ? PresentationController.compactHUDID : PresentationController.hudID, owner: id,
                 placement: compact ? .bottom : .top, surface: .hud, order: 900, recedesWhileWriting: true,
-                isVisible: { ctx in ctx.isCompact == compact && controller.showsHUD(in: ctx.session) },
+                isVisible: { ctx in ctx.kind != nil && ctx.isCompact == compact && controller.showsHUD(in: ctx.session) },
                 makeView: { ctx in
                     AnyView(PresenterHUD(app: ctx.app, session: ctx.session, controller: controller, compact: compact))
                 }))

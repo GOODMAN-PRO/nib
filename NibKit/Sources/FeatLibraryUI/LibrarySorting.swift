@@ -25,12 +25,64 @@ struct LibraryRow: Codable, Identifiable, Hashable {
     var nodeID: NibID { NibID(String(ref.split(separator: ":").last ?? "")) }
 
     var accessibilityLabel: String { name }
-    var accessibilityValue: String {
+    var accessibilityStatus: String {
         [locked == true ? String(localized: "Locked") : "",
          favorite == true ? String(localized: "Favourite") : "",
-         sync == SyncBadge.error.rawValue ? String(localized: "Sync error") : sync == SyncBadge.syncing.rawValue ? String(localized: "Syncing") : "",
-         isFolder ? items.map(Self.itemCount) ?? "" : pages.map(Self.pageCount) ?? ""]
+         syncStatus]
             .filter { !$0.isEmpty }.joined(separator: ", ")
+    }
+    var accessibilityValue: String { accessibilityValue(subtitle: nil) }
+    func accessibilityValue(subtitle: String?) -> String {
+        [accessibilityStatus, isFolder ? items.map(Self.itemCount) ?? "" : subtitle ?? self.subtitle()]
+            .filter { !$0.isEmpty }.joined(separator: ", ")
+    }
+    private var syncStatus: String {
+        switch sync.flatMap(SyncBadge.init(rawValue:)) {
+        case .localOnly: return String(localized: "Not synced")
+        case .syncing: return String(localized: "Syncing")
+        case .downloading: return String(localized: "Downloading")
+        case .error: return String(localized: "Sync error")
+        default: return ""
+        }
+    }
+    var syncSymbol: NibSymbol? {
+        switch sync.flatMap(SyncBadge.init(rawValue:)) {
+        case .error: return .syncError
+        case .syncing, .downloading: return .syncing
+        default: return nil
+        }
+    }
+    var typeBadge: NibSymbol? {
+        switch kind {
+        case "whiteboard": return .whiteboard
+        case "textDocument": return .textDocument
+        case "studySet": return .studySets
+        default: return nil
+        }
+    }
+    func subtitle(content: DocumentContent? = nil) -> String {
+        switch kind {
+        case "studySet":
+            guard let content else { return String(localized: "Study set") }
+            let count = content.cards.filter { !$0.deleted }.count
+            return count == 1 ? String(localized: "1 card") : String(localized: "\(count) cards")
+        case "textDocument":
+            guard let content else { return String(localized: "Text document") }
+            var count = 0
+            func addWords(_ text: String) {
+                text.enumerateSubstrings(in: text.startIndex..<text.endIndex, options: .byWords) { _, _, _, _ in count += 1 }
+            }
+            for block in content.blocks where !block.deleted {
+                addWords(block.text.plainText)
+                if let caption = block.caption { addWords(caption.plainText) }
+                for cells in block.table?.rows ?? [] {
+                    for cell in cells { addWords(cell.text.plainText) }
+                }
+            }
+            return count == 1 ? String(localized: "1 word") : String(localized: "\(count) words")
+        case "whiteboard": return String(localized: "Whiteboard")
+        default: return pages.map(Self.pageCount) ?? String(localized: "Notebook")
+        }
     }
     static func itemCount(_ count: Int) -> String { count == 1 ? String(localized: "1 item") : String(localized: "\(count) items") }
     static func pageCount(_ count: Int) -> String { count == 1 ? String(localized: "1 page") : String(localized: "\(count) pages") }

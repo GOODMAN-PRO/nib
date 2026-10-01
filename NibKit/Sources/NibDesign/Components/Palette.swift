@@ -634,10 +634,13 @@ public struct NibToolPalette<Settings: View>: View {
         .padding(d.isVertical ? Edge.Set.vertical : Edge.Set.horizontal, NibMetrics.paletteEndPadding)
         .frame(width: s.width, height: s.height)
         .background(alignment: .topLeading) {
-            NibSelectionBead(paletteID: id, vertical: d.isVertical, thickness: thick,
-                             fallbackHead: map[selection] ?? 0,
-                             ink: swatches.indices.contains(swatch) ? swatches[swatch].color : NibColor.label)
+            if let head = map[selection], selection != Self.moreID {
+                NibSelectionBead(paletteID: id, vertical: d.isVertical, thickness: thick,
+                                 fallbackHead: head,
+                                 ink: swatches.indices.contains(swatch) ? swatches[swatch].color : NibColor.label)
+            }
         }
+        .clipShape(NibDropletShape())
         .contentShape(NibDropletShape())
         .nibChromeTypeCap()
         .droplet(id, style: .palette, managesDrag: false)

@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import SwiftUI
 import NibContracts
 import NibTesting
 @testable import FeatWindows
@@ -15,7 +16,7 @@ final class FakeNavigator: SceneNavigator {
     private(set) var activeDocument: DocumentID?
     /// Editors built: one per open that lands (the shell builds the editor of every document it shows).
     private(set) var editorsBuilt = 0
-    var rootViewController: UIViewController? { nil }
+    var rootViewController: UIViewController?
 
     init(app: NibApp) {
         self.app = app
@@ -85,6 +86,19 @@ final class FailedCommands: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         list.append(command)
     }
+}
+
+@MainActor
+final class TabStripTestFloatingHost: FloatingHosting {
+    private(set) var content: [String: AnyView] = [:]
+
+    func present(_ id: String, content: AnyView) { self.content[id] = content }
+    func dismiss(_ id: String) { content[id] = nil }
+    func isPresenting(_ id: String) -> Bool { content[id] != nil }
+    func setAnchor(_ id: String, rect: CGRect, in view: UIView) -> Bool { false }
+    func removeAnchor(_ id: String) {}
+    func containerRect(_ rect: CGRect, from view: UIView) -> CGRect? { nil }
+    func postToast(_ message: String, actionTitle: String?, action: (@MainActor () -> Void)?) {}
 }
 
 /// A document edit made in one window, to see it from another.
@@ -589,6 +603,159 @@ final class FeatWindowsTests: XCTestCase {
 
     // MARK: Strip layout
 
+    func testTabsAreOptionalChromeWithTheirOwnDefaultOffSetting() async throws {
+        let (h, scenes, hooks) = try windows()
+        let setting = try XCTUnwrap(h.app.settings.descriptor(WindowSettings.showTabs.name))
+        XCTAssertEqual(setting.owner, FeatWindowsFeature.id)
+        XCTAssertEqual(setting.defaultValue, .bool(false))
+        XCTAssertTrue(setting.synced)
+        XCTAssertNotNil(h.app.ui.settingsPages.get("windows.settings.tabs"))
+        XCTAssertNotEqual(WindowSettings.showTabs.name, NibSettings.openAsTabs.name)
+
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        h.app.settings.set(WindowSettings.showTabs, true)
+        XCTAssertNil(hooks.makeTabBar(navigator))             // one document never repeats the title
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        XCTAssertNotNil(hooks.makeTabBar(navigator))
+        h.app.settings.set(WindowSettings.showTabs, false)
+        XCTAssertNil(hooks.makeTabBar(navigator))             // opening policy does not override visibility
+        XCTAssertTrue(h.app.settings.get(NibSettings.openAsTabs))
+        XCTAssertEqual(navigator.openDocuments, [notebook, board])
+    }
+
+    func testChangingTabsVisibilityUpdatesEveryDocumentWindowWithoutReopeningAnEditor() async throws {
+        let (h, scenes, hooks) = try windows()
+        var documents: [UIViewController] = []
+        var roots: [UIViewController] = []
+        var navigators: [FakeNavigator] = []
+        var hosts: [TabStripTestFloatingHost] = []
+        for _ in 0..<2 {
+            let navigator = window(h, scenes)
+            try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+            try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+            let root = UIViewController()
+            let document = UIViewController()
+            root.loadViewIfNeeded()
+            document.loadViewIfNeeded()
+            document.additionalSafeAreaInsets.top = 8
+            root.addChild(document)
+            root.view.addSubview(document.view)
+            document.didMove(toParent: root)
+            navigator.rootViewController = root
+            let host = TabStripTestFloatingHost()
+            navigator.session.floatingHost = host
+            XCTAssertNil(hooks.makeTabBar(navigator))
+            XCTAssertFalse(host.isPresenting(TabStripLayout.dropletID))
+            XCTAssertEqual(document.additionalSafeAreaInsets.top, 8)
+            roots.append(root)
+            documents.append(document)
+            navigators.append(navigator)
+            hosts.append(host)
+        }
+
+        h.app.settings.set(WindowSettings.showTabs, true)
+        try await waitUntil { hosts.allSatisfy { $0.isPresenting("windows.tabs") } }
+        XCTAssertTrue(documents.allSatisfy { $0.additionalSafeAreaInsets.top == 8 + TabStripLayout.documentTopInset })
+        documents[0].additionalSafeAreaInsets.top += 4
+        h.app.settings.set(WindowSettings.showTabs, false)
+        try await waitUntil { hosts.allSatisfy { !$0.isPresenting("windows.tabs") } }
+        XCTAssertEqual(documents.map { $0.additionalSafeAreaInsets.top }, [12, 8])
+        XCTAssertEqual(navigators.map { $0.editorsBuilt }, [2, 2])
+        withExtendedLifetime(roots) {}
+    }
+
+    func testDocumentTabsUseTheExistingFloatingHostAndRestoreOnlyTheirSafeAreaContribution() async throws {
+        let (h, scenes, hooks) = try windows()
+        h.app.settings.set(WindowSettings.showTabs, true)
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let root = UIViewController()
+        let document = UIViewController()
+        root.loadViewIfNeeded()
+        document.loadViewIfNeeded()
+        document.additionalSafeAreaInsets = UIEdgeInsets(top: 8, left: 4, bottom: 12, right: 4)
+        root.addChild(document)
+        root.view.addSubview(document.view)
+        document.didMove(toParent: root)
+        navigator.rootViewController = root
+        let host = TabStripTestFloatingHost()
+        navigator.session.floatingHost = host
+
+        // nil is essential: the shell then gives the document the full window, without its separate tab band.
+        XCTAssertNil(hooks.makeTabBar(navigator))
+        XCTAssertTrue(host.isPresenting(TabStripLayout.dropletID))
+        XCTAssertEqual(document.additionalSafeAreaInsets.top, 8 + TabStripLayout.stripHeight + 16)
+        XCTAssertNil(hooks.makeTabBar(navigator))
+        XCTAssertEqual(document.additionalSafeAreaInsets.top, 8 + TabStripLayout.documentTopInset)
+        XCTAssertEqual(host.content.count, 1)
+
+        // Another owner changes its inset while tabs are visible; hiding tabs preserves that change.
+        document.additionalSafeAreaInsets.top += 4
+        h.app.settings.set(WindowSettings.showTabs, false)
+        navigator.closeDocument(notebook)
+        XCTAssertNil(hooks.makeTabBar(navigator))
+        XCTAssertFalse(host.isPresenting(TabStripLayout.dropletID))
+        XCTAssertEqual(document.additionalSafeAreaInsets, UIEdgeInsets(top: 12, left: 4, bottom: 12, right: 4))
+    }
+
+    func testLeavingTheDocumentRemovesItsTabDropletAndSafeAreaReservation() async throws {
+        let (h, scenes, hooks) = try windows()
+        h.app.settings.set(WindowSettings.showTabs, true)
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let root = UIViewController()
+        let document = UIViewController()
+        root.loadViewIfNeeded()
+        root.addChild(document)
+        root.view.addSubview(document.view)
+        document.didMove(toParent: root)
+        navigator.rootViewController = root
+        let host = TabStripTestFloatingHost()
+        navigator.session.floatingHost = host
+        XCTAssertNil(hooks.makeTabBar(navigator))
+
+        navigator.showLibrary(folder: nil)
+        XCTAssertNotNil(hooks.makeTabBar(navigator))
+        XCTAssertFalse(host.isPresenting(TabStripLayout.dropletID))
+        XCTAssertEqual(document.additionalSafeAreaInsets.top, 0)
+    }
+
+    func testSwitchingDocumentContainersMovesTabsWithoutLeavingAnInsetOrDropletBehind() async throws {
+        let (h, scenes, hooks) = try windows()
+        h.app.settings.set(WindowSettings.showTabs, true)
+        let navigator = window(h, scenes)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC01"], in: navigator)
+        try await run(h, CommandIDs.docOpen, ["doc": "doc:FIXTUREDOC04"], in: navigator)
+        let root = UIViewController()
+        root.loadViewIfNeeded()
+        navigator.rootViewController = root
+        let first = UIViewController()
+        root.addChild(first)
+        root.view.addSubview(first.view)
+        first.didMove(toParent: root)
+        let firstHost = TabStripTestFloatingHost()
+        navigator.session.floatingHost = firstHost
+        XCTAssertNil(hooks.makeTabBar(navigator))
+
+        first.willMove(toParent: nil)
+        first.view.removeFromSuperview()
+        first.removeFromParent()
+        let second = UIViewController()
+        root.addChild(second)
+        root.view.addSubview(second.view)
+        second.didMove(toParent: root)
+        let secondHost = TabStripTestFloatingHost()
+        navigator.session.floatingHost = secondHost
+        XCTAssertNil(hooks.makeTabBar(navigator))
+        XCTAssertFalse(firstHost.isPresenting(TabStripLayout.dropletID))
+        XCTAssertEqual(first.additionalSafeAreaInsets.top, 0)
+        XCTAssertTrue(secondHost.isPresenting(TabStripLayout.dropletID))
+        XCTAssertEqual(second.additionalSafeAreaInsets.top, TabStripLayout.stripHeight + 16)
+    }
+
     func testStripKeepsTheCurrentTabVisibleAndOverflowsTheRest() {
         let wide = TabStripLayout.plan(count: 3, active: 0, width: 1194)
         XCTAssertEqual(wide.shown, [0, 1, 2])
@@ -608,10 +775,14 @@ final class FeatWindowsTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(phone.tabWidth, 96)
         XCTAssertLessThanOrEqual(phone.dropletWidth, 393 - 32)
 
-        XCTAssertTrue(TabStripLayout.showsStrip(tabCount: 1, openAsTabs: true))
-        XCTAssertFalse(TabStripLayout.showsStrip(tabCount: 1, openAsTabs: false))
-        XCTAssertTrue(TabStripLayout.showsStrip(tabCount: 2, openAsTabs: false))
-        XCTAssertFalse(TabStripLayout.showsStrip(tabCount: 0, openAsTabs: true))
+        for count in 0...1 {
+            XCTAssertFalse(TabStripLayout.showsStrip(tabCount: count, enabled: true))
+            XCTAssertFalse(TabStripLayout.showsStrip(tabCount: count, enabled: false))
+        }
+        for count in [2, 5, 9] {
+            XCTAssertTrue(TabStripLayout.showsStrip(tabCount: count, enabled: true))
+            XCTAssertFalse(TabStripLayout.showsStrip(tabCount: count, enabled: false))
+        }
 
         XCTAssertEqual(TabMath.neighbour(of: notebook, in: [notebook, text, board]), text)
         XCTAssertEqual(TabMath.neighbour(of: board, in: [notebook, text, board]), text)

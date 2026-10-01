@@ -68,27 +68,35 @@ struct FloatingPanelView: View {
     init(chrome: ChromeWindow, panel: PanelDescriptor, size: CGSize, region: CGRect, centre: CGPoint, isFront: Bool) {
         self.chrome = chrome
         self.panel = panel
-        self.size = size
+        self.size = CGSize(width: max(0, min(size.width, region.width)),
+                           height: max(0, min(size.height, region.height)))
         self.region = region
         self.centre = centre
         self.isFront = isFront
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if chrome.drawsHeader(panel) {
-                NibPanelHeader(title: panel.title, symbol: NibSymbol(systemName: panel.icon) ?? .puzzle,
-                               onClose: { chrome.closePanel(panel.id) }) {
-                    PanelPlacementMenu(chrome: chrome, panel: panel, current: .floating)
+        ScrollView {
+            VStack(spacing: 0) {
+                if chrome.drawsHeader(panel) {
+                    NibPanelHeader(title: panel.title, symbol: NibSymbol(systemName: panel.icon) ?? .puzzle,
+                                   onClose: { chrome.closePanel(panel.id) }) {
+                        PanelPlacementMenu(chrome: chrome, panel: panel, current: .floating)
+                    }
+                    Rectangle()
+                        .fill(NibColor.separatorSoft)
+                        .frame(height: NibStroke.hairline)
                 }
-                Rectangle()
-                    .fill(NibColor.separatorSoft)
-                    .frame(height: NibStroke.hairline)
+                panel.makeView(chrome.panelContext(panel.id, presentation: .floating))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            panel.makeView(chrome.panelContext(panel.id, presentation: .floating))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Preserve the panel's normal viewport for views with their own scrolling thread/list. When the
+            // window clamps the droplet, the outer scroll keeps the header, composer and footer reachable.
+            .frame(width: size.width, height: max(size.height, ChromeLayout.floatingHeight))
         }
+        .scrollBounceBehavior(.basedOnSize)
         .frame(width: size.width, height: size.height)
+        .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
         .droplet("chrome.floating." + panel.id, style: .floatingPanel, onDrag: { handle($0) })
         .simultaneousGesture(TapGesture().onEnded { bringToFront() })
         .accessibilityElement(children: .contain)
@@ -160,7 +168,8 @@ enum ChromeOverlayGeometry {
         var anchor: CGRect?
     }
 
-    static func frames(_ items: [Item], in region: CGRect, gap: CGFloat = NibMetrics.minimumRestingGap,
+    static func frames(_ items: [Item], in region: CGRect, keyboardFrame: CGRect? = nil,
+                       gap: CGFloat = NibMetrics.minimumRestingGap,
                        anchorGap: CGFloat = NibMetrics.popoverGap) -> [String: CGRect] {
         var frames: [String: CGRect] = [:]
         var stacks: [ChromePlacement: [(id: String, size: CGSize)]] = [:]
@@ -185,7 +194,9 @@ enum ChromeOverlayGeometry {
                     y += entry.size.height + gap
                 }
             case .bottomLeading, .bottom, .bottomTrailing:
-                var y = region.maxY
+                // Keyboard clearance belongs to bottom HUDs, never to the top field or the bars.
+                let bottomRegion = ChromeRegion.avoidingKeyboard(keyboardFrame, in: region)
+                var y = bottomRegion.maxY
                 for entry in stack {
                     y -= entry.size.height
                     frames[entry.id] = CGRect(origin: CGPoint(x: x(placement, width: entry.size.width, in: region), y: y),
@@ -389,6 +400,7 @@ final class ChromeOverlayModel: ObservableObject {
 struct ChromeOverlayStack: Layout {
     let region: CGRect
     let placed: ChromeOverlayFrames
+    var keyboardFrame: CGRect? = nil
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         proposal.replacingUnspecifiedDimensions()
@@ -402,7 +414,7 @@ struct ChromeOverlayStack: Layout {
             return ChromeOverlayGeometry.Item(id: slot.id, placement: slot.placement, size: subview.sizeThatFits(offer),
                                               anchor: slot.anchor)
         }
-        let frames = ChromeOverlayGeometry.frames(items, in: region)
+        let frames = ChromeOverlayGeometry.frames(items, in: region, keyboardFrame: keyboardFrame)
         placed.frames = frames
         for (item, subview) in zip(items, subviews) {
             let frame = frames[item.id] ?? CGRect(x: region.midX, y: region.midY, width: 0, height: 0)
@@ -427,19 +439,21 @@ struct ChromeOverlayLayer: View {
     @ObservedObject var model: ChromeOverlayModel
     let inking: ChromeInkingMirror
     let region: CGRect
+    let keyboardFrame: CGRect?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.nibLiquidMode) private var liquidMode
 
-    init(model: ChromeOverlayModel, inking: ChromeInkingMirror, region: CGRect) {
+    init(model: ChromeOverlayModel, inking: ChromeInkingMirror, region: CGRect, keyboardFrame: CGRect? = nil) {
         _model = ObservedObject(wrappedValue: model)
         self.inking = inking
         self.region = region
+        self.keyboardFrame = keyboardFrame
     }
 
     var body: some View {
         let context = model.context
         let reduced = reduceMotion || liquidMode == .off
-        ChromeOverlayStack(region: region, placed: model.placed) {
+        ChromeOverlayStack(region: region, placed: model.placed, keyboardFrame: keyboardFrame) {
             ForEach(model.overlays, id: \.id) { overlay in
                 ChromeOverlaySurface(overlay: overlay, context: context, inking: inking)
                     .layoutValue(key: ChromeOverlaySlot.self,

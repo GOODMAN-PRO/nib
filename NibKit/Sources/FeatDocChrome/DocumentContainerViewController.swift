@@ -8,7 +8,7 @@ import NibDesign
 
 /// Where everything in a document window goes (DESIGN.md §5, §14.2, §14.4). Pure, so it is unit-tested for compact
 /// and regular widths and both sidebar sides.
-/// - Below 600 pt the window is compact: sidebars and floating panels become sheets.
+/// - Phones, compact-height windows and widths below 600 pt use sheets for sidebars and floating panels.
 /// - From 900 pt sidebars dock and the editor insets so the page stays fully visible; in between they float over it.
 struct ChromeLayout: Equatable {
     enum SidebarPresentation: Equatable {
@@ -21,7 +21,10 @@ struct ChromeLayout: Equatable {
     /// Floating panels are 344 × 560 (DESIGN.md §14.9), clamped to the window.
     static let floatingHeight: CGFloat = 560
 
-    static func isCompact(width: CGFloat) -> Bool { width < NibMetrics.compactBreakpoint }
+    static func isCompact(width: CGFloat, idiom: UIUserInterfaceIdiom = .pad,
+                          verticalSizeClass: UIUserInterfaceSizeClass = .regular) -> Bool {
+        idiom == .phone || verticalSizeClass == .compact || width < NibMetrics.compactBreakpoint
+    }
 
     var isCompact: Bool
     var presentation: SidebarPresentation
@@ -36,6 +39,10 @@ struct ChromeLayout: Equatable {
     /// The window's safe area where it overlaps `toolbar`, as padding: the chrome's root ignores the safe area, so
     /// without it the top dock would sit under the status bar and the bottom dock over the home indicator.
     var toolbarInsets: EdgeInsets
+    var toolbarContentSize: CGSize {
+        CGSize(width: max(0, toolbar.width - toolbarInsets.leading - toolbarInsets.trailing),
+               height: max(0, toolbar.height - toolbarInsets.top - toolbarInsets.bottom))
+    }
     var left: CGRect?
     var right: CGRect?
     /// Window mode: the sidebar's panel over the whole window below the bars.
@@ -50,14 +57,15 @@ struct ChromeLayout: Equatable {
     var toast: CGRect
 
     /// `left` / `right`: the width of the panel a side shows, nil when that side is closed.
-    init(size: CGSize, safeArea: UIEdgeInsets, left leftWidth: CGFloat?, right rightWidth: CGFloat?, mode: SidebarMode) {
+    init(size: CGSize, safeArea: UIEdgeInsets, left leftWidth: CGFloat?, right rightWidth: CGFloat?, mode: SidebarMode,
+         idiom: UIUserInterfaceIdiom = .pad, verticalSizeClass: UIUserInterfaceSizeClass = .regular) {
         let inset = NibMetrics.chromeInset
         let width = size.width
         let height = size.height
-        let compact = ChromeLayout.isCompact(width: width)
+        let compact = ChromeLayout.isCompact(width: width, idiom: idiom, verticalSizeClass: verticalSizeClass)
         let bar = CGRect(x: safeArea.left + inset, y: safeArea.top + NibMetrics.barTopGap,
                          width: max(0, width - safeArea.left - safeArea.right - 2 * inset), height: NibMetrics.barHeight)
-        let top = bar.maxY + NibSpacing.m
+        let top = bar.maxY + NibSpacing.l
         let bottom = max(top, height - max(safeArea.bottom, inset))
         let minX = safeArea.left + inset
         let maxX = max(minX, width - safeArea.right - inset)
@@ -109,10 +117,50 @@ struct ChromeLayout: Equatable {
         self.left = left
         self.right = right
         self.window = window
-        self.floatingRegion = CGRect(x: floatMinX, y: top, width: floatMaxX - floatMinX, height: bottom - top)
+        let floatingBottom = compact ? min(bottom, overlayBottom) : bottom
+        self.floatingRegion = CGRect(x: floatMinX, y: top, width: floatMaxX - floatMinX,
+                                     height: max(0, floatingBottom - top))
         self.overlayRegion = overlay
         let toastBottom = compact ? overlay.maxY + NibSpacing.xxl : height - safeArea.bottom
         self.toast = CGRect(x: toolMinX, y: 0, width: toolMaxX - toolMinX, height: max(0, toastBottom))
+    }
+
+    /// Reserve the horizontal palette's resting band using the same dock geometry as NibToolPalette. The toolbar
+    /// is padded by toolbarInsets, so its local dock frame is translated back into container coordinates here.
+    mutating func avoidPalette(_ dock: NibPaletteDock, thickness: CGFloat, optionsHeight: CGFloat = 0) {
+        guard !dock.isVertical else { return }
+        let region = DropletDockModel.region(size: toolbarContentSize, safeArea: EdgeInsets(), compact: isCompact)
+        let model = DropletDockModel(region: region, length: region.width, thickness: thickness, compact: isCompact)
+        let frame = model.frame(for: dock).offsetBy(dx: toolbar.minX + toolbarInsets.leading,
+                                                  dy: toolbar.minY + toolbarInsets.top)
+        let extra = max(0, optionsHeight - 1) // The options bar fuses with a 1 pt overlap (§10.4).
+        if dock.edge == .top {
+            let top = frame.maxY + extra + NibSpacing.l
+            overlayRegion = ChromeRegion.below(top, in: overlayRegion)
+            floatingRegion = ChromeRegion.below(top, in: floatingRegion)
+        } else if dock.edge == .bottom {
+            let bottom = frame.minY - extra - NibSpacing.l
+            overlayRegion = ChromeRegion.above(bottom, in: overlayRegion)
+            floatingRegion = ChromeRegion.above(bottom, in: floatingRegion)
+        }
+    }
+}
+
+/// Explicit obstacle clearance never changes the bars, the canvas or the toolbar's full-window coordinates.
+enum ChromeRegion {
+    static func below(_ top: CGFloat, in region: CGRect) -> CGRect {
+        let y = min(region.maxY, max(region.minY, top))
+        return CGRect(x: region.minX, y: y, width: region.width, height: max(0, region.maxY - y))
+    }
+
+    static func above(_ bottom: CGFloat, in region: CGRect) -> CGRect {
+        CGRect(x: region.minX, y: region.minY, width: region.width,
+               height: max(0, min(region.maxY, bottom) - region.minY))
+    }
+
+    static func avoidingKeyboard(_ keyboard: CGRect?, in region: CGRect) -> CGRect {
+        guard let keyboard, keyboard.intersects(region) else { return region }
+        return above(keyboard.minY - NibSpacing.l, in: region)
     }
 }
 
@@ -256,10 +304,24 @@ final class ChromeWindow {
 final class ChromeGeometry: ObservableObject {
     @Published private(set) var size: CGSize = .zero
     @Published private(set) var safeArea: UIEdgeInsets = .zero
+    @Published private(set) var idiom: UIUserInterfaceIdiom = .pad
+    @Published private(set) var verticalSizeClass: UIUserInterfaceSizeClass = .regular
+    @Published private(set) var keyboardFrame: CGRect?
 
-    func update(size: CGSize, safeArea: UIEdgeInsets) {
+    var isCompact: Bool {
+        ChromeLayout.isCompact(width: size.width, idiom: idiom, verticalSizeClass: verticalSizeClass)
+    }
+
+    func update(size: CGSize, safeArea: UIEdgeInsets, idiom: UIUserInterfaceIdiom = .pad,
+                verticalSizeClass: UIUserInterfaceSizeClass = .regular) {
         if size != self.size { self.size = size }
         if safeArea != self.safeArea { self.safeArea = safeArea }
+        if idiom != self.idiom { self.idiom = idiom }
+        if verticalSizeClass != self.verticalSizeClass { self.verticalSizeClass = verticalSizeClass }
+    }
+
+    func updateKeyboard(_ frame: CGRect?) {
+        if frame != keyboardFrame { keyboardFrame = frame }
     }
 }
 
@@ -570,6 +632,7 @@ final class DocumentContainerViewController: UIViewController {
     /// The window's floating host while this container is on screen.
     let floatingHost: ChromeFloatingHost
     private var cancellables = Set<AnyCancellable>()
+    private var keyboardScreenFrame: CGRect?
 
     init(editor: UIViewController, document: DocumentID, app: NibApp, navigator: SceneNavigator) {
         let session = navigator.session
@@ -603,6 +666,9 @@ final class DocumentContainerViewController: UIViewController {
                                   overlays: overlays, floating: floatingHost.host, live: live, geometry: geometry,
                                   model: model)
         let host = UIHostingController(rootView: root)
+        // ChromeGeometry supplies the container's real safe area. Hosting-controller keyboard avoidance must never
+        // translate the entire droplet layer under the shell's tab band.
+        host.safeAreaRegions = []
         host.view.backgroundColor = .clear
         addChild(host)
         host.view.frame = view.bounds
@@ -627,13 +693,30 @@ final class DocumentContainerViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        geometry.update(size: view.bounds.size, safeArea: view.safeAreaInsets)
+        updateGeometry()
         Task { @MainActor [weak self] in self?.updateBackdrop() }
     }
 
     override func viewSafeAreaInsetsDidChange() {
         super.viewSafeAreaInsetsDidChange()
-        geometry.update(size: view.bounds.size, safeArea: view.safeAreaInsets)
+        updateGeometry()
+    }
+
+    private func updateGeometry() {
+        geometry.update(size: view.bounds.size, safeArea: view.safeAreaInsets,
+                        idiom: traitCollection.userInterfaceIdiom, verticalSizeClass: traitCollection.verticalSizeClass)
+        overlays.update(isCompact: geometry.isCompact)
+        updateKeyboardGeometry()
+    }
+
+    private func updateKeyboardGeometry() {
+        guard let frame = keyboardScreenFrame, let window = view.window else {
+            geometry.updateKeyboard(nil)
+            return
+        }
+        let local = view.convert(window.convert(frame, from: window.screen.coordinateSpace), from: window)
+        let overlap = view.bounds.intersection(local)
+        geometry.updateKeyboard(overlap.isNull || overlap.isEmpty ? nil : overlap)
     }
 
     /// P-106 (`NibSettings.hideStatusBar`); the shell forwards `childForStatusBarHidden` to its content.
@@ -647,6 +730,22 @@ final class DocumentContainerViewController: UIViewController {
     }
 
     private func observe() {
+        let center = NotificationCenter.default
+        center.publisher(for: UIResponder.keyboardWillChangeFrameNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self, self.view.window?.isKeyWindow == true else { return }
+                self.keyboardScreenFrame = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue
+                self.updateKeyboardGeometry()
+            }
+            .store(in: &cancellables)
+        center.publisher(for: UIResponder.keyboardWillHideNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.keyboardScreenFrame = nil
+                self?.geometry.updateKeyboard(nil)
+            }
+            .store(in: &cancellables)
         NotificationCenter.default.publisher(for: SettingsStore.didChange, object: chrome.app.settings)
             .compactMap { $0.userInfo?["name"] as? String }
             .filter { $0 == NibSettings.hideStatusBar.name }
@@ -662,9 +761,6 @@ final class DocumentContainerViewController: UIViewController {
             .store(in: &cancellables)
         model.$snapshot.map(\.kind).removeDuplicates()
             .sink { [weak self] kind in self?.overlays.update(kind: kind) }
-            .store(in: &cancellables)
-        geometry.$size.map { ChromeLayout.isCompact(width: $0.width) }.removeDuplicates()
-            .sink { [weak self] compact in self?.overlays.update(isCompact: compact) }
             .store(in: &cancellables)
     }
 
@@ -702,6 +798,7 @@ struct ChromeRootView: View {
     @ObservedObject private var state: ChromeState
     @ObservedObject private var model: ChromeDocumentModel
     @Environment(\.dynamicTypeSize) private var typeSize
+    @ScaledMetric(relativeTo: .body) private var paletteThickness = NibMetrics.paletteThickness
     @State private var openMenu: ChromeMenu? = nil
 
     init(chrome: ChromeWindow, editor: UIViewController, toolbar: AnyView?, inking: ChromeInkingMirror,
@@ -739,15 +836,33 @@ struct ChromeRootView: View {
         // Settings › Appearance › Liquid (contracts-v2 NibSettings.liquidMode) for the whole container.
         .nibLiquidMode(liquidMode)
         .frame(width: geometry.size.width, height: geometry.size.height)
-        .ignoresSafeArea()
+        .ignoresSafeArea(.container)
+        .ignoresSafeArea(.keyboard)
         .nibSheet(isPresented: sheetBinding(compact: layout.isCompact)) { sheetContent }
     }
 
     // MARK: Layout
 
     private var currentLayout: ChromeLayout {
-        ChromeLayout(size: geometry.size, safeArea: geometry.safeArea, left: sidebarWidth(.left),
-                     right: sidebarWidth(.right), mode: state.mode)
+        var layout = ChromeLayout(size: geometry.size, safeArea: geometry.safeArea, left: sidebarWidth(.left),
+                                  right: sidebarWidth(.right), mode: state.mode, idiom: geometry.idiom,
+                                  verticalSizeClass: geometry.verticalSizeClass)
+        if toolbar != nil, !model.snapshot.readOnly {
+            // Read F016's existing setting; do not redeclare its key or depend on the feature's private runtime.
+            let saved = chrome.app.settings.json("toolbar.dock")
+            let edge = saved?["edge"].stringValue.flatMap { NibDock(commandValue: $0) }
+                ?? (layout.isCompact ? .bottom : (layout.toolbarContentSize.width > layout.toolbarContentSize.height ? .leading : .top))
+            let dock = NibPaletteDock(edge: edge, along: CGFloat(saved?["along"].doubleValue ?? 0.5))
+            let dockModel = DropletDockModel(region: .zero, length: 0, thickness: 0, compact: layout.isCompact)
+            let active = chrome.app.ui.toolbarItems(for: model.snapshot.kind)
+                .first { ($0.toolID ?? $0.id) == model.snapshot.tool }
+            let hasOptions = chrome.app.ui.toolMenus.get(model.snapshot.tool) != nil
+                || active?.activeToolMenu != nil || active?.settings != nil
+            layout.avoidPalette(dockModel.validated(dock),
+                                thickness: min(max(paletteThickness, NibMetrics.paletteThickness), NibMetrics.paletteThicknessMax),
+                                optionsHeight: hasOptions ? NibMetrics.barHeight : 0)
+        }
+        return layout
     }
 
     private var liquidMode: NibLiquidMode {
@@ -773,10 +888,12 @@ struct ChromeRootView: View {
         let snapshot = model.snapshot
         ZStack(alignment: .topLeading) {
             sidebars(layout)
-            ChromeOverlayLayer(model: overlays, inking: inking, region: layout.overlayRegion)
+            ChromeOverlayLayer(model: overlays, inking: inking, region: layout.overlayRegion,
+                               keyboardFrame: geometry.keyboardFrame)
             if let toolbar {
                 // Full height between open sidebars; padded by the safe area the root ignores (see ChromeLayout).
                 toolbar
+                    .environment(\.horizontalSizeClass, layout.isCompact ? .compact : .regular)
                     .padding(layout.toolbarInsets)
                     .frame(width: layout.toolbar.width, height: layout.toolbar.height)
                     .position(x: layout.toolbar.midX, y: layout.toolbar.midY)
@@ -800,22 +917,31 @@ struct ChromeRootView: View {
     @ViewBuilder
     private func sidebars(_ layout: ChromeLayout) -> some View {
         if let frame = layout.window, let side = windowSide, let content = sidebarContent(side) {
+            let frame = panelFrame(frame, id: content.selected.id)
             SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected, mode: .window,
                              presentation: .window)
                 .frame(width: frame.width, height: frame.height)
+                .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                 .droplet("chrome.sidebar.window", style: .panel)
                 .position(x: frame.midX, y: frame.midY)
         } else if !layout.isCompact {
             ForEach(SidebarSide.allCases, id: \.self) { side in
                 if let frame = (side == .left ? layout.left : layout.right), let content = sidebarContent(side) {
+                    let frame = panelFrame(frame, id: content.selected.id)
                     SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected,
                                      mode: .sidebar, presentation: .sidebar)
                         .frame(width: frame.width, height: frame.height)
+                        .clipShape(RoundedRectangle(cornerRadius: NibRadius.panel, style: .continuous))
                         .droplet("chrome.sidebar." + side.rawValue, style: .panel)
                         .position(x: frame.midX, y: frame.midY)
                 }
             }
         }
+    }
+
+    private func panelFrame(_ frame: CGRect, id: String) -> CGRect {
+        // F027's document results panel scrolls above the keyboard; its search-field overlay stays below the bars.
+        id == "searchui.document" ? ChromeRegion.avoidingKeyboard(geometry.keyboardFrame, in: frame) : frame
     }
 
     /// The side window mode shows: the preferred side when it is open.
@@ -881,7 +1007,7 @@ struct ChromeRootView: View {
 
     @ViewBuilder
     private var sheetContent: some View {
-        switch PresentedSheet.current(state, compact: ChromeLayout.isCompact(width: geometry.size.width)) {
+        switch PresentedSheet.current(state, compact: geometry.isCompact) {
         case .modal(let id)?:
             if let panel = chrome.app.ui.panels.get(id) {
                 panel.makeView(chrome.panelContext(id, presentation: .sheet))
@@ -890,11 +1016,13 @@ struct ChromeRootView: View {
             if let content = sidebarContent(side) {
                 SidebarPanelView(chrome: chrome, side: side, tabs: content.tabs, selected: content.selected,
                                  mode: state.mode, presentation: .sheet, showsModeToggle: false)
+                    .environment(\.horizontalSizeClass, geometry.isCompact ? .compact : .regular)
                     .presentationDetents([.large])
             }
         case .floating(let id)?:
             if let panel = chrome.app.ui.panels.get(id) {
                 PanelSheetView(chrome: chrome, panel: panel)
+                    .environment(\.horizontalSizeClass, geometry.isCompact ? .compact : .regular)
                     .presentationDetents([.medium, .large])
             }
         case nil:
