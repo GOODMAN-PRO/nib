@@ -152,6 +152,7 @@ struct LibraryNewMenuPopover: View {
     @ScaledMetric(relativeTo: .body) private var rowHeight = NibMetrics.hitTarget
     @ScaledMetric(relativeTo: .headline) private var titleHeight: CGFloat = 22
     @State private var reachedBottom = false
+    @Namespace private var scrollSpace
 
     var body: some View {
         GeometryReader { proxy in
@@ -179,12 +180,17 @@ struct LibraryNewMenuPopover: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .scrollTargetLayout()
+                    .background {
+                        GeometryReader { content in
+                            Color.clear.preference(key: LibraryMenuAtBottomKey.self,
+                                value: content.frame(in: .named(scrollSpace)).maxY <= layout.viewportHeight + NibSpacing.xxs)
+                        }
+                    }
                 }
+                .coordinateSpace(name: scrollSpace)
                 .scrollTargetBehavior(.viewAligned)
                 .scrollBounceBehavior(.basedOnSize)
-                .onScrollGeometryChange(for: Bool.self) { geometry in
-                    geometry.contentOffset.y + geometry.containerSize.height >= geometry.contentSize.height - NibSpacing.xxs
-                } action: { _, value in reachedBottom = value }
+                .onPreferenceChange(LibraryMenuAtBottomKey.self) { reachedBottom = $0 }
                 .frame(height: layout.viewportHeight)
                 if layout.scrolls {
                     HStack(spacing: NibSpacing.xs) {
@@ -203,6 +209,11 @@ struct LibraryNewMenuPopover: View {
                       y: y + layout.height / 2)
         }
     }
+}
+
+private struct LibraryMenuAtBottomKey: PreferenceKey {
+    static let defaultValue = false
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = nextValue() }
 }
 
 struct LibraryMenuViewport {
