@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatInkSynth/Spellchecker.swift:596-608 (SpellcheckEngine.check, failed[key] = generation) and :553-557 (needsCheck)",
+      "problem": "Any recognition error latches the page in the app-wide engine: failed[key] is set to the current generation and needsCheck stays false until that page's ink changes. The generation does not change when spellcheck is toggled off and on, when the document is closed and reopened (the engine outlives the canvas), or when the page is scrolled away and back. So one transient recogniser or Vision failure removes the page's underlines for the rest of the app session, with no sign to the user. The failure can also be caused by another principal. When a plugin with only the .app grant calls spellcheck.tapAt on a page nobody has checked, the engine runs recognize.items through the plugin's ctx.execute. That call throws permissionDenied (document:read is missing), the error is recorded in the shared failed map, and the user's own automatic checks of that page stop.",
+      "fix": "Record a page failure only for errors from the user's (runner == nil) run. Never record permissionDenied, userDenied, locked or CancellationError. Store the failure time with the generation, and let needsCheck retry after a backoff (30 s, doubling, capped). In committed(), clear failed for every page of a document whose meta.spellcheck changes, and clear it for the document's pages in SpellcheckUnderlines.attach. Add tests: (a) FakeRecognizer throws once, then succeeds, and the page is underlined after spellcheck is turned off and on, or after the backoff; (b) a plugin granted only .app calls spellcheck.tapAt on an unchecked page, and afterwards engine.needsCheck is still true and the user's check underlines the word."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatInkSynth/SpellcheckCommands.swift:241-251 (SpellcheckTapAt.descriptor) and :267-291",
+      "problem": "The descriptor gets only the .app scope (effect .session, so (.session, _) -> .app in CommandDescriptor.init). Yet on any page the user has already viewed, the command returns document content from the engine cache without calling recognize.items: the misspelled word as written, suggestions, stroke refs and bbox. A plugin that was never granted document:read can therefore read handwriting from a document by tapping around a page. Its nested recognize.items call would be refused, so this is a bypass of the permission model at the plugin trust boundary.",
+      "fix": "Add extraScopes: [.documentRead] to the spellcheck.tapAt descriptor. The user principal skips scopes, so the canvas tap path does not change. Extend testRegistersItsCommandsTapHandlerUnderlinesAndMenus to assert the scope. Add a test in which a plugin granted only .app gets permissionDenied on a page that has already been checked."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/Spellchecker.swift:302-307 (Spellchecker.resolveLanguage)",
+      "problem": "A document language made only of separators (\"-\", \"_\", \"--\") passes the isEmpty guard, and then tag.split(separator: \"_\") returns [] (verified), so parts[0] traps. DocumentMeta.language is decoded from package files without validation (Document.swift:191). A malformed or foreign document with spellcheck on therefore crashes the app on the main actor during refilter, and again every time it reopens.",
+      "fix": "Replace parts[0] with guard let first = parts.first else { return nil } and use first. Add the separator-only tags and \"\" to testDocumentLanguagesMapToTheCheckersLanguages, expecting nil."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/SpellcheckOverlay.swift:281-297 (SpellcheckUnderlines.redraw)",
+      "problem": "The squiggle colour (NibUIColor.destructive resolved against the canvas traitCollection) is set only when the paths are rebuilt. The redraw hash covers results, zoom, hidden layers and page frames, but not the trait collection. After a switch between light and dark, or a change to Increase Contrast, canvasDidChange calls redraw(force: false), which returns early, so the underlines keep the old red until the results change.",
+      "fix": "Add host.canvasView.traitCollection.userInterfaceStyle and .accessibilityContrast to the hasher. Alternatively, have SpellcheckUnderlineView call registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) and run a closure that calls redraw(force: true)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/Spellchecker.swift:632 (w.layer = min layer); SpellcheckOverlay.swift:287; SpellcheckCommands.swift:275-276",
+      "problem": "Recognition reads strokes on hidden layers too, and a word keeps only the lowest layer of its strokes. A word whose strokes span a visible layer and a hidden one is still underlined and can be tapped. Choosing a suggestion then passes every one of its stroke refs to handwriting.replaceWord, which deletes ink on a layer the user has hidden.",
+      "fix": "Keep the full set of layers on RecognizedWord and Misspelling (layers: Set<Int>). Hide a word from the underlines and from tapAt when any of its layers is hidden (!hidden.isDisjoint(with: m.layers)). Add a hidden-layer case to the tapAt test."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/Spellchecker.swift:493-497 and :711-715; SpellcheckCommands.swift:35, :67",
+      "problem": "Each SettingsStore.didChange with the writing.dictionary. prefix starts its own Task that calls dictionaryDidChange. That bumps the generation and notifies, and each notification forces a redraw: every checked page is refiltered and PersonalDictionary.words is rebuilt, which enumerates UserDefaults.dictionaryRepresentation() and reads each word. The library posts one notification per changed name on sync and on a library switch (F025 FolderLibrary.postSettingsChanges), so N changed dictionary words cause N full rebuilds on the main actor. dictionary.add and dictionary.remove also call dictionaryDidChange directly, on top of the notification, so each local change is processed twice.",
+      "fix": "Coalesce the changes. Set a dictionaryDirty flag and schedule a single @MainActor Task only when none is pending; that Task clears the cache, bumps dictionaryGeneration and notifies once. Keep only one of the two paths in DictionaryAdd and DictionaryRemove."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatInkSynth/Spellchecker.swift:652-664 (recognise passes every stroke of the page); NibKit/Sources/NibIndex/SearchCommands.swift:296-306 (RecognizeItems.run grouping); NibKit/Sources/NibIndex/Indexer.swift:938-940 (cachedInk key)",
+      "problem": "After every 0.9 s writing pause, the engine sends a ref for every pen and pencil stroke on the page to recognize.items. That command's cache key covers the revs of all strokes, so one new stroke re-renders every tile of the page or board and runs Vision on all of them. Checks already in flight are not cancelled when writing resumes. RecognizeItems.run also removes duplicate refs with ids.contains, which is O(n^2) on the main actor. On a dense whiteboard board with thousands of strokes, this means a main-thread hitch on each pause and continuous Vision work while the user writes.",
+      "fix": "In RecognizeItems.run, remove duplicates with a Set<ElementID> per group. In the engine: skip the next check while session.inking is active and until the in-flight run for the page finishes. Recognise only the strokes whose InkLayout clusters touch strokes that changed since the last check, and keep the stored words whose strokes did not change, merging the two. For whiteboards, at minimum limit the refs to strokes that intersect the visible rect."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatInkSynthTests/SpellcheckerTests.swift:392-435 (testDictionaryAddAndRemoveFromTwoDevicesMerge)",
+      "problem": "The two-device test only asserts dictionary.list. It never checks that a word added on device B and merged into device A removes A's existing underline. That path runs through SettingsStore.didChange and the engine's dictionary cache, and no test covers it.",
+      "fix": "In the two-device test, seed a checked page on device A that has the word underlined. Add the word on B, run prefsA.sync(), post SettingsStore.didChange for the merged name (as FolderLibrary.postSettingsChanges does), await a main-actor turn, and assert that engine.displayed(...) no longer lists the word and that the recogniser was not called again."
+    }
+  ]
+}
