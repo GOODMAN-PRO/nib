@@ -1,0 +1,53 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "plugins/examples/word-count/main.js:20-32",
+      "problem": "Perf on large notebooks. Once installed, main.js subscribes at load to tx.committed, page.changed, session.document and doc.closed for every document. Per PLUGIN_API, tx.committed also fires on undo/redo and sync merges. 200 ms after any commit it runs recognize.pageText on the whole current page and emits an app-wide plugin.message event, even when the panel is closed and when the commit was in another document. recognize.pageText is cached per page version, and every new stroke changes that version, so while writing, every pause longer than 200 ms costs a full Vision recognition of the page. The documented reference in PLUGIN_API §10.3 debounces at 800 ms; this one uses 200 ms.",
+      "fix": "Refresh only while the panel is open. Track an `open` flag: the panel already posts {type:'refresh'} on load, so set the flag there, and have panel.html post {type:'closed'} on pagehide/visibilitychange. Once query.context reports contracts-v2 `session.openPanels`, check that instead. Return early in refresh() when the panel is closed. For tx.committed, ignore events whose e.doc differs from the document of the last count. Raise the debounce to at least 800 ms, the documented value."
+    },
+    {
+      "severity": "major",
+      "where": "plugins/examples/word-count/main.js:9; plugins/examples/word-complete/main.js:32",
+      "problem": "The word regexes `[\\p{L}\\p{N}]+…` and `^[\\p{L}\\p{N}'’\\-]+$` leave out combining marks (\\p{M}), and they treat any run of letters as one word. Checked in a JS engine: 'สวัสดี ครับ' (2 Thai words) counts as 4, 'नमस्ते दुनिया' (2 words) counts as 5, and a CJK sentence such as '你好世界' counts as 1. word-complete rejects every completion that contains a combining mark (/^[\\p{L}\\p{N}…]+$/u.test('สวัสดี') === false), so for Thai, Hindi and Arabic with diacritics it always fails with 'The AI returned no usable completions'. The app explicitly supports these scripts (F055 has a CJK/Thai trigram index), and the comment on line 8 says non-Latin text is handled.",
+      "fix": "word-count: count with `new Intl.Segmenter(undefined, {granularity: 'word'})` and keep only segments where `isWordLike` is true (JavaScriptCore on iOS 17 supports it). Fall back to `/[\\p{L}\\p{M}\\p{N}]+(?:['’\\-][\\p{L}\\p{M}\\p{N}]+)*/gu` when Intl.Segmenter is missing. word-complete: change the filter to `/^[\\p{L}\\p{M}\\p{N}'’\\-]+$/u`. Add test cases for Thai, Devanagari and CJK to ExamplePluginsTests (word-count count, word-complete accepting a Thai completion)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/ExamplePluginsTests/ExamplePluginsTests.swift:290-301",
+      "problem": "The unload assertions prove nothing for toolbar and menus. Nothing asserts that hello-world's toolbar button or the objectMenu entries of flashcards and word-complete were registered in the first place, so a contribution the mapper silently dropped would still pass 'unloads cleanly'. hello-world's spec'd toolbar button → command → toast path is never exercised.",
+      "fix": "Before host.unload, assert that every declared contribution is present with owner == manifest.id: toolbar ids, menu entries with location objectMenu and the right command, panels, templates, element collections and board templates. For hello-world, also run the command from the toolbar descriptor (kit.h.app.ui.toolbar.all.first { $0.owner == id }.command) and assert ui.toasts.count == 1."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/ExamplePluginsTests/ExamplePluginsTests.swift:60-175,199",
+      "problem": "ExampleFixtureCommands always registers its own query.context/query.get/recognize.*/text.createBox/doc.create/card.add/ink.writeText/panel.open, and the Harness loads only the plugin features. The fixtures are needed today because FeatQuery, NibIndex, FeatTextBox, NibLibrary, FeatStudyEditor, FeatInkSynth and FeatDocChrome are scaffold stubs. But once those modules land, the examples will still never run against the real commands, which defeats the Package.swift intent that example plugins 'run against every module'.",
+      "fix": "Add those modules' feature types to Harness(features:). Register each fixture only when `h.app.commands.descriptor(id) == nil` (or have the fixture's command() helper skip ids that are already registered). The tests then switch to the real implementations automatically."
+    },
+    {
+      "severity": "minor",
+      "where": "plugins/examples/word-complete/main.js:41-48",
+      "problem": "The stale-ink guard compares query.get results, but the documented item shape (ARCHITECTURE §7.2: kind, tool, color, width, bbox, pointCount, layer) has neither points nor rev. A point edit during the AI call or the chooser that keeps the bbox and point count (ink.setPoints, Edit Handwriting) is not detected. The test fixture returns the whole Item, which hides this. The suffix colour also comes from the last ref in the selection, not from the strokes of the recognised last word.",
+      "fix": "Snapshot and compare with `{ref, points: true}`, or compare a rev field if F003 exposes one, but only for the refs of the last word (`last.refs`) to stay under the 20 KB cap. Take `color` from `records[refs.indexOf(last.refs[last.refs.length-1])]`."
+    },
+    {
+      "severity": "minor",
+      "where": "plugins/examples/word-complete/main.js:4-12",
+      "problem": "Selection size has no cap. Running 'Complete Word' on a select-all page of thousands of strokes issues one query.get per stroke twice (Promise.all), recognizes the whole selection, and sends all of its text to the user's AI provider, only to complete one word.",
+      "fix": "Reject selections over a small bound (e.g. `if (refs.length > 200) throw invalid('Select one word', '$.selection', …)`). Or recognize the selection, then fetch and compare only `last.refs`."
+    },
+    {
+      "severity": "minor",
+      "where": "plugins/examples/word-count/main.js:12-16",
+      "problem": "dev.nib.wordcount.show posts its count outside the generation guard that refresh() uses. If a refresh for a newer page finishes first, the slower count from show() then overwrites it and the panel shows a stale page.",
+      "fix": "In show(), open the panel and call refresh() (or bump `generation` and post only when the ticket still matches) instead of posting the count directly."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/ExamplePluginsTests/ExamplePluginsTests.swift:218-226",
+      "problem": "Every install goes through `path`. The gallery's own source (`base` + `files` relative to the index URL, as plugins/index.json lists it) is never parsed for the shipped entries, so a malformed base or files entry in index.json would only show up in a live gallery install.",
+      "fix": "For each index entry, assert that `PluginSource.from(url: nil, path: nil, files: entry.files, base: entry.base, index: \"https://example.com/plugins/index.json\", expectedHash: entry.sha256)` returns `.gallery(base: https://example.com/plugins/examples/<folder>/, files: entry.files)`."
+    }
+  ]
+}

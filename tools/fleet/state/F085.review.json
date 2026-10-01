@@ -1,0 +1,113 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIChat/FeatAIChatFeature.swift:48-51 (FeatAIChatFeature.start)",
+      "problem": "F085 replaces F084's AI confirmation policy. gateway.setPolicy(forPrincipalKind: \"ai\") overwrites the closure NibAIAgentFeature.register installed (kindPolicies is keyed by kind), and returns .always whenever a chat turn is streaming. CONTRACTS.md G27 says \"F085 registers its sheet for 'ai' and F084 its policy\", and AI.md section 6 makes security.ai.confirmationPolicy (default destructive) the rule. As shipped, a user who set the policy to never or destructive still gets a confirmation sheet for every mutating tool call in every panel turn, so a 14-change turn asks 14 times or forces 'Allow for rest of turn'. testUIConfirmationDryRunDoesNotWriteBeforeAllow depends on this override.",
+      "fix": "Delete the setPolicy call from start() and leave F084's policy alone. ChatRuntime is only the presenter, which the gateway consults only when needsConfirmation is true. Change testUIConfirmationDryRunDoesNotWriteBeforeAllow to either set NibSettings.aiConfirmationPolicy to .always or register its test command with destructive: true, and add a test showing a non-destructive edit is not confirmed under the default policy."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIChat/FeatAIChatFeature.swift:156-174 (ai.chat.open handler)",
+      "problem": "When no mode is passed, ai.chat.open defaults it to \"sidebar\", then writes chrome.panelPlacement.aichat.panel through settings.set and closes and reopens the panel. The Option-Command-A key command and every 'Ask AI' menu item (object menu, block, text selection) call ai.chat.open without a mode. Each of these entry points therefore turns the user's chosen Floating mode back into a docked sidebar and rewrites the stored placement. S-002 (display modes) never sticks. On compact width it also writes left/right placement, which the iPhone sheet presentation does not expect.",
+      "fix": "If p[\"mode\"] is absent, do not touch the placement setting or close and reopen. Apply scope/refs and run panel.open {id: PanelIDs.assistant, params: {scope, refs}}, so the chrome keeps its current placement. Change the placement only when the caller names a mode explicitly. Add a test: open with mode floating, then open with no mode, and assert the placement setting is still \"floating\" and panel.close was not called."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIChat/ChatPanel.swift:227-229 (conversationList Delete button)",
+      "problem": "Data loss. One tap on the destructivePlain 'Delete' button runs ai.chat.delete straight away. F084 documents that command as \"Delete an AI conversation on every device\", with effect session, so it cannot be undone and it syncs everywhere. There is no confirmation. DESIGN.md section 13 says destructivePlain is \"always confirmed by the system\", and the label is not verb + object.",
+      "fix": "Put a system confirmation in front of it: .confirmationDialog(\"Delete this conversation on all your devices?\") with a destructive 'Delete Conversation' button that runs model.perform(CommandIDs.aiChatDelete, ...). Rename the button to 'Delete Conversation' and 'Rename' to 'Rename Conversation'."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIChat/FeatAIChatFeature.swift:296-300 (ai.chat.attach base64 path); NibKit/Sources/FeatAIChat/ChatViewModel.swift:395-398 (generateImage)",
+      "problem": "Every attached or generated image is stored with assets.putTemporary(data, ext: \"png\"), whatever its real format. F084 takes the media type from the extension (AgentService.mime returns image/png). ImageWire.normalized trusts an accepted type and does not sniff the bytes. So a JPEG or HEIC picked through 'Attach image' (most photos on iPhone and iPad) is sent as media_type image/png with JPEG/HEIC bytes. Anthropic rejects the mismatched media type with a 400, and HEIC fails on every provider, so 'attach image' breaks the turn.",
+      "fix": "In the detached task that already decodes the UIImage, keep PNG or JPEG bytes as they are and store them with the extension their signature shows (89 50 4E 47 for png, FF D8 FF for jpg). Transcode anything else (HEIC, TIFF, WebP, GIF) with UIImage(data:)?.pngData() and store it as png. Do the same for provider output in generateImage. Add a test that attaches JPEG bytes and asserts the stored AssetRef.ext is jpg."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatAIChat/MessageViews.swift:37-45 (citation chips), MessageViews.swift:105 (ChatToolRow), ConfirmationSheet.swift:41-45 (dry-run rows)",
+      "problem": "The UI shows raw internal identifiers. Citation chips are labelled with the ref string itself (\"page:FIXTUREDOC01/FIXTUREPG001\"), and VoiceOver reads \"Reveal citation item:...\". The tool trace shows command ids (\"text.setText\", \"query.get\"). The confirmation sheet lists changed refs as raw strings. The raw refs also stay inline in the answer paragraph. DESIGN.md section 14.9 asks for citation chips like \"Line 5\" and trace rows like \"Read page 3 · ...\", and the Slop checklist Trust line requires users to see what was read and where. As built, this is template-grade output.",
+      "fix": "Resolve each citation to a human label: page refs to \"Page N\" from query.context or the workspace page index, item and block refs to \"<kind> on page N\". Cache the label per entry, and remove the raw refs from the displayed paragraph (or replace them with the chips). Make the accessibility label \"Show <label>\". Title trace rows with app.commands.descriptor(name)?.title, and leave the raw id/arguments in the 'Show tool calls' NibCodeBlock. List dry-run changes as \"Added 2 · Updated 1 · Removed 1\" with resolved labels, not refs."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/MessageViews.swift:92-114, ChatPanel.swift:133-158, MessageViews.swift:81-82, ChatPanel.swift:173-175",
+      "problem": "Some UI is hand-built where NibDesign already has components. The tool trace and loading rows are a custom HStack with ProgressView instead of NibTraceRow, which also adds the 'In progress' VoiceOver value. The inline error with Retry is a custom Label/VStack instead of NibBanner (DESIGN section 13: \"the assistant's inline error with Retry\"). The 'Thumbs up' and 'Thumbs down' text buttons show the rated state only through the button kind, with no .isSelected trait, so state is shown by colour alone. Quick-action chips drop AIActionDescriptor.icon.",
+      "fix": "Use NibTraceRow(title, phase: .running/.done/.warning) for tool rows and for the 'Reading your context…' and 'Generating image…' states. Use NibBanner(error.message, style: .warning, action: NibAction(\"Retry\") { ... }). Give the rating buttons symbols and .accessibilityAddTraits(entry.rating == x ? .isSelected : []), with labels 'Rate answer helpful' / 'Rate answer unhelpful'. Pass action.icon to NibChip."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/FeatAIChatFeature.swift:103-122 (ChatRuntime.confirm)",
+      "problem": "Across the awaited dry-run preview, confirm only checks model.isStreaming. Suppose a turn is stopped and a new turn starts in the same window (same chatID) while the preview awaits, for example ai.chat.stop and then ai.chat.send in one commands.batch. The cancelled turn's request is then shown during the new turn, and requestConfirmation's resolveConfirmation(.deny) denies the new turn's pending request. If the user allows it, the cancelled turn's tool runs after its commit observer is gone, so the change is missing from any receipt.",
+      "fix": "Expose the turn token (generation) from ChatViewModel. Capture it before the dry run and return .deny unless model.generation is still that token afterward. Add a test that stops and restarts a turn while the preview is suspended."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/FeatAIChatFeature.swift:108-113 (ChatRuntime.confirm preview)",
+      "problem": "The preview runs the AI-chosen command as principal .user with dryRun before the user has consented. Nested ctx.execute calls inside that handler skip the gateway, and plugin-owned or network-scoped .edit handlers that do not honour dryRun can make network calls or other side effects before the user presses Deny. The only exclusions are sensitive, userPresence and forwardsCalls.",
+      "fix": "Also skip the preview (show 'cannot be previewed') when request.command.scopes contains .network, or when the command's owner is a plugin (app.commands.entry(id)?.descriptor.owner is not a builtin feature id)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/ChatViewModel.swift:183-205 (selectChat)",
+      "problem": "The idle guard runs before the await on ai.chat.list, and the result overwrites chatID, entries and scope without any check. If the user selects conversation A and then B quickly, a late answer for A can replace B. If a turn starts while A's lookup is pending, entries is replaced mid-turn, the stream then fails to find answerID and throws CancellationError, and the turn's receipt (Undo/Show) is lost.",
+      "fix": "Take a load token before the await and, after it, return without changes if the token was superseded or isStreaming/isGeneratingImage became true. Make send() refuse while a load is pending."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/ChatViewModel.swift:330-342, 380-406 (stop / generateImage)",
+      "problem": "Stop and Discard do not cancel an image generation in progress. stop() only calls ai.cancel(chatID:) and resets the flags. The provider request keeps running and is billed, and the user can start a second generation that overlaps it.",
+      "fix": "Run the generation in a stored Task<Void, Error> (imageTask). Have stop() cancel it, and await imageTask.value in generateImage so URLSession cancellation reaches the provider. Add a test where the fake generateImage waits on cancellation."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/FeatAIChatFeature.swift:81-96 (ChatRuntime.models); ChatPanel.swift:264 (ChatWindowScenes.windows)",
+      "problem": "Models are never removed. Each ChatViewModel holds its EditorSession strongly, plus the whole transcript and any draft UIImage. Every window or assistant scene that has been closed stays in memory until the app quits, and the windows dictionary keeps entries whose scenes are gone.",
+      "fix": "In model(for:), drop models whose session is no longer in app.services.sessions.sessions, after calling stop() on each. Hold session weakly in ChatViewModel. Prune windows entries whose scene is nil in close() and restorationActivity()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/ChatViewModel.swift:299-317 and MessageViews.swift:62, 85-89",
+      "problem": "Persisted message ids are only reconciled on .finished. After a failed or stopped turn that has partial text, the thumbs buttons are shown and send ai.chat.feedback with a local NibID that F084 never stored, so feedback fails with notFound. The id mapping is also untested against the real ai.chat.list.",
+      "fix": "Reconcile ids on every terminal path, or hide rating until the entry has a persisted id (add a persistedID field set from ai.chat.list). Add a test that registers NibAIAgentFeature and rates a finished answer."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/ChatViewModel.swift:367-378 (showChanges), 353-362 (undo)",
+      "problem": "Show runs view.reveal once for every changed ref in sequence. A 300-change turn means 300 scroll-and-flash calls that jump across pages and finish on the last ref. Undo across several documents stops on the first revertGroup that throws, but by then earlier documents are already reverted and the entry is not marked, so the receipt state is wrong.",
+      "fix": "Reveal only the first ref (its page) and highlight the rest on that page with one selection or highlight command. In undo, collect per-document results, mark the entry reverted for the documents that succeeded, and put the failure in revertNote instead of dropping the partial result."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/MessageViews.swift:37-40; ChatViewModel.swift:424-426 (ChatCitations.refs)",
+      "problem": "Every visible message runs ChatCitations.refs twice per body evaluation, and each call compiles a new NSRegularExpression. During streaming the body is re-evaluated on every token for every instantiated row.",
+      "fix": "Compile the regex once (static let) and compute citations once per entry, for example when .finished or selectChat stores the entry, keeping them in ChatEntry.citations."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/MessageViews.swift:160-166 (ChatAnswerTransfer)",
+      "problem": "UTType(exportedAs: \"app.nib.ai-answer\") is not declared in the app's UTExportedTypeDeclarations (project.yml lists only document/plugin/collection/fragment/pages). An undeclared exported type logs a fault and has no registered conformance. The answer also offers no plain-text representation, so it cannot be dropped into text documents or other apps.",
+      "fix": "Report the missing declaration as a contract gap, since project.yml is not F085's to change. Meanwhile add ProxyRepresentation(exporting: \\.text) after the CodableRepresentation so plain-text drops work."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/FeatAIChatFeature.swift:350-355 (ai.chat.insertDraft)",
+      "problem": "The draft path reads the whole generated image and base64-encodes it into the image.insert params, which can be tens of MB of JSON. AI.md section 6 says url params accept tmp: refs.",
+      "fix": "Pass [\"url\": \"tmp:\" + asset.name] (or the asset ref) to image.insert instead of base64."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatAIChat/FeatAIChatFeature.swift:17 and ChatViewModel.swift:82 (presentation); ChatPanel.swift:22,126 (settings.open page)",
+      "problem": "ChatViewModel.presentation is written but never read. It is assigned inside the PanelDescriptor factory, which publishes during a view update. The settings.open page id \"ai\" does not follow the settings page id convention (\"settings.editing\") and does not match any registered page.",
+      "fix": "Remove presentation, or use it to tick the current mode in the More menu without mutating it from the factory. Use the AI settings page id that F086 registers (or report it as a gap), not the literal \"ai\"."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatAIChatTests/ChatViewModelTests.swift:93-106 and suite",
+      "problem": "testStopDoesNotAcceptLateStreamEvents finishes the stream by hand after stop(), so it would also pass if Stop alone left the send task hanging. No tests cover ai.chat.open placement with and without mode, ai.chat.dropAnswer, deleting the current conversation, Allow for rest of turn / Deny, the media type of attached images, or feedback id reconciliation.",
+      "fix": "Make the scripted service finish its continuation in cancel(chatID:), and assert that stop() alone ends the turn within a bounded wait. Add tests for each listed path."
+    }
+  ]
+}

