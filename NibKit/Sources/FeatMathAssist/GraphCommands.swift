@@ -78,29 +78,29 @@ struct GraphCreate: NibCommand {
         var placed = frame
         if p.rect == nil { placed.x -= placed.w / 2; placed.y -= placed.h / 2 }
         let id = p.id.map { NibID($0) } ?? NibID.make()
-        guard !id.raw.isEmpty, !id.raw.contains("/"), !id.raw.contains(":") else {
-            throw GraphBuilder.invalid("Use a non-empty item id without / or :.", path: "$.id")
+        guard NibID.isValid(id.raw) else {
+            throw GraphBuilder.invalid("Use 1 to 64 letters, digits, _ or - for the id.", path: "$.id")
         }
-        func checkID() throws {
-            for existingPage in try ctx.workspace.content(doc).pages {
-                if try ctx.workspace.allItems(doc, page: existingPage.id).contains(where: { $0.id == id }) {
-                    throw NibError(.conflict, "The item id is already in use.", path: "$.id", hint: "Choose a new id or edit the existing graph with math.graph.setViewport.")
-                }
-            }
+        if p.id != nil, try ctx.workspace.allItems(doc, page: page).contains(where: { $0.id == id && !$0.deleted }) {
+            throw NibError(.conflict, "The item id is already in use.", path: "$.id")
         }
-        try checkID()
         let viewport = GraphViewport()
         let snapshotFrame = placed
-        let display = try await MathStack.perform {
-            try GraphBuilder.build(expressions: expressions, frame: snapshotFrame, viewport: viewport)
-        }
+        let cancellation = MathCancellation()
+        let display = try await withTaskCancellationHandler {
+            try await MathStack.perform {
+                try GraphBuilder.build(expressions: expressions, frame: snapshotFrame, viewport: viewport, cancellation: cancellation)
+            }
+        } onCancel: { cancellation.cancel() }
         try Task.checkCancellation()
         try GraphCommands.ensureWritable(doc, ctx)
-        try checkID() // Another command may have claimed the id while sampling.
         let custom = CustomItem(owner: GraphBuilder.owner, type: GraphBuilder.type, frame: placed,
                                 data: try JSONValue.from(GraphData(expressions: expressions, viewport: viewport)), display: display)
         let layer = ctx.activeSession?.document == doc ? (ctx.activeSession?.activeLayer ?? 0) : 0
         try ctx.mutate { tx in
+            if p.id != nil, (try? tx.item(doc, page: page, id: id)) != nil {
+                throw NibError(.conflict, "The item id is already in use.", path: "$.id")
+            }
             _ = try tx.put(Item(id: id, kind: .custom, layer: layer, custom: custom), doc: doc, page: page)
         }
         return ["ref": .string(NodeRef.item(doc, page, id).description)]
@@ -150,9 +150,12 @@ struct GraphSetViewport: NibCommand {
         if let x = p.x, let y = p.y, let scale = p.scale { data.viewport = GraphViewport(x: x, y: y, scale: scale) }
         if let expressions = p.expressions { data.expressions = expressions }
         let snapshot = data
-        let display = try await MathStack.perform {
-            try GraphBuilder.build(expressions: snapshot.expressions, frame: custom.frame, viewport: snapshot.viewport)
-        }
+        let cancellation = MathCancellation()
+        let display = try await withTaskCancellationHandler {
+            try await MathStack.perform {
+                try GraphBuilder.build(expressions: snapshot.expressions, frame: custom.frame, viewport: snapshot.viewport, cancellation: cancellation)
+            }
+        } onCancel: { cancellation.cancel() }
         try Task.checkCancellation()
         try GraphCommands.ensureWritable(doc, ctx)
         try ctx.mutate { tx in

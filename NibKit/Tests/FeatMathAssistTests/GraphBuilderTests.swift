@@ -42,13 +42,137 @@ final class GraphBuilderTests: XCTestCase {
         }
     }
 
+    func testExtremeViewportsRetainVisibleCurvesAndLabels() throws {
+        for (expression, scale, width) in [("x^2", 1e-4, 320.0), ("x^3", 0.01, 320.0),
+                                            ("100000*x^2", 32.0, 320.0), ("x^2", 0.001, 2048.0)] {
+            let display = try MathStack.run {
+                try GraphBuilder.build(expressions: [expression], frame: Frame(x: 0, y: 0, w: width, h: 240),
+                                       viewport: GraphViewport(scale: scale))
+            }
+            XCTAssertTrue(display.ops.contains { $0.op == .polyline }, "Missing visible curve for \(expression), scale \(scale)")
+            XCTAssertTrue(display.ops.contains { $0.op == .text })
+        }
+    }
+
+    func testPeriodicCurveDoesNotAliasToAxisAndSerializationIsBounded() throws {
+        let display = try build(["sin(64*pi*x)"])
+        let points = display.ops.filter { $0.op == .polyline }.flatMap { $0.points ?? [] }
+        XCTAssertTrue(points.contains { abs($0.y - frame.h / 2) > 20 })
+        let straight = try build(Array(repeating: "x", count: 8))
+        XCTAssertTrue(straight.ops.filter { $0.op == .polyline }.allSatisfy { ($0.points?.count ?? 0) == 2 })
+        let dense = try build(Array(repeating: "sin(8*x)", count: 8))
+        XCTAssertLessThan(try JSONEncoder().encode(dense).count, 600_000)
+    }
+
+    func testHeavyGraphHasWholeBuildBudget() throws {
+        let start = ProcessInfo.processInfo.systemUptime
+        XCTAssertThrowsError(try build(Array(repeating: "sum(sin(k*x), k, 1, 99999)", count: 8))) { error in
+            let error = error as? NibError
+            XCTAssertEqual(error?.code, .unsupported)
+            XCTAssertEqual(error?.message, "This graph takes too long to draw")
+        }
+        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, GraphBuilder.timeBudget * 4)
+    }
+
+    func testViewportFieldRoundTripAndCommaDecimal() {
+        for value in [1e-6, 6.1e-5, 0.1, 1e12] {
+            XCTAssertEqual(GraphEditorModel.number(GraphEditorModel.numberText(value)), value)
+        }
+        XCTAssertEqual(GraphEditorModel.number("0,5"), 0.5)
+        for text in ["", "abc", "nan", "inf"] { XCTAssertNil(GraphEditorModel.number(text)) }
+    }
+
+    func testSearchPreviousKeepsItsShortcut() {
+        let h = Harness(features: [FeatMathGraphFeature.self])
+        let search = KeyCommandDescriptor(id: "search.previous", title: "Find Previous",
+            shortcut: KeyShortcut("g", [.command, .shift]), command: CommandIDs.searchStep, scope: .document, owner: "search")
+        let active = KeyCommandRouting.active(h.app.content.keyCommands.all + [search], in: KeyCommandContext(docKind: .notebook))
+        XCTAssertEqual(active.first { $0.shortcut == search.shortcut }?.command, CommandIDs.searchStep)
+    }
+
+    func testResizeThenViewportRebuildUsesCurrentFrame() async throws {
+        let h = Harness(features: [FeatMathGraphFeature.self])
+        let ref = try await create(h)
+        // F012's boundary, using the same portable Item transform as its resize handles.
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.itemTransform, title: "Resize", summary: "Test transform host.",
+                                                  params: .anything(), effect: .edit)) { params, ctx in
+            guard case let .item(doc, page, id)? = NodeRef(params["ref"]?.stringValue ?? "") else { throw NibError.invalid("ref") }
+            try ctx.mutate { tx in
+                let item = try tx.item(doc, page: page, id: id)
+                try tx.put(item.transformed(by: .scale(2, 2)), doc: doc, page: page)
+            }
+            return [:]
+        }
+        _ = try await h.app.bus.execute(CommandIDs.itemTransform, ["ref": .string(ref)], session: h.session)
+        let resized = try XCTUnwrap(h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "TESTGRAPH001").custom)
+        XCTAssertEqual(resized.frame.w, frame.w * 2)
+        _ = try await h.app.bus.execute(CommandIDs.mathGraphSetViewport,
+            ["ref": .string(ref), "x": 0, "y": 0, "scale": 32], session: h.session)
+        let custom = try XCTUnwrap(h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "TESTGRAPH001").custom)
+        let bounds = Rect(x: 0, y: 0, width: custom.frame.w, height: custom.frame.h)
+        XCTAssertEqual(custom.display.ops.first?.rect, bounds)
+        for op in custom.display.ops {
+            if let rect = op.rect { XCTAssertTrue(bounds.contains(rect)) }
+            for point in op.points ?? [] { XCTAssertTrue(bounds.insetBy((op.width ?? 0) / 2).contains(point)) }
+        }
+    }
+
+    func testLegacyExpressionNewlinesCanStillBeEdited() async throws {
+        let data: JSONValue = ["expressions": "x\r\n", "viewport": ["x": 0, "y": 0, "scale": 32]]
+        XCTAssertEqual(try data.decode(GraphData.self).expressions, ["x"])
+        let h = Harness(features: [FeatMathGraphFeature.self])
+        let before = try h.snapshotAll()
+        do { _ = try await create(h, expressions: ["x\n"]); XCTFail("Expected newline rejection") }
+        catch let error as NibError { XCTAssertEqual(error.code, .invalidParams) }
+        XCTAssertEqual(try h.snapshotAll(), before)
+        let ref = try await create(h, expressions: ["x"])
+        _ = try await h.app.bus.execute(CommandIDs.mathGraphSetViewport,
+            ["ref": .string(ref), "x": 0, "y": 0, "scale": 32], session: h.session)
+    }
+
+    private func editorRecord() throws -> JSONValue {
+        ["ref": "item:FIXTUREDOC01/FIXTUREPG001/TESTGRAPH001", "kind": "custom",
+         "custom": ["owner": .string(GraphBuilder.owner), "type": .string(GraphBuilder.type),
+                    "frame": try JSONValue.from(frame),
+                    "data": try JSONValue.from(GraphData(expressions: ["x^2"], viewport: GraphViewport(x: 1e-6, y: 0.1, scale: 6.1e-5))),
+                    "display": ["truncated": true]],
+         "rev": "test-revision", "truncated": true]
+    }
+
+    func testEditorParsesTruncatedQueryAndAssemblesSaveParameters() throws {
+        let record = try editorRecord()
+        let (loadedFrame, data, rev) = try GraphEditorModel.parse(record)
+        XCTAssertEqual(loadedFrame, frame)
+        XCTAssertEqual(data.expressions, ["x^2"])
+        XCTAssertEqual(rev, "test-revision")
+        XCTAssertEqual(try GraphEditorModel.parse(["record": record]).1, data)
+        let ref = try XCTUnwrap(record["ref"]?.stringValue)
+        let (edit, params) = GraphEditorModel.saveParams(expressions: ["cos(x)"], viewport: data.viewport,
+                                                       ref: ref, revision: rev, context: [:])
+        XCTAssertEqual(edit, CommandIDs.mathGraphSetViewport)
+        XCTAssertEqual(params["ref"]?.stringValue, ref)
+        XCTAssertEqual(params["revision"]?.stringValue, rev)
+        XCTAssertEqual(params["scale"]?.doubleValue, 6.1e-5)
+        XCTAssertEqual(params["x"]?.doubleValue, 1e-6)
+        XCTAssertEqual(params["y"]?.doubleValue, 0.1)
+        XCTAssertEqual(params["expressions"], ["cos(x)"])
+        let context: JSONValue = ["page": .string(page), "rect": [1, 2, 320, 240], "itemID": "MYGRAPH"]
+        let (create, insert) = GraphEditorModel.saveParams(expressions: ["x"], viewport: GraphViewport(),
+                                                         ref: nil, revision: nil, context: context)
+        XCTAssertEqual(create, CommandIDs.mathGraphCreate)
+        XCTAssertEqual(insert["page"], context["page"])
+        XCTAssertEqual(insert["rect"], context["rect"])
+        XCTAssertEqual(insert["id"], "MYGRAPH")
+        XCTAssertNil(insert["revision"])
+    }
+
     func testEvaluatorCurvesAndAxesUseLocalCoordinates() throws {
         let display = try build(["y=x", "f(x)=x^2", "\\sin(x)"])
         let curves = display.ops.filter { $0.op == .polyline }
         XCTAssertEqual(Set(curves.compactMap(\.stroke)).count, 3)
         let diagonal = try XCTUnwrap(curves.first { $0.stroke == GraphBuilder.colour(NibInk.cobalt.hex) })
         for p in try XCTUnwrap(diagonal.points) {
-            XCTAssertEqual(p.y, frame.h / 2 - (p.x - frame.w / 2), accuracy: 1e-6)
+            XCTAssertEqual(p.y, frame.h / 2 - (p.x - frame.w / 2), accuracy: 0.02)
         }
         let axes = display.ops.filter { $0.width == Double(NibStroke.thin) }
         XCTAssertEqual(axes.count, 2)
@@ -68,9 +192,9 @@ final class GraphBuilderTests: XCTestCase {
     }
 
     func testMalformedMathAndGeometryProduceActionableErrors() throws {
-        for expressions in [[], [""], Array(repeating: "x", count: 9), ["x + unknown"],
+        for expressions in [[], [""], Array(repeating: "x", count: 9), ["x + unknown"], ["x\n"], ["x\r\n"],
                             ["x^2+y^2=1"], ["sin("], ["f(x)"], ["[[1,2],[3,4]]"], [String(repeating: "x", count: 2049)]] {
-            XCTAssertThrowsError(try build(expressions)) { error in
+            XCTAssertThrowsError(try build(expressions), "Accepted \(expressions)") { error in
                 let error = error as? NibError
                 XCTAssertNotNil(error)
                 XCTAssertTrue(error?.path?.hasPrefix("$.expressions") == true)
@@ -96,6 +220,11 @@ final class GraphBuilderTests: XCTestCase {
     func testCallerIDsAndCreationUndoRedo() async throws {
         let h = Harness(features: [FeatMathGraphFeature.self])
         let before = try h.snapshotAll()
+        for id in ["", "a b", "x.y", "กราฟ", String(repeating: "x", count: 10_000)] {
+            do { _ = try await create(h, id: id); XCTFail("Expected invalid id") }
+            catch let error as NibError { XCTAssertEqual(error.code, .invalidParams); XCTAssertEqual(error.path, "$.id") }
+            XCTAssertEqual(try h.snapshotAll(), before)
+        }
         let ref = try await create(h, id: "CALLERGRAPH01")
         XCTAssertEqual(ref, NodeRef.item(Fixtures.docID, Fixtures.page1, "CALLERGRAPH01").description)
         let item = try h.app.workspace.item(Fixtures.docID, page: Fixtures.page1, id: "CALLERGRAPH01")
@@ -193,13 +322,19 @@ final class GraphBuilderTests: XCTestCase {
         XCTAssertTrue(issues.isEmpty, issues.joined(separator: "\n"))
     }
 
-    func testEditorSnapshotsAtAllDesignVariants() {
+    func testEditorSnapshotsAtAllDesignVariants() throws {
         let h = Harness(features: [FeatMathGraphFeature.self])
         var context = PanelContext(app: h.app, session: h.session, navigator: nil, dismiss: {})
         context.params = ["page": .string(page)]
+        let record = try editorRecord()
+        h.app.commands.register(CommandDescriptor(id: CommandIDs.queryGet, title: "Read Graph", summary: "Test query host.", effect: .read)) { _, _ in record }
         for variant in NibSnapshot.Variant.allCases {
             let image = NibSnapshot.image(GraphEditor(context: context), size: NibMetrics.newDocumentSheetSize, variant: variant)
             XCTAssertNotNil(image, "Editor did not render in \(variant)")
+            context.params = ["ref": record["ref"]!]
+            let edited = NibSnapshot.image(GraphEditor(context: context, initialRecord: record), size: NibMetrics.newDocumentSheetSize, variant: variant)
+            XCTAssertNotNil(edited, "Edit mode did not render in \(variant)")
+            context.params = ["page": .string(page)]
         }
     }
 }

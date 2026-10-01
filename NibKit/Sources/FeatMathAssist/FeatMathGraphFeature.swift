@@ -33,11 +33,13 @@ public enum FeatMathGraphFeature: NibFeature {
                 }
                 return params
             }, isVisible: { $0.page != nil && $0.session?.readOnly != true }))
-        app.ui.toolbar.register(ToolbarItemDescriptor(
+        var toolbar = ToolbarItemDescriptor(
             id: "mathgraph.insert", title: String(localized: "Insert Graph"), icon: NibSymbol.graph.name,
-            group: .accessories, order: 107, owner: id, command: CommandIDs.mathGraphCreate))
+            group: .accessories, order: 107, owner: id, command: CommandIDs.mathGraphCreate)
+        toolbar.isEnabled = { !$0.readOnly }
+        app.ui.toolbar.register(toolbar)
         var key = KeyCommandDescriptor(id: "mathgraph.insert", title: String(localized: "Insert Graph"),
-                                       shortcut: KeyShortcut("g", [.command, .shift]),
+                                       shortcut: KeyShortcut("g", [.command, .control]),
                                        command: CommandIDs.mathGraphCreate, scope: .document, owner: id)
         key.docKinds = [.notebook, .whiteboard]
         app.content.keyCommands.register(key)
@@ -57,6 +59,10 @@ final class GraphDrawer: ItemDrawer {
         cg.rotate(by: f.rotation)
         cg.translateBy(x: -f.w / 2, y: -f.h / 2)
         cg.clip(to: CGRect(x: 0, y: 0, width: f.w, height: f.h))
+        if let background = custom.display.ops.first, background.op == .rect,
+           let built = background.rect, built.width > 0, built.height > 0 {
+            cg.scaleBy(x: f.w / built.width, y: f.h / built.height)
+        }
         custom.display.draw(in: cg)
     }
     func paintBounds(_ item: Item) -> Rect? { item.custom?.frame.bounds }
@@ -80,13 +86,26 @@ struct GraphEditor: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.dynamicTypeSize) private var typeSize
 
+    init(context: PanelContext, initialRecord: JSONValue? = nil) {
+        self.context = context
+        if let initialRecord, let (frame, data, revision) = try? GraphEditorModel.parse(initialRecord) {
+            _frame = State(initialValue: frame)
+            _expressions = State(initialValue: data.expressions.joined(separator: "\n"))
+            _centreX = State(initialValue: GraphEditorModel.numberText(data.viewport.x))
+            _centreY = State(initialValue: GraphEditorModel.numberText(data.viewport.y))
+            _scale = State(initialValue: GraphEditorModel.numberText(data.viewport.scale))
+            _revision = State(initialValue: revision)
+            _loading = State(initialValue: false)
+        }
+    }
+
     private var ref: String? { context.params["ref"]?.stringValue }
     private var lines: [String] {
         expressions.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
     private var viewport: GraphViewport? {
-        guard let x = Double(centreX), let y = Double(centreY), let s = Double(scale) else { return nil }
+        guard let x = GraphEditorModel.number(centreX), let y = GraphEditorModel.number(centreY), let s = GraphEditorModel.number(scale) else { return nil }
         return GraphViewport(x: x, y: y, scale: s)
     }
 
@@ -105,13 +124,8 @@ struct GraphEditor: View {
                     Text(String(localized: "One function per line, such as y = x² or sin(x)."))
                         .font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    TextEditor(text: $expressions)
-                        .font(NibFont.body).foregroundStyle(NibColor.label)
+                    NibField(text: $expressions, prompt: String(localized: "Graph expressions, one per line"), lines: 3...8)
                         .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: NibMetrics.hitTarget * 3)
-                        .padding(NibSpacing.s)
-                        .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field))
                         .accessibilityLabel(String(localized: "Graph expressions, one per line"))
                     if ref != nil {
                         Text(String(localized: "Viewport"))
@@ -154,13 +168,15 @@ struct GraphEditor: View {
     private func numberField(_ label: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: NibSpacing.s) {
             Text(label).font(NibFont.footnote).foregroundStyle(NibColor.labelSecondary)
-            TextField(label, text: text)
-                .font(NibFont.body).foregroundStyle(NibColor.label)
+            NibField(text: text, prompt: label)
+                .keyboardType(.numbersAndPunctuation)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
-                .frame(minHeight: NibMetrics.hitTarget)
-                .padding(.horizontal, NibSpacing.m)
-                .background(NibColor.fill4, in: RoundedRectangle(cornerRadius: NibRadius.field))
                 .accessibilityLabel(label)
+            if GraphEditorModel.number(text.wrappedValue) == nil {
+                Text(String(localized: "Enter a number, such as 0.5 or 1e-6."))
+                    .font(NibFont.footnote).foregroundStyle(NibColor.destructive)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
     @ViewBuilder private var zoomButtons: some View {
@@ -180,8 +196,8 @@ struct GraphEditor: View {
             }
             .gesture(DragGesture().onEnded { value in
                 guard ref != nil, let v = viewport else { return }
-                centreX = MathEngine.numberText(v.x - Double(value.translation.width / geometry.size.width) * frame.w / v.scale)
-                centreY = MathEngine.numberText(v.y + Double(value.translation.height / geometry.size.height) * frame.h / v.scale)
+                centreX = GraphEditorModel.numberText(v.x - Double(value.translation.width / geometry.size.width) * frame.w / v.scale)
+                centreY = GraphEditorModel.numberText(v.y + Double(value.translation.height / geometry.size.height) * frame.h / v.scale)
             })
             .simultaneousGesture(MagnificationGesture().onEnded { zoom(Double($0)) })
         }
@@ -195,7 +211,7 @@ struct GraphEditor: View {
     }
     private func zoom(_ factor: Double) {
         guard ref != nil, let v = viewport, factor.isFinite, factor > 0 else { return }
-        scale = MathEngine.numberText(min(GraphViewport.scaleRange.upperBound,
+        scale = GraphEditorModel.numberText(min(GraphViewport.scaleRange.upperBound,
                                         max(GraphViewport.scaleRange.lowerBound, v.scale * factor)))
     }
 
@@ -205,19 +221,13 @@ struct GraphEditor: View {
             if let ref {
                 // All document reads in UI go through the public query command.
                 let result = try await context.app.bus.execute(CommandIDs.queryGet, ["ref": .string(ref), "fields": ["custom", "rev"]], session: context.session)
-                let record = result["record"] ?? result
-                let customJSON = record["custom"] ?? record
-                let custom = try customJSON.decode(GraphEditorRecord.self)
-                guard custom.owner == GraphBuilder.owner, custom.type == GraphBuilder.type else {
-                    throw NibError.unsupported("editing this item as a maths graph")
-                }
-                let data = try custom.data.decode(GraphData.self)
-                frame = custom.frame
+                let (loadedFrame, data, loadedRevision) = try GraphEditorModel.parse(result)
+                frame = loadedFrame
                 expressions = data.expressions.joined(separator: "\n")
-                centreX = MathEngine.numberText(data.viewport.x)
-                centreY = MathEngine.numberText(data.viewport.y)
-                scale = MathEngine.numberText(data.viewport.scale)
-                revision = record["rev"]?.stringValue
+                centreX = GraphEditorModel.numberText(data.viewport.x)
+                centreY = GraphEditorModel.numberText(data.viewport.y)
+                scale = GraphEditorModel.numberText(data.viewport.scale)
+                revision = loadedRevision
             } else if let rect = context.params["rect"], let values = try? rect.decode([Double].self),
                       let parsed = Frame(array: values) { frame = parsed }
         } catch { self.error = NibError.wrap(error).message }
@@ -259,21 +269,8 @@ struct GraphEditor: View {
         Task { @MainActor in
             defer { saving = false }
             do {
-                var params: JSONValue = ["expressions": .array(lines.map(JSONValue.string))]
-                let command: String
-                if let ref {
-                    command = CommandIDs.mathGraphSetViewport
-                    params = params.merging(["ref": .string(ref)])
-                    params = params.merging(["x": .number(viewport.x)])
-                    params = params.merging(["y": .number(viewport.y)])
-                    params = params.merging(["scale": .number(viewport.scale)])
-                    if let revision { params = params.merging(["revision": .string(revision)]) }
-                } else {
-                    command = CommandIDs.mathGraphCreate
-                    if let page = context.params["page"] { params = params.merging(["page": page]) }
-                    if let rect = context.params["rect"] { params = params.merging(["rect": rect]) }
-                    if let id = context.params["itemID"] { params = params.merging(["id": id]) }
-                }
+                let (command, params) = GraphEditorModel.saveParams(expressions: lines, viewport: viewport,
+                    ref: ref, revision: revision, context: context.params)
                 _ = try await context.app.bus.execute(command, params, session: context.session)
                 close()
             } catch { self.error = NibError.wrap(error).message }
@@ -287,4 +284,39 @@ private struct GraphEditorRecord: Decodable {
     var type: String
     var frame: Frame
     var data: JSONValue
+}
+
+/// Pure editor inputs, independent of the potentially truncated portable display projection.
+enum GraphEditorModel {
+    static func numberText(_ value: Double) -> String { String(value) }
+    static func number(_ text: String) -> Double? {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Double(text) ?? Double(text.replacingOccurrences(of: ",", with: ".")), value.isFinite else { return nil }
+        return value
+    }
+
+    static func parse(_ result: JSONValue) throws -> (Frame, GraphData, String?) {
+        let record = result["record"] ?? result
+        let custom = try (record["custom"] ?? record).decode(GraphEditorRecord.self)
+        guard custom.owner == GraphBuilder.owner, custom.type == GraphBuilder.type else {
+            throw NibError.unsupported("editing this item as a maths graph")
+        }
+        return (custom.frame, try custom.data.decode(GraphData.self), record["rev"]?.stringValue)
+    }
+
+    static func saveParams(expressions: [String], viewport: GraphViewport, ref: String?, revision: String?,
+                           context: JSONValue) -> (String, JSONValue) {
+        var params: JSONValue = ["expressions": .array(expressions.map(JSONValue.string))]
+        if let ref {
+            params = params.merging(["ref": .string(ref), "x": .number(viewport.x), "y": .number(viewport.y),
+                                     "scale": .number(viewport.scale)])
+            if let revision { params = params.merging(["revision": .string(revision)]) }
+            return (CommandIDs.mathGraphSetViewport, params)
+        }
+        for key in ["page", "rect"] {
+            if let value = context[key] { params = params.merging([key: value]) }
+        }
+        if let id = context["itemID"] { params = params.merging(["id": id]) }
+        return (CommandIDs.mathGraphCreate, params)
+    }
 }
