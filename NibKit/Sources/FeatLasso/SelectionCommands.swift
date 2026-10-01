@@ -1,1 +1,726 @@
-// Scaffold placeholder, owned by F011 (Lasso & selection). Replace this file.
+import Foundation
+import Combine
+import NibContracts
+
+// MARK: - "Included in Selection" categories
+
+/// The lasso filter categories (setting `lasso.include`, command param `include`).
+enum LassoCategory: String, CaseIterable, Codable {
+    case handwriting, highlighter, tape, shapes, images, text, sticky, comments, math, custom
+
+    static func of(_ item: Item) -> LassoCategory {
+        switch item.kind {
+        case .stroke:
+            switch item.stroke?.style.tool ?? .pen {
+            case .pen, .pencil: return .handwriting
+            case .highlighter: return .highlighter
+            case .tape: return .tape
+            }
+        case .shape, .connector: return .shapes
+        case .image: return .images
+        case .text: return .text
+        case .sticky: return .sticky
+        case .comment: return .comments
+        case .math: return .math
+        case .custom: return .custom
+        }
+    }
+
+    static var names: [String] { allCases.map { $0.rawValue } }
+}
+
+// MARK: - Geometry (pure, unit-tested)
+
+/// A closed lasso polygon prepared for many hit tests: flat coordinate arrays, bounds, and its edges bucketed into
+/// horizontal bands, so a containment or crossing test looks only at the few edges at that height instead of all of
+/// them (a lasso over 5k strokes stays inside its 16 ms budget, ARCHITECTURE §20).
+struct LassoPolygon {
+    let xs: [Double]
+    let ys: [Double]
+    let bounds: Rect
+    /// Edge e runs from vertex e to vertex e + 1 (the last one back to vertex 0). `bands[b]` lists, ascending, the
+    /// edges whose y range meets band b.
+    private let bands: [[Int]]
+    /// The first band of each edge (so an edge spanning several bands is reported once).
+    private let firstBand: [Int]
+    private let bandHeight: Double
+
+    init?(_ points: [Point]) {
+        guard points.count >= 3, points.allSatisfy({ $0.x.isFinite && $0.y.isFinite }),
+              let b = Rect.bounding(points) else { return nil }
+        let xs = points.map { $0.x }, ys = points.map { $0.y }
+        self.xs = xs
+        self.ys = ys
+        bounds = b
+        let n = points.count
+        let count = min(n, 256)
+        let height = b.height / Double(count)
+        bandHeight = height
+        var bands = [[Int]](repeating: [], count: count)
+        var firstBand = [Int](repeating: 0, count: n)
+        for e in 0..<n {
+            let k = e + 1 == n ? 0 : e + 1
+            let lo = LassoPolygon.band(min(ys[e], ys[k]), minY: b.minY, height: height, count: count)
+            let hi = LassoPolygon.band(max(ys[e], ys[k]), minY: b.minY, height: height, count: count)
+            firstBand[e] = lo
+            for band in lo...hi { bands[band].append(e) }
+        }
+        self.bands = bands
+        self.firstBand = firstBand
+    }
+
+    var first: Point { Point(xs[0], ys[0]) }
+
+    /// The band holding height `y`, clamped to the polygon (monotonic in `y`).
+    private static func band(_ y: Double, minY: Double, height: Double, count: Int) -> Int {
+        let v = height > 0 ? (y - minY) / height : 0
+        if !(v > 0) { return 0 }
+        if v >= Double(count - 1) { return count - 1 }
+        return Int(v)
+    }
+
+    private func band(_ y: Double) -> Int {
+        LassoPolygon.band(y, minY: bounds.minY, height: bandHeight, count: bands.count)
+    }
+
+    /// Even-odd point-in-polygon, the same test (and arithmetic) as `Geo.polygonContains`. Only edges that straddle `y`
+    /// flip the answer, and every one of them lies in `y`'s band.
+    func contains(_ x: Double, _ y: Double) -> Bool {
+        guard x >= bounds.minX, x <= bounds.maxX, y >= bounds.minY, y <= bounds.maxY else { return false }
+        let xs = self.xs, ys = self.ys
+        let n = xs.count
+        var inside = false
+        for j in bands[band(y)] {
+            let i = j + 1 == n ? 0 : j + 1
+            let yi = ys[i], yj = ys[j]
+            if (yi > y) != (yj > y) {
+                let xCross = (xs[j] - xs[i]) * (y - yi) / (yj - yi) + xs[i]
+                if x < xCross { inside.toggle() }
+            }
+        }
+        return inside
+    }
+
+    /// The edges whose bounds overlap the box, each once.
+    func edges(near minX: Double, _ minY: Double, _ maxX: Double, _ maxY: Double) -> [Int] {
+        guard maxX >= bounds.minX, minX <= bounds.maxX, maxY >= bounds.minY, minY <= bounds.maxY else { return [] }
+        let xs = self.xs, ys = self.ys
+        let n = xs.count
+        let lo = band(minY), hi = band(maxY)
+        var out: [Int] = []
+        for b in lo...hi {
+            for j in bands[b] where max(lo, firstBand[j]) == b {
+                let k = j + 1 == n ? 0 : j + 1
+                let ax = xs[j], ay = ys[j], bx = xs[k], by = ys[k]
+                if max(ax, bx) < minX || min(ax, bx) > maxX || max(ay, by) < minY || min(ay, by) > maxY { continue }
+                out.append(j)
+            }
+        }
+        return out
+    }
+}
+
+enum LassoGeometry {
+    /// True when any part of the open polyline touches the polygon: an end point inside it, or a segment crossing its
+    /// boundary. Same answer as `Geo.polylineTouchesPolygon` (a polyline that crosses no edge lies wholly inside or
+    /// wholly outside), but it tests only the ends for containment and only the edges near the line for crossings, so
+    /// a lasso over 5k strokes stays inside its 16 ms budget (ARCHITECTURE §20).
+    static func lineTouches(_ line: [Point], _ poly: LassoPolygon) -> Bool {
+        guard let head = line.first, let tail = line.last else { return false }
+        if poly.contains(head.x, head.y) || poly.contains(tail.x, tail.y) { return true }
+        guard line.count >= 2 else { return false }
+        var minX = head.x, minY = head.y, maxX = head.x, maxY = head.y
+        for p in line {
+            minX = min(minX, p.x)
+            minY = min(minY, p.y)
+            maxX = max(maxX, p.x)
+            maxY = max(maxY, p.y)
+        }
+        let edges = poly.edges(near: minX, minY, maxX, maxY)
+        guard !edges.isEmpty else { return false }
+        let xs = poly.xs, ys = poly.ys
+        let m = xs.count
+        for i in 1..<line.count {
+            let p1 = line[i - 1], p2 = line[i]
+            for j in edges {
+                let k = j + 1 == m ? 0 : j + 1
+                if crosses(p1.x, p1.y, p2.x, p2.y, xs[j], ys[j], xs[k], ys[k]) { return true }
+            }
+        }
+        return false
+    }
+
+    /// `lineTouches` over a stroke's points, without building its polyline and with the line's own bounds as the first
+    /// test (not `Item.bounds`, which walks the points again for the nib width): the hot path of a lasso over thousands
+    /// of strokes.
+    static func strokeTouches(_ pts: [StrokePoint], _ poly: LassoPolygon) -> Bool {
+        let n = pts.count
+        guard n > 0 else { return false }
+        var minX = Double(pts[0].x), minY = Double(pts[0].y), maxX = minX, maxY = minY
+        for i in 1..<n {
+            let x = Double(pts[i].x), y = Double(pts[i].y)
+            if x < minX { minX = x } else if x > maxX { maxX = x }
+            if y < minY { minY = y } else if y > maxY { maxY = y }
+        }
+        let b = poly.bounds
+        if maxX < b.minX || minX > b.maxX || maxY < b.minY || minY > b.maxY { return false }
+        if poly.contains(Double(pts[0].x), Double(pts[0].y)) || poly.contains(Double(pts[n - 1].x), Double(pts[n - 1].y)) {
+            return true
+        }
+        guard n >= 2 else { return false }
+        let edges = poly.edges(near: minX, minY, maxX, maxY)
+        guard !edges.isEmpty else { return false }
+        let xs = poly.xs, ys = poly.ys
+        let m = xs.count
+        var px = Double(pts[0].x), py = Double(pts[0].y)
+        for i in 1..<n {
+            let qx = Double(pts[i].x), qy = Double(pts[i].y)
+            for j in edges {
+                let k = j + 1 == m ? 0 : j + 1
+                if crosses(px, py, qx, qy, xs[j], ys[j], xs[k], ys[k]) { return true }
+            }
+            px = qx
+            py = qy
+        }
+        return false
+    }
+
+    /// `Geo.segmentsIntersect` on raw coordinates (segment p1–p2 against edge q1–q2).
+    static func crosses(_ p1x: Double, _ p1y: Double, _ p2x: Double, _ p2y: Double,
+                        _ q1x: Double, _ q1y: Double, _ q2x: Double, _ q2y: Double) -> Bool {
+        let d1 = (q2x - q1x) * (p1y - q1y) - (q2y - q1y) * (p1x - q1x)
+        let d2 = (q2x - q1x) * (p2y - q1y) - (q2y - q1y) * (p2x - q1x)
+        let d3 = (p2x - p1x) * (q1y - p1y) - (p2y - p1y) * (q1x - p1x)
+        let d4 = (p2x - p1x) * (q2y - p1y) - (p2y - p1y) * (q2x - p1x)
+        return ((d1 > 0) != (d2 > 0)) && ((d3 > 0) != (d4 > 0))
+    }
+
+    /// A closed area (item outline) touches the polygon when its boundary does, or when the lasso lies inside it.
+    static func areaTouches(_ outline: [Point], _ poly: LassoPolygon) -> Bool {
+        guard let first = outline.first else { return false }
+        if lineTouches(outline + [first], poly) { return true }
+        return Geo.polygonContains(outline, poly.first)
+    }
+
+    /// Selection semantics: an item is selected when any part of it touches the polygon. `hitArea` is where the item's
+    /// drawer says it takes lasso hits when that differs from `Item.bounds` (`ItemDrawer.hitBounds`: a collapsed sticky
+    /// note's icon, a full-page text box's laid-out text); boxed items then touch through that rect.
+    static func touches(_ item: Item, _ poly: LassoPolygon, hitArea: Rect? = nil) -> Bool {
+        if item.kind == .stroke {
+            guard let stroke = item.stroke else { return false }
+            return strokeTouches(stroke.points, poly)
+        }
+        guard reach(item, hitArea).intersects(poly.bounds) else { return false }
+        switch item.kind {
+        case .stroke:
+            return false                                    // handled above
+        case .connector:
+            guard let c = item.connector else { return false }
+            return lineTouches([c.from.point] + c.bends + [c.to.point], poly)
+        case .shape:
+            guard let s = item.shape else { return false }
+            if s.points.count >= 3 && s.shape == .polygon { return areaTouches(s.points, poly) }
+            if s.points.count >= 2 { return lineTouches(s.points, poly) }
+            if let area = hitArea { return areaTouches(corners(area), poly) }
+            return areaTouches(s.frame.corners, poly)
+        case .comment:
+            return areaTouches(corners(hitArea ?? item.bounds), poly)
+        case .text, .image, .sticky, .math, .custom:
+            if let area = hitArea { return areaTouches(corners(area), poly) }
+            return areaTouches(item.frame?.corners ?? corners(item.bounds), poly)
+        }
+    }
+
+    /// Everything that can take a hit: the item's bounds and its drawer's hit area (the prefilter; hot, no closures).
+    static func reach(_ item: Item, _ hitArea: Rect?) -> Rect {
+        let bounds = item.bounds
+        guard let area = hitArea else { return bounds }
+        return bounds.union(area)
+    }
+
+    static func corners(_ r: Rect) -> [Point] {
+        [Point(r.minX, r.minY), Point(r.maxX, r.minY), Point(r.maxX, r.maxY), Point(r.minX, r.maxY)]
+    }
+
+    // MARK: Taps
+
+    /// True when a tap at `p` (page points) lands on the item, `tolerance` page points around its ink or outline.
+    /// `hitArea` as in `touches(_:_:hitArea:)`.
+    static func hit(_ item: Item, at p: Point, tolerance tol: Double, hitArea: Rect? = nil) -> Bool {
+        guard reach(item, hitArea).insetBy(-tol).contains(p) else { return false }
+        switch item.kind {
+        case .stroke:
+            guard let s = item.stroke else { return false }
+            return distance(p, toPolyline: s.polyline) <= tol + s.style.width / 2
+        case .connector:
+            guard let c = item.connector else { return false }
+            return distance(p, toPolyline: [c.from.point] + c.bends + [c.to.point]) <= tol + c.style.strokeWidth / 2
+        case .shape:
+            guard let s = item.shape else { return false }
+            if s.points.count >= 3 && s.shape == .polygon {
+                return Geo.polygonContains(s.points, p) || distance(p, toPolyline: s.points + [s.points[0]]) <= tol
+            }
+            if s.points.count >= 2 { return distance(p, toPolyline: s.points) <= tol + s.style.strokeWidth / 2 }
+            if let area = hitArea { return area.insetBy(-tol).contains(p) }
+            return frameContains(s.frame, p, margin: tol)
+        case .comment:
+            return hitArea.map { $0.insetBy(-tol).contains(p) } ?? true
+        case .text, .image, .sticky, .math, .custom:
+            if let area = hitArea { return area.insetBy(-tol).contains(p) }
+            return item.frame.map { frameContains($0, p, margin: tol) } ?? true
+        }
+    }
+
+    static func frameContains(_ f: Frame, _ p: Point, margin: Double) -> Bool {
+        let c = f.center
+        let cs = cos(-f.rotation), sn = sin(-f.rotation)
+        let dx = p.x - c.x, dy = p.y - c.y
+        let lx = dx * cs - dy * sn, ly = dx * sn + dy * cs
+        return abs(lx) <= f.w / 2 + margin && abs(ly) <= f.h / 2 + margin
+    }
+
+    static func distance(_ p: Point, toPolyline pts: [Point]) -> Double {
+        guard let first = pts.first else { return .infinity }
+        guard pts.count > 1 else { return p.distance(to: first) }
+        var best = Double.infinity
+        for i in 1..<pts.count { best = min(best, Geo.distance(p, toSegment: pts[i - 1], pts[i])) }
+        return best
+    }
+
+    // MARK: Bounds
+
+    static func union(_ items: [Item]) -> Rect? {
+        var out: Rect?
+        for it in items { out = out.map { $0.union(it.bounds) } ?? it.bounds }
+        return out
+    }
+
+    /// Maps a lasso outline drawn around `from` onto the same selection now occupying `to`. Only for a change that moved
+    /// the items without carrying `Selection.outline` along (the transform feature, F012, transforms it itself, rotation
+    /// included), so scale + translate is enough.
+    static func map(_ outline: [Point], from: Rect, to: Rect) -> [Point] {
+        let sx = from.width > 0.001 ? to.width / from.width : 1
+        let sy = from.height > 0.001 ? to.height / from.height : 1
+        return outline.map { Point(to.minX + ($0.x - from.minX) * sx, to.minY + ($0.y - from.minY) * sy) }
+    }
+}
+
+// MARK: - Selection engine
+
+enum SelectionEngine {
+    /// Where an item takes taps and lasso hits when it differs from its own geometry (nil = its geometry).
+    typealias HitArea = (Item) -> Rect?
+
+    /// Live items of `layer` in the included categories that touch the polygon, in z-order.
+    static func select(_ items: [Item], polygon: [Point], include: Set<LassoCategory>, layer: Int,
+                       excluding: Set<ElementID> = [], hitArea: HitArea = { _ in nil }) -> [Item] {
+        guard let poly = LassoPolygon(polygon) else { return [] }
+        let excludes = !excluding.isEmpty
+        return items.filter { item in
+            guard !item.deleted, item.layer == layer, !(excludes && excluding.contains(item.id)),
+                  include.contains(LassoCategory.of(item)) else { return false }
+            // Ink is hit-tested along its path; only other kinds ask their drawer.
+            return LassoGeometry.touches(item, poly, hitArea: item.kind == .stroke ? nil : hitArea(item))
+        }
+    }
+
+    /// The topmost live item of `layer` under a tap that `accept` allows.
+    static func tapTarget(at p: Point, in items: [Item], layer: Int, tolerance: Double,
+                          hitArea: HitArea = { _ in nil }, accept: (Item) -> Bool) -> Item? {
+        for item in items.reversed() where !item.deleted && item.layer == layer && accept(item) {
+            let area = item.kind == .stroke ? nil : hitArea(item)
+            if LassoGeometry.hit(item, at: p, tolerance: tolerance, hitArea: area) { return item }
+        }
+        return nil
+    }
+
+    /// A finger is about 8 view points of slack, converted to page points at the current zoom.
+    static func tapTolerance(zoom: Double) -> Double {
+        min(24, max(2, 8 / max(zoom, 0.01)))
+    }
+}
+
+// MARK: - Session state
+
+@MainActor
+enum SelectionSupport {
+    static let lassoTool = "lasso"
+
+    static func session(_ ctx: CommandContext) throws -> EditorSession {
+        guard let s = ctx.activeSession else {
+            throw NibError(.unavailable, "no editor window is open", hint: "open a document with doc.open first")
+        }
+        return s
+    }
+
+    /// A live page from a page ref; nil or empty = the invoking window's current page (session default, §6.1).
+    static func page(_ ref: String?, _ ctx: CommandContext, path: String = "$.page") throws -> (DocumentID, PageID) {
+        let target: (doc: DocumentID, page: PageID)
+        if let ref = ref, !ref.isEmpty {
+            guard case let .page(d, p)? = NodeRef(ref) else {
+                throw NibError(.invalidParams, "expected a page ref like page:D/P", path: path,
+                               hint: "call query.context for the current page ref")
+            }
+            target = (d, p)
+        } else {
+            target = try ctx.pageOrSession(nil)
+        }
+        guard let record = try ctx.workspace.content(target.doc).page(target.page), !record.deleted else {
+            throw NibError.notFound("page \(target.page.raw) in document \(target.doc.raw)")
+        }
+        return (target.doc, target.page)
+    }
+
+    static func include(_ names: [String]?, _ ctx: CommandContext) throws -> Set<LassoCategory> {
+        guard let names = names else { return LassoSettings.included(ctx.services.settings) }
+        var out = Set<LassoCategory>()
+        for (i, name) in names.enumerated() {
+            guard let c = LassoCategory(rawValue: name) else {
+                throw NibError(.invalidParams, "unknown category '\(name)'", path: "$.include[\(i)]",
+                               hint: "use: " + LassoCategory.names.joined(separator: ", "))
+            }
+            out.insert(c)
+        }
+        return out
+    }
+
+    /// The drawers' hit areas (`ItemDrawer.hitBounds`, contracts-v2 G14).
+    static func hitArea(_ content: ContentRegistries) -> SelectionEngine.HitArea {
+        { item in content.drawer(for: item)?.hitBounds(item) }
+    }
+
+    /// Makes `items` the session's selection (empty clears it), carrying the drawn lasso outline (`Selection.outline`).
+    @discardableResult
+    static func apply(_ items: [Item], doc: DocumentID, page: PageID, outline: [Point]?,
+                      session: EditorSession) -> SelectionOutput {
+        guard let bounds = LassoGeometry.union(items) else {
+            session.selection = Selection()
+            return SelectionOutput(refs: [], count: 0, bounds: nil)
+        }
+        session.selection = Selection(doc: doc, page: page, items: items.map { $0.id }, bounds: bounds,
+                                      outline: outline.flatMap { $0.count >= 3 ? $0 : nil })
+        return SelectionOutput(refs: session.selection.refs, count: items.count, bounds: bounds)
+    }
+
+    /// Clears the selection; a temporary lasso (quick selection, Circle to Lasso) hands back the tool it replaced.
+    static func clear(_ session: EditorSession) {
+        session.selection = Selection()
+        if session.tool == lassoTool { session.endTemporaryTool() }
+    }
+
+    /// Switches to the lasso for a selection made without it, until the selection ends (`selectTemporarily`).
+    static func enterLasso(_ session: EditorSession) {
+        guard session.tool != lassoTool else { return }
+        session.selectTemporarily(lassoTool)
+    }
+}
+
+/// Result of every selecting command.
+struct SelectionOutput: Codable, Equatable {
+    /// Selected item refs in z-order (bottom first).
+    var refs: [String]
+    var count: Int
+    /// Union of the selected items' bounds, [x, y, w, h]; absent when nothing is selected.
+    var bounds: Rect?
+}
+
+// MARK: - Commands
+
+struct SelectionSet: NibCommand {
+    struct Params: Codable {
+        var refs: [String]
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "selection.set", title: "Select Items",
+        summary: "Select items by ref (all on one page; locked items too). An empty list clears the selection.",
+        params: .obj(["refs": .arr(.ref, "item refs item:D/P/I on one page")], required: ["refs"]),
+        examples: [try! JSONValue.parse(#"{"refs": ["item:FIXTUREDOC01/FIXTUREPG001/FIXTURESHP01"]}"#)],
+        effect: .session)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> SelectionOutput {
+        let session = try SelectionSupport.session(ctx)
+        var target: (doc: DocumentID, page: PageID)?
+        var ids: [ElementID] = []
+        for (i, ref) in p.refs.enumerated() {
+            guard case let .item(doc, page, id)? = NodeRef(ref) else {
+                throw NibError(.invalidParams, "expected an item ref like item:D/P/I", path: "$.refs[\(i)]",
+                               hint: "call query.get on the page for item refs")
+            }
+            if let t = target, t.doc != doc || t.page != page {
+                throw NibError(.invalidParams, "all selected items must be on one page", path: "$.refs[\(i)]",
+                               hint: "select the items of one page at a time")
+            }
+            target = (doc, page)
+            ids.append(id)
+        }
+        guard let t = target else {
+            session.selection = Selection()
+            return SelectionOutput(refs: [], count: 0, bounds: nil)
+        }
+        _ = try SelectionSupport.page(NodeRef.page(t.doc, t.page).description, ctx, path: "$.refs")
+        let wanted = Set(ids)
+        let items = try ctx.workspace.items(t.doc, page: t.page).filter { wanted.contains($0.id) }
+        if let missing = wanted.subtracting(items.map { $0.id }).sorted().first {
+            throw NibError.notFound("item \(missing.raw) on page \(t.page.raw)")
+        }
+        return SelectionSupport.apply(items, doc: t.doc, page: t.page, outline: nil, session: session)
+    }
+}
+
+struct SelectionClear: NibCommand {
+    static let descriptor = CommandDescriptor(
+        id: "selection.clear", title: "Deselect",
+        summary: "Clear the selection in the current window (a temporary lasso returns to the previous tool).",
+        params: .empty,
+        examples: [[:]],
+        effect: .session)
+
+    static func run(_ p: NoResult, _ ctx: CommandContext) async throws -> NoResult {
+        SelectionSupport.clear(try SelectionSupport.session(ctx))
+        return NoResult()
+    }
+}
+
+struct SelectionFromPolygon: NibCommand {
+    struct Params: Codable {
+        var page: String
+        var polygon: [Point]
+        var include: [String]?
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "selection.fromPolygon", title: "Lasso Select",
+        summary: "Select items on the active layer that touch a lasso polygon; include filters kinds (default: the lasso's Included in Selection setting).",
+        params: .obj(["page": .ref,
+                      "polygon": .arr(.point, "at least 3 vertices [x, y] in page points; closed automatically"),
+                      "include": .arr(.str(choices: LassoCategory.names), "kinds to select")],
+                     required: ["page", "polygon"]),
+        examples: [try! JSONValue.parse(
+                       #"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "polygon": [[90, 190], [270, 190], [270, 300], [90, 300]]}"#),
+                   try! JSONValue.parse(
+                       #"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "polygon": [[0, 0], [595, 0], [595, 842]], "include": ["images", "text"]}"#)],
+        effect: .session)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> SelectionOutput {
+        let session = try SelectionSupport.session(ctx)
+        let (doc, page) = try SelectionSupport.page(p.page, ctx)
+        guard LassoPolygon(p.polygon) != nil else {
+            throw NibError(.invalidParams, "a lasso polygon needs at least 3 finite vertices", path: "$.polygon",
+                           hint: "pass [[x, y], …] in page points, or use selection.fromRect")
+        }
+        let include = try SelectionSupport.include(p.include, ctx)
+        let items = SelectionEngine.select(try ctx.workspace.items(doc, page: page), polygon: p.polygon,
+                                           include: include, layer: session.activeLayer,
+                                           hitArea: SelectionSupport.hitArea(ctx.content))
+        return SelectionSupport.apply(items, doc: doc, page: page, outline: p.polygon, session: session)
+    }
+}
+
+struct SelectionFromRect: NibCommand {
+    struct Params: Codable {
+        var page: String
+        var rect: Rect
+        var include: [String]?
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "selection.fromRect", title: "Rectangle Select",
+        summary: "Rectangular lasso: select items on the active layer that touch a rect [x, y, w, h]; include filters kinds.",
+        params: .obj(["page": .ref, "rect": .rect,
+                      "include": .arr(.str(choices: LassoCategory.names), "kinds to select")],
+                     required: ["page", "rect"]),
+        examples: [try! JSONValue.parse(#"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "rect": [300, 470, 100, 100]}"#)],
+        effect: .session)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> SelectionOutput {
+        let session = try SelectionSupport.session(ctx)
+        let (doc, page) = try SelectionSupport.page(p.page, ctx)
+        let r = p.rect
+        guard [r.x, r.y, r.width, r.height].allSatisfy({ $0.isFinite }) else {
+            throw NibError.invalid("rect values must be finite numbers", path: "$.rect")
+        }
+        // A rect dragged up or to the left arrives with a negative size.
+        let rect = Rect(x: min(r.x, r.x + r.width), y: min(r.y, r.y + r.height),
+                        width: abs(r.width), height: abs(r.height))
+        let polygon = LassoGeometry.corners(rect)
+        let include = try SelectionSupport.include(p.include, ctx)
+        let items = SelectionEngine.select(try ctx.workspace.items(doc, page: page), polygon: polygon,
+                                           include: include, layer: session.activeLayer,
+                                           hitArea: SelectionSupport.hitArea(ctx.content))
+        return SelectionSupport.apply(items, doc: doc, page: page, outline: polygon, session: session)
+    }
+}
+
+struct SelectionFromLoop: NibCommand {
+    struct Params: Codable {
+        var page: String
+        var stroke: String
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "selection.fromLoop", title: "Circle to Lasso",
+        summary: "Circle to Lasso: delete a loop stroke (item ref) and select what it touches on the active layer, as the lasso would.",
+        params: .obj(["page": .ref, "stroke": .str("item ref item:D/P/I (or bare id) of the loop stroke on that page")],
+                     required: ["page", "stroke"]),
+        examples: [try! JSONValue.parse(
+            #"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "stroke": "item:FIXTUREDOC01/FIXTUREPG001/FIXTURESTK01"}"#)],
+        effect: .edit)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> SelectionOutput {
+        let session = try SelectionSupport.session(ctx)
+        let (doc, page) = try SelectionSupport.page(p.page, ctx)
+        let strokeID: ElementID
+        switch NodeRef(p.stroke) {
+        case let .item(d, pg, id)?:
+            guard d == doc, pg == page else {
+                throw NibError(.invalidParams, "the loop stroke must be on the given page", path: "$.stroke")
+            }
+            strokeID = id
+        case nil where NibID.isValid(p.stroke):
+            strokeID = NibID(p.stroke)
+        default:
+            throw NibError(.invalidParams, "expected an item ref like item:D/P/I", path: "$.stroke")
+        }
+        let loop = try ctx.workspace.item(doc, page: page, id: strokeID)
+        guard loop.kind == .stroke, let stroke = loop.stroke, stroke.points.count >= 3 else {
+            throw NibError(.invalidParams, "item \(strokeID.raw) is not a loop stroke", path: "$.stroke",
+                           hint: "pass the ref of a closed ink stroke")
+        }
+        let outline = stroke.polyline
+        let include = LassoSettings.included(ctx.services.settings)
+        let items = SelectionEngine.select(try ctx.workspace.items(doc, page: page), polygon: outline,
+                                           include: include, layer: session.activeLayer, excluding: [strokeID],
+                                           hitArea: SelectionSupport.hitArea(ctx.content))
+        try ctx.mutate { tx in try tx.delete(item: strokeID, doc: doc, page: page) }
+        let out = SelectionSupport.apply(items, doc: doc, page: page, outline: outline, session: session)
+        if !items.isEmpty { SelectionSupport.enterLasso(session) }
+        return out
+    }
+}
+
+struct SelectionSelectAll: NibCommand {
+    struct Params: Codable {
+        /// The schema requires it; the user may omit it (⌘A, menus): the window's current page (§6.1 session default).
+        var page: String?
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "selection.selectAll", title: "Select All",
+        summary: "Select every item on a page's active layer (locked items included). From a key command or menu the page defaults to the window's current page.",
+        params: .obj(["page": .ref], required: ["page"]),
+        examples: [["page": "page:FIXTUREDOC01/FIXTUREPG001"]],
+        effect: .session)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> SelectionOutput {
+        let session = try SelectionSupport.session(ctx)
+        let (doc, page) = try SelectionSupport.page(p.page, ctx)
+        let layer = session.activeLayer
+        let items = try ctx.workspace.items(doc, page: page).filter { $0.layer == layer }
+        return SelectionSupport.apply(items, doc: doc, page: page, outline: nil, session: session)
+    }
+}
+
+struct SelectionTapAt: NibCommand {
+    struct Params: Codable {
+        var page: String
+        var point: Point
+        /// Topmost live item under the point (sent by the gesture router; the command hit-tests by its own rules).
+        var ref: String?
+        var gesture: String?
+    }
+
+    struct Output: Codable, Equatable {
+        var handled: Bool
+    }
+
+    static let descriptor = CommandDescriptor(
+        id: "selection.tapAt", title: "Tap to Select",
+        summary: "Tap chain: select the top non-ink item under a finger tap (quick selection; with the lasso, any item); a tap elsewhere deselects.",
+        params: .obj(["page": .ref, "point": .point, "ref": .ref,
+                      "gesture": .str(choices: CanvasGesture.allCases.map { $0.rawValue })],
+                     required: ["page", "point"]),
+        examples: [try! JSONValue.parse(#"{"page": "page:FIXTUREDOC01/FIXTUREPG001", "point": [352, 512]}"#)],
+        effect: .session)
+
+    static func run(_ p: Params, _ ctx: CommandContext) async throws -> Output {
+        guard let session = ctx.activeSession, !session.readOnly else { return Output(handled: false) }
+        let (doc, page) = try SelectionSupport.page(p.page, ctx)
+        let current = session.selection
+        let tolerance = SelectionEngine.tapTolerance(zoom: session.zoom)
+        if !current.isEmpty, current.doc == doc, current.page == page,
+           current.bounds?.insetBy(-tolerance).contains(p.point) == true {
+            return Output(handled: true)                    // on the selection: its handles and menu take the tap
+        }
+        let items = try ctx.workspace.items(doc, page: page)
+        let hitArea = SelectionSupport.hitArea(ctx.content)
+        var target: Item?
+        // Tools that edit an item kind on tap claim it earlier in the tap chain (text.tapAt, sticky.tapAt, shape.tapAt
+        // run before order 400 for their item kinds), so what reaches here is for selecting.
+        if session.tool == SelectionSupport.lassoTool {
+            let include = LassoSettings.included(ctx.services.settings)
+            target = SelectionEngine.tapTarget(at: p.point, in: items, layer: session.activeLayer, tolerance: tolerance,
+                                               hitArea: hitArea) { include.contains(LassoCategory.of($0)) }
+        } else if ctx.services.settings.get(NibSettings.objectTapSelection) {
+            target = SelectionEngine.tapTarget(at: p.point, in: items, layer: session.activeLayer, tolerance: tolerance,
+                                               hitArea: hitArea) { $0.kind != .stroke }
+        }
+        if let target = target {
+            SelectionSupport.apply([target], doc: doc, page: page, outline: nil, session: session)
+            SelectionSupport.enterLasso(session)
+            return Output(handled: true)
+        }
+        guard !current.isEmpty else { return Output(handled: false) }
+        SelectionSupport.clear(session)
+        return Output(handled: true)
+    }
+}
+
+// MARK: - Housekeeping
+
+/// Keeps every window's selection honest after commits (moves update its bounds and outline, deletions clear it) and
+/// asks the chrome to re-read the lasso's live toolbar glyph when `lasso.type` changes.
+@MainActor
+enum LassoHousekeeping {
+    private static var retained: [AnyObject] = []
+    private static var cancellables: [AnyCancellable] = []
+    /// The latest scheduled refresh (tests await it).
+    private(set) static var pending: Task<Void, Never>?
+
+    static func start(_ app: NibApp) {
+        retained.append(app.bus.observeCommits { [weak app] cs in
+            // Commit observers run inside the command's write. Refresh once that command is done with the selection,
+            // so a mover that carries it itself (F012 moves bounds and outline with the items) is not moved twice.
+            pending = Task { @MainActor [weak app] in
+                guard let app = app else { return }
+                for session in app.services.sessions.sessions { refresh(session, after: cs, app: app) }
+            }
+        })
+        cancellables.append(NotificationCenter.default.publisher(for: SettingsStore.didChange, object: app.settings)
+            .sink { [weak app] note in
+                guard let app = app, note.userInfo?["name"] as? String == LassoSettings.type.name else { return }
+                app.ui.setNeedsChromeUpdate()
+            })
+    }
+
+    static func refresh(_ session: EditorSession, after cs: Changeset, app: NibApp) {
+        let selection = session.selection
+        guard !selection.isEmpty, let doc = selection.doc, let page = selection.page,
+              cs.documents.contains(doc) else { return }
+        let touched = Set(cs.summary(for: doc).all)
+        guard selection.refs.contains(where: { touched.contains($0) }) else { return }
+        let wanted = Set(selection.items)
+        let live = ((try? app.workspace.items(doc, page: page)) ?? []).filter { wanted.contains($0.id) }
+        if live.count != wanted.count {
+            SelectionSupport.clear(session)
+        } else if let bounds = LassoGeometry.union(live), bounds != selection.bounds {
+            // Whatever moved the items left the selection behind (F012 updates bounds and outline itself).
+            var next = selection
+            if let outline = selection.outline, let old = selection.bounds {
+                next.outline = LassoGeometry.map(outline, from: old, to: bounds)
+            }
+            next.bounds = bounds
+            session.selection = next
+        }
+    }
+}
