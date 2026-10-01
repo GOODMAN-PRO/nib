@@ -1,0 +1,83 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/FeatMeetingAI/MeetingCommands.swift:25-34 (MeetingAccess.check) + MeetingSummarize.run:54-62; NibKit/Sources/FeatTranscription/TranscriptCommands.swift:24-27 (TranscriptGet merges LiveTranscriber.previews)",
+      "problem": "Live Summary (S-052) almost never commits while people are talking. transcript.get returns committed lines plus the live Speech partial hypotheses (previews, rewritten on every partial result; SpeechParagraphs.assemble can also re-split them). meeting.summarize snapshots those lines, waits several seconds for the AI, then re-reads transcript.get and requires fresh.prefix(lines.count) == lines. During continuous speech the last preview line has grown or been re-split, so the check throws .conflict ('The transcript changed while the AI was working'), the paid summary is discarded, and the next attempt 60 s later hits the same race. In practice the summary only appears after Stop. When a run does succeed, the stored windows contain unstable preview text, so the next tick re-summarises them. The existing test uses a fixed fake transcript.get, so it never sees this.",
+      "fix": "Summarise committed lines only. In F054 TranscriptGet (its file is in this branch), return the committed segments separately from the preview, for example as an output field `committed: [TranscriptSegment]`, a per-line `preview: true` flag, or a param `committedOnly: true` that skips LiveTranscriber.previews. In MeetingSummarize, MeetingGenerateNotes and MeetingAccess.check, use only the committed lines. Add a test whose transcript.get returns a growing preview tail between the first and second read; the summary must still commit, covering the committed lines only."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMeetingAI/LiveSummarizer.swift:162-165 (MeetingModel.summarize guard)",
+      "problem": "A window whose valid answer has empty keyPoints, decisions and actionItems, and no marker-based flags, is rejected with 'The AI returned an empty summary', even though the prompt says 'Empty lists are valid'. Ordinary small talk ('can everyone hear me, let's wait two minutes') can produce exactly that. The whole run then throws. Each later tick, plus Generate Notes and Regenerate (which all call summarize), re-plans from the same window and fails again, so the summary and notes for that recording can stay stuck for good.",
+      "fix": "Accept empty content as a valid result and append the window with its empty content and flags, so its source is covered and the next window is planned. Reject only undecodable JSON or a missing translation. The panel and makeNotes already skip empty sections. Add a test: an empty answer for window 1 plus a normal answer for window 2 gives 2 windows, and a re-run makes no request."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMeetingAI/LiveSummarizer.swift:232-237 (automatic Invocation) + MeetingCommands.swift:64-66 (ctx.mutate)",
+      "problem": "Each automatic live-summary tick runs meeting.summarize as .user through the normal undoable ctx.mutate, so about once a minute during a recording an undo entry ('Summarize Recording') lands on the document's undo stack, and the redo stack is cleared. A user taking notes who presses Undo reverts the AI summary instead of their last stroke, and has to press Undo again for every minute of recording.",
+      "fix": "In MeetingSummarize.run, compute `let automatic = runtime?.automaticGroups.contains(ctx.group) == true` and persist with `ctx.mutate(undoable: !automatic) { ... }`. Manual Summarise and Regenerate stay undoable. Extend testLiveCadenceProviderGuardAndStopFlush to assert h.undoDepth(Fixtures.docID) == 0 after the automatic tick."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMeetingAI/LiveSummarizer.swift:5-17, 45-54 (MeetingSummary stored in AudioClip.summary with `source: [TranscriptSegment]`); NibKit/Sources/FeatTranscription/TranscriptPanel.swift:290-313; SummaryPanel.swift:73",
+      "problem": "AudioClip.summary now holds a single-line JSON blob that embeds a full copy of every transcript segment. (1) F054's Transcript panel Summary tab (S-050) splits AudioClip.summary on newlines and shows it as paragraphs with timestamp parsing, so users see raw JSON and summary search matches JSON keys. (2) transcript.get and meeting.summarize outputs, which the AI agent and plugins read, now carry the whole transcript twice. (3) The contract keeps transcripts out of document records, in per-device sidecars ('Transcripts are NOT document records'), but this copies them into a synced LWW record that is rewritten in full every minute. For a 2-hour meeting that is hundreds of KB of churn per write. (4) SummaryPanel decodes this blob in a computed property twice per body render, including on every search keystroke.",
+      "fix": "Store a fingerprint per window instead of the segments, for example `sources: [{index, rev, hash}]` (hash of the text), and match retained windows against that. Make F054's Summary tab understand the structured form: if AudioClip.summary decodes as JSON with `windows`, render one 'm:ss – m:ss' paragraph per window, or show a button that opens panel `meetingai.summary`, instead of the raw string. Have meeting.summarize return {clip, windows: count} rather than the blob. In SummaryPanelModel, decode MeetingSummary once per reload into a @Published property."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMeetingAI/LiveSummarizer.swift:77-81, 98, 143, 163 (language == target)",
+      "problem": "Detected languages are NLLanguage raw values ('zh-Hans', 'zh-Hant'), but the target comes from the Summary language picker or the default, which are ISO language codes ('zh'). For Chinese speakers with target 'zh', every window counts as foreign. The prompt tells the model the source is 'zh-Hans' and to translate only if it differs from 'zh'. A model that sensibly returns translation:null hits the guard, so the run throws on every tick and Generate Notes never completes. A free-form or region target ('en-GB') fails the same way.",
+      "fix": "Normalise both sides before comparing: `func base(_ c: String) -> String { Locale.Language(identifier: c).languageCode?.identifier ?? c }` and compare base(language) == base(target), both in the guard and in the prompt. Add a test with target 'zh' and a Chinese line whose answer has translation null: it must succeed."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMeetingAI/LiveSummarizer.swift:139-172 (MeetingModel.summarize loop)",
+      "problem": "Summarise, Regenerate and Generate Notes on a recording with no live summary send one sequential AI request per 60 s window (about 120 for a 2-hour meeting) inside a single command, with no cancel. Nothing is saved until every window succeeds, so one transient failure, such as a 429 from a BYO-key provider (likely at that request rate), a timeout or one bad JSON reply, throws away every window already paid for. The next attempt starts from zero.",
+      "fix": "For non-incremental and catch-up runs, plan larger windows (for example 5–10 min, still capped at 16 KB and still split on language changes) so a long meeting needs far fewer requests. On a failure partway through, still return the windows completed so far: catch the error, save MeetingSummary(windows: completed) through the normal mutate (non-undoable when automatic), then rethrow, so the next run resumes incrementally. Add a test: the fake AI fails on window 3 of 4, windows 1–2 are persisted, and a re-run makes exactly 2 requests."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMeetingAI/MeetingCommands.swift:112-133 (enhance mode, notebook branch)",
+      "problem": "Enhance Notes on a notebook runs recognize.pageText on every live page of the document, one after another on the main actor, and throws 'too long' after 120 KB of recognised text. In a long-lived class or meeting notebook with hundreds of pages, Enhance takes minutes or always fails, and the model gets unrelated notes from other days.",
+      "fix": "Recognise only the pages linked to this recording: pages whose ink has t0 within [clip.start, clip.start + clip.duration] (the AudioClip contract), or whose contentRevision wallMs is at or after clip.start (as TranscriptSeek does), plus clip.page. Cap the count, for example 20 pages. If no page qualifies, throw unavailable 'Write notes during the recording before enhancing them.' Add a test with an unrelated older page that must not be recognised."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Sources/FeatMeetingAI/MeetingCommands.swift:96-107, 149 (Generate/Enhance Notes right after Stop); FeatMeetingAIFeature.swift:32-35; SummaryPanel.swift:121",
+      "problem": "Generate Notes and Enhance Notes become available as soon as the recording state is 'stopped', but F054 is still draining and transcribing the last window of audio, up to 60 s of speech, and cloud transcription can take tens of seconds. MeetingAccess.check only requires the old lines to remain a prefix, so lines that arrive during the AI call pass the check. The generated notes then silently omit the end of the meeting, often where the action items are recapped.",
+      "fix": "Have F054's transcript.get report whether a live transcription job is still running for the clip (for example `transcribing: Bool`, from LiveTranscriber.jobs[ref] != nil). MeetingGenerateNotes should throw NibError(.conflict, 'Transcription is still finishing. Try again in a moment.') while it is true. The menu isVisible and the panel buttons should disable on the same flag. Add a test where transcribing is true and expect conflict with no AI request."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMeetingAI/SummaryPanel.swift:22-25, 144-150",
+      "problem": "The Summary panel reloads (transcript.list + transcript.get, which reads and merges every device transcript file) on every NibEventType.committed event (every stroke anywhere), on transcript.changed (once per second during live transcription) and on a 3 s poll, all on the main actor while the user is writing.",
+      "fix": "Drop the `committed` subscription, or filter it to events for this document whose changes touch audio records. Throttle transcript.changed to about once every 3 s. Remove the fixed poll, or keep it only when no event arrived in the last 10 s."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMeetingAI/LiveSummarizer.swift:198-204, 225-228",
+      "problem": "After Stop, every transcript.changed for the clip resets stoppedAt and runs an automatic summarisation, including each manual transcript.editSegment correction, so each correction costs an AI request and rewrites the summary. Separately, a stopped clip whose stop-time summaries all failed (provider offline) is retired after 300 s and never retried.",
+      "fix": "Wake a stopped clip only when the transcript gained lines: compare the merged line count or max index with the last summarised source. Retire a stopped clip only after a successful run that covers its final transcript, and keep retrying on failure (with backoff) otherwise."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMeetingAI/LiveSummarizer.swift:162-170; MeetingCommands.swift:222; SummaryPanel.swift:156",
+      "problem": "Model-supplied quality flags are unioned in without any check, so a clean transcript can show 'Noisy audio'. A translation object with empty lists for non-empty content is accepted. The translated view (on by default) and makeNotes then use `translation ?? content`, so that window's points disappear from both the panel and the generated notes.",
+      "fix": "Keep model flags only for overlap and lowConfidence, which have no transcript evidence, and derive gaps and noisy from MeetingWindows.flags only. Treat a translation as missing when it is empty but content is not: reject it in the guard, and use `(translation?.isEmpty == false ? translation : nil) ?? content` in both the panel and makeNotes."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMeetingAI/FeatMeetingAIFeature.swift:16-21; SummaryPanel.swift:102, 167, 198-208",
+      "problem": "Design and IA issues. Settings now has two pages titled 'Recording Settings' (F054's transcription.recording and this one), both with Live/Cloud transcription toggles. The Summary sidebar tab uses the same NibSymbol.transcript icon as the Transcript tab, so the two tabs look the same. The Summary language picker is an unsearchable menu of about 190 ISO codes. The toggle reads 'Translated to en' (a raw code). The 'Transcript' and 'Summarise' buttons are not verb + object (Slop checklist). Each quality flag is a separate warning NibBanner.",
+      "fix": "Title this page 'Meeting AI' (keywords keep 'recording'), or add the Live Summary row to F054's page and drop the duplicate toggles. Use a distinct token for the panel (for example NibSymbol.assistant or .listBulleted). Use a searchable language list like F054's. Show Locale.current.localizedString(forLanguageCode:) in the toggle. Rename the buttons to 'Show Transcript' and 'Summarise Recording'. Show flags as one row of NibBadge(.capsule(flag.title))."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Sources/FeatMeetingAI/MeetingCommands.swift:165-195 (notebook/whiteboard branch); SummaryPanel.swift:56",
+      "problem": "On notebooks the generated notes are flattened into one plain RichText per page, losing headings, bullets and to-dos. On a whiteboard, `livePages.last?.size` is nil (infinite board), so the `?? .a4` fallback inserts a fixed A4 page into the whiteboard. The success banner has no Undo next to the result (DESIGN.md principle 8).",
+      "fix": "Build the RichText with paragraph styles per MeetingNote.kind (heading, bullet, checklist) before paginating. For whiteboard documents, add a single text box to the current board (or a new board with size nil) instead of A4 pages. Give the success banner NibAction('Undo') running CommandIDs.undo for the document."
+    }
+  ]
+}

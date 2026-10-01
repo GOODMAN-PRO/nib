@@ -1,0 +1,35 @@
+{
+  "verdict": "needs-fix",
+  "issues": [
+    {
+      "severity": "blocker",
+      "where": "NibKit/Sources/FeatQuery/{AssetCommands,FeatQueryFeature,NodeCommands,QueryCommands,QueryShapes}.swift, NibKit/Tests/FeatQueryTests/FeatQueryTests.swift (merge commit a93797b 'Merge remote-tracking branch origin/feat/F003 into feat/F111')",
+      "problem": "Ownership: git diff origin/main...HEAD contains six F003 (Query, node & asset API) files. F003 is not F111 or any allowed dependency, and origin/feat/F003 is not on main. F111 merged it because every scenario registers FeatQueryFeature and relies on query.find/query.get, which only F003 registers; FeatQueryFeature.register on main is an empty scaffold. F111 therefore has an undeclared dependency.",
+      "fix": "Remove the F003 merge from feat/F111 so the diff contains no FeatQuery files (rebuild the branch from origin/main plus the allowed dependency merges plus 920177c, or run `git checkout origin/main -- NibKit/Sources/FeatQuery NibKit/Tests/FeatQueryTests` and commit). Then pick one: (a) the spec owner adds F003 to F111.dependsOn in docs/forge-spec.json and lands F003 on main before F111 merges main again; or (b) rewrite Scenarios.swift without FeatQueryFeature and read state from h.snapshot()/h.app.workspace instead of query.find/query.get (item count, the tool field and createdBy from the snapshot's items, and nib_render marks compared against the snapshot's item refs)."
+    },
+    {
+      "severity": "major",
+      "where": "NibKit/Tests/IntegrationTests/Scenarios.swift:223-241 (repairCatalog); root cause in NibKit/Sources/FeatSyncUI/RepairTools.swift:86-87 and NibKit/Sources/NibLibrary/FolderLibrary.swift:857-863, 1222-1246",
+      "problem": "The library.repair scenario cannot fail when repair does not recreate the catalogue, and it hides a real cross-feature bug. doc.create -> FolderLibrary.changed -> scheduleCacheSave() queues a debounced save (1 s). saveCacheNow() does not cancel that saveTask. So after the test deletes cacheURL, the creation's pending save rewrites the catalogue within about 1 s whatever library.repair does, and the `wait(...) { CatalogCache.load != nil }` succeeds. The CI run of 1.237 s matches that debounce. The scenario also never checks the command's own `catalogRebuilt` output. With the real FolderLibrary that output is always false: RepairTools tests fileExists right after library.refresh(), and refresh() only schedules the debounced write. AI, plugin and MCP callers are told the catalogue was not rebuilt after every successful repair.",
+      "fix": "Scenario: after doc.create, first wait for the creation's debounced write to land (CatalogCache.load != nil, wait 1.2 s, then library.waitForIO()). Delete cacheURL, wait 1.5 s and XCTAssertFalse that the file exists, so no stray save can mask repair. Then run library.repair and XCTAssertEqual(repaired[\"catalogRebuilt\"], true) along with the existing file and CatalogCache checks. Production (F002/F070, both in this branch): make saveCacheNow() call saveTask?.cancel(); in FolderLibrary.refresh() call saveCacheNow() instead of scheduleCacheSave() when `rebuild` is true. In RepairTools, set catalogRebuilt only after the write lands, e.g. by polling CatalogCacheRepair.cacheURL every 50 ms for up to 2 s after library.refresh()."
+    },
+    {
+      "severity": "minor",
+      "where": "NibKit/Tests/IntegrationTests/Scenarios.swift:129-142 (aiTurnAndHistory)",
+      "problem": "The 'one undo group' assertion holds even if ai.ask drops the caller's group. FakeAIService uses `request.group ?? NibID.make()` for every tool call, so a regression where AIAsk stops passing ctx.group or ctx.principal still yields one group and a matching response[\"group\"].",
+      "fix": "Assert that F084 forwarded the caller's context: XCTAssertNotNil(ai.requests.first?.group), XCTAssertEqual(ai.requests.first?.group, group) and XCTAssertEqual(ai.requests.first?.principal, .ai(\"integration\")). Also check that every history entry for the turn carries `group` (h.app.bus.history.entries(Fixtures.docID).filter { $0.group == group }.count == 1 and that entry's change count is 2)."
+    },
+    {
+      "severity": "minor",
+      "where": "tools/smoke/ink.json step 14 (nib_page_text after the handwriting manual step)",
+      "problem": "The manual prompt says the next bridge call must contain the written words, but the step only expects `blocks: {$type: array}`, which passes with no recognition at all. The handwriting-recognition check can never fail.",
+      "fix": "Before the step, wait for recognition with a waitEvent for the recognition or index event (for example {\"waitEvent\": {\"type\": \"page.changed\", \"timeout\": 30}}, optional: true). Change the expectation to {\"json\": {\"blocks\": {\"$contains\": {\"text\": {\"$match\": \"(?i)nib\"}}}}}, marked optional: true so a skipped person step only warns."
+    },
+    {
+      "severity": "minor",
+      "where": "tools/smoke/sync.json step 8 (nib_find after the second device draws)",
+      "problem": "The only automated evidence of Files-provider sync is `items: {$type: array}`, which an empty page satisfies (the script admits this in step 10). Remote ink arrival is never asserted by the bridge.",
+      "fix": "Expect {\"json\": {\"items\": {\"$len\": 1}}} with \"optional\": true. The notebook is created empty and the second device draws exactly one line, so a person who completes step 6 gets a real assertion and a skipped step only warns."
+    }
+  ]
+}

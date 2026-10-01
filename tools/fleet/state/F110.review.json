@@ -1,0 +1,89 @@
+{
+ "verdict": "needs-fix",
+ "issues": [
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatTeacher/SmartViews.swift SmartViews.collect L121-124",
+   "problem": "The copy scan walks library.allNodes() and calls ctx.workspace.content(node.id) on every document in the library. That loads and permanently caches every document head and emits doc.opened for each one. FeatCollabPresence reacts to doc.opened with unseen scans and 'N changes since you left' toasts, and memory grows with library size on every collect, which runs on every panel interaction. contracts-v2 G10 (peekContent: no caching, no doc.opened, for library-wide scans) covers this, so the workaround counts as major. Also, `let record = try LessonManager.assignment(meta)` inside the guard rethrows: one unrelated or newer-version document with an unreadable nib.lesson record makes collect fail for every lesson.",
+   "fix": "Read metadata with ctx.workspace.peekContent(node.id).meta. Decode the assignment per document with do/catch: skip non-lesson documents, and add a copy whose record is unreadable to `missing` instead of throwing. Add a test with a large library of unrelated documents plus one malformed nib.lesson document. It asserts that collect succeeds, that workspace.loadedDocuments does not grow by the unrelated documents, and that no doc.opened is emitted for them."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatTeacher/InsightCommands.swift LessonSetClusters L154-162; LessonCommands.swift LessonCreate L160-215",
+   "problem": "lesson.setClusters stores the teacher's model answer and the class's cluster membership (InsightClusterRecord under nib.teacherInsights) inside the SOURCE answer zone's custom.data. lesson.create copies source items verbatim (copy.items -> tx.put, L215) and strips only the assignment and roster meta keys (L167-168). Every student copy published after a teacher saves a model answer therefore contains the answer key and other students' cluster refs, readable through query.get, plugins or the student's assistant. A late joiner or a second class period from the same source both hit this.",
+   "fix": "Keep the record out of anything copied to students. Either store it in the source meta.ext under a teacher-only key keyed by zone id and nil it in LessonCreate next to assignmentKey/rosterKey, or strip ClusterEngine.recordKey from every custom item's data in LessonCreate before transfer (LessonCommands.swift is a dependency file inside this branch). Add a test: setClusters with a modelAnswer, then lesson.create for a new student; the new copy's zone custom.data has no nib.teacherInsights."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatTeacher/ClusterEngine.swift validate L73-76; SmartViews.swift collect L144-152; InsightCommands.swift LessonSetClusters L124",
+   "problem": "Saved clusters keep refs to copies that later become unavailable. A locked copy goes to `missing`, and a trashed copy is filtered out entirely. collect returns the saved record unchanged, and the panel resubmits it on every save (rename, move, add, remove, score). validate then rejects the unknown member ('A cluster refers to an answer outside this lesson question'). One locked or trashed student copy blocks every later edit of that question's clusters. lesson.cluster also refuses while `missing` is non-empty, so a locked copy leaves no way forward.",
+   "fix": "In collect, split the saved record's members into current entries and stale refs (returned as e.g. `staleMembers`, shown under Unavailable copies), and return pruned clusters. Alternatively, let validate accept refs listed in collection.missing, preserving them but never scoring them. Add tests: save clusters, then lock one copy and trash another; renaming or removing a cluster still succeeds and keeps or prunes the unavailable refs deterministically."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatTeacher/SmartViews.swift collect L82-83,L125; InsightCommands.swift L95,L122,L147; SmartViewsPanel.source L243-245",
+   "problem": "The class scope is inconsistent. Collecting from a student copy filters copies by that copy's assignment folder. lesson.cluster's freshness re-collect (L95) and setClusters' re-collect (L147) use collection.source, which has no assignment, so they include every class published from the same source. Whenever a source has been published to two folders, a copy-scoped zone ref (AI/plugin) always fails with conflict. The panel's first collect is class-scoped (opened from a copy), but every later collect uses collection.source and silently switches the navigator and grid to all classes. The saved cluster record is one per source zone, shared by all classes.",
+   "fix": "Make the scope explicit. Add `folder` to InsightCollection and accept an optional `folder` param on lesson.collect, lesson.cluster and lesson.setClusters (defaulting to the requested copy's folder). Pass the same scope into every re-collect, keep it in the panel's state, and key the saved record by folder. Add a two-folder regression test covering collect from a copy, cluster, and setClusters with applyScores."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatTeacher/SmartViews.swift entry L164,L189-190",
+   "problem": "The stale-grading guard computes an entry's revision from workspace.items (live items only), the meta and the page record. Erasing an answer item writes a tombstone that is not counted, so when the erased item was not the max-revision item the revision is unchanged. lesson.cluster and lesson.setClusters(applyScores) then grade a stale answer. contracts-v2 G9 provides workspace.contentRevision(doc, page:), which includes tombstones.",
+   "fix": "Use max(meta.rev, record.rev, ctx.workspace.contentRevision(doc, page:) ?? allItems(doc, page:).map(\\.rev).max()) so deletions count. Add a test: collect, delete a non-latest answer item in one copy, then setClusters with the old revisions throws conflict."
+  },
+  {
+   "severity": "major",
+   "where": "NibKit/Sources/FeatTeacher/InsightCommands.swift LessonSetClusters L150-162",
+   "problem": "Bulk scoring is not atomic. Each nested answerZone.score commits its own transaction (CommandContext.mutate commits immediately; the bus has no command-level rollback). A later member can fail after the preflight: a plugin guard hook on answerZone.score, a lock or deletion arriving through sync during the awaits, or the final source mutate. Students already scored stay scored while the command throws, and the cluster record is not saved. This contradicts the panel receipt and the 'never partially grade' test intent.",
+   "fix": "Wrap the scoring loop and final mutate in do/catch. On failure, revert this command's group in every document already written (ctx.bus.revert(group: ctx.group, doc:) for each scored doc, or undo the linked entry) before rethrowing. Add a test that registers a hook throwing for the second member and asserts both copies and the source are unchanged afterwards."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatTeacher/InsightCommands.swift LessonCluster L64-85",
+   "problem": "Image handling has three problems. (a) Whenever the provider supportsVision, every answer is rendered and attached, even text-only similarity runs, with no cap on image count or bytes (up to 1,000 renders of up to 1568 px), so large classes exceed provider limits and needlessly send student handwriting images. (b) needsImages is true whenever no explicit or saved answer exists, even when the source zone contains typed model text, so a text-only provider cannot compare against a typed source answer. (c) With vision, the model image is appended even when its text is used, and the prompt never explains the trailing image.",
+   "fix": "Compute sourceText = collection.model?.text.nilIfEmpty first. Set needsImages = entries.contains(\\.hasInk) || (mode == .modelAnswer && answer == nil && sourceText == nil). Render and attach images only when needsImages, attach the model image only when its text is nil, and enforce an image budget (e.g. at most 100 images) with a clear `unsupported` error or batching. Add a test for text-only answers with a vision provider (no images sent)."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatTeacher/ClusterEngine.swift parse L37-55; SmartViews.swift clusterSections L384-388",
+   "problem": "Provider output may carry `score`. It survives parse, prefills the 'Points for this cluster' field and is persisted by 'Save Reviewed Clusters', although the prompt forbids AI scores and the descriptor says scores are explicit teacher input. Similarity cluster ids must also match NibID ([A-Za-z0-9_-]{1,64}), but the prompt never says so, so a model answering 'group 1' fails the whole suggestion.",
+   "fix": "In parse, set score = nil on every suggested cluster, or reject non-null scores. Either state the id charset in the prompt or reassign similarity ids server-side (NibID.make()) after validation. Add parse tests for a scored response and for an id containing a space."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatTeacher/SmartViews.swift questionControls/clusterActions L357-368, answerGrid picker L420-429",
+   "problem": "While AI proposals are shown (proposed == true), 'Save Model Answer', moving one answer, or scoring one cluster calls save(clusters) and silently persists the unreviewed AI groups. 'Save Reviewed Clusters' is not the only path, which undercuts the trust rule that suggestions are reviewed before saving.",
+   "fix": "Keep the last saved clusters separately (savedClusters from collect). Make 'Save Model Answer' save savedClusters while proposals are pending, or disable it and the per-answer pickers until the teacher taps 'Save Reviewed Clusters' or discards the proposal (add a Discard Suggestions button)."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatTeacher/SmartViews.swift L347-356, L376-399, L416, L536-543; ClassNavigator.swift L59-64",
+   "problem": "Accessibility gaps. Per-cluster and per-answer buttons repeat identical VoiceOver labels ('Save Cluster Name', 'Score All Answers in Cluster', 'Remove Cluster', 'Open Copy', 'Render Again'), which are ambiguous in the rotor. The 'Add Cluster' HStack (field plus button) does not switch to a VStack at compact width or AX sizes the way the other rows do. \u2318R, \u2325\u2318\u2190 and \u2325\u2318\u2192 on NibButtons show no KeyHint (Slop checklist). The model-answer thumbnail is detected by comparing student to the localized string 'Model answer', so a student with that name is mislabelled.",
+   "fix": "Add contextual labels (e.g. String(localized: \"Remove \\(cluster.label)\"), \"Open \\(entry.student)'s copy\"). Use the same `widthClass == .compact || typeSize.isAccessibilitySize` VStack switch for the add-cluster row. Show KeyHint for the shortcuts. Pass an explicit isModel flag to InsightThumbnail."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatTeacher/FeatTeacherInsightsFeature.swift L25-33; InsightCommands.swift LessonCollect L29-32",
+   "problem": "'Review Class Answers' is registered with isVisible { $0.doc != nil } at documentMore, documentTitle and libraryItem, so it appears on every document, including text documents, study sets and non-lesson notebooks. Also, lesson.collect called by an AI or plugin principal updates the user's window navigator and makes the class navigator bar appear.",
+   "fix": "Show the menu only for notebook or whiteboard documents that are a lesson source or copy: check peekContent(doc).meta.kind and the nib.lesson / nib.lesson.privateSource keys, or whether any copy references the doc. Update InsightRuntime only when ctx.principal.isUser."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatTeacher/SmartViews.swift collect L85, clusterSections L381, answerGrid L421",
+   "problem": "Large notebooks and classes are slow. Every collect, run on every picker change and after every save, loads every page of the source through LessonManager.capture just to list questions, synchronously on the main actor. The cluster UI also does O(entries x members) array scans per body evaluation (filter + members.contains, and clusters.first { members.contains } per grid cell).",
+   "fix": "Load the question list once per source revision (cache keyed by the source's page contentRevisions), or load only the selected page plus the pages' zone items lazily. Precompute a [memberRef: clusterID] dictionary and Set(cluster.members) once per render."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Sources/FeatTeacher/InsightCommands.swift LessonSetClusters L142-152",
+   "problem": "For non-user principals under the 'always' policy, the preflight authorize and then each nested ctx.execute(answerZone.score) both prompt, giving 2N confirmations per bulk score. Cluster edits without scores also live only in the source's history, so after opening the panel from a student copy, \u2318Z in that window cannot undo 'Remove Cluster' or a rename.",
+   "fix": "After a successful preflight, run the nested scores under the already-approved group (e.g. preflight once on lesson.setClusters with a summary of N scores, then skip re-confirmation for the same group). Document or surface undo for cluster-only edits, e.g. a receipt with an Undo action that calls edit.undo on the source document."
+  },
+  {
+   "severity": "minor",
+   "where": "NibKit/Tests/FeatTeacherTests/ClusterEngineTests.swift L203-236",
+   "problem": "The snapshot test only asserts more than 8 distinct pixel bytes, and the AX3 state sets width 390 without setting horizontalSizeClass to compact, so the compact and AX reflow branches are never exercised. No tests cover the risky paths listed above: tombstone staleness, partial-failure rollback, two-folder scope, stale members after lock or trash, and the answer-key leak through lesson.create.",
+   "fix": "Set .environment(\\.horizontalSizeClass, .compact) for the compact state. Add the regression tests named in each fix above."
+  }
+ ]
+}
